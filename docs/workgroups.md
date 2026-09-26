@@ -87,11 +87,13 @@ the declared path is also bound onto itself, because a plain nested bind can
 be defeated by renaming its parent directory away from inside the container.
 A declared path that does not exist is skipped, so create it on the host
 before declaring it: until a container spawns with the bind, that container
-can write there. One reached through a symlink is skipped with a warning; a
-malformed file aborts the spawn. The bind protects names, not inodes: a file
-under the path that has a second hard link (one made while the path was still
-writable) is logged at error level on every spawn and must be removed by an
-operator. Removing an entry and respawning restores write access. See
+can write there. A declared path that cannot be resolved to itself (a
+permission error, a symlink loop, or a symlink on the way) does not fail the
+spawn: that workgroup's writable mounts are mounted read-only instead, with an
+error in the log, and other workgroups are unaffected. A malformed file aborts
+the spawn. The bind protects names, not inodes: a hard link or an outward
+symlink under the path, made while it was still writable, is logged at error
+level on every spawn and must be removed by an operator. Removing an entry and respawning restores write access. See
 `src/workgroup-readonly-paths.ts`.
 
 ## Workgroup wiki

@@ -22,6 +22,19 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+function only(protectedPaths: string[]) {
+  return { protectedPaths, lockedRoots: [] };
+}
+
+function quietly<T>(run: () => T): T {
+  const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+  try {
+    return run();
+  } finally {
+    error.mockRestore();
+  }
+}
+
 function writePolicy(value: unknown): void {
   fs.writeFileSync(path.join(root, 'workgroup-readonly-paths.json'), JSON.stringify(value));
 }
@@ -50,34 +63,65 @@ describe('parseWorkgroupReadonlyPaths', () => {
 
 describe('readWorkgroupReadonlyPaths', () => {
   it('returns nothing without a policy file', () => {
-    expect(readWorkgroupReadonlyPaths(root)).toEqual([]);
+    expect(readWorkgroupReadonlyPaths(root)).toEqual({ protectedPaths: [], lockedRoots: [] });
   });
 
   it('resolves existing subpaths and skips missing ones', () => {
     fs.mkdirSync(path.join(root, 'workgroups', 'wg', 'releases', 'ops'), { recursive: true });
     writePolicy({ version: 1, workgroups: { wg: ['releases/ops', 'releases/absent'], other: ['x'] } });
-    expect(readWorkgroupReadonlyPaths(root)).toEqual([path.join(root, 'workgroups', 'wg', 'releases', 'ops')]);
+    expect(readWorkgroupReadonlyPaths(root)).toEqual({
+      protectedPaths: [path.join(root, 'workgroups', 'wg', 'releases', 'ops')],
+      lockedRoots: [],
+    });
   });
 
-  it('refuses a subpath that reaches its target through a symlink', () => {
+  it('locks the workgroup when a subpath reaches its target through a symlink', () => {
     fs.mkdirSync(path.join(root, 'workgroups', 'wg', 'real'), { recursive: true });
     fs.symlinkSync('real', path.join(root, 'workgroups', 'wg', 'link'));
     writePolicy({ version: 1, workgroups: { wg: ['link'] } });
-    expect(readWorkgroupReadonlyPaths(root)).toEqual([]);
+    expect(quietly(() => readWorkgroupReadonlyPaths(root))).toEqual({
+      protectedPaths: [],
+      lockedRoots: [path.join(root, 'workgroups', 'wg')],
+    });
   });
 
-  it('reports a file under the path that has another name elsewhere', () => {
+  it('locks only the affected workgroup when a subpath is unreadable or loops', () => {
+    const blocked = path.join(root, 'workgroups', 'wg', 'releases');
+    fs.mkdirSync(path.join(blocked, 'ops'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'workgroups', 'looped'), { recursive: true });
+    fs.symlinkSync('loop', path.join(root, 'workgroups', 'looped', 'loop'));
+    fs.mkdirSync(path.join(root, 'workgroups', 'fine', 'ops'), { recursive: true });
+    writePolicy({ version: 1, workgroups: { wg: ['releases/ops'], looped: ['loop'], fine: ['ops'] } });
+    fs.chmodSync(blocked, 0o000);
+    try {
+      const result = quietly(() => readWorkgroupReadonlyPaths(root));
+      expect(result.protectedPaths).toEqual([path.join(root, 'workgroups', 'fine', 'ops')]);
+      expect(new Set(result.lockedRoots)).toEqual(
+        new Set([path.join(root, 'workgroups', 'wg'), path.join(root, 'workgroups', 'looped')]),
+      );
+    } finally {
+      fs.chmodSync(blocked, 0o755);
+    }
+  });
+
+  it('reports hard links and symlinks that give a protected file a writable name', () => {
     const ops = path.join(root, 'workgroups', 'wg', 'ops');
     fs.mkdirSync(path.join(ops, 'nested'), { recursive: true });
     fs.writeFileSync(path.join(ops, 'nested', 'run.sh'), 'echo hi\n');
     fs.writeFileSync(path.join(ops, 'solo.sh'), 'echo solo\n');
     fs.linkSync(path.join(ops, 'nested', 'run.sh'), path.join(root, 'workgroups', 'wg', 'alias.sh'));
+    fs.writeFileSync(path.join(root, 'workgroups', 'wg', 'notes.sh'), 'echo notes\n');
+    fs.symlinkSync('../notes.sh', path.join(ops, 'out.sh'));
+    fs.symlinkSync('solo.sh', path.join(ops, 'in.sh'));
     writePolicy({ version: 1, workgroups: { wg: ['ops'] } });
     const error = vi.spyOn(log, 'error').mockImplementation(() => {});
     try {
-      expect(readWorkgroupReadonlyPaths(root)).toEqual([ops]);
+      expect(readWorkgroupReadonlyPaths(root).protectedPaths).toEqual([ops]);
       expect(error).toHaveBeenCalledTimes(1);
-      expect(error.mock.calls[0][1]).toMatchObject({ files: [path.join(ops, 'nested', 'run.sh')], count: 1 });
+      expect(error.mock.calls[0][1]).toMatchObject({
+        hardLinked: [path.join(ops, 'nested', 'run.sh')],
+        escapingSymlinks: [path.join(ops, 'out.sh')],
+      });
     } finally {
       error.mockRestore();
     }
@@ -92,13 +136,13 @@ describe('readWorkgroupReadonlyPaths', () => {
 describe('protectReadonlyHostPaths', () => {
   it('returns the list untouched when nothing is protected', () => {
     const mounts = [{ hostPath: root, containerPath: '/w', readonly: false }];
-    expect(protectReadonlyHostPaths(mounts, [])).toBe(mounts);
+    expect(protectReadonlyHostPaths(mounts, { protectedPaths: [], lockedRoots: [] })).toBe(mounts);
   });
 
   it('pins every intermediate directory and binds the target read-only', () => {
     const target = path.join(root, 'a', 'b', 'c');
     fs.mkdirSync(target, { recursive: true });
-    const result = protectReadonlyHostPaths([{ hostPath: root, containerPath: '/w', readonly: false }], [target]);
+    const result = protectReadonlyHostPaths([{ hostPath: root, containerPath: '/w', readonly: false }], only([target]));
     expect(result).toEqual([
       { hostPath: root, containerPath: '/w', readonly: false },
       { hostPath: path.join(root, 'a'), containerPath: '/w/a', readonly: false, overlayAllowedRoots: [root] },
@@ -115,7 +159,7 @@ describe('protectReadonlyHostPaths', () => {
         { hostPath: target, containerPath: '/x', readonly: false },
         { hostPath: path.join(target, 'sub'), containerPath: '/y', readonly: false },
       ],
-      [target],
+      only([target]),
     );
     expect(result.map((m) => m.readonly)).toEqual([true, true]);
   });
@@ -129,7 +173,7 @@ describe('protectReadonlyHostPaths', () => {
       { hostPath: root, containerPath: '/r', readonly: true },
       { hostPath: elsewhere, containerPath: '/e', readonly: false },
     ];
-    expect(protectReadonlyHostPaths(mounts, [target])).toEqual(mounts);
+    expect(protectReadonlyHostPaths(mounts, only([target]))).toEqual(mounts);
   });
 
   it('does not duplicate the destination of a mount that already exists below the parent', () => {
@@ -143,7 +187,7 @@ describe('protectReadonlyHostPaths', () => {
         { hostPath: memory, containerPath: '/w/memory', readonly: false },
         { hostPath: lock, containerPath: '/w/.write.lock', readonly: false },
       ],
-      [path.join(memory, 'scripts'), lock],
+      only([path.join(memory, 'scripts'), lock]),
     );
     const destinations = result.map((m) => m.containerPath);
     expect(new Set(destinations).size).toBe(destinations.length);
@@ -152,11 +196,31 @@ describe('protectReadonlyHostPaths', () => {
     expect(result.find((m) => m.containerPath === '/w/.write.lock')?.readonly).toBe(true);
   });
 
+  it('turns every writable mount reaching into a locked workgroup read-only, and nothing else', () => {
+    const wg = path.join(root, 'wg');
+    const other = path.join(root, 'other');
+    fs.mkdirSync(path.join(wg, 'sub'), { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    const result = protectReadonlyHostPaths(
+      [
+        { hostPath: wg, containerPath: '/w', readonly: false },
+        { hostPath: path.join(wg, 'sub'), containerPath: '/s', readonly: false },
+        { hostPath: root, containerPath: '/all', readonly: false },
+        { hostPath: other, containerPath: '/o', readonly: false },
+      ],
+      { protectedPaths: [], lockedRoots: [wg] },
+    );
+    expect(result.map((m) => m.readonly)).toEqual([true, true, true, false]);
+  });
+
   it('never leaves a pin writable when the pinned directory is itself protected', () => {
     const outer = path.join(root, 'rel');
     const inner = path.join(outer, 'ops', 'deep');
     fs.mkdirSync(inner, { recursive: true });
-    const result = protectReadonlyHostPaths([{ hostPath: root, containerPath: '/w', readonly: false }], [inner, outer]);
+    const result = protectReadonlyHostPaths(
+      [{ hostPath: root, containerPath: '/w', readonly: false }],
+      only([inner, outer]),
+    );
     const byPath = new Map(result.map((m) => [m.containerPath, m.readonly]));
     expect(byPath.get('/w/rel')).toBe(true);
     expect(byPath.get('/w/rel/ops')).toBe(true);

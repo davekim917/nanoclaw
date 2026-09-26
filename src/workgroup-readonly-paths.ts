@@ -70,23 +70,48 @@ export function parseWorkgroupReadonlyPaths(contents: string): ReadonlyMap<strin
   return declared;
 }
 
+export interface WorkgroupReadonlyPaths {
+  /** Real host paths to bind read-only wherever a writable mount exposes them. */
+  protectedPaths: string[];
+  /**
+   * Workgroup roots whose declarations could not be resolved safely. Nothing
+   * under them can be protected precisely, so every writable mount that
+   * reaches into one is made read-only instead. The failure stays inside that
+   * workgroup: other groups spawn as usual.
+   */
+  lockedRoots: string[];
+}
+
 /**
- * Real host paths of every declared subpath that exists, across all
- * workgroups: a mount of one workgroup's tree into another group's container
- * must not expose it writable either.
+ * Resolve every declared subpath across all workgroups: a mount of one
+ * workgroup's tree into another group's container must not expose it writable
+ * either. A missing subpath is skipped. Anything else that stops a subpath
+ * resolving to itself (a permission error or symlink loop an agent can plant,
+ * or a symlink on the way) locks that workgroup rather than throwing, which
+ * would stop every spawn on the host.
  */
-export function readWorkgroupReadonlyPaths(dataDir: string = DATA_DIR): string[] {
+export function readWorkgroupReadonlyPaths(dataDir: string = DATA_DIR): WorkgroupReadonlyPaths {
   const policyPath = path.join(dataDir, POLICY_FILE);
+  const result: WorkgroupReadonlyPaths = { protectedPaths: [], lockedRoots: [] };
   let contents: string;
   try {
     contents = fs.readFileSync(policyPath, 'utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return result;
     throw error;
   }
-  const resolved: string[] = [];
   for (const [workgroupId, subpaths] of parseWorkgroupReadonlyPaths(contents)) {
     const root = workgroupSharedDir(workgroupId, dataDir);
+    const lock = (reason: string, detail: Record<string, unknown>): void => {
+      log.error(`Workgroup read-only path ${reason}; mounting the workgroup read-only`, { workgroupId, ...detail });
+      const names = [path.resolve(root)];
+      try {
+        names.push(fs.realpathSync(root));
+      } catch {
+        // The lexical root still matches mounts that name it directly.
+      }
+      for (const name of names) if (!result.lockedRoots.includes(name)) result.lockedRoots.push(name);
+    };
     for (const subpath of subpaths) {
       let real: string;
       let realRoot: string;
@@ -95,67 +120,74 @@ export function readWorkgroupReadonlyPaths(dataDir: string = DATA_DIR): string[]
         realRoot = fs.realpathSync(root);
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (code === 'ENOENT' || code === 'ENOTDIR') continue;
-        throw error;
+        if (code === 'ENOENT') continue;
+        lock('could not be resolved', { subpath, error: code ?? String(error) });
+        break;
       }
       // A symlink anywhere on the way is replaceable by whoever can write its
       // parent, so a bind of its current target would protect a path the host
       // may no longer be reading.
       if (real !== path.join(realRoot, subpath)) {
-        log.warn('Workgroup read-only path traverses a symlink; not protected', { workgroupId, subpath, real });
-        continue;
+        lock('traverses a symlink', { subpath, real });
+        break;
       }
-      const aliased = hardLinkedFiles(real);
-      if (aliased.length > 0) {
-        log.error('Workgroup read-only path holds hard-linked files; another name for them may still be writable', {
-          workgroupId,
-          subpath,
-          files: aliased.slice(0, 20),
-          count: aliased.length,
-        });
-      }
-      resolved.push(real);
+      reportAliases(real, workgroupId, subpath);
+      result.protectedPaths.push(real);
     }
   }
-  return resolved;
+  return result;
 }
 
 /**
  * The read-only bind protects names, not inodes. Once it is in place a
  * container cannot add another name for a file under it (link(2) across mount
- * points fails with EXDEV), but a link made while the path was still writable
- * survives, and a write through it changes the file the host runs. It is
- * reported, never removed: the host cannot tell which name is the intended
- * one. Symlinks are not followed.
+ * points fails with EXDEV), but a hard link made while the path was still
+ * writable survives, and so does a symlink pointing out of it; a write through
+ * either changes what the host runs. They are reported, never removed: the
+ * host cannot tell which name is the intended one.
  */
-function hardLinkedFiles(root: string): string[] {
-  const found: string[] = [];
+function reportAliases(root: string, workgroupId: string, subpath: string): void {
+  const hardLinked: string[] = [];
+  const escaping: string[] = [];
+  const unreadable: string[] = [];
   const pending = [root];
   while (pending.length > 0) {
     const current = pending.pop() as string;
-    let stat: fs.Stats;
     try {
-      stat = fs.lstatSync(current);
+      const stat = fs.lstatSync(current);
+      if (stat.isDirectory()) {
+        for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
+      } else if (stat.isFile() && stat.nlink > 1) {
+        hardLinked.push(current);
+      } else if (stat.isSymbolicLink()) {
+        let target: string | null = null;
+        try {
+          target = fs.realpathSync(current);
+        } catch {
+          // Dangling or looping: whatever it names later is outside our view.
+        }
+        if (target === null || (target !== root && !isInside(target, root))) escaping.push(current);
+      }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw error;
-    }
-    if (stat.isDirectory()) {
-      for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
-    } else if (stat.isFile() && stat.nlink > 1) {
-      found.push(current);
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') unreadable.push(current);
     }
   }
-  return found;
+  if (hardLinked.length + escaping.length + unreadable.length === 0) return;
+  log.error('Workgroup read-only path holds names that may still be writable elsewhere', {
+    workgroupId,
+    subpath,
+    hardLinked: hardLinked.slice(0, 20),
+    escapingSymlinks: escaping.slice(0, 20),
+    unreadable: unreadable.slice(0, 20),
+  });
 }
 
 function realOrResolved(p: string): string {
   try {
     return fs.realpathSync(p);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return path.resolve(p);
-    throw error;
+  } catch {
+    // Unresolvable sources still compare by their lexical path.
+    return path.resolve(p);
   }
 }
 
@@ -165,9 +197,9 @@ function isInside(child: string, parent: string): boolean {
 
 /**
  * Re-mount each protected path read-only wherever a writable mount exposes it.
- * A writable mount whose source sits at or under a protected path becomes
- * read-only itself; one whose source contains a protected path gains a nested
- * read-only bind after it.
+ * A writable mount whose source sits at or under a protected path, or that
+ * reaches into a locked workgroup, becomes read-only itself; one whose source
+ * contains a protected path gains a nested read-only bind after it.
  *
  * A nested read-only bind is not enough on its own: from inside the container
  * the writable parent directory can be renamed away and the path recreated,
@@ -176,13 +208,20 @@ function isInside(child: string, parent: string): boolean {
  * itself, read-write, which makes it a mount point the container can neither
  * rename nor remove.
  */
-export function protectReadonlyHostPaths(mounts: VolumeMount[], protectedPaths: readonly string[]): VolumeMount[] {
-  if (protectedPaths.length === 0) return mounts;
+export function protectReadonlyHostPaths(
+  mounts: VolumeMount[],
+  { protectedPaths, lockedRoots }: WorkgroupReadonlyPaths,
+): VolumeMount[] {
+  if (protectedPaths.length === 0 && lockedRoots.length === 0) return mounts;
   const covered = (hostPath: string): boolean =>
     protectedPaths.some((target) => hostPath === target || isInside(hostPath, target));
+  const reachesLocked = (source: string): boolean =>
+    lockedRoots.some((root) => source === root || isInside(source, root) || isInside(root, source));
   const result = mounts.map((mount) => ({ ...mount }));
   for (const mount of result) {
-    if (!mount.readonly && covered(realOrResolved(mount.hostPath))) mount.readonly = true;
+    if (mount.readonly) continue;
+    const source = realOrResolved(mount.hostPath);
+    if (covered(source) || reachesLocked(source)) mount.readonly = true;
   }
   const existing = new Set(result.map((mount) => mount.containerPath));
   const nested = new Map<string, VolumeMount>();
