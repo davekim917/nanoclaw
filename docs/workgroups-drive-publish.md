@@ -62,7 +62,8 @@ The dry run prints a TSV to stdout with one row per workgroup: `tracked`, `allow
 
 ## Long runs, locking and resume
 
-- **Lock.** A run takes `flock` on `$DRIVE_STATE_FILE.lock`. A second run that finds it held logs `SKIP another publisher run holds …` and exits 0. The kernel drops the lock when the process dies, so a stale lock cannot occur.
+- **Incomplete enumeration.** Sometimes `find` cannot list an include root completely, for example when the root vanished or a subtree is unreadable. The run still publishes what it found, but it keeps every previous state row, reports nothing as removed, and exits non-zero. `--dry-run` reports `incomplete_roots=N` and exits non-zero too.
+- **Lock.** Before it reads state, a run takes `flock` on `$DRIVE_STATE_FILE.lock`. A second run that finds it held logs `SKIP another publisher run holds …` and exits 0. The kernel drops the lock when the process dies, so a stale lock cannot occur.
 - **Resume.** Progress is checkpointed to the state file every 25 uploads (`DRIVE_CHECKPOINT_EVERY`) and again on exit, including after SIGTERM. Each checkpoint keeps the previous row of every live file the run has not reached yet. An interrupted run therefore resumes where it stopped: finished files hash-match and skip, and unreached files keep their Drive ids. A SIGKILL loses at most the uploads made since the last checkpoint. Those files are found again by a name-in-parent lookup, so no duplicates are created.
 - **Cold runs.** Each new file costs one to two gws calls, about 1.5–2 s each on the reference host. A folder the run created itself is known to be empty, so the per-file lookup inside it is skipped. A first run that adds a large allowlist can take hours. If the unit's `TimeoutStartSec` is shorter than that, systemd stops the run at the timeout, the unit reports a failure, and the next timer fire resumes. To finish in one pass, raise the timeout with a drop-in before the first allowlisted run:
 

@@ -99,6 +99,26 @@ if [[ -n "$CONFIG" ]]; then
   done
 fi
 
+if [[ $DRY_RUN -eq 0 ]]; then
+  # No default: trunk carries no install-specific folder name. Set it in the
+  # unit's Environment=. Unset is a loud failure, not a silent publish to a
+  # wrong or newly-created folder.
+  ROOT_NAME="${DRIVE_ROOT_NAME:?DRIVE_ROOT_NAME must be set (the Drive root folder name)}"
+  # Explicit named account on every call. The bare default credential slot
+  # (~/.config/gws/credentials.enc) is deliberately NOT used.
+  export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-/home/ubuntu/.config/gws/accounts/primary.json}"
+
+  # --- run lock -------------------------------------------------------------
+  # A cold run over a large allowlist can take hours; a second run must never
+  # overlap it (two writers would race on the state file and on folder
+  # creation, and duplicate files on Drive). Taken BEFORE state is read: a
+  # run that loaded state while another held the lock would later persist
+  # that stale snapshot over the other run's rows. flock is released by the
+  # kernel when the process dies, so a crash never leaves a stale lock.
+  exec 9>>"$STATE.lock" || { log "FATAL cannot open lock $STATE.lock"; exit 1; }
+  if ! flock -n 9; then log "SKIP another publisher run holds $STATE.lock; not overlapping it"; exit 0; fi
+fi
+
 declare -A FOLDER OLD_SHA OLD_ID NEWDIR LIVE DONE IN_SET IS_ALLOW
 DORDER=()
 # --- load previous state (read-only here; rewritten only by a real run) ---
@@ -114,7 +134,7 @@ if [[ -f "$STATE" ]]; then
 fi
 
 added=0 updated=0 skipped=0 failed=0 refused=0 folders_made=0
-oversize=0 excluded=0
+oversize=0 excluded=0 enum_failed=0
 
 refuse() {
   log "ERROR REFUSED $1: not a regular file inside the tree (resolves to ${2:-nothing})"
@@ -162,6 +182,20 @@ enumerate_root() {
     [[ $i -gt 0 ]] && match+=( -o )
     match+=( -iname "*.${EXTS[$i]}" )
   done
+  # find's exit status is checked, so it runs to a file rather than inside
+  # the process substitution that would swallow it. A partial listing (root
+  # vanished, unreadable subtree) must not pass for a complete one: the rows
+  # of files it missed would be dropped as if those files were gone.
+  local list rc
+  list="$(mktemp)" || { enum_failed=$((enum_failed+1)); return 0; }
+  find "$root" -mindepth 1 \
+    \( -type d \( "${prune[@]}" \) -prune \) \
+    -o \( \( -type f -o -type l \) \( "${match[@]}" \) -printf '%y\t%s\t%p\0' \) > "$list"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    log "ERROR enumeration of $root incomplete (find exit $rc); state rows under it are kept"
+    enum_failed=$((enum_failed+1))
+  fi
   # Path LAST, so a tab inside a name cannot shift the type/size fields; the
   # sort keys on it so runs are deterministic.
   while IFS=$'\t' read -r -d '' ftype fsize fpath; do
@@ -190,9 +224,8 @@ enumerate_root() {
       A_NEW["$wg"]=$(( ${A_NEW[$wg]:-0} + 1 ))
       A_NEW_BYTES["$wg"]=$(( ${A_NEW_BYTES[$wg]:-0} + fsize ))
     fi
-  done < <(find "$root" -mindepth 1 \
-             \( -type d \( "${prune[@]}" \) -prune \) \
-             -o \( \( -type f -o -type l \) \( "${match[@]}" \) -printf '%y\t%s\t%p\0' \) | sort -z -t $'\t' -k3)
+  done < <(sort -z -t $'\t' -k3 "$list")
+  rm -f "$list"
 }
 
 for r in "${INCLUDE_ROOTS[@]}"; do enumerate_root "$r"; done
@@ -209,26 +242,11 @@ if [[ $DRY_RUN -eq 1 ]]; then
     tn=$((tn + ${A_NEW[$w]:-0})); tnb=$((tnb + ${A_NEW_BYTES[$w]:-0}))
   done < <(printf '%s\n' "${!WGS[@]}" | sort)
   printf 'TOTAL\t%d\t%d\t%d\t%d\t%d\n' "$tt" "$tf" "$tb" "$tn" "$tnb"
-  printf 'skipped: oversize=%d excluded=%d refused=%d\n' "$oversize" "$excluded" "$refused"
-  [[ $refused -gt 0 ]] && exit 1
+  printf 'skipped: oversize=%d excluded=%d refused=%d incomplete_roots=%d\n' \
+    "$oversize" "$excluded" "$refused" "$enum_failed"
+  [[ $refused -gt 0 || $enum_failed -gt 0 ]] && exit 1
   exit 0
 fi
-
-# No default: trunk carries no install-specific folder name. Set it in the
-# unit's Environment=. Unset is a loud failure, not a silent publish to a
-# wrong or newly-created folder.
-ROOT_NAME="${DRIVE_ROOT_NAME:?DRIVE_ROOT_NAME must be set (the Drive root folder name)}"
-# Explicit named account on every call. The bare default credential slot
-# (~/.config/gws/credentials.enc) is deliberately NOT used.
-export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-/home/ubuntu/.config/gws/accounts/primary.json}"
-
-# --- run lock ---------------------------------------------------------------
-# A cold run over a large allowlist can take hours; a second run must never
-# overlap it (two writers would race on the state file and on folder creation,
-# and duplicate files on Drive). flock is released by the kernel when the
-# process dies, so a crash never leaves a stale lock.
-exec 9>>"$STATE.lock" || { log "FATAL cannot open lock $STATE.lock"; exit 1; }
-if ! flock -n 9; then log "SKIP another publisher run holds $STATE.lock; not overlapping it"; exit 0; fi
 
 # Host-private staging dir: every upload is a snapshot taken here, never a
 # path inside the agent-writable tree. gws refuses `--upload` for any path
@@ -310,12 +328,16 @@ SET=("${TRACKED[@]}" "${ALLOW[@]}")
 
 # --- one-way deletion policy: log, never delete -------------------------
 for p in "${SET[@]}"; do LIVE["$p"]=1; done
-LIVE_READY=1
-for p in "${!OLD_ID[@]}"; do
-  if [[ -z "${LIVE[$p]:-}" ]]; then
-    log "WOULD-REMOVE $p (Drive id ${OLD_ID[$p]}) — left in place by policy"
-  fi
-done
+# Only a complete enumeration can say a file is gone. After a partial one,
+# every previous row stays in state and nothing is reported as removed.
+if [[ $enum_failed -eq 0 ]]; then
+  LIVE_READY=1
+  for p in "${!OLD_ID[@]}"; do
+    if [[ -z "${LIVE[$p]:-}" ]]; then
+      log "WOULD-REMOVE $p (Drive id ${OLD_ID[$p]}) — left in place by policy"
+    fi
+  done
+fi
 
 # Every directory that holds a published file, plus all its ancestors,
 # shortest first so a parent is always resolved before its children. awk over
@@ -411,7 +433,7 @@ for rel in "${SET[@]}"; do
 done
 
 summary="done: added=$added updated=$updated skipped=$skipped failed=$failed refused=$refused folders_created=$folders_made tracked=${#TRACKED[@]}"
-if [[ -n "$CONFIG" ]]; then summary+=" allowlisted=${#ALLOW[@]} oversize=$oversize excluded=$excluded"; fi
+if [[ -n "$CONFIG" ]]; then summary+=" allowlisted=${#ALLOW[@]} oversize=$oversize excluded=$excluded incomplete_roots=$enum_failed"; fi
 log "$summary"
-if [[ $failed -gt 0 || $refused -gt 0 ]]; then exit 1; fi
+if [[ $failed -gt 0 || $refused -gt 0 || $enum_failed -gt 0 ]]; then exit 1; fi
 exit 0

@@ -370,6 +370,32 @@ describe('publish-workgroups-drive.sh', () => {
       expect(statePaths(f)).toEqual(['wg1/records/board.md']);
     });
 
+    it('fails, keeping every state row, when an include root cannot be fully enumerated', () => {
+      const f = fixture(
+        { 'wg1/records/board.md': 'board' },
+        { 'wg1/artifacts/a.md': 'a', 'wg1/artifacts/sub/b.md': 'b' },
+      );
+      config(f);
+      expect(run(f).status).toBe(0);
+      expect(statePaths(f)).toEqual(['wg1/artifacts/a.md', 'wg1/artifacts/sub/b.md', 'wg1/records/board.md']);
+
+      const sub = path.join(f.repo, 'wg1/artifacts/sub');
+      fs.chmodSync(sub, 0o000);
+      try {
+        const r = run(f);
+        expect(r.status).toBe(1);
+        expect(r.stderr).toMatch(/ERROR enumeration of wg1\/artifacts incomplete/);
+        expect(r.stderr).not.toMatch(/WOULD-REMOVE/);
+        expect(statePaths(f)).toEqual(['wg1/artifacts/a.md', 'wg1/artifacts/sub/b.md', 'wg1/records/board.md']);
+
+        const dry = run(f, {}, ['--dry-run']);
+        expect(dry.status).toBe(1);
+        expect(dry.stdout).toMatch(/incomplete_roots=1/);
+      } finally {
+        fs.chmodSync(sub, 0o755);
+      }
+    });
+
     it('never follows a symlink out of the tree', () => {
       const f = fixture({ 'wg1/records/board.md': 'board' }, { 'wg1/artifacts/ok.pdf': 'ok' });
       fs.symlinkSync(path.join(f.outside, 'secret.pdf'), path.join(f.repo, 'wg1/artifacts/leak.pdf'));
@@ -488,7 +514,7 @@ describe('publish-workgroups-drive.sh', () => {
         'wg1\t1\t2\t12\t1\t5',
         'wg2\t0\t1\t3\t1\t3',
         'TOTAL\t1\t3\t15\t2\t8',
-        'skipped: oversize=0 excluded=0 refused=0',
+        'skipped: oversize=0 excluded=0 refused=0 incomplete_roots=0',
         '',
       ]);
       expect(r.calls).toBe('');
@@ -499,6 +525,11 @@ describe('publish-workgroups-drive.sh', () => {
     it('does not overlap a run that holds the lock', () => {
       const f = fixture({ 'wg1/records/board.md': 'board' }, { 'wg1/artifacts/deck.pdf': 'deck' });
       config(f);
+      // Enumeration logs this symlink; its absence shows the lock is taken
+      // before state is read or the tree is enumerated.
+      fs.symlinkSync(path.join(f.outside, 'secret.pdf'), path.join(f.repo, 'wg1/artifacts/leak.pdf'));
+      const seeded = 'F\twg1/records/board.md\tsha\tid-board\n';
+      fs.writeFileSync(f.state, seeded);
 
       // flock(1) holds the lock on its own open of the file while the
       // publisher runs underneath it; the publisher's open is a second one.
@@ -506,8 +537,9 @@ describe('publish-workgroups-drive.sh', () => {
 
       expect(r.status, r.stderr).toBe(0);
       expect(r.stderr).toMatch(/SKIP another publisher run holds/);
+      expect(r.stderr).not.toMatch(/SKIP symlink/);
       expect(r.calls).toBe('');
-      expect(fs.existsSync(f.state)).toBe(false);
+      expect(fs.readFileSync(f.state, 'utf8')).toBe(seeded);
     });
 
     it('resumes an interrupted run without re-uploading finished files or losing unreached rows', () => {
