@@ -12,7 +12,8 @@
  * `spawn_task` never fires. `getOrphanedTasks()` therefore returns nothing in
  * production, and T6 is a no-op.
  * Do not re-enable anything here — restoring the capability is a decision
- * made elsewhere (grantCapability()), not a side effect of this module.
+ * made elsewhere, and needs a task reaper this module no longer has (see
+ * src/modules/orchestrator-dispatch/index.ts).
  *
  * T14's own body lives in a sibling file (auto-archive.ts) rather than here,
  * so the acceptance-case suite can import it directly without pulling in this
