@@ -69,6 +69,33 @@ provider sibling receives the same access at its next spawn. See
 [Cross-workgroup read access](workgroup-read-access.md) for the policy schema,
 mounted paths, activation, and rollback.
 
+## Read-only workgroup paths
+
+With the shared filesystem on, the workgroup tree is mounted read-write into
+every sibling, so anything the host runs from inside it (a systemd unit's
+script, a host-gated task script) is editable by every agent in the
+workgroup. Declare such a subpath in `data/workgroup-readonly-paths.json`:
+
+```json
+{ "version": 1, "workgroups": { "<workgroup-id>": ["<relative/subpath>"] } }
+```
+
+At its next spawn, every container that mounts the path writable gets it
+bound read-only on top instead: agents can still read and run it, and only a
+host session can change it. Each directory between the writable mount and
+the declared path is also bound onto itself, because a plain nested bind can
+be defeated by renaming its parent directory away from inside the container.
+A declared path that does not exist is skipped, so create it on the host
+before declaring it: until a container spawns with the bind, that container
+can write there. A declared path that cannot be resolved to itself (a
+permission error, a symlink loop, or a symlink on the way) does not fail the
+spawn: that workgroup's writable mounts are mounted read-only instead, with an
+error in the log, and other workgroups are unaffected. A malformed file aborts
+the spawn. The bind protects names, not inodes: a hard link or an outward
+symlink under the path, made while it was still writable, is logged at error
+level on every spawn and must be removed by an operator. Removing an entry and respawning restores write access. See
+`src/workgroup-readonly-paths.ts`.
+
 ## Workgroup wiki
 
 A workgroup can keep a domain wiki for its agents to read. When the host has a

@@ -1973,6 +1973,100 @@ describe('symlink overlay workgroup allowlist', async () => {
   });
 });
 
+describe('workgroup read-only paths', async () => {
+  function writeReadonlyPolicy(workgroups: Record<string, string[]>): void {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(DATA_DIR, 'workgroup-readonly-paths.json'), JSON.stringify({ version: 1, workgroups }));
+  }
+
+  // The `.migrated` marker turns on the read-write workgroup mount without the
+  // global shared-FS flag, which this file's config mock leaves off.
+  async function workgroupMember(id: string, workgroupId: string, sharedFs: boolean): Promise<AgentGroup> {
+    const ag = group(id, id);
+    await createAgentGroup(ag);
+    assignWorkgroup(ag, workgroupId);
+    await ensureContainerConfig(ag.id);
+    const wgRoot = path.join(DATA_DIR, 'workgroups', workgroupId);
+    fs.mkdirSync(path.join(wgRoot, 'releases', 'ops'), { recursive: true });
+    if (sharedFs) fs.writeFileSync(path.join(wgRoot, '.migrated'), '');
+    return ag;
+  }
+
+  const shape = (mounts: Awaited<ReturnType<typeof buildMounts>>) =>
+    mounts.map((m) => `${m.containerPath}:${m.readonly ? 'ro' : 'rw'}`);
+
+  it('binds a declared subpath read-only after the read-write workgroup mount, pinning its parent', async () => {
+    const ag = await workgroupMember('ag-ro-declared', 'wg-ro', true);
+    writeReadonlyPolicy({ 'wg-ro': ['releases/ops'] });
+    const wgRoot = fs.realpathSync(path.join(DATA_DIR, 'workgroups', 'wg-ro'));
+
+    const mounts = await buildMounts(ag, session('s-ro-declared', ag.id), containerConfig(), 'claude', {}, 'wg-ro');
+
+    const parent = mounts.findIndex((m) => m.containerPath === '/workspace/workgroup');
+    const pin = mounts.findIndex((m) => m.containerPath === '/workspace/workgroup/releases');
+    const overlay = mounts.findIndex((m) => m.containerPath === '/workspace/workgroup/releases/ops');
+    expect(parent).toBeGreaterThanOrEqual(0);
+    expect(mounts[parent].readonly).toBe(false);
+    expect(pin).toBeGreaterThan(parent);
+    expect(mounts[pin]).toMatchObject({ hostPath: path.join(wgRoot, 'releases'), readonly: false });
+    expect(overlay).toBeGreaterThan(pin);
+    expect(mounts[overlay]).toMatchObject({ hostPath: path.join(wgRoot, 'releases', 'ops'), readonly: true });
+  });
+
+  it('leaves a workgroup that declares nothing unchanged', async () => {
+    const ag = await workgroupMember('ag-ro-silent', 'wg-silent', true);
+    const before = shape(
+      await buildMounts(ag, session('s-ro-silent', ag.id), containerConfig(), 'claude', {}, 'wg-silent'),
+    );
+    writeReadonlyPolicy({ 'wg-elsewhere': ['releases/ops'] });
+    const after = shape(
+      await buildMounts(ag, session('s-ro-silent', ag.id), containerConfig(), 'claude', {}, 'wg-silent'),
+    );
+
+    expect(after).toEqual(before);
+    expect(after).toContain('/workspace/workgroup:rw');
+  });
+
+  it('adds nothing in memory-only mode, where the workgroup tree is not mounted', async () => {
+    const ag = await workgroupMember('ag-ro-memonly', 'wg-memonly', false);
+    writeReadonlyPolicy({ 'wg-memonly': ['releases/ops'] });
+
+    const mounts = shape(
+      await buildMounts(ag, session('s-ro-memonly', ag.id), containerConfig(), 'claude', {}, 'wg-memonly'),
+    );
+
+    expect(mounts).not.toContain('/workspace/workgroup:rw');
+    expect(mounts.some((m) => m.startsWith('/workspace/workgroup/releases'))).toBe(false);
+  });
+
+  it('skips a declared subpath that does not exist', async () => {
+    const ag = await workgroupMember('ag-ro-missing', 'wg-missing', true);
+    writeReadonlyPolicy({ 'wg-missing': ['releases/not-there'] });
+
+    const mounts = shape(
+      await buildMounts(ag, session('s-ro-missing', ag.id), containerConfig(), 'claude', {}, 'wg-missing'),
+    );
+
+    expect(mounts).toContain('/workspace/workgroup:rw');
+    expect(mounts.some((m) => m.startsWith('/workspace/workgroup/releases'))).toBe(false);
+  });
+
+  it('protects the subpath behind a group-dir symlink into the workgroup tree too', async () => {
+    const ag = await workgroupMember('ag-ro-link', 'wg-link', true);
+    writeReadonlyPolicy({ 'wg-link': ['releases/ops'] });
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.symlinkSync(path.join(DATA_DIR, 'workgroups', 'wg-link', 'releases'), path.join(groupDir, 'rel'));
+
+    const mounts = shape(
+      await buildMounts(ag, session('s-ro-link', ag.id), containerConfig(), 'claude', {}, 'wg-link'),
+    );
+
+    expect(mounts).toContain('/workspace/agent/rel:rw');
+    expect(mounts).toContain('/workspace/agent/rel/ops:ro');
+  });
+});
+
 // H-9 (docs/specs/upstream-mailbox-seam/plan.md §8): the spawn path
 // materializes the runner's startup context and bind-mounts it read-only.
 // spawnContainer runs writeSessionContext just after writeSessionRouting and
