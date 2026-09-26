@@ -119,6 +119,8 @@ const GENERIC_REPOSITORY_WORDS = new Set([
   'server',
   'service',
   'services',
+  'sandbox',
+  'scratch',
   'site',
   'snowflake',
   'stage',
@@ -528,7 +530,12 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
         continue;
       }
       const parsed = lines[0] ? remoteOwnerRepo(lines[0]) : null;
-      if (!parsed) continue;
+      // A local-only canonical (no origin, or one naming no owner/repo) is
+      // still named by its canonical directory.
+      if (!parsed) {
+        if (!isGenericRepositoryName(name)) addIdentifier(identifiers, name);
+        continue;
+      }
       if (!remotes.owners.has(parsed.owner.toLowerCase())) addIdentifier(identifiers, parsed.owner);
       if (!remotes.repositories.has(repositoryKey(parsed)) && !isGenericRepositoryName(parsed.repo))
         addIdentifier(identifiers, parsed.repo);
@@ -811,6 +818,8 @@ export interface BaselineOutcome {
   below: string[];
   /** Raw private-identifier line counts per file, before the baseline. */
   counts: Record<string, number>;
+  /** The scanned tree carries no committed baseline, so nothing was held. */
+  missing: boolean;
 }
 
 export function parseBaseline(text: string): Baseline {
@@ -871,41 +880,13 @@ function readWorktreeBaseline(root: string): string | null {
   }
 }
 
-function branchHistoryHasBaseline(root: string): boolean {
-  const env = repositoryNeutralEnv();
-  const head = runGit(['rev-parse', '--verify', '--quiet', 'HEAD'], root, env);
-  if (head.status === 1) return false;
-  if (head.status !== 0) throw new Error('public boundary baseline history could not be read');
-  const touched = runGit(['rev-list', '-1', 'HEAD', '--', DEFAULT_BASELINE_RELATIVE], root, env);
-  if (touched.status !== 0) throw new Error('public boundary baseline history could not be read');
-  return touched.stdout.trim() !== '';
-}
-
-// The one authoritative merged copy. origin/HEAD is set at clone time and
-// can name an older default branch still holding a higher, pre-ratchet count.
-const MERGED_BASELINE_REF = 'refs/remotes/origin/main';
-
-// Only a committed, merged revision: a working copy or unpushed commit
-// anywhere on the host must not be able to exempt what this branch publishes.
-function readMergedBaseline(root: string): string | null {
-  const env = repositoryNeutralEnv();
-  const resolved = runGit(['rev-parse', '--verify', '--quiet', `${MERGED_BASELINE_REF}^{commit}`], root, env);
-  if (resolved.status === 1) return null;
-  if (resolved.status !== 0) throw new Error('public boundary merged baseline could not be resolved');
-  const listed = runGit(['ls-tree', resolved.stdout.trim(), '--', DEFAULT_BASELINE_RELATIVE], root, env);
-  if (listed.status !== 0) throw new Error('public boundary merged baseline could not be read');
-  const objectId = /^\d+ blob ([0-9a-f]+)\t/m.exec(listed.stdout)?.[1];
-  return objectId ? readBlob(root, objectId, env) : null;
-}
-
 /**
  * Explicit --baseline wins and must exist. Otherwise the scanned tree's own
  * copy (its index for an index scan, since that is what will be committed).
- * A branch whose history carried the file and no longer does gets an empty
- * baseline: deleting it removes its exemptions. A branch cut before the file
- * existed inherits the copy merged on origin/main. Anything else holds nothing.
+ * A tree without one borrows nothing — no other branch, ref or working copy
+ * is authoritative for it — so every private-identifier line it holds fails.
  */
-function loadBaseline(options: ScanOptions): Baseline {
+function loadBaseline(options: ScanOptions): Baseline | null {
   if (options.baselinePath) {
     let text: string;
     try {
@@ -916,10 +897,7 @@ function loadBaseline(options: ScanOptions): Baseline {
     return parseBaseline(text);
   }
   const own = options.index ? readIndexBaseline(options.root) : readWorktreeBaseline(options.root);
-  if (own !== null) return parseBaseline(own);
-  if (branchHistoryHasBaseline(options.root)) return { files: {} };
-  const merged = readMergedBaseline(options.root);
-  return merged !== null ? parseBaseline(merged) : { files: {} };
+  return own === null ? null : parseBaseline(own);
 }
 
 export function applyBaseline(
@@ -931,7 +909,7 @@ export function applyBaseline(
   for (const finding of findings) {
     if (finding.category === 'private-identifier') counts[finding.file] = (counts[finding.file] ?? 0) + 1;
   }
-  const outcome: BaselineOutcome = { held: 0, heldFiles: 0, exceeded: [], below: [], counts };
+  const outcome: BaselineOutcome = { held: 0, heldFiles: 0, exceeded: [], below: [], counts, missing: false };
   const heldFiles = new Set<string>();
   for (const [file, count] of Object.entries(counts)) {
     const recorded = Object.hasOwn(baseline.files, file) ? baseline.files[file] : 0;
@@ -955,7 +933,14 @@ export function applyBaseline(
   };
 }
 
-const EMPTY_BASELINE_OUTCOME: BaselineOutcome = { held: 0, heldFiles: 0, exceeded: [], below: [], counts: {} };
+const EMPTY_BASELINE_OUTCOME: BaselineOutcome = {
+  held: 0,
+  heldFiles: 0,
+  exceeded: [],
+  below: [],
+  counts: {},
+  missing: false,
+};
 
 /**
  * Git only strips `#` lines on the EDITOR path.
@@ -1107,7 +1092,9 @@ export function runReport(options: ScanOptions): RunReport {
     return { ...base, findings, baseline: EMPTY_BASELINE_OUTCOME };
   }
   const scanned = scanInputs(trackedInputs(options.root, options.index), privateIdentifiers, allowlist);
-  const { findings, outcome } = applyBaseline(scanned, loadBaseline(options));
+  const baseline = loadBaseline(options);
+  const { findings, outcome } = applyBaseline(scanned, baseline ?? { files: {} });
+  outcome.missing = baseline === null;
   return { ...base, findings, baseline: outcome };
 }
 
@@ -1128,7 +1115,7 @@ export function writeBaseline(options: ScanOptions): { written: string; refused:
     );
   }
   const target = options.baselinePath ?? path.join(options.root, DEFAULT_BASELINE_RELATIVE);
-  const recorded = loadBaseline(options).files;
+  const recorded = loadBaseline(options)?.files ?? {};
   const next: Record<string, number> = {};
   const refused: string[] = [];
   for (const [file, count] of Object.entries(report.baseline.counts)) {
@@ -1231,6 +1218,11 @@ export function main(argv = process.argv.slice(2)): number {
       if (recorded > 0) {
         process.stderr.write(`${file}: ${count} private-identifier line(s), above its baseline of ${recorded}\n`);
       }
+    }
+    if (report.baseline.missing && exceeded.length > 0) {
+      process.stderr.write(
+        `this tree has no committed ${DEFAULT_BASELINE_RELATIVE}, so no pre-existing line is held; a branch cut before it landed must rebase onto origin/main\n`,
+      );
     }
     process.stderr.write(`public boundary check failed with ${findings.length} redacted finding(s) (${surface})\n`);
     return 1;

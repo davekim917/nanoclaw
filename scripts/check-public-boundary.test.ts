@@ -741,6 +741,20 @@ describe('identifiers derived from the install', () => {
     expect(problems).toEqual([]);
   });
 
+  it('names a local-only canonical by its directory when it has no usable origin', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    for (const name of ['SecretScratch', 'scratch', 'MirrorOnly']) {
+      execFileSync('git', ['init', '-q', path.join(dataDir, 'repositories', 'wg-fictional', name)]);
+    }
+    execFileSync('git', ['remote', 'add', 'origin', '/srv/mirrors/widget.git'], {
+      cwd: path.join(dataDir, 'repositories', 'wg-fictional', 'MirrorOnly'),
+    });
+    const problems: string[] = [];
+    expect(loadInstallIdentifiers(dbPath, publicProject, problems)).toEqual(new Set(['SecretScratch', 'MirrorOnly']));
+    expect(problems).toEqual([]);
+  });
+
   it('exempts only the exact public repository, not every repository its owner holds', () => {
     const dataDir = path.join(tempRoot(), 'data');
     const dbPath = writeRegistry(dataDir);
@@ -977,44 +991,28 @@ describe('baseline ratchet', () => {
     expect(run(resolveOptions(['--root', root], root))).toEqual([]);
   });
 
-  function predatingWorktree(mainRoot: string): string {
+  it('borrows no baseline for a tree without one, and names the rebase remedy', () => {
+    const mainRoot = baselineRepo();
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: mainRoot });
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/HEAD', 'HEAD'], { cwd: mainRoot });
     const worktreeRoot = tempRoot();
     execFileSync('git', ['worktree', 'add', '--detach', '-q', worktreeRoot, 'HEAD~1'], { cwd: mainRoot });
     fs.writeFileSync(path.join(worktreeRoot, 'old.md'), 'Fictional Registry House\n');
     execFileSync('git', ['add', 'old.md'], { cwd: worktreeRoot });
-    return worktreeRoot;
-  }
+    const report = runReport(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot));
+    expect(report.findings).toEqual([{ file: 'old.md', line: 1, category: 'private-identifier' }]);
+    expect(report.baseline.missing).toBe(true);
 
-  it('gives a branch that predates the file the baseline merged on origin', () => {
-    const mainRoot = baselineRepo();
-    const worktreeRoot = predatingWorktree(mainRoot);
-    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(1);
-    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: mainRoot });
-    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toEqual([]);
-  });
-
-  it('takes the merged baseline from origin/main only, never a stale origin/HEAD', () => {
-    const mainRoot = baselineRepo();
-    const worktreeRoot = predatingWorktree(mainRoot);
-    fs.writeFileSync(path.join(worktreeRoot, 'old.md'), 'Fictional Registry House\nFictional Local Team\n');
-    execFileSync('git', ['add', 'old.md'], { cwd: worktreeRoot });
-    fs.writeFileSync(path.join(mainRoot, '.public-boundary-baseline.json'), '{"files":{"old.md":1}}\n');
-    execFileSync('git', ['commit', '-q', '-am', 'ratchet down'], { cwd: mainRoot });
-    execFileSync('git', ['update-ref', 'refs/remotes/origin/stale', 'HEAD~1'], { cwd: mainRoot });
-    execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/stale'], { cwd: mainRoot });
-    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(2);
-    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: mainRoot });
-    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(2);
-    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD~1'], { cwd: mainRoot });
-    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toEqual([]);
-  });
-
-  it('never takes a predating branch baseline from a working copy or an unmerged commit', () => {
-    const mainRoot = baselineRepo();
-    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD~1'], { cwd: mainRoot });
-    const worktreeRoot = predatingWorktree(mainRoot);
-    fs.writeFileSync(path.join(mainRoot, '.public-boundary-baseline.json'), '{"files":{"old.md":9}}\n');
-    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(1);
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    expect(main(['--root', worktreeRoot, '--index'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain('must rebase onto origin/main');
+    stderr.mockClear();
+    expect(main(['--root', mainRoot, '--index'])).toBe(0);
+    fs.appendFileSync(path.join(mainRoot, 'old.md'), 'Fictional Local Team\n');
+    execFileSync('git', ['add', 'old.md'], { cwd: mainRoot });
+    expect(main(['--root', mainRoot, '--index'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).not.toContain('rebase onto origin/main');
   });
 
   it('holds nothing once a branch deletes the baseline it carried, staged or committed', () => {
