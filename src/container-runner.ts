@@ -5113,8 +5113,10 @@ export async function buildMounts(
     logSpawnStage('mount-allowlist', mountAllowlistStartedAt);
     for (const mount of validated) {
       if (!workgroupReadAccess || !isWorkgroupReadAccessNamespace(mount.containerPath)) {
-        // An operator mount names a host path production may share.
-        mounts.push(isShadowHost() ? { ...mount, readonly: true } : mount);
+        // An operator mount names a host path production may share, and a
+        // read-only bind still lets a container connect to a socket under it
+        // (production's `ncl` socket among them), so a shadow withholds it.
+        if (!isShadowHost()) mounts.push(mount);
         continue;
       }
       if (isDuplicateWorkgroupReadAccessMount(mount, validatedWorkgroupReadAccess)) {

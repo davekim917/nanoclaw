@@ -2169,10 +2169,10 @@ describe('buildMounts on a shadow host', () => {
     expect(mounts.find((m) => m.hostPath === shared)?.readonly).toBe(false);
   });
 
-  it('withholds every host credential mount and forces operator mounts read-only on a shadow host', async () => {
+  it('withholds every host credential mount and every operator mount on a shadow host', async () => {
     shadowState.on = true;
     const { mounts, fakeHome, shared } = await mountsWithHostCredentials('shadow-on');
     expect(credentialMounts(mounts, fakeHome)).toEqual([]);
-    expect(mounts.find((m) => m.hostPath === shared)?.readonly).toBe(true);
+    expect(mounts.find((m) => m.hostPath === shared)).toBeUndefined();
   });
 });

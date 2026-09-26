@@ -52,8 +52,8 @@ export function isShadowHost(): boolean {
 const SHADOW_MODE_SUMMARY =
   'Shadow host mode: environment, host modules, sweep duties, channels (CLI only), providers (Claude ' +
   'only), ncl commands, delivery actions and approval replays are allowlisted; container image builds, ' +
-  'docker image/build-cache cleanup, host-side task scripts and host credential mounts are disabled; ' +
-  'operator mounts forced read-only; OneCLI agents, TMPDIR and the dashboard cookie are namespaced to ' +
+  'docker image/build-cache cleanup, host-side task scripts, host credential mounts and operator mounts ' +
+  'are disabled; OneCLI agents, TMPDIR and the dashboard cookie are namespaced to ' +
   'this checkout; webhook server bound to 127.0.0.1; docker networks inspected, never changed; only ' +
   'shadow-labelled containers adopted';
 
