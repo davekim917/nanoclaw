@@ -3880,16 +3880,6 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
 }
 
 /**
- * One chat line, once per cooldown, when a stored model pin is being ignored
- * because it belongs to another provider (`applyFlagBatch`). The pin itself
- * stays in session_state. What happens next depends on WHY the provider
- * differs: under a spawn-time fallback (`fallbackActive`, the host's
- * NANOCLAW_PROVIDER_FALLBACK_APPLIED marker, read in config.ts) the primary comes
- * back on its own and the pin applies again; after a deliberate provider
- * migration the new provider IS the primary, nothing reverts, and the user
- * has to re-pin or clear it.
- */
-/**
  * The last row in the batch whose flag the host acked in chat. Only the
  * router's typed-flag path stamps `flagAck`; support-thread and task rows
  * carry flagIntent without one, and nobody was told anything about those.
@@ -3910,6 +3900,16 @@ export function queuedSettingsNotice(ack: string): string {
   return `${ack} is queued until the current task finishes. Messages you send before then are read when it does.`;
 }
 
+/**
+ * One chat line, once per cooldown, when a stored model pin is being ignored
+ * because it belongs to another provider (`applyFlagBatch`). The pin itself
+ * stays in session_state. What happens next depends on WHY the provider
+ * differs: under a spawn-time fallback (`fallbackActive`, the host's
+ * NANOCLAW_PROVIDER_FALLBACK_APPLIED marker, read in config.ts) the primary comes
+ * back on its own and the pin applies again; after a deliberate provider
+ * migration the new provider IS the primary, nothing reverts, and the user
+ * has to re-pin or clear it.
+ */
 export async function noteIgnoredModel(
   model: string,
   providerName: string,
