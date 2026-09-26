@@ -79,13 +79,11 @@ import {
   listLiveOneOffTaskRows,
   listLiveTaskRows,
   listLiveTaskRowsForSeries,
-  listOutboundSystemMessages,
   listOutboundTail,
   listProcessingClaimedMessageIds,
   listRecentTaskFires,
   listTurnUsageSince,
   type MessageTailRow,
-  type OutboundSystemRow,
   type ScheduledTaskRow,
   type SessionTurnUsageRow,
   type TaskDeliveryRoute,
@@ -175,7 +173,6 @@ export interface OutboundSessionRead {
   listProcessingClaimedMessageIds(): string[];
   hasWorkContinuation(): boolean;
   latestReplyTimestampByTrigger(): Map<string, string>;
-  listOutboundSystemMessages(): OutboundSystemRow[];
   listTurnUsageSince(afterId: number): SessionTurnUsageRow[];
   listOutboundTail(limit: number): MessageTailRow[];
 }
@@ -319,7 +316,6 @@ export function readSessionOutbound<T>(
       listProcessingClaimedMessageIds: () => listProcessingClaimedMessageIds(db),
       hasWorkContinuation: () => hasWorkContinuation(db),
       latestReplyTimestampByTrigger: () => latestReplyTimestampByTrigger(db),
-      listOutboundSystemMessages: () => listOutboundSystemMessages(db),
       listTurnUsageSince: (afterId) => listTurnUsageSince(db, afterId),
       listOutboundTail: (limit) => listOutboundTail(db, limit),
     });
