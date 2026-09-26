@@ -117,8 +117,17 @@ fire() { # [env assignments...]
   ELAPSED=$(( $(date +%s) - s ))
   [ "$rc" = 0 ] || fail "wrapper exited $rc (must always be 0): $(tail -5 "$T/stderr")"
   [ "$(printf '%s\n' "$OUTPUT" | wc -l)" = 1 ] || fail "stdout must be exactly one line, got: $OUTPUT"
-  printf '%s\n' "$OUTPUT" | jq -e '(keys == ["data","wakeAgent"]) and (.wakeAgent | type == "boolean") and (.data | type == "object")' \
-    >/dev/null || fail "last line is not {wakeAgent:<bool>,data:{...}}: $OUTPUT"
+  # A wake is {wakeAgent,data}; a no-wake also declares its observation (W2).
+  printf '%s\n' "$OUTPUT" | jq -e '(.wakeAgent | type == "boolean") and (.data | type == "object")
+      and (if .wakeAgent then keys == ["data","wakeAgent"]
+           else keys == ["data","observation","wakeAgent"] and .observation.bound == "30m"
+                and (.observation.kind | IN("empty","blocked")) end)' \
+    >/dev/null || fail "last line is not {wakeAgent:<bool>,data:{...}} (+observation when quiet): $OUTPUT"
+  if [ "$(jq -r .wakeAgent <<<"$OUTPUT")" = false ]; then
+    python3 -c 'import json,sys; sys.path.insert(0, sys.argv[2]); import task_observation as t
+sys.exit(0 if t.observation_problem(json.loads(sys.argv[1])["observation"]) is None else 1)' \
+      "$OUTPUT" "$SCRIPT_DIR/../../task-observation" || fail "the declared observation is not valid: $OUTPUT"
+  fi
   WAKE="$(jq -r .wakeAgent <<<"$OUTPUT")"
   DATA="$(jq -c .data <<<"$OUTPUT")"
 }
@@ -972,6 +981,8 @@ SH
 chmod +x "$C/bin/ncl"
 fire "PATH=$C/bin:$PATH" "SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$C/owner-cutover.json"
 [ "$WAKE" = false ] && [ "$(d .failureDispatch.admission)" = inserted ] || fail "failure was not admitted quietly: $OUTPUT"
+jq -e '.observation.kind == "blocked" and (.observation.evidence.failure | length) > 0' <<<"$OUTPUT" >/dev/null \
+  || fail "an admitted failure must be declared blocked, never empty: $OUTPUT"
 fire "PATH=$C/bin:$PATH" "SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$C/owner-cutover.json"
 [ "$WAKE" = false ] && [ "$(d .failureDispatch.admission)" = replay ] || fail "same failure must replay: $OUTPUT"
 [ "$(jq length "$C/fake/failure-dispatch.json")" = 1 ] || fail "repeated failure made another event"

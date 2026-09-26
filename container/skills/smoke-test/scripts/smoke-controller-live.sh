@@ -147,13 +147,33 @@ fail_json() { # <slug> <detail> -- a failure line built with NO tool but bash
     "$(jesc "${ALARM_TEXT//\{slug\}/$1}")"
 }
 
+# A fire that does not wake declares its observation through the
+# task-observation helper (W2), bound 30m (three */10 fires): a completed step
+# or the kill switch being off is empty; a failure handed to its isolated owner
+# is blocked, so a controller that keeps failing reaches the operator. A wake
+# line is printed unchanged.
+OBS_HELPER="${SMOKE_OBSERVATION_HELPER:-$SCRIPT_DIR/../../task-observation/task_observation.py}"
+declare_line() { # <line>
+  local line="$1" data kind
+  # Matched as text first: a failure wake built without jq must still go out with no jq.
+  case "$line" in '{"wakeAgent":'true*) printf '%s\n' "$line"; return 0 ;; esac
+  if jq -e '.wakeAgent == true' <<<"$line" >/dev/null 2>&1; then printf '%s\n' "$line"; return 0; fi
+  data="$(jq -c '.data' <<<"$line" 2>/dev/null)" || return 1
+  kind=empty
+  jq -e '(.failure | type) == "string" and (.failure | length) > 0' <<<"$data" >/dev/null 2>&1 && kind=blocked
+  python3 "$OBS_HELPER" --kind "$kind" --bound 30m --data "$data" --evidence-json "$(jq -c '
+    {failure, detail, failureDispatch, stepped, skipped, mode, runs, decisions, alarmsQueued}
+    | with_entries(select(.value != null))' <<<"$data")"
+}
 emit_line() { # failed admission exits nonzero into the existing script backoff
+  local out
   if [ -n "${SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON:-}" ]; then
-    printf '%s\n' "$1" | timeout -k 1 6 python3 "$SCRIPT_DIR/smoke-controller-failure-dispatch.py" \
-      --cutover "$SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON"
+    out="$(printf '%s\n' "$1" | timeout -k 1 6 python3 "$SCRIPT_DIR/smoke-controller-failure-dispatch.py" \
+      --cutover "$SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON")" || return $?
   else
-    printf '%s\n' "$1"
+    out="$1"
   fi
+  declare_line "$(printf '%s\n' "$out" | tail -n 1)"
 }
 
 final() { # <data-json> -- the only write to the runner's stdout
