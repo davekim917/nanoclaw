@@ -155,7 +155,7 @@ risk:high:
     # either mounts a stale or tampered hook, or silently drops the scan for a wiki repo
     - 'src/managed-git-hooks.ts'
     # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
-    # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
+    # checkers, allowlist and baseline, and the PR review loop that IS the review gate. CI runs
     # only the portable boundary mode, so the strict identifier check runs only in the
     # hooks and the daily remote scan.
     - '.github/**'
@@ -163,6 +163,7 @@ risk:high:
     - 'scripts/check-public-boundary.ts'
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
+    - '.public-boundary-baseline.json'
     - 'container/skills/pr-review-loop/**'
     # The hygiene checker and the only files that may exempt anything from it
     - 'scripts/hygiene/**'
@@ -336,6 +337,7 @@ risk:gates:
     - 'scripts/check-public-boundary.ts'
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
+    - '.public-boundary-baseline.json'
     - 'container/skills/pr-review-loop/**'
     - 'scripts/hygiene/**'
     - 'knip.json'

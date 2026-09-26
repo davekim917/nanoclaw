@@ -8,7 +8,7 @@
  *
  * Findings intentionally omit the matched value.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -65,10 +65,113 @@ export interface ScanOptions {
   // A committed message is serialized history, not an editor buffer. Unlike
   // the commit-msg input, its scissors and comment text must be scanned.
   messageRaw: boolean;
+  baselinePath?: string;
+  writeBaseline: boolean;
+  acceptGrowth: boolean;
 }
 
 const DEFAULT_DB_RELATIVE = path.join('data', 'v2.db');
 const DEFAULT_IDENTIFIERS_RELATIVE = path.join('.nanoclaw', 'public-boundary-identifiers');
+const DEFAULT_BASELINE_RELATIVE = '.public-boundary-baseline.json';
+
+// A repository name built only from these words names a kind of repository,
+// not a client, and would match ordinary prose across the whole tree.
+const GENERIC_REPOSITORY_WORDS = new Set([
+  'admin',
+  'agent',
+  'analytics',
+  'android',
+  'api',
+  'app',
+  'apps',
+  'backend',
+  'bot',
+  'cli',
+  'client',
+  'config',
+  'core',
+  'dashboard',
+  'data',
+  'dbt',
+  'demo',
+  'deploy',
+  'dev',
+  'docs',
+  'etl',
+  'frontend',
+  'infra',
+  'integrations',
+  'ios',
+  'lib',
+  'looker',
+  'main',
+  'maintenance',
+  'mobile',
+  'ops',
+  'pipeline',
+  'platform',
+  'prod',
+  'qa',
+  'report',
+  'scripts',
+  'sdk',
+  'segment',
+  'server',
+  'service',
+  'services',
+  'site',
+  'snowflake',
+  'stage',
+  'staging',
+  'table',
+  'template',
+  'templates',
+  'terraform',
+  'test',
+  'tests',
+  'tools',
+  'ui',
+  'viz',
+  'web',
+  'website',
+  'wiki',
+]);
+
+// A three-letter all-caps name normally matches as a bare word (see
+// normalizedIdentifierPattern). These acronyms appear throughout ordinary
+// code, so a client repository named after one keeps the contextual match.
+const COMMON_ACRONYMS = new Set([
+  'api',
+  'app',
+  'aws',
+  'cli',
+  'csv',
+  'css',
+  'dbt',
+  'dev',
+  'dns',
+  'etl',
+  'gcp',
+  'git',
+  'ios',
+  'jwt',
+  'llm',
+  'mcp',
+  'npm',
+  'ops',
+  'pdf',
+  'sdk',
+  'sql',
+  'ssh',
+  'ssl',
+  'tls',
+  'uri',
+  'url',
+  'web',
+  'xml',
+  'yml',
+  'zip',
+]);
 
 const GENERIC_IDENTIFIERS = new Set([
   'admin',
@@ -190,19 +293,24 @@ function normalizedIdentifierPattern(value: string): RegExp | null {
   const tokens = value.match(/[A-Za-z0-9]+/g) ?? [];
   if (tokens.length === 0) return null;
   const normalizedLength = tokens.reduce((sum, token) => sum + token.length, 0);
+  // An all-caps three-letter name is a product or code name; the contextual
+  // rule below let one appear hundreds of times in tracked files unflagged.
+  if (/^[A-Z][A-Z0-9]{2}$/.test(value) && !COMMON_ACRONYMS.has(value.toLowerCase())) {
+    return new RegExp(`(^|[^A-Za-z0-9])${value}(?=$|[^A-Za-z0-9])`, 'gi');
+  }
   if (normalizedLength < 4) {
     const identifier = tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}');
     const context =
       '(?:agent|client|customer|data|datafold|discord|group|slack|tenant|token|workspace|workgroup|[amw]g)';
     return new RegExp(
       `(^|[^A-Za-z0-9])(?:${context}[^A-Za-z0-9]{1,4}${identifier}|${identifier}[^A-Za-z0-9]{1,4}${context})(?=$|[^A-Za-z0-9])`,
-      'i',
+      'gi',
     );
   }
   if (normalizedLength < 6) {
-    return new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(value)}(?=$|[^A-Za-z0-9])`, 'i');
+    return new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(value)}(?=$|[^A-Za-z0-9])`, 'gi');
   }
-  return new RegExp(`(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`, 'i');
+  return new RegExp(`(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`, 'gi');
 }
 
 function addIdentifier(target: Set<string>, value: unknown): void {
@@ -235,6 +343,7 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
     // constants IN tracked scripts — treating them as install-private would
     // make the boundary check flag the very script that authors them.
     "SELECT id, display_name FROM users WHERE id NOT LIKE 'system:%'",
+    'SELECT assistant_name FROM container_configs',
   ];
   try {
     for (const query of queries) {
@@ -252,6 +361,167 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
     db.close();
   }
   if (identifiers.size === 0) throw new Error('install registry contained no usable identifiers');
+  return identifiers;
+}
+
+export interface RemoteRepository {
+  host: string;
+  owner: string;
+  repo: string;
+}
+
+/** Host, owner and repository from a clone URL (https, ssh://, or scp-style); null for anything else. */
+export function remoteOwnerRepo(url: string): RemoteRepository | null {
+  const trimmed = url.trim();
+  let host: string;
+  let remotePath: string;
+  const scpStyle = /^[^/@\s]+@([^:/\s]+):(?!\/\/)(.+)$/.exec(trimmed);
+  if (scpStyle) {
+    host = scpStyle[1];
+    remotePath = scpStyle[2];
+  } else {
+    if (!URL.canParse(trimmed)) return null;
+    const parsed = new URL(trimmed);
+    if (!/^(?:https?|ssh|git):$/.test(parsed.protocol)) return null;
+    host = parsed.hostname;
+    remotePath = parsed.pathname;
+  }
+  const segments = remotePath
+    .replace(/\/+$/, '')
+    .replace(/\.git$/, '')
+    .split('/')
+    .filter(Boolean);
+  if (segments.length < 2) return null;
+  return { host: host.toLowerCase(), owner: segments[segments.length - 2], repo: segments[segments.length - 1] };
+}
+
+// A hook exports its own repository's GIT_DIR and friends; left in place they
+// would make a lookup in another checkout read the committing repository.
+const REPOSITORY_SELECTION_ENV =
+  /^GIT_(?:DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE|PREFIX)$/;
+
+function repositoryNeutralEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([key]) => !REPOSITORY_SELECTION_ENV.test(key)));
+}
+
+/**
+ * `git config` lines, or null when the lookup failed for a reason other than
+ * "no such key" (exit 1): an unreadable or malformed config.
+ */
+function gitConfigLines(args: string[], cwd: string): string[] | null {
+  const result = spawnSync('git', ['config', ...args], {
+    cwd,
+    env: repositoryNeutralEnv(),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (result.status === 1) return [];
+  if (result.status !== 0 || typeof result.stdout !== 'string') return null;
+  return result.stdout.split('\n').filter(Boolean);
+}
+
+function repositoryKey(remote: RemoteRepository): string {
+  return `${remote.host}/${remote.owner}/${remote.repo}`.toLowerCase();
+}
+
+export interface PublicRemotes {
+  /** Owners of the scanned and install checkouts' remotes: their names appear in public URLs. */
+  owners: Set<string>;
+  /** Exactly those remotes. Another repository under the same owner may be private. */
+  repositories: Set<string>;
+}
+
+export function publicRemotes(roots: string[], problems: string[]): PublicRemotes {
+  const remotes: PublicRemotes = { owners: new Set(), repositories: new Set() };
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
+    const lines = gitConfigLines(['--local', '--get-regexp', '^remote\\..*\\.url$'], root);
+    if (lines === null) {
+      problems.push('a checkout remote configuration could not be read');
+      continue;
+    }
+    for (const line of lines) {
+      const parsed = remoteOwnerRepo(line.replace(/^\S+\s+/, ''));
+      if (!parsed) continue;
+      remotes.owners.add(parsed.owner.toLowerCase());
+      remotes.repositories.add(repositoryKey(parsed));
+    }
+  }
+  return remotes;
+}
+
+function isGenericRepositoryName(name: string): boolean {
+  const words = name.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  return words.every((word) => GENERIC_REPOSITORY_WORDS.has(word));
+}
+
+function errorCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException | null)?.code;
+}
+
+type SourceRead<T> = { ok: true; value: T } | { ok: false; absent: boolean };
+
+// Absent is fine: an install need not have groups or clones. Any other
+// failure means a source exists but its names are unknown.
+function readSource<T>(read: () => T): SourceRead<T> {
+  try {
+    return { ok: true, value: read() };
+  } catch (err) {
+    return { ok: false, absent: errorCode(err) === 'ENOENT' || errorCode(err) === 'ENOTDIR' };
+  }
+}
+
+function listSource(dir: string, problems: string[], what: string): string[] {
+  const listed = readSource(() => fs.readdirSync(dir));
+  if (listed.ok) return listed.value;
+  if (!listed.absent) problems.push(`${what} could not be listed`);
+  return [];
+}
+
+/**
+ * Names the install holds outside the registry tables: agent persona names
+ * from each group's container.json, and the owner and name of every cloned
+ * client repository. Derived rather than listed by hand, so a new client is
+ * covered the moment its group or repository exists. A source that exists but
+ * cannot be read is recorded in `problems` (never by name) rather than
+ * silently contributing nothing.
+ */
+export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, problems: string[]): Set<string> {
+  const identifiers = new Set<string>();
+  const dataDir = path.dirname(dbPath);
+
+  if (path.basename(dataDir) === 'data') {
+    const groupsDir = path.join(path.dirname(dataDir), 'groups');
+    for (const folder of listSource(groupsDir, problems, 'the groups directory')) {
+      const config = readSource(
+        () => JSON.parse(fs.readFileSync(path.join(groupsDir, folder, 'container.json'), 'utf8')) as unknown,
+      );
+      if (!config.ok) {
+        if (!config.absent) problems.push('a group container.json could not be read or parsed');
+        continue;
+      }
+      if (config.value && typeof config.value === 'object')
+        addIdentifier(identifiers, (config.value as Record<string, unknown>).assistantName);
+    }
+  }
+
+  const repositoriesDir = path.join(dataDir, 'repositories');
+  for (const workgroup of listSource(repositoriesDir, problems, 'the repository store')) {
+    for (const name of listSource(path.join(repositoriesDir, workgroup), problems, 'a repository directory')) {
+      const config = path.join(repositoriesDir, workgroup, name, '.git', 'config');
+      if (!fs.existsSync(config)) continue;
+      const lines = gitConfigLines(['--file', config, '--get', 'remote.origin.url'], repositoriesDir);
+      if (lines === null) {
+        problems.push('a cloned repository configuration could not be read');
+        continue;
+      }
+      const parsed = lines[0] ? remoteOwnerRepo(lines[0]) : null;
+      if (!parsed) continue;
+      if (!remotes.owners.has(parsed.owner.toLowerCase())) addIdentifier(identifiers, parsed.owner);
+      if (!remotes.repositories.has(repositoryKey(parsed)) && !isGenericRepositoryName(parsed.repo))
+        addIdentifier(identifiers, parsed.repo);
+    }
+  }
   return identifiers;
 }
 
@@ -331,6 +601,10 @@ export function scanInputs(
   allowlist: AllowlistEntry[],
 ): Finding[] {
   const findings: Finding[] = [];
+  const identifierPatterns = [...privateIdentifiers].map((identifier) => ({
+    identifier,
+    pattern: normalizedIdentifierPattern(identifier),
+  }));
   for (const input of inputs) {
     if (input.content.includes(0)) continue;
     const content = input.content.toString('utf8');
@@ -358,7 +632,7 @@ export function scanInputs(
       }
     }
 
-    for (const identifier of privateIdentifiers) {
+    for (const { identifier, pattern } of identifierPatterns) {
       // The serialized-allowlist exemption matters here too: a registry-derived
       // name (e.g. a workgroup) can only be allowlisted by writing its value
       // into .public-boundary-allowlist.json, which this same scan then reads.
@@ -366,9 +640,10 @@ export function scanInputs(
       // any other private identifier inside the file still flags (see test).
       if (isAllowed(input.file, identifier, allowlist) || isSerializedAllowlistValue(input.file, identifier, allowlist))
         continue;
-      const pattern = normalizedIdentifierPattern(identifier);
-      const match = pattern?.exec(content);
-      if (match) {
+      if (!pattern) continue;
+      // Every matching line, not just the first: the baseline ratchet counts
+      // lines, so a second occurrence in an already-baselined file must raise it.
+      for (const match of content.matchAll(pattern)) {
         addFinding(findings, {
           file: input.file,
           line: lineNumber(content, match.index + (match[1]?.length ?? 0)),
@@ -406,6 +681,8 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     allowStructural: false,
     messageRaw: false,
     allowlistPath: '.public-boundary-allowlist.json',
+    writeBaseline: false,
+    acceptGrowth: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -419,17 +696,25 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     else if (arg === '--allowlist') options.allowlistPath = argv[++i] ?? '';
     else if (arg === '--message') options.messagePath = argv[++i] ?? '';
     else if (arg === '--message-raw') options.messageRaw = true;
+    else if (arg === '--baseline') options.baselinePath = argv[++i] ?? '';
+    else if (arg === '--write-baseline') options.writeBaseline = true;
+    else if (arg === '--accept-growth') options.acceptGrowth = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!options.root) throw new Error('--root requires a path');
   if (options.messagePath === '') throw new Error('--message requires a path');
   if (options.messageRaw && !options.messagePath) throw new Error('--message-raw requires --message');
+  if (options.baselinePath === '') throw new Error('--baseline requires a path');
+  if (options.acceptGrowth && !options.writeBaseline) throw new Error('--accept-growth requires --write-baseline');
+  if (options.writeBaseline && (options.messagePath || options.portable))
+    throw new Error('--write-baseline scans the tracked tree with install identifiers');
   options.root = path.resolve(options.root);
   if (options.messagePath) options.messagePath = path.resolve(options.root, options.messagePath);
   if (options.identifiersPath !== undefined)
     options.identifiersPath = path.resolve(options.root, options.identifiersPath);
   options.allowlistPath = path.resolve(options.root, options.allowlistPath);
   if (options.dbPath) options.dbPath = path.resolve(options.root, options.dbPath);
+  if (options.baselinePath) options.baselinePath = path.resolve(options.root, options.baselinePath);
   return options;
 }
 
@@ -490,7 +775,176 @@ export interface RunReport {
   identifiersOrigin: IdentifierOrigin | 'skipped';
   registryPathsTried: string[];
   identifiersPathsTried: string[];
+  baseline: BaselineOutcome;
+  /** Identifier sources that exist but could not be read; their names are missing from the scan. */
+  discoveryProblems: string[];
 }
+
+/**
+ * Per-file ratchet over pre-existing private-identifier lines: paths and line
+ * counts only, never the values. A file may keep at most its recorded count;
+ * a file absent from the baseline may hold none.
+ */
+export interface Baseline {
+  files: Record<string, number>;
+}
+
+export interface BaselineOutcome {
+  /** Private-identifier lines accepted because their file is within its recorded count. */
+  held: number;
+  heldFiles: number;
+  /** Files whose count rose above their recorded count; their findings stay reported. */
+  exceeded: Array<{ file: string; count: number; recorded: number }>;
+  /** Files now below their recorded count: `--write-baseline` lowers them. */
+  below: string[];
+  /** Raw private-identifier line counts per file, before the baseline. */
+  counts: Record<string, number>;
+}
+
+export function parseBaseline(text: string): Baseline {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error('public boundary baseline is invalid JSON', { cause: err });
+  }
+  const files = (parsed as { files?: unknown } | null)?.files;
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).some((key) => key !== 'files') ||
+    !files ||
+    typeof files !== 'object' ||
+    Array.isArray(files) ||
+    !Object.entries(files).every(([file, count]) => file.length > 0 && Number.isInteger(count) && (count as number) > 0)
+  ) {
+    throw new Error('public boundary baseline has an invalid schema');
+  }
+  return { files: files as Record<string, number> };
+}
+
+function runGit(args: string[], cwd: string, env: NodeJS.ProcessEnv): { status: number | null; stdout: string } {
+  const result = spawnSync('git', args, {
+    cwd,
+    env,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  return { status: result.status, stdout: typeof result.stdout === 'string' ? result.stdout : '' };
+}
+
+function readBlob(root: string, objectId: string, env: NodeJS.ProcessEnv): string {
+  const blob = runGit(['cat-file', 'blob', objectId], root, env);
+  if (blob.status !== 0) throw new Error('public boundary baseline object could not be read');
+  return blob.stdout;
+}
+
+// Same environment as trackedInputs: a partial commit's temporary index is
+// what will be committed, so the baseline must come from it too.
+function readIndexBaseline(root: string): string | null {
+  const listed = runGit(['ls-files', '--stage', '--', DEFAULT_BASELINE_RELATIVE], root, process.env);
+  if (listed.status !== 0) throw new Error('public boundary baseline could not be read from the index');
+  const objectId = /^\d+ ([0-9a-f]+) 0\t/m.exec(listed.stdout)?.[1];
+  return objectId ? readBlob(root, objectId, process.env) : null;
+}
+
+function readWorktreeBaseline(root: string): string | null {
+  try {
+    return fs.readFileSync(path.join(root, DEFAULT_BASELINE_RELATIVE), 'utf8');
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return null;
+    throw new Error('public boundary baseline is unreadable', { cause: err });
+  }
+}
+
+function branchHistoryHasBaseline(root: string): boolean {
+  const env = repositoryNeutralEnv();
+  const head = runGit(['rev-parse', '--verify', '--quiet', 'HEAD'], root, env);
+  if (head.status === 1) return false;
+  if (head.status !== 0) throw new Error('public boundary baseline history could not be read');
+  const touched = runGit(['rev-list', '-1', 'HEAD', '--', DEFAULT_BASELINE_RELATIVE], root, env);
+  if (touched.status !== 0) throw new Error('public boundary baseline history could not be read');
+  return touched.stdout.trim() !== '';
+}
+
+const MERGED_BASELINE_REFS = ['refs/remotes/origin/HEAD', 'refs/remotes/origin/main'];
+
+// Only a committed, merged revision: a working copy or unpushed commit
+// anywhere on the host must not be able to exempt what this branch publishes.
+function readMergedBaseline(root: string): string | null {
+  const env = repositoryNeutralEnv();
+  for (const ref of MERGED_BASELINE_REFS) {
+    const resolved = runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], root, env);
+    if (resolved.status === 1) continue;
+    if (resolved.status !== 0) throw new Error('public boundary merged baseline could not be resolved');
+    const listed = runGit(['ls-tree', resolved.stdout.trim(), '--', DEFAULT_BASELINE_RELATIVE], root, env);
+    if (listed.status !== 0) throw new Error('public boundary merged baseline could not be read');
+    const objectId = /^\d+ blob ([0-9a-f]+)\t/m.exec(listed.stdout)?.[1];
+    return objectId ? readBlob(root, objectId, env) : null;
+  }
+  return null;
+}
+
+/**
+ * Explicit --baseline wins and must exist. Otherwise the scanned tree's own
+ * copy (its index for an index scan, since that is what will be committed).
+ * A branch whose history carried the file and no longer does gets an empty
+ * baseline: deleting it removes its exemptions. A branch cut before the file
+ * existed inherits the copy merged on origin. Anything else holds nothing.
+ */
+function loadBaseline(options: ScanOptions): Baseline {
+  if (options.baselinePath) {
+    let text: string;
+    try {
+      text = fs.readFileSync(options.baselinePath, 'utf8');
+    } catch (err) {
+      throw new Error('public boundary baseline is missing or unreadable', { cause: err });
+    }
+    return parseBaseline(text);
+  }
+  const own = options.index ? readIndexBaseline(options.root) : readWorktreeBaseline(options.root);
+  if (own !== null) return parseBaseline(own);
+  if (branchHistoryHasBaseline(options.root)) return { files: {} };
+  const merged = readMergedBaseline(options.root);
+  return merged !== null ? parseBaseline(merged) : { files: {} };
+}
+
+export function applyBaseline(
+  findings: Finding[],
+  baseline: Baseline,
+): { findings: Finding[]; outcome: BaselineOutcome } {
+  // Null prototype: a tracked file named like an Object.prototype key must count from zero.
+  const counts: Record<string, number> = Object.create(null) as Record<string, number>;
+  for (const finding of findings) {
+    if (finding.category === 'private-identifier') counts[finding.file] = (counts[finding.file] ?? 0) + 1;
+  }
+  const outcome: BaselineOutcome = { held: 0, heldFiles: 0, exceeded: [], below: [], counts };
+  const heldFiles = new Set<string>();
+  for (const [file, count] of Object.entries(counts)) {
+    const recorded = Object.hasOwn(baseline.files, file) ? baseline.files[file] : 0;
+    if (count > recorded) {
+      outcome.exceeded.push({ file, count, recorded });
+      continue;
+    }
+    heldFiles.add(file);
+    outcome.held += count;
+    if (count < recorded) outcome.below.push(file);
+  }
+  for (const file of Object.keys(baseline.files)) {
+    if (!Object.hasOwn(counts, file)) outcome.below.push(file);
+  }
+  outcome.heldFiles = heldFiles.size;
+  outcome.exceeded.sort((a, b) => a.file.localeCompare(b.file));
+  outcome.below.sort();
+  return {
+    findings: findings.filter((finding) => finding.category !== 'private-identifier' || !heldFiles.has(finding.file)),
+    outcome,
+  };
+}
+
+const EMPTY_BASELINE_OUTCOME: BaselineOutcome = { held: 0, heldFiles: 0, exceeded: [], below: [], counts: {} };
 
 /**
  * Git only strips `#` lines on the EDITOR path.
@@ -582,6 +1036,7 @@ export function runReport(options: ScanOptions): RunReport {
   let identifiersOrigin: IdentifierOrigin | 'skipped' = 'skipped';
   let registryPathsTried: string[] = [];
   let identifiersPathsTried: string[] = [];
+  let discoveryProblems: string[] = [];
 
   if (!options.portable) {
     const mainCheckoutRoot = findMainCheckoutRoot(options.root);
@@ -590,7 +1045,14 @@ export function runReport(options: ScanOptions): RunReport {
       options.root,
       mainCheckoutRoot,
       DEFAULT_DB_RELATIVE,
-      loadRegistryIdentifiers,
+      (dbPath) => {
+        const values = loadRegistryIdentifiers(dbPath);
+        // Reset per attempt: only the install that supplies the names reports on them.
+        discoveryProblems = [];
+        const remotes = publicRemotes([options.root, path.dirname(path.dirname(dbPath))], discoveryProblems);
+        for (const value of loadInstallIdentifiers(dbPath, remotes, discoveryProblems)) values.add(value);
+        return values;
+      },
     );
     registryOrigin = registry.origin;
     registryPathsTried = registry.attemptedPaths;
@@ -614,14 +1076,52 @@ export function runReport(options: ScanOptions): RunReport {
       ? 'structural-fallback'
       : 'install-aware';
 
-  const findings = scanInputs(
-    options.messagePath
-      ? [commitMessageInput(options.messagePath, options.messageRaw)]
-      : trackedInputs(options.root, options.index),
-    privateIdentifiers,
-    loadAllowlist(options.allowlistPath),
-  );
-  return { findings, mode, registryOrigin, identifiersOrigin, registryPathsTried, identifiersPathsTried };
+  const allowlist = loadAllowlist(options.allowlistPath);
+  const base = {
+    mode,
+    registryOrigin,
+    identifiersOrigin,
+    registryPathsTried,
+    identifiersPathsTried,
+    discoveryProblems: [...new Set(discoveryProblems)].sort(),
+  };
+  // A commit message is not a tracked path, so no baseline entry can hold it.
+  if (options.messagePath) {
+    const findings = scanInputs(
+      [commitMessageInput(options.messagePath, options.messageRaw)],
+      privateIdentifiers,
+      allowlist,
+    );
+    return { ...base, findings, baseline: EMPTY_BASELINE_OUTCOME };
+  }
+  const scanned = scanInputs(trackedInputs(options.root, options.index), privateIdentifiers, allowlist);
+  const { findings, outcome } = applyBaseline(scanned, loadBaseline(options));
+  return { ...base, findings, baseline: outcome };
+}
+
+/**
+ * Rewrite the baseline from the current scan. Without --accept-growth it only
+ * ratchets down: each file keeps the lower of its recorded and current count,
+ * and a file above its recorded count is refused rather than absorbed.
+ */
+export function writeBaseline(options: ScanOptions): { written: string; refused: string[] } {
+  const report = runReport(options);
+  if (report.mode !== 'install-aware' || report.registryOrigin === 'none' || report.identifiersOrigin === 'none') {
+    throw new Error('--write-baseline requires both the install registry and the identifier inventory');
+  }
+  const target = options.baselinePath ?? path.join(options.root, DEFAULT_BASELINE_RELATIVE);
+  const recorded = loadBaseline(options).files;
+  const next: Record<string, number> = {};
+  const refused: string[] = [];
+  for (const [file, count] of Object.entries(report.baseline.counts)) {
+    const previous = Object.hasOwn(recorded, file) ? recorded[file] : 0;
+    const kept = options.acceptGrowth ? count : Math.min(count, previous);
+    if (count > previous && !options.acceptGrowth) refused.push(file);
+    if (kept > 0) next[file] = kept;
+  }
+  const sorted = Object.fromEntries(Object.entries(next).sort(([a], [b]) => a.localeCompare(b)));
+  fs.writeFileSync(target, `${JSON.stringify({ files: sorted }, null, 2)}\n`);
+  return { written: target, refused: refused.sort() };
 }
 
 export function run(options: ScanOptions): Finding[] {
@@ -651,6 +1151,16 @@ function describeMissingIdentifierSources(report: RunReport): string {
 export function main(argv = process.argv.slice(2)): number {
   try {
     const options = resolveOptions(argv);
+    if (options.writeBaseline) {
+      const { written, refused } = writeBaseline(options);
+      process.stdout.write(`public boundary baseline written: ${path.relative(options.root, written) || written}\n`);
+      if (refused.length === 0) return 0;
+      for (const file of refused) process.stderr.write(`${file} private-identifier count rose\n`);
+      process.stderr.write(
+        `public boundary baseline refused growth in ${refused.length} file(s); remove the new occurrences, or pass --accept-growth for a reviewed exception\n`,
+      );
+      return 1;
+    }
     const report = runReport(options);
     const { findings } = report;
     const missingIdentifierSources =
@@ -669,14 +1179,38 @@ export function main(argv = process.argv.slice(2)): number {
         return 1;
       }
     }
+    if (report.discoveryProblems.length > 0) {
+      process.stderr.write(
+        `WARNING: install-aware checks are incomplete; ${report.discoveryProblems.join('; ')} — names from those sources will NOT be caught\n`,
+      );
+      if (options.index && !options.allowStructural) {
+        process.stderr.write(
+          'public boundary check failed: indexed scans require every install identifier source to be readable\n',
+        );
+        return 1;
+      }
+    }
     const scanned = options.messagePath ? 'commit message' : options.index ? 'index' : 'worktree';
-    const surface = `${scanned}, ${describeMode(report)}`;
+    const { held, heldFiles, exceeded, below } = report.baseline;
+    const heldNote =
+      held > 0 ? `; ${held} pre-existing line(s) in ${heldFiles} file(s) held by ${DEFAULT_BASELINE_RELATIVE}` : '';
+    const surface = `${scanned}, ${describeMode(report)}${heldNote}`;
+    if (below.length > 0) {
+      process.stdout.write(
+        `${below.length} file(s) are below their baseline count; run with --write-baseline to ratchet it down\n`,
+      );
+    }
     if (findings.length === 0) {
       process.stdout.write(`public boundary check passed (${surface})\n`);
       return 0;
     }
     for (const finding of findings) {
       process.stderr.write(`${finding.file}:${finding.line} ${finding.category}\n`);
+    }
+    for (const { file, count, recorded } of exceeded) {
+      if (recorded > 0) {
+        process.stderr.write(`${file}: ${count} private-identifier line(s), above its baseline of ${recorded}\n`);
+      }
     }
     process.stderr.write(`public boundary check failed with ${findings.length} redacted finding(s) (${surface})\n`);
     return 1;

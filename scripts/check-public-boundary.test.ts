@@ -7,13 +7,19 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  applyBaseline,
+  loadInstallIdentifiers,
   loadLocalIdentifiers,
   loadRegistryIdentifiers,
   main,
+  parseBaseline,
+  publicRemotes,
+  remoteOwnerRepo,
   resolveOptions,
   run,
   runReport,
   scanInputs,
+  writeBaseline,
 } from './check-public-boundary.js';
 
 const roots: string[] = [];
@@ -653,5 +659,370 @@ describe('git hooks scan the committing tree, not the main checkout', () => {
     expect(script).toMatch(/while read -r local_ref local_sha remote_ref remote_sha/);
     expect(script).toMatch(/worktree add --detach --quiet "\$snapshot_root" "\$1"/);
     expect(script).toMatch(/check:public-boundary\s+--\s+--root\s+"\$snapshot_root" --index/);
+  });
+});
+
+describe('identifiers derived from the install', () => {
+  function writeRegistry(dataDir: string): string {
+    fs.mkdirSync(dataDir, { recursive: true });
+    const dbPath = path.join(dataDir, 'v2.db');
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE workgroups (id TEXT, display_name TEXT);
+      CREATE TABLE container_configs (agent_group_id TEXT, assistant_name TEXT);
+      INSERT INTO workgroups VALUES ('wg-fictional', 'Fictional House');
+      INSERT INTO container_configs VALUES ('ag-1', 'Nova');
+    `);
+    db.close();
+    return dbPath;
+  }
+
+  function addCanonical(dataDir: string, workgroup: string, name: string, url: string): void {
+    const repo = path.join(dataDir, 'repositories', workgroup, name);
+    execFileSync('git', ['init', '-q', repo]);
+    execFileSync('git', ['remote', 'add', 'origin', url], { cwd: repo });
+  }
+
+  it('parses host, owner and repository from https, ssh and scp-style remotes', () => {
+    expect(remoteOwnerRepo('https://github.com/acme-co/WIDGET.git')).toEqual({
+      host: 'github.com',
+      owner: 'acme-co',
+      repo: 'WIDGET',
+    });
+    expect(remoteOwnerRepo('https://x-access-token:secret@Example.com/acme-co/widget/')).toEqual({
+      host: 'example.com',
+      owner: 'acme-co',
+      repo: 'widget',
+    });
+    expect(remoteOwnerRepo('git@github.com:acme-co/widget.git')).toEqual({
+      host: 'github.com',
+      owner: 'acme-co',
+      repo: 'widget',
+    });
+    expect(remoteOwnerRepo('ssh://git@ssh.github.com:443/acme-co/widget.git')).toEqual({
+      host: 'ssh.github.com',
+      owner: 'acme-co',
+      repo: 'widget',
+    });
+    expect(remoteOwnerRepo('/srv/mirrors/widget.git')).toBeNull();
+    expect(remoteOwnerRepo('file:///srv/acme-co/widget.git')).toBeNull();
+    expect(remoteOwnerRepo('https://github.com/solo')).toBeNull();
+  });
+
+  it('reads persona names from the container_configs projection', () => {
+    const dbPath = writeRegistry(path.join(tempRoot(), 'data'));
+    expect(loadRegistryIdentifiers(dbPath).has('Nova')).toBe(true);
+  });
+
+  const publicProject = { owners: new Set(['open-org']), repositories: new Set(['github.com/open-org/project']) };
+
+  it('derives persona names and client repositories, skipping public remotes and generic names', () => {
+    const installRoot = tempRoot();
+    const dataDir = path.join(installRoot, 'data');
+    const dbPath = writeRegistry(dataDir);
+    fs.mkdirSync(path.join(installRoot, 'groups', 'nova-agent'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'groups', 'nova-agent', 'container.json'), '{"assistantName":"Orion"}');
+    fs.mkdirSync(path.join(installRoot, 'groups', 'no-config'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'groups', 'README.md'), 'not a group\n');
+    addCanonical(dataDir, 'wg-fictional', 'WIDGET', 'https://github.com/acme-co/WIDGET.git');
+    addCanonical(dataDir, 'wg-fictional', 'dbt', 'git@github.com:acme-co/dbt.git');
+    addCanonical(dataDir, 'wg-fictional', 'project', 'https://github.com/open-org/project');
+    fs.mkdirSync(path.join(dataDir, 'repositories', 'wg-fictional', 'not-a-clone'), { recursive: true });
+
+    const problems: string[] = [];
+    const values = loadInstallIdentifiers(dbPath, publicProject, problems);
+    expect(values).toEqual(new Set(['Orion', 'acme-co', 'WIDGET']));
+    expect(problems).toEqual([]);
+  });
+
+  it('exempts only the exact public repository, not every repository its owner holds', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    addCanonical(dataDir, 'wg-fictional', 'project', 'https://github.com/open-org/project.git');
+    addCanonical(dataDir, 'wg-fictional', 'launch', 'https://github.com/open-org/SecretLaunch.git');
+    addCanonical(dataDir, 'wg-fictional', 'mirror', 'https://git.example.com/open-org/project.git');
+    const values = loadInstallIdentifiers(dbPath, publicProject, []);
+    expect(values).toEqual(new Set(['SecretLaunch', 'project']));
+  });
+
+  it('records an unreadable or malformed source instead of silently dropping its names', () => {
+    const installRoot = tempRoot();
+    const dataDir = path.join(installRoot, 'data');
+    const dbPath = writeRegistry(dataDir);
+    fs.mkdirSync(path.join(installRoot, 'groups', 'broken'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'groups', 'broken', 'container.json'), '{not json');
+    fs.mkdirSync(path.join(installRoot, 'groups', 'locked'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'groups', 'locked', 'container.json'), '{"assistantName":"Vega"}');
+    fs.chmodSync(path.join(installRoot, 'groups', 'locked', 'container.json'), 0o000);
+    addCanonical(dataDir, 'wg-fictional', 'WIDGET', 'https://github.com/acme-co/WIDGET.git');
+    fs.appendFileSync(path.join(dataDir, 'repositories', 'wg-fictional', 'WIDGET', '.git', 'config'), '[broken\n');
+
+    const problems: string[] = [];
+    const values = loadInstallIdentifiers(dbPath, publicProject, problems);
+    expect(values).toEqual(new Set());
+    expect(problems.sort()).toEqual([
+      'a cloned repository configuration could not be read',
+      'a group container.json could not be read or parsed',
+      'a group container.json could not be read or parsed',
+    ]);
+  });
+
+  it('fails an indexed scan closed when an install identifier source is unreadable', () => {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    fs.mkdirSync(path.join(root, 'groups', 'broken'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'groups', 'broken', 'container.json'), '{not json');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(runReport(resolveOptions(['--root', root, '--index'], root)).discoveryProblems).toEqual([
+      'a group container.json could not be read or parsed',
+    ]);
+    expect(main(['--root', root, '--index'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain('require every install identifier source to be readable');
+    expect(main(['--root', root])).toBe(0);
+  });
+
+  it('treats the remotes of the scanned and install checkouts as public', () => {
+    const root = initRepo();
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/Open-Org/project.git'], { cwd: root });
+    execFileSync('git', ['remote', 'add', 'upstream', 'git@github.com:parent-org/project.git'], { cwd: root });
+    const problems: string[] = [];
+    expect(publicRemotes([root, path.join(root, 'missing')], problems)).toEqual({
+      owners: new Set(['open-org', 'parent-org']),
+      repositories: new Set(['github.com/open-org/project', 'github.com/parent-org/project']),
+    });
+    expect(problems).toEqual([]);
+  });
+
+  it('adds derived names to an install-aware run', () => {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/open-org/project.git'], { cwd: root });
+    addCanonical(path.join(root, 'data'), 'main-house', 'WIDGET', 'https://github.com/acme-co/WIDGET.git');
+    addCanonical(path.join(root, 'data'), 'main-house', 'project', 'https://github.com/open-org/project.git');
+    fs.writeFileSync(path.join(root, 'notes.md'), 'The widget release.\nClone open-org/project.\n');
+    execFileSync('git', ['add', 'notes.md'], { cwd: root });
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toEqual([
+      { file: 'notes.md', line: 1, category: 'private-identifier' },
+    ]);
+  });
+
+  it('matches an all-caps three-letter name as a bare word, but keeps acronyms and lowercase names contextual', () => {
+    const text = ['The WDG screen', 'export wdg_dev=1', 'wdgx is unrelated', 'The API screen', 'the abc screen'];
+    const findings = scanInputs([input('a.md', text.join('\n'))], new Set(['WDG', 'API', 'abc']), []);
+    expect(findings).toEqual([
+      { file: 'a.md', line: 1, category: 'private-identifier' },
+      { file: 'a.md', line: 2, category: 'private-identifier' },
+    ]);
+  });
+
+  it('reports every matching line, so a second occurrence counts', () => {
+    const findings = scanInputs(
+      [input('a.md', 'Fictional House\nplain\nfictional-house again\n')],
+      new Set(['Fictional House']),
+      [],
+    );
+    expect(findings.map((finding) => finding.line)).toEqual([1, 3]);
+  });
+});
+
+describe('baseline ratchet', () => {
+  const finding = (file: string, line: number): { file: string; line: number; category: 'private-identifier' } => ({
+    file,
+    line,
+    category: 'private-identifier',
+  });
+
+  it('holds a file within its count, fails a new file and a risen count, and notes a drop', () => {
+    const baseline = { files: { 'held.md': 2, 'dropped.md': 3, 'rose.md': 1, 'gone.md': 4 } };
+    const email = { file: 'held.md', line: 9, category: 'email-address' as const };
+    const { findings, outcome } = applyBaseline(
+      [
+        finding('held.md', 1),
+        finding('held.md', 2),
+        email,
+        finding('dropped.md', 1),
+        finding('rose.md', 1),
+        finding('rose.md', 2),
+        finding('new.md', 5),
+      ],
+      baseline,
+    );
+    expect(findings).toEqual([email, finding('rose.md', 1), finding('rose.md', 2), finding('new.md', 5)]);
+    expect(outcome.held).toBe(3);
+    expect(outcome.heldFiles).toBe(2);
+    expect(outcome.exceeded).toEqual([
+      { file: 'new.md', count: 1, recorded: 0 },
+      { file: 'rose.md', count: 2, recorded: 1 },
+    ]);
+    expect(outcome.below).toEqual(['dropped.md', 'gone.md']);
+  });
+
+  it('does not treat inherited object keys as baseline entries', () => {
+    const { findings } = applyBaseline([finding('constructor', 1)], { files: {} });
+    expect(findings).toHaveLength(1);
+  });
+
+  it('rejects a malformed baseline', () => {
+    expect(() => parseBaseline('{')).toThrow('invalid JSON');
+    expect(() => parseBaseline('[]')).toThrow('invalid schema');
+    expect(() => parseBaseline('{"files":{"a.md":0}}')).toThrow('invalid schema');
+    expect(() => parseBaseline('{"files":{"a.md":1.5}}')).toThrow('invalid schema');
+    expect(() => parseBaseline('{"files":{"a.md":1},"note":"x"}')).toThrow('invalid schema');
+    expect(parseBaseline('{"files":{"a.md":2}}')).toEqual({ files: { 'a.md': 2 } });
+  });
+
+  function baselineRepo(): string {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    fs.writeFileSync(path.join(root, 'old.md'), 'Fictional Registry House\nFictional Local Team\n');
+    fs.writeFileSync(path.join(root, '.public-boundary-baseline.json'), '{"files":{"old.md":2}}\n');
+    execFileSync('git', ['add', 'old.md', '.public-boundary-baseline.json'], { cwd: root });
+    execFileSync('git', ['commit', '-q', '-m', 'baseline'], { cwd: root });
+    return root;
+  }
+
+  it('passes a baselined tree and fails a new file or a risen count', () => {
+    const root = baselineRepo();
+    const report = runReport(resolveOptions(['--root', root, '--index'], root));
+    expect(report.findings).toEqual([]);
+    expect(report.baseline.held).toBe(2);
+
+    fs.appendFileSync(path.join(root, 'old.md'), 'fictional registry house again\n');
+    fs.writeFileSync(path.join(root, 'fresh.md'), 'Fictional Local Team\n');
+    execFileSync('git', ['add', 'old.md', 'fresh.md'], { cwd: root });
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toEqual([
+      { file: 'fresh.md', line: 1, category: 'private-identifier' },
+      { file: 'old.md', line: 1, category: 'private-identifier' },
+      { file: 'old.md', line: 2, category: 'private-identifier' },
+      { file: 'old.md', line: 3, category: 'private-identifier' },
+    ]);
+  });
+
+  it('reads the index copy for an index scan, so an unstaged baseline edit holds nothing', () => {
+    const root = baselineRepo();
+    fs.appendFileSync(path.join(root, 'old.md'), 'Fictional Local Team\n');
+    execFileSync('git', ['add', 'old.md'], { cwd: root });
+    fs.writeFileSync(path.join(root, '.public-boundary-baseline.json'), '{"files":{"old.md":3}}\n');
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toHaveLength(3);
+    expect(run(resolveOptions(['--root', root], root))).toEqual([]);
+  });
+
+  function predatingWorktree(mainRoot: string): string {
+    const worktreeRoot = tempRoot();
+    execFileSync('git', ['worktree', 'add', '--detach', '-q', worktreeRoot, 'HEAD~1'], { cwd: mainRoot });
+    fs.writeFileSync(path.join(worktreeRoot, 'old.md'), 'Fictional Registry House\n');
+    execFileSync('git', ['add', 'old.md'], { cwd: worktreeRoot });
+    return worktreeRoot;
+  }
+
+  it('gives a branch that predates the file the baseline merged on origin', () => {
+    const mainRoot = baselineRepo();
+    const worktreeRoot = predatingWorktree(mainRoot);
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(1);
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: mainRoot });
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toEqual([]);
+  });
+
+  it('never takes a predating branch baseline from a working copy or an unmerged commit', () => {
+    const mainRoot = baselineRepo();
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD~1'], { cwd: mainRoot });
+    const worktreeRoot = predatingWorktree(mainRoot);
+    fs.writeFileSync(path.join(mainRoot, '.public-boundary-baseline.json'), '{"files":{"old.md":9}}\n');
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(1);
+  });
+
+  it('holds nothing once a branch deletes the baseline it carried, staged or committed', () => {
+    const root = baselineRepo();
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: root });
+    execFileSync('git', ['rm', '-q', '--cached', '.public-boundary-baseline.json'], { cwd: root });
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toHaveLength(2);
+    execFileSync('git', ['commit', '-q', '-m', 'drop baseline'], { cwd: root });
+    fs.rmSync(path.join(root, '.public-boundary-baseline.json'));
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toHaveLength(2);
+    expect(run(resolveOptions(['--root', root], root))).toHaveLength(2);
+  });
+
+  it('fails rather than reading a baseline it cannot load as absent', () => {
+    const root = baselineRepo();
+    const objectId = execFileSync('git', ['rev-parse', ':.public-boundary-baseline.json'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).trim();
+    fs.rmSync(path.join(root, '.git', 'objects', objectId.slice(0, 2), objectId.slice(2)), { force: true });
+    expect(() => run(resolveOptions(['--root', root, '--index'], root))).toThrow('baseline object could not be read');
+  });
+
+  it('requires an explicit --baseline to exist', () => {
+    const root = baselineRepo();
+    expect(() => run(resolveOptions(['--root', root, '--baseline', 'missing.json'], root))).toThrow(
+      'missing or unreadable',
+    );
+    expect(run(resolveOptions(['--root', root, '--baseline', '.public-boundary-baseline.json'], root))).toEqual([]);
+  });
+
+  it('never applies the baseline to a commit message', () => {
+    const root = baselineRepo();
+    const message = path.join(root, 'MSG');
+    fs.writeFileSync(message, 'Fictional Local Team\n');
+    const report = runReport(resolveOptions(['--root', root, '--message', message], root));
+    expect(report.findings).toHaveLength(1);
+    expect(report.baseline.held).toBe(0);
+  });
+
+  it('ratchets down on write, refuses growth, and absorbs it only with --accept-growth', () => {
+    const root = baselineRepo();
+    const baselineFile = path.join(root, '.public-boundary-baseline.json');
+    fs.writeFileSync(path.join(root, 'old.md'), 'Fictional Registry House\n');
+    fs.writeFileSync(path.join(root, 'fresh.md'), 'Fictional Local Team\n');
+    execFileSync('git', ['add', 'fresh.md'], { cwd: root });
+
+    expect(writeBaseline(resolveOptions(['--root', root, '--write-baseline'], root)).refused).toEqual(['fresh.md']);
+    expect(JSON.parse(fs.readFileSync(baselineFile, 'utf8'))).toEqual({ files: { 'old.md': 1 } });
+
+    expect(
+      writeBaseline(resolveOptions(['--root', root, '--write-baseline', '--accept-growth'], root)).refused,
+    ).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(baselineFile, 'utf8'))).toEqual({ files: { 'fresh.md': 1, 'old.md': 1 } });
+  });
+
+  it('refuses to write a baseline without install identifiers', () => {
+    const root = initRepo();
+    expect(() => writeBaseline(resolveOptions(['--root', root, '--write-baseline'], root))).toThrow('requires both');
+  });
+
+  it('validates the baseline flags', () => {
+    expect(() => resolveOptions(['--baseline'])).toThrow('--baseline requires a path');
+    expect(() => resolveOptions(['--accept-growth'])).toThrow('requires --write-baseline');
+    expect(() => resolveOptions(['--write-baseline', '--portable'])).toThrow('--write-baseline scans');
+  });
+
+  it('prints held, dropped and exceeded counts without values', () => {
+    const root = baselineRepo();
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    expect(main(['--root', root, '--index'])).toBe(0);
+    expect(stdout.mock.calls.flat().join('')).toContain(
+      '2 pre-existing line(s) in 1 file(s) held by .public-boundary-baseline.json',
+    );
+
+    fs.writeFileSync(
+      path.join(root, 'old.md'),
+      'Fictional Registry House\nFictional Local Team\nFictional Local Team\n',
+    );
+    execFileSync('git', ['add', 'old.md'], { cwd: root });
+    expect(main(['--root', root, '--index'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain(
+      'old.md: 3 private-identifier line(s), above its baseline of 2',
+    );
+
+    fs.writeFileSync(path.join(root, 'old.md'), 'clean\n');
+    execFileSync('git', ['add', 'old.md'], { cwd: root });
+    expect(main(['--root', root, '--index'])).toBe(0);
+    expect(stdout.mock.calls.flat().join('')).toContain('1 file(s) are below their baseline count');
+
+    expect(main(['--root', root, '--write-baseline'])).toBe(0);
+    fs.writeFileSync(path.join(root, 'old.md'), 'Fictional Local Team\n');
+    expect(main(['--root', root, '--write-baseline'])).toBe(1);
+    const output = stdout.mock.calls.flat().join('') + stderr.mock.calls.flat().join('');
+    expect(output).toContain('refused growth in 1 file(s)');
+    expect(output).not.toMatch(/Fictional/);
   });
 });

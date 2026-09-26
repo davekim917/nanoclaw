@@ -34,6 +34,31 @@
       "path": ".public-boundary-allowlist.json",
       "value": "sunday",
       "reason": "This file's own entry above for cron-format.ts serializes the same generic word literally, which the private-identifier scan also runs against this file"
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "value": "nanoclaw-templates",
+      "reason": "Published upstream templates repository (public); the install clones it, so its name is derived as a repository identifier"
+    },
+    {
+      "path": "README.md",
+      "value": "nanoclaw-templates",
+      "reason": "Published upstream templates repository (public); the install clones it, so its name is derived as a repository identifier"
+    },
+    {
+      "path": "docs/templates.md",
+      "value": "nanoclaw-templates",
+      "reason": "Published upstream templates repository (public); the install clones it, so its name is derived as a repository identifier"
+    },
+    {
+      "path": "src/config.ts",
+      "value": "nanoclaw-templates",
+      "reason": "Published upstream templates repository (public); the install clones it, so its name is derived as a repository identifier"
+    },
+    {
+      "path": "templates/README.md",
+      "value": "nanoclaw-templates",
+      "reason": "Published upstream templates repository (public); the install clones it, so its name is derived as a repository identifier"
     }
   ]
 }
