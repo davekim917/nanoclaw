@@ -2197,10 +2197,11 @@ export async function processQuery(
               log(
                 'Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain',
               );
-              const notice = describeDeferredSettings(liveSettings, fb);
-              if (notice !== deferredSettingsNotice && carriesTypedFlag(keep)) {
+              const acked = findAckedFlag(keep);
+              const notice = acked && queuedSettingsNotice(acked.ack);
+              if (acked && notice && notice !== deferredSettingsNotice) {
                 deferredSettingsNotice = notice;
-                const routing = extractRouting(keep);
+                const routing = extractRouting([acked.row]);
                 await writeMessageOut({
                   id: generateId(),
                   kind: 'chat',
@@ -3888,29 +3889,25 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
  * migration the new provider IS the primary, nothing reverts, and the user
  * has to re-pin or clear it.
  */
-/** A person typed the flag — the only case the host posted a ⚙️ ack for. */
-export function carriesTypedFlag(messages: MessageInRow[]): boolean {
-  return messages.some((m) => {
-    if (m.kind === 'task') return false;
+/**
+ * The last row in the batch whose flag the host acked in chat. Only the
+ * router's typed-flag path stamps `flagAck`; support-thread and task rows
+ * carry flagIntent without one, and nobody was told anything about those.
+ */
+export function findAckedFlag(messages: MessageInRow[]): { row: MessageInRow; ack: string } | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
     try {
-      return (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent !== undefined;
+      const ack = (JSON.parse(messages[i].content) as { flagAck?: unknown }).flagAck;
+      if (typeof ack === 'string' && ack.length > 0) return { row: messages[i], ack };
     } catch {
-      return false;
+      // not JSON — no ack
     }
-  });
+  }
+  return undefined;
 }
 
-type LiveSettings = { model?: string; effort?: string; ultracode?: boolean };
-
-export function describeDeferredSettings(live: LiveSettings, next: LiveSettings): string {
-  const parts: string[] = [];
-  if (next.model !== live.model) parts.push(`model → ${next.model ?? 'default'}`);
-  if (next.ultracode !== live.ultracode) parts.push(`ultracode ${next.ultracode ? 'ON' : 'OFF'}`);
-  else if (next.effort !== live.effort) parts.push(`effort → ${next.effort ?? 'default'}`);
-  return (
-    `⚙️ ${parts.join(', ')} is queued until the current task finishes. ` +
-    `Messages you send before then are read when it does.`
-  );
+export function queuedSettingsNotice(ack: string): string {
+  return `${ack} is queued until the current task finishes. Messages you send before then are read when it does.`;
 }
 
 export async function noteIgnoredModel(

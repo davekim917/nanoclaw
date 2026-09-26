@@ -1451,6 +1451,10 @@ async function deliverToAgent(
   // session_state even though the operator never addressed that agent.
   let flagIntent: FlagIntent | undefined;
   let flagCleanedText: string | null = null;
+  // The settings line of the ⚙️ ack actually posted. Stored on the row so the
+  // runner can say "queued" in the same words, and only for rows a person
+  // typed: support-thread dispatch writes flagIntent on rows nobody acked.
+  let flagAck: string | undefined;
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const rawText = parsedContent.text ?? '';
     // Flag vocabulary is provider-specific (codex accepts gpt-5.5, rejects
@@ -1472,6 +1476,8 @@ async function deliverToAgent(
       flagCleanedText = parsed.cleanedText;
       const notice = formatFlagConfirmation(parsed.intent ?? {}, parsed.warnings, parsed.errors);
       if (notice) {
+        const settingsLine = notice.split('\n')[0];
+        if (parsed.intent && settingsLine.startsWith('⚙️')) flagAck = settingsLine;
         // Outbound-keyed for the same reason as the denial notice above: an
         // inbound-keyed existence check would silently drop this confirmation
         // for a session whose inbound.db is gone and outbound.db is not.
@@ -1500,6 +1506,7 @@ async function deliverToAgent(
     const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
     if (flagCleanedText !== null) parsed.text = flagCleanedText;
     if (flagIntent) parsed.flagIntent = flagIntent;
+    if (flagAck) parsed.flagAck = flagAck;
     contentForWrite = JSON.stringify(parsed);
   }
   if (
