@@ -110,7 +110,8 @@ script: |
   if [ -f /workspace/agent/wake-next-task ]; then
     echo '{"wakeAgent": true}'
   else
-    echo '{"wakeAgent": false}'
+    python3 /app/skills/task-observation/task_observation.py \
+      --kind empty --evidence "no wake marker" --bound 1h
   fi
 ---
 
