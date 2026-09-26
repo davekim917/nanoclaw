@@ -27,6 +27,8 @@ export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="${GOOGLE_WORKSPACE_CLI_CREDENTIALS
 # upload below is a path RELATIVE to the repo. Not optional — an absolute path
 # fails with a 400 "outside the current directory".
 cd "$REPO" || exit 1
+# Canonical repo path, for the per-file containment check below.
+REPO_REAL="$(pwd -P)"
 
 TMP="$STATE.tmp.$$"
 ERRF="$STATE.err.$$"
@@ -60,7 +62,7 @@ if [[ -f "$STATE" ]]; then
   done < "$STATE"
 fi
 
-added=0 updated=0 skipped=0 failed=0 folders_made=0
+added=0 updated=0 skipped=0 failed=0 refused=0 folders_made=0
 
 # find_child <name> <parentId> <folders|files> -> prints id or empty
 find_child() {
@@ -124,7 +126,16 @@ done
 for rel in "${TRACKED[@]}"; do
   # relative on purpose — see the cd above
   src="$rel"
-  if [[ ! -f "$src" ]]; then log "SKIP missing $rel"; continue; fi
+  if [[ ! -e "$src" && ! -L "$src" ]]; then log "SKIP missing $rel"; continue; fi
+  # The tree is writable from agent containers, and sha256sum and gws both
+  # follow symlinks: a tracked path (or any directory above it) swapped for a
+  # symlink would publish whatever host file it points at. Upload only a
+  # regular file whose canonical path is exactly this tracked path.
+  real="$(realpath -e -- "$src" 2>/dev/null)"
+  if [[ -L "$src" || ! -f "$src" || "$real" != "$REPO_REAL/$rel" ]]; then
+    log "ERROR REFUSED $rel: not a regular file inside the tree (resolves to ${real:-nothing})"
+    refused=$((refused+1)); continue
+  fi
   sha="$(sha256sum "$src" | cut -d' ' -f1)"
   if [[ "${OLD_SHA[$rel]:-}" == "$sha" && -n "${OLD_ID[$rel]:-}" ]]; then
     printf 'F\t%s\t%s\t%s\n' "$rel" "$sha" "${OLD_ID[$rel]}" >> "$TMP"
@@ -162,6 +173,6 @@ for rel in "${TRACKED[@]}"; do
   printf 'F\t%s\t%s\t%s\n' "$rel" "$sha" "$id" >> "$TMP"
 done
 
-log "done: added=$added updated=$updated skipped=$skipped failed=$failed folders_created=$folders_made tracked=${#TRACKED[@]}"
-if [[ $failed -gt 0 ]]; then exit 1; fi
+log "done: added=$added updated=$updated skipped=$skipped failed=$failed refused=$refused folders_created=$folders_made tracked=${#TRACKED[@]}"
+if [[ $failed -gt 0 || $refused -gt 0 ]]; then exit 1; fi
 exit 0
