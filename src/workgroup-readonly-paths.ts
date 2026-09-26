@@ -105,10 +105,48 @@ export function readWorkgroupReadonlyPaths(dataDir: string = DATA_DIR): string[]
         log.warn('Workgroup read-only path traverses a symlink; not protected', { workgroupId, subpath, real });
         continue;
       }
+      const aliased = hardLinkedFiles(real);
+      if (aliased.length > 0) {
+        log.error('Workgroup read-only path holds hard-linked files; another name for them may still be writable', {
+          workgroupId,
+          subpath,
+          files: aliased.slice(0, 20),
+          count: aliased.length,
+        });
+      }
       resolved.push(real);
     }
   }
   return resolved;
+}
+
+/**
+ * The read-only bind protects names, not inodes. Once it is in place a
+ * container cannot add another name for a file under it (link(2) across mount
+ * points fails with EXDEV), but a link made while the path was still writable
+ * survives, and a write through it changes the file the host runs. It is
+ * reported, never removed: the host cannot tell which name is the intended
+ * one. Symlinks are not followed.
+ */
+function hardLinkedFiles(root: string): string[] {
+  const found: string[] = [];
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop() as string;
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    if (stat.isDirectory()) {
+      for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
+    } else if (stat.isFile() && stat.nlink > 1) {
+      found.push(current);
+    }
+  }
+  return found;
 }
 
 function realOrResolved(p: string): string {

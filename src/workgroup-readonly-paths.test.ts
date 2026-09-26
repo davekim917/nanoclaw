@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { log } from './log.js';
 
 import {
   parseWorkgroupReadonlyPaths,
@@ -62,6 +64,23 @@ describe('readWorkgroupReadonlyPaths', () => {
     fs.symlinkSync('real', path.join(root, 'workgroups', 'wg', 'link'));
     writePolicy({ version: 1, workgroups: { wg: ['link'] } });
     expect(readWorkgroupReadonlyPaths(root)).toEqual([]);
+  });
+
+  it('reports a file under the path that has another name elsewhere', () => {
+    const ops = path.join(root, 'workgroups', 'wg', 'ops');
+    fs.mkdirSync(path.join(ops, 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(ops, 'nested', 'run.sh'), 'echo hi\n');
+    fs.writeFileSync(path.join(ops, 'solo.sh'), 'echo solo\n');
+    fs.linkSync(path.join(ops, 'nested', 'run.sh'), path.join(root, 'workgroups', 'wg', 'alias.sh'));
+    writePolicy({ version: 1, workgroups: { wg: ['ops'] } });
+    const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+    try {
+      expect(readWorkgroupReadonlyPaths(root)).toEqual([ops]);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(error.mock.calls[0][1]).toMatchObject({ files: [path.join(ops, 'nested', 'run.sh')], count: 1 });
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it('throws on a malformed policy file', () => {
