@@ -3,8 +3,12 @@
 
     python3 task_observation.py --kind empty --evidence "no new PRs" --bound 4h
     python3 task_observation.py --kind unfinished --evidence-json '{"pr": 12}' \
-        --bound 4h --since 2026-09-26T08:00:00Z --data '{"checked": 3}'
+        --bound 4h --since 2026-09-26T08:00:00Z
     python3 task_observation.py --wake --data '{"pr": 12}'
+
+--data reaches the agent's prompt when the fire wakes it. A fire that does not
+wake the agent records its observation and nothing else: its data is not
+stored anywhere, so put what the operator needs to see in the evidence.
 
 or, from Python, after putting this directory on sys.path:
 
@@ -112,7 +116,8 @@ def observation_problem(observation, now_ms=None):
 
 
 def observation_line(kind, evidence, bound, since=None, data=None):
-    """The final stdout line for a fire that does not wake the agent."""
+    """The final stdout line for a fire that does not wake the agent. Only the
+    observation is recorded; `data` is not."""
     observation = {"kind": kind, "evidence": evidence, "bound": bound}
     if since is not None:
         observation["since"] = since
@@ -153,7 +158,11 @@ def main(argv=None):
     evidence.add_argument("--evidence-json", help="evidence as a JSON object or array")
     parser.add_argument("--bound", help="how long a non-empty result may stand: 90m, 4h, 2d")
     parser.add_argument("--since", help="ISO-8601 start of the open work; required for unfinished")
-    parser.add_argument("--data", help="JSON passed through to the prompt or the run record")
+    parser.add_argument(
+        "--data",
+        help="JSON for the agent's prompt on --wake; not recorded on a fire that does not wake,"
+        " so put what the operator needs in the evidence",
+    )
     args = parser.parse_args(argv)
     try:
         data = _json_arg(args.data, "--data") if args.data is not None else None

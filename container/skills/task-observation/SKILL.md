@@ -62,4 +62,6 @@ on every fire: when it is earlier than the episode's first not-ok fire, it
 moves the episode's start back to when the work really began.
 
 `--evidence` is what you checked, in a sentence; `--evidence-json` takes a
-non-empty object or array instead. Keep both small.
+non-empty object or array instead. Keep both small. The evidence is all that is
+recorded of a fire that does not wake the agent: `--data` reaches the agent's
+prompt with `--wake` and is not stored otherwise.
