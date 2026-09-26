@@ -127,10 +127,16 @@ fire() { # [env assignments...] -- runs the wrapper, checks the output contract
   ELAPSED=$(( $(date +%s) - s ))
   [ "$rc" = 0 ] || fail "wrapper exited $rc (must always be 0): $(tail -5 "$T/stderr")"
   [ "$(printf '%s\n' "$OUTPUT" | wc -l)" = 1 ] || fail "stdout must be exactly one line, got: $OUTPUT"
-  printf '%s\n' "$OUTPUT" | jq -e '(keys == ["data","wakeAgent"]) and .wakeAgent == false and (.data | type == "object")' \
-    >/dev/null || fail "last line is not {wakeAgent:false,data:{...}}: $OUTPUT"
+  printf '%s\n' "$OUTPUT" | jq -e '(keys == ["data","observation","wakeAgent"]) and .wakeAgent == false and (.data | type == "object")' \
+    >/dev/null || fail "last line is not {wakeAgent:false,observation:{...},data:{...}}: $OUTPUT"
+  # W2: the observation is one the task-observation helper itself accepts.
+  printf '%s\n' "$OUTPUT" | python3 -c 'import json,sys; sys.path.insert(0, sys.argv[1]); from task_observation import observation_problem
+p = observation_problem(json.loads(sys.stdin.read())["observation"]); sys.exit("invalid observation: " + p if p else 0)' \
+    "$SCRIPT_DIR/../../task-observation" || fail "observation rejected by the helper: $OUTPUT"
+  KIND="$(printf '%s\n' "$OUTPUT" | jq -r .observation.kind)"
   DATA="$(printf '%s\n' "$OUTPUT" | jq -c .data)"
 }
+KIND=""
 d() { jq -r "$1" <<<"$DATA"; }
 calls() { grep -c "^$1 " "$FAKE_LOG" || true; }
 jrn() { jq -s -c "$1" "$OUT/journal.ndjson"; }
@@ -140,10 +146,12 @@ new_case off
 write_env off
 fire
 [ "$(d .mode)" = off ] && [ "$(d .stepped)" = false ] || fail "SMOKE_CONTROLLER_MODE=off must do nothing: $DATA"
+[ "$KIND" = empty ] || fail "kill switch off is empty: $KIND"
 [ ! -e "$OUT" ] || fail "mode off must not create the out-dir"
 write_env live
 fire
 [ "$(d .stepped)" = false ] && d .skipped | grep -q unsupported || fail "an unknown mode is refused: $DATA"
+[ "$KIND" = blocked ] || fail "a refused mode is blocked: $KIND"
 [ ! -s "$FAKE_LOG" ] || fail "mode off/unsupported must call nothing: $(cat "$FAKE_LOG")"
 
 # --- default: unset mode runs shadow -----------------------------------------
@@ -151,6 +159,7 @@ new_case default-on
 write_env ""
 fire
 [ "$(d .mode)" = shadow ] && [ "$(d .stepped)" = true ] || fail "unset SMOKE_CONTROLLER_MODE must default to shadow: $DATA"
+[ "$KIND" = empty ] || fail "a completed step is empty: $KIND"
 
 # --- first fire: init once, no claims, no fetches ----------------------------
 new_case init
@@ -165,6 +174,7 @@ fire
 rm "$OUT/journal.ndjson"
 fire
 [ "$(d .controllerError)" = controller_journal_error ] || fail "missing journal must surface as the controller's journal error: $DATA"
+[ "$KIND" = blocked ] || fail "a controller error is blocked, not an input failure: $KIND"
 [ ! -e "$OUT/journal.ndjson" ] || fail "the wrapper must not re-init a lost journal"
 
 # --- new claim: synthesized wake, heads fetched, decisions written -----------
@@ -189,6 +199,7 @@ dec_before="$(wc -l <"$OUT/$RUN/decisions.ndjson")"
 fire FAKE_GH=fail
 [ "$(d .stepped)" = false ] && [ "$(d .skipped)" = "input fetch failed" ] && [ "$(d .inputErrors)" = 1 ] \
   || fail "gh failure must skip the step: $DATA"
+[ "$KIND" = unreadable ] || fail "an input fetch failure is unreadable: $KIND"
 [ "$(wc -l <"$OUT/journal.ndjson")" = "$lines_before" ] && [ "$(wc -l <"$OUT/$RUN/decisions.ndjson")" = "$dec_before" ] \
   || fail "a decision-less fire writes no journal record or decision"
 tail -1 "$OUT/wrapper/fires.ndjson" | jq -e '.skipped == "input fetch failed"' >/dev/null || fail "the skip is logged"
@@ -323,6 +334,7 @@ new_case hang
 fire SMOKE_CONTROLLER_SHADOW_TEST_HANG=1 SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS=8
 [ "$ELAPSED" -le 10 ] || fail "a hung worker overran an 8s budget: ${ELAPSED}s"
 [ "$(d .skipped)" = "fire exceeded its budget and was killed" ] || fail "hung worker: $DATA"
+[ "$KIND" = blocked ] || fail "a killed fire is blocked: $KIND"
 tail -1 "$OUT/wrapper/fires.ndjson" | jq -e '.skipped == "fire exceeded its budget and was killed"' >/dev/null \
   || fail "the killed fire is logged"
 fire SMOKE_CONTROLLER_SHADOW_TEST_HANG=ignore-term SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS=8
@@ -355,10 +367,11 @@ d .skipped | grep -q "no out-dir" || fail "no out-dir and no run root must skip:
 [ ! -e "$OUT" ] || fail "a skipped fire with no out-dir must create nothing"
 
 # --- the no-wake guarantee is structural -------------------------------------
-# Only final() writes to fd 3 (the runner's stdout), and it renders a literal.
+# Only final() writes to fd 3 (the runner's stdout): the helper's observation
+# line (which never wakes), or the bare literal it falls back to.
 n_fd3="$(grep -c '>&3' "$W")"
-[ "$n_fd3" = 2 ] || fail "expected exactly final()'s two fd-3 writes, found $n_fd3"
-[ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" = 2 ] || fail "every fd-3 write must be inside final()"
+[ "$n_fd3" = 3 ] || fail "expected exactly final()'s three fd-3 writes, found $n_fd3"
+[ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" = 3 ] || fail "every fd-3 write must be inside final()"
 grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anything runs"
 ! grep -q 'wakeAgent:true\|"wakeAgent": *true\|wakeAgent=true' "$W" || fail "the wrapper must never render wakeAgent true"
 

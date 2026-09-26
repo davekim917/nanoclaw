@@ -13,6 +13,8 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { judgeGateResult, observationProblem } from '../src/modules/scheduling/observation.js';
+
 import {
   formatHumanReport,
   gateResult,
@@ -601,7 +603,18 @@ describe('gateResult — the host-gated task-script contract', () => {
       { ts: '2026-09-15T01:05:00.000Z', source: 'rate_limit_event' },
     ]);
 
-    expect(gateResult(scan(root)).wakeAgent).toBe(false);
+    const gate = gateResult(scan(root));
+    expect(gate.wakeAgent).toBe(false);
+    // The quiet line declares an observation the host's gate judge accepts.
+    expect(gate.observation).toMatchObject({ kind: 'empty', bound: '26h' });
+    expect(observationProblem(gate.observation)).toBeNull();
+    expect(judgeGateResult({ result: gate }).observation).toBe('empty');
+  });
+
+  it('declares no observation on a waking line', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-broken', 'sess-1', [{ ts: '2026-09-15T01:00:00.000Z', source: 'rate_limit_event' }]);
+    expect(gateResult(scan(root))).not.toHaveProperty('observation');
   });
 
   it('wakes on scan errors even when no pair is broken', () => {
