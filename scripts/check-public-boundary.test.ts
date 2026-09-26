@@ -406,7 +406,7 @@ describe('Git surfaces and modes', () => {
     expect(output).toContain(
       `identifier inventory paths tried: ${path.join(root, '.nanoclaw', 'public-boundary-identifiers')}`,
     );
-    expect(output).toContain('indexed scans require both an install registry and identifier inventory');
+    expect(output).toContain('gating scans require both an install registry and identifier inventory');
   });
 
   it.each([
@@ -817,12 +817,46 @@ describe('identifiers derived from the install', () => {
     const root = initRepo();
     execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/Open-Org/project.git'], { cwd: root });
     execFileSync('git', ['remote', 'add', 'upstream', 'git@github.com:parent-org/project.git'], { cwd: root });
-    const problems: string[] = [];
-    expect(publicRemotes([root, path.join(root, 'missing')], problems)).toEqual({
+    expect(publicRemotes([root, path.join(root, 'missing'), path.parse(root).root])).toEqual({
       owners: new Set(['open-org', 'parent-org']),
       repositories: new Set(['github.com/open-org/project', 'github.com/parent-org/project']),
     });
-    expect(problems).toEqual([]);
+  });
+
+  it('keeps an explicit registry outside a data directory usable, with no checkout inferred from it', () => {
+    const root = initRepo();
+    execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: root });
+    const registryDir = tempRoot();
+    const dbPath = writeRegistry(path.join(registryDir, 'elsewhere'));
+    addCanonical(
+      path.join(registryDir, 'elsewhere'),
+      'wg-fictional',
+      'WIDGET',
+      'https://github.com/acme-co/WIDGET.git',
+    );
+    const inventory = path.join(registryDir, 'identifiers');
+    fs.writeFileSync(inventory, 'Fictional Local Team\n');
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const args = ['--root', root, '--index', '--db', dbPath, '--identifiers', inventory];
+    expect(runReport(resolveOptions(args, root)).discoveryProblems).toEqual([]);
+    expect(main(args)).toBe(0);
+    expect(loadInstallIdentifiers(dbPath, publicProject, [])).toEqual(new Set());
+  });
+
+  it('fails a message scan closed when an identifier source does not resolve', () => {
+    const root = initRepo();
+    const message = path.join(root, 'TAG_MSG');
+    fs.writeFileSync(message, 'release notes\n');
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    expect(main(['--root', root, '--message', message, '--message-raw'])).toBe(1);
+    expect(main(['--root', root, '--message', message, '--allow-structural'])).toBe(0);
+    addInstallRegistry(root, 'Fictional Registry House');
+    expect(main(['--root', root, '--message', message, '--message-raw'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain('missing identifier inventory');
+    addIdentifierInventory(root, 'Fictional Local Team');
+    expect(main(['--root', root, '--message', message, '--message-raw'])).toBe(0);
   });
 
   it('adds derived names to an install-aware run', () => {

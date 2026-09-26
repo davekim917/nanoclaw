@@ -431,15 +431,14 @@ export interface PublicRemotes {
   repositories: Set<string>;
 }
 
-export function publicRemotes(roots: string[], problems: string[]): PublicRemotes {
+// Unlike identifier discovery, a failure here fails strict: an unread remote
+// only exempts less, so a root that is not a readable checkout is skipped.
+export function publicRemotes(roots: string[]): PublicRemotes {
   const remotes: PublicRemotes = { owners: new Set(), repositories: new Set() };
   for (const root of roots) {
     if (!fs.existsSync(root)) continue;
     const lines = gitConfigLines(['--local', '--get-regexp', '^remote\\..*\\.url$'], root);
-    if (lines === null) {
-      problems.push('a checkout remote configuration could not be read');
-      continue;
-    }
+    if (lines === null) continue;
     for (const line of lines) {
       const parsed = remoteOwnerRepo(line.replace(/^\S+\s+/, ''));
       if (!parsed) continue;
@@ -448,6 +447,16 @@ export function publicRemotes(roots: string[], problems: string[]): PublicRemote
     }
   }
   return remotes;
+}
+
+/**
+ * The install checkout that holds `dbPath`, only for the `<install>/data/<db>`
+ * layout. An explicit registry elsewhere names no checkout: its grandparent
+ * must not contribute groups, clones, or public remotes.
+ */
+function installRootOf(dbPath: string): string | null {
+  const dataDir = path.dirname(path.resolve(dbPath));
+  return path.basename(dataDir) === 'data' ? path.dirname(dataDir) : null;
 }
 
 function isGenericRepositoryName(name: string): boolean {
@@ -488,24 +497,22 @@ function listSource(dir: string, problems: string[], what: string): string[] {
  */
 export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, problems: string[]): Set<string> {
   const identifiers = new Set<string>();
-  const dataDir = path.dirname(dbPath);
-
-  if (path.basename(dataDir) === 'data') {
-    const groupsDir = path.join(path.dirname(dataDir), 'groups');
-    for (const folder of listSource(groupsDir, problems, 'the groups directory')) {
-      const config = readSource(
-        () => JSON.parse(fs.readFileSync(path.join(groupsDir, folder, 'container.json'), 'utf8')) as unknown,
-      );
-      if (!config.ok) {
-        if (!config.absent) problems.push('a group container.json could not be read or parsed');
-        continue;
-      }
-      if (config.value && typeof config.value === 'object')
-        addIdentifier(identifiers, (config.value as Record<string, unknown>).assistantName);
+  const installRoot = installRootOf(dbPath);
+  if (!installRoot) return identifiers;
+  const groupsDir = path.join(installRoot, 'groups');
+  for (const folder of listSource(groupsDir, problems, 'the groups directory')) {
+    const config = readSource(
+      () => JSON.parse(fs.readFileSync(path.join(groupsDir, folder, 'container.json'), 'utf8')) as unknown,
+    );
+    if (!config.ok) {
+      if (!config.absent) problems.push('a group container.json could not be read or parsed');
+      continue;
     }
+    if (config.value && typeof config.value === 'object')
+      addIdentifier(identifiers, (config.value as Record<string, unknown>).assistantName);
   }
 
-  const repositoriesDir = path.join(dataDir, 'repositories');
+  const repositoriesDir = path.join(installRoot, 'data', 'repositories');
   for (const workgroup of listSource(repositoriesDir, problems, 'the repository store')) {
     for (const name of listSource(path.join(repositoriesDir, workgroup), problems, 'a repository directory')) {
       const config = path.join(repositoriesDir, workgroup, name, '.git', 'config');
@@ -1053,7 +1060,8 @@ export function runReport(options: ScanOptions): RunReport {
         const values = loadRegistryIdentifiers(dbPath);
         // Reset per attempt: only the install that supplies the names reports on them.
         discoveryProblems = [];
-        const remotes = publicRemotes([options.root, path.dirname(path.dirname(dbPath))], discoveryProblems);
+        const installRoot = installRootOf(dbPath);
+        const remotes = publicRemotes(installRoot ? [options.root, installRoot] : [options.root]);
         for (const value of loadInstallIdentifiers(dbPath, remotes, discoveryProblems)) values.add(value);
         return values;
       },
@@ -1182,9 +1190,9 @@ export function main(argv = process.argv.slice(2)): number {
           ? `no identifier registry found; ${missing} — running structural-pattern checks only; real names and tenant identifiers will NOT be caught`
           : `install-aware checks are incomplete; ${missing}`;
       process.stderr.write(`WARNING: ${coverage}\n`);
-      if (options.index && !options.allowStructural) {
+      if ((options.index || options.messagePath) && !options.allowStructural) {
         process.stderr.write(
-          'public boundary check failed: indexed scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
+          'public boundary check failed: gating scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
         );
         return 1;
       }
