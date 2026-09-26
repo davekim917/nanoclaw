@@ -2,9 +2,15 @@
  * Orchestrator self-spawn module.
  *
  * PARKED since 2026-08-11: no agent group holds the `orchestrator` capability, so none of
- * these actions fire and the reconciler/watchdog sweeps in host-sweep.ts are no-ops. Kept
- * compiled + tested pending a new fan-out strategy; restore = grantCapability(). Do not
- * delete, do not re-grant without a decision. See docs/specs/orchestrator-dispatch/spawn-rework-plan.md.
+ * these actions fire and the reconciler sweep (src/modules/sweep-orchestrator/) is a no-op.
+ * Kept compiled + tested pending a new fan-out strategy. Do not delete, do not re-grant
+ * without a decision. See docs/specs/orchestrator-dispatch/spawn-rework-plan.md.
+ *
+ * `grantCapability()` alone is NOT a restore: nothing reaps an admitted task any more — no
+ * deadline, no-progress timeout, spawn deadline or child-exit check — so a stalled or dead
+ * child would stay `running` forever, hold its parent's concurrency slot, and keep
+ * `revokeCapability()` answering `tasks_in_flight`. Restoring dispatch needs a task reaper
+ * first.
  *
  * Registers 5 delivery actions for the spawn pipeline:
  *   - spawn_task      (orchestrator → host: admit new task)
