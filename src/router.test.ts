@@ -528,6 +528,47 @@ describe('flag dispatcher wake gate', () => {
     expect(parseMessageFlags).toHaveBeenCalled();
   });
 
+  it('stamps the posted settings line on the stored row as flagAck, so the runner can say it is queued', async () => {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg: makeMg(), agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
+    vi.mocked(getAgentGroup).mockResolvedValue({
+      id: 'ag-1',
+      name: 'Example Assistant',
+      folder: 'example-retail',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockResolvedValue({
+      session: {
+        id: 's-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: true,
+    });
+    vi.mocked(parseMessageFlags).mockReturnValueOnce({
+      intent: { stickyEffort: 'high' },
+      errors: [],
+      warnings: ['one warning'],
+      cleanedText: '',
+    });
+    vi.mocked(formatFlagConfirmation).mockReturnValueOnce('⚙️ effort → high\n⚠️ one warning');
+
+    await routeInbound(makeChatEvent('-e high'));
+
+    const written = vi.mocked(writeSessionMessageIfNew).mock.calls[0]![2];
+    const content = JSON.parse(written.content) as { flagIntent?: unknown; flagAck?: unknown };
+    expect(content.flagIntent).toEqual({ stickyEffort: 'high' });
+    expect(content.flagAck).toBe('⚙️ effort → high');
+  });
+
   it('falls back to agent_groups.agent_provider when the container_configs row is missing (mid-run-created group)', async () => {
     // Groups created mid-run have no container_configs row until
     // backfillContainerConfigs at the next host restart (group-init.ts FK

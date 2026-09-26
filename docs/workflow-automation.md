@@ -16,8 +16,10 @@ receipt, recovery deadline, or failure that needs judgment wakes with compact
 facts and evidence references.
 
 Do not encode a timeout, malformed state, or failed fetch as a quiet result. A
-task script may fail so its normal failure/backoff path remains visible, or it
-may wake with a bounded failure record when an agent can investigate. Give each
+task script may fail so its normal failure/backoff path remains visible, declare
+the fire `unreadable` or `blocked` with a bound
+([Observations](scheduled-tasks.md#observations)), or wake with a bounded
+failure record when an agent can investigate. Give each
 failure path an owner, retry limit or trigger, and a recovery action before the
 workflow is enabled.
 

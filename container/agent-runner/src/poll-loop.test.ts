@@ -5005,6 +5005,104 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(getPendingMessages().map((message) => message.id)).toContain('occ-2');
   }, 15_000);
 
+  const queuedNotices = (): { text: string; platform_id: string | null; thread_id: string | null }[] =>
+    (
+      getOutboundDb().prepare("SELECT platform_id, thread_id, content FROM messages_out WHERE kind = 'chat'").all() as {
+        platform_id: string | null;
+        thread_id: string | null;
+        content: string;
+      }[]
+    )
+      .map((row) => ({
+        text: (JSON.parse(row.content) as { text?: string }).text ?? '',
+        platform_id: row.platform_id,
+        thread_id: row.thread_id,
+      }))
+      .filter((row) => row.text.includes('is queued until the current task finishes'));
+
+  const busyQuery = (): AgentQuery => {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Several polls see the pending flag while this turn runs.
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'first', isError: true };
+      await Bun.sleep(1600);
+    }
+    return {
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      applySettings: async () => {},
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+  };
+
+  const insertRouted = (id: string, kind: string, platformId: string, threadId: string, content: object) =>
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES (?, ?, datetime('now'), 'pending', 1, ?, 'discord', ?, ?)`,
+      )
+      .run(id, kind, platformId, threadId, JSON.stringify(content));
+
+  it('tells the user once, in the words of the ack, that a typed change is queued behind a busy turn', async () => {
+    insertMessage('flag-1', 'chat', {
+      text: '',
+      flagIntent: { stickyEffort: 'high' },
+      flagAck: '⚙️ effort → high',
+    });
+
+    await processQuery(busyQuery(), TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(queuedNotices().map((n) => n.text)).toEqual([
+      '⚙️ effort → high is queued until the current task finishes. Messages you send before then are read when it does.',
+    ]);
+  }, 15_000);
+
+  it('does not announce a queued change nobody was told about (support-thread pin, scheduled task)', async () => {
+    // Support-thread dispatch writes chat rows carrying the poller's pin as
+    // flagIntent; the host posts no ack for them.
+    insertMessage('support-1', 'chat', { sender: 'system', text: 'new email', flagIntent: { turnEffort: 'low' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'high' } });
+
+    await processQuery(busyQuery(), TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    expect(queuedNotices()).toEqual([]);
+  }, 15_000);
+
+  it('routes the notice to the conversation that typed the flag, not a task sharing the batch', async () => {
+    insertRouted('occ-2', 'task', 'task-channel', 'task-thread', {
+      continuous: true,
+      prompt: 'second fire',
+      flagIntent: { turnEffort: 'high' },
+    });
+    insertRouted('flag-1', 'chat', 'human-channel', 'human-thread', {
+      text: '',
+      flagIntent: { stickyEffort: 'high' },
+      flagAck: '⚙️ effort → high',
+    });
+
+    await processQuery(busyQuery(), TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(queuedNotices()).toEqual([
+      {
+        text: '⚙️ effort → high is queued until the current task finishes. Messages you send before then are read when it does.',
+        platform_id: 'human-channel',
+        thread_id: 'human-thread',
+      },
+    ]);
+  }, 15_000);
+
   it('defers an immutable runtime-context restart while background work is live, and ends once it drains', async () => {
     insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let live = 1;

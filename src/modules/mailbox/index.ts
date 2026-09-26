@@ -89,6 +89,7 @@ import {
   type TaskListSettlement,
   getLatestRoutedTaskRow,
   getLatestTaskContent,
+  getTaskOccurrenceSeriesId,
   getRecentInboundChatSenders,
   hasRestartNoteSince,
   type ChannelDestination,
@@ -174,10 +175,13 @@ import {
   getProcessingClaims,
   hasProcessingAck,
   listOverdueRecurringRows,
+  listStuckGateResults,
+  hasUnrecordedGateRows,
   syncProcessingAcks,
   type ContainerState as ForkContainerState,
   type OverdueRecurringRows,
   type ProcessingClaim,
+  type StuckGateResults,
 } from './ops/sweep.js';
 import {
   incrementWorkContinuationResumeAttempt,
@@ -393,6 +397,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   getRecentInboundChatSenders(limit: number): InboundChatSenderRow[];
   getChannelDestination(name: string): ChannelDestination | null;
   getLatestTaskContent(seriesId: string): string | null;
+  getTaskOccurrenceSeriesId(occurrenceId: string): string | null;
   getLatestRoutedTaskRow(seriesId: string): RoutedTaskRow | null;
   getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
   getInboundRequestIdentity(sequence: number): InboundRequestIdentity | null;
@@ -427,6 +432,10 @@ export interface NanoclawMailboxSession extends MailboxSession {
   syncProcessingAcks(): string[];
   /** Recurring occurrences due since before `cutoffIso` that no container has acknowledged (see the op). */
   listOverdueRecurringRows(cutoffIso: string): OverdueRecurringRows;
+  /** Gate-lane results not on record since before `cutoffIso` (see the op). */
+  listStuckGateResults(cutoffIso: string): StuckGateResults;
+  /** A container gate row delivery has not recorded yet (see the op). */
+  hasUnrecordedGateRows(): boolean;
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
   /**
@@ -1181,6 +1190,7 @@ function forkOps(
     getRecentInboundChatSenders: (limit) => getRecentInboundChatSenders(inbound, limit),
     getChannelDestination: (name) => getChannelDestination(inbound, name),
     getLatestTaskContent: (seriesId) => getLatestTaskContent(inbound, seriesId),
+    getTaskOccurrenceSeriesId: (occurrenceId) => getTaskOccurrenceSeriesId(inbound, occurrenceId),
     getLatestRoutedTaskRow: (seriesId) => getLatestRoutedTaskRow(inbound, seriesId),
     getInboundRoutingAnchor: (messageId) => getInboundRoutingAnchor(inbound, messageId),
     getInboundRequestIdentity: (sequence) => getInboundRequestIdentity(inbound, sequence),
@@ -1196,6 +1206,9 @@ function forkOps(
     syncProcessingAcks: () => readOutbound([], (outbound) => syncProcessingAcks(inbound, outbound)),
     listOverdueRecurringRows: (cutoffIso) =>
       listOverdueRecurringRows(inbound, outboundPresent ? readableOutbound() : null, cutoffIso),
+    listStuckGateResults: (cutoffIso) =>
+      listStuckGateResults(inbound, outboundPresent ? readableOutbound() : null, cutoffIso),
+    hasUnrecordedGateRows: () => hasUnrecordedGateRows(inbound, outboundPresent ? readableOutbound() : null),
     // A never-woken session has no turn usage: empty is the honest answer here,
     // not the opener's throw (the rollup runs over every session every tick).
     listTurnUsageSince: (afterId) => readOutbound([], (outbound) => listTurnUsageSince(outbound, afterId)),

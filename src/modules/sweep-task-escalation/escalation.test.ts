@@ -36,12 +36,22 @@ vi.mock('../../host-sweep.js', () => ({
 // Seeded through the shared fixture rather than `runMigrations(getRawDb())`:
 // the raw synchronous handle is under a shrink-only pin
 // (`src/db/raw-db-ratchet.test.ts`), so naming it here would be an addition.
+import Database from 'better-sqlite3';
+
 import { closeDb } from '../../db/connection.js';
 import { initMigratedTestDb } from '../../db/index.js';
-import { readFailureStreak, recordTaskRunOutcome } from '../../db/task-run-outcomes.js';
+import {
+  readFailureStreak,
+  readGateEpisode,
+  recordTaskRunOutcome,
+  upsertGateOutcome,
+  type GateOutcomeUpsert,
+} from '../../db/task-run-outcomes.js';
+import type { GateObservation } from '../scheduling/observation.js';
 import {
   TASK_FAILURE_ESCALATION_THRESHOLD,
   formatTaskFailureAlert,
+  gateEpisodeDeadlineMs,
   runTaskFailureEscalation,
   shouldEscalateTaskFailures,
 } from './index.js';
@@ -70,7 +80,10 @@ beforeEach(async () => {
   await initMigratedTestDb();
 });
 
-afterEach(() => closeDb());
+afterEach(() => {
+  vi.useRealTimers();
+  return closeDb();
+});
 
 describe('escalation decision', () => {
   it('escalates at the threshold and not before', () => {
@@ -238,5 +251,237 @@ describe('escalation sweep', () => {
     await fire('failed');
     await runTaskFailureEscalation();
     expect(mocks.notifyOperators).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Gate lane: deadline, not count ──────────────────────────────────────────
+
+const MIN = 60_000;
+const HOUR = 60 * MIN;
+const T0 = Date.parse('2026-09-26T12:00:00.000Z');
+let occ = 0;
+
+/** One pre-task execution recorded at `atMs`, as the host or the delivery recorder would. */
+async function gateAt(
+  atMs: number,
+  observation: GateObservation,
+  over: Partial<GateOutcomeUpsert> = {},
+): Promise<void> {
+  occ += 1;
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(atMs);
+  try {
+    await upsertGateOutcome({
+      agentGroupId: 'ag-1',
+      sessionId: 'sess-gate',
+      seriesId: 'pr-watch-a1b2',
+      occurrenceId: `occ-${occ}`,
+      observation,
+      outcome: observation === 'empty' || observation === 'wake' ? 'ok' : 'failed',
+      boundMs: observation === 'wake' ? null : HOUR,
+      since: null,
+      detail: observation === 'unreadable' ? 'GitHub API returned 502' : null,
+      ...over,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+async function tickAt(nowMs: number): Promise<void> {
+  await runTaskFailureEscalation(nowMs);
+}
+
+describe('gate lane escalation', () => {
+  beforeEach(() => {
+    occ = 0;
+  });
+
+  it('DMs once the deadline passes, with no further fire, and names what the operator needs', async () => {
+    await gateAt(T0, 'unreadable');
+
+    await tickAt(T0 + 59 * MIN);
+    expect(mocks.notifyOperators).not.toHaveBeenCalled();
+
+    await tickAt(T0 + 60 * MIN);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+    const text = mocks.notifyOperators.mock.calls[0]![0];
+    expect(text).toContain('pr-watch-a1b2');
+    expect(text).toContain('watcher-agent');
+    expect(text).toContain('Sep 26, 2026, 8:00 AM'); // the episode start, in the group's zone
+    expect(text).toContain('`unreadable`');
+    expect(text).toContain('GitHub API returned 502');
+    expect(text).toContain('1h bound');
+
+    await tickAt(T0 + 5 * HOUR);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+  });
+
+  it('latches the deadline: a later, larger bound does not extend it', async () => {
+    await gateAt(T0, 'unreadable', { boundMs: HOUR });
+    await gateAt(T0 + 30 * MIN, 'unreadable', { boundMs: 4 * HOUR });
+
+    await tickAt(T0 + 60 * MIN);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+  });
+
+  it('a newer, smaller bound brings the deadline forward', async () => {
+    await gateAt(T0, 'blocked', { boundMs: 4 * HOUR });
+    await gateAt(T0 + 10 * MIN, 'blocked', { boundMs: 15 * MIN });
+
+    await tickAt(T0 + 14 * MIN);
+    expect(mocks.notifyOperators).not.toHaveBeenCalled();
+    await tickAt(T0 + 15 * MIN);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+  });
+
+  it('an earlier since pulls the start back', async () => {
+    await gateAt(T0, 'unfinished', { boundMs: 4 * HOUR, since: new Date(T0 - 3 * HOUR).toISOString() });
+
+    await tickAt(T0 + 59 * MIN);
+    expect(mocks.notifyOperators).not.toHaveBeenCalled();
+    await tickAt(T0 + 60 * MIN);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+    expect(mocks.notifyOperators.mock.calls[0]![0]).toContain('Sep 26, 2026, 5:00 AM');
+  });
+
+  it('empty and wake each end the episode, so its deadline never arrives', async () => {
+    await gateAt(T0, 'unreadable');
+    await gateAt(T0 + 30 * MIN, 'empty');
+    await tickAt(T0 + 5 * HOUR);
+
+    await gateAt(T0 + 6 * HOUR, 'error');
+    await gateAt(T0 + 6 * HOUR + 30 * MIN, 'wake');
+    await tickAt(T0 + 10 * HOUR);
+
+    expect(mocks.notifyOperators).not.toHaveBeenCalled();
+  });
+
+  it('re-arms after an ok: a later episode alerts again', async () => {
+    await gateAt(T0, 'unreadable');
+    await tickAt(T0 + HOUR);
+    await gateAt(T0 + 2 * HOUR, 'empty');
+    await gateAt(T0 + 3 * HOUR, 'unreadable');
+    await tickAt(T0 + 3 * HOUR + 30 * MIN);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+
+    await tickAt(T0 + 4 * HOUR);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves the alert armed when the DM fails, and retries it next tick', async () => {
+    mocks.notifyOperators.mockResolvedValue(false);
+    await gateAt(T0, 'unreadable');
+    await tickAt(T0 + HOUR);
+    expect((await readGateEpisode('ag-1', 'pr-watch-a1b2'))?.escalated).toBe(false);
+
+    mocks.notifyOperators.mockResolvedValue(true);
+    await tickAt(T0 + HOUR + MIN);
+    expect((await readGateEpisode('ag-1', 'pr-watch-a1b2'))?.escalated).toBe(true);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(2);
+  });
+
+  it('healthy turnover: settling K1 and admitting K2 in one fire never alerts', async () => {
+    const bound = 4 * HOUR;
+    // K1 held for three hours, reported unfinished with its own start every fire.
+    for (let t = 0; t <= 3 * HOUR; t += 30 * MIN) {
+      await gateAt(T0 + t, 'unfinished', { boundMs: bound, since: new Date(T0).toISOString() });
+      await tickAt(T0 + t);
+    }
+    // One fire settles K1 and admits K2: empty, with the turnover as evidence.
+    await gateAt(T0 + 3 * HOUR + 30 * MIN, 'empty', { detail: '{"settled":"K1","admitted":"K2"}' });
+    // K2 held for three more hours from its own start.
+    const k2 = T0 + 3 * HOUR + 30 * MIN;
+    for (let t = 30 * MIN; t <= 3 * HOUR; t += 30 * MIN) {
+      await gateAt(k2 + t, 'unfinished', { boundMs: bound, since: new Date(k2).toISOString() });
+      await tickAt(k2 + t);
+    }
+    expect(mocks.notifyOperators).not.toHaveBeenCalled();
+  });
+
+  it('without the turnover, unfinished work whose since keeps advancing still alerts at the first start', async () => {
+    const bound = 4 * HOUR;
+    for (let t = 0; t <= 4 * HOUR; t += 30 * MIN) {
+      await gateAt(T0 + t, 'unfinished', { boundMs: bound, since: new Date(T0 + t).toISOString() });
+      await tickAt(T0 + t);
+    }
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+    expect(mocks.notifyOperators.mock.calls[0]![0]).toContain('Sep 26, 2026, 8:00 AM');
+  });
+
+  it('keeps the lanes apart: gate ok rows never reset a failing turn streak', async () => {
+    await fire('failed');
+    await gateAt(T0, 'empty');
+    await fire('failed');
+    await gateAt(T0 + MIN, 'empty');
+    await fire('failed');
+
+    await tickAt(T0 + 2 * MIN);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+    expect(mocks.notifyOperators.mock.calls[0]![0]).toContain('3 consecutive failed runs');
+  });
+
+  it('computes the deadline from minima only', () => {
+    expect(
+      gateEpisodeDeadlineMs({
+        firstRecordedAt: '2026-09-26T12:00:00.000Z',
+        earliestSince: '2026-09-26T10:00:00.000Z',
+        boundMs: HOUR,
+      }),
+    ).toEqual({ startMs: T0 - 2 * HOUR, deadlineMs: T0 - HOUR });
+    // A since later than the first row cannot push the start forward.
+    expect(
+      gateEpisodeDeadlineMs({
+        firstRecordedAt: '2026-09-26T12:00:00.000Z',
+        earliestSince: '2026-09-26T13:00:00.000Z',
+        boundMs: HOUR,
+      }).startMs,
+    ).toBe(T0);
+  });
+});
+
+describe('gate lane escalation across a host restart', () => {
+  it('a fresh module state does not DM an episode that was already escalated', async () => {
+    const dbPath = `${uniqueTmpRoot('t24-restart')}/v2.db`;
+    const { mkdirSync } = await import('node:fs');
+    const { dirname } = await import('node:path');
+    mkdirSync(dirname(dbPath), { recursive: true });
+
+    const boot = async () => {
+      vi.resetModules();
+      const db = await import('../../db/index.js');
+      const migrator = new Database(dbPath);
+      try {
+        db.runMigrations(migrator);
+      } finally {
+        migrator.close();
+      }
+      await db.initDb(dbPath);
+      return { db, t24: await import('./index.js'), ledger: await import('../../db/task-run-outcomes.js') };
+    };
+
+    let host = await boot();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+    await host.ledger.upsertGateOutcome({
+      agentGroupId: 'ag-1',
+      sessionId: 'sess-gate',
+      seriesId: 'pr-watch-a1b2',
+      occurrenceId: 'occ-restart',
+      observation: 'unreadable',
+      outcome: 'failed',
+      boundMs: HOUR,
+      since: null,
+      detail: 'GitHub API returned 502',
+    });
+    vi.useRealTimers();
+    await host.t24.runTaskFailureEscalation(T0 + HOUR);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+    await host.db.closeDb();
+
+    host = await boot();
+    await host.t24.runTaskFailureEscalation(T0 + 2 * HOUR);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+    await host.db.closeDb();
   });
 });

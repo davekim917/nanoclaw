@@ -70,6 +70,14 @@ export function getLatestTaskContent(db: Database.Database, seriesId: string): s
   return row?.content ?? null;
 }
 
+/** The series a task occurrence in this session belongs to, or null when it is not one. */
+export function getTaskOccurrenceSeriesId(db: Database.Database, occurrenceId: string): string | null {
+  const row = db.prepare("SELECT series_id FROM messages_in WHERE id = ? AND kind = 'task'").get(occurrenceId) as
+    | { series_id: string | null }
+    | undefined;
+  return row?.series_id ?? null;
+}
+
 /** The delivery route and payload a host-authored task occurrence carries. */
 export interface RoutedTaskRow {
   channel_type: string;

@@ -68,6 +68,7 @@ import {
 } from './task-list-host.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
+import { isGateRow, orderGateRowsBySeq, recordGateRow } from './modules/scheduling/gate-row.js';
 import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
 import type { OutboundFile } from './channels/adapter.js';
 import { isChannelVariant, type PendingApproval, type Session } from './types.js';
@@ -979,7 +980,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   // never sent: the list is whole in every edit, so only the newest matters,
   // and skipping the rest keeps a busy list off the platform's rate limit.
   const supersededEdits = supersededTaskListEdits(due);
-  const undelivered = due.filter((m) => !supersededEdits.has(m.id));
+  const undelivered = orderGateRowsBySeq(due.filter((m) => !supersededEdits.has(m.id)));
   if (supersededEdits.size > 0) {
     await ackDelivery(agentGroup.id, session.id, (mailbox) => {
       for (const id of supersededEdits) mailbox.markDelivered(id, null);
@@ -1074,7 +1075,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     // Deciding from it BEFORE the adapter runs is what stops a successor host
     // spending attempt N+1, and stops a re-send of a message whose failure
     // happened after it had already left the previous host.
-    const stored = await readAttemptRow(msg.id);
+    const stored = isGateRow(msg) ? undefined : await readAttemptRow(msg.id);
     if (stored !== undefined && stored.attempts >= MAX_DELIVERY_ATTEMPTS) {
       // Terminal, like the give-up below, so the drain must not arm the quiet
       // cache this tick. The `delivered` row it writes takes the message out
@@ -1159,6 +1160,11 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         continue;
       }
       sawError = true;
+      // A gate row is a result the ledger must eventually hold: no attempt cap.
+      if (isGateRow(msg)) {
+        log.warn('Gate result not recorded — retrying next poll', { messageId: msg.id, sessionId: session.id, err });
+        break;
+      }
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
         await giveUpOnMessage(msg, attempts, err instanceof Error ? err.message : String(err), 'this attempt', err);
@@ -1343,6 +1349,7 @@ async function deliverMessage(
   session: Session,
 ): Promise<{ platformMsgId?: string; deferAck?: true; recordOnly?: true }> {
   if (msg.kind === 'work_log') return { recordOnly: true };
+  if (await recordGateRow(msg, session)) return { recordOnly: true };
   assertChannelRoutingConsistency({ channelType: msg.channel_type, platformId: msg.platform_id });
 
   if (!deliveryAdapter) {

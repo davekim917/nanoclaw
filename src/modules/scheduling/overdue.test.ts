@@ -8,6 +8,7 @@
 import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from '../../mailbox/sqlite/schema.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
@@ -39,19 +40,9 @@ const ago = (ms: number) => new Date(NOW - ms).toISOString();
 
 function makeSession(withOutbound = true) {
   const inDb = new Database(':memory:');
-  inDb.exec(`
-    CREATE TABLE messages_in (
-      id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
-      status TEXT DEFAULT 'pending', process_after TEXT, recurrence TEXT, series_id TEXT,
-      tries INTEGER DEFAULT 0, trigger INTEGER NOT NULL DEFAULT 1, platform_id TEXT,
-      channel_type TEXT, thread_id TEXT, content TEXT NOT NULL, source_session_id TEXT,
-      on_wake INTEGER NOT NULL DEFAULT 0
-    );
-  `);
+  inDb.exec(INBOUND_SCHEMA);
   const outDb = new Database(':memory:');
-  outDb.exec(`
-    CREATE TABLE processing_ack (message_id TEXT PRIMARY KEY, status TEXT NOT NULL, status_changed TEXT NOT NULL);
-  `);
+  outDb.exec(OUTBOUND_SCHEMA);
   const mailbox = composeNanoclawSession(inDb, () => outDb, undefined, withOutbound);
   return { inDb, outDb, mailbox };
 }
@@ -61,12 +52,12 @@ function seed(
   inDb: Database.Database,
   id: string,
   dueAgoMs: number,
-  over: { recurrence?: string | null; trigger?: number; status?: string } = {},
+  over: { recurrence?: string | null; trigger?: number; status?: string; content?: Record<string, unknown> } = {},
 ) {
   inDb
     .prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
-       VALUES (?, ?, 'task', ?, ?, ?, ?, 'series-a', ?, '{}')`,
+       VALUES (?, ?, 'task', ?, ?, ?, ?, 'series-a', ?, ?)`,
     )
     .run(
       id,
@@ -76,6 +67,7 @@ function seed(
       ago(dueAgoMs),
       over.recurrence === undefined ? '30 1 * * *' : over.recurrence,
       over.trigger ?? 1,
+      JSON.stringify(over.content ?? {}),
     );
 }
 
@@ -286,5 +278,127 @@ describe('escalateOverdueOccurrences', () => {
     }
 
     expect(notify.calls).toHaveLength(1);
+  });
+});
+
+describe('results that have not reached the gate lane', () => {
+  const HOST_GATED = { prompt: 'watch', script: 'check.sh', scriptHost: true };
+
+  /** A container gate row for `occurrenceId`, written `writtenAgoMs` ago and not yet recorded. */
+  function writeGateRow(outDb: Database.Database, id: string, occurrenceId: string, writtenAgoMs: number) {
+    outDb
+      .prepare(`INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES (?, ?, ?, 'task_log', ?)`)
+      .run(
+        id,
+        (seq += 2) + 1,
+        ago(writtenAgoMs),
+        JSON.stringify({ gate: { occurrenceId, wakeAgent: false, observation: { kind: 'empty' } } }),
+      );
+  }
+
+  it('reports a gate row delivery has not recorded for an hour, once, and retries a failed DM after the gap', async () => {
+    const { inDb, outDb, mailbox } = makeSession();
+    seed(inDb, 'task-ran', 2 * 60 * MIN, { status: 'completed' });
+    writeGateRow(outDb, 'gate-stuck', 'task-ran', 59 * MIN);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW);
+    expect(notify.calls).toEqual([]);
+
+    notify.delivered = false;
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN);
+    notify.delivered = true;
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN + 2 * TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
+
+    expect(notify.calls).toHaveLength(2);
+    const [text, context] = notify.calls[1]!;
+    expect(context).toMatchObject({ source: 'task-gate-unrecorded', seriesId: 'series-a', occurrenceId: 'task-ran' });
+    expect(text).toContain('*Scheduled check result not recorded:* `series-a`');
+    expect(text).toContain('occurrence `task-ran`');
+    expect(text).toContain('(65 min ago)');
+    expect(text).toContain('every later message from session `sess-test` is held behind it');
+  });
+
+  it('stays quiet once delivery has recorded the row, and for task_log rows that are not gate rows', async () => {
+    const { inDb, outDb, mailbox } = makeSession();
+    seed(inDb, 'task-ran', 2 * 60 * MIN, { status: 'completed' });
+    writeGateRow(outDb, 'gate-recorded', 'task-ran', 90 * MIN);
+    inDb
+      .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES ('gate-recorded', 'delivered', ?)")
+      .run(ago(80 * MIN));
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('turn-summary', 9001, ?, 'task_log', ?)`,
+      )
+      .run(ago(90 * MIN), JSON.stringify({ auto: true, summary: 'done' }));
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('not-json', 9003, ?, 'task_log', 'x')`,
+      )
+      .run(ago(90 * MIN));
+
+    await escalateOverdueOccurrences(mailbox, session, true, NOW);
+
+    expect(notify.calls).toEqual([]);
+  });
+
+  it('reports a host-gated occurrence still unadmitted with no recorded result an hour past due', async () => {
+    const { inDb, mailbox } = makeSession(false);
+    seed(inDb, 'task-withheld', 61 * MIN, { trigger: 0, content: HOST_GATED });
+    // Not withheld: a recorded wake waiting for admission (its output may be JSON null),
+    // a host-gated row not yet an hour late, and an ordinary unadmitted task.
+    seed(inDb, 'task-recorded-wake', 90 * MIN, { trigger: 0, content: { ...HOST_GATED, scriptOutput: null } });
+    seed(inDb, 'task-recent', 59 * MIN, { trigger: 0, content: HOST_GATED });
+    seed(inDb, 'task-container', 90 * MIN, { trigger: 0, content: { prompt: 'x', script: 'check.sh' } });
+
+    await escalateOverdueOccurrences(mailbox, session, false, NOW);
+
+    expect(notify.calls).toHaveLength(1);
+    const [text, context] = notify.calls[0]!;
+    expect(context).toMatchObject({
+      source: 'task-gate-withheld',
+      seriesId: 'series-a',
+      occurrenceId: 'task-withheld',
+    });
+    expect(text).toContain('Occurrence `task-withheld` has been due since');
+    expect(text).toContain('(61 min)');
+    expect(text).toContain('no recorded result');
+
+    // Past the gap the late row has crossed its hour too; the first is not repeated.
+    await escalateOverdueOccurrences(mailbox, session, false, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
+    await escalateOverdueOccurrences(mailbox, session, false, NOW + 2 * TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
+    expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-withheld', 'task-recent']);
+  });
+
+  it("shares the overdue alarm's attempt gap and dedup, and keys a withheld occurrence apart from an unclaimed one", async () => {
+    const { inDb, outDb, mailbox } = makeSession();
+    seed(inDb, 'task-unclaimed', 90 * MIN);
+    seed(inDb, 'task-withheld', 90 * MIN, { trigger: 0, content: HOST_GATED });
+    writeGateRow(outDb, 'gate-stuck', 'task-unclaimed', 90 * MIN);
+
+    const gap = TASK_OVERDUE_ATTEMPT_MIN_GAP_MS;
+    for (let tick = 0; tick < 5; tick++) {
+      await escalateOverdueOccurrences(mailbox, session, true, NOW + tick * gap);
+      await escalateOverdueOccurrences(mailbox, session, true, NOW + tick * gap + MIN);
+    }
+    expect(notify.calls.map(([, c]) => c.source)).toEqual([
+      'task-overdue',
+      'task-gate-withheld',
+      'task-gate-unrecorded',
+    ]);
+
+    // Admitted at last, then left unclaimed: a different stuck state, so it alerts again.
+    inDb.prepare("UPDATE messages_in SET trigger = 1 WHERE id = 'task-withheld'").run();
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + 5 * gap);
+    expect(notify.calls.at(-1)![1]).toMatchObject({ source: 'task-overdue', occurrenceId: 'task-withheld' });
+  });
+
+  it('a failing stuck-result read does not silence the unclaimed-occurrence alarm', async () => {
+    const { inDb, outDb, mailbox } = makeSession();
+    seed(inDb, 'task-wedged', 90 * MIN);
+    outDb.exec('DROP TABLE messages_out');
+
+    await escalateOverdueOccurrences(mailbox, session, true, NOW);
+
+    expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-wedged']);
   });
 });

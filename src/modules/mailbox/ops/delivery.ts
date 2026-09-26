@@ -7,6 +7,7 @@ import fs from 'fs';
 
 export interface OutboundMessage {
   id: string;
+  seq: number | null;
   kind: string;
   platform_id: string | null;
   channel_type: string | null;

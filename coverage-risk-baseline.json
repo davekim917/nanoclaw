@@ -178,6 +178,7 @@
     "src/db/migrations/077-choice-receipts.ts": 100,
     "src/db/migrations/078-choice-request-reservation.ts": 100,
     "src/db/migrations/083-work-outcome-receipts.ts": 100,
+    "src/db/migrations/084-task-run-outcome-lanes.ts": 100,
     "src/db/migrations/index.ts": 100,
     "src/db/migrations/module-agent-to-agent-destinations.ts": 38.89,
     "src/db/migrations/module-approvals-pending-approvals.ts": 100,
