@@ -1,6 +1,6 @@
 /**
  * Named read ops for the host's operator surfaces (dashboard, Observatory,
- * the orchestrator-dispatch watchdog, the usage rollup).
+ * the usage rollup).
  *
  * These used to be inline SQL in the caller, executed on a handle the caller
  * opened itself. They live here for the same reason every other op does: the
@@ -313,22 +313,6 @@ export function latestReplyTimestampByTrigger(db: Database.Database): Map<string
     )
     .all() as Array<{ in_reply_to: string; ts: string }>;
   return new Map(rows.map((r) => [r.in_reply_to, r.ts]));
-}
-
-/** One outbound `system` row — the envelope only; the caller parses `content`. */
-export interface OutboundSystemRow {
-  timestamp: string;
-  content: string;
-}
-
-/**
- * Every outbound `system` row. The dispatch watchdog scans these for terminal
- * spawn actions; it parses `content` as JSON itself rather than matching a
- * substring here, so this op stays a plain read and the classification stays
- * with the module that owns the vocabulary.
- */
-export function listOutboundSystemMessages(db: Database.Database): OutboundSystemRow[] {
-  return db.prepare("SELECT timestamp, content FROM messages_out WHERE kind = 'system'").all() as OutboundSystemRow[];
 }
 
 /* ─── Per-turn usage (outbound) ────────────────────────────────────────────── */
