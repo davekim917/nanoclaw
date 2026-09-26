@@ -2002,6 +2002,9 @@ export async function processQuery(
   // can dispatch them through the canonical command path. Once we've decided to
   // end, gate further polling so we don't reclaim the rows mid-teardown.
   let endedForCommand = false;
+  // The host's ⚙️ ack reads as "applied", but a deferred change can wait for
+  // the whole of a long turn. Say so once per pending change, not every poll.
+  let deferredSettingsNotice: string | null = null;
   let corruptionStreak = 0;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
@@ -2194,6 +2197,20 @@ export async function processQuery(
               log(
                 'Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain',
               );
+              const acked = findAckedFlag(keep);
+              const notice = acked && queuedSettingsNotice(acked.ack);
+              if (acked && notice && notice !== deferredSettingsNotice) {
+                deferredSettingsNotice = notice;
+                const routing = extractRouting([acked.row]);
+                await writeMessageOut({
+                  id: generateId(),
+                  kind: 'chat',
+                  platform_id: routing.platformId,
+                  channel_type: routing.channelType,
+                  thread_id: routing.threadId,
+                  content: JSON.stringify({ text: notice }),
+                });
+              }
               return;
             }
             log(
@@ -3860,6 +3877,27 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
     log(`Failed to request a primary-provider retry: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
+}
+
+/**
+ * The last row in the batch whose flag the host acked in chat. Only the
+ * router's typed-flag path stamps `flagAck`; support-thread and task rows
+ * carry flagIntent without one, and nobody was told anything about those.
+ */
+export function findAckedFlag(messages: MessageInRow[]): { row: MessageInRow; ack: string } | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    try {
+      const ack = (JSON.parse(messages[i].content) as { flagAck?: unknown }).flagAck;
+      if (typeof ack === 'string' && ack.length > 0) return { row: messages[i], ack };
+    } catch {
+      // not JSON — no ack
+    }
+  }
+  return undefined;
+}
+
+export function queuedSettingsNotice(ack: string): string {
+  return `${ack} is queued until the current task finishes. Messages you send before then are read when it does.`;
 }
 
 /**
