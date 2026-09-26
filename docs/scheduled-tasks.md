@@ -193,18 +193,15 @@ python3 /app/skills/task-observation/task_observation.py --kind empty --evidence
 Each run's result is recorded against its occurrence before the occurrence is
 completed or the agent is woken. `empty` and a wake are successes. Every other
 result is not: `unreadable`, `blocked` and `unfinished`, a script error (with
-its reason), and an invalid observation. A run of consecutive unsuccessful
+its reason), an invalid observation, and a `wakeAgent: false` line with no
+observation (recorded as `undeclared`). A run of consecutive unsuccessful
 results is one episode. Its deadline is its earliest start (its first result,
 or an earlier `since`) plus its smallest bound, so a later run can bring the
 deadline forward but never push it back. Once the deadline passes, the
 operators get one message for the episode, even if the task never runs again;
-the next `empty` or wake ends it. Errors and invalid observations use a 2-hour
-bound. A result that cannot be recorded holds its occurrence until it is, and
+the next `empty` or wake ends it. Errors, invalid observations and `undeclared`
+lines use a 2-hour bound. A result that cannot be recorded holds its occurrence until it is, and
 the operators are told once it has waited an hour.
-
-A `wakeAgent: false` line with no observation is recorded as `undeclared`. It
-currently counts as a success; once every producer declares observations it
-will count as a failure.
 
 Avoid putting secrets directly in task scripts. Prefer runtime credential
 injection through OneCLI so credentials are not stored in the task definition.

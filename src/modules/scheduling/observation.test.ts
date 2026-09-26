@@ -66,11 +66,13 @@ describe('judgeGateResult', () => {
     });
   });
 
-  it('records a missing observation as undeclared and, in report mode, ok', () => {
-    expect(judgeGateResult({ result: { wakeAgent: false } }, NOW_MS)).toMatchObject({
+  it('records a missing observation as undeclared: failed, with the fallback bound', () => {
+    expect(judgeGateResult({ result: { wakeAgent: false } }, NOW_MS)).toEqual({
       observation: 'undeclared',
-      outcome: 'ok',
+      outcome: 'failed',
       boundMs: FALLBACK_BOUND_MS,
+      since: null,
+      detail: 'no observation declared',
     });
   });
 
