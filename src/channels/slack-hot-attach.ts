@@ -26,6 +26,7 @@ import { log } from '../log.js';
 import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { normalizeName } from '../modules/agent-to-agent/db/agent-destinations.js';
 import { registerSecrets, scrubSecrets } from '../secret-scrubber.js';
+import { isShadowHost } from '../shadow-host.js';
 import { resolveOperatorSlackUserId } from '../slack-user-identity.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../types.js';
 import { getActiveAdapters, getChannelAdapterExact, startChannelAdapter } from './channel-registry.js';
@@ -266,6 +267,12 @@ async function openAndWireOwnerDm(
 }
 
 async function addSlackWorkspaceInner(input: AddSlackWorkspaceInput): Promise<SlackWorkspaceAttachResult> {
+  // Boot refuses a shadow holding platform credentials; this is the one path
+  // that writes them into a running host, so it refuses before the token is
+  // stored, validated or started.
+  if (isShadowHost()) {
+    throw attachError('a shadow host never attaches a Slack workspace: its only transport is the CLI channel');
+  }
   const { channelType } = await validateInput(input);
 
   rejectSymlinkedEnvFile(REPO_ROOT);
