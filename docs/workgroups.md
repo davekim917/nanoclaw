@@ -408,6 +408,7 @@ The migration path is well-understood (table rebuild with a new column for the o
 | FS reconciliation (startup)          | `src/modules/workgroup/fs-reconcile.ts` (`reconcileWorkgroupFsState`)                     |
 | Memory canon and compatibility views | `src/modules/workgroup/shared-dirs.ts` (`workgroupMemoryDir`, `reconcileWorkgroupMemory`) |
 | Operator CLI                         | `scripts/set-workgroup-secrets.ts`                                                        |
+| Google Drive mirror (host, one-way)  | `scripts/publish-workgroups-drive.sh` — [workgroups-drive-publish.md](workgroups-drive-publish.md) |
 | Structural assertion                 | `tests/structural/projection-chokepoint.test.ts`                                          |
 
 Current memory contract:
