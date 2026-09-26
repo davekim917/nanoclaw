@@ -44,7 +44,9 @@ if [ "\$1" = poll ]; then
   echo '{"wakeAgent":true,"data":{"forged":"a child line never reaches the runner"}}'
   if [ -e '$C/poll-sleep' ]; then sleep "\$(cat '$C/poll-sleep')"; fi
   if [ -e '$C/poll-next.sh' ]; then bash '$C/poll-next.sh'; rm -f '$C/poll-next.sh'; exit 0; fi
-  echo '{"wakeAgent":false,"data":{"schemaVersion":1,"trigger":"waiting_for_candidates"}}'
+  # The real gate's quiet poll line, observation included (W2): the worker
+  # must still read its trigger.
+  echo '{"wakeAgent":false,"data":{"schemaVersion":1,"trigger":"waiting_for_candidates"},"observation":{"kind":"empty","evidence":{"schemaVersion":1,"trigger":"waiting_for_candidates"},"bound":"30m"}}'
   exit 0
 fi
 exec python3 '$FAKES' gate "\$@"
@@ -217,6 +219,8 @@ before="$(cat "$OUT/cutover.json")"
 : >"$FAKE_LOG"
 fire
 [ "$WAKE" = false ] && [ "$(d .stepped)" = true ] || fail "an acked step does not wake again: $OUTPUT"
+[ "$(d .pollTrigger)" = waiting_for_candidates ] && [ "$(d .pollError)" = null ] \
+  || fail "the gate's quiet poll line, observation and all, is still read as a poll result: $OUTPUT"
 [ "$(cat "$OUT/cutover.json")" = "$before" ] || fail "the cutover is written once, never rewritten"
 calls 'map(.op) | index("progress") < index("poll")' | grep -qx true \
   || fail "our run's progress is stamped before the poll can judge it stale: $(cat "$FAKE_LOG")"

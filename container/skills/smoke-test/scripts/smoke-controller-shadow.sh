@@ -52,8 +52,8 @@
 # controller as `controller_orphan_claim`.
 #
 # Guarantees:
-#   - The LAST stdout line is always {"wakeAgent":false,"data":{...}} and
-#     wakeAgent is a literal. stdout is moved to fd 3 on the first line and
+#   - The LAST stdout line is always {"wakeAgent":false,"observation":{...},
+#     "data":{...}} and wakeAgent is a literal. stdout is moved to fd 3 on the first line and
 #     everything else writes to stderr, so no child can print the line the
 #     task runner parses (agent-runner scheduling/task-script.ts:163-176).
 #   - Two layers. This bash SUPERVISOR runs no config and touches no file: it
@@ -106,10 +106,26 @@ exec 3>&1 1>&2
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# The line declares an observation through the task-observation helper (W2),
+# bound 30m (three */10 fires): a fire that stepped, found the kill switch off
+# or yielded to another fire is empty; one that could not read its inputs is
+# unreadable; any other skip is blocked, so a shadow that keeps failing reaches
+# the operator. The helper failing still prints the bare line.
+OBS_HELPER="${SMOKE_OBSERVATION_HELPER:-$SCRIPT_DIR/../../task-observation/task_observation.py}"
 final() { # <data-json> -- the only write to the runner's stdout
-  local data="${1:-}"
+  local data="${1:-}" kind line
   if ! jq -e 'type == "object"' <<<"$data" >/dev/null 2>&1; then
     data="$(jq -cn --arg e "fire summary missing or not JSON" '{error:$e}' 2>/dev/null)" || data='{}'
+  fi
+  kind="$(jq -r '
+    if has("error") or (.inputErrors // 0) > 0
+       or ((.skipped // "") | test("unreadable|fetch failed")) then "unreadable"
+    elif (.skipped // null) == null or .skipped == "another shadow fire holds wrapper.lock" then "empty"
+    else "blocked" end' <<<"$data" 2>/dev/null)" || kind=""
+  if [ -n "$kind" ] && line="$(python3 "$OBS_HELPER" --kind "$kind" --bound 30m --data "$data" \
+      --evidence-json "$(jq -c '{fire, mode, stepped, skipped, error, inputErrors, activeClaims, held} | with_entries(select(.value != null))' <<<"$data")" 2>/dev/null)"; then
+    printf '%s\n' "$line" >&3
+    exit 0
   fi
   jq -cn --argjson d "$data" '{wakeAgent:false,data:$d}' >&3 2>/dev/null ||
     printf '%s\n' '{"wakeAgent":false,"data":{"error":"final line could not be rendered"}}' >&3

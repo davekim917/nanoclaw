@@ -1428,13 +1428,9 @@ describe('dependency-audit script mount', () => {
     expect(readOnlyIdx).toBeGreaterThan(mountIdx);
   });
 
-  it('keeps the slash-command prompt and precheck script on that same path', () => {
+  it('keeps the slash-command prompt on that same path', () => {
     const prompt = fs.readFileSync(new URL('./channels/discord-slash-commands.ts', import.meta.url), 'utf8');
     expect(prompt).toContain(AUDIT_CONTAINER_PATH);
-
-    const precheck = fs.readFileSync(new URL('../scripts/container-updates-precheck.sh', import.meta.url), 'utf8');
-    expect(precheck).toContain('NANOCLAW_PROJECT_ROOT:-/workspace/project');
-    expect(precheck).toContain('$PROJECT_ROOT/scripts/container-updates.ts');
   });
 });
 

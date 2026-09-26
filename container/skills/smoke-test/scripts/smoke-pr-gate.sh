@@ -25,7 +25,7 @@ _ARGS=()
 for _a in "$@"; do
   if [ "$_a" = "--takeover" ]; then TAKEOVER=true; else _ARGS+=("$_a"); fi
 done
-set -- ${_ARGS[@]+"${_ARGS[@]}"}
+set -- ${_ARGS[@]+"${_ARGS[@]}"}; GATE_VERB="${1:-poll}"; . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-pr-gate-observe.sh"
 
 REPO="${SMOKE_GATE_REPO:-}"
 BRANCH="${SMOKE_GATE_BRANCH:-develop}"
@@ -1448,8 +1448,8 @@ emit_poll_lease_failure() { # <detail-json>
   # only authority and the watcher stays quiet. Lock contention is retryable
   # on the next scheduled poll and is quiet for the same reason.
   if jq -e '(.leaseOwner // null) != null or .retryable == true' <<<"$detail" >/dev/null 2>&1; then
-    jq -cn --argjson detail "$detail" \
-      '{ok:false,wakeAgent:false,data:{schemaVersion:1,trigger:"coordinator_lease_unavailable",detail:$detail}}'
+    declare_quiet "$(jq -cn --argjson detail "$detail" \
+      '{ok:false,wakeAgent:false,data:{schemaVersion:1,trigger:"coordinator_lease_unavailable",detail:$detail}}')"
     return
   fi
   fingerprint="$(jq -r '.error // "unknown shared lease failure"' <<<"$detail" | sha256sum | cut -d' ' -f1)"
@@ -1467,8 +1467,8 @@ emit_poll_lease_failure() { # <detail-json>
     wake=true
   fi
   exec 4>&-
-  jq -cn --argjson wake "$wake" --argjson detail "$detail" \
-    '{ok:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"coordinator_lease_unavailable",detail:$detail}}'
+  declare_quiet "$(jq -cn --argjson wake "$wake" --argjson detail "$detail" \
+    '{ok:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"coordinator_lease_unavailable",detail:$detail}}')"
 }
 
 # Same liveness rule as smoke-develop-gate.sh: a run is live while its newest
@@ -4871,10 +4871,10 @@ if [ -n "$MISSING" ]; then
     CONTROL="$(jq -c --arg now "$(iso_now)" '.lastMisconfigWakeAt=$now' <<<"$CONTROL")"
   fi
   write_control "$CONTROL"
-  jq -cn --argjson wake "$WAKE" \
+  declare_quiet "$(jq -cn --argjson wake "$WAKE" \
     --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",settled:false,missing:$missing}}'
-  exit 0
+    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",settled:false,missing:$missing}}')"
+  exit $?
 fi
 
 PR_LIST_JSON="$(timeout 10 gh pr list -R "$REPO" --base "$BRANCH" --label "$LABEL" --state open \
@@ -4922,9 +4922,9 @@ if [ "$PR_LIST_RC" -ne 0 ] || [ "$REPO_PROBE_OK" != true ] || \
     fi
   fi
   write_control "$CONTROL"
-  jq -cn --argjson wake "$WAKE" --argjson failures "$FAILURES" \
-    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:$failures}}'
-  exit 0
+  declare_quiet "$(jq -cn --argjson wake "$WAKE" --argjson failures "$FAILURES" \
+    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:$failures}}')"
+  exit $?
 fi
 # Fetch succeeded — reset the strike counter.
 exec 8>"$CONTROL_LOCK"
@@ -4937,8 +4937,8 @@ PR_COUNT="$(jq -r 'length' <<<"$PR_LIST_JSON")"
 if [ "$PR_COUNT" -eq 0 ]; then
   # No labeled PR is exactly what a stalled run's PR looks like once it closes.
   if stalled_run_alarm; then exit 0; fi
-  jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates",labeledPrCount:0}}'
-  exit 0
+  declare_quiet "$(jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates",labeledPrCount:0}}')"
+  exit $?
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -5226,9 +5226,9 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       # very next poll re-evaluates this candidate fresh once a preview URL
       # is available, same "defer, don't skip" shape every other preflight
       # failure already has.
-      jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"pr_preflight_failed",
-        reason:"settled candidate has no backend preview URL to run a target-aware preflight against"}}'
-      exit 0
+      declare_quiet "$(jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"pr_preflight_failed",
+        reason:"settled candidate has no backend preview URL to run a target-aware preflight against"}}')"
+      exit $?
     fi
     export SMOKE_GATE_PREFLIGHT_TARGET_URL="$PREFLIGHT_TARGET_URL"
     if timeout "$PREFLIGHT_TIMEOUT" bash -c "$PREFLIGHT_CMD" >"$PREFLIGHT_OUT" 2>&1; then
@@ -5275,15 +5275,15 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       fi
       CONTROL="$(jq -c --arg r "$PREFLIGHT_REASON" '.preflightReason=$r' <<<"$CONTROL")"
       write_control "$CONTROL"
-      jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"pr_preflight_failed"}}'
-      exit 0
+      declare_quiet "$(jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"pr_preflight_failed"}}')"
+      exit $?
     fi
   fi
 
   exec 9>"$(pr_lock_file "$W_PR")"
   if ! flock -w "$LOCK_WAIT" 9; then
-    jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"gate_lock_failed"}}'
-    exit 0
+    declare_quiet "$(jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"gate_lock_failed"}}')"
+    exit $?
   fi
   STATE="$(read_pr_state "$W_PR")"
   # Re-verify under lock: another poll (or a human claim) may have taken this
@@ -5294,8 +5294,8 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
      { [ -n "$ACTIVE_SHA" ] && [ "$(active_run_is_live \
           "$(jq -r '.activeStartedAt // empty' <<<"$STATE")" \
           "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")" = true ]; }; then
-    jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates"}}'
-    exit 0
+    declare_quiet "$(jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates"}}')"
+    exit $?
   fi
 
   # Same-SHA recovery keeps the RUN ID, not just the deadline. Minting a new
@@ -5452,5 +5452,5 @@ fi
 
 if stalled_run_alarm; then exit 0; fi
 
-jq -cn --argjson count "$PR_COUNT" \
-  '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates",labeledPrCount:$count}}'
+declare_quiet "$(jq -cn --argjson count "$PR_COUNT" \
+  '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates",labeledPrCount:$count}}')"

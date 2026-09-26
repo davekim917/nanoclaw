@@ -81,6 +81,12 @@ const EXIT_USAGE = 2;
 /** Cap on findings embedded in `--gate` data, which is injected into a prompt. */
 const GATE_FINDING_LIMIT = 20;
 
+/**
+ * How long a quiet `--gate` result may stand (task-observation skill, W2): a
+ * daily series, matching the default one-day window, with two hours' slack.
+ */
+const GATE_BOUND = '26h';
+
 type PairVerdict =
   /** Push rows in the window, and no pull row has EVER landed for this pair. */
   | 'never'
@@ -455,15 +461,30 @@ export function windowStart(hours: number, now: Date = new Date()): string {
 
 /**
  * The host-gated task-script contract: the LAST stdout line is
- * `{wakeAgent, data}` (`src/modules/scheduling/host-script.ts`).
+ * `{wakeAgent, data}` (`src/modules/scheduling/host-script.ts`), and a quiet
+ * line declares an `empty` observation (`src/modules/scheduling/observation.ts`
+ * judges it; the task-observation skill documents it).
  *
  * A failed scan wakes too. A telemetry checker that goes quiet when it breaks
  * would reproduce, one level up, the exact failure it was built to catch.
  */
-export function gateResult(report: TelemetryHealthReport): { wakeAgent: boolean; data: unknown } {
+export function gateResult(report: TelemetryHealthReport): {
+  wakeAgent: boolean;
+  observation?: { kind: 'empty'; evidence: string; bound: string };
+  data: unknown;
+} {
   const wakeAgent = report.findings.length > 0 || report.errors.length > 0;
   return {
     wakeAgent,
+    ...(wakeAgent
+      ? {}
+      : {
+          observation: {
+            kind: 'empty' as const,
+            evidence: `${report.counts.sessionDbs} session DBs in ${report.counts.agentGroups} agent groups scanned over ${report.windowHours}h: 0 findings, 0 errors`,
+            bound: GATE_BOUND,
+          },
+        }),
     data: {
       check: 'rate-limit-telemetry-health',
       windowHours: report.windowHours,

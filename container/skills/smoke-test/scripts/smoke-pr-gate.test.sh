@@ -386,7 +386,14 @@ bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "gate_misconfigured" and
   (.data.missing | length == 3)
 ' >/dev/null
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_misconfigured"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_misconfigured" and .observation.kind == "blocked"' >/dev/null
+# W2: a quiet poll's observation is one the task-observation helper accepts,
+# and the gate's own keys are all still there for the controller to read.
+bash "$GATE" poll | python3 -c 'import json,sys; sys.path.insert(0, sys.argv[1]); from task_observation import observation_problem
+d = json.loads(sys.stdin.read().splitlines()[-1])
+assert d["wakeAgent"] is False and d["ok"] is False and d["data"]["trigger"] == "gate_misconfigured", d
+p = observation_problem(d["observation"]); sys.exit("invalid observation: " + p if p else 0)' \
+  "$(dirname "$GATE")/../../task-observation"
 
 # --- Common config for every scenario below ---------------------------------
 export SMOKE_GATE_REPO=org/repo
@@ -400,6 +407,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 export STUB_PR_LIST='[]'
 bash "$GATE" poll | jq -e '
   .wakeAgent == false and .data.trigger == "waiting_for_candidates" and .data.labeledPrCount == 0
+  and .observation.kind == "empty" and .observation.bound == "30m"
 ' >/dev/null
 
 # --- 3. Settle happy path: poll claims the run and stamps state ------------
@@ -431,7 +439,7 @@ jq -e --arg sha "$HEAD_SHA" '
 ' "$STATE_DIR/pr-42-state.json" >/dev/null
 jq -e --arg owner "$POLL_OWNER" '.owner == $owner' "$SMOKE_GATE_LEASE_DIR/lease-$POLL_RUN.json" >/dev/null
 # Same head, immediately after claiming: already active, no re-wake.
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
 
 # Automatic poll is also a claim producer. Pre-bind every run id it can mint
 # during this short hermetic call; it must refuse before PR lease/authority or
@@ -561,7 +569,7 @@ flap_poll "3 of 8 QA seats could not be verified" | jq -e '
   .wakeAgent == true and .data.trigger == "pr_preflight_failed"
 ' >/dev/null
 # Changed reason inside the floor: throttled, but the new text IS recorded.
-flap_poll "8 of 8 QA seats could not be verified" | jq -e '.wakeAgent == false' >/dev/null
+flap_poll "8 of 8 QA seats could not be verified" | jq -e '.wakeAgent == false and .observation.kind == "blocked"' >/dev/null
 jq -e '.preflightReason == "8 of 8 QA seats could not be verified"' "$FLAP_CTL" >/dev/null
 # Past the floor, flapped BACK to the reason we last alarmed on: still silent.
 flap_age
@@ -1954,7 +1962,7 @@ bash "$GATE" poll | jq -e --arg sha "$HEAD_SHA" '
   .wakeAgent == true and .data.trigger == "pr_migrations_refused" and
   .data.pr == 11 and .data.sourceSha == $sha
 ' >/dev/null
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
 [ ! -e "$STATE_DIR/pr-11-verdict.json" ]
 
 # --- 7. claim/progress/release lifecycle ------------------------------------
@@ -2008,7 +2016,7 @@ bash "$GATE" poll | jq -e --arg sha "$DUP_SHA" '
   .data.sourceSha == $sha and .data.activeAgeSeconds >= 0
 ' >/dev/null
 jq -e '.overrunAlertRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
 jq -e '.activeRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
 # Control, so the assertion above cannot pass vacuously: this fixture IS a real
 # settle candidate. Free the slot and the very same poll wakes and auto-claims.
@@ -2114,9 +2122,9 @@ jq -cn --arg o "$STALL_OWNER" --arg run "$STALL_RUN" --arg sha "$STALL_SHA" \
 # ...and the preview is suspended: the PR is still listed, it just never settles.
 export STUB_HEALTHZ_CODE=503
 # Fresh progress => silent, byte-identical to a gate that has no such alarm.
-[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: a live claimed run changed poll output" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: a live claimed run changed poll output" >&2; exit 1; }
 # Stale, but inside the grace that gives same-run recovery first refusal => silent.
-[ "$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll)" = "$IDLE_ONE" ] ||
+[ "$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] ||
   { echo "7c: stalled alarm rang inside its grace window" >&2; exit 1; }
 jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-61-state.json" >/dev/null
 # The precondition of the hole, asserted rather than assumed: the timeout verb
@@ -2147,7 +2155,7 @@ if grep -q 'owner-[0-9a-f]\{8\}' <<<"$STALL_OUT"; then echo "7c: stalled wake le
   { echo "7c: stalled alarm changed ownership of a non-settling PR" >&2; exit 1; }
 jq -e --arg run "$STALL_RUN" '.stalledAlertRunId == $run' "$STATE_DIR/pr-61-state.json" >/dev/null
 # Next poll => silent. Latched per run id, no interval re-ring.
-[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: stalled alarm re-fired on the next poll" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: stalled alarm re-fired on the next poll" >&2; exit 1; }
 # The preview comes back: existing same-run recovery is untouched by the latch.
 export STUB_HEALTHZ_CODE=200
 bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
@@ -2169,7 +2177,7 @@ bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
   .data.recovery == true and .data.resumedRunId == true and .data.runId == $run' >/dev/null
 jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-62-state.json" >/dev/null
 stall_clear
-[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: recovery and the stalled alarm double-fired" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: recovery and the stalled alarm double-fired" >&2; exit 1; }
 
 # The PR left the labeled-open list altogether (closed) — the case `poll`'s own
 # loop can never see. No disposition, unreadable contract: reported as such.
@@ -2180,7 +2188,7 @@ STALL_RUN="$(jq -r '.data.runId' <<<"$STALL_OPEN")"
 STALL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$STALL_OPEN")"
 export STUB_PR_LIST='[]'
 export STUB_PR_VIEW="{\"state\":\"CLOSED\",\"labels\":[{\"name\":\"render-preview\"}],\"baseRefName\":\"develop\",\"headRefOid\":\"$STALL_SHA\"}"
-[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: live run on an unlisted PR changed poll output" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: live run on an unlisted PR changed poll output" >&2; exit 1; }
 stall_now
 # leaseLive is reported, not acted on: this lease has not lapsed yet.
 bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
@@ -2189,7 +2197,7 @@ bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
   .data.challengerDispositionFiled == false and .data.synthesisPending == false and
   .data.completionContractExists == false and .data.contractAdoptionRequired == false and
   .data.notSettling.reason == "pr_closed" and .data.notSettling.prState == "CLOSED"' >/dev/null
-[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: unlisted stalled alarm re-fired" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: unlisted stalled alarm re-fired" >&2; exit 1; }
 # A NEW run id re-arms it. The responder's own path: resume the published run
 # id with `claim` (allowed once progress is stale and the dead owner's lease has
 # lapsed), release it, and a later run on the same PR that stalls the same way
@@ -2198,13 +2206,13 @@ expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$STALL_RUN.json"
 STALL_RECLAIM="$(bash "$GATE" claim "$STALL_RUN" 63 "$STALL_SHA" owner-responder)"
 jq -e '.ok == true' <<<"$STALL_RECLAIM" >/dev/null
 bash "$GATE" release "$STALL_RUN" owner-responder | jq -e '.ok == true' >/dev/null
-[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: a released run still alarmed" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: a released run still alarmed" >&2; exit 1; }
 bash "$GATE" claim run-stall-second 63 "$STALL_SHA" owner-second | jq -e '.ok == true' >/dev/null
 export STUB_PR_VIEW="{\"state\":\"OPEN\",\"labels\":[],\"baseRefName\":\"develop\",\"headRefOid\":\"$STALL_SHA\"}"
 bash "$GATE" poll | jq -e '
   .data.trigger == "pr_run_stalled" and .data.runId == "run-stall-second" and
   .data.notSettling.reason == "label_removed" and .data.notSettling.labeled == false' >/dev/null
-[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: re-armed stalled alarm re-fired" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: re-armed stalled alarm re-fired" >&2; exit 1; }
 # Unwired run root: null, never false — absence is only evidence when presence
 # was possible. And an unreadable `gh pr view` leaves the honest generic reason.
 bash "$GATE" release run-stall-second owner-second | jq -e '.ok == true' >/dev/null
@@ -2218,7 +2226,7 @@ SMOKE_GATE_RUN_ROOT= bash "$GATE" poll | jq -e '
 # A TERMINAL run is silent: finish it and the same poll says nothing.
 bash "$GATE" finish "$STALL_SHA" run-stall-third BLOCKED owner-third | jq -e '.ok == true' >/dev/null
 jq -e '.activeRunId == null and .completedRunId == "run-stall-third"' "$STATE_DIR/pr-63-state.json" >/dev/null
-[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: a terminal run alarmed as stalled" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: a terminal run alarmed as stalled" >&2; exit 1; }
 stall_clear
 
 # Precedence. (1) A settle candidate on ANOTHER PR outranks the stalled alarm —
@@ -2249,7 +2257,7 @@ jq -cn '{schemaVersion:1,coordinatorOwnerToken:"owner-dead"}' \
 bash "$GATE" poll | jq -e '
   .data.trigger == "pr_run_stalled" and .data.pr == 64 and .data.runId == "run-stall-dead" and
   .data.completionContractExists == true and .data.contractAdoptionRequired == true' >/dev/null
-[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: aged stalled alarm re-fired" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_ONE" ] || { echo "7c: aged stalled alarm re-fired" >&2; exit 1; }
 # (2) Overrun and stalled are disjoint by predicate: a run that is still
 # STAMPING past the ceiling is an overrun, never a stall, even at zero grace.
 STALL_SHA="$(sha 2)"
@@ -2263,10 +2271,10 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base STUB_PR_LIST='[]'
 stall_now
-[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: poll output changed with no claimed run" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: poll output changed with no claimed run" >&2; exit 1; }
 bash "$GATE" claim run-stall-done 67 "$(sha 1)" owner-done >/dev/null
 bash "$GATE" release run-stall-done owner-done >/dev/null
-[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: a released slot alarmed" >&2; exit 1; }
+[ "$(bash "$GATE" poll | jq -c 'del(.observation)')" = "$IDLE_NONE" ] || { echo "7c: a released slot alarmed" >&2; exit 1; }
 stall_clear
 unset SMOKE_GATE_RUN_ROOT
 
@@ -2389,8 +2397,8 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export STUB_PR_LIST_EXIT=1
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed"' >/dev/null
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
 bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "gate_fetch_failed" and .data.consecutiveFailures == 3
 ' >/dev/null
@@ -2403,8 +2411,8 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export STUB_PR_LIST='[]' STUB_PR_LIST_EXIT=0 STUB_REPO_VIEW_EXIT=1
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed"' >/dev/null
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .observation.kind == "unreadable"' >/dev/null
 bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "gate_fetch_failed" and .data.consecutiveFailures == 3
 ' >/dev/null
@@ -2414,7 +2422,7 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export STUB_PR_LIST='[]' STUB_REPO_VIEW_EXIT=0
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
 
 # --- 11. P1 regression: run ids must be unique ACROSS PRs, not just within
 # one PR's own state file. Before the fix, `claim` only checked collision
@@ -3246,13 +3254,14 @@ POLL_MISSING="$STATE_DIR/missing-shared"
 for expected in true false; do
   OUT="$(SMOKE_GATE_SHARED_ROOT="$POLL_MISSING" SMOKE_GATE_LEASE_DIR="$POLL_MISSING/leases" bash "$GATE" poll)"
   jq -e --argjson expected "$expected" \
-    '.ok == false and .wakeAgent == $expected and .data.trigger == "coordinator_lease_unavailable"' <<<"$OUT" >/dev/null
+    '.ok == false and .wakeAgent == $expected and .data.trigger == "coordinator_lease_unavailable"
+     and (if $expected then has("observation") | not else .observation.kind == "blocked" end)' <<<"$OUT" >/dev/null
 done
 # Force the post-bind fence to miss once. Poll must restore the pre-claim
 # absence instead of leaving a live owner token that no wake ever delivered.
 ROLLBACK_POLL="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 \
   SMOKE_GATE_TEST_HOLD_RUN_LOCK_AFTER_BIND_SECONDS=1.5 bash "$GATE" poll)"
-jq -e '.wakeAgent == false and .data.trigger == "coordinator_lease_unavailable"' <<<"$ROLLBACK_POLL" >/dev/null
+jq -e '.wakeAgent == false and .data.trigger == "coordinator_lease_unavailable" and (.observation.kind | IN("empty","blocked"))' <<<"$ROLLBACK_POLL" >/dev/null
 [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-126-authority.json" ]
 [ "$(find "$SMOKE_GATE_LEASE_DIR" -maxdepth 1 -name 'lease-smoke-pr126-*.json' -type f | wc -l)" -eq 0 ]
 # Readiness/debounce history may already exist, but no coordinator slot may.
@@ -3286,7 +3295,7 @@ scaffold_as "$ADOPT_T1" contract "$ADOPT_DIR" "$POLL_FAIL_SHA" B1:browser S1:sou
 scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" B1 fail 'by the original owner' | jq -e '.ok == true' >/dev/null
 ADOPT_B1_HASH="$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)"
 # A live run is not recoverable: no second token is minted.
-bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates" and .observation.kind == "empty"' >/dev/null
 # The predecessor's container dies. A later deadline would be observable.
 expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
 sleep 1
