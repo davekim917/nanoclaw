@@ -5005,6 +5005,66 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(getPendingMessages().map((message) => message.id)).toContain('occ-2');
   }, 15_000);
 
+  const queuedNotices = (): string[] =>
+    (getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'chat'").all() as { content: string }[])
+      .map((row) => (JSON.parse(row.content) as { text?: string }).text ?? '')
+      .filter((text) => text.includes('is queued until the current task finishes'));
+
+  it('tells the user once that a typed effort change is queued behind a busy turn', async () => {
+    insertMessage('flag-1', 'chat', { text: '', flagIntent: { stickyEffort: 'high' } });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Several polls see the flag while this turn runs.
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'first', isError: true };
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      applySettings: async () => {},
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(queuedNotices()).toEqual([
+      '⚙️ effort → high is queued until the current task finishes. Messages you send before then are read when it does.',
+    ]);
+  }, 15_000);
+
+  it('does not announce a queued change that a scheduled task brought, not a person', async () => {
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'first fire', isError: true };
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      applySettings: async () => {},
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    expect(queuedNotices()).toEqual([]);
+  }, 15_000);
+
   it('defers an immutable runtime-context restart while background work is live, and ends once it drains', async () => {
     insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let live = 1;

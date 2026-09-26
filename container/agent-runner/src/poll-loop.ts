@@ -2002,6 +2002,9 @@ export async function processQuery(
   // can dispatch them through the canonical command path. Once we've decided to
   // end, gate further polling so we don't reclaim the rows mid-teardown.
   let endedForCommand = false;
+  // The host's ⚙️ ack reads as "applied", but a deferred change can wait for
+  // the whole of a long turn. Say so once per pending change, not every poll.
+  let deferredSettingsNotice: string | null = null;
   let corruptionStreak = 0;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
@@ -2194,6 +2197,19 @@ export async function processQuery(
               log(
                 'Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain',
               );
+              const notice = describeDeferredSettings(liveSettings, fb);
+              if (notice !== deferredSettingsNotice && carriesTypedFlag(keep)) {
+                deferredSettingsNotice = notice;
+                const routing = extractRouting(keep);
+                await writeMessageOut({
+                  id: generateId(),
+                  kind: 'chat',
+                  platform_id: routing.platformId,
+                  channel_type: routing.channelType,
+                  thread_id: routing.threadId,
+                  content: JSON.stringify({ text: notice }),
+                });
+              }
               return;
             }
             log(
@@ -3872,6 +3888,31 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
  * migration the new provider IS the primary, nothing reverts, and the user
  * has to re-pin or clear it.
  */
+/** A person typed the flag — the only case the host posted a ⚙️ ack for. */
+export function carriesTypedFlag(messages: MessageInRow[]): boolean {
+  return messages.some((m) => {
+    if (m.kind === 'task') return false;
+    try {
+      return (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent !== undefined;
+    } catch {
+      return false;
+    }
+  });
+}
+
+type LiveSettings = { model?: string; effort?: string; ultracode?: boolean };
+
+export function describeDeferredSettings(live: LiveSettings, next: LiveSettings): string {
+  const parts: string[] = [];
+  if (next.model !== live.model) parts.push(`model → ${next.model ?? 'default'}`);
+  if (next.ultracode !== live.ultracode) parts.push(`ultracode ${next.ultracode ? 'ON' : 'OFF'}`);
+  else if (next.effort !== live.effort) parts.push(`effort → ${next.effort ?? 'default'}`);
+  return (
+    `⚙️ ${parts.join(', ')} is queued until the current task finishes. ` +
+    `Messages you send before then are read when it does.`
+  );
+}
+
 export async function noteIgnoredModel(
   model: string,
   providerName: string,
