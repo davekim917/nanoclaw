@@ -176,6 +176,7 @@ import {
   hasProcessingAck,
   listOverdueRecurringRows,
   listStuckGateResults,
+  hasUnrecordedGateRows,
   syncProcessingAcks,
   type ContainerState as ForkContainerState,
   type OverdueRecurringRows,
@@ -433,6 +434,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   listOverdueRecurringRows(cutoffIso: string): OverdueRecurringRows;
   /** Gate-lane results not on record since before `cutoffIso` (see the op). */
   listStuckGateResults(cutoffIso: string): StuckGateResults;
+  /** A container gate row delivery has not recorded yet (see the op). */
+  hasUnrecordedGateRows(): boolean;
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
   /**
@@ -1205,6 +1208,7 @@ function forkOps(
       listOverdueRecurringRows(inbound, outboundPresent ? readableOutbound() : null, cutoffIso),
     listStuckGateResults: (cutoffIso) =>
       listStuckGateResults(inbound, outboundPresent ? readableOutbound() : null, cutoffIso),
+    hasUnrecordedGateRows: () => hasUnrecordedGateRows(inbound, outboundPresent ? readableOutbound() : null),
     // A never-woken session has no turn usage: empty is the honest answer here,
     // not the opener's throw (the rollup runs over every session every tick).
     listTurnUsageSince: (afterId) => readOutbound([], (outbound) => listTurnUsageSince(outbound, afterId)),

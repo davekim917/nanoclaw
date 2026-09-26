@@ -198,6 +198,15 @@ function registerSchedulingSweepDuties(): void {
           });
           return;
         }
+        // Delivery visits active sessions only: closed now, a pre-task result
+        // it has not recorded yet would never be recorded.
+        if (mailbox!.hasUnrecordedGateRows()) {
+          log.info('Kept a spent task session open — a pre-task result is not recorded yet', {
+            sessionId: session.id,
+            threadId: session.thread_id,
+          });
+          return;
+        }
         // Revalidate on the mailbox AFTER the only await on this path. A task,
         // paired wait, or continuation can land while the intent check yields;
         // closing it would strand work in a session no sweep visits again. No

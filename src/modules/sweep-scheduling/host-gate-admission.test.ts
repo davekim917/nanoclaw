@@ -1,7 +1,9 @@
 /**
- * S5 end to end: a host-gated wake whose result cannot be recorded is not
- * admitted. The next tick runs the script again, and only a recorded execution
- * is handed to the container.
+ * The scheduling sweep and unrecorded gate results, end to end on real session
+ * DBs. S5: a host-gated wake whose result cannot be recorded is not admitted;
+ * the next tick runs the script again, and only a recorded execution is handed
+ * to the container. S19: a spent task session is not closed while a container
+ * gate row is still unrecorded, because delivery never visits it again.
  */
 import fs from 'fs';
 
@@ -16,8 +18,9 @@ vi.mock('../../config.js', async () => {
 });
 
 import { closeDb, createAgentGroup, getDb, initMigratedTestDb } from '../../db/index.js';
-import { createSession } from '../../db/sessions.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { createSession, getSession } from '../../db/sessions.js';
+import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting } from '../../host-sweep.js';
+import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { admitDueTaskContexts, initSessionFolder, withExistingMailboxSession } from '../../session-manager.js';
 import { allowSubprocess } from '../../test-hermeticity.js';
 import { insertTaskRow } from '../scheduling/db.js';
@@ -121,5 +124,42 @@ describe('S5 withholds a host-gated occurrence it could not record', () => {
     expect(await admit(new Set())).toBe(1);
     expect(trigger('occ-unrecorded')).toBe(1);
     inbound.close();
+  });
+});
+
+describe('S19 keeps a spent task session open while a gate row is unrecorded', () => {
+  it('closes it only once delivery has recorded the row', async () => {
+    const inbound = new Database(inboundDbPath(AG, SESS));
+    const outbound = new Database(outboundDbPath(AG, SESS));
+    // A one-shot occurrence the container ran and acked: nothing live is left.
+    insertTaskRow(inbound, {
+      id: 'occ-once',
+      seriesId: 'watch',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'check once', script: 'true' }),
+    });
+    inbound.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'occ-once'").run();
+    outbound
+      .prepare(`INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('gate-once', 1, ?, 'task_log', ?)`)
+      .run(new Date().toISOString(), JSON.stringify({ gate: { occurrenceId: 'occ-once', wakeAgent: false } }));
+
+    const s19 = _listSweepRegistrationsForTesting().duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.S19)!;
+    const gc = async () => {
+      const session = (await getSession(SESS))!;
+      await withExistingMailboxSession(AG, SESS, (mailbox) =>
+        s19.run({ session, agentGroupId: AG, mailbox, alive: false, plan: {} } as never),
+      );
+      return (await getSession(SESS))!.status;
+    };
+
+    expect(await gc()).toBe('active');
+
+    inbound
+      .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES ('gate-once', 'delivered', ?)")
+      .run(new Date().toISOString());
+    expect(await gc()).toBe('closed');
+    inbound.close();
+    outbound.close();
   });
 });

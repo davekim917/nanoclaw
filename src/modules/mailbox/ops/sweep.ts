@@ -478,8 +478,21 @@ export function listStuckGateResults(
        ORDER BY seq`,
     )
     .all(cutoffIso) as WithheldHostGatedRow[];
-  if (!outDb) return { undeliveredGateRows: [], withheldHostGatedRows };
+  return {
+    undeliveredGateRows: outDb ? undeliveredGateRows(inDb, outDb, cutoffIso) : [],
+    withheldHostGatedRows,
+  };
+}
 
+/**
+ * Container gate rows delivery has not recorded, written before `cutoffIso`
+ * (any age when null).
+ */
+function undeliveredGateRows(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  cutoffIso: string | null,
+): UndeliveredGateRow[] {
   const isDelivered = inDb.prepare('SELECT 1 FROM delivered WHERE message_out_id = ? LIMIT 1');
   const seriesOf = inDb.prepare("SELECT series_id FROM messages_in WHERE id = ? AND kind = 'task'").pluck();
   const candidates = outDb
@@ -489,11 +502,11 @@ export function listStuckGateResults(
          FROM messages_out
         WHERE kind = 'task_log'
           AND CASE WHEN json_valid(content) THEN json_type(content, '$.gate') END = 'object'
-          AND datetime(timestamp) <= datetime(?)
+          AND (@cutoff IS NULL OR datetime(timestamp) <= datetime(@cutoff))
         ORDER BY seq`,
     )
-    .all(cutoffIso) as Array<{ id: string; writtenAt: string; occurrenceId: unknown }>;
-  const undeliveredGateRows = candidates
+    .all({ cutoff: cutoffIso }) as Array<{ id: string; writtenAt: string; occurrenceId: unknown }>;
+  return candidates
     .filter((row) => isDelivered.get(row.id) === undefined)
     .map((row) => {
       const occurrenceId = typeof row.occurrenceId === 'string' ? row.occurrenceId : null;
@@ -504,7 +517,15 @@ export function listStuckGateResults(
         seriesId: occurrenceId === null ? null : ((seriesOf.get(occurrenceId) as string | null | undefined) ?? null),
       };
     });
-  return { undeliveredGateRows, withheldHostGatedRows };
+}
+
+/**
+ * Does this session hold a container gate row delivery has not recorded yet?
+ * Delivery visits active sessions only, so closing one that does would lose
+ * the result for good.
+ */
+export function hasUnrecordedGateRows(inDb: Database.Database, outDb: Database.Database | null): boolean {
+  return outDb !== null && undeliveredGateRows(inDb, outDb, null).length > 0;
 }
 
 /**
