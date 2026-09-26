@@ -1,25 +1,16 @@
 /**
  * The one reading of `NANOCLAW_SHADOW` (shadow-host.ts says what the mode
- * does). Imports only node builtins and env-parse.ts, because the deploy crash
- * guard asks the same question before the application module graph loads.
+ * does). Imports only env-file.ts, which imports only node builtins, because
+ * the deploy crash guard asks the same question before the application module
+ * graph loads.
  */
-import fs from 'fs';
-import path from 'path';
+import { readEnvValue } from './env-file.js';
 
-import { parseEnvContent } from './env-parse.js';
-
-const SHADOW_ENV_KEY = 'NANOCLAW_SHADOW';
-
-/** The process environment wins over `<root>/.env`; only the literal `1` turns it on. */
+/**
+ * The process environment wins over `<root>/.env`; only the literal `1` turns
+ * it on. An absent `.env` means off, but one that exists and cannot be read
+ * throws: reading it as "off" would boot a shadow with no protections.
+ */
 export function readShadowFlag(root: string): boolean {
-  const fromEnv = process.env[SHADOW_ENV_KEY];
-  if (fromEnv !== undefined) return fromEnv === '1';
-  let content: string;
-  try {
-    content = fs.readFileSync(path.join(root, '.env'), 'utf-8');
-  } catch (err) {
-    if (typeof (err as NodeJS.ErrnoException).code === 'string') return false;
-    throw err;
-  }
-  return parseEnvContent(content, (key) => key === SHADOW_ENV_KEY)[SHADOW_ENV_KEY] === '1';
+  return readEnvValue(root, 'NANOCLAW_SHADOW') === '1';
 }

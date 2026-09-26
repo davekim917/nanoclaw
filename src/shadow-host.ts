@@ -14,6 +14,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, DATA_DIR, INSTALL_SLUG, REPO_ROOT } from './config.js';
+import { readEnvValue } from './env-file.js';
 import { getContainerImageBase } from './install-slug.js';
 import { log } from './log.js';
 import { readShadowFlag } from './shadow-flag.js';
@@ -51,6 +52,20 @@ export function shadowImageViolation(image: string, imageBase: string, ownBase: 
     `own image namespace ${ownBase}. A shadow host must never run, build or tag another install's image. ` +
     `Unset CONTAINER_IMAGE and CONTAINER_IMAGE_BASE, then reuse the production image without rebuilding it: ` +
     `docker tag <production image>:latest ${ownBase}:latest`
+  );
+}
+
+/**
+ * Production's webhook server binds its port on every interface, so a shadow
+ * listening on that port, the default included, fails at boot. The shadow
+ * cannot see which port production chose, so it must be given its own.
+ */
+export function shadowWebhookPortViolation(raw: string | undefined): string | null {
+  if (raw !== undefined && /^\d+$/.test(raw) && Number(raw) >= 1 && Number(raw) <= 65535) return null;
+  return (
+    `NANOCLAW_SHADOW=1 needs its own WEBHOOK_PORT (got ${raw === undefined ? 'none' : JSON.stringify(raw)}): ` +
+    `production's webhook server holds its port on every interface. Set WEBHOOK_PORT to a free port ` +
+    `in this checkout's .env or the process environment.`
   );
 }
 
@@ -93,14 +108,18 @@ export function shadowProviderViolation(provider: string): string | null {
 /**
  * Enter shadow mode at boot, before anything can spawn or build. Returns the
  * refusal message when the configured image is outside this checkout's
- * namespace. Otherwise points TMPDIR into this checkout — the OneCLI SDK writes
- * CA bundles and credential stubs under fixed names in `os.tmpdir()`, which
+ * namespace, or when no WEBHOOK_PORT of its own is set (read from `.env` here
+ * too: boot copies `.env` into the environment only after this runs).
+ * Otherwise points TMPDIR into this checkout — the OneCLI SDK writes CA
+ * bundles and credential stubs under fixed names in `os.tmpdir()`, which
  * production's containers bind-mount — logs what shadow mode changed, and
  * returns null. Does nothing when shadow mode is off.
  */
 export function enterShadowHostMode(): string | null {
   if (!isShadowHost()) return null;
-  const violation = shadowImageViolation(CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, getContainerImageBase(REPO_ROOT));
+  const violation =
+    shadowImageViolation(CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, getContainerImageBase(REPO_ROOT)) ??
+    shadowWebhookPortViolation(readEnvValue(process.cwd(), 'WEBHOOK_PORT'));
   if (violation) return violation;
   const tmpDir = path.join(DATA_DIR, 'tmp');
   fs.mkdirSync(tmpDir, { recursive: true });

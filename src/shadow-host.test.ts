@@ -30,6 +30,7 @@ async function loadFresh(
   flagState.on = shadow;
   vi.stubEnv('CONTAINER_IMAGE', undefined);
   vi.stubEnv('CONTAINER_IMAGE_BASE', undefined);
+  vi.stubEnv('WEBHOOK_PORT', undefined);
   for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
   return import('./shadow-host.js');
 }
@@ -93,7 +94,7 @@ describe('enterShadowHostMode', () => {
   });
 
   it('points TMPDIR into the checkout and logs what shadow mode changed', async () => {
-    const mod = await loadFresh(true);
+    const mod = await loadFresh(true, { WEBHOOK_PORT: '3999' });
     expect(mod.enterShadowHostMode()).toBeNull();
     const tmpDir = path.join(tmpRoot, 'data', 'tmp');
     expect(process.env.TMPDIR).toBe(tmpDir);
@@ -111,6 +112,27 @@ describe('enterShadowHostMode', () => {
     expect(violation).toContain(`${getContainerImageBase(tmpRoot)}:latest`);
     expect(process.env.TMPDIR).toBe(tmpBefore);
     expect(logState.warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses without a WEBHOOK_PORT of its own, and changes nothing', async () => {
+    const tmpBefore = process.env.TMPDIR;
+    const mod = await loadFresh(true);
+    expect(mod.enterShadowHostMode()).toMatch(/needs its own WEBHOOK_PORT \(got none\)/);
+    expect(process.env.TMPDIR).toBe(tmpBefore);
+    expect(logState.warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses a WEBHOOK_PORT that is not a port number', async () => {
+    for (const bad of ['abc', '0', '65536', '3000x']) {
+      const mod = await loadFresh(true, { WEBHOOK_PORT: bad });
+      expect(mod.enterShadowHostMode()).toContain(JSON.stringify(bad));
+    }
+  });
+
+  it("accepts a WEBHOOK_PORT from this checkout's .env, which boot loads only later", async () => {
+    fs.writeFileSync(path.join(tmpRoot, '.env'), 'WEBHOOK_PORT=3999\n');
+    const mod = await loadFresh(true);
+    expect(mod.enterShadowHostMode()).toBeNull();
   });
 
   it('refuses when CONTAINER_IMAGE_BASE is overridden to another namespace', async () => {

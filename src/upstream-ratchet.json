@@ -768,7 +768,7 @@
 "src/drivers/types.ts":{"diff":638,"mode":"100644","sha256":null,"deleted":true},
 "src/egress-lockdown.ts":{"diff":0,"mode":"100644","sha256":"9b8fd11c67337c371908974cbdced6cbfc60ddb4352307c6170e63648b5fceb2"},
 "src/env.test.ts":{"diff":53,"mode":"100644","sha256":null,"deleted":true},
-"src/env.ts":{"diff":54,"mode":"100644","sha256":"dd24fa03cf01549e91911b0b4af79fe9ae84683e235f87101253d5305c58e70f"},
+"src/env.ts":{"diff":35,"mode":"100644","sha256":"be3a4fd3e0be8f1f88b774f561e6e18094216e2dd4bb8d338bf174ab45e66cef"},
 "src/gateway-providers/gateway-provider-registry.ts":{"diff":144,"mode":"100644","sha256":null,"deleted":true},
 "src/gateway-providers/index.ts":{"diff":60,"mode":"100644","sha256":null,"deleted":true},
 "src/gateway-providers/installed.ts":{"diff":8,"mode":"100644","sha256":null,"deleted":true},

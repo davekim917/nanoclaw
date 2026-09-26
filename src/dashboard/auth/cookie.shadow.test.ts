@@ -41,6 +41,20 @@ describe('resolveServerKey under shadow mode', () => {
     expect(fs.existsSync(path.join(state.dataDir, 'cookie-secret'))).toBe(false);
   });
 
+  it('uses NANOCLAW_DASHBOARD_COOKIE_SECRET when shadow mode is off', () => {
+    vi.stubEnv('NANOCLAW_DASHBOARD_COOKIE_SECRET', 'cd'.repeat(32));
+    expect(resolveServerKey().toString('hex')).toBe('cd'.repeat(32));
+    expect(fs.existsSync(path.join(state.dataDir, 'cookie-secret'))).toBe(false);
+  });
+
+  it("ignores NANOCLAW_DASHBOARD_COOKIE_SECRET on a shadow host: it is production's key", () => {
+    state.shadow = true;
+    vi.stubEnv('NANOCLAW_DASHBOARD_COOKIE_SECRET', 'cd'.repeat(32));
+    const key = resolveServerKey();
+    expect(key.toString('hex')).not.toBe('cd'.repeat(32));
+    expect(fs.readFileSync(path.join(state.dataDir, 'cookie-secret'), 'utf8')).toBe(key.toString('hex'));
+  });
+
   it('never reads or writes the home-dir secret on a shadow host', () => {
     state.shadow = true;
     const homeSecret = path.join(tmp, 'home', '.nanoclaw', 'cookie-secret');

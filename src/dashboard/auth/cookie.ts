@@ -35,15 +35,17 @@ export function _resetServerKeyForTest(): void {
 export function resolveServerKey(): Buffer {
   if (_serverKey) return _serverKey;
 
-  const envSecret = process.env.NANOCLAW_DASHBOARD_COOKIE_SECRET;
+  // Both production secrets, the env override (which a copied .env carries)
+  // and the home-dir file, would let a cookie a shadow signed authenticate
+  // against production's dashboard: cookies are not scoped by port.
+  const shadow = isShadowHost();
+  const envSecret = shadow ? undefined : process.env.NANOCLAW_DASHBOARD_COOKIE_SECRET;
   if (envSecret) {
     _serverKey = Buffer.from(envSecret, 'hex');
     return _serverKey;
   }
 
-  // The home-dir secret is production's: a cookie a shadow signed with it
-  // would authenticate against production's dashboard.
-  const secretPath = isShadowHost()
+  const secretPath = shadow
     ? path.join(DATA_DIR, 'cookie-secret')
     : path.join(os.homedir(), '.nanoclaw', 'cookie-secret');
   try {
