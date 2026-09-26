@@ -16,6 +16,14 @@ vi.mock('./log.js', () => ({
 const flagState = vi.hoisted(() => ({ on: false }));
 vi.mock('./shadow-flag.js', () => ({ readShadowFlag: () => flagState.on, isShadowProcess: () => flagState.on }));
 
+// Whether the entry shim ran. Scrubbing for real would strip the test
+// runner's own environment.
+const scrubState = vi.hoisted(() => ({ done: true }));
+vi.mock('./shadow-allowlist.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./shadow-allowlist.js')>()),
+  shadowProcessEnvScrubbed: () => scrubState.done,
+}));
+
 import { getContainerImageBase } from './install-slug.js';
 import { imageRepository, shadowImageViolation } from './shadow-host.js';
 
@@ -28,6 +36,7 @@ async function loadFresh(
 ): Promise<typeof import('./shadow-host.js')> {
   vi.resetModules();
   flagState.on = shadow;
+  scrubState.done = true;
   vi.stubEnv('CONTAINER_IMAGE', undefined);
   vi.stubEnv('CONTAINER_IMAGE_BASE', undefined);
   vi.stubEnv('WEBHOOK_PORT', undefined);
@@ -90,6 +99,15 @@ describe('enterShadowHostMode', () => {
     const mod = await loadFresh(false, { CONTAINER_IMAGE: `${OTHER_BASE}:latest`, DISCORD_BOT_TOKEN: 'production' });
     expect(mod.isShadowHost()).toBe(false);
     expect(mod.enterShadowHostMode()).toBeNull();
+    expect(process.env.TMPDIR).toBe(tmpBefore);
+    expect(logState.warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses a shadow started without the entry shim, before touching anything', async () => {
+    const tmpBefore = process.env.TMPDIR;
+    const mod = await loadFresh(true, { WEBHOOK_PORT: '3999' });
+    scrubState.done = false;
+    expect(mod.enterShadowHostMode()).toMatch(/direct src\/main\.ts start.*src\/index\.ts/);
     expect(process.env.TMPDIR).toBe(tmpBefore);
     expect(logState.warn).not.toHaveBeenCalled();
   });
@@ -179,6 +197,29 @@ describe('per-spawn rules', () => {
   });
 });
 
+describe('shadowEgressViolation', () => {
+  const NET = 'nanoclaw-egress';
+  const GW = 'onecli';
+
+  it('never inspects when shadow mode is off or lockdown is off', async () => {
+    const inspect = vi.fn(() => null);
+    expect((await loadFresh(false)).shadowEgressViolation(inspect, true, NET, GW)).toBeNull();
+    expect((await loadFresh(true)).shadowEgressViolation(inspect, false, NET, GW)).toBeNull();
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it('admits a spawn when the network exists with the gateway already attached', async () => {
+    const mod = await loadFresh(true);
+    expect(mod.shadowEgressViolation(() => ['nanoclaw-v2-abc', GW], true, NET, GW)).toBeNull();
+  });
+
+  it('refuses when the network is missing or the gateway is detached, rather than creating or attaching', async () => {
+    const mod = await loadFresh(true);
+    expect(mod.shadowEgressViolation(() => null, true, NET, GW)).toMatch(/never creates or attaches docker networks/);
+    expect(mod.shadowEgressViolation(() => ['nanoclaw-v2-abc'], true, NET, GW)).toContain(`"${GW}"`);
+  });
+});
+
 describe('call sites', () => {
   const read = (file: string) => fs.readFileSync(path.resolve(file), 'utf8');
 
@@ -200,6 +241,14 @@ describe('call sites', () => {
     expect(resolved).toBeGreaterThan(-1);
     expect(refusal).toBeGreaterThan(resolved);
     expect(driftCheck).toBeGreaterThan(refusal);
+  });
+
+  it('spawn inspects egress networking on a shadow before ensureEgressNetwork can change it', () => {
+    const source = read('src/container-runner.ts');
+    const refusal = source.indexOf('if (shadowEgressRefusal) throw new Error(shadowEgressRefusal);');
+    const ensure = source.indexOf('if (ensureEgressNetwork()) {');
+    expect(refusal).toBeGreaterThan(-1);
+    expect(ensure).toBeGreaterThan(refusal);
   });
 
   it('spawn derives the OneCLI identity through the shadow-aware helper', () => {

@@ -91,6 +91,135 @@ describe('every allowlisted name is a live registration', () => {
   });
 });
 
+/**
+ * Every free-function call in main(), classified. A start added to main()
+ * runs outside every registry the allowlists gate, so it fails here until
+ * someone decides which kind it is. CHECKOUT: acts only on this checkout's
+ * database, data directory, sockets and containers, or only reads. GATED: runs
+ * behind the named shadow check, pinned below. The database-handle getters are
+ * checkout-scoped by name pattern, so the raw handle is not named here.
+ */
+const MAIN_CHECKOUT_CALLS = new Set([
+  'activateAgentRunnerSource',
+  'adapterInboundEvent',
+  'adoptRunningSessions',
+  'adoptionSeedFor',
+  'applyChannelMetadataUpdates',
+  'backfillContainerConfigs',
+  'bootFatal',
+  'checkAgentRunnerDepsDrift',
+  'checkBuildDrift',
+  'createChannelDeliveryAdapter',
+  'drainClosedSessionPendingBacklog',
+  'enforceStartupBackoff',
+  'enforceUpgradeTripwire',
+  'ensureArchiveSchema',
+  'enterShadowHostMode',
+  'finishInterruptedSessionArchivals',
+  'formatBuildInfoLog',
+  'getBots',
+  'getHostInstanceId',
+  'getMessagingGroupByPlatform',
+  'honorPendingStopIntents',
+  'import',
+  'initChannelAdapters',
+  'initDb',
+  'initializeManagedGitHooks',
+  'isShadowHost',
+  'loadEnvIntoProcess',
+  'makeOnAction',
+  'markCliServerReady',
+  'markDeployBootHealthy',
+  'onConnectionRestored',
+  'onInbound',
+  'onInboundEvent',
+  'onMetadata',
+  'readBuildInfo',
+  'reconcilePendingUpgradeContexts',
+  'reconcileWorkgroupFsState',
+  'recoverAllChannelsAfterStartup',
+  'recoverChannelAdapter',
+  'registerSecretsFromEnv',
+  'releaseChannelRecoveryReady',
+  'releaseOrphanedRepoIngressFencesAtStartup',
+  'requestWake',
+  'resetPhantomContainerStatus',
+  'resetProcessingChannelIngress',
+  'resetStorageActivityState',
+  'resolveChannelMetadataUpdates',
+  'restoreRemoteControl',
+  'routeInbound',
+  'runBootMountQuiescence',
+  'runDispatchReconcilerOnStartup',
+  'runMigrations',
+  'runOnecliBootPreflight',
+  'setDeliveryAdapter',
+  'setSiblingBotIdsProvider',
+  'shadowMayStartChannel',
+  'shadowWrite',
+  'startActiveDeliveryPoll',
+  'startChannelRecoveryMonitor',
+  'startCliServer',
+  'startDashboard',
+  'startHostInstanceLease',
+  'startHostSweep',
+  'startSweepDeliveryPoll',
+  'writeUpstreamPolicySnapshot',
+]);
+const MAIN_GATED_CALLS: Record<string, string> = {
+  startDiscordSlashCommands: "if (shadowMayStartChannel('discord')) {\n    startDiscordSlashCommands()",
+  startHostModules: 'else await startHostModules(',
+  startShadowHostModules: 'if (isShadowHost()) await startShadowHostModules(',
+};
+
+function mainCalls(source: string): string[] {
+  const head = 'export async function main(): Promise<void> {';
+  const start = source.indexOf(head);
+  const end = source.indexOf('\n}\n', start);
+  const body = source
+    .slice(start + head.length, end)
+    .replace(/\/\/[^\n]*/g, '')
+    .replace(/'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`|"(?:[^"\\\n]|\\.)*"/g, "''");
+  const names = new Set([...body.matchAll(/(?<![\w.$])(?<!new )([A-Za-z_]\w*)\s*\(/g)].map((m) => m[1]));
+  for (const keyword of [
+    'if',
+    'for',
+    'while',
+    'return',
+    'switch',
+    'catch',
+    'function',
+    'typeof',
+    'await',
+    'void',
+    'async',
+  ]) {
+    names.delete(keyword);
+  }
+  return [...names].filter((name) => !/^get\w*Db$/.test(name)).sort();
+}
+
+describe('main() starts nothing the allowlists have not classified', () => {
+  const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
+  const calls = mainCalls(source);
+
+  it('every call in main() is checkout-scoped or behind a named shadow check', () => {
+    expect(calls.length).toBeGreaterThan(40);
+    expect(calls.filter((name) => !MAIN_CHECKOUT_CALLS.has(name) && !(name in MAIN_GATED_CALLS))).toEqual([]);
+  });
+
+  it('the classification names nothing main() no longer calls', () => {
+    const stale = [...MAIN_CHECKOUT_CALLS, ...Object.keys(MAIN_GATED_CALLS)].filter((name) => !calls.includes(name));
+    expect(stale).toEqual([]);
+  });
+
+  it('each gated call sits behind its shadow check', () => {
+    for (const [name, guarded] of Object.entries(MAIN_GATED_CALLS)) {
+      expect(source, name).toContain(guarded);
+    }
+  });
+});
+
 describe('on a shadow, every live registration the lists do not name is refused at its seam', () => {
   it('ncl commands', async () => {
     flag.on = true;

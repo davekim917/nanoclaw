@@ -27,7 +27,7 @@ import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
-import { shadowMayReadEnvKey } from './shadow-allowlist.js';
+import { shadowMayReadEnvKey, shadowMayStartChannel } from './shadow-allowlist.js';
 import { enterShadowHostMode, isShadowHost, startShadowHostModules } from './shadow-host.js';
 import {
   channelNameProvenance,
@@ -1061,9 +1061,11 @@ export async function main(): Promise<void> {
 
   // 12. Start Discord slash-command client (gated on
   //     ENABLE_DISCORD_SLASH_COMMANDS=1).
-  startDiscordSlashCommands().catch((err) => {
-    log.error('Discord slash commands failed to start', { err });
-  });
+  if (shadowMayStartChannel('discord')) {
+    startDiscordSlashCommands().catch((err) => {
+      log.error('Discord slash commands failed to start', { err });
+    });
+  }
 
   // Startup completed — the deploy that produced this build is good; disarm
   // the crash-loop rollback guard.

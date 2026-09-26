@@ -34,6 +34,12 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
+const shadowFlag = vi.hoisted(() => ({ on: false }));
+vi.mock('./shadow-flag.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./shadow-flag.js')>()),
+  isShadowProcess: () => shadowFlag.on,
+}));
+
 import {
   CONTAINER_GROUP_LABEL_KEY,
   CONTAINER_INSTALL_LABEL,
@@ -43,6 +49,7 @@ import {
   CONTAINER_WORKGROUP_LABEL_KEY,
 } from './config.js';
 import { containerLabelArgs } from './container-runner.js';
+import { SHADOW_CONTAINER_LABEL_KEY } from './shadow-flag.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 
@@ -160,5 +167,18 @@ describe('container scope labels', () => {
     expect(args).toContain('--label');
     expect(args).toContain(`${CONTAINER_WORKGROUP_LABEL_KEY}=`);
     expect(args.filter((a) => a === '--label')).toHaveLength(5);
+  });
+
+  it('a shadow stamps its provenance label, and only a shadow does', () => {
+    expect(containerLabelArgs('ag-fixture', 'sess-fixture', 'wg-fixture')).not.toContain(
+      `${SHADOW_CONTAINER_LABEL_KEY}=1`,
+    );
+    shadowFlag.on = true;
+    try {
+      const args = containerLabelArgs('ag-fixture', 'sess-fixture', 'wg-fixture');
+      expect(args.slice(-2)).toEqual(['--label', `${SHADOW_CONTAINER_LABEL_KEY}=1`]);
+    } finally {
+      shadowFlag.on = false;
+    }
   });
 });

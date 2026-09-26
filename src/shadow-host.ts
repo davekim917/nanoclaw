@@ -9,22 +9,39 @@
  * commands, delivery actions and approval replays. The seams no registry
  * covers sit inside work the allowlist admits, and each asks `isShadowHost()`
  * where it acts: the image store (spawn image, builds, the rebuild watcher,
- * docker cleanup), the OneCLI agent identity, host paths mounted into
- * containers, host-side task scripts, the dashboard cookie, the webhook port
- * and bind, the process temp dir, and deploy rollback. The rules those need
+ * docker cleanup), docker networking for egress lockdown, the OneCLI agent
+ * identity, container adoption at boot, host paths mounted into containers,
+ * host-side task scripts, the dashboard cookie, the webhook port and bind, the
+ * process temp dir, and deploy rollback. The rules those need
  * live here.
  *
  * Unset, every call site behaves exactly as before.
  */
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, DATA_DIR, INSTALL_SLUG, REPO_ROOT } from './config.js';
+import {
+  CONTAINER_IMAGE,
+  CONTAINER_IMAGE_BASE,
+  DATA_DIR,
+  EGRESS_LOCKDOWN,
+  EGRESS_NETWORK,
+  INSTALL_SLUG,
+  ONECLI_GATEWAY_CONTAINER,
+  REPO_ROOT,
+} from './config.js';
+import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { readEnvValue } from './env-file.js';
 import { getHostStartCallbacks, type HostStartContext } from './host-lifecycle.js';
 import { getContainerImageBase } from './install-slug.js';
 import { log } from './log.js';
-import { scrubbedShadowEnvKeys, shadowMayRunProvider, shadowMayStartHostModule } from './shadow-allowlist.js';
+import {
+  scrubbedShadowEnvKeys,
+  shadowMayRunProvider,
+  shadowMayStartHostModule,
+  shadowProcessEnvScrubbed,
+} from './shadow-allowlist.js';
 import { isShadowProcess } from './shadow-flag.js';
 
 export function isShadowHost(): boolean {
@@ -36,7 +53,8 @@ const SHADOW_MODE_SUMMARY =
   'only), ncl commands, delivery actions and approval replays are allowlisted; container image builds, ' +
   'docker image/build-cache cleanup, host-side task scripts and host credential mounts are disabled; ' +
   'operator mounts forced read-only; OneCLI agents, TMPDIR and the dashboard cookie are namespaced to ' +
-  'this checkout; webhook server bound to 127.0.0.1';
+  'this checkout; webhook server bound to 127.0.0.1; docker networks inspected, never changed; only ' +
+  'shadow-labelled containers adopted';
 
 /** The image reference without its tag or digest (`host:5000/name:tag` → `host:5000/name`). */
 export function imageRepository(ref: string): string {
@@ -121,6 +139,9 @@ export function shadowProviderViolation(provider: string): string | null {
  */
 export function enterShadowHostMode(): string | null {
   if (!isShadowHost()) return null;
+  if (!shadowProcessEnvScrubbed()) {
+    return 'Shadow host refuses a direct src/main.ts start: start it through src/index.ts, whose entry shim scrubs the environment before the application loads';
+  }
   const violation =
     shadowImageViolation(CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, getContainerImageBase(REPO_ROOT)) ??
     shadowWebhookPortViolation(readEnvValue(process.cwd(), 'WEBHOOK_PORT'));
@@ -144,5 +165,41 @@ export async function startShadowHostModules(ctx: HostStartContext): Promise<voi
       continue;
     }
     await cb(ctx);
+  }
+}
+
+/**
+ * Null unless spawning under egress lockdown would change docker networking.
+ * `ensureEgressNetwork` creates the network, and attaches the OneCLI gateway
+ * container to it, when either is missing; both belong to production, so a
+ * shadow only inspects, and refuses when they are not already in place.
+ */
+export function shadowEgressViolation(
+  inspect: (network: string) => string[] | null = networkContainerNames,
+  lockdown: boolean = EGRESS_LOCKDOWN,
+  network: string = EGRESS_NETWORK,
+  gateway: string = ONECLI_GATEWAY_CONTAINER,
+): string | null {
+  if (!isShadowHost() || !lockdown) return null;
+  if (inspect(network)?.includes(gateway)) return null;
+  return (
+    `Shadow host refuses to spawn: egress lockdown needs the "${network}" network with the OneCLI gateway ` +
+    `"${gateway}" already attached, and a shadow never creates or attaches docker networks. Start production ` +
+    `first, or set NANOCLAW_EGRESS_LOCKDOWN=false in the shadow's .env`
+  );
+}
+
+/** Names of the containers on a docker network, or null when it cannot be inspected. */
+function networkContainerNames(network: string): string[] | null {
+  try {
+    const out = execFileSync(
+      CONTAINER_RUNTIME_BIN,
+      ['network', 'inspect', network, '--format', '{{range .Containers}}{{.Name}} {{end}}'],
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8', timeout: 15000 },
+    );
+    return out.split(/\s+/).filter(Boolean);
+  } catch (err) {
+    if (err instanceof Error && 'status' in err) return null;
+    throw err;
   }
 }

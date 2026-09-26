@@ -15,6 +15,13 @@ export function readShadowFlag(root: string): boolean {
   return readEnvValueRaw(root, 'NANOCLAW_SHADOW') === '1';
 }
 
+/**
+ * Stamped on every container a shadow spawns. A shadow's boot adopts only
+ * survivors that carry it: a container left by an earlier unflagged run of the
+ * same checkout has production's mounts and identity.
+ */
+export const SHADOW_CONTAINER_LABEL_KEY = 'nanoclaw-shadow';
+
 let shadowProcess: boolean | undefined;
 
 /**

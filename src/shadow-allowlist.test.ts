@@ -117,6 +117,25 @@ describe('environment', () => {
     expect(scrubbedShadowEnvKeys()).not.toContain('PATH');
   });
 
+  it('on a shadow, host-side code finds no OneCLI proxy, so a credentialed host call fails closed', async () => {
+    flag.on = true;
+    vi.stubEnv('HTTPS_PROXY', 'http://127.0.0.1:10255');
+    vi.stubEnv('https_proxy', 'http://127.0.0.1:10255');
+    const saved = { ...process.env };
+    try {
+      scrubShadowProcessEnv();
+      expect(process.env.HTTPS_PROXY).toBeUndefined();
+      expect(process.env.https_proxy).toBeUndefined();
+      vi.resetModules();
+      const { askJev } = await import('./typesafe.js');
+      await expect(
+        askJev({ agent_final_message: 'synthetic' }, { q: { type: 'noul', instructions: 'synthetic' } }),
+      ).rejects.toThrow(/no OneCLI gateway proxy/);
+    } finally {
+      for (const [key, value] of Object.entries(saved)) process.env[key] = value;
+    }
+  });
+
   it('the scrub changes nothing when the flag is unset', () => {
     vi.stubEnv('ZZ_SHADOW_PROBE_TOKEN', 'synthetic');
     scrubShadowProcessEnv();

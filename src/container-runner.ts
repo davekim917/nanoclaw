@@ -164,9 +164,11 @@ import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import {
   isShadowHost,
   onecliAgentIdentifier,
+  shadowEgressViolation,
   shadowProviderViolation,
   shadowSpawnImageViolation,
 } from './shadow-host.js';
+import { SHADOW_CONTAINER_LABEL_KEY } from './shadow-flag.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { assertHostOwnedInboundDb, hostInboundMounts, migrateInboundDbToHostDir } from './modules/mailbox/index.js';
 import {
@@ -7317,6 +7319,8 @@ async function buildContainerArgs(
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
   // the spawn rather than running with open egress. Otherwise the host gateway.
+  const shadowEgressRefusal = shadowEgressViolation();
+  if (shadowEgressRefusal) throw new Error(shadowEgressRefusal);
   if (ensureEgressNetwork()) {
     args.push(...egressNetworkArgs());
     log.info('Egress lockdown active', { containerName, network: EGRESS_NETWORK });
@@ -7573,6 +7577,7 @@ export function containerLabelArgs(agentGroupId: string, sessionId: string, work
     `${CONTAINER_WORKGROUP_LABEL_KEY}=${workgroupId ?? ''}`,
     '--label',
     `${CONTAINER_ROLE_LABEL_KEY}=agent`,
+    ...(isShadowHost() ? ['--label', `${SHADOW_CONTAINER_LABEL_KEY}=1`] : []),
   ];
 }
 

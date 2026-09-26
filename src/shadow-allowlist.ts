@@ -30,7 +30,10 @@ import { isShadowProcess } from './shadow-flag.js';
  * what the OS, node and docker need, plus the non-credential configuration a
  * shadow needs to boot and run a CLI turn. `ONECLI_API_KEY` is the one
  * credential: spawning needs the gateway, and the OneCLI seams themselves are
- * guarded in shadow-host.ts.
+ * guarded in shadow-host.ts. The proxy keys are left out on purpose: they are
+ * how host-side code reaches the OneCLI proxy that injects credentials, so
+ * without them every host-side credentialed call fails closed. Containers get
+ * their proxy from OneCLI at spawn, not from the host environment.
  */
 const SHADOW_ENV_KEYS: ReadonlySet<string> = new Set([
   // OS, node, docker, systemd
@@ -57,9 +60,6 @@ const SHADOW_ENV_KEYS: ReadonlySet<string> = new Set([
   'DOCKER_CONTEXT',
   'INVOCATION_ID',
   'JOURNAL_STREAM',
-  'HTTPS_PROXY',
-  'HTTP_PROXY',
-  'NO_PROXY',
   // NanoClaw
   'NANOCLAW_SHADOW',
   'WEBHOOK_PORT',
@@ -86,7 +86,6 @@ const SHADOW_ENV_KEYS: ReadonlySet<string> = new Set([
   'PENDING_MESSAGE_MAX_AGE_HOURS',
   'SESSION_ARTIFACT_IDLE_HOURS',
   'NANOCLAW_TASK_SCRIPT_TIMEOUT_MS',
-  'NANOCLAW_PROMISE_WATCH',
   'NANOCLAW_WORKGROUP_SHARED_FS',
   'NANOCLAW_EGRESS_NETWORK',
   'NANOCLAW_EGRESS_LOCKDOWN',
@@ -115,7 +114,8 @@ const SHADOW_ADAPTER_READY: ReadonlySet<string> = new Set<string>();
  * checkout's own databases. Off: token refresh (GitHub, MCP OAuth), image and
  * disk cleanup, egress-network repair, wiki recovery, the orchestrator
  * reconciler, claims reconciliation against GitHub, approval sweeps, task
- * auto-archive, and the title duties that call a model or a chat platform.
+ * auto-archive, promise watch, and the title duties that call a model or a
+ * chat platform.
  */
 export const SHADOW_SWEEP_DUTIES: ReadonlySet<string> = new Set([
   'processing-ack-sync',
@@ -148,7 +148,6 @@ export const SHADOW_SWEEP_DUTIES: ReadonlySet<string> = new Set([
   'cli-request-execution-prune',
   'task-failure-escalation',
   'coordination-orphans',
-  'promise-watch',
 ]);
 
 /** Channel adapters a shadow starts: the CLI channel is its only transport. */
@@ -313,6 +312,7 @@ export const shadowMayRunDeliveryAction = (name: string): boolean => allows(SHAD
 export const shadowMayReplayApproval = (name: string): boolean => allows(SHADOW_APPROVAL_ACTIONS, name);
 
 let scrubbedEnvKeys: string[] = [];
+let processEnvScrubbed = false;
 
 /**
  * On a shadow, delete every process-environment key outside the allowlist, so
@@ -325,6 +325,16 @@ export function scrubShadowProcessEnv(): void {
   const removed = Object.keys(process.env).filter((key) => !SHADOW_ENV_KEYS.has(key));
   for (const key of removed) delete process.env[key];
   scrubbedEnvKeys = removed.sort();
+  processEnvScrubbed = true;
+}
+
+/**
+ * Whether the entry shim scrubbed this process's environment. A shadow started
+ * straight from src/main.ts skips the shim, and modules have already captured
+ * whatever the environment held, so boot refuses it.
+ */
+export function shadowProcessEnvScrubbed(): boolean {
+  return processEnvScrubbed;
 }
 
 /** The names `scrubShadowProcessEnv` removed, for the boot log (never values). */

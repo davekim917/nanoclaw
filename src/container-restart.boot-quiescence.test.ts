@@ -73,6 +73,12 @@ vi.mock('./container-runtime.js', () => ({
   }),
 }));
 
+const shadowFlag = vi.hoisted(() => ({ on: false }));
+vi.mock('./shadow-flag.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./shadow-flag.js')>()),
+  isShadowProcess: () => shadowFlag.on,
+}));
+
 import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
 import type { InstallContainerScope } from './container-runtime.js';
 import { log } from './log.js';
@@ -209,6 +215,27 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(scope.survivable).toBe(2);
     expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session']);
     expect(scope.mustStopSessionIds).toEqual([]);
+    expect(spawns).toEqual([]);
+  });
+
+  it('a shadow adopts only survivors a shadow spawned; an unflagged run of the checkout is stopped', async () => {
+    shadowFlag.on = true;
+    try {
+      const runtime = fakeRuntime([
+        { ...container('nanoclaw-v2-b-1', 'wg-b'), shadow: true },
+        { ...container('nanoclaw-v2-c-1', 'wg-c'), shadow: false },
+        container('nanoclaw-v2-d-1', 'wg-d'),
+      ]);
+      const scope = await quiesceWorkgroupsForBootMountChange([], {
+        ...runtime,
+        knownWorkgroupIds: ['wg-b', 'wg-c', 'wg-d'],
+        knownSessionIds: ['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session', 'nanoclaw-v2-d-1-session'],
+      });
+      expect(runtime.stops).toEqual(['nanoclaw-v2-c-1', 'nanoclaw-v2-d-1']);
+      expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
+    } finally {
+      shadowFlag.on = false;
+    }
     expect(spawns).toEqual([]);
   });
 

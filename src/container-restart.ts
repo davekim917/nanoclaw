@@ -19,6 +19,7 @@ import { randomUUID } from 'crypto';
 import { listInstallContainersWithScope, stopContainer, type InstallContainerScope } from './container-runtime.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
+import { isShadowProcess } from './shadow-flag.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { repoIngressFenceAckToken } from './modules/mailbox/ops/fence.js';
 import { withExistingNanoclawOutbound } from './modules/mailbox/index.js';
@@ -623,7 +624,9 @@ export interface BootQuiescenceOptions {
  *     `ncl groups delete` leaves the container running, and its workgroup is
  *     in no reconcile scope and resolves to no row;
  *   - a session that still exists and is active — the same rule one level down;
- *   - a workgroup outside the changed set.
+ *   - a workgroup outside the changed set;
+ *   - on a shadow host, a shadow provenance label — a survivor of an unflagged
+ *     run of the same checkout carries production's mounts and identity.
  *
  * Everything else fails closed into must-stop, and the split is exact: every
  * container is on one side or the other.
@@ -647,7 +650,8 @@ function partitionInstallContainers(
       entry.sessionId !== null &&
       knownWorkgroupIds.has(entry.workgroupId) &&
       knownSessionIds.has(entry.sessionId) &&
-      !changed.has(entry.workgroupId),
+      !changed.has(entry.workgroupId) &&
+      (!isShadowProcess() || entry.shadow === true),
   );
   const survivableNames = new Set(survivable.map((entry) => entry.name));
   return { survivable, mustStop: containers.filter((entry) => !survivableNames.has(entry.name)) };

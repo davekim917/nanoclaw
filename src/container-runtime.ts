@@ -12,6 +12,7 @@ import {
   CONTAINER_WORKGROUP_LABEL_KEY,
 } from './config.js';
 import { log } from './log.js';
+import { isShadowProcess, SHADOW_CONTAINER_LABEL_KEY } from './shadow-flag.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
@@ -182,6 +183,8 @@ export interface InstallContainerScope {
   sessionId: string | null;
   /** `nanoclaw-group` label, or null when the container carries none. */
   groupId: string | null;
+  /** Read only on a shadow host: whether a shadow spawned it. */
+  shadow?: boolean;
 }
 
 /** Docker emits an empty string for a label a container does not carry. */
@@ -206,6 +209,7 @@ export function listInstallContainersWithScope(): InstallContainerScope[] {
     `{{.Label "${CONTAINER_WORKGROUP_LABEL_KEY}"}}`,
     `{{.Label "${CONTAINER_SESSION_LABEL_KEY}"}}`,
     `{{.Label "${CONTAINER_GROUP_LABEL_KEY}"}}`,
+    ...(isShadowProcess() ? [`{{.Label "${SHADOW_CONTAINER_LABEL_KEY}"}}`] : []),
   ].join('\\t');
   let output: string;
   try {
@@ -221,12 +225,13 @@ export function listInstallContainersWithScope(): InstallContainerScope[] {
     .split('\n')
     .filter(Boolean)
     .map((line) => {
-      const [name, workgroupId, sessionId, groupId] = line.split('\t');
+      const [name, workgroupId, sessionId, groupId, shadow] = line.split('\t');
       return {
         name: (name ?? '').trim(),
         workgroupId: labelOrNull(workgroupId),
         sessionId: labelOrNull(sessionId),
         groupId: labelOrNull(groupId),
+        ...(isShadowProcess() ? { shadow: labelOrNull(shadow) === '1' } : {}),
       };
     })
     .filter((entry) => entry.name !== '');
