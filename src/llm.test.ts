@@ -17,6 +17,7 @@ import {
   callWithCredentialRotation,
   CallHaikuHttpError,
   AllCredentialSlotsParkedError,
+  CredentialRotationGateHoldTimeoutError,
   CredentialRotationGateTimeoutError,
   __resetCallHaikuSlotCacheForTest,
   __resetCredentialParkingForTest,
@@ -399,6 +400,23 @@ describe('callHaiku', () => {
       const afterThat = call(async () => 'after');
       await vi.advanceTimersByTimeAsync(1500);
       expect((await afterThat).value).toBe('after');
+    });
+
+    it('abandons a call that holds the gate past the max hold, so queued callers are not starved', async () => {
+      const warnSpy = vi.spyOn(log, 'warn');
+      const hung = call(() => new Promise<string>(() => {}));
+      hung.catch(() => {});
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await expect(hung).rejects.toBeInstanceOf(CredentialRotationGateHoldTimeoutError);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Host LLM gate: call exceeded max hold — releasing the gate',
+        expect.objectContaining({ logLabel: 'test-gate' }),
+      );
+
+      const next = call(async () => 'next');
+      await vi.advanceTimersByTimeAsync(1500);
+      expect((await next).value).toBe('next');
     });
 
     it('caps a park at the 15-minute ceiling even when retry-after claims hours', async () => {

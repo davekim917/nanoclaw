@@ -427,6 +427,16 @@ const CREDENTIAL_ROTATION_GATE_MIN_INTERVAL_MS = 1000;
 const CREDENTIAL_ROTATION_GATE_MAX_WAIT_MS = 30_000;
 
 /**
+ * The longest one call may hold {@link withCredentialRotationGate}. Every
+ * attempt carries its own abort timer, so a legitimate call finishes well
+ * inside this (slot count x per-attempt timeout); past it the call is treated
+ * as hung — its caller gets {@link CredentialRotationGateHoldTimeoutError}
+ * and the queue moves on. Without this bound one call that never settles
+ * starves every later caller for the life of the process.
+ */
+const CREDENTIAL_ROTATION_GATE_MAX_HOLD_MS = 120_000;
+
+/**
  * Test-only override for {@link CREDENTIAL_ROTATION_GATE_MIN_INTERVAL_MS}.
  * Real spacing is 1s of wall-clock time; most tests don't care about gate
  * timing at all and would otherwise need to advance fake timers between
@@ -453,6 +463,14 @@ export class CredentialRotationGateTimeoutError extends Error {
   }
 }
 
+/** Thrown to a caller whose call held {@link withCredentialRotationGate} past {@link CREDENTIAL_ROTATION_GATE_MAX_HOLD_MS}. */
+export class CredentialRotationGateHoldTimeoutError extends Error {
+  constructor(logLabel: string) {
+    super(`${logLabel}: held the host LLM gate past ${CREDENTIAL_ROTATION_GATE_MAX_HOLD_MS}ms — abandoned as hung`);
+    this.name = 'CredentialRotationGateHoldTimeoutError';
+  }
+}
+
 /**
  * Process-wide serialization for every {@link callWithCredentialRotation}
  * call. This is what actually fixes the burst-parking loop: on every 60s
@@ -475,7 +493,8 @@ export class CredentialRotationGateTimeoutError extends Error {
  * true predecessor actually finishes), never early, or a later caller could
  * start running while an earlier one is still in flight. `fn` itself is
  * released in `finally` so a throwing call can never deadlock callers
- * queued behind it.
+ * queued behind it, and raced against {@link CREDENTIAL_ROTATION_GATE_MAX_HOLD_MS}
+ * so a call that never settles cannot either.
  */
 let gateTail: Promise<void> = Promise.resolve();
 let gateLastStartMs = 0;
@@ -501,7 +520,7 @@ async function raceTimeout(promise: Promise<unknown>, ms: number): Promise<'ok' 
   }
 }
 
-async function withCredentialRotationGate<T>(fn: () => Promise<T>): Promise<T> {
+async function withCredentialRotationGate<T>(logLabel: string, fn: () => Promise<T>): Promise<T> {
   const enqueuedAtMs = Date.now();
   const previousTail = gateTail;
   let releaseMine: () => void = () => {};
@@ -533,10 +552,22 @@ async function withCredentialRotationGate<T>(fn: () => Promise<T>): Promise<T> {
     await sleep(spacingWaitMs);
   }
 
-  gateLastStartMs = Date.now();
+  const startedAtMs = Date.now();
+  gateLastStartMs = startedAtMs;
+  let holdTimer: ReturnType<typeof setTimeout> | undefined;
+  const holdExpired = new Promise<never>((_, reject) => {
+    holdTimer = setTimeout(() => {
+      log.warn('Host LLM gate: call exceeded max hold — releasing the gate', {
+        logLabel,
+        heldMs: Date.now() - startedAtMs,
+      });
+      reject(new CredentialRotationGateHoldTimeoutError(logLabel));
+    }, CREDENTIAL_ROTATION_GATE_MAX_HOLD_MS);
+  });
   try {
-    return await fn();
+    return await Promise.race([fn(), holdExpired]);
   } finally {
+    clearTimeout(holdTimer);
     releaseMine();
   }
 }
@@ -598,7 +629,7 @@ export async function callWithCredentialRotation<T>(options: {
   env?: NodeJS.ProcessEnv;
   envFile?: Record<string, string>;
 }): Promise<{ value: T; slot: ClaudeCredentialSlot }> {
-  return withCredentialRotationGate(() => callWithCredentialRotationAttempt(options));
+  return withCredentialRotationGate(options.logLabel, () => callWithCredentialRotationAttempt(options));
 }
 
 async function callWithCredentialRotationAttempt<T>(options: {
