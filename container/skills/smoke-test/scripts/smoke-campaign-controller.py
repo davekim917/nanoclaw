@@ -970,6 +970,26 @@ class EffectLayer:
             return {"ok": True}
         return {"ok": False, "error": (doc or {}).get("error") or err or "rc={}".format(rc)}
 
+    def challenger_start(self, run_id, token):
+        """Live: re-anchor the challenger deadline to the root post
+        (smoke-pr-gate.sh challenger-start), run just before the root goes out
+        so the post names the deadline the challenger actually has. Not an
+        obligation: the gate sets the deadline once and answers a repeat with
+        it, and any failure leaves the provisional claim-time deadline in
+        force. Shadow is a no-op."""
+        if self.mode != "live" or not token:
+            return None
+        rc, out, err = self._run(self.gate + ["challenger-start", run_id, token], 20)
+        doc = last_json_line(out) if rc is not None else None
+        if doc and doc.get("ok") is True and doc.get("challengerDeadline"):
+            return {"ok": True, "deadline": doc["challengerDeadline"], "startedAt": doc.get("challengerStartedAt"),
+                    "started": doc.get("started") is True}
+        # No answer at all is retryable: a call that timed out after its write
+        # is answered on retry with the deadline it set.
+        return {"ok": False, "refusal": (doc or {}).get("refusal"),
+                "retryable": doc is None or doc.get("retryable") is True,
+                "error": (doc or {}).get("error") or err or "rc={}".format(rc)}
+
     # -- plumbing -------------------------------------------------------------
 
     def _left(self):
@@ -1469,8 +1489,8 @@ class EffectLayer:
         # intake brief says so in as many words ("use its coordinatorOwnerToken
         # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
         # gate mints a FRESH token on every same-run recovery poll
-        # (smoke-pr-gate.sh:5325, written to lease/authority/state at :5354,
-        # :5359, :5402), and reconcile_claims records the new one the wake
+        # (smoke-pr-gate.sh:5475, written to lease/authority/state at :5504,
+        # :5509, :5554), and reconcile_claims records the new one the wake
         # carries. Writing wake.json only at intake left the run tree naming a
         # RETIRED token while the brief still told the owner to use it: every
         # scaffold write, and `adopt` -- the verb that exists for exactly this
@@ -1594,8 +1614,10 @@ class EffectLayer:
                 "`smoke-run-scaffold.sh` write will be refused by its owner fence. Re-read "
                 "`{run}/controller/wake.json` (refreshed with this brief), export its `coordinatorOwnerToken` as "
                 "`SMOKE_GATE_OWNER`, and run `smoke-run-scaffold.sh adopt {run} {sha}` BEFORE any further "
-                "artifact write. Do NOT copy a token out of gate state or any other actor's file: the one in "
-                "wake.json is issued to you, which is what makes the adoption an adoption.".format(
+                "artifact write. The recovery normally moved the contract onto that token already, and `adopt` "
+                "then answers `alreadyOwner` without writing; it is the check, and the fix when the wake says "
+                "`contractAdoptionRequired`. Do NOT copy a token out of gate state or any other actor's file: the "
+                "one in wake.json is issued to you, which is what makes the adoption an adoption.".format(
                     run=run, sha=claim.get("sha") or "<frozen source sha>"))
         if step in BARRIER_STEPS:
             report = os.path.join(run, "controller", "barrier-{}.json".format(step))
@@ -1782,8 +1804,18 @@ class GateView:
                 # only to recover a claim whose wake was lost.
                 out[run] = {"pr": pr, "sha": st.get("activeSha"), "deadline": st.get("challengerDeadline"),
                             "disposition": st.get("challengerDisposition"), "owner": st.get("activeLeaseOwner"),
-                            "claimant": st.get("activeClaimant")}
+                            "claimant": st.get("activeClaimant"), "startedAt": st.get("challengerStartedAt")}
         return out
+
+    def note_challenger_start(self, run_id, deadline, started_at):
+        """Carry a `challenger-start` the gate just committed into this fire's
+        snapshot, so the root post rendered later in the same fire names the
+        deadline the gate now holds rather than the provisional one read at
+        the start of the fire."""
+        for st in self.pr_states.values():
+            if st.get("activeRunId") == run_id:
+                st["challengerDeadline"] = deadline
+                st["challengerStartedAt"] = started_at
 
     def run_verdict(self, run_id):
         doc, err = read_json_file(os.path.join(self.dir, "runs", run_id, "verdict.json"))
@@ -3356,6 +3388,37 @@ class Controller:
                     self.decide(run_id, "intake", "log", "mechanical",
                                 "critic output not in by {}s; root post goes without the design check".format(
                                     CRITIC_WAIT_SECONDS))
+        # The challenger's window starts at the root post: anchor
+        # the gate's deadline before the post's first attempt goes out, so the
+        # post states it. Once the root is enqueued it is too late to anchor
+        # without handing the challenger time past the post it answers.
+        root_ob = self.obligations().get(obligation_key(run_id, "send", "root"))
+        if self.live and not (claim or {}).get("startedAt") and \
+                (root_ob is None or root_ob["state"] in ("intent", "failed")):
+            started = self.effects.challenger_start(run_id, run_ob["detail"].get("ownerToken"))
+            deadline = parse_iso((claim or {}).get("deadline"))
+            blind = bool(started) and GATE_REFUSALS.get(started.get("refusal")) == "blind"
+            if started and started.get("ok"):
+                self.gate.note_challenger_start(run_id, started["deadline"], started["startedAt"])
+            elif started and (blind or started.get("retryable")) and deadline and self.now < deadline:
+                # The gate decided nothing (it could not reach its lease store
+                # or lock, or never answered). Posting now would fix the
+                # claim-time deadline for good, so the root waits a fire. The
+                # claim-time deadline bounds the wait: past it, the root goes
+                # out and the timeout path takes over, as before.
+                if blind:
+                    self.ensure_alarm(run_id, "controller_gate_blind", "gate-blind:challenger-start",
+                                      {"verb": "challenger-start", "refusal": started.get("refusal"),
+                                       "error": started.get("error")})
+                self.decide(run_id, "intake", "wait", "wait", "challenger-start could not act yet; root post deferred",
+                            refusal=started.get("refusal"), error=started.get("error"))
+                return "intake"
+            elif started and not started.get("refusal"):
+                # A coded refusal (no deadline, window closed or expired) is the
+                # gate stating a fact the timeout path already acts on; only an
+                # uncoded failure is news.
+                self.decide(run_id, "lanes", "log", "mechanical",
+                            "challenger-start failed; the claim-time deadline stands", error=started.get("error"))
         root = self.send(run_id, "lanes", "root")
         # PRP step 3: the sheet is a SEPARATE, later row so the host threads it
         # under the fresh root -- never before the root row exists.

@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5325`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5475`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -1917,10 +1917,11 @@ nothing and changes no owner, lease or authority. On it: read
 `notSettling.reason` (`not_settled`, `head_moved`, `pr_closed`, `pr_merged`,
 `label_removed`, …). If `challengerDispositionFiled` is true the evidence is
 complete and only synthesis is owed — once `leaseLive` is false, resume the
-**same** run id with `claim <runId> <pr> <sourceSha>`, run
-`smoke-run-scaffold.sh adopt <run-dir> <sourceSha>` before any marker when
-`contractAdoptionRequired` is true (or `null`), synthesize from the evidence on
-disk and `finish`. If the campaign is moot (PR closed, head moved),
+**same** run id with `claim <runId> <pr> <sourceSha>`, which moves the
+completion contract onto your token itself (its answer carries
+`contractAdoption`); run `smoke-run-scaffold.sh adopt <run-dir> <sourceSha>`
+before any marker only when that answer still says `contractAdoptionRequired`
+true (or `null`); then synthesize from the evidence on disk and `finish`. If the campaign is moot (PR closed, head moved),
 `claim` the run id the same way and `release` it. `null` for the disposition
 and contract fields means `SMOKE_GATE_RUN_ROOT` is unwired, not "absent".
 
@@ -2440,6 +2441,19 @@ This prevents two private state roots
 from opening different live run IDs for the same PR; only an explicitly
 authorized `--takeover` may replace a live different-run binding.
 
+**The challenger's window starts at the root post.** `claim` stamps a
+provisional `challengerDeadline` (claim + `SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS`,
+default 90 min). Whoever posts the root thread runs
+`challenger-start <run-id> <owner-token>` just before posting it and names the
+deadline it answers in the post. It re-anchors the deadline once, to
+min(now + timeout, provisional + `SMOKE_GATE_CHALLENGER_INTAKE_ALLOWANCE_SECONDS`,
+default 60 min); a repeat answers with the deadline already set, a same-SHA
+recovery keeps it, and it refuses (`deadline-passed`) once the provisional
+deadline has gone, so a run whose root never went out still times out there.
+An answer that decides nothing (`lease-unavailable`, a busy lock, or no answer)
+means hold the root and ask again rather than post on the provisional deadline,
+until that deadline passes. The campaign controller does this itself.
+
 The default lease lasts 15 minutes. While a coordinator is actively running,
 call `progress <run-id> <owner-token>` at least every 10 minutes; a successful
 progress atomically renews only that live owner's lease. Do not wake an LLM
@@ -2453,9 +2467,14 @@ bash /workspace/agent/smoke-pr-gate.sh claim \
 
 That same-run claim safely reacquires an expired lease without a human. A
 different token may reclaim only after expiry — this is also what every `poll`
-recovery is, because `poll` mints a new token per wake (`resumedRunId:true`,
-and `contractAdoptionRequired:true` when the run already has a contract). The
-existing contract still names the predecessor, so `marker`/`redispatch` refuse
+recovery is, because `poll` mints a new token per wake (`resumedRunId:true`).
+A same-run recovery — `poll`'s, or a `claim` that resumes the run id — moves
+an existing completion contract onto the new token itself, through the same
+fenced `adopt` below, and reports it as `contractAdoption` (with
+`contractAdoptionRequired:false` once it succeeded). Nobody is handed a token
+to fix a recovery with. Only when that adoption did not complete
+(`contractAdoptionRequired:true`, `contractAdoption.ok:false`) does the
+contract still name the predecessor, and `marker`/`redispatch` then refuse
 with `different coordinator owner` until the recovery owner takes ONE of:
 
 ```bash
