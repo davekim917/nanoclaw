@@ -25,7 +25,7 @@ Both are read-only.
 1. Series that printed an undeclared line since the previous release deployed:
 
    ```bash
-   pnpm exec tsx scripts/q.ts data/v2.db "SELECT u.agent_group_id, u.series_id, MAX(u.recorded_at) AS last_undeclared, (SELECT MAX(d.recorded_at) FROM task_run_outcomes d WHERE d.source = 'gate' AND d.series_id = u.series_id AND d.observation IN ('empty', 'unreadable', 'blocked', 'unfinished')) AS last_declared FROM task_run_outcomes u WHERE u.source = 'gate' AND u.observation = 'undeclared' GROUP BY 1, 2 ORDER BY 3 DESC"
+   pnpm exec tsx scripts/q.ts data/v2.db "SELECT u.agent_group_id, u.series_id, MAX(u.recorded_at) AS last_undeclared, (SELECT MAX(d.recorded_at) FROM task_run_outcomes d WHERE d.source = 'gate' AND d.agent_group_id = u.agent_group_id AND d.series_id = u.series_id AND d.observation IN ('empty', 'unreadable', 'blocked', 'unfinished')) AS last_declared FROM task_run_outcomes u WHERE u.source = 'gate' AND u.observation = 'undeclared' GROUP BY 1, 2 ORDER BY 3 DESC"
    ```
 
    Every series listed printed a bare line on at least one path. Fix it unless
@@ -38,17 +38,18 @@ Both are read-only.
    errored:
 
    ```bash
-   declared=$(pnpm exec tsx scripts/q.ts data/v2.db "SELECT DISTINCT series_id FROM task_run_outcomes WHERE source = 'gate' AND observation IN ('empty', 'unreadable', 'blocked', 'unfinished')")
+   declared=$(pnpm exec tsx scripts/q.ts data/v2.db "SELECT DISTINCT agent_group_id || ' ' || series_id FROM task_run_outcomes WHERE source = 'gate' AND observation IN ('empty', 'unreadable', 'blocked', 'unfinished')")
    ncl tasks list --all --json | jq -r --arg declared "$declared" '
      ($declared | split("\n")) as $seen
      | [.data[] | select(.has_script == 1)]
      | "scripted series listed: \(length)",
-       (.[] | select(.series_id | IN($seen[]) | not) | "\(.agent_group_id) \(.series_id) \(.recurrence // "one-shot")")'
+       (.[] | select("\(.agent_group_id) \(.series_id)" | IN($seen[]) | not) | "\(.agent_group_id) \(.series_id) \(.recurrence // "one-shot")")'
    ```
 
-   Read the script of each series this prints with
-   `ncl tasks get --id <series> --group <group>`, and check every path that
-   prints `wakeAgent: false`. `has_script` is `0` or `1`, and jq treats `0` as
+   Both steps key on the agent group and the series together, because a
+   series id is unique only within its group. Read the script of each series
+   this prints with `ncl tasks get --id <series> --group <group>`, and check
+   every path that prints `wakeAgent: false`. `has_script` is `0` or `1`, and jq treats `0` as
    true, so the filter compares it explicitly. `ncl tasks list` shows only
    pending and paused occurrences, so a series whose fire is running is
    missing until it re-arms. If the `scripted series listed` count differs
