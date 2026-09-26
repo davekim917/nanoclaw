@@ -85,9 +85,13 @@ bound read-only on top instead: agents can still read and run it, and only a
 host session can change it. Each directory between the writable mount and
 the declared path is also bound onto itself, because a plain nested bind can
 be defeated by renaming its parent directory away from inside the container.
-A declared path that does not exist is skipped; one reached through a symlink
-is skipped with a warning; a malformed file aborts the spawn. Removing an
-entry and respawning restores write access. See
+A declared path that does not exist is skipped, so create it on the host
+before declaring it: until a container spawns with the bind, that container
+can write there. One reached through a symlink is skipped with a warning; a
+malformed file aborts the spawn. The bind protects names, not inodes: a file
+under the path that has a second hard link (one made while the path was still
+writable) is logged at error level on every spawn and must be removed by an
+operator. Removing an entry and respawning restores write access. See
 `src/workgroup-readonly-paths.ts`.
 
 ## Workgroup wiki
