@@ -43,6 +43,7 @@ import {
 import type { HostWorkContinuation } from './modules/mailbox/ops/continuation.js';
 import { log } from './log.js';
 import { withExistingMailboxSession } from './session-manager.js';
+import { shadowMayRunSweepDuty } from './shadow-allowlist.js';
 import {
   containerIdentityFor,
   getActiveContainerSessionIds,
@@ -448,16 +449,22 @@ export function registerSweepKillFollowUp(followUp: SweepKillFollowUp): void {
 
 // Memoized: `dutiesForPhase` runs four times per swept session, and the tick
 // walks ~3,200 of them. Registration is import-time, so the only invalidation
-// is a registration (and the test-only reset).
+// is a registration (and the test-only reset). A shadow host's allowlist is
+// fixed for the process, so it filters here once.
 let dutiesByPhase = new Map<SweepPhase, SweepDuty[]>();
 
 function dutiesForPhase(phase: SweepPhase): SweepDuty[] {
   let duties = dutiesByPhase.get(phase);
   if (!duties) {
-    duties = sweepDuties.filter((d) => d.phase === phase);
+    duties = sweepDuties.filter((d) => d.phase === phase && shadowMayRunSweepDuty(d.name));
     dutiesByPhase.set(phase, duties);
   }
   return duties;
+}
+
+/** Test-only: the duties a phase runs, after the shadow-host allowlist. */
+export function _dutiesForPhaseForTesting(phase: SweepPhase): readonly SweepDuty[] {
+  return dutiesForPhase(phase);
 }
 
 /** Test-only: the full registration set, in run order. */
@@ -667,6 +674,7 @@ export async function runSlaObservationHooks(
   mailbox: NanoclawMailboxSession,
 ): Promise<void> {
   for (const hook of slaObservationHooks) {
+    if (!shadowMayRunSweepDuty(hook.name)) continue;
     await runDutyBody(hook.name, 'session:health:sla-observe', () => hook.run(ctx, state, mailbox));
   }
 }
@@ -685,6 +693,7 @@ export async function runSweepKillFollowUps(
     killSnapshot: { value: snapshot, enumerable: true },
   }) as SweepSessionContext;
   for (const followUp of sweepKillFollowUps) {
+    if (!shadowMayRunSweepDuty(followUp.name)) continue;
     await runDutyBody(followUp.name, 'session:health:post-kill', () => followUp.run(followUpCtx, outcome, mailbox));
   }
 }

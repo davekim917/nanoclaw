@@ -14,7 +14,7 @@ vi.mock('./log.js', () => ({
 
 // The flag is whatever a test sets here; shadow-flag.test.ts covers how it is read.
 const flagState = vi.hoisted(() => ({ on: false }));
-vi.mock('./shadow-flag.js', () => ({ readShadowFlag: () => flagState.on }));
+vi.mock('./shadow-flag.js', () => ({ readShadowFlag: () => flagState.on, isShadowProcess: () => flagState.on }));
 
 import { getContainerImageBase } from './install-slug.js';
 import { imageRepository, shadowImageViolation } from './shadow-host.js';
@@ -102,7 +102,7 @@ describe('enterShadowHostMode', () => {
     expect(os.tmpdir()).toBe(tmpDir);
     expect(fs.statSync(tmpDir).isDirectory()).toBe(true);
     expect(logState.warn).toHaveBeenCalledTimes(1);
-    expect(logState.warn.mock.calls[0][0]).toMatch(/OneCLI approval handler.*image builds.*plugin updater/);
+    expect(logState.warn.mock.calls[0][0]).toMatch(/allowlisted.*image builds.*host credential mounts/);
   });
 
   it("refuses when CONTAINER_IMAGE points at another install's image, and changes nothing", async () => {
@@ -139,42 +139,6 @@ describe('enterShadowHostMode', () => {
   it('refuses when CONTAINER_IMAGE_BASE is overridden to another namespace', async () => {
     const mod = await loadFresh(true, { CONTAINER_IMAGE_BASE: OTHER_BASE });
     expect(mod.enterShadowHostMode()).not.toBeNull();
-  });
-
-  it("refuses production's chat-platform credentials from .env, naming the keys and never the values", async () => {
-    fs.writeFileSync(
-      path.join(tmpRoot, '.env'),
-      [
-        'WEBHOOK_PORT=3999',
-        'SLACK_BOT_TOKEN=xoxb-secret-1',
-        'SLACK_APP_TOKEN_EXAMPLE_LABS=xapp-secret-2',
-        'SLACK_SIGNING_SECRET=secret-3',
-        '',
-      ].join('\n'),
-    );
-    const tmpBefore = process.env.TMPDIR;
-    const mod = await loadFresh(true);
-    const violation = mod.enterShadowHostMode();
-    expect(violation).toContain('(SLACK_APP_TOKEN_EXAMPLE_LABS, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)');
-    expect(violation).not.toContain('secret-');
-    expect(process.env.TMPDIR).toBe(tmpBefore);
-    expect(logState.warn).not.toHaveBeenCalled();
-  });
-
-  it('refuses a Discord bot token that only the process environment carries', async () => {
-    const mod = await loadFresh(true, { WEBHOOK_PORT: '3999', DISCORD_BOT_TOKEN_EXAMPLE: 'discord-secret' });
-    const violation = mod.enterShadowHostMode();
-    expect(violation).toContain('(DISCORD_BOT_TOKEN_EXAMPLE)');
-    expect(violation).not.toContain('discord-secret');
-  });
-
-  it('boots with empty credential values and with platform keys that are not credentials', async () => {
-    fs.writeFileSync(
-      path.join(tmpRoot, '.env'),
-      'WEBHOOK_PORT=3999\nSLACK_BOT_TOKEN=\nSLACK_BOT_TOKENS_NOTE=x\nDISCORD_PUBLIC_KEY=abc\n',
-    );
-    const mod = await loadFresh(true, { DISCORD_BOT_TOKEN: '  ' });
-    expect(mod.enterShadowHostMode()).toBeNull();
   });
 });
 

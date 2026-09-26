@@ -26,7 +26,6 @@
 import { onDeliveryAdapterReady } from '../../delivery.js';
 import { registerResponseHandler } from '../../response-registry.js';
 import { onHostShutdown } from '../../host-lifecycle.js';
-import { isShadowHost } from '../../shadow-host.js';
 import { handleApprovalsResponse } from './response-handler.js';
 import { startOneCLIApprovalHandler, stopOneCLIApprovalHandler } from './onecli-approvals.js';
 
@@ -40,9 +39,6 @@ export { sweepAwaitingReasonRejects } from './reason-capture.js';
 registerResponseHandler(handleApprovalsResponse);
 
 onDeliveryAdapterReady((adapter) => {
-  // The OneCLI key is shared with production; a shadow's handler would answer,
-  // and deny, requests from agents it does not know.
-  if (isShadowHost()) return;
   startOneCLIApprovalHandler(adapter);
 });
 

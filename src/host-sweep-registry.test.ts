@@ -1573,6 +1573,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       'decideCeilingFollowUp',
       'WORK_CONTINUATION_RESUME_MAX_ATTEMPTS',
       // test accessors
+      '_dutiesForPhaseForTesting',
       '_lastSweepTickStatsForTesting',
       '_listSweepRegistrationsForTesting',
       '_resetQuietSessionCacheForTesting',

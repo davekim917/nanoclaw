@@ -27,7 +27,8 @@ import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
-import { enterShadowHostMode } from './shadow-host.js';
+import { shadowMayReadEnvKey } from './shadow-allowlist.js';
+import { enterShadowHostMode, isShadowHost, startShadowHostModules } from './shadow-host.js';
 import {
   channelNameProvenance,
   channelNameProvenanceAccepts,
@@ -245,7 +246,7 @@ function loadEnvIntoProcess(): void {
       .slice(eqIdx + 1)
       .trim()
       .replace(/^["']|["']$/g, '');
-    if (key && !Object.prototype.hasOwnProperty.call(process.env, key)) {
+    if (key && shadowMayReadEnvKey(key) && !Object.prototype.hasOwnProperty.call(process.env, key)) {
       process.env[key] = value;
     }
   }
@@ -1024,7 +1025,8 @@ export async function main(): Promise<void> {
   // onHostShutdown callbacks at import time; this is where registered start
   // work actually begins (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
   // Inert when no module registers anything.
-  await startHostModules({ db: getDb(), signal: hostAbortController.signal });
+  if (isShadowHost()) await startShadowHostModules({ db: getDb(), signal: hostAbortController.signal });
+  else await startHostModules({ db: getDb(), signal: hostAbortController.signal });
 
   // Start recovery only after permissions and delivery are fully wired. A
   // replay can immediately exercise either surface (sibling bots, unknown

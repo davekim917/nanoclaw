@@ -50,6 +50,7 @@ import { allowedWikiOutbound, wikiEnrollment } from './wiki-admission/policy.js'
 import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
+import { shadowMayRunAdapterReady, shadowMayRunDeliveryAction } from './shadow-allowlist.js';
 import { humanizeOutboundContent } from './verdict-tokens.js';
 import { archiveMessage } from './message-archive.js';
 import { resolveContinueThread } from './continue-thread.js';
@@ -805,6 +806,10 @@ export function getDeliveryAdapter(): ChannelDeliveryAdapter | null {
 }
 
 export function onDeliveryAdapterReady(cb: AdapterReadyCallback): void {
+  if (!shadowMayRunAdapterReady(cb.name)) {
+    log.info('Delivery-adapter-ready callback not registered on a shadow host', { callback: cb.name || '(anonymous)' });
+    return;
+  }
   adapterReadyCallbacks.push(cb);
   if (deliveryAdapter) {
     // Already set — fire immediately so late registrations still run.
@@ -2345,6 +2350,16 @@ export function registerDeliveryAction(
   deliveryActions.set(action, { guard: guardDecl, handler } as DeliveryEntry);
 }
 
+/** A registered action, or none when a shadow host's allowlist does not name it. */
+function deliveryEntry(action: string): DeliveryEntry | undefined {
+  const entry = deliveryActions.get(action);
+  if (entry && !shadowMayRunDeliveryAction(action)) {
+    log.warn('Delivery action refused on a shadow host', { action });
+    return undefined;
+  }
+  return entry;
+}
+
 /**
  * Approve continuation for a guard-wrapped delivery action: re-enter the
  * entry with the approval row as the grant. The guard treats the grant as
@@ -2354,7 +2369,7 @@ export function registerDeliveryAction(
  */
 export function reenterGuardedDeliveryAction(action: string) {
   return async (ctx: { session: Session; payload: Record<string, unknown>; approval: PendingApproval }) => {
-    const entry = deliveryActions.get(action);
+    const entry = deliveryEntry(action);
     if (!entry || isUnguardedEntry(entry)) {
       log.warn('Approved replay for an action that is not guard-wrapped — dropping', { action });
       return;
@@ -2369,7 +2384,7 @@ export function reenterGuardedDeliveryAction(action: string) {
  * both come through here; there is no route around the guard.
  */
 export function getDeliveryAction(action: string): DeliveryActionHandler | undefined {
-  const entry = deliveryActions.get(action);
+  const entry = deliveryEntry(action);
   if (!entry) return undefined;
   if (isUnguardedEntry(entry)) return entry.handler;
   return (content, session) => runGuarded(action, entry.guard, entry.handler, content, session, null);

@@ -19,6 +19,7 @@ import { withCentralSync } from '../db/central-lease.js';
 import { guard, type GuardActor } from '../guard/index.js';
 import { log } from '../log.js';
 import { registerApprovalHandler, requestApproval } from '../modules/approvals/index.js';
+import { shadowMayRunCliCommand } from '../shadow-allowlist.js';
 import type { PendingApproval } from '../types.js';
 import type { CallerContext, ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
 import { localizeIsoTimestamps } from './format.js';
@@ -72,6 +73,10 @@ export async function dispatch(
 
   if (!cmd) {
     return err(req.id, 'unknown-command', unknownCommandMessage(req.command));
+  }
+
+  if (!shadowMayRunCliCommand(cmd.name)) {
+    return err(req.id, 'forbidden', `${cmd.name} is not served on a shadow host (NANOCLAW_SHADOW=1)`);
   }
 
   // Group-scope mechanics for agent callers (visibility, not policy — the

@@ -15,7 +15,6 @@ const state = vi.hoisted(() => ({
   wiringExists: false,
   startError: undefined as string | undefined,
   secrets: new Set<string>(),
-  shadow: false,
 }));
 
 const spies = vi.hoisted(() => ({
@@ -32,8 +31,6 @@ const spies = vi.hoisted(() => ({
 }));
 
 vi.mock('../log.js', () => ({ log: { warn: spies.warn } }));
-
-vi.mock('../shadow-host.js', () => ({ isShadowHost: () => state.shadow }));
 
 vi.mock('../config.js', () => ({
   get REPO_ROOT() {
@@ -171,7 +168,6 @@ beforeEach(() => {
   state.wiringExists = false;
   state.startError = undefined;
   state.secrets.clear();
-  state.shadow = false;
   vi.clearAllMocks();
 });
 
@@ -211,16 +207,6 @@ describe('addSlackWorkspace', () => {
 
     await expect(addSlackWorkspace(input)).resolves.toMatchObject({ status: 'already-active' });
     expect(spies.start).toHaveBeenCalledTimes(1);
-  });
-
-  it('refuses on a shadow host before the token is stored, validated or started', async () => {
-    state.shadow = true;
-    const input = { instance: 'helper', botToken: 'xoxb-synthetic-helper', appToken: 'xapp-synthetic-helper' };
-    await expect(addSlackWorkspace(input)).rejects.toThrow('a shadow host never attaches a Slack workspace');
-    expect(spies.upsert).not.toHaveBeenCalled();
-    expect(spies.auth).not.toHaveBeenCalled();
-    expect(spies.registerWorkspace).not.toHaveBeenCalled();
-    expect(spies.start).not.toHaveBeenCalled();
   });
 
   it('serializes concurrent attachments so the adapter starts once', async () => {

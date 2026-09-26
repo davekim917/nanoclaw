@@ -13,47 +13,18 @@
  */
 import { randomUUID } from 'node:crypto';
 import fs from 'fs';
-import path from 'path';
 
-function envPath(rootDir: string): string {
-  return path.join(rootDir, '.env');
-}
+import { envPath, parseEnvText, readEnvText, readEnvValueRaw } from './env-text.js';
+import { shadowMayReadEnvKey } from './shadow-allowlist.js';
 
-function readEnvText(rootDir: string): string {
-  try {
-    return fs.readFileSync(envPath(rootDir), 'utf-8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
-    throw error;
-  }
-}
-
-/** Parse one KEY from dotenv-style text with src/env.ts semantics. Last line wins. */
-function parseEnvText(text: string, key: string): string | undefined {
-  let result: string | undefined;
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    if (trimmed.slice(0, eqIdx).trim() !== key) continue;
-    let value = trimmed.slice(eqIdx + 1).trim();
-    if (
-      value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (value) result = value;
-  }
-  return result;
-}
-
-/** Process env first, then `${rootDir}/.env` — the same order everywhere. */
+/**
+ * Process env first, then `${rootDir}/.env` — the same order everywhere. On a
+ * shadow host a key outside the shadow allowlist reads as absent, however
+ * often it is re-read and whatever `.env` holds by then.
+ */
 export function readEnvValue(rootDir: string, key: string): string | undefined {
-  const fromEnv = process.env[key]?.trim();
-  if (fromEnv) return fromEnv;
-  return parseEnvText(readEnvText(rootDir), key);
+  if (!shadowMayReadEnvKey(key)) return undefined;
+  return readEnvValueRaw(rootDir, key);
 }
 
 /**

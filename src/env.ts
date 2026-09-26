@@ -1,12 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 import { log } from './log.js';
+import { shadowMayReadEnvKey } from './shadow-allowlist.js';
 
 /**
  * Parse the .env file and return values for the requested keys.
  * Does NOT load anything into process.env — callers decide what to
  * do with the values. This keeps secrets out of the process environment
- * so they don't leak to child processes.
+ * so they don't leak to child processes. On a shadow host a key outside the
+ * shadow allowlist reads as absent, on every read.
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
   const wanted = new Set(keys);
@@ -38,7 +40,7 @@ function parseEnvFile(include: (key: string) => boolean): Record<string, string>
     const eqIdx = trimmed.indexOf('=');
     if (eqIdx === -1) continue;
     const key = trimmed.slice(0, eqIdx).trim();
-    if (!include(key)) continue;
+    if (!include(key) || !shadowMayReadEnvKey(key)) continue;
     let value = trimmed.slice(eqIdx + 1).trim();
     if (
       value.length >= 2 &&

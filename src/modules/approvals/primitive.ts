@@ -31,6 +31,7 @@ import {
 import { getDeliveryAdapter, settleSessionStatusAfterPublicDelivery } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
+import { shadowMayReplayApproval } from '../../shadow-allowlist.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
@@ -87,7 +88,9 @@ export function registerApprovalHandler(action: string, handler: ApprovalHandler
   approvalHandlers.set(action, handler);
 }
 
+/** The handler for an approved action; none on a shadow host whose allowlist does not name it. */
 export function getApprovalHandler(action: string): ApprovalHandler | undefined {
+  if (!shadowMayReplayApproval(action)) return undefined;
   return approvalHandlers.get(action);
 }
 

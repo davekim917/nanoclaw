@@ -2,12 +2,17 @@
  * Shadow host mode (`NANOCLAW_SHADOW=1`): a second host run from a separate
  * checkout on a machine that already runs a production host — the practice
  * copy an agent drives to verify a change. Data, sockets and containers are
- * already scoped to the checkout. What this flag turns off is what acts on
- * state the two hosts share: the OneCLI approval queue, agent grants and
- * secrets, the container image store and build cache, the live plugin sources
- * under `~/plugins`, host credential files mounted read-write, the system temp
- * dir, the dashboard cookie, an off-box port, and production's chat-platform
- * bots.
+ * already scoped to the checkout.
+ *
+ * What a shadow may run and read is an allowlist (shadow-allowlist.ts): its
+ * environment, host modules, sweep duties, channels, providers, `ncl`
+ * commands, delivery actions and approval replays. The seams no registry
+ * covers sit inside work the allowlist admits, and each asks `isShadowHost()`
+ * where it acts: the image store (spawn image, builds, the rebuild watcher,
+ * docker cleanup), the OneCLI agent identity, host paths mounted into
+ * containers, host-side task scripts, the dashboard cookie, the webhook port
+ * and bind, the process temp dir, and deploy rollback. The rules those need
+ * live here.
  *
  * Unset, every call site behaves exactly as before.
  */
@@ -15,25 +20,23 @@ import fs from 'fs';
 import path from 'path';
 
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, DATA_DIR, INSTALL_SLUG, REPO_ROOT } from './config.js';
-import { readEnvFileMatching } from './env.js';
 import { readEnvValue } from './env-file.js';
+import { getHostStartCallbacks, type HostStartContext } from './host-lifecycle.js';
 import { getContainerImageBase } from './install-slug.js';
 import { log } from './log.js';
-import { readShadowFlag } from './shadow-flag.js';
-
-const shadowHost = readShadowFlag(process.cwd());
+import { scrubbedShadowEnvKeys, shadowMayRunProvider, shadowMayStartHostModule } from './shadow-allowlist.js';
+import { isShadowProcess } from './shadow-flag.js';
 
 export function isShadowHost(): boolean {
-  return shadowHost;
+  return isShadowProcess();
 }
 
 const SHADOW_MODE_SUMMARY =
-  'Shadow host mode: OneCLI approval handler, MCP OAuth refresh and secret writes, container image ' +
-  'builds, plugin updater, docker image/build-cache cleanup, host-side task scripts and host ' +
-  'credential mounts are disabled; ' +
-  'chat-platform credentials and non-Claude providers refused; operator mounts forced read-only; ' +
-  'OneCLI agents, TMPDIR and the dashboard cookie are namespaced to this checkout; webhook server ' +
-  'bound to 127.0.0.1';
+  'Shadow host mode: environment, host modules, sweep duties, channels (CLI only), providers (Claude ' +
+  'only), ncl commands, delivery actions and approval replays are allowlisted; container image builds, ' +
+  'docker image/build-cache cleanup, host-side task scripts and host credential mounts are disabled; ' +
+  'operator mounts forced read-only; OneCLI agents, TMPDIR and the dashboard cookie are namespaced to ' +
+  'this checkout; webhook server bound to 127.0.0.1';
 
 /** The image reference without its tag or digest (`host:5000/name:tag` → `host:5000/name`). */
 export function imageRepository(ref: string): string {
@@ -72,35 +75,6 @@ export function shadowWebhookPortViolation(raw: string | undefined): string | nu
   );
 }
 
-// A newly installed channel's credential keys belong here too, or its adapter
-// connects on a shadow as production's bot.
-const PLATFORM_CREDENTIAL_KEY = /^(SLACK_(BOT_TOKEN|APP_TOKEN|SIGNING_SECRET)|DISCORD_BOT_TOKEN)(_|$)/;
-
-/**
- * A shadow holding production's chat-platform credentials connects as
- * production's bot: Socket Mode splits live events between the two hosts, and
- * the host-side writers that call the platform APIs directly reach
- * production's channels. The adapters and those writers all take their tokens
- * from these keys, so refusing the keys closes every path. Names only: a
- * value is never put in the message.
- */
-export function shadowPlatformCredentialViolation(names: string[]): string | null {
-  if (names.length === 0) return null;
-  return (
-    `NANOCLAW_SHADOW=1 refuses to boot holding chat-platform credentials (${names.join(', ')}): ` +
-    `a shadow connected as production's bot receives and answers production's traffic. Its only ` +
-    `transport is the CLI channel; remove these from this checkout's .env and the process environment.`
-  );
-}
-
-function platformCredentialNames(): string[] {
-  const names = new Set(Object.keys(readEnvFileMatching(PLATFORM_CREDENTIAL_KEY)));
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value?.trim() && PLATFORM_CREDENTIAL_KEY.test(key)) names.add(key);
-  }
-  return [...names].sort();
-}
-
 /**
  * Per-spawn form of the same rule, for the image a spawn actually resolves —
  * a group's `container.json` `imageTag` can name an image the boot check never
@@ -128,36 +102,47 @@ export function onecliAgentIdentifier(agentGroupId: string): string {
   return isShadowHost() ? `shadow-${INSTALL_SLUG}-${agentGroupId}` : agentGroupId;
 }
 
-/**
- * Codex and OpenCode sessions mount host credential homes read-write, so a
- * shadow runs Claude-provider sessions only. Null when allowed.
- */
+/** Null when the shadow provider allowlist admits the provider (always, off a shadow). */
 export function shadowProviderViolation(provider: string): string | null {
-  if (!isShadowHost() || provider === 'claude') return null;
+  if (shadowMayRunProvider(provider)) return null;
   return `Shadow host refuses a ${provider} session: only the claude provider runs without writing host credential files`;
 }
 
 /**
  * Enter shadow mode at boot, before anything can spawn or build. Returns the
  * refusal message when the configured image is outside this checkout's
- * namespace, when no WEBHOOK_PORT of its own is set, or when a chat-platform
- * credential is present (both read from `.env` here too: boot copies `.env`
- * into the environment only after this runs).
+ * namespace, or when no WEBHOOK_PORT of its own is set (read from `.env` here
+ * too: boot copies `.env` into the environment only after this runs).
  * Otherwise points TMPDIR into this checkout — the OneCLI SDK writes CA
  * bundles and credential stubs under fixed names in `os.tmpdir()`, which
- * production's containers bind-mount — logs what shadow mode changed, and
- * returns null. Does nothing when shadow mode is off.
+ * production's containers bind-mount — logs what shadow mode changed and the
+ * environment keys the entry shim removed, and returns null. Does nothing
+ * when shadow mode is off.
  */
 export function enterShadowHostMode(): string | null {
   if (!isShadowHost()) return null;
   const violation =
     shadowImageViolation(CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, getContainerImageBase(REPO_ROOT)) ??
-    shadowWebhookPortViolation(readEnvValue(process.cwd(), 'WEBHOOK_PORT')) ??
-    shadowPlatformCredentialViolation(platformCredentialNames());
+    shadowWebhookPortViolation(readEnvValue(process.cwd(), 'WEBHOOK_PORT'));
   if (violation) return violation;
   const tmpDir = path.join(DATA_DIR, 'tmp');
   fs.mkdirSync(tmpDir, { recursive: true });
   process.env.TMPDIR = tmpDir;
-  log.warn(SHADOW_MODE_SUMMARY, { image: CONTAINER_IMAGE, tmpDir });
+  log.warn(SHADOW_MODE_SUMMARY, { image: CONTAINER_IMAGE, tmpDir, removedEnvKeys: scrubbedShadowEnvKeys() });
   return null;
+}
+
+/**
+ * A shadow host's replacement for `startHostModules`, which main.ts calls
+ * instead on a shadow: host-lifecycle.ts must stay byte-identical to upstream,
+ * so the allowlist filters here rather than in the registry itself.
+ */
+export async function startShadowHostModules(ctx: HostStartContext): Promise<void> {
+  for (const cb of getHostStartCallbacks()) {
+    if (!shadowMayStartHostModule(cb.name)) {
+      log.info('Host module not started on a shadow host', { module: cb.name || '(anonymous)' });
+      continue;
+    }
+    await cb(ctx);
+  }
 }

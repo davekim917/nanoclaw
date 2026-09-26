@@ -7,6 +7,7 @@
 import type { ChannelAdapter, ChannelDefaults, ChannelRegistration, ChannelSetup, OutboundFile } from './adapter.js';
 import type { ChannelDeliveryAdapter } from '../delivery.js';
 import { log } from '../log.js';
+import { shadowMayStartChannel } from '../shadow-allowlist.js';
 
 const SETUP_RETRY_DELAYS_MS = [2000, 5000, 10000];
 
@@ -309,6 +310,11 @@ async function startRegisteredChannelAdapter(
   setupFn: (adapter: ChannelAdapter) => ChannelSetup,
   options: { replaceActive: boolean },
 ): Promise<ChannelAdapterStartResult> {
+  // Before the factory: an adapter reads its credentials as it is built.
+  if (!shadowMayStartChannel(name)) {
+    log.warn('Channel adapter not started on a shadow host', { channel: name });
+    return 'no-credentials';
+  }
   const adapter = await registration.factory();
   if (!adapter) {
     log.warn('Channel credentials missing, skipping', { channel: name });

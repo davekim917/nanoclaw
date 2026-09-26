@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { readShadowFlag } from './shadow-flag.js';
+import { _resetShadowProcessForTesting, isShadowProcess, readShadowFlag } from './shadow-flag.js';
 
 describe('readShadowFlag', () => {
   let root: string;
@@ -57,5 +57,38 @@ describe('readShadowFlag', () => {
     fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=0\n');
     vi.stubEnv('NANOCLAW_SHADOW', '1');
     expect(readShadowFlag(root)).toBe(true);
+  });
+});
+
+describe('isShadowProcess', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'shadow-process-'));
+    vi.stubEnv('NANOCLAW_SHADOW', undefined);
+    vi.spyOn(process, 'cwd').mockReturnValue(root);
+    _resetShadowProcessForTesting();
+  });
+
+  afterEach(() => {
+    _resetShadowProcessForTesting();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('decides once, from the working directory, and ignores a later .env edit', () => {
+    fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=1\n');
+    expect(isShadowProcess()).toBe(true);
+    fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=0\n');
+    expect(isShadowProcess()).toBe(true);
+    fs.rmSync(path.join(root, '.env'));
+    expect(isShadowProcess()).toBe(true);
+  });
+
+  it('stays off for the process when it starts off', () => {
+    expect(isShadowProcess()).toBe(false);
+    fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=1\n');
+    expect(isShadowProcess()).toBe(false);
   });
 });
