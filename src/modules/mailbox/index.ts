@@ -176,7 +176,7 @@ import {
   listOverdueRecurringRows,
   syncProcessingAcks,
   type ContainerState as ForkContainerState,
-  type OverdueRecurringRow,
+  type OverdueRecurringRows,
   type ProcessingClaim,
 } from './ops/sweep.js';
 import {
@@ -425,8 +425,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
    * them with no ack left to sync (see the op).
    */
   syncProcessingAcks(): string[];
-  /** Recurring occurrences due since before `cutoffIso` with nothing in the session being worked (see the op). */
-  listOverdueRecurringRows(cutoffIso: string): OverdueRecurringRow[];
+  /** Recurring occurrences due since before `cutoffIso` that no container has acknowledged (see the op). */
+  listOverdueRecurringRows(cutoffIso: string): OverdueRecurringRows;
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
   /**
