@@ -6,6 +6,8 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockExecFileSync = vi.fn();
+const shadowState = vi.hoisted(() => ({ on: false }));
+vi.mock('./shadow-host.js', () => ({ isShadowHost: () => shadowState.on }));
 vi.mock('child_process', () => ({
   execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
 }));
@@ -1896,6 +1898,26 @@ describe('storage-manager Docker cleanup', () => {
 
     expect(forced.actions.some((action) => action.pool === 'docker')).toBe(true);
     expect(forced.warnings).not.toContain('docker cleanup skipped by emergency retry throttle');
+  });
+
+  it('plans no docker action, even when forced, on a shadow host', () => {
+    shadowState.on = true;
+    try {
+      const report = getStorageReport({
+        mode: 'apply',
+        now,
+        force: true,
+        sessionsRoot: MISSING_SESSIONS_ROOT,
+        threadsRoot: MISSING_THREADS_ROOT,
+        policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+      });
+      expect(report.actions.filter((action) => action.pool === 'docker')).toEqual([]);
+      expect(report.warnings).toContain('docker cleanup skipped: shadow host');
+      const dockerCalls = mockExecFileSync.mock.calls.filter(([cmd]) => cmd === CONTAINER_RUNTIME_BIN);
+      expect(dockerCalls).toEqual([]);
+    } finally {
+      shadowState.on = false;
+    }
   });
 
   it('runs the age-bounded BuildKit cleanup on the first normal-cadence scan', () => {

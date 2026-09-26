@@ -1,0 +1,43 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { readShadowFlag } from './shadow-flag.js';
+
+describe('readShadowFlag', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'shadow-flag-'));
+    vi.stubEnv('NANOCLAW_SHADOW', undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('is off with no environment variable and no .env', () => {
+    expect(readShadowFlag(root)).toBe(false);
+  });
+
+  it('turns on from .env, quoted or not', () => {
+    fs.writeFileSync(path.join(root, '.env'), 'OTHER=x\nNANOCLAW_SHADOW="1"\n');
+    expect(readShadowFlag(root)).toBe(true);
+  });
+
+  it('treats only the literal 1 as on', () => {
+    fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=true\n');
+    expect(readShadowFlag(root)).toBe(false);
+  });
+
+  it('lets the process environment override .env in both directions', () => {
+    fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=1\n');
+    vi.stubEnv('NANOCLAW_SHADOW', '0');
+    expect(readShadowFlag(root)).toBe(false);
+    fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=0\n');
+    vi.stubEnv('NANOCLAW_SHADOW', '1');
+    expect(readShadowFlag(root)).toBe(true);
+  });
+});

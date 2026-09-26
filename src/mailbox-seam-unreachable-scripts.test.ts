@@ -754,6 +754,10 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       'src/modules/mailbox/index.ts': ['resolveInboundDbPath', 'sessionMailboxDir', 'sessionMailboxPath'],
       'src/repository-workspaces.ts': ['listTopicCheckouts', 'resolveRepositoryWorkUnit'],
       'src/session-manager.ts': ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'],
+      // shadow-host.ts imports config.ts, env.ts, install-slug.ts and log.ts —
+      // config.ts already reaches the middle two and the other two are pinned
+      // here — so this edge reaches no module storage-manager.ts did not.
+      'src/shadow-host.ts': ['isShadowHost'],
       'src/storage-activity.ts': ['STORAGE_INTERNAL_ENTRY_NAMES', 'tryRunWithStorageCleanupClaim'],
       // `import type { ContainerConfigRow }` — a whole-clause type-only
       // import, erased at compile time. discoverRelativeModules still

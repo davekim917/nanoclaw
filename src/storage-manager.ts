@@ -50,6 +50,7 @@ import { CONTAINER_CONFIGS_ALL_SQL } from './db/container-configs.js';
 import type { ContainerConfigRow } from './types.js';
 import { log } from './log.js';
 import { listTopicCheckouts, resolveRepositoryWorkUnit } from './repository-workspaces.js';
+import { isShadowHost } from './shadow-host.js';
 import { STORAGE_INTERNAL_ENTRY_NAMES, tryRunWithStorageCleanupClaim } from './storage-activity.js';
 // The session-directory LAYOUT, not the data: this file's reclaim probes open
 // their own read-only handles, so all they need from the seam is where a
@@ -3072,6 +3073,12 @@ function collectDockerActions(
   usageBefore: FilesystemUsage | null,
   force: boolean,
 ): { actions: StorageAction[]; images: DockerImageDispositionReport[] } {
+  // Images and the build cache are shared with every other install on the
+  // host; a shadow's inventory would count production's images as unowned.
+  if (isShadowHost()) {
+    warnings.push('docker cleanup skipped: shadow host');
+    return { actions: [], images: [] };
+  }
   let dockerRoot: string;
   try {
     dockerRoot = dockerRootDir();

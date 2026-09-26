@@ -29,6 +29,9 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
+const shadowState = vi.hoisted(() => ({ on: false }));
+vi.mock('./shadow-host.js', () => ({ isShadowHost: () => shadowState.on }));
+
 const mockCheckDepsDrift = vi.fn();
 vi.mock('./agent-runner-image-check.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./agent-runner-image-check.js')>()),
@@ -127,6 +130,7 @@ const notifier = async (message: string): Promise<void> => {
 };
 
 beforeEach(() => {
+  shadowState.on = false;
   _resetWatcherStateForTest();
   world = freshWorld();
   installExecImpl(world);
@@ -280,6 +284,32 @@ describe('startContainerRebuildWatcher', () => {
     startContainerRebuildWatcher(notifier);
     await flushMicrotasks();
     expect(mockCheckDepsDrift).toHaveBeenCalled();
+    expect(_pendingRebuildForTest()).toBeNull();
+    expect(world.buildCalls).toBe(0);
+  });
+});
+
+describe('shadow host', () => {
+  it('refuses every rebuild request and never runs git, docker or build.sh', async () => {
+    shadowState.on = true;
+    const calls: string[] = [];
+    execState.impl = async (file: string, args: string[]) => {
+      calls.push(`${file} ${args.join(' ')}`);
+      return { stdout: '', stderr: '' };
+    };
+    requestContainerRebuild('deps drift');
+    requestContainerRebuild('deps drift again');
+    expect(_pendingRebuildForTest()).toBeNull();
+    expect(calls).toEqual([]);
+    expect(notified).toEqual([]);
+  });
+
+  it('the startup drift check on a shadow host requests nothing', async () => {
+    shadowState.on = true;
+    mockCheckDepsDrift.mockResolvedValue({ ok: false, message: 'deps drift' });
+    startContainerRebuildWatcher(notifier);
+    await vi.waitFor(() => expect(mockCheckDepsDrift).toHaveBeenCalled());
+    await Promise.resolve();
     expect(_pendingRebuildForTest()).toBeNull();
     expect(world.buildCalls).toBe(0);
   });

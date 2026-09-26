@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { parseEnvContent } from './env-parse.js';
 import { log } from './log.js';
 
 /**
@@ -31,23 +32,5 @@ function parseEnvFile(include: (key: string) => boolean): Record<string, string>
     return {};
   }
 
-  const result: Record<string, string> = {};
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    if (!include(key)) continue;
-    let value = trimmed.slice(eqIdx + 1).trim();
-    if (
-      value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (value) result[key] = value;
-  }
-
-  return result;
+  return parseEnvContent(content, include);
 }

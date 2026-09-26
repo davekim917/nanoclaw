@@ -49,6 +49,7 @@ import {
 } from '../../db/mcp-oauth-integrations.js';
 import { readContainerConfig, updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
+import { isShadowHost } from '../../shadow-host.js';
 import { assertHttpsEndpoint, discoverAuthorization, type FetchLike } from './discovery.js';
 import {
   buildAuthorizeUrl,
@@ -1058,8 +1059,11 @@ export interface RefreshOutcome {
  * in `error` to be retried on the next tick with the token it already has.
  */
 export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike = fetch): Promise<RefreshOutcome> {
-  const rows = await listMcpOAuthIntegrations();
   const outcome: RefreshOutcome = { checked: 0, refreshed: [], failed: [], needsLogin: [] };
+  // A copied refresh token rotates at the provider on first use, which would
+  // invalidate production's copy of it.
+  if (isShadowHost()) return outcome;
+  const rows = await listMcpOAuthIntegrations();
   const now = Date.now();
 
   for (const listed of rows) {

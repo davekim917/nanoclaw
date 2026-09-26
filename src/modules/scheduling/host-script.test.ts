@@ -31,6 +31,9 @@ vi.mock('../../db/container-configs.js', async (importOriginal) => ({
   getContainerConfig: () => ({ timezone: containerConfigState.timezone }),
 }));
 
+const shadowState = vi.hoisted(() => ({ on: false }));
+vi.mock('../../shadow-host.js', () => ({ isShadowHost: () => shadowState.on }));
+
 const TEST_DIR = uniqueTmpRoot('host-script-test');
 const SESS = 'sess-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -92,6 +95,7 @@ function rowContent(db: ReturnType<typeof openInboundDb>, id: string): Record<st
 
 afterEach(() => {
   containerConfigState.timezone = null;
+  shadowState.on = false;
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -120,6 +124,25 @@ describe('classifyForHostExecution', () => {
 });
 
 describe('runHostGatedTaskScripts', () => {
+  it('on a shadow host runs nothing host-side and leaves the row to the container path', async () => {
+    const db = freshDb();
+    const marker = path.join(TEST_DIR, 'ran.marker');
+    const script = `touch ${marker}; echo '{"wakeAgent": false}'`;
+
+    shadowState.on = true;
+    insertHostGatedTask(db, 't-shadow', script);
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(rowStatus(db, 't-shadow')).toBe('pending');
+    expect(rowContent(db, 't-shadow').scriptOutput).toBeUndefined();
+
+    shadowState.on = false;
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+    expect(fs.existsSync(marker)).toBe(true);
+    expect(rowStatus(db, 't-shadow')).toBe('completed');
+    db.close();
+  });
+
   it('runs a clean wakeAgent=false script and marks it completed without a container', async () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-gated', 'echo \'{"wakeAgent": false}\'');

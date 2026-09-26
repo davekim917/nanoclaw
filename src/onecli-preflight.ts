@@ -41,6 +41,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 import { ONECLI_API_KEY, ONECLI_URL } from './config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { log } from './log.js';
+import { onecliAgentIdentifier } from './shadow-host.js';
 
 /**
  * Attempts before the boot is failed. The transport failures worth riding out
@@ -82,7 +83,10 @@ export interface PreflightDeps {
 const realDeps: PreflightDeps = {
   getContainerConfig: (options) =>
     new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: PREFLIGHT_TIMEOUT_MS }).getContainerConfig(options),
-  probeAgent: async () => pickProbeAgent(await getAllAgentGroups()),
+  probeAgent: async () => {
+    const groupId = pickProbeAgent(await getAllAgentGroups());
+    return groupId === null ? null : onecliAgentIdentifier(groupId);
+  },
   onecliConfigured: () => Boolean(ONECLI_URL || ONECLI_API_KEY),
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -94,8 +98,8 @@ const realDeps: PreflightDeps = {
 /**
  * Pick the agent identifier to probe with: the oldest agent group.
  *
- * The spawn path uses `agentGroup.id` as the OneCLI agent identifier, so any
- * group id is a representative probe. Oldest wins because it is deterministic
+ * The spawn path derives the OneCLI agent identifier from `agentGroup.id`, so
+ * any group is a representative probe. Oldest wins because it is deterministic
  * across restarts and is the group most likely to already exist in the vault
  * (`ensureOnecliAgent` creates the vault agent on first spawn, so a group that
  * has never spawned has no vault agent yet — see the 404 handling below).

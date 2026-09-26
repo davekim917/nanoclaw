@@ -16,6 +16,12 @@ vi.mock('./config.js', async (importOriginal) => ({
   WORKGROUP_SHARED_FS: false,
 }));
 
+const shadowState = vi.hoisted(() => ({ on: false }));
+vi.mock('./shadow-host.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./shadow-host.js')>()),
+  isShadowHost: () => shadowState.on,
+}));
+
 vi.mock('./log.js', () => ({
   setLogScrubber: vi.fn(),
   log: {
@@ -2109,5 +2115,64 @@ describe('runner session context file', () => {
       containerPath: '/app/.nanoclaw-session.json',
       readonly: true,
     });
+  });
+});
+
+describe('buildMounts on a shadow host', () => {
+  afterEach(() => {
+    shadowState.on = false;
+  });
+
+  async function mountsWithHostCredentials(folder: string) {
+    const ag = group(`ag-${folder}`, folder);
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const fakeHome = path.join(TEST_ROOT, `${folder}-home`);
+    fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(path.join(fakeHome, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(fakeHome, '.codex', 'auth.json'), '{}');
+    fs.mkdirSync(path.join(fakeHome, '.wix'), { recursive: true });
+    const shared = path.join(TEST_ROOT, `${folder}-shared`);
+    fs.mkdirSync(shared, { recursive: true });
+    fs.writeFileSync(
+      path.join(TEST_ROOT, 'mount-allowlist.json'),
+      JSON.stringify({ allowedRoots: [{ path: shared, allowReadWrite: true }], blockedPatterns: [] }),
+    );
+    const cfg: ContainerConfig = {
+      ...containerConfig(),
+      wixHostAuth: true,
+      additionalMounts: [{ hostPath: shared, containerPath: 'shared', readonly: false }],
+    };
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const mounts = await buildMounts(ag, session(`s-${folder}`, ag.id), cfg, 'claude', {}, ag.folder);
+      return { mounts, fakeHome, shared };
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  }
+
+  const credentialMounts = (mounts: Array<{ hostPath: string }>, fakeHome: string) =>
+    mounts.filter((m) =>
+      [path.join(fakeHome, '.codex'), path.join(fakeHome, '.wix')].some((p) => m.hostPath.startsWith(p)),
+    );
+
+  it('mounts the host Codex credential and ~/.wix read-write, and an operator rw mount rw, when shadow mode is off', async () => {
+    const { mounts, fakeHome, shared } = await mountsWithHostCredentials('shadow-off');
+    expect(credentialMounts(mounts, fakeHome).length).toBeGreaterThanOrEqual(2);
+    expect(mounts.find((m) => m.hostPath === shared)?.readonly).toBe(false);
+  });
+
+  it('withholds every host credential mount and forces operator mounts read-only on a shadow host', async () => {
+    shadowState.on = true;
+    const { mounts, fakeHome, shared } = await mountsWithHostCredentials('shadow-on');
+    expect(credentialMounts(mounts, fakeHome)).toEqual([]);
+    expect(mounts.find((m) => m.hostPath === shared)?.readonly).toBe(true);
   });
 });

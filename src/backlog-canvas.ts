@@ -56,6 +56,7 @@ import { extractSlackChannelId, loadSlackWorkspaces } from './channels/slack.js'
 import { slackPermalink } from './channels/slack-mentions.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
+import { onecliAgentIdentifier } from './shadow-host.js';
 import { formatLocalTime } from './timezone.js';
 
 const TICK_INTERVAL_MS = 5 * 60 * 1000;
@@ -175,7 +176,7 @@ async function getAgentProxyDispatcher(agentGroupId: string): Promise<Dispatcher
   let dispatcher: Dispatcher | null = null;
   try {
     const cfg = await new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 }).getContainerConfig({
-      agent: agentGroupId,
+      agent: onecliAgentIdentifier(agentGroupId),
     });
     const url = cfg.env['HTTPS_PROXY'] || cfg.env['https_proxy'] || '';
     // Only useful if it actually carries an identity; a bare proxy URL would

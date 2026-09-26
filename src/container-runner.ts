@@ -161,6 +161,12 @@ import {
 import { buildContainerCodexConfig } from './providers/codex.js';
 import { OPENCODE_XDG_CONTAINER_PATH, OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
+import {
+  isShadowHost,
+  onecliAgentIdentifier,
+  shadowProviderViolation,
+  shadowSpawnImageViolation,
+} from './shadow-host.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { assertHostOwnedInboundDb, hostInboundMounts, migrateInboundDbToHostDir } from './modules/mailbox/index.js';
 import {
@@ -1673,6 +1679,8 @@ async function spawnContainer(
   // shared base) so derived images built via install_packages are checked
   // against their own label, not the base's. See src/agent-runner-image-check.ts.
   const spawnImageRef = containerConfig.imageTag || CONTAINER_IMAGE;
+  const shadowImageRefusal = shadowSpawnImageViolation(spawnImageRef);
+  if (shadowImageRefusal) throw new Error(shadowImageRefusal);
   const depsDriftStartedAt = Date.now();
   const depsCheck = await checkAgentRunnerDepsDrift(spawnImageRef);
   logSpawnStage('deps-drift-check', depsDriftStartedAt);
@@ -1815,6 +1823,8 @@ async function spawnContainer(
   logSpawnStage('provider-decision', providerDecisionStartedAt);
 
   const providerName = resolveProviderName(spawnSession.agent_provider, containerConfig.provider);
+  const shadowProviderRefusal = shadowProviderViolation(providerName);
+  if (shadowProviderRefusal) throw new Error(shadowProviderRefusal);
   const groupFilesystemStartedAt = Date.now();
   initGroupFilesystem({ ...agentGroup, workgroup_id: resolvedWgId }, { provider: providerName });
   logSpawnStage('group-filesystem-init', groupFilesystemStartedAt);
@@ -1830,9 +1840,10 @@ async function spawnContainer(
   const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
   logSpawnStage('build-mounts', buildMountsStartedAt);
   const containerName = `${CONTAINER_NAME_PREFIX}${agentGroup.folder}-${Date.now()}`;
-  // OneCLI agent identifier is always the agent group id — stable across
-  // sessions and reversible via getAgentGroup() for approval routing.
-  const agentIdentifier = agentGroup.id;
+  // OneCLI agent identifier is the agent group id — stable across sessions and
+  // reversible via getAgentGroup() for approval routing. A shadow host prefixes
+  // it, and never routes approvals.
+  const agentIdentifier = onecliAgentIdentifier(agentGroup.id);
   // Resolve per-channel (messaging_group_agents) default_model / default_effort
   // so buildContainerArgs can apply them ABOVE the per-agent container.json
   // defaults. Null/missing falls through. Agent-spawned sessions without a
@@ -5100,7 +5111,8 @@ export async function buildMounts(
     logSpawnStage('mount-allowlist', mountAllowlistStartedAt);
     for (const mount of validated) {
       if (!workgroupReadAccess || !isWorkgroupReadAccessNamespace(mount.containerPath)) {
-        mounts.push(mount);
+        // An operator mount names a host path production may share.
+        mounts.push(isShadowHost() ? { ...mount, readonly: true } : mount);
         continue;
       }
       if (isDuplicateWorkgroupReadAccessMount(mount, validatedWorkgroupReadAccess)) {
@@ -5254,7 +5266,7 @@ export async function buildMounts(
     // which validateAdditionalMounts sandboxes under /workspace/extra (where
     // the CLI's os.homedir()-based ~/.wix lookup would never find it). The
     // CLI's *.wix.com traffic is NO_PROXY-bypassed in the gateway block below.
-    if (containerConfig.wixHostAuth === true) {
+    if (containerConfig.wixHostAuth === true && !isShadowHost()) {
       const hostWix = path.join(os.homedir(), '.wix');
       if (fs.existsSync(hostWix)) {
         mounts.push({ hostPath: hostWix, containerPath: '/home/node/.wix', readonly: false });
@@ -5267,7 +5279,7 @@ export async function buildMounts(
     // not reach Codex withholds the `codex` plugin and the credential goes with
     // it, and the refusal above makes an exclusion that matches nothing fatal
     // rather than silently fail-open.
-    if (!excluded.has('codex') && entries.includes('codex')) {
+    if (!excluded.has('codex') && entries.includes('codex') && !isShadowHost()) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
 
       // Staging reads and rewrites host-side state, so a malformed home (a
@@ -7609,6 +7621,7 @@ const execAsync = promisify(exec);
 
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
+  if (isShadowHost()) throw new Error('Per-agent-group image builds are disabled on a shadow host (NANOCLAW_SHADOW=1)');
   const agentGroup = await getAgentGroup(agentGroupId);
   if (!agentGroup) throw new Error('Agent group not found');
 

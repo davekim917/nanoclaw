@@ -114,6 +114,25 @@ describe('runDeployCrashGuard', () => {
     expect(readAttempts()).toBe(2);
   });
 
+  it('on a shadow host, neither counts boots nor rolls back, even on the rollback boot', () => {
+    writeManifest(0);
+    fs.writeFileSync(
+      path.join(root, 'data', 'deploy-boot-attempts.json'),
+      JSON.stringify({ attempts: 2, timestamp: new Date().toISOString() }),
+    );
+    fs.writeFileSync(path.join(root, '.env'), 'NANOCLAW_SHADOW=1\n');
+    vi.stubEnv('NANOCLAW_SHADOW', undefined);
+    const calls: string[][] = [];
+    try {
+      expect(() => runDeployCrashGuard(root, fakeDeps(calls))).not.toThrow();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(calls).toEqual([]);
+    expect(readAttempts()).toBe(2);
+    expect(fs.existsSync(path.join(root, 'data', 'deploy-rollback.json'))).toBe(true);
+  });
+
   it('cleans up a stale manifest and does not count the boot', () => {
     writeManifest(31 * 60 * 1000);
     runDeployCrashGuard(root, fakeDeps([]));

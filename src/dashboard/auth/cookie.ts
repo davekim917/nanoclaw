@@ -3,6 +3,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { DATA_DIR } from '../../config.js';
+import { isShadowHost } from '../../shadow-host.js';
+
 export interface CookiePayload {
   user_id: string;
   expires_at: string;
@@ -38,7 +41,11 @@ export function resolveServerKey(): Buffer {
     return _serverKey;
   }
 
-  const secretPath = path.join(os.homedir(), '.nanoclaw', 'cookie-secret');
+  // The home-dir secret is production's: a cookie a shadow signed with it
+  // would authenticate against production's dashboard.
+  const secretPath = isShadowHost()
+    ? path.join(DATA_DIR, 'cookie-secret')
+    : path.join(os.homedir(), '.nanoclaw', 'cookie-secret');
   try {
     const content = fs.readFileSync(secretPath, 'utf8').trim();
     _serverKey = Buffer.from(content, 'hex');

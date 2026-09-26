@@ -27,6 +27,7 @@ import { execFile } from 'child_process';
 
 import { ONECLI_URL } from '../../config.js';
 import { curlConfigEscape, onecliAuthConfigLine, sanitizeCurlFailure } from '../../onecli-curl.js';
+import { isShadowHost } from '../../shadow-host.js';
 
 const CURL_CONNECT_TIMEOUT_SECONDS = 2;
 const CURL_MAX_TIME_SECONDS = 10;
@@ -96,6 +97,10 @@ function curlJson(
   body?: unknown,
 ): Promise<{ status: number; body: unknown }> {
   const label = `${method} /api/${path.replace(/^\//, '')}`;
+  // Secret names are shared with production, whose values these would overwrite.
+  if (method !== 'GET' && isShadowHost()) {
+    return Promise.reject(new Error(`OneCLI secret writes are disabled on a shadow host (${label})`));
+  }
   const config = curlConfig(method, `${base()}/api/${path.replace(/^\//, '')}`, body);
 
   return new Promise((resolve, reject) => {

@@ -38,6 +38,7 @@ import { evaluateManagedGitCommand } from '../../managed-git-command-guard.js';
 // loadEnvIntoProcess() runs.
 import { TASK_SCRIPT_TIMEOUT_MS, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
+import { isShadowHost } from '../../shadow-host.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 
 // Same rationale as the container-side constant (task-script.ts): the flat
@@ -456,6 +457,9 @@ export async function runHostGatedTaskScripts(
   // exactly what the pre-seam state already did by passing the sweep's open
   // inbound handle, so this is not a regression. Closing the session before
   // the scripts run is a host-sweep restructure, not this PR.
+  // A host-side script can reach anything the host can, production's image
+  // store included; on a shadow host every task script runs in its container.
+  if (isShadowHost()) return;
   const due = mailbox.listDueTaskRows();
   if (due.length === 0) return;
 

@@ -30,6 +30,7 @@ import { vendorDesignArtifactLoop } from './design-artifact-loop-vendor.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import { syncOpenCodeSubagents } from './opencode-sync.js';
+import { isShadowHost } from './shadow-host.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -95,6 +96,7 @@ async function updatePlugin(pluginPath: string, name: string): Promise<UpdateRes
  * /update-plugins slash command) decide what to do with the output.
  */
 export async function runPluginUpdates(): Promise<UpdateResult[]> {
+  if (isShadowHost()) return [];
   const pluginsRoot = path.join(os.homedir(), 'plugins');
   if (!fs.existsSync(pluginsRoot)) {
     log.debug('Plugin updater: ~/plugins missing, skipping');
@@ -166,6 +168,7 @@ function vendorDesignArtifactLoopIfPresent(): void {
  */
 export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshResult> {
   const result: CodexSurfaceRefreshResult = {};
+  if (isShadowHost()) return result;
 
   // NOTE: plugin SKILLS are deliberately not mirrored to host CLI paths
   // (`~/.agents/skills`, OpenCode's XDG skill dirs). `~/plugins` is the
@@ -311,6 +314,8 @@ export function stopPluginUpdater(): void {
 }
 
 onHostStart(function pluginUpdaterHostStart() {
+  // ~/plugins and the Codex marketplace are production's live plugin sources.
+  if (isShadowHost()) return;
   // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
   startPluginUpdater({
     notify: async (platformId, text) => {

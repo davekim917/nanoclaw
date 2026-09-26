@@ -18,13 +18,16 @@
  * systemd restarts into the restored build. A successful startup calls
  * markDeployBootHealthy() which disarms the guard.
  *
- * Must stay dependency-free (node builtins only): anything it imports becomes
- * part of the surface it is supposed to survive.
+ * Must stay dependency-free (node builtins, and local modules that import only
+ * node builtins): anything it imports becomes part of the surface it is
+ * supposed to survive.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+import { readShadowFlag } from './shadow-flag.js';
 
 // 3rd boot = 2 consecutive crashes after a deploy. One crash can be a fluke
 // (OOM, transient port clash); two in a row right after a deploy is the
@@ -276,6 +279,9 @@ export function performRollback(
 export function runDeployCrashGuard(root: string = DEFAULT_ROOT, deps: GuardDeps = realDeps): void {
   let rollback: { manifest: RollbackManifest; attempts: number } | null = null;
   try {
+    // A shadow host never retags images or restarts services, whatever
+    // manifest its data directory holds.
+    if (readShadowFlag(root)) return;
     const manifest = readJson<RollbackManifest>(manifestPath(root));
     const prior = readJson<{ attempts: number }>(attemptsPath(root))?.attempts ?? 0;
     const verdict = evaluateBoot(manifest, prior, deps.now());

@@ -11,6 +11,7 @@ import type { Chat } from 'chat';
 
 import { log } from './log.js';
 import { register, dispatch } from './dashboard/router.js';
+import { isShadowHost } from './shadow-host.js';
 
 const DEFAULT_PORT = 3000;
 
@@ -152,7 +153,8 @@ export function ensureServerStarted(): void {
     })();
   });
 
-  server.listen(port, '0.0.0.0', () => {
+  // A shadow host runs unreviewed code; nothing off this machine needs to reach it.
+  server.listen(port, isShadowHost() ? '127.0.0.1' : '0.0.0.0', () => {
     log.info('Webhook server started', { port });
   });
 }

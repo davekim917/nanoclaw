@@ -27,6 +27,7 @@ import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
+import { enterShadowHostMode } from './shadow-host.js';
 import {
   channelNameProvenance,
   channelNameProvenanceAccepts,
@@ -588,6 +589,11 @@ export async function main(): Promise<void> {
   } else {
     log.warn('dist/BUILD_INFO.json missing — cannot report build provenance (older dist, or a dev run)');
   }
+
+  // Ahead of every socket, spawn and scheduled service: a shadow host pointed
+  // at another install's image must stop before anything can build or run it.
+  const shadowViolation = enterShadowHostMode();
+  if (shadowViolation) bootFatal(shadowViolation, undefined);
 
   // 0. Claim exclusive host ownership before any startup work that can
   // mutate shared state. The socket binds early but remains not-ready until

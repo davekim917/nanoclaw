@@ -30,6 +30,7 @@ import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
+import { isShadowHost } from './shadow-host.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -54,6 +55,7 @@ let notify: Notifier | null = null;
 let rebuildPromise: Promise<void> | null = null;
 let lastFailureAt: number | null = null;
 let lastNotifiedDetail: string | null = null;
+let shadowRefusalLogged = false;
 
 export function _resetWatcherStateForTest(): void {
   started = false;
@@ -61,6 +63,7 @@ export function _resetWatcherStateForTest(): void {
   rebuildPromise = null;
   lastFailureAt = null;
   lastNotifiedDetail = null;
+  shadowRefusalLogged = false;
 }
 
 /** Test-only: the in-flight rebuild attempt, so tests can await settlement. */
@@ -300,6 +303,13 @@ async function attemptRebuild(reason: string): Promise<void> {
  * notified) so a persistently refused spawn doesn't retry-storm the build.
  */
 export function requestContainerRebuild(reason: string): void {
+  if (isShadowHost()) {
+    if (!shadowRefusalLogged) {
+      shadowRefusalLogged = true;
+      log.warn('Container rebuild refused: shadow host never builds images', { reason });
+    }
+    return;
+  }
   if (rebuildPromise) return;
   if (lastFailureAt !== null && Date.now() - lastFailureAt < MIN_RETRY_INTERVAL_MS) return;
   rebuildPromise = attemptRebuild(reason)
