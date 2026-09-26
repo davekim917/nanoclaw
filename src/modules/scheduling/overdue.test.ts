@@ -29,15 +29,12 @@ vi.mock('../../container-config.js', async (importOriginal) => ({
 
 import {
   TASK_OVERDUE_ATTEMPT_MIN_GAP_MS,
-  TASK_OVERDUE_ALERT_MS,
   _resetOverdueAlertsForTesting,
   escalateOverdueOccurrences,
-  overdueCutoffMs,
 } from './overdue.js';
 
 const MIN = 60_000;
 const NOW = Date.now();
-const UP_LONG = 10 * TASK_OVERDUE_ALERT_MS;
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
 
 function makeSession(withOutbound = true) {
@@ -90,21 +87,14 @@ beforeEach(() => {
   _resetOverdueAlertsForTesting();
 });
 
-describe('overdueCutoffMs', () => {
-  it('counts only time this host was up to watch', () => {
-    expect(overdueCutoffMs(NOW, TASK_OVERDUE_ALERT_MS - 1)).toBeNull();
-    expect(overdueCutoffMs(NOW, TASK_OVERDUE_ALERT_MS)).toBe(NOW - TASK_OVERDUE_ALERT_MS);
-  });
-});
-
 describe('escalateOverdueOccurrences', () => {
   it('alerts once for a due occurrence nothing has claimed, and not again on later ticks', async () => {
     const { inDb, mailbox } = makeSession();
     seed(inDb, 'task-wedged', 90 * MIN);
 
-    await escalateOverdueOccurrences(mailbox, session, true, NOW, UP_LONG);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN, UP_LONG);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + 10 * MIN, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + 10 * MIN);
 
     expect(notify.calls).toHaveLength(1);
     const [text, context] = notify.calls[0]!;
@@ -123,41 +113,75 @@ describe('escalateOverdueOccurrences', () => {
     const { inDb, mailbox } = makeSession(false);
     seed(inDb, 'task-unwoken', 90 * MIN);
 
-    await escalateOverdueOccurrences(mailbox, session, false, NOW, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, false, NOW);
 
     expect(notify.calls).toHaveLength(1);
     expect(notify.calls[0]![0]).toContain('No container is running');
   });
 
-  it('stays quiet inside the window, and for a host that has not been up for it', async () => {
+  it('stays quiet inside the window, and alerts from the minute it closes', async () => {
     const { inDb, mailbox } = makeSession();
     seed(inDb, 'task-recent', 59 * MIN);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW, UP_LONG);
-
-    seed(inDb, 'task-old', 6 * 60 * MIN);
-    await escalateOverdueOccurrences(mailbox, session, false, NOW, 5 * MIN);
-
+    await escalateOverdueOccurrences(mailbox, session, true, NOW);
     expect(notify.calls).toEqual([]);
+
+    // Lateness is `now - process_after` and nothing else: no host-uptime term.
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN);
+    expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-recent']);
+    expect(notify.calls[0]![0]).toContain('(60 min)');
   });
 
-  it('stays quiet while the session is being worked, and for rows that are not a stuck schedule', async () => {
+  it('a claim on another row does not hide a stuck occurrence: it alerts as queued behind active work', async () => {
     const busy = makeSession();
     seed(busy.inDb, 'task-queued', 90 * MIN);
-    // A different row is mid-turn: the container is busy, this one is queued.
+    // A different message is mid-turn and has held the session for 80 minutes.
     busy.outDb.prepare("INSERT INTO processing_ack VALUES ('other', 'processing', ?)").run(ago(80 * MIN));
-    await escalateOverdueOccurrences(busy.mailbox, session, true, NOW, UP_LONG);
+
+    await escalateOverdueOccurrences(busy.mailbox, session, true, NOW);
+
+    expect(notify.calls).toHaveLength(1);
+    const [text, context] = notify.calls[0]!;
+    expect(context).toMatchObject({ occurrenceId: 'task-queued' });
+    expect(text).toContain('queued behind active work');
+    expect(text).toContain('its turn on another message has not ended');
+    expect(text).not.toContain('nothing has claimed it');
+    expect(text).not.toContain('holds no claim');
+  });
+
+  it('a stale claim with no container running is reported as a claim, not as work in progress', async () => {
+    const busy = makeSession();
+    seed(busy.inDb, 'task-queued', 90 * MIN);
+    busy.outDb.prepare("INSERT INTO processing_ack VALUES ('other', 'processing', ?)").run(ago(80 * MIN));
+
+    await escalateOverdueOccurrences(busy.mailbox, session, false, NOW);
+
+    expect(notify.calls).toHaveLength(1);
+    expect(notify.calls[0]![0]).toContain('queued behind active work');
+    expect(notify.calls[0]![0]).toContain('still holds a processing claim');
+  });
+
+  it("the row's own ack excludes it, in any status", async () => {
+    const claimed = makeSession();
+    seed(claimed.inDb, 'task-running', 90 * MIN);
+    // Its own turn is under way: the claim-stuck rule judges that, not this one.
+    claimed.outDb.prepare("INSERT INTO processing_ack VALUES ('task-running', 'processing', ?)").run(ago(80 * MIN));
+    await escalateOverdueOccurrences(claimed.mailbox, session, true, NOW);
 
     const acked = makeSession();
     seed(acked.inDb, 'task-done', 90 * MIN);
     // Finished; the ack sync has simply not mirrored it yet.
     acked.outDb.prepare("INSERT INTO processing_ack VALUES ('task-done', 'completed', ?)").run(ago(MIN));
-    await escalateOverdueOccurrences(acked.mailbox, session, true, NOW, UP_LONG);
+    await escalateOverdueOccurrences(acked.mailbox, session, true, NOW);
 
+    expect(notify.calls).toEqual([]);
+  });
+
+  it('stays quiet for rows that are not a stuck schedule', async () => {
     const other = makeSession();
     seed(other.inDb, 'task-oneshot', 90 * MIN, { recurrence: null }); // expireStalePending owns it
     seed(other.inDb, 'task-unadmitted', 90 * MIN, { trigger: 0 }); // never counted due
     seed(other.inDb, 'task-paused', 90 * MIN, { status: 'paused' });
-    await escalateOverdueOccurrences(other.mailbox, session, true, NOW, UP_LONG);
+    await escalateOverdueOccurrences(other.mailbox, session, true, NOW);
 
     expect(notify.calls).toEqual([]);
   });
@@ -167,7 +191,7 @@ describe('escalateOverdueOccurrences', () => {
     seed(inDb, 'task-wedged', 90 * MIN);
 
     notify.delivered = false;
-    await escalateOverdueOccurrences(mailbox, session, true, NOW, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW);
     expect(notify.calls).toHaveLength(1);
 
     // Inside the gap: every sweep tick comes back here, and none may spend
@@ -177,14 +201,14 @@ describe('escalateOverdueOccurrences', () => {
     const other = makeSession();
     seed(other.inDb, 'task-other', 90 * MIN);
     const otherSession = { id: 'sess-other', agent_group_id: 'ag-test' } as Session;
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN, UP_LONG);
-    await escalateOverdueOccurrences(other.mailbox, otherSession, true, NOW + MIN, UP_LONG);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS - 1, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN);
+    await escalateOverdueOccurrences(other.mailbox, otherSession, true, NOW + MIN);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS - 1);
     expect(notify.calls).toHaveLength(1);
 
     // Past the gap: still owing, so it alerts — and, delivered, never again.
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS, UP_LONG);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + 2 * TASK_OVERDUE_ATTEMPT_MIN_GAP_MS, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + 2 * TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
     expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-wedged', 'task-wedged']);
   });
 
@@ -195,24 +219,72 @@ describe('escalateOverdueOccurrences', () => {
     seed(b.inDb, 'task-b', 90 * MIN);
     const sessionB = { id: 'sess-b', agent_group_id: 'ag-test' } as Session;
 
-    await escalateOverdueOccurrences(a.mailbox, session, false, NOW, UP_LONG);
-    await escalateOverdueOccurrences(b.mailbox, sessionB, false, NOW, UP_LONG);
+    await escalateOverdueOccurrences(a.mailbox, session, false, NOW);
+    await escalateOverdueOccurrences(b.mailbox, sessionB, false, NOW);
     expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-a']);
 
-    await escalateOverdueOccurrences(b.mailbox, sessionB, false, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS, UP_LONG);
+    await escalateOverdueOccurrences(b.mailbox, sessionB, false, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
     expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-a', 'task-b']);
   });
 
   it('re-arms for the next occurrence of the same series', async () => {
     const { inDb, mailbox } = makeSession();
     seed(inDb, 'task-first', 90 * MIN);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW);
 
     inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'task-first'").run();
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN);
     seed(inDb, 'task-second', 90 * MIN);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + 30 * MIN, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + 30 * MIN);
 
     expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-first', 'task-second']);
+  });
+
+  it('restarts every 2 minutes leave no blind window: each process alerts on its first tick, at most once', async () => {
+    const { inDb, mailbox } = makeSession();
+    seed(inDb, 'task-wedged', 90 * MIN);
+
+    // 2 minutes is shorter than both the attempt gap and the alert window, so
+    // any gate keyed on how long THIS process has been watching would never
+    // open. Each restart is a fresh process: its dedup set and attempt gap
+    // start empty. Two ticks per process, a minute apart.
+    const perProcess: number[] = [];
+    for (let restart = 0; restart < 5; restart++) {
+      _resetOverdueAlertsForTesting();
+      const before = notify.calls.length;
+      const startedAt = NOW + restart * 2 * MIN;
+      await escalateOverdueOccurrences(mailbox, session, false, startedAt);
+      expect(notify.calls.length - before, `process ${restart} did not alert on its first tick`).toBe(1);
+      await escalateOverdueOccurrences(mailbox, session, false, startedAt + MIN);
+      perProcess.push(notify.calls.length - before);
+    }
+
+    expect(perProcess).toEqual([1, 1, 1, 1, 1]);
+    expect(new Set(notify.calls.map(([, c]) => c.occurrenceId))).toEqual(new Set(['task-wedged']));
+  });
+
+  it('after a long outage, at most one DM goes out before the woken rows are claimed', async () => {
+    // Six hours down: every scheduled session comes back to a row six hours late.
+    const sessions = ['a', 'b', 'c', 'd'].map((name) => {
+      const made = makeSession();
+      seed(made.inDb, `task-${name}`, 6 * 60 * MIN);
+      return { ...made, session: { id: `sess-${name}`, agent_group_id: 'ag-test' } as Session, rowId: `task-${name}` };
+    });
+
+    // The new process's first tick over every session.
+    for (const s of sessions) await escalateOverdueOccurrences(s.mailbox, s.session, false, NOW);
+    expect(notify.calls).toHaveLength(1);
+
+    // Its wakes land and each container claims its row before the gap passes.
+    for (const s of sessions) {
+      s.outDb.prepare("INSERT INTO processing_ack VALUES (?, 'processing', ?)").run(s.rowId, ago(0));
+    }
+    for (let tick = 1; tick <= 10; tick++) {
+      for (const s of sessions) {
+        await escalateOverdueOccurrences(s.mailbox, s.session, true, NOW + tick * TASK_OVERDUE_ATTEMPT_MIN_GAP_MS);
+      }
+    }
+
+    expect(notify.calls).toHaveLength(1);
   });
 });

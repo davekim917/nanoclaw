@@ -371,34 +371,43 @@ export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Data
   return backfilled;
 }
 
-export interface OverdueRecurringRow {
+interface OverdueRecurringRow {
   id: string;
   seriesId: string | null;
   processAfter: string;
 }
 
+export interface OverdueRecurringRows {
+  rows: OverdueRecurringRow[];
+  /**
+   * True when some other message in this session holds a 'processing' claim:
+   * the rows above are waiting behind that turn rather than unclaimed with
+   * nothing running.
+   */
+  queuedBehindActiveWork: boolean;
+}
+
 /**
  * Recurring occurrences that have been DUE and wake-eligible since before
- * `cutoffIso` while no container is working on anything in this session.
+ * `cutoffIso` and that no container has acknowledged.
  *
  * The due filter is `countDueMessages`' own, narrowed to recurring rows that
  * carry a `process_after`: these are the rows that hold a session "due" and
  * that `expireStalePending` never reaps, so nothing else ever ends their wait.
  *
- * Empty when `outDb` holds ANY 'processing' claim: a container that has claimed
- * work is busy, a due row queued behind its turn is not stuck, and a claim that
- * stops moving is the claim-stuck rule's to judge, not this read's. A row with
- * an ack of its own (any status) is likewise somebody's — see `hasProcessingAck`.
- * `outDb` is null for a session that has never run a container: nothing can
- * have claimed.
+ * A row with an ack of its own (any status) is somebody's and is left out —
+ * see `hasProcessingAck`. A claim on a DIFFERENT row does not hide this one: a
+ * turn that never ends starves every row queued behind it, and that is exactly
+ * the stuck schedule this read exists to surface. `queuedBehindActiveWork`
+ * reports that case so the alert can say so. `outDb` is null for a session
+ * that has never run a container: nothing can have claimed.
  */
 export function listOverdueRecurringRows(
   inDb: Database.Database,
   outDb: Database.Database | null,
   cutoffIso: string,
-): OverdueRecurringRow[] {
+): OverdueRecurringRows {
   migrateMessagesInTable(inDb);
-  if (outDb && getProcessingClaims(outDb).length > 0) return [];
   const rows = inDb
     .prepare(
       `SELECT id, series_id AS seriesId, process_after AS processAfter FROM messages_in
@@ -411,7 +420,12 @@ export function listOverdueRecurringRows(
        ORDER BY seq`,
     )
     .all(cutoffIso) as OverdueRecurringRow[];
-  return outDb ? rows.filter((row) => !hasProcessingAck(outDb, row.id)) : rows;
+  if (!outDb) return { rows, queuedBehindActiveWork: false };
+  const unacked = rows.filter((row) => !hasProcessingAck(outDb, row.id));
+  return {
+    rows: unacked,
+    queuedBehindActiveWork: unacked.length > 0 && getProcessingClaims(outDb).length > 0,
+  };
 }
 
 /**
