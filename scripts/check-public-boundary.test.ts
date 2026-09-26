@@ -993,13 +993,19 @@ describe('baseline ratchet', () => {
     expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toEqual([]);
   });
 
-  it('looks past an origin/HEAD that lacks the baseline to origin/main', () => {
+  it('takes the merged baseline from origin/main only, never a stale origin/HEAD', () => {
     const mainRoot = baselineRepo();
     const worktreeRoot = predatingWorktree(mainRoot);
+    fs.writeFileSync(path.join(worktreeRoot, 'old.md'), 'Fictional Registry House\nFictional Local Team\n');
+    execFileSync('git', ['add', 'old.md'], { cwd: worktreeRoot });
+    fs.writeFileSync(path.join(mainRoot, '.public-boundary-baseline.json'), '{"files":{"old.md":1}}\n');
+    execFileSync('git', ['commit', '-q', '-am', 'ratchet down'], { cwd: mainRoot });
     execFileSync('git', ['update-ref', 'refs/remotes/origin/stale', 'HEAD~1'], { cwd: mainRoot });
     execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/stale'], { cwd: mainRoot });
-    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(1);
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(2);
     execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: mainRoot });
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(2);
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD~1'], { cwd: mainRoot });
     expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toEqual([]);
   });
 

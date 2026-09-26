@@ -881,22 +881,21 @@ function branchHistoryHasBaseline(root: string): boolean {
   return touched.stdout.trim() !== '';
 }
 
-const MERGED_BASELINE_REFS = ['refs/remotes/origin/HEAD', 'refs/remotes/origin/main'];
+// The one authoritative merged copy. origin/HEAD is set at clone time and
+// can name an older default branch still holding a higher, pre-ratchet count.
+const MERGED_BASELINE_REF = 'refs/remotes/origin/main';
 
 // Only a committed, merged revision: a working copy or unpushed commit
 // anywhere on the host must not be able to exempt what this branch publishes.
 function readMergedBaseline(root: string): string | null {
   const env = repositoryNeutralEnv();
-  for (const ref of MERGED_BASELINE_REFS) {
-    const resolved = runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], root, env);
-    if (resolved.status === 1) continue;
-    if (resolved.status !== 0) throw new Error('public boundary merged baseline could not be resolved');
-    const listed = runGit(['ls-tree', resolved.stdout.trim(), '--', DEFAULT_BASELINE_RELATIVE], root, env);
-    if (listed.status !== 0) throw new Error('public boundary merged baseline could not be read');
-    const objectId = /^\d+ blob ([0-9a-f]+)\t/m.exec(listed.stdout)?.[1];
-    if (objectId) return readBlob(root, objectId, env);
-  }
-  return null;
+  const resolved = runGit(['rev-parse', '--verify', '--quiet', `${MERGED_BASELINE_REF}^{commit}`], root, env);
+  if (resolved.status === 1) return null;
+  if (resolved.status !== 0) throw new Error('public boundary merged baseline could not be resolved');
+  const listed = runGit(['ls-tree', resolved.stdout.trim(), '--', DEFAULT_BASELINE_RELATIVE], root, env);
+  if (listed.status !== 0) throw new Error('public boundary merged baseline could not be read');
+  const objectId = /^\d+ blob ([0-9a-f]+)\t/m.exec(listed.stdout)?.[1];
+  return objectId ? readBlob(root, objectId, env) : null;
 }
 
 /**
@@ -904,7 +903,7 @@ function readMergedBaseline(root: string): string | null {
  * copy (its index for an index scan, since that is what will be committed).
  * A branch whose history carried the file and no longer does gets an empty
  * baseline: deleting it removes its exemptions. A branch cut before the file
- * existed inherits the copy merged on origin. Anything else holds nothing.
+ * existed inherits the copy merged on origin/main. Anything else holds nothing.
  */
 function loadBaseline(options: ScanOptions): Baseline {
   if (options.baselinePath) {
