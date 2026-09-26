@@ -3,15 +3,19 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ shadow: false, dataDir: '' }));
+const state = vi.hoisted(() => ({ shadow: false, dataDir: '', slug: 'abcdef12' }));
 vi.mock('../../shadow-host.js', () => ({ isShadowHost: () => state.shadow }));
 vi.mock('../../config.js', () => ({
   get DATA_DIR() {
     return state.dataDir;
   },
+  get INSTALL_SLUG() {
+    return state.slug;
+  },
 }));
 
-const { _resetServerKeyForTest, resolveServerKey } = await import('./cookie.js');
+const { _resetServerKeyForTest, buildSetCookie, parseAndVerifyCookie, resolveServerKey, sessionCookieName } =
+  await import('./cookie.js');
 
 describe('resolveServerKey under shadow mode', () => {
   let tmp: string;
@@ -65,5 +69,33 @@ describe('resolveServerKey under shadow mode', () => {
     expect(key.toString('hex')).not.toBe('ab'.repeat(32));
     expect(fs.readFileSync(path.join(state.dataDir, 'cookie-secret'), 'utf8')).toBe(key.toString('hex'));
     expect(fs.readFileSync(homeSecret, 'utf8')).toBe('ab'.repeat(32));
+  });
+});
+
+describe('session cookie name under shadow mode', () => {
+  const key = Buffer.alloc(32, 7);
+  const payload = { user_id: 'user-1', expires_at: new Date(Date.now() + 3_600_000).toISOString() };
+
+  afterEach(() => {
+    state.shadow = false;
+  });
+
+  it("keeps production's spawn_board name when shadow mode is off", () => {
+    expect(sessionCookieName()).toBe('spawn_board');
+    expect(buildSetCookie(payload, key)).toMatch(/^spawn_board=[^;]+; HttpOnly; /);
+  });
+
+  it('names the shadow cookie after its checkout, and neither dashboard reads the other one', () => {
+    const production = buildSetCookie(payload, key).split(';')[0];
+    state.shadow = true;
+    const shadow = buildSetCookie(payload, key).split(';')[0];
+    expect(shadow.startsWith('spawn_board_abcdef12=')).toBe(true);
+    expect(parseAndVerifyCookie(shadow, key)).toEqual(payload);
+    expect(parseAndVerifyCookie(production, key)).toBeNull();
+    expect(parseAndVerifyCookie(`${production}; ${shadow}`, key)).toEqual(payload);
+
+    state.shadow = false;
+    expect(parseAndVerifyCookie(production, key)).toEqual(payload);
+    expect(parseAndVerifyCookie(shadow, key)).toBeNull();
   });
 });

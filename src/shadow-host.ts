@@ -1,12 +1,13 @@
 /**
  * Shadow host mode (`NANOCLAW_SHADOW=1`): a second host run from a separate
  * checkout on a machine that already runs a production host — the practice
- * copy an agent drives to verify a change. Data, sockets, containers and chat
- * channels are already scoped to the checkout. What this flag turns off is
- * what acts on state the two hosts share: the OneCLI approval queue, agent
- * grants and secrets, the container image store and build cache, the live
- * plugin sources under `~/plugins`, host credential files mounted read-write,
- * the system temp dir, the dashboard cookie secret, and an off-box port.
+ * copy an agent drives to verify a change. Data, sockets and containers are
+ * already scoped to the checkout. What this flag turns off is what acts on
+ * state the two hosts share: the OneCLI approval queue, agent grants and
+ * secrets, the container image store and build cache, the live plugin sources
+ * under `~/plugins`, host credential files mounted read-write, the system temp
+ * dir, the dashboard cookie, an off-box port, and production's chat-platform
+ * bots.
  *
  * Unset, every call site behaves exactly as before.
  */
@@ -14,6 +15,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, DATA_DIR, INSTALL_SLUG, REPO_ROOT } from './config.js';
+import { readEnvFileMatching } from './env.js';
 import { readEnvValue } from './env-file.js';
 import { getContainerImageBase } from './install-slug.js';
 import { log } from './log.js';
@@ -29,8 +31,9 @@ const SHADOW_MODE_SUMMARY =
   'Shadow host mode: OneCLI approval handler, MCP OAuth refresh and secret writes, container image ' +
   'builds, plugin updater, docker image/build-cache cleanup, host-side task scripts and host ' +
   'credential mounts are disabled; ' +
-  'non-Claude providers refused; operator mounts forced read-only; OneCLI agents, TMPDIR and the ' +
-  'dashboard cookie secret are namespaced to this checkout; webhook server bound to 127.0.0.1';
+  'chat-platform credentials and non-Claude providers refused; operator mounts forced read-only; ' +
+  'OneCLI agents, TMPDIR and the dashboard cookie are namespaced to this checkout; webhook server ' +
+  'bound to 127.0.0.1';
 
 /** The image reference without its tag or digest (`host:5000/name:tag` → `host:5000/name`). */
 export function imageRepository(ref: string): string {
@@ -67,6 +70,35 @@ export function shadowWebhookPortViolation(raw: string | undefined): string | nu
     `production's webhook server holds its port on every interface. Set WEBHOOK_PORT to a free port ` +
     `in this checkout's .env or the process environment.`
   );
+}
+
+// A newly installed channel's credential keys belong here too, or its adapter
+// connects on a shadow as production's bot.
+const PLATFORM_CREDENTIAL_KEY = /^(SLACK_(BOT_TOKEN|APP_TOKEN|SIGNING_SECRET)|DISCORD_BOT_TOKEN)(_|$)/;
+
+/**
+ * A shadow holding production's chat-platform credentials connects as
+ * production's bot: Socket Mode splits live events between the two hosts, and
+ * the host-side writers that call the platform APIs directly reach
+ * production's channels. The adapters and those writers all take their tokens
+ * from these keys, so refusing the keys closes every path. Names only: a
+ * value is never put in the message.
+ */
+export function shadowPlatformCredentialViolation(names: string[]): string | null {
+  if (names.length === 0) return null;
+  return (
+    `NANOCLAW_SHADOW=1 refuses to boot holding chat-platform credentials (${names.join(', ')}): ` +
+    `a shadow connected as production's bot receives and answers production's traffic. Its only ` +
+    `transport is the CLI channel; remove these from this checkout's .env and the process environment.`
+  );
+}
+
+function platformCredentialNames(): string[] {
+  const names = new Set(Object.keys(readEnvFileMatching(PLATFORM_CREDENTIAL_KEY)));
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value?.trim() && PLATFORM_CREDENTIAL_KEY.test(key)) names.add(key);
+  }
+  return [...names].sort();
 }
 
 /**
@@ -108,8 +140,9 @@ export function shadowProviderViolation(provider: string): string | null {
 /**
  * Enter shadow mode at boot, before anything can spawn or build. Returns the
  * refusal message when the configured image is outside this checkout's
- * namespace, or when no WEBHOOK_PORT of its own is set (read from `.env` here
- * too: boot copies `.env` into the environment only after this runs).
+ * namespace, when no WEBHOOK_PORT of its own is set, or when a chat-platform
+ * credential is present (both read from `.env` here too: boot copies `.env`
+ * into the environment only after this runs).
  * Otherwise points TMPDIR into this checkout — the OneCLI SDK writes CA
  * bundles and credential stubs under fixed names in `os.tmpdir()`, which
  * production's containers bind-mount — logs what shadow mode changed, and
@@ -119,7 +152,8 @@ export function enterShadowHostMode(): string | null {
   if (!isShadowHost()) return null;
   const violation =
     shadowImageViolation(CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, getContainerImageBase(REPO_ROOT)) ??
-    shadowWebhookPortViolation(readEnvValue(process.cwd(), 'WEBHOOK_PORT'));
+    shadowWebhookPortViolation(readEnvValue(process.cwd(), 'WEBHOOK_PORT')) ??
+    shadowPlatformCredentialViolation(platformCredentialNames());
   if (violation) return violation;
   const tmpDir = path.join(DATA_DIR, 'tmp');
   fs.mkdirSync(tmpDir, { recursive: true });

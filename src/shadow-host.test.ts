@@ -86,7 +86,8 @@ describe('enterShadowHostMode', () => {
 
   it('does nothing when shadow mode is off, whatever the image', async () => {
     const tmpBefore = process.env.TMPDIR;
-    const mod = await loadFresh(false, { CONTAINER_IMAGE: `${OTHER_BASE}:latest` });
+    fs.writeFileSync(path.join(tmpRoot, '.env'), 'SLACK_BOT_TOKEN=xoxb-production\n');
+    const mod = await loadFresh(false, { CONTAINER_IMAGE: `${OTHER_BASE}:latest`, DISCORD_BOT_TOKEN: 'production' });
     expect(mod.isShadowHost()).toBe(false);
     expect(mod.enterShadowHostMode()).toBeNull();
     expect(process.env.TMPDIR).toBe(tmpBefore);
@@ -138,6 +139,42 @@ describe('enterShadowHostMode', () => {
   it('refuses when CONTAINER_IMAGE_BASE is overridden to another namespace', async () => {
     const mod = await loadFresh(true, { CONTAINER_IMAGE_BASE: OTHER_BASE });
     expect(mod.enterShadowHostMode()).not.toBeNull();
+  });
+
+  it("refuses production's chat-platform credentials from .env, naming the keys and never the values", async () => {
+    fs.writeFileSync(
+      path.join(tmpRoot, '.env'),
+      [
+        'WEBHOOK_PORT=3999',
+        'SLACK_BOT_TOKEN=xoxb-secret-1',
+        'SLACK_APP_TOKEN_EXAMPLE_LABS=xapp-secret-2',
+        'SLACK_SIGNING_SECRET=secret-3',
+        '',
+      ].join('\n'),
+    );
+    const tmpBefore = process.env.TMPDIR;
+    const mod = await loadFresh(true);
+    const violation = mod.enterShadowHostMode();
+    expect(violation).toContain('(SLACK_APP_TOKEN_EXAMPLE_LABS, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)');
+    expect(violation).not.toContain('secret-');
+    expect(process.env.TMPDIR).toBe(tmpBefore);
+    expect(logState.warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses a Discord bot token that only the process environment carries', async () => {
+    const mod = await loadFresh(true, { WEBHOOK_PORT: '3999', DISCORD_BOT_TOKEN_EXAMPLE: 'discord-secret' });
+    const violation = mod.enterShadowHostMode();
+    expect(violation).toContain('(DISCORD_BOT_TOKEN_EXAMPLE)');
+    expect(violation).not.toContain('discord-secret');
+  });
+
+  it('boots with empty credential values and with platform keys that are not credentials', async () => {
+    fs.writeFileSync(
+      path.join(tmpRoot, '.env'),
+      'WEBHOOK_PORT=3999\nSLACK_BOT_TOKEN=\nSLACK_BOT_TOKENS_NOTE=x\nDISCORD_PUBLIC_KEY=abc\n',
+    );
+    const mod = await loadFresh(true, { DISCORD_BOT_TOKEN: '  ' });
+    expect(mod.enterShadowHostMode()).toBeNull();
   });
 });
 

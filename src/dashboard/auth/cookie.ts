@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { DATA_DIR } from '../../config.js';
+import { DATA_DIR, INSTALL_SLUG } from '../../config.js';
 import { isShadowHost } from '../../shadow-host.js';
 
 export interface CookiePayload {
@@ -66,6 +66,15 @@ export function resolveServerKey(): Buffer {
 }
 
 /**
+ * Cookies are not scoped by port, so a shadow dashboard reached on the same
+ * hostname as production's would overwrite production's session cookie under
+ * a shared name, and each would keep logging the other out.
+ */
+export function sessionCookieName(): string {
+  return isShadowHost() ? `spawn_board_${INSTALL_SLUG}` : 'spawn_board';
+}
+
+/**
  * Build a Set-Cookie header value for the spawn_board session cookie.
  *
  * `secure` controls the `Secure` attribute. Set to `false` for direct HTTP
@@ -83,18 +92,19 @@ export function buildSetCookie(payload: CookiePayload, serverKey: Buffer, option
   const secure = options.secure !== false; // default true
   const secureAttr = secure ? 'Secure; ' : '';
   const maxAgeSec = Math.floor(dashboardSessionTtlHours() * 3600);
-  return `spawn_board=${encoded}; HttpOnly; ${secureAttr}SameSite=Strict; Max-Age=${maxAgeSec}; Path=/dashboard`;
+  return `${sessionCookieName()}=${encoded}; HttpOnly; ${secureAttr}SameSite=Strict; Max-Age=${maxAgeSec}; Path=/dashboard`;
 }
 
 export function parseAndVerifyCookie(cookieHeader: string | null, serverKey: Buffer): CookiePayload | null {
   try {
     if (!cookieHeader) return null;
 
+    const prefix = `${sessionCookieName()}=`;
     const parts = cookieHeader.split(';').map((p) => p.trim());
-    const entry = parts.find((p) => p.startsWith('spawn_board='));
+    const entry = parts.find((p) => p.startsWith(prefix));
     if (!entry) return null;
 
-    const value = entry.slice('spawn_board='.length);
+    const value = entry.slice(prefix.length);
     const dotIdx = value.indexOf('.');
     if (dotIdx === -1) return null;
 
