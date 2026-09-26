@@ -1,8 +1,9 @@
 import fs from 'fs';
+import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { GROUPS_DIR, TIMEZONE } from '../../config.js';
+import { GROUPS_DIR, REPO_ROOT, TIMEZONE } from '../../config.js';
 import { resolveGroupProvider, resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -1633,7 +1634,7 @@ registerResource({
         `    {"wakeAgent": false, "observation": {"kind": ..., "evidence": ..., "bound": "4h", "since"?: ...}, "data": {...}}\n` +
         `    {"wakeAgent": true, "data": {...}}\n` +
         `  wakeAgent=false handles the run without waking the agent (zero tokens) and declares what it saw: kind empty (nothing to do), unreadable, blocked, or unfinished (with since, ISO-8601, when the open work started); evidence is non-empty; bound (90m|4h|2d) is how long a result other than empty may stand before the operator is told.\n` +
-        `  Print that line with /app/skills/task-observation/task_observation.py (see the task-observation skill); it escapes the JSON and refuses an invalid observation.\n` +
+        `  Print that line with the task-observation skill's helper, which escapes the JSON and refuses an invalid observation: /app/skills/task-observation/task_observation.py in a container; a --script-host script runs on the host, where /app does not exist, and uses ${path.join(REPO_ROOT, 'container/skills/task-observation/task_observation.py')}.\n` +
         `  wakeAgent=true wakes the agent with data attached to the prompt.\n` +
         `  DO: print the JSON as the very last line, exit 0, keep data small (a summary, not a dump).\n` +
         `  DON'T: print anything after the JSON, prompt for input, or rely on an earlier process's memory or temporary files.\n` +

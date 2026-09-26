@@ -33,21 +33,25 @@ export function isGateRow(msg: { kind: string; content: string }): boolean {
 }
 
 /**
- * Reorder the gate rows among the positions they already hold, by ascending
- * `seq`. Delivery reads in timestamp order, which a backward clock step or an
- * equal timestamp can invert; every other row keeps its place.
+ * Put every gate row ahead of every row the runner wrote after it (higher
+ * `seq`), and the gate rows themselves in `seq` order. Delivery reads in
+ * timestamp order, which a backward clock step or an equal timestamp can
+ * invert; a failing gate row stops the drain, and that holds back only what
+ * was written after it if nothing written after it is ahead of it. The other
+ * rows keep their relative order.
  */
 export function orderGateRowsBySeq<T extends { kind: string; content: string; seq: number | null }>(rows: T[]): T[] {
-  const slots = rows.flatMap((row, index) => (isGateRow(row) ? [index] : []));
-  if (slots.length < 2) return rows;
-  const bySeq = slots
-    .map((index) => rows[index]!)
-    .sort((a, b) => (a.seq ?? Number.MAX_SAFE_INTEGER) - (b.seq ?? Number.MAX_SAFE_INTEGER));
-  const ordered = [...rows];
-  slots.forEach((slot, k) => {
-    ordered[slot] = bySeq[k]!;
-  });
-  return ordered;
+  const seqOf = (row: T): number => row.seq ?? Number.MAX_SAFE_INTEGER;
+  const gates = rows.filter(isGateRow).sort((a, b) => seqOf(a) - seqOf(b));
+  if (gates.length === 0) return rows;
+  const ordered: T[] = [];
+  let next = 0;
+  for (const row of rows) {
+    if (isGateRow(row)) continue;
+    while (next < gates.length && seqOf(gates[next]!) < seqOf(row)) ordered.push(gates[next++]!);
+    ordered.push(row);
+  }
+  return [...ordered, ...gates.slice(next)];
 }
 
 function rawResult(gate: Record<string, unknown>): RawGateResult {

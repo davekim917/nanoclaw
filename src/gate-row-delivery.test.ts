@@ -238,6 +238,27 @@ describe('container gate rows in delivery', () => {
     expect(ledger().map((r) => r.observation)).toEqual(['unreadable']);
   });
 
+  it('holds back a row written after a failing gate row even when its timestamp sorts it first', async () => {
+    const session = await taskSession();
+    insertOccurrence(session, 'occ-1', 'series-1');
+    insertWorkLog(session, 'written-before', 3, '2026-09-26T09:59:59.000Z');
+    insertGateRow(session, 'gate-a', 5, '2026-09-26T10:00:05.000Z', {
+      occurrenceId: 'occ-1',
+      wakeAgent: false,
+      observation: UNREADABLE,
+    });
+    // The clock stepped back: written after the gate row, stamped before it.
+    insertWorkLog(session, 'written-after', 7, '2026-09-26T10:00:00.000Z');
+    renameLedger('task_run_outcomes', 'task_run_outcomes_unreachable');
+
+    expect(await deliverSessionMessages(session)).toBe('error');
+    expect(delivered(session)).toEqual(['written-before']);
+
+    renameLedger('task_run_outcomes_unreachable', 'task_run_outcomes');
+    expect(await deliverSessionMessages(session)).toBe('clean');
+    expect(delivered(session)).toEqual(['gate-a', 'written-after', 'written-before']);
+  });
+
   it('a recording failure is retried in place: five failures, never given up, order kept, then recorded', async () => {
     const session = await taskSession();
     insertOccurrence(session, 'occ-1', 'series-1');
