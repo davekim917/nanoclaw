@@ -704,6 +704,12 @@ describe('identifiers derived from the install', () => {
       owner: 'acme-co',
       repo: 'widget',
     });
+    expect(remoteOwnerRepo('github.com:acme-co/widget.git')).toEqual({
+      host: 'github.com',
+      owner: 'acme-co',
+      repo: 'widget',
+    });
+    expect(remoteOwnerRepo('./mirrors:acme-co/widget.git')).toBeNull();
     expect(remoteOwnerRepo('/srv/mirrors/widget.git')).toBeNull();
     expect(remoteOwnerRepo('file:///srv/acme-co/widget.git')).toBeNull();
     expect(remoteOwnerRepo('https://github.com/solo')).toBeNull();
@@ -982,6 +988,16 @@ describe('baseline ratchet', () => {
   it('gives a branch that predates the file the baseline merged on origin', () => {
     const mainRoot = baselineRepo();
     const worktreeRoot = predatingWorktree(mainRoot);
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(1);
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: mainRoot });
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toEqual([]);
+  });
+
+  it('looks past an origin/HEAD that lacks the baseline to origin/main', () => {
+    const mainRoot = baselineRepo();
+    const worktreeRoot = predatingWorktree(mainRoot);
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/stale', 'HEAD~1'], { cwd: mainRoot });
+    execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/stale'], { cwd: mainRoot });
     expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toHaveLength(1);
     execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: mainRoot });
     expect(run(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot))).toEqual([]);

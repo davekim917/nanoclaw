@@ -375,7 +375,8 @@ export function remoteOwnerRepo(url: string): RemoteRepository | null {
   const trimmed = url.trim();
   let host: string;
   let remotePath: string;
-  const scpStyle = /^[^/@\s]+@([^:/\s]+):(?!\/\/)(.+)$/.exec(trimmed);
+  // git's scp-like form is `[user@]host:path`, recognized only with no slash before the first colon.
+  const scpStyle = /^(?:[^/@\s]+@)?([^:/\s]+):(?!\/\/)(.+)$/.exec(trimmed);
   if (scpStyle) {
     host = scpStyle[1];
     remotePath = scpStyle[2];
@@ -893,7 +894,7 @@ function readMergedBaseline(root: string): string | null {
     const listed = runGit(['ls-tree', resolved.stdout.trim(), '--', DEFAULT_BASELINE_RELATIVE], root, env);
     if (listed.status !== 0) throw new Error('public boundary merged baseline could not be read');
     const objectId = /^\d+ blob ([0-9a-f]+)\t/m.exec(listed.stdout)?.[1];
-    return objectId ? readBlob(root, objectId, env) : null;
+    if (objectId) return readBlob(root, objectId, env);
   }
   return null;
 }
