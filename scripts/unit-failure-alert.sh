@@ -26,6 +26,13 @@ mkdir -p "$OUTBOX"
 
 STAMP=$(date -u +%Y%m%dT%H%M%S)
 OUT="$OUTBOX/${STAMP}-unitfail-${UNIT//[^A-Za-z0-9._-]/_}.md"
+# The outbox is writable by agents and OUT is predictable, so whatever sits at
+# that name must be replaced, never written through. Build the alert outside
+# the outbox, where no agent can swap the temp file for a link mid-write, then
+# move it into place: mv -T renames over the name, or across filesystems
+# unlinks it and creates the file exclusively.
+TMP=$(mktemp "${TMPDIR:-/tmp}/unitfail.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
 
 {
   printf '*systemd unit failed:* `%s`\n_host: %s · %s UTC_\n\n' \
@@ -34,7 +41,9 @@ OUT="$OUTBOX/${STAMP}-unitfail-${UNIT//[^A-Za-z0-9._-]/_}.md"
   # exits 3 for an inactive unit -- the normal case here, since we are
   # invoked precisely because it is not running. Emptiness is checked below.
   { systemctl status "$UNIT" --no-pager -n 20 2>&1 || true; } | head -c 3000
-} > "$OUT"
+} > "$TMP"
 
-[ -s "$OUT" ] || { echo "unit-failure-alert: wrote an empty alert for $UNIT" >&2; exit 1; }
+[ -s "$TMP" ] || { echo "unit-failure-alert: wrote an empty alert for $UNIT" >&2; exit 1; }
+chmod 0644 "$TMP"
+mv -T "$TMP" "$OUT"
 echo "unit-failure-alert: queued $OUT"
