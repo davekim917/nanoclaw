@@ -335,9 +335,17 @@ describe('runHostGatedTaskScripts records, then acts', () => {
       bound_ms: 7_200_000,
     });
     expect(byOccurrence['gate:t-error']!.detail).toBe('exited with code 3; stderr: boom');
-    // Report mode: an undeclared result is recorded, and still counts as ok.
-    expect(byOccurrence['gate:t-undeclared']).toMatchObject({ observation: 'undeclared', outcome: 'ok' });
-    expect(byOccurrence['gate:t-invalid']).toMatchObject({ observation: 'invalid', outcome: 'failed' });
+    expect(byOccurrence['gate:t-undeclared']).toMatchObject({
+      observation: 'undeclared',
+      outcome: 'failed',
+      bound_ms: 7_200_000,
+      detail: 'no observation declared',
+    });
+    expect(byOccurrence['gate:t-invalid']).toMatchObject({
+      observation: 'invalid',
+      outcome: 'failed',
+      bound_ms: 7_200_000,
+    });
     expect(byOccurrence['gate:t-wake']).toMatchObject({ observation: 'wake', outcome: 'ok', bound_ms: null });
 
     // Occurrence status keeps its existing mapping: only a script error fails.

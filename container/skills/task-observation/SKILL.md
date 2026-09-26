@@ -12,7 +12,7 @@ description: >-
 
 A pre-task script's last stdout line decides the fire. When it does not wake
 the agent, it must say what it observed, or the fire is recorded as
-`undeclared` (and, once enforcement lands, as a failure):
+`undeclared`, a failure held to a 2-hour bound:
 
 ```json
 { "wakeAgent": false, "observation": { "kind": "empty", "evidence": "no new PRs", "bound": "4h" }, "data": {} }

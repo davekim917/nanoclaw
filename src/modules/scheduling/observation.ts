@@ -135,12 +135,7 @@ export function observationProblem(observation: unknown, nowMs: number = Date.no
   return null;
 }
 
-/**
- * Map one execution's result onto the gate lane.
- *
- * `undeclared` records ok while producers adopt the contract; enforcement
- * makes it failed with the fallback bound.
- */
+/** Map one execution's result onto the gate lane. */
 export function judgeGateResult(raw: RawGateResult, nowMs: number = Date.now()): GateJudgement {
   if ('error' in raw) {
     return {
@@ -156,7 +151,7 @@ export function judgeGateResult(raw: RawGateResult, nowMs: number = Date.now()):
   if (!Object.prototype.hasOwnProperty.call(result, 'observation')) {
     return {
       observation: 'undeclared',
-      outcome: 'ok',
+      outcome: 'failed',
       boundMs: FALLBACK_BOUND_MS,
       since: null,
       detail: 'no observation declared',
