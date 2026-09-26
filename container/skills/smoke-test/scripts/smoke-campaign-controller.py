@@ -984,7 +984,10 @@ class EffectLayer:
         if doc and doc.get("ok") is True and doc.get("challengerDeadline"):
             return {"ok": True, "deadline": doc["challengerDeadline"], "startedAt": doc.get("challengerStartedAt"),
                     "started": doc.get("started") is True}
+        # No answer at all is retryable: a call that timed out after its write
+        # is answered on retry with the deadline it set.
         return {"ok": False, "refusal": (doc or {}).get("refusal"),
+                "retryable": doc is None or doc.get("retryable") is True,
                 "error": (doc or {}).get("error") or err or "rc={}".format(rc)}
 
     # -- plumbing -------------------------------------------------------------
@@ -3393,8 +3396,23 @@ class Controller:
         if self.live and not (claim or {}).get("startedAt") and \
                 (root_ob is None or root_ob["state"] in ("intent", "failed")):
             started = self.effects.challenger_start(run_id, run_ob["detail"].get("ownerToken"))
+            deadline = parse_iso((claim or {}).get("deadline"))
+            blind = bool(started) and GATE_REFUSALS.get(started.get("refusal")) == "blind"
             if started and started.get("ok"):
                 self.gate.note_challenger_start(run_id, started["deadline"], started["startedAt"])
+            elif started and (blind or started.get("retryable")) and deadline and self.now < deadline:
+                # The gate decided nothing (it could not reach its lease store
+                # or lock, or never answered). Posting now would fix the
+                # claim-time deadline for good, so the root waits a fire. The
+                # claim-time deadline bounds the wait: past it, the root goes
+                # out and the timeout path takes over, as before.
+                if blind:
+                    self.ensure_alarm(run_id, "controller_gate_blind", "gate-blind:challenger-start",
+                                      {"verb": "challenger-start", "refusal": started.get("refusal"),
+                                       "error": started.get("error")})
+                self.decide(run_id, "intake", "wait", "wait", "challenger-start could not act yet; root post deferred",
+                            refusal=started.get("refusal"), error=started.get("error"))
+                return "intake"
             elif started and not started.get("refusal"):
                 # A coded refusal (no deadline, window closed or expired) is the
                 # gate stating a fact the timeout path already acts on; only an

@@ -2450,7 +2450,9 @@ min(now + timeout, provisional + `SMOKE_GATE_CHALLENGER_INTAKE_ALLOWANCE_SECONDS
 default 60 min); a repeat answers with the deadline already set, a same-SHA
 recovery keeps it, and it refuses (`deadline-passed`) once the provisional
 deadline has gone, so a run whose root never went out still times out there.
-The campaign controller does this itself.
+An answer that decides nothing (`lease-unavailable`, a busy lock, or no answer)
+means hold the root and ask again rather than post on the provisional deadline,
+until that deadline passes. The campaign controller does this itself.
 
 The default lease lasts 15 minutes. While a coordinator is actively running,
 call `progress <run-id> <owner-token>` at least every 10 minutes; a successful

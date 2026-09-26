@@ -1275,8 +1275,8 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5475' 'smoke-campaign-controller.py:1523-1525' \
-         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1512-1522'; do
+for c in 'smoke-pr-gate.sh:5475' 'smoke-campaign-controller.py:1526-1528' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1515-1525'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
 cite smoke-pr-gate.sh 5475 'OWNER_TOKEN="$(new_owner_token'
@@ -1285,9 +1285,9 @@ cite smoke-pr-gate.sh 5509 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
 cite smoke-pr-gate.sh 5554 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 707 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1468 'def _owner_wake'
-cite smoke-campaign-controller.py 1518 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1523 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1471 'def _owner_wake'
+cite smoke-campaign-controller.py 1521 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1526 'if c.get("wake"):'
 
 
 # --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
@@ -1972,5 +1972,49 @@ C1_WHEN="$(python3 -c 'import datetime,sys; d=datetime.datetime.strptime(sys.arg
 jq -e --arg w "Deadline $C1_WHEN." '[.messages[] | select(.text | startswith("**Smoke campaign started"))] | length == 1 and (.[0].text | contains($w))' \
   "$C/fake/enqueue.json" >/dev/null || fail "c1: the root post does not name the re-anchored deadline ($C1_WHEN)"
 certified_go c1
+
+# c2) A challenger-start that decides nothing -- the gate cannot reach its
+#     lease store (a blind refusal), or its lock is busy -- defers the root
+#     post a fire instead of sending it on the claim-time deadline for good.
+#     The blind refusal raises one alarm; the start that succeeds a fire later
+#     anchors the deadline the root post then names.
+new_case challenger-start-transient
+C2_DL="$(date -u -d "@$(( $(date -u +%s) + 1800 ))" +'%Y-%m-%dT%H:%M:%SZ')"
+jq -cn '{"gate:challenger-start":["refuse-code:lease-unavailable","fail-before"]}' >"$C/fake/faults.json"
+claim "$C2_DL"; wake_json
+ticks 0 11
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-start")] | length' "$FAKE_LOG")" = 3 ] \
+  || fail "c2: challenger-start is retried until it answers: $(jq -sc '[.[]|select(.tool=="gate")|.argv[0]]' "$FAKE_LOG")"
+[ "$(dq '[.[] | select(.reason=="challenger-start could not act yet; root post deferred") | .at]')" \
+  = '["2026-09-18T10:20:00Z","2026-09-18T10:30:00Z"]' ] \
+  || fail "c2: the root waits exactly the two fires the gate decided nothing: $(dq '[.[]|select(.type=="wait")|{at,reason}]')"
+[ "$(jr '[.[] | select(.kind=="send" and .slot=="root") | .at] | first')" = '"2026-09-18T10:40:00Z"' ] \
+  || fail "c2: the root first goes out on the fire the start succeeds: $(jr '[.[]|select(.kind=="send" and .slot=="root")]')"
+one_alarm c2 "alarm:gate-blind:challenger-start"
+C2_NEW="$(jq -r '.challengerDeadline' "$C/state/pr-$PR-state.json")"
+[[ "$C2_NEW" > "$C2_DL" ]] || fail "c2: the deadline was not re-anchored ($C2_DL -> $C2_NEW)"
+C2_WHEN="$(python3 -c 'import datetime,sys; d=datetime.datetime.strptime(sys.argv[1],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print(d.astimezone().strftime("%a %H:%M %Z"))' "$C2_NEW")"
+jq -e --arg w "Deadline $C2_WHEN." '[.messages[] | select(.text | startswith("**Smoke campaign started"))] | length == 1 and (.[0].text | contains($w))' \
+  "$C/fake/enqueue.json" >/dev/null || fail "c2: the root post does not name the re-anchored deadline ($C2_WHEN)"
+certified_go c2
+
+# c3) The claim-time deadline bounds that wait. The root's first attempt, at
+#     10:20, does not land; on the next fire, past the 10:25 deadline, the
+#     gate is blind -- and the root goes out anyway, leaving the run to the
+#     timeout path.
+DL=2026-09-18T10:25:00Z
+new_case challenger-start-blind-past-deadline
+jq -cn '{"gate:challenger-start":["refuse-code:deadline-passed","refuse-code:lease-unavailable"],"enqueue":["fail-before"]}' \
+  >"$C/fake/faults.json"
+claim "$DL"; wake_json
+ticks 0 3
+[ "$(jr '[.[] | select(.kind=="send" and .slot=="root" and .at=="2026-09-18T10:20:00Z") | .state] | last')" = '"intent"' ] \
+  || fail "c3: precondition -- the root's 10:20 attempt did not land: $(jr '[.[]|select(.kind=="send" and .slot=="root")|{at,state}]')"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-start")] | length' "$FAKE_LOG")" = 2 ] \
+  || fail "c3: precondition -- the fire past the deadline asked the gate again: $(jq -sc '[.[]|select(.tool=="gate")|.argv[0]]' "$FAKE_LOG")"
+! dq '[.[] | select(.reason=="challenger-start could not act yet; root post deferred")] | length > 0' | grep -qx true \
+  || fail "c3: the root was deferred past the claim-time deadline"
+[ "$(jr '[.[] | select(.kind=="send" and .slot=="root" and .state=="enqueued") | .at] | first')" = '"2026-09-18T10:30:00Z"' ] \
+  || fail "c3: past the deadline the root goes out despite a blind gate: $(jr '[.[]|select(.kind=="send" and .slot=="root")|{at,state}]')"
 
 echo "smoke campaign controller live tests passed"
