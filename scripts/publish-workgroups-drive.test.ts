@@ -61,10 +61,15 @@ function git(repo: string, ...args: string[]) {
 
 // Swaps a file for a symlink the moment the publisher looks that file up on
 // Drive: after every check on it has passed, before gws opens it.
+// GROW_PATH instead grows a file to GROW_BYTES on the first Drive-shaped jq
+// call, which comes after enumeration and before any file is opened.
 const JQ_SWAP_STUB = `#!/bin/bash
 for a in "$@"; do
   if [[ -n "\${SWAP_NAME:-}" && "$a" == *"name = '$SWAP_NAME'"*"mimeType !="* ]]; then
     ln -sfn "$SWAP_TO" "$SWAP_PATH"
+  fi
+  if [[ -n "\${GROW_PATH:-}" && "$a" == *mimeType* ]]; then
+    head -c "$GROW_BYTES" /dev/zero > "$GROW_PATH"
   fi
 done
 exec "$REAL_JQ" "$@"
@@ -333,6 +338,36 @@ describe('publish-workgroups-drive.sh', () => {
       expect(statePaths(f)).toEqual(['wg1/artifacts/small.pdf', 'wg1/records/board.md']);
       expect(r.stderr).toMatch(/SKIP oversize wg1\/artifacts\/big\.pdf \(1048577 bytes > 1048576\)/);
       expect(r.stderr).toMatch(/oversize=1 /);
+    });
+
+    it('enforces the size cap on a file that grows after enumeration', () => {
+      const f = fixture(
+        { 'wg1/records/board.md': 'board' },
+        { 'wg1/artifacts/small.pdf': 'small', 'wg1/artifacts/grows.pdf': 'tiny at enumeration' },
+      );
+      config(f, { max_file_mb: 1 });
+
+      const r = run(f, { GROW_PATH: path.join(f.repo, 'wg1/artifacts/grows.pdf'), GROW_BYTES: '1048577' });
+
+      expect(r.status, r.stderr).toBe(0);
+      expect(fs.statSync(path.join(f.repo, 'wg1/artifacts/grows.pdf')).size).toBe(1048577);
+      expect(r.uploads).not.toContain('grows.pdf');
+      expect(statePaths(f)).toEqual(['wg1/artifacts/small.pdf', 'wg1/records/board.md']);
+      expect(r.stderr).toMatch(/SKIP oversize wg1\/artifacts\/grows\.pdf \(grew past 1048576 bytes/);
+    });
+
+    it('drops the state row of a tracked file deleted from the worktree', () => {
+      const f = fixture({ 'wg1/records/board.md': 'board', 'wg1/records/gone.md': 'gone' });
+      expect(run(f).status).toBe(0);
+      expect(statePaths(f)).toEqual(['wg1/records/board.md', 'wg1/records/gone.md']);
+
+      fs.rmSync(path.join(f.repo, 'wg1/records/gone.md'));
+      const r = run(f);
+
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).toMatch(/SKIP missing wg1\/records\/gone\.md/);
+      expect(r.calls).toBe('');
+      expect(statePaths(f)).toEqual(['wg1/records/board.md']);
     });
 
     it('never follows a symlink out of the tree', () => {

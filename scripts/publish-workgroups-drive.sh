@@ -99,7 +99,7 @@ if [[ -n "$CONFIG" ]]; then
   done
 fi
 
-declare -A FOLDER OLD_SHA OLD_ID NEWDIR LIVE DONE IN_SET
+declare -A FOLDER OLD_SHA OLD_ID NEWDIR LIVE DONE IN_SET IS_ALLOW
 DORDER=()
 # --- load previous state (read-only here; rewritten only by a real run) ---
 if [[ -f "$STATE" ]]; then
@@ -181,6 +181,7 @@ enumerate_root() {
       log "SKIP oversize $fpath ($fsize bytes > $MAX_BYTES)"; oversize=$((oversize+1)); continue
     fi
     IN_SET["$fpath"]=1
+    IS_ALLOW["$fpath"]=1
     ALLOW+=("$fpath")
     WGS["$wg"]=1
     A_FILES["$wg"]=$(( ${A_FILES[$wg]:-0} + 1 ))
@@ -330,7 +331,9 @@ done
 since_checkpoint=0
 for rel in "${SET[@]}"; do
   src="$rel"
-  if [[ ! -e "$src" && ! -L "$src" ]]; then log "SKIP missing $rel"; continue; fi
+  # A missing file is handled, not unreached: its old row must not be carried
+  # forward (one-way policy — log it, drop it from state, leave Drive alone).
+  if [[ ! -e "$src" && ! -L "$src" ]]; then log "SKIP missing $rel"; DONE["$rel"]=1; continue; fi
   # The tree is writable from agent containers, and any open by pathname
   # follows symlinks: a path (or any directory above it) swapped for a
   # symlink would publish whatever host file it points at, and a pathname
@@ -341,14 +344,26 @@ for rel in "${SET[@]}"; do
   # from that descriptor. The -L/-f pre-check keeps a FIFO or device from
   # ever being opened.
   if [[ -L "$src" || ! -f "$src" ]]; then refuse "$rel" "$(realpath -e -- "$src" 2>/dev/null)"; continue; fi
-  if ! exec 3<"$src"; then log "SKIP missing $rel"; continue; fi
+  if ! exec 3<"$src"; then log "SKIP missing $rel"; DONE["$rel"]=1; continue; fi
   opened="$(readlink -- /proc/self/fd/3)"
   if [[ ! -f /proc/self/fd/3 || "$opened" != "$REPO_REAL/$rel" ]]; then
     exec 3<&-; refuse "$rel" "$opened"; continue
   fi
   snap="f/$(basename "$rel")"
-  cat <&3 > "$STAGE/$snap"; rc=$?; exec 3<&-
+  # An allowlisted file can grow between enumeration and this open, so its
+  # cap is enforced on the snapshot itself — copied one byte past the cap,
+  # which also bounds what a runaway file can put in the staging dir.
+  if [[ -n "${IS_ALLOW[$rel]:-}" ]]; then
+    head -c "$((MAX_BYTES + 1))" <&3 > "$STAGE/$snap"; rc=$?
+  else
+    cat <&3 > "$STAGE/$snap"; rc=$?
+  fi
+  exec 3<&-
   if [[ $rc -ne 0 ]]; then log "ERROR snapshot $rel"; failed=$((failed+1)); rm -f "$STAGE/$snap"; continue; fi
+  if [[ -n "${IS_ALLOW[$rel]:-}" && "$(stat -c %s "$STAGE/$snap")" -gt "$MAX_BYTES" ]]; then
+    log "SKIP oversize $rel (grew past $MAX_BYTES bytes after enumeration)"
+    oversize=$((oversize+1)); DONE["$rel"]=1; rm -f "$STAGE/$snap"; continue
+  fi
   sha="$(sha256sum "$STAGE/$snap" | cut -d' ' -f1)"
   if [[ "${OLD_SHA[$rel]:-}" == "$sha" && -n "${OLD_ID[$rel]:-}" ]]; then
     printf 'F\t%s\t%s\t%s\n' "$rel" "$sha" "${OLD_ID[$rel]}" >> "$TMP"

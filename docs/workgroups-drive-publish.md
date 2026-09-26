@@ -39,7 +39,7 @@ A config that is present but malformed is **fatal**, and nothing is published. T
 | `include_roots` | non-empty string[] | Repo-relative directories. The first component is the workgroup folder. No absolute paths and no `.`, `..` or hidden components. A root that does not exist is skipped with a warning. A root that is a symlink, or that resolves outside the tree, is refused and fails the run. |
 | `extensions` | non-empty string[] | Allowed file extensions, without the dot. Matching ignores case. |
 | `exclude_dirs` | string[] | Directory-name globs (`find -name`). Matching directories are pruned, so they are never walked. |
-| `max_file_mb` | positive integer | Per-file cap. A larger file is skipped and logged `SKIP oversize`. |
+| `max_file_mb` | positive integer | Per-file cap. A larger file is skipped and logged `SKIP oversize`. The cap is checked again on the upload snapshot, so a file that grows after enumeration is still skipped. |
 
 Unknown keys are rejected, so a typo such as `include_root` fails loudly instead of being ignored.
 
