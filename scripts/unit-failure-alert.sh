@@ -26,11 +26,12 @@ mkdir -p "$OUTBOX"
 
 STAMP=$(date -u +%Y%m%dT%H%M%S)
 OUT="$OUTBOX/${STAMP}-unitfail-${UNIT//[^A-Za-z0-9._-]/_}.md"
-# The outbox is writable by agents and OUT is predictable, so something already
-# at that name must be replaced, never written through: build the alert in a
-# fresh file (hidden, not *.md, so the shipper cannot take it half-written) and
-# rename it into place.
-TMP=$(mktemp "$OUTBOX/.unitfail.XXXXXX")
+# The outbox is writable by agents and OUT is predictable, so whatever sits at
+# that name must be replaced, never written through. Build the alert outside
+# the outbox, where no agent can swap the temp file for a link mid-write, then
+# move it into place: mv -T renames over the name, or across filesystems
+# unlinks it and creates the file exclusively.
+TMP=$(mktemp "${TMPDIR:-/tmp}/unitfail.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 chmod 0644 "$TMP"
 
