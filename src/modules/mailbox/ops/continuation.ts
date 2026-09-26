@@ -50,6 +50,24 @@ export function canAttemptContinuationRecovery(continuation: HostWorkContinuatio
   return continuation.resume_attempts < WORK_CONTINUATION_RESUME_MAX_ATTEMPTS;
 }
 
+/**
+ * A capped record a runner already claimed. No runner picks up a queued record
+ * that carries a `runner_id`, and the host authorizes no attempt past the cap,
+ * so only real inbound — which arrives as a due row — can re-arm it. Holding a
+ * container open for it waits out the absolute ceiling for nothing.
+ *
+ * A capped `running` record is deliberately not parked: a live runner writes
+ * it before raising `provider_executing` for the final attempt, and the host
+ * cannot tell that runner from a dead one.
+ */
+export function isContinuationParked(continuation: HostWorkContinuation): boolean {
+  return (
+    continuation.phase === 'queued' &&
+    continuation.runner_id !== undefined &&
+    !canAttemptContinuationRecovery(continuation)
+  );
+}
+
 export function readWorkContinuation(outDb: Database.Database): HostWorkContinuation | null {
   try {
     const row = outDb.prepare("SELECT value FROM session_state WHERE key = 'work_continuation'").get() as

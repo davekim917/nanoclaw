@@ -544,6 +544,7 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
       processingClaimCount?: number;
       providerExecuting?: boolean;
       hasContinuation?: boolean;
+      continuation?: Record<string, unknown>;
       lastOutboundAtMs?: number | null;
       lastInboundAtMs?: number | null;
     }): SweepSessionContext {
@@ -551,7 +552,7 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
         session: { id: 'sess-direct', thread_id: overrides.threadId ?? null } as unknown,
         plan: {
           dueCount: overrides.dueCount ?? 0,
-          workContinuation: overrides.hasContinuation ? { id: 'c1' } : null,
+          workContinuation: overrides.continuation ?? (overrides.hasContinuation ? { id: 'c1' } : null),
         } as unknown,
         observed: {
           containerState: { provider_executing: overrides.providerExecuting ? 1 : 0 },
@@ -597,6 +598,27 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
 
       expect(h.kills).toEqual([{ sessionId: 'sess-direct', reason: 'chat-idle-reap', depth: 0 }]);
       expect(h.spawns).toEqual([]);
+    });
+
+    describe('a parked continuation does not hold a container open', () => {
+      const parked = { id: 'c1', task: 't', phase: 'queued', chain: 1, runner_id: 'r-old', resume_attempts: 2 };
+      const cases: Array<[string, boolean, Record<string, unknown>]> = [
+        ['capped and owned by a runner (parked)', true, parked],
+        ['capped but authorized for its last attempt', false, { ...parked, runner_id: undefined }],
+        ['owned by a runner below the cap', false, { ...parked, resume_attempts: 1 }],
+        ['capped and running', false, { ...parked, phase: 'running' }],
+      ];
+      const longQuiet = Date.now() - CHAT_IDLE_REAP_MS - 1;
+
+      it.each(cases)('S12 task reap, continuation %s → reaps=%s', async (_label, reaps, continuation) => {
+        const ctx = fakeHealthCtx({ threadId: 'system:tasks:series-parked', continuation });
+        expect(await getHealthDuty(SWEEP_DUTY_INVENTORY.S12).claims!(ctx)).toBe(reaps);
+      });
+
+      it.each(cases)('S13 chat reap, continuation %s → reaps=%s', async (_label, reaps, continuation) => {
+        const ctx = fakeHealthCtx({ continuation, lastOutboundAtMs: longQuiet, lastInboundAtMs: longQuiet });
+        expect(await getHealthDuty(SWEEP_DUTY_INVENTORY.S13).claims!(ctx)).toBe(reaps);
+      });
     });
   });
 
