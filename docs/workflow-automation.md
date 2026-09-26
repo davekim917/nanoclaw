@@ -10,7 +10,8 @@ Inspect and migrate each existing workflow separately.
 Use deterministic code first when bounded data can decide whether work exists:
 polling, normalization, comparison, debounce, duplicate-delivery detection,
 and routine status publication belong there. A successful quiet observation
-with no pending work or due recovery returns `wakeAgent:false` and does not
+with no pending work or due recovery returns `wakeAgent:false` with an `empty`
+observation ([Observations](scheduled-tasks.md#observations)) and does not
 call a model. A meaningful change, due unresolved action, missing completion
 receipt, recovery deadline, or failure that needs judgment wakes with compact
 facts and evidence references.

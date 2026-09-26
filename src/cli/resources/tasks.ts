@@ -1645,7 +1645,7 @@ registerResource({
         `carries a --script gate (the script decides whether each fire needs you — a gated fire that\n` +
         `finds nothing costs zero tokens) or you pass --dangerously-override-recurrence-limit after\n` +
         `the user explicitly confirmed they want an ungated frequent task.\n\n` +
-        `Failure backoff: a script that ERRORS repeatedly backs the series off (2,4,8,…60 min between fires; each errored fire counts as a failed run); after 8 consecutive failures the series is auto-paused with a note in its run log — fix the script, then \`ncl tasks resume <id>\`. A wakeAgent=false run never backs off, but only an empty observation (or a wake) is a success: consecutive unreadable/blocked/unfinished/error/invalid results past their bound page the operator once. \`ncl tasks get <id>\` shows failed_runs and the run log.\n\n` +
+        `Failure backoff: a script that ERRORS repeatedly backs the series off (2,4,8,…60 min between fires; each errored fire counts as a failed run); after 8 consecutive failures the series is auto-paused with a note in its run log — fix the script, then \`ncl tasks resume <id>\`. A wakeAgent=false run never backs off, but only an empty observation (or a wake) is a success: consecutive unreadable/blocked/unfinished/error/invalid/undeclared (no observation) results past their bound page the operator once. \`ncl tasks get <id>\` shows failed_runs and the run log.\n\n` +
         `Routing (where an unaddressed reply lands): an agent caller stamps its own channel by default (thread null) — a normal reply with no explicit destination lands there; --thread also binds your own thread (falls back to channel if you aren't in a thread session); --isolated stamps no routing (unaddressed replies are discarded, only an explicit <message to=...> reaches anyone). --messaging-group/--thread-id are host-only raw stamps.`,
       args: [
         {
@@ -1753,7 +1753,7 @@ registerResource({
       examples: [
         `# Recurring — --recurrence alone is enough; the first run comes off the cron grid:\nncl tasks create --name "sales briefing" --prompt "Send the weekday sales briefing" --recurrence "0 9 * * 1-5"`,
         `# One-shot — --process-after required (UTC, offset, or naive-local in the instance TZ):\nncl tasks create --name "ping" --prompt "Remind me to call Dana" --process-after "tomorrow 18:00"`,
-        `# Monitor — script gates the run; the agent wakes only when something matters:\nncl tasks create --name "alert watch" --recurrence "*/15 * * * *" \\\n  --prompt "Investigate the alerts in the script data and notify me if serious" \\\n  --script 'c=$(curl -sf https://example.com/api/alerts | jq length) || exit 0\necho "{\\"wakeAgent\\": $([ "$c" -gt 0 ] && echo true || echo false), \\"data\\": {\\"alerts\\": $c}}"'`,
+        `# Monitor — script gates the run; the agent wakes only when something matters:\nncl tasks create --name "alert watch" --recurrence "*/15 * * * *" \\\n  --prompt "Investigate the alerts in the script data and notify me if serious" \\\n  --script 'set -o pipefail\nH=/app/skills/task-observation/task_observation.py\nc=$(curl -sf https://example.com/api/alerts | jq -e length) || { python3 "$H" --kind unreadable --evidence "alerts API unreadable" --bound 1h; exit 0; }\nif [ "$c" -gt 0 ]; then python3 "$H" --wake --data "{\\"alerts\\": $c}"; else python3 "$H" --kind empty --evidence "0 alerts" --bound 1h; fi'`,
       ],
       handler: async (args, ctx) => createTask(args, ctx),
     },

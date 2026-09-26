@@ -47,7 +47,7 @@ import {
   upsertGateOutcome,
   type GateOutcomeUpsert,
 } from '../../db/task-run-outcomes.js';
-import type { GateObservation } from '../scheduling/observation.js';
+import { recordGateResult, type GateObservation } from '../scheduling/observation.js';
 import {
   TASK_FAILURE_ESCALATION_THRESHOLD,
   formatTaskFailureAlert,
@@ -483,5 +483,47 @@ describe('gate lane escalation across a host restart', () => {
     await host.t24.runTaskFailureEscalation(T0 + 2 * HOUR);
     expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
     await host.db.closeDb();
+  });
+});
+
+describe('gate lane escalation of a series that declares nothing', () => {
+  /** One fire whose last line is a bare `{"wakeAgent":false}`, judged and recorded as the host does. */
+  async function undeclaredAt(atMs: number, occurrenceId: string): Promise<void> {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(atMs);
+    try {
+      await recordGateResult({
+        agentGroupId: 'ag-1',
+        sessionId: 'sess-quiet',
+        seriesId: 'quiet-watch',
+        occurrenceId,
+        raw: { result: { wakeAgent: false } },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it('DMs once, 2h after its first undeclared fire, and the episode never ends on its own', async () => {
+    for (let t = 0; t < 2 * HOUR; t += 30 * MIN) {
+      await undeclaredAt(T0 + t, `occ-quiet-${t}`);
+      await tickAt(T0 + t);
+    }
+    await tickAt(T0 + 2 * HOUR - 1);
+    expect(mocks.notifyOperators).not.toHaveBeenCalled();
+
+    await tickAt(T0 + 2 * HOUR);
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
+    const text = mocks.notifyOperators.mock.calls[0]![0];
+    expect(text).toContain('`quiet-watch`');
+    expect(text).toContain('past its 2h bound (4 consecutive non-ok results)');
+    expect(text).toContain('`undeclared`');
+    expect(text).toContain('no observation declared');
+
+    for (let t = 2 * HOUR; t <= 8 * HOUR; t += 30 * MIN) {
+      await undeclaredAt(T0 + t, `occ-quiet-${t}`);
+      await tickAt(T0 + t);
+    }
+    expect(mocks.notifyOperators).toHaveBeenCalledTimes(1);
   });
 });
