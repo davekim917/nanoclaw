@@ -509,7 +509,11 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
   for (const workgroup of listSource(repositoriesDir, problems, 'the repository store')) {
     for (const name of listSource(path.join(repositoriesDir, workgroup), problems, 'a repository directory')) {
       const config = path.join(repositoriesDir, workgroup, name, '.git', 'config');
-      if (!fs.existsSync(config)) continue;
+      const present = readSource(() => fs.statSync(config));
+      if (!present.ok) {
+        if (!present.absent) problems.push('a cloned repository configuration could not be read');
+        continue;
+      }
       const lines = gitConfigLines(['--file', config, '--get', 'remote.origin.url'], repositoriesDir);
       if (lines === null) {
         problems.push('a cloned repository configuration could not be read');
@@ -1109,6 +1113,12 @@ export function writeBaseline(options: ScanOptions): { written: string; refused:
   if (report.mode !== 'install-aware' || report.registryOrigin === 'none' || report.identifiersOrigin === 'none') {
     throw new Error('--write-baseline requires both the install registry and the identifier inventory');
   }
+  // Names missing from the scan would read as removed hits and erase their counts.
+  if (report.discoveryProblems.length > 0) {
+    throw new Error(
+      `--write-baseline requires every install identifier source: ${report.discoveryProblems.join('; ')}`,
+    );
+  }
   const target = options.baselinePath ?? path.join(options.root, DEFAULT_BASELINE_RELATIVE);
   const recorded = loadBaseline(options).files;
   const next: Record<string, number> = {};
@@ -1183,9 +1193,11 @@ export function main(argv = process.argv.slice(2)): number {
       process.stderr.write(
         `WARNING: install-aware checks are incomplete; ${report.discoveryProblems.join('; ')} — names from those sources will NOT be caught\n`,
       );
-      if (options.index && !options.allowStructural) {
+      // A message scan gates publication too: a tag annotation on an already
+      // published commit is the only thing its push scans.
+      if ((options.index || options.messagePath) && !options.allowStructural) {
         process.stderr.write(
-          'public boundary check failed: indexed scans require every install identifier source to be readable\n',
+          'public boundary check failed: gating scans require every install identifier source to be readable\n',
         );
         return 1;
       }

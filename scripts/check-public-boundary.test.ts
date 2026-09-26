@@ -778,7 +778,39 @@ describe('identifiers derived from the install', () => {
     ]);
     expect(main(['--root', root, '--index'])).toBe(1);
     expect(stderr.mock.calls.flat().join('')).toContain('require every install identifier source to be readable');
+    const message = path.join(root, 'TAG_MSG');
+    fs.writeFileSync(message, 'release notes\n');
+    expect(main(['--root', root, '--message', message, '--message-raw'])).toBe(1);
     expect(main(['--root', root])).toBe(0);
+  });
+
+  it('records a clone whose directory cannot be traversed', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    addCanonical(dataDir, 'wg-fictional', 'WIDGET', 'https://github.com/acme-co/WIDGET.git');
+    const gitDir = path.join(dataDir, 'repositories', 'wg-fictional', 'WIDGET', '.git');
+    fs.chmodSync(gitDir, 0o000);
+    const problems: string[] = [];
+    try {
+      expect(loadInstallIdentifiers(dbPath, publicProject, problems)).toEqual(new Set());
+    } finally {
+      fs.chmodSync(gitDir, 0o755);
+    }
+    expect(problems).toEqual(['a cloned repository configuration could not be read']);
+  });
+
+  it('refuses to write a baseline from incomplete discovery, leaving the file unchanged', () => {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    const baselineFile = path.join(root, '.public-boundary-baseline.json');
+    fs.writeFileSync(baselineFile, '{"files":{"old.md":2}}\n');
+    fs.mkdirSync(path.join(root, 'groups', 'broken'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'groups', 'broken', 'container.json'), '{not json');
+    for (const extra of [[], ['--accept-growth']]) {
+      expect(() => writeBaseline(resolveOptions(['--root', root, '--write-baseline', ...extra], root))).toThrow(
+        'requires every install identifier source',
+      );
+    }
+    expect(fs.readFileSync(baselineFile, 'utf8')).toBe('{"files":{"old.md":2}}\n');
   });
 
   it('treats the remotes of the scanned and install checkouts as public', () => {
