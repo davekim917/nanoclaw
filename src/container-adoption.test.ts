@@ -253,13 +253,11 @@ import {
   getContainerIdentity,
   killContainer,
   getContainerSpawnedAt,
-  hasContainerEverRun,
   hasPendingAdoption,
   isAdoptedContainer,
   isContainerRunning,
   wakeContainer,
   _resetAdoptionStateForTesting,
-  _resetEverSeenRunningForTest,
 } from './container-runner.js';
 import { resolveContainerResources } from './container-resources.js';
 import { killContainerHard } from './container-runtime.js';
@@ -347,7 +345,6 @@ describe('adoptRunningSessions', () => {
     vi.mocked(killContainerHard).mockClear();
     hooks.claimWriteFails = false;
     _resetAdoptionStateForTesting();
-    _resetEverSeenRunningForTest();
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
     vi.mocked(log.error).mockClear();
@@ -376,7 +373,6 @@ describe('adoptRunningSessions', () => {
     expect(reconciled).toEqual({ adopted: 1, stopped: 0, pendingClaim: 0, fencedInbound: 0 });
     expect(isContainerRunning('sess-adopt')).toBe(true);
     expect(isAdoptedContainer('sess-adopt')).toBe(true);
-    expect(hasContainerEverRun('sess-adopt')).toBe(true);
     // `markContainerRunning` landed, and the claim is held by THIS host with
     // the survivor's name as its container_ref.
     expect(await containerStatusOf('sess-adopt')).toBe('running');
@@ -533,7 +529,7 @@ describe('adoptRunningSessions', () => {
       'Error: session sess-peer has a running container this host could not claim — not spawning',
     ]);
     expect(infos('Spawning container')).toEqual([]);
-    expect(hasContainerEverRun('sess-peer')).toBe(false);
+    expect(isContainerRunning('sess-peer')).toBe(false);
     // Still pending: the next wake asks again, and never spawns while refused.
     expect(hasPendingAdoption('sess-peer')).toBe(true);
     const claim = await getSessionClaim('sess-peer');

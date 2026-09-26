@@ -43,7 +43,6 @@ const h = await vi.hoisted(async () => {
     opensAtKill: [] as number[],
     wakes: [] as { sessionId: string; depth: number }[],
     spawns: [] as string[],
-    watchdogAction: null as string | null,
     // The fake mailbox store.
     exists: true,
     opens: [] as string[],
@@ -167,7 +166,6 @@ vi.mock('./container-runner.js', async (importOriginal) => {
   return {
     ...real,
     isContainerRunning: (id: string) => h.running.has(id),
-    hasContainerEverRun: () => false,
     getContainerSpawnedAt: () => h.spawnedAtMs,
     getActiveContainerSessionIds: () => [...h.running],
     killContainer: (sessionId: string, reason: string, onExit?: () => void) => {
@@ -218,7 +216,6 @@ vi.mock('./modules/orchestrator-dispatch/db/tasks.js', async (importOriginal) =>
   const real = await importOriginal<typeof import('./modules/orchestrator-dispatch/db/tasks.js')>();
   return {
     ...real,
-    getActiveTasks: () => [],
     getOrphanedTasks: () => [],
     autoArchiveCompletedBefore: () => 0,
     transitionToTerminal: () => false,
@@ -228,14 +225,6 @@ vi.mock('./modules/orchestrator-dispatch/db/agent-group-capabilities.js', async 
   ...(await importOriginal<typeof import('./modules/orchestrator-dispatch/db/agent-group-capabilities.js')>()),
   getCapabilityConfig: async () => undefined,
 }));
-vi.mock('./modules/orchestrator-dispatch/watchdog.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('./modules/orchestrator-dispatch/watchdog.js')>();
-  return {
-    ...real,
-    pendingTerminalSpawnOutboundSeenAt: () => null,
-    decideTaskAction: () => (h.watchdogAction ? { action: h.watchdogAction } : { action: 'ok' }),
-  };
-});
 vi.mock('./storage-maintenance-worker.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./storage-maintenance-worker.js')>()),
   runStorageMaintenanceInBackground: async () => null,
@@ -410,7 +399,7 @@ import './modules/sweep-idle-reap/index.js';
 // S2-PR4 moved the central housekeeping duties. Their own duty-body mocks are
 // already declared above (this file predates the move and anticipated it).
 import './modules/sweep-central/index.js';
-// S2-PR5 moved T6/T14/T18 (reconciler, auto-archive, task watchdog).
+// S2-PR5 moved T6/T14 (reconciler, auto-archive).
 import './modules/sweep-orchestrator/index.js';
 // S2-PR6 moved T2 (egress), T13 (storage) and T20/T21 (claims).
 import './modules/sweep-egress/index.js';
@@ -540,7 +529,6 @@ describe('sweep duty registry (S2-PR2)', () => {
     h.wakes = [];
     // Truncate, never reassign: the tripwire factory closed over THIS array.
     h.spawns.length = 0;
-    h.watchdogAction = null;
     h.exists = true;
     h.opens = [];
     h.failNextOpen = null;
@@ -1338,7 +1326,7 @@ describe('sweep duty registry (S2-PR2)', () => {
    * remote MCP servers authenticate with short-lived OAuth access tokens, and
    * the OneCLI secret injecting one used to hold a value pasted by hand.
    * All five are tracked in SWEEP_DUTY_INVENTORY (as FORK1, T23, FORK2, T24
-   * and FORK4) alongside the 38 seam-2-ported duties, so the set below stays an
+   * and FORK4) alongside the 37 seam-2-ported duties, so the set below stays an
    * exact accounting of every registered duty — ported or not.
    */
   const EXPECTED_REGISTRATIONS: Array<[string, string, string, number]> = [
@@ -1361,7 +1349,6 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'spent-task-session-gc', 'session:tail', 30],
     ['duty', 'orchestrator-reconciler', 'tick:post-session', 10],
     ['duty', 'thread-close-advance', 'tick:post-session', 20],
-    ['duty', 'task-watchdog', 'tick:post-session', 25],
     ['duty', 'storage-maintenance', 'tick:post-session', 30],
     ['duty', 'usage-rollup', 'tick:post-session', 40],
     ['duty', 'orphaned-repo-fence-release', 'tick:post-session', 50],
@@ -1411,16 +1398,16 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    // 46 registrations: the 39 from the seam-2 port (38 unique names, one
+    // 45 registrations: the 38 from the seam-2 port (37 unique names, one
     // registered twice — see below) plus six fork additions,
     // github-token-file-refresh, cli-request-execution-prune,
     // coordination-orphans (seam 4 series A', issue #430),
     // task-failure-escalation, mcp-oauth-refresh and promise-watch.
-    expect(actual).toHaveLength(46);
+    expect(actual).toHaveLength(45);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(45);
+    expect(names.size).toBe(44);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(45);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(44);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1444,14 +1431,14 @@ describe('sweep duty registry (S2-PR2)', () => {
   });
 
   // ── F-5.4 (S2-PR5, plan.md §8) ───────────────────────────────────────────────
-  it('reconciler, thread-close and watchdog run in tick:post-session', () => {
+  it('reconciler and thread-close run in tick:post-session', () => {
     // The container-state ordering constraint (plan.md §4.3 constraint 1)
-    // survives the move of T6/T18 into src/modules/sweep-orchestrator/. T8
+    // survives the move of T6 into src/modules/sweep-orchestrator/. T8
     // thread-close is S2-PR11's family — assert its declared phase only, not
     // its behavior.
     const { duties } = _listSweepRegistrationsForTesting();
     const byName = new Map(duties.map((d) => [d.name, d]));
-    for (const name of [SWEEP_DUTY_INVENTORY.T6, SWEEP_DUTY_INVENTORY.T8, SWEEP_DUTY_INVENTORY.T18]) {
+    for (const name of [SWEEP_DUTY_INVENTORY.T6, SWEEP_DUTY_INVENTORY.T8]) {
       expect(byName.get(name), `duty ${name}`).toBeDefined();
       expect(byName.get(name)?.phase, `duty ${name}`).toBe('tick:post-session');
     }
@@ -1594,7 +1581,6 @@ describe('sweep duty registry (S2-PR2)', () => {
       '_setSweepYieldForTesting',
       '_sweepOnceForTesting',
       '_sweepSessionForTesting',
-      '_sweepTaskWatchdogForTesting',
     ]);
     const actualExports = Object.keys(isolated);
     expect([...actualExports].filter((name) => !ALLOWED_EXPORTS.has(name))).toEqual([]);
@@ -1834,7 +1820,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ];
 
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
-    // 43 registrations over 42 names. The seam-2 port is 38 duties in 39
+    // 45 registrations over 44 names. The seam-2 port is 37 duties in 38
     // registrations — S17 is the only one registered twice, once as a
     // session:health duty and once as the post-kill follow-up — plus the four
     // fork duties the upstream seam does not have: T23
@@ -1845,12 +1831,12 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `mcp-oauth-refresh` from `mcp-oauth`. The numbers here said 39/38/38 from
     // before those landed; the tuple comparison above was already right, which
     // is why it never failed.
-    expect(actual).toHaveLength(46);
+    expect(actual).toHaveLength(45);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(45);
+    expect(names.size).toBe(44);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(45);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(44);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });
@@ -2501,28 +2487,6 @@ describe('sweep duty registry (S2-PR2)', () => {
         vi.useRealTimers();
         info.mockRestore();
       }
-      expect(h.spawns).toEqual([]);
-    });
-
-    it('the task watchdog’s parent wake', async () => {
-      const { _sweepTaskWatchdogForTesting } = await import('./host-sweep.js');
-      const tasksModule = await import('./modules/orchestrator-dispatch/db/tasks.js');
-      const parent = fakeSession('sess-parent');
-      h.sessions = [parent];
-      h.watchdogAction = 'fail-deadline';
-      vi.spyOn(tasksModule, 'getActiveTasks').mockReturnValue([
-        {
-          task_id: 't1',
-          parent_agent_group_id: 'ag-1',
-          parent_session_id: 'sess-parent',
-          child_session_id: null,
-        },
-      ] as never);
-      vi.spyOn(tasksModule, 'transitionToTerminal').mockResolvedValue(true);
-
-      await _sweepTaskWatchdogForTesting();
-
-      expect(h.wakes).toEqual([{ sessionId: 'sess-parent', depth: 0 }]);
       expect(h.spawns).toEqual([]);
     });
 

@@ -722,7 +722,7 @@ function windowedRunner(run: SessionRunner, sessionId: string, window: () => Swe
   };
 }
 
-/** The 38 duties this module still owns, as 39 registrations. Ids from seam2-inventory.md §3. */
+/** The 37 duties this module still owns, as 38 registrations. Ids from seam2-inventory.md §3. */
 export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T2: 'egress-network-reheal',
   T5: 'approvals-reason-sweep',
@@ -738,7 +738,6 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T15: 'session-title-sweep',
   T16: 'thread-title-retry',
   T17: 'dashboard-token-prune',
-  T18: 'task-watchdog',
   T19: 'usage-rollup',
   T20: 'claims-reconcile',
   T21: 'claims-self-heal',
@@ -1512,15 +1511,8 @@ export async function _sweepSessionForTesting(session: Session): Promise<number 
 // Running-container SLA (S14) and the OOM / memory-pressure notice (S16)
 // moved to src/modules/sweep-container-health/index.ts.
 
-// sweepTaskWatchdog moved with the orchestrator family into
-// src/modules/sweep-orchestrator/task-watchdog.ts — a sibling of that
-// family's index.ts, not index.ts itself, so this re-export doesn't create a
-// static cycle back through index.ts's own import of this file (registerSweepDuty
-// / registerSweepDutySource / SWEEP_DUTY_INVENTORY).
-export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting } from './modules/sweep-orchestrator/task-watchdog.js';
-
 // ─────────────────────────────────────────────────────────────────────────────
-// The 38 duty names, 39 registrations — none of them here any more.
+// The 37 duty names, 38 registrations — none of them here any more.
 //
 // Every duty this driver runs is registered by its own `src/modules/sweep-*`
 // module at import time (the modules barrel `src/modules/index.ts` is what

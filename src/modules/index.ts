@@ -33,7 +33,7 @@ import './bash-gate/index.js';
 // Orchestrator dispatch — task dispatch pipeline + reconciler.
 import './orchestrator-dispatch/index.js';
 // Sweep family: orchestrator, dormant — T6 reconciler,
-// T14 auto-archive, T18 task watchdog. Registers at import.
+// T14 auto-archive. Registers at import.
 import './sweep-orchestrator/index.js';
 // Backlog + ship-log delivery action handlers (add_ship_log, add/update/delete_backlog_item).
 import './backlog/index.js';

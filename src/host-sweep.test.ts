@@ -112,7 +112,6 @@ vi.mock('./db/provider-health.js', async (importOriginal) => {
 const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(0);
 const mockWakeContainer = vi.fn();
 const mockIsContainerRunning = vi.fn();
-const mockHasContainerEverRun = vi.fn();
 const mockGetSession = vi.fn();
 
 vi.mock('./session-manager.js', async (importOriginal) => {
@@ -135,7 +134,6 @@ vi.mock('./container-runner.js', async (importOriginal) => {
     // alone would silently bypass `mockIsContainerRunning`.
     containerOwnsOutbound: (sessionId: string) =>
       Boolean(mockIsContainerRunning(sessionId)) || real.isContainerSpawning(sessionId),
-    hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
     killContainer: (...args: unknown[]) => mockKillContainer(...args),
   };
@@ -342,7 +340,6 @@ describe('sweepSession on a session with no mailbox', () => {
     ).run(new Date().toISOString());
     mockWakeContainer.mockReset();
     mockIsContainerRunning.mockReset().mockReturnValue(false);
-    mockHasContainerEverRun.mockReset().mockReturnValue(false);
 
     const session: Session = { ...fakeSession(), id: 'sess-nomailbox', agent_group_id: 'ag-nomailbox' };
     const sessionPath = path.join(testDataDir.dir, 'v2-sessions', session.agent_group_id, session.id);
@@ -795,7 +792,6 @@ describe('sweepSession on a session with no mailbox', () => {
     ).run(new Date().toISOString());
     mockWakeContainer.mockReset();
     mockIsContainerRunning.mockReset().mockReturnValue(false);
-    mockHasContainerEverRun.mockReset().mockReturnValue(false);
     mockAdmitDueTaskContexts.mockReturnValue(0);
 
     const session: Session = { ...fakeSession(), id: 'sess-badout', agent_group_id: 'ag-badout' };
@@ -834,7 +830,6 @@ describe('sweepSession on a session with no mailbox', () => {
     ).run(new Date().toISOString());
     mockWakeContainer.mockReset().mockResolvedValue(true);
     mockIsContainerRunning.mockReset().mockReturnValue(false);
-    mockHasContainerEverRun.mockReset().mockReturnValue(false);
     mockAdmitDueTaskContexts.mockReturnValue(0);
 
     const snapshot: Session = { ...fakeSession(), id: 'sess-stale', agent_group_id: 'ag-stale', status: 'active' };
@@ -883,7 +878,6 @@ describe('sweepSession on a session with no mailbox', () => {
     ).run(new Date().toISOString());
     mockWakeContainer.mockReset();
     mockIsContainerRunning.mockReset().mockReturnValue(false);
-    mockHasContainerEverRun.mockReset().mockReturnValue(false);
 
     const session: Session = { ...fakeSession(), id: 'sess-dutythrow', agent_group_id: 'ag-dutythrow' };
     // A real mailbox, so the open succeeds and only the DUTY fails.

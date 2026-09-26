@@ -1,23 +1,23 @@
 /**
  * Sweep family: orchestrator, dormant.
  *
- * T6 orchestrator-reconciler (tick:post-session, order 10), T18 task-watchdog
- * (tick:post-session, order 25) and T14 completed-task-auto-archive
- * (tick:housekeeping, order 70) — moved out of src/host-sweep.ts unchanged
- * (plan.md §4.3/§4.7). T6 and T18 read container state, so they MUST stay in
- * tick:post-session, after the per-session fan-out (constraint 1).
+ * T6 orchestrator-reconciler (tick:post-session, order 10) and T14
+ * completed-task-auto-archive (tick:housekeeping, order 70) — moved out of
+ * src/host-sweep.ts unchanged (plan.md §4.3/§4.7). T6 reads container state,
+ * so it MUST stay in tick:post-session, after the per-session fan-out
+ * (constraint 1).
  *
  * DORMANT: no agent group holds the `orchestrator` capability (parked
  * 2026-08-11 — see src/modules/orchestrator-dispatch/index.ts), so
- * `spawn_task` never fires. `getOrphanedTasks()` and `getActiveTasks()`
- * therefore return nothing in production, and both T6 and T18 are no-ops.
+ * `spawn_task` never fires. `getOrphanedTasks()` therefore returns nothing in
+ * production, and T6 is a no-op.
  * Do not re-enable anything here — restoring the capability is a decision
- * made elsewhere (grantCapability()), not a side effect of this module.
+ * made elsewhere, and needs a task reaper this module no longer has (see
+ * src/modules/orchestrator-dispatch/index.ts).
  *
- * T18's and T14's own bodies live in sibling files (task-watchdog.ts,
- * auto-archive.ts) rather than here, so the acceptance-case suite can import
- * them directly without pulling in this file's dependency on host-sweep.ts —
- * the same split as steer-idempotency.ts.
+ * T14's own body lives in a sibling file (auto-archive.ts) rather than here,
+ * so the acceptance-case suite can import it directly without pulling in this
+ * file's dependency on host-sweep.ts — the same split as steer-idempotency.ts.
  *
  * Registers at import — this module has no other consumer. It is imported by
  * src/modules/index.ts (production boot) and, for hermetic coverage, by
@@ -31,7 +31,6 @@
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { runReconcilerSweep } from '../orchestrator-dispatch/reconciler.js';
 import { autoArchiveOldCompleted } from './auto-archive.js';
-import { sweepTaskWatchdog } from './task-watchdog.js';
 
 function registerOrchestratorSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
@@ -50,16 +49,6 @@ function registerOrchestratorSweepDuties(): void {
     run: async () => {
       await runReconcilerSweep();
     },
-  });
-
-  registerSweepDuty({
-    name: id.T18,
-    phase: 'tick:post-session',
-    order: 25,
-    // MODULE-HOOK:orchestrator-dispatch:watchdog — reap tasks that have exceeded
-    // their deadline, spawn window, no-progress timeout, or whose child
-    // container exited.
-    run: () => sweepTaskWatchdog(),
   });
 
   // ── tick:housekeeping — order-free central work ─────────────────────────────

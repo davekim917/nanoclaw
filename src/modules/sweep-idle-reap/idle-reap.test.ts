@@ -209,7 +209,6 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     // duty graph would silently bypass this mock. Same composition
     // src/host-sweep.test.ts uses.
     containerOwnsOutbound: (sessionId: string) => h.running.has(sessionId) || real.isContainerSpawning(sessionId),
-    hasContainerEverRun: () => false,
     getContainerSpawnedAt: () => 0,
     getActiveContainerSessionIds: () => [...h.running],
     killContainer: (sessionId: string, reason: string, onExit?: () => void) => {
@@ -254,7 +253,6 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/db/tasks.js')>();
   return {
     ...real,
-    getActiveTasks: () => [],
     getOrphanedTasks: () => [],
     autoArchiveCompletedBefore: () => 0,
     transitionToTerminal: () => false,
@@ -264,10 +262,6 @@ vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (import
   ...(await importOriginal<typeof import('../orchestrator-dispatch/db/agent-group-capabilities.js')>()),
   getCapabilityConfig: async () => undefined,
 }));
-vi.mock('../orchestrator-dispatch/watchdog.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../orchestrator-dispatch/watchdog.js')>();
-  return { ...real, pendingTerminalSpawnOutboundSeenAt: () => null, decideTaskAction: () => ({ action: 'ok' }) };
-});
 vi.mock('../../storage-maintenance-worker.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../storage-maintenance-worker.js')>()),
   runStorageMaintenanceInBackground: async () => null,

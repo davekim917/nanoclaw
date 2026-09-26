@@ -1,34 +1,28 @@
 /**
  * Acceptance cases for the orchestrator, dormant sweep family (convergence
- * seam 2, S2-PR5 — F-5.1..F-5.4 in docs/specs/upstream-host-sweep-seam/plan.md
+ * seam 2, S2-PR5 — F-5.2..F-5.4 in docs/specs/upstream-host-sweep-seam/plan.md
  * §8). F-5.4 lives in src/host-sweep-registry.test.ts (it proves a
  * registry-level property — phase placement — not a property of this
  * module's own code).
  *
- * F-5.1's and F-5.2's cases are MOVED, unchanged, from src/host-sweep.test.ts
- * (`describe('sweepTaskWatchdog (C3)')` and `describe('autoArchiveOldCompleted')`)
- * — the bodies they exercise moved from src/host-sweep.ts to
- * ./task-watchdog.ts and ./auto-archive.ts in this same commit. Imports come
- * from those sibling files directly, not from ./index.ts, so this suite never
- * pulls in index.ts's own dependency on host-sweep.ts's full registry import
- * graph (same split as sweep-central/central.test.ts).
+ * F-5.2's cases exercise ./auto-archive.ts, imported from that sibling file
+ * directly, not from ./index.ts, so this suite never pulls in index.ts's own
+ * dependency on host-sweep.ts's full registry import graph (same split as
+ * sweep-central/central.test.ts).
  *
- * F-5.3 is new: with the `orchestrator` capability absent (the production
- * steady state — no agent group holds it, so `spawn_task` never fires and the
- * task tables stay empty), both the reconciler and the watchdog duties must
- * run and change nothing.
+ * F-5.3: with the `orchestrator` capability absent (the production steady
+ * state — no agent group holds it, so `spawn_task` never fires and the task
+ * tables stay empty), the reconciler duty must run and change nothing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
-import { withCentralSync } from '../../db/central-lease.js';
 import { log } from '../../log.js';
 
 // Hermeticity tripwire (brief-common.md HARD RULE): every case below runs a
-// real duty body (sweepTaskWatchdog, autoArchiveOldCompleted,
-// runReconcilerSweep). None of this family's own I/O should ever reach a real
-// process spawn — every seam it touches (tasks.js, agent-group-capabilities.js,
-// watchdog.js, session-manager.js, container-runner.js, db/sessions.js) is
+// real duty body (autoArchiveOldCompleted, runReconcilerSweep). None of this
+// family's own I/O should ever reach a real process spawn — every seam it
+// touches (tasks.js, session-manager.js, container-runner.js, db/sessions.js) is
 // mocked below. A tripwire, not a functional mock: it records the call (so a
 // test can assert on the record even though a real caller's own try/catch
 // might swallow the throw) and then throws, so an uncaught spawn fails loudly
@@ -63,14 +57,10 @@ afterEach(() => {
   spawnAttempts.length = 0;
 });
 
-const mockGetActiveTasks = vi.fn();
 const mockTransitionToTerminal = vi.fn();
-const mockGetCapabilityConfig = vi.fn();
-const mockPendingTerminalDispatchOutboundSeenAt = vi.fn();
 const mockWriteSessionMessage = vi.fn();
 const mockWakeContainer = vi.fn();
 const mockIsContainerRunning = vi.fn();
-const mockHasContainerEverRun = vi.fn();
 const mockGetSession = vi.fn();
 const mockGetOrphanedTasks = vi.fn();
 
@@ -78,7 +68,6 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/db/tasks.js')>();
   return {
     ...real,
-    getActiveTasks: (...args: unknown[]) => mockGetActiveTasks(...args),
     transitionToTerminal: (...args: unknown[]) => mockTransitionToTerminal(...args),
     getOrphanedTasks: (...args: unknown[]) => mockGetOrphanedTasks(...args),
     // Wrapped, not replaced — calls the real DB-backed function by default so
@@ -86,19 +75,6 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
     // unaffected. Only the registered-duty-wrapper throwing-path case below
     // overrides it, once, via mockImplementationOnce.
     autoArchiveCompletedBefore: vi.fn(real.autoArchiveCompletedBefore),
-  };
-});
-
-vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../orchestrator-dispatch/db/agent-group-capabilities.js')>()),
-  getCapabilityConfig: (...args: unknown[]) => mockGetCapabilityConfig(...args),
-}));
-
-vi.mock('../orchestrator-dispatch/watchdog.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../orchestrator-dispatch/watchdog.js')>();
-  return {
-    ...real,
-    pendingTerminalSpawnOutboundSeenAt: (...args: unknown[]) => mockPendingTerminalDispatchOutboundSeenAt(...args),
   };
 });
 
@@ -125,7 +101,6 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     // leaving a trap for the next family move.
     containerOwnsOutbound: (sessionId: string) =>
       Boolean(mockIsContainerRunning(sessionId)) || real.isContainerSpawning(sessionId),
-    hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
   };
 });
@@ -144,9 +119,8 @@ vi.mock('../../db/sessions.js', async (importOriginal) => {
 // no central DB, so the fake answers a `FROM sessions` lookup from
 // `mockGetSession` and nothing else.
 // The auto-archive cases below open a real in-memory DB and seed rows, so the
-// real handle wins whenever one is initialized (`preferRealDb`). The watchdog
-// cases open none, and fall back to the shared fake for the one guard-path
-// lookup.
+// real handle wins whenever one is initialized (`preferRealDb`). The dormant
+// cases open none, and fall back to the shared fake.
 // The fixture is imported INSIDE the factory: a hoisted `vi.mock` runs before
 // this file's own import bindings are initialized.
 vi.mock('../../db/connection.js', async (importOriginal) => {
@@ -158,7 +132,7 @@ vi.mock('../../db/connection.js', async (importOriginal) => {
   );
 });
 
-// Wrap (not replace) the three duty bodies: `vi.fn(real)` still calls the real
+// Wrap (not replace) the two duty bodies: `vi.fn(real)` still calls the real
 // implementation by default, so every case below and above keeps its existing
 // behavior. The wrapping only exists so the registered-duty-wrapper cases
 // further down (added pre-review, per plan.md §4.3's registry contract) can
@@ -167,10 +141,6 @@ vi.mock('../../db/connection.js', async (importOriginal) => {
 vi.mock('./auto-archive.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./auto-archive.js')>();
   return { ...real, autoArchiveOldCompleted: vi.fn(real.autoArchiveOldCompleted) };
-});
-vi.mock('./task-watchdog.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('./task-watchdog.js')>();
-  return { ...real, sweepTaskWatchdog: vi.fn(real.sweepTaskWatchdog) };
 });
 vi.mock('../orchestrator-dispatch/reconciler.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/reconciler.js')>();
@@ -185,11 +155,10 @@ vi.mock('../orchestrator-dispatch/dispatch.js', async (importOriginal) => {
 });
 
 import { autoArchiveOldCompleted } from './auto-archive.js';
-import { sweepTaskWatchdog } from './task-watchdog.js';
 import { runReconcilerSweep } from '../orchestrator-dispatch/reconciler.js';
 import { autoArchiveCompletedBefore } from '../orchestrator-dispatch/db/tasks.js';
 import { completeSpawnSideEffects } from '../orchestrator-dispatch/dispatch.js';
-// Registers T6/T14/T18 into host-sweep.ts's live registry — needed so the
+// Registers T6/T14 into host-sweep.ts's live registry — needed so the
 // registered-duty-wrapper cases below can obtain them by name, the same
 // accessor R-7 uses in src/host-sweep-registry.test.ts. Safe to import
 // unmocked here: registration only pushes duty objects into an array (no
@@ -199,54 +168,6 @@ import { completeSpawnSideEffects } from '../orchestrator-dispatch/dispatch.js';
 // does, which none of these cases trigger).
 import './index.js';
 import { _listSweepRegistrationsForTesting, type SweepTickContext } from '../../host-sweep.js';
-
-// ── F-5.1 — the task watchdog transitions and parent notifications are unchanged ──
-
-const NOW = Date.parse('2026-04-20T12:00:00.000Z');
-
-function makeTask(
-  overrides: Partial<{
-    task_id: string;
-    parent_session_id: string;
-    parent_agent_group_id: string;
-    child_session_id: string | null;
-    status: 'pending' | 'running';
-    admitted_at: string;
-    started_at: string | null;
-    last_progress_at: string | null;
-    deadline: string | null;
-  }> = {},
-) {
-  return {
-    task_id: 'task-watchdog-1',
-    idempotency_key: 'idem-w1',
-    parent_session_id: 'parent-sess',
-    parent_agent_group_id: 'parent-ag',
-    parent_messaging_group_id: null,
-    child_session_id: 'child-sess',
-    status: 'running' as const,
-    task_content: '{}',
-    request_hash: 'hash',
-    deadline: null,
-    parent_platform_message_id: null,
-    child_platform_thread_id: null,
-    child_messaging_group_id: null,
-    admitted_at: new Date(NOW - 10 * 60 * 1000).toISOString(),
-    started_at: new Date(NOW - 9 * 60 * 1000).toISOString(),
-    completed_at: null,
-    failed_at: null,
-    cancelled_at: null,
-    last_progress_at: new Date(NOW - 2 * 60 * 1000).toISOString(),
-    last_progress_message: null,
-    fail_reason: null,
-    result_summary: null,
-    dispatch_completion_attempts: 0,
-    completion_lease_at: null,
-    surface_mode: 'headless' as const,
-    created_at: new Date(NOW - 10 * 60 * 1000).toISOString(),
-    ...overrides,
-  };
-}
 
 function fakeParentSession() {
   return {
@@ -261,308 +182,6 @@ function fakeParentSession() {
     created_at: new Date().toISOString(),
   };
 }
-
-describe('the task watchdog transitions and parent notifications are unchanged', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockGetSession.mockReturnValue(fakeParentSession());
-    mockIsContainerRunning.mockReturnValue(true);
-    // Default: container has been observed running. Individual tests that
-    // need the "never started yet" case override per-call.
-    mockHasContainerEverRun.mockReturnValue(true);
-    mockWakeContainer.mockResolvedValue(true);
-    mockWriteSessionMessage.mockResolvedValue(undefined);
-    mockGetCapabilityConfig.mockResolvedValue(null); // use defaults
-    mockPendingTerminalDispatchOutboundSeenAt.mockReturnValue(null);
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it('test_watchdog_terminates_no_progress_task: reaped task gets failed + parent notified', async () => {
-    const task = makeTask({
-      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // 2 hours ago — past 30 min default
-    });
-    mockGetActiveTasks.mockReturnValue([task]);
-    mockTransitionToTerminal.mockReturnValue(true);
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    expect(mockTransitionToTerminal).toHaveBeenCalledWith(
-      task.task_id,
-      'failed',
-      expect.objectContaining({ fail_reason: 'no_progress_timeout' }),
-    );
-    // Watchdog now writes kind='chat' so the orchestrator surfaces the
-    // failure to the user via a normal turn input (the prior `kind='system'`
-    // envelope had no consumer and sat silently in the inbound).
-    expect(mockWriteSessionMessage).toHaveBeenCalledWith(
-      task.parent_agent_group_id,
-      task.parent_session_id,
-      expect.objectContaining({ kind: 'chat' }),
-    );
-    const writeCallArgs = mockWriteSessionMessage.mock.calls[0]?.[2];
-    const parsed = writeCallArgs ? JSON.parse(writeCallArgs.content) : {};
-    expect(parsed.text).toContain('Task failed (watchdog)');
-    expect(parsed.text).toContain('no_progress_timeout');
-    expect(parsed._task_update).toMatchObject({
-      task_id: task.task_id,
-      status: 'failed',
-      fail_reason: 'no_progress_timeout',
-      source: 'watchdog',
-    });
-    expect(mockWakeContainer).toHaveBeenCalled();
-  });
-
-  /**
-   * The parent can be archived while the notification is being written.
-   *
-   * `parentSession` is fetched before the awaited mailbox write and was handed
-   * straight to `wakeContainer` after it. A reclaim inside that window leaves a
-   * snapshot that still says `active`, and waking on it spawns a container
-   * `getActiveSessions()` will never return — no stuck detection, no heartbeat
-   * ceiling, no claim tolerance, for as long as it runs.
-   *
-   * The notification itself still lands: the row is durable and the parent may
-   * come back. Only the wake is withheld.
-   */
-  it('hands the parent wake a guard that refuses a session archived under it', async () => {
-    const task = makeTask({
-      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(),
-    });
-    mockGetActiveTasks.mockReturnValue([task]);
-    mockTransitionToTerminal.mockReturnValue(true);
-    // The reclaim lands while the wake is in flight, which is exactly the window
-    // a caller-side re-read cannot observe.
-    let parentGone = false;
-    mockWriteSessionMessage.mockImplementation(async () => {
-      parentGone = true;
-    });
-    mockGetSession.mockImplementation(() => (parentGone ? undefined : fakeParentSession()));
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    expect(mockWriteSessionMessage).toHaveBeenCalled();
-    // Issued with a guard rather than skipped: the parent can also be archived
-    // during the wake's own awaits, which a re-read here could never see.
-    const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
-    // The guard's read is raw (seam 3 §4.5 I-1), answered by the raw-db fake
-    // inside the lease block.
-    expect(await withCentralSync(() => guard(), 'test-guard')).toEqual({
-      ok: false,
-      reason: 'session no longer exists',
-    });
-  });
-
-  it('test_watchdog_skips_when_drain_active: task with recent terminal outbound is not reaped', async () => {
-    const task = makeTask({
-      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // 2 hours ago
-    });
-    // Drain guard: terminal action seen 30s ago, within 120s grace
-    mockPendingTerminalDispatchOutboundSeenAt.mockReturnValue(new Date(NOW - 30 * 1000).toISOString());
-    mockGetActiveTasks.mockReturnValue([task]);
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    expect(mockTransitionToTerminal).not.toHaveBeenCalled();
-    expect(mockWriteSessionMessage).not.toHaveBeenCalled();
-  });
-
-  it('CAS guard: 0-rows transitionToTerminal skips parent notification', async () => {
-    const task = makeTask({
-      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(),
-    });
-    mockGetActiveTasks.mockReturnValue([task]);
-    mockTransitionToTerminal.mockReturnValue(false); // CAS failed — already terminal
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    expect(mockTransitionToTerminal).toHaveBeenCalled();
-    expect(mockWriteSessionMessage).not.toHaveBeenCalled();
-  });
-
-  it('test_one_task_failure_doesnt_skip_others: error in one task does not prevent processing others', async () => {
-    // Both tasks have stale progress — both should trigger transitionToTerminal.
-    // The first call throws (simulates a corrupt task failing mid-reap).
-    const badTask = makeTask({
-      task_id: 'bad-task',
-      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // stale — triggers reap
-    });
-    const goodTask = makeTask({
-      task_id: 'good-task',
-      last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // stale — should also be reaped
-    });
-    mockGetActiveTasks.mockReturnValue([badTask, goodTask]);
-    // First call (bad task) — throws to simulate a corrupt/unrecoverable failure mid-loop
-    // Second call (good task) — returns true
-    mockTransitionToTerminal
-      .mockImplementationOnce(() => {
-        throw new Error('synthetic failure');
-      })
-      .mockReturnValue(true);
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    // Both tasks were attempted — try/catch isolation ensures good task ran
-    expect(mockTransitionToTerminal).toHaveBeenCalledTimes(2);
-    // Only good task (second call) succeeded, so only one parent notification
-    expect(mockWriteSessionMessage).toHaveBeenCalledTimes(1);
-  });
-
-  it('uses per-orchestrator config when available', async () => {
-    const task = makeTask({
-      last_progress_at: new Date(NOW - 35 * 60 * 1000).toISOString(), // 35 min ago
-    });
-    // Custom timeout of 60 min — 35 min is within timeout, so no reap
-    mockGetCapabilityConfig.mockResolvedValue({
-      noProgressTimeoutSec: 3600,
-      spawnDeadlineSec: 600,
-      drainGraceSec: 180,
-      concurrencyCap: 5,
-    });
-    mockGetActiveTasks.mockReturnValue([task]);
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    expect(mockTransitionToTerminal).not.toHaveBeenCalled();
-  });
-
-  it('falls back to default timeouts when capability config is absent', async () => {
-    const task = makeTask({
-      last_progress_at: new Date(NOW - 35 * 60 * 1000).toISOString(), // 35 min ago — past 30 min default
-    });
-    mockGetCapabilityConfig.mockResolvedValue(null); // no config
-    mockGetActiveTasks.mockReturnValue([task]);
-    mockTransitionToTerminal.mockReturnValue(true);
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    // Default 1800s = 30 min; 35 min ago should trigger no-progress reap
-    expect(mockTransitionToTerminal).toHaveBeenCalledWith(
-      task.task_id,
-      'failed',
-      expect.objectContaining({ fail_reason: 'no_progress_timeout' }),
-    );
-  });
-
-  // test_watchdog_fail_reason_canonical: all 4 watchdog actions produce canonical fail_reason values
-  it.each([
-    {
-      label: 'no-progress → no_progress_timeout',
-      taskOverrides: { last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString() },
-      expectedFailReason: 'no_progress_timeout',
-    },
-    {
-      label: 'deadline → deadline_exceeded',
-      taskOverrides: {
-        deadline: new Date(NOW - 60 * 60 * 1000).toISOString(),
-        last_progress_at: new Date(NOW - 2 * 60 * 1000).toISOString(),
-      },
-      expectedFailReason: 'deadline_exceeded',
-    },
-    {
-      label: 'spawn-deadline → spawn_deadline',
-      taskOverrides: {
-        status: 'pending' as const,
-        started_at: null,
-        last_progress_at: null,
-        admitted_at: new Date(NOW - 10 * 60 * 1000).toISOString(), // 10 min > 5 min spawn deadline
-      },
-      expectedFailReason: 'spawn_deadline',
-    },
-    {
-      label: 'container-exit → container_exit',
-      taskOverrides: {
-        child_session_id: 'child-sess',
-        last_progress_at: new Date(NOW - 2 * 60 * 1000).toISOString(), // recent progress
-      },
-      expectedFailReason: 'container_exit',
-      childContainerStopped: true,
-    },
-  ])(
-    'test_watchdog_fail_reason_canonical: $label',
-    async ({ taskOverrides, expectedFailReason, childContainerStopped }) => {
-      const task = makeTask(taskOverrides);
-      mockGetActiveTasks.mockReturnValue([task]);
-      mockTransitionToTerminal.mockReturnValue(true);
-      if (childContainerStopped) {
-        mockIsContainerRunning.mockReturnValue(false);
-        // Sticky bit: container WAS observed running, now stopped — the
-        // case `fail-container-exit` is designed for. Without this the
-        // bug-fix logic treats the child as "never started" and returns ok.
-        mockHasContainerEverRun.mockReturnValue(true);
-      }
-
-      vi.useFakeTimers();
-      vi.setSystemTime(NOW);
-
-      await sweepTaskWatchdog();
-
-      expect(mockTransitionToTerminal).toHaveBeenCalledWith(
-        task.task_id,
-        'failed',
-        expect.objectContaining({ fail_reason: expectedFailReason }),
-      );
-    },
-  );
-
-  it('test_watchdog_does_not_reap_container_exit_before_container_ever_started', async () => {
-    // Regression: under concurrency cap the 4th-of-4 spawned child created
-    // its session row immediately but waited 78s for an actual container.
-    // The watchdog ran during the gap, saw `isContainerRunning(child) === false`,
-    // and reaped as `fail-container-exit` — terminally failing a task before
-    // it had a chance to start. Observed against the spawn-board build for
-    // task spawn-80a5ba9b2f8b532b at 01:53:10 UTC on 2026-05-11; the
-    // container then actually spawned, the child completed the work, and
-    // its `spawn_complete` was discarded because the task was already
-    // terminal.
-    //
-    // Correct behavior: when the container has never been observed running,
-    // `childContainerStatus` is null, not 'stopped', and the watchdog must
-    // not reap as container_exit. (Other reapers — no_progress_timeout,
-    // spawn_deadline — still cover legitimate stuck-spawn failure modes.)
-    const task = makeTask({
-      child_session_id: 'child-sess-queued',
-      last_progress_at: new Date(NOW - 30 * 1000).toISOString(), // 30s old, well within timeout
-    });
-    mockGetActiveTasks.mockReturnValue([task]);
-    mockIsContainerRunning.mockReturnValue(false);
-    mockHasContainerEverRun.mockReturnValue(false); // critical: never started
-
-    vi.useFakeTimers();
-    vi.setSystemTime(NOW);
-
-    await sweepTaskWatchdog();
-
-    expect(mockTransitionToTerminal).not.toHaveBeenCalledWith(
-      task.task_id,
-      'failed',
-      expect.objectContaining({ fail_reason: 'container_exit' }),
-    );
-  });
-});
 
 // ── F-5.2 — auto-archive covers completed tasks older than 24h and never failed tasks ──
 
@@ -653,67 +272,41 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
 // ── F-5.3 — the dormant module takes no action when the spawn_task capability is revoked ──
 //
 // Codex MUST-FIX (efb8350a..e1e8955f, conf 0.94, accepted): the original
-// version of this suite mocked getActiveTasks/getOrphanedTasks to bare `[]`
-// with no seeded fixture — vacuously true (empty in, no calls out, for ANY
-// implementation, dormant or not) and blind to a re-activation regression.
+// version of this suite mocked getOrphanedTasks to bare `[]` with no seeded
+// fixture — vacuously true (empty in, no calls out, for ANY implementation,
+// dormant or not) and blind to a re-activation regression.
 //
-// The real gate is upstream of both duties: `hasOrchestratorCapability`
+// The real gate is upstream of the duty: `hasOrchestratorCapability`
 // (src/modules/orchestrator-dispatch/db/agent-group-capabilities.ts), checked
-// only inside `applySpawnTask` (dispatch.ts) — neither the reconciler nor the
-// watchdog reads it themselves; `getActiveTasks`/`getOrphanedTasks` are
-// unconditional table scans. So in production the tables are empty PURELY
-// because no row was ever admitted, not because either duty checks anything.
-// `getCapabilityConfig` (the one capability-shaped read the watchdog's own
-// body actually makes — for per-task timeout defaults, not a gate) reads the
-// same `agent_group_capabilities` table `hasOrchestratorCapability` does, so
-// it is null under the exact same "no grant" condition and is the closest
-// thing to an explicit capability signal available at this level.
+// only inside `applySpawnTask` (dispatch.ts) — the reconciler does not read it
+// itself; `getOrphanedTasks` is an unconditional table scan. So in production
+// the table is empty PURELY because no row was ever admitted, not because the
+// duty checks anything.
 //
 // `capabilityGranted` below models that upstream admission gate directly: it
-// is the single switch every mock in this block reads, so "capability
-// revoked" is one explicit state, not scattered empty-array literals. Each
-// dormant case seeds a task that a LIVE watchdog/reconciler would act on
-// (timed-out progress; a completion-lease-expired orphan) and asserts every
-// downstream action seam saw zero calls. The "prove it bites" case flips the
-// switch and re-runs the SAME fixture, asserting those seams DO fire — proof
-// the dormant assertions are discriminating, not vacuous. Neither duty has
-// its own "skip"/dormant log line (there is nothing to skip — the loop body
-// just never executes), so there is no log assertion to add here; T18's own
-// internal-failure log line is already covered above.
+// is the single switch the mock in this block reads, so "capability revoked"
+// is one explicit state, not a scattered empty-array literal. The dormant case
+// seeds a completion-lease-expired orphan a LIVE reconciler would act on and
+// asserts the downstream action seam saw zero calls. The "prove it bites" case
+// flips the switch and re-runs the SAME fixture, asserting that seam DOES fire
+// — proof the dormant assertion is discriminating, not vacuous. The duty has
+// no "skip"/dormant log line of its own (there is nothing to skip — the loop
+// body just never executes), so there is no log assertion to add here.
 describe('the dormant module takes no action when the spawn_task capability is revoked', () => {
   let capabilityGranted = false;
 
-  const eligibleActiveTask = makeTask({
-    task_id: 'would-be-reaped',
-    last_progress_at: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), // 2h stale — past default 30min
-  });
   const eligibleOrphanedTask = { task_id: 'would-be-reconciled', parent_agent_group_id: 'parent-ag' };
 
   beforeEach(() => {
     vi.clearAllMocks();
     capabilityGranted = false;
-    mockGetActiveTasks.mockImplementation(() => (capabilityGranted ? [eligibleActiveTask] : []));
     mockGetOrphanedTasks.mockImplementation(() => (capabilityGranted ? [eligibleOrphanedTask] : []));
-    mockGetCapabilityConfig.mockImplementation(async () => (capabilityGranted ? { noProgressTimeoutSec: 1800 } : null));
     mockGetSession.mockReturnValue(fakeParentSession());
     mockTransitionToTerminal.mockReturnValue(true);
     mockIsContainerRunning.mockReturnValue(true);
-    mockHasContainerEverRun.mockReturnValue(true);
-    mockPendingTerminalDispatchOutboundSeenAt.mockReturnValue(null);
     mockWriteSessionMessage.mockResolvedValue(undefined);
     mockWakeContainer.mockResolvedValue(true);
     vi.mocked(completeSpawnSideEffects).mockClear();
-  });
-
-  it('the watchdog acts on nothing: getActiveTasks is empty and every action seam sees zero calls', async () => {
-    const duty = getDuty('task-watchdog');
-
-    await duty.run(fakeTickContext());
-
-    expect(mockGetActiveTasks).toHaveBeenCalled();
-    expect(mockTransitionToTerminal).not.toHaveBeenCalled();
-    expect(mockWriteSessionMessage).not.toHaveBeenCalled();
-    expect(mockWakeContainer).not.toHaveBeenCalled();
   });
 
   it('the reconciler acts on nothing: getOrphanedTasks is empty and no side effect is scheduled', async () => {
@@ -724,20 +317,6 @@ describe('the dormant module takes no action when the spawn_task capability is r
 
     expect(mockGetOrphanedTasks).toHaveBeenCalled();
     expect(completeSpawnSideEffects).not.toHaveBeenCalled();
-  });
-
-  it('PROVES IT BITES: with the capability granted, the same fixture reaps the task and notifies the parent', async () => {
-    capabilityGranted = true;
-    const duty = getDuty('task-watchdog');
-
-    await duty.run(fakeTickContext());
-
-    expect(mockTransitionToTerminal).toHaveBeenCalledWith(
-      'would-be-reaped',
-      'failed',
-      expect.objectContaining({ fail_reason: 'no_progress_timeout' }),
-    );
-    expect(mockWriteSessionMessage).toHaveBeenCalled();
   });
 
   it('PROVES IT BITES: with the capability granted, the same fixture schedules the reconciler side effect', async () => {
@@ -753,12 +332,12 @@ describe('the dormant module takes no action when the spawn_task capability is r
 
 // ── registered duty wrappers drive their underlying functions ────────────────
 //
-// F-5.1..F-5.3 above exercise the duty BODIES directly. These cases exercise
+// F-5.2..F-5.3 above exercise the duty BODIES directly. These cases exercise
 // the registered wrapper each body sits behind — obtained from the registry
 // by name, the same accessor R-7 uses in src/host-sweep-registry.test.ts —
 // proving the move preserved both the call-through and the failure contract
 // each wrapper relied on before it left host-sweep.ts. `run(ctx)` never reads
-// `ctx` for any of the three, so a minimal fake tick context stands in.
+// `ctx` for either, so a minimal fake tick context stands in.
 
 function fakeTickContext(): SweepTickContext {
   return { now: Date.now(), sessions: [], activeContainerSessionIds: new Set() } as unknown as SweepTickContext;
@@ -795,39 +374,6 @@ describe('the registered orchestrator-reconciler wrapper calls runReconcilerSwee
     });
 
     await expect(duty.run(fakeTickContext())).rejects.toThrow('reconciler boom');
-  });
-});
-
-describe('the registered task-watchdog wrapper calls sweepTaskWatchdog', () => {
-  beforeEach(() => {
-    vi.mocked(sweepTaskWatchdog).mockClear();
-    mockGetActiveTasks.mockReturnValue([]);
-  });
-
-  it('run(ctx) calls sweepTaskWatchdog with no arguments', async () => {
-    const duty = getDuty('task-watchdog');
-
-    await duty.run(fakeTickContext());
-
-    expect(sweepTaskWatchdog).toHaveBeenCalledTimes(1);
-    expect(sweepTaskWatchdog).toHaveBeenCalledWith();
-  });
-
-  it('a failure inside sweepTaskWatchdog logs the preserved string and does not reject', async () => {
-    // sweepTaskWatchdog's own top-level try/catch (task-watchdog.ts) is what
-    // the pre-move body relied on — this proves the move kept it: a failure
-    // this deep still produces 'Task watchdog: failed to load active tasks'
-    // and the wrapper still resolves, exactly as it did inside host-sweep.ts.
-    const duty = getDuty('task-watchdog');
-    const error = vi.spyOn(log, 'error').mockImplementation(() => undefined);
-    mockGetActiveTasks.mockImplementationOnce(() => {
-      throw new Error('db boom');
-    });
-
-    await expect(duty.run(fakeTickContext())).resolves.toBeUndefined();
-
-    expect(error).toHaveBeenCalledWith('Task watchdog: failed to load active tasks', expect.objectContaining({}));
-    error.mockRestore();
   });
 });
 

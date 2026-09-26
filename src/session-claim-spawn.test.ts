@@ -173,6 +173,16 @@ vi.mock('child_process', async (importOriginal) => {
   return {
     ...real,
     spawn: ((...spawnArgs: Parameters<typeof real.spawn>) => {
+      if (spawnArgs[0] === ABSENT_CONTAINER_RUNTIME_BIN) {
+        const argv = Array.isArray(spawnArgs[1]) ? (spawnArgs[1] as readonly string[]) : [];
+        const sessionDirs = new Set(
+          argv.flatMap((arg) => {
+            const match = /v2-sessions\/[^/]+\/([^/:]+)/.exec(arg);
+            return match ? [match[1]] : [];
+          }),
+        );
+        for (const sessionId of sessionDirs) hooks.events.push(`spawn:${sessionId}`);
+      }
       if (!hooks.spawnErrorsInMicrotask && !hooks.spawnHeld) return real.spawn(...spawnArgs);
       const Emitter = hooks.EventEmitter as typeof import('node:events').EventEmitter;
       const child = new Emitter() as unknown as import('child_process').ChildProcess & {
@@ -358,13 +368,11 @@ import type fs from 'fs';
 
 import {
   adoptRunningSessions,
-  hasContainerEverRun,
   isContainerRunning,
   killContainer,
   stopAllContainers,
   wakeContainer,
   _resetAdoptionStateForTesting,
-  _resetEverSeenRunningForTest,
 } from './container-runner.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -495,6 +503,11 @@ async function untilEvent(event: string): Promise<void> {
   await until(() => hooks.events.includes(event), `the spawn path never reached ${event}`);
 }
 
+/** Whether the spawn path reached `spawn()` for this session's container. */
+function containerSpawned(sessionId: string): boolean {
+  return hooks.events.includes(`spawn:${sessionId}`);
+}
+
 /** Wait for the ENOENT child's close/error to drive finalizeContainer. */
 async function waitForFinalize(sessionId: string): Promise<void> {
   await until(() => !isContainerRunning(sessionId), `the container for ${sessionId} never finalized`);
@@ -506,7 +519,6 @@ describe('claim-first spawn', () => {
   beforeEach(async () => {
     hooks.reset();
     _resetAdoptionStateForTesting();
-    _resetEverSeenRunningForTest();
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
     // A real, fully migrated central DB on disk rather than a hand-rolled
@@ -571,7 +583,7 @@ describe('claim-first spawn', () => {
 
     await expect(wakeContainer(callerSnapshot('sess-lost'))).resolves.toBe(false);
 
-    expect(hasContainerEverRun('sess-lost'), 'a container was started against a lost claim').toBe(false);
+    expect(containerSpawned('sess-lost'), 'a container was started against a lost claim').toBe(false);
     expect(wakeFailures()).toEqual([
       'Error: session sess-lost is claimed by another live host process — not spawning a duplicate',
     ]);
@@ -589,7 +601,7 @@ describe('claim-first spawn', () => {
 
     await expect(wakeContainer(callerSnapshot('sess-peer-live'))).resolves.toBe(false);
 
-    expect(hasContainerEverRun('sess-peer-live'), 'a second host started a duplicate container').toBe(false);
+    expect(containerSpawned('sess-peer-live'), 'a second host started a duplicate container').toBe(false);
     expect(liveHolderRefusals()).toEqual([{ sessionId: 'sess-peer-live', holder: 'peer-instance' }]);
     expect(wakeFailures()).toEqual([
       'Error: session sess-peer-live is claimed by another live host process — not spawning a duplicate',
@@ -618,7 +630,7 @@ describe('claim-first spawn', () => {
     // A dead claimant must never wedge a session: the CAS ran on the
     // incarnation it left behind and the container started.
     expect(hooks.events).toContain(`claim:${sessionId}:4`);
-    expect(hasContainerEverRun(sessionId), 'a dead host wedged the session').toBe(true);
+    expect(containerSpawned(sessionId), 'a dead host wedged the session').toBe(true);
     expect(liveHolderRefusals()).toEqual([]);
     await waitForFinalize(sessionId);
   });
@@ -632,7 +644,7 @@ describe('claim-first spawn', () => {
 
     await expect(wakeContainer(callerSnapshot('sess-no-lease'))).resolves.toBe(false);
 
-    expect(hasContainerEverRun('sess-no-lease'), 'a container started under an unanswerable claimant').toBe(false);
+    expect(containerSpawned('sess-no-lease'), 'a container started under an unanswerable claimant').toBe(false);
     expect(
       vi
         .mocked(log.warn)
@@ -657,7 +669,7 @@ describe('claim-first spawn', () => {
     expect(instanceId, 'the spawn path did not start a lease').not.toBeNull();
     const claim = await getSessionClaim('sess-late-lease');
     expect([claim?.incarnation, claim?.claimed_by]).toEqual([1, instanceId]);
-    expect(hasContainerEverRun('sess-late-lease')).toBe(true);
+    expect(containerSpawned('sess-late-lease')).toBe(true);
     await waitForFinalize('sess-late-lease');
   });
 
@@ -671,7 +683,7 @@ describe('claim-first spawn', () => {
 
     await expect(wakeContainer(callerSnapshot('sess-lapsed'))).resolves.toBe(false);
 
-    expect(hasContainerEverRun('sess-lapsed'), 'a container started under a dead lease').toBe(false);
+    expect(containerSpawned('sess-lapsed'), 'a container started under a dead lease').toBe(false);
     expect(
       vi
         .mocked(log.warn)
@@ -692,7 +704,7 @@ describe('claim-first spawn', () => {
     expect(hooks.events).toContain(`renew:${instanceId}`);
     const claim = await getSessionClaim('sess-relapsed');
     expect([claim?.incarnation, claim?.claimed_by]).toEqual([1, instanceId]);
-    expect(hasContainerEverRun('sess-relapsed')).toBe(true);
+    expect(containerSpawned('sess-relapsed')).toBe(true);
     await waitForFinalize('sess-relapsed');
   });
 
@@ -728,7 +740,7 @@ describe('claim-first spawn', () => {
 
     await expect(wakeContainer(callerSnapshot('sess-unwritable'))).resolves.toBe(false);
 
-    expect(hasContainerEverRun('sess-unwritable'), 'a container was started on an unrecorded claim').toBe(false);
+    expect(containerSpawned('sess-unwritable'), 'a container was started on an unrecorded claim').toBe(false);
     expect(wakeFailures()).toEqual(['Error: session_claims write failed']);
     expect(await getSessionClaim('sess-unwritable')).toBeUndefined();
   });
@@ -749,7 +761,7 @@ describe('claim-first spawn', () => {
       }),
     ).resolves.toBe(false);
 
-    expect(hasContainerEverRun('sess-guarded')).toBe(false);
+    expect(containerSpawned('sess-guarded')).toBe(false);
     expect(wakeFailures()).toEqual([
       'Error: Container spawn refused by its guard: thread was closed while this wake queued',
     ]);
@@ -761,7 +773,7 @@ describe('claim-first spawn', () => {
     await wakeContainer(callerSnapshot('sess-guarded'));
     await waitForFinalize('sess-guarded');
     expect(hooks.events).toContain('claim:sess-guarded:2');
-    expect(hasContainerEverRun('sess-guarded')).toBe(true);
+    expect(containerSpawned('sess-guarded')).toBe(true);
   });
 
   it('a late kill cancellation releases the claim', async () => {
@@ -780,7 +792,7 @@ describe('claim-first spawn', () => {
     release();
 
     await expect(wake).resolves.toBe(false);
-    expect(hasContainerEverRun('sess-cancelled')).toBe(false);
+    expect(containerSpawned('sess-cancelled')).toBe(false);
     expect(wakeFailures()).toEqual(['Error: Container spawn cancelled by a kill request: thread close']);
     const cancelled = await getSessionClaim('sess-cancelled');
     expect([cancelled?.incarnation, cancelled?.claimed_by]).toEqual([1, null]);
@@ -790,7 +802,7 @@ describe('claim-first spawn', () => {
     await seedSession('sess-exit');
 
     await wakeContainer(callerSnapshot('sess-exit'));
-    expect(hasContainerEverRun('sess-exit')).toBe(true);
+    expect(containerSpawned('sess-exit')).toBe(true);
     await waitForFinalize('sess-exit');
 
     expect(hooks.events).toContain('release:sess-exit:1');
@@ -950,7 +962,7 @@ describe('claim-first spawn', () => {
 
     await expect(wakeContainer(callerSnapshot('sess-survivor'))).resolves.toBe(false);
 
-    expect(hasContainerEverRun('sess-survivor'), 'a second container was started beside the survivor').toBe(false);
+    expect(containerSpawned('sess-survivor'), 'a second container was started beside the survivor').toBe(false);
     expect(hooks.events.filter((event) => event.startsWith('claim:sess-survivor:'))).toEqual([]);
     expect(
       vi
@@ -994,7 +1006,7 @@ describe('claim-first spawn', () => {
     await expect(wakeContainer(callerSnapshot('sess-unprovable'))).resolves.toBe(false);
 
     // Fails CLOSED: "cannot prove absence" never reads as "absent".
-    expect(hasContainerEverRun('sess-unprovable')).toBe(false);
+    expect(containerSpawned('sess-unprovable')).toBe(false);
     expect(hooks.runtimeCalls).toBe(1);
     expect(
       vi
@@ -1065,7 +1077,7 @@ describe('claim-first spawn', () => {
     release();
 
     await expect(wake).resolves.toBe(false);
-    expect(hasContainerEverRun('sess-shutdown')).toBe(false);
+    expect(containerSpawned('sess-shutdown')).toBe(false);
     expect(wakeFailures()).toEqual(['Error: Container spawn cancelled because host shutdown is in progress']);
     const cancelled = await getSessionClaim('sess-shutdown');
     expect([cancelled?.incarnation, cancelled?.claimed_by]).toEqual([1, null]);

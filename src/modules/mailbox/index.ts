@@ -16,7 +16,7 @@ import {
   type TaskDispatchResult,
 } from './ops/task-dispatch.js';
 import { readTaskSettlement, type TaskSettlement } from './ops/task-settlement.js';
-export { dispatchSeriesId, dispatchEventId, validateDispatchKey } from './ops/task-dispatch.js';
+export { dispatchSeriesId, validateDispatchKey } from './ops/task-dispatch.js';
 
 import { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 import { SqliteAgentMailbox, wrapSqliteInbound, wrapSqliteOutbound } from '../../mailbox/sqlite/index.js';
@@ -208,38 +208,13 @@ import {
 } from './ops/recovery.js';
 
 export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
-export { parseSqliteUtc } from './sqlite-utc.js';
-export {
-  canAttemptContinuationRecovery,
-  isContinuationParked,
-  readWorkContinuation,
-  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-  WORK_CONTINUATION_TASK_MAX_CHARS,
-  type HostWorkContinuation,
-} from './ops/continuation.js';
-export { writeOutboundDirectRow } from './ops/recovery.js';
-export type { DirectOutboundRow, InboundMessageRouting, OutboundChatRow } from './ops/recovery.js';
-export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
-export { readRepoIngressFence } from './ops/fence.js';
-export {
-  hasMatchingBootstrapRecall,
-  listOpenChatContents,
-  listRecentRecallRows,
-  readProviderRecallState,
-  type ProviderRecallState,
-} from './ops/recall.js';
-export { nextEvenSeq, type DestinationRow, type MessageInsert } from './ops/ingress.js';
-export {
-  cancelAllTasks,
-  cancelTask,
-  clearRecurrence,
-  deleteTask,
-  pauseTask,
-  trailingFailedRuns,
-} from '../../mailbox/sqlite/tasks.js';
+export { isContinuationParked, type HostWorkContinuation } from './ops/continuation.js';
+export { type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
+export { type ProviderRecallState } from './ops/recall.js';
+export { type DestinationRow, type MessageInsert } from './ops/ingress.js';
+export { cancelTask, pauseTask } from '../../mailbox/sqlite/tasks.js';
 export {
   cancelSeriesWithStrandClear,
-  cancelTaskRow,
   getCompletedRecurring,
   insertRecurrence,
   insertTaskRow,
@@ -247,23 +222,14 @@ export {
   resumeTask,
   updateTask,
   type CliTaskRow,
-  type CreatedTaskRow,
-  type HostGatedTaskRow,
   type RecurringMessage,
-  type TaskRowInsert,
   type TaskRowSnapshot,
-  type TaskSeriesCollision,
-  type TaskSeriesSnapshot,
   type TaskUpdate,
-  type UpsertedTaskSeries,
 } from './ops/tasks.js';
-export type { DueAdmissionRow, PendingUpgradeRow } from './ops/admission.js';
 export {
   CLOSE_REASON_MAX_CHARS,
   clearWorkContinuation,
-  readContinuationPresence,
   readDoneProposal,
-  type ContinuationPresence,
   type DoneProposal,
 } from './ops/session-state.js';
 
@@ -288,9 +254,7 @@ export {
   hostInboundDbPathFor,
   hostInboundDirFor,
   hostInboundMounts,
-  inboundDbIsHostOwned,
   migrateInboundDbToHostDir,
-  removeForeignInboundSidecars,
   resolveInboundDbPath,
 } from './host-inbound.js';
 
@@ -300,24 +264,9 @@ export {
  * write a session it is only listing — see read-only.ts for why `session()` is
  * the wrong funnel there.
  */
-export {
-  readSessionInbound,
-  readSessionOutbound,
-  type InboundSessionRead,
-  type OutboundSessionRead,
-  type SessionReadLocation,
-  type SessionReadOptions,
-} from './read-only.js';
-export type {
-  MessageTailRow,
-  OutboundSystemRow,
-  ScheduledTaskRow,
-  SessionTurnUsageRow,
-  TaskDeliveryRoute,
-  TaskFireRow,
-  TaskRoutingStamp,
-} from './ops/reads.js';
-export type { ContainerState, OverdueRecurringRow, ProcessingClaim } from './ops/sweep.js';
+export { readSessionInbound, readSessionOutbound, type SessionReadLocation } from './read-only.js';
+export type { MessageTailRow, ScheduledTaskRow, TaskFireRow } from './ops/reads.js';
+export type { ContainerState } from './ops/sweep.js';
 
 /**
  * `(mtime, size)` of a session's outbound.db for the delivery sweep's quiet
@@ -352,10 +301,10 @@ function sqliteTimestamp(value: string): string {
  * A superset of both, so it stays assignable to upstream's `ContainerState`
  * while the fork's sweep keeps reading the snake_case columns.
  */
-export interface NanoclawContainerState extends UpstreamContainerState, ForkContainerState {}
+interface NanoclawContainerState extends UpstreamContainerState, ForkContainerState {}
 
 /** Insert shapes the fork accepts: its own, or upstream's `InboundWrite`. */
-export type NanoclawInboundInsert = MessageInsert | InboundMessage;
+type NanoclawInboundInsert = MessageInsert | InboundMessage;
 
 /**
  * The mailbox session the fork's actions receive.
@@ -666,7 +615,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
  * they join this vocabulary, the union belongs in ONE of these two types,
  * not in a third.
  */
-export type NanoclawOutboundRead = Pick<
+type NanoclawOutboundRead = Pick<
   NanoclawMailboxSession,
   | 'getContainerState'
   | 'getProcessingClaimRows'
@@ -917,7 +866,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
  * inside a mailbox session. The outbound-keyed funnel always passes true — it
  * has already established the file is there.
  */
-export function composeOutboundOps(
+function composeOutboundOps(
   readableOutbound: () => Database.Database,
   writableOutbound: () => Database.Database,
   outboundPresent: boolean,
