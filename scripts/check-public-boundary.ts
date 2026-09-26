@@ -365,36 +365,61 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
   return identifiers;
 }
 
-export interface RemoteRepository {
-  host: string;
-  owner: string;
-  repo: string;
+export type ParsedRemote =
+  | { kind: 'network'; host: string; namespaces: string[]; repo: string; key: string }
+  | { kind: 'local' }
+  | { kind: 'unsupported' };
+
+const NETWORK_SCHEMES = /^(?:https?|ssh|git|git\+ssh|ssh\+git):$/;
+
+function pathSegments(remotePath: string): string[] {
+  const segments = remotePath.split('/').filter(Boolean);
+  const last = segments.pop()?.replace(/\.git$/, '');
+  return last ? [...segments, last] : segments;
 }
 
-/** Host, owner and repository from a clone URL (https, ssh://, or scp-style); null for anything else. */
-export function remoteOwnerRepo(url: string): RemoteRepository | null {
+/**
+ * What a remote URL names, as git would reach it. A network remote yields its
+ * host[:port], every namespace segment, the repository, and an exact identity
+ * key (case-folded only on github.com, whose paths are case-insensitive). A
+ * local path or file:// URL is local. Any other form (a remote helper, an
+ * unknown scheme, a malformed escape, no path) is unsupported: what it names
+ * is unknown.
+ */
+export function parseRemote(url: string): ParsedRemote {
   const trimmed = url.trim();
+  if (/^[A-Za-z][A-Za-z0-9+.-]*::/.test(trimmed)) return { kind: 'unsupported' };
   let host: string;
-  let remotePath: string;
-  // git's scp-like form is `[user@]host:path`, recognized only with no slash before the first colon.
-  const scpStyle = /^(?:[^/@\s]+@)?([^:/\s]+):(?!\/\/)(.+)$/.exec(trimmed);
-  if (scpStyle) {
-    host = scpStyle[1];
-    remotePath = scpStyle[2];
-  } else {
-    if (!URL.canParse(trimmed)) return null;
+  let segments: string[];
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(trimmed)) {
+    if (!URL.canParse(trimmed)) return { kind: 'unsupported' };
     const parsed = new URL(trimmed);
-    if (!/^(?:https?|ssh|git):$/.test(parsed.protocol)) return null;
-    host = parsed.hostname;
-    remotePath = parsed.pathname;
+    if (parsed.protocol === 'file:') return { kind: 'local' };
+    if (!NETWORK_SCHEMES.test(parsed.protocol)) return { kind: 'unsupported' };
+    const decoded = readSource(() => parsed.pathname.split('/').map((segment) => decodeURIComponent(segment)));
+    if (!decoded.ok) return { kind: 'unsupported' };
+    host = parsed.hostname.toLowerCase() + (parsed.port ? `:${parsed.port}` : '');
+    segments = pathSegments(decoded.value.join('/'));
+  } else {
+    // git reads a path with no colon, or a slash before the first colon, as local.
+    const colon = trimmed.indexOf(':');
+    const slash = trimmed.indexOf('/');
+    if (colon < 0 || (slash >= 0 && slash < colon)) return { kind: 'local' };
+    const scpStyle = /^(?:[^/@\s]+@)?([^:/\s]+):(.*)$/.exec(trimmed);
+    if (!scpStyle) return { kind: 'unsupported' };
+    host = scpStyle[1].toLowerCase();
+    segments = pathSegments(scpStyle[2]);
   }
-  const segments = remotePath
-    .replace(/\/+$/, '')
-    .replace(/\.git$/, '')
-    .split('/')
-    .filter(Boolean);
-  if (segments.length < 2) return null;
-  return { host: host.toLowerCase(), owner: segments[segments.length - 2], repo: segments[segments.length - 1] };
+  const repo = segments.at(-1);
+  if (!repo) return { kind: 'unsupported' };
+  const repoPath = segments.join('/');
+  return {
+    kind: 'network',
+    host,
+    namespaces: segments.slice(0, -1),
+    repo,
+    key: `${host}/${host === 'github.com' ? repoPath.toLowerCase() : repoPath}`,
+  };
 }
 
 // A hook exports its own repository's GIT_DIR and friends; left in place they
@@ -417,12 +442,8 @@ function remoteUrl(dir: string, name: string, env: NodeJS.ProcessEnv): RemoteUrl
   return result.status === 2 ? { kind: 'absent' } : { kind: 'unreadable' };
 }
 
-function repositoryKey(remote: RemoteRepository): string {
-  return `${remote.host}/${remote.owner}/${remote.repo}`.toLowerCase();
-}
-
 export interface PublicRemotes {
-  /** Owners of the scanned and install checkouts' remotes: their names appear in public URLs. */
+  /** Namespaces (owners) of the scanned and install checkouts' remotes: their names appear in public URLs. */
   owners: Set<string>;
   /** Exactly those remotes. Another repository under the same owner may be private. */
   repositories: Set<string>;
@@ -438,10 +459,10 @@ export function publicRemotes(roots: string[]): PublicRemotes {
     if (names.status !== 0) continue;
     for (const name of names.stdout.split('\n').filter(Boolean)) {
       const lookup = remoteUrl(root, name, env);
-      const parsed = lookup.kind === 'url' ? remoteOwnerRepo(lookup.url) : null;
-      if (!parsed) continue;
-      remotes.owners.add(parsed.owner.toLowerCase());
-      remotes.repositories.add(repositoryKey(parsed));
+      const parsed = lookup.kind === 'url' ? parseRemote(lookup.url) : null;
+      if (parsed?.kind !== 'network') continue;
+      for (const namespace of parsed.namespaces) remotes.owners.add(namespace.toLowerCase());
+      remotes.repositories.add(parsed.key);
     }
   }
   return remotes;
@@ -512,13 +533,16 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
     const config = readSource(() => {
       const parsed = JSON.parse(fs.readFileSync(path.join(groupsDir, folder, 'container.json'), 'utf8')) as unknown;
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a config object');
-      return parsed as Record<string, unknown>;
+      const persona = (parsed as Record<string, unknown>).assistantName;
+      if (persona !== undefined && (typeof persona !== 'string' || !persona.trim()))
+        throw new Error('assistantName is not a non-empty string');
+      return persona;
     });
     if (!config.ok) {
       if (!config.absent) problems.push('a group container.json could not be read or parsed');
       continue;
     }
-    addIdentifier(identifiers, config.value.assistantName);
+    addIdentifier(identifiers, config.value);
   }
 
   const repositoriesDir = path.join(installRoot, 'data', 'repositories');
@@ -540,15 +564,21 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
         problems.push('a cloned repository configuration could not be read');
         continue;
       }
-      const parsed = origin.kind === 'url' ? remoteOwnerRepo(origin.url) : null;
-      // A local-only canonical (no origin, or one naming no owner/repo) is
-      // still named by its canonical directory.
-      if (!parsed) {
+      const parsed = origin.kind === 'url' ? parseRemote(origin.url) : null;
+      if (parsed?.kind === 'unsupported') {
+        problems.push('a cloned repository origin could not be interpreted');
+        continue;
+      }
+      // A local-only canonical (no origin, or a local one) is named by its canonical directory.
+      if (parsed?.kind !== 'network') {
         if (!isGenericRepositoryName(name)) addIdentifier(identifiers, name);
         continue;
       }
-      if (!remotes.owners.has(parsed.owner.toLowerCase())) addIdentifier(identifiers, parsed.owner);
-      if (!remotes.repositories.has(repositoryKey(parsed)) && !isGenericRepositoryName(parsed.repo))
+      for (const namespace of parsed.namespaces) {
+        if (!remotes.owners.has(namespace.toLowerCase()) && !isGenericRepositoryName(namespace))
+          addIdentifier(identifiers, namespace);
+      }
+      if (!remotes.repositories.has(parsed.key) && !isGenericRepositoryName(parsed.repo))
         addIdentifier(identifiers, parsed.repo);
     }
   }
@@ -878,20 +908,39 @@ function readBlob(root: string, objectId: string, env: NodeJS.ProcessEnv): strin
 }
 
 // Same environment as trackedInputs: a partial commit's temporary index is
-// what will be committed, so the baseline must come from it too.
+// what will be committed, so the baseline must come from it too. Pathspecs are
+// literal and case-sensitive, and only the exact path, as a regular file at
+// stage 0, is policy: a directory, a symlink, or another spelling grants nothing.
 function readIndexBaseline(root: string): string | null {
-  const listed = runGit(['ls-files', '--stage', '--', DEFAULT_BASELINE_RELATIVE], root, process.env);
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_LITERAL_PATHSPECS: '1' };
+  delete env.GIT_ICASE_PATHSPECS;
+  delete env.GIT_GLOB_PATHSPECS;
+  delete env.GIT_NOGLOB_PATHSPECS;
+  const listed = runGit(['ls-files', '-z', '--stage', '--', DEFAULT_BASELINE_RELATIVE], root, env);
   if (listed.status !== 0) throw new Error('public boundary baseline could not be read from the index');
-  const objectId = /^\d+ ([0-9a-f]+) 0\t/m.exec(listed.stdout)?.[1];
-  return objectId ? readBlob(root, objectId, process.env) : null;
+  const entry = listed.stdout
+    .split('\0')
+    .map((line) => /^(\d+) ([0-9a-f]+) (\d)\t(.*)$/s.exec(line))
+    .find((match) => match?.[4] === DEFAULT_BASELINE_RELATIVE);
+  if (!entry) return null;
+  if (entry[1] !== '100644' || entry[3] !== '0')
+    throw new Error('public boundary baseline is not a regular file in the index');
+  return readBlob(root, entry[2], env);
 }
 
 function readWorktreeBaseline(root: string): string | null {
+  let fd: number;
   try {
-    return fs.readFileSync(path.join(root, DEFAULT_BASELINE_RELATIVE), 'utf8');
+    fd = fs.openSync(path.join(root, DEFAULT_BASELINE_RELATIVE), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   } catch (err) {
     if (errorCode(err) === 'ENOENT') return null;
-    throw new Error('public boundary baseline is unreadable', { cause: err });
+    throw new Error('public boundary baseline is unreadable or a symlink', { cause: err });
+  }
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('public boundary baseline is not a regular file');
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -1131,7 +1180,7 @@ export function writeBaseline(options: ScanOptions): { written: string; refused:
   }
   const target = options.baselinePath ?? path.join(options.root, DEFAULT_BASELINE_RELATIVE);
   const recorded = loadBaseline(options)?.files ?? {};
-  const next: Record<string, number> = {};
+  const next: Record<string, number> = Object.create(null) as Record<string, number>;
   const refused: string[] = [];
   for (const [file, count] of Object.entries(report.baseline.counts)) {
     const previous = Object.hasOwn(recorded, file) ? recorded[file] : 0;

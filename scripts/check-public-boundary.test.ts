@@ -14,7 +14,7 @@ import {
   main,
   parseBaseline,
   publicRemotes,
-  remoteOwnerRepo,
+  parseRemote,
   resolveOptions,
   run,
   runReport,
@@ -683,36 +683,52 @@ describe('identifiers derived from the install', () => {
     execFileSync('git', ['remote', 'add', 'origin', url], { cwd: repo });
   }
 
-  it('parses host, owner and repository from https, ssh and scp-style remotes', () => {
-    expect(remoteOwnerRepo('https://github.com/acme-co/WIDGET.git')).toEqual({
-      host: 'github.com',
-      owner: 'acme-co',
-      repo: 'WIDGET',
+  it('parses network remotes into host, every namespace, repository and an exact identity key', () => {
+    const net = (host: string, namespaces: string[], repo: string, key: string) => ({
+      kind: 'network',
+      host,
+      namespaces,
+      repo,
+      key,
     });
-    expect(remoteOwnerRepo('https://x-access-token:secret@Example.com/acme-co/widget/')).toEqual({
-      host: 'example.com',
-      owner: 'acme-co',
-      repo: 'widget',
-    });
-    expect(remoteOwnerRepo('git@github.com:acme-co/widget.git')).toEqual({
-      host: 'github.com',
-      owner: 'acme-co',
-      repo: 'widget',
-    });
-    expect(remoteOwnerRepo('ssh://git@ssh.github.com:443/acme-co/widget.git')).toEqual({
-      host: 'ssh.github.com',
-      owner: 'acme-co',
-      repo: 'widget',
-    });
-    expect(remoteOwnerRepo('github.com:acme-co/widget.git')).toEqual({
-      host: 'github.com',
-      owner: 'acme-co',
-      repo: 'widget',
-    });
-    expect(remoteOwnerRepo('./mirrors:acme-co/widget.git')).toBeNull();
-    expect(remoteOwnerRepo('/srv/mirrors/widget.git')).toBeNull();
-    expect(remoteOwnerRepo('file:///srv/acme-co/widget.git')).toBeNull();
-    expect(remoteOwnerRepo('https://github.com/solo')).toBeNull();
+    expect(parseRemote('https://github.com/acme-co/WIDGET.git')).toEqual(
+      net('github.com', ['acme-co'], 'WIDGET', 'github.com/acme-co/widget'),
+    );
+    expect(parseRemote('https://x-access-token:secret@Example.com/acme-co/widget/')).toEqual(
+      net('example.com', ['acme-co'], 'widget', 'example.com/acme-co/widget'),
+    );
+    expect(parseRemote('git@github.com:acme-co/widget.git')).toEqual(
+      net('github.com', ['acme-co'], 'widget', 'github.com/acme-co/widget'),
+    );
+    expect(parseRemote('github.com:acme-co/widget.git')).toEqual(
+      net('github.com', ['acme-co'], 'widget', 'github.com/acme-co/widget'),
+    );
+    expect(parseRemote('ssh://git@ssh.github.com:443/acme-co/widget.git')).toEqual(
+      net('ssh.github.com:443', ['acme-co'], 'widget', 'ssh.github.com:443/acme-co/widget'),
+    );
+    expect(parseRemote('https://git.example.com:8443/Acme-Co/Team/Widget.git')).toEqual(
+      net('git.example.com:8443', ['Acme-Co', 'Team'], 'Widget', 'git.example.com:8443/Acme-Co/Team/Widget'),
+    );
+    expect(parseRemote('https://github.com/acme%2Dco/WID%47ET.git')).toEqual(
+      net('github.com', ['acme-co'], 'WIDGET', 'github.com/acme-co/widget'),
+    );
+    expect(parseRemote('https://github.com/solo')).toEqual(net('github.com', [], 'solo', 'github.com/solo'));
+  });
+
+  it('classifies local paths as local and every other form as unsupported', () => {
+    for (const local of ['./mirrors:acme-co/widget.git', '/srv/mirrors/widget.git', 'file:///srv/acme-co/widget.git']) {
+      expect(parseRemote(local)).toEqual({ kind: 'local' });
+    }
+    for (const unsupported of [
+      'https://github.com/acme%zzco/widget.git',
+      'https://github.com/acme-co/wid%FFget.git',
+      'hg::https://example.com/acme-co/widget',
+      'sso://example.com/acme-co/widget',
+      'https://github.com/',
+      'github.com:',
+    ]) {
+      expect(parseRemote(unsupported)).toEqual({ kind: 'unsupported' });
+    }
   });
 
   it('reads persona names from the container_configs projection', () => {
@@ -863,6 +879,56 @@ describe('identifiers derived from the install', () => {
       new Set(['acme-co', 'GADGET', 'other-co', 'SPROCKET']),
     );
     expect(problems).toEqual([]);
+  });
+
+  it('derives every namespace of a nested origin and exempts only the exact public identity', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    addCanonical(dataDir, 'wg-fictional', 'nested', 'https://git.example.com:8443/acme-co/team-x/Widget.git');
+    addCanonical(dataDir, 'wg-fictional', 'encoded', 'https://github.com/zeta%2Dcorp/GAD%47ET.git');
+    const exempt = {
+      owners: new Set<string>(),
+      repositories: new Set(['git.example.com/acme-co/team-x/widget', 'git.example.com:8443/acme-co/team-x/widget']),
+    };
+    const problems: string[] = [];
+    expect(loadInstallIdentifiers(dbPath, exempt, problems)).toEqual(
+      new Set(['acme-co', 'team-x', 'Widget', 'zeta-corp', 'GADGET']),
+    );
+    expect(problems).toEqual([]);
+  });
+
+  it('records a clone whose origin form cannot be interpreted', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    addCanonical(dataDir, 'wg-fictional', 'SecretHelper', 'hg::https://example.com/acme-co/widget');
+    addCanonical(dataDir, 'wg-fictional', 'SecretEscape', 'https://github.com/acme%zzco/widget.git');
+    const problems: string[] = [];
+    expect(loadInstallIdentifiers(dbPath, publicProject, problems)).toEqual(new Set());
+    expect(problems).toEqual([
+      'a cloned repository origin could not be interpreted',
+      'a cloned repository origin could not be interpreted',
+    ]);
+  });
+
+  it('records a present persona field that is not a non-empty string', () => {
+    const installRoot = tempRoot();
+    const dbPath = writeRegistry(path.join(installRoot, 'data'));
+    for (const [folder, config] of [
+      ['listed', '{"assistantName":["Vega"]}'],
+      ['blank', '{"assistantName":"  "}'],
+      ['nulled', '{"assistantName":null}'],
+      ['unnamed', '{"provider":"claude"}'],
+    ]) {
+      fs.mkdirSync(path.join(installRoot, 'groups', folder), { recursive: true });
+      fs.writeFileSync(path.join(installRoot, 'groups', folder, 'container.json'), config);
+    }
+    const problems: string[] = [];
+    expect(loadInstallIdentifiers(dbPath, publicProject, problems)).toEqual(new Set());
+    expect(problems).toEqual([
+      'a group container.json could not be read or parsed',
+      'a group container.json could not be read or parsed',
+      'a group container.json could not be read or parsed',
+    ]);
   });
 
   it('records a clone whose .git is a pointer file rather than a directory', () => {
@@ -1108,6 +1174,48 @@ describe('baseline ratchet', () => {
     fs.rmSync(path.join(root, '.public-boundary-baseline.json'));
     expect(run(resolveOptions(['--root', root, '--index'], root))).toHaveLength(2);
     expect(run(resolveOptions(['--root', root], root))).toHaveLength(2);
+  });
+
+  it('takes the index baseline only from the exact path as a regular file', () => {
+    const root = baselineRepo();
+    execFileSync('git', ['rm', '-q', '--cached', '.public-boundary-baseline.json'], { cwd: root });
+    fs.rmSync(path.join(root, '.public-boundary-baseline.json'));
+    fs.mkdirSync(path.join(root, '.public-boundary-baseline.json'));
+    fs.writeFileSync(path.join(root, '.public-boundary-baseline.json', 'payload.json'), '{"files":{"old.md":2}}\n');
+    execFileSync('git', ['add', '.public-boundary-baseline.json/payload.json'], { cwd: root });
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toHaveLength(2);
+    expect(() => run(resolveOptions(['--root', root], root))).toThrow('not a regular file');
+
+    execFileSync('git', ['rm', '-q', '-r', '--cached', '.public-boundary-baseline.json'], { cwd: root });
+    fs.writeFileSync(path.join(root, '.PUBLIC-BOUNDARY-BASELINE.JSON'), '{"files":{"old.md":2}}\n');
+    execFileSync('git', ['add', '.PUBLIC-BOUNDARY-BASELINE.JSON'], { cwd: root });
+    vi.stubEnv('GIT_ICASE_PATHSPECS', '1');
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toHaveLength(2);
+    vi.unstubAllEnvs();
+  });
+
+  it('refuses a baseline that is a symlink, in the index or the worktree', () => {
+    const root = baselineRepo();
+    const target = path.join(tempRoot(), 'elsewhere.json');
+    fs.writeFileSync(target, '{"files":{"old.md":2}}\n');
+    execFileSync('git', ['rm', '-q', '--cached', '.public-boundary-baseline.json'], { cwd: root });
+    fs.rmSync(path.join(root, '.public-boundary-baseline.json'));
+    fs.symlinkSync(target, path.join(root, '.public-boundary-baseline.json'));
+    execFileSync('git', ['add', '.public-boundary-baseline.json'], { cwd: root });
+    expect(() => run(resolveOptions(['--root', root, '--index'], root))).toThrow('not a regular file in the index');
+    expect(() => run(resolveOptions(['--root', root], root))).toThrow('a symlink');
+  });
+
+  it('keeps a baseline entry for a file named like an Object.prototype key', () => {
+    const root = baselineRepo();
+    fs.writeFileSync(path.join(root, '__proto__'), 'Fictional Local Team\n');
+    execFileSync('git', ['add', '__proto__'], { cwd: root });
+    writeBaseline(resolveOptions(['--root', root, '--write-baseline', '--accept-growth'], root));
+    const written = JSON.parse(fs.readFileSync(path.join(root, '.public-boundary-baseline.json'), 'utf8')) as {
+      files: Record<string, number>;
+    };
+    expect(Object.hasOwn(written.files, '__proto__')).toBe(true);
+    expect(written.files.__proto__).toBe(1);
   });
 
   it('fails rather than reading a baseline it cannot load as absent', () => {
