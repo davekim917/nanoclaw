@@ -174,6 +174,7 @@ fire
 rm "$OUT/journal.ndjson"
 fire
 [ "$(d .controllerError)" = controller_journal_error ] || fail "missing journal must surface as the controller's journal error: $DATA"
+[ "$KIND" = blocked ] || fail "a controller error is blocked, not an input failure: $KIND"
 [ ! -e "$OUT/journal.ndjson" ] || fail "the wrapper must not re-init a lost journal"
 
 # --- new claim: synthesized wake, heads fetched, decisions written -----------

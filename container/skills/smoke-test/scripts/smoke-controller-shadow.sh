@@ -109,8 +109,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The line declares an observation through the task-observation helper (W2),
 # bound 30m (three */10 fires): a fire that stepped, found the kill switch off
 # or yielded to another fire is empty; one that could not read its inputs is
-# unreadable; any other skip is blocked, so a shadow that keeps failing reaches
-# the operator. The helper failing still prints the bare line.
+# unreadable; a controller error or any other skip is blocked, so a shadow
+# that keeps failing reaches the operator. The helper failing still prints the
+# bare line.
 OBS_HELPER="${SMOKE_OBSERVATION_HELPER:-$SCRIPT_DIR/../../task-observation/task_observation.py}"
 final() { # <data-json> -- the only write to the runner's stdout
   local data="${1:-}" kind line
@@ -118,8 +119,8 @@ final() { # <data-json> -- the only write to the runner's stdout
     data="$(jq -cn --arg e "fire summary missing or not JSON" '{error:$e}' 2>/dev/null)" || data='{}'
   fi
   kind="$(jq -r '
-    if has("error") or (.inputErrors // 0) > 0
-       or ((.skipped // "") | test("unreadable|fetch failed")) then "unreadable"
+    if (.inputErrors // 0) > 0 or ((.skipped // "") | test("unreadable|fetch failed")) then "unreadable"
+    elif has("error") or has("controllerError") then "blocked"
     elif (.skipped // null) == null or .skipped == "another shadow fire holds wrapper.lock" then "empty"
     else "blocked" end' <<<"$data" 2>/dev/null)" || kind=""
   if [ -n "$kind" ] && line="$(python3 "$OBS_HELPER" --kind "$kind" --bound 30m --data "$data" \
