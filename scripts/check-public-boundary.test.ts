@@ -771,6 +771,8 @@ describe('identifiers derived from the install', () => {
     const dbPath = writeRegistry(dataDir);
     fs.mkdirSync(path.join(installRoot, 'groups', 'broken'), { recursive: true });
     fs.writeFileSync(path.join(installRoot, 'groups', 'broken', 'container.json'), '{not json');
+    fs.mkdirSync(path.join(installRoot, 'groups', 'not-an-object'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'groups', 'not-an-object', 'container.json'), 'null');
     fs.mkdirSync(path.join(installRoot, 'groups', 'locked'), { recursive: true });
     fs.writeFileSync(path.join(installRoot, 'groups', 'locked', 'container.json'), '{"assistantName":"Vega"}');
     fs.chmodSync(path.join(installRoot, 'groups', 'locked', 'container.json'), 0o000);
@@ -782,6 +784,7 @@ describe('identifiers derived from the install', () => {
     expect(values).toEqual(new Set());
     expect(problems.sort()).toEqual([
       'a cloned repository configuration could not be read',
+      'a group container.json could not be read or parsed',
       'a group container.json could not be read or parsed',
       'a group container.json could not be read or parsed',
     ]);
@@ -802,6 +805,53 @@ describe('identifiers derived from the install', () => {
     fs.writeFileSync(message, 'release notes\n');
     expect(main(['--root', root, '--message', message, '--message-raw'])).toBe(1);
     expect(main(['--root', root])).toBe(0);
+  });
+
+  it('refuses every gate when a clone config cannot be read, though its directories can', () => {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    addCanonical(path.join(root, 'data'), 'main-house', 'WIDGET', 'https://github.com/acme-co/WIDGET.git');
+    fs.chmodSync(path.join(root, 'data', 'repositories', 'main-house', 'WIDGET', '.git', 'config'), 0o000);
+    const baselineFile = path.join(root, '.public-boundary-baseline.json');
+    fs.writeFileSync(baselineFile, '{"files":{"old.md":2}}\n');
+    const message = path.join(root, 'MSG');
+    fs.writeFileSync(message, 'release notes\n');
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    expect(runReport(resolveOptions(['--root', root, '--index'], root)).discoveryProblems).toEqual([
+      'a cloned repository configuration could not be read',
+    ]);
+    expect(main(['--root', root, '--index'])).toBe(1);
+    expect(main(['--root', root, '--message', message])).toBe(1);
+    expect(main(['--root', root, '--message', message, '--message-raw'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain('require every install identifier source to be readable');
+    expect(() => writeBaseline(resolveOptions(['--root', root, '--write-baseline'], root))).toThrow(
+      'requires every install identifier source',
+    );
+    expect(fs.readFileSync(baselineFile, 'utf8')).toBe('{"files":{"old.md":2}}\n');
+  });
+
+  it('records a clone whose .git is a pointer file rather than a directory', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    const clone = path.join(dataDir, 'repositories', 'wg-fictional', 'WIDGET');
+    fs.mkdirSync(clone, { recursive: true });
+    fs.writeFileSync(path.join(clone, '.git'), 'gitdir: /srv/elsewhere/WIDGET.git\n');
+    const problems: string[] = [];
+    expect(loadInstallIdentifiers(dbPath, publicProject, problems)).toEqual(new Set());
+    expect(problems).toEqual(['a cloned repository configuration could not be read']);
+  });
+
+  it('treats a missing registry table as absent but any other query failure as unreadable', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    expect(loadRegistryIdentifiers(dbPath).has('Nova')).toBe(true);
+    const db = new Database(dbPath);
+    db.exec(
+      "CREATE VIEW messaging_groups AS SELECT abs(1 << 63) AS id, 'p' AS platform_id, 'i' AS instance, 'n' AS name",
+    );
+    db.close();
+    expect(() => loadRegistryIdentifiers(dbPath)).toThrow('install registry is unreadable');
   });
 
   it('records a clone whose directory cannot be traversed', () => {

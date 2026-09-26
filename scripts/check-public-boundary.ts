@@ -349,13 +349,12 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
   ];
   try {
     for (const query of queries) {
-      let rows: Record<string, unknown>[];
-      try {
-        rows = db.prepare(query).all() as Record<string, unknown>[];
-      } catch {
-        continue;
+      const rows = readSource(() => db.prepare(query).all() as Record<string, unknown>[], isMissingSchema);
+      if (!rows.ok) {
+        if (rows.absent) continue;
+        throw new Error('install registry is unreadable');
       }
-      for (const row of rows) {
+      for (const row of rows.value) {
         for (const value of Object.values(row)) addIdentifier(identifiers, value);
       }
     }
@@ -408,19 +407,27 @@ function repositoryNeutralEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * `git config` lines, or null when the lookup failed for a reason other than
- * "no such key" (exit 1): an unreadable or malformed config.
+ * Every `key=value` entry of a git config, or a thrown Error when git cannot
+ * list it. `--list` exits non-zero only for a config it cannot read or parse;
+ * `--get` exits 1 both for a missing key and for an unreadable file.
  */
-function gitConfigLines(args: string[], cwd: string): string[] | null {
-  const result = spawnSync('git', ['config', ...args], {
+function gitConfigList(source: string[], cwd: string): string[] {
+  const result = spawnSync('git', ['config', ...source, '--list'], {
     cwd,
     env: repositoryNeutralEnv(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
   });
-  if (result.status === 1) return [];
-  if (result.status !== 0 || typeof result.stdout !== 'string') return null;
+  if (result.status !== 0 || typeof result.stdout !== 'string') throw new Error('git config could not be listed');
   return result.stdout.split('\n').filter(Boolean);
+}
+
+/** Values of the config entries whose key matches, in file order. */
+function configValues(entries: string[], key: RegExp): string[] {
+  return entries.flatMap((entry) => {
+    const at = entry.indexOf('=');
+    return at > 0 && key.test(entry.slice(0, at)) ? [entry.slice(at + 1)] : [];
+  });
 }
 
 function repositoryKey(remote: RemoteRepository): string {
@@ -439,11 +446,10 @@ export interface PublicRemotes {
 export function publicRemotes(roots: string[]): PublicRemotes {
   const remotes: PublicRemotes = { owners: new Set(), repositories: new Set() };
   for (const root of roots) {
-    if (!fs.existsSync(root)) continue;
-    const lines = gitConfigLines(['--local', '--get-regexp', '^remote\\..*\\.url$'], root);
-    if (lines === null) continue;
-    for (const line of lines) {
-      const parsed = remoteOwnerRepo(line.replace(/^\S+\s+/, ''));
+    const entries = readSource(() => gitConfigList(['--local'], root));
+    if (!entries.ok) continue;
+    for (const url of configValues(entries.value, /^remote\..+\.url$/)) {
+      const parsed = remoteOwnerRepo(url);
       if (!parsed) continue;
       remotes.owners.add(parsed.owner.toLowerCase());
       remotes.repositories.add(repositoryKey(parsed));
@@ -473,13 +479,23 @@ function errorCode(err: unknown): string | undefined {
 
 type SourceRead<T> = { ok: true; value: T } | { ok: false; absent: boolean };
 
-// Absent is fine: an install need not have groups or clones. Any other
-// failure means a source exists but its names are unknown.
-function readSource<T>(read: () => T): SourceRead<T> {
+function isMissingPath(err: unknown): boolean {
+  return errorCode(err) === 'ENOENT' || errorCode(err) === 'ENOTDIR';
+}
+
+// An older registry schema lacks a table or column; that is absence, not damage.
+function isMissingSchema(err: unknown): boolean {
+  return err instanceof Error && /^no such (?:table|column)\b/.test(err.message);
+}
+
+// The one read path for every discovery input. Absent is fine: an install need
+// not have groups or clones. Any other failure means a source exists but its
+// names are unknown, and the caller must count discovery incomplete.
+function readSource<T>(read: () => T, isAbsent: (err: unknown) => boolean = isMissingPath): SourceRead<T> {
   try {
     return { ok: true, value: read() };
   } catch (err) {
-    return { ok: false, absent: errorCode(err) === 'ENOENT' || errorCode(err) === 'ENOTDIR' };
+    return { ok: false, absent: isAbsent(err) };
   }
 }
 
@@ -504,32 +520,40 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
   if (!installRoot) return identifiers;
   const groupsDir = path.join(installRoot, 'groups');
   for (const folder of listSource(groupsDir, problems, 'the groups directory')) {
-    const config = readSource(
-      () => JSON.parse(fs.readFileSync(path.join(groupsDir, folder, 'container.json'), 'utf8')) as unknown,
-    );
+    const config = readSource(() => {
+      const parsed = JSON.parse(fs.readFileSync(path.join(groupsDir, folder, 'container.json'), 'utf8')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a config object');
+      return parsed as Record<string, unknown>;
+    });
     if (!config.ok) {
       if (!config.absent) problems.push('a group container.json could not be read or parsed');
       continue;
     }
-    if (config.value && typeof config.value === 'object')
-      addIdentifier(identifiers, (config.value as Record<string, unknown>).assistantName);
+    addIdentifier(identifiers, config.value.assistantName);
   }
 
   const repositoriesDir = path.join(installRoot, 'data', 'repositories');
   for (const workgroup of listSource(repositoriesDir, problems, 'the repository store')) {
     for (const name of listSource(path.join(repositoriesDir, workgroup), problems, 'a repository directory')) {
-      const config = path.join(repositoriesDir, workgroup, name, '.git', 'config');
-      const present = readSource(() => fs.statSync(config));
-      if (!present.ok) {
-        if (!present.absent) problems.push('a cloned repository configuration could not be read');
+      const gitDir = path.join(repositoriesDir, workgroup, name, '.git');
+      const isClone = readSource(() => fs.lstatSync(gitDir));
+      if (!isClone.ok) {
+        if (!isClone.absent) problems.push('a cloned repository could not be read');
         continue;
       }
-      const lines = gitConfigLines(['--file', config, '--get', 'remote.origin.url'], repositoriesDir);
-      if (lines === null) {
+      // Once .git exists, every failure is unreadable, absence included: a
+      // gitdir pointer or a lost config still names a clone whose owner is unknown.
+      const config = path.join(gitDir, 'config');
+      const entries = readSource(() => {
+        fs.accessSync(config, fs.constants.R_OK);
+        return gitConfigList(['--file', config], repositoriesDir);
+      });
+      if (!entries.ok) {
         problems.push('a cloned repository configuration could not be read');
         continue;
       }
-      const parsed = lines[0] ? remoteOwnerRepo(lines[0]) : null;
+      const [origin] = configValues(entries.value, /^remote\.origin\.url$/);
+      const parsed = origin ? remoteOwnerRepo(origin) : null;
       // A local-only canonical (no origin, or one naming no owner/repo) is
       // still named by its canonical directory.
       if (!parsed) {
