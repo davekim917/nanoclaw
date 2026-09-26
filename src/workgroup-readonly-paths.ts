@@ -146,6 +146,7 @@ export function protectReadonlyHostPaths(mounts: VolumeMount[], protectedPaths: 
   for (const mount of result) {
     if (!mount.readonly && covered(realOrResolved(mount.hostPath))) mount.readonly = true;
   }
+  const existing = new Set(result.map((mount) => mount.containerPath));
   const nested = new Map<string, VolumeMount>();
   for (const mount of result) {
     if (mount.readonly) continue;
@@ -156,6 +157,9 @@ export function protectReadonlyHostPaths(mounts: VolumeMount[], protectedPaths: 
       for (let depth = 1; depth <= segments.length; depth++) {
         const hostPath = path.join(source, ...segments.slice(0, depth));
         const containerPath = path.posix.join(mount.containerPath, ...segments.slice(0, depth));
+        // An explicit mount already sits here and shadows everything below it;
+        // that mount is checked against the protected paths on its own.
+        if (existing.has(containerPath)) break;
         nested.set(containerPath, {
           hostPath,
           containerPath,

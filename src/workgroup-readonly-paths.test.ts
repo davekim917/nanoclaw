@@ -113,6 +113,26 @@ describe('protectReadonlyHostPaths', () => {
     expect(protectReadonlyHostPaths(mounts, [target])).toEqual(mounts);
   });
 
+  it('does not duplicate the destination of a mount that already exists below the parent', () => {
+    const memory = path.join(root, 'memory');
+    const lock = path.join(root, '.write.lock');
+    fs.mkdirSync(path.join(memory, 'scripts'), { recursive: true });
+    fs.writeFileSync(lock, '');
+    const result = protectReadonlyHostPaths(
+      [
+        { hostPath: root, containerPath: '/w', readonly: false },
+        { hostPath: memory, containerPath: '/w/memory', readonly: false },
+        { hostPath: lock, containerPath: '/w/.write.lock', readonly: false },
+      ],
+      [path.join(memory, 'scripts'), lock],
+    );
+    const destinations = result.map((m) => m.containerPath);
+    expect(new Set(destinations).size).toBe(destinations.length);
+    expect(result.find((m) => m.containerPath === '/w/memory')?.readonly).toBe(false);
+    expect(result.find((m) => m.containerPath === '/w/memory/scripts')?.readonly).toBe(true);
+    expect(result.find((m) => m.containerPath === '/w/.write.lock')?.readonly).toBe(true);
+  });
+
   it('never leaves a pin writable when the pinned directory is itself protected', () => {
     const outer = path.join(root, 'rel');
     const inner = path.join(outer, 'ops', 'deep');
