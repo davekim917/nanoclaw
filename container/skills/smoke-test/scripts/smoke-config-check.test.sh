@@ -67,6 +67,10 @@ write_env "$T/noslash.sh" 'export SMOKE_GATE_MIGRATIONS_PREFIX="api/migrations"'
 OUT="$(bash "$CHECK" "$T/noslash.sh")"; RC=$?
 [ "$RC" -eq 2 ] && jq -e '.ok == false and .files[0].missing == [] and .files[0].malformed == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$OUT" >/dev/null \
   && ok "prefix without trailing / named malformed" || fail "malformed: rc=$RC out=$OUT"
+write_env "$T/dotted.sh" 'export SMOKE_GATE_FRONTEND_PREFIX="./web/"' 'export SMOKE_GATE_BACKEND_PREFIX="/api/"'
+OUT="$(bash "$CHECK" "$T/dotted.sh")"; RC=$?
+[ "$RC" -eq 2 ] && jq -e '.files[0].malformed == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
+  && ok "non-relative prefixes named malformed" || fail "non-relative: rc=$RC out=$OUT"
 
 # --- 6. Unreadable file: exit 3 ---------------------------------------------
 OUT="$(bash "$CHECK" "$T/env.sh" "$T/absent.sh")"; RC=$?

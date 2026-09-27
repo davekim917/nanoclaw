@@ -74,9 +74,22 @@ CREDENTIAL_PATTERNS = [
 
 
 
+def campaign_re(prefix):
+    """`<prefix>-pr<n>-<sha12>-<stamp>`, the only run-id shape a PR campaign has; group 1 is <n>."""
+    return re.compile(re.escape(prefix) + r"-pr(\d+)-[0-9a-f]{12}-[0-9]{8}T")
+
+
+def campaign_runs(names, prefix, since, until=None):
+    """The PR-campaign run dirs among `names` stamped in [since, until]; task and manual runs are skipped."""
+    pattern = campaign_re(prefix)
+    return sorted(d for d in names
+                  if pattern.match(d) and d.rsplit("-", 1)[1][:8] >= since
+                  and (not until or d.rsplit("-", 1)[1][:8] <= until))
+
+
 def pr_tag(run_id):
-    """`pr<n>-` from `<prefix>-pr<n>-<sha12>-<stamp>`, whatever the install's prefix."""
-    m = re.search(r"-(pr\d+-)", run_id)
+    """`pr<n>-` from `<prefix>-pr<n>-<sha12>-<stamp>`, whatever the install's prefix (even one containing -pr<n>-)."""
+    m = re.search(r"-(pr\d+-)[0-9a-f]{12}-[^-]+$", run_id)
     return m.group(1) if m else run_id
 
 def parse_iso(s):
@@ -158,9 +171,8 @@ def build(args):
     gh = json.load(open(args.gh_actual))
     a2 = json.load(open(args.actuals2))
     turns = json.load(open(args.turns)).get("camp", {}) if args.turns else {}
-    runs = sorted(d for d in os.listdir(args.gate_runs)
-                  if d.startswith(prefix + "-") and d.rsplit("-", 1)[1][:8] >= args.since
-                  and (not args.until or d.rsplit("-", 1)[1][:8] <= args.until))
+    campaign = campaign_re(prefix)
+    runs = campaign_runs(os.listdir(args.gate_runs), prefix, args.since, args.until)
     lines = [json.dumps({"provenance": {
         "builtAt": iso(dt.datetime.now(dt.timezone.utc)),
         "window": [args.since, args.until],
@@ -242,7 +254,7 @@ def build(args):
         confirmed = sorted({f for fe in files if isinstance(fe.get("content"), dict)
                             for f in fe["content"].get("confirmedFindings") or []})
         entry = {
-            "runId": run, "pr": int(re.match(re.escape(prefix) + r"-pr(\d+)-", run).group(1)),
+            "runId": run, "pr": int(campaign.match(run).group(1)),
             "sourceSha": contract.get("sourceSha"), "claimAt": iso(run_claim_time(run)),
             "isFreezePr": (x.get("headRefName") or "").startswith("smoke/freeze-"),
             "files": sorted({f["path"]: f for f in reversed(files)}.values(), key=lambda f: (f["at"], f["path"])),

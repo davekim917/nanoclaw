@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5491`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5494`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2511,13 +2511,13 @@ then carries `tookOverFrom`. `poll` never takes over.
 A PR settles when: it is open and carries `SMOKE_GATE_LABEL` (default
 `render-preview`); its backend preview exists, is `live`, and its deploy
 commit equals the PR head SHA; the frontend preview additionally matches when
-the diff touches `XZO-FRONTEND/`; CI is green on the head — **except** a
+the diff touches `SMOKE_GATE_FRONTEND_PREFIX`; CI is green on the head — **except** a
 freeze PR (see below), where CI is checked on the head's *parent* commit,
 since freeze commits get no path-filtered CI of their own; and the backend's
 `/healthz` returns 200 (a fresh preview can read `{"status":"warming"}` for
 ~6-10 minutes after `live` — the gate never sleeps waiting this out, it just
 reports not-settled and lets the next poll catch it). Any labeled **ordinary**
-PR whose own diff touches `XZO-BACKEND/migrations/` is refused outright (one
+PR whose own diff touches `SMOKE_GATE_MIGRATIONS_PREFIX` is refused outright (one
 throttled `pr_migrations_refused` alarm, never a settle). A **freeze PR is
 never refused on migrations**: its target is already on the tracked branch, so
 a migration in its range is campaign scope, reported in `migrationsInRange`,
@@ -2617,7 +2617,7 @@ hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFI
 `/`: a diff under the frontend prefix requires the frontend preview to match,
 one under the migrations prefix refuses an ordinary PR, and the freeze markers
 are `<prefix>.render-freeze` under the backend and frontend prefixes; all
-three are required; empty or without the `/` is `gate_misconfigured`),
+three are required, each a relative path of plain segments ending in `/`: anything else is `gate_misconfigured`),
 `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
 seam and semantics as the develop gate — one readiness command run once per

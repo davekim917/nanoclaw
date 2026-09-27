@@ -9,7 +9,7 @@
 #   default files: /workspace/agent/smoke-gate-env.sh /workspace/agent/smoke-develop-gate.sh
 #
 # One JSON line: {ok, files:[{path, missing:[NAME...], malformed:[NAME...]}], mismatched:[NAME...]}
-# A *_PREFIX value without its trailing "/" is malformed, as the gate reads it.
+# A *_PREFIX that is not a relative dir of plain segments ending in "/" is malformed, as the gate reads it.
 # Exit 0 every required key present, well-formed and agreeing everywhere · 2 a
 # key missing, malformed or mismatched · 3 a file unreadable · 4 usage.
 set -u
@@ -48,7 +48,7 @@ for f in "$@"; do
       missing+=("SMOKE_GATE_$name")
       continue
     fi
-    case "$name" in *_PREFIX) [ "${v%/}" != "$v" ] || malformed+=("SMOKE_GATE_$name") ;; esac
+    case "$name" in *_PREFIX) [[ "${v#=}" =~ ^([A-Za-z0-9_][A-Za-z0-9._-]*/)+$ ]] || malformed+=("SMOKE_GATE_$name") ;; esac
     if [ -n "${SEEN[$name]+x}" ]; then
       [ "${SEEN[$name]}" = "$v" ] || MISMATCH[$name]=1
     else

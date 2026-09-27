@@ -121,12 +121,15 @@ BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"
 MIGRATIONS_PREFIX="${SMOKE_GATE_MIGRATIONS_PREFIX:-}"
 FREEZE_MARKER_BACKEND="${BACKEND_PREFIX}.render-freeze"
 FREEZE_MARKER_FRONTEND="${FRONTEND_PREFIX}.render-freeze"
-# Each prefix is a directory path ending in "/": without it, "api" also matches
-# "api-archive/" and the marker lands at "api.render-freeze", outside the root.
-malformed_layout_prefixes() {  # → " SMOKE_GATE_<K>" for each set prefix lacking the trailing "/"
+# Each prefix is a repository-relative directory of plain segments ending in "/"
+# (GitHub file names carry no leading "/", "./" or ".."). Otherwise "api" also
+# matches "api-archive/", "/api/" matches nothing, and a freeze marker lands
+# outside the service root.
+LAYOUT_PREFIX_RE='^([A-Za-z0-9_][A-Za-z0-9._-]*/)+$'
+malformed_layout_prefixes() {  # → " SMOKE_GATE_<K>" for each set prefix that is not such a path
   local name
   for name in FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX; do
-    [ -z "${!name}" ] || [ "${!name%/}" != "${!name}" ] || printf ' SMOKE_GATE_%s' "$name"
+    [ -z "${!name}" ] || [[ "${!name}" =~ $LAYOUT_PREFIX_RE ]] || printf ' SMOKE_GATE_%s' "$name"
   done
 }
 
@@ -2917,7 +2920,7 @@ freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha[, problem]}
   # claim and finish reach here without check/poll's config guard; an unset or
   # malformed prefix would silently classify a real freeze head as ordinary.
   if [ -z "$FRONTEND_PREFIX" ] || [ -z "$BACKEND_PREFIX" ] || [ -n "$(malformed_layout_prefixes)" ]; then
-    jq -cn '{ok:false, isFreeze:false, targetSha:null, problem:"SMOKE_GATE_FRONTEND_PREFIX/BACKEND_PREFIX/MIGRATIONS_PREFIX unset or missing the trailing /, so whether this head is a freeze is unknown"}'
+    jq -cn '{ok:false, isFreeze:false, targetSha:null, problem:"SMOKE_GATE_FRONTEND_PREFIX/BACKEND_PREFIX/MIGRATIONS_PREFIX unset or not a relative dir ending in /, so whether this head is a freeze is unknown"}'
     return
   fi
   if ! commit="$(timeout 10 gh api "repos/$REPO/commits/$sha" 2>/dev/null)" ||

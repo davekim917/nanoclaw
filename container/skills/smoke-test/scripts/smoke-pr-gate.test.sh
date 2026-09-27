@@ -401,6 +401,14 @@ NO_SLASH="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base
   bash "$GATE" check 7 2>/dev/null || true)"
 jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$NO_SLASH" >/dev/null ||
   { echo "a prefix without its trailing / was accepted: $NO_SLASH" >&2; exit 1; }
+# ...and so is one that is not repository-relative: GitHub file names never start "/", "./" or "../".
+for bad in /api/migrations/ ../api/migrations/ ./api/migrations/ api//migrations/ api/../migrations/; do
+  NOT_REL="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+    SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX="$bad" \
+    bash "$GATE" check 7 2>/dev/null || true)"
+  jq -e '.ok == false and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$NOT_REL" >/dev/null ||
+    { echo "a non-relative prefix $bad was accepted: $NOT_REL" >&2; exit 1; }
+done
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_misconfigured" and .observation.kind == "blocked"' >/dev/null
 # W2: a quiet poll's observation is one the task-observation helper accepts,
 # and the gate's own keys are all still there for the controller to read.
