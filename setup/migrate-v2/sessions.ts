@@ -22,8 +22,7 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-// Session provisioning goes through the registered mailbox; this standalone
-// entrypoint loads the composition slot itself.
+// Side-effect import: session provisioning needs the registered mailbox.
 import '../../src/mailbox/compose.js';
 import { DATA_DIR } from '../../src/config.js';
 import { initDb, closeDb, getRawDb } from '../../src/db/connection.js';
@@ -31,11 +30,6 @@ import { getAllAgentGroups } from '../../src/db/agent-groups.js';
 import { getMessagingGroupsByAgentGroup } from '../../src/db/messaging-groups.js';
 import { runMigrations } from '../../src/db/migrations/index.js';
 import { resolveSession, writeSessionRouting } from '../../src/session-manager.js';
-// The session-directory LAYOUT only. `session-manager`'s path wrappers went
-// away with the mailbox seam's raw surface; upstream's own helper is where the
-// layout lives. Deliberately not the seam itself: this runs under `tsx` from
-// migrate-v2.sh, before any host boot, so `mailbox/compose.js` has not
-// registered an implementation and `withMailboxSession` would throw.
 import { outboundDbPath } from '../../src/mailbox/sqlite/paths.js';
 
 import { copyTree } from './shared.js';
@@ -100,12 +94,7 @@ async function main(): Promise<void> {
       const { session, created } = await resolveSession(ag.id, mg.id, null, 'shared');
 
       if (created) {
-        // Write routing so the container knows where to reply. AWAITED:
-        // `writeSessionRouting` returns a promise since it moved behind the
-        // mailbox seam, and an unawaited one lets `closeDb()` and the `OK:`
-        // line below run while the write is still suspended — reporting a
-        // successful migration for routing that never landed, and turning a
-        // failure into an unhandled rejection instead of aborting the step.
+        // AWAITED: unawaited, `closeDb()` and the `OK:` line run before the routing write lands.
         await writeSessionRouting(ag.id, session.id);
         sessionsCreated++;
       } else {

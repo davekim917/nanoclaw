@@ -106,10 +106,8 @@ export type FlockCommandOverrides = {
 };
 
 /**
- * Resolve a flock(1) that supports the inherited-fd form used by the host.
- * macOS has flock(2) but no bundled flock(1); Homebrew's portable `flock`
- * formula provides it. The functional probe prevents installing a command
- * that launchd can find but that cannot acquire the same kernel lock.
+ * Resolve a flock(1) supporting the host's inherited-fd form (macOS: Homebrew's `flock`). The
+ * functional probe rejects a flock launchd can find but that cannot take the same kernel lock.
  */
 export function ensureHostFlock(
   platform: ReturnType<typeof getPlatform>,
@@ -355,14 +353,7 @@ function checkDockerGroupStale(): boolean {
   }
 }
 
-/**
- * Content for /etc/logrotate.d/<unit-name>. Mirrors the reference snapshot
- * checked in at data/logrotate/nanoclaw-v2 (see that file for the full
- * rationale on copytruncate, maxsize vs size, and su) — keep the two in
- * sync if the rotation policy changes. Paths here are derived from
- * projectRoot, matching the StandardOutput=/StandardError= paths this same
- * function writes into the systemd unit above, so they can't drift apart.
- */
+/** Keep in sync with the reference snapshot data/logrotate/nanoclaw-v2, which explains the policy. */
 export function renderLogrotateConfig(projectRoot: string): string {
   return `${projectRoot}/logs/nanoclaw.log
 ${projectRoot}/logs/nanoclaw.error.log {
@@ -439,9 +430,7 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, fl
   fs.writeFileSync(unitPath, unit);
   log.info('Wrote systemd unit', { unitPath });
 
-  // logrotate.d is a root-only system directory — there's no user-level
-  // equivalent the way ~/.config/systemd/user/ stands in for a non-root
-  // systemd install, so only install it when we can write to /etc directly.
+  // logrotate.d is root-only, with no user-level equivalent.
   let logrotatePath: string | undefined;
   if (runningAsRoot) {
     logrotatePath = `/etc/logrotate.d/${unitName}`;

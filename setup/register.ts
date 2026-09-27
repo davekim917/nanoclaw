@@ -11,9 +11,7 @@ import path from 'path';
 // registerChannelAdapter() at module scope (factories are NOT invoked, no
 // adapter connects), so declared channel defaults resolve without the service.
 import '../src/channels/index.js';
-// Session provisioning goes through the registered mailbox (initSessionFolder →
-// getAgentMailbox().prepare()), so this standalone entrypoint has to load the
-// composition slot itself — it never imports src/modules/index.js.
+// Side-effect import: session provisioning needs the registered mailbox.
 import '../src/mailbox/compose.js';
 import {
   resolveUnknownSenderPolicy,
@@ -276,10 +274,7 @@ export async function run(args: string[]): Promise<void> {
       engage_mode: engage.engage_mode,
       engage_pattern: engage.engage_pattern,
       sender_scope: 'all',
-      // accumulate (not drop): group/sibling members need prior thread context
-      // when eventually triggered, or they start fresh — the bug that left the
-      // opencode siblings context-blind. Owner directive: accumulate is the
-      // default for all agents.
+      // accumulate, not drop: a member triggered later needs the prior thread context.
       ignored_message_policy: 'accumulate',
       session_mode: parsed.sessionMode as 'shared' | 'per-thread' | 'agent-shared',
       priority: 0,

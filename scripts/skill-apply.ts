@@ -13,9 +13,7 @@
 //   3. acquire inputs     — resolve every `prompt` via `inputs` / `resolveInput`
 //   4. mutate             — copy/append/env-set, journaled + idempotent
 //   5. run                — build/test/fetch (+ dep install) via injected exec
-//
-// A failed `effect:check` is a true precondition failure: apply stops at that
-// directive, before any later file/dependency/config mutation can occur.
+// A failed `effect:check` stops apply before any later mutation.
 // Remove is derived from the journal — no hand-written REMOVE.md.
 //
 // Inputs + `resolveInput` make one engine serve three contexts:
@@ -132,21 +130,14 @@ function selfStatus(d: Directive, root: string, force = false): { status: StepSt
       const missing = dests.filter((p) => !has(root, p));
       const forkOwned = d.args.includes('owned-by-fork');
       if (missing.length === 0) {
-        // force overrides an owned-by-fork refusal, but only applyOne can
-        // tell whether any present dest actually diverged — a blanket 'skip'
-        // here (nothing missing ⇒ nothing to do) would
-        // make `force` a documented no-op the moment the run stabilizes
-        // (every dest present, which is the common steady state). Run
-        // applyOne so it can re-check and force-overwrite where needed.
+        // Not a blanket 'skip': only applyOne can tell whether a present dest diverged, and
+        // skipping would make `force` a no-op once every dest is present.
         if (forkOwned && force) {
           return { status: 'apply', detail: `${dests.join(', ')} present — force re-checks each against the branch` };
         }
         return { status: 'skip', detail: `${dests.join(', ')} present` };
       }
       const from = d.attrs['from-branch'] ? `fetch ${String(d.attrs['from-branch'])} → ` : '';
-      // owned-by-fork: some dest is missing so applyOne runs, but every dest
-      // that's already present is compared to the branch and REFUSED (not
-      // overwritten) if it diverged — only the missing ones actually copy.
       const forkNote = forkOwned
         ? '; present files are compared to the branch and refused (not overwritten) if diverged'
         : '';
@@ -249,14 +240,7 @@ interface AgentTask {
   line: number;
   reason: string;
   prose: string; // the surrounding prose the agent reads to apply the step
-  // True only for a `copy owned-by-fork` refusal: the engine already
-  // did the safe, complete thing (installed what it safely could, left a
-  // diverged file alone) — nothing is broken and no follow-up is required
-  // unless the operator deliberately wants `force`. Undefined/false for
-  // every other bounce, which DOES need an agent/operator to finish the step.
-  // See `hasBlockingFailure` — the predicate a consumer should gate on
-  // instead of `agentTasks.length`/`fullyApplied` when it wants to treat a
-  // protective refusal as informational rather than fatal.
+  // True only for a `copy owned-by-fork` refusal, which needs no follow-up (see `hasBlockingFailure`).
   protective?: boolean;
 }
 
@@ -316,11 +300,7 @@ export interface ApplyOptions {
   // Resolve which remote carries a `from-branch` registry branch. Defaults to
   // resolveRegistryRemote(root).
   resolveRemote?: (branch: string) => string;
-  // Overrides a `copy owned-by-fork` refusal (see selfStatus/applyOne): when
-  // true, a fork-owned destination that has diverged from the registry branch
-  // IS overwritten with the branch version instead of being refused. The
-  // engine's only opinion of what "force" means — mirrors a driver's --force
-  // flag. Absent/false ⇒ the protective default: refuse and bounce.
+  // Overwrite a diverged `copy owned-by-fork` destination instead of refusing it.
   force?: boolean;
 }
 
@@ -334,30 +314,21 @@ export function fullyApplied(res: ApplyResult): boolean {
 }
 
 /**
- * True when `res` has a genuine blocking issue — deferred input, or a
- * non-`protective` agentTask — that a human/agent must resolve before a
- * caller can safely treat the skill as done. `fullyApplied` stays
- * strict (a protective refusal still isn't "nothing left to report"; the CLI
- * should still print it), but a consumer deciding whether to ABORT a flow
- * (e.g. the setup driver, mid credential collection) should gate on this
- * instead: a `copy owned-by-fork` refusal means the engine already did the
- * safe, complete thing, so it must not stop a setup that's otherwise fine.
+ * Deferred input or a non-`protective` agentTask. Gate an abort on this, not `fullyApplied`:
+ * a protective refusal must not stop an otherwise-fine setup.
  */
 export function hasBlockingFailure(res: ApplyResult): boolean {
   return res.deferred.length > 0 || res.agentTasks.some((t) => !t.protective);
 }
 
 /**
- * The failure diagnosis for the FIRST BLOCKING directive that bounced to an
- * agent, in document order — a purely `protective` refusal is skipped
- * so it never becomes the reported headline for a real failure elsewhere in
- * the same run: a concise headline (the nearest section heading) plus the
+ * The failure diagnosis for the FIRST non-`protective` directive that bounced, in
+ * document order: a concise headline (the nearest section heading) plus the
  * bounced step's own prose as the hint. The setup driver surfaces this when a
  * channel skill doesn't fully apply — the prose beside the step that failed
  * becomes the operator's failure hint and the Claude-handoff context, instead
  * of a generic "couldn't finish" message. Returns undefined when nothing
- * blocking bounced (e.g. a headless rebuild only left prompts deferred, or
- * every bounce was protective — neither is a failure).
+ * bounced (e.g. a headless rebuild only left prompts deferred — not a failure).
  */
 export function firstFailureHint(res: ApplyResult): { headline: string; hint: string } | undefined {
   const first = res.agentTasks.find((t) => !t.protective);
@@ -441,11 +412,8 @@ export function referenceProse(md: string): string {
 
 const CHANNELS_REMOTE_SH = fileURLToPath(new URL('../setup/lib/channels-remote.sh', import.meta.url));
 
-// setup/lib/channels-remote.sh owns the lookup; this only runs it in `root`.
-// Every inherited GIT_* variable is dropped so a GIT_DIR/GIT_WORK_TREE leaked
-// from a hook or parent git process cannot aim it (or the `git remote add` in
-// resolve_channels_remote) at another repository. NANOCLAW_CHANNELS_REMOTE
-// passes through and is honoured by the script.
+// Drops every inherited GIT_* variable so a leaked GIT_DIR/GIT_WORK_TREE cannot aim the lookup
+// (or its `git remote add`) at another repository.
 function runChannelsRemote(fn: 'detect_channels_remote' | 'resolve_channels_remote', root: string): string {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   return execFileSync('/bin/bash', ['-c', `source "$1"; ${fn}`, 'channels-remote', CHANNELS_REMOTE_SH], {
@@ -665,31 +633,14 @@ async function applyOne(
         const remote = ctx.resolveRemote(b);
         await exec(`git fetch ${remote} ${b}`);
         if (d.args.includes('owned-by-fork')) {
-          // This fork has customized these destinations beyond the registry
-          // branch (Slack/Discord's multi-workspace suffix tokens, mention
-          // resolution, missed-message recovery, on top of the channels
-          // branch's stale snapshot): the branch is a REFERENCE for a
-          // file never installed here, not a source of truth to replay over
-          // a live one. Content is captured via `exec` and written with
-          // writeFileSync — never a shell redirect — so a branch path that
-          // doesn't exist (git show fails, e.g. a registration test the
-          // branch never had) can never truncate a live file. Per file: a
-          // missing dest is a safe fresh install; a present dest is compared
-          // byte-for-byte — identical is a no-op, diverged is collected and
-          // REFUSED (every other listed file still applies) unless the
-          // caller passed `force`.
+          // The fork customized these beyond the registry branch, so a diverged present dest is
+          // refused unless `force`. Never a shell redirect: a failed `git show` would truncate a live file.
           const refused: string[] = [];
           for (const l of d.body) {
             const dst = join(root, destOf(l));
             mkdirSync(dirname(dst), { recursive: true });
             const out = await exec(`git show ${remote}/${b}:${srcOf(l)}`);
-            // ApplyOptions.exec is allowed to return void (most directives
-            // discard its result), but here the return value IS the file
-            // content this line writes — silently coercing a missing result
-            // to '' would plant a zero-byte file, journal it as written, and
-            // let the run report fullyApplied. An executor that discards
-            // stdout for this command can't safely resolve an owned-by-fork
-            // copy, so bounce instead of guessing.
+            // exec may return void; coercing that to '' would plant a zero-byte file reported as applied.
             if (typeof out !== 'string') {
               throw new Error(
                 `copy owned-by-fork needs ${remote}/${b}:${srcOf(l)}'s content as a string from exec (got ${typeof out}) to write ${destOf(l)} — an executor that discards git show's stdout can't safely resolve this copy`,
@@ -697,7 +648,7 @@ async function applyOne(
             }
             const branchContent = out;
             if (existsSync(dst)) {
-              if (readFileSync(dst, 'utf8') === branchContent) continue; // already matches — no-op
+              if (readFileSync(dst, 'utf8') === branchContent) continue;
               if (!ctx.force) {
                 refused.push(destOf(l));
                 continue;
@@ -846,7 +797,6 @@ async function applyOne(
       const arr = JSON.parse(read(target) || '[]') as unknown[];
       if (!Array.isArray(arr)) throw new Error(`${into} is not a JSON array`);
       const value = obj[key];
-      // Idempotent: only push when no element already matches on the key.
       if (!arr.some((el) => el !== null && typeof el === 'object' && (el as Record<string, unknown>)[key] === value)) {
         arr.push(obj);
         writeFileSync(target, JSON.stringify(arr, null, 2) + '\n');
@@ -890,12 +840,8 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
   // bounce; a later side-effecting run becomes its own bounce so the agent
   // finishes it from the prose once the upstream failure is fixed. A DEFERRED
   // prompt (headless rebuild, no answer) is not a failure — it never bounces, so
-  // `blocked` stays false and a later restart remains runnable. A PROTECTIVE
-  // bounce (`copy owned-by-fork` refusing a diverged file) also leaves
-  // `blocked` false: the engine already did the safe, complete thing, the run
-  // is NOT in a known-bad state, and a later restart/wire still needs to fire
-  // normally (e.g. so a channel install still restarts and loads the new
-  // credentials even though a customized adapter file was correctly left alone).
+  // `blocked` stays false and a later restart remains runnable.
+  // A protective bounce also leaves `blocked` false: a later restart/wire must still fire.
   let blocked = false;
   const SIDE_EFFECTS = new Set(['restart', 'step', 'wire']);
   const bounce = (d: Directive, reason: string, opts?: { protective?: boolean }) => {
@@ -1058,19 +1004,10 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
       if (/unresolved \{\{/.test(msg)) {
         res.deferred.push(msg); // blocked on a prompt input
       } else if (msg.startsWith('FORK_OWNED_DIVERGED: ')) {
-        // A protective refusal, not an engine failure — bounce with the
-        // specific reason verbatim (never the generic "could not apply"
-        // wrapper) so the agent (or operator) reads exactly what diverged
-        // and what force does. protective:true keeps it out of
-        // `hasBlockingFailure` and off the run-health gate (`blocked` stays
-        // false) — the engine already did the safe, complete thing.
         bounce(d, msg.slice('FORK_OWNED_DIVERGED: '.length), { protective: true });
       } else {
         bounce(d, `engine could not apply (${msg}) — an agent applies it from the prose`);
-        // `effect:check` is a PRECONDITION, not a best-effort health signal.
-        // Continuing could overwrite customized source before the agent gets a
-        // chance to resolve the failed check. Stop with exactly the failed
-        // check as the handoff; successful and check-free flows are unchanged.
+        // Continuing past a failed precondition could overwrite customized source.
         if (d.kind === 'run' && d.attrs.effect === 'check') break;
       }
     }
