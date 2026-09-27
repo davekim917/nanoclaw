@@ -237,7 +237,7 @@ export async function migrateInboundDbToHostDir(
   // in it tells them apart. The database does: replay only if it is torn
   // without it. The container can't write `inbound.db`, so a forgery meets a
   // healthy database and is discarded. (`quick_check` catches structural
-  // tearing, the strongest signal available.)
+  // tearing, not every semantically partial write.)
   const legacyJournal = `${legacyPath}-journal`;
   if (fs.existsSync(legacyJournal)) {
     if (databaseIsIntact(hostPath)) {

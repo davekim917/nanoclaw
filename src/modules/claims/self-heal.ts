@@ -426,7 +426,8 @@ async function seriesRoutingStamp(
   seriesId: string,
 ): Promise<{ messagingGroupId: string; deliverThreadId: string | null } | null> {
   // Read-only: a probe must never provision or migrate the session. No mailbox
-  // reads as "no routing stamp".
+  // reads as "no routing stamp". The 5s wait and hot-journal recovery (a write)
+  // keep the replaced opener's behaviour.
   const [{ readSessionInbound }, { getDb }] = await Promise.all([
     import('../mailbox/index.js'),
     import('../../db/connection.js'),
