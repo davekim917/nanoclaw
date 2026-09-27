@@ -2847,3 +2847,10 @@ is not implemented by this script; it is a separate, later decision.
   across SHAs.
 - Cap retries, agent-to-agent debate, screenshots, and browser waits. After two
   failed cross-checks, escalate or mark blocked instead of looping.
+
+## Changing these scripts
+
+Each iteration, run only the shell suites your change can break:
+`python3 container/skills/smoke-test/scripts/select-tests.py --run` (from
+the repo checkout; `--explain` says why each was picked). Run the full set
+once before merge: `select-tests.py --all --run`.
