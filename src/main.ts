@@ -1,9 +1,3 @@
-/**
- * NanoClaw — main entry point.
- *
- * Thin orchestrator: init DB, run migrations, start channel adapters,
- * start delivery polls, start sweep, handle shutdown.
- */
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
@@ -57,11 +51,8 @@ import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { resetStorageActivityState } from './storage-activity.js';
 import { finishInterruptedSessionArchivals } from './storage-manager.js';
 import { drainClosedSessionPendingBacklog } from './session-close-expiry.js';
-// Side-effect only: each registers its onHostStart/onHostShutdown timer with
-// src/host-lifecycle.ts at import time. See "7–10b" in startNanoClaw below.
-// managed-git-hooks.js is NOT one of these — it's a one-shot startup step
-// with a harder deadline (before anything can spawn), called explicitly
-// below via initializeManagedGitHooks, not registered as a timer.
+// Side-effect only: each registers its onHostStart/onHostShutdown timer with src/host-lifecycle.ts at import.
+// managed-git-hooks is not one of these: it must finish before anything can spawn, so it is called explicitly.
 import './worktree-cleanup.js';
 import './repo-freshness.js';
 import { initializeManagedGitHooks } from './managed-git-hooks.js';
@@ -85,27 +76,14 @@ import { enforceUpgradeTripwire } from './upgrade-state.js';
 import { reconcilePendingUpgradeContexts } from './session-manager.js';
 import { releaseOrphanedRepoIngressFencesAtStartup } from './repo-fence-recovery.js';
 
-// The response registry lives in response-registry.ts to break the circular
-// import cycle: src/index.ts imports src/modules/index.js for side effects, and
-// the modules call registerResponseHandler at top level — which would hit a
+// The registry lives in response-registry.ts: modules register at top level during import, which would hit a
 // TDZ error if the array lived here.
 import { getResponseHandlers, type ResponsePayload } from './response-registry.js';
 
-// Upstream host-lifecycle seam (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
-// Aborted as the first shutdown action so `HostStartContext.signal` carries real
-// semantics for any module that registers a start callback.
+// Aborted as the first shutdown action, so `HostStartContext.signal` is meaningful to start callbacks.
 export const hostAbortController = new AbortController();
 
-/**
- * Dedupe marker for the boot-time build-drift alert (see the drift check in
- * `main()`, below). Mirrors the small-JSON-state-file idiom already used for
- * boot-time markers (`daily-summary.ts`'s STATE_PATH, `deploy-crash-guard.ts`'s
- * attempts/manifest files): a marker under `data/` (gitignored), read/write
- * wrapped so a corrupt or unwritable file degrades to "alert again" rather
- * than blocking boot. Holds just the last-alerted (buildSha, headSha) pair —
- * nothing else is needed to decide "have we already told the owner about
- * this exact drift".
- */
+/** Last-alerted (buildSha, headSha) pair for the boot build-drift DM; a corrupt or missing file means alert again. */
 interface BuildDriftAlertState {
   buildSha: string;
   headSha: string;
@@ -113,7 +91,6 @@ interface BuildDriftAlertState {
 
 const BUILD_DRIFT_ALERT_STATE_PATH = path.join(DATA_DIR, 'build-drift-alert.json');
 
-/** Never throws — a corrupt or missing marker reads as "no prior alert". */
 function readBuildDriftAlertState(): BuildDriftAlertState | null {
   try {
     return JSON.parse(fs.readFileSync(BUILD_DRIFT_ALERT_STATE_PATH, 'utf8')) as BuildDriftAlertState;
@@ -122,7 +99,7 @@ function readBuildDriftAlertState(): BuildDriftAlertState | null {
   }
 }
 
-/** Best-effort; never throws. A failed write just means the next boot re-alerts. */
+/** Best-effort; a failed write just means the next boot re-alerts. */
 function writeBuildDriftAlertState(state: BuildDriftAlertState): void {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -133,17 +110,8 @@ function writeBuildDriftAlertState(state: BuildDriftAlertState): void {
 }
 
 /**
- * Boot-time build-drift check: does the running build match the checkout?
- * Never throws and never blocks boot — a stale build is wrong, not unsafe,
- * and a refusal here would take the fleet down for it. See describeBuildDrift
- * (build-info.ts) for what "drift" means and why it matters more than plain
- * staleness (agent-runner source activates on a restart; host src/ does not).
- *
- * Dedupe: a crash-looping host would otherwise DM the owner every boot for
- * the same stale build, so the owner is only messaged again once the
- * (buildSha, headSha) pair actually changes from the last recorded alert.
- * The WARN log line, by contrast, is unconditional on every drifted boot —
- * it costs nothing and belongs in the logs every time.
+ * Boot-time build-drift check. Never throws and never blocks boot: a stale build is wrong, not unsafe. The WARN
+ * logs on every drifted boot; the owner DM is deduped on the (buildSha, headSha) pair so a crash loop cannot spam.
  */
 async function checkBuildDrift(buildInfo: ReturnType<typeof readBuildInfo>): Promise<void> {
   try {
@@ -151,17 +119,13 @@ async function checkBuildDrift(buildInfo: ReturnType<typeof readBuildInfo>): Pro
     const drift = describeBuildDrift(buildInfo, headSha);
     if (!drift) return;
 
-    // The WARN is unconditional: the mismatch is true and the log is cheap.
     log.warn(drift.msg, drift.data);
 
     const buildSha = buildInfo!.sha;
     const head = headSha!;
 
-    // The DM is not. This checkout is pulled through the day without a rebuild
-    // always following, so a sha mismatch is the normal state — DMing on every
-    // one would fire on nearly every boot, and an alert that noisy gets muted.
-    // A null diff means git could not tell us; treat that as material and
-    // alert, because an unreadable diff is not evidence of safety.
+    // A sha mismatch is the normal state (the checkout is pulled without rebuilds), so DM only when the diff is
+    // material. A null diff means git could not tell: treat it as material.
     const changed = changedPathsBetween(REPO_ROOT, buildSha, head);
     if (changed !== null && !isMaterialDrift(changed)) {
       log.info('build-drift: stale build, but nothing compiled into dist/ differs — not alerting', {
@@ -195,9 +159,7 @@ async function checkBuildDrift(buildInfo: ReturnType<typeof readBuildInfo>): Pro
         'agent-runner code running against this older host build.',
     });
     if (result.code === 0) {
-      // Only a verified delivery is recorded. Stamping the marker before the
-      // send would remember a FAILED alert as sent and never retry it — the
-      // same false-receipt defect that muted host alerting for three days.
+      // Record only a verified delivery: stamping first would remember a failed alert as sent and never retry.
       writeBuildDriftAlertState({ buildSha, headSha: head });
     } else {
       log.warn('build-drift: could not DM the owner', { code: result.code, message: result.message });
@@ -219,12 +181,7 @@ async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
 }
 
-/**
- * Load .env file values into process.env, without overriding vars already set.
- * Mirrors V1's readEnvFile behavior — needed so ANTHROPIC_BASE_URL,
- * ANTHROPIC_API_KEY, and other env-driven config flows work even when
- * the host is started without those vars in the shell environment.
- */
+/** Load .env into process.env without overriding vars already set in the shell. */
 function loadEnvIntoProcess(): void {
   const envPath = path.join(process.cwd(), '.env');
   let content: string;
@@ -250,19 +207,15 @@ function loadEnvIntoProcess(): void {
   }
 }
 
-// Channel barrel — each enabled channel self-registers on import.
-// Channel skills uncomment lines in channels/index.ts to enable them.
+// Channel barrel: each enabled channel self-registers on import.
 import './channels/index.js';
 
-// Modules barrel — default modules (typing, mount-security) ship here; skills
-// append registry-based modules. Imported for side effects (registrations).
+// Modules barrel, imported for its registration side effects.
 import './modules/index.js';
 
-// Orchestrator-dispatch reconciler startup hook — called from main() AFTER initDb,
-// since the reconciler queries the central DB.
+// Called from main() after initDb: the reconciler queries the central DB.
 import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modules/orchestrator-dispatch/index.js';
 
-// Workgroup FS reconciler — drains the migration-036 report after migrations.
 import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
 import {
   reconcileWorkgroupMemory,
@@ -272,8 +225,7 @@ import {
   type WorkgroupMemoryReport,
 } from './modules/workgroup/shared-dirs.js';
 import { WORKGROUP_SHARED_FS } from './config.js';
-// CLI command barrel — populates the `ncl` registry before the CLI server
-// accepts connections.
+// Populates the `ncl` registry before the CLI server accepts connections.
 import './cli/commands/index.js';
 import './cli/delivery-action.js';
 import { markCliServerReady, startCliServer, stopCliServer } from './cli/socket-server.js';
@@ -288,24 +240,15 @@ import {
 import type Database from 'better-sqlite3';
 
 /**
- * Canonical-memory reconciliation for the workgroups the boot door proved
- * quiescent.
- *
- * It no longer stops anything: `cleanupOrphansStrict()` moved out to
- * `quiesceWorkgroupsForBootMountChange`, which runs once, ahead of every
- * reconcile, and proves its own scope (plan §7.D). This gate is now the
- * runtime check plus the cutover, and it must never be called from outside a
- * quiescence door — src/workgroup-reconcile-doors.test.ts pins that.
+ * Canonical-memory reconciliation for the workgroups the boot door proved quiescent. Must never be called from
+ * outside a quiescence door (src/workgroup-reconcile-doors.test.ts pins that).
  */
 export function runWorkgroupMemoryStartupGate(
   db: Database.Database,
   deps: {
     /**
-     * Confines the cutover's WRITES to the workgroups the boot door proved
-     * quiescent. Every workgroup is still reported: `main()` derives the
-     * pending-pre-turn-context targets and the migration-required operator
-     * warnings from these reports, and an ordinary boot changes nothing, so
-     * scoping the report set would silently skip both on almost every start.
+     * Confines the cutover's writes to these workgroups. Every workgroup is still reported: `main()` derives
+     * pre-turn-context targets and migration warnings from the full report set.
      */
     mutateWorkgroupIds?: string[];
     ensureRuntime?: () => void;
@@ -316,7 +259,6 @@ export function runWorkgroupMemoryStartupGate(
   return (deps.reconcile ?? reconcileWorkgroupMemory)(db, { mutateWorkgroupIds: deps.mutateWorkgroupIds });
 }
 
-/** Seams the boot mount-change block injects in tests; real work by default. */
 export interface BootMountQuiescenceDeps {
   workgroupIds?: (db: Database.Database) => string[];
   memoryWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
@@ -345,16 +287,9 @@ export interface BootMountQuiescenceDeps {
 }
 
 /**
- * The sessions whose containers a boot leaves running, as the fail-closed seed
- * adoption holds pending when its own inventory cannot be taken (seam 4 E,
- * `heldOnInventoryFailure`). Under D2 the door's returned survivors ARE the
- * post-stop inventory — the containers it proved still running after its
- * last pass — so they are the seed directly. Not inferred from the counts: a
- * newcomer stopped in the second pass makes `stopped` reach `containers`
- * while the final partition still holds survivors, and those must be held
- * (owned, leased, counted) rather than left unprotected. A door that stopped
- * everything returns no survivors, and the seed is then empty on its own.
- * Exported for the unit test only.
+ * The fail-closed adoption seed when adoption's own inventory fails: the door's returned survivors, the
+ * containers it proved still running. Not inferred from counts: a newcomer stopped in the second pass makes
+ * `stopped` reach `containers` while survivors remain, and those must be held. Exported for the unit test.
  */
 export function adoptionSeedFor(scope: Pick<BootQuiescenceScope, 'survivableSessionIds'>): string[] {
   return [...scope.survivableSessionIds];
@@ -366,40 +301,12 @@ function bootFatal(message: string, err: unknown): never {
 }
 
 /**
- * The boot mount-change block: decide the scope, prove it, then reconcile.
- *
- * Order is the safety argument (plan §4.1, §7.D), and every step of it is
- * asserted in src/boot-quiescence-order.test.ts:
- *
- *   1. warn sessions still marked 'running' by an unclean previous host —
- *      BEFORE anything is stopped, which is where `main()` has always had it,
- *      and it is DB-only so it stays ahead of every docker call;
- *   2. probe the container runtime, bounded, before the door's unbounded
- *      inventory — the order main has;
- *   3. evaluate the predicates once, as the door's input;
- *   4. quiesce — the ONLY thing that stops containers at boot, and it throws
- *      before anything below runs if it cannot prove its scope is down;
- *   5. the door re-evaluates the predicates on the now-quiescent tree and
- *      partitions against THAT answer; the same set drives the reconciles.
- *      Group directories are container-writable, so the pre-stop snapshot can
- *      be stale by the time the stops finish, and a scope built from it would
- *      call a flipped workgroup's sessions survivable;
- *   6. shared-FS consolidation, scoped to the post-stop set. It used to run
- *      BEFORE the quiescence proof (plan §3.5, divergence 4), masked only by
- *      the flag defaulting off;
- *   7. canonical-memory cutover, scoped to the same set;
- *   8. snapshot pruning, after both cutovers.
- *
- * Steps 2 and 3 are swapped relative to §7.D's listed order, deliberately: the
- * plan's order writes the accountability note after the stops, so a door that
- * fails part way through them would leave the sessions it already killed with
- * no note at all. Warning first is what `main()` did before this PR.
- *
- * D1 measures: `quiesceWorkgroupsForBootMountChange` still stops the whole
- * install regardless of the scope it computes, so this boot behaves exactly
- * as the one before it. The scope decision runs in production, and its
- * `survivable` count is the milestone-1 counterfactual, before D2 is allowed
- * to act on it.
+ * The boot mount-change block. Order is the safety argument, asserted in src/boot-quiescence-order.test.ts:
+ * warn sessions an unclean previous host left 'running' (DB-only, before any stop); probe the runtime (bounded)
+ * before the door's unbounded inventory; evaluate predicates as the door's input; quiesce (the only boot-time
+ * stopper; throws before anything below if it cannot prove its scope is down); re-evaluate on the quiescent tree,
+ * since group dirs are container-writable and the pre-stop snapshot can be stale; then shared-FS consolidation and
+ * the canonical-memory cutover on that post-stop set; then snapshot pruning.
  */
 export async function runBootMountQuiescence(
   db: Database.Database,
@@ -415,54 +322,25 @@ export async function runBootMountQuiescence(
   const fatal = deps.fatal ?? bootFatal;
 
   const allWorkgroupIds = listWorkgroupIds(db);
-  // D2 note (not built — see initializeManagedGitHooks's own call site in
-  // startNanoClaw, and its module's doc comments): once a D2 survivable-
-  // container path exists, THIS predicate is where "this workgroup's wiki
-  // repo's core.hooksPath is about to change" must also count as a mount
-  // change — a survivor that keeps its pre-migration `.git/config` file
-  // mount would otherwise carry no hook at all until its next respawn. That
-  // check has to be computed here, BEFORE the door runs (same
-  // changedBeforeQuiescence snapshot timing as the other two predicates),
-  // even though the actual hooksPath write happens AFTER the door returns
-  // (initializeManagedGitHooks runs later in startNanoClaw, once this
-  // function's stops are known to be done).
+  // Once a D2 survivable-container path exists, a pending wiki core.hooksPath change must also count as a mount
+  // change here, before the door runs: a survivor keeps its pre-migration `.git/config` mount and has no hook.
   const evaluateChanged = (): string[] =>
     allWorkgroupIds.filter((id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)));
 
-  // Bounded probe BEFORE the unbounded inventory, which is the order main has.
-  // There `ensureContainerRuntimeRunning()` (a 10 s-timeout `docker info`) ran
-  // immediately ahead of `cleanupOrphansStrict()`; here the door's
-  // `listInstallContainersWithScope` is an unbounded `docker ps`, so without
-  // this a stalled daemon hangs the boot instead of failing it. The memory
-  // gate keeps its own call: idempotent, and fast when the daemon is healthy.
+  // Bounded probe before the door's unbounded `docker ps`, so a stalled daemon fails the boot instead of hanging.
   (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
 
-  // The pre-stop evaluation is the door's INPUT, and nothing more. The group
-  // directories these predicates read are bind-mounted writable into live
-  // containers, so a still-running agent can flip a workgroup from settled to
-  // needs-reconcile between this snapshot and the stops completing.
+  // Only the door's input: live containers can flip a workgroup between this snapshot and the stops completing.
   const changedBeforeQuiescence = evaluateChanged();
 
-  // One read, for the door's known-session test. A container whose session row
-  // is gone or archived has nothing for adoption to resolve, so it can never
-  // be classified survivable.
+  // A container whose session row is gone or archived has nothing to adopt, so it is never survivable.
   const knownSessionIds = await (
     deps.activeSessionIds ?? (async () => (await getActiveSessions()).map((session) => session.id))
   )();
 
-  // The startup warn runs INSIDE the door, after its pre-stop partition and
-  // before its first stop (`beforeStop`): the note is written from the session
-  // rows an unclean previous host left marked 'running', and under D2 it must
-  // skip the survivors — their containers are not interrupted, and the note
-  // says they were. That skip set exists only once the door has listed and
-  // partitioned, and the note still has to precede the stop pass, which can
-  // outlast the heartbeat freshness window. A door that dies half way
-  // through its stops leaves the note already written for every must-stop
-  // session; a door whose listing fails writes none, and the boot fails there.
-  // The door calls it a second time only when its post-stop re-evaluation
-  // moved sessions INTO must-stop: those were skipped by the first note as
-  // survivable and are about to be interrupted after all, so they — and only
-  // they — get theirs then (the skip set is every other known session).
+  // Runs inside the door, after its pre-stop partition and before its first stop: the note must skip survivors
+  // and still precede a stop pass that can outlast the heartbeat window. The door calls it again only for
+  // sessions its post-stop re-evaluation moved into must-stop.
   const warnStartup = deps.warnStartup ?? warnMarkedRunningSessionsOfStartup;
   const beforeStop = async (partition: {
     pass: 1 | 2;
@@ -483,30 +361,23 @@ export async function runBootMountQuiescence(
   const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {
     knownWorkgroupIds: allWorkgroupIds,
     knownSessionIds,
-    // Re-run on the quiescent tree. The door partitions against THIS answer,
-    // so the scope it returns and the cutover below can never disagree about
-    // which workgroups changed.
+    // The door partitions against this answer, so its scope and the cutover cannot disagree.
     reevaluateChanged: evaluateChanged,
     beforeStop,
   });
 
-  // The authoritative set: one evaluation, inside the door, after the proof.
-  // A workgroup that flipped while the stops were in flight is in it, so it is
-  // reconciled here and is must-stop in the partition — never left out of both.
+  // The authoritative set: a workgroup that flipped during the stops is reconciled here and must-stop in the
+  // partition, never left out of both.
   const changedWorkgroupIds = scope.changedWorkgroupIds;
   const flipped = changedWorkgroupIds.filter((id) => !changedBeforeQuiescence.includes(id));
   log.info('Boot quiescence rescope', {
     changedBefore: changedBeforeQuiescence.length,
     changedAfter: changedWorkgroupIds.length,
-    // Non-empty means a live agent wrote to a group directory while the door
-    // was stopping it. Harmless under D1; under D2 it is the case the door's
-    // own re-validation has to cover (see quiesceWorkgroupsForBootMountChange).
+    // Non-empty means a live agent wrote to a group directory while the door was stopping it.
     ...(flipped.length > 0 ? { flipped } : {}),
   });
 
-  // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,
-  // default off). Moves each workgroup's shared dirs into data/workgroups/<id>/
-  // (bind-mounted at /workspace/workgroup). Idempotent + fail-closed.
+  // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed.
   if (sharedFsEnabled) {
     try {
       (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, { workgroupIds: changedWorkgroupIds });
@@ -519,47 +390,18 @@ export async function runBootMountQuiescence(
     mutateWorkgroupIds: changedWorkgroupIds,
   });
 
-  // Prune old agent-runner-source snapshots now that the boot door above has
-  // stopped every container left running by an unclean previous host — pruning
-  // any earlier is unsafe (a bind mount pins the directory, not its entries).
-  // `defaultReferencedPaths` reads docker rather than the in-process registry
-  // (src/agent-runner-source.ts), so this stays correct under D2, when an
-  // adopted container is a live reference this call must not delete out from
-  // under.
+  // Only after the door has stopped the previous host's containers: a bind mount pins the directory, not its
+  // entries. `defaultReferencedPaths` reads docker, so adopted containers stay protected.
   (deps.prune ?? pruneAgentRunnerSnapshots)();
 
   return { changedWorkgroupIds, scope, memoryReports };
 }
 
 /**
- * Which fields `onMetadata`'s one-shot channel-metadata discovery should
- * persist for a channel it just saw.
- *
- * `is_group` is a plain refresh — one boolean, one writer, nothing to lose.
- *
- * `name` is the interesting one, because two writers produce it and they are
- * not equally informed. `reportChannelMetadata` (chat-sdk-bridge.ts) does a
- * generic per-channel fetch and reports whatever raw string the platform hangs
- * on the conversation. The classification seam (`resolveConversation` /
- * `resolveChannelName`, run by the approval flow in channel-approval.ts and by
- * the router's auto-wire) can enrich that: a Slack MPDM's platform-side name is
- * an internal `mpdm-alice--bob--carol-1` slug, and the classifier replaces it
- * with the participant roster a human would recognize. The raw fetch has no way
- * to produce that answer and no way to know it is undoing one — which is why,
- * before provenance, every host restart quietly overwrote the roster name with
- * the slug again.
- *
- * So the decision is not made by looking at the name. It is made by comparing
- * where the incoming value came from with where the stored value came from,
- * via `channelNameProvenanceAccepts` (db/messaging-groups.ts), which owns the
- * invariant and the ordering. `onMetadata` is always an `adapter`-sourced
- * refresh on its own adapter's platform.
- *
- * Wiring status deliberately plays no part any more. The old rule ("unwired →
- * set-once, wired → refresh") existed only to settle the race between these two
- * writers on a channel's first inbound event; provenance settles it directly
- * and in the same direction regardless of who wins the network round trip, so
- * the wiring test is gone along with the `isWired` argument.
+ * Which fields `onMetadata`'s one-shot channel-metadata discovery should persist. `name` has two writers: the
+ * raw platform fetch and the classification seam (e.g. a Slack MPDM roster instead of its `mpdm-…` slug). The
+ * decision compares provenance via `channelNameProvenanceAccepts`, never the name itself or wiring status, so a
+ * restart cannot overwrite a classified name with the raw slug.
  */
 export function resolveChannelMetadataUpdates(
   mg: { name: string | null; name_source?: string | null; channel_type: string; is_group: number },
@@ -589,93 +431,49 @@ export async function main(): Promise<void> {
     log.warn('dist/BUILD_INFO.json missing — cannot report build provenance (older dist, or a dev run)');
   }
 
-  // 0. Claim exclusive host ownership before any startup work that can
-  // mutate shared state. The socket binds early but remains not-ready until
-  // every existing boot gate has completed below.
+  // Claim exclusive host ownership before any startup work that can mutate shared state; the socket stays
+  // not-ready until every boot gate below completes.
   await startCliServer();
 
-  // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
 
-  // Does the running build match the checkout? WARNs and DMs the owner on
-  // drift; never blocks boot (see checkBuildDrift's own doc comment).
-  //
-  // Deliberately below both gates above, not beside the provenance log it
-  // reads. It sends an outbound DM and writes a shared dedupe marker, which
-  // is exactly the "startup work that can mutate shared state" the ownership
-  // claim exists to fence: two hosts racing to start would otherwise both
-  // alert and both write the marker before one of them is rejected. Running
-  // after the circuit breaker also means a crash-looping host is throttled
-  // before it can message anyone.
+  // Below both gates above: it sends a DM and writes a shared dedupe marker, so two racing hosts must not both
+  // run it, and a crash-looping host is throttled before it can message anyone.
   await checkBuildDrift(buildInfo);
 
-  // 0a. Load .env into process.env (for secrets not injected by the shell,
-  //     like ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY which determine whether
-  //     we use direct proxy or OneCLI gateway). Does NOT override vars already
-  //     in the process environment — shell-set values take precedence.
+  // Shell-set values take precedence over .env.
   loadEnvIntoProcess();
 
-  // 0b. Register secret values from .env for outbound scrubbing.
   registerSecretsFromEnv();
 
-  // 0.5 Upgrade tripwire — refuse to start if this install was updated
-  // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
+  // Refuse to start if this install was updated outside the sanctioned path (raw `git pull`).
   enforceUpgradeTripwire();
 
-  // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
   await initDb(dbPath);
-  // The migration runner stays synchronous on the raw handle (plan §4.3
-  // amendment): it runs at boot with no concurrent central-DB activity, and
-  // the boot-time workgroup reconcilers below take the same handle.
+  // The migration runner stays synchronous on the raw handle: nothing else touches the central DB at boot.
   const db = getRawDb();
   runMigrations(db);
 
-  // 1-a. Register this host process in `host_instances` and start renewing
-  // its lease. Ahead of everything that can spawn, so the row exists before
-  // any container work; write-only shadow state — nothing reads it yet
-  // (docs/specs/upstream-restart-survival-seam/plan.md §7.A). Through
-  // `shadowWrite` for the same reason: a failed INSERT (contention, a locked
-  // file) must log and let boot continue, never turn shadow state into a
-  // startup dependency. The double-start throw is unreachable here (one call).
+  // Ahead of everything that can spawn. Through `shadowWrite`: a failed INSERT must log and let boot continue,
+  // never make this shadow state a startup dependency.
   await shadowWrite('host instance lease start', () => startHostInstanceLease({ leaseTtlMs: HOST_LEASE_TTL_MS }));
   const hostInstanceId = getHostInstanceId();
   if (hostInstanceId) {
-    // Plan §6 series-A evidence: exactly one per boot, instance id + ttl. Its
-    // absence after a boot means the registration failed (WARN above).
+    // Exactly one per boot; its absence means registration failed.
     log.info('Host instance lease started', { instanceId: hostInstanceId, ttlMs: HOST_LEASE_TTL_MS });
   }
 
-  // 1-0. Materialize the archive schema before ANY service that can spawn.
-  //
-  // `archive_row_marks` and its triggers are created by the archive's lazy
-  // open, which fires on the first archive WRITE. Until they exist every
-  // projection freshness stamp reports an unknown mutation count and fails
-  // closed, so every spawn does the full 19 s rebuild the stamps exist to remove.
-  //
-  // Ahead of the dashboard for the same reason the OneCLI preflight below is:
-  // `startDashboard()` exposes endpoints that reach `wakeContainer` — a
-  // scheduled task's run-now, for one — so a dashboard-triggered spawn during
-  // the window would rebuild, and so would every spawn until unrelated chat
-  // traffic happened to open the archive. Ahead of channel recovery too, which
-  // archives messages: otherwise the one-time "Archive row-marks schema
-  // created" line would land from a recovery thread on some boots and from
-  // here on others, which is useless as a deploy gate.
-  //
-  // Nothing above this point can spawn, and the archive is a standalone file
-  // that depends only on DATA_DIR, so this is the earliest honest position.
+  // Before ANY service that can spawn (the dashboard's run-now included): until the archive's row-mark schema
+  // exists every projection freshness stamp fails closed, and every spawn does the full rebuild.
   ensureArchiveSchema();
 
-  // Snapshot the agent-runner source for this boot —
-  // must happen before anything can spawn a container, so every spawn this
-  // process makes mounts the same tree, not the live checkout mid-`git pull`.
+  // Before anything can spawn, so every spawn this process makes mounts the same tree, not a checkout mid-pull.
   activateAgentRunnerSource();
 
   await resetProcessingChannelIngress();
 
-  // Workgroup FS reconciliation — runs after migrations to drain the
-  // _migration036_report temp table. On FS failure, exit; restart is the recovery
-  // (reconciler is idempotent).
+  // Drains the migration-036 report. On FS failure, exit: the reconciler is idempotent and restart recovers.
   try {
     reconcileWorkgroupFsState(db);
   } catch (fsErr) {
@@ -683,47 +481,21 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Boot mount-change block: scope → quiescence proof → both reconciles →
-  // snapshot prune. Nothing here mutates a mount before the proof returns; a
-  // listing failure or a stop that does not take throws out of startup, which
-  // is what "prove install-scoped container absence" has always meant.
+  // Nothing here mutates a mount before the quiescence proof returns; a failed listing or stop throws out of boot.
   const { scope, memoryReports } = await runBootMountQuiescence(db);
 
-  // Two resets of the previous host's residue, BEFORE adoption — both are
-  // "everything the last host marked is stale", which is true only until
-  // adoption re-marks what survived (src/adoption-order.test.ts pins the
-  // order). The storage-activity markers and cleanup claims: adoption takes a
-  // fresh lease for every survivor, and a reset after it would strip exactly
-  // that marker and let the storage manager clean a root a survivor is using.
+  // Both resets must run before adoption (src/adoption-order.test.ts): after it, this one would strip the fresh
+  // lease adoption takes for a survivor, letting the storage manager clean a root in use.
   resetStorageActivityState();
-  // The phantom `container_status` rows: before adoption every 'running' row
-  // is a previous host's, and the sweep would otherwise waste ticks enforcing
-  // SLA against containers that no longer exist; adoption then writes
-  // `running` for the sessions it took over, and a reset after it would flip
-  // them back to 'stopped' while their containers run.
+  // After adoption this would flip the rows adoption just marked `running` back to 'stopped'.
   const resetCount = await resetPhantomContainerStatus();
   if (resetCount > 0) {
     log.info('Reset phantom container_status rows on startup', { count: resetCount });
   }
 
-  // Adopt the containers the boot door left running (seam 4 series E, plan
-  // §7.E). Immediately after the door's return, and before every wake source
-  // (the dashboard, the channel adapters, the sweep, delivery) and before the
-  // orphaned-fence recovery below — src/adoption-order.test.ts pins both: no
-  // wake can spawn a second container beside an untracked survivor, and the
-  // recovery still runs against its premise (a fresh process holds no mount
-  // claims, so every active fence it finds is orphaned).
-  //
-  // The candidate set is the door's own partition, `survivableSessionIds` —
-  // the same set the startup warn skips. Under D1 that partition is computed
-  // AFTER the stops and the door still stops the survivable containers too, so
-  // the set is empty and this adopts nothing until D2 flips the stop set. D2
-  // also needs a PRE-stop partition for the warn's skip set (the door's D2
-  // note); this post-stop one is the adoption contract.
-  //
-  // If adoption's own inventory then fails, the fail-closed seed is only what
-  // the door actually LEFT running (`adoptionSeedFor`): under D2 that is the
-  // post-stop survivable set; a boot that stopped everything seeds nothing.
+  // Before every wake source and before the orphaned-fence recovery (src/adoption-order.test.ts): no wake may
+  // spawn a second container beside an untracked survivor, and the recovery's premise (a fresh process holds no
+  // mount claims) must still hold. If adoption's inventory fails, the seed is only what the door left running.
   const reconciled = await adoptRunningSessions({
     survivableSessionIds: scope.survivableSessionIds,
     heldOnInventoryFailure: adoptionSeedFor(scope),
@@ -744,9 +516,7 @@ export async function main(): Promise<void> {
         .map((report) => report.workgroupId),
     );
     if (pendingUpgrade.skipped > 0 || pendingUpgrade.stubsRemoved > 0) {
-      // A session DB the pass could not read no longer stops startup, so it has
-      // to be loud instead. Counts, not silence: a rising `skipped` is the shape
-      // of a systemic problem that a per-session error line would bury.
+      // An unreadable session DB no longer stops startup, so report counts: a rising `skipped` is systemic.
       log.warn('Startup reconciliation could not process every session DB', pendingUpgrade);
     }
     if (pendingUpgrade.admitted > 0) {
@@ -757,19 +527,11 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Incident 2026-09-01: a failed repository publication left 1401 session
-  // inbound DBs fenced with no publication left to release them, and the
-  // workgroup went silently deaf. The mount/lifecycle claims that mark a
-  // publication "in flight" are process-local Sets (src/repository-workspaces.ts),
-  // so a fresh process holds none: every active fence found here belongs to a
-  // publication that died with the previous process and is orphaned by
-  // definition. Per-session failures are isolated inside the pass and never
-  // exit the process — a fence is a liveness problem, not a boot invariant.
+  // Mount/lifecycle claims are process-local, so every active fence a fresh process finds belongs to a dead
+  // publication and is orphaned. Per-session failures never exit: a fence is a liveness problem, not a boot one.
   try {
     const fences = await releaseOrphanedRepoIngressFencesAtStartup();
     if (fences.released > 0 || fences.failed > 0) {
-      // An adopted session behind an active fence is one of these releases;
-      // the count from adoption makes that visible beside the release count.
       log.warn('Released orphaned repository ingress fences at startup', {
         ...fences,
         adoptedWithActiveFence: reconciled.fencedInbound,
@@ -781,81 +543,44 @@ export async function main(): Promise<void> {
 
   log.info('Central DB ready', { path: dbPath });
 
-  // 1-bis. OneCLI control-API preflight — the credential call every spawn
-  // makes, once, before ANY ingress opens. A control API this process cannot
-  // reach means every spawn is refused at WARN and the fleet goes silently
-  // deaf (2026-09-02: 11 minutes, 0/8 spawns, a clean-looking boot).
-  //
-  // Ahead of the dashboard and the channel adapters deliberately: past that
-  // point an inbound message can reach routeInbound() and wake a container
-  // while the probe is still retrying, which both contends with the probe and
-  // means the exit below would kill a host that has already accepted work.
-  // Failing here logs ERROR and exits non-zero BEFORE markDeployBootHealthy(),
-  // so the unit-failure alert fires and the deploy stays rollback-eligible.
+  // Before ANY ingress opens: an unreachable control API makes every spawn refuse at WARN and the fleet goes
+  // deaf. Past the adapters, a message could wake a container while this retries and the exit would kill a host
+  // that accepted work. Failing exits before markDeployBootHealthy(), keeping the deploy rollback-eligible.
   await runOnecliBootPreflight();
 
-  // 1-ter. Host-managed pre-push secret-scan hooks: refresh the boot-snapshot
-  // directories and run the scan-policy core.hooksPath migration pass. Must
-  // run after runBootMountQuiescence (the boot door may stop containers
-  // whose workgroup's mounts are about to change — see its own D2 note
-  // above) and before startDashboard()/honorPendingStopIntents()/
-  // initChannelAdapters() below, all three of which can already trigger a
-  // spawn. A spawn that mounts a scan-policy (wiki) repo depends on this
-  // having already run at least once THIS process
-  // (resolveScanPolicyHooksMount -> decideHooksMountStrategy in
-  // container-runner.ts/managed-git-hooks.ts falls back to the refuse
-  // hook, never throws the whole spawn, when it hasn't — see
-  // managed-git-hooks.ts's own doc comments on why this is a direct call
-  // here, not an onHostStart registrant with the six timer modules below).
+  // After runBootMountQuiescence and before startDashboard()/honorPendingStopIntents()/initChannelAdapters(),
+  // all of which can spawn: a spawn mounting a scan-policy repo depends on this having run once this process.
   initializeManagedGitHooks();
 
-  // Host-computed upstreamPin/heldByMerge snapshot for the container-updates
-  // audit. Containers can't derive this themselves (/workspace/project has no
-  // `.git`), so the host computes it here where git works and refreshes it
-  // again in handleUpdateContainer before each interactive audit. Best-effort:
-  // log and continue, never block boot on a dependency-audit side channel.
+  // Containers cannot derive this (/workspace/project has no `.git`). Best-effort; never blocks boot.
   try {
     await writeUpstreamPolicySnapshot(REPO_ROOT, path.join(DATA_DIR, 'upstream-policy.json'));
   } catch (err) {
     log.error('Upstream policy snapshot failed at startup', { err });
   }
 
-  // 1a. Start dashboard — after migrations (028 must exist) and before
-  //     channel adapters so the HTTP server is up regardless of channel config.
+  // After migrations (028) and before channel adapters, so the HTTP server is up regardless of channel config.
   startDashboard();
 
-  // 1b. Orchestrator-dispatch reconciler startup scan — must run after migrations
-  // so the tasks table exists. Recovers any tasks left in 'pending' with
-  // admitted_at set but no child_session_id (host crashed mid-completion).
+  // Recovers tasks left 'pending' with admitted_at set but no child_session_id (host crashed mid-completion).
   await runDispatchReconcilerOnStartup();
 
-  // 1c. Backfill container_configs from legacy container.json files.
-  // Idempotent — skips groups that already have a config row.
   await backfillContainerConfigs();
 
-  // 2. (The storage-activity reset moved ahead of adoption, above.)
-
-  // 2-bis. Resolve any session archival a previous stop interrupted, before
-  // the sweep can hand out work to a row still parked in 'archiving'.
+  // Before the sweep can hand out work to a row still parked in 'archiving'.
   try {
     await finishInterruptedSessionArchivals();
   } catch (err) {
     log.error('Interrupted session archival recovery failed', { err });
   }
 
-  // 2-ter. Drain the pending rows left in sessions closed before S19 learned
-  // to expire them. Bounded and self-draining — a session whose rows
-  // are expired stops pinning `sessionHasOpenWork`, reclaim removes its
-  // directory, and the next boot skips it on a statSync. Non-fatal.
   try {
     await drainClosedSessionPendingBacklog();
   } catch (err) {
     log.error('Closed-session pending backlog drain failed', { err });
   }
 
-  // 2a. Surface agent-runner deps drift at boot, not when an agent silently
-  // stops responding. Non-fatal — the hard gate lives in spawnContainer, this
-  // is just an early operator signal.
+  // Early operator signal only; the hard gate lives in spawnContainer.
   void (async () => {
     try {
       const { checkAgentRunnerDepsDrift } = await import('./agent-runner-image-check.js');
@@ -872,49 +597,15 @@ export async function main(): Promise<void> {
     }
   })();
 
-  // 2a. (The phantom container_status reset moved ahead of adoption, above.)
-
-  // 2b. Re-issue any restart a previous host ordered but did not live to
-  // finish. `respawn_after_stop` is the durable half of a kill whose respawn
-  // was only ever a process-memory callback, so this is where "rebuild
-  // applied" with nothing coming back gets recovered.
-  //
-  // This is the FIRST thing in startup that may deliberately spawn a
-  // container, so it sits below every startup-only reset and every pre-spawn
-  // gate, and `src/stop-intent-recovery.test.ts` pins that order:
-  //
-  //   - `resetStorageActivityState()` recursively deletes the active-lease
-  //     directory. Above it, a recovery spawn's own lease is deleted out from
-  //     under the live container it belongs to.
-  //   - `resetPhantomContainerStatus()` rewrites every `running` row to
-  //     `stopped` on the premise that no container survived the restart.
-  //     Above it, the recovery's fresh container is flipped to `stopped` while
-  //     it runs, and the sweep then reasons about a session it cannot see.
-  //   - `runOnecliBootPreflight()` proves the credential API every spawn calls.
-  //   - `releaseOrphanedRepoIngressFencesAtStartup()` treats every active fence
-  //     as orphaned because a fresh process holds no mount claims. A spawn
-  //     above it can break that premise; below it, nothing does.
-  //
-  // E integration (seam4/e-adoption): E's `adoptRunningSessions()` lands
-  // earlier, right after D1's boot door, and E moves the two resets above it.
-  // Either way this call stays BELOW adoption, which is the ordering that
-  // matters: a survivor must be registered and claim-fenced before an intent
-  // against it is acted on, and a session still awaiting its fence is skipped
-  // here rather than killed at the wrong incarnation.
-  //
-  // E also leaves a `// F2 hook` marker at the END of `adoptRunningSessions`,
-  // and this call deliberately does NOT move there: it can spawn, and adoption
-  // must stay a pure inventory pass with no wake inside it. §7.F says `main()`.
-  // The recovery wake goes through the seam like every other wake: the
-  // module-internal default exists for the unit tests, main()
-  // injects requestWake so a recovered restart records the same wake signal a
-  // live one does.
+  // The first deliberate spawn in startup, so it sits below every startup-only reset, pre-spawn gate and
+  // adoption (src/stop-intent-recovery.test.ts pins the order): above the resets its container's lease and
+  // `running` row would be wiped; above the fence recovery it would break that pass's premise; above adoption
+  // it could act on a survivor not yet registered. It must not move into `adoptRunningSessions`, which stays a
+  // pure inventory pass with no wake.
   await honorPendingStopIntents((session) => requestWake(session, 'container-restart'));
 
-  // 3. Channel adapters
-  // Gateway READY can arrive while adapters are still initializing. Hold its
-  // recovery callback until every adapter identity, the sibling allow-list,
-  // and the delivery bridge are ready.
+  // Gateway READY can arrive while adapters are still initializing; hold its recovery callback until every
+  // adapter identity, the sibling allow-list and the delivery bridge are ready.
   let releaseChannelRecoveryReady!: () => void;
   const channelRecoveryReady = new Promise<void>((resolve) => {
     releaseChannelRecoveryReady = resolve;
@@ -922,9 +613,6 @@ export async function main(): Promise<void> {
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
-        // The event shape — instance stamping and the trust-bearing
-        // `nativeId` — is built by the ingress producer, so it is testable
-        // against the real router rather than only reachable from here.
         return routeInbound(adapterInboundEvent(adapter, platformId, threadId, message)).catch((err) => {
           log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
           throw err;
@@ -949,9 +637,7 @@ export async function main(): Promise<void> {
         const incoming = { platform: adapter.channelType, source: 'adapter' as const };
         const updates = resolveChannelMetadataUpdates(mg, name, isGroup, incoming);
         if (Object.keys(updates).length === 0) return;
-        // The provenance check runs again INSIDE the write: the
-        // read above and this write are separated by an await, and the
-        // router's classified name may land between them.
+        // Checked again inside the write: the router's classified name may land during the await.
         await applyChannelMetadataUpdates(mg.id, updates, incoming);
         log.info('Channel metadata persisted', {
           channelType: adapter.channelType,
@@ -960,19 +646,11 @@ export async function main(): Promise<void> {
           updates,
         });
       },
-      // Payload construction lives in channels/action-response.ts so a test can
-      // drive the real thing rather than rebuild it.
       onAction: makeOnAction(adapter.channelType, dispatchResponse),
     };
   });
-  // Wire the access gate's sibling-bot allow-list now that channel adapters are
-  // up and their known-bot registries are populated. A message authored by one
-  // of our own bots (Example Agent, Example Agent-Codex, Example Agent-OpenCode, …) is then allowed to
-  // engage siblings even under a `strict` messaging group — without this, a
-  // strict mg drops sibling @-mentions as `not_member` and cross-agent handoff
-  // silently fails (only owner/admins/members get through). Dynamic imports so
-  // a build without a given channel adapter still links; the provider reads the
-  // registries live, so it reflects later identity fetches too.
+  // Lets our own sibling bots engage each other under a `strict` messaging group, where they would otherwise be
+  // dropped as `not_member`. Dynamic imports so a build without an adapter still links.
   {
     const { setSiblingBotIdsProvider } = await import('./modules/permissions/index.js');
     const botRegistries: Array<() => ReadonlyMap<string, { userId: string }>> = [];
@@ -998,129 +676,79 @@ export async function main(): Promise<void> {
     log.info('Sibling-bot allow-list wired for access gate', { registries: botRegistries.length });
   }
 
-  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
-  // registry key (instance ?? channelType): a named instance with an
-  // offline adapter is never rerouted through a sibling bot. The factory now
-  // also carries our support-thread surfaces (deleteMessage/postParent/
-  // createThread). See createChannelDeliveryAdapter in channel-registry.ts.
+  // Dispatches by exact registry key (instance ?? channelType): an offline named instance is never rerouted
+  // through a sibling bot.
   setDeliveryAdapter(createChannelDeliveryAdapter());
 
-  // 4a. The `ncl` socket has been bound and refusing a second host since
-  // the pre-DB ownership step above, but it has been refusing every request with `not-ready`
-  // until now: everything that can mutate central-DB state on this process's
-  // behalf — archive init, FS reconciliation, the OneCLI preflight,
-  // container-config backfill, channel adapters, and the delivery bridge
-  // just above — has to be up first, or an `ncl` call racing them could read
-  // or write into state that is still mid-setup.
+  // Everything that can mutate central-DB state on this process's behalf is up only now; an earlier `ncl` call
+  // could read or write mid-setup state.
   markCliServerReady();
 
-  // 4b. Host module lifecycle (upstream seam) — modules register onHostStart/
-  // onHostShutdown callbacks at import time; this is where registered start
-  // work actually begins (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
-  // Inert when no module registers anything.
   await startHostModules({ db: getDb(), signal: hostAbortController.signal });
 
-  // Start recovery only after permissions and delivery are fully wired. A
-  // replay can immediately exercise either surface (sibling bots, unknown
-  // sender/channel approval), so it must not race partial host startup.
+  // A replay can immediately exercise permissions and delivery, so it must not race partial startup.
   releaseChannelRecoveryReady();
   void recoverAllChannelsAfterStartup(Date.now() - 10 * 60 * 1000)
     .then(() => {
       log.info('Initial channel recovery pass finished');
     })
     .catch((err) => {
-      // Per-adapter failures schedule their own retry; this guard reports an
-      // unexpected aggregate failure without affecting live ingress.
       log.error('Initial channel recovery coordinator failed', { err });
     });
   startChannelRecoveryMonitor();
 
-  // 5. Start delivery polls
   startActiveDeliveryPoll();
   startSweepDeliveryPoll();
   log.info('Delivery polls started');
 
-  // 6. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7–10b. Worktree cleanup, repo freshness, plugin updater, commit scan,
-  // daily summary, and backlog canvas each start themselves via onHostStart
-  // — see src/host-lifecycle.ts and each module's own registration.
+  // Worktree cleanup, repo freshness, plugin updater, commit scan, daily summary and backlog canvas start via
+  // onHostStart (src/host-lifecycle.ts).
 
-  // 11. Restore any Remote Control session that was running before restart
   restoreRemoteControl();
 
-  // 12. Start Discord slash-command client (gated on
-  //     ENABLE_DISCORD_SLASH_COMMANDS=1).
   startDiscordSlashCommands().catch((err) => {
     log.error('Discord slash commands failed to start', { err });
   });
 
-  // Startup completed — the deploy that produced this build is good; disarm
-  // the crash-loop rollback guard.
   markDeployBootHealthy();
 
   log.info('NanoClaw running');
 }
 
-/** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
-  // Upstream host-lifecycle seam: abort registered modules' signal, then run
-  // their onHostShutdown callbacks LIFO, before any other shutdown work
-  // (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
+  // Before any other shutdown work: abort the modules' signal, then run their onHostShutdown callbacks LIFO.
   hostAbortController.abort();
   await stopHostModules();
   stopDeliveryPolls();
   stopHostSweep();
   stopChannelRecoveryMonitor();
-  // Worktree cleanup, repo freshness, plugin updater, commit scan, daily
-  // summary, backlog canvas, and storage-maintenance stop themselves via
-  // stopHostModules() above (each guards its own stop failure).
   await stopDiscordSlashCommands();
-  // Stop accepting CLI requests before teardown, but keep the kernel claim
-  // until process exit. A replacement host must not open or migrate the
-  // central DB while this process is still tearing it down.
+  // Keep the kernel claim until process exit: a replacement host must not open or migrate the central DB while
+  // this one is still tearing it down.
   await stopCliServer({ retainOwnership: true });
   try {
     await teardownChannelAdapters();
-    // Warn mid-work sessions before their containers are stopped: the
-    // on_wake note (due immediately) makes the post-restart spawn account
-    // for the interruption publicly instead of the session going dark.
+    // Before their containers stop: the on_wake note makes the post-restart spawn account for the interruption.
     try {
-      // The stopping set is the door's own plan, asked before the door runs
-      // (series E, door 1): under it no running container is stopped, so this
-      // is the empty set and adopted-to-be sessions get no interruption note.
-      // Sessions the unit's `ExecStop` still stops until the unit-file doors
-      // land get none either — accepted, the doors ship on one restart.
       await warnActiveContainersOfShutdown('graceful host shutdown', planContainerShutdown());
     } catch (err) {
       log.error('host-restart shutdown warn failed', { err });
     }
-    // Door 1 (plan §4.3.5): close the spawn path and let in-flight wakes
-    // settle, but leave running containers ALONE — the next host adopts them.
-    // This used to be `stopAllContainers()`, added because lingering client
-    // children stalled systemd for `TimeoutStopSec` on every restart; the unit
-    // now carries `KillMode=mixed` (the client children are reaped by systemd
-    // once this process exits, without touching the daemon-owned containers)
-    // and no `ExecStop` sweep, which is what makes leaving them alive here
-    // both safe and observable. Both unit-file lines are the other two doors;
-    // rollback restores them FIRST (plan §5).
+    // Close the spawn path but leave running containers alone for the next host to adopt. Safe only because the
+    // unit carries `KillMode=mixed` and no `ExecStop` sweep; a rollback restores those first.
     try {
       await beginContainerShutdown();
     } catch (err) {
       log.error('beginContainerShutdown threw', { err });
     }
   } finally {
-    // Stamp `stopped_at` FIRST so a graceful exit is durably distinguishable
-    // from a crash even if the teardown above threw — in the `try` a throw
-    // from teardownChannelAdapters() would skip it and leave the row looking
-    // crash-ended for the 90 s lease TTL. Never throws.
+    // In `finally`, so a teardown throw cannot leave the row looking crash-ended for the lease TTL.
     await stopHostInstanceLease();
-    // Always reset on graceful shutdown — even if teardown threw, we got here
-    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
-    // as one.
+    // We got here via a signal, not a crash, so the next start must not count as one.
     resetCircuitBreaker();
     process.exit(0);
   }
@@ -1130,10 +758,7 @@ export function isDirectExecution(moduleUrl: string, argvEntry: string | undefin
   return !!argvEntry && pathToFileURL(path.resolve(argvEntry)).href === moduleUrl;
 }
 
-/**
- * Start the service: signal handlers + main(). Called by the entry bootstrap
- * (src/index.ts) after the deploy crash guard has run.
- */
+/** Signal handlers + main(); called by src/index.ts after the deploy crash guard has run. */
 export function startNanoClaw(): void {
   process.on('SIGTERM', () => {
     shutdown('SIGTERM').catch((err) => log.fatal('Shutdown handler failed', { err, signal: 'SIGTERM' }));
@@ -1147,8 +772,7 @@ export function startNanoClaw(): void {
   });
 }
 
-// Support running src/main.ts directly (e.g. tsx) without the bootstrap;
-// the guard is a no-op when no deploy manifest exists.
+// Supports running src/main.ts directly (e.g. tsx); the guard is a no-op without a deploy manifest.
 if (isDirectExecution(import.meta.url, process.argv[1])) {
   startNanoClaw();
 }
