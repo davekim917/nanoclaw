@@ -17,11 +17,13 @@ ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
    not exist; a rotation must), and posts a card to the first reachable owner or global admin DM
    (`pickOwnersFirst` → `pickApprovalDelivery`). The card states who asked, the host the key will be sent to,
    and who gets it. The call returns at once with an intake id.
-2. The card's button (`ncs:<intakeId>`) opens a Slack modal. Only an owner or global admin may open or submit
-   it; the check runs on both.
-3. Submit validates (non-empty, no whitespace) inside Slack's 3-second window and closes the modal. The vault
-   write and grants run after the reply: `POST /api/secrets` for a new secret, `PATCH` of the value for a
-   rotation — through `src/onecli-secret-writer.ts`, which keeps the value out of argv.
+2. The card's button (`ncs:<intakeId>`) opens a Slack modal. Opening checks only that the intake is still
+   pending: nothing inside Slack's 3-second trigger window waits on the central DB lease.
+3. Submit validates (non-empty, no whitespace), claims the intake and closes the modal. Only then does the host
+   check that the submitter is an owner or global admin; anyone else's submit stores nothing and returns the
+   intake to pending. The vault write and grants follow: `POST /api/secrets` for a new secret, `PATCH` of the
+   value for a rotation — through `src/onecli-secret-writer.ts`, which keeps the value out of argv. Any failure
+   before the store completes marks the intake failed, on the card and to the requester.
 4. The card is edited to the outcome, and the requesting agent session (if any) gets a host note: stored or
    not, and who it is granted to. The value never appears in either.
 

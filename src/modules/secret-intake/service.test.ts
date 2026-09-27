@@ -231,6 +231,31 @@ describe('the form', () => {
     }
   });
 
+  it('counts a submitted, still-storing intake as live for the same name', async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    vi.mocked(withCentralSync).mockImplementation(() => new Promise(() => {}));
+    try {
+      await hooks.submit(intakeId, 'UOWNER', SECRET);
+      expect(getSecretIntake(intakeId)?.status).toBe('storing');
+      await expect(startSecretIntake({ ...newKey, caller: agentCaller })).rejects.toThrow(/already waiting/);
+    } finally {
+      vi.mocked(withCentralSync).mockImplementation((async (fn: () => unknown) => fn()) as never);
+    }
+  });
+
+  it('fails the intake, visibly, when the authority lookup throws', async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    vi.mocked(withCentralSync).mockImplementationOnce(async () => {
+      throw new Error('central DB unavailable');
+    });
+    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await settle();
+    expect(getSecretIntake(intakeId)).toMatchObject({ status: 'failed', detail: 'central DB unavailable' });
+    expect(h.createCalls).toHaveLength(0);
+    expect(h.notes[0]).toContain('was NOT stored');
+    expect(everythingObservable()).not.toContain(SECRET);
+  });
+
   it('refuses an empty value or one with whitespace, keeping the intake pending', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
     expect(await hooks.submit(intakeId, 'UOWNER', '  ')).toEqual({ ok: false, message: 'Paste the secret value.' });

@@ -242,7 +242,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
   ].join('\n');
 
   // Checked here, after the last await, so two concurrent requests cannot both pass.
-  const pending = [...intakes.values()].filter((other) => other.status === 'pending');
+  const pending = [...intakes.values()].filter((other) => other.status === 'pending' || other.status === 'storing');
   const duplicate = pending.find((other) => other.secretName === name);
   if (duplicate) {
     throw new Error(
@@ -320,6 +320,19 @@ function unavailable(intake: Intake | undefined): string | null {
   return intake.status === 'pending' ? null : `This secret request is already ${intake.status}.`;
 }
 
+async function failIntake(intake: Intake, err: unknown): Promise<void> {
+  if (intake.status !== 'storing') {
+    log.warn('Secret intake: follow-up after the store failed', { intakeId: intake.id, err });
+    return;
+  }
+  intake.status = 'failed';
+  intake.finishedAt = Date.now();
+  intake.detail = err instanceof Error ? err.message : String(err);
+  log.warn('Secret intake: not stored', { intakeId: intake.id, detail: intake.detail });
+  await editCard(intake, `${cardTitle(intake)}\n\nNot stored: ${intake.detail}`);
+  await tellRequester(intake, `Secret "${intake.secretName}" was NOT stored: ${intake.detail}`);
+}
+
 async function completeIntake(intake: Intake, namespacedUserId: string, value: string): Promise<void> {
   const allowed = await withCentralSync(
     () => isOwner(namespacedUserId) || isGlobalAdmin(namespacedUserId),
@@ -330,22 +343,12 @@ async function completeIntake(intake: Intake, namespacedUserId: string, value: s
     log.warn('Secret intake: submit refused, not an owner or global admin', { intakeId: intake.id });
     return;
   }
-  try {
-    if (intake.injection) {
-      await createOnecliSecret(intake.injection, value);
-    } else {
-      const existing = await findOnecliSecretByName(intake.secretName);
-      if (!existing) throw new Error(`"${intake.secretName}" is no longer in the vault`);
-      await updateOnecliSecretValue(existing, value);
-    }
-  } catch (err) {
-    intake.status = 'failed';
-    intake.finishedAt = Date.now();
-    intake.detail = err instanceof Error ? err.message : String(err);
-    log.warn('Secret intake: vault write failed', { intakeId: intake.id, detail: intake.detail });
-    await editCard(intake, `${cardTitle(intake)}\n\nNot stored: ${intake.detail}`);
-    await tellRequester(intake, `Secret "${intake.secretName}" was NOT stored: ${intake.detail}`);
-    return;
+  if (intake.injection) {
+    await createOnecliSecret(intake.injection, value);
+  } else {
+    const existing = await findOnecliSecretByName(intake.secretName);
+    if (!existing) throw new Error(`"${intake.secretName}" is no longer in the vault`);
+    await updateOnecliSecretValue(existing, value);
   }
 
   const failedGrants: string[] = [];
@@ -410,9 +413,9 @@ export function secretIntakeHooks(channelType: string): SecretIntakeHooks {
       if (!trimmed) return { ok: false, message: 'Paste the secret value.' };
       if (/\s/.test(trimmed)) return { ok: false, message: 'Paste only the key: it contains spaces or line breaks.' };
       intake.status = 'storing';
-      completeIntake(intake, namespaced(userId), trimmed).catch((err) => {
-        log.error('Secret intake: completion failed', { intakeId: intake.id, err });
-      });
+      completeIntake(intake, namespaced(userId), trimmed)
+        .catch((err) => failIntake(intake, err))
+        .catch((err) => log.error('Secret intake: completion failed', { intakeId: intake.id, err }));
       return { ok: true };
     },
   };
