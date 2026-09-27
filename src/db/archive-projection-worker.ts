@@ -1,25 +1,8 @@
 /**
- * Host-side owner of the archive projection build.
- *
- * This module is now a thin transport. One request means "make this projection
- * current"; the worker decides between reuse, append and full rebuild and says
- * which it did (`materializeArchiveProjection`). The host thread reads nothing
- * from the 400 MB source.
- *
- * `buildArchiveProjection` used to run synchronously on the main thread on
- * every container spawn: a `GROUP BY` over an unindexed 135 MB `text` column
- * against a 414 MB source, then a row-by-row rewrite of a projection as large
- * as 238 MB. That was the dominant cause of event-loop stalls — 327 in one day, p50
- * 18.3 s, max 59.7 s, with 86% of them ending inside a container spawn. Moving
- * it off-thread removed the stall but not the work: a later measurement found 435 full
- * rebuilds against 65 reuses in a day, median 19 s and p90 28 s each, because
- * the v1 freshness stamp keyed on the whole archive file and a message for any
- * agent group invalidated every session's projection. Five of those serialized
- * behind one worker is what made a post-boot sweep tick take 200 s.
- *
- * Mirrors `src/storage-maintenance-worker.ts`: one persistent worker, which
- * also serializes rebuilds so concurrent spawns cannot stampede the same
- * source file.
+ * Host-side transport for archive projection builds. One request means "make this projection current"; the worker
+ * decides reuse, append or rebuild (`materializeArchiveProjection`) and the host thread never reads the large source.
+ * Synchronous builds on the main thread were the dominant cause of event-loop stalls. One persistent worker, as in
+ * `src/storage-maintenance-worker.ts`, which also serializes builds so concurrent spawns cannot stampede the source.
  */
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
@@ -48,21 +31,18 @@ function createWorker(): WorkerLike {
     import.meta.url,
   );
   if (runningTypeScript) {
-    // Node does not apply `--import tsx` hooks to a file-backed Worker.
-    // Register tsx inside an eval bootstrap, then load the real ESM-flavored
-    // TypeScript entrypoint through its supported CJS API. Same shape as
-    // `storage-maintenance-worker.ts`.
+    // Node does not apply `--import tsx` hooks to a file-backed Worker, so tsx is registered inside an eval
+    // bootstrap.
     const entryPath = fileURLToPath(workerUrl);
     const parentPath = fileURLToPath(import.meta.url);
     const bootstrap = `const { require: tsxRequire } = require('tsx/cjs/api'); tsxRequire(${JSON.stringify(entryPath)}, ${JSON.stringify(parentPath)});`;
     return new Worker(bootstrap, { eval: true, execArgv: [] });
   }
-  // Never inherit parent-only flags such as `--input-type=module`; Node rejects
-  // those when the Worker has a file URL entrypoint.
+  // Never inherit parent-only flags such as `--input-type=module`; Node rejects them for a file-URL Worker.
   return new Worker(workerUrl, { execArgv: [] });
 }
 
-/** Raised when the worker could not be used at all, as opposed to a build that ran and failed. */
+/** The worker could not be used at all, as opposed to a build that ran and failed. */
 class WorkerUnavailableError extends Error {}
 
 class ArchiveProjectionWorker {
@@ -112,8 +92,7 @@ class ArchiveProjectionWorker {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
-      // A build that ran and threw is a real failure and must reach the spawn
-      // path as one — never a WorkerUnavailableError, which would silently
+      // A build that ran and threw is a real failure for the spawn path, never WorkerUnavailableError, which would
       // retry the same doomed build on the main thread.
       if (message.ok) {
         pending.resolve({
@@ -135,15 +114,14 @@ class ArchiveProjectionWorker {
         this.handleWorkerFailure(worker, new WorkerUnavailableError(`Archive projection worker exited ${code}`));
       }
     });
-    // The worker must never hold the host process open at shutdown.
+    // Must never hold the host process open at shutdown.
     worker.unref?.();
     this.worker = worker;
     return worker;
   }
 
   private handleWorkerFailure(worker: WorkerLike, error: Error): void {
-    // A failed Worker emits `error` and then `exit`. Ignore that late exit if a
-    // replacement Worker has already accepted new requests.
+    // A failed Worker emits `error` then `exit`; ignore the late exit if a replacement already took requests.
     if (this.worker !== worker) return;
     this.worker = null;
     this.failPending(error);
@@ -158,19 +136,9 @@ class ArchiveProjectionWorker {
 let sharedWorker = new ArchiveProjectionWorker();
 
 /**
- * Produce the session's archive projection, reusing the existing file when this
- * workgroup's own rows have not moved, extending it in place when rows have
- * only been added, and rebuilding it off the main thread otherwise.
- *
- * Fail-closed is unchanged from the synchronous original: a build that runs and
- * throws propagates, and the spawn aborts rather than mounting a projection
- * that looks valid and yields nothing.
- *
- * The one deliberate exception is the worker being unavailable — it failed to
- * start, crashed, or the host is shutting it down. That is an infrastructure
- * fault, not a bad projection, and refusing every spawn on it would take the
- * fleet down. Those cases fall back to running the SAME decision in process,
- * which is correct but blocking, and say so at WARN.
+ * Makes the session's archive projection current. Fail-closed: a build that throws propagates and the spawn aborts.
+ * The one exception is an unavailable worker (failed to start, crashed, shutting down): an infrastructure fault that
+ * falls back to the SAME decision in process, blocking, logged at WARN, rather than refusing every spawn.
  */
 export async function ensureArchiveProjection(
   srcPath: string,
@@ -195,9 +163,7 @@ export async function ensureArchiveProjection(
 
   const scope = workgroupMemberIds?.length ?? null;
   if (result.mode === 'seeded') {
-    // Distinct log mode: production can grep this apart from ordinary
-    // 'reused'/'appended' traffic to confirm a fresh session avoided the
-    // full-build path.
+    // Distinct log mode so a fresh session's seed is greppable apart from steady-state traffic.
     log.info('Archive projection seeded', {
       agentGroupId,
       dstPath,
@@ -249,10 +215,8 @@ export function stopArchiveProjectionWorker(): Promise<void> {
   return sharedWorker.close();
 }
 
-// Registration at import time is inert by design (see host-lifecycle.ts). The
-// worker is also unref'd, so a shutdown that never reaches this hook still
-// cannot be held open by it; an in-flight rebuild killed mid-write leaves no
-// stamp, so the next spawn rebuilds rather than trusting a partial file.
+// Registration at import is inert (see host-lifecycle.ts). The worker is unref'd, and a rebuild killed mid-write
+// leaves no stamp, so the next spawn rebuilds.
 onHostShutdown(async function archiveProjectionHostShutdown() {
   try {
     await stopArchiveProjectionWorker();
@@ -261,7 +225,7 @@ onHostShutdown(async function archiveProjectionHostShutdown() {
   }
 });
 
-/** Test hook — swaps the worker for a stub and returns a restore function. */
+/** Test hook: swaps the worker factory. */
 export function __setArchiveProjectionWorkerFactoryForTest(factory: ArchiveProjectionWorkerFactory | null): void {
   sharedWorker = factory ? new ArchiveProjectionWorker(factory) : new ArchiveProjectionWorker();
 }

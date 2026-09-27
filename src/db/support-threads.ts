@@ -1,15 +1,6 @@
 /**
- * Support-thread mapping: Gmail thread ⇄ Linear issue ⇄ Slack thread ⇄ session.
- *
- * One row per support email thread (keyed on Gmail `threadId`). Written by the
- * `dispatch_support_issue` delivery-action handler when it opens a new per-issue
- * Slack thread + session, and read by the same handler to route follow-up emails
- * back into the existing thread/session. See migration 041.
- *
- * Seam 3 PR 5d: every export runs on the async driver. Each is a single
- * statement — the upsert is one `INSERT ... ON CONFLICT DO UPDATE`, not a
- * lookup followed by a write — so none needs `centralTransaction` (plan §4.1,
- * §4.4).
+ * Support-thread mapping: Gmail thread ⇄ Linear issue ⇄ Slack thread ⇄ session, one row per Gmail `threadId`
+ * (migration 041). Every export is a single statement, so none needs `centralTransaction`.
  */
 import { getDb } from './connection.js';
 
@@ -49,13 +40,9 @@ export interface UpsertSupportThread {
 }
 
 /**
- * Record a freshly-opened support thread. UPSERT, not INSERT OR IGNORE: a row
- * may already exist with no live session/thread — either seeded from a legacy
- * ticket map (linear fields set, session/slack null) or left behind when its
- * session was archived (reopen). In both cases the new session/thread MUST be
- * recorded or every later follow-up would open yet another thread. Linear
- * fields use COALESCE so a dispatch without ticket info never clobbers a
- * recorded ticket; `created_at` is preserved on conflict.
+ * UPSERT, not INSERT OR IGNORE: a row may exist with no live session (seeded from a legacy ticket map, or left by an
+ * archived session), and the new session/thread MUST be recorded or every follow-up opens another thread. Linear
+ * fields COALESCE so a dispatch without ticket info never clobbers a recorded ticket; `created_at` is preserved.
  */
 export async function upsertSupportThread(t: UpsertSupportThread, now: string): Promise<void> {
   await getDb().run(
@@ -83,18 +70,13 @@ export async function upsertSupportThread(t: UpsertSupportThread, now: string): 
   );
 }
 
-/**
- * Resolve the support thread a per-issue session belongs to. Used by the
- * `update_support_ticket` handler — keying on the CALLING session id means the
- * agent never supplies a cross-row key (same security posture as scheduling).
- */
+/** Keyed on the CALLING session id, so the agent never supplies a cross-row key. */
 export function getSupportThreadBySession(
   sessionId: string,
   sessionThreadId: string | null,
 ): Promise<SupportThread | undefined> {
-  // Any agent working the ticket's Slack thread may record the ticket, not only
-  // the session the row is bound to. Both keys are host-authored (the session
-  // row's id and thread_id), so the agent still supplies no cross-row key.
+  // Any agent in the ticket's Slack thread may record the ticket; both keys are host-authored, so the agent still
+  // supplies no cross-row key.
   return getDb().get<SupportThread>(
     `SELECT * FROM support_threads
       WHERE session_id = ? OR (? IS NOT NULL AND slack_thread_id = ?)
@@ -106,7 +88,6 @@ export function getSupportThreadBySession(
   );
 }
 
-/** Record the Linear ticket a per-issue session created for its thread. */
 export async function setSupportThreadTicket(
   gmailThreadId: string,
   linearIssue: string,
@@ -123,11 +104,7 @@ export async function setSupportThreadTicket(
   );
 }
 
-/**
- * Touch a thread on new activity (a follow-up email or engineer reply). Bumps
- * `last_activity_at`, refreshes `last_gmail_message_id` when supplied, and
- * reopens a previously-closed thread (a customer reply revives the issue).
- */
+/** Also reopens a closed thread: a customer reply revives the issue. */
 export async function touchSupportThread(
   gmailThreadId: string,
   now: string,
@@ -144,22 +121,15 @@ export async function touchSupportThread(
 }
 
 /**
- * Rebind a thread to a fresh session, and ONLY that — one column. Status and
- * activity belong to `touchSupportThread`, which the caller runs anyway.
- *
- * A support thread outlives its session: reclaim archives the session dir and
- * closes the row, but the Slack thread, the Linear ticket and the customer's
- * Gmail thread are all still the same issue. Replacing the whole row (the
- * upsert path) would mint a new Slack thread and a duplicate announcement for
- * what is, to everyone involved, an ongoing conversation.
+ * Rebinds ONE column. Status and activity belong to `touchSupportThread`. The upsert path would mint a new Slack
+ * thread and a duplicate announcement for what is still the same issue.
  */
 export async function rebindSupportThreadSession(
   gmailThreadId: string,
   sessionId: string,
   agentGroupId: string,
 ): Promise<void> {
-  // messaging_group_id is deliberately left alone: it names the bot that posted
-  // the parent announcement, and only that bot can edit it.
+  // messaging_group_id stays: it names the bot that posted the parent announcement, and only that bot can edit it.
   await getDb().run(
     'UPDATE support_threads SET session_id = @sessionId, agent_group_id = @agentGroupId WHERE gmail_thread_id = @gmailThreadId',
     { gmailThreadId, sessionId, agentGroupId },

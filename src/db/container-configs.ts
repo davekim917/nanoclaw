@@ -22,17 +22,8 @@ const JSON_COLUMNS = new Set([
 ]);
 
 /**
- * Resolve the provider name for a session using the precedence documented in
- * the provider-install skills:
- *
- *   sessions.agent_provider
- *     → container_configs.provider
- *     → 'claude'
- *
- * Pure so the precedence can be unit-tested without a DB or filesystem.
- * Lives here (not container-runner.ts, which re-exports it) so light
- * consumers — e.g. the router's provider-aware flag parsing — don't have to
- * import the container runner, which half the test suite factory-mocks.
+ * Provider precedence: `sessions.agent_provider` → `container_configs.provider` → 'claude'. Lives here rather than
+ * container-runner.ts so light consumers need not import the runner, which much of the suite mocks.
  */
 export function resolveProviderName(
   sessionProvider: string | null | undefined,
@@ -41,11 +32,7 @@ export function resolveProviderName(
   return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
 }
 
-/**
- * Exported for the synchronous blocks the plan allowlists (§4.5, I-1): guard
- * decisions and the storage pass execute these on the raw handle rather than
- * calling the async exports below.
- */
+/** For the allowlisted synchronous blocks (guard decisions, the storage pass), which run these on the raw handle. */
 export const CONTAINER_CONFIG_BY_GROUP_SQL = 'SELECT * FROM container_configs WHERE agent_group_id = ?';
 export const CONTAINER_CONFIGS_ALL_SQL = 'SELECT * FROM container_configs';
 

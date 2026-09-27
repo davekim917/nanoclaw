@@ -1,23 +1,10 @@
 /**
- * Provider availability per agent group.
- *
- * A provider account can go hard-unavailable for hours or days (a weekly
- * usage limit, a suspended key). Spawning a container onto it in that window
- * produces one guaranteed-failing turn per wake — visible to users as an
- * error, and for a scheduled agent, silently repeated forever.
- *
- * The container observes the failure (only it talks to the provider) and
- * reports it; the host records the window here and routes later spawns to the
- * group's declared fallback until the window expires. Recovery needs no
- * probe, no cron, and no operator action: the row simply ages out, and the
- * next spawn returns to the primary provider.
- *
- * Cooldown precedence:
- *   1. the provider's own reset time, when it tells us one ("try again at X")
- *   2. otherwise exponential backoff on the failure streak
- * Both are clamped — a provider claiming a year-long lockout should not
- * outlive an operator fixing the account, and a one-second reset should not
- * produce a hot loop.
+ * Provider availability per agent group. An account can go unavailable for hours or days (usage limit, suspended
+ * key), and spawning onto it produces a guaranteed-failing turn per wake. The container reports the failure; the host
+ * records the window here and routes spawns to the group's declared fallback until it expires. Recovery needs no
+ * probe: the row ages out.
+ * Cooldown: the provider's stated reset time when it gives one, else exponential backoff on the failure streak, both
+ * clamped.
  */
 import { centralTransaction } from './central-lease.js';
 import { getDb } from './connection.js';
@@ -25,7 +12,7 @@ import { getDb } from './connection.js';
 /** Never trust an unbounded reset promise from a provider. */
 const MAX_COOLDOWN_MS = 7 * 24 * 60 * 60_000;
 const MIN_COOLDOWN_MS = 60_000;
-/** Backoff when the provider gave us no reset time: 15m, 30m, 1h … capped. */
+/** Used when the provider gave no reset time: 15m, 30m, 1h, … capped. */
 const BACKOFF_BASE_MS = 15 * 60_000;
 const BACKOFF_CAP_MS = 6 * 60 * 60_000;
 
@@ -53,24 +40,14 @@ function cooldownMs(
 ): number {
   const cap = Math.min(MAX_COOLDOWN_MS, options.maxCooldownMs ?? MAX_COOLDOWN_MS);
   const backoff = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, consecutiveFailures - 1));
-  // A MEASURED reset — the provider's own rate-limit snapshot reporting when
-  // the exhausted window rolls over (Codex `account/rateLimits/read`, plan
-  // item 0.7) — is the schedule, not an upper bound: nothing restores a
-  // usage window early, and re-probing it costs a spawn per backoff step
-  // that lands on the fallback anyway. Still clamped: never past the cap.
+  // A MEASURED reset (the provider's own rate-limit snapshot) is the schedule, not an upper bound: nothing restores a
+  // usage window early. Still clamped.
   if (options.honorResetAt && resetAtMs !== null && Number.isFinite(resetAtMs)) {
     return Math.min(cap, clampCooldown(resetAtMs - nowMs));
   }
-  // A provider's stated reset is an UPPER BOUND, never the schedule. Accounts
-  // are often restored before the quoted time, and a window pinned to that
-  // quote would keep a group on its fallback for days after the primary came
-  // back — the exact hard-lock this mechanism exists to avoid. Taking the
-  // minimum still honors a SHORT stated reset ("try again in 5 minutes")
-  // while retrying a long one on the backoff schedule instead.
-  //
-  // Retries are cheap because spawns are demand-driven: a probe costs one
-  // container start and a turn that dies immediately, it is suppressed from
-  // chat, and it reroutes to the fallback in the same breath.
+  // A reset stated in error prose is an UPPER BOUND, never the schedule: accounts are often restored early, and
+  // pinning to the quote would strand a group on its fallback for days. The minimum still honors a short stated
+  // reset. Retries are cheap: a probe is one suppressed, immediately rerouted turn.
   if (resetAtMs !== null && Number.isFinite(resetAtMs)) {
     return Math.min(cap, clampCooldown(Math.min(resetAtMs - nowMs, backoff)));
   }
@@ -89,9 +66,8 @@ export async function getProviderHealth(
 }
 
 /**
- * True while the group's provider is inside a recorded cooldown window.
- * Absence of a row — the normal case — is always "available": this must fail
- * OPEN, or a bookkeeping gap would strand every group on its fallback.
+ * Must fail OPEN: no row (the normal case) is always available, or a bookkeeping gap would strand every group on its
+ * fallback.
  */
 export async function isProviderUnavailable(
   agentGroupId: string,
@@ -106,16 +82,9 @@ export async function isProviderUnavailable(
 }
 
 /**
- * Record a provider as unavailable and return the window end.
- * `resetAt` is the provider's own stated recovery time when it gave one.
- * `honorResetAt` says that time was MEASURED (a rate-limit snapshot), not
- * parsed out of error prose, so the window ends exactly there instead of on
- * the backoff schedule. `maxCooldownMs` bounds the window below the global
- * cap — the coarse Codex systemError park uses it to stay within an hour.
- *
- * The read-then-upsert is one central transaction (`centralTransaction`,
- * plan §4.4), which is what keeps the failure streak from racing itself. The
- * closure is DB-only: nothing but driver statements, sequentially awaited.
+ * Records a provider as unavailable and returns the window end. `honorResetAt` means `resetAt` was MEASURED, not
+ * parsed from prose; `maxCooldownMs` bounds the window below the global cap. The read-then-upsert is one central
+ * transaction so the failure streak cannot race itself.
  */
 export async function markProviderUnavailable(
   agentGroupId: string,
@@ -168,14 +137,9 @@ export async function markProviderUnavailable(
 }
 
 /**
- * Clear a cooldown — a turn completed on this provider, so it works.
- *
- * Read then a CONDITIONAL update, not a transaction: the UPDATE only applies
- * while the row still looks the way the read saw it (`updated_at` is the
- * version stamp — every writer bumps it). A `markProviderUnavailable` that
- * commits between the read and this write therefore stands: its newer cooldown
- * is not clobbered by a success that predates it. Returns
- * whether the clear applied.
+ * Clears a cooldown after a successful turn. A CONDITIONAL update keyed on `updated_at` (every writer bumps it), so a
+ * newer `markProviderUnavailable` committed between the read and the write is not clobbered by an older success.
+ * Returns whether it applied.
  */
 export async function markProviderAvailable(
   agentGroupId: string,
@@ -184,8 +148,7 @@ export async function markProviderAvailable(
 ): Promise<boolean> {
   if (!agentGroupId || !provider) return false;
   const row = await getProviderHealth(agentGroupId, provider);
-  // Only write when there is something to clear: a healthy provider must not
-  // generate a DB write on every successful turn.
+  // A healthy provider must not cause a DB write on every turn.
   if (!row || (row.unavailable_until === null && row.consecutive_failures === 0)) return false;
   const result = await getDb().run(
     `UPDATE provider_health
@@ -205,12 +168,8 @@ export async function markProviderAvailable(
 }
 
 /**
- * Parse a provider's stated recovery time out of its own error text.
- *
- * Codex says: "You've hit your usage limit. … try again at Aug 8th, 2026
- * 12:42 AM." The ordinal suffix ("8th") is not parseable by `Date`, so it is
- * stripped first. Returns null when nothing usable is present — the caller
- * then falls back to backoff, which is the safe direction.
+ * Parses a stated recovery time from the provider's error text ("try again at Aug 8th, 2026 12:42 AM"). Ordinal
+ * suffixes are stripped because `Date` cannot parse them. Null when nothing usable is present (the caller backs off).
  */
 export function parseProviderResetAt(message: string | null | undefined, nowMs = Date.now()): string | null {
   if (!message) return null;
@@ -222,7 +181,7 @@ export function parseProviderResetAt(message: string | null | undefined, nowMs =
     .trim();
   const parsed = Date.parse(cleaned);
   if (!Number.isFinite(parsed)) return null;
-  // A reset in the past (clock skew, a stale message) is not a usable window.
+  // A past reset (clock skew, stale message) is not a usable window.
   if (parsed <= nowMs) return null;
   return new Date(parsed).toISOString();
 }

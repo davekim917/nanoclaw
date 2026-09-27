@@ -1,9 +1,6 @@
 /**
- * Seam 3 PR 5d: every export runs on the async driver. Each statement is
- * self-guarding — the claim is `INSERT ... ON CONFLICT DO NOTHING`, every
- * transition carries the status it is transitioning FROM in its `WHERE` — so
- * two callers racing settle in SQLite, not in a lease, and none of these needs
- * `centralTransaction` (plan §4.1, §4.4).
+ * Every statement is self-guarding (the claim is `ON CONFLICT DO NOTHING`, each transition names its FROM status in
+ * `WHERE`), so races settle in SQLite and none needs `centralTransaction`.
  */
 import { getDb } from './connection.js';
 
@@ -23,7 +20,6 @@ function params(key: ChannelIngressReceiptKey): Record<string, string> {
   };
 }
 
-/** The claim INSERT, shared by the direct and the deferred-replay claim. */
 async function claimIngressRow(key: ChannelIngressReceiptKey): Promise<boolean> {
   const result = await getDb().run(
     `INSERT INTO channel_ingress_receipts
@@ -35,7 +31,6 @@ async function claimIngressRow(key: ChannelIngressReceiptKey): Promise<boolean> 
   return result.changes > 0;
 }
 
-/** Atomically reserve all router side effects for one platform event. */
 export function claimChannelIngress(key: ChannelIngressReceiptKey): Promise<boolean> {
   return claimIngressRow(key);
 }
@@ -53,9 +48,8 @@ export async function completeChannelIngress(key: ChannelIngressReceiptKey): Pro
 }
 
 /**
- * Keep an approval-gated event reserved without treating it as delivered.
- * Platform recovery retries remain blocked until the human flow explicitly
- * claims the deferred receipt for replay.
+ * Keeps an approval-gated event reserved but not delivered: platform recovery retries stay blocked until the human
+ * flow claims it for replay.
  */
 export async function deferChannelIngress(key: ChannelIngressReceiptKey): Promise<void> {
   await getDb().run(
@@ -71,15 +65,9 @@ export async function deferChannelIngress(key: ChannelIngressReceiptKey): Promis
 }
 
 /**
- * Atomically reclaim an approval-deferred event. The INSERT fallback supports
- * approvals created before this migration without allowing a completed event
- * to replay.
- *
- * Two awaited statements, not a transaction: the UPDATE's `status = 'deferred'`
- * IS the compare-and-set, and the fallback INSERT's `ON CONFLICT DO NOTHING` is
- * the claim. A concurrent caller landing between them can only make the INSERT
- * lose its conflict race and return false — the same answer the loser of the
- * original single-block race got.
+ * The INSERT fallback covers approvals that predate the migration without letting a completed event replay. Two
+ * statements, not a transaction: the UPDATE's `status = 'deferred'` is the compare-and-set and the INSERT's `ON
+ * CONFLICT DO NOTHING` the claim, so an interleaved caller can only make this return false.
  */
 export async function claimDeferredChannelIngress(key: ChannelIngressReceiptKey): Promise<boolean> {
   const updated = await getDb().run(
@@ -96,7 +84,6 @@ export async function claimDeferredChannelIngress(key: ChannelIngressReceiptKey)
   return claimIngressRow(key);
 }
 
-/** Resolve a denied/abandoned deferred event without routing it. */
 export async function completeDeferredChannelIngress(key: ChannelIngressReceiptKey): Promise<void> {
   await getDb().run(
     `UPDATE channel_ingress_receipts
@@ -110,7 +97,6 @@ export async function completeDeferredChannelIngress(key: ChannelIngressReceiptK
   );
 }
 
-/** Release a failed route so recovery can retry the event. */
 export async function releaseChannelIngress(key: ChannelIngressReceiptKey): Promise<void> {
   await getDb().run(
     `DELETE FROM channel_ingress_receipts
@@ -123,7 +109,7 @@ export async function releaseChannelIngress(key: ChannelIngressReceiptKey): Prom
   );
 }
 
-/** Processing claims cannot survive the host process that owned their side effects. */
+/** Processing claims cannot outlive the host process that owned their side effects. */
 export async function resetProcessingChannelIngress(): Promise<number> {
   const result = await getDb().run("DELETE FROM channel_ingress_receipts WHERE status = 'processing'");
   return result.changes;

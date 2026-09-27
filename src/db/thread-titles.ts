@@ -1,13 +1,6 @@
 /**
- * Durable idempotency + retry state for Discord thread topic-titling.
- * See migration 062 for why this table exists and why `channel_type` is
- * stored despite not being in the original spec (sibling-bot token
- * resolution on retry).
- *
- * Seam 3 PR 5d: the five statements run on the async driver. Each is a single
- * statement — the claim is `INSERT ... ON CONFLICT DO NOTHING` and the failure
- * counter increments in SQL — so none needs `centralTransaction` (plan §4.1,
- * §4.4).
+ * Idempotency and retry state for Discord thread titling (migration 062). `channel_type` is stored so a retry can
+ * resolve the sibling bot's token. Single statements only, so none needs `centralTransaction`.
  */
 import { getDb } from './connection.js';
 
@@ -26,10 +19,8 @@ export function getThreadTitleRow(threadId: string): Promise<ThreadTitleRow | un
 }
 
 /**
- * Claim a thread for titling. Idempotent — `ON CONFLICT DO NOTHING` so
- * concurrent siblings racing through `maybeRenameNewThread` for the same
- * thread can't double-insert (or clobber an existing row's `first_message`
- * with a later follow-up).
+ * `ON CONFLICT DO NOTHING`: siblings racing through `maybeRenameNewThread` must not double-insert or clobber
+ * `first_message` with a later follow-up.
  */
 export async function insertThreadTitleClaim(
   threadId: string,
@@ -45,7 +36,7 @@ export async function insertThreadTitleClaim(
   );
 }
 
-/** Mark a thread as successfully titled — permanent, never re-attempted again. */
+/** Permanent: never re-attempted. */
 export async function markThreadTitled(
   threadId: string,
   title: string,
@@ -54,17 +45,11 @@ export async function markThreadTitled(
   await getDb().run(`UPDATE thread_titles SET title = ?, titled_at = ? WHERE thread_id = ?`, title, titledAt, threadId);
 }
 
-/** Record a failed attempt so the retry sweep's `attempts < N` filter eventually gives up. */
 export async function recordThreadTitleAttemptFailure(threadId: string): Promise<void> {
   await getDb().run(`UPDATE thread_titles SET attempts = attempts + 1 WHERE thread_id = ?`, threadId);
 }
 
-/**
- * Rows still untitled, under the attempt cap, and created within the retry
- * window — the host-sweep retry step's candidate set. Ordered oldest-first so
- * a backlog drains in creation order rather than starving old threads behind
- * a stream of new failures.
- */
+/** Oldest-first, so a backlog drains in creation order instead of starving old threads behind new failures. */
 export function getPendingThreadTitleRetries(
   sinceIso: string,
   maxAttempts: number,
