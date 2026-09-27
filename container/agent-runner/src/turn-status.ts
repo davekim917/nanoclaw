@@ -3,20 +3,14 @@ import { getTaskSeriesId } from './db/session-routing.js';
 import { getAgentMailbox } from './mailbox/index.js';
 
 /**
- * The model/effort/context status line stamped under an agent's own replies.
- *
  * Context occupancy is kept here, not on `TurnUsageInfo`: the usage ledger
  * stores per-turn deltas, and occupancy is an absolute reading that must not be
  * deltaed. It is also needed mid-turn, which the result-scoped ledger cannot serve.
  */
 
 /**
- * Tokens in the context window as of the most recent provider request.
- *
- * Providers pass a finished number because the sum is provider-specific:
- * Anthropic's `input_tokens` EXCLUDES cache reads and writes (add all three),
- * while OpenAI/Codex counts cached tokens as a SUBSET of input (adding them
- * double-counts).
+ * Providers pass a finished number because the sum is provider-specific: Anthropic's `input_tokens` EXCLUDES
+ * cache reads and writes (add all three), while Codex counts cached tokens as a SUBSET of input.
  */
 let contextTokens: number | null = null;
 
@@ -145,7 +139,8 @@ interface Snapshot {
 
 /**
  * True in the process that SETS turn state. Its memory is authoritative and is
- * never hydrated from the DB, which may be stale after a failed persist.
+ * never hydrated from the DB, which may be stale after a failed persist. A process
+ * that never sets state (the MCP subprocess, long-lived across turns) re-reads every time.
  */
 let ownsStore = false;
 
@@ -172,7 +167,6 @@ function persist(): void {
 
 let persistFailed = false;
 
-/** Load the persisted snapshot into this process. Returns false if none. */
 export function hydrateTurnStatus(): boolean {
   if (ownsStore) return false;
   let raw: string | undefined;

@@ -67,7 +67,7 @@ const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
 
 /**
  * Audio/video only when declared (closed by default), resolved through `resolveModelCapabilities` so this and the
- * config writer cannot disagree.
+ * config writer cannot disagree. Images and PDFs always forward: a rejection is visible, a withheld file is not.
  */
 export function forwardableAttachmentMime(
   mime: string,
@@ -135,7 +135,8 @@ export function buildPromptParts(
 /**
  * Enumerated rather than `permission: 'allow'` so `question` is a deterministic `deny`: a headless container cannot
  * answer it and the session wedges. Every other key stays `allow`, so the destructive-action plugin remains the only
- * guard. Values must be `allow`/`deny` only: an invalid action fails the whole spawn.
+ * guard. Values must be `allow`/`deny` only: an invalid action fails the whole spawn. Undocumented categories are
+ * omitted on purpose, so unlisted and future keys keep OpenCode's defaults rather than an implicit allow.
  */
 export const OPENCODE_PERMISSIONS: Record<string, string> = {
   read: 'allow',
@@ -475,7 +476,6 @@ export function declarationsApplyToModel(
 ): boolean {
   const configured = env.OPENCODE_MODEL?.trim().toLowerCase();
   if (!configured) return false;
-  // No per-turn override resolved: the turn runs the configured model.
   const effective = effectiveModel?.trim().toLowerCase();
   if (!effective) return true;
   return effective === configured;
@@ -542,7 +542,7 @@ export function buildOpenCodeConfig(
   const modelsToRegister = [defaultModelId, smallModelId]
     .filter((mid): mid is string => Boolean(mid))
     .filter((mid, i, a) => a.indexOf(mid) === i);
-  // Declarations attach only to the configured model's entry; a per-turn `-m` gets a bare entry.
+  // Declarations attach only when the effective model is the configured OPENCODE_MODEL (a matching `-m` included).
   const { limit: modelLimit, modalities: modelModalities } = resolveModelCapabilities(model);
   const modelsBlock =
     modelsToRegister.length > 0
@@ -608,8 +608,8 @@ export function buildOpenCodeConfig(
     snapshot: false,
     provider: providerOptions,
     mcp,
-    // Both unconditional: the managed-Git guard has no opt-out, and with the opt-out and no bootstrap mount
-    // OpenCode ignores only the missing second path.
+    // Both unconditional: the managed-Git guard (agent bash only; MCP and host Git run outside it) has no opt-out,
+    // and with the opt-out and no bootstrap mount OpenCode ignores only the missing second path.
     plugin: [MANAGED_GIT_OPENCODE_PLUGIN_PATH, GUARD_PLUGIN, ...commentRulePlugins()],
   };
 }
@@ -734,8 +734,7 @@ export function runtimeConfigKey(
     model: process.env.OPENCODE_MODEL,
     small: process.env.OPENCODE_SMALL_MODEL,
     providers: authProviders,
-    // A direct-native route changes the child process environment. Crossings
-    // must respawn; model switches that stay on the same route must not.
+    // A direct-native route changes the child env: crossing it respawns, a same-route model switch must not.
     nativeDirect: shouldBypassOpenCodeProxy(effectiveModel, authProviders),
     // Effort lives in the server config, so changing it respawns; an unresumable respawn self-heals via the recap.
     effort,

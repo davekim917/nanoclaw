@@ -18,8 +18,8 @@
 # "directory to run in"; nothing calls it a sandbox. OpenCode has a permission
 # category named `external_directory` precisely because reaching outside the
 # project root is a supported thing to permit — enumerated at
-# container/agent-runner/src/providers/opencode.ts:138 and set to `allow` at
-# :146. On the host this was written for, ~/.config/opencode/opencode.jsonc
+# container/agent-runner/src/providers/opencode.ts:139 and set to `allow` at
+# :147. On the host this was written for, ~/.config/opencode/opencode.jsonc
 # declared no `permission` block at all, so nothing narrowed that default;
 # check your own before assuming otherwise. Bash and absolute paths run as the
 # host user either way.

@@ -1,7 +1,8 @@
 /**
- * Peer-mode CODEX_HOME for a Claude/OpenCode container: `/home/node/.codex-runtime/`, whose only host input is the
- * auth.json symlink (OAuth refresh must persist to the host); config, MCP servers, agents and plugins are generated
- * in-container. `~/.codex/config.toml` cannot hold them because the host regenerates it on every spawn.
+ * Peer-mode CODEX_HOME for a Claude/OpenCode container: `/home/node/.codex-runtime/`. Its only input from the host
+ * CLI's Codex home is the auth.json symlink (OAuth refresh must persist there); config, MCP servers and plugins are
+ * generated in-container, and agents/ links the host-populated group roster. `~/.codex/config.toml` can't hold them:
+ * the host regenerates it on every spawn.
  */
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
@@ -48,7 +49,6 @@ const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
 const FAILED_CODEX_HOME = '/nonexistent/codex-runtime-setup-failed';
 const CONTAINER_CLAUDE_SKILLS_DIR = '/home/node/.claude/skills';
 const CONTAINER_PLUGINS_DIR = '/workspace/plugins';
-// Codex scans this in addition to $CODEX_HOME/skills/ (verified via `codex debug prompt-input`).
 const CONTAINER_AGENTS_SKILLS_DIR = '/home/node/.agents/skills';
 
 /** Parallel implementation of `buildContainerCodexConfig()` in src/providers/codex.ts: keep the two in sync. */
@@ -351,7 +351,8 @@ export function writeCodexHooksAndTrust(opts?: {
 
 /**
  * Returns `null` only when the codex auth mount is absent; every filesystem failure returns the FAILED_CODEX_HOME
- * sentinel instead (see `failClosed`).
+ * sentinel instead (see `failClosed`). Set `process.env.CODEX_HOME` to the result BEFORE constructing the
+ * provider: it snapshots process.env for every child it spawns.
  */
 export function setupCodexRuntime(
   mcpServers: Record<string, McpServerConfig>,
@@ -369,7 +370,6 @@ export function setupCodexRuntime(
     return failClosed('could not create the runtime dir', err);
   }
 
-  // Symlink so OAuth token refresh writes back to the host's mounted file.
   const runtimeAuth = path.join(RUNTIME_CODEX_DIR, 'auth.json');
   try {
     if (fs.existsSync(runtimeAuth) || fs.lstatSync(runtimeAuth, { throwIfNoEntry: false } as never)) {
@@ -550,7 +550,6 @@ function findCodexSubPlugins(
 ): Array<{ dir: string; entryName: string }> {
   const found: Array<{ dir: string; entryName: string }> = [];
   const seen = new Set<string>();
-  // Both monorepo layouts: `<root>/plugins/<sub>` and `<root>/<sub>`.
   for (const container of [path.join(pluginDir, 'plugins'), pluginDir]) {
     if (!isDirectorySafe(container)) continue;
     // Exclusions are matched against the walk's own relative path, never a resolved one.
@@ -576,7 +575,6 @@ function findCodexSubPlugins(
 }
 
 export interface CodexPluginRegistrationPlan {
-  /** Display label. For a monorepo sub-plugin this is `<repo>/<entry>`. */
   name: string;
   action: 'register' | 'skip';
   reason?: string;
@@ -625,7 +623,6 @@ export function planCodexPluginRegistration(
     }
     const entryName = readCodexPluginEntryName(dir);
     if (entryName) {
-      // Single-plugin repo: the repo root IS the plugin.
       plans.push({ name, action: 'register', entryName, marketplaceName, repoName: name, pluginDir: dir });
       continue;
     }

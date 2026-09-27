@@ -94,8 +94,9 @@ function deferredRecallTargetId(m: MessageInRow): string | null {
 }
 
 /**
- * Keep recall-enabled batches atomic. A real workgroup runtime is always recall-enabled, so every admissible
- * trigger must have its recall partner; a harness batch with no valid pair keeps legacy behavior.
+ * Keep recall-enabled batches atomic. A real workgroup runtime is always recall-enabled, so every recall-bearing
+ * trigger must have its partner (accumulated context, system rows and /clear bear none); a harness batch with no
+ * valid pair keeps legacy behavior.
  */
 export function retainCompleteRecallUnits(rows: MessageInRow[]): MessageInRow[] {
   const ids = new Set(rows.map((row) => row.id));
