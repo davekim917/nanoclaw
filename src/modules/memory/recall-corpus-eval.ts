@@ -1,11 +1,4 @@
-/**
- * Recall-corpus evaluation harness.
- *
- * Test-only: the sole consumer is `pre-turn-context.test.ts`, which scores
- * `tests/fixtures/workgroup-memory-recall.json` against the live retrieval
- * helpers. Nothing here runs in production. It lived in `pre-turn-context.ts`
- * until it was split out, where its exports read as live retrieval API.
- */
+/** Test-only: consumed by `pre-turn-context.test.ts`; nothing here runs in production. */
 import { compareCodepoint, ephemeralExpansion, rankByBestPassage, tokenizeForRecall } from './pre-turn-context.js';
 
 export interface RecallCorpus {

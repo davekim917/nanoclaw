@@ -3,13 +3,9 @@ import { randomUUID } from 'crypto';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { centralTransaction } from '../../db/central-lease.js';
 import { getDb } from '../../db/connection.js';
-// Lazy import to avoid module-init cycle (events.ts imports nothing from dispatch.ts).
-// The import() call is memoized by Node's module cache after the first resolution.
-//
-// TS quirk: `Parameters<typeof emitDashboardEvent>` only resolves to the LAST
-// overload of an overloaded function, so a rest-spread signature here would
-// silently force callers into one specific event kind. Re-declare each
-// overload explicitly so the type-system honors all of them.
+// Lazy import avoids a module-init cycle. The overloads below are re-declared
+// explicitly: `Parameters<typeof f>` only resolves an overloaded function's LAST
+// overload, which would force callers into one event kind.
 import type {
   InboundMessagePayload as _IMP,
   TaskEventPayload as _TEP,
@@ -61,7 +57,6 @@ const DEFAULT_CAPABILITY_CONFIG: CapabilityConfig = {
   drainGraceSec: 120,
 };
 
-/** In-process deduplication guard for completeSpawnSideEffects. */
 const completionInFlight = new Map<string, Promise<void>>();
 
 export async function applySpawnTask(content: Record<string, unknown>, callerSession: Session): Promise<void> {
@@ -74,16 +69,11 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     return;
   }
 
-  // Self-orchestration: spawned children always run in the SAME agent group as
-  // the parent. They share workspace, memory, CLAUDE.md, channels — only the
-  // session/thread is isolated. There is no cross-group dispatch primitive.
+  // Children always run in the parent's agent group; there is no cross-group dispatch.
   const childAgentGroupId = callerSession.agent_group_id;
 
-  // Surface mode — per-channel capability check (cycle-3 S24). Resolved BEFORE
-  // the admission transaction: it reads the messaging group (whose channel
-  // type never changes) and consults the in-memory adapter registry, and a
-  // central transaction closure is DB-only (plan §4.4) — no adapter lookups
-  // inside it.
+  // Resolved BEFORE the transaction: it consults the in-memory adapter
+  // registry, and the transaction closure must stay DB-only.
   let surfaceMode: 'native_thread' | 'headless' = 'headless';
   if (callerSession.messaging_group_id !== null) {
     const mg = await getMessagingGroup(callerSession.messaging_group_id);
@@ -95,24 +85,16 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     }
   }
 
-  // All admission steps inside a single central transaction. The driver opens
-  // it IMMEDIATE (write lock from BEGIN) so the cap-count read holds the write
-  // lock through the INSERT — prevents two parallel delivery drains from the
-  // same orchestrator both reading the same count, both passing the cap check,
-  // and both succeeding INSERT (cap exceeded). The closure is DB-only: every notification, wake
-  // and dashboard event below runs after commit, never after a rollback.
+  // BEGIN IMMEDIATE holds the write lock from the cap-count read through the
+  // INSERT, so two parallel drains can't both pass the cap. DB-only closure:
+  // every notification, wake and event runs after commit.
   let taskRow: Task | null = null;
   let replayResult: { message: string } | null = null;
   let notOrchestrator = false;
 
   await centralTransaction(async () => {
-    // Step 0: Auth — the caller's agent_group must hold the orchestrator
-    // capability, read INSIDE the transaction. Read
-    // before the closure, the awaited check yields, and a `revokeCapability`
-    // landing in that window admits one task after the revoke. Under BEGIN
-    // IMMEDIATE the revoke either commits before this read (rejected here) or
-    // waits for this commit (the task is admitted while the capability still
-    // held). The same holds for the cap config the count below is judged by.
+    // Capability read INSIDE the transaction, so a concurrent revoke either
+    // commits first (rejected here) or waits for this commit.
     if (!(await hasOrchestratorCapability(callerSession.agent_group_id))) {
       notOrchestrator = true;
       return;
@@ -120,7 +102,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     const capConfig =
       (await getCapabilityConfig(callerSession.agent_group_id, 'orchestrator')) ?? DEFAULT_CAPABILITY_CONFIG;
 
-    // Step 1: Idempotency replay PRECEDES cap (cycle-3 M20)
+    // Idempotency replay PRECEDES the cap check.
     const existingByIdempotency = await getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
     if (existingByIdempotency) {
       const computedHash = computeRequestHash(taskContent, deadline);
@@ -134,7 +116,6 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
       return;
     }
 
-    // Step 2: Concurrency cap — only for NEW admissions
     const activeCount = await countActiveByParent(callerSession.id);
     if (activeCount >= capConfig.concurrencyCap) {
       replayResult = {
@@ -143,12 +124,8 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
       return;
     }
 
-    // Step 3: Compute request_hash
     const requestHash = computeRequestHash(taskContent, deadline);
 
-    // Step 4: surface_mode was resolved above, before the transaction.
-
-    // Step 5: Atomic INSERT
     const taskId = deriveSpawnTaskId(callerSession.id, idempotencyKey);
     const now = new Date().toISOString();
     taskRow = await insertTaskAtomic({
@@ -179,7 +156,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
       surface_mode: surfaceMode,
     });
 
-    // Parallel admit race: if INSERT returned null, SELECT the winner
+    // Parallel admit race: INSERT returned null, so read the winner.
     if (taskRow === null) {
       taskRow = await getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
       if (taskRow) {
@@ -191,18 +168,14 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     }
   }, 'applySpawnTask');
 
-  // Post-transaction handling — every notification/wake is an external effect
-  // and runs after commit, never inside the closure.
   if (notOrchestrator) {
     await _notifyCaller(callerSession, 'spawn rejected: not an orchestrator');
     return;
   }
-  // TypeScript doesn't track mutation through the transaction callback,
-  // so we assert the type here.
+  // TypeScript doesn't track mutation through the transaction callback.
   const postTxnReplay = replayResult as { message: string } | null;
   if (postTxnReplay) {
     await _notifyCaller(callerSession, postTxnReplay.message);
-    // P11 carry-forward: wake caller so it sees the notification on next turn
     void requestWake(callerSession, 'inbound-message').catch((err) =>
       log.warn('wakeContainer(caller) failed after replay notification', { err }),
     );
@@ -217,15 +190,13 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
 
   const admittedTask = finalTaskRow;
 
-  // Sync admit notification — failure logged but NOT thrown
   await _notifyCaller(callerSession, `Task admitted: ${admittedTask.task_id}`);
 
-  // P11 carry-forward: wake caller so it sees the admit notification
   void requestWake(callerSession, 'inbound-message').catch((err) =>
     log.warn('wakeContainer(caller) failed after admit notification', { err }),
   );
 
-  // Emit dashboard event AFTER transaction committed (kind='admit')
+  // Only AFTER commit.
   void lazyEmit('task_event', {
     task_id: admittedTask.task_id,
     kind: 'admit',
@@ -234,12 +205,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     admitted_at: admittedTask.admitted_at,
   });
 
-  // Schedule side-effect completion. Pass the resolved child agent group id
-  // so the side-effect path doesn't need to re-derive it. Args stay on
-  // setImmediate's own (fn, ...args) forwarding — a test asserts on that
-  // exact call shape. completeSpawnSideEffects internally .catch()es
-  // _runCompletionSideEffects, so the promise it returns never rejects —
-  // void is safe here.
+  // Tests assert on this exact setImmediate(fn, ...args) call shape.
   setImmediate(
     (taskId: string, groupId: string) => {
       void completeSpawnSideEffects(taskId, groupId);
@@ -249,12 +215,8 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   );
 }
 
-/**
- * Post-admit side-effect completion: postParent → createThread → openSession.
- * Called via setImmediate from applySpawnTask AND from the reconciler for crash recovery.
- */
+/** Called from applySpawnTask AND from the reconciler for crash recovery. */
 export async function completeSpawnSideEffects(taskId: string, childAgentGroupId: string): Promise<void> {
-  // In-process deduplication guard
   const existing = completionInFlight.get(taskId);
   if (existing) {
     return existing;
@@ -271,7 +233,6 @@ export async function completeSpawnSideEffects(taskId: string, childAgentGroupId
 }
 
 async function _runCompletionSideEffects(taskId: string, childAgentGroupId: string): Promise<void> {
-  // Acquire durable lease — returns null if another worker holds it
   const leaseRow = await acquireCompletionLease(taskId);
   if (!leaseRow) {
     log.debug('completeSpawnSideEffects: lease held by another worker, skipping', { taskId });
@@ -315,8 +276,7 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
 async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<void> {
   const taskId = task.task_id;
 
-  // Resolve adapter — if adapter no longer has createThread, mark failed immediately
-  // (adapter_unavailable does NOT consume retry budget)
+  // adapter_unavailable does NOT consume retry budget.
   const mg = task.parent_messaging_group_id ? await getMessagingGroup(task.parent_messaging_group_id) : undefined;
   if (!mg) {
     await transitionToTerminal(taskId, 'failed', {
@@ -335,35 +295,31 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
     return;
   }
 
-  // Step 1: postParent
   {
     const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.parent_platform_message_id === null) {
       const truncContent = task.task_content.slice(0, 100);
-      // Per-adapter signature: postParent(platformId, text) — no channelType prefix
       const { messageId } = await adapter.postParent!(mg.platform_id, `Spawned task: ${truncContent}`);
       const updated = await updateArtifactColumn(taskId, 'parent_platform_message_id', messageId);
       if (!updated) return; // status-CAS rejected — another path won
     }
   }
 
-  // Step 2: createThread
   {
     const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.child_platform_thread_id === null) {
       const parentMsgId = current.parent_platform_message_id!;
-      // Per-adapter signature: createThread(platformId, parentMsgId, title, first)
       const { threadId } = await adapter.createThread!(
         mg.platform_id,
         parentMsgId,
         `Task: ${task.task_content.slice(0, 80)}`,
         task.task_content,
       );
-      // Slack: threadId IS parent_platform_message_id (cycle-3 M25)
+      // Slack: threadId IS parent_platform_message_id.
       const childMgId = task.parent_messaging_group_id;
       const updated = await updateArtifactColumn(taskId, 'child_platform_thread_id', threadId);
       if (!updated) return;
@@ -373,20 +329,15 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
     }
   }
 
-  // Step 3: openSession (cycle-3 M21 write order)
+  // Write order: tasks row, routing stamp, first inbound, then wake LAST.
   {
     const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.child_session_id === null) {
-      // chat-sdk encodes thread IDs as `<scheme>:<channel>:<thread>` (Slack)
-      // or `<scheme>:<guild>:<channel>:<thread>` (Discord). createThread
-      // returns the BARE thread id (parent message ts on Slack), which is
-      // what `child_platform_thread_id` stores for direct adapter calls.
-      // For session routing the chat-sdk adapter needs the encoded form, or
-      // the bridge rejects every outbound with "Invalid Slack thread ID"
-      // and child status/chat messages never reach the spawn thread.
-      // mg.platform_id already contains the scheme+channel prefix.
+      // createThread returns the BARE thread id; session routing needs the
+      // chat-sdk encoded form (mg.platform_id carries the scheme+channel
+      // prefix), or the bridge rejects every child outbound.
       const bareThreadId = current.child_platform_thread_id!;
       const encodedThreadId = bareThreadId.includes(':') ? bareThreadId : `${mg.platform_id}:${bareThreadId}`;
       const { session: childSession } = await resolveSession(
@@ -396,7 +347,6 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
         'per-thread',
       );
 
-      // a. UPDATE tasks first (cycle-3 M21)
       const now = new Date().toISOString();
       const updated = await getDb().run(
         `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
@@ -408,21 +358,11 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       );
       if (updated.changes === 0) return;
 
-      // b. Write spawn_task_id to child's inbound.db session_routing
       await _writeSpawnTaskIdToRouting(childSession.agent_group_id, childSession.id, taskId);
 
-      // c. Write first inbound to child — stamp the spawn thread's routing
-      // onto the brief inbound. The agent-runner's per-destination thread
-      // resolver (poll-loop.ts `resolveDestinationThread`) looks up the
-      // most-recent inbound matching channelType+platformId to find the
-      // thread the child should reply into. Without these fields the
-      // lookup misses and the child's chat outbound lands at channel root
-      // instead of in its spawn thread — invisible to anyone watching the
-      // thread, so all per-task progress/results stayed in the dark.
-      //
-      // threadId stored here is the chat-sdk encoded form (computed above)
-      // so the value the child stamps on its outbound matches what the
-      // delivery bridge expects.
+      // Stamp the spawn thread's routing on the brief: the runner's
+      // per-destination thread resolver needs it, or child replies land at
+      // channel root instead of the spawn thread.
       await writeSessionMessage(childSession.agent_group_id, childSession.id, {
         id: randomUUID(),
         kind: 'chat',
@@ -433,12 +373,10 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
         content: JSON.stringify({ _spawn: { task_id: taskId }, text: task.task_content }),
       });
 
-      // d. Wake child LAST (cycle-3 M21)
       void requestWake(childSession, 'agent-created').catch((err) =>
         log.warn('wakeContainer(child) failed in threaded path', { taskId, err }),
       );
 
-      // Notify parent with thread URL
       const parentSession = await _resolveParentSession(task);
       if (parentSession) {
         const threadUrl = `Thread started: ${current.child_platform_thread_id}`;
@@ -465,7 +403,6 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
       'per-thread',
     );
 
-    // a. UPDATE tasks first (cycle-3 M21)
     const now = new Date().toISOString();
     const updated = await getDb().run(
       `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
@@ -477,10 +414,8 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
     );
     if (updated.changes === 0) return;
 
-    // b. Write spawn_task_id to child's inbound.db session_routing
     await _writeSpawnTaskIdToRouting(childSession.agent_group_id, childSession.id, taskId);
 
-    // c. Write first inbound
     await writeSessionMessage(childSession.agent_group_id, childSession.id, {
       id: randomUUID(),
       kind: 'chat',
@@ -488,12 +423,10 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
       content: JSON.stringify({ _spawn: { task_id: taskId }, text: task.task_content }),
     });
 
-    // d. Wake child LAST
     void requestWake(childSession, 'agent-created').catch((err) =>
       log.warn('wakeContainer(child) failed in headless path', { taskId, err }),
     );
 
-    // Notify parent (no platform URL in headless mode)
     await _notifyParent(task, `Headless task running: ${taskId}`);
     const parentSession = await _resolveParentSession(task);
     if (parentSession) {
@@ -505,14 +438,9 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
 }
 
 async function _writeSpawnTaskIdToRouting(agentGroupId: string, sessionId: string, taskId: string): Promise<void> {
-  // `withMailboxSession` — the PROVISIONING one. I-4 governs reads, and this
-  // is a write on a child session `resolveSession` just created, which may
-  // have no mailbox on disk at all yet; its first inbound message is written
-  // one line later through the same provisioning path. Taking the
-  // existing-only funnel here would skip the stamp on exactly that child and
-  // leave it running with no `spawn_task_id`, so `mountSpawnTools()` would
-  // give it no way to report progress or completion — while the very next call
-  // provisions the mailbox anyway.
+  // PROVISIONING session on purpose: the child was just created and may have
+  // no mailbox yet; the existing-only funnel would skip the stamp and leave it
+  // unable to report progress or completion.
   await withMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.setSessionRoutingSpawnTaskId(taskId));
 }
 

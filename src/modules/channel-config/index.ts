@@ -1,36 +1,9 @@
 /**
- * Chat-invokable per-channel model/effort defaults (fork addition).
- *
- * Registers two delivery actions — `set_channel_model`, `set_channel_effort`
- * — that the container's channel-config MCP tool emits. See
- * `container/agent-runner/src/mcp-tools/channel-config.ts` for the agent-
- * facing side.
- *
- * Terminology (v2):
- *   - channel = messaging_group (one chat on one platform)
- *   - agent   = agent_group (one persona/workspace)
- *   - wiring  = messaging_group_agents row (channel ↔ agent link)
- *
- * Precedence the mutation interacts with (most specific wins):
- *   1. Per-session flag in chat: -m / -m1 / -e / -e1
- *   2. Per-channel wiring: messaging_group_agents.default_model / _effort  ← this module
- *   3. Per-agent container.json: model / effort, then defaultModel / defaultEffort
- *   4. Install-wide DEFAULT_OPUS_MODEL in src/flag-parser.ts (single source of
- *      truth for "default"); effort has no install-wide constant — with no
- *      override the claude provider applies its per-model-family default.
- *
- * Authorization (trust-minimal, mirrors permissions/grant.ts):
- *   1. Caller identity derived from session's latest inbound chat message.
- *   2. Caller must be owner / global admin / admin-of-the-target-agent.
- *   3. Target channel defaults to the session's own messaging_group if
- *      the agent didn't specify one. A named channel must have an
- *      existing wiring with THIS agent.
- *
- * Container restart: after a successful mutation, we don't restart the
- * container. Env is read at spawn time, so the NEW default only takes
- * effect on the NEXT container spawn. The current session keeps its
- * current model until the user types `-m` or the container otherwise
- * cycles. notify message says so.
+ * `set_channel_model` / `set_channel_effort`: per-wiring defaults. A per-session
+ * chat flag still beats these; they beat container.json. Caller must be owner,
+ * global admin, or admin of the target agent; a named channel must already be
+ * wired to THIS agent. Takes effect at the NEXT container spawn (env is read
+ * at spawn), not in the running session.
  */
 
 import { withCentralSync } from '../../db/central-lease.js';
@@ -58,11 +31,7 @@ function hasMutateAuthority(userId: string, agentGroupId: string): Promise<boole
   );
 }
 
-/**
- * Resolve the target channel for the mutation. If `channelName` is given,
- * look it up in the session's destinations map (inbound.db). Otherwise
- * use the session's own messaging_group. Returns null if unresolved.
- */
+/** Named channel via the session's destinations map, else its own messaging group; null if unresolved. */
 async function resolveChannelMessagingGroupId(
   session: Session,
   channelName: string | undefined,
@@ -70,19 +39,12 @@ async function resolveChannelMessagingGroupId(
   if (!channelName) {
     return session.messaging_group_id ?? null;
   }
-  // Look up the destination by name from inbound.db's destinations table
-  // (host writes this before each container wake; container reads it
-  // live). type='channel' rows carry channel_type + platform_id; map
-  // those back to a messaging_group id. Its own short mailbox session:
-  // delivery holds none while a handler runs (plan §4.5b), and a session with
-  // no mailbox has no destinations map to resolve against.
+  // Existing-only: a session with no mailbox has no destinations map.
   const row = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.getChannelDestination(channelName),
   );
   if (!row?.channel_type || !row.platform_id) return null;
-  // destinations lives in the session's inbound.db (host writes it at
-  // wake). messaging_groups lives in central v2.db — cross-DB join by
-  // (channel_type, platform_id).
+  // Cross-DB join: destinations live in inbound.db, messaging_groups in central.
   const mg = await getMessagingGroupByPlatform(row.channel_type, row.platform_id);
   return mg?.id ?? null;
 }
@@ -96,12 +58,10 @@ interface ChannelConfigArgs {
 type ParsedChannelValue = { value?: string | null; error?: string };
 
 /**
- * Channel defaults use the same provider-aware vocabulary as chat flags.
- * A Codex value goes through the flag vocabulary: dot forms (`gpt6-sol`)
- * normalize to gpt-* ids, and the family names (`sol`/`luna`/`astra`/`terra`)
- * are kept as typed so the wiring follows the next release; other providers retain their existing model strings for forward-compatible
- * SDK ids. Effort is validated for every provider so `max`/`ultra` cannot be
- * written to a Claude or OpenCode wiring by accident.
+ * Codex values go through the chat-flag vocabulary (dot forms normalize,
+ * family names stay as typed so the wiring follows the next release). Effort
+ * is validated for every provider so `max`/`ultra` can't reach a Claude or
+ * OpenCode wiring by accident.
  */
 function parseChannelModel(model: string, provider: string): ParsedChannelValue {
   if (provider !== 'codex') return { value: model };
@@ -188,11 +148,8 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
       : normalizedModel === model
         ? `set to ${normalizedModel}`
         : `set to ${normalizedModel} (via ${model})`;
-  // Best-effort: updateMessagingGroupAgent above already committed. This is a
-  // system-action delivery handler — an awaited rejection here would leave
-  // the message undelivered, so the delivery loop retries the whole handler
-  // (re-applying an already-applied model change) rather than just
-  // re-attempting the notification.
+  // Best-effort, never awaited: an awaited rejection leaves the message
+  // undelivered, and the retry re-applies the whole handler.
   void Promise.resolve(
     notifyAgent(
       session,
@@ -257,7 +214,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     by: callerId,
   });
   const label = normalizedEffort === null ? 'cleared' : `set to ${normalizedEffort}`;
-  // Best-effort — see the matching comment in handleSetChannelModel above.
+  // Best-effort, as above.
   void Promise.resolve(
     notifyAgent(
       session,

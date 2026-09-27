@@ -1,48 +1,16 @@
 /**
- * Detached execution for the repository delivery actions.
+ * Repository delivery actions run on a detached chain with `deferAck`, so a
+ * long quiesce never holds the serial delivery loop. The undelivered
+ * `messages_out` row IS the durable job record (deliberately no `markPending`:
+ * 'pending' reads as delivered and would be lost across a restart); a
+ * restart re-dispatches it and both applies are idempotent. `inFlight`
+ * (keyed by request id) is the dedup against the 1s poll re-entering.
  *
- * `pollActive`/`pollSweep` drain sessions serially (delivery.ts), and a
- * `repository_publish` handled inline held that loop for the whole of
- * `quiesceSessionsForRepositoryMounts` — every sibling container in the
- * workgroup finishing its current tool call. Observed 2026-09-01:
- * `Active delivery poll timing cycleMs=172606 polled=2`, i.e. no session on the
- * host got an outbound message for nearly three minutes. Nothing about the
- * action needs the loop: the container fire-and-forgets the row
- * (the runner's git-worktrees tool) and reads the outcome later from an `onWake` chat
- * row, so the only thing the inline call bought was the ack.
- *
- * So: return `deferAck` and run the apply on a detached chain.
- *
- *   - The undelivered `messages_out` row IS the durable job record. Nothing new
- *     is persisted, and deliberately NOT a `markPending` row — `getDeliveredIds`
- *     (modules/mailbox/ops/delivery.ts) cannot tell 'pending' from 'delivered', so one
- *     would silently lose the action across a host restart. A host that dies
- *     mid-publish leaves the row untouched: the startup orphan-fence pass
- *     releases the dead process's fences (repo-fence-recovery.ts) and the
- *     first poll re-dispatches the action, which both applies absorb
- *     idempotently (canonical-exists branch / transfer tombstone recovery).
- *   - `inFlight` is the dedup: the row stays undelivered while the job runs, so
- *     every 1s poll re-enters here and must find the job already started. It is
- *     keyed by request id alone, across every lane.
- *   - Jobs run on LANES: one FIFO chain per lane key, jobs on different lanes in
- *     parallel.
- *       - `repository_publish`, `repository_refresh` and `repository_transfer`
- *         share the one `'global'` lane. Publish and transfer both take
- *         `withRepositoryLifecycleClaims` on the work units they drain (publish
- *         drains only the requester's), which THROWS rather than queues, so two of them on one work unit
- *         would fail each other. The serial drain is what kept those apart, and
- *         the global lane reproduces exactly that property.
- *       - `repository_checkout` runs on a lane per (workgroup, work unit)
- *         (docs/specs/repository-branch-clones/plan.md §5.2, M6). Same-thread
- *         requests stay serialized, which is what makes a sibling's request for
- *         the same branch wait for, then reuse, the checkout being built. A
- *         checkout never quiesces or takes the mount claim, so it has no reason
- *         to queue behind an unrelated publish or transfer (which may itself be
- *         waiting on the requester's in-flight tool). It coordinates with them
- *         through the lifecycle claim (held -> retryable refusal) and the
- *         per-repository flock (queues).
- *     A lane is forgotten once its last job settles, so per-work-unit lanes do
- *     not accumulate.
+ * Lanes: publish, refresh and transfer share the `'global'` lane, because
+ * their lifecycle claims THROW rather than queue. Checkout runs on a lane per
+ * (workgroup, work unit): same-thread requests stay serialized, and it
+ * coordinates with the others through the lifecycle claim and the
+ * per-repository flock. Lanes are forgotten once idle.
  */
 import fs from 'fs';
 import path from 'path';
@@ -57,33 +25,27 @@ import type { Session } from '../../types.js';
 /** Container-generated request id, which is also the `messages_out` row id. */
 export const REPOSITORY_REQUEST_ID_PATTERN = /^repo-[0-9]{10,17}-[a-f0-9]{16}$/;
 
-/** The lane publish, refresh and transfer share. */
 const GLOBAL_REPOSITORY_LANE = 'global';
 
 export type RepositoryActionApply = (content: Record<string, unknown>, session: Session) => Promise<void>;
 
 const inFlight = new Set<string>();
-/** Tail of each lane's chain. Never rejects: every link ends in the terminal catch. */
+/** Never rejects: every link ends in the terminal catch. */
 const chains = new Map<string, Promise<void>>();
 
 /**
- * Actions whose apply drains sessions (quiesceSessionsForRepositoryMounts). A
- * host restart in the middle of one leaves its `messages_out` row undelivered,
- * so the next host start replays it from scratch and drains every session a
- * second time. While one runs, a marker file tells scripts/deploy.sh to
- * hold the restart until the drain settles.
+ * A restart mid-drain replays the whole drain, so while one runs a marker file
+ * tells scripts/deploy.sh to hold the restart.
  */
 const DRAINING_ACTIONS = new Set(['repository_publish', 'repository_transfer']);
 
 /** Its `pid` lets a deploy ignore a marker left by a host that died mid-drain. */
 let drainMarkerPath = path.join(DATA_DIR, 'repository-drain-in-flight.json');
 
-/** Test seam: point the drain marker somewhere disposable. */
 export function _setRepositoryDrainMarkerPathForTesting(markerPath: string): void {
   drainMarkerPath = markerPath;
 }
 
-/** Best effort: a marker that cannot be written must never stop the job itself. */
 function writeDrainMarker(action: string, requestId: string, session: Session): boolean {
   const marker = { action, requestId, sessionId: session.id, pid: process.pid, startedAt: new Date().toISOString() };
   const tmp = `${drainMarkerPath}.${process.pid}.tmp`;
@@ -109,30 +71,20 @@ function clearDrainMarker(requestId: string): void {
   }
 }
 
-/** Test seam: await the tail of one lane's chain (the global lane by default). */
 export function _repositoryActionChainForTesting(lane: string = GLOBAL_REPOSITORY_LANE): Promise<void> {
   return chains.get(lane) ?? Promise.resolve();
 }
 
-/** Test seam: how many lanes still hold a chain. */
 export function _repositoryActionLaneCountForTesting(): number {
   return chains.size;
 }
 
-/** Test seam: forget every in-flight job so tests start from a clean runner. */
 export function _resetRepositoryActionsForTesting(): void {
   inFlight.clear();
   chains.clear();
 }
 
-/**
- * Write this action's own `delivered` row. Returns false if the ack never landed.
- *
- * Its own short mailbox session: this runs on the detached job chain, long
- * after the drain that dispatched the action returned, and delivery holds no
- * session while a handler runs (plan §4.5b). A vanished mailbox counts as a
- * failed ack, same as an unwritable handle did.
- */
+/** Returns false if the ack never landed; a vanished mailbox counts as failed. */
 async function ackRow(session: Session, requestId: string, failure: unknown): Promise<boolean> {
   try {
     const acked = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
@@ -143,11 +95,8 @@ async function ackRow(session: Session, requestId: string, failure: unknown): Pr
     if (!acked) throw new Error(`session mailbox for ${session.id} is gone`);
     return true;
   } catch (ackError) {
-    // The work is done but unacknowledged, so the row stays undelivered and the
-    // next host start replays it — idempotently, by the applies' own design.
-    // Keeping the in-flight guard is the point: re-running a ten-minute
-    // fleet-wide quiescence because a SQLite handle failed is far worse than
-    // deferring recovery to that restart.
+    // Keep the in-flight guard: the unacked row replays idempotently at the
+    // next host start, far cheaper than re-running a fleet-wide quiesce now.
     log.error('Repository action finished but its delivery ack could not be written', {
       sessionId: session.id,
       requestId,
@@ -172,15 +121,12 @@ async function runRepositoryActionJob(
     failure = error;
     log.error('Repository action failed', { action, requestId, sessionId: session.id, err: error });
   } finally {
-    // The drain is over once the apply settles, whichever way it went.
     if (marked) clearDrainMarker(requestId);
   }
   const acked = await ackRow(session, requestId, failure);
   if (failure !== null) {
-    // Incident 2026-09-01's last line of defence, preserved from the delivery
-    // loop's give-up path: a failed publication can leave sessions fenced that
-    // no live publication owns. Runs even when the ack write above failed — a
-    // strand is the more expensive of the two failures.
+    // A failed publication can leave sessions fenced that no publication owns.
+    // Runs even when the ack failed: a strand is the costlier failure.
     try {
       await releaseOrphanedRepoIngressFencesForDroppedMessage({ kind: 'system' }, session);
     } catch (recoveryErr) {
@@ -196,13 +142,8 @@ async function runRepositoryActionJob(
 }
 
 /**
- * Delivery-action entry point: hand the apply to its lane's chain, ack
- * immediately.
- *
- * A payload with no usable request id is run inline instead — it throws before
- * any quiescence, so it costs nothing, and there is no key to write a
- * `delivered` row under, so the delivery loop's own retry/give-up path must
- * stay in charge of that row.
+ * A payload with no usable request id runs inline: it throws before any
+ * quiesce, and with no key the delivery loop must own the row's retry.
  */
 export async function runRepositoryActionDetached(
   action: string,
@@ -219,13 +160,9 @@ export async function runRepositoryActionDetached(
   if (inFlight.has(requestId)) return { deferAck: true };
   inFlight.add(requestId);
   log.info('Repository action queued off the delivery loop', { action, requestId, sessionId: session.id, lane });
-  // Terminal catch. `runRepositoryActionJob` handles its own failures, but an
-  // escape (a future edit, a throwing logger) would both poison the lane for
-  // every later repository action on it and surface as an unhandled rejection,
-  // which kills the host — the failure class this whole change exists to
-  // remove. The escaped job keeps its in-flight entry, exactly like the
-  // ack-failure branch: its ack is unproven, so only the next host start may
-  // replay it.
+  // Terminal catch: an escape would poison the lane and, as an unhandled
+  // rejection, kill the host. The job keeps its in-flight entry, since its
+  // ack is unproven.
   const tail = (chains.get(lane) ?? Promise.resolve()).then(() =>
     runRepositoryActionJob(action, apply, content, session, requestId).catch((err) =>
       log.error('Repository action job escaped its own error handling', {

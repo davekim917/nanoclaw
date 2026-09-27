@@ -43,12 +43,8 @@ export async function revokeCapability(
   agentGroupId: string,
   role: 'orchestrator',
 ): Promise<{ success: boolean; reason?: string }> {
-  // The in-flight test and the delete are ONE statement (the read-then-write
-  // race class). Read first and delete after, and a task admitted in the
-  // window between them loses its orchestrator capability mid-flight — the
-  // exact condition the guard exists to prevent. The NOT EXISTS makes SQLite
-  // evaluate both at the same instant, and `changes === 0` means a task was
-  // in flight, which is the same answer the two-step version gave.
+  // The in-flight test and the delete are ONE statement: read-then-delete lets
+  // a task admitted in between lose its capability mid-flight.
   const deleted = await getDb().run(
     `DELETE FROM agent_group_capabilities
        WHERE agent_group_id = ? AND role = ?
@@ -61,8 +57,7 @@ export async function revokeCapability(
     agentGroupId,
   );
   if (deleted.changes === 0) {
-    // Either a task is in flight, or there was no capability row to begin
-    // with. Distinguish them so the caller's message stays truthful.
+    // In flight, or no row to begin with; distinguish for a truthful message.
     const inFlight = await getDb().get(
       `SELECT 1 FROM tasks WHERE parent_agent_group_id = ? AND status IN ('pending', 'running') LIMIT 1`,
       agentGroupId,

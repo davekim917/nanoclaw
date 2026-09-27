@@ -1,15 +1,8 @@
 /**
- * Remote Control module — agent-triggered start/stop/status of the host-side
- * `claude remote-control` CLI.
- *
- * SECURITY: starting remote control hands a Claude.ai web/mobile URL to whoever
- * receives it; that URL drives the host install with full host privileges
- * (every tenant, every credential surface). It MUST NOT execute on a bare
- * agent-triggered system action — prompt injection in any tenant chat would
- * pivot to host hijack. Both `start_remote_control` and `stop_remote_control`
- * are gated through `requestApproval` so an owner/admin must click before the
- * CLI spawns. `cwd` is ignored from the agent payload and pinned to the host
- * project root at apply time.
+ * SECURITY: the remote-control URL drives the host install with full host
+ * privileges, so start/stop MUST go through owner/admin approval (prompt
+ * injection in any tenant chat would otherwise pivot to host hijack). `cwd`
+ * from the agent payload is ignored and pinned to the host project root.
  */
 
 import { registerDeliveryAction } from '../../delivery.js';
@@ -28,9 +21,8 @@ async function handleStartRemoteControl(content: Record<string, unknown>, sessio
   }
   const sender = (content.sender as string) || 'unknown';
   const chatJid = (content.chatJid as string) || '';
-  // NOTE: `cwd` is intentionally NOT carried through. Agent-supplied cwd would
-  // let prompt injection root the remote-control CLI at any tenant's group
-  // folder. The apply handler pins cwd to the host project root.
+  // `cwd` is intentionally NOT carried through: an agent-supplied cwd would let
+  // prompt injection root the CLI at any tenant's group folder.
   await requestApproval({
     session,
     agentName: agentGroup.name,
@@ -62,8 +54,7 @@ async function handleStopRemoteControl(_content: Record<string, unknown>, sessio
 }
 
 async function handleGetRemoteControlStatus(_content: Record<string, unknown>, session: Session): Promise<void> {
-  // Read-only — does not need approval. Returns whether a session is active
-  // and its URL, but does not start or stop anything.
+  // Read-only, so no approval.
   const active = getActiveSession();
   const text = active
     ? `Remote Control active (pid=${active.pid}): ${active.url}`
@@ -74,7 +65,6 @@ async function handleGetRemoteControlStatus(_content: Record<string, unknown>, s
 const applyStartRemoteControl: ApprovalHandler = async ({ session, payload, notify }) => {
   const sender = (payload.sender as string) || 'unknown';
   const chatJid = (payload.chatJid as string) || '';
-  // Pin cwd to a fixed safe location regardless of any agent-supplied value.
   const cwd = process.cwd();
   const result = await startRemoteControl(sender, chatJid, cwd);
   if (result.ok) {
@@ -82,13 +72,9 @@ const applyStartRemoteControl: ApprovalHandler = async ({ session, payload, noti
   } else {
     await notify(`Remote Control failed: ${result.error}`);
   }
-  // Backstop notify on the session so the agent can relay; primitive notify
-  // already targets the originating session, but keep behavior in line with
-  // the previous direct-execute path. Best-effort: startRemoteControl above
-  // already ran (this is an approval handler — an awaited rejection here
-  // would propagate to response-handler.ts's catch, which attempts its own
-  // fallback notify; if that ALSO fails, the approval row is never deleted
-  // and stays clickable, risking a second remote-control spawn attempt).
+  // Best-effort, never awaited: in an approval handler an awaited rejection
+  // whose fallback notify also fails leaves the approval row clickable,
+  // risking a second remote-control spawn.
   void Promise.resolve(
     notifyAgent(session, result.ok ? `Remote Control ready: ${result.url}` : `Remote Control failed: ${result.error}`),
   ).catch((err) => log.warn('start_remote_control backstop notification failed', { err }));

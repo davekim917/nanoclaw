@@ -1,54 +1,16 @@
 /**
- * Self-heal class 3 — stale work claims.
+ * Acts on stale work claims: nudge the owner, nudge once more a day later, then
+ * (behind its own flag, since a misfire recreates duplicate work) offer it to a
+ * sibling; after that the claim is left red forever. Detection is the board's,
+ * verbatim, so board and automation can't disagree.
  *
- * A claim past its TTL plus grace (or a park nobody took inside PARK_GRACE_MS)
- * means one thing: work someone said they owned, that has not moved, and that
- * no human is going to notice. The board already shows it in red. This is the
- * part that acts on it.
+ * Never nudged: `waiting on <person>:` notes (they get one @-mention escalation
+ * past PARK_GRACE_MS instead), claims with no `thread_id`, claims that declare
+ * themselves finished, and parks carrying a handoff note.
  *
- * Detection is the board's, verbatim — `readClaims` + `state === 'stale'`. A
- * second staleness rule living here is exactly how a board and its automation
- * start disagreeing, and the automation is the one that would be wrong loudly.
- *
- * Three exclusions are load-bearing, not defensive padding:
- *
- *   1. `waiting on <person>: …` notes are never NUDGED or reassigned. That note
- *      shape is the human-blocked discipline from
- *      container/skills/work-claims/SKILL.md. Nudging it tells an agent to move
- *      work it already correctly stopped on; reassigning it moves the block to a
- *      second agent. What it gets instead is silence for PARK_GRACE_MS and then
- *      exactly one escalation that @-mentions the named human — see
- *      `decideHumanBlocked`. This used to be an absolute exemption, which meant
- *      a claim parked on a person could never be spoken about again; "do not nag
- *      on a timer" is not the same rule as "never speak".
- *   2. A claim with no `thread_id` is never nudged. There is no honest room to
- *      nudge in — the same reason dashboard/nudge.ts 409s rather than guessing.
- *   3. A claim that says it finished is not stalled work (declaresItselfFinished).
- *   4. A claim already `parked` WITH a handoff note (isHandedOffPark). Parking
- *      on the record IS the action a nudge would ask for; PARK_GRACE_MS decay
- *      making it stale-eligible again is a board-visibility rule, not a reason
- *      to re-ask. All three nudge options are no-ops for such a claim.
- *
- * A nudge is meant to produce WORK, not chat. Moving the claim — finishing,
- * releasing, parking — is a silent state change: the claims board and the
- * Observatory already render claim state, and the agents' own instructions
- * forbid announcing completion. The single sanctioned post is "a human owes me
- * a decision", which is the one fact no board can show. That is enforced twice:
- * the prompt says it, and NUDGE_TASK_QUIET_ARGS caps the task at one chat send
- * with no streaming status.
- *
- * The ladder is deliberately slow and deliberately short: nudge the owner, nudge
- * it once more a day later, and only then — behind its own separate flag —
- * offer the work to a sibling. A human-blocked claim skips the ladder entirely
- * and gets its own single rung. Takeover is the only step where one agent takes
- * another's work with no human in the loop, and a misfire recreates the
- * duplicate-work problem claims exist to prevent, so it arms separately from
- * everything else here. After that the claim is left alone, red, forever.
- *
- * Nothing here is unaccounted for: every action stamps the claim file and logs a
- * structured line (that is the audit trail — deliberately NOT a chat post); with
- * the flag off, the same detection runs and logs `self-heal: would …` while
- * spawning nothing.
+ * Nudges must produce WORK, not chat: the only sanctioned post is "a human owes
+ * me a decision", enforced by the prompt and by NUDGE_TASK_QUIET_ARGS. Every
+ * action stamps the claim file (the audit trail); with the flag off it only logs.
  */
 import fs from 'fs';
 import path from 'path';
@@ -59,24 +21,15 @@ import { readContainedFile } from '../../dashboard/api/attention-fs.js';
 import { log } from '../../log.js';
 import { claimsBaseDir, declaresItselfFinished } from './escalation.js';
 
-/** Scan cadence — the sweep calls this every tick; the throttle lives here. */
+/** The sweep calls this every tick; the throttle lives here. */
 export const SELF_HEAL_SCAN_INTERVAL_MS = 10 * 60 * 1000;
 
-/**
- * Between rungs. A stale claim has already burned its TTL plus a 2h grace
- * before the first nudge; a day between nudges is the difference between
- * "nobody is coming back" and "the owner is mid-turn on something else".
- */
+/** Between rungs. */
 export const SELF_HEAL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
-/** 2 owner nudges + 1 takeover, per claim period. */
 export const SELF_HEAL_MAX_NUDGES = 2;
 
-/**
- * The park-when-blocked note shape from the work-claims skill:
- * `waiting on <person>: <what you asked>`. Anchored — a note that merely
- * mentions waiting somewhere in the middle is prose, not the discipline.
- */
+/** Anchored: a note merely mentioning waiting mid-prose is not the discipline. */
 export function isWaitingOnHuman(note: string): boolean {
   return /^\s*waiting on\b/i.test(note);
 }
@@ -87,28 +40,15 @@ export function isExplicitlyPaused(raw: { status?: unknown }): boolean {
 }
 
 /**
- * How much note a park has to carry to count as a handoff rather than a walk-away.
- *
- * `claim.sh park` REFUSES an empty note, so "has a note" is not a signal — every
- * script-written park has one. What separates "schema done, handlers TODO" from
- * "parked" / "wip" / "not done" is that the first names both the state and what
- * is needed next, and two facts do not fit in three words.
+ * `claim.sh park` refuses an empty note, so "has a note" is no signal; a real
+ * handoff names both the state and what is needed next.
  */
-// ponytail: word count, not meaning. Upgrade path if junk notes get wordier is
-// the same one the board would need — a note-quality check the skill enforces
-// at write time, in claim.sh, not a classifier here.
 const HANDOFF_NOTE_MIN_WORDS = 4;
 
 /**
- * A park that told a successor what they need is a COMPLETED action, not a
- * stall — the whole point of `park` is stepping off work on the record. It
- * decays to `stale` on the board after PARK_GRACE_MS (claims-board.ts) so a
- * human still sees it, and that is the right amount of pressure. Nudging it
- * asks the agent to redo the thing it already did: all three options below are
- * no-ops for a claim that is already parked with a note.
- *
- * A park with a throwaway note is the genuine abandonment case, and it keeps
- * the 24h decay.
+ * A park with a real handoff note is a completed action, not a stall; it still
+ * decays to `stale` on the board after PARK_GRACE_MS. A throwaway note keeps
+ * the decay and counts as abandonment.
  */
 export function isHandedOffPark(raw: { status?: unknown; note?: unknown }): boolean {
   if (typeof raw.status !== 'string' || raw.status.trim().toLowerCase() !== 'parked') return false;
@@ -116,13 +56,12 @@ export function isHandedOffPark(raw: { status?: unknown; note?: unknown }): bool
   return words.length >= HANDOFF_NOTE_MIN_WORDS;
 }
 
-/** Ladder state, as stamped on the claim file. No new schema. */
 interface SelfHealStamps {
   claimed_at?: unknown;
   auto_nudged_at?: unknown;
   auto_nudge_count?: unknown;
   auto_heal_exhausted_at?: unknown;
-  /** Last time no deliverable target could be resolved — a backoff, not a rung. */
+  /** A backoff, not a rung. */
   auto_heal_unresolved_at?: unknown;
 }
 
@@ -130,17 +69,11 @@ type SelfHealAction = 'nudge' | 'takeover' | 'exhaust' | 'escalate-human';
 
 interface SelfHealDecision {
   action: SelfHealAction | 'none';
-  /** 1 or 2 for a nudge — which owner nudge this is. */
   nudge?: number;
-  /** Why, for the log line. Always set. */
   reason: string;
 }
 
-/**
- * Effective nudge count. A re-claim (fresh `claimed_at` newer than the last
- * stamp) is new work by a new owner, so the ladder starts over — the same rule
- * `shouldEscalate` applies to `escalated_at` (escalation.ts).
- */
+/** A re-claim (fresh `claimed_at` newer than the last stamp) restarts the ladder. */
 function effectiveState(stamps: SelfHealStamps): { count: number; lastAt: number; exhausted: boolean } {
   const lastAt = typeof stamps.auto_nudged_at === 'string' ? Date.parse(stamps.auto_nudged_at) : NaN;
   const claimedAt = typeof stamps.claimed_at === 'string' ? Date.parse(stamps.claimed_at) : NaN;
@@ -155,16 +88,9 @@ function effectiveState(stamps: SelfHealStamps): { count: number; lastAt: number
 }
 
 /**
- * Backoff after a sweep could not resolve anywhere to deliver.
- *
- * Deliberately NOT a spent rung: an unresolvable target says nothing about
- * whether the owner needs nudging, so re-arming must not cost the claim one of
- * its two nudges. It is only a "stop asking for a day". Without it the sweep
- * re-decided `first-nudge`, failed, and re-logged every scan forever — 1035
- * warnings from 8 claims in one log, the loudest line in the file.
- *
- * Same re-claim reset as `effectiveState`: a fresh `claimed_at` is new work,
- * possibly in a thread that DOES resolve, so it clears the backoff immediately.
+ * Backoff after no deliverable target resolved. Deliberately NOT a spent rung:
+ * unresolvability says nothing about the owner, it only means "stop asking for
+ * a day". A re-claim clears it.
  */
 function inUnresolvedBackoff(stamps: SelfHealStamps, now: number): boolean {
   const at = typeof stamps.auto_heal_unresolved_at === 'string' ? Date.parse(stamps.auto_heal_unresolved_at) : NaN;
@@ -175,12 +101,8 @@ function inUnresolvedBackoff(stamps: SelfHealStamps, now: number): boolean {
 }
 
 /**
- * Who the note says owes the answer, out of `waiting on <person>: <what>`.
- *
- * Returned verbatim, including "the reviewer or the operator" — the note names whoever
- * the agent believed was blocking, and narrowing that to one person here would
- * be the host guessing. Falls back to a generic phrase rather than an empty
- * mention, because the prompt has to stay readable when the note is malformed.
+ * Returned verbatim: narrowing the named blocker to one person would be the
+ * host guessing. Falls back to a generic phrase so the prompt stays readable.
  */
 export function namedHuman(note: string): string {
   const m = /^\s*waiting on\s+([^:\n]{1,80}?)\s*:/i.exec(note);
@@ -188,29 +110,10 @@ export function namedHuman(note: string): string {
 }
 
 /**
- * The human-blocked rung — a suppression WINDOW, not an exemption.
- *
- * `waiting on <person>` is the park-when-blocked discipline from the work-claims
- * skill, and nudging it on a timer tells an agent to move work it correctly
- * stopped on. That was the reason this returned `none` unconditionally. It
- * overshot: unconditional means a claim parked on a human is exempt from the
- * ladder FOREVER, so the one state that genuinely needs a person is the one
- * state nobody is ever told about. Live proof: two claims sat `parked` on
- * "waiting on <two people>" for ~40h with no notification ever sent.
- *
- * So: silent inside the window, one escalation past it, then never again.
- *
- * The window is `PARK_GRACE_MS`, reused rather than re-invented, because that
- * constant is already the boundary at which the board stops calling a park
- * healthy and starts rendering it red (claims-board.ts). One constant, one
- * meaning — a second timeout here would be a second opinion about when a
- * hand-off has lapsed, and the two would drift.
- *
- * Note that for a PARKED claim the window has already elapsed by construction:
- * `readClaims` only reports `stale` for a park once it is past PARK_GRACE_MS,
- * and `decideSelfHeal` returns early on anything not `stale`. The check still
- * runs, because a claim can also carry a `waiting on` note without being parked,
- * and that one is measured past its own TTL.
+ * Human-blocked: silent inside PARK_GRACE_MS (the same constant at which the
+ * board turns a park red, so the two can't drift), one escalation past it,
+ * then never again. Not an exemption: an exempt claim parked on a person is
+ * surfaced to no one.
  */
 function decideHumanBlocked(
   claim: BoardClaim,
@@ -218,7 +121,7 @@ function decideHumanBlocked(
   now: number,
 ): SelfHealDecision {
   if (claim.staleMs <= PARK_GRACE_MS) return { action: 'none', reason: 'waiting-on-human' };
-  // Reuses the ladder's own terminal stamp, so one escalation is all there is.
+  // Reuses the ladder's terminal stamp, so there is exactly one escalation.
   if (effectiveState(raw).exhausted) return { action: 'none', reason: 'exhausted' };
   if (inUnresolvedBackoff(raw, now)) return { action: 'none', reason: 'unresolved-backoff' };
   if (!claim.threadId) return { action: 'none', reason: 'no-thread' };
@@ -227,9 +130,8 @@ function decideHumanBlocked(
 }
 
 /**
- * Pure — which rung this claim is on right now. `claim` must already be the
- * board's `stale` state; the exclusions are re-checked here so the decision is
- * testable on its own and cannot be bypassed by a future second caller.
+ * `claim` must already be `stale`; exclusions are re-checked here so a future
+ * second caller can't bypass them.
  */
 function decideSelfHeal(
   claim: BoardClaim,
@@ -256,11 +158,9 @@ function decideSelfHeal(
   return { action: 'exhaust', reason: 'takeover-spent' };
 }
 
-/** Shared header both prompts open with — state, age, owner, note. */
 function claimStateLine(claim: BoardClaim): string {
   const hours = Math.max(0, Math.round(claim.staleMs / 3600000));
-  // staleMs means "since parked" for a parked claim and "past TTL" otherwise —
-  // label it honestly rather than telling a parked claim it is overdue.
+  // staleMs means "since parked" for a park and "past TTL" otherwise.
   return (
     `state: ${claim.state} · ${hours}h ${claim.state === 'parked' ? 'since parked' : 'past due'} · owner: ${claim.owner}` +
     (claim.escalated ? ' · already escalated once' : '') +
@@ -269,17 +169,9 @@ function claimStateLine(claim: BoardClaim): string {
 }
 
 /**
- * The claim thread's link, for any post these prompts sanction.
- *
- * Those posts often land top-level in a channel, away from the thread that holds
- * the context. A human who gets "blocked on you, answer by Friday" there either
- * has to go find the thread or answers under the alert. Answering under the alert
- * starts a second thread on the same topic, one the owning agent's session is not
- * reading. The link sends them back to the right thread. It is resolved host-side
- * because the agent cannot build it: a Slack thread id carries no workspace URL.
- * `slackPermalink` reads it from the bot identity (slack-mentions.ts), which
- * `auth.test` fills at adapter init. Null (no adapter
- * could build one) adds nothing, so the prompt reads as it did before links.
+ * Link back to the claim thread: an alert that lands top-level otherwise gets
+ * answered under the alert, in a thread the owning agent isn't reading.
+ * Resolved host-side because a Slack thread id carries no workspace URL.
  */
 function threadLinkLine(threadUrl: string | null | undefined): string {
   return threadUrl
@@ -289,23 +181,10 @@ function threadLinkLine(threadUrl: string | null | undefined): string {
 }
 
 /**
- * The push-it-forward contract, composed entirely from the claim file.
- *
- * Shared by the human path (dashboard/nudge.ts, `origin` = who clicked) and the
- * autonomous path here, so the two can never drift into telling an agent
- * different things about the same claim. The three options are the whole point:
- * an item neither moved nor released by the end of the task is the failure this
- * exists to end, and "name the human who blocks you" is the exit that stops a
- * nudge loop on genuinely blocked work.
- *
- * Moving the claim is SILENT. The first version of this prompt made options 1
- * and 2 announce themselves ("then say here that it is free"), and the result
- * was the measurable failure: 22 nudges in a day produced 22 channel posts, of
- * which ~half of one channel's traffic was agents narrating a state change the
- * claims board and the Observatory already render. It also contradicted the
- * agents' own standing instruction never to announce completion. The one thing
- * a board cannot show is a human who owes a decision, so that is the one thing
- * that posts.
+ * Shared by the human (dashboard/nudge.ts) and autonomous paths so they can't
+ * drift. Moving the claim is SILENT (the board already renders it; announcing
+ * every move floods channels); the one thing that posts is a human who owes a
+ * decision.
  */
 export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';
@@ -331,29 +210,16 @@ export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: 
 }
 
 /**
- * Task-create args every nudge is spawned with, on both paths.
- *
- * The prompt above is instruction; this is the enforcement, and it exists
- * because instructions demonstrably do not hold on their own. `quiet_status`
- * drops the streaming 💭 progress writes — those carry the task row's routing
- * and land in the channel whatever the prompt says. `chat_limit: 1` caps the
- * turn at a single chat send at the agent-runner's write layer
- * (`container/agent-runner/src/db/messages-out.ts`), which is exactly the one
- * post option 3 is allowed. Not `mute_chat`: that would make option 3
- * impossible, and a silently blocked agent is the outcome this whole ladder is
- * trying to prevent.
+ * Enforcement, because the prompt alone doesn't hold: `quiet_status` drops
+ * streaming progress writes, `chat_limit: 1` allows exactly the one sanctioned
+ * post. Not `mute_chat`: that would make "name the human who blocks you"
+ * impossible.
  */
 export const NUDGE_TASK_QUIET_ARGS = { quiet_status: true, chat_limit: 1 } as const;
 
 /**
- * Takeover has a different contract from a nudge: the agent being addressed is
- * not the owner, so "finish it" is not one of its options until it has actually
- * taken the claim. Declining is a first-class answer — a sibling that says why
- * it is not the right owner has still moved the claim out of silence.
- *
- * Same posting rule as the nudge: taking the claim rewrites the owner on the
- * board, so announcing it is duplication. Declining is not visible anywhere,
- * so declining is what posts.
+ * The addressee is not the owner, so declining is a first-class answer and is
+ * what posts; taking the claim already rewrites the board.
  */
 export function buildTakeoverPrompt(claim: BoardClaim, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';
@@ -373,24 +239,10 @@ export function buildTakeoverPrompt(claim: BoardClaim, threadUrl?: string | null
 }
 
 /**
- * The one message a human-blocked claim is allowed to produce, ever.
- *
- * It exists because a park that named a person notified nobody. The note shape
- * `waiting on <person>: <what you asked>` is a record, not a delivery — and the
- * two live claims that motivated this sat on it for ~40h while the Observatory
- * rendered them as a human owing a decision that the human had never been told
- * about.
- *
- * So the entire contract is the @-mention. `container/CLAUDE.md` binds the shape
- * (`👉 @<person> — <what they do, by when>`) and says why: the mention IS the
- * delivery mechanism — a human's notification, an agent's wake — and there is no
- * slot for a bare name. A message that says "waiting on the operator" and does not
- * mention them is this bug all over again, one layer up.
- *
- * Unlike a nudge this asks for no work, so it offers no ladder of options: if
- * the answer already arrived the claim should just move, and if it has not, the
- * ask has to reach someone. Either way this fires once — `applyDecision` stamps
- * `auto_heal_exhausted_at` on delivery, and the claim is then left red forever.
+ * The one message a human-blocked claim ever produces. The @-mention IS the
+ * delivery (a human's notification, an agent's wake); naming someone without
+ * mentioning them notifies nobody. Fires once: `applyDecision` stamps
+ * `auto_heal_exhausted_at` on delivery.
  */
 function buildHumanEscalationPrompt(claim: BoardClaim, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';
@@ -413,17 +265,13 @@ function buildHumanEscalationPrompt(claim: BoardClaim, threadUrl?: string | null
   );
 }
 
-/** An agent group wired to the claim's own thread channel. */
 interface SelfHealTarget {
   agentGroupId: string;
   messagingGroupId: string;
-  /** Display name we matched on, for the log line. */
   name: string;
   /**
-   * Where to deliver, when that is NOT the claim's own thread. Set only for a
-   * `system:tasks:<seriesId>` claim, whose thread is a task session rather than
-   * a real channel thread — see `taskSeriesCandidates`. `null` means the
-   * channel with no thread, which is distinct from `undefined`.
+   * Set only for a `system:tasks:<seriesId>` claim (its thread is a task
+   * session). `null` means the channel with no thread, distinct from `undefined`.
    */
   deliverThreadId?: string | null;
 }
@@ -436,25 +284,21 @@ export interface SelfHealTaskInput {
 }
 
 export interface SelfHealDeps {
-  /** Claims root — `data/workgroups` in production. */
   root?: string;
-  /** Owner's agent group, wired to the claim's thread channel. null = unresolvable. */
+  /** null = unresolvable. */
   resolveOwner?: (workgroupId: string, claim: BoardClaim) => Promise<SelfHealTarget | null>;
-  /** Any OTHER agent group in the workgroup wired to that channel. */
   resolveSibling?: (
     workgroupId: string,
     claim: BoardClaim,
     excludeAgentGroupId: string | null,
   ) => Promise<SelfHealTarget | null>;
-  /** One-shot task into the claim's own thread. Returns false on failure. */
+  /** Returns false on failure. */
   createTask?: (input: SelfHealTaskInput) => Promise<boolean>;
-  /** Human-clickable link to a thread id, or null. Defaults to the board's own resolver. */
   resolveThreadUrl?: (threadId: string) => Promise<string | null>;
   enabled?: boolean;
   takeoverEnabled?: boolean;
 }
 
-/** What the sweep did (or would have done) — returned so the tick and tests can assert on it. */
 export interface SelfHealOutcome {
   workgroupId: string;
   slug: string;
@@ -477,21 +321,10 @@ function listWorkgroupDirs(root: string): string[] {
 }
 
 /**
- * One resolve-then-read of a claim by slug, safe against the same hazards for
- * every caller: a FIFO, a directory, a device node, an oversized file, or one
- * symlinked out of the workgroup's own `claims/`. Never throws; returns
- * `null` for all of the above — logged here for a bad DIRECTORY, by
- * `readContainedFile` itself for a bad FILE. Callers decide what "cannot read
- * this claim right now" means for them (see `sweepClaimsSelfHeal` vs
- * `stampClaim`, which disagree on exactly that).
- *
- * `dir` is resolved FRESH on every call, never passed in and reused: a value
- * proven safe before an `await` only narrows the swap window an agent with
- * write access to `claims/` could exploit, it does not close it. Both the
- * classification re-read and the write-back stamp go through this one
- * function so they can never diverge on the containment logic or the size
- * cap — two numbers, or two resolution algorithms, for one file is its own
- * bug.
+ * Safe read of a claim by slug against a FIFO, directory, device node,
+ * oversized file, or symlink out of `claims/`. Never throws; null for all of
+ * those. `dir` is resolved FRESH each call: a path proven safe before an
+ * `await` only narrows the swap window for an agent with write access.
  */
 function resolveAndReadClaim(
   label: string,
@@ -505,27 +338,14 @@ function resolveAndReadClaim(
     return null;
   }
   const read = readContainedFile(label, dir, `${slug}.json`, workgroupId, MAX_CLAIM_BYTES);
-  if (read === null) return null; // already logged by readContainedFile — FIFO, oversized, escaping, or absent
+  if (read === null) return null; // already logged by readContainedFile
   return { file: path.join(dir, `${slug}.json`), text: read.text };
 }
 
 /**
- * Atomic tmp+rename, the same convention claim.sh itself writes with.
- *
- * Unlike the classification re-read, an unreadable claim here is NOT a safe
- * skip. Every call site below reaches this AFTER the thing the stamp exists
- * to remember has already happened — a nudge already sent, an escalation
- * already fired, a rung already spent — so silently dropping the stamp would
- * make the NEXT scan re-decide the same rung from nothing: re-nudging or
- * re-escalating every ~10 minutes instead of once. There is nowhere else to
- * persist that fact (no new schema — the claim file IS the ladder's memory),
- * so this THROWS on a hostile or missing file instead, exactly as a raw
- * `readFileSync`/`JSON.parse` on a deleted or corrupted claim already did
- * before this seam existed. `host-sweep.ts` already catches it ("Claims
- * self-heal sweep step failed"), logs once, and the next throttled scan tries
- * again. What changes is only HOW a hostile file gets there: a FIFO used to
- * hang this open forever; now it throws immediately instead, same as any
- * other unreadable claim always has.
+ * Atomic tmp+rename, as claim.sh writes. THROWS on an unreadable claim: every
+ * caller runs after the action being recorded, and dropping the stamp would
+ * re-fire the same rung every scan.
  */
 function stampClaim(root: string, workgroupId: string, slug: string, patch: Record<string, unknown>): void {
   const found = resolveAndReadClaim('self-heal stamp', root, workgroupId, slug);
@@ -544,47 +364,18 @@ interface WiredCandidate {
   name: string;
   folder: string;
   /**
-   * Deliver here instead of the claim's own thread. Set only by task-series
-   * claims, whose thread is a task session and never a real destination.
-   * `null` means the channel with no thread — a legitimate answer, distinct
-   * from `undefined` ("use the claim's thread").
+   * Set only by task-series claims. `null` means the channel with no thread,
+   * distinct from `undefined` ("use the claim's thread").
    */
   deliverThreadId?: string | null;
 }
 
 /**
- * A claim taken inside a scheduled task has no channel to nudge into: its
- * thread is `system:tasks:<seriesId>`, and a task session is deliberately
- * minted with `messaging_group_id = null` (session-manager `resolveTaskSession`),
- * so the channel join above matches nothing. Most autonomous work happens in
- * scheduled tasks, which made that the single biggest hole in this path — 805
- * of 1035 "no deliverable target" warnings in one log, and self-reinforcing:
- * a nudge is DELIVERED as a task, so an owner who re-claims while working it
- * rewrites the claim's thread to that nudge task's own `system:tasks:*` thread
- * and the claim can never be nudged again.
- *
- * WHO is not a guess: the task session row IS the series' owner, a strictly
- * better signal than reverse-mapping a channel.
- *
- * WHERE has two sources that are NOT the same thing, so they are ranked:
- *
- *   1. `task_thread_anchors` — where the series' output actually LANDED. First
- *      choice for a nudge: it is the live context the claim was worked in.
- *      Only ~46% of task sessions have one (64 of 138 measured), because an
- *      anchor is written only once a session posts into a thread.
- *   2. the series' routing STAMP on its `messages_in` row — where an
- *      unaddressed reply is supposed to land (`ncl tasks` help: "Routing (where
- *      an unaddressed reply lands)"). It exists from task-definition time
- *      whether or not the series ever spoke, but the agent picks its real
- *      destination per fire via `send_message`, so it is second
- *      choice, never first.
- *   3. neither — no target. "Unrouted" is the honest answer; the backoff above
- *      is what keeps it from being a loud one.
- *
- * Same precedence the display side uses, deliberately: two answers to "what
- * channel does a task session belong to" would be worse than either alone.
- * The wiring join is kept on both so we can still only address a channel the
- * agent group actually belongs to.
+ * A task-series claim's thread is `system:tasks:<seriesId>`, a session with no
+ * messaging group, so the channel join matches nothing. The task session row
+ * IS the owner. Destination, ranked: the newest `task_thread_anchors` row
+ * (where output actually landed), then the series' routing stamp, else none.
+ * Same precedence the display side uses. The wiring join still applies.
  */
 async function taskSeriesCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
   const { getDb } = await import('../../db/connection.js');
@@ -600,9 +391,7 @@ async function taskSeriesCandidates(workgroupId: string, threadId: string): Prom
   );
   if (!owner) return [];
 
-  // Newest anchor wins — a series that has posted in two channels is talking in
-  // the one it spoke in last, and picking arbitrarily is how a nudge lands in a
-  // room nobody is reading.
+  // Newest anchor wins: the channel the series spoke in last.
   const anchor = await getDb().get<{
     channelType: string;
     platformId: string;
@@ -630,47 +419,20 @@ async function taskSeriesCandidates(workgroupId: string, threadId: string): Prom
   return [{ agentGroupId: owner.agentGroupId, name: owner.name, folder: owner.folder, ...where }];
 }
 
-/**
- * Rung 2 — the series' own routing stamp, read from its task row.
- *
- * Reaching here costs a session-DB file open, so it is deliberately lazy: only
- * `system:tasks:*` claims get here, only after the anchor lookup missed, and
- * only once per backoff window (a claim that resolves to nothing is stamped and
- * left alone for a day). No cache — the backoff already is the throttle.
- */
+/** Lazy (a session-DB open): only after the anchor lookup missed. */
 async function seriesRoutingStamp(
   agentGroupId: string,
   sessionId: string,
   seriesId: string,
 ): Promise<{ messagingGroupId: string; deliverThreadId: string | null } | null> {
-  // Read-only seam: a self-heal probe must never provision or migrate the task
-  // session it is asking about (invariant I-4). `undefined` is "no mailbox",
-  // which reads the same as "no routing stamp" here — both leave the claim
-  // unrouted rather than guessing a destination.
-  //
-  // The two options restore what the replaced `withInboundDb` did. It reached
-  // `openInboundDb`: a READ-WRITE open with `busy_timeout = 5000` and
-  // `journal_mode = DELETE`. The funnel defaults to the console fan-out's 1s
-  // and no recovery, which is stricter on both counts.
-  //
-  // The timeout is the demonstrable half — 5000 to 1000, so a contended
-  // session gives up where it used to wait. `recoverJournal` is here on
-  // MECHANISM rather than a reproduced failure: `recoverHotJournal` is a
-  // read-write open that touches the DB, which is what the replaced open
-  // already was, so this restores its behavior rather than adding one. (A hot
-  // journal would not reproduce on this host to prove it end to end — the
-  // header comes back zeroed and SQLite ignores it.)
-  //
-  // What the conversion still drops is the schema-ensure, the migration and
-  // the reclaim-blocking activity marker, which is the whole point of it.
+  // Read-only: a probe must never provision or migrate the session. No mailbox
+  // reads as "no routing stamp".
   const [{ readSessionInbound }, { getDb }] = await Promise.all([
     import('../mailbox/index.js'),
     import('../../db/connection.js'),
   ]);
-  // Both reads are read-only, so they do not share a lease block: the stamp
-  // read is a synchronous session-DB open and the central lookup that follows
-  // it is one awaited SELECT. Nothing here writes, so a row changing between them costs at most one stale nudge
-  // destination — which a later tick re-resolves.
+  // Not in one lease block: a row changing between the two reads costs at most
+  // one stale destination, re-resolved later.
   const stamp = readSessionInbound(
     { agentGroupId, sessionId },
     (mailbox) => mailbox.getLatestTaskRoutingStamp(seriesId),
@@ -692,21 +454,9 @@ async function seriesRoutingStamp(
 }
 
 /**
- * Agent groups in `workgroupId` wired to the channel the claim's thread lives
- * in — the same join dashboard/nudge.ts uses to refuse a nudge into a channel
- * the agent does not belong to. Resolved from the DB by platform id, NOT by
- * looking for a live session: un-engaged traffic no longer mints sessions, so
- * "no live session on this channel" is the normal case, and a session-based
- * lookup would make delivery fail exactly when it is most needed.
- *
- * Do NOT reach for a "pick whichever session is newest on this messaging
- * group" helper here (the pattern `findAnySessionForMessagingGroup` used to
- * provide, since deleted as dead code): picking whichever is newest would
- * drop delivery into an unrelated thread's container. Route by the DB join
- * below instead.
- *
- * Exported for its own test: both resolvers funnel through here, so this is the
- * one place the "which room can we actually reach?" question is answered.
+ * Wired by DB join on platform id, NOT by live session: un-engaged traffic mints
+ * no sessions, and "newest session on this messaging group" would deliver into
+ * an unrelated thread's container.
  */
 export async function wiredCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
   const [{ getDb }, { threadPlatformId }, { isTaskThread }] = await Promise.all([
@@ -728,12 +478,9 @@ export async function wiredCandidates(workgroupId: string, threadId: string): Pr
 }
 
 /**
- * `claim.owner` is `$NANOCLAW_ASSISTANT_NAME` (set by claim.sh) — the agent's
- * user-facing name, which varies per channel. So the match runs through the
- * same resolver the spawn path uses to produce that env var, against the
- * channel the claim's thread is in, and falls back to the structural group
- * name. An owner we cannot resolve is skipped, never guessed: nudging the
- * wrong agent group is worse than not nudging.
+ * `claim.owner` is the per-channel assistant name, so match through the same
+ * resolver the spawn path uses, falling back to the group name. Never guess:
+ * nudging the wrong agent group is worse than not nudging.
  */
 async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Promise<SelfHealTarget | null> {
   if (!claim.threadId) return null;
@@ -775,10 +522,7 @@ async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Prom
       };
     }
   }
-  // A miss has to say what it looked at. Without this the caller logs only
-  // "no deliverable target", which is unfalsifiable after the fact: an
-  // investigation into 14 such warnings could rule out every testable cause and
-  // still not name the mechanism, because the candidate set was gone by then.
+  // A miss must log what it looked at, or it can't be diagnosed later.
   log.warn('self-heal: owner did not match any wired agent on the thread', {
     slug: claim.slug,
     wanted,
@@ -795,8 +539,6 @@ async function defaultResolveSibling(
 ): Promise<SelfHealTarget | null> {
   if (!claim.threadId) return null;
   const rows = await wiredCandidates(workgroupId, claim.threadId);
-  // ponytail: first wired sibling wins. Add a least-loaded pick if a workgroup
-  // ever has enough siblings on one channel for the choice to matter.
   const row = rows.find((r) => r.agentGroupId !== exclude);
   return row
     ? {
@@ -809,11 +551,8 @@ async function defaultResolveSibling(
 }
 
 /**
- * One-shot task into the claim's own thread. `caller: 'host'` with an explicit
- * `messaging_group` + `thread_id` is the only routing shape that does not
- * depend on a session already existing: `resolveTaskRouting` reads the
- * messaging-group ROW, and `resolveTaskSession` mints the agent group's task
- * session if it is missing.
+ * `caller: 'host'` with explicit `messaging_group` + `thread_id` is the only
+ * routing shape that doesn't need an existing session.
  */
 async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
   const { dispatch } = await import('../../cli/dispatch.js');
@@ -827,9 +566,7 @@ async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
         prompt: input.prompt,
         process_after: new Date().toISOString(),
         messaging_group: input.target.messagingGroupId,
-        // The claim's own thread, except for a task-series claim whose "thread"
-        // is a task session and never a destination — that one carries its own,
-        // and `null` there means "the channel, no thread", not "fall back".
+        // For a task-series claim `null` means "the channel, no thread", not "fall back".
         thread_id: input.target.deliverThreadId !== undefined ? input.target.deliverThreadId : input.claim.threadId,
         ...NUDGE_TASK_QUIET_ARGS,
       },
@@ -850,22 +587,17 @@ async function defaultResolveThreadUrl(threadId: string): Promise<string | null>
 
 let lastRanAtMs = 0;
 
-/** Test-only, same precedent as _resetNudgeDedupeForTesting. */
 export function _resetSelfHealThrottleForTesting(): void {
   lastRanAtMs = 0;
 }
 
-/** Pure — throttle gate for the scan cadence (mirrors the retired claims scan). */
 export function shouldSkipSelfHealScan(lastRan: number, now: number): boolean {
   return now - lastRan < SELF_HEAL_SCAN_INTERVAL_MS;
 }
 
 /**
- * Scan every workgroup for stale claims and walk each one up the ladder.
- *
- * Zero tokens until an action actually fires: the scan is a directory read and
- * a JSON parse. With `NANOCLAW_SELF_HEAL` off it logs what it would have done
- * and returns; takeover additionally requires `NANOCLAW_SELF_HEAL_TAKEOVER`.
+ * With `NANOCLAW_SELF_HEAL` off it only logs what it would do; takeover also
+ * requires `NANOCLAW_SELF_HEAL_TAKEOVER`.
  */
 export async function sweepClaimsSelfHeal(
   now: number = Date.now(),
@@ -887,16 +619,10 @@ export async function sweepClaimsSelfHeal(
     for (const claim of readClaims(workgroupId, now, root)) {
       if (claim.state !== 'stale') continue;
 
-      // Re-reads the SAME claim `readClaims` just classified, moments
-      // earlier — every property of the file on disk (FIFO, directory,
-      // symlinked elsewhere, oversized) is still an agent's choice right up
-      // to this line, so this goes through `resolveAndReadClaim` (fresh
-      // directory resolution + `readContainedFile`) rather than reusing
-      // anything `readClaims` already proved safe a moment ago. A skip here
-      // costs nothing: no decision has been made yet, so the claim is simply
-      // picked up again on the next scan.
+      // Re-read through `resolveAndReadClaim`: the file is an agent's choice up
+      // to this line. A skip is free, since nothing has been decided yet.
       const found = resolveAndReadClaim('self-heal', root, workgroupId, claim.slug);
-      if (found === null) continue; // already logged — directory or file, see resolveAndReadClaim
+      if (found === null) continue; // already logged
 
       let raw: SelfHealStamps & { note?: unknown; status?: unknown };
       try {
@@ -944,7 +670,6 @@ async function applyDecision(args: {
   const { workgroupId, claim, root, decision, now, enabled, takeoverEnabled } = args;
   const base = { workgroupId, slug: claim.slug, action: decision.action, reason: decision.reason };
 
-  // Terminal rung: no delivery, just the stamp that stops the ladder re-running.
   if (decision.action === 'exhaust') {
     if (!enabled) {
       log.info('self-heal: would exhaust stale claim', { class: 'stale-claim', ...base });
@@ -964,19 +689,14 @@ async function applyDecision(args: {
   const target =
     decision.action === 'takeover' ? await args.resolveSibling(workgroupId, claim, owner?.agentGroupId ?? null) : owner;
   if (!target) {
-    // Never guess a room or an agent: an unresolvable target means the claim
-    // stays exactly where it is, visible and red, with one line saying why.
-    // The stamp is what keeps that ONE line from becoming one per scan forever
-    // — it backs the claim off for a day without spending a nudge. Shadow mode
-    // stamps nothing, so a dry run still reports the full picture every scan.
+    // Never guess a target. The backoff stamp keeps this to one line per day
+    // without spending a nudge; shadow mode stamps nothing.
     if (enabled) stampClaim(root, workgroupId, claim.slug, { auto_heal_unresolved_at: new Date(now).toISOString() });
     log.warn('self-heal: no deliverable target for stale claim', { class: 'stale-claim', ...base });
     return { ...base, applied: false, reason: decision.action === 'takeover' ? 'no-sibling' : 'owner-unresolved' };
   }
 
-  // Link the thread the work lives in: the delivery thread for a task-series
-  // claim (its own thread is a task session, never a place a human can open),
-  // else the claim's thread. `null` delivery means channel-level: nothing to link.
+  // A task-series claim's own thread is not linkable; `null` means channel-level.
   const contextThread = target.deliverThreadId !== undefined ? target.deliverThreadId : claim.threadId;
   const threadUrl = contextThread ? await args.resolveThreadUrl(contextThread) : null;
   const prompt =
@@ -1006,13 +726,9 @@ async function applyDecision(args: {
   const sent = await args.createTask({ target, claim, prompt, name: `${verb} ${claim.slug}` });
   if (!sent) return { ...base, applied: false, reason: 'delivery-failed', target: target.agentGroupId };
 
-  // Stamp AFTER delivery: a failed send must not burn a rung. The count is the
-  // ladder's whole memory, so takeover writes the value that makes the next
-  // decision `exhaust`.
-  // `escalate-human` is terminal on delivery, so it stamps the ladder's own
-  // exhausted marker rather than a rung. `auto_nudged_at` goes with it because
-  // `effectiveState` reads exhaustion through that timestamp — without it the
-  // stamp is invisible and the one-shot escalation would repeat every day.
+  // Stamp AFTER delivery: a failed send must not burn a rung. `escalate-human`
+  // is terminal, so it stamps exhausted plus `auto_nudged_at` (effectiveState
+  // reads exhaustion through it, or the escalation repeats daily).
   stampClaim(
     root,
     workgroupId,

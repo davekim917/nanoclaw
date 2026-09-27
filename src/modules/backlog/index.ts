@@ -1,15 +1,3 @@
-/**
- * Backlog + ship-log module.
- *
- * Registers delivery action handlers for backlog and ship-log mutations:
- *   - add_ship_log
- *   - add_backlog_item
- *   - update_backlog_item
- *   - delete_backlog_item
- *
- * The container writes these as system-kind outbound messages; the host reads
- * them during delivery and applies the change to the central DB here.
- */
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';

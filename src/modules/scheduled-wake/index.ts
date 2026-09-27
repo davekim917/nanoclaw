@@ -1,15 +1,7 @@
 /**
- * Scheduled-wake module — the in-session "wait" primitive.
- *
- * The container agent's `wait` MCP tool writes a kind='system' outbound row
- * with action 'schedule_wake'; this handler converts it into a
- * `process_after` row in the SAME session's inbound.db. When it fires, the
- * sweep's due-wake step wakes this session (or a warm container's follow-up
- * poll pushes it into the active query) — an in-thread continuation with
- * full conversation context. This is deliberately NOT `ncl tasks`: a core
- * scheduled task fires in an isolated task session and posts to a
- * destination, which is the wrong shape for "I'll check CI in 15 minutes"
- * said inside a thread.
+ * The in-session `wait` primitive: a `process_after` row in the SAME session's
+ * inbound.db, so the wake continues in-thread with full context. Deliberately
+ * NOT `ncl tasks`, which fires in an isolated task session.
  */
 import { createHash } from 'crypto';
 
@@ -63,19 +55,10 @@ export async function applyScheduleWake(
     throw new Error('schedule_wake rejected: invalid payload');
   }
 
-  // One short mailbox session of its own for the whole handler: the anchor
-  // lookup, the routing fallback and the deferred insert are one logical step
-  // against the caller's own inbound queue, and delivery holds no session
-  // while a handler runs (plan §4.5b). The rejection throws from inside the
-  // action so the anchor check still precedes the insert; the helper closes
-  // its handles on the way out.
-  //
-  // Existing-only, never provisioning: `prepare()` would open the
-  // container-owned outbound.db read-write to apply its schema, and this
-  // request was read out of that very mailbox, so it exists. A session that
-  // has vanished has nothing left to wake.
-  // Ingress (src/modules/mailbox/ops/ingress.ts) checks the trigger ID regardless of status before
-  // atomically inserting its pair. The key stays consumed while that row is retained.
+  // Existing-only: provisioning would open the container-owned outbound.db
+  // read-write, and a vanished session has nothing to wake. The rejection
+  // throws inside the action so the anchor check precedes the insert. A dedupe
+  // key stays consumed while its row is retained.
   const effectiveWakeId = hasDedupeKey
     ? `keyed-${createHash('sha256').update(`${session.id}\0${dedupeKey}`).digest('hex')}`
     : wakeId ||
@@ -101,9 +84,7 @@ export async function applyScheduleWake(
       threadId: routing?.thread_id ?? null,
       sourceSessionId: anchoredRouting?.source_session_id ?? null,
       content: JSON.stringify({
-        // Self-wake final text stays internal (the runner's poll loop).
-        // Refer to the mounted send_message schema rather than version-specific
-        // policy fields (the runner's core MCP tools).
+        // Self-wake final text stays internal.
         text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Use the send_message tool for anything that should post, following its available schema and communication rules; if nothing needs posting, end with no message at all.)`,
         sender: 'system',
         senderId: 'system',

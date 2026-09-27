@@ -1,50 +1,12 @@
 /**
- * Bash gate — in-container Bash commands that require admin approval.
+ * Admin-approval gates for in-container Bash: `request_bash_gate` (soft
+ * sensitive, e.g. email send) and `request_destructive_gate`. Distinct action
+ * names so cards, logs and policy can differ; shared ack mechanics.
  *
- * Two sibling entry points that share the same machinery but carry
- * different category labels:
- *   - `request_bash_gate` / approval action `bash-gate` —
- *     soft-sensitive ops (email send). Default title prefix: "Bash".
- *   - `request_destructive_gate` / approval action `destructive-gate` —
- *     destructive filesystem / infra ops, triggered by
- *     bootstrap/plugins/workflow/hooks/guards/block-destructive.ts.
- *     Default title prefix: "Destructive".
- *
- * The categorical split exists so approval cards, audit logs, and
- * future differentiated policy (e.g. always-block vs require-2FA for
- * destructive) can key off the action name rather than pattern-match
- * the label. The handlers themselves are shared — both categories
- * round-trip through the same ack mechanism.
- *
- * Flow (originator: a PreToolUse:Bash hook or plugin in the container):
- *   1. Hook writes a system-action message to outbound.db with
- *      action='request_bash_gate' or 'request_destructive_gate' and
- *      content { requestId, label, summary, command }.
- *      requestId === messages_out.id.
- *   2. delivery.ts picks the system action up, dispatches to our
- *      category-specific handler, which calls requestApproval with the
- *      matching approval action and sets a 60-min timeout.
- *   3. Admin clicks approve / reject in their DM. response-handler.ts
- *      dispatches to our shared approval handler, which writes the
- *      decision into inbound.db's `delivered` table under requestId.
- *   4. Timeout fires if still pending after 60 min → same table write
- *      with status='failed' + a timeout error.
- *   5. The container hook polls `delivered` for requestId via the same
- *      awaitDeliveryAck primitive that send_file uses. Approve →
- *      command executes; reject/timeout → command is denied with the
- *      returned error.
- *
- * Cross-mount state lives entirely in `delivered` — no new per-session
- * schema. The `delivered` table is dual-purpose (chat delivery outcomes
- * AND bash-gate outcomes) which is a mild semantic overload but keeps
- * the wire surface minimal and lets the container side reuse existing
- * code unchanged.
- *
- * Tier: default module. Optional in the sense that a fork that doesn't
- * want admin-gated Bash can `registerDeliveryAction` a no-op — but the
- * email-gate container hook will dead-lock for 30 min on every send
- * without a handler wired up, so effectively required wherever email
- * skills are enabled.
+ * The container hook writes the request (requestId === messages_out.id) and
+ * polls inbound.db's `delivered` table for requestId; approve, reject or
+ * timeout writes the decision there. Without a registered handler the
+ * container-side hook blocks until its own timeout on every send.
  */
 
 import { registerDeliveryAction } from '../../delivery.js';
@@ -67,27 +29,18 @@ import {
   type ApprovalHandlerContext,
 } from '../approvals/primitive.js';
 
-// 60 minutes — users often step away for meetings and come back. The
-// prior 30-min window matched v1's IDLE_TIMEOUT but routinely timed out
-// on approvers who were in a call when the card landed.
+// Approvers are often in a meeting when the card lands.
 const BASH_GATE_TIMEOUT_MS = 60 * 60 * 1000;
 const GATE_CARD_TITLE_MAX_CHARS = 140;
-// Leave enough room for the structured summary and footer on both Slack
-// Block Kit and Discord embeds. A head+tail preview preserves both the
-// command being invoked and its final arguments, which are often the most
-// consequential part of a long shell command.
+// Head+tail preview: a long command's final arguments are often the most
+// consequential part.
 const GATE_COMMAND_PREVIEW_MAX_CHARS = 1400;
 
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
 
 /**
- * Session IDs with at least one in-flight gate. The router checks this
- * Set before calling `cancelPendingGatesForSession` so the common case
- * (no gate, no cancel needed) skips the DB query entirely.
- *
- * Not persisted — on host restart all container gates are already stale
- * (awaitDeliveryAck will hit the container-side timeout either way), so
- * losing this set on restart is the right behavior.
+ * Lets the router skip the cancel query in the common case. Not persisted: on
+ * host restart every container gate is already stale.
  */
 const sessionsWithActiveGates = new Set<string>();
 
@@ -100,18 +53,12 @@ interface BashGatePayload {
   label: string;
   summary: string;
   command: string;
-  /** Carried into the approval payload so the approval handler can find its way back to the session. */
   sessionId: string;
 }
 
 /**
- * Resolve the gate's own `delivered` row.
- *
- * A short mailbox session of its own: the gate defers its ack, so this runs
- * long after the drain that dispatched it, with no session open anywhere
- * (plan §4.5b). `withExistingMailboxSession` because a session whose mailbox
- * is gone has no container left polling for the decision — provisioning one
- * would recreate a reclaimed directory to write an ack nobody reads.
+ * Runs long after the dispatching drain, in its own short session. Existing-only:
+ * a session whose mailbox is gone has no container polling for the decision.
  */
 async function writeGateAck(
   session: Session,
@@ -137,40 +84,15 @@ function clearPending(requestId: string): void {
 }
 
 interface GateCategory {
-  /** Delivery-action name the container writes (e.g. 'request_bash_gate'). */
   deliveryAction: string;
-  /** Approval-action name carried into requestApproval + registered on the approval side. */
   approvalAction: string;
-  /** Fallback label when the container omits one. */
   defaultLabel: string;
-  /** Fallback summary when the container omits one. */
   defaultSummary: string;
-  /** Log prefix for this category. */
   logPrefix: string;
-  /** Emoji shown in the card title (⚠️ for soft gates, 🛑 for destructive). */
   titleEmoji: string;
-  /** Short category word rendered in the card body header (e.g. "Email send", "Destructive command"). */
   kindNoun: string;
 }
 
-/**
- * Build the card body shown to the approver. Structure:
- *
- *   **<title-label>**
- *
- *   <summary sentence>
- *
- *   ```
- *   <truncated command>
- *   ```
- *
- *   _Approve to run. Reject to cancel. Times out in 60 min._
- *
- * Keeps the Slack/Discord rendering readable: title stays short, the
- * command lives in its own code block instead of being inlined with
- * the summary, and the footer tells the approver what each outcome
- * means and what the timeout is. Matches v1's richer card layout.
- */
 function commandPreview(command: string): string {
   const codePoints = Array.from(command);
   if (codePoints.length <= GATE_COMMAND_PREVIEW_MAX_CHARS) return command;
@@ -185,10 +107,8 @@ function commandPreview(command: string): string {
 function buildCardBody(category: GateCategory, summary: string, command: string): string {
   const parts: string[] = [summary];
   if (command) {
-    // Multi-line fenced code block renders nicely on both Slack and
-    // Discord (mrkdwn + markdown). The full command is persisted in the
-    // approval payload; the readable card preview keeps both its head and
-    // tail so an approver is not asked to infer omitted final arguments.
+    // The full command is persisted in the approval payload; the card preview
+    // keeps head and tail so the approver never infers omitted final arguments.
     parts.push('```\n' + commandPreview(command) + '\n```');
   }
   const timeoutMinutes = BASH_GATE_TIMEOUT_MS / 60_000;
@@ -217,23 +137,20 @@ function createGateHandler(category: GateCategory) {
   ): Promise<{ deferAck: true }> {
     const label = typeof content.label === 'string' ? content.label : category.defaultLabel;
     const summary = typeof content.summary === 'string' ? content.summary : category.defaultSummary;
-    // Preserve the full command for audit and for a head+tail card preview.
-    // Truncating it here silently discarded the most important trailing flags
-    // before either of those consumers could see them.
+    // Keep the full command: truncating would drop consequential trailing flags.
     const command = typeof content.command === 'string' ? content.command : '';
     const requestId = typeof content.requestId === 'string' ? (content.requestId as string) : '';
     if (!requestId) {
       log.warn(`${category.deliveryAction} missing requestId`, { content });
-      // Even on malformed request we want to defer — the container wrote a
-      // messages_out row keyed on its own requestId and will poll for the
-      // delivered/failed decision. Auto-acking here would falsely unblock.
+      // Still defer: the container polls for a decision on its own requestId,
+      // and auto-acking would falsely unblock it.
       return { deferAck: true };
     }
 
     sessionsWithActiveGates.add(session.id);
 
-    // Schedule the timeout before we dispatch the approval, so if anything
-    // below throws we still auto-resolve on the container side.
+    // Schedule the timeout before dispatching, so a throw below still
+    // auto-resolves the container side.
     const timer = setTimeout(() => {
       void (async () => {
         pendingTimeouts.delete(requestId);
@@ -276,11 +193,9 @@ function createGateHandler(category: GateCategory) {
       payload: payload as unknown as Record<string, unknown>,
       title: buildCardTitle(category, label),
       question: buildCardBody(category, summary, command),
-      // Gates deliver in-thread so teammates using the agent can approve
-      // their own work-level requests without waiting on the bot owner.
-      // response-handler.ts doesn't check clicker identity — thread access
-      // IS the authority for work-level gates. Self-mod / credential
-      // approvals stay admin-DM (their defaults).
+      // In-thread: thread access IS the authority for work-level gates
+      // (response-handler.ts doesn't check clicker identity). Self-mod and
+      // credential approvals stay admin-DM.
       deliveryTarget: 'thread',
     });
     if (!approvalDelivered) {
@@ -295,12 +210,8 @@ function createGateHandler(category: GateCategory) {
       return { deferAck: true };
     }
 
-    // Write a 'pending' row to `delivered` so the delivery loop's
-    // getDeliveredIds dedup filter skips this message on the next poll
-    // tick. Without this, every poll re-dispatches the gate → one
-    // approval card per poll interval (~500ms) until the human acts.
-    // The bash-gate approval handler (or timeout path) later UPSERTs
-    // this to 'delivered' or 'failed' — both outcomes supersede 'pending'.
+    // Mark 'pending' so the delivery loop's dedup skips it; otherwise every
+    // poll re-dispatches the gate and posts another card.
     await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.markPending(requestId));
 
     return { deferAck: true };
@@ -324,26 +235,17 @@ function createApprovalHandler(logPrefix: string) {
       return;
     }
 
-    // response-handler.ts only invokes registered handlers on Approve —
-    // Reject is handled directly there via markDeliveryFailed. So
-    // reaching this function always means approved.
+    // Only invoked on Approve; Reject is handled in response-handler.ts.
     await writeGateAck(session, p.requestId, 'approved');
     log.info(`${logPrefix} gate approved`, { requestId: p.requestId, userId });
-    // Best-effort: writeGateAck above already recorded the approval. This is
-    // an approval handler (registerApprovalHandler) — an awaited rejection
-    // here would propagate to response-handler.ts's catch, which attempts
-    // its own fallback notify; if that ALSO fails, the approval row is never
-    // deleted and stays clickable, risking a replay of the already-recorded
-    // ack.
+    // Best-effort, never awaited: an awaited rejection whose fallback notify
+    // also fails leaves the approval row clickable, replaying the ack.
     void Promise.resolve(notifyAgent(session, `${logPrefix} gate approved: ${p.label}`)).catch((err) =>
       log.warn(`${logPrefix} gate approval notification failed`, { requestId: p.requestId, err }),
     );
   };
 }
 
-// Categorical split: bash-gate (soft sensitive — email) vs destructive-gate
-// (filesystem/infra destructive ops). Same ack mechanics, distinct labels
-// and action names so logs / policy can differentiate.
 const BASH_GATE: GateCategory = {
   deliveryAction: 'request_bash_gate',
   approvalAction: 'bash-gate',
@@ -377,28 +279,10 @@ registerDeliveryAction(
 registerApprovalHandler(DESTRUCTIVE_GATE.approvalAction, createApprovalHandler(DESTRUCTIVE_GATE.logPrefix));
 
 /**
- * Auto-cancel every in-flight gate for `sessionId`. Called from the
- * router when a new inbound message arrives for a session that has
- * pending gates — v1 behavior: sending a follow-up implicitly rejects
- * the open gate so the agent can answer the new question instead of
- * staying blocked on awaitDeliveryAck.
- *
- * For each pending bash-gate or destructive-gate row:
- *   1. Clear the in-memory 60-min timeout (no-op if the handler was
- *      registered on a previous host run).
- *   2. Edit the card in Slack/Discord to show "cancelled by follow-up"
- *      and drop the buttons. Best-effort — failures just leave the
- *      card live but that's recoverable by the user clicking anyway
- *      (the pending_approvals row is deleted below, so clicks become
- *      no-ops rather than firing the stale gate).
- *   3. Write 'failed' to the session's inbound.db delivered table so
- *      the container's awaitDeliveryAck returns → PreToolUse hook
- *      denies the Bash command → current turn ends → next turn picks
- *      up the new inbound message cleanly.
- *   4. Delete the pending_approvals row so a late click can't
- *      retroactively approve a cancelled gate.
- *
- * Safe to call with no pending gates — returns immediately.
+ * A follow-up message implicitly rejects the session's open gates so the
+ * agent can answer it instead of staying blocked. Card edit is best-effort;
+ * the pending_approvals row is deleted so a late click can't approve a
+ * cancelled gate.
  */
 export async function cancelPendingGatesForSession(sessionId: string, reason: string): Promise<void> {
   const pending: PendingApproval[] = (await getPendingApprovalsBySession(sessionId)).filter(
@@ -419,9 +303,7 @@ export async function cancelPendingGatesForSession(sessionId: string, reason: st
   });
 
   for (const p of pending) {
-    // p.request_id is the gate's own outbound message id (bash-gate
-    // passes it through requestApproval's requestId option) — that's
-    // what the container's awaitDeliveryAck polls on.
+    // request_id is the gate's own outbound message id, which the container polls on.
     clearPending(p.request_id);
     try {
       await editApprovalCard(p, `❌ *${p.title}* — cancelled\n\n${reason}`);
