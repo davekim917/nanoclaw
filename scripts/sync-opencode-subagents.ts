@@ -1,14 +1,8 @@
 #!/usr/bin/env tsx
 /**
- * CLI shim — convert every Claude-format subagent `.md` (plugin tree +
- * `~/.claude/agents/`) into an OpenCode agent `.md` and write to
- * `~/.config/opencode/agent/` (host's personal opencode session) plus every
- * `~/.local/share/opencode-<folder>/agent/` whose folder has an `auth.json`.
+ * CLI shim for `syncOpenCodeSubagents()` (src/opencode-sync.ts): Claude-format subagents to
+ * OpenCode agent `.md` files.
  *
- * Real work lives in `src/opencode-sync.ts:syncOpenCodeSubagents()` so the
- * watcher daemon can call it in-process without spawn overhead.
- *
- * Usage:
  *   pnpm exec tsx scripts/sync-opencode-subagents.ts
  */
 import { syncOpenCodeSubagents } from '../src/opencode-sync.js';

@@ -1,7 +1,5 @@
 /**
- * Scheduled turns that delivered no chat reply, grouped by what woke them.
- * Local only: reads every group, sends nothing, prints only the first 70
- * characters of each task prompt (text we author, shown on this host).
+ * Scheduled turns that delivered no chat reply, grouped by what woke them. Local only.
  *
  *   pnpm exec tsx scripts/jev-shadow/silent.ts [--since 2026-09-10]
  */

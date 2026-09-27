@@ -1,8 +1,6 @@
 /**
- * Walks `argv`, accepting both `--flag value` and `--flag=value`. `onArg` receives the flag
- * name (the text before any `=`), the raw argument, and `value()`, which returns the inline
- * value or consumes the next argument. A missing value calls `fail`. A value may itself begin
- * with a dash, so `--accept -- -weird.md` stays possible.
+ * Accepts `--flag value` and `--flag=value`; `value()` returns the inline value or consumes the
+ * next argument, which may itself begin with a dash.
  */
 export function walkArgs(
   argv: readonly string[],

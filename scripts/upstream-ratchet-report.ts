@@ -1,34 +1,16 @@
 #!/usr/bin/env tsx
 /**
- * Upstream-ownership ratchet — the git half. Recomputes every upstream-owned path's
- * divergence against the PINNED commit and compares it to the committed manifest:
+ * Upstream-ownership ratchet, the git half: every upstream-owned path's divergence against the
+ * PINNED commit, compared to the committed manifest. GROWTH and NEW fail; SHRINK, STALE (manifest
+ * owes a regeneration), UNCHANGED and DROPPED (re-pin only) do not.
  *
- *   GROWTH     the fork diverged further in that file        → fails
- *   NEW        the file was byte-identical and no longer is,
- *              or was present and is now deleted             → fails
- *   SHRINK     the fork moved back toward upstream           → always allowed
- *   STALE      recorded as divergent, now byte-identical     → allowed, but the
- *              manifest owes a regeneration
- *   UNCHANGED  same divergence as recorded
- *   DROPPED    the path left upstream's tree (re-pin only)   → never a failure
+ * Modes: default reports; `--write` regenerates src/upstream-ratchet.json, REFUSING while a GROWTH
+ * or NEW path is not named by `--accept <path>` / `--accept-all`; `--upstream <rev>` re-pins
+ * (implies both); `--check <ref>` evaluates <ref>'s committed tree with no writes, plus a
+ * STALE-MANIFEST check (docs/upstream-ratchet.md); `--root <dir>`; `--json`.
  *
- * Modes:
- *   (default)              report; exit 1 on any GROWTH or NEW, else 0
- *   --write                regenerate src/upstream-ratchet.json; REFUSES while
- *                          any GROWTH or NEW path is not named by --accept
- *   --accept <path>        (repeatable, `--accept=<path>` too) permit one path
- *   --accept-all           permit all of them
- *   --upstream <rev>       re-pin to <rev>'s full commit id. Implies --write and
- *                          --accept-all
- *   --root <dir>           repo to operate on (default: this script's checkout)
- *   --json                 machine-readable output
- *   --check <ref>          evaluate <ref>'s own committed tree instead of the
- *                          working tree, with no writes, plus a STALE-MANIFEST
- *                          currency check. See docs/upstream-ratchet.md.
- *
- * Exit 2 (not 1) when the pinned commit is not in the clone: that is "cannot
- * measure", not "the ratchet failed", and CI needs to tell them apart. Same
- * code when a `--check` ref does not resolve, or carries no manifest.
+ * Exit 2, not 1, when the pinned commit is not in the clone or a `--check` ref does not resolve or
+ * carries no manifest: "cannot measure" is not "the ratchet failed", and CI tells them apart.
  */
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -86,7 +68,6 @@ interface Options {
   acceptAll: boolean;
   upstream: string | null;
   json: boolean;
-  /** `--check <ref>`: evaluate `<ref>`'s own tree instead of the working tree. */
   check: string | null;
 }
 
@@ -113,8 +94,6 @@ function parseArgs(argv: readonly string[]): Options {
     else if (arg !== '--') fail(`unknown argument: ${arg}`);
   });
   if (options.upstream !== null) {
-    // Re-pinning moves the base under every path at once, so there is no per-path
-    // arbitration to do.
     options.write = true;
     options.acceptAll = true;
   }
@@ -135,7 +114,6 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-/** A malformed invocation — distinct exit code from `fail`'s "the ratchet failed" (1). */
 function usageError(message: string): never {
   console.error(`upstream-ratchet: ${message}`);
   process.exit(2);
@@ -166,16 +144,12 @@ function git(root: string, args: string[], quiet = false): string {
   return execFileSync('git', ['-C', root, ...args], {
     maxBuffer: 512 * 1024 * 1024,
     encoding: 'utf8',
-    // A probe that is EXPECTED to fail should not print git's own `fatal:` line
-    // over the actionable message this script is about to give instead.
+    // An EXPECTED failure: git's own `fatal:` line would bury the actionable message.
     stdio: quiet ? ['ignore', 'pipe', 'ignore'] : ['ignore', 'pipe', 'inherit'],
   });
 }
 
-/**
- * The full 40-hex commit id `rev` names, or exit 2 with the fetch to run. A branch name
- * persisted verbatim would make the pin move under the fork.
- */
+/** Exit 2 with the fetch to run. A branch name persisted verbatim would make the pin move under the fork. */
 function resolveCommit(root: string, rev: string): string {
   let resolved: string;
   try {
@@ -193,11 +167,7 @@ function resolveCommit(root: string, rev: string): string {
   return resolved;
 }
 
-/**
- * `--check` needs git 2.40+ for `--attr-source=<ref>`: without it git resolves
- * `.gitattributes` from the running checkout, and `--check` would silently measure with the
- * wrong tree's attributes.
- */
+/** `--attr-source` needs git 2.40+: without it `.gitattributes` silently resolves from the running checkout. */
 function requireAttrSourceSupport(root: string): void {
   const raw = git(root, ['--version'], true).trim();
   const match = /git version (\d+)\.(\d+)/.exec(raw);
@@ -212,10 +182,7 @@ function requireAttrSourceSupport(root: string): void {
   }
 }
 
-/**
- * `git check-ignore` is index-aware: it never reports a tracked path, so `ignored` safely
- * implies `deleted`. It exits 1 when nothing matches, which is a normal answer.
- */
+/** Index-aware: never reports a tracked path, so `ignored` implies `deleted`. Exit 1 means no match. */
 function gitIgnored(root: string, paths: readonly string[]): Set<string> {
   if (paths.length === 0) return new Set();
   let stdout: string;
@@ -227,8 +194,7 @@ function gitIgnored(root: string, paths: readonly string[]): Set<string> {
       stdio: ['pipe', 'pipe', 'ignore'],
     });
   } catch (error) {
-    // Exit 1 means "none of them are ignored", and the child still wrote its
-    // (empty) stdout. Anything without stdout is a real failure.
+    // Exit 1 with stdout is "none ignored"; anything without stdout is a real failure.
     const output = (error as { stdout?: string }).stdout;
     if (typeof output !== 'string') throw error;
     stdout = output;
@@ -236,10 +202,7 @@ function gitIgnored(root: string, paths: readonly string[]): Set<string> {
   return new Set(stdout.split('\0').filter(Boolean));
 }
 
-/**
- * `git diff <commit>` compares against the WORKING TREE, so an uncommitted edit is measured
- * (deliberate). It only sees tracked paths, which is why the shadow check exists.
- */
+/** Measures the WORKING TREE (deliberate), tracked paths only; the shadow check covers the rest. */
 export function computeFromGit(root: string, sha: string): UpstreamRatchetManifest {
   const upstreamModes = parseLsTree(git(root, ['ls-tree', '-r', '-z', sha]));
   const forkIndex = parseLsFiles(git(root, ['ls-files', '-s', '-z']));
@@ -275,28 +238,19 @@ export function computeFromGit(root: string, sha: string): UpstreamRatchetManife
   );
 }
 
-/**
- * Raw (unfiltered) blob content for symlink ids, via one `cat-file --batch`. Not routed through
- * `git()`: its utf8 decoding would mangle non-UTF8 bytes.
- */
+/** Not routed through `git()`: its utf8 decoding would mangle non-UTF8 bytes. */
 function catFileBatch(root: string, ref: string, ids: readonly string[]): Buffer {
   if (ids.length === 0) return Buffer.alloc(0);
   return execFileSync('git', ['-C', root, `--attr-source=${ref}`, 'cat-file', '--batch'], {
     input: ids.join('\n') + '\n',
-    // Bounded: only upstream-owned symlink blobs (a target string) are ever requested.
     maxBuffer: 512 * 1024 * 1024,
     stdio: ['pipe', 'pipe', 'inherit'],
   }) as Buffer;
 }
 
 /**
- * The sha256 a real checkout of `<ref>:<relPath>` would hash to: the blob after `<ref>`'s own
- * gitattributes filters, with filter drivers from the running repo's config (as a real
- * checkout does). One subprocess per regular upstream-owned path, never a selected subset:
- * `check-attr` cannot enumerate every transform (`core.autocrlf` applies with no attribute),
- * and `cat-file --batch --filters` reports the PRE-filter size in its header, which desyncs
- * the batch framing. `--attr-source=<ref>` pins attribute resolution to `<ref>`'s tree.
- * See "Checkout filters" in docs/upstream-ratchet.md.
+ * One subprocess per regular path: `check-attr` cannot enumerate every transform, and
+ * `cat-file --batch --filters` reports the PRE-filter size. See docs/upstream-ratchet.md.
  */
 function catFileFiltered(root: string, ref: string, relPath: string): Buffer {
   return execFileSync('git', ['-C', root, `--attr-source=${ref}`, 'cat-file', '--filters', `${ref}:${relPath}`], {
@@ -309,23 +263,16 @@ function hashFilteredBlob(root: string, ref: string, relPath: string): string {
   return hashBlobContent(catFileFiltered(root, ref, relPath));
 }
 
-/**
- * The `--check` counterpart to `computeFromGit`, sharing `buildManifest` as the one
- * arbitration path. No index or working tree exists for a bare ref, so `ignored` is always
- * empty and the untracked-shadow check does not run.
- */
+/** No index or working tree for a bare ref: `ignored` is always empty and the untracked-shadow check does not run. */
 function computeFromRef(
   root: string,
   sha: string,
   ref: string,
 ): { manifest: UpstreamRatchetManifest; reader: TreeReader } {
   const upstreamModes = parseLsTree(git(root, ['ls-tree', '-r', '-z', sha]));
-  // Every `<ref>`-scoped call carries `--attr-source=<ref>`, so that stays a checkable
-  // invariant even where git does not consult attributes today.
   const refEntries = parseLsTreeEntries(git(root, [`--attr-source=${ref}`, 'ls-tree', '-r', '-z', ref]));
 
-  // A directory where an upstream-owned blob belongs cannot be measured: exit 2, as for an
-  // unmeasurable pinned commit.
+  // A directory where an upstream-owned blob belongs cannot be measured: exit 2.
   const directoryShadows = findDirectoryShadows([...upstreamModes.keys()], [...refEntries.keys()]);
   if (directoryShadows.length > 0) {
     console.error(
@@ -336,8 +283,7 @@ function computeFromRef(
     process.exit(2);
   }
 
-  // Symlinks are never filtered on checkout, and raw `cat-file --batch` reports their size
-  // correctly, so batching is safe for these.
+  // Symlinks are never filtered on checkout, so batching is safe for these.
   const symlinkBlobIds = [
     ...new Set(
       [...refEntries.entries()]
@@ -365,8 +311,7 @@ function computeFromRef(
     return entry === undefined ? null : (symlinkHashes.get(entry.blob) ?? null);
   };
   const forkIndex = new Map([...refEntries].map(([p, e]) => [p, e.mode]));
-  // NOT a no-op: `diff --numstat` decides binary-ness from `-diff`/`binary`/`diff=` attributes,
-  // which without `--attr-source` come from the running checkout, not `<ref>`.
+  // NOT a no-op: `diff --numstat` reads binary-ness from attributes, which must come from `<ref>`.
   const numstat = parseNumstat(
     git(root, [`--attr-source=${ref}`, 'diff', '--numstat', '--no-renames', '-z', sha, ref]),
   );
@@ -438,7 +383,6 @@ function counts(manifest: UpstreamRatchetManifest): {
   };
 }
 
-/** The `--write --accept …` line to re-run, safe to paste into a shell. */
 function acceptCommand(rows: readonly Row[]): string {
   return `pnpm run ratchet:report -- --write ${rows.map((r) => acceptFlag(r.path)).join(' ')}`;
 }
@@ -447,7 +391,7 @@ function renderCurrencyFinding(f: Finding): string {
   return `  STALE-MANIFEST ${f.path.padEnd(51)} ${f.detail}`;
 }
 
-/** Rendered through the same `--json` shape as every other `--check` failure, never a plain `fail()`. */
+/** Rendered through the `--json` shape, never a plain `fail()`. */
 function reportUnusableCheckedManifest(ref: string, resolvedRef: string, findings: Finding[], json: boolean): never {
   if (json) {
     console.log(
@@ -478,7 +422,6 @@ function reportUnusableCheckedManifest(ref: string, resolvedRef: string, finding
   process.exit(1);
 }
 
-/** The working-tree counterpart to `reportUnusableCheckedManifest`, for `main()`'s local manifest. */
 function reportUnusableLocalManifest(committedPath: string, findings: Finding[], json: boolean): never {
   if (json) {
     console.log(
@@ -499,11 +442,6 @@ function reportUnusableLocalManifest(committedPath: string, findings: Finding[],
   process.exit(1);
 }
 
-/**
- * `--check <ref>` fails on either: `classify()` against the manifest committed at `<ref>`, or
- * the STALE-MANIFEST currency check (`checkTree` over a ref-backed reader), which catches
- * bookkeeping drift the diff arithmetic alone would not.
- */
 function runCheck(options: Options): never {
   const root = options.root;
   const ref = options.check as string;
@@ -526,8 +464,7 @@ function runCheck(options: Options): never {
   );
   if (symlinkFinding !== null) reportUnusableCheckedManifest(ref, resolvedRef, [symlinkFinding], options.json);
 
-  // Read through the filtered path, not `git show`: a clean/smudge filter on the manifest
-  // itself would otherwise have `--check` read a different form than a real checkout.
+  // Through the filtered path, not `git show`: a clean/smudge filter on the manifest would differ.
   let manifestText: string;
   try {
     manifestText = catFileFiltered(root, resolvedRef, MANIFEST_REL).toString('utf8');
@@ -557,8 +494,7 @@ function runCheck(options: Options): never {
     );
   }
 
-  // Validated before `committed.upstream` is dereferenced: `--check` reads an arbitrary ref's
-  // content, and no `unpinnedOk` exemption applies to a committed manifest.
+  // Validated before `committed.upstream` is dereferenced: `--check` reads an arbitrary ref's content.
   const shapeFindings = validateManifestShape(committed);
   if (shapeFindings.length > 0) reportUnusableCheckedManifest(ref, resolvedRef, shapeFindings, options.json);
 
@@ -577,8 +513,7 @@ function runCheck(options: Options): never {
   }
   const elapsedMs = Date.now() - started;
 
-  // `classify` and `counts` throw on a malformed manifest; `checkTree` reports it as a
-  // `malformed` finding without throwing, so rows are skipped when it does.
+  // `checkTree` reports a malformed manifest without throwing, where `classify` and `counts` throw.
   const malformed = currencyFindings.some((f) => f.kind === 'malformed');
   const rows = malformed ? [] : classify(committed, current);
   const outcome = decideCheckOutcome(rows, currencyFindings);
@@ -678,7 +613,6 @@ function main(): void {
     committed = readManifest(root);
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (error) {
-    // Invalid JSON means the file exists but can't be trusted — not the "no manifest yet" case.
     if (error instanceof SyntaxError) {
       reportUnusableLocalManifest(
         committedPath,
@@ -693,9 +627,7 @@ function main(): void {
         options.json,
       );
     }
-    // Creating the manifest for the first time is a re-pin against an empty
-    // baseline: everything upstream owns reads as NEW, which is exactly what an
-    // unaudited starting point is. Any other mode needs the file to exist.
+    // First-run creation is a re-pin against an empty baseline: everything upstream owns reads as NEW.
     if (options.upstream === null) {
       fail(`could not read ${committedPath}: ${error instanceof Error ? error.message : String(error)}`);
     }

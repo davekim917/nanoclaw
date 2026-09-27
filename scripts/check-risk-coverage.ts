@@ -1,130 +1,42 @@
 #!/usr/bin/env tsx
 /**
- * check-risk-coverage — the coverage ratchet docs/specs/risk-based-review/plan.md's
- * "Tests on risky paths" item calls for: coverage on the risk:high paths
- * (.github/labeler.yml) can drop only on purpose. NOT a fixed floor — plan.md's
- * Non-goals section is explicit that copying someone else's 85% number is out of
- * scope; this only ratchets against this repo's OWN prior measurement, and it is a
- * manually-raised floor, not an automatic one: a coverage GAIN never fails, and never
- * gets locked in on its own either — see "Raising the baseline" below.
+ * Coverage ratchet for the risk:high paths (.github/labeler.yml): coverage can drop only on
+ * purpose. It ratchets against this repo's own committed baseline, and a gain is never locked in
+ * automatically.
  *
- * Every risk file gets classified into exactly one of three states, both when
- * measured now and when recorded in the baseline (see `Classification`/`BaselineEntry`):
- *   - a NUMBER — real, measured line-coverage percentage;
- *   - `'untested'` — has executable statements, currently 0% (or, for a container file,
- *     never appears in bun's report at all — see "The container gap" below). Recorded
- *     explicitly, not as a silent `0`, so an already-untested file at baseline time reads
- *     back as KNOWN accepted debt on every later run, not as a brand-new failure;
- *   - `'n/a'` — no executable statements at all (a barrel re-export file, a `.ts` file
- *     of only `interface`/`type`/`import`/`export` declarations — see `hasExecutableCode`).
- *     Exempt from the ratchet entirely: never fails, never shown as a percentage, and
- *     dropped from summarize()/raiseHints()'s numbers. A coverage tool reporting "0
- *     countable lines, 100% by convention" for these is true but useless — this repo
- *     tracks them as not-applicable instead.
+ * Each risk file is classified as a measured NUMBER, `'untested'` (executable, 0% or absent;
+ * recorded so known debt doesn't read as a new failure), or `'n/a'` (no executable statements,
+ * see `hasExecutableCode`; exempt).
  *
- * The container gap: bun's `--coverage` has no glob-`include` equivalent to vitest's
- * `coverage.include` — its lcov report only ever lists a file some test ACTUALLY loaded
- * (verified: running the full 122-file agent-runner suite with coverage still produced
- * no SF: entry at all for container/agent-runner/src/mcp-tools/types.ts, db/index.ts,
- * or backlog.ts, none of which any test currently imports). vitest's `coverage.include`
- * has no such gap (verified separately: it produces a 0%-via-AST-synthesis entry for
- * EVERY included file, whether any test touched it or not — see vitest.config.ts's
- * `readHostRiskGlobs` comment). So a container risk file absent from bun's report is
- * NORMAL, not a tooling bug, and `classifyFile` below resolves it with a static AST
- * check on the source itself (`hasExecutableCode`) rather than treating absence as an
- * error — the equivalent host-side absence (impossible under normal operation, since
- * `include` guarantees an entry) still hard-fails via `--allow-partial-report`'s check.
+ * The container gap: bun's lcov lists only files some test actually loaded, unlike vitest's
+ * `coverage.include`, which emits an entry for every included file. A container file absent from
+ * bun's report is normal and is resolved by a static read; a host file absent from vitest's
+ * report hard-fails unless `--allow-partial-report`.
  *
- * Inputs (produced separately, never by this script):
- *   - host:      `pnpm run test:coverage:risk` → coverage/coverage-summary.json
- *                (vitest's `json-summary` reporter; `coverage.include` in
- *                vitest.config.ts scopes what gets REPORTED to the host half of
- *                risk:high via scripts/risk-globs.ts, derived at run time from
- *                .github/labeler.yml — see that file and vitest.config.ts's
- *                `readHostRiskGlobs`). `coverage.include` does NOT scope
- *                INSTRUMENTATION: coverage-v8 starts V8's precise/detailed
- *                coverage profiler for the whole worker
- *                (@vitest/coverage-v8's `Profiler.startPreciseCoverage({ callCount:
- *                true, detailed: true })`, node_modules/@vitest/coverage-v8/dist/index.js)
- *                and applies `include`/`exclude` only when building the report — so
- *                a coverage run's CPU overhead is global to the process, not confined
- *                to risk:high files. See ci-full.yml for what that meant for one
- *                CPU-heavy, unrelated test.
- *   - container: `bun run test -- --coverage --coverage-reporter=lcov` (from
- *                container/agent-runner) → container/agent-runner/coverage/lcov.info.
- *                Host and container numbers are kept STRICTLY separate end to end —
- *                parseVitestJsonSummary only ever runs against `hostRiskFiles`,
- *                parseLcov/containerSfToRepoPath only against `containerRiskFiles` — a
- *                container file's classification never comes from a host test that
- *                happens to import it (vitest's own `coverage.include` structurally
- *                can't name a `container/agent-runner/**` path anyway — see
- *                scripts/risk-globs.ts's `isHostCodeGlob`/`isContainerCodeGlob`).
+ * Inputs (produced separately): host `pnpm run test:coverage:risk` → coverage/coverage-summary.json;
+ * container `bun run test -- --coverage --coverage-reporter=lcov` → container/agent-runner/coverage/lcov.info.
+ * Host and container numbers stay strictly separate. `coverage.include` scopes only the REPORT:
+ * coverage-v8 profiles the whole worker, so a coverage run's CPU overhead is global.
  *
- * This script itself only reads those two reports plus `.github/labeler.yml`, computes
- * one merged per-file line-coverage table over every risk file that exists on disk, and
- * compares it against the committed baseline (default `coverage-risk-baseline.json`,
- * itself on `risk:high` — see .github/labeler.yml — so lowering it takes review).
+ * Fails when a non-'n/a' file with a numeric baseline drops more than `--threshold` points
+ * (untested counts as 0%), or a file absent from the baseline is `'new-untested'` or `'new'`
+ * (`--write`/`--bootstrap` suspend `'new'`). A baseline `'untested'` never fails. Fails closed
+ * before that on a missing baseline (unless `--bootstrap`), a partial host report, or a missing
+ * container lcov (unless `--allow-missing-container-report`); CI passes neither allow-flag.
  *
- * Fails (exit 1) when, for any risk file whose CURRENT classification is not `'n/a'`:
- *   - it was in the baseline as a NUMBER and current coverage is more than
- *     `--threshold` (default 0.5) points below that value (missing/'untested' current
- *     coverage counts as a drop to 0%, not a skipped comparison);
- *   - it is NOT in the baseline at all (a risk file introduced after the baseline was
- *     last written) and is currently `'untested'` (`'new-untested'`), OR has some
- *     measured coverage but still no floor recorded for it (`'new'`) — a risk file
- *     that ships with no coverage floor at all is exactly the gap `--write` exists to
- *     close, so ordinary runs fail it rather than silently accepting whatever the file
- *     happens to measure today (see docs/review-notes.md's `risk coverage`/repeat-class
- *     entries).
- * A baseline entry of `'untested'` never fails on its own — it is accepted debt, not a
- * live threshold. `--write` folds the current state into the baseline either way, and
- * `--write`/`--bootstrap` (either flag) suspend the `'new'` failure specifically:
- * `--write` is about to record a floor for it, and `--bootstrap`'s one-time empty
- * baseline would otherwise fail on every risk file that exists.
+ * Producing an honest baseline: never run full-suite coverage on the production host. Commit the
+ * candidate ci-full.yml's "Generate coverage baseline candidate" step uploads; a local `--write`
+ * against CI's raw reports resolves paths against the wrong root and silently writes an all-zero
+ * baseline that can never fail again.
  *
- * Fails closed (exit 1) BEFORE any of the above, regardless of --write, when:
- *   - the baseline file does not exist — pass `--bootstrap` for the one-time initial
- *     baseline creation only (see "Producing an honest baseline" below); every other
- *     run must find a real, committed baseline, or a PR that deleted it would silently
- *     stop being ratcheted instead of failing loudly;
- *   - a HOST risk file `discoverRiskFiles` found on disk has NO entry at all in vitest's
- *     report — pass `--allow-partial-report` for a deliberately narrow local sanity run
- *     (e.g. running coverage against two test files instead of the whole suite). NOT
- *     applied to container files — see "The container gap" above;
- *   - `container/agent-runner`'s lcov report file itself is missing (as opposed to
- *     merely lacking some files' entries — see "The container gap") while risk:high
- *     names any container path — pass `--allow-missing-container-report` for a
- *     host-only local run. Both allow-flags exist for local dev only; CI never passes
- *     either.
- *
- * Producing an honest baseline: this repo's host suite runs on a memory-constrained,
- * production-serving box that must never run the full vitest suite with coverage
- * (docs/specs/risk-based-review/plan.md). ci-full.yml's "Generate coverage baseline
- * candidate" step runs `--write --bootstrap` against CI's own full-suite reports and
- * uploads the result as part of the `risk-coverage-reports` artifact — download THAT
- * file and commit it directly, rather than downloading the raw reports and running
- * `--write` locally: a locally-run `--write` needs the raw reports' paths to resolve
- * against this checkout's OWN root (see parseVitestJsonSummary below), and a
- * mismatched root (this box's checkout path vs. CI's `/home/runner/work/...`) would
- * silently produce an all-zero baseline that then never fails again, since nothing can
- * measure below 0%. Letting CI both produce and evaluate the candidate removes that
- * whole class of mistake.
- *
- * Raising the baseline: a coverage GAIN is never required, and `--write` is the only
- * way to lock one in — this script does not auto-raise the baseline on a passing run
- * (a "ratchet" here means "never silently regresses," not "automatically improves").
- * The non-`--write` report prints a hint listing any file that rose more than 2 points
- * above its baseline, as a nudge to `--write` after a deliberate coverage improvement.
+ * Raising the baseline: only `--write` locks in a gain; a normal run prints a hint for files more
+ * than 2 points above baseline.
  *
  * Usage:
  *   pnpm exec tsx scripts/check-risk-coverage.ts [--write] [--bootstrap]
  *     [--allow-partial-report] [--allow-missing-container-report]
  *     [--host-summary <path>] [--container-lcov <path>] [--baseline <path>]
  *     [--threshold <points>] [--json]
- *
- * Defaults: --host-summary coverage/coverage-summary.json,
- *   --container-lcov container/agent-runner/coverage/lcov.info,
- *   --baseline coverage-risk-baseline.json, --threshold 0.5.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -136,18 +48,14 @@ import { globsForRiskHigh } from './review-outcomes.js';
 import { splitRiskGlobs } from './risk-globs.js';
 import { walkArgs } from './lib/cli-args.js';
 
-// ─────────────────────────── types ─────────────────────────────────────────
-
 export interface CoverageStat {
   covered: number;
   total: number;
   pct: number;
 }
 
-/** A single risk file's resolved state — see the file header for what each means. */
 export type Classification = { kind: 'measured'; pct: number } | { kind: 'untested' } | { kind: 'n/a' };
 
-/** Classification, flattened for storage/comparison: a real number, or the two words. */
 export type BaselineEntry = number | 'untested' | 'n/a';
 
 export type FileStatus = 'ok' | 'regressed' | 'new-untested' | 'new' | 'removed' | 'n/a';
@@ -172,29 +80,17 @@ export interface Baseline {
 }
 
 const DEFAULT_THRESHOLD = 0.5;
-/** Non-blocking: a file that rose this many points above baseline earns a hint to --write. */
 const RAISE_HINT_THRESHOLD = 2;
-/** Test-only support files, never a coverage TARGET regardless of extension. */
 const FIXTURE_DIR_NAMES = new Set(['__fixtures__', '__test-fixtures__']);
 
-// ─────────────────────────── pure logic ────────────────────────────────────
-
-/** `risk:high` from a parsed `.github/labeler.yml`, split host vs container (throws on
- * an unrecognized glob — see scripts/risk-globs.ts's `assertFullyClassified`). */
+/** Throws on an unrecognized glob. */
 export function readRiskGlobs(labelerConfig: Record<string, unknown>): { host: string[]; container: string[] } {
   return splitRiskGlobs(globsForRiskHigh(labelerConfig));
 }
 
 /**
- * `.ts` files under `repoRoot` matching any of `globs`, excluding `*.test.ts` (a test
- * file isn't a coverage TARGET; it's what exercises one) and anything under a
- * `__fixtures__`/`__test-fixtures__` directory (test-only support files picked up by a
- * `*guard*.ts`-shaped glob purely by naming coincidence, e.g.
- * `container/agent-runner/src/providers/__test-fixtures__/guard-core-stub.ts`  — not
- * production code, and never worth a baseline entry). Only walks the top-level
- * directory each glob starts with (`src`, `scripts`, or `container`) rather than the
- * whole repo, since every risk:high host/container glob is rooted at one of those three
- * — bounded and fast rather than a full-repo walk.
+ * Excludes tests and `__fixtures__`/`__test-fixtures__` dirs, which a `*guard*.ts`-shaped glob
+ * can match by naming coincidence. Walks only each glob's top-level directory.
  */
 export function discoverRiskFiles(repoRoot: string, globs: readonly string[]): string[] {
   const roots = new Set(globs.map((glob) => glob.split('/')[0]));
@@ -221,25 +117,13 @@ function walkTsFiles(absDir: string, relDir: string): string[] {
   return out;
 }
 
-/** Mirrors `matchesAnyGlob` (scripts/review-outcomes.ts) — not imported: that one is
- * typed for PR changed-file lists; this one is typed for on-disk discovery, and both
- * are one-line wrappers over the same `path.matchesGlob`, so duplication costs nothing
- * and keeps each call site's intent legible on its own. */
 function matchesAnyGlob(filePath: string, globs: readonly string[]): boolean {
   return globs.some((glob) => path.matchesGlob(filePath, glob));
 }
 
 /**
- * `coverage-summary.json` (vitest's `json-summary` coverage reporter) keys files by an
- * ABSOLUTE path rooted at wherever vitest ran (verified against a real run: every
- * non-"total" key was `<that machine's repo root>/src/...` or `.../scripts/...`). That
- * root is NOT necessarily this process's own repo root — the report may have been
- * generated on a different machine (CI) and downloaded here — so this matches by
- * SUFFIX against the known repo-relative `riskFiles` list instead of stripping a
- * literal prefix: a key ending in `/${riskFile}` (or equal to it outright) is that
- * file, regardless of what came before it. Matching against a known, finite candidate
- * list (rather than trying to infer "the repo root" from the keys themselves) also
- * means a coincidental path collision can't misattribute a file.
+ * Keys are ABSOLUTE paths rooted wherever vitest ran, possibly another machine (CI), so this
+ * matches by suffix against the known `riskFiles` rather than stripping a prefix.
  */
 export function parseVitestJsonSummary(
   summary: Record<string, unknown>,
@@ -258,14 +142,7 @@ export function parseVitestJsonSummary(
   return out;
 }
 
-/**
- * lcov (bun's `--coverage-reporter=lcov`), one SF:/DA: block per file. `sfToRepoPath`
- * maps the lcov-relative `SF:` value (relative to wherever `bun test` ran, i.e.
- * `container/agent-runner`) to a repo-root-relative path. Unlike the vitest json-summary
- * case above, this needs no cross-machine path normalization: bun's `SF:` values are
- * already relative (to the test run's cwd), not absolute, so they resolve the same way
- * regardless of which machine produced the report.
- */
+/** `sfToRepoPath` maps bun's cwd-relative `SF:` value to a repo-root-relative path. */
 export function parseLcov(lcov: string, sfToRepoPath: (sf: string) => string): Map<string, CoverageStat> {
   const out = new Map<string, CoverageStat>();
   let currentFile: string | null = null;
@@ -292,10 +169,8 @@ export function parseLcov(lcov: string, sfToRepoPath: (sf: string) => string): M
   return out;
 }
 
-/** Istanbul/lcov convention: a file with zero countable lines is 100% covered.
- * `classifyFile` never trusts this at face value for a classification decision — a
- * `total === 0` entry is never classified `'measured'`; it falls through to
- * `hasExecutableCode` like an absent one (see that function's own comment). */
+/** Istanbul/lcov convention: zero countable lines is 100%. `classifyFile` never trusts that as
+ * 'measured'. */
 function pctOf(covered: number, total: number): number {
   return total === 0 ? 100 : (covered / total) * 100;
 }
@@ -312,19 +187,8 @@ export function mergeCoverage(...maps: ReadonlyArray<Map<string, CoverageStat>>)
 }
 
 /**
- * True when `sourceText`'s top-level statements are ENTIRELY declarative — imports,
- * re-exports (`export {...}`, `export {...} from`, `export type {...}`), `interface`,
- * and `type` alias declarations — with nothing that produces or runs a value. Such a
- * file compiles to no runtime logic worth testing (a barrel re-export, a pure `.d.ts`
- * -shaped module), which is what `classifyFile` calls `'n/a'`. Any other top-level
- * statement (a function, a class, a `const` holding a computed value, a bare
- * expression, `export default`, ...) makes it executable, real code that a coverage
- * tool CAN and should measure.
- *
- * Deliberately conservative: this only reads the file's OWN statements, not what it
- * imports, so a re-export can never be misclassified as executable just because the
- * module it points to has logic — the coverage question is "does THIS file have
- * anything to cover", not "does importing it run code somewhere else".
+ * False when every top-level statement is an import, re-export, interface or type alias (the
+ * `'n/a'` case). Reads only this file's own statements, never what it imports.
  */
 export function hasExecutableCode(sourceText: string): boolean {
   const sourceFile = ts.createSourceFile('risk-file.ts', sourceText, ts.ScriptTarget.Latest, true);
@@ -344,24 +208,9 @@ export function hasExecutableCode(sourceText: string): boolean {
 }
 
 /**
- * Resolves one risk file's `Classification` from its measured `CoverageStat` (if the
- * report has one and shows unambiguous positive coverage) or, otherwise, a static read
- * of the file itself — see the file header's "The container gap" for why absence needs
- * a fallback at all, and `hasExecutableCode` for what the fallback actually checks.
- *
- * A report entry is trusted OUTRIGHT only when `total > 0 && pct > 0` — real,
- * unambiguous measured coverage. Anything else (absent from the report; `total === 0`,
- * which istanbul/lcov convention reports as 100% — see `pctOf` — and would otherwise be
- * misread as "measured, fully covered"; or `pct === 0`) is cross-checked against the
- * file's own source instead of taken at face value: `hasExecutableCode` is the single
- * source of truth for the n/a-vs-untested distinction, so a coverage-tool quirk that
- * reports a spuriously empty or zero block for a file with real code can't silently
- * exempt it from the ratchet forever — `evaluate()` lets a CURRENT 'n/a' override even a
- * baseline that remembers real measured coverage, by design (see its own comment), so
- * getting 'n/a' wrong here would be a real masked regression, not just a display quirk.
- *
- * `readSource` is injected (rather than calling `fs.readFileSync` directly) purely so
- * this stays unit-testable without a real file on disk.
+ * A report entry is trusted only when `total > 0 && pct > 0`; anything else is decided by the
+ * file's source, because a current 'n/a' overrides even a measured baseline and a spurious empty
+ * block would otherwise exempt real code from the ratchet forever.
  */
 export function classifyFile(stat: CoverageStat | undefined, readSource: () => string): Classification {
   if (stat && stat.total > 0 && stat.pct > 0) return { kind: 'measured', pct: stat.pct };
@@ -388,39 +237,13 @@ function toBaselineEntry(classification: Classification): BaselineEntry {
 }
 
 export interface EvaluateOptions {
-  /**
-   * Suspend the `'new'` failure (a risk file with real measured coverage but no
-   * floor recorded for it yet) — never `'new-untested'`, which stays a failure
-   * regardless. `main()` sets this for `--write` (a floor is about to be recorded,
-   * from the very classifications being evaluated) and `--bootstrap` (the empty
-   * baseline it seeds would otherwise fail on every risk file that exists, which is
-   * the opposite of what a one-time bootstrap run is for). Default false: an
-   * ordinary run — the one CI's "Risk-path coverage ratchet" step runs — fails a
-   * `'new'` file exactly like `'new-untested'`, so a risk file can no longer ship
-   * with no floor at all and stay green.
-   */
+  /** Suspends the `'new'` failure only, never `'new-untested'`. */
   allowNew?: boolean;
 }
 
 /**
- * Whether `main()` should suspend the `'new'` failure for this run — the exact value
- * `EvaluateOptions.allowNew` takes. Factored out of `main()`'s inline arithmetic into
- * a pure, directly testable function: with `allowNew` computed inline, flipping it to
- * unconditionally `true` in normal mode left every one of this script's existing
- * tests green, because none of them exercised `main()` itself.
- *
- * True in exactly two cases:
- *   - `write` is set — a `--write` run is ABOUT to record a floor for every current
- *     risk file (via `buildBaseline`), so `'new'` can never actually fire against the
- *     baseline it just wrote; true unconditionally, regardless of `bootstrap` or
- *     `baselineExists`.
- *   - `bootstrap` is set AND no baseline file exists yet — the one-time
- *     initial-baseline case (see `resolveBaseline`), whose empty baseline would
- *     otherwise fail on every risk file that exists.
- * `bootstrap` paired with an ALREADY-EXISTING baseline is deliberately false:
- * `--bootstrap` is documented as a one-time initial-baseline flag, not a standing way
- * to silence the check, so passing it again against a baseline that is already
- * committed must not suppress `'new'`.
+ * `--bootstrap` against an already-existing baseline is deliberately false: it is a one-time
+ * initial-baseline flag, not a standing way to silence the check.
  */
 export function allowNewFor(opts: { write: boolean; bootstrap: boolean; baselineExists: boolean }): boolean {
   return opts.write || (opts.bootstrap && !opts.baselineExists);
@@ -439,9 +262,7 @@ export function evaluate(
     const current = toBaselineEntry(classifications.get(file) ?? { kind: 'n/a' });
     const baselineEntry = Object.hasOwn(baseline.files, file) ? baseline.files[file] : null;
 
-    // Not-applicable always wins, regardless of history: a file with no executable
-    // statements is exempt from the ratchet on its own terms, not because of what it
-    // used to be.
+    // Not-applicable always wins, regardless of history.
     if (current === 'n/a') {
       return { file, baseline: baselineEntry, current, delta: null, status: 'n/a' };
     }
@@ -449,28 +270,14 @@ export function evaluate(
     let status: FileStatus;
     let delta: number | null = null;
     if (baselineEntry === null || baselineEntry === 'n/a') {
-      // Genuinely new to the ratchet — either never in the baseline, or the baseline
-      // remembers it as having no executable statements (code has since been added).
-      // Either way, there is no numeric floor to compare against: the only failure
-      // mode is "nothing exercises it yet".
       status = current === 'untested' ? 'new-untested' : 'new';
     } else if (baselineEntry === 'untested') {
-      // Accepted debt at baseline time — any current state (still untested, or
-      // improved) is fine. Never fails; there is no lower state to regress to.
       status = 'ok';
     } else {
-      // baselineEntry is a number — the normal regression-threshold comparison.
       const effectiveCurrent = typeof current === 'number' ? current : 0; // 'untested' reads as 0
       delta = effectiveCurrent - baselineEntry;
-      // Compare in integer hundredths, not the raw float delta: effectiveCurrent and
-      // baselineEntry are both already round2()-ed to 2 decimal places (see
-      // toBaselineEntry), but IEEE 754 doubles can't represent every 2-decimal value
-      // exactly, so a raw float subtraction at an exact threshold boundary can land a
-      // hair past it — e.g. 63.51 - 64.01 comes out about 7e-15 more negative than
-      // -0.5, not exactly -0.5, which would wrongly fail a drop of precisely the
-      // threshold. Multiplying by 100 and rounding to the nearest integer before
-      // comparing removes that drift; --threshold is rounded the same way so it stays
-      // exact at any 2-decimal value a caller passes.
+      // Integer hundredths, not the raw float delta: 63.51 - 64.01 lands a hair past -0.5 and
+      // would fail a drop of exactly the threshold.
       const currentHundredths = Math.round(effectiveCurrent * 100);
       const baselineHundredths = Math.round(baselineEntry * 100);
       const thresholdHundredths = Math.round(threshold * 100);
@@ -479,9 +286,7 @@ export function evaluate(
     return { file, baseline: baselineEntry, current, delta, status };
   });
 
-  // Baseline entries for a file that no longer exists on disk (deleted or renamed) —
-  // reported, not silently dropped, though they never fail the run: `--write` is what
-  // actually removes them (buildBaseline only ever writes the CURRENT riskFiles).
+  // Reported, never failed; only `--write` removes them.
   for (const file of Object.keys(baseline.files).sort()) {
     if (riskFileSet.has(file)) continue;
     rows.push({ file, baseline: baseline.files[file], current: 'n/a', delta: null, status: 'removed' });
@@ -508,18 +313,11 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/**
- * Rounds DOWN to one decimal place — this repo's floor convention for a SUGGESTED
- * coverage baseline entry (a floor must never be stricter than what was actually
- * measured, so it only ever rounds down, never to the nearest or up). Operates on an already `round2()`-ed value rather than the
- * raw float, so a floating-point artifact one decimal place further out (e.g.
- * 92.30000000000001) can't floor to the wrong decile.
- */
+/** Rounds DOWN (a suggested floor must never be stricter than measured), after round2 so a float
+ * artifact like 92.30000000000001 can't floor to the wrong decile. */
 function floorTo1Decimal(n: number): number {
   return Math.floor(round2(n) * 10) / 10;
 }
-
-// ─────────────────────────── table rendering ───────────────────────────────
 
 function fmtEntry(entry: BaselineEntry | null): string {
   if (entry === null) return '—';
@@ -533,24 +331,8 @@ function fmtDelta(delta: number | null): string {
 }
 
 /**
- * One `--failures` line for `printReport`. A `'new'` row (real measured coverage,
- * no floor recorded — see `EvaluateOptions.allowNew`) gets its own message naming
- * the measured value and the exact JSON line to add to `baselinePath`, rather than
- * the generic baseline-arrow-current line every other failure status uses: there is
- * no baseline entry to show an arrow FROM, and the whole point of failing this
- * status is to hand the author something to paste, not just a diagnosis.
- *
- * The suggested value is `floorTo1Decimal`-ed — this repo's floor convention, never
- * rounded to the nearest or up, so a pasted-in-full suggestion is never stricter than
- * what was actually measured. The line itself carries no trailing comma:
- * `coverage-risk-baseline.json` is one JSON object, a comma after its LAST entry
- * breaks it, and this script has no way to know whether the entry being pasted in
- * will land last — so the message says so explicitly instead of guessing.
- *
- * `row.current` is always a `number` for a `'new'` row: `classifyFile` only ever
- * produces status `'new'` (never `'new-untested'`/`'n/a'`) from a `{ kind:
- * 'measured' }` classification, and `toBaselineEntry` (called before `evaluate`
- * ever sees the row) turns that into the rounded percentage this prints.
+ * A `'new'` row gets the exact JSON line to paste, without a trailing comma (one after the last
+ * entry breaks the file). `row.current` is always a number for a `'new'` row.
  */
 export function formatFailureLine(row: FileRow, baselinePath: string): string {
   if (row.status === 'new') {
@@ -577,8 +359,7 @@ export function renderTable(rows: readonly FileRow[]): string {
   return [renderRow(header), renderRow(widths.map((w) => '-'.repeat(w))), ...lines.map(renderRow)].join('\n');
 }
 
-/** `'n/a'` rows are excluded from min/median — they carry no percentage at all, not a
- * 0% or 100% one, and would otherwise skew both toward whichever extreme they default to. */
+/** `'n/a'` rows carry no percentage and are excluded from min/median. */
 export function summarize(rows: readonly FileRow[]): { count: number; min: number | null; median: number | null } {
   const pcts = rows
     .map((r) => (typeof r.current === 'number' ? r.current : null))
@@ -590,14 +371,9 @@ export function summarize(rows: readonly FileRow[]): { count: number; min: numbe
   return { count: rows.length, min: sorted[0], median };
 }
 
-/** Rows that rose more than RAISE_HINT_THRESHOLD points above their baseline — see the
- * file header's "Raising the baseline". Only meaningful for a numeric baseline, hence
- * `delta !== null` (an 'untested'/'n/a'/absent baseline never produces a delta). */
 export function raiseHints(rows: readonly FileRow[]): FileRow[] {
   return rows.filter((row) => row.delta !== null && row.delta > RAISE_HINT_THRESHOLD);
 }
-
-// ─────────────────────────── CLI ───────────────────────────────────────────
 
 interface Options {
   write: boolean;
@@ -666,12 +442,7 @@ function usage(): never {
 
 export type BaselineResolution = { ok: true; baseline: Baseline } | { ok: false; error: string };
 
-/**
- * Whether to fail closed on a missing baseline, factored out of the filesystem so it's
- * directly testable: `exists`/`raw` are what `fs.existsSync`/`fs.readFileSync` would
- * have returned, not called here. `--bootstrap` is the only escape hatch — see this
- * file's "Producing an honest baseline".
- */
+/** `--bootstrap` is the only escape hatch from failing closed on a missing baseline. */
 export function resolveBaseline(exists: boolean, raw: string | null, bootstrap: boolean): BaselineResolution {
   if (!exists) {
     if (bootstrap) return { ok: true, baseline: { generatedAt: new Date(0).toISOString(), files: {} } };
@@ -686,10 +457,7 @@ export function resolveBaseline(exists: boolean, raw: string | null, bootstrap: 
   return { ok: true, baseline: JSON.parse(raw as string) as Baseline };
 }
 
-/** HOST risk files `discoverRiskFiles` found on disk with no entry at all in vitest's
- * report — see `--allow-partial-report` in this file's header. Host-only: a container
- * file absent from bun's lcov is normal (see "The container gap"), not a tooling bug,
- * so it is never part of this check. */
+/** Host-only: a container file absent from bun's lcov is normal ("The container gap"). */
 export function findMissingFromReport(
   hostRiskFiles: readonly string[],
   hostCoverage: ReadonlyMap<string, CoverageStat>,
@@ -699,8 +467,7 @@ export function findMissingFromReport(
 
 function main(): void {
   const options = parseArgs(process.argv.slice(2));
-  // path.resolve, not path.join: options.hostSummary/.containerLcov/.baseline may be
-  // absolute (path.join would concatenate literally instead of anchoring on them).
+  // path.resolve, not path.join, below: the option paths may be absolute.
   const repoRoot = path.resolve(import.meta.dirname, '..');
 
   const labelerConfig = parseYaml(fs.readFileSync(path.join(repoRoot, '.github', 'labeler.yml'), 'utf8')) as Record<
@@ -744,32 +511,19 @@ function main(): void {
   const containerCoverage = containerReportExists
     ? parseLcov(fs.readFileSync(containerLcovPath, 'utf8'), containerSfToRepoPath)
     : new Map<string, CoverageStat>();
-  // Deliberately NOT checked against `discoverRiskFiles` the way hostCoverage is above:
-  // a container file's absence from bun's report is the expected, normal case for an
-  // untested one (see this file's header, "The container gap") — classifyAll resolves
-  // it via a static read of the file, not a hard failure.
+  // Not checked for missing entries like the host report: see "The container gap".
 
   const current = mergeCoverage(hostCoverage, containerCoverage);
   const classifications = classifyAll(repoRoot, riskFiles, current);
 
   const baselinePath = path.resolve(repoRoot, options.baseline);
-  // Read BEFORE --write's own writeFileSync below, in both branches: allowNewFor's
-  // `baselineExists` means "did a baseline already exist when this run started", not
-  // "does the fresh one --write is about to produce exist" — a --write run replaces
-  // the file regardless of whether one was already there, and `write: true` alone
-  // already forces `allowNewFor` true either way.
+  // Read BEFORE --write's writeFileSync: it means "existed when this run started".
   const baselineExists = fs.existsSync(baselinePath);
   const allowNew = allowNewFor({ write: options.write, bootstrap: options.bootstrap, baselineExists });
 
   if (options.write) {
     const baseline = buildBaseline(riskFiles, classifications);
     fs.writeFileSync(baselinePath, JSON.stringify(baseline, null, 2) + '\n');
-    // allowNew is true here unconditionally (`allowNewFor` returns true whenever
-    // `write` is set) — buildBaseline just recorded a floor for every current risk
-    // file (including any that were `new`), so evaluating against that same fresh
-    // baseline never actually produces a `new` row; routing through `allowNewFor`
-    // rather than a literal `true` keeps this call sourced from the same single
-    // predicate the other branch below uses, not a second copy of the rule.
     const result = evaluate(riskFiles, classifications, baseline, options.threshold, { allowNew });
     printReport(result, options, true);
     return;
@@ -781,11 +535,6 @@ function main(): void {
     options.bootstrap,
   );
   if (!resolution.ok) fail(resolution.error);
-  // --bootstrap without --write: a preview of what bootstrapping would produce.
-  // allowNewFor suspends `new` only when bootstrap is paired with NO existing
-  // baseline (the one-time initial-baseline case, whose empty baseline would
-  // otherwise fail on every risk file that exists) — `--bootstrap` against an
-  // ALREADY-committed baseline does not silently suppress the check.
   const result = evaluate(riskFiles, classifications, resolution.baseline, options.threshold, { allowNew });
   printReport(result, options, false);
   process.exit(result.passed ? 0 : 1);
@@ -833,7 +582,6 @@ function printReport(result: EvaluateResult, options: Options, wrote: boolean): 
   }
 }
 
-// ESM-safe "is this the entrypoint" check (mirrors scripts/review-outcomes.ts).
 if (process.argv[1] && new URL(process.argv[1], 'file:').href === import.meta.url) {
   main();
 }

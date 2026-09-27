@@ -5,10 +5,7 @@ import { pathToFileURL } from 'url';
 
 import Database from 'better-sqlite3';
 
-// Composition slot. These are standalone `tsx` entrypoints: they never load
-// `src/modules/index.js`, so nothing else registers an AgentMailbox and any
-// path reaching `getAgentMailbox()` throws `No agent mailbox registered`.
-// Importing it for side effect is idempotent — ESM evaluates it once.
+// Standalone entrypoint: without this import no AgentMailbox is registered.
 import '../src/mailbox/compose.js';
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { cleanupOrphansStrict } from '../src/container-runtime.js';
@@ -1350,8 +1347,7 @@ export function applyMigrationReport(reportPath: string, hooks: ApplyHooks = {})
         writeJsonAtomic(absoluteReport, report);
         hooks.afterSnapshot?.(migration);
 
-        // Load and hash again while quiescent immediately before any source or
-        // canonical path is replaced.
+        // Re-hash while quiescent, immediately before any path is replaced.
         const postSnapshot = inventoryWorkgroup(db, migration.workgroupId, trusted.groupsDir, trusted.dataDir);
         if (!sourcesEqual(migration.sources, postSnapshot.sources)) {
           throw new Error('Source changed after snapshot; refusing cutover');
@@ -1476,9 +1472,7 @@ export function rollbackMigrationReport(reportPath: string, hooks: ApplyHooks = 
     }
     try {
       verifySnapshotForRollback(migration, trusted);
-      // Completed applies may retain a newly-created canon for forensic
-      // comparison. Interrupted cutovers restore every inventoried source
-      // exactly, including removing a canon that was originally missing.
+      // Interrupted cutovers restore every source exactly, including removing a canon that was missing.
       restoreSnapshotEntries(migration, interruptedCutover ? undefined : preservePostMigrationCanonical(migration));
       migration.status = 'rolled-back';
       delete migration.error;
@@ -1545,10 +1539,7 @@ export async function runCli(args = process.argv.slice(2), migrationHooks: Apply
     await initDb(report.dbPath);
     const db = getRawDb();
     try {
-      // Awaited: the reconciliation became async with the mailbox seam, and
-      // the `finally` below closes the central DB it is still using. Without
-      // the await, `closeDb()` fires mid-pass and a rejection escapes this
-      // try/catch as an unhandled rejection.
+      // Awaited: the `finally` below closes the central DB this pass still uses.
       await reconcilePendingUpgradeContexts(
         db,
         report.workgroups

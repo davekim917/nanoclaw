@@ -1,12 +1,5 @@
-// Track B baseline miner — read-only.
-//
-// Anthropic diagnosed their overconstraint by reading their own transcripts.
-// This does the equivalent: scans every session outbound.db for observable
-// fingerprints of the bucket-3 directives, so "no measurable loss" can be
-// checked after softening instead of asserted.
-//
-// Opens each DB read-only in ONE process (2,753 DBs — a process per DB is
-// hopeless). Never writes.
+// Read-only baseline miner: scans every session outbound.db for fingerprints of the bucket-3
+// directives. One process opens every DB: a process per DB is far too slow.
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -14,19 +7,13 @@ import path from 'path';
 const ROOT = process.cwd();
 const SESS = path.join(ROOT, 'data', 'v2-sessions');
 
-// Each probe: what directive it fingerprints, and a regex over agent output.
 const PROBES = [
-  // C5 / humanizer gate — is the mandated skill actually being invoked, and on what?
   { id: 'humanizer_mention', dir: 'humanizer gate', re: /\bhumaniz(e|er|ed|ing)\b/i },
-  // C2 — the mandated 3-part completion recitation
   { id: 'verified_recitation', dir: 'Completion Protocol', re: /what I verified|cases checked|beyond the happy path|verification evidence/i },
   { id: 'cannot_verify_hedge', dir: 'Completion Protocol', re: /cannot verify|could not verify|unable to verify/i },
-  // C3 — plan-first vs outcomes-only
   { id: 'plan_first', dir: 'plan-before-work', re: /here'?s (my|the) plan|before I (start|begin)|I'?m going to (start|begin|do)|my plan is/i },
-  // C1 — overachieve vs YAGNI
   { id: 'overachieve', dir: 'Owner-mode overachieve', re: /while I was (in there|at it)|also fixed|took the opportunity|since I was already|bonus[: ]/i },
   { id: 'ponytail_restraint', dir: 'ponytail ladder', re: /\bskipped:|\bponytail:|YAGNI|over-?engineer/i },
-  // meta-response garbage the system prompt explicitly forbids
   { id: 'meta_response', dir: 'meta-response ban', re: /no response (is )?requested|does not require a response|no reply needed/i },
 ];
 

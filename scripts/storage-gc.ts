@@ -1,16 +1,6 @@
 /**
- * Storage GC entry point.
- *
- * Reports only. Removal happens exactly when NANOCLAW_STORAGE_GC=apply is set
- * in the environment; a bare run never deletes anything.
- *
- *   pnpm exec tsx scripts/storage-gc.ts
- *   NANOCLAW_STORAGE_GC=apply pnpm exec tsx scripts/storage-gc.ts
- *
- * Deliberately not wired into the 6h worktree-cleanup cron: a pass costs
- * 90-230s of synchronous git and filesystem work, which would stall host
- * message routing for that long. Schedule it out of process (systemd timer or
- * `ncl tasks`) if it should run unattended.
+ * Storage GC: reports only unless NANOCLAW_STORAGE_GC=apply is set. Kept out of the host process:
+ * a pass is minutes of synchronous work that would stall message routing.
  */
 import path from 'path';
 

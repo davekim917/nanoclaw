@@ -1,13 +1,7 @@
 /**
- * Minimal TypeSafe System One client for the jev-shadow replays.
- *
- * Pinned to a versioned model, not the `jev-latest` alias: an alias moves on
- * release, and every threshold these replays report is only meaningful against
- * the model that produced it (docs.typesafe.ai/models, "Aliases").
- *
- * The key is read from the environment, else from this checkout's `.env`, and
- * never printed. This is a host-side, operator-run experiment; nothing here is
- * reachable from a container.
+ * Minimal TypeSafe System One client for the jev-shadow replays. Pinned to a versioned model, not
+ * the `jev-latest` alias: every threshold reported is only meaningful against the model that
+ * produced it. The key is never printed.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -73,7 +67,7 @@ export async function ask(state: unknown, questions: Record<string, Question>): 
   }
 }
 
-/** Run `fn` over `items` with at most `limit` in flight, preserving order. */
+/** Preserves order. */
 export async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let next = 0;

@@ -1,17 +1,9 @@
 #!/usr/bin/env tsx
 /**
- * Enable a `~/plugins/<name>` plugin across the three container agent providers — the
- * deterministic half of the /enable-agent-plugins skill:
- *
- *   - Claude   → auto-loaded via the mount, but ONLY with a Claude manifest; a minimal one is
- *                generated when missing.
- *   - Codex    → registered by the CONTAINER at spawn; this only generates the
- *                `.codex-plugin/plugin.json` and self-referencing marketplace.json it needs.
- *   - OpenCode → skills mirrored into `~/.config/opencode/skill/` (no plugin loader).
- *
- * Container agent groups only: never touches host CLI plugin state, since containers strip
- * every inherited `[plugins.*]` / `[marketplaces.*]` table from the host Codex config.
- * Per-provider opt-out lives in `~/plugins/<name>/.nanoclaw-plugin.json` (`--deny`/`--allow`).
+ * Enable a `~/plugins/<name>` plugin across the three container agent providers (the
+ * deterministic half of /enable-agent-plugins). Claude loads it only with a Claude manifest, so a
+ * minimal one is generated; Codex is registered by the container at spawn from the generated
+ * manifests. Never touches host CLI plugin state.
  *
  * Usage:
  *   pnpm exec tsx scripts/enable-agent-plugin.ts <name|path> [--exclude g1,g2] [--dry-run]
@@ -45,7 +37,6 @@ interface Classification {
   sessionStartHook: boolean;
   hasAlwaysOnFile: boolean;
   alwaysOnIsStub: boolean;
-  /** The plugin carries its OWN generic `always-on.md` — no override wanted. */
   hasOwnRuleset: boolean;
 }
 
@@ -184,7 +175,6 @@ function generateClaudeManifest(dir: string, name: string, dryRun: boolean): boo
   const marketplacePath = path.join(dir, '.claude-plugin', 'marketplace.json');
   if (fs.existsSync(manifestPath) || fs.existsSync(marketplacePath)) return false;
 
-  // Claude auto-discovers skills/, commands/, agents/; a non-conventional hooks file must be declared.
   const manifest: Record<string, unknown> = {
     name,
     version: '0.0.0',
@@ -255,7 +245,6 @@ interface CodexRegistration {
   reason: string | null;
 }
 
-/** Marketplace name from either manifest location Codex accepts. */
 function readAnyMarketplaceName(repoDir: string): string | null {
   for (const rel of [
     path.join('.agents', 'plugins', 'marketplace.json'),
@@ -359,8 +348,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
 
   const manifestGenerated = ensureCodexPluginManifest(dir, name, skillsRoot, dryRun);
 
-  // The marketplace entry name MUST match the name inside .codex-plugin/plugin.json (Codex
-  // hard-errors otherwise), and a pre-existing manifest can differ from the folder name.
+  // Must match the name inside .codex-plugin/plugin.json (Codex hard-errors otherwise), which can differ from the folder.
   let entryName = name;
   try {
     const declared = JSON.parse(fs.readFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), 'utf-8')) as {
@@ -395,11 +383,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
   return { skillsRoot, manifestGenerated, marketplaceGenerated, registerable: self !== null, reason };
 }
 
-/**
- * Runs in a separate process from the host, so it must use the cross-process
- * `updateContainerConfig`: a plain read-modify-write races the host's spawn-time write and can
- * lose `excludePlugins`.
- */
+/** Cross-process `updateContainerConfig`: a plain read-modify-write races the host's spawn-time write. */
 async function applyOptOut(exclude: string[], pluginName: string, dryRun: boolean): Promise<string[]> {
   const applied: string[] = [];
   for (const folder of exclude) {
@@ -448,7 +432,6 @@ async function main(): Promise<void> {
       }
     : resolveCodexRegistration(dir, name, dryRun);
 
-  // What `syncOpenCodePluginSkills` will publish, so scoped-plugin precedence is reported correctly.
   const portableSkills = openCodeMirrorSkills(PLUGINS_ROOT)
     .filter((s) => s.plugin === name)
     .map((s) => s.name);
@@ -456,9 +439,8 @@ async function main(): Promise<void> {
   const alwaysOnPath = path.join(dir, '.nanoclaw-always-on.md');
   const hasAlwaysOnFile = fs.existsSync(alwaysOnPath);
   const alwaysOnIsStub = hasAlwaysOnFile && fs.readFileSync(alwaysOnPath, 'utf-8').trim().length === 0;
-  // A plugin with its own `always-on.md` needs no `.nanoclaw-always-on.md` override: both
-  // would deliver the directive twice. Must match exactly the set the composer reads (root,
-  // `plugins/<sub>`, `<sub>`; `subPluginDirs` in src/claude-md-compose.ts).
+  // Must match exactly the set the composer reads (`subPluginDirs` in src/claude-md-compose.ts),
+  // or the directive is delivered twice.
   const hasOwnRuleset =
     fs.existsSync(path.join(dir, 'always-on.md')) ||
     [path.join(dir, 'plugins'), dir].some((container) => {

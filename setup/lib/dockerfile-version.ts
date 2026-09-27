@@ -41,7 +41,6 @@ function withoutContinuation(line: string): { value: string; continues: boolean 
     : { value: trimmed, continues: false };
 }
 
-/** Parse the Docker instructions relevant to version pins without treating comments as code. */
 export function parseDockerInstructions(dockerfile: string): DockerInstruction[] {
   const instructions: DockerInstruction[] = [];
   let current: DockerInstruction | undefined;
@@ -240,8 +239,7 @@ function inheritedEnvShadowsArg(
     if (inherited === undefined) return undefined;
     shadowed = inherited;
   } else if (/\$[{(]?/.test(stage.base)) {
-    // An ARG-expanded base may resolve to a named stage or an image with an
-    // unknown ENV. Do not certify a pin when that lineage cannot be traced.
+    // Do not certify a pin when an ARG-expanded base's lineage cannot be traced.
     return undefined;
   }
 
@@ -272,16 +270,11 @@ function lastDockerArg(instructions: DockerInstruction[], name: string): string 
   return effective;
 }
 
-/** Whether a real global pnpm/npm/bun install consumes the pinned package text. */
 export function hasDockerRunConsumer(dockerfile: string, consumingText: string): boolean {
   return finalRunConsumerIndex(parseDockerInstructions(dockerfile), consumingText) >= 0;
 }
 
-/**
- * Return the ARG value visible to the final real RUN instruction that consumes
- * the pinned package. Docker ARG values are stage-scoped: a global default is
- * usable in a stage only after that stage redeclares the ARG.
- */
+/** Docker ARG values are stage-scoped: a global default is visible only after the stage redeclares it. */
 export function effectiveDockerArgBeforeFinalRun(
   dockerfile: string,
   name: string,
@@ -316,7 +309,6 @@ export function effectiveDockerArgBeforeFinalRun(
   return redeclared && !shadowedByEnv ? effective : undefined;
 }
 
-/** Return the final ARG declaration for diagnostics when no consuming RUN exists. */
 export function finalDockerArg(dockerfile: string, name: string): string | undefined {
   return lastDockerArg(parseDockerInstructions(dockerfile), name);
 }
