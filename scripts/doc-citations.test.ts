@@ -35,22 +35,20 @@ function trackedFiles(root: string): string[] {
 
 type Resolution = { file: string } | { missing: true } | { skip: true };
 
-function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<string>, topDirs: ReadonlySet<string>) {
+function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<string>) {
   if (tracked.has(cited)) return { file: cited } satisfies Resolution;
   const relative = path.posix.normalize(path.posix.join(path.posix.dirname(doc), cited));
   if (tracked.has(relative)) return { file: relative } satisfies Resolution;
   const shaped = cited.startsWith('.') ? relative : cited;
-  if (topDirs.has(shaped.split('/')[0])) return { missing: true } satisfies Resolution;
-  const bySuffix = [...tracked].filter((file) => file.endsWith(`/${cited}`));
-  if (bySuffix.length === 1) return { file: bySuffix[0] } satisfies Resolution;
   if (/^\.?[A-Za-z_][\w-]*\//.test(shaped)) return { missing: true } satisfies Resolution;
-  return { skip: true } satisfies Resolution;
+  if (cited.includes('/')) return { skip: true } satisfies Resolution;
+  const byName = [...tracked].filter((file) => file.endsWith(`/${cited}`));
+  return byName.length === 1 ? ({ file: byName[0] } satisfies Resolution) : ({ skip: true } satisfies Resolution);
 }
 
 function docCitationProblems(root: string, docs?: readonly string[]): string[] {
   const all = trackedFiles(root);
   const tracked = new Set(all);
-  const topDirs = new Set(all.filter((file) => file.includes('/')).map((file) => file.split('/')[0]));
   const treeCache = new Map<string, Set<string>>();
   const filesAt = (sha: string | null): Set<string> => {
     if (!sha) return tracked;
@@ -71,7 +69,7 @@ function docCitationProblems(root: string, docs?: readonly string[]): string[] {
         for (const link of run.links) {
           const cited = `${link.file}:${link.span}`;
           if (ILLUSTRATIVE_CITATIONS.has(`${doc} ${cited}`)) continue;
-          const resolved = resolveCitedPath(link.file, doc, filesAt(link.pinnedSha), topDirs);
+          const resolved = resolveCitedPath(link.file, doc, filesAt(link.pinnedSha));
           if ('skip' in resolved) continue;
           const where = `${doc}:${index + 1}`;
           if ('missing' in resolved) {
@@ -161,7 +159,7 @@ describe('docCitationProblems', () => {
     ]);
   });
 
-  it('resolves a path relative to the doc, and a bare file name that one tracked file ends with', () => {
+  it('resolves a path relative to the doc, and a bare file name that exactly one tracked file has', () => {
     const { root } = repo({
       'skills/x/scripts/run.sh': 'a\n',
       'skills/x/SKILL.md': '`scripts/run.sh:1` and `run.sh:4`\n',
@@ -186,6 +184,13 @@ describe('docCitationProblems', () => {
     const { root } = repo({ 'src/keep.ts': 'a\n', 'container/src/code.ts': 'a\n', 'guide.md': '`src/code.ts:1`\n' });
     expect(docCitationProblems(root, ['guide.md'])).toEqual([
       'guide.md:1: cites `src/code.ts:1`, but no tracked file has that path',
+    ]);
+  });
+
+  it('fails a partial path instead of matching it against the end of another path', () => {
+    const { root } = repo({ 'container/old/code.ts': 'a\n', 'guide.md': '`old/code.ts:1`\n' });
+    expect(docCitationProblems(root, ['guide.md'])).toEqual([
+      'guide.md:1: cites `old/code.ts:1`, but no tracked file has that path',
     ]);
   });
 

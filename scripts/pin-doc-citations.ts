@@ -208,6 +208,11 @@ export function pinDocs(
           refuse(`${doc} differs from ${rev} by more than pins; commit it first`);
           continue;
         }
+        const onLine = citationRuns(text).flatMap((other) => other.links.map((link) => `${link.file}:${link.span}`));
+        if (run.links.some((link) => onLine.filter((key) => key === `${link.file}:${link.span}`).length > 1)) {
+          refuse('the line cites the same file:line more than once, so its history cannot tell them apart');
+          continue;
+        }
         const linkOrigins = run.links.map((link) =>
           introducingCommit(root, rev, doc, i + 1, `${link.file}:${link.span}`),
         );

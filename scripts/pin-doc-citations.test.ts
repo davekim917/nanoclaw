@@ -403,6 +403,19 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
   });
 
+  it('refuses a line that cites the same file:line twice', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'drainQueue(old);\n');
+    write(root, NOTE, '- old `drainQueue` at `src/code.ts:1`\n');
+    commit(root, 'note');
+    write(root, 'src/code.ts', 'drainQueue(newLimit);\n');
+    commit(root, 'change the code');
+    write(root, NOTE, '- old `drainQueue` at `src/code.ts:1`; new `drainQueue` at `src/code.ts:1`\n');
+    commit(root, 'extend the note');
+
+    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused', 'refused']);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

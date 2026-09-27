@@ -125,7 +125,7 @@ things, and nothing else:
 
    This is the one send this task may make, and it is not affected by the
    mute: `enqueue-send` is its own process and writes the outbound row
-   directly (`cli/enqueue-send.ts:286,347-351`), so it never reaches
+   directly (`writeControllerSendRow`, `container/agent-runner/src/cli/enqueue-send.ts`), so it never reaches
    `NanoclawAgentMailbox.writeMessageOut` → `admitChatWrite`
    (`container/agent-runner/src/modules/mailbox/index.ts`), where the per-turn
    chat budget that `muteChat` zeroes (`applyChatBudget`, `poll-loop.ts`) swallows it. A
