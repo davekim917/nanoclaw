@@ -20,7 +20,7 @@ enforceHermeticity();
  */
 const EXCLUDED_DOC_PREFIXES = ['docs/specs/', 'docs/retros/', 'docs/review-notes', 'CHANGELOG.md', 'PROGRESS.md'];
 
-/** `<doc> <citation>` pairs that illustrate a format and name no file in this repo. */
+/** `<doc> <citation>` pairs that illustrate a format, or name a file in another repository. */
 const ILLUSTRATIVE_CITATIONS = new Set([
   '.claude/skills/qodo-pr-resolver/SKILL.md src/auth/service.py:42',
   '.claude/skills/qodo-pr-resolver/SKILL.md src/api/handlers.py:156',
@@ -40,9 +40,10 @@ function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<strin
   const relative = path.posix.normalize(path.posix.join(path.posix.dirname(doc), cited));
   if (tracked.has(relative)) return { file: relative } satisfies Resolution;
   const shaped = cited.startsWith('.') ? relative : cited;
-  if (shaped.includes('/') && topDirs.has(shaped.split('/')[0])) return { missing: true } satisfies Resolution;
+  if (topDirs.has(shaped.split('/')[0])) return { missing: true } satisfies Resolution;
   const bySuffix = [...tracked].filter((file) => file.endsWith(`/${cited}`));
   if (bySuffix.length === 1) return { file: bySuffix[0] } satisfies Resolution;
+  if (/^\.?[A-Za-z_][\w-]*\//.test(shaped)) return { missing: true } satisfies Resolution;
   return { skip: true } satisfies Resolution;
 }
 
@@ -170,13 +171,14 @@ describe('docCitationProblems', () => {
     ]);
   });
 
-  it('fails a repo-shaped path that no longer exists, and skips hosts, ratios and other repos', () => {
+  it('fails a repo-shaped path that no longer exists, and skips hosts and ratios', () => {
     const { root } = repo({
       'src/a.ts': 'a\n',
-      'doc.md': '`src/gone.ts:3`; http://127.0.0.1:8080; 4.5:1 contrast; `pkg/cmd/list.go:9`\n',
+      'doc.md': '`src/gone.ts:3`; http://127.0.0.1:8080; 4.5:1 contrast; `old/code.ts:1`\n',
     });
     expect(docCitationProblems(root, ['doc.md'])).toEqual([
       'doc.md:1: cites `src/gone.ts:3`, but no tracked file has that path',
+      'doc.md:1: cites `old/code.ts:1`, but no tracked file has that path',
     ]);
   });
 

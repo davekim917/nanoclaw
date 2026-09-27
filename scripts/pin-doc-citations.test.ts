@@ -376,6 +376,20 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: extended })]);
   });
 
+  it('dates a continuation by the file it continues, not an equal continuation of another file', () => {
+    const root = gitRoot();
+    write(root, 'src/a.ts', 'function drainQueue() {}\nx\ndrainQueue(a);\n');
+    write(root, 'src/b.ts', 'function drainQueue() {}\nx\ndrainQueue(old);\n');
+    write(root, NOTE, '- `drainQueue` at `src/a.ts:1`, `:3`; `drainQueue` at `src/b.ts:1` drops items\n');
+    commit(root, 'note');
+    write(root, 'src/b.ts', 'function drainQueue() {}\nx\ndrainQueue(newLimit);\n');
+    commit(root, 'change b');
+    write(root, NOTE, '- `drainQueue` at `src/a.ts:1`, `:3`; `drainQueue` at `src/b.ts:1`, `:3` drops items\n');
+    const extended = commit(root, 'extend the b run');
+
+    expect(pinDocs(root, [NOTE], ['src/b.ts'])).toEqual([expect.objectContaining({ kind: 'pinned', sha: extended })]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

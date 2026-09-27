@@ -82,8 +82,8 @@ function citedText(lines: string[] | null, link: FileLineCitation): string | nul
   return lines.slice(link.startLine - 1, link.endLine).join('\n');
 }
 
-function citesExactly(line: string, cited: string): boolean {
-  return new RegExp(`(?<![\\w./-])${cited.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(line);
+function citedLinks(line: string): Set<string> {
+  return new Set(citationRuns(line).flatMap((run) => run.links.map((link) => `${link.file}:${link.span}`)));
 }
 
 function introducingCommit(root: string, rev: string, doc: string, lineNumber: number, cited: string): string | null {
@@ -95,9 +95,9 @@ function introducingCommit(root: string, rev: string, doc: string, lineNumber: n
     const after = body.filter((line) => line.startsWith('+')).map((line) => line.slice(1));
     const before = body.filter((line) => line.startsWith('-')).map((line) => line.slice(1));
     if (after.length === 0 && before.length === 0) continue;
-    if (!after.some((line) => citesExactly(line, cited))) break;
+    if (!after.some((line) => citedLinks(line).has(cited))) break;
     oldest = sha.trim();
-    if (!before.some((line) => citesExactly(line, cited))) break;
+    if (!before.some((line) => citedLinks(line).has(cited))) break;
   }
   return oldest;
 }
@@ -209,7 +209,7 @@ export function pinDocs(
           continue;
         }
         const linkOrigins = run.links.map((link) =>
-          introducingCommit(root, rev, doc, i + 1, text.slice(link.index, link.end).replace(/`/g, '')),
+          introducingCommit(root, rev, doc, i + 1, `${link.file}:${link.span}`),
         );
         if (linkOrigins.some((sha) => sha === null)) {
           refuse("the line's history does not show the commit that added this citation");
