@@ -372,7 +372,7 @@ them, quotes from them, and the after-the-fact check verifies against them —
 never against the live body.
 
 **Acceptance contract (contract steps).** Active only when the QA pair's
-standing instructions say `Acceptance contract (XZO pilot): active`; every
+standing instructions say `Acceptance contract (pilot): active`; every
 step marked *(contract)* applies then and never otherwise, and without that
 line this skill runs exactly as before. *(contract)* Also freeze every request
 the PR body's `acceptance-v1` block (`references/acceptance.example.json`)
@@ -1664,7 +1664,7 @@ do its job without. Both used to stay in the controller's own journal.
   `:1579-1580` and unlinks on `doc is None` at `:1565-1573`), and every
   barrier-backed brief names that file (`:1600-1623`). `invalid[]` is artifact
   CONTENT the barrier rejects; only the owner can repair it, and no amount of
-  lane work clears it. Run `xzo-pr-pr2055-…` (XZO #2047) spent 67 minutes
+  lane work clears it. Run `acme-pr-pr2055-…` spent 67 minutes
   running lanes while the barrier had already named
   `journeys/scope-dispositions.json` invalid on the first lanes fire — the
   journal said so, the brief did not, and the owner found out by running the
@@ -1673,7 +1673,7 @@ do its job without. Both used to stay in the controller's own journal.
   **A refusal that appears AFTER the brief was acknowledged re-offers the
   step.** The first fix covered first arrival — the barrier already refusing
   when the brief was written. The commoner order, and the one run
-  `xzo-pr-pr2055-…` actually took, is the reverse: the brief is issued while
+  `acme-pr-pr2055-…` actually took, is the reverse: the brief is issued while
   the barrier is merely waiting for markers, the owner acks it, and then the
   owner writes evidence the barrier rejects. `owner_step` re-offers a wake only
   while the `.ack` is absent (`smoke-campaign-controller.py:2738-2740`), so that
@@ -1717,7 +1717,7 @@ do its job without. Both used to stay in the controller's own journal.
   `wake.json` and run `smoke-run-scaffold.sh adopt` before writing anything.
   That re-issue is the only legitimate route: a token copied out of gate state
   passes the fence by impersonating its holder, which is what the fence exists
-  to prevent (XZO #2046 — the owner on `xzo-pr-pr2055-…` was asked to do
+  to prevent (the owner on `acme-pr-pr2055-…` was asked to do
   exactly that and correctly refused, leaving eight completed lanes
   unbankable).
 
@@ -1764,7 +1764,7 @@ during a long step: the controller's series arms its next occurrence only when
 the current one resolves, so it cannot fire while the owner's turn is running,
 and the owner is refused `progress` as a claimant mismatch. On PR #2022 that
 cost a 13-lane step four lane markers and finished the run `BLOCKED`
-(XZO #2024).
+(a lease that expired mid-step).
 
 **The live controller will not claim a new campaign without it.** Every tick
 writes `<out-dir>/renewer/heartbeat.json`. Before each poll, the live
@@ -2676,7 +2676,7 @@ A `frontendEvidenceGap: true` fact marks a null `frontendPreviewUrl` as a
 gap in the evidence available for browser-lane build-identity attestation
 (`smoke-build-identity.sh` needs that URL), not a silent "not applicable" —
 the frontend preview is now looked up on every PR regardless of whether its
-diff touched `XZO-FRONTEND/`, since the disambiguation oracle above needs it
+diff touched `web/`, since the disambiguation oracle above needs it
 even on a backend-only PR.
 
 Full design and the live Render verification behind every rule above:

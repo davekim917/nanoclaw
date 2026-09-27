@@ -1500,8 +1500,8 @@ class EffectLayer:
         # transition (smoke-run-scaffold.sh:696, and its own header says so) --
         # then dies in begin_active_run_fence's owner check
         # (smoke-run-scaffold.sh:267-269)
-        # with no legitimate way back. XZO #2046, run
-        # xzo-pr-pr2055-dacf01328421-20260921T193111Z. It is refreshed on EVERY
+        # with no legitimate way back. One campaign, run
+        # acme-pr-pr2055-dacf01328421-20260921T193111Z. It is refreshed on EVERY
         # step so the file the brief points at always names the live token.
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
@@ -1510,7 +1510,7 @@ class EffectLayer:
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
-        # and never re-offered -- the second half of XZO #2046. Removing it here
+        # and never re-offered -- the second half of that failure. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
         # (owner_step, :2668), never while a live brief is enqueued, so any ack
@@ -1575,8 +1575,8 @@ class EffectLayer:
         why (smoke-evidence-barrier.sh -> invalid[]/invalidReasons[]). Before
         this, the controller kept that to its own decisions journal -- truncated
         to three reasons -- and woke the owner with a STATIC brief that said
-        nothing about it (XZO #2047, run
-        xzo-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier named
+        nothing about it (run
+        acme-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier named
         journeys/scope-dispositions.json invalid on the 19:51:35Z fire and the
         owner, the only party that could repair it, first learned of it at
         20:58Z by running the barrier itself). The file is rewritten every fire
@@ -1655,7 +1655,7 @@ class EffectLayer:
         """This run's exact pair-identity commands, or None for a run with no
         readable pr contract.
 
-        XZO #2092: the controller required a clean pair-identity record for GO
+        the controller required a clean pair-identity record for GO
         (validate_synthesis) and no brief ever asked for one, so the cadence
         ran only when an owner remembered SKILL.md -- pr2081's did, pr2088's
         did not, and pr2088 published BLOCKED over a clean GO. What the owner
@@ -1743,7 +1743,7 @@ def resolve_labels(wanted, repo_labels):
 
     `gh issue create --label X` is refused outright when the repo has no X,
     and a refused create is an issue obligation that never settles -- the
-    run cannot finish (XZO #2126: an owner wrote `P3`, the repo's convention
+    run cannot finish (an owner wrote `P3`, the repo's convention
     is `severity:p3`). So a label the repo lacks is dropped, never sent; a
     bare severity shorthand `P<n>` maps to the repo's `severity:p<n>` when
     that label exists. Matching is case-insensitive and sends the repo's own
@@ -1889,7 +1889,7 @@ class RunView:
     def has(self, rel):
         return self.exists and nonempty_file(self.path(rel))
 
-    # THREE-VALUED READS (XZO #2093, PR #1066's closing review). `exists`,
+    # THREE-VALUED READS (PR #1066's closing review). `exists`,
     # has() and nonempty_file answer False both for "not there" and for "could
     # not look", and nothing may be CONCLUDED from the second: one fire where
     # the run dir was invisible (a mount blip, EACCES, a mis-pointed
@@ -2813,7 +2813,7 @@ class Controller:
 
     def _reissue_owner_token(self, run_id, token):
         """A recovery poll re-minted this run's lease under a fresh token while
-        an owner step was IN FLIGHT. XZO #2046.
+        an owner step was IN FLIGHT.
 
         The gate is right to re-mint (that is how a coordinator that died is
         recovered) and `adopt`'s fence is right to refuse a stale owner
@@ -2906,7 +2906,7 @@ class Controller:
     def _reoffer_on_new_refusal(self, run_id, step):
         """Re-offer an ACKNOWLEDGED step whose barrier refusal has changed.
 
-        XZO #2047 again, by the likelier route. Round 1 covered first arrival:
+        the same failure again, by the likelier route. Round 1 covered first arrival:
         the barrier was already refusing when the brief was written, so the
         brief said so. The commoner order is the reverse -- the brief is issued
         while the barrier is merely waiting for markers, the owner acks it,
@@ -3050,7 +3050,7 @@ class Controller:
                 # cross-claimant verb ("Never both act on one run",
                 # smoke-pr-gate.sh:1336-1347). Journaling it made this
                 # controller alarm no-authority on it, then foreign-finish, and
-                # plan a freeze-close write on a run it never held (XZO #2176).
+                # plan a freeze-close write on a run it never held.
                 # Shadow still mirrors it: comparing those runs is its job.
                 continue
             if obligation_key(run, "run", "claim") not in obs:
@@ -3344,12 +3344,12 @@ class Controller:
         self._alarm_overdue(run_id, None)
 
         # -- phase derivation (derived, never stored) --
-        # THE CHALLENGER DEADLINE IS EVALUATED BEFORE INTAKE CAN RETURN (XZO
+        # THE CHALLENGER DEADLINE IS EVALUATED BEFORE INTAKE CAN RETURN (issue
         # #2093). Intake returns on every fire until a readable contract exists
         # and the intake step settles, and before this the deadline was only
         # evaluated further down, so a run whose owner never wrote a contract
         # (a provider park, a declination) held its PR slot with no terminal
-        # path at all: run xzo-pr-pr2075-0f94c66c2d32-20260922T002109Z blew
+        # path at all: run acme-pr-pr2075-0f94c66c2d32-20260922T002109Z blew
         # its deadline at 01:51:10Z and sat fifteen hours. It runs here only
         # while the run has never posted its root (or its contract is
         # unreadable, where intake returns before the root post on every fire
@@ -3516,7 +3516,7 @@ class Controller:
                 # owner:synthesis obligation this branch declined to create
                 # (:3461-3463), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
-                # (XZO #2047), on the sibling path.
+                #, on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
                 if timed:
                     return timed
@@ -3600,7 +3600,7 @@ class Controller:
 
     def _terminal_before_root(self, run_id, claim, run, pr):
         """The terminal paths a run that has not left intake can still take,
-        in the precedence the ladder below gives them (XZO #2093):
+        in the precedence the ladder below gives them:
 
         1. A non-GO verdict frozen on an earlier fire settles, whatever the
            phase files say now. The challenger-timeout this function raises

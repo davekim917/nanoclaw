@@ -50,7 +50,7 @@ to the retained technical owner, verify its artifact receipt, and stop.
    started with is then retired. The controller refreshes `wake.json` with
    every brief it writes (`smoke-campaign-controller.py:1529-1531`, in
    `_owner_wake` at `:1451`), which is why the file is current and your own
-   copy of its value is not (XZO #2046).
+   copy of its value is not.
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
      mid-step: the controller saw the step's `briefedToken` differ from the
      token the gate holds and re-offered it
@@ -72,7 +72,7 @@ to the retained technical owner, verify its artifact receipt, and stop.
    fire from the real `smoke-evidence-barrier.sh` and deletes it once the phase
    passes. `invalid[]` is artifact CONTENT the barrier rejects — yours to
    repair, and no amount of lane work clears it; `missing[]` is what is not
-   written yet. A phase never passes while `invalid[]` is non-empty (XZO #2047).
+   written yet. A phase never passes while `invalid[]` is non-empty.
    - **You will be woken again if that refusal changes while you hold the
      step**, including after you have acked the brief: the controller compares
      the current `invalid[]`+`invalidReasons[]` against the ones your brief was

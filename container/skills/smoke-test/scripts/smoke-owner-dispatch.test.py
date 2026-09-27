@@ -14,7 +14,7 @@ import unittest
 spec = importlib.util.spec_from_file_location("controller", Path(__file__).with_name("smoke-campaign-controller.py"))
 ctl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ctl)
-RUN = "xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
+RUN = "acme-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
 HERE = Path(__file__).resolve().parent
 NCL_TS = HERE.parents[3] / "container" / "agent-runner" / "src" / "cli" / "ncl.ts"
 

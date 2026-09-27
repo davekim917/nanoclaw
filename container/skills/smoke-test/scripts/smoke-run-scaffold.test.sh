@@ -43,7 +43,7 @@ gate_owns() {
 gate_owns "$(basename "$FIXTURE_DIR")"
 scaffold() { bash "$SCRIPT_DIR/smoke-run-scaffold.sh" "$@"; }
 # Every pr contract the scaffold writes owes a pair-identity record before a
-# barrier phase passes (XZO #2092; the rule is smoke-evidence-barrier.test.sh's
+# barrier phase passes (the rule is smoke-evidence-barrier.test.sh's
 # to cover). Seed a clean one where the contract asks for it and none exists,
 # so every barrier assertion below keeps testing what it tests.
 seed_pair_identity() { # <run-dir>
@@ -97,7 +97,7 @@ jq -e --arg sha "$SHA" '.sourceSha == $sha and (.requiredLaneMarkers | length ==
   .schemaVersion == 2 and .pr == 5 and .repoSlug == "org__repo"' \
   "$FIXTURE_DIR/completion-contract.json" >/dev/null
 
-# XZO #2092: a pr contract declares that it owes pair identity, and no
+# a pr contract declares that it owes pair identity, and no
 # deployment extra can take that back -- the fenced field is written after it.
 jq -e '.pairIdentity == "required"' "$FIXTURE_DIR/completion-contract.json" >/dev/null || {
   echo "expected a pr contract to declare pairIdentity required" >&2; exit 1; }
@@ -298,7 +298,7 @@ SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" |
 # Only the owner binding moved. Lanes, generations, marker list, createdAt,
 # sourceSha and runId are untouched; no marker file was rewritten.
 [ "$(jq -c '[.lanes, .requiredLaneMarkers, .createdAt, .sourceSha, .runId]' "$ADOPT/completion-contract.json")" = "$ADOPT_LANES" ]
-# ...and so did not the run's pair-identity terms (XZO #2092).
+# ...and so did not the run's pair-identity terms.
 jq -e '.pairIdentity == "required"' "$ADOPT/completion-contract.json" >/dev/null || {
   echo "expected adoption to keep the contract's pairIdentity requirement" >&2; exit 1; }
 [ "$(sha256sum "$ADOPT/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
@@ -700,7 +700,7 @@ jq -e '.ok == false and (.error | test("does not hold the gate")) and (.error | 
 gate task-claim "$TASK_RUN_ID" "$SHA" | jq -e '.ok == true' >/dev/null
 scaffold contract "$TASK_RUN" "$SHA" B1:browser:'certification lane' \
   | jq -e '.ok == true and .laneCount == 1' >/dev/null
-# Only a pr contract owes pair identity (XZO #2092); a task run is unchanged.
+# Only a pr contract owes pair identity; a task run is unchanged.
 jq -e 'has("pairIdentity") | not' "$TASK_RUN/completion-contract.json" >/dev/null || {
   echo "expected a task-scoped contract not to declare pairIdentity" >&2; exit 1; }
 printf 'ok\n' >"$TASK_RUN/evidence/ok.txt"

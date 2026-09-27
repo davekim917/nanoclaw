@@ -459,7 +459,7 @@ echo "9/17 malformed source sha is refused, never written into the manifest ok"
 # --- 10. Every screen gets its own fresh session (state load THEN open, in
 # that session, before any other screen's session is ever touched) — and the
 # per-screen pattern is identical regardless of which order the screens are
-# listed in. This is the regression for xzo-pr-pr1792-cac47f6f1153-20260912T113129Z,
+# listed in. This is the regression for acme-pr-pr1792-cac47f6f1153-20260912T113129Z,
 # where one shared session let an earlier screen's open nav drawer bleed into
 # every later 390px shot and the shadow critic graded all three BROKEN on
 # that capture artifact alone.

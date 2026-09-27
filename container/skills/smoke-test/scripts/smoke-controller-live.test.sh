@@ -20,8 +20,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 PR=7
-RUN=xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z
-LEGACY=xzo-pr-pr9-cccccccccccc-20260918T090000Z
+RUN=acme-pr-pr7-aaaaaaaaaaaa-20260918T100000Z
+LEGACY=acme-pr-pr9-cccccccccccc-20260918T090000Z
 TOKEN=owner-ctl-2222
 
 new_case() {
@@ -341,13 +341,13 @@ fire; fire
 [ "$(posted pr_run_stalled)" = 1 ] || fail "the recovered stall alarm is posted once, ever"
 # The poll path: the gate emits the stall wake after latching it; the ack of the
 # latch is lost; recovery re-queues the SAME fingerprint, so no second post.
-jq -c '.stalledAlertRunId=null | .activeRunId="xzo-pr-pr7-bbbbbbbbbbbb-20260918T110000Z"' "$C/agent/state/pr-7-state.json" >"$C/s.tmp"
+jq -c '.stalledAlertRunId=null | .activeRunId="acme-pr-pr7-bbbbbbbbbbbb-20260918T110000Z"' "$C/agent/state/pr-7-state.json" >"$C/s.tmp"
 mv "$C/s.tmp" "$C/agent/state/pr-7-state.json"
 fire   # acknowledges the cleared latch
 cat >"$C/poll-next.sh" <<SH
 jq -c '.stalledAlertRunId=.activeRunId' '$C/agent/state/pr-7-state.json' >'$C/s.tmp'
 mv '$C/s.tmp' '$C/agent/state/pr-7-state.json'
-jq -cn '{wakeAgent:true,data:{schemaVersion:1,trigger:"pr_run_stalled",pr:7,runId:"xzo-pr-pr7-bbbbbbbbbbbb-20260918T110000Z",
+jq -cn '{wakeAgent:true,data:{schemaVersion:1,trigger:"pr_run_stalled",pr:7,runId:"acme-pr-pr7-bbbbbbbbbbbb-20260918T110000Z",
   sourceSha:"$SHA",quietSeconds:4000}}'
 SH
 fire
@@ -801,7 +801,7 @@ fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-ro
 [ "$WAKE" = true ] && [ "$(d .alarm.to)" = campaign-room ] \
   || fail "a fire hung on the env file still reports somewhere to post: $OUTPUT"
 
-# --- the env file is the list of keys (XZO #2047) --------------------------------
+# --- the env file is the list of keys --------------------------------
 # The install's env file is the single source of truth for SMOKE_GATE_*. This
 # wrapper used to re-declare a 12-name allowlist of its own while the install's
 # file defined 17, so eleven names -- SMOKE_GATE_LEASE_DIR among them -- were
@@ -823,7 +823,7 @@ write_env_full() { # the shape of a real install's file: every SMOKE_GATE_* it s
     echo "export SMOKE_GATE_BACKEND_SERVICE='srv-back'"
     echo "export SMOKE_GATE_FRONTEND_SERVICE='srv-front'"
     echo "export SMOKE_GATE_LABEL='render-preview'"
-    echo "export SMOKE_GATE_RUN_PREFIX='xzo-pr'"
+    echo "export SMOKE_GATE_RUN_PREFIX='acme-pr'"
     echo "export SMOKE_GATE_STATE_DIR='$C/agent/state'"
     echo "export SMOKE_GATE_LEASE_DIR='$C/wg/leases'"
     echo "export SMOKE_GATE_RUN_ROOT='$C/wg/runs'"
@@ -836,7 +836,7 @@ write_env_full() { # the shape of a real install's file: every SMOKE_GATE_* it s
     echo "export SMOKE_GATE_PREFLIGHT_CMD='QA_LOGIN_URL=\"\${SMOKE_GATE_PREFLIGHT_TARGET_URL%/}/users/login\" true'"
     echo "export SMOKE_CONTROLLER_MODE='live'"
     echo "export SMOKE_CONTROLLER_SEND_TO='campaign-room'"
-    echo "export SMOKE_CONTROLLER_CHALLENGER_MENTION='@Gilfoyle'"
+    echo "export SMOKE_CONTROLLER_CHALLENGER_MENTION='@Challenger'"
     echo "export SMOKE_CONTROLLER_GATE_CMD='$C/bin/gate.sh'"
   } >"$C/env.sh"
 }

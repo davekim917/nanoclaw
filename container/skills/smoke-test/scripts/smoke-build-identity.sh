@@ -14,7 +14,7 @@
 # had to be discarded. A frontend that serves fine while its API host
 # resolves to nothing looks identical to a correct build until something
 # actually calls the backend, so this script makes that call explicit and
-# gates on it (issue #1148).
+# gates on it.
 #
 # Usage: smoke-build-identity.sh <frontend-base-url> <backend-base-url>
 #

@@ -7,7 +7,7 @@
 # stays BLOCKED, a stale-generation receipt never counts toward the current
 # baseline, and `finish` (and the evidence barrier) refuse until every lane
 # the contract declared at the re-freeze has been redispatched after it
-# (issue #731, F3). Contracts and redispatches go through the real
+# (F3). Contracts and redispatches go through the real
 # smoke-run-scaffold.sh verbs, so the snapshot is tested against its field.
 set -euo pipefail
 
@@ -365,7 +365,7 @@ expect_rc "$(run finish "$RUN15")" 2 bypass-restored-refuses-for-the-real-reason
 out | grep -Fq 'not redispatched since the pair re-freeze: A, B;' || \
   fail "bypass-restored-refuses-for-the-real-reason: expected the ordinary un-redispatched refusal after restoring the real snapshot"
 
-# --- 5i. A LATE freeze does not launder evidence gathered before it (XZO #2092)
+# --- 5i. A LATE freeze does not launder evidence gathered before it
 # The laundering sequence: lanes run and write markers with no pair frozen;
 # `start` then freezes whatever is live NOW and one ok `check` follows. Before,
 # that cleared finish and the barrier, so markers bound to no build supported a

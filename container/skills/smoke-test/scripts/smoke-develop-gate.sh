@@ -794,7 +794,7 @@ drop_disposition() {
 # The ledger is the release desk's own append-only record. Entries key the hold
 # as `smoke_hold:<runId>`, which is why the hold file carries `runId` at all.
 # NEWEST LINE WINS and it must be an `override`: on 2026-08-25 a human wrote an
-# `override` on `smoke_hold:xzo-pr-pr1211-…` at 19:21:33Z and the desk wrote a
+# `override` on `smoke_hold:acme-pr-pr1211-…` at 19:21:33Z and the desk wrote a
 # `correction` on the SAME target at 20:27:00Z reading "not a human gate,
 # authorizes nothing". Matching any override anywhere in the file would read
 # that retracted one as decided.
@@ -2024,7 +2024,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   # finished LATER than the verdict state holds -- whatever its targetSha, and
   # completedSha becomes that line's own target. Keyed on develop's current
   # head instead (as it was through #1108), a freeze whose target develop had
-  # already moved past was never adopted: XZO #2176 froze fe92bc76, develop
+  # already moved past was never adopted: one campaign froze fe92bc76, develop
   # reached ef798620 mid-run, and state kept #2161 while the hold named #2176,
   # so the reconciler woke gate_hold_tampered "mismatched" (#1134). The
   # same-SHA re-smoke (#1108: #2121 void BLOCKED, then #2126) and the

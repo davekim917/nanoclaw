@@ -25,10 +25,10 @@
 #     (references/controller-owner-router.md:113-115).
 #
 # So any judgment step longer than 900 s dropped the lease under itself: on
-# run xzo-pr-pr2022-...-20260920T052052Z the lanes step went `enqueued` at
+# run acme-pr-pr2022-...-20260920T052052Z the lanes step went `enqueued` at
 # 06:20:47Z, the lease lapsed at 06:35:49Z, four lane markers were refused by
 # smoke-run-scaffold.sh, a recovery poll rebound the lease to a fresh token,
-# and the run finished BLOCKED (XZO #2024).
+# and the run finished BLOCKED.
 #
 # This tick closes that hole from OUTSIDE both clocks: its own series, its own
 # session (one session per series -- src/session-manager.ts:428-433), so
@@ -148,7 +148,7 @@ GATE_FAILURES=0
 # THE HEARTBEAT (#1031). This tick's only other output is task stdout, which
 # nothing keeps, so nothing could tell "the renewer ran and had nothing to do"
 # from "the renewer's series was never created, or was paused" -- which is how
-# campaign pr2055 lost its lease mid-step (XZO #2024): the renewer merged on
+# campaign pr2055 lost its lease mid-step: the renewer merged on
 # 09-20 and its series was not created until 09-22, and nothing noticed. So
 # every tick that knows the controller's out-dir records that it ran, and how
 # it ended, in ONE file of its own: <out>/renewer/heartbeat.json. The live
@@ -227,7 +227,7 @@ command -v jq >/dev/null 2>&1 || final no-jq "jq is unavailable; nothing renewed
 # overrides the process env.
 #
 # THE ENV FILE IS THE LIST OF KEYS, WITHIN ONE NAMESPACE. This tick used to
-# read a hardcoded four, which is the XZO #2047 shape: a list of names owned by
+# read a hardcoded four, which is the same failure shape: a list of names owned by
 # a DIFFERENT file goes stale the moment the install adds one, silently. It now
 # reads every `SMOKE_*` name the file mentions, so a new SMOKE_ key works with
 # no change here.
@@ -238,7 +238,7 @@ command -v jq >/dev/null 2>&1 || final no-jq "jq is unavailable; nothing renewed
 # SMOKE_*). Everything else -- PATH, LD_PRELOAD, PYTHONPATH, BASH_ENV,
 # BUN_OPTIONS (`--preload` runs a module before Bun's main script) -- is simply
 # not this file's configuration and is IGNORED, exactly as it was before
-# XZO #2047. not_config() below is only for the dangerous SMOKE_ names.
+# the same failure. not_config() below is only for the dangerous SMOKE_ names.
 ENV_FILE="${SMOKE_CONTROLLER_ENV_FILE:-/workspace/agent/smoke-gate-env.sh}"
 CONFIG_PREFIX=SMOKE_
 not_config() { # <name> -- 0 when a SMOKE_ name still must not come from the file

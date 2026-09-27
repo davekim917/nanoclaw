@@ -367,8 +367,8 @@ freeze_ready_fixture() { # <pr> <freeze-sha> <target-sha>
   export STUB_PARENT_SHA="$3"
   export STUB_RUN_LIST="[{\"headSha\":\"$3\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
   export STUB_SERVICES="[\
-{\"id\":\"srv-backend-pr-$1\",\"name\":\"XZO-DEV-BACKEND PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-$1.onrender.com\"}},\
-{\"id\":\"srv-frontend-pr-$1\",\"name\":\"XZO-DEV-FRONTEND PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-$1.onrender.com\"}}]"
+{\"id\":\"srv-backend-pr-$1\",\"name\":\"WIDGET-API PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-$1.onrender.com\"}},\
+{\"id\":\"srv-frontend-pr-$1\",\"name\":\"WIDGET-WEB PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-$1.onrender.com\"}}]"
   export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
   export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
   export STUB_HEALTHZ_CODE=200
@@ -469,14 +469,14 @@ HEAD_SHA="$(sha b)"
 export STUB_PR_LIST="[{\"number\":42,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"XZO-DEV-BACKEND PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-42.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"WIDGET-API PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-42.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 POLL_OUT="$(bash "$GATE" poll)"
 jq -e --arg sha "$HEAD_SHA" '
   .wakeAgent == true and .data.trigger == "pr_build_settled" and
   .data.pr == 42 and .data.sourceSha == $sha and
-  .data.previewUrl == "https://xzo-dev-backend-pr-42.onrender.com" and
+  .data.previewUrl == "https://widget-api-pr-42.onrender.com" and
   .data.isFreezePr == false and .data.ciSha == $sha and
   .data.recovery == false and .data.abandonedActiveSha == null and
   .data.campaignSize == "standard" and .data.sizeReason == "no sizing rules" and
@@ -502,7 +502,7 @@ export SMOKE_GATE_RUN_PREFIX=bound
 export STUB_PR_LIST="[{\"number\":142,\"headRefOid\":\"$AUTO_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$AUTO_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES='[{"id":"srv-backend-pr-142","name":"XZO-DEV-BACKEND PR #142","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://xzo-dev-backend-pr-142.onrender.com"}}]'
+export STUB_SERVICES='[{"id":"srv-backend-pr-142","name":"WIDGET-API PR #142","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://widget-api-pr-142.onrender.com"}}]'
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$AUTO_SHA\"}}]"
 mkdir -p "$SMOKE_GATE_LEASE_DIR"
 AUTO_LEGACY_STATE="$STATE_DIR/legacy-private"
@@ -546,13 +546,13 @@ HEAD_SHA="$(sha c)"
 export STUB_PR_LIST="[{\"number\":43,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-43\",\"name\":\"XZO-DEV-BACKEND PR #43\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-43.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-43\",\"name\":\"WIDGET-API PR #43\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-43.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 SEEN_URL_FILE="$STATE_DIR/seen-preflight-url.txt"
 export SMOKE_GATE_PREFLIGHT_CMD="printf '%s' \"\$SMOKE_GATE_PREFLIGHT_TARGET_URL\" > $SEEN_URL_FILE"
 bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled"' >/dev/null
-[ "$(cat "$SEEN_URL_FILE")" = "https://xzo-dev-backend-pr-43.onrender.com" ] \
+[ "$(cat "$SEEN_URL_FILE")" = "https://widget-api-pr-43.onrender.com" ] \
   || { echo "expected the preflight command to see this candidate's own preview URL" >&2; cat "$SEEN_URL_FILE" >&2; exit 1; }
 unset SMOKE_GATE_PREFLIGHT_CMD
 
@@ -565,7 +565,7 @@ HEAD_SHA="$(sha d)"
 export STUB_PR_LIST="[{\"number\":44,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-44\",\"name\":\"XZO-DEV-BACKEND PR #44\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-44.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-44\",\"name\":\"WIDGET-API PR #44\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-44.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 export SMOKE_GATE_PREFLIGHT_CMD='echo "seat qa-a@example.com could not be verified"; exit 1'
@@ -603,7 +603,7 @@ HEAD_SHA="$(sha e)"
 export STUB_PR_LIST="[{\"number\":45,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-45\",\"name\":\"XZO-DEV-BACKEND PR #45\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-45.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-45\",\"name\":\"WIDGET-API PR #45\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-45.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 FLAP_CTL="$STATE_DIR/control.json"
@@ -651,7 +651,7 @@ export STUB_PR_LIST="[{\"number\":46,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\
 export STUB_PR_VIEW="{\"number\":46,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"frontend/a.css"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-46\",\"name\":\"XZO-DEV-BACKEND PR #46\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-46.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-46\",\"name\":\"WIDGET-API PR #46\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-46.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 CHECK_OUT="$(bash "$GATE" check 46)"
@@ -683,7 +683,7 @@ export STUB_PR_LIST="[{\"number\":47,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\
 export STUB_PR_VIEW="{\"number\":47,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"backend/migrations/0100_add_col.sql"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-47\",\"name\":\"XZO-DEV-BACKEND PR #47\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-47.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-47\",\"name\":\"WIDGET-API PR #47\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-47.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 CHECK_OUT="$(bash "$GATE" check 47)"
@@ -709,7 +709,7 @@ STALE_SHA="$(sha d)"
 export STUB_PR_VIEW="{\"number\":7,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-7\",\"name\":\"XZO-DEV-BACKEND PR #7\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-7.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-7\",\"name\":\"WIDGET-API PR #7\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-7.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$STALE_SHA\"}}]"
 bash "$GATE" check 7 | jq -e --arg head "$HEAD_SHA" --arg stale "$STALE_SHA" '
   .eligible == true and .settled == false and .backendReady == false and
@@ -2062,7 +2062,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 export STUB_PR_LIST="[{\"number\":55,\"headRefOid\":\"$DUP_SHA\",\"headRefName\":\"feature/dup\"}]"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$DUP_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"XZO-DEV-BACKEND PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-55.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"WIDGET-API PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-55.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$DUP_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 # ...but the ceiling still RINGS. It was demoted from executioner to alarm, not
@@ -2152,7 +2152,7 @@ stalled_fixture() { # <pr> <sha>: a settling ordinary PR plus a readable run roo
   export STUB_PR_LIST="[{\"number\":$1,\"headRefOid\":\"$2\",\"headRefName\":\"feature/stall\"}]"
   export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
   export STUB_RUN_LIST="[{\"headSha\":\"$2\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-  export STUB_SERVICES="[{\"id\":\"srv-backend-pr-$1\",\"name\":\"XZO-DEV-BACKEND PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-$1.onrender.com\"}}]"
+  export STUB_SERVICES="[{\"id\":\"srv-backend-pr-$1\",\"name\":\"WIDGET-API PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-$1.onrender.com\"}}]"
   export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
   export STUB_HEALTHZ_CODE=200
 }
@@ -2337,7 +2337,7 @@ bash "$GATE" release run-stall-done owner-done >/dev/null
 stall_clear
 unset SMOKE_GATE_RUN_ROOT
 
-# --- 7d. challenger-timeout ends a run that never left intake (XZO #2093) ------
+# --- 7d. challenger-timeout ends a run that never left intake ------
 # The controller now times a run out while it is still in intake -- no
 # completion contract, possibly no run directory at all (run pr2075). That
 # rests on the verb needing neither: it reads the claim, the deadline and the
@@ -2484,7 +2484,7 @@ unset SMOKE_GATE_RUN_ROOT
 fresh_state
 FINISH_SHA="$(sha 3)"
 bash "$GATE" claim run-finish-1 42 "$FINISH_SHA" >/dev/null
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"XZO-DEV-BACKEND PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-42.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"WIDGET-API PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-42.onrender.com\"}}]"
 export STUB_SUSPEND_CODE=202
 bash "$GATE" finish "$FINISH_SHA" run-finish-1 GO | jq -e --arg sha "$FINISH_SHA" '
   .ok == true and .verdict == "GO" and .pr == 42 and .sha == $sha and
@@ -2603,7 +2603,7 @@ HEAD_SHA="$(sha 9)"
 export STUB_PR_VIEW="{\"number\":55,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES_EXIT=1
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"XZO-DEV-BACKEND PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-55.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"WIDGET-API PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-55.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 bash "$GATE" check 55 | jq -e '
@@ -2736,7 +2736,7 @@ OTHER_SHA="$(sha 2)"
 export STUB_PR_VIEW="{\"number\":61,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$OTHER_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-61\",\"name\":\"XZO-DEV-BACKEND PR #61\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-61\",\"name\":\"WIDGET-API PR #61\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 bash "$GATE" check 61 | jq -e '
@@ -2759,7 +2759,7 @@ HEAD_SHA="$(sha 3)"
 export STUB_PR_LIST="[{\"number\":77,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST_EXIT=1
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-77\",\"name\":\"XZO-DEV-BACKEND PR #77\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-77\",\"name\":\"WIDGET-API PR #77\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 
@@ -3552,7 +3552,7 @@ jq -e '.ok == false and (.error | test("different coordinator owner"))' <<<"$OUT
 scaffold_as "$ADOPT_T4" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" |
   jq -e '.ok == true and .adopted == true and .adoptionCount == 3' >/dev/null
 # The scaffold's pr contract also owes a pair-identity record before a barrier
-# phase passes (XZO #2092, covered by smoke-evidence-barrier.test.sh); seed a
+# phase passes (covered by smoke-evidence-barrier.test.sh); seed a
 # clean one so this still asserts only what adoption leaves behind.
 jq -e '.pairIdentity == "required"' "$ADOPT_DIR/completion-contract.json" >/dev/null
 mkdir -p "$ADOPT_DIR/coordinator"
@@ -3809,11 +3809,11 @@ export STUB_PR_VIEW="{\"number\":80,\"state\":\"OPEN\",\"isDraft\":false,\"headR
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$D_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[\
-{\"id\":\"srv-frontend-pr-80\",\"name\":\"XZO-DEV-FRONTEND PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-80.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-80-a\",\"name\":\"XZO-DEV-BACKEND PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-80-a.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-80-b\",\"name\":\"XZO-DEV-BACKEND PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-80-b.onrender.com\"}}]"
+{\"id\":\"srv-frontend-pr-80\",\"name\":\"WIDGET-WEB PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-80.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-80-a\",\"name\":\"WIDGET-API PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-80-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-80-b\",\"name\":\"WIDGET-API PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-80-b.onrender.com\"}}]"
 export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Cg8w-v89.js"></script></body></html>'
-export STUB_BUNDLE_JS='fetch("https://xzo-dev-backend-pr-80-b.onrender.com/api")'
+export STUB_BUNDLE_JS='fetch("https://widget-api-pr-80-b.onrender.com/api")'
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$D_SHA\"}}]"
 export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$D_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
@@ -3822,7 +3822,7 @@ jq -e '
   .previewAmbiguous == false and .previewAmbiguityReason == null and
   .backendSelectionMethod == "bundle-disambiguated" and
   .backendPreviewId == "srv-backend-pr-80-b" and
-  .backendPreviewUrl == "https://xzo-dev-backend-pr-80-b.onrender.com" and
+  .backendPreviewUrl == "https://widget-api-pr-80-b.onrender.com" and
   (.backendCandidates | length) == 2 and
   .frontendEvidenceGap == false and .settled == true
 ' <<<"$D_CHECK" >/dev/null || { echo "33: bundle disambiguation did not prefer the referenced host: $D_CHECK" >&2; exit 1; }
@@ -3839,9 +3839,9 @@ export STUB_PR_VIEW="{\"number\":81,\"state\":\"OPEN\",\"isDraft\":false,\"headR
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$N_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[\
-{\"id\":\"srv-frontend-pr-81\",\"name\":\"XZO-DEV-FRONTEND PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-81.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-81-a\",\"name\":\"XZO-DEV-BACKEND PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-81-a.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-81-b\",\"name\":\"XZO-DEV-BACKEND PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-81-b.onrender.com\"}}]"
+{\"id\":\"srv-frontend-pr-81\",\"name\":\"WIDGET-WEB PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-81.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-81-a\",\"name\":\"WIDGET-API PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-81-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-81-b\",\"name\":\"WIDGET-API PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-81-b.onrender.com\"}}]"
 export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Cg8w-v89.js"></script></body></html>'
 export STUB_BUNDLE_JS='fetch("/api/local")'
 N_ERR="$STATE_DIR/n-check-stderr.txt"
@@ -3880,8 +3880,8 @@ export STUB_PR_VIEW="{\"number\":82,\"state\":\"OPEN\",\"isDraft\":false,\"headR
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$G_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[\
-{\"id\":\"srv-backend-pr-82-a\",\"name\":\"XZO-DEV-BACKEND PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-82-a.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-82-b\",\"name\":\"XZO-DEV-BACKEND PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-82-b.onrender.com\"}}]"
+{\"id\":\"srv-backend-pr-82-a\",\"name\":\"WIDGET-API PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-82-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-82-b\",\"name\":\"WIDGET-API PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-82-b.onrender.com\"}}]"
 G_CHECK="$(bash "$GATE" check 82 2>/dev/null)"
 jq -e '
   .previewAmbiguous == true and
@@ -3901,7 +3901,7 @@ E_SHA="$(sha 5)"
 export STUB_PR_VIEW="{\"number\":83,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$E_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$E_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-83\",\"name\":\"XZO-DEV-BACKEND PR #83\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-83.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-83\",\"name\":\"WIDGET-API PR #83\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-83.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$E_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 E_CHECK="$(bash "$GATE" check 83 2>/dev/null)"
@@ -3991,9 +3991,9 @@ export STUB_SUSPEND_LOG="$STATE_DIR/suspend-posts-37.log"
 : > "$STUB_SUSPEND_LOG"
 bash "$GATE" claim run-amb-finish 84 "$F_SHA" >/dev/null
 export STUB_SERVICES="[\
-{\"id\":\"srv-frontend-pr-84\",\"name\":\"XZO-DEV-FRONTEND PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-84.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-84-a\",\"name\":\"XZO-DEV-BACKEND PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-84-a.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-84-b\",\"name\":\"XZO-DEV-BACKEND PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-84-b.onrender.com\"}}]"
+{\"id\":\"srv-frontend-pr-84\",\"name\":\"WIDGET-WEB PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-84.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84-a\",\"name\":\"WIDGET-API PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-84-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84-b\",\"name\":\"WIDGET-API PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-84-b.onrender.com\"}}]"
 export STUB_FRONTEND_HTML='<html><body>no module script here</body></html>'
 export STUB_SUSPEND_CODE=202
 F_ERR="$STATE_DIR/f-finish-stderr.txt"
@@ -4024,11 +4024,11 @@ export STUB_SUSPEND_LOG="$STATE_DIR/suspend-posts-38.log"
 : > "$STUB_SUSPEND_LOG"
 bash "$GATE" claim run-disambig-finish 85 "$S_SHA" >/dev/null
 export STUB_SERVICES="[\
-{\"id\":\"srv-frontend-pr-85\",\"name\":\"XZO-DEV-FRONTEND PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-85.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-85-a\",\"name\":\"XZO-DEV-BACKEND PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-85-a.onrender.com\"}},\
-{\"id\":\"srv-backend-pr-85-b\",\"name\":\"XZO-DEV-BACKEND PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-85-b.onrender.com\"}}]"
+{\"id\":\"srv-frontend-pr-85\",\"name\":\"WIDGET-WEB PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://widget-web-pr-85.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85-a\",\"name\":\"WIDGET-API PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-85-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85-b\",\"name\":\"WIDGET-API PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-85-b.onrender.com\"}}]"
 export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Dw8AA3y4.js"></script></body></html>'
-export STUB_BUNDLE_JS='fetch("https://xzo-dev-backend-pr-85-a.onrender.com/api")'
+export STUB_BUNDLE_JS='fetch("https://widget-api-pr-85-a.onrender.com/api")'
 export STUB_SUSPEND_CODE=202
 bash "$GATE" finish "$S_SHA" run-disambig-finish GO | jq -e '
   .ok == true and .suspend.attempted == true and .suspend.ok == true and
@@ -4048,7 +4048,7 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 W_SHA="$(sha 8)"
-export STUB_SERVICES="[{\"id\":\"srv-backend-pr-86\",\"name\":\"XZO-DEV-BACKEND PR #86\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-86.onrender.com\"}}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-86\",\"name\":\"WIDGET-API PR #86\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://widget-api-pr-86.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$W_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 bash "$GATE" claim run-warmup-finish 86 "$W_SHA" >/dev/null
@@ -5813,7 +5813,7 @@ fresh_state
 WAIT_SHA="$(sha a)"
 export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/wait\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"api/src/wait.ts"}]'
-export STUB_SERVICES='[{"id":"srv-backend-pr-301","name":"XZO-DEV-BACKEND PR #301","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://xzo-dev-backend-pr-301.onrender.com"}}]'
+export STUB_SERVICES='[{"id":"srv-backend-pr-301","name":"WIDGET-API PR #301","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://widget-api-pr-301.onrender.com"}}]'
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$WAIT_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 WAIT_CLOCK="$STATE_DIR/wait-clock.txt"
