@@ -112,8 +112,8 @@ export function namedHuman(note: string): string {
 /**
  * Human-blocked: silent inside PARK_GRACE_MS (the same constant at which the
  * board turns a park red, so the two can't drift), one escalation past it,
- * then never again. Not an exemption: an exempt claim parked on a person was
- * never surfaced to anyone.
+ * then never again. Not an exemption: an exempt claim parked on a person is
+ * surfaced to no one.
  */
 function decideHumanBlocked(
   claim: BoardClaim,
@@ -182,9 +182,9 @@ function threadLinkLine(threadUrl: string | null | undefined): string {
 
 /**
  * Shared by the human (dashboard/nudge.ts) and autonomous paths so they can't
- * drift. Moving the claim is SILENT (the board already renders it, and
- * announcing it flooded channels); the one thing that posts is a human who
- * owes a decision.
+ * drift. Moving the claim is SILENT (the board already renders it; announcing
+ * every move floods channels); the one thing that posts is a human who owes a
+ * decision.
  */
 export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';

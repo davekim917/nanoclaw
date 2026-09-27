@@ -62,13 +62,13 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // Eviction trigger in `boundedCapabilities`, measured over the services array
   // only (the ~740-char preamble is extra). Load-bearing: capabilities are the
   // LAST thing enforceFinalBound sacrifices, so without a total they can starve
-  // all recall. Since the roster, a safety net that real content shouldn't reach;
-  // keep it, since an operator can put anything in a stored MCP `description`.
+  // all recall. Real content shouldn't reach it, but an operator can put
+  // anything in a stored MCP `description`.
   capabilityTotalChars: 10_000,
   finalChars: 12_000,
   exactLinkFinalChars: 16_000,
   // Bootstrap turns carry mandatory payload (capability block, core index) the
-  // ordinary bound never sees; at 12,000 they evicted every recall excerpt.
+  // ordinary bound never sees; under finalChars it would evict every recall excerpt.
   // Derived: finalChars + capabilityTotalChars + 1,100 (memory-lane raise).
   // Worst realistic payload is ~21,800. Deliberately NOT the sum of every lane
   // cap (~29,000): a bootstrap turn with a full exact-link match is exactly the
