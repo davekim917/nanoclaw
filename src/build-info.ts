@@ -1,8 +1,4 @@
-/**
- * Build provenance — reads the dist/BUILD_INFO.json stamp written by
- * scripts/write-build-info.ts (postbuild) so "what is actually deployed" is
- * answerable from the running process, not just from the checkout on disk.
- */
+/** Reads the dist/BUILD_INFO.json stamp (scripts/write-build-info.ts) so the running process knows what it runs. */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -44,11 +40,7 @@ export function formatBuildInfoLog(info: BuildInfo): { msg: string; data: Record
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 
-/**
- * The checkout's current HEAD sha, or null (never throws) when git is
- * missing, `repoRoot` isn't a repo, or the command otherwise fails — a boot
- * gate reading this must fail closed to "nothing to compare", not crash.
- */
+/** HEAD sha, or null (never throws) on any git failure, so a boot gate fails closed to "nothing to compare". */
 export function readCheckoutHead(repoRoot: string): string | null {
   try {
     const out = execFileSync('git', ['rev-parse', 'HEAD'], {
@@ -64,19 +56,8 @@ export function readCheckoutHead(repoRoot: string): string | null {
 }
 
 /**
- * PURE (no I/O) so it's directly testable. Returns null when there's nothing
- * to report: either input is null, or the running build's sha matches HEAD.
- * Otherwise names both shas.
- *
- * Deliberately does NOT claim the two build halves are mismatched right now.
- * Build/checkout drift is the NORMAL state on this install (frequent pulls
- * without an immediate rebuild), and it is usually still LATENT:
- * `activateAgentRunnerSource()` (agent-runner-source.ts) only re-snapshots
- * `container/agent-runner/src` from the working tree at the NEXT restart, so
- * until then both halves stay consistent with each other, merely stale
- * relative to the checkout. The risk this names is what the NEXT restart
- * does: it re-snapshots agent-runner source but does not rebuild `dist/`, so
- * a restart taken while this is true is what actually splits the two halves.
+ * Null when either input is null or the shas match. Does not claim the halves are split now: agent-runner source is
+ * re-snapshotted only at the next restart, which does not rebuild `dist/`, so that restart is what splits them.
  */
 export function describeBuildDrift(
   info: BuildInfo | null,
@@ -97,27 +78,9 @@ export function describeBuildDrift(
 }
 
 /**
- * Whether a drift changes what the RUNNING host executes.
- *
- * Sha inequality alone is the normal state on this install: the checkout is
- * pulled through the day and a rebuild does not always follow, so alerting on
- * every mismatch would fire on nearly every boot. An alert that fires that
- * often gets muted, which is the failure this whole alerting path exists to
- * avoid — so the DM is gated on materiality while the WARN is not.
- *
- * Only `src/**` is compiled into `dist/` (tsconfig `include: ["src*"]`), so
- * nothing else can change the running host by rebuilding:
- *
- * - `docs/`, root markdown — never executed.
- * - `scripts/` — run from the checkout by systemd timers, so those changes are
- *   already live and a rebuild is irrelevant to them.
- * - `container/agent-runner/**` — a real concern, but a SEPARATE one: that half
- *   activates from the working tree at boot via `activateAgentRunnerSource()`,
- *   so it is never stale-because-unbuilt.
- * - test files under `src` — these ARE compiled into `dist/` (verified: the
- *   live checkout's dist holds 391 `*.test.js`), but nothing reachable from
- *   `dist/index.js` imports them, so they cannot change the running host's
- *   behaviour.
+ * Whether a drift changes what the RUNNING host executes; sha inequality alone is normal here, and a DM on every
+ * boot would get muted. docs and scripts/ (run from the checkout) never need a rebuild, and agent-runner source
+ * activates from the working tree at boot.
  */
 export function isMaterialDrift(changedPaths: string[]): boolean {
   return changedPaths.some(isMaterialPath);
@@ -127,18 +90,8 @@ export function isMaterialDrift(changedPaths: string[]): boolean {
 const TEST_FILE_RE = /\.test\.[cm]?[jt]sx?$/;
 
 /**
- * Whether ONE changed path can change what a rebuild would deploy.
- *
- * Exported so the alert body and the gate cannot drift apart: the call site
- * filters with this same predicate instead of restating the rule.
- *
- * The top-level build is `tsc && pnpm run build:spa`, so it produces two
- * runtime artifacts rather than one. The compiled host output covers the src
- * tree; the second is the dashboard SPA, built from its own Vite project and
- * served directly by `src/dashboard/static.ts`, so a dashboard-only change is
- * user-facing and would otherwise have read as harmless here. Dependency
- * manifests count for the same reason: they need the deploy install-and-build
- * flow before they are live.
+ * Whether ONE changed path can change what a rebuild deploys; shared by the gate and the alert body. The build
+ * emits the host (`src/`) and the dashboard SPA (`dashboard/`); dependency manifests need install-and-build too.
  */
 export function isMaterialPath(changedPath: string): boolean {
   if (changedPath === 'package.json' || changedPath === 'pnpm-lock.yaml') return true;
@@ -146,12 +99,7 @@ export function isMaterialPath(changedPath: string): boolean {
   return changedPath.startsWith('src/') || changedPath.startsWith('dashboard/');
 }
 
-/**
- * Paths changed between two commits, or **null when git cannot tell us** —
- * an unknown sha after a force-push, a shallow clone, git missing. Null is
- * not "nothing changed": the caller must treat it as material and alert,
- * because an unreadable diff is not evidence of safety.
- */
+/** Changed paths, or null when git cannot tell (unknown sha, shallow clone): the caller must treat that as material. */
 export function changedPathsBetween(repoRoot: string, fromSha: string, toSha: string): string[] | null {
   try {
     const out = execFileSync('git', ['diff', '--name-only', `${fromSha}..${toSha}`], {
@@ -166,13 +114,7 @@ export function changedPathsBetween(repoRoot: string, fromSha: string, toSha: st
   }
 }
 
-/**
- * Commit count between two shas (`git rev-list --count`), or null on the
- * same failures as {@link changedPathsBetween} — same never-throws contract.
- * Purely cosmetic: used to make the DM readable ("N commits of drift"), never
- * to decide materiality. A null here does not change what the alert does,
- * only what it says.
- */
+/** Commit count, or null on the same failures as changedPathsBetween; cosmetic only, never decides materiality. */
 export function commitCountBetween(repoRoot: string, fromSha: string, toSha: string): number | null {
   try {
     const out = execFileSync('git', ['rev-list', '--count', `${fromSha}..${toSha}`], {

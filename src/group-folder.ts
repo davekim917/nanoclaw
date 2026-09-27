@@ -24,17 +24,7 @@ export function assertValidGroupFolder(folder: string): void {
 
 function ensureWithinBase(baseDir: string, resolvedPath: string): void {
   const rel = path.relative(baseDir, resolvedPath);
-  // Exact-segment check, not a prefix test: `rel.startsWith('..')` would also
-  // reject a same-level entry whose name merely starts with the two
-  // characters "..", e.g. `baseDir/..legacy` (rel === '..legacy'). That is
-  // not an escape — it never leaves baseDir — so only `rel === '..'` or
-  // `rel` starting with `..` + the path separator (a real parent-then-descend)
-  // counts. This function is private to this module; both callers below are
-  // covered by the fix. resolveGroupFolderPath is unaffected in practice
-  // (assertValidGroupFolder's charset excludes '.' entirely, so it can never
-  // pass a name that would have hit the old bug), but groupFolderExistsOnDisk
-  // deliberately probes names the grammar refuses too, so a legacy directory
-  // like `..legacy` must read as present rather than throw.
+  // Exact segment, not a prefix test: `..legacy` never leaves baseDir, and groupFolderExistsOnDisk must see it.
   if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     throw new Error(`Path escapes base directory: ${resolvedPath}`);
   }
@@ -60,27 +50,18 @@ export function resolveGroupFolderPath(folder: string): string {
 export function groupFolderExistsOnDisk(folder: string): boolean {
   const groupPath = path.resolve(GROUPS_DIR, folder);
   ensureWithinBase(GROUPS_DIR, groupPath);
-  // A base-directory alias (`.`, `x/..`, `./`) resolves to GROUPS_DIR itself,
-  // which always exists — reporting it as occupied residue would tell the
-  // operator to move or remove every group's workspace.
+  // A base-directory alias (`.`, `x/..`) resolves to GROUPS_DIR itself, which is not residue.
   if (path.relative(GROUPS_DIR, groupPath) === '') {
     throw new Error(`Invalid group folder "${folder}": names the groups directory itself`);
   }
-  // lstat, not existsSync: existsSync follows symlinks, so a dangling
-  // symlink at groups/<folder> would read as absent even though it occupies
-  // the name (mkdir would fail on it with EEXIST). lstat probes the entry
-  // itself, so a dangling symlink still counts as present.
+  // lstat, not existsSync: existsSync follows symlinks, so a dangling symlink
+  // at groups/<folder> would read as absent even though it occupies the name
+  // (mkdir would fail on it). lstat probes the entry itself.
   try {
     fs.lstatSync(groupPath);
     return true;
   } catch (err) {
-    // ENOENT is a real "not there" answer. Anything else — EACCES, EIO, a
-    // broken GROUPS_DIR — means the probe itself failed, not that the name
-    // is free; reporting that as absent would let a caller allocate or
-    // adopt a name it never actually verified. ENOTDIR is deliberately NOT
-    // folded in here: it means a path component (potentially GROUPS_DIR
-    // itself) isn't a directory, which is an environment fault, not
-    // "folder absent" — fail closed on it too. Rethrow everything but ENOENT.
+    // Only ENOENT means absent; any other failure (ENOTDIR included) means the probe failed, so fail closed.
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }

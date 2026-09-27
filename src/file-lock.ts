@@ -1,40 +1,13 @@
 /**
- * Cross-process exclusive file locking, held by the kernel.
- *
- * Extracted from `withHostRepositoryLock` (repository-workspaces.ts), which was
- * the host's only cross-process mutual exclusion until `container.json` needed
- * one too. Two mechanisms for one job is how they drift, so there is one here
- * and both callers use it.
- *
- * WHY `flock(2)` AND NOT AN `O_EXCL` LOCK FILE. Node has no synchronous
- * `flock`, so an in-process lock file (`fs.openSync(p, 'wx')` plus a PID
- * staleness check, as `codex-sync-watcher.ts` does for its singleton guard)
- * is the tempting alternative and is wrong for data integrity:
- *
- *   - It LEAKS on `kill -9`. The kernel releases an flock when the holding fd
- *     closes, which includes every abnormal exit; an O_EXCL file survives, and
- *     the next writer is wedged until a person deletes it.
- *   - Its staleness check is unsound. "Is that PID alive" answers wrongly after
- *     PID recycling, and there is no way to tell a recycled PID from the
- *     original — so the repair for the leak above is itself a way to break the
- *     lock while a writer holds it.
- *
- * The cost is a `flock` child process per acquisition (~5ms). `flock` is
- * already a hard host prerequisite: `ncl`'s single-host ownership claim shells
- * out to it (`src/cli/socket-server.ts`, which fails setup with an install
- * hint when it is missing) and `container/build.sh` serializes rebuilds with
- * it. This adds no dependency.
+ * Cross-process exclusive file locking via `flock(2)`, never an O_EXCL lock file: the kernel releases an flock on
+ * any exit (including `kill -9`), while an O_EXCL file leaks, and its PID staleness check is unsound under PID
+ * recycling. Costs one `flock` child per acquisition; `flock` is already a host prerequisite.
  */
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-/**
- * Open `file` as a stable regular file, creating it if absent, and return the
- * fd. Refuses a symlink (`O_NOFOLLOW`) and anything that is not a regular file:
- * a lock whose path can be redirected is not a lock, and locking a FIFO blocks
- * forever rather than failing.
- */
+/** Refuses a symlink and non-regular files: a redirectable lock is no lock, and locking a FIFO blocks forever. */
 function openStableRegularFile(file: string): { fd: number; created: boolean } {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   let fd: number;
@@ -45,18 +18,8 @@ function openStableRegularFile(file: string): { fd: number; created: boolean } {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     created = false;
     try {
-      // READ-ONLY on the reopen. `flock(2)` needs an open fd, not write access,
-      // so this is the weakest open that works and it removes one way to be
-      // locked out of a lock another user created.
-      //
-      // HONEST LIMIT: it does not fix that case. The create mode is 0600
-      // (above), so a lock created by root is unreadable to a non-root service
-      // whatever open mode is used, and a root-created LOCK DIRECTORY (0700)
-      // fails the `wx+` create for every group that has no lock yet. All this
-      // branch buys is the message below instead of a bare EACCES. Nothing
-      // documented tells an operator to `sudo` a host script, so the cure —
-      // refusing to run as root, or relaxing the mode — is left until someone
-      // actually hits it.
+      // Read-only reopen: flock needs an fd, not write access. A lock created by another user (e.g. root) is still
+      // unreadable under mode 0600; this only turns that into the message below instead of a bare EACCES.
       fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     } catch (openError) {
       const code = (openError as NodeJS.ErrnoException).code;
@@ -85,11 +48,8 @@ function openStableRegularFile(file: string): { fd: number; created: boolean } {
 export function ensureLockFile(file: string): string {
   const { fd, created } = openStableRegularFile(file);
   try {
-    // Only on CREATE, and through the fd. A path-based `chmod` follows symlinks
-    // and runs after the O_NOFOLLOW fd is closed, so it is a window in which
-    // the path can be swapped for a symlink and this process talked into
-    // chmodding another file it owns. On a file we did not create it also has
-    // nothing to do but fail with EPERM against another user's lock.
+    // Only on create, and via the fd: a path-based chmod after the O_NOFOLLOW fd closes could be redirected by a
+    // swapped-in symlink.
     if (created) fs.fchmodSync(fd, 0o600);
   } finally {
     fs.closeSync(fd);
@@ -105,20 +65,9 @@ export interface FileLockOptions {
 }
 
 /**
- * Run `fn` holding an exclusive kernel lock on `lockFile`.
- *
- * The lock file is a SIDECAR, never the file being mutated. `flock` holds an
- * open file description, so any writer that ever replaces the data file by
- * rename would leave every holder locking an unlinked inode while the new one
- * goes unprotected — and locking the data file also means the lock's location
- * is dictated by the data's, which is wrong when the data lives somewhere a
- * container can reach (`containerConfigLockPath`, container-config.ts).
- *
- * The identity re-check after acquisition closes the same hole for the lock
- * file itself. Between `ensureLockFile` and the holder's own open, another
- * process can unlink and recreate the path; both would then "hold the lock" on
- * different inodes. Comparing dev/ino across the acquisition turns that into a
- * loud failure instead of two concurrent mutators.
+ * Run `fn` holding an exclusive kernel lock on `lockFile`, which must be a SIDECAR, never the mutated file: a writer
+ * that replaces the data file by rename would leave holders locking an unlinked inode. The dev/ino re-check after
+ * acquisition makes a lock file unlinked and recreated mid-acquire fail loudly instead of admitting two mutators.
  */
 export async function withFileLock<T>(
   lockFile: string,
@@ -129,16 +78,12 @@ export async function withFileLock<T>(
   const label = options.label ?? lockFile;
   ensureLockFile(lockFile);
   const before = fs.lstatSync(lockFile);
-  // `read _` parks the holder on stdin: the lock lives exactly as long as this
-  // child, and closing its stdin in the `finally` below is what releases it.
+  // `read _` parks the holder on stdin: closing stdin in the `finally` releases the lock.
   const holder = spawn('flock', ['-x', '-w', String(waitSec), lockFile, 'sh', '-c', 'printf ready; read _'], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-  // Every release path writes a newline to stdin. If the holder is already
-  // gone (killed by a signal, or `flock` missing), that write surfaces as an
-  // asynchronous EPIPE on the stream — with no listener it is an uncaught
-  // exception in the HOST process, not a failed lock. Swallow it: a dead
-  // holder has already released the lock, which is all the write was for.
+  // Writing to a dead holder's stdin raises an async EPIPE that would be uncaught in the host; the lock is already
+  // released.
   holder.stdin.on('error', () => {
     /* holder gone; lock already released */
   });
@@ -146,12 +91,8 @@ export async function withFileLock<T>(
   await new Promise<void>((resolve, reject) => {
     let output = '';
     let stderr = '';
-    // Give up on the holder COMPLETELY, not just on its parent. `flock` runs
-    // `sh -c 'printf ready; read _'` as a child that inherits the locked fd, so
-    // SIGTERM to the parent alone can leave that child parked on `read` holding
-    // the lock for the life of this process — the exact case where the lock WAS
-    // acquired inside the window but `ready` had not reached Node yet. Ending
-    // stdin is what lets the child exit and the kernel drop the lock.
+    // `flock`'s `sh` child inherits the locked fd, so killing the parent alone can leave it holding the lock (acquired
+    // but `ready` not yet read); ending stdin lets it exit.
     const abandonHolder = (): void => {
       try {
         holder.stdin.end('\n');
@@ -201,9 +142,7 @@ export async function withFileLock<T>(
   } finally {
     holder.stdin.end('\n');
     await new Promise<void>((resolve) => {
-      // A holder killed by a signal has already closed with `exitCode === null`
-      // and `signalCode` set; waiting for a second 'close' would never settle,
-      // and on the spawn path that is a hung `ensureRuntimeFields`.
+      // A signal-killed holder already closed; waiting for another 'close' would hang forever.
       if (holder.exitCode !== null || holder.signalCode !== null) return resolve();
       holder.once('close', () => resolve());
     });

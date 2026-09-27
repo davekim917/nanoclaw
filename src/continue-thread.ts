@@ -1,16 +1,7 @@
 /**
- * `continue_thread` on send_message/send_file (`content.continueThread`,
- * container/agent-runner/src/mcp-tools/core.ts): the first post under a
- * `thread_key` adopts an EXISTING thread in the same destination instead of
- * opening a new one, and the key's anchor records that thread, so every later
- * post under the key lands there too.
- *
- * The outbound row is container-written and never trusted (the same reason the
- * host re-checks `threadKey`, src/db/thread-key-anchors.ts). So the value
- * is only a pointer: it is resolved against the destination's own address, and
- * adopted only when the host has already seen that thread on that messaging
- * group — a session bound to it, or an archived message in it. Anything else
- * resolves to null and the caller posts exactly as it would without the arg.
+ * `continue_thread` on send_message/send_file: the first post under a `thread_key` adopts an EXISTING thread in the
+ * destination. The container-written value is only a pointer: adopted only when the host already saw that thread on
+ * that messaging group; anything else resolves to null and the post proceeds as without the arg.
  */
 import { getDb } from './db/connection.js';
 import { log } from './log.js';
@@ -43,11 +34,8 @@ function adopt(platformId: string, segment: string | undefined): AdoptedThread |
 }
 
 /**
- * Map the agent's value onto a thread of `platformId`, or null when it names
- * something else. Accepts the encoded id `search_threads` prints
- * (`<platform_id>:<thread>`), a bare thread id, a Discord channel/thread link,
- * or a Slack message permalink. Shape only — `resolveContinueThread` decides
- * whether the thread is real.
+ * Shape only (resolveContinueThread decides reality): an encoded `<platform_id>:<thread>`, a bare thread id, a
+ * Discord channel/thread link or a Slack permalink; null when it names something other than `platformId`.
  */
 export function continueThreadCandidate(raw: unknown, platformId: string): AdoptedThread | null {
   if (typeof raw !== 'string') return null;
@@ -57,9 +45,8 @@ export function continueThreadCandidate(raw: unknown, platformId: string): Adopt
   const discord = DISCORD_URL.exec(value);
   if (discord) {
     const [, guild, first, second] = discord;
-    // A thread is its own Discord channel, so /<guild>/<thread>[/<message>] names
-    // it first. /<guild>/<this channel>/<message> is a message in the parent,
-    // whose thread (if it started one) shares the message's id.
+    // /<guild>/<thread>[/<message>] names a thread; /<guild>/<parent>/<message> names a message whose thread shares
+    // its id.
     if (platformId === `discord:${guild}:${first}`) return adopt(platformId, second);
     if (!platformId.startsWith(`discord:${guild}:`)) return null;
     return adopt(platformId, first);
@@ -79,12 +66,8 @@ export function continueThreadCandidate(raw: unknown, platformId: string): Adopt
 }
 
 /**
- * The thread to adopt, or null (logged: the caller then opens a new thread,
- * which is what the agent's post did before this argument existed). Evidence is the host's own record of the
- * thread on THIS messaging group: a session bound to (messaging group, thread)
- * — `idx_sessions_lookup` — or an archived message on the same channel
- * (channel_type + platform_id) in that thread. The archive covers threads the
- * agent was present in but never engaged, whose messages it still keeps.
+ * The thread to adopt, or null (logged). Evidence: a session bound to (messaging group, thread), or an archived
+ * message on the same channel in that thread (threads the agent saw but never engaged).
  */
 export async function resolveContinueThread(
   raw: unknown,
@@ -113,7 +96,7 @@ async function confirmedThread(raw: unknown, dest: ContinueThreadDestination): P
   try {
     return archiveHasThread(dest.channelType, dest.platformId, candidate.threadId) ? candidate : null;
   } catch {
-    // An unreadable archive is no evidence; the post opens a new thread as before.
+    // An unreadable archive is no evidence.
     return null;
   }
 }
