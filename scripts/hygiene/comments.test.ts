@@ -10,7 +10,7 @@ import { commentFindings, sourceFiles } from './run.js';
 enforceHermeticity();
 
 const rules = (source: string, fileName = 'fixture.ts') =>
-  scanComments(fileName, source).map((finding) => [finding.line, finding.rule]);
+  scanComments(fileName, source).findings.map((finding) => [finding.line, finding.rule]);
 
 describe('comment scan flags', () => {
   it.each([
@@ -59,6 +59,25 @@ describe('comment scan flags', () => {
     expect(rules(source).map(([, found]) => found)).toContain(rule);
   });
 
+  it('scans a directive description like any comment', () => {
+    expect(rules('// eslint-disable-next-line no-console -- see #123\nconsole.log(1);\n')).toEqual([[1, 'pr-history']]);
+    expect(rules('// prettier-ignoreSomething: moved from core.ts:12 in #123\nconst a = 1;\n')).toEqual([
+      [1, 'file-line-citation'],
+      [1, 'pr-history'],
+    ]);
+  });
+
+  it('splits a comment on CR, CRLF and Unicode line separators', () => {
+    expect(rules('/* one\r * fixed in #123\r */\rconsole.log(1);\n')).toEqual([[2, 'pr-history']]);
+    expect(rules('/* one\u2028 * fixed in #123\u2029 */\nconsole.log(1);\n')).toEqual([[2, 'pr-history']]);
+  });
+
+  it('scans a multi-line block that starts with a directive', () => {
+    expect(rules('/* eslint-disable no-console\n * fixed in #123\n */\nconsole.log(1);\n')).toEqual([
+      [2, 'pr-history'],
+    ]);
+  });
+
   it('reports every offending line of a multi-line comment at its own line', () => {
     const source = 'export const a = 1;\n/**\n * See x.ts:1.\n * Fixed in #12.\n */\nexport const b = 2;\n';
     expect(rules(source)).toEqual([
@@ -74,13 +93,7 @@ describe('comment scan flags', () => {
 
 describe('comment scan passes', () => {
   it.each([
-    [
-      'a lint directive that cites evidence',
-      '// eslint-disable-next-line no-console -- see core.ts:12 and #5\nconsole.log(1);\n',
-    ],
-    ['a type directive', '// @ts-expect-error -- upstream types lag, #44\nconst a: number = "x";\n'],
     ['a formatter directive', '// prettier-ignore\nconst m = [1,0, 0,1];\n'],
-    ['a coverage directive', '/* c8 ignore next -- see a.ts:1 */\nconst a = 1;\n'],
     ['a shebang line', '#!/usr/bin/env -S tsx --conditions=a.ts:1 #1234\nexport const a = 1;\n'],
     ['citations inside strings', 'const s = \'see src/router.ts:42 and #1144\';\nconst d = "// b.ts:2";\n'],
     ['citations inside template text', 'const t = `see src/router.ts:42 ${a} and // c.ts:3 #9`;\n'],
@@ -126,5 +139,51 @@ describe('scanned files', () => {
       'pr-history scripts/tool.mjs:1',
       'file-line-citation src/a.ts:1',
     ]);
+  });
+});
+
+describe('comment-only line count', () => {
+  const count = (source: string, fileName = 'fixture.ts') => scanComments(fileName, source).commentOnlyLines;
+
+  it('counts every line of a multi-line JSDoc, blank ones included', () => {
+    expect(count('/**\n * One.\n *\n * Two.\n */\nexport const a = 1;\n')).toBe(5);
+  });
+
+  it('counts line and block comments on their own lines, not ones sharing a line with code', () => {
+    expect(count('// a\nconst a = 1; // b\n/* c */ const b = 2;\nconst c = 3; /* d\n e */\n')).toBe(2);
+  });
+
+  it('does not count comment markers inside a template literal, a string or a regex', () => {
+    const source = [
+      'const t = `first',
+      '// not a comment',
+      '/* nor this */',
+      '${a}',
+      '// nor this',
+      '`;',
+      "const s = '// no';",
+      'const r = /\\/\\/ no/;',
+      '',
+    ].join('\n');
+    expect(count(source)).toBe(0);
+  });
+
+  it('counts a tooling directive like any comment', () => {
+    const source =
+      '/// <reference types="node" />\n// @ts-check\n// eslint-disable-next-line no-console\n/* c8 ignore next */\n// @ts-expect-error -- lagging types\nconsole.log(1);\n';
+    expect(count(source)).toBe(5);
+    expect(count('// prettier-ignoreSomething: moved from core.ts:12 in #123\nconst a = 1;\n')).toBe(1);
+  });
+
+  it('counts each line of a CR-separated block', () => {
+    expect(count('/* one\r * two\r */\rconsole.log(1);\n')).toBe(3);
+  });
+
+  it('counts every line of a multi-line block that starts with a directive', () => {
+    expect(count('/* eslint-disable no-console\n * narration about the code\n */\nconsole.log(1);\n')).toBe(3);
+  });
+
+  it('counts nothing for a shebang', () => {
+    expect(count('#!/usr/bin/env node\nexport const a = 1;\n', 'tool.mjs')).toBe(0);
   });
 });

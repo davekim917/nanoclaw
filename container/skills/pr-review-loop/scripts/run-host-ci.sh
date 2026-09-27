@@ -173,6 +173,9 @@ git -C "$src" fetch -q --no-tags "https://github.com/$repo.git" "$head"
 git -C "$src" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
 got=$(git -C "$src" rev-parse HEAD)
 [ "$got" = "$head" ] || { echo "run-host-ci: fetched $got, not $head" >&2; exit 1; }
+# After the checkout, since a fetch overwrites FETCH_HEAD. The base as origin/<base>, as ci.yml's
+# checkout has it: the hygiene run measures comment growth from its merge base.
+git -C "$src" fetch -q --no-tags "https://github.com/$repo.git" "+$base_sha:refs/remotes/origin/$base_ref"
 if [ -n "$overlay" ]; then
   cp -R "$overlay/." "$src/"
   echo "run-host-ci: --dry-run with $overlay copied over the head (uncommitted)" >&2

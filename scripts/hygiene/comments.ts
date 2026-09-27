@@ -2,15 +2,14 @@ import ts from 'typescript';
 
 type CommentRule = 'inline-suppression' | 'file-line-citation' | 'pr-history';
 
-export interface CommentFinding {
+interface CommentFinding {
   rule: CommentRule;
   line: number;
   excerpt: string;
 }
 
-// Checked before the directive exemption: knip honours these tags even inside an eslint-disable comment.
 const SUPPRESSION = /jscpd:ignore-|@(?:public|internal|beta|alias|lintignore)(?![A-Za-z0-9_])/;
-const DIRECTIVE = /^(?:eslint-disable|eslint-enable|@ts-expect-error|@ts-ignore|@ts-nocheck|prettier-ignore|c8 ignore)/;
+const LINE_BREAK = /\r\n|[\r\n\u2028\u2029]/;
 const PR_HISTORY = /(?<!&)#\d+\b|\bPR\s?\d+\b/;
 
 // `<name>:<digits>`, excluding a version such as `image:1.3.14`.
@@ -39,9 +38,11 @@ function isJSDocNode(node: ts.Node): boolean {
  * literal is never mistaken for one. JSDoc is skipped as a subtree and read once, as the leading
  * trivia of the token it documents.
  */
-function commentRanges(sourceFile: ts.SourceFile): ts.CommentRange[] {
+function commentRangesAndCodeLines(sourceFile: ts.SourceFile): { ranges: ts.CommentRange[]; codeLines: Set<number> } {
   const text = sourceFile.text;
   const byStart = new Map<number, ts.CommentRange>();
+  const codeLines = new Set<number>();
+  const lineOf = (position: number) => sourceFile.getLineAndCharacterOfPosition(position).line;
   const add = (ranges: ts.CommentRange[] | undefined) => {
     for (const range of ranges ?? []) byStart.set(range.pos, range);
   };
@@ -51,29 +52,40 @@ function commentRanges(sourceFile: ts.SourceFile): ts.CommentRange[] {
     if (children.length === 0) {
       add(ts.getLeadingCommentRanges(text, node.getFullStart()));
       add(ts.getTrailingCommentRanges(text, node.getEnd()));
+      const start = node.getStart(sourceFile);
+      if (node.kind !== ts.SyntaxKind.EndOfFileToken && node.getEnd() > start) {
+        for (let line = lineOf(start); line <= lineOf(node.getEnd() - 1); line++) codeLines.add(line);
+      }
       return;
     }
     for (const child of children) visit(child);
   };
   visit(sourceFile);
-  return [...byStart.values()].sort((a, b) => a.pos - b.pos);
+  return { ranges: [...byStart.values()].sort((a, b) => a.pos - b.pos), codeLines };
 }
 
-export function scanComments(fileName: string, text: string): CommentFinding[] {
+export interface CommentScan {
+  findings: CommentFinding[];
+  commentOnlyLines: number;
+}
+
+export function scanComments(fileName: string, text: string): CommentScan {
   const sourceFile = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false);
+  const { ranges, codeLines } = commentRangesAndCodeLines(sourceFile);
   const findings: CommentFinding[] = [];
-  for (const range of commentRanges(sourceFile)) {
+  const commentLines = new Set<number>();
+  for (const range of ranges) {
     const comment = text.slice(range.pos, range.end);
-    const isDirective = DIRECTIVE.test(comment.replace(/^\/[/*]+\s*/, ''));
     const firstLine = sourceFile.getLineAndCharacterOfPosition(range.pos).line + 1;
-    comment.split('\n').forEach((lineText, offset) => {
+    comment.split(LINE_BREAK).forEach((lineText, offset) => {
+      commentLines.add(firstLine - 1 + offset);
       const report = (rule: CommentRule) =>
         findings.push({ rule, line: firstLine + offset, excerpt: lineText.trim().slice(0, 160) });
       if (SUPPRESSION.test(lineText)) report('inline-suppression');
-      if (isDirective) return;
       if (citesFileLine(lineText)) report('file-line-citation');
       if (PR_HISTORY.test(lineText)) report('pr-history');
     });
   }
-  return findings;
+  const commentOnlyLines = [...commentLines].filter((line) => !codeLines.has(line)).length;
+  return { findings, commentOnlyLines };
 }

@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -7,10 +8,20 @@ import { allowSubprocess, enforceHermeticity } from '../../src/test-hermeticity.
 import { scaledTimeout } from '../../src/test-timeout-scale.js';
 import { createHash } from 'node:crypto';
 
-import { commentFindings, exemptFiles, hygieneFindings, jscpdFindings, knipFindings, sourceFiles } from './run.js';
+import {
+  commentFindings,
+  commentGrowth,
+  commentGrowthFindings,
+  exemptFiles,
+  growthBase,
+  hygieneFindings,
+  jscpdFindings,
+  knipFindings,
+  sourceFiles,
+} from './run.js';
 
 enforceHermeticity();
-allowSubprocess(['knip', 'jscpd']);
+allowSubprocess(['knip', 'jscpd', 'git']);
 
 const TOOL_TIMEOUT = scaledTimeout(30_000);
 
@@ -270,4 +281,145 @@ describe('exempt files', () => {
     },
     TOOL_TIMEOUT * 2,
   );
+});
+
+describe('comment growth', () => {
+  const NO_EXEMPT = { upstream: new Set<string>(), vendored: new Set<string>() };
+
+  function git(root: string, ...args: string[]): string {
+    const result = spawnSync(
+      'git',
+      ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.com', '-c', 'commit.gpgsign=false', ...args],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+      },
+    );
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.error?.message ?? result.stderr}`);
+    return result.stdout.trim();
+  }
+
+  function write(root: string, files: Record<string, string | null>): void {
+    for (const [file, text] of Object.entries(files)) {
+      if (text === null) {
+        fs.rmSync(path.join(root, file));
+        continue;
+      }
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    }
+  }
+
+  /** A repository whose origin/main is `main`, with HEAD on a branch that commits `change` on top. */
+  function repo(main: Record<string, string>, change: Record<string, string | null>): string {
+    const root = project('growth', {});
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q', '-b', 'work');
+    write(root, main);
+    git(root, 'add', '-A');
+    git(root, 'commit', '-q', '--allow-empty', '-m', 'main');
+    git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    write(root, change);
+    git(root, 'add', '-A');
+    git(root, 'commit', '-q', '--allow-empty', '-m', 'change');
+    return root;
+  }
+
+  const verdict = (root: string, exempt = NO_EXEMPT) => {
+    const growth = commentGrowth(root, growthBase(root), exempt);
+    return {
+      net: growth.files.reduce((sum, file) => sum + file.head - file.base, 0),
+      files: growth.files.map((file) => file.file),
+      findings: summary(commentGrowthFindings(growth)),
+    };
+  };
+
+  const code = 'export const a = 1;\n';
+
+  it('fails a change that adds comment-only lines to a changed file', () => {
+    const root = repo({ 'src/a.ts': code }, { 'src/a.ts': `// one\n/**\n * two\n */\n${code}` });
+    const result = verdict(root);
+    expect(result.net).toBe(4);
+    expect(result.findings).toEqual([
+      expect.stringMatching(
+        /^net-growth since [0-9a-f]{12} \+4 comment-only line\(s\) on net in the changed files; delete narration in the files you touched, or keep only comments that name a hazard$/,
+      ),
+    ]);
+  });
+
+  it('passes a change that adds and removes the same number of comment lines across files', () => {
+    const root = repo(
+      { 'src/a.ts': code, 'setup/b.ts': `// old\n${code}` },
+      { 'src/a.ts': `// new\n${code}`, 'setup/b.ts': code },
+    );
+    expect(verdict(root)).toEqual({ net: 0, files: ['setup/b.ts', 'src/a.ts'], findings: [] });
+  });
+
+  it('passes a change that deletes comments, counting a deleted file negative', () => {
+    const root = repo(
+      { 'src/a.ts': `// a\n// b\n${code}`, 'scripts/gone.ts': `// c\n${code}` },
+      { 'src/a.ts': code, 'scripts/gone.ts': null },
+    );
+    expect(verdict(root)).toEqual({ net: -3, files: ['scripts/gone.ts', 'src/a.ts'], findings: [] });
+  });
+
+  it('counts a new file in full', () => {
+    const root = repo({ 'src/a.ts': code }, { 'container/agent-runner/src/new.ts': `// fresh\n${code}` });
+    expect(verdict(root).net).toBe(1);
+    expect(verdict(root).findings).toHaveLength(1);
+  });
+
+  it('counts changed source outside the scanned roots', () => {
+    const root = repo({ 'dashboard/src/main.tsx': code }, { 'dashboard/src/main.tsx': `// new\n${code}` });
+    expect(verdict(root)).toMatchObject({ net: 1, files: ['dashboard/src/main.tsx'] });
+  });
+
+  it('counts a changed .jsx file', () => {
+    const root = repo({ 'dashboard/src/view.jsx': code }, { 'dashboard/src/view.jsx': `// new\n${code}` });
+    expect(verdict(root)).toMatchObject({ net: 1, files: ['dashboard/src/view.jsx'] });
+  });
+
+  it('ignores test files, fixtures, non-source files and exempt files', () => {
+    const root = repo(
+      { 'src/a.ts': code, 'src/upstream.ts': code },
+      {
+        'src/a.test.ts': `// test\n${code}`,
+        'scripts/__fixtures__/f.ts': `// fixture\n${code}`,
+        'dashboard/src/view.test.tsx': `// test\n${code}`,
+        'docs/notes.md': `// doc\n`,
+        'src/upstream.ts': `// upstream\n${code}`,
+        'src/vendored.ts': `// vendored\n${code}`,
+      },
+    );
+    const exempt = { upstream: new Set(['src/upstream.ts']), vendored: new Set(['src/vendored.ts']) };
+    expect(verdict(root, exempt)).toEqual({ net: 0, files: [], findings: [] });
+  });
+
+  it('does not count comment markers inside a template literal', () => {
+    const root = repo(
+      { 'src/a.ts': code },
+      { 'src/a.ts': `${code}export const t = \`\n// not a comment\n/* nor this */\n\`;\n` },
+    );
+    expect(verdict(root)).toEqual({ net: 0, files: ['src/a.ts'], findings: [] });
+  });
+
+  it('counts uncommitted and untracked source as changed', () => {
+    const root = repo({ 'src/a.ts': code }, {});
+    write(root, { 'src/a.ts': `// edited\n${code}`, 'src/untracked.ts': `// new\n${code}` });
+    expect(verdict(root)).toMatchObject({ net: 2, files: ['src/a.ts', 'src/untracked.ts'] });
+  });
+
+  it('passes on origin/main itself, where the base is HEAD', () => {
+    const root = repo({ 'src/a.ts': `// a\n${code}` }, {});
+    git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    expect(growthBase(root)).toBe(git(root, 'rev-parse', 'HEAD'));
+    expect(verdict(root)).toEqual({ net: 0, files: [], findings: [] });
+  });
+
+  it('fails closed when origin/main cannot be resolved', () => {
+    const root = repo({ 'src/a.ts': code }, {});
+    git(root, 'update-ref', '-d', 'refs/remotes/origin/main');
+    expect(() => growthBase(root)).toThrow(/^hygiene: cannot find the merge base of HEAD and origin\/main/);
+  });
 });
