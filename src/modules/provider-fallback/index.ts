@@ -1,13 +1,6 @@
 /**
- * Provider-fallback module — `provider_unavailable` delivery action.
- *
- * A container is the only thing that talks to its provider, so it is the only
- * thing that can observe "this account is spent until Tuesday". It reports
- * that here; the host records the window (`provider_health`) and respawns the
- * session, which then picks the group's declared fallback at spawn time.
- *
- * The user-visible effect is a slow reply instead of an error, and recovery
- * is automatic: the window ages out and the next spawn returns to the primary.
+ * Only the container can observe "this account is spent until Tuesday"; the
+ * host records the window and respawns the session onto the declared fallback.
  */
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
@@ -19,11 +12,7 @@ const PROVIDER_UNAVAILABLE_ACTION = unguarded(
 );
 registerDeliveryAction('provider_unavailable', handleProviderUnavailable, PROVIDER_UNAVAILABLE_ACTION);
 
-/**
- * The way back. Strictly weaker than the action above — it clears a window it
- * cannot set, for the calling session's own group only — so it carries the
- * same unguarded justification.
- */
+/** Strictly weaker than the action above (clears a window, own group only), hence also unguarded. */
 const PROVIDER_RETRY_PRIMARY_ACTION = unguarded(
   'asks for the calling session own group primary provider to be tried again; the handler only clears that group availability window and respawns that session',
 );

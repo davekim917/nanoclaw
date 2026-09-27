@@ -1,17 +1,7 @@
 /**
- * Owner-escalation module — the unmutable "was this actually you?" lane.
- *
- * The container agent's `escalate_to_owner` MCP tool writes a kind='system'
- * outbound row with action 'escalate_to_owner'. That row is NOT kind='chat',
- * so the runner's physical chat budget (muteChat / chatLimit) never touches
- * it by construction: a muted watcher or capped standup task can still ask a
- * human to confirm a suspicious instruction, without re-opening a general
- * chat bypass.
- *
- * Delivery reuses the approvals primitive: the question lands as an approval
- * card in the first reachable owner/admin DM (pickApprover chain). Approve
- * relays "confirmed — proceed"; plain reject relays a decline to the agent
- * via the shared finalizeReject path.
+ * Owner escalation. The row is kind='system', not 'chat', so the runner's chat
+ * budget never mutes it: a muted or capped agent can still ask a human to
+ * confirm a suspicious instruction, without opening a general chat bypass.
  */
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { registerDeliveryAction, type DeliveryActionResult } from '../../delivery.js';
@@ -22,11 +12,8 @@ import { registerApprovalHandler, requestApproval } from '../approvals/index.js'
 import { pickOwnersFirst } from '../approvals/primitive.js';
 
 /**
- * OWNERS-FIRST candidate order — the reverse of pickApprover. An escalation's
- * question is addressed to the owner personally ("was this actually you?");
- * routing it to a group admin sends the question to someone who cannot
- * answer it (observed live: the card landed in a teammate's DM while the
- * owner saw nothing). Admins remain as reachability fallback only.
+ * OWNERS first (the reverse of pickApprover): the question is for the owner
+ * personally; admins are only a reachability fallback.
  */
 function escalationApprovers(agentGroupId: string): Promise<string[]> {
   return pickOwnersFirst(agentGroupId);
@@ -35,8 +22,7 @@ function escalationApprovers(agentGroupId: string): Promise<string[]> {
 const MAX_QUESTION_CHARS = 1500;
 const ALLOWED_KEYS = new Set(['action', 'question']);
 
-// Abuse valve: an agent that spams escalations is pinging a human directly,
-// which is self-limiting socially — but cap it mechanically too.
+// Abuse valve: an agent that spams escalations pings a human directly.
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 3;
 const recentBySession = new Map<string, number[]>();
@@ -54,8 +40,7 @@ async function applyOwnerEscalation(content: Record<string, unknown>, session: S
   }
 
   const now = Date.now();
-  // Prune the whole map, not just this session's entry — long-lived hosts
-  // otherwise accumulate one array per session that ever escalated.
+  // Prune the whole map, not just this session's entry, or it grows forever.
   for (const [key, stamps] of recentBySession) {
     const live = stamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
     if (live.length === 0) recentBySession.delete(key);

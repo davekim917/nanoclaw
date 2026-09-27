@@ -22,7 +22,7 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
     return;
   }
 
-  // Auth: ONLY parent_session_id match — no isOwner OR-clause (cycle-1 M2 / C17)
+  // Auth: ONLY the parent session; no owner override.
   if (callerSession.id !== task.parent_session_id) {
     log.warn('applySpawnCancel: auth failed — not the parent session', {
       taskId,
@@ -44,7 +44,6 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
       return;
     }
 
-    // Dashboard SSE emit (post-build drift fix B5)
     void import('../../dashboard/api/events.js')
       .then((mod) =>
         mod.emitDashboardEvent('task_event', {
@@ -58,7 +57,6 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
       });
 
     if (task.status === 'running' && task.child_session_id) {
-      // Write _spawn_cancel envelope to child's inbound (cycle-3 S26)
       const childSession = await getSession(task.child_session_id);
       if (childSession) {
         try {
@@ -73,7 +71,6 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
         }
       }
 
-      // Arm 2-minute hard kill timer
       const childSessionId = task.child_session_id;
       setTimeout(() => {
         log.info('applySpawnCancel: 2-min grace expired, killing child container', { taskId, childSessionId });
@@ -81,7 +78,6 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
       }, 120_000);
     }
 
-    // Notify parent of successful cancellation
     const parentSession = await getSession(task.parent_session_id);
     if (parentSession) {
       try {

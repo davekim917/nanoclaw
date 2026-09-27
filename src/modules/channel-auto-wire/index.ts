@@ -1,65 +1,20 @@
 /**
- * Channel auto-wire module (fork addition).
- *
- * Opt-in default-agent wiring for freshly-appearing messaging groups.
- * Registered against `setUnwiredChannelResolver` in `src/router.ts`, so
- * it runs only when a new messaging group has no `messaging_group_agents`
- * rows. Zero effect on already-wired channels.
- *
- * Use case. Upstream's model is "invite the bot, then run
- * `/manage-channels` to wire it." For our Slack (Example Labs workspace),
- * the wiring decision is always the same — point the new channel at
- * `example-labs-v2` with `per-thread` isolation — so the manual step is
- * pure friction. This module lets Operator declare the rule once in `.env`
- * and have new invites route immediately, no repeat-invocation of the
- * skill.
- *
- * Config (optional, per channel_type). Keys are the channel_type
- * uppercased with dashes replaced by underscores:
+ * Opt-in default-agent wiring for a new messaging group with no wiring rows,
+ * registered via `setUnwiredChannelResolver`. Per channel_type (uppercased,
+ * dashes → underscores):
  *
  *   NANOCLAW_DEFAULT_AGENT_GROUP_<CHANNEL_TYPE>     agent_groups.folder
  *   NANOCLAW_DEFAULT_SESSION_MODE_<CHANNEL_TYPE>    per-thread | shared |
  *                                                   agent-shared (default: per-thread)
  *   NANOCLAW_DEFAULT_SENDER_POLICY_<CHANNEL_TYPE>   strict | request_approval |
  *                                                   decline_notify | public
- *                                                   (default: strict — the
- *                                                   safe v2 upstream default)
+ *                                                   (default: strict)
  *   NANOCLAW_DEFAULT_IGNORED_POLICY_<CHANNEL_TYPE>  accumulate | drop
  *                                                   (default: accumulate)
  *
- * Why sender policy is part of auto-wire. Router creates new messaging
- * groups with `unknown_sender_policy='strict'`, which is the right safe
- * default when wiring is manual (you explicitly grant access per user).
- * For channel-types where the platform's own membership is the gate —
- * Slack workspace membership for the Example Labs bot — v1 behavior is
- * effectively `public` (anyone in the workspace can invoke). Setting
- * this env matches that behavior per channel_type without widening it
- * for channel_types where you do want strict.
- *
- * Example:
- *   NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_EXAMPLE_LABS=example-labs-v2
- *   NANOCLAW_DEFAULT_SESSION_MODE_SLACK_EXAMPLE_LABS=per-thread
- *   NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_EXAMPLE_LABS=public
- *   NANOCLAW_DEFAULT_IGNORED_POLICY_SLACK_EXAMPLE_LABS=accumulate
- *
- * Architectural default policy. getMessagingGroupAgents() COALESCEs NULL
- * ignored_message_policy values to 'accumulate' for legacy/manual rows, but
- * auto-wire still writes the resolved value explicitly. That keeps DB
- * inspection, exports, audit queries, and future raw-column filters honest
- * while the COALESCE remains belt-and-suspenders for rows not created here.
- *
- * When a Slack message arrives from a channel in the Example Labs workspace
- * that's not yet wired, this module creates a `messaging_group_agents`
- * row pointing at the `example-labs-v2` agent group and the message routes
- * through the normal path in the same tick — no dropped first message.
- *
- * Unset env var for a channel_type ⇒ no auto-wire ⇒ upstream drop behavior.
- * Unknown folder in env var ⇒ logs a warning, no auto-wire, drop proceeds.
- *
- * Upstream drift. One additive hook in `src/router.ts` (next to
- * `setSenderResolver` / `setAccessGate`) plus this self-registering
- * module. The hook's default is null, so trunk behavior without the
- * module matches upstream exactly. Candidate for upstreaming later.
+ * The sender policy widens access for every new channel of that type; use
+ * `public` only where platform membership is itself the gate. Unset or unknown
+ * folder ⇒ no auto-wire (upstream drop behavior).
  */
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { createMessagingGroupAgent, updateMessagingGroup, getMessagingGroupAgents } from '../../db/messaging-groups.js';
@@ -148,22 +103,16 @@ export const resolver: UnwiredChannelResolverFn = async (event, mg) => {
     return [];
   }
 
-  // v2 engage model: DMs use pattern='.' (always respond); group chats use
-  // mention mode. Never infer this from threadId: Slack/Discord DMs can have
-  // subthreads, while non-threaded group platforms always have null thread ids.
+  // Never infer DM-ness from threadId: DMs can have subthreads, and
+  // non-threaded group platforms always have null thread ids.
   const isGroup = event.message.isGroup ?? mg.is_group === 1;
   const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention' : 'pattern';
   const engagePattern = engageMode === 'pattern' ? '.' : null;
 
   const sessionMode = resolveDefaultSessionMode(event.channelType);
 
-  // Relax the unknown_sender_policy if one is configured for this
-  // channel_type. Router created the mg with `strict` (v2's safe default);
-  // for channel_types where the platform's own membership is the gate
-  // (e.g. Slack workspace), `public` restores v1 parity. We mutate `mg`
-  // in-place because the router holds a reference to this same object
-  // and passes it to the access gate immediately after us — the DB
-  // update is what persists the change for subsequent messages.
+  // Mutate `mg` in place: the router passes this same object to the access
+  // gate right after us; the DB update persists it for later messages.
   const senderPolicy = resolveDefaultSenderPolicy(event.channelType);
   if (senderPolicy && senderPolicy !== mg.unknown_sender_policy) {
     await updateMessagingGroup(mg.id, { unknown_sender_policy: senderPolicy });
@@ -193,11 +142,8 @@ export const resolver: UnwiredChannelResolverFn = async (event, mg) => {
     created_at: new Date().toISOString(),
   };
 
-  // The lookups above yield (async driver), so two initial messages for one
-  // unwired channel can both reach this insert; the loser adopts the wiring
-  // the winner created (seam 3 primitive) instead of reporting the channel
-  // as unwired. Anything but a unique-key loss still drops this message, as
-  // before.
+  // Two initial messages for one unwired channel can both reach this insert;
+  // the loser adopts the winner's wiring.
   try {
     const { row, created } = await insertOrAdopt(
       mga,

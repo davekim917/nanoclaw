@@ -96,12 +96,10 @@ export interface TransferRepositoryWorktreeInput {
   destination: RepositoryWorkUnit;
   loadSourceSessions: () => Promise<RepositorySourceSessionState[]> | RepositorySourceSessionState[];
   /**
-   * Asked under the lifecycle claims and BEFORE any quiescence, only when the
-   * source tombstone already records a finished move to this destination.
-   * Resolving true answers that move as it stands: nothing is drained or
-   * stopped and no hook below runs. Resolving false takes the ordinary path,
-   * whose recovery branch re-adopts and releases barriers a crashed attempt
-   * left behind.
+   * Asked under the lifecycle claims, BEFORE any quiescence, only when the
+   * source tombstone records a finished move here. True answers it as it
+   * stands (nothing drained, no hook runs); false takes the ordinary path,
+   * whose recovery re-adopts barriers a crashed attempt left.
    */
   answerCompletedMoveWithoutQuiescence?: () => Promise<boolean> | boolean;
   beforeSourceActivityCheckWhileClaimed?: () => Promise<void> | void;
@@ -178,18 +176,14 @@ function assertNormalClone(repoPath: string, label: string): void {
   const gitDir = path.join(repoPath, '.git');
   const gitStat = fs.lstatSync(gitDir);
   if (gitStat.isSymbolicLink() || !gitStat.isDirectory()) throw new Error(`${label} must be a normal clone`);
-  // Git follows a `commondir` to another repository's refs, objects and config.
-  // A normal clone's .git holds none, or the self-referential sentinel
-  // a canonical carries (canonical-git-commondir.ts), which spawn mounts
-  // read-only over its own path. Anything else is
-  // refused before any git command here, which would follow it.
+  // Git follows a `commondir` to another repository; only none or the
+  // canonical's self-referential sentinel is allowed, refused before any git
+  // command here would follow it.
   if (readCanonicalCommondir(gitDir) === 'foreign') {
     throw new Error(`${label} must be a normal clone, and its .git holds a commondir file that is not the sentinel`);
   }
-  // Then Git's own answer. The canonical .git is mounted read-write into
-  // containers, so the file check alone is
-  // check-then-use: this catches a
-  // commondir that appeared after it, up to this call's own read.
+  // Then Git's own answer: the canonical .git is mounted read-write into
+  // containers, so the file check alone is check-then-use.
   if (!gitCommonDirIs(gitDir, gitDir)) {
     throw new Error(
       `${label} must be a normal clone, and its Git common dir (commondir) does not resolve to its own .git`,
@@ -275,15 +269,10 @@ function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void
   }
   const formatVersion = objectFormat === 'sha256' ? '1' : '0';
   const escapedOrigin = normalizeOrigin(origin).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-  // Scan-policy repos (today: the wiki canonical repo) point at the ONE
-  // host-managed, read-only-mounted hook directory instead of /dev/null —
-  // see managed-git-hooks.ts's header for why hooksPath itself is the
-  // signal container-runner.ts reads to decide whether to mount it.
+  // Scan-policy repos point at the host-managed read-only hook dir; hooksPath
+  // itself is the signal spawn reads to mount it.
   const hooksPath = isScanPolicyRepositoryName(path.basename(repoPath)) ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null';
-  // Quoted: the backslash/quote escaping below is only
-  // correct inside a quoted git-config value — written bare, a literal `\`
-  // or `"` in the path would land unescaped instead of being interpreted,
-  // corrupting the value silently.
+  // Quoted: the escaping below is only correct inside a quoted git-config value.
   const escapedHooksPath = hooksPath.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
   const body =
     `[core]\n\trepositoryformatversion = ${formatVersion}\n\tfilemode = true\n\tbare = false\n` +
@@ -313,7 +302,6 @@ function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void
   }
 }
 
-/** Refuse unless the workgroup's pin for this repository matches the requested origin and identity. */
 function assertPinMatchesRequest(
   pin: OriginPin | null,
   input: { workgroupId: string; repo: string },
@@ -331,11 +319,9 @@ function assertPinMatchesRequest(
 }
 
 /**
- * The read-only checks publishStagedCanonical makes against an existing canonical
- * and its pin, run before the drain. A publish that can only be refused must not
- * stop containers first: it would stop every container in the workgroup, then
- * fail on the pin check. publishStagedCanonical repeats these under the
- * repository lock, which stays authoritative; this is an early refusal, never a grant.
+ * Early refusal before the drain, so a publish that can only be refused never
+ * stops the workgroup's containers first. publishStagedCanonical repeats these
+ * under the lock and stays authoritative.
  */
 function assertPublishCanMatchCanonical(input: {
   workgroupId: string;
@@ -353,8 +339,7 @@ function assertPublishCanMatchCanonical(input: {
     validateCloneOrigin(canonical, input.origin);
     assertPinMatchesRequest(pin, input, normalizedInputOrigin, repositoryId);
   } else if (pin) {
-    // A pin with no canonical is a crash between pin and rename; writeOriginPin
-    // refuses to replace it with a different one.
+    // A pin with no canonical is a crash between pin and rename.
     assertPinMatchesRequest(pin, input, normalizedInputOrigin, repositoryId);
   }
 }
@@ -372,22 +357,10 @@ export async function publishStagedCanonical(
     input.repo,
     () => {
       if (fs.existsSync(canonical)) {
-        // Read-only on the canonical: validate, discard the staging clone, answer.
-        // Other threads' containers keep running through a publish and
-        // hold file bind mounts of the canonical's config, HEAD and index
-        // (canonicalGitControlMounts), so a
-        // rewrite here changes the canonical under them. A config rewrite also
-        // changes behaviour, not just an inode: spawn mounts the managed hook
-        // only when core.hooksPath already names it,
-        // so installing it here would leave running threads of a scan-policy
-        // repository without the hook until they restart. Activation keeps an
-        // adopted canonical's own config on purpose (its only config writes are
-        // the gc keys, in repository-activation.ts). The checks below only
-        // read: assertNormalClone runs rev-parse, and the other checks parse
-        // files. There is no status and no checkout either: the checkout (and
-        // the status that guarded it) only re-detached a canonical that is
-        // detached when it is created, by the staging detach below or by
-        // activation (repository-activation.ts).
+        // Read-only on an existing canonical: other threads' containers hold
+        // bind mounts of its config, HEAD and index, so a rewrite changes it
+        // under them (and a config change would leave them without the managed
+        // hook until restart). Validate, discard staging, answer.
         assertNormalClone(canonical, 'existing canonical repository');
         validateCloneOrigin(canonical, input.origin);
         assertCanonicalConfigContract(canonical, input.origin);
@@ -418,10 +391,8 @@ export async function publishStagedCanonical(
         return { status: 'existing' as const, canonicalPath: canonical };
       }
 
-      // Validate staging only when publication is still needed. If the host
-      // crashed after the atomic rename but before acknowledging the durable
-      // action, the retry is idempotently satisfied by the matching canonical
-      // even though the staging path no longer exists.
+      // Validate staging only when publication is still needed: a retry after a
+      // crash post-rename is satisfied by the canonical though staging is gone.
       assertNormalClone(input.stagingPath, 'repository staging path');
       validateCloneOrigin(input.stagingPath, input.origin);
       sanitizeCanonicalConfig(input.stagingPath, input.origin);
@@ -429,31 +400,23 @@ export async function publishStagedCanonical(
         throw new Error('repository staging clone has local modifications and was left untouched');
       }
       const head = git(input.stagingPath, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
-      // The host canonical must not own a user branch. Topic worktrees may
-      // legitimately preserve or request the remote-default branch name.
+      // The host canonical must not own a user branch.
       git(input.stagingPath, ['checkout', '-q', '--detach', head], 30_000);
-      // A canonical is published already carrying its commondir sentinel,
-      // so it never exists without one. assertNormalClone above
-      // refused any other commondir.
+      // Published already carrying its commondir sentinel, so it never exists without one.
       if (ensureCanonicalCommondirSentinel(path.join(input.stagingPath, '.git')) !== 'sentinel') {
         throw new Error('repository staging clone .git holds a commondir file that is not the sentinel');
       }
 
       fs.mkdirSync(path.dirname(canonical), { recursive: true, mode: 0o700 });
       writeOriginPin(input.workgroupId, input.repo, { origin: normalizedInputOrigin, repositoryId }, dataDir);
-      // Staging and canonicals both live under data/, so rename is atomic. An
-      // EXDEV is a hard error rather than a copy fallback that could publish a
-      // partially-copied canonical.
+      // Same filesystem, so rename is atomic; EXDEV is a hard error, never a
+      // copy fallback that could publish a partial canonical.
       fs.renameSync(input.stagingPath, canonical);
       fsyncDirectories(path.dirname(input.stagingPath), path.dirname(canonical));
-      // Nothing may rewrite the canonical after the rename. Containers in other
-      // threads keep running through a publish, so a spawn can discover
-      // the canonical the instant it appears and bind its .git/config by path
-      // (canonicalGitControlMounts). `git config`
-      // replaces that file through a lock-file rename, which would leave such a
-      // container on an orphaned inode. gc.auto and gc.worktreePruneExpire are
-      // already in the staging config sanitizeCanonicalConfig wrote above
-      // (the [gc] section, line 291).
+      // Nothing may rewrite the canonical after the rename: a spawn can bind its
+      // .git/config by path the instant it appears, and `git config` replaces
+      // the file via rename, orphaning that mount. The gc keys are already in
+      // the staging config.
       return { status: 'published' as const, canonicalPath: canonical };
     },
     dataDir,
@@ -476,9 +439,7 @@ export async function refreshCanonicalFromLocalRefs(input: {
       const remoteHead = git(canonical, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
       if (!remoteHead.startsWith('refs/remotes/origin/')) throw new Error('origin/HEAD is not resolved');
       const oid = git(canonical, ['rev-parse', '--verify', `${remoteHead}^{commit}`], 10_000);
-      // Keep the canonical detached so it never reserves a branch that a
-      // topic worktree needs. Readers still see the freshly checked-out
-      // remote-default tree from the host-only canonical.
+      // Keep the canonical detached so it never reserves a branch a topic worktree needs.
       git(canonical, ['checkout', '-q', '--detach', remoteHead], 30_000);
       git(canonical, ['config', 'gc.auto', '0'], 10_000);
       git(canonical, ['config', 'gc.worktreePruneExpire', 'never'], 10_000);
@@ -501,11 +462,9 @@ function removeOwnedTombstone(file: string): void {
 }
 
 /**
- * The finished move the source tombstone records to this destination, or null
- * when the ordinary path still has something to do: a `prepared` phase, a
- * reverse tombstone to clean up, or filesystem state that does not match. The
- * same predicate as the recovery branch in `transferRepositoryWorktree`,
- * without the repairs that branch performs.
+ * The finished move the source tombstone records, or null when the ordinary
+ * path still has work. Same predicate as the recovery branch in
+ * `transferRepositoryWorktree`, without its repairs.
  */
 function completedTransfer(
   input: TransferRepositoryWorktreeInput,
@@ -528,33 +487,24 @@ export async function transferRepositoryWorktree(
   if (input.source.key === input.destination.key) throw new Error('source and destination topics are identical');
 
   return withRepositoryLifecycleClaims([input.source, input.destination], async () => {
-    // A duplicate of a finished move must not drain anything. The drains below
-    // stop every container involved, and kill them all if one does not
-    // quiesce in time, so an agent retrying a move that already landed would
-    // pay that again for nothing. Tombstones and the move change only inside
-    // this function under both lifecycle claims, which this call holds (topic
-    // cleanup takes the same claim first, worktree-cleanup.ts), so reading
-    // them here, before the Git lock, is sound.
+    // A duplicate of a finished move must not drain (drains stop, and may
+    // kill, every container involved). Tombstones only change under both
+    // lifecycle claims, held here, so reading them before the Git lock is sound.
     if (input.answerCompletedMoveWithoutQuiescence) {
       const completed = completedTransfer(input);
       if (completed && (await input.answerCompletedMoveWithoutQuiescence())) {
         return { ...completed, alreadyMoved: true as const };
       }
     }
-    // Stop source writers at a safe turn boundary before taking the Git lock.
-    // A draining source tool may itself need that lock; taking it first would
-    // deadlock quiescence against the very Git operation we are waiting on.
-    // The lifecycle claims already prevent a fresh source spawn in this gap.
+    // Quiesce source writers BEFORE taking the Git lock: a draining tool may
+    // need that lock, and taking it first would deadlock.
     await input.beforeSourceActivityCheckWhileClaimed?.();
     return withHostRepositoryLock(
       input.workgroupId,
       input.repo,
       async () => {
-        // Claims are acquired before observing activity. A source spawn that
-        // begins afterward fails at the spawn gate; an already-running or
-        // already-spawning session is either quiesced by the host action or
-        // visible in this fresh snapshot. The lifecycle claims remain held,
-        // so no fresh source writer can enter between the barrier and proof.
+        // Claims were taken before observing activity, so a later source spawn
+        // fails at the spawn gate and no fresh writer can enter before proof.
         const sourceSessions = await input.loadSourceSessions();
         const active = sourceSessions.filter(
           (session) =>
@@ -564,9 +514,8 @@ export async function transferRepositoryWorktree(
           throw new RepositorySourceActiveError(active.map((session) => session.id));
         }
 
-        // Destination siblings already mount the topic root. Stop them before
-        // the moved directory can appear, otherwise a still-finishing turn can
-        // mutate the transferred HEAD/index/bytes in the move-to-kill window.
+        // Stop destination siblings (they mount the topic root) before the moved
+        // directory appears, or a finishing turn mutates the transferred tree.
         await input.beforeMoveWhileClaimed?.();
 
         const canonical = canonicalRepoDir(input.workgroupId, input.repo, input.dataDir);
@@ -649,8 +598,7 @@ export async function transferRepositoryWorktree(
             removeOwnedTombstone(transferTombstonePath(input.destination, input.repo, input.dataDir));
           }
         } catch (error) {
-          // Restore the original path before reporting failure. The entire
-          // worktree remains linked and byte-for-byte intact throughout.
+          // Restore the original path; the worktree stays linked and intact throughout.
           if (fs.existsSync(destinationPath) && !fs.existsSync(sourcePath)) {
             tryGit(canonical, ['worktree', 'move', destinationPath, sourcePath], 120_000);
             fsyncDirectories(path.dirname(destinationPath), path.dirname(sourcePath));
@@ -669,19 +617,7 @@ export async function transferRepositoryWorktree(
   });
 }
 
-/**
- * Answer one repository action in the caller's own inbound queue.
- *
- * Opens its own short mailbox session. This runs on the detached job chain,
- * by which time the drain that dispatched the action has long returned, and
- * delivery holds no session while a handler runs (plan §4.5b).
- *
- * Existing-only, never provisioning: `prepare()` would open the
- * container-owned outbound.db read-write to apply its schema, and the request
- * this answers was read out of that very mailbox, so it exists. A session that
- * has vanished has no container left to read the answer.
- */
-/** Structured fields a `repository_checkout` answer carries. Every other action answers with the message alone. */
+/** Only a `repository_checkout` answer carries these; other actions answer with the message alone. */
 interface RepositoryActionResponseDetail {
   dirName?: string;
   branch?: string;
@@ -721,23 +657,15 @@ async function response(
   }
 }
 
-// ── repository_checkout (plan §5.2) ─────────────────────────────────────────
-//
-// One (thread, branch) gets one independent clone. The host builds it in the
-// topic's staging dir (beside `worktrees/`, outside every container mount:
-// checkoutStagingRoot), initializes it fully, and publishes it with one rename,
-// so a checkout exists only once it is ready. The job runs on its work unit's
-// own lane (job-runner.ts), takes that unit's lifecycle claim and the
-// repository flock, and never quiesces anything.
-//
-// It runs on the host because inside a container the canonical and the topic
-// root are different bind mounts: link(2) returns EXDEV across mounts, and Git
-// would copy every object into every clone (plan §4.6).
+// repository_checkout: one independent clone per (thread, branch), built in
+// the topic's staging dir (outside every container mount) and published with
+// one rename, so a checkout exists only once ready. Runs on the host because
+// in a container the canonical and topic root are different mounts: link(2)
+// returns EXDEV and Git would copy every object.
 
 export interface CheckoutFarmPolicy {
-  /** `NANOCLAW_DEPENDENCY_CACHE`: `apply` links farms, `report` logs what it would link, `off` shares nothing (§5.7.8). */
+  /** `apply` links farms, `report` logs what it would link, `off` shares nothing. */
   mode: DependencyCacheMode;
-  /** The environment fingerprint; the agent image's when omitted. */
   fingerprint?: () => string | null;
 }
 
@@ -745,7 +673,6 @@ export interface CheckoutRepositoryInput {
   workgroupId: string;
   workUnit: RepositoryWorkUnit;
   repo: string;
-  /** `null`: the thread's primary checkout `<repo>`. */
   branch: string | null;
   requestId: string;
   dataDir?: string;
@@ -755,7 +682,7 @@ export interface CheckoutRepositoryInput {
 export interface CheckoutRepositoryResult {
   dirName: string;
   path: string;
-  /** The branch the checkout serves; `null` only for a legacy linked checkout on a detached HEAD. */
+  /** `null` only for a legacy linked checkout on a detached HEAD. */
   branch: string | null;
   created: boolean;
   shape: 'clone' | 'linked';
@@ -764,7 +691,7 @@ export interface CheckoutRepositoryResult {
   farmsLinked: number;
 }
 
-/** A refusal the requester can act on; `retryable` when waiting a few seconds is the whole fix. */
+/** `retryable` when waiting a few seconds is the whole fix. */
 class RepositoryCheckoutError extends Error {
   constructor(
     message: string,
@@ -781,12 +708,10 @@ export interface RepositoryCheckoutHooks {
 
 let checkoutHooks: RepositoryCheckoutHooks = {};
 
-/** Test seam: pause or fail a checkout once its staging clone is fully built. */
 export function _setRepositoryCheckoutHooksForTesting(hooks: RepositoryCheckoutHooks | null): void {
   checkoutHooks = hooks ?? {};
 }
 
-/** The job-runner lane for one (workgroup, work unit). */
 export function repositoryCheckoutLane(workgroupId: string, workUnit: RepositoryWorkUnit): string {
   return `checkout:${workgroupId}:${workUnit.id}`;
 }
@@ -803,13 +728,13 @@ function gitWithInput(cwd: string, args: string[], input: string, timeout = 120_
   });
 }
 
-/** Delete refs by name. A symbolic ref is deleted itself, never its target. */
+/** A symbolic ref is deleted itself, never its target. */
 function deleteRefs(repoPath: string, refs: string[]): void {
   if (refs.length === 0) return;
   gitWithInput(repoPath, ['update-ref', '--stdin'], refs.map((ref) => `option no-deref\ndelete ${ref}\n`).join(''));
 }
 
-/** A branch name `git branch` would accept, checked without letting `--branch` expand `@{-N}`. */
+/** Checked without letting `--branch` expand `@{-N}`. */
 function assertCheckoutBranch(canonical: string, branch: string): void {
   if (
     !branch ||
@@ -825,7 +750,7 @@ function currentBranch(checkoutPath: string): string | null {
   return tryGit(checkoutPath, ['symbolic-ref', '--quiet', '--short', 'HEAD'], 10_000);
 }
 
-/** The branch a checkout is FOR: a clone's recorded branch, a linked worktree's current one. `null` when unknown. */
+/** A clone's recorded branch, a linked worktree's current one; `null` when unknown. */
 function branchOfCheckout(checkout: TopicCheckout): string | null {
   if (checkout.shape === 'linked') return currentBranch(checkout.path);
   if (checkout.shape !== 'clone') return null;
@@ -839,16 +764,15 @@ function branchOfCheckout(checkout: TopicCheckout): string | null {
 interface CheckoutTarget {
   dirName: string;
   path: string;
-  /** The branch a new checkout here is created on (ignored when `existing`). */
+  /** Ignored when `existing`. */
   branch: string;
   existing: TopicCheckout | null;
 }
 
 /**
- * Which checkout serves (repo, branch) (plan §5.1): no branch -> `<repo>`;
- * `<repo>` absent -> `<repo>`, created on the branch; `<repo>`'s own branch ->
- * `<repo>`; anything else -> `<repo>@<slug>`. A `<repo>` whose branch cannot be
- * read serves only requests without a branch, and is then refused by validation.
+ * No branch -> `<repo>`; `<repo>` absent or on this branch -> `<repo>`;
+ * otherwise `<repo>@<slug>`. A `<repo>` whose branch can't be read serves only
+ * branchless requests.
  */
 function selectCheckoutTarget(
   topicRoot: string,
@@ -872,10 +796,9 @@ function selectCheckoutTarget(
 }
 
 /**
- * The resolution rules of plan §5.3, host side. A clone must still be on its
- * recorded branch (R3) with the origin its pin allows; a linked worktree must
- * belong to this workgroup's canonical. Anything else is refused and left
- * exactly as it is. Returns the branch the checkout serves.
+ * A clone must still be on its recorded branch with an origin its pin allows;
+ * a linked worktree must belong to this workgroup's canonical. Anything else is
+ * refused and left as it is.
  */
 function validateExistingCheckout(input: {
   checkout: TopicCheckout;
@@ -936,7 +859,7 @@ function validateExistingCheckout(input: {
   return metadata.branch;
 }
 
-/** Did the clone hardlink the canonical's objects? Judged by one pack's (else one loose object's) link count. */
+/** Judged by one pack's (else one loose object's) link count. */
 function objectsAreLinked(clonePath: string): boolean {
   const objects = path.join(clonePath, '.git', 'objects');
   const list = (dir: string): string[] => {
@@ -956,37 +879,30 @@ function objectsAreLinked(clonePath: string): boolean {
   return false;
 }
 
-/**
- * Steps 1-3 of plan §5.2, under the repository flock because they read the
- * canonical: clone, remote-ref hygiene, and the start point.
- */
+/** Under the repository flock because it reads the canonical. */
 function stageClone(input: { canonical: string; staging: string; branch: string; pin: OriginPin }): {
   startedFrom: CheckoutStartedFrom;
   startCommit: string;
   objectsLinked: boolean;
 } {
   const { canonical, staging, branch, pin } = input;
-  // 1. A local clone hardlinks the canonical's object files, copying only what
-  // it cannot link, and without --shared it never writes objects/info/alternates,
-  // so canonical GC cannot break the clone (plan §5.8).
+  // Hardlinks the canonical's objects without writing alternates (no
+  // --shared), so canonical GC cannot break the clone.
   git(path.dirname(staging), ['clone', '--no-checkout', '--quiet', canonical, staging], 600_000);
   const objectsLinked = objectsAreLinked(staging);
 
-  // 2. Remote-ref hygiene (M2). `git clone <canonical>` maps the canonical's own
-  // refs/heads/* into refs/remotes/origin/* and guesses a local branch from its
-  // detached HEAD (both seen in a scratch clone, 2026-09-11). Neither may
-  // survive: the clone disposability proof trusts --remotes (plan §5.8).
+  // Neither the refs clone maps into refs/remotes nor its guessed local branch
+  // may survive: the disposability proof trusts --remotes.
   git(staging, ['update-ref', '--no-deref', 'HEAD', git(staging, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000)]);
   const cloned = git(staging, ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'], 10_000)
     .split('\n')
     .filter(Boolean);
   deleteRefs(staging, cloned);
-  // The guessed branch also got `branch.<name>` tracking config; drop it with the ref.
   for (const ref of cloned.filter((name) => name.startsWith('refs/heads/'))) {
     tryGit(staging, ['config', '--remove-section', `branch.${ref.slice('refs/heads/'.length)}`], 10_000);
   }
   if (pin.kind === 'local-only') {
-    // M7: a local-only canonical has no origin, so neither does its clone.
+    // A local-only canonical has no origin, so neither does its clone.
     git(staging, ['remote', 'remove', 'origin'], 10_000);
   } else {
     git(staging, ['config', 'remote.origin.url', pin.origin], 10_000);
@@ -997,9 +913,8 @@ function stageClone(input: { canonical: string; staging: string; branch: string;
     if (originHead) git(staging, ['symbolic-ref', 'refs/remotes/origin/HEAD', originHead], 10_000);
   }
 
-  // 3. The start point (R4): the most complete known state of the branch.
-  // Every canonical object is already here, so committed-but-unpushed legacy
-  // work in canonical refs/heads/B stays reachable.
+  // Start point: the most complete known state of the branch (unpushed legacy
+  // work in canonical refs/heads/B stays reachable).
   let startedFrom: CheckoutStartedFrom;
   let startCommit: string | null = tryGit(
     canonical,
@@ -1009,7 +924,6 @@ function stageClone(input: { canonical: string; staging: string; branch: string;
   if (startCommit) {
     startedFrom = 'canonical-local';
   } else if (pin.kind === 'local-only') {
-    // Today's local-only rule (the runner's git-worktrees tool).
     startCommit = git(canonical, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
     startedFrom = 'local-head';
   } else {
@@ -1036,11 +950,7 @@ function stageClone(input: { canonical: string; staging: string; branch: string;
   return { startedFrom, startCommit, objectsLinked };
 }
 
-/**
- * Package dirs of a checkout: every tracked `package-lock.json`'s directory,
- * outside node_modules. Called only on a staging clone, which no container can
- * reach (checkoutStagingRoot).
- */
+/** Only ever called on a staging clone, which no container can reach. */
 function checkoutPackageDirs(checkoutPath: string): string[] {
   const listed = git(checkoutPath, ['ls-files', '-z', '--', 'package-lock.json', '*/package-lock.json'], 60_000);
   const dirs = new Set<string>();
@@ -1051,12 +961,7 @@ function checkoutPackageDirs(checkoutPath: string): string[] {
   return [...dirs].sort();
 }
 
-/**
- * Link a farm into every package dir that has no `node_modules` and whose key
- * has a verified, strictly complete entry (plan §5.7.4, §5.7.5). All the
- * deciding is `linkPackageDir`'s, and so is the WARN on every refusal or link
- * failure. Returns how many farms it linked.
- */
+/** Returns how many farms it linked; `linkPackageDir` decides and WARNs. */
 function linkCheckoutFarms(
   checkoutPath: string,
   workgroupId: string,
@@ -1068,10 +973,9 @@ function linkCheckoutFarms(
   if (pkgDirs.length === 0) return 0;
   const pass = startDependencyCachePass({
     mode: farms.mode === 'apply' ? 'apply' : 'report',
-    // A sibling of v2-topics, as the storage sweep's, so every link stays on one mount.
+    // Beside v2-topics, so every link stays on one mount.
     cacheRoot: path.join(path.resolve(dataDir), DEPENDENCY_CACHE_DIRNAME),
     now: Date.now(),
-    // Only convert and GC decisions read reclaimable bytes; a link reclaims nothing.
     reclaimableBytes: () => 0,
     fingerprint: farms.fingerprint,
   });
@@ -1090,7 +994,6 @@ function checkoutFarmPolicyFromEnvironment(): CheckoutFarmPolicy {
   return { mode: resolveStoragePolicy().dependencyCacheMode ?? 'off' };
 }
 
-/** Steps 1-7 of plan §5.2 for a checkout that does not exist yet. */
 async function createCheckout(input: {
   workgroupId: string;
   repo: string;
@@ -1105,9 +1008,7 @@ async function createCheckout(input: {
   const { target } = input;
   const requestRoot = path.join(checkoutStagingRoot(input.topicRoot), input.requestId);
   const staging = path.join(requestRoot, target.dirName);
-  // Both live in the topic state dir, which no container mounts: staging
-  // beside `worktrees/` (checkoutStagingRoot), and `worktrees/` itself, the
-  // publish destination, which may not exist before the topic's first spawn.
+  // Both in the topic state dir, which no container mounts.
   fs.mkdirSync(requestRoot, { recursive: true });
   fs.mkdirSync(input.topicRoot, { recursive: true });
   let staged: { startedFrom: CheckoutStartedFrom; startCommit: string; objectsLinked: boolean };
@@ -1127,7 +1028,6 @@ async function createCheckout(input: {
         canonical: input.canonical,
       });
     }
-    // 4. Materialize the working tree, then record what this checkout is.
     git(staging, ['checkout', '--quiet', '--force', target.branch], 600_000);
     git(staging, ['config', 'gc.auto', '0'], 10_000);
     writeCheckoutMetadata(staging, {
@@ -1138,27 +1038,20 @@ async function createCheckout(input: {
       startedFrom: staged.startedFrom,
     });
     await checkoutHooks.afterStagingPopulated?.(staging);
-    // 5. Farms, now that the manifests exist.
     farmsLinked = linkCheckoutFarms(staging, input.workgroupId, input.farms, input.dataDir);
-    // The tags the clone holds now are the ones it inherited from the canonical;
-    // the disposability proof skips them while they stay unchanged.
+    // Inherited tags; the disposability proof skips them while unchanged.
     const inheritedTags = git(staging, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags'], 60_000);
-    // The publish rename keeps this identity; any other clone at the target has another.
     const identity = cloneIdentity(staging);
     if (identity === null) throw new RepositoryCheckoutError(`${target.dirName} staging has no .git directory`);
-    // 6. Publish: one rename inside the topic root. rename(2) would replace an
-    // empty directory, so anything already at the target refuses instead.
+    // rename(2) would replace an empty directory, so anything at the target refuses.
     if (fs.existsSync(target.path) || isSymlink(target.path)) {
       throw new RepositoryCheckoutError(`${target.dirName} already exists and is not a checkout this host can serve`);
     }
-    // Recorded host-only (checkoutInheritedTagsPath), bound to this clone's
-    // identity, once the target is known free.
     writeCheckoutInheritedTags(target.path, identity, inheritedTags);
     tagsRecorded = true;
     fs.renameSync(staging, target.path);
   } catch (error) {
-    // Nothing outside this request's own staging dir was touched, apart from a
-    // tag record for a publish that then failed.
+    // Nothing outside this request's staging dir was touched, apart from the tag record.
     if (tagsRecorded) removeCheckoutInheritedTags(target.path);
     fs.rmSync(requestRoot, { recursive: true, force: true });
     throw error;
@@ -1167,7 +1060,6 @@ async function createCheckout(input: {
     fsyncDirectories(input.topicRoot, requestRoot);
     fs.rmdirSync(requestRoot);
   } catch (error) {
-    // Published: the checkout is ready either way, and an empty request dir is swept later.
     log.warn('Repository checkout published but could not tidy its staging dir', {
       requestRoot,
       error: error instanceof Error ? error.message : String(error),
@@ -1193,31 +1085,16 @@ function isSymlink(target: string): boolean {
   }
 }
 
-/**
- * The checkout serving (repo, branch) in this work unit's topic: reused when it
- * exists and passes validation, otherwise created (plan §5.2). Preconditions
- * come from the trusted work unit, never from payload paths.
- */
+/** Preconditions come from the trusted work unit, never from payload paths. */
 export async function checkoutRepository(input: CheckoutRepositoryInput): Promise<CheckoutRepositoryResult> {
   const dataDir = input.dataDir ?? DATA_DIR;
   const { workgroupId, workUnit, repo, branch, requestId } = input;
   assertRepositoryName(repo);
   assertRepositoryRequestId(requestId);
-  // This function is the ONLY place a clone-shaped checkout is created or
-  // served: the runner's create_worktree reaches it exclusively through
-  // createCloneWorktree (container/agent-runner/src/mcp-tools/git-worktrees.ts)
-  // -> requestRepositoryCheckout's `repository_checkout` request (same file)
-  // -> applyRepositoryCheckoutAction above -> here -> createCheckout
-  // -> stageClone, a full independent `git clone` with no `core.hooksPath`
-  // set. The runner is expected to never route a scan-policy repo
-  // (isScanPolicyRepositoryName) here at all — it pins that repo to
-  // `worktree` mode itself (effectiveCheckoutModeFor, container/agent-runner/
-  // src/mcp-tools/git-worktrees.ts) — but this host predicate is the
-  // single source of truth (src/managed-git-hooks.ts), so a clone request
-  // for such a repo is refused here too: if the runner's own copy of the
-  // list (container/agent-runner/src/mcp-tools/scan-policy-repos.json) ever
-  // drifted from the host's, that drift would otherwise be the only thing
-  // standing between an unscanned clone and its remote push.
+  // The ONLY place a clone-shaped checkout is created. The runner should never
+  // route a scan-policy repo here, but the host predicate is the source of truth,
+  // so refuse here too: a drifted runner list would otherwise be the only thing
+  // between an unscanned clone and its remote push.
   if (isScanPolicyRepositoryName(repo)) {
     throw new RepositoryCheckoutError(
       `${repo} is under host-managed secret-scan policy and cannot be checked out as a clone; ` +
@@ -1227,10 +1104,8 @@ export async function checkoutRepository(input: CheckoutRepositoryInput): Promis
   if (workUnit.workgroupId !== workgroupId) {
     throw new RepositoryCheckoutError('the checkout work unit belongs to another workgroup');
   }
-  // Transfer and cleanup hold this claim for seconds to minutes, so the answer
-  // is "retry", not "failed". The check and the claim below are one synchronous
-  // step: withRepositoryLifecycleClaims tests and takes its keys before its
-  // first await.
+  // Transfer and cleanup hold this claim for minutes, so the answer is "retry".
+  // Check and claim are one synchronous step.
   if (isRepositoryLifecycleClaimed(workUnit)) {
     throw new RepositoryCheckoutError(
       "this thread's repository checkouts are being moved or cleaned up; retry in a few seconds",
@@ -1251,10 +1126,8 @@ export async function checkoutRepository(input: CheckoutRepositoryInput): Promis
     if (branch !== null) assertCheckoutBranch(canonical, branch);
 
     const topicRoot = topicWorktreesDir(workUnit, dataDir);
-    // This job is the one its lane is running, so no other staging entry in
-    // this topic is being built: older ones are crash residue, and so is any
-    // left by an earlier attempt at this same request (a replay after a host
-    // restart), which was never published.
+    // This lane runs one job at a time, so any other staging entry here is
+    // crash residue, including an unpublished earlier attempt at this request.
     removeStaleCheckoutStaging(topicRoot, { now: Date.now(), keep: requestId });
     fs.rmSync(path.join(checkoutStagingRoot(topicRoot), requestId), { recursive: true, force: true });
 
@@ -1268,9 +1141,7 @@ export async function checkoutRepository(input: CheckoutRepositoryInput): Promis
         branch: served,
         created: false,
         shape: target.existing.shape === 'linked' ? 'linked' : 'clone',
-        // A published checkout is live and container-writable, so the host
-        // writes no farm into it (plan §5.2, rev 2.6): npm installs a private
-        // tree there, and the sweep converts it once the topic is idle.
+        // A published checkout is live and container-writable: no host farm.
         farmsLinked: 0,
       };
     }
@@ -1296,11 +1167,7 @@ function checkoutMessage(result: CheckoutRepositoryResult): string {
   return `Checkout created at ${where} on branch ${result.branch}${from}`;
 }
 
-/**
- * `repository_checkout` (container -> host): `{requestId, repo, branch, workUnitKey}`.
- * Always answers in the requester's inbound with `repository-action-response-<requestId>`;
- * a refusal is an answer (`ok:false`), not a failed delivery.
- */
+/** A refusal is an answer (`ok:false`), not a failed delivery. */
 export async function applyRepositoryCheckoutAction(content: Record<string, unknown>, session: Session): Promise<void> {
   const startedAt = Date.now();
   const requestId = typeof content.requestId === 'string' ? content.requestId : '';
@@ -1377,12 +1244,11 @@ async function checkoutLaneForSession(session: Session): Promise<string> {
     const workgroupId = await workgroupForSession(session);
     return repositoryCheckoutLane(workgroupId, await workUnitForSession(session, workgroupId));
   } catch {
-    // The apply reaches the same failure and answers it; any lane of its own will do.
+    // The apply reaches the same failure and answers it.
     return `checkout:session:${session.id}`;
   }
 }
 
-/** Delivery-action entry: the job runs on its work unit's lane, never the global one. */
 export async function dispatchRepositoryCheckout(
   content: Record<string, unknown>,
   session: Session,
@@ -1455,14 +1321,11 @@ async function workUnitForSession(session: Session, workgroupId: string): Promis
   });
 }
 
-/** How often a publish re-checks a lifecycle claim another operation holds on the requester's work unit. */
 const PUBLISH_CLAIM_POLL_MS = 1_000;
-/** How long a publish waits for that claim before it fails. */
 const PUBLISH_CLAIM_WAIT_MS = 120_000;
 
 let publishClaimWait = { pollMs: PUBLISH_CLAIM_POLL_MS, timeoutMs: PUBLISH_CLAIM_WAIT_MS };
 
-/** Test seam for the publish claim wait; `null` restores the defaults. */
 export function _setPublishClaimWaitForTesting(wait: { pollMs: number; timeoutMs: number } | null): void {
   publishClaimWait = wait ?? { pollMs: PUBLISH_CLAIM_POLL_MS, timeoutMs: PUBLISH_CLAIM_WAIT_MS };
 }
@@ -1486,45 +1349,16 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
   let quiescence: RepositoryMountQuiescence | null = null;
   let claimHeldAfterWait = false;
   try {
-    // Refuse before the drain what the publication would refuse after it.
     assertPublishCanMatchCanonical({ workgroupId, repo, origin, repositoryId });
     const requesterWorkUnit = await workUnitForSession(session, workgroupId);
-    // Only the requester's thread is drained. A container's canonical
-    // mounts are fixed when it spawns (buildMounts binds each canonical
-    // discoverCanonicalRepositories finds then),
-    // so a container in another thread keeps running on the mounts it has and
-    // sees the new canonical at its next start; nothing needs it stopped. A
-    // spawn that races the publication sees either no canonical or a whole
-    // one: the pin and the lock exist before the atomic rename (withHostRepositoryLock
-    // and writeOriginPin in publishStagedCanonical), discovery refuses a canonical
-    // without its pin, and nothing rewrites the
-    // canonical after the rename.
-    //
-    // The requester's work unit must stop: its staging clone is in the
-    // requester's writable /workspace (clone_repo stages under
-    // /workspace/repository-staging), and the confirmation below is an onWake
-    // row that only a fresh container reads. Same-thread sessions share the
-    // topic root, so the whole work unit goes. Its lifecycle claim closes spawn
-    // admission for that work unit and marks its
-    // fences as in flight to the orphan-fence pass (repo-fence-recovery.ts).
-    // The claim throws when already held.
-    // Publish stays on the global lane with transfer — both are dispatched on
-    // GLOBAL_REPOSITORY_LANE (job-runner.ts) — so those two never
-    // meet on it, but a same-thread checkout or topic cleanup holds it for
-    // seconds (checkoutRepository, worktree-cleanup.ts). So
-    // wait for it, bounded, instead of failing the publish outright.
-    //
-    // The workgroup mount claim is waited on by the same loop. `ncl
-    // repositories activate|rollback` still takes it (cli/resources/repositories.ts)
-    // and quiesces every session in the workgroup, the requester's among them.
-    // The two claim namespaces do not conflict, so without this wait a publish
-    // and an operator transition would each fence the requester's sessions
-    // under a different epoch and the second activateRepoIngressFence would
-    // throw (modules/mailbox/ops/fence.ts). Publish defers to that claim
-    // rather than taking it: holding it would close spawn admission for every
-    // thread in the workgroup for as long as
-    // the transition runs — the workgroup-wide stall the requester-only drain
-    // exists to avoid.
+    // Only the requester's work unit is drained: other threads' containers keep
+    // their spawn-time mounts and see the new canonical at next start, and a
+    // racing spawn sees no canonical or a whole one (pin and lock precede the
+    // rename). The requester must stop because its staging clone is in its
+    // writable /workspace and the confirmation is an onWake row.
+    // Wait (bounded) for a same-thread checkout/cleanup lifecycle claim and for
+    // the workgroup mount claim: taking the latter would stall every thread,
+    // and ignoring it would double-fence the requester's sessions.
     const claimDeadline = Date.now() + publishClaimWait.timeoutMs;
     while (
       (isRepositoryLifecycleClaimed(requesterWorkUnit) || isWorkgroupRepositoryMountClaimed(workgroupId)) &&
@@ -1532,13 +1366,9 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
     ) {
       await new Promise((resolve) => setTimeout(resolve, publishClaimWait.pollMs));
     }
-    // No await from here to the claim: withRepositoryLifecycleClaims tests and
-    // takes its keys synchronously, before its first await,
-    // so nothing can take the claim between
-    // the last check above and this one. Past the deadline it still throws.
+    // No await from here to the claim: it is tested and taken synchronously.
     if (isWorkgroupRepositoryMountClaimed(workgroupId)) {
-      // withRepositoryLifecycleClaims below keys on the work unit, not the
-      // workgroup, so it would not refuse this. Fail here, before the drain.
+      // The lifecycle claim below keys on the work unit, so it wouldn't refuse this.
       throw new Error(
         `a workgroup repository transition held the mount claim on ${workgroupId} for more than ` +
           `${Math.ceil(publishClaimWait.timeoutMs / 1000)} s, so publication never started; clone_repo can be retried`,
@@ -1548,27 +1378,20 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
     await withRepositoryLifecycleClaims([requesterWorkUnit], async () => {
       mountSessions = await sessionsForWorkUnit(requesterWorkUnit);
 
-      // Wait for every already admitted turn/tool in this work unit to finish
-      // and stop its containers before the first canonical publication mutation.
+      // Stop every admitted turn in this work unit before the first canonical mutation.
       quiescence = await quiesceSessionsForRepositoryMounts(
         mountSessions,
         `repository-publish:${requestId}`,
         REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
       );
       affectedSessions = quiescence.sessions;
-      // A canonical that already matches takes publishStagedCanonical's
-      // existing branch under this same claim: the staging clone is discarded
-      // and the requester is answered. That branch only reads the canonical,
-      // because other threads' containers keep running with its config, HEAD
-      // and index bind-mounted (see the comment there).
+      // An already-matching canonical takes the read-only branch (see there).
       const published = await publishStagedCanonical({ workgroupId, repo, origin, repositoryId, stagingPath });
       const confirmation =
         published.status === 'published'
           ? `Repository ready: ${repo} is published as the workgroup canonical. This thread restarted with it mounted; other threads see it at their next container start.`
           : `Repository ready: ${repo} already matched the workgroup canonical, so the staging clone was discarded. This thread restarted with it mounted.`;
-      // onWake is load-bearing: the container that requested publication is
-      // deliberately among those stopped above, so a synchronous MCP response
-      // cannot survive. Only the fresh container may consume this confirmation.
+      // onWake is load-bearing: the requesting container was stopped above.
       await writeSessionMessageIfNew(session.agent_group_id, session.id, {
         id: `repository-publish-complete-${requestId}`,
         kind: 'chat',
@@ -1592,8 +1415,7 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
     }
     let failure: unknown = error;
     if (claimHeldAfterWait) {
-      // Still held at the deadline, so the claim itself threw
-      // and nothing was drained or published.
+      // Still held at the deadline: nothing was drained or published.
       failure = new Error(
         `another repository operation on this thread held its lifecycle claim for more than ` +
           `${Math.ceil(publishClaimWait.timeoutMs / 1000)} s, so publication never started; clone_repo can be retried`,
@@ -1646,13 +1468,9 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
   assertRepositoryRequestId(requestId);
   const workgroupId = await workgroupForSession(session);
   try {
-    // Refresh never reads or fetches from an agent checkout (plan §5.5, rev
-    // 2.7); the host still validates reused checkouts and proves cleanup
-    // candidates, as it does for linked worktrees. A `checkout` field
-    // from a container that has not restarted since is ignored: a clone's .git
-    // is container-writable, and a planted commondir or object alternate there
-    // redirects a host fetch to another workgroup's repository. Containers
-    // fetch origin into the canonical themselves, as linked worktrees do.
+    // Never read or fetch from an agent checkout: its .git is container-writable,
+    // and a planted commondir or alternate redirects a host fetch to another
+    // workgroup's repository.
     await refreshCanonicalFromLocalRefs({ workgroupId, repo });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1733,9 +1551,8 @@ export function resolveTransferSourceWorkUnit(
     }),
   }));
 
-  // Managed locators are a separate namespace from adapter-owned thread IDs.
-  // Otherwise an external ID that happens to equal another topic's locator
-  // makes the only exact, host-generated identity ambiguous.
+  // Managed locators are a separate namespace from adapter thread IDs, or a
+  // colliding external ID would make the host identity ambiguous.
   if (/^(?:thread|conversation|task|session)-[a-f0-9]{32}$/.test(sourceThreadId)) {
     const locatorUnits = new Map<string, RepositoryWorkUnit>();
     for (const { unit } of resolvedRows) {
@@ -1745,8 +1562,7 @@ export function resolveTransferSourceWorkUnit(
       throw new Error(`source thread is ambiguous in workgroup ${workgroupId}: ${sourceThreadId}`);
     }
     if (locatorUnits.size === 1) return [...locatorUnits.values()][0];
-    // Adapter-owned IDs are not constrained by the managed locator grammar.
-    // If no exact managed identity exists, retain the legacy alias lookup.
+    // No exact managed identity: keep the legacy alias lookup.
   }
 
   const units = new Map<string, RepositoryWorkUnit>();
@@ -1778,9 +1594,7 @@ async function sourceSessionStates(
   for (const row of rows) {
     const running = isContainerRunning(row.id);
     const spawning = isContainerSpawning(row.id);
-    // Closed sessions cannot accept another turn or continuation. Once their
-    // runtime is stopped, stale outbound claims are residue, not a possible
-    // writer; the exact checkout transfer is the recovery path for that work.
+    // Stopped closed sessions can't write; stale claims there are residue.
     if (row.status === 'closed' && !running && !spawning) {
       states.push({
         id: row.id,
@@ -1796,10 +1610,8 @@ async function sourceSessionStates(
     let activeTool = false;
     let continuation = false;
     try {
-      // Read-only seam: the quiescence probe must never provision or migrate a
-      // session it is only inspecting. Hot-journal recovery is load-bearing:
-      // an unreadable existing mailbox must fail closed rather than strand a
-      // recoverable processing claim behind a crash artifact.
+      // Read-only probe. Hot-journal recovery is load-bearing: an unreadable
+      // mailbox must fail closed rather than strand a recoverable claim.
       const state = readSessionOutbound(
         { agentGroupId: row.agent_group_id, sessionId: row.id },
         (mailbox) => ({
@@ -1810,8 +1622,7 @@ async function sourceSessionStates(
         { busyTimeoutMs: 5000, recoverJournal: true },
       );
       if (!state) {
-        // A missing mailbox on a non-terminal session may mean it is between
-        // creation and first boot. Transfer without proof remains unsafe.
+        // Possibly between creation and first boot: no proof, so unsafe.
         throw new Error(`no outbound mailbox for session ${row.id}`);
       } else {
         processing = state.processing;
@@ -1819,7 +1630,6 @@ async function sourceSessionStates(
         continuation = state.continuation;
       }
     } catch {
-      // An unreadable non-terminal mailbox is unknown state, so fail closed.
       processing = true;
     }
     states.push({
@@ -1860,10 +1670,8 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     if (index >= 0) pendingQuiescences.splice(index, 1);
   };
   try {
-    // Resolution belongs inside the recovery boundary. The container has
-    // already durably queued the request and returned control to the agent; a
-    // lookup rejection must therefore produce the same explicit failure wake
-    // as a later Git/quiescence rejection instead of becoming a log-only job.
+    // Inside the recovery boundary: a lookup rejection must produce the same
+    // failure wake as a later rejection, not a log-only job.
     const workgroupId = await workgroupForSession(session);
     const destination = await workUnitForSession(session, workgroupId);
     if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
@@ -1884,10 +1692,8 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
       repo,
       source,
       destination,
-      // A new request for a move that already landed has no barrier of its
-      // own to release, so it answers without draining. A replay of THIS
-      // request can still hold its barriers after a crash, and only the
-      // quiescing path re-adopts and releases them.
+      // Only a NEW request for a landed move answers without draining; a replay
+      // of this request may hold barriers only the quiescing path releases.
       answerCompletedMoveWithoutQuiescence: async () =>
         !(await sessionsHoldRepoIngressFence(
           uniqueSessionsById(await sessionsForWorkUnit(source), await sessionsForWorkUnit(destination)),
@@ -1898,9 +1704,8 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
         rememberQuiescence(
           await quiesceSessionsForRepositoryMounts(sourceSessions, sourceEpoch, REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS),
         );
-        // Re-read under the lifecycle claim. A row created while barriers
-        // activated cannot spawn, but it must still participate in the final
-        // active-state proof instead of escaping through a stale row snapshot.
+        // Re-read under the claim so a row created during barrier activation
+        // still joins the final active-state proof.
         sourceSessions = await sessionsForWorkUnit(source);
       },
       loadSourceSessions: () => sourceSessionStates(source, sourceSessions),
@@ -1978,8 +1783,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
           sender: 'system',
           senderId: 'system',
         }),
-        // A plain row: this answer stopped no container, and an on_wake row
-        // is read only by a fresh container's first poll.
+        // Stopped no container, and on_wake is read only by a fresh container.
         onWake: 0,
       });
       wakeRepositoryMountSessions([session]);
@@ -2081,21 +1885,10 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
   }
 }
 
-// All four run OFF the serial delivery drain (job-runner.ts): a publish's
-// quiescence now waits up to REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS for the
-// requester's thread to reach a safe point, and no other session's outbound messages may
-// queue behind that. `repository_refresh` joins them because it contends for the
-// same per-repository flock that a detached transfer holds across its whole
-// quiescence — left inline it would simply move the delivery block. Publish,
-// refresh and transfer share the global lane; `repository_checkout` runs on its
-// work unit's own lane, so it never waits behind them (plan §5.2, M6).
-//
-// MAX_DELIVERY_ATTEMPTS no longer applies to these rows: the runner owns the
-// `delivered` row (deferAck) and gives each action exactly one attempt per host
-// process. A retry is not free here — every attempt re-fences and re-kills every
-// container it drains, so three attempts at a quiescence that has already timed
-// out cost three restarts to reach the same failure.
-// The give-up path keeps the orphan-fence release the delivery loop used to run.
+// All four run OFF the serial delivery drain (a publish can wait minutes for
+// quiescence; refresh contends for the same flock). Each gets exactly one
+// attempt per host process: every retry re-fences and re-kills every drained
+// container.
 registerDeliveryAction(
   'repository_publish',
   (content, session) =>

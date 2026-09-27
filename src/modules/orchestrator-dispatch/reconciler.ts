@@ -8,12 +8,8 @@ export async function runReconcilerSweep(): Promise<void> {
 
   log.info('Reconciler: scheduling side-effects for orphaned tasks', { count: orphans.length });
   for (const task of orphans) {
-    // Lease + completionInFlight in completeSpawnSideEffects dedupes against
-    // any in-flight setImmediate from the original admit. Self-orchestration:
-    // child agent group is always the parent's agent group. Args stay on
-    // setImmediate's own (fn, ...args) forwarding — tests assert on that
-    // exact call shape. completeSpawnSideEffects internally .catch()es its
-    // own work, so the promise it returns never rejects — void is safe here.
+    // Dedupes against any in-flight admit via the lease. Tests assert on this
+    // exact setImmediate(fn, ...args) call shape.
     setImmediate(
       (taskId: string, groupId: string) => {
         void completeSpawnSideEffects(taskId, groupId);

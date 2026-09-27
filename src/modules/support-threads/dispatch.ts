@@ -1,39 +1,15 @@
 /**
- * Support-threads delivery-action handlers.
+ * `dispatch_support_issue` (from the inbox poller, idempotent on the Gmail
+ * `threadId`): a new thread gets an announcement, a Slack thread and a
+ * per-issue session in the poller's agent group, which creates the ticket and
+ * reports it via `update_support_ticket`; a follow-up email routes into the
+ * open session. All workflow state is host-side in `support_threads`.
  *
- * `dispatch_support_issue` — called by the inbox-poller agent once per real
- * support email (after noise pre-flight; NO Linear work in the poller). The
- * container writes a `kind='system'` outbound; this host handler applies it.
+ * Not the orchestrator tasks layer: support issues idle for days, which that
+ * layer's watchdog would reap.
  *
- * One idempotent path keyed on the Gmail `threadId`:
- *   - NEW thread → post a channel announcement, open a native Slack thread under
- *     it, create a per-thread session in the SAME agent group as the poller,
- *     seed it with the issue context + ticketing protocol, record the mapping,
- *     and wake it. The PER-ISSUE session creates the Linear ticket (or comments
- *     if a ticket is already known) and reports it back via
- *     `update_support_ticket` — the poller carries no per-agent state at all.
- *   - EXISTING thread (a follow-up email) → route the new email into the
- *     already-open session/thread and wake it. No second thread is created.
- *
- * `update_support_ticket` — called by a per-issue session after it creates the
- * Linear ticket. Resolved by the CALLING session id (never an agent-supplied
- * key), records the ticket on the row, and best-effort edits the channel
- * announcement to show the ticket id.
- *
- * State design: ALL workflow state lives host-side in the
- * central `support_threads` table. No bedroom or workgroup files — any agent
- * assigned to the workflow inherits protocol (repo) + state (host) wholesale.
- *
- * Deliberately does NOT use the orchestrator-dispatch tasks/watchdog layer:
- * support issues idle for days awaiting an engineer reply, and the watchdog is
- * built to *reap* idle workers — the opposite of what a support thread needs.
- * It reuses only the low-level primitives (postParent → createThread →
- * resolveSession('per-thread') → seed → wake), mirroring orchestrator-dispatch.
- *
- * SECURITY: routing is derived from the CALLING session's own messaging group
- * or, for an isolated system task, its host-written messages_in routing
- * columns — never from agent-supplied action content. This preserves the
- * post-2026-05-02 cross-tenant invariant (see scheduling/actions.ts).
+ * SECURITY: routing comes from the CALLING session's own messaging group or
+ * host-written task routing, never from agent-supplied content.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -91,25 +67,16 @@ function ticketCreationStep(policy: string | null): string {
 }
 
 /**
- * Isolated scheduled-task sessions have no central messaging_group_id. Their
- * host-authored task row carries the delivery route instead, and its per-fire
- * turn flags are the model policy that should follow work dispatched from that
- * fire. They stay ONE-TURN flags on the dispatched message: the poller's own
- * work in the support thread (seeding a new issue, relaying a customer reply)
- * runs on the task's model/effort, while a human's reply in that thread
- * resolves like any other thread (sticky → wiring → group → install default).
- * Operator decision 2026-09-23: follow-ups should not inherit the poller's
- * cheap per-fire pin. (Before this, the pin was converted to a session sticky,
- * which silently put every engineer reply on it.)
+ * Isolated task sessions have no messaging_group_id; the host-authored task row
+ * carries the route. Its per-fire flags stay ONE-TURN on the dispatched message:
+ * a human's reply in the support thread must not inherit the poller's cheap pin.
  */
 async function getSupportTaskContext(session: Session): Promise<SupportTaskContext | null> {
   if (!session.thread_id?.startsWith(TASK_SESSION_PREFIX)) return null;
   const seriesId = session.thread_id.slice(TASK_SESSION_PREFIX.length);
   if (!seriesId) return null;
 
-  // Its own short mailbox session — delivery holds none while a handler runs
-  // (plan §4.5b). A session with no mailbox carries no host-authored task row,
-  // and the caller already treats a missing row as "no task context".
+  // Existing-only: no mailbox means no task row, i.e. "no task context".
   const row = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.getLatestRoutedTaskRow(seriesId),
   );
@@ -130,14 +97,12 @@ async function getSupportTaskContext(session: Session): Promise<SupportTaskConte
     }
   } catch (err) {
     if (!(err instanceof SyntaxError)) throw err;
-    // A malformed task prompt must not block support routing. Task creation
-    // normally validates this JSON; fall back to provider defaults if corrupt.
+    // A malformed task prompt must not block support routing.
   }
 
   return { channelType: row.channel_type, platformId: row.platform_id, flagIntent };
 }
 
-/** The channel-level announcement (the working thread's parent message). */
 function announcementText(
   subject: string,
   sender: string,
@@ -149,13 +114,9 @@ function announcementText(
 }
 
 /**
- * Classify-on-arrival hint from the container's `dispatch_support_issue`
- * (container/agent-runner/src/mcp-tools/support-triage.ts). It is container-
- * supplied content, so it is validated strictly: the category must be one of
- * the fixed categories the container asks (TRIAGE_CATEGORIES, kept in step with
- * that file's CATEGORIES), option keys are short snake_case tokens, a general
- * email carries no area, and every number must already be in range. Anything
- * else drops the whole hint — the email still dispatches exactly as without it.
+ * Container-supplied, so validated strictly (fixed categories kept in step
+ * with support-triage.ts, snake_case keys, in-range numbers); anything else
+ * drops the whole hint and the email dispatches without it.
  */
 interface SupportTriageView {
   product: string | null;
@@ -181,7 +142,7 @@ export const TRIAGE_CATEGORIES = new Set([
   'automated_notice',
 ]);
 
-/** A number already inside [0, max], or null — out of range is malformed, never clamped. */
+/** Out of range is malformed, never clamped. */
 function inRange(v: unknown, max: number): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max ? v : null;
 }
@@ -204,7 +165,7 @@ function supportTriage(raw: unknown): SupportTriageView | null {
   const product = t.product === null ? null : triageKey(t.product);
   if (t.product !== null && product === null) return null;
 
-  // No area is exactly (null, 0); an area needs a key and an in-range confidence. Nothing is repaired.
+  // No area is exactly (null, 0). Nothing is repaired.
   let area: string | null = null;
   let areaConfidence = 0;
   if (t.area === null) {
@@ -222,7 +183,6 @@ function triageArea(t: SupportTriageView): string {
   return t.area ? `${t.area} (${t.areaType})` : t.areaType;
 }
 
-/** Agent-facing: every number, plus the reminder that it is a hint. */
 function triageContextLine(t: SupportTriageView): string {
   return (
     `Automatic triage (fast classifier — a hint, not a verdict; the email below is authoritative): ` +
@@ -232,7 +192,6 @@ function triageContextLine(t: SupportTriageView): string {
   );
 }
 
-/** Human-facing: short enough for the thread opener. */
 function triageTag(t: SupportTriageView): string {
   return `_Triage: ${triageArea(t)} · ${t.category.replace(/_/g, ' ')}_`;
 }
@@ -255,7 +214,6 @@ function emailContext(
   ].join('\n');
 }
 
-/** First thread message (bot-posted) — the captured customer email. */
 function threadOpener(
   sender: string,
   date: string,
@@ -269,11 +227,8 @@ function threadOpener(
 }
 
 /**
- * Seed inbound that wakes the per-issue session. Two variants:
- *  - no ticket known → the session CREATES the Linear issue, then reports it
- *    back via `update_support_ticket`;
- *  - ticket known (seeded legacy row, or the dispatcher passed one) → the
- *    session posts a Linear comment instead of creating a duplicate.
+ * No ticket known: the session CREATES it and reports back. Ticket known: it
+ * comments instead of creating a duplicate.
  */
 function seedPrompt(
   linearIssue: string | null,
@@ -303,7 +258,6 @@ function seedPrompt(
   return `${protocol}\n\n${emailContext(subject, sender, date, bodyText, triage)}`;
 }
 
-/** Follow-up inbound for a new email landing on an open issue. */
 function followupText(
   subject: string,
   sender: string,
@@ -325,12 +279,9 @@ function followupText(
 }
 
 /**
- * One in-flight dispatch per Gmail thread. Two follow-ups arriving together
- * used to race: both read the same stale binding, both opened a thread and a
- * session, and the second upsert overwrote the first — one orphaned session,
- * one duplicate Slack thread, one message delivered where nobody was reading.
- * The host is a single Node process, so a promise chain per thread id is the
- * whole lock.
+ * One in-flight dispatch per Gmail thread: concurrent follow-ups otherwise
+ * both open a thread and session and one is orphaned. The host is a single
+ * Node process, so a promise chain per thread id is the whole lock.
  */
 const dispatchChains = new Map<string, Promise<unknown>>();
 
@@ -385,24 +336,17 @@ async function dispatchSupportIssue(
   const triage = supportTriage(content.triage);
 
   const existing = await getSupportThread(gmailThreadId);
-  // Ticket identity: prefer what the host already recorded; fall back to what
-  // the dispatcher passed (it may know from a legacy flow).
+  // Prefer the host's recorded ticket; fall back to what the dispatcher passed.
   const linearIssue = existing?.linear_issue ?? str(content.linearIssue);
   const linearTeam = existing?.linear_team ?? str(content.linearTeam);
   const ticketPolicy = await supportTicketPolicy(session.agent_group_id);
 
-  // ── Follow-up: an open issue with a live Slack thread already exists ──
   if (existing && existing.slack_thread_id) {
     const bound = existing.session_id ? await getSession(existing.session_id) : undefined;
-    // Reclaim only CLOSES a session row, it never deletes it, so `getSession`
-    // still answers for an archived session. Without the status filter the
-    // follow-up wrote into (and spawned a container for) a status='closed'
-    // row — permanently invisible to host-sweep's stuck/heartbeat machinery.
-    // The follow-up goes to the agent whose poller found it, not to whichever
-    // agent opened the ticket: another agent may have taken the ticket over, and
-    // the poller's model pin only means something in the poller's own group.
-    // A poller on a different channel than the ticket's thread cannot reach that
-    // thread through its own bot, so there the original owner keeps it.
+    // getSession still answers for a CLOSED session; without the status filter
+    // the follow-up would spawn into a row the sweep never watches. Follow-ups go
+    // to the poller's own group (the ticket may have changed hands), unless the
+    // poller's bot can't reach the thread's channel.
     const ownerGroupId = existing.slack_thread_id.startsWith(`${mg.platform_id}:`)
       ? session.agent_group_id
       : existing.agent_group_id;
@@ -422,10 +366,8 @@ async function dispatchSupportIssue(
       }),
     };
 
-    // The Slack thread, the Linear ticket and the customer's Gmail thread all
-    // outlive the session. A reclaimed session is re-provisioned in place —
-    // same thread, same ticket, ONLY session_id changes — instead of opening a
-    // second announcement for one ongoing conversation.
+    // Thread, ticket and Gmail thread outlive the session: re-provision in place
+    // (only session_id changes), never a second announcement.
     const target =
       issueSession ?? (await resolveSession(ownerGroupId, mg.id, existing.slack_thread_id, 'per-thread')).session;
 
@@ -452,7 +394,6 @@ async function dispatchSupportIssue(
     return;
   }
 
-  // ── New issue (or seeded/orphaned row): announcement → thread → session → seed → wake ──
   const adapter = getChannelAdapter(mg.channel_type);
   if (!adapter || typeof adapter.createThread !== 'function' || typeof adapter.postParent !== 'function') {
     log.error('dispatch_support_issue: channel adapter lacks thread support', { channelType: mg.channel_type });
@@ -469,8 +410,7 @@ async function dispatchSupportIssue(
     subject.slice(0, 80),
     threadOpener(sender, date, content.bodyText, linearIssue, triage),
   );
-  // chat-sdk needs the encoded thread id (`<platform_id>:<thread>`) for routing,
-  // mirroring orchestrator-dispatch.
+  // chat-sdk needs the encoded thread id for routing.
   const encodedThreadId = bareThreadId.includes(':') ? bareThreadId : `${mg.platform_id}:${bareThreadId}`;
 
   const { session: issueSession } = await resolveSession(session.agent_group_id, mg.id, encodedThreadId, 'per-thread');
@@ -518,12 +458,7 @@ async function dispatchSupportIssue(
   });
 }
 
-/**
- * `update_support_ticket` — a per-issue session reports the Linear ticket it
- * created. The row is resolved from the CALLING session id; the agent supplies
- * only the ticket fields. Best-effort: re-edit the channel announcement so the
- * parent message shows the ticket id.
- */
+/** The row is resolved from the CALLING session id; the agent supplies only ticket fields. */
 export async function handleUpdateSupportTicket(content: Record<string, unknown>, session: Session): Promise<void> {
   const linearIssue = str(content.linearIssue);
   if (!linearIssue) {
@@ -544,8 +479,7 @@ export async function handleUpdateSupportTicket(content: Record<string, unknown>
     sessionId: session.id,
   });
 
-  // Best-effort announcement edit — recompose the full announcement (subject +
-  // sender are stored on the row) so the parent message now shows the ticket id.
+  // Best-effort re-edit of the announcement to show the ticket id.
   if (row.slack_parent_msg_id && row.messaging_group_id) {
     const mg = await getMessagingGroup(row.messaging_group_id);
     const adapter = mg ? getChannelAdapter(mg.channel_type) : undefined;

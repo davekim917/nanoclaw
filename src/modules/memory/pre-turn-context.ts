@@ -23,35 +23,22 @@ import { USER_BY_ID_SQL } from '../permissions/db/users.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
-  // Per-file read cap. Only two things are read from the memory tree per turn —
-  // index.md and the matched preferences/<slug>.md files — so this plus the
-  // per-lane counts is the whole IO bound. Nothing walks the tree.
+  // Per-file read cap. Only index.md and matched preferences/<slug>.md are read
+  // per turn; nothing walks the tree.
   markdownFileBytes: 65_536,
-  // index.md, injected whole on a bootstrap turn. This is the retrieval
-  // mechanism for manual memory: the agent gets the map and reads or greps
-  // /workspace/workgroup/memory itself from there. Keep index.md under this
-  // bound or the map the agent navigates by is a truncated one.
+  // index.md, injected whole on a bootstrap turn: the map the agent navigates
+  // manual memory by. Keep index.md under this or the map is truncated.
   markdownCoreChars: 2_500,
   markdownHeadings: 24,
   markdownHeadingChars: 240,
-  // Deterministic per-person preference lane: preferences/<name-slug>.md files
-  // matching the conversation's involved senders are injected whole (bounded).
-  // Cap covers a busy multi-human thread; the per-file cap bounds one person's
-  // file. This is the ONLY lane that reads manual Markdown per turn — ordinary
-  // memory files are navigated by the agent from index.md, not scanned here.
-  // 2,200 matches the write-side guidance for a preference file's current-state
-  // section (~2,000 chars) with headroom — real files measure ~1.5-2.1KB.
+  // Per-person preference files matching the conversation's senders, injected
+  // whole; the ONLY lane that reads manual Markdown per turn. 2,200 fits the
+  // write-side guidance for a preference file (~2,000 chars) with headroom.
   preferenceExcerpts: 6,
   preferenceExcerptChars: 2_200,
-  // Total for the memory excerpt lane, enforced after selection.
-  //
-  // Load-bearing for the same reason capabilityTotalChars is: enforceFinalBound
-  // sacrifices conversation excerpts FIRST, so unbounded memory could silently
-  // evict every archive excerpt. No longer just a safety net now the per-file
-  // cap is 2,200: it fires with 3+ matched preference files, deliberately
-  // letting preferences crowd out ranked memory in many-human threads —
-  // preferences carry MAX_SAFE_INTEGER scores so they sort first, and the
-  // budget loop below pops the (lower-ranked) tail first.
+  // Load-bearing: enforceFinalBound sacrifices conversation excerpts FIRST, so
+  // unbounded memory could evict every archive excerpt. Preferences sort first
+  // (MAX_SAFE_INTEGER scores) and may crowd out ranked memory.
   memoryExcerptTotalChars: 6_600,
   archiveCandidates: 96,
   archiveExcerpts: 3,
@@ -59,132 +46,53 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   exactLinkCandidates: 32,
   exactLinkExcerpts: 8,
   capabilityServices: 32,
-  // Per-field cap for a roster entry. The block no longer carries the
-  // `useFor`/`activation` prose — that lives in `/workspace/capabilities.json`
-  // and reaches the agent through `get_capabilities({ service })` — so the
-  // only free text here is a ~80-char `summary`. 2500 stays as the ceiling
-  // rather than being tightened to the authoring target: it is what stops a
-  // pathological entry (a stored MCP `description` with no whitespace, say)
-  // from being clipped mid-sentence, and the roster budget below is what
-  // actually holds the block down.
+  // Per-field cap for a roster entry. Kept at 2500 (not the ~80-char authoring
+  // target) so a pathological entry isn't clipped mid-sentence; the roster
+  // budget is what holds the block down.
   capabilityDetailChars: 2500,
-  // Hard cap on ONE roster hint. Authoring target is ~80; this is the backstop
-  // for a derived summary whose source text has no early word boundary
-  // (`summarizeCapabilityText`, src/capabilities.ts), and for the hints that
-  // are deliberately longer because they change what the agent may DO — Slack
-  // WITHHELD, and the safety imperatives carried by GitHub, Cloudflare, Wix
-  // and Google Workspace.
-  //
-  // 200, up from 160: `boundedText` clips from the END, and an imperative
-  // ("never run `wix login`", "never verify with /user/tokens/verify") is
-  // written last in a hint for the same reason it is written last in the full
-  // prose — so a clip removes exactly the part that does the work. This is the
-  // same reasoning that took `capabilityDetailChars` from 600 to 2500. The cap
-  // is enforced, not advisory: `src/capabilities.test.ts` fails on an authored
-  // summary over it, so the clip stays unreachable rather than silent.
+  // Hard cap on ONE roster hint (authoring target ~80). `boundedText` clips from
+  // the END, where safety imperatives ("never run `wix login`") are written, so
+  // this must not clip them; `src/capabilities.test.ts` fails on an authored
+  // summary over it.
   capabilityRosterUseChars: 200,
-  // What the whole roster block — preamble included — is expected to cost.
-  // NOT an eviction trigger; the eviction trigger is `capabilityTotalChars`
-  // below. This is the number a test pins the widest-wired shape against, so
-  // that a service added with a paragraph for a `summary` fails in CI instead
-  // of quietly re-creating the budget pressure the roster removed. Measured
-  // 2026-09-17 against the widest-wired group's real `container.json`: 23
-  // services, 3,314 chars and nothing evicted, where the full-prose block was
-  // 14,307 and the budget dropped six services off its end.
-  //
-  // 5,200, up from 4,000, for two reasons that landed together. First, the
-  // safety imperatives moved back into the always-on text — the preamble
-  // gained the "never run an interactive login, never set your own
-  // Authorization header" sentence (822 chars now, from 360) and four hints
-  // gained their own — so the widest LIVE group went 3,314 -> 3,879. Second,
-  // the fixture this is asserted against was widened to hold EVERY
-  // hand-written entry rather than the ones one group happens to wire, since a
-  // budget measured over a subset is a ratchet a newly added service walks
-  // past; that fixture measures 4,530 over 27 services. The distance from
-  // there to `capabilityTotalChars` is the point: this trips long before
-  // eviction can.
+  // Expected cost of the whole roster block, preamble included. NOT an eviction
+  // trigger: a test pins the widest fixture (every hand-written entry) against
+  // it so an over-long `summary` fails in CI long before eviction can.
   capabilityRosterChars: 5_200,
-  // Eviction trigger for the capability block, enforced in
-  // `boundedCapabilities`. Measured over the SERVICES ARRAY only — it does not
-  // include the roster's `howToUse` preamble (~740 chars), so the block an
-  // agent actually receives is that much larger than this number. Compare
-  // `capabilityRosterChars` above, which is measured over the whole block and
-  // is the figure to reason about for context cost.
-  //
-  // Load-bearing: `finalChars` below is a budget for the ENTIRE serialized
-  // context, and enforceFinalBound evicts in the order conversation excerpts →
-  // memory excerpts → halve memory core → capability services. Capabilities are
-  // therefore the LAST thing sacrificed, so a per-field cap alone lets them
-  // silently consume the whole budget and starve recall: raising the per-field
-  // cap to 2500 with no total pushed a widely-wired owner-safe group's block to
-  // ~11.2k of the 12k budget, leaving the agent with zero archive recall and
-  // zero workgroup-memory excerpts and only an internal notice as evidence.
-  // 10,000 after the 2026-08-13 fleet audit: the widest-wired group's snapshot
-  // measures 9,508 chars raw, so the previous 8,000 silently dropped whole
-  // services from its bootstrap turns — the mirror image of the recall-starving
-  // incident this cap was added to prevent. Only bootstrap rows carry the
-  // block, and those are bounded by bootstrapFinalChars below, so this raise
-  // cannot starve recall.
-  //
-  // Since the block became a roster this is a SAFETY NET, not the thing that
-  // decides what an agent is told it has. Raising the cap was never the fix:
-  // the widest live group had already grown to 13,247 chars of prose, and the
-  // budget was dropping six services off the end of it (Fivetran, Profound,
-  // SELECT, Hex, Looker, dbt-mcp) — so the agent was never told about tools it
-  // holds, which is the exact failure the block exists to prevent. The roster
-  // costs 3,314 for the same 23 services, so this cap should now be unreachable
-  // on real content; keep it, because an operator can put anything in a stored
-  // MCP `description`.
+  // Eviction trigger in `boundedCapabilities`, measured over the services array
+  // only (the ~740-char preamble is extra). Load-bearing: capabilities are the
+  // LAST thing enforceFinalBound sacrifices, so without a total they can starve
+  // all recall. Since the roster, a safety net that real content shouldn't reach;
+  // keep it, since an operator can put anything in a stored MCP `description`.
   capabilityTotalChars: 10_000,
   finalChars: 12_000,
   exactLinkFinalChars: 16_000,
-  // Bootstrap turns carry mandatory payload the ordinary bound never sees —
-  // the capability block (capabilityTotalChars) and the core index
-  // (markdownCoreChars) — so bounding them at the ordinary 12,000 evicted
-  // every fact and archive excerpt on exactly the fleet's first impression of
-  // each thread. The 2026-08-13 incident: an agent denied knowing a project
-  // with 165 facts in its own store because the delivered bootstrap row held
-  // only a preference file. Derived: finalChars + capabilityTotalChars +
-  // 1,100. The +1,100 tracks the 2026-08-31 preference-lane fix, which raised
-  // memoryExcerptTotalChars 5,500 -> 6,600 to fit two per-person files
-  // instead of one after the alias-group rework — otherwise that raise would
-  // silently widen the bootstrap payload past the bound derived before it.
-  // Worst realistic bootstrap payload with today's constants: capability
-  // 10,000 + core index 2,500 + memory/preference excerpts 6,600 + lexical
-  // archive 3*900=2,700 = 21,800 before JSON/provenance overhead — comfortably
-  // under 23,100. Deliberately NOT the sum of every lane cap (recomputed
-  // honestly here, not copied from the old ~24.5k figure that predates the
-  // graph-scent lane's retirement): capability 10,000 + core index 2,500 +
-  // memory 6,600 + lexical archive 2,700 + exact-link 8*900=7,200 = 29,000.
-  // That combination is unreachable as a hard cap — exact-link rows are the
-  // one conversation lane enforceFinalBound protects from early eviction, so
-  // a turn that is simultaneously a bootstrap turn and a full exact-link
-  // match is exactly the case the safety net exists to shed memory/lexical
-  // excerpts for — and sizing the bound there would turn it into dead code
-  // instead of a live one.
+  // Bootstrap turns carry mandatory payload (capability block, core index) the
+  // ordinary bound never sees; at 12,000 they evicted every recall excerpt.
+  // Derived: finalChars + capabilityTotalChars + 1,100 (memory-lane raise).
+  // Worst realistic payload is ~21,800. Deliberately NOT the sum of every lane
+  // cap (~29,000): a bootstrap turn with a full exact-link match is exactly the
+  // case this bound should shed memory/lexical excerpts for.
   bootstrapFinalChars: 23_100,
 });
 
 export interface PreTurnContextInput {
   agentGroupId: string;
   sessionId: string;
-  /** Actual host-routed scope for agent-shared sessions; omitted uses the persisted session scope. */
+  /** Host-routed scope for agent-shared sessions; omitted uses the persisted session scope. */
   messagingGroupId?: string | null;
   threadId?: string | null;
   kind: string;
   trigger: 0 | 1;
   normalizedContent: string;
-  /** Provider-specific context identity supplied by the trusted host lifecycle. */
   provider?: string;
   contextEpoch?: number;
-  /** Full capabilities plus index.md are emitted only at a fresh context boundary. */
+  /** Full capabilities plus index.md only at a fresh context boundary. */
   includeBootstrap?: boolean;
-  /** Evidence already delivered in this provider context epoch. */
   seenEvidenceFingerprints?: readonly string[];
   /**
-   * Central-DB facts for the capabilities snapshot, resolved by the caller
-   * (`resolveSessionServicesCentral`) before its synchronous block. The build
-   * itself never awaits: it runs between a write guard and its insert.
+   * Resolved by the caller before its synchronous block: the build itself never
+   * awaits (it runs between a write guard and its insert).
    */
   servicesCentral: SessionServicesCentral;
 }
@@ -228,10 +136,8 @@ export interface PreTurnContext {
   provider?: string;
   contextEpoch?: number;
   /**
-   * The always-on capability ROSTER, not the full services snapshot: one line
-   * per wired service plus the standing instruction that heads it. Full usage
-   * notes stay in `/workspace/capabilities.json` behind
-   * `get_capabilities({ service })`. See `boundedCapabilities`.
+   * The always-on ROSTER (one line per wired service), not the full snapshot;
+   * full notes stay behind `get_capabilities({ service })`.
    */
   trustedCapabilities?: CapabilityRoster;
   memoryEvidence: {
@@ -247,7 +153,6 @@ export interface PreTurnContext {
 const CORE_PATHS = ['index.md'] as const;
 const PREFERENCES_DIR = 'preferences/';
 
-/** Canonical filename key for a person: "Pat Doe" -> "pat-doe". */
 function preferenceSlug(name: string): string {
   return name
     .toLocaleLowerCase('en-US')
@@ -257,7 +162,7 @@ function preferenceSlug(name: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-/** Stem matches a sender when equal or hyphen-prefix either way ("alex" <-> "alex-stone"). */
+/** Equal, or hyphen-prefix either way ("alex" <-> "alex-stone"). */
 function preferenceStemMatches(stem: string, senderSlug: string): boolean {
   return stem === senderSlug || senderSlug.startsWith(`${stem}-`) || stem.startsWith(`${senderSlug}-`);
 }
@@ -268,20 +173,14 @@ export interface PreferenceFrontmatter {
 }
 
 /**
- * Parses the optional leading frontmatter of a `preferences/<slug>.md` file
- * declaring the person's platform sender ids:
+ * Optional leading frontmatter declaring platform sender ids:
  *
  *   ---
  *   ids: [U0TEST111AAA, U0TEST222BBB]
  *   ---
- *   # body...
  *
- * Deliberately NOT a YAML parser — this grammar is one line long: a literal
- * `---\n` fence, one `ids: [...]` bracket-list line (entries trimmed, empties
- * ignored), a closing `---\n` fence. Anything that doesn't match that exact
- * shape (no opening fence, no `ids:` line, no closing fence) is treated as
- * absent frontmatter: `ids` empty, `body` the full original content,
- * unchanged. Never throws.
+ * Deliberately not YAML: exactly that shape, else `ids` is empty and `body` is
+ * the unchanged content. Never throws.
  */
 export function parsePreferenceFrontmatter(content: string): PreferenceFrontmatter {
   const OPEN = '---\n';
@@ -313,17 +212,8 @@ function extractSenderName(normalizedContent: string): string | null {
 }
 
 /**
- * Extracts the triggering message's sender id from normalized content — same
- * shapes the runner formatter's `extractSenderId` and the permissions
- * module's `extractAndUpsertUser` already
- * parse: top-level `senderId` string, else nested `author.userId` string.
- * Absence or a parse failure returns null, same permissiveness as
- * extractSenderName above. Unlike those two call sites this id is used
- * as-is, NOT namespaced with a channel-type prefix — it is typically the RAW
- * platform id (unnamespaced), and readMemoryEvidence's id tier deliberately
- * routes an unnamespaced id through the raw (bare-entry) map, keyed by the
- * id with the CURRENT conversation's verified channel_type prefix stripped —
- * see stripVerifiedPrefix.
+ * `senderId`, else `author.userId`; null on absence or parse failure. Returns
+ * the RAW (un-namespaced) platform id.
  */
 function extractSenderId(normalizedContent: string): string | null {
   try {
@@ -337,15 +227,7 @@ function extractSenderId(normalizedContent: string): string | null {
   }
 }
 
-/**
- * Looks up the CURRENT messaging group's channel_type ONCE per build, for
- * reuse by both trigger-sender namespacing (namespaceTriggerSenderId) and
- * verified-prefix stripping (stripVerifiedPrefix) in buildPreTurnContext and
- * readMemoryEvidence's id tier. A lookup failure (missing row, closed DB) or
- * a null messagingGroupId degrades to null: every caller treats a null
- * channelType as "no verified namespace for this conversation" and skips
- * stripping/prefixing rather than throwing.
- */
+/** Looked up ONCE per build; null means "no verified namespace" and callers skip stripping/prefixing. */
 function lookupChannelType(db: RawStatements, messagingGroupId: string | null): string | null {
   if (!messagingGroupId) return null;
   try {
@@ -359,23 +241,10 @@ function lookupChannelType(db: RawStatements, messagingGroupId: string | null): 
 }
 
 /**
- * Strips ONLY a VERIFIED namespace prefix — `${channelType}:` for the
- * CURRENT conversation's channel_type — and only when `id` actually starts
- * with it; otherwise `id` is returned completely unchanged.
- *
- * Do not "strip everything before the LAST colon" instead. That rule is unsound: a raw
- * platform handle can itself contain a colon (Matrix: `@alice:matrix.org`),
- * and `extractAndUpsertUser` stores
- * such a handle UN-prefixed (no leading `channelType:`) because it already
- * "looks namespaced". Suffixing at the last colon would collapse two
- * DIFFERENT people on different homeservers — `@alice:matrix.org` and
- * `@bob:matrix.org` — to the same "matrix.org" suffix, letting a bare
- * `ids: [matrix.org]` entry match a whole homeserver and letting an
- * unrelated archived participant suppress the trigger-fallback group.
- *
- * Only the id's OWN verified prefix may be removed. A colon-bearing id that
- * does not start with `${channelType}:` is left whole, colon and all, and
- * must NOT be treated as if it had a strippable namespace.
+ * Strips ONLY the current conversation's verified `${channelType}:` prefix.
+ * Never "everything before the last colon": raw handles can contain colons
+ * (`@alice:matrix.org`), and that rule would collapse different people on one
+ * homeserver to the same suffix.
  */
 function stripVerifiedPrefix(id: string, channelType: string | null): string {
   if (channelType === null) return id;
@@ -384,24 +253,9 @@ function stripVerifiedPrefix(id: string, channelType: string | null): string {
 }
 
 /**
- * Namespaces the trigger-fallback sender id the same way `extractAndUpsertUser`
- * namespaces an archived one: an id
- * that already contains a colon is left as-is, otherwise it is prefixed with
- * the CURRENT messaging group's channel_type (`${channelType}:${rawId}`).
- * `channelType` is the value `lookupChannelType` already resolved once in
- * buildPreTurnContext — this function does no DB access of its own.
- *
- * extractSenderId returns the RAW platform id off the wire (e.g. `U123`),
- * unlike an archived row's sender_id which is already namespaced at write
- * time. Without this, the fallback group's senderId could only ever hit
- * readMemoryEvidence's raw (bare-entry) map — never a file's namespace-exact
- * `ids: [discord:U123]` declaration. Namespacing it here makes it hit the
- * exact map first, and stripping its own (now-present) verified prefix still
- * hits the raw map as before — no change needed on the lookup side.
- *
- * A null channelType (lookup failure, or no current messaging group)
- * degrades to the raw id rather than throwing: worst case is falling back to
- * raw (bare-entry) matching, not losing the fallback group's id entirely.
+ * Namespaces a raw trigger id like `extractAndUpsertUser` namespaces archived
+ * ones (colon-free ids get `${channelType}:`), so it can hit a file's
+ * namespace-exact `ids:` entry. A null channelType degrades to the raw id.
  */
 function namespaceTriggerSenderId(rawId: string | null, channelType: string | null): string | null {
   if (rawId === null || rawId.includes(':') || !channelType) return rawId;
@@ -425,7 +279,6 @@ export function compareCodepoint(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** Recall stopword list: tokens too common to carry any ranking signal. */
 const STOP_WORDS = new Set([
   'a',
   'about',
@@ -488,34 +341,15 @@ function canonicalToken(token: string): string {
 }
 
 /**
- * Per-token canonical-form memo.
- *
- * Natural language is Zipfian, and this function is pure. A cold turn on the
- * largest workgroup makes 1,063,284 `canonicalToken` calls over 35,849 DISTINCT
- * tokens (29.7x reuse); memoizing removes 60% of the turn's CPU (7,047ms ->
- * 2,837ms measured). `TOKEN_STREAM_CACHE` cannot cover this: it is keyed per
- * candidate STRING, so every candidate on a cold turn misses and
- * re-canonicalizes the same few thousand words. The two caches are layered, not
- * alternatives.
- *
- * NO REORDER ON HIT — do not "improve" this into an LRU. A delete+set per hit
- * costs ~2.5s of the 4.2s saving (cold CPU: 2,837ms without, 5,457ms with).
- *
- * THE CAP IS A FLOOR, NOT A BUDGET. Without reordering, a sequential sweep over
- * a working set LARGER than the cap evicts every entry before its reuse and the
- * hit rate collapses to ZERO, not to "degraded" — measured: 0 hits over 119,836
- * lookups at a 50,000 cap against a 59,918-token sweep. That is the same failure
- * the `TOKEN_STREAM_CACHE` wholesale-`.clear()` had, wearing a different costume.
- * The memo is process-wide and shared across workgroups (the map is
- * workgroup-independent), so the working set is the UNION over every tree:
- * 79,071 distinct tokens today. 131,072 is ~1.66x that at a measured 51
- * bytes/entry (~6.4MB). Raising it is cheap; lowering it below the union is a
- * cliff. The hit-rate warning below is what makes that cliff observable.
- *
- * The cliff is worse than zero hits: past the cap every miss costs a delete
- * plus an insert, and V8 compacts the ordered hash table on delete, so a
- * 131,072-entry map runs ~80us per lookup (measured). Over-capacity is slower
- * than no memo at all, and the warning is the only thing that says so.
+ * Per-token canonical-form memo (Zipfian reuse; the per-string token-stream
+ * cache can't cover it). Two hazards measured:
+ * - NO REORDER ON HIT: do not make this an LRU; the delete+set per hit eats
+ *   most of the saving.
+ * - THE CAP IS A FLOOR: without reordering, a working set larger than the cap
+ *   drops the hit rate to ZERO, and over-capacity is slower than no memo. The
+ *   working set is the union of tokens across every workgroup; raising the cap
+ *   is cheap, lowering it below that union is a cliff. The hit-rate warning is
+ *   what makes the cliff observable.
  */
 const CANONICAL_MEMO = new Map<string, string>();
 const CANONICAL_MEMO_MAX = 131_072;
@@ -530,9 +364,7 @@ function canonicalTokenMemo(token: string): string {
   }
   CANONICAL_MEMO_STATS.misses++;
   const value = canonicalToken(token);
-  // Evict exactly ONE oldest entry. Never `.clear()` — one overflow must not
-  // discard the whole warm set. A Map iterates in insertion order, so the first
-  // key is the oldest.
+  // Evict exactly ONE oldest entry; never `.clear()` the warm set.
   if (CANONICAL_MEMO.size >= CANONICAL_MEMO_MAX) {
     CANONICAL_MEMO.delete(CANONICAL_MEMO.keys().next().value!);
   }
@@ -549,7 +381,6 @@ function canonicalTokenMemo(token: string): string {
   return value;
 }
 
-/** Test seam: proves the memo caches and evicts without asserting on wall clock. */
 export function _canonicalMemoStatsForTest(): { hits: number; misses: number; size: number; max: number } {
   return { ...CANONICAL_MEMO_STATS, size: CANONICAL_MEMO.size, max: CANONICAL_MEMO_MAX };
 }
@@ -567,50 +398,19 @@ export function tokenizeForRecall(value: string): string[] {
 
 export type RecallToken = { value: string; start: number; end: number };
 
-// Tokenizing ranked candidates is the single largest per-turn cost, and it
-// repeats near-identically across turns: the archive rows a conversation keeps
-// re-selecting are the same strings, re-normalized, re-matched and re-filtered
-// over and over. Measured against the retired 1 MiB / 1,058-fact ledger that
-// was 875 ms added to EVERY turn, scaling linearly with the candidate set.
-//
-// Keyed on the text itself, so it needs no invalidation: a rewritten fact is a
-// different string and simply misses. Evicted least-recently-used: a Map keeps
-// insertion order, so delete-and-reinsert on a hit moves a key to the young end
-// and the first key is always the oldest. Wholesale-clear was the bug — one
-// overflow threw away the entire warm set instead of one entry.
+// Tokenizing ranked candidates is the largest per-turn cost and repeats across
+// turns. Keyed on the text itself, so no invalidation is needed. LRU via
+// delete-and-reinsert on hit; never wholesale-clear.
 const TOKEN_STREAM_CACHE = new Map<string, readonly RecallToken[]>();
-// SIZING. An entry used to be one WINDOW, not one candidate: bestPassage
-// tokenized every boundedPassages window and a candidate yields 9-12 of them,
-// so the per-turn working set of the two large workgroups was 46,108 and
-// 131,245 entries — far past any cap worth paying for, and on a single
-// sequential sweep a partial cache yields ~zero hits rather than partial ones.
-//
-// passageWindows now tokenizes each CANDIDATE once and slices that stream per
-// window, so an entry is one candidate again and those working sets collapse to
-// 6,633 and 1,438 — both inside this cap, which is why the large workgroups get
-// a warm cache for the first time. Measured heap is ~4.4 KB per entry, so
-// 24,576 entries is ~108 MB worst case.
-//
-// The cache still earns its place after that fix: it is what makes repeated
-// selection of the same candidate nearly free. The fix removes intra-turn
-// duplication; the cache removes inter-turn repetition. They are not
-// substitutes.
-// ponytail: entry-count cap, not a byte cap — a candidate is bounded by the
-// per-lane read caps, so entries stay within ~2x of the measured mean.
+// An entry is one candidate (windows slice its stream), ~4.4 KB each, so
+// 24,576 is ~108 MB worst case.
 const TOKEN_STREAM_CACHE_MAX = 24_576;
 
 const TOKEN_STREAM_CACHE_STATS = { hits: 0, misses: 0 };
 
-/**
- * Process-wide counters for the offset-slicing fast path (see `offsetSliceable`
- * below): how many `passageWindows` calls could slice a single whole-candidate
- * tokenization instead of re-tokenizing every window. Read (and diffed) by the
- * per-build log line in `buildPreTurnContext`; incremented in `passageWindows`,
- * the only caller of `offsetSliceable`.
- */
+/** Offset-slicing fast-path counters, diffed per build for the log line. */
 const OFFSET_SLICE_STATS = { hits: 0, total: 0 };
 
-/** Test seam: proves cache behavior without asserting on wall-clock timing. */
 export function _tokenStreamCacheStatsForTest(): { hits: number; misses: number; size: number; max: number } {
   return { ...TOKEN_STREAM_CACHE_STATS, size: TOKEN_STREAM_CACHE.size, max: TOKEN_STREAM_CACHE_MAX };
 }
@@ -625,7 +425,6 @@ export function tokenStreamForRecall(value: string): readonly RecallToken[] {
   const cached = TOKEN_STREAM_CACHE.get(value);
   if (cached) {
     TOKEN_STREAM_CACHE_STATS.hits++;
-    // Re-insert to move this key to the young end of the iteration order.
     TOKEN_STREAM_CACHE.delete(value);
     TOKEN_STREAM_CACHE.set(value, cached);
     return cached;
@@ -708,46 +507,20 @@ function sentenceSpans(candidate: string, maxChars: number): Array<{ start: numb
 const RECALL_TOKEN_CHAR = /[\p{L}\p{N}_-]/u;
 
 /**
- * A non-ASCII character that neither NFKC nor en-US lowercasing can move off
- * its own index, and that cannot pull a NEIGHBOUR off theirs. Four properties,
- * each of which is load-bearing for `offsetSliceable`'s coordinate-space claim:
- *
- * - NOT A SURROGATE. Astral scalars occupy two UTF-16 indices, so a window edge
- *   could split one and a slice would see two lone surrogates where the whole
- *   string saw a letter. (Checked by the caller, which already has the code.)
- * - NOT A COMBINING MARK, AND NOT A HANGUL JAMO. Canonical reordering only
- *   permutes non-starters and canonical composition only merges a starter with
- *   a following non-starter (or an L/V/T jamo with its neighbour). Exclude both
- *   and every character's decomposition is a self-contained run bounded by the
- *   next character's starter, so NFKC cannot act across a character boundary —
- *   which is what makes it distribute over concatenation, and therefore over
- *   slicing. `é` as a single U+00E9 qualifies (it decomposes and recomposes
- *   within itself); `e` + U+0301 does not.
- * - NFKC-STABLE ON ITS OWN. Rules out every compatibility expansion ('ﬁ' ->
- *   'fi', '①' -> '1', 'Ⅷ' -> 'VIII', NBSP -> space).
- * - LOWERCASES TO EXACTLY ONE UNIT. Rules out 'İ' -> 'i' + U+0307. U+03A3 is
- *   excluded outright because it is the one character whose lowercase is
- *   CONTEXT-sensitive in the root locale (Final_Sigma: 'Σ' -> 'ς' at word end,
- *   'σ' elsewhere), so a slice could case it differently from the whole.
- *
- * Verified exhaustively over the BMP: of the 58,796 code points this admits,
- * zero are non-starters, zero have a context-sensitive lowercase, and NFKC +
- * lowercasing distributes over every pair and 3M random triples drawn from
- * them.
+ * A non-ASCII character that neither NFKC nor en-US lowercasing can move off its
+ * own index or pull a neighbour off theirs, which `offsetSliceable` relies on:
+ * not a surrogate (checked by the caller), not a combining mark or Hangul jamo
+ * (so NFKC can't act across a character boundary), NFKC-stable alone, and
+ * lowercasing to exactly one unit. U+03A3 is excluded because its lowercase is
+ * context-sensitive (Final_Sigma). Verified exhaustively over the BMP.
  */
 const OFFSET_UNSTABLE_CHAR = /\p{M}|[ᄀ-ᇿꥠ-꥿ힰ-퟿Σ]/u;
 const OFFSET_STABLE_CHAR = new Map<string, boolean>();
 
 /**
- * True when NFKC + en-US lowercasing maps every index of `value` to itself, so
- * offsets into the normalized string are offsets into the original.
- *
- * Per character rather than whole-string, because whole-string length equality
- * is NOT sufficient: an expansion and a contraction cancel ('ﬁ' + 'e' + U+0301
- * is three units before and after) and canonical reordering is length-preserving
- * by definition. ASCII short-circuits on the code unit, so the common candidate
- * never touches the Map; the repertoire above ASCII is a few dozen characters
- * across a whole store, so the `normalize` calls are paid once each per process.
+ * True when NFKC + en-US lowercasing maps every index of `value` to itself.
+ * Per character, because whole-string length equality is NOT sufficient (an
+ * expansion and a contraction can cancel).
  */
 function offsetStable(value: string): boolean {
   for (let index = 0; index < value.length; index++) {
@@ -769,33 +542,11 @@ function offsetStable(value: string): boolean {
 }
 
 /**
- * True when the whole-candidate token stream can be sliced by window offset
- * instead of re-tokenizing every window. Two independent things have to hold,
- * and neither is safe to assume:
- *
- * - COORDINATE SPACE. `tokenStreamForRecall` matches against
- *   `value.normalize('NFKC').toLocaleLowerCase('en-US')`, so `token.start/.end`
- *   index the NORMALIZED string, while windows are slices of the ORIGINAL.
- *   NFKC changes length in both directions ('ﬁ' -> 'fi' grows, 'e' + U+0301 ->
- *   'é' shrinks) and en-US lowercasing grows ('İ' -> 'i' + U+0307), so the two
- *   spaces are not interchangeable in general — conflating them mis-slices
- *   silently. `offsetStable` is the exact condition for them to coincide.
- *   ASCII is a strict subset of it and used to be the whole test, which cost
- *   the fast path to a single em-dash: 372 of the 574 files in the live store
- *   are non-ASCII, essentially all of them only in punctuation, and each one
- *   was re-tokenizing ~118 windows instead of 1.
- * - CLEAN CUTS. The token pattern is a bare character-class run with no
- *   lookaround, so a slice yields exactly the matches it fully contains — but
- *   only when no run crosses a window edge. Window edges are sentence-span
- *   edges, and an edge cuts a run precisely when the characters either side of
- *   it are both token characters. `sentenceSpans` hard-chops a sentence longer
- *   than `maxChars` at a fixed offset, which lands mid-word routinely.
- *   (Sound to test one UTF-16 unit at a time only because `offsetStable` has
- *   already ruled out surrogates, so every index is a whole character.)
- *
- * Failing either check costs the candidate the speedup, never correctness: it
- * falls back to the original per-window tokenization. Measured fast-path
- * coverage on the live store is 99.3% of fact lines and 90.9% of whole files.
+ * Whether the whole-candidate token stream can be sliced by window offset.
+ * Both must hold: token offsets index the NORMALIZED string while windows slice
+ * the ORIGINAL, so every index must be offset-stable; and no token run may
+ * cross a window edge (`sentenceSpans` hard-chops long sentences mid-word).
+ * Failing costs only the speedup, never correctness.
  */
 function offsetSliceable(candidate: string, sentences: readonly { start: number; end: number }[]): boolean {
   if (!offsetStable(candidate)) return false;
@@ -808,20 +559,10 @@ function offsetSliceable(candidate: string, sentences: readonly { start: number;
 }
 
 /**
- * The window geometry `bestPassage` scores, WITHOUT materializing a token array
- * per window.
- *
- * TWO COORDINATE SYSTEMS, and conflating them is the way to break this:
- * `start`/`end` are CHARACTER offsets into `candidate`. `tokenLo`/`tokenHi`
- * are the half-open range of PARENT-STREAM TOKEN indices, which only exist when
- * `stream` is non-null.
- *
- * `stream` is the whole-candidate token stream when the candidate is
- * offset-sliceable. When it is null the candidate failed the sliceability gate
- * and each window must be tokenized from its own text; those two tokenizations
- * genuinely disagree (a mid-word chop mints window-local tokens the parent
- * stream never had, ~1 candidate in 9,001 on the live store), so the null case
- * is a correctness gate, not a missed optimization.
+ * TWO COORDINATE SYSTEMS: `start`/`end` are CHARACTER offsets into `candidate`;
+ * `tokenLo`/`tokenHi` are PARENT-STREAM token indices, present only when
+ * `stream` is non-null. A null stream is a correctness gate (window-local
+ * tokenization genuinely differs), not a missed optimization.
  */
 function passageWindowSpans(
   candidate: string,
@@ -836,9 +577,8 @@ function passageWindowSpans(
   if (sliceable) OFFSET_SLICE_STATS.hits++;
   const stream = sliceable ? tokenStreamForRecall(candidate) : null;
 
-  // Token index at each span edge. Span offsets are non-decreasing and (given
-  // the clean-cut check) no token crosses an edge, so two monotone cursors
-  // place every edge in a single pass.
+  // Spans are non-decreasing and no token crosses an edge, so two monotone
+  // cursors place every edge in one pass.
   const firstToken: number[] = [];
   const afterToken: number[] = [];
   if (stream) {
@@ -860,12 +600,8 @@ function passageWindowSpans(
       if (windowEnd - windowStart > maxChars) break;
       windows.push({
         text: candidate.slice(windowStart, windowEnd),
-        // The span is REPORTED, not re-derived. Recovering these offsets by
-        // searching for the window text finds the FIRST occurrence, not this
-        // one — on `'aa bb?\naa bb?'` the third window's true [7,13) reads back
-        // as [0,6), byte-identical and therefore invisible to a round-trip
-        // check. The offsets exist here; nothing should ever go looking for
-        // them again. `recall-ranking.test.ts` pins exactly that case.
+        // REPORTED, never re-derived: searching for the window text finds the
+        // first occurrence, not this one (pinned in recall-ranking.test.ts).
         start: windowStart,
         end: windowEnd,
         tokenLo: stream ? firstToken[first]! : 0,
@@ -877,16 +613,9 @@ function passageWindowSpans(
 }
 
 /**
- * The overlapping windows paired with their tokens.
- *
- * `bestPassage` uses `passageWindowSpans` directly so it never materializes a
- * token array per window; this is the materialized form the ranking tests
- * assert against. The windows themselves are unchanged —
- * still original-string slices, so the text delivered to the agent is
- * byte-identical. The candidate is tokenized ONCE and each window takes a slice
- * of that stream: the 1..3-sentence sweep re-covers the same characters ~2.9x on
- * the live 6,633-fact store, and every window is a distinct string, so no cache
- * could ever collapse the duplication.
+ * Materialized windows the ranking tests assert against; `bestPassage` uses
+ * `passageWindowSpans` directly. Windows are original-string slices, so the
+ * delivered text is byte-identical.
  */
 export function passageWindows(
   candidate: string,
@@ -928,12 +657,9 @@ function comparePassageMatch(a: PassageMatch, b: PassageMatch): number {
 }
 
 /**
- * The encoded score. NOT display-only, despite what the comment inside the old
- * `bestPassage` claimed: it drives `excerpts.sort((a, b) => b.score - a.score)`,
- * decides which excerpt the character budget sheds, ships serialized in the
- * provider payload, and gates the conflict notice. Every arm below must
- * reproduce it BIT-EXACTLY, which is why `density` is passed as the same float
- * both paths compute rather than recomputed from rounded parts.
+ * NOT display-only: it drives sorting, budget shedding, the serialized payload
+ * and the conflict notice. Every arm must reproduce it BIT-EXACTLY, hence the
+ * same float `density` rather than one recomputed from rounded parts.
  */
 function encodePassageScore(coverage: number, density: number, tokenSpan: number, questionLike: boolean): number {
   return (
@@ -955,8 +681,7 @@ function bestPassage(
   const matches: PassageMatch[] = [];
 
   if (stream === null) {
-    // Sliceability gate failed: window text and the parent stream disagree, so
-    // each window is tokenized from its own text exactly as before.
+    // Window text and the parent stream disagree: tokenize each window itself.
     for (const { text } of windows) {
       const passageTokens = tokenStreamForRecall(text);
       const candidateSet = new Set(passageTokens.map((token) => token.value));
@@ -977,10 +702,8 @@ function bestPassage(
     return matches.sort(comparePassageMatch)[0] ?? null;
   }
 
-  // Fast path. Building a Set over EVERY token of EVERY window was 55-59% of the
-  // whole ranking sweep (measured 250ms of 424ms on the largest live store).
-  // Only query terms can ever contribute, so collect their positions once per
-  // candidate and read each window off that.
+  // Fast path: only query terms can contribute, so collect their positions once
+  // per candidate instead of a Set over every window's tokens.
   const queryTermSet = new Set(queryTokens);
   const hitIndex: number[] = [];
   const hitTerm: string[] = [];
@@ -992,8 +715,7 @@ function bestPassage(
     }
   }
 
-  // `windows` is ordered by `tokenLo` non-decreasing, so one monotone cursor
-  // finds each window's first hit without rescanning.
+  // `windows` is ordered by `tokenLo`, so one monotone cursor suffices.
   let cursor = 0;
   for (const { text, tokenLo, tokenHi } of windows) {
     while (cursor < hitIndex.length && hitIndex[cursor]! < tokenLo) cursor++;
@@ -1003,13 +725,10 @@ function bestPassage(
       matchedTerms.add(hitTerm[end]!);
       end++;
     }
-    // Filter BEFORE computing density: `tokenHi - tokenLo` is zero for an empty
-    // window and `0 / 0` would put NaN into the score.
+    // Filter BEFORE density: an empty window would give 0 / 0 = NaN.
     if (matchedTerms.size < minimumOverlap) continue;
-    // Span in PARENT-STREAM indices, never in hit-list positions. Hit-list
-    // positions are compressed — they skip every non-query token in between — so
-    // using them would shrink the span whenever other words interleave and
-    // silently change tokenSpan, score and ranking order.
+    // Span in PARENT-STREAM indices, never hit-list positions (those skip
+    // non-query tokens and would shrink the span, changing the ranking).
     let tokenSpan = Number.POSITIVE_INFINITY;
     for (let start = cursor; start < end; start++) {
       const seen = new Set<string>();
@@ -1032,17 +751,12 @@ function bestPassage(
       score: encodePassageScore(matchedTerms.size, density, tokenSpan, questionLike),
     });
   }
-  // Stable sort, kept deliberately. A keep-best scan is NOT equivalent: on a
-  // four-field tie `<=` takes the LAST window where the sort takes the FIRST,
-  // changing the bytes delivered. See the tie case in the tests.
+  // Stable sort, deliberately: a keep-best scan takes the LAST window on a
+  // four-field tie where the sort takes the FIRST, changing the bytes delivered.
   return matches.sort(comparePassageMatch)[0] ?? null;
 }
 
-/**
- * Test seam. The hit-list fast path and the non-sliceable fallback must agree
- * bit-for-bit on `tokenSpan`, `density` and `score`, and the only way to assert
- * that is to call the ranker directly rather than through a whole turn.
- */
+/** Test seam: the fast path and the fallback must agree bit-for-bit. */
 export function _bestPassageForTest(
   queryTokens: string[],
   candidate: string,
@@ -1079,11 +793,7 @@ function lexicalScore(queryTokens: string[], candidate: string): number {
   return bestPassage(queryTokens, candidate)?.score ?? 0;
 }
 
-/**
- * The only permitted query expansion is ephemeral and bounded. It is used
- * after an unchanged lexical corpus fails, and its terms never become
- * evidence or persistent state.
- */
+/** Ephemeral and bounded: its terms never become evidence or persistent state. */
 export function ephemeralExpansion(query: string): string[] {
   const tokens = new Set(tokenizeForRecall(query));
   const expanded: string[] = [];
@@ -1149,17 +859,10 @@ function readBoundedFile(
   canonicalRoot: string,
   maxBytes: number = PRE_TURN_BOUNDS.markdownFileBytes,
 ): { content: string; bytes: number; truncated: boolean } {
-  // Open the checked leaf itself without following a final-component symlink,
-  // then validate the identity of the object that was actually opened. A
-  // leaf-only O_NOFOLLOW does not stop an enumerated ancestor directory from
-  // being swapped to a symlink before open.
-  //
-  // Node has no portable openat(2) API. The cross-platform equivalent here is
-  // to pin the leaf with an fd, resolve the requested path under the canonical
-  // root, and require that resolved object's device+inode match the pinned fd
-  // before reading. If an ancestor remains swapped, containment fails. If it
-  // is swapped back after open, identity fails. The final read uses the already
-  // validated fd, so a later path mutation cannot redirect it.
+  // No portable openat(2): pin the leaf with an O_NOFOLLOW fd, resolve the path
+  // under the canonical root, and require the resolved object's device+inode to
+  // match the fd before reading from it. That defeats a swapped ancestor both
+  // before and after open.
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const stat = fs.fstatSync(fd);
@@ -1186,11 +889,7 @@ function readBoundedFile(
   }
 }
 
-/**
- * Direct, non-recursive listing of one directory's Markdown stems. The
- * preference lane is a deterministic direct-path lookup keyed by sender slug,
- * so it reads exactly the one directory it needs.
- */
+/** Direct, non-recursive listing of one directory's Markdown stems. */
 function listDirectMarkdownStems(root: string, dir: string, notices: ContextNotice[]): string[] {
   let entries: fs.Dirent[];
   try {
@@ -1222,47 +921,20 @@ function listDirectMarkdownStems(root: string, dir: string, notices: ContextNoti
 }
 
 interface InvolvedSenderGroup {
-  /** Archive's stable sender_id for this person, or null for the trigger-sender fallback group. */
   senderId: string | null;
-  /** Per-message display name and, when resolved and different, the canonical users.display_name. */
+  /** Per-message display name, plus the canonical users.display_name when resolved and different. */
   aliases: readonly string[];
 }
 
 /**
- * Module-level mtime+size cache of one `preferences/<stem>.md` file's
- * declared `ids:` frontmatter, keyed by absolute path. Before this cache,
- * readMemoryEvidence's id-index tier read every preferences/ file (up to
- * markdownFileBytes each) on EVERY admissible turn just to build
- * exactIdToRelative/rawIdToRelative — steady-state cost scaled with the
- * number of files in the directory regardless of whether anything changed.
- * A cache hit now costs one `fs.lstatSync`; a miss (new file, or an
- * mtime/size change) falls through to the existing `readPreferenceFile`
- * read, same as before.
- *
- * Only the frontmatter IDS ride this cache. The excerpt-build loop further
- * down, for whichever files end up MATCHED to a sender, still reads fresh
- * content every turn through `readPreferenceFile` (that function's own
- * per-turn Map, unaffected by this one) — correctness of the injected TEXT
- * is unchanged; only the id lookup used to DECIDE which files match by id is
- * now cached across turns.
- *
- * (mtimeMs, size) is the change-detection key, not a content hash — hashing
- * would defeat the point, since it requires reading the very bytes this
- * cache exists to avoid reading. A same-mtime-same-size in-place edit is
- * therefore an accepted staleness window: file writes are sub-second and
- * `write_memory_file` (the only writer of these files) always rewrites the
- * whole file rather than patching it in place, which moves mtime every time.
- *
- * Not swept for deleted files: a stale entry for a since-deleted path is
- * never looked up again (its stem no longer appears in a directory listing
- * unless the filename is recreated, and a recreated file's fresh write moves
- * mtime, which invalidates the entry naturally) — one leaked Map slot per
- * since-deleted file is cheaper than eagerly diffing the whole cache against
- * every turn's listing.
+ * mtime+size cache of each preference file's `ids:` frontmatter, so the id
+ * tier costs one lstat per file per turn. Only the ids ride it: matched files'
+ * content is still read fresh. A same-mtime-same-size in-place edit is an
+ * accepted staleness window (the only writer rewrites whole files). Deleted
+ * paths are not swept; a stale entry is never looked up again.
  */
 const PREFERENCE_ID_CACHE = new Map<string, { mtimeMs: number; size: number; ids: string[] }>();
 
-/** Test seam: clears the cache between test cases that reuse fixture paths. */
 export function _resetPreferenceIdCacheForTest(): void {
   PREFERENCE_ID_CACHE.clear();
 }
@@ -1275,10 +947,7 @@ function readMemoryEvidence(
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
   involvedSenders: ReadonlyArray<InvolvedSenderGroup> = [],
-  /** CURRENT conversation's verified channel_type, threaded from
-   * buildPreTurnContext's single lookupChannelType call. Default null means
-   * "no verified namespace" — stripVerifiedPrefix then never strips, so a
-   * bare `ids:` entry only ever matches a genuinely colon-free sender_id. */
+  /** Null = no verified namespace, so a bare `ids:` entry matches only colon-free sender ids. */
   channelType: string | null = null,
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
@@ -1309,41 +978,19 @@ function readMemoryEvidence(
     }
   }
 
-  // Deterministic per-person preference lane. Files under preferences/ are
-  // keyed by name slug (or, when the file declares an `ids:` frontmatter
-  // block, by explicit platform sender id) and injected whole for the
-  // conversation's involved senders. Selection tier, in order: (1) explicit
-  // `ids:` frontmatter — a file whose declared ids include the group's
-  // sender_id wins outright and skips name matching entirely; (2) per-message
-  // display name; (3) canonical `users.display_name`. ONE FILE PER PERSON,
-  // never per alias: `involvedSenders` groups each participant's aliases
-  // (their per-message display name and, when resolved, set and different,
-  // their canonical `users.display_name`) so a platform rename can't leave
-  // BOTH the pre-rename and post-rename preference file injected as
-  // conflicting guidance for the same human. For each group, name aliases are
-  // tried IN ORDER — per-message name first, canonical name as fallback,
-  // preserving pre-PR behavior when both files happen to exist — using the
-  // exact-slug-wins-else-longest-stem rule below; the first alias that claims
-  // an unclaimed file wins and the group stops looking. An alias matching a
-  // file an earlier group already claimed falls through to the next alias
-  // for a name match — that file belongs to the other person. An id match is
-  // terminal for its group instead: a resolved id stops the group right
-  // there, claiming the file if unclaimed and contributing nothing if
-  // another group already claimed it — it NEVER falls through to name/alias
-  // matching. This is what stops a human declared under two raw ids in one
-  // file (e.g. an old and a new platform id for the same person,
-  // `ids: [U1, U2]`, each matched by stripping the CURRENT conversation's
-  // verified channel_type prefix — see stripVerifiedPrefix) from having
-  // their second, already-resolved group also pick up a second, stale
-  // name-matched file for the same person. Never lexically ranked, so a
-  // preference cannot lose a relevance contest to unrelated memory. Reads
-  // run before the ranked scan so the shared byte budget cannot starve them.
+  // Per-person preference lane, never lexically ranked. Tiers: (1) explicit
+  // `ids:` frontmatter, (2) per-message display name, (3) canonical display
+  // name. ONE FILE PER PERSON: a rename must not inject both the old and new
+  // file. Name aliases are tried in order; one hitting a file another group
+  // claimed falls through to the next alias. An id match is TERMINAL for its
+  // group (claims the file or contributes nothing) and never falls through to
+  // name matching, or a person declared under two ids picks up a stale second
+  // file. Read before the ranked scan so the shared budget can't starve it.
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenders.length > 0) {
     const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
-    // ONE file per sender alias: exact slug match wins outright; otherwise
-    // the longest prefix-compatible stem. Matching every prefix would let
-    // `alex.md` ride along with `alex-stone.md` for the same person.
+    // Exact slug wins, else the longest prefix-compatible stem; matching every
+    // prefix would add `alex.md` alongside `alex-stone.md`.
     const matchStem = (slug: string): string | undefined => {
       if (preferenceStems.includes(slug)) return slug;
       const compatible = preferenceStems
@@ -1351,15 +998,8 @@ function readMemoryEvidence(
         .sort((a, b) => b.length - a.length || compareCodepoint(a, b));
       return compatible[0];
     };
-    // Every preferences/ file is read AT MOST ONCE per turn, cached here —
-    // the id tier below needs each file's frontmatter to build the id map,
-    // and the selection loop further down needs the same file's content
-    // (for a matched file) to build the injected excerpt. Caching (rather
-    // than reading twice) also keeps a read FAILURE a one-time event: without
-    // it, a file whose read throws once (e.g. the security check in
-    // `readBoundedFile` rejecting a symlink-swapped ancestor) would silently
-    // succeed on a second, unrelated read attempt and the resulting
-    // `preference-read-failed` notice would never fire.
+    // Each file is read AT MOST ONCE per turn, which also keeps a read failure
+    // from silently succeeding on a second attempt and hiding its notice.
     const preferenceFileReads = new Map<string, { content: string } | { error: unknown }>();
     const readPreferenceFile = (relative: string): { content: string } | { error: unknown } => {
       const cached = preferenceFileReads.get(relative);
@@ -1373,12 +1013,7 @@ function readMemoryEvidence(
       preferenceFileReads.set(relative, result);
       return result;
     };
-    // Reported at most once per file per turn — the id-index loop below
-    // attempts every preferences/ file regardless of whether it ends up
-    // matched, and the excerpt-build loop further down re-reads the same
-    // (cached) result for whichever subset got matched by name, so without
-    // this guard a file reached by both would surface two notices for one
-    // failure.
+    // At most one notice per file per turn (both loops may reach a file).
     const reportedReadFailures = new Set<string>();
     const reportReadFailure = (relative: string, error: unknown): void => {
       if (reportedReadFailures.has(relative)) return;
@@ -1390,24 +1025,11 @@ function readMemoryEvidence(
         detail: `${relative}: ${error instanceof Error ? error.message : String(error)}`,
       });
     };
-    // Explicit-id tier: index every preferences/ file's declared ids. An
-    // entry WITHOUT a colon (a "bare" entry) matches a sender_id with the
-    // CURRENT conversation's VERIFIED channel_type prefix stripped
-    // (stripVerifiedPrefix) — one entry covers every conversation in this
-    // channel, but NOT an arbitrary other namespace; an entry WITH a colon
-    // must equal the full sender_id exactly. Every file is attempted here
-    // regardless of whether any sender later matches it by name, so a read
-    // failure is reported even for a file "matches nothing by name" would
-    // otherwise never reach.
-    //
-    // Ids ride PREFERENCE_ID_CACHE (mtime+size keyed) instead of a full read
-    // every turn — see that Map's doc comment above. `fs.lstatSync`, not
-    // `fs.statSync`, mirrors readBoundedFile's O_NOFOLLOW leaf semantics: a
-    // leaf swapped to a symlink since the last successful read reports
-    // `isFile() === false` here exactly as O_NOFOLLOW would refuse to open
-    // it there, so a swapped leaf never satisfies a cache hit and always
-    // falls through to the fully safety-checked readPreferenceFile read
-    // below — same as an ordinary (uncached) miss.
+    // Explicit-id tier over every file (so read failures are reported even for
+    // unmatched files). A bare entry matches a sender id with the current
+    // conversation's verified prefix stripped; a colon entry must equal the full
+    // id. `lstatSync` mirrors readBoundedFile's O_NOFOLLOW: a symlink-swapped
+    // leaf never satisfies a cache hit.
     const frontmatterIds = (relative: string): string[] | undefined => {
       const absolute = path.join(root, relative);
       let stat: fs.Stats | undefined;
@@ -1420,15 +1042,12 @@ function readMemoryEvidence(
         const cached = PREFERENCE_ID_CACHE.get(absolute);
         if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.ids;
       } else {
-        // Gone, or no longer a plain file (e.g. symlink-swapped) — never
-        // trust a stale entry for this path; let the read below produce
-        // (and report) the real failure.
+        // Gone or no longer a plain file: never trust the stale entry.
         PREFERENCE_ID_CACHE.delete(absolute);
       }
       const read = readPreferenceFile(relative);
       if (!('content' in read)) {
-        // Never cached on failure — retried fresh next turn, same as every
-        // other read failure in this lane.
+        // Never cached on failure.
         reportReadFailure(relative, read.error);
         return undefined;
       }
@@ -1436,15 +1055,9 @@ function readMemoryEvidence(
       if (stat?.isFile()) PREFERENCE_ID_CACHE.set(absolute, { mtimeMs: stat.mtimeMs, size: stat.size, ids });
       return ids;
     };
-    // Duplicate declarations of the same id across DIFFERENT files are
-    // ambiguous. Map.set used to let the lexically-last stem silently win —
-    // collect every (id -> declaring files) pair first instead. An id
-    // declared by more than one distinct file is blacklisted from id
-    // matching entirely (both files lose it, one degraded notice per
-    // conflicting id per turn); affected senders fall back to name matching,
-    // same as a file with no ids: frontmatter at all. A Set per id absorbs
-    // the same file declaring an id twice (not a conflict) without
-    // over-counting.
+    // An id declared by more than one file is ambiguous: blacklist it for id
+    // matching (both files lose it, with a notice); those senders fall back to
+    // name matching.
     const exactDeclarations = new Map<string, Set<string>>();
     const rawDeclarations = new Map<string, Set<string>>();
     for (const stem of preferenceStems) {
@@ -1481,16 +1094,9 @@ function readMemoryEvidence(
     for (const group of involvedSenders) {
       if (matched.length >= PRE_TURN_BOUNDS.preferenceExcerpts) break;
 
-      // Explicit id match wins over name/alias matching. Exact namespaced id
-      // first (full sender_id string, unaffected by channelType), then the
-      // raw (bare-entry) tier — but ONLY when stripVerifiedPrefix actually
-      // removed the CURRENT conversation's verified channel_type prefix, or
-      // the id was already colon-free to begin with. A colon-bearing id that
-      // does NOT start with the verified prefix (a Matrix-style raw handle
-      // whose own colon isn't a namespace separator, or a sibling bot's
-      // differently-namespaced sender_id) is left whole and must NOT reach
-      // the raw map — that would resurrect the last-colon-suffix bug this id
-      // tier exists to avoid.
+      // Exact namespaced id first, then the raw tier ONLY when the id was
+      // colon-free or its verified prefix was actually stripped: a colon-bearing
+      // id under another namespace must never reach the raw map.
       let idRelative: string | undefined;
       if (group.senderId !== null) {
         idRelative = exactIdToRelative.get(group.senderId);
@@ -1503,11 +1109,7 @@ function readMemoryEvidence(
         }
       }
       if (idRelative !== undefined) {
-        // Terminal for this group either way: claim the file if unclaimed,
-        // or contribute nothing if an earlier group already claimed it — an
-        // id resolution is never a reason to fall through to name matching
-        // (see the lane comment above for the shared-raw-id case this
-        // prevents).
+        // Terminal either way: never fall through to name matching.
         if (!selectedRelatives.has(idRelative)) {
           selectedRelatives.add(idRelative);
           matched.push(idRelative);
@@ -1521,10 +1123,7 @@ function readMemoryEvidence(
         const stem = matchStem(slug);
         if (stem === undefined) continue;
         const relative = `${PREFERENCES_DIR}${stem}.md`;
-        // A file an earlier group already claimed is that PERSON's file, not
-        // this one's — fall through to the next alias (two humans sharing a
-        // display name resolve through their differing canonical names)
-        // instead of silently contributing nothing.
+        // Another group's claimed file belongs to that person: try the next alias.
         if (selectedRelatives.has(relative)) continue;
         selectedRelatives.add(relative);
         matched.push(relative);
@@ -1534,9 +1133,7 @@ function readMemoryEvidence(
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
       const read = readPreferenceFile(relative);
       if ('error' in read) {
-        // Already reported by the id-index loop above for every stem
-        // (matched or not) — reportReadFailure's dedupe means this only
-        // actually pushes a (second) notice if that invariant ever breaks.
+        // Normally already reported by the id-index loop (deduped).
         reportReadFailure(relative, read.error);
         continue;
       }
@@ -1578,13 +1175,11 @@ function readMemoryEvidence(
       detail: `suppressed ${suppressed} unchanged Markdown passage${suppressed === 1 ? '' : 's'} in this context epoch`,
     });
   }
-  // Most relevant first: enforceFinalBound pops from the end when over budget.
-  // Preferences carry MAX_SAFE_INTEGER scores, so they sort first and the
-  // budget loop below (which pops the tail) can never drop them.
+  // Most relevant first: the budget pops from the end, and preferences
+  // (MAX_SAFE_INTEGER scores) sort first so they are never dropped.
   const excerpts = [...dedupedPreferences].sort((a, b) => b.score - a.score);
-  // Keep the memory lane inside its total, dropping the least relevant first,
-  // so memory cannot reach enforceFinalBound large enough to evict the archive
-  // lane that function sacrifices ahead of it.
+  // Keep the memory lane inside its total so it can't reach enforceFinalBound
+  // large enough to evict the archive lane.
   let excerptChars = excerpts.reduce((sum, row) => sum + row.text.length, 0);
   let droppedForBudget = 0;
   while (excerpts.length > 1 && excerptChars > PRE_TURN_BOUNDS.memoryExcerptTotalChars) {
@@ -1640,14 +1235,9 @@ function archiveExcerpt(row: ArchiveEvidenceRow, score: number, passageText?: st
 type CapabilityService = CapabilityRosterEntry;
 
 /**
- * Evict one capability entry for a budget: the LAST entry not marked
- * `retainUnderBudget`, or the last entry outright once only retained ones are
- * left. Both capability budgets evict from the end, and entries are pushed in
- * a fixed authoring order (the Slack entry is pushed near the end of
- * `buildSessionServicesSnapshotFrom`, src/capabilities.ts), so without the
- * mark whichever service happens to be authored late is the one an agent
- * loses — the Slack entry was, on the widest-wired groups, and the agent then
- * told the owner it could not read a Slack link it could read.
+ * Evicts the LAST entry not marked `retainUnderBudget`, else the last entry.
+ * Without the mark, whichever service is authored late (Slack) is the one an
+ * agent silently loses.
  */
 function evictCapability(services: CapabilityService[]): string | undefined {
   for (let index = services.length - 1; index >= 0; index--) {
@@ -1667,19 +1257,8 @@ function selectCapabilities(services: CapabilityService[], limit: number): Capab
 }
 
 /**
- * Reduce the session's full services snapshot to the bounded roster the
- * pre-turn block carries.
- *
- * The roster is the awareness surface: every wired service, one line each,
- * never evicted in practice. The mini-manual for any one of them stays in
- * `/workspace/capabilities.json` byte-for-byte and reaches the agent through
- * `get_capabilities({ service })`. Before this split the block carried all 23
- * manuals for the widest-wired group (13,247 chars) and the budget below
- * silently dropped the last six — so an agent holding Hex and Looker was never
- * told it had them, which is precisely what the block exists to prevent.
- *
- * Exported for direct test of the total-block budget — see
- * pre-turn-context.test.ts.
+ * Every wired service, one line each; the full notes stay in
+ * `/workspace/capabilities.json` behind `get_capabilities({ service })`.
  */
 export function boundedCapabilities(snapshot: SessionServicesSnapshot, notices: ContextNotice[]): CapabilityRoster {
   const roster = buildCapabilityRoster(snapshot);
@@ -1691,10 +1270,8 @@ export function boundedCapabilities(snapshot: SessionServicesSnapshot, notices: 
       service.use === undefined
         ? undefined
         : boundedText(service.use, PRE_TURN_BOUNDS.capabilityRosterUseChars, TRUNCATED_CAPABILITY_DETAIL),
-    // Short-TTL credential expiry (e.g. GitHub App installation tokens). Not
-    // free text — an ISO timestamp from the host — so it passes the bound
-    // untouched. Dropped here it would never reach agents: this sanitizer is
-    // what rebuilds trustedCapabilities every bootstrap turn.
+    // An ISO timestamp from the host, not free text, so it passes unbounded.
+    // Dropped here, it would never reach agents.
     expiresAt: service.expiresAt,
   }));
   if (selected.length < snapshot.services.length) {
@@ -1705,14 +1282,9 @@ export function boundedCapabilities(snapshot: SessionServicesSnapshot, notices: 
       detail: `selected ${selected.length} of ${snapshot.services.length} services`,
     });
   }
-  // Total-block budget. Drops whole services from the end rather than clipping
-  // a kept one, because boundedText cuts from the END and the operative
-  // sentence of every capability entry ("never tell the owner you can't X
-  // without first trying Y") is written last — clipping would remove exactly
-  // the guidance the entry exists to deliver. Enforced here so capabilities can
-  // never reach enforceFinalBound large enough to evict conversation and memory
-  // recall, which that function sacrifices first. A `retainUnderBudget` entry
-  // is dropped only after every other entry is gone (evictCapability).
+  // Drop whole services from the end rather than clipping one: the operative
+  // sentence of an entry is written last and `boundedText` clips from the end.
+  // Keeps capabilities from evicting recall in enforceFinalBound.
   const droppedForBudget: string[] = [];
   while (selected.length > 0 && JSON.stringify(selected).length > PRE_TURN_BOUNDS.capabilityTotalChars) {
     droppedForBudget.push(evictCapability(selected)!);
@@ -1728,17 +1300,12 @@ export function boundedCapabilities(snapshot: SessionServicesSnapshot, notices: 
   return { agentGroupId: roster.agentGroupId, howToUse: roster.howToUse, services: selected };
 }
 
-/**
- * Exported for direct test of the eviction order. After the 2026-08-13 bound
- * fix this rarely fires on natural content (measured saturated ceiling
- * ~21.1k vs the 22k bootstrap bound) — it is a safety net, and the shed-order
- * invariant is guarded at this seam rather than through end-to-end fixtures.
- */
+/** A safety net that rarely fires on natural content; exported to test the shed order directly. */
 export function enforceFinalBound(context: PreTurnContext): void {
   let truncated = false;
   const serializedLength = (): number => JSON.stringify(context).length;
-  // A row carrying trustedCapabilities is by definition a bootstrap row and
-  // gets the raised bound; exact-link keeps its own. Max wins when both apply.
+  // A row with trustedCapabilities is a bootstrap row; exact-link has its own
+  // bound. Max wins.
   const limit = Math.max(
     context.conversationEvidence.excerpts.some((row) => row.rank === 'exact-link')
       ? PRE_TURN_BOUNDS.exactLinkFinalChars
@@ -1827,15 +1394,10 @@ function potentialConflict(
  */
 export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext {
   const startedAt = Date.now();
-  // Snapshotted before any recall work runs, diffed against the same
-  // process-wide counters at the end — cheap (two integer reads now, two more
-  // at the log line) and gives THIS build's cache/fast-path activity rather
-  // than the all-time total, which a shared, cross-workgroup counter would
-  // otherwise make meaningless per line.
+  // Snapshot the process-wide counters so the log line reports THIS build.
   const tokenStatsBefore = { ...TOKEN_STREAM_CACHE_STATS };
   const offsetStatsBefore = { ...OFFSET_SLICE_STATS };
-  // Lease-only (seam 3 §4.5): this runs inside the caller's `withCentralSync`
-  // block — the recall-row insert, or the admission pass that wraps it.
+  // Lease-only: this runs inside the caller's `withCentralSync` block.
   const scope = withRawDb(
     (db) =>
       db
@@ -1860,11 +1422,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   const currentMessagingGroupId =
     input.messagingGroupId === undefined ? scope.messaging_group_id : input.messagingGroupId;
   const currentThreadId = input.threadId === undefined ? scope.thread_id : input.threadId;
-  // Looked up ONCE and reused below by both namespaceTriggerSenderId (trigger
-  // fallback) and stripVerifiedPrefix (alreadyRepresented comparison, and
-  // threaded into readMemoryEvidence's id tier) — see lookupChannelType.
-  // The same lease-only rule as the scope read above: one `withRawDb` block
-  // for the channel type, the fallback folder and the workgroup roster.
+  // Looked up ONCE and reused by trigger namespacing and prefix stripping.
   const { channelType, workgroupId, memberAgentGroupIds } = withRawDb((db) => {
     const channelType = lookupChannelType(db, currentMessagingGroupId);
     const fallbackGroup = db.prepare(`SELECT folder FROM agent_groups WHERE id = ?`).get(input.agentGroupId) as
@@ -1926,40 +1484,13 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     }
   }
 
-  // Involved senders for the deterministic preference lane, grouped by
-  // person so a platform rename can't inject BOTH the pre-rename and
-  // post-rename preference file for the same human (see readMemoryEvidence).
-  // One group per recent conversation sender, carrying the archive's stable
-  // sender_id (for the explicit-`ids:`-frontmatter tier) alongside its name
-  // aliases: [per-message senderName, canonical users.display_name] —
-  // canonical included only when resolved, set, and different from the
-  // per-message name. Since the round-1 fix the triggering message is
-  // archived before this runs, so the trigger sender normally already
-  // appears as the newest recentConversationSenders row; a fallback group is
-  // prepended only for kinds that don't archive before this call.
-  //
-  // Round 2: suppression of that fallback is by sender id, not display name.
-  // A DIFFERENT participant who merely shares the trigger's display name
-  // must not swallow the trigger's own id-declared preference file. When the
-  // trigger resolves a senderId (see namespaceTriggerSenderId below), the
-  // fallback is suppressed only if some existing group's senderId matches it
-  // exactly, or the two ids agree once each has the CURRENT conversation's
-  // VERIFIED channel_type prefix stripped (stripVerifiedPrefix) — same
-  // conversation, same channel_type, so this still unifies a renamed sender
-  // across turns. A colon-bearing id that is NOT namespaced under the
-  // current channel_type (a Matrix-style raw handle, or a sibling bot's own
-  // namespace) is left whole and compared as-is, so it can only coincide by
-  // accident, never by an unverified shared suffix (round 4: rawIdSuffix's
-  // last-colon rule let `@alice:matrix.org` and `@bob:matrix.org` collapse
-  // to the same "matrix.org" suffix — fixed by removing it). The old
-  // name-based check (aliases.includes) now applies ONLY when the trigger
-  // has no senderId at all.
-  //
-  // The fallback's senderId comes from extractSenderId (not an archive
-  // lookup) via normalizedContent — the RAW platform id — then gets
-  // namespaced with the current messaging group's channel_type before use,
-  // so it can hit a file's namespace-exact `ids:` declaration and not only
-  // the raw (bare-entry) map; see namespaceTriggerSenderId's doc comment.
+  // Involved senders for the preference lane, one group per person (archive
+  // sender_id plus name aliases). The trigger sender is normally already the
+  // newest row; a fallback group is prepended only for kinds not archived yet.
+  // Suppression of that fallback is by sender id (exact, or equal after
+  // stripping the verified prefix), never by a shared display name or an
+  // unverified colon suffix; the name check applies only when the trigger has
+  // no sender id.
   const involvedSenders: InvolvedSenderGroup[] = [];
   try {
     for (const sender of recentConversationSenders({
@@ -1967,9 +1498,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       messagingGroupId: currentMessagingGroupId,
       threadId: currentThreadId,
     })) {
-      // Raw, not the async `getUser`: this whole builder runs inside
-      // `writeSessionMessage`'s synchronous recall block (seam-3 plan §4.5,
-      // I-1), so it executes the users leaf's exported SQL under that lease.
+      // Raw, not async `getUser`: this builder runs inside a synchronous lease block.
       const canonicalName = sender.senderId
         ? withRawDb(
             (db) =>
@@ -2149,13 +1678,8 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     notices,
   };
   enforceFinalBound(context);
-  // One structured line per build: nothing else logs recall latency in
-  // production, so every prior performance claim came from an ad-hoc harness
-  // run against a copied tree. debug, not info — this fires on every
-  // admissible trigger message across every session and workgroup, the same
-  // routine per-message volume as router.ts's debug-level drop/dedupe lines,
-  // not a business event like "Message routed"/"Message delivered" (info).
-  // Counts only, no memory or conversation text.
+  // Debug level: fires on every admissible trigger. Counts only, no memory
+  // or conversation text.
   log.debug('pre-turn-context: build', {
     workgroupId,
     elapsedMs: Date.now() - startedAt,

@@ -19,13 +19,12 @@ export async function applySpawnComplete(content: Record<string, unknown>, calle
     result_summary: summary,
   });
 
-  // CAS returned false → already in terminal state; skip duplicate parent notification
+  // Already terminal: skip the duplicate parent notification.
   if (!transitioned) {
     log.debug('applySpawnComplete: task already in terminal state, skipping notify', { taskId });
     return;
   }
 
-  // Dashboard SSE emit (post-build drift fix B5 — D6 plan callsite missing)
   void import('../../dashboard/api/events.js')
     .then((mod) =>
       mod.emitDashboardEvent('task_event', {
@@ -38,7 +37,6 @@ export async function applySpawnComplete(content: Record<string, unknown>, calle
       /* dashboard module may not be initialized in tests */
     });
 
-  // Notify parent
   const parentSession = await getSession(task.parent_session_id);
   if (!parentSession) return;
 
@@ -79,7 +77,6 @@ export async function applySpawnFailed(content: Record<string, unknown>, callerS
     return;
   }
 
-  // Dashboard SSE emit (post-build drift fix B5)
   void import('../../dashboard/api/events.js')
     .then((mod) =>
       mod.emitDashboardEvent('task_event', {

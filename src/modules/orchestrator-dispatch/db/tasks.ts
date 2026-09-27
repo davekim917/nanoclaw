@@ -50,17 +50,8 @@ type TaskInsert = Omit<Task, 'created_at' | 'needs_input' | 'steer_question' | '
   Partial<Pick<Task, 'needs_input' | 'steer_question' | 'archived_at'>>;
 
 /**
- * The three exports `applySpawnTask`'s admission transaction calls —
- * `insertTaskAtomic`, `getTaskByParentAndIdempotency`, `countActiveByParent` —
- * run on the async driver, because a `centralTransaction` closure may await
- * driver statements and nothing else. Every other export runs on the driver
- * too.
- *
- * None of them needs `centralTransaction`. Each is ONE statement, and each
- * mutation is already compare-and-set in SQL — `WHERE status = 'pending'`,
- * `WHERE status IN ('pending','running')`, `WHERE archived_at IS NULL`,
- * `WHERE needs_input = 1`, `RETURNING` — so a caller that loses a race sees
- * `changes === 0` and takes the same branch it took before the conversion.
+ * Each export is ONE statement with compare-and-set in SQL, so none needs
+ * `centralTransaction`; a caller that loses a race sees `changes === 0`.
  */
 export async function insertTaskAtomic(row: TaskInsert): Promise<Task | null> {
   const createdAt = new Date().toISOString();
@@ -118,7 +109,6 @@ export async function getTaskByParentAndIdempotency(
 
 export async function acquireCompletionLease(taskId: string, leaseExpirySec: number = 60): Promise<Task | null> {
   const now = new Date().toISOString();
-  // Compute expired threshold: now minus leaseExpirySec
   const expiredBefore = new Date(Date.now() - leaseExpirySec * 1000).toISOString();
 
   const result = await getDb().get<Task>(
@@ -167,9 +157,8 @@ export async function transitionToTerminal(
   }
   values.push(taskId);
 
-  // Always at least two positional parameters (the status and the task id), so
-  // the driver's single-object named-parameter overload can never be selected
-  // by accident even when `extraCols` is empty.
+  // Always at least two positional parameters, so the driver's single-object
+  // named-parameter overload can never be selected by accident.
   const result = await getDb().run(
     `UPDATE tasks
           SET ${sets.join(', ')}
@@ -209,14 +198,7 @@ export async function getTaskByChildSession(childSessionId: string): Promise<Tas
   return (await getDb().get<Task>(`SELECT * FROM tasks WHERE child_session_id = ?`, childSessionId)) ?? null;
 }
 
-/**
- * Two-column auth for child→host action handlers (spawn_progress,
- * spawn_complete, spawn_failed, spawn_request_steer). Resolves task_id from
- * the action content, looks up the task, and verifies the calling session
- * owns it (`task.child_session_id === callerSession.id`). Logs and returns
- * null on any failure — never throws. `actionLabel` is the prefix used in
- * log lines so the originating handler stays greppable.
- */
+/** Verifies the calling session owns the task. Logs and returns null on any failure; never throws. */
 export async function authChildTaskAction(
   content: Record<string, unknown>,
   callerSession: Session,
@@ -243,14 +225,7 @@ export async function authChildTaskAction(
   return { task, taskId };
 }
 
-/**
- * Flip `needs_input=1` on a running task with the optional question text.
- * Returns true when the row actually changed — callers gate SSE emits on
- * this so a no-op (already-flagged with same question) doesn't trigger
- * dashboard refetches. Shared by `applySpawnNeedsInput` (child MCP path)
- * and the host-side delivery hook that catches `ask_question` outbound
- * messages from spawn-child sessions.
- */
+/** Returns true only when the row changed, so a no-op doesn't trigger dashboard refetches. */
 export async function flagNeedsInput(taskId: string, question: string | null): Promise<boolean> {
   const result = await getDb().run(
     `UPDATE tasks
@@ -266,12 +241,7 @@ export async function flagNeedsInput(taskId: string, question: string | null): P
   return result.changes > 0;
 }
 
-/**
- * Sweep helper used by `host-sweep.ts:autoArchiveOldCompleted`. Archives
- * every completed task whose `completed_at < cutoffIso` and isn't already
- * archived. Failed tasks are intentionally excluded — operator must
- * dismiss those explicitly.
- */
+/** Failed tasks are excluded: an operator must dismiss them explicitly. */
 export async function autoArchiveCompletedBefore(
   cutoffIso: string,
   archivedAt: string = new Date().toISOString(),
