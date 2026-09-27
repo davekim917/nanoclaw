@@ -10,8 +10,8 @@ import type { Migration } from './index.js';
  * a held request under the same id after a restart; bash-gate keys on its outbound id).
  * Covers `pending` AND `approved`: `resolveChoice` flips a row to approved before awaiting delivery and restores
  * `pending` on failure, and with `pending` alone a second card could claim the id mid-delivery and the restore would
- * throw SQLITE_CONSTRAINT_UNIQUE from an uncaught path, stranding the first card. `expired` is not covered: those
- * rows are deleted immediately.
+ * throw SQLITE_CONSTRAINT_UNIQUE from an uncaught path, stranding the first card. `expired` is not covered: on the
+ * normal path `retireChoice` deletes an expired row at once, and the legacy duplicates expired below must fall out.
  * FAILS SOFT on pre-existing duplicates, because this runs at every host start and a throwing CREATE UNIQUE INDEX
  * would crash-loop the host: newer live duplicates are marked 'expired' (oldest kept). Nothing is deleted.
  */
