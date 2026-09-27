@@ -4964,7 +4964,11 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('defers an immutable runtime-context restart until the active query is idle', async () => {
-    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', {
+      continuous: true,
+      prompt: 'second fire',
+      flagIntent: { turnModel: 'claude-sonnet-5' },
+    });
     let firstResult = false;
 
     async function* events(): AsyncGenerator<ProviderEvent> {
@@ -5049,8 +5053,8 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   it('tells the user once, in the words of the ack, that a typed change is queued behind a busy turn', async () => {
     insertMessage('flag-1', 'chat', {
       text: '',
-      flagIntent: { stickyEffort: 'high' },
-      flagAck: '⚙️ effort → high',
+      flagIntent: { stickyModel: 'claude-sonnet-5' },
+      flagAck: '⚙️ model → claude-sonnet-5',
     });
 
     await processQuery(busyQuery(), TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
@@ -5059,15 +5063,23 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     });
 
     expect(queuedNotices().map((n) => n.text)).toEqual([
-      '⚙️ effort → high is queued until the current task finishes. Messages you send before then are read when it does.',
+      '⚙️ model → claude-sonnet-5 is queued until the current task finishes. Messages you send before then are read when it does.',
     ]);
   }, 15_000);
 
   it('does not announce a queued change nobody was told about (support-thread pin, scheduled task)', async () => {
     // Support-thread dispatch writes chat rows carrying the poller's pin as
     // flagIntent; the host posts no ack for them.
-    insertMessage('support-1', 'chat', { sender: 'system', text: 'new email', flagIntent: { turnEffort: 'low' } });
-    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'high' } });
+    insertMessage('support-1', 'chat', {
+      sender: 'system',
+      text: 'new email',
+      flagIntent: { turnModel: 'claude-sonnet-5' },
+    });
+    insertMessage('occ-2', 'task', {
+      continuous: true,
+      prompt: 'second fire',
+      flagIntent: { turnModel: 'claude-sonnet-5' },
+    });
 
     await processQuery(busyQuery(), TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
       effort: 'xhigh',
@@ -5081,12 +5093,12 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     insertRouted('occ-2', 'task', 'task-channel', 'task-thread', {
       continuous: true,
       prompt: 'second fire',
-      flagIntent: { turnEffort: 'high' },
+      flagIntent: { turnModel: 'claude-sonnet-5' },
     });
     insertRouted('flag-1', 'chat', 'human-channel', 'human-thread', {
       text: '',
-      flagIntent: { stickyEffort: 'high' },
-      flagAck: '⚙️ effort → high',
+      flagIntent: { stickyModel: 'claude-sonnet-5' },
+      flagAck: '⚙️ model → claude-sonnet-5',
     });
 
     await processQuery(busyQuery(), TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
@@ -5096,15 +5108,112 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
 
     expect(queuedNotices()).toEqual([
       {
-        text: '⚙️ effort → high is queued until the current task finishes. Messages you send before then are read when it does.',
+        text: '⚙️ model → claude-sonnet-5 is queued until the current task finishes. Messages you send before then are read when it does.',
         platform_id: 'human-channel',
         thread_id: 'human-thread',
       },
     ]);
   }, 15_000);
 
+  const liveEffortQuery = (opts: { failApply?: boolean } = {}) => {
+    let effort: string | null = 'medium';
+    const calls: { phase: 'busy' | 'idle'; effort?: string }[] = [];
+    const pushed: string[] = [];
+    let busy = true;
+    let endedWhileBusy = false;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      await Bun.sleep(1600);
+      busy = false;
+      yield { type: 'result', text: 'first', isError: true };
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      push: (text: string) => {
+        pushed.push(text);
+        return undefined;
+      },
+      end: () => {
+        if (busy) endedWhileBusy = true;
+      },
+      abort: () => {},
+      applySettings: async (s) => {
+        calls.push({ phase: busy ? 'busy' : 'idle', effort: s.effort });
+        if (opts.failApply) throw new Error('control request failed');
+        effort = s.effort ?? null;
+      },
+      get resolvedEffort() {
+        return effort;
+      },
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+    return { query, calls, pushed, endedWhileBusy: () => endedWhileBusy };
+  };
+
+  it('applies a typed effort change to the running turn and tells the agent, instead of holding the message', async () => {
+    insertMessage('flag-1', 'chat', {
+      text: 'build the diagram',
+      flagIntent: { stickyEffort: 'high' },
+      flagAck: '⚙️ effort → high',
+    });
+    const q = liveEffortQuery();
+
+    await processQuery(q.query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(q.calls).toEqual([{ phase: 'busy', effort: 'high' }]);
+    expect(q.endedWhileBusy()).toBe(false);
+    expect(q.pushed).toHaveLength(1);
+    expect(q.pushed[0]).toStartWith(
+      '<system>Active Runtime update: reasoning effort is now "high" from this point on.',
+    );
+    expect(q.pushed[0]).toContain('build the diagram');
+    expect(getPendingMessages().map((m) => m.id)).not.toContain('flag-1');
+    expect(queuedNotices()).toEqual([]);
+  }, 15_000);
+
+  it('still waits for a fresh query for max effort, which has no live control', async () => {
+    insertMessage('flag-1', 'chat', { text: '', flagIntent: { stickyEffort: 'max' }, flagAck: '⚙️ effort → max' });
+    const q = liveEffortQuery();
+
+    await processQuery(q.query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(q.calls).toEqual([]);
+    expect(q.endedWhileBusy()).toBe(false);
+    expect(getPendingMessages().map((m) => m.id)).toContain('flag-1');
+    expect(queuedNotices().map((n) => n.text)).toEqual([
+      '⚙️ effort → max is queued until the current task finishes. Messages you send before then are read when it does.',
+    ]);
+  }, 15_000);
+
+  it('falls back to waiting, not cutting the turn off, when the live effort change fails', async () => {
+    insertMessage('flag-1', 'chat', { text: '', flagIntent: { stickyEffort: 'high' }, flagAck: '⚙️ effort → high' });
+    const q = liveEffortQuery({ failApply: true });
+
+    await processQuery(q.query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    // One attempt, not one per poll for the rest of the turn.
+    expect(q.calls).toEqual([{ phase: 'busy', effort: 'high' }]);
+    expect(q.endedWhileBusy()).toBe(false);
+    expect(q.pushed).toEqual([]);
+    expect(getPendingMessages().map((m) => m.id)).toContain('flag-1');
+  }, 15_000);
+
   it('defers an immutable runtime-context restart while background work is live, and ends once it drains', async () => {
-    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', {
+      continuous: true,
+      prompt: 'second fire',
+      flagIntent: { turnModel: 'claude-sonnet-5' },
+    });
     let live = 1;
     let drained = false;
 
@@ -5148,7 +5257,11 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('does not close immutable runtime context during asynchronous result handling', async () => {
-    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', {
+      continuous: true,
+      prompt: 'second fire',
+      flagIntent: { turnModel: 'claude-sonnet-5' },
+    });
     let beginOutcome!: () => void;
     const outcomeStarted = new Promise<void>((resolve) => {
       beginOutcome = resolve;
