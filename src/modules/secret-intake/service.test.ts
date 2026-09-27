@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
   groupAdmins: new Set<string>(['slack:UADMIN1|ag-1', 'slack:UADMIN2|ag-2']),
   originType: 'slack',
   notifyFails: false,
+  ownerIds: ['slack:UOWNER'],
 }));
 
 vi.mock('../../onecli-secret-writer.js', () => ({
@@ -80,11 +81,15 @@ vi.mock('../../delivery.js', () => ({
   }),
 }));
 vi.mock('../approvals/primitive.js', () => ({
-  pickOwnersFirst: vi.fn(async () => ['slack:UOWNER']),
-  pickApprovalDelivery: vi.fn(async (approvers: string[]) => ({
-    userId: approvers[0],
-    messagingGroup: { channel_type: 'slack', platform_id: 'slack:D1', instance: 'slack' },
-  })),
+  pickOwnersFirst: vi.fn(async () => h.ownerIds),
+  pickApprovalDelivery: vi.fn(async (approvers: string[]) =>
+    approvers[0].startsWith('discord')
+      ? {
+          userId: approvers[0],
+          messagingGroup: { channel_type: 'discord', platform_id: 'discord:D9', instance: 'discord' },
+        }
+      : { userId: approvers[0], messagingGroup: { channel_type: 'slack', platform_id: 'slack:D1', instance: 'slack' } },
+  ),
   notifyAgent: vi.fn(async (_session: unknown, text: string) => {
     if (h.notifyFails) throw new Error('session DB unavailable');
     h.notes.push(text);
@@ -94,6 +99,9 @@ vi.mock('../permissions/db/user-roles.js', () => ({
   isOwner: (id: string) => h.owners.has(id),
   isGlobalAdmin: () => false,
   isAdminOfAgentGroup: (id: string, group: string) => h.groupAdmins.has(`${id}|${group}`),
+}));
+vi.mock('../permissions/user-dm.js', () => ({
+  resolveUserChannelType: vi.fn(async (id: string) => id.slice(0, id.indexOf(':'))),
 }));
 vi.mock('../permissions/db/users.js', () => ({
   getUser: vi.fn(async (id: string) => ({ id, display_name: `name-of-${id}` })),
@@ -155,6 +163,7 @@ beforeEach(() => {
   h.groups.clear();
   h.originType = 'slack';
   h.notifyFails = false;
+  h.ownerIds = ['slack:UOWNER'];
   h.groups.set('ag-1', { id: 'ag-1', name: 'Helper', folder: 'helper', workgroup_id: 'wg-a' });
   h.groups.set('ag-2', { id: 'ag-2', name: 'Other', folder: 'other', workgroup_id: 'wg-b' });
 });
@@ -170,6 +179,18 @@ describe('startSecretIntake', () => {
     await startSecretIntake({ ...newKey, name: 'Host-Key', caller: { kind: 'host' } });
     expect(h.deliveries[1].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
     expect(JSON.parse(h.deliveries[1].args[4] as string).body).toContain('Only an owner or global admin can enter it.');
+  });
+
+  it('sends a rotation to an owner DM, since only an owner can fill it', async () => {
+    h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
+    await startSecretIntake({ name: 'Linear-API-Key', rotate: true, groups: [], workgroups: [], caller: agentCaller });
+    expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
+  });
+
+  it("picks an owner's Slack DM over an earlier owner's Discord DM", async () => {
+    h.ownerIds = ['discord:UFIRST', 'slack-inst:UOWNER'];
+    await startSecretIntake({ ...newKey, caller: { kind: 'host' } });
+    expect(h.deliveries[0].args.slice(0, 2)).toEqual(['slack', 'slack:D1']);
   });
 
   it('sends a card from a platform that cannot open forms to an owner DM instead', async () => {

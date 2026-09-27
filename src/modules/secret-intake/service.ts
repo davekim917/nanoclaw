@@ -21,6 +21,7 @@ import { formatLocalTime } from '../../timezone.js';
 import { notifyAgent, pickApprovalDelivery, pickOwnersFirst } from '../approvals/primitive.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
+import { resolveUserChannelType } from '../permissions/user-dm.js';
 
 const INTAKE_TTL_MS = 15 * 60_000;
 const FINISHED_RETENTION_MS = 60 * 60_000;
@@ -221,7 +222,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
   const originMg = session?.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
   let card: Intake['card'];
   let deliveredTo: string;
-  if (originMg && session && isSlackChannelType(originMg.channel_type)) {
+  if (originMg && session && isSlackChannelType(originMg.channel_type) && callerGroup && !input.rotate) {
     card = {
       channelType: originMg.channel_type,
       platformId: originMg.platform_id,
@@ -231,8 +232,8 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
     };
     deliveredTo = `the requesting conversation (${originMg.name ?? originMg.platform_id})`;
   } else {
-    const target = await pickApprovalDelivery(await pickOwnersFirst(null), 'slack');
-    if (!target) throw new Error('No owner or global admin has a reachable DM to receive the secret form.');
+    const target = await slackOwnerDm();
+    if (!target) throw new Error('No owner or global admin has a reachable Slack DM to receive the secret form.');
     card = {
       channelType: target.messagingGroup.channel_type,
       platformId: target.messagingGroup.platform_id,
@@ -369,10 +370,20 @@ function authorityOf(intake: Intake, namespacedUserId: string): Promise<Authorit
   }, 'secret intake authority');
 }
 
+async function slackOwnerDm(): ReturnType<typeof pickApprovalDelivery> {
+  for (const userId of await pickOwnersFirst(null)) {
+    const type = await resolveUserChannelType(userId);
+    if (!type || !isSlackChannelType(type)) continue;
+    const target = await pickApprovalDelivery([userId], type);
+    if (target) return target;
+  }
+  return null;
+}
+
 async function noticeOwners(intake: Intake, namespacedUserId: string): Promise<void> {
   try {
     const adapter = getDeliveryAdapter();
-    const target = await pickApprovalDelivery(await pickOwnersFirst(null), 'slack');
+    const target = await pickApprovalDelivery(await pickOwnersFirst(null), '');
     if (!adapter || !target) throw new Error('no owner DM is reachable');
     const who = (await getUser(namespacedUserId))?.display_name || namespacedUserId;
     const where = intake.injection ? injectionLine(intake.injection) : '';

@@ -42,8 +42,9 @@ Every store by a group admin sends an owner a DM, right after the vault write an
 naming who, which secret, the host and the grants — never the value. A failed notice is logged at error. A key
 a group admin stores for their workgroup is used by every agent in it.
 
-A card goes into the requesting thread only on Slack, the one platform whose adapter opens the form; any
-other origin gets it in an owner's DM.
+A card goes into the requesting thread only for an agent's new secret on Slack, the one platform whose adapter
+opens the form. A rotation (which only an owner can fill), a host request, and any other origin get it in the
+first owner or global admin with a Slack DM.
 
 ## What to check on the card
 
