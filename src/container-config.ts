@@ -970,24 +970,21 @@ export async function writeContainerConfigScalars(
   );
 }
 
-/** Edit the package lists in both stores, file first; the projection copies the file's result for the image build. */
-export async function writeContainerConfigPackages(
+/**
+ * Mutate the collection fields in both stores: container.json, then every JSON column projected from it (packages,
+ * MCP servers, mounts), copied from the locked result so the projection cannot fall behind the file.
+ */
+export async function writeContainerConfigJson(
   agentGroupId: string,
   folder: string,
-  edit: (packages: ContainerConfig['packages']) => void,
-): Promise<ContainerConfig['packages']> {
-  const { packages } = await updateContainerConfig(
-    folder,
-    (config) => {
-      if (!config.packages) config.packages = { apt: [], npm: [] };
-      edit(config.packages);
-    },
-    async ({ packages: projected }) => {
-      await updateContainerConfigJson(agentGroupId, 'packages_apt', projected.apt);
-      await updateContainerConfigJson(agentGroupId, 'packages_npm', projected.npm);
-    },
-  );
-  return packages;
+  mutate: (config: ContainerConfig) => void,
+): Promise<ContainerConfig> {
+  return updateContainerConfig(folder, mutate, async (config) => {
+    await updateContainerConfigJson(agentGroupId, 'packages_apt', config.packages?.apt ?? []);
+    await updateContainerConfigJson(agentGroupId, 'packages_npm', config.packages?.npm ?? []);
+    await updateContainerConfigJson(agentGroupId, 'mcp_servers', config.mcpServers ?? {});
+    await updateContainerConfigJson(agentGroupId, 'additional_mounts', config.additionalMounts ?? []);
+  });
 }
 
 /** Idempotent; under the same lock so two concurrent calls cannot both see "absent". */

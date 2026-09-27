@@ -1548,10 +1548,9 @@ describe('per-person preference recall', () => {
     // strip to their bare form and both resolve via the id tier.
     // Newest first: the 'River Park' row is processed first and claims
     // river-park.md via the id tier; the 'River Park Alt' row's id resolves
-    // to the same, now-claimed file. Pre-fix, that already-claimed id match
-    // fell through to name matching, and its own display name slugs to the
-    // unrelated river-park-alt.md — injecting a second, stale file for the
-    // same person. Post-fix, an id match never falls through.
+    // to the same, now-claimed file. An id match must never fall through to
+    // name matching, whose slug (river-park-alt.md) would inject a second,
+    // stale file for the same person.
     memoryFile(
       'preferences/river-park.md',
       '---\nids: [U0TEST900XYZ, U0TEST900ALT]\n---\n# River Park\nCurrent preferences.',
@@ -1910,13 +1909,11 @@ describe('per-person preference recall', () => {
 
   it('does not suppress the fallback for a different homeserver user with the same last-colon suffix (Matrix-shape)', async () => {
     // Matrix-style raw handles contain their OWN colon (`@user:homeserver`),
-    // and extractAndUpsertUser (src/modules/permissions/index.ts:96-99)
+    // and extractAndUpsertUser (src/modules/permissions/index.ts)
     // stores them UN-PREFIXED — this is the platform's own opaque id, not a
-    // "channelType:rawId" pair. Pre-fix (PR #221 round 4), rawIdSuffix took
-    // everything after the LAST colon, so '@bob:matrix.example' and
-    // '@alice:matrix.example' both suffixed to 'matrix.example' and the
-    // archived Bob wrongly suppressed Alice's own trigger-fallback group —
-    // dropping her exact-declared preference file entirely. Post-fix, a
+    // "channelType:rawId" pair. A suffix taken after the LAST colon would map
+    // '@bob:matrix.example' and '@alice:matrix.example' both to 'matrix.example',
+    // letting the archived Bob suppress Alice's trigger-fallback group. A
     // colon-bearing id that isn't namespaced under the CURRENT verified
     // channel_type ('discord', mg-a's channel_type per seedScope) is
     // compared whole, so the two different homeserver users never collide.

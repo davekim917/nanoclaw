@@ -1,14 +1,10 @@
 /**
- * The one judge for a scripted fire that ran its pre-task script: host-gated
- * fires and container fires both reach `judgeGateResult`, so the two paths
- * cannot disagree about what a result means.
- *
- * A producer's last stdout line carries
+ * The one judge for a scripted fire's pre-task result, host-gated or container.
+ * A producer's last stdout line is
  * `{"wakeAgent":false,"observation":{kind,evidence,bound,since?},"data":{...}}`.
- * `container/skills/task-observation/task_observation.py` writes that line and applies
- * the same rules; both implementations are tested against one case table
- * (`container/skills/task-observation/cases.json`), because no module is
- * importable from both the host build and a container.
+ * The container helper `container/skills/task-observation/task_observation.py`
+ * applies the same rules; both are tested against `cases.json`, since no module
+ * is importable from both the host and a container.
  */
 import { upsertGateOutcome } from '../../db/task-run-outcomes.js';
 import { scrubSecrets } from '../../secret-scrubber.js';
@@ -16,7 +12,6 @@ import { scrubSecrets } from '../../secret-scrubber.js';
 const OBSERVATION_KINDS = ['empty', 'unreadable', 'blocked', 'unfinished'] as const;
 type ObservationKind = (typeof OBSERVATION_KINDS)[number];
 
-/** What the gate lane records for one execution. */
 export type GateObservation = ObservationKind | 'wake' | 'error' | 'invalid' | 'undeclared';
 
 const MINUTE_MS = 60_000;
@@ -32,10 +27,7 @@ const BOUND_UNIT_MS: Record<string, number> = { m: MINUTE_MS, h: 60 * MINUTE_MS,
 const SINCE_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(?:(Z)|([+-])(\d{2}):(\d{2}))$/;
 
-/**
- * A script execution before judgement: its parsed last stdout line, or why it
- * produced none. Wrapped, because the line itself may carry any key.
- */
+/** A script run before judgement, wrapped because the line itself may carry any key. */
 export type RawGateResult = { result: { wakeAgent: boolean; observation?: unknown } } | { error: string };
 
 export interface GateJudgement {
@@ -69,10 +61,8 @@ function daysInMonth(year: number, month: number): number {
 }
 
 /**
- * ISO-8601 with an explicit zone → epoch ms, or null.
- *
- * Validated field by field: `Date.parse` accepts `2026-02-30` and `24:00`,
- * which Python's `datetime` refuses, and the helper must agree with this.
+ * ISO-8601 with an explicit zone → epoch ms, or null. Validated field by field:
+ * `Date.parse` accepts `2026-02-30` and `24:00`, which the Python helper refuses.
  */
 export function parseSince(since: unknown): number | null {
   if (typeof since !== 'string') return null;
@@ -135,7 +125,6 @@ export function observationProblem(observation: unknown, nowMs: number = Date.no
   return null;
 }
 
-/** Map one execution's result onto the gate lane. */
 export function judgeGateResult(raw: RawGateResult, nowMs: number = Date.now()): GateJudgement {
   if ('error' in raw) {
     return {

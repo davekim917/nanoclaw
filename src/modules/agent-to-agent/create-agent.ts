@@ -1,13 +1,9 @@
 /**
  * `create_agent` delivery-action bodies.
  *
- * SECURITY: spawning a new agent group is a host-level state change (creates
- * a directory under groups/, inserts an agent_groups row, and opens bidirectional
- * agent_destinations grants). Any tenant agent can
- * call this — but allowing direct execution lets prompt injection in any
- * tenant chat fan out unbounded child groups, each with its own credentials
- * and recurring tasks. This handler now requests an owner/admin approval and
- * the actual creation runs only on click via `applyCreateAgent`.
+ * SECURITY: any tenant agent can call create_agent, so creation runs only after
+ * owner/admin approval (`applyCreateAgent`); otherwise prompt injection in any
+ * chat could fan out child groups, each with its own credentials and tasks.
  */
 import fs from 'fs';
 import path from 'path';
@@ -63,19 +59,10 @@ async function notifyAgent(session: Session, text: string): Promise<void> {
 }
 
 /**
- * Best-effort folder rollback. Returns true on clean removal, false when
- * fs.rmSync itself failed — in which case an orphan directory persists on
- * disk and the caller should surface that to the user via notifyAgent so
- * they know manual cleanup may be needed.
- */
-/**
- * Folder allocation is lookup-then-insert, and every lookup now yields (async
- * driver): two approved create_agent requests with the same or a
- * prefix-colliding name could both validate against the same pre-insert
- * snapshot, both touch one directory, and the loser's rollback would delete
- * the winner's configuration. One in-process lock serializes the whole
- * derivation → validation → filesystem → insert sequence; the host is a
- * single process, and create_agent is operator-approved and rare.
+ * Folder allocation is lookup-then-insert across awaits: two approved requests
+ * with the same or a prefix-colliding name could both validate, and the loser's
+ * rollback would delete the winner's configuration. One in-process lock
+ * serializes derivation → validation → filesystem → insert.
  */
 let folderAllocationChain: Promise<void> = Promise.resolve();
 function acquireFolderAllocationLock(): Promise<() => void> {
@@ -139,10 +126,7 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     return;
   }
 
-  // SECURITY GATE: route through approval. The actual create runs in
-  // `applyCreateAgent` only after an owner/admin clicks Approve. Without
-  // this gate, prompt injection in any tenant chat could spawn unbounded
-  // child agent groups, each with its own credentials and recurring tasks.
+  // SECURITY GATE: the create runs in `applyCreateAgent` only after approval.
   const localPreview = normalizeName(name);
   await requestApproval({
     session,
@@ -185,16 +169,12 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   // hits the parent's primary key, or eleven children under a cap of ten).
   const releaseAllocation = await acquireFolderAllocationLock();
   try {
-    // Collision in the creator's destination namespace
     if (await getDestinationByName(sourceGroup.id, localName)) {
       await notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
       return;
     }
 
-    // SECURITY (cross-tenant audit 2026-05-03): cap children per parent. Even
-    // with admin approval, an attacker can social-engineer one approval per
-    // request — bounding total children per parent prevents resource
-    // exhaustion + persistent-foothold accumulation.
+    // SECURITY: cap children per parent; approval can be social-engineered once per request.
     const CHILDREN_PER_PARENT_CAP = 10;
     const childCount =
       (
@@ -212,33 +192,22 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       return;
     }
 
-    // Derive a safe folder name, deduplicated globally across
-    // agent_groups.folder AND the on-disk groups/ dir: a folder present on
-    // disk with no claiming DB row is deleted-group residue, and adopting it
-    // would silently re-scope the old group's data under the new agent's
-    // identity — skip to the next suffix instead. Name-squatting is
-    // mitigated by the approval gate (operator sees the requested name in
-    // the card) rather than by mandatory parent prefix — forcing a
-    // parent-folder prefix breaks scoped-env token boundaries (e.g.
-    // PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
+    // Deduplicated across agent_groups.folder AND on-disk groups/: a folder on
+    // disk with no DB row is deleted-group residue, and adopting it would
+    // re-scope the old group's data under the new agent. No mandatory parent
+    // prefix: it would break scoped-env token boundaries.
     let folder = localName;
     let suffix = 2;
     while ((await getAgentGroupByFolder(folder)) || groupFolderExistsOnDisk(folder)) {
       folder = `${localName}-${suffix}`;
       suffix++;
     }
-    // The suffix can push a 63/64-char name past the folder grammar. A DB-row
-    // collision is caught by the prefix guard below (the row's token is a
-    // prefix of ours), but disk-only residue has no row, so validate the
-    // generated name explicitly rather than persist a folder every provider
-    // spawn will refuse (assertValidGroupFolder, src/group-folder.ts).
+    // The suffix can push a name past the folder grammar, and disk-only residue
+    // has no row for the prefix guard to catch, so validate explicitly.
     assertValidGroupFolder(folder);
 
-    // SECURITY (cross-tenant audit 2026-05-03): folder-name prefix collision
-    // would let scoped-env env-var matching cross-leak (e.g. folder=example-agent
-    // inheriting EXAMPLE_DEV_* vars from folder=example-dev). Normalize tokens and
-    // refuse if any existing folder's token is a prefix of this one or vice
-    // versa.
+    // SECURITY: a folder-token prefix collision would cross-leak scoped-env vars
+    // (folder=example inheriting EXAMPLE_DEV_* from folder=example-dev).
     const newTok = folder.toUpperCase().replace(/-/g, '_');
     for (const existing of await getAllAgentGroups()) {
       if (existing.folder === folder) continue;
@@ -267,20 +236,9 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     const agentGroupId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
 
-    // The child joins the PARENT's workgroup, not a workgroup of its own.
-    //
-    // Before this, `createAgentGroup` left `workgroup_id` NULL and nothing
-    // ever filled it in, so a chat-created child sat outside every workgroup:
-    // no shared chat archive, no shared files, and — the one that bites —
-    // none of the workgroup's OneCLI secret union, which surfaces as a 401
-    // from an API whose credential is demonstrably in the vault. Inheriting
-    // is also what makes the child a sibling of its parent rather than a
-    // stranger that happens to have a destination grant.
-    //
-    // A parent with no workgroup (a pre-036 row that never got backfilled)
-    // still yields NULL — the same value as before — rather than inventing a
-    // workgroup id, because `workgroup_id` is a foreign key into `workgroups`
-    // and a fabricated id would fail the insert.
+    // The child joins the PARENT's workgroup; without it the child gets none of
+    // the workgroup's OneCLI secret union (a 401 from a vaulted API). A parent
+    // with no workgroup yields NULL, not an invented id (it is a foreign key).
     const workgroupId = sourceGroup.workgroup_id ?? null;
 
     const newGroup: AgentGroup = {
@@ -292,26 +250,15 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       workgroup_id: workgroupId,
     };
 
-    // STEP 1: Create folder + baseline container.json + skills
-    //         symlinks. initGroupFilesystem is idempotent; writes an empty
-    //         container.json via initContainerConfig.
     initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
 
-    // STEP 2: Mutate container.json to set provider + providerConfig +
-    //         agentGroupId. Persisting agentGroupId BEFORE the DB insert
-    //         (rather than after) means a downstream failure can't leave us
-    //         in the awkward state where the DB has the row but container.json
-    //         lacks the ID — recovery from that state currently isn't supported
-    //         by enable-memory.ts (Codex F9). Doing it before DB-insert keeps
-    //         the rollback story clean: any failure here also rolls back the
-    //         folder via safeRemoveFolder.
+    // container.json BEFORE the DB insert, so a failure here needs only the
+    // folder rolled back.
     try {
       await updateContainerConfig(folder, (c) => {
         c.agentGroupId = agentGroupId;
-        // Written HERE, before the DB insert and therefore before any spawn:
-        // the spawn path reads container.json, not the DB row, so a child
-        // whose workgroup only ever reached the database would boot its first
-        // container outside the workgroup's data pool and secret union.
+        // Before any spawn: the spawn path reads container.json, not the DB row,
+        // so the first container would otherwise boot outside the workgroup.
         if (workgroupId !== null) c.workgroup_id = workgroupId;
         if (provider !== undefined) c.provider = provider;
         if (providerConfig !== undefined) c.providerConfig = providerConfig;
@@ -326,8 +273,6 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       return;
     }
 
-    // STEP 3: DB INSERT. On failure, rollback the folder from step 1
-    //         (including the agentGroupId / provider config written in step 2).
     try {
       await createAgentGroup(newGroup);
     } catch (err) {
@@ -340,8 +285,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       return;
     }
 
-    // Insert bidirectional destination rows (= ACL grants).
-    // Creator refers to child by the name it chose; child refers to creator as "parent".
+    // Bidirectional destination rows (= ACL grants); the child calls its creator "parent".
     await createDestination({
       agent_group_id: sourceGroup.id,
       local_name: localName,
@@ -349,8 +293,6 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       target_id: agentGroupId,
       created_at: now,
     });
-    // Handle the unlikely case where the child already has a "parent" destination
-    // (shouldn't happen for a brand-new agent, but be safe).
     let parentName = 'parent';
     let parentSuffix = 2;
     while (await getDestinationByName(agentGroupId, parentName)) {
@@ -366,13 +308,10 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     });
 
     // REQUIRED: project the new destination into the running container's
-    // inbound.db. See the top-of-file invariant in db/agent-destinations.ts
-    // — forgetting this causes "dropped: unknown destination" when the parent
-    // tries to send to the newly-created child.
+    // inbound.db, or the parent's first send is "dropped: unknown destination".
     await writeDestinations(session.agent_group_id, session.id);
 
-    // notifyAgent is async since the writeSessionMessage signature change.
-    // Awaiting ensures the notification commits before the container wakes.
+    // Awaited so the notification commits before the container wakes.
     await notifyAgent(
       session,
       `Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`,

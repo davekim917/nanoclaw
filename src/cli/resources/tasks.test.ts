@@ -2938,7 +2938,7 @@ describe('ncl tasks repin', () => {
 
     it('REFUSES an id that names a series in more than one group rather than repinning both', async () => {
       // Series ids are unique within an agent group, not fleet-wide: a named
-      // task's id is `<slug>-<4hex>` (scheduling/create.ts:67), so two groups
+      // task's id is `<slug>-<4hex>` (`makeTaskId`), so two groups
       // running a task of the same name collide on a 1-in-65536 draw. Under
       // `--all`, a filter that promised ONE series would then rewrite several.
       await makePinGroup('ag-2', 'claude');

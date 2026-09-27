@@ -1,26 +1,12 @@
 /**
- * Aged-occurrence alarm — a recurring occurrence that is due, wake-eligible and
- * untouched for an hour reaches a human.
- *
- * Every per-session guard in the sweep answers a narrow question and declines
- * correctly when it is not its case: the wake duty does not spawn behind a
- * running container, the idle-task reap does not reap while work is due, the
- * ceiling skips a container that never touched its heartbeat, claim-stuck ages
- * claims and there are none, and `expireStalePending` exempts recurring rows.
- * A due row the runner never selects therefore satisfies all of them at once,
- * forever, and the series stops with nothing logged above INFO (observed live
- * 2026-09-15: one series silent for 57 hours across two containers).
- *
- * This asks the one question none of them does — "has due scheduled work sat
- * for an hour with nobody working on IT?" — and asks it of the OUTCOME, not of
- * any cause, so it holds for causes nobody has found yet. It is an observer: it
- * completes, kills and re-arms nothing.
- *
- * It complements `task-failure-escalation` (T24), which counts runs that
- * happened and failed; an occurrence that never runs leaves no outcome row for
- * T24 to count. For the same reason it also reports a pre-task result that has
- * not reached T24's ledger for an hour (`listStuckGateResults`), through the
- * same dedup and attempt gap.
+ * Aged-occurrence alarm: a recurring occurrence that is due, wake-eligible and
+ * untouched for an hour reaches a human. Every per-session sweep guard declines
+ * correctly for its own case, so a due row the runner never selects can satisfy
+ * all of them forever with nothing logged above INFO. This asks of the OUTCOME
+ * ("due work nobody picked up for an hour"), so it holds for unknown causes. An
+ * observer only: it completes, kills and re-arms nothing. It also reports a
+ * pre-task result that has not reached the failure-escalation ledger for an
+ * hour (`listStuckGateResults`), which counts only runs that happened.
  */
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -34,51 +20,26 @@ import type { StuckGateResults } from '../mailbox/ops/sweep.js';
 import { parseSqliteUtc, sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
 
 /**
- * How long a due occurrence may sit before a human is told, measured from its
- * `process_after` alone.
- *
- * A flat hour, not a multiple of the series' cadence. The rows this looks at
- * exclude every occurrence a container has acknowledged, so what is being
- * timed is not "a slow turn on this row" but "due work nobody has picked up" —
- * and that has no legitimate reason to last longer on a daily series than on
- * a 5-minute one. A spawn queue, a provider park or a turn on another row that
- * holds the session for an hour is itself worth the DM. Sixty sweep ticks is
- * also far past any retry backoff (`BACKOFF_BASE_MS * 2 ** MAX_TRIES` in
- * sweep-session-core tops out under 3 minutes).
- *
- * Host uptime does not enter into it. A host that was down comes back to rows
- * that are already late; the attempt gap below lets its first tick send at
- * most one DM, and by the next attempt the rows its wakes reached have been
- * claimed and drop out.
+ * How long a due occurrence may sit before a human is told, from its
+ * `process_after` alone. A flat hour, not a cadence multiple: acknowledged
+ * occurrences are excluded, so this times "due work nobody picked up", which has
+ * no reason to last longer on a daily series. Far past any retry backoff.
  */
 const TASK_OVERDUE_ALERT_MS = 60 * 60 * 1000;
 
 /**
- * Floor between two alert ATTEMPTS from this process — delivered or not.
- *
- * A fleet-wide cause (the host cannot spawn at all) makes every session with a
- * schedule overdue in the same tick; the first DM says so and the rest arrive
- * one per window instead of as a burst.
- *
- * It advances on a FAILED attempt too, deliberately. A failed attempt can cost
- * the sweep up to `OPERATOR_ALERT_DEADLINE_MS` (src/operator-alert.ts), and if
- * nobody is reachable, not advancing would have every overdue session spend
- * that again on every tick. Holding the other alerts back costs nothing: they
- * go to the same recipients, who were just shown to be unreachable. This gap
- * decides only WHEN the next attempt happens; whether an occurrence still owes
- * an alert is the `alerted` set's business, and a failed attempt leaves it owing.
+ * Floor between two alert ATTEMPTS, delivered or not, so a fleet-wide cause
+ * yields one DM per window instead of a burst. It advances on a FAILED attempt
+ * too: each can cost up to the operator-alert deadline, and the recipients were
+ * just shown unreachable. Whether an occurrence still owes an alert is the
+ * `alerted` set's business.
  */
 export const TASK_OVERDUE_ATTEMPT_MIN_GAP_MS = 5 * 60 * 1000;
 
-// One DELIVERED alert per stuck thing per host process: an unclaimed occurrence
-// (keyed by its id), a withheld one (`withheld:<id>`, so an occurrence that is
-// later admitted and then goes unclaimed alerts again), and an unrecorded gate
-// row (`gate-row:<outbound id>`). In memory on purpose: a still-stuck item
-// alerts once more from each new host process, so the repeats are bounded by
-// the number of restarts, and a restart loop cannot hide a stuck row. None of
-// those ids is ever reused (`task-<ms>-<rand>`, recurrence.ts; `gate-<uuid>`),
-// so an entry is only ever stale, never wrong; stale ones are dropped per
-// session below.
+// One DELIVERED alert per stuck item per host process (occurrence id,
+// `withheld:<id>`, `gate-row:<outbound id>`). In memory on purpose: repeats are
+// bounded by restarts, and a restart loop cannot hide a stuck row. The ids are
+// never reused, so an entry can only be stale, never wrong.
 const alerted = new Map<string, Set<string>>();
 let lastAttemptAtMs = 0;
 
@@ -156,7 +117,6 @@ function formatUndeliveredGateAlert(input: {
   ].join('\n');
 }
 
-/** One thing this pass may report, keyed for the `alerted` dedup. */
 interface PendingAlert {
   key: string;
   source: string;
@@ -272,7 +232,6 @@ export async function escalateOverdueOccurrences(
     const tz = await resolveGroupTimezone(session.agent_group_id);
     const text = alert.render(group?.name ?? session.agent_group_id, tz);
 
-    // The attempt gap advances whatever happens next (see the constant).
     lastAttemptAtMs = nowMs;
     const context = {
       source: alert.source,
@@ -280,9 +239,7 @@ export async function escalateOverdueOccurrences(
       occurrenceId: alert.occurrenceId,
       sessionId: session.id,
     };
-    // Stamped only on a delivery that reached someone — same rule, and same
-    // reason, as task-failure-escalation (sweep-task-escalation). A failed
-    // attempt leaves it owing, to be retried once the attempt gap has passed.
+    // Stamped only on a delivery that reached someone; a failed attempt leaves it owing.
     if (await notifyOperators(text, context)) {
       const stamped = alerted.get(session.id) ?? new Set<string>();
       stamped.add(alert.key);

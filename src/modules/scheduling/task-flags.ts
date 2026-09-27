@@ -1,10 +1,4 @@
-/**
- * Per-fire model/effort resolver shared by the legacy MCP scheduling actions
- * (actions.ts) and the `ncl tasks` CLI resource (cli/resources/tasks.ts).
- * Split out so the CLI path can validate `--model`/`--effort` against the
- * same provider vocabulary without depending on actions.ts, which is slated
- * for deletion once the MCP scheduling surface retires.
- */
+/** Per-fire model/effort resolver shared by the MCP scheduling actions and the `ncl tasks` CLI. */
 import { resolveGroupProvider } from '../../container-config.js';
 import { parseMessageFlags, type FlagIntent } from '../../flag-parser.js';
 
@@ -12,21 +6,11 @@ import { parseMessageFlags, type FlagIntent } from '../../flag-parser.js';
 export type TaskFlagIntent = Pick<FlagIntent, 'turnModel' | 'turnEffort'>;
 
 /**
- * Validate a `{model?, effort?}` pin against ONE named provider's flag
- * vocabulary, returning the resolved per-fire intent or the parser's own
- * error text.
- *
- * The provider is a parameter, not a lookup, because the two callers ask
- * different questions of the same predicate: `resolveTaskFlagIntent` asks
- * "is this pin valid for the group as it is configured NOW", while the
- * provider-migration audit (`pin-audit.ts`) asks "would this already-stored
- * pin still be valid AFTER the provider changes". Both must reach the same
- * verdict from the same table — a second, drifting copy of "what counts as a
- * valid claude model" is exactly how a codex model id survived a `--provider`
- * switch and reached the Anthropic API for 14 hours (2026-09-07).
- *
- * Reuses the chat flag parser with `-m1`/`-e1` (per-turn) so a task pin is
- * resolved and rejected identically to an interactive `-m1 sonnet -e1 medium`.
+ * Validate a `{model?, effort?}` pin against ONE named provider's vocabulary,
+ * returning the intent or the parser's error. The provider is a parameter so
+ * the migration audit can ask "valid AFTER the switch" through the same
+ * predicate — a second copy of the model table could send a codex id to the
+ * Anthropic API. Uses the chat parser's per-turn `-m1`/`-e1` forms.
  */
 export function validateTaskPin(
   pin: { model?: string | null; effort?: string | null },
@@ -44,30 +28,10 @@ export function validateTaskPin(
   if (parsed.intent?.turnModel) flagIntent.turnModel = parsed.intent.turnModel;
   if (parsed.intent?.turnEffort) flagIntent.turnEffort = parsed.intent.turnEffort;
 
-  // A DROPPED axis is a rejection here, even though the chat parser treats it
-  // as a warning. `-m1 haiku -e1 xhigh` returns no error and simply omits
-  // `turnEffort`, because in chat the human sees "skipped effort" on screen and
-  // the turn runs anyway. A PIN has no such reader: it is written once and
-  // fires unattended for weeks, so "accepted, minus a piece you asked for" is
-  // indistinguishable from "accepted" at every later read — by `repin`, by the
-  // provider-migration audit, and by the operator looking at `tasks list`.
-  //
-  // Returning the subset silently would also re-open the exact defect this
-  // module exists to close: a caller that persists what it asked for rather
-  // than what came back stores a value validation refused.
-  // `ultracode` is not a storable effort. The parser represents it as
-  // `turnEffort: 'xhigh'` PLUS a separate `turnUltracode` boolean, and the
-  // stored pin shape carries only the effort — so accepting it would report
-  // success and persist plain `xhigh`, silently dropping the dynamic-workflow
-  // behavior the operator asked for. That is this module's own defect class,
-  // so it is refused rather than quietly downgraded.
-  //
-  // Deliberately NOT solved by carrying the flag through storage: that means
-  // threading a second field through the content envelope, the CLI's pin
-  // display, the provider-migration audit and repin's matching, and
-  // `ultracode` is claude-only, so it would also need a rule at every provider
-  // boundary. If a task ever needs it, that is the change to make — not a
-  // silent `xhigh` today.
+  // A DROPPED axis is a rejection here, though chat only warns: a pin fires
+  // unattended for weeks, and "accepted minus a piece" reads as "accepted" to
+  // every later reader. `ultracode` is refused for the same reason: the stored
+  // pin carries only `xhigh`, silently dropping the ultracode behavior.
   if (effort && effort.trim().toLowerCase() === 'ultracode') {
     return {
       error:
@@ -87,18 +51,11 @@ export function validateTaskPin(
 }
 
 /**
- * Resolve a `{ model?, effort? }` schedule/update payload into a per-fire
- * flagIntent, validated against the agent group's provider vocabulary.
- * Returns `{ flagIntent }` on success (empty object when neither field was
- * given), or `{ error }` with a human-readable reason the agent sees.
- *
- * `target.agent_provider` is optional: the MCP scheduling path passes the
- * calling session's sticky provider override; the `ncl tasks` CLI path has no
- * such session in hand and resolves purely off the agent group's container
- * config. `target.overrideProvider` short-circuits both — the bulk re-pin
- * command uses it to validate against the provider a group is ABOUT to move
- * to, which is the only way to fix pins ahead of a migration (validating
- * against the current provider would reject every correct new value).
+ * Resolve a `{ model?, effort? }` payload into a per-fire flagIntent validated
+ * against the group's provider vocabulary: `{}` when neither is given,
+ * `{ flagIntent }` when valid, else `{ error }`. `target.overrideProvider` wins over both the session's sticky
+ * provider and the container config — bulk re-pin validates against the
+ * provider a group is ABOUT to move to.
  */
 export async function resolveTaskFlagIntent(
   content: Record<string, unknown>,
@@ -108,10 +65,7 @@ export async function resolveTaskFlagIntent(
   const effort = typeof content.effort === 'string' ? content.effort.trim() : '';
   if (!model && !effort) return {};
 
-  // Through the seam, so create/update validate a pin against the provider the
-  // group ACTUALLY runs. This was the third site reading the lagging
-  // projection: two were found as separate review findings at separate call
-  // sites, which is the whole argument for there being one resolver.
+  // Through the seam: validate against the provider the group ACTUALLY runs.
   const provider =
     target.overrideProvider ?? (await resolveGroupProvider(target.agent_group_id, target.agent_provider));
   return validateTaskPin({ model, effort }, provider);

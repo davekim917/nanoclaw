@@ -150,13 +150,9 @@ export function prepareScheduledTask(input: {
 }
 
 /**
- * Persist a prepared task through NanoClaw's single task/session representation.
- *
- * Asynchronous: the write goes through the seam, whose
- * `session()` is a promise. `resolveTaskSession` above provisions the mailbox,
- * so this uses the existing-only funnel and treats `undefined` as the same
- * hard error the pre-seam existsSync guard raised (invariant I-10 — a task
- * writer must not be what resurrects a reclaimed session directory).
+ * Persist a prepared task. `resolveTaskSession` provisions the mailbox, so this
+ * uses the existing-only funnel and a missing mailbox is a hard error: a task
+ * writer must not resurrect a reclaimed session directory.
  */
 export async function createScheduledTask(
   agentGroupId: string,
@@ -166,14 +162,9 @@ export async function createScheduledTask(
   const id = makeTaskId(task.name);
   const { session } = await resolveTaskSession(agentGroupId, id);
 
-  // The insert changes when this session next has work due, and due-ness lives
-  // only in the session DB where the host sweep's quiet cache cannot see it.
-  // `withQuietInvalidationSync` clears the mark in the same synchronous turn as
-  // the insert, INSIDE the mailbox callback: `withExistingMailboxSession` awaits
-  // the mailbox's existence before it calls back, so invalidating outside would
-  // leave that await between the two (Codex round 3, H1). Fail-closed — a
-  // refused invalidation aborts the create rather than landing a row behind a
-  // mark nothing will clear.
+  // Invalidate the sweep's quiet-cache mark in the same synchronous turn as the
+  // insert, INSIDE the mailbox callback (the funnel awaits before calling back).
+  // Fail-closed: a refused invalidation aborts the create.
   const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) =>
     withCentralSync(
       () =>
@@ -187,9 +178,7 @@ export async function createScheduledTask(
               prompt: task.prompt,
               script: task.script,
               originSessionId: options?.originSessionId ?? null,
-              // Physical send suppression: the agent-runner drops chat-kind
-              // outbound writes for tasks carrying muteChat (watcher-style tasks
-              // whose contract is board/file output, never channel posts).
+              // The runner drops chat-kind outbound writes for muteChat tasks.
               ...(task.muteChat ? { muteChat: true } : {}),
             }),
             status: options?.status ?? 'pending',

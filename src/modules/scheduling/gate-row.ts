@@ -1,14 +1,10 @@
 /**
- * Container gate rows: the runner's record of one pre-task script execution,
- * written before it acks the occurrence as a `task_log` outbound row
- * `{"gate":{occurrenceId, wakeAgent, observation?, error?}}` with no `auto`
- * flag and a null `in_reply_to` (a non-null one would let the sweep complete
- * the occurrence as answered before its ack).
- *
- * A crash between the gate row and the ack re-runs the script and writes a
- * second row for the same occurrence. The ledger upsert keeps whichever is
- * recorded last, so rows are recorded in `seq` order and a failed recording is
- * retried in place rather than skipped or given up.
+ * Container gate rows: the runner's `task_log` record of one pre-task script
+ * run, `{"gate":{occurrenceId, wakeAgent, observation?, error?}}`, written
+ * before its ack with a null `in_reply_to` (non-null would let the sweep
+ * complete the occurrence as answered). A crash can produce two rows for one
+ * occurrence; the ledger keeps the last, so rows are recorded in `seq` order
+ * and a failed recording is retried in place.
  */
 import { taskSeriesId } from '../../db/sessions.js';
 import { log } from '../../log.js';
@@ -33,12 +29,9 @@ export function isGateRow(msg: { kind: string; content: string }): boolean {
 }
 
 /**
- * Put every gate row ahead of every row the runner wrote after it (higher
- * `seq`), and the gate rows themselves in `seq` order. Delivery reads in
- * timestamp order, which a backward clock step or an equal timestamp can
- * invert; a failing gate row stops the drain, and that holds back only what
- * was written after it if nothing written after it is ahead of it. The other
- * rows keep their relative order.
+ * Put every gate row ahead of rows the runner wrote after it (higher `seq`);
+ * other rows keep their relative order. Delivery reads in timestamp order,
+ * which a clock step can invert, and a failing gate row stops the drain.
  */
 export function orderGateRowsBySeq<T extends { kind: string; content: string; seq: number | null }>(rows: T[]): T[] {
   const seqOf = (row: T): number => row.seq ?? Number.MAX_SAFE_INTEGER;
@@ -65,12 +58,9 @@ function rawResult(gate: Record<string, unknown>): RawGateResult {
 }
 
 /**
- * Record a gate row. Returns false for any other row.
- *
- * The series is the host's, never the container's: a task session's own
- * series, or else the series of the named occurrence in this session's
- * inbound. A container can therefore only record against its own series.
- * Throws when the ledger write fails; delivery then retries the row.
+ * Record a gate row; false for any other row. The series is the host's (the
+ * task session's own, or the named occurrence's in this inbound), so a
+ * container can only record against its own series. Throws on ledger failure.
  */
 export async function recordGateRow(
   msg: { id: string; kind: string; content: string },

@@ -148,7 +148,7 @@ async function produceQuestionResponse(): Promise<ProducedQuestionResponse> {
   vi.setSystemTime('2026-09-10T09:01:00.000Z');
   try {
     // Drive the registered host producer itself. It writes kind='system' with
-    // the question_response envelope at `src/modules/interactive/index.ts:38-52`.
+    // the question_response envelope in `handleInteractiveResponse` (src/modules/interactive/index.ts).
     await import('../src/modules/interactive/index.js');
     const { getResponseHandlers } = await import('../src/response-registry.js');
     let handled = false;
