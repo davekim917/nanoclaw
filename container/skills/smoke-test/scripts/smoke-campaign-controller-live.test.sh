@@ -206,15 +206,18 @@ world() { # tick
 tick_time() { python3 -c 'import datetime,sys; print((datetime.datetime(2026,9,18,10,0,tzinfo=datetime.timezone.utc)+datetime.timedelta(minutes=10*int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
 
 inputs_from_fakes() { # receipts: every enqueued message delivered unless FAIL_RECEIPTS; tasks from ncl
-  python3 - "$C" "${FAIL_RECEIPTS:-}" "${MISSING_RECEIPTS:-}" <<'PY'
+  # RECEIPT_TIMES: each receipt is {status, at} with the message's enqueue time
+  # as its delivery time, as the live worker reads delivered_at.
+  python3 - "$C" "${FAIL_RECEIPTS:-}" "${MISSING_RECEIPTS:-}" "${RECEIPT_TIMES:-}" <<'PY'
 import json, os, sys
-c, fail, missing = sys.argv[1], sys.argv[2], sys.argv[3]
+c, fail, missing, timed = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 try:
     msgs = json.load(open(os.path.join(c, "fake", "enqueue.json")))["messages"]
 except FileNotFoundError:
     msgs = {}
-json.dump({mid: ("failed" if fail and fail in mid else "delivered") for mid in msgs
-           if not (missing and missing in mid)}, open(os.path.join(c, "receipts.json"), "w"))
+status = {mid: ("failed" if fail and fail in mid else "delivered") for mid in msgs if not (missing and missing in mid)}
+json.dump({mid: ({"status": st, "at": msgs[mid]["at"]} if timed else st) for mid, st in status.items()},
+          open(os.path.join(c, "receipts.json"), "w"))
 try:
     tasks = json.load(open(os.path.join(c, "fake", "ncl.json")))["tasks"]
 except FileNotFoundError:
@@ -1320,19 +1323,19 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5570' 'smoke-campaign-controller.py:1529-1531' \
-         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1518-1528'; do
+for c in 'smoke-pr-gate.sh:5612' 'smoke-campaign-controller.py:1535-1537' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1524-1534'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
-cite smoke-pr-gate.sh 5570 'OWNER_TOKEN="$(new_owner_token'
-cite smoke-pr-gate.sh 5599 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5604 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5649 '.activeLeaseOwner=$owner'
+cite smoke-pr-gate.sh 5612 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5641 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5646 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5693 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 707 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1474 'def _owner_wake'
-cite smoke-campaign-controller.py 1524 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1529 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1480 'def _owner_wake'
+cite smoke-campaign-controller.py 1530 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1535 'if c.get("wake"):'
 
 
 fi
@@ -2082,6 +2085,82 @@ ticks 0 3
 [ "$(jr '[.[] | select(.kind=="send" and .slot=="root" and .state=="enqueued") | .at] | first')" = '"2026-09-18T10:30:00Z"' ] \
   || fail "c3: past the deadline the root goes out despite a blind gate: $(jr '[.[]|select(.kind=="send" and .slot=="root")|{at,state}]')"
 
+fi
+
+# c4) The window starts at DELIVERY, not at a send that did not land. The
+#     root's first attempt comes back with a failed receipt; the retry is armed
+#     again before it goes out, and once its receipt is in, the gate's start is
+#     confirmed at the delivery time that receipt carries -- once, never asked
+#     again on later fires.
+start_calls() { # arm|confirm
+  if [ "$1" = arm ]; then
+    jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-start" and (.argv | length) == 3)] | length' "$FAKE_LOG"
+  else
+    jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-start" and .argv[3]=="--delivered")] | length' "$FAKE_LOG"
+  fi
+}
+root_message_at() { # attempt
+  jq -r --arg m "$(key "$RUN" send root)#$1" '.messages[$m].at // empty' "$C/fake/enqueue.json"
+}
+if smoke_case 26-challenger-start-delivery; then
+new_case challenger-start-at-delivery
+C4_DL="$(date -u -d "@$(( $(date -u +%s) + 5000 ))" +'%Y-%m-%dT%H:%M:%SZ')"
+claim "$C4_DL"; wake_json
+RECEIPT_TIMES=1 FAIL_RECEIPTS="$(key "$RUN" send root)#1" ticks 0 11
+[ "$(jr '[.[] | select(.kind=="send" and .slot=="root" and .state=="failed")] | length')" = 1 ] \
+  || fail "c4: precondition -- the root's first attempt failed: $(jr '[.[]|select(.kind=="send" and .slot=="root")|{at,state,attempt}]')"
+[ "$(start_calls arm)" = 2 ] || fail "c4: each attempt of the root is armed, the retry included: $(jq -sc '[.[]|select(.tool=="gate")|.argv]' "$FAKE_LOG")"
+C4_AT="$(root_message_at 2)"
+[ -n "$C4_AT" ] || fail "c4: precondition -- the root's second attempt was enqueued"
+[ "$(start_calls confirm)" = 1 ] || fail "c4: the delivered root confirms the start exactly once: $(jq -sc '[.[]|select(.tool=="gate")|.argv]' "$FAKE_LOG")"
+jq -se --arg at "$C4_AT" '[.[] | select(.tool=="gate" and .argv[3]=="--delivered")][0].argv[4] == $at' "$FAKE_LOG" >/dev/null \
+  || fail "c4: the confirm carries the delivered attempt's receipt time ($C4_AT): $(jq -sc '[.[]|select(.tool=="gate" and .argv[3]=="--delivered")|.argv]' "$FAKE_LOG")"
+C4_WANT="$(date -u -d "@$(( $(date -u -d "$C4_AT" +%s) + 5400 ))" +'%Y-%m-%dT%H:%M:%SZ')"
+jq -e --arg at "$C4_AT" --arg d "$C4_WANT" \
+  '.challengerStartedAt == $at and .challengerProvisionalDeadline == null and .challengerDeadline == $d' \
+  "$C/state/pr-$PR-state.json" >/dev/null \
+  || fail "c4: the challenger's window runs from the root's delivery ($C4_AT -> $C4_WANT): $(jq -c '{challengerStartedAt,challengerDeadline,challengerProvisionalDeadline}' "$C/state/pr-$PR-state.json")"
+[ "$(jr '[.[] | select(.kind=="send" and .slot=="root") | .detail.challengerStart // empty]')" = '["confirmed"]' ] \
+  || fail "c4: the confirm is journaled on the root obligation: $(jr '[.[]|select(.kind=="send" and .slot=="root")|.detail]')"
+# Not certified_go: its exactly-once check counts the root's two attempts.
+[ "$(finish_verdict)" = '"GO"' ] && [ "$(jq -r '.completedVerdict' "$C/state/pr-$PR-state.json")" = GO ] \
+  || fail "c4: the run certifies GO through finish: $(finish_verdict)"
+
+# c5) A confirm the gate cannot decide (blind) holds nothing -- the root is
+#     already out -- and is asked again next fire with the SAME delivery time,
+#     so waiting costs the challenger nothing. One alarm.
+new_case challenger-confirm-blind
+C5_DL="$(date -u -d "@$(( $(date -u +%s) + 5000 ))" +'%Y-%m-%dT%H:%M:%SZ')"
+jq -cn '{"gate:challenger-start":["pass","refuse-code:lease-unavailable"]}' >"$C/fake/faults.json"
+claim "$C5_DL"; wake_json
+RECEIPT_TIMES=1 ticks 0 11
+[ "$(start_calls confirm)" = 2 ] || fail "c5: a blind confirm is asked again: $(jq -sc '[.[]|select(.tool=="gate")|.argv]' "$FAKE_LOG")"
+C5_AT="$(root_message_at 1)"
+jq -se --arg at "$C5_AT" '[.[] | select(.tool=="gate" and .argv[3]=="--delivered") | .argv[4]] == [$at, $at]' "$FAKE_LOG" >/dev/null \
+  || fail "c5: both confirms carry the root's delivery time ($C5_AT)"
+[ "$(dq '[.[] | select(.reason=="challenger-start could not confirm the delivered root yet")] | length')" = 1 ] \
+  || fail "c5: one journaled wait for the blind confirm: $(dq '[.[]|select(.type=="wait")|{at,reason}]')"
+! dq '[.[] | select(.reason=="challenger-start could not act yet; root post deferred")] | length > 0' | grep -qx true \
+  || fail "c5: a confirm never defers anything"
+jq -e --arg at "$C5_AT" '.challengerStartedAt == $at and .challengerProvisionalDeadline == null' "$C/state/pr-$PR-state.json" >/dev/null \
+  || fail "c5: the retried confirm anchors at the delivery time: $(jq -c '{challengerStartedAt,challengerProvisionalDeadline}' "$C/state/pr-$PR-state.json")"
+one_alarm c5 "alarm:gate-blind:challenger-start"
+certified_go c5
+
+# c6) A coded refusal at confirm (here: delivered after the deadline in force)
+#     is the gate stating a fact: journaled, never asked again, and the armed
+#     deadline stands.
+new_case challenger-confirm-refused
+C6_DL="$(date -u -d "@$(( $(date -u +%s) + 5000 ))" +'%Y-%m-%dT%H:%M:%SZ')"
+jq -cn '{"gate:challenger-start":["pass","refuse-code:deadline-passed"]}' >"$C/fake/faults.json"
+claim "$C6_DL"; wake_json
+RECEIPT_TIMES=1 ticks 0 11
+[ "$(start_calls confirm)" = 1 ] || fail "c6: a refused confirm is not asked again: $(jq -sc '[.[]|select(.tool=="gate")|.argv]' "$FAKE_LOG")"
+[ "$(jr '[.[] | select(.kind=="send" and .slot=="root") | .detail.challengerStart // empty]')" = '["deadline-passed"]' ] \
+  || fail "c6: the refusal is journaled on the root obligation: $(jr '[.[]|select(.kind=="send" and .slot=="root")|.detail]')"
+jq -e '.challengerProvisionalDeadline != null' "$C/state/pr-$PR-state.json" >/dev/null \
+  || fail "c6: the armed start stands"
+certified_go c6
 fi
 smoke_cases_done
 echo "smoke campaign controller live tests passed"
