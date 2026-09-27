@@ -1,15 +1,3 @@
-/**
- * Codex app-server JSON-RPC transport primitives.
- *
- * Communicates with `codex app-server` over stdio. This module is just the
- * plumbing — spawn the process, send requests, dispatch responses and
- * notifications. Higher-level semantics (threads, turns, event translation)
- * live in codex.ts.
- *
- * Kept separate so the transport can be unit-tested without pulling in the
- * full provider and so any future Codex tooling (e.g. a CLI for manual
- * debugging) can reuse the same primitives.
- */
 import fs from 'fs';
 import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
@@ -32,37 +20,14 @@ const CODEX_INITIALIZE_CAPABILITIES = {
   // Required for thread/list.ancestorThreadId, which lets the liveness probe
   // see work delegated below a quiet root thread.
   experimentalApi: true,
-  // `optOutNotificationMethods` is a suppression list, not an allow-list.
-  // Keep it empty so high-volume streams such as item/agentMessage/delta and
-  // item/reasoning/* remain eligible for delivery on this connection.
+  // A suppression list, not an allow-list: keep it empty so high-volume delta streams stay deliverable.
   optOutNotificationMethods: [],
 };
 
-/**
- * Errors from `thread/resume` that indicate the thread ID is unusable —
- * typically because the app-server has no memory of it (thread transcript
- * was deleted, server was wiped, ID is from a different codex version).
- * Only errors matching this pattern trigger silent fallback to a fresh
- * thread; everything else bubbles up so the caller can decide what to do.
- *
- * Shared with `codex.ts`'s `isSessionInvalid` to keep the two detection
- * paths in sync.
- */
+/** Only these errors fall back to a fresh thread; shared with codex.ts's `isSessionInvalid`. */
 export const STALE_THREAD_RE = /thread\s+not\s+found|unknown\s+thread|thread[_\s]id|no such thread/i;
 
-/**
- * Escape a string for emission inside a TOML basic string (double-quoted).
- * Handles `"`, `\` and the C0/DEL control range. Rejects newlines: basic
- * strings can't contain raw newlines, and silently converting them to `\n`
- * would mask misconfiguration (e.g. a secret pasted with a trailing newline).
- * Multiline strings are unsupported for `config.toml` use here.
- *
- * Every other control character IS escaped rather than rejected: TOML forbids
- * raw C0 controls and DEL inside basic strings, so one stray invisible byte in
- * an MCP env value or header made codex reject the whole config file — which
- * drops EVERY MCP server for that group, not just the offending one.
- * (upstream 05860324c)
- */
+/** Rejects newlines, which in an MCP value are misconfiguration (e.g. a secret with a trailing newline). */
 function tomlBasicString(value: string): string {
   if (value.includes('\n') || value.includes('\r')) {
     throw new Error(
@@ -73,23 +38,8 @@ function tomlBasicString(value: string): string {
 }
 
 /**
- * The escaping half of {@link tomlBasicString}, without its newline refusal —
- * the one place this repo escapes a TOML basic string, so a second caller
- * cannot ship a partial ruleset of its own.
- *
- * `tomlBasicString` REFUSES a newline because one inside an MCP env value or
- * header is misconfiguration worth surfacing (a secret pasted with a trailing
- * newline). A TOML KEY is different: it is derived from a path this process was
- * handed rather than authored, so refusing would turn one oddly-named plugin
- * file into a spawn that never happens. Keys escape everything and always
- * produce a parsable table header.
- *
- * Escaping the whole C0/DEL range is the load-bearing part either way, and the
- * reason is the tolerant reader on the other side: codex answers one raw
- * control byte anywhere in config.toml with "Invalid configuration; using
- * defaults" and then starts anyway, so a stray byte fails neither the write nor
- * the launch — it silently drops EVERY table in the file. (upstream 05860324c
- * for the MCP half; `docs/review-notes/822.md` registers the class.)
+ * The only TOML basic-string escaper here, and it never refuses (keys come from paths, not authors). Every C0/DEL
+ * byte must be escaped: codex answers one raw control byte with "using defaults" and silently drops every table.
  */
 export function escapeTomlBasicStringBody(value: string): string {
   // The control-char replace must stay LAST: an earlier pass would double the
@@ -104,17 +54,8 @@ export function escapeTomlBasicStringBody(value: string): string {
 }
 
 /**
- * Emit a TOML key, quoting anything that is not a bare key.
- *
- * MCP server names and env keys are operator- (and, through the
- * `add_mcp_server` approval flow, agent-) supplied, and nothing on the host
- * validates their charset — `validateMcpServers` only rejects the deprecated
- * SSE transport. `[A-Za-z0-9_-]+` is exactly TOML's bare-key grammar, so an
- * ordinary name stays byte-identical and anything else is quoted. A name with
- * a dot would otherwise nest itself under a sibling table, and a name with a
- * `]` or a quote could close the header and open its own `[mcp_servers.*]`
- * table carrying a command the approval card never showed. Bare and quoted
- * forms name the same table. (upstream 2e97ab046)
+ * Names are operator/agent-supplied and unvalidated, so anything outside TOML's bare-key grammar is quoted; a `.`,
+ * `]` or quote could otherwise nest or open an `[mcp_servers.*]` table the approval card never showed.
  */
 function tomlKey(name: string): string {
   return /^[A-Za-z0-9_-]+$/.test(name) ? name : tomlBasicString(name);
@@ -126,14 +67,11 @@ function tomlInlineStringMap(map: Record<string, string>): string {
     .join(', ')} }`;
 }
 
-// ── JSON-RPC types ──────────────────────────────────────────────────────────
-
 let nextRequestId = 1;
 
 interface JsonRpcRequest {
   id: number;
   method: string;
-  /** Absent when the method takes no params — see `makeRequest`. */
   params?: Record<string, unknown>;
 }
 
@@ -157,10 +95,8 @@ export interface JsonRpcServerRequest {
 type JsonRpcMessage = JsonRpcResponse | JsonRpcNotification | JsonRpcServerRequest;
 
 /**
- * `params` omitted (not `null`, not `{}`) when the caller passes none: the key
- * is left off the object so `JSON.stringify` writes no `"params"` at all. A
- * method whose params the server deserializes as unit accepts that shape on
- * every codex version we run (see `readCodexAccountRateLimits`).
+ * No params means no `params` key at all (not null, not {}): methods whose params deserialize as unit accept only
+ * that shape.
  */
 function makeRequest(method: string, params?: Record<string, unknown>): JsonRpcRequest {
   const id = nextRequestId++;
@@ -174,8 +110,6 @@ function isResponse(msg: JsonRpcMessage): msg is JsonRpcResponse {
 function isServerRequest(msg: JsonRpcMessage): msg is JsonRpcServerRequest {
   return 'id' in msg && 'method' in msg;
 }
-
-// ── App-server handle ───────────────────────────────────────────────────────
 
 export interface AppServer {
   process: ChildProcess;
@@ -303,11 +237,7 @@ export function killCodexAppServer(server: AppServer): void {
   }
 }
 
-// ── Auto-approval ───────────────────────────────────────────────────────────
-// The container sandbox is already the security boundary; inside it, Codex's
-// own approval prompts would just block every tool call on a user that isn't
-// watching. Accept everything and let sandbox limits do the enforcement.
-
+// The container sandbox is the security boundary; Codex's own approval prompts would block on an absent user.
 export function attachCodexAutoApproval(server: AppServer): void {
   server.serverRequestHandlers.push((req) => {
     const method = req.method;
@@ -349,8 +279,6 @@ export function attachCodexAutoApproval(server: AppServer): void {
   });
 }
 
-// ── High-level helpers ──────────────────────────────────────────────────────
-
 export async function initializeCodexAppServer(server: AppServer): Promise<void> {
   log('Sending initialize…');
   const resp = await sendCodexRequest(
@@ -375,12 +303,7 @@ export interface ThreadParams {
   baseInstructions?: string;
 }
 
-/**
- * Start or resume a Codex thread. If `threadId` is provided, attempts
- * `thread/resume` first and falls back to a fresh `thread/start` on failure
- * (stale thread IDs commonly outlive containers). Returns the active thread
- * ID either way.
- */
+/** Falls back to `thread/start` only on a recognized stale-thread error (thread IDs commonly outlive containers). */
 export async function startOrResumeCodexThread(
   server: AppServer,
   threadId: string | undefined,
@@ -396,9 +319,7 @@ export async function startOrResumeCodexThread(
       log(`Thread resumed: ${threadId}`);
       return threadId;
     }
-    // Only fall through to fresh-thread on recognized stale-thread errors.
-    // Auth, version, or transient failures would otherwise silently discard
-    // session state — fail loud instead so the caller can retry or surface.
+    // Any other resume failure throws: a silent fresh thread would discard session state.
     if (!STALE_THREAD_RE.test(resp.error.message)) {
       throw new Error(`thread/resume failed: ${resp.error.message}`);
     }
@@ -463,12 +384,7 @@ export async function readCodexTurnSnapshot(
   return turn;
 }
 
-/**
- * Non-mutating control-plane probe for a running turn. A successful response
- * proves the app-server JSON-RPC loop is responsive even when the model or a
- * tool has emitted no notifications. Descendants are included because an
- * Ultra root may be idle-looking while delegated agents remain active.
- */
+/** Non-mutating; descendants are included because a root can look idle while delegated agents are active. */
 export async function probeCodexThreadHealth(
   server: AppServer,
   threadId: string,
@@ -500,7 +416,6 @@ export async function probeCodexThreadHealth(
   };
 }
 
-/** One subagent thread, as the status subtext needs it. */
 export interface CodexSubagentThread {
   id: string;
   model: string | null;
@@ -508,27 +423,8 @@ export interface CodexSubagentThread {
 }
 
 /**
- * List the child threads a turn's subagents ran in, with the model and effort
- * each was configured with.
- *
- * Codex models a subagent as its own THREAD — `SubAgentActivityItem` carries
- * only `{id, kind, agent_thread_id, agent_path}`, and the model/effort live on
- * the thread record it points at. `thread/list` with `ancestorThreadId` is a
- * SECOND call with the same parameters the liveness probe sends
- * (probeCodexThreadHealth) — not a reuse of its response. It keeps the fields
- * that probe discards.
- *
- * HONEST LABEL: `model` and `reasoning_effort` are the thread's CONFIGURED
- * values. Codex's own protocol comment calls them "current configured … when
- * loaded, otherwise the latest persisted", and says explicitly: "This is not
- * per-turn execution telemetry." So this answers "what was this worker set to
- * run at" — what the Codex desktop app shows when you click a subagent — and
- * not "what did each of its requests observably use". Claude's side of this
- * feature reads an observed model; the difference is real and is why the two
- * capture sites do not share a helper.
- *
- * Returns [] rather than throwing: a roster is decoration, and a failed list
- * must never take down the turn that was about to report its own success.
+ * `model`/`effort` are the thread's configured values, not per-turn telemetry (Codex's protocol says so).
+ * Returns [] rather than throwing: a failed roster must never fail the turn.
  */
 export async function readCodexSubagentThreads(
   server: AppServer,
@@ -552,8 +448,7 @@ export async function readCodexSubagentThreads(
       .map((thread) => ({
         id: text(thread.id) ?? '',
         model: text(thread.model),
-        // snake_case on the wire; the generated TS schema camelCases it, and
-        // which one arrives depends on the app-server build, so read both.
+        // snake_case on the wire, camelCase in some app-server builds: read both.
         effort: text(thread.reasoning_effort) ?? text(thread.reasoningEffort),
       }))
       .filter((thread) => thread.id !== '');
@@ -563,37 +458,8 @@ export async function readCodexSubagentThreads(
 }
 
 /**
- * Pull the account's rate-limit snapshot. (Claude has no counterpart pull: it
- * reads the per-window headers off `rate_limit_event`, providers/claude.ts
- * `unifiedWindowsToSamples`.)
- *
- * **Sent with NO `params` at all**, and that stays true across pin moves. The
- * shape originally shipped as `{ excludeResetCreditDetails: true }`, written
- * against the HOST's codex-cli 0.154.0, whose generated schema defines
- * `GetAccountRateLimitsParams` and marks the request's `params` optional. The
- * container was then pinned to 0.153.4, where `account/rateLimits/read`
- * deserializes its params as unit, so that map was refused at the JSON-RPC
- * boundary before any account lookup:
- *   `Invalid request: invalid type: map, expected unit`
- * — which is what production logged for every bind-time read. Omitting
- * `params` is valid on both: unit on 0.153.4, absent-and-optional on 0.154.0
- * (verified by issuing the real RPC against both binaries).
- *
- * The container's `ARG CODEX_VERSION` (`container/Dockerfile`) is now
- * **0.154.0** too, so the params map would be accepted again — and it is still
- * deliberately NOT sent. `excludeResetCreditDetails: true` only skipped a
- * second reset-credit lookup we never read, so re-adding it would buy nothing
- * and re-couple this call to one codex version; the no-params shape is the one
- * both old and new binaries accept, and it is what the next pin move should
- * keep. Do not "fix" it back.
- *
- * Throws on an RPC error or a malformed result; the caller treats a failed read
- * as NOT SAMPLED (no row, no park) and logs it — telemetry must never fail a
- * turn. That is why this failed silently for a full deploy:
- * `CodexRateLimitTracker.read()` writes its `usage_pull` sample inside the same
- * `try` (`codex-rate-limit-tracker.ts`), so a throw here
- * costs every pull row while the push path (`account/rateLimits/updated`,
- * `onNotification`) keeps writing and the sample table looks alive.
+ * Sent with NO `params`: codex 0.153.4 deserializes them as unit and refuses a map while 0.154.0 accepts absence,
+ * so this is the one shape both accept. Do not re-add `excludeResetCreditDetails`.
  */
 export async function readCodexAccountRateLimits(
   server: AppServer,
@@ -606,17 +472,7 @@ export async function readCodexAccountRateLimits(
   return parsed;
 }
 
-// ── hooks/list ──────────────────────────────────────────────────────────────
-
-/**
- * One handler as `hooks/list` reports it. Fields are those codex 0.154.0
- * actually emits, measured against a scratch `CODEX_HOME`; everything is
- * optional because this is a foreign wire shape and a pin move may drop or
- * rename a field. The three the trust check reads — `key`, `enabled`,
- * `trustStatus` — are exactly the three codex's own dispatch predicate reads
- * (`hooks/src/engine/discovery.rs`: `enabled && (bypass_hook_trust ||
- * trust_status is Managed | Trusted)`).
- */
+/** Foreign wire shape (measured on 0.154.0): every field is optional because a pin move may drop or rename one. */
 export interface CodexHookListEntry {
   key?: string;
   eventName?: string;
@@ -635,7 +491,6 @@ export interface CodexHookListEntry {
 
 export interface CodexHookListResult {
   entries: CodexHookListEntry[];
-  /** Per-source diagnostics codex attaches to the listing, flattened. */
   warnings: string[];
   errors: string[];
 }
@@ -643,18 +498,8 @@ export interface CodexHookListResult {
 export const CODEX_HOOKS_LIST_METHOD = 'hooks/list';
 
 /**
- * Read back every hook the app-server actually loaded, with its trust status.
- *
- * **`params` is `{}`, not omitted.** Measured on 0.154.0: sending the request
- * with no `params` member is refused at the JSON-RPC boundary with
- * `Invalid request: missing field \`params\`` — the opposite of
- * `account/rateLimits/read` above, whose params deserialize as unit. Do not
- * "harmonize" the two.
- *
- * The result is `{ data: [ { cwd, hooks: [...], warnings, errors } ] }` — one
- * group per cwd, because project-local hook files are discovered per working
- * directory. Every group's handlers are flattened into one list; the caller
- * scopes by `sourcePath`.
+ * `params` must be `{}`, not omitted: 0.154.0 refuses a missing `params` here, the opposite of
+ * `account/rateLimits/read`. Groups are per cwd and flattened; the caller scopes by `sourcePath`.
  */
 export async function listCodexHooks(server: AppServer, timeoutMs = 15_000): Promise<CodexHookListResult> {
   const resp = await sendCodexRequest(server, CODEX_HOOKS_LIST_METHOD, {}, timeoutMs);
@@ -679,7 +524,6 @@ export async function listCodexHooks(server: AppServer, timeoutMs = 15_000): Pro
   return { entries, warnings, errors };
 }
 
-/** Best-effort graceful cancellation before replacing a responsive server. */
 export async function interruptCodexTurn(
   server: AppServer,
   params: { threadId: string; turnId: string },
@@ -690,17 +534,8 @@ export async function interruptCodexTurn(
 }
 
 /**
- * Append text input to a turn that is currently in flight. Codex's app-server
- * routes the new input to the running turn (rather than queuing it for the
- * next turn), so the agent's response can reference late-arriving content
- * without ending the turn first.
- *
- * `expectedTurnId` is a precondition the server checks — if it doesn't match
- * the active turn, the request fails. The caller has to pass the turnId
- * observed from a prior `turn/started` notification.
- *
- * Throws on RPC error so the caller can fall back to queuing the message
- * for the next turn (e.g. if the active turn has just ended).
+ * `expectedTurnId` must match the active turn or the server refuses; the caller queues for the next turn on a
+ * throw.
  */
 export async function steerCodexTurn(
   server: AppServer,
@@ -717,11 +552,6 @@ export async function steerCodexTurn(
   return { turnId };
 }
 
-// ── MCP config.toml ─────────────────────────────────────────────────────────
-// Codex discovers MCP servers by reading ~/.codex/config.toml at startup.
-// We rewrite it on every spawn from whatever mcpServers the agent-runner
-// passes in, so the container's config reflects the current host wiring.
-
 export type CodexMcpServer = CodexStdioMcpServer | CodexHttpMcpServer;
 
 export interface CodexStdioMcpServer {
@@ -729,10 +559,7 @@ export interface CodexStdioMcpServer {
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  /**
-   * Working directory for the server process. Codex's stdio MCP transport
-   * takes this natively. Absolute by the time it reaches here.
-   */
+  /** Absolute by the time it reaches here. */
   cwd?: string;
 }
 
@@ -745,21 +572,8 @@ export interface CodexHttpMcpServer {
 const MCP_MARKER = '# --- nanoclaw runtime MCP servers ---';
 
 /**
- * Parse a TOML table header line, returning the table name or null.
- *
- * Sole owner of "is this line a table header" for every config.toml scanner in
- * the tree — this file's MCP stripper and codex-companion-setup's plugin
- * stripper both call it, because one of them getting the grammar wrong is how
- * a block goes unrecognized.
- *
- * `.+` is greedy on purpose: the closing bracket is the LAST `]` on the line,
- * not the first. A quoted key segment may legally contain `]` — which is
- * exactly what `tomlKey` now emits for a hostile server name — and a negated
- * class stops at the inner bracket, fails the end anchor, and reports "not a
- * header" for a line that is one. Both scanners then mis-handle the block: the
- * MCP stripper keeps the stale table as base config and the next spawn appends
- * a duplicate table, which codex refuses outright; the plugin stripper leaves
- * its flag stale and silently drops the following lines from the base config.
+ * Shared by every config.toml scanner. `.+` is greedy on purpose: a quoted key may contain `]` (tomlKey emits one
+ * for a hostile name), and a match that stopped at the first `]` would miss the header and leave a duplicate table.
  */
 export function parseTomlTableHeader(line: string): string | null {
   const match = line.match(/^\s*\[(.+)\]\s*$/);
@@ -778,17 +592,10 @@ function stripExistingMcpServers(toml: string): string {
     }
     if (!inMcpBlock) out.push(line);
   }
-  // Collapse blank-line runs left behind by the removed marker/blocks.
   const collapsed = out.filter((line, i) => line !== '' || out[i - 1] !== '');
   return collapsed.join('\n').trimEnd();
 }
 
-/**
- * Render the MCP half of a config.toml over an existing base.
- *
- * Split out from the write so the rendering is testable without a filesystem,
- * and so the write itself is one call to the shared durable primitive.
- */
 export function renderCodexMcpConfigToml(existing: string, servers: Record<string, CodexMcpServer>): string {
   const base = stripExistingMcpServers(existing);
   const lines: string[] = base ? [base, '', MCP_MARKER, ''] : [];
@@ -798,7 +605,6 @@ export function renderCodexMcpConfigToml(existing: string, servers: Record<strin
   return lines.join('\n');
 }
 
-/** One `[mcp_servers.<name>]` table, with its env sub-table when it has one. */
 export function renderCodexMcpServer(name: string, config: CodexMcpServer): string[] {
   const tomlName = tomlKey(name);
   const lines = [`[mcp_servers.${tomlName}]`];
@@ -811,9 +617,7 @@ export function renderCodexMcpServer(name: string, config: CodexMcpServer): stri
   }
   lines.push('type = "stdio"');
   lines.push(`command = ${tomlBasicString(config.command)}`);
-  // Codex launches the stdio server here natively. Must stay ABOVE the
-  // `[mcp_servers.*.env]` sub-table header or TOML re-parents it into the
-  // env table. (upstream 5e15069da)
+  // Must stay above the `[mcp_servers.*.env]` sub-table header or TOML re-parents it into the env table.
   if (config.cwd) {
     lines.push(`cwd = ${tomlBasicString(config.cwd)}`);
   }
@@ -830,49 +634,18 @@ export function renderCodexMcpServer(name: string, config: CodexMcpServer): stri
   return lines;
 }
 
-/**
- * Resolve the container's Codex config directory.
- *
- * Honors CODEX_HOME so a rotated home (OAuth fallback) gets its own regenerated
- * config — otherwise the rotated app-server reads stale config from the wrong
- * dir. CODEX_HOME == $HOME/.codex on initial spawn, so this is a no-op there.
- */
+/** Honors CODEX_HOME so a rotated OAuth-fallback home gets its own regenerated config. */
 export function resolveCodexConfigDir(): string {
   return process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
 }
 
-/**
- * Rewrite the MCP tables in the container's `config.toml`.
- *
- * THROWS when the existing file cannot be read or the new one cannot be
- * committed, and that is the fix this function exists for. It used to read
- * under `catch { base = '' }`: a config.toml that is unreadable but writable
- * (mode `0200`) was read as empty and the file then TRUNCATED to MCP tables
- * only — dropping the `[hooks.state.*]` trust rows and the `[plugins.*]` /
- * `[marketplaces.*]` tables. This runs immediately BEFORE `writeCodexHooksAndTrust`
- * on every spawn (`./codex.ts`), so it got there first: the trust writer's own
- * read guard aborted that query, but the damage was already on disk, and the
- * next query happily wrote valid trust rows over a base that had lost
- * everything else. See `./codex-config-file.ts`.
- */
+/** Throws on an unreadable base rather than truncating the file to MCP tables only (see ./codex-config-file.ts). */
 export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>): void {
   const configTomlPath = path.join(resolveCodexConfigDir(), 'config.toml');
   writeCodexConfigToml(configTomlPath, (existing) => renderCodexMcpConfigToml(existing, servers));
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
-// ── hooks.json (NanoClaw guardrails + source capture) ──────────────────────
-// Codex app-server reads ~/.codex/hooks.json at session start and fires
-// shell-command hooks on PreToolUse / PostToolUse / etc. We point each
-// event at `bun /app/src/codex-hooks/cli.ts <event>` which dispatches to
-// the same hook decisions the Claude provider uses as SDK callbacks
-// (see ../codex-hooks/runner.ts).
-
-/**
- * Build the hooks.json content (in-memory). Split out from the filesystem
- * write so tests can assert on the structure without depending on `fs`
- * mocks set by sibling test files.
- */
 export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
   hooks: {
     PreToolUse: { hooks: { type: 'command'; command: string; timeout: number }[] }[];
@@ -910,32 +683,12 @@ export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
 }
 
 /**
- * Generate `~/.codex/hooks.json` for the current container. Mirrors the
- * Claude SDK hooks block in `claude.ts` for PreToolUse / PostToolUse
- * coverage. Email-gate is on the PreToolUse chain — its 60-minute admin
- * approval wait requires a long timeout (`emailGateTimeoutSec`), so this
- * event gets the longest timeout in the file.
- *
- * Writing the file is only half the wiring: Codex will not RUN an untrusted
- * hook, so the resolved home ALSO needs matching `[hooks.state.*]` entries in
- * its config.toml. Returning the directory is what lets the caller
- * (`writeCodexHooksAndTrust` in ../codex-companion-setup.ts) key those entries
- * on the home this call actually wrote to, including after an OAuth-fallback
- * rotation.
+ * The PreToolUse email gate waits up to 60 minutes for approval, hence its long timeout. The caller keys the
+ * `[hooks.state.*]` trust entries on the returned directory, since Codex will not run an untrusted hook.
  */
 export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codexHome?: string }): string {
-  // Honor CODEX_HOME (see resolveCodexConfigDir): hooks.json is the destructive-
-  // guard wiring, so a rotated fallback home MUST get the regenerated hooks or the
-  // guard silently stops firing after an OAuth rotation. An explicit codexHome
-  // lets peer-mode `codex exec` receive the same in-tree hook before CODEX_HOME
-  // is switched to its synthesized runtime directory.
-  //
-  // Through the SAME resolver as the config writer, deliberately. This used to
-  // read `process.env.CODEX_HOME ?? …` while the config writer read
-  // `process.env.CODEX_HOME || …`, so `CODEX_HOME=""` sent config.toml to
-  // `$HOME/.codex` and hooks.json to the relative path `hooks.json` — trust
-  // entries keyed on a file the app-server would never load, which is this
-  // module's silent-inert failure reached through a typo in one env var.
+  // Same resolver as the config writer: a rotated home must get the hooks too, or the guard silently stops firing.
+  // An explicit codexHome lets peer-mode `codex exec` get the hook before CODEX_HOME is switched.
   const codexConfigDir = opts?.codexHome ?? resolveCodexConfigDir();
   fs.mkdirSync(codexConfigDir, { recursive: true });
   const hooksJsonPath = path.join(codexConfigDir, 'hooks.json');
@@ -945,16 +698,7 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codex
   return codexConfigDir;
 }
 
-/**
- * Build the `-c key=value` overrides passed to `codex app-server`. The
- * `stickyConfig` argument is the validated per-agent provider config slice
- * (see `codexConfigSchema` in `./codex.ts`). When set, `reasoning_effort`
- * propagates as `model_reasoning_effort=<value>` — Codex's native config key.
- *
- * The `model` field is NOT applied here because thread/start carries it as a
- * first-class JSON-RPC parameter; emitting it via `-c model=...` would
- * shadow but not improve precedence.
- */
+/** `model` is not emitted here: thread/start carries it as a first-class parameter. */
 export function createCodexConfigOverrides(
   stickyConfig?: {
     reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -963,33 +707,23 @@ export function createCodexConfigOverrides(
   fast = false,
 ): string[] {
   // CLI overrides survive per-spawn config rewrites and fallback-home rotation.
-  // Steering is built into turn/steer; its former feature toggle was removed.
   const overrides = [
     'features.use_linux_sandbox_bwrap=false',
     'features.goals=true',
-    // Raises Codex's silent-truncation ceiling for the group AGENTS.md — the
-    // 32KB default (`project_doc_max_bytes`) truncated whole behavioral
-    // sections in production (4,131 logged incidents). 262144 = 256KB, ~8x
-    // the largest current doc. Keep src/codex-project-doc-cap.ts's warn
-    // threshold numerically in sync with this value.
+    // 256KB: the 32KB default silently truncated the group AGENTS.md. Keep src/codex-project-doc-cap.ts's warn
+    // threshold in sync with this value.
     'project_doc_max_bytes=262144',
-    // Preserve the container context limits if a rotated OAuth fallback home
-    // has not retained its generated config.toml.
+    // Also set here in case a rotated OAuth fallback home lost its generated config.toml.
     'model_context_window=400000',
     'model_auto_compact_token_limit=360000',
     'features.fast_mode=false',
-    // Bound native collaboration at the app-server boundary. Each Codex
-    // subagent owns a full MCP subprocess tree, so an inherited host setting
-    // that permits an unbounded/high worker count can exhaust the container's
-    // PID cgroup and surface as a misleading protocol-desync error.
+    // Each subagent owns a full MCP subprocess tree: an unbounded worker count exhausts the PID cgroup and
+    // surfaces as a misleading protocol-desync error.
     'features.multi_agent=true',
     `agents.max_concurrent_threads_per_session=${
       stickyConfig?.max_concurrent_threads_per_session ?? DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION
     }`,
-    // The canonical Markdown memory tree is the sole retrieval layer. Codex's
-    // opaque summary store is disabled; canonical memory bytes enter through
-    // paired untrusted recall. The provider lifecycle carries trusted static
-    // guidance only.
+    // The Markdown memory tree is the sole retrieval layer, so Codex's own memory store stays off.
     'memories.generate_memories=false',
     'memories.use_memories=false',
   ];
@@ -999,20 +733,11 @@ export function createCodexConfigOverrides(
   if (fast) {
     overrides.push('service_tier="fast"');
   }
-  // Force reasoning-summary notifications on. Without this, gpt-5.x runs in
-  // xhigh effort still produce zero `item/reasoning/summaryTextDelta` events
-  // — verified empirically via per-method debug logging. "detailed" gives
-  // the richest stream; "auto" was insufficient even with high effort.
-  // Container chat-UX surfaces these as 💭 thinking labels (see codex.ts
-  // runOneTurn's item/reasoning/* cases).
+  // Without "detailed", gpt-5.x emits no reasoning-summary deltas even at xhigh effort ("auto" was insufficient).
   overrides.push('model_reasoning_summary="detailed"');
   return overrides;
 }
 
-// The native cap counts spawned agents, excluding the primary thread. Four is
-// the install default (was 15; lowered for quota — docs/specs/quota-burn/plan.md
-// §0.4); operators can override it per group through providerConfig when a
-// workload warrants it. This constant is what actually binds: it is passed as a
-// `-c agents.max_concurrent_threads_per_session=` override at app-server spawn
-// (createCodexConfigOverrides above), which beats the generated config.toml.
+// Counts spawned agents, excluding the primary thread. Passed as a `-c` override, which beats the generated
+// config.toml.
 export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 5;

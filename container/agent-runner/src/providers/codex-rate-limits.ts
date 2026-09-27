@@ -1,41 +1,16 @@
-/**
- * Codex (ChatGPT / OpenAI) account rate-limit snapshot handling.
- *
- * Pure functions over the app-server's `account/rateLimits/read` response
- * and `account/rateLimits/updated` notification — no I/O, so every branch is
- * unit-testable against fixtures without a network or a `codex` binary.
- * The RPC itself lives in codex-app-server.ts (`readCodexAccountRateLimits`);
- * the lifecycle (when to read, when to park) is in codex.ts.
- *
- * Shapes are from `codex app-server generate-json-schema` (codex-cli 0.154.0,
- * `codex_app_server_protocol.v2.schemas.json` definitions
- * `GetAccountRateLimitsResponse`, `RateLimitSnapshot`, `RateLimitWindow`,
- * `RateLimitReachedType`, `AccountRateLimitsUpdatedNotification`). Typed
- * structurally and read defensively: only the fields used below are declared,
- * and every optional field tolerates `null` because the schema marks them
- * nullable.
- *
- * Why this exists: Codex turns had zero rate-limit visibility — 561 turns in a
- * week with every `turn_usage.rate_limit_*` NULL, the only signal a post-hoc
- * `systemError` once the wall was already hit. The protocol exposes the data;
- * this asks.
- */
+/** Shapes follow codex-cli 0.154.0's app-server schema, where every optional field may be `null`. */
 import type { AccountIdentity, RateLimitSample, RateLimitSampleSource } from '../modules/mailbox/index.js';
 
 interface CodexRateLimitWindow {
   /** Integer 0-100 (required by the schema). */
   usedPercent: number;
-  /** Epoch seconds (int64). Nullable. */
+  /** Epoch seconds. */
   resetsAt?: number | null;
   /** Nullable; 300 = five-hour window, 10080 = seven-day window. */
   windowDurationMins?: number | null;
 }
 
-/**
- * `RateLimitReachedType` enum. Kept as a string union so an unknown value a
- * newer app-server adds still parks (any non-null value is "reached") and is
- * recorded verbatim rather than dropped.
- */
+/** Any non-null value, including one a newer app-server adds, counts as reached. */
 type CodexRateLimitReachedType =
   | 'rate_limit_reached'
   | 'workspace_owner_credits_depleted'
@@ -64,16 +39,10 @@ export interface CodexRateLimitsReadResponse {
 export const CODEX_RATE_LIMITS_READ_METHOD = 'account/rateLimits/read';
 export const CODEX_RATE_LIMITS_UPDATED_METHOD = 'account/rateLimits/updated';
 
-/** `windowDurationMins` values that name a window the fleet already tracks for Claude. */
 const FIVE_HOUR_MINS = 300;
 const SEVEN_DAY_MINS = 7 * 24 * 60;
 
-/**
- * Weekly utilization at or above which the group's Codex is parked on its
- * fallback BEFORE the wall, so the last turns of the week land somewhere that
- * can answer them. Spec: docs/specs/quota-burn/plan.md item 0.7.
- */
-// Park at 95% used, not 100%: leaves headroom for the in-flight turn to finish before the wall. A wall mid-turn aborts and replays the whole turn, which costs more than the last 5% of a weekly bucket. Tune from measurement.
+// Park at 95%, not 100%: a wall mid-turn aborts and replays the whole turn, costing more than the last 5%.
 export const CODEX_PARK_USED_PERCENT = 95;
 
 export interface ClassifiedCodexWindow {
@@ -82,12 +51,7 @@ export interface ClassifiedCodexWindow {
   usedPercent: number;
   /** ISO-8601 UTC, or null when the window states no reset. */
   resetsAt: string | null;
-  /**
-   * True when `windowDurationMins` was null and the type was inferred from
-   * position (primary → five_hour, secondary → seven_day). Logged by the
-   * caller; a reader of the table cannot otherwise tell a measured window
-   * from an assumed one.
-   */
+  /** True when `windowDurationMins` was null and the type was inferred from position. */
   assumed: boolean;
 }
 
@@ -100,7 +64,7 @@ function isWindow(value: unknown): value is CodexRateLimitWindow {
   );
 }
 
-/** Epoch seconds → ISO. Tolerates epoch milliseconds the way claude.ts's resetsAtIso does. */
+/** Epoch seconds → ISO; epoch milliseconds are tolerated too. */
 export function codexResetsAtIso(resetsAt: number | null | undefined): string | null {
   if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt) || resetsAt <= 0) return null;
   const ms = resetsAt < 1e12 ? resetsAt * 1000 : resetsAt;
@@ -125,11 +89,7 @@ function classifyOne(
   return { limitType, usedPercent: window.usedPercent, resetsAt: codexResetsAtIso(window.resetsAt), assumed };
 }
 
-/**
- * Name the snapshot's windows. `primary`/`secondary` are the 5-hour/7-day
- * pair in different clothes; classification is by `windowDurationMins` and
- * falls back to position only when the server omits the duration.
- */
+/** Classified by `windowDurationMins`; position is the fallback only when the server omits it. */
 export function classifyCodexRateLimitWindows(
   snapshot: CodexRateLimitSnapshot | null | undefined,
 ): ClassifiedCodexWindow[] {
@@ -143,13 +103,8 @@ export function classifyCodexRateLimitWindows(
 }
 
 /**
- * Which top-level keys an update would actually overwrite in
- * `mergeCodexRateLimitSnapshot`: present, non-null, and — for `primary`/
- * `secondary` — a valid window (usedPercent is required, so a malformed
- * window is not a reading). Exported so the tracker can stamp per-field
- * freshness (a read in flight must know, per field, whether a push that
- * landed mid-read actually touched that field) without duplicating this
- * eligibility rule.
+ * Keys `mergeCodexRateLimitSnapshot` would overwrite: present, non-null, and for `primary`/`secondary` a valid
+ * window (a malformed window is not a reading).
  */
 export function codexRateLimitSnapshotUpdatedKeys(
   update: CodexRateLimitSnapshot | null | undefined,
@@ -166,16 +121,8 @@ export function codexRateLimitSnapshotUpdatedKeys(
 }
 
 /**
- * Sparse merge per the notification's own contract: "merge available values
- * into the most recent read response … nullable account metadata may be
- * unavailable in a rolling update and does not clear a previously observed
- * value". A window present in the update replaces the prior window wholesale
- * (usedPercent is required, so a present window is a complete reading);
- * every null/absent field keeps what the last read said.
- *
- * `rateLimitReachedType` follows the same rule: null in an update means
- * "not stated", NOT "cleared". A reached limit therefore stays parked until
- * a full re-read replaces the snapshot — the next session start does that.
+ * Null in an update means "not stated", not "cleared" (the notification's contract), so a reached limit stays
+ * parked until a full re-read replaces the snapshot.
  */
 export function mergeCodexRateLimitSnapshot(
   prev: CodexRateLimitSnapshot | null,
@@ -189,15 +136,7 @@ export function mergeCodexRateLimitSnapshot(
   return merged;
 }
 
-/**
- * Translate a snapshot into `rate_limit_samples` rows, one per window, in the
- * same shape as the Claude provider's per-window rows (`unifiedWindowsToSamples`,
- * providers/claude.ts) so one query reads both providers:
- * `utilization` is the 0-1 fraction, `limit_type` is `five_hour`/`seven_day`.
- * A snapshot with no window still records that the pull happened
- * (`status: 'no_window'`) — never sampling is a different state from
- * sampling nothing.
- */
+/** A snapshot with no window still yields one `no_window` row: never sampling differs from sampling nothing. */
 export function codexSnapshotToSamples(
   snapshot: CodexRateLimitSnapshot | null | undefined,
   who: AccountIdentity,
@@ -210,9 +149,6 @@ export function codexSnapshotToSamples(
     available: true,
   };
   const windows = classifyCodexRateLimitWindows(snapshot);
-  // `status` explains the row (schema.ts): the reached-limit enum is the one
-  // fact a percentage cannot carry, so it rides here on every window row —
-  // and on the no-window row, where a sparse push may carry nothing else.
   const status = snapshot?.rateLimitReachedType ?? null;
   if (windows.length === 0) {
     return [{ ...base, limitType: null, utilization: null, resetsAt: null, status: status ?? 'no_window' }];
@@ -227,30 +163,18 @@ export function codexSnapshotToSamples(
 }
 
 export interface CodexRateLimitPark {
-  /** Which rule fired. */
   reason: 'seven_day_threshold' | 'rate_limit_reached';
-  /** The `RateLimitReachedType` value when `reason === 'rate_limit_reached'`. */
   reachedType: string | null;
-  /** Window the decision rests on, when one does. */
   limitType: string | null;
   usedPercent: number | null;
   /** ISO reset the host should park until; null → the host's backoff schedule. */
   resetsAt: string | null;
-  /** One line for `provider_health.last_error_message` and the chat log. */
   message: string;
 }
 
 /**
- * Park rule (plan item 0.7): park when the weekly window is at or past
- * CODEX_PARK_USED_PERCENT, or when the server says a limit is reached
- * (any `rateLimitReachedType`). The enum distinguishes a plain rate limit
- * from workspace credit/usage exhaustion; the message names which so the
- * `provider_health` row does too.
- *
- * `resetsAt` selection: the seven-day window's reset for the threshold rule.
- * For a reached limit, the earliest reset among windows already at 100%,
- * else the earliest reset stated at all — a depleted-credits state states no
- * reset, and null hands the host its bounded backoff, the safe direction.
+ * For a reached limit, `resetsAt` is the earliest reset among exhausted windows, else the earliest stated;
+ * null (depleted credits state none) hands the host its bounded backoff.
  */
 export function decideCodexRateLimitPark(
   snapshot: CodexRateLimitSnapshot | null | undefined,
@@ -295,12 +219,7 @@ export function decideCodexRateLimitPark(
   return null;
 }
 
-/**
- * The single window stamped onto `turn_usage.rate_limit_*` for a Codex turn.
- * One row holds one window; the weekly one is the binding constraint the
- * quota-burn plan tracks, so it wins when present. Falls back to the
- * five-hour window, then whatever the snapshot has.
- */
+/** The weekly window wins when present: it is the binding constraint. */
 export function codexTurnRateLimit(
   snapshot: CodexRateLimitSnapshot | null | undefined,
 ): { type: string | null; utilization: number | null; resetsAt: string | null } | null {
@@ -311,7 +230,6 @@ export function codexTurnRateLimit(
   return { type: pick.limitType, utilization: pick.usedPercent / 100, resetsAt: pick.resetsAt };
 }
 
-/** Parse a `GetAccountRateLimitsResponse`; null when the shape is not one. */
 export function parseCodexRateLimitsReadResponse(result: unknown): CodexRateLimitsReadResponse | null {
   if (!result || typeof result !== 'object') return null;
   const r = result as Record<string, unknown>;
@@ -324,21 +242,13 @@ export function parseCodexRateLimitsReadResponse(result: unknown): CodexRateLimi
   };
 }
 
-/** Parse an `account/rateLimits/updated` notification's params; null when not one. */
 export function parseCodexRateLimitsUpdated(params: unknown): CodexRateLimitSnapshot | null {
   if (!params || typeof params !== 'object') return null;
   const rl = (params as { rateLimits?: unknown }).rateLimits;
   return rl && typeof rl === 'object' ? (rl as CodexRateLimitSnapshot) : null;
 }
 
-/**
- * Codex account identity for the `account` column, read from the active
- * CODEX_HOME's `auth.json` (`tokens.account_id` — the ChatGPT account id,
- * the same namespace `GetAccountRateLimitsResponse.accountId` reports).
- * Null for an API-key login (`auth_mode: 'apikey'` has no `tokens`) or an
- * unreadable file — the sample is still written, unattributed, the way an
- * API-key Claude session's is.
- */
+/** Null for an API-key login, whose auth.json has no `tokens`; the sample is then written unattributed. */
 export function readCodexAccountIdFromAuthJson(raw: string | null | undefined): string | null {
   if (!raw) return null;
   try {
