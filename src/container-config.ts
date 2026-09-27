@@ -1582,13 +1582,16 @@ export function containerConfigLockPath(folder: string): string {
 export async function updateContainerConfig(
   folder: string,
   mutate: (config: ContainerConfig) => void,
+  project?: (config: ContainerConfig) => Promise<void>,
 ): Promise<ContainerConfig> {
   return withFileLock(
     containerConfigLockPath(folder),
-    () => {
+    async () => {
       const config = readContainerConfig(folder);
       mutate(config);
       writeContainerConfig(folder, config);
+      // Inside the lock: a projection written after release can land behind a later writer's and go stale.
+      await project?.(config);
       return config;
     },
     { label: `container.json for ${folder}` },
@@ -1607,8 +1610,13 @@ export async function writeContainerConfigScalars(
   updates: Parameters<typeof updateContainerConfigScalars>[1],
 ): Promise<void> {
   const { provider, model, effort, image_tag, assistant_name, timezone } = updates;
-  if ([provider, model, effort, image_tag, assistant_name, timezone].some((v) => v !== undefined)) {
-    await updateContainerConfig(folder, (config) => {
+  if (![provider, model, effort, image_tag, assistant_name, timezone].some((v) => v !== undefined)) {
+    await updateContainerConfigScalars(agentGroupId, updates);
+    return;
+  }
+  await updateContainerConfig(
+    folder,
+    (config) => {
       if (provider !== undefined) config.provider = provider ?? undefined;
       if (image_tag !== undefined) config.imageTag = image_tag || undefined;
       if (model !== undefined) config.model = model || undefined;
@@ -1616,9 +1624,9 @@ export async function writeContainerConfigScalars(
       if (assistant_name !== undefined) config.assistantName = assistant_name || undefined;
       // null must ERASE the field so the spawn falls back to the install timezone.
       if (timezone !== undefined) config.timezone = timezone ?? undefined;
-    });
-  }
-  await updateContainerConfigScalars(agentGroupId, updates);
+    },
+    () => updateContainerConfigScalars(agentGroupId, updates),
+  );
 }
 
 /** Edit the package lists in both stores, file first; the projection copies the file's result for the image build. */
@@ -1627,12 +1635,17 @@ export async function writeContainerConfigPackages(
   folder: string,
   edit: (packages: ContainerConfig['packages']) => void,
 ): Promise<ContainerConfig['packages']> {
-  const { packages } = await updateContainerConfig(folder, (config) => {
-    if (!config.packages) config.packages = { apt: [], npm: [] };
-    edit(config.packages);
-  });
-  await updateContainerConfigJson(agentGroupId, 'packages_apt', packages.apt);
-  await updateContainerConfigJson(agentGroupId, 'packages_npm', packages.npm);
+  const { packages } = await updateContainerConfig(
+    folder,
+    (config) => {
+      if (!config.packages) config.packages = { apt: [], npm: [] };
+      edit(config.packages);
+    },
+    async ({ packages: projected }) => {
+      await updateContainerConfigJson(agentGroupId, 'packages_apt', projected.apt);
+      await updateContainerConfigJson(agentGroupId, 'packages_npm', projected.npm);
+    },
+  );
   return packages;
 }
 
