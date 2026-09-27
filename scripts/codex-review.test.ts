@@ -2458,7 +2458,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.posted).toBeNull();
   });
 
-  it('stops at the round cap and escalates instead of posting', () => {
+  it('stops at the round cap and points at the checkpoint instead of posting', () => {
     const root = tempRoot();
     const heads = ['1', '2', '3'].map((c) => c.repeat(40));
     scopeFixture(root, { labels: ['risk:high'], comments: heads.map((h, i) => marker(h, i + 1)) });
@@ -2466,7 +2466,9 @@ describe('codex-review risk-scoped review requests', () => {
     const capped = runHelper(root, ['request']);
     expect(capped.status).toBe(23);
     expect(capped.stderr).toContain('CAP: 3 of 3 review rounds already requested');
-    expect(capped.stderr).toContain('escalate');
+    expect(capped.stderr).toContain('Checkpoint, not a stop');
+    expect(capped.stderr).toContain('substitute review');
+    expect(capped.stderr).not.toMatch(/escalate to the\s+operator, or restart/);
     expect(capped.posted).toBeNull();
     expect(capped.calls).not.toMatch(/^node /m);
 

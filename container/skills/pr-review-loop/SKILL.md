@@ -38,8 +38,8 @@ the change, not a budget.
   not an escalation; it is a queue of things to record so the PR can move.
   If the trend IS in the blocking class — same subsystem, same invariant,
   severity flat or rising — stop and diagnose out loud before touching code.
-  Post your read to the PR thread and mention the PR owner and whoever owns
-  release calls in this deployment, then act on that diagnosis. What you must
+  Post your read to the PR thread, then act on it yourself: converge through a
+  fresh-context substitute review, or rebuild (*Round 3 is a checkpoint*, below). What you must
   not do is push another patch because a patch is what you pushed last time —
   "address the Nth review" as a commit message is the anti-pattern this skill
   exists to stop, and it is how #299 reached round 18.
