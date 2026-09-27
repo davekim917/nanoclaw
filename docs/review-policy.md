@@ -44,7 +44,7 @@ newest release; `codex exec` and `opencode run` use their configured model
 unless given `-m`. Effort is a runtime setting — a native spawn's own field, or
 a scoped CLI invocation — never prompt wording. `opencode run` has no effort
 flag at all (effort is per-model `options` in the opencode config,
-`container/agent-runner/src/providers/opencode.ts:779-784`), so on that pool
+`container/agent-runner/src/providers/opencode.ts:535-536`), so on that pool
 the model id is the whole tier.
 
 Eligibility is enforced as a **denylist of small tiers**:
