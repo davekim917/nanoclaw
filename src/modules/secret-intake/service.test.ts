@@ -303,6 +303,22 @@ describe('the form', () => {
     expect(h.createCalls).toHaveLength(1);
   });
 
+  it('grants nothing new on a rotation unless asked', async () => {
+    h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
+    const view = await startSecretIntake({
+      name: 'Linear-API-Key',
+      rotate: true,
+      groups: [],
+      workgroups: [],
+      caller: agentCaller,
+    });
+    expect(view.groups).toEqual([]);
+    expect(JSON.parse(h.deliveries[0].args[4] as string).body).toContain('nobody yet');
+    await hooks.submit(view.intakeId, 'UOWNER', SECRET);
+    await settle();
+    expect(h.groupGrants).toEqual([]);
+  });
+
   it('rotates by value only', async () => {
     h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
     const { intakeId } = await startSecretIntake({

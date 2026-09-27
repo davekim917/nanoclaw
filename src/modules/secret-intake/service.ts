@@ -161,11 +161,12 @@ async function grantTargets(
   rawGroups: string[],
   rawWorkgroups: string[],
   caller: SecretIntakeCaller,
+  defaultToOwnGroup: boolean,
 ): Promise<{ groups: string[]; workgroups: string[] }> {
   let groups = splitList(rawGroups);
   const workgroups = splitList(rawWorkgroups);
   if (caller.kind === 'agent') {
-    if (groups.length === 0 && workgroups.length === 0) groups = [caller.agentGroupId];
+    if (defaultToOwnGroup && groups.length === 0 && workgroups.length === 0) groups = [caller.agentGroupId];
     const foreignGroup = groups.find((g) => g !== caller.agentGroupId);
     if (foreignGroup) throw new Error(`An agent can grant a secret only to its own group, not ${foreignGroup}.`);
     const ownWorkgroup = (await getAgentGroup(caller.agentGroupId))?.workgroup_id;
@@ -197,7 +198,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
 
   const caller = input.caller;
   const callerGroup = caller.kind === 'agent' ? await getAgentGroup(caller.agentGroupId) : undefined;
-  const { groups, workgroups } = await grantTargets(input.groups, input.workgroups, caller);
+  const { groups, workgroups } = await grantTargets(input.groups, input.workgroups, caller, !input.rotate);
 
   const existing = await findOnecliSecretByName(name);
   if (existing && !input.rotate) {
@@ -438,7 +439,7 @@ export async function grantSecret(input: {
   if (splitList(input.groups).length === 0 && splitList(input.workgroups).length === 0) {
     throw new Error('Name at least one --groups or --workgroups.');
   }
-  const { groups, workgroups } = await grantTargets(input.groups, input.workgroups, input.caller);
+  const { groups, workgroups } = await grantTargets(input.groups, input.workgroups, input.caller, false);
   if (!(await findOnecliSecretByName(input.name))) {
     throw new Error(`"${input.name}" is not in the vault. Store it first with ncl secrets intake.`);
   }

@@ -65,7 +65,7 @@ registerResource({
         "Ask the owner for a secret. Posts a card to an owner's DM; its button opens a form, and the value typed there goes straight to the vault — you never see it. Returns at once; the requesting agent is told when it is stored (host callers: `ncl secrets intake-status`).\n\n" +
         'New secret: --host-pattern is required and decides where the gateway sends the value, so name the API host exactly. ' +
         'Rotation (--rotate): replaces only the value; the secret keeps its host, header and grants, and takes effect on the next request.\n\n' +
-        'From an agent with no --groups/--workgroups, the secret is granted to the calling group. A new grant takes effect at the next container start.',
+        'From an agent with no --groups/--workgroups, a new secret is granted to the calling group; a rotation grants nothing new. A new grant takes effect at the next container start.',
       args: [
         { name: 'name', type: 'string', description: 'Vault name, e.g. Linear-API-Key.', required: true },
         { name: 'rotate', type: 'boolean', description: 'Replace the value of an existing secret.' },
