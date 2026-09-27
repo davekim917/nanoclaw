@@ -683,43 +683,49 @@ describe('identifiers derived from the install', () => {
     execFileSync('git', ['remote', 'add', 'origin', url], { cwd: repo });
   }
 
-  it('parses network remotes into host, every namespace, repository and an exact identity key', () => {
-    const net = (host: string, namespaces: string[], repo: string, key: string) => ({
+  it('parses the two accepted network shapes into host, owner, repository and identity key', () => {
+    const net = (host: string, owner: string, repo: string, key: string) => ({
       kind: 'network',
       host,
-      namespaces,
+      owner,
       repo,
       key,
     });
     expect(parseRemote('https://github.com/acme-co/WIDGET.git')).toEqual(
-      net('github.com', ['acme-co'], 'WIDGET', 'github.com/acme-co/widget'),
+      net('github.com', 'acme-co', 'WIDGET', 'github.com/acme-co/widget'),
     );
-    expect(parseRemote('https://x-access-token:secret@Example.com/acme-co/widget/')).toEqual(
-      net('example.com', ['acme-co'], 'widget', 'example.com/acme-co/widget'),
+    expect(parseRemote('https://github.com/acme-co/WIDGET')).toEqual(
+      net('github.com', 'acme-co', 'WIDGET', 'github.com/acme-co/widget'),
     );
     expect(parseRemote('git@github.com:acme-co/widget.git')).toEqual(
-      net('github.com', ['acme-co'], 'widget', 'github.com/acme-co/widget'),
+      net('github.com', 'acme-co', 'widget', 'github.com/acme-co/widget'),
     );
-    expect(parseRemote('http://git.example.com/acme-co/widget')).toEqual(
-      net('git.example.com', ['acme-co'], 'widget', 'git.example.com/acme-co/widget'),
+    expect(parseRemote('git@Example.COM:Acme-Co/Widget_v2')).toEqual(
+      net('example.com', 'Acme-Co', 'Widget_v2', 'example.com/Acme-Co/Widget_v2'),
     );
-    expect(parseRemote('ssh://git@ssh.github.com:443/acme-co/widget.git')).toEqual(
-      net('ssh.github.com:443', ['acme-co'], 'widget', 'ssh.github.com:443/acme-co/widget'),
-    );
-    expect(parseRemote('https://git.example.com:8443/Acme-Co/Team/Widget.git')).toEqual(
-      net('git.example.com:8443', ['Acme-Co', 'Team'], 'Widget', 'git.example.com:8443/Acme-Co/Team/Widget'),
-    );
-    expect(parseRemote('https://github.com/acme%2Dco/WID%47ET.git')).toEqual(
-      net('github.com', ['acme-co'], 'WIDGET', 'github.com/acme-co/widget'),
-    );
-    expect(parseRemote('https://github.com/solo')).toEqual(net('github.com', [], 'solo', 'github.com/solo'));
   });
 
-  it('reads an absolute path or file:// as local and refuses every form outside the accepted ones', () => {
+  it('reads an absolute path or file:// as local and refuses every other form', () => {
     for (const local of ['/srv/mirrors/widget.git', 'file:///srv/acme-co/widget.git']) {
       expect(parseRemote(local)).toEqual({ kind: 'local' });
     }
     for (const unsupported of [
+      'https://example.com/acme-co/SecretWidget.git/.',
+      'https://example.com/acme-co/../open-org/project.git',
+      'https://example.com/./widget.git',
+      'https://github.com/acme-co/.hidden',
+      'http://example.com#@other.example/acme-co/widget.git',
+      'https://github.com/acme%2Dco/widget.git',
+      'https://token@example.com/acme-co/widget.git',
+      'https://github.com:443/acme-co/widget.git',
+      'https://gitlab.example.com/acme-co/team/widget.git',
+      'ssh://git@github.com/acme-co/widget.git',
+      'http://github.com/acme-co/widget.git',
+      'https://github.com/acme-co/widget/',
+      'https://github.com/acme-co/widget.git?ref=main',
+      'https://github.com/solo',
+      'https://localhost/acme-co/widget',
+      'deploy@example.com:acme-co/widget.git',
       '1helper::x',
       'helper::x',
       '2scheme://x',
@@ -727,15 +733,12 @@ describe('identifiers derived from the install', () => {
       'github.com:acme-co/widget.git',
       'git://example.com/acme-co/widget.git',
       'git+ssh://git@example.com/acme-co/widget.git',
-      'ftp://example.com/acme-co/widget.git',
       'git@example.com:/srv/acme-co/widget.git',
       'git@example.com::acme-co/widget.git',
       'git@example.com:acme-co/wid::get.git',
-      'https://github.com/acme-co/widget.git?ref=main',
       './mirrors:acme-co/widget.git',
       'mirrors/widget.git',
       'https://github.com/acme%zzco/widget.git',
-      'https://github.com/acme-co/wid%FFget.git',
       'hg::https://example.com/acme-co/widget',
       'sso://example.com/acme-co/widget',
       'https://github.com/',
@@ -895,19 +898,17 @@ describe('identifiers derived from the install', () => {
     expect(problems).toEqual([]);
   });
 
-  it('derives every namespace of a nested origin and exempts only the exact public identity', () => {
+  it('exempts a repository only by its exact identity, case-folded only on github.com', () => {
     const dataDir = path.join(tempRoot(), 'data');
     const dbPath = writeRegistry(dataDir);
-    addCanonical(dataDir, 'wg-fictional', 'nested', 'https://git.example.com:8443/acme-co/team-x/Widget.git');
-    addCanonical(dataDir, 'wg-fictional', 'encoded', 'https://github.com/zeta%2Dcorp/GAD%47ET.git');
+    addCanonical(dataDir, 'wg-fictional', 'hosted', 'https://git.example.com/Acme-Co/Widget.git');
+    addCanonical(dataDir, 'wg-fictional', 'public', 'https://github.com/Open-Org/Project.git');
     const exempt = {
-      owners: new Set<string>(),
-      repositories: new Set(['git.example.com/acme-co/team-x/widget', 'git.example.com:8443/acme-co/team-x/widget']),
+      owners: new Set(['open-org']),
+      repositories: new Set(['git.example.com/acme-co/widget', 'github.com/open-org/project']),
     };
     const problems: string[] = [];
-    expect(loadInstallIdentifiers(dbPath, exempt, problems)).toEqual(
-      new Set(['acme-co', 'team-x', 'Widget', 'zeta-corp', 'GADGET']),
-    );
+    expect(loadInstallIdentifiers(dbPath, exempt, problems)).toEqual(new Set(['Acme-Co', 'Widget']));
     expect(problems).toEqual([]);
   });
 
@@ -915,6 +916,9 @@ describe('identifiers derived from the install', () => {
     const dataDir = path.join(tempRoot(), 'data');
     const dbPath = writeRegistry(dataDir);
     const refused = [
+      'https://example.com/acme-co/SecretWidget.git/.',
+      'http://example.com#@other.example/acme-co/widget.git',
+      'https://gitlab.example.com/acme-co/team/widget.git',
       'hg::https://example.com/acme-co/widget',
       'https://github.com/acme%zzco/widget.git',
       '1helper::x',

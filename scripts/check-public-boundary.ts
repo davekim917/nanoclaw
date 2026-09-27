@@ -366,56 +366,39 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
 }
 
 export type ParsedRemote =
-  | { kind: 'network'; host: string; namespaces: string[]; repo: string; key: string }
+  | { kind: 'network'; host: string; owner: string; repo: string; key: string }
   | { kind: 'local' }
   | { kind: 'unsupported' };
 
-// The only network forms discovery reads; anything else is unsupported.
-// https/http/ssh URL: optional userinfo, host[:port], a path, no query or fragment.
-const URL_REMOTE = /^(?:https?|ssh):\/\/(?:[^@/\s]+@)?([A-Za-z0-9.-]+)(?::(\d+))?(\/[^\s?#]*)$/;
-// scp-like user@host:path, the path neither absolute nor starting a helper `::`.
-const SCP_REMOTE = /^[^@/:\s]+@([A-Za-z0-9.-]+):([^/:\s]\S*)$/;
-
-function pathSegments(remotePath: string): string[] {
-  const segments = remotePath.split('/').filter(Boolean);
-  const last = segments.pop()?.replace(/\.git$/, '');
-  return last ? [...segments, last] : segments;
-}
+// The only network shapes the repository store uses. A name never starts with
+// a dot, so `.` and `..` segments cannot hide the repository git reaches.
+const REMOTE_HOST = String.raw`[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+`;
+const REMOTE_NAME = String.raw`[A-Za-z0-9_-][A-Za-z0-9._-]*`;
+const NETWORK_REMOTES = [
+  new RegExp(`^https://(${REMOTE_HOST})/(${REMOTE_NAME})/(${REMOTE_NAME})$`),
+  new RegExp(`^git@(${REMOTE_HOST}):(${REMOTE_NAME})/(${REMOTE_NAME})$`),
+];
 
 /**
- * What a remote URL names. Only explicit forms are read: an https/http/ssh URL
- * or an scp-like `user@host:path` yields its host[:port], every namespace
- * segment, the repository, and an exact identity key (case-folded only on
- * github.com, whose paths are case-insensitive); an absolute path or file://
- * URL is local. Everything else (a `::` helper, any other scheme, a bare
- * `host:path`, a malformed escape, no path) is unsupported: what it names is
- * unknown.
+ * What a remote URL names. Only `https://<host>/<owner>/<repo>[.git]` and
+ * `git@<host>:<owner>/<repo>[.git]` are network remotes, yielding host, owner,
+ * repository and an exact identity key (case-folded only on github.com, whose
+ * paths are case-insensitive); an absolute path or file:// URL is local.
+ * Everything else is unsupported: what it names is unknown.
  */
 export function parseRemote(url: string): ParsedRemote {
   const trimmed = url.trim();
   if (trimmed.startsWith('/') || trimmed.startsWith('file://')) return { kind: 'local' };
-  const urlForm = URL_REMOTE.exec(trimmed);
-  const scpForm = trimmed.includes('::') ? null : SCP_REMOTE.exec(trimmed);
-  let host: string;
-  let segments: string[];
-  if (urlForm) {
-    const decoded = readSource(() => urlForm[3].split('/').map((segment) => decodeURIComponent(segment)));
-    if (!decoded.ok) return { kind: 'unsupported' };
-    host = urlForm[1].toLowerCase() + (urlForm[2] ? `:${urlForm[2]}` : '');
-    segments = pathSegments(decoded.value.join('/'));
-  } else if (scpForm) {
-    host = scpForm[1].toLowerCase();
-    segments = pathSegments(scpForm[2]);
-  } else {
-    return { kind: 'unsupported' };
-  }
-  const repo = segments.at(-1);
-  if (!repo) return { kind: 'unsupported' };
-  const repoPath = segments.join('/');
+  const match = NETWORK_REMOTES.map((pattern) => pattern.exec(trimmed)).find(Boolean);
+  if (!match) return { kind: 'unsupported' };
+  const [, rawHost, owner, rawRepo] = match;
+  const host = rawHost.toLowerCase();
+  const repo = rawRepo.replace(/\.git$/, '');
+  const repoPath = `${owner}/${repo}`;
   return {
     kind: 'network',
     host,
-    namespaces: segments.slice(0, -1),
+    owner,
     repo,
     key: `${host}/${host === 'github.com' ? repoPath.toLowerCase() : repoPath}`,
   };
@@ -442,7 +425,7 @@ function remoteUrl(dir: string, name: string, env: NodeJS.ProcessEnv): RemoteUrl
 }
 
 export interface PublicRemotes {
-  /** Namespaces (owners) of the scanned and install checkouts' remotes: their names appear in public URLs. */
+  /** Owners of the scanned and install checkouts' remotes: their names appear in public URLs. */
   owners: Set<string>;
   /** Exactly those remotes. Another repository under the same owner may be private. */
   repositories: Set<string>;
@@ -460,7 +443,7 @@ export function publicRemotes(roots: string[]): PublicRemotes {
       const lookup = remoteUrl(root, name, env);
       const parsed = lookup.kind === 'url' ? parseRemote(lookup.url) : null;
       if (parsed?.kind !== 'network') continue;
-      for (const namespace of parsed.namespaces) remotes.owners.add(namespace.toLowerCase());
+      remotes.owners.add(parsed.owner.toLowerCase());
       remotes.repositories.add(parsed.key);
     }
   }
@@ -573,10 +556,8 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
         if (!isGenericRepositoryName(name)) addIdentifier(identifiers, name);
         continue;
       }
-      for (const namespace of parsed.namespaces) {
-        if (!remotes.owners.has(namespace.toLowerCase()) && !isGenericRepositoryName(namespace))
-          addIdentifier(identifiers, namespace);
-      }
+      if (!remotes.owners.has(parsed.owner.toLowerCase()) && !isGenericRepositoryName(parsed.owner))
+        addIdentifier(identifiers, parsed.owner);
       if (!remotes.repositories.has(parsed.key) && !isGenericRepositoryName(parsed.repo))
         addIdentifier(identifiers, parsed.repo);
     }
