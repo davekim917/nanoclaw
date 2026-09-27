@@ -26,7 +26,10 @@ export function workgroupWikiHostPath(workgroupId: string): string {
   return path.join(DATA_DIR, 'wikis', workgroupId);
 }
 
-/** With `workspaceHostRoot`, the wiki is skipped if a non-directory already sits at its `wiki` mountpoint. */
+/**
+ * `workspaceHostRoot` must be the agent-writable session dir mounted at `/workspace`; when given, the wiki is skipped
+ * if a non-directory already sits at its `wiki` mountpoint.
+ */
 export function resolveWorkgroupWiki(
   workgroupId: string | null | undefined,
   workspaceHostRoot?: string,

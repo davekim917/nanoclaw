@@ -39,8 +39,9 @@ function realDirectory(directory: string): boolean {
 }
 
 /**
- * Empty `.git` dirs are Docker bind-mount stubs. A non-empty malformed marker is a blocker, never silently dropped;
- * broken linked-worktree pointers stay candidates for the migration's collided-admin recovery.
+ * Directory-only skeletons (Docker bind-mount stubs, even a non-empty `.git` holding only directories) are ignored;
+ * any other malformed marker is a blocker, never silently dropped. Broken linked-worktree pointers stay candidates
+ * for the migration's collided-admin recovery.
  */
 function containsOnlyDirectories(root: string): boolean {
   const stack = [root];
