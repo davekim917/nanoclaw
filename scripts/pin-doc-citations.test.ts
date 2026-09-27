@@ -210,6 +210,35 @@ describe('pinDocs', () => {
     ]);
   });
 
+  it("finds the origin in the note's own doc, not a later note elsewhere with the same wording", () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, '- old finding: the `drainQueue` function at `src/code.ts:1` dropped items\n');
+    const original = commit(root, 'old note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+    write(
+      root,
+      'docs/review-notes/2.md',
+      '- new finding: the `drainQueue` function at `src/code.ts:1` takes a limit\n',
+    );
+    commit(root, 'new note');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: original })]);
+  });
+
+  it('matches a named identifier whole, not inside a longer one', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    const named = commit(root, 'code');
+    write(root, 'src/code.ts', 'function drainQueueLater() {}\n');
+    commit(root, 'rename');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` dropped items\n');
+    commit(root, 'note');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: named })]);
+  });
+
   it('leaves pinned citations and citations of other files alone', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

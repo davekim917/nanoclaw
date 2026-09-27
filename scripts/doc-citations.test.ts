@@ -121,6 +121,16 @@ describe('docCitationProblems', () => {
     ]);
   });
 
+  it('checks a path with no file extension', () => {
+    const { root } = repo({
+      'container/Dockerfile': 'FROM x\n',
+      'doc.md': '`container/Dockerfile:1`, `container/Dockerfile:99`\n',
+    });
+    expect(docCitationProblems(root, ['doc.md'])).toEqual([
+      'doc.md:1: cites `container/Dockerfile:99`, but container/Dockerfile has only 1 lines',
+    ]);
+  });
+
   it('fails a line zero and a range that runs backwards', () => {
     const { root } = repo({ 'src/a.ts': 'one\ntwo\n', 'doc.md': '`src/a.ts:0` and `src/a.ts:9-2`\n' });
     expect(docCitationProblems(root, ['doc.md'])).toEqual([

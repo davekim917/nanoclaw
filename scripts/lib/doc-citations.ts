@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 
-const CITED_FILE_LINE_RE = /([\w./-]+\.\w+):(\d+)(?:-(\d+))?/g;
+const CITED_FILE_LINE_RE = /([\w./-]+\.\w+|(?:[\w.-]+\/)+[\w-]+):(\d+)(?:-(\d+))?/g;
 const AT_SHA_RE = /^at\s+([0-9a-f]{7,40})\b/;
-const PIN_CHAIN_LINK_RE = /^`?(?:(?:[\w./-]+\.\w+)?:\d+(?:-\d+)?|#\d+)`?/;
+const PIN_CHAIN_LINK_RE = /^`?(?:(?:[\w./-]+\.\w+|(?:[\w.-]+\/)+[\w-]+)?:\d+(?:-\d+)?|#\d+)`?/;
 const PIN_CHAIN_JOIN_RE = /^\s*(?:,|and)\s*/;
 const CONTINUATION_RE = /^`?:(\d+)(?:-(\d+))?`?/;
 

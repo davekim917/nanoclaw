@@ -5,7 +5,6 @@ import path from 'node:path';
 import { walkArgs } from './lib/cli-args.js';
 import { citationRuns, gitRead, type CitationRun, type FileLineCitation } from './lib/doc-citations.js';
 
-const REVIEW_NOTES_PATHS = ['docs/review-notes.md', 'docs/review-notes'];
 const MAX_EARLIER_VERSIONS = 5;
 const USAGE =
   'usage: pnpm exec tsx scripts/pin-doc-citations.ts [--doc <path>]... [--rev <rev>] [--dry-run] [<cited file>...]\n' +
@@ -123,6 +122,11 @@ function shortSha(root: string, sha: string): string {
   return gitRead(root, ['rev-parse', '--short=9', sha])?.trim() ?? sha;
 }
 
+function mentions(text: string, anchor: string): boolean {
+  if (!/^[\w$-]+$/.test(anchor)) return text.includes(anchor);
+  return new RegExp(`(?<![\\w$])${anchor.replace(/\$/g, '\\$')}(?![\\w$])`).test(text);
+}
+
 function choosePin(
   root: string,
   links: readonly FileLineCitation[],
@@ -138,7 +142,7 @@ function choosePin(
     return texts.every((text): text is string => text !== null) ? texts : null;
   };
   const matches = (texts: string[] | null): boolean =>
-    texts !== null && texts.every((text) => anchors.some((anchor) => text.includes(anchor)));
+    texts !== null && texts.every((text) => anchors.some((anchor) => mentions(text, anchor)));
   const index = candidates.findIndex((rev) => matches(view(rev)));
   if (index === -1)
     return {
@@ -170,7 +174,6 @@ export function pinDocs(
   const rev = options.rev ?? 'HEAD';
   const outcomes: PinOutcome[] = [];
   for (const doc of docs) {
-    const docPaths = doc.startsWith('docs/review-notes') ? REVIEW_NOTES_PATHS : [doc];
     const lines = fs.readFileSync(path.join(root, doc), 'utf8').split('\n');
     const committedLines = new Set((gitRead(root, ['show', `${rev}:${doc}`]) ?? '').split('\n'));
     let changed = false;
@@ -179,7 +182,7 @@ export function pinDocs(
       let previousEnd = 0;
       for (const run of citationRuns(text)) {
         const head = run.links[0];
-        const context = text.slice(Math.max(previousEnd, head.index - 40), head.index);
+        const context = text.slice(Math.max(previousEnd, head.index - 120), head.index);
         previousEnd = run.end + (/^\s+at\s+[0-9a-f]{7,40}\b/.exec(text.slice(run.end))?.[0].length ?? 0);
         if (run.pinnedSha) continue;
         const files = runFiles(run);
@@ -188,7 +191,7 @@ export function pinDocs(
         const headText = `${head.file}:${head.span}`;
         const searches = [];
         if (context.trim().length >= 10)
-          searches.push({ needle: context + text.slice(head.index, head.end), paths: docPaths });
+          searches.push({ needle: context + text.slice(head.index, head.end), paths: [doc] });
         if (committedLines.has(text)) searches.push({ needle: headText, paths: [doc] });
         const origin = introducingCommit(root, rev, searches);
         const start = origin ?? gitRead(root, ['rev-parse', rev])?.trim() ?? rev;
