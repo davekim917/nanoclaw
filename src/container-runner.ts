@@ -213,7 +213,7 @@ const HOST_ONLY_MCP_FIELDS = ['displayName', 'description', 'plugin'] as const;
 
 /**
  * Omits entries with a non-empty plugin root: the runner resolves those from container.json, then overlays this by
- * name. HOST_ONLY_MCP_FIELDS never reach a provider; `instructions` deliberately still crosses.
+ * name. HOST_ONLY_MCP_FIELDS are stripped from what this payload carries; `instructions` deliberately still crosses.
  */
 export function serializeMcpServersEnv(
   servers: Record<string, unknown>,
