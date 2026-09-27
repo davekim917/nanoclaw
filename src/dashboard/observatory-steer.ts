@@ -1,38 +1,11 @@
 /**
- * Steer write path for `POST /dashboard/api/observatory/steer`.
- *
- * Nudge's sibling, and deliberately its inverse. `nudge.ts` composes the whole
- * prompt from the claim file so a browser can never author a line of what an
- * agent is told; steer exists precisely for the case where a HUMAN has
- * something to say that no file contains — "drop it, ship the
- * other one", "the blocker just cleared". Everything else is nudge's shape: same role gate
- * (`canAssign`), same one-shot task through `dispatch`, same rule that the task
- * lands in the work's OWN thread rather than wherever the agent happens to be.
- *
- * Because the text IS client-authored here, the gate carries more weight than
- * it does for nudge: only an owner / global admin / admin of the target group
- * can reach it, the body is length-capped, and it is quoted into the prompt as
- * an attributed instruction from a named person rather than pasted as if the
- * system said it.
- *
- * Nothing here ever GUESSES a room — nudge's barge-in doctrine holds — but a
- * room that is already data is not a guess, and both callers have one:
- *
- * - **Claim with a thread** → post into it.
- * - **Claim with no thread** → the operator NAMES the room (`channel`), because
- *   a claim file carries no channel of its own. That anchors a real parent +
- *   thread (support-threads' postParent → createThread precedent) and RECORDS
- *   the new `thread_id` back onto the claim file, so the next steer, the next
- *   nudge and the board's own link all continue the same conversation.
- * - **Release-board item** → its room comes off the BOARD (`item.channel`,
- *   the same field assign routes by and the queue renders as its Room column),
- *   never off the request: the operator confirms the target in the composer,
- *   but a browser can never redirect the post. Only an item with no channel at
- *   all has nothing to aim at, and that is the one 409.
- *
- * The asymmetry that remains is honest and deliberate: an item has no file to
- * write a thread id back to, so its thread is returned in the response and not
- * persisted. See the `ponytail:` note at that branch.
+ * Steer write path (`POST /dashboard/api/observatory/steer`): nudge's inverse, carrying a HUMAN's own text. Same role
+ * gate (`canAssign`), same one-shot task, same rule that the task lands in the work's OWN thread. Because the text is
+ * client-authored, it is length-capped and quoted as an attributed instruction from a named person.
+ * Never guesses a room. A claim with a thread posts into it. A claim with no thread needs the operator to name
+ * `channel`; the new thread id is recorded back onto the claim file. A release-board item's room comes off the BOARD
+ * (`item.channel`), never off the request; an item with no channel is the one 409. An item has no file to record a
+ * thread on, so `observatory_item_threads` holds it.
  */
 import fs from 'fs';
 import path from 'path';
@@ -51,34 +24,21 @@ import type { AuthHandler } from './router.js';
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
-/** Long enough for a paragraph of direction, short enough that nobody pastes a log into an agent's prompt. */
 const MAX_TEXT = 2000;
 
-// Double-click protection, NOT nudge's per-claim dedupe: an operator may
-// legitimately steer the same claim twice in a minute, just never with the
-// same words by accident. Keyed on the text, so a second thought goes through.
+// Double-click protection keyed on the text, not nudge's per-claim dedupe: steering the same claim twice with
+// different words is legitimate.
 const SEND_DEDUPE_MS = 60 * 1000;
 const recentSends = new Map<string, number>();
 
-/** Test-only, same precedent as _resetNudgeDedupeForTesting. */
 export function _resetSteerDedupeForTesting(): void {
   recentSends.clear();
 }
 
 /**
- * Serializes the resolve → open → claim window for ONE item, in this process.
- *
- * The `observatory_item_threads` PRIMARY KEY already guarantees one thread per
- * item: a losing insert is detectable (`changes === 0`) and its steer is
- * re-pointed at the winner. But by then the loser has ALREADY posted a parent
- * message to Slack, so the board stays right while the channel collects an
- * orphan thread nobody will ever answer in.
- *
- * ponytail: the host is a single Node process (see CLAUDE.md — it is the one
- * that serves this endpoint), so a keyed in-process lock is enough to make that
- * window atomic and costs eight lines. The PK behind it is what still holds if
- * a restart ever lands between two clicks — belt, then braces, in that order.
- * A cross-process host would need the claim-before-post dance instead.
+ * Serializes resolve → open → claim for one item in this process. The PRIMARY KEY already guarantees one thread per
+ * item, but a losing insert has by then posted an orphan parent message to Slack. The host is a single Node process,
+ * so an in-process lock suffices; the PK still covers a restart mid-window.
  */
 const itemThreadLocks = new Map<string, Promise<unknown>>();
 
@@ -89,8 +49,7 @@ export async function withItemThreadLock<T>(key: string, fn: () => Promise<T>): 
     release = resolve;
   });
   itemThreadLocks.set(key, mine);
-  // Never inherit a predecessor's failure — it queued behind us, it did not
-  // poison us. Its own caller already saw the error.
+  // Never inherit a predecessor's failure; its own caller saw the error.
   if (ahead) await ahead.catch(() => {});
   try {
     return await fn();
@@ -100,7 +59,6 @@ export async function withItemThreadLock<T>(key: string, fn: () => Promise<T>): 
   }
 }
 
-/** The thread an item's work already lives in, or null when nobody has opened one. */
 export async function readItemThread(workgroupId: string, itemId: string): Promise<ItemThreadRow | null> {
   return (
     (await getDb().get<ItemThreadRow>(
@@ -119,11 +77,7 @@ export interface ItemThreadRow {
   created_by: string;
 }
 
-/**
- * Claim this item's thread. Returns the thread that WON — ours if the insert
- * landed, the incumbent's if we lost the race — so the caller always has
- * somewhere real to post and never a second thread to apologise for.
- */
+/** Returns the thread that WON (ours, or the incumbent's on a lost race), so the caller never has a second thread. */
 export async function claimItemThread(
   workgroupId: string,
   itemId: string,
@@ -144,10 +98,7 @@ export async function claimItemThread(
   return (await readItemThread(workgroupId, itemId))?.thread_id ?? threadId;
 }
 
-/**
- * The wired messaging group behind a thread id — the same "an agent can only be
- * made to speak where it belongs" check the claim-with-a-thread branch runs.
- */
+/** An agent can only be made to speak where it is wired. */
 async function wiredGroupForThread(
   agentGroupId: string,
   threadId: string,
@@ -162,18 +113,12 @@ async function wiredGroupForThread(
   );
 }
 
-/** '#Qa-Room' / 'qa-room' → 'qa-room', for name matching. Assign's rule, same reason. */
 const channelKey = (name: string): string => name.replace(/^#/, '').toLowerCase();
 
 /**
- * Record a freshly-created thread onto the claim file, preserving every other
- * field — `claim.sh` owns this schema and writes the same flat JSON object, so
- * this only ever adds `thread_id`. Atomic (write-then-rename) because the
- * claim's own agent may be writing the file at the same moment, and a
- * half-written claim reads as a lost claim.
- *
- * Never throws: the thread is already real by the time this runs, so a failed
- * record-back is a degraded result to report, not a reason to fail the steer.
+ * Adds only `thread_id`, preserving every other field (`claim.sh` owns the schema). Atomic write-then-rename because
+ * the claim's agent may be writing the file concurrently, and a half-written claim reads as lost. Never throws: the
+ * thread is already real.
  */
 export function recordClaimThread(
   workgroupId: string,
@@ -184,8 +129,7 @@ export function recordClaimThread(
   const file = path.join(root, workgroupId, 'claims', `${slug}.json`);
   try {
     const claim = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
-    // Re-read wins: if the owning agent backfilled a thread while we were
-    // posting, theirs is the one the room is actually using.
+    // Re-read wins: a thread the owning agent backfilled meanwhile is the one the room uses.
     if (typeof claim['thread_id'] === 'string' && claim['thread_id']) return false;
     const tmp = `${file}.tmp-${randomUUID().slice(0, 8)}`;
     fs.writeFileSync(tmp, JSON.stringify({ ...claim, thread_id: threadId }, null, 2));
@@ -198,13 +142,8 @@ export function recordClaimThread(
 }
 
 /**
- * Anchor a real thread in one of this agent's wired rooms and return its
- * encoded id — the support-threads postParent → createThread precedent.
- *
- * One implementation for both callers on purpose: a claim opening its first
- * thread and a board item opening one differ only in what they call the thing,
- * and two copies of this would drift on the wiring check that keeps an agent
- * from being made to speak where it doesn't belong.
+ * Anchors a real thread in one of this agent's wired rooms. One implementation for claims and items so the wiring
+ * check cannot drift.
  */
 async function openThreadFor(
   agentGroupId: string,
@@ -231,9 +170,7 @@ async function openThreadFor(
   try {
     const { messageId } = await adapter.postParent(target.platform_id, announcement);
     const created = await adapter.createThread(target.platform_id, messageId, title.slice(0, 80), firstMessage);
-    // chat-sdk routes on the ENCODED thread id (`<platform_id>:<thread>`);
-    // createThread returns the bare one. Same normalization as
-    // orchestrator-dispatch and support-threads.
+    // chat-sdk routes on the ENCODED thread id (`<platform_id>:<thread>`); createThread returns the bare one.
     return {
       threadId: created.threadId.includes(':') ? created.threadId : `${target.platform_id}:${created.threadId}`,
       messagingGroupId: target.id,
@@ -250,7 +187,7 @@ interface SteerBody {
   claimSlug?: string;
   itemId?: string;
   text?: string;
-  /** Room name (e.g. '#dispatch') — required ONLY to open a thread for a claim that has none. */
+  /** Required ONLY to open a thread for a claim that has none. */
   channel?: string;
 }
 
@@ -282,7 +219,6 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
 
   const who = ctx.user.display_name ?? ctx.user.id;
 
-  // ── Resolve the thread this steer lands in ────────────────────────────────
   let threadId: string;
   let messagingGroupId: string;
   let subject: string;
@@ -295,12 +231,8 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
     if (!item) return json(404, { error: 'item_not_on_board' });
     subject = `the board item ${item.id} — "${item.title}"`;
 
-    // One item, one thread. An item has no file of its own to write a thread id
-    // back to (a claim does — see recordClaimThread), so `observatory_item_threads`
-    // is that file: the FIRST steer opens the thread, every later one continues
-    // it. Without this the board's one-click ship opened a second thread for the
-    // same work on the second press, by anyone, and the agent got the same ask
-    // twice in two places with no way to see the other.
+    // One item, one thread: the first steer opens it and every later one continues it, rather than a second press
+    // opening a duplicate thread for the same work.
     type Resolved = { error: Response } | { threadId: string; messagingGroupId: string; created: boolean };
     const resolved = await withItemThreadLock<Resolved>(`${workgroupId}:${itemId}`, async () => {
       const known = await readItemThread(workgroupId, itemId);
@@ -310,9 +242,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
         return { threadId: known.thread_id, messagingGroupId: target.id, created: false };
       }
 
-      // The item's room comes off the BOARD, not off the request — the operator
-      // confirms it in the composer, but a browser can never redirect the post.
-      // No channel is the one case with nothing to aim at.
+      // The room comes off the BOARD, never the request.
       if (!item.channel) {
         return {
           error: json(409, {
@@ -329,9 +259,8 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
         text,
       );
       if ('error' in opened) return { error: opened.error };
-      // Claim it before returning. Under the lock this always wins in-process;
-      // the ON CONFLICT is what covers a restart landing mid-window, and it
-      // hands back the incumbent rather than the thread we just opened.
+      // Under the lock this always wins in-process; ON CONFLICT covers a restart mid-window and hands back the
+      // incumbent.
       const won = await claimItemThread(workgroupId, itemId, opened.threadId, ctx.user.id);
       if (won !== opened.threadId) {
         const target = await wiredGroupForThread(agentGroupId, won);
@@ -352,7 +281,6 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
     subject = `the claim \`${claim.slug}\` (owner: ${claim.owner})`;
 
     if (claim.threadId) {
-      // Same rule as nudge: an agent can only be made to speak where it belongs.
       const target = await getDb().get<{ id: string; name: string }>(
         `SELECT mg.id, mg.name
          FROM messaging_group_agents mga
@@ -382,13 +310,10 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
       threadId = opened.threadId;
       messagingGroupId = opened.messagingGroupId;
       threadCreated = true;
-      // Unlike an item, a claim HAS a file — so the thread we just opened becomes
-      // its thread, and the next steer continues the conversation.
       recordedOnClaim = recordClaimThread(workgroupId, claim.slug, threadId);
     }
   }
 
-  // ── The steer itself ──────────────────────────────────────────────────────
   const prompt =
     `${who} steered this from the Observatory — on ${subject}.\n\n` +
     `They said, verbatim:\n"""\n${text}\n"""\n\n` +
@@ -413,8 +338,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
 
   if (!res.ok) {
     log.warn('observatory steer: task create failed', { targetId, agentGroupId, error: res });
-    // A thread we just opened is real whether or not the task landed — say so
-    // rather than letting the operator think nothing happened.
+    // A thread just opened is real whether or not the task landed; say so.
     return json(502, { error: 'task_create_failed', ...(threadCreated ? { threadId, threadCreated } : {}) });
   }
 
@@ -427,8 +351,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
     threadId,
     threadUrl: await threadPermalink(threadId),
     threadCreated,
-    // The board already had a thread for this item and we posted into it, not
-    // a new one. The UI says so rather than reporting a fresh send.
+    // Posted into the item's existing thread, not a new one.
     ...(existing ? { existing: true } : {}),
     ...(recordedOnClaim === null ? {} : { recordedOnClaim }),
   });

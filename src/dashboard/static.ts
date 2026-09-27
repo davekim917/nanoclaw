@@ -1,19 +1,14 @@
 /**
- * Path-traversal-safe static asset handler for the dashboard SPA bundle.
- *
- * Security: path.resolve + startsWith(STATIC_ROOT + sep) containment,
- * null-byte rejection, isFile() guard. Unknown extensions default to
- * application/octet-stream (NOT text/plain — browsers reject JS modules
- * served as text/plain).
+ * Path-traversal-safe static handler for the SPA bundle: resolve + `STATIC_ROOT + sep` containment, null-byte
+ * rejection, isFile() guard. Unknown extensions are application/octet-stream, never text/plain (browsers reject JS
+ * modules served as text/plain).
  */
 import fs from 'fs';
 import path from 'path';
 
 import type { Handler } from './router.js';
 
-// SPA assets live in `dist/dashboard-spa/` (sibling of the host's compiled
-// API handlers at `dist/dashboard/`). They used to share the directory but
-// Vite's emptyOutDir wiped the host's index.js on every dashboard build.
+// Separate from the host's compiled `dist/dashboard/`: Vite's emptyOutDir would wipe the host's index.js.
 export const STATIC_ROOT = path.resolve(process.cwd(), 'dist/dashboard-spa');
 
 const MIME: Record<string, string> = {
@@ -30,7 +25,6 @@ const MIME: Record<string, string> = {
 };
 
 function resolveAndCheck(tail: string): { filePath: string; stat: fs.Stats } | null {
-  // Null-byte rejection
   if (tail.includes('\0')) return null;
 
   let decoded: string;
@@ -44,10 +38,8 @@ function resolveAndCheck(tail: string): { filePath: string; stat: fs.Stats } | n
 
   const filePath = path.resolve(STATIC_ROOT, decoded);
 
-  // Path-containment check
   if (!filePath.startsWith(STATIC_ROOT + path.sep)) return null;
 
-  // Must be a file
   let stat: fs.Stats;
   try {
     stat = fs.statSync(filePath);
@@ -88,7 +80,6 @@ export const indexHtmlHandler: Handler = async (_req, _params, _ctx) => {
 export const staticHandler: Handler = async (req, params, _ctx) => {
   const tail = params['tail'] ?? '';
 
-  // Empty tail → 404
   if (!tail) {
     return new Response(JSON.stringify({ error: 'not_found' }), {
       status: 404,
@@ -106,9 +97,7 @@ export const staticHandler: Handler = async (req, params, _ctx) => {
 
   const { filePath, stat } = resolved;
 
-  // RFC 7232: ETag values must be quoted strings (post-build QA fix SF-4).
-  // Without quotes, browsers send If-None-Match: "abc" but the unquoted compare
-  // always fails → 304 never served and assets are re-downloaded on every request.
+  // ETags must be quoted (RFC 7232), or If-None-Match never matches and assets re-download every request.
   const etag = `"${stat.mtimeMs.toString(16)}"`;
   const ifNoneMatch = req.headers.get('if-none-match');
   if (ifNoneMatch === etag) {

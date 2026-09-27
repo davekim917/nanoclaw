@@ -1,21 +1,8 @@
 /**
- * Native Slack slash-command handler for `/dashboard-token`.
- *
- * This is a SEPARATE entry point from `dashboard-token-issue.ts`'s chat
- * intercept: that one fires when a user types `/dashboard-token` as a plain
- * message the bot has to be mentioned/DM'd to see. This one fires when Slack
- * itself recognizes `/dashboard-token` as a registered slash command (app
- * manifest registration — see docs/slack-slash-commands.md) and delivers a
- * `SlashCommandEvent` directly, bypassing Slack's "not a valid command"
- * interception entirely.
- *
- * Slash commands can be invoked from any channel, including ones the bot
- * isn't a member of — so the reply MUST go through Slack's `response_url`
- * (valid regardless of channel membership) rather than a normal channel
- * post or the SDK's `channel.postEphemeral` (which posts via the
- * `chat.postEphemeral` Web API and needs the bot present in the channel).
- * The link is a bearer credential, so the reply is always ephemeral —
- * visible only to the invoking user, never posted to the channel.
+ * Native Slack `/dashboard-token` slash command, separate from `dashboard-token-issue.ts`'s chat intercept (which
+ * needs the bot to see a plain message). Slash commands can run in channels the bot is not in, so the reply MUST use
+ * Slack's `response_url`, not a channel post or `chat.postEphemeral`. The link is a bearer credential, so the reply
+ * is always ephemeral.
  */
 import type { SlashCommandEvent } from 'chat';
 import { registerSlashCommandHandler } from '../../channels/chat-sdk-bridge.js';
@@ -25,18 +12,12 @@ import { upsertUser } from '../../modules/permissions/db/users.js';
 import { mintDashboardTokenUrl, formatTtl } from './dashboard-token-issue.js';
 import { log } from '../../log.js';
 
-/** Slack sends `response_url` as a normal form field on the slash-command payload. */
 function extractResponseUrl(raw: unknown): string | undefined {
   const url = (raw as Record<string, unknown> | undefined)?.response_url;
   return typeof url === 'string' ? url : undefined;
 }
 
-/**
- * Reply to a slash command via Slack's `response_url` — the only reply path
- * that works regardless of whether the bot is in the invoking channel.
- * `response_type: 'ephemeral'` (the default) keeps the message visible only
- * to the invoker.
- */
+/** `response_url` works regardless of the bot's channel membership; ephemeral by default. */
 async function postEphemeralViaResponseUrl(responseUrl: string, text: string): Promise<void> {
   try {
     const res = await fetch(responseUrl, {
@@ -65,25 +46,17 @@ export async function dashboardTokenSlashCommand(event: SlashCommandEvent): Prom
     return;
   }
 
-  // Persisted identity is `<channel_type>:<Slack user id>` — same convention
-  // as every other Slack-derived user id (see slack-user-identity.ts). The
-  // bridge overrides `adapter.name` to the workspace's channelType, so this
-  // matches exactly what the chat-intercept path produces for the same user.
+  // `<channel_type>:<Slack user id>`, matching what the chat-intercept path produces (the bridge sets `adapter.name`
+  // to the workspace's channelType).
   const userId = `${event.adapter.name}:${rawUserId}`;
 
-  // Same gate as the chat-intercept path (command-gate.ts's INTERCEPT_COMMANDS
-  // entry for /dashboard-token): any admin, or any existing agent-group
-  // member, can mint their own read-only login link. Everyone else is denied
-  // — the token binds to the invoker's identity, so this is not "mint for
-  // anyone," only "mint for yourself."
+  // Same gate as the chat intercept: any admin or agent-group member may mint a link for themselves only.
   if (!(await isAnyAdmin(userId)) && !(await hasAnyMembership(userId))) {
     await postEphemeralViaResponseUrl(responseUrl, "You don't have dashboard access. Ask an admin to add you.");
     return;
   }
 
-  // dashboard_tokens.user_id is FK'd to users(id) — ensure the row exists
-  // before minting (same upsert shape the chat-inbound path uses in
-  // modules/permissions/index.ts's extractAndUpsertUser).
+  // dashboard_tokens.user_id is FK'd to users(id), so the row must exist before minting.
   await upsertUser({
     id: userId,
     kind: event.adapter.name,
@@ -98,5 +71,4 @@ export async function dashboardTokenSlashCommand(event: SlashCommandEvent): Prom
   );
 }
 
-// Side-effect registration — importing this file registers the handler.
 registerSlashCommandHandler('/dashboard-token', dashboardTokenSlashCommand);

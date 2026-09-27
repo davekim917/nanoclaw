@@ -15,17 +15,8 @@ export interface UserScopes {
 }
 
 /**
- * Compute the dashboard scope for a user, querying `user_roles` directly.
- *
- * Used by:
- *  - `requireAuth` (src/dashboard/router.ts) to populate `ctx.scopes` for every
- *    authenticated request — drives §2a per-query scope filtering.
- *  - `authMeHandler` (src/dashboard/api/auth-me.ts) to project the scope to the SPA.
- *
- * Both call sites must share the same logic; previously they diverged
- * (post-build QA fix MF-3 — scoped admins were getting allowed_group_ids=[]
- * because requireAuth used canAccessAgentGroup(user, '*') instead of this
- * enumeration query, locking the entire scoped-admin role tier out of the dashboard).
+ * The dashboard scope for a user from `user_roles`. `requireAuth` and `authMeHandler` must both use this: enumerating
+ * real groups is what lets scoped admins see anything.
  */
 export async function computeScopes(userId: string): Promise<UserScopes> {
   const rows = await getDb().all<UserRoleRow>('SELECT role, agent_group_id FROM user_roles WHERE user_id = ?', userId);
@@ -49,9 +40,7 @@ export async function computeScopes(userId: string): Promise<UserScopes> {
     return { role: 'admin_of_group', allowed_group_ids: scopedAdminGroups, no_filter: false };
   }
 
-  // The 'member' role in user_roles is legacy/unused in practice — the real
-  // membership grant is `agent_group_members` (see ncl members add). Union
-  // both so either mechanism unlocks the same read-only scope.
+  // The 'member' role in user_roles is legacy; the real grant is `agent_group_members`. Both are unioned.
   const roleMemberGroups = rows
     .filter((r) => r.role === 'member' && r.agent_group_id !== null)
     .map((r) => r.agent_group_id as string);

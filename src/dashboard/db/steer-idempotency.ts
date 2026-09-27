@@ -60,10 +60,7 @@ function fromExistingRow(existing: ExistingRow, target: SteerTarget, requestHash
     throw new IdempotencyConflict('target');
   }
   if (existing.request_hash !== requestHash) throw new IdempotencyConflict('request_hash');
-  // Row truth for target_type/target_id wins over whatever shape the
-  // legacy cached_response JSON used — pre-C5 deploys persisted
-  // `{task_id, message_id, echo_status}` only. Overriding from the
-  // existing row fixes those replays without a JSON migration sweep.
+  // Row values for target_type/target_id win over legacy cached_response JSON, which lacked them.
   const cached =
     existing.status === 'applied' && existing.cached_response
       ? ({
@@ -83,17 +80,10 @@ function fromExistingRow(existing: ExistingRow, target: SteerTarget, requestHash
 }
 
 /**
- * Reserve (or replay) a steer slot for the given (user, idempotency_key). The
- * `target` ties the key to a specific (task or session) — replay with a
- * mismatched target raises `IdempotencyConflict('target')` rather than
- * silently letting one key write to two destinations.
- *
- * The select-then-insert below is exactly the race `insertOrAdopt` (seam 3
- * §4.5) exists for: under the async driver, two concurrent reserves for the
- * SAME key can both see "no existing row" and both attempt the INSERT. The
- * loser adopts the winner's row and runs it through the same conflict check
- * `fromExistingRow` applies to an ordinary replay — a concurrent race and a
- * later replay are the same case from this function's point of view.
+ * Reserves (or replays) a steer slot for (user, idempotency_key). A replay with a different target raises
+ * `IdempotencyConflict('target')` rather than letting one key write to two destinations. Two concurrent reserves can
+ * both see no row; `insertOrAdopt` makes the loser adopt the winner's row and run the same conflict check as a
+ * replay.
  */
 export async function reserveIdempotency(
   userId: string,
@@ -106,16 +96,8 @@ export async function reserveIdempotency(
   const existing = await selectExisting(userId, idempotencyKey);
   if (existing) return fromExistingRow(existing, target, requestHash);
 
-  // Typed as the wide `Record<string, unknown>` rather than the literal
-  // insert-column shape on purpose: `insertOrAdopt`'s type parameter is
-  // shared between `candidate` and `reload`'s return, and `reload` here is
-  // `selectExisting`, which returns the narrower `ExistingRow` (a SELECT
-  // projection, not the INSERT columns) — the two shapes genuinely differ
-  // (e.g. `reserved_at` vs `status`/`echo_attempted`). Neither branch's
-  // result is read off the primitive's own return value below (both re-read
-  // via `selectExisting` directly at line ~138), so the exact row shape
-  // insertOrAdopt threads through is never observed — only that both
-  // arguments satisfy ONE shared type, which `Record<string, unknown>` does.
+  // Widened to `Record<string, unknown>` because `insertOrAdopt` shares one type parameter between `candidate` and
+  // `reload`, whose SELECT projection differs from the INSERT columns; neither return value is read.
   const candidate: Record<string, unknown> = {
     user_id: userId,
     idempotency_key: idempotencyKey,
@@ -124,15 +106,11 @@ export async function reserveIdempotency(
     message_id: messageId,
     text,
     request_hash: requestHash,
-    // ISO, never datetime('now') — the naive shape sorts below ISO as TEXT and
-    // is misparsed as local by `new Date()`. See the CLAUDE.md timestamp rule.
+    // ISO, never datetime('now').
     reserved_at: new Date().toISOString(),
   };
 
-  // `ExistingRow` (a plain `interface`) has no index signature, so it is not
-  // structurally assignable to `Record<string, unknown>` even though every
-  // one of its properties is — hence the explicit widening cast on reload's
-  // return rather than relying on assignability.
+  // `ExistingRow` has no index signature, so the cast on reload's return is required.
   const { created } = await insertOrAdopt(
     candidate,
     async (row) => {
@@ -146,9 +124,8 @@ export async function reserveIdempotency(
     async () => (await selectExisting(userId, idempotencyKey)) as Record<string, unknown> | undefined,
   );
 
-  // Re-read regardless of `created`: the plain INSERT above carries no
-  // RETURNING, and the adopted-row branch needs the full row for the
-  // conflict check the same way an ordinary replay does.
+  // Re-read regardless of `created`: the INSERT has no RETURNING, and the adopted branch needs the full row for the
+  // conflict check.
   const row = await selectExisting(userId, idempotencyKey);
   if (!row) throw new Error('reserveIdempotency: row vanished immediately after insert/adopt');
   if (!created) return fromExistingRow(row, target, requestHash);
@@ -171,7 +148,7 @@ export async function applyIdempotency(userId: string, idempotencyKey: string, r
       user_id: userId,
       idempotency_key: idempotencyKey,
       cached_response: JSON.stringify(response),
-      // ISO, never datetime('now') — see reserveIdempotency above.
+      // ISO, never datetime('now').
       applied_at: new Date().toISOString(),
     },
   );
@@ -182,14 +159,8 @@ export async function markEchoAttempted(idempotencyRowId: number): Promise<void>
 }
 
 /**
- * Atomically claim the echo-attempt slot — sets `echo_attempted = 1` if and only
- * if it was currently 0. Returns true iff this call won the race.
- *
- * Use this in lieu of the read-then-write check `if (!reserved.echoAttempted) ...
- * markEchoAttempted(...)` to prevent the echo-duplication race where two concurrent
- * retries of the same idempotency_key both see echo_attempted=0 at reservation
- * time and both schedule adapter.deliver, resulting in duplicate Slack/Discord
- * messages. Post-build QA fix SF-1.
+ * Atomically claims the echo slot (sets `echo_attempted = 1` only if it was 0); true iff this call won. Use instead
+ * of read-then-write, which lets two concurrent retries both echo.
  */
 export async function claimEchoAttempted(idempotencyRowId: number): Promise<boolean> {
   const result = await getDb().run(

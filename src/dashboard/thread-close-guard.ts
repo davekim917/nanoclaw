@@ -1,95 +1,34 @@
 /**
- * Thread-close guard adapter — the catalog entry for `threads.close`, composed
- * at this feature's module edge (imported by `thread-close.ts`).
- *
- * Closing is privileged because it is the one console action that ENDS work:
- * it clears the agent's saved continuation, stops its container and archives
- * the sessions. None of that is trivially reversible — `unarchiveSessionById`
- * puts the row back on the list, but the continuation and the container are
- * gone — so it passes the same seam every other privileged action does.
- *
- * **Allow/deny only, no `grantActionName`.** A hold routes to the approvals
- * primitive, which resolves through an approver's chat card — a second person,
- * asynchronously, possibly never. Closure has the opposite requirement: the
- * operator confirms it themselves, in front of the thread, or it does not
- * happen. There is no settle-by-silence for closure, and a HOLD is exactly the
- * shape that would grow one. Nothing pairs with an approval handler here
- * because nothing is ever waiting for one.
- *
- * **Three rules, and all are in `decide` rather than in the handler**, so the
- * seam is the authority and a second caller cannot arrive later with its own
- * looser copy:
- *
- *  1. An admin of at least one agent group backing the thread — the same
- *     privilege the rest of this surface's mutating verbs demand.
- *  2. No session behind the thread may back a LIVE (pending or paused) task
- *     series. A per-series task thread (`system:tasks:<seriesId>`) is 1:1
- *     with its session — archiving that session strands the series: it stays
- *     `pending`/`paused` forever, `unwakeableReason` refuses every fire with
- *     "session is archived" (`src/container-runner.ts`), and nothing
- *     reopens it, because `unarchiveSessionById` has no callers. A silent
- *     cascade-cancel was considered and rejected — closing a thread must not
- *     quietly end scheduled work — so this is a hard refusal, not a third
- *     confirmation: the operator must explicitly cancel the series first
- *     (`ncl tasks cancel --id <series>`) before the thread can close. NOT
- *     `ncl tasks pause` — pause still counts as live (this rule's own
- *     "pending OR paused"), so a paused series denies the close exactly like
- *     a pending one; pausing it first buys nothing. If the work should keep
- *     running, the fix is to recreate it with `ncl tasks create` (same
- *     prompt, recurrence, pins) after the close, then cancel this one.
- *  3. The confirmation count. An agent-proposed close needs ONE confirmation:
- *     the agent already vouched that it is finished, and the operator is
- *     agreeing. A close with no proposal needs TWO, because it overrides an
- *     agent that still believes it has work — which is precisely the case the
- *     removed Dismiss action got wrong by making it a single silent click.
- *
- * **What the count is, and what it is NOT.** The REQUIRED number is decided
- * here and only here: a UI that forgot the second confirmation, or shipped its
- * own looser guess, sends too low a number and is denied. What is NOT decided
- * here is how many acts actually happened — `confirmations` arrives in the
- * request body (`thread-close.ts` reads it straight off the JSON), so nothing
- * on this path distinguishes two deliberate clicks from one crafted POST
- * carrying `{"confirmations": 2}`. Do not read the paragraphs above as a claim
- * that a client cannot collapse the two acts into one call. It can.
- *
- * That is accepted, not overlooked. The gate that matters is the admin check
- * immediately above, and the same admin can click twice; the second
- * confirmation is procedural friction that makes an irreversible action
- * deliberate, not a boundary that keeps anyone out. Making it a real count
- * would mean persisting the first refused attempt per (thread, user) with a
- * TTL — new server state for a step that stops nobody who is already allowed
- * to close. If that trade is ever revisited, the honest fix is that row, not a
- * stricter-looking comment here.
+ * Guard catalog entry for `threads.close`, the one console action that ENDS work (clears the saved continuation,
+ * stops the container, archives the sessions; not reversible).
+ * Allow/deny only, no `grantActionName`: a hold would route to an asynchronous approver and grow a settle-by-silence
+ * path, while a close must be confirmed by the operator in front of the thread.
+ * All three rules live in `decide` so no second caller can bring a looser copy: (1) the caller administers at least
+ * one agent group backing the thread; (2) no session behind it backs a LIVE (pending or paused) task series, because
+ * archiving strands the series forever (fires refuse "session is archived" and nothing unarchives); this is a hard
+ * refusal, not a silent cascade-cancel, and the operator must `ncl tasks cancel` it first (pause still counts as
+ * live); (3) one confirmation if an agent proposed the close, two if not.
+ * The REQUIRED count is decided here, but `confirmations` arrives in the request body, so a crafted POST can claim
+ * two. That is accepted: the admin check is the gate, and the second confirmation is procedural friction, not a
+ * boundary. A real count would need a persisted first attempt per (thread, user).
  */
 import { ALLOW, DENY, defineGuardedAction } from '../guard/index.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 
 /**
- * How many explicit operator confirmations this close requires.
- *
- * Exported so the HTTP layer can TELL the client the number before it asks —
- * the client must never be the one deciding it. `decide` re-derives it from
- * the same input, so the two cannot drift apart in a way that lets a close
- * through.
+ * Exported so the HTTP layer can tell the client the number up front; the client never decides it, and `decide`
+ * re-derives it from the same input.
  */
 export function requiredConfirmations(agentProposed: boolean): 1 | 2 {
   return agentProposed ? 1 : 2;
 }
 
 interface ThreadClosePayload extends Record<string, unknown> {
-  /** Every agent group with a session in the close's frozen fan-out. */
   agentGroupIds: string[];
-  /** An agent on this thread has a standing `propose_done` record. */
   agentProposed: boolean;
-  /** Confirmations the operator actually gave, as counted by the caller. */
+  /** As counted by the caller from the request body. */
   confirmations: number;
-  /**
-   * Series ids of any LIVE (pending|paused) task series a session behind this
-   * thread backs, sampled by the caller before the decision — `decide` never
-   * touches a per-session mailbox itself, the same reason `agentProposed`
-   * arrives pre-sampled rather than re-derived in here. See
-   * `src/dashboard/thread-close.ts`'s `liveTaskSeriesIdsSync`.
-   */
+  /** Sampled by the caller: `decide` never opens a per-session mailbox itself. */
   liveTaskSeriesIds: string[];
 }
 
@@ -98,9 +37,7 @@ export const threadsClose = defineGuardedAction({
   decide: (input) => {
     const actor = input.actor;
     if (actor.kind !== 'human') {
-      // Not a policy choice about who is trustworthy — an agent closing its
-      // own thread is the blindness switch again, from the other side, and the
-      // host has no business ending work nobody asked it to end.
+      // An agent closing its own thread is the same blindness switch from the other side.
       return DENY('closing a thread is an operator action');
     }
     const payload = input.payload as Partial<ThreadClosePayload>;

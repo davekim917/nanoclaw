@@ -1,59 +1,15 @@
 /**
- * Assign write path for `POST /dashboard/api/observatory/assign`.
- *
- * The console's verb for an OWNERLESS row. DESIGN.md §2: an unowned work item
- * "has no thread yet, and Assign is the verb that creates the thread". This is
- * that verb: it turns an attention item into a one-shot task owned by a chosen
- * agent group, routed to THE CHANNEL THE ITEM'S SOURCE DECLARED — a fresh
- * thread in the right room, never a steer into whatever conversation the agent
- * happens to be in (an assignment that barges into an unrelated thread is an
- * interruption, not an assignment — that shape was rejected explicitly).
- *
- * ## Why this endpoint and not `POST /threads/:id/message`
- *
- * That path is the console's primitive for every row that HAS a thread, and it
- * cannot serve these: it resolves the room by parsing the thread id, and an
- * attention item's id is a dedupe key with a `board:` prefix, explicitly never
- * a thread id (`ATTENTION_ITEM_PREFIX`). Running one through `threadChannelKey`
- * yields a channel nothing is wired to, so the send refuses — which is exactly
- * what an adversarial review found: the row rendered a selector with no handler
- * that could ever succeed behind it.
- *
- * The two paths therefore split on a real distinction, not a historical one:
- * a row with a thread gets a message in that thread, a row without one gets a
- * task that opens the conversation. DESIGN.md §10's "reconciling two steer
- * paths" is settled that way rather than by merging them — merged, the message
- * path would have to grow a "when the thread does not exist, spawn a task"
- * branch that only ever fires for this one row type.
- *
- * ## Security shape, deliberate
- *
- * The client sends two ids and nothing else, and the server re-derives every
- * fact behind them:
- *
- *  - **Which item.** Resolved through `selectScopedAttentionItems`, the SAME
- *    producer the row the operator clicked came from — not a raw board read.
- *    A board read admits items the console never showed (already claimed, next
- *    mover is an agent, shipped since the snapshot); those are not ownerless
- *    and must not be assignable. It also applies §2a's scope intersection, so
- *    an item in a workgroup this caller cannot see resolves to ABSENT, never a
- *    distinguishable refusal.
- *  - **Which room.** Off the item's own `channel_key`, which its attention
- *    source declared. A browser can choose which item and which agent; it can
- *    never redirect where the work lands.
- *  - **Which agents are eligible.** Re-derived from `messaging_group_agents`
- *    through `wiredAgentsByChannel()` — byte-for-byte the join that produced
- *    `ThreadSummary.assignable_agents`, so what the row offered and what the
- *    server accepts cannot disagree. An agent not wired to the room cannot be
- *    made to speak in it.
- *  - **What the agent is told.** Composed HERE out of board fields. A browser
- *    cannot author a single line of it.
- *
- * The privilege decision itself is not in this file: it is
- * `observatory-assign-guard.ts`, consulted through `guard()` like every other
- * privileged action. Scope stays here, because §2a requires an out-of-scope
- * target to be indistinguishable from a missing one and a guard can only ever
- * answer "denied".
+ * Assign write path (`POST /dashboard/api/observatory/assign`): turns an ownerless attention item into a one-shot
+ * task owned by a chosen agent group, routed to the channel the item's source declared: a fresh thread in the right
+ * room, never a steer into whatever conversation the agent is in.
+ * Not `POST /threads/:id/message`: an attention item id is a `board:` dedupe key, never a thread id, so that path
+ * cannot resolve a wired room for it.
+ * The client sends two ids; the server re-derives everything else. The item comes from `selectScopedAttentionItems`
+ * (the producer the row came from, never a raw board read, which admits items that are not ownerless) with scope
+ * applied, so an out-of-scope item is simply absent. The room comes from the item's declared `channel_key`. Eligible
+ * agents come from `wiredAgentsByChannel()`, the join behind `assignable_agents`. The prompt is composed here from
+ * board fields. Privilege is decided by `observatory-assign-guard.ts`; scope stays here because an out-of-scope
+ * target must be indistinguishable from a missing one.
  */
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getDb } from '../db/connection.js';
@@ -75,28 +31,16 @@ import type { AuthHandler, AuthedRequestContext } from './router.js';
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
-/**
- * How long an assignment holds the item against a second assign.
- *
- * Re-exported from `item-assignments.ts`, which owns the definition so the
- * write side here and the read side in `api/threads.ts` share exactly one
- * constant. See that module for why.
- */
+/** Owned by `item-assignments.ts` so the write side and `api/threads.ts`'s read side share one constant. */
 export { ASSIGN_DEDUPE_MS };
 
 /**
- * The role gate for every Observatory write that makes an agent act. Exported so
- * nudge.ts and observatory-steer.ts draw the SAME line — one definition, so the
- * buttons can never disagree about who may point an agent at work.
- *
- * This path no longer calls it directly: its allow condition is
- * `hasAdminPrivilege`, which is what `observatory-assign-guard.ts` decides on.
- * The `member` distinction below is the part a guard cannot express — §2a wants
- * a stranger to see absence, while a member of the group is someone the surface
- * may honestly tell "not you".
+ * The role gate for every Observatory write that makes an agent act; nudge.ts and observatory-steer.ts draw the same
+ * line. The `member` distinction is what a guard cannot express: a stranger sees absence, a group member may be told
+ * "not you".
  */
 function canAssign(userId: string, agentGroupId: string): Promise<{ ok: boolean; reason?: string }> {
-  // The role predicates are lease-only (§4.5 I-1); one block for the whole decision.
+  // Lease-only role predicates; one block for the whole decision.
   return withCentralSync((): { ok: boolean; reason?: string } => {
     if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
       return { ok: true };
@@ -124,18 +68,13 @@ export async function refuseUnassignableInWorkgroup(
 }
 
 /**
- * The item's natural id, however the client spelled it.
- *
- * A console row's `thread_id` is the STAMPED id (`board:<natural>`); an older
- * caller sends the natural one. Both name the same item, so both are accepted
- * and the natural form is what reaches the DB — see migration 058 on why the
- * prefix is never stored.
+ * Accepts the stamped (`board:<natural>`) or natural id; only the natural form reaches the DB (migration 058 never
+ * stores the prefix).
  */
 function naturalItemId(raw: string): string {
   return raw.startsWith(ATTENTION_ITEM_PREFIX) ? raw.slice(ATTENTION_ITEM_PREFIX.length) : raw;
 }
 
-/** A slug for the claim the receiving agent is told to take. */
 function claimSlug(itemId: string): string {
   return itemId
     .toLowerCase()
@@ -151,14 +90,8 @@ export interface AssignBody {
 }
 
 /**
- * The assign decision and write, with the attention feed's filesystem roots
- * injectable.
- *
- * Split out of the handler for the same reason `sendThreadMessage` is: the
- * board lives on disk, and a test that cannot point the reader at a fixture
- * would have to mock the producer — which is precisely the thing this path
- * must NOT do, since re-deriving the item from the real producer is half its
- * security argument.
+ * The assign decision and write, with the attention feed's roots injectable so tests use a fixture board rather than
+ * mocking the producer, whose re-derivation is half this path's security argument.
  */
 export async function assignAttentionItem(
   body: AssignBody,
@@ -169,17 +102,15 @@ export async function assignAttentionItem(
   const agentGroupId = (body.agentGroupId ?? '').trim();
   if (!rawItemId || !agentGroupId) return json(400, { error: 'itemId and agentGroupId are required' });
 
-  // §2a, first: an agent group outside the caller's ceiling is ABSENT. Before
-  // any lookup that could time-differ, and never a 403.
+  // An agent group outside the caller's ceiling is ABSENT, checked before any lookup that could time-differ; never a
+  // 403.
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(agentGroupId)) {
     return json(404, { error: 'not_found' });
   }
 
   const now = Date.now();
   const itemId = naturalItemId(rawItemId);
-  // The stamped id is what `selectScopedAttentionItems` matches on, and the
-  // intersection with the caller's scope happens inside it — an unknown item
-  // and an out-of-scope one both come back as an empty list.
+  // Scope intersection happens inside; unknown and out-of-scope items both come back empty.
   const [item] = await selectScopedAttentionItems(
     ctx,
     {
@@ -193,8 +124,7 @@ export async function assignAttentionItem(
   );
   if (!item) return json(404, { error: 'not_found' });
 
-  // The SAME join that produced the row's `assignable_agents`. Re-derived, never
-  // trusted from the request.
+  // Re-derived, never trusted from the request.
   const wired = (await wiredAgentsByChannel()).get(item.channel_key) ?? [];
   const target = wired.find((a) => a.agent_group_id === agentGroupId) ?? null;
 
@@ -203,8 +133,7 @@ export async function assignAttentionItem(
     channelKey: item.channel_key,
     wiredToItemChannel: target !== null,
   };
-  // Under the central lease: `guard()`'s reads are raw by design (seam 3
-  // §4.5 I-1).
+  // Under the central lease: `guard()`'s reads are raw by design.
   const decision = await withCentralSync(
     () =>
       guard(observatoryAssign, {
@@ -215,11 +144,8 @@ export async function assignAttentionItem(
     'observatory assign guard',
   );
   if (decision.effect !== 'allow') {
-    // Two refusals that must not look alike. "Not wired to this room" is a
-    // state the operator can act on — pick a different agent — and the row
-    // already told them which agents those are. Everything else (no privilege
-    // here) collapses to §2a's absence so the surface never discloses that an
-    // agent group exists.
+    // "Not wired to this room" is actionable and reported; any other refusal collapses to absence so the surface
+    // never discloses that an agent group exists.
     if (!target) {
       return json(409, { error: 'agent_not_wired_to_channel', channel: item.channel_key });
     }
@@ -235,16 +161,12 @@ export async function assignAttentionItem(
   const agent = await getAgentGroup(agentGroupId);
   if (!agent) return json(404, { error: 'not_found' });
 
-  // RESERVE BEFORE DISPATCH. A losing double-click fails here, having queued
-  // nothing — a record written after its side effect cannot prevent the side
-  // effect happening twice.
+  // RESERVE BEFORE DISPATCH: a losing double-click fails here having queued nothing.
   if (!(await reserveItemAssignment(item.workgroupId, itemId, agentGroupId, ctx.user.id, now, ASSIGN_DEDUPE_MS))) {
     return json(409, { error: 'already_assigned' });
   }
 
-  // Composed entirely from board fields — nothing client-authored reaches the
-  // prompt. The claim is the fleet's real ownership record; the item's own
-  // source stays its author's file and picks the new owner up from the claim.
+  // Nothing client-authored reaches the prompt. The claim is the fleet's real ownership record.
   const slug = claimSlug(itemId);
   const who = ctx.user.display_name ?? ctx.user.id;
   const prompt =
@@ -281,8 +203,6 @@ export async function assignAttentionItem(
     return json(502, { error: 'task_create_failed' });
   }
 
-  // `getMessagingGroup` stays synchronous forever (seam 3 §4.2 — it is called
-  // from inside raw transaction closures elsewhere); no await here.
   const room = await getMessagingGroup(target!.messaging_group_id);
   const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;
   log.info('observatory assign', {
@@ -296,11 +216,10 @@ export async function assignAttentionItem(
     ok: true,
     seriesId,
     channel: room?.name ?? item.channel_key,
-    // The name the room knows this agent by, not the infrastructure one — the
-    // confirmation should echo the agent the operator actually picked.
+    // The name the room knows this agent by.
     agent: await personaName(agent),
     channelUrl: room ? roomPermalink(room.channel_type, room.platform_id) : null,
-    // Sweep admits within ~60s, plus container boot. Deliberately coarse.
+    // Sweep admission (~60s) plus container boot. Deliberately coarse.
     etaSeconds: 120,
   });
 }
