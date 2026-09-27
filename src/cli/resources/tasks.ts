@@ -41,10 +41,9 @@ import type { CallerContext } from '../frame.js';
 
 type TaskStatus = 'pending' | 'paused';
 
-/** The board row shape is the mailbox module's — this file no longer selects it. */
 type TaskRow = CliTaskRow;
 
-/** Routing a task series posts to on fire; all-null means unaddressed output is discarded. */
+/** All-null means unaddressed output is discarded. */
 interface TaskRouting {
   platformId: string | null;
   channelType: string | null;
@@ -63,25 +62,9 @@ function str(value: unknown): string | undefined {
 }
 
 /**
- * Read a flag the caller SUPPLIED, refusing a value that is not usable.
- *
- * `str()` collapses "absent" and "supplied but empty" into `undefined`. That
- * is the right answer when reading an optional value and the wrong one for the
- * scope guards below, which branch on presence: `--session "$SESS"` with an
- * unset variable arrives as `session: ''` (parse-argv.ts keeps it), and a
- * presence test built on `str()` reads that as absent and skips — failing open
- * on exactly the input that makes the mistake likely, and doing it to a script
- * silently, every run. That is this file's own class one level down: the guard
- * drops an input the caller cannot see.
- *
- * The empty string is the shape that gets here, because `''` is a valid string
- * and passes argument validation. The value-less `--session` shape does not:
- * it parses to `true` and `validateArgs` already rejects it with "--session
- * requires a value". The non-string branch below is therefore
- * defence in depth for callers that bypass validation, not a live hole.
- *
- * No flag guarded here has an empty string as a meaningful value, so refusing
- * one rejects nothing legitimate.
+ * Reads a flag the caller SUPPLIED, refusing an unusable value. `str()` collapses "absent" and "supplied empty" into
+ * `undefined`, so a presence guard built on it fails OPEN on `--session "$UNSET"` (which arrives as `''`). No guarded
+ * flag has a meaningful empty value.
  */
 function suppliedFlag(args: Record<string, unknown>, key: string, cliName: string): string | undefined {
   if (args[key] === undefined) return undefined;
@@ -97,12 +80,8 @@ function bool(value: unknown): boolean {
 }
 
 /**
- * scheduled_audit actor string — the best identity CallerContext actually
- * carries. Neither transport threads a human user_id through to the CLI
- * dispatch layer (the host socket's auth boundary is the 0600 socket file
- * itself, socket-server.ts; an agent caller is identified by its own group),
- * so unlike the dashboard's `ctx.user.id`, "host" and "agent:<group>" are all
- * that's available here — never invented.
+ * The best identity CallerContext carries: neither transport threads a human user id through, so it is "host" or
+ * "agent:<group>", never invented.
  */
 function actorFor(ctx: CallerContext): string {
   return ctx.caller === 'agent' ? `agent:${ctx.agentGroupId}` : 'host';
@@ -150,23 +129,10 @@ async function ownSession(sessionId: string, ctx: CallerContext): Promise<Scoped
 }
 
 /**
- * The one place every `ncl tasks` verb resolves its targets, so the scope
- * invariant lives here rather than in each of the eight callers.
- *
- * `--session` names a session by id and `--group` names the scope the operator
- * believes they are inside; a session id that is not in that scope means the
- * two disagree, and the command is not the one that was typed. Answering it
- * with the session's real group — `--group A --session <a session of B>` —
- * runs the verb against B: destructively for `cancel --all` and `delete`, as a
- * read leak for `list`/`get`. Rejecting is the only reading that cannot be
- * wrong, since either flag alone already expresses whichever one was meant.
- *
- * Agent callers never reach this check: `groupArg` pins them to their own
- * group, so `ownSession` above has already answered "session not found" for
- * anything outside it — deliberately refusing to confirm the id exists
- * elsewhere. Naming both groups here is a host-caller affordance, and the host
- * caller is unrestricted by construction, so it reveals nothing it could not
- * already read.
+ * The one place every `ncl tasks` verb resolves targets. A `--session` outside `--group` means the two disagree, and
+ * answering with the session's real group would run the verb (destructively, or as a read leak) against a group the
+ * operator did not name, so it is refused. Agent callers never reach this: `groupArg` pins them to their own group,
+ * and `ownSession` answers "not found" without confirming the id exists elsewhere.
  */
 async function selectedSessions(args: Record<string, unknown>, ctx: CallerContext): Promise<ScopedSession[]> {
   const sessionId = suppliedFlag(args, 'session', '--session');
@@ -191,49 +157,20 @@ async function selectedSessions(args: Record<string, unknown>, ctx: CallerContex
   return (await getActiveSessions()).map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
 }
 
-/**
- * Run one CLI operation against a task session's mailbox.
- *
- * Existing-only (invariant I-10): `ncl tasks` fans out across every session
- * the caller can see, and listing or mutating one must never be what creates
- * a mailbox. `undefined` is "this session has none", which every call site
- * below already treats as "nothing here".
- */
+/** Existing-only: listing or mutating must never create a mailbox. `undefined` means this session has none. */
 function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSession) => T): Promise<T | undefined> {
   return withExistingMailboxSession(session.agent_group_id, session.id, fn);
 }
 
 /**
- * ── Quiet-mark invalidation in this file: PROBE FIRST, then invalidate ──
- *
- * Every mutating command below writes due-ness straight into the session DB,
- * where the host sweep's quiet cache cannot see it, so each write runs inside
- * `withQuietInvalidationSync`: ONE fail-closed invalidation, then the statement,
- * in the same synchronous turn (see that helper — there is no second call and
- * none is owed). A swallowed central-DB failure would leave the row hidden
- * behind a mark nothing clears until `QUIET_SESSION_BACKOFF_MS` expires, past a
- * warmed restart, since the mark is persisted.
- *
- * The call goes INSIDE the mailbox action, after the action's own read, not
- * around `withInbound`. These commands fan out across every session the caller
- * can see (`selectedSessions`) and typically one holds the series, so wrapping
- * the open would charge N central-DB writes and N spurious sweeps for one
- * mutation — and would put the funnel's await between the invalidation and the
- * statement. Each site instead asks its already-open handle whether this session
- * holds the target row and returns 0 when it does not — no invalidation, no
- * write. `getCliTaskRow(id)` is the probe for the per-series verbs, and it is a
- * strict SUPERSET of what they can touch: it matches
- * `(id = ? OR series_id = ?) AND kind = 'task'` at any status, while
- * pause/resume/cancel/update/delete all add a status filter to that same
- * predicate (src/mailbox/sqlite/tasks.ts). A miss therefore proves the
- * write would match nothing. Cancel-all probes with `listCliTaskSeries()`,
- * whose pending/paused set is exactly what `cancelAllTasks` updates.
- *
- * Inside the action there is no `await` between the invalidation and the write,
- * so no sweep tick can interleave between them at all — which is exactly why
- * one invalidation is enough.
- *
- * Reads (`list`, `show`) never invalidate.
+ * Quiet-mark invalidation: PROBE FIRST, then invalidate. Every mutating verb writes due-ness straight into a session
+ * DB the sweep's quiet cache cannot see, so each write runs inside `withQuietInvalidationSync` (one fail-closed
+ * invalidation, then the statement, same synchronous turn).
+ * The call sits INSIDE the mailbox action, after its own read, not around `withInbound`: verbs fan out across
+ * sessions and usually one holds the series, so wrapping the open would cost N invalidations and put an await between
+ * invalidation and write. `getCliTaskRow(id)` is the probe for per-series verbs and a strict SUPERSET of what they
+ * can touch (every verb adds a status filter to the same predicate), so a miss proves the write matches nothing.
+ * Cancel-all probes with `listCliTaskSeries()`, exactly the set it updates. Reads never invalidate.
  */
 
 function toOutput(session: ScopedSession, row: TaskRow) {
@@ -251,17 +188,14 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     has_script: content.script ? 1 : 0,
     script_host: content.scriptHost ? 1 : 0,
     thread_anchor: content.threadAnchor ? 1 : 0,
-    // Each fire starts fresh unless --continuous or a dispatch event (modules/scheduling/fresh-context.ts).
     context: taskFiresFresh(row.content) ? 'fresh' : 'continuous',
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
-    // The per-fire pin, EXACTLY as stored. Until this landed, `ncl tasks` had
-    // no way to show an operator what a series was pinned to — which is half
-    // of why a stranded `gpt-6-astra` pin survived 21 failed fires unnoticed.
+    // The per-fire pin exactly as stored.
     model_pin: pin.model,
     effort_pin: pin.effort,
     created_at: row.timestamp,
     tries: row.tries,
-    // Where an unaddressed reply lands on fire; null = discarded (isolated).
+    // Null means discarded (isolated).
     routed: row.platform_id
       ? { channel_type: row.channel_type, platform_id: row.platform_id, thread_id: row.thread_id }
       : null,
@@ -275,17 +209,10 @@ function taskId(args: Record<string, unknown>): string {
 }
 
 /**
- * Resolve the routing a new task series stamps, host-authoritatively.
- *
- * Agent callers derive routing from their OWN session (never agent-supplied
- * ids — the cross-tenant leak class actions.ts's header warns about): default
- * stamps the session's channel (thread null); `--thread` additionally binds
- * the session's own thread (falls back to channel-only, with a note, if the
- * caller isn't a thread session); `--isolated` or a session with no
- * messaging group stamps nothing. `--messaging-group`/`--thread-id` are
- * host-only raw stamps and are rejected outright from an agent caller.
- *
- * Host callers get no implicit stamp — routing only via the host-only flags.
+ * Agent callers derive routing from their OWN session, never agent-supplied ids: default stamps the session's
+ * channel, `--thread` also its thread (falling back to channel-only with a note), `--isolated` or no messaging group
+ * stamps nothing. `--messaging-group`/`--thread-id` are host-only raw stamps, rejected from agents. Host callers get
+ * no implicit stamp.
  */
 async function resolveTaskRouting(
   args: Record<string, unknown>,
@@ -320,7 +247,6 @@ async function resolveTaskRouting(
     return { routing: { platformId: mg.platform_id, channelType: mg.channel_type, threadId: null } };
   }
 
-  // Host caller: no implicit stamp — routing only via the explicit flags below.
   if (threadIdArg !== undefined && messagingGroupArg === undefined) {
     throw new Error('--thread-id requires --messaging-group');
   }
@@ -339,15 +265,12 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const script = normalizeNullableString(args.script) ?? null;
   const scriptHost = bool(args.script_host);
   if (scriptHost && !script) throw new Error('--script-host requires --script');
-  // Host execution is opt-in by a HOST OPERATOR only. The host-side classifier
-  // (classifyForHostExecution) is a regex subset, not a sandbox — for
-  // agent-authored script text the trust boundary has to be who set the flag,
-  // not what the script looks like.
+  // Only a HOST OPERATOR may opt into host execution: the host-side classifier is a regex subset, not a sandbox, so
+  // for agent-authored script text the trust boundary is who set the flag.
   if (scriptHost && ctx.caller === 'agent') {
     throw new Error('--script-host runs the script on the host and can only be set by a host operator');
   }
-  // Wall-clock fields (--process-after, the cron grid) are interpreted in the
-  // owning group's timezone, not the install's.
+  // Wall-clock fields are interpreted in the owning group's timezone.
   const tz = await resolveGroupTimezone(group);
   validateRecurrence(recurrence, tz);
   enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), script != null, tz);
@@ -361,13 +284,8 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   );
   if (flagError) throw new Error(flagError);
 
-  // Each series runs in its own isolated session. Delivery and run-log
-  // instructions come from the runtime system prompt, not persisted prompt
-  // suffixes; the formatter strips old generated suffixes for compatibility.
-  // `routing.platformId` is stamped onto the session as well as the task row:
-  // same value, two readers. The row is what the fire path uses; the session
-  // column is what the console reads to place a task in the channel it is
-  // routed to (migration 056). NO_ROUTING passes null and stamps nothing.
+  // `routing.platformId` is stamped on the session as well as the task row: the row drives the fire path, the session
+  // column places the task in the console (migration 056).
   const { session } = await resolveTaskSession(group, id, routing.platformId);
 
   const created = await withInbound(session, (mailbox) =>
@@ -389,16 +307,11 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
               ...(args.thread_anchor !== undefined && !bool(args.thread_anchor) ? { threadAnchor: false } : {}),
               originSessionId,
               ...(flagIntent && (flagIntent.turnModel || flagIntent.turnEffort) ? { flagIntent } : {}),
-              // Physical send suppression, enforced by the agent-runner: chat-kind
-              // outbound writes are dropped for tasks carrying muteChat.
+              // Enforced by the agent-runner: chat-kind outbound writes are dropped.
               ...(bool(args.mute_chat) ? { muteChat: true } : {}),
-              // Streaming status is useful interactively but noisy for scheduled
-              // orchestrators that publish one consolidated channel message.
               ...(bool(args.quiet_status) ? { quietStatus: true } : {}),
-              // Fires resume one conversation instead of starting fresh (modules/scheduling/fresh-context.ts).
               ...(bool(args.continuous) ? { continuous: true } : {}),
-              // Per-turn chat send budget (e.g. 1 for a standup whose contract is
-              // one digest post — trailing work-log messages get dropped).
+              // Per-turn chat send budget.
               ...(chatLimitArg(args) !== undefined ? { chatLimit: chatLimitArg(args) } : {}),
             }),
           });
@@ -435,7 +348,7 @@ async function dispatchTask(args: Record<string, unknown>, ctx: CallerContext) {
   const prompt = str(args.prompt);
   if (!prompt?.trim() || prompt.length > 64_000) throw new Error('--prompt must contain 1–64000 characters');
   const { routing, note } = await resolveTaskRouting(args, ctx);
-  // Resolve without re-stamping: a colliding replay must not mutate the existing route.
+  // A colliding replay must not mutate the existing route, so no re-stamp.
   const { session } = await resolveTaskSession(group, dispatchSeriesId(contextKey));
   const admitted = await withInbound(session, (mailbox) =>
     withCentralSync(
@@ -499,11 +412,7 @@ async function appendTaskLog(
   let group = groupArg(args, ctx);
   if (!series && ctx.caller === 'agent' && ctx.sessionId) {
     const sess = await getSession(ctx.sessionId);
-    // `taskSeriesId` returns null for the bare
-    // `system:tasks` an upgraded install may still hold; the old slice returned
-    // `''` there, which fell through to the `--id is required` error below only
-    // by accident of being falsy. Being explicit keeps that behaviour when the
-    // shape changes.
+    // Null for a bare legacy `system:tasks`, which then fails the `--id is required` check below.
     const derived = taskSeriesId(sess?.thread_id ?? null);
     if (sess && derived !== null) {
       series = derived;
@@ -529,9 +438,7 @@ function seriesStats(
   mailbox: NanoclawMailboxSession,
   seriesKey: string,
 ): { runs: number; last_run: string | null; failed_runs: number } {
-  // Upstream's own op, not a fork copy of the same SELECT (invariant I-2). It
-  // normalizes `lastRun` through Date.parse, which is a no-op for the ISO
-  // timestamps this fork writes and repairs a naive legacy one.
+  // Upstream's own op (invariant I-2).
   const stats = mailbox.getTaskStats(seriesKey);
   return { runs: stats.runs, last_run: stats.lastRun, failed_runs: stats.failedRuns };
 }
@@ -611,9 +518,7 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
       };
     });
     if (found) {
-      // Read after the mailbox action: the log lives on disk and its lookup
-      // goes through the async agent-groups leaf, so it cannot sit inside
-      // the synchronous callback.
+      // Read after the mailbox action: the log lookup is async and cannot sit inside the synchronous callback.
       const { seriesKey, ...output } = found;
       return { ...output, recent_log: await tailRunLog(session.agent_group_id, seriesKey) };
     }
@@ -633,17 +538,13 @@ async function mutateTask(
     const n =
       (await withInbound(session, (mailbox) =>
         withCentralSync(() => {
-          // Probe (see the seam note above): no task row for this id/series here
-          // means every verb's UPDATE/DELETE matches nothing, so this session is
-          // owed neither a write nor an invalidation.
+          // Probe first (see the invalidation note above).
           if (!mailbox.getCliTaskRow(id)) return 0;
           return withQuietInvalidationSync(session.id, () => fn(mailbox, id));
         }, `ncl tasks ${action}`),
       )) ?? 0;
     if (n > 0) {
-      // No before/after body: pause/resume/delete/cancel don't touch the
-      // prompt, matching the dashboard's own pause/resume/cancel audit rows
-      // (scheduled-mutations.ts) — a status-only change is the "after" here.
+      // No body before/after: these verbs change status only, matching the dashboard's audit rows.
       await writeAudit({
         actor: actorFor(ctx),
         action,
@@ -670,12 +571,8 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   const id = taskId(args);
   const update: TaskUpdate = {};
   if (typeof args.prompt === 'string') {
-    // `create` refuses an empty prompt (`--prompt is required`); `update` must
-    // too. A shell substitution over a missing file (`--prompt "$(cat gone.md)"`)
-    // otherwise blanks a live series in place, and every later occurrence wakes
-    // the agent with no instruction at all — a recurring series quietly turns
-    // into a recurring no-op that still burns a container spawn. Whitespace is
-    // treated as empty for the same reason `create` does.
+    // An empty prompt is refused as in `create`: `--prompt "$(cat missing.md)"` would otherwise blank a live series
+    // into a recurring no-op that still spawns a container.
     if (!args.prompt.trim()) throw new Error('--prompt must not be empty; omit it to keep the current prompt');
     update.prompt = args.prompt;
   }
@@ -685,27 +582,10 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   const recurrence = normalizeNullableString(args.recurrence);
   const script = normalizeNullableString(args.script);
 
-  // An unscoped host `tasks update` fans out across every active session,
-  // which can span groups with different timezone overrides. There is no
-  // representative zone here: the persisted instant differs per group, and so
-  // does the recurrence ceiling, which counts fires in a rolling 24h window —
-  // a cron whose fires cluster on one weekday can be past that window in one
-  // zone and still inside it in another. So EVERY matched session validates in
-  // its own zone, and all of that happens before the first write.
-  //
-  // codex: getCliTaskRow() prioritizes a live row but falls back to terminal
-  // (completed/cancelled) history when a session has none — right for getTask
-  // and the audit before/after lookups below, which want that history, but
-  // WRONG here: updateTask() only ever mutates pending/paused rows, so a
-  // terminal row can never be one of the writes this validates for. Left
-  // unfiltered, a live series edited in one session can be rejected by a
-  // same-id terminal row's stale script/timezone in a different one. Require
-  // live status at the one place `matched` is built, rather than in
-  // getCliTaskRow() itself, which other callers rely on for terminal history.
-  //
-  // Sequential, not a `Promise.all` fan-out: each iteration opens one
-  // session's mailbox and closes it before the next, exactly as the raw open
-  // this replaced did.
+  // An unscoped host update can span groups with different timezones, and both the persisted instant and the 24h
+  // recurrence ceiling depend on the zone, so EVERY matched session validates in its own zone before the first write.
+  // Only live rows count: `getCliTaskRow()` falls back to terminal history, which `updateTask()` never writes, and a
+  // same-id terminal row elsewhere must not veto the edit. Sequential so only one mailbox is open at a time.
   const matched: { session: ScopedSession; row: TaskRow }[] = [];
   for (const session of await selectedSessions(args, ctx)) {
     const row = await withInbound(session, (mailbox) => mailbox.getCliTaskRow(id));
@@ -715,16 +595,14 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   const validationZones =
     matched.length > 0
       ? matched.map((m) => ({ tz: resolveGroupTimezone(m.session.agent_group_id), row: m.row }))
-      : // Nothing matched: still validate the input shape so a typo is reported
-        // as one, rather than as "no live task matched".
+      : // Nothing matched: still validate the input so a typo is reported as one.
         [{ tz: TIMEZONE, row: undefined }];
 
   for (const { tz, row } of validationZones) {
     if (args.process_after !== undefined) parseProcessAfter(args.process_after, await tz);
     if (recurrence !== undefined) {
       validateRecurrence(recurrence, await tz);
-      // Effective script AFTER this update: the new value when provided
-      // (including an explicit clear), else whatever THIS task already has.
+      // The effective script AFTER this update, including an explicit clear.
       const scriptAfter: string | null =
         script !== undefined ? script : row ? parseTaskContent(row.content).script : null;
       enforceRecurrenceLimit(
@@ -737,9 +615,8 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   }
   if (recurrence !== undefined) update.recurrence = recurrence;
 
-  // A new cron with the old armed timestamp fires off the new grid (or a day
-  // late). Unless the caller pinned --process-after explicitly, re-derive the
-  // next fire from the new expression — in the receiving group's zone.
+  // A new cron with the old armed timestamp fires off the new grid, so unless `--process-after` is pinned the next
+  // fire is re-derived in the receiving group's zone.
   const rearmFromCron = recurrence !== undefined && recurrence !== null && args.process_after === undefined;
   const hasWallClockUpdate = args.process_after !== undefined || rearmFromCron;
 
@@ -751,40 +628,23 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   if (script !== undefined) update.script = script;
   if (args.script_host !== undefined) {
     const scriptHost = bool(args.script_host);
-    // Same trust boundary as createTask: agents may clear the flag (execution
-    // moves back to the container — strictly safer) but never set it.
+    // Agents may clear the flag (strictly safer) but never set it.
     if (scriptHost && ctx.caller === 'agent') {
       throw new Error('--script-host runs the script on the host and can only be set by a host operator');
     }
-    // ponytail: only catches the same-call clear (--script-host true --script none);
-    // a scriptHost=true call that leaves an already-scriptless task alone is a
-    // silent no-op in host-script.ts rather than a hard error — narrower check,
-    // add the existing-row lookup (mirrors the scriptAfter derivation above) if
-    // that gap ever bites in practice.
+    // Only catches the same-call clear; setting scriptHost on an already-scriptless task is a silent no-op in
+    // host-script.ts.
     if (scriptHost && script === null) throw new Error('--script-host requires --script');
     update.scriptHost = scriptHost;
   }
   if (args.thread_anchor !== undefined) update.threadAnchor = bool(args.thread_anchor);
-  // `--model ""` CLEARS the per-fire pin, the same spelling `groups config
-  // update` uses for a group pin, plus this verb's own
-  // `"null"`/`"none"` clear words (`--script`, `--recurrence`). `str()` is
-  // wrong here for the reason `suppliedFlag` exists one way up: it collapses
-  // "absent" and "supplied empty" into `undefined`, and on THIS flag the empty
-  // string is the whole request. Until this landed there was no spelling at
-  // all — `--model ""` reported "nothing to update" and `--model null` came
-  // back "unknown model: null", so the only way off a pin was another pin.
+  // `--model ""` (or this verb's `null`/`none`) CLEARS the per-fire pin. `str()` would collapse the empty string,
+  // which on this flag is the whole request.
   const model = normalizeNullableString(args.model);
   const effort = normalizeNullableString(args.effort);
   if (model !== undefined || effort !== undefined) {
-    // `--group` is required for a CLEAR too, not only for a set. A set needs it
-    // to resolve the provider vocabulary; a clear needs it for SCOPE, which is
-    // the separate reason and the one that bites harder. Series ids are unique
-    // within an agent group, not fleet-wide,
-    // and an unscoped `tasks update --id X` falls back to every active session
-    // (`selectedSessions` below) — so an unscoped clear could silently unpin a
-    // same-named series in another group and report success. Exempting clears
-    // from the requirement (an earlier draft of this change) would have been a
-    // new way to touch a group the operator never named.
+    // `--group` is required for a clear too: series ids are unique per group, not fleet-wide, so an unscoped clear
+    // could silently unpin a same-named series in another group.
     const group = groupArg(args, ctx);
     if (!group) throw new Error('--group is required to set or clear --model/--effort');
     if (model || effort) {
@@ -796,38 +656,29 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
       if (flagIntent?.turnModel) update.flagIntent = { ...update.flagIntent, turnModel: flagIntent.turnModel };
       if (flagIntent?.turnEffort) update.flagIntent = { ...update.flagIntent, turnEffort: flagIntent.turnEffort };
     }
-    // Clears are applied AFTER the validated sets, and independently: a single
-    // call may clear one axis while setting the other.
+    // Clears apply after the validated sets and independently, so one call may clear one axis and set the other.
     if (model === null) update.flagIntent = { ...update.flagIntent, turnModel: null };
     if (effort === null) update.flagIntent = { ...update.flagIntent, turnEffort: null };
   }
-  // `wallClockUpdate` contributes exactly one key when it contributes any, so
-  // the reported field list is the same for every session even though the
-  // instant behind `processAfter` differs per group.
+  // `wallClockUpdate` adds exactly one key, so the reported field list is the same for every session even though the
+  // instant differs.
   const fields = hasWallClockUpdate ? [...Object.keys(update), 'processAfter'] : Object.keys(update);
   if (fields.length === 0) throw new Error('nothing to update');
 
   let touched = 0;
   for (const { session } of matched) {
-    // One value per session, and the ONLY one: what gets written is what gets
-    // audited and what gets reported. Merging the per-session part at the
-    // `updateTask` call while the audit kept reading the pre-merge object is
-    // how a schedule-only update wrote a new instant and recorded nothing.
-    // The group's zone is the one central read this write needs; resolved
-    // BEFORE the session opens so the block below stays synchronous from its
-    // row read to its write.
+    // One value per session, and the only one: what is written is what is audited and reported (merging per-session
+    // parts only at the write once audited nothing). The zone is resolved before the session opens so the block stays
+    // synchronous from row read to write.
     const tz = await resolveGroupTimezone(session.agent_group_id);
     const sessionUpdate: TaskUpdate = { ...update, ...wallClockUpdate(tz) };
     const result = await withInbound(session, (mailbox) =>
       withCentralSync(() => {
         const before = mailbox.getCliTaskRow(id);
-        // The probe is free here: `before` is the same superset read the seam
-        // note describes, and `updateTask` narrows it further still.
+        // `before` doubles as the probe.
         if (!before) return { before, n: 0 };
-        // Close the indirect path to host execution: an agent swapping the
-        // script text on a series a host operator flagged scriptHost would get
-        // its own script run on the host next fire. Unless the same call also
-        // clears the flag, reject.
+        // An agent swapping the script on a host-flagged series would get its own script run on the host, so it is
+        // rejected unless the same call clears the flag.
         if (
           ctx.caller === 'agent' &&
           sessionUpdate.script !== undefined &&
@@ -837,18 +688,10 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         ) {
           throw new Error('this series runs its script on the host — an operator must make script changes');
         }
-        // The recurrence ceiling is enforced AGAIN, here, against the row this
-        // write will actually land on. The pre-pass above validates the input
-        // shape and reports a typo before the first write — that part has to
-        // stay ahead of the loop — but its script exemption was decided from a
-        // row read in an EARLIER mailbox pass. Opening a mailbox yields, so
-        // between the two passes another caller can clear the script that
-        // exempted a `*/5 * * * *`, and the high-frequency recurrence lands on a
-        // now-scriptless series. Re-deciding from `before`, with nothing awaited
-        // between the read and the write, is what ties the exemption to the row
-        // it exempts. The inverse ordering is covered too: a change that became
-        // valid while this call was in flight is no longer rejected on a stale
-        // read.
+        // The recurrence ceiling is enforced AGAIN against the row this write lands on: the pre-pass decided the
+        // script exemption from an earlier mailbox read, and opening a mailbox yields, so another caller may have
+        // cleared that script in between. Deciding from `before`, with nothing awaited before the write, ties the
+        // exemption to its row.
         if (recurrence !== undefined) {
           const scriptNow: string | null =
             script !== undefined ? script : before ? parseTaskContent(before.content).script : null;
@@ -875,20 +718,13 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         detail: {
           ...(sessionUpdate.recurrence !== undefined ? { recurrence: sessionUpdate.recurrence } : {}),
           ...(sessionUpdate.processAfter !== undefined ? { processAfter: sessionUpdate.processAfter } : {}),
-          // The pin, from and to. A CLEAR is the reason this is not optional:
-          // it is the one pin edit that destroys a value rather than replacing
-          // it, so without the `from` half neither the row nor the trail can
-          // say what the series used to be pinned to, and a clear run by
-          // mistake — `--model "$MODEL"` with MODEL unset arrives as `""` and
-          // now means "clear" — has no way back. `repin` already records
-          // `detail.repin.from/to`; the same pin change was audited through one
-          // verb and not the other.
+          // Records the pin from and to. A clear destroys a value (and `--model "$UNSET"` now means clear), so
+          // without `from` nothing could say what the series was pinned to.
           ...(sessionUpdate.flagIntent !== undefined
             ? {
                 pin: {
                   from: before ? parseTaskPin(before.content) : null,
-                  // What `updateTask` will have MERGED, not the delta: an
-                  // untouched axis keeps its old value, and a null axis is gone.
+                  // The MERGED result, not the delta: an untouched axis keeps its value.
                   to: {
                     model:
                       sessionUpdate.flagIntent.turnModel === undefined
@@ -920,12 +756,8 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     return mutateTask(args, ctx, 'cancel', (mailbox, id) => mailbox.cancelTask(id));
   }
 
-  // The same contradiction as --group/--session above, on the other axis:
-  // `--id` names one series and `--all` names every live one in scope, and the
-  // kill switch used to win silently by never reading `--id` at all. So
-  // `cancel --id nightly-digest --all` cancelled the whole group's tasks while
-  // the operator had named exactly one. The flag's own help already says "omit
-  // with --all" — this enforces what it documents instead of assuming it.
+  // `--id` with `--all` is a contradiction (one series versus every series), refused rather than letting the kill
+  // switch silently win.
   const named = suppliedFlag(args, 'id', '--id');
   if (named) {
     throw new Error(
@@ -939,11 +771,9 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     const result = await withInbound(session, (mailbox) =>
       withCentralSync(() => {
         const seriesIds = mailbox.listCliTaskSeries().map((r) => r.series_id ?? r.row_id);
-        // The listing is the probe: `listCliTaskSeries()` returns the
-        // pending/paused set, which is exactly what cancel-all updates.
+        // The listing is the probe: exactly the pending/paused set cancel-all updates.
         if (seriesIds.length === 0) return { seriesIds, n: 0 };
-        // Upstream's `cancelTask()` with no id IS cancel-all; there is one
-        // statement behind both names (invariant I-2).
+        // Upstream's `cancelTask()` with no id IS cancel-all (invariant I-2).
         return { seriesIds, n: withQuietInvalidationSync(session.id, () => mailbox.cancelTask()) };
       }, 'ncl tasks cancel-all'),
     );
@@ -966,9 +796,8 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 }
 
 /**
- * Move exactly one task series through the dashboard's hardened transaction.
- * A task move changes its execution identity, so unlike ordinary task verbs it
- * never fans out and is available only through the host's 0600 ncl socket.
+ * Moves one series through the dashboard's hardened transaction. A move changes execution identity, so it never fans
+ * out and is host-only (0600 socket).
  */
 async function moveTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   if (ctx.caller !== 'host') throw new Error('tasks move is operator-only');
@@ -1002,14 +831,12 @@ async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext)
     const fired = await withInbound(session, (mailbox) =>
       withCentralSync(() => {
         const row = mailbox.getCliTaskRow(id);
-        // The probe is free here too — no row, no fire, no invalidation.
+        // No row, no fire, no invalidation.
         if (!row) return undefined;
         const seriesKey = row.series_id ?? row.row_id;
         const rowId = makeTaskId(`${seriesKey}-run`);
-        // recurrence=NULL is load-bearing: a run-now row must not be re-armed by
-        // handleRecurrence into a phantom series. Routing carries forward from
-        // the source row — an on-demand fire reports to the same destination
-        // the series is wired to.
+        // recurrence=NULL is load-bearing: handleRecurrence must not re-arm a run-now row into a phantom series.
+        // Routing carries over from the source row.
         withQuietInvalidationSync(session.id, () =>
           mailbox.insertTaskRow({
             id: rowId,
@@ -1040,44 +867,25 @@ async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext)
 }
 
 /**
- * `ncl tasks repin` — retarget per-fire pins in bulk.
- *
- * The operator case is "a new model shipped; move everything pinned to the old
- * one" and, harder, "I am migrating this group's provider and every pin has to
- * move first". The second is why `--target-provider` exists: a pin is
- * validated against the group's CURRENT provider, so re-pinning a codex group's
- * tasks to a claude model ahead of the switch would be rejected by the very
- * check that is supposed to protect them. `--target-provider` says "validate
- * against the provider this group is about to become".
- *
- * MATCHING IS LITERAL by default. The fleet stores both `sonnet` (family alias
- * — deliberately tracks the install default across future bumps) and
- * `claude-sonnet-5` (frozen id) as pins for the same intent, and rewriting the
- * first is not the same act as rewriting the second: it converts a floating
- * choice into a frozen one. So `--from-model sonnet` hits only the literal
- * `sonnet` pins, `--match-resolved` unifies the two, and either way the report
- * lists the near-misses (same resolved model, different literal pin) so a
- * conservative default can never read as "there was nothing else".
- *
- * ALL-OR-NOTHING by default: every match is validated before the first write,
- * and one invalid target aborts the whole run rather than leaving half the
- * fleet re-pinned. `--skip-invalid` applies the valid subset instead.
+ * `ncl tasks repin`: retarget per-fire pins in bulk. `--target-provider` validates against the provider a group is
+ * ABOUT to become, since re-pinning ahead of a provider switch would otherwise be rejected by the current provider's
+ * check.
+ * MATCHING IS LITERAL by default: `sonnet` (a floating family alias) and `claude-sonnet-5` (frozen) are different
+ * pins, and rewriting the first freezes it. `--match-resolved` unifies them, and near-misses are always reported so a
+ * literal run never looks exhaustive.
+ * ALL-OR-NOTHING validation by default; `--skip-invalid` applies the valid subset.
  */
 interface RepinCandidate {
   session: ScopedSession;
   seriesId: string;
   status: string;
   current: { model: string | null; effort: string | null };
-  /** What the operator asked for, verbatim — may be an alias (`astra`). */
+  /** Verbatim; may be an alias. */
   next: { model?: string; effort?: string };
   /**
-   * What actually gets written: the validator's RESOLVED values, for the axes
-   * the operator set. Filled during validation, because the resolution and the
-   * acceptance are one act — `astra` is accepted only BECAUSE it resolves to
-   * `gpt-6-astra`, so storing the raw alias would persist a value the check
-   * never approved. `codex.ts::resolveQueryModel` accepts only `gpt-*` and
-   * silently falls back otherwise, which is a wrong-model-forever fire with no
-   * error anywhere.
+   * What is written: the validator's RESOLVED values for the axes the operator set. Acceptance and resolution are one
+   * act, so storing the raw alias would persist a value the check never approved (and `codex.ts::resolveQueryModel`
+   * silently falls back on a non-`gpt-*` value).
    */
   write: { model?: string; effort?: string };
   matchedVia: 'literal' | 'resolved';
@@ -1090,21 +898,12 @@ interface RepinRejection {
 }
 
 /**
- * Does a stored pin match what the operator asked to move?
- *
- * `normalize` is applied UNCONDITIONALLY and is where an axis declares what
- * counts as the same value written differently; `resolver` is the semantic
- * widening that `--match-resolved` gates. The two are different questions:
- * `XHIGH` and `xhigh` are one effort spelled two ways, while `sonnet` and
- * `claude-sonnet-5` are two DIFFERENT pins that happen to resolve alike — the
- * first tracks the install default across bumps, the second freezes it.
+ * `normalize` always applies (same value spelled differently, e.g. effort case); `resolver` is the semantic widening
+ * `--match-resolved` gates (two pins that resolve alike are still different pins).
  */
 /**
- * Model resolution for MATCHING, in the vocabulary of the group whose task is
- * being matched. The vocabulary normalizes provider spellings first (a Codex
- * dot form like `gpt6-astra`, lowercasing), then `resolveEffectiveModel`
- * expands family names of either provider (`opus`, `fable`, `astra`), so `--from-model astra --match-resolved` also
- * finds a codex pin stored as `gpt-6-astra`.
+ * In the vocabulary of the task's group: provider spellings normalize first, then family names expand, so `astra`
+ * also finds a codex pin stored as `gpt-6-astra`.
  */
 function modelResolverFor(provider: string): (v: string) => string {
   const vocab = vocabFor(provider);
@@ -1118,7 +917,7 @@ function pinMatches(
   resolver: (v: string) => string,
   matchResolved: boolean,
 ): 'literal' | 'resolved' | null {
-  if (wanted === undefined) return 'literal'; // no constraint on this axis
+  if (wanted === undefined) return 'literal'; // No constraint on this axis.
   if (stored === null) return null;
   if (normalize(stored) === normalize(wanted)) return 'literal';
   if (matchResolved && resolver(stored) === resolver(wanted)) return 'resolved';
@@ -1130,31 +929,18 @@ function modelLiteral(v: string): string {
   return v.trim();
 }
 
-/**
- * Effort has no alias layer and no case significance — `XHIGH` IS `xhigh`, so
- * matching it is normalization, not the semantic widening `--match-resolved`
- * gates. Documented as a case-insensitive compare; this is what makes that true.
- */
+/** Effort has no alias layer and no case significance, so this is normalization, not `--match-resolved` widening. */
 function effortIdentity(v: string): string {
   return v.trim().toLowerCase();
 }
 
 /**
- * The sessions a repin run walks.
- *
- * `--session` and `--group` defer to `selectedSessions` (which already narrows
- * a group to its task-system sessions). A fleet-wide run does NOT: the
- * unscoped `selectedSessions` fallback is every ACTIVE session on the host,
- * which is hundreds of mailbox opens for a handful of task rows, and mailbox
- * churn at that scale is a known way to stall the sweep. Every task series
- * lives in its own task-system session, so fanning out over `findTaskSessions`
- * per group reaches the same rows — and exactly the population `auditTaskPins`
- * reports, which is what makes the audit's suggested remedy actually apply.
+ * A fleet-wide run walks `findTaskSessions` per group, not the unscoped `selectedSessions` fallback: that is every
+ * active session (hundreds of mailbox opens, a known sweep staller), and task series live only in task sessions,
+ * which is also exactly what `auditTaskPins` reports.
  */
 async function repinSessions(args: Record<string, unknown>, ctx: CallerContext): Promise<ScopedSession[]> {
-  // The cross-group `--session` refusal lives in `selectedSessions` itself, so
-  // every caller inherits it — including this one. Deliberately NOT repeated
-  // here: a second copy of an invariant one layer down is how the two drift.
+  // The cross-group `--session` refusal lives in `selectedSessions`; do not duplicate it here.
   if (str(args.session) || groupArg(args, ctx)) return selectedSessions(args, ctx);
   const sessions: ScopedSession[] = [];
   for (const group of await getAllAgentGroups()) {
@@ -1164,40 +950,15 @@ async function repinSessions(args: Record<string, unknown>, ctx: CallerContext):
 }
 
 /**
- * ── CONTRADICTORY-INPUT REFUSALS ──
- *
- * One defect class, found five times in this file: TWO INPUTS THAT CANNOT BOTH
- * BE TRUE, RECONCILED BY SILENTLY CHOOSING ONE INSTEAD OF REFUSING. Silently
- * picking a winner is indefensible because BOTH readings are plausible to the
- * caller, so whichever the code drops was — half the time — the one that was
- * meant, and the command reports success either way.
- *
- * The two refusals below are the ones `repin` owns:
- *   `--target-provider` with `--all` — validated the whole fleet against one
- *     group's FUTURE provider, writing claude ids onto codex/opencode series;
- *   `--group` with `--all` — contradictory scopes, silently narrowed;
- *   `--all` with `--session` — `--all` says fleet-wide, `--session` says one
- *     session, and the session silently won.
- *
- * A sharper sub-shape, and the reason `suppliedFlag` is used below rather than
- * `str`: A GUARD DEFEATED BY ITS OWN PRESENCE TEST. `str('')` is `undefined`,
- * so `--group ""` read as "no group supplied" and the contradiction guards
- * never fired — silently widening a scoped repin to fleet-wide.
- *
- * The rest of the class lives elsewhere, deliberately not duplicated here:
- *   `--group A --session <B's>` — fixed in `selectedSessions`, which
- *     every verb in this file inherits, this one included;
- *   `cancel --id X --all` — dropped the id and cancelled everything in scope;
- *     owned by its own single-purpose change;
- *   `create --isolated --thread` — silently prefers `--isolated`. Documented,
- *     not patched: it is non-destructive and fails safe toward the NARROWER
- *     option, so refusing would cost more than it buys.
+ * CONTRADICTORY-INPUT REFUSALS. Two inputs that cannot both be true are refused, never reconciled by silently picking
+ * one: either reading is plausible, and the command reports success whichever was dropped. Owned here:
+ * `--target-provider` with `--all` (would validate the fleet against one group's future provider), `--group` with
+ * `--all`, and `--all` with `--session`. `suppliedFlag`, not `str`, is used because `--group ""` would otherwise read
+ * as absent and widen a scoped repin to fleet-wide.
+ * Elsewhere: `--group A --session <B's>` (`selectedSessions`) and `cancel --id X --all`. `create --isolated --thread`
+ * silently prefers `--isolated` by design: non-destructive and fails toward the narrower option.
  */
 async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
-  // `suppliedFlag`, not `str`: `str('')` is `undefined`, so an empty flag reads
-  // as ABSENT and skips the guard written to catch it. On this verb that fails
-  // OPEN — `--group "" --all` and `--all --session ""` both silently widen a
-  // scoped repin to fleet-wide. One helper, shared with every other verb here.
   const fromModel = suppliedFlag(args, 'from_model', '--from-model');
   const toModel = suppliedFlag(args, 'to_model', '--to-model');
   const fromEffort = suppliedFlag(args, 'from_effort', '--from-effort');
@@ -1222,19 +983,11 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
         '--session alone is already a complete scope.',
     );
   }
-  // Narrows the walk to ONE series inside the chosen scope. It is not itself a
-  // scope: the series id says nothing about which group owns it, so without
-  // --group/--session/--all the run would still fan out over every group on the
-  // host to find it. Requiring a scope alongside keeps that fan-out an explicit
-  // `--all`, the same bargain every other filter on this verb makes.
+  // Narrows the walk to one series inside the chosen scope; it is not a scope itself, so a scope is still required.
   const seriesId = suppliedFlag(args, 'series_id', '--series-id');
   const targetProvider = suppliedFlag(args, 'target_provider', '--target-provider');
-  // `--target-provider` describes ONE group's migration — it is the answer to
-  // "what will this group's provider be after the switch". Applied fleet-wide
-  // it validates every group against a provider only one of them is moving to,
-  // so `--all --target-provider claude` would write claude model ids onto codex
-  // and opencode series and report success: the exact stranded-pin condition
-  // this PR exists to prevent, manufactured by the tool built to remedy it.
+  // `--target-provider` describes ONE group's migration; fleet-wide it would write one provider's ids onto every
+  // other provider's series and report success.
   if (targetProvider && !group) {
     throw new Error(
       '--target-provider requires --group: it names the provider ONE group is migrating to, ' +
@@ -1245,25 +998,15 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
   const dryRun = bool(args.dry_run);
   const skipInvalid = bool(args.skip_invalid);
 
-  // One provider read per group, not per task: the fan-out below can span
-  // every group on the host and each lookup is a central-DB round trip.
-  // TWO providers, for two different questions, and conflating them broke both
-  // halves of a migration repin:
-  //
-  //   MATCHING asks "what vocabulary was this stored pin WRITTEN in" — always
-  //     the group's CURRENT provider. Resolving `astra` with claude's tables
-  //     because the group is moving to claude finds nothing, since the stored
-  //     value is `gpt-6-astra` in codex's.
-  //   VALIDATION asks "will the new value RUN" — the target provider when one
-  //     is given, because that is the whole point of re-pinning before a switch.
+  // One provider read per group, not per task. MATCHING uses the group's CURRENT provider (the vocabulary the stored
+  // pin was written in); VALIDATION uses the target provider when given (will the new value run). Conflating them
+  // broke both halves of a migration repin.
   const providerCache = new Map<string, string>();
   const currentProviderFor = async (agentGroupId: string): Promise<string> => {
     const cached = providerCache.get(agentGroupId);
     if (cached) return cached;
-    // Through the seam, not `getContainerConfig` directly: the projection can
-    // lag the authoritative file, and reading it here resolved aliases and
-    // validated replacements in the WRONG vocabulary — the same wrong-answer
-    // the migration audit had at its own call site.
+    // Through the seam, not `getContainerConfig`: the projection can lag the authoritative file and resolve in the
+    // wrong vocabulary.
     const resolved = await resolveGroupProvider(agentGroupId);
     providerCache.set(agentGroupId, resolved);
     return resolved;
@@ -1273,20 +1016,9 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
 
   const candidates: RepinCandidate[] = [];
   const nearMisses: Array<{ session_id: string; series_id: string; model: string | null; effort: string | null }> = [];
-  // WHERE `--series-id` was seen, not merely whether. Two questions ride on it:
-  //
-  //   NOT SEEN AT ALL — a typo'd or out-of-scope id is otherwise
-  //     indistinguishable from "that series is not pinned to --from-model":
-  //     both report zero matches, and the operator reads the second as the
-  //     first and moves on.
-  //   SEEN IN MORE THAN ONE SESSION — series ids are NOT globally unique. A
-  //     named task's id is `<slug>-<4hex>`,
-  //     so two groups that both run a task by the same name collide on a
-  //     1-in-65536 draw, and nothing anywhere prevents it — task-session lookup
-  //     scopes the id by agent group rather than assuming uniqueness.
-  //     Under `--all` a single `--series-id`
-  //     could therefore re-pin several series while the flag promised one.
-  //     Refused below, before any write, rather than silently repinning both.
+  // WHERE `--series-id` was seen, not just whether. Not seen: a typo would otherwise read as "not pinned to
+  // --from-model". Seen in several sessions: series ids are not globally unique (`<slug>-<4hex>`), so under `--all`
+  // one id could re-pin several series; refused before any write.
   const seriesSeenIn = new Set<string>();
 
   for (const session of await repinSessions(args, ctx)) {
@@ -1299,19 +1031,15 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
         })),
       )) ?? [];
     for (const row of rows) {
-      // A pure NARROWING filter, applied before matching: `--series-id` picks
-      // which series the --from-* filter is allowed to hit, it does not replace
-      // it. Repin's contract is "retarget an existing pin", and a run that
-      // skipped the from-check would be a blind overwrite of whatever that
-      // series currently carries — `tasks update --model` is the verb for that.
+      // A NARROWING filter only: the --from-* match still applies, since repin retargets an existing pin (`tasks
+      // update --model` is the blind overwrite).
       if (seriesId !== undefined && row.seriesId !== seriesId) continue;
       if (seriesId !== undefined) seriesSeenIn.add(`${session.agent_group_id}/${session.id}`);
       const resolveModel = modelResolverFor(await currentProviderFor(session.agent_group_id));
       const modelHit = pinMatches(row.pin.model, fromModel, modelLiteral, resolveModel, matchResolved);
       const effortHit = pinMatches(row.pin.effort, fromEffort, effortIdentity, effortIdentity, matchResolved);
       if (modelHit === null || effortHit === null) {
-        // Would this have matched if --match-resolved were on? Report it, so a
-        // conservative literal match never silently looks exhaustive.
+        // Would --match-resolved have matched? Reported so a literal match never silently looks exhaustive.
         const asResolvedModel = pinMatches(row.pin.model, fromModel, modelLiteral, resolveModel, true);
         const asResolvedEffort = pinMatches(row.pin.effort, fromEffort, effortIdentity, effortIdentity, true);
         if (!matchResolved && asResolvedModel !== null && asResolvedEffort !== null) {
@@ -1339,16 +1067,12 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
     }
   }
 
-  // Refuse rather than report an empty run: "no series with that id is in
-  // scope" and "that series is not pinned to --from-model" are different
-  // answers, and only one of them means the operator's command was wrong.
+  // "No such series in scope" and "not pinned to --from-model" are different answers; only the first means the
+  // command was wrong.
   if (seriesId !== undefined && seriesSeenIn.size === 0) {
     throw new Error(`no task series ${seriesId} in scope — check --series-id against \`ncl tasks list\``);
   }
-  // An ambiguous id is refused, never resolved by picking one. `--series-id`
-  // promises ONE series; honouring it across several would rewrite pins the
-  // operator did not name, and choosing a winner silently is this file's
-  // documented defect class (see the CONTRADICTORY-INPUT REFUSALS block).
+  // An ambiguous id is refused, never resolved by picking one.
   if (seriesId !== undefined && seriesSeenIn.size > 1) {
     throw new Error(
       `--series-id ${seriesId} is ambiguous: it names a series in ${seriesSeenIn.size} sessions ` +
@@ -1357,17 +1081,9 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
     );
   }
 
-  // Validate EVERY match before writing anything. The target is checked against
-  // each candidate's OWN group provider (a fleet-wide run spans providers), or
-  // against --target-provider when re-pinning ahead of a migration.
-  //
-  // Validate the MERGED pin, not the delta. `updateTask` merges flagIntent, so
-  // a model-only repin leaves the existing effort in place: a codex task at
-  // {gpt-6-astra, ultra} repinned to a Claude model would store
-  // {claude-…, ultra}, which is still invalid for Claude. Validating only the
-  // half being written reports success and leaves the series broken — and it
-  // breaks the one workflow this command exists for, because the provider
-  // migration it was meant to unblock stays blocked.
+  // Validate EVERY match before writing, each against its OWN group's provider (or --target-provider). Validate the
+  // MERGED pin, not the delta: `updateTask` merges flagIntent, so a model-only repin keeps an effort that may be
+  // invalid for the new provider.
   const rejected: RepinRejection[] = [];
   const applicable: RepinCandidate[] = [];
   for (const candidate of candidates) {
@@ -1381,15 +1097,9 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
       rejected.push({ session_id: candidate.session.id, series_id: candidate.seriesId, reason: error });
       continue;
     }
-    // Persist the RESOLVED value, but ONLY for the axis the operator asked to
-    // change. Writing the resolved form of an untouched axis would rewrite a
-    // pin nobody asked to rewrite — the exact thing this whole change exists
-    // to prevent (`sonnet` quietly becoming `claude-sonnet-5`).
-    // NO `?? candidate.next.*` fallback. That would persist the operator's raw
-    // request when the validator returned something different — which is the
-    // very defect this loop was added to fix, reintroduced one line later.
-    // `validateTaskPin` now rejects a dropped axis outright, so a requested
-    // axis always comes back resolved or not at all.
+    // Persist the RESOLVED value only for the axes the operator asked to change; resolving an untouched axis would
+    // rewrite a pin nobody asked about. No `?? candidate.next.*` fallback: that would persist the raw request the
+    // validator did not return.
     if (candidate.next.model !== undefined) candidate.write.model = flagIntent?.turnModel;
     if (candidate.next.effort !== undefined) candidate.write.effort = flagIntent?.turnEffort;
     applicable.push(candidate);
@@ -1408,14 +1118,13 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
       status: c.status,
       matched_via: c.matchedVia,
       from: { model: c.current.model, effort: c.current.effort },
-      // Resolved, so a dry run shows the value that will actually be stored.
+      // Resolved, so a dry run shows what will be stored.
       to: {
         model: c.write.model ?? c.next.model ?? c.current.model,
         effort: c.write.effort ?? c.next.effort ?? c.current.effort,
       },
     })),
-    // Series whose RESOLVED pin matches but whose literal pin does not. Left
-    // untouched by design; `--match-resolved` includes them.
+    // Resolved-but-not-literal matches, left untouched by design.
     near_misses: nearMisses,
   });
 
@@ -1431,23 +1140,9 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
 
   if (dryRun) return report(0);
 
-  // ── WHAT IS AND IS NOT ATOMIC HERE ──
-  //
-  // VALIDATION is all-or-nothing: every match is checked before the first write
-  // and one invalid target aborts the run, so a bad `--to-model` never lands
-  // half a fleet. That is the guarantee this command makes and keeps.
-  //
-  // The WRITE phase cannot be, and pretending otherwise is the more dangerous
-  // error. Each series lives in its OWN session database — that is the
-  // architecture, not an oversight — so there is no transaction spanning them
-  // and no honest rollback: undoing an applied repin is itself a write that can
-  // fail. A mid-loop failure therefore leaves earlier series repinned.
-  //
-  // So the loop does not abort on a failed candidate. It records the failure,
-  // continues, and REPORTS exactly which series moved and which did not.
-  // Aborting would produce the same partial state while returning only an
-  // error — the operator would know something broke but not what landed, which
-  // is the worst of both.
+  // VALIDATION is all-or-nothing; the WRITE phase cannot be: each series lives in its own session DB, with no
+  // spanning transaction and no honest rollback. So a failed candidate is recorded and the loop continues, reporting
+  // exactly which series moved. Aborting would leave the same partial state while hiding what landed.
   let applied = 0;
   const failed: Array<{ session_id: string; series_id: string; reason: string }> = [];
   for (const candidate of applicable) {
@@ -1458,9 +1153,7 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
       const n =
         (await withInbound(candidate.session, (mailbox) =>
           withCentralSync(() => {
-            // Same probe as every other mutating verb here (see the seam note):
-            // no row for this series in this session means no write and no
-            // invalidation is owed.
+            // Same probe as every other mutating verb.
             if (!mailbox.getCliTaskRow(candidate.seriesId)) return 0;
             return withQuietInvalidationSync(candidate.session.id, () =>
               mailbox.updateTask(candidate.seriesId, { flagIntent }),
@@ -1477,9 +1170,8 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
           detail: {
             repin: {
               from: { model: candidate.current.model, effort: candidate.current.effort },
-              // `updateTask` MERGES, so an axis this run did not touch survives.
-              // Recording it as null would say the pin was cleared — a durable
-              // audit row that is wrong is worse than no row during an incident.
+              // `updateTask` MERGES, so an untouched axis survives; recording it as null would falsely say it was
+              // cleared.
               to: {
                 model: candidate.write.model ?? candidate.current.model,
                 effort: candidate.write.effort ?? candidate.current.effort,
@@ -1874,10 +1566,7 @@ registerResource({
     },
     repin: {
       access: 'approval',
-      // Host-only: a bulk pin rewrite is an operator act. An agent caller is
-      // already scoped to its own group by groupArg, but the blast radius of a
-      // wrong --from-model is every armed series it can see, and nothing about
-      // running a scheduled fire needs it.
+      // Host-only: a wrong --from-model would hit every armed series in view, and no scheduled fire needs it.
       hostOnly: true,
       description:
         'Retarget per-fire model/effort pins in bulk (e.g. move everything pinned to one model onto its successor). OPERATOR-ONLY.\n\n' +

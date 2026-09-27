@@ -34,13 +34,9 @@ const CREATE_ENUMS: Record<string, string[]> = {
 };
 
 /**
- * A profile name indexes a filename under
- * `groups/<folder>/channel-instructions/`, and the host forwards it verbatim
- * into the container's environment — so an unconstrained value is a
- * path-traversal read of the container FS by whoever can write a wiring.
- * Rejected here rather than only in the runner, so the bad value never reaches
- * the DB and `ncl wirings get` can't show a name that will never resolve.
- * Same pattern the runner enforces (isSafeInstructionsProfileName).
+ * The profile name becomes a filename under `groups/<folder>/channel-instructions/` and is forwarded verbatim into
+ * the container, so an unconstrained value is a path traversal. Rejected here too so a bad value never reaches the
+ * DB. Same pattern as the runner's isSafeInstructionsProfileName.
  */
 const INSTRUCTIONS_PROFILE_RE = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -119,8 +115,7 @@ registerResource({
       description:
         'What happens to messages that don\'t trigger engagement. "drop" — agent never sees them. "accumulate" — stored as background context (trigger=0) so the agent has prior context when eventually triggered.',
       enum: ['drop', 'accumulate'],
-      // accumulate by default: group/sibling members need prior context when
-      // triggered (dropping it left the opencode siblings context-blind).
+      // Group and sibling members need prior context when triggered.
       default: 'accumulate',
       updatable: true,
     },
@@ -130,8 +125,7 @@ registerResource({
       description:
         '"shared" — one session per (agent, messaging group). "per-thread" — separate session per thread/topic. "agent-shared" — one session across all messaging groups wired to this agent. Note: threaded adapters in group chats force per-thread regardless of this setting.',
       enum: ['shared', 'per-thread', 'agent-shared'],
-      // per-thread by default: matches the router/permissions auto-wire and
-      // every other origin; threaded adapters force per-thread anyway.
+      // Matches the router auto-wire; threaded adapters force per-thread anyway.
       default: 'per-thread',
       updatable: true,
     },
@@ -149,12 +143,7 @@ registerResource({
       default: 0,
       updatable: true,
     },
-    // The three per-channel overrides. NULL (the norm) means "inherit the
-    // group default from container.json" — set one only to make this channel
-    // deliberately different. They were undeclared until 2026-08-08, so they
-    // could neither be read nor written here: a `-m sonnet` that went sticky
-    // on one channel was invisible to `ncl wirings get`, and a channel that
-    // silently lost its tone looked identical to one that never had it.
+    // Per-channel overrides. NULL (the norm) inherits the group default from container.json.
     {
       name: 'default_tone',
       type: 'string',
@@ -200,8 +189,7 @@ registerResource({
   preUpdate: async (updates, current) => {
     const mg = await requireMessagingGroup(current.messaging_group_id);
     if (updates.threads !== undefined) updates.threads = normalizeThreads(updates.threads);
-    // genericUpdate has already turned `--instructions-profile ""` into null
-    // (nullable column), so this only ever sees a real value to check.
+    // genericUpdate has already turned `""` into null.
     validateInstructionsProfile(updates.instructions_profile);
 
     const merged: EngageValues = { ...current, ...updates };
@@ -279,8 +267,7 @@ registerResource({
         if (args.engage_pattern !== undefined) values.engage_pattern = args.engage_pattern;
         if (args.threads !== undefined) values.threads = args.threads;
         if (args.priority !== undefined) values.priority = Number(args.priority);
-        // Per-channel overrides. Omitted stays absent → column NULL → inherit
-        // the group default, which is the right answer for almost every wiring.
+        // Omitted stays NULL and inherits the group default.
         for (const name of ['default_tone', 'default_model', 'default_effort', 'instructions_profile'] as const) {
           if (args[name] !== undefined && args[name] !== '') values[name] = args[name];
         }
@@ -331,10 +318,8 @@ registerResource({
         // (no destination matches the target) and the reply is silently lost.
         const colNames = Object.keys(values);
         const placeholders = colNames.map((c) => `@${c}`);
-        // Guard inside one central transaction (BEGIN IMMEDIATE under the
-        // driver) so check + insert + companion row are atomic against a
-        // concurrent wiring from another process, and a failing companion
-        // rolls the wiring row back. DB-only closure (plan §4.4).
+        // One IMMEDIATE central transaction, so the guard, insert and companion row are atomic against a concurrent
+        // wiring and a failing companion rolls back the wiring.
         await centralTransaction(async () => {
           await assertSameWorkgroupWiring(values.messaging_group_id as string, agId);
           await getDb().run(

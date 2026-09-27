@@ -1,39 +1,11 @@
 /**
- * `ncl integrations` — connect a remote MCP server the way a first-party MCP
- * client does, instead of pasting an API key.
- *
- *   ncl integrations login --name <n> --url <mcp-url> --group <agent-group-id>
- *   ncl integrations complete --name <n> --redirect-url '<pasted url>'
- *   ncl integrations list [--group <agent-group-id>]
- *   ncl integrations remove --name <n> [--delete-secret]
- *   ncl integrations refresh            # what the sweep does, on demand
- *
- * The default is the two-step paste: `login` prints a URL, the operator opens
- * it on their own machine, and `complete` takes whatever the browser landed on.
- * Nothing on this host tries to open a browser. `--listen` and `--device` are
- * opt-in conveniences documented in docs/mcp-oauth-integrations.md.
- *
- * ACCESS. Every mutating verb is `hostOnly`: an OAuth login mints a credential
- * for the operator's own account at a third party, so it is operator work in
- * the same sense mount management is — no `cli_scope`, not even `global`, and
- * no approval, makes it appropriate for an agent to initiate. `list` is left
- * open because it carries no token material and answers the exact question an
- * agent hitting a 401 through its MCP bridge has ("is my integration expired,
- * or is this something else?"); `integrations` is not in
- * `GROUP_SCOPE_RESOURCES`, so a group-scoped agent is refused it anyway.
- *
- * No `create`/`update`/`delete` generic verbs: a row here is only ever
- * meaningful alongside its OAuth bundle and its OneCLI secret, and a hand-written
- * row would be a registry entry with no credential behind it.
- *
- * FLAG NAMES ARE snake_case, ALWAYS. Every command parser runs `normalizeArgs`
- * before `validateArgs` (`src/cli/crud.ts`), so `--authorize-param`
- * reaches validation as the key `authorize_param`; a ColumnDef declaring
- * `authorize-param` therefore matches nothing and the flag is rejected as
- * `unknown flag --authorize-param`. Help and error text hyphenate for display
- * (`flagName` in `src/cli/help-render.ts`), so the operator-facing syntax
- * stays `--authorize-param` either way. `src/cli/flag-name-normalization.test.ts`
- * enforces this across every registered resource.
+ * `ncl integrations`: connect a remote MCP server via OAuth rather than a pasted key. The default is a two-step paste
+ * (`login` prints a URL, `complete` takes the landed URL); nothing on this host opens a browser.
+ * Every mutating verb is `hostOnly`: a login mints a credential on the operator's third-party account, which no
+ * `cli_scope` or approval makes appropriate for an agent. `list` stays open (no token material). No generic
+ * create/update/delete: a row without its OAuth bundle and OneCLI secret is meaningless.
+ * Flag names in ColumnDefs are snake_case, ALWAYS: `normalizeArgs` runs before `validateArgs`, so a hyphenated
+ * declaration matches nothing (enforced by `src/cli/flag-name-normalization.test.ts`).
  */
 import { TIMEZONE } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -46,13 +18,11 @@ import {
 import { formatLocalTime } from '../../timezone.js';
 import { registerResource } from '../crud.js';
 
-/** A boolean flag arrives as `true` from argv parsing and as a real boolean
- *  over the JSON transport. */
+/** `true` from argv, a real boolean over JSON. */
 function flag(raw: unknown): boolean {
   return raw === true || raw === 'true';
 }
 
-/** `--authorize-param k=v` repeated, or a single `k=v,k=v` string. */
 function parseExtraParams(raw: unknown): Record<string, string> | undefined {
   if (raw === undefined) return undefined;
   const items = (Array.isArray(raw) ? raw : String(raw).split(',')).map((s) => String(s).trim()).filter(Boolean);
@@ -348,11 +318,8 @@ registerResource({
           `registry row: ${d.removedRow ? 'deleted' : 'not found'}`,
           `oauth bundle: ${d.removedBundle ? 'deleted' : 'not found'}`,
         ];
-        // Only ever speak about the declaration on the path that touches it.
-        // Without --delete-secret nothing here looked at where the bearer is
-        // declared, and saying "left in place" would be a claim this command
-        // did not check. With it, the refusal above has already proved the
-        // owning group's file was the only site.
+        // Speaks about the declaration only when --delete-secret was requested: only then did the refusal above prove
+        // the owning file was the only declaration site.
         if (d.secretName && d.deleteSecretRequested) {
           lines.push(
             `bearer secret ${d.secretName}: ${d.removedSecret ? 'deleted from the vault' : 'not found in the vault'}`,
