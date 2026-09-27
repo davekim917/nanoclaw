@@ -1212,8 +1212,9 @@ export const createWorktreeTool: McpToolDefinition = {
       return err(error instanceof Error ? error.message : String(error));
     }
 
-    // In worktree mode only a clone's refusal stops here: linked, empty or unrecognized primaries go on to
-    // createLinkedWorktree, which validates them and recovers a crash-emptied one. `mode` is per-repo: scan-policy repos are pinned to `worktree` whatever NANOCLAW_CHECKOUT_MODE says.
+    // Clone mode refuses every failure but not-found. Worktree mode stops only a clone's refusal: linked, empty or
+    // unrecognized primaries go on to createLinkedWorktree, which validates them and recovers a crash-emptied one.
+    // `mode` is per-repo: scan-policy repos stay `worktree` whatever NANOCLAW_CHECKOUT_MODE says.
     const mode = effectiveCheckoutModeFor(repo);
     let existing: ResolvedCheckout | null = null;
     try {
