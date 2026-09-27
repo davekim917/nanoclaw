@@ -827,7 +827,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
     excludePlugins: validateExcludePlugins(raw.excludePlugins),
-    // This projection is an ALLOWLIST: a key with no line here (e.g. the removed `codexHostAuth`) is dropped.
+    // This projection is an ALLOWLIST: a key with no line here is silently dropped.
     wixHostAuth: raw.wixHostAuth,
     codexAuthFallbacks: raw.codexAuthFallbacks,
     credentialFolder: raw.credentialFolder,
