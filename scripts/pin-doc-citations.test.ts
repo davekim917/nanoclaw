@@ -390,6 +390,19 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], ['src/b.ts'])).toEqual([expect.objectContaining({ kind: 'pinned', sha: extended })]);
   });
 
+  it('follows the note back through a rename of its doc', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, 'docs/old-notes.md', '- `drainQueue` at `src/code.ts:1` drops items\n');
+    const introduced = commit(root, 'note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+    spawnSync('git', ['mv', 'docs/old-notes.md', NOTE], { cwd: root });
+    commit(root, 'rename the doc');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
