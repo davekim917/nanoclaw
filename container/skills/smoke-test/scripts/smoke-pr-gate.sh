@@ -158,8 +158,6 @@ SIZING_CLASSIFIER="$SIZING_CLASSIFIER_DIR/campaign-size-classify.py"
 JOURNEYS_CATALOGUE="${SMOKE_JOURNEYS_CATALOGUE:-/workspace/agent/journeys.json}"
 JOURNEYS_TOOL="$SIZING_CLASSIFIER_DIR/smoke-journeys.py"
 
-mkdir -p "$STATE_DIR"
-
 iso_now() {
   date -u +'%Y-%m-%dT%H:%M:%SZ'
 }
@@ -2940,16 +2938,44 @@ detect_freeze() {
   jq -c '{isFreezePr:.isFreeze, filesOk:.ok, targetSha:.targetSha}' <<<"$probe"
 }
 
+# " SMOKE_GATE_<KEY>" for every key check, poll and config refuse on.
+gate_config_missing() {
+  local k MISSING=""
+  for k in REPO BACKEND_SERVICE FRONTEND_SERVICE; do
+    [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
+  done
+  MISSING="$MISSING$LAYOUT_MISSING"
+  # A knob that fell back to its default because the deployed value was not a
+  # number is a misconfiguration, not a detail — name it in the same alarm.
+  MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+  printf '%s' "$MISSING"
+}
+
+# `config`: the go-time check an operator runs through the wrapper. It judges
+# the environment the wrapper hands this script and exits 0 (ok) or 1 (key
+# names); it runs before the state dir is created, so it reads no state, takes
+# no lock and calls nothing remote (smoke-gate-config.test.sh holds that).
+config_verb() {
+  local missing
+  missing="$(gate_config_missing)"
+  if [ -z "$missing" ]; then jq -cn '{ok:true}'; exit 0; fi
+  jq -cn --argjson missing "$(printf '%s\n' $missing | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{ok:false,error:"gate misconfigured",missing:$missing}'
+  exit 1
+}
+
 COMMAND="${1:-poll}"
 
 # The layout validator runs once, before any mode: `poll` names a bad prefix in
 # its throttled gate_misconfigured wake below, and every other mode refuses here.
 LAYOUT_MISSING="$(layout_prefix_problems)"
+[ "$COMMAND" != config ] || config_verb
 if [ -n "$LAYOUT_MISSING" ] && [ "$COMMAND" != poll ]; then
   jq -cn --argjson missing "$(printf '%s\n' $LAYOUT_MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     '{ok:false,error:"gate misconfigured",missing:$missing}'
   exit 2
 fi
+mkdir -p "$STATE_DIR"
 
 # ---------------------------------------------------------------------------
 if [ "$COMMAND" = "wait-settled" ]; then
@@ -3083,13 +3109,7 @@ if [ "$COMMAND" = "check" ]; then
     jq -cn '{ok:false,error:"check requires a PR number"}'
     exit 2
   fi
-  MISSING=""
-  for k in REPO BACKEND_SERVICE FRONTEND_SERVICE; do
-    [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
-  done
-# A knob that fell back to its default because the deployed value was not a
-# number is a misconfiguration, not a detail — name it in the same alarm.
-MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+  MISSING="$(gate_config_missing)"
   if [ -n "$MISSING" ]; then
     jq -cn --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
       '{ok:false,error:"gate misconfigured",missing:$missing}'
@@ -5018,14 +5038,7 @@ fi
 # poll: fail-closed on missing deployment config, throttled to one wake per
 # 6h so misconfiguration surfaces once as a visible alarm instead of silent
 # wakeAgent:false forever.
-MISSING=""
-for k in REPO BACKEND_SERVICE FRONTEND_SERVICE; do
-  [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
-done
-MISSING="$MISSING$LAYOUT_MISSING"
-# A knob that fell back to its default because the deployed value was not a
-# number is a misconfiguration, not a detail — name it in the same alarm.
-MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+MISSING="$(gate_config_missing)"
 if [ -n "$MISSING" ]; then
   exec 8>"$CONTROL_LOCK"
   flock -w 5 8 || true

@@ -1,7 +1,7 @@
 # Sourced, never run: the one validator for an install's repository-layout
-# prefixes. smoke-pr-gate.sh, smoke-develop-gate.sh, smoke-freeze-pr.sh and
-# smoke-config-check.sh all read the prefixes through it, so a bad prefix is
-# refused before any mode runs instead of mode by mode.
+# prefixes. smoke-pr-gate.sh, smoke-develop-gate.sh and smoke-freeze-pr.sh all
+# read the prefixes through it, so a bad prefix is refused before any mode runs
+# instead of mode by mode, and each gate's `config` verb reports the same names.
 #
 # A prefix is a repository-relative directory of plain segments ending in "/"
 # (GitHub file names never start "/", "./" or "../"). Anything else silently

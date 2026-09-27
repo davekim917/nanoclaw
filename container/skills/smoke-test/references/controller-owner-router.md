@@ -45,8 +45,8 @@ to the retained technical owner, verify its artifact receipt, and stop.
    writer, pass `SMOKE_GATE_OWNER=<coordinatorOwnerToken>` from
    `<run>/controller/wake.json` — **re-read that file on every wake, not once
    at intake.** `smoke-pr-gate.sh poll` mints a fresh owner token on every
-   same-SHA recovery (`smoke-pr-gate.sh:5492`, written to the lease at `:5521`,
-   the PR authority at `:5526` and the gate state at `:5571`), so the token you
+   same-SHA recovery (`smoke-pr-gate.sh:5505`, written to the lease at `:5534`,
+   the PR authority at `:5539` and the gate state at `:5584`), so the token you
    started with is then retired. The controller refreshes `wake.json` with
    every brief it writes (`smoke-campaign-controller.py:1529-1531`, in
    `_owner_wake` at `:1451`), which is why the file is current and your own

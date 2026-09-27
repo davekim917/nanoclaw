@@ -237,7 +237,8 @@ FREEZE_HANDOFF="${SMOKE_GATE_FREEZE_HANDOFF:-false}"
 FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 # The freeze helper builds its markers under the layout prefixes, so with the
 # handoff on they are validated once here (smoke-gate-layout.sh) and a bad one
-# is named in poll's gate_misconfigured alarm before any freeze is cut.
+# is named by `config` and in poll's gate_misconfigured alarm before any freeze
+# is cut.
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
 LAYOUT_MISSING=""
 [ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems FRONTEND_PREFIX BACKEND_PREFIX)"
@@ -286,7 +287,6 @@ num_env FREEZE_HELPER_TIMEOUT SMOKE_GATE_FREEZE_HELPER_TIMEOUT 90
 # burst two minutes after the freeze.
 READONLY=false
 
-mkdir -p "$STATE_DIR"
 # How long to wait for the state lock before giving up. The lock is no longer
 # held across the network phases (see the release/re-acquire below and the
 # unlock inside `freeze_status`), so a few seconds covers every ordinary
@@ -487,12 +487,6 @@ emit_lock_busy() {
       wakeAgent:false,
       data:{schemaVersion:1,trigger:"gate_lock_busy",phase:$phase}}')"
 }
-
-exec 9>"$LOCK_FILE"
-if ! flock -w "$LOCK_WAIT" 9; then
-  emit_lock_busy entry
-  exit 0
-fi
 
 # Re-take the lock after a network phase and re-read state from disk, because a
 # claim/progress/finish may have landed while we were unlocked. Read-only
@@ -930,8 +924,46 @@ write_active_file() {
   mv "$tmp" "$ACTIVE_FILE"
 }
 
-STATE="$(read_state)"
+# " SMOKE_GATE_<KEY>" for every key poll (and so check) and config refuse on.
+gate_config_missing() {
+  local MISSING=""
+  [ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
+  [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
+  [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
+  [ -n "$DEV_URL" ] || MISSING="$MISSING SMOKE_GATE_DEV_URL"
+  MISSING="$MISSING$LAYOUT_MISSING"
+  # A knob that fell back to its default because the deployed value was not a
+  # number is a misconfiguration, not a detail — name it in the same alarm.
+  MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+  if [ "$FREEZE_HANDOFF" = true ] && { [ -z "$FREEZE_HELPER" ] || [ ! -x "$FREEZE_HELPER" ]; }; then
+    MISSING="$MISSING SMOKE_GATE_FREEZE_HELPER"
+  fi
+  printf '%s' "$MISSING"
+}
+
+# `config`: the go-time check an operator runs through the wrapper. It judges
+# the environment the wrapper hands this script -- including the freeze
+# helper's keys, which it inherits from here -- and exits 0 (ok) or 1 (key
+# names). It runs before the state dir, the state lock and the state read, so
+# it touches no state and calls nothing remote (smoke-gate-config.test.sh).
+config_verb() {
+  local missing
+  missing="$(gate_config_missing)"
+  if [ -z "$missing" ]; then jq -cn '{ok:true}'; exit 0; fi
+  jq -cn --argjson missing "$(printf '%s\n' $missing | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{ok:false,error:"gate misconfigured",missing:$missing}'
+  exit 1
+}
+
 COMMAND="${1:-poll}"
+[ "$COMMAND" != config ] || config_verb
+mkdir -p "$STATE_DIR"
+exec 9>"$LOCK_FILE"
+if ! flock -w "$LOCK_WAIT" 9; then
+  emit_lock_busy entry
+  exit 0
+fi
+STATE="$(read_state)"
 
 # `check` is `poll` with every write suppressed and an early exit once
 # readiness is known. Reusing the poll derivation is the point: a campaign
@@ -1439,18 +1471,7 @@ fi
 # Fail closed on missing deployment config: wake the agent (throttled to one
 # wake per 6h) so misconfiguration surfaces as a visible BLOCKED watcher note
 # instead of silent wakeAgent:false forever.
-MISSING=""
-[ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-[ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-[ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
-[ -n "$DEV_URL" ] || MISSING="$MISSING SMOKE_GATE_DEV_URL"
-MISSING="$MISSING$LAYOUT_MISSING"
-# A knob that fell back to its default because the deployed value was not a
-# number is a misconfiguration, not a detail — name it in the same alarm.
-MISSING="$MISSING$BAD_NUMERIC_CONFIG"
-if [ "$FREEZE_HANDOFF" = true ] && { [ -z "$FREEZE_HELPER" ] || [ ! -x "$FREEZE_HELPER" ]; }; then
-  MISSING="$MISSING SMOKE_GATE_FREEZE_HELPER"
-fi
+MISSING="$(gate_config_missing)"
 if [ -n "$MISSING" ]; then
   LAST_FAILURE_WAKE="$(jq -r '.lastFailureWakeAt // empty' <<<"$STATE")"
   LAST_FAILURE_EPOCH="$(epoch_or_zero "$LAST_FAILURE_WAKE")"

@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5492`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5505`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2629,14 +2629,18 @@ SHA this gate's own `finish` already completed and suspended: `finish`
 suspending its preview by design produces the identical
 backendReady-true/healthzReady-false shape, and is checked first).
 
-`scripts/smoke-config-check.sh [<file>...]` (default: the install's
-`/workspace/agent/smoke-gate-env.sh` and `/workspace/agent/smoke-develop-gate.sh`)
-sources each file as its wrapper does, in a clean `env -i` shell (a wrapper's
-closing `exec` into its gate reports instead of starting the gate), judges the
-result with the gates' own validator, and names every required key a file leaves
-the gate without, every malformed prefix, and every required key the files
-disagree on — names only, never a value. Run it before a gate change goes live;
-`gate_misconfigured` after a pull means a key it would have named.
+**Go-time config check: run each wrapper with `config`.**
+`bash /workspace/agent/smoke-pr-gate.sh config` and
+`bash /workspace/agent/smoke-develop-gate.sh config` judge the environment each
+wrapper hands its gate with the gate's own refusal list: the required keys, the
+layout prefixes (`scripts/smoke-gate-layout.sh`) and every numeric knob. They
+print `{"ok":true}` and exit 0, or exit 1 with the key names
+(`{"ok":false,"error":"gate misconfigured","missing":[…]}`), never a value.
+`config` returns before the gate creates its state dir, takes a lock, reads
+state or calls anything remote. The freeze helper runs under the develop
+wrapper's environment, so the develop gate's `config` covers its keys too. Run
+both before a gate change goes live: `gate_misconfigured` after a pull means a
+key `config` would have named.
 
 **Preview identity is never a positional pick.** Render has provisioned two
 services sharing one display name under the same parent more than once (a
