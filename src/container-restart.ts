@@ -548,8 +548,8 @@ export async function quiesceWorkgroupsForBootMountChange(
   };
   stopAll(preStop.mustStop);
 
-  // Re-evaluated now that nothing in a changed workgroup can write its group dir; partitioning against the stale
-  // snapshot would call a flipped workgroup's sessions survivable.
+  // Re-evaluated once nothing in a changed workgroup can write its group dir (the stale snapshot would call a flipped
+  // workgroup survivable). Survivors keep running, so a flip after this is reconciled at the next boot, not this one.
   const finalChanged = (await options.reevaluateChanged?.()) ?? changedWorkgroupIds;
 
   // A SECOND inventory, taken after the re-evaluation is awaited, classified by each container's own labels: a

@@ -273,7 +273,6 @@ interface ActiveContainerEntry {
   adopted: boolean;
   /** null for an adopted entry: this host holds no lease for a container it did not spawn. */
   storageActivity: StorageActivityLease | null;
-  /** Incarnation this process claimed in `session_claims` for this runtime. */
   claimIncarnation?: number;
 }
 
@@ -370,8 +369,7 @@ async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
 /**
  * Returns the claimed incarnation, or null when the claim was lost (do not start a container). Throws on a
  * failed write. A claim held by a LIVE peer host is refused; a stopped, lease-expired or unknown holder is
- * takeover-able so a crashed claimant never wedges a session. This must stay the last `await` before `spawn()`.
- *
+ * takeover-able so a crashed claimant never wedges a session. After it, only the central lease may be awaited.
  * P2 (container fence): an untracked container still running for the session fails the claim; fails CLOSED,
  * and is a runtime call so it sits outside the transaction. P1: the peer-liveness read and the incarnation CAS
  * run in one `BEGIN IMMEDIATE` transaction so a peer's lease renewal cannot land between them.
@@ -1017,7 +1015,6 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
   const activeCount = activeContainers.size;
   // Count spawning sessions only until they enter activeContainers, or one process is double-counted at the cap.
   const inFlightWakes = [...spawningSessions].filter((sessionId) => !activeContainers.has(sessionId)).length;
-  // A pending survivor occupies a slot.
   const pendingSurvivors = pendingAdoptions.size;
   if (MAX_CONCURRENT_CONTAINERS > 0 && activeCount + inFlightWakes + pendingSurvivors >= MAX_CONCURRENT_CONTAINERS) {
     log.warn('Container wake deferred — concurrency cap reached', {
@@ -1166,7 +1163,6 @@ export function canonicalGitControlMounts(gitDir: string, stateDir: string): Vol
   ];
 }
 
-/** One alert per repository per boot. */
 const scanPolicyHooksAlerted = new Set<string>();
 
 function alertScanPolicyHooksOnce(repository: { gitDir: string }, outcome: 'refuse' | 'withhold'): void {
@@ -1353,7 +1349,6 @@ async function spawnContainer(
   const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
   logSpawnStage('build-mounts', buildMountsStartedAt);
   const containerName = `${CONTAINER_NAME_PREFIX}${agentGroup.folder}-${Date.now()}`;
-  // Stable across sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
   // Per-wiring defaults outrank container.json; sessions with no messaging group skip the lookup.
   let channelDefaultModel: string | null = null;
@@ -1412,7 +1407,8 @@ async function spawnContainer(
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
   // THE CROSS-PROCESS SPAWN FENCE: winning the claim licenses touching this session's runtime state (the heartbeat
-  // clear below included). This is the LAST `await` before the spawn; everything after it is synchronous.
+  // clear below included). Only the central-lease acquisition awaits after it; the guard, spawn and registration run
+  // synchronously inside that callback.
   const claimIncarnation = await claimSessionRun(session.id, containerName);
   if (claimIncarnation === null) {
     throw new Error(`session ${session.id} is claimed by another live host process — not spawning a duplicate`);
@@ -1454,8 +1450,6 @@ async function spawnContainer(
       dockerEnvironmentFile = dockerEnvironment.file;
       const child = spawn(CONTAINER_RUNTIME_BIN, dockerEnvironment.args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-      // The registry entry and the finalize fence below share this exact
-      // channel object (`active.channel === channel` in finalizeSession).
       channel = { kind: 'spawned', process: child };
       activeContainers.set(session.id, {
         channel,
@@ -2561,8 +2555,7 @@ export async function reconcileSurvivorWakeRows(session: Session): Promise<{ con
 /**
  * Consume durable `respawn_after_stop` rows at startup: a session whose container is still up gets its kill
  * re-issued with the respawn re-armed; otherwise it is respawned directly. The intent clears only once the wake
- * succeeds. Plain `'stop'` rows are already honoured and are cleared after. A session pending adoption keeps its
- * row. `hasContainer` is injectable because tests cannot put a container in the registry.
+ * succeeds. Plain `'stop'` rows are already honoured and are cleared after. A session pending adoption keeps its row.
  */
 export async function honorPendingStopIntents(
   wake: (session: Session) => Promise<boolean> = wakeContainer,
@@ -3567,7 +3560,8 @@ export async function buildMounts(
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
   }
   // Unconditional: in memory-only mode /workspace/workgroup is container-local, and the lock needs a host bind so
-  // every provider and sibling flocks the same inode.
+  // every provider and sibling flocks the same inode. In shared-FS mode it must follow the writable parent mount,
+  // so the container cannot unlink or replace the inode.
   mounts.push(...resolveWorkgroupMemoryMounts(wgId));
 
   // Nested RO mount over the RW group dir: the agent can read its config but not modify it.
@@ -4459,9 +4453,8 @@ const MANAGED_WORKER_DEFS = [
 
 /**
  * Copy trunk worker defs (container/agents/*.md) into .claude-shared/agents/; managed defs absent from trunk are
- * pruned, operator-added defs are untouched.
- *
- * Trunk ships NO defs, so a missing `container/agents/` must not return early: that would never prune retired copies.
+ * pruned, operator-added defs are untouched. Trunk ships NO defs, so a missing `container/agents/` must not return
+ * early: that would never prune retired copies.
  */
 function syncWorkerAgentDefs(claudeDir: string): void {
   const srcDir = path.join(process.cwd(), 'container', 'agents');
@@ -4997,8 +4990,8 @@ async function buildContainerArgs(
       );
     }
     args.push(...ghPlan.envArgs);
-    // Optional per-group org allowlist: entrypoint.sh restricts git's credential helper to these orgs and skips
-    // `gh auth login`, so a broad token cannot reach other orgs.
+    // Optional per-group org allowlist: entrypoint.sh restricts git's credential helper to these orgs only; the gh
+    // wrapper and direct reads of the mounted token keep its full reach.
     const ghOrgs = resolveScopedEnv('GITHUB_ALLOWED_ORGS', credentialFolder);
     if (ghOrgs) args.push('-e', `GITHUB_ALLOWED_ORGS=${ghOrgs}`);
   } else {
@@ -5275,7 +5268,8 @@ async function buildContainerArgs(
 
   for (const mount of mounts) {
     // Overlay sources live under agent-writable trees: re-validate right before emitting the arg so a target
-    // swapped after buildMounts aborts the spawn (a residual race with runc's own resolution is accepted).
+    // swapped after buildMounts aborts the spawn. A residual race with runc's own resolution is accepted: it needs a
+    // concurrent same-workgroup process, which already shares the trees these roots allow.
     if (mount.overlayAllowedRoots) {
       let recheck: string;
       try {
