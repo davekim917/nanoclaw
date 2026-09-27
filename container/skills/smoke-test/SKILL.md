@@ -1679,7 +1679,7 @@ do its job without. Both used to stay in the controller's own journal.
   while the `.ack` is absent (`smoke-campaign-controller.py:2738-2740`), so that
   fire published the new refusal and woke nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
   `invalidReasons[]`, digested against what the brief was written under
-  (`refusal_digest`, `smoke-campaign-controller.py:255`; recorded as
+  (`refusal_digest`, `smoke-campaign-controller.py:258`; recorded as
   `briefedRefusal` at `:1518-1519`, carried forward at `:2731-2732`, compared by
   `_reoffer_on_new_refusal` at `:2872`) — and
   deliberately neither of its neighbours: not "the published answer changed",
@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5475`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5505`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2511,13 +2511,13 @@ then carries `tookOverFrom`. `poll` never takes over.
 A PR settles when: it is open and carries `SMOKE_GATE_LABEL` (default
 `render-preview`); its backend preview exists, is `live`, and its deploy
 commit equals the PR head SHA; the frontend preview additionally matches when
-the diff touches `XZO-FRONTEND/`; CI is green on the head — **except** a
+the diff touches `SMOKE_GATE_FRONTEND_PREFIX`; CI is green on the head — **except** a
 freeze PR (see below), where CI is checked on the head's *parent* commit,
 since freeze commits get no path-filtered CI of their own; and the backend's
 `/healthz` returns 200 (a fresh preview can read `{"status":"warming"}` for
 ~6-10 minutes after `live` — the gate never sleeps waiting this out, it just
 reports not-settled and lets the next poll catch it). Any labeled **ordinary**
-PR whose own diff touches `XZO-BACKEND/migrations/` is refused outright (one
+PR whose own diff touches `SMOKE_GATE_MIGRATIONS_PREFIX` is refused outright (one
 throttled `pr_migrations_refused` alarm, never a settle). A **freeze PR is
 never refused on migrations**: its target is already on the tracked branch, so
 a migration in its range is campaign scope, reported in `migrationsInRange`,
@@ -2612,7 +2612,13 @@ Config: `SMOKE_GATE_REPO`, `SMOKE_GATE_BRANCH` (default `develop`),
 `SMOKE_GATE_BACKEND_SERVICE` / `SMOKE_GATE_FRONTEND_SERVICE` (the **base**
 Render service ids — previews are discovered per PR by matching
 `serviceDetails.parentServer.id` plus a `PR #<n>` name suffix, never
-hardcoded preview ids), `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
+hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFIX` /
+`SMOKE_GATE_MIGRATIONS_PREFIX` (the install's repo dirs, each with a trailing
+`/`: a diff under the frontend prefix requires the frontend preview to match,
+one under the migrations prefix refuses an ordinary PR, and the freeze markers
+are `<prefix>.render-freeze` under the backend and frontend prefixes; all
+three are required for every gate verb, each a relative path of plain segments ending in `/` and distinct from the other two (nesting is fine), checked once before any mode by `scripts/smoke-gate-layout.sh`: anything else is `gate_misconfigured`),
+`SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
 seam and semantics as the develop gate — one readiness command run once per
 poll, immediately before a settled candidate is actually claimed), and
@@ -2622,6 +2628,19 @@ without a healthy `/healthz` after going `live` raises one throttled
 SHA this gate's own `finish` already completed and suspended: `finish`
 suspending its preview by design produces the identical
 backendReady-true/healthzReady-false shape, and is checked first).
+
+**Go-time config check: run each wrapper with `config`.**
+`bash /workspace/agent/smoke-pr-gate.sh config` and
+`bash /workspace/agent/smoke-develop-gate.sh config` judge the environment each
+wrapper hands its gate with the gate's own refusal list: the required keys, the
+layout prefixes (`scripts/smoke-gate-layout.sh`) and every numeric knob. They
+print `{"ok":true}` and exit 0, or exit 1 with the key names
+(`{"ok":false,"error":"gate misconfigured","missing":[…]}`), never a value.
+`config` returns before the gate creates its state dir, takes a lock, reads
+state or calls anything remote. The freeze helper runs under the develop
+wrapper's environment, so the develop gate's `config` covers its keys too. Run
+both before a gate change goes live: `gate_misconfigured` after a pull means a
+key `config` would have named.
 
 **Preview identity is never a positional pick.** Render has provisioned two
 services sharing one display name under the same parent more than once (a

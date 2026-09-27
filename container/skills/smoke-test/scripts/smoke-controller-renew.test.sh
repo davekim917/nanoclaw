@@ -90,6 +90,7 @@ new_case() { # <name>
   # execs the gate; here the gate is called directly and takes its own
   # SMOKE_GATE_* from the process env the test exports.
   export SMOKE_CONTROLLER_GATE_CMD="$GATE"
+  export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
   JOURNAL="$C/out/journal.ndjson"
   : >"$JOURNAL"
   write_env live

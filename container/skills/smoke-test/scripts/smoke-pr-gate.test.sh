@@ -363,7 +363,7 @@ seed_ledger_receipt() { # <ledger> <run-id> <verdict> <target-sha> <freeze-sha> 
 freeze_ready_fixture() { # <pr> <freeze-sha> <target-sha>
   export STUB_PR_VIEW="{\"number\":$1,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$2\",\"headRefName\":\"smoke-freeze/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
   export STUB_PR_LIST="[{\"number\":$1,\"headRefOid\":\"$2\",\"headRefName\":\"smoke-freeze/x\"}]"
-  export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+  export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
   export STUB_PARENT_SHA="$3"
   export STUB_RUN_LIST="[{\"headSha\":\"$3\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
   export STUB_SERVICES="[\
@@ -381,11 +381,34 @@ expire_lease() { # <lease-file>; no writer is live in these test fixtures
 
 # --- 1. Misconfig: fail-closed wake, throttled on the immediate next poll --
 fresh_state
-unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE 2>/dev/null || true
+unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE \
+  SMOKE_GATE_FRONTEND_PREFIX SMOKE_GATE_BACKEND_PREFIX SMOKE_GATE_MIGRATIONS_PREFIX 2>/dev/null || true
 bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "gate_misconfigured" and
-  (.data.missing | length == 3)
+  (.data.missing | length == 6) and
+  (.data.missing | index("SMOKE_GATE_FRONTEND_PREFIX") != null) and
+  (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null) and
+  (.data.missing | index("SMOKE_GATE_MIGRATIONS_PREFIX") != null)
 ' >/dev/null
+# An empty prefix is refused too: `startswith("")` would match every file.
+EMPTY_PREFIX="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX="" \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$EMPTY_PREFIX" >/dev/null
+# ...and so is one without its trailing "/": "api/migrations" also matches "api/migrations-archive/".
+NO_SLASH="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$NO_SLASH" >/dev/null ||
+  { echo "a prefix without its trailing / was accepted: $NO_SLASH" >&2; exit 1; }
+# ...and so is one that is not repository-relative: GitHub file names never start "/", "./" or "../".
+for bad in /api/migrations/ ../api/migrations/ ./api/migrations/ api//migrations/ api/../migrations/; do
+  NOT_REL="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+    SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX="$bad" \
+    bash "$GATE" check 7 2>/dev/null || true)"
+  jq -e '.ok == false and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$NOT_REL" >/dev/null ||
+    { echo "a non-relative prefix $bad was accepted: $NOT_REL" >&2; exit 1; }
+done
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_misconfigured" and .observation.kind == "blocked"' >/dev/null
 # W2: a quiet poll's observation is one the task-observation helper accepts,
 # and the gate's own keys are all still there for the controller to read.
@@ -395,10 +418,38 @@ assert d["wakeAgent"] is False and d["ok"] is False and d["data"]["trigger"] == 
 p = observation_problem(d["observation"]); sys.exit("invalid observation: " + p if p else 0)' \
   "$(dirname "$GATE")/../../task-observation"
 
+# The layout validator runs before mode dispatch, so a verb that never reads
+# the prefixes refuses too: no mode can run with a bad layout.
+for verb in progress release task-claim lease-status challenger-timeout; do
+  T1V="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=/api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/ \
+    bash "$GATE" "$verb" 2>/dev/null || true)"
+  jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$T1V" >/dev/null ||
+    { echo "1: $verb ran with a bad layout prefix: $T1V" >&2; exit 1; }
+done
+# Equal service prefixes would collapse the two freeze markers into one path.
+T1E="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=src/ SMOKE_GATE_BACKEND_PREFIX=src/ SMOKE_GATE_MIGRATIONS_PREFIX=src/migrations/ \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.error == "gate misconfigured" and .missing == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$T1E" >/dev/null ||
+  { echo "1: equal frontend and backend prefixes were accepted: $T1E" >&2; exit 1; }
+# The freeze helper validates the same way, before it touches GitHub, and names
+# exactly the key at fault: backend, frontend, or both when they are equal.
+while read -r fe be want; do
+  T1F="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX="$fe" SMOKE_GATE_BACKEND_PREFIX="$be" \
+    bash "$(dirname "$GATE")/smoke-freeze-pr.sh" "$(printf 'a%.0s' $(seq 40))" 2>/dev/null)" && T1F_RC=0 || T1F_RC=$?
+  [ "$T1F_RC" -eq 2 ] && jq -e --argjson want "$want" '.ok == false and .missing == $want' <<<"$T1F" >/dev/null ||
+    { echo "1: the freeze helper accepted $fe $be: rc=$T1F_RC $T1F" >&2; exit 1; }
+done <<'CASES'
+web/ ../api/ ["SMOKE_GATE_BACKEND_PREFIX"]
+../web/ api/ ["SMOKE_GATE_FRONTEND_PREFIX"]
+src/ src/ ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]
+CASES
+
 # --- Common config for every scenario below ---------------------------------
 export SMOKE_GATE_REPO=org/repo
 export SMOKE_GATE_BACKEND_SERVICE=srv-backend-base
 export SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
 
 # --- 2. No labeled open PRs: quiet idle, no wake ----------------------------
 fresh_state
@@ -416,7 +467,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha b)"
 export STUB_PR_LIST="[{\"number\":42,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"XZO-DEV-BACKEND PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-42.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
@@ -449,7 +500,7 @@ AUTO_SHA="$(sha d)"
 AUTO_LEGACY_SHA="$(sha e)"
 export SMOKE_GATE_RUN_PREFIX=bound
 export STUB_PR_LIST="[{\"number\":142,\"headRefOid\":\"$AUTO_SHA\",\"headRefName\":\"feature/x\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$AUTO_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES='[{"id":"srv-backend-pr-142","name":"XZO-DEV-BACKEND PR #142","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://xzo-dev-backend-pr-142.onrender.com"}}]'
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$AUTO_SHA\"}}]"
@@ -493,7 +544,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha c)"
 export STUB_PR_LIST="[{\"number\":43,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-43\",\"name\":\"XZO-DEV-BACKEND PR #43\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-43.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
@@ -512,7 +563,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha d)"
 export STUB_PR_LIST="[{\"number\":44,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-44\",\"name\":\"XZO-DEV-BACKEND PR #44\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-44.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
@@ -550,7 +601,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha e)"
 export STUB_PR_LIST="[{\"number\":45,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-45\",\"name\":\"XZO-DEV-BACKEND PR #45\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-45.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
@@ -656,7 +707,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 HEAD_SHA="$(sha c)"
 STALE_SHA="$(sha d)"
 export STUB_PR_VIEW="{\"number\":7,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-7\",\"name\":\"XZO-DEV-BACKEND PR #7\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-7.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$STALE_SHA\"}}]"
@@ -683,9 +734,9 @@ BASE_SHA="$(sha a)"
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 export STUB_PR_VIEW="{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":3,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":3,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 export STUB_COMPARE_LOG="$STATE_DIR/compare.log"
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
 T5_OUT="$(bash "$GATE" check 9)"
@@ -717,13 +768,13 @@ BASE_SHA="$(sha a)"
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"},{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"api/migrations/222_undo_edit_prior_actor.sql"},{"filename":"api/src/other.ts"}]}'
 T5A_OUT="$(bash "$GATE" check 10)"
 jq -e '
   .isFreezePr == true and .migrationsTouched == true and .settled == true and .fetchOk == true and
   .migrationsDeterminable == true and
-  .migrationFiles == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"] and
-  .migrationsInRange == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"] and
+  .migrationFiles == ["api/migrations/222_undo_edit_prior_actor.sql"] and
+  .migrationsInRange == ["api/migrations/222_undo_edit_prior_actor.sql"] and
   .campaignRange.determinable == true
 ' <<<"$T5A_OUT" >/dev/null || { echo "5a: a ready migration-bearing freeze did not settle: $T5A_OUT" >&2; exit 1; }
 T5A_POLL="$(bash "$GATE" poll)"
@@ -732,7 +783,7 @@ jq -e --arg base "$BASE_SHA" --arg parent "$PARENT_SHA" '
   .data.isFreezePr == true and
   .data.campaignRange.baselineSha == $base and .data.campaignRange.targetSha == $parent and
   .data.campaignRange.determinable == true and
-  .data.migrationsInRange == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"]
+  .data.migrationsInRange == ["api/migrations/222_undo_edit_prior_actor.sql"]
 ' <<<"$T5A_POLL" >/dev/null || { echo "5a: poll did not settle the freeze with its range: $T5A_POLL" >&2; exit 1; }
 jq -e '.refusedAlertSha == null' "$STATE_DIR/pr-10-state.json" >/dev/null
 # 5a-ii. What still blocks: the MG-1 failure itself. Same freeze, but the
@@ -743,7 +794,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"api/migrations/222_undo_edit_prior_actor.sql"}]}'
 export STUB_HEALTHZ_CODE=503
 bash "$GATE" check 10 | jq -e '.settled == false and .healthzReady == false' >/dev/null
 bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
@@ -819,7 +870,7 @@ export SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/dev-gate/latest-verdict.json" \
   SMOKE_GATE_HOLD_FILE="$STATE_DIR/dev-gate/develop-hold.json" \
   SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 GO_FREEZE="$(sha b)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$BASE_SHA"
 bash "$GATE" claim run-real-go 5 "$GO_FREEZE" >/dev/null
 bash "$GATE" finish "$GO_FREEZE" run-real-go GO | jq -e '.ok == true and .handoff.written == true' >/dev/null
@@ -835,7 +886,7 @@ bash "$GATE" finish "$(sha d)" run-real-blocked2 BLOCKED | jq -e '.ok == true' >
 tail -1 "$SMOKE_GATE_HANDOFF_LEDGER" | jq -e --arg t "$LATER_SHA" '.verdict == "BLOCKED" and .targetSha == $t' >/dev/null
 export STUB_PARENT_BY_COMMIT="{\"$GO_FREEZE\":\"$BASE_SHA\"}" STUB_PULL_HEADS="{\"5\":\"$GO_FREEZE\"}"
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 range_case 5c '.campaignRange.baselineSha == $base and .campaignRange.baselineRunId == "run-real-go" and
   .campaignRange.determinable == true and .migrationsInRange == [] and .settled == true'
 
@@ -851,7 +902,7 @@ seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(s
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
 export STUB_COMPARE_FILES='{"status":"behind","ahead_by":0,"behind_by":4,"files":[]}'
 range_case 5d-behind "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"not strictly ahead.*behind\"))"
-export STUB_COMPARE_FILES='{"status":"diverged","ahead_by":2,"behind_by":1,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"diverged","ahead_by":2,"behind_by":1,"files":[{"filename":"api/src/other.ts"}]}'
 range_case 5d-diverged "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"diverged\"))"
 export STUB_COMPARE_FILES='{"status":"identical","ahead_by":0,"behind_by":0,"files":[]}'
 range_case 5d-identical-but-different "$UNKNOWN_RANGE"
@@ -859,7 +910,7 @@ range_case 5d-identical-but-different "$UNKNOWN_RANGE"
 export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[]}'
 range_case 5d-ahead-empty "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"empty although\"))"
 # Malformed: no status / files not an array / a non-object body.
-export STUB_COMPARE_FILES='{"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"files":[{"filename":"api/src/other.ts"}]}'
 range_case 5d-malformed-nostatus "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"malformed\"))"
 export STUB_COMPARE_FILES='{"status":"ahead","behind_by":0,"files":"nope"}'
 range_case 5d-malformed-files "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"malformed\"))"
@@ -867,15 +918,15 @@ export STUB_COMPARE_FILES='[]'
 range_case 5d-malformed-body "$UNKNOWN_RANGE"
 # A renamed/removed migration still counts: previous_filename sizes, filename names it.
 export SMOKE_SIZING_RULES="$STATE_DIR/rules.json"
-printf '%s' '{"full":["XZO-BACKEND/migrations/**"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-FRONTEND/src/moved.sql","previous_filename":"XZO-BACKEND/migrations/9_x.sql","status":"renamed"}]}'
+printf '%s' '{"full":["api/migrations/**"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"web/src/moved.sql","previous_filename":"api/migrations/9_x.sql","status":"renamed"}]}'
 range_case 5d-renamed '.campaignRange.determinable == true and .campaignSize == "full" and
-  (.sizeReason | test("XZO-BACKEND/migrations/9_x.sql")) and
+  (.sizeReason | test("api/migrations/9_x.sql")) and
   .migrationsTouched == true and .migrationsDeterminable == true and
-  .migrationsInRange == ["XZO-BACKEND/migrations/9_x.sql"] and .migrationFiles == .migrationsInRange and
+  .migrationsInRange == ["api/migrations/9_x.sql"] and .migrationFiles == .migrationsInRange and
   .frontendTouched == true'
 # ...and the mirror image: moved OUT of the frontend prefix still reads frontendTouched.
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"docs/moved.tsx","previous_filename":"XZO-FRONTEND/src/moved.tsx","status":"renamed"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"docs/moved.tsx","previous_filename":"web/src/moved.tsx","status":"renamed"}]}'
 range_case 5d-renamed-frontend '.frontendTouched == true and .migrationsTouched == false and .migrationsInRange == []'
 unset SMOKE_SIZING_RULES
 
@@ -898,23 +949,23 @@ freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
 # comes from the two recursive trees: determinable, COMPLETE, and it names
 # migrations the capped compare list never showed. Live case: the first freeze
 # after the pinned GO spans 613 files, and would otherwise be unknown forever.
-CAPPED_COMPARE="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":40,"behind_by":0,"files":[{"filename": f"XZO-BACKEND/src/f{i}.ts"} for i in range(300)]}))')"
+CAPPED_COMPARE="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":40,"behind_by":0,"files":[{"filename": f"api/src/f{i}.ts"} for i in range(300)]}))')"
 tree_fixture() { # <n-changed> <truncated> -> STUB_TREES_BY_SHA for BASE_SHA / PARENT_SHA
   STUB_TREES_BY_SHA="$(python3 - "$BASE_SHA" "$PARENT_SHA" "$1" "$2" <<'PYF'
 import json, sys
 base, target, n, truncated = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "true"
 blob = lambda p, s, mode="100644": {"path": p, "type": "blob", "mode": mode, "sha": s}
-same = [blob("README.md", "s0"), blob("XZO-BACKEND/src/same.ts", "s1"),
-        {"path": "XZO-BACKEND/src", "type": "tree", "mode": "040000", "sha": "t-will-differ"}]
-a = same + [blob(f"XZO-BACKEND/src/f{i}.ts", f"a{i}") for i in range(n)]
-b = [dict(e) for e in same] + [blob(f"XZO-BACKEND/src/f{i}.ts", f"b{i}") for i in range(n)]
+same = [blob("README.md", "s0"), blob("api/src/same.ts", "s1"),
+        {"path": "api/src", "type": "tree", "mode": "040000", "sha": "t-will-differ"}]
+a = same + [blob(f"api/src/f{i}.ts", f"a{i}") for i in range(n)]
+b = [dict(e) for e in same] + [blob(f"api/src/f{i}.ts", f"b{i}") for i in range(n)]
 b[2]["sha"] = "t-differs"                       # a changed DIRECTORY entry is not a file
-a += [blob("XZO-BACKEND/migrations/9_old_name.sql", "m9"), blob("XZO-BACKEND/src/removed.ts", "r1")]
+a += [blob("api/migrations/9_old_name.sql", "m9"), blob("api/src/removed.ts", "r1")]
 a += [blob("scripts/run.sh", "x1"), {"path": "vendor/lib", "type": "commit", "mode": "160000", "sha": "c1"}]
 b += [blob("scripts/run.sh", "x1", "100755"),              # chmod only: SAME blob sha, new mode
       {"path": "vendor/lib", "type": "commit", "mode": "160000", "sha": "c2"}]  # submodule bump
-b += [blob("XZO-FRONTEND/src/9_new_name.sql", "m9"),       # rename: same blob, both paths change
-      blob("XZO-BACKEND/migrations/301_added.sql", "m301")]
+b += [blob("web/src/9_new_name.sql", "m9"),       # rename: same blob, both paths change
+      blob("api/migrations/301_added.sql", "m301")]
 print(json.dumps({base: {"sha": base, "truncated": False, "tree": a},
                   target: {"sha": target, "truncated": truncated, "tree": b}}))
 PYF
@@ -927,14 +978,14 @@ tree_fixture 400 false
 range_case 5f-tree '.campaignRange.determinable == true and .campaignRange.reason == null and
   .campaignRange.fileListMethod == "tree" and .fetchOk == true and .settled == true and
   .migrationsTouched == true and .migrationsDeterminable == true and .frontendTouched == true and
-  .migrationsInRange == ["XZO-BACKEND/migrations/301_added.sql","XZO-BACKEND/migrations/9_old_name.sql"] and
+  .migrationsInRange == ["api/migrations/301_added.sql","api/migrations/9_old_name.sql"] and
   .migrationFiles == .migrationsInRange'
 [ "$(sort "$STUB_TREE_GET_LOG" | tr '\n' ' ')" = "$(printf '%s\n%s\n' "$BASE_SHA" "$PARENT_SHA" | sort | tr '\n' ' ')" ] ||
   { echo "5f: tree diff did not fetch exactly baseline+target: $(cat "$STUB_TREE_GET_LOG")" >&2; exit 1; }
 # The rename shows BOTH sides, so sizing still sees the path it moved OUT of;
 # unchanged blobs and the changed directory entry are not files in the range.
 export SMOKE_SIZING_RULES="$STATE_DIR/rules-tree.json"
-printf '%s' '{"full":["XZO-BACKEND/migrations/9_old_name.sql"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
+printf '%s' '{"full":["api/migrations/9_old_name.sql"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
 range_case 5f-tree-rename '.campaignSize == "full" and (.sizeReason | test("9_old_name.sql"))'
 # Full entry identity, not path->blob-sha: a chmod-only change (same blob sha)
 # and a submodule bump (`commit` entry) are both in the list. Each is made the
@@ -944,12 +995,12 @@ range_case 5f-tree-chmod '.campaignSize == "full" and (.sizeReason | test("scrip
 printf '%s' '{"full":["vendor/lib"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
 range_case 5f-tree-submodule '.campaignSize == "full" and (.sizeReason | test("vendor/lib"))'
 # Control: an UNCHANGED blob and the changed directory entry never trigger.
-printf '%s' '{"full":["README.md","XZO-BACKEND/src"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
+printf '%s' '{"full":["README.md","api/src"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
 range_case 5f-tree-unchanged '.campaignRange.determinable == true and .campaignSize != "full"'
 unset SMOKE_SIZING_RULES
 # Below the cap the compare list is used as-is and no tree is fetched.
 rm -f "$STUB_TREE_GET_LOG"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 range_case 5f-compare '.campaignRange.determinable == true and .campaignRange.fileListMethod == "compare"'
 [ ! -e "$STUB_TREE_GET_LOG" ] || { echo "5f: an uncapped compare still fetched trees" >&2; exit 1; }
 export STUB_COMPARE_FILES="$CAPPED_COMPARE"
@@ -968,11 +1019,11 @@ range_case 5f-tree-malformed "$UNKNOWN_RANGE and (.campaignRange.reason | test(\
 # another changed file kept the range determinable; an unknown type was dropped.
 tree_fixture 400 false
 T5F_GOOD_TREES="$STUB_TREES_BY_SHA"
-export STUB_TREES_BY_SHA="$(jq -c 'map_values(.tree += [{"path":"XZO-BACKEND/migrations/777_nosha.sql","type":"blob","mode":"100644"}])' <<<"$T5F_GOOD_TREES")"
+export STUB_TREES_BY_SHA="$(jq -c 'map_values(.tree += [{"path":"api/migrations/777_nosha.sql","type":"blob","mode":"100644"}])' <<<"$T5F_GOOD_TREES")"
 range_case 5f-tree-entry-no-sha "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree is malformed\"))"
-export STUB_TREES_BY_SHA="$(jq -c 'map_values(.tree += [{"path":"XZO-BACKEND/x","type":"blob","sha":"s9"}])' <<<"$T5F_GOOD_TREES")"
+export STUB_TREES_BY_SHA="$(jq -c 'map_values(.tree += [{"path":"api/x","type":"blob","sha":"s9"}])' <<<"$T5F_GOOD_TREES")"
 range_case 5f-tree-entry-no-mode "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree is malformed\"))"
-export STUB_TREES_BY_SHA="$(jq -c --arg t "$PARENT_SHA" '.[$t].tree += [{"path":"XZO-BACKEND/y","type":"symlinkish","mode":"120000","sha":"s8"}]' <<<"$T5F_GOOD_TREES")"
+export STUB_TREES_BY_SHA="$(jq -c --arg t "$PARENT_SHA" '.[$t].tree += [{"path":"api/y","type":"symlinkish","mode":"120000","sha":"s8"}]' <<<"$T5F_GOOD_TREES")"
 range_case 5f-tree-entry-unknown-type "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"target tree is malformed\"))"
 export STUB_TREES_BY_SHA="$T5F_GOOD_TREES"
 range_case 5f-tree-entries-control '.campaignRange.determinable == true and .campaignRange.fileListMethod == "tree"'
@@ -984,7 +1035,7 @@ bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_set
   .data.campaignRange.fileListMethod == "tree" and (.data.migrationsInRange | length) == 2' >/dev/null
 unset STUB_TREES_BY_SHA STUB_TREE_GET_LOG
 unset -f tree_fixture
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 
 # --- 5g. No validated GO: no ledger configured, an empty one, and one that
 # holds only non-GO verdicts. Unknown range, full, still settles.
@@ -992,7 +1043,7 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 range_case 5g-unconfigured "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
   (.campaignRange.reason | test(\"no handoff ledger\"))"
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
@@ -1031,7 +1082,7 @@ export STUB_PULL_HEADS="$(jq -c --arg other "$(sha 7)" '.["25"]=$other' <<<"$STU
 # (vi) torn / malformed trailing lines never abort the scan
 printf '%s\n' '{"verdict":"GO","targetSha":"short","runId":"../../etc"}' '{"verdict":"GO"' >> "$SMOKE_GATE_HANDOFF_LEDGER"
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 range_case 5h '.campaignRange.baselineSha == $base and .campaignRange.baselineRunId == "run-go-base" and
   .campaignRange.determinable == true'
 
@@ -1065,8 +1116,8 @@ export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
 export SMOKE_SIZING_RULES="$STATE_DIR/rules-pin.json"
-printf '%s' '{"full":["XZO-BACKEND/migrations/**"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+printf '%s' '{"full":["api/migrations/**"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 # `check` before any poll computes and pins nothing.
 range_case 5j-check-before '.campaignRange.baselinePinned == false'
 [ ! -e "$STATE_DIR/pr-13-state.json" ] || { echo "5j: check wrote PR state" >&2; exit 1; }
@@ -1079,7 +1130,7 @@ T5J_RUN="$(jq -r '.data.runId' <<<"$T5J_FIRST")"
 jq -e --arg base "$BASE_SHA" --arg head "$FREEZE_SHA" '
   .headSha == $head and .campaignRange.baselineSha == $base and
   .campaignRange.baselineRunId == "run-go-base" and
-  .rangePaths == ["XZO-BACKEND/src/other.ts"] and
+  .rangePaths == ["api/src/other.ts"] and
   .campaignSize == "standard" and (.pinnedAt | type == "string")' "$(pin_file 13 "$FREEZE_SHA")" >/dev/null ||
   { echo "5j: pin record wrong: $(cat "$(pin_file 13 "$FREEZE_SHA")")" >&2; exit 1; }
 # The pin lives in its own per-head file on the shared root: not in a slot of
@@ -1092,7 +1143,7 @@ jq -e '.campaignRange.baselinePinned == true' <<<"$T5J_VIEW" >/dev/null
 [ "$(jq -c '.data.campaignRange | del(.baselinePinned)' <<<"$T5J_FIRST")" = "$(jq -c '.campaignRange | del(.baselinePinned)' <<<"$T5J_VIEW")" ]
 NEWER_SHA="$(sha c)"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-newer GO "$NEWER_SHA" "$(sha d)" 6
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":9,"behind_by":0,"files":[{"filename":"XZO-BACKEND/migrations/400_later.sql"},{"filename":"XZO-FRONTEND/src/a.tsx"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":9,"behind_by":0,"files":[{"filename":"api/migrations/400_later.sql"},{"filename":"web/src/a.tsx"}]}'
 printf '%s' '{"full":["**"]}' > "$SMOKE_SIZING_RULES"
 export STUB_COMPARE_LOG="$STATE_DIR/compare-after-pin.log"
 [ "$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")" = "$T5J_VIEW" ] ||
@@ -1110,11 +1161,11 @@ jq -e --arg run "$T5J_RUN" '.wakeAgent == true and .data.trigger == "pr_build_se
 NEW_FREEZE="$(sha 5)"
 freeze_ready_fixture 13 "$NEW_FREEZE" "$PARENT_SHA"
 range_case 5j-new-head '.campaignRange.baselineSha != $base and .campaignRange.baselinePinned == false and
-  .migrationsInRange == ["XZO-BACKEND/migrations/400_later.sql"] and .campaignSize == "full"'
+  .migrationsInRange == ["api/migrations/400_later.sql"] and .campaignSize == "full"'
 bash "$GATE" poll >/dev/null
 jq -e --arg head "$NEW_FREEZE" --arg newer "$NEWER_SHA" '.headSha == $head and
   .campaignRange.baselineSha == $newer and
-  .migrationsInRange == ["XZO-BACKEND/migrations/400_later.sql"]' \
+  .migrationsInRange == ["api/migrations/400_later.sql"]' \
   "$(pin_file 13 "$NEW_FREEZE")" >/dev/null || { echo "5j: a new head did not get its own pin" >&2; exit 1; }
 # ...and the first head's pin is still there, untouched by the new head.
 [ "$(jq -c "$RANGE_VIEW"' | del(.campaignRange.baselinePinned, .campaignRange.pinState)' <<<"$T5J_VIEW")" = \
@@ -1133,7 +1184,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 export STUB_COMPARE_EXIT=1
 T5J2_FIRST="$(bash "$GATE" poll)"
 jq -e --arg base "$BASE_SHA" '.data.trigger == "pr_build_settled" and .data.campaignSize == "full" and
@@ -1162,7 +1213,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 export STUB_COMPARE_EXIT=1 STUB_HEALTHZ_CODE=503
 bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
 [ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] ||
@@ -1175,7 +1226,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.campaignSize == "full" and
   .data.campaignRange.determinable == false' >/dev/null
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-late GO "$BASE_SHA" "$(sha b)" 5
@@ -1193,19 +1244,19 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
-export STUB_COMPARE_FILES="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":900,"behind_by":0,"files":[{"filename": f"XZO-BACKEND/src/f{i}.ts"} for i in range(300)]}))')"
+export STUB_COMPARE_FILES="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":900,"behind_by":0,"files":[{"filename": f"api/src/f{i}.ts"} for i in range(300)]}))')"
 export STUB_TREES_FILE="$STATE_DIR/big-trees.json"
 python3 - "$BASE_SHA" "$PARENT_SHA" > "$STUB_TREES_FILE" <<'PYF'
 import json, sys
 base, target = sys.argv[1], sys.argv[2]
 blob = lambda p, s: {"path": p, "type": "blob", "mode": "100644", "sha": s}
-paths = [f"XZO-BACKEND/src/modules/some/deeply/nested/feature/area/file_{i:05d}.ts" for i in range(4600)]
-paths += [f"XZO-BACKEND/migrations/{i:04d}_a_descriptively_named_migration_step.sql" for i in range(600)]
+paths = [f"api/src/modules/some/deeply/nested/feature/area/file_{i:05d}.ts" for i in range(4600)]
+paths += [f"api/migrations/{i:04d}_a_descriptively_named_migration_step.sql" for i in range(600)]
 print(json.dumps({base: {"truncated": False, "tree": [blob(p, "a") for p in paths]},
                   target: {"truncated": False, "tree": [blob(p, "b") for p in paths]}}))
 PYF
 export SMOKE_SIZING_RULES="$STATE_DIR/rules-big.json"
-printf '%s' '{"full":["XZO-BACKEND/migrations/0599_*"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
+printf '%s' '{"full":["api/migrations/0599_*"],"lightAllowed":["web/**"]}' > "$SMOKE_SIZING_RULES"
 T5J3_FIRST="$(bash "$GATE" poll)"
 jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
   .data.campaignRange.determinable == true and .data.campaignRange.fileListMethod == "tree" and
@@ -1247,7 +1298,7 @@ export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 H1_SHA="$FREEZE_SHA"
 H2_SHA="$(sha 5)"
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 freeze_ready_fixture 13 "$H1_SHA" "$PARENT_SHA"
 T5J4_HOLD="$STATE_DIR/hold-a"
 T5J4_A_OUT="$STATE_DIR/poll-a.out"
@@ -1300,7 +1351,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
 T5J5_HOLD="$STATE_DIR/hold-a"
 SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE="$T5J5_HOLD" bash "$GATE" poll > "$STATE_DIR/poll-a.out" 2>/dev/null &
@@ -1330,7 +1381,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled"' >/dev/null
 T5J6_PIN="$(cat "$(pin_file 13 "$H2_SHA")")"
@@ -1349,7 +1400,7 @@ done
 freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
 T5J7_VIEW_A="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
 jq -e '.campaignRange.pinState == "valid" and .campaignRange.determinable == true' <<<"$T5J7_VIEW_A" >/dev/null
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":9,"behind_by":0,"files":[{"filename":"XZO-BACKEND/migrations/400_later.sql"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":9,"behind_by":0,"files":[{"filename":"api/migrations/400_later.sql"}]}'
 T5J7_OTHER_STATE="$(mktemp -d)"
 [ "$(SMOKE_GATE_STATE_DIR="$T5J7_OTHER_STATE" bash "$GATE" check 13 | jq -c "$RANGE_VIEW")" = "$T5J7_VIEW_A" ] ||
   { echo "5j-vii: a second coordinator (different private state dir) recomputed the range" >&2; exit 1; }
@@ -1378,7 +1429,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
-export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
 freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
 T5J8_FIRST="$(bash "$GATE" poll)"
 jq -e '.data.trigger == "pr_build_settled" and .data.campaignRange.determinable == true' <<<"$T5J8_FIRST" >/dev/null
@@ -1401,7 +1452,7 @@ for T5J8_KIND in dangling livelink directory; do
   fresh_state
   export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
     SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
-  export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+  export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/other.ts"}]}'
   freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
   mkdir -p "$SMOKE_GATE_LEASE_DIR"
   case "$T5J8_KIND" in
@@ -1791,6 +1842,14 @@ pin_file() { printf '%s/range-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DI
 journeys_fixture "$BACKEND_ONLY"
 bash "$GATE" check 13 | jq -e '.settled == true and .campaignRange.pinState == "absent" and .journeys.pinState == "absent"' >/dev/null
 [ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+# claim reaches detect_freeze without check/poll's config guard, so an unset or
+# malformed marker prefix must refuse there too, never admit the freeze as ordinary.
+for bad in "SMOKE_GATE_FRONTEND_PREFIX=" "SMOKE_GATE_BACKEND_PREFIX=api" "SMOKE_GATE_MIGRATIONS_PREFIX="; do
+  T5L_BAD="$(env "$bad" bash "$GATE" claim run-manual-13x 13 "$FREEZE_SHA" 2>/dev/null || true)"
+  jq -e '.ok == false and (.error | startswith("gate misconfigured"))' <<<"$T5L_BAD" >/dev/null ||
+    { echo "5l: claim with $bad did not refuse: $T5L_BAD" >&2; exit 1; }
+done
+[ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-manual-13x.json" ] || { echo "5l: a refused claim left a lease" >&2; exit 1; }
 T5L_CLAIM="$(bash "$GATE" claim run-manual-13 13 "$FREEZE_SHA")"
 jq -e '.ok == true and .runId == "run-manual-13" and .campaignRange.pinState == "valid" and
   .campaignRange.baselinePinned == true and .journeys.pinned == true and .journeys.pinState == "valid" and
@@ -1879,7 +1938,7 @@ unset STUB_COMMIT_GET_EXIT
 journeys_fixture "$BACKEND_ONLY"
 T5L_J="$(sha 9)"
 export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'   # the PR's CURRENT (J) diff
-export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]}')"
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]}')"
 T5L_DRIFT="$(bash "$GATE" claim run-drift 13 "$FREEZE_SHA")"
 jq -e '.ok == true and .campaignRange.pinState == "valid" and .journeys.pinned == true' <<<"$T5L_DRIFT" >/dev/null ||
   { echo "5l: a freeze head on an advanced PR was not pinned at claim: $T5L_DRIFT" >&2; exit 1; }
@@ -1888,7 +1947,7 @@ bash "$GATE" release run-drift >/dev/null
 # poll shares the classifier: the listed head H is a freeze by its own commit.
 journeys_fixture "$BACKEND_ONLY"
 export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
-export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]}')"
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]}')"
 bash "$GATE" check 13 | jq -e '.isFreezePr == true and .settled == true' >/dev/null ||
   { echo "5l: check classified a freeze head by the PR's current files" >&2; exit 1; }
 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.isFreezePr == true and .data.journeys.pinned == true' >/dev/null ||
@@ -1906,12 +1965,12 @@ jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)'
 # ordinary: no freeze keys, the head's own CI (not the parent's) consulted,
 # an ordinary claim, and `finish` writes no handoff. So are a rename, a
 # modification, and the two markers added beside a third file.
-MARKERS='{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}'
+MARKERS='{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}'
 head_files() { export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" --argjson f "$1" '{($h):$f}')"; }
 for shape in \
-  "removed|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"removed\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\",\"status\":\"removed\"}]" \
-  "renamed|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"renamed\",\"previous_filename\":\"XZO-BACKEND/.freeze\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\"}]" \
-  "modified|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"modified\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\"}]" \
+  "removed|[{\"filename\":\"api/.render-freeze\",\"status\":\"removed\"},{\"filename\":\"web/.render-freeze\",\"status\":\"removed\"}]" \
+  "renamed|[{\"filename\":\"api/.render-freeze\",\"status\":\"renamed\",\"previous_filename\":\"api/.freeze\"},{\"filename\":\"web/.render-freeze\"}]" \
+  "modified|[{\"filename\":\"api/.render-freeze\",\"status\":\"modified\"},{\"filename\":\"web/.render-freeze\"}]" \
   "extra-file|[$MARKERS,{\"filename\":\"api/src/x.ts\"}]" \
   "two-parents|[$MARKERS]"; do
   label="${shape%%|*}"; files="${shape#*|}"
@@ -1954,7 +2013,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha 1)"
 export STUB_PR_VIEW="{\"number\":11,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/migrations/0099_add_col.sql"},{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/migrations/0099_add_col.sql"},{"filename":"api/src/foo.ts"}]'
 bash "$GATE" check 11 | jq -e '.migrationsTouched == true and .settled == false' >/dev/null
 # Same PR through poll: refuses with a throttled alarm, never a settle wake.
 export STUB_PR_LIST="[{\"number\":11,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
@@ -2001,7 +2060,7 @@ jq -e '.activeRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export STUB_PR_LIST="[{\"number\":55,\"headRefOid\":\"$DUP_SHA\",\"headRefName\":\"feature/dup\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$DUP_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"XZO-DEV-BACKEND PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-55.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$DUP_SHA\"}}]"
@@ -2091,7 +2150,7 @@ stalled_fixture() { # <pr> <sha>: a settling ordinary PR plus a readable run roo
   export SMOKE_GATE_RUN_ROOT="$STATE_DIR/qa-runs"
   mkdir -p "$SMOKE_GATE_RUN_ROOT"
   export STUB_PR_LIST="[{\"number\":$1,\"headRefOid\":\"$2\",\"headRefName\":\"feature/stall\"}]"
-  export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+  export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
   export STUB_RUN_LIST="[{\"headSha\":\"$2\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
   export STUB_SERVICES="[{\"id\":\"srv-backend-pr-$1\",\"name\":\"XZO-DEV-BACKEND PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-$1.onrender.com\"}}]"
   export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
@@ -2560,7 +2619,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 TARGET_SHA="$(sha 7)"
 FREEZE_HEAD_SHA="$(sha 8)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$TARGET_SHA"
 bash "$GATE" claim run-freeze-1 60 "$FREEZE_HEAD_SHA" >/dev/null
 
@@ -2613,7 +2672,7 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 NORMAL_SHA="$(sha 9)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 bash "$GATE" claim run-normal-1 61 "$NORMAL_SHA" >/dev/null
 DEV_HOLD2="$STATE_DIR/dev-gate2/develop-hold.json"
 DEV_PUBLISH2="$STATE_DIR/dev-gate2/latest-verdict.json"
@@ -2636,7 +2695,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 LOCKFAIL_TARGET="$(sha 1)"
 LOCKFAIL_HEAD="$(sha 2)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$LOCKFAIL_TARGET"
 bash "$GATE" claim run-lockfail 70 "$LOCKFAIL_HEAD" >/dev/null
 
@@ -2675,7 +2734,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
 HEAD_SHA="$(sha 1)"
 OTHER_SHA="$(sha 2)"
 export STUB_PR_VIEW="{\"number\":61,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$OTHER_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-61\",\"name\":\"XZO-DEV-BACKEND PR #61\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
@@ -2698,7 +2757,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha 3)"
 export STUB_PR_LIST="[{\"number\":77,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST_EXIT=1
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-77\",\"name\":\"XZO-DEV-BACKEND PR #77\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
@@ -2780,7 +2839,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 CRASH_TARGET="$(sha 9)"
 CRASH_HEAD="$(sha a)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$CRASH_TARGET"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-91\",\"name\":\"backend-preview PR #91\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
 export STUB_SUSPEND_CODE=202
@@ -2854,7 +2913,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 CLAIMED="$(sha c)"
 NOT_CLAIMED="$(sha d)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$(sha e)"
 DEV_PUBLISH4="$STATE_DIR/dev-gate4/latest-verdict.json"
 DEV_HOLD4="$STATE_DIR/dev-gate4/develop-hold.json"
@@ -2893,7 +2952,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 DIV_SHA="$(sha f)"
 DIV_TARGET="$(sha 0)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$DIV_TARGET"
 SHARED="$STATE_DIR/shared-mount"
 mkdir -p "$SHARED"
@@ -2950,6 +3009,16 @@ bash "$GATE" finish "$BLIND_SHA" run-blind NO_GO | jq -e '
   .ok == true and .handoff.written == false and
   (.handoff.reason | test("freeze-PR status is unknown"))
 ' >/dev/null || { echo "an unreadable diff during finish was reported as an ordinary PR" >&2; exit 1; }
+unset STUB_PR_FILES_EXIT
+# ...but a misconfigured layout prefix is refused before finish runs at all, so
+# the slot and lease stay held for a retry instead of dropping a possible freeze verdict.
+bash "$GATE" claim run-blind-2 96 "$BLIND_SHA" >/dev/null
+T24="$(SMOKE_GATE_MIGRATIONS_PREFIX= bash "$GATE" finish "$BLIND_SHA" run-blind-2 NO_GO 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$T24" >/dev/null ||
+  { echo "24: finish with a misconfigured prefix did not refuse for retry: $T24" >&2; exit 1; }
+[ -e "$SMOKE_GATE_LEASE_DIR/lease-run-blind-2.json" ] || { echo "24: the refused finish released its lease" >&2; exit 1; }
+bash "$GATE" finish "$BLIND_SHA" run-blind-2 NO_GO | jq -e '.ok == true' >/dev/null ||
+  { echo "24: the retried finish with the prefix restored did not complete" >&2; exit 1; }
 
 
 # --- 25. Cross-target interleaving: the divergence check compares the hold
@@ -2963,7 +3032,7 @@ bash "$GATE" finish "$BLIND_SHA" run-blind NO_GO | jq -e '
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 ILV_SHARED="$STATE_DIR/interleave"
 mkdir -p "$ILV_SHARED"
 export SMOKE_GATE_PUBLISH_FILE="$ILV_SHARED/latest-verdict.json" \
@@ -3011,7 +3080,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 APPFAIL_TARGET="$(sha 3)"
 APPFAIL_HEAD="$(sha 4)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$APPFAIL_TARGET"
 APPFAIL_DIR="$STATE_DIR/dev-gate4"
 mkdir -p "$APPFAIL_DIR"
@@ -3122,7 +3191,7 @@ STATE_A="$STALE_BASE/private-a" STATE_B="$STALE_BASE/private-b"
 mkdir -p "$STATE_A" "$STATE_B"
 COMMON_LEASE="$TEST_SHARED_ROOT/stale-separate/leases"
 STALE_SHA="$(sha 5)"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$(sha 4)"
 export SMOKE_GATE_PUBLISH_FILE="$STALE_BASE/latest-verdict.json" \
   SMOKE_GATE_HOLD_FILE="$STALE_BASE/develop-hold.json" \
@@ -3325,7 +3394,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 POLL_FAIL_SHA="$(sha 9)"
 export STUB_PR_LIST="[{\"number\":126,\"headRefOid\":\"$POLL_FAIL_SHA\",\"headRefName\":\"feature/y\"}]"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$POLL_FAIL_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES='[{"id":"backend-pr-126","name":"backend PR #126","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://preview.invalid"}}]'
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$POLL_FAIL_SHA\"}}]"
@@ -3622,7 +3691,7 @@ export SMOKE_SIZING_RULES="$RULES"
 PARENT_SHA="$(sha e)"
 FREEZE_SHA="$(sha f)"
 export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PR_FILES='[{"filename":"api/.render-freeze"},{"filename":"web/.render-freeze"}]'
 export STUB_PARENT_SHA="$PARENT_SHA"
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$(sha a)" "$(sha b)" 5
@@ -3737,7 +3806,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 D_SHA="$(sha 2)"
 export STUB_PR_VIEW="{\"number\":80,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$D_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$D_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[\
 {\"id\":\"srv-frontend-pr-80\",\"name\":\"XZO-DEV-FRONTEND PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-80.onrender.com\"}},\
@@ -3767,7 +3836,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 N_SHA="$(sha 3)"
 export STUB_PR_VIEW="{\"number\":81,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$N_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$N_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[\
 {\"id\":\"srv-frontend-pr-81\",\"name\":\"XZO-DEV-FRONTEND PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-81.onrender.com\"}},\
@@ -3808,7 +3877,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 G_SHA="$(sha 4)"
 export STUB_PR_VIEW="{\"number\":82,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$G_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$G_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[\
 {\"id\":\"srv-backend-pr-82-a\",\"name\":\"XZO-DEV-BACKEND PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-82-a.onrender.com\"}},\
@@ -3830,7 +3899,7 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 E_SHA="$(sha 5)"
 export STUB_PR_VIEW="{\"number\":83,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$E_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$E_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-83\",\"name\":\"XZO-DEV-BACKEND PR #83\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-83.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$E_SHA\"}}]"
@@ -3853,10 +3922,10 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 F_SHA="$(sha 6)"
-# The one fixture path that must match the gate's hardcoded frontend prefix is
-# built from the gate's own FRONTEND_PREFIX constant rather than restated here.
-F_FRONTEND_PREFIX="$(sed -n 's/^FRONTEND_PREFIX="\(.*\)"$/\1/p' "$GATE")"
-[ -n "$F_FRONTEND_PREFIX" ] || { echo "36b: could not read FRONTEND_PREFIX from the gate" >&2; exit 1; }
+# The one fixture path that must match the frontend prefix is built from the
+# same env the gate reads rather than restated here.
+F_FRONTEND_PREFIX="$SMOKE_GATE_FRONTEND_PREFIX"
+[ -n "$F_FRONTEND_PREFIX" ] || { echo "36b: SMOKE_GATE_FRONTEND_PREFIX is not exported" >&2; exit 1; }
 export STUB_PR_VIEW="{\"number\":84,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$F_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"backend/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$F_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
@@ -3991,7 +4060,7 @@ jq -e --arg sha "$W_SHA" '.completedSha == $sha and .activeRunId == null' "$STAT
 # The suspended preview now 503s. Same headSha, same STUB_PR_FILES/RUN_LIST
 # (evaluate_pr re-fetches them fresh every poll) as a plain settled PR would
 # use, but healthz now reports the suspension.
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$W_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_HEALTHZ_CODE=503
 export STUB_PR_LIST="[{\"number\":86,\"headRefOid\":\"$W_SHA\",\"headRefName\":\"feature/x\"}]"
@@ -5743,7 +5812,7 @@ jq -e --arg sha "$CROSS_SHA_B" '.deploySha == $sha and .terminal == null' \
 fresh_state
 WAIT_SHA="$(sha a)"
 export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/wait\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/wait.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/wait.ts"}]'
 export STUB_SERVICES='[{"id":"srv-backend-pr-301","name":"XZO-DEV-BACKEND PR #301","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://xzo-dev-backend-pr-301.onrender.com"}}]'
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$WAIT_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
@@ -5807,7 +5876,7 @@ jq -e --arg expected "$WAIT_SHA" --arg observed "$MOVED_SHA" '
 fresh_state
 WAIT_SHA="$(sha e)"
 export STUB_PR_VIEW="{\"number\":304,\"state\":\"OPEN\",\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/pending\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/pending.ts"}]'
+export STUB_PR_FILES='[{"filename":"api/src/pending.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$WAIT_SHA\",\"status\":\"in_progress\",\"conclusion\":null,\"workflowName\":\"CI\"}]"
 WAIT_CLOCK="$STATE_DIR/pending-clock.txt"
 printf '400\n400\n500\n500\n' > "$WAIT_CLOCK"

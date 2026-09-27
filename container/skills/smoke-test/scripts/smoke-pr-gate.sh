@@ -26,6 +26,7 @@ for _a in "$@"; do
   if [ "$_a" = "--takeover" ]; then TAKEOVER=true; else _ARGS+=("$_a"); fi
 done
 set -- ${_ARGS[@]+"${_ARGS[@]}"}; GATE_VERB="${1:-poll}"; . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-pr-gate-observe.sh"
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
 
 REPO="${SMOKE_GATE_REPO:-}"
 BRANCH="${SMOKE_GATE_BRANCH:-develop}"
@@ -115,12 +116,12 @@ CONTROL_LOCK="$STATE_DIR/control.lock"
 # this lock is the one exception and DOES fail closed (see below), because it
 # guards a real write (cross-PR run-id uniqueness), not just an alarm stamp.
 
-# Deployment-specific path conventions from the design doc — not exposed as
-# env because they are facts about this repo's layout, not gate policy.
-FRONTEND_PREFIX="XZO-FRONTEND/"
-MIGRATIONS_PREFIX="XZO-BACKEND/migrations/"
-FREEZE_MARKER_BACKEND="XZO-BACKEND/.render-freeze"
-FREEZE_MARKER_FRONTEND="XZO-FRONTEND/.render-freeze"
+# Repo-layout prefixes, validated once before any mode (smoke-gate-layout.sh).
+FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
+BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"
+MIGRATIONS_PREFIX="${SMOKE_GATE_MIGRATIONS_PREFIX:-}"
+FREEZE_MARKER_BACKEND="${BACKEND_PREFIX}.render-freeze"
+FREEZE_MARKER_FRONTEND="${FRONTEND_PREFIX}.render-freeze"
 
 # Preview-identity disambiguation (#1536). Render has twice provisioned two
 # services sharing one display name under the same parent (PR #1533, PR
@@ -156,8 +157,6 @@ SIZING_CLASSIFIER="$SIZING_CLASSIFIER_DIR/campaign-size-classify.py"
 # gate is byte-identical to a gate that has never heard of journeys.
 JOURNEYS_CATALOGUE="${SMOKE_JOURNEYS_CATALOGUE:-/workspace/agent/journeys.json}"
 JOURNEYS_TOOL="$SIZING_CLASSIFIER_DIR/smoke-journeys.py"
-
-mkdir -p "$STATE_DIR"
 
 iso_now() {
   date -u +'%Y-%m-%dT%H:%M:%SZ'
@@ -2927,13 +2926,56 @@ freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha}
 # tell" (the probe's ok): finish reports it — a failed probe used to collapse to
 # isFreezePr:false and drop a freeze-run verdict on the floor silently — and
 # claim refuses on it, because a freeze campaign is never admitted unpinned.
+# A PR campaign's run id: <prefix>-pr<n>-<sha12>-<YYYYMMDDTHHMMSSZ>, the one
+# shape smoke_run_id.py parses for every reader.
+campaign_run_id() {  # <pr> <sha> <epoch>
+  printf '%s-pr%s-%s-%s' "$RUN_PREFIX" "$1" "${2:0:12}" "$(date -u -d "@$3" +%Y%m%dT%H%M%SZ)"
+}
+
 detect_freeze() {
   local pr="$1" sha="$2" probe
   probe="$(freeze_head_probe "$sha")"
   jq -c '{isFreezePr:.isFreeze, filesOk:.ok, targetSha:.targetSha}' <<<"$probe"
 }
 
+# " SMOKE_GATE_<KEY>" for every key check, poll and config refuse on.
+gate_config_missing() {
+  local k MISSING=""
+  for k in REPO BACKEND_SERVICE FRONTEND_SERVICE; do
+    [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
+  done
+  MISSING="$MISSING$LAYOUT_MISSING"
+  # A knob that fell back to its default because the deployed value was not a
+  # number is a misconfiguration, not a detail — name it in the same alarm.
+  MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+  printf '%s' "$MISSING"
+}
+
+# `config`: the go-time check an operator runs through the wrapper. It judges
+# the environment the wrapper hands this script and exits 0 (ok) or 1 (key
+# names); it runs before the state dir is created, so it reads no state, takes
+# no lock and calls nothing remote (smoke-gate-config.test.sh holds that).
+config_verb() {
+  local missing
+  missing="$(gate_config_missing)"
+  if [ -z "$missing" ]; then jq -cn '{ok:true}'; exit 0; fi
+  jq -cn --argjson missing "$(printf '%s\n' $missing | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{ok:false,error:"gate misconfigured",missing:$missing}'
+  exit 1
+}
+
 COMMAND="${1:-poll}"
+
+# The layout validator runs once, before any mode: `poll` names a bad prefix in
+# its throttled gate_misconfigured wake below, and every other mode refuses here.
+LAYOUT_MISSING="$(layout_prefix_problems)"
+[ "$COMMAND" != config ] || config_verb
+if [ -n "$LAYOUT_MISSING" ] && [ "$COMMAND" != poll ]; then
+  jq -cn --argjson missing "$(printf '%s\n' $LAYOUT_MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{ok:false,error:"gate misconfigured",missing:$missing}'
+  exit 2
+fi
+mkdir -p "$STATE_DIR"
 
 # ---------------------------------------------------------------------------
 if [ "$COMMAND" = "wait-settled" ]; then
@@ -3067,13 +3109,7 @@ if [ "$COMMAND" = "check" ]; then
     jq -cn '{ok:false,error:"check requires a PR number"}'
     exit 2
   fi
-  MISSING=""
-  [ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-  [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-  [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
-# A knob that fell back to its default because the deployed value was not a
-# number is a misconfiguration, not a detail — name it in the same alarm.
-MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+  MISSING="$(gate_config_missing)"
   if [ -n "$MISSING" ]; then
     jq -cn --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
       '{ok:false,error:"gate misconfigured",missing:$missing}'
@@ -5002,13 +5038,7 @@ fi
 # poll: fail-closed on missing deployment config, throttled to one wake per
 # 6h so misconfiguration surfaces once as a visible alarm instead of silent
 # wakeAgent:false forever.
-MISSING=""
-[ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-[ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-[ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
-# A knob that fell back to its default because the deployed value was not a
-# number is a misconfiguration, not a detail — name it in the same alarm.
-MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+MISSING="$(gate_config_missing)"
 if [ -n "$MISSING" ]; then
   exec 8>"$CONTROL_LOCK"
   flock -w 5 8 || true
@@ -5465,11 +5495,11 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     RESUMED_RUN_ID=true
   else
     RUN_STAMP_EPOCH="$(date -u +%s)"
-    RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
+    RUN_ID="$(campaign_run_id "$W_PR" "$HEAD_SHA" "$RUN_STAMP_EPOCH")"
     while [ "$RUN_ID" = "$(jq -r '.activeRunId // empty' <<<"$STATE")" ] ||
           [ "$RUN_ID" = "$(jq -r '.completedRunId // empty' <<<"$STATE")" ]; do
       RUN_STAMP_EPOCH="$(( RUN_STAMP_EPOCH + 1 ))"
-      RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
+      RUN_ID="$(campaign_run_id "$W_PR" "$HEAD_SHA" "$RUN_STAMP_EPOCH")"
     done
   fi
   OWNER_TOKEN="$(new_owner_token || true)"

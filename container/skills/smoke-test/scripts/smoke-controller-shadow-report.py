@@ -55,11 +55,13 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPLAY_PATH = os.path.join(SCRIPT_DIR, "smoke-campaign-replay.py")
+sys.dont_write_bytecode = True  # smoke-acceptance.test.sh rejects __pycache__ beside the scripts
+sys.path.insert(0, SCRIPT_DIR)
+import smoke_run_id  # noqa: E402
 FIRE_SECONDS = 600
 POST_WINDOW_AFTER = dt.timedelta(hours=2)
 POST_WINDOW_BEFORE = dt.timedelta(minutes=5)
 COORDINATION_REDUCTION_BAR = 0.80
-RUN_PR_RE = re.compile(r"-pr(\d+)-")
 
 
 def parse_iso(s):
@@ -73,13 +75,6 @@ def parse_iso(s):
 
 def iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def claim_time(run_id):
-    try:
-        return dt.datetime.strptime(run_id.rsplit("-", 1)[1], "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
-    except (IndexError, ValueError):
-        return None
 
 
 def load_replay():
@@ -119,7 +114,7 @@ def finished_runs(gate_state_dir, since, until):
         doc = read_json(path)
         fin = parse_iso((doc or {}).get("finishedAt"))
         run_id = os.path.basename(os.path.dirname(path))
-        if not fin or not RUN_PR_RE.search(run_id):
+        if not fin or smoke_run_id.parse(run_id) is None:
             continue
         if fin >= since and (until is None or fin <= until):
             out[run_id] = doc
@@ -248,8 +243,8 @@ def collect(args):
                                       "--json", "number,createdAt,body", "--limit", "1000"])
     out = {}
     for run_id, verdict in sorted(runs.items()):
-        pr = int(RUN_PR_RE.search(run_id).group(1))
-        claim = claim_time(run_id)
+        pr = smoke_run_id.pr_number(run_id)
+        claim = smoke_run_id.claimed_at(run_id)
         fin = parse_iso(verdict.get("finishedAt"))
         window = (claim or fin, fin + POST_WINDOW_AFTER)
         entry = {"pr": pr, "verdict": verdict.get("verdict"), "finishedAt": verdict.get("finishedAt"),
@@ -305,7 +300,7 @@ REQUIRED_ACTUALS = ("postTimes", "prComments", "issues")
 
 
 def score(replay, run_id, verdict, actual, records, decisions):
-    pr = int(RUN_PR_RE.search(run_id).group(1))
+    pr = smoke_run_id.pr_number(run_id)
     act = {
         "verdict": verdict.get("verdict"), "finishedAt": verdict.get("finishedAt"),
         "verdictSha": verdict.get("sha"), "headSha": actual.get("headSha"),

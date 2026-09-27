@@ -92,6 +92,9 @@ import sys
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.dont_write_bytecode = True  # smoke-acceptance.test.sh rejects __pycache__ beside the scripts
+sys.path.insert(0, SCRIPT_DIR)
+import smoke_run_id  # noqa: E402
 BARRIER = os.path.join(SCRIPT_DIR, "smoke-evidence-barrier.sh")
 PAIR_IDENTITY = os.path.join(SCRIPT_DIR, "smoke-pair-identity.sh")
 READ_ONLY_COMMANDS = {("bash", BARRIER)}
@@ -1489,8 +1492,8 @@ class EffectLayer:
         # intake brief says so in as many words ("use its coordinatorOwnerToken
         # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
         # gate mints a FRESH token on every same-run recovery poll
-        # (smoke-pr-gate.sh:5475, written to lease/authority/state at :5504,
-        # :5509, :5554), and reconcile_claims records the new one the wake
+        # (smoke-pr-gate.sh:5505, written to lease/authority/state at :5534,
+        # :5539, :5584), and reconcile_claims records the new one the wake
         # carries. Writing wake.json only at intake left the run tree naming a
         # RETIRED token while the brief still told the owner to use it: every
         # scaffold write, and `adopt` -- the verb that exists for exactly this
@@ -1609,7 +1612,7 @@ class EffectLayer:
         ob = self.ctl.obligations().get(obligation_key(run_id, "owner", step)) or {}
         if (ob.get("detail") or {}).get("tokenReissued"):
             out.append(
-                "**YOUR OWNER TOKEN CHANGED (XZO #2046).** A recovery `poll` re-minted this run's coordinator "
+                "**YOUR OWNER TOKEN CHANGED.** A recovery `poll` re-minted this run's coordinator "
                 "lease under a fresh token, so the one you have been using is retired and every "
                 "`smoke-run-scaffold.sh` write will be refused by its owner fence. Re-read "
                 "`{run}/controller/wake.json` (refreshed with this brief), export its `coordinatorOwnerToken` as "
@@ -1866,8 +1869,7 @@ class GateView:
         for pr, st in self.pr_states.items():
             if run_id in (st.get("activeRunId"), st.get("completedRunId")):
                 return pr
-        m = re.match(r".*-pr(\d+)-", run_id)
-        return int(m.group(1)) if m else None
+        return smoke_run_id.pr_number(run_id)
 
 
 class RunView:
