@@ -40,7 +40,8 @@ written only after the vault write succeeds, because a declared name missing fro
 spawn that inherits it. A new grant takes effect at the group's next container start; a rotation takes
 effect on the next request.
 
-An agent may grant only to its own group and its own workgroup; with no target it grants to its own group.
+An agent may grant only to its own group and its own workgroup. With no target, a new secret goes to its own
+group and a rotation grants nothing new.
 `grant` from an agent is held for admin approval (it changes who holds a credential without a form to
 consent through); from the host it runs directly.
 

@@ -313,10 +313,13 @@ describe('the form', () => {
       caller: agentCaller,
     });
     expect(view.groups).toEqual([]);
-    expect(JSON.parse(h.deliveries[0].args[4] as string).body).toContain('nobody yet');
+    expect(JSON.parse(h.deliveries[0].args[4] as string).body).toContain('New grants: none; current holders keep it');
+    expect(JSON.parse(h.deliveries[0].args[4] as string).body).not.toContain('nobody yet');
     await hooks.submit(view.intakeId, 'UOWNER', SECRET);
     await settle();
     expect(h.groupGrants).toEqual([]);
+    expect(JSON.parse(h.deliveries[1].args[4] as string).text).toContain('New grants: none; current holders keep it');
+    expect(h.notes[0]).toContain('New grants: none; current holders keep it');
   });
 
   it('rotates by value only', async () => {

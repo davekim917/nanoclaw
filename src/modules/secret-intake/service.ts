@@ -115,12 +115,13 @@ function cardTitle(intake: Pick<Intake, 'rotate' | 'secretName'>): string {
   return `🔐 ${intake.rotate ? 'Rotate' : 'New'} secret: ${intake.secretName}`;
 }
 
-function grantsLine(groups: string[], workgroups: string[]): string {
+function grantsLine(groups: string[], workgroups: string[], rotate: boolean): string {
   const parts = [
     ...(groups.length ? [`groups ${groups.join(', ')}`] : []),
     ...(workgroups.length ? [`workgroups ${workgroups.join(', ')}`] : []),
   ];
-  return parts.length ? parts.join('; ') : 'nobody yet (vault only)';
+  if (rotate) return `New grants: ${parts.length ? parts.join('; ') : 'none; current holders keep it'}`;
+  return `Granted to: ${parts.length ? parts.join('; ') : 'nobody yet (vault only)'}`;
 }
 
 function injectionLine(spec: OnecliInjectionSpec): string {
@@ -238,7 +239,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
   const body = [
     `${requester} is asking for this secret.`,
     injection ? injectionLine(injection) : 'Replaces the value; where it is sent stays unchanged.',
-    `Granted to: ${grantsLine(groups, workgroups)}`,
+    grantsLine(groups, workgroups, input.rotate),
     `The value goes straight to the vault — no agent sees it. Expires ${formatLocalTime(new Date(intake.expiresAt).toISOString(), TIMEZONE)}.`,
   ].join('\n');
 
@@ -373,17 +374,17 @@ async function completeIntake(intake: Intake, namespacedUserId: string, value: s
   intake.detail = failedGrants.length ? `stored, but these grants failed: ${failedGrants.join('; ')}` : null;
   log.info('Secret intake stored', { intakeId: intake.id, secretName: intake.secretName, failedGrants });
 
-  const granted = grantsLine(intake.groups, intake.workgroups);
+  const granted = grantsLine(intake.groups, intake.workgroups, intake.rotate);
   const effect = intake.rotate
     ? 'The new value applies to the next request; no restart needed.'
     : 'A newly granted group picks it up at its next container start (ncl groups restart --id <group>).';
   await editCard(
     intake,
-    `${cardTitle(intake)}\n\nStored. Granted to: ${granted}.${intake.detail ? `\n\n⚠️ ${intake.detail}` : ''}`,
+    `${cardTitle(intake)}\n\nStored. ${granted}.${intake.detail ? `\n\n⚠️ ${intake.detail}` : ''}`,
   );
   await tellRequester(
     intake,
-    `Secret "${intake.secretName}" is stored in the vault (${intake.rotate ? 'rotated' : 'created'}); you never saw its value. Granted to: ${granted}. ${effect}${intake.detail ? ` WARNING: ${intake.detail}` : ''}`,
+    `Secret "${intake.secretName}" is stored in the vault (${intake.rotate ? 'rotated' : 'created'}); you never saw its value. ${granted}. ${effect}${intake.detail ? ` WARNING: ${intake.detail}` : ''}`,
   );
 }
 
