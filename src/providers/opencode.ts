@@ -406,7 +406,6 @@ registerProviderContainerConfig('opencode', async (ctx) => {
 
   env.OPENCODE_EFFORT = dbConfig?.effort ?? DEFAULT_OPENCODE_EFFORT;
 
-  // Forwarded only when set.
   for (const varName of OPENCODE_MODEL_CAPABILITY_VARS) {
     const value = resolveScopedOpenCodeEnv(ctx.hostEnv, varName, ctx.agentGroupFolder);
     if (value !== undefined && value.trim() !== '') env[varName] = value;
