@@ -1,14 +1,7 @@
 /**
- * Container copy of the checkout-layout primitive (plan §5.1,
- * docs/specs/repository-branch-clones/plan.md).
- *
- * `worktrees/<repo>` is a thread's primary checkout and `worktrees/<repo>@<slug>`
- * any other branch's; `@` is outside the repository-name charset, so names
- * parse unambiguously. Duplicated on purpose from the host copy,
- * `src/repository-workspaces.ts`, the same way
- * `container/agent-runner/src/managed-git-command-guard.ts` duplicates its
- * host counterpart. Both copies are pinned by the shared vector file beside
- * this one, `checkout-layout.fixtures.json` — read by both test suites.
+ * Container copy of the checkout-layout primitive: `worktrees/<repo>` is a thread's primary checkout,
+ * `worktrees/<repo>@<slug>` any other branch's (`@` is outside the repo-name charset). Duplicated on purpose from
+ * the host copy, `src/repository-workspaces.ts`; both are pinned by `checkout-layout.fixtures.json`.
  */
 import { createHash } from 'crypto';
 import fs from 'fs';

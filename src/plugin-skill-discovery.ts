@@ -1,35 +1,15 @@
 /**
- * Plugin-skill discovery for Codex parity.
+ * Plugin-skill discovery for Codex/OpenCode parity, shared by the host script and container-side setup.
  *
- * Walks a `~/plugins/`-style root and finds every portable skill (SKILL.md)
- * that should be exposed to Codex. The host script and the container-side
- * setup both consume this — same rules apply to `~/plugins/*` on host and
- * `/workspace/plugins/*` inside the container.
- *
- * Discovery preference order per plugin (highest-priority match wins, one
- * skill-name → one path):
- *
- *   1. `<plugin>/.agents/skills/<name>/SKILL.md`        ← runtime-agnostic canonical
- *   2. `<plugin>/skills/<name>/SKILL.md`                ← top-level skills dir
- *   3. `<plugin>/SKILL.md`                              ← single-skill (name = plugin)
- *   4. `<plugin>/plugin/skills/<name>/SKILL.md`         ← impeccable-style
+ * Per-plugin preference order (first match per skill name wins):
+ *   1. `<plugin>/.agents/skills/<name>/SKILL.md`   (runtime-agnostic canonical)
+ *   2. `<plugin>/skills/<name>/SKILL.md`
+ *   3. `<plugin>/SKILL.md`                         (single-skill, name = plugin)
+ *   4. `<plugin>/plugin/skills/<name>/SKILL.md`
  *   5. `<plugin>/<plugin>-cursor-integration/skills/<name>/SKILL.md`
  *   6. `<plugin>/<plugin>-claude-plugin/skills/<name>/SKILL.md`
  *
- * Skipped:
- *   - Plugins on `denyPlugins` (Claude-runtime-only by design — bootstrap-workflow,
- *     codex plugin, etc.)
- *   - Skill dirs under runtime-specific path segments: `.claude/`, `.cursor/`,
- *     `.opencode/`, `.gemini/`, `.kiro/`, `.trae/`, `.trae-cn/`, `.qoder/`,
- *     `.rovodev/`, `.github/`, `.pi/` (these are runtime-specific duplicates;
- *     prefer `.agents/skills/` which is the canonical multi-runtime version)
- *   - SKILL.md files with `user-invocable: false` in frontmatter
- *   - Deprecated dirs under `<plugin>/deprecated/`
- *   - Plugins under `<plugin>/plugins/<sub>/skills/` when `<sub>` matches a
- *     plugin-specific denylist (e.g. bootstrap-workflow within davekim917/bootstrap)
- *   - Codex-native plugin skill roots that are loaded through Codex plugin
- *     metadata. Mirroring those into `~/.agents/skills` would create a second
- *     same-named install path and make source precedence ambiguous.
+ * Codex-native plugin skill roots are skipped: mirroring them creates a second same-named install path.
  */
 import fs from 'fs';
 import path from 'path';
@@ -44,22 +24,14 @@ export interface DiscoveredSkill {
   /** Plugin folder it came from */
   plugin: string;
   /**
-   * Absolute path to the repository root that must CONTAIN every byte this
-   * skill contributes to a mirror. The mirror is copied into an agent
-   * container, so the host reading a path the plugin chose is the host moving
-   * whatever that path resolves to across the host→container boundary. A
-   * plugin's code being trusted to RUN in the container is a different
-   * permission (the reasoning `readRulesetFile` carries in
-   * `src/claude-md-compose.ts`). Producers set it to the directory they walked;
+   * Repository root that must CONTAIN every byte this skill contributes: the mirror is copied into an agent
+   * container, so reading a plugin-chosen path moves whatever it resolves to across the host→container boundary.
    * `syncSkillSymlinks` refuses anything resolving outside it.
    */
   pluginRoot: string;
 }
 
-/**
- * `fs.realpathSync`, or null when the path does not resolve (missing, dangling
- * symlink, permission). Callers treat null as "refuse", never as "allow".
- */
+/** `fs.realpathSync`, or null when the path does not resolve. Null means refuse. */
 export function resolveRealPath(target: string): string | null {
   try {
     return fs.realpathSync(target);
@@ -69,27 +41,16 @@ export function resolveRealPath(target: string): string | null {
 }
 
 /**
- * Is an already-resolved path inside an already-resolved root?
- *
- * Both sides must come from `realpathSync`, and the boundary is a separator so
- * a sibling directory named `<root>-evil` cannot prefix-match. Same shape as
- * the containment in `readRulesetFile` (`src/claude-md-compose.ts`).
+ * Is an already-resolved path inside an already-resolved root? Separator
+ * boundary, so a sibling named `<root>-evil` cannot prefix-match.
  */
 export function isWithinResolvedRoot(resolved: string, resolvedRoot: string): boolean {
   return resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep);
 }
 
 /**
- * The resolved repository roots a mirror built from `pluginsRoot` may point
- * into: one per plugin directory, each `realpath`-resolved so an ordinarily
- * symlinked `~/plugins/<name>` (a dev checkout living elsewhere) keeps working.
- *
- * Resolving per plugin rather than taking `realpath(pluginsRoot)` as one root is
- * what makes that dev-checkout case work; the cost is that a plugin root which
- * is ITSELF a symlink to somewhere broad widens its own boundary. Placing that
- * link is a write to `~/plugins`, i.e. an operator act with the same authority
- * as installing the plugin — the input this contains is what a repository holds,
- * not what the operator mounted.
+ * Resolved repository roots a mirror may point into, one per plugin dir (resolved so symlinked checkouts work).
+ * A plugin root that is itself a broad symlink widens its own boundary; placing it is an operator act.
  */
 export function resolvePluginRoots(pluginsRoot: string): string[] {
   let entries: string[];
@@ -111,51 +72,26 @@ export function resolvePluginRoots(pluginsRoot: string): string[] {
   return roots;
 }
 
-/**
- * Plugins to skip entirely. These wrap Claude-only runtime functionality
- * (Skill tool, Agent tool, slash-command machinery).
- */
+/** Plugins skipped entirely: Claude-only runtime functionality. */
 export const DEFAULT_DENY_PLUGINS = new Set<string>([
-  // bootstrap: many sub-plugins inside; we walk it with a finer-grained denylist
-  //            via DENY_SUB_PLUGIN_SKILL_DIRS, not at the top level.
-  // codex: skills here are Codex-plugin internal, already loaded via the codex
-  //        Claude plugin and either non-user-invocable or specific to Claude.
+  // bootstrap is walked with the finer-grained DENY_SUB_PLUGIN_SKILL_DIRS instead.
+  // codex: Codex-plugin internal skills, already loaded via the codex Claude plugin.
   'codex',
-  // design-artifact-loop: ships in-tree (container/skills skill + the
-  //   agent-runner design_review MCP tool rooted at /workspace/agent). The
-  //   standalone plugin's portable skill uses cwd-based paths the in-container
-  //   tool rejects — mirroring it would duplicate the in-tree skill with
-  //   conflicting instructions. Host codex loads it natively via `codex plugin add`.
+  // design-artifact-loop ships in-tree; its standalone skill's cwd-based paths conflict with the in-container tool.
   'design-artifact-loop',
 ]);
 
 /**
- * Within a multi-plugin repo (like davekim917/bootstrap, which contains
- * workflow/domain/tools sub-plugins), these maps mark the *sub-plugin* skill
- * roots to ignore — runtime-conditional. Different agent runtimes have
- * different native plugin loaders, so a skill that's "denied" for one runtime
- * (because the runtime loads it via a native path) may need to be surfaced
- * for another runtime that lacks that loader.
- *
- * Format: `<plugin>/<sub-plugin-skills-segment>`
- *
- * Sibling-parity invariant: when adding a new runtime, the denylist for that
- * runtime should ONLY exclude skill roots that this runtime loads through
- * another path. Skills that can't be invoked but CAN be read as instruction
+ * Per-runtime sub-plugin skill roots to ignore (`<plugin>/<sub-plugin-skills-segment>`). Deny a root for a
+ * runtime ONLY when that runtime loads it through another path; skills that can't be invoked but can be read as
  * text should still be surfaced.
  */
 const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> = {
   claude: new Set<string>([
-    // workflow-agents: same skill names as the Claude workflow; the Claude
-    // runtime already loads its own `bootstrap/plugins/workflow/skills` via
-    // the Claude plugin marketplace, so mirroring the codex variant would be
-    // a name-collision duplicate.
+    // workflow-agents: same skill names as the Claude workflow the Claude runtime already loads; a duplicate here.
     'bootstrap/plugins/workflow-agents/skills',
-    // orchestrate-agents: same reasoning as workflow-agents. Claude loads
-    // `bootstrap/plugins/orchestrate/skills` from the marketplace, so the
-    // agents twin is a same-name duplicate here. Without this entry the winner
-    // between the two directories is decided by first-match-wins over an
-    // unsorted readdirSync (see the discovery loop below), i.e. arbitrary.
+    // orchestrate-agents: same-name duplicate of the Claude-loaded orchestrate; without this entry the winner is
+    // decided by an unsorted readdirSync, i.e. arbitrary.
     'bootstrap/plugins/orchestrate-agents/skills',
   ]),
   codex: new Set<string>([
@@ -164,44 +100,26 @@ const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> =
     // Codex workflow: installed through `.codex-plugin/plugin.json`, not the
     // legacy skills mirror. Same-name collision would make precedence ambiguous.
     'bootstrap/plugins/workflow-agents/skills',
-    // Claude orchestrate: requires Claude's Skill/Agent tool, same as the
-    // Claude workflow above. Its orchestrate-agents twin needs no entry —
-    // that one ships `.codex-plugin`, so the manifest rule already keeps it
-    // out of the codex mirror.
+    // Claude orchestrate: requires Claude's Skill/Agent tool. orchestrate-agents needs no entry: it ships
+    // `.codex-plugin`, so the manifest rule already keeps it out of the codex mirror.
     'bootstrap/plugins/orchestrate/skills',
   ]),
   opencode: new Set<string>([
     // Claude workflow: requires Claude's Skill/Agent tool.
     'bootstrap/plugins/workflow/skills',
-    // Claude orchestrate: same reasoning as the Claude workflow above — its
-    // /orchestrate SKILL.md dispatches through Claude's Agent tool, which
-    // opencode does not have. Its twin under orchestrate-agents stays
-    // surfaced, matching how team-* already resolves from workflow-agents.
+    // Claude orchestrate dispatches through Claude's Agent tool, which opencode lacks; the orchestrate-agents twin
+    // stays surfaced.
     'bootstrap/plugins/orchestrate/skills',
-    // workflow-agents is NOT denied for opencode — there's no native codex-plugin
-    // loader on opencode, and surfacing the skill TEXT gives the agent
-    // awareness of /team-* patterns even without the spawn_task harness
-    // (which is a separate runtime gap).
+    // workflow-agents is NOT denied: opencode has no codex-plugin loader, and the skill text still helps.
   ]),
 };
 
 export type AgentRuntime = 'claude' | 'codex' | 'opencode';
 
-/**
- * Default runtime when none is specified. 'claude' is intentionally chosen as
- * the most-conservative fallback: every runtime is allowed to see Claude's
- * `bootstrap/plugins/workflow/skills` (since the workflow-claude denylist
- * targets the codex-loaded path, not the Claude-loaded one). Callers should
- * still pass `runtime` explicitly; the default exists only for back-compat
- * with pre-runtime-split callers that haven't been updated.
- */
+/** Most-conservative fallback, for back-compat only; callers should pass `runtime`. */
 const DEFAULT_RUNTIME: AgentRuntime = 'claude';
 
-/**
- * Path segments that mean "runtime-specific copy of a skill" — we prefer the
- * `.agents/skills/` canonical version (or the plugin-author's chosen top-level)
- * over these.
- */
+/** Runtime-specific skill copies; the `.agents/skills/` canonical version is preferred. */
 const RUNTIME_SPECIFIC_DIRS = new Set<string>([
   '.claude',
   '.cursor',
@@ -217,29 +135,17 @@ const RUNTIME_SPECIFIC_DIRS = new Set<string>([
 ]);
 
 /**
- * A (sub)plugin dir that ships `.codex-plugin/plugin.json` is loaded natively by
- * Codex through its plugin marketplace/cache — skills namespaced `<plugin>:`,
- * plus any MCP server the plugin declares. Mirroring such a plugin into the
- * portable-skill set would DUPLICATE every skill (unprefixed, and — worse —
- * stripped of its MCP server). So the Codex mirror skips a plugin Codex already
- * loads natively. This is orthogonal to the .nanoclaw-plugin.json marker: the
- * marker says "don't deliver to this sibling AT ALL" (any mechanism); this rule
- * says "don't DOUBLE-deliver to Codex via the mirror what it already gets
- * natively." A Codex-native plugin therefore stays OUT of `denySiblings` for
- * codex (Codex should have it) yet is still skipped from the Codex mirror here.
+ * A plugin shipping `.codex-plugin/plugin.json` is loaded natively by Codex (skills plus its MCP server);
+ * mirroring it would duplicate every skill without the MCP server. Orthogonal to `.nanoclaw-plugin.json`
+ * `denySiblings`: a Codex-native plugin stays delivered to Codex, just not through the mirror.
  */
 function loadedNativelyByCodex(pluginRootDir: string): boolean {
   return fs.existsSync(path.join(pluginRootDir, '.codex-plugin', 'plugin.json'));
 }
 
 /**
- * Per-plugin sibling routing marker: `~/plugins/<plugin>/.nanoclaw-plugin.json`.
- * The single source of truth for which of the three container agent providers
- * (claude | codex | opencode) a plugin is delivered to. Default is all three;
- * `denySiblings` is the exception list. Written/updated by enable-agent-plugin
- * (`--deny`/`--allow`) or edited by hand, and re-read on every reconcile and
- * every container spawn — so a change after initial enabling just takes effect,
- * no drift. See docs and enable-agent-plugin.ts.
+ * `~/plugins/<plugin>/.nanoclaw-plugin.json` is the single source of truth for which sibling providers get a
+ * plugin (default all; `denySiblings` is the exception list). Re-read on every reconcile and spawn.
  */
 export function readPluginDenySiblings(pluginDir: string): Set<AgentRuntime> {
   try {
@@ -297,11 +203,7 @@ function readPluginName(skillDir: string): string | null {
   return fm.name || null;
 }
 
-/**
- * For a single plugin folder, enumerate every portable skill following the
- * preference order. Returns each skill exactly once (by name) — later
- * matches with the same name are dropped.
- */
+/** One plugin folder's portable skills in preference order, each name once. */
 function discoverInPlugin(
   pluginDir: string,
   pluginName: string,
@@ -312,28 +214,12 @@ function discoverInPlugin(
 ): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
 
-  // Manifest-derived mirror routing: the Codex mirror skips any plugin root
-  // Codex loads natively (see loadedNativelyByCodex). Applied per plugin root
-  // — the top-level plugin (rules 1–6) and each sub-plugin (rules 7–8).
+  // Applied per plugin root: the top-level plugin (rules 1-6) and each sub-plugin (rules 7-8).
   const skipCodexNative = (root: string) => runtime === 'codex' && loadedNativelyByCodex(root);
   const doTopLevel = !skipCodexNative(pluginDir);
 
-  // The group's exclusions, asked ONCE here rather than at each layout rule.
-  // Every rule below ends at `recordCandidate`, and it is the only place that
-  // holds the candidate's full path, so this is the seam they share. Rules 7
-  // and 8 used to carry the check themselves, and rules 4-6 — `plugin/`,
-  // `<repo>-cursor-integration/`, `<repo>-claude-plugin/`, all of them
-  // root-level sub-plugin layouts an entry can legitimately name — did not, so
-  // an excluded sub-plugin in one of those shapes was recorded before the
-  // later check could refuse it (first match wins), and only this walker
-  // disagreed: Claude's and Codex's honour the same entry. A predicate applied
-  // per layout rule is a predicate one new layout rule forgets.
-  //
-  // `relPath` is assembled from this walk's own names — `pluginName`, then the
-  // path the rule built under `pluginDir` — never a `realpath`, which is what
-  // `isExcludedPluginPath` requires. Ancestor coverage does the rest: a
-  // candidate at `<repo>/plugin/skills/<name>` is covered by an entry naming
-  // `<repo>/plugin`.
+  // Exclusions are asked ONCE, at `recordCandidate`, the seam every layout rule ends at: a per-rule check is one
+  // a new layout rule forgets. `relPath` is built from this walk's own names, never a realpath.
   const excludedCandidate = (skillDir: string): boolean => {
     const rel = path.relative(pluginDir, skillDir);
     return isExcludedPluginPath(rel ? `${pluginName}/${rel.split(path.sep).join('/')}` : pluginName, excluded);
@@ -342,13 +228,8 @@ function discoverInPlugin(
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
     if (excludedCandidate(skillDir)) return;
-    // `user-invocable: false` skills are referenceable helpers (e.g.
-    // team-verification-before-completion), not user-facing commands. Claude & Codex load
-    // them via native plugin loaders — available to reference, hidden from the command list.
-    // OpenCode has NO plugin loader; this discovery mirror is its ONLY skill delivery, so
-    // filtering these out makes them UNavailable and breaks the visible skills that reference
-    // them. For opencode we therefore provision them too (they also surface as commands —
-    // opencode can't load-without-surfacing — an accepted cosmetic cost for availability parity).
+    // OpenCode has no plugin loader, so this mirror is its only skill delivery: it gets `user-invocable: false`
+    // helpers too (visible skills reference them), at the cosmetic cost of surfacing them as commands.
     if (!isUserInvocable(skillDir) && !allowNonInvocable) return;
     const fmName = readPluginName(skillDir);
     const name = fmName ?? path.basename(skillDir);
@@ -416,11 +297,8 @@ function discoverInPlugin(
     }
   }
 
-  // 8. marketplace monorepos: <plugin>/<sub>/skills/<name>/ — sub-plugins at the
-  //    REPO ROOT rather than under `plugins/` (rule 7). anthropics/knowledge-work-plugins
-  //    is shaped this way. Gated on `<sub>/.claude-plugin/plugin.json` so we only walk
-  //    dirs that declare themselves a plugin — the same signal Claude's own
-  //    discoverPlugins uses — instead of every subdirectory in the repo.
+  // 8. marketplace monorepos: <plugin>/<sub>/skills/<name>/, gated on `<sub>/.claude-plugin/plugin.json` (the
+  //    signal Claude's discoverPlugins uses).
   for (const sub of fs.readdirSync(pluginDir)) {
     if (RUNTIME_SPECIFIC_DIRS.has(sub)) continue;
     const subDir = path.join(pluginDir, sub);
@@ -445,41 +323,17 @@ export interface DiscoverOptions {
   denySkills?: Set<string>;
   /** Paths or path components that should never be traversed (runtime-specific dirs) */
   denyDirSegments?: Set<string>;
-  /**
-   * Target agent runtime. Selects the appropriate sub-plugin denylist
-   * (different runtimes have different native plugin loaders, so a sub-plugin
-   * may be denied for one runtime and surfaced for another).
-   * Defaults to 'codex' for back-compat with the original Codex-parity caller.
-   */
+  /** Selects the sub-plugin denylist. Defaults to 'codex' for back-compat. */
   runtime?: AgentRuntime;
   /**
-   * A group's `excludePlugins`, already split (`./plugin-exclusions.js`).
-   * Honoured for BOTH shapes: a top-level entry drops the repo, a sub-plugin
-   * path drops that sub-plugin's skills while the rest of the repo still
-   * mirrors. Defaults to "nothing excluded".
-   *
-   * NO HOST CALLER PASSES IT, and that is not an oversight to fix by finding
-   * one. Every host caller builds a mirror shared across groups
-   * (`syncOpenCodePluginSkills`, `src/opencode-sync.ts`;
-   * `scripts/enable-agent-plugin.ts`) and so has no group's list in hand, and
-   * the one host consumer that IS per-group asks the predicate about each
-   * discovered skill's own path rather than filtering the walk
-   * (`excludedOpenCodeSkillNames`, `src/providers/opencode.ts`). The option
-   * stays because this file is maintained as the twin of
-   * `container/agent-runner/src/plugin-skill-discovery.ts`, where it is live
-   * and per-group; letting the two diverge is how a walker's behaviour stops
-   * being reviewable in one place. Its behaviour is pinned by the twin's tests
-   * (`container/agent-runner/src/plugin-exclusion-walkers.test.ts`).
+   * A group's split `excludePlugins`, honoured for both shapes. NO HOST CALLER PASSES IT, deliberately: host
+   * mirrors are shared across groups. It stays so this file remains the twin of the container copy, where it is
+   * live (pinned by container/agent-runner/src/plugin-exclusion-walkers.test.ts).
    */
   excludePlugins?: ExcludedPlugins;
 }
 
-/**
- * Walk a plugins root and return every portable skill we'd want to expose to
- * the target runtime. Pure function — no filesystem writes. Caller decides
- * what to do with the results (typically: symlink each `skillDir` into
- * `<runtime-home>/skills/<name>/` or `~/.agents/skills/<name>/`).
- */
+/** Every portable skill to expose to the target runtime. No filesystem writes. */
 export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOptions = {}): DiscoveredSkill[] {
   if (!isDirectory(pluginsRoot)) return [];
 
@@ -487,9 +341,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
   const denySkills = options.denySkills ?? new Set<string>();
   const runtime = options.runtime ?? DEFAULT_RUNTIME;
   const denySubPluginSkillDirs = DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME[runtime];
-  // OpenCode has no native plugin loader (the discovery mirror is its sole skill delivery),
-  // so it must also receive `user-invocable:false` helper skills that the visible skills
-  // reference. Claude/Codex load those via their plugin loaders, so their mirrors stay lean.
+  // OpenCode's mirror is its sole skill delivery, so it also gets `user-invocable:false` helper skills.
   const allowNonInvocable = runtime === 'opencode';
 
   const excluded = options.excludePlugins ?? splitExcludedPlugins(undefined);
@@ -501,11 +353,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     if (RUNTIME_SPECIFIC_DIRS.has(pluginName)) continue;
     const pluginDir = path.join(pluginsRoot, pluginName);
     if (!isDirectory(pluginDir)) continue;
-    // Per-plugin sibling routing: skip this plugin for the current runtime if
-    // its .nanoclaw-plugin.json marker denies this sibling (default: all three).
     if (readPluginDenySiblings(pluginDir).has(runtime)) continue;
-    // Skip deprecated subtree contents — they live at <plugin>/deprecated/ and
-    // shouldn't appear as portable skills.
     for (const skill of discoverInPlugin(
       pluginDir,
       pluginName,
@@ -516,8 +364,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     )) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
-      // First-plugin-wins by name (alphabetical iteration); a later plugin
-      // with the same skill name won't override.
+      // First plugin wins by name (alphabetical).
       if (!allSkills.has(skill.name)) allSkills.set(skill.name, skill);
     }
   }
@@ -525,57 +372,14 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
 }
 
 /**
- * Reconcile a target skills dir against a discovered skill set.
+ * Reconcile a target skills dir against a discovered skill set. Codex auto-discovery skips symlinked skill
+ * dirs, so each skill is a REAL dir holding per-child symlinks (SKILL.md itself is copied). Converges on every
+ * run; a dir with real non-mirror files (operator-placed or native install) is left alone.
  *
- * Critical constraint: Codex's skill auto-discovery only follows REAL
- * directories — symlinked dirs at `<dst>/<name>` are silently skipped
- * (verified empirically 2026-05-14: `humanizer` as a symlink → not found
- * at `r1`; same content as a real dir → found at `r1`).
- *
- * Therefore we mirror as: real dir at `<dst>/<name>/` containing
- * **per-child symlinks** to every entry in the source skill dir
- * (`SKILL.md` + any `scripts/`, `agents/`, `reference/` subdirs).
- * Codex sees a real dir → discovers it. Reads of SKILL.md / scripts
- * follow the symlinks → auto-update inherits from plugin marketplace
- * updates with zero re-sync.
- *
- * Behavior:
- * - Creates real-dir `<dst>/<name>/` + child symlinks for each source entry.
- * - If `<dst>/<name>/` already exists as a real dir, reconciles its child
- *   symlinks (adds missing, removes stale, leaves non-symlinks alone) —
- *   so on every re-run it converges. A native install (e.g. `gitnexus setup`
- *   wrote real files there) is preserved verbatim.
- * - Skips a name entirely when `<dst>/<name>/` contains real (non-symlink)
- *   files — that's the "operator-placed or natively-installed" signal.
- * - Removes our previously-managed mirror dirs for names no longer in the
- *   desired set. Detection: a dir whose child entries are entirely symlinks
- *   to paths under any known plugin source root we control.
- *
- * Returns four buckets:
- *   - `created`:   new mirror dir created
- *   - `unchanged`: existing mirror dir matches desired child set
- *   - `updated`:   existing mirror dir needed child resync
- *   - `removed`:   stale managed mirror dir deleted
- *   - `skipped`:   would have written but a real non-managed entry already
- *                  exists (deferring to it)
- *   - `refused`:   a skill (or one child of one) resolving outside its own
- *                  `pluginRoot` — see the containment note below
- *
- * CONTAINMENT. Every path this mirrors is one a plugin chose, and the mirror is
- * copied into an agent container (`copyOpenCodeSkills`, `src/providers/opencode.ts`),
- * so a link out of the repository makes the HOST read host-only state and hand
- * the bytes over. `SKILL.md` is COPIED rather than linked, so that read happens
- * here, at sync time, and no filter downstream can see it any more. So each
- * skill directory and each of its children is resolved and required to stay
- * inside the skill's own `pluginRoot`; a link that stays in the repository still
- * mirrors. Refusals are returned rather than logged because this file is
- * maintained as a byte-for-byte-logic twin of the container's copy, which has a
- * different logger; the callers log.
- *
- * A refused name is treated as NOT desired, so a mirror dir created before the
- * escape was planted is pruned by the cleanup pass rather than left behind.
- *
- * Idempotent.
+ * CONTAINMENT: a mirrored path is one a plugin chose, and the mirror is copied into an agent container, so a
+ * link out of the repository would make the HOST read host-only state and hand it over. Anything resolving
+ * outside its own `pluginRoot` is refused. Refusals are returned, not logged, so this file stays logic-identical
+ * to its container twin. A refused name is not desired, so the cleanup pass prunes it.
  */
 export function syncSkillSymlinks(
   dst: string,
@@ -595,9 +399,7 @@ export function syncSkillSymlinks(
   const skipped: string[] = [];
   const refused: string[] = [];
 
-  // Resolve containment BEFORE anything is written, so a refused name is absent
-  // from `desired` and the cleanup pass below prunes any dir a previous run made
-  // for it.
+  // Decided before anything is written, so a refused name is absent from `desired` and the cleanup pass prunes it.
   const desired = new Map<string, { skillDir: string; resolvedRoot: string }>();
   for (const skill of skills) {
     const resolvedRoot = resolveRealPath(skill.pluginRoot);
@@ -609,9 +411,7 @@ export function syncSkillSymlinks(
     desired.set(skill.name, { skillDir: skill.skillDir, resolvedRoot });
   }
 
-  // ── Cleanup pass: drop managed mirror dirs whose name is no longer
-  // desired. A managed mirror dir is a real dir whose entries are all
-  // symlinks (no real files of its own). Anything else is preserved.
+  // Cleanup pass: drop managed mirror dirs whose name is no longer desired.
   let existing: string[] = [];
   try {
     existing = fs.readdirSync(dst);
@@ -638,8 +438,6 @@ export function syncSkillSymlinks(
     }
   }
 
-  // ── Sync pass: ensure each desired skill is a real dir whose children
-  // are symlinks to the corresponding source entries.
   for (const [name, { skillDir: srcDir, resolvedRoot }] of desired) {
     const skillDirAtDst = path.join(dst, name);
 
@@ -651,8 +449,7 @@ export function syncSkillSymlinks(
     }
 
     if (dstStat?.isSymbolicLink()) {
-      // Legacy: top-level was a symlink from an earlier implementation.
-      // Replace with managed mirror.
+      // Legacy top-level symlink: replace with a managed mirror.
       try {
         fs.unlinkSync(skillDirAtDst);
       } catch {
@@ -662,8 +459,7 @@ export function syncSkillSymlinks(
     }
 
     if (dstStat?.isDirectory() && !isManagedMirror(skillDirAtDst)) {
-      // Native install present (e.g. gitnexus setup wrote real files).
-      // Don't touch it.
+      // Native install present: don't touch it.
       skipped.push(name);
       continue;
     }
@@ -673,9 +469,7 @@ export function syncSkillSymlinks(
     const changed = mirrored.changed;
     if (dstStat?.isDirectory()) {
       if (changed) {
-        // Re-sync touched some links; classify as updated (we report
-        // as `created` in returned buckets for simplicity — caller
-        // mostly cares about "new vs unchanged" distinction).
+        // Reported as `created`: callers only distinguish new from unchanged.
         created.push(name);
       } else {
         unchanged.push(name);
@@ -689,56 +483,30 @@ export function syncSkillSymlinks(
 }
 
 /**
- * Marker file we drop inside every mirror dir we create. Lets us
- * distinguish our writes from native installs (e.g. `gitnexus setup`)
- * without ambiguity — a native install never has this file. Managed-ness is
- * ALL it means: the source a dir was published from lives in
- * `MIRROR_SOURCE_ROOT_FILE`, which the support-dir mirror writes too and which
- * `isManagedMirror` must not key on.
+ * Marker in every mirror dir we create; a native install never has it. It means managed and nothing else:
+ * provenance lives in `MIRROR_SOURCE_ROOT_FILE`, which `isManagedMirror` must not key on.
  */
 export const MIRROR_MARKER = '.nanoclaw-managed';
 
 /**
- * Provenance file: the plugin repository a mirror dir was published from.
- *
- * The dir's own name is a skill name and carries no provenance, and the reader
- * that needs it is the session copy (`copyOpenCodeSkills`,
- * `src/providers/opencode.ts`): containment there has to be against this ONE
- * repository, not against the union of every repository under `~/plugins`. A
- * union lets a link NESTED below a mirror dir's top level — never seen by these
- * writers, which resolve only each direct child — reach a DIFFERENT plugin,
- * including a workgroup-scoped one the mirror deliberately never published
- * (`scopedPluginNames`, `src/plugin-scopes.ts`).
- *
- * Separate from `MIRROR_MARKER` because the support-dir mirror
- * (`mirrorSupportDir`, `src/opencode-sync.ts`) needs provenance too and must NOT
- * read as a managed skill mirror — `isManagedMirror` keys on `MIRROR_MARKER`,
- * and the cleanup pass deletes a managed dir whose name is not a desired skill,
- * which every support dir's is not.
+ * Provenance: the ONE repository a mirror dir was published from. The session copy (`copyOpenCodeSkills`)
+ * contains nested links against this root, not the union of every plugin, which would let a nested link reach a
+ * different (possibly workgroup-scoped, never-published) plugin. Separate from `MIRROR_MARKER` because the
+ * support-dir mirror needs provenance but must not read as a managed skill mirror.
  */
 const MIRROR_SOURCE_ROOT_FILE = '.nanoclaw-source-root';
 
 /** Names this mirror owns in its own dirs. A plugin child using one is never mirrored. */
 export const MIRROR_OWNED_CHILDREN: ReadonlySet<string> = new Set([MIRROR_MARKER, MIRROR_SOURCE_ROOT_FILE]);
 
-/**
- * The provenance file's contents for a mirror dir published from `resolvedRoot`.
- *
- * JSON-encoded, so a directory name containing a newline can neither forge nor
- * truncate the record — a real Linux basename may contain one
- * (`docs/review-notes/826.md`, the segment-rule rounds).
- */
+/** JSON-encoded so a directory name containing a newline can neither forge nor truncate the record. */
 function formatMirrorSourceRoot(resolvedRoot: string): string {
   return `${JSON.stringify(resolvedRoot)}\n`;
 }
 
 /**
- * Write the provenance file, replacing anything that is not already exactly it.
- *
- * `lstat` first and unlink a non-regular entry: if an earlier write failed, the
- * child loop could have symlinked a plugin's own same-named file into this dir,
- * and writing through that link would both trust a plugin-authored record and
- * write into the plugin's repository. Returns whether anything changed.
+ * Replace anything that is not already exactly the record. lstat first and unlink a non-regular entry: writing
+ * through a plugin-planted symlink would trust a plugin-authored record and write into the plugin's repo.
  */
 export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): boolean {
   const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
@@ -770,24 +538,13 @@ export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): 
   }
 }
 
-/**
- * The plugin repository a mirror dir was published from, or null when it holds
- * no provenance file — a dir published before this record existed, or one an
- * operator or native installer placed. Null means "no provenance recorded",
- * never "any root": the caller decides what an unattributed dir may do.
- *
- * `lstat`-gated to a regular file, so a symlink standing where the record
- * belongs is not followed and read as a record.
- */
+/** null = no provenance recorded (never "any root"). lstat-gated so a symlink in its place is not read as a record. */
 export function readMirrorSourceRoot(mirrorDir: string): string | null {
   const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
   let stat: fs.Stats | undefined;
   try {
-    // `throwIfNoEntry` suppresses ENOENT and nothing else: this path has a
-    // caller-supplied DIRECTORY component, so a file (or a symlink to one)
-    // standing where that directory should be throws ENOTDIR, and an unreadable
-    // parent throws EACCES. Unhandled, either would escape a `cpSync` filter and
-    // fail the whole spawn over one bad entry in a shared mirror.
+    // Catch everything: the path has a caller-supplied directory component (ENOTDIR, EACCES), and one bad entry
+    // must not fail a whole spawn.
     stat = fs.lstatSync(file, { throwIfNoEntry: false });
   } catch {
     return null;
@@ -807,14 +564,7 @@ export function readMirrorSourceRoot(mirrorDir: string): string | null {
   }
 }
 
-/**
- * A "managed mirror" dir is one we created: it contains our marker file.
- * Anything without the marker is treated as operator-placed or native
- * install (preserved verbatim).
- *
- * Empty dirs count as managed (treated as "ours, just emptied" — safe to
- * write into).
- */
+/** Managed = contains our marker; empty dirs count as managed. Anything else is preserved verbatim. */
 function isManagedMirror(dir: string): boolean {
   let entries: string[];
   try {
@@ -827,23 +577,9 @@ function isManagedMirror(dir: string): boolean {
 }
 
 /**
- * Materialize `<dstDir>` as a real directory containing:
- *   - `SKILL.md`: a REAL FILE (copied from source). Codex's auto-discovery
- *     skips symlinked SKILL.md files (verified empirically 2026-05-14),
- *     so we copy. Re-copies only when source mtime > dst mtime.
- *   - Every other top-level child: a symlink to the corresponding source
- *     entry. Subdir reads at agent runtime follow symlinks normally, so
- *     `scripts/`, `reference/`, `agents/`, etc. inherit auto-update.
- *
- * Every child is resolved against `resolvedRoot` first; one that leaves the
- * plugin's own repository is refused and named in `refusedChildren` instead of
- * being mirrored. That covers both of the reads this function makes: the
- * `SKILL.md` COPY, whose bytes are taken here and are indistinguishable from a
- * legitimate file downstream, and the per-child SYMLINK, which the session copy
- * later dereferences. A dangling child resolves to null and is refused too — it
- * carried no content and the copy dropped it anyway.
- *
- * Returns whether anything changed, plus the refused child names.
+ * Materialize a real dir: SKILL.md COPIED (Codex skips a symlinked SKILL.md), every other child symlinked.
+ * Each child is resolved against `resolvedRoot` first; one leaving the plugin's repository (or dangling) is
+ * refused and named in `refusedChildren`.
  */
 function mirrorSkillDir(
   dstDir: string,
@@ -875,10 +611,7 @@ function mirrorSkillDir(
       /* swallow — non-critical */
     }
   }
-  // Record the ONE repository this dir was published from, so the session copy
-  // can contain every link under it to that root. Rewritten when it differs, so
-  // a dir published before this record existed — or from a plugin that has since
-  // moved — self-heals on the next sync.
+  // Rewritten when it differs, so older dirs and moved plugins self-heal.
   if (writeMirrorSourceRoot(dstDir, resolvedRoot)) changed = true;
 
   let srcEntries: string[];
@@ -888,14 +621,10 @@ function mirrorSkillDir(
     return { changed, refusedChildren };
   }
 
-  // Containment, decided before the removal pass below so a child refused now
-  // is ALSO pruned from a dst a previous run wrote it into.
+  // Decided before the removal pass so a child refused now is also pruned from an earlier run's dst.
   const allowedChildren: string[] = [];
   for (const child of srcEntries) {
-    // Names this mirror writes itself are never taken from the source. A plugin
-    // shipping one would otherwise be mirrored into the slot our own record
-    // occupies the moment a write of ours fails, and the copy would then read a
-    // plugin-authored provenance record.
+    // Never take our own record names from the source: a plugin shipping one would land in our provenance slot.
     if (MIRROR_OWNED_CHILDREN.has(child)) continue;
     const resolvedChild = resolveRealPath(path.join(srcDir, child));
     if (resolvedChild === null || !isWithinResolvedRoot(resolvedChild, resolvedRoot)) {
@@ -906,8 +635,7 @@ function mirrorSkillDir(
   }
   const desiredChildren = new Set(allowedChildren);
 
-  // Remove stale children whose name no longer exists in src.
-  // Only remove our own writes — symlinks and copies of SKILL.md.
+  // Remove stale children; only our own writes (symlinks and the SKILL.md copy).
   let dstChildren: string[] = [];
   try {
     dstChildren = fs.readdirSync(dstDir);
@@ -924,8 +652,6 @@ function mirrorSkillDir(
         fs.unlinkSync(childPath);
         changed = true;
       } else if (child === 'SKILL.md') {
-        // Stale copy — source no longer has SKILL.md (shouldn't happen for
-        // valid skills, but clean up just in case).
         fs.unlinkSync(childPath);
         changed = true;
       }
@@ -934,7 +660,6 @@ function mirrorSkillDir(
     }
   }
 
-  // Sync each contained source child into dst.
   for (const child of allowedChildren) {
     const childPath = path.join(dstDir, child);
     const srcPath = path.join(srcDir, child);
@@ -944,8 +669,6 @@ function mirrorSkillDir(
       continue;
     }
 
-    // Other children: symlink (Codex doesn't auto-discover, but runtime
-    // reads follow symlinks).
     let currentTarget: string | null = null;
     let stat: fs.Stats | null = null;
     try {
@@ -981,14 +704,7 @@ function mirrorSkillDir(
   return { changed, refusedChildren };
 }
 
-/**
- * Copy SKILL.md from source to dst if source is newer (or dst missing).
- * Returns true if a copy was performed.
- *
- * Codex's skill auto-discovery requires SKILL.md to be a real file (not a
- * symlink) — see `mirrorSkillDir` comment. We re-copy on mtime drift so
- * marketplace updates propagate on the next sync invocation.
- */
+/** Copy SKILL.md when the source is newer or a different size (Codex needs a real file). Returns true if copied. */
 function syncSkillMdCopy(dst: string, src: string): boolean {
   let srcStat: fs.Stats;
   try {
@@ -996,9 +712,7 @@ function syncSkillMdCopy(dst: string, src: string): boolean {
   } catch {
     return false;
   }
-  // `copyFileSync` on a FIFO blocks until a writer appears, and on the host that
-  // is the single event loop. A containment check cannot see this: the path is
-  // inside the repository. Only a regular file is a SKILL.md.
+  // `copyFileSync` on a FIFO blocks the host's single event loop until a writer appears: only a regular file is a SKILL.md.
   if (!srcStat.isFile()) return false;
   let dstStat: fs.Stats | null = null;
   try {
@@ -1016,7 +730,6 @@ function syncSkillMdCopy(dst: string, src: string): boolean {
     dstStat = null;
   }
   if (dstStat) {
-    // mtime comparison — re-copy when source is strictly newer or size differs.
     if (dstStat.size === srcStat.size && dstStat.mtimeMs >= srcStat.mtimeMs) {
       return false;
     }

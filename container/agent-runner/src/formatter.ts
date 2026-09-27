@@ -33,16 +33,8 @@ export interface CommandInfo {
 }
 
 /**
- * For threaded chat-sdk inbounds, router.ts prepends
- *   `[Thread context]\n<transcript>\n[Latest message]\n<user text>`
- * (or `[New in thread since last response]\n...` on later wakes) to
- * `content.text`. Slash-command classification must run against the
- * USER's text, not the wrapped form, so peel everything before the
- * final `[Latest message]\n` marker. Plain inbounds pass through.
- *
- * Mirrors `extractUserMessage` in src/command-gate.ts. Kept duplicated
- * because the host and container tree don't share modules — only the
- * session DB.
+ * Classify the USER's text: peel everything before the final `[Latest message]\n` marker router.ts prepends to
+ * threaded chat-sdk inbounds. Mirrors `extractUserMessage` in src/command-gate.ts (the trees share no modules).
  */
 function extractUserText(text: string): string {
   const marker = '[Latest message]\n';
@@ -51,13 +43,7 @@ function extractUserText(text: string): string {
   return text.substring(idx + marker.length).trim();
 }
 
-/**
- * Discord/Slack deliver `<@U123> /compact` (or `@bot /compact`) when the
- * bot is mentioned — the slash command is the second token. Without
- * stripping, `startsWith('/')` mis-classifies these as plain prose and
- * the SDK never dispatches `/compact`. Mirrors `stripLeadingMentions`
- * in src/command-gate.ts.
- */
+/** Strip leading `<@U123>` / `@bot` mentions so `/compact` is still dispatched. Mirrors `stripLeadingMentions` in src/command-gate.ts. */
 function stripLeadingMentions(text: string): string {
   let prev: string;
   let cur = text;
@@ -79,12 +65,6 @@ function stripLeadingMentions(text: string): string {
  * platform id with no prefix, so we prefix it here. If the id already
  * contains a `:` we assume it's pre-namespaced (non-chat-sdk adapters
  * that populate `senderId` directly) and leave it alone.
- *
- * `text` is unwrapped and mention-stripped so callers that pass it raw
- * to the SDK (formatMessagesWithCommands) send `/compact` rather than
- * `[Thread context]\n...\n[Latest message]\n/compact` — the latter
- * arrives as plain user text and the SDK never dispatches it as a
- * slash command.
  */
 export function categorizeMessage(msg: MessageInRow): CommandInfo {
   const content = parseContent(msg.content);
@@ -110,18 +90,7 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
   return { category: 'passthrough', command, text, senderId };
 }
 
-/**
- * Keep a threaded message's preceding transcript available to a native slash
- * command without moving the command away from the start of the prompt.
- *
- * Claude Code only dispatches a native command when it is presented raw and
- * first.  `categorizeMessage` therefore intentionally peels the router's
- * `[Thread context] ... [Latest message]` wrapper to identify `/command`.
- * Passing that peeled string on its own, however, silently turns a reply such
- * as `/wwbd` under a decision card into a command with no subject.  Preserve
- * the earlier transcript *after* the raw command: the provider can still
- * dispatch it, while the skill receives the decision it is being asked about.
- */
+/** Put the raw native command first (Claude Code only dispatches it raw and first) and the thread transcript after it, so the skill still sees its subject. */
 export function nativeSlashCommandPrompt(msg: MessageInRow, commandText: string): string {
   const content = parseContent(msg.content);
   const rawText = (content.text || '').trim();
@@ -136,8 +105,6 @@ export function nativeSlashCommandPrompt(msg: MessageInRow, commandText: string)
 /**
  * Narrow check for /clear — the only command the runner handles directly.
  * All other command gating (filtered, admin) is done by the host router
- * before messages reach the container. Must unwrap thread-context and
- * strip leading mentions for the same reason as `categorizeMessage`.
  */
 export function isClearCommand(msg: MessageInRow): boolean {
   const content = parseContent(msg.content);
@@ -159,16 +126,9 @@ export function isRunnerCommand(msg: MessageInRow): boolean {
 }
 
 /**
- * True when the message carries a host-parsed flagIntent (-m/-e/-m1/-e1).
- * Model and effort are query-creation options — they cannot be applied to an
- * already-running SDK query, and applyFlagBatch only runs when a new query
- * starts. A flag message pushed into an active stream would be silently
- * dropped while the host's ⚙️ ack had already told the user it applied
- * (observed live 2026-06-10: `-m fable` mid-turn left no sticky row and the
- * turn kept running opus). Used by the follow-up poller to end the stream —
- * same treatment as isRunnerCommand — so the outer loop re-batches and the
- * fresh query honors the flags. Kinds mirror applyFlagBatch (chat,
- * chat-sdk, task).
+ * A host-parsed flagIntent (-m/-e/-m1/-e1): model and effort apply only when a new query starts, so a flag pushed
+ * into an active stream would be silently dropped after the host already acked it. The follow-up poller ends the
+ * stream on it. Kinds mirror applyFlagBatch.
  */
 export function hasFlagIntent(msg: MessageInRow): boolean {
   if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk' && msg.kind !== 'task') return false;
@@ -200,31 +160,16 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
-  /**
-   * When true, suppress streaming status writes (`> 💭 ...`) for this turn.
-   * Final chat messages still go out — the agent decides whether to write
-   * one. Set when any task in the inbound batch carries `quietStatus: true`
-   * in its content JSON. Used by background maintenance tasks where only
-   * notable findings should reach chat.
-   */
+  /** Suppress streaming status writes for this turn (any task in the batch has `quietStatus: true`); final messages still go out. */
   quietStatus: boolean;
   /** Batch is an isolated task run. Final-text message blocks are inert;
    *  only explicitly addressed tools deliver, and final text is logged. */
   taskRun: boolean;
-  /** Batch is solely the agent's own scheduled wake(s) (`wait` tool firing).
-   *  Explicit <message> blocks still deliver, but bare final text is
-   *  logged instead of origin-fallback-delivered: a wake's unwrapped
-   *  output is almost always self-narration ("nothing moved"), and
-   *  posting it spammed channels with no-op status lines. */
+  /** Batch is solely the agent's own `wait` wake(s): bare final text is logged, not delivered (it is almost always self-narration). */
   selfWake: boolean;
 }
 
-/**
- * Host-generated notifications (approval outcomes, restart notes, self-mod
- * results, etc.) are written as self-agent messages so they reach the running
- * container. They are inputs to the current session, not an explicit request
- * to make the agent itself the reply destination.
- */
+/** Host notifications arrive as self-agent messages; they are session inputs, not a request to reply to the agent itself. */
 function isSessionLocalSystemNotification(message: MessageInRow | undefined): boolean {
   if (message?.channel_type !== 'agent') return false;
   try {
@@ -237,53 +182,14 @@ function isSessionLocalSystemNotification(message: MessageInRow | undefined): bo
 
 /**
  * Extract routing context from a batch of messages.
- *
- * Routing rule: if the first non-system message has `platform_id` set,
- * treat its three routing fields (platform_id, channel_type, thread_id) as
- * an authoritative atomic unit — including `thread_id=null`, which means
- * "post to the channel root, no thread". Only when the message itself has
- * no platform_id (e.g. agent-to-agent inbounds with channel_type='agent'
- * and no platform info) do we fall back to session_routing.
- *
- * Why the unit-fallback matters:
- *   - Daily background tasks like wiki-synthesise are scheduled with
- *     destination={platformId:..., channelType:..., threadId:null} so the
- *     report posts to the channel root. Without unit-fallback, the
- *     null-coalescing operator treats the explicit-null thread_id as
- *     "missing" and falls back to session_routing.thread_id — which is
- *     whatever thread last woke the session — and the report lands in
- *     that thread instead of the channel root.
- *   - Agent-to-agent inbounds have channel_type='agent' and no platform
- *     info; the reply needs to route to the originating session's
- *     channel/thread, so per-field session_routing fallback is correct
- *     for that case (gated by `platform_id == null`).
- *   - Host-generated self-agent system notifications carry the agent group
- *     id as platform_id only as an internal delivery address. Their replies
- *     must stay on the session's Slack/Discord origin rather than route back
- *     into the same agent as a new inbound message.
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
-  // Skip system rows when picking the routing anchor — recall_context system
-  // messages (id `recall-<targetId>`) are inserted before their paired inbound
-  // message and would otherwise hijack `inReplyTo`, making outbound replies
-  // attach to `recall-X` instead of the real user message X.
-  //
-  // Task rows take priority over chat rows: scheduled tasks fire on a clock,
-  // not in response to a conversation, so the task is always the wake reason
-  // for any batch it appears in. Without this, a task firing while an older
-  // chat row is still pending in the batch (e.g. host hadn't synced
-  // processing_ack yet, or container restart wiped processing claims) would
-  // route the task's response into the chat's thread instead of the channel
-  // root the host stamped the task with.
+  // Skip system rows as the anchor: a `recall-<X>` row precedes X and would hijack `inReplyTo`. Task rows win over
+  // chat rows: a task is always its batch's wake reason and must reply to the channel root it was stamped with.
   const taskRow = messages.find((m) => m.kind === 'task');
   const first = taskRow ?? messages.find((m) => m.kind !== 'system') ?? messages[0];
   const sessionRouting = getSessionRouting();
-  // Quiet-status mode: any task in the batch carrying `quietStatus: true`
-  // in its content JSON suppresses streaming status writes for the turn.
-  // Tasks rarely batch with chat messages, but if they did the chat
-  // shouldn't get silenced — so this is conservative: only quiet when
-  // ALL non-task messages would also be no-op (currently: when the batch
-  // is task-only).
+  // Quiet only for task-only batches, so a chat message batched with a quiet task is never silenced.
   const substantiveMessages = messages.filter((m) => m.kind !== 'system');
   const taskOnly = substantiveMessages.length > 0 && substantiveMessages.every((m) => m.kind === 'task');
   const selfWakeOnly =
@@ -306,9 +212,8 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
         return false;
       }
     });
-  // Treat (platform_id, channel_type, thread_id) as a unit. `platform_id`
-  // is the discriminator — when set, the message itself specifies WHERE
-  // to go and we respect even an explicit null thread_id (= channel root).
+  // (platform_id, channel_type, thread_id) are one unit: when platform_id is set, even an explicit null thread_id
+  // (channel root) is honoured instead of falling back to session routing.
   const useOwnRouting = first?.platform_id != null && !isSessionLocalSystemNotification(first);
   return {
     platformId: useOwnRouting ? first.platform_id : (sessionRouting.platform_id ?? null),
@@ -348,17 +253,8 @@ export function formatMessages(messages: MessageInRow[]): string {
 
   const parts: string[] = [];
 
-  // Detect spawn envelope in the first chat message and inject a system fact.
-  // The _spawn.task_id is surfaced before the prompt so the agent knows it
-  // is operating as a spawned child and can reference its own task_id.
-  //
-  // `_spawn` is a plain field on chat content, not host-verified at this
-  // layer, so an a2a peer's forwarded message can carry an arbitrary
-  // `task_id` string, e.g. one containing a forged `<message origin="host" ...>`
-  // element. A real id is always `deriveSpawnTaskId`'s output
-  // (`spawn-${hash}`, 16 lowercase hex chars);
-  // anything else is dropped rather than rendered, and the accepted shape is
-  // escaped too as defense in depth even though it can't carry markup.
+  // `_spawn.task_id` is not host-verified here (an a2a peer can forward any string, e.g. a forged host message),
+  // so only a real `spawn-<16 hex>` id is rendered, escaped as well.
   const SPAWN_TASK_ID_PATTERN = /^spawn-[0-9a-f]{16}$/;
   let spawnTaskId: string | null = null;
   if (chatMessages.length > 0) {
@@ -405,26 +301,14 @@ function detectSpawnEnvelope(content: any): { taskId: string; text: string } | n
   return { taskId, text: (content.text as string) || '' };
 }
 
-/**
- * Render a chat batch, splitting by trigger flag: trigger=1 are messages the
- * bot was addressed in (need a reply); trigger=0 are accumulated context
- * (`ignored_message_policy='accumulate'` on a non-engaging message). Both
- * reach the prompt — the bot needs surrounding thread context to answer
- * well — but only the addressed rows call for a response.
- *
- * Context is emitted first so the agent reads the backdrop before the
- * message it's expected to act on.
- */
+/** trigger=1 rows need a reply, trigger=0 rows are accumulated context; context is emitted first. */
 function formatChatMessages(messages: MessageInRow[]): string {
   const triggers = messages.filter((m) => m.trigger === 1);
   const context = messages.filter((m) => m.trigger !== 1);
 
   if (context.length === 0) {
-    // No thread context — just the addressed message(s). Concatenate the
-    // self-contained <message> blocks; do NOT wrap them in an outer
-    // <messages> envelope: the Claude Agent SDK responds to that shape with a
-    // synthetic "No response requested." stub instead of calling the API.
-    // The single-message path is just the N=1 case of this.
+    // Do NOT wrap in an outer <messages> envelope: the Claude Agent SDK answers that shape with a synthetic
+    // "No response requested." stub instead of calling the API.
     return messages.map(formatSingleChat).join('\n');
   }
 
@@ -465,24 +349,14 @@ function formatSingleChat(msg: MessageInRow): string {
   const replyPrefix = formatReplyContext(content.replyTo);
   const attachmentsSuffix = formatAttachments(content.attachments);
 
-  // A host note (origin "host", a field only the host can write) has no destination
-  // behind it: render no `from` rather than "unknown:agent:<own group>". origin="host"
-  // says where it came from, and a from value could collide with a destination name.
+  // A host note has no destination behind it: render no `from` (it could collide with a destination name).
   const fromAttr = content.origin === 'host' ? '' : originAttr(msg);
-  // Surface the platform-side sender user_id so the agent can build
-  // canonical `<@USER_ID>` mentions when replying to the sender (humans
-  // OR bots). Slack `auth.test` returns the user_id without the channel-
-  // type prefix; Discord uses bare snowflakes. This sidesteps the
-  // "@Operator" vs "@Operator.kim" prose-name ambiguity by giving the model the
-  // authoritative id to wrap. Omitted when the inbound envelope has no
-  // senderId (e.g. system/CLI messages).
+  // The platform-side sender id lets the agent build canonical `<@USER_ID>` mentions instead of guessing from prose names.
   const senderId = content.senderId || content.author?.userId;
   const senderIdAttr = typeof senderId === 'string' && senderId.length > 0 ? ` sender_id="${escapeXml(senderId)}"` : '';
 
-  // origin="host" comes only from the reserved content field, which the host
-  // strips from every inbound write except its own notes (src/session-manager.ts,
-  // WriteSessionMessageOptions.hostOrigin). sender/sender_id are whatever the
-  // author put in content, so they prove nothing about who wrote the message.
+  // origin="host" comes only from a reserved field the host strips from every write but its own notes;
+  // sender/sender_id are author-controlled and prove nothing.
   const hostAttr = content.origin === 'host' ? ' origin="host"' : '';
   // event="..." names a host note's purpose (e.g. choice_response). The host strips
   // it from every other write too, so a host note that merely echoes someone's
@@ -492,16 +366,8 @@ function formatSingleChat(msg: MessageInRow): string {
       ? ` event="${content.event}"`
       : '';
 
-  // The platform-native id of the specific inbound message this row
-  // represents (e.g. a Slack `ts`) — lets the agent cite the exact message
-  // it was answering, and lets an external verifier check that citation
-  // against the platform's own API. `content.platformMsgId` is a host-only
-  // field: the host strips it from every write except its own routed-message
-  // write (src/host-origin.ts PLATFORM_MSG_ID_FIELD, src/router.ts), so no
-  // chat write — an agent's own tool call, an agent-to-agent delivery, a host
-  // note — can forge or echo one. `origin === 'host'` is excluded explicitly
-  // too, belt-and-suspenders with that write-side guarantee: a host note
-  // never has a genuine platform message behind it.
+  // The platform-native id of this inbound (e.g. a Slack `ts`), so the agent can cite it verifiably. A host-only
+  // field (stripped from every other write), and never trusted on a host note.
   const platformMsgId =
     content.origin !== 'host' && typeof content.platformMsgId === 'string' && content.platformMsgId.length > 0
       ? content.platformMsgId
@@ -529,40 +395,17 @@ function formatTaskMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const from = originAttr(msg);
   const idAttr = msg.seq != null ? ` id="${msg.seq}"` : '';
-  // `time` is the occurrence's SCHEDULED time, not the row's creation time.
-  // For a recurring series the successor row is inserted the moment the
-  // previous run completes (recurrence.ts insert-then-clear), so its
-  // `timestamp` is the PREVIOUS occurrence — a daily 9am task rendered
-  // `time="Jan 4, 9:05 AM"` on the run due Jan 5, and an agent asked for
-  // "today's" numbers reasoned from the wrong date.
-  //
-  // `scheduled_for`, NOT `process_after`. The two are stamped equal at insert
-  // and then diverge: a crashed provider turn is put behind a retry deadline by
-  // rewriting `process_after` (deferMessageForFreshContextRetry), which is a
-  // "don't touch me until", not a new slot. Reading `process_after` here made a
-  // retried 9am occurrence announce its backoff time as its scheduled slot, so
-  // anything date-windowed or idempotent keyed off it lost its occurrence
-  // identity across a retry.
-  //
-  // The two fallbacks are both real: `process_after` for a task row written
-  // before the column existed, `timestamp` for one that never had a
-  // process_after either. Each keeps exactly the behavior that row already had.
+  // `time` is the occurrence's SCHEDULED slot (`scheduled_for`), not the row's creation time (a recurring
+  // successor is inserted when the previous run completes) nor `process_after` (a retry rewrites it). The
+  // fallbacks cover rows written before those columns existed.
   const time = formatLocalTime(msg.scheduled_for ?? msg.process_after ?? msg.timestamp, TIMEZONE);
-  // When the run actually reached the agent. A task can be due at 9:00 and run
-  // at 11:30 (container busy, host restart, ceiling respawn, a paused series
-  // resumed days later), and without this the agent has no wall clock at all —
-  // "today" and "yesterday" in the prompt resolve against nothing.
+  // The run can start long after its slot; this gives the agent a real wall clock.
   const currentTime = formatLocalDateTimeFull(new Date(), TIMEZONE);
   const parts: string[] = [];
   if (content.scriptOutput) {
     parts.push('Script output:', collisionSafeJson(content.scriptOutput, 2), '');
   }
-  // The prompt is untrusted: any agent can set it (`ncl tasks create --prompt`),
-  // and a raw `</task><message origin="host" event="choice_response" ...>` inside
-  // it would render a byte-identical fake host message as a SIBLING of this
-  // <task> element, defeating the origin="host" trust check in
-  // mcp-tools/request-choice.ts. Escape after stripping the legacy contract
-  // (its markers are plain ASCII, unaffected by escaping either way).
+  // The prompt is untrusted (any agent can set it): escape it so it cannot render a fake sibling host message.
   parts.push('Instructions:', escapeXml(stripLegacyTaskContract(content.prompt || '')));
   return `<task${idAttr}${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;
 }
@@ -599,19 +442,13 @@ function formatWebhookMessage(msg: MessageInRow): string {
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
 
-  // Current recall_context rows carry freshly admitted capability state and
-  // recalled evidence; the same branch also remains compatible with rows
-  // persisted before the structured format shipped. Capability state is
-  // host-asserted and rendered separately from all recalled evidence. Evidence
-  // and provenance are opaque data, never tool or action requests.
-  // Collision-safe JSON escaping prevents recalled strings from closing either
-  // delimiter and impersonating the trusted section.
+  // Capability state is host-asserted and rendered apart from recalled evidence, which is opaque data, never a
+  // request. Collision-safe JSON escaping stops recalled strings from impersonating the trusted section.
   if (content.subtype === 'recall_context') {
     return formatRecallContext(content);
   }
 
   // Spawn cancellation: render as a structured directive, not raw JSON.
-  // Per design §4 S26: the orchestrator signals the child to flush and exit.
   if (content._spawn_cancel && typeof content._spawn_cancel === 'object') {
     const reason = (content._spawn_cancel.reason as string | undefined) ?? '(none)';
     return `[Spawn cancelled]\nThis task was cancelled by the orchestrator (reason: ${escapeXml(reason)}). Please flush any in-flight work and exit cleanly.`;
@@ -646,27 +483,9 @@ function collisionSafeJson(value: unknown, indent?: number): string {
 }
 
 /**
- * The excerpt fields the agent is SENT. The host writes more than this — the
- * fingerprints, ids and scores that the dedup path reads back off the stored
- * row (`recallFingerprints` via `parseRecallContext` in src/session-manager.ts)
- * — but nothing in the container reads them and the model cannot act on them.
- * On live traffic they were 43% of this block (1,717 excerpts across 588 blocks,
- * 2026-09-19 fleet sample): 594 bytes of bookkeeping per excerpt against ~790
- * bytes of the text the excerpt exists to carry, re-read on every later call of
- * the session.
- *
- * Projecting at render time rather than trimming what the host stores is what
- * keeps dedup working: the row keeps every field, and only the prompt loses the
- * ones with no reader.
- *
- * `channelType`, `platformId` and `threadId` stay because they are a tool
- * contract, not bookkeeping: they are exactly the locator `read_thread` resolves
- * a thread from (`mcp-tools/thread-search.ts`), so dropping them would
- * take away the agent's only deterministic way to open an excerpt's source
- * thread. `id` does NOT stay: the container's archive projection collapses
- * sibling copies to `MIN(id)`, so a
- * recalled id need not exist in the archive the container can read, and no tool
- * accepts one as a locator.
+ * The excerpt fields the agent is SENT; the host's stored row keeps its dedup bookkeeping, which nothing here
+ * reads. `channelType`/`platformId`/`threadId` stay: they are the locator `read_thread` resolves. `id` does not:
+ * the archive projection collapses sibling copies, so a recalled id need not exist there.
  */
 const CONVERSATION_EXCERPT_FIELDS = [
   'role',
@@ -685,12 +504,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/**
- * Keep only `fields` of each element. Anything that is not the expected
- * array-of-objects shape passes through untouched: this is a rendering
- * nicety, and a malformed payload is the other branches' business, never a
- * reason to drop evidence on the floor.
- */
+/** Keep only `fields` of each element; anything else passes through untouched (never drop evidence). */
 function projectExcerpts(value: unknown, fields: readonly string[]): unknown {
   if (!Array.isArray(value)) return value;
   return value.map((row) => {
@@ -800,15 +614,7 @@ function formatAttachments(attachments: any[] | undefined): string {
   return '\n' + parts.join('\n');
 }
 
-/**
- * Structured view of the attachments in a batch, for providers whose SDK takes
- * real file parts. Additive: `formatAttachments` above still renders every one
- * of these into the prompt text, so nothing here is load-bearing for a provider
- * that ignores it.
- *
- * `localPath` is relative to the session directory, which is mounted at
- * `/workspace` in the container — the same resolution `formatAttachments` uses.
- */
+/** Structured attachments for providers whose SDK takes file parts; additive to the text rendering. `localPath` is relative to /workspace. */
 export function extractAttachments(messages: MessageInRow[]): PromptAttachment[] {
   const out: PromptAttachment[] = [];
   for (const msg of messages) {
@@ -827,21 +633,7 @@ export function extractAttachments(messages: MessageInRow[]): PromptAttachment[]
   return out;
 }
 
-/**
- * Every field on an inbound attachment is channel-supplied and untyped. The
- * host stages the file without normalizing them — `deriveAttachmentName` reads
- * `mimeType` through a `typeof` guard and writes the record back verbatim — so
- * a bridge that reports `mimeType: {}` puts a non-string here. Anything that is
- * not a non-empty string becomes `undefined`, which is the same value an
- * attachment that simply omitted the field produces: for `mime` that means the
- * consumer falls through to the filename extension, exactly as it would for a
- * channel that sent no MIME at all.
- *
- * Normalized HERE, at the one seam that reads the raw content JSON, rather than
- * in each consumer — `PromptAttachment` declares string fields, and a value
- * that reaches a provider having violated its own type is a crash waiting for
- * whichever provider calls a string method on it first.
- */
+/** Attachment fields are channel-supplied and untyped: anything but a non-empty string becomes undefined, here at the one seam that reads the raw JSON. */
 function attachmentString(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined;
 }
@@ -855,9 +647,7 @@ function parseContent(json: string): any {
   }
 }
 
-// Coerces at the boundary: a non-string value here (a numeric `sender`, a
-// non-string attachment `type`, ...) used to throw out of escapeXml and fail
-// the whole formatting batch instead of just that one field.
+// Coerces non-strings at the boundary, so one bad field cannot fail the whole batch.
 function escapeXml(value: unknown): string {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }

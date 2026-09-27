@@ -1,15 +1,7 @@
 /**
- * Container-side spawn task ID derivation.
- *
- * IDENTICAL algorithm to host's src/modules/orchestrator-dispatch/derive-task-id.ts.
- * Must NOT import from host — host is Node, container is Bun (separate package trees).
- * Synchronization is via F2 contract test against tests/fixtures/spawn-task-id-vectors.json.
- *
- * Length-prefix canonicalization (per design S23) prevents colon-collision attacks
- * where 'foo:bar' vs 'foo' + ':bar' would otherwise hash identically. Idempotency
- * keys are user-supplied (orchestrator agent chooses them) and may legitimately
- * contain ':' — without length-prefix, a key like 'X:Y' could collide with another
- * orchestrator's parent_session_id ending in 'X' + key 'Y'.
+ * IDENTICAL algorithm to the host's src/modules/orchestrator-dispatch/derive-task-id.ts (separate package trees,
+ * no import); kept in sync by the contract test against tests/fixtures/spawn-task-id-vectors.json.
+ * Length-prefixed so a user-supplied idempotency key containing ':' cannot collide with another pair.
  */
 import { createHash } from 'crypto';
 

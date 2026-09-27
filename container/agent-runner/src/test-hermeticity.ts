@@ -1,23 +1,10 @@
 /**
- * Test hermeticity tripwire for the agent-runner suite.
+ * Test hermeticity tripwire for the agent-runner suite (a `bunfig.toml` preload); the host counterpart is
+ * `src/test-hermeticity.ts`. Mode from `NANOCLAW_TEST_HERMETICITY`: `warn` (default), `enforce`, `off`.
  *
- * The host counterpart lives at `src/test-hermeticity.ts` and carries the full
- * rationale. Short version: unit tests must not shell out, hit the network, or
- * write outside a temp fixture, and on 2026-09-03 two suites did all three
- * before anyone noticed. This module is a `bunfig.toml` preload, so it is in
- * place before any test file's imports resolve.
- *
- * Mode comes from `NANOCLAW_TEST_HERMETICITY`: `warn` (default) records and
- * logs, `enforce` records and throws, `off` disables the guard.
- *
- * One difference from the host guard worth knowing: `bun test` runs every file
- * in a single process and its preload runs once, so `allowSubprocess` and
- * friends are scoped to the whole run, not to one file. Call
- * `resetHermeticityAllowances()` in a suite's teardown if that matters to you.
- * For the same reason there is no per-file `enforceHermeticity()` here as there
- * is on the host: flipping the mode would silently enforce every file that ran
- * afterwards. A suite that wants the strict guard wraps the call in
- * `withHermeticityMode('enforce', ...)`, which restores the previous mode.
+ * Unlike the host guard, `bun test` runs every file in one process with one preload, so allowances are scoped
+ * to the whole run (reset with `resetHermeticityAllowances()`), and there is no per-file `enforceHermeticity()`:
+ * use `withHermeticityMode('enforce', ...)`, which restores the previous mode.
  */
 import { afterAll, mock } from 'bun:test';
 import nodeOs from 'node:os';
@@ -34,15 +21,9 @@ export interface HermeticityAttempt {
 }
 
 /**
- * Inherited `GIT_*` variables point every fixture git command at a real
- * repository: on 2026-09-25 a `GIT_DIR` exported by `git bisect run` let a host
- * test write `core.bare=true` into the shared checkout. The whole prefix is
- * dropped before any test file loads; a test that needs one sets it on the
- * child it spawns. Host counterpart: `src/test-git-env.ts`.
- *
- * Deleting from `process.env` is not enough under Bun (1.3.12): a child spawned
- * without an explicit `env` gets the environment the process started with, not
- * the edited `process.env`. `guardBunSubprocess` below fills that gap.
+ * Inherited `GIT_*` variables point fixture git commands at a real repository, so the prefix is dropped before
+ * any test loads (host counterpart: `src/test-git-env.ts`). Under Bun a child spawned without `env` still gets
+ * the startup environment; `guardBunSubprocess` covers that.
  */
 const strippedGitEnv = Object.keys(process.env).filter((key) => key.startsWith('GIT_'));
 for (const key of strippedGitEnv) delete process.env[key];
@@ -146,10 +127,7 @@ export function withHermeticityMode<T>(mode: HermeticityMode, fn: () => T): T {
     restore();
     throw error;
   }
-  // An async callback returns at its first `await` with the rest of its body
-  // still to run. Restoring in a `finally` would drop the requested mode right
-  // there, so everything past the first suspension would execute under the
-  // repo default and, in `warn`, actually reach out.
+  // Restoring in a `finally` would drop the mode at an async callback's first `await`.
   if (isThenable(result)) {
     return result.then(
       (value) => {
@@ -176,11 +154,7 @@ function callSite(): string {
   return frames[0] ?? 'unknown call site';
 }
 
-/**
- * Record first, then throw. Recording is the load-bearing half: most callers
- * here already swallow subprocess and network failures so the runner survives a
- * flaky host, which means a throw-only tripwire can fire and leave a test green.
- */
+/** Record first, then throw: callers often swallow the failure, so a throw-only tripwire can leave a test green. */
 function trip(kind: HermeticityAttempt['kind'], api: string, target: string, hint: string): void {
   const attempt: HermeticityAttempt = { kind, api, target, callSite: callSite() };
   state.attempts.push(attempt);
@@ -200,8 +174,6 @@ function trip(kind: HermeticityAttempt['kind'], api: string, target: string, hin
 
 type AnyFn = (...args: unknown[]) => unknown;
 
-// ── subprocess ───────────────────────────────────────────────────────────────
-
 function commandOf(api: string, args: unknown[]): string {
   const first = args[0];
   if (typeof first !== 'string') return String(first);
@@ -209,12 +181,7 @@ function commandOf(api: string, args: unknown[]): string {
   return first;
 }
 
-/**
- * True while a guarded `child_process` call is running. Bun implements Node's
- * `child_process` on top of `Bun.spawn`, so without this a single
- * `execFileSync` records twice — once at each layer — and doubles the tally the
- * end-of-run message reports.
- */
+/** Bun implements `child_process` on `Bun.spawn`, so without this one call records twice. */
 let insideGuardedSubprocess = false;
 
 /** The guard body shared by the direct call and its promisified twin. */
@@ -238,10 +205,7 @@ function guardChildProcess(real: Record<string, unknown>): Record<string, unknow
         insideGuardedSubprocess = false;
       }
     };
-    // `promisify(execFile)` reads this symbol off the function it is handed and
-    // calls it INSTEAD of the function itself, so copying the original's
-    // implementation across would hand every promisified caller a straight line
-    // to the real binary, past the check above. Wrap it instead.
+    // `promisify(execFile)` calls this symbol INSTEAD of the function; copying it across would bypass the check.
     const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
     const custom = (original as unknown as Record<symbol, unknown>)[promisifyCustom];
     if (typeof custom === 'function') {
@@ -256,16 +220,7 @@ function guardChildProcess(real: Record<string, unknown>): Record<string, unknow
   return guarded;
 }
 
-/**
- * Bun's own subprocess APIs, which `child_process` does not cover.
- *
- * The runner reaches for these directly — `src/mcp-tools/self-mod.ts` shells out
- * to `opencode` through `Bun.spawn`, and several suites spawn helper processes
- * the same way — so a guard that only wraps Node's exports would report a clean
- * strict run while real child processes came and went. `Bun.spawn` takes either
- * an argv array or `{ cmd: [...] }`; `Bun.$` is a tagged template, and its
- * command text is not reliably recoverable, so it is reported by name.
- */
+/** Bun's own subprocess APIs, not covered by `child_process`. `Bun.$` is reported by name: its command text is not recoverable. */
 function guardBunSubprocess(): void {
   const bun = globalThis.Bun as unknown as Record<string, unknown> | undefined;
   if (bun === undefined) return;
@@ -292,8 +247,6 @@ const guardedChildProcess = guardChildProcess(realChildProcess);
 mock.module('child_process', () => guardedChildProcess);
 mock.module('node:child_process', () => guardedChildProcess);
 
-// ── network ──────────────────────────────────────────────────────────────────
-
 function urlOf(input: unknown): string {
   if (typeof input === 'string') return input;
   if (input instanceof URL) return input.href;
@@ -311,30 +264,13 @@ if (typeof globalThis.fetch === 'function') {
   }) as unknown as typeof fetch;
 }
 
-// ── out-of-tree writes ───────────────────────────────────────────────────────
-
 /** The repository root, resolved from this file rather than the working directory. */
 const CHECKOUT_ROOT = nodePath.resolve(nodePath.dirname(fileURLToPath(import.meta.url)), '../../..');
 
 /**
- * Roots inside the checkout that a unit test has no business writing to. In a
- * live install these hold production session state, so a test that lands here
- * is writing over the running system.
- *
- * The roots are derived from this file's own location, not from
- * `process.cwd()`. The runner suite runs with `container/agent-runner` as its
- * working directory, so a cwd-derived list protects
- * `container/agent-runner/data` — a path that does not exist — and leaves the
- * real `<checkout>/data` open to `path.resolve(cwd, '../../data/v2.db')`. The
- * cwd is still included, so a suite launched from somewhere else is covered too.
- *
- * Deliberately a denylist, not an allowlist: fixtures live all over the temp
- * dir and a few suites build their own scratch checkouts, so an allowlist would
- * be a wall of exemptions while the escapes worth catching are a short, known
- * list. The home-relative half of the denylist — `~/plugins`, a live
- * fail-closed mount into every agent container, and `$HOME` dotfiles — is
- * applied in `writeDenied` rather than here, because it must yield to the
- * temp-dir allowance.
+ * Roots a unit test must not write to (live session state in an install). Derived from this file's location,
+ * not `process.cwd()`: the runner suite's cwd is container/agent-runner. A denylist on purpose; the home-relative
+ * half is applied in `writeDenied` because it must yield to the temp-dir allowance.
  */
 function checkoutDeniedRoots(): string[] {
   const names = ['data', 'groups', 'dist', 'logs', 'node_modules'];
@@ -368,13 +304,7 @@ interface PathOps {
 }
 let PATH_OPS: PathOps | null = null;
 
-/**
- * Run a path-inspection call, or `null` if it fails.
- *
- * Every caller below is inspecting a path that may not exist yet, may dangle,
- * or may not be readable. Any failure means "cannot resolve further", and the
- * lexical path is then the safe answer — so there is nothing to rethrow.
- */
+/** A path-inspection call, or null if it fails: the lexical path is then the safe answer. */
 function attempt<T>(fn: () => T): T | null {
   try {
     return fn();
@@ -385,15 +315,8 @@ function attempt<T>(fn: () => T): T | null {
 }
 
 /**
- * The physical path a write lands on, following symlinks.
- *
- * A lexical check is not enough: a fixture under the temp dir can hold a
- * symlink into a denied root, and a write through it would sail past the
- * temp-directory allowance and mutate live state. Neither the target nor the
- * link's destination is guaranteed to exist yet, so this walks to the nearest
- * lstat-able ancestor, follows it by hand when it is a symlink — a dangling one
- * throws out of `realpathSync`, which is exactly what a not-yet-created fixture
- * produces — and re-appends the rest.
+ * The physical path a write lands on: a temp fixture can symlink into a denied root. Walks to the nearest
+ * lstat-able ancestor and follows it by hand, since the target may not exist yet.
  */
 function canonicalize(p: string): string {
   const ops = PATH_OPS;
@@ -426,18 +349,11 @@ function canonicalize(p: string): string {
 
 /** The denylist verdict for one already-resolved path. */
 function deniedFor(resolved: string): string | null {
-  // Checkout-relative roots are denied even under the temp dir: a scratch
-  // worktree can itself live in /tmp, and `<worktree>/data` is exactly the
-  // escape worth catching.
+  // Checkout-relative roots are denied even under the temp dir: a scratch worktree can live in /tmp.
   for (const denied of checkoutDeniedRoots()) {
     if (isUnder(resolved, denied)) return denied;
   }
-  // Fixtures live under the temp dir; that is the normal case. This allowance
-  // comes BEFORE the home-relative rules on purpose. `homedir()` reads $HOME at
-  // call time, and a suite that sandboxes itself by pointing $HOME at a temp
-  // directory — codex-sync builds a whole fake `~/plugins` that way — would
-  // otherwise be flagged for doing exactly the right thing. A real home
-  // directory is never under the temp dir, so nothing worth catching is lost.
+  // The temp-dir allowance comes BEFORE the home rules: suites sandbox $HOME under the temp dir.
   for (const tmp of [nodeOs.tmpdir(), '/tmp', '/private/tmp', '/var/tmp']) {
     if (isUnder(resolved, nodePath.resolve(tmp))) return null;
   }
@@ -458,9 +374,7 @@ function writeDenied(target: unknown): string | null {
   for (const allowed of state.writePaths) {
     if (isUnder(resolved, allowed) || isUnder(physical, allowed)) return null;
   }
-  // Both the lexical and the physical path have to be clear. The lexical one
-  // catches `<checkout>/data` even when it is itself a symlink elsewhere; the
-  // physical one catches a temp path that points into a denied root.
+  // Both the lexical and the physical path must be clear.
   for (const candidate of physical === resolved ? [resolved] : [resolved, physical]) {
     const denied = deniedFor(candidate);
     if (denied !== null) return denied;
@@ -515,18 +429,9 @@ function isWriteOpen(flags: unknown): boolean {
 }
 
 /**
- * Which arguments hold a path this call MUTATES.
- *
- * Most of the API mutates its first. `copyFile`, `cp`, `symlink` and `link`
- * only create their second — checking the first there flags the source, which
- * is how this guard first "caught" a container mount copying a real Snowflake
- * key it was only reading. `rename` mutates both: it removes the source as well
- * as creating the destination, so `renameSync('<checkout>/data/v2.db', '/tmp/x')`
- * would move live central state out of the checkout past a destination-only
- * check. `open` mutates its first only when the flags say so, but it has to be
- * covered: `openSync(p, 'w')` truncates before a single byte is written, and
- * the descriptor it hands back is a number, which this guard deliberately
- * ignores — so an unguarded `open` makes every subsequent write invisible.
+ * Which arguments a call MUTATES. `copyFile`/`cp`/`symlink`/`link` create only their second; `rename` mutates
+ * both; `open` mutates its first only for write flags, but must be covered because it truncates and the
+ * returned descriptor is invisible to this guard.
  */
 function writeTargets(api: string, args: unknown[]): number[] {
   if (/^open/.test(api)) return isWriteOpen(args[1]) ? [0] : [];
@@ -579,16 +484,7 @@ guardedFsPromises.default = guardedFsPromises;
 mock.module('fs/promises', () => guardedFsPromises);
 mock.module('node:fs/promises', () => guardedFsPromises);
 
-// ── end-of-scope accounting ──────────────────────────────────────────────────
-
-/**
- * Throwing from the guarded call is not enough on its own. Much of the runner
- * wraps its real work in try/catch precisely so a flaky host never takes the
- * session down, so an escape can be caught by the code under test and leave the
- * run green even under `enforce`. Failing here closes that gap: anything that
- * reached out has to say so, by calling clearHermeticityAttempts() once it has
- * asserted on the record.
- */
+/** Fail at end of scope: code under test often catches the guarded throw. Acknowledge with clearHermeticityAttempts(). */
 afterAll(() => {
   const unacknowledged = state.attempts.slice();
   state.attempts.length = 0;
