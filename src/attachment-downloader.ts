@@ -1,20 +1,3 @@
-/**
- * Persist attachments that chat-sdk-bridge has already downloaded+base64'd
- * onto the session workspace so the container agent can actually read
- * them (via Read/Bash tools) instead of seeing only the filename.
- *
- * Chat SDK stores attachments with a base64 `data` field in the inbound
- * content JSON. That's bloated in the session DB and invisible to
- * Claude. This module decodes `data` → file under
- * `data/v2-sessions/<ag>/<sess>/attachments/<msgId>/<filename>` and
- * rewrites the attachment entry with a relative `localPath` that the
- * agent-runner's formatter resolves to `/workspace/<localPath>`.
- *
- * Phase 2.6 minimum: text/document attachments land on disk for
- * Read/Bash access. Image vision (base64 → content blocks passed to
- * Claude directly) is a separate formatter change if we want inline
- * image reading rather than tool-based reads.
- */
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -44,12 +27,7 @@ interface AttachmentEntry {
   localPath?: string;
 }
 
-/**
- * Inspect content JSON, persist any base64 attachments to disk, and
- * mutate the content in place to replace `data` with `localPath`.
- * Returns the new content string. Idempotent if called twice (skips
- * entries that already have a localPath).
- */
+/** Mutates `content` in place and returns the new string; idempotent (skips entries that have a localPath). */
 export function persistInboundAttachments(
   agentGroupId: string,
   sessionId: string,
@@ -71,7 +49,7 @@ export function persistInboundAttachments(
   let anyPersisted = false;
 
   for (const raw of attachments as AttachmentEntry[]) {
-    if (raw.localPath || !raw.data) continue; // already saved or nothing to save
+    if (raw.localPath || !raw.data) continue;
     try {
       const buffer = Buffer.from(raw.data, 'base64');
       if (buffer.length === 0) continue;
@@ -85,10 +63,7 @@ export function persistInboundAttachments(
         continue;
       }
       fs.mkdirSync(baseDir, { recursive: true });
-      // Content-hash the filename to disambiguate same-named attachments
-      // (Slack/Discord paste every clipboard image as "image.png"). Prior fix
-      // 50556f7 lived in the pre-Phase-2.6 download path that 8f913c6 replaced
-      // with this function; the dedup didn't migrate over.
+      // Content-hashed so same-named attachments (every pasted clipboard image is "image.png") don't collide.
       const sha = createHash('sha256').update(buffer).digest('hex').slice(0, 8);
       const rawName = sanitizeSegment(raw.name || raw.filename || 'file', 'file');
       const ext = path.extname(rawName);

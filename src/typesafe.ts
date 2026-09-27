@@ -1,11 +1,7 @@
 /**
- * Host-side client for TypeSafe's Jev (docs.typesafe.ai): send one `state`
- * and a map of typed questions, get typed answers with probabilities back.
- *
- * The key is never in this process. Requests go through the OneCLI gateway
- * proxy (the same dispatcher `src/llm.ts` uses for Anthropic), which injects
- * the `TypeSafe` secret for api.typesafe.ai — the host's OneCLI agent needs
- * that secret granted, otherwise the gateway answers 403 and this throws.
+ * Host-side client for TypeSafe's Jev: one `state` plus typed questions in, typed answers with probabilities out.
+ * The key never enters this process: the OneCLI gateway proxy injects it, and without the secret granted to the
+ * host's agent the gateway answers 403 and this throws.
  */
 import { fetch as undiciFetch } from 'undici';
 
@@ -37,8 +33,7 @@ export async function askJev(
   options: { timeoutMs?: number; fetch?: JevFetch } = {},
 ): Promise<Record<string, JevAnswer>> {
   const dispatcher = options.fetch ? null : getProxyDispatcher();
-  // Fail closed: without the gateway proxy nothing injects the credential, and
-  // the request body would still leave the host. Never send it direct.
+  // Fail closed: without the gateway proxy nothing injects the credential, yet the body would still leave the host.
   if (!options.fetch && !dispatcher) throw new Error('TypeSafe: no OneCLI gateway proxy configured');
   const fetchImpl: JevFetch =
     options.fetch ??

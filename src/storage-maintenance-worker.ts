@@ -14,8 +14,7 @@ import {
 } from './storage-manager.js';
 import { clearStorageCleanupClaims } from './storage-activity.js';
 
-// Both omitted members are functions and cannot cross the worker boundary; the
-// worker thread supplies its own.
+// Both omitted members are functions, which cannot cross the worker boundary.
 type SerializableStorageOptions = Omit<StorageReportOptions, 'isContainerRunning' | 'runningContainerMounts'>;
 type StorageWorkerCommand = 'maintenance' | 'admission' | 'report';
 
@@ -49,9 +48,7 @@ function createWorker(): WorkerLike {
   );
   const workerData = { dbPath: path.join(DATA_DIR, 'v2.db') };
   if (runningTypeScript) {
-    // Node 20 does not apply `--import tsx` hooks to a file-backed Worker.
-    // Register tsx inside an eval bootstrap, then load the real ESM-flavored
-    // TypeScript entrypoint through its supported CJS API.
+    // Node 20 does not apply `--import tsx` hooks to a file-backed Worker, so tsx is registered in an eval bootstrap.
     const entryPath = fileURLToPath(workerUrl);
     const parentPath = fileURLToPath(import.meta.url);
     const bootstrap = `const { require: tsxRequire } = require('tsx/cjs/api'); tsxRequire(${JSON.stringify(entryPath)}, ${JSON.stringify(parentPath)});`;
@@ -59,17 +56,12 @@ function createWorker(): WorkerLike {
   }
   return new Worker(workerUrl, {
     workerData,
-    // Never inherit parent-only flags such as `--input-type=module`; Node
-    // rejects those when the Worker has a file URL entrypoint.
+    // Never inherit parent-only flags such as `--input-type=module`: Node rejects them for a file-URL Worker.
     execArgv: [],
   });
 }
 
-/**
- * Owns one persistent worker so storage-manager cadence state stays intact.
- * Every filesystem walk, recursive removal, SQLite inventory read, and Docker
- * command runs on the worker's event loop rather than the channel host's.
- */
+/** One persistent worker (keeps cadence state); all filesystem, SQLite and Docker work runs off the host's loop. */
 export class BackgroundStorageMaintenance {
   private worker: WorkerLike | null = null;
   private readonly pending = new Map<number, PendingRequest>();
@@ -153,8 +145,7 @@ export class BackgroundStorageMaintenance {
   }
 
   private handleWorkerFailure(worker: WorkerLike, error: Error): void {
-    // A failed Worker emits `error` and then `exit`. Ignore that late exit if
-    // a replacement Worker has already accepted new requests.
+    // A failed Worker emits `error` then `exit`; ignore the late exit once a replacement exists.
     if (this.worker !== worker) return;
     this.worker = null;
     this.maintenanceInFlight = null;
@@ -229,9 +220,7 @@ export async function assertStorageAdmissionInBackground(activeSessionIds: strin
     };
   }
 
-  // Only pressure cases enter the serialized worker queue. If scheduled
-  // maintenance is already running, admission naturally observes its result
-  // rather than racing a second destructive cleanup pass.
+  // Only pressure cases enter the serialized queue, so admission observes a running pass instead of racing it.
   return backgroundStorageMaintenance.assertAdmission(activeSessionIds);
 }
 

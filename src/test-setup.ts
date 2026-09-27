@@ -12,22 +12,9 @@ stripInheritedGitEnv();
 const createdRoots: string[] = [];
 
 /**
- * A fixture root unique to this process and this call.
- *
- * Fixed roots (`/tmp/nanoclaw-<suite>`) made two vitest runs in two worktrees
- * share fixture state: whichever run lost the race failed as `disk I/O error`
- * or a missing directory somewhere unrelated to the change under test, never as
- * an assertion. `fileParallelism: false` only ever covered the single-process
- * case.
- *
- * The directory is NOT created — suites that assert on an absent root, or that
- * exercise code whose job is to create it, keep that behavior. Every root
- * handed out is removed after the test file finishes.
- *
- * This is installed on `globalThis` rather than exported because its main
- * callers are `vi.hoisted` factories, which vitest hoists above the file's
- * imports and which therefore cannot reference an imported binding. Setup files
- * run before the test module loads, so the global is already in place.
+ * A fixture root unique to this process and call: fixed roots let concurrent vitest runs in two worktrees share
+ * fixture state. NOT created (suites asserting an absent root keep that behavior); removed after the test file.
+ * On `globalThis`, not exported, because its callers are `vi.hoisted` factories, which cannot reference an import.
  */
 function uniqueTmpRoot(name: string): string {
   const root = path.join(os.tmpdir(), `nanoclaw-${name}-${process.pid}-${randomBytes(4).toString('hex')}`);

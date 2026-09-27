@@ -1,24 +1,11 @@
-/**
- * Bind-mount inspection for running containers.
- *
- * Its own module rather than a member of container-runtime.ts: worktree-cleanup
- * imports storage-manager, so storage-manager cannot import worktree-cleanup
- * back for this, and both need the same answer from the same implementation.
- * Keeping the runtime binary as a live import binding also leaves the existing
- * container-runtime mocks in place for callers' tests.
- */
+/** Bind-mount inspection for running containers; a module of its own to avoid a worktree-cleanup import cycle. */
 import { execFileSync } from 'child_process';
 
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 
 /**
- * Every host path bind-mounted into a currently running container.
- *
- * `isContainerRunning` reads this process's own bookkeeping, which is empty in
- * any out-of-process caller and says nothing about a container started by
- * someone else. Before removing anything, apply mode asks the runtime directly.
- * `null` means the runtime could not be listed, and a container we cannot see
- * is a container we must assume owns the path.
+ * Every host path bind-mounted into a running container, asked of the runtime directly (`isContainerRunning` sees
+ * only this process's containers). `null`: the runtime could not be listed, so assume it owns the path.
  */
 export function runningContainerMounts(): string[] | null {
   try {

@@ -12,8 +12,7 @@ interface StorageWorkerData {
   dbPath: string;
 }
 
-// Both omitted members are functions: they cannot survive the structured clone
-// into the worker, and both are supplied on this side instead.
+// Both omitted members are functions, which cannot survive the structured clone; this side supplies them.
 type SerializableStorageOptions = Omit<StorageReportOptions, 'isContainerRunning' | 'runningContainerMounts'>;
 
 type StorageWorkerRequest =
@@ -45,12 +44,8 @@ await initDb((workerData as StorageWorkerData).dbPath);
 port.on('message', (message: StorageWorkerRequest) => {
   try {
     if (message.command === 'close') {
-      // `void`, not `await`: this listener must stay synchronous (an async
-      // listener would report success before the close ran, and is a
-      // no-misused-promises error). `closeDb()` runs `SqliteDriver.close()`,
-      // whose body reaches `raw.close()` synchronously whenever no driver
-      // transaction is open — and this worker opens none — so the handle is
-      // shut before `postMessage`, exactly as before the driver landed.
+      // `void`, not `await`: the listener must stay synchronous, and `closeDb()` reaches `raw.close()` synchronously
+      // when no transaction is open (this worker opens none), so the handle is shut before `postMessage`.
       void closeDb();
       port.postMessage({ id: message.id, ok: true });
       port.close();
@@ -78,8 +73,7 @@ port.on('message', (message: StorageWorkerRequest) => {
   }
 });
 
-// Same reasoning as the 'close' command: an exit handler cannot await, and
-// `closeDb()` closes the raw handle synchronously when no transaction is open.
+// An exit handler cannot await; `closeDb()` closes synchronously when no transaction is open.
 process.once('exit', () => {
   void closeDb();
 });

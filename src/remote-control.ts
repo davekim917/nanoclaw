@@ -1,17 +1,3 @@
-/**
- * Remote Control (Phase 5.7).
- *
- * Thin wrapper around Claude Code's OOTB `claude remote-control` CLI.
- * NanoClaw doesn't build anything novel here — just spawns the CLI,
- * captures the URL it prints, and tracks the session so we can tell
- * users "already running" on repeat requests and restore state on
- * restart.
- *
- * Ported from v1 with minor v2-idiom adjustments:
- * - logger → log
- * - exported startRemoteControl / stopRemoteControl / getActiveSession
- *   so the host-side system-action handler can drive them
- */
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -58,7 +44,6 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** Restore session from disk on startup. If the process is still alive, adopt it. Otherwise clean up. */
 export function restoreRemoteControl(): void {
   let data: string;
   try {
