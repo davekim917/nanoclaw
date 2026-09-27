@@ -9,7 +9,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
-import { declareGroupSecret } from '../../onecli-secret-grants.js';
+import { declareGroupSecret, findSecretDeclarations } from '../../onecli-secret-grants.js';
 import {
   createOnecliSecret,
   findOnecliSecretByName,
@@ -18,7 +18,8 @@ import {
 } from '../../onecli-secret-writer.js';
 import { formatLocalTime } from '../../timezone.js';
 import { notifyAgent, pickApprovalDelivery, pickOwnersFirst } from '../approvals/primitive.js';
-import { isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
+import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
+import { getUser } from '../permissions/db/users.js';
 
 const INTAKE_TTL_MS = 15 * 60_000;
 const FINISHED_RETENTION_MS = 60 * 60_000;
@@ -28,6 +29,7 @@ const HOST_PATTERN_RE = /^([A-Za-z0-9-]+\.)+[A-Za-z0-9-]+$/;
 const PATH_PATTERN_RE = /^\/[!-~]{0,255}$/;
 const VALUE_FORMAT_RE = /^[ -~]{1,200}$/;
 const MAX_PENDING_PER_SESSION = 3;
+const OPEN_AUTHORITY_WAIT_MS = 1000;
 
 type SecretIntakeStatus = 'pending' | 'storing' | 'stored' | 'failed' | 'expired';
 
@@ -53,7 +55,14 @@ interface Intake {
   groups: string[];
   workgroups: string[];
   sessionId: string | null;
-  card: { channelType: string; platformId: string; instance: string; messageId: string | null };
+  requester: { agentGroupId: string; agentName: string; workgroupId: string | null } | null;
+  card: {
+    channelType: string;
+    platformId: string;
+    threadId: string | null;
+    instance: string;
+    messageId: string | null;
+  };
   deliveredTo: string;
   expiresAt: number;
   status: SecretIntakeStatus;
@@ -209,8 +218,29 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
 
   const session = caller.kind === 'agent' ? await getSession(caller.sessionId) : undefined;
   const originMg = session?.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
-  const target = await pickApprovalDelivery(await pickOwnersFirst(null), originMg?.channel_type ?? '');
-  if (!target) throw new Error('No owner or global admin has a reachable DM to receive the secret form.');
+  let card: Intake['card'];
+  let deliveredTo: string;
+  if (originMg && session) {
+    card = {
+      channelType: originMg.channel_type,
+      platformId: originMg.platform_id,
+      threadId: session.thread_id,
+      instance: originMg.instance ?? originMg.channel_type,
+      messageId: null,
+    };
+    deliveredTo = `the requesting conversation (${originMg.name ?? originMg.platform_id})`;
+  } else {
+    const target = await pickApprovalDelivery(await pickOwnersFirst(null), '');
+    if (!target) throw new Error('No owner or global admin has a reachable DM to receive the secret form.');
+    card = {
+      channelType: target.messagingGroup.channel_type,
+      platformId: target.messagingGroup.platform_id,
+      threadId: null,
+      instance: target.messagingGroup.instance ?? target.messagingGroup.channel_type,
+      messageId: null,
+    };
+    deliveredTo = target.userId;
+  }
   const adapter = getDeliveryAdapter();
   if (!adapter) throw new Error('Channel delivery is not ready yet; try again in a moment.');
 
@@ -222,13 +252,12 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
     groups,
     workgroups,
     sessionId: caller.kind === 'agent' ? caller.sessionId : null,
-    card: {
-      channelType: target.messagingGroup.channel_type,
-      platformId: target.messagingGroup.platform_id,
-      instance: target.messagingGroup.instance ?? target.messagingGroup.channel_type,
-      messageId: null,
-    },
-    deliveredTo: target.userId,
+    requester:
+      caller.kind === 'agent' && callerGroup
+        ? { agentGroupId: callerGroup.id, agentName: callerGroup.name, workgroupId: callerGroup.workgroup_id ?? null }
+        : null,
+    card,
+    deliveredTo,
     expiresAt: now + INTAKE_TTL_MS,
     status: 'pending',
     detail: null,
@@ -240,6 +269,9 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
     `${requester} is asking for this secret.`,
     injection ? injectionLine(injection) : 'Replaces the value; where it is sent stays unchanged.',
     grantsLine(groups, workgroups, input.rotate),
+    callerGroup
+      ? `An owner, a global admin, or an admin of "${callerGroup.name}" can enter it.`
+      : 'Only an owner or global admin can enter it.',
     `The value goes straight to the vault — no agent sees it. Expires ${formatLocalTime(new Date(intake.expiresAt).toISOString(), TIMEZONE)}.`,
   ].join('\n');
 
@@ -265,7 +297,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
       (await adapter.deliver(
         intake.card.channelType,
         intake.card.platformId,
-        null,
+        intake.card.threadId,
         'chat-sdk',
         JSON.stringify({
           type: 'secret_intake',
@@ -294,21 +326,73 @@ export function getSecretIntake(intakeId: string): SecretIntakeView | undefined 
 }
 
 async function editCard(intake: Intake, text: string): Promise<void> {
+  if (!intake.card.messageId) return;
+  await deliverToCard(intake, 'chat-sdk', { operation: 'edit', messageId: intake.card.messageId, text });
+}
+
+async function deliverToCard(intake: Intake, kind: string, content: Record<string, unknown>): Promise<void> {
   const adapter = getDeliveryAdapter();
-  if (!adapter || !intake.card.messageId) return;
+  if (!adapter) return;
   try {
     await adapter.deliver(
       intake.card.channelType,
       intake.card.platformId,
-      null,
-      'chat-sdk',
-      JSON.stringify({ operation: 'edit', messageId: intake.card.messageId, text }),
+      intake.card.threadId,
+      kind,
+      JSON.stringify(content),
       undefined,
       intake.card.instance,
     );
   } catch (err) {
-    log.warn('Secret intake: could not edit the card', { intakeId: intake.id, err });
+    log.warn('Secret intake: could not post to the card conversation', { intakeId: intake.id, err });
   }
+}
+
+type Authority = 'owner' | 'group-admin' | null;
+
+function mayEnter(intake: Intake): string {
+  const who = intake.requester
+    ? `an owner, a global admin or an admin of "${intake.requester.agentName}"`
+    : 'an owner or global admin';
+  return `Only ${who} can enter this secret.`;
+}
+
+function authorityOf(intake: Intake, namespacedUserId: string): Promise<Authority> {
+  return withCentralSync(() => {
+    if (isOwner(namespacedUserId) || isGlobalAdmin(namespacedUserId)) return 'owner' as const;
+    if (intake.requester && isAdminOfAgentGroup(namespacedUserId, intake.requester.agentGroupId)) {
+      return 'group-admin' as const;
+    }
+    return null;
+  }, 'secret intake authority');
+}
+
+async function foreignHolder(intake: Intake): Promise<string | null> {
+  const existing = await findOnecliSecretByName(intake.secretName);
+  const own = intake.requester?.workgroupId ?? null;
+  const found = await findSecretDeclarations(existing ? [existing.name, existing.id] : [intake.secretName]);
+  const workgroup = found.workgroups.find((w) => w.id !== own);
+  if (workgroup) return `workgroup ${workgroup.id}`;
+  const group = found.groups.find((g) => own === null || g.workgroupId !== own);
+  return group ? `agent group ${group.id}` : null;
+}
+
+async function tellOwners(text: string): Promise<void> {
+  const adapter = getDeliveryAdapter();
+  const target = await pickApprovalDelivery(await pickOwnersFirst(null), '');
+  if (!adapter || !target) {
+    log.warn('Secret intake: no owner DM for the store notice');
+    return;
+  }
+  await adapter.deliver(
+    target.messagingGroup.channel_type,
+    target.messagingGroup.platform_id,
+    null,
+    'chat',
+    JSON.stringify({ text }),
+    undefined,
+    target.messagingGroup.instance ?? target.messagingGroup.channel_type,
+  );
 }
 
 async function tellRequester(intake: Intake, text: string): Promise<void> {
@@ -336,13 +420,20 @@ async function failIntake(intake: Intake, err: unknown): Promise<void> {
 }
 
 async function completeIntake(intake: Intake, namespacedUserId: string, value: string): Promise<void> {
-  const allowed = await withCentralSync(
-    () => isOwner(namespacedUserId) || isGlobalAdmin(namespacedUserId),
-    'secret intake authority',
-  );
-  if (!allowed) {
+  const authority = await authorityOf(intake, namespacedUserId);
+  const refusal = !authority
+    ? mayEnter(intake)
+    : authority === 'group-admin' && intake.rotate
+      ? await foreignHolder(intake).then((holder) =>
+          holder
+            ? `"${intake.secretName}" is also held by ${holder}, so only an owner or global admin can rotate it.`
+            : null,
+        )
+      : null;
+  if (refusal) {
     intake.status = 'pending';
-    log.warn('Secret intake: submit refused, not an owner or global admin', { intakeId: intake.id });
+    log.warn('Secret intake: submit refused', { intakeId: intake.id, authority });
+    await deliverToCard(intake, 'chat', { text: `${refusal} Nothing was stored; the request is still open.` });
     return;
   }
   if (intake.injection) {
@@ -386,17 +477,31 @@ async function completeIntake(intake: Intake, namespacedUserId: string, value: s
     intake,
     `Secret "${intake.secretName}" is stored in the vault (${intake.rotate ? 'rotated' : 'created'}); you never saw its value. ${granted}. ${effect}${intake.detail ? ` WARNING: ${intake.detail}` : ''}`,
   );
+  if (authority === 'group-admin') {
+    const who = (await getUser(namespacedUserId))?.display_name || namespacedUserId;
+    await tellOwners(
+      `🔐 ${who} ${intake.rotate ? 'rotated' : 'stored'} secret "${intake.secretName}" for agent "${intake.requester?.agentName}". ${intake.injection ? injectionLine(intake.injection) : 'Where it is sent is unchanged.'} ${granted}.`,
+    );
+  }
 }
 
 export function secretIntakeHooks(channelType: string): SecretIntakeHooks {
   const namespaced = (userId: string): string => (userId.includes(':') ? userId : `${channelType}:${userId}`);
   return {
-    // No awaits: the trigger window can close before the central lease frees, so completeIntake checks authority.
-    async open(intakeId) {
+    // The trigger window can close before the lease frees, so open waits briefly and completeIntake decides.
+    async open(intakeId, userId) {
       prune(Date.now());
       const intake = intakes.get(intakeId);
       const refused = unavailable(intake);
       if (refused || !intake) return { ok: false, message: refused ?? 'This secret request no longer exists.' };
+      let timer: NodeJS.Timeout | undefined;
+      const early = await Promise.race([
+        authorityOf(intake, namespaced(userId)).catch(() => 'undecided' as const),
+        new Promise<'undecided'>((resolve) => {
+          timer = setTimeout(() => resolve('undecided'), OPEN_AUTHORITY_WAIT_MS);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (early === null) return { ok: false, message: mayEnter(intake) };
       return {
         ok: true,
         form: {
