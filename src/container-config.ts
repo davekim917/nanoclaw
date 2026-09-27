@@ -1,9 +1,9 @@
 /**
  * Container config types and access layer.
  *
- * `groups/<folder>/container.json` is the source of truth for every field. The `container_configs` row mirrors only
- * the operational scalars (`configFromDb` reconstructs ONLY those), so never write the file from DB state alone:
- * that would silently drop every file-only field.
+ * `groups/<folder>/container.json` is the source of truth except `agentGroupId`/`groupName`, which spawn overwrites
+ * from the DB. The `container_configs` row mirrors only the operational scalars (`configFromDb` reconstructs ONLY
+ * those), so never write the file from DB state alone: that would silently drop every file-only field.
  */
 import fs from 'fs';
 import path from 'path';
@@ -558,10 +558,10 @@ export interface ContainerConfig {
 
   /**
    * `~/plugins` paths NOT delivered to this group (validated by `validateExcludePlugins`). A top-level entry is
-   * never mounted (OpenCode's skills still arrive via a mirror filtered only for sub-path entries). A sub-path
-   * entry (`"bootstrap/plugins/orchestrate"`) withholds only REGISTRATION: the repo mounts whole and each walker
-   * that would register the sub-plugin skips it via `src/plugin-exclusions.ts`. Guard files loaded by absolute path
-   * are withheld by neither form. An entry naming a path this install lacks REFUSES THE SPAWN: an exclusion that
+   * never mounted, guard files included (OpenCode's skills still arrive via a mirror filtered only for sub-path
+   * entries). A sub-path entry (`"bootstrap/plugins/orchestrate"`) withholds only REGISTRATION: the repo mounts
+   * whole, so absolute-path guard files stay, and each walker that would register it skips it via
+   * `src/plugin-exclusions.ts`. An entry naming a path this install lacks REFUSES THE SPAWN: an exclusion that
    * matches nothing silently withholds nothing.
    */
   excludePlugins?: string[];
