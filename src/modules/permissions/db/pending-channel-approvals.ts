@@ -41,15 +41,11 @@ export async function createPendingChannelApproval(row: PendingChannelApproval):
   return result.changes > 0;
 }
 
-/** The row the `channels.register` guard reads. */
 const PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL = 'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?';
 
 /**
- * Synchronous and lease-only (seam-3 plan §4.5, I-1): the `channels.register`
- * guard in `../guard.ts` reads this row inside its `decide` body, which never
- * awaits, so the read goes through `withRawDb` and works only inside a
- * `withCentralSync` block. The guard's caller holds one; every other caller
- * takes the lease around this call. One form, no `*Sync` twin.
+ * Synchronous and lease-only: the `channels.register` guard reads it inside a
+ * `decide` body, so callers outside a `withCentralSync` block take the lease.
  */
 export function getPendingChannelApproval(messagingGroupId: string): PendingChannelApproval | undefined {
   return withRawDb(
@@ -84,11 +80,8 @@ export async function updatePendingChannelApprovalCard(
 /**
  * Delete the row, and say whether THIS caller is the one that deleted it.
  *
- * The twin of `deletePendingSenderApproval`'s claim, for the same reason: the
- * click handler resolves the card across several awaits, so two callbacks for
- * one card can both reach the branch that wires the channel and admits the
- * sender. SQLite applies the DELETE once, so exactly one caller sees
- * `changes === 1`. See `handleChannelApprovalResponse` in ../index.ts.
+ * The claim: two callbacks for one card can both reach the terminal branch,
+ * and exactly one sees `changes === 1`.
  */
 export async function deletePendingChannelApproval(messagingGroupId: string): Promise<boolean> {
   const info = await getDb().run(

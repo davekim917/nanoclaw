@@ -1,25 +1,10 @@
 /**
- * Chat-invokable access grants (fork addition).
+ * Chat-invokable access grants: `grant_access`, `revoke_access`, `list_access`.
  *
- * Registers three delivery actions — `grant_access`, `revoke_access`,
- * `list_access` — that the container's permissions MCP tool emits. See
- * `container/agent-runner/src/mcp-tools/permissions.ts` for the agent-
- * facing side.
- *
- * Authorization (trust-minimal):
- *   1. Caller identity is read from the SESSION's latest inbound chat
- *      message — not from anything the agent can pass in. The agent
- *      can't impersonate; it can only choose whether to emit the
- *      action for the user who actually sent the triggering message.
- *   2. Authority tiers:
- *        - owner / global admin → can grant/revoke `member` or `admin`,
- *          on any agent group.
- *        - admin-of-target-group → can grant/revoke `member` only, on
- *          their own scoped group.
- *        - anyone else → denied.
- *      `list_access` is readable by anyone who can reach the session.
- *   3. Owner role is never grantable via tool. Set via
- *      `/init-first-agent` or a direct DB edit.
+ * Caller identity is read from the SESSION's latest inbound chat message, never
+ * from anything the agent passes in. Owner / global admin may grant or revoke
+ * `member` or `admin` anywhere; a scoped admin only `member` on their own group.
+ * The owner role is never grantable here.
  */
 
 import { withCentralSync, withRawDb } from '../../db/central-lease.js';
@@ -52,7 +37,6 @@ interface GrantArgs {
   agentGroupId?: unknown;
 }
 
-/** Strip `<@…>` wrapping and prepend channel_type when needed. */
 async function resolveTargetUserId(rawUser: string, session: Session): Promise<string | null> {
   let handle = rawUser.trim();
   if (handle.startsWith('<@') && handle.endsWith('>')) {
@@ -84,13 +68,10 @@ function describeAuthority(userId: string, agentGroupId: string): Promise<string
 async function ensureUserExists(userId: string): Promise<void> {
   if (await getUser(userId)) return;
   const [kind] = userId.split(':', 1);
-  // createUser shape matches upsertUser; upsert is no-op safe.
   await upsertUser({ id: userId, kind: kind ?? 'unknown', display_name: null, created_at: new Date().toISOString() });
-  void createUser; // imported for parity; upsertUser is the idempotent path.
+  void createUser;
 }
 
-// Exports the derivation helpers for unit testing. Handlers below are
-// intentionally not exported — they self-register via registerDeliveryAction.
 export { deriveCallerId as _deriveCallerId, resolveTargetUserId as _resolveTargetUserId };
 
 export async function handleGrantAccess(content: Record<string, unknown>, session: Session): Promise<void> {
@@ -119,7 +100,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  // Authorization. The role predicates are lease-only (§4.5 I-1).
+  // The role predicates are lease-only.
   const { callerIsGlobal, callerIsScopedAdmin } = await withCentralSync(
     () => ({
       callerIsGlobal: isOwner(callerId) || isGlobalAdmin(callerId),
@@ -158,12 +139,8 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
 
   await ensureUserExists(targetUserId);
 
-  // The authority snapshot above is UX — the fast denial before the target is
-  // resolved. The decision that matters is re-taken INSIDE the block that
-  // writes: the target resolution awaits, and a caller revoked
-  // in that window must not complete a privileged write on stale authority.
-  // Caller re-check, target check and the write are one synchronous lease
-  // block; the write runs the leaf's exported constant through `withRawDb`.
+  // The snapshot above is only the fast denial. Target resolution awaits, so
+  // the caller re-check, target check and write are one synchronous lease block.
   if (role === 'member') {
     const outcome = await withCentralSync((): 'caller-revoked' | 'already' | 'added' => {
       if (!(isOwner(callerId) || isGlobalAdmin(callerId) || isAdminOfAgentGroup(callerId, targetAgentGroupId))) {
@@ -195,11 +172,8 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
       return;
     }
     log.info('grant_access: member added', { callerId, targetUserId, targetAgentGroupId });
-    // Best-effort: addMember above already committed. This is a system-action
-    // delivery handler — an awaited rejection here would leave the message
-    // undelivered, so the delivery loop retries the whole handler (re-adding
-    // an already-added member) rather than just re-attempting the
-    // notification.
+    // Not awaited: a rejection would make the delivery loop retry the whole
+    // handler after the grant already committed.
     void Promise.resolve(
       notifyAgent(session, `Granted member access: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`),
     ).catch((err) => log.warn('grant_access notification failed', { targetUserId, targetAgentGroupId, err }));
@@ -234,7 +208,6 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
   log.info('grant_access: admin granted', { callerId, targetUserId, targetAgentGroupId });
-  // Best-effort — see the matching comment on the member-grant path above.
   void Promise.resolve(notifyAgent(session, `Granted admin: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`)).catch(
     (err) => log.warn('grant_access notification failed', { targetUserId, targetAgentGroupId, err }),
   );
@@ -281,19 +254,9 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
 
-  // ONE synchronous lease block: the caller's authority is RE-CHECKED here,
-  // the target's standing is read, and the removal runs — nothing awaits
-  // between them. The snapshot taken before `resolveTargetUserId`
-  // is only the fast denial; another owner/admin can revoke this caller during
-  // that await, and the write must see the caller as they are NOW. The writes
-  // execute the leaves' exported constants through `withRawDb` (one constant,
-  // two executors), so the block holds no driver statement.
-  //
-  // `callerIsGlobal` is the load-bearing half of the admin-role branch, not a
-  // shortcut for the refusal above it: a scoped
-  // admin may take membership, never a role, and with the checks and the
-  // writes in one block a role granted concurrently is either seen (refused)
-  // or lands after this block, untouched.
+  // ONE synchronous lease block: caller re-check, target standing and removal,
+  // nothing awaited between them, so the write sees the caller as they are NOW.
+  // A scoped admin may take membership, never a role.
   type RevokeOutcome = 'caller-revoked' | 'target-global' | 'target-owner' | 'target-admin' | 'nothing' | 'revoked';
   const outcome = await withCentralSync((): RevokeOutcome => {
     const callerIsGlobalNow = isOwner(callerId) || isGlobalAdmin(callerId);
@@ -306,7 +269,6 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     const targetIsMember = isMember(targetUserId, targetAgentGroupId);
     // Never let a scoped admin revoke owner or global admin.
     if (!callerIsGlobalNow && targetIsGlobal) return 'target-global';
-    // Owners are never revoked via this path — sensitive, do it manually.
     if (targetIsOwner) return 'target-owner';
     // Scoped admins can only revoke `member`, not `admin` (that's an escalation).
     if (!callerIsGlobalNow && targetIsAdminOfGroup) return 'target-admin';
@@ -351,9 +313,7 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
   log.info('revoke_access: revoked', { callerId, targetUserId, targetAgentGroupId });
-  // Best-effort: the removal above already committed. Same
-  // reasoning as the grant paths — an awaited rejection here would cause a
-  // full-handler retry that re-attempts an already-completed revoke.
+  // Not awaited, as on the grant paths.
   void Promise.resolve(notifyAgent(session, `Revoked access: \`${targetUserId}\` ← \`${targetAgentGroupId}\`.`)).catch(
     (err) => log.warn('revoke_access notification failed', { targetUserId, targetAgentGroupId, err }),
   );
@@ -377,9 +337,6 @@ export async function handleListAccess(content: Record<string, unknown>, session
   lines.push(`  global admins: ${globalAdmins.length ? globalAdmins.map((r) => r.user_id).join(', ') : '(none)'}`);
   lines.push(`  scoped admins: ${scopedAdmins.length ? scopedAdmins.map((r) => r.user_id).join(', ') : '(none)'}`);
   lines.push(`  members: ${members.length ? members.map((m) => m.user_id).join(', ') : '(none)'}`);
-  // Authority + role are distinct — a user with `getUserRoles` that are all
-  // global owner/admin shows up in roles above but not members. Document
-  // that explicitly if anyone reads the output and is confused:
   lines.push('  (note: owners + admins implicitly have member-level access even without a row in `members`).');
   // Referenced for type-check silence on the import and future extension.
   void getUserRoles;

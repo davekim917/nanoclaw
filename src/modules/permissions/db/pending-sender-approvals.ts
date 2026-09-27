@@ -62,13 +62,8 @@ export async function getInFlightSenderApproval(
 /**
  * Delete the row, and say whether THIS caller is the one that deleted it.
  *
- * The boolean is the claim. Under the async driver the click handler's
- * `getPendingSenderApproval` read yields, so two callbacks for one card (an
- * adapter retry, a double-click) can both find the row live and both act on
- * it — and "act" ends in `replayDeferredInbound`, so the retained message
- * would be delivered twice. This DELETE is the arbiter: SQLite applies it
- * once, exactly one caller sees `changes === 1`, and only that caller
- * proceeds. See `handleSenderApprovalResponse` in ../index.ts.
+ * The boolean is the claim: two callbacks for one card can both find the row
+ * live, and only the caller whose DELETE applied may replay the message.
  */
 export async function deletePendingSenderApproval(id: string): Promise<boolean> {
   const info = await getDb().run('DELETE FROM pending_sender_approvals WHERE id = ?', id);
@@ -80,36 +75,23 @@ export async function deletePendingSenderApproval(id: string): Promise<boolean> 
 // group, sender) by reusing this table's UNIQUE key — an id prefix
 // distinguishes stamps from real card rows. Stamps never render a card and
 // no click can resolve one: response handlers look a row up by exact id, and
-// a stamp's id is not a `nsa-` id any card was ever delivered with.
-//
-// Two collisions on the UNIQUE key, both deliberate:
-//   - policy flipped decline_notify → request_approval, stale stamp in the
-//     way: requestSenderApproval clears the stamp before carding.
-//   - policy flipped request_approval → decline_notify, card row in the way:
-//     upsertDeclineStamp converts the row into the stamp shape. The card is
-//     obsolete once the policy no longer cards.
+// a stamp's id is not a `nsa-` id any card was ever delivered with. A policy
+// flip in either direction collides on the UNIQUE key deliberately.
 
 const DECLINE_STAMP_ID_PREFIX = 'decline:';
 
 /**
  * A stamp records only THAT a sender was declined, never what they wrote.
  *
- * `original_message` exists so an approved card can replay the held event; a
- * declined sender has no replay path, so keeping their message would retain
- * content from someone the operator explicitly turned away, with no reader
- * and no expiry (the row is refreshed, not deleted). This inert sentinel goes
- * in its place — NOT NULL is satisfied, and the one function that ever parses
- * the column (`isSameInboundEvent`) already treats unparseable content as
- * "not the retained event".
+ * A declined sender has no replay path, so their message is not retained; the
+ * sentinel satisfies NOT NULL and parses as "not the retained event".
  */
 const DECLINE_STAMP_BODY = '{"declined":true}';
 
 /** ISO timestamp of the last decline for this pair, if any. */
 /**
- * True for a decline stamp, false for a real approval card. The two share the
- * table and its UNIQUE key, so anything that reads a row for the pair without
- * knowing which flow wrote it has to ask — a stamp has no approver, no render
- * metadata, and a sentinel body rather than a retained event.
+ * Stamps and cards share the table and its UNIQUE key; a reader that does not
+ * know which flow wrote a row has to ask.
  */
 export function isDeclineStampId(id: string): boolean {
   return id.startsWith(DECLINE_STAMP_ID_PREFIX);
@@ -119,18 +101,9 @@ export function isDeclineStampId(id: string): boolean {
  * Freshness check and stamp write as ONE statement, returning whether this
  * caller won.
  *
- * Reading the stamp, deciding the window had expired, and only then writing
- * the stamp is not safe. Under the async driver that read
- * yields, so two overlapping declines both saw "no fresh stamp" and both sent
- * — a decline plus an owner FYI, twice, to someone we are in the middle of
- * refusing. The conflict clause below is the arbiter instead: the upsert
- * applies only when the existing row is NOT a fresh decline stamp, so exactly
- * one caller gets `changes === 1` and sends.
- *
- * The two rows it must still overwrite, both deliberate and both preserved:
- * a stale stamp (past the dedupe window) is refreshed, and a real card row is
- * converted into a stamp, because a group that has flipped to decline_notify
- * no longer cards. Only a FRESH stamp blocks.
+ * Read-then-write would let two overlapping declines both send; the conflict
+ * clause applies the upsert only when the existing row is NOT a fresh stamp.
+ * A stale stamp is refreshed and a card row converted; only a FRESH stamp blocks.
  */
 export async function claimDeclineStamp(
   stamp: { messaging_group_id: string; agent_group_id: string; sender_identity: string },

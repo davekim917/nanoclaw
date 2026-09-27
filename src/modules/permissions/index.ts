@@ -80,9 +80,7 @@ interface PendingNameInput {
   channelMgId: string;
   dmChannelType: string;
   dmPlatformId: string;
-  // Named-instance approver DM: without this, a reply on the approver's
-  // bare-channel-type conversation would be matched to a different
-  // sibling bot's conversation carrying the same channelType/platformId.
+  // Without it, a reply on a bare-channel-type DM could match a sibling bot's conversation.
   dmInstance?: string;
 }
 const awaitingNameInput = new Map<string, PendingNameInput>();
@@ -165,9 +163,7 @@ async function handleUnknownSender(
   // The admission decision is the guard's senders.admit decision (./guard.ts)
   // — unknown_sender_policy verbatim: strict → deny, request_approval → hold,
   // decline_notify → deny, public → allow (short-circuited before the gate).
-  // Drop-recording, the hold creation and the decline side effects stay here.
-  // Under the central lease: `guard()`'s reads are raw by design (seam 3
-  // §4.5 I-1).
+  // Under the central lease: `guard()`'s reads are raw by design.
   const decision = await withCentralSync(
     () =>
       guard(sendersAdmit, {
@@ -201,26 +197,12 @@ async function handleUnknownSender(
   );
   await recordDroppedMessage(dropRecord);
 
-  // decline_notify: polite in-DM decline + one-line owner FYI, no card.
-  // Fire-and-forget like the hold path — declineAndNotify dedupes itself
-  // (24h stamp) and logs its own failures; the sender's message stays
-  // dropped either way, so nothing is retained for replay.
-  // Gated on the guard's own verdict, not on the policy string alone: the
-  // guard (./guard.ts) is the decision seam, so a future policy change that
-  // makes decline_notify hold must card, not decline behind the guard's back.
+  // Gated on the guard's verdict, not the policy string: the guard is the
+  // decision seam, so a policy that holds must card, not decline.
   if (decision.effect === 'deny' && isDeclineNotify) {
-    // The decline copy assumes a 1:1 DM surface, so this needs POSITIVE
-    // evidence of one — `mg.is_group !== 1` is not that. The router's
-    // auto-create default only resolves an adapter
-    // that reports NEITHER isDM nor isGroup to is_group = 1
-    // (group/mention-safe); is_group also defaults to 0 with NO adapter
-    // evidence at all on other paths that create a row — the CLI's
-    // `is_group` field and the column itself both default to 0. So
-    // `mg.is_group` alone is never proof either way, and this event's own
-    // live signal is required — the same reason the user_dms cache
-    // requires `event.isDM === true` (src/router.ts, the 2a branch).
-    // Without the evidence the drop above stands and nothing is sent:
-    // silence beats posting "I'm <owner>'s personal agent" into a channel.
+    // The decline copy assumes a 1:1 DM, so it needs this event's POSITIVE DM
+    // evidence: `is_group` defaults to 0 on several paths with no adapter signal.
+    // Without it nothing is sent — silence beats a DM-only reply in a channel.
     const confirmedDm = mg.is_group !== 1 && (event.isDM === true || event.message.isGroup === false);
     if (!confirmedDm) {
       log.warn('decline_notify skipped — no confirmed 1:1 DM context (no public decline)', {
@@ -259,13 +241,8 @@ async function handleUnknownSender(
 
 setSenderResolver(extractAndUpsertUser);
 
-// ── Sibling-bot allow-list ──
-// Provider injected by the host once channel adapters are up (see
-// `setSiblingBotIdsProvider` wiring in src/index.ts). Returns the set of
-// platform user-ids belonging to NanoClaw's OWN bots in this process. The
-// access gate consults it so sibling agents can engage each other even under a
-// `strict` messaging group. Defaults to empty (fail-closed) until wired, and
-// is read live at message time so it reflects the current adapter registries.
+// NanoClaw's OWN bots' platform user-ids, injected once adapters are up. Empty
+// (fail-closed) until wired; read live at message time.
 const EMPTY_BOT_IDS: ReadonlySet<string> = new Set();
 let getSiblingBotIds: () => ReadonlySet<string> = () => EMPTY_BOT_IDS;
 export function setSiblingBotIdsProvider(provider: () => ReadonlySet<string>): void {
@@ -292,11 +269,8 @@ setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promis
     return { allowed: true };
   }
 
-  // Sibling agent bots are trusted peers, not strangers. A message authored by
-  // one of our own bots is allowed past the strict / request_approval gate so
-  // siblings can hand off to each other (the whole point of clone-as-codex /
-  // -opencode). Unknown humans and third-party bots still fall through to the
-  // drop / approval path below.
+  // Our own sibling bots pass the strict / request_approval gate so they can
+  // hand off to each other; unknown humans and third-party bots do not.
   if (isSiblingBotSender(userId, getSiblingBotIds())) {
     log.debug('ACCESS — sibling agent bot allowed past gate', {
       messagingGroupId: mg.id,
@@ -377,40 +351,17 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     });
     return true; // claim the response so it's not unclaimed-logged, but do nothing
   }
-  // The card is only actionable while the group still runs the flow that
-  // issued it. `decline_notify` promises the opposite of a card — no buttons,
-  // no approval path, grants stay explicit (`ncl members add`) — so a button
-  // delivered before the flip must not still grant membership afterwards.
-  //
-  // Checked here rather than by deleting rows inside the policy update: the
-  // click is the decision seam, so this holds no matter how the policy
-  // changed (ncl, dashboard, auto-wire, a direct DB edit), and it covers the
-  // window before the sender's next message converts the card into a stamp.
-  // Only decline_notify voids the card. `strict` and `public` do not: neither
-  // promises there is no approval path, so an admin approving an outstanding
-  // card there is a legitimate explicit grant, and that behavior predates
-  // this policy.
+  // `decline_notify` promises no approval path, so a card delivered before the
+  // flip must not grant membership after it. Checked at the click (the decision
+  // seam) so it holds however the policy changed; `strict` and `public` do not
+  // void the card.
   const currentMg = await getMessagingGroup(row.messaging_group_id);
   const voidedByPolicyFlip = currentMg?.unknown_sender_policy === 'decline_notify';
 
-  // ── Claim the card before acting on it ──
-  //
-  // `getPendingSenderApproval` above is awaited, so it yields. Two callbacks
-  // for the SAME card — an adapter retry, a double-click — can therefore both
-  // find the row live, and every branch below ends in an effect that must not
-  // happen twice: the approve branch replays the retained message
-  // (`replayDeferredInbound`), which is a real second delivery to the agent,
-  // and the deny and policy-flip branches each close out the deferred inbound.
-  //
-  // The DELETE is the arbiter rather than a lock: SQLite applies it once, so
-  // exactly one caller sees `changes === 1`. The loser returns `true` — the
-  // response IS claimed, by the winner, so reporting it unclaimed would be
-  // wrong — and does nothing else.
-  //
-  // It also has to happen HERE, before the approve branch's `addMember`, and
-  // that is the same ordering the pre-seam code already needed for a different
-  // reason: the row must be gone before `replayDeferredInbound` runs, or the
-  // second routing attempt sees an in-flight row and short-circuits.
+  // Claim the card before acting: two callbacks for the SAME card can both find
+  // the row live, and the approve branch's replay would deliver twice. The DELETE
+  // is the arbiter; the loser returns true (the winner claimed it). It must also
+  // precede `replayDeferredInbound`, which short-circuits on an in-flight row.
   const claimed = await deletePendingSenderApproval(row.id);
   if (!claimed) {
     log.debug('Unknown-sender approval click ignored — another callback already resolved this card', {
@@ -420,8 +371,6 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     return true;
   }
 
-  // The card is only actionable while the group still runs the flow that
-  // issued it — see the comment above the policy read.
   if (voidedByPolicyFlip) {
     log.warn('Unknown-sender approval click rejected — group switched to decline_notify', {
       approvalId: row.id,
@@ -429,9 +378,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
       messagingGroupId: row.messaging_group_id,
       clickerId,
     });
-    // Void the card the same way a deny does: the row (and with it the
-    // retained message body) is already dropped by the claim above; close out
-    // the deferred inbound so it does not sit unresolved.
+    // Void like a deny: the claim dropped the row; close out the deferred inbound.
     await completeStoredDeferredInbound(row.original_message);
     return true;
   }
@@ -440,16 +387,8 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   const approved = payload.value === 'approve';
 
   if (approved) {
-    // The claim above already removed the row, and that row held the ONLY copy
-    // of the retained inbound (`original_message`). If the member write fails
-    // here, a plain rethrow would leave the sender approved-but-not-admitted
-    // with nothing left to replay and no card to click again.
-    //
-    // So the claim is made recoverable by putting the row back, rather than by
-    // adding a `claimed_at` column — a column means a migration, and the row
-    // object is already in hand, complete with its body and render metadata.
-    // `createPendingSenderApproval` is INSERT OR IGNORE, so a concurrent flow
-    // that re-created the card in the meantime wins and this is a no-op.
+    // The claimed row held the ONLY copy of the retained inbound, so a failed
+    // member write puts it back (INSERT OR IGNORE: a re-created card wins).
     try {
       await addMember({
         user_id: row.sender_identity,
@@ -530,14 +469,8 @@ async function wireApprovedChannel(
     return false;
   }
 
-  // Claim the card before any write. This is the terminal branch — it creates
-  // the wiring, admits the sender and replays the retained message — and the
-  // caller reached it across several awaits, so a duplicate callback can be
-  // here too. Every individual effect below is already idempotent or
-  // self-claiming (`insertOrAdopt` on the wiring, INSERT OR IGNORE on the
-  // member, `replayDeferredInbound`'s own receipt claim), so the claim is the
-  // belt rather than the only guard — but it means the log lines and the
-  // approver's confirmation reflect one act, not two.
+  // Claim before any write: this terminal branch can be reached by a duplicate
+  // callback, and the logs and confirmation must reflect one act.
   if (!(await deletePendingChannelApproval(row.messaging_group_id))) {
     log.debug('Channel registration: another callback already wired this channel', {
       messagingGroupId: row.messaging_group_id,
@@ -568,13 +501,8 @@ async function wireApprovedChannel(
     return false;
   }
 
-  // Everything from here to the member write runs with the card already
-  // claimed (deleted) and the retained inbound still deferred. A failure in
-  // this stretch must not lose the retry path: no card, no wiring, a receipt
-  // nothing would ever complete. The claim stays a
-  // DELETE — it is the arbiter between duplicate callbacks — so the recovery
-  // is to put the full row BACK on failure: the next click (or the retained
-  // inbound's own retry) finds the card exactly as it was.
+  // The card is claimed and the inbound still deferred: a failure before the
+  // member write puts the full row BACK so the retry path survives.
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     await wireAndAdmit(row, agentGroupId, approverId, engage, mgaId, event);
@@ -607,7 +535,6 @@ async function wireApprovedChannel(
   return true;
 }
 
-/** The central writes of an approved channel registration: wiring row + sender membership. */
 async function wireAndAdmit(
   row: PendingChannelApproval,
   agentGroupId: string,
@@ -627,8 +554,6 @@ async function wireAndAdmit(
     // 'accumulate' / 'shared' / priority 0 are the flow's fixed semantics.
     sender_scope: 'known',
     ignored_message_policy: 'accumulate',
-    // Fork policy (134dc2dc): per-thread is the default session_mode across
-    // all wiring origins.
     session_mode: 'per-thread',
     priority: 0,
     default_model: null,
@@ -637,8 +562,7 @@ async function wireAndAdmit(
     instructions_profile: null,
     created_at: new Date().toISOString(),
   };
-  // Lookup-then-insert on the async driver: a concurrent route can win the
-  // same wiring; adopt it instead of failing this message (seam 3 primitive).
+  // A concurrent route can win the same wiring; adopt it instead of failing.
   await insertOrAdopt(
     wiring,
     async (candidate) => {
@@ -683,10 +607,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   const row = await withCentralSync(() => getPendingChannelApproval(payload.questionId), 'pending approval read');
   if (!row) return false;
 
-  // Origin conversation's adapter instance — threaded into ensureUserDm below
-  // so the follow-up card / name prompt lands on the SAME sibling bot's DM
-  // the registration card itself was delivered on, instead of falling back
-  // to whichever adapter the bare channel_type happens to resolve.
+  // Keeps the follow-up on the SAME sibling bot's DM the card was delivered on.
   const originMg = await getMessagingGroup(row.messaging_group_id);
 
   // Click authorization is the guard's channels.register decision (./guard.ts):
@@ -717,10 +638,8 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Reject / Cancel ──
   if (payload.value === REJECT_VALUE) {
-    // Claim before acting, same rule as the sender card: this branch is
-    // terminal, so a duplicate callback must not run it twice. The
-    // intermediate branches below (choose_existing, new_agent) deliberately do
-    // NOT claim — they leave the card live for a second click by design.
+    // Claim before acting (terminal branch). choose_existing and new_agent
+    // deliberately do NOT claim: they leave the card live for a second click.
     if (!(await deletePendingChannelApproval(row.messaging_group_id))) return true;
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
     await completeStoredDeferredInbound(row.original_message);
@@ -875,11 +794,8 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const pending = awaitingNameInput.get(userId);
   if (!pending) return false;
   if (event.channelType !== pending.dmChannelType || event.platformId !== pending.dmPlatformId) return false;
-  // Instance-matched too: the same channelType/platformId can be shared by
-  // more than one sibling bot's conversation (e.g. a direct-addressable
-  // channel where the platform_id is the user's own handle) — a reply that
-  // arrived on a DIFFERENT instance is a different conversation, not the
-  // approver answering this prompt.
+  // Instance-matched too: a reply on a DIFFERENT sibling bot's instance is a
+  // different conversation.
   if ((event.instance ?? event.channelType) !== (pending.dmInstance ?? pending.dmChannelType)) return false;
 
   awaitingNameInput.delete(userId);
@@ -900,15 +816,10 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const row = await withCentralSync(() => getPendingChannelApproval(pending.channelMgId), 'pending approval read');
   if (!row) return true;
 
-  // Origin instance for the follow-up notifications below, same reasoning as
-  // handleChannelApprovalResponse: keep every reply to this approver on the
-  // sibling bot the registration started on.
   const originMg = await getMessagingGroup(row.messaging_group_id);
 
-  // `awaitingNameInput` is already deleted by here, so a throw out of this
-  // interceptor would strand the approver with no card, no agent, and no
-  // message. Creation can now legitimately fail (folder allocation gives up
-  // after N concurrent losses), so report it instead of propagating.
+  // `awaitingNameInput` is already deleted, so a throw here would strand the
+  // approver; creation can legitimately fail, so report it instead.
   let ag: AgentGroup;
   try {
     ag = await createNewAgentGroup(text);
