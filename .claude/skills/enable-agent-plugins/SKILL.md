@@ -201,7 +201,7 @@ next spawn, and the enabler run is just a verification pass.
 
    | Mechanism | Claude | Codex | OpenCode |
    |---|---|---|---|
-   | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset and any runner-listed module, **keeps the skills** |
+   | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset and, for `bootstrap`, the comment-rule feedback module; **keeps the skills** |
    | `excludePlugins` with a sub-plugin path (per group, by hand) | not registered as a plugin: no skills, no commands, no hook | not registered: no skills, no hook trust | no ruleset, no skills (both mirrors) |
    | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills, **keeps the ruleset** | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
