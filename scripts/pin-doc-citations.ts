@@ -88,6 +88,7 @@ function introducingCommit(root: string, rev: string, doc: string, lineNumber: n
     const [sha, ...patch] = entry.split('\n');
     const after = patch.filter((line) => line.startsWith('+') && !line.startsWith('+++'));
     const before = patch.filter((line) => line.startsWith('-') && !line.startsWith('---'));
+    if (after.length === 0 && before.length === 0) continue;
     if (!after.some((line) => line.includes(cited))) break;
     oldest = sha.trim();
     if (!before.some((line) => line.includes(cited))) break;
@@ -183,7 +184,12 @@ export function pinDocs(
         if (citedFiles.length > 0 && !files.some((file) => citedFiles.includes(file))) continue;
         const citation = text.slice(head.index, run.end).replace(/`/g, '');
         const headText = `${head.file}:${head.span}`;
-        const committedAt = committedLines.indexOf(unpinned(text));
+        const occurrence = lines.slice(0, i).filter((line) => unpinned(line) === unpinned(text)).length;
+        const committedAt = committedLines.findIndex(
+          (line, n) =>
+            line === unpinned(text) &&
+            committedLines.slice(0, n).filter((earlier) => earlier === line).length === occurrence,
+        );
         const origin = committedAt === -1 ? null : introducingCommit(root, rev, doc, committedAt + 1, headText);
         const start = origin ?? gitRead(root, ['rev-parse', rev])?.trim() ?? rev;
         if (!gitRead(root, ['log', '-1', '--format=%H', start, '--', head.file])?.trim()) continue;

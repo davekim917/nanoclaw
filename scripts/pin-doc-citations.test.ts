@@ -256,6 +256,45 @@ describe('pinDocs', () => {
     ]);
   });
 
+  it('traces the right one of two identical note lines', () => {
+    const root = gitRoot();
+    const note = '- `drainQueue` at `src/code.ts:1` drops items\n';
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, `# First\n${note}`);
+    const first = commit(root, 'first note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+    write(root, NOTE, `# First\n${note}# Second\n${note}`);
+    const second = commit(root, 'second note');
+
+    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind === 'pinned' && outcome.sha)).toEqual([
+      first,
+      second,
+    ]);
+  });
+
+  it('follows the line through a merge that kept the citation', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` drops items\n');
+    const introduced = commit(root, 'note');
+    const main = (gitRead(root, ['branch', '--show-current']) ?? '').trim();
+    spawnSync('git', ['checkout', '-qb', 'side'], { cwd: root });
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` drops items on the side\n');
+    commit(root, 'side prose');
+    spawnSync('git', ['checkout', '-q', main], { cwd: root });
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` drops items on main\n');
+    commit(root, 'main prose');
+    spawnSync('git', ['merge', '-q', 'side', '--no-edit', '--no-gpg-sign'], { cwd: root });
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` drops items on both\n');
+    spawnSync('git', ['add', '-A'], { cwd: root });
+    spawnSync('git', ['commit', '-q', '--no-edit', '--no-gpg-sign'], { cwd: root });
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
