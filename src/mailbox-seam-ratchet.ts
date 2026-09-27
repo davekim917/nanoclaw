@@ -80,8 +80,8 @@ function stripComments(src: string): string {
 }
 
 /**
- * Length-preserving strip, for rules that report line numbers. Not merged with `stripComments`, whose deletion
- * also joins the text either side of a comment, which patterns (a)-(d) were reviewed against.
+ * Length-preserving strip, for rules that report line numbers. Not merged with `stripComments`: patterns (a)-(d)
+ * depend on its deletion joining the text either side of a removed comment.
  */
 function blankComments(src: string): string {
   const blank = (match: string): string => match.replace(/[^\n]/g, ' ');
