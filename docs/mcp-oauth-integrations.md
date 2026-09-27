@@ -36,7 +36,7 @@ There is **no read route**: `GET /api/secrets/{id}`, `…/value`, `…/reveal`, 
 `?include=value` all 404 or return the same value-free listing. A refresher that cannot read its
 refresh token cannot refresh. The precedent for holding it host-side is exact — the GitHub App
 **private key** already sits on this host's filesystem at `GITHUB_APP_PRIVATE_KEY_PATH` and the host
-mints short-lived installation tokens from it (`src/github-app-token.ts:227`). `DATA_DIR` itself is
+mints short-lived installation tokens from it (`src/github-app-token.ts`). `DATA_DIR` itself is
 never bind-mounted into a container; only named subpaths under it are, and `mcp-oauth/` is not one.
 
 ## Logging in

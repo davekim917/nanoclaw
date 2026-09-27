@@ -166,7 +166,7 @@ git init -q "$src"
 # By sha: GitHub serves any reachable commit, and a sha cannot move under us the
 # way pull/<n>/head can. Checked again after checkout. Full history, not
 # --depth=1: a declaration may run checks that need it, and a shallow clone
-# makes scripts/review-notes.test.ts:232-237 skip every pinned `at <sha>`
+# makes the citation tests (scripts/lib/doc-citations.ts) skip every pinned `at <sha>`
 # citation it cannot resolve — host CI would then pass a stale citation that
 # ci.yml's `fetch-depth: 0` checkout (.github/workflows/ci.yml:48-50) fails.
 git -C "$src" fetch -q --no-tags "https://github.com/$repo.git" "$head"

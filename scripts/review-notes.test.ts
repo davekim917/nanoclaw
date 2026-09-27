@@ -8,6 +8,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
 import { scaledTimeout } from '../src/test-timeout-scale.js';
 
+import {
+  checkLineCitation,
+  fileLineCitations,
+  gitCommitResolvable,
+  gitIsShallowRepo,
+  gitPathExists,
+  gitRead,
+} from './lib/doc-citations.js';
+
 allowSubprocess(['git']);
 enforceHermeticity();
 
@@ -59,7 +68,6 @@ const CITATIONS = [/`[^`]*[./][^`]*`/, /[\w./-]+\.\w+:\d+/, /#\d+/, /\b(?=[0-9a-
 // offline — there is no local issue/PR list, and a sha may predate this
 // checkout's history or belong to a commit later squashed or rebased away.
 const CITED_BACKTICK_PATH_RE = /`([\w.][^`\s]*)`/g;
-const CITED_FILE_LINE_RE = /([\w./-]+\.\w+):(\d+)(?:-(\d+))?/g;
 
 /**
  * True when a whitespace-free backtick span (already matched by
@@ -85,178 +93,17 @@ function looksLikePath(span: string): boolean {
   if (colon !== -1 && (slash === -1 || colon < slash)) return false;
   return true;
 }
-// A citation reads as pinned to a historical commit only when `at <sha>`
-// immediately follows it — or follows an unbroken run of citations, joined
-// only by `, ` or ` and `, that it belongs to. Not a clause-boundary
-// heuristic (#713 P3: any `at <sha>` sharing a `(`, `)` or `;`-delimited
-// clause with a citation used to pin it, so a stray sha elsewhere in the same
-// clause silently suppressed the line check, and read the wrong direction —
-// a sha *before* a citation counted the same as one after). Checked by hand
-// against every pin currently in docs/review-notes.md: line 69's
-// "`git-safety.sh:551-557`, `:627`, `:681-683` at 545c164cf" and line 70's
-// "`git-safety.sh:154-156`, `:886-891` at 545c164cf" (a same-file `:N-M`
-// continuation, comma-joined, still pins); line 72's "`git-safety.sh:681`,
-// `:834`, `:889` and `secret-scan-allow.sh:93` at 545c164cf" (an " and "
-// join, and a second file's own citation, both still pin); line 74's
-// "`codex-review.sh:1084`, `:1556`, `:1777` at 35c8c952b"; and line 64's
-// "`receipt-order.jq:5-6`, #692 at f6d93e3b0" (a bare `#<n>` — itself one of
-// this file's own citation shapes — joins the run same as a file:line does).
-// Line 65's "(#692 at f6d93e3b0, `codex-review.sh:858`), and one edited in it
-// too (#698 at 35c8c952b" pins nothing: the first sha *precedes* the
-// citation, and prose ("and one edited in it too") sits between the citation
-// and the next sha, breaking the run. A pinned citation must never be read
-// against the working tree — it is checked against that commit with `git
-// show <sha>:<path>` instead (#713).
-const AT_SHA_RE = /^at\s+([0-9a-f]{7,40})\b/;
-// One hop in a pinning run: either a same-file `:N` / `:N-M` continuation (no
-// filename of its own), a whole other file's own citation, or a bare `#<n>` —
-// each optionally backtick-quoted.
-const PIN_CHAIN_LINK_RE = /^`?(?:(?:[\w./-]+\.\w+)?:\d+(?:-\d+)?|#\d+)`?/;
-const PIN_CHAIN_JOIN_RE = /^\s*(?:,|and)\s*/;
 
-/**
- * The sha pinning the citation that ends at `pos` in `fix`, or null when
- * nothing pins it. Walks forward from `pos` through zero or more
- * comma-/"and"-joined chain links (PIN_CHAIN_LINK_RE) — consuming a citation's
- * own closing backtick first, if there is one — then requires `at <sha>` to
- * follow immediately (only whitespace in between).
- */
-function pinningShaAfter(fix: string, pos: number): string | null {
-  let i = fix[pos] === '`' ? pos + 1 : pos;
-  for (;;) {
-    const join = PIN_CHAIN_JOIN_RE.exec(fix.slice(i));
-    if (!join) break;
-    const afterJoin = i + join[0].length;
-    const link = PIN_CHAIN_LINK_RE.exec(fix.slice(afterJoin));
-    if (!link) break;
-    i = afterJoin + link[0].length;
-  }
-  const rest = fix.slice(i).replace(/^\s*/, '');
-  const sha = AT_SHA_RE.exec(rest);
-  return sha ? sha[1] : null;
-}
-
-/** A file's real line count: `.split('\n').length` over-counts by one when the file ends with a trailing newline (#713). */
-function countLines(content: string): number {
-  if (content === '') return 0;
-  return (content.endsWith('\n') ? content.slice(0, -1) : content).split('\n').length;
-}
-
-/** Runs `git <args>` in `root`, returning stdout on a zero exit, or null on any failure. */
-function gitRead(root: string, args: string[]): string | null {
-  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  return result.status === 0 ? result.stdout : null;
-}
-
-/**
- * True when `filePath` names a real blob or tree (file or directory) in
- * `root`'s repo. `rev` checks a historical commit-ish for a pinned citation.
- * Omit it to check the index rather than HEAD (#713 P3): a file staged but
- * not yet committed then passes the local review loop the same way it will
- * once committed, while an untracked or gitignored path still fails exactly
- * as it would in a fresh checkout that never had it either. `git cat-file -e
- * :<path>` cannot see a directory this way — the index holds blobs, not tree
- * entries — so the no-`rev` case goes through `ls-files --error-unmatch`
- * instead, which matches a directory against every tracked/staged path under
- * it the same way `cat-file` matches a tree object at a real commit.
- */
-function gitPathExists(root: string, filePath: string, rev?: string): boolean {
-  if (rev === undefined)
-    // --literal-pathspecs (#730 P3): ls-files otherwise treats `filePath` as a
-    // pathspec, so a citation shaped like a glob (`scripts/*.test.ts`) or a
-    // single-char wildcard (`docs/review-notes.m?`) passes existence just by
-    // matching some other tracked file — this repo's own `pathspec quoting`
-    // class (docs/review-notes.md:67).
-    return (
-      spawnSync('git', ['--literal-pathspecs', 'ls-files', '--error-unmatch', '--', filePath], { cwd: root }).status ===
-      0
-    );
-  return spawnSync('git', ['cat-file', '-e', `${rev}:${filePath}`], { cwd: root }).status === 0;
-}
-
-/** True when `sha` resolves to a real commit object in `root`'s repo — false in a checkout too shallow to have it. */
-function gitCommitResolvable(root: string, sha: string): boolean {
-  return spawnSync('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd: root }).status === 0;
-}
-
-/** True when `root`'s repo is a shallow clone (a partial history, missing most commit objects) — the only case an unresolvable pinned sha is expected, not a typo (#730 P3). */
-function gitIsShallowRepo(root: string): boolean {
-  return (gitRead(root, ['rev-parse', '--is-shallow-repository']) ?? '').trim() === 'true';
-}
-
-/** `filePath`'s line count at `rev` in `root`'s repo, or null when it can't be read there. Omit `rev` to read the index (see gitPathExists). */
-function gitLineCount(root: string, filePath: string, rev?: string): number | null {
-  const content = gitRead(root, ['show', `${rev ?? ''}:${filePath}`]);
-  return content === null ? null : countLines(content);
-}
-
-interface FileLineCitation {
-  file: string;
-  span: string; // "N" or "N-M", exactly as cited
-  endLine: number; // M when a range, else N
-  pinnedSha: string | null;
-}
-
-function fileLineCitations(fix: string): FileLineCitation[] {
-  const citations: FileLineCitation[] = [];
-  for (const m of fix.matchAll(CITED_FILE_LINE_RE)) {
-    const [, file, startStr, endStr] = m;
-    citations.push({
-      file,
-      span: endStr ? `${startStr}-${endStr}` : startStr,
-      endLine: Number(endStr ?? startStr),
-      pinnedSha: pinningShaAfter(fix, (m.index ?? 0) + m[0].length),
-    });
-  }
-  return citations;
-}
-
+// A citation is pinned only when `at <sha>` follows it directly, or follows the unbroken `, `/` and `-joined run of
+// citations it belongs to (scripts/lib/doc-citations.ts); a pinned citation is checked at that commit, never at HEAD.
 /** Existence problems for one structural-fix field's citations, checked against `root`'s git repo. */
 function citationExistenceProblems(fix: string, root: string): string[] {
   const problems: string[] = [];
 
-  for (const { file, span, endLine, pinnedSha } of fileLineCitations(fix)) {
-    if (pinnedSha) {
-      if (!gitCommitResolvable(root, pinnedSha)) {
-        // A shallow checkout (actions/checkout@v4's default depth 1 — ci.yml and ci-full.yml
-        // override it with fetch-depth: 0, and run-host-ci.sh fetches full history) cannot resolve most historical
-        // shas at all — the *only* case an unresolvable sha is expected, not a
-        // mistake. Skipping unconditionally here (#730 P3 regression) let a
-        // typo'd `at <sha>` silently exempt a wrong line, or a citation to a
-        // file that never existed, even in a full clone that could have
-        // caught it. So only a genuinely shallow repo skips (with a test-log
-        // note, never checking the path at HEAD as a fallback — a citation
-        // correct at its own pinned commit but whose file has since been
-        // deleted must not fail only there); a full clone that simply cannot
-        // resolve the sha treats that as the problem it is.
-        if (gitIsShallowRepo(root)) {
-          console.warn(
-            `review-notes: skipping \`${file}:${span}\` at ${pinnedSha} — that commit is not resolvable in ` +
-              'this checkout (a shallow clone); not checked',
-          );
-          continue;
-        }
-        problems.push(`cites \`${file}:${span}\` at ${pinnedSha}, but ${pinnedSha} does not resolve to a commit here`);
-        continue;
-      }
-      if (!gitPathExists(root, file, pinnedSha)) {
-        problems.push(`cites \`${file}:${span}\` at ${pinnedSha}, but ${file} does not exist at ${pinnedSha}`);
-        continue;
-      }
-      const lineCount = gitLineCount(root, file, pinnedSha);
-      if (lineCount === null || lineCount < endLine)
-        problems.push(
-          `cites \`${file}:${span}\` at ${pinnedSha}, but ${file} has only ${lineCount ?? 0} lines at ${pinnedSha}`,
-        );
-      continue;
-    }
-    if (!gitPathExists(root, file)) {
-      problems.push(`cites \`${file}:${span}\`, but ${file} does not exist`);
-      continue;
-    }
-    const lineCount = gitLineCount(root, file);
-    if (lineCount === null || lineCount < endLine)
-      problems.push(`cites \`${file}:${span}\`, but ${file} has only ${lineCount ?? 0} lines`);
+  for (const citation of fileLineCitations(fix)) {
+    const check = checkLineCitation(root, citation);
+    if (check.ok === 'skipped') console.warn(`review-notes: skipping ${check.reason}; not checked`);
+    else if (!check.ok) problems.push(check.problem);
   }
 
   for (const [, span] of fix.matchAll(CITED_BACKTICK_PATH_RE)) {

@@ -21,7 +21,7 @@ pnpm exec tsc --noEmit
 pnpm exec tsc -p tsconfig.scripts.json --noEmit
 pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 pnpm exec vitest run scripts/host-ci-declaration.test.ts --maxWorkers=1
-pnpm exec vitest run scripts/review-notes.test.ts --maxWorkers=1
+pnpm exec vitest run scripts/review-notes.test.ts scripts/doc-citations.test.ts --maxWorkers=1
 pnpm exec vitest run src/upstream-ratchet.test.ts --maxWorkers=1
 pnpm exec tsx scripts/hygiene/run.ts
 pnpm exec vitest run scripts/hygiene --maxWorkers=1

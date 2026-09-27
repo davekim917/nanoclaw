@@ -186,8 +186,8 @@ These columns, table, and guard triggers are installed by `migrateMessagesInTabl
 
 Every message (in or out) gets a monotonic integer `seq`, unique _within the session_ across both tables.
 
-- **Host writes even seq** (2, 4, 6, …) to `messages_in` — `nextEvenSeq()` at `src/db/session-db.ts:75`.
-- **Container writes odd seq** (1, 3, 5, …) to `messages_out` — logic at `container/agent-runner/src/db/messages-out.ts:54` (`max % 2 === 0 ? max + 1 : max + 2`), reading `MAX(seq)` across _both_ tables to preserve global ordering.
+- **Host writes even seq** (2, 4, 6, …) to `messages_in` — `nextEvenSeq()` in `src/mailbox/sqlite/session-db.ts`.
+- **Container writes odd seq** (1, 3, 5, …) to `messages_out` — logic in `container/agent-runner/src/mailbox/sqlite/operations.ts` (`max % 2 === 0 ? max + 1 : max + 2`), reading `MAX(seq)` across _both_ tables to preserve global ordering.
 
 Why disjoint? `seq` is the agent-facing message ID. When the agent calls `edit_message(seq=5)` or `add_reaction(seq=6)`, `getMessageIdBySeq()` uses the parity to route the lookup: odd → `messages_out`, even → `messages_in`. The parity alone disambiguates without a join. Collisions would break editing.
 

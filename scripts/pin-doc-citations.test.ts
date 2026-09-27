@@ -1,0 +1,183 @@
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+
+import { citationRuns, gitRead } from './lib/doc-citations.js';
+import { citationClause, noteAnchors, pinDocs } from './pin-doc-citations.js';
+
+allowSubprocess(['git']);
+enforceHermeticity();
+
+const roots: string[] = [];
+afterEach(() => {
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+function gitRoot(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pin-doc-citations-'));
+  roots.push(root);
+  spawnSync('git', ['init', '-q'], { cwd: root });
+  spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: root });
+  spawnSync('git', ['config', 'user.name', 'Test'], { cwd: root });
+  fs.mkdirSync(path.join(root, 'docs', 'review-notes'), { recursive: true });
+  return root;
+}
+
+function write(root: string, file: string, content: string): void {
+  fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+  fs.writeFileSync(path.join(root, file), content);
+}
+
+function commit(root: string, message = 'fixture'): string {
+  spawnSync('git', ['add', '-A'], { cwd: root });
+  spawnSync('git', ['commit', '-q', '--allow-empty', '-m', message, '--no-gpg-sign'], { cwd: root });
+  return (gitRead(root, ['rev-parse', '--short=9', 'HEAD']) ?? '').trim();
+}
+
+const read = (root: string, file: string): string => fs.readFileSync(path.join(root, file), 'utf8');
+const NOTE = 'docs/review-notes/1.md';
+
+describe('citationRuns', () => {
+  it('groups same-file continuations and joined citations into one run with one pin', () => {
+    const [run] = citationRuns('see `a.ts:3`, `:9-11` and `b.ts:2` at abc1234 for it');
+    expect(run.pinnedSha).toBe('abc1234');
+    expect(run.links.map((link) => `${link.file}:${link.span}`)).toEqual(['a.ts:3', 'a.ts:9-11', 'b.ts:2']);
+  });
+
+  it('keeps separate runs apart when prose sits between them', () => {
+    const runs = citationRuns('`a.ts:3` does one thing, and `b.ts:4` at abc1234 another');
+    expect(runs.map((run) => run.pinnedSha)).toEqual([null, 'abc1234']);
+  });
+});
+
+describe('noteAnchors', () => {
+  it('takes identifiers from code spans and identifier-shaped prose words, not plain English or the file name', () => {
+    const anchors = noteAnchors(
+      'the `retryBudget` reset in drainQueue() skipped MAX_RETRIES while the queue stayed full (`queue.ts:4`)',
+      ['src/queue.ts'],
+    );
+    expect(anchors).toEqual(expect.arrayContaining(['retryBudget', 'drainQueue', 'MAX_RETRIES']));
+    expect(anchors).not.toContain('while');
+    expect(anchors).not.toContain('queue');
+  });
+
+  it('keeps a quoted test name whole, and ignores apostrophes in prose', () => {
+    const anchors = noteAnchors("the key's lock is held ('two writers make one root')", []);
+    expect(anchors).toContain('two writers make one root');
+    expect(anchors.some((anchor) => anchor.startsWith('s lock'))).toBe(false);
+  });
+
+  it('does not cut a clause at a semicolon inside a code span', () => {
+    const text = 'guarded by `if (x) { a(); return; }` (`f.ts:2`), then more';
+    const start = text.indexOf('`f.ts');
+    expect(citationClause(text, start, start + '`f.ts:2`'.length)).toContain('if (x) { a(); return; }');
+  });
+});
+
+describe('pinDocs', () => {
+  it('pins a note written in the fixing commit to the code before the fix when only that holds what it describes', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'import x;\n\nfunction retryWithoutBudget() {}\n');
+    const before = commit(root, 'code');
+    write(root, 'src/code.ts', 'import x;\nconst budget = 3;\nconst other = 1;\n\nfunction retryWithBudget() {}\n');
+    write(root, NOTE, '- the old `retryWithoutBudget` at `src/code.ts:3` looped forever\n');
+    commit(root, 'fix and note');
+
+    const [outcome] = pinDocs(root, [NOTE], ['src/code.ts']);
+    expect(outcome).toMatchObject({ kind: 'pinned', sha: before });
+    expect(read(root, NOTE)).toContain(`\`src/code.ts:3\` at ${before} looped`);
+  });
+
+  it('pins to the commit that introduced the citation, not a later docs-only edit of the same line', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'a\nb\nfunction drainQueue() {}\n');
+    write(root, 'src/other.ts', 'function flushAll() {}\n');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:3` and `flushAll` in `src/other.ts:1` both drop items\n');
+    const introduced = commit(root, 'code and note');
+    write(root, 'src/code.ts', 'new\nnew\na\nb\nfunction drainQueue() {}\n');
+    commit(root, 'shift the code');
+    write(
+      root,
+      NOTE,
+      `- \`drainQueue\` at \`src/code.ts:3\` and \`flushAll\` in \`src/other.ts:1\` at ${introduced} both drop items\n`,
+    );
+    commit(root, 'docs-only pin of the other citation');
+
+    const outcomes = pinDocs(root, [NOTE], ['src/code.ts']);
+    expect(outcomes).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
+    expect(read(root, NOTE)).toContain(`\`src/code.ts:3\` at ${introduced} and`);
+  });
+
+  it('refuses a note that names nothing to check the cited lines against, and leaves the doc unchanged', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'a\nb\nc\n');
+    const text = '- this was wrong at `src/code.ts:2` for a while\n';
+    write(root, NOTE, text);
+    commit(root);
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'refused' })]);
+    expect(read(root, NOTE)).toBe(text);
+  });
+
+  it('refuses when no revision holds the identifier at the cited lines', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'a\nb\nfunction other() {}\n');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:3` drops items\n');
+    commit(root);
+
+    const [outcome] = pinDocs(root, [NOTE], []);
+    expect(outcome).toMatchObject({ kind: 'refused' });
+    expect(outcome.kind === 'refused' && outcome.reason).toMatch(/drainQueue/);
+  });
+
+  it("refuses when the note's own commit and the one before it both match with different code", () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'a\nb\nif (drainQueue()) skip();\n');
+    commit(root, 'code');
+    write(root, 'src/code.ts', 'a\nb\nif (drainQueue()) retry();\n');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:3` decides it\n');
+    commit(root, 'change and note');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([
+      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/both .* match/) }),
+    ]);
+  });
+
+  it('leaves pinned citations and citations of other files alone', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, 'src/other.ts', 'function flushAll() {}\n');
+    const sha = commit(root);
+    const text = `- \`drainQueue\` at \`src/code.ts:1\` at ${sha}; \`flushAll\` at \`src/other.ts:1\`\n`;
+    write(root, NOTE, text);
+    commit(root);
+
+    expect(pinDocs(root, [NOTE], ['src/code.ts'])).toEqual([]);
+    expect(read(root, NOTE)).toBe(text);
+  });
+
+  it('skips a citation-shaped token that names no file in the repo history', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'a\n');
+    write(root, NOTE, '- the `drainQueue` proxy on `127.0.0.1:8080` and a 4.5:1 ratio\n');
+    commit(root);
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([]);
+  });
+
+  it('writes nothing on a dry run', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    const text = '- `drainQueue` at `src/code.ts:1` drops items\n';
+    write(root, NOTE, text);
+    commit(root);
+
+    expect(pinDocs(root, [NOTE], [], { write: false })).toEqual([expect.objectContaining({ kind: 'pinned' })]);
+    expect(read(root, NOTE)).toBe(text);
+  });
+});

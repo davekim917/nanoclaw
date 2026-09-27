@@ -127,8 +127,8 @@ things, and nothing else:
    mute: `enqueue-send` is its own process and writes the outbound row
    directly (`cli/enqueue-send.ts:286,347-351`), so it never reaches
    `NanoclawAgentMailbox.writeMessageOut` → `admitChatWrite`
-   (`modules/mailbox/index.ts:302-305,117-129`), which is where `muteChat`
-   zeroes the per-turn chat budget (`poll-loop.ts:3422-3430`). A
+   (`container/agent-runner/src/modules/mailbox/index.ts`), where the per-turn
+   chat budget that `muteChat` zeroes (`applyChatBudget`, `poll-loop.ts`) swallows it. A
    `send_message` call, by contrast, IS dropped.
 
 2. Take no campaign action at all. No gate verb, no `step`, no brief, no
