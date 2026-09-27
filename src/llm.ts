@@ -114,28 +114,69 @@ function parseRetryAfterMs(value: string | null, nowMs = Date.now()): number | n
   return Number.isFinite(timestamp) ? Math.max(0, timestamp - nowMs) : null;
 }
 
+const PROVIDER_MESSAGE_LOG_MAX_CHARS = 300;
+
+function truncateProviderMessage(message: string | null): string | null {
+  if (message === null || message.length <= PROVIDER_MESSAGE_LOG_MAX_CHARS) return message;
+  return `${message.slice(0, PROVIDER_MESSAGE_LOG_MAX_CHARS)}...`;
+}
+
+const RATE_LIMIT_UNIFIED_HEADER_PREFIX = 'anthropic-ratelimit-unified-';
+
+function rateLimitUnifiedHeaders(headers: Headers): Record<string, string> | null {
+  const found: Record<string, string> = {};
+  headers.forEach((value, name) => {
+    if (name.startsWith(RATE_LIMIT_UNIFIED_HEADER_PREFIX)) found[name] = value;
+  });
+  return Object.keys(found).length > 0 ? found : null;
+}
+
+export interface CallHaikuHttpErrorDetails {
+  providerErrorType?: string | null;
+  retryAfterHeader?: string | null;
+  rateLimitUnifiedHeaders?: Record<string, string> | null;
+}
+
 export class CallHaikuHttpError extends Error {
   readonly status: number;
   readonly retryAfterMs: number | null;
   readonly providerMessage: string | null;
+  readonly providerErrorType: string | null;
+  readonly retryAfterHeader: string | null;
+  readonly rateLimitUnifiedHeaders: Record<string, string> | null;
 
-  constructor(status: number, retryAfterMs: number | null, providerMessage: string | null = null) {
-    super(`callHaiku: Anthropic returned ${status}`);
+  constructor(
+    status: number,
+    retryAfterMs: number | null,
+    providerMessage: string | null = null,
+    details: CallHaikuHttpErrorDetails = {},
+  ) {
+    const providerErrorType = details.providerErrorType ?? null;
+    const shownMessage = truncateProviderMessage(providerMessage);
+    super(
+      `callHaiku: Anthropic returned ${status}` +
+        (providerErrorType ? ` ${providerErrorType}` : '') +
+        (shownMessage ? `: ${shownMessage}` : ''),
+    );
     this.name = 'CallHaikuHttpError';
     this.status = status;
     this.retryAfterMs = retryAfterMs;
     this.providerMessage = providerMessage;
+    this.providerErrorType = providerErrorType;
+    this.retryAfterHeader = details.retryAfterHeader ?? null;
+    this.rateLimitUnifiedHeaders = details.rateLimitUnifiedHeaders ?? null;
   }
 }
 
 /** Shared by every single-credential Anthropic caller so a 429 is parsed identically for the classifier. */
 export async function anthropicCredentialHttpError(response: Response): Promise<CallHaikuHttpError> {
-  const { providerMessage } = await parseAnthropicErrorBody(response);
-  return new CallHaikuHttpError(
-    response.status,
-    parseRetryAfterMs(response.headers.get('retry-after')),
-    providerMessage,
-  );
+  const { providerErrorType, providerMessage } = await parseAnthropicErrorBody(response);
+  const retryAfterHeader = response.headers.get('retry-after');
+  return new CallHaikuHttpError(response.status, parseRetryAfterMs(retryAfterHeader), providerMessage, {
+    providerErrorType,
+    retryAfterHeader,
+    rateLimitUnifiedHeaders: rateLimitUnifiedHeaders(response.headers),
+  });
 }
 
 async function callHaikuOnce(prompt: string, timeoutMs: number, credential: StructuredCredential): Promise<string> {
@@ -205,11 +246,27 @@ function isSlotParked(slot: ClaudeCredentialSlot, nowMs: number): boolean {
   return true;
 }
 
-/** Logs the slot name only, never a token value. */
-function parkSlot(slot: ClaudeCredentialSlot, retryAfterMs: number, nowMs: number, logLabel: string): void {
+/** Logs the slot name and response-side diagnostics only, never a request header or token value. */
+function parkSlot(
+  slot: ClaudeCredentialSlot,
+  retryAfterMs: number,
+  nowMs: number,
+  logLabel: string,
+  err: unknown,
+): void {
   const untilMs = nowMs + Math.min(retryAfterMs, CREDENTIAL_PARK_CEILING_MS);
   parkedSlotUntilMs.set(slot, untilMs);
-  log.warn(`${logLabel}: parking exhausted credential slot`, { slot, untilIso: new Date(untilMs).toISOString() });
+  const failure = err as Partial<CallHaikuHttpError>;
+  log.warn(`${logLabel}: parking exhausted credential slot`, {
+    slot,
+    untilIso: new Date(untilMs).toISOString(),
+    status: failure.status ?? null,
+    retryAfterMs,
+    retryAfterHeader: failure.retryAfterHeader ?? null,
+    providerErrorType: failure.providerErrorType ?? null,
+    providerMessage: truncateProviderMessage(failure.providerMessage ?? null),
+    rateLimitUnifiedHeaders: failure.rateLimitUnifiedHeaders ?? null,
+  });
 }
 
 export function __getParkedUntilMsForTest(slot: ClaudeCredentialSlot): number | undefined {
@@ -472,7 +529,7 @@ async function callWithCredentialRotationAttempt<T>(options: {
 
         const retryAfterMs = (err as { retryAfterMs?: number | null }).retryAfterMs;
         if (retryAfterMs != null && retryAfterMs > CREDENTIAL_PARK_THRESHOLD_MS) {
-          parkSlot(credential.slot, retryAfterMs, Date.now(), options.logLabel);
+          parkSlot(credential.slot, retryAfterMs, Date.now(), options.logLabel, err);
           break;
         }
 
