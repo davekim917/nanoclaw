@@ -23,16 +23,9 @@ export interface CodexLivenessSnapshot {
   openItems: Array<{ id: string; type: string }>;
 }
 
-// ThreadItems whose lifecycle represents work that must finish before a
-// successful turn can be trusted. Keep this explicit so informational items
-// such as reasoning remain version-tolerant, while commands and tools fail
-// closed if app-server reports turn completion without their item/completed.
-//
-// Collaboration items are deliberately excluded. `collabAgentToolCall` and
-// `subAgentActivity` describe a persistent parent/child relationship, not an
-// execution barrier for the parent turn. Codex can leave them `inProgress`
-// after the child has emitted task_complete, and can intentionally keep a
-// completed child available for follow-up work until closeAgent is called.
+// Items that must finish before a completed turn is trusted: commands and tools fail closed if their
+// item/completed never arrived.
+// Collaboration items are excluded because Codex can leave them `inProgress` after the child has finished.
 const TURN_BLOCKING_ITEM_TYPES = new Set([
   'commandExecution',
   'fileChange',
@@ -44,15 +37,11 @@ const TURN_BLOCKING_ITEM_TYPES = new Set([
   'imageGeneration',
 ]);
 
-// Codex 0.144.x includes the final ThreadItems in turn/completed. Under load,
-// the app-server can omit an individual item/completed notification even
-// though that final snapshot marks the item terminal. Treat the completed-turn
-// snapshot as the authoritative reconciliation source while keeping unknown
-// and in-progress statuses fail-closed.
+// Codex 0.144.x can drop item/completed under load, so the turn/completed item snapshot is authoritative;
+// unknown and in-progress statuses stay open.
 const TERMINAL_ITEM_STATUSES = new Set(['completed', 'failed', 'declined']);
 
-// These item schemas carry no status field in Codex 0.144.x. Their presence
-// in a completed turn's final item snapshot is therefore the terminal signal.
+// These types carry no status field in Codex 0.144.x: presence in the completed-turn snapshot is the terminal signal.
 const STATUSLESS_TERMINAL_ITEM_TYPES = new Set(['webSearch', 'imageView', 'sleep']);
 
 function hasSavedImageGenerationPath(item: Record<string, unknown>): boolean {
@@ -60,7 +49,6 @@ function hasSavedImageGenerationPath(item: Record<string, unknown>): boolean {
   return typeof savedPath === 'string' && savedPath.trim().length > 0;
 }
 
-/** Whether a completed-turn snapshot authoritatively closes this item. */
 export function isCodexTerminalTurnItem(item: unknown): boolean {
   const parsed = parseItemIdentity(item);
   if (!parsed) return false;
@@ -69,22 +57,14 @@ export function isCodexTerminalTurnItem(item: unknown): boolean {
   return (
     (typeof status === 'string' && TERMINAL_ITEM_STATUSES.has(status)) ||
     (status === undefined && STATUSLESS_TERMINAL_ITEM_TYPES.has(parsed.type)) ||
-    // Codex image snapshots use `succeeded` rather than the common
-    // `completed`, and omit status on some saved-path records. Neither is
-    // safe to close without an actual generated file; `inProgress` and
-    // statusless pathless records stay open. Failed states remain terminal
-    // through the common status branch, but never produce a file event.
+    // Image snapshots report `succeeded` or omit status; close only once a saved file path exists.
     (parsed.type === 'imageGeneration' &&
       (status === 'succeeded' || status === undefined) &&
       hasSavedImageGenerationPath(record))
   );
 }
 
-/**
- * Normalize the app-server's version-dependent thread status shape.
- * Unknown shapes deliberately fail open: a responsive future Codex version
- * must not be restarted merely because it added a status variant.
- */
+/** Unknown shapes fail open: a new Codex status variant must not trigger a restart. */
 export function normalizeCodexThreadStatus(value: unknown): CodexThreadStatus {
   let candidate = value;
   if (value && typeof value === 'object') {
@@ -99,10 +79,6 @@ export function normalizeCodexThreadStatus(value: unknown): CodexThreadStatus {
   return 'unknown';
 }
 
-/**
- * Pure state machine for a single Codex turn. Timers and JSON-RPC live in the
- * provider; this class only decides whether observed protocol state is safe.
- */
 export class CodexTurnLiveness {
   private readonly now: () => number;
   private readonly openItems = new Map<string, string>();

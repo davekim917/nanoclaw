@@ -1,7 +1,6 @@
 import { cwdWrappedArgv } from './cwd-shim.js';
 import type { McpServerConfig } from './types.js';
 
-/** OpenCode `mcp` entry shape (local stdio server). */
 type OpenCodeMcpLocal = {
   type: 'local';
   command: string[];
@@ -9,7 +8,6 @@ type OpenCodeMcpLocal = {
   enabled: true;
 };
 
-/** OpenCode `mcp` entry shape (remote Streamable HTTP server). */
 type OpenCodeMcpRemote = {
   type: 'remote';
   url: string;
@@ -19,12 +17,7 @@ type OpenCodeMcpRemote = {
 
 export type OpenCodeMcpEntry = OpenCodeMcpLocal | OpenCodeMcpRemote;
 
-/**
- * Map NanoClaw v2 MCP definitions into OpenCode config `mcp` field.
- * stdio (explicit or implicit) → local, Streamable HTTP → remote.
- * Legacy SSE is intentionally rejected instead of silently preserving a
- * transport that is not part of the cross-harness native baseline.
- */
+/** Legacy SSE is rejected rather than preserved: it is outside the cross-harness native baseline. */
 export function mcpServersToOpenCodeConfig(
   servers: Record<string, McpServerConfig> | undefined,
 ): Record<string, OpenCodeMcpEntry> {
@@ -43,10 +36,7 @@ export function mcpServersToOpenCodeConfig(
       };
       continue;
     }
-    // OpenCode's local MCP entry is a bare argv array with no cwd field, so a
-    // plugin server that declares one is wrapped through /bin/sh the same way
-    // cwd-shim.ts does for Claude — never launched silently in the wrong
-    // directory.
+    // OpenCode's local entry has no cwd field, so a declared cwd is wrapped through /bin/sh rather than ignored.
     const command = cfg.cwd
       ? cwdWrappedArgv(cfg.cwd, cfg.command, cfg.args ?? [])
       : [cfg.command, ...(cfg.args ?? [])];
