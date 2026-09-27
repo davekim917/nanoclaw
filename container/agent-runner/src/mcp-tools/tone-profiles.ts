@@ -1,16 +1,4 @@
-/**
- * Tone Profile MCP tools (Phase 5.1).
- *
- * Agents read profiles from /workspace/tone-profiles/ (mounted RO by
- * the host in Phase 5.0-C). `writing-rules.md` is appended to every
- * profile so the universal banned-vocabulary / structural rules travel
- * with any tone load.
- *
- * Usage pattern: agent's CLAUDE.md declares a default tone; agent calls
- * `get_tone_profile` before drafting any written content. Ad-hoc
- * overrides (e.g. "respond in a pirate voice") work by passing any
- * name — unknown names return an instruction to interpret ad-hoc.
- */
+/** Tone profile tools. `writing-rules.md` is appended to every profile; unknown names return an instruction to interpret ad-hoc. */
 import {
   listToneProfileNames,
   readToneAuxFile,

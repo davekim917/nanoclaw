@@ -1,10 +1,4 @@
-/**
- * Thread Search + Permalink Resolver MCP tools (Phase 2.9 + 2.10).
- *
- * Queries the host-maintained central archive mounted read-only at
- * /workspace/archive.db. Host writes on every chat inbound/outbound;
- * container reads via these tools.
- */
+/** Thread search and permalink tools over the host-maintained archive, mounted read-only at /workspace/archive.db. */
 import { Database } from 'bun:sqlite';
 
 import { findByName } from '../destinations.js';
@@ -31,29 +25,15 @@ function getDb(): Database | null {
   }
 }
 
-/**
- * Test seam: hand the tools an archive handle instead of opening ARCHIVE_PATH;
- * `null` drops it so the next call opens the path again. Tests must use this
- * rather than `mock.module('bun:sqlite')`: bun module mocks are process-global
- * and `mock.restore()` does not undo them, so every later test file's session
- * DBs would be built from the mock class.
- */
+/** Test seam. Tests must not `mock.module('bun:sqlite')`: bun module mocks are process-global and survive `mock.restore()`. */
 export function _setArchiveDbForTest(db: Database | null): void {
   _db = db;
 }
 
 /**
- * When sibling copies of one conversation pool into one.
- *
- * In a workgroup each sibling bot archives the same conversation under its
- * own channel_type (`slack-acme`, `slack-acme-codex`, ...). Those multi-bot
- * types reuse the base platform's adapter, which emits a platform_id carrying
- * the BASE prefix (`slack:C123`) for every bot — `namespacedPlatformId` in
- * src/platform-id.ts. That prefix is the evidence two rows are one
- * conversation: pool on it, and only on it. Native adapters (WhatsApp,
- * Signal, iMessage) emit unprefixed ids, and `whatsapp` / `whatsapp-cloud`
- * are distinct platforms, not base and variant (`isChannelVariant`,
- * src/types.ts) — those rows keep matching on their exact channel_type.
+ * Sibling bots archive one conversation under their own channel_types, but their adapter emits the BASE prefix
+ * (`slack:C123`) for every bot; that prefix is the only evidence two rows are one conversation. Native adapters
+ * emit unprefixed ids and keep matching on their exact channel_type.
  */
 function channelFamily(channelType: string): string {
   const dash = channelType.indexOf('-');
@@ -70,10 +50,7 @@ const POOLED_SQL = (t: string): string =>
   `substr(${t}.channel_type, 1, instr(${t}.channel_type || '-', '-') - 1) || ':'`;
 
 function sanitizeFtsQuery(q: string): string {
-  // FTS5 treats space-separated terms as implicit AND. For chat-sized
-  // messages that's far too strict — "docker container build" almost
-  // never appears all-three-in-one-message. Join with OR so any term
-  // matches; BM25 then ranks rows by how many rare terms they hit.
+  // FTS5 ANDs space-separated terms, far too strict for chat; OR them and let BM25 rank.
   const terms = q
     .replace(/[^\w\s-]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -131,18 +108,8 @@ export const searchThreadsTool: McpToolDefinition = {
     try {
       rows = db
         .prepare(
-          // bun:sqlite named params: both the SQL placeholder AND the JS
-          // object keys must carry the `$` prefix (unlike better-sqlite3 on
-          // the host, which auto-strips). Using `@name` here produced a
-          // "datatype mismatch" at runtime because bun left the params
-          // unbound. See CLAUDE.md container-runtime gotchas.
-          // BM25 ordering. bm25() returns a negative score, lower = better.
-          // The MATERIALIZED hint is load-bearing: without it SQLite inlines
-          // the CTE and rewrites the query into a shape where bm25() runs
-          // outside its FTS5 MATCH context — the vtab then errors with
-          // "unable to use function bm25 in the requested context". Forcing
-          // materialization computes scores in the FTS-only block, then the
-          // outer query joins on rowid and aggregates per thread.
+          // bun:sqlite named params need the `$` prefix in both SQL and JS keys.
+          // MATERIALIZED is load-bearing: without it SQLite inlines the CTE and bm25() errors outside its MATCH context.
           `WITH matches AS MATERIALIZED (
              SELECT rowid, bm25(messages_archive_fts) AS score
              FROM messages_archive_fts
@@ -237,15 +204,13 @@ export const resolveThreadLinkTool: McpToolDefinition = {
     const db = getDb();
     if (!db) return err('archive database not mounted');
 
-    // Figure out channel_type + platform_id + thread_id we should load.
     let channelType: string | null = null;
     let platformId: string | null = null;
     let threadId: string | null = null;
 
     const slack = parseSlackUrl(url);
     if (slack) {
-      // The channelType in v2 may be 'slack' or 'slack-<workspace>'. Query by
-      // LIKE so we catch either convention without being told which.
+      // channelType may be 'slack' or 'slack-<workspace>'.
       channelType = 'slack%';
       platformId = `slack:${slack.channel}`;
       threadId = slack.threadTs
@@ -295,25 +260,8 @@ export const resolveThreadLinkTool: McpToolDefinition = {
 };
 
 /**
- * Shared routing resolution: a caller can address a thread either by a
- * destination name ("channel key") from the agent's destinations map, or
- * by raw (channel_type, platform_id). If neither is given, fall back to
- * the session's own routing — so the agent can say "read this thread"
- * and get the current conversation's transcript.
- */
-/**
- * Resolve the channel the caller wants to read from, plus — importantly —
- * the default `thread_id` to use when the caller didn't pin one.
- *
- * The default-thread rule exists because `read_thread` without a thread_id
- * used to fall back to "most recent thread in the channel", which is wrong
- * when the agent is already mid-conversation inside a specific thread: the
- * "most recent" row may well be a different thread that happened to get a
- * message 30 seconds ago. This led to hallucinated cross-thread answers
- * (see the example-data/example incident). Now: if the resolved channel is the same
- * channel as the current session, the session's own thread_id is returned
- * as the default. Callers that want a different thread must pass
- * `thread_id` explicitly.
+ * Resolve the channel to read plus the default `thread_id`: for the session's own channel that is the session's
+ * thread, never "most recent thread" (which can be a sibling thread and yields cross-thread answers).
  */
 function resolveRouting(args: {
   channel?: unknown;
@@ -359,7 +307,6 @@ function resolveRouting(args: {
       sessionThreadId: sessionThreadIdForChannel(ct, pid),
     };
   }
-  // Fall back to current session routing entirely.
   if (!sessionRouting.channel_type || !sessionRouting.platform_id) {
     return 'no channel/channel_type+platform_id provided and session routing unavailable';
   }
@@ -404,12 +351,8 @@ export const readThreadTool: McpToolDefinition = {
     const db = getDb();
     if (!db) return err('archive database not mounted');
 
-    // Example Data/example guard: refuse the current channel's "most recent thread"
-    // fallback. The bug it prevents is silently picking a sibling thread
-    // when the channel has many concurrent ones. Passing `thread_id`
-    // explicitly is allowed — including for the current session — so the
-    // agent can pull deep history when the per-session recap window is
-    // too short.
+    // Refuse the current channel's "most recent thread" fallback, which can silently pick a sibling thread. An
+    // explicit thread_id is allowed, including the current one.
     if (!threadId && routing.sessionThreadId) {
       return err(
         'no thread_id provided and the resolved channel matches the current session — ' +

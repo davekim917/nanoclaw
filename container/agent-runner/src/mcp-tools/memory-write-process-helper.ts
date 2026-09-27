@@ -13,11 +13,7 @@ interface ProcessWriteRequest {
   resumeSignalPath?: string;
 }
 
-// Bounds the whole JSON request, not just the content: 16 MiB of document plus
-// HELPER_REQUEST_OVERHEAD_BYTES (16 KiB) of envelope. The host no longer has a
-// matching read cap to stay in step with — the generated-fact reader that owned
-// it is gone — so this is now the single authority on how large one memory
-// write may be.
+// Bounds the whole JSON request (16 MiB of document plus 16 KiB envelope); the single authority on one memory write's size.
 const MAX_MEMORY_WRITE_REQUEST_BYTES = 16400 * 1024;
 
 if (import.meta.main) {

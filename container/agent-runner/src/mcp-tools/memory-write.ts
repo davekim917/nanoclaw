@@ -78,12 +78,7 @@ export function sha256Text(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
-/**
- * The lock is deliberately workgroup-wide rather than per memory path. Memory
- * writes are rare, and one stable inode gives every sibling container the same
- * kernel-owned serialization point without putting coordination bytes in the
- * canonical memory tree.
- */
+/** Deliberately workgroup-wide: one stable inode gives every sibling container the same kernel-owned serialization point. */
 export function memoryLockPath(_target: string, rootDir = path.dirname(_target)): string {
   return path.join(path.dirname(rootDir), WORKGROUP_LOCK_LEAF);
 }
@@ -380,9 +375,7 @@ export async function writeMemoryFile(
     assertStableLockIdentity(lock);
     assertOrdinaryFileOrMissing(anchoredTarget, 'memory file');
     assertExpectedState(anchoredTarget, input.expected_sha256);
-    // Test-only race seam: source and destination remain anchored to open
-    // directory descriptors, so replacing string-path ancestors cannot redirect
-    // the atomic rename outside the canonical filesystem objects.
+    // Test-only race seam; source and destination stay anchored to open directory fds, so the rename cannot be redirected.
     options.beforeAtomicRename?.();
     assertStableLockIdentity(lock);
     fs.renameSync(tmpPath, anchoredTarget);

@@ -1,18 +1,6 @@
 /**
- * Orchestrator-only MCP tools: spawn_task, list_spawned_tasks, spawn_cancel.
- *
- * Mounted ONLY when:
- * 1. getSessionSpawnTaskId() === null (this is not a child/spawned session)
- * 2. This agent's group has agent_group_capabilities.role = 'orchestrator'
- *    in the per-agent central DB projection.
- *
- * All three tools write kind='system' outbound rows. The host processes them
- * in the delivery loop — there is no synchronous host round-trip.
- *
- * Self-orchestration: spawn_task always targets the SAME agent group as the
- * caller (sharing workspace, memory, CLAUDE.md, channels). There is no
- * cross-group dispatch primitive — group is the trust boundary, session is
- * the work-unit boundary.
+ * Orchestrator-only tools, mounted only in a non-child session whose group has role 'orchestrator'. spawn_task
+ * always targets the caller's own agent group: the group is the trust boundary, the session the work unit.
  */
 import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
@@ -67,11 +55,8 @@ export const spawnTask: McpToolDefinition = {
       return err('content and idempotency_key are required');
     }
 
-    // Refuse to spawn if we cannot establish our own session identity.
-    // Falling back to '' would compute task_id from an empty parentSessionId, which
-    // would not match the host's task_id (host derives from the real session ID).
-    // The agent would silently see a spawn acknowledged with a task_id it doesn't
-    // recognize. Better to fail loud at the caller boundary.
+    // Fail loud without a session id: the host derives task_id from the real session id, so '' would acknowledge a
+    // spawn under a task_id the agent never sees.
     const parentSessionId = getSessionId();
     if (!parentSessionId) {
       return err('spawn_task: cannot determine parent session id (session_routing.session_id missing); host may need a wake to populate it');

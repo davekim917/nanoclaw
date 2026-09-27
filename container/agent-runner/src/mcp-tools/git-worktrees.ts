@@ -1,19 +1,9 @@
 /**
- * Git repository MCP tools.
- *
- * One host-owned normal canonical clone exists per (workgroup, repository).
- * Each thread's checkouts live under the topic root. In
- * `NANOCLAW_CHECKOUT_MODE=worktree` (default) a thread has one linked worktree
- * per repo at `/workspace/worktrees/<repo>`, and another branch is refused. In
- * `clone` mode `/workspace/worktrees/<repo>` is the primary and
- * `/workspace/worktrees/<repo>@<slug>` holds any other branch, each an
- * independent clone (plan docs/specs/repository-branch-clones/plan.md
- * §5.2-§5.3). Resolution
- * (`resolveCheckout`) is shape-aware and branch-aware in both modes, so a
- * clone created under `clone` mode stays usable after a rollback to
- * `worktree` mode (R10). The host mounts the topic root and canonical
- * metadata at their exact host paths, so Git records paths that work
- * unchanged from both the host and every sibling container.
+ * Git repository MCP tools. One host-owned canonical clone per (workgroup, repository); a thread's checkouts
+ * live under the topic root. `worktree` mode (default): one linked worktree per repo, other branches refused.
+ * `clone` mode: other branches are independent clones at `<repo>@<slug>`. Resolution is shape- and branch-aware
+ * in both modes, so a clone survives a rollback to `worktree` mode. Paths are mounted at their exact host paths
+ * so Git's recorded paths work from the host and every sibling container.
  */
 import { dlopen } from 'bun:ffi';
 import { execFileSync } from 'child_process';
@@ -70,11 +60,7 @@ function validateSegment(value: string, label: string): string | null {
   return null;
 }
 
-// ── Checkout mode (plan §5.3 M1) ─────────────────────────────────────────────
-//
-// Controls creation only. Resolution (resolveCheckout) is shape-aware and
-// branch-aware regardless of mode, so a clone made under `clone` mode keeps
-// working after a rollback to `worktree` mode (R10, P2-18).
+// Controls creation only; resolution is shape- and branch-aware regardless of mode.
 
 type CheckoutMode = 'worktree' | 'clone';
 
@@ -82,39 +68,13 @@ function checkoutMode(): CheckoutMode {
   return process.env.NANOCLAW_CHECKOUT_MODE === 'clone' ? 'clone' : 'worktree';
 }
 
-// A `clone`-mode checkout is a full `git clone` with its own independent
-// `.git/config` (host `stageClone`) — it never inherits the canonical's `core.hooksPath`. A
-// `worktree`-mode checkout is a linked worktree sharing the canonical's
-// `.git` (createLinkedWorktree below), so it DOES inherit `core.hooksPath`,
-// which is how a scan-policy repo's host-managed pre-push hook
-// (src/managed-git-hooks.ts) actually gets scanned. Under global `clone`
-// mode this container has no other signal for "is this a scan-policy repo"
-// — it cannot import src/managed-git-hooks.ts (container/agent-runner is a
-// separate Bun package tree, no shared modules with host src/, per
-// CLAUDE.md's Module System section) — so the list is duplicated here, as
-// scan-policy-repos.json, kept in exact lockstep with the host's own
-// `SCAN_POLICY_REPOSITORY_NAMES` (src/managed-git-hooks.ts) — a
-// src/managed-git-hooks.test.ts drift test reads both and fails CI the
-// moment either side widens without the other. A wiki
-// checkout must always be a linked worktree, whatever NANOCLAW_CHECKOUT_MODE
-// says, or its pushes go unscanned.
+// Scan-policy repos must use a linked worktree: only that inherits the canonical's `core.hooksPath` (the
+// host-managed pre-push scan); a clone has its own config and pushes unscanned. The list is duplicated from the
+// host's SCAN_POLICY_REPOSITORY_NAMES (src/managed-git-hooks.ts) in scan-policy-repos.json; a host drift test
+// keeps them in lockstep.
 //
-// The list is read LAZILY, on first use, and memoized here (`undefined` =
-// "not yet loaded" is a distinct cache state from a loaded `null`) rather
-// than at module load: this module is imported
-// transitively by every MCP tool (mcp-tools/index.ts -> git-worktrees.ts),
-// so a missing, unreadable or malformed scan-policy-repos.json must never be
-// able to throw during import and take down the whole `nanoclaw` MCP server
-// for every tool in every container. A load failure
-// (`loadScanPolicyRepositoryNames` returning `null`) fails CLOSED, not open:
-// every repo name is treated as scan-policy, so `effectiveCheckoutModeFor`
-// pins every repo to `worktree` and every leftover-clone refusal above still
-// fires. The blast radius of a bad data file is then confined to these git
-// tools (a repo that need not be scan-policy is pinned to worktree mode
-// anyway) rather than leaking unscanned pushes by silently loading `[]`
-// and failing open. The failure is logged exactly once per container
-// lifetime — repeating it on every tool call would just be noise once the
-// cause is already fixed by pinning everything closed.
+// Loaded lazily (undefined = not loaded, null = failed) because every MCP tool imports this module, so a bad
+// file must never throw at import. A load failure fails CLOSED: every repo is treated as scan-policy.
 let scanPolicyNamesCache: readonly string[] | null | undefined;
 let loggedScanPolicyLoadFailure = false;
 let scanPolicyDataPathOverride: string | undefined;
@@ -140,13 +100,7 @@ export function isScanPolicyRepositoryName(name: string): boolean {
   return names === null ? true : names.includes(name);
 }
 
-/**
- * Test-only seam: clears the memoized scan-policy list and the one-time
- * load-failure log latch, so the next `isScanPolicyRepositoryName` call
- * reloads from disk. Pass `dataPath` to point the reload at a fixture file
- * instead of the real scan-policy-repos.json; omit it (or pass `undefined`)
- * to restore the real file. Never called from production code.
- */
+/** Test-only: clears the memoized list and the log latch; `dataPath` points the reload at a fixture. */
 export function resetScanPolicyRepositoryNamesForTest(dataPath?: string): void {
   scanPolicyNamesCache = undefined;
   loggedScanPolicyLoadFailure = false;
@@ -159,23 +113,8 @@ function effectiveCheckoutModeFor(repo: string): CheckoutMode {
 }
 
 /**
- * Shared refusal text for a scan-policy repo's leftover clone-shaped
- * checkout, whether hit at creation (`create_worktree`) or at resolution
- * time for every other tool (`worktreeForTool`). A clone has its own
- * independent `.git/config` with no `core.hooksPath` set (see the block
- * comment above `isScanPolicyRepositoryName`), so nothing pushed from it is
- * ever scanned by the host-managed pre-push hook — it must
- * be removed, never served or pushed from, so re-running create_worktree is
- * the only way forward.
- *
- * `repo` here may be scan-policy for either of two reasons, and the caller
- * cannot tell them apart without asking: the list loaded fine and genuinely
- * names `repo` (normal case — say nothing extra), or the list failed to load
- * and `isScanPolicyRepositoryName` is fail-closed treating EVERY repo as
- * scan-policy. In the second case the wiki-shaped wording above names
- * the wrong cause — the real cause, the failed load, is otherwise visible
- * only in the MCP server's stderr (`resolvedScanPolicyRepositoryNames`'s
- * one-time log) — so this appends a hint pointing the operator at the host.
+ * Refusal for a scan-policy repo's leftover clone (its pushes are never scanned, so it must be removed). When the
+ * list failed to load, every repo reads as scan-policy, so this appends a hint pointing at the host.
  */
 function scanPolicyCloneLeftoverMessage(repo: string, checkoutPath: string): string {
   const base =
@@ -193,9 +132,7 @@ function scanPolicyCloneLeftoverMessage(repo: string, checkoutPath: string): str
 function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
   return execFileSync('git', args, {
     cwd,
-    // Pass the caller's current environment explicitly. Git identity is
-    // per-agent and can vary between calls, so each subprocess receives the
-    // values present for this invocation.
+    // Git identity is per-agent and can vary between calls: pass this invocation's env explicitly.
     env: process.env,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -204,44 +141,22 @@ function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
 }
 
 /**
- * The branch and the commit it points at, read in ONE git invocation.
- *
- * Two commands can straddle a sibling checking out another branch — they share
- * this worktree — leaving a branch name from before the switch beside a commit
- * from after it. Everything downstream is then pinned to an identity that never
- * existed: the gate judges one PR's history while the refspec pushes the other
- * branch's commit. `status --porcelain=v2 --branch` reports both from a single
- * snapshot, so there is no window to lose rather than a smaller one.
- *
- * Unchanged by the branch-clones plan (§5.3): `context.worktree` and
- * `context.lockPath` already point at whichever checkout `resolveCheckout`
- * selected (see `contextForCheckout`), so this primitive never needs to know
- * about checkout shape at all.
+ * Branch and commit read in ONE git invocation: two commands can straddle a sibling switching branches in this
+ * shared worktree, pairing a branch with a commit it never had.
  */
 async function capturedIdentity(
   context: RepositoryContext,
 ): Promise<{ branch: string; head: string; lease: string } | null> {
-  // The whole capture is one critical section, and the lock is taken HERE
-  // rather than by each caller: an identity read outside it is the defect, so
-  // the primitive that produces identities is the place it cannot happen. The
-  // branch, the commit and the remote value are three reads of shared state
-  // that must describe one instant — a sibling topic's `create_worktree` runs
-  // its `fetch --prune` under this same lock, so a capture that straddled it
-  // would pair this checkout's commit with a remote value the fetch had just
-  // advanced, and the lease below would then name a commit this caller never
-  // integrated.
+  // One critical section under the repo lock: a sibling's `create_worktree` fetches under the same lock, and a
+  // capture straddling it would pair this commit with a remote value it never integrated.
   return await withRepositoryLock(context, () => {
     const worktree = context.worktree;
     const out = runGitAt(worktree, ['status', '--porcelain=v2', '--branch', '--untracked-files=no']);
     const oid = /^# branch\.oid (\S+)$/m.exec(out)?.[1];
     const head = /^# branch\.head (.+)$/m.exec(out)?.[1];
     if (!oid || !head || head === '(detached)' || oid === '(initial)') return null;
-    // The remote value this caller actually integrated, read now rather than
-    // left to `--force-with-lease` to infer at push time: a bare lease expects
-    // whatever `refs/remotes/origin/<branch>` says when the push runs, so a
-    // commit that landed while the gate was on the network would be adopted as
-    // the expectation and then overwritten. An empty lease means the branch
-    // must not exist on the remote yet.
+    // Read the lease now: a bare --force-with-lease adopts whatever origin/<branch> says at push time, overwriting
+    // a commit that landed meanwhile. An empty lease means the branch must not exist on the remote yet.
     const lease = tryGitAt(worktree, ['rev-parse', `refs/remotes/origin/${head}`]) ?? '';
     return { branch: head, head: oid, lease };
   });
@@ -351,11 +266,8 @@ function contextFor(repo: string): RepositoryContext {
   if (!contained(canonical, repositoriesRoot) || !contained(worktree, topicRoot)) {
     throw new Error('repository path escapes its trusted host root');
   }
-  // The transfer check comes before every canonical check. The spawn withholds
-  // the canonical `.git` from a topic whose checkout was transferred away, so
-  // checking `.git` first would answer "metadata is unavailable" to exactly the
-  // topic this refusal exists for, and agents read that as "never published"
-  // and re-run clone_repo.
+  // Transfer check first: the spawn withholds `.git` from a transferred topic, and "metadata unavailable" would
+  // make agents re-run clone_repo.
   const workUnitId = createHash('sha256').update(`${workgroupId}\0${workUnitKey}`).digest('hex').slice(0, 32);
   const tombstonePath = path.join(stateRoot, 'transfers', `${workUnitId}.json`);
   if (fs.existsSync(tombstonePath)) {
@@ -402,14 +314,7 @@ function identity(stat: fs.Stats): string {
   return `${stat.dev}:${stat.ino}`;
 }
 
-/**
- * The flock loop shared by every checkout's lock, whatever its path: the
- * canonical `repository.lock` for a linked checkout, or a clone's own
- * `.git/nanoclaw-checkout.lock` (plan §5.3 "Locking"). The lock file itself
- * must already exist — `withRepositoryLock` relies on the host having
- * provisioned the canonical lock, and clone callers provision their own
- * on demand via `ensureCloneLock` before calling this.
- */
+/** The flock loop for every checkout lock; the lock file must already exist (host-provisioned, or `ensureCloneLock`). */
 async function withFlockAt<T>(lockPath: string, fn: () => Promise<T> | T): Promise<T> {
   let fd: number;
   try {
@@ -440,7 +345,7 @@ async function withRepositoryLock<T>(context: RepositoryContext, fn: () => Promi
   return withFlockAt(context.lockPath, fn);
 }
 
-/** Creates `<clone>/.git/nanoclaw-checkout.lock` on demand — no host mount provisions it (plan §5.3 "Locking"). */
+/** No host mount provisions a clone's lock, so it is created on demand. */
 function ensureCloneLock(checkoutPath: string): string {
   const file = path.join(checkoutPath, '.git', 'nanoclaw-checkout.lock');
   try {
@@ -487,10 +392,7 @@ function validateExistingWorktree(context: RepositoryContext, branchArg: string 
   return ok(`Worktree ready at ${context.worktree} (existing ${current}; left untouched)`);
 }
 
-/** A crash or concurrent topic-root recreation can leave the exact repo slot
- * as an empty directory while Git still owns its linked admin record. Removing
- * an empty directory is the atomic proof that no agent bytes are present; the
- * branch/index safety decision still happens below against the private admin. */
+/** A crash can leave the slot as an empty dir while Git still owns its linked admin record; rmdir proves it held no bytes. */
 function removeEmptyTopicPlaceholder(context: RepositoryContext): void {
   try {
     const stat = fs.lstatSync(context.worktree);
@@ -613,13 +515,7 @@ async function queueHostAction(action: string, payload: Record<string, unknown>)
   return requestId;
 }
 
-/**
- * Asks the host to move the canonical's own checkout to the origin/HEAD this
- * container's fetch recorded. It names no checkout: refresh never reads or
- * fetches from an agent checkout (plan §5.5, rev 2.7). The host still
- * validates reused checkouts and proves cleanup candidates, as it does for
- * linked worktrees.
- */
+/** Asks the host to move the canonical's checkout to the fetched origin/HEAD; refresh never reads an agent checkout. */
 async function emitRefresh(context: RepositoryContext): Promise<void> {
   await queueHostAction('repository_refresh', {
     repo: context.repo,
@@ -627,14 +523,7 @@ async function emitRefresh(context: RepositoryContext): Promise<void> {
   });
 }
 
-/**
- * Fetches origin into the workgroup canonical through this container's scoped
- * identity and returns origin/HEAD's ref (plan §5.5). The caller holds the
- * canonical's repository lock and has a network pin. The canonical's config,
- * HEAD, index, hooks and objects/info are read-only overlays in both checkout
- * modes (src/container-runner.ts canonicalGitControlMounts, :4413), so this
- * writes refs and objects only.
- */
+/** Caller holds the canonical's repository lock and a network pin. Config/HEAD/index/hooks are read-only overlays, so this writes refs and objects only. */
 function fetchCanonicalHeld(context: RepositoryContext): string {
   runGitDir(context.gitDir, ['fetch', 'origin', '--prune'], 300_000);
   runGitDir(context.gitDir, ['remote', 'set-head', 'origin', '--auto'], 120_000);
@@ -643,11 +532,7 @@ function fetchCanonicalHeld(context: RepositoryContext): string {
   return baseRef;
 }
 
-/**
- * `fetchCanonicalHeld` under the canonical's repository lock, for the clone
- * paths, which do not otherwise hold it. `context` must be the canonical's
- * own (from `contextFor`), never a clone's: its `lockPath` is the lock taken.
- */
+/** `context` must be the canonical's own (its `lockPath` is the lock taken), never a clone's. */
 async function fetchCanonical(context: RepositoryContext): Promise<void> {
   await withRepositoryLock(context, () => {
     fetchCanonicalHeld(context);
@@ -660,9 +545,7 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
     return err(`Invalid branch name: ${branch}`);
   }
 
-  // Every network-backed invocation refreshes shared refs through this
-  // container's scoped identity. Local-only repositories are a migration
-  // preservation state and start new worktrees from the canonical HEAD.
+  // Local-only repositories (a migration preservation state) start new worktrees from the canonical HEAD.
   let baseRef: string;
   if (context.pin.kind === 'local-only') {
     baseRef = runGitDir(context.gitDir, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
@@ -678,14 +561,9 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
 
   let owner = branchOwner(context.gitDir, branch);
   if (owner && canonicalPath(owner) === canonicalPath(context.worktree) && worktreePathIsMissing(owner)) {
-    // A killed or externally removed current topic can leave only Git's linked-worktree
-    // registration behind. The branch ref survives removal, but a private
-    // linked index may contain the last recoverable staged blobs. Remove only
-    // this proven-clean registration only when its path is this container's
-    // observable topic mount. Sibling topic paths are intentionally unmounted,
-    // so ENOENT for them is not evidence that the host checkout is missing.
-    // Repository-wide prune would also delete
-    // unrelated missing owners whose private indexes still hold staged work.
+    // Remove only this proven-clean registration, and only when its path is this container's own topic mount:
+    // sibling topic paths are unmounted, so ENOENT there is not evidence. A repository-wide prune would delete
+    // missing owners whose private indexes still hold staged work.
     const blocker = missingOwnerRemovalBlocker(context, owner);
     if (blocker) {
       return err(`Branch '${branch}' has a missing registered owner, but automatic cleanup refused: ${blocker}`);
@@ -725,10 +603,7 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
   if (localExists && branchArg) {
     runGitDir(context.gitDir, ['worktree', 'add', context.worktree, branch]);
   } else if (localExists) {
-    // A surviving generated ref without a checkout can contain unpushed work
-    // after an unexpected directory/admin loss. Never reset it. Normal host
-    // cleanup deletes this exact ref only after proving it remote-contained;
-    // any unexplained survivor is reattached losslessly.
+    // A surviving generated ref may hold unpushed work: never reset it, reattach losslessly.
     runGitDir(context.gitDir, ['worktree', 'add', context.worktree, branch]);
   } else if (remoteExists) {
     runGitDir(context.gitDir, ['worktree', 'add', '-b', branch, context.worktree, `refs/remotes/origin/${branch}`]);
@@ -745,8 +620,6 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
       'fetch, push, and PR operations remain unavailable until an operator publishes an origin',
   );
 }
-
-// ── resolveCheckout (plan §5.3) ──────────────────────────────────────────────
 
 interface CloneCheckoutMetadata {
   version: 1;
@@ -831,23 +704,10 @@ interface ResolvedCheckout {
   branch: string;
 }
 
-/**
- * Thrown by `resolveCheckout` specifically when nothing exists yet at the
- * candidate path — as opposed to something existing there but being invalid
- * (unknown shape, an R3 mismatch, a detached HEAD, an origin-pin mismatch).
- * Callers that fall back to a mode-specific creation path on "not found"
- * (`create_worktree` in worktree mode) must NOT fall back on any other
- * failure: a mismatched checkout is refused, not silently worked around
- * (R3, P2-7).
- */
+/** Only "nothing exists here yet": callers may fall back to creation on this error and on no other. */
 class CheckoutNotFoundError extends Error {}
 
-/**
- * A clone-shaped checkout that exists but may not be served: an R3 mismatch,
- * a detached HEAD, unreadable metadata, or an origin that drifted from the pin.
- * In worktree mode this is the only resolution failure `create_worktree` stops
- * on; every other one keeps today's linked-worktree handling.
- */
+/** A clone-shaped checkout that exists but must not be served (branch mismatch, detached HEAD, bad metadata, origin drift). */
 class CloneCheckoutRefusedError extends Error {}
 
 function validateCloneCandidate(
@@ -861,8 +721,7 @@ function validateCloneCandidate(
   if (!currentBranch) {
     throw new Error(`Clone checkout at ${checkoutPath} is on a detached HEAD and was left untouched`);
   }
-  // R3: a checkout's current branch must equal its recorded branch, or it is
-  // refused, not reused, for any branch.
+  // A checkout whose branch differs from its recorded branch is refused, not reused, for any branch.
   if (metadata.branch !== currentBranch) {
     throw new Error(
       `Clone checkout at ${checkoutPath} is on '${currentBranch}', not its recorded branch '${metadata.branch}'. ` +
@@ -933,14 +792,7 @@ function validateCandidate(
   throw new Error(`Checkout at ${checkoutPath} has unrecognized Git metadata and was left untouched`);
 }
 
-/**
- * Picks the checkout serving `(repo, branch)` by the plan §5.1 rule, without
- * creating anything: no branch, or the primary checkout's own branch already
- * matches, resolves to `<repo>`; otherwise `<repo>@<slug>`. Shape- and
- * branch-aware in both modes (§5.3) — a clone left over from a `clone`-mode
- * period resolves the same way after a rollback to `worktree` mode (R10).
- * Throws, mutating nothing, on an unknown shape or an R3 mismatch.
- */
+/** Picks the checkout serving (repo, branch) without creating anything; throws, mutating nothing, on an unknown shape or branch mismatch. */
 function resolveCheckout(context: RepositoryContext, branch: string | null): ResolvedCheckout {
   const primaryPath = context.worktree;
   if (branch === null) return validateCandidate(context, primaryPath, context.repo, null);
@@ -961,13 +813,7 @@ function resolveCheckout(context: RepositoryContext, branch: string | null): Res
   return validateCandidate(context, path.join(context.topicRoot, dirName), dirName, branch);
 }
 
-/**
- * Yields a context whose `.worktree`/`.lockPath` point at the RESOLVED
- * checkout, so every downstream primitive (`capturedIdentity`,
- * `withRepositoryLock`, the git_commit/git_push/open_pr handler bodies) keeps
- * operating on `context.worktree`/`context.lockPath` completely unchanged
- * (plan §5.3: "capturedIdentity and the refspec push are unchanged").
- */
+/** Points `.worktree`/`.lockPath` at the resolved checkout so every downstream primitive works unchanged. */
 function contextForCheckout(context: RepositoryContext, resolved: ResolvedCheckout): RepositoryContext {
   return {
     ...context,
@@ -987,15 +833,8 @@ function worktreeForTool(
   try {
     const context = contextFor(repo);
     const resolved = resolveCheckout(context, branchArg);
-    // Same refusal as create_worktree's reuse branch above, at resolution
-    // time: this is the one choke point git_commit, git_push and open_pr all
-    // route through (see their handlers below), so it also covers a
-    // `wiki@<branch>` position, not just the primary one. `scanPolicyRefusal:
-    // true` lets open_pr's branch-then-primary fallback (below) tell this
-    // refusal apart from an ordinary "no checkout for that branch" miss: a
-    // fallback to the primary here would silently swallow the refusal and
-    // open the PR from an unrelated (linked) checkout instead of surfacing
-    // the leftover-clone problem.
+    // The one choke point for git_commit/git_push/open_pr. `scanPolicyRefusal` stops open_pr's primary fallback
+    // from swallowing this refusal.
     if (resolved.shape === 'clone' && isScanPolicyRepositoryName(repo)) {
       return { error: err(scanPolicyCloneLeftoverMessage(repo, resolved.path)), scanPolicyRefusal: true };
     }
@@ -1005,8 +844,6 @@ function worktreeForTool(
     return { error: err(error instanceof Error ? error.message : String(error)) };
   }
 }
-
-// ── Clone creation (plan §5.2-§5.3) ──────────────────────────────────────────
 
 interface RepositoryActionResponsePayload {
   requestId: string;
@@ -1038,9 +875,7 @@ async function pollRepositoryActionResponse(
 ): Promise<RepositoryActionResponsePayload | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    // The host writes the answer at this exact id. getMessageIn opens a fresh
-    // read-only handle per call, the cross-mount visibility rule
-    // findCliResponse relies on.
+    // getMessageIn opens a fresh read-only handle per call (cross-mount visibility).
     const row = getMessageIn(`repository-action-response-${requestId}`);
     if (row && row.status === 'pending') {
       markCompleted([row.id]);
@@ -1051,7 +886,7 @@ async function pollRepositoryActionResponse(
   return null;
 }
 
-/** Writes `repository_checkout` and polls for its response (plan §5.3 steps 1-2), retrying once on `retryable:true`. */
+/** Writes `repository_checkout` and polls for its response, retrying once on `retryable:true`. */
 async function requestRepositoryCheckout(
   context: RepositoryContext,
   branch: string | null,
@@ -1100,14 +935,8 @@ interface FreshnessNote {
 }
 
 /**
- * The container-side post-step after every clone-mode `create_worktree`
- * response, for a network pin only (plan §5.3 step 3). Runs under the
- * per-checkout lock so it is idempotent: a real `git fetch` through this
- * container's own scoped identity (the host never talks to GitHub), then —
- * only when the checkout is pristine (HEAD still at the recorded
- * `startCommit` and a clean status) — moves it to fresh remote state and
- * records the new `startCommit`. A non-pristine checkout, or one that started
- * from preserved local work (`canonical-local`), is left exactly as is.
+ * Clone-mode post-step for a network pin, under the per-checkout lock (idempotent): fetch through this
+ * container's identity (the host never talks to GitHub), then advance only a pristine checkout.
  */
 async function runCloneFreshnessStep(context: RepositoryContext, checkoutPath: string): Promise<FreshnessNote> {
   return await withCheckoutLock(checkoutPath, async () => {
@@ -1174,9 +1003,7 @@ async function runCloneFreshnessStep(context: RepositoryContext, checkoutPath: s
 }
 
 async function createCloneWorktree(context: RepositoryContext, branch: string | null): Promise<ToolResult> {
-  // A network pin fetches the canonical first, as a linked worktree does, so
-  // the host stages from current refs and starts B from origin/B when another
-  // thread already pushed it. Local-only pins fetch nothing.
+  // Fetch the canonical first so the host stages from current refs (origin/B if another thread pushed B).
   if (context.pin.kind !== 'local-only') await fetchCanonical(context);
   const response = await requestRepositoryCheckout(context, branch);
   if (!response.ok) return err(response.message || `repository checkout failed for ${context.repo}`);
@@ -1186,8 +1013,6 @@ async function createCloneWorktree(context: RepositoryContext, branch: string | 
   const resolvedBranch = response.branch ?? branch ?? dirName;
 
   if (context.pin.kind === 'local-only') {
-    // Local-only pins skip the whole post-step, including refresh (the same
-    // rule as for linked worktrees).
     return ok(
       `Worktree ready at ${checkoutPath} on branch ${resolvedBranch} from the preserved local-only canonical; ` +
         'fetch, push, and PR operations remain unavailable until an operator publishes an origin',
@@ -1202,13 +1027,7 @@ async function createCloneWorktree(context: RepositoryContext, branch: string | 
   );
 }
 
-/**
- * clone_repo's answer for a repository the workgroup already had when this
- * container started, or null when there is none. The spawn mounts every
- * canonical's transfers directory before any per-topic withhold, so that
- * directory proves the canonical exists even where its `.git` is withheld.
- * Publishing it again would drain this thread's containers and change nothing.
- */
+/** The spawn mounts every canonical's transfers dir before per-topic withholds, so it proves the canonical exists even when `.git` is withheld. */
 function alreadyPublishedAnswer(repo: string, requestedOrigin: string): ToolResult | null {
   const dataDir = process.env.NANOCLAW_HOST_DATA_DIR ?? '';
   const workgroupId = process.env.NANOCLAW_WORKGROUP_ID ?? '';
@@ -1312,11 +1131,7 @@ export const cloneRepoTool: McpToolDefinition = {
   },
 };
 
-/**
- * create_worktree's behaviour depends on the mode the spawn passed in, so its
- * description does too: worktree mode refuses a second branch
- * (validateExistingWorktree), and must not offer one.
- */
+/** Worktree mode refuses a second branch, so its description must not offer one. */
 const CREATE_WORKTREE_DESCRIPTIONS: Record<CheckoutMode, string> = {
   clone:
     "Create or reuse a checkout of repo for this thread. With no branch, this is the thread's own checkout at " +
@@ -1398,22 +1213,8 @@ export const createWorktreeTool: McpToolDefinition = {
       return err(error instanceof Error ? error.message : String(error));
     }
 
-    // Resolve what already exists here, in EITHER mode, before deciding how
-    // to create anything. A checkout that resolves but is INVALID (an R3
-    // mismatch, an origin-pin drift) is refused right here rather than
-    // silently falling through to a mode-specific creation path, which would
-    // ignore it and act on an unrelated path or an unrelated host action
-    // (R3, P2-7). Only a clean "nothing here yet" falls through. In worktree
-    // mode only a clone's refusal stops here: a linked, empty or unrecognized
-    // primary keeps today's handling in createLinkedWorktree, which validates a
-    // linked checkout and recovers one a crash left as an empty directory.
-    //
-    // `mode` is per-repo, not the raw global `checkoutMode()`: a scan-policy
-    // repo (isScanPolicyRepositoryName above) is pinned to `worktree`
-    // regardless of NANOCLAW_CHECKOUT_MODE, so its pushes always go through
-    // a linked worktree sharing the canonical's `core.hooksPath` — a `clone`
-    // checkout has its own independent git config with no hooksPath set at
-    // all, and would never be scanned.
+    // Resolve what exists first, in either mode: an INVALID checkout is refused here rather than falling through
+    // to creation. `mode` is per-repo: scan-policy repos are pinned to `worktree` whatever NANOCLAW_CHECKOUT_MODE says.
     const mode = effectiveCheckoutModeFor(repo);
     let existing: ResolvedCheckout | null = null;
     try {
@@ -1425,19 +1226,11 @@ export const createWorktreeTool: McpToolDefinition = {
     }
 
     if (existing?.shape === 'clone' && mode === 'worktree') {
-      // A scan-policy repo (isScanPolicyRepositoryName) is pinned to
-      // `worktree` mode precisely so its pushes go through a linked worktree
-      // sharing the canonical's `core.hooksPath`. Serving
-      // this leftover clone as-is, the way a non-scan-policy repo's leftover
-      // clone is served below, would hand back a checkout whose pushes are
-      // never scanned — refuse instead of reusing it.
+      // Never serve a scan-policy repo's leftover clone: its pushes would not be scanned.
       if (isScanPolicyRepositoryName(repo)) {
         return err(scanPolicyCloneLeftoverMessage(repo, existing.path));
       }
-      // A clone-shaped checkout left over from a clone-mode period is served
-      // as-is (R10, P2-18) — worktree-mode creation below only knows how to
-      // create or reuse a LINKED worktree at the primary position, and has
-      // no idea a `<repo>@<slug>` clone exists at all.
+      // Serve a leftover clone as-is: worktree-mode creation only knows linked worktrees at the primary position.
       return ok(`Checkout ready at ${existing.path} on branch ${existing.branch} (existing clone; left untouched)`);
     }
 
@@ -1449,9 +1242,6 @@ export const createWorktreeTool: McpToolDefinition = {
       }
     }
 
-    // worktree mode, or a legacy linked checkout reused unchanged in clone
-    // mode (R10, §5.10, P2-11): createLinkedWorktree runs its own
-    // fetch-then-reuse-or-create flow exactly as today.
     try {
       return await withRepositoryLock(context, () => createLinkedWorktree(context, branch));
     } catch (error) {
@@ -1540,25 +1330,10 @@ export const gitPushTool: McpToolDefinition = {
     if ('error' in resolved) return resolved.error;
     const worktree = resolved.context.worktree;
     try {
-      // A container agent's push path is this tool, not the skill's
-      // `codex-review.sh push`, so the gate has to sit here or it does not
-      // exist for container review loops. It fails open — only an explicit
-      // refusal stops the push.
-      //
-      // The identity is captured under the repository lock (see
-      // `capturedIdentity`); the gate then runs OUTSIDE it, deliberately,
-      // because it makes its own `gh` calls and holding the lock across them
-      // would stall every sibling topic on this repo. Same-topic siblings
-      // share this worktree,
-      // so the checkout can change underneath the verdict — a commit, a
-      // rewrite, a checkout of another branch at the same commit. Rather than
-      // detect each of those, the branch and commit are captured once, up
-      // front, and everything downstream NAMES them: the gate is asked about
-      // that branch and that commit, and the push sends them as an explicit
-      // refspec. Nothing downstream reads the checkout again, so what reaches
-      // the remote is what the gate looked at, or nothing. Work a sibling adds
-      // in the window is simply not pushed here; it gets its own verdict on
-      // its own push.
+      // The gate must sit here: a container agent's push path is this tool, not `codex-review.sh push`. It fails open
+      // (only an explicit refusal stops the push) and runs OUTSIDE the repo lock because it makes its own `gh` calls.
+      // Siblings share this worktree, so branch and commit are captured once and everything downstream names them
+      // (explicit refspec): what reaches the remote is what the gate judged, or nothing.
       const identity = await capturedIdentity(resolved.context);
       if (!identity) return err('Cannot push a detached HEAD; create or switch to a branch explicitly');
       const { branch, head } = identity;
@@ -1580,16 +1355,11 @@ export const gitPushTool: McpToolDefinition = {
           `${head}:refs/heads/${branch}`,
         ];
         runGitAt(worktree, push, 300_000);
-        // `-u` does not apply to a refspec whose source is a commit, so the
-        // tracking config the old form set is restored explicitly. Best effort:
-        // it is a convenience, and the push has already landed.
+        // `-u` does not apply to a commit-sourced refspec; set tracking explicitly (best effort, the push has landed).
         tryGitAt(worktree, ['branch', `--set-upstream-to=origin/${branch}`, branch]);
       });
-      // A linked worktree's push is recorded in the canonical's own refs. A
-      // clone's is recorded only in the clone, so the canonical fetches origin
-      // itself (plan §5.5), after the clone's lock is released so the two
-      // locks never nest. The push has landed either way, so a failed fetch is
-      // reported, not raised.
+      // A clone's push is recorded only in the clone, so the canonical fetches origin itself, after the clone's lock
+      // is released (the two locks never nest). A failed fetch is reported, not raised.
       let canonicalNote = '';
       if (resolved.checkout.shape === 'clone' && resolved.canonical.pin.kind !== 'local-only') {
         try {
@@ -1639,29 +1409,14 @@ export const openPrTool: McpToolDefinition = {
     const body = typeof args.body === 'string' ? args.body : '';
     if (!title.trim()) return err('title is required');
     const branchArg = typeof args.branch === 'string' && args.branch.trim() ? args.branch.trim() : undefined;
-    // `branch` selects the checkout holding it. When none does (the push came
-    // from a checkout a same-topic sibling has since switched), the PR still
-    // opens for it: `gh` needs only some checkout of the repository to run in,
-    // and `--head` names the branch. That fallback must NOT fire for a
-    // scan-policy leftover-clone refusal (`scanPolicyRefusal`): the branch
-    // checkout exists, it is just refused, and retrying against the primary
-    // would silently swallow the refusal and open the PR from an unrelated
-    // checkout instead of surfacing the leftover clone.
+    // Fall back to any checkout when none holds `branch` (`gh` only needs one; `--head` names the branch), but
+    // never on a scan-policy refusal, which the fallback would swallow.
     let resolved = worktreeForTool(repo, branchArg);
     if ('error' in resolved && branchArg && !resolved.scanPolicyRefusal) resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
     try {
-      // Bound to a named branch, never to whatever is checked out when `gh`
-      // runs: same-topic siblings share the worktree, and `gh pr create`
-      // defaults `--head` to the current branch, so a switch mid-call would
-      // open the PR for the sibling's branch — or push theirs to open it.
-      //
-      // `branch` is what closes the window between a push and this call, which
-      // no locking here can reach: git_push names the branch it pushed, and
-      // passing that name back makes this call describe that push rather than
-      // the checkout as it now stands, whichever checkout `gh` runs in. Absent
-      // it, the branch is captured under the lock, which is correct whenever
-      // the checkout has not moved.
+      // Bound to a named branch: `gh pr create` defaults `--head` to the current branch, which a sibling may switch
+      // mid-call. git_push's branch name closes the push-to-PR window.
       let head = branchArg;
       if (!head) {
         const identity = await capturedIdentity(resolved.context);

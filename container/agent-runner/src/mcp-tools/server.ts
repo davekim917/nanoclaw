@@ -63,14 +63,12 @@ export async function mountSpawnTools(): Promise<void> {
   const spawnTaskId = getSessionSpawnTaskId();
 
   if (spawnTaskId !== null) {
-    // Child session — mount child tools
     const { spawnProgress, spawnComplete, spawnFailed, spawnRequestSteer } = await import('./dispatch-child.js');
     registerTools([spawnProgress, spawnComplete, spawnFailed, spawnRequestSteer]);
     log('Spawn: mounted child tools (spawn_progress, spawn_complete, spawn_failed, spawn_request_steer)');
     return;
   }
 
-  // Not a child session — check orchestrator capability
   if (hasOrchestratorCapability()) {
     const { spawnTask, listSpawnedTasks, spawnCancel } = await import('./dispatch.js');
     registerTools([spawnTask, listSpawnedTasks, spawnCancel]);

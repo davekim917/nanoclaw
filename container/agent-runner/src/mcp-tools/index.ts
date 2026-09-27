@@ -36,24 +36,15 @@ function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
 
-// MCP server runs in its own child process (spawned by the SDK over stdio),
-// so the config cache populated by the agent-runner entry point isn't here.
-// Tool handlers like backlog/thread-search read agentGroupId via getConfig(),
-// which throws if loadConfig() hasn't been called — populate it before tools
-// can be invoked.
+// This child process doesn't share the runner's config cache, and tool handlers call getConfig(): load it first.
 loadConfig();
 registerProviderSpecificSelfModTools();
 
-// Boot the mailbox, then mount spawn tools bifurcated (orchestrator vs child)
-// and start the server. This process is spawned by the provider over stdio and
-// shares nothing with the runner's process, so it registers and starts the
-// mailbox itself.
+// Spawned by the provider over stdio, sharing nothing with the runner process, so it starts the mailbox itself.
 async function main(): Promise<void> {
   await getAgentMailbox().start(await readMailboxContext());
   await mountSpawnTools();
   await startMcpServer();
-  // No stop(): startMcpServer resolves once the stdio transport is connected,
-  // and the process then serves tool calls for the rest of the turn.
 }
 
 main().catch((err: unknown) => {
