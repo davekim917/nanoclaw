@@ -209,8 +209,7 @@ describe('every container skill shell test suite (*.test.sh)', () => {
       );
 
       // The rest of this test's assertions run with the ambient environment
-      // already contaminated — buildSuiteEnv() spreads `...process.env` first,
-      // so this is what a real CI runner or dev machine would hand it.
+      // already contaminated, as a real CI runner or dev machine could be.
       process.env.XDG_CONFIG_HOME = hostileXdg;
       process.env.GIT_CONFIG_GLOBAL = hostileConfigPath;
       process.env.GIT_CONFIG_SYSTEM = hostileConfigPath;
@@ -240,8 +239,7 @@ describe('every container skill shell test suite (*.test.sh)', () => {
       expect(leakedHooksPath).toBe('/nonexistent/hostile-hooks');
 
       // The suite's real sandbox env must not see it, even though
-      // `process.env` still carries the hostile values at the point
-      // buildSuiteEnv() spreads it.
+      // `process.env` still carries the hostile values when buildSuiteEnv() runs.
       const insteadOf = execFileSync('bash', ['-c', 'git config --get url.https://github.com/.insteadOf; exit 0'], {
         encoding: 'utf-8',
         cwd: probeCwd,
