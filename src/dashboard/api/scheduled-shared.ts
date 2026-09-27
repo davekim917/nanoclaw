@@ -230,8 +230,8 @@ export function decodeKey(key: string): { agentGroupId: string; sessionId: strin
 
 /**
  * The inbound.db path for a locator, only if it resolves to exactly `<dataDir>/v2-sessions/<ag>/<sess>/inbound.db`
- * inside the base; otherwise null. Every board handler opens through here, so a caller that skips the codec guard
- * still cannot escape.
+ * inside the base; otherwise null. Every board handler that opens an inbound DB from a decoded `:key` goes through
+ * here, so a caller that skips the codec guard still cannot escape.
  */
 export function sessionInboundPathFor(dataDir: string, agentGroupId: string, sessionId: string): string | null {
   const base = path.resolve(dataDir, 'v2-sessions');
