@@ -721,8 +721,10 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
  *
  * Gated on the SAME predicate as the `/workspace/workgroup` mount: without the
  * mount the link target is container-local storage that `--rm` destroys.
- * Links only where nothing is there, unlike `ensureCompatSymlink`, which
- * repoints any non-matching symlink and would strand a member's linked content.
+ * Links only where nothing is left once a member's real directory has been
+ * consolidated (see `consolidateMemberWorkDir` for its cross-device loss window),
+ * unlike `ensureCompatSymlink`, which repoints any non-matching symlink and
+ * would strand a member's linked content.
  */
 export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: string; dataDir?: string } = {}): void {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
@@ -749,8 +751,7 @@ function ensureOneWorkgroupWorkDir(
 ): void {
   assertTrustedPathSegment(workgroupId, 'workgroup id');
   const wgDir = workgroupSharedDir(workgroupId, ctx.dataDir);
-  // Same predicate as the mount in container-runner.ts. A link whose target
-  // is not mounted is worse than no link.
+  // Same predicate as the container-runner.ts mount: an unmounted target is worse than no link.
   if (!WORKGROUP_SHARED_FS && !fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
   fs.mkdirSync(path.join(wgDir, SHARED_WORK_DIR_NAME), { recursive: true });
   const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
@@ -767,8 +768,6 @@ function ensureOneWorkgroupWorkDir(
     let st = lstatOrNull(linkPath);
     if (st?.isSymbolicLink() && safeReadlink(linkPath) === ctx.target) continue; // already correct
     if (st?.isDirectory()) {
-      // A member's own real directory is the divergence this exists to end:
-      // consolidate it, then fall through and link.
       consolidateMemberWorkDir(linkPath, path.join(wgDir, SHARED_WORK_DIR_NAME), {
         workgroupId,
         member: member.folder,
@@ -898,7 +897,6 @@ function moveStrategy(a: string, b: string): 'rename' | 'copy' | null {
 
 type PublishCtx = { workgroupId: string; member: string };
 
-/** The member's own name first, then the aside name a collision falls back to. */
 function candidateNames(name: string, ctx: PublishCtx): [string, string] {
   return [name, `${name}.from-${ctx.member}`];
 }
