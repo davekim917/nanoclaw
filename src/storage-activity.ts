@@ -83,7 +83,6 @@ function endPlant(key: string): void {
   else plantsInFlight.delete(key);
 }
 
-/** True when some holder or in-flight plant in this process still needs the directory. */
 function activeDirInUse(key: string): boolean {
   return heldLeases.has(key) || plantsInFlight.has(key);
 }

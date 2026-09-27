@@ -10,7 +10,6 @@ import { log } from './log.js';
 const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 
 let _envProxyDispatcher: Dispatcher | null | undefined;
-/** The OneCLI gateway proxy dispatcher for host calls to external APIs, or null without proxy env. */
 export function getProxyDispatcher(): Dispatcher | null {
   if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
   const hasProxyEnv = !!(
@@ -139,7 +138,6 @@ export async function anthropicCredentialHttpError(response: Response): Promise<
   );
 }
 
-/** One request against one resolved credential; retry/rotation policy lives in {@link callWithCredentialRotation}. */
 async function callHaikuOnce(prompt: string, timeoutMs: number, credential: StructuredCredential): Promise<string> {
   const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
 
@@ -197,7 +195,6 @@ const parkedSlotUntilMs = new Map<ClaudeCredentialSlot, number>();
  */
 const CREDENTIAL_PARK_CEILING_MS = 15 * 60_000;
 
-/** Lazily expires the entry once its window has passed. */
 function isSlotParked(slot: ClaudeCredentialSlot, nowMs: number): boolean {
   const until = parkedSlotUntilMs.get(slot);
   if (until === undefined) return false;
@@ -264,7 +261,6 @@ export function __resetCallHaikuSlotCacheForTest(): void {
   lastGoodCredentialSlotAt = 0;
 }
 
-/** Start from the last-known-good slot (wrapping), else the configured order. */
 function orderCredentialsFromLastGood(credentials: StructuredCredential[], now: number): StructuredCredential[] {
   if (lastGoodCredentialSlot !== null && now - lastGoodCredentialSlotAt >= CREDENTIAL_ROTATION_STICKY_MS) {
     lastGoodCredentialSlot = null;
@@ -517,7 +513,6 @@ async function callWithCredentialRotationAttempt<T>(options: {
   throw lastErr;
 }
 
-/** Rotates across every configured credential slot. */
 export async function callHaiku(prompt: string, timeoutMs = 15_000): Promise<string> {
   const { value } = await callWithCredentialRotation({
     attempt: (credential) => callHaikuOnce(prompt, timeoutMs, credential),

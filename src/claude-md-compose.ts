@@ -24,7 +24,6 @@ import { log } from './log.js';
 import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import type { AgentGroup } from './types.js';
 
-// Placed first, so it tops the composed system prompt.
 const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 
 // Joined against projectRoot (derived from GROUPS_DIR) so tests that mock GROUPS_DIR resolve consistently.
@@ -231,7 +230,6 @@ export async function composeGroupClaudeMd(
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
-      // The task-list tool is registered only while its switch is on.
       if (moduleName === 'task-list' && !TASK_LIST_ENABLED) continue;
       desired.set(`module-${moduleName}.md`, flattenClaudeMd(path.join(mcpToolsHostDir, entry)));
     }
@@ -292,8 +290,6 @@ export async function composeGroupClaudeMd(
   // Flattening is safe: host-controlled.
   const sharedBaseHostPath = path.join(projectRoot, 'container', 'CLAUDE.md');
 
-  // Persona first, then the shared base, then the remaining fragments sorted.
-  //
   // SECURITY: mcp/plugin/persona bodies are emitted VERBATIM, never flattened: their sources are
   // agent-writable, and flattening runs host-side, so an `@~/.env` would exfiltrate host bytes into the mount.
   const sections: string[] = [COMPOSED_HEADER];

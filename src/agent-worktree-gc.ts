@@ -38,7 +38,6 @@ export interface WorktreeRow {
   path: string;
   head: string;
   branch: string | null;
-  /** Registered but gone: a prunable registration. */
   missing: boolean;
   locked: boolean;
 }
@@ -194,7 +193,6 @@ export function assess(
     openPrBranches?: ReadonlySet<string>;
     /** GitHub unreachable: refuse branch-carrying worktrees, and say why. */
     prStateUnknown?: boolean;
-    /** Git's primary worktree, i.e. the first `worktree list` entry. */
     mainWorktreePath?: string;
   } = {},
 ): Assessment {
@@ -309,11 +307,9 @@ function listWorktrees(repoRoot: string): WorktreeRow[] | null {
 export interface GcReport {
   mainWorktreePath: string;
   assessments: Assessment[];
-  /** Worktrees whose directory is gone; their registrations are prunable. */
   orphanedRegistrations: string[];
 }
 
-/** Classify every registered worktree; reports and never deletes. */
 export function runAgentWorktreeGcOnce(
   repoRoot: string,
   opts: { mainRef?: string; procRoot?: string } = {},

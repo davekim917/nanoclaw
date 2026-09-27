@@ -470,7 +470,6 @@ export function typesafeKeyPlaceholderEnv(provider: string, grantedSecrets: stri
   return ['-e', 'TYPESAFE_API_KEY=onecli-gateway-injected'];
 }
 
-/** Test seam: seed the secrets cache without touching the gateway. */
 export function __setSecretsCacheForTest(secrets: OnecliSecret[]): void {
   secretsCache = { at: Date.now(), secrets };
 }

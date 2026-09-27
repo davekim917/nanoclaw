@@ -24,7 +24,6 @@ export interface ClaudeAgent {
   effort?: string;
 }
 
-/** Frontmatter block and body, or null when there is no frontmatter block. */
 function splitClaudeAgentMd(content: string): { frontmatter: string; body: string } | null {
   const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   if (!normalized.startsWith('---\n')) return null;

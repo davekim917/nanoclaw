@@ -45,7 +45,6 @@ const SEVERITY_LABEL: Record<Severity, string> = {
 };
 /** Index is the Linear priority value. */
 const PRIORITY_TO_SEVERITY: Severity[] = ['unset', 'p0', 'p1', 'p2', 'p3'];
-/** Rows with no `repo:` label; worded as the fix. */
 const NO_REPO = 'Unattributed — add a `repo:` label to file these';
 
 let timer: NodeJS.Timeout | null = null;
@@ -336,7 +335,6 @@ export function renderBoard(issues: BoardIssue[]): string {
     else byRepo.set(repo, [issue]);
   }
 
-  // Alphabetical for stability; the catch-all bucket last.
   const repos = [...byRepo.keys()].sort((a, b) => {
     if (a === NO_REPO) return 1;
     if (b === NO_REPO) return -1;

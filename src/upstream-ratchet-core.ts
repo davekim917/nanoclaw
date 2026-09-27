@@ -304,7 +304,6 @@ export function buildManifest(input: BuildInput): UpstreamRatchetManifest {
     const forkMode = input.modeOf(relPath);
 
     if (forkMode === null) {
-      // Deleted in the fork: upstream's line count and mode.
       const entry: UpstreamRatchetEntry = {
         diff: stat === undefined ? 0 : (stat.lines ?? 1),
         mode: upstreamMode,
@@ -345,7 +344,6 @@ export interface Row {
   after: number;
   deletedBefore: boolean;
   deletedAfter: boolean;
-  /** Why a flat-diff entry is still blocking, when it is. */
   reason: string | null;
 }
 

@@ -117,7 +117,6 @@ export function resolveModelAlias(raw: string): string {
  * ships. Keyed on both family alias and concrete id so `-m haiku` and `-m claude-haiku-4-5` validate alike.
  */
 const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
-  // Haiku: no effort control.
   haiku: new Set(),
   'claude-haiku-4-5': new Set(),
   // Keyed explicitly: a lookup miss means "do not clamp", the opposite of Haiku's empty set.
@@ -159,10 +158,8 @@ const CODEX_VALID_MODEL_RE = /^gpt-[a-z0-9][a-z0-9.-]*$/;
 export interface ProviderFlagVocab {
   resolveModel(raw: string): string;
   isValidModel(resolved: string): boolean;
-  /** Appended to the unknown-model error so the user learns the right shape. */
   modelHint: string;
   validEfforts: ReadonlySet<string>;
-  /** The `(expected …)` list in the unknown-effort error. */
   effortHint: string;
   allowsUltracode: boolean;
   allowsFast: boolean;
@@ -170,7 +167,6 @@ export interface ProviderFlagVocab {
 }
 
 const CLAUDE_VOCAB: ProviderFlagVocab = {
-  // Family names stored lowercase; everything else through the alias map.
   resolveModel: (raw) => {
     const key = raw.toLowerCase();
     return Object.hasOwn(FAMILY_DEFAULTS, key) ? key : resolveModelAlias(raw);
@@ -266,7 +262,6 @@ const MENTION_PREFIX_RE = /^\s*(?:<@!?[^>]+>|@[\w.-]+)\s*/;
 const SWITCH_COMMAND_RE = /^\s*\/switch(?:\s+|$)/i;
 const FLAG_TOKEN_RE = /^\s*(-[mef]1?)\s+("([^"]*)"|'([^']*)'|(\S*))\s*/;
 
-/** Parse mention + flags from the front of the text; `provider` selects the vocabulary. Always returns a result. */
 export function parseMessageFlags(rawText: string, provider: string = 'claude'): FlagParseResult {
   const vocab = vocabFor(provider);
   let cursor = rawText.replace(MENTION_PREFIX_RE, '').replace(SWITCH_COMMAND_RE, '');

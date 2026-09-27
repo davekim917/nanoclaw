@@ -45,7 +45,6 @@ export interface DepsDriftCheck {
 /** Clears a BuildKit export window while an unlabeled image still fails well inside one sweep cycle. */
 export const LABEL_RETRY_DELAY_MS = 2_000;
 
-/** Raw `docker inspect` stdout producer — the one seam tests replace. */
 type InspectRunner = (imageRef: string) => Promise<string>;
 
 export interface DriftCheckOptions {
@@ -74,7 +73,6 @@ interface CachedDriftCheck {
  */
 export const DEPS_DRIFT_CACHE_TTL_MS = 60_000;
 
-/** Passing results only, for the process lifetime. */
 const okResultCache = new Map<string, CachedDriftCheck>();
 
 async function currentDepsFileFingerprint(): Promise<DepsFileFingerprint> {

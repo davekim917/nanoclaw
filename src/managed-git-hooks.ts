@@ -52,7 +52,6 @@ function readSourceOrThrow(file: string): Buffer {
   return fs.readFileSync(file);
 }
 
-/** Temp file in the same dir, fsync, rename, fsync the dir. */
 function atomicWriteInDir(dir: string, filename: string, content: Buffer, mode: number): void {
   const dest = path.join(dir, filename);
   const temp = path.join(dir, `${filename}.tmp-${process.pid}-${Date.now()}`);
