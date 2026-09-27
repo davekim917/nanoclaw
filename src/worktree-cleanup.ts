@@ -678,7 +678,8 @@ function provenDisposable(
 
   // Host git runs in a repository a container may have configured: signature programs are off and every filter
   // is neutralized by name. An embedded repository is refused before `status` could recurse into it; one whose
-  // config or index cannot be read is unprovable.
+  // config or index cannot be read is unprovable. `--ignore-submodules=all` still matters: a submodule added between
+  // the two commands would carry filters outside the overrides.
   const filters = repositoryFilterNames(dir, env);
   if (filters === null) return { ok: false, reason: 'status-unprovable' };
   const modes = git(dir, ['ls-files', '-z', '--format=%(objectmode)'], env, filters);
@@ -1347,7 +1348,7 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
   }
 }
 
-/** null on either side is never "later". */
+/** A missing `b` is never later; a real `b` after a missing `a` is. */
 function laterThan(a: number | null, b: number | null): boolean {
   if (b === null) return false;
   if (a === null) return true;
@@ -1576,8 +1577,9 @@ function removeMissingWorktreeRegistration(
     const adminStat = fs.fstatSync(adminFd);
     if (!lockStat.isFile() || !adminStat.isDirectory()) throw new Error('repository cleanup lock state is invalid');
 
-    // `flock` on the same inode container create_worktree uses; fds 3 and 4 pin the lock/admin identities so a
-    // recreated worktree cannot be swapped in between this re-proof and the removal.
+    // `flock` on the same inode container create_worktree uses; fds 3 and 4 pin the lock/admin identities, so a
+    // cooperating writer cannot swap in a recreated worktree between this re-proof and the removal (an uncooperative
+    // process is not excluded).
     const script = [
       'set -eu',
       'lock_path=$1',

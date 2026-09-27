@@ -458,8 +458,9 @@ async function withCredentialRotationGate<T>(logLabel: string, fn: () => Promise
 /**
  * The ONE credential-rotation policy for host Anthropic callers: `attempt` runs one request against one
  * credential, serialized by {@link withCredentialRotationGate}.
- *  - `retry-after` above {@link CREDENTIAL_PARK_THRESHOLD_MS}: the slot is parked for this and later calls; if
- *    every slot is parked, throws {@link AllCredentialSlotsParkedError} without sleeping.
+ *  - `retry-after` above {@link CREDENTIAL_PARK_THRESHOLD_MS}: the slot is parked for this and later calls. Only
+ *    when every slot is already parked at the start does it throw {@link AllCredentialSlotsParkedError} (no sleep);
+ *    slots parked during the call end in the last request error.
  *  - transient: retry the SAME slot (default one attempt; backoff honors `retry-after`, else capped exponential
  *    with jitter, never over the cap).
  *  - quota-exhausted: next slot, no sleep. fatal: throw at once.

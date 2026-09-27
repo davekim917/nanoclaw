@@ -11,7 +11,8 @@
  *
  * A role's effort BEATS the spawn call's `reasoning_effort` (a shim named for a level must run at it) and is
  * validated against the child model, so `worker-max` spawned onto a model without `max` fails the spawn instead of
- * silently downgrading.
+ * silently downgrading. Validation is skipped when the role changes neither model nor effort, or the model
+ * metadata is a fallback.
  */
 
 const MANAGED_MARKER = '# managed by nanoclaw codex-sync';
