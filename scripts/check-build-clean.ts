@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const IGNORABLE_DIRT_PREFIXES = ['docs/'];
 
-/** Root-level markdown is documentation by convention; nested markdown still blocks. */
+/** Exempt: everything under docs/, plus root-level README* and *.md; nested markdown elsewhere still blocks. */
 export function isIgnorableDirtPath(filePath: string): boolean {
   if (IGNORABLE_DIRT_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return true;
   if (!filePath.includes('/')) {

@@ -132,7 +132,10 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
   return result;
 }
 
-/** src/log.ts colors the level tag with ANSI; the stamp carries a UTC offset, so never assume a zone. */
+/**
+ * src/log.ts colors the level tag with ANSI; never assume a zone. A legacy line without a UTC offset
+ * still counts, parsed in this process's zone, so its window membership is best-effort.
+ */
 // eslint-disable-next-line no-control-regex -- deliberately matches the ANSI CSI escape byte to strip src/log.ts's color codes
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const ERROR_LINE_RE =
@@ -501,7 +504,10 @@ const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => 
   '/app/src/mcp-tools': path.join(repoRoot, 'container', 'agent-runner', 'src', 'mcp-tools'),
 });
 
-/** Absent or `'default'` means claude. An unsafe or malformed container.json returns `skip`, never a guess. */
+/**
+ * Absent or `'default'` means claude. An unsafe or malformed container.json returns `skip`, never a guess.
+ * Group config only: a session-level provider override applied at spawn is outside this scan.
+ */
 function readGroupProvider(groupDir: string, groupsRootResolved: string): { provider: string } | { skip: string } {
   const p = path.join(groupDir, 'container.json');
   const resolved = resolveStandingFile(p, groupsRootResolved);
