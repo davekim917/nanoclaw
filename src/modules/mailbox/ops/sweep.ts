@@ -1,8 +1,3 @@
-/**
- * Sweep-side reads and status transitions: due counting, staleness, retries,
- * processing-ack reconciliation and the tiered container-state read.
- * Internal to `src/modules/mailbox/`.
- */
 import type Database from 'better-sqlite3';
 
 import { getProcessingClaims } from '../../../mailbox/sqlite/session-db.js';
@@ -15,9 +10,8 @@ export {
 } from '../../../mailbox/sqlite/session-db.js';
 
 /**
- * Earliest FUTURE process_after among pending rows, or null. Used by the host
- * sweep's quiet-session cache: a session with nothing due may be skipped only
- * until its next scheduled row becomes due — never past it.
+ * Earliest FUTURE process_after among pending rows, or null: a quiet session
+ * may be skipped only until then, never past it.
  */
 export function getNextFutureProcessAfter(db: Database.Database): string | null {
   migrateMessagesInTable(db);
@@ -49,30 +43,18 @@ export function countDueMessages(db: Database.Database): number {
 }
 
 /**
- * A due non-task row older than this no longer forces an interactive wake.
- * Nobody is sitting on the other end of a 15-minute-old message the way they
- * are for one sent seconds ago — rows past this age are backlog (channel
- * recovery after a restart, stale-reset retries) and must not let a stampede
- * of old chat rows starve a live thread out of the memory-budget queue.
- * Demotion is decided per wake attempt from row age; an entry already queued
- * as interactive is never demoted (admission promotes only, see
- * MemoryAdmissionController.request), so a fresh message that then waits in
- * a full queue keeps its class.
+ * A due non-task row older than this no longer forces an interactive wake:
+ * backlog must not let a stampede of old chat rows starve a live thread out of
+ * the memory-budget queue. An entry already queued as interactive is never
+ * demoted (admission only promotes).
  */
 const INTERACTIVE_WAKE_MAX_AGE_MS = 15 * 60 * 1000;
 
 /**
- * Priority for a session wake based on the work that is due right now.
- * A wake is interactive only when some due triggering row is BOTH non-task
- * (chat, system notification, approval, agent message) AND recent — see
- * INTERACTIVE_WAKE_MAX_AGE_MS. Scheduled-task rows and aged backlog rows
- * classify as scheduled. No due rows defaults to interactive, which is the
- * fail-safe classification for callers racing with another writer.
- * Age is measured from INSERTION (`timestamp`), deliberately not from
- * `process_after`: stale-reset backoff stamps a fresh fire time on every
- * retry, which would keep months-old backlog permanently "fresh". Insertion
- * time is when the human-visible event actually happened, which is the only
- * thing interactive priority is about.
+ * Interactive only when some due triggering row is non-task AND recent; no due
+ * rows defaults to interactive (fail-safe under a racing writer). Age is from
+ * INSERTION (`timestamp`), not `process_after`: backoff re-stamps process_after
+ * on every retry and would keep old backlog "fresh" forever.
  */
 export function getDueWakePriority(db: Database.Database): 'interactive' | 'scheduled' {
   migrateMessagesInTable(db);
@@ -94,23 +76,11 @@ export function getDueWakePriority(db: Database.Database): 'interactive' | 'sche
 }
 
 /**
- * Mark long-pending NON-RECURRING rows as 'expired' so sweep stops re-waking
- * sessions on one-shot messages that have sat unprocessed for a day or more.
- * Unscheduled rows age from insertion; scheduled rows age from their fire
- * time, so a valid multi-day wait is not expired at the moment it becomes due.
- *
- * Recurring tasks (recurrence IS NOT NULL) are NEVER expired here. A recurring
- * row is inserted ~24h before its next daily fire, so it crosses the staleness
- * cutoff the moment it comes due — reaping it would silently lose that fire and
- * (since handleRecurrence only resumes completed/failed/expired rows) used to
- * strand the whole series. They instead stay 'pending' and are re-fired by the
- * sweep (caught up if a fire was missed), then advanced to their next slot by
- * handleRecurrence on completion. A missed recurring fire must resume the
- * schedule, never get reaped. (The earlier `process_after >= now` framing only
- * protected FUTURE-dated rows and let due recurring rows be reaped — that
- * stranded wiki-synth across all memory-enabled agents on 2026-05-10.)
- *
- * Returns the number of rows expired this call.
+ * Expire long-pending NON-RECURRING rows. Unscheduled rows age from
+ * insertion, scheduled rows from their fire time (so a valid multi-day wait
+ * isn't expired as it comes due). Recurring rows are NEVER expired here: they
+ * cross the cutoff the moment they come due, and reaping one loses the fire and
+ * can strand the series. Returns the number expired.
  */
 export function expireStalePending(db: Database.Database, maxAgeMs: number): number {
   migrateMessagesInTable(db);
@@ -132,42 +102,13 @@ export function expireStalePending(db: Database.Database, maxAgeMs: number): num
 }
 
 /**
- * Mark every row that still pins a TERMINALLY CLOSED session as 'expired'.
- *
- * `closed` is terminal for a session row: the only transition back to 'active'
- * is from 'archiving' (`releaseArchivingRow`), never from 'closed', and
- * `findSessionForAgent` matches active rows only — the next inbound for the
- * same thread creates a FRESH session. So nothing left in a closed session's
- * inbound can ever be consumed.
- *
- * The status set is exactly the one `sessionHasOpenWork` (src/storage-manager.ts)
- * counts, `('processing', 'pending')`, because that predicate is what these
- * rows pin: while any of them survives, reclaim refuses to archive the
- * directory and the session dir is stranded forever.
- *
- * Unlike `expireStalePending` above this takes NO age cutoff and applies NO
- * recurrence or fence guard, and each omission is deliberate:
- *
- *  - Age is the wrong discriminator. The question is not "has this waited long
- *    enough" but "can this ever run", and for a closed session the answer is
- *    no at any age.
- *  - The recurrence guard exists because reaping a DUE recurring row skips a
- *    fire and used to strand the whole series (wiki-synth, 2026-05-10). What
- *    makes that guard work is `handleRecurrence` re-firing the row on a later
- *    sweep — and that is duty S18 inside the per-session loop, which iterates
- *    ACTIVE sessions only. In a closed session the guard protects nothing: the
- *    series cannot fire and cannot be advanced, so keeping the row 'pending'
- *    preserves no schedule, it only pins the directory. A live series also
- *    cannot reach the close in the first place — `countLiveTasks` counts
- *    pending/paused task rows and S19 refuses to close while it is non-zero —
- *    so a recurring row here is already an anomaly, not a working schedule.
- *  - A `repo_fence_epoch` row waits for an ingress fence release that only a
- *    running container in this session can produce; there will not be one.
- *  - `processing` is included for the same reason: the claiming container is
- *    gone, and the duties that clear orphaned claims (S4, S17) also only ever
- *    see active sessions, so nothing will ever ack it.
- *
- * Returns the number of rows expired this call.
+ * Expire every row still pinning a TERMINALLY CLOSED session: `closed` never
+ * returns to active and new inbound creates a fresh session, so nothing here
+ * can run, and while `('processing', 'pending')` rows survive
+ * (`sessionHasOpenWork`) reclaim refuses the directory forever. No age cutoff,
+ * recurrence or fence guard: each exists only for something an active session
+ * can still do (re-fire, fence release, claim clearing), and none happens in a
+ * closed one. Returns the number expired.
  */
 export function expireClosedSessionPending(db: Database.Database): number {
   migrateMessagesInTable(db);
@@ -176,20 +117,10 @@ export function expireClosedSessionPending(db: Database.Database): number {
 }
 
 /**
- * Fused read-outbound/write-inbound reconciliation. Upstream splits this into
- * `getTerminalProcessingAcks()` + `applyProcessingAcks()`; the fork keeps it
- * fused because both handles are already in scope inside a mailbox session and
- * the host sweep's control flow is written around one call.
- *
- * This is the one place the runner's notion of "handled" is mapped onto
- * `messages_in.status`, which is what every host reader of due-ness keys on
- * (`countDueMessages`, `getDueWakePriority`, recurrence fan-out). The runner
- * has TWO ways of treating a row as handled, and both are reconciled here:
- * a terminal `processing_ack`, and an answer in `messages_out`
- * (`completeAnsweredPendingRows` below).
- *
- * Returns the ids completed because they were already answered, so the caller
- * can log them; terminal-ack syncs are the normal path and stay silent.
+ * Fused (upstream splits it): maps the runner's two notions of "handled", a
+ * terminal `processing_ack` and an answer in `messages_out`, onto
+ * `messages_in.status`, which every host due-ness reader keys on. Returns ids
+ * completed because they were already answered.
  */
 export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): string[] {
   const completed = outDb
@@ -199,9 +130,8 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
     .all() as Array<{ message_id: string; status: string }>;
 
   if (completed.length > 0) {
-    // `script-skip:error` (pre-task script crashed) lands as a FAILED run —
-    // semantically true, and it lets recurrence derive the trailing failed
-    // streak from the occurrence rows themselves (no stored counter).
+    // `script-skip:error` lands as FAILED, so recurrence derives the failure
+    // streak from the rows themselves.
     const completeStmt = inDb.prepare(
       "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
     );
@@ -221,33 +151,11 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
 }
 
 /**
- * Close every pending `recall-<X>` row whose target `<X>` is already terminal:
- * `completed`, `failed`, `expired`, or `cancelled` (an admitted task cancelled
- * before the runner claimed it keeps its recall, `cancelTask` in
- * src/mailbox/sqlite/tasks.ts; nothing revives a cancelled row).
- *
- * Admission writes the recall row beside its turn (`admitDueRow`) and a normal turn claims and
- * acks both. A turn that ends without claiming its recall leaves it pending: a
- * script-gated or script-errored task fire, where the runner acks only the task
- * (`completed` or `script-skip:error`) and defers the
- * unclaimed rest, or a /clear
- * completed inline. The runner's selection already treats such a row as dead,
- * nothing re-pairs it once its target is terminal (admission needs the target pending,
- * `DUE_PREDICATE`), and `expireStalePending` above expires
- * it 24 hours later anyway. This expires it on the same tick instead, so a
- * watcher on a 5-minute cadence stops carrying a day of dead recall payloads
- * through every poll's candidate windows.
- *
- * A row counts as a recall only by the runner's own test — `kind = 'system'`,
- * the `recall-` id prefix AND `subtype: 'recall_context'` content
- * (`recallTargetId` in the runner's mailbox selection),
- * which both writers stamp (the session manager for the admitted recall;
- * ingress for the deferred marker). A system row
- * that merely shares the prefix is not ours to expire.
- *
- * `expired` is exactly the state `expireStalePending` would give it. The query
- * also matches orphans left before this ran, so the first tick after deploy
- * clears each visited session's backlog. Idempotent.
+ * Expire pending `recall-<X>` rows whose target is already terminal (e.g. a
+ * script-gated fire acks only the task). Nothing re-pairs them, and
+ * `expireStalePending` would only get to them a day later. A row counts as a
+ * recall only by the runner's own test (`kind = 'system'`, `recall-` prefix AND
+ * `subtype: 'recall_context'`). Idempotent.
  */
 export function closeOrphanRecallRows(inDb: Database.Database): number {
   return inDb
@@ -269,45 +177,8 @@ export function closeOrphanRecallRows(inDb: Database.Database): number {
 }
 
 /**
- * Complete due wake rows the runner will never select again because they are
- * already answered.
- *
- * The runner drops a pending row from selection when `messages_out` holds a
- * non-status row with `in_reply_to` = its id, written at/after the row's
- * `process_after` (any time, for a row without one) — `isResponded` in the
- * runner's mailbox selection. `in_reply_to` is stamped from the CLAIMED batch
- * by the runner's poll loop, so such a row was claimed
- * once. Normally the claim turns terminal and the sync above completes the
- * row. It does not when the turn ends without `markCompleted` — a batch
- * deferred to the fallback provider keeps its 'processing' claim
- * — and the next container's startup then deletes
- * every 'processing' claim (`clearStaleProcessingAcks`). What is
- * left is a row with no ack at all that the runner treats as handled and the
- * host still counts as due: the wake duty sees due work behind a running
- * container, the idle-task reap sees due work and declines, and a recurring
- * row is exempt from `expireStalePending`, so its series never re-arms
- * (observed live 2026-09-15: one series silent for 57 hours across two containers).
- *
- * The predicate is a strict mirror of the runner's, so this can only complete
- * a row the runner would never run — including on malformed data: the runner's
- * `ts >= parseDbUtc(process_after)` is false when either side is NaN, so the
- * row stays selectable there, and `answeredSinceDue` below is the same POSITIVE
- * comparison rather than its negation. Completing here means "answered, will
- * not be resumed", never "ran successfully". It is no grace period's business: the
- * answer's timestamp and the row's `process_after` are both already written,
- * and only the host moves `process_after` (synchronously, not under this
- * call). A row carrying ANY ack is left alone — a live claim belongs to the
- * container, a terminal one to the sync above, an orphan 'processing' one to
- * `resetStuckProcessingRows` in sweep-session-core.
- *
- * Writes inbound only. The due filter is `countDueMessages`' own, so the rows
- * considered are exactly the rows that hold a session "due".
- */
-/**
- * The runner's own timestamp reading, statement for statement (`parseDbUtc` in
- * the runner's mailbox selection) — the two
- * package trees cannot share a module, and a looser or stricter parse here is
- * exactly how the host and the runner would come to disagree again.
+ * The runner's `parseDbUtc`, statement for statement: the package trees can't
+ * share it, and any difference is how host and runner would disagree.
  */
 function parseRunnerUtc(value: string): number {
   let s = value.includes('T') ? value : value.replace(' ', 'T');
@@ -321,9 +192,16 @@ function answeredSinceDue(answeredAt: string, processAfter: string | null): bool
   return parseRunnerUtc(answeredAt) >= parseRunnerUtc(processAfter);
 }
 
-/** Ids per grouped `messages_out` read in `completeAnsweredPendingRows`. */
 export const ANSWERED_LOOKUP_CHUNK = 500;
 
+/**
+ * Complete due rows with no ack that the runner treats as answered (a non-status
+ * reply at/after `process_after`) and will never select again, e.g. a claim
+ * deleted at the next container's startup. Otherwise the host counts them due
+ * forever and a recurring series never re-arms. The predicate strictly mirrors
+ * the runner's (positive comparison, so NaN keeps a row selectable). "Answered,
+ * not resumed", never "ran successfully". Rows with any ack are left alone.
+ */
 export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Database.Database): string[] {
   migrateMessagesInTable(inDb);
   const due = inDb
@@ -337,12 +215,8 @@ export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Data
     .all() as Array<{ id: string; processAfter: string | null }>;
   if (due.length === 0) return [];
 
-  // ONE grouped read per chunk, never one per due row: `messages_out.in_reply_to`
-  // is unindexed, so each lookup is a scan of the session's whole outbound
-  // history, and a backlog of due rows would multiply that inside the sweep's
-  // synchronous turn. Same statement shape as the runner's own read in its
-  // mailbox selection. Chunked under SQLite's bound-variable limit (999 on
-  // older builds).
+  // ONE grouped read per chunk, never per row: `in_reply_to` is unindexed.
+  // Chunked under SQLite's bound-variable limit.
   const answeredAt = new Map<string, string>();
   for (let start = 0; start < due.length; start += ANSWERED_LOOKUP_CHUNK) {
     const ids = due.slice(start, start + ANSWERED_LOOKUP_CHUNK).map((row) => row.id);
@@ -379,28 +253,15 @@ interface OverdueRecurringRow {
 
 export interface OverdueRecurringRows {
   rows: OverdueRecurringRow[];
-  /**
-   * True when some other message in this session holds a 'processing' claim:
-   * the rows above are waiting behind that turn rather than unclaimed with
-   * nothing running.
-   */
+  /** Some other message holds a 'processing' claim: these rows are queued behind that turn. */
   queuedBehindActiveWork: boolean;
 }
 
 /**
- * Recurring occurrences that have been DUE and wake-eligible since before
- * `cutoffIso` and that no container has acknowledged.
- *
- * The due filter is `countDueMessages`' own, narrowed to recurring rows that
- * carry a `process_after`: these are the rows that hold a session "due" and
- * that `expireStalePending` never reaps, so nothing else ever ends their wait.
- *
- * A row with an ack of its own (any status) is somebody's and is left out —
- * see `hasProcessingAck`. A claim on a DIFFERENT row does not hide this one: a
- * turn that never ends starves every row queued behind it, and that is exactly
- * the stuck schedule this read exists to surface. `queuedBehindActiveWork`
- * reports that case so the alert can say so. `outDb` is null for a session
- * that has never run a container: nothing can have claimed.
+ * Recurring occurrences DUE since before `cutoffIso` with no ack of their own
+ * (`expireStalePending` never reaps them). A claim on a DIFFERENT row does not
+ * hide them: a turn that never ends starves the queue, which is what this
+ * surfaces. `outDb` is null when no container ever ran.
  */
 export function listOverdueRecurringRows(
   inDb: Database.Database,
@@ -442,21 +303,15 @@ interface WithheldHostGatedRow {
 }
 
 export interface StuckGateResults {
-  /** Container gate rows written before the cutoff that delivery has not recorded. */
   undeliveredGateRows: UndeliveredGateRow[];
-  /** Host-gated occurrences due before the cutoff, still unadmitted and without a host result. */
   withheldHostGatedRows: WithheldHostGatedRow[];
 }
 
 /**
- * Gate-lane results that have not reached the ledger since before `cutoffIso`.
- *
- * Delivery retries an unrecorded gate row in place and never gives it up, so
- * every later row of the session waits behind it; S5 withholds a host-gated
- * occurrence whose result could not be recorded, so it neither runs nor
- * completes. Both are correct and both are silent, which is why they are read
- * here. A recorded host wake carries `scriptOutput` (JSON null included) and is
- * not withheld.
+ * Delivery retries an unrecorded gate row forever (blocking later rows), and S5
+ * withholds a host-gated occurrence whose result couldn't be recorded: both
+ * correct and both silent, hence this read. A recorded host wake carries
+ * `scriptOutput` (JSON null included).
  */
 export function listStuckGateResults(
   inDb: Database.Database,
@@ -484,10 +339,7 @@ export function listStuckGateResults(
   };
 }
 
-/**
- * Container gate rows delivery has not recorded, written before `cutoffIso`
- * (any age when null).
- */
+/** `cutoffIso` null means any age. */
 function undeliveredGateRows(
   inDb: Database.Database,
   outDb: Database.Database,
@@ -519,29 +371,15 @@ function undeliveredGateRows(
     });
 }
 
-/**
- * Does this session hold a container gate row delivery has not recorded yet?
- * Delivery visits active sessions only, so closing one that does would lose
- * the result for good.
- */
+/** Delivery visits active sessions only, so closing a session holding one would lose the result. */
 export function hasUnrecordedGateRows(inDb: Database.Database, outDb: Database.Database | null): boolean {
   return outDb !== null && undeliveredGateRows(inDb, outDb, null).length > 0;
 }
 
 /**
- * Has a container acknowledged this inbound message at all?
- *
- * ANY row, in ANY status — deliberately not just `'processing'`. The question
- * is whether a container ever reached the message, and a claim it has since
- * finished is still a claim: by the time the host asks, the row may already
- * read `completed`, `failed` or `script-skip:error`.
- *
- * This is the only durable record of consumption the host can see promptly.
- * `messages_in.status` is NOT: the container claims by writing here, in
- * `outbound.db`, and the inbound row stays `pending` until a later sweep tick
- * runs `syncProcessingAcks`. Anything that reads inbound `status` to decide
- * whether a message was consumed has a window, one sweep interval wide, in
- * which a claimed message looks untouched.
+ * ANY ack in ANY status: a finished claim is still a claim. `messages_in.status`
+ * is not a consumption record: it stays `pending` for up to one sweep interval
+ * after the container claims.
  */
 export function hasProcessingAck(outDb: Database.Database, messageId: string): boolean {
   return outDb.prepare('SELECT 1 FROM processing_ack WHERE message_id = ? LIMIT 1').get(messageId) !== undefined;
@@ -563,31 +401,20 @@ export interface ContainerState {
   memory_max_bytes?: number | null;
   memory_oom_events?: number | null;
   memory_oom_kill_events?: number | null;
-  /** memory.events:max — ceiling hits that forced reclaim (pre-kill signal). */
+  /** Ceiling hits that forced reclaim (pre-kill signal). */
   memory_max_events?: number | null;
   memory_telemetry_at?: string | null;
   /**
-   * When the container's CURRENT query first produced a provider event; null
-   * until it has, and between queries. Written by the runner
-   * (container/agent-runner/src/modules/mailbox/container-state.ts,
-   * `markProviderQueryEvent`); undefined on an outbound.db an older runner
-   * created, which the claim rule reads as "no forgiveness".
+   * When the CURRENT query first produced a provider event; null until then.
+   * Undefined on an older runner's DB, which the claim rule reads as "no forgiveness".
    */
   provider_query_event_at?: string | null;
 }
 
-/**
- * Read the container's current tool-in-flight state, if any. Returns null
- * when either the table doesn't exist yet (older session DB) or no tool is
- * active. Host sweep reads this to widen stuck-detection tolerance while a
- * declared Bash operation or a bounded native Codex item is in flight.
- */
+/** Null when the table doesn't exist yet or no tool is active. */
 export function getContainerState(outDb: Database.Database): ContainerState | null {
-  // Widest column set first, narrowing on each failure. Session DBs are
-  // migrated forward by the CONTAINER (connection.ts forwardColumns), so a
-  // session whose container has not respawned since a column was added still
-  // has the older shape — dropping straight to the tool-only tier would
-  // silently take resource telemetry away from every such session.
+  // Widest column set first: the CONTAINER migrates columns forward, so a DB
+  // whose container hasn't respawned has the older shape.
   for (const columns of CONTAINER_STATE_COLUMN_TIERS) {
     try {
       const row = outDb.prepare(`SELECT ${columns} FROM container_state WHERE id = 1`).get() as
@@ -608,17 +435,11 @@ const CONTAINER_STATE_PROVIDER_COLUMNS =
 const CONTAINER_STATE_MEMORY_COLUMNS =
   `${CONTAINER_STATE_PROVIDER_COLUMNS}, memory_current_bytes, memory_peak_bytes, memory_max_bytes, ` +
   'memory_oom_events, memory_oom_kill_events, memory_telemetry_at';
-// `provider_executing` is the one fork column the HOST adds itself
-// (schema.ts's ensureSchema), because the reap decision needs it; every other
-// fork column arrives when the container first boots and runs its own
-// ensureNanoclawOutboundSchema. Without this tier a session DB the host
-// prepared but no container has booted yet drops straight to the tool-only
-// tier and the column the host just added reads back as undefined.
+// `provider_executing` is the one fork column the HOST adds (the reap needs it),
+// so a DB no container has booted yet still has it.
 const CONTAINER_STATE_EXECUTING_COLUMNS = `${CONTAINER_STATE_TOOL_COLUMNS}, provider_executing`;
 const CONTAINER_STATE_COLUMN_TIERS = [
-  // Newest first. A DB whose container has not yet run a runner that adds
-  // provider_query_event_at fails this SELECT with "no such column" and reads
-  // the tier below, exactly as it did before the column existed.
+  // Newest first; a missing column fails over to the tier below.
   `${CONTAINER_STATE_MEMORY_COLUMNS}, memory_max_events, provider_query_event_at`,
   `${CONTAINER_STATE_MEMORY_COLUMNS}, memory_max_events`,
   CONTAINER_STATE_MEMORY_COLUMNS,

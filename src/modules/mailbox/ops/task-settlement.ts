@@ -14,7 +14,7 @@ export interface TaskSettlement {
   futureInputs?: number;
 }
 
-/** Exact automatic single-event outcome. Legacy and batched outcomes cannot settle one event. */
+/** Exact automatic single-event outcome only; legacy and batched outcomes cannot settle one event. */
 function readTaskOutcome(outbound: Database.Database, eventId: string): 'success' | 'error' | null {
   const rows = outbound
     .prepare("SELECT content FROM messages_out WHERE kind = 'task_log' AND in_reply_to = ? ORDER BY seq DESC")
@@ -39,13 +39,9 @@ function readTaskOutcome(outbound: Database.Database, eventId: string): 'success
 }
 
 /**
- * Host-owned facts only: no prompt, transcript, or artifact interpretation.
- *
- * `futureInputs` is for an observer whose later follow-ups are separate
- * episodes (a watcher's deadline wake for one PR is not the observation that
- * armed it): pending inputs not yet due are counted and reported, not treated
- * as outstanding execution. Due, processing and paused inputs, claims,
- * provider execution, continuation and undelivered actions still block.
+ * Host-owned facts only. With `futureInputs`, pending not-yet-due inputs are
+ * counted, not treated as outstanding (a watcher's later wake is a separate
+ * episode); everything else outstanding still blocks.
  */
 export function readTaskSettlement(
   inbound: Database.Database,
@@ -95,11 +91,9 @@ export function readTaskSettlement(
       state.provider_executing === 1,
       readContinuationPresence(outbound) !== null,
     );
-    // A completed fire row never keeps its recurrence: re-arming inserts the next
-    // occurrence and clears the original's recurrence in one transaction
-    // (`armNextTask` in ops/tasks.ts). So the
-    // observer's own series is identified by id and task thread, and only a
-    // recurring, inert, future row of that series is exempt.
+    // Re-arming clears the completed fire's recurrence in the same transaction,
+    // so the observer's series is identified by id and task thread; only its
+    // recurring, inert, future row is exempt.
     const observerSeries = observer && row.series_id && threadId === taskThreadId(row.series_id) ? row.series_id : null;
     const obligations = (
       inbound

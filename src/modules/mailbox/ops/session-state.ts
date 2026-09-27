@@ -1,29 +1,13 @@
 /**
- * Reads and writes against the container-owned `session_state` table in
- * outbound.db, for the keys the continuation record does not own.
- *
- * Internal to `src/modules/mailbox/`. Two records live here, both written by
- * the container and read by the host: the raw presence of a work continuation
- * (and its force-clear, from `src/dashboard/thread-close.ts`) and the done
- * proposal (`propose_done`, same file). The statements moved here so that the
- * host files that need them stop taking an outbound handle.
- *
- * The continuation record itself — `HostWorkContinuation`, its size cap and
- * its validating parser — lives in `ops/continuation.ts` and is NOT duplicated
- * here (invariant I-2: one implementation of any SQL statement). Presence and
- * force-clear stay in this file because they deliberately do not validate:
- * "the row is there but we could not parse it" is not a state the thread-close
- * path may treat as cleared.
+ * Container-owned `session_state` keys other than the continuation record
+ * (which lives in ops/continuation.ts): raw continuation presence and
+ * force-clear, and the done proposal.
  */
 import type Database from 'better-sqlite3';
 
 /**
- * Raw presence of either continuation key, with whatever is readable for the
- * caller's log line.
- *
- * Deliberately NOT `readWorkContinuation`: that parser returns null for a
- * malformed record, and "the row is there but we could not parse it" is not a
- * state the thread-close path may treat as cleared. Presence is the question.
+ * Deliberately NOT `readWorkContinuation`: a row that is present but
+ * unparseable must not read as cleared to the thread-close path.
  */
 export interface ContinuationPresence {
   key: string;
@@ -49,13 +33,8 @@ export function readContinuationPresence(outbound: Database.Database): Continuat
 }
 
 /**
- * Drop both continuation keys in one transaction.
- *
- * `cancelWorkContinuation` in the container clears both, and
- * `readWorkContinuation` (`ops/continuation.ts`) falls back to the legacy
- * `pending_next`, so leaving that key behind would leave a promise the next
- * wake still finds.
- * Returns what was held, so the caller can say what it dropped.
+ * Drops both keys in one transaction: `readWorkContinuation` falls back to the
+ * legacy `pending_next`, so leaving it would leave a promise. Returns what was held.
  */
 export function clearWorkContinuation(outboundRw: Database.Database): ContinuationPresence | null {
   const held = readContinuationPresence(outboundRw);
@@ -67,7 +46,6 @@ export function clearWorkContinuation(outboundRw: Database.Database): Continuati
   return held;
 }
 
-/** Longest reason string a done proposal may carry before it is treated as absent. */
 export const CLOSE_REASON_MAX_CHARS = 500;
 
 export interface DoneProposal {
@@ -76,14 +54,9 @@ export interface DoneProposal {
 }
 
 /**
- * Parse a proposal off an open outbound.db handle.
- *
- * Validated the same way the container validates it on write: anything that
- * does not parse is treated as absent, never as a proposal. This function is
- * the ONLY way a proposal enters the host, and its only source is the row
- * `propose_done` writes — there is no host-side path that can mint one, which
- * is what keeps the one-confirmation close unreachable without an actual agent
- * saying it is finished.
+ * Validated as the container validates on write; anything unparseable is
+ * absent. The ONLY way a proposal enters the host, so a one-confirmation close
+ * always needs an agent that actually said it is finished.
  */
 export function readDoneProposal(outbound: Database.Database): DoneProposal | null {
   try {

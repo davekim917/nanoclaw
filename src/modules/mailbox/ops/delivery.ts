@@ -1,7 +1,3 @@
-/**
- * Delivery bookkeeping: the host-owned `delivered` table and the read of due
- * outbound rows. Internal to `src/modules/mailbox/`.
- */
 import type Database from 'better-sqlite3';
 import fs from 'fs';
 
@@ -27,11 +23,8 @@ export function getDueOutboundMessages(db: Database.Database): OutboundMessage[]
 }
 
 /**
- * Every id in `messages_out`, due or not.
- *
- * The delivery loop arms a session as quiet only when nothing is outstanding,
- * and a row scheduled for later sits in a file that may never change again —
- * so "outstanding" has to mean every undelivered id, not just the due ones.
+ * Every id in `messages_out`, due or not: a session is armed quiet only when
+ * nothing is outstanding, and a future row sits in a file that may never change.
  */
 export function listOutboundMessageIds(db: Database.Database): string[] {
   return (db.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>).map((row) => row.id);
@@ -46,21 +39,12 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
 }
 
 /**
- * UPSERT the `delivered` row for a message_out id. Three flavors:
- *   - 'pending'   — gate dispatched, awaiting human. INSERT-only (idempotent).
- *   - 'delivered' — gate approved / message sent successfully.
- *   - 'failed'    — gate rejected/timed out / delivery threw.
- *
- * `delivered` and `failed` must overwrite an earlier 'pending' row so the
- * container's awaitDeliveryAck sees the final decision instead of staying
- * stuck on 'pending'. 'pending' uses INSERT OR IGNORE because once a row
- * exists (pending or resolved) we don't want to clobber it by accident.
+ * 'pending' (gate awaiting a human) is INSERT OR IGNORE so it never clobbers
+ * an existing row; 'delivered'/'failed' must overwrite 'pending' so the
+ * container's awaitDeliveryAck sees the final decision.
  */
 export function markPending(db: Database.Database, messageOutId: string): void {
-  // Bound ISO, matching `markDelivered`/`markDeliveryFailed` below, which
-  // overwrite this same column on this same row. `datetime('now')` wrote the
-  // naive shape, so a still-pending row's `delivered_at` sorted and parsed
-  // differently from a resolved one (CLAUDE.md, Timestamps).
+  // Bound ISO like the resolving writers that overwrite this column.
   db.prepare(
     "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'pending', ?)",
   ).run(messageOutId, new Date().toISOString());
@@ -102,17 +86,9 @@ export function markLifecycleTerminal(db: Database.Database, messageOutId: strin
 }
 
 /**
- * The quiet-delivery gate's view of a session's outbound file.
- *
- * The delivery sweep arms a session as quiet off `(mtime, size)` of
- * outbound.db and re-polls when either moves. That is a storage question, not
- * a mailbox-session one — it must be answered BEFORE any handle is opened, and
- * for sessions that have no mailbox at all — so it lives here as a path-level
- * op rather than on `MailboxSession`.
- *
- * `null` means "do not arm": the file is absent, unreadable, or carries a hot
- * journal, and a hot journal means a rollback (a write) is still owed on it, so
- * the pre-rollback stat is ambiguous. See `recoverHotJournal` in the openers.
+ * Path-level (answered BEFORE any handle opens, and for sessions with no
+ * mailbox). `null` means "do not arm": absent, unreadable, or a hot journal,
+ * whose pending rollback makes the stat ambiguous.
  */
 export function outboundStorageStat(dbPath: string): { mtimeNs: bigint; size: number } | null {
   try {

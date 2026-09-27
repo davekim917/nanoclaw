@@ -1,15 +1,6 @@
 /**
- * Reads behind the pre-turn recall pairing in `session-manager.ts`.
- *
- * Internal to `src/modules/mailbox/`. Every inbound write pairs its trigger
- * row with an inert `recall-<id>` context row, and deciding what that row
- * should contain takes four reads: two of the container's provider state in
- * outbound.db, two of the recall rows already in the inbound queue. They moved
- * here with the rest of the ingress family so the writer no longer needs a raw
- * handle of its own (plan §4.4, Ingress row).
- *
- * Deliberately four named ops rather than one "run this SQL" helper: the point
- * of the seam is that every statement is nameable and lives in one place.
+ * Reads behind the pre-turn recall pairing. Deliberately named ops rather
+ * than a "run this SQL" helper, so every statement lives in one place.
  */
 import type Database from 'better-sqlite3';
 
@@ -18,12 +9,7 @@ export interface ProviderRecallState {
   hasContinuation: boolean;
 }
 
-/**
- * The container-owned memory epoch and continuation flag for one provider.
- *
- * A non-integer or negative epoch reads as 0 — the same "treat it as fresh"
- * answer the host gives when outbound.db cannot be read at all.
- */
+/** A non-integer or negative epoch reads as 0 ("fresh"), same as an unreadable outbound.db. */
 export function readProviderRecallState(outbound: Database.Database, provider: string): ProviderRecallState {
   const epochRow = outbound
     .prepare('SELECT value FROM session_state WHERE key = ?')
@@ -38,11 +24,8 @@ export function readProviderRecallState(outbound: Database.Database, provider: s
 }
 
 /**
- * Content of every chat row still open in the queue, newest first.
- *
- * The caller looks for a queued `/clear`: the runner owns the epoch write, so
- * a reset already queued ahead of this message is invisible in outbound.db and
- * has to be read off the inbound queue instead.
+ * The runner owns the epoch write, so a `/clear` already queued ahead of this
+ * message is visible only on the inbound queue.
  */
 export function listOpenChatContents(inbound: Database.Database): Array<{ content: string }> {
   return inbound
@@ -58,7 +41,6 @@ export function listOpenChatContents(inbound: Database.Database): Array<{ conten
     .all() as Array<{ content: string }>;
 }
 
-/** The most recent recall rows, newest first, bounded by `limit`. */
 export function listRecentRecallRows(
   inbound: Database.Database,
   limit: number,

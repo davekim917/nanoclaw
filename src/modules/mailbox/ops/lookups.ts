@@ -1,27 +1,18 @@
 /**
- * Narrow named reads the host's delivery family needs from a session's
- * inbound.db. Internal to `src/modules/mailbox/`.
- *
- * Each op exists because exactly one caller used to run its SELECT on a raw
- * handle the delivery loop handed it (plan §4.5b, invariant I-9). They are
- * deliberately specific rather than one parameterized query: a generic
- * "run this SQL" escape hatch would move the statement out of the module
- * again in everything but name.
+ * Narrow named reads for the delivery family, deliberately specific rather than
+ * one parameterized query: a "run this SQL" hatch would move the statement out
+ * of the module in all but name.
  */
 import type Database from 'better-sqlite3';
 
-/** One inbound chat row, as `caller-identity.ts` scans it for a human sender. */
 export interface InboundChatSenderRow {
   content?: string;
   channel_type?: string;
 }
 
 /**
- * The most recent inbound chat rows, newest first.
- *
- * `chat` / `chat-sdk` only — `task` / `system` / `webhook` rows carry no human
- * sender. Both chat kinds must be listed: the chat-SDK bridge writes
- * `chat-sdk`, legacy adapters write `chat`.
+ * Newest first. Both `chat` (legacy adapters) and `chat-sdk` (the bridge) must
+ * be listed; other kinds carry no human sender.
  */
 export function getRecentInboundChatSenders(db: Database.Database, limit: number): InboundChatSenderRow[] {
   return db
@@ -34,19 +25,12 @@ export function getRecentInboundChatSenders(db: Database.Database, limit: number
     .all(limit) as InboundChatSenderRow[];
 }
 
-/** A named `type='channel'` destination row the host wrote before the last wake. */
 export interface ChannelDestination {
   channel_type?: string;
   platform_id?: string;
 }
 
-/**
- * Resolve a destination name to its (channel_type, platform_id) address.
- *
- * `destinations` lives in the session's inbound.db (the host writes it at each
- * wake, the container reads it live); the caller maps the address back to a
- * central `messaging_groups` row.
- */
+/** The caller maps the address back to a central `messaging_groups` row. */
 export function getChannelDestination(db: Database.Database, name: string): ChannelDestination | null {
   return (
     (db.prepare(`SELECT channel_type, platform_id FROM destinations WHERE name = ? AND type = 'channel'`).get(name) as
@@ -56,12 +40,8 @@ export function getChannelDestination(db: Database.Database, name: string): Chan
 }
 
 /**
- * The newest task occurrence of a series, by wall-clock timestamp.
- *
- * Delivery reads the series' own row to answer the per-series thread-anchor
- * opt-out (`content.threadAnchor === false`). Timestamp order, not `seq`:
- * this only ever needs the series' current declared contract, and the
- * timestamp is what the fires carry.
+ * Timestamp order, not `seq`: only the series' current declared contract
+ * (e.g. the `threadAnchor` opt-out) is needed.
  */
 export function getLatestTaskContent(db: Database.Database, seriesId: string): string | null {
   const row = db
@@ -70,7 +50,7 @@ export function getLatestTaskContent(db: Database.Database, seriesId: string): s
   return row?.content ?? null;
 }
 
-/** The series a task occurrence in this session belongs to, or null when it is not one. */
+/** Null when the row is not a task occurrence. */
 export function getTaskOccurrenceSeriesId(db: Database.Database, occurrenceId: string): string | null {
   const row = db.prepare("SELECT series_id FROM messages_in WHERE id = ? AND kind = 'task'").get(occurrenceId) as
     | { series_id: string | null }
@@ -78,7 +58,6 @@ export function getTaskOccurrenceSeriesId(db: Database.Database, occurrenceId: s
   return row?.series_id ?? null;
 }
 
-/** The delivery route and payload a host-authored task occurrence carries. */
 export interface RoutedTaskRow {
   channel_type: string;
   platform_id: string;
@@ -86,12 +65,9 @@ export interface RoutedTaskRow {
 }
 
 /**
- * The newest task occurrence of a series that carries a delivery route.
- *
- * Isolated scheduled-task sessions have no central messaging_group_id; their
- * host-authored task row is the only place the route lives. `seq` order (not
- * timestamp) because the caller wants the latest ROW, and rows with a null
- * route are skipped rather than ending the search.
+ * Isolated task sessions have no messaging group; the task row is the only
+ * place the route lives. `seq` order, and null-route rows are skipped rather
+ * than ending the search.
  */
 export function getLatestRoutedTaskRow(db: Database.Database, seriesId: string): RoutedTaskRow | null {
   return (
@@ -110,7 +86,6 @@ export function getLatestRoutedTaskRow(db: Database.Database, seriesId: string):
   );
 }
 
-/** Routing carried by one inbound row, used to anchor a reply to it. */
 export interface InboundRoutingAnchor {
   platform_id: string | null;
   channel_type: string | null;
@@ -128,7 +103,6 @@ export interface InboundRequestIdentity {
   content: string;
 }
 
-/** Host-authoritative source row for a harness request id. */
 export function getInboundRequestIdentity(db: Database.Database, sequence: number): InboundRequestIdentity | null {
   return (
     (db
@@ -150,7 +124,7 @@ export interface RecoverableLifecycleStatus {
   platformMessageId: string;
 }
 
-/** Recover a delivered typed lifecycle row after the host's in-memory map was lost. */
+/** Recovers a delivered typed lifecycle row after the host's in-memory map was lost. */
 export function getRecoverableLifecycleStatus(
   inbound: Database.Database,
   outbound: Database.Database,
@@ -210,11 +184,8 @@ export function getRecoverableLifecycleStatus(
 }
 
 /**
- * The routing of one inbound row in THIS session.
- *
- * `schedule_wake` anchors its deferred row to the message the agent replied
- * to; a miss means the anchor is not in the caller's session and the request
- * is rejected, so `null` is a load-bearing answer, not a fallback.
+ * `null` is load-bearing: `schedule_wake` rejects an anchor that is not in the
+ * caller's own session.
  */
 export function getInboundRoutingAnchor(db: Database.Database, messageId: string): InboundRoutingAnchor | null {
   return (
@@ -224,14 +195,7 @@ export function getInboundRoutingAnchor(db: Database.Database, messageId: string
   );
 }
 
-/**
- * True when this session already carries a host-restart accountability note
- * timestamped at or after `since`.
- *
- * The dedupe window is the caller's (`host-restart-warn.ts`); the id prefix is
- * the note's identity, so the predicate belongs to the row shape rather than
- * to the caller.
- */
+/** The dedupe window is the caller's; the id prefix is the note's identity. */
 export function hasRestartNoteSince(db: Database.Database, since: string): boolean {
   return (
     db
@@ -245,21 +209,16 @@ export function hasRestartNoteSince(db: Database.Database, since: string): boole
 }
 
 /**
- * What the host does with a live task list when its container is killed
- * mid-work (src/task-list-host.ts). Only the list's WORDING comes from the
- * container-written record (`session_state.task_list`); where to edit comes
- * from host-owned evidence — the post row the host delivered and the platform
- * id it recorded in `delivered` — so a forged record cannot point the host at
- * a message or destination the list never had.
+ * Only the list's WORDING comes from the container-written record; where to
+ * edit comes from host-owned evidence (the delivered post and its platform id),
+ * so a forged record cannot aim the host at a message the list never had.
  */
 export interface TaskListSettlement {
   /**
-   * The dead container's undelivered task_list rows, written at or before the
-   * kill. Recorded delivered-unsent so none can land over the interrupted form
-   * (or, for a first post that never went out, show a list nobody will finish).
+   * Undelivered task_list rows written at or before the kill, recorded
+   * delivered-unsent so none lands over the interrupted form.
    */
   staleRowIds: string[];
-  /** The interrupted edit, when the list's post is on screen. */
   edit: {
     channelType: string;
     platformId: string;
@@ -272,8 +231,7 @@ export interface TaskListSettlement {
 
 /**
  * Null when there is nothing to settle: no list, a finished or stale one (its
- * queued rows carry its real final state — let them deliver), or one touched
- * after the kill began, which belongs to a newer container.
+ * queued rows carry its real final state), or one touched after the kill began.
  */
 export function getTaskListSettlement(
   inbound: Database.Database,
@@ -291,9 +249,7 @@ export function getTaskListSettlement(
     return null;
   }
   if (record.version !== 1 || record.finished === true || record.stale === true) return null;
-  // `touchedAt` is stamped on every save (an unchanged or still-pending
-  // update keeps `updatedAt`, the time on screen); a record from a runner
-  // snapshot older than that field falls back to `updatedAt`.
+  // Older runner snapshots lack `touchedAt`; fall back to `updatedAt`.
   const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
   if (typeof touchedAt !== 'string' || !(Date.parse(touchedAt) <= Date.parse(killedAt))) return null;
   const delivered = new Set(
@@ -301,8 +257,7 @@ export function getTaskListSettlement(
       (r) => r.message_out_id,
     ),
   );
-  // julianday keeps the milliseconds datetime() would truncate: a row written
-  // in the kill's own second, after it, is a newer container's.
+  // julianday keeps the milliseconds datetime() truncates.
   const staleRowIds = (
     outbound
       .prepare("SELECT id FROM messages_out WHERE kind = 'task_list' AND julianday(timestamp) <= julianday(?)")
@@ -311,9 +266,8 @@ export function getTaskListSettlement(
     .map((r) => r.id)
     .filter((id) => !delivered.has(id));
 
-  // The list's own post when it is on screen; while a replacement post is
-  // still undelivered (and about to be dropped as stale above), the post it
-  // was replacing is the one on screen — it gets the interrupted form.
+  // While a replacement post is still undelivered, the post it replaces is
+  // the one on screen.
   let edit: TaskListSettlement['edit'] = null;
   const supersedes = record.supersedes as { outboundId?: unknown } | null | undefined;
   const candidates = [record.postOutboundId, supersedes?.outboundId].filter(

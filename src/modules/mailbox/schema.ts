@@ -1,14 +1,8 @@
 /**
- * Session-DB schema creation and the fork's additive migrations.
- *
- * Internal to `src/modules/mailbox/`. The fork's on-disk shape is upstream's
- * baseline plus: `repo_ingress_fence`, `messages_in.repo_fence_epoch` /
- * `.repo_fence_original_trigger` and their four guard triggers,
- * `idx_messages_in_series_seq`, `session_routing.spawn_task_id` / `.session_id`,
- * `delivered.error` / `.lifecycle_terminal_at`, and the `container_state` provider/memory columns. Every
- * migration here is idempotent and guarded by `PRAGMA table_info`, so it is
- * safe to run on every open — that lazy, on-open shape IS the upgrade path for
- * session DBs (there is no central migration for them).
+ * Session-DB schema creation and the fork's additive migrations. Every
+ * migration is idempotent and `PRAGMA table_info`-guarded, so it runs on every
+ * open: that lazy shape IS the upgrade path (no central migration exists for
+ * session DBs).
  */
 import Database from 'better-sqlite3';
 
@@ -18,7 +12,6 @@ import {
   migrateMessagesInTable as migrateUpstreamMessagesInColumns,
 } from '../../mailbox/sqlite/session-db.js';
 
-/** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
   const db = new Database(dbPath);
   db.pragma('journal_mode = DELETE');
@@ -41,13 +34,8 @@ export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): vo
 }
 
 /**
- * Ensure session_routing has the spawn_task_id and session_id columns the
- * upsert needs. Handles three cases idempotently:
- *   1. Pre-Phase-1 sessions (no extra columns)            → ADD spawn_task_id + session_id
- *   2. Phase-1 sessions (have legacy dispatch_task_id)    → RENAME to spawn_task_id
- *   3. Post-rework sessions (already have spawn_task_id)  → no-op
- *
- * SQLite ALTER TABLE RENAME COLUMN requires 3.25+ (better-sqlite3 ships 3.45+).
+ * Idempotent across three shapes: no extra columns (ADD), legacy
+ * `dispatch_task_id` (RENAME, needs SQLite 3.25+), already current (no-op).
  */
 export function migrateSessionRoutingTable(db: Database.Database): void {
   const existing = new Set(
@@ -66,7 +54,6 @@ export function migrateSessionRoutingTable(db: Database.Database): void {
   }
 }
 
-/** Ensure the delivered table has columns added after initial schema. */
 export function migrateDeliveredTable(db: Database.Database): void {
   migrateUpstreamDeliveredColumns(db);
   const cols = new Set(
@@ -80,14 +67,7 @@ export function migrateDeliveredTable(db: Database.Database): void {
   }
 }
 
-/**
- * The four repository-ingress guard triggers.
- *
- * Lives here rather than in `ops/fence.ts` (where the rest of the fence
- * subsystem sits) because `migrateMessagesInTable` installs them and the fence
- * ops call `migrateMessagesInTable` — the other placement makes schema.ts and
- * ops/fence.ts a static import cycle for no gain. Trigger creation is schema.
- */
+/** Here, not ops/fence.ts, because placing it there makes a static import cycle. */
 function installRepoIngressFenceGuards(db: Database.Database): void {
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS messages_in_repo_fence_insert_guard
@@ -139,54 +119,22 @@ function installRepoIngressFenceGuards(db: Database.Database): void {
   `);
 }
 
-// LEGACY-COMPAT(v1-tasks): adds columns added to messages_in after the initial
-// v2 schema to pre-existing session DBs — this lazy, on-open migration IS the
-// upgrade path for old installs (there is no central migration for session
-// DBs). No-op on fresh installs where the columns are in the baseline schema.
-// Backfills existing rows so invariants hold (series_id = id).
+// Adds messages_in columns newer than the baseline to pre-existing session DBs
+// and backfills existing rows (series_id = id).
 export function migrateMessagesInTable(db: Database.Database): void {
   migrateUpstreamMessagesInColumns(db);
   const cols = new Set(
     (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name),
   );
   if (!cols.has('scheduled_for')) {
-    // ALTER and backfill in ONE transaction. SQLite makes DDL transactional,
-    // and better-sqlite3 nests via SAVEPOINT, so this is safe wherever the
-    // migration is called from. Split, a crash between the two statements
-    // leaves the column present and every legacy task's slot NULL — and
-    // because the next open sees the column in PRAGMA table_info, the backfill
-    // never runs again. The first retry after that would rewrite
-    // `process_after`, the formatter would fall back to the backoff deadline,
-    // and the regression this column exists to prevent would be permanent.
+    // ALTER and backfill in ONE transaction: split, a crash leaves the column
+    // present and the backfill never runs again (the next open sees the column).
     db.transaction(() => {
       db.prepare('ALTER TABLE messages_in ADD COLUMN scheduled_for TEXT').run();
-      // Backfilled from process_after for existing TASK rows, once, here.
-      //
-      // Leaving them NULL looks conservative and is not: a legacy occurrence
-      // would carry no slot until something rewrote it, so its FIRST crash after
-      // the upgrade would defer process_after, the formatter would fall back to
-      // the backoff deadline, and the exact defect this column exists to prevent
-      // would reproduce on every pre-migration task.
-      //
-      // The backfill is never worse than NULL. For a row not currently deferred,
-      // process_after IS its slot and this is simply correct. For one already
-      // sitting in backoff the value is the deadline — but that is precisely what
-      // the NULL fallback would have rendered anyway, so nothing is lost, and the
-      // next genuine reschedule corrects it.
-      //
-      // At the migration seam rather than in each deferral path: `scheduled_for`
-      // has to be present before ANY writer of process_after runs, and there is
-      // more than one (fresh-context retry, stale-message backoff). One statement
-      // here covers every such path, including ones added later.
-      //
-      // Through strftime, not a bare copy. `process_after` on a pre-upgrade
-      // install can hold SQLite's naive `YYYY-MM-DD HH:MM:SS`, and copying
-      // that shape verbatim would seed the new column with values that
-      // `new Date()` reads as LOCAL time and that string comparisons rank
-      // against ISO ones. strftime treats a naive value as UTC — which is what
-      // it is — and re-renders an already-ISO one unchanged, so one expression
-      // normalizes both. This is the root fix: no naive `scheduled_for` is
-      // ever created, so no reader downstream has to cope with one.
+      // Backfill TASK rows from process_after; NULL would make a legacy task's
+      // first post-upgrade crash lose its slot. Done here because it must precede
+      // every writer of process_after. Through strftime: a naive
+      // `YYYY-MM-DD HH:MM:SS` value is UTC and must not be copied as-is.
       db.prepare(
         `UPDATE messages_in
             SET scheduled_for = strftime('%Y-%m-%dT%H:%M:%fZ', process_after)
@@ -216,29 +164,16 @@ export function migrateMessagesInTable(db: Database.Database): void {
     db.prepare('UPDATE repo_ingress_fence SET generation = lower(hex(randomblob(16))) WHERE generation IS NULL').run();
   }
   installRepoIngressFenceGuards(db);
-  // Read-path enabler for the Scheduled Tasks Board (design §4.8). Added
-  // unconditionally — existing DBs already carry `series_id` (so the branch
-  // above is skipped) yet still need this compound index. Created on the next
-  // write-path open; board read-only opens tolerate its absence and fall back
-  // to the scan. Idempotent via IF NOT EXISTS. Read-path only; C1 untouched.
+  // Unconditional: existing DBs skip the series_id branch above but still need
+  // this index. Board read-only opens tolerate its absence.
   db.prepare('CREATE INDEX IF NOT EXISTS idx_messages_in_series_seq ON messages_in(series_id, seq DESC)').run();
 }
 
 /**
- * Run every fork-side inbound migration against an already-open handle.
- *
- * The single entry point `NanoclawAgentMailbox.session()` uses, once per
- * inbound path per process. Additive and `PRAGMA table_info`-guarded
- * throughout, so it is safe on a DB that already has the current shape and on
- * a legacy one that has none of it.
- *
- * The baseline runs FIRST, and unconditionally. A legacy DB can predate
- * `session_routing` or `delivered` entirely, and an additive migration against
- * an absent table either throws or (if guarded) silently leaves it absent —
- * after which the next spawn's `writeSessionRouting` fails on
- * `ALTER TABLE session_routing` for that session, every time. `CREATE TABLE IF
- * NOT EXISTS` throughout, so it is a no-op on a current DB. This is what
- * `initSessionFolder`'s unconditional `ensureSchema` has always done.
+ * Every fork-side inbound migration, run once per inbound path per process.
+ * The baseline runs FIRST and unconditionally: a legacy DB can predate whole
+ * tables, and an additive migration against an absent table throws or leaves it
+ * absent.
  */
 export function ensureNanoclawInboundSchema(db: Database.Database): void {
   db.exec(INBOUND_SCHEMA);
