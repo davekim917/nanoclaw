@@ -27,7 +27,6 @@ function normalize(value: string): string {
   return value.trim().toLowerCase();
 }
 
-/** Every handle a service answers to (display name, CLI binary, MCP namespace, bare server name), case-insensitive. */
 function handlesFor(service: SnapshotService): string[] {
   const handles: string[] = [];
   const push = (value: unknown) => {
