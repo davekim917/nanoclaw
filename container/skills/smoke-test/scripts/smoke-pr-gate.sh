@@ -143,6 +143,9 @@ CONTROL_LOCK="$STATE_DIR/control.lock"
 FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
 BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"
 MIGRATIONS_PREFIX="${SMOKE_GATE_MIGRATIONS_PREFIX:-}"
+# jq, with --arg mig "$MIGRATIONS_PREFIX": a path is a migration when it falls
+# under ANY of the comma-listed migrations trees.
+MIGRATIONS_JQ='def migration: . as $f | any($mig | split(",")[]; . as $p | $f | startswith($p));'
 FREEZE_MARKER_BACKEND="${BACKEND_PREFIX}.render-freeze"
 FREEZE_MARKER_FRONTEND="${FRONTEND_PREFIX}.render-freeze"
 
@@ -2406,7 +2409,7 @@ evaluate_pr() {
     migrations_touched=true
     frontend_touched=true
   else
-    migrations_touched="$(jq -r --arg p "$MIGRATIONS_PREFIX" 'any(.[].filename; startswith($p))' <<<"$files_json" 2>/dev/null)"
+    migrations_touched="$(jq -r --arg mig "$MIGRATIONS_PREFIX" "$MIGRATIONS_JQ"' any(.[].filename; migration)' <<<"$files_json" 2>/dev/null)"
     frontend_touched="$(jq -r --arg p "$FRONTEND_PREFIX" 'any(.[].filename; startswith($p))' <<<"$files_json" 2>/dev/null)"
     [ "$migrations_touched" = true ] || [ "$migrations_touched" = false ] || migrations_touched=true
     [ "$frontend_touched" = true ] || [ "$frontend_touched" = false ] || frontend_touched=true
@@ -2565,9 +2568,9 @@ evaluate_pr() {
       if [ "$range_determinable" = true ]; then
         range_paths_json="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$target_files_json" 2>/dev/null)"
         jq -e 'type == "array" and all(.[]; type == "string")' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json=""
-        migrations_touched="$(jq -r --arg p "$MIGRATIONS_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
+        migrations_touched="$(jq -r --arg mig "$MIGRATIONS_PREFIX" "$MIGRATIONS_JQ"' any(.[]; migration)' <<<"$range_paths_json" 2>/dev/null)"
         frontend_touched="$(jq -r --arg p "$FRONTEND_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
-        migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.[] | select(startswith($p))] | unique' <<<"$range_paths_json" 2>/dev/null)"
+        migration_files="$(jq -c --arg mig "$MIGRATIONS_PREFIX" "$MIGRATIONS_JQ"' [.[] | select(migration)] | unique' <<<"$range_paths_json" 2>/dev/null)"
       fi
       if [ "$range_determinable" != true ] ||
          { [ "$migrations_touched" != true ] && [ "$migrations_touched" != false ]; } ||
@@ -2607,7 +2610,7 @@ evaluate_pr() {
     # name which files, so say so rather than reporting an empty list as fact.
     migrations_determinable=false
   else
-    migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.[].filename | select(startswith($p))]' <<<"$files_json" 2>/dev/null)"
+    migration_files="$(jq -c --arg mig "$MIGRATIONS_PREFIX" "$MIGRATIONS_JQ"' [.[].filename | select(migration)]' <<<"$files_json" 2>/dev/null)"
     [ -n "$migration_files" ] && jq -e 'type == "array"' <<<"$migration_files" >/dev/null 2>&1 || migration_files='[]'
   fi
 

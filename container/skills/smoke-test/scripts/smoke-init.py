@@ -195,8 +195,9 @@ def propose(found):
          "why": "the backend's directory; freeze markers live under it; ends in /",
          "find": seen("the API app's directory", candidates(dirs, {"api", "backend", "server", "service"}))},
         {"key": "SMOKE_GATE_MIGRATIONS_PREFIX", "value": None,
-         "why": "an ordinary PR touching it is refused (migrations never run against shared dev); ends in /",
-         "find": seen("the directory holding schema migrations", found["migrationDirs"])},
+         "why": "an ordinary PR touching it is refused (migrations never run against shared dev); ends in /, "
+                "and several trees are comma-separated",
+         "find": seen("every directory holding schema migrations", found["migrationDirs"])},
     ]
     if provider != "static":
         mandatory.append(

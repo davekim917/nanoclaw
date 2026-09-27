@@ -851,6 +851,26 @@ jq -e --arg base "$BASE_SHA" --arg parent "$PARENT_SHA" '
   .data.migrationsInRange == ["api/migrations/222_undo_edit_prior_actor.sql"]
 ' <<<"$T5A_POLL" >/dev/null || { echo "5a: poll did not settle the freeze with its range: $T5A_POLL" >&2; exit 1; }
 jq -e '.refusedAlertSha == null' "$STATE_DIR/pr-10-state.json" >/dev/null
+# 5a-list. SMOKE_GATE_MIGRATIONS_PREFIX may list several trees: a file under
+# ANY of them is a migration, and the single-tree result above is unchanged.
+fresh_state
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":3,"behind_by":0,"files":[{"filename":"api/migrations/222_undo_edit_prior_actor.sql"},{"filename":"data/migrations/043_sheet.sql"},{"filename":"data/seed.sql"}]}'
+T5L_OUT="$(SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/,data/migrations/ bash "$GATE" check 10)"
+jq -e '.migrationsTouched == true and .settled == true and
+  .migrationFiles == ["api/migrations/222_undo_edit_prior_actor.sql","data/migrations/043_sheet.sql"] and
+  .migrationsInRange == .migrationFiles' <<<"$T5L_OUT" >/dev/null ||
+  { echo "5a-list: a file under the second migrations tree was not a migration: $T5L_OUT" >&2; exit 1; }
+for bad in 'api/migrations/,' 'api/migrations/,,data/migrations/' 'api/migrations/,api/migrations/' 'api/migrations/,web/' 'api/migrations/,/data/'; do
+  T5L_BAD="$(SMOKE_GATE_MIGRATIONS_PREFIX="$bad" bash "$GATE" check 10 2>/dev/null || true)"
+  jq -e '.error == "gate misconfigured" and (.missing | index("SMOKE_GATE_MIGRATIONS_PREFIX") != null)' <<<"$T5L_BAD" >/dev/null ||
+    { echo "5a-list: a bad migrations list $bad was accepted: $T5L_BAD" >&2; exit 1; }
+done
+T5L_FE="$(SMOKE_GATE_FRONTEND_PREFIX=web/,site/ bash "$GATE" check 10 2>/dev/null || true)"
+jq -e '.missing == ["SMOKE_GATE_FRONTEND_PREFIX"]' <<<"$T5L_FE" >/dev/null ||
+  { echo "5a-list: the frontend prefix, which names one freeze marker, accepted a list: $T5L_FE" >&2; exit 1; }
 # 5a-ii. What still blocks: the MG-1 failure itself. Same freeze, but the
 # backend never came healthy — not settled, whatever the range says.
 fresh_state

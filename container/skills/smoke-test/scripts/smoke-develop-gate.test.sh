@@ -133,6 +133,10 @@ chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl" "$STUB_BIN/freeze-helper"
 export PATH="$STUB_BIN:$PATH"
 export STUB_SOURCE_SHA="$BUILD_SHA"
 export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
+# The PR gate's env file, which the develop gate reads as data and must agree with.
+CONTROLLER_ENV="$STUB_BIN/controller-env.sh"
+printf 'export SMOKE_GATE_FRONTEND_PREFIX="web/"\nexport SMOKE_GATE_BACKEND_PREFIX=%s\nexport SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/\n' "'api/'" >"$CONTROLLER_ENV"
+export SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV"
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-b \
   SMOKE_GATE_FRONTEND_SERVICE=srv-f SMOKE_GATE_DEV_URL=https://dev.example.test \
   SMOKE_GATE_DEBOUNCE_SECONDS=0
@@ -1100,6 +1104,44 @@ SMOKE_GATE_FRONTEND_PREFIX=api/ SMOKE_GATE_BACKEND_PREFIX=api/ bash "$GATE" poll
   .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_FRONTEND_PREFIX") != null)
   and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null)
 ' >/dev/null || uc_fail "equal frontend and backend prefixes were not named with the freeze handoff on"
+# The PR gate's env file must state every prefix identically, as a literal.
+# Each disagreement is named (never its value), nothing is cut, and it pages
+# once: gate_misconfigured's 6h throttle holds it quiet on the next tick.
+agree_case() {  # <label> <env file line...> -- expect exactly the named keys
+  local label="$1" want="$2"; shift 2
+  printf '%s\n' "$@" >"$CONTROLLER_ENV.case"
+  OUT="$(SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.case" bash "$GATE" poll)"
+  jq -e --argjson want "$want" '.data.trigger == "gate_misconfigured" and (.data.missing | . - (. - $want)) == $want
+    and ([.data.missing[] | select(startswith("SMOKE_GATE_") and endswith("_PREFIX"))] - $want) == []' <<<"$OUT" >/dev/null ||
+    uc_fail "agreement $label: $OUT"
+  ! grep -qF 'other/' <<<"$OUT" || uc_fail "agreement $label leaked a value: $OUT"
+}
+A_FE='export SMOKE_GATE_FRONTEND_PREFIX=web/'; A_BE='export SMOKE_GATE_BACKEND_PREFIX=api/'; A_MI='export SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/'
+uc_open 78
+OUT="$(bash "$GATE" poll)"
+jq -e '.data.trigger != "gate_misconfigured"' <<<"$OUT" >/dev/null || uc_fail "agreeing env files were refused: $OUT"
+agree_case frontend '["SMOKE_GATE_FRONTEND_PREFIX"]' 'export SMOKE_GATE_FRONTEND_PREFIX=other/' "$A_BE" "$A_MI"
+agree_case backend '["SMOKE_GATE_BACKEND_PREFIX"]' "$A_FE" 'SMOKE_GATE_BACKEND_PREFIX="other/"' "$A_MI"
+agree_case migrations '["SMOKE_GATE_MIGRATIONS_PREFIX"]' "$A_FE" "$A_BE" 'export SMOKE_GATE_MIGRATIONS_PREFIX=other/'
+agree_case absent '["SMOKE_GATE_MIGRATIONS_PREFIX"]' "$A_FE" "$A_BE"
+agree_case non-literal '["SMOKE_GATE_BACKEND_PREFIX"]' "$A_FE" 'export SMOKE_GATE_BACKEND_PREFIX="${ROOT}api/"' "$A_MI"
+agree_case literal-then-non-literal '["SMOKE_GATE_BACKEND_PREFIX"]' "$A_FE" "$A_BE" 'export SMOKE_GATE_BACKEND_PREFIX="$ROOT"' "$A_MI"
+agree_case unset '["SMOKE_GATE_FRONTEND_PREFIX"]' "$A_FE" "$A_BE" "$A_MI" 'unset SMOKE_GATE_FRONTEND_PREFIX'
+OUT="$(SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.absent" bash "$GATE" poll)"
+jq -e '.data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_CONTROLLER_ENV_FILE") != null)' <<<"$OUT" >/dev/null ||
+  uc_fail "a missing PR-gate env file was not named: $OUT"
+# A comma list agrees in any order.
+printf '%s\n' "$A_FE" "$A_BE" 'export SMOKE_GATE_MIGRATIONS_PREFIX=data/migrations/,api/migrations/' >"$CONTROLLER_ENV.case"
+OUT="$(SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/,data/migrations/ SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.case" bash "$GATE" poll)"
+jq -e '(.data.missing // []) | index("SMOKE_GATE_MIGRATIONS_PREFIX") == null' <<<"$OUT" >/dev/null ||
+  uc_fail "the same migrations list in another order disagreed: $OUT"
+# One page per episode: the first refusing tick wakes, the next does not.
+uc_open 79
+printf '%s\n' 'export SMOKE_GATE_FRONTEND_PREFIX=other/' "$A_BE" "$A_MI" >"$CONTROLLER_ENV.case"
+W1="$(SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.case" bash "$GATE" poll | jq -r '[.data.trigger, .wakeAgent] | join(" ")')"
+W2="$(SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.case" bash "$GATE" poll | jq -r '[.data.trigger, .wakeAgent] | join(" ")')"
+[ "$W1 | $W2" = "gate_misconfigured true | gate_misconfigured false" ] ||
+  uc_fail "a disagreement must page once and stay quiet on the next tick: $W1 | $W2"
 # Leave the ambient ceiling exactly as case 33 left it for the cases below.
 export SMOKE_GATE_FREEZE_STALE_SECONDS=0
 

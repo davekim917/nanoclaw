@@ -29,7 +29,11 @@ snapshot() {
   (cd "$T/fx" && find . -printf '%p %y %s %m %T@\n' | sort && find . -type f -exec sha256sum {} + | sort)
 }
 
+# The PR gate's env file, which the develop gate reads as data and must agree with.
+printf '%s\n' 'export SMOKE_GATE_FRONTEND_PREFIX=web/' 'export SMOKE_GATE_BACKEND_PREFIX=api/' \
+  'export SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/' >"$T/controller-env.sh"
 BASE_ENV=(
+  SMOKE_CONTROLLER_ENV_FILE="$T/controller-env.sh"
   PATH="$T/shim:$PATH" HOME="$T"
   SMOKE_GATE_REPO=acme/widget SMOKE_GATE_BACKEND_SERVICE=srv-acme-api SMOKE_GATE_FRONTEND_SERVICE=srv-acme-web
   SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
@@ -115,5 +119,22 @@ OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERV
   && ok "a template with a query or shell metacharacter named" || fail "static unsafe template: rc=$RC $OUT"
 OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.acme.example' SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.acme.example')"; RC=$?
 [ "$RC" -eq 0 ] && ok "static provider with templates ok" || fail "static ok: rc=$RC $OUT"
+
+# The develop gate's config also enforces agreement with the PR gate's env file,
+# and dropping that comparison is caught.
+GATE="$SCRIPT_DIR/smoke-develop-gate.sh"
+printf '%s\n' 'export SMOKE_GATE_FRONTEND_PREFIX=web/' 'export SMOKE_GATE_BACKEND_PREFIX=server/' \
+  'export SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/' >"$T/controller-env-diverged.sh"
+OUT="$(run_config "$GATE" SMOKE_CONTROLLER_ENV_FILE="$T/controller-env-diverged.sh")"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null && ! grep -q 'server/' <<<"$OUT" \
+  && ok "develop config names a prefix the PR gate's env file states differently" || fail "develop disagreement: rc=$RC $OUT"
+rm -rf "$T/mut"; mkdir "$T/mut"
+for f in "$SCRIPT_DIR"/*; do ln -s "$f" "$T/mut/"; done
+rm "$T/mut/smoke-develop-gate.sh"
+grep -v 'LAYOUT_MISSING="$LAYOUT_MISSING$(prefix_agreement_problems)"' "$GATE" >"$T/mut/smoke-develop-gate.sh"
+! cmp -s "$GATE" "$T/mut/smoke-develop-gate.sh" || fail "mutation: the agreement line was not found to remove"
+OUT="$(run_config "$T/mut/smoke-develop-gate.sh" SMOKE_CONTROLLER_ENV_FILE="$T/controller-env-diverged.sh")"; RC=$?
+[ "$RC" -eq 0 ] && ok "mutant without the comparison accepts the divergence (so the check above is what refuses it)" \
+  || fail "mutation not observable: rc=$RC $OUT"
 
 [ "$FAIL" -eq 0 ] && echo "PASS smoke-gate-config.test.sh" || { echo "FAIL smoke-gate-config.test.sh" >&2; exit 1; }
