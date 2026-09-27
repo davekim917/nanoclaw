@@ -227,6 +227,35 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: original })]);
   });
 
+  it('keeps the introducing commit through later prose edits on the same line', () => {
+    const root = gitRoot();
+    const pad = ' '.repeat(50);
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, `- OLD introduction${pad}the \`drainQueue\` function at \`src/code.ts:1\` dropped items\n`);
+    const introduced = commit(root, 'note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+    write(root, NOTE, `- NEW introduction${pad}the \`drainQueue\` function at \`src/code.ts:1\` dropped items\n`);
+    commit(root, 'reword the note');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
+  });
+
+  it('finds a committed note again after an earlier run pinned another citation on its line', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, 'src/other.ts', 'function flushAll() {}\n');
+    write(root, NOTE, '- `flushAll` in `src/other.ts:1`; `drainQueue` at `src/code.ts:1` drops items\n');
+    const introduced = commit(root, 'note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+
+    pinDocs(root, [NOTE], ['src/other.ts']);
+    expect(pinDocs(root, [NOTE], ['src/code.ts'])).toEqual([
+      expect.objectContaining({ kind: 'pinned', sha: introduced }),
+    ]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

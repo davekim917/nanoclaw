@@ -81,22 +81,18 @@ function citedText(lines: string[] | null, link: FileLineCitation): string | nul
   return lines.slice(link.startLine - 1, link.endLine).join('\n');
 }
 
-function occurrences(root: string, rev: string, needle: string, paths: readonly string[]): number {
-  const out = gitRead(root, ['grep', '-F', '-c', '-e', needle, rev, '--', ...paths]);
-  return (out ?? '').split('\n').reduce((sum, line) => sum + (Number(line.slice(line.lastIndexOf(':') + 1)) || 0), 0);
-}
-
-function introducingCommit(root: string, rev: string, searches: { needle: string; paths: readonly string[] }[]) {
-  for (const { needle, paths } of searches) {
-    const changes = (gitRead(root, ['log', '--format=%H', `-S${needle}`, rev, '--', ...paths]) ?? '')
-      .split('\n')
-      .filter(Boolean);
-    const added = changes.find(
-      (sha) => occurrences(root, sha, needle, paths) > occurrences(root, `${sha}^`, needle, paths),
-    );
-    if (added) return added;
+function introducingCommit(root: string, rev: string, doc: string, lineNumber: number, cited: string): string | null {
+  const history = gitRead(root, ['log', `-L${lineNumber},${lineNumber}:${doc}`, '--format=%x00%H', rev]) ?? '';
+  let oldest: string | null = null;
+  for (const entry of history.split('\0').filter(Boolean)) {
+    const [sha, ...patch] = entry.split('\n');
+    const after = patch.filter((line) => line.startsWith('+') && !line.startsWith('+++'));
+    const before = patch.filter((line) => line.startsWith('-') && !line.startsWith('---'));
+    if (!after.some((line) => line.includes(cited))) break;
+    oldest = sha.trim();
+    if (!before.some((line) => line.includes(cited))) break;
   }
-  return null;
+  return oldest;
 }
 
 function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] {
@@ -175,25 +171,20 @@ export function pinDocs(
   const outcomes: PinOutcome[] = [];
   for (const doc of docs) {
     const lines = fs.readFileSync(path.join(root, doc), 'utf8').split('\n');
-    const committedLines = new Set((gitRead(root, ['show', `${rev}:${doc}`]) ?? '').split('\n'));
+    const unpinned = (line: string): string => line.replace(/\s+at\s+[0-9a-f]{7,40}\b/g, '');
+    const committedLines = (gitRead(root, ['show', `${rev}:${doc}`]) ?? '').split('\n').map(unpinned);
     let changed = false;
     lines.forEach((text, i) => {
       const inserts: { at: number; sha: string }[] = [];
-      let previousEnd = 0;
       for (const run of citationRuns(text)) {
         const head = run.links[0];
-        const context = text.slice(Math.max(previousEnd, head.index - 120), head.index);
-        previousEnd = run.end + (/^\s+at\s+[0-9a-f]{7,40}\b/.exec(text.slice(run.end))?.[0].length ?? 0);
         if (run.pinnedSha) continue;
         const files = runFiles(run);
         if (citedFiles.length > 0 && !files.some((file) => citedFiles.includes(file))) continue;
         const citation = text.slice(head.index, run.end).replace(/`/g, '');
         const headText = `${head.file}:${head.span}`;
-        const searches = [];
-        if (context.trim().length >= 10)
-          searches.push({ needle: context + text.slice(head.index, head.end), paths: [doc] });
-        if (committedLines.has(text)) searches.push({ needle: headText, paths: [doc] });
-        const origin = introducingCommit(root, rev, searches);
+        const committedAt = committedLines.indexOf(unpinned(text));
+        const origin = committedAt === -1 ? null : introducingCommit(root, rev, doc, committedAt + 1, headText);
         const start = origin ?? gitRead(root, ['rev-parse', rev])?.trim() ?? rev;
         if (!gitRead(root, ['log', '-1', '--format=%H', start, '--', head.file])?.trim()) continue;
         const candidates = candidateRevisions(root, start, files);
