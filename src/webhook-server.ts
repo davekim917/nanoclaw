@@ -1,6 +1,3 @@
-/**
- * HTTP server for Chat SDK webhooks and the dashboard, started lazily; one route table (src/dashboard/router.ts).
- */
 import http from 'http';
 
 import type { Chat } from 'chat';
@@ -118,7 +115,6 @@ export function ensureServerStarted(): void {
         }
         // null → handler already wrote to res directly (SSE bypass)
       } catch (err) {
-        // Body cap: 413, not 500.
         if (err instanceof RequestTooLargeError) {
           log.warn('Request body too large — rejected', { url: req.url, max: MAX_REQUEST_BODY_BYTES });
           if (!res.headersSent) {

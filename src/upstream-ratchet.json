@@ -950,7 +950,7 @@
 "src/upgrade-state.ts":{"diff":104,"mode":"100644","sha256":"3fb08518919ecd645e88ab55e7a27550747fc39ba2632cd27532c0862d4430fb"},
 "src/webhook-server-raw.test.ts":{"diff":97,"mode":"100644","sha256":null,"deleted":true},
 "src/webhook-server.test.ts":{"diff":227,"mode":"100644","sha256":"164c6542a72111393687b01dbbdc194d7b54c4456bc44bcd7220745d54cd7ee8"},
-"src/webhook-server.ts":{"diff":140,"mode":"100644","sha256":"a154d17aa20f6706c79db46a8237053385909d7e9e287d7319e7e5413a6c5164"},
+"src/webhook-server.ts":{"diff":140,"mode":"100644","sha256":"5d9cf6d9690f68a02672e3ff68a8d68b5cc1a5c678837d12444319892c97ad5d"},
 "src/workspace-contract.ts":{"diff":30,"mode":"100644","sha256":null,"deleted":true},
 "templates/README.md":{"diff":65,"mode":"100644","sha256":"33c5a73e548925974c8b09bce410422f1e1705307feaba1538cb7e870e987e01"},
 "tsconfig.json":{"diff":0,"mode":"100644","sha256":"25bb17e17ea109ef835738bc5481a8e79b3169dd003dd3c73c3f860724e653e8"},
