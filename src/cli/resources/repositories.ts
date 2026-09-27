@@ -1,11 +1,7 @@
 /**
- * Operator seam for adopting workgroup-shared checkouts as host canonicals.
- *
- * These verbs must run inside the host process: quiescence stops containers
- * through the runtime process map, and the in-memory workgroup mount claim that
- * closes spawn admission is per-process. A standalone script could write the
- * durable ingress fence but could not stop a live container, so it would move a
- * directory out from under an active bind mount.
+ * Must run inside the host process: quiescence stops containers through the runtime process map, and the workgroup
+ * mount claim that closes spawn admission is per-process. A standalone script would move a directory out from under a
+ * live bind mount.
  */
 import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
@@ -64,11 +60,7 @@ function describe(checkout: LegacyCheckout): string {
   return `${checkout.repo} [${head}] ${state.length > 0 ? state.join(', ') : 'clean'}`;
 }
 
-/**
- * Fence and stop every container in the workgroup, run `body`, then release and
- * wake. One quiescence covers every repository so a workgroup is paused once
- * rather than once per repository.
- */
+/** One quiescence for every repository, so a workgroup pauses once. */
 async function withWorkgroupQuiescence<T>(workgroupId: string, body: () => Promise<T>): Promise<T> {
   const groupIds = (await getAllAgentGroups())
     .filter((group) => (group.workgroup_id ?? group.folder) === workgroupId)
@@ -81,9 +73,7 @@ async function withWorkgroupQuiescence<T>(workgroupId: string, body: () => Promi
       sessions,
       `repository-activation:${workgroupId}:${Date.now()}`,
     );
-    // Release runs on both paths, but a release failure must never mask why the
-    // body failed — an unreleased fence and a failed move are different
-    // incidents and the operator needs to see both.
+    // A release failure must never mask the body's failure; the operator needs both.
     let result: T | undefined;
     let bodyError: unknown;
     try {
@@ -181,8 +171,8 @@ registerResource({
               try {
                 activated.push(await activateCanonicalRepository({ workgroupId, checkout }));
               } catch (error) {
-                // One bad repository must not abandon the rest mid-quiescence;
-                // each adoption is independently atomic under its own lock.
+                // One bad repository must not abandon the rest mid-quiescence; each adoption is atomic under its own
+                // lock.
                 failed.push({ repo: checkout.repo, error: error instanceof Error ? error.message : String(error) });
               }
             }

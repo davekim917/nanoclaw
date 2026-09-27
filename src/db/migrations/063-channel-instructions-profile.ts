@@ -2,27 +2,10 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Migration 063 — per-channel (messaging_group_agents) instructions profile.
- *
- * The second per-channel always-on layer, and deliberately NOT the tone one.
- * `default_tone` (migration 016) carries VOICE and only voice — a documented
- * invariant with exactly one slot (see container/agent-runner/src/index.ts).
- * Operating rules are a different axis: "in this room you may only write to
- * lab-* repos, commit straight to main, never ask a question" is not a voice,
- * and folding it into a tone profile would make the voice slot arbitrate two
- * unrelated concerns.
- *
- * Why a channel column instead of the group's standing instructions: standing
- * instructions are per-agent-group and therefore identical in every room that
- * group is wired into. A rule set that applies in ONE channel would otherwise
- * have to be conditional prose taxed against every other channel's always-on
- * budget, and unenforceable besides.
- *
- * Value is a profile NAME resolving to
- * `groups/<folder>/channel-instructions/<name>.md`, mounted read-only at
- * /workspace/channel-instructions and injected by the runner. NULL (the norm)
- * means no channel instructions — there is no group-level fallback, because a
- * group-level operating rule set is what standing-instructions.md already is.
+ * Per-wiring instructions profile: operating rules for one room, deliberately separate from `default_tone` (016),
+ * which carries voice only. A profile NAME resolving to `groups/<folder>/channel-instructions/<name>.md`, mounted
+ * read-only and injected by the runner. NULL (the norm) means none; there is no group-level fallback, since
+ * standing-instructions.md already is that.
  */
 export const migration063: Migration = {
   version: 63,

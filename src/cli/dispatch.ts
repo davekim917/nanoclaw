@@ -94,9 +94,8 @@ export async function dispatch(
       }
       req = { ...req, args: { ...req.args, ...fill } };
 
-      // Fail-closed pre-handler check for sessions-get: returns "not found"
-      // regardless of whether the UUID exists in another group, preventing an
-      // existence oracle across group boundaries.
+      // Answers "not found" whether or not the id exists in another group, so there is no cross-group existence
+      // oracle.
       if (cmd.resource === 'sessions' && req.command === 'sessions-get' && req.args.id) {
         const s = await getSession(req.args.id as string);
         if (!s || s.agent_group_id !== ctx.agentGroupId) {
@@ -106,8 +105,7 @@ export async function dispatch(
     }
   }
 
-  // Under the central lease: the guard's reads (cli_scope, a replay's grant
-  // row) are raw by design (seam 3 §4.5 I-1).
+  // Under the central lease: the guard's reads are raw by design.
   const decision = await withCentralSync(
     () =>
       guard(commandGuard(cmd.name), {
@@ -231,12 +229,8 @@ registerApprovalHandler('cli_command', async ({ payload, approval, notify }) => 
   const callerContext = parseCallerContext(payload.callerContext) ?? { caller: 'host' };
   const response = await dispatch(frame, callerContext, { grant: approval });
 
-  // notify is best-effort here, not part of the approval's success/failure:
-  // dispatch() above has ALREADY executed (or attempted) the command, so a
-  // rejected notify must not fail this handler — an awaited rejection would
-  // propagate to the approval-processing caller, which could leave the
-  // approval row undeleted/still-clickable and risk replaying an
-  // already-executed, non-idempotent command.
+  // Best-effort: dispatch() has already run the command, and a rejected notify propagating to the approval caller
+  // could leave the approval clickable and replay a non-idempotent command.
   if (response.ok) {
     const localized = localizeIsoTimestamps(response.data);
     const data = typeof localized === 'string' ? localized : JSON.stringify(localized, null, 2);

@@ -2,14 +2,6 @@
  * Strict parser for template task files (tasks/*.md with YAML frontmatter).
  * Shared plumbing, not extension-specific code — the NanoClaw extension dir
  * is merely where the files live in a plugin.
- *
- * Upstream also puts `prepareTemplateTasks` here — the single stamp-time
- * validity gate that refuses two task names colliding on one id slug. It needs
- * scheduling's `taskNameSlug`, which this fork does not have yet (the slug is
- * still inlined in `makeTaskId`), so the create path keeps preparing tasks with
- * `prepareScheduledTask` directly for now.
- * TODO: add `prepareTemplateTasks` here once the scheduling theme
- * lands `taskNameSlug`; restamp cannot match a live series without it.
  */
 import fs from 'fs';
 import path from 'path';

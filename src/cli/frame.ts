@@ -35,11 +35,8 @@ export type ErrorCode =
   | 'approval-pending'
   | 'handler-error'
   | 'transport-error'
-  // The socket is bound (ownership is claimed) before startup finishes, so a
-  // request can arrive before archive init, FS reconciliation, the OneCLI
-  // preflight, container-config backfill, or channel-adapter setup have
-  // completed. dispatch() is not called at all for this code — never a
-  // handler-error, because the handler never ran.
+  // The socket binds before startup finishes; dispatch() is never called for this code, so it is never a
+  // handler-error.
   | 'not-ready';
 
 /**

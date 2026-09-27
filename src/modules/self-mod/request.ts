@@ -8,17 +8,9 @@
  * hold builders create the approval card when the guard holds. On approve,
  * the continuation re-enters the wrapped action and ./apply.ts runs.
  *
- * The container is untrusted and its MCP tools do not validate: the checks
- * here are the only ones, and a hand-written outbound row reaches them as
- * easily as a tool call. For install_packages that matters most — the DB row
- * carries the payload verbatim through to shell exec on apply.
- *
- * `parseMcpServerConfig` below is where a bad remote-MCP config fails
- * closed: it calls `isKnownRawSecret` (../../container-config.js) on every
- * header value, URL query value, and URL path segment, so a credential
- * never reaches the DB row this validator builds — durability of that
- * rejection lives entirely in that one function, not in this file's own
- * DB/hold-request plumbing.
+ * The container is untrusted and its MCP tools do not validate: these checks
+ * are the only ones. install_packages carries its payload verbatim to shell
+ * exec on apply.
  */
 import { createHash } from 'node:crypto';
 
@@ -133,17 +125,9 @@ export function escapeInvisibles(s: string): string {
 }
 
 /**
- * Fields `parseMcpServerConfig` accepts from an admin or a plugin stamp but
- * not from an agent. The approval card is the admin's only view of what gets
- * persisted, so this path refuses a field it cannot honour or cannot show,
- * rather than persist it unseen.
- *
- * - `cwd`: an absolute path fails `parseCwd`, and `validateMcpServers` strips
- *   the ./ and ${PLUGIN_ROOT}/${PLUGIN_DATA} forms from a server with no
- *   `pluginRoot` — which an agent-added server never has.
- * - `displayName`, `description`: persisted and shown to agents in the
- *   capability list, so they belong with an admin, who sets them with
- *   `ncl groups config add-mcp-server`.
+ * Fields accepted from an admin or a plugin stamp but not from an agent: the
+ * approval card is the admin's only view of what gets persisted, so a field it
+ * cannot honour or cannot show is refused rather than persisted unseen.
  */
 const AGENT_REFUSED_MCP_FIELDS: ReadonlyArray<readonly [field: string, reason: string]> = [
   [
@@ -218,11 +202,8 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
   let fields: string[];
   let opaqueWarning = '';
   if (serverConfig.type === 'http') {
-    // No redaction on the URL: `parseMcpServerConfig` rejects a credential in
-    // the path, the query, or a header before we get here, so the card shows
-    // exactly the destination that will be persisted — which is the thing an
-    // admin has to judge. Redacting here instead would have meant approving a
-    // secret we then wrote to container.json unredacted.
+    // No redaction on the URL: parse already rejected credentials, and the card
+    // must show exactly the destination that will be persisted.
     fields = [
       `name: ${escapeInvisibles(JSON.stringify(serverName))}`,
       `type: ${escapeInvisibles(JSON.stringify(serverConfig.type))}`,
@@ -231,11 +212,8 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
     if (serverConfig.headers !== undefined) {
       fields.push(`headers: ${escapeInvisibles(JSON.stringify(serverConfig.headers))}`);
     }
-    // Recognizable credential shapes are already rejected at parse. What is
-    // left is the unclassifiable case: an opaque path segment or query value
-    // that is either a tenant id or a bearer token, with nothing in the string
-    // to tell them apart. Name it for the human who is already approving this,
-    // rather than guessing in a regex — the URL is persisted verbatim.
+    // An opaque path segment or query value may be a tenant id or a bearer
+    // token; nothing in the string tells them apart, so the approver is warned.
     const opaque = opaqueUrlParts(serverConfig.url);
     if (opaque.length > 0) {
       opaqueWarning =
@@ -296,9 +274,7 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
 }
 
 export async function handleChangeModel(content: Record<string, unknown>, session: Session): Promise<void> {
-  // Model changes do NOT require admin approval — same as a user's no-approval
-  // `-m` flag. We validate shape here, then apply directly via performModelChange
-  // (which re-checks the group/provider/deny-list and restarts the container).
+  // No admin approval, like a user's `-m` flag; performModelChange re-checks the deny list.
   const slug = content.slug as string;
   const effort = content.effort as string | undefined;
   if (!slug) {

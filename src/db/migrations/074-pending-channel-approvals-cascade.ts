@@ -2,25 +2,11 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * `pending_channel_approvals` is the only child of `messaging_groups` that
- * nothing ever cleans up: the agent-group delete path
- * (`src/cli/resources/groups.ts`) removes its rows by `agent_group_id`, but no
- * path removes them by `messaging_group_id`, and migration 012 declared the FK
- * with the default NO ACTION. Two consequences, one visible and one latent:
- *
- *   1. A live install carries an orphan row whose parent messaging group is
- *      gone, so every `disableForeignKeys` migration re-logs
- *      "Pre-existing FK violations carried through migration" at boot.
- *   2. With `foreign_keys = ON` (`src/db/compose.ts`), deleting a messaging
- *      group that still holds a pending registration card fails outright.
- *
- * Delete the orphans, then rebuild the table with ON DELETE CASCADE on
- * `messaging_group_id` — the same recreate migration 073 used for the
- * workgroup-owned tables, because SQLite cannot alter a foreign-key action in
- * place. Columns, keys and defaults are copied from the tip schema (012's
- * table plus 013's title/options_json and 045's question); `agent_group_id`
- * keeps NO ACTION, since the agent-group delete path already clears those rows
- * explicitly and surfaces the count.
+ * `pending_channel_approvals` is the only `messaging_groups` child nothing cleans up by messaging group, and 012
+ * declared the FK NO ACTION: orphans re-log FK violations on every boot, and deleting a messaging group holding a
+ * pending card fails. Deletes the orphans, then rebuilds with ON DELETE CASCADE on `messaging_group_id` (SQLite
+ * cannot alter an FK action). `agent_group_id` keeps NO ACTION: the agent-group delete path clears those rows
+ * explicitly and reports the count.
  */
 export const migration074: Migration = {
   version: 74,

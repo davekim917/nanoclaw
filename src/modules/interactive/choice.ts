@@ -1,27 +1,10 @@
 /**
  * request_choice — a non-blocking button card backed by the approvals primitive.
  *
- * The container's `request_choice` MCP tool writes a `request_choice` system
- * action and returns at once. This module turns it into a card with the
- * agent's own options as buttons, via requestApproval with deliveryTarget
- * 'thread':
- *
- *   - no `to`: into the session's own conversation and thread — the routing
- *     the container sees (from the session manager);
- *   - `to`: top-level in the named destination (the card IS the ask), after the
- *     host re-authorizes the container's routing (authorizedDestination).
- *
- * The card outlives the container. The pending_approvals row is central, and a
- * module approval row carries no expiry: the only writer of `expires_at` on one
- * is the reject-with-reason hold, which a choice
- * card never enters. `approvers` narrows who may answer; `key` retires the agent
- * group's open card under the same key once the new one has posted ("replace,
- * never stack").
- *
- * An authorized click (approvals/choices.ts) reaches relayChoice, which writes
- * one host-marked line into the session a typed reply in the card's thread
- * would reach, and wakes it. What a value means, and who ought to answer, is
- * the agent's business; this module only carries the answer back.
+ * The card outlives the container: the pending_approvals row is central and
+ * carries no expiry. An authorized click reaches relayChoice, which writes one
+ * host-marked line into the session a typed reply in the card's thread would
+ * reach, and wakes it.
  */
 import type { OptionStyle, RawOption } from '../../channels/ask-question.js';
 import { resolveThreadPolicy } from '../../channels/channel-defaults.js';
@@ -70,10 +53,7 @@ interface ChoiceRequest {
   approvalScope?: ReleaseShipScope;
 }
 
-/**
- * Validate the container's payload. The MCP tool validates first; this is the
- * host's own check, since the outbound row is container-written.
- */
+/** The host's own validation: the outbound row is container-written. */
 function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | { error: string } {
   const { choiceId, title, question, options, key, approvers, to, channelType, platformId, approvalScope } = content;
   if (typeof choiceId !== 'string' || !ID_RE.test(choiceId)) return { error: 'choiceId is missing or malformed' };
@@ -151,23 +131,10 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     return;
   }
 
-  // Refuse a choiceId reuse while the earlier card is still live. Without
-  // this, two pending approvals could share one request_id: the reused card
-  // review finding (choice_receipts keys on the host-minted approval_id
-  // precisely so a reuse never collapses two receipts into one, but a
-  // clicker can still be shown the wrong card's text if two cards answer to
-  // the same id — refusing the second ask up front is the cheaper fix).
-  // Scoped globally, not per agent group: a compromised agent's own group is
-  // sufficient to create the collision either way.
-  //
-  // This read is the FAST PATH, not the guarantee. It and the insert inside
-  // requestApprovalOutcome are separated by every await below — approver
-  // validation, destination authorization — and delivery is excluded per
-  // session (src/delivery.ts `inflightDeliveries`, keyed on session.id), so
-  // two sessions of this agent group can both read "nothing pending" here.
-  // The guarantee is migration 078's partial unique index, honoured as
-  // 'duplicate-request' at the insert; this check only saves the work when
-  // the reuse is plain rather than racing.
+  // Refuse a choiceId reuse while the earlier card is live, globally: two cards
+  // answering to one id can show a clicker the wrong card's text. This read is
+  // only the FAST PATH — two sessions can race past it; the partial unique
+  // index on request_id is the guarantee ('duplicate-request' below).
   if (await getPendingApprovalByRequestId(request.choiceId)) {
     log.warn('request_choice refused: choiceId already has a pending approval', {
       sessionId: session.id,
@@ -215,9 +182,7 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     value: o.value,
     ...(o.style ? { style: o.style } : {}),
   }));
-  // Delivery failures notify the agent from inside requestApprovalOutcome;
-  // a lost reservation does not, because only this module knows what a
-  // reused choiceId means — so it gets the same refusal as the fast path.
+  // A lost reservation is not notified by requestApprovalOutcome, so it gets the fast path's refusal here.
   const outcome = await requestApprovalOutcome({
     session,
     agentName: session.agent_group_id,
@@ -254,21 +219,13 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
   }
 }
 
-/**
- * The refusal for a choiceId that is already live. One wording for both the
- * fast-path read and the lost reservation, so an agent cannot tell a race
- * from a plain reuse — there is nothing it could usefully do differently.
- */
 function duplicateChoiceRefusal(choiceId: string): string {
   return `request_choice failed: choiceId "${choiceId}" already has a pending answer.`;
 }
 
 /**
  * The messaging group a container-resolved destination names, if this agent
- * group may post there — the check an ordinary outbound message gets
- * in delivery.ts: resolve the group origin-first, then allow the
- * session's own chat, and require an agent_destinations channel row for any
- * other (skipped, as there, when the agent-to-agent module's table is absent).
+ * group may post there — the same check delivery.ts gives an ordinary outbound message.
  */
 async function authorizedDestination(
   session: Session,
@@ -292,18 +249,9 @@ async function authorizedDestination(
 }
 
 /**
- * Replace, never stack: retire every open request_choice card this agent
- * group posted under `key` BEFORE `newest` (createdBefore), so the newest card
- * always survives. Two same-key asks from different sessions of one group can
- * be handled at the same time — delivery's active poll and its
- * sweep are separate loops — and "everything but my own
- * row" let each retire the other, leaving no card open.
- *
- * The key lives in the row's payload JSON, not a column of its own: open
- * choice cards per group are few, getPendingApprovalsByAction already narrows
- * to this action (indexed by idx_pending_approvals_action_status), filtering in
- * JS keeps the query portable (no json_extract), and a column would be schema
- * for one action.
+ * Replace, never stack: retire only cards under `key` created BEFORE `newest`.
+ * Two same-key asks can be handled concurrently, and "everything but my own
+ * row" would let each retire the other, leaving no card open.
  */
 async function supersedeOpenChoices(agentGroupId: string, key: string, newest: PendingApproval): Promise<void> {
   for (const row of await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)) {
@@ -333,12 +281,8 @@ function payloadKey(row: PendingApproval): string | undefined {
 
 /**
  * The session a typed reply in the card's thread would reach, resolved as the
- * router resolves one — thread policy, per-thread
- * promotion, then resolveSession,
- * which creates the session when absent. So a click behaves like a reply in
- * the ask's thread and lands where that conversation already lives.
- * Undefined when the card's channel is not wired to the agent group (a
- * destination only), and the caller falls back to the requester.
+ * router does (creating it when absent). Undefined when the card's channel is
+ * not wired to the agent group; the caller then falls back to the requester.
  */
 async function cardConversationSession(
   approval: PendingApproval,
@@ -370,13 +314,9 @@ async function cardConversationSession(
 }
 
 /**
- * Thread id of a reply in the thread under message `messageId` on `mg`'s
- * channel. Slack only: the adapter encodes a thread as `slack:<channel>:<ts>`
- * (@chat-adapter/slack) and the messaging
- * group stores the channel-root id `slack:<channel>` (chat-sdk-bridge.ts),
- * the composition the router already uses for root DMs. A card's
- * platform_message_id is its Slack ts: the bridge returns postMessage's id,
- * which is chat.postMessage's `ts`. Elsewhere: null, where a channel-root reply lands.
+ * Slack only: a thread id is `slack:<channel>:<ts>`, the messaging group stores
+ * `slack:<channel>`, and a card's platform_message_id is its Slack ts.
+ * Elsewhere: null, where a channel-root reply lands.
  */
 function replyThreadId(mg: MessagingGroup, messageId: string | null): string | null {
   // Same predicate as isSlackChannelType in router.ts; router.ts imports module code, so not imported here.
@@ -388,26 +328,12 @@ function replyThreadId(mg: MessagingGroup, messageId: string | null): string | n
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
 /**
- * The line the agent receives:
- *
- *   choice_response choice_id=<id> approval_id=<aid> value=<v> label=<l> user_id=<id> user_name=<n>
- *   [release_scope=<canonical-json>]
- *
- * Fixed key order, every value percent-encoded with encodeURIComponent, so it
- * stays one line whatever a label or name contains, and it reaches the model
- * unchanged: the runner XML-escapes chat text (& < > ", in the formatter
- * in container/agent-runner/src), and encodeURIComponent output contains none
- * of those. Lone surrogates, which encodeURIComponent throws on, become U+FFFD.
- * Anyone can type this line, and a host note can echo text it was sent, so the
- * agent trusts it only inside a message the runner marks origin="host" AND
- * event="choice_response" (notifyAgent with CHOICE_RESPONSE_EVENT).
- *
- * `approval_id` is the host-minted id `choice_receipts` (migration 077) keys
- * on — `choice_id` alone is agent-chosen and not unique, so an agent that
- * wants to cite the durable receipt for this answer needs the approval id,
- * not just the choice id. Scoped release cards append `release_scope`, but
- * only after the host has re-validated the pending row's saved payload. It is
- * an encoded copy of the host-canonical JSON, not agent-supplied display text.
+ * The line the agent receives. Fixed key order, every value percent-encoded,
+ * so it stays one line and survives the runner's XML escaping unchanged; lone
+ * surrogates (which encodeURIComponent throws on) become U+FFFD. Anyone can type
+ * this line, so the agent trusts it only inside a message marked origin="host"
+ * AND event="choice_response". `approval_id` is the unique key `choice_receipts`
+ * uses; `choice_id` is agent-chosen.
  */
 export function formatChoiceResponse(fields: {
   choiceId: string;
@@ -448,10 +374,7 @@ function responseReleaseScope(approval: PendingApproval): string | undefined {
 async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
   const target = (await cardConversationSession(ctx.approval, ctx.requester)) ?? ctx.requester;
   if (!target) return null;
-  // The click reaches the host without the platform's display name
-  // (ResponsePayload in src/response-registry.ts), so the name comes from
-  // the clicker's users row — an authorized clicker holds a user_roles row,
-  // which references users(id).
+  // The click carries no display name, so it comes from the clicker's users row.
   const user = await getUser(ctx.userId);
   const id = `choice-answer-${ctx.approval.approval_id}`;
   try {
@@ -469,11 +392,8 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
       { id, event: CHOICE_RESPONSE_EVENT },
     );
   } catch (err) {
-    // notifyAgent inserts the row, then reads the session back and wakes it
-    // (primitive.ts). A failure after the insert still leaves a due row, and
-    // the sweep wakes a session with due rows (sweep-scheduling,
-    // sweep-continuation) — so a recorded answer is delivered.
-    // Only an unrecorded one may reopen the card (ChoiceHandler contract).
+    // A failure after notifyAgent's insert leaves a due row the sweep will
+    // wake, so the answer is delivered; only an unrecorded one may reopen the card.
     if (await sessionMessageExists(target.agent_group_id, target.id, id)) {
       log.warn('Choice answer recorded but the wake failed — the sweep will wake the session', {
         approvalId: ctx.approval.approval_id,

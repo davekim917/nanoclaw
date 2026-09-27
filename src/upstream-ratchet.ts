@@ -1,76 +1,15 @@
 /**
- * Upstream-ownership ratchet — the fork's divergence from nanocoai/nanoclaw.
+ * Upstream-ownership ratchet: `src/upstream-ratchet.json` records, for every path upstream owns at a pinned
+ * commit, the fork's divergence (`diff`), mode and sha256. Growth in `diff` fails; shrink is allowed; a
+ * byte-identical file that stops being so is NEW divergence and fails.
  *
- * `src/upstream-ratchet.json` is an allowlist of every path upstream owns at one
- * PINNED upstream commit, each with the size of the fork's divergence in that
- * file (`diff`), the fork's file mode, and a sha256 of the fork's current bytes.
- * Growth in `diff` fails; shrink is always allowed; a file that was
- * byte-identical and is no longer is NEW divergence and fails.
+ * This module cannot measure diff size (host suites mock `child_process`, and CI clones carry no upstream
+ * objects); it only verifies the manifest is CURRENT. Arbitration lives in `src/upstream-ratchet-core.ts`, git
+ * in `scripts/upstream-ratchet-report.ts`. Fork-added paths are out of scope.
  *
- * ── Reach, stated plainly ──────────────────────────────────────────────────
- *
- * This module, and the vitest suite that drives it, CANNOT measure diff size.
- * A test here has no git: `src/test-hermeticity.ts` mocks `child_process` for
- * every host suite, and the fork's CI clone carries no upstream commit objects
- * until the ratchet's own CI step fetches them (the same reason
- * `src/mailbox-seam-manifest.ts` ships a committed hash manifest). So the split
- * is three ways:
- *
- *  - THIS module verifies the manifest is CURRENT: every upstream-owned file
- *    still hashes AND still has the mode it had when its `diff` was measured,
- *    deleted stays deleted, present stays present, the pinned path set is
- *    complete, and every entry is internally well formed. That is what makes
- *    the recorded `diff` trustworthy without git.
- *  - `src/upstream-ratchet-core.ts` holds the pure arbitration — parsing git's
- *    output, building entries, classifying GROWTH / NEW / SHRINK / STALE, and
- *    the `--write` gate — so all of it has hermetic tests.
- *  - `scripts/upstream-ratchet-report.ts` runs git and picks an exit code.
- *
- * Paths the FORK added are out of scope — they are not upstream-owned, and
- * there is nothing to ratchet against. Only the paths in
- * `git ls-tree -r <pinned sha>` get an entry, and every one of them does: no
- * exclusions, and the `paths` seal below makes an omission fail rather than pass.
- *
- * ── Why an ignored path is recorded rather than checked ────────────────────
- *
- * An entry carrying `ignored: true` skips the presence, mode and hash checks.
- * That looks like a hole, and a reviewer read it as one, so the reasoning is
- * here rather than in a commit message.
- *
- * **The objection.** A deleted upstream path matched by an ignore rule can be
- * recreated with arbitrary bytes, and those bytes can change again later, and
- * neither the test nor the report says a word. Resurrection checks exist
- * precisely to catch a deleted upstream file coming back.
- *
- * **Why it does not apply.** Ordinary git operations leave an ignored path
- * untracked, so whatever is sitting there is not fork source. This tool measures
- * the divergence of the fork's SOURCE from upstream's; untracked bytes are
- * whatever the machine happened to be doing. The one real instance is a runtime
- * lock file that a running system recreates on its own checkout, so "did it come
- * back?" answers "is the system up?" — which is not a question about divergence,
- * and answering it made the host suite red on a production checkout.
- *
- * `git add -f` CAN track an ignored path, and that is not a hole. Once it is
- * tracked, `git check-ignore` stops reporting it (it is index-aware), so the
- * entry loses `ignored` on the next regeneration and the deleted → present
- * transition classifies as GROWTH, which needs an explicit `--accept`. Taking an
- * ignored upstream path back into the fork is therefore a reviewed act, exactly
- * like any other new divergence. Making the path source deliberately — by
- * editing `.gitignore` — goes through the ratchet too: `.gitignore` is itself an
- * upstream-owned file with its own entry, so that edit moves a diff.
- *
- * **What is NOT claimed.** That the tree is clean, or that nothing is sitting
- * there. Only that the fork's committed content is unchanged, which is the
- * property this whole file exists to check.
- *
- * **What holds it up.** The exemption is load-bearing only while `ignored`
- * really does mean untracked, so that is asserted rather than assumed:
- * `buildManifest` refuses at write time if an ignored path is in the fork index
- * (an ignore rule over a tracked file is a misconfiguration, and git honours the
- * index over the rule), `checkEntry` rejects an `ignored` entry that is not also
- * `deleted`, and the hermetic suite asserts that pairing over the real manifest.
- * A per-file exception list was considered and rejected: it would need a human
- * to maintain, and it would say nothing about why.
+ * An `ignored: true` entry skips presence/mode/hash checks: an ignored path is untracked, so its bytes are not
+ * fork source. That holds only while `ignored` means untracked: `buildManifest` refuses an ignored path in the
+ * index, and `checkEntry` rejects `ignored` without `deleted`.
  *
  * Pure `fs` + `crypto` by construction. Do not import `child_process` here.
  */
@@ -79,14 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/**
- * The three blob modes git records for a file.
- *
- * Lives here rather than in `src/upstream-ratchet-core.ts` because it is part of
- * the manifest's shape, and because the dependency between the two modules must
- * run one way only: core imports this module, never the reverse (the host is
- * ESM, where a cycle is a runtime trap — see CLAUDE.md, Module System).
- */
+/** Defined here, not in core: core imports this module, never the reverse (an ESM cycle is a runtime trap). */
 export type GitMode = '100644' | '100755' | '120000';
 
 const GIT_MODES: readonly GitMode[] = ['100644', '100755', '120000'];
@@ -95,41 +27,21 @@ export function isGitMode(value: string): value is GitMode {
   return (GIT_MODES as readonly string[]).includes(value);
 }
 
-/**
- * A submodule. The ratchet cannot express one: there are no bytes to hash and no
- * lines to count, so every check it makes would be vacuous. Refused loudly on
- * either side rather than silently recorded as something it is not.
- */
+/** A submodule: nothing to hash or count, so it is refused on either side rather than recorded. */
 export const GITLINK_MODE = '160000';
 
-/** The repo this module was loaded from — a worktree when it is loaded from one. */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** Manifest location, relative to a repo root. */
 export const MANIFEST_REL = 'src/upstream-ratchet.json';
 
-/** The command that regenerates the manifest, quoted in every finding's hint. */
 export const REGENERATE_HINT = 'pnpm run ratchet:report -- --write';
 
 /**
- * One upstream-owned path.
- *
- *  - `diff`   added+deleted lines vs the pinned commit, plus one unit when the
- *             fork's file mode differs from upstream's. 0 means byte- and
- *             mode-identical. For a path the fork DELETED this is upstream's own
- *             line count. For a binary path it is 1 for the bytes (plus the mode
- *             unit if any), because there are no lines to count.
- *  - `mode`   the FORK's working-tree mode, or upstream's when the fork deleted
- *             the path. A mode change carries no bytes and no lines, so without
- *             this field `chmod -x` on an upstream-owned file is invisible.
- *  - `sha256` sha256 of the FORK's current bytes, or `null` when the fork has
- *             deleted the path. For a symlink it is the sha256 of the link
- *             TARGET STRING, which is what git stores for a mode-120000 blob.
- *  - `deleted` present only when the fork deleted the path.
- *  - `ignored` present only when the fork's `.gitignore` covers the path. Always
- *             together with `deleted`, because `git check-ignore` is index-aware
- *             and never reports a tracked path. See the note below.
- *  - `binary`  present only when git reported the path as binary (`-` numstat).
+ * - `diff`: added+deleted lines vs the pinned commit, +1 when the mode differs; upstream's line count for a
+ *   path the fork deleted; 1 for binary bytes.
+ * - `mode`: the fork's working-tree mode (upstream's when deleted); without it `chmod -x` would be invisible.
+ * - `sha256`: of the fork's bytes, `null` when deleted; for a symlink, of the target string (git's 120000 blob).
+ * - `ignored`: always together with `deleted`, because `git check-ignore` never reports a tracked path.
  */
 export interface UpstreamRatchetEntry {
   diff: number;
@@ -141,44 +53,22 @@ export interface UpstreamRatchetEntry {
 }
 
 export interface UpstreamRatchetManifest {
-  /** The PINNED upstream commit, full 40-hex. Never `upstream/main` — a moving
-   *  base would measure upstream's activity rather than the fork's divergence.
-   *  Re-pinning is a deliberate act: `--upstream <rev>`. */
+  /** The pinned upstream commit (40-hex), never a moving ref; re-pin with `--upstream <rev>`. */
   upstream: string;
   /**
-   * Coverage seal: sha256 of the pinned commit's sorted path list joined by
-   * newlines.
-   *
-   * Without it, deleting one entry line leaves valid, sorted, canonical JSON
-   * that every hermetic check passes — and that upstream-owned path is then
-   * silently unprotected. The seal is computed from the path SET, not from the
-   * entries' contents, so an ordinary regeneration never moves it; it changes
-   * only on a re-pin, where upstream's own tree changed.
+   * sha256 of the pinned commit's sorted path list. Without it, deleting an entry leaves a manifest every check
+   * passes; it moves only on a re-pin.
    */
   paths: string;
-  /** One entry per path in `git ls-tree -r <upstream>`, sorted by path. */
   files: Record<string, UpstreamRatchetEntry>;
 }
 
-type FindingKind =
-  /** The fork's bytes moved since `diff` was measured — `diff` is now unproven. */
-  | 'changed'
-  /** The fork's file mode moved since `diff` was measured. */
-  | 'mode'
-  /** The entry is not marked deleted, but the file is absent from the tree. */
-  | 'missing'
-  /** The entry is marked deleted, but the file is present in the tree. */
-  | 'resurrected'
-  /** The manifest itself is not internally well formed. */
-  | 'malformed';
+type FindingKind = 'changed' | 'mode' | 'missing' | 'resurrected' | 'malformed';
 
 export interface Finding {
   kind: FindingKind;
-  /** The upstream-owned path, or the manifest itself for a manifest-level finding. */
   path: string;
-  /** What is wrong, in one line. */
   detail: string;
-  /** What to run to fix it, in one line. */
   hint: string;
 }
 
@@ -191,20 +81,9 @@ export function readManifest(repoRoot: string = REPO_ROOT): UpstreamRatchetManif
 }
 
 /**
- * Whether the LOCAL manifest is committed as a symlink rather than a regular
- * file — checked with `lstat` (which does not follow the link), before
- * `readManifest`'s `fs.readFileSync` (which does) ever reads through it.
- * `false` for a genuinely missing manifest too: that is `readManifest`'s job
- * to report, not this check's.
- *
- * `src/upstream-ratchet.json` is a generated artifact this tool itself always
- * writes as a regular file. A symlinked one is refused outright rather than
- * reconciled, in both the working-tree report and `--check <ref>` (see
- * `manifestSymlinkFinding` in `src/upstream-ratchet-core.ts` for the ref-tree
- * counterpart and the reason: `cat-file --filters` on a 120000 entry returns
- * the raw target string, unfiltered, while a real checkout's
- * `fs.readFileSync` follows the link — the two would silently measure two
- * different files.
+ * Whether the local manifest is a symlink (`lstat`, before `readManifest` follows it); `false` when missing.
+ * Refused because `cat-file --filters` on a 120000 entry returns the target string while a checkout follows the
+ * link, so the two would measure different files.
  */
 export function isManifestSymlink(repoRoot: string = REPO_ROOT): boolean {
   try {
@@ -221,47 +100,20 @@ export function writeManifest(manifest: UpstreamRatchetManifest, repoRoot: strin
   fs.writeFileSync(target, serializeManifest(manifest));
 }
 
-/**
- * The coverage seal for a set of upstream-owned paths.
- *
- * Sorted, joined by `\n` with no trailing newline, sha256'd. Deterministic and
- * order-independent, so two regenerations of the same pinned commit agree.
- */
+/** Sorted, joined by `\n` with no trailing newline, sha256'd, so regenerations of one pin agree. */
 export function pathsSeal(paths: readonly string[]): string {
   return createHash('sha256')
     .update([...paths].sort().join('\n'), 'utf8')
     .digest('hex');
 }
 
-/** The manifest with its seal recomputed from its own key set. */
 export function sealManifest(manifest: UpstreamRatchetManifest): UpstreamRatchetManifest {
   return { ...manifest, paths: pathsSeal(Object.keys(manifest.files)) };
 }
 
 /**
- * The manifest's ON-DISK form: ONE LINE PER FILE ENTRY, sorted by path.
- *
- * `JSON.stringify(…, null, 2)` would spread every entry over four to six lines
- * and indent them, which makes this file a merge minefield: two PRs that each
- * regenerate it after touching unrelated upstream-owned files would collide on
- * the indented braces between their entries. One line per path means git's
- * line-level merge resolves them cleanly — two regenerations conflict only on
- * the paths they BOTH touched, which is exactly the case a human should look at.
- *
- * The file carries `upstream`, `paths` and `files` and nothing else. No totals,
- * no counts, no timestamps: an aggregate would change on every regeneration
- * regardless of which path moved, so every PR would conflict on it, and it would
- * be a second copy of a number `scripts/upstream-ratchet-report.ts` derives from
- * the entries anyway. (`paths` is a seal over the key set, not an aggregate over
- * their contents — it is stable across ordinary regenerations.)
- *
- * Deterministic by construction — sorted paths, fixed key order within an entry,
- * optional flags only when true — so `--write` twice on an unchanged tree
- * produces byte-identical output. `src/upstream-ratchet.json` is in
- * `.prettierignore`, because prettier would reflow it straight back into the
- * indented shape this avoids.
- *
- * Still ordinary JSON: `readManifest` is a plain `JSON.parse`.
+ * On-disk form: one line per entry, sorted, fixed key order, no aggregates, so two PRs regenerating it conflict
+ * only on paths they both touched. The file is in `.prettierignore` because prettier would reflow it.
  */
 export function serializeManifest(manifest: UpstreamRatchetManifest): string {
   const sorted = sortManifest(manifest);
@@ -269,8 +121,6 @@ export function serializeManifest(manifest: UpstreamRatchetManifest): string {
   const lines = [`{"upstream":${JSON.stringify(sorted.upstream)},"paths":${JSON.stringify(sorted.paths)},"files":{`];
   paths.forEach((relPath, index) => {
     const entry = sorted.files[relPath];
-    // Fixed key order, and an optional flag only when it is set — two runs over
-    // the same tree must produce the same bytes.
     const fields = [
       `"diff":${entry.diff}`,
       `"mode":${JSON.stringify(entry.mode)}`,
@@ -286,7 +136,6 @@ export function serializeManifest(manifest: UpstreamRatchetManifest): string {
   return lines.join('\n') + '\n';
 }
 
-/** The manifest with `files` in path order, so a regeneration produces a stable diff. */
 function sortManifest(manifest: UpstreamRatchetManifest): UpstreamRatchetManifest {
   const files: Record<string, UpstreamRatchetEntry> = {};
   for (const key of Object.keys(manifest.files).sort()) files[key] = manifest.files[key];
@@ -294,28 +143,18 @@ function sortManifest(manifest: UpstreamRatchetManifest): UpstreamRatchetManifes
 }
 
 /**
- * Why a manifest key is not usable as a repo-relative path, or `null`.
- *
- * Called BEFORE any filesystem access. A manifest key is joined to the repo root
- * and then `lstat`-ed and read; `../../.ssh/id_rsa` as a key would make the
- * hermetic test read outside the checkout, and the hermeticity tripwire guards
- * WRITES, not reads. The manifest is generated, so none of this should ever
- * fire — it fires when someone hand-edits the file, which is precisely when the
- * check is worth having.
+ * Why a manifest key is not a usable repo-relative path, or `null`. Runs before any fs access: a hand-edited key
+ * like `../../.ssh/id_rsa` would otherwise make the hermetic test read outside the checkout.
  */
 export function validateRelPath(relPath: string, repoRoot: string = REPO_ROOT): string | null {
   if (relPath === '') return 'the path is empty';
   if (relPath.includes('\0')) return 'the path contains a NUL byte';
-  // Git stores `/` on every platform. A backslash is a literal character in a
-  // git path, not a separator, so a key containing one cannot have come from
-  // `ls-tree` output on any host and is a hand edit or a Windows-ism.
+  // Git paths always use `/`; a backslash can only be a hand edit.
   if (relPath.includes('\\')) return 'the path contains a backslash';
   if (relPath.startsWith('/') || /^[A-Za-z]:/.test(relPath)) return 'the path is absolute';
   const segments = relPath.split('/');
   if (segments.some((segment) => segment === '')) return 'the path has an empty segment';
   if (segments.some((segment) => segment === '.' || segment === '..')) return 'the path has a "." or ".." segment';
-  // Belt and braces: even with the lexical checks above, the resolved path must
-  // land inside the repo.
   const resolved = path.resolve(repoRoot, relPath);
   const root = path.resolve(repoRoot);
   if (resolved !== root && !resolved.startsWith(root + path.sep)) return 'the path resolves outside the repository';
@@ -323,27 +162,14 @@ export function validateRelPath(relPath: string, repoRoot: string = REPO_ROOT): 
 }
 
 /**
- * Why the entry's PHYSICAL location is outside the repo, or `null`.
- *
- * `validateRelPath` is lexical, and `path.resolve` never touches the disk. That
- * is not enough on its own: an ancestor DIRECTORY can be a symlink pointing
- * anywhere. In this very checkout `node_modules` is a symlink to another tree,
- * so a hand-written key like `node_modules/<file>` passes every lexical rule and
- * is then read from outside the repository. The hermeticity tripwire guards
- * writes, not reads, so nothing else would catch it.
- *
- * Resolves the entry's PARENT and walks up to the nearest ancestor that exists,
- * deliberately never following the final component — the entry itself may well
- * be a symlink, and hashing the link target string rather than the pointee is
- * the whole point of `hashFile`. Segments that do not exist cannot be symlinks,
- * so re-joining them lexically is safe.
+ * Why the entry's physical parent resolves outside the repo, or `null`: an ancestor directory can be a symlink
+ * (`node_modules` is one here) even when every lexical rule passes. Never follows the final component, since
+ * `hashFile` hashes a symlink's target string.
  */
 export function ancestorEscape(relPath: string, repoRoot: string = REPO_ROOT): string | null {
   const root = realpath(repoRoot) ?? path.resolve(repoRoot);
   let dir = path.dirname(path.resolve(repoRoot, relPath));
   const below: string[] = [];
-  // Bounded: one hop per path segment, and `dirname` is a fixed point at the
-  // filesystem root, so this cannot spin.
   for (let hop = 0; hop < 4096; hop += 1) {
     const real = realpath(dir);
     if (real !== null) {
@@ -354,8 +180,6 @@ export function ancestorEscape(relPath: string, repoRoot: string = REPO_ROOT): s
       return null;
     }
     const parent = path.dirname(dir);
-    // Nothing along the path exists, so nothing can be a symlink and the lexical
-    // check already settled it.
     if (parent === dir) return null;
     below.unshift(path.basename(dir));
     dir = parent;
@@ -374,25 +198,8 @@ function realpath(abs: string): string | null {
 }
 
 /**
- * sha256 of one path's content, or `null` when it does not exist.
- *
- * Symlink-aware: `lstat` first, and for a symlink hash the TARGET STRING rather
- * than following the link. Two of upstream's paths are mode-120000 blobs
- * (`.agents/skills`, `AGENTS.md`), and git's content for those is the target
- * string. Following them instead would hash the pointee, so a re-aimed symlink
- * would read as unchanged and a dangling one would read as deleted.
- *
- * Reads the target as RAW BYTES (`{ encoding: 'buffer' }`), not as a decoded
- * string re-encoded to UTF-8: a symlink target is whatever byte sequence the
- * OS stores, with no encoding guarantee, and `readlinkSync` (string mode)
- * decodes it as UTF-8 first — silently mangling a non-UTF8 target before this
- * function ever sees it. `scripts/upstream-ratchet-report.ts --check <ref>`
- * hashes a symlink's git blob content directly (git stores the target string
- * verbatim, byte for byte, with no encoding of its own), so the two sides
- * must both be byte-based to ever agree on a non-UTF8 target. Both of this
- * fork's real symlinks are plain ASCII, so this is unobservable on the
- * committed manifest today — ASCII round-trips identically through UTF-8
- * either way — and changes no recorded hash.
+ * sha256 of one path's content, or `null` when absent. A symlink hashes its target string as raw bytes (git's
+ * 120000 blob content); following it or decoding it as UTF-8 would disagree with `--check <ref>`.
  */
 export function hashFile(abs: string): string | null {
   const stat = lstat(abs);
@@ -402,19 +209,8 @@ export function hashFile(abs: string): string | null {
 }
 
 /**
- * The git file mode of a path in the WORKING TREE, or `null` when it is absent.
- *
- * Deliberately derived from `lstat` rather than from `git ls-files -s`. Every
- * other measurement this tool makes is against the working tree — `git diff
- * <commit>` with no second commit, and `hashFile` on the bytes on disk — so
- * taking the mode from the INDEX would mix two different trees into one entry.
- * It would also wedge the hermetic check: an unstaged `chmod +x` leaves the
- * index at 100644 forever, so the recorded mode would permanently disagree with
- * the file, and regenerating could not fix it.
- *
- * A path that is neither a regular file nor a symlink (a directory, a socket)
- * has no blob mode; `null` there would read as "deleted", so it is reported by
- * the caller instead.
+ * The working-tree mode from `lstat`, or `null` when absent. Not from the index: every other measurement is
+ * against the working tree, and an unstaged `chmod +x` would leave the index mode permanently stale.
  */
 export function fileModeOf(abs: string): GitMode | null {
   const stat = lstat(abs);
@@ -425,7 +221,7 @@ export function fileModeOf(abs: string): GitMode | null {
   return (stat.mode & 0o100) !== 0 ? '100755' : '100644';
 }
 
-/** Whether a path exists, symlinks included (a dangling link still counts). */
+/** Whether a path exists; a dangling symlink counts. */
 export function pathExists(abs: string): boolean {
   return lstat(abs) !== null;
 }
@@ -441,20 +237,14 @@ function lstat(abs: string): fs.Stats | null {
 }
 
 /**
- * One argument, safe to paste into a POSIX shell.
- *
- * The hints this module and the report script print are meant to be run
- * verbatim. An upstream path may hold a space, a quote, a newline or a leading
- * dash, and an unquoted one would split into two arguments or be read as an
- * option. Single quotes take everything literally; the only character that has
- * to be handled is the single quote itself.
+ * One argument, single-quoted for a POSIX shell: hints are pasted verbatim and a path may hold spaces, quotes,
+ * newlines or a leading dash.
  */
 export function shellQuote(value: string): string {
   if (value !== '' && /^[A-Za-z0-9_./@:+-]+$/.test(value) && !value.startsWith('-')) return value;
   return `'${value.split("'").join(`'\\''`)}'`;
 }
 
-/** `--accept <path>` for one path, quoted so it survives a copy-paste. */
 export function acceptFlag(relPath: string): string {
   return `--accept ${shellQuote(relPath)}`;
 }
@@ -463,14 +253,8 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 
 /**
- * Where `checkTree`/`checkEntry` read presence, mode and content from.
- *
- * The default is the local working tree (`fsTreeReader`), which is what every
- * existing caller gets when it omits the parameter — behavior is unchanged.
- * `scripts/upstream-ratchet-report.ts --check <ref>` supplies a reader backed
- * by `git ls-tree`/`cat-file --batch` over a commit instead, so the SAME
- * per-entry currency logic (missing / resurrected / mode / changed, and the
- * `ignored` skip) runs against a bare ref with no working tree at all.
+ * Where `checkTree`/`checkEntry` read presence, mode and content: the working tree by default, or a git commit
+ * (`--check <ref>`) so the same per-entry logic runs without a checkout.
  */
 export interface TreeReader {
   exists(relPath: string): boolean;
@@ -478,7 +262,6 @@ export interface TreeReader {
   hashOf(relPath: string): string | null;
 }
 
-/** The default `TreeReader`: the local working tree under `repoRoot`. */
 function fsTreeReader(repoRoot: string): TreeReader {
   return {
     exists: (relPath) => pathExists(path.join(repoRoot, relPath)),
@@ -488,61 +271,11 @@ function fsTreeReader(repoRoot: string): TreeReader {
 }
 
 /**
- * Whether `value` even has the SHAPE of a manifest — an object (never `null`,
- * never an array) with `upstream`/`paths` as strings and `files` as a
- * (possibly empty, but non-null, non-array) object. Called BEFORE
- * `checkTree`, `classify`, `counts`, or `resolveCommit` ever read a property
- * off the parsed value, on BOTH the working-tree path (right after
- * `readManifest`, in `main()`) and the `--check <ref>` path (right after
- * `JSON.parse`-ing `git show <ref>:...json`, in `runCheck`) — closing the
- * whole "throws instead of reporting" class in this one place rather than
- * guarding each call site separately, which is how it stayed open long enough
- * for a top-level `null` to reach `resolveCommit` uncaught.
- *
- * `--check` reads `committed` from an ARBITRARY ref's content, never
- * guaranteed well-formed the way `readManifest`'s local file effectively
- * always is (this tool is the only thing that ever writes it) — but the
- * working tree is not exempt either: a hand-edited or corrupted local
- * `src/upstream-ratchet.json` hits the exact same `.upstream` dereference in
- * `main()`, so both paths get the same guard rather than treating the local
- * file as trusted by convention.
- *
- * ALSO validates the SHAPE of `upstream` (a 40-character commit sha) and
- * `paths` (a 64-character sha256 hex digest) rather than just their type.
- * This used to be `checkTree`'s own `COMMIT_RE` check, run AFTER this
- * function, on the next line — which meant an invalid-but-string pin like
- * `"not-a-sha"` or a 7-character short sha passed here and reached
- * `resolveCommit`'s `git rev-parse` UNCAUGHT: that call is itself an object
- * lookup, so it either misreports the failure as "not in this clone, run:
- * git fetch" (exit 2, wrong diagnosis) or — for a short sha that happens to
- * resolve locally — silently accepts a pin this tool never writes in that
- * form. Moved here so both call sites (`runCheck` and `main()`) catch it
- * before any object lookup, with one JSON-safe MALFORMED finding, exit 1.
- * The seal-equality check (`paths` against the ACTUAL computed seal of
- * `files`' keys) still lives in `checkTree`, since it needs the file list
- * this function deliberately does not require.
- *
- * `opts.unpinnedOk` (default `false`) is the ONLY escape hatch from the
- * 40-hex/64-hex shape rule above, and it exists for exactly one caller:
- * `main()` synthesizing the not-yet-pinned in-memory baseline
- * (`{ upstream: '', paths: '', files: {} }`) when `--upstream <rev>` creates
- * a manifest for the first time — a value this tool builds itself, never one
- * read off disk or off a ref. Every OTHER caller — `checkTree`, `runCheck`'s
- * own call on a `--check <ref>`'s committed manifest, and `main()`'s call on
- * whatever `readManifest` returned for an EXISTING on-disk manifest — passes
- * no `opts` and gets the strict, no-exceptions check. An on-disk or
- * checked-ref manifest can never legitimately carry an empty pin: the
- * committed baseline case is over the instant `--write` first runs, since
- * `writeManifest` never serializes an empty `upstream`. A carried-over empty
- * pin reaching `resolveCommit('')` used to exit 2 with a plain "not in this
- * clone" stderr line instead of this function's structured MALFORMED finding
- * (exit 1, JSON-safe) — see the fork issue tracker, "upstream-ratchet
- * --check: reject an empty upstream pin before resolveCommit".
- *
- * Per-entry validation (`diff`/`mode`/`sha256`/`deleted`/`ignored`/`binary`
- * shapes) stays in `checkEntry`, which already never crashes anything
- * downstream because every field read there is either optional-chained or
- * already defended.
+ * Whether `value` has the shape of a manifest: a plain object, `upstream` a 40-hex sha, `paths` a 64-hex digest,
+ * `files` an object. Both `main()` and `--check <ref>` call it before any property read or `resolveCommit`, so a
+ * malformed manifest yields a MALFORMED finding instead of a throw or a misdiagnosed `git fetch` hint.
+ * `unpinnedOk` exists only for `main()`'s in-memory baseline when `--upstream` creates the first manifest; on-disk
+ * and ref manifests are always checked strictly.
  */
 export function validateManifestShape(value: unknown, opts: { unpinnedOk?: boolean } = {}): Finding[] {
   const unpinnedOk = opts.unpinnedOk ?? false;
@@ -600,38 +333,21 @@ export function validateManifestShape(value: unknown, opts: { unpinnedOk?: boole
 }
 
 /**
- * Every way the tree and the committed manifest disagree.
- *
- * An empty result means the manifest is CURRENT — not that the fork is at zero
- * divergence, and not that the recorded `diff` values are the smallest they
- * could be. See the reach note at the top of this file.
- *
- * `reader` defaults to the local working tree; passing a git-commit-backed one
- * (see `TreeReader` above) checks a ref's tree instead, with no fs access.
- * The physical ancestor-symlink-escape check (`ancestorEscape`) only applies to
- * a real filesystem, so it runs only for the default reader.
+ * Every way the tree and the committed manifest disagree. Empty means CURRENT, not zero divergence. The ancestor
+ * symlink check runs only for the default fs reader.
  */
 export function checkTree(
   manifest: UpstreamRatchetManifest,
   repoRoot: string = REPO_ROOT,
   reader?: TreeReader,
 ): Finding[] {
-  // `validateManifestShape` is what stands between this function and a crash
-  // on a top-level `null`/array/primitive — everything below assumes `manifest`
-  // is at least a plain object, which is exactly (and only) what that check
-  // guarantees. It ALSO now covers the `upstream`/`paths` regex-shape checks
-  // that used to live inline here (see its docstring), so any shape finding
-  // at all — including an invalid pin — stops here: with `upstream` not even
-  // a usable commit sha, neither the seal check nor a per-entry walk means
-  // anything.
+  // Any shape finding stops here: everything below assumes a plain object with a usable pin.
   const shapeFindings = validateManifestShape(manifest);
   if (shapeFindings.length > 0) return shapeFindings;
 
   const findings: Finding[] = [];
 
-  // The coverage seal. This is the only check that can tell a complete manifest
-  // from one an entry was deleted out of — every other check here is per-entry,
-  // and a deleted entry has nothing left to check.
+  // The seal is the only check that catches a deleted entry; per-entry checks have nothing left to check.
   const seal = pathsSeal(Object.keys(manifest.files));
   if (manifest.paths !== seal) {
     findings.push({
@@ -656,11 +372,7 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     findings.push({ kind: 'malformed', path: relPath, detail, hint: `regenerate: ${REGENERATE_HINT}` });
   };
 
-  // BEFORE any filesystem access. Lexical rules first, then (for the default,
-  // fs-backed reader only) the physical check: an ancestor directory can be a
-  // symlink out of the tree even when every lexical rule passes. A git commit
-  // has no such concept — ls-tree already yields clean, tree-relative paths —
-  // so a non-default reader skips it.
+  // Before any fs access. The physical ancestor check applies only to the fs reader; ls-tree paths are clean.
   const invalidPath = validateRelPath(relPath, repoRoot);
   if (invalidPath !== null) {
     malformed(`not a usable repo-relative path: ${invalidPath}`);
@@ -696,16 +408,10 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
   if (entry.binary !== undefined && entry.binary !== true) {
     malformed(`"binary" may only be present as true, got ${JSON.stringify(entry.binary)}`);
   }
-  // `git check-ignore` is index-aware: it never reports a tracked path, so an
-  // ignored upstream path is always one the fork does not track — which this
-  // manifest records as deleted. An `ignored` entry without `deleted` therefore
-  // could not have been generated, and would switch off the presence and hash
-  // checks for a file the tree really does own.
+  // `check-ignore` never reports a tracked path, so `ignored` without `deleted` could not have been generated.
   if (entry.ignored === true && entry.deleted !== true) {
     malformed('an "ignored" entry must also be "deleted" — check-ignore never reports a tracked path');
   }
-  // A deleted path has no fork bytes to hash, and a present one always does.
-  // These two are what let a reader trust `deleted` without stat-ing the tree.
   if (entry.deleted === true && entry.sha256 !== null) {
     malformed('a deleted entry must carry "sha256": null');
   }
@@ -714,16 +420,8 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
   }
   if (findings.length > 0) return findings;
 
-  // An IGNORED upstream path is one the fork deleted and then told git to
-  // ignore — `.claude/scheduled_tasks.lock` is the live example: a runtime lock
-  // file some process recreates on a production checkout whenever the system is
-  // running. Nothing about the tree can prove anything here, and asking would
-  // make the host suite go red on a file that is not source: present, it reads
-  // as `resurrected`; absent, it reads as deleted; both are just "whatever the
-  // runtime last did". The DIVERGENCE is the .gitignore rule itself, and that is
-  // already counted — `.gitignore` is an upstream-owned file with its own entry,
-  // so adding or removing the rule moves a diff there. So: record the fact and
-  // check nothing else about it.
+  // An ignored path's bytes are whatever the runtime last did (e.g. a lock file); the divergence is the
+  // .gitignore rule, already counted on its own entry.
   if (entry.ignored === true) return findings;
 
   const active = reader ?? fsTreeReader(repoRoot);
@@ -782,17 +480,14 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
   return findings;
 }
 
-/** Findings rendered for a test failure message, one per line. */
 export function formatFindings(findings: readonly Finding[]): string {
   return findings.map((f) => `  ${f.kind} ${f.path}: ${f.detail}\n    fix: ${f.hint}`).join('\n');
 }
 
-/** Divergent = every entry the fork is not byte- and mode-identical to upstream on. */
 export function divergentEntries(manifest: UpstreamRatchetManifest): Array<[string, UpstreamRatchetEntry]> {
   return Object.entries(manifest.files).filter(([, entry]) => entry.diff > 0);
 }
 
-/** Total added+deleted lines the fork carries against the pinned commit. */
 export function totalDiffLines(manifest: UpstreamRatchetManifest): number {
   return Object.values(manifest.files).reduce((sum, entry) => sum + entry.diff, 0);
 }
