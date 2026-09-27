@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5563`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5551`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2654,11 +2654,14 @@ head lowercased with every non-alphanumeric character a `-`, Cloudflare Pages'
 `gate_misconfigured`. A preview's deploy identity is the full 40-character
 commit SHA it serves, read from `SMOKE_PREVIEW_VERSION_PATH` (default `/version`,
 JSON `sha`, `commit` or `gitSha`) or else a `<meta name="build-sha" content="…">`
-tag in its page. `static` never calls a provider API and never suspends.
+tag in its page (`scripts/smoke-preview-static.sh`, read by the gate and by
+`smoke-pair-identity.sh`, which then freezes each preview's URL and served
+commit, recorded as deploy `sha-<commit>`; a same-commit redeploy is invisible
+to it). `static` never calls a provider API and never suspends.
 `SMOKE_GATE_HEALTH_PATH` (default `/healthz`) is the backend readiness probe for
-both providers and for `smoke-build-identity.sh`. The develop gate, the freeze
-helper and `smoke-pair-identity.sh` still read Render's API; a `static` install
-runs PR-scoped campaigns only. A hard assumption for every provider: the repo
+both providers and for `smoke-build-identity.sh`. The develop gate and the
+freeze helper still read Render's API; a `static` install runs PR-scoped
+campaigns only. A hard assumption for every provider: the repo
 is on GitHub (`gh` reads PRs, CI runs and trees).
 
 **Preview identity is never a positional pick.** Render has provisioned two

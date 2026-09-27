@@ -32,6 +32,9 @@
 # Env: RENDER_API_KEY; SMOKE_GATE_FRONTEND_SERVICE / SMOKE_GATE_BACKEND_SERVICE (required —
 #      no defaults; a missing id fails closed rather than silently identifying the wrong pair.
 #      Same names smoke-develop-gate.sh reads, so one wrapper env file configures both.)
+#      SMOKE_PREVIEW_PROVIDER=static: the two ids are the PR previews' URLs (the gate's
+#      frontendPreviewId/backendPreviewId), and each side's identity is the commit it serves
+#      (smoke-preview-static.sh), recorded as deploy `sha-<commit>`; no Render call, no key.
 #      SMOKE_PAIR_FIXTURE_DIR (tests only: <dir>/fe.json, <dir>/be.json replace Render).
 #
 # RE-FREEZE, BOUNDED. `start` is no-clobber by design — an unbounded re-freeze would let
@@ -60,19 +63,30 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FE="${SMOKE_GATE_FRONTEND_SERVICE:-}"
 BE="${SMOKE_GATE_BACKEND_SERVICE:-}"
+PROVIDER="${SMOKE_PREVIEW_PROVIDER:-render}"
+. "$HERE/smoke-preview-static.sh"
 require_services() {
+  case "$PROVIDER" in render|static) ;; *)
+    echo "REFUSED: SMOKE_PREVIEW_PROVIDER must be render or static — an unknown provider identifies no pair (exit 2)" >&2
+    exit 2 ;; esac
   [ -n "$FE" ] && [ -n "$BE" ] && return 0
   echo "REFUSED: SMOKE_GATE_FRONTEND_SERVICE and SMOKE_GATE_BACKEND_SERVICE are required — no default pair (exit 2)" >&2
   exit 2
 }
 fetch() { if [ -n "${SMOKE_PAIR_FIXTURE_DIR:-}" ]; then cat "$SMOKE_PAIR_FIXTURE_DIR/$1.json"; return; fi
+  if [ "$PROVIDER" = static ]; then
+    jq -cn --arg sha "$(served_sha "$2")" '[{deploy:{id:(if $sha == "" then null else "sha-" + $sha end),status:"live",commit:{id:(if $sha == "" then null else $sha end)}}}]'
+    return
+  fi
   curl -sS --max-time 20 -H "Authorization: Bearer ${RENDER_API_KEY:?RENDER_API_KEY required}" "https://api.render.com/v1/services/$2/deploys?limit=5"; }
 read_pair() { local fe be
   fe="$(fetch fe "$FE")" || { echo '{"ok":false,"error":"frontend read failed"}'; return 2; }
   be="$(fetch be "$BE")" || { echo '{"ok":false,"error":"backend read failed"}'; return 2; }
-  FE_SVC="$FE" BE_SVC="$BE" python3 - "$fe" "$be" <<'PY'
+  FE_SVC="$FE" BE_SVC="$BE" PROVIDER="$PROVIDER" python3 - "$fe" "$be" <<'PY'
 import json, sys, os, re, datetime
 DEP = re.compile(r"^dep-[a-z0-9]{10,}$"); SVC = re.compile(r"^srv-[a-z0-9]{10,}$"); SHA = re.compile(r"^[0-9a-f]{40}$")
+if os.environ["PROVIDER"] == "static":
+    DEP = re.compile(r"^sha-[0-9a-f]{40}$"); SVC = re.compile(r"^https?://[^\s/]+(/\S*)?$")
 def pick(raw, svc):
     try:
         arr = json.loads(raw)

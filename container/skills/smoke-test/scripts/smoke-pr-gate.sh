@@ -38,11 +38,9 @@ RUN_PREFIX="${SMOKE_GATE_RUN_PREFIX:-smoke}"
 # Where each PR's preview comes from. `render` (default): *_SERVICE are the
 # parent service ids and previews are found through Render's API. `static`:
 # *_SERVICE are URL templates with `{pr}` and/or `{branch}`, and a preview's deploy
-# identity is the SHA it serves at $VERSION_PATH (JSON sha|commit|gitSha) or in a
-# `<meta name="build-sha">` tag.
+# identity is the commit it serves (smoke-preview-static.sh).
 PREVIEW_PROVIDER="${SMOKE_PREVIEW_PROVIDER:-render}"
 HEALTH_PATH="${SMOKE_GATE_HEALTH_PATH:-/healthz}"
-VERSION_PATH="${SMOKE_PREVIEW_VERSION_PATH:-/version}"
 provider_config_problems() {  # → " NAME" for each preview-provider key this install cannot run on
   case "$PREVIEW_PROVIDER" in
     render) ;;
@@ -1829,18 +1827,8 @@ preview_branch_alias() {
   printf '%s' "$ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]/-/g'
 }
 
-# static provider: the commit a preview serves, from $VERSION_PATH's JSON or
-# the page's <meta name="build-sha">; empty when neither names one.
-served_sha() {
-  local url="${1%/}" out sha
-  if out="$(timeout 10 curl -fsS --max-time 10 "$url$VERSION_PATH" 2>/dev/null)"; then
-    sha="$(jq -r '(.sha // .commit // .gitSha // empty) | select(type == "string" and test("^[0-9a-f]{40}$"))' <<<"$out" 2>/dev/null)"
-  fi
-  if [ -z "${sha:-}" ] && out="$(timeout 10 curl -fsS --max-time 10 "$url/" 2>/dev/null)"; then
-    sha="$(grep -oiE '<meta[^>]+name="build-sha"[^>]*>' <<<"$out" | head -n 1 | sed -nE 's/.*content="([0-9a-f]{40})".*/\1/p')"
-  fi
-  printf '%s' "${sha:-}"
-}
+# static provider: served_sha (smoke-preview-static.sh) is the commit a preview serves.
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-preview-static.sh"
 
 healthz_ok() {
   local url="$1" code
