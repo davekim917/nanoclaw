@@ -46,9 +46,7 @@ function hasOrchestratorCapability(): boolean {
 
 /**
  * Mount spawn tools bifurcated based on session role.
- *
- * Phase 1 simplification (acked in drift-acks.json entry B1):
- * orchestrator and child tool sets are mutually exclusive.
+ * Orchestrator and child tool sets are mutually exclusive.
  *
  * Call this from the barrel (index.ts) after loadConfig() and before startMcpServer().
  */

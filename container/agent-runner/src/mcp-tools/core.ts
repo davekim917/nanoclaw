@@ -126,7 +126,6 @@ const THREAD_KEY_DESCRIPTION =
 const IN_PLACE_THREAD_KEY_DESCRIPTION =
   'Optional. The thread_key the target message was sent with, when it went into an incident thread — routes this to the message inside that thread. Omit otherwise.';
 
-/** Validate an optional thread_key argument. Blank or absent → no key. Exported for tests. */
 export function parseThreadKey(raw: unknown): { threadKey: string | null } | { error: string } {
   if (raw === undefined || raw === null) return { threadKey: null };
   if (typeof raw !== 'string') return { error: 'thread_key must be a string' };

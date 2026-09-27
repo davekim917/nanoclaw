@@ -40,7 +40,7 @@ function log(msg: string): void {
 loadConfig();
 registerProviderSpecificSelfModTools();
 
-// Spawned by the provider over stdio, sharing nothing with the runner process, so it starts the mailbox itself.
+// Starts its own mailbox (shares nothing with the runner); no stop(): startMcpServer resolves before serving ends.
 async function main(): Promise<void> {
   await getAgentMailbox().start(await readMailboxContext());
   await mountSpawnTools();
