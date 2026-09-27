@@ -59,7 +59,7 @@ describe('getAskQuestionRender — module-absent path', () => {
  *   3. It must remain REACHABLE. An upgraded install may still hold an active
  *      one, and `findTaskSessions` is how every consumer enumerates task
  *      sessions (`src/cli/resources/tasks.ts:182` and `:996`,
- *      `src/modules/scheduling/pin-audit.ts:77`). Hiding it would leave a live
+ *      `auditTaskPins` in src/modules/scheduling/pin-audit.ts). Hiding it would leave a live
  *      task that `ncl tasks cancel` cannot reach.
  *
  * (1) is why the value never appears in new data; (3) is why the predicates
@@ -91,7 +91,7 @@ describe('per-series task session threads', () => {
     expect(taskSeriesId(taskThreadId('watch-1'))).toBe('watch-1');
     // THE bug: `.slice(prefix.length)` took 13 characters off this 12-character
     // string and produced ''. `appendRunLog` rejected that on its charset guard
-    // (`src/modules/scheduling/run-log.ts:24`) before writing anything;
+    // (`appendRunLog`, src/modules/scheduling/run-log.ts) before writing anything;
     // `recordTaskRunOutcome` (`src/db/task-run-outcomes.ts:47-61`) had no
     // guard, so the empty id landed in the central ledger instead.
     expect(taskSeriesId(TASKS_SYSTEM_THREAD_ID)).toBeNull();

@@ -76,7 +76,7 @@ describe('pruneDanglingWorkgroupCompatLinks with the shared-fs flag ON', () => {
   // The fail-open shape. The shared tree is lost (unmounted volume, partial
   // restore, an agent's `rm -rf`), so the `.migrated` marker goes with it —
   // then step 2 recreates the directory holding only `artifacts`
-  // (ensureWorkgroupWorkDirs, shared-dirs.ts:861) BEFORE this runs. The
+  // (ensureWorkgroupWorkDirs) BEFORE this runs. The
   // listing therefore SUCCEEDS and reads every real name as gone, so the
   // readdir-throws bail cannot help. Only requiring the marker does.
   it('prunes nothing when the shared tree was recreated without its marker', () => {

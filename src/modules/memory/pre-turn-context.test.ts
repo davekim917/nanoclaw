@@ -1910,7 +1910,7 @@ describe('per-person preference recall', () => {
 
   it('does not suppress the fallback for a different homeserver user with the same last-colon suffix (Matrix-shape)', async () => {
     // Matrix-style raw handles contain their OWN colon (`@user:homeserver`),
-    // and extractAndUpsertUser (src/modules/permissions/index.ts:96-99)
+    // and extractAndUpsertUser (src/modules/permissions/index.ts)
     // stores them UN-PREFIXED — this is the platform's own opaque id, not a
     // "channelType:rawId" pair. Pre-fix (PR #221 round 4), rawIdSuffix took
     // everything after the LAST colon, so '@bob:matrix.example' and

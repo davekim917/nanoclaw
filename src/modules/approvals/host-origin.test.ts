@@ -5,7 +5,7 @@
  * request_choice tells the agent to trust a choice_response only there. So
  * every other inbound write must lose the field — above all the two paths a
  * person or a peer agent controls: channel ingress (router.ts:1545,
- * writeSessionMessageIfNew) and agent-to-agent (agent-route.ts:674,
+ * writeSessionMessageIfNew) and agent-to-agent (`performAgentRoute`,
  * writeSessionMessage). Both land in writeSessionMessageLocked, which strips it.
  */
 import * as fs from 'fs';
@@ -104,7 +104,7 @@ describe('reserved origin field', () => {
   });
 
   it('agent-to-agent: a peer row claiming origin "host" and sender "system" is stripped', async () => {
-    // The row agent-route.ts:674-684 writes: platformId = the SOURCE group.
+    // The row `performAgentRoute` writes: platformId = the SOURCE group.
     await writeSessionMessage(AG, SESS, {
       id: 'a2a-peer-1',
       kind: 'chat',

@@ -3,7 +3,7 @@
  *
  * The runner marks origin="host" from the reserved content field alone
  * (container/agent-runner/src/formatter.ts), and an a2a message is written
- * through writeSessionMessage (agent-route.ts:674), which strips the field
+ * through writeSessionMessage (`performAgentRoute`), which strips the field
  * unless the caller is notifyAgent. Routing cannot carry that trust: a
  * same-group a2a row has a host note's platformId and channelType exactly.
  * These go through the real route, not just the writer.

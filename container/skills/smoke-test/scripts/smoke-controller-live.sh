@@ -51,7 +51,7 @@
 # What that does NOT cover, and is accepted: a fire whose whole task script is
 # killed prints no line at all, so it reports nothing -- the host discards the
 # output and resolves the occurrence `failed` with no wake
-# (src/modules/scheduling/host-script.ts:361, 383, 490-499). Only those
+# (`runHostGatedTaskScripts`, src/modules/scheduling/host-script.ts). Only those
 # unreported fires feed the failure streak that auto-pauses the series after 8
 # and notifies the owner (src/modules/scheduling/recurrence.ts:128-147): a
 # REPORTED failure is a wakeAgent:true occurrence, which the container resolves

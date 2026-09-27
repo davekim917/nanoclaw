@@ -6,7 +6,7 @@ final stdout line; this prints one JSON summary line and exits 0.
 A fire that cannot complete reports itself through that line and nothing else:
 `failure` (a stable cause slug), `detail` and `fire` in the summary, which the
 supervisor renders as wakeAgent:true so the host wakes the owner with the data
-(modules/scheduling/host-script.ts:490-503). The wrapper never posts to chat
+(`runHostGatedTaskScripts`, modules/scheduling/host-script.ts). The wrapper never posts to chat
 itself -- the owner does, per references/controller-owner-router.md.
 
 See smoke-controller-live.sh for the fire's steps and guarantees.
@@ -218,7 +218,7 @@ def end_fire(extra, ok=None, failure="wrapper-error"):
     EVERY other end is FAIL-CLOSED and reports itself the only way a task
     script can: `failure` (a stable cause slug), `detail` and `fire` in the
     summary, which the supervisor renders as wakeAgent:true. The host wakes
-    the owner with that data (modules/scheduling/host-script.ts:490-503) and
+    the owner with that data (`runHostGatedTaskScripts`) and
     the owner posts the operator alarm (references/controller-owner-router.md).
     The wrapper posts nothing itself: a fire that cannot complete cannot be
     trusted to run the send either, and one reporting path is one thing to get
