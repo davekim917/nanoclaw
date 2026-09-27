@@ -24,15 +24,14 @@ const INTAKE_TTL_MS = 15 * 60_000;
 const FINISHED_RETENTION_MS = 60 * 60_000;
 const SECRET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,128}$/;
-// A bare `*` or `*.com` would hand the key to every host; a wildcard needs a registrable domain under it.
-const HOST_PATTERN_RE = /^(\*\.)?([A-Za-z0-9-]+\.)+[A-Za-z0-9-]+$/;
+const HOST_PATTERN_RE = /^([A-Za-z0-9-]+\.)+[A-Za-z0-9-]+$/;
 const PATH_PATTERN_RE = /^\/[!-~]{0,255}$/;
 const VALUE_FORMAT_RE = /^[ -~]{1,200}$/;
 const MAX_PENDING_PER_SESSION = 3;
 
 type SecretIntakeStatus = 'pending' | 'storing' | 'stored' | 'failed' | 'expired';
 
-type SecretIntakeCaller = { kind: 'host' } | { kind: 'agent'; sessionId: string; agentGroupId: string };
+export type SecretIntakeCaller = { kind: 'host' } | { kind: 'agent'; sessionId: string; agentGroupId: string };
 
 export interface StartSecretIntakeInput {
   name: string;
@@ -140,7 +139,9 @@ function validateInjection(input: StartSecretIntakeInput): OnecliInjectionSpec |
   }
   const hostPattern = input.hostPattern?.trim() ?? '';
   if (hostPattern.length > 253 || !HOST_PATTERN_RE.test(hostPattern)) {
-    throw new Error('--host-pattern is required: a bare host such as api.example.com (no scheme, no path).');
+    throw new Error(
+      '--host-pattern is required: one exact host such as api.example.com (no scheme, path or wildcard).',
+    );
   }
   const headerName = input.headerName?.trim() || 'Authorization';
   if (!HEADER_NAME_RE.test(headerName)) throw new Error(`Invalid header name: "${headerName}"`);
@@ -153,6 +154,33 @@ function validateInjection(input: StartSecretIntakeInput): OnecliInjectionSpec |
     throw new Error('--path-pattern must start with / and contain no spaces.');
   }
   return { name: input.name, hostPattern, pathPattern, headerName, valueFormat };
+}
+
+/** An agent may grant only to its own group and its own workgroup, whatever its cli_scope. */
+async function grantTargets(
+  rawGroups: string[],
+  rawWorkgroups: string[],
+  caller: SecretIntakeCaller,
+): Promise<{ groups: string[]; workgroups: string[] }> {
+  let groups = splitList(rawGroups);
+  const workgroups = splitList(rawWorkgroups);
+  if (caller.kind === 'agent') {
+    if (groups.length === 0 && workgroups.length === 0) groups = [caller.agentGroupId];
+    const foreignGroup = groups.find((g) => g !== caller.agentGroupId);
+    if (foreignGroup) throw new Error(`An agent can grant a secret only to its own group, not ${foreignGroup}.`);
+    const ownWorkgroup = (await getAgentGroup(caller.agentGroupId))?.workgroup_id;
+    const foreignWorkgroup = workgroups.find((w) => w !== ownWorkgroup);
+    if (foreignWorkgroup) {
+      throw new Error(`An agent can grant a secret only to its own workgroup, not ${foreignWorkgroup}.`);
+    }
+  }
+  for (const g of groups) {
+    if (!(await getAgentGroup(g))) throw new Error(`Agent group not found: ${g}`);
+  }
+  for (const w of workgroups) {
+    if (!(await workgroupExists(w))) throw new Error(`Workgroup not found: ${w}`);
+  }
+  return { groups, workgroups };
 }
 
 export async function startSecretIntake(input: StartSecretIntakeInput): Promise<SecretIntakeView> {
@@ -169,23 +197,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
 
   const caller = input.caller;
   const callerGroup = caller.kind === 'agent' ? await getAgentGroup(caller.agentGroupId) : undefined;
-  let groups = splitList(input.groups);
-  const workgroups = splitList(input.workgroups);
-  if (caller.kind === 'agent') {
-    if (groups.length === 0 && workgroups.length === 0) groups = [caller.agentGroupId];
-    const foreignGroup = groups.find((g) => g !== caller.agentGroupId);
-    if (foreignGroup) throw new Error(`An agent can grant a secret only to its own group, not ${foreignGroup}.`);
-    const foreignWorkgroup = workgroups.find((w) => w !== callerGroup?.workgroup_id);
-    if (foreignWorkgroup) {
-      throw new Error(`An agent can grant a secret only to its own workgroup, not ${foreignWorkgroup}.`);
-    }
-  }
-  for (const g of groups) {
-    if (!(await getAgentGroup(g))) throw new Error(`Agent group not found: ${g}`);
-  }
-  for (const w of workgroups) {
-    if (!(await workgroupExists(w))) throw new Error(`Workgroup not found: ${w}`);
-  }
+  const { groups, workgroups } = await grantTargets(input.groups, input.workgroups, caller);
 
   const existing = await findOnecliSecretByName(name);
   if (existing && !input.rotate) {
@@ -416,16 +428,12 @@ export async function grantSecret(input: {
   name: string;
   groups: string[];
   workgroups: string[];
+  caller: SecretIntakeCaller;
 }): Promise<SecretGrantResult> {
-  const groups = splitList(input.groups);
-  const workgroups = splitList(input.workgroups);
-  if (groups.length === 0 && workgroups.length === 0) throw new Error('Name at least one --group or --workgroup.');
-  for (const g of groups) {
-    if (!(await getAgentGroup(g))) throw new Error(`Agent group not found: ${g}`);
+  if (splitList(input.groups).length === 0 && splitList(input.workgroups).length === 0) {
+    throw new Error('Name at least one --groups or --workgroups.');
   }
-  for (const w of workgroups) {
-    if (!(await workgroupExists(w))) throw new Error(`Workgroup not found: ${w}`);
-  }
+  const { groups, workgroups } = await grantTargets(input.groups, input.workgroups, input.caller);
   if (!(await findOnecliSecretByName(input.name))) {
     throw new Error(`"${input.name}" is not in the vault. Store it first with ncl secrets intake.`);
   }

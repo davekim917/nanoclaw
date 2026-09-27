@@ -5,10 +5,12 @@ import {
   grantSecret,
   startSecretIntake,
   type SecretGrantResult,
+  type SecretIntakeCaller,
   type SecretIntakeView,
 } from '../../modules/secret-intake/service.js';
 import { formatLocalTime } from '../../timezone.js';
 import { registerResource } from '../crud.js';
+import type { CallerContext } from '../frame.js';
 
 function optionalString(raw: unknown): string | undefined {
   return raw === undefined || raw === null ? undefined : String(raw);
@@ -17,6 +19,12 @@ function optionalString(raw: unknown): string | undefined {
 function list(raw: unknown): string[] {
   if (raw === undefined || raw === null) return [];
   return (Array.isArray(raw) ? raw : [raw]).map(String);
+}
+
+function callerOf(ctx: CallerContext): SecretIntakeCaller {
+  return ctx.caller === 'agent'
+    ? { kind: 'agent', sessionId: ctx.sessionId, agentGroupId: ctx.agentGroupId }
+    : { kind: 'host' };
 }
 
 function formatIntake(v: SecretIntakeView): string {
@@ -30,12 +38,12 @@ function formatIntake(v: SecretIntakeView): string {
 
 const grantArgs = [
   {
-    name: 'group',
+    name: 'groups',
     type: 'string' as const,
     description: 'Agent group id(s) to grant it to, comma-separated. An agent may name only its own group.',
   },
   {
-    name: 'workgroup',
+    name: 'workgroups',
     type: 'string' as const,
     description: 'Workgroup id(s) to grant it to, comma-separated; every member group inherits it.',
   },
@@ -57,7 +65,7 @@ registerResource({
         "Ask the owner for a secret. Posts a card to an owner's DM; its button opens a form, and the value typed there goes straight to the vault — you never see it. Returns at once; the requesting agent is told when it is stored (host callers: `ncl secrets intake-status`).\n\n" +
         'New secret: --host-pattern is required and decides where the gateway sends the value, so name the API host exactly. ' +
         'Rotation (--rotate): replaces only the value; the secret keeps its host, header and grants, and takes effect on the next request.\n\n' +
-        'From an agent with no --group/--workgroup, the secret is granted to the calling group. A new grant takes effect at the next container start.',
+        'From an agent with no --groups/--workgroups, the secret is granted to the calling group. A new grant takes effect at the next container start.',
       args: [
         { name: 'name', type: 'string', description: 'Vault name, e.g. Linear-API-Key.', required: true },
         { name: 'rotate', type: 'boolean', description: 'Replace the value of an existing secret.' },
@@ -77,7 +85,7 @@ registerResource({
       ],
       examples: [
         'ncl secrets intake --name Linear-API-Key --host-pattern api.linear.app --value-format "{value}"',
-        'ncl secrets intake --name Exa-API-Key --host-pattern api.exa.ai --header x-api-key --value-format "{value}" --workgroup example-wg',
+        'ncl secrets intake --name Exa-API-Key --host-pattern api.exa.ai --header x-api-key --value-format "{value}" --workgroups example-wg',
         'ncl secrets intake --name Linear-API-Key --rotate',
       ],
       handler: async (args, ctx) =>
@@ -88,12 +96,9 @@ registerResource({
           pathPattern: optionalString(args.path_pattern),
           headerName: optionalString(args.header),
           valueFormat: optionalString(args.value_format),
-          groups: list(args.group),
-          workgroups: list(args.workgroup),
-          caller:
-            ctx.caller === 'agent'
-              ? { kind: 'agent', sessionId: ctx.sessionId, agentGroupId: ctx.agentGroupId }
-              : { kind: 'host' },
+          groups: list(args.groups),
+          workgroups: list(args.workgroups),
+          caller: callerOf(ctx),
         }),
       formatHuman: (data) =>
         `${formatIntake(data as SecretIntakeView)}\n\nThe owner enters the value in the card's form; nothing is stored until then.`,
@@ -117,9 +122,14 @@ registerResource({
       description:
         'Grant a secret already in the vault to agent groups or workgroups, by name. Takes effect at each group’s next container start. An agent’s call waits for admin approval.',
       args: [{ name: 'name', type: 'string', description: 'Vault name.', required: true }, ...grantArgs],
-      examples: ['ncl secrets grant --name Linear-API-Key --workgroup example-wg'],
-      handler: async (args) =>
-        grantSecret({ name: String(args.name), groups: list(args.group), workgroups: list(args.workgroup) }),
+      examples: ['ncl secrets grant --name Linear-API-Key --workgroups example-wg'],
+      handler: async (args, ctx) =>
+        grantSecret({
+          name: String(args.name),
+          groups: list(args.groups),
+          workgroups: list(args.workgroups),
+          caller: callerOf(ctx),
+        }),
       formatHuman: (data) => {
         const d = data as SecretGrantResult;
         return [

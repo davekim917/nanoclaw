@@ -160,6 +160,8 @@ describe('startSecretIntake', () => {
     [{ valueFormat: 'Bearer {value}\nX-Other: 1' }, /one line/],
     [{ hostPattern: '*' }, /--host-pattern is required/],
     [{ hostPattern: '*.com' }, /--host-pattern is required/],
+    [{ hostPattern: '*.linear.app' }, /--host-pattern is required/],
+    [{ hostPattern: '*.co.uk' }, /--host-pattern is required/],
     [{ pathPattern: 'v1/*' }, /must start with \//],
     [{ headerName: 'Bad Header' }, /Invalid header name/],
     [{ groups: ['ag-2'] }, /only to its own group/],
@@ -187,12 +189,6 @@ describe('startSecretIntake', () => {
     for (const n of ['A', 'B', 'C']) await startSecretIntake({ ...newKey, name: `Key-${n}`, caller: agentCaller });
     await expect(startSecretIntake({ ...newKey, name: 'Key-D', caller: agentCaller })).rejects.toThrow(/already has 3/);
     expect(h.deliveries).toHaveLength(3);
-  });
-
-  it('accepts a wildcard only above a registrable domain', async () => {
-    const view = await startSecretIntake({ ...newKey, hostPattern: '*.linear.app', caller: agentCaller });
-    expect(JSON.parse(h.deliveries[0].args[4] as string).body).toContain('*.linear.app');
-    expect(view.status).toBe('pending');
   });
 
   it('lets the host grant to any existing group and workgroup', async () => {
@@ -312,13 +308,33 @@ describe('the form', () => {
 describe('grantSecret', () => {
   it('grants an existing secret and refuses one the vault lacks', async () => {
     h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
-    expect(await grantSecret({ name: 'Linear-API-Key', groups: ['ag-2'], workgroups: ['wg-b'] })).toEqual({
+    expect(
+      await grantSecret({ name: 'Linear-API-Key', groups: ['ag-2'], workgroups: ['wg-b'], caller: { kind: 'host' } }),
+    ).toEqual({
       secretName: 'Linear-API-Key',
       addedGroups: ['ag-2'],
       addedWorkgroups: ['wg-b'],
       alreadyGranted: [],
     });
-    await expect(grantSecret({ name: 'Nope', groups: ['ag-2'], workgroups: [] })).rejects.toThrow(/not in the vault/);
-    await expect(grantSecret({ name: 'Linear-API-Key', groups: [], workgroups: [] })).rejects.toThrow(/at least one/);
+    await expect(
+      grantSecret({ name: 'Nope', groups: ['ag-2'], workgroups: [], caller: { kind: 'host' } }),
+    ).rejects.toThrow(/not in the vault/);
+    await expect(
+      grantSecret({ name: 'Linear-API-Key', groups: [], workgroups: [], caller: agentCaller }),
+    ).rejects.toThrow(/at least one/);
+  });
+
+  it('holds an agent to its own group and workgroup, as intake does', async () => {
+    h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
+    await expect(
+      grantSecret({ name: 'Linear-API-Key', groups: [], workgroups: ['wg-b'], caller: agentCaller }),
+    ).rejects.toThrow(/only to its own workgroup/);
+    await expect(
+      grantSecret({ name: 'Linear-API-Key', groups: ['ag-2'], workgroups: [], caller: agentCaller }),
+    ).rejects.toThrow(/only to its own group/);
+    expect(
+      await grantSecret({ name: 'Linear-API-Key', groups: [], workgroups: ['wg-a'], caller: agentCaller }),
+    ).toMatchObject({ addedGroups: [], addedWorkgroups: ['wg-a'] });
+    expect(h.groupGrants).toEqual([]);
   });
 });

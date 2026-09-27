@@ -5,10 +5,10 @@ Adding or rotating an API key without the key passing through chat, a session DB
 
 ```
 ncl secrets intake --name <n> --host-pattern <api-host> [--header <h>] [--value-format '<fmt with {value}>']
-                   [--path-pattern <p>] [--group <ids>] [--workgroup <ids>]
-ncl secrets intake --name <n> --rotate [--group …] [--workgroup …]
+                   [--path-pattern <p>] [--groups <ids>] [--workgroups <ids>]
+ncl secrets intake --name <n> --rotate [--groups …] [--workgroups …]
 ncl secrets intake-status --id <si-…>
-ncl secrets grant --name <n> [--group <ids>] [--workgroup <ids>]
+ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 ```
 
 ## Flow
@@ -27,8 +27,8 @@ ncl secrets grant --name <n> [--group <ids>] [--workgroup <ids>]
 
 ## What the owner must check on the card
 
-The **host pattern**. The gateway injects the key into any request to that host, so a wrong or hostile host
-sends the key there. It is the one decision the form cannot make for you.
+The **host pattern**: one exact host, no wildcards. The gateway injects the key into any request to that host,
+so a wrong or hostile host gets the key. It is the one decision the form cannot make for you.
 
 ## Grants
 

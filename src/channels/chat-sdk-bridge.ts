@@ -471,7 +471,6 @@ const SUBTEXT_BUDGET_OVERHEAD = 8;
 const SECRET_INTAKE_ACTION_PREFIX = 'ncs:';
 const SECRET_INTAKE_CALLBACK_ID = 'nc-secret-intake';
 const SECRET_INTAKE_INPUT_ID = 'secret_value';
-const SECRET_INTAKE_MAX_LENGTH = 4000;
 
 /** The platform's trigger id expires in seconds (Slack: 3), so nothing slow may run before `openModal`. */
 async function openSecretIntakeForm(event: ActionEvent, setup: ChannelSetup): Promise<void> {
@@ -503,7 +502,6 @@ async function openSecretIntakeForm(event: ActionEvent, setup: ChannelSetup): Pr
           id: SECRET_INTAKE_INPUT_ID,
           label: opened.form.inputLabel,
           placeholder: 'Paste it here',
-          maxLength: SECRET_INTAKE_MAX_LENGTH,
         }),
       ],
     }),
