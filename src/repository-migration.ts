@@ -1519,6 +1519,7 @@ function migrationRootForIdentity(input: {
   if (!SAFE_MIGRATION_RUN_ID.test(input.runId) || input.runId === '.' || input.runId === '..') {
     throw new Error(`invalid repository migration run id: ${input.runId}`);
   }
+  // Called for its workgroup/repository segment validation, even for archive-only migrations; the path is unused.
   canonicalRepoDir(input.workgroupId, input.repo, input.dataDir);
   return path.join(input.dataDir, 'repository-migrations', input.runId, input.workgroupId, input.repo);
 }
@@ -1952,10 +1953,12 @@ export function createRepositoryMigrationManifest(input: {
   const worktreeAdminBytes = selectedCaptures.reduce((sum, capture) => {
     const rawIndexBytes = capture.indexBytesBase64 ? Buffer.from(capture.indexBytesBase64, 'base64').length : 0;
     const auxiliaryBytes = capture.indexAuxiliaryFiles.reduce((fileSum, entry) => fileSum + entry.size, 0);
+    // 64 KiB per checkout for linked-worktree admin files, logs and the pointer beyond the captured index.
     return sum + rawIndexBytes + auxiliaryBytes + 64 * 1024;
   }, 0);
   // Only status-visible content can add rescue blobs absent from a captured object store (staged blobs are already
-  // there; missing-admin seeds are counted in objectStores), so clean tracked bytes are not counted.
+  // there; missing-admin seeds are counted in objectStores), so clean tracked bytes are not counted. Three copies:
+  // the source store, replacement canonical and external bundle coexist during the overlap.
   const novelVisibleBytes = captures.reduce((sum, capture) => sum + allocatedChangedWorktreeBytes(capture), 0);
   const rescueObjectBytes = novelVisibleBytes * 3;
   const core = uniqueGitBytes * 2 + worktreeBytes + canonicalWorktreeBytes + worktreeAdminBytes + rescueObjectBytes;
