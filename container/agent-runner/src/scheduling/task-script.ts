@@ -8,7 +8,7 @@ import { evaluateManagedGitCommand } from '../managed-git-guard.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 import { writeGateRow } from './gate-row.js';
 
-// 120s default (env-overridable): a flat 30s killed working watcher scripts and auto-paused their series.
+// 120s default (env-overridable): legitimate watcher scripts run past 30s, and repeated timeouts auto-pause a series.
 // Read per call so tests can drive a real timeout.
 function scriptTimeoutMs(): number {
   const parsed = Number.parseInt(process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? '', 10);
