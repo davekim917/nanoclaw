@@ -2,9 +2,9 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Gate lane for `task_run_outcomes`: one row per scripted fire that did not wake the agent, keyed `'gate:'
- * <occurrence id>`. Additive, so a reverted host still inserts turn rows; its lane-blind streak would count gate
- * rows, so a rollback must delete them.
+ * Gate lane for `task_run_outcomes`: one row per scripted fire that did not wake the agent, keyed
+ * `outbound_id = 'gate:' || <occurrence id>`. Additive, so a reverted host still inserts turn rows; its lane-blind
+ * streak would count gate rows, so a rollback must delete them.
  */
 export const migration084: Migration = {
   version: 84,
