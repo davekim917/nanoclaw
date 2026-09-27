@@ -45,9 +45,9 @@ HEALTH_PATH="${SMOKE_GATE_HEALTH_PATH:-/healthz}"
 # otherwise a plain http(s) URL (host, optional port and path, no query):
 # the URL it resolves to is pasted unquoted into shell commands in briefs.
 static_template_ok() {
-  local rest="${1//\{pr\}/}"
-  rest="${rest//\{branch\}/}"
-  [ "$rest" != "$1" ] && [[ "$rest" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]
+  local url="${1//\{pr\}/1}"
+  url="${url//\{branch\}/b}"
+  [ "$url" != "$1" ] && [[ "$url" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]
 }
 provider_config_problems() {  # → " NAME" for each preview-provider key this install cannot run on
   case "$PREVIEW_PROVIDER" in
@@ -1633,8 +1633,16 @@ find_pr_for_any_run() {
 # // .)` covers both.
 # ponytail: limit=100, no cursor pagination. The account runs a handful of
 # services; add pagination if the account ever exceeds one page.
-fetch_services() {
-  if [ "$PREVIEW_PROVIDER" = static ]; then printf '[]'; return 0; fi
+fetch_services() {  # [<pr> <head ref>]
+  if [ "$PREVIEW_PROVIDER" = static ]; then
+    # The one lookup a static preview needs: the branch alias, from the head
+    # ref already fetched when the caller has it. A failed lookup fails the
+    # fetch, so the gate reports fetchOk:false rather than an absent preview.
+    local alias=""
+    case "$FRONTEND_SERVICE$BACKEND_SERVICE" in *'{branch}'*) alias="$(preview_branch_alias "${1:-}" "${2:-}")" || return 1 ;; esac
+    jq -cn --arg alias "$alias" '[{branchAlias:$alias}]'
+    return 0
+  fi
   timeout 10 curl -fsS --max-time 10 "https://api.render.com/v1/services?limit=100" 2>/dev/null
 }
 
@@ -1644,8 +1652,9 @@ find_preview_candidates() {
   local services_json="$1" parent_id="$2" pr="$3"
   if [ "$PREVIEW_PROVIDER" = static ]; then
     local url="${parent_id//\{pr\}/$pr}" branch
+    branch="$(jq -r '.[0].branchAlias // empty' <<<"$services_json" 2>/dev/null)"
     if [[ "$url" == *'{branch}'* ]]; then
-      branch="$(preview_branch_alias "$pr")" || { printf '[]'; return 0; }
+      [ -n "$branch" ] || { printf '[]'; return 0; }
       url="${url//\{branch\}/$branch}"
     fi
     jq -cn --arg url "$url" '[{id:$url, name:$url, url:$url}]'
@@ -1828,9 +1837,9 @@ latest_live_deploy_sha() {
 
 # static provider: the PR head branch as a host alias — lowercased, every
 # non-alphanumeric character a "-" (Cloudflare Pages' branch-alias rule).
-preview_branch_alias() {
-  local ref
-  ref="$(timeout 10 gh pr view "$1" -R "$REPO" --json headRefName 2>/dev/null | jq -r '.headRefName // empty' 2>/dev/null)"
+preview_branch_alias() {  # <pr> [<head ref>] -- looked up when not given
+  local ref="${2:-}"
+  [ -n "$ref" ] || ref="$(timeout 10 gh pr view "$1" -R "$REPO" --json headRefName 2>/dev/null | jq -r '.headRefName // empty' 2>/dev/null)"
   [ -n "$ref" ] || return 1
   printf '%s' "$ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]/-/g'
 }
@@ -2724,7 +2733,7 @@ evaluate_pr() {
     fi
   fi
 
-  if ! services_json="$(fetch_services)" || ! jq -e 'type == "array"' <<<"$services_json" >/dev/null 2>&1; then
+  if ! services_json="$(fetch_services "$pr" "$head_ref")" || ! jq -e 'type == "array"' <<<"$services_json" >/dev/null 2>&1; then
     fetch_ok=false
     services_json='[]'
   fi
@@ -4473,7 +4482,7 @@ if [ "$COMMAND" = "finish" ]; then
   SUSPEND_OK=false
   SUSPEND_STATUS="null"
   SUSPEND_REASON=""
-  if SERVICES_JSON="$(fetch_services)" && jq -e 'type == "array"' <<<"$SERVICES_JSON" >/dev/null 2>&1; then
+  if SERVICES_JSON="$(fetch_services "$PR")" && jq -e 'type == "array"' <<<"$SERVICES_JSON" >/dev/null 2>&1; then
     # THE mutating site (#1536) — a wrong-twin pick here POSTs suspend against
     # a service nobody chose. Same candidate-enumeration + bundle-oracle
     # resolution as evaluate_pr, so this site can never disagree with what a

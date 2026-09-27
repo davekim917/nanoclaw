@@ -765,6 +765,20 @@ T4A="$(STUB_VERSION_JSON="{\"sha\":\"$HEAD_SHA\"}" SMOKE_PREVIEW_PROVIDER=static
   SMOKE_GATE_FRONTEND_SERVICE='https://{branch}.web.example.test' bash "$GATE" check 48)"
 jq -e '.settled == true and .backendPreviewUrl == "https://feature-x.api.example.test"' <<<"$T4A" >/dev/null ||
   { echo "4a: a {branch} template did not resolve to the head alias: $T4A" >&2; exit 1; }
+# The alias comes from the head ref `check` already fetched. When no head ref
+# can be had, the fetch fails (fetchOk:false) instead of reading as a missing preview.
+T4A="$(STUB_PR_VIEW="$(jq -c 'del(.headRefName)' <<<"$STUB_PR_VIEW")" STUB_VERSION_JSON="{\"sha\":\"$HEAD_SHA\"}" \
+  SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.example.test' \
+  SMOKE_GATE_FRONTEND_SERVICE='https://{branch}.web.example.test' bash "$GATE" check 48)"
+jq -e '.fetchOk == false and .settled == false' <<<"$T4A" >/dev/null ||
+  { echo "4a: an unresolvable {branch} alias read as an absent preview: $T4A" >&2; exit 1; }
+# A placeholder outside the host or path still yields no URL: refused.
+for bad in 'http{pr}://api.example.test' '{branch}https://api.example.test'; do
+  T4A="$(SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_BACKEND_SERVICE="$bad" \
+    SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.example.test' bash "$GATE" check 48 2>/dev/null || true)"
+  jq -e '.missing == ["SMOKE_GATE_BACKEND_SERVICE"]' <<<"$T4A" >/dev/null ||
+    { echo "4a: a template with a misplaced placeholder was accepted ($bad): $T4A" >&2; exit 1; }
+done
 unset STUB_CURL_LOG
 
 # --- 5. Freeze-PR: CI checked on the PARENT sha, not the marker head; range
