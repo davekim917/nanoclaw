@@ -87,6 +87,7 @@ vi.mock('../../log.js', () => {
   return { log: { info: record, warn: record, error: record, debug: record } };
 });
 
+import { withCentralSync } from '../../db/central-lease.js';
 import {
   __resetSecretIntakesForTest,
   getSecretIntake,
@@ -207,16 +208,27 @@ describe('startSecretIntake', () => {
 });
 
 describe('the form', () => {
-  it('opens and accepts a submit only for an owner or global admin', async () => {
+  it('stores nothing for a submit by someone other than an owner or global admin, and stays open', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    expect(await hooks.open(intakeId, 'USTRANGER')).toEqual({
-      ok: false,
-      message: 'Only an owner or global admin can enter a secret.',
-    });
-    expect(await hooks.submit(intakeId, 'USTRANGER', SECRET)).toMatchObject({ ok: false });
-    const opened = await hooks.open(intakeId, 'UOWNER');
-    expect(opened).toMatchObject({ ok: true, form: { title: 'Store secret' } });
+    expect(await hooks.submit(intakeId, 'USTRANGER', SECRET)).toEqual({ ok: true });
+    await settle();
     expect(h.createCalls).toHaveLength(0);
+    expect(getSecretIntake(intakeId)?.status).toBe('pending');
+    expect(everythingObservable()).not.toContain(SECRET);
+    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await settle();
+    expect(h.createCalls).toHaveLength(1);
+  });
+
+  it('answers open and submit without waiting on the central lease', async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    vi.mocked(withCentralSync).mockImplementation(() => new Promise(() => {}));
+    try {
+      expect(await hooks.open(intakeId, 'UOWNER')).toMatchObject({ ok: true, form: { title: 'Store secret' } });
+      expect(await hooks.submit(intakeId, 'UOWNER', SECRET)).toEqual({ ok: true });
+    } finally {
+      vi.mocked(withCentralSync).mockImplementation((async (fn: () => unknown) => fn()) as never);
+    }
   });
 
   it('refuses an empty value or one with whitespace, keeping the intake pending', async () => {

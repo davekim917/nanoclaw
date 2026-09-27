@@ -315,17 +315,21 @@ async function tellRequester(intake: Intake, text: string): Promise<void> {
   if (session) await notifyAgent(session, text);
 }
 
-async function refusal(intake: Intake | undefined, namespacedUserId: string): Promise<string | null> {
+function unavailable(intake: Intake | undefined): string | null {
   if (!intake) return 'This secret request has expired or no longer exists. Ask for a new one.';
-  if (intake.status !== 'pending') return `This secret request is already ${intake.status}.`;
+  return intake.status === 'pending' ? null : `This secret request is already ${intake.status}.`;
+}
+
+async function completeIntake(intake: Intake, namespacedUserId: string, value: string): Promise<void> {
   const allowed = await withCentralSync(
     () => isOwner(namespacedUserId) || isGlobalAdmin(namespacedUserId),
     'secret intake authority',
   );
-  return allowed ? null : 'Only an owner or global admin can enter a secret.';
-}
-
-async function completeIntake(intake: Intake, value: string): Promise<void> {
+  if (!allowed) {
+    intake.status = 'pending';
+    log.warn('Secret intake: submit refused, not an owner or global admin', { intakeId: intake.id });
+    return;
+  }
   try {
     if (intake.injection) {
       await createOnecliSecret(intake.injection, value);
@@ -382,10 +386,11 @@ async function completeIntake(intake: Intake, value: string): Promise<void> {
 export function secretIntakeHooks(channelType: string): SecretIntakeHooks {
   const namespaced = (userId: string): string => (userId.includes(':') ? userId : `${channelType}:${userId}`);
   return {
-    async open(intakeId, userId) {
+    // No awaits: the trigger window can close before the central lease frees, so completeIntake checks authority.
+    async open(intakeId) {
       prune(Date.now());
       const intake = intakes.get(intakeId);
-      const refused = await refusal(intake, namespaced(userId));
+      const refused = unavailable(intake);
       if (refused || !intake) return { ok: false, message: refused ?? 'This secret request no longer exists.' };
       return {
         ok: true,
@@ -399,16 +404,13 @@ export function secretIntakeHooks(channelType: string): SecretIntakeHooks {
     async submit(intakeId, userId, value) {
       prune(Date.now());
       const intake = intakes.get(intakeId);
-      const refused = await refusal(intake, namespaced(userId));
+      const refused = unavailable(intake);
       if (refused || !intake) return { ok: false, message: refused ?? 'This secret request no longer exists.' };
       const trimmed = value.trim();
       if (!trimmed) return { ok: false, message: 'Paste the secret value.' };
       if (/\s/.test(trimmed)) return { ok: false, message: 'Paste only the key: it contains spaces or line breaks.' };
-      // Re-read after the authority await: a concurrent submit may have claimed it, and must not write twice.
-      if (intake.status !== 'pending')
-        return { ok: false, message: `This secret request is already ${intake.status}.` };
       intake.status = 'storing';
-      completeIntake(intake, trimmed).catch((err) => {
+      completeIntake(intake, namespaced(userId), trimmed).catch((err) => {
         log.error('Secret intake: completion failed', { intakeId: intake.id, err });
       });
       return { ok: true };

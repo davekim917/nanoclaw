@@ -33,7 +33,7 @@ export interface ChannelSetup {
   onConnectionRestored?(info: ChannelConnectionRestored): void | Promise<void>;
 }
 
-/** Both run inside the platform's trigger window (Slack: 3 s); `submit` only validates, the store runs after. */
+/** Both run inside the platform's trigger window (Slack: 3 s), so neither may wait on anything slow. */
 export interface SecretIntakeHooks {
   open(
     intakeId: string,
