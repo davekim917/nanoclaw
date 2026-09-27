@@ -304,7 +304,6 @@ async function performDriftCheck(
     }
   })();
 
-  // Only a passing result is cached.
   if (result.ok) {
     okResultCache.set(imageRef, { fingerprint, result, cachedAt: Date.now() });
   }

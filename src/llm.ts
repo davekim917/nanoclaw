@@ -9,7 +9,6 @@ import { log } from './log.js';
 
 const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 
-// Resolved on first call.
 let _envProxyDispatcher: Dispatcher | null | undefined;
 /** The OneCLI gateway proxy dispatcher for host calls to external APIs, or null without proxy env. */
 export function getProxyDispatcher(): Dispatcher | null {
