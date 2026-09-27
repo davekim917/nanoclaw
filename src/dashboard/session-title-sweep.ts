@@ -4,21 +4,12 @@
  * REFRESH_MIN_NEW_MESSAGES new messages. A sweep rather than on-write keeps LLM cost bounded; a stale title beats a
  * churning one.
  */
-import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
-
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../modules/mailbox/index.js';
-import {
-  anthropicCredentialHttpError,
-  callWithCredentialRotation,
-  listClaudeStructuredCredentialSlots,
-  type StructuredCredential,
-} from '../llm.js';
+import { callHaiku, listClaudeStructuredCredentialSlots } from '../llm.js';
 
-// Bounds how many candidates are PICKED per tick, not in-flight requests: `callWithCredentialRotation` (src/llm.ts)
-// queues behind a process-wide gate allowing one request at a time, because bursts from this sweep tripped account
-// rate limits. Slot rotation and parking state is module-level in llm.ts, so candidates in one tick share it.
+// Candidates per tick. They run one at a time: concurrent bursts from this sweep tripped the keys' rate limits.
 export const CONCURRENCY_CAP = 3;
 export const COOLDOWN_HOURS = 1;
 export const REFRESH_MIN_NEW_MESSAGES = 10;
@@ -55,8 +46,7 @@ export function _resetTitleBackendForTest(): void {
 
 /**
  * Sweep-level cooldown engaged by the circuit breaker. The per-tick breaker only de-duplicates log lines; this is
- * what actually stops doomed calls during a sustained 429 window, which would otherwise starve the other host Haiku
- * callers.
+ * what actually stops doomed calls during a sustained 429 window.
  */
 export const BREAKER_COOLDOWN_BASE_MS = 5 * 60_000;
 export const BREAKER_COOLDOWN_CAP_MS = 30 * 60_000;
@@ -107,71 +97,9 @@ export function isBackendConfigured(): boolean {
   return listClaudeStructuredCredentialSlots().length > 0;
 }
 
-// Lazy so tests do not inherit stale proxy env and a restart after env changes needs no other init path.
-let _envProxyDispatcher: Dispatcher | null | undefined;
-function getProxyDispatcher(): Dispatcher | null {
-  if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
-  const hasProxyEnv = !!(
-    process.env['HTTPS_PROXY'] ||
-    process.env['https_proxy'] ||
-    process.env['HTTP_PROXY'] ||
-    process.env['http_proxy']
-  );
-  _envProxyDispatcher = hasProxyEnv ? new EnvHttpProxyAgent() : null;
-  return _envProxyDispatcher;
-}
-
-export function _resetProxyDispatcherForTest(): void {
-  _envProxyDispatcher = undefined;
-}
-
 let _missingBackendLogged = false;
 
-/** One request against a single resolved credential; rotation and retry live in {@link callTitleBackend}. */
-async function callTitleBackendOnce(system: string, user: string, credential: StructuredCredential): Promise<string> {
-  const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
-  const model = process.env['NANOCLAW_SESSION_TITLE_MODEL'] ?? DEFAULT_MODEL;
-
-  // Through the proxy so the OneCLI gateway can swap the placeholder OAuth token for the vault token.
-  const dispatcher = getProxyDispatcher();
-  const fetchImpl: typeof fetch = dispatcher
-    ? (url, init) =>
-        undiciFetch(
-          url as string,
-          { ...init, dispatcher } as Parameters<typeof undiciFetch>[1],
-        ) as unknown as Promise<Response>
-    : fetch;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), HAIKU_TIMEOUT_MS);
-  try {
-    const resp = await fetchImpl(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...credential.headers,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 80,
-        temperature: 0,
-        system,
-        messages: [{ role: 'user', content: user }],
-      }),
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      throw await anthropicCredentialHttpError(resp);
-    }
-    const data = (await resp.json()) as { content?: Array<{ type: string; text: string }> };
-    return data.content?.find((c) => c.type === 'text')?.text ?? '';
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** The test override is one direct call raced against its own timeout; production goes through {@link callWithCredentialRotation}. */
+/** The test override is one direct call raced against its own timeout. */
 async function callTitleBackend(system: string, user: string): Promise<string> {
   if (_backendOverride !== null) {
     const controller = new AbortController();
@@ -189,12 +117,11 @@ async function callTitleBackend(system: string, user: string): Promise<string> {
     }
   }
 
-  const { value } = await callWithCredentialRotation({
-    attempt: (credential) => callTitleBackendOnce(system, user, credential),
-    logLabel: 'session-title',
-    noCredentialsMessage: 'session-title: no Anthropic credentials available',
+  return callHaiku(user, {
+    system,
+    timeoutMs: HAIKU_TIMEOUT_MS,
+    model: process.env['NANOCLAW_SESSION_TITLE_MODEL'] ?? DEFAULT_MODEL,
   });
-  return value;
 }
 
 /** Strips quotes, "Title: " preambles and trailing periods, and caps at {@link HAIKU_MAX_TITLE_CHARS}. */
@@ -357,8 +284,7 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     return { generated: 0, skipped: 0 };
   }
 
-  // Fail closed during the breaker cooldown: a rate-limited but configured credential produces the same waste the
-  // gate above cannot see.
+  // Fail closed during the breaker cooldown: a rate-limited but configured credential produces the same waste.
   if (isCoolingDown(Date.now())) {
     return { generated: 0, skipped: 0 };
   }
@@ -368,7 +294,7 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
 
   let generated = 0;
   let skipped = 0;
-  const tasks: Array<Promise<TaskOutcome>> = [];
+  const tasks: Array<() => Promise<TaskOutcome>> = [];
 
   for (const row of candidates) {
     if (tasks.length >= CONCURRENCY_CAP) break;
@@ -390,39 +316,36 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
       skipped++;
       continue;
     }
-    tasks.push(
-      (async (): Promise<TaskOutcome> => {
-        try {
-          // Timeouts are per attempt inside callTitleBackend: a rotation may try several slots, each needing its own
-          // budget.
-          const raw = await callTitleBackend(SYSTEM_PROMPT, slice.text);
-          const title = postProcessTitle(raw);
-          if (!title) {
-            skipped++;
-            return { sessionId: row.id, ok: true };
-          }
-          await persistTitle(row.id, title, slice.maxSeq, new Date().toISOString());
-          generated++;
-          return { sessionId: row.id, ok: true };
-        } catch (err) {
-          try {
-            await stampFailureBackoff(row.id);
-          } catch {
-            /* stamp failure is non-fatal — next tick will retry */
-          }
+    tasks.push(async (): Promise<TaskOutcome> => {
+      try {
+        const raw = await callTitleBackend(SYSTEM_PROMPT, slice.text);
+        const title = postProcessTitle(raw);
+        if (!title) {
           skipped++;
-          return {
-            sessionId: row.id,
-            ok: false,
-            transient: isTransientBackendFailure(err),
-            errMessage: err instanceof Error ? err.message : String(err),
-          };
+          return { sessionId: row.id, ok: true };
         }
-      })(),
-    );
+        await persistTitle(row.id, title, slice.maxSeq, new Date().toISOString());
+        generated++;
+        return { sessionId: row.id, ok: true };
+      } catch (err) {
+        try {
+          await stampFailureBackoff(row.id);
+        } catch {
+          /* stamp failure is non-fatal — next tick will retry */
+        }
+        skipped++;
+        return {
+          sessionId: row.id,
+          ok: false,
+          transient: isTransientBackendFailure(err),
+          errMessage: err instanceof Error ? err.message : String(err),
+        };
+      }
+    });
   }
 
-  const outcomes = await Promise.all(tasks);
+  const outcomes: TaskOutcome[] = [];
+  for (const task of tasks) outcomes.push(await task());
   const breakerTripped = logFailuresWithBreaker(outcomes);
 
   // A success proves the backend is not fully rate-limited, so the escalation resets; a trip (only possible when the
@@ -486,10 +409,7 @@ function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
   return tripped;
 }
 
-/**
- * Breaker/log-volume policy only, deliberately coarser than llm.ts's `classifyCredentialFailure`: every 429 counts
- * toward the breaker, whatever its cause.
- */
+/** Breaker policy only: every 429 counts toward the breaker, whatever its cause. */
 function isTransientBackendFailure(err: unknown): boolean {
   const status = (err as { status?: number }).status;
   return status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;

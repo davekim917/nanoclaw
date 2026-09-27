@@ -1327,3 +1327,196 @@ describe('baseline ratchet', () => {
     expect(output).not.toMatch(/Fictional/);
   });
 });
+
+describe('tracked paths are a scanned surface', () => {
+  it('scans every path, including unreadable and binary files, and redacts the matching segment', () => {
+    const findings = scanInputs(
+      [
+        input('docs/fictional-house/notes.md', 'clean\n'),
+        { file: 'assets/Fictional House.png', content: Buffer.from([0x89, 0, 1]) },
+        { file: 'gone/fictional_house.md', content: null },
+        input(`fixtures/${['C', '01ABCDEF2'].join('')}.json`, '{}\n'),
+        input('docs/plain.md', 'clean\n'),
+      ],
+      new Set(['Fictional House']),
+      [],
+    );
+    expect(findings).toEqual([
+      { file: 'assets/<redacted>', line: 0, category: 'private-identifier', inPath: true },
+      { file: 'docs/<redacted>/notes.md', line: 0, category: 'private-identifier', inPath: true },
+      { file: 'fixtures/<redacted>', line: 0, category: 'slack-identifier', inPath: true },
+      { file: 'gone/<redacted>', line: 0, category: 'private-identifier', inPath: true },
+    ]);
+    expect(JSON.stringify(findings)).not.toMatch(/ictional|01ABCDEF2/);
+  });
+
+  it('never lets the per-file baseline hold a path hit', () => {
+    const pathHit = { file: 'a.md', line: 0, category: 'private-identifier' as const, inPath: true as const };
+    expect(applyBaseline([pathHit], { files: { 'a.md': 5 } }).findings).toEqual([pathHit]);
+  });
+
+  it('refuses an identifier in a tracked path on index and daily-snapshot scans, without printing it', () => {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    fs.mkdirSync(path.join(root, 'clients', 'fictional-registry-house'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'clients', 'fictional-registry-house', 'readme.md'), 'nothing private\n');
+    execFileSync('git', ['add', 'clients'], { cwd: root });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(main(['--root', root, '--index'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain('clients/<redacted>/readme.md (path) private-identifier');
+    expect(() => writeBaseline(resolveOptions(['--root', root, '--write-baseline'], root))).toThrow('rename it first');
+    // A file gone from the worktree is still tracked, so its path still scans.
+    fs.rmSync(path.join(root, 'clients', 'fictional-registry-house', 'readme.md'));
+    expect(main(['--root', root])).toBe(1);
+    execFileSync('git', ['checkout', '--', 'clients'], { cwd: root });
+
+    // The daily remote scan's invocation: a detached snapshot, --index, an allowlist outside the tree.
+    execFileSync('git', ['commit', '-q', '-m', 'add'], { cwd: root });
+    const snapshot = addLinkedWorktree(root);
+    const allowlist = path.join(tempRoot(), 'allowlist.json');
+    fs.writeFileSync(allowlist, '{"entries":[]}\n');
+    expect(main(['--root', snapshot, '--index', '--allowlist', allowlist])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).not.toMatch(/registry.house/i);
+  });
+});
+
+describe('content with NUL bytes', () => {
+  const utf16 = (text: string, bigEndian: boolean): Buffer => {
+    const body = Buffer.from(text, 'utf16le');
+    return Buffer.concat([Buffer.from(bigEndian ? [0xfe, 0xff] : [0xff, 0xfe]), bigEndian ? body.swap16() : body]);
+  };
+
+  it('still checks forbidden and identifier paths', () => {
+    const binary = Buffer.from([0x89, 0x50, 0, 1]);
+    expect(
+      scanInputs(
+        [
+          { file: '.context/shot.png', content: binary },
+          { file: 'docs/specs/feature/qa-evidence/shot.png', content: binary },
+          { file: 'img/fictional-house.png', content: binary },
+        ],
+        new Set(['Fictional House']),
+        [],
+      ),
+    ).toEqual([
+      { file: '.context/shot.png', line: 1, category: 'forbidden-artifact-path' },
+      { file: 'docs/specs/feature/qa-evidence/shot.png', line: 1, category: 'forbidden-artifact-path' },
+      { file: 'img/<redacted>', line: 0, category: 'private-identifier', inPath: true },
+    ]);
+  });
+
+  it('decodes and scans UTF-16 text that carries a BOM', () => {
+    const text = 'intro\nFictional House\n';
+    expect(
+      scanInputs(
+        [
+          { file: 'le.txt', content: utf16(text, false) },
+          { file: 'be.txt', content: utf16(text, true) },
+        ],
+        new Set(['Fictional House']),
+        [],
+      ),
+    ).toEqual([
+      { file: 'be.txt', line: 2, category: 'private-identifier' },
+      { file: 'le.txt', line: 2, category: 'private-identifier' },
+    ]);
+  });
+
+  it('refuses NUL-bearing content it cannot decode unless its extension is a binary one', () => {
+    const utf32 = Buffer.alloc(4 * 5);
+    [0xfeff, ...'Acme'].forEach((char, i) =>
+      utf32.writeUInt32LE(typeof char === 'number' ? char : (char.codePointAt(0) ?? 0), i * 4),
+    );
+    const findings = scanInputs(
+      [
+        input('notes.md', 'Fictional\0House\n'),
+        { file: 'export.sqlite', content: Buffer.from([0x53, 0, 0x51]) },
+        { file: 'wide.txt', content: utf32 },
+        { file: 'odd.txt', content: Buffer.from([0xff, 0xfe, 0x41]) },
+        { file: 'logo.png', content: Buffer.from([0x89, 0, 0x50]) },
+        { file: 'font.WOFF2', content: Buffer.from([0x77, 0, 0x4f]) },
+        { file: 'blob.bin', content: Buffer.from([0xff, 0xfe, 0x41]) },
+      ],
+      new Set(['Fictional House']),
+      [],
+    );
+    expect(findings).toEqual(
+      ['export.sqlite', 'notes.md', 'odd.txt', 'wide.txt'].map((file) => ({
+        file,
+        line: 1,
+        category: 'unscannable-content',
+      })),
+    );
+  });
+});
+
+describe('short and Unicode identifiers', () => {
+  const lines = (identifiers: string[], text: string[]): number[] =>
+    scanInputs([input('a.md', text.join('\n'))], new Set(identifiers), []).map((finding) => finding.line);
+
+  it('matches a Unicode name literally, case-insensitively, across normal forms, and under its ASCII spelling', () => {
+    expect(
+      lines(['Zoë Quill'], ['zoë-quill', 'ZOË QUILL', 'Zoë Quill', 'zoe_quill', 'Zoëlle Quillon', 'Zoe Quillon']),
+    ).toEqual([1, 2, 3, 4]);
+    // No ASCII spelling to fall back on: only normalizing the content finds the decomposed form.
+    expect(lines(['Łódź Harbor'], ['Ło\u0301dz\u0301 Harbor'])).toEqual([1]);
+  });
+
+  it('finds a name in an unspaced script inside running text, and bounds one in a spaced script', () => {
+    expect(lines(['林檎堂'], ['これは林檎堂のメモ', '林檎の木'])).toEqual([1]);
+    expect(lines(['Жорик'], ['жорик-бот', 'Жорики'])).toEqual([1]);
+  });
+
+  it('keeps a one-character name and matches it beside a context word', () => {
+    const file = path.join(tempRoot(), 'ids');
+    fs.writeFileSync(file, 'Q\n');
+    expect(loadLocalIdentifiers(file)).toEqual(new Set(['Q']));
+    expect(lines(['Q'], ['workspace-q', 'Q and A', 'agent Q'])).toEqual([1, 3]);
+    expect(lines(['Ø'], ['slack-ø', 'Ø alone'])).toEqual([1]);
+  });
+
+  it('matches a capitalized two- or three-letter name as a bare word in its own case only', () => {
+    expect(lines(['Qz'], ['the Qz board', 'qz', 'QZ', 'Qzx'])).toEqual([1]);
+    expect(lines(['VK'], ['the VK board', 'vk', 'Vk'])).toEqual([1]);
+    expect(lines(['Qvx'], ['Qvx release', 'qvx'])).toEqual([1]);
+    // A digit or a common acronym keeps the name contextual.
+    expect(lines(['Q7'], ['Q7 build', 'slack-Q7'])).toEqual([2]);
+    expect(lines(['OK'], ['OK then', 'workspace ok'])).toEqual([2]);
+  });
+
+  it('reports a name the matcher cannot express, failing a gating scan closed', () => {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    fs.appendFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), '★★\n');
+    const report = runReport(resolveOptions(['--root', root, '--index'], root));
+    expect(report.discoveryProblems).toEqual([
+      '1 loaded identifier(s) have no letter or digit the matcher can express; remove them or add a letter or digit',
+    ]);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(main(['--root', root, '--index'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).not.toContain('★');
+  });
+
+  it('counts names matched only in context and prints the count', () => {
+    const root = initInstallRepo('Fictional Registry House', 'qx');
+    expect(runReport(resolveOptions(['--root', root, '--index'], root)).contextOnlyIdentifiers).toBe(1);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(main(['--root', root, '--index'])).toBe(0);
+    expect(stdout.mock.calls.flat().join('')).toContain('note: 1 short identifier(s) match only beside a context word');
+  });
+
+  it('keeps a canonical name that ASCII-only tokens would read as generic or empty', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    fs.mkdirSync(dataDir, { recursive: true });
+    const dbPath = path.join(dataDir, 'v2.db');
+    const db = new Database(dbPath);
+    db.exec("CREATE TABLE workgroups (id TEXT, display_name TEXT); INSERT INTO workgroups VALUES ('wg-x', 'Nova');");
+    db.close();
+    // One with no letters at all is kept too, so discovery can report it as inexpressible.
+    for (const name of ['林檎堂', 'app-林檎', '_'])
+      execFileSync('git', ['init', '-q', path.join(dataDir, 'repositories', 'wg-x', name)]);
+    expect(loadInstallIdentifiers(dbPath, { owners: new Set(), repositories: new Set() }, [])).toEqual(
+      new Set(['林檎堂', 'app-林檎', '_']),
+    );
+  });
+});

@@ -935,6 +935,20 @@ describe('.husky/pre-push', () => {
     },
   );
 
+  it('refuses a pushed commit whose tracked path holds an identifier, without printing it', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    fs.mkdirSync(path.join(f.root, 'docs', 'private-customer'), { recursive: true });
+    fs.writeFileSync(path.join(f.root, 'docs', 'private-customer', 'notes.md'), 'nothing private\n');
+    runGit(f.root, ['add', 'docs']);
+    const pushed = commit(f.root, 'clean-contents', 'add notes');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, { realTreeCheck: true });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('docs/<redacted>/notes.md (path) private-identifier');
+    expect(result.stderr).not.toMatch(/private.customer/i);
+  });
+
   it('clears the source Git environment before the boundary gate reads a snapshot index', () => {
     const f = fixture();
     const snapshot = commit(f.root, 'snapshot-index');

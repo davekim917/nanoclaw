@@ -19,12 +19,15 @@ export type ScanCategory =
   | 'atlassian-tenant-url'
   | 'linear-workspace-url'
   | 'vendor-organization-id'
-  | 'forbidden-artifact-path';
+  | 'forbidden-artifact-path'
+  | 'unscannable-content';
 
 export interface Finding {
   file: string;
   line: number;
   category: ScanCategory;
+  /** A path match: no baseline holds it, and `file` has matching segments redacted in every finding for that path. */
+  inPath?: true;
 }
 
 interface AllowlistEntry {
@@ -35,7 +38,7 @@ interface AllowlistEntry {
 
 interface ScanInput {
   file: string;
-  content: Buffer;
+  content: Buffer | null;
 }
 
 export interface ScanOptions {
@@ -124,8 +127,33 @@ const GENERIC_REPOSITORY_WORDS = new Set([
   'wiki',
 ]);
 
-// Three-letter acronyms common in code: a name matching one keeps the contextual match, not bare-word.
+// Short acronyms and words common in code and prose: a name matching one keeps the contextual match, not bare-word.
 const COMMON_ACRONYMS = new Set([
+  'ai',
+  'am',
+  'cd',
+  'ci',
+  'db',
+  'dr',
+  'go',
+  'id',
+  'io',
+  'ip',
+  'it',
+  'js',
+  'mr',
+  'no',
+  'ok',
+  'os',
+  'pm',
+  'pr',
+  'qa',
+  'st',
+  'ts',
+  'ui',
+  'us',
+  'ux',
+  'vm',
   'api',
   'app',
   'aws',
@@ -263,33 +291,90 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function normalizedIdentifierPattern(value: string): RegExp | null {
+const CONTEXT_WORDS =
+  '(?:agent|client|customer|data|datafold|discord|group|slack|tenant|token|workspace|workgroup|[amw]g)';
+
+interface IdentifierMatcher {
+  identifier: string;
+  /** Empty: the matcher cannot express this identifier, which discovery reports. */
+  patterns: RegExp[];
+  contextOnly: boolean;
+  unicode: boolean;
+}
+
+function contextualPattern(identifier: string, word: string, flags: string): RegExp {
+  const other = word === 'A-Za-z0-9' ? '[^A-Za-z0-9]' : `[^${word}]`;
+  return new RegExp(
+    `(^|${other})(?:${CONTEXT_WORDS}${other}{1,4}${identifier}|${identifier}${other}{1,4}${CONTEXT_WORDS})(?=$|${other})`,
+    flags,
+  );
+}
+
+// A short name always matches beside a context word, and as a case-exact bare word only when it is
+// two or three letters with a capital: lowercase or with a digit, such a token is ordinary code.
+function asciiPatterns(value: string): { patterns: RegExp[]; contextOnly: boolean } {
   const tokens = value.match(/[A-Za-z0-9]+/g) ?? [];
-  if (tokens.length === 0) return null;
+  if (tokens.length === 0) return { patterns: [], contextOnly: false };
   const normalizedLength = tokens.reduce((sum, token) => sum + token.length, 0);
+  const common = COMMON_ACRONYMS.has(value.toLowerCase());
   // An all-caps three-letter name is a product or code name: match it as a bare word.
-  if (/^[A-Z][A-Z0-9]{2}$/.test(value) && !COMMON_ACRONYMS.has(value.toLowerCase())) {
-    return new RegExp(`(^|[^A-Za-z0-9])${value}(?=$|[^A-Za-z0-9])`, 'gi');
+  if (/^[A-Z][A-Z0-9]{2}$/.test(value) && !common) {
+    return { patterns: [new RegExp(`(^|[^A-Za-z0-9])${value}(?=$|[^A-Za-z0-9])`, 'gi')], contextOnly: false };
   }
   if (normalizedLength < 4) {
-    const identifier = tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}');
-    const context =
-      '(?:agent|client|customer|data|datafold|discord|group|slack|tenant|token|workspace|workgroup|[amw]g)';
-    return new RegExp(
-      `(^|[^A-Za-z0-9])(?:${context}[^A-Za-z0-9]{1,4}${identifier}|${identifier}[^A-Za-z0-9]{1,4}${context})(?=$|[^A-Za-z0-9])`,
-      'gi',
-    );
+    const patterns = [contextualPattern(tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}'), 'A-Za-z0-9', 'gi')];
+    const cased = /^[A-Za-z]{2,3}$/.test(value) && /[A-Z]/.test(value) && !common;
+    if (cased) patterns.push(new RegExp(`(^|[^A-Za-z0-9])${value}(?=$|[^A-Za-z0-9])`, 'g'));
+    return { patterns, contextOnly: !cased };
   }
   if (normalizedLength < 6) {
-    return new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(value)}(?=$|[^A-Za-z0-9])`, 'gi');
+    return {
+      patterns: [new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(value)}(?=$|[^A-Za-z0-9])`, 'gi')],
+      contextOnly: false,
+    };
   }
-  return new RegExp(`(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`, 'gi');
+  return {
+    patterns: [
+      new RegExp(`(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`, 'gi'),
+    ],
+    contextOnly: false,
+  };
+}
+
+const UNICODE_WORD = String.raw`\p{L}\p{N}\p{M}`;
+// Scripts written without spaces between words: a name in one is found inside running text.
+const UNSPACED_SCRIPT =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+
+// Non-ASCII: literal on NFC text, Unicode case-insensitive, plus any diacritic-free ASCII spelling.
+function identifierMatcher(identifier: string): IdentifierMatcher {
+  if (!/[^\p{ASCII}]/u.test(identifier)) return { identifier, ...asciiPatterns(identifier), unicode: false };
+  const value = identifier.normalize('NFC');
+  const tokens = value.match(new RegExp(`[${UNICODE_WORD}]+`, 'gu')) ?? [];
+  if (tokens.length === 0) return { identifier, patterns: [], contextOnly: false, unicode: true };
+  const joined = tokens.map(escapeRegex).join(`[^${UNICODE_WORD}]{0,4}`);
+  const chars = [...tokens.join('')];
+  const length = chars.length;
+  let patterns: RegExp[];
+  if (length < 2) {
+    patterns = [contextualPattern(joined, UNICODE_WORD, 'giu')];
+  } else {
+    const first = chars[0] ?? '';
+    const last = chars.at(-1) ?? '';
+    const before = UNSPACED_SCRIPT.test(first) ? '()' : `(^|[^${UNICODE_WORD}])`;
+    const after = UNSPACED_SCRIPT.test(last) ? '' : `(?=$|[^${UNICODE_WORD}])`;
+    patterns = [new RegExp(`${before}${joined}${after}`, 'giu')];
+  }
+  const folded = value.normalize('NFD').replace(/\p{M}/gu, '');
+  const ascii = folded !== value && !/[^\p{ASCII}]/u.test(folded) ? asciiPatterns(folded) : null;
+  if (ascii) patterns.push(...ascii.patterns);
+  return { identifier, patterns, contextOnly: length < 2 && (ascii?.contextOnly ?? true), unicode: true };
 }
 
 function addIdentifier(target: Set<string>, value: unknown): void {
   if (typeof value !== 'string') return;
   const trimmed = value.trim().replace(/^#/, '');
-  if (trimmed.length < 2 || GENERIC_IDENTIFIERS.has(trimmed.toLowerCase())) return;
+  if (!trimmed || GENERIC_IDENTIFIERS.has(trimmed.toLowerCase())) return;
   target.add(trimmed);
   for (const platformId of trimmed.match(/[CDGUWT][A-Z0-9]{8,}|\d{17,20}/g) ?? []) {
     if (GENERIC_IDENTIFIERS.has(platformId.toLowerCase())) continue;
@@ -418,8 +503,8 @@ function installRootOf(dbPath: string): string | null {
 }
 
 function isGenericRepositoryName(name: string): boolean {
-  const words = name.toLowerCase().match(/[a-z0-9]+/g) ?? [];
-  return words.every((word) => GENERIC_REPOSITORY_WORDS.has(word));
+  const words = name.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  return words.length > 0 && words.every((word) => GENERIC_REPOSITORY_WORDS.has(word));
 }
 
 function errorCode(err: unknown): string | undefined {
@@ -453,10 +538,7 @@ function listSource(dir: string, problems: string[], what: string): string[] {
   return [];
 }
 
-/**
- * Persona names from each group's container.json and every cloned repository's owner and name.
- * An unreadable source is recorded in `problems` (never by name).
- */
+// An unreadable source is recorded in `problems`, never by name.
 export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, problems: string[]): Set<string> {
   const identifiers = new Set<string>();
   const installRoot = installRootOf(dbPath);
@@ -578,11 +660,151 @@ function addFinding(target: Finding[], finding: Finding): void {
   if (
     !target.some(
       (existing) =>
-        existing.file === finding.file && existing.line === finding.line && existing.category === finding.category,
+        existing.file === finding.file &&
+        existing.line === finding.line &&
+        existing.category === finding.category &&
+        existing.inPath === finding.inPath,
     )
   ) {
     target.push(finding);
   }
+}
+
+// Content that is neither NUL-free nor BOM-marked UTF-16 passes unscanned only under one of these extensions.
+const BINARY_EXTENSIONS = new Set([
+  '7z',
+  'a',
+  'avif',
+  'bin',
+  'bmp',
+  'bz2',
+  'class',
+  'dll',
+  'dylib',
+  'eot',
+  'exe',
+  'flac',
+  'gif',
+  'gz',
+  'heic',
+  'ico',
+  'jar',
+  'jpeg',
+  'jpg',
+  'm4a',
+  'mov',
+  'mp3',
+  'mp4',
+  'o',
+  'ogg',
+  'otf',
+  'pdf',
+  'png',
+  'psd',
+  'pyc',
+  'rar',
+  'so',
+  'tar',
+  'tgz',
+  'tif',
+  'tiff',
+  'ttf',
+  'wasm',
+  'wav',
+  'webm',
+  'webp',
+  'woff',
+  'woff2',
+  'xz',
+  'zip',
+  'zst',
+]);
+
+type DecodedContent = { kind: 'text'; text: string } | { kind: 'binary' } | { kind: 'unscannable' };
+
+function decodeUtf16(body: Buffer, bigEndian: boolean): string | null {
+  if (body.length % 2 !== 0) return null;
+  const text = (bigEndian ? Buffer.from(body).swap16() : body).toString('utf16le');
+  // A U+0000 left after decoding is UTF-32 or binary read as UTF-16.
+  return text.includes('\0') ? null : text;
+}
+
+function decodeContent(file: string, content: Buffer): DecodedContent {
+  const bom = content.length >= 2 ? content.readUInt16BE(0) : 0;
+  if (bom === 0xfffe || bom === 0xfeff) {
+    const text = decodeUtf16(content.subarray(2), bom === 0xfeff);
+    if (text !== null) return { kind: 'text', text };
+  } else if (!content.includes(0)) {
+    return { kind: 'text', text: content.toString('utf8') };
+  }
+  const extension = path.extname(file).slice(1).toLowerCase();
+  return BINARY_EXTENSIONS.has(extension) ? { kind: 'binary' } : { kind: 'unscannable' };
+}
+
+interface Match {
+  line: number;
+  category: ScanCategory;
+  start: number;
+  end: number;
+}
+
+function findMatches(
+  file: string,
+  text: string,
+  identifierText: string,
+  matchers: IdentifierMatcher[],
+  allowlist: AllowlistEntry[],
+): Match[] {
+  const matches: Match[] = [];
+  for (const rule of STRUCTURAL_RULES) {
+    rule.pattern.lastIndex = 0;
+    for (const match of text.matchAll(rule.pattern)) {
+      const value = match[0];
+      if (
+        rule.synthetic(value) ||
+        isAllowed(file, value, allowlist) ||
+        isSerializedAllowlistValue(file, value, allowlist)
+      )
+        continue;
+      matches.push({
+        line: lineNumber(text, match.index),
+        category: rule.category,
+        start: match.index,
+        end: match.index + value.length,
+      });
+    }
+  }
+  for (const { identifier, patterns } of matchers) {
+    // The allowlist file itself holds allowlisted values; any other identifier in it still flags.
+    if (isAllowed(file, identifier, allowlist) || isSerializedAllowlistValue(file, identifier, allowlist)) continue;
+    for (const pattern of patterns) {
+      // Every matching line: the baseline ratchet counts lines.
+      for (const match of identifierText.matchAll(pattern)) {
+        const start = match.index + (match[1]?.length ?? 0);
+        matches.push({
+          line: lineNumber(identifierText, start),
+          category: 'private-identifier',
+          start,
+          end: match.index + match[0].length,
+        });
+      }
+    }
+  }
+  return matches;
+}
+
+function redactPath(file: string, matches: Match[]): string {
+  let offset = 0;
+  return file
+    .split('/')
+    .map((segment) => {
+      const start = offset;
+      offset += segment.length + 1;
+      return matches.some((match) => match.start < start + segment.length && match.end > start)
+        ? '<redacted>'
+        : segment;
+    })
+    .join('/');
 }
 
 export function scanInputs(
@@ -591,50 +813,27 @@ export function scanInputs(
   allowlist: AllowlistEntry[],
 ): Finding[] {
   const findings: Finding[] = [];
-  const identifierPatterns = [...privateIdentifiers].map((identifier) => ({
-    identifier,
-    pattern: normalizedIdentifierPattern(identifier),
-  }));
+  const matchers = [...privateIdentifiers].map(identifierMatcher);
+  const normalize = matchers.some((matcher) => matcher.unicode);
+  const forIdentifiers = (text: string): string => (normalize ? text.normalize('NFC') : text);
   for (const input of inputs) {
-    if (input.content.includes(0)) continue;
-    const content = input.content.toString('utf8');
+    const pathText = forIdentifiers(input.file);
+    const pathMatches = findMatches(input.file, pathText, pathText, matchers, allowlist);
+    const file = pathMatches.length > 0 ? redactPath(pathText, pathMatches) : input.file;
+    for (const match of pathMatches) addFinding(findings, { file, line: 0, category: match.category, inPath: true });
 
     if (FORBIDDEN_PATHS.some((pattern) => pattern.test(input.file))) {
-      addFinding(findings, { file: input.file, line: 1, category: 'forbidden-artifact-path' });
+      addFinding(findings, { file, line: 1, category: 'forbidden-artifact-path' });
     }
-
-    for (const rule of STRUCTURAL_RULES) {
-      rule.pattern.lastIndex = 0;
-      for (const match of content.matchAll(rule.pattern)) {
-        const value = match[0];
-        if (
-          rule.synthetic(value) ||
-          isAllowed(input.file, value, allowlist) ||
-          isSerializedAllowlistValue(input.file, value, allowlist)
-        ) {
-          continue;
-        }
-        addFinding(findings, {
-          file: input.file,
-          line: lineNumber(content, match.index ?? 0),
-          category: rule.category,
-        });
-      }
+    if (input.content === null) continue;
+    const decoded = decodeContent(input.file, input.content);
+    if (decoded.kind === 'binary') continue;
+    if (decoded.kind === 'unscannable') {
+      addFinding(findings, { file, line: 1, category: 'unscannable-content' });
+      continue;
     }
-
-    for (const { identifier, pattern } of identifierPatterns) {
-      // The allowlist file itself holds allowlisted values; any other identifier in it still flags.
-      if (isAllowed(input.file, identifier, allowlist) || isSerializedAllowlistValue(input.file, identifier, allowlist))
-        continue;
-      if (!pattern) continue;
-      // Every matching line: the baseline ratchet counts lines.
-      for (const match of content.matchAll(pattern)) {
-        addFinding(findings, {
-          file: input.file,
-          line: lineNumber(content, match.index + (match[1]?.length ?? 0)),
-          category: 'private-identifier',
-        });
-      }
+    for (const match of findMatches(input.file, decoded.text, forIdentifiers(decoded.text), matchers, allowlist)) {
+      addFinding(findings, { file, line: match.line, category: match.category });
     }
   }
   return findings.sort(
@@ -646,14 +845,15 @@ function trackedInputs(root: string, index: boolean): ScanInput[] {
   const files = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
   const inputs: ScanInput[] = [];
   for (const file of files) {
+    let content: Buffer | null = null;
     try {
-      const content = index
+      content = index
         ? execFileSync('git', ['show', `:${file}`], { cwd: root, encoding: 'buffer', maxBuffer: 32 * 1024 * 1024 })
         : fs.readFileSync(path.join(root, file));
-      inputs.push({ file, content });
     } catch {
-      // A tracked file deleted from the selected surface has no content to scan.
+      // A tracked file deleted from the selected surface has no content to scan; its path still publishes.
     }
+    inputs.push({ file, content });
   }
   return inputs;
 }
@@ -755,8 +955,9 @@ export interface RunReport {
   registryPathsTried: string[];
   identifiersPathsTried: string[];
   baseline: BaselineOutcome;
-  /** Identifier sources that exist but could not be read; their names are missing from the scan. */
+  /** Identifier sources that exist but could not be read, or names the matcher cannot express. */
   discoveryProblems: string[];
+  contextOnlyIdentifiers: number;
 }
 
 /** Per-file private-identifier line counts, never values; a file absent from it may hold none. */
@@ -765,14 +966,11 @@ export interface Baseline {
 }
 
 export interface BaselineOutcome {
-  /** Private-identifier lines accepted because their file is within its recorded count. */
   held: number;
   heldFiles: number;
   /** Files whose count rose above their recorded count; their findings stay reported. */
   exceeded: Array<{ file: string; count: number; recorded: number }>;
-  /** Files now below their recorded count: `--write-baseline` lowers them. */
   below: string[];
-  /** Raw private-identifier line counts per file, before the baseline. */
   counts: Record<string, number>;
   /** The scanned tree carries no committed baseline, so nothing was held. */
   missing: boolean;
@@ -857,10 +1055,8 @@ function readWorktreeBaseline(root: string): string | null {
   }
 }
 
-/**
- * Explicit --baseline must exist. Otherwise the scanned tree's own copy; a tree without one
- * borrows nothing, so every private-identifier line it holds fails.
- */
+// Explicit --baseline must exist. A tree without its own copy borrows nothing, so every
+// private-identifier line it holds fails.
 function loadBaseline(options: ScanOptions): Baseline | null {
   if (options.baselinePath) {
     let text: string;
@@ -881,8 +1077,9 @@ export function applyBaseline(
 ): { findings: Finding[]; outcome: BaselineOutcome } {
   // Null prototype: a tracked file named like an Object.prototype key must count from zero.
   const counts: Record<string, number> = Object.create(null) as Record<string, number>;
+  const held = (finding: Finding): boolean => finding.category === 'private-identifier' && !finding.inPath;
   for (const finding of findings) {
-    if (finding.category === 'private-identifier') counts[finding.file] = (counts[finding.file] ?? 0) + 1;
+    if (held(finding)) counts[finding.file] = (counts[finding.file] ?? 0) + 1;
   }
   const outcome: BaselineOutcome = { held: 0, heldFiles: 0, exceeded: [], below: [], counts, missing: false };
   const heldFiles = new Set<string>();
@@ -903,7 +1100,7 @@ export function applyBaseline(
   outcome.exceeded.sort((a, b) => a.file.localeCompare(b.file));
   outcome.below.sort();
   return {
-    findings: findings.filter((finding) => finding.category !== 'private-identifier' || !heldFiles.has(finding.file)),
+    findings: findings.filter((finding) => !held(finding) || !heldFiles.has(finding.file)),
     outcome,
   };
 }
@@ -1000,6 +1197,13 @@ export function runReport(options: ScanOptions): RunReport {
       ? 'structural-fallback'
       : 'install-aware';
 
+  const matchers = [...privateIdentifiers].map(identifierMatcher);
+  const inexpressible = matchers.filter((matcher) => matcher.patterns.length === 0).length;
+  if (inexpressible > 0) {
+    discoveryProblems.push(
+      `${inexpressible} loaded identifier(s) have no letter or digit the matcher can express; remove them or add a letter or digit`,
+    );
+  }
   const allowlist = loadAllowlist(options.allowlistPath);
   const base = {
     mode,
@@ -1008,6 +1212,7 @@ export function runReport(options: ScanOptions): RunReport {
     registryPathsTried,
     identifiersPathsTried,
     discoveryProblems: [...new Set(discoveryProblems)].sort(),
+    contextOnlyIdentifiers: matchers.filter((matcher) => matcher.contextOnly).length,
   };
   // A commit message is not a tracked path, so no baseline entry can hold it.
   if (options.messagePath) {
@@ -1036,6 +1241,9 @@ export function writeBaseline(options: ScanOptions): { written: string; refused:
     throw new Error(
       `--write-baseline requires every install identifier source: ${report.discoveryProblems.join('; ')}`,
     );
+  }
+  if (report.findings.some((finding) => finding.inPath)) {
+    throw new Error('--write-baseline refuses while a tracked path matches; rename it first');
   }
   const target = options.baselinePath ?? path.join(options.root, DEFAULT_BASELINE_RELATIVE);
   const recorded = loadBaseline(options)?.files ?? {};
@@ -1124,6 +1332,11 @@ export function main(argv = process.argv.slice(2)): number {
     const heldNote =
       held > 0 ? `; ${held} pre-existing line(s) in ${heldFiles} file(s) held by ${DEFAULT_BASELINE_RELATIVE}` : '';
     const surface = `${scanned}, ${describeMode(report)}${heldNote}`;
+    if (report.contextOnlyIdentifiers > 0) {
+      process.stdout.write(
+        `note: ${report.contextOnlyIdentifiers} short identifier(s) match only beside a context word (agent, slack, workspace, …)\n`,
+      );
+    }
     if (below.length > 0) {
       process.stdout.write(
         `${below.length} file(s) are below their baseline count; run with --write-baseline to ratchet it down\n`,
@@ -1134,7 +1347,13 @@ export function main(argv = process.argv.slice(2)): number {
       return 0;
     }
     for (const finding of findings) {
-      process.stderr.write(`${finding.file}:${finding.line} ${finding.category}\n`);
+      const where = finding.inPath ? `${finding.file} (path)` : `${finding.file}:${finding.line}`;
+      process.stderr.write(`${where} ${finding.category}\n`);
+    }
+    if (findings.some((finding) => finding.category === 'unscannable-content')) {
+      process.stderr.write(
+        'unscannable-content: a NUL byte without a UTF-16 BOM; escape the NUL or re-encode the file, or give a binary file a binary extension\n',
+      );
     }
     for (const { file, count, recorded } of exceeded) {
       if (recorded > 0) {
