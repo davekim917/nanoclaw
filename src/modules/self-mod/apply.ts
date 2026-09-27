@@ -23,6 +23,7 @@ import {
   isOneCliPlaceholder,
   parseMcpServerConfig,
   readContainerConfig,
+  resolveGroupProvider,
   type ParsedMcpServerConfig,
   updateContainerConfig,
   validateMcpServerName,
@@ -237,14 +238,12 @@ export async function performModelChange(
     await notify('change_model failed: container config missing.');
     return;
   }
-  if (!config.provider) {
-    await notify('change_model failed: group has no provider — cannot revalidate model.');
-    return;
-  }
+  // The file, not the projection: it is what the respawned container boots.
+  const provider = await resolveGroupProvider(agentGroup.id);
 
   // Opencode slugs MUST be provider-prefixed: the host derives the routing
   // provider from the prefix, and a bare slug restarts into an unresolvable model.
-  if (config.provider === 'opencode' && !isOpenCodeModelSlug(slug)) {
+  if (provider === 'opencode' && !isOpenCodeModelSlug(slug)) {
     await notify(
       `change_model failed: "${slug}" is not a valid opencode slug — it must be provider-prefixed ` +
         `(e.g. opencode-go/kimi-k2.7-code, nvidia/meta/llama-3.3-70b-instruct). Run list_models for exact ids.`,
@@ -252,10 +251,10 @@ export async function performModelChange(
     return;
   }
 
-  const denied = await getDenialFor(config.provider, slug);
+  const denied = await getDenialFor(provider, slug);
   if (denied) {
     await notify(
-      `change_model failed: "${slug}" is in the ${config.provider} deny list${
+      `change_model failed: "${slug}" is in the ${provider} deny list${
         denied.reason ? ` (${denied.reason})` : ''
       }. Aborted.`,
     );

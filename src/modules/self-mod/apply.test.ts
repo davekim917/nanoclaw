@@ -234,4 +234,15 @@ describe('performModelChange', () => {
     expect(readContainerConfig('agent').model).toBeUndefined();
     expect((await getContainerConfig('ag-1'))!.model).toBeNull();
   });
+
+  it('validates against the provider in container.json when the projection disagrees', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), provider: 'opencode' });
+    const notify = vi.fn();
+
+    await performModelChange(session, 'gpt-6-sol', 'high', notify);
+
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('not a valid opencode slug'));
+    expect(readContainerConfig('agent').model).toBeUndefined();
+    expect((await getContainerConfig('ag-1'))!.model).toBeNull();
+  });
 });
