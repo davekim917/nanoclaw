@@ -8,7 +8,12 @@ vi.mock('./llm.js', async (importOriginal) => ({
   callHaiku: vi.fn(async () => 'Rollout fix'),
 }));
 
-import { callHaiku } from './llm.js';
+import {
+  AllCredentialSlotsParkedError,
+  callHaiku,
+  CredentialRotationGateHoldTimeoutError,
+  CredentialRotationGateTimeoutError,
+} from './llm.js';
 import { maybeRenameNewThread, retryPendingThreadTitles, _resetRenamedThreadsForTest } from './topic-title.js';
 
 const OPENER_ID = '33333333333333333';
@@ -157,6 +162,26 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
     expect(vi.mocked(callHaiku).mock.calls[0][0]).toContain('the ORIGINAL opening message');
     const row = await getThreadTitleRow(THREAD_ID);
     expect(row?.title).toBe('Retried title');
+  });
+
+  it('does not spend an attempt while the host LLM is unavailable (all slots parked, gate timeouts)', async () => {
+    await insertThreadTitleClaim(THREAD_ID, 'discord', 'opener', NOW);
+    const unavailable = [
+      new AllCredentialSlotsParkedError('callHaiku', null),
+      new CredentialRotationGateTimeoutError(30_000),
+      new CredentialRotationGateHoldTimeoutError('callHaiku'),
+    ];
+    for (const err of unavailable) {
+      vi.mocked(callHaiku).mockRejectedValueOnce(err);
+      expect(await retryPendingThreadTitles(NOW)).toEqual({ attempted: 1, titled: 0 });
+    }
+    expect((await getThreadTitleRow(THREAD_ID))?.attempts).toBe(0);
+
+    vi.mocked(callHaiku).mockRejectedValueOnce(Object.assign(new Error('boom'), { status: 400 }));
+    await retryPendingThreadTitles(NOW);
+    expect((await getThreadTitleRow(THREAD_ID))?.attempts).toBe(1);
+
+    expect(await retryPendingThreadTitles(NOW)).toEqual({ attempted: 1, titled: 1 });
   });
 
   it('excludes rows past the attempt cap', async () => {
