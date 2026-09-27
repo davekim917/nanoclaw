@@ -204,7 +204,7 @@ export function ensureFreshContextBootstrap(
   // Shed the bootstrap's own size before evidence: the capability bound plus a full index can exceed
   // NORMAL_RECALL_CHARS alone. Order matches the host's `enforceFinalBound` (memory core first, capability
   // entries last). Both loops terminate. A bootstrap that already fits is deliberately NOT shrunk to make room
-  // for evidence (the host's policy too), even if every recall block must then be dropped.
+  // for evidence, even if every recall block must then be dropped.
   let shedIndex = false;
   while (bootstrap.length > limit && indexText !== undefined) {
     indexText =
