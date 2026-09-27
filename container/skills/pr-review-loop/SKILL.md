@@ -38,8 +38,8 @@ the change, not a budget.
   not an escalation; it is a queue of things to record so the PR can move.
   If the trend IS in the blocking class — same subsystem, same invariant,
   severity flat or rising — stop and diagnose out loud before touching code.
-  Post your read to the PR thread and mention the PR owner and whoever owns
-  release calls in this deployment, then act on that diagnosis. What you must
+  Post your read to the PR thread, then act on it yourself: converge through a
+  fresh-context substitute review, or rebuild (*Round 3 is a checkpoint*, below). What you must
   not do is push another patch because a patch is what you pushed last time —
   "address the Nth review" as a commit message is the anti-pattern this skill
   exists to stop, and it is how #299 reached round 18.
@@ -456,7 +456,7 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch nam
 
 1. After opening the PR, run `codex-review.sh scope`. It prints a `verdict` for the current head, computed from the files that exact commit changes rather than read off the PR's labels. It resolves the base branch to one commit, then reads `.github/labeler.yml` and a comparison pinned to both SHAs at that commit: `review` when a changed path, or the old path of a renamed file, matches a `risk:high` glob there, matched as the labeler matches them (minimatch with `dot: true`). A `risk:high` or `review:requested` label adds review, but a missing one never skips it; the `Risk label` workflow's labels are there for people to read. To ask for review on a head the globs don't select, add `review:requested`. `scope` fails closed to `review` when it cannot judge the files: the listing fails, reaches GitHub's 300-file cap for a comparison, or disagrees with the PR's file count, the head moves while it is read, or `risk:high` is not in the one shape it reads (a top-level `risk:high:` key holding one rule with one `any-glob-to-any-file` list of quoted globs that use only `*` and `**`).
 2. **`skip`** — no review. Wait for CI with `codex-review.sh ci-wait --head "$SHA"`, then merge with `codex-review.sh merge` (4).
-3. **`review`** — capture `SHA` and `SINCE` (Step 3), run `codex-review.sh request`, then `codex-review.sh wait "$SHA" "$SINCE"`. Work the findings as one batch (Steps 1–4, pushing through `codex-review.sh push`), then capture and `request` again. Repeat until `wait` is clean or `request` hits the cap. Then `codex-review.sh ci-wait --head "$SHA"` before you merge.
+3. **`review`** — capture `SHA` and `SINCE` (Step 3), run `codex-review.sh request`, then `codex-review.sh wait "$SHA" "$SINCE"`. Work the findings as one batch (Steps 1–4, pushing through `codex-review.sh push`), then capture and `request` again. Repeat until `wait` is clean or `request` hits the cap, which is a checkpoint (see *Round 3 is a checkpoint* below). Then `codex-review.sh ci-wait --head "$SHA"` before you merge.
 4. Merge only with `codex-review.sh merge`, within Step 6's authorization rule. It is the only merge path in a risk-scoped repo:
 
    ```bash
@@ -511,7 +511,14 @@ The reviewer reads that diff: every line, including deletions. A regenerated `sr
 
 **Read the review notes first, and add to your fragment.** Before writing or reviewing code, the author and the reviewer read `docs/review-notes.md` and every `docs/review-notes/<PR>.md` fragment (in a container: `/workspace/project/docs/review-notes.md` and `/workspace/project/docs/review-notes/`). Post every review verdict as a receipt, `changes` included. Once any receipt on the PR, on any head, says `changes`, the PR adds `docs/review-notes/<its PR number>.md` — one or more lesson lines, in the registry's format and classes — or its body carries `Review-notes: none (<reason>)`; `merge-check` refuses with `review_notes_missing` (24) otherwise. Do not append the historical `docs/review-notes.md` lessons. Deferring a finding to an issue, or reverting a PR, adds a fragment too. When the PR carries `risk:*` dimension labels, they scope the reviewer's brief.
 
-**The round cap is what bounds the loop here.** `REVIEW_ROUND_CAP` (default 3) is the initial review plus two corrections: after two failed corrections, stop correcting and reframe. On exit 23, stop — summarize the open findings, then escalate to the operator or restart in a fresh session with a reframed prompt. The churn gate cannot do this job alone: it derives seams from imports, so a finding class whose sites are Markdown or YAML never gates. PR #566 went 12 rounds that way.
+**Round 3 is a checkpoint for you, not a stop that waits for the operator.** `REVIEW_ROUND_CAP` (default 3) limits Codex requests, not the work. On exit 23, decide yourself, and never escalate to the operator because the cap was reached:
+
+1. **Assess.** Classify the rounds by file and by class (above, `review-churn.mjs`). For a second opinion, give a fresh-context subagent the diff and the finding history with one question: are these rounds hardening the right parts of this PR, or is each fix creating the next finding?
+2. **Converging** (severity falling, no class recurring): fix the open findings in one batch and push. Then get a fresh-context substitute review of the new head, post it with `receipt`, and merge on `approve`.
+3. **Churning** (a class or seam recurring, or the substitute review still finds new defects): stop patching sites. Rebuild instead: fix the shared seam once, split the PR, or close it and redo the change in a fresh session with a reframed plan. A PR that needs more than six review rounds in total is the wrong PR, not an unlucky one. PR #566 went 12 rounds by patching.
+4. **The operator** hears only about a decision that is genuinely theirs (scope, product behaviour, an authority gate), in one or two lines with your recommendation.
+
+The churn gate cannot do this job alone: it derives seams from imports, so a finding class whose sites are Markdown or YAML never gates.
 
 ## When you compose the review prompt yourself
 
@@ -536,7 +543,7 @@ classes already there.
 - **One comment, one commit, one push.** The loop that never ends. Batch or don't push.
 - **Commenting `@codex review` at all.** It overrides the reviewer's own judgment about whether the commit needed a look, and every one you send is a round you then have to work.
 - **Treating a review you asked for as evidence the change is troubled.** It is evidence you asked.
-- **Fixing by addition.** Each round's fix adds a guard, a flag, a wrapper, and the new machinery draws the next round's findings. Simplify first; escalate what can't be simplified.
+- **Fixing by addition.** Each round's fix adds a guard, a flag, a wrapper, and the new machinery draws the next round's findings. Simplify first; rebuild what can't be simplified.
 - **Replying without resolving.** Next round you re-triage threads you already answered.
 - **Rejecting to save a round.** A rejection without a traced `file:line` is an accept you skipped.
 - **Editing a test so a review comment passes.** The test is the contract; change it only when the user changes the contract.
