@@ -617,8 +617,8 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
   const { seedDir, wgDir, siblingFolders, shared, candidates } = plan;
 
   const markerPath = path.join(wgDir, MIGRATION_MARKER);
-  // RE-RUNS EVERY STARTUP, deliberately: a one-shot latch missed seed dirs added
-  // after the first run. Every step skips when already correct, so a settled
+  // RE-RUNS EVERY STARTUP, deliberately: a one-shot latch would miss seed dirs
+  // added after the first run. Every step skips when already correct, so a settled
   // re-run writes nothing; the marker is a record (keeps `migratedAt`), not a latch.
   const priorReport = readMigrationReport(markerPath);
 

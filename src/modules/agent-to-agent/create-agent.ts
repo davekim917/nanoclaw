@@ -207,7 +207,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     assertValidGroupFolder(folder);
 
     // SECURITY: a folder-token prefix collision would cross-leak scoped-env vars
-    // (folder=example-agent inheriting EXAMPLE_DEV_* from folder=example-dev).
+    // (folder=example inheriting EXAMPLE_DEV_* from folder=example-dev).
     const newTok = folder.toUpperCase().replace(/-/g, '_');
     for (const existing of await getAllAgentGroups()) {
       if (existing.folder === folder) continue;
@@ -252,8 +252,8 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
 
     initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
 
-    // container.json BEFORE the DB insert: a DB row whose container.json lacks
-    // the id is not recoverable, and a failure here still rolls back the folder.
+    // container.json BEFORE the DB insert, so a failure here needs only the
+    // folder rolled back.
     try {
       await updateContainerConfig(folder, (c) => {
         c.agentGroupId = agentGroupId;

@@ -601,8 +601,9 @@ async function completeLoginLocked(
 
 /**
  * Add the bearer secret to the group's `container.json` `onecliSecrets`, which
- * is what grants it: the spawn reconciles the OneCLI agent to EXACTLY that set,
- * so an undeclared secret is a 401 however fresh its value. True when added.
+ * is what grants it: the spawn reconciles the OneCLI agent to exactly the
+ * merged workgroup and group declarations, so a bearer declared nowhere is a
+ * 401 however fresh its value. True when added.
  */
 async function ensureSecretDeclared(agentGroupId: string, secretName: string): Promise<boolean> {
   const group = await getAgentGroup(agentGroupId);

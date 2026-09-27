@@ -744,7 +744,7 @@ function removeForwardedFiles(writtenPaths: string[]): void {
     try {
       fs.rmdirSync(dir);
     } catch {
-      // Non-empty or already gone; the refused bytes are already removed.
+      // Non-empty or already gone. Best-effort: a file that would not unlink was logged above.
     }
   }
 }

@@ -29,9 +29,9 @@ export function isGateRow(msg: { kind: string; content: string }): boolean {
 }
 
 /**
- * Put every gate row ahead of rows the runner wrote after it (higher `seq`).
- * Delivery reads in timestamp order, which a clock step can invert, and a
- * failing gate row stops the drain.
+ * Put every gate row ahead of rows the runner wrote after it (higher `seq`);
+ * other rows keep their relative order. Delivery reads in timestamp order,
+ * which a clock step can invert, and a failing gate row stops the drain.
  */
 export function orderGateRowsBySeq<T extends { kind: string; content: string; seq: number | null }>(rows: T[]): T[] {
   const seqOf = (row: T): number => row.seq ?? Number.MAX_SAFE_INTEGER;
