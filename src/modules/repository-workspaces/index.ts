@@ -252,6 +252,7 @@ function assertCanonicalConfigContract(
   return { origin, objectFormat };
 }
 
+/** Rebuilt from selected values: no container-supplied setting may survive publication. */
 function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void {
   const config = path.join(repoPath, '.git', 'config');
   const objectsInfo = path.join(repoPath, '.git', 'objects', 'info');
@@ -660,8 +661,9 @@ async function response(
 // the topic's staging dir (outside every container mount) and published with
 // one rename, so a checkout exists only once ready. Runs on the host because
 // in a container the canonical and topic root are different mounts: link(2)
-// returns EXDEV and Git would copy every object. It takes its work unit's
-// lifecycle claim and the repository flock, and never quiesces containers.
+// returns EXDEV and Git would copy every object. It takes only its work unit's
+// lifecycle claim and the repository flock: never the workgroup mount claim,
+// and it never quiesces containers.
 
 export interface CheckoutFarmPolicy {
   /** `apply` links farms, `report` logs what it would link, `off` shares nothing. */
