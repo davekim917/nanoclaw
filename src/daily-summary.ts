@@ -498,7 +498,7 @@ export function rankBacklog(items: BacklogItem[]): BacklogItem[] {
     if (prog !== 0) return prog;
     const pri = (priRank[a.priority] ?? 3) - (priRank[b.priority] ?? 3);
     if (pri !== 0) return pri;
-    return a.created_at.localeCompare(b.created_at); // oldest first
+    return a.created_at.localeCompare(b.created_at);
   });
 }
 

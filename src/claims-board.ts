@@ -130,7 +130,7 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
     } else if (isParked) {
       const parkedAt = typeof raw.parked_at === 'string' ? Date.parse(raw.parked_at) : NaN;
       staleMs = Number.isFinite(parkedAt) ? now - parkedAt : 0;
-      // Parked decays into stale; with no exit it was an absorbing state nobody picked up.
+      // Parked must decay into stale: with no exit it is an absorbing state nobody picks up.
       state = staleMs > PARK_GRACE_MS ? 'stale' : 'parked';
     } else {
       const claimedAt = typeof raw.claimed_at === 'string' ? raw.claimed_at : '';
