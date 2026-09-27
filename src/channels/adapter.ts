@@ -27,8 +27,25 @@ export interface ChannelSetup {
    */
   onAction(questionId: string, selectedOption: string, userId: string, messageId: string | null): void;
 
+  secretIntake?: SecretIntakeHooks;
+
   /** The adapter's inbound transport reconnected. Core also triggers the same recovery after host event-loop stalls. */
   onConnectionRestored?(info: ChannelConnectionRestored): void | Promise<void>;
+}
+
+/** Both run inside the platform's trigger window (Slack: 3 s); `submit` only validates, the store runs after. */
+export interface SecretIntakeHooks {
+  open(
+    intakeId: string,
+    userId: string,
+  ): Promise<{ ok: true; form: SecretIntakeForm } | { ok: false; message: string }>;
+  submit(intakeId: string, userId: string, value: string): Promise<{ ok: true } | { ok: false; message: string }>;
+}
+
+interface SecretIntakeForm {
+  title: string;
+  body: string;
+  inputLabel: string;
 }
 
 export interface ChannelConnectionRestored {
