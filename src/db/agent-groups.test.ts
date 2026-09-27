@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import { getRawDb, initTestDb, closeDb } from './connection.js';
-import { createAgentGroup, getAgentGroup, getWorkgroupOnecliSecrets } from './agent-groups.js';
+import {
+  addWorkgroupOnecliSecret,
+  createAgentGroup,
+  getAgentGroup,
+  getWorkgroupOnecliSecrets,
+  workgroupExists,
+} from './agent-groups.js';
 
 describe('getWorkgroupOnecliSecrets', () => {
   beforeEach(async () => {
@@ -55,6 +61,24 @@ describe('getWorkgroupOnecliSecrets', () => {
   it('returns [] (not a throw) when onecli_secrets holds malformed JSON', async () => {
     getRawDb().prepare(`UPDATE workgroups SET onecli_secrets = ? WHERE id = ?`).run('{not json', 'wg-retail');
     expect(await getWorkgroupOnecliSecrets('ag-retail')).toEqual([]);
+  });
+
+  it('appends a secret name once, leaving the existing names in order', async () => {
+    expect(await addWorkgroupOnecliSecret('wg-retail', 'Linear-API-Key')).toBe(true);
+    expect(await addWorkgroupOnecliSecret('wg-retail', 'Linear-API-Key')).toBe(false);
+    expect(await addWorkgroupOnecliSecret('wg-empty', 'Linear-API-Key')).toBe(true);
+    expect(await getWorkgroupOnecliSecrets('ag-retail')).toEqual([
+      'Slack-User-Token-example-retail',
+      'Anthropic',
+      'Linear-API-Key',
+    ]);
+    expect(await getWorkgroupOnecliSecrets('ag-empty')).toEqual(['Linear-API-Key']);
+  });
+
+  it('reports an unknown workgroup rather than creating it', async () => {
+    expect(await addWorkgroupOnecliSecret('wg-nope', 'Linear-API-Key')).toBe(false);
+    expect(await workgroupExists('wg-nope')).toBe(false);
+    expect(await workgroupExists('wg-retail')).toBe(true);
   });
 });
 

@@ -13,6 +13,9 @@ Codex/OpenCode. Hook delivery is **conditional, and the condition is the manifes
 Claude always fires a plugin's SessionStart hook, Codex fires it only for a plugin it
 can register — one shipping `.codex-plugin/plugin.json` that declares a hook — and
 OpenCode has no plugin loader, so no hook path at all.
+The one OpenCode exception is a module the runner itself lists in the OpenCode config's
+`plugin` array: the destructive guard and bootstrap's comment-rule feedback
+(`commentRulePlugins` in `container/agent-runner/src/providers/opencode.ts`).
 
 ## Scope: container agent groups only — never a host CLI
 
@@ -37,8 +40,8 @@ Each provider reaches the plugin by its own path, all rooted at the `~/plugins` 
 | **Skills / commands** (`skills/<n>/SKILL.md`) | `.claude-plugin/plugin.json` + mount (`CLAUDE_PLUGINS_ROOT`) | native registration at spawn from the mount, needs `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` | mirror → `~/.config/opencode/skill/` (no plugin loader) |
 | **Always-on directive, plugin's own** | plugin SessionStart hook (auto, via `CLAUDE_PLUGINS_ROOT`) | plugin SessionStart hook (Codex fires plugin hooks; a hook that injects context delivers it natively) | composed from the plugin's own `always-on.md` → `AGENTS.md` — the only provider with no hook path |
 | **Always-on ruleset, operator override** (e.g. impeccable) | not composed — hook only | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`. Only for a plugin we do NOT control — never alongside the plugin's own `always-on.md`, or the directive lands twice | same |
-| **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset only** — skills stay. The mirror is synced globally, not per group |
-| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` — dropped from the SDK `plugins:` list, so its skills, commands, SessionStart hook and guards do not load | not registered (`codex plugin add`), so no skills and no hook trust; skills mirror drops it too | its `always-on.md` is not composed, and its skills leave both the `~/.agents/skills` mirror and the session XDG copy. A REPO-ROOT ruleset (the repo's own `always-on.md`, or your `.nanoclaw-always-on.md`) is the repo's directive and is NOT withheld by a sub-path entry — exclude the repo to withhold that |
+| **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset** (and, for `bootstrap`, the runner-listed comment-rule module) — skills stay. The mirror is synced globally, not per group |
+| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` — dropped from the SDK `plugins:` list, so its skills, commands, SessionStart hook and guards do not load | not registered (`codex plugin add`), so no skills and no hook trust; skills mirror drops it too | its `always-on.md` is not composed, its skills leave both the `~/.agents/skills` mirror and the session XDG copy, and `bootstrap/plugins/comment-rule` also drops its runner-listed feedback module. A REPO-ROOT ruleset (the repo's own `always-on.md`, or your `.nanoclaw-always-on.md`) is the repo's directive and is NOT withheld by a sub-path entry — exclude the repo to withhold that |
 | **Workgroup scope** | `data/plugin-scopes.json`: mounts only in the listed workgroups | same, and the ruleset skips it elsewhere; the subagent mirror never copies it | the ruleset skips it elsewhere; the skill and subagent mirrors never copy it |
 
 So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
@@ -198,7 +201,7 @@ next spawn, and the enabler run is just a verification pass.
 
    | Mechanism | Claude | Codex | OpenCode |
    |---|---|---|---|
-   | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset, **keeps the skills** |
+   | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset and, for `bootstrap`, the comment-rule feedback module; **keeps the skills** |
    | `excludePlugins` with a sub-plugin path (per group, by hand) | not registered as a plugin: no skills, no commands, no hook | not registered: no skills, no hook trust | no ruleset, no skills (both mirrors) |
    | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills, **keeps the ruleset** | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |

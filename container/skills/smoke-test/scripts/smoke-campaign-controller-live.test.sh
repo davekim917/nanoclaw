@@ -370,6 +370,56 @@ PY
 }
 assert_once() { local r; r="$(effects_once)"; jq -e .ok <<<"$r" >/dev/null || fail "effects not exactly once ($1): $r"; }
 
+# The property, over every terminal or failure transition the controller can
+# make: by the end of the fire that records it, the journal holds that
+# transition's alarm obligation. Journaling is unconditional and outside every
+# budget; DELIVERY is a separate, budgeted step, so the property holds just as
+# well when the send budget is already spent (the alarm is then an open
+# intent@0, drained on a later fire, never a terminal state with no alarm).
+alarm_property() { # label required-alarm-slot-prefix
+  python3 - "$C/out/journal.ndjson" "$1" "$2" <<'PY' || fail "$1: terminal transition without its alarm (above)"
+import json, sys
+path, label, want = sys.argv[1], sys.argv[2], sys.argv[3]
+obs = {}
+for line in open(path):
+    if not line.strip():
+        continue
+    r = json.loads(line)
+    o = obs.setdefault(r["key"], {"runId": r["runId"], "kind": r["kind"], "slot": r["slot"], "detail": {}})
+    o["state"] = r["state"]
+    o["detail"].update(r.get("detail") or {})
+alarms = {}
+for o in obs.values():
+    if o["kind"] == "send" and (o["slot"].startswith("alarm:") or o["runId"].startswith("ctl.")):
+        alarms.setdefault(o["runId"], []).append(o)
+errs = []
+for o in obs.values():
+    if o["state"] not in ("failed_terminal", "abandoned"):
+        continue
+    if o["kind"] == "send" and (o["slot"].startswith("alarm:") or o["runId"].startswith("ctl.")):
+        continue   # an alarm IS the alarm; nothing alarms about it
+    if not alarms.get(o["runId"]):
+        errs.append("{} {}:{} is {} with no alarm obligation on the run".format(
+            o["runId"][-12:], o["kind"], o["slot"], o["state"]))
+hit = [o for rid in alarms for o in alarms[rid] if o["slot"].startswith(want)]
+if not hit:
+    errs.append("no alarm obligation {}* (have: {})".format(
+        want, sorted({o["slot"] for rid in alarms for o in alarms[rid]})))
+for o in hit:
+    if o["state"] == "abandoned":
+        errs.append("{} was abandoned instead of settled".format(o["slot"]))
+for e in errs:
+    print("{}: {}".format(label, e))
+sys.exit(1 if errs else 0)
+PY
+}
+alarm_raised() { # label required-alarm-slot-prefix: journaled and, within budget, sent
+  alarm_property "$1" "$2"
+  jq -s -e --arg p "$2" '[.[] | select(.kind=="send" and (.slot | startswith($p)))] | last
+    | .state == "delivered" or .state == "enqueued"' "$C/out/journal.ndjson" >/dev/null \
+    || fail "$1: within budget the alarm is actually delivered"
+}
+
 if smoke_case 1-refusals; then
 # --- 1. startup refusals -------------------------------------------------------
 new_case refusals
@@ -507,6 +557,7 @@ jr "[.[] | select(.kind==\"send\" and .slot==\"root\")] | last | .state == \"fai
 [ "$(jq -r '.messages | keys | map(select(startswith("'"$(key "$RUN" send root)"'"))) | length' "$C/fake/enqueue.json")" = 3 ] \
   || fail "each failed receipt advances the attempt (3 attempts, no more)"
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "undeliverable root -> BLOCKED: $(finish_verdict)"
+alarm_raised receipts-exhausted alarm:send-failed:
 
 fi
 if smoke_case 5-dispatch-refused; then
@@ -517,6 +568,7 @@ campaign 10
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "a refused critic dispatch blocks GO: $(finish_verdict)"
 [ "$(jq -s '[.[] | select(.tool=="ncl" and .op=="refused")] | length' "$FAKE_LOG")" = 1 ] \
   || fail "a refused dispatch is not retried"
+alarm_raised dispatch-failed alarm:dispatch-failed:
 
 fi
 if smoke_case 5b-owner-overdue; then
@@ -526,6 +578,7 @@ STALL=8 DEADLINE=2026-09-18T14:00:00Z campaign 20
 jr '[.[] | select(.kind=="send" and (.slot|startswith("alarm:overdue:")) and .state=="delivered")] | length == 1' \
   | grep -qx true || fail "the overdue alarm is receipted once its delivery row exists"
 [ "$(finish_verdict)" = '"GO"' ] || fail "a late-but-complete owner step still finishes GO: $(finish_verdict) $(dq '[.[]|select(.type=="finish")]')"
+alarm_raised overdue alarm:overdue:
 unset STALL
 
 fi
@@ -919,49 +972,6 @@ done
 unset STALL DEADLINE UNCONF FOREIGN AMB OVERDUE
 
 # --- 11. review round 3: no terminal transition without its alarm -----------------
-# The property, over every terminal or failure transition the controller can
-# make: by the end of the fire that records it, the journal holds that
-# transition's alarm obligation. Journaling is unconditional and outside every
-# budget; DELIVERY is a separate, budgeted step, so the property holds just as
-# well when the send budget is already spent (the alarm is then an open
-# intent@0, drained on a later fire, never a terminal state with no alarm).
-alarm_property() { # label required-alarm-slot-prefix
-  python3 - "$C/out/journal.ndjson" "$1" "$2" <<'PY' || fail "$1: terminal transition without its alarm (above)"
-import json, sys
-path, label, want = sys.argv[1], sys.argv[2], sys.argv[3]
-obs = {}
-for line in open(path):
-    if not line.strip():
-        continue
-    r = json.loads(line)
-    o = obs.setdefault(r["key"], {"runId": r["runId"], "kind": r["kind"], "slot": r["slot"], "detail": {}})
-    o["state"] = r["state"]
-    o["detail"].update(r.get("detail") or {})
-alarms = {}
-for o in obs.values():
-    if o["kind"] == "send" and (o["slot"].startswith("alarm:") or o["runId"].startswith("ctl.")):
-        alarms.setdefault(o["runId"], []).append(o)
-errs = []
-for o in obs.values():
-    if o["state"] not in ("failed_terminal", "abandoned"):
-        continue
-    if o["kind"] == "send" and (o["slot"].startswith("alarm:") or o["runId"].startswith("ctl.")):
-        continue   # an alarm IS the alarm; nothing alarms about it
-    if not alarms.get(o["runId"]):
-        errs.append("{} {}:{} is {} with no alarm obligation on the run".format(
-            o["runId"][-12:], o["kind"], o["slot"], o["state"]))
-hit = [o for rid in alarms for o in alarms[rid] if o["slot"].startswith(want)]
-if not hit:
-    errs.append("no alarm obligation {}* (have: {})".format(
-        want, sorted({o["slot"] for rid in alarms for o in alarms[rid]})))
-for o in hit:
-    if o["state"] == "abandoned":
-        errs.append("{} was abandoned instead of settled".format(o["slot"]))
-for e in errs:
-    print("{}: {}".format(label, e))
-sys.exit(1 if errs else 0)
-PY
-}
 # "The budget is already spent": both lanes, the controller's side (journaled
 # attempts) and the helper's (its own table), so no delivery is possible at all.
 spend_budget() {
@@ -1048,6 +1058,9 @@ for variant in budgeted spent; do
            dispatch-failed:dispatch-failed gate-refused:gate-refused overdue:overdue released:released \
            no-authority:no-authority foreign-finish:foreign-finish finish-unconfirmed:finish-unconfirmed \
            malformed-verdict:step-outcome step-error:step-error; do
+    # Within budget these three drive exactly 4-failed-receipts, 5-dispatch-refused and
+    # 5b-owner-overdue, which assert their alarm there.
+    case "$variant/${t%%:*}" in budgeted/receipts-exhausted | budgeted/dispatch-failed | budgeted/overdue) continue ;; esac
     smoke_case "11-$variant-${t%%:*}" || continue
     name="${t%%:*}"
     want="${t##*:}"
@@ -1063,9 +1076,7 @@ for variant in budgeted spent; do
     transition "$name"
     alarm_property "$variant/$name" "alarm:$want:"
     if [ "$variant" = budgeted ] && [ "$name" != send-budget ]; then
-      jq -s -e --arg p "alarm:$want:" '[.[] | select(.kind=="send" and (.slot | startswith($p)))] | last
-        | .state == "delivered" or .state == "enqueued"' "$C/out/journal.ndjson" >/dev/null \
-        || fail "$name: within budget the alarm is actually delivered"
+      alarm_raised "$variant/$name" "alarm:$want:"
     else
       # Spent: journaled anyway, and never silently dropped.
       jq -s -e --arg p "alarm:$want:" '[.[] | select(.kind=="send" and (.slot | startswith($p)))] | length > 0' \

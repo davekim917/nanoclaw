@@ -37,4 +37,28 @@ describe('resolvePluginServer — the ownership marker', () => {
     const server = { command: 'node', args: ['a.js'], env: {} };
     expect(resolvePluginServer({ ...server })).toEqual(server);
   });
+
+  it('strips the host-only displayName and description from a plugin-rooted server', () => {
+    const resolved = resolvePluginServer({
+      command: './bin/server',
+      args: [],
+      env: {},
+      pluginRoot: ROOT,
+      displayName: 'SDR',
+      description: 'Sales tools',
+    } as Parameters<typeof resolvePluginServer>[0]);
+    expect(resolved).not.toHaveProperty('displayName');
+    expect(resolved).not.toHaveProperty('description');
+    expect(resolved).toMatchObject({ command: `${ROOT}/bin/server`, env: { PLUGIN_ROOT: ROOT } });
+  });
+
+  it('strips them from an http server too, keeping the rest', () => {
+    const resolved = resolvePluginServer({
+      type: 'http',
+      url: 'https://example.com/mcp',
+      displayName: 'Docs',
+      instructions: 'kept',
+    } as Parameters<typeof resolvePluginServer>[0]);
+    expect(resolved).toEqual({ type: 'http', url: 'https://example.com/mcp', instructions: 'kept' });
+  });
 });

@@ -89,14 +89,24 @@ OneCLI dashboard and connect the service there.
 retry once they have connected. When they confirm, retry the original
 request. If the retry still fails, ask if they need help with the setup.
 
+## Adding or Rotating an API Key
+
+When a service needs a key the vault lacks, or the user wants to add or
+rotate one, run `ncl secrets intake` (`ncl secrets help intake` for flags).
+It posts a form to the owner's DM; the value typed there goes straight to
+the vault, and you are told when it is stored. Name the API host exactly
+with `--host-pattern`: the gateway sends the key only there. If the user
+pastes a key into chat anyway, do not use or repeat it; tell them to rotate
+it, since chat history keeps it.
+
 ## Rules
 
 - **Never** say "I don't have access to X" without first making the HTTP
   request through the proxy.
 - **Never** use browser extensions, gcloud, or manual auth flows. The
   gateway handles credentials for you.
-- **Never** ask the user for API keys or tokens directly. Direct them to
-  connect the service in the OneCLI dashboard.
+- **Never** ask the user for API keys or tokens in chat. Use
+  `ncl secrets intake`, or the service's connect URL / the OneCLI dashboard.
 - **Never** suggest the user open Gmail/Calendar/GitHub in their browser
   when they ask you to read or interact with those services. You have API
   access. Use it.

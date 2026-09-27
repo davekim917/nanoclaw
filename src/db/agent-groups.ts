@@ -88,6 +88,24 @@ export async function getAllWorkgroupOnecliSecrets(): Promise<{ id: string; secr
   return rows.map((row) => ({ id: row.id, secrets: parseSecrets(row) }));
 }
 
+export async function workgroupExists(workgroupId: string): Promise<boolean> {
+  return (await getDb().get('SELECT 1 FROM workgroups WHERE id = ?', workgroupId)) !== undefined;
+}
+
+/** One statement, so two concurrent grants cannot drop each other's append. True when added. */
+export async function addWorkgroupOnecliSecret(workgroupId: string, secretName: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE workgroups
+        SET onecli_secrets = json_insert(COALESCE(onecli_secrets, '[]'), '$[#]', ?)
+      WHERE id = ?
+        AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(workgroups.onecli_secrets, '[]')) WHERE value = ?)`,
+    secretName,
+    workgroupId,
+    secretName,
+  );
+  return result.changes > 0;
+}
+
 function parseSecrets(row: { secrets: string } | undefined): string[] {
   if (!row) return [];
   try {

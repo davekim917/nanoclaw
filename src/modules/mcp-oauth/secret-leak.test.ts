@@ -123,7 +123,7 @@ import { markMcpOAuthIntegration, upsertMcpOAuthIntegration } from '../../db/mcp
 import { getMcpOAuthIntegration } from '../../db/mcp-oauth-integrations.js';
 import { enforceHermeticity } from '../../test-hermeticity.js';
 import type { FetchLike } from './discovery.js';
-import { putOnecliBearerSecret } from './onecli-secret-writer.js';
+import { putOnecliBearerSecret } from '../../onecli-secret-writer.js';
 import { _resetMcpOAuthWarnStateForTesting, refreshExpiringMcpOAuthIntegrations } from './service.js';
 import { writeMcpOAuthBundle } from './store.js';
 

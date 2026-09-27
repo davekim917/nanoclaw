@@ -154,7 +154,7 @@ function callSite(): string {
   return frames[0] ?? 'unknown call site';
 }
 
-/** Record first, then throw: callers often swallow the failure, so a throw-only tripwire can leave a test green. */
+/** Record first: callers often swallow the throw, and a throw-only tripwire leaves the test green. `warn` only logs. */
 function trip(kind: HermeticityAttempt['kind'], api: string, target: string, hint: string): void {
   const attempt: HermeticityAttempt = { kind, api, target, callSite: callSite() };
   state.attempts.push(attempt);

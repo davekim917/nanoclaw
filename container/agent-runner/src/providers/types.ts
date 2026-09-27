@@ -318,8 +318,8 @@ export type ProviderEvent =
    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
    * `usage` as an array means the turn spanned multiple models: one entry per model.
    *
-   * `steps` is the number of provider API round-trips, turn-level (every row of a multi-model `usage` gets the same
-   * value); NULL when nothing usable is available, never a guessed count.
+   * `steps` is the provider's API round-trip count or its closest proxy (Codex: completed items; OpenCode: assistant
+   * messages), turn-level (every multi-model `usage` row gets the same value); NULL when unavailable, never guessed.
    *
    * `rateLimit` — Claude: the latest `rate_limit_event` this turn; Codex: the weekly (else five-hour) window of the
    * account snapshot; OpenCode leaves it unset.
