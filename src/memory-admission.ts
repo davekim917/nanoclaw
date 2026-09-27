@@ -14,12 +14,8 @@ interface QueuedRequest<T> {
 }
 
 /**
- * Host-local priority-aware memory reservation controller.
- * Reservations cover both in-flight spawns and active containers.
- * Interactive work always runs before scheduled work, with FIFO preserved
- * within each priority class. Background work may wait under sustained chat
- * load; that is deliberate because an operator message must never lose a slot
- * to a scheduled wake merely because the scheduled wake has waited longer.
+ * Priority-aware memory reservations covering in-flight spawns and active containers. Interactive work always runs
+ * before scheduled (FIFO within a class): an operator message must never lose a slot to a longer-waiting wake.
  */
 export class MemoryAdmissionController<T> {
   private readonly reservations = new Map<string, number>();
@@ -68,8 +64,7 @@ export class MemoryAdmissionController<T> {
     }
     if (this.queuedIds.has(id)) {
       const entry = this.queue.find((queued) => queued.id === id)!;
-      // A task retry must not demote a session that an operator has already
-      // promoted by sending an interactive message into the same session.
+      // A task retry must not demote a session an operator's interactive message already promoted.
       if (priority === 'interactive') entry.priority = priority;
       if (this.tryAdmit(id)) {
         return { status: 'admitted', budgetMb: this.budgetMb, requestMb };
@@ -94,14 +89,9 @@ export class MemoryAdmissionController<T> {
   }
 
   /**
-   * Reserve `requestMb` for `id` whether or not it fits — a SATURATING
-   * reservation for memory that is already in use by a container this host
-   * did not admit (a survivor of the previous host it could not yet adopt).
-   * `reservedMb` may then exceed `budgetMb`, and
-   * `request`/`drain` admit nothing further until enough is released: the
-   * budget is a fact about the machine, and an over-committed survivor must
-   * block fresh spawns rather than be left uncounted. A queued request under
-   * the same id is withdrawn; an existing reservation is replaced.
+   * Reserves `requestMb` even if it does not fit, for memory already used by a container this host did not admit (an
+   * unadopted survivor). `reservedMb` may then exceed the budget and nothing further is admitted until release. A
+   * queued request under the same id is withdrawn; an existing reservation is replaced.
    */
   reserveSaturating(id: string, requestMb: number): void {
     if (!Number.isInteger(requestMb) || requestMb <= 0) {

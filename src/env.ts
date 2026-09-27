@@ -13,10 +13,6 @@ export function readEnvFile(keys: string[]): Record<string, string> {
   return parseEnvFile((key) => wanted.has(key));
 }
 
-/**
- * Return all .env keys that match a regex, as a map of full-key → value.
- * Useful for scanning variable-suffix patterns like `SLACK_BOT_TOKEN(_<SUFFIX>)?`.
- */
 export function readEnvFileMatching(pattern: RegExp): Record<string, string> {
   return parseEnvFile((key) => pattern.test(key));
 }

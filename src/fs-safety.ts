@@ -1,10 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-/**
- * Fail closed when any existing component below `parent` is a symlink or is
- * not a directory. Missing descendants are safe for a later mkdir operation.
- */
+/** Fails closed on any existing symlink or non-directory component below `parent`; missing descendants are fine. */
 function isNonSymlinkDirectoryChain(parent: string, ...components: string[]): boolean {
   let parentStat: fs.Stats;
   try {
@@ -33,11 +30,7 @@ function assertSinglePathEntry(entry: string): void {
   }
 }
 
-/**
- * Assert that a host directory which was previously writable by a container is
- * still a real directory. Host reconciliation must fail closed rather than
- * following a container-planted symlink on the next spawn.
- */
+/** Fails closed on a container-planted symlink where a previously container-writable directory was. */
 export function assertRealDirectory(dir: string): void {
   const stat = fs.lstatSync(dir);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
@@ -46,10 +39,8 @@ export function assertRealDirectory(dir: string): void {
 }
 
 /**
- * Resolve a host directory below an agent-writable root without accepting any
- * symlink in the relative chain. The returned canonical path is suitable for a
- * bind source; callers must still revalidate it immediately before Docker uses
- * the pathname to close the remaining writable-tree TOCTOU window.
+ * Refuses any symlink in the chain. Callers must still revalidate the result immediately before Docker uses it
+ * (the writable-tree TOCTOU window).
  */
 export function resolveContainedRealDirectory(parent: string, ...components: string[]): string {
   if (!isNonSymlinkDirectoryChain(parent, ...components)) {
@@ -69,10 +60,7 @@ export function resolveContainedRealDirectory(parent: string, ...components: str
   return candidateReal;
 }
 
-/**
- * Remove exactly one entry from a real parent directory. A symlink at the
- * entry itself is unlinked; it is never traversed.
- */
+/** A symlink at the entry is unlinked, never traversed. */
 export function removeUntrustedPathEntry(parent: string, entry: string): void {
   assertSinglePathEntry(entry);
   assertRealDirectory(parent);
@@ -82,10 +70,7 @@ export function removeUntrustedPathEntry(parent: string, entry: string): void {
   }
 }
 
-/**
- * Replace a container-writable entry with a fresh regular file. `wx` makes a
- * concurrent or unexpected replacement fail closed instead of following it.
- */
+/** `wx`: a concurrent or unexpected replacement fails closed instead of being followed. */
 export function replaceUntrustedFile(parent: string, entry: string, contents: string | Buffer): string {
   removeUntrustedPathEntry(parent, entry);
   const target = path.join(parent, entry);
@@ -93,7 +78,6 @@ export function replaceUntrustedFile(parent: string, entry: string, contents: st
   return target;
 }
 
-/** Replace a container-writable entry with a fresh real directory. */
 export function replaceUntrustedDirectory(parent: string, entry: string): string {
   removeUntrustedPathEntry(parent, entry);
   const target = path.join(parent, entry);

@@ -3,11 +3,8 @@ import fs from 'fs';
 import path from 'path';
 
 /**
- * These are host-side provider state or nested bind-mount stubs beneath a
- * session directory. Their authoritative sources are mounted and preserved by
- * their owning subsystem; they are not agent topic checkouts. Unknown
- * top-level directories remain discoverable so `/workspace/foo` clones cannot
- * be hidden accidentally. `worktrees` is intentionally absent.
+ * Host-side provider state and bind-mount stubs under a session dir, owned by other subsystems. Unknown top-level
+ * directories stay discoverable so `/workspace/foo` clones are never hidden. `worktrees` is intentionally absent.
  */
 export const SESSION_RUNTIME_REPOSITORY_EXCLUSIONS = new Set([
   '.cache',
@@ -43,10 +40,8 @@ function realDirectory(directory: string): boolean {
 }
 
 /**
- * Empty `.git` directories are Docker bind-mount stubs, not repositories.
- * A non-empty malformed marker is a blocker instead of something discovery
- * may silently discard. Broken linked-worktree pointers remain candidates so
- * the migration's collided-admin recovery can handle them explicitly.
+ * Empty `.git` dirs are Docker bind-mount stubs. A non-empty malformed marker is a blocker, never silently dropped;
+ * broken linked-worktree pointers stay candidates for the migration's collided-admin recovery.
  */
 function containsOnlyDirectories(root: string): boolean {
   const stack = [root];
@@ -207,10 +202,8 @@ export function discoverPhysicalGitCheckouts(
       );
     }
     for (const entry of entries) {
-      // Git administration and legacy bare-store namespaces are structural,
-      // not candidate working trees. Content/cache names are different: a
-      // repository may legitimately be named `dist`, `build`, `target`, or
-      // `.cache`, so classify that directory itself before pruning recursion.
+      // Git admin and bare-store namespaces are structural; content/cache names (`dist`, `.cache`) can be real
+      // repositories, so that directory is classified before recursion is pruned.
       if (entry.name === '.git' || entry.name === '.repos' || generatedPrune.has(entry.name)) continue;
       if (entry.name === 'tmp' && (path.basename(real) === 'codex' || path.basename(real) === '.codex')) continue;
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;

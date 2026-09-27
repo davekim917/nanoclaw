@@ -1,15 +1,7 @@
 /**
- * .env read/write helpers shared by host code that manages .env keys.
- *
- * Read semantics MUST stay compatible with src/env.ts readEnvFile (trimmed
- * lines, `#` comments, first `=` splits, matched surrounding quotes stripped,
- * empty values read as absent) — everything written here is read back through
- * that parser. Write conventions for module and skill code that manages .env
- * keys: replace the key's line in place, preserve every other line (comments
- * and blanks included), append with a clean trailing newline.
- *
- * Values written here include live credentials: never log values, only key
- * names. (No log calls exist in this file — keep it that way.)
+ * .env read/write helpers. Reads MUST match src/env.ts readEnvFile (trimmed lines, `#` comments, first `=` splits,
+ * matched quotes stripped, empty reads as absent): everything written here is read back through that parser. Writes
+ * replace the key's line in place and preserve every other line. Values include live credentials: never log them.
  */
 import { randomUUID } from 'node:crypto';
 import fs from 'fs';
@@ -28,7 +20,7 @@ function readEnvText(rootDir: string): string {
   }
 }
 
-/** Parse one KEY from dotenv-style text with src/env.ts semantics. Last line wins. */
+/** src/env.ts semantics; last line wins. */
 function parseEnvText(text: string, key: string): string | undefined {
   let result: string | undefined;
   for (const line of text.split('\n')) {
@@ -56,11 +48,7 @@ export function readEnvValue(rootDir: string, key: string): string | undefined {
   return parseEnvText(readEnvText(rootDir), key);
 }
 
-/**
- * Replace KEY's line(s) in place, else append; creates .env when absent.
- * Every matching line is rewritten (not just the first) so the parser's
- * last-line-wins read can never resurface a stale value.
- */
+/** Rewrites EVERY matching line, so the parser's last-line-wins read can never resurface a stale value. */
 export function upsertEnvKey(rootDir: string, key: string, value: string): void {
   upsertEnvKeys(rootDir, { [key]: value });
 }
@@ -101,9 +89,8 @@ export function upsertEnvKeys(rootDir: string, values: Record<string, string>): 
 }
 
 /**
- * Set-union `entry` into KEY's comma-separated list (file value, not process
- * env — the list's readers parse .env only). Creates the key when absent.
- * Returns true iff the entry was newly added.
+ * Set-union into KEY's comma-separated list, from the file, not process env (the list's readers parse .env only).
+ * True iff newly added.
  */
 export function appendToEnvList(rootDir: string, key: string, entry: string): boolean {
   const current = parseEnvText(readEnvText(rootDir), key);

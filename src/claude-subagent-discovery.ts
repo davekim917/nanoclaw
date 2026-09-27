@@ -1,11 +1,3 @@
-/**
- * Shared discovery for Claude-format subagent `.md` files.
- *
- * Both codex-sync and opencode-sync need the same source set, so the walk
- * lives here. Output ordering: personal scope under ~/.claude/agents/ wins
- * over plugin-tree (recursive scan under ~/plugins/) when names collide — a
- * user-authored override should beat a plugin-shipped default.
- */
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -19,22 +11,14 @@ export interface DiscoveredSubagent {
 }
 
 /**
- * Find Claude-format subagent `.md` files in two locations:
- *   1. `~/plugins/<plugin>/[plugins/<sub>/]agents/*.md`
- *   2. `~/.claude/agents/*.md` (personal scope)
- *
- * First-occurrence-by-name wins, with personal scope outranking plugins so a
- * user-authored override beats a plugin-shipped default. Runtime-specific
- * dirs (`.claude/`, `.cursor/`, `.codex/`, etc.) under a plugin root are
- * skipped — those are runtime-specific copies; we want the canonical Claude
- * `.md` shape only. Hidden dirs (starting with `.`) and `deprecated/` dirs
- * are skipped too.
+ * Claude-format subagent `.md` files from `~/.claude/agents/*.md` and
+ * `~/plugins/<plugin>/[plugins/<sub>/]agents/*.md`. First occurrence by name wins, personal scope first.
+ * Runtime-specific (`.claude/`, `.cursor/`, `.codex/`), hidden and `deprecated/` dirs under a plugin root are skipped.
  */
 export function discoverClaudeSubagents(): DiscoveredSubagent[] {
   const home = os.homedir();
   const seen = new Map<string, DiscoveredSubagent>();
 
-  // Personal scope first — these override plugin defaults.
   const personalDir = path.join(home, '.claude', 'agents');
   if (fs.existsSync(personalDir)) {
     for (const f of fs.readdirSync(personalDir)) {
@@ -44,10 +28,7 @@ export function discoverClaudeSubagents(): DiscoveredSubagent[] {
     }
   }
 
-  // Plugin tree. A workgroup-scoped plugin's agents are never mirrored: both
-  // consumers (codex-sync, opencode-sync) write to targets not keyed by
-  // workgroup (src/plugin-scopes.ts). Claude loads plugin agents from the
-  // plugin mount, which the scope already gates.
+  // A workgroup-scoped plugin's agents are never mirrored: both consumers write targets not keyed by workgroup.
   const pluginsRoot = path.join(home, 'plugins');
   if (fs.existsSync(pluginsRoot)) {
     const scoped = scopedPluginNames(loadPluginScopes());

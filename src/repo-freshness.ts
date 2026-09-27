@@ -1,10 +1,6 @@
 /**
- * Local-only canonical refresh recovery worker.
- *
- * Network fetches happen only inside the requesting container's scoped
- * identity. This worker advances clean host canonical working trees from refs
- * already fetched into their mounted `.git` directories; it never invokes a
- * remote or falls back to host credentials.
+ * Advances clean host canonical working trees from refs a container already fetched into their `.git`; never
+ * contacts a remote or falls back to host credentials.
  */
 import fs from 'fs';
 import path from 'path';

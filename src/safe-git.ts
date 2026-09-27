@@ -13,9 +13,7 @@ const BASE_CONFIG = [
   'credential.helper=',
   '-c',
   'protocol.file.allow=always',
-  // Signature verification runs a configured program: `log.showSignature` makes
-  // every `git log` (and `stash list`) verify signed commits through
-  // `gpg.program`, and a container can set both in a repository it writes.
+  // `log.showSignature` runs `gpg.program` on every `git log` and `stash list`, and a container can set both.
   '-c',
   'log.showSignature=false',
   '-c',
@@ -141,13 +139,7 @@ export function safeGitConfigGet(configPath: string, key: string): string | null
   }
 }
 
-/**
- * Set exactly one key in a config file, leaving every other key untouched.
- * Used for the targeted core.hooksPath migration on EXISTING canonical
- * repositories (managed-git-hooks.ts) rather than a full config rewrite
- * (sanitizeCanonicalConfig's template), which needs the repo's origin and
- * would drop any non-template key the repo happens to carry.
- */
+/** Sets exactly one key, leaving every other untouched (a template rewrite would drop non-template keys). */
 export function safeGitConfigSet(configPath: string, key: string, value: string): void {
   const stat = fs.lstatSync(configPath);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`unsafe Git config path: ${configPath}`);

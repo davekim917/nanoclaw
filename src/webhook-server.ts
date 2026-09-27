@@ -1,9 +1,5 @@
 /**
- * HTTP server for Chat SDK adapter webhooks and the dashboard.
- *
- * Starts lazily on first adapter registration or explicit ensureServerStarted()
- * call. All routing goes through src/dashboard/router.ts dispatch so webhook
- * and dashboard routes share one table on one server.
+ * HTTP server for Chat SDK webhooks and the dashboard, started lazily; one route table (src/dashboard/router.ts).
  */
 import http from 'http';
 
@@ -23,10 +19,7 @@ const webhookRoutes = new Map<string, WebhookEntry>();
 let server: http.Server | null = null;
 
 /** Convert Node.js IncomingMessage to a Web API Request. */
-// 8 MiB body cap. Webhook adapters (Slack, Discord) send small JSON envelopes; the
-// dashboard `/auth/exchange` body is tiny ({token: string}). Cap exists to prevent
-// OOM/DoS via a single multi-GB POST to any endpoint, including unauthenticated
-// /dashboard/api/auth/exchange (post-build QA fix SF-5).
+// 8 MiB cap: every endpoint takes small JSON, and this stops one multi-GB POST (even unauthenticated) from OOMing.
 const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
 
 class RequestTooLargeError extends Error {
@@ -89,7 +82,6 @@ export function registerWebhookAdapter(chat: Chat, adapterName: string, routingP
   const key = routingPath ?? adapterName;
   webhookRoutes.set(key, { chat, adapterName });
 
-  // Register the webhook path in the shared route table
   register('POST', `/webhook/${key}`, async (webReq) => {
     const entry = webhookRoutes.get(key);
     if (!entry) {
@@ -109,20 +101,14 @@ export function registerWebhookAdapter(chat: Chat, adapterName: string, routingP
   log.info('Webhook adapter registered', { adapter: adapterName, path: `/webhook/${key}` });
 }
 
-/**
- * Start the HTTP server if not already started. Idempotent.
- * Called by registerWebhookAdapter and by the dashboard bootstrap so the
- * server is up regardless of whether any webhook adapters are registered.
- */
+/** Idempotent; the dashboard bootstrap calls it too, so the server is up with no webhook adapter registered. */
 export function ensureServerStarted(): void {
   if (server) return;
 
   const port = parseInt(process.env.WEBHOOK_PORT || String(DEFAULT_PORT), 10);
 
   server = http.createServer((req, res) => {
-    // The whole body is wrapped in try/catch below, so this IIFE's promise
-    // never rejects — void is safe here. http.createServer's request
-    // listener type is synchronous (req, res) => void, hence the wrapper.
+    // The body is fully try/caught, so this IIFE never rejects and `void` is safe.
     void (async () => {
       try {
         const webReq = await toWebRequest(req);
@@ -132,7 +118,7 @@ export function ensureServerStarted(): void {
         }
         // null → handler already wrote to res directly (SSE bypass)
       } catch (err) {
-        // Body cap (post-build QA fix SF-5) — return 413 instead of 500.
+        // Body cap: 413, not 500.
         if (err instanceof RequestTooLargeError) {
           log.warn('Request body too large — rejected', { url: req.url, max: MAX_REQUEST_BODY_BYTES });
           if (!res.headersSent) {
