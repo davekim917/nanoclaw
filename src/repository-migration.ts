@@ -1,4 +1,3 @@
-/** Lossless legacy-checkout to canonical-plus-linked-worktree migration. */
 import { execFileSync } from 'child_process';
 import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -840,7 +839,6 @@ function assertObjectStoreAlternatesDisabled(store: string): void {
   }
 }
 
-/** Revalidate every unique host-only recovery seed once at a durable gate. */
 export function validateReviewedRecoverySeeds(decisions: readonly ReviewedCheckoutRecoveryDecision[]): void {
   const context = createLegacyGitResolutionContext([]);
   for (const decision of decisions) {
