@@ -1,7 +1,7 @@
 /**
  * Per-container-lifetime bookkeeping for the cgroup `memory.events` counters the runner mirrors into
- * `container_state`: `oom_kill` counts CHILDREN the kernel killed (never PID 1, so the agent only sees a command
- * exit with no output); `max` counts ceiling hits that forced reclaim, before anything dies. Both reset on respawn,
+ * `container_state`: `oom_kill` counts processes the kernel OOM-killed in the cgroup (often a child the agent sees
+ * only as a command exiting with no output); `max` counts ceiling hits that forced reclaim. Both reset on respawn,
  * so the lifetime key is (sessionId, spawnedAtMs).
  */
 
