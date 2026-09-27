@@ -67,7 +67,11 @@ export function httpStatusOf(err: unknown): number | undefined {
   return typeof status === 'number' ? status : undefined;
 }
 
-/** 4xx statuses describing a moment, not a misconfiguration; every other 4xx is a fault retrying can't fix. */
+/**
+ * 4xx statuses describing a moment, not a misconfiguration; every other 4xx is a fault retrying can't fix.
+ * `Retry-After` is ignored on purpose: the SDK error carries no headers, and reading them would mean bypassing
+ * `getContainerConfig`, the very call this probe exists to make.
+ */
 const RETRYABLE_4XX: ReadonlySet<number> = new Set([408, 425, 429]);
 
 export function isRetryableStatus(status: number | undefined): boolean {

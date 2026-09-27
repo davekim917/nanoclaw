@@ -18,7 +18,7 @@ const TITLE_PROMPT_CAP = 500; // Truncate input to keep Haiku latency low
 
 const RETRY_MAX_ATTEMPTS = 5;
 const RETRY_WINDOW_HOURS = 24;
-// One per tick: bursts with the other title sweeps tripped per-account rate limits on healthy credentials.
+// One per tick: bursting alongside the other title sweeps trips per-account rate limits on healthy credentials.
 const RETRY_BATCH_CAP = 1;
 
 /** Undefined on failure: skip the rename. */

@@ -45,7 +45,7 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // model travels as NANOCLAW_CLAUDE_MODEL.
   model: 'opus',
   outputStyle: 'Proactive',
-  // Every model call re-reads the skill listing, so unused bundled skills are hidden or shortened here.
+  // Hides unused bundled skills (re-read every model call). Not plugin skills: use container.json excludePlugins.
   skillOverrides: {
     'update-config': 'user-invocable-only',
     'keybindings-help': 'user-invocable-only',

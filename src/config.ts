@@ -124,7 +124,7 @@ export const CONTAINER_SESSION_LABEL_KEY = 'nanoclaw-session';
 export const CONTAINER_WORKGROUP_LABEL_KEY = 'nanoclaw-workgroup';
 export const CONTAINER_ROLE_LABEL_KEY = 'nanoclaw-role';
 export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10);
-export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
+export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10);
 export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '3g';
 export const CONTAINER_MEMORY_RESERVATION =
   process.env.CONTAINER_MEMORY_RESERVATION || envConfig.CONTAINER_MEMORY_RESERVATION || CONTAINER_MEMORY_LIMIT;

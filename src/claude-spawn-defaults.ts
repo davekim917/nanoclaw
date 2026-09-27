@@ -17,7 +17,8 @@ export type ClaudeSpawnConfig = Pick<
  * Quota caps every Claude container receives, emitted by `claudeSpawnEnv` for both spawn branches and mirrored
  * into each group's settings.json by group-init.ts `REQUIRED_ENV`, so a settings pin can't disagree with the `-e`.
  * Subagent concurrency is session-wide, not per-parent (the CLI shares one counter across nesting), so depth 2
- * does not square it.
+ * does not square it: 5 is 5 slots per session excluding the main agent. Not an absolute ceiling either: resumes can
+ * bypass admission and agent teams count separately.
  */
 export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 600_000;
 export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '2';
@@ -92,7 +93,7 @@ export function resolveClaudeSpawnDefaults(
  *
  * The four `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` vars are install-wide alias answers (what a bare `opus` or a
  * `model: opus` subagent resolves to), never the group's model, which travels in NANOCLAW_CLAUDE_MODEL. Putting
- * the group's model in the opus alias made every `model: opus` pin silently run the group's model. Don't reunite.
+ * the group's model in the opus alias would make every `model: opus` pin silently run the group's model.
  */
 export function claudeSpawnEnv(
   containerConfig: ClaudeSpawnConfig,
