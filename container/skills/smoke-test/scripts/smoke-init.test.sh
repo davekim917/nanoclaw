@@ -108,4 +108,19 @@ OUT="$(python3 "$INIT" propose "$T/tokenish" --group-dir "$T/group2")"; RC=$?
 [ "$RC" -eq 2 ] && check "a credential-shaped value stops the draft" "$OUT" '.ok == false and (.error | contains("looks like a credential"))' || fail "credential: rc=$RC $OUT"
 [ ! -e "$T/group2/smoke-gate-env.draft.sh" ] && ok "no draft written beside a credential-shaped value" || fail "draft written with a credential-shaped value"
 
+# A directory name outside the gates' prefix grammar never reaches the draft:
+# a newline in it would end the comment and leave a live shell command.
+mkrepo evil https://github.com/acme/evil
+EVIL_DIR="$T/evil/payload"$'\n'"touch PWN #"
+mkdir -p "$EVIL_DIR/web" "$T/evil/api" "$T/group3"
+echo '{"dependencies":{"next":"15.0.0"}}' >"$EVIL_DIR/web/package.json"
+echo '{"dependencies":{"express":"4.0.0"}}' >"$T/evil/api/package.json"
+OUT="$(python3 "$INIT" propose "$T/evil" --group-dir "$T/group3")"
+check "a directory name outside the prefix grammar is not recorded" "$OUT" '.detected.serviceDirs == ["api/"]'
+if [ -f "$T/group3/smoke-gate-env.draft.sh" ] && ! grep -qv '^\(#.*\)\?$' "$T/group3/smoke-gate-env.draft.sh"; then
+  ok "every draft line is a comment"
+else
+  fail "draft has a live line: $(grep -v '^\(#.*\)\?$' "$T/group3/smoke-gate-env.draft.sh" 2>&1)"
+fi
+
 [ "$FAILED" -eq 0 ] && echo "PASS smoke-init.test.sh" || { echo "FAIL smoke-init.test.sh"; exit 1; }

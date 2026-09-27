@@ -54,6 +54,10 @@ PREVIEW_SUPPORT = {
 }
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", ".next", "__pycache__", "vendor", "target"}
 HEALTH_RE = re.compile(r"""["'](/(?:api/)?(?:healthz|health|livez|readyz|ping|status|version))["']""")
+# The gates' layout-prefix grammar (LAYOUT_PREFIX_RE in smoke-gate-layout.sh). A directory
+# name outside it is never recorded: it could not be a prefix, and it lands in a shell draft.
+DIR_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*/)+")
+UNSAFE_DRAFT_RE = re.compile(r"[\x00-\x1f\x7f]")
 SECRET_RE = re.compile(r"(?i)(secret|token|password|passwd|api[_-]?key|private[_-]?key)|^(sk|pk|ghp|gho|xox[abp])[-_]|[A-Za-z0-9+/]{32,}")
 
 
@@ -76,6 +80,11 @@ def walk(root, max_depth=3):
         yield ("" if rel == "." else rel), files
 
 
+def add_dir(bucket, rel):
+    if DIR_RE.fullmatch(rel + "/"):
+        bucket.append(rel + "/")
+
+
 def hit(bucket, name, where):
     bucket.setdefault(name, [])
     if where not in bucket[name]:
@@ -88,7 +97,7 @@ def detect(root):
     for rel, files in walk(root):
         parts = rel.split(os.sep) if rel else []
         if parts[-1:] == ["migrations"] or parts[-2:] in (["db", "migrate"], ["alembic", "versions"]):
-            found["migrationDirs"].append(rel + "/")
+            add_dir(found["migrationDirs"], rel)
         for f in files:
             path = os.path.join(rel, f) if rel else f
             full = os.path.join(root, path)
@@ -108,22 +117,22 @@ def detect(root):
                 if any(d in deps for d in ("pg", "postgres", "@prisma/client", "drizzle-orm", "knex")):
                     hit(found["databases"], "Postgres (likely)", path)
                 if rel and any(k in deps for k, _ in JS_FRAMEWORKS):
-                    found["serviceDirs"].append(rel + "/")
+                    add_dir(found["serviceDirs"], rel)
             elif f in ("requirements.txt", "pyproject.toml", "Pipfile"):
                 text = (read(full) or "").lower()
                 for mod, label in PY_FRAMEWORKS:
                     if re.search(r"(^|[^a-z])" + mod + r"([^a-z]|$)", text):
                         hit(found["frameworks"], label, path)
                         if rel:
-                            found["serviceDirs"].append(rel + "/")
+                            add_dir(found["serviceDirs"], rel)
             elif f == "Gemfile" and re.search(r"gem ['\"]rails['\"]", read(full) or ""):
                 hit(found["frameworks"], "Rails", path)
                 if rel:
-                    found["serviceDirs"].append(rel + "/")
+                    add_dir(found["serviceDirs"], rel)
             elif f == "go.mod":
                 hit(found["frameworks"], "Go", path)
                 if rel:
-                    found["serviceDirs"].append(rel + "/")
+                    add_dir(found["serviceDirs"], rel)
             if path == "supabase/config.toml":
                 hit(found["databases"], "Supabase (local stack)", path)
             if f in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
@@ -264,6 +273,9 @@ def write_draft(group_dir, plan):
             lines.append("# {}".format(e["why"]))
             lines.append("# export {}={}".format(e["key"], "'" + value + "'" if value else "  # " + e["find"]))
         lines.append("")
+    if any(UNSAFE_DRAFT_RE.search(line) for line in lines) or any(
+            "'" in str(e["value"]) for e in plan["mandatory"] + plan["recommended"] if e["value"] is not None):
+        refuse("a proposed line is not safe to write into a shell file; no draft written")
     with open(out, "x", encoding="utf8") as fh:
         fh.write("\n".join(lines))
     return out
