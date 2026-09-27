@@ -133,10 +133,12 @@ export type LineCitationCheck = { ok: true } | { ok: false; problem: string } | 
 
 export function checkLineCitation(
   root: string,
-  citation: Pick<FileLineCitation, 'file' | 'span' | 'endLine' | 'pinnedSha'>,
+  citation: Pick<FileLineCitation, 'file' | 'span' | 'startLine' | 'endLine' | 'pinnedSha'>,
   label = `\`${citation.file}:${citation.span}\``,
 ): LineCitationCheck {
-  const { file, endLine, pinnedSha } = citation;
+  const { file, startLine, endLine, pinnedSha } = citation;
+  if (startLine < 1 || startLine > endLine)
+    return { ok: false, problem: `cites ${label}, which is not a line range (lines start at 1 and run forward)` };
   if (pinnedSha) {
     if (!gitCommitResolvable(root, pinnedSha)) {
       if (gitIsShallowRepo(root))

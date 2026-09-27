@@ -125,6 +125,42 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: head, origin: null })]);
   });
 
+  it('ignores a later pin of an earlier citation on the same line', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'a\nb\nfunction drainQueue() {}\n');
+    write(root, 'src/other.ts', 'function flushAll() {}\n');
+    write(root, NOTE, '- `flushAll` in `src/other.ts:1`; `drainQueue` at `src/code.ts:3` drops items\n');
+    const introduced = commit(root, 'code and note');
+    write(root, 'src/code.ts', 'x\ny\nconst q = drainQueue();\na\nb\nfunction drainQueue() {}\n');
+    commit(root, 'shift the code');
+    write(
+      root,
+      NOTE,
+      `- \`flushAll\` in \`src/other.ts:1\` at ${introduced}; \`drainQueue\` at \`src/code.ts:3\` drops items\n`,
+    );
+    commit(root, 'docs-only pin of the earlier citation');
+
+    expect(pinDocs(root, [NOTE], ['src/code.ts'])).toEqual([
+      expect.objectContaining({ kind: 'pinned', sha: introduced }),
+    ]);
+  });
+
+  it('pins a note re-added after an earlier removal to its surviving addition', () => {
+    const root = gitRoot();
+    const line = '- the queue `drainQueue` at `src/code.ts:1` drops items\n';
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, line);
+    commit(root, 'first note');
+    write(root, NOTE, '- nothing yet\n');
+    commit(root, 'drop the note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+    write(root, NOTE, line);
+    const readded = commit(root, 're-add the note');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: readded })]);
+  });
+
   it('refuses a note that names nothing to check the cited lines against, and leaves the doc unchanged', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'a\nb\nc\n');

@@ -120,6 +120,14 @@ describe('docCitationProblems', () => {
     ]);
   });
 
+  it('fails a line zero and a range that runs backwards', () => {
+    const { root } = repo({ 'src/a.ts': 'one\ntwo\n', 'doc.md': '`src/a.ts:0` and `src/a.ts:9-2`\n' });
+    expect(docCitationProblems(root, ['doc.md'])).toEqual([
+      'doc.md:1: cites `src/a.ts:0`, which is not a line range (lines start at 1 and run forward)',
+      'doc.md:1: cites `src/a.ts:9-2`, which is not a line range (lines start at 1 and run forward)',
+    ]);
+  });
+
   it('checks a pinned citation at its commit, not at HEAD', () => {
     const { root, sha } = repo({ 'src/a.ts': 'one\ntwo\nthree\n' });
     fs.writeFileSync(path.join(root, 'src/a.ts'), 'one\n');

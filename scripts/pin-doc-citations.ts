@@ -82,11 +82,20 @@ function citedText(lines: string[] | null, link: FileLineCitation): string | nul
   return lines.slice(link.startLine - 1, link.endLine).join('\n');
 }
 
+function occurrences(root: string, rev: string, needle: string, paths: readonly string[]): number {
+  const out = gitRead(root, ['grep', '-F', '-c', '-e', needle, rev, '--', ...paths]);
+  return (out ?? '').split('\n').reduce((sum, line) => sum + (Number(line.slice(line.lastIndexOf(':') + 1)) || 0), 0);
+}
+
 function introducingCommit(root: string, rev: string, searches: { needle: string; paths: readonly string[] }[]) {
   for (const { needle, paths } of searches) {
-    const out = gitRead(root, ['log', '--reverse', '--format=%H', `-S${needle}`, rev, '--', ...paths]);
-    const first = out?.split('\n').find(Boolean);
-    if (first) return first;
+    const changes = (gitRead(root, ['log', '--format=%H', `-S${needle}`, rev, '--', ...paths]) ?? '')
+      .split('\n')
+      .filter(Boolean);
+    const added = changes.find(
+      (sha) => occurrences(root, sha, needle, paths) > occurrences(root, `${sha}^`, needle, paths),
+    );
+    if (added) return added;
   }
   return null;
 }
@@ -169,7 +178,7 @@ export function pinDocs(
       for (const run of citationRuns(text)) {
         const head = run.links[0];
         const context = text.slice(Math.max(previousEnd, head.index - 40), head.index);
-        previousEnd = run.end;
+        previousEnd = run.end + (/^\s+at\s+[0-9a-f]{7,40}\b/.exec(text.slice(run.end))?.[0].length ?? 0);
         if (run.pinnedSha) continue;
         const files = runFiles(run);
         if (citedFiles.length > 0 && !files.some((file) => citedFiles.includes(file))) continue;
