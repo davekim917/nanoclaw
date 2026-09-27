@@ -373,7 +373,7 @@ function dedupeTrustEntries(entries: readonly CodexHookTrustEntry[]): Map<string
 
 /**
  * What a post-write read-back must assert. Hashes alone are wrong both ways: identical handlers share one hash
- * across keys, and the dedupe drops a duplicate key's second hash.
+ * across keys, and the dedupe keeps only a duplicate key's last hash.
  */
 export function codexHookTrustTables(entries: readonly CodexHookTrustEntry[]): string[] {
   return [...dedupeTrustEntries(entries)].map(

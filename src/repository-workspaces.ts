@@ -473,7 +473,10 @@ export function discoverCanonicalRepositories(workgroupId: string, dataDir: stri
   return repositories;
 }
 
-/** A pin's identity as lowercase `github.com/<owner>/<repo>`, so activation's URL form and publication's form compare equal. */
+/**
+ * An HTTPS github.com owner/repo URL becomes lowercase `github.com/<owner>/<repo>`, so activation's and
+ * publication's forms compare equal; any other identity is returned unchanged.
+ */
 function normalizedPinIdentity(repositoryId: string): string {
   if (!/^https:\/\//i.test(repositoryId) || !URL.canParse(repositoryId)) return repositoryId;
   const parsed = new URL(repositoryId);
