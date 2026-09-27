@@ -12,6 +12,7 @@ fail() { echo "  FAIL $1"; FAILED=1; }
 check() { # <label> <json> <jq predicate>
   if jq -e "$3" <<<"$2" >/dev/null 2>&1; then ok "$1"; else fail "$1: $2"; fi
 }
+E='def e(k): [.mandatory[], .recommended[] | select(.key == k)][0];'
 mkrepo() { mkdir -p "$T/$1" && git -C "$T/$1" init -q && git -C "$T/$1" remote add origin "$2"; }
 
 # --- 1. Netlify + Next.js frontend, FastAPI backend with a health route -----
@@ -27,12 +28,9 @@ check "auth provider detected" "$OUT" '.detected.auth | has("Supabase Auth")'
 check "repo slug from origin" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_REPO") | .value) == "acme/widget"'
 check "netlify maps to the static provider" "$OUT" '(.mandatory[] | select(.key == "SMOKE_PREVIEW_PROVIDER") | .value) == "static"'
 check "netlify template is a hint, never a value" "$OUT" '.mandatory[] | select(.key == "SMOKE_GATE_FRONTEND_SERVICE") | .value == null and (.find | contains("https://deploy-preview-{pr}--<site>.netlify.app"))'
-check "service dir prefixes" "$OUT" '([.mandatory[] | select(.key == "SMOKE_GATE_FRONTEND_PREFIX" or .key == "SMOKE_GATE_BACKEND_PREFIX" or .key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value]) == ["web/","api/","api/migrations/"]'
-check "health route found" "$OUT" '(.recommended[] | select(.key == "SMOKE_GATE_HEALTH_PATH") | .value) == "/healthz"'
-# The proposed prefixes pass the gates' own layout validator.
-PROBLEMS="$(env $(jq -r '.mandatory[] | select(.key | endswith("_PREFIX")) | "\(.key)=\(.value)"' <<<"$OUT") \
-  bash -c '. "$1"; layout_prefix_problems' _ "$SCRIPT_DIR/smoke-gate-layout.sh")"
-[ -z "$PROBLEMS" ] && ok "proposed prefixes pass smoke-gate-layout.sh" || fail "proposed prefixes refused by the gate:$PROBLEMS"
+check "prefixes are never filled in" "$OUT" "$E"' [e("SMOKE_GATE_FRONTEND_PREFIX"), e("SMOKE_GATE_BACKEND_PREFIX"), e("SMOKE_GATE_MIGRATIONS_PREFIX")] | map(.value) == [null, null, null]'
+check "the dirs seen are listed for each prefix" "$OUT" "$E"' (e("SMOKE_GATE_FRONTEND_PREFIX").find | contains("web/")) and (e("SMOKE_GATE_BACKEND_PREFIX").find | contains("api/")) and (e("SMOKE_GATE_MIGRATIONS_PREFIX").find | contains("api/migrations/"))'
+check "the health path is never filled in" "$OUT" "$E"' e("SMOKE_GATE_HEALTH_PATH").value == null'
 check "the next step is the gates' config check" "$OUT" '.next | test("config")'
 check "every entry says why and how to find it" "$OUT" '[.mandatory[], .recommended[] | (.why | length > 0) and (.find | length > 0)] | all'
 
@@ -44,9 +42,8 @@ echo '{"dependencies":{"express":"4.0.0"}}' >"$T/render/backend/package.json"
 OUT="$(python3 "$INIT" propose "$T/render")"
 check "render maps to the render provider" "$OUT" '(.mandatory[] | select(.key == "SMOKE_PREVIEW_PROVIDER") | .value) == "render"'
 check "scp-style origin parsed" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_REPO") | .value) == "acme/gizmo"'
-check "backend prefix from dir name" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_BACKEND_PREFIX") | .value) == "backend/"'
+check "backend dir listed from its name" "$OUT" "$E"' e("SMOKE_GATE_BACKEND_PREFIX").find | contains("backend/")'
 check "no migration dir: no guessed prefix" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == null'
-check "no migration dir named as a gap" "$OUT" '.gaps | any(startswith("no migration directory"))'
 check "render: the develop gate's dev URL is mandatory" "$OUT" '[.mandatory[] | .key] | index("SMOKE_GATE_DEV_URL") != null'
 
 # --- 3. Cloudflare Pages + Vite: {branch} alias template -------------------
@@ -67,13 +64,21 @@ check "unsupported host named as a gap" "$OUT" '.gaps | any(startswith("fly: no 
 check "native app named as a gap" "$OUT" '.gaps | any(startswith("native app"))'
 check "missing GitHub origin named as a gap" "$OUT" '.gaps | any(startswith("no GitHub origin"))'
 check "detect alone lists hosts" "$(python3 "$INIT" detect "$T/fly")" '.previewHosts | has("fly")'
+check "no supported host: the provider is left to the operator" "$OUT" "$E"' e("SMOKE_PREVIEW_PROVIDER").value == null'
+check "no supported host named as a gap" "$OUT" '.gaps | any(startswith("no preview host with an adapter"))'
+mkrepo twohost https://github.com/acme/twin
+printf 'services: []\n' >"$T/twohost/render.yaml"
+printf '[build]\n' >"$T/twohost/netlify.toml"
+OUT="$(python3 "$INIT" propose "$T/twohost")"
+check "two supported hosts: no provider picked" "$OUT" "$E"' e("SMOKE_PREVIEW_PROVIDER").value == null'
+check "two supported hosts named as a gap" "$OUT" '.gaps | any(startswith("several preview hosts (netlify, render)"))'
 
 # --- 4b. Migration dirs come from the tree; Go and Rails dirs are services ----
 mkrepo prisma https://github.com/acme/ledger
 mkdir -p "$T/prisma/api/prisma/migrations"
 echo '{"dependencies":{"express":"4.0.0"}}' >"$T/prisma/api/package.json"
 OUT="$(python3 "$INIT" propose "$T/prisma")"
-check "prisma migrations dir, not a guessed api/migrations/" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == "api/prisma/migrations/"'
+check "prisma migrations dir listed, nothing guessed" "$OUT" "$E"' e("SMOKE_GATE_MIGRATIONS_PREFIX") | .value == null and (.find | contains("api/prisma/migrations/")) and (.find | contains("api/migrations/, ") | not)'
 mkrepo rails https://github.com/acme/shop
 mkdir -p "$T/rails/web" "$T/rails/server/db/migrate" "$T/rails/worker"
 echo '{"dependencies":{"next":"15.0.0"}}' >"$T/rails/web/package.json"
@@ -81,16 +86,12 @@ printf "source 'https://rubygems.org'\ngem 'rails', '~> 8.0'\n" >"$T/rails/serve
 printf 'module example.test/worker\n' >"$T/rails/worker/go.mod"
 OUT="$(python3 "$INIT" propose "$T/rails")"
 check "go and rails dirs recorded as services" "$OUT" '.detected.serviceDirs == ["server/","web/","worker/"]'
-check "rails db/migrate is the migrations prefix" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == "server/db/migrate/"'
-PROBLEMS="$(env $(jq -r '.mandatory[] | select(.key | endswith("_PREFIX")) | "\(.key)=\(.value)"' <<<"$OUT") \
-  bash -c '. "$1"; layout_prefix_problems' _ "$SCRIPT_DIR/smoke-gate-layout.sh")"
-[ -z "$PROBLEMS" ] && ok "go/rails prefixes pass smoke-gate-layout.sh" || fail "go/rails prefixes refused by the gate:$PROBLEMS"
+check "rails db/migrate listed" "$OUT" "$E"' e("SMOKE_GATE_MIGRATIONS_PREFIX").find | contains("server/db/migrate/")'
 mkrepo twomig https://github.com/acme/depot
 mkdir -p "$T/twomig/api/migrations" "$T/twomig/data/migrations"
 echo '{"dependencies":{"express":"4.0.0"}}' >"$T/twomig/api/package.json"
 OUT="$(python3 "$INIT" propose "$T/twomig")"
-check "two migration dirs: no prefix chosen" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == null'
-check "two migration dirs named as a gap" "$OUT" '.gaps | any(startswith("several migration directories (api/migrations/, data/migrations/)"))'
+check "two migration dirs both listed" "$OUT" "$E"' e("SMOKE_GATE_MIGRATIONS_PREFIX") | .value == null and (.find | contains("api/migrations/, data/migrations/"))'
 
 mkrepo twofront https://github.com/acme/suite
 mkdir -p "$T/twofront/apps/frontend" "$T/twofront/packages/web" "$T/twofront/api"
@@ -98,26 +99,21 @@ echo '{"dependencies":{"next":"15.0.0"}}' >"$T/twofront/apps/frontend/package.js
 echo '{"dependencies":{"react":"19.0.0"}}' >"$T/twofront/packages/web/package.json"
 echo '{"dependencies":{"express":"4.0.0"}}' >"$T/twofront/api/package.json"
 OUT="$(python3 "$INIT" propose "$T/twofront")"
-check "two frontend dirs: no prefix chosen" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_FRONTEND_PREFIX") | .value) == null'
-check "two frontend dirs named as a gap" "$OUT" '.gaps | any(startswith("several frontend directories (apps/frontend/, packages/web/)"))'
-check "the one backend dir is still proposed" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_BACKEND_PREFIX") | .value) == "api/"'
+check "two frontend dirs both listed" "$OUT" "$E"' e("SMOKE_GATE_FRONTEND_PREFIX") | .value == null and (.find | contains("apps/frontend/, packages/web/"))'
+check "the backend dir listed on its own" "$OUT" "$E"' e("SMOKE_GATE_BACKEND_PREFIX").find | contains("(seen in this repo: api/)")'
 
 mkrepo deepmig https://github.com/acme/vault
 mkdir -p "$T/deepmig/apps/api/prisma/migrations" "$T/deepmig/supabase/migrations"
 echo '{"dependencies":{"express":"4.0.0"}}' >"$T/deepmig/apps/api/package.json"
 OUT="$(python3 "$INIT" propose "$T/deepmig")"
-check "a deep migration dir counts: no prefix chosen" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == null'
-check "the deep migration dir is named" "$OUT" '.gaps | any(contains("apps/api/prisma/migrations/"))'
+check "a deep migration dir is listed" "$OUT" "$E"' e("SMOKE_GATE_MIGRATIONS_PREFIX").find | contains("apps/api/prisma/migrations/, supabase/migrations/")'
 
-# --- 4c. A symlinked file is never read: it can point outside the repo ------
+# --- 4c. A symlinked manifest is never read: it can point outside the repo ---
 mkrepo linked https://github.com/acme/linked
 mkdir -p "$T/outside/web" "$T/linked/web"
-printf 'TOKEN = "x"\nroute = "/healthz"\n' >"$T/outside/creds.py"
 echo '{"dependencies":{"next":"15.0.0"}}' >"$T/outside/web/package.json"
-ln -s "$T/outside/creds.py" "$T/linked/probe.py"
 ln -s "$T/outside/web/package.json" "$T/linked/web/package.json"
 OUT="$(python3 "$INIT" detect "$T/linked")"
-check "a symlinked source file is not read" "$OUT" '.healthRoutes == {}'
 check "a symlinked manifest is not read" "$OUT" '.frameworks == {} and .serviceDirs == []'
 
 # --- 5. The draft: private dir only, never overwritten, never inside the skill

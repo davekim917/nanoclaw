@@ -5,17 +5,18 @@
     smoke-init.py propose <repo-dir> [--group-dir <dir>]
 
 `detect` prints one JSON object: frameworks, preview hosts, auth, database,
-monorepo service dirs and candidate health routes, each with the file that
-showed it. `propose` turns that into MANDATORY keys (without them the gates
-refuse to run) and RECOMMENDED keys (they make campaigns sharper), each with
-why it matters and how to find its value. Neither command reads a secret or
-prints one.
+monorepo service dirs and migration dirs, each with the file that showed it.
+It reads manifests only (never source files, never a symlink). `propose` turns
+that into MANDATORY keys (without them the gates refuse to run) and RECOMMENDED
+keys (they make campaigns sharper), each with why it matters and how to find
+its value.
 
 `--group-dir` also writes `smoke-gate-env.draft.sh` there: every proposed key
-commented out, values filled in only where the repo itself shows them (the
-GitHub slug, service dir prefixes, the one migration directory, a health route). It refuses to overwrite a
-file, to write inside a checkout of this skill, and to write at all when any
-proposed value looks like a credential. Review the draft, move the keys you keep into the
+commented out, a value filled in only where the repo settles it (the GitHub
+slug, and the provider when exactly one preview host is found). Prefixes and
+service ids are the operator's: the draft lists what it saw, never picks. It
+refuses to overwrite a file, to write inside a checkout of this skill, and to
+write at all when any proposed value looks like a credential. Review the draft, move the keys you keep into the
 install's `smoke-gate-env.sh`, then run each gate wrapper with `config`: it names any key the gate
 would still refuse on.
 """
@@ -46,14 +47,13 @@ HOST_FILES = [
     ("wrangler.jsonc", "cloudflare"), ("amplify.yml", "amplify"), ("app.yaml", "app-engine"),
     ("eas.json", "expo-eas"), ("Procfile", "procfile"),
 ]
-# Hosts the gate has a preview adapter for, and how a static template would look otherwise.
+# Hosts the gate has a preview adapter for: the provider, and a static host's per-PR URL shape.
 PREVIEW_SUPPORT = {
-    "render": ("render", "SMOKE_PREVIEW_PROVIDER=render; *_SERVICE are the base Render service ids"),
+    "render": ("render", None),
     "netlify": ("static", "https://deploy-preview-{pr}--<site>.netlify.app"),
     "cloudflare": ("static", "https://{branch}.<project>.pages.dev"),
 }
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", ".next", "__pycache__", "vendor", "target"}
-HEALTH_RE = re.compile(r"""["'](/(?:api/)?(?:healthz|health|livez|readyz|ping|status|version))["']""")
 # The gates' layout-prefix grammar (LAYOUT_PREFIX_RE in smoke-gate-layout.sh). A directory
 # name outside it is never recorded: it could not be a prefix, and it lands in a shell draft.
 DIR_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*/)+")
@@ -70,16 +70,11 @@ def read(path):
 
 
 def walk(root):
-    """(relative dir, depth, file names) for the whole repo tree, without vendored dirs.
-
-    Never depth-capped: a single migration or service dir is proposed only when it is the only one,
-    which holds only if the scan saw every directory.
-    """
+    """(relative dir, file names) for the whole repo tree, without vendored dirs."""
     for dirpath, dirs, files in os.walk(root):
         rel = os.path.relpath(dirpath, root)
-        depth = 0 if rel == "." else rel.count(os.sep) + 1
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".") or d in (".vercel", ".github")]
-        yield ("" if rel == "." else rel), depth, files
+        yield ("" if rel == "." else rel), files
 
 
 def add_dir(bucket, rel):
@@ -95,8 +90,8 @@ def hit(bucket, name, where):
 
 def detect(root):
     found = {"frameworks": {}, "previewHosts": {}, "auth": {}, "databases": {}, "serviceDirs": [],
-             "healthRoutes": {}, "migrationDirs": [], "githubRepo": None, "ci": []}
-    for rel, depth, files in walk(root):
+             "migrationDirs": [], "githubRepo": None, "ci": []}
+    for rel, files in walk(root):
         parts = rel.split(os.sep) if rel else []
         if parts[-1:] == ["migrations"] or parts[-2:] in (["db", "migrate"], ["alembic", "versions"]):
             add_dir(found["migrationDirs"], rel)
@@ -147,9 +142,6 @@ def detect(root):
                     hit(found["previewHosts"], host, path)
             if rel.startswith(".github/workflows") and f.endswith((".yml", ".yaml")):
                 found["ci"].append(path)
-            if depth <= 3 and f.endswith((".ts", ".js", ".py", ".rb", ".go")) and os.path.getsize(full) < 400_000:
-                for m in HEALTH_RE.finditer(read(full) or ""):
-                    hit(found["healthRoutes"], m.group(1), path)
     found["serviceDirs"] = sorted(set(found["serviceDirs"]))
     found["migrationDirs"].sort()
     try:
@@ -162,25 +154,27 @@ def detect(root):
     return found
 
 
-def guess_prefix(dirs, words):
-    """(the one dir whose name is in words, else None; every such dir)."""
-    hits = [d for d in dirs if d.rstrip("/").split("/")[-1].lower() in words]
-    return (hits[0] if len(hits) == 1 else None), hits
+def candidates(dirs, words):
+    return [d for d in dirs if d.rstrip("/").split("/")[-1].lower() in words]
+
+
+def seen(text, dirs):
+    return text + (" (seen in this repo: " + ", ".join(dirs) + ")" if dirs else "")
 
 
 def propose(found):
-    hosts = [h for h in found["previewHosts"] if h in PREVIEW_SUPPORT or h in dict(HOST_FILES).values()]
-    supported = [h for h in hosts if h in PREVIEW_SUPPORT]
-    host = supported[0] if supported else None
-    provider, template = PREVIEW_SUPPORT.get(host, ("static", "https://<preview host for PR {pr}>"))
+    hosts = [h for h in found["previewHosts"] if h in dict(HOST_FILES).values()]
+    supported = sorted({h for h in hosts if h in PREVIEW_SUPPORT})
+    provider, template = PREVIEW_SUPPORT[supported[0]] if len(supported) == 1 else (None, None)
     dirs = found["serviceDirs"]
-    # Never a pick among several: a change under the unpicked service settles without its preview.
-    front, fronts = guess_prefix(dirs, {"web", "frontend", "client", "app", "ui", "site"})
-    back, backs = guess_prefix(dirs, {"api", "backend", "server", "service"})
-    health = next(iter(sorted(found["healthRoutes"], key=lambda r: ("health" not in r, r))), None)
-    # Never a guessed path: a prefix that matches nothing lets every migration PR past the gate.
-    migs = found["migrationDirs"]
-    migrations = migs[0] if len(migs) == 1 else None
+    if provider == "render":
+        service_find = "the base Render service id from the dashboard"
+    elif provider == "static":
+        service_find = "the host's per-PR preview URL with the real names filled in, e.g. " + template
+    else:
+        service_find = "a base Render service id (render) or the host's per-PR preview URL template (static)"
+    # The prefixes decide what the gates check and refuse, and a wrong one passes `config`
+    # while silently weakening a gate, so they are listed as seen, never filled in.
     mandatory = [
         {"key": "SMOKE_GATE_REPO", "value": found["githubRepo"],
          "why": "the GitHub repo whose labeled PRs the gate watches; every gate reads it through gh",
@@ -190,30 +184,29 @@ def propose(found):
          "find": "render if previews are Render preview environments, else static with URL templates"},
         {"key": "SMOKE_GATE_FRONTEND_SERVICE", "value": None,
          "why": "the frontend preview: a base Render service id (render) or a URL template with {pr}/{branch} (static)",
-         "find": "the base Render service id from the dashboard" if provider == "render"
-                 else "the host's per-PR preview URL with the real names filled in, e.g. " + template},
+         "find": service_find},
         {"key": "SMOKE_GATE_BACKEND_SERVICE", "value": None,
          "why": "the backend preview, same form as the frontend one; the gate probes its health path",
          "find": "as above, for the API service"},
-        {"key": "SMOKE_GATE_FRONTEND_PREFIX", "value": front,
+        {"key": "SMOKE_GATE_FRONTEND_PREFIX", "value": None,
          "why": "a diff under it requires the frontend preview to match the head; ends in /, and differs from the other two prefixes",
-         "find": "the frontend app's directory in the repo"},
-        {"key": "SMOKE_GATE_BACKEND_PREFIX", "value": back,
+         "find": seen("the frontend app's directory", candidates(dirs, {"web", "frontend", "client", "app", "ui", "site"}))},
+        {"key": "SMOKE_GATE_BACKEND_PREFIX", "value": None,
          "why": "the backend's directory; freeze markers live under it; ends in /",
-         "find": "the API app's directory in the repo"},
-        {"key": "SMOKE_GATE_MIGRATIONS_PREFIX", "value": migrations,
+         "find": seen("the API app's directory", candidates(dirs, {"api", "backend", "server", "service"}))},
+        {"key": "SMOKE_GATE_MIGRATIONS_PREFIX", "value": None,
          "why": "an ordinary PR touching it is refused (migrations never run against shared dev); ends in /",
-         "find": "the directory holding schema migrations" + (" (found: " + ", ".join(migs) + ")" if migs else "")},
+         "find": seen("the directory holding schema migrations", found["migrationDirs"])},
     ]
-    if provider == "render":
+    if provider != "static":
         mandatory.append(
             {"key": "SMOKE_GATE_DEV_URL", "value": None,
-             "why": "develop gate only: the shared dev environment it smoke-tests; that gate refuses without it",
+             "why": "Render installs: the shared dev environment the develop gate smoke-tests; that gate refuses without it",
              "find": "the dev environment's public URL"})
     recommended = [
-        {"key": "SMOKE_GATE_HEALTH_PATH", "value": health,
+        {"key": "SMOKE_GATE_HEALTH_PATH", "value": None,
          "why": "the backend readiness probe; default /healthz",
-         "find": "the route the backend answers 200 on once it can serve traffic"},
+         "find": "the route the backend answers 200 on only once it can serve traffic"},
         {"key": "SMOKE_GATE_LABEL", "value": None,
          "why": "the PR label that opts a PR into smoke campaigns; default render-preview",
          "find": "the label your preview host or team already uses"},
@@ -235,18 +228,13 @@ def propose(found):
         if h not in PREVIEW_SUPPORT:
             gaps.append("{}: no preview adapter; use SMOKE_PREVIEW_PROVIDER=static if it gives each PR a "
                         "predictable URL, or open an adapter request".format(h))
+    if len(supported) > 1:
+        gaps.append("several preview hosts ({}): set SMOKE_PREVIEW_PROVIDER for the one that builds PR "
+                    "previews".format(", ".join(supported)))
+    elif not supported:
+        gaps.append("no preview host with an adapter found: set SMOKE_PREVIEW_PROVIDER yourself")
     if "Expo" in found["frameworks"] or "React Native" in found["frameworks"]:
         gaps.append("native app: campaigns drive web previews only; native changes need a manual test packet")
-    for role, hits in (("frontend", fronts), ("backend", backs)):
-        if len(hits) > 1:
-            gaps.append("several {} directories ({}): the gate takes one prefix; set it by hand".format(
-                role, ", ".join(hits)))
-    if len(migs) > 1:
-        gaps.append("several migration directories ({}): the gate takes one prefix; set the one whose PRs "
-                    "must be refused".format(", ".join(migs)))
-    elif not migs:
-        gaps.append("no migration directory found: set SMOKE_GATE_MIGRATIONS_PREFIX to where schema "
-                    "migrations live")
     if not found["githubRepo"]:
         gaps.append("no GitHub origin found: every gate reads PRs, CI and trees through gh")
     if provider == "static":
