@@ -27,8 +27,6 @@
  * sender_identity). A replay of the retained event remains deferred; a later
  * message from that sender is dropped without replacing it or sending another
  * card.
- *
- * Also carries the `decline_notify` continuation (declineAndNotify).
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
 import { getAllAgentGroups } from '../../db/agent-groups.js';

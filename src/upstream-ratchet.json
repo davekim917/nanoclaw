@@ -879,7 +879,7 @@
 "src/modules/permissions/index.ts":{"diff":411,"mode":"100644","sha256":"1f88389e7306836ccf13c9974fcbd0a1c9357a05ba889f4dfc4e2fb2692c5de1"},
 "src/modules/permissions/permissions.test.ts":{"diff":192,"mode":"100644","sha256":"3678d1c871487fce8791a944cc5b222053df437a050cf27d728332bb853e6f62"},
 "src/modules/permissions/sender-approval.test.ts":{"diff":433,"mode":"100644","sha256":"67d95e23853f4d5d44993f0baaf836af15a31f530a004b3be291cb5dc6cb3471"},
-"src/modules/permissions/sender-approval.ts":{"diff":226,"mode":"100644","sha256":"806c08301c15c8556503b09022834f82ee9bb0d4230fe856860f5ee96eaba7dd"},
+"src/modules/permissions/sender-approval.ts":{"diff":226,"mode":"100644","sha256":"283cde3397ad4e318e1105c29b9e744849332c58d417e799ae6f603b78957ad7"},
 "src/modules/permissions/sender-decline-notify.test.ts":{"diff":722,"mode":"100644","sha256":"7f17278a76cb99571e150d403be4540a0e7ab4929e8c53a568735057cbbacc5b"},
 "src/modules/permissions/user-dm.test.ts":{"diff":78,"mode":"100644","sha256":"f998f3f895701ba3eed2d2dbd5311bd57657fe88e48accb30c5c920db82ba473"},
 "src/modules/permissions/user-dm.ts":{"diff":125,"mode":"100644","sha256":"ed3b82e6c23027b74deb543483c57a5ab6f25b1b848e4eca5e85d06c3eefa53c"},
