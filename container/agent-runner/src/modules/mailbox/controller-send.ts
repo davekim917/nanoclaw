@@ -1,15 +1,7 @@
 /**
- * The controller-send row op: insert-or-verify one `messages_out` chat row
- * atomically with its attachment digests and the per-run send budget.
- *
- * This lives in the mailbox module because it is session-DB access. The caller
- * (`cli/enqueue-send.ts`) owns input validation, routing resolution and
- * attachment reading; it reaches the two session DBs only through this file.
- * `src/mailbox-seam-ratchet.test.ts` asserts the runner half of the raw-access
- * allowlist stays exactly empty (docs/specs/upstream-mailbox-seam/plan.md §165:
- * "the runner half exactly EMPTY", and a file that leaves the allowlist may
- * never re-enter it), so a caller that needs a compound transaction gets a
- * named op here rather than an allowlist entry.
+ * Insert-or-verify one controller-send chat row atomically with its attachment digests and the per-run budget.
+ * A named op here because the runner's raw-access allowlist must stay exactly empty
+ * (src/mailbox-seam-ratchet.test.ts).
  */
 import { createOutboundRecord } from '../../mailbox/model.generated.js';
 import { getInboundDb, getOutboundDb } from '../../mailbox/sqlite/connection.js';
@@ -92,12 +84,7 @@ export interface ControllerSendRowInput {
   fingerprint: string | null | undefined;
   wanted: ControllerSendRowPayload;
   digests: ControllerSendDigests;
-  /**
-   * Writes the attachment bytes. Called inside the write transaction, before
-   * the row exists, because the host reads `<outbox>/<id>/` when it delivers
-   * the row. A crash after staging leaves only a
-   * directory the retry overwrites.
-   */
+  /** Runs inside the write transaction before the row exists (the host reads `<outbox>/<id>/` on delivery); a crash leaves a directory the retry overwrites. */
   stageAttachments: () => void;
   samePayload: (a: ControllerSendRowPayload, b: ControllerSendRowPayload) => boolean;
   sameDigests: (stored: ControllerSendDigests | null, wanted: ControllerSendDigests) => boolean;
@@ -145,8 +132,7 @@ export function writeControllerSendRow(input: ControllerSendRowInput): Controlle
 
     input.stageAttachments();
 
-    // Sequence rule of sqliteWriteMessageOut (mailbox/sqlite/operations.ts:
-    // 133-144): the container claims odd numbers above every row on both sides.
+    // Same rule as upstream's sqliteWriteMessageOut: the container claims odd seq numbers above every row on both sides.
     const maxOut = (
       outbound.prepare('SELECT COALESCE(MAX(seq), 0) AS value FROM messages_out').get() as { value: number }
     ).value;

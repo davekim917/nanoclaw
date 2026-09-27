@@ -1,16 +1,6 @@
 /**
- * OpenAI Codex provider — wraps `codex app-server` via JSON-RPC.
- *
- * Unlike the (deprecated) @openai/codex-sdk approach, the app-server
- * protocol exposes proper session/stream semantics, native compaction, and
- * stable MCP config via ~/.codex/config.toml — which is the same mechanism
- * the standalone codex CLI uses, so the container and host share one
- * provider-integration story.
- *
- * Codex turns accept mid-turn input through the app-server's `turn/steer`
- * RPC. Follow-up `push()` messages steer the active turn by default and fall
- * back to the pending queue only when no turn is in flight or the steer races
- * with turn completion.
+ * Follow-up `push()` messages steer the active turn via `turn/steer`, queuing only when no turn is in flight or the
+ * steer races turn completion.
  */
 import fs from 'fs';
 import crypto from 'crypto';
@@ -47,9 +37,7 @@ import {
   writeCodexMcpConfigToml,
   readCodexSubagentThreads,
 } from './codex-app-server.js';
-// Hooks AND the `[hooks.state.*]` entries that make Codex actually dispatch
-// them: Codex >=0.154 refuses to run an untrusted hook, so writing hooks.json
-// alone leaves the destructive-action guard chain loaded but never fired.
+// Hooks AND their trust entries: Codex >=0.154 never runs an untrusted hook.
 import { verifyCodexHookTrust, writeCodexHooksAndTrust } from '../codex-companion-setup.js';
 import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus } from './codex-liveness.js';
 import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
@@ -59,26 +47,9 @@ import { formatBlockquoteLabel, thinkingForwardingEnabled, truncate } from './th
 import { recordContextTokens, recordSubagent } from '../turn-status.js';
 
 /**
- * Health watchdog for a single turn. Guards against codex-app-server wedging
- * without treating a quiet Ultra/model/tool operation as dead.
- *
- * Previously this was a wall-clock timer from turn start (`TURN_TIMEOUT_MS
- * = 300_000`). That cut off every legitimate long turn — `xhigh` reasoning
- * with multi-step tool work routinely runs past 5 min while emitting
- * reasoning deltas every 1–10s. Wall-clock can't tell "thinking hard" from
- * "wedged"; idle-from-last-notification can.
- *
- * Notifications remain the primary activity signal. Once they go quiet, the
- * provider sends non-mutating thread/read + descendant thread/list requests.
- * A responsive active root/descendant may remain quiet indefinitely; only
- * repeated control-plane failures or repeated impossible inactive snapshots
- * trigger app-server replacement.
- *
- * Initial production defaults: wait 60s of notification silence, probe every
- * 30s with a 10s response deadline, and recover after three consecutive
- * failures. At those defaults a hard wedge is replaced in roughly two minutes.
- * Successful probes yield ProviderEvent.activity, keeping the host heartbeat
- * fresh even for a legitimate turn that stays notification-silent for hours.
+ * Idle is measured from the last notification, not turn start: a quiet turn can be legitimate for hours. Once quiet,
+ * non-mutating probes decide, and only repeated control-plane failures or impossible inactive snapshots replace the
+ * app-server.
  */
 const CODEX_HEALTH_PROBE_QUIET_MS = 60_000;
 const CODEX_HEALTH_PROBE_INTERVAL_MS = 30_000;
@@ -125,12 +96,7 @@ function persistCodexProviderHealth(state: ProviderHealthState): void {
   }
 }
 
-/**
- * Lookup tables for translating Codex collaboration ThreadItems into
- * human-readable progress labels. Codex 0.144.1 emits both the legacy
- * `collabAgentToolCall` shape and the current `subAgentActivity` lifecycle
- * shape; both carry the originating collaboration call ID.
- */
+/** Codex 0.144.1 can surface one action as both the legacy `collabAgentToolCall` and the `subAgentActivity` shape. */
 const COLLAB_TOOL_EMOJI: Record<string, string> = {
   spawnAgent: '🌱',
   sendInput: '📨',
@@ -163,15 +129,7 @@ type CodexCollaborationThreadItem = {
   kind?: unknown;
 };
 
-/**
- * Translate a Codex collaboration ThreadItem into a status message.
- *
- * The app-server may surface the same collaboration action through both
- * `collabAgentToolCall` and `subAgentActivity` (and through both item lifecycle
- * notifications). Their required `id` is the originating collaboration call
- * ID, so a per-turn set safely suppresses duplicate renderings without hiding
- * distinct actions against the same child agent.
- */
+/** Both shapes carry the originating call ID, so the per-turn set dedupes them without hiding distinct actions. */
 export function formatCodexCollaborationProgress(rawItem: unknown, emittedItemIds: Set<string>): string | null {
   if (!rawItem || typeof rawItem !== 'object') return null;
   const item = rawItem as CodexCollaborationThreadItem;
@@ -214,9 +172,7 @@ export function isCodexNotificationForActiveTurn(
     return !!thread && typeof thread === 'object' && (thread as Record<string, unknown>).id === threadId;
   }
 
-  // Every current Codex lifecycle notification except thread/started carries
-  // a top-level threadId. Missing scope is malformed under the exact-pinned
-  // protocol and must not be allowed to mutate the active turn.
+  // Every lifecycle notification but thread/started carries threadId; one without it must not mutate the turn.
   if (params.threadId !== threadId) return false;
 
   const turn = params.turn;
@@ -226,27 +182,13 @@ export function isCodexNotificationForActiveTurn(
       : null;
   const notificationTurnId = typeof params.turnId === 'string' ? params.turnId : nestedTurnId;
 
-  // Two separate rules, deliberately not merged.
-  //
-  // (1) PRESENCE is required only of the lifecycle namespaces that always
-  //     carry a turn id. Missing scope there is malformed under the
-  //     exact-pinned protocol and must not mutate the active turn.
+  // A turn id must be PRESENT only on turn/, item/ and rawResponseItem/ notifications.
   const requiresTurnId =
     method.startsWith('turn/') || method.startsWith('item/') || method.startsWith('rawResponseItem/');
   if (requiresTurnId && !notificationTurnId) return false;
 
-  // (2) MATCHING applies to any notification that names a turn, whatever
-  //     namespace its method sits in. `thread/tokenUsage/updated` carries a
-  //     `turnId` (ThreadTokenUsageUpdatedNotification is a 3-field struct in
-  //     codex 0.145.0: threadId, turnId, tokenUsage) but lives under
-  //     `thread/`, so a prefix-only rule left it categorically unscoped: a
-  //     late, reordered, or replayed-on-resume payload tagged with a PRIOR
-  //     turn summed into the current turn's accumulator. That is the
-  //     overcount mirror of the undercount 9f86ac2d fixed.
-  //
-  //     Presence is deliberately NOT required here. An app-server build that
-  //     omits the field keeps today's behaviour instead of having every usage
-  //     notification silently dropped — which would meter codex at zero.
+  // MATCHING applies to any notification naming a turn: thread/tokenUsage/updated carries turnId too, and a stale one
+  // would inflate this turn's usage. Presence is not required here, or a build omitting it would meter zero.
   if (currentTurnId && notificationTurnId && notificationTurnId !== currentTurnId) return false;
   return true;
 }
@@ -288,13 +230,7 @@ type ImageGenerationThreadItem = {
   saved_path?: unknown;
 };
 
-/**
- * `TokenUsageBreakdown` from the codex app-server protocol — the shape of BOTH
- * `tokenUsage.last` and `tokenUsage.total` on the `thread/tokenUsage/updated`
- * notification. Field list verified against the codex 0.145.0 binary's own
- * generated `TokenUsageBreakdown.ts`. Fleet Hardening Phase 0.1 — see
- * TurnUsageInfo in providers/types.ts.
- */
+/** Shape of both `tokenUsage.last` and `.total`, verified against codex 0.145.0's generated types. */
 type CodexTokenUsageBreakdown = {
   totalTokens: number;
   inputTokens: number;
@@ -318,9 +254,7 @@ function joinStringArray(value: unknown): string {
 
 function extractReasoningItemText(item: ReasoningThreadItem | undefined): string | null {
   if (item?.type !== 'reasoning') return null;
-  // ThreadItem reasoning payloads carry summary/content as string arrays.
-  // Prefer summaries because those are the user-facing reasoning surface;
-  // content is only a fallback for app-server builds that finalize raw text.
+  // Summaries are the user-facing surface; content is a fallback for builds that finalize raw text.
   const summary = joinStringArray(item.summary);
   if (summary) return summary;
   const content = joinStringArray(item.content);
@@ -368,34 +302,11 @@ export function materializeRawImageGeneration(
   return outPath;
 }
 
-// ── Provider config schema ──────────────────────────────────────────────────
-// Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
-// `reasoning_effort` instead of Claude's `effort`. Codex 0.144.1 exposes
-// reasoning effort as a model-advertised string; its current model catalog
-// uses low | medium | high | xhigh | max | ultra. Ultra is a real Codex effort
-// value that adds proactive task delegation, not Claude's `ultracode` flag.
-//
-// Per-agent settings are exceptions only: an unpinned native Codex group and
-// an unpinned Claude → Codex fallback must resolve identically after the
-// source provider's config is discarded — which is why the fleet default is
-// ONE pair of constants, used by both the schema default below and the model
-// chain in the constructor, and nowhere else.
-//
-// Sticky-only: `model` is applied at thread-start; `reasoning_effort` and the
-// native collaboration cap are applied at app-server spawn. They persist for
-// the query/session. Per-turn overrides for these fields are not currently
-// exposed by Codex's `thread/start` shape.
+// Sticky-only: `model` applies at thread-start, `reasoning_effort` and the collaboration cap at app-server spawn.
 /**
- * The unpinned Codex fleet default: gpt-6-sol at `high` reasoning (operator
- * decision 2026-09-22, replacing gpt-5.6-sol; gpt-5.6-terra at `xhigh` before
- * 2026-09-16). Keep it equal to the `sol` family target
- * (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts; setup/lib/codex-model-min-cli.test.ts
- * fails when they differ).
- *
- * These are the ONLY fleet defaults for Codex. A group pins with
- * `providerConfig.model`/`reasoning_effort` in container.json, or
- * `ncl groups config update --model/--effort`, and a pin always wins — nothing
- * here rewrites one.
+ * The only Codex fleet defaults, shared by the schema default and the constructor so an unpinned native group and a
+ * Claude → Codex fallback resolve identically. Keep equal to the `sol` family target (`CODEX_FAMILY_DEFAULTS`,
+ * src/flag-parser.ts); setup/lib/codex-model-min-cli.test.ts fails when they differ.
  */
 export const DEFAULT_CODEX_MODEL = 'gpt-6-sol';
 export const DEFAULT_CODEX_EFFORT = 'high' as const;
@@ -413,22 +324,16 @@ export const codexConfigSchema = z.strictObject({
 
 registerProviderConfigSchema('codex', codexConfigSchema);
 
-// ── Per-query model/effort overrides (-m/-e flags) ──────────────────────────
-// The poll-loop delivers host-parsed flag values via QueryInput.model/.effort
-// (turn override → sticky, resolved in applyFlagBatch). Both are validated
-// here before they reach the app-server: session_state can carry values from
-// before the host's flag vocabulary became provider-aware (observed live
-// 2026-06-10: sticky_model=claude-fable-5[1m] on a codex session), and a
-// claude id at thread/start would fail every turn of the session.
+// Validated before reaching the app-server: stale sticky state can carry a claude id, which would fail every turn
+// at thread/start.
 
-/** Mirrors CODEX_VALID_MODEL_RE in the host's flag-parser (separate package trees); shared with the poll-loop's cross-provider pin drop. */
+/** Mirrors the host flag-parser's CODEX_VALID_MODEL_RE (separate package trees). */
 export { CODEX_MODEL_RE };
 
 const CODEX_EFFORT_VALUES: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
 type CodexStickyConfig = z.infer<typeof codexConfigSchema>;
 
-/** Flag-requested model if it's codex-shaped, else the configured fallback. */
 export function resolveQueryModel(requested: string | undefined, fallback: string): string {
   if (!requested) return fallback;
   requested = resolveCodexFamily(requested);
@@ -437,12 +342,6 @@ export function resolveQueryModel(requested: string | undefined, fallback: strin
   return fallback;
 }
 
-/**
- * Sticky config with the flag-requested effort folded in (when valid for
- * Codex's currently supported reasoning-effort set). Returned object feeds
- * createCodexConfigOverrides at app-server spawn — one server per query, so
- * a per-query effort lands as `-c model_reasoning_effort` naturally.
- */
 export function resolveQueryEffort(requested: string | undefined, sticky: CodexStickyConfig): CodexStickyConfig {
   if (!requested) return sticky;
   if (CODEX_EFFORT_VALUES.has(requested)) {
@@ -465,39 +364,15 @@ This session allows up to ${maxConcurrentThreadsPerSession} concurrent subagents
 - Before ending your turn, close every subagent you spawned, including failure and cancellation paths.`;
 }
 
-// Group instructions (shared base + fragments + per-group standing
-// instructions) reach Codex through AGENTS.md, which the app-server
-// auto-loads as its project doc from cwd (`/workspace/agent` — see
-// poll-loop's caller in index.ts). This function used to also read and
-// @-import-resolve CLAUDE.md and its local companion file by hand and fold that in here
-// too, which doubled ~26KB of instructions into every turn's context and
-// left two copies of every rule that could drift out of sync. AGENTS.md is
-// now the single instruction surface for Codex.
+// Group instructions reach Codex only through the auto-loaded AGENTS.md; folding CLAUDE.md in here would duplicate
+// them every turn.
 function composeBaseInstructions(promptAddendum: string | undefined, maxConcurrentThreadsPerSession: number): string {
   const lifecycle = buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession);
   const pieces = [promptAddendum, lifecycle].filter((s): s is string => Boolean(s));
   return pieces.join('\n\n---\n\n');
 }
 
-// ── Provider ────────────────────────────────────────────────────────────────
-
-/**
- * Container env vars that need to reach every MCP subprocess for outbound
- * HTTPS to work through OneCLI's substitution proxy + CA. Order matters
- * only in that comments and key membership do; if the host has the var
- * set in process.env, it gets forwarded; if not, the slot is omitted.
- *
- * Categories:
- *   - HTTPS_PROXY / HTTP_PROXY / NO_PROXY (and lowercase): routes
- *     outbound HTTP through the OneCLI gateway. Without these, remote
- *     MCP calls bypass OneCLI and outbound auth substitution fails.
- *   - NODE_USE_ENV_PROXY: makes Node 22+ fetch honor HTTPS_PROXY without
- *     explicit ProxyAgent setup. Required because remote-mcp-bridge uses
- *     undici's fetch which only honors env-proxy when this flag is set.
- *   - NODE_EXTRA_CA_CERTS + the CA-bundle siblings: lets the MCP
- *     subprocess trust OneCLI's mitm CA. Without these, outbound TLS to
- *     the gateway fails with CERT_HAS_EXPIRED / SELF_SIGNED_CERT.
- */
+/** Forwarded to every MCP subprocess: without them remote MCP calls bypass OneCLI or fail on its mitm CA. */
 const MCP_PROXY_ENV_KEYS = [
   'HTTPS_PROXY',
   'HTTP_PROXY',
@@ -516,12 +391,7 @@ const MCP_PROXY_ENV_KEYS = [
   'GIT_SSL_CAINFO',
 ] as const;
 
-/**
- * Copy the proxy + CA env vars from `process.env` into `baseEnv` if they're
- * not already set. Existing keys in `baseEnv` (e.g. an MCP that intentionally
- * overrides a proxy setting) win. Returns a new object — never mutates the
- * input.
- */
+/** Keys already in `baseEnv` win (an MCP may override a proxy deliberately). */
 export function augmentWithProxyEnv(baseEnv: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = { ...baseEnv };
   for (const key of MCP_PROXY_ENV_KEYS) {
@@ -534,51 +404,19 @@ export function augmentWithProxyEnv(baseEnv: Record<string, string>): Record<str
   return out;
 }
 
-// ── Codex OAuth fallback (rollout-copy rotation) ───────────────────────────
-// Codex stores per-thread state in `${CODEX_HOME}/sessions/YYYY/MM/DD/
-// rollout-<ISO>-<threadId>.jsonl`. The file is self-contained: the codex
-// app-server reconstructs full history from it and sends the inline message
-// list to the responses API on resume — no `previous_response_id`, no
-// account-binding (verified via openai/codex docs + empirical inspection of
-// a real rollout's payload). So OAuth fallback can preserve conversation
-// context by copying the rollout into the new CODEX_HOME's sessions tree
-// before respawning the app-server.
+// A rollout file is self-contained (no account binding), so OAuth fallback preserves context by copying it into the
+// new CODEX_HOME before respawning.
 
-/**
- * `codexErrorInfo.type` values that should trigger OAuth fallback rotation.
- * `Unauthorized` is also account-scoped: a second authenticated Codex
- * account can recover an invalidated primary token. Other terminal kinds
- * (`BadRequest`, `ContextWindowExceeded`, etc.) are not identity-specific
- * and must not consume a fallback account. Source: openai/codex
- * `CodexErrorInfo` enum + the TUI's `app_server_rate_limit_error_kind`
- * rate-limit classifier.
- */
+/** Account-scoped kinds only: other terminal kinds must not consume a fallback account. */
 const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set([
   'UsageLimitExceeded',
   'ServerOverloaded',
   'Unauthorized',
 ]);
 
-/**
- * The app-server's own usage-limit sentence, as thrown from the query path
- * (the event path carries the structured `UsageLimitExceeded` kind instead).
- * Deliberately anchored on the stable phrase pair rather than the whole
- * message, which embeds a per-account reset date and billing URL.
- */
+/** Anchored on stable phrases: the full message embeds a per-account reset date and billing URL. */
 const CODEX_USAGE_LIMIT_RE = /hit your usage limit|usage limit reached|purchase more credits/i;
 
-/**
- * Map a terminal turn error to a ProviderEvent `classification` consumed by
- * the poll-loop catch path:
- *   - `quota` / `overloaded` / `auth_invalidated` → rotation-eligible
- *     (structured CodexErrorInfo)
- *   - `system_error` → coarse thread/status/changed wedge (no structured detail)
- *   - `control_plane_unresponsive` / `protocol_desync` → provider-local
- *     app-server replacement + persisted-thread resume
- *   - `idle_timeout` → legacy compatibility for older emitted errors
- * A rotation-eligible `errorKind` short-circuits the message checks (a
- * structured quota/overload error is never also a system/idle error).
- */
 export function classifyCodexError(message: string, errorKind: string | null): string | undefined {
   if (errorKind && ROTATABLE_CODEX_ERROR_KINDS.has(errorKind)) {
     if (errorKind === 'UsageLimitExceeded') return 'quota';
@@ -593,11 +431,7 @@ export function classifyCodexError(message: string, errorKind: string | null): s
   return undefined;
 }
 
-/**
- * Only these terminal classifications can be recovered by changing Codex
- * OAuth identities. Keep this predicate central so a new classification
- * cannot accidentally fall through to the host's cross-provider fallback.
- */
+/** Central on purpose: a new classification must not fall through to the host's cross-provider fallback. */
 export function isCodexOAuthRotationEligible(classification: string | undefined): boolean {
   return (
     classification === 'quota' ||
@@ -607,71 +441,18 @@ export function isCodexOAuthRotationEligible(classification: string | undefined)
   );
 }
 
-// ── Child-agent (multi_agent) quota exhaustion ──
-
 /**
- * Upstream's inter-agent completion framing, as emitted by codex-rs
- * `session_prefix.rs::format_inter_agent_completion_message` when a spawned
- * child agent's turn ends in `AgentStatus::Errored`. Both literals below are
- * verbatim from the installed codex 0.151.0 binary.
- *
- * WHY THE FRAMING IS MANDATORY, AND WHY CODEX_USAGE_LIMIT_RE ALONE IS NOT
- * ENOUGH: CODEX_USAGE_LIMIT_RE is safe today only because every caller
- * applies it to a STRUCTURED error object (a thrown app-server Error, or a
- * `codexErrorInfo` payload). The child-agent failure has no structured
- * carrier at all — upstream forwards it to the PARENT as ordinary injected
- * conversation prose and deliberately does NOT fail the parent's turn. So the
- * only place to see it is free text, and free text is exactly where that
- * regex stops being a signal: "purchase more credits" / "hit your usage
- * limit" are phrases an agent can legitimately WRITE. An agent working on
- * this very file would trip a prose-only matcher and kill its own live turn
- * plus rotate a perfectly healthy credential slot.
- *
- * The guard is therefore a conjunction of three independent conditions
- * (see `detectCodexChildAgentQuotaFailure`):
- *   1. the item text opens a line with upstream's "Agent errored:" prefix,
- *   2. it carries upstream's verbatim turn-failed sentence, and
- *   3. the error body matches CODEX_USAGE_LIMIT_RE.
- * i.e. "a child agent reported a terminal error AND that error is a quota
- * error" — never "this text mentions a usage limit".
- *
- * Residual, knowingly accepted: prose that reproduces the WHOLE framed
- * message verbatim, starting at a line boundary, still matches. The cost of
- * that is one turn aborted and replayed on the next credential slot; the cost
- * of relaxing the conjunction is silent rotation storms on ordinary agent
- * chatter. Line-start anchoring (rather than whole-string) is deliberate:
- * app-server versions may prefix the item with an agent path/nickname, and a
- * missed detection costs the pre-fix behavior.
+ * A child agent's quota failure reaches the parent only as injected prose, where CODEX_USAGE_LIMIT_RE alone would
+ * fire on an agent merely writing those words. Detection therefore requires this framing (line-start, since versions
+ * may prefix a nickname), the turn-failed sentence and the quota phrase together. Literals are verbatim from 0.151.0.
  */
 export const CODEX_CHILD_AGENT_ERROR_FRAMING_RE = /^[\s>*_`[\]()-]*Agent errored:/m;
 
-/**
- * The fixed sentence upstream appends after the child's error text. Verbatim
- * from codex 0.151.0; it is the half of the framing that free prose is most
- * unlikely to reproduce, so it does the heavy lifting of the false-positive
- * guard. Matched case-insensitively with flexible inner whitespace so a
- * re-wrap in transport cannot break detection, and tolerating either
- * apostrophe for the same reason QUOTA regexes elsewhere do.
- */
+/** Case-insensitive, flexible whitespace, either apostrophe: transport re-wrapping must not break detection. */
 export const CODEX_CHILD_AGENT_TURN_FAILED_RE =
   /This\s+agent['’]s\s+turn\s+failed\.\s+If\s+you\s+still\s+need\s+this\s+agent,\s+use\s+the\s+available\s+collaboration\s+tools\s+to\s+give\s+it\s+another\s+task\./i;
 
-/**
- * Flatten an app-server ThreadItem (typed `unknown` — the protocol is pinned
- * but the payload shape varies by item type and app-server version) to text
- * the framing/quota matchers can run over.
- *
- * Covers both subagent surfaces the child-agent failure can arrive on:
- *   - `multi_agent_v2`: the injected inter-agent completion message, which
- *     lands as an ordinary conversation item (`text`).
- *   - `multi_agent` v1: the child's error text inside the collaboration
- *     tool's own result (`functionCallOutput.output`, `result`, `content`).
- * Both flags are `stable=true` on codex 0.151.0 and which one is exercised is
- * install-dependent, so both are scanned — the framing conjunction is what
- * makes that safe rather than reckless.
- *
- * Never throws; depth-capped so a cyclic or pathological payload cannot spin.
- */
+/** Scans multi_agent_v2 conversation text and v1 tool-result fields; depth-capped so a cyclic payload cannot spin. */
 export function extractCodexThreadItemText(value: unknown, depth = 0): string {
   if (value == null || depth > 4) return '';
   if (typeof value === 'string') return value;
@@ -697,33 +478,14 @@ export function extractCodexThreadItemText(value: unknown, depth = 0): string {
 }
 
 /**
- * Detect a spawned child agent reporting a QUOTA failure, on either subagent
- * surface. Returns the terminal error message to attribute to the parent
- * turn, or null.
- *
- * This exists because the parent turn never learns about it any other way:
- * `turnState.error` / `turnState.errorKind` are populated only from the
- * coordinator's OWN `turn/completed`+`turn/failed` payloads, and upstream
- * explicitly leaves the parent turn running and unmarked when a child errors.
- * Without this, `classifyCodexError` never sees a quota error,
- * `isCodexOAuthRotationEligible` is never consulted, no rotation happens, and
- * the coordinator is left holding literal "purchase more credits" prose it
- * can misread as an instruction to the user.
- *
- * The caller routes a hit into the EXISTING rotation path by setting
- * `turnState.error` + `errorKind = 'UsageLimitExceeded'`, exactly as if the
- * parent's own turn had failed that way. No new rotation logic.
- *
- * Never throws — a malformed item is not a reason to lose a turn.
+ * Otherwise the parent never learns: upstream leaves its turn running and unmarked when a child errors. Never throws.
  */
 export function detectCodexChildAgentQuotaFailure(item: unknown): string | null {
   try {
     if (!item || typeof item !== 'object') return null;
     const text = extractCodexThreadItemText(item);
     if (!text) return null;
-    // Conjunction, in cheapest-first order. All three must hold; see the
-    // comment on CODEX_CHILD_AGENT_ERROR_FRAMING_RE for why any two of them
-    // would be an unsafe matcher.
+    // All three must hold; any two would be an unsafe matcher.
     if (!CODEX_CHILD_AGENT_ERROR_FRAMING_RE.test(text)) return null;
     if (!CODEX_CHILD_AGENT_TURN_FAILED_RE.test(text)) return null;
     if (!CODEX_USAGE_LIMIT_RE.test(text)) return null;
@@ -743,13 +505,7 @@ export function buildCodexRecoveryPrompt(): string {
   ].join(' ');
 }
 
-/**
- * Decide how one logical user turn crosses an app-server restart. A resumed
- * thread already contains the original request, so repeat only the recovery
- * instruction and retain its replay guards. A fresh thread has no such
- * context, so it must receive the original request and start with fresh
- * thread-scoped dedupe state.
- */
+/** A resumed thread already holds the request, so it gets only the recovery prompt; a fresh one needs the original. */
 export function resolveCodexRestartTransition({
   previousThreadId,
   nextThreadId,
@@ -775,23 +531,12 @@ export function resolveCodexRestartTransition({
   };
 }
 
-/**
- * Walk `${codexHome}/sessions/` for the rollout `.jsonl` whose filename
- * embeds the given thread UUID. Codex's path layout is
- * `sessions/YYYY/MM/DD/rollout-<ISO>-<threadId>.jsonl`. Returns absolute
- * path or null if nothing matches.
- *
- * Tolerates UUIDs in any case and missing date subdirs. Walks at most 3
- * levels deep (year/month/day) so a corrupted sessions tree can't lock the
- * search; returns the first match (multiple rollouts per thread aren't
- * expected in this codex version).
- */
+/** Depth-capped at year/month/day so a corrupted sessions tree cannot lock the search; returns the first match. */
 export function findRolloutFile(threadId: string, codexHome: string): string | null {
   for (const rollout of rolloutFilesFor(threadId, codexHome)) return rollout.path;
   return null;
 }
 
-/** Every rollout file under one home's `sessions/` whose name embeds the thread id, in walk order. */
 function* rolloutFilesFor(threadId: string, codexHome: string): Generator<{ path: string; stat: fs.Stats }> {
   const sessionsRoot = path.join(codexHome, 'sessions');
   if (!fs.existsSync(sessionsRoot)) return;
@@ -824,19 +569,8 @@ function* rolloutFilesFor(threadId: string, codexHome: string): Generator<{ path
 }
 
 /**
- * Copy a rollout `.jsonl` from one CODEX_HOME's sessions tree to another,
- * preserving the date subdirectory layout. The destination path mirrors the
- * source's path relative to its sessions/ root (so `sessions/2026/05/21/...`
- * lands at the same subpath under the fallback home).
- *
- * Idempotent: overwrites the destination if it exists. Creates parent dirs.
- * Returns the destination path on success, null on failure.
- *
- * Important: copying mid-turn is safe because Codex's writer appends
- * line-by-line and fsyncs per record. The destination won't capture any
- * records written after the copy starts, but those records belong to the
- * failed turn anyway (the rotation routine will replay the user input
- * against the new app-server, generating a fresh assistant response).
+ * Mirrors the date subpath under the target's sessions/. Copying mid-turn is safe: Codex appends and fsyncs per
+ * record.
  */
 export function copyRolloutToFallback(srcRollout: string, srcCodexHome: string, dstCodexHome: string): string | null {
   const srcSessionsRoot = path.join(srcCodexHome, 'sessions');
@@ -852,17 +586,7 @@ export function copyRolloutToFallback(srcRollout: string, srcCodexHome: string, 
   }
 }
 
-/**
- * Mirror the named-subagent role definitions (`<primary>/agents`) into a rotated
- * CODEX_HOME. The agents/ tree is bind-mounted ONLY at the primary home, so a
- * fallback home reached on OAuth rotation has no role TOMLs and would silently
- * lose every named subagent role (architecture-advisor, code-review-specialist,
- * …) — the exact layer the agents/ mount surfaces. Copy (not symlink): the
- * fallback home is RW and Codex reads roles from `$CODEX_HOME/agents/`. The
- * destination is an exact snapshot: retired roles must not survive a later
- * mirror, and removing the primary tree clears a stale fallback tree. No-op
- * only when src==dst or neither tree exists.
- */
+/** agents/ is mounted only at the primary home; the copy is an exact snapshot so retired roles do not survive. */
 export function mirrorCodexAgentsToHome(primaryCodexHome: string, targetCodexHome: string): boolean {
   if (primaryCodexHome === targetCodexHome) return false;
   const src = path.join(primaryCodexHome, 'agents');
@@ -915,28 +639,9 @@ export function refreshCodexAuthFromHost(activeCodexHome: string, hostCodexHome:
 }
 
 /**
- * Locate the freshest rollout for `threadId` across multiple CODEX_HOMEs.
- *
- * Why this exists: after an in-session rotation, the rollout file diverges
- * across homes. Primary holds the pre-rotation history; the fallback holds
- * the newer post-rotation history. When the container later dies (host-sweep
- * absolute-ceiling, idle timeout) and a fresh container spawns for the same
- * thread, it starts on the primary (`CODEX_HOME` is per process) and
- * `thread/resume` reads from there — finding the STALE pre-rotation rollout. Post-rotation turns are
- * stranded on the fallback; if primary is still rate-limited, rotation
- * fires again and the *stale* primary rollout overwrites the *newer*
- * fallback rollout, destroying history.
- *
- * The fix: at thread/resume time, scan all CODEX_HOMEs for rollout files
- * matching this threadId and pick the freshest. Selection key is
- * `(mtimeMs DESC, size DESC)` — mtime alone is fragile because the
- * rotation's `copyFileSync` can leave two homes with nearly-identical
- * mtimes; size as a tiebreaker prefers the one with more appended turns
- * (codex rollouts are append-only line-by-line).
- *
- * Returns null when no home contains the threadId. Skips homes whose
- * sessions tree is missing entirely (fresh fallback dirs that haven't
- * been written to yet).
+ * After a rotation the fallback holds newer history than the primary, and a respawn starts on the primary: resuming
+ * there and rotating again would overwrite the newer rollout. Ordered by (mtimeMs DESC, size DESC); size breaks the
+ * near-tie a rotation copy leaves.
  */
 export interface RolloutCandidate {
   home: string;
@@ -966,25 +671,15 @@ export class CodexProvider implements AgentProvider {
   private memorySessionHook?: MemorySessionHookRegistration;
 
   /**
-   * Ordered fallback CODEX_HOME paths from the `CODEX_FALLBACK_HOMES` env
-   * (colon-joined). Host's container-runner mounts each fallback `~/.codex*`
-   * dir at `/home/node/.codex-fallback-N/` and forwards the env var. Used
-   * with the primary as the ring `gen()` walks on `UsageLimitExceeded` /
-   * `ServerOverloaded` / coarse `systemError` (`rotateCodexHome`). The
-   * active home is `process.env.CODEX_HOME`: a rotation moves it and the next
-   * `query()` inherits it, so a container stays on the last account that
-   * worked until that one fails too.
+   * Walked as a ring with the primary. `process.env.CODEX_HOME` is the active home, so a container stays on the last
+   * account that worked.
    */
   readonly fallbackHomes: readonly string[];
   private readonly primaryCodexHome: string;
   private readonly primaryHostCodexHome: string | undefined;
 
   constructor(options: ProviderOptions = {}) {
-    // Native-first MCP wiring:
-    // - stdio stays stdio, with proxy/CA env injected for child MCP processes.
-    // - Streamable HTTP stays native Codex HTTP (url in config.toml).
-    // - the old stdio bridge is only an explicit compatibility fallback.
-    // - legacy SSE is rejected at config parse time and defensively here.
+    // The stdio bridge for HTTP servers is an explicit compatibility fallback only; SSE is rejected.
     const mcpServers: Record<string, CodexMcpServer> = {};
     const useHttpBridgeFallback = process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK === '1';
     for (const [name, cfg] of Object.entries(options.mcpServers ?? {})) {
@@ -999,11 +694,7 @@ export class CodexProvider implements AgentProvider {
       } else if (cfg?.type === 'http') {
         if (useHttpBridgeFallback) {
           const baseEnv: Record<string, string> = { REMOTE_MCP_NAME: name };
-          // The full validated header map, not just Authorization — a server
-          // wired with X-Api-Version or a custom OneCLI-managed placeholder
-          // header had every header past Authorization silently dropped by
-          // the bridge, which is a different set than the one the CLI,
-          // template, and approval flows validated and reported success on.
+          // The full header map, not just Authorization: the bridge must carry every header the approval validated.
           if (cfg.headers && Object.keys(cfg.headers).length > 0) {
             baseEnv.REMOTE_MCP_HEADERS = JSON.stringify(cfg.headers);
           }
@@ -1026,29 +717,15 @@ export class CodexProvider implements AgentProvider {
     }
     this.mcpServers = mcpServers;
 
-    // `providerConfig` describes the PRIMARY provider, so under a spawn-time
-    // provider fallback the runner deliberately empties it (see
-    // `parseRawConfig` in config.ts — codex's `reasoning_effort` key is a
-    // fatal boot error under claude's strict schema). The fallback's own
-    // declared model/effort travel on `options.model`/`options.effort`
-    // instead, so fold them in here or they are lost and the container runs
-    // codex's built-in defaults.
-    //
-    // Guarded by `=== undefined` so this is a strict no-op on the PRIMARY
-    // path: config.ts already copies the resolved codex model/effort INTO
-    // providerConfig there, and it draws them from the same chain that feeds
-    // `options.model`/`options.effort` — a declared providerConfig always
-    // wins. Values are validated first because the schema is strict and an
-    // out-of-vocabulary value (a claude model id from a mis-declared
-    // `providerFallback`) would throw at boot instead of degrading.
+    // Under a spawn-time provider fallback the runner empties `providerConfig` (it describes the primary), so the
+    // fallback's model/effort arrive on `options` and are folded in here. `=== undefined` keeps this a no-op on the
+    // primary path; values are validated first because the strict schema would otherwise throw at boot.
     const rawSticky: Record<string, unknown> = { ...(options.providerConfig ?? {}) };
     // A family alias (`sol`) anywhere in the chain resolves here, before the
     // strict schema and the `gpt-*` guard see it.
     if (typeof rawSticky.model === 'string') {
       rawSticky.model = resolveCodexFamily(rawSticky.model);
-      // Unresolved only when the host sent no alias map (a host predating
-      // `codexFamilyAliasEnv`, i.e. an adopted container).
-      // Never hand the app-server a bare family word.
+      // Unresolved only when an older host sent no alias map; never hand the app-server a bare family word.
       if (isCodexFamilyName(rawSticky.model as string)) {
         console.error(`[codex-provider] Ignoring unresolved Codex family alias "${rawSticky.model}"`);
         delete rawSticky.model;
@@ -1063,15 +740,8 @@ export class CodexProvider implements AgentProvider {
       if (CODEX_EFFORT_VALUES.has(options.effort)) rawSticky.reasoning_effort = options.effort;
       else console.error(`[codex-provider] Ignoring non-codex config effort "${options.effort}"`);
     }
-    // Defensive re-parse (R8): catches hand-edited container.json or self-mod
-    // mutations on startup before they reach codex.
     this.stickyConfig = codexConfigSchema.parse(rawSticky);
 
-    // Model precedence: stickyConfig (per-agent providerConfig, or the
-    // declared provider fallback's model folded in above) > CODEX_MODEL env
-    // (host default) > built-in default.
-    // Unpinned native Codex groups and unpinned provider fallbacks share this
-    // final default. A fallback's primary config is intentionally absent here.
     const envDefault = options.env?.CODEX_MODEL as string | undefined;
     const hostDefault = envDefault ? resolveCodexFamily(envDefault) : undefined;
     this.model =
@@ -1079,11 +749,7 @@ export class CodexProvider implements AgentProvider {
       (hostDefault && !isCodexFamilyName(hostDefault) ? hostDefault : undefined) ??
       DEFAULT_CODEX_MODEL;
 
-    // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
-    // (the host didn't mount any fallbacks). Read from process.env rather
-    // than options.env because options.env is filtered for SDK consumption
-    // — the host-side container-runner passes the var via `-e`, and Codex
-    // doesn't have an env-allowlist filter for the app-server side.
+    // Read from process.env: options.env is filtered for SDK consumption and would drop it.
     const fallbackEnv = process.env.CODEX_FALLBACK_HOMES ?? '';
     this.fallbackHomes = Object.freeze(
       fallbackEnv
@@ -1100,30 +766,13 @@ export class CodexProvider implements AgentProvider {
     }
   }
 
-  /** The credential ring in rotation order: the primary first, then each declared fallback. */
   get codexHomeRing(): readonly string[] {
     return [this.primaryCodexHome, ...this.fallbackHomes];
   }
 
   /**
-   * The next CODEX_HOME to try after `current`: the ring walked circularly,
-   * skipping every home in `tried`; null once all of them have been tried.
-   *
-   * Circular on purpose. The cursor this replaces was forward-only for the
-   * life of the provider instance: once a container had rotated to its last
-   * fallback, that account's next park ended the query with nothing left to
-   * try, and the poll-loop reported the WHOLE provider unavailable until that
-   * account's reset — while the primary, rotated away from turns earlier, had
-   * long since recovered. Observed 2026-09-16: a group parked on codex until
-   * its secondary's 2026-09-21 weekly reset with a healthy primary.
-   * `tried` is per turn (gen() creates it at the `pending.shift()` boundary —
-   * one query serves many turns), so every account is retried once per turn
-   * and only a turn on which ALL of them fail reaches the host (gen() then
-   * reports the ring's earliest reset, `earliestCodexSlotReset`). Nothing is
-   * persisted: `process.env.CODEX_HOME` carries the active home between turns
-   * and queries, and a respawn starts on the primary.
-   *
-   * Exported as a method so the gen() body and unit tests can both drive it.
+   * Circular, skipping every home in `tried` (per turn), so a recovered primary is retried; null once all were tried.
+   * Nothing persists: `process.env.CODEX_HOME` carries the active home and a respawn starts on the primary.
    */
   rotateCodexHome(current: string, tried: ReadonlySet<string>): string | null {
     const ring = this.codexHomeRing;
@@ -1145,19 +794,11 @@ export class CodexProvider implements AgentProvider {
   }
 
   /**
-   * Codex reports an exhausted account two ways: as a structured
-   * `UsageLimitExceeded` on the event path, and as a plain thrown Error
-   * carrying the CLI's own sentence on the query path ("You've hit your usage
-   * limit … try again at <date>"). Both mean the same thing to the caller, so
-   * match either — the app-server owns this wording, and a missed match only
-   * costs the old behavior (a visible error) rather than a wrong one.
+   * Matches both the structured event-path kind and the query path's thrown sentence; a miss only costs a visible
+   * error.
    */
   isQuotaExhausted(err: unknown): boolean {
-    // A provider event already classified `quota` — the structured
-    // `UsageLimitExceeded` kind, or the pre-turn rate-limit park synthesized
-    // in gen() (see `parkedTurnEvents`) — is a spent account regardless of
-    // wording; the poll-loop hands us its ProviderEventError, which carries
-    // the classification (poll-loop.ts `ProviderEventError`).
+    // A ProviderEventError classified `quota` (including the pre-turn park) is a spent account whatever its wording.
     if (err && typeof err === 'object' && (err as { classification?: unknown }).classification === 'quota') {
       return true;
     }
@@ -1168,12 +809,8 @@ export class CodexProvider implements AgentProvider {
   query(input: QueryInput): AgentQuery {
     if (!this.memorySessionHook) throw new Error('Codex memory session hook was not registered');
     const pending: string[] = [];
-    // Steering RPCs that have been issued but not settled. A steer that
-    // rejects falls back to `pending`, and that rejection is asynchronous — it
-    // can land after the poll-loop has already sampled `hasQueuedWork` at the
-    // current turn's `result`. Counting the in-flight RPC keeps the signal
-    // true across that window; `sendCodexRequest` bounds it at 60s, and the
-    // catch below queues BEFORE the decrement, so the signal never dips.
+    // A rejected steer falls back to `pending` asynchronously, possibly after `hasQueuedWork` was sampled; counting
+    // in-flight steers (bounded at 60s, decremented only after queuing) keeps that signal true across the gap.
     let steersInFlight = 0;
     let waiting: (() => void) | null = null;
     let ended = false;
@@ -1182,9 +819,6 @@ export class CodexProvider implements AgentProvider {
       waiting?.();
     };
 
-    // Mid-turn input plumbing: when the agent is mid-turn we steer the
-    // active turn instead of queueing the message. `runOneTurn` updates
-    // `currentTurnId` on turn/started + clears it on turn/completed.
     const turnTracker: { server: AppServer | null; threadId: string | null; currentTurnId: string | null } = {
       server: null,
       threadId: null,
@@ -1195,8 +829,6 @@ export class CodexProvider implements AgentProvider {
 
     const self = this;
 
-    // -m/-e flag overrides for this query (validated; invalid values fall
-    // back to configured defaults — see resolveQueryModel/resolveQueryEffort).
     const effectiveModel = resolveQueryModel(input.model, this.model);
     const effectiveConfig = resolveQueryEffort(input.effort, this.stickyConfig);
     const effectiveFast = input.fast === true;
@@ -1205,14 +837,7 @@ export class CodexProvider implements AgentProvider {
       model: effectiveModel,
       effort: effectiveConfig.reasoning_effort,
     });
-    // What this query's turns actually run at, for the turn_usage ledger.
-    // `reasoning_effort` is what reaches the app-server as
-    // `-c model_reasoning_effort`; the requested value is the raw `-e` before
-    // resolveQueryEffort validated it, so a `-e` outside Codex's vocabulary
-    // (silently ignored, staying on the sticky default) is visible as a
-    // divergence rather than looking like it took effect. Codex reports one
-    // usage entry per turn, so there is no per-model attribution to make —
-    // see providers/turn-effort.ts.
+    // `requested` is the raw `-e` before validation, so an ignored out-of-vocabulary effort shows as a divergence.
     const turnEffort = {
       model: effectiveModel,
       effective: effectiveConfig.reasoning_effort,
@@ -1220,40 +845,27 @@ export class CodexProvider implements AgentProvider {
     };
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
-      // One app-server per query invocation. The poll-loop keeps a single
-      // query active per batch of pending messages and ends it on idle, so
-      // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
       writeCodexHooksAndTrust();
       let server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
       turnTracker.server = server;
       attachCodexAutoApproval(server);
-      // Account rate-limit snapshot for this query: pulled at every server
-      // bind below, pushed via account/rateLimits/updated in between. Asked
-      // before each turn whether to park, and at each result for the window
-      // to stamp on turn_usage. See codex-rate-limit-tracker.ts.
       const rateLimits = new CodexRateLimitTracker();
 
       let threadId: string | undefined = input.continuation;
       let initYielded = false;
 
-      // Current CODEX_HOME. Tracked locally so the rotation routine can
-      // pass it into findRolloutFile (the rollout to copy lives in the home
-      // we're rotating AWAY from). Falls back to the conventional path when
-      // process.env.CODEX_HOME is unset — the codex CLI uses the same default.
+      // The rotation routine copies the rollout from the home it is rotating away from.
       let currentCodexHome = resolveCodexConfigDir();
       let primaryAuthRefreshAttempted = false;
 
       try {
         await initializeCodexAppServer(server);
-        // Fail closed on a guard chain that loaded but would never fire. Runs on
-        // EVERY spawn (11ms measured, first call) — see verifyCodexHookTrust.
+        // Fail closed on a guard chain that loaded but would never fire, on every spawn.
         await verifyCodexHookTrust(server, currentCodexHome);
         await rateLimits.bind(server, currentCodexHome);
 
-        // Codex preserves base instructions across native compaction. The
-        // lifecycle seam adds trusted static memory handling/write guidance;
-        // canonical bytes arrive per turn only in paired untrusted recall.
+        // Base instructions survive Codex's native compaction, so the static memory guidance rides there.
         const memoryContext = memoryContextForSessionStart('startup');
         const lifecycleInstructions = [runtimeInstructions, memoryContext].filter(Boolean).join('\n\n');
         const threadParams = {
@@ -1268,18 +880,8 @@ export class CodexProvider implements AgentProvider {
           ),
         };
 
-        // Cross-container rollout repair. When a prior session rotated to a
-        // fallback and that container later died, the fallback holds the
-        // newest rollout — but the fresh container starts with
-        // currentCodexHome=primary (`CODEX_HOME` is per process).
-        // Without this pass, thread/resume would read the STALE pre-rotation
-        // rollout from primary; if rotation fires again here, the in-session
-        // rotation copy would write that stale rollout OVER the newer
-        // fallback rollout, destroying history.
-        //
-        // Cost: ~4ms with current sessions-tree scale (151 files), zero when
-        // no fallbacks are configured. The fast-path skip is what makes this
-        // free for the 99% of installs not using OAuth fallback.
+        // A fresh container starts on the primary, but a prior rotation may have left newer history on a fallback;
+        // resuming the stale rollout and rotating again would overwrite it.
         if (threadId && self.fallbackHomes.length > 0) {
           const candidate = findNewestRolloutAcrossHomes(threadId, [currentCodexHome, ...self.fallbackHomes]);
           if (candidate && candidate.home !== currentCodexHome) {
@@ -1308,45 +910,19 @@ export class CodexProvider implements AgentProvider {
           const text = pending.shift()!;
           let attemptText = text;
           let controlPlaneRecoveryAttempts = 0;
-          // TURN BOUNDARY for cost attribution. One `text` off `pending` is one
-          // logical turn, and the rotation loop below can run runOneTurn several
-          // times for it, so the usage accumulator is created HERE — not inside
-          // runOneTurn (which drops every request made before a retry) and not
-          // outside this shift (which would re-book earlier turns' spend and
-          // recreate the cumulative-carry bug this replaced).
-          //
-          // It is created once and NEVER replaced. Every attempt this loop makes
-          // — same-thread recovery and fresh-thread retry alike — bills real
-          // tokens to the provider, so all of them belong to this turn's total.
-          // The fresh-thread paths reset only the thread-scoped dedupe state; see
-          // resetCodexTurnAccumulatorThread.
+          // One `text` may take several attempts (recoveries, rotations), all billed to this turn, so the accumulator
+          // is created here once and never replaced; a fresh thread resets only its dedupe state.
           const turnAccum = createCodexTurnAccumulator();
-          // Ring state is per TURN, at this same boundary. The poll-loop keeps
-          // one query open and pushes later turns into it (poll-loop.ts
-          // `pushToQuery` → `query.push`), so a set scoped to the
-          // query would keep every home marked tried after the first
-          // rotation, and a later turn's park on the fallback would find
-          // nothing left — the outage shape again. Homes this turn has run on:
-          // a rotation adds its target and `rotateCodexHome` skips them, so
-          // one turn tries each account at most once — the bound that keeps
-          // the rotation loop finite.
+          // Per turn, not per query (later turns are pushed into the same query): each account is tried at most once
+          // per turn, which keeps the rotation loop finite.
           const triedHomes = new Set<string>([currentCodexHome]);
-          // The reset instant each failed account stated this turn (null when
-          // its error carried none), in rotation order; read only once the
-          // ring is exhausted.
+          // Read only once the ring is exhausted; null when an account stated no reset.
           const slotResets: Array<string | null> = [];
 
-          // Restart loop. Each recovery branch has its own monotonic cap:
-          // one control-plane replacement, one primary-auth refresh, and
-          // each fallback home once. Do not add a shared attempt counter:
-          // it can exhaust before a capped branch gets to surface its final
-          // error, silently ending a logical user turn.
-          // Replace the app-server — on `nextHome` when rotating accounts — and
-          // resume this turn's thread on it. Each recovery branch announces
-          // itself before calling this.
+          // Each recovery branch has its own cap; a shared counter could exhaust before a capped branch surfaces its
+          // error, silently ending the user's turn.
           const restartAppServer = async (nextHome?: string): Promise<void> => {
-            // Tear down the wedged app-server, switch identity, spawn fresh.
-            // CODEX_HOME on process.env is what the app-server reads at spawn.
+            // The app-server reads CODEX_HOME from process.env at spawn.
             turnTracker.server = null;
             turnTracker.threadId = null;
             turnTracker.currentTurnId = null;
@@ -1356,14 +932,8 @@ export class CodexProvider implements AgentProvider {
               currentCodexHome = nextHome;
             }
 
-            // config.toml / hooks.json / agents/ all live under CODEX_HOME,
-            // so a new home needs all three. The writers honor CODEX_HOME
-            // (just switched above), so regenerating config + the guard hooks
-            // lands them in the fallback home — without this the rotated
-            // app-server runs UNGUARDED. agents/ is bind-mounted only at the
-            // primary, so mirror the role definitions across explicitly;
-            // the mirror is a no-op when the ring wraps back
-            // to the primary (`mirrorCodexAgentsToHome` returns on src == dst).
+            // A new home needs config, the guard hooks (or the rotated server runs unguarded) and the agents/ roles,
+            // which are mounted only at the primary.
             writeCodexMcpConfigToml(self.mcpServers);
             writeCodexHooksAndTrust();
             if (nextHome) mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
@@ -1376,10 +946,7 @@ export class CodexProvider implements AgentProvider {
             await verifyCodexHookTrust(server, currentCodexHome);
             await rateLimits.bind(server, currentCodexHome);
 
-            // Re-resume the thread. If it resumes, threadId stays the same and
-            // history continues. If not, startOrResume falls back to a fresh
-            // thread via STALE_THREAD_RE and returns a new id — re-emit init so
-            // the poll loop updates its continuation.
+            // A fresh thread gets a new id: re-emit init so the poll-loop updates its continuation.
             const previousThreadId: string | undefined = threadId;
             threadId = await startOrResumeCodexThread(server, threadId, threadParams);
             turnTracker.threadId = threadId ?? null;
@@ -1400,32 +967,9 @@ export class CodexProvider implements AgentProvider {
           while (rotateAndRetry) {
             rotateAndRetry = false;
 
-            // One turn = one channel of streaming events. Each notification
-            // from the app-server yields an `activity` first (so the
-            // poll-loop's idle timer stays honest) and then, where relevant,
-            // an init / result / progress event.
-            //
-            // We inspect each event while re-yielding it. Confirmed control-
-            // plane failures are recovered here by interrupting when possible,
-            // replacing only app-server, resuming the persisted thread, and
-            // continuing once. Other hard errors still return from gen() so
-            // its finally tears down the per-query app-server cleanly.
-            //
-            // EXCEPTION: when the error's classification matches a
-            // rotation-eligible kind AND we have a fallback CODEX_HOME
-            // available, transparently swap identity and retry instead of
-            // surfacing the error.
-            //
-            // PRE-TURN PARK (plan item 0.7). Before spending a turn on this
-            // account, consult the rate-limit snapshot. At the weekly park
-            // threshold, or with a limit already reached, the turn is
-            // replaced by a synthetic `quota` error so the SAME branches
-            // below handle it: rotate to a fallback CODEX_HOME when one is
-            // left (that home's own snapshot is read at bind and checked on
-            // the retry), else surface it — the poll-loop reports it to the
-            // host, which parks (agent_group, 'codex') until the window's
-            // reset and respawns the session on the group's providerFallback.
-            // A failed read leaves the snapshot empty, which never parks.
+            // A pre-turn park replaces the turn with a synthetic `quota` error so the branches below rotate to a
+            // fallback or surface it for the host to park. A failed rate-limit read leaves the snapshot empty and
+            // never parks.
             await rateLimits.refreshIfStale();
             const preTurnPark = rateLimits.parkDecision();
             if (preTurnPark) console.error(`[codex-provider] pre-turn park: ${preTurnPark.message}`);
@@ -1470,10 +1014,7 @@ export class CodexProvider implements AgentProvider {
                     ),
                   };
 
-                  // A responsive but inconsistent server gets a graceful
-                  // interrupt. An unresponsive server already failed three
-                  // bounded probes, so waiting on another RPC only delays
-                  // recovery; replace it directly.
+                  // An unresponsive server already failed its probes, so only a desynced one gets an interrupt first.
                   if (ev.classification === 'protocol_desync' && turnTracker.threadId && turnTracker.currentTurnId) {
                     try {
                       await interruptCodexTurn(
@@ -1519,17 +1060,9 @@ export class CodexProvider implements AgentProvider {
                 const nextHome = eligible ? self.rotateCodexHome(currentCodexHome, triedHomes) : null;
                 if (nextHome) {
                   triedHomes.add(nextHome);
-                  // 1-based position in the ring (primary = 1), for the
-                  // status line and the notice to the resumed thread.
                   const position = self.codexHomeRing.indexOf(nextHome) + 1;
                   const ringSize = self.codexHomeRing.length;
-                  // Best-effort: copy the active rollout into the new
-                  // CODEX_HOME's sessions tree so thread/resume reconstructs
-                  // history inline. If the rollout doesn't exist yet (first
-                  // turn) or the copy fails, the new app-server falls back
-                  // to a fresh thread via STALE_THREAD_RE in
-                  // startOrResumeCodexThread — conversation context is lost
-                  // but the turn still completes.
+                  // Best-effort: without the rollout the new server starts a fresh thread and history is lost.
                   let rolloutCopied = false;
                   if (threadId) {
                     const src = findRolloutFile(threadId, currentCodexHome);
@@ -1539,9 +1072,6 @@ export class CodexProvider implements AgentProvider {
                     }
                   }
 
-                  // Visible status — better than swallowing the rotation
-                  // silently. Uses progress so it flows through the same
-                  // edit-in-place surface as the thinking labels.
                   yield {
                     type: 'progress',
                     message: formatBlockquoteLabel(
@@ -1552,30 +1082,15 @@ export class CodexProvider implements AgentProvider {
                   };
 
                   await restartAppServer(nextHome);
-                  // Credential rotation, specifically — unlike the
-                  // control-plane-recovery and primary-auth-refresh
-                  // branches above, this is the one where the PRIOR
-                  // credential actually hit its usage limit. Tell the
-                  // resumed/restarted thread explicitly so it doesn't read
-                  // its own prior turn's "rate limited" narrative (if any
-                  // survived into `attemptText`) as still describing this
-                  // attempt.
+                  // Only this branch means the prior credential hit its limit: tell the thread, so it does not read
+                  // its own earlier "rate limited" narrative as describing this attempt.
                   attemptText += '\n\n' + formatCredentialRotationNotice({ position, ringSize });
 
                   rotateAndRetry = true;
-                  break; // exit for-await; the outer rotation while re-runs
+                  break;
                 }
-                // Not eligible, or every account in the ring has failed this
-                // query: surface the error and end the query. When more than
-                // one account was tried, the error carries the ring's EARLIEST
-                // stated reset — the host parks the whole provider on that
-                // instant (poll-loop.ts `reportProviderUnavailable` →
-                // provider_health), and the provider is back the moment its
-                // first account is, not when its last one is.
-                // Gated on `eligible` too: an ineligible error after a rotation
-                // (a control-plane failure past its cap on the fallback) has
-                // not tried the rest of the ring, so it keeps its own reset
-                // and message.
+                // Ring exhausted: report the earliest stated reset, so the provider returns with its first account.
+                // Gated on `eligible`: an ineligible error after a rotation has not tried the rest of the ring.
                 if (eligible && triedHomes.size > 1) {
                   yield {
                     ...ev,
@@ -1587,13 +1102,7 @@ export class CodexProvider implements AgentProvider {
                 }
                 return;
               }
-              // Stamp the effort this query is running at onto the turn's
-              // usage. Done here rather than in runOneTurn because this is
-              // where the resolved config lives; runOneTurn only ever sees a
-              // model string.
-              // `rateLimit` is the latest snapshot's weekly window (or the
-              // five-hour one), so turn_usage.rate_limit_* is populated for
-              // Codex turns the way the Claude provider populates it.
+              // Stamped here because this is where the resolved effort config lives.
               yield ev.type === 'result'
                 ? { ...ev, usage: attachTurnEffort(ev.usage, turnEffort), rateLimit: rateLimits.turnRateLimit() }
                 : ev;
@@ -1609,18 +1118,11 @@ export class CodexProvider implements AgentProvider {
     }
 
     return {
-      // What this query actually runs, already resolved above. Codex always
-      // names a model (`stickyConfig.model ?? CODEX_MODEL ?? DEFAULT_CODEX_MODEL`), so
-      // there is no unknown case here.
       resolvedModel: effectiveModel,
-      // The effort the app-server was actually configured with, not the `-e`
-      // that asked for it — same value `turnEffort.effective` reports (:1239).
+      // The effort the app-server was configured with, not the requested `-e`.
       resolvedEffort: effectiveConfig.reasoning_effort ?? null,
       push: (message: string) => {
-        // If a turn is in flight, steer it instead of queueing — the agent's
-        // response can then reference the late-arriving content. Falls back
-        // to queueing on RPC error (e.g. the turn just ended between our
-        // check and the call) and on missing handles.
+        // Steer an in-flight turn; queue on RPC error (the turn may have just ended) or missing handles.
         if (turnTracker.server && turnTracker.threadId && turnTracker.currentTurnId) {
           const expectedTurnId = turnTracker.currentTurnId;
           steersInFlight += 1;
@@ -1643,12 +1145,8 @@ export class CodexProvider implements AgentProvider {
         pending.push(message);
         kick();
       },
-      // Steering keeps the push inside the running turn, but the fallbacks
-      // above queue it as a separate future turn — same shape as opencode.
-      // An unsettled steer counts too: its rejection queues asynchronously,
-      // after the poll-loop may already have sampled this. Reported so the
-      // poll-loop doesn't publish idle in the gap before a queued turn
-      // starts. See AgentQuery.hasQueuedWork.
+      // A fallback queues a separate future turn and an unsettled steer's rejection queues asynchronously, so both
+      // count, or the poll-loop publishes idle in the gap.
       hasQueuedWork: () => pending.length > 0 || steersInFlight > 0,
       end: () => {
         ended = true;
@@ -1663,25 +1161,19 @@ export class CodexProvider implements AgentProvider {
   }
 }
 
-// Per-turn totals summed across ONE logical turn. Owned by the caller so it outlives a
-// single runOneTurn attempt — see the LIFETIME note inside runOneTurn.
+// Owned by the caller: one logical turn spans several runOneTurn attempts.
 export type CodexTurnAccumulator = {
   seen: boolean;
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
   cacheWriteInputTokens: number;
-  // `item/completed` count — the turn's step proxy. Same struct as the token
-  // counters on purpose: both are per-turn totals with the same lifetime, so
-  // one reset can't be remembered and the other forgotten.
+  // On the same struct as the tokens so the two cannot be reset separately.
   steps: number;
-  // Item ids already counted into `steps`. Same replay exposure as the token
-  // counters: a resumed app-server that re-emits `item/completed` for items
-  // the pre-crash attempt already counted would inflate `steps`, and `steps`
-  // is the denominator of output_per_step.
+  // A resumed app-server can re-emit item/completed for items already counted, inflating the output_per_step
+  // denominator.
   countedItemIds: Set<string>;
-  // Serialized previous `tokenUsage` payload — the duplicate-emission guard.
-  // See the `thread/tokenUsage/updated` handler.
+  // Duplicate-emission guard; see the `thread/tokenUsage/updated` handler.
   lastUsageKey: string | null;
 };
 
@@ -1699,38 +1191,14 @@ export function createCodexTurnAccumulator(): CodexTurnAccumulator {
 }
 
 /**
- * A fresh-thread retry keeps the turn's billed totals and drops only the state
- * that belonged to the thread that went away.
- *
- * The totals carry because the failed attempt's tokens were genuinely billed by
- * the provider. They are never added twice — the fresh attempt's requests are
- * distinct requests — so clearing them here does not prevent a double-count, it
- * silently discards real spend.
- *
- * Both dedupe guards DO reset, because each keys on a value the new thread
- * re-issues from scratch:
- *  - `lastUsageKey` is the adjacent-duplicate guard. A fresh thread's first
- *    payload is `{last: X, total: X}` — exactly the shape the failed attempt's
- *    FIRST payload had, and the fresh attempt re-sends the same prompt, so those
- *    counts can match byte-for-byte. A carried key would suppress a genuine
- *    request rather than a repeat.
- *  - `countedItemIds` holds server-assigned ids from a thread that no longer
- *    exists. A fresh app-server may reuse them, which would undercount `steps` —
- *    the denominator of output_per_step.
- *
- * The same-thread recovery path resets NEITHER: there the resumed app-server
- * really can replay records the pre-crash attempt already counted, which is the
- * exposure both guards exist for.
+ * A fresh-thread retry keeps the billed totals (the failed attempt's tokens were real spend) and resets both dedupe
+ * guards, which key on values the new thread re-issues. Same-thread recovery resets neither: a resumed app-server
+ * can replay records already counted.
  */
 export function resetCodexTurnAccumulatorThread(accum: CodexTurnAccumulator): void {
   accum.countedItemIds.clear();
   accum.lastUsageKey = null;
 }
-
-// ── Per-turn event pump ─────────────────────────────────────────────────────
-// Pulled out because the gen() loop above reads cleaner with it extracted,
-// and because it's a natural seam for future unit tests that drive it with
-// a fake notification stream.
 
 export async function* runOneTurn(
   server: AppServer,
@@ -1745,77 +1213,25 @@ export async function* runOneTurn(
   recoveryAttempts = 0,
   turnAccum: CodexTurnAccumulator = createCodexTurnAccumulator(),
 ): AsyncGenerator<ProviderEvent> {
-  // Mutable refs via object properties — TS can't track closure assignments
-  // for narrowing, but property access keeps the declared type visible.
-  //
-  // `errorKind` carries Codex's structured `codexErrorInfo.type` enum
-  // (e.g. `UsageLimitExceeded`, `ServerOverloaded`, `Unauthorized`,
-  // `ContextWindowExceeded`) when present on a `turn/completed: failed`
-  // payload. Used by callers to decide whether an error is rotation-eligible
-  // (quota-flavored) vs terminal (auth/context).
+  // `errorKind` is Codex's structured `codexErrorInfo.type`, which decides rotation eligibility.
   const turnState: { error: Error | null; errorKind: string | null } = { error: null, errorKind: null };
   let resultText = '';
   let turnDone = false;
-  // Set when a SPAWNED CHILD agent's turn died on a quota error. Kept out of
-  // `turnState` until the turn actually ends because `completeTurn` /
-  // `finishForLivenessFailure` both overwrite `turnState.error` on their own
-  // terminal paths — this failure has to survive those, since it is the one
-  // that says "this credential slot is spent" and therefore the one the
-  // rotation path needs to see. Applied to `turnState` at the single point
-  // where the classification is read. See detectCodexChildAgentQuotaFailure.
+  // Kept out of `turnState` until the turn ends: completeTurn and finishForLivenessFailure overwrite
+  // `turnState.error`, and this is the failure the rotation path must see.
   let childAgentQuotaError: string | null = null;
-  // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up): Codex's
-  // app-server protocol has no single "API round-trip count" field the way
-  // the Claude SDK's num_turns does. `item/completed` — one per tool call,
-  // command execution, reasoning block, or agent message the turn produced —
-  // is the closest available proxy: not a literal HTTP request count, but the
-  // best signal this protocol exposes rather than a guess. It lives on the
-  // same accumulator as the token counters — see LIFETIME below.
+  // Usage sums per-request `last` from `thread/tokenUsage/updated`, never `total`: the thread is persisted, so a
+  // respawned app-server replays a carried-forward `total` and the prior history would book as one turn. `seen`
+  // keeps a genuine all-zero turn distinct from an unreported one. No cost field exists (plan billing), so cost_usd
+  // stays NULL; `item/completed` count is the closest proxy for round trips.
   //
-  // Fleet Hardening Phase 0.1 (see TurnUsageInfo). `thread/tokenUsage/updated`
-  // fires once per MODEL REQUEST and carries both `last` (that one request)
-  // and `total` (the THREAD's running total). A turn makes as many requests as
-  // it takes tool-calling round trips, so `last` on its own is NOT the turn —
-  // recording only the final one undercounted codex by ~1-2 orders of
-  // magnitude. Summing `last` across the turn is.
-  //
-  // Reporting `total` and deltaing it downstream (what turn-usage.ts's
-  // toTurnDelta does for Claude) would be WRONG here, because codex's counter
-  // is not process-local: the thread is persisted and a respawned container
-  // resumes it, so the fresh app-server replays a carried-forward `total`
-  // against an empty in-memory baseline (turn-usage.ts's memo is a module
-  // global) — the whole pre-restart thread history books as one turn, and the
-  // reset check cannot catch it because the value went UP, not down. Summing
-  // per-request `last` depends on nothing outside this turn, so a respawn
-  // mid-thread costs at most the requests already made before the kill.
-  // Verified against codex 0.145.0's rollout log: consecutive `total`
-  // differences equal each record's own `last`.
-  //
-  // No cost field exists on this protocol (ChatGPT-plan billing, not
-  // per-token pricing) — cost_usd stays NULL for codex. `seen` (rather than
-  // "are the counters still zero") keeps a genuine all-zero turn distinct from
-  // a turn the app-server never reported usage for, which stays a NULL-token
-  // row so the gap remains visible. Object-property refs (not bare `let`s) for
-  // the same reason as `turnState` above — TS can't track closure assignments
-  // for narrowing, but property access keeps the declared type visible.
-  //
-  // LIFETIME: the accumulator is owned by the CALLER (see gen()), not declared
-  // here, because ONE logical turn can span several runOneTurn invocations —
-  // the outer retry loop re-invokes this generator on a same-thread recovery,
-  // and the model requests made before that crash belong to the same turn.
-  // Codex can deliver reasoning two ways: streaming `item/reasoning/…` deltas
-  // when enabled by the app-server, or finalized reasoning ThreadItems via
-  // item/completed. Streamed item IDs are tracked so lifecycle fallback
-  // payloads do not duplicate already-forwarded summaries.
+  // Reasoning arrives as streamed deltas or as completed items; streamed ids are tracked so items do not duplicate.
   let reasoningBuffer = '';
   const reasoningItemsWithDeltas = new Set<string>();
   const emittedReasoningItemIds = new Set<string>();
   const emittedImageKeys = new Set<string>();
   const emittedCollaborationItemIds = new Set<string>();
 
-  // Buffered event queue so we can `yield` across the async notification
-  // callback. Each notification pushes zero or more ProviderEvents; the
-  // generator drains the buffer.
   const buffer: ProviderEvent[] = [];
   let waker: (() => void) | null = null;
   const kick = (): void => {
@@ -1849,31 +1265,13 @@ export async function* runOneTurn(
     buffer.push({ type: 'file', path: filePath });
   };
 
-  // Child-thread ids this turn's subagents ran in, for the status subtext.
-  // `SubAgentActivityItem` carries the id and the agent path but NOT the
-  // model or effort — those live on the thread it points at.
-  //
-  // READ AS SOON AS A CHILD APPEARS, not only at turn end. With
-  // outcome reporting on (the default) the agent replies through
-  // send_message mid-turn, and that row is stamped from the persisted
-  // snapshot at the moment it is written. A roster enriched only after the
-  // turn completes arrives after the reply already went out, so a default
-  // Codex install showed `2x /root/researcher` with no model or effort. A
-  // child's model and effort are fixed when it is spawned, and a worker runs
-  // long before the parent can report its results, so a read started on the
-  // first activity item finishes well before the reply.
-  //
-  // Reads coalesce: one in flight at a time, and a spawn that lands during a
-  // read requests exactly one follow-up. Non-throwing (readCodexSubagentThreads
-  // returns [] on any failure), and never awaited on the stream path.
+  // Read the roster as soon as a child appears, not at turn end: with outcome reporting the reply goes out mid-turn,
+  // stamped from the snapshot at that moment. Reads coalesce and are never awaited on the stream path.
   const subagentThreadIds = new Set<string>();
   let rosterRead: Promise<void> | null = null;
   let rosterReadAgain = false;
-  // Set in this turn's `finally`. A read still in flight when the turn ends on
-  // an error path (the success path awaits it) must not write into the roster
-  // poll-loop has since cleared: that would stamp THIS turn's workers onto the
-  // NEXT turn's reply. Not awaited in `finally` instead, because against a dead
-  // server that would add a full request timeout to teardown.
+  // A read still in flight after an error-path end must not write into the next turn's roster; not awaited in
+  // `finally` because against a dead server that adds a full request timeout.
   let rosterTurnOver = false;
   const enrichRoster = (): void => {
     if (rosterRead) {
@@ -1906,15 +1304,12 @@ export async function* runOneTurn(
         agentPath?: unknown;
       };
       if (activity.type === 'subAgentActivity') {
-        // camelCase on the generated TS schema, snake_case on the Rust wire
-        // type — which arrives depends on the app-server build, so read both.
+        // camelCase or snake_case depending on the app-server build: read both.
         const id = activity.agentThreadId ?? activity.agent_thread_id;
         if (typeof id === 'string' && id) {
           const firstSighting = !subagentThreadIds.has(id);
           subagentThreadIds.add(id);
-          // Identity now, model/effort after the thread read below. Recording
-          // the path immediately means a turn whose thread list fails still
-          // reports that it delegated, and to what.
+          // Record the path now so a turn whose thread list fails still reports that it delegated.
           recordSubagent(id, { type: typeof activity.agentPath === 'string' ? activity.agentPath : null });
           // One read per child, not per activity item: a worker emits many.
           if (firstSighting) enrichRoster();
@@ -1932,14 +1327,8 @@ export async function* runOneTurn(
     | undefined;
 
   /**
-   * Upstream does NOT fail the parent turn when a spawned child agent errors
-   * — it injects the child's error into the parent as prose and lets the
-   * parent keep going. On a quota error that means the parent runs on against
-   * a spent credential slot, and nothing in `turnState` ever tells the
-   * rotation path why. End the turn here instead, attributed as the parent's
-   * own quota failure, so `classifyCodexError` →
-   * `isCodexOAuthRotationEligible` → `rotateCodexHome` + app-server respawn
-   * runs unchanged. First detection wins; later items cannot downgrade it.
+   * Upstream does not fail the parent turn when a child errors, so a child quota failure ends the turn here as the
+   * parent's own, routing it through the unchanged rotation path. First detection wins.
    */
   const noteChildAgentQuotaFailure = (item: unknown): void => {
     if (childAgentQuotaError) return;
@@ -1951,23 +1340,18 @@ export async function* runOneTurn(
       type: 'progress',
       message: formatBlockquoteLabel('↻', 'A Codex subagent exhausted this account; rotating credentials and retrying'),
     });
-    // Ending the turn is what actually stops the burn: the app-server is torn
-    // down by the rotation path in gen(), which is this provider's equivalent
-    // of interrupting the in-flight query.
+    // Ending the turn is what stops the burn: the rotation path tears the app-server down.
     if (!turnDone) {
       turnDone = true;
       kick();
     }
   };
 
-  // Codex may deliver completed ThreadItems live, only in turn/completed, or
-  // both. Keep all user-visible restoration and liveness bookkeeping here so
-  // those delivery paths remain observationally equivalent.
+  // Items may arrive live, only in turn/completed, or both; all bookkeeping lives here so the paths stay equivalent.
   const reduceCompletedThreadItem = (item: CompletedThreadItem): void => {
     liveness.noteItemCompleted(item);
 
-    // Count each item once per turn. The id-less case still counts — there is
-    // nothing to dedupe on, and dropping it would undercount.
+    // Id-less items still count: there is nothing to dedupe on.
     const stepItemId = typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : '';
     if (!stepItemId || !turnAccum.countedItemIds.has(stepItemId)) {
       turnAccum.steps++;
@@ -1985,13 +1369,10 @@ export async function* runOneTurn(
   const isTerminalThreadItemPayload = (item: unknown): boolean => {
     if (!item || typeof item !== 'object') return false;
     const { status, type } = item as { status?: unknown; type?: unknown };
-    // A completed-turn snapshot can still explicitly report a blocking item
-    // as in progress. Preserve that signal for liveness recovery instead of
-    // treating it as a completed item just because it appeared in the payload.
+    // An explicit inProgress in a completed-turn snapshot is kept for liveness recovery.
     if (status === 'inProgress') return false;
     if (isCodexTerminalTurnItem(item)) return true;
-    // Assistant/reasoning items have no status in current Codex snapshots;
-    // their presence in an authoritative completed turn is terminal output.
+    // Statusless agentMessage/reasoning items in a completed turn are terminal output.
     return status === undefined && (type === 'agentMessage' || type === 'reasoning');
   };
   let healthTimer: ReturnType<typeof setInterval> | null = null;
@@ -2052,9 +1433,7 @@ export async function* runOneTurn(
         descendantStatuses: raw.descendantStatuses.map(normalizeCodexThreadStatus),
       });
 
-      // A successful control-plane round trip is real liveness even when the
-      // model/tool emitted no user-visible event. The poll-loop converts this
-      // activity event into the host heartbeat file touch.
+      // A successful round trip is liveness even with no visible event; the poll-loop turns it into a heartbeat.
       buffer.push({ type: 'activity' });
       if (decision.kind === 'recover') {
         finishForLivenessFailure(decision.classification, decision.reason);
@@ -2079,8 +1458,7 @@ export async function* runOneTurn(
       }
     } catch (err) {
       if (turnDone) return;
-      // A notification arriving while the probe was pending proves the
-      // control plane is alive; do not count a raced request timeout.
+      // A notification during the probe proves liveness; do not count a raced request timeout.
       if (liveness.snapshot().lastNotificationAtMs > probeStartedAtMs) {
         liveness.noteProbeSuccess({ rootStatus: 'unknown', descendantStatuses: [] });
         return;
@@ -2114,12 +1492,8 @@ export async function* runOneTurn(
     let completedTurn = p.turn;
     const initialStatus = completedTurn?.status ?? p.status;
 
-    // Current Codex app-server can guarantee turn/completed while omitting
-    // turn.items under notification backpressure. It can also explicitly mark
-    // a non-empty payload as `itemsView: summary`, which is not authoritative.
-    // Match the official `codex exec` recovery and extend it to the protocol's
-    // explicit partial-view marker before deciding that a locally open
-    // execution item was abandoned.
+    // turn.items can be omitted under backpressure or marked a non-full `itemsView`; backfill (as `codex exec` does)
+    // before concluding an open execution item was abandoned.
     const completedTurnId = completedTurn?.id ?? turnTracker?.currentTurnId ?? null;
     const items = completedTurn?.items;
     const hasExplicitNonFullItemsView = completedTurn?.itemsView !== undefined && completedTurn.itemsView !== 'full';
@@ -2155,10 +1529,7 @@ export async function* runOneTurn(
     const snapshotItemsAreAuthoritative = completedTurn?.itemsView === undefined || completedTurn.itemsView === 'full';
     if (snapshotItemsAreAuthoritative && Array.isArray(completedTurn?.items)) {
       for (const item of completedTurn.items) {
-        // Scanned unconditionally, ahead of the terminality gate: the injected
-        // inter-agent completion message is not necessarily an
-        // agentMessage/reasoning item, so `isTerminalThreadItemPayload` can
-        // legitimately reject the one item that carries the child's failure.
+        // Scanned before the terminality gate: the item carrying a child's failure may not be a terminal item type.
         noteChildAgentQuotaFailure(item);
         if (isTerminalThreadItemPayload(item)) reduceCompletedThreadItem(item as CompletedThreadItem);
       }
@@ -2172,8 +1543,7 @@ export async function* runOneTurn(
       turnState.error = new Error(error?.message || 'Turn failed');
       if (typeof kind === 'string') turnState.errorKind = kind;
     } else if (status === 'interrupted') {
-      // Interruption is an explicit terminal state, not evidence that the
-      // app-server lost execution lifecycle state.
+      // An explicit terminal state, not evidence of lost lifecycle state.
       turnState.error = new Error('Turn interrupted');
     } else if (turnEndDecision.kind === 'recover') {
       if (turnTracker) turnTracker.currentTurnId = null;
@@ -2199,9 +1569,7 @@ export async function* runOneTurn(
     );
 
     if (!isActiveTurnNotification) {
-      // Child/older-turn traffic still proves the shared app-server control
-      // plane is responsive, but it must never mutate the root turn's item
-      // tracker, result text, error, or completion state.
+      // Other turns' traffic proves liveness but must never mutate this turn's state.
       liveness.noteNotification();
     } else if (method === 'item/started') {
       liveness.noteItemStarted(params.item);
@@ -2211,9 +1579,6 @@ export async function* runOneTurn(
       liveness.noteNotification();
     }
 
-    // Every inbound notification counts as activity for the poll-loop's
-    // idle timer — yield before any event-specific translation so even
-    // long tool executions keep the loop awake.
     buffer.push({ type: 'activity' });
 
     if (!isActiveTurnNotification) {
@@ -2249,55 +1614,18 @@ export async function* runOneTurn(
         break;
       }
       case 'thread/tokenUsage/updated': {
-        // See turnAccum above — `last` is ONE model request and this
-        // notification fires per request, so the sum of every `last` seen
-        // between turn/started and turn/completed IS this turn's usage.
-        // `total` is deliberately ignored: it is thread-scoped and survives
-        // container respawns, which no in-process baseline can subtract.
         const usage = (params as { tokenUsage?: Record<string, unknown> }).tokenUsage;
         const last = (params as { tokenUsage?: { last?: CodexTokenUsageBreakdown } }).tokenUsage?.last;
 
-        // Duplicate-emission guard. Codex re-emits this notification with a
-        // byte-identical payload: over 209 local rollouts (305,129 records)
-        // 4,630 adjacent pairs carried an identical running counter AND an
-        // identical `last`, which summing `last` double-counts — measured at
-        // 2.88% of input tokens fleet-wide, 1.48x on the worst session. (The
-        // old `total`-delta reading was immune because a repeat is a zero
-        // delta; the sum is not, which is why the guard has to be explicit.)
-        //
-        // The key is the whole `tokenUsage` object rather than the running
-        // counter alone, because that is exactly the shape measured as
-        // repeating, and because it keeps this a duplicate KEY and never a
-        // token VALUE — the running counter stays unusable as a number here
-        // (it is thread-scoped and survives respawns; see the accumulator
-        // note above and the guard test in codex.recovery-integration.test.ts).
-        //
-        // No false-positive risk when the payload carries the running
-        // counter: a genuine second request always advances it, so an
-        // unchanged payload cannot be a distinct request. When it does NOT
-        // carry one there is no monotonic evidence, so the guard stands down
-        // rather than risk dropping a real request.
+        // Codex re-emits byte-identical usage payloads (measured ~2.9% of input tokens), which summing `last` would
+        // double-count. Only a payload carrying the running counter can be judged a repeat; without it the guard
+        // stands down rather than drop a real request.
         const usageKey = usage && 'total' in usage ? JSON.stringify(usage) : null;
         const isRepeat = usageKey !== null && usageKey === turnAccum.lastUsageKey;
         turnAccum.lastUsageKey = usageKey;
 
-        // Context occupancy for the status subtext, taken from Codex's OWN
-        // definition: `TokenUsage::tokens_in_context_window()` returns
-        // `total_tokens` (codex-rs/protocol/src/protocol.rs). It is read off
-        // `last` — one request — never off the thread-scoped running counter,
-        // which survives respawns and measures the thread, not the window.
-        //
-        // Deliberately NOT `inputTokens + cachedInputTokens`: in this protocol
-        // `cached_input_tokens` is a SUBSET of `input_tokens` (the same source
-        // defines `non_cached_input() = input_tokens - cached_input()`), so
-        // summing them double-counts the cached prefix. The opposite of
-        // Anthropic's convention, where the three prompt counters are disjoint
-        // — which is why each provider reports a finished figure here instead
-        // of handing raw fields to a shared seam.
-        //
-        // Unlike the accumulator below, this is a LATEST-WINS reading, so it
-        // needs no duplicate guard: a re-emitted payload re-reports the same
-        // window and overwrites the value with itself.
+        // Codex's own occupancy is `last.totalTokens`: `cached_input_tokens` is a SUBSET of input here, so summing
+        // them would double-count. Latest-wins, so a repeated payload needs no guard.
         if (last) recordContextTokens(last.totalTokens);
 
         if (last && !isRepeat) {
@@ -2310,13 +1638,8 @@ export async function* runOneTurn(
         break;
       }
       case 'item/started': {
-        // Surface both the legacy collab tool-call shape and Codex 0.144.1's
-        // native sub-agent lifecycle events. Some app-server versions also
-        // repeat ThreadItems at completion; the required item ID dedupes them.
         emitCollaborationProgress(params.item);
-        // Cheap second look at the start of an item's life: some app-server
-        // versions carry an injected item's full text on item/started, and
-        // catching it there saves a round trip on the spent slot.
+        // A child's quota failure can already be visible on item/started; catching it here saves a round trip.
         noteChildAgentQuotaFailure(params.item);
         break;
       }
@@ -2334,10 +1657,6 @@ export async function* runOneTurn(
       }
       case 'item/reasoning/summaryTextDelta':
       case 'item/reasoning/textDelta': {
-        // Codex emits one of these (per `show_raw_agent_reasoning` config —
-        // default false → summary deltas). Accumulate until a section
-        // break or turn end flushes as a 💭 thinking label, mirroring
-        // Claude's thinking-block UX. Suppressed when NANOCLAW_HIDE_THINKING=1.
         const itemId = (params as { itemId?: unknown }).itemId;
         if (typeof itemId === 'string') {
           reasoningItemsWithDeltas.add(itemId);
@@ -2350,9 +1669,7 @@ export async function* runOneTurn(
       case 'item/reasoning/summaryPartAdded': {
         const itemId = (params as { itemId?: unknown }).itemId;
         if (typeof itemId === 'string') reasoningItemsWithDeltas.add(itemId);
-        // Codex finalized a reasoning summary section. Emit whatever we
-        // accumulated so the user sees thinking updates as they happen,
-        // not just one giant label at turn end.
+        // Flush per section so thinking streams rather than arriving as one label at turn end.
         flushReasoning();
         break;
       }
@@ -2366,21 +1683,8 @@ export async function* runOneTurn(
         break;
       }
       case 'thread/status/changed': {
-        // Codex's thread/status/changed payload shape varies by app-server
-        // version. Some versions emit params.status as a plain string;
-        // others emit a structured object (e.g. { state: 'thinking',
-        // detail: '...' }, or { type: 'systemError' }). Extract the most
-        // useful human-readable label; never let template coercion produce
-        // "[object Object]".
-        //
-        // Drop the trivial "active" / "idle" labels — they fire on every
-        // turn-state flip, so the chat-side status message (which the host
-        // delivers as edit-in-place) ends up overwriting the 💭 thinking
-        // labels emitted from `item/reasoning/…` with "status: active". The
-        // Claude provider hit the analogous problem with tool_use labels
-        // overwriting thinking and resolved it the same way.
-        // Anything more semantic that codex might emit (compacting,
-        // loading skills, etc.) still gets forwarded.
+        // Payload shape varies by version (string or object). `active`/`idle` are dropped: they would overwrite the
+        // 💭 thinking labels in the edit-in-place status message.
         const raw = params.status;
         let label: string | null = null;
         if (typeof raw === 'string') {
@@ -2390,14 +1694,8 @@ export async function* runOneTurn(
           const candidate = obj.label ?? obj.state ?? obj.status ?? obj.kind ?? obj.type ?? obj.message ?? obj.text;
           label = typeof candidate === 'string' ? candidate : JSON.stringify(raw);
         }
-        // `systemError` is a thread-fatal state — Codex stops processing the
-        // turn but the follow-up `turn/completed: failed` is unreliable
-        // across app-server versions (observed wedge in 0.130.0: 30-min idle
-        // until host-sweep ceiling killed the container). End the turn here
-        // so the caller can react instead of waiting for a notification that
-        // may never come. errorKind stays null because thread/status/changed
-        // carries no structured detail — rotation logic should treat that as
-        // "unknown, conservative-rotate" rather than "definitely auth/context".
+        // systemError is thread-fatal and the follow-up turn/completed is unreliable, so end the turn here rather
+        // than wait for the host ceiling. It carries no structured detail, so errorKind stays null.
         if (label === 'systemError') {
           turnState.error = new Error('codex_system_error: thread entered systemError state');
           if (turnTracker) turnTracker.currentTurnId = null;
@@ -2410,8 +1708,6 @@ export async function* runOneTurn(
         break;
       }
       default:
-        // Silently handle the many `item/…` notifications — they already
-        // contributed an activity event above.
         break;
     }
 
@@ -2420,9 +1716,7 @@ export async function* runOneTurn(
 
   server.notificationHandlers.push(handler);
 
-  // Publish the entire Codex turn as host-visible work. Successful protocol
-  // probes refresh the heartbeat, so the one-hour value is now only the host's
-  // catastrophic fallback if this in-container recovery loop itself stops.
+  // One hour is only the host's fallback if this in-container recovery loop itself stops.
   try {
     setContainerToolInFlight('CodexItem', CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS);
   } catch (err) {
@@ -2434,8 +1728,7 @@ export async function* runOneTurn(
   }, healthConfig.intervalMs);
 
   try {
-    // If we yield init before turn/start, the poll-loop stores
-    // continuation early and survives a mid-turn crash.
+    // Yield init before turn/start so the continuation is stored before a mid-turn crash.
     if (!hasInit()) {
       markInit();
       buffer.push({ type: 'init', continuation: threadId });
@@ -2458,30 +1751,14 @@ export async function* runOneTurn(
 
     while (buffer.length > 0) yield buffer.shift()!;
 
-    // A child agent's quota failure is the parent turn's failure too — the
-    // slot it is running on is spent. Attribute it exactly as a structured
-    // `UsageLimitExceeded` on this turn so the existing classification and
-    // rotation path below needs no special case. Deliberately overrides an
-    // already-set `turnState.error`: whatever else the turn reported, the
-    // spent credential is the actionable cause and the only one whose
-    // recovery (rotate + replay) is correct.
+    // Overrides any other error: the spent credential is the actionable cause, and rotate + replay the right fix.
     if (childAgentQuotaError) {
       turnState.error = new Error(childAgentQuotaError);
       turnState.errorKind = 'UsageLimitExceeded';
     }
 
     if (turnState.error) {
-      // Map the structured CodexErrorInfo type to a ProviderEvent
-      // `classification` so callers (CodexProvider.gen rotation) can decide
-      // whether to rotate OAuth identities. Unknown → omit classification.
-      // The `system_error` value below covers the coarse-systemError path
-      // where thread/status/changed fired but no follow-up turn/completed
-      // carried structured detail (observed wedge in codex-cli 0.130.0).
-      // Control-plane classifications are intercepted by CodexProvider.gen,
-      // which replaces only app-server and resumes this persisted thread.
-      // retryable stays false: this is NOT the SDK-internal-retry signal (that
-      // path keeps the stream open) — the turn is dead and must be re-run via
-      // the catch path. See classifyCodexError.
+      // retryable is false: the turn is dead and must re-run through the catch path.
       const classification = classifyCodexError(turnState.error.message, turnState.errorKind);
       yield {
         type: 'error',
@@ -2492,12 +1769,7 @@ export async function* runOneTurn(
       return;
     }
 
-    // Backstop for the early reads above: let any in-flight read land, then
-    // read once more so a child whose thread was not yet listable when it was
-    // spawned is still enriched for the envelope path, which dispatches after
-    // `result`. Only when the turn actually delegated — a turn that spawned
-    // nobody makes no call. Non-throwing by construction: a roster is
-    // decoration and must not fail a turn that otherwise succeeded.
+    // Backstop: re-read once so a child not yet listable at spawn is still enriched; skipped when nothing delegated.
     if (rosterRead) await rosterRead;
     if (subagentThreadIds.size > 0 && threadId) {
       for (const thread of await readCodexSubagentThreads(server, threadId, CODEX_HEALTH_PROBE_TIMEOUT_MS)) {
@@ -2510,8 +1782,7 @@ export async function* runOneTurn(
     yield {
       type: 'result',
       text: resultText || null,
-      // This turn's own usage already — the sum of every model request it
-      // made. NOT routed through turn-usage.ts's cumulative delta path.
+      // Already this turn's own usage: not routed through turn-usage.ts's cumulative delta path.
       usage: turnAccum.seen
         ? {
             model,
@@ -2540,15 +1811,7 @@ export async function* runOneTurn(
   }
 }
 
-/**
- * The turn a pre-turn rate-limit park replaces: one non-retryable `quota`
- * error carrying the measured reset instant. `classification: 'quota'` is
- * what makes it rotation-eligible in gen() (`isCodexOAuthRotationEligible`)
- * and a recognized spent account in the poll-loop (`isQuotaExhausted`);
- * `resetAt` rides to the host as `provider_unavailable.resetAt`, where a
- * MEASURED reset is honoured as the park end instead of clamped to backoff
- * (src/db/provider-health.ts `honorResetAt`).
- */
+/** `resetAt` is a measured reset, which the host honours as the park end instead of clamping to backoff. */
 export async function* parkedTurnEvents(park: CodexRateLimitPark): AsyncGenerator<ProviderEvent> {
   yield {
     type: 'error',
@@ -2559,13 +1822,7 @@ export async function* parkedTurnEvents(park: CodexRateLimitPark): AsyncGenerato
   };
 }
 
-/**
- * When the ring is next expected to have a usable account: the earliest reset
- * any failed account stated, or null when one of them stated none (an overload
- * or system error carries no reset). Null hands the host its bounded backoff
- * rather than a date from a different account — the safe direction
- * (src/db/provider-health.ts `cooldownMs`).
- */
+/** Null when any failed account stated no reset: the host's bounded backoff beats another account's date. */
 export function earliestCodexSlotReset(resets: ReadonlyArray<string | null>): string | null {
   if (resets.length === 0) return null;
   let earliest: { iso: string; ms: number } | null = null;

@@ -45,18 +45,9 @@ export class SqliteStateAdapter implements StateAdapter {
     return this.namespace ? `${this.namespace}:${key}` : key;
   }
 
-  /**
-   * Every statement runs inside `withCentralSync(() => withRawDb(...))`: the
-   * chat_sdk_* tables live in the central DB, and a bare statement could land
-   * inside a driver transaction's suspension window (seam 3, plan R4). The
-   * `StateAdapter` contract is already async, so the lease costs nothing at
-   * the interface.
-   */
+  /** Every statement runs under withCentralSync: a bare one could land inside a driver transaction's suspension. */
   private raw<T>(label: string, fn: (db: RawDb) => T): Promise<T> {
-    // The primitives' rest parameters are the compile-time half of "no async
-    // callback"; with `T` generic here they cannot resolve, so they are
-    // instantiated explicitly. Every `fn` below is a plain synchronous
-    // callback, and the runtime half still rejects a thenable result.
+    // Explicit instantiation: with `T` generic the primitives' no-async-callback rest parameters cannot resolve.
     return withCentralSync(
       () => withRawDb(fn, ...([] as RawCallbackOnly<T>)),
       `chat-sdk state ${label}`,

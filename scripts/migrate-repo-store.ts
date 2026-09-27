@@ -144,11 +144,7 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-/**
- * This is deliberately outside any active migration run. It is an advisory
- * host-only byte-hash cache, never a rescue, origin pin, manifest, or a
- * published canonical. A subsequent offline run revalidates every entry.
- */
+/** Advisory host-only byte-hash cache, outside any migration run; an offline run revalidates every entry. */
 function repositoryMigrationPrestageCachePath(dataDir: string = DATA_DIR): string {
   return path.join(dataDir, 'repository-migration-prestage', 'file-hashes-v1.json');
 }
@@ -181,9 +177,7 @@ export function captureProtectedArchives(
       const candidateStat = fs.lstatSync(candidate);
       if (candidateStat.isSymbolicLink()) {
         try {
-          // safeDirectories deliberately includes symlinks so repository
-          // discovery can validate directory aliases. Group configuration
-          // also uses symlinks to regular files; those cannot be archives.
+          // Symlinks to regular files (group configuration) cannot be archives.
           if (!fs.statSync(candidate).isDirectory()) continue;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
@@ -484,9 +478,7 @@ function inventoryCandidates(
     }
   }
 
-  // Recursively inventory every live and historical physical session root,
-  // not only the conventional worktrees/ child. Agents could previously make
-  // standalone or nested clones anywhere under writable /workspace.
+  // Every physical session root, recursively: agents could make clones anywhere under /workspace.
   const rowsByPhysicalSession = new Map(rows.map((row) => [`${row.agent_group_id}\0${row.session_id}`, row]));
   const groupsById = new Map(groups.map((group) => [group.agent_group_id, group]));
   const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
@@ -542,9 +534,7 @@ function inventoryCandidates(
     }
   }
 
-  // Legacy thread checkout paths outside session roots get the same canonical
-  // work-unit used by spawn/create/cleanup. Inventory the physical
-  // tree too so deleted DB rows cannot hide historical work.
+  // Inventory the physical tree too, so deleted DB rows cannot hide historical work.
   const physicalThreadUnits = new Map<string, RepositoryWorkUnit[]>();
   for (const row of rows) {
     const unit = resolveRepositoryWorkUnit({
@@ -584,9 +574,7 @@ function inventoryCandidates(
           if (fs.existsSync(worktrees)) roots.push({ state, worktrees, scopedWorkgroup });
         }
       } else {
-        // Old installs can leave empty messaging-group directories or put a
-        // checkout directly below one. Empty roots are harmless; any actual
-        // checkout is inventoried and requires an exact reviewed owner mapping.
+        // Any checkout directly below a messaging-group directory requires an exact reviewed owner mapping.
         roots.push({ state: top, worktrees: top });
       }
     }
@@ -646,13 +634,10 @@ function inventoryCandidates(
     );
   }
 
-  // Object overlap is diagnostic evidence, not repository identity. Shared
-  // templates, forks, and copied files can overlap heavily; an originless
-  // checkout therefore remains its own local-only repository unless an
-  // operator supplies an explicit mapping in a future reviewed manifest.
+  // Object overlap is diagnostic, not identity: an originless checkout stays its own local-only
+  // repository unless an explicit mapping says otherwise.
 
-  // Add common Git dirs as collision-recovery candidates after the complete
-  // repository inventory is known.
+  // Only after the complete inventory is known.
   for (const candidates of grouped.values()) {
     const common = candidates
       .map((candidate) => path.join(candidate.checkoutPath, '.git'))
@@ -950,9 +935,8 @@ function assertFleetQuiescent(paths: string[], refreshInodes = false): void {
   const services = [...new Set(['nanoclaw.service', 'nanoclaw-v2.service', `${getSystemdUnit(REPO_ROOT)}.service`])];
   for (const service of services) {
     assertServiceInactive(service);
-    // Check both managers unconditionally. A unit may remain loaded after its
-    // file is removed, so filesystem registration discovery cannot prove that
-    // the user manager is quiet. An unavailable manager therefore fails closed.
+    // Check both managers: a unit can stay loaded after its file is removed, so an unavailable
+    // manager fails closed.
     assertServiceInactive(service, undefined, 'user');
   }
   try {
@@ -984,13 +968,8 @@ function assertFleetQuiescent(paths: string[], refreshInodes = false): void {
   }
   let snapshot: Buffer;
   try {
-    // `lsof +D <root>` recursively stats the entire root before it examines
-    // descriptors. Large workgroups can therefore time out even when no file
-    // is open, and repeating that traversal for every migration boundary is
-    // quadratic in the retained topology. Capture the kernel's open-file view
-    // once and filter its NUL-delimited records against the exact protected
-    // roots instead. Service/container admission is already stopped above, so
-    // the snapshot closes the remaining same-host process writer surface.
+    // One `lsof` snapshot filtered against the exact roots, not `lsof +D` per root: +D stats the
+    // whole tree first, which times out on large workgroups.
     snapshot = execFileSync('lsof', ['-nP', '-F0pDin'], {
       encoding: 'buffer',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1027,11 +1006,8 @@ function preManifestQuiescencePaths(
   }
   for (const group of groups) {
     if (!workgroups.has(group.workgroup_id)) continue;
-    // These are the configured legacy roots searched by inventory. Proving
-    // only the checkout directory quiet is insufficient: another process can
-    // mutate a linked external common Git dir, create a new nested checkout,
-    // or update a group-local bare store while the hash-bound manifest is
-    // being captured.
+    // The whole configured legacy roots, not only the checkout: another process could mutate a
+    // linked common Git dir or create a nested checkout while the manifest is captured.
     paths.add(path.resolve(GROUPS_DIR, group.folder));
     paths.add(path.resolve(DATA_DIR, 'workgroups', group.workgroup_id));
     paths.add(path.resolve(DATA_DIR, 'v2-sessions', group.agent_group_id));
@@ -1067,9 +1043,7 @@ function prestageRepositoryMigrationFileHashes(
             `(${result.files} files; ${result.reusedFiles} reused, ${result.rehashedFiles} rehashed)`,
         );
       } catch (error) {
-        // This cache is an outage-reduction optimization, not inventory
-        // evidence. Missing/collided admins and files changing under the live
-        // runtime are left for the authoritative quiescent capture to decide.
+        // An outage-reduction cache, not inventory evidence: the quiescent capture decides.
         skipped += 1;
         console.error(
           `Skipped prestage for ${workgroupId}/${repo}: ${candidate.checkoutPath}: ` +
@@ -1078,9 +1052,7 @@ function prestageRepositoryMigrationFileHashes(
       }
     }
   }
-  // Cache entries absent from this live path inventory must not survive into
-  // the offline run; pruning keeps the bounded envelope representative of the
-  // current prestage rather than accumulating stale server history.
+  // Entries absent from this live inventory must not survive into the offline run.
   cache.flush({ pruneUntouched: true });
   const stats = cache.stats();
   console.log(
@@ -1380,10 +1352,8 @@ function manifestExecutionKey(manifest: RepositoryMigrationManifest): string {
 }
 
 /**
- * Return a deterministic physical-containment topological order. A repository
- * with a checkout nested below another repository's checkout must be cut over
- * first, regardless of workgroup/repository lexical order. The descriptor
- * persists this exact order; rollback deliberately reverses it.
+ * A repository with a checkout nested below another's must be cut over first. The descriptor
+ * persists this order; rollback reverses it.
  */
 export function orderRepositoryMigrationManifests(
   manifests: readonly RepositoryMigrationManifest[],
@@ -1599,9 +1569,8 @@ function auditServerTopology(
     }
   }
 
-  // Re-run discovery from the configured DB roots after conversion. A checkout
-  // omitted by the manifest, an unreadable root, or a residual bare store is a
-  // hard activation blocker even when every listed manifest audits cleanly.
+  // An omitted checkout, unreadable root or residual bare store blocks activation even when every
+  // listed manifest audits cleanly.
   const db = new Database(path.join(DATA_DIR, 'v2.db'), { readonly: true, fileMustExist: true });
   let rows: SessionRow[];
   let groups: AgentGroupRow[];
@@ -1677,10 +1646,8 @@ async function executeAndAudit(
         assertQuiescent: () => assertFleetQuiescent(repositoryPaths),
         refreshQuiescent: () => assertFleetQuiescent(completedPaths, true),
       });
-      // Migration creates new canonical, linked-worktree, state, journal, and
-      // bundle inodes under roots captured before the manifest existed. Merge
-      // those exact post-mutation trees, then take another open-file snapshot
-      // before advancing to the next repository.
+      // Migration creates new inodes under roots captured before the manifest existed: take another
+      // open-file snapshot before the next repository.
       assertFleetQuiescent(completedPaths, true);
     }
     auditServerTopology(manifests, protectedArchives);
@@ -1820,9 +1787,7 @@ async function rollbackCompletedServerMigration(runId: string): Promise<void> {
   assertFleetQuiescent(allPaths);
   validateRecoverySeedEvidence(loaded.descriptor.recoverySeeds);
   if (firstAttempt) {
-    // Canary rollback is permitted only while the post-migration repository
-    // topology remains byte-for-byte identical to the offline audit. Any edit
-    // or newly created linked worktree blocks before the first rollback write.
+    // Rollback only while the topology is byte-for-byte identical to the offline audit.
     auditServerTopology(loaded.manifests, protectedArchives);
     durableRename(completed, activeRollback);
   }
@@ -1981,9 +1946,7 @@ async function main(): Promise<void> {
     prestageRepositoryMigrationFileHashes(grouped, bareStores);
     return;
   }
-  // Cache reads are advisory only. This call never writes: only --prestage
-  // persists hashes, so an ordinary dry run remains read-only. Validate its
-  // host-only path before taking the fleet offline.
+  // Read-only: only --prestage persists hashes.
   const fileHashCache = loadRepositoryMigrationPrestageCache(repositoryMigrationPrestageCachePath());
   if (args.execute) assertFleetQuiescent(preManifestPaths);
 

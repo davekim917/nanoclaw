@@ -1,56 +1,26 @@
 /**
- * The PR review-loop churn gate, at the container's push primitive.
- *
- * `pr-review-loop` refuses a site patch once one finding class has drawn
- * findings in three rounds: the fix belongs in the primitive every flagged
- * site calls, not at one more call site. On a host session that gate sits in
- * `codex-review.sh push`, which is the only push path the skill sanctions.
- *
- * A container agent does not push through a shell. It calls the `git_push`
- * MCP tool, so for it the skill's push path is instruction-only, and an
- * advisory CHURN report does not stop an agent from patching one more site
- * each round. So the gate is hoisted to the primitive the container actually
- * routes through.
- *
- * The decision itself is NOT reimplemented here. This runs the one
- * implementation, `codex-review.sh gate`, out of the read-only skill mount —
- * a second copy of the classifier is the same defect this gate exists to
- * catch.
- *
- * It fails OPEN, always. A push must never be blocked because GitHub was
- * slow, the branch has no PR yet, `gh` is unauthenticated, or the skill is not
- * mounted for this group. Only an explicit exit 3 from the gate refuses.
+ * Runs the pr-review-loop churn gate (`codex-review.sh gate`) before a container
+ * `git_push`, since agents push through the MCP tool, not the skill's push path.
+ * Never reimplement the classifier here: it runs the skill's one copy.
+ * Fails OPEN: only an explicit exit 3 refuses a push.
  */
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 
-/** Where the skill is mounted, in the order the providers see it. */
 export const CHURN_GATE_SCRIPT_PATHS = [
   '/home/node/.claude/skills/pr-review-loop/scripts/codex-review.sh',
   '/app/skills/pr-review-loop/scripts/codex-review.sh',
 ];
 
-/**
- * Operator and test override for the script path. An agent cannot set it —
- * the runner's environment comes from the host at spawn — so it is not a way
- * around the gate from inside a session.
- */
+/** Set only by the host at spawn, so an agent cannot use it to bypass the gate. */
 export const CHURN_GATE_SCRIPT_ENV = 'NANOCLAW_REVIEW_CHURN_GATE_SCRIPT';
 
-/** Exit status the skill's gate uses for REFRAME REQUIRED. */
 const REFRAME_REQUIRED_EXIT = 3;
 
 /**
- * The gate is asked about the identity the caller has pinned, never about the
- * checkout as it stands when the script happens to run — same-topic siblings
- * share the worktree, and the verdict has to describe what the push sends.
- *
- * `--committed-only`: a bare `gate` counts uncommitted work at the primitive as
- * evidence of the reframe, which is right for a pre-commit check and wrong in
- * front of a push, because a push sends committed history.
- * `--head <sha>`: read that commit's history, not the current HEAD's.
- * `BRANCH` in the environment: resolve the PR from that branch, not from
- * whatever `gh pr view` finds checked out.
+ * Pin the gate to the pushed commit (and `BRANCH` env), never the checkout:
+ * siblings share the worktree. `--committed-only` because a push sends only
+ * committed history; uncommitted work must not count as the reframe.
  */
 export function churnGateArgs(head: string): string[] {
   return ['gate', '--committed-only', '--head', head];
@@ -71,19 +41,12 @@ export interface ChurnGateRun {
 }
 
 export interface ChurnGateOptions {
-  /** The worktree being pushed — the gate reads its imports from here. */
   worktree: string;
-  /** The branch being pushed. Resolves the PR without consulting the checkout. */
   branch: string;
-  /** The commit being pushed. Its history is the lift evidence. */
   head: string;
-  /** Whether this push was requested as a force. Shapes the override command. */
   force?: boolean;
-  /** The lease captured with the identity, carried into the override command. */
   lease?: string;
-  /** Override for tests; defaults to CHURN_GATE_SCRIPT_PATHS. */
   scriptPaths?: string[];
-  /** Override for tests; defaults to spawning bash. */
   run?: (script: string, args: string[], worktree: string, timeoutMs: number, env: NodeJS.ProcessEnv) => ChurnGateRun;
   timeoutMs?: number;
   exists?: (p: string) => boolean;
@@ -112,16 +75,7 @@ function defaultRun(
   };
 }
 
-/**
- * The refusal an agent sees. It carries the gate's own text — class, sites,
- * seam, candidate primitives — plus the two ways out, one of which is not
- * "push anyway".
- */
-/**
- * One argument, safe to paste into a shell. Git accepts `&` and backticks in a
- * branch name, and this command is written to be executed — unquoted, such a
- * name splits the assignment or substitutes a command.
- */
+/** Git allows `&` and backticks in branch names, and the override command is meant to be executed. */
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -131,12 +85,9 @@ function refusalMessage(
   script: string,
   identity: { branch: string; head: string; force?: boolean; lease?: string },
 ): string {
-  // A refused force push is usually a rewrite, so an override that pushes
-  // fast-forward-only is rejected by the remote and the documented escape
-  // hatch does not exist. The original request's force is carried through with
-  // the lease captured alongside the identity — not a bare `--force`, which
-  // would drop the very protection the captured lease provides, and not a bare
-  // `--force-with-lease`, which re-reads the tracking ref at override time.
+  // A refused force push is usually a rewrite, so the override must force too,
+  // with the captured lease: bare `--force` drops it, bare `--force-with-lease`
+  // re-reads the tracking ref at override time.
   const forceFlag =
     identity.force === true
       ? [`        ${shellQuote(`--force-with-lease=refs/heads/${identity.branch}:${identity.lease ?? ''}`)} \\`]
@@ -150,29 +101,15 @@ function refusalMessage(
     'If the reframe honestly belongs to a different PR, take the override through the',
     'skill so it is recorded on the PR body rather than made silently:',
     '',
-    // Bound to the identity that was refused, not to the checkout. The script
-    // resolves its PR from `BRANCH` when given and passes trailing arguments
-    // to `git push`, so the explicit refspec sends the commit that was judged.
-    // An unbound override would follow git's checkout-dependent default and
-    // could push a sibling's branch, recording the override on their PR.
-    //
-    // The path is the one actually selected — the Claude mount, the /app
-    // fallback, or an override — since printing a path the agent cannot run
-    // turns the documented, PR-recorded override into a command that fails.
-    // `origin` is spelled out for the same reason: `git push <refspec>` with
-    // no repository reads the refspec AS the repository name and dies trying
-    // to resolve it as a host, and `origin` is the remote this primitive
-    // pushes to.
+    // Bound to the refused identity: an unbound override follows the checkout
+    // and could push a sibling's branch. `origin` is required, or git reads the
+    // refspec as the repository name.
     `    REVIEW_LOOP_ALLOW_SITE_PATCH=1 BRANCH=${shellQuote(identity.branch)} ${shellQuote(script)} push \\`,
     ...forceFlag,
     `        origin ${shellQuote(`${identity.head}:refs/heads/${identity.branch}`)}`,
   ].join('\n');
 }
 
-/**
- * Decide whether this worktree may push. Everything that is not an explicit
- * refusal is a pass — see the fail-open note above.
- */
 export function evaluateReviewChurnGate(options: ChurnGateOptions): ChurnGateResult {
   const exists = options.exists ?? fs.existsSync;
   const override = (options.env ?? process.env)[CHURN_GATE_SCRIPT_ENV];
@@ -206,8 +143,7 @@ export function evaluateReviewChurnGate(options: ChurnGateOptions): ChurnGateRes
 
   if (result.error) return { status: 'skipped', reason: `the gate could not run (${result.error.message})` };
   if (result.status === REFRAME_REQUIRED_EXIT) {
-    // The skill prints the human-readable decision on stderr and the JSON on
-    // stdout; only `gate` (no --json) is run here, so stderr is the decision.
+    // Without --json the gate prints its decision on stderr.
     return {
       status: 'refused',
       message: refusalMessage(result.stderr || result.stdout, script, {
@@ -219,8 +155,6 @@ export function evaluateReviewChurnGate(options: ChurnGateOptions): ChurnGateRes
     };
   }
   if (result.status === 0) return { status: 'pass' };
-  // Every other status is the gate declining to answer — no PR for this
-  // branch yet, `gh` unauthenticated, no JS runtime, a timeout. Not a refusal.
   return {
     status: 'skipped',
     reason: `the gate returned ${result.status ?? 'no status'} (${(result.stderr || result.stdout).trim().split('\n')[0] ?? 'no output'})`,

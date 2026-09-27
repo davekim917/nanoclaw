@@ -1,20 +1,7 @@
 /**
- * Host-side commit-digest scanner.
- *
- * Walks every agent group's workspace, finds git repos at the workspace
- * root and immediate subdirectories, and records new direct commits to
- * the default branch as ship_log entries (tagged `commit-digest,<repo>`).
- *
- * Why host-side: ship_log is a fact about what shipped, not a user-facing
- * flow. The container-side `scan_commits` MCP tool only fires when an
- * agent calls it — direct commits and external PRs made from outside the
- * agent silently went unrecorded. v1 had the same shape via a system task
- * `__commit_digest`; this is the v2 port, hooked into the host's existing
- * periodic-job infrastructure (sibling of host-sweep, plugin-updater,
- * worktree-cleanup) instead of a scheduled task.
- *
- * Same logic + state table as the container-side tool — they coexist
- * idempotently because both gate on commit_digest_state.last_commit_sha.
+ * Host-side commit-digest scanner: records new commits on each workspace repo's default branch as ship_log entries
+ * (`commit-digest,<repo>`), so commits made outside an agent are recorded too. Coexists with the container
+ * `scan_commits` tool: both gate on commit_digest_state.last_commit_sha.
  */
 import { execFile } from 'node:child_process';
 import fs from 'fs';
@@ -33,24 +20,12 @@ const SCAN_INTERVAL_MS = 10 * 60 * 1000;
 const STARTUP_DELAY_MS = 90_000;
 const FIRST_SCAN_WINDOW_HOURS = 24;
 const FIRST_SCAN_COMMIT_CAP = 100;
-// Prevents one ship_log row from carrying a wall-of-text description when
-// a repo has been quiet for weeks and the scanner finds dozens of merged
-// commits at once. The agent's morning briefing reads description fields
-// verbatim — without a cap, a 100-commit burst becomes a 100-line chat
-// message. Title still reports the true count.
+// The briefing reads descriptions verbatim, so a burst after weeks of quiet must not become a 100-line message.
 const DESCRIPTION_COMMIT_CAP = 20;
 
 let timer: NodeJS.Timeout | null = null;
-// Guards against overlapping scans now that git calls are async: the old
-// execFileSync-based scan could never overlap its own
-// re-armed timer, because every await inside it settled as a same-tick
-// microtask before the event loop could reach a timer callback. Now each git
-// call actually yields, so a scan slower than SCAN_INTERVAL_MS (e.g. every
-// repo's `git fetch` timing out at 30s with the network down — 72 repos ×
-// 30s ≈ 36min) would otherwise let two scans run at once: both read
-// commit_digest_state.last_commit_sha before either updates it, so the same
-// commits get recorded twice, and concurrent fetches in one repo contend on
-// git's own lock.
+// A slow scan (every fetch timing out) outlives the interval; two concurrent scans would both read
+// last_commit_sha before either updates it and record the same commits twice.
 let scanInFlight = false;
 
 export function startCommitScan(): void {
@@ -66,8 +41,7 @@ export function startCommitScan(): void {
           scanInFlight = false;
         });
     }
-    // Re-armed unconditionally, same as before: a skipped or failed tick must
-    // not stop future ticks from firing.
+    // Re-armed unconditionally: a skipped or failed tick must not stop future ticks.
     timer = setTimeout(tick, SCAN_INTERVAL_MS);
     timer.unref?.();
   }, STARTUP_DELAY_MS);
@@ -144,14 +118,7 @@ function errorMessage(error: unknown): string {
 
 async function readGit(repoDir: string, args: string[], operation: string, timeout = 5000): Promise<string | null> {
   try {
-    // execFile has no `stdio` option — @types/node's ExecFileOptions
-    // extends only CommonOptions + Abortable, unlike CommonSpawnOptions, so it
-    // can't reject a fetch's credential prompt the way execFileSync's
-    // `stdio: ['ignore', 'pipe', 'pipe']` did. util.promisify's custom
-    // execFile implementation attaches the live ChildProcess as `.child`
-    // on the returned promise (PromiseWithChild, :1023), so ending stdin
-    // immediately reproduces the same "no prompt, fail on timeout"
-    // behavior instead of leaving the pipe open for git to block on.
+    // execFile has no `stdio` option: end stdin so a fetch credential prompt fails on timeout instead of blocking.
     const pending = execFileAsync('git', args, {
       cwd: repoDir,
       encoding: 'utf-8',
@@ -205,9 +172,7 @@ async function getDefaultBranch(repoDir: string): Promise<string | null> {
 
 async function fetchOrigin(repoDir: string): Promise<void> {
   if ((await readGit(repoDir, ['fetch', '--quiet', '--no-tags', 'origin'], 'fetch origin', 30_000)) === null) {
-    // Network failure, auth missing, repo without origin — fall through and
-    // scan whatever the local refs already have. Loud failure here would
-    // suppress every repo's data on a transient blip.
+    // No network, auth or origin: scan the local refs rather than suppress data on a transient blip.
   }
 }
 
@@ -251,16 +216,10 @@ async function scanRepo(repoDir: string, agentGroupId: string): Promise<number> 
   const defaultBranch = await getDefaultBranch(repoDir);
   if (!defaultBranch) return 0;
 
-  // Refresh remote refs before reading. Without this we'd see whatever the
-  // local clone last pulled — for a host-side scanner watching for external
-  // commits and merged PRs, that's exactly the wrong thing. Fetch only
-  // updates refs/remotes/* and doesn't touch the working tree, so safe even
-  // when the agent has WIP in a worktree.
+  // Refs only, never the working tree, so safe with WIP in a worktree.
   await fetchOrigin(repoDir);
 
-  // Track origin/<branch>, not local <branch>. The local ref drifts whenever
-  // the user works on a feature branch and forgets to pull main; the remote
-  // ref is what actually represents "shipped to default branch."
+  // origin/<branch>, not local: the local ref drifts when nobody pulls main.
   const remoteRef = `origin/${defaultBranch}`;
   const latestSha = await getLatestCommitSha(repoDir, remoteRef);
   if (!latestSha) return 0;

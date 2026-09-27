@@ -1,20 +1,8 @@
 /**
- * Upstream mailbox-seam manifest.
- *
- * The files listed in UPSTREAM_FILES are ported byte-for-byte from upstream
- * nanocoai/nanoclaw and must never be hand-edited — src/mailbox-seam-upstream.test.ts
- * fails the build if any of them drifts from src/mailbox/UPSTREAM-MANIFEST.json.
- *
- * To intentionally sync with a newer upstream commit, re-run:
- *   pnpm exec tsx scripts/mailbox-seam-manifest.ts --update <upstream-sha>
- * from a worktree that has upstream's commit objects (e.g. after `git fetch
- * upstream`), review the resulting diff, then commit the regenerated manifest
- * alongside the ported file changes.
- *
- * See docs/specs/upstream-mailbox-seam/plan.md §4.6.1. Same vendor-then-CLI-shim
- * split as src/design-artifact-loop-vendor.ts + scripts/vendor-design-artifact-loop.ts
- * — the logic lives here (under src/, so src/*.test.ts can import it: the host
- * tsconfig's rootDir is src/), scripts/mailbox-seam-manifest.ts is a thin CLI shim.
+ * Upstream mailbox-seam manifest: UPSTREAM_FILES are ported byte-for-byte from upstream and must never be
+ * hand-edited (src/mailbox-seam-upstream.test.ts fails on drift). To sync with a newer upstream, run
+ * `pnpm exec tsx scripts/mailbox-seam-manifest.ts --update <upstream-sha>` from a worktree holding upstream's
+ * objects and commit the regenerated manifest with the ported changes.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,16 +13,7 @@ import { hashFilesAtGitSha } from './seam-manifest-git.js';
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const MANIFEST_PATH = path.join(REPO_ROOT, 'src/mailbox/UPSTREAM-MANIFEST.json');
 
-/**
- * Every file ported verbatim from upstream in this PR. Both compose.ts files
- * are the sanctioned fork edit points and are intentionally excluded — they
- * register the fork's mailbox implementation and are never byte-identical to
- * upstream's own compose.ts (which registers SqliteAgentMailbox directly).
- *
- * Grows as later PRs in the mailbox-seam series (R1, etc.) port more upstream
- * files (the runner's messages-in/messages-out/session-state/session-routing
- * compat shims) — add them here and re-run --update when that lands.
- */
+/** Both compose.ts files are the sanctioned fork edit points (they register the fork's mailbox) and are excluded. */
 export const UPSTREAM_FILES: readonly string[] = [
   // Host
   'src/mailbox/index.ts',
@@ -68,34 +47,16 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/db/messages-out.ts',
   'container/agent-runner/src/db/session-routing.ts',
   'container/agent-runner/src/db/session-state.ts',
-  // Not in the plan's enumerated set, but the registry test ported in R3
-  // asserts its exact `preload` line, so an unmanifested hand-edit would
-  // silently break the guarantee that every runner entrypoint composes the
-  // real barrel. Byte-identical to upstream.
+  // The runner registry test asserts its exact `preload` line.
   'container/agent-runner/bunfig.toml',
 ] as const;
 
-/**
- * Deferred ported-file paths: not in UPSTREAM_FILES yet (they assert the end
- * state of the migration), but must land no later than their half of the
- * raw-access ratchet (RATCHET.json) being done — asserted in
- * src/mailbox-seam-ratchet.test.ts.
- */
-export const DEFERRED_UPSTREAM_FILES: readonly string[] = [
-  // Empty, and this is the PR that empties it. The runner half was ported in
-  // R3 when its allowlist reached zero. The host half turned out to be
-  // UNPORTABLE rather than merely deferred — see UNPORTABLE_UPSTREAM_FILES —
-  // so nothing is waiting on a later PR any more.
-] as const;
+/** Not yet ported; each must land no later than its half of RATCHET.json is done (mailbox-seam-ratchet.test.ts). */
+export const DEFERRED_UPSTREAM_FILES: readonly string[] = [] as const;
 
 /**
- * Upstream files this fork CANNOT carry byte-for-byte, with the fork-owned
- * test that covers the same invariants instead.
- *
- * This is not a deferral and never becomes one: adding such a file to
- * UPSTREAM_FILES would put a permanently red test in CI. The ratchet test
- * asserts both halves of that — the replacement exists, and the upstream path
- * stays out of UPSTREAM_FILES.
+ * Upstream files this fork CANNOT carry byte-for-byte, each with the fork-owned test covering the same invariants.
+ * Never a deferral: in UPSTREAM_FILES they would be a permanently red test.
  */
 export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
   upstream: string;
@@ -117,29 +78,10 @@ export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
 ] as const;
 
 /**
- * Files that WERE ported byte-for-byte from upstream but have since been
- * hand-edited for a fork-only feature. Unlike DEFERRED_UPSTREAM_FILES (not
- * yet ported, will become byte-identical later), these are never expected to
- * match upstream's hash again — the fork's own logic now lives in them. They
- * are tracked by name, not by hash, so a future re-port from a newer upstream
- * sha is a deliberate, reviewed act (diff against the sha in `upstream`
- * below) rather than a silent overwrite via --update.
- *
- * container/agent-runner/src/db/messages-in.ts: diverged in 1dfd2857
- * ("give a task occurrence its own scheduled_for") to add the fork-only
- * `scheduled_for` column so a retry backoff can't rewrite a task
- * occurrence's original slot. See docs/specs/upstream-mailbox-seam/plan.md.
- *
- * container/agent-runner/src/mailbox/sqlite/connection.ts: diverged in e4cefa3c8
- * to add refuseProductionSessionDbUnderTest() and its call from
- * getOutboundDb, so a test that skipped initTestSessionDb() can no longer
- * silently create the production-path session DB.
- *
- * container/agent-runner/src/mailbox/sqlite/index.ts, .../sqlite/sqlite.test.ts
- * and container/agent-runner/src/mailbox/types.ts: diverged in 83697a84c
- * ("live task list replaces 💭 thinking messages") and its review rounds to add
- * the fork-only task-list reads — countConversationMessagesAfter,
- * getInboundRouteById and maxInboundSeq — to the runner's mailbox session.
+ * Ported from upstream, since hand-edited for fork-only features, so never expected to match upstream's hash again;
+ * tracked by name so a re-port is a reviewed act, not a silent --update overwrite. Fork additions: messages-in.ts
+ * `scheduled_for` (a retry backoff must not rewrite an occurrence's slot); connection.ts
+ * refuseProductionSessionDbUnderTest; sqlite/index.ts, sqlite.test.ts and types.ts the task-list reads.
  */
 export const FORK_DIVERGED_UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/db/messages-in.ts',

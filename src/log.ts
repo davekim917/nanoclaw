@@ -30,13 +30,7 @@ function formatData(data: Record<string, unknown>): string {
   return parts.length ? ' ' + parts.join(' ') : '';
 }
 
-/**
- * Numeric UTC offset for `d` as `+HH:MM` / `-HH:MM`.
- *
- * `getTimezoneOffset()` returns minutes the local zone is BEHIND UTC, so its
- * sign is inverted relative to the ISO-8601 marker: EDT is +240 and renders
- * as `-04:00`.
- */
+/** `+HH:MM`; `getTimezoneOffset()` counts minutes BEHIND UTC, so its sign is inverted (EDT +240 → `-04:00`). */
 function offsetMarker(d: Date): string {
   const mins = -d.getTimezoneOffset();
   const sign = mins < 0 ? '-' : '+';
@@ -45,16 +39,8 @@ function offsetMarker(d: Date): string {
 }
 
 /**
- * Host log stamp: local wall-clock plus an explicit numeric UTC offset.
- *
- * The offset is load-bearing, not decoration. The stamp is built from local
- * `Date` getters, so it renders in the host PROCESS's zone (`TZ` env, else
- * `/etc/localtime`) — which is not necessarily the zone of whatever later
- * reads the line. On this install the systemd unit sets
- * `TZ=America/New_York` while `/etc/localtime` is `Etc/UTC`, so a script
- * rebuilding the stamp with local getters lands 4h off and, because nothing
- * throws, the error surfaces as a confident zero rather than a failure.
- * Parse with `parseLogStamp` below rather than re-deriving the parts.
+ * Local wall-clock plus an explicit UTC offset. The offset is load-bearing: the process zone (`TZ`, else
+ * /etc/localtime) need not match the reader's, so parse with `parseLogStamp`, never by re-deriving the parts.
  */
 function ts(): string {
   const d = new Date();
@@ -68,23 +54,12 @@ function ts(): string {
   return `${yyyy}-${MM}-${dd} ${hh}:${mm}:${ss}.${ms}${offsetMarker(d)}`;
 }
 
-/**
- * Matches a host log line's leading `[<stamp>]`, with or without the offset.
- *
- * The offset group is OPTIONAL because rotated logs are kept 30 days and
- * every line written before this change lacks it — a required group would
- * silently stop matching all history.
- */
+/** The offset group is optional: rotated logs keep lines written before it existed. */
 export const LOG_STAMP_RE = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})([+-]\d{2}:\d{2})?\]/;
 
 /**
- * Absolute epoch ms for a stamp captured by `LOG_STAMP_RE`.
- *
- * With an offset the instant is unambiguous. WITHOUT one (pre-change lines)
- * there is no recoverable answer: the only reading available is the READER's
- * local zone, which is exactly the assumption that made these stamps
- * misparse. `legacyIsLocal` therefore returns that best-effort value and
- * callers that care can tell the two apart via the second return field.
+ * Epoch ms for a `LOG_STAMP_RE` stamp. Without an offset there is no recoverable instant: the reader's local zone is
+ * a best effort, flagged `exact: false`.
  */
 export function parseLogStamp(stamp: string, offset?: string): { ms: number; exact: boolean } | null {
   if (offset) {
@@ -103,11 +78,7 @@ export function parseLogStamp(stamp: string, offset?: string): { ms: number; exa
     number,
   ];
   const dt = new Date(y, mo - 1, d, h, mi, sec, msec);
-  // `new Date(2026, 12, 99, 99, ...)` does not throw — it NORMALISES, rolling
-  // overflow into a real instant. A corrupted line would then parse to a
-  // plausible-looking date, and in host-health.ts's backward walk a value
-  // below the cutoff ends the scan early, which is precisely the silent zero
-  // this change exists to remove. Reject anything that did not round-trip.
+  // `new Date` normalises overflow instead of throwing; a corrupted line must not parse to a plausible date.
   if (
     dt.getFullYear() !== y ||
     dt.getMonth() !== mo - 1 ||
@@ -123,8 +94,7 @@ export function parseLogStamp(stamp: string, offset?: string): { ms: number; exa
   return Number.isFinite(ms) ? { ms, exact: false } : null;
 }
 
-// Pluggable scrubber — the secret-scrubber module wires this on load to
-// avoid a circular import (secret-scrubber itself logs via this module).
+// Set by secret-scrubber on load (it logs via this module, so it cannot be imported here).
 let scrubber: ((s: string) => string) | null = null;
 export function setLogScrubber(fn: (s: string) => string): void {
   scrubber = fn;
@@ -147,21 +117,15 @@ export const log = {
 };
 
 /**
- * A dead peer on a socket write is not a reason to kill the orchestrator.
- * These escape as uncaught exceptions whenever a stream write completes with
- * EPIPE/ECONNRESET and nothing listened for 'error' on that handle — most of
- * them come from inside dependencies, and the async completion stack names no
- * user frame, so there is nothing to fix at the call site. Exiting on them
- * took the whole host down mid-turn (systemd restarted it) and forced every
- * mid-work session to post a "host restarted" accounting note.
+ * EPIPE/ECONNRESET on a stream write with no 'error' listener escapes as an uncaught exception, mostly from inside
+ * dependencies; a dead peer is no reason to take the host down mid-turn.
  */
 export function isSurvivableIoError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   return code === 'EPIPE' || code === 'ECONNRESET';
 }
 
-// One diagnostic report per process — enough to identify the owning handle,
-// not enough to fill the disk when a peer flaps.
+// One diagnostic report per process: enough to find the owning handle without filling the disk.
 let ioReportWritten = false;
 
 process.on('uncaughtException', (err) => {
@@ -170,8 +134,7 @@ process.on('uncaughtException', (err) => {
     if (!ioReportWritten) {
       ioReportWritten = true;
       try {
-        // Names the libuv handle list (sockets, pipes, their fds) at the
-        // moment of failure — the only way to attribute an async write error.
+        // Lists libuv handles at failure: the only way to attribute an async write error.
         report = process.report.writeReport(`logs/io-error-report-${Date.now()}.json`);
       } catch {
         // best-effort diagnostics

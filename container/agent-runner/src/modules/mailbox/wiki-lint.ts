@@ -1,13 +1,4 @@
-/**
- * Weekly wiki-lint gate reads (scheduling/wiki-lint-gate.ts).
- *
- * The gate runs as its own short-lived Bun process inside the container (a
- * pre-task script), alongside the agent-runner process that owns outbound.db
- * as sole writer. Both handles are therefore opened READ-ONLY and closed
- * immediately — never the module's read-write outbound singleton, which would
- * put a second writer on the file and run the outbound schema warm-up from a
- * process that has no business doing it.
- */
+/** Wiki-lint gate reads from a separate pre-task process: open READ-ONLY and close, never the read-write outbound singleton (a second writer). */
 import { Database } from 'bun:sqlite';
 
 import { getOutboundDb, openInboundDb } from '../../mailbox/sqlite/connection.js';
@@ -33,16 +24,7 @@ function withOutboundReader<T>(action: (db: Database) => T): T {
   }
 }
 
-/**
- * The `status_changed` of the newest completed run of a task series, or null
- * when the series has never completed.
- *
- * Completion truth comes from outbound `processing_ack`. The host eventually
- * mirrors this status into inbound.db, but the container owns processing_ack
- * and updates it immediately after the lint finishes. Using status_changed
- * means edits made by that lint predate its boundary and cannot retrigger it
- * next week.
- */
+/** Newest completed run's `status_changed` from outbound processing_ack (updated immediately, unlike the host's mirror), so the lint's own edits can't retrigger it. */
 export function readSeriesLastCompletedRun(seriesId: string): string | null {
   const inbound = openInboundDb();
   try {

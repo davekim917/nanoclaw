@@ -35,8 +35,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA2=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 PR=7
-RUN=xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z
-LEGACY=xzo-pr-pr9-cccccccccccc-20260918T090000Z
+RUN=acme-pr-pr7-aaaaaaaaaaaa-20260918T100000Z
+LEGACY=acme-pr-pr9-cccccccccccc-20260918T090000Z
 TOKEN=owner-ctl-1111
 
 key() { python3 -c 'import hashlib,sys; print(hashlib.sha256("|".join(sys.argv[1:]).encode()).hexdigest())' "$@"; }
@@ -110,7 +110,7 @@ parent_conclusions() { # [challenger-disposition]
   printf 'disposition\n' >"$R/challenger/disposition.md"
   jq -cn --arg d "${1:-CLEAR}" '{schemaVersion:1,lane:"challenger",status:"completed",disposition:$d}' \
     >"$R/challenger/challenge.complete.json"
-  # NO_IDENTITY: an owner that never runs smoke-pair-identity.sh (XZO #2092).
+  # NO_IDENTITY: an owner that never runs smoke-pair-identity.sh.
   [ -n "${NO_IDENTITY:-}" ] || printf '{"label":"end","verdict":"ok"}\n' >"$R/coordinator/identity-checks.ndjson"
 }
 
@@ -157,7 +157,7 @@ world() { # tick
   fi
   [ "$n" -ge 1 ] || return 0
   # NO_CONTRACT: an owner that never writes a completion contract -- a
-  # provider park, a declination (XZO #2093, run pr2075).
+  # provider park, a declination (run pr2075).
   [ -z "${NO_CONTRACT:-}" ] || return 0
   if [ ! -e "$R/completion-contract.json" ]; then
     contract
@@ -579,7 +579,7 @@ for variant in claimant token; do
   [ ! -e "$R/controller/brief-intake.md" ] || fail "$variant: no owner brief for a run we do not hold"
   # Its holder finishes it: no foreign-finish alarm (no-authority already said
   # so) and no post-finish write -- the wake marked it a freeze PR, so before
-  # XZO #2176 this planned and ran a freeze-close on a run we never held.
+  # Before this fix it planned and ran a freeze-close on a run we never held.
   gate_finished_elsewhere "$RUN"
   step_ok 2026-09-18T12:10:00Z
   [ "$(jq -s '[.[] | select(.tool=="gate" or .tool=="gh" or .tool=="ncl")] | length' "$FAKE_LOG")" = 0 ] \
@@ -590,7 +590,7 @@ for variant in claimant token; do
     || fail "$variant: the run is closed out as finished by its holder"
 done
 # d) a run the legacy coordinator claimed and finishes itself -- a
-#    human-requested campaign (XZO #2176) -- is not an orphan of ours: never
+#    human-requested campaign -- is not an orphan of ours: never
 #    journaled, never alarmed, never acted on, from claim to finish.
 new_case coordinator-run
 claim 2026-09-18T11:30:00Z "" owner-coordinator
@@ -666,7 +666,7 @@ step_ok 2026-09-18T11:00:00Z
 jr '[.[] | select(.slot | startswith("alarm:foreign-finish"))] | length == 0' | grep -qx true \
   || fail "lost-twice: the holder's finish is quiet once the last loss was alarmed"
 # h) a post-finish write an earlier controller already journaled for such a
-#    run (XZO #2176 had a freeze-close planned) is abandoned with its reason,
+#    run (one that had a freeze-close planned) is abandoned with its reason,
 #    not left open -- open, it kept every later fire revisiting the run.
 for seeded in intent failed; do
   new_case "inherited-close-$seeded"
@@ -782,7 +782,7 @@ python3 -B - "$CTL" <<'PY' || fail "abandoned: pick_owner_wake filters on the fi
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("ctl", sys.argv[1])
 ctl = importlib.util.module_from_spec(spec); spec.loader.exec_module(ctl)
-run = "xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
+run = "acme-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
 k = lambda kind, slot: ctl.obligation_key(run, kind, slot)
 class Stub:
     live, fire = True, "f1"
@@ -844,7 +844,7 @@ UNCONF="alarm:finish-unconfirmed:${RUN: -40}"
 for point in "after-intent:send:$UNCONF" "before-intent:send:$UNCONF"; do
   new_case "unconfirmed-${point%%:*}"
   claim; wake_json
-  gate_finished_elsewhere xzo-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
+  gate_finished_elsewhere acme-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
   recovery_fires "$point" 0
   one_alarm "finish unconfirmed, killed ${point%%:*}" "$UNCONF"
   [ "$(jq -s '[.[] | select(.tool=="gate")] | length' "$FAKE_LOG")" = 0 ] \
@@ -970,7 +970,7 @@ transition() { # name
                         gate_finished_elsewhere "$RUN"
                         inputs_from_fakes; step_ok "$(tick_time 1)" ;;
     finish-unconfirmed) claim; wake_json; inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
-                        gate_finished_elsewhere xzo-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
+                        gate_finished_elsewhere acme-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
                         inputs_from_fakes; step_ok "$(tick_time 1)" ;;
     # Codex round-4 repro 2: the gate's verdict.json cannot be parsed. The step
     # answers "unknown" -- not on the allowlist -- so the boundary alarms.
@@ -1039,8 +1039,8 @@ done
 unset variant name t want
 
 
-# --- XZO #2047: a barrier refusal must reach the OWNER ------------------------
-# Run xzo-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier answered
+# --- a barrier refusal must reach the OWNER ------------------------
+# Run acme-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier answered
 # `invalid: ["journeys/scope-dispositions.json"]` on the 19:51:35Z fire -- the
 # FIRST lanes fire, before a single lane had run -- and every fire after it. The
 # controller journaled that as an `escalate` decision with the reasons truncated
@@ -1088,7 +1088,7 @@ grep -q 'controller/barrier-lanes.json' "$R/controller/brief-lanes.md" \
 grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
   || fail "#2047: a barrier that is only waiting for markers must not shout like one refusing content"
 
-# --- XZO #2046: a re-minted owner token must be re-ISSUED to the owner --------
+# --- a re-minted owner token must be re-ISSUED to the owner --------
 # Same run. The controller's fires stopped for 40 minutes (19:51:19Z ->
 # 20:31:42Z, wrapper/fires.ndjson) while the gate's coordinator lease is 900 s
 # (smoke-pr-gate.sh:220), so the lease lapsed under a live owner and its eight
@@ -1160,7 +1160,7 @@ jq -se '[.[] | select(.kind=="owner" and .state=="intent" and (.detail.tokenReis
 
 
 # --- round 2, finding 3: the SYNTHESIS barrier's refusal wakes the owner too ---
-# The lanes fix (XZO #2047) left the identical blind spot on the sibling path:
+# The lanes fix left the identical blind spot on the sibling path:
 # when the synthesis barrier is not ready the branch published the report and
 # returned, and smoke-controller-live.sh wakes the owner only on `ownerWake`.
 # So the owner -- the only party that can repair what that barrier rejects --
@@ -1275,19 +1275,19 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5475' 'smoke-campaign-controller.py:1526-1528' \
-         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1515-1525'; do
+for c in 'smoke-pr-gate.sh:5567' 'smoke-campaign-controller.py:1529-1531' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1518-1528'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
-cite smoke-pr-gate.sh 5475 'OWNER_TOKEN="$(new_owner_token'
-cite smoke-pr-gate.sh 5504 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5509 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5554 '.activeLeaseOwner=$owner'
+cite smoke-pr-gate.sh 5567 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5596 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5601 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5646 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 707 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1471 'def _owner_wake'
-cite smoke-campaign-controller.py 1521 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1526 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1474 'def _owner_wake'
+cite smoke-campaign-controller.py 1524 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1529 'if c.get("wake"):'
 
 
 # --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
@@ -1431,7 +1431,7 @@ jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .detail.briefedToken
   "$C/out/journal.ndjson" >/dev/null \
   || fail "#2046(backfill): an agreeing run tree was not backfilled, so it is re-read every fire"
 
-# --- XZO #2092: a clean GO synthesis with no pair identity is caught at lanes --
+# --- a clean GO synthesis with no pair identity is caught at lanes --
 # Run pr2088's real shape: the owner never runs smoke-pair-identity.sh (neither
 # identity.json nor identity-checks.ndjson), every lane passes, the challenger
 # clears and the owner synthesises GO. The controller's only enforcement point
@@ -1505,7 +1505,7 @@ done
 [ ! -e "$R/controller/barrier-lanes.json" ] \
   || fail "#2092: the lanes refusal was left published after the phase passed"
 
-# --- XZO #2093: the challenger deadline ends a run from EVERY phase ------------
+# --- the challenger deadline ends a run from EVERY phase ------------
 # Every negative below is paired with a positive that only happens if the code
 # under test ran: a wake or a wait decision BEFORE the deadline proves the run
 # really sat in that phase, and the gate's own terminal call proves the fire

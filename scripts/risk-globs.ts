@@ -1,18 +1,7 @@
 /**
- * Host/container split of `.github/labeler.yml`'s `risk:high` globs, for the coverage
- * ratchet (docs/specs/risk-based-review/plan.md, "Tests on risky paths").
- *
- * Reuses `globsForRiskHigh` (scripts/review-outcomes.ts) rather than re-deriving the
- * risk:high glob list a third time — that function already owns "read risk:high out of
- * a parsed labeler.yml payload" (scripts/labeler-config.test.ts's `globsFor` is its own
- * copy, deliberately, because that script has to replay an arbitrary `--repo`'s
- * labeler.yml fetched over the network; the coverage ratchet only ever reads this
- * checkout's own `.github/labeler.yml`, so importing is safe here).
- *
- * The host/container split matters because the two lanes' coverage tools are entirely
- * separate: host risk files are `.ts` under `src/`/`scripts/` that vitest (Node) can
- * import and instrument; container risk files live under `container/agent-runner/` and
- * only run under Bun (bun:sqlite, Bun-only APIs) — vitest can't load them at all.
+ * Host/container split of `.github/labeler.yml`'s `risk:high` globs, for the coverage ratchet.
+ * The two lanes' coverage tools are separate: host files are `.ts` under `src/`/`scripts/` that
+ * vitest instruments; container files run only under Bun, which vitest can't load.
  */
 
 /** True for a risk:high glob that names `.ts` source under `src/` or `scripts/`. */
@@ -35,14 +24,9 @@ export function containerRiskGlobs(riskHighGlobs: readonly string[]): string[] {
 }
 
 /**
- * Everything else `risk:high` covers — `.github/**`, `.husky/**`, shell scripts,
- * `pnpm-workspace.yaml`, `container/Dockerfile`, docs, and the baseline file itself
- * (added to risk:high so deleting it, or gaming it, requires review) — is config or
- * prose with no line coverage to measure, on either side. Listed explicitly, rather
- * than "anything neither host nor container", so a genuinely new risk:high glob that
- * SHOULD carry coverage (say, a `.ts` file added outside `src/`/`scripts/`, or a `.tsx`
- * that `isHostCodeGlob`'s extension check doesn't recognize) fails loudly instead of
- * silently vanishing from `coverage.include` — see `assertFullyClassified` below.
+ * Config or prose with no line coverage on either side. Listed explicitly, not "anything else",
+ * so a new risk:high glob that SHOULD carry coverage fails loudly instead of silently vanishing
+ * from `coverage.include`.
  */
 const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   'pnpm-workspace.yaml',
@@ -50,9 +34,6 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   'container/build.sh',
   'scripts/deploy.sh',
   'scripts/git-safety*.sh',
-  // scripts/wiki-autopush.sh is gone (removed from risk:high upstream) — deliberately
-  // not left here as a stale entry; an unclassified glob should still throw if this
-  // path ever comes back under a different name.
   'scripts/lib/secret-scan.sh',
   'scripts/wiki-pre-push-hook*.sh',
   '.github/**',
@@ -63,40 +44,24 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   // Hygiene-check policy (knip and jscpd configuration); the checker itself is scripts/hygiene/**.
   'knip.json',
   '.jscpd.json',
-  // The QA release gate. Bash and Python only -- no .ts/.js in the tree --
-  // run by its own *.test.sh suites, which neither lane's coverage tool instruments.
+  // The QA release gate: Bash and Python only, which neither lane's coverage tool instruments.
   'container/skills/smoke-test/**',
   'docs/review-policy.md',
-  // Trunk's worker agent definitions. The directory is EMPTY today: reviewer
-  // eligibility is a small-tier denylist in codex-review.sh, not a list of ids
-  // derived from here, and delegation ships in the bootstrap orchestrate plugin
-  // instead. The glob stays because re-adding a
-  // def here would put a subagent definition into every Claude group, which is
-  // a risk:high change on its own — .md frontmatter/prose, not source either
-  // lane's test suite instruments.
+  // Agent definitions: .md frontmatter/prose, not instrumented source.
   'container/agents/**',
-  // Executable agent/tool config — a hook, an
-  // auto-trusted MCP server, Claude Code's own trust state, a ripgrep config, and a
-  // submodule URL (see .github/labeler.yml's own comment on this block). None of
-  // these is source this repo's own test suites instrument; they are config other
-  // tools read.
+  // Executable agent/tool config other tools read, not source this repo's suites instrument.
   '.claude/**',
   '.mcp.json',
   '.claude.json',
   '.ripgreprc',
   '.gitmodules',
-  // The coverage baseline itself: docs/specs/risk-based-review/plan.md, "Tests on
-  // risky paths" — a PR that deletes tests should not also get to delete the
-  // evidence, so this file is on risk:high, but it carries no line coverage.
+  // The coverage baseline: risk:high so a PR can't delete tests and the evidence together.
   'coverage-risk-baseline.json',
 ]);
 
 /**
- * Every `risk:high` glob must be host code, container code, or a KNOWN_NON_CODE_GLOBS
- * entry — anything else is a genuinely unrecognized shape (a new extension, a new
- * top-level directory) that would otherwise silently drop out of coverage scope. Throws
- * rather than warns: `.github/labeler.yml` changes are already review-gated (risk:gates),
- * so the fix belongs in this file's classification, not a log line nobody reads.
+ * Every glob must be host code, container code, or a KNOWN_NON_CODE_GLOBS entry. Throws rather
+ * than warns: the fix belongs in this file's classification.
  */
 export function assertFullyClassified(riskHighGlobs: readonly string[]): void {
   const unclassified = riskHighGlobs.filter(

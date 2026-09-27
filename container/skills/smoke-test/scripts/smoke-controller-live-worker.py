@@ -39,7 +39,7 @@ INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbo
 # THE ENV FILE IS THE LIST OF KEYS. Every literal assignment in it is
 # configuration and is passed through, because the file is the INSTALL's and
 # a copy of its key names kept here goes stale the first time the install adds
-# one. That is XZO #2047: this file carried a 12-name allowlist while the
+# one. That was the earlier failure: this file carried a 12-name allowlist while the
 # install's env file defined 17, so SMOKE_GATE_LEASE_DIR was dropped. An
 # install's deployment gate wrapper sources the file itself (`. <its
 # dir>/smoke-gate-env.sh`, then exec the skill's gate), so ITS lease dir stayed
@@ -62,7 +62,7 @@ INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbo
 # WITHIN ONE NAMESPACE, though. The scope is the `SMOKE_` prefix the install's
 # configuration owns -- not a list of names, so it cannot drift: a new SMOKE_
 # key the install adds works here with no change. Everything outside it is not
-# this file's configuration and is IGNORED, exactly as it was before XZO #2047:
+# this file's configuration and is IGNORED, exactly as it was before that fix:
 # PATH, IFS and the shell hooks, LD_PRELOAD and friends, PYTHONPATH, and
 # BUN_OPTIONS -- whose `--preload` makes Bun execute a module before its main
 # script, and this wrapper's enqueue command is Bun (ENQUEUE above). Honouring
@@ -550,7 +550,7 @@ def alarm_queue():
 # because smoke-controller-renew.sh, its own scheduled series, keeps stamping
 # `progress` for it. Nothing verified that series existed: it merged on 09-20
 # (#955), was not created until 09-22, and campaign pr2055 lost its lease
-# mid-step in between (XZO #2024). The renewer now records every tick in
+# mid-step in between. The renewer now records every tick in
 # <out>/renewer/heartbeat.json (smoke-controller-renew.sh, THE HEARTBEAT), and
 # this fire reads it before it may POLL -- the poll being what claims new
 # campaigns (pr_build_settled) and what re-mints a stale one.

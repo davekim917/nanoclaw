@@ -1,16 +1,4 @@
-/**
- * Codex-side hook runner.
- *
- * Codex's app-server fires shell-command hooks via ~/.codex/hooks.json with
- * Claude-flavored stdin/stdout JSON (same shape Claude Code uses; the codex
- * hook protocol borrowed this format directly). This module exposes the
- * same hook decisions the Claude provider uses as SDK callbacks, but
- * dispatched from a CLI entry-point so codex-spawned subprocesses can
- * invoke them.
- *
- * Payload differences from Claude to Codex are normalized in
- * `normalizeCodexHookInput` — same algorithm as ~/.codex/hooks/codex-claude-shim.cjs.
- */
+/** Payload normalization follows ~/.codex/hooks/codex-claude-shim.cjs; keep the two in step. */
 import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
 
 import {
@@ -24,10 +12,7 @@ import {
 } from '../providers/claude.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 
-/**
- * Codex shell-tool aliases. Normalized to Claude's `Bash` so existing hooks
- * (which match on `tool_name === 'Bash'`) fire correctly.
- */
+/** Normalized to `Bash` because the shared hooks match on `tool_name === 'Bash'`. */
 const CODEX_SHELL_ALIASES = new Set(['exec_command', 'local_shell_call', 'shell']);
 
 export interface CodexHookInput {
@@ -37,22 +22,13 @@ export interface CodexHookInput {
   tool_response?: unknown;
   cwd?: string;
   session_id?: string;
-  /**
-   * The tool call this hook was fired for. Codex supplies it on every
-   * PreToolUse input (`PreToolUseCommandInput`, codex-rs `hooks/src/schema.rs`),
-   * and EVERY handler of one tool call receives the same value — which is what
-   * lets the concurrently-dispatched guards collapse to one approval card.
-   */
+  /** Same value for every handler of one tool call, which lets the concurrent guards share one approval card. */
   tool_use_id?: string;
   transcript_path?: string;
   hook_event_name?: string;
   [key: string]: unknown;
 }
 
-/**
- * Normalize a Codex hook payload to Claude's shape so existing
- * `tool_name === 'Bash'` / `tool_input.command` matching works.
- */
 export function normalizeCodexHookInput(input: CodexHookInput): CodexHookInput {
   if (!input || typeof input !== 'object') return input;
   const out: CodexHookInput = { ...input };
@@ -81,26 +57,8 @@ export function normalizeCodexHookInput(input: CodexHookInput): CodexHookInput {
 
 export type HookEvent = 'PreToolUse' | 'PostToolUse' | 'PostToolUseFailure';
 
-// ── Destructive-action guard (shared bootstrap core) ───────────────────────────
-// This chain carries the destructive-command gate (parity with the Claude
-// block-destructive hook + the OpenCode opencode-guard plugin), reusing the SAME
-// decision core the other runtimes import — no drift. The equivalent adapter on
-// the plugin side is workflow-agents/hooks/codex-guard.ts.
-//
-// It was wired here because Codex did NOT fire plugin-provided hooks under
-// app-server or exec. That premise is GONE: the spawn writes the `[hooks.state.*]`
-// trust entries that make codex dispatch plugin hooks, and refuses the spawn
-// unless the generated chain reads back dispatchable. So in a Codex
-// container BOTH adapters now run on every tool call — concurrently, with the
-// same `tool_use_id` (codex-rs 0.154.0 `hooks/src/engine/dispatcher.rs` pushes
-// every matched handler onto a `FuturesUnordered`; measured 0.7 ms apart).
-//
-// Both still EVALUATE, deliberately: the two chains are not equivalent (the
-// plugin alone carries the /team-auto request_user_input block, the native
-// email-tool gate and the snapshot-git-mutation guard), so silencing either
-// would drop coverage. What must not double is the APPROVAL: `toolUseId` is
-// threaded into the gate so the two guards share one card. See
-// `claimGateRequest` in the shared core.
+// This chain and the plugin's codex-guard.ts both run, concurrently, on every Codex tool call. Both must evaluate
+// (neither covers the other); only the approval is shared, via `toolUseId`, so the two raise one card.
 type GuardCore = {
   evaluateBashCommand: (
     cmd: string,
@@ -111,28 +69,18 @@ type GuardCore = {
     cmd: string,
     reason: string,
     onStageError?: (e: unknown) => void,
-    /**
-     * OPTIONAL 4th positional, added by the shared core's one-card-per-tool-call
-     * claim. A core from an older container image ignores it and behaves exactly
-     * as before — two cards — so this must never be required.
-     */
+    /** Optional: a core from an older image ignores it (two cards), so it must never be required. */
     toolUseId?: string,
   ) => 'approved' | 'denied' | 'timeout';
   IS_NANOCLAW: boolean;
 };
 
-/** Default container path to the vendored shared guard core. Overridable via
- *  NANOCLAW_DESTRUCTIVE_GUARD_CORE (used by tests). */
 const DEFAULT_GUARD_CORE_PATH =
   '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 
-/** Typed load result — never a bare null. A failure carries a reason so the
- *  caller can deny with a diagnostic instead of silently allowing (D17/C4:
- *  the destructive guard is fail-CLOSED). */
 type GuardCoreLoad = { ok: true; core: GuardCore } | { ok: false; reason: string };
 
-/** Required exports + their expected types. A core missing/mis-typing any of
- *  these is malformed and must be rejected (fail-closed), not used partially. */
+/** A core missing or mis-typing any export is rejected, never used partially. */
 function validateGuardCore(mod: Record<string, unknown>): string | null {
   const missing: string[] = [];
   if (typeof mod.evaluateBashCommand !== 'function') missing.push('evaluateBashCommand');
@@ -142,11 +90,6 @@ function validateGuardCore(mod: Record<string, unknown>): string | null {
   return missing.length > 0 ? `missing/mis-typed export(s): ${missing.join(', ')}` : null;
 }
 
-/** Import the shared guard core from the mounted bootstrap plugin (bun caches the
- *  module, so re-calls are cheap), then validate its export shape. Returns a
- *  TYPED failure (never a bare null) if the import fails or the exports are
- *  malformed — the caller denies. Fail-CLOSED: a missing/broken core must not
- *  let destructive commands through unguarded. */
 async function loadGuardCore(): Promise<GuardCoreLoad> {
   const corePath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
   let mod: Record<string, unknown>;
@@ -166,10 +109,7 @@ async function loadGuardCore(): Promise<GuardCoreLoad> {
   return { ok: true, core: mod as unknown as GuardCore };
 }
 
-/** A guard core's evaluateBashCommand may return garbage even when it passes
- *  the load-time export-type check. Every verdict — initial AND the post-approval
- *  skipGate re-checks — must be shape-validated; an unknown/missing action denies
- *  (fail-closed), never falls through to allow. */
+/** Every verdict, including the post-approval re-checks, is shape-checked: an unknown action denies. */
 function wellFormedVerdict(v: unknown): v is { action: 'allow' | 'block' | 'gate'; reason?: string } {
   const action = (v as { action?: unknown } | null | undefined)?.action;
   return action === 'allow' || action === 'block' || action === 'gate';
@@ -188,16 +128,13 @@ function denyDecision(reason: string): {
   };
 }
 
-/** Evaluate a bash command against the shared core; return a deny decision to
- *  block, or null to allow. Mirrors the control flow of block-destructive.ts /
- *  opencode-guard.ts / codex-guard.ts (each a thin adapter over the same core). */
 async function runDestructiveGuard(
   command: string,
   toolUseId?: string,
 ): Promise<ReturnType<typeof denyDecision> | null> {
   if (!command) return null;
   const loaded = await loadGuardCore();
-  // Fail-CLOSED (D17/C4): a missing or malformed core denies, it does NOT allow.
+  // Fail closed: a missing or malformed core denies.
   if (!loaded.ok) {
     return denyDecision(
       `Destructive-command guard unavailable (${loaded.reason}). Denying for safety — report this rather than retrying.`,
@@ -205,9 +142,7 @@ async function runDestructiveGuard(
   }
   const core = loaded.core;
 
-  // Wrap the core evaluator: any exception → deny (a throwing guard must never
-  // fall through to allow). consumeGateApproval / runNanoclawGate exceptions are
-  // likewise treated as a denied gate below.
+  // A throwing guard must never fall through to allow.
   let verdict: ReturnType<GuardCore['evaluateBashCommand']>;
   try {
     verdict = core.evaluateBashCommand(command);
@@ -216,14 +151,6 @@ async function runDestructiveGuard(
       `Destructive-command guard errored (${err instanceof Error ? err.message : String(err)}). Denying for safety.`,
     );
   }
-  // Validate the verdict SHAPE (C4 fail-closed): validateGuardCore only proves
-  // evaluateBashCommand is a function — not that it RETURNS a real verdict. A
-  // malformed-but-importable core returning undefined/null/{}/an unknown action
-  // would otherwise fall through `verdict.action` access (the prior `.action`
-  // read sat outside the try/catch and would throw, escaping to the CLI's
-  // fail-open path). The SAME check is applied to the post-approval skipGate
-  // re-checks below — every evaluateBashCommand result is
-  // shape-validated, never just the first.
   if (!wellFormedVerdict(verdict)) {
     return denyDecision(
       'Destructive-command guard returned a malformed verdict — denying for safety. Report this rather than retrying.',
@@ -232,18 +159,14 @@ async function runDestructiveGuard(
   if (verdict.action === 'allow') return null;
   if (verdict.action === 'block') return denyDecision(verdict.reason ?? 'destructive command blocked');
 
-  // gate
   const reason = verdict.reason ?? 'requires approval';
   try {
-    // STRICT boolean: a malformed core could return a truthy non-boolean ({}, a
-    // non-empty string) — only an exact `true` counts as "already approved".
-    // Anything else falls through to real gate staging (fail-closed).
+    // Only an exact `true` counts: a malformed core may return a truthy non-boolean.
     if (core.consumeGateApproval(command) === true) {
       const post = core.evaluateBashCommand(command, { skipGate: true });
       if (!wellFormedVerdict(post))
         return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
-      // Only an explicit `allow` passes. A repeated `gate` (a stale/malformed core
-      // that ignored skipGate) must NOT become an allow — deny it.
+      // A repeated `gate` (a stale core ignoring skipGate) must deny, not allow.
       return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
     }
     if (core.IS_NANOCLAW) {
@@ -261,8 +184,6 @@ async function runDestructiveGuard(
         const post = core.evaluateBashCommand(command, { skipGate: true });
         if (!wellFormedVerdict(post))
           return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
-        // Only an explicit `allow` passes — a repeated `gate` after approval (stale
-        // core ignoring skipGate) must deny, not fall through to allow.
         return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
       }
       const detail =
@@ -281,16 +202,12 @@ async function runDestructiveGuard(
   return denyDecision(`${reason} — requires explicit user approval, unavailable in this environment.`);
 }
 
-// ── File-protection (shared bootstrap core, parity with Claude file-protection) ──
 type FileProtectionCore = {
   EDIT_TOOLS: Set<string>;
   checkEditProtection: (toolName: string, toolInput: Record<string, unknown>) => string | null;
 };
 
-/** Inline fallback set of edit-tool names — used ONLY to decide fail-closed deny
- *  when the file-protection core is unavailable/malformed (so we still know a
- *  call is an edit that should be blocked without a working EDIT_TOOLS export).
- *  Keep in sync with file-protection-core.ts EDIT_TOOLS. */
+/** Used only to deny edits when the core is unavailable; keep in sync with file-protection-core.ts EDIT_TOOLS. */
 const FALLBACK_EDIT_TOOLS = new Set([
   'Edit',
   'MultiEdit',
@@ -302,10 +219,8 @@ const FALLBACK_EDIT_TOOLS = new Set([
   'apply_patch',
 ]);
 
-/** Typed load result for the file-protection core — never a bare null. */
 type FileProtectionLoad = { ok: true; core: FileProtectionCore } | { ok: false; reason: string };
 
-/** Validate the file-protection core's export shape. */
 function validateFileProtectionCore(mod: Record<string, unknown>): string | null {
   const missing: string[] = [];
   if (!(mod.EDIT_TOOLS instanceof Set)) missing.push('EDIT_TOOLS');
@@ -313,10 +228,6 @@ function validateFileProtectionCore(mod: Record<string, unknown>): string | null
   return missing.length > 0 ? `missing/mis-typed export(s): ${missing.join(', ')}` : null;
 }
 
-/** Import file-protection-core.ts from the same dir as the guard core, then
- *  validate its export shape. Returns a TYPED failure (never a bare null) when
- *  the import fails or the exports are malformed. Fail-CLOSED: the caller denies
- *  protected edits when the core can't be loaded. */
 async function loadFileProtectionCore(): Promise<FileProtectionLoad> {
   const guardPath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
   const fpPath = guardPath.replace(/[^/]+$/, 'file-protection-core.ts');
@@ -337,10 +248,7 @@ async function loadFileProtectionCore(): Promise<FileProtectionLoad> {
   return { ok: true, core: mod as unknown as FileProtectionCore };
 }
 
-/** Block edits (Edit/Write/apply_patch/...) to protected paths. Returns a deny
- *  decision or null. Bypassable via SKIP_FILE_PROTECTION=1 (parity with Claude).
- *  Fail-CLOSED: a missing/malformed/throwing core denies any EDIT tool call
- *  (identified via FALLBACK_EDIT_TOOLS) rather than letting the edit through. */
+/** A missing, malformed or throwing core denies every edit tool (per FALLBACK_EDIT_TOOLS) rather than allowing. */
 async function runFileProtection(
   toolName: string,
   toolInput: Record<string, unknown>,
@@ -349,8 +257,6 @@ async function runFileProtection(
 
   const loaded = await loadFileProtectionCore();
   if (!loaded.ok) {
-    // Core gone/broken — deny edit-tool calls (using the inline edit-tool set),
-    // pass non-edit tools through (file-protection only governs edits).
     if (!FALLBACK_EDIT_TOOLS.has(toolName)) return null;
     return denyDecision(
       `file-protection unavailable (${loaded.reason}) — denying edit to '${(toolInput.file_path ?? toolInput.path ?? toolName) as string}' for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
@@ -359,21 +265,16 @@ async function runFileProtection(
 
   const core = loaded.core;
   if (!core.EDIT_TOOLS.has(toolName)) return null;
-  // Typed `unknown`: checkEditProtection comes from a dynamically-imported core,
-  // so its runtime return can't be trusted to match the `string | null` type.
+  // `unknown`: the dynamically imported core's return value cannot be trusted to match its type.
   let blocked: unknown;
   try {
     blocked = core.checkEditProtection(toolName, toolInput);
   } catch (err) {
-    // A throwing protection check must not fall through to allow.
     return denyDecision(
       `file-protection check errored (${err instanceof Error ? err.message : String(err)}) — denying edit for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
     );
   }
-  // Contract: a non-empty string = protected (block); null = allowed. Anything
-  // else (undefined/false/''/0/a non-string) is a malformed core result — for an
-  // EDIT tool (we passed EDIT_TOOLS.has above) that means deny, never fall through
-  // to allow on a falsy-non-null.
+  // Only null allows; anything other than a non-empty string is malformed and denies.
   if (blocked === null) return null;
   if (typeof blocked === 'string' && blocked.length > 0) {
     return denyDecision(
@@ -385,25 +286,11 @@ async function runFileProtection(
   );
 }
 
-/**
- * Run the PreToolUse hook chain in sequence. Stops on the first hook
- * that emits a `decision: 'block'` or a `permissionDecision: 'deny'`.
- * Carries `updatedInput` forward across hooks.
- *
- * Output: a single object suitable for JSON.stringify to stdout. Codex's
- * hook runtime parses it the same way Claude Code does:
- *   { hookSpecificOutput: { hookEventName: 'PreToolUse',
- *                            permissionDecision: 'deny' | 'allow',
- *                            permissionDecisionReason: string,
- *                            updatedInput?: object } }
- *   or { continue: true } for "no opinion / proceed".
- */
+/** Stops at the first block or deny, carrying `updatedInput` forward across hooks. */
 export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown> {
   const normalized = normalizeCodexHookInput(input);
 
-  // Tool denylist (preToolUseHook's first responsibility) + container_state
-  // tracking. Block path is structural — non-Bash tools also pass through
-  // here so the in-flight tracker stays current.
+  // Non-Bash tools also pass through here so the in-flight tracker stays current.
   const first = await preToolUseHook(
     normalized as Parameters<HookCallback>[0],
     {} as Parameters<HookCallback>[1],
@@ -414,8 +301,6 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   }
 
   if (normalized.tool_name !== 'Bash') {
-    // File-protection applies to edit tools (apply_patch, Edit, Write, ...) —
-    // they don't go through the Bash chain below.
     const fpDeny = await runFileProtection(
       normalized.tool_name ?? '',
       (normalized.tool_input ?? {}) as Record<string, unknown>,
@@ -424,18 +309,14 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
     return first ?? { continue: true };
   }
 
-  // Bash-only chain. Order matters: the command rewrite (jest lock only — this
-  // chain applies no stdin prefix, see below) first, so every guardrail after
-  // it evaluates the same command text.
+  // Rewrite first, so every guardrail after it evaluates the same command text.
   const chain: HookCallback[] = [
     createBashCommandRewriteHook(),
     createManagedGitMaintenanceHook(),
     createSelfApprovalBlockHook(),
     createBlockSnowflakeConnectorHook(),
     createBlockGitCloneHook(),
-    // The ONLY caller that arms the shared approval claim: this chain knows the
-    // plugin adapter is gating the same tool call. See `GateClaimApi` in
-    // providers/claude.ts.
+    // The only caller that arms the shared approval claim: the plugin adapter gates the same tool call.
     createEmailGateHook({ sharedApprovalClaim: true }),
   ];
   let currentInput: CodexHookInput = normalized;
@@ -450,11 +331,7 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
         {} as Parameters<HookCallback>[2],
       );
     } catch (err) {
-      // Fail CLOSED (C4): a guard hook that throws — e.g. the email gate's
-      // session-DB round-trip (writeMessageOut/awaitDeliveryAck) failing — must
-      // DENY, not let the exception escape to the CLI's PreToolUse handler.
-      // (cli.ts now also denies on escape; this denies at the source with a
-      // clearer reason and keeps the guarantee local to the chain.)
+      // A throwing guard (e.g. the email gate's session-DB round-trip) must deny here, not escape to the CLI.
       return denyDecision(
         `Guard hook errored (${err instanceof Error ? err.message : String(err)}) — denying for safety. Report this rather than retrying.`,
       );
@@ -483,28 +360,15 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
     }
   }
 
-  // Destructive-action guard — runs on the post-sanitize command, after the
-  // existing chain. Returns a deny decision (blocks) or null (allow/continue).
+  // Runs on the rewritten command, after the chain.
   const guardCommand = (currentInput.tool_input as { command?: string } | undefined)?.command ?? '';
-  // The gate is keyed on the RAW tool_use_id codex supplied, not on anything
-  // this chain derived: the plugin adapter keys on the same value, and a
-  // divergence would silently give each chain its own card again.
-  // `typeof === 'string'`, matching codex-guard.ts: a non-string id would make
-  // this chain claim while the plugin adapter did not, which is two cards again.
+  // Keyed on the raw string tool_use_id exactly as codex-guard.ts keys it: any divergence means two cards.
   const toolUseId = typeof normalized.tool_use_id === 'string' ? normalized.tool_use_id : undefined;
   const guardDeny = await runDestructiveGuard(guardCommand, toolUseId);
   if (guardDeny) return guardDeny;
 
-  // NO stdin prefix here, deliberately. `exec </dev/null` exists for the Claude
-  // Code Bash tool, whose fd 0 is a unix socket that is never written and never
-  // closed (the 2026-09-22 hang). Nothing shows a Codex path has that
-  // condition, and emitting `updatedInput` on every Bash call — rather than
-  // only for the jest rewrite — would put unverified surface on every Codex
-  // container for a hypothetical gain: whether codex honours the field, and
-  // under which key, is not established.
-  // So this chain emits exactly what it did before: the jest rewrite, or nothing.
-  // The Claude side applies the prefix at its own emit point — see
-  // createBashCommandRewriteHook's INVARIANT in providers/claude.ts.
+  // No `exec </dev/null` stdin prefix here: nothing shows Codex needs it, and whether Codex honours
+  // `updatedInput` on every Bash call is unverified. The Claude side applies it at its own emit point.
 
   if (mergedUpdatedInput) {
     return {
@@ -517,9 +381,6 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   return { continue: true };
 }
 
-/**
- * Run the PostToolUse hook chain. Always clears the in-flight tracker.
- */
 async function runPostToolUseChain(input: CodexHookInput): Promise<unknown> {
   const normalized = normalizeCodexHookInput(input);
 
@@ -532,10 +393,6 @@ async function runPostToolUseChain(input: CodexHookInput): Promise<unknown> {
   return { continue: true };
 }
 
-/**
- * Dispatch a hook by event name. Returns the JSON object to emit on
- * stdout for the Codex hook runtime to interpret.
- */
 export async function runHookForCodex(eventName: HookEvent, input: CodexHookInput): Promise<unknown> {
   switch (eventName) {
     case 'PreToolUse':

@@ -53,6 +53,9 @@ import sys
 import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.dont_write_bytecode = True  # smoke-acceptance.test.sh rejects __pycache__ beside the scripts
+sys.path.insert(0, SCRIPT_DIR)
+import smoke_run_id  # noqa: E402
 CONTROLLER_PATH = os.path.join(SCRIPT_DIR, "smoke-campaign-controller.py")
 FIRE_SECONDS = 600
 CHALLENGER_TIMEOUT_SECONDS = 5400
@@ -73,6 +76,13 @@ CREDENTIAL_PATTERNS = [
 ]
 
 
+def campaign_runs(names, prefix, since, until=None):
+    """The PR-campaign run dirs among `names` stamped in [since, until]; task and manual runs are skipped."""
+    return sorted(d for d in names
+                  if (m := smoke_run_id.parse(d, prefix)) and m.group("stamp")[:8] >= since
+                  and (not until or m.group("stamp")[:8] <= until))
+
+
 def parse_iso(s):
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
 
@@ -83,10 +93,6 @@ def iso(t):
 
 def mtime_iso(path):
     return iso(dt.datetime.fromtimestamp(os.path.getmtime(path), dt.timezone.utc))
-
-
-def run_claim_time(run_id):
-    return dt.datetime.strptime(run_id.rsplit("-", 1)[1], "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
 
 
 def credential_hits(text):
@@ -146,12 +152,13 @@ def _scrub_marker(m):
 
 
 def build(args):
+    prefix = (getattr(args, "run_prefix", "") or "").strip()
+    if not prefix:
+        sys.exit("build: --run-prefix (or SMOKE_GATE_RUN_PREFIX) is required")
     gh = json.load(open(args.gh_actual))
     a2 = json.load(open(args.actuals2))
     turns = json.load(open(args.turns)).get("camp", {}) if args.turns else {}
-    runs = sorted(d for d in os.listdir(args.gate_runs)
-                  if d.startswith("xzo-pr-") and d.rsplit("-", 1)[1][:8] >= args.since
-                  and (not args.until or d.rsplit("-", 1)[1][:8] <= args.until))
+    runs = campaign_runs(os.listdir(args.gate_runs), prefix, args.since, args.until)
     lines = [json.dumps({"provenance": {
         "builtAt": iso(dt.datetime.now(dt.timezone.utc)),
         "window": [args.since, args.until],
@@ -232,9 +239,10 @@ def build(args):
         x = a2.get(run, {})
         confirmed = sorted({f for fe in files if isinstance(fe.get("content"), dict)
                             for f in fe["content"].get("confirmedFindings") or []})
+        claim = smoke_run_id.claimed_at(run)
         entry = {
-            "runId": run, "pr": int(re.match(r"xzo-pr-pr(\d+)-", run).group(1)),
-            "sourceSha": contract.get("sourceSha"), "claimAt": iso(run_claim_time(run)),
+            "runId": run, "pr": smoke_run_id.pr_number(run, prefix),
+            "sourceSha": contract.get("sourceSha"), "claimAt": iso(claim) if claim else verdict.get("finishedAt"),
             "isFreezePr": (x.get("headRefName") or "").startswith("smoke/freeze-"),
             "files": sorted({f["path"]: f for f in reversed(files)}.values(), key=lambda f: (f["at"], f["path"])),
             "identityChecks": sorted(identity, key=lambda i: i["at"]),
@@ -341,9 +349,6 @@ def replay_barrier(run_dir, phase):
 
 
 def load_controller():
-    # No __pycache__ beside the shipped scripts (smoke-acceptance.test.sh
-    # rejects bytecode there), however the replay is invoked.
-    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("smoke_campaign_controller", CONTROLLER_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -710,14 +715,14 @@ def aggregate(results):
             "controllerGo": sum(r["controllerVerdict"] == "GO" for r in rs),
             "actualGo": sum(r["actualVerdict"] == "GO" for r in rs),
             "verdictMismatches": sum(r["verdictMismatch"] for r in rs),
-            "mismatchDetail": sorted("{} {}->{} ({})".format(r["runId"][7:14], r["actualVerdict"], r["controllerVerdict"],
+            "mismatchDetail": sorted("{} {}->{} ({})".format(smoke_run_id.pr_tag(r["runId"]), r["actualVerdict"], r["controllerVerdict"],
                                                              r["controllerVerb"]) for r in rs if r["verdictMismatch"]),
             "finishedByController": sum(r["finishedBy"] == "controller" for r in rs),
             "finishedByGateFirst": sum(r["finishedBy"] == "gate" for r in rs),
             "duplicates": sum(r["duplicateRecordsOnReplay"] + r["duplicateEffectsOnReplay"] + r["duplicateIntents"]
                               + r["duplicateEffects"] for r in rs),
             "hardErrors": sum(len(r["hardErrors"]) for r in rs),
-            "missedObligations": sorted("{}:{}".format(r["runId"][7:14], o) for r in rs for o in r["missedObligations"]),
+            "missedObligations": sorted("{}:{}".format(smoke_run_id.pr_tag(r["runId"]), o) for r in rs for o in r["missedObligations"]),
             "issuesActual": sum(r["issuesActual"] for r in rs),
             "issuesController": sum(r["issuesController"] for r in rs),
             "issuesMissed": sum(r["issuesMissed"] for r in rs),
@@ -758,6 +763,8 @@ def main(argv=None):
     b.add_argument("--gh-actual", required=True)
     b.add_argument("--actuals2", required=True)
     b.add_argument("--turns")
+    b.add_argument("--run-prefix", default=os.environ.get("SMOKE_GATE_RUN_PREFIX", ""),
+                   help="the install's SMOKE_GATE_RUN_PREFIX; run dirs are <prefix>-pr<n>-<sha12>-<stamp>")
     b.add_argument("--since", default="20260905")
     b.add_argument("--until", default="")
     b.add_argument("--out", required=True)

@@ -1,28 +1,13 @@
 /**
- * Materialize plugin skills whose `SKILL.md` upstream ships as a SYMLINK.
- *
- * Codex's native plugin loader silently skips such a skill (verified in-container
- * 2026-07-22: humanizer ships `skills/humanizer/SKILL.md -> ../../SKILL.md` and
- * loaded 0 skills, while impeccable's real file loaded fine). Some upstreams use
- * that shape deliberately, keeping a root-level SKILL.md as the source of truth.
- *
- * We therefore write a real skills tree under `<plugin>/.nanoclaw/codex-skills/`
- * — a real dir per skill holding a REAL `SKILL.md` copy plus symlinks for sibling
- * files — and point the generated `.codex-plugin` manifest at it. The path sits
- * inside the plugin clone but under NanoClaw's own `.nanoclaw/` namespace, so it
- * stays untracked by the plugin's git and never conflicts with `git pull`.
- *
- * Because the SKILL.md is a COPY, it would go stale after an upstream update.
- * `refreshMaterializedCodexSkills()` re-materializes every already-materialized
- * plugin and is called from the hourly plugin-update refresh, BEFORE the codex
- * plugin cache is re-copied — so a `git pull` propagates all the way through to
- * what Codex actually reads.
+ * Codex's plugin loader silently skips a skill whose `SKILL.md` is a symlink, so such plugins get a real tree under
+ * `<plugin>/.nanoclaw/codex-skills/` (a real SKILL.md copy plus symlinked siblings; untracked by the plugin's git),
+ * which the generated `.codex-plugin` manifest points at. The copy goes stale on `git pull`, so the hourly plugin
+ * refresh re-materializes BEFORE the Codex plugin cache is re-copied.
  */
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-/** NanoClaw-owned, git-untracked skills root we materialize into. */
 const CODEX_MATERIALIZED_ROOT = path.join('.nanoclaw', 'codex-skills');
 
 /** Skill-root layouts we know how to materialize from, in discovery preference order. */
@@ -43,11 +28,7 @@ export function findCodexSkillsRoot(dir: string): string | null {
   return null;
 }
 
-/**
- * If any skill under `<dir>/<skillsRoot>` has a symlinked SKILL.md, materialize the
- * whole set into `<dir>/.nanoclaw/codex-skills/` and return that root. Otherwise
- * return `skillsRoot` unchanged (nothing to do — Codex reads the originals fine).
- */
+/** Materialize when any skill's SKILL.md is a symlink; otherwise `skillsRoot` unchanged. */
 export function materializeSymlinkedSkills(dir: string, skillsRoot: string, dryRun = false): string {
   const srcRoot = path.join(dir, skillsRoot);
   let entries: string[];
@@ -77,7 +58,7 @@ export function materializeSymlinkedSkills(dir: string, skillsRoot: string, dryR
       try {
         fs.rmSync(childDst, { recursive: true, force: true });
         if (child === 'SKILL.md') {
-          // Real copy — the whole point: Codex must see a regular file here.
+          // Codex must see a regular file here.
           fs.writeFileSync(childDst, fs.readFileSync(childSrc));
         } else {
           fs.symlinkSync(fs.realpathSync(childSrc), childDst);
@@ -91,17 +72,10 @@ export function materializeSymlinkedSkills(dir: string, skillsRoot: string, dryR
 }
 
 export interface MaterializeRefreshResult {
-  /** Plugin folders that had an existing materialized tree and were refreshed. */
   refreshed: string[];
 }
 
-/**
- * Re-materialize every plugin that already has a `.nanoclaw/codex-skills/` tree.
- *
- * Deliberately only touches plugins already set up that way — this is a staleness
- * refresh, not a discovery pass, so it never invents materialized trees for plugins
- * the operator hasn't enabled for Codex.
- */
+/** Staleness refresh of plugins already materialized; never materializes a plugin not set up that way. */
 export function refreshMaterializedCodexSkills(
   pluginsRoot = path.join(os.homedir(), 'plugins'),
 ): MaterializeRefreshResult {

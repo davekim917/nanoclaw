@@ -1,16 +1,6 @@
 /**
- * Outbound secret scrubber.
- *
- * Registers credential values from `.env` at host startup. Callers run
- * `scrubSecrets()` on any text that might leak to a user (channel
- * messages, logs) to replace known secret values with `[REDACTED]`.
- *
- * Defense-in-depth only — v2's primary credential isolation is OneCLI
- * (HTTPS_PROXY interception so agents never see api keys). This catches
- * the narrow case of a secret reaching agent context anyway (e.g. the
- * agent reads a file that contains a token) and echoing it outbound.
- *
- * Ported from v1's `src/secret-scrubber.ts`.
+ * Outbound secret scrubber for text that might reach a user or a log. Defense in depth only: OneCLI keeps
+ * credentials out of agents; this catches one that reached agent context anyway and is echoed outbound.
  */
 import fs from 'fs';
 import path from 'path';
@@ -19,12 +9,9 @@ import { log, setLogScrubber } from './log.js';
 
 const secretValues = new Set<string>();
 
-/** Minimum length to register — avoids false-positive redactions on short values. */
+/** Shorter values are not registered, to avoid false-positive redactions. */
 const MIN_LENGTH = 8;
 
-/**
- * Register secret values for scrubbing. Idempotent; duplicates are no-ops.
- */
 export function registerSecrets(secrets: Record<string, string>): void {
   for (const value of Object.values(secrets)) {
     if (value && value.length >= MIN_LENGTH) {
@@ -34,15 +21,8 @@ export function registerSecrets(secrets: Record<string, string>): void {
 }
 
 /**
- * Parse `.env` at `cwd/.env` and register values whose keys match known
- * credential-name patterns. Previously this used a blacklist (register
- * everything except a few hand-picked non-secrets) but that caused
- * over-redaction as new NANOCLAW_DEFAULT_* config knobs and per-workspace
- * identifier keys were added — e.g. NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_*
- * values are short config strings like "example-labs" that the scrubber then
- * wiped out of every message. Allowlist is safer here: defense-in-depth
- * only (OneCLI is the primary isolation), and every real credential in
- * the canonical .env template follows one of these naming patterns.
+ * Register `.env` values whose KEYS match credential-name patterns. An allowlist, not a blacklist: short config
+ * values (e.g. NANOCLAW_DEFAULT_* slugs) would otherwise be redacted out of every message.
  */
 const SECRET_KEY_PATTERNS: RegExp[] = [
   /_TOKEN(_|$)/,
@@ -100,12 +80,7 @@ export function registerSecretsFromEnv(envPath?: string): number {
   return count;
 }
 
-/**
- * Contextual secret patterns: a credential recognizable only alongside the
- * surrounding text that names it (a header line, a CLI flag, a query-string
- * key=value pair) — meaningless applied to an isolated value with that
- * context already stripped off.
- */
+/** Credentials recognizable only with the surrounding text (header, CLI flag, query key); useless on a bare value. */
 const CONTEXTUAL_SECRET_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/Authorization:\s*(?:Bearer|Basic|Digest)\s+[^\s'"]+/gi, 'Authorization: [REDACTED]'],
   [/-H\s+['"]?(?:X-API-Key|X-Auth-Token|X-Access-Token|Api-Key|X-Token)[:=]\s*[^'"\s]+['"]?/gi, '-H [REDACTED]'],
@@ -114,16 +89,8 @@ const CONTEXTUAL_SECRET_PATTERNS: ReadonlyArray<[RegExp, string]> = [
 ];
 
 /**
- * Bare token shapes: recognizable from the value alone, with no surrounding
- * context needed — safe to test against an isolated string (a header value,
- * a URL path segment, a query parameter value already pulled out of its
- * key=value pair).
- *
- * Exported so a hard-rejection check elsewhere (src/container-config.ts, MCP
- * server config intake) can test against these same shapes instead of
- * hand-copying a subset — a shape added here for outbound scrubbing is then
- * inherited there automatically, rather than costing that caller a separate
- * review round to notice the gap.
+ * Token shapes recognizable from the value alone, safe on an isolated string. Exported so MCP config intake
+ * (container-config.ts) rejects the same shapes this scrubs.
  */
 export const TOKEN_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]'],
@@ -134,21 +101,12 @@ export const TOKEN_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED]'],
 ];
 
-/**
- * Catches tokens that aren't in `.env`: OneCLI-injected API tokens (never
- * touch disk), runtime-fetched OAuth, bearer tokens appearing in response
- * bodies that an agent echoes back, literal secrets inlined into SQL/URL
- * strings.
- */
+/** Catches tokens absent from `.env`: OneCLI-injected, runtime OAuth, echoed bearer tokens, inlined literals. */
 const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [...CONTEXTUAL_SECRET_PATTERNS, ...TOKEN_SHAPE_PATTERNS];
 
 /**
- * No high-entropy catch-all — every iteration of length/composition
- * heuristics destroyed legitimate identifiers (dbt models, Snowflake
- * tables, content-addressed digests, trace IDs). Scrubbing is
- * structural: prefixes + contextual patterns + .env values. Novel-vendor
- * tokens are an accepted residual risk; the fix is a one-line prefix
- * addition, not a heuristic.
+ * Deliberately no high-entropy catch-all: every heuristic destroyed legitimate identifiers (model and table names,
+ * digests, trace IDs). A novel vendor's token needs a one-line prefix addition.
  */
 function scrubSecretShapes(text: string): string {
   let out = text;
@@ -158,11 +116,7 @@ function scrubSecretShapes(text: string): string {
   return out;
 }
 
-/**
- * Replace registered .env secrets AND generic secret-shaped tokens
- * (bearer headers, known vendor prefixes, JWTs, high-entropy opaque
- * tokens). Fast no-op when text is empty.
- */
+/** Replace registered `.env` secrets and secret-shaped tokens with `[REDACTED]`. */
 export function scrubSecrets(text: string): string {
   if (!text) return text;
   let result = text;
@@ -177,11 +131,9 @@ export function scrubSecrets(text: string): string {
   return result;
 }
 
-/** For tests: reset registry. */
 export function _clearSecretsForTest(): void {
   secretValues.clear();
 }
 
-// Wire the scrubber into the logger on module load — any log line with a
-// registered secret gets redacted before hitting stdout/stderr.
+// Every log line is scrubbed too.
 setLogScrubber(scrubSecrets);

@@ -1,34 +1,11 @@
 /**
- * Workgroup-scoped plugins: opt-in delivery for a ~/plugins entry that carries
- * one tenant's content.
- *
- * ~/plugins is fleet-wide by default. Every group mounts every entry unless its
- * container.json `excludePlugins` names it (the plugin loop in buildMounts,
- * src/container-runner.ts), so a group created tomorrow would receive a
- * client's plugin unless someone remembered to exclude it. A plugin named in
- * this host-owned policy is delivered only to agent groups in the workgroups
- * it lists. Plugins it does not name keep the fleet-wide default, and
- * `excludePlugins` still applies on top of both.
- *
- * Policy file: data/plugin-scopes.json
- *   { "version": 1, "plugins": { "<plugin directory name>": ["<workgroup id>", ...] } }
- *
- * No file means no scoped plugins. A file that exists but does not parse
- * throws, the rule data/workgroup-read-access.json follows
- * (src/workgroup-read-access.ts): the spawn aborts instead of guessing which
- * plugins were meant to be scoped. An empty list scopes a plugin to no
- * workgroup at all.
- *
- * Enforced on every path plugin content takes into a container:
- * - the plugin mount (Claude and Codex, which registers plugins from that mount);
- * - the always-on ruleset composed for Codex and OpenCode (src/claude-md-compose.ts);
- * - the Codex and OpenCode subagent mirrors (src/claude-subagent-discovery.ts) and
- *   the OpenCode skill mirror (src/opencode-sync.ts), which never copy a scoped
- *   plugin's agents or skills because none of their targets is keyed by workgroup;
- * - the capabilities snapshot, which names a scoped plugin only inside its
- *   workgroups (src/capabilities.ts).
- * A scoped name that matches no ~/plugins directory enforces nothing, so the
- * mount loop warns about it once per process.
+ * Workgroup-scoped plugins: ~/plugins is fleet-wide by default, so a plugin carrying one tenant's content would
+ * reach every new group unless excluded. A plugin named in data/plugin-scopes.json
+ * (`{ "version": 1, "plugins": { "<dir name>": ["<workgroup id>", ...] } }`) is delivered only to groups in those
+ * workgroups; `excludePlugins` still applies. No file scopes nothing; an unparseable file throws so the spawn
+ * aborts; an empty list scopes a plugin to no workgroup. Enforced on every path plugin content takes into a
+ * container: the plugin mount, the composed ruleset, the subagent and OpenCode skill mirrors (which never copy a
+ * scoped plugin), and the capabilities snapshot.
  */
 import fs from 'fs';
 import path from 'path';
@@ -43,7 +20,6 @@ const WORKGROUP_ID_RE = /^[a-z][a-z0-9-]*$/;
 // One ~/plugins directory name: no path separators, and not "." or "..".
 const PLUGIN_NAME_RE = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 
-/** Plugin directory name → the workgroups it may be delivered to. */
 export type PluginScopes = ReadonlyMap<string, ReadonlySet<string>>;
 
 function fail(message: string): never {
@@ -117,11 +93,7 @@ export function scopedPluginNames(scopes: PluginScopes): ReadonlySet<string> {
 
 const warnedUnmatched = new Set<string>();
 
-/**
- * Warn, once per process per name, about each scoped plugin that matches no
- * directory in `pluginDirs`. Such a scope enforces nothing: a typo or a clone
- * under a different directory name leaves the real plugin fleet-wide.
- */
+/** Warn once per name about scoped plugins matching no directory: a typo leaves the real plugin fleet-wide. */
 export function warnUnmatchedPluginScopes(scopes: PluginScopes, pluginDirs: readonly string[]): void {
   for (const plugin of scopes.keys()) {
     if (pluginDirs.includes(plugin) || warnedUnmatched.has(plugin)) continue;

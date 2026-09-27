@@ -1,23 +1,8 @@
 /**
- * Agent-runner source activation.
- *
- * `container-runner.ts` bind-mounts a directory at /app/src for every
- * container spawn. Mounting the live checkout directly meant `git pull`
- * changed what the *next spawn* loaded mid-pull — a non-atomic, silent
- * window — before the host process restarted. This module snapshots
- * `container/agent-runner/src` once at host boot (`main.ts` calls
- * `activateAgentRunnerSource()` before anything can spawn) so activation
- * happens exactly at restart: copy to a temp dir under `data/agent-runner-src/`,
- * then atomically rename it in. Pruning old snapshots is a SEPARATE step
- * (`pruneAgentRunnerSnapshots()`, called from `main.ts` after orphan
- * containers from a previous host process have been stopped): a bind mount
- * pins the directory, not its entries, so deleting an old snapshot's
- * contents out from under a still-running container would empty its
- * `/app/src` live. Pruning therefore only removes a snapshot once no
- * running container has it mounted. Rollback of a runner-source edit is a
- * host restart. `NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout
- * directly for local dev (`pnpm run dev`) so edits take effect without a
- * restart.
+ * Snapshots `container/agent-runner/src` once at host boot (copy, then atomic rename) and serves it as every spawn's
+ * /app/src, so a `git pull` never changes what the next spawn loads before a restart. Pruning is separate and only
+ * removes a snapshot no running container mounts: a bind mount pins the directory, not its entries.
+ * `NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout directly for local dev.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -41,10 +26,7 @@ function countFiles(dir: string): number {
 }
 
 function bootStamp(): string {
-  // e.g. 20260902T233000123Z-12345-0 — sortable, unique per process even
-  // across two activations inside the same millisecond (a real host only
-  // ever activates once per boot, but tests and any future re-activation
-  // path must not collide on the directory name).
+  // Sortable, and unique even for two activations in one millisecond.
   const compact = new Date().toISOString().replace(/[-:]/g, '');
   activationCounter += 1;
   return `${compact}-${process.pid}-${activationCounter}`;
@@ -71,18 +53,14 @@ export function activateAgentRunnerSource(opts?: { sourceDir?: string; dataDir?:
   try {
     fs.mkdirSync(root, { recursive: true });
     fs.cpSync(sourceDir, tmpDir, { recursive: true });
-    // Atomic within the same filesystem — the snapshot appears fully formed
-    // or not at all; no spawn ever sees a partial copy. Pruning old
-    // snapshots is a separate call (pruneAgentRunnerSnapshots) — see the
-    // module header for why activation must not also delete.
+    // Atomic on one filesystem: no spawn ever sees a partial copy.
     fs.renameSync(tmpDir, finalDir);
 
     activePath = finalDir;
     log.info('agent-runner source: snapshot activated', { path: finalDir, files: countFiles(finalDir) });
     return activePath;
   } catch (err) {
-    // Never throw out of boot — fall back to the pre-PR-0 behavior (mount
-    // the checkout directly) so the host still comes up.
+    // Never throw out of boot: fall back to mounting the checkout directly.
     log.error('agent-runner source: snapshot failed, falling back to the checkout', {
       err: err instanceof Error ? err.message : String(err),
     });
@@ -96,15 +74,9 @@ export function agentRunnerSourcePath(): string {
 }
 
 /**
- * Default `referencedPaths` for pruneAgentRunnerSnapshots: the host mount
- * source of every mount on every running container whose name carries
- * `CONTAINER_NAME_PREFIX`, read via `docker inspect`. That prefix is the same
- * constant the spawn path names the container with (src/config.ts), because a
- * successful listing that matches nothing returns an EMPTY set here and would
- * prune a snapshot a live container still has mounted.
- * Returns null (never an empty set) when docker itself
- * cannot be queried, so a Docker hiccup fails toward "prune nothing" rather
- * than toward deleting a snapshot a live container still has mounted.
+ * Host mount sources of every running `CONTAINER_NAME_PREFIX` container, via `docker inspect`; the prefix must be
+ * the spawn path's own, since a listing matching nothing prunes a live snapshot. Null (never an empty set) when
+ * docker cannot be queried, so a hiccup prunes nothing.
  */
 function defaultReferencedPaths(): Set<string> | null {
   try {
@@ -137,20 +109,9 @@ function defaultReferencedPaths(): Set<string> | null {
 }
 
 /**
- * Removes every snapshot under `data/agent-runner-src/` except the active
- * one and any still mounted by a running container. Best-effort: a failure
- * removing one entry is logged and skipped, never thrown — pruning is
- * housekeeping, not a boot-blocking step. Call only after the boot quiescence
- * door has proved its stop set gone — `main.ts` calls this last in
- * `runBootMountQuiescence`, after both reconciles.
- *
- * It stays correct once containers start surviving a restart (seam 4, D2 + E):
- * `defaultReferencedPaths` above reads docker, not the in-process registry,
- * so an adopted container's mounts are covered the same way a freshly spawned
- * one's are. What it depends on is the container NAME PREFIX — that listing
- * selects by `name=nanoclaw-v2-`, and a successful listing that matches
- * nothing prunes everything, so the prefix is pinned in one constant
- * (src/config.ts) rather than adopted from upstream's `ncl-…` grammar.
+ * Remove every snapshot except the active one and any a running container mounts (read from docker, so adopted
+ * containers count). Best-effort: failures are logged, never thrown. Call only after the boot quiescence door has
+ * proved its stop set gone.
  */
 export function pruneAgentRunnerSnapshots(opts?: {
   dataDir?: string;

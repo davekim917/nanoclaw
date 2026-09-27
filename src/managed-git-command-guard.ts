@@ -1,15 +1,9 @@
 import path from 'node:path';
 
 /**
- * Host-side counterpart of the Bun agent-runner managed Git guard.
- *
- * The host and agent-runner intentionally have separate dependency/runtime
- * trees, so this small parser is duplicated rather than imported across that
- * boundary. Keep the operation matrix in this file aligned with
- * `container/agent-runner/src/managed-git-guard.ts`. Host task scripts have no
- * legitimate reason to mutate shared linked-worktree administration or run
- * object-pruning maintenance; those operations belong to the repository host
- * actions, which hold the canonical lock.
+ * Host-side twin of `container/agent-runner/src/managed-git-guard.ts` (separate package trees): keep the operation
+ * matrix aligned. Host task scripts must never mutate linked-worktree administration or prune objects; those belong
+ * to the repository host actions, which hold the canonical lock.
  */
 
 const PROTECTED_WORKTREE_ACTIONS = new Set(['add', 'lock', 'move', 'prune', 'remove', 'repair', 'unlock']);

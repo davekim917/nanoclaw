@@ -26,6 +26,7 @@ for _a in "$@"; do
   if [ "$_a" = "--takeover" ]; then TAKEOVER=true; else _ARGS+=("$_a"); fi
 done
 set -- ${_ARGS[@]+"${_ARGS[@]}"}; GATE_VERB="${1:-poll}"; . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-pr-gate-observe.sh"
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
 
 REPO="${SMOKE_GATE_REPO:-}"
 BRANCH="${SMOKE_GATE_BRANCH:-develop}"
@@ -34,6 +35,29 @@ FRONTEND_SERVICE="${SMOKE_GATE_FRONTEND_SERVICE:-}"
 LABEL="${SMOKE_GATE_LABEL:-render-preview}"
 STATE_DIR="${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}"
 RUN_PREFIX="${SMOKE_GATE_RUN_PREFIX:-smoke}"
+# Where each PR's preview comes from. `render` (default): *_SERVICE are the
+# parent service ids and previews are found through Render's API. `static`:
+# *_SERVICE are URL templates with `{pr}` and/or `{branch}`, and a preview's deploy
+# identity is the commit it serves (smoke-preview-static.sh).
+PREVIEW_PROVIDER="${SMOKE_PREVIEW_PROVIDER:-render}"
+HEALTH_PATH="${SMOKE_GATE_HEALTH_PATH:-/healthz}"
+# A static template names each PR's preview with {pr} and/or {branch} and is
+# otherwise a plain http(s) URL (host, optional port and path, no query):
+# the URL it resolves to is pasted unquoted into shell commands in briefs.
+static_template_ok() {
+  local url="${1//\{pr\}/1}"
+  url="${url//\{branch\}/b}"
+  [ "$url" != "$1" ] && [[ "$url" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]
+}
+provider_config_problems() {  # → " NAME" for each preview-provider key this install cannot run on
+  case "$PREVIEW_PROVIDER" in
+    render) ;;
+    static)
+      [ -z "$FRONTEND_SERVICE" ] || static_template_ok "$FRONTEND_SERVICE" || printf ' SMOKE_GATE_FRONTEND_SERVICE'
+      [ -z "$BACKEND_SERVICE" ] || static_template_ok "$BACKEND_SERVICE" || printf ' SMOKE_GATE_BACKEND_SERVICE' ;;
+    *) printf ' SMOKE_PREVIEW_PROVIDER' ;;
+  esac
+}
 # Ported verbatim from smoke-develop-gate.sh — a claimed run is live while its
 # newest liveness signal is fresh AND under the hard age ceiling. Not called
 # out as a separate contract knob because it is the same plumbing every claim/
@@ -115,12 +139,12 @@ CONTROL_LOCK="$STATE_DIR/control.lock"
 # this lock is the one exception and DOES fail closed (see below), because it
 # guards a real write (cross-PR run-id uniqueness), not just an alarm stamp.
 
-# Deployment-specific path conventions from the design doc — not exposed as
-# env because they are facts about this repo's layout, not gate policy.
-FRONTEND_PREFIX="XZO-FRONTEND/"
-MIGRATIONS_PREFIX="XZO-BACKEND/migrations/"
-FREEZE_MARKER_BACKEND="XZO-BACKEND/.render-freeze"
-FREEZE_MARKER_FRONTEND="XZO-FRONTEND/.render-freeze"
+# Repo-layout prefixes, validated once before any mode (smoke-gate-layout.sh).
+FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
+BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"
+MIGRATIONS_PREFIX="${SMOKE_GATE_MIGRATIONS_PREFIX:-}"
+FREEZE_MARKER_BACKEND="${BACKEND_PREFIX}.render-freeze"
+FREEZE_MARKER_FRONTEND="${FRONTEND_PREFIX}.render-freeze"
 
 # Preview-identity disambiguation (#1536). Render has twice provisioned two
 # services sharing one display name under the same parent (PR #1533, PR
@@ -156,8 +180,6 @@ SIZING_CLASSIFIER="$SIZING_CLASSIFIER_DIR/campaign-size-classify.py"
 # gate is byte-identical to a gate that has never heard of journeys.
 JOURNEYS_CATALOGUE="${SMOKE_JOURNEYS_CATALOGUE:-/workspace/agent/journeys.json}"
 JOURNEYS_TOOL="$SIZING_CLASSIFIER_DIR/smoke-journeys.py"
-
-mkdir -p "$STATE_DIR"
 
 iso_now() {
   date -u +'%Y-%m-%dT%H:%M:%SZ'
@@ -1611,7 +1633,16 @@ find_pr_for_any_run() {
 # // .)` covers both.
 # ponytail: limit=100, no cursor pagination. The account runs a handful of
 # services; add pagination if the account ever exceeds one page.
-fetch_services() {
+fetch_services() {  # [<pr> <head ref>]
+  if [ "$PREVIEW_PROVIDER" = static ]; then
+    # The one lookup a static preview needs: the branch alias, from the head
+    # ref already fetched when the caller has it. A failed lookup fails the
+    # fetch, so the gate reports fetchOk:false rather than an absent preview.
+    local alias=""
+    case "$FRONTEND_SERVICE$BACKEND_SERVICE" in *'{branch}'*) alias="$(preview_branch_alias "${1:-}" "${2:-}")" || return 1 ;; esac
+    jq -cn --arg alias "$alias" '[{branchAlias:$alias}]'
+    return 0
+  fi
   timeout 10 curl -fsS --max-time 10 "https://api.render.com/v1/services?limit=100" 2>/dev/null
 }
 
@@ -1619,6 +1650,16 @@ fetch_services() {
 # defect). Returns a JSON array of {id,name,url}, empty when nothing matches.
 find_preview_candidates() {
   local services_json="$1" parent_id="$2" pr="$3"
+  if [ "$PREVIEW_PROVIDER" = static ]; then
+    local url="${parent_id//\{pr\}/$pr}" branch
+    branch="$(jq -r '.[0].branchAlias // empty' <<<"$services_json" 2>/dev/null)"
+    if [[ "$url" == *'{branch}'* ]]; then
+      [ -n "$branch" ] || { printf '[]'; return 0; }
+      url="${url//\{branch\}/$branch}"
+    fi
+    jq -cn --arg url "$url" '[{id:$url, name:$url, url:$url}]'
+    return 0
+  fi
   jq -c --arg pid "$parent_id" --arg suffix "PR #$pr" '
     [.[]? | (.service // .) | select(.serviceDetails.parentServer.id == $pid) | select(.name | endswith($suffix))
      | {id:(.id // null), name:(.name // null), url:(.serviceDetails.url // null)}]
@@ -1789,15 +1830,34 @@ resolve_frontend_identity() {
 
 latest_live_deploy_sha() {
   local service_id="$1" out
+  if [ "$PREVIEW_PROVIDER" = static ]; then served_sha "$service_id"; return; fi
   out="$(timeout 10 curl -fsS --max-time 10 "https://api.render.com/v1/services/$service_id/deploys?limit=5" 2>/dev/null)" || return 1
   jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' <<<"$out" 2>/dev/null
 }
 
+# static provider: the PR head branch as a host alias — lowercased, every
+# non-alphanumeric character a "-" (Cloudflare Pages' branch-alias rule).
+preview_branch_alias() {  # <pr> [<head ref>] -- looked up when not given
+  local ref="${2:-}"
+  [ -n "$ref" ] || ref="$(timeout 10 gh pr view "$1" -R "$REPO" --json headRefName 2>/dev/null | jq -r '.headRefName // empty' 2>/dev/null)"
+  [ -n "$ref" ] || return 1
+  printf '%s' "$ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]/-/g'
+}
+
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-preview-static.sh"
+
 healthz_ok() {
   local url="$1" code
   [ -n "$url" ] && [ "$url" != "null" ] || return 1
-  code="$(timeout 10 curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "${url%/}/healthz" 2>/dev/null)" || return 1
+  code="$(timeout 10 curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "${url%/}$HEALTH_PATH" 2>/dev/null)" || return 1
   [ "$code" = "200" ]
+}
+
+# Best-effort Render teardown of a finished backend preview. Prints the HTTP
+# status, empty on a network failure.
+suspend_preview() {
+  timeout 10 curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    -X POST "https://api.render.com/v1/services/$1/suspend" 2>/dev/null
 }
 
 # Prints one `{campaignSize, sizeReason}` JSON object. Classification is
@@ -2673,7 +2733,7 @@ evaluate_pr() {
     fi
   fi
 
-  if ! services_json="$(fetch_services)" || ! jq -e 'type == "array"' <<<"$services_json" >/dev/null 2>&1; then
+  if ! services_json="$(fetch_services "$pr" "$head_ref")" || ! jq -e 'type == "array"' <<<"$services_json" >/dev/null 2>&1; then
     fetch_ok=false
     services_json='[]'
   fi
@@ -2927,13 +2987,56 @@ freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha}
 # tell" (the probe's ok): finish reports it — a failed probe used to collapse to
 # isFreezePr:false and drop a freeze-run verdict on the floor silently — and
 # claim refuses on it, because a freeze campaign is never admitted unpinned.
+# A PR campaign's run id: <prefix>-pr<n>-<sha12>-<YYYYMMDDTHHMMSSZ>, the one
+# shape smoke_run_id.py parses for every reader.
+campaign_run_id() {  # <pr> <sha> <epoch>
+  printf '%s-pr%s-%s-%s' "$RUN_PREFIX" "$1" "${2:0:12}" "$(date -u -d "@$3" +%Y%m%dT%H%M%SZ)"
+}
+
 detect_freeze() {
   local pr="$1" sha="$2" probe
   probe="$(freeze_head_probe "$sha")"
   jq -c '{isFreezePr:.isFreeze, filesOk:.ok, targetSha:.targetSha}' <<<"$probe"
 }
 
+# " SMOKE_GATE_<KEY>" for every key check, poll and config refuse on.
+gate_config_missing() {
+  local k MISSING=""
+  for k in REPO BACKEND_SERVICE FRONTEND_SERVICE; do
+    [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
+  done
+  MISSING="$MISSING$LAYOUT_MISSING$(provider_config_problems)"
+  # A knob that fell back to its default because the deployed value was not a
+  # number is a misconfiguration, not a detail — name it in the same alarm.
+  MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+  printf '%s' "$MISSING"
+}
+
+# `config`: the go-time check an operator runs through the wrapper. It judges
+# the environment the wrapper hands this script and exits 0 (ok) or 1 (key
+# names); it runs before the state dir is created, so it reads no state, takes
+# no lock and calls nothing remote (smoke-gate-config.test.sh holds that).
+config_verb() {
+  local missing
+  missing="$(gate_config_missing)"
+  if [ -z "$missing" ]; then jq -cn '{ok:true}'; exit 0; fi
+  jq -cn --argjson missing "$(printf '%s\n' $missing | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{ok:false,error:"gate misconfigured",missing:$missing}'
+  exit 1
+}
+
 COMMAND="${1:-poll}"
+
+# The layout validator runs once, before any mode: `poll` names a bad prefix in
+# its throttled gate_misconfigured wake below, and every other mode refuses here.
+LAYOUT_MISSING="$(layout_prefix_problems)"
+[ "$COMMAND" != config ] || config_verb
+if [ -n "$LAYOUT_MISSING" ] && [ "$COMMAND" != poll ]; then
+  jq -cn --argjson missing "$(printf '%s\n' $LAYOUT_MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{ok:false,error:"gate misconfigured",missing:$missing}'
+  exit 2
+fi
+mkdir -p "$STATE_DIR"
 
 # ---------------------------------------------------------------------------
 if [ "$COMMAND" = "wait-settled" ]; then
@@ -3067,13 +3170,7 @@ if [ "$COMMAND" = "check" ]; then
     jq -cn '{ok:false,error:"check requires a PR number"}'
     exit 2
   fi
-  MISSING=""
-  [ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-  [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-  [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
-# A knob that fell back to its default because the deployed value was not a
-# number is a misconfiguration, not a detail — name it in the same alarm.
-MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+  MISSING="$(gate_config_missing)"
   if [ -n "$MISSING" ]; then
     jq -cn --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
       '{ok:false,error:"gate misconfigured",missing:$missing}'
@@ -4385,7 +4482,7 @@ if [ "$COMMAND" = "finish" ]; then
   SUSPEND_OK=false
   SUSPEND_STATUS="null"
   SUSPEND_REASON=""
-  if SERVICES_JSON="$(fetch_services)" && jq -e 'type == "array"' <<<"$SERVICES_JSON" >/dev/null 2>&1; then
+  if SERVICES_JSON="$(fetch_services "$PR")" && jq -e 'type == "array"' <<<"$SERVICES_JSON" >/dev/null 2>&1; then
     # THE mutating site (#1536) — a wrong-twin pick here POSTs suspend against
     # a service nobody chose. Same candidate-enumeration + bundle-oracle
     # resolution as evaluate_pr, so this site can never disagree with what a
@@ -4405,10 +4502,11 @@ if [ "$COMMAND" = "finish" ]; then
       printf 'smoke-pr-gate: %s\n' "$SUSPEND_REASON" >&2
     elif [ "$BACKEND_PREVIEW" != "null" ]; then
       BACKEND_PREVIEW_ID="$(jq -r '.id // empty' <<<"$BACKEND_PREVIEW")"
-      if [ -n "$BACKEND_PREVIEW_ID" ]; then
+      if [ "$PREVIEW_PROVIDER" = static ]; then
+        SUSPEND_REASON="the static preview provider has no suspend; the preview's own lifecycle tears it down"
+      elif [ -n "$BACKEND_PREVIEW_ID" ]; then
         SUSPEND_ATTEMPTED=true
-        HTTP_CODE="$(timeout 10 curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-          -X POST "https://api.render.com/v1/services/$BACKEND_PREVIEW_ID/suspend" 2>/dev/null)"
+        HTTP_CODE="$(suspend_preview "$BACKEND_PREVIEW_ID")"
         if [ -z "$HTTP_CODE" ]; then
           SUSPEND_REASON="suspend request failed (network/timeout)"
         else
@@ -5002,13 +5100,7 @@ fi
 # poll: fail-closed on missing deployment config, throttled to one wake per
 # 6h so misconfiguration surfaces once as a visible alarm instead of silent
 # wakeAgent:false forever.
-MISSING=""
-[ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-[ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-[ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
-# A knob that fell back to its default because the deployed value was not a
-# number is a misconfiguration, not a detail — name it in the same alarm.
-MISSING="$MISSING$BAD_NUMERIC_CONFIG"
+MISSING="$(gate_config_missing)"
 if [ -n "$MISSING" ]; then
   exec 8>"$CONTROL_LOCK"
   flock -w 5 8 || true
@@ -5465,11 +5557,11 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     RESUMED_RUN_ID=true
   else
     RUN_STAMP_EPOCH="$(date -u +%s)"
-    RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
+    RUN_ID="$(campaign_run_id "$W_PR" "$HEAD_SHA" "$RUN_STAMP_EPOCH")"
     while [ "$RUN_ID" = "$(jq -r '.activeRunId // empty' <<<"$STATE")" ] ||
           [ "$RUN_ID" = "$(jq -r '.completedRunId // empty' <<<"$STATE")" ]; do
       RUN_STAMP_EPOCH="$(( RUN_STAMP_EPOCH + 1 ))"
-      RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
+      RUN_ID="$(campaign_run_id "$W_PR" "$HEAD_SHA" "$RUN_STAMP_EPOCH")"
     done
   fi
   OWNER_TOKEN="$(new_owner_token || true)"

@@ -1,36 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
 
 /**
- * Sibling-parity invariant: shared definition of which container.json fields
- * are allowed to differ between a source group and its sibling created via
- * `/clone-as-codex` / `/clone-as-opencode` (or future `/clone-as-<provider>`).
- *
- * Read by two consumers — they MUST agree:
- *   - `ncl groups parity-check` (`src/cli/resources/groups.ts`) — diffs source
- *     vs sibling via `findSiblingParityDrifts` below.
- *   - The `/clone-as-*` skills — replace identity/provider state, preserve a
- *     safe resource baseline, and normalize identity-scoped nested fields.
- *
- * Adding a sibling-bound field: add to this set + document why it's allowed
- * to differ. Removing: a field that used to differ must now match across
- * sibling+source; remove from this set, and the next parity-check run will
- * flag drift on any sibling created with the old behavior.
+ * Which container.json fields may differ between a source group and its `/clone-as-*` sibling. `ncl groups
+ * parity-check` and the `/clone-as-*` skills MUST agree on it. Removing a field makes the next parity-check flag
+ * siblings created under the old rule.
  */
 
-/**
- * Container.json fields that may differ between source and sibling without
- * violating the parity invariant. Everything NOT in this set must match
- * structurally on every parity-check, except for the semantic comparisons in
- * `findSiblingParityDrifts`.
- *
- * Categories:
- *   - Identity-bound: always per-group (folder/group/agent IDs, credentialFolder).
- *   - Provider-bound: the whole point of a sibling (provider, Codex auth).
- *   - Operator-tunable runtime: siblings may pick different model/effort
- *     tiers, image tags, per-call defaults, or resource budgets independently
- *     without changing skills/MCPs/tools/secrets.
- *   - Memory + summary: per-sibling memory state; one writer per workgroup.
- */
+/** Everything NOT here must match structurally, apart from the semantic comparisons in `findSiblingParityDrifts`. */
 export const SIBLING_BOUND_FIELDS: ReadonlySet<string> = new Set([
   // Identity-bound (always per-group)
   'groupName',
@@ -42,14 +18,8 @@ export const SIBLING_BOUND_FIELDS: ReadonlySet<string> = new Set([
   // Provider-bound (the reason siblings exist)
   'provider',
   'codexAuthFallbacks',
-  // RETIRED KEY, deliberately still ignored. `codexHostAuth` no longer exists
-  // in the schema (the Codex host-auth mount is unconditional) and
-  // `materializeContainerConfig` drops it, but this comparison reads the RAW
-  // container.json (cli/resources/groups) and today's files
-  // disagree on it (most claude/codex groups carry `true`, opencode siblings
-  // omit it, one group carries an explicit `false`). Dropping the entry
-  // would make parity-check report drift on a value nothing reads. Remove it
-  // once the key is gone from `groups/*/container.json`.
+  // Retired key, still ignored: parity-check reads the RAW container.json, where existing files disagree on it.
+  // Remove once no `groups/*/container.json` carries it.
   'codexHostAuth',
   // Operator-tunable runtime
   'model',
@@ -64,10 +34,6 @@ export const SIBLING_BOUND_FIELDS: ReadonlySet<string> = new Set([
   'dailySummary',
 ]);
 
-/**
- * Convenience predicate for callers diffing two container.json objects.
- * Returns `true` for fields whose drift is expected/allowed.
- */
 export function isSiblingBoundField(field: string): boolean {
   return SIBLING_BOUND_FIELDS.has(field);
 }
@@ -95,10 +61,8 @@ function slackUserTokenEnabled(value: unknown): unknown {
 }
 
 /**
- * Diff two sibling configs on capability parity rather than raw serialization.
- * Slack's non-identity settings must match (including the retired
- * `enabled` flag, so a pair's files stay identical), while `also_allowed_in` contains exact
- * messaging-group IDs and is therefore identity-bound to each adapter.
+ * Diff on capability parity, not raw serialization: Slack's non-identity settings must match (the retired `enabled`
+ * flag included), while `also_allowed_in` holds exact messaging-group ids and is identity-bound.
  */
 export function findSiblingParityDrifts(
   source: Record<string, unknown>,

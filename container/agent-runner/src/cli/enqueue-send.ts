@@ -1,44 +1,12 @@
 #!/usr/bin/env bun
 /**
- * enqueue-send — idempotent, model-free chat send for the smoke campaign
- * controller (CONTROLLER-SPEC rev 3 s2, "Model-free sends"). The live
- * controller runs it from its task script as
+ * enqueue-send: idempotent, model-free chat send for the smoke campaign controller's task script, using the same
+ * path as `send_message`/`send_file`. Differences: `to` and the thread key are required; the id is the caller's
+ * `<key>#<attempt>` and a replay must match byte-for-byte (attachment sha256s are recorded with the row); it
+ * bypasses the MODEL's chat budget and enforces the controller's own budget in the same transaction.
  *
- *   bun /app/src/cli/enqueue-send.ts --id <key>#<attempt> --to <destination> \
- *     --text-file <path> --thread-key <runId> --run-id <runId> --fire <fire> \
- *     [--fingerprint <fp>] [--file <abs path>]... [--outbox-root <dir>]
- *
- * in the task's own session, the same transport `ncl` uses: the task-script
- * process starts the session mailbox itself. The
- * runner source is a boot snapshot (src/agent-runner-source.ts), so a change
- * here reaches containers only after a host restart.
- *
- * Same path as `send_message`/`send_file` (mcp-tools/core.ts): resolve a named
- * destination, stage attachments at <outbox>/<id>/<name>, write one
- * messages_out row the host drains with no agent turn. Four differences:
- *
- *  - `to` is required (task sessions must name it) and the
- *    thread key (the run id) is required, so every post of a run threads
- *    across fires (src/db/thread-key-anchors.ts).
- *  - The id is the caller's `<obligation key>#<attempt>`, not a random one,
- *    and the row is written with INSERT ... ON CONFLICT(id) DO
- *    NOTHING, then read back. An identical existing row is `replay` (exit 0);
- *    a different payload under the same id is an error and is never
- *    overwritten. A plain INSERT would throw on replay.
- *  - It does not go through the fork's per-turn chat budget
- *    (NanoclawAgentMailbox.writeMessageOut -> admitChatWrite), which is the MODEL's budget and
- *    silently returns -1 when refused. The controller has its own, enforced
- *    here in the same transaction as the insert: per run per fire, per run,
- *    per alarm fingerprint. A replay never consumes budget.
- *  - Attachment bytes are part of the payload. Each staged file's sha256 is
- *    written to session_state (`controller_send_files:<id>`) in the same
- *    transaction as the row, and outlives the host's cleanup of <outbox>/<id>/,
- *    so a replay compares bytes, not just names. A row whose digest record is
- *    missing or unreadable never verifies as a replay.
- *  - Output is one JSON line; exit codes are the contract (below).
- *
- * Exit: 0 enqueued|replay, 2 invalid input, 3 controller_send_budget,
- *       4 payload mismatch for an existing id, 1 anything else.
+ * Exit: 0 enqueued|replay, 2 invalid input, 3 controller_send_budget, 4 payload mismatch for an existing id,
+ * 1 anything else.
  */
 import '../modules/index.js';
 import crypto from 'crypto';
@@ -51,13 +19,7 @@ import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import { writeControllerSendRow } from '../modules/mailbox/controller-send.js';
 import { isAllowedFilePath, parseThreadKey } from '../mcp-tools/core.js';
 
-// Controller-send budget. Measured over the 30 finished PR smoke campaigns of
-// 2026-09-05..18 (gate agent session outbound.db, kind=chat rows naming the PR or
-// run id, claim-5m to finish+2h): posts per campaign p50 3, max 12 (pr1896,
-// including human-thread replies); most posts inside any 10-minute window
-// (one */10 fire) 4, in 2 of 30 campaigns. So the per-run cap keeps the
-// spec's 15 (above the measured max) and the per-fire cap is 4, not the spec's
-// 3: 3 would have throttled 2 real bursts. Per-fingerprint stays the spec's 2.
+// Sized from measured campaigns: per-fire 4 (3 would have throttled real bursts), per-run 15, per-fingerprint 2.
 export const CONTROLLER_SEND_BUDGET = { perFire: 4, perRun: 15, perFingerprint: 2 } as const;
 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}#[1-9][0-9]{0,2}$/;
@@ -98,10 +60,8 @@ interface Routing {
 }
 
 /**
- * The named-destination branch of core.ts resolveRouting:
- * a channel keeps the session's thread only when it is the session's own
- * chat; an agent destination never carries a thread. The parity test in
- * enqueue-send.test.ts holds this to send_message's actual row.
+ * The named-destination branch of core.ts resolveRouting; the parity test in enqueue-send.test.ts holds this to
+ * send_message's actual row.
  */
 function resolveNamedRouting(to: string): Routing {
   const dest = findByName(to);
@@ -167,9 +127,6 @@ interface BudgetState {
   fingerprints: Record<string, number>;
 }
 
-// The session-DB reads and the insert transaction live in the mailbox module
-// (modules/mailbox/controller-send.ts); this file keeps the budget POLICY
-// below, the payload comparisons, and the CLI's error taxonomy.
 function sameDigests(stored: FileDigests | null, wanted: FileDigests): boolean {
   if (wanted.length === 0) return stored === null;
   if (stored === null || stored.length !== wanted.length) return false;
@@ -258,12 +215,7 @@ export function enqueueSend(input: EnqueueSendInput): EnqueueSendResult & { ok: 
   return { ok: true, outcome: result.outcome, id: input.id, seq: result.seq };
 }
 
-// ---------------------------------------------------------------------------
-// CLI
-
-// A text file the caller names but that cannot be read is a deterministic
-// input fault (exit 2), not a transient one: the controller retries `error`
-// (exit 1) as an unknown outcome, and a retry cannot make the file appear.
+// An unreadable text file is a deterministic input fault (exit 2): the controller retries exit 1.
 function readTextFile(file: string): string {
   try {
     return fs.readFileSync(file, 'utf8');

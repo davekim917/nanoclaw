@@ -1191,10 +1191,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           message.kind,
           platformId,
         );
-        // Only status bubbles are edited (chat replies post fresh). Oversize status text truncates to one chunk:
-        // extra posts would not be tracked by delivery.ts's statusTracking and would survive cleanup as stale
-        // thinking tails. An edited chat reply keeps its subtext; the footer is budgeted before truncating, as on the
-        // post path.
+        // Status bubbles, agent corrections to a chat reply, and task lists are edited here. Oversize text truncates
+        // to one chunk: extra posts would escape delivery.ts's statusTracking and survive cleanup as stale thinking
+        // tails. Chat and task-list edits keep their subtext, budgeted before truncating as on the post path.
         const editSubtext =
           (message.kind === 'chat' || message.kind === 'task_list') &&
           typeof content.subtext === 'string' &&

@@ -1,14 +1,4 @@
-/**
- * Test harness for the session DBs.
- *
- * Builds upstream's in-memory baseline (which also flips upstream's connection
- * module into test mode, so openInboundDb/getInboundDb/getOutboundDb resolve to
- * these handles), then applies the fork schema through the SAME functions
- * production uses — tests and production share one schema source.
- *
- * Importing this module registers the fork mailbox, so the compat shims in
- * db/*.ts (which go through getAgentMailbox()) work inside tests.
- */
+/** Test harness: builds upstream's in-memory baseline, then the fork schema through the same functions production uses. */
 import type { Database } from 'bun:sqlite';
 
 // Module barrel — loads registration modules, including the singular mailbox slot.
@@ -29,18 +19,12 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
   // A fresh session DB starts a fresh poll tick — never inherit the previous
   // test's memoized fence token.
   clearTickRepositoryBarrier();
-  // provider_executing's two scopes are module-level counters, so a test that
-  // left a turn raised or a scope open would otherwise carry it into the next.
-  // Zeroed without a DB write: the fresh outbound has no container_state row
-  // yet, and publishing one here would change what every other test observes.
+  // Zero the module-level busy scopes without a DB write, so no test inherits another's.
   resetProviderExecutingScopes();
   const { inbound, outbound } = upstreamInitTestSessionDb();
   ensureNanoclawInboundTestSchema(inbound);
   ensureNanoclawOutboundSchema(outbound);
-  // Registered by the barrel import above. The schema is applied synchronously
-  // here rather than through start(), whose await boundary would push it into a
-  // microtask and break this function's synchronous contract; production runs
-  // the same two functions from NanoclawAgentMailbox.start().
+  // Schema applied synchronously, not via start(), whose await would break this function's synchronous contract.
   getAgentMailbox();
   return { inbound, outbound };
 }

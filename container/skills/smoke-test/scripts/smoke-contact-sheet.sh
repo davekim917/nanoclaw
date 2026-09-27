@@ -101,7 +101,7 @@
 # across the seat; loading the same saved state file locally isn't a login).
 # One shared session for the whole run used to carry a previous screen's DOM
 # state — e.g. a nav drawer opened by an earlier screen's `steps` — into every
-# later screenshot; xzo-pr-pr1792-cac47f6f1153-20260912T113129Z's three 390px
+# later screenshot; acme-pr-pr1792-cac47f6f1153-20260912T113129Z's three 390px
 # shots all showed the drawer open, and the shadow critic graded all three
 # BROKEN partly on that capture artifact, which corrupts the agreement score
 # the whole critic feature is judged on. A same-URL, same-viewport `open` can

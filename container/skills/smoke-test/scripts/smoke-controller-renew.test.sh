@@ -7,7 +7,7 @@
 # gate's own answer, not a mock's. The STUB-GATE arm replaces the gate with a
 # logger, so what the tick did and did not invoke is exact.
 #
-# Covers: the XZO #2024 regression (an owner step outliving the 900 s lease)
+# Covers: the lease regression (an owner step outliving the 900 s lease)
 # and its control arm (no renewer -> the lease expires, which is the pre-fix
 # behaviour and the renewer-killed degradation); a step that completes; an
 # abandoned run; the ceiling; a withdrawn/absent ack; the kill switch; a torn
@@ -90,6 +90,7 @@ new_case() { # <name>
   # execs the gate; here the gate is called directly and takes its own
   # SMOKE_GATE_* from the process env the test exports.
   export SMOKE_CONTROLLER_GATE_CMD="$GATE"
+  export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
   JOURNAL="$C/out/journal.ndjson"
   : >"$JOURNAL"
   write_env live
@@ -194,7 +195,7 @@ in_flight_at() { # <started-epoch>
 tick_working() { owner_writes; tick; }
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 1. THE REGRESSION (XZO #2024) — an owner step longer than the lease TTL.
+# 1. THE REGRESSION — an owner step longer than the lease TTL.
 #    Control arm first: with no renewer this is exactly today's behaviour.
 # ═════════════════════════════════════════════════════════════════════════════
 echo "== 1. owner step outlives the 900s lease =="
@@ -515,7 +516,7 @@ tick
 [ "$(field '.data.status')" = misconfigured ] || fail "a non-literal value was not refused: $LAST"
 ok
 # The env file is the list of keys, not a copy of it kept in this tick
-# (XZO #2047). A name outside the four this tick reads for itself must still
+#. A name outside the four this tick reads for itself must still
 # reach the gate call -- here the gate is invoked directly, so its lease dir
 # comes from nowhere else -- and a name the tick has never heard of must pass
 # through rather than be dropped or crash.
@@ -569,7 +570,7 @@ ok
 # --- imported config never touches this script's own variables --------------
 # The tick's internals are ours and can be renamed at any time, so no deny list
 # can protect them in general: config goes into the CHILD environment only.
-# CEILING_MAX is the renewal ceiling added for XZO #2024; NOW stamps the final
+# CEILING_MAX is the renewal ceiling added for that regression; NOW stamps the final
 # line. At 760e6220c the env file could overwrite both.
 new_case env-cannot-clobber-internals
 START="$(/usr/bin/date -u +%s)"

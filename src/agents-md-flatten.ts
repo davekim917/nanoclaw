@@ -1,61 +1,21 @@
 /**
- * CLAUDE.md → AGENTS.md flattener.
- *
- * Codex doesn't resolve `@path` includes in AGENTS.md (verified empirically
- * via `codex debug prompt-input` 2026-05-13: `@/tmp/.../included.md` was
- * passed to the model as literal text). So to keep Operator's CLAUDE.md as the
- * canonical source of behavioral rules, we flatten it: every `@<path>`
- * line is replaced inline with the referenced file's content. Recursive,
- * cycle-safe, symlink-aware.
- *
- * Resolution rules — mirror Claude Code's @-include behavior:
- *   - `@./foo.md` or `@foo.md` resolves relative to the file containing it.
- *   - `@/abs/path` resolves as an absolute path.
- *   - `@~/foo` expands `~` to $HOME first.
- *   - One `@<path>` per line; whitespace before/after the @-line is preserved.
- *   - Trailing whitespace, fenced code blocks, and any non-leading @ are
- *     left alone — we only intercept lines whose first non-whitespace
- *     character starts the `@<path>` token.
- *
- * Missing or unreadable includes are passed through as a comment so the
- * model can see something went wrong, instead of silently dropping.
- *
- * Symlinks pointing at container-only paths (e.g. `/app/CLAUDE.md`) are
- * supported via the optional `containerToHost` map — translates a known
- * container-prefix to a host-prefix before reading.
+ * CLAUDE.md → AGENTS.md flattener: Codex passes `@path` includes to the model as literal text, so each line that
+ * starts with `@<path>` is replaced by the file's content (relative to the including file; `~` expanded).
+ * Recursive, cycle-safe; a missing include becomes an inline comment marker rather than vanishing.
  */
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
 export interface FlattenOptions {
-  /**
-   * Map of container-path-prefix → host-path-prefix. Symlinks whose
-   * targets start with a known container prefix are rewritten to their
-   * host equivalent before being read. Useful for `composeGroupClaudeMd`
-   * which writes container-relative symlinks (e.g. `/app/CLAUDE.md`).
-   */
+  /** Container→host path prefixes for symlink targets (composeGroupClaudeMd writes e.g. `/app/CLAUDE.md`). */
   containerToHost?: Record<string, string>;
-  /**
-   * Maximum recursion depth — protects against include-cycles.
-   * Default 8.
-   */
+  /** Include-cycle guard; default 8. */
   maxDepth?: number;
   /**
-   * Optional gate called with the resolved read target — the top-level
-   * file and every recursively inlined `@`-import — immediately before it
-   * is ever passed to `readFileSync`. Return a reason string to skip the
-   * read (replaced with the same kind of inline comment marker used for a
-   * missing/unreadable include); return undefined to proceed normally.
-   *
-   * `compose`'s own usage never sets this — every top-level and nested
-   * target it flattens is a host-controlled path it fully trusts. A caller
-   * reading FROM a container-writable directory (e.g. a metrics job
-   * walking `groups/`, where an agent could plant a symlink to a FIFO, a
-   * huge file, or a path outside its trust boundary) should pass one; the
-   * blind `readFileSync` two lines below is exactly the DoS/exfiltration
-   * surface such a caller needs to gate. Undefined by default so this is a
-   * pure opt-in with zero behavior change for existing callers.
+   * Called with every resolved read target before `readFileSync`; a returned reason skips it with a marker. Callers
+   * reading from a container-writable tree must pass one: an agent could plant a symlink to a FIFO, a huge file or
+   * a path outside its trust boundary.
    */
   validateRead?: (realPath: string) => string | undefined;
 }
@@ -68,10 +28,6 @@ function expandHome(p: string): string {
   return p;
 }
 
-/**
- * Translate a container-only target path to its host equivalent using the
- * provided prefix map. Returns the path unchanged if no prefix matches.
- */
 function translateContainerPath(target: string, containerToHost: Record<string, string>): string {
   for (const [containerPrefix, hostPrefix] of Object.entries(containerToHost)) {
     if (target === containerPrefix || target.startsWith(containerPrefix + '/')) {
@@ -81,11 +37,7 @@ function translateContainerPath(target: string, containerToHost: Record<string, 
   return target;
 }
 
-/**
- * Resolve a symlink to its eventual real file path, walking through any
- * intermediate links and translating container paths via the provided map.
- * Returns null if the chain dangles or hits a non-readable target.
- */
+/** The real file at the end of a symlink chain, translating container paths; null when it dangles or loops. */
 function resolveSymlinkChain(start: string, containerToHost: Record<string, string>): string | null {
   let current = start;
   for (let i = 0; i < 16; i++) {
@@ -145,17 +97,8 @@ function flattenInner(filePath: string, visited: Set<string>, depth: number, opt
       out.push(line);
       continue;
     }
-    // Don't intercept email-like patterns or things inside code fences;
-    // a conservative heuristic: the `@` must be followed by a path
-    // (containing / or .md) — not a bare identifier like `@param`.
-    //
-    // Whitespace in the ref means it's prose, not a path. Real paths
-    // never contain spaces (and quoted paths aren't supported in this
-    // syntax), so the presence of any whitespace is a strong "this is
-    // a sentence" signal. Without this, prose like "the @-mention itself
-    // is the signal." gets parsed as `@-mention itself is the signal.`
-    // → ENOENT on a nonexistent file, with the failure marker spliced
-    // mid-sentence into the composed AGENTS.md.
+    // Only a path-like ref (contains / or .) with no whitespace: prose such as "the @-mention itself is the signal."
+    // would otherwise splice an ENOENT marker mid-sentence.
     const ref = match[2];
     if (/\s/.test(ref) || !/[/.]/.test(ref) || /@\w+\s/.test(line)) {
       out.push(line);
@@ -173,10 +116,7 @@ function flattenInner(filePath: string, visited: Set<string>, depth: number, opt
   return out.join('\n');
 }
 
-/**
- * Read `filePath`, recursively inline all `@path` includes, return the
- * flat content. Safe for repeated invocation — pure function of inputs.
- */
+/** Read `filePath` with every `@path` include inlined recursively. */
 export function flattenClaudeMd(filePath: string, options: FlattenOptions = {}): string {
   const opts: Required<FlattenOptions> = {
     containerToHost: options.containerToHost ?? {},

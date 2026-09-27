@@ -1,40 +1,11 @@
 /**
- * scripts/backfill-task-routing-platform-id.ts — one-off backfill for
- * `sessions.task_routing_platform_id` (migration 056).
+ * One-off backfill for `sessions.task_routing_platform_id` (migration 056 shipped without one).
+ * For each task-shaped session with the column NULL, reads its own `inbound.db` and stamps the
+ * `platform_id` that every real-channel row of the task's series agrees on; disagreement or an
+ * unreadable DB is SKIPPED, never guessed.
  *
- * Migration 056 added the column NULL-by-default and deliberately shipped
- * with no backfill (see its header): the stamp's only source is a task's
- * `messages_in` rows, which live in a per-session `inbound.db`, and a schema
- * migration must not open thousands of session files to reconstruct one
- * column. This script does that reconstruction as a separate, explicit step.
- *
- * For each session whose `thread_id` is task-shaped (`system:tasks` or
- * `system:tasks:<seriesId>`, `messaging_group_id IS NULL` — see `isTaskThread`
- * / migration 056) with `task_routing_platform_id IS NULL`, read that
- * session's own `inbound.db` and look at every row that carries the task's
- * `series_id` AND a real channel (`channel_type IS NOT NULL AND != 'agent'` —
- * `channel_type = 'agent'` rows are agent-to-agent traffic, e.g. a restart
- * notice, that happens to share the series_id; their "platform_id" is a
- * target agent_group_id, not a `messaging_groups.platform_id`, and picking
- * one up as if it were routing produced real false conflicts in the live
- * data — see the script header comment above the query for a worked
- * example). If every remaining row agrees on one `platform_id`, stamp it
- * (already channel-key shape, e.g. `slack:CTESTCHAN01`). If the rows
- * disagree, or the inbound DB is missing/locked/unreadable, or the session
- * has no such row at all — SKIP. Never guess.
- *
- * Never writes `messaging_group_id` or anything else. `messaging_group_id IS
- * NULL` is a load-bearing discriminator read by `src/delivery.ts` (`task_log`
- * routing and `isTaskSessionPost`) — this script only ever reads it as a
- * filter, never writes it.
- *
- * Safety:
- *   - dry-run by default; --apply to write
- *   - central DB opened read-only unless --apply
- *   - every session inbound.db opened read-only, ALWAYS — this script never
- *     writes to a session DB, apply or not
- *   - idempotent: only ever updates rows still NULL, both in the in-memory
- *     filter and the UPDATE's own WHERE clause
+ * Never writes `messaging_group_id`: `messaging_group_id IS NULL` is a load-bearing discriminator
+ * in `src/delivery.ts`. Session DBs are always opened read-only, and only NULL rows are updated.
  *
  * Usage:
  *   pnpm exec tsx scripts/backfill-task-routing-platform-id.ts          # dry run
@@ -48,11 +19,8 @@ import Database from 'better-sqlite3';
 import { DATA_DIR } from '../src/config.js';
 import { isTaskThread, TASKS_SYSTEM_THREAD_ID } from '../src/db/sessions.js';
 
-// Deliberately NOT `inboundDbPath` from `../src/session-manager.js` — that
-// helper resolves against the module-level `DATA_DIR` singleton (itself
-// pinned to `process.cwd()` at import time), so it silently ignores the
-// `dataDir` parameter this script takes for fixture testing. Same join
-// `sessionDir` does, just parameterized.
+// Not `inboundDbPath` from src/session-manager.ts: that resolves against the import-time
+// `DATA_DIR` and would silently ignore this script's `dataDir` parameter.
 function inboundDbPath(dataDir: string, agentGroupId: string, sessionId: string): string {
   return path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
 }
@@ -71,11 +39,7 @@ export type Outcome =
   | { kind: 'unresolvable' }
   | { kind: 'conflict'; platformIds: string[] };
 
-/**
- * Pure decision: given a session's thread/stamp state and the distinct
- * `platform_id` values seen across its task `messages_in` rows, decide what
- * (if anything) to write. No file IO — the only part under test.
- */
+/** Pure decision, no file IO. */
 export function decideRoutingStamp(
   session: Pick<CandidateSession, 'thread_id' | 'task_routing_platform_id'>,
   taskMessageRows: { platform_id: string | null }[],
@@ -151,15 +115,8 @@ function runBackfill(apply: boolean, dataDir: string = DATA_DIR): void {
         const inDb = new Database(inPath, { readonly: true, fileMustExist: true });
         try {
           inDb.pragma('busy_timeout = 2000');
-          // channel_type = 'agent' rows are agent-to-agent traffic (see
-          // src/modules/agent-to-agent/) that happens to share the task's
-          // series_id — a restart notice, an approval recall note. Their
-          // "platform_id" is a target agent_group_id, not a
-          // `messaging_groups.platform_id`, so they are never a legitimate
-          // routing signal and must be excluded before we even look at
-          // distinctness (verified live: every task session where this
-          // fired was otherwise unanimous — the a2a row was the only
-          // disagreement).
+          // channel_type = 'agent' rows are agent-to-agent traffic sharing the series_id; their
+          // platform_id is an agent group id, never a routing signal.
           rows = inDb
             .prepare(
               `SELECT platform_id FROM messages_in

@@ -175,7 +175,7 @@ CTL = os.path.join(SCRIPT_DIR, "smoke-campaign-controller.py")
 ENV_FILE = os.environ.get("SMOKE_CONTROLLER_ENV_FILE", "/workspace/agent/smoke-gate-env.sh")
 TEST_HANG = os.environ.get("SMOKE_CONTROLLER_SHADOW_TEST_HANG", "")  # test-only; never read from config
 # THE ENV FILE IS THE LIST OF KEYS -- see the live worker
-# (smoke-controller-live-worker.py, same rule, same reason: XZO #2047, where a
+# (smoke-controller-live-worker.py, same rule, same reason: the earlier failure where a
 # hardcoded allowlist here dropped SMOKE_GATE_LEASE_DIR and the evidence
 # barrier this wrapper's controller step spawns
 # (smoke-campaign-controller.py:1989 -> spawn, :692-704, env=None) fell back to
@@ -187,7 +187,7 @@ TEST_HANG = os.environ.get("SMOKE_CONTROLLER_SHADOW_TEST_HANG", "")  # test-only
 # Not a list, so it cannot drift -- a new SMOKE_ key works with no change here
 # -- while PATH, IFS, the shell hooks, LD_PRELOAD, PYTHONPATH and BUN_OPTIONS
 # (`--preload` runs a module before Bun's main script) are simply not this
-# file's configuration and stay IGNORED, exactly as before XZO #2047.
+# file's configuration and stay IGNORED, exactly as before that fix.
 CONFIG_PREFIX = "SMOKE_"
 # NOT_CONFIG is then only for the dangerous names inside that namespace. Each
 # is IGNORED, which is what the old allowlist did, so nothing that worked stops.

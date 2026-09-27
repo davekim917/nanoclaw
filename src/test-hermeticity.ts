@@ -1,52 +1,10 @@
 /**
- * Repo-level test hermeticity tripwire.
- *
- * Unit tests must not reach the world. Two escapes happened on 2026-09-03: a
- * fake-timer test advanced past the plugin updater's startup delay and ran a
- * real `git pull` across every repo under `~/plugins` (a live, fail-closed
- * mount into every agent container — a mid-pull tree denies every tool
- * fleet-wide), and `host-sweep-reschedule.test.ts` was found to have been doing
- * a real disk walk plus a GitHub and an Anthropic API call since before seam 2.
- * Both were caught by hand. Per the same-mistake-twice rule the guard is
- * structural, not per-suite discipline.
- *
- * This module is loaded from `setupFiles`, so it is installed in every host
- * test file's module graph before that file's own imports run. It guards three
- * seams:
- *
- *   - **subprocess** — `child_process` / `node:child_process` are mocked so
- *     every spawning export records the attempt and throws with the call site.
- *   - **network** — `globalThis.fetch` and `undici`'s `fetch`/`request` are
- *     wrapped the same way.
- *   - **out-of-tree writes** — `fs`, `node:fs`, `fs/promises` and
- *     `node:fs/promises` write calls are checked against a denylist of paths a
- *     unit test has no business touching (`~/plugins`, the repo's `data/`,
- *     `groups/`, `dist/`, `$HOME` dotfiles). Writes under the temp dir — where
- *     `uniqueTmpRoot` puts every fixture — are untouched.
- *
- * A test that legitimately needs one of these opts in through a named helper,
- * so the exemption is visible in the diff:
- *
- * ```ts
- * import { allowSubprocess, allowNetwork, allowWritesTo } from './test-hermeticity.js';
- * beforeAll(() => allowSubprocess(['git']));
- * ```
- *
- * Allowances are file-scoped and cleared after the file finishes, so one
- * suite's opt-in never widens another's.
- *
- * Mode is set by `NANOCLAW_TEST_HERMETICITY`:
- *   - `warn` (default) — record and log the call site, let the call through.
- *   - `enforce` — record and throw.
- *   - `off` — no guard at all.
- *
- * The repo default is `warn` because the suite is not yet clean: the first full
- * run under this guard failed 40 of 313 files, mostly suites that shell out to
- * real `git` on a scratch checkout. Flipping the whole repo to `enforce` in one
- * commit would have blocked the tripwire from landing at all. The ratchet is
- * per file instead — a suite that is hermetic calls `enforceHermeticity()` in
- * its own body and can never regress, and `NANOCLAW_TEST_HERMETICITY=enforce`
- * runs the whole repo strictly once the backlog is worked off.
+ * Repo-level test hermeticity tripwire, loaded from `setupFiles` so it is installed before each host test file's
+ * imports. Guards subprocess (`child_process`), network (`fetch`, `undici`) and out-of-tree writes (`fs` against
+ * a denylist; the temp dir is untouched). A test opts in through a named helper so the exemption is visible in
+ * the diff (`allowSubprocess(['git'])`, `allowNetwork()`, `allowWritesTo(root)`); allowances are file-scoped.
+ * Mode from `NANOCLAW_TEST_HERMETICITY`: `warn` (repo default), `enforce`, `off`; a clean suite calls
+ * `enforceHermeticity()` to ratchet itself.
  */
 import nodeOs from 'node:os';
 import nodePath from 'node:path';
@@ -72,12 +30,7 @@ function readMode(): HermeticityMode {
   return 'warn';
 }
 
-/**
- * State lives on `globalThis` rather than in module scope: `vi.resetModules()`
- * (used by a number of suites) gives the test file a fresh copy of this module,
- * and the mock factories below must keep talking to the same allowlists and
- * attempt log the helpers write to.
- */
+/** State lives on `globalThis`: `vi.resetModules()` gives a file a fresh copy of this module, and the mocks must share one state. */
 interface HermeticityState {
   mode: HermeticityMode;
   attempts: HermeticityAttempt[];
@@ -102,14 +55,7 @@ function state(): HermeticityState {
   return s;
 }
 
-// ── opt-in helpers (their use is deliberately visible in a diff) ─────────────
-
-/**
- * Permit real subprocess execution for these commands, by basename, for the
- * rest of the current test file. `allowSubprocess(['git'])` lets `git`,
- * `/usr/bin/git` and `exec('git rev-parse …')` through; everything else still
- * throws.
- */
+/** Permit real subprocess execution for these commands, by basename, for the rest of this test file. */
 export function allowSubprocess(commands: string[]): void {
   for (const c of commands) state().commands.add(nodePath.basename(c));
 }
@@ -119,10 +65,7 @@ export function allowNetwork(): void {
   state().network = true;
 }
 
-/**
- * Permit writes under `root` for the rest of the current test file, overriding
- * the out-of-tree denylist.
- */
+/** Permit writes under `root` for the rest of this test file, overriding the denylist. */
 export function allowWritesTo(root: string): void {
   state().writePaths.push(nodePath.resolve(root));
 }
@@ -137,13 +80,7 @@ export function clearHermeticityAttempts(): void {
   state().attempts.length = 0;
 }
 
-/**
- * Hold this file to the strict guard regardless of the repo default. A suite
- * that mocks its own I/O seams should call this at the top of its body: it is
- * the ratchet that keeps a clean file clean while the repo as a whole is still
- * on `warn`. Cleared with the rest of the file-scoped state after the file
- * finishes.
- */
+/** Hold this file to the strict guard regardless of the repo default: the ratchet that keeps a clean file clean. */
 export function enforceHermeticity(): void {
   const s = state();
   if (s.mode !== 'off') s.mode = 'enforce';
@@ -162,12 +99,7 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
   );
 }
 
-/**
- * Run `fn` with the tripwire in `mode`, restoring the previous mode after. An
- * async callback is awaited, so the mode survives past the first suspension.
- * This is how the tripwire proves it bites: the test disables enforcement and
- * asserts the attempt log still filled up.
- */
+/** Run `fn` with the tripwire in `mode`, restoring the previous mode after (an async callback is awaited). */
 export function withHermeticityMode<T>(mode: HermeticityMode, fn: () => T): T {
   const s = state();
   const previous = s.mode;
@@ -185,10 +117,7 @@ export function withHermeticityMode<T>(mode: HermeticityMode, fn: () => T): T {
     restore();
     throw error;
   }
-  // An async callback returns at its first `await` with the rest of its body
-  // still to run. Restoring in a `finally` would drop the requested mode right
-  // there, so everything past the first suspension would execute under the
-  // repo default and, in `warn`, actually reach out.
+  // Restoring in a `finally` would drop the mode at an async callback's first `await`.
   if (isThenable(result)) {
     return result.then(
       (value) => {
@@ -205,8 +134,6 @@ export function withHermeticityMode<T>(mode: HermeticityMode, fn: () => T): T {
   return result;
 }
 
-// ── the guard itself ─────────────────────────────────────────────────────────
-
 function callSite(): string {
   const stack = new Error('hermeticity').stack ?? '';
   const frames = stack
@@ -219,12 +146,7 @@ function callSite(): string {
   return frames[0] ?? 'unknown call site';
 }
 
-/**
- * Record the attempt, then throw (or warn). Recording matters independently of
- * throwing: most host callers already wrap their real work in try/catch or
- * `.catch` precisely so a git or network failure never crashes the host, so a
- * throw-only tripwire can fire and still leave a test green.
- */
+/** Record first, then throw: callers often swallow the failure, so a throw-only tripwire can leave a test green. */
 function trip(kind: HermeticityAttempt['kind'], api: string, target: string, hint: string): void {
   const s = state();
   const attempt: HermeticityAttempt = { kind, api, target, callSite: callSite() };
@@ -242,8 +164,6 @@ function trip(kind: HermeticityAttempt['kind'], api: string, target: string, hin
   }
   throw new Error(message);
 }
-
-// ── subprocess ───────────────────────────────────────────────────────────────
 
 /** The command a `child_process` call is aimed at, for allowlist matching. */
 function commandOf(api: string, args: unknown[]): string {
@@ -281,11 +201,7 @@ function guardChildProcess(real: Record<string, unknown>): Record<string, unknow
       checkSubprocess(api, args);
       return original(...args);
     };
-    // `promisify(execFile)` reads this symbol off the function it is handed and
-    // calls it INSTEAD of the function itself. Copying the original's
-    // implementation across would therefore hand every promisified caller —
-    // `src/container-updates.ts` among them — a straight line to the real
-    // binary, past the check above. Wrap it instead.
+    // `promisify(execFile)` calls this symbol INSTEAD of the function; copying it across would bypass the check.
     const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
     const custom = (original as unknown as Record<symbol, unknown>)[promisifyCustom];
     if (typeof custom === 'function') {
@@ -306,8 +222,6 @@ vi.mock('child_process', async (importOriginal) =>
 vi.mock('node:child_process', async (importOriginal) =>
   guardChildProcess((await importOriginal()) as Record<string, unknown>),
 );
-
-// ── network ──────────────────────────────────────────────────────────────────
 
 function urlOf(input: unknown): string {
   if (typeof input === 'string') return input;
@@ -341,8 +255,6 @@ vi.mock('undici', async (importOriginal) => {
   return guarded;
 });
 
-// ── out-of-tree writes ───────────────────────────────────────────────────────
-
 /** `fs.constants`, filled in from the real module inside the mock factory. */
 const nodeFsConstants = { O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_TRUNC: 512, O_APPEND: 1024 };
 
@@ -350,24 +262,9 @@ const nodeFsConstants = { O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_TRUNC: 512, O_A
 const CHECKOUT_ROOT = nodePath.resolve(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
- * Roots inside the checkout that a unit test has no business writing to. In a
- * live install these hold production session state, so a test that lands here
- * is writing over the running system.
- *
- * The roots are derived from this file's own location, not from
- * `process.cwd()`. The runner suite runs with `container/agent-runner` as its
- * working directory, so a cwd-derived list protects
- * `container/agent-runner/data` — a path that does not exist — and leaves the
- * real `<checkout>/data` open to `path.resolve(cwd, '../../data/v2.db')`. The
- * cwd is still included, so a suite launched from somewhere else is covered too.
- *
- * Deliberately a denylist, not an allowlist: fixtures live all over the temp
- * dir and a few suites build their own scratch checkouts, so an allowlist would
- * be a wall of exemptions while the escapes worth catching are a short, known
- * list. The home-relative half of the denylist — `~/plugins`, a live
- * fail-closed mount into every agent container, and `$HOME` dotfiles — is
- * applied in `writeDenied` rather than here, because it must yield to the
- * temp-dir allowance.
+ * Roots a unit test must not write to (live session state in an install). Derived from this file's location,
+ * not `process.cwd()`: the runner suite's cwd is container/agent-runner. A denylist on purpose; the home-relative
+ * half is applied in `writeDenied` because it must yield to the temp-dir allowance.
  */
 function checkoutDeniedRoots(): string[] {
   const names = ['data', 'groups', 'dist', 'logs', 'node_modules'];
@@ -391,11 +288,7 @@ function pathOf(arg: unknown): string | null {
   return null;
 }
 
-/**
- * The unguarded path-inspection calls, captured inside the mock factory where
- * `importOriginal()` still hands back the real module. None of them is a write
- * API, so none is wrapped.
- */
+/** Path-inspection calls captured inside the mock factory, where `importOriginal()` is still the real module. */
 interface PathOps {
   lstatSync: (p: string) => { isSymbolicLink(): boolean };
   readlinkSync: (p: string) => string;
@@ -403,13 +296,7 @@ interface PathOps {
 }
 let PATH_OPS: PathOps | null = null;
 
-/**
- * Run a path-inspection call, or `null` if it fails.
- *
- * Every caller below is inspecting a path that may not exist yet, may dangle,
- * or may not be readable. Any failure means "cannot resolve further", and the
- * lexical path is then the safe answer — so there is nothing to rethrow.
- */
+/** A path-inspection call, or null if it fails: the lexical path is then the safe answer. */
 function attempt<T>(fn: () => T): T | null {
   try {
     return fn();
@@ -420,15 +307,8 @@ function attempt<T>(fn: () => T): T | null {
 }
 
 /**
- * The physical path a write lands on, following symlinks.
- *
- * A lexical check is not enough: a fixture under the temp dir can hold a
- * symlink into a denied root, and a write through it would sail past the
- * temp-directory allowance and mutate live state. Neither the target nor the
- * link's destination is guaranteed to exist yet, so this walks to the nearest
- * lstat-able ancestor, follows it by hand when it is a symlink — a dangling one
- * throws out of `realpathSync`, which is exactly what a not-yet-created fixture
- * produces — and re-appends the rest.
+ * The physical path a write lands on: a temp fixture can symlink into a denied root. Walks to the nearest
+ * lstat-able ancestor and follows it by hand, since the target may not exist yet.
  */
 function canonicalize(p: string): string {
   const ops = PATH_OPS;
@@ -461,18 +341,11 @@ function canonicalize(p: string): string {
 
 /** The denylist verdict for one already-resolved path. */
 function deniedFor(resolved: string): string | null {
-  // Checkout-relative roots are denied even under the temp dir: a scratch
-  // worktree can itself live in /tmp, and `<worktree>/data` is exactly the
-  // escape worth catching.
+  // Checkout-relative roots are denied even under the temp dir: a scratch worktree can live in /tmp.
   for (const denied of checkoutDeniedRoots()) {
     if (isUnder(resolved, denied)) return denied;
   }
-  // Fixtures live under the temp dir; that is the normal case. This allowance
-  // comes BEFORE the home-relative rules on purpose. `homedir()` reads $HOME at
-  // call time, and a suite that sandboxes itself by pointing $HOME at a temp
-  // directory — codex-sync builds a whole fake `~/plugins` that way — would
-  // otherwise be flagged for doing exactly the right thing. A real home
-  // directory is never under the temp dir, so nothing worth catching is lost.
+  // The temp-dir allowance comes BEFORE the home rules: suites sandbox $HOME under the temp dir.
   for (const tmp of [nodeOs.tmpdir(), '/tmp', '/private/tmp', '/var/tmp']) {
     if (isUnder(resolved, nodePath.resolve(tmp))) return null;
   }
@@ -496,9 +369,7 @@ function writeDenied(target: unknown): string | null {
   for (const allowed of s.writePaths) {
     if (isUnder(resolved, allowed) || isUnder(physical, allowed)) return null;
   }
-  // Both the lexical and the physical path have to be clear. The lexical one
-  // catches `<checkout>/data` even when it is itself a symlink elsewhere; the
-  // physical one catches a temp path that points into a denied root.
+  // Both the lexical and the physical path must be clear.
   for (const candidate of physical === resolved ? [resolved] : [resolved, physical]) {
     const denied = deniedFor(candidate);
     if (denied !== null) return denied;
@@ -521,19 +392,9 @@ function isWriteOpen(flags: unknown): boolean {
 }
 
 /**
- * Which arguments hold a path this call MUTATES.
- *
- * Most of the API mutates its first. `copyFile`, `cp`, `symlink` and `link`
- * only create their second — checking the first there flags the source, which
- * is how this guard first "caught" a container mount copying a real Snowflake
- * key it was only reading. `rename` mutates both: it removes the source as well
- * as creating the destination, so `renameSync('<checkout>/data/v2.db', '/tmp/x')`
- * would move live central state out of the checkout past a destination-only
- * check. `open` mutates its first only when the flags say so, but it has to be
- * covered: `openSync(p, 'w')` truncates before a single byte is written, and
- * the descriptor it hands back is a number, which this guard deliberately
- * ignores — so an unguarded `open` makes every subsequent write invisible.
- * `src/session-manager.ts` opens the upgrade manifest exactly that way.
+ * Which arguments a call MUTATES. `copyFile`/`cp`/`symlink`/`link` create only their second; `rename` mutates
+ * both; `open` mutates its first only for write flags, but must be covered because it truncates and the
+ * returned descriptor is invisible to this guard.
  */
 function writeTargets(api: string, args: unknown[]): number[] {
   if (/^open/.test(api)) return isWriteOpen(args[1]) ? [0] : [];
@@ -626,8 +487,6 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return guarded;
 });
 
-// ── per-file lifecycle ───────────────────────────────────────────────────────
-
 afterAll(() => {
   const s = state();
   const unacknowledged = s.attempts.slice();
@@ -657,12 +516,7 @@ afterAll(() => {
     return;
   }
 
-  // Throwing from the guarded call is not enough on its own. Much of the host
-  // wraps its real work in try/catch precisely so a git or network failure
-  // never crashes the daemon, so an escape can be caught by the code under test
-  // and leave the file green in `enforce` mode. Failing here closes that gap: a
-  // file that reached out has to say so, by calling clearHermeticityAttempts()
-  // once it has asserted on the record.
+  // Fail at end of file: code under test often catches the guarded throw. Acknowledge with clearHermeticityAttempts().
   const detail = unacknowledged.map((a) => `  ${a.kind} ${a.api}(${a.target}) at ${a.callSite}`).join('\n');
   throw new Error(
     `test hermeticity: ${unacknowledged.length} escape(s) were recorded but never acknowledged:\n${detail}\n` +

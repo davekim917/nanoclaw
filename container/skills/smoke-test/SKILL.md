@@ -372,7 +372,7 @@ them, quotes from them, and the after-the-fact check verifies against them —
 never against the live body.
 
 **Acceptance contract (contract steps).** Active only when the QA pair's
-standing instructions say `Acceptance contract (XZO pilot): active`; every
+standing instructions carry `Acceptance contract (<any label>): active`; every
 step marked *(contract)* applies then and never otherwise, and without that
 line this skill runs exactly as before. *(contract)* Also freeze every request
 the PR body's `acceptance-v1` block (`references/acceptance.example.json`)
@@ -1664,7 +1664,7 @@ do its job without. Both used to stay in the controller's own journal.
   `:1579-1580` and unlinks on `doc is None` at `:1565-1573`), and every
   barrier-backed brief names that file (`:1600-1623`). `invalid[]` is artifact
   CONTENT the barrier rejects; only the owner can repair it, and no amount of
-  lane work clears it. Run `xzo-pr-pr2055-…` (XZO #2047) spent 67 minutes
+  lane work clears it. Run `acme-pr-pr2055-…` spent 67 minutes
   running lanes while the barrier had already named
   `journeys/scope-dispositions.json` invalid on the first lanes fire — the
   journal said so, the brief did not, and the owner found out by running the
@@ -1673,13 +1673,13 @@ do its job without. Both used to stay in the controller's own journal.
   **A refusal that appears AFTER the brief was acknowledged re-offers the
   step.** The first fix covered first arrival — the barrier already refusing
   when the brief was written. The commoner order, and the one run
-  `xzo-pr-pr2055-…` actually took, is the reverse: the brief is issued while
+  `acme-pr-pr2055-…` actually took, is the reverse: the brief is issued while
   the barrier is merely waiting for markers, the owner acks it, and then the
   owner writes evidence the barrier rejects. `owner_step` re-offers a wake only
   while the `.ack` is absent (`smoke-campaign-controller.py:2738-2740`), so that
   fire published the new refusal and woke nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
   `invalidReasons[]`, digested against what the brief was written under
-  (`refusal_digest`, `smoke-campaign-controller.py:255`; recorded as
+  (`refusal_digest`, `smoke-campaign-controller.py:258`; recorded as
   `briefedRefusal` at `:1518-1519`, carried forward at `:2731-2732`, compared by
   `_reoffer_on_new_refusal` at `:2872`) — and
   deliberately neither of its neighbours: not "the published answer changed",
@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5475`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5567`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -1717,7 +1717,7 @@ do its job without. Both used to stay in the controller's own journal.
   `wake.json` and run `smoke-run-scaffold.sh adopt` before writing anything.
   That re-issue is the only legitimate route: a token copied out of gate state
   passes the fence by impersonating its holder, which is what the fence exists
-  to prevent (XZO #2046 — the owner on `xzo-pr-pr2055-…` was asked to do
+  to prevent (the owner on `acme-pr-pr2055-…` was asked to do
   exactly that and correctly refused, leaving eight completed lanes
   unbankable).
 
@@ -1764,7 +1764,7 @@ during a long step: the controller's series arms its next occurrence only when
 the current one resolves, so it cannot fire while the owner's turn is running,
 and the owner is refused `progress` as a claimant mismatch. On PR #2022 that
 cost a 13-lane step four lane markers and finished the run `BLOCKED`
-(XZO #2024).
+(a lease that expired mid-step).
 
 **The live controller will not claim a new campaign without it.** Every tick
 writes `<out-dir>/renewer/heartbeat.json`. Before each poll, the live
@@ -2511,13 +2511,13 @@ then carries `tookOverFrom`. `poll` never takes over.
 A PR settles when: it is open and carries `SMOKE_GATE_LABEL` (default
 `render-preview`); its backend preview exists, is `live`, and its deploy
 commit equals the PR head SHA; the frontend preview additionally matches when
-the diff touches `XZO-FRONTEND/`; CI is green on the head — **except** a
+the diff touches `SMOKE_GATE_FRONTEND_PREFIX`; CI is green on the head — **except** a
 freeze PR (see below), where CI is checked on the head's *parent* commit,
 since freeze commits get no path-filtered CI of their own; and the backend's
 `/healthz` returns 200 (a fresh preview can read `{"status":"warming"}` for
 ~6-10 minutes after `live` — the gate never sleeps waiting this out, it just
 reports not-settled and lets the next poll catch it). Any labeled **ordinary**
-PR whose own diff touches `XZO-BACKEND/migrations/` is refused outright (one
+PR whose own diff touches `SMOKE_GATE_MIGRATIONS_PREFIX` is refused outright (one
 throttled `pr_migrations_refused` alarm, never a settle). A **freeze PR is
 never refused on migrations**: its target is already on the tracked branch, so
 a migration in its range is campaign scope, reported in `migrationsInRange`,
@@ -2612,7 +2612,13 @@ Config: `SMOKE_GATE_REPO`, `SMOKE_GATE_BRANCH` (default `develop`),
 `SMOKE_GATE_BACKEND_SERVICE` / `SMOKE_GATE_FRONTEND_SERVICE` (the **base**
 Render service ids — previews are discovered per PR by matching
 `serviceDetails.parentServer.id` plus a `PR #<n>` name suffix, never
-hardcoded preview ids), `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
+hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFIX` /
+`SMOKE_GATE_MIGRATIONS_PREFIX` (the install's repo dirs, each with a trailing
+`/`: a diff under the frontend prefix requires the frontend preview to match,
+one under the migrations prefix refuses an ordinary PR, and the freeze markers
+are `<prefix>.render-freeze` under the backend and frontend prefixes; all
+three are required for every gate verb, each a relative path of plain segments ending in `/` and distinct from the other two (nesting is fine), checked once before any mode by `scripts/smoke-gate-layout.sh`: anything else is `gate_misconfigured`),
+`SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
 seam and semantics as the develop gate — one readiness command run once per
 poll, immediately before a settled candidate is actually claimed), and
@@ -2622,6 +2628,42 @@ without a healthy `/healthz` after going `live` raises one throttled
 SHA this gate's own `finish` already completed and suspended: `finish`
 suspending its preview by design produces the identical
 backendReady-true/healthzReady-false shape, and is checked first).
+
+**Go-time config check: run each wrapper with `config`.**
+`bash /workspace/agent/smoke-pr-gate.sh config` and
+`bash /workspace/agent/smoke-develop-gate.sh config` judge the environment each
+wrapper hands its gate with the gate's own refusal list: the required keys, the
+layout prefixes (`scripts/smoke-gate-layout.sh`) and every numeric knob. They
+print `{"ok":true}` and exit 0, or exit 1 with the key names
+(`{"ok":false,"error":"gate misconfigured","missing":[…]}`), never a value.
+`config` returns before the gate creates its state dir, takes a lock, reads
+state or calls anything remote. The freeze helper runs under the develop
+wrapper's environment, so the develop gate's `config` covers its keys too. Run
+both before a gate change goes live: `gate_misconfigured` after a pull means a
+key `config` would have named.
+
+**Preview providers.** `SMOKE_PREVIEW_PROVIDER` picks where a PR's previews
+come from. `render` (default) is everything above: base service ids, Render's
+services/deploys API, and a best-effort suspend on `finish`. `static` fits any
+host that gives each PR a predictable URL (Cloudflare Pages, Netlify, Vercel,
+a self-hosted preview): `SMOKE_GATE_FRONTEND_SERVICE` / `SMOKE_GATE_BACKEND_SERVICE`
+become URL templates containing `{pr}` (the PR number, e.g. Netlify's
+`https://deploy-preview-{pr}--<site>.netlify.app`) and/or `{branch}` (the PR
+head lowercased with every non-alphanumeric character a `-`, Cloudflare Pages'
+`https://{branch}.<project>.pages.dev` alias); a template with neither, or one
+that is not a plain http(s) URL (host, optional port and path; no query, since
+the resolved URL is pasted into shell commands), is `gate_misconfigured`. A preview's deploy identity is the full 40-character
+commit SHA it serves, read from `SMOKE_PREVIEW_VERSION_PATH` (default `/version`,
+JSON `sha`, `commit` or `gitSha`) or else a `<meta name="build-sha" content="…">`
+tag in its page (`scripts/smoke-preview-static.sh`, read by the gate and by
+`smoke-pair-identity.sh`, which then freezes each preview's URL and served
+commit, recorded as deploy `sha-<commit>`; a same-commit redeploy is invisible
+to it). `static` never calls a provider API and never suspends.
+`SMOKE_GATE_HEALTH_PATH` (default `/healthz`) is the backend readiness probe for
+both providers and for `smoke-build-identity.sh`. The develop gate and the
+freeze helper still read Render's API; a `static` install runs PR-scoped
+campaigns only. A hard assumption for every provider: the repo
+is on GitHub (`gh` reads PRs, CI runs and trees).
 
 **Preview identity is never a positional pick.** Render has provisioned two
 services sharing one display name under the same parent more than once (a
@@ -2657,7 +2699,7 @@ A `frontendEvidenceGap: true` fact marks a null `frontendPreviewUrl` as a
 gap in the evidence available for browser-lane build-identity attestation
 (`smoke-build-identity.sh` needs that URL), not a silent "not applicable" —
 the frontend preview is now looked up on every PR regardless of whether its
-diff touched `XZO-FRONTEND/`, since the disambiguation oracle above needs it
+diff touched `web/`, since the disambiguation oracle above needs it
 even on a backend-only PR.
 
 Full design and the live Render verification behind every rule above:

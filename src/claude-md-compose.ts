@@ -1,30 +1,6 @@
 /**
- * CLAUDE.md composition for agent groups.
- *
- * Replaces the per-group "written once at init, owned by the group" pattern
- * with a host-regenerated entry point that INLINES:
- *   - a shared base (`container/CLAUDE.md`, read directly from its host path)
- *   - built-in module fragments (`<name>.instructions.md` next to each MCP
- *     tool, read directly from their host paths)
- *   - optional per-MCP-server fragments (inline `instructions` field in
- *     `container.json`)
- *   - optional provider-neutral standing instructions
- *
- * Every section is written into the file itself rather than `@`-imported:
- * Claude Code silently DROPS an `@`-import whose resolved realpath falls
- * outside the project directory, and a container-path symlink this function
- * used to write (e.g. `/app/CLAUDE.md`) resolves outside the container's
- * project directory of `/workspace/agent`. Reading the host source directly
- * at compose time — rather than writing a dangling on-host symlink to a
- * container-only path and re-deriving its host equivalent through a
- * container-to-host translation map — sidesteps that entirely: compose
- * always runs host-side, so it never needed the container's view of these
- * paths in the first place. See the comment on the composition block below
- * for the measurement that motivated inlining.
- *
- * Runs on every spawn from `container-runner.buildMounts()`. Deterministic —
- * same inputs produce the same CLAUDE.md. The composition order and fragment
- * sources are documented inline above.
+ * Host-regenerated CLAUDE.md/AGENTS.md for agent groups, run on every spawn. Every section is INLINED, never
+ * `@`-imported: Claude Code silently drops an `@`-import whose realpath falls outside the project directory.
  */
 import fs from 'fs';
 import { OUTCOME_REPORTING_INSTRUCTIONS } from './outcome-reporting-instructions.js';
@@ -48,73 +24,27 @@ import { log } from './log.js';
 import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import type { AgentGroup } from './types.js';
 
-// Fragment holding a group's standing instructions. Imported FIRST (before
-// the shared base) so it is the top of the composed system prompt.
 const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 
-// Host-side source paths used to discover fragment sources at compose time.
-// Joined against `projectRoot` (derived from GROUPS_DIR) at call time so
-// tests, which mock GROUPS_DIR to a scratch dir, resolve these consistently.
+// Joined against projectRoot (derived from GROUPS_DIR) so tests that mock GROUPS_DIR resolve consistently.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
-/**
- * NanoClaw-side override marker, written by the operator (via
- * /enable-agent-plugins) into a `~/plugins` entry that ships no clean standing
- * ruleset of its own. A NanoClaw-specific filename, so it belongs only on
- * third-party plugins we do not control.
- */
+/** Operator override (via /enable-agent-plugins) for a third-party plugin that ships no clean ruleset. */
 const NANOCLAW_ALWAYS_ON_MARKER = '.nanoclaw-always-on.md';
 
-/**
- * A plugin's OWN standing-directive file, in the plugin's own vocabulary — no
- * NanoClaw-specific name, nothing a plugin repo carries for our benefit.
- */
 const PLUGIN_ALWAYS_ON_FILE = 'always-on.md';
 
-/**
- * Largest plugin ruleset this composer will read, in bytes.
- *
- * Sized against the surface it feeds rather than picked round: the composed
- * doc as a whole is already capped at `CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES`
- * (`src/codex-project-doc-cap.ts`), and one plugin's standing directive is a
- * fraction of a document that also carries the persona, the shared base and
- * every other fragment. 64 KiB is far above every ruleset in the tree and far
- * below anything that costs a spawn measurable time or memory.
- */
+/** Bounded because one plugin's directive is a fraction of the capped composed doc. */
 const MAX_PLUGIN_RULESET_BYTES = 64 * 1024;
 
 /**
- * One ruleset file's trimmed contents, or null when absent, empty, unreadable,
- * or resolving outside `repoRoot`.
- *
- * The containment check is this reader's security boundary, and it lives here
- * because this is the one place the bytes are actually read. What this composes
- * lands in the group's `AGENTS.md`, which is mounted into the container — so the
- * HOST reads a path and publishes it somewhere the container can see. Every
- * component of that path is plugin-choosable: `statSync` and `readFileSync`
- * follow symlinks, and `subPluginDirs` walks through directory symlinks too, so
- * an `always-on.md` symlinked at `~/.codex/auth.json`, or a sub-plugin directory
- * symlinked at `/etc`, would otherwise read host-only state and paste it into
- * the prompt.
- *
- * That a plugin's code is already trusted to RUN in the container is not the
- * same permission — this crosses host-only state into container-visible state.
- * So the rule is resolved-path containment rather than a check on the final
- * component: `realpathSync` both sides, compared with a separator boundary so a
- * sibling named `<root>-evil` cannot prefix-match. Resolving the root as well
- * keeps an ordinarily-symlinked `~/plugins/<name>` (a dev checkout living
- * elsewhere) working, and an in-repo symlink still composes — only leaving the
- * repository is refused.
+ * One ruleset file's trimmed contents, or null when absent, empty, unreadable, or resolving outside `repoRoot`.
+ * Security boundary: the host reads plugin-choosable paths and publishes them into the container-visible
+ * AGENTS.md, so containment is checked on the realpath (separator-bounded) of the opened descriptor.
  */
 function readRulesetFile(dir: string, filename: string, repoRoot: string): string | null {
   const file = path.join(dir, filename);
-  // The root is resolved BEFORE the open, and that ordering is the point. A
-  // root resolved afterwards is a second pathname lookup the first one cannot
-  // constrain: swap `~/plugins/<repo>` for a symlink to `/home/ubuntu` between
-  // the two, and a descriptor holding `~/.codex/auth.json` measures as
-  // contained by the freshly-resolved root. Resolving first means the fd is
-  // always judged against the root we INTENDED, and a root swapped before the
-  // open sends the open somewhere that no longer measures as inside it.
+  // Resolve the root BEFORE the open: a root resolved afterwards can be swapped to contain the opened fd.
   let root: string;
   try {
     root = fs.realpathSync(repoRoot);
@@ -123,44 +53,15 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
   }
   let fd: number;
   try {
-    // O_NONBLOCK, always: opening a FIFO for reading blocks until a writer
-    // appears, and that open happens before any check below can reject it — so
-    // a plugin repo carrying a `mkfifo` would hang the host's single event loop
-    // rather than return an error. On a regular file Linux ignores the flag.
-    // Same flag, same reason, as `readContainedFile` in
-    // `src/dashboard/api/attention-fs.ts`, which is where this pattern comes
-    // from.
+    // O_NONBLOCK: opening a FIFO for reading would otherwise block the host's event loop.
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   } catch {
     return null;
   }
   try {
-    // Containment is decided about the OPEN DESCRIPTOR, never about a path.
-    // `realpathSync(file)` answers a question about a string at one instant;
-    // between that answer and the read, any component — the leaf or a directory
-    // `subPluginDirs` walked through — can become a symlink, and the read then
-    // follows somewhere the check never saw. `/proc/self/fd/<fd>` is a
-    // kernel-maintained link to the inode this descriptor already holds, so it
-    // cannot be raced: the open happened first, and nothing about a path can
-    // change what an open descriptor refers to.
-    //
-    // This matters because what the host reads here is written into the group's
-    // `AGENTS.md`, which is mounted into the container — so a win moves
-    // host-only state (`~/.codex/auth.json`, `.env`) into container-visible
-    // state. That a plugin's code already runs in the container is a different
-    // permission.
-    //
-    // NOT `O_NOFOLLOW`: it refuses only the final component, so it would not
-    // close the walked-parent case this check does close, and it WOULD refuse a
-    // leaf that is legitimately a symlink to another file inside the same repo.
-    //
-    // FAILS CLOSED where the descriptor cannot be identified. `/proc` is absent
-    // on macOS, and falling back to `realpathSync(file)` there would reinstate
-    // exactly the pathname lookup this check exists to avoid. `attention-fs.ts`
-    // does take that fallback, because it serves a live dashboard where
-    // emitting nothing is a visible outage; here the cost is that a macOS
-    // developer checkout composes no plugin rulesets, which is a degraded
-    // convenience rather than a broken product. This host is Linux (CLAUDE.md).
+    // Containment is judged on the OPEN DESCRIPTOR via /proc/self/fd, which cannot be raced, never on a path.
+    // Not O_NOFOLLOW: it misses walked parent symlinks and refuses legitimate in-repo leaf symlinks.
+    // Fails closed without /proc (macOS composes no plugin rulesets).
     let opened: string;
     try {
       opened = fs.readlinkSync(`/proc/self/fd/${fd}`);
@@ -173,20 +74,11 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
       log.warn('Plugin ruleset resolves outside its plugin repository; not composing it', { file, repoRoot: root });
       return null;
     }
-    // Every remaining question is answered from this same descriptor, so a swap
-    // has nothing left to win — including the size bound, which a second
-    // `statSync` would let a growing file defeat.
+    // Answer everything from the same descriptor, including size, which a second statSync would let a growing
+    // file defeat.
     const st = fs.fstatSync(fd);
     if (!st.isFile()) return null;
-    // A HARD LINK defeats containment in either form, and measuring it is the
-    // only way to see that: `ln ~/.codex/auth.json <repo>/plugins/x/always-on.md`
-    // makes both `realpath` and the fd path answer with the in-repo name
-    // (verified on this host), because a hard link is not an indirection — the
-    // directory entry IS the file. So containment alone would compose the
-    // secret. `nlink` is the property that actually differs, and this repo
-    // already uses it for the same reason on the canonical-git sentinel
-    // (`docs/review-notes.md`). A plugin's standing ruleset having a
-    // second name is not a legitimate shape.
+    // A hard link to a secret passes both realpath and fd-path containment; nlink is what differs.
     if (st.nlink !== 1) {
       log.warn('Plugin ruleset has more than one hard link; not composing it', { file, nlink: st.nlink });
       return null;
@@ -215,35 +107,10 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
 }
 
 /**
- * A directory is a sub-plugin when it declares itself one, which is the signal
- * both container-side walkers use: Claude asks only that
- * `.claude-plugin/plugin.json` EXIST (`hasManifest`,
- * `container/agent-runner/src/providers/claude.ts`, applied to `<repo>/<sub>`
- * and `<repo>/plugins/<sub>` alike), while Codex additionally requires the
- * manifest to PARSE and carry a non-empty `name`, since that name is what it
- * registers (`readCodexPluginEntryName`,
- * `container/agent-runner/src/codex-companion-setup.ts`, reached from
- * `findCodexSubPlugins` for the same two layouts).
- *
- * Each manifest is held to its OWN walker's rule rather than to one rule for
- * both: a broken `.codex-plugin/plugin.json` is not a plugin to Codex, so it
- * must not be one here either.
- *
- * EITHER manifest, because this composer serves OpenCode — the provider with no
- * native plugin loader at all — and a directory either walker would load as a
- * plugin is one this must be able to speak for. A directory declaring neither is
- * not a plugin to anything in this system: a ruleset file under
- * `~/plugins/<repo>/docs/` would otherwise be injected into every OpenCode
- * group's standing prompt while no walker mounts, registers or excludes it, and
- * `excludePlugins` names plugins.
- *
- * NOT a claim that this walks the same DIRECTORIES the walkers do, only that it
- * asks the same question of one. Claude stops descending at a repo root that
- * carries a manifest and descends a level deeper than this does elsewhere; this
- * composer walks `<repo>/<sub>` and `<repo>/plugins/<sub>` unconditionally, and
- * that is load-bearing — `bootstrap` ships a root `.claude-plugin/`, so matching
- * Claude's stop-at-the-root rule would withhold `plugins/wwbd`'s directive from
- * every OpenCode group.
+ * Whether either container-side walker treats `dir` as a plugin: Claude needs `.claude-plugin/plugin.json` to
+ * exist; Codex needs `.codex-plugin/plugin.json` to parse with a non-empty `name`. Walks `<repo>/<sub>` and
+ * `<repo>/plugins/<sub>` unconditionally, unlike Claude's stop-at-a-manifest-root rule (bootstrap ships a root
+ * `.claude-plugin/`, so matching it would withhold its sub-plugins' directives from OpenCode).
  */
 function hasPluginManifest(dir: string): boolean {
   if (fs.existsSync(path.join(dir, '.claude-plugin', 'plugin.json'))) return true;
@@ -256,12 +123,7 @@ function hasPluginManifest(dir: string): boolean {
   }
 }
 
-/**
- * Every sub-plugin directory of one `~/plugins` entry, in both layouts the
- * container-side walkers descend: `<repo>/plugins/<sub>` and `<repo>/<sub>`.
- * Returned paths are relative to the plugins root, which is the spelling
- * `excludePlugins` uses.
- */
+/** Sub-plugin dirs in both layouts; `subPath` is relative to the plugins root, the spelling `excludePlugins` uses. */
 function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: string; dir: string }> {
   const out: Array<{ subPath: string; dir: string }> = [];
   const seen = new Set<string>();
@@ -303,22 +165,8 @@ export interface ComposeGroupClaudeMdOptions {
 }
 
 /**
- * Regenerate `groups/<folder>/CLAUDE.md` from the shared base, built-in
- * module fragments, and MCP server fragments declared in `container.json`.
- *
- * `provider` is the spawn-resolved effective provider (session override →
- * container config → 'claude', already lowercased by resolveProviderName).
- * It must come from the spawn path rather than being re-derived here — a
- * session-level provider override would otherwise make this gate disagree
- * with the worker-def sync gate in buildMounts.
- */
-/**
- * Directories a group's standing-instructions symlink may resolve into:
- * its own, plus every agent group sharing its workgroup. Siblings that build
- * together share one instruction file, and the workgroup is the data-pool
- * boundary — a group in another workgroup is a different tenant, so a link
- * there would pull that tenant's content into this always-on prompt. A group
- * with no workgroup gets its own directory only.
+ * Directories a group's standing-instructions symlink may resolve into: its own plus its workgroup siblings'.
+ * Another workgroup is a different tenant.
  */
 async function personaSymlinkRoots(group: AgentGroup, groupDir: string): Promise<string[]> {
   if (!group.workgroup_id) return [groupDir];
@@ -338,6 +186,7 @@ async function personaSymlinkRoots(group: AgentGroup, groupDir: string): Promise
   }
 }
 
+/** `provider` must be the spawn-resolved one (session override included), or this gate disagrees with buildMounts. */
 export async function composeGroupClaudeMd(
   group: AgentGroup,
   provider: string,
@@ -351,14 +200,8 @@ export async function composeGroupClaudeMd(
   removeStaleFragmentArtifacts(group.folder, groupDir);
   retireLegacyLocalFile(group.folder, groupDir);
 
-  // Host-side project root, derived from GROUPS_DIR (not process.cwd()) so
-  // every host source this function reads resolves the same way in tests,
-  // which mock GROUPS_DIR to a scratch dir without also changing cwd.
   const projectRoot = path.resolve(GROUPS_DIR, '..');
 
-  // Desired fragment set — name -> already-resolved content, ready to be
-  // pushed straight into the composed doc. Nothing here is written to disk;
-  // it exists only in memory for the duration of this call.
   const configRow = await getContainerConfig(group.id);
   const mcpServers: Record<string, McpServerConfig> = configRow
     ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
@@ -377,14 +220,8 @@ export async function composeGroupClaudeMd(
     desired.set('host-workgroup-wiki.md', options.workgroupWikiInstructions);
   }
 
-  // Built-in module fragments — every MCP/CLI module that ships a
-  // sibling `<name>.instructions.md`. These describe how the agent should
-  // use that module's tools (install_packages, ncl tasks, etc.). Scheduling
-  // guidance lives entirely in cli.instructions.md and is therefore excluded
-  // when cli_scope is disabled; there is no separate scheduling MCP fragment.
-  // Read (and flattened, in case a module fragment ever grows its own
-  // `@`-import) directly from its host path — these are trunk-controlled
-  // files, not agent-writable, so flattening is safe.
+  // Built-in module fragments (`<name>.instructions.md`). Scheduling guidance lives only in the cli fragment,
+  // so it drops out when cli_scope is disabled. Flattening is safe: these are host-controlled trunk files.
   const cliDisabled = configRow?.cli_scope === 'disabled';
   const mcpToolsHostDir = path.join(projectRoot, MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
@@ -393,46 +230,23 @@ export async function composeGroupClaudeMd(
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
-      // The task-list tool is registered only while its switch is on.
       if (moduleName === 'task-list' && !TASK_LIST_ENABLED) continue;
       desired.set(`module-${moduleName}.md`, flattenClaudeMd(path.join(mcpToolsHostDir, entry)));
     }
   }
 
-  // MCP server fragments — inline instructions from container.json for
-  // user-added external MCP servers.
   for (const [name, mcp] of Object.entries(mcpServers)) {
     if (mcp.instructions) {
       desired.set(`mcp-${name}.md`, mcp.instructions);
     }
   }
 
-  // Always-on agent-plugin rulesets. A plugin's standing directive reaches a
-  // container by ONE of two paths, never both:
-  //
-  //   1. The plugin's own SessionStart hook, from the mounted plugin. Claude
-  //      auto-loads it via CLAUDE_PLUGINS_ROOT; Codex fires plugin hooks too,
-  //      and a hook that injects context is how a Codex container gets the
-  //      directive natively. Neither provider is composed for below.
-  //   2. This composer, for OpenCode only — the one provider with no plugin
-  //      hook path at all. It reads the plugin's own generic
-  //      `always-on.md` (no NanoClaw-specific filename in the plugin repo).
-  //
-  // Separately, `~/plugins/<name>/.nanoclaw-always-on.md` is the operator's
-  // OVERRIDE for a third-party plugin that ships no clean ruleset — a
-  // NanoClaw-side convention authored by /enable-agent-plugins, read for every
-  // non-Claude provider as it always has been.
-  //
-  // Per-group opt-out reuses `excludePlugins` — the same field that drops the
-  // mount — so excluding a plugin, or one sub-plugin path of a monorepo,
-  // withholds its directive here too. A workgroup-scoped plugin's ruleset
-  // reaches only its workgroups, matching the mount (src/plugin-scopes.ts);
-  // with no spawn-resolved workgroup it reaches none. See docs/skills-model.md.
+  // Always-on plugin rulesets. Claude and Codex get a plugin's own directive through its SessionStart hook
+  // from the mount; this composes it for OpenCode only. `.nanoclaw-always-on.md` is the operator override,
+  // composed for every non-Claude provider. `excludePlugins` and workgroup plugin scopes withhold it here as
+  // they do the mount.
   if (provider !== 'claude') {
-    // The same split, and below the same predicate, the three container
-    // walkers ask (`container/agent-runner/src/plugin-exclusions.ts` is a
-    // verbatim copy of the module this imports), so a directive and a
-    // registration can never disagree about one entry.
+    // Same predicate as the container walkers (runner plugin-exclusions.ts is a verbatim copy).
     const excluded = splitExcludedPlugins(readContainerConfig(group.folder).excludePlugins);
     const pluginScopes = loadPluginScopes();
     const pluginsRoot = path.join(os.homedir(), 'plugins');
@@ -448,26 +262,10 @@ export async function composeGroupClaudeMd(
       const repoRoot = path.join(pluginsRoot, name);
       const override = readRulesetFile(repoRoot, NANOCLAW_ALWAYS_ON_MARKER, repoRoot);
       if (override) desired.set(`plugin-${name}.md`, override);
-      // A plugin's own always-on.md reaches OpenCode and nothing else. Claude
-      // auto-loads the plugin's SessionStart hook through CLAUDE_PLUGINS_ROOT,
-      // and Codex fires plugin hooks too — but ONLY for a plugin whose
-      // `.codex-plugin/plugin.json` declares them AND whose hook identity is
-      // TRUSTED. That trust is not automatic: codex reports an unenrolled plugin
-      // hook as `trustStatus: "untrusted"` and never dispatches it, which made
-      // this gate's premise FALSE until container-side hook trust was
-      // installed. It now is, so the premise holds. The
-      // ordering was the fix rather than the code — composing for Codex in the
-      // meantime would have delivered the text twice the day hook trust landed.
-      // Re-check this gate if hook trust is removed, or if a plugin's manifest
-      // stops declaring the hooks file it ships.
+      // Codex dispatches plugin hooks only once container-side hook trust is installed; composing for Codex too
+      // would deliver the directive twice. Re-check this gate if hook trust is removed.
       if (provider !== 'opencode') continue;
-      // The repo ROOT's own generic ruleset, for a single-plugin repo whose
-      // directive is not under a sub-plugin. Without this, such a repo would
-      // still need a NanoClaw-specific `.nanoclaw-always-on.md` to reach
-      // OpenCode — the exact property a plugin repo we maintain is supposed to
-      // avoid. Same containment read and same key as the override, so an
-      // operator override present alongside it wins: `desired.set` above ran
-      // first, and this does not overwrite.
+      // An operator override set above wins over the repo root's own ruleset.
       const rootFragment = `plugin-${name}.md`;
       if (!desired.has(rootFragment)) {
         const rootOwn = readRulesetFile(repoRoot, PLUGIN_ALWAYS_ON_FILE, repoRoot);
@@ -477,79 +275,23 @@ export async function composeGroupClaudeMd(
         if (isExcludedPluginPath(subPath, excluded)) continue;
         const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE, repoRoot);
         if (!content) continue;
-        // Keyed by the FULL sub-path, not its basename. A repo carrying the
-        // same name in both walked layouts (`repo/plugins/foo` and `repo/foo`
-        // — `subPluginDirs` returns both) shares a basename, so a
-        // basename-keyed fragment collided and one sub-plugin's ruleset was
-        // silently dropped. `subPath` is unique per sub-plugin by construction
-        // (`subPluginDirs` dedupes on it — the `seen` set at :93, added at
-        // :111), and it always carries a `/`, which a top-level
-        // `plugin-<name>.md` key never can: `name` is an entry of
-        // `fs.readdirSync(pluginsRoot)` (:273), i.e. one path component. The
-        // two key spaces are therefore disjoint and no collision is reachable.
-        //
-        // A `/` here is safe ONLY because these keys never become paths, so
-        // that is asserted against every consumer rather than assumed — a key
-        // that reached a path join would make this traversal, not a collision.
-        // `desired` is a function-local const (:204), never returned and never
-        // passed to a callee. Written at :209, :213, :232, :240, :280, this
-        // line, and :323; read at exactly two places — `pushFragment`'s
-        // `desired.get` (:364) and the `[...desired.keys()].sort()` that orders
-        // sections (:369). Both feed `sections`, joined into `body` (:372) and
-        // written to two FIXED paths, `<groupDir>/CLAUDE.md` (:373) and
-        // `<groupDir>/AGENTS.md` (:420). No key is ever a filename: the
-        // `.claude-fragments/` directory that once made them one is gone along
-        // with the mount that backed it,
-        // and `removeStaleFragmentArtifacts` only deletes that legacy
-        // directory — it never reads `desired`.
+        // Keyed by the full sub-path: `repo/plugins/foo` and `repo/foo` share a basename. Keys are never used
+        // as paths, so the `/` is safe.
         desired.set(`plugin-${subPath}.md`, content);
       }
     }
   }
 
-  // Template persona (if any) — inline; imported first (see the imports
-  // assembly) so it prepends the composed system prompt.
   const persona = readGroupPersona(groupDir, await personaSymlinkRoots(group, groupDir));
   if (persona) {
     desired.set(STANDING_INSTRUCTIONS_FRAGMENT, persona);
   }
 
-  // Shared base — read straight from its host path. Flattened in case it
-  // ever grows its own `@`-import; host-controlled, not agent-writable, so
-  // safe to flatten.
+  // Flattening is safe: host-controlled.
   const sharedBaseHostPath = path.join(projectRoot, 'container', 'CLAUDE.md');
 
-  // Composed entry — every section INLINED, in the same order the imports
-  // used to be listed: persona first (top of the system prompt), then the
-  // shared base, then the remaining fragments sorted.
-  //
-  // Inlined rather than `@`-imported because Claude Code silently DROPS an
-  // `@`-import whose resolved realpath falls outside the project directory.
-  // Inside the container the project directory is `/workspace/agent` (the
-  // group folder); this function used to write a `.claude-shared.md` symlink
-  // to `/app/CLAUDE.md` and a `.claude-fragments/module-*.md` symlink per
-  // module, both of which resolve outside it, so the shared base and every
-  // module fragment reached the model as nothing at all. Measured
-  // 2026-09-03 in the real agent image (claude-code 2.1.257) by capturing
-  // the outgoing Messages API request body: the inline fragment's sentinel
-  // was present, both symlinked ones were absent, and `--add-dir` on the
-  // target directory does not widen the boundary. Non-Claude providers were
-  // unaffected — they read the already flat AGENTS.md below. Now that every
-  // section is read from its host path and inlined directly, the symlinks
-  // (and the RO mounts that backed them) serve no purpose and are gone —
-  // see `removeStaleFragmentArtifacts` above and the mount removal in
-  // `container-runner.ts`.
-  //
-  // SECURITY: an inline fragment's body (mcp/plugin/persona) is emitted
-  // VERBATIM — never run through the flattener. Those bodies come from
-  // agent-writable sources (the group folder is mounted RW at
-  // `/workspace/agent`), and the flattener runs HOST-side with the host
-  // user's filesystem access, so expanding them here would let a container
-  // author `@~/.env`, have the host inline those bytes, and read them back
-  // through its own mount — a container-to-host exfiltration path around the
-  // rule that containers never receive raw credentials. Only the shared base
-  // and module fragments, whose sources are host-controlled trunk files, are
-  // flattened, and only at the point they're read above.
+  // SECURITY: mcp/plugin/persona bodies are emitted VERBATIM, never flattened: their sources are
+  // agent-writable, and flattening runs host-side, so an `@~/.env` would exfiltrate host bytes into the mount.
   const sections: string[] = [COMPOSED_HEADER];
   const pushFragment = (name: string): void => {
     const content = desired.get(name);
@@ -563,19 +305,12 @@ export async function composeGroupClaudeMd(
   const body = [...sections, ''].join('\n');
   writeAtomic(path.join(groupDir, 'CLAUDE.md'), body);
 
-  // Codex parity: also emit an AGENTS.md carrying the same flat body. Codex
-  // doesn't expand @-references in AGENTS.md, so a reference would reach the
-  // model as literal text — which is exactly why the body above is already
-  // flat. The two files are the same document: every per-group instruction
-  // reaches every provider through `standing-instructions.md`, composed above.
+  // Same flat body for Codex/OpenCode, which do not expand @-references.
   const fullAgents =
     '<!-- Generated by composeGroupClaudeMd from CLAUDE.md. Do not edit. All instruction sections inlined. -->\n\n' +
     body;
-  // Written UNCAPPED for every provider — content bloat is judged by a human
-  // reading the file, not by a byte number. Codex containers raise their own
-  // `project_doc_max_bytes` to CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES
-  // (codex-app-server.ts); warn loudly if we ever exceed that, since it means
-  // either the doc grew absurdly or the container override stopped applying.
+  // Uncapped. Codex containers raise `project_doc_max_bytes` to this value; exceeding it means the doc grew
+  // absurdly or the container override stopped applying.
   if (provider === 'codex') {
     warnIfOversized(`${group.folder}/AGENTS.md`, fullAgents, CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES);
   }
@@ -583,28 +318,9 @@ export async function composeGroupClaudeMd(
 }
 
 /**
- * Retire a group's legacy `CLAUDE.local.md`.
- *
- * It is a leftover of the v2 cutover, which renamed each group's hand-written
- * `CLAUDE.md` so the host could generate that name. It then held the same
- * thing as `standing-instructions.md` — a group's identity and standing rules
- * — in a second place that reached providers unevenly: Claude Code
- * auto-discovers it, Codex and OpenCode never did, so this composer used to
- * append it to `AGENTS.md` by hand. One persona file per group,
- * `standing-instructions.md`, now carries all of it.
- *
- * Earlier builds created the file empty on every init and every spawn, so an
- * empty or whitespace-only regular file is that placeholder and is removed.
- * Anything else — real content, or a symlink — is left exactly as it is and
- * warned about on every spawn. It is no longer composed, so for Codex and
- * OpenCode it is invisible, while Claude Code still loads it natively: the
- * one-provider-only reach this retirement exists to end. Moving its content
- * is an edit to an agent's identity, which is the operator's call, not this
- * function's. A symlink is never followed or read here.
- *
- * One window is accepted, not closed: the unlink is by name, so a write the
- * container lands between the read and the unlink is lost. Only the container
- * can race it, into a file it has no reason to write, for microseconds.
+ * Retire a group's legacy `CLAUDE.local.md`: remove an empty placeholder, warn about anything else (content or
+ * a symlink, never followed). Moving content is the operator's call. Accepted race: a container write between
+ * the read and the by-name unlink is lost.
  */
 const PLACEHOLDER_MAX_BYTES = 4096;
 
@@ -616,12 +332,8 @@ function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
       { group: groupFolder, kind },
     );
 
-  // ONE open, then every judgment on that descriptor. The folder is a live
-  // container's read-write /workspace/agent, so a lstat-then-read-then-rm by
-  // name can be raced: swap in a FIFO after the lstat and a blocking read hangs
-  // the host's main thread — every group, not one. O_NOFOLLOW refuses a symlink
-  // (ELOOP), O_NONBLOCK makes a FIFO open return instead of waiting for a
-  // writer, and fstat on the fd judges the object actually opened.
+  // ONE open, then every judgment on that descriptor: the folder is a live container's RW mount, so a FIFO
+  // swapped in would hang the host's main thread. O_NOFOLLOW refuses a symlink; O_NONBLOCK a FIFO wait.
   let fd: number;
   try {
     fd = fs.openSync(
@@ -645,10 +357,7 @@ function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
     const st = fs.fstatSync(fd);
     if (st.isFile()) {
       kind = 'file';
-      // A placeholder is 0 bytes (a trimmed one a few more); anything larger is
-      // content by definition. The read is BOUNDED as well as gated: the size
-      // is from fstat, and a container growing the file after it must not turn
-      // this into an unbounded read on the host's main thread.
+      // Bounded read: a container may grow the file after the fstat.
       if (st.size <= PLACEHOLDER_MAX_BYTES) {
         const buf = Buffer.alloc(PLACEHOLDER_MAX_BYTES + 1);
         const n = fs.readSync(fd, buf, 0, buf.length, 0);
@@ -665,8 +374,7 @@ function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
   try {
     fs.unlinkSync(localFile);
   } catch (err) {
-    // A container replaced it since the read (a directory, say). Nothing was
-    // lost and the spawn must not fail over a retired file; next spawn retries.
+    // A container replaced it since the read; the next spawn retries.
     log.warn('Could not remove empty legacy CLAUDE.local.md; left for next spawn', {
       group: groupFolder,
       error: err instanceof Error ? err.message : String(err),
@@ -674,21 +382,7 @@ function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
   }
 }
 
-/**
- * ONE-RELEASE CLEANUP — delete after the next deploy has reached every group.
- *
- * Before instruction sections were inlined, `composeGroupClaudeMd` wrote a
- * `.claude-shared.md` symlink (→ `/app/CLAUDE.md`) and a `.claude-fragments/`
- * directory of symlink/inline fragment files so the composed doc could
- * `@`-import them. Both are superseded: every section this function produces
- * is now read from its host path and written into the doc directly, and the
- * mounts that backed those container paths (`/app/CLAUDE.md`,
- * `/workspace/agent/.claude-fragments`) are gone from `container-runner.ts`.
- * Existing group dirs still carry the on-disk artifacts from before this
- * cutover; delete them on next compose so disk state converges without a
- * separate migration pass. Idempotent — a no-op once a group has been
- * cleaned. Logs once per group, only when something was actually removed.
- */
+/** ONE-RELEASE CLEANUP (delete once every group has respawned): pre-inlining `@`-import symlink artifacts. */
 function removeStaleFragmentArtifacts(groupFolder: string, groupDir: string): void {
   let removed = false;
 

@@ -12,13 +12,10 @@ export interface MessageInRow {
   kind: InboundMessage['kind'];
   timestamp: string;
   status: string;
-  /** When the row becomes runnable. Deferral paths rewrite this. */
   process_after: string | null;
   /**
-   * Which scheduled slot a task occurrence is FOR. Stamped at insert and moved
-   * only by a genuine reschedule, so it survives a retry backoff that pushes
-   * `process_after` forward. NULL on non-task rows and on task rows written
-   * before the column existed — readers fall back to `process_after`.
+   * The slot a task occurrence is FOR; retry backoff moves `process_after`, not this.
+   * NULL on non-task and legacy rows — readers fall back to `process_after`.
    */
   scheduled_for?: string | null;
   recurrence: string | null;
@@ -42,9 +39,7 @@ function messageRow(message: InboundMessage): MessageInRow {
     timestamp: message.timestamp,
     status: message.status,
     process_after: message.processAfter,
-    // Fork-only, so it is present only on records the fork's own selection
-    // built (the pending path). Records from upstream's ops carry none, and
-    // the formatter's documented fallback to `process_after` covers them.
+    // Only the fork's pending-path records carry this; upstream ops' records do not.
     scheduled_for: (message as Partial<NanoclawInboundMessage>).scheduledFor ?? null,
     recurrence: message.recurrence,
     series_id: message.seriesId,

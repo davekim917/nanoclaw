@@ -544,7 +544,7 @@ async function mutateTask(
         }, `ncl tasks ${action}`),
       )) ?? 0;
     if (n > 0) {
-      // No body before/after: these verbs change status only, matching the dashboard's audit rows.
+      // No body before/after: these verbs never touch the prompt, matching the dashboard's audit rows.
       await writeAudit({
         actor: actorFor(ctx),
         action,
