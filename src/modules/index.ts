@@ -27,85 +27,38 @@ import './slack-agent-flow/index.js';
 import './self-mod/index.js';
 import './remote-control/index.js';
 import './channel-auto-wire/index.js';
-// Bash-gate depends on approvals (registers an approval handler) and on
-// the delivery action registry being up — both satisfied by the order above.
+// Bash-gate depends on approvals and the delivery action registry, both loaded above.
 import './bash-gate/index.js';
-// Orchestrator dispatch — task dispatch pipeline + reconciler.
 import './orchestrator-dispatch/index.js';
-// Sweep family: orchestrator, dormant — T6 reconciler,
-// T14 auto-archive. Registers at import.
 import './sweep-orchestrator/index.js';
-// Backlog + ship-log delivery action handlers (add_ship_log, add/update/delete_backlog_item).
 import './backlog/index.js';
-// Channel-config registers delivery actions for set_channel_model /
-// set_channel_effort. Depends on permissions (for isAdminOfAgentGroup).
+// Channel-config depends on permissions (isAdminOfAgentGroup).
 import './channel-config/index.js';
-// Support-threads — dispatch_support_issue: route each support email thread to
-// its own Slack thread + per-issue session. Depends on the delivery action
-// registry being up (satisfied by import order).
 import './support-threads/index.js';
-// Scheduled-wake — schedule_wake delivery action: the container `wait` tool's
-// in-session delayed wake (process_after row in the caller's own session).
 import './scheduled-wake/index.js';
-// Provider fallback — provider_unavailable: a container reports its own
-// exhausted provider account; the host records the outage window and
-// respawns that session onto the group's declared fallback provider.
 import './provider-fallback/index.js';
-// Repository workspaces — durable clone publication, local canonical refresh,
-// and exact topic-to-topic linked-worktree transfer.
 import './repository-workspaces/index.js';
-// Sweep storage — declares startStorageMaintenanceOnce (called by host-sweep.ts's
-// tick) and the onHostShutdown that stops the persistent worker, in one module.
 import './sweep-storage/index.js';
 
 import './escalation/index.js';
 
-// Sweep duty families — each self-registers its duties
-// on the host-sweep.ts registry at import time, same pattern as above.
-// sweep-idle-reap: S12 idle-task-reap, S13 idle-chat-reap.
 import './sweep-idle-reap/index.js';
-// Sweep family: central housekeeping — github-app-token-refresh,
-// steer-idempotency-prune, channel-ingress-receipt-prune, session-title-sweep,
-// thread-title-retry, dashboard-token-prune (all tick:housekeeping).
 import './sweep-central/index.js';
-// Sweep-repo-fence: T5 approvals-reason-sweep,
-// T22 orphaned-repo-fence-release.
 import './sweep-repo-fence/index.js';
-// Sweep family: scheduled-move recovery — T11
-// scheduled-move-recovery, T12 audit-body-prune on tick:housekeeping.
 import './sweep-scheduled-move/index.js';
 import './wiki-admission/index.js';
-// Sweep container health — S11 provider self-heal, S14 running-container SLA,
-// S16 OOM / memory-pressure notice.
 import './sweep-container-health/index.js';
-// sweep-egress: T2 egress-network-reheal.
 import './sweep-egress/index.js';
-// sweep-claims: T20 claims-reconcile, T21 claims-self-heal.
 import './sweep-claims/index.js';
-// No second barrel line for sweep-storage: it is imported above for its
-// onHostShutdown half, and its T13 registration rides that same import.
-// Sweep family: usage-rollup (T19).
+// No second import for sweep-storage: its duty registration rides the import above.
 import './sweep-usage/index.js';
-// Sweep per-session core — S2 processing_ack sync, S3 stale-pending expiry,
-// S4 pre-wake orphan-claim reset, S17 orphan-claim retry.
 import './sweep-session-core/index.js';
 
-// Continuation and ceiling accountability — S6 done-proposal-mirror,
-// S7 continuation-read, S8 continuation-recovery-parking, S9a
-// continuation-wake-eligibility, S9b container-wake, S15 kill-ceiling-notice,
-// S10 ceiling-kill-accountability.
 import './sweep-continuation/index.js';
 import './sweep-promise-watch/index.js';
 
-// Sweep duty family: scheduling + thread-close — thread-close-advance,
-// due-wake-admission, recurrence-fanout, spent-task-session-gc.
 import './sweep-scheduling/index.js';
 
-// Sweep duty family: scheduled-task failure escalation (T24) — a series whose
-// agent turn keeps erroring reaches a human instead of dying silently.
 import './sweep-task-escalation/index.js';
 
-// Sweep duty family: remote-MCP OAuth token refresh (FORK4) — keeps the OneCLI
-// bearer secret behind an OAuth-protected MCP server fresh, so a dead access
-// token stops being something a human has to notice and re-paste.
 import './mcp-oauth/index.js';
