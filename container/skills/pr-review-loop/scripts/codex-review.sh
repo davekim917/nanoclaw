@@ -38,7 +38,7 @@
 #   20  request: not risk-scoped — automatic review handles this repo; never request
 #   21  request: scope verdict is skip — this head merges on green CI, no round
 #   22  request: a review of this head was already requested
-#   23  request: REVIEW_ROUND_CAP reached — stop, summarize, escalate or reframe
+#   23  request: REVIEW_ROUND_CAP reached — checkpoint: converge via substitute review, or rebuild
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
 #       neither a clean Codex review nor an approving substitute receipt, the
 #       approving receipt's reviewer is not a frontier model id, it is a
@@ -2639,8 +2639,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     if [ "$requested" -ge "$cap" ]; then
       {
         echo "CAP: $requested of $cap review rounds already requested on PR #$PR — do not request another."
-        echo "Stop the loop, summarize the open findings (codex-review.sh open), and escalate to the"
-        echo "operator, or restart in a fresh session with a reframed prompt."
+        echo "Checkpoint, not a stop: judge whether the rounds are converging or churning (SKILL.md,"
+        echo "'Round 3 is a checkpoint'). Converging: fix, then a fresh-context substitute review and receipt."
+        echo "Churning: rebuild the change. Do not escalate to the operator for the cap."
       } >&2
       exit 23
     fi
