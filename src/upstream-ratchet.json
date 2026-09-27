@@ -882,7 +882,7 @@
 "src/modules/permissions/sender-approval.ts":{"diff":226,"mode":"100644","sha256":"283cde3397ad4e318e1105c29b9e744849332c58d417e799ae6f603b78957ad7"},
 "src/modules/permissions/sender-decline-notify.test.ts":{"diff":722,"mode":"100644","sha256":"7f17278a76cb99571e150d403be4540a0e7ab4929e8c53a568735057cbbacc5b"},
 "src/modules/permissions/user-dm.test.ts":{"diff":78,"mode":"100644","sha256":"f998f3f895701ba3eed2d2dbd5311bd57657fe88e48accb30c5c920db82ba473"},
-"src/modules/permissions/user-dm.ts":{"diff":124,"mode":"100644","sha256":"2318169ef9a1a35e5e6cede9f057e482eb2e53d03b23b6fa324b1388903ff4b7"},
+"src/modules/permissions/user-dm.ts":{"diff":124,"mode":"100644","sha256":"6f025382549dda9888ea14ff4409f8e410b6b5f533c4c8034ce24afea9d86030"},
 "src/modules/scheduling/create.ts":{"diff":90,"mode":"100644","sha256":"fb0ee8dd906ac315691184e409926bb75dd17bd1f156c2696a42453cedeb0ac6"},
 "src/modules/scheduling/recurrence.test.ts":{"diff":213,"mode":"100644","sha256":"9b2a4ae8d7a6607cc1ad780e9278fd47d9b5d6543e526d3d3e6cec989e175f87"},
 "src/modules/scheduling/recurrence.ts":{"diff":157,"mode":"100644","sha256":"a8e9b407b85d40bf2c64d40bd08cbef6aaaf16a305b017ca8f823afec907f891"},

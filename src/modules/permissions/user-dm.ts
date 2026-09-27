@@ -53,7 +53,7 @@ import { getUserDm, upsertUserDm } from './db/user-dms.js';
  * `instance` stamps a created row (unset gives `instance = channel_type`,
  * undeliverable when every bot is a named instance) and rejects a cached row
  * from a different instance. `user_dms` is keyed (user_id, channel_type), so an
- * unaddressed caller gets whichever instance cached first.
+ * unaddressed caller gets whichever instance is currently cached.
  *
  * `privacySafeLogs` omits user, handle, messaging-group and raw platform-error
  * details from logs, for security-sensitive flows only.
