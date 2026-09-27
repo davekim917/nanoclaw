@@ -275,7 +275,7 @@ if [ -n "$rest" ]; then
       exit 1
       ;;
     */compare/*)
-      # compare--<base>...<head>.json is the comparison of exactly those two. Absent = the read fails.
+      # compare--<base>...<head>.json is the comparison of exactly those two, merge base <base> unless it names one. Absent = the read fails.
       basehead="\${rest#*/compare/}"
       basehead="\${basehead%%\\?*}"
       pinned="$MOCK_DIR/compare--$basehead.json"
@@ -284,7 +284,7 @@ if [ -n "$rest" ]; then
         echo 'gh: Not Found (HTTP 404)' >&2
         exit 1
       fi
-      cat "$pinned"
+      jq -c --arg base "\${basehead%%...*}" '.merge_base_commit //= { sha: $base }' "$pinned"
       exit 0
       ;;
     */pulls/*/files\\?*)
@@ -692,17 +692,28 @@ function scopeFixture(
   writePage(root, 'rollup', 1, rollupPage(opts.rollup === undefined ? [] : opts.rollup));
 }
 
+const COMMENT_RULE_HEAD = '5555555555555555555555555555555555555555';
+
 // Runs the helper with any arguments. Each run starts a fresh call log and
 // posted-comment slot, so assertions describe that run alone. `node` is a stub
-// for the churn classifier (exit MOCK_GATE_STATUS).
+// for the churn classifier and the comment-rule checker (MOCK_*_STATUS).
 function runHelper(root: string, args: string[], env: Record<string, string> = {}, script = HELPER) {
   const { bin, calls, sleepLog } = writeMocks(root);
   const posted = path.join(root, 'posted');
   for (const file of [calls, sleepLog, posted, path.join(root, 'merged'), path.join(root, 'swapped')])
     fs.rmSync(file, { force: true });
+  const plugins = path.join(root, 'plugins');
+  const checker = path.join(plugins, 'bootstrap/plugins/comment-rule/bin/comment-rule.mjs');
+  fs.mkdirSync(path.dirname(checker), { recursive: true });
+  fs.writeFileSync(checker, '');
   fs.writeFileSync(
     path.join(bin, 'node'),
     `#!/usr/bin/env bash
+if [[ "$1" == */comment-rule.mjs ]]; then
+  printf 'comment-rule %s\\n' "\${*:2}" >> "$MOCK_CALLS"
+  printf '%s\\n' "\${MOCK_COMMENT_RULE_REPORT:-comment-rule: PASS}"
+  exit "\${MOCK_COMMENT_RULE_STATUS:-0}"
+fi
 cat >/dev/null
 printf 'node %s\\n' "$*" >> "$MOCK_CALLS"
 echo '{"status":"pass"}'
@@ -714,6 +725,16 @@ exit "\${MOCK_GATE_STATUS:-0}"
     path.join(bin, 'git'),
     `#!/usr/bin/env bash
 if [ "$*" = "rev-parse --show-toplevel" ]; then pwd; exit 0; fi
+[ "$1" = -C ] && shift 2
+while [ "$1" = -c ]; do shift 2; done
+case "$1" in
+  init|remote|config|diff) exit 0 ;;
+  fetch)
+    printf 'git %s\\n' "$*" >> "$MOCK_CALLS"
+    [ "\${MOCK_GIT_FETCH_STATUS:-0}" = 0 ] || { echo 'fatal: could not read Username' >&2; exit "$MOCK_GIT_FETCH_STATUS"; }
+    exit 0 ;;
+  commit-tree) printf 'git %s\\n' "$*" >> "$MOCK_CALLS"; echo ${COMMENT_RULE_HEAD}; exit 0 ;;
+esac
 echo "unexpected git $*" >&2
 exit 64
 `,
@@ -737,6 +758,7 @@ exit 64
       REVIEW_ROUND_CAP: '',
       CODEX_REVIEW_REQUIRED_WORKFLOWS: '',
       CODEX_REVIEW_HOST_CI_POSTERS: 'fleet-bot',
+      CLAUDE_PLUGINS_ROOT: plugins,
       ...env,
     },
   });
@@ -2593,6 +2615,112 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
   });
 
+  describe('the comment rule, on unless the base branch opts out', () => {
+    const MERGE_BASE = '6666666666666666666666666666666666666666';
+    const FAIL_REPORT = 'comment-rule: FAIL — net +2 comment lines (3 → 5 in the changed files)';
+
+    function commentRuleFixture(root: string, opts: { legacy?: boolean; reviewLoop?: string } = {}): void {
+      scopeFixture(root, {
+        labels: [],
+        body: 'Summary.\n\nReplaces: nothing',
+        reviewLoop: opts.reviewLoop,
+        ...(opts.legacy ? { baseConfig: null } : {}),
+      });
+      writeJson(root, `compare--${BASE_OID}...${HEAD}.json`, {
+        status: 'ahead',
+        merge_base_commit: { sha: MERGE_BASE },
+        files: [changedFile('docs/notes.md')],
+      });
+    }
+
+    it.each([
+      ['risk-scoped', false],
+      ['legacy', true],
+    ])('refuses a %s head whose change grows comments, with the checker report', (_mode, legacy) => {
+      const root = tempRoot();
+      commentRuleFixture(root, { legacy });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], {
+        MOCK_COMMENT_RULE_STATUS: '1',
+        MOCK_COMMENT_RULE_REPORT: FAIL_REPORT,
+      });
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(FAIL_REPORT);
+      expect(result.stderr).toContain(`merge=refused head=${HEAD}: comment_rule:`);
+      expect(result.stdout).not.toMatch(/merge=(allowed|defer)/);
+      expect(result.calls).toContain(`git fetch -q --no-tags --depth=1 --filter=blob:none origin ${MERGE_BASE} ${HEAD}\n`);
+      expect(result.calls).toContain(`git commit-tree ${HEAD}^{tree} -p ${MERGE_BASE} -m ${HEAD}\n`);
+      expect(result.calls).toMatch(
+        new RegExp(`comment-rule check --repo \\S+ --base ${MERGE_BASE} --head ${COMMENT_RULE_HEAD}\\n`),
+      );
+    });
+
+    it.each([
+      ['risk-scoped', false, 0],
+      ['legacy', true, 26],
+    ])('lets a comment-neutral %s head through to the rest of the gate', (_mode, legacy, status) => {
+      const root = tempRoot();
+      commentRuleFixture(root, { legacy });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(status);
+      expect(result.stdout).toMatch(legacy ? /merge=defer mode=legacy/ : /merge=allowed head=\S+ mode=risk-scoped/);
+      expect(result.calls).toContain('comment-rule check');
+    });
+
+    it('skips the checker where the base sets "commentRule": false', () => {
+      const root = tempRoot();
+      commentRuleFixture(root, { reviewLoop: '{ "requireReplacesLine": true, "commentRule": false }\n' });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], { MOCK_COMMENT_RULE_STATUS: '1' });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('comment rule off');
+      expect(result.calls).not.toContain('comment-rule check');
+      expect(result.calls).not.toContain('git fetch');
+    });
+
+    it('reads the opt-out at the base commit alone, so a PR cannot opt itself out', () => {
+      const root = tempRoot();
+      commentRuleFixture(root);
+      for (const ref of ['main', 'feat', STALE_BASE])
+        fs.writeFileSync(path.join(root, `review-loop--${ref}.json`), '{ "commentRule": false }\n');
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], { MOCK_COMMENT_RULE_STATUS: '1' });
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('comment_rule:');
+    });
+
+    it.each([
+      ['the checker is not installed', { CLAUDE_PLUGINS_ROOT: '/nonexistent', HOME: '/nonexistent' }, 'is not installed'],
+      ['the checker cannot judge the change', { MOCK_COMMENT_RULE_STATUS: '2' }, 'gave no verdict (exit 2)'],
+      ['the checker crashes', { MOCK_COMMENT_RULE_STATUS: '139' }, 'gave no verdict (exit 139)'],
+      ['the fetch fails', { MOCK_GIT_FETCH_STATUS: '128' }, 'could not fetch'],
+    ])('fails closed when %s', (_case, env, message) => {
+      const root = tempRoot();
+      commentRuleFixture(root);
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], env);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(message);
+      expect(result.stderr).toContain('merge=error');
+      expect(result.stdout).not.toContain('merge=allowed');
+    });
+
+    it.each([
+      ['sets commentRule to a string', '{ "commentRule": "no" }\n'],
+      ['is empty', ''],
+    ])('gives no verdict when the base config %s', (_case, content) => {
+      const root = tempRoot();
+      commentRuleFixture(root, { legacy: true });
+      fs.writeFileSync(path.join(root, `review-loop--${BASE_OID}.json`), content);
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('as an object with a boolean commentRule');
+      expect(result.stdout).not.toContain('merge=defer');
+    });
+  });
+
   describe('the Replaces line, required only where the base branch opts in', () => {
     const REFUSED = `merge=refused head=${HEAD}: the PR body has no 'Replaces:' line, which .github/pr-review-loop.json on main requires.`;
 
@@ -2665,14 +2793,14 @@ describe('codex-review risk-scoped review requests', () => {
       );
     });
 
-    it('never reads the opt-in in a legacy repo, whose merge-check still defers', () => {
+    it('never applies the opt-in in a legacy repo, whose merge-check still defers', () => {
       const root = tempRoot();
       scopeFixture(root, { baseConfig: null, labels: [], body: 'Summary.', reviewLoop: REPLACES_OPT_IN });
 
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(26);
       expect(result.stdout).toContain('merge=defer mode=legacy');
-      expect(result.calls).not.toContain('pr-review-loop.json');
+      expect(result.stderr).not.toContain("'Replaces:' line");
     });
 
     it('reads the opt-in at the base commit alone, so a PR cannot opt itself out', () => {
@@ -5628,6 +5756,7 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
       files: null,
       body: 'Review-notes: none (covered by the line #700 added)',
       comments: [CHANGES_EARLIER, APPROVED],
+      reviewLoop: '{ "commentRule": false }\n',
     });
     const allowed = runHelper(said, ['merge-check', '--head', HEAD]);
     expect(allowed.status).toBe(0);
