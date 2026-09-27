@@ -1,10 +1,4 @@
-/**
- * Central DB — read-only from the container. Mounted at /workspace/central.db.
- *
- * Not mailbox state: this is the host's central database, not one of the two
- * session DBs, so it deliberately lives outside modules/mailbox/ (which owns
- * every fork customization of inbound.db/outbound.db and nothing else).
- */
+/** The host's central DB, read-only in the container; not session state, so it stays outside modules/mailbox/. */
 import { Database } from 'bun:sqlite';
 
 let _central: Database | null = null;

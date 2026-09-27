@@ -1,18 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Granola MCP server (stdio). Thin wrapper around the Granola REST API.
- *
- * Replaces the hosted MCP at mcp.granola.ai/mcp — that one uses OAuth session
- * tokens which silently expire (~hours/days). This server uses the static
- * `grn_*` API key vended by Granola's REST API, auto-injected at request time
- * by the OneCLI gateway based on the `public-api.granola.ai` host pattern. No token
- * rotation, no refresh worker, no in-container secret handling.
- *
- * Runs as a standalone process (not folded into the `nanoclaw` MCP) so tools
- * expose to the agent as `mcp__granola__*` — matching the legacy namespace
- * the hosted MCP used, so existing agent CLAUDE.md references keep working.
- *
- * Docs: https://docs.granola.ai/introduction.md
+ * Granola MCP server (stdio) over the REST API, using the static `grn_*` key the OneCLI gateway injects. Runs
+ * standalone so its tools keep the legacy `mcp__granola__*` namespace.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -27,12 +16,7 @@ function log(msg: string): void {
 
 async function granolaGet(path: string): Promise<unknown> {
   const url = `${BASE}${path}`;
-  // OneCLI's HTTPS proxy intercepts requests to public-api.granola.ai and injects
-  // `Authorization: Bearer grn_...` from the vault. If HTTPS_PROXY isn't set
-  // (container spawned with OneCLI skipped/failed), the request goes out
-  // unauthenticated — Granola returns 401/403. Surface that hint in the error
-  // so the agent doesn't blame "expired token" when the real issue is proxy
-  // wiring.
+  // Without HTTPS_PROXY the request goes out unauthenticated (401/403); say so, so the agent doesn't blame an expired token.
   const res = await fetch(url);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -128,9 +112,7 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // Warn on boot if HTTPS_PROXY is absent — calls will fail with 401, and
-  // without this log operators have no cue that proxy wiring is the root
-  // cause. Don't exit: valid test/dev setups can wire the key directly.
+  // Don't exit: test/dev setups may wire the key directly.
   if (!process.env.HTTPS_PROXY) {
     log('WARN: HTTPS_PROXY not set — Granola calls will go out unauthenticated and fail with 401');
   }

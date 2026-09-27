@@ -66,9 +66,7 @@ const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  // Cross-model reviews run through this service (one ring slot per review,
-  // rotation, output redaction, byte caps). Start it before any provider
-  // snapshots process.env; it reads the current runner env per request.
+  // Start before any provider snapshots process.env; the service reads the current runner env per request.
   let reviewService: Awaited<ReturnType<typeof startClaudeReviewService>> | undefined;
   delete process.env[CLAUDE_REVIEW_SOCKET_ENV];
   try {
@@ -98,12 +96,8 @@ async function main(): Promise<void> {
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
-  // GCP service-account: when the host mounted a key (GOOGLE_APPLICATION_CREDENTIALS),
-  // activate it so the `gcloud`/`bq` CLIs authenticate. No-op otherwise. All providers.
   activateGcpServiceAccount(log);
 
-  // All providers share one canonical file-memory tree. Recall reads these
-  // source files; no second derived retrieval store is introduced.
   ensureMemoryScaffold();
 
   // Runtime-generated system-prompt addendum: agent identity + communication
@@ -120,17 +114,8 @@ async function main(): Promise<void> {
     taskId ? { kind: 'task', taskId } : { kind: 'chat' },
   );
 
-  // Always-on voice injection. Host resolves per-channel tone (via
-  // messaging_group_agents.default_tone → container.json `tone`) and forwards
-  // the name in NANOCLAW_DEFAULT_TONE. The name resolves group-local first
-  // (groups/<folder>/tone-profiles/) then shared — see ../tone-profiles.ts —
-  // so a group-owned persona and a fleet-wide tone are the same mechanism and
-  // occupy the same single slot. THIS IS THE ONLY ALWAYS-ON VOICE LAYER: never
-  // add a second one (a persona section in a group's instructions file, say),
-  // because a per-group layer cannot vary by channel and ends up arguing with
-  // this one in rooms where a different voice was selected. Operating rules
-  // are a SEPARATE layer (channel instructions, just below) — that one is not
-  // a second voice slot and does not compete with this invariant.
+  // THE ONLY ALWAYS-ON VOICE LAYER: never add a second one (e.g. a persona in a group's instructions);
+  // it cannot vary by channel and fights this one. Channel instructions are a separate layer, not a voice slot.
   let toneBlock: string | undefined;
   const toneName = process.env.NANOCLAW_DEFAULT_TONE;
   if (toneName) {
@@ -145,26 +130,14 @@ async function main(): Promise<void> {
     }
   }
 
-  // Capability-awareness note — short and always-on. Points the agent at
-  // the `get_capabilities` MCP tool instead of statically listing every
-  // CLI/auth detail (v1 pattern drifted from reality).
   const capabilityNote = [
     '## Capability Awareness',
     '',
     'Before saying a service is unavailable, verify it with `mcp__nanoclaw__get_capabilities` using `section: "session"`. Absence of a dedicated MCP tool is not proof of no access; follow the live snapshot\'s activation instructions.',
   ].join('\n');
 
-  // Always-on per-channel operating rules. Host resolves
-  // messaging_group_agents.instructions_profile for this wiring and forwards
-  // the name in NANOCLAW_INSTRUCTIONS_PROFILE; the file is mounted read-only
-  // at /workspace/channel-instructions (see ./channel-instructions.ts).
-  //
-  // Ordered FIRST in baseInstructions, ahead of the tone block: these are the
-  // rules of the room (what the agent may touch, whether it may ask), and a
-  // rule the agent reads after being told how to sound is a rule it has
-  // already had a chance to break. A missing or unreadable file is a warning,
-  // never a session failure — a wiring pointing at a profile that was renamed
-  // must still answer, in the group's default posture.
+  // Ordered before the tone block: the room's rules must be read before the voice. A missing or unreadable
+  // profile is a warning, never a session failure.
   let channelInstructionsBlock: string | undefined;
   const instructionsProfile = process.env.NANOCLAW_INSTRUCTIONS_PROFILE;
   if (instructionsProfile) {
@@ -206,21 +179,11 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // The Codex CLI scrubs stdio MCP server children down to a small
-  // proxy/CA allowlist — NANOCLAW_* spawn context never reaches the
-  // nanoclaw tool process through inheritance, which made every managed
-  // repository tool fail with "repository workgroup context is
-  // unavailable" in codex groups. Forward the runner's own NANOCLAW_*
-  // vars through the per-server env table (rendered into codex's
-  // [mcp_servers.nanoclaw.env] and opencode's environment map); providers
-  // that inherit full env merge the same values harmlessly. Unset or
-  // empty vars are omitted so "absent" semantics stay intact.
+  // Codex scrubs stdio MCP children's env down to a proxy/CA allowlist, so NANOCLAW_* must be forwarded
+  // explicitly through the per-server env table. Unset or empty vars are omitted.
   const nanoclawEnv = builtInNanoclawMcpEnv();
 
   // Build MCP servers config: nanoclaw built-in + any from container.json
-  // or host-injected NANOCLAW_MCP_SERVERS. Host may inject stdio or http
-  // servers — http servers rely on the container's HTTPS_PROXY pointing at
-  // the OneCLI gateway for auth.
   const mcpServers: Record<string, McpServerConfig> = {
     nanoclaw: {
       type: 'stdio',
@@ -230,7 +193,6 @@ async function main(): Promise<void> {
     },
   };
 
-  // Static per-group config from container.json.
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
     // Plugin-shipped servers get ${PLUGIN_ROOT}/${PLUGIN_DATA} expansion and
     // the two injected env vars; everything else passes through untouched.
@@ -238,8 +200,6 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${mcpServerSummary(name, serverConfig)})`);
   }
 
-  // Dynamic host-injected servers via env — lets the host wire universal
-  // MCPs (DeepWiki, Context7, Exa, etc.) without rewriting every container.json.
   if (process.env.NANOCLAW_MCP_SERVERS) {
     try {
       const additional = JSON.parse(process.env.NANOCLAW_MCP_SERVERS) as Record<string, McpServerConfig>;
@@ -255,36 +215,19 @@ async function main(): Promise<void> {
   dropRetiredMcpServers(mcpServers, log);
   const instructions = baseInstructions;
 
-  // Skills parity: populate `/home/node/.agents/skills/` unconditionally so
-  // BOTH codex-primary (helper-codex) AND codex-as-peer (helper running the
-  // codex companion) see the same plugin skills (humanizer, impeccable,
-  // etc.). Pass runtime so runtime-specific denylists apply
-  // correctly — e.g., opencode runtime surfaces workflow-agents skills as
-  // text (since there's no codex-plugin loader on opencode), while codex
-  // runtime continues to deny them (loaded via .codex-plugin/ instead).
+  // Unconditional so codex-primary and codex-as-peer see the same plugin skills; the runtime picks the denylist.
   const skillRuntime: 'codex' | 'opencode' | 'claude' =
     providerName === 'codex' ? 'codex' : providerName === 'opencode' ? 'opencode' : 'claude';
   syncAgentSkillsMirror(skillRuntime);
 
-  // Container-local CODEX_HOME for codex-as-peer mode (invoked by Claude
-  // via the codex-companion script). Builds ~/.codex-runtime/ with auth.json
-  // symlink + merged config.toml so the peer sees the same MCP servers
-  // Claude does — most importantly the in-container `nanoclaw` server.
-  // Codex-primary owns a persistent session-local ~/.codex and registers
-  // plugins there. Peer-mode Codex uses the synthesized ~/.codex-runtime.
+  // Codex-primary uses a persistent session-local ~/.codex; peer-mode Codex (codex-companion) uses the
+  // synthesized ~/.codex-runtime.
   if (providerName === 'codex') {
     setupCodexPrimaryRuntime();
   } else {
-    // Pass the host runtime so the registration log names it accurately. Only the
-    // label varies — which plugins get registered is always codex's own set,
-    // since this CODEX_HOME is what the peer `codex` process reads.
-    // `null` means only one thing: no codex auth is mounted, so peer-mode codex
-    // cannot run at all and CODEX_HOME is left unset. Any OTHER failure returns
-    // the nonexistent FAILED_CODEX_HOME sentinel rather than null — a truthy
-    // value we deliberately still assign, because an unset CODEX_HOME would run
-    // codex unguarded against the staged ~/.codex. So a non-null result
-    // means "CODEX_HOME is authoritative", NOT "peer codex is usable": on the
-    // sentinel, codex refuses to start (see failClosed in codex-companion-setup).
+    // null means no codex auth is mounted, so CODEX_HOME stays unset. Any other failure returns the nonexistent
+    // FAILED_CODEX_HOME sentinel, which must still be assigned: an unset CODEX_HOME would run codex unguarded
+    // against the staged ~/.codex.
     const codexHome = setupCodexRuntime(mcpServers, providerName === 'opencode' ? 'opencode' : 'claude');
     if (codexHome) {
       process.env.CODEX_HOME = codexHome;
@@ -301,10 +244,7 @@ async function main(): Promise<void> {
     effort: config.effort,
   });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-  // Session DB is open: mailbox.start above calls getOutboundDb while
-  // applying the schema, so the provider
-  // may now read the credential slot a previous container of this session
-  // rotated onto.
+  // Must run after mailbox.start has opened the session DB.
   provider.restorePersistedCredentialSlot?.();
 
   const stopResourceTelemetry = startResourceTelemetry(log);

@@ -7,49 +7,16 @@ const INDEX_PATH = '/workspace/workgroup/memory/index.md';
 const MAX_CAPABILITY_SERVICES = 32;
 const MAX_CAPABILITY_STRING_CHARS = 600;
 /**
- * Must cover the LARGEST roster the host itself would emit, or this fallback
- * drops services the host kept and capabilities vanish specifically after a
- * cold-context recovery — the one path the agent cannot see happening.
- *
- * The host bounds `JSON.stringify(services)` at `PRE_TURN_BOUNDS
- * .capabilityTotalChars` = 10,000 (src/modules/memory/pre-turn-context.ts,
- * `boundedCapabilities`); this bound is measured over the whole snapshot
- * object, which adds `agentGroupId` and the ~740-char `howToUse`. 11,000
- * clears that with margin (10,000 + 740 + ~45). At 5,000 — the pre-roster
- * value, sized when the block carried five or six full manuals — a
- * host-accepted shape lost entries here alone.
- *
- * This leaves less room under `NORMAL_RECALL_CHARS`, and at the extreme this
- * bound plus a full `MAX_INDEX_BYTES` index exceeds it on its own. The
- * bootstrap's own size is brought back in `ensureFreshContextBootstrap`, which
- * sheds the index and then capability entries before it looks at evidence. A
- * bootstrap that fits the ceiling but leaves no room for evidence is NOT
- * brought back, and that is the host's policy rather than an oversight —
- * `enforceFinalBound` sheds every conversation and memory excerpt before it
- * touches a capability entry. It only bites on pathological input; real
- * rosters measure ~3.9k.
+ * Must cover the LARGEST roster the host would emit, or capabilities vanish only after a cold-context
+ * recovery. The host bounds `JSON.stringify(services)` at 10,000; this bound covers the whole snapshot object,
+ * which adds `agentGroupId` and the ~740-char `howToUse`.
  */
 const MAX_CAPABILITY_JSON_CHARS = 11_000;
 /** Roster hint cap. Mirrors PRE_TURN_BOUNDS.capabilityRosterUseChars on the host. */
 const MAX_CAPABILITY_USE_CHARS = 200;
-/**
- * The standing instruction gets its OWN bound, well clear of the 822 chars the
- * host writes today (`CAPABILITY_ROSTER_PREAMBLE`, src/capabilities.ts).
- *
- * At the 600-char default this string was clipped mid-list, around
- * `snow login[truncated:…]`, which dropped the "never set your own
- * Authorization header" rule and the "report it instead of re-authenticating"
- * fallback — the exact prohibitions the preamble exists to keep always-on, and
- * only on the cold-context path, where nobody would see it go.
- */
+/** Must stay well clear of the host's ~822-char preamble: clipping it drops its always-on prohibitions. */
 const MAX_HOW_TO_USE_CHARS = 2_000;
-/**
- * Used only when the mounted snapshot predates the roster and so carries no
- * `session.howToUse`. The host writes that field
- * (`CAPABILITY_ROSTER_PREAMBLE`, src/capabilities.ts), so the live text has
- * one source; this is the older-host fallback, not a second copy to keep in
- * sync.
- */
+/** Older-host fallback only (snapshot without `session.howToUse`); the host is the live text's one source. */
 const FALLBACK_HOW_TO_USE =
   'EVERY service listed here is wired into THIS session right now — never tell the user you lack one of them, and never ask for its credentials. ' +
   'These are one-line reminders, not instructions: before you first use a service in a session, call `get_capabilities` with `{"service":"<name>"}` for its full usage notes (auth, exact tool names, known failure shapes). ' +
@@ -71,13 +38,7 @@ function boundedString(value: unknown, limit = MAX_CAPABILITY_STRING_CHARS): str
   return `${value.slice(0, limit - TRUNCATED.length)}${TRUNCATED}`;
 }
 
-/**
- * The roster hint for one entry, from the same snapshot the host reduces:
- * the hand-written/derived `summary` when the host wrote one, else the leading
- * clause of the how-to prose so an older snapshot still renders a line rather
- * than a bare name. Word-boundary cut, same intent as
- * `summarizeCapabilityText` (src/capabilities.ts).
- */
+/** The host's `summary`, else the leading clause of the how-to prose, cut at a word boundary. */
 function rosterUse(service: Record<string, unknown>): string | undefined {
   const summary = boundedString(service.summary, MAX_CAPABILITY_USE_CHARS);
   if (summary !== undefined) return summary;
@@ -90,13 +51,7 @@ function rosterUse(service: Record<string, unknown>): string | undefined {
   return `${(lastSpace > 24 ? cut.slice(0, lastSpace) : cut).replace(/[,;:.\s]+$/, '')}…`;
 }
 
-/**
- * Evict one capability entry: the last one not marked `retainUnderBudget`,
- * or the last outright once only retained ones remain. The host's
- * `evictCapability` (src/modules/memory/pre-turn-context.ts) applies the same
- * rule to the host-built bootstrap; this fallback must not drop an entry the
- * host would have kept.
- */
+/** Same rule as the host's `evictCapability`: this fallback must not drop an entry the host would have kept. */
 function evictCapability(services: unknown[]): void {
   for (let index = services.length - 1; index >= 0; index--) {
     const service = services[index];
@@ -125,14 +80,9 @@ function readCapabilitiesFrom(filePath: string): {
     if (!session || !Array.isArray(session.services)) throw new Error('session capability snapshot is missing');
     const selectedRaw = [...(session.services as unknown[])];
     while (selectedRaw.length > MAX_CAPABILITY_SERVICES) evictCapability(selectedRaw);
-    // Same reduction the host applies (`buildCapabilityRoster`,
-    // src/capabilities.ts): a roster line per service, not the mini-manual.
-    // The prose stays in the mounted snapshot, whole, and the agent fetches
-    // one service's worth of it with `get_capabilities({ service })`.
+    // Same reduction as the host's `buildCapabilityRoster`: one roster line per service, not the manual.
     const services = selectedRaw
-      // Skip a malformed entry rather than mapping it to `{}`, which rendered
-      // as a nameless, handle-less roster line — an agent reading the block has
-      // no way to tell that from a service it holds and cannot name.
+      // Skip malformed entries: `{}` would render as a nameless roster line.
       .filter((raw): raw is Record<string, unknown> => !!raw && typeof raw === 'object' && !Array.isArray(raw))
       .map((service) => {
         const via = boundedString(service.mcpNamespace) ?? boundedString(service.cli) ?? '';
@@ -182,12 +132,7 @@ function readIndexFrom(filePath: string): { text?: string; degraded?: string } {
   }
 }
 
-/**
- * Runner-side fallback for a context reset the host could not predict (for
- * example cold-continuation rotation or an in-turn stale-session retry).
- * Normal turns get the host-built bootstrap row; this path only fills a
- * missing bootstrap and reads no source beyond the two host-mounted surfaces.
- */
+/** Fallback for a context reset the host could not predict; normal turns get the host-built bootstrap row. */
 export function ensureFreshContextBootstrap(
   prompt: string,
   paths: { capabilities?: string; index?: string } = {},
@@ -256,27 +201,9 @@ export function ensureFreshContextBootstrap(
   let bootstrap = render();
   const limit = prompt.includes('"rank":"exact-link"') ? EXACT_LINK_RECALL_CHARS : NORMAL_RECALL_CHARS;
 
-  // Shed the bootstrap's OWN size first, before touching evidence.
-  // `MAX_CAPABILITY_JSON_CHARS` plus a full `MAX_INDEX_BYTES` index exceeds
-  // `NORMAL_RECALL_CHARS` on its own, and these two loops are the only thing
-  // that can bring that back: no amount of evidence shedding helps when the
-  // bootstrap alone is over. Running them first also means the evidence loop
-  // below sizes itself against the FINAL bootstrap rather than one that is
-  // about to shrink under it.
-  //
-  // Within the bootstrap, the order is the host's (`enforceFinalBound`,
-  // src/modules/memory/pre-turn-context.ts): memory core first, capability
-  // entries last, so the roster is the final thing to go. Both loops
-  // terminate — the index halves to nothing, and `evictCapability` always
-  // removes an entry.
-  //
-  // What this does NOT do is stop a bootstrap that fits the ceiling on its own
-  // from leaving no room for evidence. That is the host's policy, not an
-  // oversight: `enforceFinalBound` sheds every conversation and memory excerpt
-  // before it touches a capability entry. It is reachable only with
-  // operator-set multi-hundred-character `displayName`s; real rosters measure
-  // ~3.9k of the 12,000, which is more room for evidence than the pre-roster
-  // block left.
+  // Shed the bootstrap's own size before evidence: the capability bound plus a full index can exceed
+  // NORMAL_RECALL_CHARS alone. Order matches the host's `enforceFinalBound` (memory core first, capability
+  // entries last). Both loops terminate.
   let shedIndex = false;
   while (bootstrap.length > limit && indexText !== undefined) {
     indexText =
@@ -307,8 +234,6 @@ export function ensureFreshContextBootstrap(
     bootstrap = render();
   }
 
-  // Now the evidence blocks already in the prompt, measured against the
-  // bootstrap the caller will actually receive.
   const evidencePattern =
     /\[Untrusted recalled evidence[^\n]*\]\n[\s\S]*?<untrusted_recall_json>[\s\S]*?<\/untrusted_recall_json>/g;
   let boundedPrompt = prompt;
@@ -321,9 +246,6 @@ export function ensureFreshContextBootstrap(
     recalledChars = bootstrap.length + evidenceBlocks.reduce((sum, match) => sum + match[0].length, 0);
   }
 
-  // A native slash command reaches this runner as raw text specifically so the
-  // provider SDK can dispatch it. Keep that token at byte zero even when a
-  // cold-context bootstrap is needed; otherwise the bootstrap turns a native
-  // command back into ordinary prompt text before the provider sees it.
+  // Keep a native slash command at byte zero so the provider SDK still dispatches it.
   return boundedPrompt.startsWith('/') ? `${boundedPrompt}\n\n${bootstrap}` : `${bootstrap}\n\n${boundedPrompt}`;
 }

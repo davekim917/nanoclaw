@@ -1,21 +1,4 @@
-/**
- * Tone profile resolution — group-local first, shared fallback.
- *
- * Two mounts, one namespace:
- *
- *   /workspace/tone-profiles-group   groups/<folder>/tone-profiles/  (private groups repo)
- *   /workspace/tone-profiles         tone-profiles/                  (shared, fleet-wide)
- *
- * A group's own directory wins, so a workgroup can add profiles nobody else
- * sees (agent personas) or override a shared name for itself, without editing
- * the shared set. The shared set stays the common vocabulary.
- *
- * This is what makes voice per-CHANNEL selectable. A persona written as a
- * group-local profile is chosen through `messaging_group_agents.default_tone`
- * like any other tone, so one agent group can be its persona in one channel
- * and a plain shared tone in another. Voice lives in exactly one slot; there
- * is no second always-on voice layer to arbitrate against.
- */
+/** Tone profile resolution: the group-local mount wins over the shared fleet-wide one. */
 import fs from 'fs';
 import path from 'path';
 
@@ -25,14 +8,9 @@ const SHARED_TONE_DIR = '/workspace/tone-profiles';
 export const WRITING_RULES_FILE = 'writing-rules.md';
 export const SELECTION_GUIDE_FILE = 'selection-guide.md';
 
-/** Resolution order: group-local overrides shared. */
 const SEARCH_DIRS = [GROUP_TONE_DIR, SHARED_TONE_DIR];
 
-/**
- * Profile names index a filename, and `get_tone_profile` takes its name from
- * the agent — so an unconstrained name is a path-traversal read of the whole
- * container FS. Names are single path segments, nothing else.
- */
+/** `get_tone_profile` takes the name from the agent: anything but one path segment is a path-traversal read. */
 export function isSafeProfileName(name: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) && !name.includes('..');
 }
@@ -58,7 +36,6 @@ export function readToneProfile(name: string, dirs: string[] = SEARCH_DIRS): str
   }
 }
 
-/** An auxiliary file (writing rules, selection guide), group-local first. */
 export function readToneAuxFile(filename: string, dirs: string[] = SEARCH_DIRS): string | null {
   for (const dir of dirs) {
     const candidate = path.join(dir, filename);
