@@ -47,7 +47,7 @@ async function loadBashEvaluator(): Promise<BashEvaluator | null> {
   return _evalBash;
 }
 
-// Fail-closed fallback when the core is missing or fails to import, so the refusal never fails open.
+// Intentionally narrow backstop for a missing or unimportable core: a script matching nothing here passes.
 const FALLBACK_BLOCK: RegExp[] = [
   /\brm\s+(?:-\w*[rf]\w*\s+)+/i,
   /\b(?:unlink|shred|truncate)\b/i,
