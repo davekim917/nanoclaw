@@ -4,8 +4,9 @@
  *
  * Effort goes under `options.reasoningEffort`, not `variant:`: OpenCode resolves an agent's `variant` only when
  * the agent names its own `model:`, which these shims deliberately don't, so `variant` would be dropped silently.
- * `reasoningEffort` is the OpenAI-family spelling, passed through unvalidated: a provider that knows the key can
- * reject an out-of-range value (a loud failure on one shim, preferred over silently dropping the effort).
+ * `reasoningEffort` is the OpenAI-family spelling, passed through unvalidated and untranslated per provider: a
+ * provider that does not know the key ignores it; one that does can reject an out-of-range value (a loud failure on
+ * one shim, preferred over silently dropping the effort).
  */
 import type { ClaudeAgent } from './claude-agent-md.js';
 

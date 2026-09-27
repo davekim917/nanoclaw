@@ -220,7 +220,9 @@ export const OUTBOUND_WRITE_GUARD = 'withStoppedContainerSession';
 
 /**
  * A host session action that mutates `outbound.db` without the guard. Lexical only: it does not see writes via a
- * callback parameter or helper, nor via `withExistingNanoclawOutbound`. Those are outside the rule, not exempt.
+ * callback parameter or helper, nor via `withExistingNanoclawOutbound`. Those are outside the rule, not exempt:
+ * the router's notices and thread-close's force-clear write deliberately while a container may be running, and this
+ * guard is not their remedy.
  */
 export interface OutboundWriteMatch {
   file: string;

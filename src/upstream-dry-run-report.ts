@@ -1,6 +1,6 @@
 /**
  * Weekly upstream dry-run report: read-only triage via `git merge-tree`, never `git merge`/`git checkout`.
- * `generateDryRunReport` is the impure orchestrator and is not unit tested; everything else is pure.
+ * `generateDryRunReport` and its git-reading helpers are impure and not unit tested; parsers and renderers are pure.
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
