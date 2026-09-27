@@ -148,7 +148,7 @@ case "$*" in
   *branches*)  [ -n "${FAKE_FETCH_DELAY:-}" ] && sleep "$FAKE_FETCH_DELAY"
                jq -cn --arg s "$FAKE_SOURCE" '{commit:{sha:$s}}' ;;
   *"run list"*) cat "$FAKE_CHECKS" ;;
-  *compare*)   jq -cn '{status:"ahead",behind_by:0,files:[{filename:"XZO-BACKEND/src/x.ts"}]}' ;;
+  *compare*)   jq -cn '{status:"ahead",behind_by:0,files:[{filename:"api/src/x.ts"}]}' ;;
 esac
 SH
 cat > "$BIN/curl" <<'SH'
@@ -161,7 +161,7 @@ SH
 chmod +x "$BIN/gh" "$BIN/curl"
 export PATH="$BIN:$PATH"
 export SMOKE_GATE_REPO=o/r SMOKE_GATE_BACKEND_SERVICE=srv-be SMOKE_GATE_FRONTEND_SERVICE=srv-fe \
-       SMOKE_GATE_DEV_URL=https://dev.example SMOKE_GATE_FRONTEND_PATHS=XZO-FRONTEND/ \
+       SMOKE_GATE_DEV_URL=https://dev.example SMOKE_GATE_FRONTEND_PATHS=web/ \
        FAKE_BACKEND_ID=srv-be FAKE_FRONTEND_ID=srv-fe
 export FAKE_SOURCE="$SHA" FAKE_BACKEND="$SHA" FAKE_FRONTEND="$SHA" FAKE_CHECKS="$T/checks.json"
 

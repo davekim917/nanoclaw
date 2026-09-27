@@ -532,7 +532,7 @@ contract)
   # it. A rewrite over a contract that predates the field keeps that
   # contract's terms — `--regenerate` and a new-build rewrite continue a run
   # that started without the requirement, and must not have it land mid-run
-  # unannounced (XZO #2092). `adopt` never rewrites it (`. + $identity`).
+  # unannounced. `adopt` never rewrites it (`. + $identity`).
   PAIR_IDENTITY='{}'
   if [ "$FENCED_STATE_KIND" = pr ]; then
     PAIR_IDENTITY='{"pairIdentity":"required"}'

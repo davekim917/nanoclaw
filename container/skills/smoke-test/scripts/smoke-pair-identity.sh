@@ -46,7 +46,7 @@
 #
 # REDISPATCH AFTER RE-FREEZE. A fresher receipt is not fresher lane evidence: before this
 # was enforced, one ok `check` by the coordinator at the new generation cleared `finish`
-# while every lane's evidence still came from the OLD pair (issue #731, F3). `refreeze`
+# while every lane's evidence still came from the OLD pair (F3). `refreeze`
 # therefore snapshots the completion contract's lane generations into identity.json
 # (`refreezeLaneSnapshot`) — the scaffold's own `.lanes[].generation`, which only
 # smoke-run-scaffold.sh `redispatch <run-dir> <lane-id>` (one lane) or `contract
@@ -185,7 +185,7 @@ case "${1:-}" in
       echo "REFUSED: live pair does not serve PR contract sourceSha $EXPECTED_SOURCE_SHA — nothing frozen (exit 2): $P" >&2
       exit 2
     fi
-    # LATE FREEZE (XZO #2092). A freeze binds evidence gathered AFTER it; it
+    # LATE FREEZE. A freeze binds evidence gathered AFTER it; it
     # proves nothing about a lane that already ran, which gathered its evidence
     # against a pair nobody froze and possibly a different deploy. Without this,
     # `start` after the lanes plus one ok `check` cleared every gate and those

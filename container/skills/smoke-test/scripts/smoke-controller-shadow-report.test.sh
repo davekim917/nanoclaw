@@ -27,7 +27,7 @@ script_dir, corpus, t = sys.argv[1:4]
 spec = importlib.util.spec_from_file_location("replay", os.path.join(script_dir, "smoke-campaign-replay.py"))
 replay = importlib.util.module_from_spec(spec); spec.loader.exec_module(replay)
 wanted = ("pr1495-", "pr1945-", "pr1968-", "pr1606-")
-entries = [e for e in map(json.loads, open(corpus)) if "runId" in e and e["runId"][7:14] in wanted]
+entries = [e for e in map(json.loads, open(corpus)) if "runId" in e and replay.smoke_run_id.pr_tag(e["runId"]) in wanted]
 assert len(entries) == 4, [e["runId"] for e in entries]
 ctl = replay.load_controller()
 work = tempfile.mkdtemp(dir=t)
@@ -87,7 +87,7 @@ jq -e '.pass == false and .bars.missedObligations == "FAIL"' "$T/r.stdout" >/dev
 # --- window: a campaign finished outside it is not scored -------------------
 python3 "$REP" report --shadow-dir "$T/shadow" --gate-state-dir "$T/gate" --actuals "$T/actuals.json" \
   --since 2026-09-10T00:00:00Z --until 2026-09-30T00:00:00Z --json "$T/w.json" >/dev/null
-jq -e '[.campaigns[].runId | .[7:14]] == ["pr1945-","pr1968-"]' "$T/w.json" >/dev/null \
+jq -e '[.campaigns[].runId | capture("-(?<p>pr[0-9]+-)").p] == ["pr1945-","pr1968-"]' "$T/w.json" >/dev/null \
   || fail "pr1495 (09-05) and pr1606 (09-08) are outside a 09-10 window: $(jq -c '[.campaigns[].runId]' "$T/w.json")"
 
 # --- injected failures flip their bars --------------------------------------
@@ -136,7 +136,7 @@ rm "$T/shadow/wrapper/fires.ndjson"
 
 # (f) duplicates are scanned over every shadow record in the window, including
 # a campaign the gate never finished (still active or stuck).
-ACTIVE=xzo-pr-pr9999-aaaaaaaaaaaa-20260910T000000Z
+ACTIVE=acme-pr-pr9999-aaaaaaaaaaaa-20260910T000000Z
 mkdir -p "$T/shadow/$ACTIVE"
 {
   eff='"type":"send","class":"mechanical","reason":"r","key":"kA","effect":"shadow_refused","attempt":1,"runId":"'"$ACTIVE"'","fire":"f"'
@@ -244,7 +244,7 @@ PY
   echo '{"type":"user","timestamp":"2026-09-18T10:01:00Z","message":{"content":"Script output: {\"runId\":\"'"$RUN"'\"}"}}'
   echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}'
   echo '{"type":"user","timestamp":"2026-09-18T10:01:05Z","message":{"content":[{"type":"tool_result","content":"x"}]}}'
-  echo '{"type":"user","timestamp":"2026-09-18T10:40:00Z","message":{"content":"@Dinesh disposition filed"}}'
+  echo '{"type":"user","timestamp":"2026-09-18T10:40:00Z","message":{"content":"@Owner disposition filed"}}'
   echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cat runs/'"$RUN"'/x"}}]}}'
   echo '{"type":"user","timestamp":"2026-09-18T10:41:00Z","message":{"content":"Base directory for this skill: '"$RUN"'"}}'
   echo '{"type":"user","timestamp":"2026-09-18T10:50:00Z","message":{"content":"something else"}}'

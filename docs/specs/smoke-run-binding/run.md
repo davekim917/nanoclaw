@@ -8,7 +8,7 @@
   the source for exact interrupted-finish reconstruction.
 - Verified with `bash -n` on both gate scripts and tests, `git diff --check`,
   the full hermetic `smoke-pr-gate.test.sh`, `smoke-develop-gate.test.sh`, and
-  `smoke-run-scaffold.test.sh` suites, plus `gate-campaign-test.sh`. Focused
+  `smoke-run-scaffold.test.sh` suites, plus `gate-campaign.test.sh`. Focused
   cases cover cross-private-root exclusion, malformed/conflicting evidence,
   lease/slot rollback, and crash cuts before/after binding, verdict, lease
   removal, and private state commit.
@@ -20,7 +20,7 @@
   automatic PR, manual develop, automatic develop). Deterministic selective
   `mv` release/finish rollback fixtures and real base-gate legacy fixtures pass.
 - Fresh correction verification passed both full hermetic gate suites,
-  `smoke-run-scaffold.test.sh`, `gate-campaign-test.sh`, shell syntax checks,
+  `smoke-run-scaffold.test.sh`, `gate-campaign.test.sh`, shell syntax checks,
   `git diff --check`, and the upstream ratchet (`959` entries unchanged,
   divergence delta `0`). The supplied diagnostic probes now stop at their old
   expected-success assertions: legacy reciprocal claim returns `ok:false`, and
