@@ -1,4 +1,3 @@
-/** Wrappers around the host's `claude remote-control`: a system action out, the URL or status back as a chat message. */
 import { registerTools } from './server.js';
 import { emitSystemAction, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
