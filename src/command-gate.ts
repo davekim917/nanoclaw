@@ -48,14 +48,7 @@ export function clearInterceptHandlers(): void {
 const FILTERED_COMMANDS = new Set(['/start', '/help', '/login', '/logout', '/doctor', '/config', '/remote-control']);
 const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 
-/**
- * For threaded chat-sdk inbounds, the message text the agent sees is wrapped
- * with prior thread context:
- *   `[Thread context]\nassistant: <prev>\n[Latest message]\n<user text>`
- * The gate functions classify the USER's text, not the wrapped form, so peel
- * off everything before the final `[Latest message]\n` marker. Plain (non-
- * threaded) inbounds have no marker and pass through unchanged.
- */
+/** Classify the USER's text: peel everything before the final `[Latest message]\n` marker that threaded chat-sdk inbounds carry. */
 function extractUserMessage(text: string): string {
   const marker = '[Latest message]\n';
   const idx = text.lastIndexOf(marker);
@@ -63,16 +56,7 @@ function extractUserMessage(text: string): string {
   return text.substring(idx + marker.length).trim();
 }
 
-/**
- * Strip leading mention tokens from message text. Discord/Slack inboxes deliver
- * messages like `<@U123> /dashboard-token` or `@bot /clear` — the slash command
- * is the second token, not the first. Without stripping, both gates' first-char
- * check would mis-classify these as plain prose and route them to the agent.
- *
- * Strips both formal (`<@123>`, `<@!123>`, `<@UTEST00013|name>`) and bare
- * (`@bot ` followed by whitespace) mention prefixes. Iterates so that multi-
- * mention prefixes (`@bot1 @bot2 /command`) all get stripped.
- */
+/** Strip leading mention tokens (`<@U123>`, `@bot `), repeatedly: Discord/Slack deliver `<@U123> /cmd`, which would otherwise read as prose. */
 function stripLeadingMentions(text: string): string {
   let prev: string;
   let cur = text;
@@ -101,10 +85,7 @@ export async function preFanoutGate(content: string, userId: string): Promise<Ga
   text = extractUserMessage(text);
   const beforeMentionStrip = text;
   text = stripLeadingMentions(text);
-  // Did the raw text explicitly name a bot (any bot, formal or bare @mention)
-  // before the command? Used by the router to tell "addressed to nobody" —
-  // safe to pick a fallback responder — apart from "addressed to a specific
-  // OTHER sibling bot" — never our command to answer.
+  // Whether the raw text named a bot before the command: tells "addressed to nobody" from "addressed to another sibling".
   const leadingMention = text !== beforeMentionStrip;
 
   if (!text.startsWith('/')) return { action: 'pass' };
@@ -118,10 +99,7 @@ export async function preFanoutGate(content: string, userId: string): Promise<Ga
   const intercept = INTERCEPT_COMMANDS.get(command);
   if (intercept) {
     if (intercept.requiresAuth === 'admin') {
-      // Despite the flag name, /dashboard-token also allows members to mint
-      // their own read-only login link — they just can't mint one for anyone
-      // else (the token binds to ctx.userId). A user with neither an admin
-      // role nor any agent_group_members row still gets denied.
+      // Despite the flag name, members may mint their own read-only login link (the token binds to ctx.userId).
       if (!(await isAnyAdmin(userId)) && !(await hasAnyMembership(userId)))
         return { action: 'deny', command, leadingMention };
     }
