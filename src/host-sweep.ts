@@ -569,7 +569,7 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T22: 'orphaned-repo-fence-release',
   T23: 'cli-request-execution-prune',
   T24: 'task-failure-escalation',
-  // Fork addition, kept so the drift guard in host-sweep-registry.test.ts accounts for every registered duty.
+  // Fork additions (FORK*), kept so the drift guard in host-sweep-registry.test.ts accounts for every duty.
   FORK1: 'github-token-file-refresh',
   FORK2: 'coordination-orphans',
   FORK3: 'wiki-admission-recovery',
