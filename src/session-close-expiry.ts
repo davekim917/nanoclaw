@@ -1,45 +1,14 @@
 /**
- * Releasing everything a CLOSED session can never consume.
- *
- * ## The leak
- *
- * `expireStalePending` is the sweep's reaper, and it runs as duty S3 inside
- * the per-session loop — a loop over `getActiveSessions()`. A session that
- * reaches `closed` while it still holds `pending` rows therefore takes them
- * permanently out of the reaper's reach. Those rows then keep
- * `sessionHasOpenWork` (src/storage-manager.ts) returning true forever, so
- * reclaim never archives the directory and the session dir is pinned for good:
- * 561 rows across 53 sessions on this install, the oldest 43 days old.
- *
- * The fix is to release the work AT THE SOURCE rather than to teach readers to
- * ignore it. Once the rows are `expired` and the claims are gone,
- * `sessionHasOpenWork` already answers false — no caller changes, and no third
- * "unconsumable" state to keep in sync with the two that exist.
- *
- * ## All THREE things sessionHasOpenWork counts
- *
- * The predicate is a chain, and clearing only its first link leaves the
- * session pinned exactly as before:
+ * Releases everything a CLOSED session can never consume. The reaper only walks active sessions, so leftover work
+ * keeps `sessionHasOpenWork` true and pins the session dir for reclaim forever. All three things that predicate
+ * counts must be cleared, or the session stays pinned:
  *
  *   1. inbound `messages_in` in ('processing','pending')  → expireClosedSessionPending
  *   2. outbound `processing_ack` status = 'processing'    → deleteOrphanProcessingClaims
  *   3. outbound `session_state` work_continuation/pending_next → clearWorkContinuation
  *
- * `expireClosedSessionWork` below does all three, so both entry points get the
- * complete release.
- *
- * ## The two entry points
- *
- *  - `src/modules/sweep-scheduling/index.ts` duty S19, immediately after the
- *    `active -> closed` update. That is the ONLY active->closed transition on
- *    the host (`src/session-close-sites.test.ts` pins it), so it is the whole
- *    of the ongoing leak.
- *  - `drainClosedSessionPendingBacklog()` at boot, for sessions that were
- *    already closed before this landed.
- *
- * The four `archiving -> closed` sites in `src/storage-manager.ts` are
- * deliberately NOT wired up; see `session-close-sites.test.ts` for the case
- * that none of them can strand a row.
+ * Entry points: sweep duty S19 right after the only active→closed transition (pinned by
+ * `session-close-sites.test.ts`), and `drainClosedSessionPendingBacklog()` at boot.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -55,86 +24,21 @@ import { sessionsBaseDir, withExistingMailboxSession } from './session-manager.j
 import type { Session } from './types.js';
 
 /**
- * How many closed sessions one backlog drain may OPEN. The DB open is the cost
- * this bounds; the scan around it is one `statSync` per closed row and stays
- * trivial as the table grows.
- *
- * A no-op session still spends budget — exempting it would put the open count
- * back under the control of what the sessions happen to hold, which is the
- * unbounded case this exists to prevent. Progress across boots is guaranteed by
- * the cursor instead.
+ * How many closed sessions one backlog drain may OPEN. No-op sessions spend budget too, or the open count would be
+ * unbounded again; the cursor guarantees progress across boots.
  */
 const CLOSED_SESSION_BACKLOG_DRAIN_LIMIT = 250;
 
 export interface ClosedSessionRelease {
-  /** Inbound rows moved to 'expired'. */
   expired: number;
-  /** Orphan outbound 'processing' claims deleted. */
   claimsCleared: number;
-  /** Whether a durable follow-up promise was dropped. */
   continuationCleared: boolean;
 }
 
 /**
- * Release everything a closed (or about-to-be-closed) session still holds.
- *
- * Takes the mailbox session rather than a key: S19 calls this from INSIDE the
- * sweep's already-open session window, and opening a second mailbox session on
- * the same key would throw the nesting guard (`runMailboxSession`).
- *
- * Callers must have established that the session row is `closed` or is being
- * closed in the same turn — the inbound op drops the age, recurrence and fence
- * guards that are load-bearing for a live session.
- *
- * ## The outbound half and its guard
- *
- * `outbound.db` has ONE writer. The host may touch it only while no container
- * owns the session, and the check has to sit immediately before the mutation
- * with no await between the two. `writeOutboundWhenStopped` is that shape and
- * is the ownership check carried INLINE here — the lexical scanner in
- * `src/mailbox-seam-ratchet.ts` cannot see a write made through a helper the
- * session action calls, so this function owns the property rather than
- * inheriting it from its call sites.
- *
- * Gated on `hasOutbound()` first: a never-woken session has no outbound.db, and
- * reaching for the writable handle would CREATE one — a cleanup pass must not
- * provision files.
- *
- * ## Why the continuation goes too
- *
- * A `work_continuation` (or its legacy `pending_next` spelling) is a promise to
- * resume work on the next wake. A closed session has no next wake: resuming one
- * means waking the session, and every session lookup filters `status='active'`.
- * The promise can never be honoured, and while it survives it pins the
- * directory — which is the entire defect. Its presence here is already an
- * anomaly: S19 refuses to close a session while `readContinuationPresence()`
- * is non-null, so a continuation in a closed session arrived after that check
- * or predates this code. `clearWorkContinuation` drops both keys in one
- * transaction and returns what it held, so the drop is reported rather than
- * silent.
- */
-/**
- * `writeOutboundWhenStopped`, for a session reached through the OUTBOUND-keyed
- * funnel instead of the mailbox session.
- *
- * The two guards in `host-sweep.ts` both go through the mailbox session, whose
- * existence check is `inbound.db && outbound.db`
- * (`SqliteAgentMailbox.exists`) — so neither can reach a session that kept
- * outbound.db and lost inbound.db. This is the same guarantee on
- * `withExistingNanoclawOutbound`: `containerOwnsOutbound` runs INSIDE the
- * funnel, synchronously, immediately before the mutation. The funnel demands a
- * synchronous action, so no await can be introduced into that gap.
- *
- * Deliberately here and not beside its two siblings in `host-sweep.ts`.
- * `host-sweep.ts` is upstream-owned, its export surface is a curated allowlist,
- * and its line ceiling is set to zero headroom on purpose
- * (`src/host-sweep-registry.test.ts`) — growing all three for a helper with one
- * fork-owned caller and no relationship to the sweep driver buys nothing. The
- * siblings live there because the sweep families share them across a kill;
- * this one is not shared.
- *
- * Resolves `undefined` when there is no `outbound.db` OR a container owns it —
- * both are "did not run", never a failure.
+ * `writeOutboundWhenStopped` for a session reached through the OUTBOUND-keyed funnel: `containerOwnsOutbound`
+ * runs synchronously inside the funnel right before the mutation. Kept out of the upstream-owned `host-sweep.ts`
+ * (curated exports, zero line headroom). `undefined` when there is no outbound.db or a container owns it.
  */
 async function writeOutboundOnlyWhenStopped<T>(
   agentGroupId: string,
@@ -151,29 +55,8 @@ async function writeOutboundOnlyWhenStopped<T>(
 }
 
 /**
- * Release a closed session that still holds `outbound.db` but has lost
- * `inbound.db`.
- *
- * Keyed on OUTBOUND, because `SqliteAgentMailbox.exists` is
- * `inbound.db && outbound.db`: the mailbox-session funnel answers `undefined`
- * for this cohort, so routing it through `expireClosedSessionWork` would spend
- * a slot of the drain's budget, report success, and release nothing. That is
- * the seam's own rule — the existence question a read asks is keyed to the file
- * the read actually touches (`src/modules/mailbox/index.ts`) — and four earlier
- * findings in this series were instances of getting it wrong.
- *
- * `writeOutboundOnlyWhenStopped` carries the same ownership guarantee as the
- * two-sided path: `containerOwnsOutbound` inside the funnel, synchronously,
- * immediately before the mutation.
- *
- * ## What this does and does not buy
- *
- * It genuinely releases the state. It does NOT, on its own, unpin the
- * directory for reclaim: `sessionHasOpenWork` reads inbound.db FIRST, and
- * `dbHasRows` answers `null` for a file that is not there, which every caller
- * treats as "could not tell" and therefore as pinned. A half-present session is
- * pinned by its missing file, not by its rows. Fixing that is a separate
- * question about the `null` fail-closed and is deliberately not attempted here.
+ * Release a closed session that kept `outbound.db` but lost `inbound.db`. Keyed on OUTBOUND: the mailbox funnel's
+ * existence check keys on inbound, so it would report success and release nothing for this cohort.
  */
 async function releaseOutboundOnlyClosedSession(
   agentGroupId: string,
@@ -196,6 +79,13 @@ async function releaseOutboundOnlyClosedSession(
   return released;
 }
 
+/**
+ * Release everything a closed (or closing-this-turn) session holds; the inbound op drops the guards a live session
+ * needs. Takes the open mailbox session because S19 calls it inside the sweep's session window (a nested open
+ * throws). The outbound write is guarded INLINE by `writeOutboundWhenStopped` (the seam ratchet cannot see through
+ * helpers), and gated on `hasOutbound()` so cleanup never creates an outbound.db. The continuation is dropped
+ * because a closed session never wakes to honour it.
+ */
 export function expireClosedSessionWork(
   mailbox: NanoclawMailboxSession,
   session: Session,
@@ -229,25 +119,12 @@ export function expireClosedSessionWork(
   return result;
 }
 
-/* ─── Backlog drain ────────────────────────────────────────────────────────── */
-
-/**
- * Where the drain remembers how far it got.
- *
- * A function, not a module constant, so a test's mocked `DATA_DIR` is honoured
- * and so a `DATA_DIR` that only exists after boot cannot be captured too early.
- */
+/** A function so a test's mocked `DATA_DIR` is honoured and nothing is captured before boot. */
 function cursorPath(): string {
   return path.join(DATA_DIR, 'closed-session-drain-cursor.json');
 }
 
-/**
- * The last session id this drain OPENED, or null for "start from the top".
- *
- * Any failure — missing file, unreadable, malformed JSON, wrong shape — reads
- * as null. A cursor is an optimisation for where to resume, never a
- * precondition, so it must not be able to fail a boot.
- */
+/** The last session id this drain OPENED, or null. Any read failure is null: a cursor must never fail a boot. */
 function readDrainCursor(): string | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(cursorPath(), 'utf8')) as { after?: unknown };
@@ -262,7 +139,6 @@ function writeDrainCursor(after: string | null): void {
     fs.mkdirSync(path.dirname(cursorPath()), { recursive: true });
     fs.writeFileSync(cursorPath(), JSON.stringify({ after, updated_at: new Date().toISOString() }));
   } catch (err) {
-    // Losing the cursor costs a repeated window next boot, nothing more.
     log.warn('Could not persist the closed-session drain cursor', { err });
   }
 }
@@ -273,50 +149,21 @@ interface ClosedSessionRow extends Session {
 }
 
 export interface ClosedSessionDrainResult {
-  /** Closed session rows the query returned. */
   scanned: number;
-  /** Sessions actually opened — bounded by `limit`. */
   visited: number;
   expired: number;
   claimsCleared: number;
   continuationsCleared: number;
-  /** Sessions with a surviving directory that the cap pushed to a later run. */
   deferred: number;
-  /**
-   * Sessions holding `inbound.db` with no `outbound.db`. The seam has no
-   * inbound-keyed funnel, so these are reported rather than released — and a
-   * missing file already makes `sessionHasOpenWork` fail closed, so releasing
-   * them would not unpin them either.
-   */
-  /** Where the next run will resume, or null when this run completed a lap. */
+  /** Null when this run completed a lap. */
   cursor: string | null;
 }
 
 /**
- * Drain the sessions that were closed BEFORE this landed.
- *
- * Deliberately not a sweep duty and not a migration: a per-tick pass over every
- * closed session is the per-session cost this avoids, and a migration would
- * rewrite 1,229 session files in one shot.
- *
- * ## Why a cursor, not "reclaim will take care of it"
- *
- * Leaning on reclaim removing a drained session's directory so the next boot
- * would skip it is true EVENTUALLY and false within an evening: reclaim is
- * asynchronous and bounded per tick, so a host
- * that restarts three times in a night re-walks the same unordered prefix and
- * the tail past the cap never gets opened at all, and those rows clearing is
- * the entire point.
- *
- * So progress is guaranteed rather than incidental: the query is ordered by
- * `id`, the run records the last session it OPENED, and the next run resumes
- * after it, wrapping to the top when the list is exhausted. A run that gets
- * through a whole lap with budget to spare clears the cursor rather than
- * leaving it pointed at an id reclaim may have removed.
- *
- * `sessionsRoot` is the existence gate only — the open itself goes through the
- * mailbox, which is keyed on `DATA_DIR`. The two are the same root in
- * production; the parameter exists so a test can point both at a temp dir.
+ * Drain sessions closed before the S19 release existed. Not a sweep duty (per-tick cost) nor a migration.
+ * Progress is guaranteed by a cursor, not left to async reclaim: rows are ordered by `id`, the run records the
+ * last session it OPENED, the next resumes after it and wraps; a full lap with budget left clears the cursor.
+ * `sessionsRoot` is only the existence gate; the open goes through the mailbox, keyed on `DATA_DIR`.
  */
 export async function drainClosedSessionPendingBacklog(
   sessionsRoot: string = sessionsBaseDir(),
@@ -341,9 +188,7 @@ export async function drainClosedSessionPendingBacklog(
   }
   result.scanned = rows.length;
 
-  // Rotate so iteration starts after the cursor and wraps back to the top. An
-  // id that is no longer in the table simply yields an empty first half, which
-  // is the same as starting from the beginning.
+  // Rotate to start after the cursor; a vanished cursor id yields an empty first half, i.e. start from the top.
   const cursor = readDrainCursor();
   const ordered = cursor ? [...rows.filter((r) => r.id > cursor), ...rows.filter((r) => r.id <= cursor)] : rows;
 
@@ -351,17 +196,7 @@ export async function drainClosedSessionPendingBacklog(
   let cappedOut = false;
 
   for (const row of ordered) {
-    // Cheap gate first: a fully reclaimed session has no directory left, and
-    // that is the overwhelming majority of the closed rows.
-    //
-    // Both sides are checked, not just inbound. `sessionHasOpenWork` pins a
-    // session on outbound `processing_ack` or `session_state` even when it
-    // finds no inbound work, so a session that has lost `inbound.db` while
-    // keeping `outbound.db` still needs releasing — and gating on inbound
-    // alone would skip it on every boot forever. That is the seam's own rule
-    // (`src/modules/mailbox/index.ts`): the existence question a read asks is
-    // keyed to the file the read actually touches. Four earlier findings in
-    // this series were instances of getting it wrong; this was the fifth.
+    // Gate on either DB existing: outbound `processing_ack`/`session_state` pin a session with no inbound.db too.
     const sessionDir = path.join(sessionsRoot, row.agent_group_id, row.id);
     const hasInbound = fs.existsSync(path.join(sessionDir, 'inbound.db'));
     const hasOutbound = fs.existsSync(path.join(sessionDir, 'outbound.db'));
@@ -374,22 +209,8 @@ export async function drainClosedSessionPendingBacklog(
     result.visited += 1;
     lastOpened = row.id;
     try {
-      // Two cohorts, not three. `NanoclawAgentMailbox.exists()` is overridden
-      // to key on `inbound.db` ALONE (src/modules/mailbox/index.ts), and
-      // `session()` degrades every outbound read to empty when that side is
-      // absent — the doc there calls inbound-only the normal never-woken
-      // shape. So the mailbox funnel serves every session that still has
-      // inbound.db, outbound present or not, and only the inbound-absent case
-      // needs the outbound-keyed funnel.
-      //
-      // This replaced a branch per file-existence cohort. That shape drew a
-      // finding a round for three rounds because each branch encoded a belief
-      // about the seam rather than asking it: that `exists()` was
-      // `inbound && outbound`, and that a missing file made `dbHasRows`
-      // answer `null` and fail closed. Both were false — `dbHasRows`
-      // short-circuits a missing path to `false` (storage-manager.ts) — so
-      // inbound-only sessions are pinned by their rows and releasing them
-      // does unpin them.
+      // `NanoclawAgentMailbox.exists()` keys on inbound.db alone and degrades absent outbound reads to empty, so
+      // the mailbox funnel serves every session with inbound.db; only inbound-absent sessions need the outbound one.
       const released = hasInbound
         ? await withExistingMailboxSession(row.agent_group_id, row.id, (mailbox) =>
             expireClosedSessionWork(mailbox, row, 'closed-session-backlog'),
@@ -401,10 +222,7 @@ export async function drainClosedSessionPendingBacklog(
         if (released.continuationCleared) result.continuationsCleared += 1;
       }
     } catch (err) {
-      // One unreadable session DB must not stop the drain — the rest of the
-      // backlog is still worth clearing, and reclaim already fails closed on
-      // a session it cannot read. It still consumed budget and still advances
-      // the cursor, so a permanently broken session cannot wedge the window.
+      // One unreadable session must not stop the drain; it still spent budget and advances the cursor.
       log.warn('Could not release a closed session’s work', {
         sessionId: row.id,
         agentGroupId: row.agent_group_id,
