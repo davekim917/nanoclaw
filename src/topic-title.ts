@@ -40,8 +40,11 @@ export async function generateTopicTitle(messageText: string): Promise<string | 
   } catch (err) {
     // Error serialization drops custom props, so surface callHaiku's stderr explicitly.
     const stderr = (err as { stderr?: string }).stderr;
+    if (isHostLlmUnavailable(err)) {
+      log.info('Topic title deferred: host LLM unavailable', { err: (err as Error).message });
+      throw err;
+    }
     log.warn('Topic title generation failed', { err, stderr });
-    if (isHostLlmUnavailable(err)) throw err;
     return undefined;
   }
 }
@@ -87,7 +90,6 @@ function resolveDiscordBotToken(channelType: string): string | undefined {
   return process.env[envVar] || primary;
 }
 
-/** Shared by the live path and the retry sweep so a retry never diverges. True on a confirmed rename. */
 function isHostLlmUnavailable(err: unknown): boolean {
   return (
     err instanceof AllCredentialSlotsParkedError ||
@@ -96,6 +98,7 @@ function isHostLlmUnavailable(err: unknown): boolean {
   );
 }
 
+/** Shared by the live path and the retry sweep so a retry never diverges. True on a confirmed rename. */
 async function attemptThreadTitle(
   threadPlatformId: string,
   channelType: string,
