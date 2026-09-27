@@ -1,19 +1,9 @@
 /**
- * Read-only, evidence-first operator-attention extract: durable events only, never inferred
- * attention or reading time.
- *
- * - Delivery evidence is a non-null platform message id at `delivered_at`; the delivery loop
- *   also acknowledges adapter no-ops with a null id, so a null marker is NOT delivery.
- * - An assistant archive row is archive observation only, never delivery evidence, and an
- *   explicit archive DB is never claimed to cover every session under the sessions root.
- * - `quietStatus`/`chatLimit` drop rows before they are written; missing rows are never
- *   invented as suppressed deliveries.
- *
- * Connections are `readonly` + `PRAGMA query_only=ON`. WAL locking may still create `-shm`
- * metadata, which the report counts; never `immutable=1`, which would ignore committed WAL data.
- *
- * Emits no message text, title, card option, selected choice, sender identity, user id,
- * payload, or PR body — only synthetic-safe provenance.
+ * Read-only operator-attention extract from durable events only. Delivery evidence is a non-null
+ * platform message id at `delivered_at`: adapter no-ops are acknowledged with a null id. An
+ * assistant archive row is never delivery evidence. `quietStatus`/`chatLimit` drop rows before they
+ * are written, so missing rows never count as suppressed deliveries. Never `immutable=1`, which
+ * would ignore committed WAL data. Emits no message text, identity or payload, only provenance.
  */
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
@@ -27,10 +17,7 @@ const DEFAULT_SAMPLE_LIMIT = 10;
 const DEFAULT_FOLLOWUP_DAYS = 14;
 const REVIEW_OUTCOME_BASE_BRANCH = 'main' as const;
 
-/**
- * Agent-group metadata directories, not sessions. Explicit on purpose: an unfamiliar
- * directory must fail closed as a possible session rather than disappear from coverage.
- */
+/** Explicit on purpose: an unfamiliar directory must fail closed as a possible session. */
 const AGENT_GROUP_METADATA_DIR_NAMES = new Set(['.claude-shared', '.claude-memory', '.context']);
 
 interface CandidateSample {
@@ -56,11 +43,9 @@ type ArchiveScope = 'explicit_db_scope_unverified_against_sessions_root';
 interface AttentionCounters {
   /** Current pending central-DB cards, never a historical card total. */
   platformBackedPendingApprovalCardsSnapshot: number;
-  /** Durable host-written receipts; no clicker id, label, or value is emitted. */
   resolvedChoiceReceipts: number;
   /** Exact `ask_question` payload plus a non-null platform message id. */
   platformBackedQuestionCards: number;
-  /** `kind='chat'` with a non-null platform id at `delivered_at`. */
   finalChatDeliveryEvidence: number;
   finalChatPlatformMessageId: number;
   /** Matching assistant archive rows at `sent_at`; never delivery confirmation. */
@@ -81,9 +66,7 @@ interface ReviewOutcomeRow {
   kind: 'explicit_pr_revert' | 'fixes_pr_proxy' | 'same_file_overlap_proxy';
   targetPr: number;
   evidencePr: number;
-  /** Existing review-metrics week maturity, not a newly invented threshold. */
   maturity: 'mature' | 'immature';
-  /** The existing cumulative revert view is intentionally unbounded. */
   relation: 'within_followup_window' | 'later_unbounded';
 }
 
@@ -95,7 +78,6 @@ export interface ReviewOutcomeEvidence {
   matureTargetPrs: number;
   immatureTargetPrs: number;
   rows: ReviewOutcomeRow[];
-  /** No current PullRequestData field links a PR to an incident/customer defect. */
   incidentCustomerDefectRows: [];
   incidentCustomerDefectStatus: 'unavailable_no_machine_readable_linkage';
 }
@@ -112,7 +94,6 @@ export interface OperatorAttentionEvidence {
     sqliteReadContract: {
       readonly: true;
       queryOnly: true;
-      /** SQLite may create/change WAL shared-memory lock metadata even on a logical read. */
       sidecarMetadataMayChange: true;
       walFilesWithoutShmBeforeRead: number;
       shmFilesObservedNewDuringRead: number;
@@ -307,7 +288,6 @@ function parseTaskControls(content: string): ParsedTaskControls | null {
   };
 }
 
-/** A deliberately small prose-only candidate detector; never an outcome fact. */
 function isStatusChaseCandidate(text: string): boolean {
   return /\b(?:status|update|progress|eta|any news|where (?:are|is)|still (?:working|running)|how(?:'s| is) it going)\b/i.test(
     text,
@@ -580,8 +560,7 @@ function scanSession(input: {
           ORDER BY timestamp, id`,
       )
       .all() as OutboundRow[];
-    // Acknowledgements live in the *inbound* DB (`messages_out` never has this table). No
-    // ATTACH: each source DB stays independently read-only.
+    // Acknowledgements live in the *inbound* DB. No ATTACH: each source DB stays independently read-only.
     const deliveredRows = inbound
       .prepare('SELECT message_out_id, status, platform_message_id, delivered_at FROM delivered')
       .all() as DeliveredRow[];
@@ -637,11 +616,7 @@ function scanSession(input: {
   }
 }
 
-/**
- * Extracts only the outcome relationships already modelled by review-outcomes.
- * An explicit PR-to-PR revert is a source/deployment outcome, not a customer-defect
- * claim. `Fixes-PR:` and same-file overlap remain explicitly named proxies.
- */
+/** An explicit PR-to-PR revert is a source outcome, not a customer-defect claim; the others are proxies. */
 export function extractReviewOutcomeEvidence(
   prs: readonly PullRequestData[],
   since: string,

@@ -1,11 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * CLI shim — regenerate ~/.codex/AGENTS.md from ~/.claude/CLAUDE.md.
+ * CLI shim for `syncCodexAgentsMd()` (src/codex-sync.ts): regenerates ~/.codex/AGENTS.md.
  *
- * Real work lives in `src/codex-sync.ts:syncCodexAgentsMd()` so the
- * watcher daemon can call it in-process without spawn overhead.
- *
- * Usage:
  *   pnpm exec tsx scripts/sync-codex-agents-md.ts
  */
 import { syncCodexAgentsMd } from '../src/codex-sync.js';

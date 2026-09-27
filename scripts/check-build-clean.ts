@@ -1,15 +1,9 @@
 #!/usr/bin/env tsx
 /**
- * Prebuild guard: dist/ is compiled from the WORKING TREE, not from HEAD, so in a checkout
- * shared by concurrent agents a build would capture whoever's half-finished work is on disk.
- * Refuses a dirty tree (docs-only dirt excepted); BUILD_ALLOW_DIRTY=1 overrides loudly.
- *
- * HEAD must also match origin/main (BUILD_ALLOW_LOCAL=1 overrides). The HEAD sha and a content
- * fingerprint of any allowed dirt go to dist/ so scripts/write-build-info.ts can detect HEAD or
- * that dirt changing *during* the build.
- *
- * Typecheck and lint must be green first; they run throttled (ionice + nice) so a build does
- * not starve co-resident agent containers.
+ * Prebuild guard: dist/ is compiled from the WORKING TREE, not HEAD, so in a shared checkout a
+ * build would capture whoever's half-finished work is on disk. Refuses a dirty tree (docs-only
+ * dirt excepted; BUILD_ALLOW_DIRTY=1 overrides) and a HEAD other than origin/main
+ * (BUILD_ALLOW_LOCAL=1 overrides).
  */
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -19,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const IGNORABLE_DIRT_PREFIXES = ['docs/'];
 
-/** Root-level markdown is documentation by convention; nested markdown still blocks. */
+/** Exempt: everything under docs/, plus root-level README* and *.md; nested markdown elsewhere still blocks. */
 export function isIgnorableDirtPath(filePath: string): boolean {
   if (IGNORABLE_DIRT_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return true;
   if (!filePath.includes('/')) {
@@ -35,7 +29,7 @@ function stripQuotes(p: string): string {
   return p;
 }
 
-/** Extracts the path(s) a `git status --porcelain` line refers to. Rename entries yield both sides. */
+/** Rename entries yield both sides. */
 function pathsForLine(line: string): string[] {
   const rest = line.slice(3); // "XY " prefix
   const arrow = rest.indexOf(' -> ');
@@ -44,10 +38,8 @@ function pathsForLine(line: string): string[] {
 }
 
 /**
- * Stray `dist.*`/`node_modules.*` snapshot directories a hand-run deploy left beside `dist/`
- * (deploy.sh's own snapshots are gitignored). Named separately because "commit or stash" is
- * the wrong remedy and BUILD_ALLOW_DIRTY is dangerous for them. Decided by a real `isDirectory`
- * check, not the path string: a root file like `dist.config.ts` has the same porcelain shape.
+ * Stray `dist.*`/`node_modules.*` snapshot directories a hand-run deploy left beside `dist/`.
+ * Decided by a real `isDirectory` check: a root file like `dist.config.ts` has the same shape.
  */
 export function strayBuildArtifactDirs(paths: string[], isDirectory: (relPath: string) => boolean): string[] {
   const dirs = new Set<string>();
@@ -88,10 +80,7 @@ export function pathsForLines(lines: string[]): string[] {
   return [...paths].sort();
 }
 
-/**
- * Order-independent and stable across processes (prebuild writes it, postbuild recomputes it),
- * so a BUILD_ALLOW_DIRTY build detects its allowed dirt changing content mid-build.
- */
+/** Must stay order-independent and stable across processes: postbuild recomputes it. */
 export function fingerprintDirt(blockingLines: string[]): string {
   const hash = crypto.createHash('sha256');
   for (const p of pathsForLines(blockingLines)) {
@@ -109,7 +98,7 @@ export function fingerprintDirt(blockingLines: string[]): string {
 
 export interface FreshnessCheck {
   ok: boolean;
-  /** Printed via console.warn when ok+overridden, console.error when refused. Null when HEAD already matches. */
+  /** Null when HEAD already matches. */
   message: string | null;
 }
 
@@ -148,10 +137,7 @@ interface EslintFileResult {
   messages: EslintMessage[];
 }
 
-/**
- * eslint exits 1 on any lint error, which is expected here; its JSON report is on stdout either
- * way. A spawn failure has no `.stdout`, so it still throws.
- */
+/** eslint exits 1 on any lint error; its JSON report is on stdout either way. */
 function execCaptureStdout(cmd: string, args: string[], options: { cwd: string }): string {
   try {
     return execFileSync(cmd, args, { encoding: 'utf8', cwd: options.cwd });
@@ -162,10 +148,7 @@ function execCaptureStdout(cmd: string, args: string[], options: { cwd: string }
   }
 }
 
-/**
- * From `import.meta.url`, not `process.cwd()`: the test runs this with `cwd` in a fixture repo
- * that has no `node_modules/`, `src/` or `scripts/`.
- */
+/** From `import.meta.url`, not `process.cwd()`: the test runs with `cwd` in a bare fixture repo. */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export interface GuardStepResult {
@@ -257,8 +240,7 @@ function runTypecheckGate(): GuardStepResult {
 }
 
 function readStatus(): string[] {
-  // Don't .trim() before splitting: a porcelain line can start with a space (" M path"), and
-  // trimming would shift `pathsForLine`'s 3-char prefix slice on the first line.
+  // Don't .trim() before splitting: a porcelain line can start with a space (" M path").
   const raw = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
   return raw.trim() ? raw.split('\n').filter((line) => line.length > 0) : [];
 }

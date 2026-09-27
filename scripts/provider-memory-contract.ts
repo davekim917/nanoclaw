@@ -1,11 +1,7 @@
 /**
- * Fail-closed conformance gate for registry-branch provider payloads.
- *
- * Provider skills publish missing files create-only from the long-lived
- * `providers` branch and accept existing files only when byte-identical. This
- * validator reads the candidate ref before publication and the composed tree
- * afterward so a stale registry branch cannot silently restore provider-native
- * memory, bypass the shared pre-turn contract, or overwrite a customization.
+ * Fail-closed conformance gate for registry-branch provider payloads, run on the candidate ref
+ * before publication and the composed tree after, so a stale `providers` branch cannot restore
+ * provider-native memory or overwrite a customization.
  */
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -106,8 +102,7 @@ function atomicCreate(projectRoot: string, relativePath: string, bytes: Buffer, 
     fs.closeSync(fd);
     fd = undefined;
     fs.chmodSync(temporary, mode);
-    // Same-directory hard-link publication is atomic and create-only. Unlike
-    // rename, it cannot replace a customization that appears after preflight.
+    // Hard link, not rename: it cannot replace a customization that appears after preflight.
     fs.linkSync(temporary, target);
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
@@ -337,10 +332,8 @@ export function compareProviderPayloadBytes(
 }
 
 /**
- * Install a fully-read, prevalidated provider payload without overwriting any
- * existing path. If later publication fails, already-published create-only
- * files are deliberately retained: there is no portable atomic
- * compare-and-unlink, so automatic deletion cannot prove it still owns a path.
+ * Never overwrites an existing path. On a later failure, already-published files are retained:
+ * with no portable atomic compare-and-unlink, deletion cannot prove it still owns a path.
  */
 export function installProviderMemoryPayload(
   provider: MemoryConformantProvider,

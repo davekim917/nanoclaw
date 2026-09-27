@@ -1,11 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * CLI shim — print the weekly upstream dry-run report to stdout, and
- * optionally submit it to the latest owner DM through the CLI socket.
- * Report generation lives in src/upstream-dry-run-report.ts. It fetches
- * upstream and runs `git merge-tree` (in-memory), never `git merge` or
- * checkout. The report is safe to run from the live checkout or any worktree
- * because it always compares origin/main and upstream/main.
+ * Print the weekly upstream dry-run report, optionally to the latest owner DM. Uses in-memory
+ * `git merge-tree` against origin/main and upstream/main, so it is safe from the live checkout.
  *
  * Usage: pnpm exec tsx scripts/upstream-dry-run-report.ts
  *        pnpm exec tsx scripts/upstream-dry-run-report.ts --notify-owner
@@ -66,9 +62,6 @@ function parseDeliveryResult(response: unknown, requestId: string): DeliveryResu
   return delivered as DeliveryResult;
 }
 
-/**
- * Deliver the report through the host-only ncl command and await its result.
- */
 export async function submitOwnerReport(
   {
     socketPath,

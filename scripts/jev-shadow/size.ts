@@ -1,7 +1,5 @@
 /**
- * Metadata-only sizing: how much turn spend produced no delivered reply, or a
- * trivially short one. Reads every group (lengths and counts only), sends
- * NOTHING to TypeSafe, prints no message content.
+ * Turn spend that produced no or a trivially short reply. Metadata only: sends nothing to TypeSafe.
  *
  *   pnpm exec tsx scripts/jev-shadow/size.ts [--since 2026-09-10]
  */

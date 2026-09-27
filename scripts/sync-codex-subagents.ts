@@ -1,13 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * CLI shim — convert every Claude-format subagent `.md` (plugin tree +
- * `~/.claude/agents/`) into a Codex TOML and write to `~/.codex/agents/`
- * (plus every `~/.codex-<folder>/agents/` whose folder has an auth.json).
+ * CLI shim for `syncCodexSubagents()` (src/codex-sync.ts): Claude-format subagents to Codex TOML.
  *
- * Real work lives in `src/codex-sync.ts:syncCodexSubagents()` so the
- * watcher daemon can call it in-process without spawn overhead.
- *
- * Usage:
  *   pnpm exec tsx scripts/sync-codex-subagents.ts
  */
 import { syncCodexSubagents } from '../src/codex-sync.js';

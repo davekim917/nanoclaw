@@ -1,15 +1,8 @@
 /**
- * Can Jev tell a hard request from an easy one well enough to route models?
- *
- * Replay cannot say whether a cheaper model would have SUCCEEDED — that needs a
- * live A/B. It can test the precondition: if Jev's difficulty rating of the
- * incoming message does not even track how much work the turn took on the SAME
- * model, it cannot route, and an A/B is not worth running. Held to one
- * model+effort (the biggest bucket, Opus-high) so the model is not the
- * confound.
- *
- * Human-triggered turns in the focus workgroups (FOCUS_WORKGROUPS, set with
- * JEV_SHADOW_FOCUS).
+ * Does Jev's difficulty rating of a request track how much work the turn took on the SAME model?
+ * If not, it cannot route models. This tests only that precondition: whether a cheaper model would
+ * have succeeded needs a live A/B. Held to one model+effort (Opus-high) so the model is not the
+ * confound. Human-triggered turns in the focus workgroups only.
  *
  *   pnpm exec tsx scripts/jev-shadow/routing.ts [--since 2026-09-10]
  */

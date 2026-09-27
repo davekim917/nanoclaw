@@ -1,11 +1,8 @@
 #!/usr/bin/env tsx
 /**
- * Content-hash gate for the dashboard SPA bundle: hashes the SPA's inputs and restores the
- * bundle from a cache instead of rebuilding when the hash matches.
- *
- * The cache lives under `data/`, outside `dist/`, on purpose: scripts/deploy.sh does
- * `rm -rf dist` before the host `tsc`, so the bundle must be repopulated on every build, hit
- * or miss. `data/*` is gitignored, so the cache cannot trip the prebuild clean-tree guard.
+ * Content-hash gate for the dashboard SPA bundle. The cache lives under gitignored `data/`, outside
+ * `dist/`: deploy.sh does `rm -rf dist` before the host `tsc`, so the bundle is repopulated every
+ * build, hit or miss.
  *
  * Usage:
  *   tsx scripts/build-dashboard-spa.ts            # dev/`build:spa`: build only, never seeds the cache
@@ -20,10 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 import ts from 'typescript';
 
-/**
- * Bump when the set of hashed inputs or the cache layout changes, so old
- * entries can never be mistaken for a match under new rules.
- */
+/** Bump when the hashed inputs or cache layout change. */
 export const CACHE_FORMAT_VERSION = 3;
 
 export const CACHE_KEEP = 3;
@@ -34,20 +28,14 @@ const VITE_ENV_FILES = ['.env', '.env.local', '.env.production', '.env.productio
 const VITE_ENV_REFERENCE = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|([A-Za-z_][A-Za-z0-9_]*))/g;
 type Environment = Record<string, string | undefined>;
 
-/**
- * Test files are inputs too: the SPA build's `tsc` typechecks them, so excluding them would let
- * a test-file type error pass silently on a cache hit.
- */
+/** Test files are inputs: the SPA build's `tsc` typechecks them. */
 
-/**
- * `.gitignore`'s `node_modules/` only matches a real directory, so a symlinked
- * `dashboard/node_modules` shows up as an untracked FILE and would land in the hash.
- */
+/** A symlinked `dashboard/node_modules` is an untracked FILE to git and would land in the hash. */
 export function isDependencyPath(relPath: string): boolean {
   return relPath.split('/').includes('node_modules');
 }
 
-/** Tracked plus untracked-but-not-ignored files, so a new component counts before it is committed. */
+/** Untracked-but-not-ignored files count, so a new component invalidates before it is committed. */
 export function listInputFiles(repoRoot: string): string[] {
   const out = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', 'dashboard'], {
     cwd: repoRoot,
@@ -64,10 +52,8 @@ export function listInputFiles(repoRoot: string): string[] {
 }
 
 /**
- * Repo files outside `dashboard/` that its TypeScript program compiles (relative imports into
- * `src/`): the build typechecks them, so they are inputs. Derived from the program rather than
- * a list; parse + module resolution only, with the host's `typescript` because the dashboard's
- * deps may not be installed yet.
+ * Repo files outside `dashboard/` its TypeScript program compiles. Resolved with the host's
+ * `typescript` because the dashboard's deps may not be installed yet.
  */
 export function listProgramExternalFiles(repoRoot: string): string[] {
   const configPath = path.join(repoRoot, 'dashboard', 'tsconfig.json');
@@ -98,11 +84,7 @@ export function listProgramExternalFiles(repoRoot: string): string[] {
   return [...seen].sort();
 }
 
-/**
- * Hash file CONTENT off disk, not the git object id: `build:spa` can be run
- * directly, without the `prebuild` clean-tree guard, and an uncommitted edit
- * must still invalidate the cache.
- */
+/** CONTENT off disk, not the git object id: `build:spa` runs without the clean-tree guard. */
 export function hashInputs(repoRoot: string, files: string[], env: Environment = process.env): string {
   const h = createHash('sha256');
   h.update(`v${CACHE_FORMAT_VERSION}\n`);
@@ -117,9 +99,7 @@ export function hashInputs(repoRoot: string, files: string[], env: Environment =
     }
     h.update(`${rel}\0${digest}\n`);
   }
-  // Vite loads these files from its project root for `vite build`'s production
-  // mode, then gives any existing VITE_* process setting precedence. They are
-  // ignored locally, so git-visible dashboard inputs alone cannot see them.
+  // Vite loads these ignored env files for `vite build`, so git-visible inputs alone cannot see them.
   const referencedEnvironment = new Set(Object.keys(env).filter((key) => key.startsWith('VITE_')));
   for (const name of VITE_ENV_FILES) {
     const abs = path.join(repoRoot, 'dashboard', name);
@@ -161,9 +141,8 @@ export function isUsableCacheEntry(cacheEntry: string): boolean {
 }
 
 /**
- * Only the `--install` path may seed the cache. deploy.sh runs `build:spa` (no install) BEFORE
- * `build:dashboard --install`; on a dependency bump the first call would cache a bundle built
- * against the previous `node_modules` under the new hash, and the second would restore it.
+ * Only `--install` may seed the cache: deploy.sh runs `build:spa` BEFORE `build:dashboard --install`,
+ * so on a dependency bump the first would cache a bundle built against the old `node_modules`.
  */
 export function decideBuild(opts: {
   hash: string;
@@ -184,10 +163,7 @@ export function restoreFromCache(cacheEntry: string, bundleDir: string): void {
   fs.cpSync(path.join(cacheEntry, 'bundle'), bundleDir, { recursive: true });
 }
 
-/**
- * Stage into a temp dir and rename into place, so a concurrent reader never
- * sees a half-written entry. `meta.json` is written last for the same reason.
- */
+/** Staged in a temp dir and renamed into place, `meta.json` last, so a reader never sees a half-written entry. */
 export function storeInCache(bundleDir: string, cacheEntry: string, hash: string): void {
   const cacheRoot = path.dirname(cacheEntry);
   fs.mkdirSync(cacheRoot, { recursive: true });
@@ -278,8 +254,7 @@ function main(): void {
   }
 
   console.log(`dashboard SPA: ${decision.reason} ${decision.hash.slice(0, 12)} — building`);
-  // Always `dashboard`'s own `build` (`tsc --noEmit && vite build`), never bare `vite build`:
-  // a restore skips the typecheck, so every cached bundle must already be typechecked.
+  // Never bare `vite build`: a restore skips the typecheck, so every cached bundle must be typechecked.
   run('pnpm', ['run', 'build'], dashboardDir);
 
   if (!decision.cacheable) {
@@ -294,8 +269,7 @@ function main(): void {
   console.log(`dashboard SPA: cached ${decision.hash.slice(0, 12)}`);
 }
 
-// fileURLToPath, not `new URL(...).pathname`: the latter stays percent-encoded, so on a path with
-// a space main() would silently never run, after deploy.sh has already removed dist.
+// Not `new URL(...).pathname`: it stays percent-encoded, so on a path with a space main() would never run.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main();
 }

@@ -1,21 +1,12 @@
 #!/usr/bin/env tsx
 /**
- * Daily control-band fleet-health check, run by a systemd timer
- * (data/systemd/nanoclaw-fleet-drift.{service,timer} — reference copies only). No LLM calls.
+ * Daily control-band fleet-health check, run by a systemd timer (data/systemd/ holds reference
+ * copies). Fail-closed: any unreadable source throws, never a silent zero. Banded metrics breach at
+ * median + 3×MAD of the prior days (warm-up below 7 days, except the instruction-stack tripwire). A
+ * breach files one `fleet-drift` issue per metric; an open issue with that title prefix IS the
+ * cooldown, and closing it re-arms.
  *
- * Collects disk usage, ERROR lines in the last 24h and scheduled-task health; fail-closed:
- * any unreadable source throws and main() returns 1, never silently zero. Appends one line to
- * data/fleet-drift/metrics.ndjson. disk_growth_bytes and error_events_24h breach at median +
- * 3×MAD of the prior days; paused_series and failed_streak_max use fixed thresholds. Fewer
- * than 7 prior days → warm-up, but the instruction-stack tripwire (no history) still runs.
- * On breach, files one `fleet-drift` GitHub issue per metric; an open issue with the same
- * title prefix IS the cooldown, and closing it re-arms.
- *
- * FLEET_DRIFT_DRY_RUN=1: writes to a temp path and never calls `gh issue create`; band
- * computation still reads the REAL prior history (read-only).
- *
- *   node_modules/.bin/tsx scripts/fleet-drift.ts
- *   FLEET_DRIFT_DRY_RUN=1 node_modules/.bin/tsx scripts/fleet-drift.ts
+ * FLEET_DRIFT_DRY_RUN=1 writes to a temp path and never files, but still reads the REAL history.
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -43,10 +34,7 @@ export function median(nums: number[]): number {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-/**
- * median + 3×MAD (scaled ×1.4826). When MAD is 0 (flat history) that would flag any nonzero
- * value, so the fallback also requires the gap to exceed `flatZeroGuardAbs`.
- */
+/** MAD scaled ×1.4826. MAD 0 (flat history) would flag any nonzero value, hence `flatZeroGuardAbs`. */
 export function checkBand(value: number, priorValues: number[], flatZeroGuardAbs: number): BandResult {
   const med = median(priorValues);
   const madRaw = median(priorValues.map((v) => Math.abs(v - med)));
@@ -59,12 +47,12 @@ export function checkBand(value: number, priorValues: number[], flatZeroGuardAbs
   return { breach: value > threshold, median: med, madScaled, threshold };
 }
 
-/** A paused series is an absorbing state (see src/modules/scheduling/recurrence.ts) — flag it once it's been sitting unresumed for a few days. */
+/** A paused series is an absorbing state: flag it once it's been sitting unresumed for a few days. */
 export function pausedSeriesBreach(pausedSeries: number, oldestPausedDays: number): boolean {
   return pausedSeries > 0 && oldestPausedDays >= 3;
 }
 
-/** Auto-pause cap is 8 consecutive failures (recurrence.ts SCRIPT_FAIL_PAUSE_CAP) — catch the streak before it pauses itself. */
+/** Below recurrence.ts SCRIPT_FAIL_PAUSE_CAP (8), to catch the streak before it pauses itself. */
 export function failedStreakBreach(failedStreakMax: number): boolean {
   return failedStreakMax >= 6;
 }
@@ -78,10 +66,7 @@ export function isWarmingUp(priorLineCount: number): boolean {
   return priorLineCount < 7;
 }
 
-/**
- * Excludes a series whose newest row is 'cancelled' or 'paused': nothing ever appends a fresh
- * row to reset a dead series' streak, so it would breach forever.
- */
+/** Excludes cancelled/paused series: nothing resets a dead series' streak, so it would breach forever. */
 export function isLiveForStreak(latestStatus: string): boolean {
   return latestStatus !== 'cancelled' && latestStatus !== 'paused';
 }
@@ -91,9 +76,8 @@ export interface PauseState {
 }
 
 /**
- * `pauseTask` never stamps a fresh timestamp, so the DB has no "when paused" signal: track
- * first-observed-paused per series across runs. This LOWER-BOUNDS true pause duration, and a
- * series that resumes and re-pauses starts fresh.
+ * `pauseTask` stamps no timestamp, so first-observed-paused is tracked across runs: a LOWER bound
+ * on pause duration.
  */
 export function advancePauseState(
   prevState: PauseState,
@@ -124,9 +108,8 @@ interface SeriesStat {
 }
 
 /**
- * Per series (keyed by COALESCE(series_id, id)), input ordered by seq DESC. `failedStreak`
- * must match `trailingFailedRuns` in src/modules/scheduling/db.ts: only 'completed'/'failed'
- * rows count, so other statuses neither break nor pad the streak.
+ * Input ordered by seq DESC. `failedStreak` must match `trailingFailedRuns` in
+ * src/modules/scheduling/db.ts: only 'completed'/'failed' rows count.
  */
 export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, SeriesStat> {
   const bySeries = new Map<string, TaskRow[]>();
@@ -150,9 +133,8 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
 }
 
 /**
- * src/log.ts wraps the level tag in ANSI color codes, so ANSI is stripped before matching. The
- * stamp is local wall-clock plus an explicit UTC offset, which `parseLogStamp` turns into an
- * absolute instant; the logger's TZ differs from /etc/localtime, so never assume a zone.
+ * src/log.ts colors the level tag with ANSI; never assume a zone. A legacy line without a UTC offset
+ * still counts, parsed in this process's zone, so its window membership is best-effort.
  */
 // eslint-disable-next-line no-control-regex -- deliberately matches the ANSI CSI escape byte to strip src/log.ts's color codes
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
@@ -197,7 +179,7 @@ function collectErrorEvents24h(logsDir: string, nowMs: number): number {
   return countRecentErrorLines(primary, nowMs) + countRecentErrorLines(rotated, nowMs);
 }
 
-/** Missing state.json (first run ever) is a normal empty state; a present-but-corrupt one is fail-closed like every other source. */
+/** Missing state.json is a normal first run; a present-but-corrupt one fails closed. */
 function readPauseState(p: string): PauseState {
   try {
     return JSON.parse(fs.readFileSync(p, 'utf-8')) as PauseState;
@@ -280,7 +262,6 @@ function loadPriorMetrics(ndjsonPath: string): StoredMetrics[] {
 interface Breach {
   metric: string;
   ruleDescription: string;
-  /** Banded metrics only. The instruction-stack tripwire is a static tree check with no numeric series behind it. */
   todayValue?: number;
   last7RawValues?: number[];
 }
@@ -341,8 +322,7 @@ function detectBreaches(metrics: StoredMetrics, priorMetrics: StoredMetrics[]): 
   return breaches;
 }
 
-// The banned-pattern scan lives in ./instruction-surface.ts so it can be imported without
-// loading this module (and better-sqlite3 with it).
+// The scan lives in ./instruction-surface.ts so it imports without loading better-sqlite3.
 import { scanBannedPatterns } from './instruction-surface.js';
 
 export { scanBannedPatterns };
@@ -391,10 +371,8 @@ interface UnscannableFile {
 }
 
 /**
- * `groups/<name>/` is container-writable: a symlink to a FIFO would hang this process, a huge
- * file or device would exhaust memory, and a symlink outside groups/ crosses the trust
- * boundary. lstat first; follow a symlink only if it stays inside `groupsRootResolved`; read
- * only a regular file under the size cap. `null`: absent; `skip`: exists but unsafe to read.
+ * `groups/<name>/` is container-writable: a FIFO symlink would hang, a huge file exhaust memory, a
+ * symlink outside groups/ cross the trust boundary. `null`: absent; `skip`: exists but unsafe.
  */
 function resolveStandingFile(p: string, groupsRootResolved: string): { realPath: string } | { skip: string } | null {
   let stat: fs.Stats;
@@ -431,7 +409,6 @@ function resolveStandingFile(p: string, groupsRootResolved: string): { realPath:
   return check.ok ? { realPath } : { skip: check.reason };
 }
 
-/** Sanity cap: never read a planted huge file or device into memory. */
 const MAX_STANDING_FILE_BYTES = 1_000_000;
 
 function checkRegularSize(stat: fs.Stats): { ok: true } | { ok: false; reason: string } {
@@ -441,7 +418,6 @@ function checkRegularSize(stat: fs.Stats): { ok: true } | { ok: false; reason: s
   return { ok: true };
 }
 
-/** Symlinks resolve to their real target so a shared file is read and counted once. */
 function readGroupStandingFiles(
   groupDir: string,
   groupsRootResolved: string,
@@ -465,10 +441,7 @@ function readGroupStandingFiles(
   return { files, unscannable };
 }
 
-/**
- * Keyed by resolved real path, not group: siblings symlink some or all standing files to one
- * source, so a shared file's hit is reported once, scoped to every group that reaches it.
- */
+/** Keyed by real path: siblings symlink standing files to one source, so a shared hit reports once. */
 export function checkGroupStandingPatterns(groupsRoot: string): InstructionStackBreach[] {
   if (!fs.existsSync(groupsRoot)) return [];
   const groupsRootResolved = fs.realpathSync(groupsRoot);
@@ -524,8 +497,7 @@ function unscannableBreaches(
   }));
 }
 
-// No longer produced by compose, kept for CLAUDE.md files that predate that change and for a
-// hand-written `@/app/...` import. Keep in sync with compose's host paths if those move.
+// Kept for older CLAUDE.md files and hand-written `@/app/...` imports; keep in sync with compose's host paths.
 const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => ({
   '/app/CLAUDE.md': path.join(repoRoot, 'container', 'CLAUDE.md'),
   '/app/skills': path.join(repoRoot, 'container', 'skills'),
@@ -533,9 +505,8 @@ const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => 
 });
 
 /**
- * Which provider reads this group's composed doc (absent or `'default'` means claude). An
- * unsafe or malformed container.json returns `skip`, never a guess: source selection depends
- * on it.
+ * Absent or `'default'` means claude. An unsafe or malformed container.json returns `skip`, never a guess.
+ * Group config only: a session-level provider override applied at spawn is outside this scan.
  */
 function readGroupProvider(groupDir: string, groupsRootResolved: string): { provider: string } | { skip: string } {
   const p = path.join(groupDir, 'container.json');
@@ -564,10 +535,7 @@ function readGroupProvider(groupDir: string, groupsRootResolved: string): { prov
   return { provider: (rawProvider || 'claude').toLowerCase() };
 }
 
-/**
- * `flattenClaudeMd`'s `validateRead` gate: every hop of a group's @-import chain is as
- * untrusted as a top-level standing file. Violations are recorded into `unscannable`.
- */
+/** Every hop of a group's @-import chain is as untrusted as a top-level standing file. */
 function makeFlattenGuard(
   group: string,
   allowedRoots: string[],
@@ -583,8 +551,7 @@ function makeFlattenGuard(
       throw err;
     }
     if (lst.isSymbolicLink()) {
-      // Dangling and non-regular (e.g. FIFO) targets both land here and are both treated as
-      // unscannable: never read, and a dangling fragment is itself a staleness signal.
+      // Dangling and non-regular (e.g. FIFO) targets are unscannable: never read.
       const reason = 'symlink does not resolve to a readable regular file (dangling target or non-regular type)';
       unscannable.push({ group, path: realPath, reason });
       return reason;
@@ -605,9 +572,8 @@ function makeFlattenGuard(
 }
 
 /**
- * Codex/opencode read AGENTS.md alone. Claude walks CLAUDE.md's own @-import chain plus any
- * CLAUDE.local.md, which Claude Code auto-discovers. The flatten output is discarded: the call
- * is made for its `validateRead` gate.
+ * Codex/opencode read AGENTS.md alone; Claude walks CLAUDE.md's @-import chain plus any
+ * CLAUDE.local.md. The flatten output is discarded: the call is made for its `validateRead` gate.
  */
 function scanEffectiveStack(groupDir: string, groupsRootResolved: string): UnscannableFile[] {
   const group = path.basename(groupDir);
@@ -649,10 +615,7 @@ function scanEffectiveStack(groupDir: string, groupsRootResolved: string): Unsca
   return unscannable;
 }
 
-/**
- * Safety walk of the composed doc each container agent receives. No banned-pattern scan: that
- * content was already scanned at its source, and re-scanning would double-report.
- */
+/** No banned-pattern scan here: the content was scanned at its source, and re-scanning would double-report. */
 export function checkEffectiveStackSafety(groupsRoot: string): InstructionStackBreach[] {
   if (!fs.existsSync(groupsRoot)) return [];
   const groupsRootResolved = fs.realpathSync(groupsRoot);

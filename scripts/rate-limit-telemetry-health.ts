@@ -1,19 +1,12 @@
 /**
- * Read-path health for rate-limit telemetry (`rate_limit_samples`). Rows come from a PUSH
- * (`rate_limit_event`, volunteered mid-turn) and a READING (`usage_pull` for Codex,
- * `rate_limit_headers` for Claude). Both readings are fail-open, so a dead read path leaves no
- * error anywhere while push rows keep the table looking alive.
+ * Read-path health for rate-limit telemetry: an (agent group, `credential_set`) pair that is
+ * PUSHING (`rate_limit_event`) inside the window but has landed NO reading row (`usage_pull`,
+ * `rate_limit_headers`). Both readings are fail-open, so a dead read path leaves no error anywhere
+ * while push rows keep the table looking alive. Silence never fires.
  *
- * THE SIGNAL: an (agent group, `credential_set`) pair that is PUSHING inside the window but
- * has landed NO reading row in it. It does not fire on silence (idle, OpenCode and quiet
- * pairs are indistinguishable), and a pull row counts whatever its `status`.
- *
- * ERRORS ARE NEVER ZEROS, in the filesystem walk as much as the DB reads: every unlistable
- * directory, unstattable path, unopenable DB and failed query is counted under its own code.
- * A DB with no `rate_limit_samples` table (`noTable`) predates it and is evidence of nothing.
- *
- * Opens are `readonly` + `PRAGMA query_only=ON`: a read-only open never replays a rollback
- * journal, so this cannot alter a session DB.
+ * ERRORS ARE NEVER ZEROS: every unlistable directory, unstattable path, unopenable DB and failed
+ * query is counted under its own code. Opens are `readonly` + `query_only`, which never replay a
+ * rollback journal.
  */
 /* eslint-disable no-catch-all/no-catch-all -- an unreadable or malformed session DB must become an explicit counted error, never a silent zero; that is the defect this script exists to catch */
 import fs from 'node:fs';
@@ -30,10 +23,10 @@ const EXIT_OK = 0;
 const EXIT_SCAN_FAILED = 1;
 const EXIT_USAGE = 2;
 
-/** Cap on findings embedded in `--gate` data, which is injected into a prompt. */
+/** Findings embedded in `--gate` data are injected into a prompt. */
 const GATE_FINDING_LIMIT = 20;
 
-/** How long a quiet `--gate` result may stand: daily, with two hours' slack. */
+// Daily cadence plus two hours' slack.
 const GATE_BOUND = '26h';
 
 type PairVerdict =
@@ -55,7 +48,6 @@ interface TelemetryPair {
 }
 
 type ScanErrorCode =
-  /** A group directory could not be listed — every session under it is invisible. */
   | 'group_unlistable'
   /** An `outbound.db` path could not be stat'd for a reason other than ENOENT. */
   | 'db_unstattable'
@@ -85,7 +77,6 @@ export interface TelemetryHealthReport {
     noTable: number;
     /** DB paths that failed to stat, open or query. Never folded into a zero. */
     errored: number;
-    /** Group directories that could not be listed — a blind spot, not an absence. */
     unlistableDirs: number;
   };
   pairs: TelemetryPair[];
@@ -103,10 +94,9 @@ const openReadOnly: OpenSessionDb = (file) => {
 
 export interface ScanOptions {
   sessionsRoot: string;
-  /** Inclusive lower bound, ISO-8601 UTC. */
+  /** Inclusive, ISO-8601 UTC. */
   sinceIso: string;
   windowHours: number;
-  /** Push rows a pair needs in the window before it can be judged at all. */
   minPushes: number;
   now?: Date;
   openDb?: OpenSessionDb;
@@ -128,20 +118,13 @@ interface PerSessionRow {
   last_push_in_window: string | null;
 }
 
-/** Either reading source landing counts as the read path working. */
 const READING_SOURCES = ['usage_pull', 'rate_limit_headers'] as const;
 const READING_SOURCES_SQL = READING_SOURCES.map((s) => `'${s}'`).join(', ');
 
-/**
- * A push that can be judged: an API-key, Bedrock or Vertex Claude session has no credential
- * set and never carries header windows, so it has no reading to be missing.
- */
+/** An API-key, Bedrock or Vertex Claude session has no credential set and no reading to be missing. */
 const JUDGED_PUSH_SQL = `source = 'rate_limit_event' AND NOT (account IS NULL AND credential_set IS NULL)`;
 
-/**
- * `datetime()` answers NULL for a value it cannot parse, and `NULL >= x` is false, so a
- * malformed `ts` would silently drop out of both counts; `UNPARSABLE_TS_SQL` makes it an error.
- */
+/** `datetime()` answers NULL for an unparseable `ts`, which would silently drop out of both counts. */
 const PER_SESSION_SQL = `
   SELECT credential_set,
          SUM(CASE WHEN ${JUDGED_PUSH_SQL} AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END)                    AS push_rows,
@@ -159,9 +142,9 @@ const TABLE_PRESENT_SQL = `SELECT name FROM sqlite_master WHERE type = 'table' A
 type DirListing = { names: string[] } | { error: string };
 
 /**
- * THE ONE PLACE A DIRECTORY IS LISTED. Returns a union, never a bare array: `[]` and "could not
- * look" must differ, or an unlistable directory reads as empty and healthy. A symlinked entry
- * stays a candidate so a non-directory target fails loudly later instead of vanishing.
+ * THE ONE PLACE A DIRECTORY IS LISTED. A union, never a bare array: an unlistable directory must not
+ * read as empty and healthy. A symlink stays a candidate so a non-directory target fails loudly
+ * later instead of vanishing.
  */
 function listSubdirectories(dir: string): DirListing {
   let entries: fs.Dirent[];
@@ -180,10 +163,7 @@ function listSubdirectories(dir: string): DirListing {
 
 type DbProbe = { present: boolean } | { error: string };
 
-/**
- * `statSync`, NOT `fs.existsSync`: existsSync answers `false` for EACCES too, hiding an
- * untraversable session. ENOENT is the only genuine "no".
- */
+/** `statSync`, NOT `existsSync`: existsSync answers `false` for EACCES too. */
 function probeSessionDb(file: string): DbProbe {
   try {
     fs.statSync(file);
@@ -194,10 +174,7 @@ function probeSessionDb(file: string): DbProbe {
   }
 }
 
-/**
- * Written as an escape, never a literal NUL byte: a literal one makes this file binary to
- * `grep` and `rg`, which then silently return nothing over it.
- */
+/** An escape, never a literal NUL byte: that makes this file binary to `grep`/`rg`, which then skip it. */
 const KEY_SEP = '\u0000';
 
 /** A literal 'null' credential_set and a SQL NULL must not collapse together. */
@@ -207,7 +184,6 @@ function pairKey(agentGroup: string, credentialSet: string | null): string {
 
 const VERDICT_ORDER: Record<PairVerdict, number> = { never: 0, stale: 1, ok: 2 };
 
-/** Walks `<sessionsRoot>/<agent group>/<session>/outbound.db`, the two levels `sessionDir()` writes. */
 export function scanRateLimitTelemetry(options: ScanOptions): TelemetryHealthReport {
   const { sessionsRoot, sinceIso, windowHours, minPushes } = options;
   const openDb = options.openDb ?? openReadOnly;
@@ -217,8 +193,7 @@ export function scanRateLimitTelemetry(options: ScanOptions): TelemetryHealthRep
   const pairs = new Map<string, { credentialSet: string | null; agentGroup: string; acc: PairAccumulator }>();
   const counts = { agentGroups: 0, sessionDbs: 0, withTable: 0, noTable: 0, errored: 0, unlistableDirs: 0 };
 
-  // An unlistable ROOT leaves no coverage at all, so it throws rather than reporting
-  // "0 groups, 0 findings"; under `--gate` that still wakes someone.
+  // An unlistable ROOT throws rather than reporting "0 groups, 0 findings".
   const rootListing = listSubdirectories(sessionsRoot);
   if ('error' in rootListing) {
     throw new Error(`sessions root is not listable: ${sessionsRoot} — ${rootListing.error}`);
@@ -345,10 +320,7 @@ export function windowStart(hours: number, now: Date = new Date()): string {
   return new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
 }
 
-/**
- * The host-gated task-script contract: the LAST stdout line is `{wakeAgent, data}`, and a
- * quiet line declares an `empty` observation. A failed scan wakes too.
- */
+/** Host-gated task-script contract: the LAST stdout line is `{wakeAgent, data}`. A failed scan wakes too. */
 export function gateResult(report: TelemetryHealthReport): {
   wakeAgent: boolean;
   observation?: { kind: 'empty'; evidence: string; bound: string };
@@ -515,8 +487,7 @@ export function main(argv: string[]): number {
       now,
     });
   } catch (err) {
-    // A broken checker must still wake someone and exit 0: a non-zero exit makes the host
-    // discard the fire entirely, which is silence again.
+    // Must wake someone and exit 0: a non-zero exit makes the host discard the fire entirely.
     if (parsed.format === 'gate') {
       console.log(
         JSON.stringify({

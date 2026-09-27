@@ -1,12 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * Public repository boundary checker.
- *
- * Portable checks use structural patterns and require no install state.
- * Install-aware checks additionally compare tracked content with identifiers
- * derived from the local registry and an ignored operator-maintained file.
- *
- * Findings intentionally omit the matched value.
+ * Public repository boundary checker. Install-aware checks add identifiers derived from the local
+ * registry and an ignored operator-maintained file. Findings intentionally omit the matched value.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -49,21 +44,12 @@ export interface ScanOptions {
   portable: boolean;
   allowStructural: boolean;
   dbPath?: string;
-  // Undefined means "not explicitly requested" — run() resolves the default
-  // local path, falling back to the main checkout when the worktree has none.
-  // An explicit --identifiers value always wins over that fallback.
+  // Undefined: resolve the local default, then the main checkout's.
   identifiersPath?: string;
   allowlistPath: string;
-  // Scan ONE text file instead of the tracked tree. Set by --message, which
-  // the commit-msg hook points at git's message file. Commit messages are part
-  // of what a fork publishes upstream — history travels with the branch — but
-  // they are not tracked files, so the file scan never saw them. On
-  // 2026-08-25 a message naming a real group folder and an install's OAuth
-  // slot arrangement committed clean while the gate rejected the same
-  // identifier in the diff.
+  // Scan ONE text file (the commit-msg hook's message file): messages publish with the branch.
   messagePath?: string;
-  // A committed message is serialized history, not an editor buffer. Unlike
-  // the commit-msg input, its scissors and comment text must be scanned.
+  // A committed message is history, not an editor buffer: scan its scissors and comment text too.
   messageRaw: boolean;
   baselinePath?: string;
   writeBaseline: boolean;
@@ -74,8 +60,7 @@ const DEFAULT_DB_RELATIVE = path.join('data', 'v2.db');
 const DEFAULT_IDENTIFIERS_RELATIVE = path.join('.nanoclaw', 'public-boundary-identifiers');
 const DEFAULT_BASELINE_RELATIVE = '.public-boundary-baseline.json';
 
-// A repository name built only from these words names a kind of repository,
-// not a client, and would match ordinary prose across the whole tree.
+// A repository name built only from these words names a kind of repository, not a client.
 const GENERIC_REPOSITORY_WORDS = new Set([
   'admin',
   'agent',
@@ -139,9 +124,7 @@ const GENERIC_REPOSITORY_WORDS = new Set([
   'wiki',
 ]);
 
-// A three-letter all-caps name normally matches as a bare word (see
-// normalizedIdentifierPattern). These acronyms appear throughout ordinary
-// code, so a client repository named after one keeps the contextual match.
+// Three-letter acronyms common in code: a name matching one keeps the contextual match, not bare-word.
 const COMMON_ACRONYMS = new Set([
   'api',
   'app',
@@ -180,17 +163,10 @@ const GENERIC_IDENTIFIERS = new Set([
   'agent',
   'claude',
   'codex',
-  // Same shape as 'dispatch' below: a Slack channel named "#commercial" put a
-  // common English word in the registry-derived set, where it matched ordinary
-  // prose in long-committed vendored design docs and blocked every commit. The
-  // channel's platform ID stays banned.
+  // Common words that can also be channel names; the channel's platform ID stays banned.
   'commercial',
   'dbt cloud',
   'discord',
-  // Common orchestration term (src/modules/orchestrator-dispatch/ and
-  // dispatch.ts throughout). A Slack channel renamed to "#dispatch" put it
-  // in the registry-derived set and blocked every commit with ~154 hits in
-  // long-committed code. The channel's platform ID stays banned.
   'dispatch',
   'general',
   'github actions',
@@ -209,11 +185,7 @@ const GENERIC_IDENTIFIERS = new Set([
   'discord-opencode',
   'cli:local',
   'cli:test-driver',
-  // Slack's built-in bot; ingress auto-creates a user row named this in any
-  // install with a Slack workspace, and it collides with generic camelCase
-  // `slackBot` variables in channel code. Universal, not install-specific.
-  // Same for its platform ID: USLACKBOT is identical in every workspace and
-  // appears as a literal in adapter filter code.
+  // Slack's built-in bot and its platform ID: identical in every workspace, not install-specific.
   'slackbot',
   'uslackbot',
 ]);
@@ -295,8 +267,7 @@ function normalizedIdentifierPattern(value: string): RegExp | null {
   const tokens = value.match(/[A-Za-z0-9]+/g) ?? [];
   if (tokens.length === 0) return null;
   const normalizedLength = tokens.reduce((sum, token) => sum + token.length, 0);
-  // An all-caps three-letter name is a product or code name; the contextual
-  // rule below let one appear hundreds of times in tracked files unflagged.
+  // An all-caps three-letter name is a product or code name: match it as a bare word.
   if (/^[A-Z][A-Z0-9]{2}$/.test(value) && !COMMON_ACRONYMS.has(value.toLowerCase())) {
     return new RegExp(`(^|[^A-Za-z0-9])${value}(?=$|[^A-Za-z0-9])`, 'gi');
   }
@@ -340,10 +311,7 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
     'SELECT id, display_name FROM workgroups',
     'SELECT id, name, folder, workgroup_id FROM agent_groups',
     'SELECT id, platform_id, instance, name FROM messaging_groups',
-    // system:* rows are synthetic senders minted when a host script DMs via
-    // the CLI socket (health-sentinel, drift-check, ...). Their ids are
-    // constants IN tracked scripts — treating them as install-private would
-    // make the boundary check flag the very script that authors them.
+    // system:* ids are constants in tracked host scripts, not install-private.
     "SELECT id, display_name FROM users WHERE id NOT LIKE 'system:%'",
     'SELECT assistant_name FROM container_configs',
   ];
@@ -379,13 +347,7 @@ const NETWORK_REMOTES = [
   new RegExp(`^git@(${REMOTE_HOST}):(${REMOTE_NAME})/(${REMOTE_NAME})$`),
 ];
 
-/**
- * What a remote URL names. Only `https://<host>/<owner>/<repo>[.git]` and
- * `git@<host>:<owner>/<repo>[.git]` are network remotes, yielding host, owner,
- * repository and an exact identity key (case-folded only on github.com, whose
- * paths are case-insensitive); an absolute path or file:// URL is local.
- * Everything else is unsupported: what it names is unknown.
- */
+/** The key is case-folded only on github.com, whose paths are case-insensitive. */
 export function parseRemote(url: string): ParsedRemote {
   const trimmed = url.trim();
   if (trimmed.startsWith('/') || trimmed.startsWith('file://')) return { kind: 'local' };
@@ -415,9 +377,8 @@ function repositoryNeutralEnv(): NodeJS.ProcessEnv {
 
 type RemoteUrl = { kind: 'url'; url: string } | { kind: 'absent' } | { kind: 'unreadable' };
 
-// Git resolves its own config (include.path, includeIf, url.*.insteadOf);
-// discovery never parses it. Exit 2 is git's "no such remote"; anything else
-// (an unreadable config or include, a refused repository, a timeout) is unknown.
+// Git resolves its own config (includes, insteadOf); never parse it. Exit 2 is "no such remote";
+// anything else is unknown.
 function remoteUrl(dir: string, name: string, env: NodeJS.ProcessEnv): RemoteUrl {
   const result = runGit(['remote', 'get-url', name], dir, env);
   if (result.status === 0 && result.stdout.trim()) return { kind: 'url', url: result.stdout.trim() };
@@ -450,11 +411,7 @@ export function publicRemotes(roots: string[]): PublicRemotes {
   return remotes;
 }
 
-/**
- * The install checkout that holds `dbPath`, only for the `<install>/data/<db>`
- * layout. An explicit registry elsewhere names no checkout: its grandparent
- * must not contribute groups, clones, or public remotes.
- */
+/** Only for the `<install>/data/<db>` layout: a registry elsewhere names no checkout. */
 function installRootOf(dbPath: string): string | null {
   const dataDir = path.dirname(path.resolve(dbPath));
   return path.basename(dataDir) === 'data' ? path.dirname(dataDir) : null;
@@ -480,9 +437,7 @@ function isMissingSchema(err: unknown): boolean {
   return err instanceof Error && /^no such (?:table|column)\b/.test(err.message);
 }
 
-// The one read path for every discovery input. Absent is fine: an install need
-// not have groups or clones. Any other failure means a source exists but its
-// names are unknown, and the caller must count discovery incomplete.
+// Absent is fine; any other failure means a source's names are unknown and discovery is incomplete.
 function readSource<T>(read: () => T, isAbsent: (err: unknown) => boolean = isMissingPath): SourceRead<T> {
   try {
     return { ok: true, value: read() };
@@ -499,12 +454,8 @@ function listSource(dir: string, problems: string[], what: string): string[] {
 }
 
 /**
- * Names the install holds outside the registry tables: agent persona names
- * from each group's container.json, and the owner and name of every cloned
- * client repository. Derived rather than listed by hand, so a new client is
- * covered the moment its group or repository exists. A source that exists but
- * cannot be read is recorded in `problems` (never by name) rather than
- * silently contributing nothing.
+ * Persona names from each group's container.json and every cloned repository's owner and name.
+ * An unreadable source is recorded in `problems` (never by name).
  */
 export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, problems: string[]): Set<string> {
   const identifiers = new Set<string>();
@@ -536,8 +487,7 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
         if (!isClone.absent) problems.push('a cloned repository could not be read');
         continue;
       }
-      // Without the ceiling, git run in a clone whose .git vanished answers for
-      // the enclosing checkout instead.
+      // Without the ceiling, a clone whose .git vanished answers for the enclosing checkout.
       const origin = remoteUrl(clone, 'origin', {
         ...repositoryNeutralEnv(),
         GIT_CEILING_DIRECTORIES: path.dirname(clone),
@@ -673,16 +623,11 @@ export function scanInputs(
     }
 
     for (const { identifier, pattern } of identifierPatterns) {
-      // The serialized-allowlist exemption matters here too: a registry-derived
-      // name (e.g. a workgroup) can only be allowlisted by writing its value
-      // into .public-boundary-allowlist.json, which this same scan then reads.
-      // The exemption covers exactly the values owner-reviewed via entries —
-      // any other private identifier inside the file still flags (see test).
+      // The allowlist file itself holds allowlisted values; any other identifier in it still flags.
       if (isAllowed(input.file, identifier, allowlist) || isSerializedAllowlistValue(input.file, identifier, allowlist))
         continue;
       if (!pattern) continue;
-      // Every matching line, not just the first: the baseline ratchet counts
-      // lines, so a second occurrence in an already-baselined file must raise it.
+      // Every matching line: the baseline ratchet counts lines.
       for (const match of content.matchAll(pattern)) {
         addFinding(findings, {
           file: input.file,
@@ -760,10 +705,7 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
 
 type IdentifierOrigin = 'explicit' | 'local' | 'main-checkout' | 'none';
 
-// A linked worktree shares the main checkout's git dir, so `--git-common-dir`
-// finds it with no configuration. Returns null (never throws) whenever that
-// can't be established — git failure, or this root already IS the main
-// checkout — so callers fall back to today's local-only behaviour.
+// Null (never throws) on git failure or when this root already IS the main checkout.
 function findMainCheckoutRoot(root: string): string | null {
   let commonDir: string;
   try {
@@ -775,11 +717,8 @@ function findMainCheckoutRoot(root: string): string | null {
   return candidateRoot === path.resolve(root) ? null : candidateRoot;
 }
 
-// Explicit path wins outright (and stays fail-closed: a bad explicit path
-// throws, same as before). Otherwise try the local default, then the main
-// checkout's copy of that same default. An unusable/missing source at any
-// step is a soft miss, not an error, so a broken local file can't block
-// resolution reaching the fallback.
+// A bad explicit path throws; a missing or broken default is a soft miss, so it can't block the
+// main-checkout fallback.
 function resolveIdentifierSet(
   explicitPath: string | undefined,
   root: string,
@@ -820,11 +759,7 @@ export interface RunReport {
   discoveryProblems: string[];
 }
 
-/**
- * Per-file ratchet over pre-existing private-identifier lines: paths and line
- * counts only, never the values. A file may keep at most its recorded count;
- * a file absent from the baseline may hold none.
- */
+/** Per-file private-identifier line counts, never values; a file absent from it may hold none. */
 export interface Baseline {
   files: Record<string, number>;
 }
@@ -887,10 +822,8 @@ function readBlob(root: string, objectId: string, env: NodeJS.ProcessEnv): strin
   return blob.stdout;
 }
 
-// Same environment as trackedInputs: a partial commit's temporary index is
-// what will be committed, so the baseline must come from it too. Pathspecs are
-// literal and case-sensitive, and only the exact path, as a regular file at
-// stage 0, is policy: a directory, a symlink, or another spelling grants nothing.
+// From the index a partial commit will commit. Only the exact path as a regular stage-0 file is
+// policy: a directory, symlink, or another spelling grants nothing.
 function readIndexBaseline(root: string): string | null {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_LITERAL_PATHSPECS: '1' };
   delete env.GIT_ICASE_PATHSPECS;
@@ -925,10 +858,8 @@ function readWorktreeBaseline(root: string): string | null {
 }
 
 /**
- * Explicit --baseline wins and must exist. Otherwise the scanned tree's own
- * copy (its index for an index scan, since that is what will be committed).
- * A tree without one borrows nothing — no other branch, ref or working copy
- * is authoritative for it — so every private-identifier line it holds fails.
+ * Explicit --baseline must exist. Otherwise the scanned tree's own copy; a tree without one
+ * borrows nothing, so every private-identifier line it holds fails.
  */
 function loadBaseline(options: ScanOptions): Baseline | null {
   if (options.baselinePath) {
@@ -987,58 +918,14 @@ const EMPTY_BASELINE_OUTCOME: BaselineOutcome = {
 };
 
 /**
- * Git only strips `#` lines on the EDITOR path.
- *
- * `git commit -m` (and `-F`) use cleanup mode `whitespace`, which keeps
- * comment lines verbatim — verified against git 2.43.0: a `-F` message whose
- * body contains `#\tmodified: …`, `# <identifier>` and a scissors line comes
- * back out of `git log` byte for byte. Only the editor path uses cleanup
- * `default` (plus scissors under `-v`), which discards them. So blanking
- * every `#` line unconditionally is fail-OPEN: an identifier prefixed with
- * `#` and passed to `-m` ships while the gate prints "passed".
- *
- * Scanning every `#` line instead is fail-CLOSED but false-positives on git's
- * own editor template, which names the branch and lists every staged path — a
- * guaranteed block for an install with group-named directories, and a blocked
- * gate gets disabled with --no-verify, which checks nothing at all.
- *
- * The commit-msg hook is handed only the message file, never the invocation
- * (git passes the source to prepare-commit-msg, not to us), so the path has to
- * be inferred from content. Two rounds of this were bypassable because they
- * inferred it for the WHOLE FILE from a single marker anywhere in it:
- *
- *   - a `-m` body containing one `#\t` line blanked every other `#` line,
- *     including `# person@example.com` further down;
- *   - a `-m` body containing a scissors LOOKALIKE (`# --- >8 ---`) truncated
- *     everything below it out of the scan.
- *
- * Both are fixed by narrowing what a marker licenses:
- *
- *   1. Scissors must be git's own line EXACTLY — `# ` + 24 dashes + ` >8 ` +
- *      24 dashes (builtin/commit.c; verified against 2.43.0). A loose `-+`
- *      pattern is a one-line, hand-typeable way to hide a message tail.
- *   2. The template is a CONTIGUOUS TRAILING comment block, and it is only
- *      treated as one if it contains a bare `#` line. Git's template always
- *      has them (verified for staged, unstaged, `--allow-empty`, and `-v`
- *      commits) and always sits at the end of the file; `#` lines that appear
- *      anywhere else are the author's and get scanned.
- *
- * Rule 2 also fixes the mirror-image false positive: `--allow-empty` produces
- * a template with no `#\t` line and no scissors, so the previous marker set
- * missed it and scanned `# On branch <branch>` — a branch named after a
- * registry identifier blocked the commit.
- *
- * Two residual fail-opens are accepted deliberately, both requiring the author
- * to reproduce git's own template shape in a `-m` body: an identifier written
- * ON a `#\t` line inside a trailing block, and an identifier inside a trailing
- * comment block that also contains a bare `#` line. The alternative is
- * scanning git's template, whose false positives are not rare-and-contrived
- * but routine — and a gate that blocks routine commits is a gate that gets
- * turned off. Do NOT "simplify" this predicate in either direction; each half
- * is load-bearing against a bypass that shipped.
- *
- * Blanking rather than removing keeps reported line numbers matching the file
- * the author sees in their editor.
+ * Git strips `#` lines only on the EDITOR path: `-m`/`-F` keep them verbatim, so blanking every
+ * `#` line is fail-open, while scanning git's own template (branch name, staged paths) blocks
+ * routine commits. The hook sees only the file, so the template is inferred narrowly: scissors
+ * must be git's exact line, and only a CONTIGUOUS TRAILING comment block containing a bare `#`
+ * line is blanked. Accepted residual fail-open: a `-m` body that reproduces that trailing-block
+ * shape escapes the scan, because scanning git's template instead blocks routine commits. Do NOT
+ * "simplify" this in either direction. Blanking, not removing, keeps line numbers matching the
+ * author's editor.
  */
 const GIT_SCISSORS = /^# -{24} >8 -{24}$/m;
 const GIT_BARE_COMMENT = /^#[ \t]*$/;
@@ -1046,14 +933,10 @@ const GIT_BARE_COMMENT = /^#[ \t]*$/;
 function commitMessageInput(messagePath: string, rawMode: boolean): ScanInput {
   const raw = fs.readFileSync(messagePath, 'utf8');
   if (rawMode) return { file: path.basename(messagePath), content: Buffer.from(raw, 'utf8') };
-  // `commit -v` appends the staged diff below the scissors rule, un-prefixed.
-  // Git discards everything from that line down, so it never ships — and
-  // pre-commit already gates that same content under its real filenames.
+  // Git discards everything below the scissors; pre-commit gates that diff under its real filenames.
   const scissors = raw.search(GIT_SCISSORS);
   const lines = (scissors === -1 ? raw : raw.slice(0, scissors)).split('\n');
 
-  // Walk back over the trailing run of comment and blank lines: that, and
-  // only that, is where git's template can live.
   let blockStart = lines.length;
   while (blockStart > 0) {
     const line = lines[blockStart - 1];
@@ -1142,11 +1025,7 @@ export function runReport(options: ScanOptions): RunReport {
   return { ...base, findings, baseline: outcome };
 }
 
-/**
- * Rewrite the baseline from the current scan. Without --accept-growth it only
- * ratchets down: each file keeps the lower of its recorded and current count,
- * and a file above its recorded count is refused rather than absorbed.
- */
+/** Without --accept-growth it only ratchets down; a file above its count is refused, not absorbed. */
 export function writeBaseline(options: ScanOptions): { written: string; refused: string[] } {
   const report = runReport(options);
   if (report.mode !== 'install-aware' || report.registryOrigin === 'none' || report.identifiersOrigin === 'none') {
@@ -1232,8 +1111,7 @@ export function main(argv = process.argv.slice(2)): number {
       process.stderr.write(
         `WARNING: install-aware checks are incomplete; ${report.discoveryProblems.join('; ')} — names from those sources will NOT be caught\n`,
       );
-      // A message scan gates publication too: a tag annotation on an already
-      // published commit is the only thing its push scans.
+      // A message scan gates publication too (a tag annotation is all its push scans).
       if ((options.index || options.messagePath) && !options.allowStructural) {
         process.stderr.write(
           'public boundary check failed: gating scans require every install identifier source to be readable\n',
