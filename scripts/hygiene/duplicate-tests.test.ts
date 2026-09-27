@@ -71,6 +71,18 @@ it('wider', () => {
     expect(duplicates(keeper, `${keeper}${added}\n`)).toEqual([]);
   });
 
+  it('does not flag a case that calls a different import and shadows a name only in a nested block', () => {
+    const a = "it('a', () => {\n  expect(f(1)).toBe(2);\n  { const f = 0; }\n});\n";
+    const b = "it('b', () => {\n  expect(g(1)).toBe(2);\n  { const g = 0; }\n});\n";
+    expect(duplicates(a, a + b)).toEqual([]);
+  });
+
+  it('ignores every case inside a skipped suite', () => {
+    const copy =
+      "describe.skip('off', () => {\n  it('copy', () => {\n    const out = f(1);\n    expect(out).toBe(2);\n  });\n});\n";
+    expect(duplicates(keeper, keeper + copy)).toEqual([]);
+  });
+
   it('does not treat a skipped case as the keeper', () => {
     const skipped = keeper.replace("it('keeper'", "it.skip('keeper'");
     const copy = "it('copy', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n});\n";
