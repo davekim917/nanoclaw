@@ -259,6 +259,17 @@ describe('the form', () => {
     expect(await hooks.submit(intakeId, 'UOWNER', SECRET)).toMatchObject({ ok: false });
   });
 
+  it('writes once when two submits race past the authority check', async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    const results = await Promise.all([
+      hooks.submit(intakeId, 'UOWNER', SECRET),
+      hooks.submit(intakeId, 'UOWNER', SECRET),
+    ]);
+    await settle();
+    expect(results.filter((r) => r.ok)).toHaveLength(1);
+    expect(h.createCalls).toHaveLength(1);
+  });
+
   it('rotates by value only', async () => {
     h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
     const { intakeId } = await startSecretIntake({

@@ -392,6 +392,9 @@ export function secretIntakeHooks(channelType: string): SecretIntakeHooks {
       const trimmed = value.trim();
       if (!trimmed) return { ok: false, message: 'Paste the secret value.' };
       if (/\s/.test(trimmed)) return { ok: false, message: 'Paste only the key: it contains spaces or line breaks.' };
+      // Re-read after the authority await: a concurrent submit may have claimed it, and must not write twice.
+      if (intake.status !== 'pending')
+        return { ok: false, message: `This secret request is already ${intake.status}.` };
       intake.status = 'storing';
       completeIntake(intake, trimmed).catch((err) => {
         log.error('Secret intake: completion failed', { intakeId: intake.id, err });
