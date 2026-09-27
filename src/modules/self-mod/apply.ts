@@ -14,11 +14,7 @@
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import {
-  getContainerConfig,
-  updateContainerConfigJson,
-  updateContainerConfigScalars,
-} from '../../db/container-configs.js';
+import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { getDenialFor } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
@@ -30,6 +26,7 @@ import {
   type ParsedMcpServerConfig,
   updateContainerConfig,
   validateMcpServerName,
+  writeContainerConfigScalars,
 } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -265,9 +262,7 @@ export async function performModelChange(
     return;
   }
 
-  const updates: Parameters<typeof updateContainerConfigScalars>[1] = { model: slug };
-  if (effort) updates.effort = effort;
-  await updateContainerConfigScalars(agentGroup.id, updates);
+  await writeContainerConfigScalars(agentGroup.id, agentGroup.folder, { model: slug, effort: effort || undefined });
 
   log.info('Model change applied', {
     agentGroupId: session.agent_group_id,

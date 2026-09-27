@@ -40,10 +40,11 @@ import { readContainerConfig, writeContainerConfig } from '../../container-confi
 import { writeSessionMessage } from '../../session-manager.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
+import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { addDeniedModel } from '../../db/denied-models.js';
 import { createSession } from '../../db/sessions.js';
 import type { Session } from '../../types.js';
-import { applyAddMcpServer } from './apply.js';
+import { applyAddMcpServer, performModelChange } from './apply.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -193,5 +194,44 @@ describe('applyAddMcpServer', () => {
 
     await expect(applyAddMcpServer(payload, session)).resolves.toBeUndefined();
     expect(readContainerConfig('agent').mcpServers.bad).toBeUndefined();
+  });
+});
+
+describe('performModelChange', () => {
+  beforeEach(async () => {
+    await updateContainerConfigScalars('ag-1', { provider: 'codex' });
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), provider: 'codex' });
+  });
+
+  it('writes the model and effort to container.json, which the respawned container boots from', async () => {
+    await performModelChange(session, 'gpt-6-sol', 'high', vi.fn());
+
+    const file = readContainerConfig('agent');
+    expect(file.model).toBe('gpt-6-sol');
+    expect(file.effort).toBe('high');
+    expect(file.onecliSecrets).toEqual(['Keep-Me']);
+    const row = (await getContainerConfig('ag-1'))!;
+    expect([row.model, row.effort]).toEqual(['gpt-6-sol', 'high']);
+  });
+
+  it('keeps the existing effort when none is given', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), effort: 'medium' });
+    await updateContainerConfigScalars('ag-1', { effort: 'medium' });
+
+    await performModelChange(session, 'gpt-6-sol', null, vi.fn());
+
+    expect(readContainerConfig('agent').effort).toBe('medium');
+    expect((await getContainerConfig('ag-1'))!.effort).toBe('medium');
+  });
+
+  it('leaves both stores untouched for a denied model', async () => {
+    await addDeniedModel('codex', 'gpt-6-sol', 'wrong subscription');
+    const notify = vi.fn();
+
+    await performModelChange(session, 'gpt-6-sol', 'high', notify);
+
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('deny list'));
+    expect(readContainerConfig('agent').model).toBeUndefined();
+    expect((await getContainerConfig('ag-1'))!.model).toBeNull();
   });
 });
