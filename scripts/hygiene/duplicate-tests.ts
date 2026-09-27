@@ -182,10 +182,44 @@ class Normalizer {
       else if (n.kind === ts.SyntaxKind.SemicolonToken && !ts.isForStatement(n.parent)) return;
       else if (n.getChildCount(this.sourceFile) === 0) out.push(n.getText(this.sourceFile));
       else for (const child of n.getChildren(this.sourceFile)) visit(child);
+      if (inStatementList(n)) out.push(';');
     };
     visit(node);
     return out.join(' ');
   }
+}
+
+function statementList(node: ts.Node): ts.NodeArray<ts.Statement> | undefined {
+  return ts.isBlock(node) || ts.isSourceFile(node) || ts.isCaseOrDefaultClause(node) || ts.isModuleBlock(node)
+    ? node.statements
+    : undefined;
+}
+
+function inStatementList(node: ts.Node): boolean {
+  return !!node.parent && !!statementList(node.parent)?.includes(node as ts.Statement);
+}
+
+const passesContext = new WeakMap<ts.Node, boolean>();
+
+function underContextHook(node: ts.Node): boolean {
+  for (let p = node.parent; p; p = p.parent) {
+    const list = statementList(p);
+    if (!list) continue;
+    if (!passesContext.has(p)) {
+      passesContext.set(
+        p,
+        list.some(
+          (st) =>
+            ts.isExpressionStatement(st) &&
+            ts.isCallExpression(st.expression) &&
+            !isSuiteOrCase(st) &&
+            st.expression.arguments.some((arg) => ts.isFunctionLike(arg) && arg.parameters.length > 0),
+        ),
+      );
+    }
+    if (passesContext.get(p)) return true;
+  }
+  return false;
 }
 
 function isSuiteOrCase(statement: ts.Statement): boolean {
@@ -229,7 +263,7 @@ export function extractCases(file: string, text: string): TestCase[] {
       const callback = callee && CASE_CALLEES.has(callee.base) ? callbackOf(node) : undefined;
       if (callee && callback?.body) {
         const options = node.arguments.slice(1).filter((arg) => arg !== callback && !ts.isNumericLiteral(arg));
-        if (options.length) return;
+        if (options.length || (!callee.table && callback.parameters.length) || underContextHook(node)) return;
         const normalizer = new Normalizer(sourceFile, callback);
         const body = callback.body;
         const parts: ts.Node[] = ts.isBlock(body) ? [...body.statements] : [body];

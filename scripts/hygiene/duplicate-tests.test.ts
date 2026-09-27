@@ -115,6 +115,18 @@ it('wider', () => {
       'loop headers that differ only in where a semicolon falls',
       "it('a', () => {\n  for (let i = 0; i++; ) g(i);\n  expect(f(1)).toBe(2);\n});\nit('b', () => {\n  for (let i = 0; ; i++) g(i);\n  expect(f(1)).toBe(2);\n});",
     ],
+    [
+      'bodies that differ only in where a statement ends',
+      "it('a', () => {\n  const cb = (stop) => { if (stop) return; g(0); };\n  expect(f(cb)).toBe(2);\n});\nit('b', () => {\n  const cb = (stop) => { if (stop) return g(0); };\n  expect(f(cb)).toBe(2);\n});",
+    ],
+    [
+      'bodies that read the running test from their context',
+      "it('sqlite', ({ task }) => {\n  expect(f(task.name)).toBe(2);\n});\nit('postgres', ({ task }) => {\n  expect(f(task.name)).toBe(2);\n});",
+    ],
+    [
+      'bodies whose shared setup reads the running test',
+      "describe('s', () => {\n  let v;\n  beforeEach(({ task }) => { v = task.name; });\n  it('sqlite', () => {\n    expect(f(v)).toBe(2);\n  });\n  it('postgres', () => {\n    expect(f(v)).toBe(2);\n  });\n});",
+    ],
   ])('does not flag %s', (_label, added) => {
     expect(duplicates(keeper, `${keeper}${added}\n`)).toEqual([]);
   });
