@@ -69,15 +69,17 @@ def read(path):
         return None
 
 
-def walk(root, max_depth=3):
-    """(relative dir, file names) for the repo tree, shallow and without vendored dirs."""
+def walk(root):
+    """(relative dir, depth, file names) for the whole repo tree, without vendored dirs.
+
+    Never depth-capped: a single migration or service dir is proposed only when it is the only one,
+    which holds only if the scan saw every directory.
+    """
     for dirpath, dirs, files in os.walk(root):
         rel = os.path.relpath(dirpath, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".") or d in (".vercel", ".github")]
-        if depth >= max_depth:
-            dirs[:] = []
-        yield ("" if rel == "." else rel), files
+        yield ("" if rel == "." else rel), depth, files
 
 
 def add_dir(bucket, rel):
@@ -94,13 +96,16 @@ def hit(bucket, name, where):
 def detect(root):
     found = {"frameworks": {}, "previewHosts": {}, "auth": {}, "databases": {}, "serviceDirs": [],
              "healthRoutes": {}, "migrationDirs": [], "githubRepo": None, "ci": []}
-    for rel, files in walk(root):
+    for rel, depth, files in walk(root):
         parts = rel.split(os.sep) if rel else []
         if parts[-1:] == ["migrations"] or parts[-2:] in (["db", "migrate"], ["alembic", "versions"]):
             add_dir(found["migrationDirs"], rel)
         for f in files:
             path = os.path.join(rel, f) if rel else f
             full = os.path.join(root, path)
+            # A symlink can point outside the repo, at a credential file.
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
             if f == "package.json":
                 pkg = read(full)
                 try:
@@ -142,7 +147,7 @@ def detect(root):
                     hit(found["previewHosts"], host, path)
             if rel.startswith(".github/workflows") and f.endswith((".yml", ".yaml")):
                 found["ci"].append(path)
-            if f.endswith((".ts", ".js", ".py", ".rb", ".go")) and os.path.getsize(full) < 400_000:
+            if depth <= 3 and f.endswith((".ts", ".js", ".py", ".rb", ".go")) and os.path.getsize(full) < 400_000:
                 for m in HEALTH_RE.finditer(read(full) or ""):
                     hit(found["healthRoutes"], m.group(1), path)
     found["serviceDirs"] = sorted(set(found["serviceDirs"]))

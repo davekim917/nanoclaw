@@ -102,6 +102,24 @@ check "two frontend dirs: no prefix chosen" "$OUT" '(.mandatory[] | select(.key 
 check "two frontend dirs named as a gap" "$OUT" '.gaps | any(startswith("several frontend directories (apps/frontend/, packages/web/)"))'
 check "the one backend dir is still proposed" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_BACKEND_PREFIX") | .value) == "api/"'
 
+mkrepo deepmig https://github.com/acme/vault
+mkdir -p "$T/deepmig/apps/api/prisma/migrations" "$T/deepmig/supabase/migrations"
+echo '{"dependencies":{"express":"4.0.0"}}' >"$T/deepmig/apps/api/package.json"
+OUT="$(python3 "$INIT" propose "$T/deepmig")"
+check "a deep migration dir counts: no prefix chosen" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == null'
+check "the deep migration dir is named" "$OUT" '.gaps | any(contains("apps/api/prisma/migrations/"))'
+
+# --- 4c. A symlinked file is never read: it can point outside the repo ------
+mkrepo linked https://github.com/acme/linked
+mkdir -p "$T/outside/web" "$T/linked/web"
+printf 'TOKEN = "x"\nroute = "/healthz"\n' >"$T/outside/creds.py"
+echo '{"dependencies":{"next":"15.0.0"}}' >"$T/outside/web/package.json"
+ln -s "$T/outside/creds.py" "$T/linked/probe.py"
+ln -s "$T/outside/web/package.json" "$T/linked/web/package.json"
+OUT="$(python3 "$INIT" detect "$T/linked")"
+check "a symlinked source file is not read" "$OUT" '.healthRoutes == {}'
+check "a symlinked manifest is not read" "$OUT" '.frameworks == {} and .serviceDirs == []'
+
 # --- 5. The draft: private dir only, never overwritten, never inside the skill
 mkdir -p "$T/group"
 OUT="$(python3 "$INIT" propose "$T/netlify" --group-dir "$T/group")"
@@ -132,5 +150,23 @@ if [ -f "$T/group3/smoke-gate-env.draft.sh" ] && ! grep -qv '^\(#.*\)\?$' "$T/gr
 else
   fail "draft has a live line: $(grep -v '^\(#.*\)\?$' "$T/group3/smoke-gate-env.draft.sh" 2>&1)"
 fi
+
+# The writer's own refusal, reached directly: a control character in a line or
+# a quote in a value never reaches the file.
+for bad in 'value:a'"'"'b' 'why:a
+touch PWN'; do
+  G="$T/group4-${bad%%:*}"; mkdir -p "$G"
+  OUT="$(python3 - "$INIT" "$G" "${bad%%:*}" "${bad#*:}" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("smoke_init", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+entry = {"key": "SMOKE_GATE_X", "value": "ok", "why": "w", "find": "f"}
+entry[sys.argv[3]] = sys.argv[4]
+mod.write_draft(sys.argv[2], {"mandatory": [entry], "recommended": []})
+PY
+)"; RC=$?
+  if [ "$RC" -eq 2 ] && [ ! -e "$G/smoke-gate-env.draft.sh" ]; then ok "the writer refuses an unsafe ${bad%%:*}"; else fail "unsafe ${bad%%:*}: rc=$RC $OUT"; fi
+done
 
 [ "$FAILED" -eq 0 ] && echo "PASS smoke-init.test.sh" || { echo "FAIL smoke-init.test.sh"; exit 1; }
