@@ -5,9 +5,10 @@
  * (`resetStuckProcessingRows` already does), (e) archive, as the terminal marker only.
  * (b) MUST precede the archive: `work_continuation` is read on any wake and `decideCeilingFollowUp` returns
  * `wake-accountable` on it first, so a killed container's promise would resurface on the next message.
- * Confirmations: one if an agent proposed the close (`propose_done`), two if not, counted server-side by the guard
- * (`thread-close-guard.ts`). Nothing closes by silence; a timer only stops waiting for the AGENT after the operator
- * has confirmed. Not snooze, and not a general archive endpoint: `archiveSessionById` is reachable only as step (e).
+ * Confirmations: one if an agent proposed the close (`propose_done`), two if not; the guard decides the required
+ * count (`thread-close-guard.ts`). Nothing closes by silence; a timer only stops waiting for the AGENT after the
+ * operator has confirmed. Not snooze, and not a general archive endpoint: `archiveSessionById` is reachable only as
+ * step (e).
  */
 import { containerOwnsOutbound, killContainer } from '../container-runner.js';
 import { getDb } from '../db/connection.js';
