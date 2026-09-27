@@ -113,16 +113,21 @@ describe('pinDocs', () => {
     expect(read(root, NOTE)).toContain(`\`src/code.ts:3\` at ${introduced} and`);
   });
 
-  it("does not borrow an older note's commit for a new note that repeats the same citation", () => {
+  it('refuses a doc that differs from --rev by more than pins', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
-    write(root, 'docs/review-notes/1.md', '- `src/code.ts:1` once dropped items\n');
-    commit(root, 'old note');
-    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
-    const head = commit(root, 'change the code');
-    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` takes a limit now\n');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` once dropped items\n');
+    commit(root, 'note');
+    write(
+      root,
+      NOTE,
+      '- `drainQueue` at `src/code.ts:1` once dropped items\n- `drainQueue` at `src/code.ts:1` again\n',
+    );
 
-    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: head, origin: null })]);
+    expect(pinDocs(root, [NOTE], [])).toEqual([
+      expect.objectContaining({ kind: 'refused', line: 1, reason: expect.stringMatching(/commit it first/) }),
+      expect.objectContaining({ kind: 'refused', line: 2, reason: expect.stringMatching(/commit it first/) }),
+    ]);
   });
 
   it('ignores a later pin of an earlier citation on the same line', () => {
@@ -273,19 +278,24 @@ describe('pinDocs', () => {
     ]);
   });
 
-  it('keeps a committed note on its own history when an identical uncommitted note lands above it', () => {
+  it('traces identical notes to their own commits after an earlier run pinned another citation on both', () => {
     const root = gitRoot();
-    const note = '- `drainQueue` at `src/code.ts:1` drops items\n';
+    const note = '- `flushAll` in `src/other.ts:1`; `drainQueue` at `src/code.ts:1` drops items\n';
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
-    write(root, NOTE, `# Historical\n${note}`);
-    const historical = commit(root, 'note');
+    write(root, 'src/other.ts', 'function flushAll() {}\n');
+    write(root, NOTE, note);
+    const first = commit(root, 'first note');
     write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
-    const head = commit(root, 'change the code');
-    write(root, NOTE, `# New\n${note}# Historical\n${note}`);
+    commit(root, 'change the code');
+    write(root, NOTE, note + note);
+    const second = commit(root, 'second note');
+    write(root, 'src/code.ts', 'function drainQueue(limit, later) {}\n');
+    commit(root, 'change the code again');
 
-    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind === 'pinned' && outcome.sha)).toEqual([
-      head,
-      historical,
+    pinDocs(root, [NOTE], ['src/other.ts']);
+    expect(pinDocs(root, [NOTE], ['src/code.ts']).map((outcome) => outcome.kind === 'pinned' && outcome.sha)).toEqual([
+      first,
+      second,
     ]);
   });
 

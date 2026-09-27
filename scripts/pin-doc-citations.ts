@@ -13,10 +13,10 @@ const USAGE =
   "  commit that introduced the citation back through the cited file's earlier versions, whose cited lines\n" +
   '  hold an identifier the note names next to the citation. A citation with no such identifier, no\n' +
   '  matching revision, or two different matching versions around its own commit is refused and left\n' +
-  '  for a manual pin; the run then exits 1.';
+  '  for a manual pin; the run then exits 1. Each doc must match --rev apart from pins: commit a new note first.';
 
 export type PinOutcome =
-  | { kind: 'pinned'; doc: string; line: number; citation: string; sha: string; origin: string | null }
+  | { kind: 'pinned'; doc: string; line: number; citation: string; sha: string; origin: string }
   | { kind: 'refused'; doc: string; line: number; citation: string; reason: string };
 
 export function noteAnchors(clause: string, citedFiles: readonly string[]): string[] {
@@ -98,35 +98,6 @@ function introducingCommit(root: string, rev: string, doc: string, lineNumber: n
 
 const unpinned = (line: string): string => line.replace(/\s+at\s+[0-9a-f]{7,40}\b/g, '');
 
-function committedLineNumbers(root: string, rev: string, doc: string, working: readonly string[]): (number | null)[] {
-  const map: (number | null)[] = working.map(() => null);
-  const committed = gitRead(root, ['show', `${rev}:${doc}`]);
-  const diff = gitRead(root, ['diff', '--no-color', '--no-ext-diff', '-U0', rev, '--', doc]);
-  if (committed === null || diff === null) return map;
-  const old = committed.split('\n');
-  let oldAt = 1;
-  let newAt = 1;
-  const copyUntil = (newEnd: number): void => {
-    for (; newAt < newEnd; newAt++, oldAt++) map[newAt - 1] = oldAt;
-  };
-  for (const [, oldStart, oldCount = '1', newStart, newCount = '1'] of diff.matchAll(
-    /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm,
-  )) {
-    const removedFirst = Number(oldCount) === 0 ? Number(oldStart) + 1 : Number(oldStart);
-    const addedFirst = Number(newCount) === 0 ? Number(newStart) + 1 : Number(newStart);
-    copyUntil(addedFirst);
-    const removed = old.slice(removedFirst - 1, removedFirst - 1 + Number(oldCount)).map(unpinned);
-    for (let n = addedFirst; n < addedFirst + Number(newCount); n++) {
-      const matches = removed.flatMap((line, k) => (line === unpinned(working[n - 1]) ? [removedFirst + k] : []));
-      if (matches.length === 1) map[n - 1] = matches[0];
-    }
-    newAt = addedFirst + Number(newCount);
-    oldAt = removedFirst + Number(oldCount);
-  }
-  copyUntil(working.length + 1);
-  return map;
-}
-
 function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] {
   const touching = (gitRead(root, ['log', '--format=%H', `-n${MAX_EARLIER_VERSIONS}`, origin, '--', ...files]) ?? '')
     .split('\n')
@@ -203,7 +174,11 @@ export function pinDocs(
   const outcomes: PinOutcome[] = [];
   for (const doc of docs) {
     const lines = fs.readFileSync(path.join(root, doc), 'utf8').split('\n');
-    const committedAt = committedLineNumbers(root, rev, doc, lines);
+    const committed = gitRead(root, ['show', `${rev}:${doc}`])?.split('\n');
+    const inSync =
+      committed !== undefined &&
+      committed.length === lines.length &&
+      lines.every((line, n) => unpinned(line) === unpinned(committed[n]));
     let changed = false;
     lines.forEach((text, i) => {
       const inserts: { at: number; sha: string }[] = [];
@@ -214,24 +189,33 @@ export function pinDocs(
         if (citedFiles.length > 0 && !files.some((file) => citedFiles.includes(file))) continue;
         const citation = text.slice(head.index, run.end).replace(/`/g, '');
         const headText = `${head.file}:${head.span}`;
-        const committedLine = committedAt[i];
-        const origin = committedLine === null ? null : introducingCommit(root, rev, doc, committedLine, headText);
-        const start = origin ?? gitRead(root, ['rev-parse', rev])?.trim() ?? rev;
-        if (!gitRead(root, ['log', '-1', '--format=%H', start, '--', head.file])?.trim()) continue;
-        const candidates = candidateRevisions(root, start, files);
-        const originTouchedFile =
-          origin !== null &&
-          Boolean(gitRead(root, ['diff', '--name-only', `${origin}^`, origin, '--', ...files])?.trim());
+        if (!gitRead(root, ['log', '-1', '--format=%H', rev, '--', head.file])?.trim()) continue;
+        const refuse = (reason: string): void => {
+          outcomes.push({ kind: 'refused', doc, line: i + 1, citation, reason });
+        };
+        if (!inSync) {
+          refuse(`${doc} differs from ${rev} by more than pins; commit it first`);
+          continue;
+        }
+        const origin = introducingCommit(root, rev, doc, i + 1, headText);
+        if (!origin) {
+          refuse("the line's history does not show the commit that added this citation");
+          continue;
+        }
+        const candidates = candidateRevisions(root, origin, files);
+        const originTouchedFile = Boolean(
+          gitRead(root, ['diff', '--name-only', `${origin}^`, origin, '--', ...files])?.trim(),
+        );
         const runStart = text[head.index - 1] === '`' ? head.index - 1 : head.index;
         const anchors = noteAnchors(citationClause(text, runStart, run.end), files);
         const decision = choosePin(root, run.links, anchors, candidates, originTouchedFile);
         if ('refused' in decision) {
-          outcomes.push({ kind: 'refused', doc, line: i + 1, citation, reason: decision.refused });
+          refuse(decision.refused);
           continue;
         }
         const sha = shortSha(root, decision.sha);
         inserts.push({ at: run.end, sha });
-        outcomes.push({ kind: 'pinned', doc, line: i + 1, citation, sha, origin: origin && shortSha(root, origin) });
+        outcomes.push({ kind: 'pinned', doc, line: i + 1, citation, sha, origin: shortSha(root, origin) });
       }
       if (inserts.length === 0) return;
       let next = text;
@@ -281,7 +265,7 @@ function main(): void {
   for (const outcome of outcomes) {
     if (outcome.kind === 'pinned')
       console.log(
-        `${outcome.doc}:${outcome.line}: ${outcome.citation} at ${outcome.sha} (introduced in ${outcome.origin ?? 'an uncommitted edit'})`,
+        `${outcome.doc}:${outcome.line}: ${outcome.citation} at ${outcome.sha} (introduced in ${outcome.origin})`,
       );
     else console.log(`REFUSED ${outcome.doc}:${outcome.line}: ${outcome.citation}: ${outcome.reason}; pin it by hand`);
   }
