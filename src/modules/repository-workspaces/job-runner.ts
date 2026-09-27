@@ -46,6 +46,7 @@ export function _setRepositoryDrainMarkerPathForTesting(markerPath: string): voi
   drainMarkerPath = markerPath;
 }
 
+/** Best effort: a marker that cannot be written must never stop the job. */
 function writeDrainMarker(action: string, requestId: string, session: Session): boolean {
   const marker = { action, requestId, sessionId: session.id, pid: process.pid, startedAt: new Date().toISOString() };
   const tmp = `${drainMarkerPath}.${process.pid}.tmp`;

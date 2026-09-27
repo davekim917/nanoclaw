@@ -1,8 +1,8 @@
 /**
  * Session-DB schema creation and the fork's additive migrations. Every
- * migration is idempotent and `PRAGMA table_info`-guarded, so it runs on every
- * open: that lazy shape IS the upgrade path (no central migration exists for
- * session DBs).
+ * migration is idempotent and `PRAGMA table_info`-guarded, so it is safe to
+ * repeat; it runs lazily on writable opens (read-only opens never migrate), and
+ * that IS the upgrade path (no central migration exists for session DBs).
  */
 import Database from 'better-sqlite3';
 
@@ -119,8 +119,6 @@ function installRepoIngressFenceGuards(db: Database.Database): void {
   `);
 }
 
-// Adds messages_in columns newer than the baseline to pre-existing session DBs
-// and backfills existing rows (series_id = id).
 export function migrateMessagesInTable(db: Database.Database): void {
   migrateUpstreamMessagesInColumns(db);
   const cols = new Set(
@@ -133,8 +131,9 @@ export function migrateMessagesInTable(db: Database.Database): void {
       db.prepare('ALTER TABLE messages_in ADD COLUMN scheduled_for TEXT').run();
       // Backfill TASK rows from process_after; NULL would make a legacy task's
       // first post-upgrade crash lose its slot. Done here because it must precede
-      // every writer of process_after. Through strftime: a naive
-      // `YYYY-MM-DD HH:MM:SS` value is UTC and must not be copied as-is.
+      // every writer of process_after. A row already in backoff takes its retry
+      // deadline as its slot, as the NULL fallback rendered, until rescheduled.
+      // Through strftime: a naive `YYYY-MM-DD HH:MM:SS` value is UTC.
       db.prepare(
         `UPDATE messages_in
             SET scheduled_for = strftime('%Y-%m-%dT%H:%M:%fZ', process_after)
@@ -170,7 +169,8 @@ export function migrateMessagesInTable(db: Database.Database): void {
 }
 
 /**
- * Every fork-side inbound migration, run once per inbound path per process.
+ * Every fork-side inbound migration: `session()` runs it once per inbound path
+ * per process, `ensureSchema` on every call.
  * The baseline runs FIRST and unconditionally: a legacy DB can predate whole
  * tables, and an additive migration against an absent table throws or leaves it
  * absent.

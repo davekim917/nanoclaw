@@ -132,6 +132,7 @@ export const resolver: UnwiredChannelResolverFn = async (event, mg) => {
     engage_mode: engageMode,
     engage_pattern: engagePattern,
     sender_scope: 'all',
+    // Explicit although reads COALESCE NULL: raw queries and exports see the real policy.
     ignored_message_policy: resolveDefaultIgnoredPolicy(event.channelType),
     session_mode: sessionMode,
     priority: 0,
