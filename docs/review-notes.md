@@ -74,6 +74,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `uncited behavioural claim` — a comment or branch rests on how another module behaves (what runs when, what a predicate returns, whether a method is overridden) without the `file:line` that says so, and the claim is wrong; it does not fail loudly, because the code looks right and a test oracle paraphrases the same wrong belief
 - `unclamped bound` — a caller- or model-supplied value is used as a safety bound (a kill ceiling, a tolerance, a deadline) without clamping it to what the enforcer actually allows, so an in-type but out-of-range value widens or disables the protection; unlike `fail-open default`, the input is present and valid, just larger than anything the thing it describes can really do
 - `upstream drift` — a fork change grows an upstream-owned file (one with a `src/upstream-ratchet.json` entry) with prose or structure that belongs in a fork-owned module, widening the surface an upstream merge can conflict on
+- `guessed safety value` — a tool fills a setting that decides what a protection covers from a heuristic guess; the value passes the syntax check, so a wrong guess silently narrows the protection instead of failing
 
 ## Lessons
 
