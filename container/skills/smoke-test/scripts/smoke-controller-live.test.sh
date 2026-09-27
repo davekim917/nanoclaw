@@ -243,6 +243,9 @@ inbound_db "$mid" delivered
 fire
 jq -s -e '[.[] | select(.kind=="send" and .slot=="root")] | last | .state == "delivered"' "$OUT/journal.ndjson" >/dev/null \
   || fail "the delivered row in inbound.db settles the root send: $(tail -3 "$OUT/journal.ndjson")"
+jq -s -e '[.[] | select(.kind=="send" and .slot=="root" and .state=="delivered")][0].detail.deliveredAt == "2026-09-18T10:00:00Z"' \
+  "$OUT/journal.ndjson" >/dev/null \
+  || fail "the root's delivery time is the row's delivered_at: $(tail -3 "$OUT/journal.ndjson")"
 
 # --- an invalid journal: no progress, no poll, one alarm (review round 1, #3) ------
 for variant in torn schema; do

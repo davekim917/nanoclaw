@@ -2441,18 +2441,24 @@ This prevents two private state roots
 from opening different live run IDs for the same PR; only an explicitly
 authorized `--takeover` may replace a live different-run binding.
 
-**The challenger's window starts at the root post.** `claim` stamps a
-provisional `challengerDeadline` (claim + `SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS`,
+**The challenger's window starts when the root post is delivered.** `claim`
+stamps a provisional `challengerDeadline` (claim + `SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS`,
 default 90 min). Whoever posts the root thread runs
-`challenger-start <run-id> <owner-token>` just before posting it and names the
-deadline it answers in the post. It re-anchors the deadline once, to
+`challenger-start <run-id> <owner-token>` just before each attempt of the post
+and names the deadline it answers in the post. That arms the deadline to
 min(now + timeout, provisional + `SMOKE_GATE_CHALLENGER_INTAKE_ALLOWANCE_SECONDS`,
-default 60 min); a repeat answers with the deadline already set, a same-SHA
-recovery keeps it, and it refuses (`deadline-passed`) once the provisional
-deadline has gone, so a run whose root never went out still times out there.
-An answer that decides nothing (`lease-unavailable`, a busy lock, or no answer)
-means hold the root and ask again rather than post on the provisional deadline,
-until that deadline passes. The campaign controller does this itself.
+default 60 min), never earlier than the deadline in force, so an attempt that
+fails and is retried does not spend the window. Once the post's delivery
+receipt is in, `challenger-start <run-id> <owner-token> --delivered <delivered-at>`
+moves the start to that delivery time by the same formula, once; every later
+call answers with that deadline. A same-SHA recovery keeps the start, and it
+refuses (`deadline-passed`) once the deadline in force has gone (for
+`--delivered`: when the post was delivered after it), so a run whose root never
+went out still times out at the provisional deadline. An answer that decides
+nothing (`lease-unavailable`, a busy lock, or no answer) means hold the root and
+ask again rather than post on the old deadline, until that deadline passes; for
+`--delivered`, ask again with the same delivery time. The campaign controller
+does this itself.
 
 The default lease lasts 15 minutes. While a coordinator is actively running,
 call `progress <run-id> <owner-token>` at least every 10 minutes; a successful

@@ -412,13 +412,18 @@ def gate(argv):
             return "progress", out({"ok": True, "runId": run})
         if verb == "challenger-start":
             # The real verb's order and refusal codes (smoke-pr-gate.sh
-            # challenger-start): a repeat answers with the deadline already
-            # set, then no-deadline / disposition-filed / deadline-passed, then
-            # min(now + timeout, provisional + allowance), never earlier than
-            # the provisional deadline.
+            # challenger-start): a final start (confirmed, or one with no
+            # provisional deadline recorded) answers with the deadline already
+            # set, then no-deadline / disposition-filed / deadline-passed
+            # (judged at the delivery time for --delivered, else now), then
+            # min(at + timeout, provisional + allowance), never earlier than
+            # the deadline in force. An arm keeps the provisional deadline, a
+            # confirm clears it.
             deadline = st.get("challengerDeadline") or ""
-            if st.get("challengerStartedAt") and deadline:
+            provisional_iso = st.get("challengerProvisionalDeadline") or ""
+            if st.get("challengerStartedAt") and deadline and not provisional_iso:
                 return "challenger-start", out({"ok": True, "started": False, "alreadyStarted": True,
+                                                "confirmed": True,
                                                 "challengerStartedAt": st["challengerStartedAt"],
                                                 "challengerDeadline": deadline})
             if not deadline:
@@ -427,21 +432,27 @@ def gate(argv):
             if st.get("challengerDisposition"):
                 return "disposition-filed", out({"ok": False, "refusal": "disposition-filed",
                                                  "error": "the challenger window is already closed for this run"})
+            confirm = len(argv) > 3 and argv[3] == "--delivered"
             now_s = int(time.time())
-            provisional = epoch_or_zero(deadline)
-            if now_s >= provisional:
+            at_s = epoch_or_zero(argv[4]) if confirm and len(argv) > 4 else now_s
+            at_s = min(at_s, now_s)
+            provisional_iso = provisional_iso or deadline
+            in_force = epoch_or_zero(deadline)
+            if at_s >= in_force:
                 return "deadline-passed", out({"ok": False, "refusal": "deadline-passed",
-                                               "error": "the provisional challenger deadline has passed"})
+                                               "error": "the challenger deadline in force has passed"})
             timeout = int(os.environ.get("SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS") or 5400)
             allowance = int(os.environ.get("SMOKE_GATE_CHALLENGER_INTAKE_ALLOWANCE_SECONDS") or 3600)
-            nxt = max(provisional, min(now_s + timeout, provisional + allowance))
-            st["challengerStartedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_s))
+            nxt = max(in_force, min(at_s + timeout, epoch_or_zero(provisional_iso) + allowance))
+            st["challengerStartedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at_s))
             st["challengerDeadline"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(nxt))
+            st["challengerProvisionalDeadline"] = None if confirm else provisional_iso
             write(p, st)
             return "challenger-start", out({"ok": True, "started": True, "alreadyStarted": False,
+                                            "confirmed": confirm,
                                             "challengerStartedAt": st["challengerStartedAt"],
                                             "challengerDeadline": st["challengerDeadline"],
-                                            "provisionalDeadline": deadline})
+                                            "provisionalDeadline": provisional_iso})
         if verb == "challenger-timeout":
             # The real verb's own preconditions, in its order
             # (smoke-pr-gate.sh:4634-4670), each with the SAME machine-readable

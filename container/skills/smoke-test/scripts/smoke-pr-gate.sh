@@ -1324,7 +1324,8 @@ num_env CHALLENGER_TIMEOUT_SECONDS SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS 5400
 # The deadline `claim` stamps is provisional: the challenger only starts once
 # the root post goes out, typically 28-40 minutes after claim, so a claim
 # anchor spent that much of the challenger's window on intake. `challenger-start`
-# re-anchors it to the root post, once. The ceiling is the provisional deadline
+# re-anchors it to the root post: armed at each send attempt, confirmed at
+# delivery (see that verb). The ceiling is the provisional deadline
 # plus this allowance, so re-anchoring can never push a deadline out without
 # bound, and a run whose root never goes out still times out at the
 # provisional deadline.
@@ -1447,6 +1448,7 @@ default_pr_state() {
     reconciliation: null,
     challengerDeadline: null,
     challengerStartedAt: null,
+    challengerProvisionalDeadline: null,
     challengerDisposition: null,
     challengerTimedOutAt: null
   }'
@@ -3427,12 +3429,14 @@ if [ "$COMMAND" = "claim" ]; then
       then .challengerDeadline else $deadline end) as $dl |
     (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then (.challengerStartedAt // null) else null end) as $started |
+    (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
+      then (.challengerProvisionalDeadline // null) else null end) as $provisional |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
      .activeLeaseOwner=$owner |
      .activeClaimant=(if $claimant == "" then null else $claimant end) |
      .displacedRunId=(if $took == "" then null else $took end) |
      .displacedAt=(if $took == "" then null else $now end) |
-     .challengerDeadline=$dl | .challengerStartedAt=$started |
+     .challengerDeadline=$dl | .challengerStartedAt=$started | .challengerProvisionalDeadline=$provisional |
      .challengerDisposition=null | .challengerTimedOutAt=null |
      .finishIntent=null' <<<"$STATE")"
   if ! write_pr_state "$PR" "$STATE"; then
@@ -3667,16 +3671,28 @@ if [ "$COMMAND" = "progress" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# challenger-start: the challenger's window begins at the root post, not at
-# claim. Called by whoever posts the root, just before it goes out. It sets
-# the deadline ONCE, to min(now + CHALLENGER_TIMEOUT_SECONDS, provisional
-# deadline + CHALLENGER_INTAKE_ALLOWANCE_SECONDS), and never moves it again: a
-# repeat answers with the deadline already set, and a same-SHA recovery keeps
-# it (claim/poll carry challengerStartedAt with the deadline). It refuses once
-# the provisional deadline has passed, so an expired window is never revived.
+# challenger-start: the challenger's window begins when the root post is
+# delivered, not at claim and not at a send that never landed. Two calls, by
+# whoever posts the root:
+#   challenger-start <run> <owner>
+#       ARM, just before each attempt of the root post goes out, so the post
+#       can name a deadline: min(now + CHALLENGER_TIMEOUT_SECONDS, claim-time
+#       deadline + CHALLENGER_INTAKE_ALLOWANCE_SECONDS), never earlier than the
+#       deadline already set. An attempt that fails and is retried re-arms, so
+#       a failed send does not spend the window. Refused once the deadline in
+#       force has passed: an expired window is never revived.
+#   challenger-start <run> <owner> --delivered [<delivered-at>]
+#       CONFIRM, once the root's delivery receipt is in: the same formula from
+#       the delivery time (default now; a future time reads as now). Refused if
+#       the root was delivered after the deadline in force. Final: every later
+#       call answers with the deadline it set.
+# challengerProvisionalDeadline holds the claim-time deadline while the start
+# is only armed; it is what the ceiling is measured from. A start without it
+# (confirmed, or set before arming existed) is final. A same-SHA recovery keeps
+# all three fields (claim/poll carry them with the deadline).
 # Refusal codes, keyed on by callers instead of the prose:
 #   no-deadline       structural: this run has no deadline to re-anchor
-#   deadline-passed   the provisional deadline already expired
+#   deadline-passed   the deadline in force expired before this start
 #   disposition-filed the challenger already filed or timed out
 if [ "$COMMAND" = "challenger-start" ]; then
   RUN_ID="${2:-}"
@@ -3685,6 +3701,24 @@ if [ "$COMMAND" = "challenger-start" ]; then
     jq -cn --arg run "$RUN_ID" \
       '{ok:false,error:"challenger-start requires a run id of 1-200 chars of [A-Za-z0-9._-]",runId:$run}'
     exit 2
+  fi
+  CONFIRM=false
+  AT_EPOCH=""
+  if [ "$#" -ge 4 ]; then
+    if [ "$4" != "--delivered" ] || [ "$#" -gt 5 ]; then
+      jq -cn --arg run "$RUN_ID" \
+        '{ok:false,error:"usage: challenger-start <run-id> <owner> [--delivered [<delivered-at ISO-8601>]]",runId:$run}'
+      exit 2
+    fi
+    CONFIRM=true
+    if [ "$#" -eq 5 ]; then
+      AT_EPOCH="$(date -u -d "$5" +%s 2>/dev/null || true)"
+      if ! [[ "$AT_EPOCH" =~ ^[0-9]+$ ]]; then
+        jq -cn --arg run "$RUN_ID" --arg at "$5" \
+          '{ok:false,error:"challenger-start --delivered needs an ISO-8601 delivery time",runId:$run,deliveredAt:$at}'
+        exit 2
+      fi
+    fi
   fi
   PR="$(find_pr_for_run "$RUN_ID" || true)"
   if [ -z "${PR:-}" ]; then
@@ -3713,9 +3747,10 @@ if [ "$COMMAND" = "challenger-start" ]; then
   claimant_guard "$STATE" "$PR" "$RUN_ID" "$COMMAND"
   DEADLINE="$(jq -r '.challengerDeadline // empty' <<<"$STATE")"
   STARTED_AT="$(jq -r '.challengerStartedAt // empty' <<<"$STATE")"
-  if [ -n "$STARTED_AT" ] && [ -n "$DEADLINE" ]; then
+  PROVISIONAL="$(jq -r '.challengerProvisionalDeadline // empty' <<<"$STATE")"
+  if [ -n "$STARTED_AT" ] && [ -n "$DEADLINE" ] && [ -z "$PROVISIONAL" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" --arg started "$STARTED_AT" \
-      '{ok:true,runId:$run,pr:$pr,started:false,alreadyStarted:true,
+      '{ok:true,runId:$run,pr:$pr,started:false,alreadyStarted:true,confirmed:true,
         challengerStartedAt:$started,challengerDeadline:$deadline}'
     exit 0
   fi
@@ -3729,35 +3764,42 @@ if [ "$COMMAND" = "challenger-start" ]; then
       '{ok:false,refusal:"disposition-filed",error:"the challenger window is already closed for this run",pr:$pr,runId:$run}'
     exit 0
   fi
+  [ -n "$PROVISIONAL" ] || PROVISIONAL="$DEADLINE"
   NOW_EPOCH="$(date -u +%s)"
+  [ -n "$AT_EPOCH" ] && [ "$AT_EPOCH" -le "$NOW_EPOCH" ] || AT_EPOCH="$NOW_EPOCH"
   DEADLINE_EPOCH="$(epoch_or_zero "$DEADLINE")"
-  if [ "$NOW_EPOCH" -ge "$DEADLINE_EPOCH" ]; then
-    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" \
-      '{ok:false,refusal:"deadline-passed",error:"the provisional challenger deadline has passed — challenger-timeout applies; the window is not reopened",
+  if [ "$AT_EPOCH" -ge "$DEADLINE_EPOCH" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" --argjson confirm "$CONFIRM" \
+      '{ok:false,refusal:"deadline-passed",
+        error:(if $confirm then "the root post was delivered after the challenger deadline in force — challenger-timeout applies; the window is not reopened"
+               else "the challenger deadline in force has passed — challenger-timeout applies; the window is not reopened" end),
         pr:$pr,runId:$run,challengerDeadline:$deadline}'
     exit 0
   fi
-  NEXT_EPOCH="$(( NOW_EPOCH + CHALLENGER_TIMEOUT_SECONDS ))"
-  CEILING_EPOCH="$(( DEADLINE_EPOCH + CHALLENGER_INTAKE_ALLOWANCE_SECONDS ))"
+  NEXT_EPOCH="$(( AT_EPOCH + CHALLENGER_TIMEOUT_SECONDS ))"
+  CEILING_EPOCH="$(( $(epoch_or_zero "$PROVISIONAL") + CHALLENGER_INTAKE_ALLOWANCE_SECONDS ))"
   [ "$NEXT_EPOCH" -le "$CEILING_EPOCH" ] || NEXT_EPOCH="$CEILING_EPOCH"
   [ "$NEXT_EPOCH" -ge "$DEADLINE_EPOCH" ] || NEXT_EPOCH="$DEADLINE_EPOCH"
   NEXT_DEADLINE="$(date -u -d "@$NEXT_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')"
-  NOW="$(date -u -d "@$NOW_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')"
+  STARTED="$(date -u -d "@$AT_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')"
+  KEEP_PROVISIONAL="$PROVISIONAL"
+  [ "$CONFIRM" = false ] || KEEP_PROVISIONAL=""
   if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
     exit 0
   fi
-  STATE="$(jq -c --arg now "$NOW" --arg deadline "$NEXT_DEADLINE" \
-    '.challengerStartedAt=$now | .challengerDeadline=$deadline' <<<"$STATE")"
+  STATE="$(jq -c --arg started "$STARTED" --arg deadline "$NEXT_DEADLINE" --arg provisional "$KEEP_PROVISIONAL" \
+    '.challengerStartedAt=$started | .challengerDeadline=$deadline |
+     .challengerProvisionalDeadline=(if $provisional == "" then null else $provisional end)' <<<"$STATE")"
   if ! write_pr_state "$PR" "$STATE"; then
     lease_fence_end
-    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
-      '{ok:false,error:"could not write challenger-start state - the provisional deadline stands",pr:$pr,runId:$run}'
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" \
+      '{ok:false,error:"could not write challenger-start state - the deadline in force stands",pr:$pr,runId:$run,challengerDeadline:$deadline}'
     exit 1
   fi
   lease_fence_end
-  jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$NEXT_DEADLINE" --arg started "$NOW" \
-    --arg provisional "$DEADLINE" \
-    '{ok:true,runId:$run,pr:$pr,started:true,alreadyStarted:false,
+  jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$NEXT_DEADLINE" --arg started "$STARTED" \
+    --arg provisional "$PROVISIONAL" --argjson confirm "$CONFIRM" \
+    '{ok:true,runId:$run,pr:$pr,started:true,alreadyStarted:false,confirmed:$confirm,
       challengerStartedAt:$started,challengerDeadline:$deadline,provisionalDeadline:$provisional}'
   exit 0
 fi
@@ -3796,7 +3838,7 @@ if [ "$COMMAND" = "release" ]; then
     exit 0
   fi
   STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .challengerStartedAt=null | .finishIntent=null' <<<"$STATE")"
+     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .challengerStartedAt=null | .challengerProvisionalDeadline=null | .finishIntent=null' <<<"$STATE")"
   # Remove the PR binding and run lease together under the shared locks. Any
   # later failure restores both identities before releasing the fence.
   if ! remove_pr_authority_fenced "$PR" "$RUN_ID" "$OWNER"; then
@@ -4811,7 +4853,7 @@ if [ "$COMMAND" = "finish" ]; then
     '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
      .completedVerdictDigest=$digest | .finishIntent=null |
      .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .challengerStartedAt=null' <<<"$STATE")"
+     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .challengerStartedAt=null | .challengerProvisionalDeadline=null' <<<"$STATE")"
   if ! write_pr_state "$PR" "$STATE"; then
     RESTORED=false
     if lease_restore_fenced "$RUN_ID" "$FENCED_LEASE_JSON" &&
@@ -5645,10 +5687,12 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       then .challengerDeadline else $deadline end) as $dl |
     (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then (.challengerStartedAt // null) else null end) as $started |
+    (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
+      then (.challengerProvisionalDeadline // null) else null end) as $provisional |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
      .activeLeaseOwner=$owner |
      .activeClaimant=(if $claimant == "" then null else $claimant end) |
-     .challengerDeadline=$dl | .challengerStartedAt=$started |
+     .challengerDeadline=$dl | .challengerStartedAt=$started | .challengerProvisionalDeadline=$provisional |
      .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"
   if ! write_pr_state "$W_PR" "$STATE"; then
     lease_fence_end

@@ -932,7 +932,8 @@ def main():
                      for t in resp["data"] if isinstance(t, dict)]
     # Delivery receipts for enqueued sends: the host writes them into this
     # session's inbound.db `delivered` table (container/agent-runner/src/db/
-    # delivery-acks.ts); 'pending' is not an answer yet.
+    # delivery-acks.ts); 'pending' is not an answer yet. `at` is the host's
+    # delivered_at, which anchors the challenger's window to the root post.
     receipts = {}
     ids = [ob["detail"].get("messageId") for ob in folded.values()
            if ob.get("kind") == "send" and ob.get("state") == "enqueued" and ob["detail"].get("messageId")]
@@ -942,9 +943,11 @@ def main():
             try:
                 for i in range(0, len(ids), 200):
                     chunk = ids[i:i + 200]
-                    rows = conn.execute("SELECT message_out_id, status FROM delivered WHERE message_out_id IN ({})"
-                                        .format(",".join("?" * len(chunk))), chunk).fetchall()
-                    receipts.update({mid: st for mid, st in rows if st in ("delivered", "failed")})
+                    rows = conn.execute("SELECT message_out_id, status, delivered_at FROM delivered "
+                                        "WHERE message_out_id IN ({})".format(",".join("?" * len(chunk))),
+                                        chunk).fetchall()
+                    receipts.update({mid: {"status": st, "at": at} for mid, st, at in rows
+                                     if st in ("delivered", "failed")})
             finally:
                 conn.close()
         except sqlite3.Error as exc:

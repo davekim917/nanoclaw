@@ -2507,9 +2507,9 @@ unset SMOKE_GATE_RUN_ROOT
 
 # --- 7e. challenger-start anchors the challenger's window to the root post ---
 # `claim` stamps a provisional deadline; the challenger only starts at the root
-# post. `challenger-start` moves the deadline ONCE, to min(now + timeout,
-# provisional + intake allowance). A repeat and a same-SHA recovery leave it
-# where it is, an expired provisional deadline is never revived, and a run
+# post. `challenger-start` arms the deadline before each attempt of the root,
+# to min(now + timeout, provisional + intake allowance), never moving it back.
+# A same-SHA recovery keeps it, an expired deadline is never revived, and a run
 # whose root never goes out still times out at the provisional deadline.
 START_SHA="$(sha 5)"
 stalled_fixture 69 "$START_SHA"
@@ -2538,20 +2538,92 @@ START_EPOCH="$(date -u -d "$START_DEADLINE" +%s)"
   { echo "7e: the challenger did not get its full window from the root post ($START_DEADLINE)" >&2; exit 1; }
 jq -e --arg d "$START_DEADLINE" --argjson o "$START_OUT" \
   '.challengerDeadline == $d and .challengerStartedAt == $o.challengerStartedAt' "$STATE_DIR/pr-69-state.json" >/dev/null
-# Once only: a repeat answers with the deadline already set.
-bash "$GATE" challenger-start run-start owner-start | jq -e --arg d "$START_DEADLINE" '
-  .ok == true and .started == false and .alreadyStarted == true and .challengerDeadline == $d' >/dev/null
+# The arm is kept provisional, measured from the claim-time deadline.
+jq -e --arg p "$START_PROVISIONAL" '.challengerProvisionalDeadline == $p' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: an arm did not keep the claim-time deadline" >&2; exit 1; }
+# A re-arm (the root's next attempt) moves the start forward, never back.
+REARM_OUT="$(bash "$GATE" challenger-start run-start owner-start)"
+jq -e --arg p "$START_PROVISIONAL" --arg d "$START_DEADLINE" '
+  .ok == true and .started == true and .confirmed == false and .provisionalDeadline == $p and .challengerDeadline >= $d' \
+  <<<"$REARM_OUT" >/dev/null || { echo "7e: a re-arm did not move the start forward: $REARM_OUT" >&2; exit 1; }
+START_DEADLINE="$(jq -r '.challengerDeadline' <<<"$REARM_OUT")"
+START_OUT="$REARM_OUT"
 # challenger-timeout keys on the re-anchored deadline.
 bash "$GATE" challenger-timeout run-start owner-start | jq -e '.ok == false and .refusal == "deadline-not-passed"' >/dev/null
-# A same-SHA recovery keeps the anchor, and cannot start the window again.
+# A same-SHA recovery keeps the anchor and its claim-time deadline.
 expire_lease "$SMOKE_GATE_LEASE_DIR/lease-run-start.json"
 SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" claim run-start 69 "$START_SHA" owner-start-2 | jq -e '.ok == true' >/dev/null
-jq -e --arg d "$START_DEADLINE" --argjson o "$START_OUT" \
-  '.challengerDeadline == $d and .challengerStartedAt == $o.challengerStartedAt' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+jq -e --arg d "$START_DEADLINE" --argjson o "$START_OUT" --arg p "$START_PROVISIONAL" \
+  '.challengerDeadline == $d and .challengerStartedAt == $o.challengerStartedAt and .challengerProvisionalDeadline == $p' \
+  "$STATE_DIR/pr-69-state.json" >/dev/null ||
   { echo "7e: recovery reset the challenger anchor" >&2; exit 1; }
-bash "$GATE" challenger-start run-start owner-start-2 | jq -e --arg d "$START_DEADLINE" '.alreadyStarted == true and .challengerDeadline == $d' >/dev/null
+# --- 7f. the delivery receipt confirms the start at the delivery time -------
+# The root was armed 30 minutes ago and its delivery landed 10 minutes ago
+# (its first attempt failed and was retried): the window runs from the
+# delivery, not from the arm and not from this call.
+ARMED_EPOCH="$(( $(date -u +%s) - 1800 ))"
+pr69 ".challengerStartedAt=\"$(iso_at "$ARMED_EPOCH")\" | .challengerDeadline=\"$(iso_at $(( ARMED_EPOCH + 5400 )))\""
+DELIVERED_EPOCH="$(( $(date -u +%s) - 600 ))"
+confirm_unchanged() { # <label> <args...>: refused, nothing written
+  local label="$1" before out; shift
+  before="$(jq -c '[.challengerDeadline,.challengerStartedAt,.challengerProvisionalDeadline]' "$STATE_DIR/pr-69-state.json")"
+  out="$(bash "$GATE" challenger-start "$@")" && rc=0 || rc=$?
+  jq -e '.ok == false' <<<"$out" >/dev/null || { echo "7f: $label was not refused: $out" >&2; exit 1; }
+  [ "$(jq -c '[.challengerDeadline,.challengerStartedAt,.challengerProvisionalDeadline]' "$STATE_DIR/pr-69-state.json")" = "$before" ] ||
+    { echo "7f: $label wrote state" >&2; exit 1; }
+  printf '%s\n' "$out"
+}
+confirm_unchanged "a malformed delivery time" run-start owner-start-2 --delivered not-a-time | jq -e '.error | test("ISO-8601")' >/dev/null
+confirm_unchanged "an unknown flag" run-start owner-start-2 --at "$(iso_at "$DELIVERED_EPOCH")" | jq -e '.error | test("usage")' >/dev/null
+CONFIRM_OUT="$(bash "$GATE" challenger-start run-start owner-start-2 --delivered "$(iso_at "$DELIVERED_EPOCH")")"
+jq -e --arg at "$(iso_at "$DELIVERED_EPOCH")" --arg d "$(iso_at $(( DELIVERED_EPOCH + 5400 )))" '
+  .ok == true and .started == true and .confirmed == true and .challengerStartedAt == $at and .challengerDeadline == $d' \
+  <<<"$CONFIRM_OUT" >/dev/null || { echo "7f: the confirm did not anchor at the delivery time: $CONFIRM_OUT" >&2; exit 1; }
+jq -e --arg d "$(iso_at $(( DELIVERED_EPOCH + 5400 )))" \
+  '.challengerDeadline == $d and .challengerProvisionalDeadline == null' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7f: the confirmed start was not written final" >&2; exit 1; }
+START_DEADLINE="$(jq -r '.challengerDeadline' <<<"$CONFIRM_OUT")"
+# Final: neither a repeat confirm nor an arm moves it again.
+for extra in "" "--delivered $(iso_at $(( DELIVERED_EPOCH + 300 )))"; do
+  # shellcheck disable=SC2086
+  bash "$GATE" challenger-start run-start owner-start-2 $extra | jq -e --arg d "$START_DEADLINE" '
+    .ok == true and .started == false and .alreadyStarted == true and .confirmed == true and .challengerDeadline == $d' >/dev/null ||
+    { echo "7f: a confirmed start moved (extra: $extra)" >&2; exit 1; }
+done
 bash "$GATE" release run-start owner-start-2 | jq -e '.ok == true' >/dev/null
-jq -e '.challengerStartedAt == null and .challengerDeadline == null' "$STATE_DIR/pr-69-state.json" >/dev/null
+jq -e '.challengerStartedAt == null and .challengerDeadline == null and .challengerProvisionalDeadline == null' \
+  "$STATE_DIR/pr-69-state.json" >/dev/null
+# A root delivered before the armed deadline is confirmed even when that
+# deadline has passed by the time the receipt is read; one delivered after it
+# is not, and the window stays closed.
+bash "$GATE" claim run-edge 69 "$START_SHA" owner-edge | jq -e '.ok == true' >/dev/null
+EDGE_NOW="$(date -u +%s)"
+pr69 ".challengerStartedAt=\"$(iso_at $(( EDGE_NOW - 5460 )))\" | .challengerDeadline=\"$(iso_at $(( EDGE_NOW - 60 )))\" |
+  .challengerProvisionalDeadline=\"$(iso_at $(( EDGE_NOW - 1000 )))\""
+confirm_unchanged "a root delivered after the deadline" run-edge owner-edge --delivered "$(iso_at $(( EDGE_NOW - 30 )))" |
+  jq -e '.refusal == "deadline-passed"' >/dev/null
+confirm_unchanged "a re-arm past the deadline" run-edge owner-edge | jq -e '.refusal == "deadline-passed"' >/dev/null
+# Capped at the claim-time deadline plus the allowance.
+bash "$GATE" challenger-start run-edge owner-edge --delivered "$(iso_at $(( EDGE_NOW - 120 )))" |
+  jq -e --arg at "$(iso_at $(( EDGE_NOW - 120 )))" --arg d "$(iso_at $(( EDGE_NOW - 1000 + 3600 )))" '
+    .ok == true and .confirmed == true and .challengerStartedAt == $at and .challengerDeadline == $d' >/dev/null ||
+  { echo "7f: a root delivered before the armed deadline was not confirmed under the ceiling" >&2; exit 1; }
+bash "$GATE" release run-edge owner-edge >/dev/null
+# A future delivery time reads as now.
+bash "$GATE" claim run-future 69 "$START_SHA" owner-future | jq -e '.ok == true' >/dev/null
+FUTURE_OUT="$(bash "$GATE" challenger-start run-future owner-future --delivered "$(iso_at $(( $(date -u +%s) + 7200 )))")"
+FUTURE_AT="$(date -u -d "$(jq -r '.challengerStartedAt' <<<"$FUTURE_OUT")" +%s)"
+[ "$FUTURE_AT" -le "$(date -u +%s)" ] && jq -e '.ok == true and .confirmed == true' <<<"$FUTURE_OUT" >/dev/null ||
+  { echo "7f: a future delivery time was not read as now: $FUTURE_OUT" >&2; exit 1; }
+bash "$GATE" release run-future owner-future >/dev/null
+# Never moved back: a delivery time that would end the window before the
+# deadline already armed leaves that deadline in force.
+bash "$GATE" claim run-floor 69 "$START_SHA" owner-floor | jq -e '.ok == true' >/dev/null
+FLOOR_DL="$(bash "$GATE" challenger-start run-floor owner-floor | jq -r '.challengerDeadline')"
+bash "$GATE" challenger-start run-floor owner-floor --delivered "$(iso_at $(( $(date -u +%s) - 1800 )))" |
+  jq -e --arg d "$FLOOR_DL" '.ok == true and .confirmed == true and .challengerDeadline == $d' >/dev/null ||
+  { echo "7f: a confirm moved the armed deadline back" >&2; exit 1; }
+bash "$GATE" release run-floor owner-floor >/dev/null
 # The ceiling: an intake that ate most of the window gets the allowance, not a
 # full fresh window.
 bash "$GATE" claim run-slow 69 "$START_SHA" owner-slow | jq -e '.ok == true' >/dev/null

@@ -973,20 +973,26 @@ class EffectLayer:
             return {"ok": True}
         return {"ok": False, "error": (doc or {}).get("error") or err or "rc={}".format(rc)}
 
-    def challenger_start(self, run_id, token):
-        """Live: re-anchor the challenger deadline to the root post
-        (smoke-pr-gate.sh challenger-start), run just before the root goes out
-        so the post names the deadline the challenger actually has. Not an
-        obligation: the gate sets the deadline once and answers a repeat with
-        it, and any failure leaves the provisional claim-time deadline in
-        force. Shadow is a no-op."""
+    def challenger_start(self, run_id, token, delivered_at=None):
+        """Live: anchor the challenger deadline to the root post
+        (smoke-pr-gate.sh challenger-start). Without `delivered_at` it ARMS the
+        start just before an attempt of the root goes out, so the post names
+        the deadline the challenger has; with it, it CONFIRMS the start at the
+        root's delivery time, after which the gate never moves it again. Not
+        an obligation: a repeat is answered from the gate's state, and any
+        failure leaves the deadline in force. Shadow is a no-op."""
         if self.mode != "live" or not token:
             return None
-        rc, out, err = self._run(self.gate + ["challenger-start", run_id, token], 20)
+        argv = self.gate + ["challenger-start", run_id, token]
+        if delivered_at:
+            argv += ["--delivered", delivered_at]
+        rc, out, err = self._run(argv, 20)
         doc = last_json_line(out) if rc is not None else None
         if doc and doc.get("ok") is True and doc.get("challengerDeadline"):
+            final = doc.get("confirmed") is True or doc.get("alreadyStarted") is True
             return {"ok": True, "deadline": doc["challengerDeadline"], "startedAt": doc.get("challengerStartedAt"),
-                    "started": doc.get("started") is True}
+                    "started": doc.get("started") is True,
+                    "provisional": None if final else doc.get("provisionalDeadline")}
         # No answer at all is retryable: a call that timed out after its write
         # is answered on retry with the deadline it set.
         return {"ok": False, "refusal": (doc or {}).get("refusal"),
@@ -1808,10 +1814,11 @@ class GateView:
                 # only to recover a claim whose wake was lost.
                 out[run] = {"pr": pr, "sha": st.get("activeSha"), "deadline": st.get("challengerDeadline"),
                             "disposition": st.get("challengerDisposition"), "owner": st.get("activeLeaseOwner"),
-                            "claimant": st.get("activeClaimant"), "startedAt": st.get("challengerStartedAt")}
+                            "claimant": st.get("activeClaimant"), "startedAt": st.get("challengerStartedAt"),
+                            "provisional": st.get("challengerProvisionalDeadline")}
         return out
 
-    def note_challenger_start(self, run_id, deadline, started_at):
+    def note_challenger_start(self, run_id, deadline, started_at, provisional):
         """Carry a `challenger-start` the gate just committed into this fire's
         snapshot, so the root post rendered later in the same fire names the
         deadline the gate now holds rather than the provisional one read at
@@ -1820,6 +1827,7 @@ class GateView:
             if st.get("activeRunId") == run_id:
                 st["challengerDeadline"] = deadline
                 st["challengerStartedAt"] = started_at
+                st["challengerProvisionalDeadline"] = provisional
 
     def run_verdict(self, run_id):
         doc, err = read_json_file(os.path.join(self.dir, "runs", run_id, "verdict.json"))
@@ -2168,7 +2176,14 @@ class Controller:
         self.planned = set()
         self.fire_sends = {}
         self.driven = set()  # send keys already driven this fire (settled at most once)
-        self.receipts = self._load_json_arg(args.receipts_json, {})
+        # A receipt is a status string, or {status, at} carrying the host's
+        # delivered_at, which anchors the challenger's window to the root's
+        # actual delivery.
+        receipts = self._load_json_arg(args.receipts_json, {})
+        receipts = receipts if isinstance(receipts, dict) else {}
+        self.receipts = {mid: (r.get("status") if isinstance(r, dict) else r) for mid, r in receipts.items()}
+        self.receipt_at = {mid: r["at"] for mid, r in receipts.items()
+                           if isinstance(r, dict) and isinstance(r.get("at"), str) and r["at"]}
         self.tasks = self._load_json_arg(args.tasks_json, [])
         self.pr_heads = {str(k): v for k, v in self._load_json_arg(args.pr_heads_json, {}).items()}
         self.poll = self._load_json_arg(args.poll_json, None)
@@ -2359,7 +2374,10 @@ class Controller:
             mid = send_id(key, attempt)
             receipt = self.receipts.get(mid)
             if receipt == "delivered":
-                self.record(run_id, "send", slot, "delivered", attempt, {"messageId": mid})
+                detail = {"messageId": mid}
+                if mid in self.receipt_at:
+                    detail["deliveredAt"] = self.receipt_at[mid]
+                self.record(run_id, "send", slot, "delivered", attempt, detail)
                 return "delivered"
             if receipt != "failed":
                 # A missing receipt is ambiguous and waits; only a definitive
@@ -3391,38 +3409,41 @@ class Controller:
                     self.decide(run_id, "intake", "log", "mechanical",
                                 "critic output not in by {}s; root post goes without the design check".format(
                                     CRITIC_WAIT_SECONDS))
-        # The challenger's window starts at the root post: anchor
-        # the gate's deadline before the post's first attempt goes out, so the
-        # post states it. Once the root is enqueued it is too late to anchor
-        # without handing the challenger time past the post it answers.
+        # The challenger's window starts when the root post is delivered. Each
+        # attempt of the root is ARMED first, so the post names a deadline and
+        # a failed attempt does not spend the window; the delivery receipt
+        # then CONFIRMS the start at the delivery time (_confirm_challenger_start).
         root_ob = self.obligations().get(obligation_key(run_id, "send", "root"))
-        if self.live and not (claim or {}).get("startedAt") and \
-                (root_ob is None or root_ob["state"] in ("intent", "failed")):
+        if self.live and claim and (not claim.get("startedAt") or claim.get("provisional")) and \
+                self._root_attempt_due(run_id, root_ob):
             started = self.effects.challenger_start(run_id, run_ob["detail"].get("ownerToken"))
-            deadline = parse_iso((claim or {}).get("deadline"))
+            deadline = parse_iso(claim.get("deadline"))
             blind = bool(started) and GATE_REFUSALS.get(started.get("refusal")) == "blind"
+            hold_phase = "intake" if root_ob is None else "lanes"
             if started and started.get("ok"):
-                self.gate.note_challenger_start(run_id, started["deadline"], started["startedAt"])
+                self._note_challenger_start(run_id, claim, started)
             elif started and (blind or started.get("retryable")) and deadline and self.now < deadline:
                 # The gate decided nothing (it could not reach its lease store
-                # or lock, or never answered). Posting now would fix the
-                # claim-time deadline for good, so the root waits a fire. The
-                # claim-time deadline bounds the wait: past it, the root goes
-                # out and the timeout path takes over, as before.
+                # or lock, or never answered). Posting now would leave the
+                # window running from an earlier point, so the root waits a
+                # fire. The deadline in force bounds the wait: past it, the
+                # root goes out and the timeout path takes over, as before.
                 if blind:
                     self.ensure_alarm(run_id, "controller_gate_blind", "gate-blind:challenger-start",
                                       {"verb": "challenger-start", "refusal": started.get("refusal"),
                                        "error": started.get("error")})
-                self.decide(run_id, "intake", "wait", "wait", "challenger-start could not act yet; root post deferred",
+                self.decide(run_id, hold_phase, "wait", "wait", "challenger-start could not act yet; root post deferred",
                             refusal=started.get("refusal"), error=started.get("error"))
-                return "intake"
+                return hold_phase
             elif started and not started.get("refusal"):
                 # A coded refusal (no deadline, window closed or expired) is the
                 # gate stating a fact the timeout path already acts on; only an
                 # uncoded failure is news.
                 self.decide(run_id, "lanes", "log", "mechanical",
-                            "challenger-start failed; the claim-time deadline stands", error=started.get("error"))
+                            "challenger-start failed; the deadline in force stands", error=started.get("error"))
         root = self.send(run_id, "lanes", "root")
+        if self.live and claim and root == "delivered":
+            self._confirm_challenger_start(run_id, run_ob, claim)
         # PRP step 3: the sheet is a SEPARATE, later row so the host threads it
         # under the fresh root -- never before the root row exists.
         if run.has("contact-sheet/sheet.png") and root in ("enqueued", "delivered", "done"):
@@ -3627,6 +3648,60 @@ class Controller:
             if not early_err and isinstance(early, dict) and early.get("verdict") in ("BLOCKED", "HUMAN_DECISION"):
                 return None
         return self._maybe_challenger_timeout(run_id, claim, run)
+
+    def _root_attempt_due(self, run_id, root_ob):
+        """Will send() put an attempt of the root post out this fire? A first
+        attempt, a replay of one that never reached the helper, or a new one
+        after a definitive failed receipt."""
+        if root_ob is None:
+            return True
+        state, attempt = root_ob["state"], root_ob["attempt"]
+        if state == "intent":
+            return True
+        if state == "enqueued":
+            key = obligation_key(run_id, "send", "root")
+            return self.receipts.get(send_id(key, attempt)) == "failed" and attempt < MAX_SEND_ATTEMPTS
+        return state == "failed" and attempt < MAX_SEND_ATTEMPTS
+
+    def _note_challenger_start(self, run_id, claim, started):
+        self.gate.note_challenger_start(run_id, started["deadline"], started["startedAt"], started.get("provisional"))
+        claim.update({"deadline": started["deadline"], "startedAt": started["startedAt"],
+                      "provisional": started.get("provisional")})
+
+    def _confirm_challenger_start(self, run_id, run_ob, claim):
+        """The root post is delivered: move the challenger's start to the
+        delivery time the host recorded, once. The outcome is journaled on the
+        root's own obligation, so a settled confirm is never asked again; one
+        the gate could not decide is asked again next fire with the same
+        delivery time, so waiting costs the challenger nothing. The deadline in
+        force bounds that: once it passes, the timeout path below acts."""
+        ob = self.obligations().get(obligation_key(run_id, "send", "root"))
+        detail = (ob or {}).get("detail") or {}
+        if not detail.get("deliveredAt") or detail.get("challengerStart"):
+            return
+        started = self.effects.challenger_start(run_id, run_ob["detail"].get("ownerToken"),
+                                                delivered_at=detail["deliveredAt"])
+        if not started:
+            return
+        blind = GATE_REFUSALS.get(started.get("refusal")) == "blind"
+        if started.get("ok"):
+            self._note_challenger_start(run_id, claim, started)
+            outcome = "confirmed"
+        elif blind or started.get("retryable"):
+            if blind:
+                self.ensure_alarm(run_id, "controller_gate_blind", "gate-blind:challenger-start",
+                                  {"verb": "challenger-start", "refusal": started.get("refusal"),
+                                   "error": started.get("error")})
+            self.decide(run_id, "lanes", "wait", "wait", "challenger-start could not confirm the delivered root yet",
+                        refusal=started.get("refusal"), error=started.get("error"))
+            return
+        else:
+            if not started.get("refusal"):
+                self.decide(run_id, "lanes", "log", "mechanical",
+                            "challenger-start at delivery failed; the deadline in force stands",
+                            error=started.get("error"))
+            outcome = started.get("refusal") or "failed"
+        self.record(run_id, "send", "root", ob["state"], ob["attempt"], {"challengerStart": outcome})
 
     def _maybe_challenger_timeout(self, run_id, claim, run):
         deadline = parse_iso(claim.get("deadline"))
