@@ -2666,7 +2666,8 @@ enforced: with the freeze handoff on, the develop gate reads the PR gate's env
 file (`SMOKE_CONTROLLER_ENV_FILE`, default `/workspace/agent/smoke-gate-env.sh`)
 as data with the controller renewer's literal reader
 (`scripts/smoke-env-literal.sh`, never sourced) and refuses unless every prefix
-there is a literal equal to its own (a migrations list in any order). A
+there is a literal that passes the layout validator and equals its own (a
+migrations list in any order). A
 disagreement, or an unreadable file, is `gate_misconfigured` naming the keys:
 on every tick and in `config`, paging once per 6h while it lasts, and no
 freeze is cut until the files agree. Run both before a gate change goes live:

@@ -1127,6 +1127,16 @@ agree_case absent '["SMOKE_GATE_MIGRATIONS_PREFIX"]' "$A_FE" "$A_BE"
 agree_case non-literal '["SMOKE_GATE_BACKEND_PREFIX"]' "$A_FE" 'export SMOKE_GATE_BACKEND_PREFIX="${ROOT}api/"' "$A_MI"
 agree_case literal-then-non-literal '["SMOKE_GATE_BACKEND_PREFIX"]' "$A_FE" "$A_BE" 'export SMOKE_GATE_BACKEND_PREFIX="$ROOT"' "$A_MI"
 agree_case unset '["SMOKE_GATE_FRONTEND_PREFIX"]' "$A_FE" "$A_BE" "$A_MI" 'unset SMOKE_GATE_FRONTEND_PREFIX'
+# Equal after normalizing is not enough: each side must pass the layout validator.
+agree_case duplicate-element '["SMOKE_GATE_MIGRATIONS_PREFIX"]' "$A_FE" "$A_BE" 'export SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/,api/migrations/'
+printf '%s\n' "$A_FE" "$A_BE" 'export SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations' >"$CONTROLLER_ENV.case"
+OUT="$(SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.case" bash "$GATE" poll)"
+jq -e '.data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_MIGRATIONS_PREFIX") != null)' <<<"$OUT" >/dev/null ||
+  uc_fail "an invalid migrations prefix both files agree on was accepted: $OUT"
+printf '%s\n' "$A_FE" "$A_BE" "$A_MI" >"$CONTROLLER_ENV.case"
+OUT="$(SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/,api/migrations/ SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.case" bash "$GATE" poll)"
+jq -e '.data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_MIGRATIONS_PREFIX") != null)' <<<"$OUT" >/dev/null ||
+  uc_fail "a duplicate element in this gate's own migrations list was accepted: $OUT"
 OUT="$(SMOKE_CONTROLLER_ENV_FILE="$CONTROLLER_ENV.absent" bash "$GATE" poll)"
 jq -e '.data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_CONTROLLER_ENV_FILE") != null)' <<<"$OUT" >/dev/null ||
   uc_fail "a missing PR-gate env file was not named: $OUT"
