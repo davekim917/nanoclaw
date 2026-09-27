@@ -64,9 +64,9 @@ interface StdioMcpServerConfig {
    */
   plugin?: string;
   instructions?: string;
-  /** Capability-snapshot label (default: the name, capitalized). Host-only: stripped before reaching a container. */
+  /** Capability-snapshot label (default: the name, capitalized). Stripped from the env payload, not container.json. */
   displayName?: string;
-  /** Capability-list line (default: a generic transport line). Host-only, unlike always-in-context `instructions`. */
+  /** Capability-list line (default: a generic transport line). Env-stripped like displayName, unlike `instructions`. */
   description?: string;
 }
 
@@ -524,10 +524,8 @@ export interface ContainerConfig {
   assistantName?: string;
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
-  /** Per-session container resource request and hard ceilings. */
   resources?: ContainerResources;
 
-  /** Per-session container privilege hardening (capabilities, no-new-privileges). */
   security?: SecurityConfig;
 
   /** What the container_configs row materializes for `ncl` (distinct from the default* intent fields below). */
@@ -540,7 +538,10 @@ export interface ContainerConfig {
   /** `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (tokens); absent = fleet default. Not mirrored to the DB. */
   autoCompactWindow?: number;
 
-  /** Opt-in route while `provider` is recorded unavailable; without it an outage fails loudly. */
+  /**
+   * Opt-in route while `provider` is recorded unavailable; without it an outage fails loudly. A different vendor
+   * loses an adversarial pairing's independence: groups that care must say so in their own output.
+   */
   providerFallback?: {
     provider: string;
     model?: string;
@@ -566,7 +567,6 @@ export interface ContainerConfig {
    */
   excludePlugins?: string[];
 
-  /** Fleet MCP server names to withhold from this group. */
   excludeMcpServers?: string[];
 
   /** Mount host `~/.wix` RW for the Wix CLI's OAuth session. Default OFF: one tenant's CLI, no fleet-wide use. */
