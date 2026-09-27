@@ -1,17 +1,8 @@
 /**
- * Host storage manager.
- *
- * Reclaims only regenerable storage:
- *   - package/build caches inside idle session and thread worktrees
- *   - dependency-install trees inside idle topic worktrees (data/v2-topics)
- *   - per-session archive/central database projections rebuilt on container spawn
- *   - per-session Codex plugin caches rebuilt on container spawn
- *   - stopped containers carrying this NanoClaw install's ownership label
- *   - unused NanoClaw images and bounded Docker builder cache
- *
- * It deliberately does not remove canonical DBs, session inbound/outbound DBs,
- * source checkouts, .git directories, or anything attached to a live/in-flight
- * session.
+ * Host storage manager. Reclaims only regenerable storage: caches and dependency trees in idle worktrees,
+ * per-session projections and Codex plugin caches rebuilt on spawn, this install's stopped containers, unused
+ * images and bounded builder cache. Never canonical DBs, session DBs, source checkouts, .git directories, or
+ * anything attached to a live or in-flight session.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -39,11 +30,8 @@ import {
   type PackageOutcome,
 } from './dependency-cache.js';
 import { type RawStatements, withCentralSync, withRawDb } from './db/central-lease.js';
-// Every remaining `getRawDb()` in this file executes in the storage maintenance
-// worker thread (`storage-maintenance-worker-thread.ts`), which opens its own
-// connection with `initDb` and has no host lease to join — the report and the
-// reclaim executors are only reachable through that thread. The one host-side
-// entry point, `finishInterruptedSessionArchivals`, takes the lease. Pinned by
+// Every `getRawDb()` here runs in the storage worker thread, on its own connection with no host lease to join;
+// the one host-side entry point, `finishInterruptedSessionArchivals`, takes the lease. Pinned by
 // `src/db/raw-outside-lease.test.ts`.
 import { getRawDb } from './db/connection.js';
 import { CONTAINER_CONFIGS_ALL_SQL } from './db/container-configs.js';
@@ -51,19 +39,9 @@ import type { ContainerConfigRow } from './types.js';
 import { log } from './log.js';
 import { listTopicCheckouts, resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { STORAGE_INTERNAL_ENTRY_NAMES, tryRunWithStorageCleanupClaim } from './storage-activity.js';
-// The session-directory LAYOUT, not the data: this file's reclaim probes open
-// their own read-only handles, so all they need from the seam is where a
-// session's two files live.
-//
-// This is the ONE documented exemption on the host half of the raw-access
-// ratchet (`src/mailbox/RATCHET.json`, asserted by
-// `src/mailbox-seam-ratchet.test.ts`). The probes run in a WORKER THREAD over
-// an INJECTED sessions root — the reclaim scans a directory tree it is handed,
-// including roots that are not this install's `DATA_DIR` — and the mailbox is
-// keyed by `DATA_DIR`, so it cannot address them. They are also strictly
-// read-only (`readonly: true, fileMustExist: true`), never provision, and
-// answer `null` for "could not tell", which every caller treats as
-// fail-closed. Nothing else on the host may open a session DB directly.
+// The one documented exemption on the host raw-access ratchet (`src/mailbox/RATCHET.json`): the probes run in a
+// worker over an injected sessions root the DATA_DIR-keyed mailbox cannot address. They are read-only, never
+// provision, and answer `null` ("could not tell", fail closed). Nothing else on the host opens a session DB.
 import { resolveInboundDbPath, sessionMailboxDir, sessionMailboxPath } from './modules/mailbox/index.js';
 import { sessionContextPathFor, sessionsBaseDir, threadsBaseDir, threadWorktreeDir } from './session-manager.js';
 
@@ -78,55 +56,31 @@ const DEFAULT_CLEANUP_TARGET_MARGIN_PCT = 3;
 const DEFAULT_EMERGENCY_RETRY_SECONDS = 60;
 const DEFAULT_IMAGE_RETENTION_HOURS = 168;
 const DEFAULT_LEGACY_IMAGE_GRACE_HOURS = 168;
-/**
- * The only environment inputs that decide whether new containers are refused
- * for storage pressure. Exported for host scripts that must report the same
- * validated policy without re-implementing its clamping rules.
- */
+/** The only env inputs that decide storage-pressure refusal; exported so host scripts report the same policy. */
 export const STORAGE_ADMISSION_POLICY_ENV_KEYS = [
   'NANOCLAW_STORAGE_MANAGER_ENABLED',
   'NANOCLAW_STORAGE_CLEANUP_THRESHOLD_PCT',
   'NANOCLAW_DOCKER_PRUNE_THRESHOLD_PCT',
   'NANOCLAW_STORAGE_ADMISSION_REFUSE_PCT',
 ] as const;
-// Archive-then-reclaim: a thread worktree dir idle this long is tarred
-// (minus regenerable dirs) into data/thread-rescues/ and then removed.
-// Owner-approved policy 2026-08-05; 47GB of never-reclaimed checkouts
-// (oldest from May) motivated it.
+// A thread worktree dir idle this long is tarred (minus regenerable dirs) into data/thread-rescues/ and removed.
 const DEFAULT_WORKTREE_RECLAIM_DAYS = 30;
-// Session archival is bounded per pass. Without a cap, one cohort of sessions
-// crossing the age threshold together is a single-tick tar+rm stampede (1,041
-// archives on 2026-08-05 was exactly that).
-//
-// Measured 2026-08-19: the 50 archives of one tick applied in 10s (~0.2s each),
-// while the unavoidable scan over all 6,939 session dirs cost ~15s. The count
-// was sized far below what the work justified — the expensive half of a pass
-// happens whether the budget is 50 or 500. Against ~250 sessions created per
-// day, 50/tick × 24 hourly ticks left only 4.8x headroom and a five-day drain
-// on the standing backlog; 500 makes it ~48x and under a day.
+// Bounded per pass so a cohort crossing the age threshold together is not one tar+rm stampede. The directory
+// scan dominates a pass's cost, so the count is sized to drain the backlog, not to save work.
 const DEFAULT_SESSION_RECLAIM_PER_TICK = 500;
-// The honest stampede guard is wall-clock, not count: a session tree can be
-// 5MB or 5GB, so N archives is not a bound on anything. Once this much time
-// has gone into archiving in the current pass, remaining archive actions skip
-// and are reconsidered next tick. 0 stops all archiving (test hook), it does
-// not disable the deadline.
+// The real stampede guard is wall-clock (a session tree can be 5MB or 5GB): past it, remaining archive actions
+// wait for the next tick. 0 stops all archiving (test hook); it does not disable the deadline.
 const DEFAULT_SESSION_RECLAIM_MAX_SECONDS = 120;
-// Rescue archives were written from 2026-08-05 onward and never pruned:
-// 1,152 session archives (4.6GB) plus 393 thread archives (1.8GB) by
-// 2026-08-19. Retention is deliberately longer than the reclaim horizons that
-// create them, so a wrongly-reclaimed session stays restorable well past the
-// point anyone would notice it missing.
+// Longer than the reclaim horizons that create archives, so a wrongly reclaimed session stays restorable well
+// past the point anyone would notice it missing.
 const DEFAULT_RESCUE_RETENTION_DAYS = 30;
-// 0 disables the count cap. Non-zero makes the oldest-idle sessions above the
-// cap eligible regardless of age.
+// 0 disables the count cap. Non-zero makes the oldest-idle sessions above the cap eligible regardless of age.
 const DEFAULT_SESSION_ACTIVE_CAP = 0;
 const THREAD_RESCUES_DIRNAME = 'thread-rescues';
 /** Append-only record of every completed archival; the restore/finish authority. */
 export const SESSION_RECLAIM_JOURNAL_FILENAME = 'reclaim-journal.jsonl';
-// Regenerable trees excluded from rescue archives — pure reinstallable weight.
-// NOT a deletion allowlist: skipping a tree here only declines to copy it, and
-// the original stays on disk. `REGENERABLE_SWEEP_DIR_NAMES` below is the list
-// that authorizes removal, and it is deliberately narrower. Do not merge them.
+// Excluded from rescue archives only (not worth the bytes). NOT a deletion allowlist:
+// `REGENERABLE_SWEEP_DIR_NAMES` authorizes removal and is deliberately narrower. Do not merge them.
 const ARCHIVE_EXCLUDED_DIR_NAMES = [
   'node_modules',
   '.pnpm-store',
@@ -144,49 +98,16 @@ const parsedIdleHours = Number(process.env.SESSION_ARTIFACT_IDLE_HOURS);
 export const SESSION_ARTIFACT_IDLE_MS =
   (Number.isFinite(parsedIdleHours) && parsedIdleHours > 0 ? parsedIdleHours : DEFAULT_IDLE_HOURS) * 60 * 60 * 1000;
 
-// Regenerable trees under an idle topic worktree are swept on a much shorter
-// clock than anything else here. Measured 2026-09-01: one sampled topic held
-// 1.5GB, 1.3GB of it node_modules, across ~547 topics — ~130GB of dependency
-// trees. npm is authoritative for the repos that dominate that (13 `npm ci`
-// invocations across their CI workflows), and npm has no content store and no
-// hardlinks, so every install is a full copy and nothing dedupes them.
+// Idle topic dependency trees go on a much shorter clock: npm has no content store or hardlinks, so every
+// install is a full copy and topics carried ~130GB of them.
 const DEFAULT_REGENERABLE_SWEEP_DAYS = 2;
 const TOPICS_DIRNAME = 'v2-topics';
 const TOPIC_WORKTREES_DIRNAME = 'worktrees';
-// DELIBERATELY NARROWER THAN `ARCHIVE_EXCLUDED_DIR_NAMES` — do not merge the
-// two lists. They answer different questions:
-//
-//   - the archive list answers "is it worth the bytes to tar this?" A name on
-//     it is merely not worth archiving; the original stays on disk either way,
-//     so a wrong entry costs nothing.
-//   - THIS list answers "may we recursively delete this from a live checkout?"
-//     A wrong entry destroys the only copy.
-//
-// So this one holds ONLY names whose contents are reconstructible from a file
-// that is itself under version control. Every exclusion below is on the archive
-// list and deliberately not here:
-//
-//   - `dist`, `build`, `.next`, `coverage` — plenty of repos track them, and an
-//     agent's uncommitted output can sit in them.
-//   - `.cache` — a generic name that can mean anything, which is the same
-//     argument in weaker form.
-//   - `.venv` (and any `venv`/`.venv*` spelling) — the tempting one, and still
-//     wrong. A virtualenv is reconstructible only if a requirements.txt or
-//     lockfile pins it; one grown by ad-hoc `pip install` with nothing
-//     committed is unique state, and nothing here can tell the two apart
-//     without the per-target git machinery this sweep exists to avoid. Do not
-//     re-add it on "it's just a dependency cache" reasoning. Measured
-//     2026-09-01: zero `.venv*` or `venv` directories anywhere under
-//     data/v2-topics (depth 8), so it was never buying anything either.
-//
-// `__pycache__` survives that bar where `.venv` does not: PEP 3147 bytecode is
-// not importable without its adjacent `.py`, so a `__pycache__/*.pyc` can never
-// be the only copy of anything. Verified on CPython 3.12 — removing the source
-// and keeping `__pycache__` raises ModuleNotFoundError rather than importing.
-// Worst case for deleting it is a recompile on next import.
-//
-// Cost of the narrowing is close to zero: the measurement that motivated this
-// sweep was node_modules at ~1.3GB of a 1.5GB topic.
+// May we recursively delete this from a live checkout? A wrong entry destroys the only copy, so only names
+// whose contents are reconstructible from a version-controlled file belong here. Deliberately excluded: `dist`,
+// `build`, `.next`, `coverage` (often tracked, may hold uncommitted output), `.cache` (means anything), and
+// `.venv`/`venv` (an ad-hoc `pip install` venv is unique state; do not re-add it as "just a cache").
+// `__pycache__` qualifies: PEP 3147 bytecode is not importable without its `.py`, so it is never the only copy.
 const REGENERABLE_SWEEP_DIR_NAMES = new Set<string>(['node_modules', '.pnpm-store', '.turbo', '__pycache__']);
 
 const PRUNABLE_DIR_NAMES = new Set(['node_modules', '.pnpm-store', '.turbo', '.cache']);
@@ -214,36 +135,23 @@ export interface StoragePolicy {
   cleanupThresholdPct: number;
   admissionRefusePct: number;
   idleArtifactMs: number;
-  /** Archive-then-reclaim threshold for whole thread worktree dirs. */
   worktreeReclaimMs: number;
-  /**
-   * Archive-then-reclaim threshold for whole SESSION dirs. Its own knob, so
-   * sessions and thread worktrees can age out on different clocks; unset it
-   * falls back to `worktreeReclaimMs` (the pre-split behavior).
-   */
+  /** Its own knob so sessions and thread worktrees age on different clocks; unset falls back to `worktreeReclaimMs`. */
   sessionReclaimMs: number;
-  /** Ceiling on session archivals per maintenance pass. */
   sessionReclaimPerTick: number;
-  /** Wall-clock ceiling on the archiving portion of one maintenance pass. */
   sessionReclaimMaxMs: number;
   /** Age at which a rescue archive is pruned; 0 disables rescue retention. */
   rescueRetentionMs: number;
   /** Target ceiling on active sessions; 0 disables the count cap. */
   sessionActiveCap: number;
   /**
-   * Idle threshold for sweeping regenerable dependency-install trees out of topic
-   * worktrees. Its own (short) clock: unlike a whole topic dir, these trees can
-   * never hold work, so they do not need the topic GC's git proofs, quarantine,
-   * or CAS machinery. 0 disables the sweep.
+   * Idle threshold for sweeping regenerable dependency trees out of topic worktrees. A short clock without the
+   * topic GC's git proofs, because these trees can never hold work. 0 disables the sweep.
    */
   regenerableSweepMs: number;
   /**
-   * `NANOCLAW_DEPENDENCY_CACHE` (docs/specs/repository-branch-clones/plan.md
-   * §5.7.8). `off` leaves the regenerable sweep exactly as it was; `report`
-   * logs every dependency-cache decision and mutates nothing; `apply` shares
-   * eligible npm trees as verified hardlink farms inside the same sweep.
-   * `resolveStoragePolicy` always sets it; a hand-built policy without it is
-   * `off`.
+   * `NANOCLAW_DEPENDENCY_CACHE`: `off` leaves the sweep unchanged, `report` logs decisions and mutates nothing,
+   * `apply` shares eligible npm trees as verified hardlink farms. Absent means `off`.
    */
   dependencyCacheMode?: DependencyCacheMode;
   scanCadenceMs: number;
@@ -422,17 +330,13 @@ export interface StorageReport {
     busySessions: number;
     freshSessions: number;
     freshThreads: number;
-    /** Topics skipped because a running container bind-mounts them. */
     liveTopics: number;
-    /** Topics skipped because they are inside the regenerable sweep's idle window. */
     freshTopics: number;
     /** Sweep candidates refused for want of a recorded manifest beside them. */
     noManifestTrees: number;
-    /** Topics whose worktrees or activity inventory could not be read. */
     unreadableTopics: number;
     unreadableSessions: number;
     noActivitySessions: number;
-    /** Eligible sessions left for a later pass by the per-tick budget. */
     budgetDeferredSessions: number;
   };
   warnings: string[];
@@ -448,7 +352,6 @@ export interface StorageReportOptions {
   sessionsRoot?: string;
   threadsRoot?: string;
   topicsRoot?: string;
-  /** Injection seam for the real docker mount lookup the regenerable sweep gates on. */
   runningContainerMounts?: () => string[] | null;
   includeDocker?: boolean;
   respectCadence?: boolean;
@@ -482,10 +385,8 @@ const warnedInvalidKnobs = new Set<string>();
 let loggedSessionReclaimConfig = false;
 
 /**
- * Session-reclaim knobs are integers with a hard floor. An unparseable or
- * out-of-range value falls back to the default and warns exactly once per
- * process, so a typo degrades to the documented behavior instead of silently
- * disabling (or unbounding) reclaim.
+ * Integer knobs with a hard floor. An unparseable or out-of-range value falls back to the default and warns once,
+ * so a typo cannot silently disable or unbound reclaim.
  */
 function parseSessionKnob(name: string, fallback: number, min: number): number {
   const raw = process.env[name];
@@ -504,14 +405,8 @@ function parseSessionKnob(name: string, fallback: number, min: number): number {
 let warnedBadRegenerableSweepDays = false;
 
 /**
- * Idle days before regenerable trees are swept out of a topic worktree.
- *
- * UNSET (not in the environment at all) -> the deliberate default. Set to
- * anything that is not a plain non-negative integer — "" included (negative,
- * decimal, exponent notation, "abc", "NaN") -> DISABLED (0), not the default.
- * A typo meant to turn this off must never silently turn it on, so this is
- * fail-closed in the direction of doing nothing. Mirrors `topicIdleReclaimDays`
- * in worktree-cleanup.ts, which guards the same tree on the same reasoning.
+ * Unset means the default; any value that is not a plain non-negative integer ("" included) DISABLES the sweep,
+ * so a typo meant to turn it off never turns it on. Mirrors `topicIdleReclaimDays` in worktree-cleanup.ts.
  */
 function parseRegenerableSweepDays(): number {
   const raw = process.env.NANOCLAW_REGENERABLE_SWEEP_DAYS;
@@ -527,12 +422,9 @@ function parseRegenerableSweepDays(): number {
 let warnedBadDependencyCacheMode = false;
 
 /**
- * Read exactly like `parseRegenerableSweepDays`: from `process.env` at policy
- * resolution time, inside the storage worker. That worker is created after
- * main.ts's `loadEnvIntoProcess()` and inherits its environment, so a value set
- * only in `.env` arrives — the import-time capture trap in config.ts does not
- * apply to a call-time read. UNSET -> `off`. Anything else that is not one of
- * the three values -> `off` with one WARN: a typo must never turn it on.
+ * Read from `process.env` at call time inside the storage worker, which inherits main.ts's loaded `.env`, so the
+ * config.ts import-time capture trap does not apply. Unset means `off`; any other invalid value is `off` with one
+ * WARN.
  */
 function parseDependencyCacheMode(): DependencyCacheMode {
   const raw = process.env.NANOCLAW_DEPENDENCY_CACHE;
@@ -557,7 +449,6 @@ export interface StorageAdmissionPolicy {
   admissionRefusePct: number;
 }
 
-/** Resolve the storage-admission knobs shared by the spawn gate and host alerts. */
 export function resolveStorageAdmissionPolicy(
   env: Record<string, string | undefined> = process.env,
 ): StorageAdmissionPolicy {
@@ -655,8 +546,7 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     ...overrides,
   };
 
-  // Compatibility default: an install that never sets the session knob keeps
-  // ageing sessions on the shared worktree clock exactly as before the split.
+  // An install that never sets the session knob keeps sessions on the shared worktree clock.
   if (overrides.sessionReclaimMs === undefined && sessionReclaimDays === 0) {
     policy.sessionReclaimMs = policy.worktreeReclaimMs;
   }
@@ -721,12 +611,8 @@ function isPathInside(parent: string, child: string): boolean {
 }
 
 /**
- * Bytes a recursive delete of `root` would actually free (plan §5.8, R9).
- *
- * Only regular files with a link count of 1 count. A file hardlinked from
- * anywhere else — a dependency-cache farm's shared files, a pnpm store — keeps
- * its blocks after this path is gone, so counting it overstated every reclaim
- * estimate. Real usage still comes from `df` (`getFilesystemUsage`).
+ * Bytes a recursive delete of `root` would actually free: only regular files with link count 1, since a
+ * hardlinked file keeps its blocks. Real usage still comes from `df`.
  */
 export function dirSizeBytes(root: string): number {
   let total = 0;
@@ -807,44 +693,12 @@ function safeReaddirDirents(root: string): fs.Dirent[] {
 
 const SESSION_ACTIVITY_FILES = ['inbound.db', 'outbound.db', 'archive.db', 'central.db', '.heartbeat'] as const;
 
-// inbound.db is excluded from both idle gates, because something rewrites
-// every inbound.db in the fleet within a couple of minutes and resets the
-// whole mtime clock at once: 5,027 files on 2026-08-15 20:21-20:22 UTC, and
-// 2,167 of 2,404 on 2026-08-25 16:34-16:35 UTC.
-//
-// WHAT IS KNOWN vs WHAT IS ASSUMED. The rewrites are measured — file counts
-// and timestamps are from the live tree. The WRITER IS NOT IDENTIFIED. The
-// lazy on-open schema migration (`migrateMessagesInTable`) is the leading
-// hypothesis and is named here because it fits the shape, but attribution was
-// never confirmed, and commit dfa6e3db (2026-08-19) already added
-// manifest-and-restore around the reconcile pass on that theory and the event
-// still recurred on 08-25. `migrateMessagesInTable` has ~10 call sites
-// (now `src/modules/mailbox/schema.ts`, reached from every open funnel) with
-// no mtime bookkeeping on any of them, so the leak — whatever it is — is still
-// live and can poison any future consumer of inbound.db mtime.
-//
-// Excluding inbound from the gates is therefore SHIELDING, not a cure. It is
-// still the right shield: the host writes inbound.db and `sessions.last_active`
-// in the same path, so the central row already carries every real inbound
-// event, and `sessionHasOpenWork` independently refuses any session holding an
-// unconsumed inbound row. The other files stay in — they are container- and
-// host-written and can legitimately outrun the central row.
-//
-// The 2026-08-15 fix narrowed only the long-horizon reclaim age and left the
-// 24h freshness gate on the full set, reasoning that a too-new reading there
-// was harmless. It is not: a fleet-wide rewrite makes every session look fresh
-// and stalls the reaper entirely (328 sessions on 2026-08-25, 103 on 08-26,
-// against ~1,300/day before). Both gates now read this list — with one
-// documented hole: a session dir whose ONLY file is inbound.db has no narrowed
-// signal at all, and the `|| lastActivity` fallback below puts its inbound
-// mtime back in charge, migration rewrites included. That cohort is
-// never-woken sessions, the direction is conservative (it preserves), and it
-// predates this change; it is knowingly left alone rather than silently
-// claimed as covered.
-//
-// The full set stays correct for the PRE-APPLY revalidation, which only asks
-// "did anything at all touch this directory since planning" and where a
-// too-new reading genuinely is harmless — it aborts one action, not the pass.
+// inbound.db is excluded from both idle gates: something (unidentified; the lazy on-open schema migration is the
+// leading suspect) periodically rewrites every inbound.db in the fleet within minutes, which made every session
+// look fresh and stalled the reaper. This is shielding, not a cure. It is safe because the host writes
+// `sessions.last_active` on the same path and `sessionHasOpenWork` refuses any unconsumed inbound row. Known hole:
+// a dir whose only file is inbound.db falls back to the full reading below (conservative: it preserves). The
+// pre-apply revalidation keeps the full set, where a too-new reading only aborts one action.
 const SESSION_AGE_SIGNAL_FILES = SESSION_ACTIVITY_FILES.filter((name) => name !== 'inbound.db');
 
 function sessionLastActivityMs(sessPath: string, names: readonly string[] = SESSION_ACTIVITY_FILES): number {
@@ -875,27 +729,15 @@ function dbHasRows(dbPath: string, sql: string, params: unknown[] = []): boolean
 }
 
 /**
- * Is this session unsafe to reclaim?
- *
- * `null` means "could not tell" (unreadable DB) and callers treat it exactly
- * like `true` — reclaim fails closed.
- *
- * Any UNCONSUMED inbound row counts, including a `process_after` in the
- * future: a monthly recurrence is real pending work even though the session
- * has looked idle for weeks, and the due-only predicate this replaced could
- * not see it. Durable follow-up promises (`work_continuation`, and its legacy
- * `pending_next` spelling) live in outbound `session_state` and are checked
- * too — a container between turns owes that work even with no live claim.
+ * Is this session unsafe to reclaim? `null` ("could not tell") is treated exactly like `true`. Any unconsumed
+ * inbound row counts, including a future `process_after` (a monthly recurrence is real pending work), and so do
+ * durable follow-up promises in outbound `session_state`.
  */
 export function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
   const inbound = dbHasRows(
-    // The RESOLVER, not the legacy name. A container can still plant
-    // `<session>/inbound.db-journal` beside the legacy hard link, and a hot
-    // journal makes every READ-ONLY open fail — `dbHasRows` catches and returns
-    // `null`, which this function's callers treat exactly like `true`, so the
-    // session becomes permanently unreclaimable. Reading through the resolver
-    // opens `.host/inbound.db` instead, whose directory the container cannot
-    // write, so no planted sidecar can wedge it. Same inode either way.
+    // The resolver, not the legacy name: a container can plant `inbound.db-journal` beside the legacy link, and a
+    // hot journal fails every read-only open, which would make the session permanently unreclaimable. The
+    // resolver opens `.host/inbound.db`, whose directory the container cannot write. Same inode.
     resolveInboundDbPath(sessPath ?? sessionMailboxDir({ agentGroupId, sessionId })),
     `SELECT 1 AS found
        FROM messages_in
@@ -910,8 +752,7 @@ export function sessionHasOpenWork(agentGroupId: string, sessionId: string, sess
   const claimed = dbHasRows(outboundPath, "SELECT 1 AS found FROM processing_ack WHERE status = 'processing' LIMIT 1");
   if (claimed === null || claimed) return claimed;
 
-  // session_state is absent from older outbound DBs; a missing table reads as
-  // null (unreadable) from dbHasRows, which would block every legacy session.
+  // Older outbound DBs lack session_state; dbHasRows would read that as unreadable and block every legacy session.
   if (!sessionStateTableExists(outboundPath)) return false;
   return dbHasRows(
     outboundPath,
@@ -1006,21 +847,11 @@ function createDeleteArtifactAction(args: {
     apply: () => {
       let allowed = true;
       const claimed = tryRunWithStorageCleanupClaim(args.root, () => {
-        // Inside the claim, deliberately: the two protections compose only
-        // here. The claim refuses while any NanoClaw activity lease marker is
-        // present, so it covers our own spawn path; a `canApply` that asks the
-        // container runtime covers externally started containers, which plant
-        // no marker. Run outside the claim and a NanoClaw container can start
-        // between the check and the delete — inside, it cannot.
-        //
-        // HARD CONSTRAINT for anything added here, learned by shipping it
-        // wrong: `tryRunWithStorageCleanupClaim` creates and removes its own
-        // marker file inside `root`, which bumps `root`'s mtime. So a guard
-        // that reads the mtime of `root` (or of anything under it that this
-        // action deletes) is reading this pass's own footprint, and will refuse
-        // every time — a gate that looks conservative and is simply broken.
-        // Facts of that shape have to be settled at scan time; only facts this
-        // pass does not itself write can be re-proven here.
+        // Inside the claim, deliberately: the claim refuses while any activity lease exists (our spawns), and
+        // `canApply` asking the runtime covers external containers; outside it a container can start in between.
+        // HARD CONSTRAINT: the claim creates and removes a marker inside `root`, bumping its mtime, so a guard
+        // reading the mtime of `root` or anything this action deletes reads our own footprint and always refuses.
+        // Only facts this pass does not write may be re-proven here.
         if (args.canApply && !args.canApply()) {
           allowed = false;
           return;
@@ -1070,11 +901,9 @@ function isReadableSqliteDatabase(dbPath: string, requiredTable?: string): boole
 function sessionProjectionSources(sessionsRoot: string): SessionProjectionSources {
   const dataRoot = path.dirname(sessionsRoot);
   return {
-    // Archive projections hold conversation history. Require the canonical history table,
-    // not merely a file that happens to open as SQLite, before reclaiming any projection.
+    // Archive projections hold conversation history: require the canonical history table, not just any SQLite file.
     archiveReady: isReadableSqliteDatabase(path.join(dataRoot, 'archive.db'), 'messages_archive'),
-    // central.db is a per-session projection too. Its canonical source must be readable
-    // before reclamation so cleanup never turns a source-database outage into data loss.
+    // A readable source first, so cleanup never turns a source-database outage into data loss.
     centralReady: isReadableSqliteDatabase(path.join(dataRoot, 'v2.db')),
   };
 }
@@ -1097,29 +926,21 @@ function isRealDirectory(dirPath: string): boolean {
   }
 }
 
-// ── Reclaim serializer ───────────────────────────────────────────────────────
-// Every production reclaim entry point (hourly maintenance, pressure
-// admission, force prune) lands in the single storage worker thread of a
-// single-process host, so one module-level budget IS the serializer: whoever
-// opens the pass sets the budget, anything that starts while it is open draws
-// from the same pool instead of getting a second one.
-// ponytail: if reclaim ever runs in more than one process, this becomes a lock
-// file under the sessions root — the call sites do not change.
+// Every production reclaim entry point lands in the single storage worker of a single-process host, so this
+// module-level budget is the serializer: anything starting while a pass is open draws from the same pool. If
+// reclaim ever runs in more than one process, this must become a lock file.
 let reclaimPassDepth = 0;
 let reclaimBudgetRemaining = 0;
 let reclaimEpochStartMs = 0;
 let reclaimDeadlineAt = Number.POSITIVE_INFINITY;
 
-// The budget is a lease on a stretch of time, not a per-call allowance. Under
-// the hourly scan cadence each tick opens a new epoch; anything that fires in
-// between — a pressure bypass, a force prune, a second call a minute later —
-// draws from the epoch already open instead of minting itself a fresh 50.
+// A lease on a stretch of time, not a per-call allowance: a pressure bypass or force prune between hourly ticks
+// draws from the open epoch instead of minting a fresh budget.
 const RECLAIM_BUDGET_EPOCH_MS = 45 * 60 * 1000;
 
 function beginReclaimPass(perTick: number, maxMs: number, now: number): void {
   if (reclaimPassDepth === 0) {
-    // Real elapsed time, not the (possibly injected) logical `now`: the
-    // deadline exists to protect a real host from a real long tar.
+    // Real elapsed time, not the injectable logical `now`: the deadline protects a real host from a real long tar.
     reclaimDeadlineAt = Date.now() + Math.max(0, maxMs);
     if (now - reclaimEpochStartMs >= RECLAIM_BUDGET_EPOCH_MS) {
       reclaimEpochStartMs = now;
@@ -1134,7 +955,6 @@ function endReclaimPass(): void {
   if (reclaimPassDepth === 0) reclaimDeadlineAt = Number.POSITIVE_INFINITY;
 }
 
-/** True once the pass has spent its archiving time budget. */
 function reclaimDeadlinePassed(): boolean {
   return Date.now() >= reclaimDeadlineAt;
 }
@@ -1147,30 +967,17 @@ function takeReclaimBudget(want: number): number {
 }
 
 export const SESSION_RESCUES_DIRNAME = 'session-rescues';
-// Secret material never enters a rescue archive: creds/ is re-materialized on
-// every spawn.
+// Secret material never enters a rescue archive: creds/ is re-materialized on every spawn.
 const SESSION_ARCHIVE_EXTRA_EXCLUDES = ['creds'];
-// Node's execFileSync defaults maxBuffer to 1MB per stream. A session dir is
-// archived while its agent may still be writing to it, so tar's "file changed
-// as we read it" warning is expected, not exceptional, and reliably blows past
-// that default — every archive-session then fails with `spawnSync tar
-// ENOBUFS` right when disk pressure needs the reclaim to actually work. Applied
-// to every tar invocation below (create and `-tf` verify/listing alike).
+// A live session dir makes tar warn "file changed as we read it", which overflows execFileSync's 1MB default
+// maxBuffer (ENOBUFS) exactly when disk pressure needs reclaim to work. Applied to every tar call below.
 const TAR_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
 /**
- * Create a tar archive, tolerating GNU tar's documented exit 1 ("some files
- * were changed while being archived" — `man tar` RETURN VALUE, verified on
- * this box against tar 1.35 by forcing the race: exit 1, and unaffected by
- * `--warning=no-file-changed`, which mutes only the message, not the status).
- * That is the expected outcome of archiving a dir its agent may still be
- * writing to, not a failure — treating it as fatal is what made every
- * archive-session on a live tree fail before this fix. Exit 2 (or anything
- * else, including a fatal subprocess failure passed through from zstd) still
- * throws. Safety is not weakened: content correctness is decided by the
- * `-tf` read-back and size/fsync checks the caller runs afterward, not by
- * this exit code, so a genuinely truncated or corrupt archive still fails
- * fast there.
+ * Create a tar archive, tolerating GNU tar's exit 1 ("some files were changed while being archived"), the
+ * expected outcome of archiving a dir its agent may still write; `--warning=no-file-changed` mutes only the
+ * message. Exit 2 or anything else throws. Content correctness is decided by the caller's `-tf` read-back and
+ * size/fsync checks, not this exit code.
  */
 function tarCreate(args: string[], options: Parameters<typeof execFileSync>[2]): void {
   try {
@@ -1186,10 +993,8 @@ interface CentralSessionRow {
 }
 
 /**
- * Central-DB row for a session dir, or null when the row is gone (orphan
- * dir), or 'unavailable' when the central DB cannot be read — in which case
- * session reclaim MUST NOT run (fail closed: without the row we cannot see
- * status or true activity).
+ * Central-DB row for a session dir, null when the row is gone (orphan dir), or 'unavailable' when the central DB
+ * cannot be read, in which case session reclaim MUST NOT run.
  */
 function centralSessionRow(sessionId: string): CentralSessionRow | null | 'unavailable' {
   try {
@@ -1214,12 +1019,6 @@ function reclaimJournalPath(rescuesDir: string): string {
   return path.join(rescuesDir, SESSION_RECLAIM_JOURNAL_FILENAME);
 }
 
-/**
- * Record one archival durably BEFORE the dir is removed. This line is what
- * makes both recovery directions mechanical: a crash between publish and rm is
- * finished from it at startup, and an operator restore reads the rescue path
- * and the status to put back.
- */
 function fsyncDir(dirPath: string): void {
   let fd: number;
   try {
@@ -1245,7 +1044,7 @@ function appendReclaimJournal(rescuesDir: string, entry: SessionReclaimJournalEn
   } finally {
     fs.closeSync(fd);
   }
-  // The line is durable but its directory entry may not be on first create.
+  // The line is durable, but its directory entry may not be on first create.
   fsyncDir(rescuesDir);
 }
 
@@ -1274,38 +1073,12 @@ export function readReclaimJournal(rescuesDir: string): Map<string, SessionRecla
 let reclaimJournalIdCache: { path: string; key: string; ids: Set<string> } | undefined;
 
 /**
- * True once the reclaim has decided to take this session, and true forever
- * after.
- *
- * This is the generation token for a session id. Every path that removes a
- * session directory appends the journal line first — `:1207` before the
- * `rmSync` at `:1230`, for all three `prior_status` values, and
- * `finishInterruptedSessionArchivals` only removes a directory when a line for
- * it already exists. Nothing ever deletes a line: rescue retention prunes only
- * `*.tar.zst`, and says so. Session ids are never reused.
- *
- * So this is the one fact about a session id that is monotone (`false -> true`,
- * once) and that outlives both the central row and the directory — which is
- * exactly what `status` and file existence are not, since a row is `closed`
- * for reasons other than reclaim (rotation supersedes a predecessor) and a
- * path can be deleted and recreated.
- *
- * INTENT, NOT COMPLETION. The line precedes the `archiving -> closed` CAS at
- * `:1215`, and `:1221` keeps the directory when that CAS loses. A caller that
- * must not refuse a session the reclaim ended up keeping has to pair this with
- * evidence the removal happened — see `writeSessionMessageLocked`.
- *
- * ponytail: size-keyed cache rather than a parse per call — the journal grows
- * one line per session ever reclaimed and this sits on the ingestion path.
- * `appendReclaimJournal` is the only writer and only ever appends, so the size
- * is strictly increasing and an exact key on its own. Truncating or rotating
- * the journal breaks that invariant — a size that repeats an earlier value
- * would serve a stale answer. `mtimeMs` rides along because it is the same
- * stat and costs nothing, and it covers a rewrite that lands on a repeated
- * size; it is a second belt, not the argument. If the journal ever does get
- * rotated, key this on content, not on the stat. A stat rather than an
- * in-process invalidation hook because the reclaim runs in a worker thread
- * whose appends no hook would see.
+ * True once the reclaim decided to take this session, forever after: the journal line precedes every removal,
+ * lines are never deleted, and ids are never reused, so unlike `status` or file existence this is monotone.
+ * INTENT, NOT COMPLETION: the line precedes the `archiving -> closed` CAS, and a lost CAS keeps the directory,
+ * so a caller that must not refuse a kept session pairs this with evidence of removal (see
+ * `writeSessionMessageLocked`). Cached by the journal's size (plus mtime), valid only because the journal is
+ * append-only: rotating or truncating it would serve stale answers.
  */
 export function sessionWasReclaimed(sessionId: string, sessionsRoot: string = sessionsBaseDir()): boolean {
   const rescuesDir = path.join(path.dirname(sessionsRoot), SESSION_RESCUES_DIRNAME);
@@ -1323,11 +1096,7 @@ export function sessionWasReclaimed(sessionId: string, sessionsRoot: string = se
   return reclaimJournalIdCache.ids.has(sessionId);
 }
 
-/**
- * A published rescue archive is one we can still LIST, not merely one that
- * exists with bytes in it. Recovery uses this to decide whether a session dir
- * may be removed, and a truncated zstd stream is a non-empty file.
- */
+/** Published means still listable: a truncated zstd stream is a non-empty file. */
 function isPublishedArchive(archivePath: string): boolean {
   try {
     const st = fs.statSync(archivePath);
@@ -1344,10 +1113,8 @@ function isPublishedArchive(archivePath: string): boolean {
 }
 
 /**
- * Put an interrupted archival's row back. The active triple is uniquely
- * indexed (migration 049), so if a fresh session claimed this session's triple
- * while it was 'archiving', reviving it as 'active' would violate that index —
- * the old row is history at that point and closes instead.
+ * The active triple is uniquely indexed (migration 049): if a fresh session claimed it while this row was
+ * 'archiving', reviving it would violate the index, so the old row closes instead.
  */
 function isConstraintViolation(err: unknown): boolean {
   return (
@@ -1356,25 +1123,20 @@ function isConstraintViolation(err: unknown): boolean {
   );
 }
 
-/**
- * `db` is the storage worker thread's own handle from the reclaim executors,
- * or the `withRawDb` facade from the host's boot-time finisher below.
- */
+/** `db` is the worker's own handle, or the host's `withRawDb` facade from the boot-time finisher. */
 function releaseArchivingRow(db: RawStatements, sessionId: string): 'active' | 'closed' | 'failed' {
   try {
     db.prepare("UPDATE sessions SET status = 'active' WHERE id = ? AND status = 'archiving'").run(sessionId);
     return 'active';
   } catch (err) {
-    // The ONLY expected failure: a fresh session claimed this row's active
-    // triple while it was archiving (migration 049). That row is history now.
+    // The only expected failure: a fresh session claimed this row's active triple while it was archiving.
     if (isConstraintViolation(err)) {
       db.prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
       log.warn('storage-manager: archiving row lost its triple to a newer session, closed instead', { sessionId });
       return 'closed';
     }
-    // Anything else (locked DB, disk full) must NOT become a silent close —
-    // that would hide an intact session dir from every sweep forever. Leave it
-    // in 'archiving' and let the next startup finisher retry, loudly.
+    // Anything else must not become a silent close, which would hide an intact dir from every sweep forever:
+    // leave it 'archiving' for the startup finisher to retry, loudly.
     log.error('storage-manager: could not release an archiving session row; left for startup recovery', {
       sessionId,
       err,
@@ -1384,19 +1146,10 @@ function releaseArchivingRow(db: RawStatements, sessionId: string): 'active' | '
 }
 
 /**
- * Archive-then-reclaim one whole session dir. findSessionForAgent only matches
- * status='active', so the next inbound for the same thread creates a FRESH
- * session with a fresh dir (initSessionFolder is idempotent) — conversation
- * history stays in the canonical data/archive.db. The rescue
- * archive preserves the session DBs, provider continuity files, and any
- * worktree content minus regenerable trees and creds.
- *
- * The lifecycle is ordered so no crash can lose the dir without a readable
- * archive standing in for it:
- *   revalidate → CAS active→archiving → temp tar → validate → atomic publish
- *   → journal → CAS archiving→closed → rm
- * `archiving` is a real, sweep-invisible state; `finishInterruptedSessionArchivals`
- * resolves whatever a crash left behind.
+ * Archive-then-reclaim one whole session dir. The next inbound for the thread creates a fresh session (only
+ * 'active' rows match); history stays in data/archive.db. Ordered so no crash can lose the dir without a
+ * readable archive: revalidate, CAS active->archiving, temp tar, validate, atomic publish, journal, CAS
+ * archiving->closed, rm. `finishInterruptedSessionArchivals` resolves whatever a crash left behind.
  */
 function createArchiveSessionAction(args: {
   id: string;
@@ -1422,8 +1175,7 @@ function createArchiveSessionAction(args: {
       'Whole long-idle session dir; DBs and worktree content preserved in a zstd rescue archive before removal (creds and regenerable trees excluded). Re-validated immediately before acting, and the row is held in "archiving" until the archive is published so the next inbound message creates a fresh session.',
     status: 'planned',
     apply: () => {
-      // The pass has spent its archiving time; leave the rest for the next
-      // tick rather than holding the storage worker for an unbounded stretch.
+      // Past the pass's archiving time: leave the rest for the next tick.
       if (reclaimDeadlinePassed()) return false;
       let acted = true;
       const claimed = tryRunWithStorageCleanupClaim(args.sessPath, () => {
@@ -1435,9 +1187,7 @@ function createArchiveSessionAction(args: {
           throw new Error(`refusing to archive non-directory or symlink: ${args.sessPath}`);
         }
 
-        // Collection and apply are separated by the rest of the pass, which
-        // can be minutes of tar work. Anything that made this session live in
-        // between wins; the next pass will reconsider it.
+        // Minutes of tar work can separate collection from apply; anything that made this session live wins.
         if (args.isContainerRunning(args.sessionId)) {
           acted = false;
           return;
@@ -1451,8 +1201,7 @@ function createArchiveSessionAction(args: {
           return;
         }
 
-        // Claim the row before touching the disk. An 'unavailable' DB throws
-        // out of here and the dir is kept (fail closed).
+        // Claim the row before touching the disk; an 'unavailable' DB throws and the dir is kept.
         if (args.sessionStatus === 'active') {
           const claimedRow = getRawDb()
             .prepare("UPDATE sessions SET status = 'archiving' WHERE id = ? AND status = 'active'")
@@ -1474,16 +1223,7 @@ function createArchiveSessionAction(args: {
             [
               '-I',
               'zstd -T0',
-              // The tree is live while we read it (the agent may still be
-              // writing), so tar's own "file changed as we read it" notice
-              // (and the exit 1 that comes with it, tolerated by tarCreate
-              // above) is the expected case here, not a sign of trouble —
-              // silencing the message just cuts noise, since suppressing it
-              // does NOT change the exit status. Correctness is decided by
-              // the `-tf` verify pass and the size/fsync checks below, not by
-              // the exit code or by parsing warning text, so none of this
-              // hides a genuinely corrupt archive. Every OTHER warning class
-              // stays on.
+              // Expected on a live tree (see tarCreate); the -tf verify decides correctness. Other warnings stay on.
               '--warning=no-file-changed',
               ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
               ...SESSION_ARCHIVE_EXTRA_EXCLUDES.map((name) => `--exclude=${name}`),
@@ -1499,23 +1239,21 @@ function createArchiveSessionAction(args: {
           if (!archiveSt.isFile() || archiveSt.size === 0) {
             throw new Error(`rescue archive missing or empty: ${tempPath}`);
           }
-          // Readable, not merely present: a truncated zstd stream is a file
-          // with bytes in it and would still license the delete.
+          // Readable, not merely present: a truncated zstd stream would still license the delete.
           execFileSync('tar', ['-I', 'zstd -T0', '-tf', tempPath], {
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: 60 * 60 * 1000,
             maxBuffer: TAR_MAX_BUFFER_BYTES,
           });
-          // tar exited, but its bytes may still be page cache. The rename is
-          // durable; the CONTENT has to be too, or a crash publishes an empty
-          // archive that then licenses deleting the only copy.
+          // The content must be durable too, or a crash publishes an empty archive that licenses deleting the
+          // only copy.
           const tempFd = fs.openSync(tempPath, fs.constants.O_RDONLY);
           try {
             fs.fsyncSync(tempFd);
           } finally {
             fs.closeSync(tempFd);
           }
-          // Publish atomically — a rescue path only ever exists complete.
+          // Publish atomically: a rescue path only ever exists complete.
           fs.renameSync(tempPath, archivePath);
           fsyncDir(args.rescuesDir);
         } catch (err) {
@@ -1535,9 +1273,8 @@ function createArchiveSessionAction(args: {
           const closed = getRawDb()
             .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
             .run(args.sessionId).changes;
-          // The row stopped being ours between the claim and here. The archive
-          // is published and journalled, so nothing is lost — but the dir now
-          // belongs to whoever moved the row, and removing it is not our call.
+          // The row stopped being ours after the claim; the archive is published and journaled, but removing the
+          // dir is no longer our call.
           if (closed !== 1) {
             log.error('storage-manager: archiving row changed under an archival; dir kept', {
               sessionId: args.sessionId,
@@ -1548,9 +1285,7 @@ function createArchiveSessionAction(args: {
           }
         }
         fs.rmSync(args.sessPath, { recursive: true, force: true });
-        // The runner context file is a SIBLING of the session directory
-        // (<group>/.context/<session>.json), so removing the directory does
-        // not take it. Left behind, every reclaimed session leaks one.
+        // The runner context file is a sibling of the session directory, so removing the directory leaks it.
         fs.rmSync(sessionContextPathFor(args.sessPath), { force: true });
       });
       return claimed && acted;
@@ -1559,16 +1294,9 @@ function createArchiveSessionAction(args: {
 }
 
 /**
- * Startup finisher for archivals a host stop interrupted. Idempotent, and
- * deliberately journal-gated: a `closed` session dir is only removed when a
- * journal line names a published archive for it, so the ~1,200 sessions closed
- * by ordinary session-close paths are never touched.
- */
-/**
- * Host-side, at boot (`main.ts`), so it runs under the central lease: the row
- * reads and the status flips are one synchronous block with nothing able to
- * interleave. The reclaim executors above run in the storage worker thread on
- * that thread's own connection and take no host lease.
+ * Startup finisher for archivals a host stop interrupted. Idempotent and journal-gated: a `closed` dir is removed
+ * only when a journal line names a published archive for it. Runs on the host at boot, under the central lease,
+ * so row reads and status flips are one synchronous block.
  */
 export async function finishInterruptedSessionArchivals(sessionsRoot: string = sessionsBaseDir()): Promise<{
   released: number;
@@ -1596,9 +1324,7 @@ export async function finishInterruptedSessionArchivals(sessionsRoot: string = s
         for (const row of archiving) {
           const sessPath = path.join(sessionsRoot, row.agent_group_id, row.id);
           const entry = journal.get(row.id);
-          // 'archiving' is a state only this module writes, so a journal line for a
-          // row still in it names THIS attempt — no stale-line ambiguity. The
-          // archive is re-listed here rather than trusted from its size.
+          // Only this module writes 'archiving', so the line names this attempt; the archive is re-listed, not trusted.
           if (entry && isPublishedArchive(entry.rescue_path)) {
             const closed = db
               .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
@@ -1608,15 +1334,14 @@ export async function finishInterruptedSessionArchivals(sessionsRoot: string = s
               continue;
             }
             if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
-            // Sibling of the session directory — see the note in the archival path.
+            // Sibling of the session directory (see the archival path).
             fs.rmSync(sessionContextPathFor(sessPath), { force: true });
             result.finished += 1;
             continue;
           }
           if (!fs.existsSync(sessPath)) {
-            // Dir gone with no readable archive behind it. Closing the row is the
-            // only honest state — the session cannot run — but this is data loss and
-            // it gets said out loud rather than counted as a success.
+            // Dir gone with no readable archive: closing the row is the only honest state, but it is data loss and
+            // is reported as such.
             db.prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
             log.error('storage-manager: session directory lost with no readable rescue archive', {
               sessionId: row.id,
@@ -1643,11 +1368,8 @@ export async function finishInterruptedSessionArchivals(sessionsRoot: string = s
     // No rescues dir yet.
   }
 
-  // ponytail: there is deliberately NO "closed row with a journal line, remove
-  // its dir" pass. A crash between the close and the rm leaves an orphan dir on
-  // a closed row, which the ordinary reclaim walk already re-archives on its
-  // next tick. Adding the pass back would mean a journal line from an OLD
-  // archival could authorize deleting a dir an operator has since restored.
+  // Deliberately no "closed row with a journal line: remove its dir" pass. The ordinary reclaim re-archives such an
+  // orphan, and the pass would let an old journal line delete a dir an operator has since restored.
   if (result.released + result.finished + result.lost + result.failed > 0) {
     log.info('storage-manager: resolved interrupted session archivals', result);
   }
@@ -1662,16 +1384,13 @@ interface SessionReclaimCandidate {
   newestActivityMs: number;
   ageEligible: boolean;
   /**
-   * The full-list mtime reading taken at the same instant as the age and
-   * central-row signals this candidate was judged on. Apply re-reads it and
-   * refuses on any difference, so this must be the DECISION-time value: a
-   * reading taken later would absorb activity that arrived during planning and
-   * quietly certify a stale decision as current.
+   * The full-list mtime reading taken with the signals this candidate was judged on. Apply refuses on any
+   * difference, so it must be the decision-time value, never a later reading.
    */
   collectedActivityMs: number;
 }
 
-/** Active-row count for the count cap; null means "cannot tell" — cap disabled. */
+/** Active-row count for the count cap; null means "cannot tell" (cap disabled). */
 function activeSessionCount(): number | null {
   try {
     const row = getRawDb().prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as
@@ -1684,11 +1403,8 @@ function activeSessionCount(): number | null {
 }
 
 /**
- * One union pass over the reclaim candidates: age-eligible ∪ count-overflow,
- * oldest-idle first, bounded by the pass budget. Blocked sessions never reach
- * here, so a blocked old session cannot consume an overflow slot — the
- * next-oldest unblocked one does, and the cap stays a target rather than a
- * promise.
+ * Age-eligible plus count-overflow candidates, oldest-idle first, bounded by the pass budget. Blocked sessions
+ * never reach here, so they cannot consume an overflow slot; the cap is a target, not a promise.
  */
 function selectSessionsToArchive(
   candidates: SessionReclaimCandidate[],
@@ -1729,9 +1445,7 @@ function collectSessionCacheActions(args: {
   let warnedArchiveSourceUnavailable = false;
   let warnedCentralSourceUnavailable = false;
 
-  // Pass 1: everything that survives the blocker checks, with the reclaim
-  // classification attached. Selection needs the whole population (the count
-  // cap is a fleet-level fact), so no dir is archived during the walk.
+  // Pass 1: selection needs the whole population (the count cap is fleet-level), so nothing is archived here.
   const candidates: SessionReclaimCandidate[] = [];
   const cacheOnly: Array<{ groupName: string; sessionId: string; sessPath: string }> = [];
 
@@ -1762,27 +1476,17 @@ function collectSessionCacheActions(args: {
         args.skipped.noActivitySessions += 1;
         continue;
       }
-      // A dir with only inbound.db (created, never woken) has no narrowed
-      // signal at all; fall back to the full reading rather than reading 0 as
-      // "infinitely old".
+      // A dir with only inbound.db has no narrowed signal; fall back to the full reading rather than "infinitely old".
       const ageSignal = sessionLastActivityMs(sessPath, SESSION_AGE_SIGNAL_FILES) || lastActivity;
-      // The 24h gate reads the age signal, NOT the full activity set. A lazy
-      // inbound.db schema migration rewrites the whole fleet's inbound files
-      // in minutes, and against the full set that reads as fleet-wide
-      // freshness and stalls the reaper for a day. Nothing is lost by
-      // excluding inbound here: sessionHasOpenWork() above already refuses any
-      // session with an unconsumed inbound row, and the pre-apply
-      // revalidation still compares the FULL set, so a real inbound write
-      // between planning and applying still aborts the archive.
+      // The 24h gate reads the age signal, not the full set (see SESSION_AGE_SIGNAL_FILES); the pre-apply
+      // revalidation still compares the full set.
       if (args.now - ageSignal < args.policy.idleArtifactMs) {
         args.skipped.freshSessions += 1;
         continue;
       }
 
-      // Reclaim requires BOTH the on-disk signal and the central-DB row (when
-      // one exists) to agree the session has been quiet; an unreadable central
-      // DB disables reclaim entirely (fail closed) while the ordinary cache
-      // pruning below continues to work.
+      // Reclaim requires both the on-disk signal and the central row to agree; an unreadable central DB disables
+      // reclaim (fail closed) while ordinary cache pruning continues.
       const row = centralSessionRow(sessionId);
       if (row === 'unavailable' || row?.status === 'archiving') {
         cacheOnly.push({ groupName: groupDirent.name, sessionId, sessPath });
@@ -1797,15 +1501,13 @@ function collectSessionCacheActions(args: {
         sessionStatus: row === null ? 'orphan' : row.status === 'closed' ? 'closed' : 'active',
         newestActivityMs: newestActivity,
         ageEligible: args.now - newestActivity >= args.policy.sessionReclaimMs,
-        // `lastActivity` is the full-list reading from the top of this
-        // iteration — the same instant the gates above were evaluated.
+        // The full-list reading from the same instant the gates above were evaluated.
         collectedActivityMs: lastActivity,
       });
     }
   }
 
-  // Pass 2: bounded, oldest-first selection; everything not selected falls
-  // through to ordinary cache pruning as it always did.
+  // Pass 2: bounded selection; everything not selected falls through to ordinary cache pruning.
   const { selected, deferred } = selectSessionsToArchive(candidates, args.policy);
   args.skipped.budgetDeferredSessions += deferred;
 
@@ -1848,9 +1550,7 @@ function collectSessionCacheActions(args: {
       );
     }
 
-    // This exact path is intentionally separate from findPrunableArtifactDirs:
-    // a generic "plugins" directory could be source content, while this one
-    // is Codex's session-local cache and is recreated on every spawn.
+    // Separate from findPrunableArtifactDirs: a generic "plugins" dir could be source; this is Codex's per-spawn cache.
     const codexPluginCache = path.join(sessPath, 'codex', 'plugins');
     if (isRealDirectory(codexPluginCache)) {
       actions.push(
@@ -1922,14 +1622,7 @@ function collectSessionCacheActions(args: {
   return actions;
 }
 
-/**
- * Enumerate thread dirs across BOTH on-disk layouts:
- *   flat:   <root>/<threadKey>/worktrees
- *   nested: <root>/wg-<workgroup>/<threadKey>/worktrees   (shared-FS rework)
- * The pre-rework collector only looked at the flat layout, which made the
- * entire nested population invisible to cleanup (observed live: 47GB of
- * never-reclaimed checkouts, oldest 3 months).
- */
+/** Thread dirs in both layouts: `<root>/<threadKey>/worktrees` and `<root>/wg-<workgroup>/<threadKey>/worktrees`. */
 function* threadDirs(root: string): Generator<{ threadDir: string; label: string }> {
   for (const dirent of safeReaddirDirents(root)) {
     if (!dirent.isDirectory() || dirent.isSymbolicLink()) continue;
@@ -1949,10 +1642,8 @@ function* threadDirs(root: string): Generator<{ threadDir: string; label: string
 }
 
 /**
- * Archive-then-reclaim one whole thread dir: tar (zstd) the checkout minus
- * regenerable trees into <dataRoot>/thread-rescues/, verify the archive is a
- * non-empty file, and only then remove the thread dir. Any tar failure keeps
- * the dir untouched — the archive is the license to delete.
+ * Archive-then-reclaim one whole thread dir into thread-rescues/. Any tar failure keeps the dir: the archive is
+ * the license to delete.
  */
 function createArchiveThreadWorktreeAction(args: {
   id: string;
@@ -1989,10 +1680,7 @@ function createArchiveThreadWorktreeAction(args: {
           [
             '-I',
             'zstd -T0',
-            // Same rationale as the session-archive create call (tarCreate
-            // tolerates tar's exit 1 there too): this path is idle-gated,
-            // not guaranteed quiet, and the maxBuffer bump below is a
-            // bounded ceiling rather than a bug fix on its own.
+            // Idle-gated, not guaranteed quiet: same tolerance as the session archive (see tarCreate).
             '--warning=no-file-changed',
             ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
             '-cf',
@@ -2049,8 +1737,7 @@ function collectThreadCacheActions(args: {
       continue;
     }
 
-    // Long-idle: archive the whole thread dir and reclaim it. Emitting this
-    // INSTEAD of per-cache deletes — the removal covers the caches anyway.
+    // Long-idle: archive the whole dir instead of per-cache deletes, which the removal covers anyway.
     if (args.now - lastActivity >= args.policy.worktreeReclaimMs) {
       actions.push(
         createArchiveThreadWorktreeAction({
@@ -2085,38 +1772,11 @@ function collectThreadCacheActions(args: {
 }
 
 /**
- * Is this candidate's content reconstructible from something on disk?
- *
- * THE INVARIANT THE WHOLE SWEEP RESTS ON, made checkable. Three review rounds
- * removed one directory name each (dist/build/.next/coverage, then .venv, then
- * node_modules was challenged) and each time the same property was being
- * enforced one name later. A name list cannot express it: the property is
- * per-INSTANCE, not per-name — the same `node_modules` is reproducible in a
- * checkout that committed a lockfile and is unique state in one that did not.
- * So it is asked per candidate instead.
- *
- * `node_modules` is a materialized tree whose reproducer is a SEPARATE file
- * that may or may not exist, so it must be shown one. The other three names
- * carry their own reproducer structurally and need no gate:
- *
- *   - `.pnpm-store` is content-addressed. Every entry is keyed by the integrity
- *     hash of a published tarball, so it cannot hold anything authored here.
- *   - `.turbo` is a task cache keyed by a hash of its inputs; a hit is by
- *     definition equivalent to re-running the task that produced it.
- *   - `__pycache__` is PEP 3147 bytecode, not importable without the adjacent
- *     `.py` (verified on CPython 3.12), so it can never be the only copy.
- *
- * HONEST RESIDUAL: a lockfile proves a recorded state is reconstructible, not
- * that the CURRENT tree is. Packages added by `npm install --no-save` are, by
- * construction, unrecorded, and `npm ci` would drop them in CI too — they are a
- * transient build input, not a work product. Closing even that would take a
- * manifest-vs-tree diff per candidate, which is the per-target machinery this
- * sweep exists to avoid.
- *
- * Deliberately NOT listed: `bun.lockb` and `npm-shrinkwrap.json`. Both are real
- * lockfiles, but every name omitted here only ever preserves a tree, so the
- * short list is the safe direction and widening it is a decision to take on
- * purpose, not by drift.
+ * Lockfiles that make a `node_modules` reconstructible. Reconstructibility is per instance, not per name: the same
+ * `node_modules` is unique state in a checkout with no lockfile, so each candidate must show one. `.pnpm-store`
+ * (content-addressed), `.turbo` (input-hashed cache) and `__pycache__` (needs its `.py`) carry their reproducer
+ * structurally. A lockfile proves a recorded state, not the current tree (`--no-save` packages are lost, as in CI).
+ * `bun.lockb` and `npm-shrinkwrap.json` are omitted on purpose: omission only ever preserves a tree.
  */
 const NODE_MODULES_REPRODUCERS = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'];
 
@@ -2126,20 +1786,10 @@ function hasRecordedReproducer(parentDir: string, name: string): boolean {
 }
 
 /**
- * Real regenerable directories under a topic worktree subtree.
- *
- * SYMLINKS ARE NEVER RETURNED, whatever they are named. A lockfile reproduces a
- * dependency tree's contents; it does not record that the tree was a link, or
- * where it pointed, so a hand-made `node_modules -> ../shared` mapping is
- * unique state wearing a disposable name. 13 such links exist in production.
- * Skipping the class outright is a shorter argument than gating it, and the
- * walk never descends through one either, so nothing outside the topic is
- * reachable from here.
- *
- * The dependency cache's temp names are never descended either, in any flag
- * mode: mid-convert, `.node_modules.nanoclaw-old` holds a private tree, and a
- * nested `node_modules` inside it is not a regenerable target of anything.
- * Every package dir holding one is reported in `recoveryDirs` instead.
+ * Real regenerable directories under a topic worktree subtree. Symlinks are never returned or descended: a
+ * lockfile does not record that a tree was a link, so `node_modules -> ../shared` is unique state. Dependency-cache
+ * temp names are never descended either (mid-convert they hold a private tree); their package dirs are reported in
+ * `recoveryDirs`.
  */
 function findRegenerableTargets(root: string, recoveryDirs: string[] = []): string[] {
   const targets: string[] = [];
@@ -2150,8 +1800,7 @@ function findRegenerableTargets(root: string, recoveryDirs: string[] = []): stri
       const full = path.join(dir, entry.name);
       if (!isPathInside(root, full)) continue;
 
-      // Dirents carry lstat semantics: a symlink to a directory reports
-      // isSymbolicLink() and NOT isDirectory(), so this covers both.
+      // Dirents carry lstat semantics, so a symlink to a directory is not isDirectory(): this covers both.
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       if (SKIP_DESCEND_DIR_NAMES.has(entry.name)) continue;
       if (DEPENDENCY_CACHE_TEMP_NAMES.includes(entry.name)) {
@@ -2159,8 +1808,7 @@ function findRegenerableTargets(root: string, recoveryDirs: string[] = []): stri
         continue;
       }
       if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) {
-        // Do not descend: the whole tree goes, and a nested node_modules inside
-        // it would only be counted twice.
+        // Do not descend: the whole tree goes.
         targets.push(full);
         continue;
       }
@@ -2171,26 +1819,10 @@ function findRegenerableTargets(root: string, recoveryDirs: string[] = []): stri
 }
 
 /**
- * A topic's regenerable targets, walked checkout by checkout.
- *
- * `listTopicCheckouts` is the only enumerator of a topic's checkouts, so a
- * branch clone at `<repo>@<slug>` is walked, shared and swept
- * exactly like `<repo>`. What the lister skips is never walked: every
- * dot-prefixed name. Nothing under one is
- * deleted, adopted, converted or recovered. repository_checkout builds its
- * clones outside `worktrees/` altogether (`checkoutStagingRoot`), so a
- * half-built clone is never here.
- *
- * One kind of non-checkout entry is still a target: a regenerable store
- * sitting directly at the worktrees root, beside the checkouts. Production
- * topics carry a `.pnpm-store` there, and before the lister existed the walk
- * from the root reclaimed it; skipping it would stop that reclaim for good.
- * Only the entry itself is taken, never descended, and only under a
- * regenerable name.
- *
- * `null` when the worktrees root cannot be read: the lister returns [] only
- * for ENOENT and throws on anything else,
- * so the caller counts the topic unreadable instead of sweeping it as empty.
+ * A topic's regenerable targets, walked checkout by checkout through `listTopicCheckouts`; anything the lister skips
+ * is never walked. One non-checkout entry is still a target: a regenerable store directly at the worktrees root
+ * (taken, never descended). `null` when the root cannot be read, so the caller counts it unreadable instead of
+ * sweeping it as empty.
  */
 function findTopicRegenerableTargets(worktreeRoot: string, recoveryDirs: string[]): string[] | null {
   let checkouts: ReturnType<typeof listTopicCheckouts>;
@@ -2207,12 +1839,8 @@ function findTopicRegenerableTargets(worktreeRoot: string, recoveryDirs: string[
 }
 
 /**
- * Newest `sessions.last_active` per topic, keyed `<workgroup>/<kind>-<id>` —
- * the last two path segments of a topic state dir, so the map is independent
- * of which root the caller scans.
- *
- * `null` means the central DB could not be read, and the caller then sweeps
- * nothing: without it there is no message-driven activity signal at all.
+ * Newest `sessions.last_active` per topic, keyed `<workgroup>/<kind>-<id>`. `null` means the central DB could not
+ * be read, and the caller then sweeps nothing.
  */
 function topicSessionActivity(): Map<string, number> | null {
   interface Row {
@@ -2253,8 +1881,7 @@ function topicSessionActivity(): Map<string, number> | null {
       });
       key = `${unit.workgroupId}/${unit.kind}-${unit.id}`;
     } catch {
-      // An unresolvable identity cannot be attributed to a topic dir. It is
-      // not evidence that any topic is idle, so it is simply dropped.
+      // An unresolvable identity is not evidence any topic is idle: drop it.
       continue;
     }
     const ms = row.idle_since ? parseSqliteUtc(row.idle_since) : NaN;
@@ -2271,36 +1898,16 @@ function pathsOverlap(a: string, b: string): boolean {
 }
 
 /**
- * The `worktrees/` reading of a topic's idle clock, with this module's own
- * footprint removed.
- *
- * A directory's mtime moves when an ENTRY is added or removed under it, so
- * `worktrees/` mtime is written by two things that are not activity at all:
- * the spawn path's `.nanoclaw-storage-active` lease (created and removed on
- * every container spawn) and this file's own `.nanoclaw-storage-cleanup`
- * claim (created and removed inside `root` by every applied action). Reading
- * the directory's own mtime therefore reads "a container was spawned for this
- * topic recently, or we swept it recently", and on the production install that
- * held 47 of 53 candidate trees permanently fresh — the clock was pinned just
- * under the gate by the fleet's own spawn cadence.
- *
- * The children are the honest reading: a checkout directory's mtime moves when
- * the checkout itself changes, and neither writer above touches one. The
- * directory's own mtime remains the fallback for an EMPTY `worktrees/`, where
- * there is nothing else to read and the creation time is the only signal there
- * has ever been.
- *
- * This is only the file-side term. The caller still takes `max()` with the
- * central DB's `last_active` for the topic's sessions, which is the real
- * activity signal and is unaffected by any of this.
+ * The `worktrees/` side of a topic's idle clock: the newest child mtime, excluding our own lease and cleanup-claim
+ * entries. The directory's own mtime is our footprint (every spawn and applied action adds and removes an entry),
+ * which pinned the clock fresh; it is only the fallback for an empty `worktrees/`.
  */
 function worktreeContentMtimeMs(worktreeRoot: string, ownMtimeMs: number): number {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(worktreeRoot, { withFileTypes: true });
   } catch {
-    // Unreadable after the lstat that got us here: fall back rather than
-    // inventing freshness or staleness from a failed syscall.
+    // Unreadable after the lstat that got us here: fall back rather than invent freshness or staleness.
     return ownMtimeMs;
   }
 
@@ -2314,7 +1921,7 @@ function worktreeContentMtimeMs(worktreeRoot: string, ownMtimeMs: number): numbe
       // Removed under us mid-walk; it contributes nothing either way.
     }
   }
-  // No non-internal children at all — an empty or lease-only `worktrees/`.
+  // No non-internal children: an empty or lease-only `worktrees/`.
   return newest === 0 ? ownMtimeMs : newest;
 }
 
@@ -2327,22 +1934,9 @@ type SweepRefusal =
   | 'no-recorded-reproducer';
 
 /**
- * Scan-time eligibility for one candidate. `null` means sweepable.
- *
- * SCAN-TIME ONLY, deliberately. Rounds 3-5 pushed toward revalidating each of
- * these again at apply time, and the honest bound on what that buys is small:
- * the recorded-reproducer gate above already proves every candidate rebuildable
- * from a committed lockfile, which turns losing any of these races from data
- * loss into a wasted `npm ci`. The apply path therefore re-runs exactly one
- * check — the container-mount lookup, which is the only condition that can flip
- * for a reason we both care about and can observe cheaply. Two of the others
- * cannot honestly be re-read at all once the pass has started: this sweep is a
- * writer into the tree it would be reading, so a deletion bumps its parent's
- * mtime and the cleanup claim bumps `worktrees/`.
- *
- * Empirical support for the sizing, not just the argument: the manual sweep has
- * removed 101 of 208 trees on the live host with agents running, against these
- * four checks and no revalidation whatsoever, with zero incidents.
+ * Scan-time eligibility for one candidate; `null` means sweepable. Scan-time only: the reproducer gate already
+ * makes losing any race a wasted `npm ci`, so apply re-runs only the container-mount lookup. The mtime checks
+ * cannot be re-read once the pass starts, since this sweep writes into the tree it would be reading.
  */
 function sweepEligibility(args: {
   now: number;
@@ -2377,17 +1971,8 @@ function sweepEligibility(args: {
 }
 
 /**
- * The one condition re-proven immediately before each delete.
- *
- * An agent waking and its container mounting the topic between collection and
- * deletion is the realistic case, and it is the only one worth a syscall here:
- * a lookup is ~114ms, and a lockfile-backed tree taken from under a live
- * container costs a reinstall rather than any work. A lookup that fails refuses
- * the action — an unlistable runtime is a container we cannot see.
- *
- * Safe to call under the cleanup claim because it reads the container runtime
- * and nothing under the claim root; see the constraint documented at the
- * `canApply` call in createDeleteArtifactAction.
+ * The one condition re-proven immediately before each delete: no container mounts the topic. A failed lookup
+ * refuses. Safe under the cleanup claim because it reads the runtime, not the claim root.
  */
 function topicIsUnmounted(topicDir: string, lookup: () => string[] | null): boolean {
   const mounts = lookup();
@@ -2396,43 +1981,11 @@ function topicIsUnmounted(topicDir: string, lookup: () => string[] | null): bool
 }
 
 /**
- * Sweep regenerable dependency-install trees out of idle topic worktrees.
- *
- * A DIFFERENT SAFETY CLASS from the topic GC in worktree-cleanup.ts, which is
- * why this is a separate pass on a separate clock. That GC removes whole topic
- * dirs, which can hold uncommitted work, so it needs git proofs, quarantine and
- * a 7-to-30-day horizon. `REGENERABLE_SWEEP_DIR_NAMES` is restricted to trees
- * that are 100% derived from package.json and lockfiles and can never hold
- * work — which is what buys the short clock and lets this skip the git proofs.
- * The only real hazard left is deleting one out from under a container that is
- * using it, and the cost of being wrong is an `npm ci`, not lost work. Hence a
- * 2-day default. Widening that list is what would break this argument; see the
- * comment at its declaration.
- *
- * IDLE SIGNAL — `max(sessions.last_active for the topic's participants,
- * newest mtime among <topic>/worktrees CHILDREN, excluding this system's own
- * lease and claim entries)`. Deliberately NOT:
- *   - the regenerable tree's own mtime. It moves on install, not on use, so a
- *     tree installed in June and read every day since still dates to June. It
- *     measures the last `npm ci`, not activity.
- *   - the topic dir's own mtime. Any bulk metadata touch on the parent bumps
- *     every topic at once,
- *     which here would make the whole fleet look fresh and silently disable
- *     the sweep.
- *   - `worktrees/`'s OWN mtime, which is what this used to read. A directory
- *     mtime moves when an entry is added or removed under it, and the two
- *     things that add and remove entries there are both ours: the spawn path's
- *     `.nanoclaw-storage-active` lease, and this file's own
- *     `.nanoclaw-storage-cleanup` claim. So the reading was our own footprint,
- *     and it was pinned just under the gate by the fleet's spawn cadence — on
- *     the production install, 47 of 53 candidate trees (27.0 GB of 29.7 GB)
- *     refused as `recently-active` with 20 of 31 topics sitting between 24 and
- *     44 hours against a 48-hour gate, and eleven of them sharing one
- *     identical timestamp from a single spawn burst. `worktreeContentMtimeMs`
- *     reads the children instead, which neither writer touches.
- * `last_active` covers the converse hole — turns that touch no file under
- * `worktrees/` at all. The MAX is taken so that a fresh reading on ANY signal
- * preserves the tree; every signal must be stale before anything is swept.
+ * Sweep regenerable dependency trees out of idle topic worktrees. A different safety class from the topic GC:
+ * these trees can never hold work, so the cost of a mistake is an `npm ci`, which buys a short clock and no git
+ * proofs. Widening `REGENERABLE_SWEEP_DIR_NAMES` breaks that argument. Idle signal: the max of the topic
+ * sessions' `last_active` and `worktreeContentMtimeMs`; never the tree's own mtime (moves on install, not use) or
+ * the topic dir's (a bulk parent touch freshens the fleet). Every signal must be stale before anything is swept.
  */
 function collectTopicRegenerableActions(args: {
   now: number;
@@ -2448,11 +2001,8 @@ function collectTopicRegenerableActions(args: {
   if (args.policy.regenerableSweepMs <= 0) return actions;
   if (!fs.existsSync(args.topicsRoot)) return actions;
 
-  // Pass-level fail-closed, before walking hundreds of topics: a runtime we
-  // cannot list is a container we cannot see, and a central DB we cannot read
-  // leaves no activity signal worth acting on. Both snapshots are then reused
-  // as the SCAN's view of the world — the scan is a cheap filter, and the
-  // apply-time guard below re-reads everything from source.
+  // Pass-level fail-closed: an unlistable runtime hides containers and an unreadable central DB leaves no activity
+  // signal. Both snapshots serve only the scan; the apply-time guard re-reads from source.
   const mounts = args.runningMounts();
   if (mounts === null) {
     args.warnings.push('regenerable sweep skipped: container runtime mounts could not be listed');
@@ -2507,14 +2057,9 @@ function collectTopicRegenerableActions(args: {
         : new Set<string>();
 
       for (const target of targets) {
-        // A farm is exempt from the 2-day delete (plan §5.7.5): it frees
-        // nothing another workspace still holds, and deleting it only loses
-        // the dedupe. A farm of a quarantined entry is not in this set.
+        // A farm is exempt from the delete: it frees nothing another workspace still holds.
         if (keptByCache.has(target)) continue;
-        // A package dir mid-conversion (recovery blocked, failed, or not run
-        // in this flag mode) can hold private entries in the node_modules
-        // beside its temp name. Never collected, in any flag mode; the apply
-        // path re-checks under the claim.
+        // A package dir mid-conversion can hold private entries: never collected; apply re-checks under the claim.
         if (hasPendingConversion(path.dirname(target))) continue;
         const refusal = sweepEligibility({
           now: args.now,
@@ -2526,9 +2071,7 @@ function collectTopicRegenerableActions(args: {
         });
         if (refusal !== null) {
           countRefusal(refusal);
-          // `no-recorded-reproducer` is the only per-TARGET reason. The rest are
-          // properties of the topic and answer the same for every candidate
-          // under it, so the topic is abandoned rather than re-asked.
+          // The only per-target reason; the rest are topic-wide, so the topic is abandoned.
           if (refusal === 'no-recorded-reproducer') continue;
           break;
         }
@@ -2543,15 +2086,8 @@ function collectTopicRegenerableActions(args: {
             reason: `topic worktree idle for at least ${idleDays}d — ${path.basename(target)} is regenerated from a recorded manifest`,
             targetType: 'directory',
             kind: 'sweep-regenerable-tree',
-            // Collection and apply are separated by the rest of the pass, which
-            // can be minutes, and an agent waking in that window is the one
-            // condition worth a syscall to re-prove. It runs under the cleanup
-            // claim, so it composes with the claim's own lease check to cover
-            // both NanoClaw and external containers. Everything else the scan
-            // decided is held by the recorded-reproducer gate: losing those
-            // races costs a reinstall, not work. A conversion that became
-            // pending since collection is the other exception: that can be
-            // private work, so it is re-proven here too.
+            // Re-prove the mount lookup (an agent waking in the gap) and a newly pending conversion (possibly
+            // private work) under the claim; other scan decisions are covered by the reproducer gate.
             canApply: () =>
               topicIsUnmounted(topicDir, args.runningMounts) && !hasPendingConversion(path.dirname(target)),
             safety:
@@ -2563,7 +2099,7 @@ function collectTopicRegenerableActions(args: {
   }
   if (cache) {
     collectCacheGarbage(cache.pass);
-    // An `off` pass with nothing to clean stays as silent as `off` always was.
+    // An `off` pass with nothing to clean stays silent.
     if (!cache.cleanupOnly || cache.pass.decisions.length > 0) {
       const report = finishDependencyCachePass(cache.pass);
       args.dependencyCacheOut.report = report;
@@ -2579,17 +2115,9 @@ interface TopicDependencyCache {
   pass: DependencyCachePass;
   /** Operations really run: an applying storage pass with the flag at `apply` or `off`. */
   mutate: boolean;
-  /**
-   * Flag `apply`: farms, and trees this pass adopts or converts, skip the
-   * 2-day delete — in a dry-run report too, so the report predicts the apply
-   * pass. Flag `report` keeps today's delete behavior and only logs.
-   */
+  /** Flag `apply`: farms and trees this pass adopts or converts skip the delete, in dry-run reports too. */
   exemptFarms: boolean;
-  /**
-   * Flag `off`, applying pass: recovery and cache GC only, so a rollback to
-   * `off` never strands an interrupted conversion and entries still age out
-   * (plan §5.7.8). No adopt, convert, link, farm exemption or counting.
-   */
+  /** Flag `off`, applying pass: recovery and cache GC only, so a rollback never strands an interrupted conversion. */
   cleanupOnly: boolean;
 }
 
@@ -2603,9 +2131,7 @@ function startTopicDependencyCache(args: {
   const flag = args.policy.dependencyCacheMode ?? 'off';
   if (flag === 'off' && args.mode !== 'apply') return null;
   const mutate = args.mode === 'apply' && flag !== 'report';
-  // The fingerprint is resolved lazily: an `off` pass, or one with nothing
-  // eligible, never inspects the agent image. Without one, the pass cannot key
-  // anything, so it recovers and collects garbage and skips adopt/convert/link.
+  // The fingerprint is lazy: an `off` pass never inspects the image; without one, only recovery and GC run.
   const pass = startDependencyCachePass({
     mode: mutate ? 'apply' : 'report',
     // A sibling of v2-topics, so every link stays on one filesystem and mount.
@@ -2619,16 +2145,9 @@ function startTopicDependencyCache(args: {
 const KEPT_BY_CACHE: ReadonlySet<PackageOutcome> = new Set<PackageOutcome>(['farm', 'adopted', 'converted']);
 
 /**
- * One topic's dependency-cache work (plan §5.7.5): recovery first, then adopt
- * or convert, for eligible npm trees. No idle threshold — these operations
- * preserve content — but the same two guards as a delete: never under a live
- * container mount, and only inside the topic's storage cleanup claim, with the
- * runtime mount lookup re-run under the claim exactly as `canApply` does in
- * `createDeleteArtifactAction` (the claim covers our spawn path's markers, the
- * lookup covers containers that plant none). A cleanup-only (`off`) pass
- * runs the recovery half and nothing else.
- *
- * Returns the targets the 2-day delete must skip.
+ * One topic's dependency-cache work: recovery, then adopt or convert eligible npm trees. No idle threshold (these
+ * preserve content), but the same guards as a delete: never under a live mount, and only inside the topic's
+ * cleanup claim with the mount lookup re-run under it. Returns the targets the delete must skip.
  */
 function runTopicDependencyCache(args: {
   cache: TopicDependencyCache;
@@ -2651,9 +2170,7 @@ function runTopicDependencyCache(args: {
   if (!isRealDirectory(args.worktreeRoot)) return kept;
 
   if (args.mounts.some((mount) => pathsOverlap(args.topicDir, mount))) {
-    // Nothing is touched under a live mount; this only measures what agents
-    // are keeping private (the §2 guard-escalation trigger). The delete loop
-    // refuses the topic on its own.
+    // Nothing is touched under a live mount; this only measures what agents keep private.
     for (const target of npmTargets) {
       if (isFarmPackageDir(pass, args.workgroupId, path.dirname(target))) continue;
       pass.counters.privateInMountedTopics += 1;
@@ -2687,8 +2204,7 @@ function runTopicDependencyCache(args: {
   if (!args.cache.exemptFarms) return kept;
   for (const target of npmTargets) {
     const outcome = result.outcomes?.get(target);
-    // No outcome means the claim or the mount re-check refused and nothing
-    // ran; an existing farm is still a farm.
+    // No outcome means the claim or mount re-check refused and nothing ran; an existing farm is still a farm.
     const isKept = outcome
       ? KEPT_BY_CACHE.has(outcome)
       : isFarmPackageDir(pass, args.workgroupId, path.dirname(target));
@@ -2697,13 +2213,7 @@ function runTopicDependencyCache(args: {
   return kept;
 }
 
-/**
- * Age out rescue archives. Archive-then-reclaim wrote these from 2026-08-05
- * onward and nothing ever removed them, so the rescue dirs are a monotonically
- * growing copy of everything the reclaimer has ever taken. Only `.tar.zst`
- * files are eligible — the reclaim journal beside them is the permanent record
- * of what was reclaimed and outlives the archives themselves.
- */
+/** Age out rescue archives (`.tar.zst` only): the reclaim journal beside them is the permanent record. */
 function collectRescueRetentionActions(args: {
   now: number;
   dataRoot: string;
@@ -2966,12 +2476,8 @@ function inspectDockerImages(ids?: string[]): DockerImageInventory[] {
     // Docker's InspectResponse omits Created when the image has no timestamp.
     '(index . "Created")',
     '.Size',
-    // A per-key `index` renders both absent and explicitly empty labels as
-    // `""` in Docker's Go template. The whole map preserves that distinction:
-    // absent retention metadata takes the legacy grace path; an empty value
-    // remains invalid and protected. Batching still omits RootFS and Config.Env.
-    // Some OCI configs omit Labels entirely; Docker rejects dotted access to
-    // a missing map key, while index returns null and preserves an empty map.
+    // The whole labels map, not per-key `index`, which renders absent and empty alike: absent retention metadata
+    // takes the legacy grace path, an empty value stays protected. `index` also tolerates a missing Labels map.
     '(index .Config "Labels")',
   ]);
   return inspectBatches(selectedIds).flatMap((batch) => {
@@ -3007,10 +2513,7 @@ function configuredImageProtection(): { images: Set<string>; readable: boolean }
   try {
     return {
       images: new Set(
-        // Raw and synchronous on purpose: this pass runs inside the storage
-        // maintenance worker thread and the synchronous reclaim executors,
-        // and the image-removal action re-reads it immediately before `rmi`.
-        // It is on the raw-DB allowlist (db/raw-db-ratchet.test).
+        // Raw and synchronous on purpose: runs in the storage worker (raw-DB allowlist); re-read before `rmi`.
         (getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[])
           .map((config) => config.image_tag?.trim())
           .filter((tag): tag is string => Boolean(tag)),
@@ -3311,7 +2814,6 @@ function pressureReport(usage: FilesystemUsage | null, policy: StoragePolicy): S
   };
 }
 
-/** Build a cheap report from a filesystem probe without inventorying caches or Docker. */
 export function createStorageStatusReport(
   policy: StoragePolicy,
   usage: FilesystemUsage | null,
@@ -3334,9 +2836,7 @@ export function createStorageStatusReport(
 }
 
 export function getStorageReport(options: StorageReportOptions = {}): StorageReport {
-  // The whole pass — collection AND apply — is one reclaim pass. Anything that
-  // re-enters storage maintenance while this is open draws from the same
-  // budget instead of opening a second one.
+  // Collection and apply are one reclaim pass: re-entry while it is open draws from the same budget.
   const passPolicy = resolveStoragePolicy(options.policy);
   beginReclaimPass(passPolicy.sessionReclaimPerTick, passPolicy.sessionReclaimMaxMs, options.now ?? Date.now());
   try {
@@ -3354,8 +2854,7 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
   const skipped = emptySkipped();
   const sessionsRoot = options.sessionsRoot ?? sessionsBaseDir();
   const threadsRoot = options.threadsRoot ?? threadsBaseDir();
-  // Same derivation as the rescue dirs below: DATA_DIR in production, and the
-  // test's own tree whenever sessionsRoot is redirected.
+  // DATA_DIR in production; the test's own tree whenever sessionsRoot is redirected.
   const topicsRoot = options.topicsRoot ?? path.join(path.dirname(sessionsRoot), TOPICS_DIRNAME);
   const isContainerRunning = options.isContainerRunning ?? (() => false);
   const includeDocker = options.includeDocker ?? true;
@@ -3514,12 +3013,8 @@ export function assertStorageAdmission(options: Omit<StorageReportOptions, 'mode
     return { allowed: true, reason: 'below-threshold', report };
   }
 
-  // respectCadence: admission fires on EVERY container spawn, so without the
-  // throttle any usage in the [threshold, refuse) band turns spawn traffic
-  // into full session-tree scan+apply passes (observed live: one ~40s pass
-  // per spawn for hours at 85-89%). Inside the cadence window admission
-  // decides from current usage alone; at >= admissionRefusePct the throttle
-  // is bypassed upstream (criticalPressure), so emergency passes still scan.
+  // Admission fires on every spawn, so without the cadence throttle usage in [threshold, refuse) turns spawn
+  // traffic into full scan+apply passes. At >= admissionRefusePct the throttle is bypassed upstream.
   const report = getStorageReport({ ...options, policy, mode: 'apply', force: false, respectCadence: true });
   const afterPct = report.filesystem.after?.usagePct ?? before.usagePct;
   if (afterPct >= policy.admissionRefusePct) {
