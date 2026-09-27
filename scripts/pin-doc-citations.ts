@@ -82,9 +82,9 @@ function citedText(lines: string[] | null, link: FileLineCitation): string | nul
   return lines.slice(link.startLine - 1, link.endLine).join('\n');
 }
 
-function introducingCommit(root: string, rev: string, docPaths: readonly string[], needles: string[]): string | null {
-  for (const needle of needles) {
-    const out = gitRead(root, ['log', '--reverse', '--format=%H', `-S${needle}`, rev, '--', ...docPaths]);
+function introducingCommit(root: string, rev: string, searches: { needle: string; paths: readonly string[] }[]) {
+  for (const { needle, paths } of searches) {
+    const out = gitRead(root, ['log', '--reverse', '--format=%H', `-S${needle}`, rev, '--', ...paths]);
     const first = out?.split('\n').find(Boolean);
     if (first) return first;
   }
@@ -161,6 +161,7 @@ export function pinDocs(
   for (const doc of docs) {
     const docPaths = doc.startsWith('docs/review-notes') ? REVIEW_NOTES_PATHS : [doc];
     const lines = fs.readFileSync(path.join(root, doc), 'utf8').split('\n');
+    const committedLines = new Set((gitRead(root, ['show', `${rev}:${doc}`]) ?? '').split('\n'));
     let changed = false;
     lines.forEach((text, i) => {
       const inserts: { at: number; sha: string }[] = [];
@@ -174,13 +175,17 @@ export function pinDocs(
         if (citedFiles.length > 0 && !files.some((file) => citedFiles.includes(file))) continue;
         const citation = text.slice(head.index, run.end).replace(/`/g, '');
         const headText = `${head.file}:${head.span}`;
-        const origin = introducingCommit(root, rev, docPaths, [context + text.slice(head.index, head.end), headText]);
+        const searches = [];
+        if (context.trim().length >= 10)
+          searches.push({ needle: context + text.slice(head.index, head.end), paths: docPaths });
+        if (committedLines.has(text)) searches.push({ needle: headText, paths: [doc] });
+        const origin = introducingCommit(root, rev, searches);
         const start = origin ?? gitRead(root, ['rev-parse', rev])?.trim() ?? rev;
         if (!gitRead(root, ['log', '-1', '--format=%H', start, '--', head.file])?.trim()) continue;
         const candidates = candidateRevisions(root, start, head.file);
-        const originTouchedFile = Boolean(
-          gitRead(root, ['diff', '--name-only', `${start}^`, start, '--', head.file])?.trim(),
-        );
+        const originTouchedFile =
+          origin !== null &&
+          Boolean(gitRead(root, ['diff', '--name-only', `${origin}^`, origin, '--', head.file])?.trim());
         const runStart = text[head.index - 1] === '`' ? head.index - 1 : head.index;
         const anchors = noteAnchors(citationClause(text, runStart, run.end), files);
         const decision = choosePin(root, run.links, anchors, candidates, originTouchedFile);

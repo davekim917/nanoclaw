@@ -113,6 +113,18 @@ describe('pinDocs', () => {
     expect(read(root, NOTE)).toContain(`\`src/code.ts:3\` at ${introduced} and`);
   });
 
+  it("does not borrow an older note's commit for a new note that repeats the same citation", () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, 'docs/review-notes/1.md', '- `src/code.ts:1` once dropped items\n');
+    commit(root, 'old note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    const head = commit(root, 'change the code');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` takes a limit now\n');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: head, origin: null })]);
+  });
+
   it('refuses a note that names nothing to check the cited lines against, and leaves the doc unchanged', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'a\nb\nc\n');

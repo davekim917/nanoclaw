@@ -50,6 +50,15 @@ function docCitationProblems(root: string, docs?: readonly string[]): string[] {
   const all = trackedFiles(root);
   const tracked = new Set(all);
   const topDirs = new Set(all.filter((file) => file.includes('/')).map((file) => file.split('/')[0]));
+  const treeCache = new Map<string, Set<string>>();
+  const filesAt = (sha: string | null): Set<string> => {
+    if (!sha) return tracked;
+    if (!treeCache.has(sha)) {
+      const listing = gitRead(root, ['ls-tree', '-r', '-z', '--name-only', sha]);
+      treeCache.set(sha, listing === null ? tracked : new Set(listing.split('\0').filter(Boolean)));
+    }
+    return treeCache.get(sha)!;
+  };
   const inScope =
     docs ??
     all.filter((file) => file.endsWith('.md') && !EXCLUDED_DOC_PREFIXES.some((prefix) => file.startsWith(prefix)));
@@ -61,7 +70,7 @@ function docCitationProblems(root: string, docs?: readonly string[]): string[] {
         for (const link of run.links) {
           const cited = `${link.file}:${link.span}`;
           if (ILLUSTRATIVE_CITATIONS.has(`${doc} ${cited}`)) continue;
-          const resolved = resolveCitedPath(link.file, doc, tracked, topDirs);
+          const resolved = resolveCitedPath(link.file, doc, filesAt(link.pinnedSha), topDirs);
           if ('skip' in resolved) continue;
           const where = `${doc}:${index + 1}`;
           if ('missing' in resolved) {
@@ -119,6 +128,17 @@ describe('docCitationProblems', () => {
     spawnSync('git', ['commit', '-q', '-m', 'shrink', '--no-gpg-sign'], { cwd: root });
     expect(docCitationProblems(root, ['guide.md'])).toEqual([
       'guide.md:1: cites `src/a.ts:3`, but src/a.ts has only 1 lines',
+    ]);
+  });
+
+  it('resolves a pinned citation against its commit, so a file deleted since still passes', () => {
+    const { root, sha } = repo({ 'src/old.ts': 'one\ntwo\n', 'src/keep.ts': 'a\n' });
+    fs.rmSync(path.join(root, 'src/old.ts'));
+    fs.writeFileSync(path.join(root, 'guide.md'), `\`src/old.ts:2\` at ${sha}; \`src/old.ts:5\` at ${sha}\n`);
+    spawnSync('git', ['add', '-A'], { cwd: root });
+    spawnSync('git', ['commit', '-q', '-m', 'delete', '--no-gpg-sign'], { cwd: root });
+    expect(docCitationProblems(root, ['guide.md'])).toEqual([
+      `guide.md:1: cites \`src/old.ts:5\` at ${sha}, but src/old.ts has only 2 lines at ${sha}`,
     ]);
   });
 
