@@ -273,7 +273,6 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       return;
     }
 
-    // On failure, roll back the folder.
     try {
       await createAgentGroup(newGroup);
     } catch (err) {

@@ -1,7 +1,7 @@
 /**
  * Device authorization grant (RFC 8628), opt-in. Servers rarely publish
- * `device_authorization_endpoint` in their metadata, so `--device` refuses
- * rather than guessing a URL unless `--device-endpoint` is supplied.
+ * `device_authorization_endpoint`, so `--device` refuses rather than guessing a
+ * URL when neither discovery nor `--device-endpoint` supplies one.
  */
 import { assertHttpsEndpoint, type FetchLike } from './discovery.js';
 import { OAuthTokenError, type TokenResponse } from './oauth-client.js';

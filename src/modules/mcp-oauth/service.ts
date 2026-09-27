@@ -601,9 +601,9 @@ async function completeLoginLocked(
 
 /**
  * Add the bearer secret to the group's `container.json` `onecliSecrets`, which
- * is what grants it: the spawn reconciles the OneCLI agent to exactly the
- * merged workgroup and group declarations, so a bearer declared nowhere is a
- * 401 however fresh its value. True when added.
+ * is what grants it: the spawn reconciles the OneCLI agent to the merged
+ * workgroup and group declarations (when that set is non-empty), so an
+ * undeclared bearer is a 401 however fresh its value. True when added.
  */
 async function ensureSecretDeclared(agentGroupId: string, secretName: string): Promise<boolean> {
   const group = await getAgentGroup(agentGroupId);
@@ -873,9 +873,8 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
   const row = await getMcpOAuthIntegration(name);
   if (!row) return;
 
-  // RE-DECIDED under the lock: acting on the snapshot's decision lets two passes
-  // refresh the same integration, and the second sends a refresh token the
-  // first already rotated away — a forced human re-login.
+  // RE-DECIDED under the lock: acting on the snapshot's decision would let a
+  // second queued pass refresh an integration the first just refreshed.
   const decision = decideRefresh(row, Date.now());
   if (!decision.refresh) return;
   outcome.checked++;

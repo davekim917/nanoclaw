@@ -826,7 +826,7 @@
 "src/modules/agent-to-agent/agent-route.ts":{"diff":462,"mode":"100644","sha256":"449050cc6a813a275af9b888ed453e62c339aa6eea232c3f3071998f5ffdfe69"},
 "src/modules/agent-to-agent/create-agent.notify.test.ts":{"diff":85,"mode":"100644","sha256":null,"deleted":true},
 "src/modules/agent-to-agent/create-agent.test.ts":{"diff":936,"mode":"100644","sha256":"a1f2d52ed3b349d06e46bb8036308b6c63e8154ec7f772f1cb8567c51c979095"},
-"src/modules/agent-to-agent/create-agent.ts":{"diff":432,"mode":"100644","sha256":"a3b8c3bb509d6b1897016a339349818446597fae29e1f1078e751bca6209f503"},
+"src/modules/agent-to-agent/create-agent.ts":{"diff":431,"mode":"100644","sha256":"7798145d3825fd980e0d5fd004c8c15fab572d52b14f02f5668cbc2976561222"},
 "src/modules/agent-to-agent/db/agent-destinations.ts":{"diff":56,"mode":"100644","sha256":"e573e83974473ef61200386162fb9f8dd37eb029c1bf6e85e60e8660b5fd215e"},
 "src/modules/agent-to-agent/db/agent-message-policies.ts":{"diff":10,"mode":"100644","sha256":"a8c040a829c195e71b0c7501ae66c8ba2713a31a45b938f84ebb803a24888166"},
 "src/modules/agent-to-agent/guard.ts":{"diff":38,"mode":"100644","sha256":"a1620fd5d30ab4dfcfeb41bcdffa8a24b6eb547ee2009b1986c58836b19748bd"},

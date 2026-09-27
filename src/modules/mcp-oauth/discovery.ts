@@ -50,11 +50,7 @@ export function parseWwwAuthenticate(header: string | null | undefined): string 
   return value && value.length > 0 ? value : undefined;
 }
 
-/**
- * Well-known URLs for a protected resource, most-specific first (RFC 9728 §3.1):
- * the resource path is APPENDED after the well-known segment, not inserted
- * before it as RFC 8414 does for authorization servers.
- */
+/** Well-known URLs for a protected resource, most-specific first (RFC 9728 §3.1). */
 export function protectedResourceMetadataUrls(mcpUrl: string): string[] {
   const url = new URL(mcpUrl);
   const path = url.pathname.replace(/\/$/, '');
@@ -65,8 +61,7 @@ export function protectedResourceMetadataUrls(mcpUrl: string): string[] {
 
 /**
  * Well-known URLs for an authorization server, in probe order (RFC 8414 §3.1,
- * OpenID Discovery 1.0 §4). RFC 8414 INSERTS the well-known segment between
- * origin and issuer path — the opposite of the protected-resource rule above.
+ * OpenID Discovery 1.0 §4), including OpenID's issuer-path-first form.
  * Deduped because a path-less issuer collapses the first two entries.
  */
 export function authorizationServerMetadataUrls(issuer: string): string[] {

@@ -815,8 +815,10 @@ function ensureOneWorkgroupWorkDir(
  * The cross-device copy branch loses bytes written into the source during the
  * copy, so it runs only when the paths are PROVEN to be on different
  * filesystems; an unreadable `stat` skips the member for this boot (the
- * opposite of `sameFilesystem`'s unknown→copy). Interrupted publishes resume
- * next boot from their `.<name>.publishing` hold.
+ * opposite of `sameFilesystem`'s unknown→copy). An interrupted file publish
+ * resumes next boot from its `.<name>.publishing` hold (under copy it may
+ * republish to `.from-<member>`, a duplicate, never a loss); a death between a
+ * directory claim and its move leaves an empty claim the next boot moves aside.
  */
 function consolidateMemberWorkDir(
   memberWorkDir: string,
