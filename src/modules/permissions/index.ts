@@ -551,7 +551,7 @@ async function wireAndAdmit(
     engage_pattern: engage.engage_pattern,
     // Deliberate card-flow choices, not channel defaults: the triggering
     // sender is auto-admitted below, so 'known' keeps other strangers gated;
-    // 'accumulate' / 'shared' / priority 0 are the flow's fixed semantics.
+    // 'accumulate', per-thread sessions and priority 0 are the flow's fixed semantics.
     sender_scope: 'known',
     ignored_message_policy: 'accumulate',
     session_mode: 'per-thread',
@@ -671,8 +671,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
 
     try {
-      // Instance-addressed: `approverDm.instance` is the exact adapter
-      // instance `ensureUserDm` resolved this DM on above.
+      // Instance-addressed: the exact instance `ensureUserDm` resolved above.
       await adapter.deliver(
         approverDm.channel_type,
         approverDm.platform_id,
@@ -724,8 +723,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     });
 
     try {
-      // Instance-addressed: `approverDm.instance` is the exact adapter
-      // instance `ensureUserDm` resolved this DM on above.
+      // Instance-addressed: the exact instance `ensureUserDm` resolved above.
       await adapter.deliver(
         approverDm.channel_type,
         approverDm.platform_id,

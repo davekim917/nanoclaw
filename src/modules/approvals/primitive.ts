@@ -177,9 +177,10 @@ export async function pickOwnersFirst(agentGroupId: string | null): Promise<stri
  * Tie-break: prefer approvers reachable on the same channel kind as the
  * origin; else first in list.
  *
- * `sameChannelTypeOnly`: no cross-channel-type fallback. Callers whose card
- * carries a user-originated message body set it, so the body cannot leak from
- * one workspace into another where the same owner is registered.
+ * `sameChannelTypeOnly`: no cross-channel-type fallback, for cards carrying a
+ * user-originated message body, which must not leak into another workspace.
+ * Agent-originated cards leave it off: their content is system-owned, and the
+ * fallback keeps the owner reachable.
  */
 export async function pickApprovalDelivery(
   approvers: string[],
@@ -201,8 +202,7 @@ export async function pickApprovalDelivery(
     }
   }
   if (options.sameChannelTypeOnly) return null;
-  // Cross-channel fallback: the origin instance belongs to a different
-  // platform here, so it must not be stamped on this user's DM row.
+  // The origin instance belongs to a different platform here; never stamp it on this DM row.
   for (const userId of approvers) {
     const mg = await ensureUserDm(userId, { privacySafeLogs: true });
     if (mg) return { userId, messagingGroup: mg };

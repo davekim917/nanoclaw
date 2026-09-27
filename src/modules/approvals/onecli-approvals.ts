@@ -468,8 +468,8 @@ async function editCardResolution(row: PendingApproval, resolution: string): Pro
   }
 }
 
-/** The hosted gateway's structured request summary — not yet in the SDK's
- *  ApprovalRequest type (observed on api.onecli.sh, 2026-07): the action being
+/** The hosted gateway's structured request summary — not in the SDK's
+ *  ApprovalRequest type (observed on api.onecli.sh): the action being
  *  performed plus labeled fields (To / Subject / Body for email sends). */
 interface ApprovalSummary {
   action?: string;

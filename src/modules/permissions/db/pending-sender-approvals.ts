@@ -2,7 +2,7 @@
  * CRUD for pending_sender_approvals — the in-flight state for the
  * request_approval unknown-sender flow. Rows are created when an unknown
  * sender writes into a wired messaging group with that policy, and are
- * deleted on admin approve (after adding the user as a member) or deny.
+ * claimed (deleted) on admin approve before the member is added, or on deny.
  *
  * UNIQUE(messaging_group_id, sender_identity) enforces in-flight dedup:
  * a retry / second message from the same unknown sender while a card is
@@ -60,10 +60,8 @@ export async function getInFlightSenderApproval(
 }
 
 /**
- * Delete the row, and say whether THIS caller is the one that deleted it.
- *
- * The boolean is the claim: two callbacks for one card can both find the row
- * live, and only the caller whose DELETE applied may replay the message.
+ * Delete the row; true only for the caller whose DELETE applied. That is the
+ * claim: two callbacks for one card can both find it live, only one may replay.
  */
 export async function deletePendingSenderApproval(id: string): Promise<boolean> {
   const info = await getDb().run('DELETE FROM pending_sender_approvals WHERE id = ?', id);
@@ -88,7 +86,6 @@ const DECLINE_STAMP_ID_PREFIX = 'decline:';
  */
 const DECLINE_STAMP_BODY = '{"declined":true}';
 
-/** ISO timestamp of the last decline for this pair, if any. */
 /**
  * Stamps and cards share the table and its UNIQUE key; a reader that does not
  * know which flow wrote a row has to ask.
@@ -98,8 +95,7 @@ export function isDeclineStampId(id: string): boolean {
 }
 
 /**
- * Freshness check and stamp write as ONE statement, returning whether this
- * caller won.
+ * Freshness check and stamp write as ONE statement; true when this caller won.
  *
  * Read-then-write would let two overlapping declines both send; the conflict
  * clause applies the upsert only when the existing row is NOT a fresh stamp.

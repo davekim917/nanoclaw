@@ -50,11 +50,10 @@ import { getUserDm, upsertUserDm } from './db/user-dms.js';
  *
  * Callers should treat null as "this user is unreachable on this channel".
  *
- * `instance` matters only when the row is created: unset stamps
- * `instance = channel_type`, undeliverable when every bot is a named instance.
- * `user_dms` is keyed (user_id, channel_type), so an unaddressed caller gets
- * whichever instance cached first; a caller naming an instance never gets a
- * row stamped with a different one.
+ * `instance` stamps a created row (unset gives `instance = channel_type`,
+ * undeliverable when every bot is a named instance) and rejects a cached row
+ * from a different instance. `user_dms` is keyed (user_id, channel_type), so an
+ * unaddressed caller gets whichever instance cached first.
  *
  * `privacySafeLogs` omits user, handle, messaging-group and raw platform-error
  * details from logs, for security-sensitive flows only.
