@@ -165,7 +165,8 @@ export function extractCases(file: string, text: string): TestCase[] {
   }
 
   const cases: TestCase[] = [];
-  const scopes = [{ id: file, names: fileNames }];
+  const scopes = [{ id: '', names: fileNames }];
+  const seenTitles = new Map<string, number>();
   const contexts: string[] = [];
 
   const normalize = (node: ts.Node, locals = new Set<string>()) =>
@@ -225,8 +226,11 @@ export function extractCases(file: string, text: string): TestCase[] {
             }
             for (const p of callback.parameters) declaredNames(p, names);
             const title = node.arguments[0];
-            const label = title && ts.isStringLiteralLike(title) ? title.text : String(scopes.length);
-            scopes.push({ id: `${scopes[scopes.length - 1].id}>${label}`, names });
+            const parent = scopes[scopes.length - 1].id;
+            const label = `${parent}>${title && ts.isStringLiteralLike(title) ? title.text : ''}`;
+            const nth = (seenTitles.get(label) ?? 0) + 1;
+            seenTitles.set(label, nth);
+            scopes.push({ id: `${label}#${nth}`, names });
             visitBlock(callback.body.statements, false, callback.body);
             scopes.pop();
             return;

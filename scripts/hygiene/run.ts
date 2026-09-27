@@ -266,14 +266,20 @@ const DUPLICATE_WAIVER = /^Duplicate-test:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*\S.*$/gm;
 export function duplicateTestFindings(root: string, base: string): Finding[] {
   const log = stdoutOf('git', git(root, ['log', '--format=%B', `${base}..HEAD`]));
   const waived = new Set([...log.matchAll(DUPLICATE_WAIVER)].map(([, file, name]) => `${file}|${name}`));
+  const renames = stdoutOf('git', git(root, ['diff', '--name-status', '-M', '--diff-filter=R', '-z', base]))
+    .split('\0')
+    .filter(Boolean);
+  const renamedFrom = new Map<string, string>();
+  for (let i = 0; i + 2 < renames.length; i += 3) renamedFrom.set(renames[i + 2], renames[i + 1]);
   return changedFiles(root, base)
     .filter((file) => TEST_FILE.test(file) && !NOT_SOURCE_DIR.test(file))
     .flatMap((file) => {
-      const text = textAt(root, base, file);
-      if (text.head === null) return [];
-      const head = extractCases(file, text.head);
-      const added = addedCases(text.base === null ? [] : extractCases(file, text.base), head);
-      return findDuplicateTests(added, head);
+      const head = textAt(root, base, file).head;
+      if (head === null) return [];
+      const origin = renamedFrom.get(file) ?? file;
+      const before = textAt(root, base, origin).base;
+      const headCases = extractCases(file, head);
+      return findDuplicateTests(addedCases(before === null ? [] : extractCases(origin, before), headCases), headCases);
     })
     .filter(({ test }) => !waived.has(`${test.file}|${test.name}`))
     .map(({ kind, test, keeper }) => ({

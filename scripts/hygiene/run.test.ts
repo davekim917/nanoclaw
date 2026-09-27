@@ -440,4 +440,13 @@ describe('duplicate tests', () => {
     git(root, 'commit', '-q', '--allow-empty', '-m', 'why\n\nDuplicate-test: src/f.test.ts | copy | pins a title');
     expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
   });
+
+  it('does not report a duplicate that a renamed file already held', () => {
+    const pair = spec(`${keeper}it('copy', () => {\n  expect(f(1)).toBe(2);\n});\n`);
+    const root = repo(
+      { 'src/f.test.ts': pair },
+      { 'src/f.test.ts': null, 'src/moved/f.test.ts': pair.replace("'./f.js'", "'../f.js'") },
+    );
+    expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
+  });
 });

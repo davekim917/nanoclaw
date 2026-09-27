@@ -60,6 +60,10 @@ it('wider', () => {
     ],
     ['a case that asserts nothing', "it('probe', () => {\n  const out = f(1);\n});"],
     [
+      'the same body under two same-titled blocks with different fixtures',
+      "describe('s', () => {\n  const v = 1;\n  it('a', () => {\n    expect(f(v)).toBe(2);\n  });\n});\ndescribe('s', () => {\n  const v = 5;\n  it('b', () => {\n    expect(f(v)).toBe(2);\n  });\n});",
+    ],
+    [
       'the same body in loops over different rows',
       "for (const x of [1]) it('a', () => {\n  expect(f(x)).toBe(2);\n});\nfor (const x of [5]) it('b', () => {\n  expect(f(x)).toBe(2);\n});",
     ],
