@@ -1,7 +1,3 @@
-/**
- * Thin wrapper around Claude Code's `claude remote-control` CLI: spawns it, captures the URL it prints, and persists
- * the session so repeat requests report "already running" and a restart can adopt it.
- */
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -48,7 +44,6 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** Adopts the persisted session if its process is alive, else cleans up. */
 export function restoreRemoteControl(): void {
   let data: string;
   try {
