@@ -3,6 +3,7 @@
 # two of them inside a loop. Shards partition the cases; a filter that matches
 # nothing, or a malformed shard, fails the suite.
 set -u
+unset SMOKE_CASE SMOKE_SHARD SMOKE_CASE_LOG
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 FAILED=0

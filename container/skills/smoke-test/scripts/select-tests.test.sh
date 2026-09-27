@@ -4,6 +4,7 @@
 # symlink) selects it, prose does not chain, and anything unmapped runs the
 # FULL set. The selector is copied into the fixture so it finds that repo.
 set -u
+unset SMOKE_CASE SMOKE_SHARD SMOKE_CASE_LOG
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 export PYTHONDONTWRITEBYTECODE=1
@@ -85,6 +86,12 @@ for c in a b c; do
 done
 smoke_cases_done
 EOF
+cat >"$R/$S/writes-cased.test.sh" <<'EOF'
+cat >"$CASE_OUT.fixture" <<'FX'
+. "$(dirname "$0")/smoke-case.sh"
+FX
+echo "shard=${SMOKE_SHARD:-none}" >>"$CASE_OUT"
+EOF
 git -C "$R" add -A && git -C "$R" -c user.email=t@example.com -c user.name=t commit -qm base
 
 SEL="$R/$S/select-tests.py"
@@ -151,6 +158,10 @@ fi
 SMOKE_CASE=b CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/cased.test.sh" >"$T/run.out" 2>&1
 [ "$(grep -c "PASS" "$T/run.out")" = 1 ] && [ "$(cat "$T/cases.out")" = b ] &&
   ok "SMOKE_CASE runs the picked cases in one process, unsharded" || fail "SMOKE_CASE run: $(cat "$T/run.out")"
+: >"$T/cases.out"
+CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/writes-cased.test.sh" >"$T/run.out" 2>&1
+[ "$(cat "$T/cases.out")" = "shard=none" ] && ok "a suite that only writes a heredoc sourcing smoke-case.sh is not sharded" ||
+  fail "heredoc suite was sharded: $(cat "$T/cases.out")"
 
 [ "$FAILED" = 0 ] || { echo "select-tests tests FAILED" >&2; exit 1; }
 echo "select-tests tests passed"

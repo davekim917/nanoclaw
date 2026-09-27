@@ -49,7 +49,8 @@ WORD = r"(?<![A-Za-z0-9_]){}(?![A-Za-z0-9_])"
 EXCLUDED_MARK = "relPath: '"
 DEFAULT_TIMEOUT_S = 400
 SLOW_MARK = ".test.sh': "
-CASES_LIB = "smoke-case.sh"
+SOURCES_CASES = re.compile(r"^\s*(?:\.|source)\s+.*smoke-case\.sh\b")
+HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
 
 
 def git(root, *args, check=True):
@@ -262,12 +263,26 @@ def run_one(repo, suite, shard, logdir):
     return label, rc, time.monotonic() - start, log
 
 
+def marks_cases(text):
+    """The suite itself sources smoke-case.sh -- not a heredoc it writes for a fixture."""
+    end = None
+    for line in text.splitlines():
+        if end is not None:
+            end = None if line.strip() == end else end
+            continue
+        if SOURCES_CASES.match(line):
+            return True
+        m = HEREDOC.search(line)
+        end = m.group(1) if m else None
+    return False
+
+
 def jobs_for(repo, suites, shards):
     """One job per suite; a suite that marks its cases (smoke-case.sh) is split
     into `shards` processes that together run each case once."""
     out = []
     for s in suites:
-        if shards > 1 and not os.environ.get("SMOKE_CASE") and CASES_LIB in repo.code(s):
+        if shards > 1 and not os.environ.get("SMOKE_CASE") and marks_cases(repo.read(s)):
             out += [(s, "{}/{}".format(k, shards)) for k in range(1, shards + 1)]
         else:
             out.append((s, None))
