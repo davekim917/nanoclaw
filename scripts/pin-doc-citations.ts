@@ -100,17 +100,19 @@ function introducingCommit(root: string, rev: string, searches: { needle: string
   return null;
 }
 
-function candidateRevisions(root: string, origin: string, file: string): string[] {
-  const touching = (gitRead(root, ['log', '--format=%H', `-n${MAX_EARLIER_VERSIONS}`, origin, '--', file]) ?? '')
+function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] {
+  const touching = (gitRead(root, ['log', '--format=%H', `-n${MAX_EARLIER_VERSIONS}`, origin, '--', ...files]) ?? '')
     .split('\n')
     .filter(Boolean);
   const revs = [origin, ...touching.map((sha) => `${sha}^`)];
-  const seenBlobs = new Set<string>();
+  const seenVersions = new Set<string>();
   const out: string[] = [];
   for (const rev of revs) {
-    const blob = gitRead(root, ['rev-parse', '--verify', '--quiet', `${rev}:${file}`])?.trim() ?? `missing:${rev}`;
-    if (seenBlobs.has(blob)) continue;
-    seenBlobs.add(blob);
+    const version = files
+      .map((file) => gitRead(root, ['rev-parse', '--verify', '--quiet', `${rev}:${file}`])?.trim() ?? 'missing')
+      .join(' ');
+    if (seenVersions.has(version)) continue;
+    seenVersions.add(version);
     const sha = gitRead(root, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`])?.trim();
     if (sha) out.push(sha);
   }
@@ -191,10 +193,10 @@ export function pinDocs(
         const origin = introducingCommit(root, rev, searches);
         const start = origin ?? gitRead(root, ['rev-parse', rev])?.trim() ?? rev;
         if (!gitRead(root, ['log', '-1', '--format=%H', start, '--', head.file])?.trim()) continue;
-        const candidates = candidateRevisions(root, start, head.file);
+        const candidates = candidateRevisions(root, start, files);
         const originTouchedFile =
           origin !== null &&
-          Boolean(gitRead(root, ['diff', '--name-only', `${origin}^`, origin, '--', head.file])?.trim());
+          Boolean(gitRead(root, ['diff', '--name-only', `${origin}^`, origin, '--', ...files])?.trim());
         const runStart = text[head.index - 1] === '`' ? head.index - 1 : head.index;
         const anchors = noteAnchors(citationClause(text, runStart, run.end), files);
         const decision = choosePin(root, run.links, anchors, candidates, originTouchedFile);

@@ -196,6 +196,20 @@ describe('pinDocs', () => {
     ]);
   });
 
+  it("checks the ambiguity around the note's own commit for every file in a joined run", () => {
+    const root = gitRoot();
+    write(root, 'src/a.ts', 'function drainQueue() {}\n');
+    write(root, 'src/b.ts', 'drainQueue(skip);\n');
+    commit(root, 'code');
+    write(root, 'src/b.ts', 'drainQueue(retry);\n');
+    write(root, NOTE, '- `drainQueue` at `src/a.ts:1` and `src/b.ts:1` decides it\n');
+    commit(root, 'change b and note');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([
+      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/both .* match/) }),
+    ]);
+  });
+
   it('leaves pinned citations and citations of other files alone', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

@@ -41,7 +41,8 @@ function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<strin
   if (tracked.has(relative)) return { file: relative } satisfies Resolution;
   const bySuffix = [...tracked].filter((file) => file.endsWith(`/${cited}`));
   if (bySuffix.length === 1) return { file: bySuffix[0] } satisfies Resolution;
-  if (bySuffix.length === 0 && cited.includes('/') && topDirs.has(cited.split('/')[0]))
+  const shaped = cited.startsWith('.') ? relative : cited;
+  if (bySuffix.length === 0 && shaped.includes('/') && topDirs.has(shaped.split('/')[0]))
     return { missing: true } satisfies Resolution;
   return { skip: true } satisfies Resolution;
 }
@@ -167,6 +168,13 @@ describe('docCitationProblems', () => {
     });
     expect(docCitationProblems(root, ['doc.md'])).toEqual([
       'doc.md:1: cites `src/gone.ts:3`, but no tracked file has that path',
+    ]);
+  });
+
+  it('fails a doc-relative path to a file that no longer exists', () => {
+    const { root } = repo({ 'src/a.ts': 'a\n', 'docs/guide.md': '`../src/gone.ts:3` and `../src/a.ts:1`\n' });
+    expect(docCitationProblems(root, ['docs/guide.md'])).toEqual([
+      'docs/guide.md:1: cites `../src/gone.ts:3`, but no tracked file has that path',
     ]);
   });
 });
