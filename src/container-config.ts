@@ -59,8 +59,8 @@ interface StdioMcpServerConfig {
   /**
    * Name of the plugin that stamped this server. Ownership marker: plugin-owned
    * servers reject CLI/self-mod edits and are swapped wholesale on restamp
-   * (`ncl groups create --template`). Never CLI input, and never written to container.json (it would flow into
-   * every provider's server map); ownership is read from the `container_configs.mcp_servers` projection.
+   * (`ncl groups create --template`). Never CLI input. Written to container.json and the projection alike; guards
+   * read the file, and the runner strips it so it never reaches a provider's server map.
    */
   plugin?: string;
   instructions?: string;
