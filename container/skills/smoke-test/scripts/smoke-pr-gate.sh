@@ -115,12 +115,12 @@ CONTROL_LOCK="$STATE_DIR/control.lock"
 # this lock is the one exception and DOES fail closed (see below), because it
 # guards a real write (cross-PR run-id uniqueness), not just an alarm stamp.
 
-# Deployment-specific path conventions from the design doc — not exposed as
-# env because they are facts about this repo's layout, not gate policy.
-FRONTEND_PREFIX="XZO-FRONTEND/"
-MIGRATIONS_PREFIX="XZO-BACKEND/migrations/"
-FREEZE_MARKER_BACKEND="XZO-BACKEND/.render-freeze"
-FREEZE_MARKER_FRONTEND="XZO-FRONTEND/.render-freeze"
+# Repo-layout prefixes: install env, refused empty (`startswith("")` matches all).
+FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
+BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"
+MIGRATIONS_PREFIX="${SMOKE_GATE_MIGRATIONS_PREFIX:-}"
+FREEZE_MARKER_BACKEND="${BACKEND_PREFIX}.render-freeze"
+FREEZE_MARKER_FRONTEND="${FRONTEND_PREFIX}.render-freeze"
 
 # Preview-identity disambiguation (#1536). Render has twice provisioned two
 # services sharing one display name under the same parent (PR #1533, PR
@@ -3068,9 +3068,9 @@ if [ "$COMMAND" = "check" ]; then
     exit 2
   fi
   MISSING=""
-  [ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-  [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-  [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
+  for k in REPO BACKEND_SERVICE FRONTEND_SERVICE FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX; do
+    [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
+  done
 # A knob that fell back to its default because the deployed value was not a
 # number is a misconfiguration, not a detail — name it in the same alarm.
 MISSING="$MISSING$BAD_NUMERIC_CONFIG"
@@ -5003,9 +5003,9 @@ fi
 # 6h so misconfiguration surfaces once as a visible alarm instead of silent
 # wakeAgent:false forever.
 MISSING=""
-[ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
-[ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
-[ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
+for k in REPO BACKEND_SERVICE FRONTEND_SERVICE FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX; do
+  [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
+done
 # A knob that fell back to its default because the deployed value was not a
 # number is a misconfiguration, not a detail — name it in the same alarm.
 MISSING="$MISSING$BAD_NUMERIC_CONFIG"

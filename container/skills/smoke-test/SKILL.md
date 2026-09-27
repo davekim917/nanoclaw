@@ -2612,7 +2612,13 @@ Config: `SMOKE_GATE_REPO`, `SMOKE_GATE_BRANCH` (default `develop`),
 `SMOKE_GATE_BACKEND_SERVICE` / `SMOKE_GATE_FRONTEND_SERVICE` (the **base**
 Render service ids — previews are discovered per PR by matching
 `serviceDetails.parentServer.id` plus a `PR #<n>` name suffix, never
-hardcoded preview ids), `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
+hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFIX` /
+`SMOKE_GATE_MIGRATIONS_PREFIX` (the install's repo dirs, each with a trailing
+`/`: a diff under the frontend prefix requires the frontend preview to match,
+one under the migrations prefix refuses an ordinary PR, and the freeze markers
+are `<prefix>.render-freeze` under the backend and frontend prefixes; all
+three are required, an empty value is `gate_misconfigured`),
+`SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
 seam and semantics as the develop gate — one readiness command run once per
 poll, immediately before a settled candidate is actually claimed), and
@@ -2622,6 +2628,13 @@ without a healthy `/healthz` after going `live` raises one throttled
 SHA this gate's own `finish` already completed and suspended: `finish`
 suspending its preview by design produces the identical
 backendReady-true/healthzReady-false shape, and is checked first).
+
+`scripts/smoke-config-check.sh [<file>...]` (default: the install's
+`/workspace/agent/smoke-gate-env.sh` and `/workspace/agent/smoke-develop-gate.sh`)
+reads those files as data and names every required key a file lacks and every
+required key the files disagree on — names only, never a value. Run it before a
+gate change goes live; `gate_misconfigured` after a pull means a key it would
+have named.
 
 **Preview identity is never a positional pick.** Render has provisioned two
 services sharing one display name under the same parent more than once (a

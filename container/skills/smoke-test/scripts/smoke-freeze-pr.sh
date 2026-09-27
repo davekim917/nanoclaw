@@ -8,7 +8,7 @@
 #     PR #759: 35 minutes, zero preview events). Render only builds a preview
 #     when the PR diff touches the service's rootDir, so this script instead
 #     adds ONE marker commit creating `.render-freeze` (containing the target
-#     SHA) under both XZO-BACKEND/ and XZO-FRONTEND/ — build-inert (nothing
+#     SHA) under each service's root dir (the *_PREFIX env) — build-inert (nothing
 #     imports a dotfile), but a real diff.
 #   - Draft PRs DO trigger previews (verified live, PR #775: draft from
 #     creation, labeled at creation, both previews within 30s). Draft is also
@@ -22,11 +22,11 @@
 #   <target-sha>  full 40-character SHA on SMOKE_GATE_BRANCH to freeze.
 #
 # Env (same family as smoke-pr-gate.sh):
-#   SMOKE_GATE_REPO    required, "owner/repo".
-#   SMOKE_GATE_BRANCH  base branch for the draft PR (default: develop).
-#   SMOKE_GATE_LABEL   label that opts the PR into Render previews
-#                      (default: render-preview). Must already exist on the
-#                      repo — this script does not create labels.
+#   SMOKE_GATE_REPO             required, "owner/repo".
+#   SMOKE_GATE_BACKEND_PREFIX / SMOKE_GATE_FRONTEND_PREFIX
+#                               required, each service's root dir with a trailing "/".
+#   SMOKE_GATE_BRANCH           base branch for the draft PR (default: develop).
+#   SMOKE_GATE_LABEL            opts the PR into Render previews (default: render-preview); must exist.
 #
 # Output: one JSON line on success —
 #   {"prNumber":<n>,"branch":"smoke/freeze-<sha12>","freezeSha":"<40char>","targetSha":"<40char>"}
@@ -48,9 +48,9 @@ REPO="${SMOKE_GATE_REPO:-}"
 BRANCH="${SMOKE_GATE_BRANCH:-develop}"
 LABEL="${SMOKE_GATE_LABEL:-render-preview}"
 TARGET_SHA="${1:-}"
-
-if [ -z "$REPO" ]; then
-  jq -cn '{ok:false,error:"SMOKE_GATE_REPO is required"}'
+BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"; FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
+if [ -z "$REPO" ] || [ -z "$BACKEND_PREFIX" ] || [ -z "$FRONTEND_PREFIX" ]; then
+  jq -cn '{ok:false,error:"SMOKE_GATE_REPO, SMOKE_GATE_BACKEND_PREFIX and SMOKE_GATE_FRONTEND_PREFIX are required"}'
   exit 2
 fi
 if ! printf '%s' "$TARGET_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
@@ -87,10 +87,10 @@ if [ -z "$BLOB_SHA" ]; then
 fi
 
 NEW_TREE="$(jq -cn \
-  --arg base "$BASE_TREE" --arg sha "$BLOB_SHA" \
+  --arg base "$BASE_TREE" --arg sha "$BLOB_SHA" --arg be "$BACKEND_PREFIX" --arg fe "$FRONTEND_PREFIX" \
   '{base_tree:$base,tree:[
-    {path:"XZO-BACKEND/.render-freeze",mode:"100644",type:"blob",sha:$sha},
-    {path:"XZO-FRONTEND/.render-freeze",mode:"100644",type:"blob",sha:$sha}
+    {path:($be + ".render-freeze"),mode:"100644",type:"blob",sha:$sha},
+    {path:($fe + ".render-freeze"),mode:"100644",type:"blob",sha:$sha}
   ]}' | timeout 10 gh api "repos/$REPO/git/trees" --input - --jq '.sha // empty' 2>/dev/null)"
 if [ -z "$NEW_TREE" ]; then
   jq -cn '{ok:false,error:"failed to create marker tree"}'

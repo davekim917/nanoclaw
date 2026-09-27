@@ -1609,7 +1609,7 @@ class EffectLayer:
         ob = self.ctl.obligations().get(obligation_key(run_id, "owner", step)) or {}
         if (ob.get("detail") or {}).get("tokenReissued"):
             out.append(
-                "**YOUR OWNER TOKEN CHANGED (XZO #2046).** A recovery `poll` re-minted this run's coordinator "
+                "**YOUR OWNER TOKEN CHANGED.** A recovery `poll` re-minted this run's coordinator "
                 "lease under a fresh token, so the one you have been using is retired and every "
                 "`smoke-run-scaffold.sh` write will be refused by its owner fence. Re-read "
                 "`{run}/controller/wake.json` (refreshed with this brief), export its `coordinatorOwnerToken` as "

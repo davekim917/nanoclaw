@@ -146,11 +146,14 @@ def _scrub_marker(m):
 
 
 def build(args):
+    prefix = (getattr(args, "run_prefix", "") or "").strip()
+    if not prefix:
+        sys.exit("build: --run-prefix (or SMOKE_GATE_RUN_PREFIX) is required")
     gh = json.load(open(args.gh_actual))
     a2 = json.load(open(args.actuals2))
     turns = json.load(open(args.turns)).get("camp", {}) if args.turns else {}
     runs = sorted(d for d in os.listdir(args.gate_runs)
-                  if d.startswith("xzo-pr-") and d.rsplit("-", 1)[1][:8] >= args.since
+                  if d.startswith(prefix + "-") and d.rsplit("-", 1)[1][:8] >= args.since
                   and (not args.until or d.rsplit("-", 1)[1][:8] <= args.until))
     lines = [json.dumps({"provenance": {
         "builtAt": iso(dt.datetime.now(dt.timezone.utc)),
@@ -233,7 +236,7 @@ def build(args):
         confirmed = sorted({f for fe in files if isinstance(fe.get("content"), dict)
                             for f in fe["content"].get("confirmedFindings") or []})
         entry = {
-            "runId": run, "pr": int(re.match(r"xzo-pr-pr(\d+)-", run).group(1)),
+            "runId": run, "pr": int(re.match(re.escape(prefix) + r"-pr(\d+)-", run).group(1)),
             "sourceSha": contract.get("sourceSha"), "claimAt": iso(run_claim_time(run)),
             "isFreezePr": (x.get("headRefName") or "").startswith("smoke/freeze-"),
             "files": sorted({f["path"]: f for f in reversed(files)}.values(), key=lambda f: (f["at"], f["path"])),
@@ -758,6 +761,8 @@ def main(argv=None):
     b.add_argument("--gh-actual", required=True)
     b.add_argument("--actuals2", required=True)
     b.add_argument("--turns")
+    b.add_argument("--run-prefix", default=os.environ.get("SMOKE_GATE_RUN_PREFIX", ""),
+                   help="the install's SMOKE_GATE_RUN_PREFIX; run dirs are <prefix>-pr<n>-<sha12>-<stamp>")
     b.add_argument("--since", default="20260905")
     b.add_argument("--until", default="")
     b.add_argument("--out", required=True)
