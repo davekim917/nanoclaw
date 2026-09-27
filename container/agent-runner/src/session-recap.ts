@@ -1,15 +1,7 @@
 /**
- * Session recap: rebuild a recent-conversation transcript from the
- * per-session DBs (messages_in + messages_out) so the agent can recover
- * context after the SDK transcript is lost.
- *
- * Only runs on session-reset paths — see poll-loop.ts:
- *   - stale-session error (transcript .jsonl missing or session id unknown)
- *   - context-too-long retry (continuation cleared because the cumulative
- *     prompt exceeded the model's context window)
- *
- * NOT used on credential rotation: the .jsonl is local to the container
- * and resumes cleanly under the new token, so no recap is needed there.
+ * Rebuilds recent history from the session DBs for session-reset paths (stale
+ * session, context-too-long). Not for credential rotation: the .jsonl resumes
+ * cleanly there.
  */
 import { readRecapInboundRows, readRecapOutboundRows } from './modules/mailbox/index.js';
 
@@ -38,13 +30,8 @@ export interface SessionRecapOptions {
 }
 
 /**
- * Build a chronological transcript of the most recent completed turns
- * for this session. Returns null if nothing is available (e.g. this is
- * the first message of a brand-new session).
- *
- * Inbound rows are filtered to status='completed' so the user's current
- * in-flight prompt (status='processing') doesn't end up duplicated in
- * its own recap.
+ * Null when there is no history. Inbound rows are completed-only, so the
+ * in-flight prompt is not duplicated in its own recap.
  */
 export function buildSessionRecap(opts: SessionRecapOptions = {}): string | null {
   const maxMessages = opts.maxMessages ?? DEFAULT_MAX_MESSAGES;
@@ -56,7 +43,7 @@ export function buildSessionRecap(opts: SessionRecapOptions = {}): string | null
   try {
     inRows = readRecapInboundRows(maxMessages);
   } catch {
-    // Tables missing (test harness, fresh session). Treat as no history.
+    // Tables missing (fresh session): no history.
   }
 
   try {
@@ -82,16 +69,11 @@ export function buildSessionRecap(opts: SessionRecapOptions = {}): string | null
 
   if (merged.length === 0) return null;
 
-  // Keep the most recent `maxMessages` after merge — the inbound and
-  // outbound caps above are independent, so the merged list can have up
-  // to 2*maxMessages entries.
   const trimmed = merged.slice(-maxMessages);
 
   const lines = trimmed.map((m) => `[${m.timestamp}] ${m.role}: ${m.text}`);
   let recap = lines.join('\n\n');
 
-  // Char budget. Trim from the front and snap to the next message
-  // boundary so we never start a recap mid-message.
   if (recap.length > maxChars) {
     recap = recap.slice(-maxChars);
     const firstBoundary = recap.indexOf('\n\n');
@@ -101,11 +83,6 @@ export function buildSessionRecap(opts: SessionRecapOptions = {}): string | null
   return recap;
 }
 
-/**
- * Wrap a recap string in a marker block. The agent should treat the
- * contents as restored history, not new user input — the framing tells
- * it not to respond to or quote past turns as if they just arrived.
- */
 export function wrapRecap(recap: string, reason: string): string {
   return (
     `<session-recap reason="${reason}">\n` +
