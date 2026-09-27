@@ -806,7 +806,7 @@ async function retryPendingSecretWrite(
       // The MINT time, not now: the unknown-expiry interval is measured from this column.
       last_refresh_at: new Date(parked.mintedAtMs).toISOString(),
     });
-    // Same tail as `finalizeToken`: an undeclared bearer is never granted.
+    // Same tail as `finalizeToken`: the bearer must be declared to be granted at spawn.
     await ensureSecretDeclared(row.agent_group_id, row.bearer_secret_name);
     outcome.refreshed.push(row.name);
     log.info('MCP OAuth bearer write recovered', {
@@ -1158,8 +1158,9 @@ async function removeIntegrationLocked(name: string, options: { deleteSecret?: b
       );
     }
     if (ref) {
-      // The declaration is already gone, so a failure here leaves only an inert
-      // orphan secret (named in the error) and the row, so a retry resolves it again.
+      // The declaration is already gone. A failure here leaves the orphan secret
+      // (named in the error; an existing gateway grant is not revoked) and the
+      // row, so a retry resolves it again.
       removedSecret = await deleteOnecliSecret(ref.id);
     }
   }

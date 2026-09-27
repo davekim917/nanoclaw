@@ -817,8 +817,9 @@ function ensureOneWorkgroupWorkDir(
  * filesystems; an unreadable `stat` skips the member for this boot (the
  * opposite of `sameFilesystem`'s unknown→copy). An interrupted file publish
  * resumes next boot from its `.<name>.publishing` hold (under copy it may
- * republish to `.from-<member>`, a duplicate, never a loss); a death between a
- * directory claim and its move leaves an empty claim the next boot moves aside.
+ * republish to `.from-<member>`, a duplicate, never a loss). A death between a
+ * directory claim and its move leaves the empty claim at the real name; the
+ * next boot publishes the source under `<name>.from-<member>` instead.
  */
 function consolidateMemberWorkDir(
   memberWorkDir: string,
