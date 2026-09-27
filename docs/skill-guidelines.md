@@ -169,6 +169,7 @@ Each with its fix. These are patterns to remove, not to test around: a drift-pro
 7. **Diff-against-past framing** ("earlier versions…", "this is now redundant") and **documenting non-steps** ("no X needed"). Write present-tense DO steps only. A skill reads as a standalone artifact with no memory of its own edits.
 8. **Stale reach-in targets** (an edit aimed at code that no longer exists; a reach-in already shipped in trunk). Verify the target exists *before* instructing the edit; reconcile already-in-trunk ones to a no-op. Before appending to an allowlist or list, check how it's consumed; the entry may already be derived from a registry, making the edit dead.
 9. **Hand-maintained duplicate copies** (a mirror directory kept in sync by hand or sed). Generate the mirror from a single canonical source.
+10. **Install-specific names in a public skill.** Container skills and trunk code are public. A client, product, agent persona, or client repository name never appears in them, not even in an example or a test fixture; fixtures use fictional names. Values that differ per install come from that install's own config: a group's `journeys.json` beside its standing instructions, its `/workspace/agent/smoke-gate-env.sh`, the caller-provided `contact-sheet/shots.json`. The public-boundary hooks derive these names from the install and refuse them; `.public-boundary-baseline.json` holds the occurrences that predate the check, per file, and only shrinks (`check:public-boundary -- --write-baseline`).
 
 ---
 

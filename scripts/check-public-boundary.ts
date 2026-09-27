@@ -8,7 +8,7 @@
  *
  * Findings intentionally omit the matched value.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -65,10 +65,115 @@ export interface ScanOptions {
   // A committed message is serialized history, not an editor buffer. Unlike
   // the commit-msg input, its scissors and comment text must be scanned.
   messageRaw: boolean;
+  baselinePath?: string;
+  writeBaseline: boolean;
+  acceptGrowth: boolean;
 }
 
 const DEFAULT_DB_RELATIVE = path.join('data', 'v2.db');
 const DEFAULT_IDENTIFIERS_RELATIVE = path.join('.nanoclaw', 'public-boundary-identifiers');
+const DEFAULT_BASELINE_RELATIVE = '.public-boundary-baseline.json';
+
+// A repository name built only from these words names a kind of repository,
+// not a client, and would match ordinary prose across the whole tree.
+const GENERIC_REPOSITORY_WORDS = new Set([
+  'admin',
+  'agent',
+  'analytics',
+  'android',
+  'api',
+  'app',
+  'apps',
+  'backend',
+  'bot',
+  'cli',
+  'client',
+  'config',
+  'core',
+  'dashboard',
+  'data',
+  'dbt',
+  'demo',
+  'deploy',
+  'dev',
+  'docs',
+  'etl',
+  'frontend',
+  'infra',
+  'integrations',
+  'ios',
+  'lib',
+  'looker',
+  'main',
+  'maintenance',
+  'mobile',
+  'ops',
+  'pipeline',
+  'platform',
+  'prod',
+  'qa',
+  'report',
+  'scripts',
+  'sdk',
+  'segment',
+  'server',
+  'service',
+  'services',
+  'sandbox',
+  'scratch',
+  'site',
+  'snowflake',
+  'stage',
+  'staging',
+  'table',
+  'template',
+  'templates',
+  'terraform',
+  'test',
+  'tests',
+  'tools',
+  'ui',
+  'viz',
+  'web',
+  'website',
+  'wiki',
+]);
+
+// A three-letter all-caps name normally matches as a bare word (see
+// normalizedIdentifierPattern). These acronyms appear throughout ordinary
+// code, so a client repository named after one keeps the contextual match.
+const COMMON_ACRONYMS = new Set([
+  'api',
+  'app',
+  'aws',
+  'cli',
+  'csv',
+  'css',
+  'dbt',
+  'dev',
+  'dns',
+  'etl',
+  'gcp',
+  'git',
+  'ios',
+  'jwt',
+  'llm',
+  'mcp',
+  'npm',
+  'ops',
+  'pdf',
+  'sdk',
+  'sql',
+  'ssh',
+  'ssl',
+  'tls',
+  'uri',
+  'url',
+  'web',
+  'xml',
+  'yml',
+  'zip',
+]);
 
 const GENERIC_IDENTIFIERS = new Set([
   'admin',
@@ -190,19 +295,24 @@ function normalizedIdentifierPattern(value: string): RegExp | null {
   const tokens = value.match(/[A-Za-z0-9]+/g) ?? [];
   if (tokens.length === 0) return null;
   const normalizedLength = tokens.reduce((sum, token) => sum + token.length, 0);
+  // An all-caps three-letter name is a product or code name; the contextual
+  // rule below let one appear hundreds of times in tracked files unflagged.
+  if (/^[A-Z][A-Z0-9]{2}$/.test(value) && !COMMON_ACRONYMS.has(value.toLowerCase())) {
+    return new RegExp(`(^|[^A-Za-z0-9])${value}(?=$|[^A-Za-z0-9])`, 'gi');
+  }
   if (normalizedLength < 4) {
     const identifier = tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}');
     const context =
       '(?:agent|client|customer|data|datafold|discord|group|slack|tenant|token|workspace|workgroup|[amw]g)';
     return new RegExp(
       `(^|[^A-Za-z0-9])(?:${context}[^A-Za-z0-9]{1,4}${identifier}|${identifier}[^A-Za-z0-9]{1,4}${context})(?=$|[^A-Za-z0-9])`,
-      'i',
+      'gi',
     );
   }
   if (normalizedLength < 6) {
-    return new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(value)}(?=$|[^A-Za-z0-9])`, 'i');
+    return new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(value)}(?=$|[^A-Za-z0-9])`, 'gi');
   }
-  return new RegExp(`(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`, 'i');
+  return new RegExp(`(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`, 'gi');
 }
 
 function addIdentifier(target: Set<string>, value: unknown): void {
@@ -235,16 +345,16 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
     // constants IN tracked scripts — treating them as install-private would
     // make the boundary check flag the very script that authors them.
     "SELECT id, display_name FROM users WHERE id NOT LIKE 'system:%'",
+    'SELECT assistant_name FROM container_configs',
   ];
   try {
     for (const query of queries) {
-      let rows: Record<string, unknown>[];
-      try {
-        rows = db.prepare(query).all() as Record<string, unknown>[];
-      } catch {
-        continue;
+      const rows = readSource(() => db.prepare(query).all() as Record<string, unknown>[], isMissingSchema);
+      if (!rows.ok) {
+        if (rows.absent) continue;
+        throw new Error('install registry is unreadable');
       }
-      for (const row of rows) {
+      for (const row of rows.value) {
         for (const value of Object.values(row)) addIdentifier(identifiers, value);
       }
     }
@@ -252,6 +362,206 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
     db.close();
   }
   if (identifiers.size === 0) throw new Error('install registry contained no usable identifiers');
+  return identifiers;
+}
+
+export type ParsedRemote =
+  | { kind: 'network'; host: string; owner: string; repo: string; key: string }
+  | { kind: 'local' }
+  | { kind: 'unsupported' };
+
+// The only network shapes the repository store uses. A name never starts with
+// a dot, so `.` and `..` segments cannot hide the repository git reaches.
+const REMOTE_HOST = String.raw`[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+`;
+const REMOTE_NAME = String.raw`[A-Za-z0-9_-][A-Za-z0-9._-]*`;
+const NETWORK_REMOTES = [
+  new RegExp(`^https://(${REMOTE_HOST})/(${REMOTE_NAME})/(${REMOTE_NAME})$`),
+  new RegExp(`^git@(${REMOTE_HOST}):(${REMOTE_NAME})/(${REMOTE_NAME})$`),
+];
+
+/**
+ * What a remote URL names. Only `https://<host>/<owner>/<repo>[.git]` and
+ * `git@<host>:<owner>/<repo>[.git]` are network remotes, yielding host, owner,
+ * repository and an exact identity key (case-folded only on github.com, whose
+ * paths are case-insensitive); an absolute path or file:// URL is local.
+ * Everything else is unsupported: what it names is unknown.
+ */
+export function parseRemote(url: string): ParsedRemote {
+  const trimmed = url.trim();
+  if (trimmed.startsWith('/') || trimmed.startsWith('file://')) return { kind: 'local' };
+  const match = NETWORK_REMOTES.map((pattern) => pattern.exec(trimmed)).find(Boolean);
+  if (!match) return { kind: 'unsupported' };
+  const [, rawHost, owner, rawRepo] = match;
+  const host = rawHost.toLowerCase();
+  const repo = rawRepo.replace(/\.git$/, '');
+  const repoPath = `${owner}/${repo}`;
+  return {
+    kind: 'network',
+    host,
+    owner,
+    repo,
+    key: `${host}/${host === 'github.com' ? repoPath.toLowerCase() : repoPath}`,
+  };
+}
+
+// A hook exports its own repository's GIT_DIR and friends; left in place they
+// would make a lookup in another checkout read the committing repository.
+const REPOSITORY_SELECTION_ENV =
+  /^GIT_(?:DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE|PREFIX)$/;
+
+function repositoryNeutralEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([key]) => !REPOSITORY_SELECTION_ENV.test(key)));
+}
+
+type RemoteUrl = { kind: 'url'; url: string } | { kind: 'absent' } | { kind: 'unreadable' };
+
+// Git resolves its own config (include.path, includeIf, url.*.insteadOf);
+// discovery never parses it. Exit 2 is git's "no such remote"; anything else
+// (an unreadable config or include, a refused repository, a timeout) is unknown.
+function remoteUrl(dir: string, name: string, env: NodeJS.ProcessEnv): RemoteUrl {
+  const result = runGit(['remote', 'get-url', name], dir, env);
+  if (result.status === 0 && result.stdout.trim()) return { kind: 'url', url: result.stdout.trim() };
+  return result.status === 2 ? { kind: 'absent' } : { kind: 'unreadable' };
+}
+
+export interface PublicRemotes {
+  /** Owners of the scanned and install checkouts' remotes: their names appear in public URLs. */
+  owners: Set<string>;
+  /** Exactly those remotes. Another repository under the same owner may be private. */
+  repositories: Set<string>;
+}
+
+// Unlike identifier discovery, a failure here fails strict: an unread remote
+// only exempts less, so a root that is not a readable checkout is skipped.
+export function publicRemotes(roots: string[]): PublicRemotes {
+  const remotes: PublicRemotes = { owners: new Set(), repositories: new Set() };
+  const env = repositoryNeutralEnv();
+  for (const root of roots) {
+    const names = runGit(['remote'], root, env);
+    if (names.status !== 0) continue;
+    for (const name of names.stdout.split('\n').filter(Boolean)) {
+      const lookup = remoteUrl(root, name, env);
+      const parsed = lookup.kind === 'url' ? parseRemote(lookup.url) : null;
+      if (parsed?.kind !== 'network') continue;
+      remotes.owners.add(parsed.owner.toLowerCase());
+      remotes.repositories.add(parsed.key);
+    }
+  }
+  return remotes;
+}
+
+/**
+ * The install checkout that holds `dbPath`, only for the `<install>/data/<db>`
+ * layout. An explicit registry elsewhere names no checkout: its grandparent
+ * must not contribute groups, clones, or public remotes.
+ */
+function installRootOf(dbPath: string): string | null {
+  const dataDir = path.dirname(path.resolve(dbPath));
+  return path.basename(dataDir) === 'data' ? path.dirname(dataDir) : null;
+}
+
+function isGenericRepositoryName(name: string): boolean {
+  const words = name.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  return words.every((word) => GENERIC_REPOSITORY_WORDS.has(word));
+}
+
+function errorCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException | null)?.code;
+}
+
+type SourceRead<T> = { ok: true; value: T } | { ok: false; absent: boolean };
+
+function isMissingPath(err: unknown): boolean {
+  return errorCode(err) === 'ENOENT' || errorCode(err) === 'ENOTDIR';
+}
+
+// An older registry schema lacks a table or column; that is absence, not damage.
+function isMissingSchema(err: unknown): boolean {
+  return err instanceof Error && /^no such (?:table|column)\b/.test(err.message);
+}
+
+// The one read path for every discovery input. Absent is fine: an install need
+// not have groups or clones. Any other failure means a source exists but its
+// names are unknown, and the caller must count discovery incomplete.
+function readSource<T>(read: () => T, isAbsent: (err: unknown) => boolean = isMissingPath): SourceRead<T> {
+  try {
+    return { ok: true, value: read() };
+  } catch (err) {
+    return { ok: false, absent: isAbsent(err) };
+  }
+}
+
+function listSource(dir: string, problems: string[], what: string): string[] {
+  const listed = readSource(() => fs.readdirSync(dir));
+  if (listed.ok) return listed.value;
+  if (!listed.absent) problems.push(`${what} could not be listed`);
+  return [];
+}
+
+/**
+ * Names the install holds outside the registry tables: agent persona names
+ * from each group's container.json, and the owner and name of every cloned
+ * client repository. Derived rather than listed by hand, so a new client is
+ * covered the moment its group or repository exists. A source that exists but
+ * cannot be read is recorded in `problems` (never by name) rather than
+ * silently contributing nothing.
+ */
+export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, problems: string[]): Set<string> {
+  const identifiers = new Set<string>();
+  const installRoot = installRootOf(dbPath);
+  if (!installRoot) return identifiers;
+  const groupsDir = path.join(installRoot, 'groups');
+  for (const folder of listSource(groupsDir, problems, 'the groups directory')) {
+    const config = readSource(() => {
+      const parsed = JSON.parse(fs.readFileSync(path.join(groupsDir, folder, 'container.json'), 'utf8')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a config object');
+      const persona = (parsed as Record<string, unknown>).assistantName;
+      if (persona !== undefined && (typeof persona !== 'string' || !persona.trim()))
+        throw new Error('assistantName is not a non-empty string');
+      return persona;
+    });
+    if (!config.ok) {
+      if (!config.absent) problems.push('a group container.json could not be read or parsed');
+      continue;
+    }
+    addIdentifier(identifiers, config.value);
+  }
+
+  const repositoriesDir = path.join(installRoot, 'data', 'repositories');
+  for (const workgroup of listSource(repositoriesDir, problems, 'the repository store')) {
+    for (const name of listSource(path.join(repositoriesDir, workgroup), problems, 'a repository directory')) {
+      const clone = path.join(repositoriesDir, workgroup, name);
+      const isClone = readSource(() => fs.lstatSync(path.join(clone, '.git')));
+      if (!isClone.ok) {
+        if (!isClone.absent) problems.push('a cloned repository could not be read');
+        continue;
+      }
+      // Without the ceiling, git run in a clone whose .git vanished answers for
+      // the enclosing checkout instead.
+      const origin = remoteUrl(clone, 'origin', {
+        ...repositoryNeutralEnv(),
+        GIT_CEILING_DIRECTORIES: path.dirname(clone),
+      });
+      if (origin.kind === 'unreadable') {
+        problems.push('a cloned repository configuration could not be read');
+        continue;
+      }
+      const parsed = origin.kind === 'url' ? parseRemote(origin.url) : null;
+      if (parsed?.kind === 'unsupported') {
+        problems.push('a cloned repository origin could not be interpreted');
+        continue;
+      }
+      // A local-only canonical (no origin, or a local one) is named by its canonical directory.
+      if (parsed?.kind !== 'network') {
+        if (!isGenericRepositoryName(name)) addIdentifier(identifiers, name);
+        continue;
+      }
+      if (!remotes.owners.has(parsed.owner.toLowerCase()) && !isGenericRepositoryName(parsed.owner))
+        addIdentifier(identifiers, parsed.owner);
+      if (!remotes.repositories.has(parsed.key) && !isGenericRepositoryName(parsed.repo))
+        addIdentifier(identifiers, parsed.repo);
+    }
+  }
   return identifiers;
 }
 
@@ -331,6 +641,10 @@ export function scanInputs(
   allowlist: AllowlistEntry[],
 ): Finding[] {
   const findings: Finding[] = [];
+  const identifierPatterns = [...privateIdentifiers].map((identifier) => ({
+    identifier,
+    pattern: normalizedIdentifierPattern(identifier),
+  }));
   for (const input of inputs) {
     if (input.content.includes(0)) continue;
     const content = input.content.toString('utf8');
@@ -358,7 +672,7 @@ export function scanInputs(
       }
     }
 
-    for (const identifier of privateIdentifiers) {
+    for (const { identifier, pattern } of identifierPatterns) {
       // The serialized-allowlist exemption matters here too: a registry-derived
       // name (e.g. a workgroup) can only be allowlisted by writing its value
       // into .public-boundary-allowlist.json, which this same scan then reads.
@@ -366,9 +680,10 @@ export function scanInputs(
       // any other private identifier inside the file still flags (see test).
       if (isAllowed(input.file, identifier, allowlist) || isSerializedAllowlistValue(input.file, identifier, allowlist))
         continue;
-      const pattern = normalizedIdentifierPattern(identifier);
-      const match = pattern?.exec(content);
-      if (match) {
+      if (!pattern) continue;
+      // Every matching line, not just the first: the baseline ratchet counts
+      // lines, so a second occurrence in an already-baselined file must raise it.
+      for (const match of content.matchAll(pattern)) {
         addFinding(findings, {
           file: input.file,
           line: lineNumber(content, match.index + (match[1]?.length ?? 0)),
@@ -406,6 +721,8 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     allowStructural: false,
     messageRaw: false,
     allowlistPath: '.public-boundary-allowlist.json',
+    writeBaseline: false,
+    acceptGrowth: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -419,17 +736,25 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     else if (arg === '--allowlist') options.allowlistPath = argv[++i] ?? '';
     else if (arg === '--message') options.messagePath = argv[++i] ?? '';
     else if (arg === '--message-raw') options.messageRaw = true;
+    else if (arg === '--baseline') options.baselinePath = argv[++i] ?? '';
+    else if (arg === '--write-baseline') options.writeBaseline = true;
+    else if (arg === '--accept-growth') options.acceptGrowth = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!options.root) throw new Error('--root requires a path');
   if (options.messagePath === '') throw new Error('--message requires a path');
   if (options.messageRaw && !options.messagePath) throw new Error('--message-raw requires --message');
+  if (options.baselinePath === '') throw new Error('--baseline requires a path');
+  if (options.acceptGrowth && !options.writeBaseline) throw new Error('--accept-growth requires --write-baseline');
+  if (options.writeBaseline && (options.messagePath || options.portable))
+    throw new Error('--write-baseline scans the tracked tree with install identifiers');
   options.root = path.resolve(options.root);
   if (options.messagePath) options.messagePath = path.resolve(options.root, options.messagePath);
   if (options.identifiersPath !== undefined)
     options.identifiersPath = path.resolve(options.root, options.identifiersPath);
   options.allowlistPath = path.resolve(options.root, options.allowlistPath);
   if (options.dbPath) options.dbPath = path.resolve(options.root, options.dbPath);
+  if (options.baselinePath) options.baselinePath = path.resolve(options.root, options.baselinePath);
   return options;
 }
 
@@ -490,7 +815,176 @@ export interface RunReport {
   identifiersOrigin: IdentifierOrigin | 'skipped';
   registryPathsTried: string[];
   identifiersPathsTried: string[];
+  baseline: BaselineOutcome;
+  /** Identifier sources that exist but could not be read; their names are missing from the scan. */
+  discoveryProblems: string[];
 }
+
+/**
+ * Per-file ratchet over pre-existing private-identifier lines: paths and line
+ * counts only, never the values. A file may keep at most its recorded count;
+ * a file absent from the baseline may hold none.
+ */
+export interface Baseline {
+  files: Record<string, number>;
+}
+
+export interface BaselineOutcome {
+  /** Private-identifier lines accepted because their file is within its recorded count. */
+  held: number;
+  heldFiles: number;
+  /** Files whose count rose above their recorded count; their findings stay reported. */
+  exceeded: Array<{ file: string; count: number; recorded: number }>;
+  /** Files now below their recorded count: `--write-baseline` lowers them. */
+  below: string[];
+  /** Raw private-identifier line counts per file, before the baseline. */
+  counts: Record<string, number>;
+  /** The scanned tree carries no committed baseline, so nothing was held. */
+  missing: boolean;
+}
+
+export function parseBaseline(text: string): Baseline {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error('public boundary baseline is invalid JSON', { cause: err });
+  }
+  const files = (parsed as { files?: unknown } | null)?.files;
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).some((key) => key !== 'files') ||
+    !files ||
+    typeof files !== 'object' ||
+    Array.isArray(files) ||
+    !Object.entries(files).every(([file, count]) => file.length > 0 && Number.isInteger(count) && (count as number) > 0)
+  ) {
+    throw new Error('public boundary baseline has an invalid schema');
+  }
+  return { files: files as Record<string, number> };
+}
+
+// A killed git has status null, which every caller reads as a failure.
+const GIT_TIMEOUT_MS = 30_000;
+
+function runGit(args: string[], cwd: string, env: NodeJS.ProcessEnv): { status: number | null; stdout: string } {
+  const result = spawnSync('git', args, {
+    cwd,
+    env,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: GIT_TIMEOUT_MS,
+  });
+  return { status: result.status, stdout: typeof result.stdout === 'string' ? result.stdout : '' };
+}
+
+function readBlob(root: string, objectId: string, env: NodeJS.ProcessEnv): string {
+  const blob = runGit(['cat-file', 'blob', objectId], root, env);
+  if (blob.status !== 0) throw new Error('public boundary baseline object could not be read');
+  return blob.stdout;
+}
+
+// Same environment as trackedInputs: a partial commit's temporary index is
+// what will be committed, so the baseline must come from it too. Pathspecs are
+// literal and case-sensitive, and only the exact path, as a regular file at
+// stage 0, is policy: a directory, a symlink, or another spelling grants nothing.
+function readIndexBaseline(root: string): string | null {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_LITERAL_PATHSPECS: '1' };
+  delete env.GIT_ICASE_PATHSPECS;
+  delete env.GIT_GLOB_PATHSPECS;
+  delete env.GIT_NOGLOB_PATHSPECS;
+  const listed = runGit(['ls-files', '-z', '--stage', '--', DEFAULT_BASELINE_RELATIVE], root, env);
+  if (listed.status !== 0) throw new Error('public boundary baseline could not be read from the index');
+  const entry = listed.stdout
+    .split('\0')
+    .map((line) => /^(\d+) ([0-9a-f]+) (\d)\t(.*)$/s.exec(line))
+    .find((match) => match?.[4] === DEFAULT_BASELINE_RELATIVE);
+  if (!entry) return null;
+  if (entry[1] !== '100644' || entry[3] !== '0')
+    throw new Error('public boundary baseline is not a regular file in the index');
+  return readBlob(root, entry[2], env);
+}
+
+function readWorktreeBaseline(root: string): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(path.join(root, DEFAULT_BASELINE_RELATIVE), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return null;
+    throw new Error('public boundary baseline is unreadable or a symlink', { cause: err });
+  }
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('public boundary baseline is not a regular file');
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Explicit --baseline wins and must exist. Otherwise the scanned tree's own
+ * copy (its index for an index scan, since that is what will be committed).
+ * A tree without one borrows nothing — no other branch, ref or working copy
+ * is authoritative for it — so every private-identifier line it holds fails.
+ */
+function loadBaseline(options: ScanOptions): Baseline | null {
+  if (options.baselinePath) {
+    let text: string;
+    try {
+      text = fs.readFileSync(options.baselinePath, 'utf8');
+    } catch (err) {
+      throw new Error('public boundary baseline is missing or unreadable', { cause: err });
+    }
+    return parseBaseline(text);
+  }
+  const own = options.index ? readIndexBaseline(options.root) : readWorktreeBaseline(options.root);
+  return own === null ? null : parseBaseline(own);
+}
+
+export function applyBaseline(
+  findings: Finding[],
+  baseline: Baseline,
+): { findings: Finding[]; outcome: BaselineOutcome } {
+  // Null prototype: a tracked file named like an Object.prototype key must count from zero.
+  const counts: Record<string, number> = Object.create(null) as Record<string, number>;
+  for (const finding of findings) {
+    if (finding.category === 'private-identifier') counts[finding.file] = (counts[finding.file] ?? 0) + 1;
+  }
+  const outcome: BaselineOutcome = { held: 0, heldFiles: 0, exceeded: [], below: [], counts, missing: false };
+  const heldFiles = new Set<string>();
+  for (const [file, count] of Object.entries(counts)) {
+    const recorded = Object.hasOwn(baseline.files, file) ? baseline.files[file] : 0;
+    if (count > recorded) {
+      outcome.exceeded.push({ file, count, recorded });
+      continue;
+    }
+    heldFiles.add(file);
+    outcome.held += count;
+    if (count < recorded) outcome.below.push(file);
+  }
+  for (const file of Object.keys(baseline.files)) {
+    if (!Object.hasOwn(counts, file)) outcome.below.push(file);
+  }
+  outcome.heldFiles = heldFiles.size;
+  outcome.exceeded.sort((a, b) => a.file.localeCompare(b.file));
+  outcome.below.sort();
+  return {
+    findings: findings.filter((finding) => finding.category !== 'private-identifier' || !heldFiles.has(finding.file)),
+    outcome,
+  };
+}
+
+const EMPTY_BASELINE_OUTCOME: BaselineOutcome = {
+  held: 0,
+  heldFiles: 0,
+  exceeded: [],
+  below: [],
+  counts: {},
+  missing: false,
+};
 
 /**
  * Git only strips `#` lines on the EDITOR path.
@@ -582,6 +1076,7 @@ export function runReport(options: ScanOptions): RunReport {
   let identifiersOrigin: IdentifierOrigin | 'skipped' = 'skipped';
   let registryPathsTried: string[] = [];
   let identifiersPathsTried: string[] = [];
+  let discoveryProblems: string[] = [];
 
   if (!options.portable) {
     const mainCheckoutRoot = findMainCheckoutRoot(options.root);
@@ -590,7 +1085,15 @@ export function runReport(options: ScanOptions): RunReport {
       options.root,
       mainCheckoutRoot,
       DEFAULT_DB_RELATIVE,
-      loadRegistryIdentifiers,
+      (dbPath) => {
+        const values = loadRegistryIdentifiers(dbPath);
+        // Reset per attempt: only the install that supplies the names reports on them.
+        discoveryProblems = [];
+        const installRoot = installRootOf(dbPath);
+        const remotes = publicRemotes(installRoot ? [options.root, installRoot] : [options.root]);
+        for (const value of loadInstallIdentifiers(dbPath, remotes, discoveryProblems)) values.add(value);
+        return values;
+      },
     );
     registryOrigin = registry.origin;
     registryPathsTried = registry.attemptedPaths;
@@ -614,14 +1117,60 @@ export function runReport(options: ScanOptions): RunReport {
       ? 'structural-fallback'
       : 'install-aware';
 
-  const findings = scanInputs(
-    options.messagePath
-      ? [commitMessageInput(options.messagePath, options.messageRaw)]
-      : trackedInputs(options.root, options.index),
-    privateIdentifiers,
-    loadAllowlist(options.allowlistPath),
-  );
-  return { findings, mode, registryOrigin, identifiersOrigin, registryPathsTried, identifiersPathsTried };
+  const allowlist = loadAllowlist(options.allowlistPath);
+  const base = {
+    mode,
+    registryOrigin,
+    identifiersOrigin,
+    registryPathsTried,
+    identifiersPathsTried,
+    discoveryProblems: [...new Set(discoveryProblems)].sort(),
+  };
+  // A commit message is not a tracked path, so no baseline entry can hold it.
+  if (options.messagePath) {
+    const findings = scanInputs(
+      [commitMessageInput(options.messagePath, options.messageRaw)],
+      privateIdentifiers,
+      allowlist,
+    );
+    return { ...base, findings, baseline: EMPTY_BASELINE_OUTCOME };
+  }
+  const scanned = scanInputs(trackedInputs(options.root, options.index), privateIdentifiers, allowlist);
+  const baseline = loadBaseline(options);
+  const { findings, outcome } = applyBaseline(scanned, baseline ?? { files: {} });
+  outcome.missing = baseline === null;
+  return { ...base, findings, baseline: outcome };
+}
+
+/**
+ * Rewrite the baseline from the current scan. Without --accept-growth it only
+ * ratchets down: each file keeps the lower of its recorded and current count,
+ * and a file above its recorded count is refused rather than absorbed.
+ */
+export function writeBaseline(options: ScanOptions): { written: string; refused: string[] } {
+  const report = runReport(options);
+  if (report.mode !== 'install-aware' || report.registryOrigin === 'none' || report.identifiersOrigin === 'none') {
+    throw new Error('--write-baseline requires both the install registry and the identifier inventory');
+  }
+  // Names missing from the scan would read as removed hits and erase their counts.
+  if (report.discoveryProblems.length > 0) {
+    throw new Error(
+      `--write-baseline requires every install identifier source: ${report.discoveryProblems.join('; ')}`,
+    );
+  }
+  const target = options.baselinePath ?? path.join(options.root, DEFAULT_BASELINE_RELATIVE);
+  const recorded = loadBaseline(options)?.files ?? {};
+  const next: Record<string, number> = Object.create(null) as Record<string, number>;
+  const refused: string[] = [];
+  for (const [file, count] of Object.entries(report.baseline.counts)) {
+    const previous = Object.hasOwn(recorded, file) ? recorded[file] : 0;
+    const kept = options.acceptGrowth ? count : Math.min(count, previous);
+    if (count > previous && !options.acceptGrowth) refused.push(file);
+    if (kept > 0) next[file] = kept;
+  }
+  const sorted = Object.fromEntries(Object.entries(next).sort(([a], [b]) => a.localeCompare(b)));
+  fs.writeFileSync(target, `${JSON.stringify({ files: sorted }, null, 2)}\n`);
+  return { written: target, refused: refused.sort() };
 }
 
 export function run(options: ScanOptions): Finding[] {
@@ -651,6 +1200,16 @@ function describeMissingIdentifierSources(report: RunReport): string {
 export function main(argv = process.argv.slice(2)): number {
   try {
     const options = resolveOptions(argv);
+    if (options.writeBaseline) {
+      const { written, refused } = writeBaseline(options);
+      process.stdout.write(`public boundary baseline written: ${path.relative(options.root, written) || written}\n`);
+      if (refused.length === 0) return 0;
+      for (const file of refused) process.stderr.write(`${file} private-identifier count rose\n`);
+      process.stderr.write(
+        `public boundary baseline refused growth in ${refused.length} file(s); remove the new occurrences, or pass --accept-growth for a reviewed exception\n`,
+      );
+      return 1;
+    }
     const report = runReport(options);
     const { findings } = report;
     const missingIdentifierSources =
@@ -662,21 +1221,52 @@ export function main(argv = process.argv.slice(2)): number {
           ? `no identifier registry found; ${missing} — running structural-pattern checks only; real names and tenant identifiers will NOT be caught`
           : `install-aware checks are incomplete; ${missing}`;
       process.stderr.write(`WARNING: ${coverage}\n`);
-      if (options.index && !options.allowStructural) {
+      if ((options.index || options.messagePath) && !options.allowStructural) {
         process.stderr.write(
-          'public boundary check failed: indexed scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
+          'public boundary check failed: gating scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
+        );
+        return 1;
+      }
+    }
+    if (report.discoveryProblems.length > 0) {
+      process.stderr.write(
+        `WARNING: install-aware checks are incomplete; ${report.discoveryProblems.join('; ')} — names from those sources will NOT be caught\n`,
+      );
+      // A message scan gates publication too: a tag annotation on an already
+      // published commit is the only thing its push scans.
+      if ((options.index || options.messagePath) && !options.allowStructural) {
+        process.stderr.write(
+          'public boundary check failed: gating scans require every install identifier source to be readable\n',
         );
         return 1;
       }
     }
     const scanned = options.messagePath ? 'commit message' : options.index ? 'index' : 'worktree';
-    const surface = `${scanned}, ${describeMode(report)}`;
+    const { held, heldFiles, exceeded, below } = report.baseline;
+    const heldNote =
+      held > 0 ? `; ${held} pre-existing line(s) in ${heldFiles} file(s) held by ${DEFAULT_BASELINE_RELATIVE}` : '';
+    const surface = `${scanned}, ${describeMode(report)}${heldNote}`;
+    if (below.length > 0) {
+      process.stdout.write(
+        `${below.length} file(s) are below their baseline count; run with --write-baseline to ratchet it down\n`,
+      );
+    }
     if (findings.length === 0) {
       process.stdout.write(`public boundary check passed (${surface})\n`);
       return 0;
     }
     for (const finding of findings) {
       process.stderr.write(`${finding.file}:${finding.line} ${finding.category}\n`);
+    }
+    for (const { file, count, recorded } of exceeded) {
+      if (recorded > 0) {
+        process.stderr.write(`${file}: ${count} private-identifier line(s), above its baseline of ${recorded}\n`);
+      }
+    }
+    if (report.baseline.missing && exceeded.length > 0) {
+      process.stderr.write(
+        `this tree has no committed ${DEFAULT_BASELINE_RELATIVE}, so no pre-existing line is held; a branch cut before it landed must rebase onto origin/main\n`,
+      );
     }
     process.stderr.write(`public boundary check failed with ${findings.length} redacted finding(s) (${surface})\n`);
     return 1;
