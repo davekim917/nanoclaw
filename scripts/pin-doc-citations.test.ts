@@ -273,6 +273,22 @@ describe('pinDocs', () => {
     ]);
   });
 
+  it('keeps a committed note on its own history when an identical uncommitted note lands above it', () => {
+    const root = gitRoot();
+    const note = '- `drainQueue` at `src/code.ts:1` drops items\n';
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, `# Historical\n${note}`);
+    const historical = commit(root, 'note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    const head = commit(root, 'change the code');
+    write(root, NOTE, `# New\n${note}# Historical\n${note}`);
+
+    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind === 'pinned' && outcome.sha)).toEqual([
+      head,
+      historical,
+    ]);
+  });
+
   it('follows the line through a merge that kept the citation', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

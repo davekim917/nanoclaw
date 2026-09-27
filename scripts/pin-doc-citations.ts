@@ -96,6 +96,37 @@ function introducingCommit(root: string, rev: string, doc: string, lineNumber: n
   return oldest;
 }
 
+const unpinned = (line: string): string => line.replace(/\s+at\s+[0-9a-f]{7,40}\b/g, '');
+
+function committedLineNumbers(root: string, rev: string, doc: string, working: readonly string[]): (number | null)[] {
+  const map: (number | null)[] = working.map(() => null);
+  const committed = gitRead(root, ['show', `${rev}:${doc}`]);
+  const diff = gitRead(root, ['diff', '--no-color', '--no-ext-diff', '-U0', rev, '--', doc]);
+  if (committed === null || diff === null) return map;
+  const old = committed.split('\n');
+  let oldAt = 1;
+  let newAt = 1;
+  const copyUntil = (newEnd: number): void => {
+    for (; newAt < newEnd; newAt++, oldAt++) map[newAt - 1] = oldAt;
+  };
+  for (const [, oldStart, oldCount = '1', newStart, newCount = '1'] of diff.matchAll(
+    /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm,
+  )) {
+    const removedFirst = Number(oldCount) === 0 ? Number(oldStart) + 1 : Number(oldStart);
+    const addedFirst = Number(newCount) === 0 ? Number(newStart) + 1 : Number(newStart);
+    copyUntil(addedFirst);
+    const removed = old.slice(removedFirst - 1, removedFirst - 1 + Number(oldCount)).map(unpinned);
+    for (let n = addedFirst; n < addedFirst + Number(newCount); n++) {
+      const matches = removed.flatMap((line, k) => (line === unpinned(working[n - 1]) ? [removedFirst + k] : []));
+      if (matches.length === 1) map[n - 1] = matches[0];
+    }
+    newAt = addedFirst + Number(newCount);
+    oldAt = removedFirst + Number(oldCount);
+  }
+  copyUntil(working.length + 1);
+  return map;
+}
+
 function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] {
   const touching = (gitRead(root, ['log', '--format=%H', `-n${MAX_EARLIER_VERSIONS}`, origin, '--', ...files]) ?? '')
     .split('\n')
@@ -172,8 +203,7 @@ export function pinDocs(
   const outcomes: PinOutcome[] = [];
   for (const doc of docs) {
     const lines = fs.readFileSync(path.join(root, doc), 'utf8').split('\n');
-    const unpinned = (line: string): string => line.replace(/\s+at\s+[0-9a-f]{7,40}\b/g, '');
-    const committedLines = (gitRead(root, ['show', `${rev}:${doc}`]) ?? '').split('\n').map(unpinned);
+    const committedAt = committedLineNumbers(root, rev, doc, lines);
     let changed = false;
     lines.forEach((text, i) => {
       const inserts: { at: number; sha: string }[] = [];
@@ -184,13 +214,8 @@ export function pinDocs(
         if (citedFiles.length > 0 && !files.some((file) => citedFiles.includes(file))) continue;
         const citation = text.slice(head.index, run.end).replace(/`/g, '');
         const headText = `${head.file}:${head.span}`;
-        const occurrence = lines.slice(0, i).filter((line) => unpinned(line) === unpinned(text)).length;
-        const committedAt = committedLines.findIndex(
-          (line, n) =>
-            line === unpinned(text) &&
-            committedLines.slice(0, n).filter((earlier) => earlier === line).length === occurrence,
-        );
-        const origin = committedAt === -1 ? null : introducingCommit(root, rev, doc, committedAt + 1, headText);
+        const committedLine = committedAt[i];
+        const origin = committedLine === null ? null : introducingCommit(root, rev, doc, committedLine, headText);
         const start = origin ?? gitRead(root, ['rev-parse', rev])?.trim() ?? rev;
         if (!gitRead(root, ['log', '-1', '--format=%H', start, '--', head.file])?.trim()) continue;
         const candidates = candidateRevisions(root, start, files);
