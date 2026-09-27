@@ -2,22 +2,10 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Enforce one active channel-root session per (agent_group_id, messaging_group_id).
- *
- * Scheduled tasks live in the channel-root session — `thread_id IS NULL` is the
- * load-bearing filter (`src/db/sessions.ts:findSessionByAgentGroupAndMessagingGroup`).
- * `resolveActiveSession` does lookup-then-insert with no concurrency guard, so
- * two simultaneous schedule_task calls from different thread containers can
- * race and create duplicate channel-root sessions, after which `list_tasks`
- * silently sees only one of the two task piles.
- *
- * Step 1: dedupe existing duplicates. Keep the most recently active row,
- * archive the others. The keeper is the row most likely to hold the live
- * task pile.
- *
- * Step 2: add a partial unique index. SQLite treats NULLs as distinct in
- * UNIQUE indexes, so agent-shared sessions (messaging_group_id IS NULL) are
- * not constrained — only true channel-root rows with a non-null MG are.
+ * One active channel-root session per (agent_group_id, messaging_group_id): lookup-then-insert let concurrent
+ * schedule_task calls create duplicates, hiding one task pile. Dedupes first (keeps the most recently active row,
+ * archives the rest), then adds a partial unique index; NULL messaging groups (agent-shared sessions) stay
+ * unconstrained because SQLite treats NULLs as distinct.
  */
 export const migration024: Migration = {
   version: 24,

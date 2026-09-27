@@ -1,20 +1,8 @@
 /**
- * Migration 048 — task_thread_anchors
- *
- * Fleet-hardening Phase 1.4: a recurring task session posts to the same
- * destination on every fire, but each fire is a fresh turn with a fresh
- * `in_reply_to` — so the existing per-turn root-post anchor (delivery.ts's
- * in-memory `chatThreadAnchor`, keyed by session + in_reply_to) resets every
- * fire and every fire mints a brand-new top-level post (and, on Slack, a
- * brand-new thread every wired sibling has to re-notice). This table
- * persists the anchor ACROSS fires instead, keyed by (session, destination),
- * so a series stays in one rolling thread until it rotates (default: UTC
- * day change — see `anchorRotationKey` in `../task-thread-anchors.ts`).
- *
- * Host-owned, central DB: the platform thread id only exists after the
- * adapter's first send, so it's recorded delivery-side from the send
- * result, not by the container. One row per (session, destination) — a task
- * session could in principle post to more than one destination.
+ * Persists a recurring task's root-post anchor ACROSS fires, keyed by (session, destination): each fire is a fresh
+ * turn, so the per-turn anchor would mint a new top-level post every time. The series stays in one thread until it
+ * rotates (`anchorRotationKey`). Recorded delivery-side, since the platform thread id exists only after the first
+ * send.
  */
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';

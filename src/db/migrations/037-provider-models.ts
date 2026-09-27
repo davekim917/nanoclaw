@@ -1,34 +1,7 @@
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
-/**
- * Migration 037 — provider-models
- *
- * Adds the `provider_models` table: per-provider allowlist of model slugs
- * operators are willing to expose. Closes the gap where `container_configs.model`
- * was a free-form text field with zero validation — a user (or agent calling
- * `change_model` via self-mod) could set `opencode/claude-opus-4-7` on a Go-
- * subscription sibling and the call would fail at request time (or worse,
- * silently route to a wrong-subscription endpoint).
- *
- * Schema:
- *   provider TEXT      — matches container_configs.provider
- *   slug     TEXT      — the runtime model identifier (e.g. 'opencode/kimi-k2.6')
- *   display_name TEXT  — human label shown in lists ('Kimi K2.6')
- *   notes    TEXT      — operator notes, shown in lists (e.g. 'Default. Best general coding agent.')
- *   default_effort TEXT — 'low' | 'medium' | 'high' | null
- *   supports_effort INTEGER — 0/1, hint for UI
- *   is_default INTEGER — 0/1; ≤1 row with is_default=1 per provider
- *   created_at TEXT
- *
- * Validation:
- *   - ncl groups config update --model X validates against this table for the
- *     group's current provider
- *   - The agent's change_model self-mod tool validates the same way
- *
- * Seed data: a conservative starter set per provider. Operators extend via
- * `ncl provider-models add --provider X --slug Y ...`.
- */
+/** `provider_models`: a per-provider allowlist of model slugs, replaced by the `denied_models` blocklist in 039. */
 export const migration037: Migration = {
   version: 37,
   name: 'provider-models',
@@ -60,10 +33,7 @@ export const migration037: Migration = {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    // OpenCode (Go subscription + free tier — what Operator actually holds).
-    // Conservative set; operators extend via ncl. Not exhaustive on purpose.
     const opencodeSeed: Array<[string, string, string, 'low' | 'medium' | 'high' | null, 0 | 1, 0 | 1]> = [
-      // [slug, display_name, notes, default_effort, supports_effort, is_default]
       [
         'opencode/kimi-k2.6',
         'Kimi K2.6',
@@ -103,9 +73,6 @@ export const migration037: Migration = {
       insert.run('opencode', slug, name, notes, defaultEffort, supportsEffort, isDefault, now);
     }
 
-    // Codex provider — seed with the codex-* models. is_default chosen to match
-    // current convention (gpt-5.3-codex is the strongest, default for Codex
-    // siblings).
     const codexSeed: Array<[string, string, string, 'low' | 'medium' | 'high' | null, 0 | 1, 0 | 1]> = [
       ['gpt-5.3-codex', 'GPT-5.3 Codex', 'Default. OpenAI — strongest Codex variant.', 'high', 1, 1],
       ['gpt-5.2-codex', 'GPT-5.2 Codex', 'Previous-gen Codex. Cheaper.', 'high', 1, 0],
@@ -116,9 +83,6 @@ export const migration037: Migration = {
       insert.run('codex', slug, name, notes, defaultEffort, supportsEffort, isDefault, now);
     }
 
-    // Claude provider — Anthropic models accessed via Claude Agent SDK
-    // (not via opencode). Effort doesn't apply the same way; thinking
-    // budget is the analog. We don't seed an is_default — operator picks.
     const claudeSeed: Array<[string, string, string, 'low' | 'medium' | 'high' | null, 0 | 1, 0 | 1]> = [
       ['claude-opus-4-7', 'Claude Opus 4.7', 'Anthropic — current strongest.', null, 0, 1],
       ['claude-sonnet-4-6', 'Claude Sonnet 4.6', 'Anthropic — fast + capable.', null, 0, 0],

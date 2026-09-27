@@ -1,13 +1,6 @@
 import type { Migration } from './index.js';
 
-/**
- * Add thread_id to pending_approvals so the host can look the approval
- * card back up on the platform (to edit it when the gate times out or
- * gets auto-cancelled by a follow-up message). channel_type and
- * platform_id were already on the row; thread_id (Slack thread_ts or
- * Discord thread id) is the remaining bit the Chat-SDK bridge needs to
- * resolve the adapter's internal thread key for editMessage calls.
- */
+/** thread_id lets the host find the approval card on the platform again to edit it on timeout or auto-cancel. */
 export const pendingApprovalsThreadId: Migration = {
   version: 18,
   name: 'pending-approvals-thread-id',

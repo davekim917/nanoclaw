@@ -1,17 +1,7 @@
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
-/**
- * Per-channel (messaging_group_agents) default tone profile.
- *
- * Ports v1's "always-on, system-prompt-injected default tone" feature, but at
- * the channel-wiring grain instead of v1's group grain. v1 used one tone per
- * agent_group; v2 needs variation within a group (e.g. example-labs agent runs in
- * both Slack and Discord: Slack→engineering, Discord→assistant).
- *
- * Null falls through to container.json group-level `tone` (if set), then to
- * no tone injection (selection-guide MCP tool remains as runtime fallback).
- */
+/** Per-wiring default tone. Null falls through to container.json `tone`, then to no tone injection. */
 export const migration016: Migration = {
   version: 16,
   name: 'channel-tone',

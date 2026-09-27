@@ -2,35 +2,14 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Migration 038 — provider-models-go-seed-fix
- *
- * Corrects the OpenCode seed shipped in migration 037, which I (the original
- * author of 037) had populated from training-data guesses rather than the
- * authoritative `/zen/go/v1/models` endpoint. Concretely:
- *
- *   - 037 seeded `opencode/kimi-k2.6-thinking` — that slug DOESN'T EXIST in
- *     either Go or Zen catalogs. Fabricated.
- *   - 037 seeded `opencode/gemini-3.5-flash` — exists in Zen credit, NOT in
- *     Go subscription. Wrong tier.
- *   - 037 seeded `opencode/deepseek-v4-flash-free` — `-free` tier slugs are
- *     a Zen-only tier. Go has plain `deepseek-v4-flash` (no `-free` suffix).
- *
- * Authoritative source consulted (curl https://opencode.ai/zen/go/v1/models):
- *   minimax-m2.7, minimax-m2.5, kimi-k2.6, kimi-k2.5, glm-5.1, glm-5,
- *   deepseek-v4-pro, deepseek-v4-flash, qwen3.6-plus, qwen3.5-plus,
- *   mimo-v2-pro, mimo-v2-omni, mimo-v2.5-pro, mimo-v2.5, hy3-preview
- *
- * Convention: OpenCode CLI uses the `opencode/<id>` prefix when selecting
- * a model (env OPENCODE_MODEL_X=opencode/kimi-k2.6 works); the Zen API
- * surface uses unprefixed ids. We store the prefixed form because that's
- * what `container_configs.model` carries and what the OpenCode runtime
- * accepts via env. Operators querying the API directly would drop the prefix.
+ * Corrects 037's OpenCode seed against the authoritative `/zen/go/v1/models` list (one slug did not exist, two were
+ * Zen-only). Slugs keep the `opencode/` prefix because that is what `container_configs.model` and the runtime env
+ * carry.
  */
 export const migration038: Migration = {
   version: 38,
   name: 'provider-models-go-seed-fix',
   up(db: Database.Database) {
-    // ── 1. Remove the bogus 037 rows ─────────────────────────────────────────
     db.prepare(
       `DELETE FROM provider_models WHERE provider = 'opencode' AND slug IN (
          'opencode/kimi-k2.6-thinking',
@@ -39,7 +18,6 @@ export const migration038: Migration = {
        )`,
     ).run();
 
-    // ── 2. Insert the actual Go set, default unchanged (kimi-k2.6) ──────────
     const now = new Date().toISOString();
     const insert = db.prepare(`
       INSERT OR IGNORE INTO provider_models
@@ -47,12 +25,8 @@ export const migration038: Migration = {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    // Go-included models. is_default left at 0 — the existing kimi-k2.6 row
-    // from 037 keeps is_default=1 (already correct). Order here is roughly
-    // "what coding-agent operator would pick first": flagship → second-tier.
+    // kimi-k2.6 keeps is_default=1 from 037 and is not re-inserted.
     const goSeed: Array<[string, string, string, 'low' | 'medium' | 'high' | null, 0 | 1]> = [
-      // [slug, display_name, notes, default_effort, supports_effort]
-      // (kimi-k2.6 stays the default from 037 — not re-inserted)
       ['opencode/kimi-k2.5', 'Kimi K2.5', 'Moonshot — previous-gen K2 series. Available on Go.', 'high', 1],
       ['opencode/glm-5', 'GLM 5', 'Zhipu — older GLM. Available on Go.', 'high', 1],
       [

@@ -2,28 +2,15 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Migration 036 — workgroup-id
- *
- * Introduces the `workgroups` table and backfills `agent_groups.workgroup_id`.
- *
- * A workgroup groups a primary agent-group with its optional Codex twin:
- *   - `<x>` + `<x>-codex` → workgroup id = `<x>` (paired)
- *   - `<x>-codex` with no matching parent → workgroup id = `<x>-codex` (orphan, suffix_strip_unmatched)
- *   - Anything else → workgroup id = own folder (standalone)
- *
- * workgroups.mnemon_store_id is set to the parent agent_groups.id so that
- * recall history is preserved across workgroup members.
- *
- * A temp table `_migration036_report` is written for the FS reconciler
- * (consumed by a sibling builder group).
+ * Adds `workgroups` and backfills `agent_groups.workgroup_id`: `<x>` and `<x>-codex` pair under `<x>`; an unmatched
+ * `<x>-codex` and everything else get their own folder. `mnemon_store_id` is the parent's agent_groups.id so recall
+ * history is shared. `_migration036_report` is for the FS reconciler.
  */
 export const migration036: Migration = {
   version: 36,
   name: 'workgroup-id',
   up(db: Database.Database) {
-    // ── 1. Schema DDL ──────────────────────────────────────────────────────
-
-    // IF NOT EXISTS guards make this safe to re-run (idempotency).
+    // IF NOT EXISTS keeps a re-run safe.
     db.exec(`
       CREATE TABLE IF NOT EXISTS workgroups (
         id              TEXT PRIMARY KEY CHECK (id GLOB '[a-z]*' AND id NOT LIKE 'ag-%'),
@@ -35,8 +22,7 @@ export const migration036: Migration = {
       );
     `);
 
-    // ALTER TABLE is not idempotent in SQLite.  Guard with a column-existence
-    // check so a re-run after a partial failure doesn't error on "duplicate column".
+    // ALTER TABLE is not idempotent in SQLite; the column check lets a re-run after a partial failure proceed.
     const agCols = (db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>).map((c) => c.name);
     if (!agCols.includes('workgroup_id')) {
       db.exec(`ALTER TABLE agent_groups ADD COLUMN workgroup_id TEXT REFERENCES workgroups(id);`);
@@ -46,15 +32,12 @@ export const migration036: Migration = {
       CREATE INDEX IF NOT EXISTS idx_agent_groups_workgroup_id ON agent_groups(workgroup_id);
     `);
 
-    // ── 2. Backfill ────────────────────────────────────────────────────────
-
     const rows = db.prepare(`SELECT id, folder FROM agent_groups`).all() as Array<{
       id: string;
       folder: string;
     }>;
 
     if (rows.length === 0) {
-      // Nothing to backfill; write empty report and return.
       db.prepare(`CREATE TABLE IF NOT EXISTS _migration036_report (report TEXT)`).run();
       db.prepare(`DELETE FROM _migration036_report`).run();
       db.prepare(`INSERT INTO _migration036_report (report) VALUES (?)`).run(
@@ -69,7 +52,7 @@ export const migration036: Migration = {
     const standalone: string[] = [];
     const suffix_strip_unmatched: string[] = [];
 
-    const workgroupForRow = new Map<string, string>(); // agent_groups.id → workgroup id
+    const workgroupForRow = new Map<string, string>();
 
     for (const row of rows) {
       let wg: string;
@@ -89,7 +72,6 @@ export const migration036: Migration = {
       workgroupForRow.set(row.id, wg);
     }
 
-    // Collect all distinct workgroup ids
     const distinctWorkgroups = new Set(workgroupForRow.values());
 
     const insertWorkgroup = db.prepare(`
@@ -106,7 +88,6 @@ export const migration036: Migration = {
     for (const wg of distinctWorkgroups) {
       insertWorkgroup.run(wg, now);
 
-      // mnemon_store_id → the parent agent_groups.id for this workgroup.
       // The parent is the row whose folder equals the workgroup id.
       const parentRow = db.prepare(`SELECT id FROM agent_groups WHERE folder = ? LIMIT 1`).get(wg) as
         | { id: string }
@@ -117,13 +98,10 @@ export const migration036: Migration = {
       setStoreId.run(parentRow.id, wg);
     }
 
-    // Apply workgroup_id to every agent_groups row
     const updateWorkgroupId = db.prepare(`UPDATE agent_groups SET workgroup_id = ? WHERE id = ?`);
     for (const [agId, wgId] of workgroupForRow) {
       updateWorkgroupId.run(wgId, agId);
     }
-
-    // ── 3. Validation ──────────────────────────────────────────────────────
 
     // W1 + W2: every row must have a non-null workgroup_id that exists in workgroups
     const nullOrOrphanRows = db
@@ -137,13 +115,10 @@ export const migration036: Migration = {
       );
     }
 
-    // FK check
     const fkViolations = db.prepare(`PRAGMA foreign_key_check(agent_groups)`).all();
     if (fkViolations.length > 0) {
       throw new Error(`Migration 036: PRAGMA foreign_key_check found violations: ${JSON.stringify(fkViolations)}`);
     }
-
-    // ── 4. Temp report table for FS reconciler ─────────────────────────────
 
     db.prepare(`CREATE TABLE IF NOT EXISTS _migration036_report (report TEXT)`).run();
     db.prepare(`DELETE FROM _migration036_report`).run();

@@ -2,13 +2,8 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Dashboard tables.
- *
- * dashboard_tokens: stores HMAC-of-token (NOT raw bearer), one-time-use
- * gate for the browser auth flow.
- *
- * steer_idempotency: deduplicates steer write requests per (user, key) with
- * body binding (request_hash) and echo gating (echo_attempted).
+ * dashboard_tokens stores an HMAC of the token, never the raw bearer (one-time use). steer_idempotency dedupes steer
+ * writes per (user, key), bound to the body via request_hash.
  */
 export const migration028: Migration = {
   version: 28,
