@@ -158,11 +158,9 @@ def detect(root):
 
 
 def guess_prefix(dirs, words):
-    for d in dirs:
-        base = d.rstrip("/").split("/")[-1].lower()
-        if base in words:
-            return d
-    return None
+    """(the one dir whose name is in words, else None; every such dir)."""
+    hits = [d for d in dirs if d.rstrip("/").split("/")[-1].lower() in words]
+    return (hits[0] if len(hits) == 1 else None), hits
 
 
 def propose(found):
@@ -171,8 +169,9 @@ def propose(found):
     host = supported[0] if supported else None
     provider, template = PREVIEW_SUPPORT.get(host, ("static", "https://<preview host for PR {pr}>"))
     dirs = found["serviceDirs"]
-    front = guess_prefix(dirs, {"web", "frontend", "client", "app", "ui", "site"})
-    back = guess_prefix(dirs, {"api", "backend", "server", "service"})
+    # Never a pick among several: a change under the unpicked service settles without its preview.
+    front, fronts = guess_prefix(dirs, {"web", "frontend", "client", "app", "ui", "site"})
+    back, backs = guess_prefix(dirs, {"api", "backend", "server", "service"})
     health = next(iter(sorted(found["healthRoutes"], key=lambda r: ("health" not in r, r))), None)
     # Never a guessed path: a prefix that matches nothing lets every migration PR past the gate.
     migs = found["migrationDirs"]
@@ -184,9 +183,10 @@ def propose(found):
         {"key": "SMOKE_PREVIEW_PROVIDER", "value": provider,
          "why": "where each PR's preview comes from",
          "find": "render if previews are Render preview environments, else static with URL templates"},
-        {"key": "SMOKE_GATE_FRONTEND_SERVICE", "value": None if provider == "render" else template,
+        {"key": "SMOKE_GATE_FRONTEND_SERVICE", "value": None,
          "why": "the frontend preview: a base Render service id (render) or a URL template with {pr}/{branch} (static)",
-         "find": "Render dashboard service id, or the host's preview URL pattern"},
+         "find": "the base Render service id from the dashboard" if provider == "render"
+                 else "the host's per-PR preview URL with the real names filled in, e.g. " + template},
         {"key": "SMOKE_GATE_BACKEND_SERVICE", "value": None,
          "why": "the backend preview, same form as the frontend one; the gate probes its health path",
          "find": "as above, for the API service"},
@@ -232,6 +232,10 @@ def propose(found):
                         "predictable URL, or open an adapter request".format(h))
     if "Expo" in found["frameworks"] or "React Native" in found["frameworks"]:
         gaps.append("native app: campaigns drive web previews only; native changes need a manual test packet")
+    for role, hits in (("frontend", fronts), ("backend", backs)):
+        if len(hits) > 1:
+            gaps.append("several {} directories ({}): the gate takes one prefix; set it by hand".format(
+                role, ", ".join(hits)))
     if len(migs) > 1:
         gaps.append("several migration directories ({}): the gate takes one prefix; set the one whose PRs "
                     "must be refused".format(", ".join(migs)))
