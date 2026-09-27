@@ -409,10 +409,7 @@ function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
   return tripped;
 }
 
-/**
- * Breaker/log-volume policy only, deliberately coarser than llm.ts's `classifyCredentialFailure`: every 429 counts
- * toward the breaker, whatever its cause.
- */
+/** Breaker policy only: every 429 counts toward the breaker, whatever its cause. */
 function isTransientBackendFailure(err: unknown): boolean {
   const status = (err as { status?: number }).status;
   return status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;

@@ -425,14 +425,12 @@ describe('runSessionTitleSweep', () => {
       vi.unstubAllGlobals();
     });
 
-    it('rotates to a second credential slot on a quota-exhaustion 429 instead of tripping the breaker', async () => {
+    it('moves to the second key on a 429 instead of tripping the breaker', async () => {
       seedSession('sess-rotate', 'ag-1');
       writeInboundMessages('ag-1', 'sess-rotate', [
         { kind: 'chat', content: JSON.stringify({ text: 'fix the rollout for EXAMPLE-71' }) },
       ]);
 
-      // Slot 1: quota-exhaustion 429 (no retry-after — the shape that needs
-      // rotation, not backoff). Slot 2: succeeds.
       fetchMock
         .mockResolvedValueOnce(jsonResponse({ error: { type: 'rate_limit_error' } }, { status: 429 }))
         .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'EXAMPLE-71 rollout fix' }] }));
@@ -447,9 +445,7 @@ describe('runSessionTitleSweep', () => {
       expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
       expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
 
-      // Rotation absorbed the 429 at the request layer — the breaker/cooldown
-      // (a DIFFERENT, coarser mechanism for when every slot is exhausted)
-      // never engaged.
+      // The next key absorbed the 429, so the breaker and cooldown never engaged.
       const breakerWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('circuit breaker'));
       const cooldownWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('cooldown engaged'));
       expect(breakerWarns.length).toBe(0);

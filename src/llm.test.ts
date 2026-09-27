@@ -112,6 +112,14 @@ describe('callHaiku', () => {
       expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
     });
 
+    it('rethrows a 429 over a later key’s different failure', async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({}, { status: 429 }))
+        .mockResolvedValueOnce(jsonResponse({}, { status: 401 }));
+
+      await expect(callHaiku('hello')).rejects.toMatchObject({ status: 429 });
+    });
+
     it('throws the last error after one request per key', async () => {
       fetchMock.mockImplementation(() => jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }));
 

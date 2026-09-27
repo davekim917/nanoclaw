@@ -106,14 +106,6 @@ async function parseAnthropicErrorBody(
   }
 }
 
-function parseRetryAfterMs(value: string | null, nowMs = Date.now()): number | null {
-  if (!value) return null;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? Math.max(0, timestamp - nowMs) : null;
-}
-
 const PROVIDER_MESSAGE_LOG_MAX_CHARS = 300;
 
 function truncateProviderMessage(message: string | null): string | null {
@@ -139,18 +131,12 @@ export interface CallHaikuHttpErrorDetails {
 
 export class CallHaikuHttpError extends Error {
   readonly status: number;
-  readonly retryAfterMs: number | null;
   readonly providerMessage: string | null;
   readonly providerErrorType: string | null;
   readonly retryAfterHeader: string | null;
   readonly rateLimitUnifiedHeaders: Record<string, string> | null;
 
-  constructor(
-    status: number,
-    retryAfterMs: number | null,
-    providerMessage: string | null = null,
-    details: CallHaikuHttpErrorDetails = {},
-  ) {
+  constructor(status: number, providerMessage: string | null = null, details: CallHaikuHttpErrorDetails = {}) {
     const providerErrorType = details.providerErrorType ?? null;
     const shownMessage = truncateProviderMessage(providerMessage);
     super(
@@ -160,7 +146,6 @@ export class CallHaikuHttpError extends Error {
     );
     this.name = 'CallHaikuHttpError';
     this.status = status;
-    this.retryAfterMs = retryAfterMs;
     this.providerMessage = providerMessage;
     this.providerErrorType = providerErrorType;
     this.retryAfterHeader = details.retryAfterHeader ?? null;
@@ -171,7 +156,7 @@ export class CallHaikuHttpError extends Error {
 async function anthropicCredentialHttpError(response: Response): Promise<CallHaikuHttpError> {
   const { providerErrorType, providerMessage } = await parseAnthropicErrorBody(response);
   const retryAfterHeader = response.headers.get('retry-after');
-  return new CallHaikuHttpError(response.status, parseRetryAfterMs(retryAfterHeader), providerMessage, {
+  return new CallHaikuHttpError(response.status, providerMessage, {
     providerErrorType,
     retryAfterHeader,
     rateLimitUnifiedHeaders: rateLimitUnifiedHeaders(response.headers),
@@ -239,13 +224,22 @@ export async function callHaiku(prompt: string, options: CallHaikuOptions = {}):
     );
   }
   let lastErr: unknown;
+  let rateLimitErr: unknown;
   for (const credential of credentials) {
     try {
       return await callHaikuOnce(prompt, resolved, credential);
     } catch (err) {
       lastErr = err;
-      log.warn('callHaiku: key failed, trying the next one', { slot: credential.slot, err: (err as Error).message });
+      if (err instanceof CallHaikuHttpError && err.status === 429) rateLimitErr = err;
+      log.info('callHaiku: key failed, trying the next one', {
+        slot: credential.slot,
+        err: (err as Error).message,
+        ...(err instanceof CallHaikuHttpError
+          ? { retryAfterHeader: err.retryAfterHeader, rateLimitUnifiedHeaders: err.rateLimitUnifiedHeaders }
+          : {}),
+      });
     }
   }
-  throw lastErr;
+  // A 429 from any key outranks a later different failure: callers' rate-limit handling keys on it.
+  throw rateLimitErr ?? lastErr;
 }

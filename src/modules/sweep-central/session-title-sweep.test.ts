@@ -8,7 +8,7 @@
  * the moved wrapper's dependency).
  *
  * Kept in its own file, not central.test.ts: this fixture needs the REAL
- * src/llm.js (for its credential-rotation reset helpers), which conflicts
+ * src/llm.js, which conflicts
  * with thread-title-retry.test.ts's full `vi.mock('../../llm.js', ...)` —
  * `vi.mock` is hoisted per FILE, not per `describe` block.
  *
