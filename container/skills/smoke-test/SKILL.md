@@ -2617,7 +2617,7 @@ hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFI
 `/`: a diff under the frontend prefix requires the frontend preview to match,
 one under the migrations prefix refuses an ordinary PR, and the freeze markers
 are `<prefix>.render-freeze` under the backend and frontend prefixes; all
-three are required for every gate verb, each a relative path of plain segments ending in `/`, checked once before any mode by `scripts/smoke-gate-layout.sh`: anything else is `gate_misconfigured`),
+three are required for every gate verb, each a relative path of plain segments ending in `/` and distinct from the other two (nesting is fine), checked once before any mode by `scripts/smoke-gate-layout.sh`: anything else is `gate_misconfigured`),
 `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
 seam and semantics as the develop gate — one readiness command run once per
@@ -2631,10 +2631,12 @@ backendReady-true/healthzReady-false shape, and is checked first).
 
 `scripts/smoke-config-check.sh [<file>...]` (default: the install's
 `/workspace/agent/smoke-gate-env.sh` and `/workspace/agent/smoke-develop-gate.sh`)
-reads those files as data and names every required key a file lacks and every
-required key the files disagree on — names only, never a value. Run it before a
-gate change goes live; `gate_misconfigured` after a pull means a key it would
-have named.
+sources each file as its wrapper does, in a clean `env -i` shell (a wrapper's
+closing `exec` into its gate reports instead of starting the gate), judges the
+result with the gates' own validator, and names every required key a file leaves
+the gate without, every malformed prefix, and every required key the files
+disagree on — names only, never a value. Run it before a gate change goes live;
+`gate_misconfigured` after a pull means a key it would have named.
 
 **Preview identity is never a positional pick.** Render has provisioned two
 services sharing one display name under the same parent more than once (a

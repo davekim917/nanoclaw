@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # smoke-config-check.sh: required-key and cross-file agreement report over an
-# install's gate config files, read as data. Fictional install throughout.
+# install's gate config files, sourced as their wrappers source them and judged
+# by the gates' own validator. Fictional install throughout.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECK="$SCRIPT_DIR/smoke-config-check.sh"
@@ -16,10 +17,16 @@ GATE_LISTS="$(sed -n -E 's/^[[:space:]]*for k in (.*); do$/\1/p' "$GATE" | sort 
 CHECK_LIST="$(sed -n -E 's/^GATE_REQUIRED="(.*)"$/\1/p' "$CHECK")"
 [ "$GATE_LISTS" = "$CHECK_LIST" ] && ok "required set pinned to smoke-pr-gate.sh" \
   || fail "required set drift: gate [$GATE_LISTS] check [$CHECK_LIST]"
-# The layout prefixes come from the one validator both scripts source.
+# The layout prefixes are judged by the one validator the gate sources, never
+# by a grammar or pattern of this script's own.
 grep -q 'smoke-gate-layout.sh' "$GATE" && grep -q 'smoke-gate-layout.sh' "$CHECK" \
-  && grep -q '^REQUIRED="\$GATE_REQUIRED \$LAYOUT_PREFIX_KEYS"$' "$CHECK" \
-  && ok "layout prefixes come from smoke-gate-layout.sh in both" || fail "layout prefixes not shared through smoke-gate-layout.sh"
+  && grep -q 'layout_prefix_problems' "$CHECK" && ! grep -Eq 'layout_prefix_ok|LAYOUT_PREFIX_RE|sed -n -E "s/\^' "$CHECK" \
+  && ok "layout prefixes judged by smoke-gate-layout.sh alone" || fail "config-check re-implements the layout check"
+
+# The gate's verdict on a config file, sourced the way its wrapper does.
+gate_on() { # <file>
+  env -i PATH="$PATH" bash -c '. "$1" >/dev/null 2>&1; SMOKE_GATE_STATE_DIR="$3" bash "$2" check 1' _ "$1" "$GATE" "$T/state" 2>/dev/null
+}
 
 write_env() { # <file> <extra lines...>
   local f="$1"; shift
@@ -52,12 +59,31 @@ OUT="$(bash "$CHECK" "$T/env.sh" "$T/short.sh")"; RC=$?
 [ "$RC" -eq 2 ] && jq -e '.ok == false and .files[0].missing == [] and .files[1].missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"] and .mismatched == []' <<<"$OUT" >/dev/null \
   && ok "missing key named per file" || fail "missing: rc=$RC out=$OUT"
 
-# --- 4. Set-but-empty and non-literal values count as missing ---------------
+# --- 4. What the gate sees after sourcing is what counts --------------------
+# Set-but-empty is missing. Assign-then-unset and a non-literal reassignment
+# fail here exactly as the gate refuses them.
 write_env "$T/empty.sh" 'export SMOKE_GATE_BACKEND_PREFIX=""'
-sed -i 's|^export SMOKE_GATE_FRONTEND_PREFIX="web/"$|export SMOKE_GATE_FRONTEND_PREFIX="${ROOT}/web/"|' "$T/empty.sh"
 OUT="$(bash "$CHECK" "$T/empty.sh")"; RC=$?
-[ "$RC" -eq 2 ] && jq -e '.files[0].missing == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
-  && ok "empty and \$-expanding values are not configuration" || fail "empty/non-literal: rc=$RC out=$OUT"
+[ "$RC" -eq 2 ] && jq -e '.files[0].missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
+  && ok "an empty value is missing" || fail "empty: rc=$RC out=$OUT"
+write_env "$T/unset.sh" 'unset SMOKE_GATE_BACKEND_PREFIX'
+OUT="$(bash "$CHECK" "$T/unset.sh")"; RC=$?; G="$(gate_on "$T/unset.sh")"; GRC=$?
+[ "$RC" -eq 2 ] && jq -e '.files[0].missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
+  && [ "$GRC" -eq 2 ] && jq -e '.error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$G" >/dev/null \
+  && ok "assign-then-unset fails here and at the gate" || fail "unset: rc=$RC out=$OUT gate rc=$GRC $G"
+write_env "$T/nonlit.sh" 'export SMOKE_GATE_BACKEND_PREFIX="${API_ROOT:-}/api/"'
+OUT="$(bash "$CHECK" "$T/nonlit.sh")"; RC=$?; G="$(gate_on "$T/nonlit.sh")"; GRC=$?
+[ "$RC" -eq 2 ] && jq -e '.files[0].malformed == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
+  && [ "$GRC" -eq 2 ] && jq -e '.error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$G" >/dev/null \
+  && ok "a non-literal reassignment fails here and at the gate" || fail "non-literal: rc=$RC out=$OUT gate rc=$GRC $G"
+write_env "$T/unbound.sh" 'export SMOKE_GATE_BACKEND_PREFIX="${API_ROOT}/api/"'
+OUT="$(bash "$CHECK" "$T/unbound.sh")"; RC=$?; G="$(gate_on "$T/unbound.sh")"; GRC=$?
+[ "$RC" -eq 3 ] && jq -e '.ok == false and .error == "config file failed to source"' <<<"$OUT" >/dev/null && [ "$GRC" -ne 0 ] && [ -z "$G" ] \
+  && ok "a file its wrapper cannot source (set -u, unbound) is refused" || fail "unbound: rc=$RC out=$OUT gate rc=$GRC"
+# A clean shell: the caller's own environment never fills a gap in the file.
+OUT="$(SMOKE_GATE_BACKEND_PREFIX=api/ bash "$CHECK" "$T/unset.sh")"; RC=$?
+[ "$RC" -eq 2 ] && jq -e '.files[0].missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
+  && ok "the caller's environment is not inherited" || fail "env leak: rc=$RC out=$OUT"
 
 # --- 5. Files that disagree on a required key: mismatched, exit 2 -----------
 write_env "$T/other.sh" 'export SMOKE_GATE_BACKEND_PREFIX="server/"'
@@ -75,14 +101,26 @@ write_env "$T/dotted.sh" 'export SMOKE_GATE_FRONTEND_PREFIX="./web/"' 'export SM
 OUT="$(bash "$CHECK" "$T/dotted.sh")"; RC=$?
 [ "$RC" -eq 2 ] && jq -e '.files[0].malformed == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
   && ok "non-relative prefixes named malformed" || fail "non-relative: rc=$RC out=$OUT"
+write_env "$T/equal.sh" 'export SMOKE_GATE_FRONTEND_PREFIX="api/"'
+OUT="$(bash "$CHECK" "$T/equal.sh")"; RC=$?; G="$(gate_on "$T/equal.sh")"; GRC=$?
+[ "$RC" -eq 2 ] && jq -e '.files[0].malformed == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null \
+  && [ "$GRC" -eq 2 ] && jq -e '.missing == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$G" >/dev/null \
+  && ok "equal frontend and backend prefixes refused here and at the gate" || fail "equal: rc=$RC out=$OUT gate rc=$GRC $G"
 
 # --- 6. Unreadable file: exit 3 ---------------------------------------------
 OUT="$(bash "$CHECK" "$T/env.sh" "$T/absent.sh")"; RC=$?
 [ "$RC" -eq 3 ] && jq -e '.ok == false and .path == "'"$T/absent.sh"'"' <<<"$OUT" >/dev/null \
   && ok "absent file refused" || fail "absent: rc=$RC out=$OUT"
 
-# --- 7. The file is data: a command in it never runs ------------------------
-write_env "$T/trap.sh" "touch $T/RAN"
-bash "$CHECK" "$T/trap.sh" >/dev/null; [ ! -e "$T/RAN" ] && ok "file never sourced" || fail "config file was executed"
+# --- 7. A wrapper is judged at its exec; the gate it hands off to never starts --
+printf '#!/usr/bin/env bash\ntouch "%s"\n' "$T/GATE_RAN" >"$T/fake-gate.sh"
+write_env "$T/wrap-exec.sh" "exec bash $T/fake-gate.sh"
+bash "$CHECK" "$T/wrap-exec.sh" >/dev/null; RC=$?
+[ "$RC" -eq 0 ] && [ ! -e "$T/GATE_RAN" ] && ok "exec hand-off reports instead of starting the gate" || fail "exec: rc=$RC gate ran: $([ -e "$T/GATE_RAN" ] && echo yes)"
+write_env "$T/late.sh" "exec bash $T/fake-gate.sh" 'export SMOKE_GATE_REPO=""'
+sed -i '/^export SMOKE_GATE_MIGRATIONS_PREFIX=/d' "$T/late.sh"; echo 'export SMOKE_GATE_MIGRATIONS_PREFIX="api/migrations/"' >>"$T/late.sh"
+OUT="$(bash "$CHECK" "$T/late.sh")"; RC=$?
+[ "$RC" -eq 2 ] && jq -e '.files[0].missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$OUT" >/dev/null \
+  && ok "a key set after the exec is not the gate's" || fail "late: rc=$RC out=$OUT"
 
 [ "$FAIL" -eq 0 ] && echo "PASS smoke-config-check.test.sh" || { echo "FAIL smoke-config-check.test.sh" >&2; exit 1; }

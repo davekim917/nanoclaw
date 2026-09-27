@@ -49,8 +49,8 @@ BRANCH="${SMOKE_GATE_BRANCH:-develop}"
 LABEL="${SMOKE_GATE_LABEL:-render-preview}"
 TARGET_SHA="${1:-}"
 BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"; FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
-. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"; if [ -z "$REPO" ] || [ -n "$(layout_prefix_problems FRONTEND_PREFIX BACKEND_PREFIX)" ]; then
-  jq -cn '{ok:false,error:"SMOKE_GATE_REPO, SMOKE_GATE_BACKEND_PREFIX and SMOKE_GATE_FRONTEND_PREFIX are required, each prefix a relative dir ending in /"}'
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"; MISSING="$([ -n "$REPO" ] || printf ' SMOKE_GATE_REPO')$(layout_prefix_problems FRONTEND_PREFIX BACKEND_PREFIX)"; if [ -n "$MISSING" ]; then
+  jq -cn --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" '{ok:false,error:"SMOKE_GATE_REPO, SMOKE_GATE_BACKEND_PREFIX and SMOKE_GATE_FRONTEND_PREFIX are required, each prefix a relative dir ending in / and distinct from the other",missing:$missing}'
   exit 2
 fi
 if ! printf '%s' "$TARGET_SHA" | grep -Eq '^[0-9a-f]{40}$'; then

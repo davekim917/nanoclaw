@@ -28,6 +28,9 @@ class RunIds(unittest.TestCase):
         self.assertEqual(smoke_run_id.claimed_at(RUN).isoformat(), "2026-09-10T00:00:00+00:00")
         self.assertIsNone(smoke_run_id.claimed_at(RUN + "-copy"))
         self.assertIsNone(smoke_run_id.claimed_at("acme-maintenance-20260911T000000Z"))
+        feb30 = "acme-pr7-aaaaaaaaaaaa-20260230T100000Z"
+        self.assertIsNotNone(smoke_run_id.parse(feb30), "well-shaped, so still a campaign run")
+        self.assertIsNone(smoke_run_id.claimed_at(feb30), "but no real instant: readers fall back to finishedAt")
 
     def test_tag_is_the_campaign_segment(self):
         self.assertEqual(smoke_run_id.pr_tag(RUN), "pr42-")
@@ -42,6 +45,18 @@ class RunIds(unittest.TestCase):
                     "acme-maintenance-20260911T000000Z", "run-manual-13", "acme-pr-pr42-0123456789ab-20260910T0000Z"):
             self.assertIsNone(smoke_run_id.parse(bad), bad)
         self.assertEqual(smoke_run_id.pr_tag("run-manual-13"), "run-manual-13")
+        self.assertIsNone(smoke_run_id.parse(RUN + "\n"), "a trailing newline is not the whole id")
+
+    def test_prefix_is_literal_not_a_pattern(self):
+        bad = "acmeXv2-pr7-0123456789ab-20260910T000000Z"
+        self.assertIsNone(smoke_run_id.parse(bad, "acme.v2"))
+        self.assertEqual(smoke_run_id.pr_number("acme.v2-pr7-0123456789ab-20260910T000000Z", "acme.v2"), 7)
+        # Mutation check: the case above is what catches a lost re.escape.
+        src = open(os.path.join(HERE, "smoke_run_id.py"), encoding="utf8").read()
+        self.assertIn("re.escape(prefix)", src)
+        mutant = {}
+        exec(compile(src.replace("re.escape(prefix)", "prefix"), "smoke_run_id-mutant", "exec"), mutant)
+        self.assertIsNotNone(mutant["parse"](bad, "acme.v2"))
 
     def test_replay_reads_only_canonical_campaign_runs(self):
         names = ["acme-pr7-0123456789ab-20260910T000000Z", "acme-maintenance-20260911T000000Z",

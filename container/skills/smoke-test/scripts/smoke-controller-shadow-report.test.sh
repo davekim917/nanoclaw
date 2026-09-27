@@ -267,5 +267,14 @@ jq -e --arg run "$OTHER" '.[$run].issues == ["2026-09-18T10:31:00Z"]' "$C/actual
 python3 "$REP" collect --gate-state-dir "$C/gate" --since 2026-09-18T00:00:00Z --out "$C/bare.json"
 jq -e --arg run "$RUN" '.[$run] | (.gaps | length) == 3 and (has("postTimes") | not)' "$C/bare.json" >/dev/null \
   || fail "collect without sources must name its gaps: $(jq -c --arg run "$RUN" '.[$run]' "$C/bare.json")"
+# A well-shaped id whose stamp is no real date (Feb 30) is still collected: its
+# window starts at finishedAt instead of crashing the whole collect.
+FEB30=demo-pr-pr9-cccccccccccc-20260230T100000Z
+mkdir -p "$C/gate/runs/$FEB30"
+echo '{"runId":"'"$FEB30"'","sha":"cccc","verdict":"GO","finishedAt":"2026-09-18T12:00:00Z"}' >"$C/gate/runs/$FEB30/verdict.json"
+python3 "$REP" collect --gate-state-dir "$C/gate" --since 2026-09-18T00:00:00Z --out "$C/feb30.json" \
+  || fail "collect crashed on a Feb-30 run id"
+jq -e --arg run "$FEB30" '.[$run].finishedAt == "2026-09-18T12:00:00Z"' "$C/feb30.json" >/dev/null \
+  || fail "the Feb-30 campaign must be collected: $(jq -c --arg run "$FEB30" '.[$run]' "$C/feb30.json")"
 
 echo "smoke controller shadow report tests passed"

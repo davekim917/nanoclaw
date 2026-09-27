@@ -426,11 +426,24 @@ for verb in progress release task-claim lease-status challenger-timeout; do
   jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$T1V" >/dev/null ||
     { echo "1: $verb ran with a bad layout prefix: $T1V" >&2; exit 1; }
 done
-# The freeze helper validates the same way, before it touches GitHub.
-T1F="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=../api/ \
-  bash "$(dirname "$GATE")/smoke-freeze-pr.sh" "$(printf 'a%.0s' $(seq 40))" 2>/dev/null)" && T1F_RC=0 || T1F_RC=$?
-[ "$T1F_RC" -eq 2 ] && jq -e '.ok == false and (.error | contains("SMOKE_GATE_BACKEND_PREFIX"))' <<<"$T1F" >/dev/null ||
-  { echo "1: the freeze helper accepted a bad layout prefix: rc=$T1F_RC $T1F" >&2; exit 1; }
+# Equal service prefixes would collapse the two freeze markers into one path.
+T1E="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=src/ SMOKE_GATE_BACKEND_PREFIX=src/ SMOKE_GATE_MIGRATIONS_PREFIX=src/migrations/ \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.error == "gate misconfigured" and .missing == ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]' <<<"$T1E" >/dev/null ||
+  { echo "1: equal frontend and backend prefixes were accepted: $T1E" >&2; exit 1; }
+# The freeze helper validates the same way, before it touches GitHub, and names
+# exactly the key at fault: backend, frontend, or both when they are equal.
+while read -r fe be want; do
+  T1F="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX="$fe" SMOKE_GATE_BACKEND_PREFIX="$be" \
+    bash "$(dirname "$GATE")/smoke-freeze-pr.sh" "$(printf 'a%.0s' $(seq 40))" 2>/dev/null)" && T1F_RC=0 || T1F_RC=$?
+  [ "$T1F_RC" -eq 2 ] && jq -e --argjson want "$want" '.ok == false and .missing == $want' <<<"$T1F" >/dev/null ||
+    { echo "1: the freeze helper accepted $fe $be: rc=$T1F_RC $T1F" >&2; exit 1; }
+done <<'CASES'
+web/ ../api/ ["SMOKE_GATE_BACKEND_PREFIX"]
+../web/ api/ ["SMOKE_GATE_FRONTEND_PREFIX"]
+src/ src/ ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]
+CASES
 
 # --- Common config for every scenario below ---------------------------------
 export SMOKE_GATE_REPO=org/repo

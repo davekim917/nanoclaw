@@ -239,9 +239,10 @@ def build(args):
         x = a2.get(run, {})
         confirmed = sorted({f for fe in files if isinstance(fe.get("content"), dict)
                             for f in fe["content"].get("confirmedFindings") or []})
+        claim = smoke_run_id.claimed_at(run)
         entry = {
             "runId": run, "pr": smoke_run_id.pr_number(run, prefix),
-            "sourceSha": contract.get("sourceSha"), "claimAt": iso(smoke_run_id.claimed_at(run)),
+            "sourceSha": contract.get("sourceSha"), "claimAt": iso(claim) if claim else verdict.get("finishedAt"),
             "isFreezePr": (x.get("headRefName") or "").startswith("smoke/freeze-"),
             "files": sorted({f["path"]: f for f in reversed(files)}.values(), key=lambda f: (f["at"], f["path"])),
             "identityChecks": sorted(identity, key=lambda i: i["at"]),

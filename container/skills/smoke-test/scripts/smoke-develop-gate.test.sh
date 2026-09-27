@@ -1091,7 +1091,15 @@ bash "$GATE" ack develop_freeze_unclaimed "77" acked | jq -e '.ok == true and .s
 # anything else; a bad one is named in the same alarm, and nothing is cut.
 SMOKE_GATE_BACKEND_PREFIX=../api/ bash "$GATE" poll | jq -e '
   .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null)
-' >/dev/null || uc_fail "a bad layout prefix was not named with the freeze handoff on"
+' >/dev/null || uc_fail "a bad backend prefix was not named with the freeze handoff on"
+SMOKE_GATE_FRONTEND_PREFIX=../web/ bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_FRONTEND_PREFIX") != null)
+  and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") == null)
+' >/dev/null || uc_fail "a bad frontend prefix was not named with the freeze handoff on"
+SMOKE_GATE_FRONTEND_PREFIX=api/ SMOKE_GATE_BACKEND_PREFIX=api/ bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_FRONTEND_PREFIX") != null)
+  and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null)
+' >/dev/null || uc_fail "equal frontend and backend prefixes were not named with the freeze handoff on"
 # Leave the ambient ceiling exactly as case 33 left it for the cases below.
 export SMOKE_GATE_FREEZE_STALE_SECONDS=0
 
