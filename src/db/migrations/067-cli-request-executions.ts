@@ -2,39 +2,15 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Migration 067 — cli_request_executions
- *
- * At-most-once execution ledger for the agent `ncl` transport
- * (`src/cli/delivery-action.ts`).
- *
- * The `cli_request` delivery action executes the command and THEN writes the
- * `cli_response` row. If that write throws — descriptor exhaustion, a session
- * reclaimed mid-flight, a transient SQLite error — the handler rejects, the
- * delivery loop counts a failed delivery and re-dispatches the same outbound
- * row on the next poll, running the command a second and third time
- * (`MAX_DELIVERY_ATTEMPTS` is 3). For `ncl tasks create`, whose series id
- * comes from `randomUUID()` per invocation, that is three scheduled series
- * where the agent asked for one.
- *
- * The row is claimed BEFORE dispatch and completed with the response frame
- * after, so a retry replays the stored frame instead of re-running the
- * command. `session_id` is part of the key because request ids are minted
- * in-container as `cli-<ms>-<6 random chars>` and are only unique per session.
- *
- * `status`:
- *   - `executing` — claimed, outcome unknown. A retry that finds this row is
- *     the second attempt after the host died mid-dispatch; it must NOT re-run
- *     the command. A dispatch that throws before the command handler ran
- *     deletes its own claim, so `executing` never means "never started".
- *   - `done` — `response` holds the ResponseFrame JSON to replay.
- *
- * Rows are pruned by the host sweep, but never on a wall clock alone: an aged
- * claim that the delivery loop can still retry would re-open the exact hole
- * this table closes. The terminal test is "does this session have a NEWER
- * completed request", where "newer" is the table's implicit rowid (insertion
- * order), not `claimed_at` — wall-clock time is not guaranteed monotonic
- * across a host restart + NTP step, and the index below still serves that
- * query as a (session_id, *) prefix. See `pruneCliRequestExecutions`.
+ * At-most-once execution ledger for the agent `ncl` transport (`src/cli/delivery-action.ts`). The command runs BEFORE
+ * the `cli_response` write, so a failed write made the delivery loop re-run it (three `ncl tasks create` series for
+ * one ask). The row is claimed before dispatch and completed with the response frame, so a retry replays the frame.
+ * `session_id` is in the key because request ids are only unique per session.
+ * `executing` means claimed, outcome unknown: a retry must NOT re-run it (a dispatch that throws before the handler
+ * ran deletes its claim). `done` holds the frame to replay.
+ * Never pruned on a wall clock alone, since an aged claim the loop can still retry would reopen the hole: a row is
+ * terminal once its session has a NEWER completed request by rowid, not `claimed_at` (wall clock is not monotonic
+ * across a restart plus NTP step). See `pruneCliRequestExecutions`.
  */
 export const migration067: Migration = {
   version: 67,

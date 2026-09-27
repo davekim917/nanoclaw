@@ -1,33 +1,13 @@
 import type { Migration } from './index.js';
 
 /**
- * Durable host-coordination state (schema only — no writers yet). Every
- * coordination fact the host holds in process memory today is lost on
- * restart: delivery retry counts reset (a poison message retries forever
- * across a crash loop), stop/respawn intent vanishes after "rebuild
- * applied", and a stale `finish()` can stomp a fresh container. These
- * tables give each fact a durable home; the in-memory maps stay
- * authoritative until a follow-up flips authority to the rows, so this is
- * shadow surface for now.
- *
- * - `host_instances` — one row per live host process (lease). Lease expiry is
- *   compared as ISO-8601 strings; renewal is the host's heartbeat.
- * - `session_claims` — per-session incarnation fencing + durable stop intent.
- *   `incarnation` increments per container start; a compare-and-set on it is
- *   the spawn-dedup / stale-`finish()` fence. `stop_intent` outlives a host
- *   restart (`respawn_after_stop` replaces the volatile on-wake promise).
- * - `delivery_attempts` — outbound retry counts + backoff schedule, keyed by
- *   mailbox message id. `delivered` stays mailbox-side; only attempt
- *   bookkeeping lives here.
- * - `wake_signals` — durable "session has reason to wake" rows, written where
- *   mail is written and consumed by the wake path. Text ids (uuid) — no
- *   AUTOINCREMENT, the schema stays portable.
- *
- * Fork note: this is upstream's 024 under upstream's `name`, numbered 071 so it
- * sorts after this fork's local migrations (`schema_version` keys on `name`, so
- * the number is cosmetic). The four tables are pure shadow schema here — the
- * fork has ZERO writers and ZERO readers for them, and the durable-host theme
- * that follows this seam is what wires them up.
+ * Durable homes for host-coordination facts now held only in memory (retry counts, stop/respawn intent, incarnation
+ * fencing, wake signals). Shadow schema: the in-memory maps stay authoritative until a follow-up flips authority to
+ * these rows.
+ * `session_claims.incarnation` increments per container start; a compare-and-set on it fences spawn dedup and stale
+ * `finish()`. `delivery_attempts` keys on mailbox message id and holds only attempt bookkeeping. `wake_signals` uses
+ * text ids, not AUTOINCREMENT, to stay portable.
+ * Upstream's 024 under upstream's `name`, numbered to sort after the fork's local migrations.
  */
 export const migration071: Migration = {
   version: 71,
