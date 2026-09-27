@@ -6,9 +6,7 @@
  * cron-parser, insert a fresh pending row (copying series_id forward), then
  * clear the recurrence on the original so it isn't re-cloned next tick.
  *
- * Called from `src/modules/sweep-scheduling/index.ts` (the S18 duty, inside
- * the `MODULE-HOOK:scheduling-recurrence` marker) via a dynamic import of
- * this file.
+ * Called by the sweep-scheduling S18 duty via a dynamic import.
  */
 import { withCentralSync } from '../../db/central-lease.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';

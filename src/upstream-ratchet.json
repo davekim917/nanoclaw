@@ -885,7 +885,7 @@
 "src/modules/permissions/user-dm.ts":{"diff":177,"mode":"100644","sha256":"2af0eb32be9fe85dd8abb4eac7a9720a784a8eafd296a1a9c0fc878ab9dd1367"},
 "src/modules/scheduling/create.ts":{"diff":90,"mode":"100644","sha256":"fb0ee8dd906ac315691184e409926bb75dd17bd1f156c2696a42453cedeb0ac6"},
 "src/modules/scheduling/recurrence.test.ts":{"diff":213,"mode":"100644","sha256":"9b2a4ae8d7a6607cc1ad780e9278fd47d9b5d6543e526d3d3e6cec989e175f87"},
-"src/modules/scheduling/recurrence.ts":{"diff":159,"mode":"100644","sha256":"ff1a74bd6789cf28a407b864421f396834f9e82249f3878628d1a3f0582bcbd8"},
+"src/modules/scheduling/recurrence.ts":{"diff":157,"mode":"100644","sha256":"a8e9b407b85d40bf2c64d40bd08cbef6aaaf16a305b017ca8f823afec907f891"},
 "src/modules/scheduling/run-log.ts":{"diff":9,"mode":"100644","sha256":"98d1e414a4d17e60911227513ff30e4479bdab888cfd8a764cb3df56f85e155a"},
 "src/modules/scheduling/task-content.ts":{"diff":52,"mode":"100644","sha256":"0304faa0aee566ef93697370b3e99003826f3c0f1dc3f0606775a9a1c45c9790"},
 "src/modules/self-mod/agent.md":{"diff":35,"mode":"100644","sha256":"63c5640e37fea22c6c02e60853fe4d830f0ac06d34127479be097ba8c563a87e"},

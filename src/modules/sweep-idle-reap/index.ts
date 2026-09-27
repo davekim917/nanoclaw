@@ -1,12 +1,7 @@
 /**
- * Sweep family: idle reaps. Registers S12 (idle-task-reap) and S13
- * (idle-chat-reap) on the `session:health` exclusive chain at order 20/30 —
- * heal (S11, order 10, sweep-container-health) runs first, then
- * this module's two reaps, then the running-container SLA (S14, order 40,
- * the fallthrough, also sweep-container-health).
- *
- * Known hazard, not fixed here: the scheduled-task idle reaper can kill a
- * task-script container mid-run.
+ * Idle reaps on the `session:health` exclusive chain: heal (10) → task reap
+ * (20) → chat reap (30) → SLA (40). Known hazard: the task idle reaper can
+ * kill a task-script container mid-run.
  */
 import { isTaskThread } from '../../db/sessions.js';
 import { killContainer } from '../../container-runner.js';
@@ -29,32 +24,11 @@ function holdsLiveContinuation(continuation: HostWorkContinuation | null): boole
 }
 
 /**
- * Chat/channel containers have an interactive follow-up window worth
- * preserving (a human may reply within seconds), so unlike task containers
- * they get a quiet-duration floor before reaping. `provider_status` is not
- * usable here — every container clears it to 'idle' at startup and only the
- * Codex provider (container/agent-runner/src/providers/codex.ts) writes it
- * again, so for other providers it reads 'idle' for the container's whole
- * life. This keys on the durable, provider-agnostic signal instead: no due
- * message, no
- * claimed message, no pending work_continuation promise, and the container's
- * last outbound row (chat or status) is older than CHAT_IDLE_REAP_MS. State
- * lives entirely in inbound.db/outbound.db, so the next @mention respawns
- * and resumes exactly like a stuck-ceiling kill does today.
- *
- * `provider_executing` blocks the reap for the same reason it blocks the task
- * reap above: message quiet is not idleness. A parent turn that launched a
- * background agent ends with a `result` and then emits nothing until the
- * agent finishes; the runner holds the turn level up across that stretch
- * (`lowerTurnLevelUnlessQueued` in container/agent-runner/src/poll-loop.ts
- * returns early while `query.hasBackgroundWork()`), and it is the only signal
- * that does — no due row, no claim, no continuation, no outbound. Observed
- * live 2026-09-16/17: a chat session's builder subagent ran past the floor
- * twice and was killed mid-build each time, 15 min after the parent's last
- * status, with the heartbeat fresh and the flag raised. A container that
- * wedges with the flag up is still bounded: a wedged provider stops touching
- * the heartbeat, and the ceiling (`decideStuckAction` in
- * sweep-container-health) keys on that alone.
+ * Chat containers get a quiet-duration floor before reaping (a human may reply
+ * within seconds). Keys on provider-agnostic signals, not `provider_status`
+ * (only Codex writes it past startup). `provider_executing` must block the
+ * reap: a turn waiting on a background agent emits nothing and holds no row,
+ * claim or continuation, so message quiet is not idleness.
  */
 export const CHAT_IDLE_REAP_MS = 15 * 60 * 1000;
 
@@ -72,27 +46,13 @@ export function shouldReapIdleChatContainer(
   if (dueMessageCount !== 0 || processingClaimCount !== 0 || hasActiveContinuation) return false;
   if (providerExecuting) return false;
   if (lastOutboundAtMs === null) return false;
-  // Idleness is the newest activity in EITHER direction, not just outbound.
-  // A container that has consumed a fresh message but not yet emitted its
-  // first status looks identical to an idle one from outbound alone, and the
-  // other guards do not cover it: the row is already `completed` so dueCount
-  // is 0, and processing claims are not written on this path. Observed live
-  // 2026-08-12 — a user message landed 16.0 min after the previous reply and
-  // the reaper killed the container 11s into the turn, so the turn produced
-  // no answer at all. 15 min after the last reply is precisely when a human
-  // returns to a thread, so this was the common case, not an edge.
+  // Idleness is the newest activity in EITHER direction: a container that has
+  // consumed a fresh message but not yet emitted anything looks idle from
+  // outbound alone, and no other guard covers it.
   const lastActivityAtMs = Math.max(lastOutboundAtMs, lastInboundAtMs ?? 0);
   return now - lastActivityAtMs >= CHAT_IDLE_REAP_MS;
 }
 
-/**
- * Registers S12/S13. A named export, not just an import-time side effect, so
- * it can be handed to `registerSweepDutySource` below — the registry replays
- * every recorded source's registrar on a default (builtins-restoring) test
- * reset, which is what lets this module's duties survive
- * `_resetSweepRegistryForTesting()` in src/host-sweep-registry.test.ts instead
- * of only host-sweep.ts's own in-file builtins coming back.
- */
 function registerIdleReapSweepDuties(): void {
   registerSweepDuty({
     name: id.S12,

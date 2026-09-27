@@ -1,22 +1,7 @@
 /**
- * Scheduling + thread-close.
- *
- * Four duties, three of them the scheduled-task lifecycle and one the
- * operator-confirmed thread close:
- *
- *   T8 `thread-close-advance`   tick:post-session 20
- *   S5 `due-wake-admission`     session:plan 40   (host-gated scripts + admission + priority)
- *   S18 `recurrence-fanout`     session:tail 20
- *   S19 `spent-task-session-gc` session:tail 30   (strictly after S18 — constraint 13)
- *
- * The duties preserve the host sweep's ordering and session-window ownership.
- * S19 additionally preserves recall-paired waits and durable continuations;
- * it does not add a wake path. Nothing here kills or wakes, so every body runs
- * inside the window the driver already opened and holds no second session on
- * the same key (constraint 18, invariant I-3):
- * `runHostGatedTaskScripts` and `handleRecurrence` take the sweep's OWN
- * session as their first parameter rather than opening
- * one of their own.
+ * Scheduled-task lifecycle and thread-close duties. Nothing here kills or
+ * wakes: every body runs inside the session the driver already opened and
+ * never opens a second session on the same key.
  */
 import { isContainerRunning } from '../../container-runner.js';
 import { advanceThreadClosures } from '../../dashboard/thread-close.js';
@@ -56,24 +41,10 @@ async function prepareDueWake(
   agentGroupId: string,
   sessionId: string,
 ): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
-  // Fleet-hardening Phase 1.1: run any opted-in (scriptHost) pre-task scripts
-  // on the host BEFORE admission, so a gated/errored fire never becomes due
-  // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
-  //
-  // `runHostGatedTaskScripts` and `admitDueTaskContexts` both take this
-  // session: they are sweep callees with no other production caller, and a
-  // SESSION parameter is the seam's sanctioned object — invariant I-9 forbids
-  // handing out raw handles, not sessions, so neither callee lands on the
-  // ratchet's allowlist. The script runner can spend the full pre-task timeout
-  // per row, so the session is held across that work exactly as it was when
-  // these lines passed a raw handle.
-  //
-  // `agentGroupId` rides along because the callee resolves the GROUP's
-  // timezone for its local-time gate: a session parameter identifies the
-  // mailbox, not the group whose zone override applies.
-  //
-  // A row whose host result could not be recorded is withheld from admission:
-  // it must not run anywhere until an execution of it is on record.
+  // Host-gated pre-task scripts run BEFORE admission, so a gated/errored fire
+  // never becomes due. `agentGroupId` is needed because the local-time gate
+  // uses the GROUP's timezone, which the session does not identify. A row
+  // whose host result could not be recorded is withheld from admission.
   const unrecorded = await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
   const admittedTasks = await admitDueTaskContexts(mailbox, agentGroupId, sessionId, unrecorded);
   const dueCount = mailbox.countDueMessages();
@@ -99,11 +70,8 @@ function registerSchedulingSweepDuties(): void {
     name: id.S5,
     phase: 'session:plan',
     order: 40,
-    // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
-    // recall/capabilities immediately before they become wakeable. Task rows
-    // stay trigger=0 from creation through this point; paired lifecycle wakes
-    // stay trigger=0 throughout backoff. A warm poller cannot race ahead of
-    // either context pair, and a repeated sweep is idempotent.
+    // Task rows and paired lifecycle wakes stay trigger=0 until admitted here,
+    // so a warm poller cannot race ahead of their context. Idempotent.
     run: async (ctx) => {
       const { session, agentGroupId, mailbox, plan } = asSessionContext(ctx);
       const preparedWake = await prepareDueWake(mailbox!, agentGroupId, session.id);
@@ -123,20 +91,12 @@ function registerSchedulingSweepDuties(): void {
     name: id.S18,
     phase: 'session:tail',
     order: 20,
-    // 8. Recurrence fanout for completed recurring tasks.
-    // MODULE-HOOK:scheduling-recurrence:start
-    // Takes this session. Same rule as
-    // `runHostGatedTaskScripts` in prepareDueWake: a sweep callee with no other
-    // production caller receives the sweep's session, never a raw handle and
-    // never its own nested open on the same key.
     run: async (ctx) => {
       const { session, mailbox, alive } = asSessionContext(ctx);
       const { handleRecurrence } = await import('../scheduling/recurrence.js');
       await handleRecurrence(mailbox!, session);
-      // The series-health observer for the opposite failure: an occurrence that
-      // never completes gives the fan-out above nothing to advance. Guarded on
-      // its own — it changes no state, so its throw must not fail the duty that
-      // keeps every schedule moving.
+      // Guarded separately: it changes no state, so its throw must not fail
+      // the fan-out that keeps every schedule moving.
       try {
         const { escalateOverdueOccurrences } = await import('../scheduling/overdue.js');
         await escalateOverdueOccurrences(mailbox!, session, alive);
@@ -144,26 +104,18 @@ function registerSchedulingSweepDuties(): void {
         log.warn('Overdue occurrence check failed', { sessionId: session.id, err });
       }
     },
-    // MODULE-HOOK:scheduling-recurrence:end
   });
 
   registerSweepDuty({
     name: id.S19,
     phase: 'session:tail',
     order: 30,
-    // 9. GC spent task sessions. A task session is spent only after its live
-    // task rows, recall-paired waits, and durable continuation are all gone and
-    // no container is running. A future `wait` is inert (trigger=0) until due,
-    // but it still needs this same active session for admission and respawn.
-    // Runs after recurrence so a just-fired recurring series has already
-    // re-armed its next pending row and is never collected. The per-task log
-    // file in the workspace is the durable history and survives the close.
+    // Must run after recurrence (S18) so a just-fired series has re-armed its
+    // next row. A future `wait` is inert until due but still needs this session.
     run: async (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       if (isTaskThread(session.thread_id)) {
-        // Keyed dispatch receipts must remain addressable by the active-session
-        // lookup in src/session-manager.ts. Container idle reaping is
-        // independent; keeping this metadata does not keep its process alive.
+        // Keyed dispatch receipts must stay addressable by the active-session lookup.
         if (mailbox!.hasTaskDispatchEvents()) return;
         const liveTasks = mailbox!.countLiveTasks();
         const hasPendingWait = mailbox!.hasPendingRecallPairedTrigger();
@@ -179,18 +131,9 @@ function registerSchedulingSweepDuties(): void {
         ) {
           return;
         }
-        // A move in flight looks EXACTLY like a spent session: it cancels the
-        // source series before inserting into the target, so between those two
-        // steps the source holds zero live rows and no container. Closing it
-        // here is unrecoverable — `recoverMoveIntents` only acts on intents
-        // older than one sweep interval, so it always arrives after this duty,
-        // and its restore's `withQuietInvalidationSync` refuses on a session
-        // row that is no longer active. The intent then stays unresolved and
-        // the series stays cancelled, with nothing left that can repair it.
-        //
-        // Asked only once the cheap predicate above has already said "close",
-        // so the ordinary spent session pays one central-DB read and a live
-        // one pays nothing.
+        // A move in flight looks exactly like a spent session (source cancelled
+        // before target insert), and closing it is unrecoverable: move recovery
+        // runs later and refuses an inactive session.
         if (await hasUnresolvedMoveIntent(session.id)) {
           log.info('Kept a spent task session open — an unresolved move intent still names it', {
             sessionId: session.id,
@@ -198,8 +141,8 @@ function registerSchedulingSweepDuties(): void {
           });
           return;
         }
-        // Delivery visits active sessions only: closed now, a pre-task result
-        // it has not recorded yet would never be recorded.
+        // Delivery visits active sessions only, so an unrecorded pre-task
+        // result would never be recorded after close.
         if (mailbox!.hasUnrecordedGateRows()) {
           log.info('Kept a spent task session open — a pre-task result is not recorded yet', {
             sessionId: session.id,
@@ -207,11 +150,8 @@ function registerSchedulingSweepDuties(): void {
           });
           return;
         }
-        // Revalidate on the mailbox AFTER the only await on this path. A task,
-        // paired wait, or continuation can land while the intent check yields;
-        // closing it would strand work in a session no sweep visits again. No
-        // await may sit between these reads and the UPDATE: the SQLite reads
-        // run synchronously, so the decision and close share one turn.
+        // Revalidate AFTER the only await on this path; no await may sit
+        // between these synchronous reads and the UPDATE.
         const workArrived =
           mailbox!.hasTaskDispatchEvents() ||
           mailbox!.countLiveTasks() > 0 ||
@@ -225,21 +165,10 @@ function registerSchedulingSweepDuties(): void {
           return;
         }
         await updateSession(session.id, { status: 'closed' });
-        // The ONLY active->closed transition on the host, and therefore the
-        // one place pending work can leak: `expireStalePending` runs as duty S3 inside a
-        // loop over ACTIVE sessions, so anything still `pending` here is out
-        // of its reach the moment the row above flips, and pins the session
-        // directory against reclaim forever via `sessionHasOpenWork`.
-        //
-        // Ordered AFTER the close, not before: the close is what makes the
-        // expiry correct, so a failed `updateSession` must leave the rows
-        // live. A crash in the gap is repaired by
-        // `drainClosedSessionPendingBacklog` at the next boot. Nothing can
-        // insert into this inbound in the gap — `findSessionForAgent` matches
-        // active rows only. Uses the sweep's OWN session, never a second one
-        // on the same key (constraint 18, invariant I-3). The outbound half of
-        // the release carries its own stopped-container check inside the
-        // helper — see `expireClosedSessionWork`.
+        // The ONLY active->closed transition, so the one place pending work can
+        // leak (S3 expiry only visits active sessions). Ordered AFTER the close
+        // so a failed update leaves rows live; a crash in the gap is repaired at
+        // boot by `drainClosedSessionPendingBacklog`.
         expireClosedSessionWork(mailbox!, session, 'spent-task-session-gc');
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
@@ -250,18 +179,11 @@ function registerSchedulingSweepDuties(): void {
     name: id.T8,
     phase: 'tick:post-session',
     order: 20,
-    // Advance operator-confirmed thread closes: wait for the agent's wrap-up
-    // confirmation, then clear its saved work, stop the container and archive —
-    // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
-    // in-flight rows, once per tick, after the per-session loop so container
-    // state is current. Nothing here can START a close; only an operator can.
+    // Advance operator-confirmed thread closes. Nothing here can START a
+    // close; only an operator can.
     run: async () => {
       try {
-        // Awaited: the close path is asynchronous because
-        // its proposal reads go through the funnel, and an unawaited call
-        // would let the tick finish while the close is still mid-flight —
-        // rejections escaping this catch, and the duty reporting success it
-        // has not had.
+        // Awaited, or the duty reports success while the close is mid-flight.
         await advanceThreadClosures();
       } catch (err) {
         log.warn('thread-close sweep step failed', { err });

@@ -1,11 +1,6 @@
 /**
- * Sweep family: scheduled-move recovery. Registers T11
- * (scheduled-move-recovery) and T12 (audit-body-prune) on `tick:housekeeping` at order 50/60 — order-free housekeeping work, run
- * every tick with no session fan-out.
- *
- * The two duties are independently guarded registrations that KEEP the identical
- * `scheduled-move-recovery: sweep hook failed` warn string on both, so a log
- * search for that string still finds every failure it used to.
+ * Both duties keep the identical `scheduled-move-recovery: sweep hook failed`
+ * warn string so one log search finds every failure.
  */
 import fs from 'fs';
 import path from 'path';
@@ -16,11 +11,6 @@ import { withCentralSync } from '../../db/central-lease.js';
 import { taskThreadId, withQuietInvalidationSync } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
-// Move recovery resolves its source session through the seam, like every other
-// host caller. The raw-opener exemption this module used to carry existed for
-// an INJECTED sessions root, but no production caller ever injects one — the
-// sweep's only call site passes `{}` — so it protected test scaffolding rather
-// than behaviour, and it is gone.
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { readSessionInbound } from '../mailbox/index.js';
 import { type TaskRowSnapshot } from '../scheduling/db.js';
@@ -35,25 +25,16 @@ import {
 
 const id = SWEEP_DUTY_INVENTORY;
 
-// ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
-
 interface MoveRecoveryOptions {
   nowMs?: number;
 }
 
-// TaskRowSnapshot fields, parsed from the intent's detail_json (A-1: a type
-// alias, not an empty-extends interface — clears the lone no-empty-interface lint).
 type MoveIntentSnapshot = TaskRowSnapshot;
 
 /**
- * Resolve every target per-series system session, including closed sessions.
- * `scheduleTask` writes a move into `taskSeriesId(seriesId)`, not the
- * channel-root session — checking the latter after a crash can mistake a
- * successful target insert for zero live rows and restore the source on top of
- * it. A completed target occurrence can have closed before recovery while its
- * exact row remains durable, so active-only `findSystemSession()` is too weak
- * for ownership proof. A database failure is UNKNOWN, not "no target":
- * recovery must defer rather than compensate blindly.
+ * Every target per-series session, including closed ones: a move writes into
+ * `taskSeriesId(seriesId)`, and a completed target may have closed while its
+ * row stays durable. A DB failure is UNKNOWN, not "no target": defer.
  */
 async function resolveTargetSessions(
   targetAgentGroupId: string,
@@ -157,9 +138,8 @@ function targetOwnsIntent(
   for (const target of targets) {
     try {
       const row = readSessionInbound({ ...target, dataDir }, (mailbox) => mailbox.getTaskRowById(targetRowId));
-      // The generated id is the durable ownership token, but bind it to the
-      // intent's series too: an impossible id collision must not suppress a
-      // source repair for another series.
+      // Bind the id to the series too, so an id collision cannot suppress a
+      // repair for another series.
       if (row?.series_id === seriesId) return { owned: true, unreadable: false };
     } catch {
       unreadable = true;
@@ -169,36 +149,18 @@ function targetOwnsIntent(
 }
 
 /**
- * Consume unresolved `move_intent` rows older than one sweep interval (D3).
- *
- * SCOPED predicate (M1): the live-row count is taken over EXACTLY {source
- * session, target session} — never a bare-series_id fleet scan that an unrelated
- * group reusing the same series_id could falsely satisfy. A crash BEFORE the
- * move's cancel leaves the SOURCE live; a crash after a successful target insert
- * leaves the TARGET live. If either holds a live row → stamp + purge (the move
- * resolved itself), never restore (would double the live rows). If the scoped
- * count is a readable ZERO → restore the source from the snapshot, re-checking
- * zero-live immediately before the insert (idempotent compensation, M10).
- *
- * FAIL-SAFE (F6 / M2): if the scoped count is UNREADABLE, the live state is
- * UNKNOWN — skip this intent this pass (leave it unresolved for a clean later
- * pass), NEVER restore on unknown.
- *
- * ADV-S2: an intent that can NEVER be restored (no snapshot body, or the source
- * inbound.db is gone) is RESOLVED (resolved_at stamped) rather than surfacing
- * forever as an unclearable 'stalled' repair row.
- *
- * Autonomous, not just observable. Additive — no firing-path change (C1).
+ * Consume unresolved `move_intent` rows older than one sweep interval. The live
+ * count is scoped to exactly {source, target}, never a bare series_id scan
+ * another group could satisfy. Any live row means the move resolved itself
+ * (stamp, never restore: that would double it); a readable ZERO means restore
+ * from the snapshot, re-checked immediately before insert. An UNREADABLE count
+ * is unknown: skip this pass, never restore. An intent that can never be
+ * restored is stamped resolved rather than left as an unclearable repair row.
  */
 export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
-  // ONE sessions root, always the real one. `dataDir` used to be injectable and
-  // no production caller ever injected it — the sweep's only call site passes
-  // `{}`. Worse, once the restore moved onto the seam a non-default root
-  // silently SPLIT this function: the live count and the inbound.db pre-check
-  // honoured the injected root while `withExistingNanoclawSession` resolved
-  // through DATA_DIR, so reads and writes could address different trees. The
-  // option is gone rather than threaded, which makes that split unrepresentable.
+  // One sessions root, always the real one: an injectable root split reads
+  // and writes across different trees.
   const dataDir = path.dirname(sessionsBaseDir());
   const sessionsRoot = sessionsBaseDir();
 
@@ -217,17 +179,14 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
           WHERE action = 'move_intent' AND resolved_at IS NULL`,
     );
   } catch (err) {
-    // Table absent (feature not installed) — nothing to recover. Anything
-    // else (a driver that is not initialized, a locked file) is a real
-    // failure and surfaces through the duty's own catch.
+    // Only a missing table (feature not installed) means nothing to recover.
     if (isMissingTable(err)) return;
     throw err;
   }
 
   for (const intent of intents) {
     const tsMs = parseSqliteUtc(intent.ts);
-    // Only act on intents older than one sweep interval — the normal in-flight
-    // window is seconds; younger ones are likely still executing.
+    // Younger intents are likely still executing.
     if (Number.isNaN(tsMs) || nowMs - tsMs <= SWEEP_INTERVAL_MS) continue;
     if (!intent.correlation_id) continue;
 
@@ -243,16 +202,13 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
       });
       continue;
     }
-    // Legacy intents can only count a live target row. An active task session
-    // is the only status that can hold one; durable ownership below searches
-    // closed sessions too.
+    // Legacy intents can only count a live target row, which only an active
+    // session can hold.
     const target = targetResolution.sessions.find((session) => session.status === 'active') ?? null;
 
     // A receipt-bearing intent compensates only a source cancellation it can
-    // prove it performed. If no receipt exists, the source may have been
-    // changed by an overlapping winning move; resolving this loser is the
-    // safe direction. Pre-receipt intents retain their historical recovery
-    // policy below so an upgrade cannot strand an already-cancelled source.
+    // prove it performed; without the receipt an overlapping move may have won.
+    // Pre-receipt intents keep the legacy policy so an upgrade can't strand a source.
     const sourceCancellation = detail.sourceCancellationReceiptId
       ? sourceOwnsCancellation(dataDir, source, detail.sourceCancellationReceiptId)
       : null;
@@ -268,10 +224,8 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
       continue;
     }
 
-    // New intents reserve a target row id before source cancellation. A
-    // same-series row is not enough to prove the move landed: it can be a
-    // manual run that collided after preflight. Legacy intents lack this field
-    // and retain the old scoped-count fallback below.
+    // A same-series target row does not prove the move landed (a colliding
+    // manual run could have made it); only the reserved row id does.
     const ownedTarget = detail.targetRowId
       ? targetOwnsIntent(dataDir, targetResolution.sessions, detail.targetRowId, intent.series_id)
       : null;
@@ -295,12 +249,10 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
         await purgeIntentBody(intent.correlation_id);
         continue;
       }
-      // Source is gone and no owned target exists. Continue to compensation
-      // even if a different target row uses this series id; it is not ours to
-      // overwrite, and it must not turn a rejected move into source loss.
+      // No owned target: compensate even if another same-series target row
+      // exists; it is not ours, and must not turn a rejected move into source loss.
     } else {
-      // Legacy intent: its audit payload cannot identify a target row, so the
-      // conservative historical rule is the only safe classification.
+      // Legacy intent: no target row id, so only the conservative rule is safe.
       const live = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
       if (live.unreadable) {
         log.warn('scheduled-move-recovery: scoped live count unreadable — deferring', {
@@ -322,10 +274,8 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
       }
     }
 
-    // Zero live rows in scope → restore the source from the snapshot.
     if (!detail.snapshot) {
-      // ADV-S2: body lost (purged but still unresolved) — unrecoverable. RESOLVE
-      // it (stamp) so it does not surface forever as an unclearable repair row.
+      // Body lost: unrecoverable. Resolve so it doesn't surface forever.
       log.warn('scheduled-move-recovery: unresolved intent with no snapshot — resolving (unrecoverable)', {
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
@@ -336,8 +286,7 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
 
     const inboundPath = path.join(sessionsRoot, intent.agent_group_id, intent.session_id, 'inbound.db');
     if (!fs.existsSync(inboundPath)) {
-      // ADV-S2: the source session is gone — cannot restore. RESOLVE so it does
-      // not zombie as a permanent stalled repair row.
+      // Source session gone: unrecoverable. Resolve.
       log.warn('scheduled-move-recovery: source inbound.db missing — resolving (unrecoverable)', {
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
@@ -348,14 +297,11 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
     const snapshot = detail.snapshot;
     let outcome: 'restored' | 'deferred' | undefined;
     try {
-      // Existing-only: the existsSync above already answered "is there a
-      // session to restore into", and a recovery pass must never re-provision
-      // one it has just been told is gone (invariant I-10).
+      // Existing-only: recovery must never re-provision a session it was told is gone.
       outcome = await withExistingMailboxSession(intent.agent_group_id, intent.session_id, (mailbox) =>
         withCentralSync(() => {
-          // Idempotency re-check: a durable target row id distinguishes this
-          // move from unrelated same-series work. Legacy intents still use the
-          // old scoped count because they have no ownership record to consult.
+          // Idempotency re-check. Legacy intents have no ownership record, so they
+          // use the scoped count.
           const sourceRecheck = countLiveRowsInSessions(dataDir, [source], intent.series_id);
           if (sourceRecheck.unreadable || sourceRecheck.count > 0) return 'deferred' as const;
           if (
@@ -377,31 +323,12 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
             if (legacyRecheck.unreadable || legacyRecheck.count > 0) return 'deferred' as const;
           }
           {
-            // This duty runs in tick:housekeeping — AFTER the session fan-out and
-            // after the quiet-mark flush. The fan-out saw a source with no live
-            // task (that is the crash state this recovery exists for) and may have
-            // just marked it quiet, so the row about to be restored is a DUE task
-            // hiding behind a mark taken seconds ago, and the persisted mark
-            // would survive a restart. The central-DB invalidation clears it.
-            //
-            // Invalidate BEFORE the restore, in the same synchronous turn (Codex
-            // pre-pass Part C, round 3 H1): inbound.db and the central DB are two
-            // separate files with no shared transaction, so a crash between the
-            // two statements is possible even with no `await` between them.
-            // Invalidate-then-restore's worst case is one wasted sweep of a
-            // session that then finds nothing new to restore (the idempotency
-            // re-check above already tolerates a repeated call); the reverse
-            // leaves the restored row durable while the persisted quiet mark
-            // survives the crash, hiding a due task for up to
-            // `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
-            //
-            // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
-            // throws — on a central-DB error AND on a session row that is gone or
-            // no longer active — and the throw escapes the mailbox action into
-            // this loop's catch, which logs and leaves the intent UNRESOLVED for
-            // the next recovery pass. A swallowed failure would instead restore
-            // the row behind a mark nothing clears and then stamp the intent
-            // resolved — the one outcome no later pass can repair.
+            // The fan-out may have just marked this source quiet (it had no live
+            // task), which would hide the restored due row, even across restart.
+            // Invalidate BEFORE the restore: the two DBs share no transaction, and
+            // the reverse order can leave a restored row hidden behind a persisted
+            // mark. FAIL-CLOSED: the invalidation throws on error or an inactive
+            // session, leaving the intent unresolved for the next pass.
             withQuietInvalidationSync(intent.session_id, () =>
               mailbox.restoreTaskRow({
                 // Fresh id — the cancelled source row may still hold the snapshot id.
@@ -409,8 +336,7 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
                 series_id: snapshot.series_id,
                 status: snapshot.status,
                 process_after: snapshot.process_after,
-                // Optional on the parsed audit body: an intent written before the
-                // column existed has none, and restoreTaskRow falls back.
+                // Optional: older intents lack it; restoreTaskRow falls back.
                 scheduled_for: snapshot.scheduled_for,
                 recurrence: snapshot.recurrence,
                 content: snapshot.content,
@@ -432,9 +358,7 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
       continue;
     }
     if (outcome === undefined) {
-      // The mailbox went away between the existsSync above and the open. The
-      // pre-seam open threw here and landed in the catch; same outcome, said
-      // out loud rather than as an exception.
+      // The mailbox vanished between the existsSync and the open.
       log.error('scheduled-move-recovery: restore failed', {
         seriesId: intent.series_id,
         err: 'source inbound mailbox vanished before the restore',
@@ -447,8 +371,8 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
       });
       continue;
     }
-    // Stamp + purge AFTER the restore (so a crash before this makes the next
-    // pass re-evaluate; now a live row exists → it stamps without re-restoring).
+    // Stamp AFTER the restore: a crash before this re-evaluates next pass,
+    // finds a live row, and stamps without re-restoring.
     await purgeIntentBody(intent.correlation_id);
   }
 }
@@ -456,12 +380,8 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
 const AUDIT_BODY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 /**
- * Prune `scheduled_audit` bodies older than 90 days (D4): NULL the
- * `before_preview`/`after_preview`/`detail_json` columns ONLY, keeping the
- * action-metadata row (actor/action/ts/hashes/correlation_id/resolved_at) for
- * the series' lifetime. This bounds the plaintext footprint while preserving
- * cancel-vs-completed distinguishability (the `action='cancel'` join, §4.3)
- * indefinitely. Design §4.4 retention.
+ * NULLs only the preview/detail body columns past 90 days; the action-metadata
+ * row stays for the series' lifetime (cancel-vs-completed depends on it).
  */
 export async function pruneAuditBodies(options: { nowMs?: number }): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
@@ -480,23 +400,11 @@ export async function pruneAuditBodies(options: { nowMs?: number }): Promise<voi
   }
 }
 
-/**
- * Registers T11/T12. A named export, not just an import-time side effect, so
- * it can be handed to `registerSweepDutySource` below — the registry replays
- * every recorded source's registrar on a default (builtins-restoring) test
- * reset, which is what lets this module's duties survive
- * `_resetSweepRegistryForTesting()` in src/host-sweep-registry.test.ts instead
- * of only host-sweep.ts's own in-file builtins coming back.
- */
 export function registerScheduledMoveSweepDuties(): void {
   registerSweepDuty({
     name: id.T11,
     phase: 'tick:housekeeping',
     order: 50,
-    // MODULE-HOOK:scheduled-move-recovery — autonomous recovery of unresolved
-    // move intents. Additive (same pattern as the recurrence hook); touches only
-    // scheduled_audit (central) + the move's own session inbound rows — no
-    // firing-path change (C1).
     run: async () => {
       try {
         await recoverMoveIntents({});
@@ -510,7 +418,6 @@ export function registerScheduledMoveSweepDuties(): void {
     name: id.T12,
     phase: 'tick:housekeeping',
     order: 60,
-    // 90d audit-body prune, the companion of the move recovery above.
     run: async () => {
       try {
         await pruneAuditBodies({});
