@@ -1,4 +1,3 @@
-/** One Slack working thread + per-issue session per support email thread. */
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { handleDispatchSupportIssue, handleUpdateSupportTicket } from './dispatch.js';
