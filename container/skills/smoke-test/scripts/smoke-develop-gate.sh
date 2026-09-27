@@ -235,13 +235,42 @@ FREEZE_HANDOFF="${SMOKE_GATE_FREEZE_HANDOFF:-false}"
 # gate_misconfigured alarm below) whenever FREEZE_HANDOFF is on — there is no
 # fallback freeze mechanism this gate could improvise.
 FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
-# The freeze helper builds its markers under the layout prefixes, so with the
-# handoff on they are validated once here (smoke-gate-layout.sh) and a bad one
-# is named by `config` and in poll's gate_misconfigured alarm before any freeze
-# is cut.
+# The freeze helper builds its markers under the layout prefixes, and the PR
+# gate refuses a freeze unless all three are valid, so with the handoff on they
+# are validated once here (smoke-gate-layout.sh) and a bad one is named by
+# `config` and in poll's gate_misconfigured alarm before any freeze is cut.
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
 LAYOUT_MISSING=""
-[ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems FRONTEND_PREFIX BACKEND_PREFIX)"
+[ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems)"
+# The PR gate detects the freeze this gate cuts by the same prefixes, read from
+# ITS env file (the one the controller renewer reads). If the two files
+# disagree, the freeze head reads as an ordinary PR and nothing alarms, so with
+# the handoff on the file is read as data (smoke-env-literal.sh, never sourced)
+# and every prefix must be a literal that passes the same validator and equals
+# this gate's own value (normalizing would otherwise hide a duplicate element).
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-env-literal.sh"
+CONTROLLER_ENV_FILE="$(controller_env_file)"
+prefix_agreement_problems() {  # → " NAME" for each prefix the PR gate's env file does not state identically
+  local key var theirs theirs_invalid
+  if [ ! -f "$CONTROLLER_ENV_FILE" ] || [ ! -r "$CONTROLLER_ENV_FILE" ]; then printf ' SMOKE_CONTROLLER_ENV_FILE'; return 0; fi
+  theirs_invalid="$(
+    for key in $LAYOUT_PREFIX_KEYS; do
+      theirs="$(env_file_value "$CONTROLLER_ENV_FILE" "SMOKE_GATE_$key")"
+      export "SMOKE_GATE_$key=${theirs#=}"
+    done
+    layout_prefix_problems) "
+  for key in $LAYOUT_PREFIX_KEYS; do
+    var="SMOKE_GATE_$key"
+    case "$LAYOUT_MISSING " in *" $var "*) continue ;; esac
+    theirs="$(env_file_value "$CONTROLLER_ENV_FILE" "$var")"
+    if [ -z "$theirs" ] || env_file_unsets "$CONTROLLER_ENV_FILE" "$var" || env_file_nonliteral "$CONTROLLER_ENV_FILE" "$var" ||
+       case "$theirs_invalid" in *" $var "*) true ;; *) false ;; esac ||
+       [ "$(layout_prefix_normalize "$key" "${theirs#=}")" != "$(layout_prefix_normalize "$key" "${!var:-}")" ]; then
+      printf ' %s' "$var"
+    fi
+  done
+}
+[ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$LAYOUT_MISSING$(prefix_agreement_problems)"
 # How long an open freeze handoff stays worth testing. A freeze pins one
 # develop SHA; past this, with develop moved on, the slot is freed so the next
 # poll re-freezes on current head rather than campaigning a superseded build.

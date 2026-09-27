@@ -239,7 +239,10 @@ command -v jq >/dev/null 2>&1 || final no-jq "jq is unavailable; nothing renewed
 # BUN_OPTIONS (`--preload` runs a module before Bun's main script) -- is simply
 # not this file's configuration and is IGNORED, exactly as it was before
 # the same failure. not_config() below is only for the dangerous SMOKE_ names.
-ENV_FILE="${SMOKE_CONTROLLER_ENV_FILE:-/workspace/agent/smoke-gate-env.sh}"
+# The file is read as data through smoke-env-literal.sh (the literal grammar in
+# its header), never sourced.
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-env-literal.sh"
+ENV_FILE="$(controller_env_file)"
 CONFIG_PREFIX=SMOKE_
 not_config() { # <name> -- 0 when a SMOKE_ name still must not come from the file
   case "$1" in
@@ -249,21 +252,8 @@ not_config() { # <name> -- 0 when a SMOKE_ name still must not come from the fil
   esac
   return 1
 }
-# Every name the file assigns or unsets, first mention first, deduplicated.
-env_names() {
-  [ -f "$ENV_FILE" ] || return 0
-  {
-    sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*$/\2/p' "$ENV_FILE"
-    sed -n -E 's/^[[:space:]]*unset[[:space:]]+([A-Za-z_][A-Za-z0-9_[:space:]]*)$/\1/p' "$ENV_FILE" | tr -s '[:space:]' '\n'
-  } 2>/dev/null | awk 'NF && !seen[$0]++'
-}
-env_value() { # <key> -- "=<value>" for the last accepted literal, else empty.
-  # The "=" prefix is what distinguishes an EMPTY literal (`FOO=`, which is a
-  # value) from "no literal assignment at all" (which is a refusal below).
-  [ -f "$ENV_FILE" ] || return 0
-  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=('([^']*)'|\"([^\"\$\`\\\\]*)\"|([^[:space:]'\"\$\`\\\\;&|<>()]*))[[:space:]]*(#.*)?\$/=\3\4\5/p" \
-    "$ENV_FILE" 2>/dev/null | tail -n 1
-}
+env_names() { env_file_names "$ENV_FILE"; }
+env_value() { env_file_value "$ENV_FILE" "$1"; }  # "=<value>" for the last accepted literal, else empty
 ACTIVE_ENV=""
 if [ -f "$ENV_FILE" ]; then
   ACTIVE_ENV="$(sed '/^[[:space:]]*#/d' "$ENV_FILE" 2>/dev/null)"
@@ -293,7 +283,7 @@ declare -A CFG_UNSET=()   # SMOKE_ name -> set when the file unsets it
 for key in $(env_names); do
   case "$key" in "$CONFIG_PREFIX"*) ;; *) continue ;; esac
   not_config "$key" && continue
-  if grep -Eq "^[[:space:]]*unset[[:space:]]+([A-Za-z_][A-Za-z0-9_]*[[:space:]]+)*$key([[:space:]]|\$)" "$ENV_FILE" 2>/dev/null; then
+  if env_file_unsets "$ENV_FILE" "$key"; then
     CFG_UNSET[$key]=1
     continue
   fi

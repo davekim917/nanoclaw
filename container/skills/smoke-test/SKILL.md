@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5567`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5570`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2616,7 +2616,9 @@ hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFI
 `SMOKE_GATE_MIGRATIONS_PREFIX` (the install's repo dirs, each with a trailing
 `/`: a diff under the frontend prefix requires the frontend preview to match,
 one under the migrations prefix refuses an ordinary PR, and the freeze markers
-are `<prefix>.render-freeze` under the backend and frontend prefixes; all
+are `<prefix>.render-freeze` under the backend and frontend prefixes only;
+`SMOKE_GATE_MIGRATIONS_PREFIX` alone may list several migrations trees,
+comma-separated, and a file under ANY of them is a migration; all
 three are required for every gate verb, each a relative path of plain segments ending in `/` and distinct from the other two (nesting is fine), checked once before any mode by `scripts/smoke-gate-layout.sh`: anything else is `gate_misconfigured`),
 `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
@@ -2658,9 +2660,18 @@ print `{"ok":true}` and exit 0, or exit 1 with the key names
 (`{"ok":false,"error":"gate misconfigured","missing":[…]}`), never a value.
 `config` returns before the gate creates its state dir, takes a lock, reads
 state or calls anything remote. The freeze helper runs under the develop
-wrapper's environment, so the develop gate's `config` covers its keys too. Run
-both before a gate change goes live: `gate_misconfigured` after a pull means a
-key `config` would have named.
+wrapper's environment, so the develop gate's `config` covers its keys too.
+The two env files must state the three prefixes identically, and this is
+enforced: with the freeze handoff on, the develop gate reads the PR gate's env
+file (`SMOKE_CONTROLLER_ENV_FILE`, default `/workspace/agent/smoke-gate-env.sh`)
+as data with the controller renewer's literal reader
+(`scripts/smoke-env-literal.sh`, never sourced) and refuses unless every prefix
+there is a literal that passes the layout validator and equals its own (a
+migrations list in any order). A
+disagreement, or an unreadable file, is `gate_misconfigured` naming the keys:
+on every tick and in `config`, paging once per 6h while it lasts, and no
+freeze is cut until the files agree. Run both before a gate change goes live:
+`gate_misconfigured` after a pull means a key `config` would have named.
 
 **Preview providers.** `SMOKE_PREVIEW_PROVIDER` picks where a PR's previews
 come from. `render` (default) is everything above: base service ids, Render's
