@@ -64,8 +64,8 @@ import { isChannelVariant } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 /**
- * The agent group a new messaging group in this workspace inherits for workspace-trust auto-wire, or null
- * (approval gate). Scope: Slack channel_type (includes the workspace) or Discord guild id.
+ * The agent group a new messaging group in this workspace inherits for auto-wire, or null (approval gate).
+ * Scope: Discord guild id; any other adapter its channel_type (Slack/GitHub/Linear variants carry the workspace).
  */
 /**
  * Channel types carrying a tenant-scoped workspace id; without one, an unrelated tenant's fresh chat would
