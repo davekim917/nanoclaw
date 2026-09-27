@@ -370,7 +370,11 @@ export type ParsedRemote =
   | { kind: 'local' }
   | { kind: 'unsupported' };
 
-const NETWORK_SCHEMES = /^(?:https?|ssh|git|git\+ssh|ssh\+git):$/;
+// The only network forms discovery reads; anything else is unsupported.
+// https/http/ssh URL: optional userinfo, host[:port], a path, no query or fragment.
+const URL_REMOTE = /^(?:https?|ssh):\/\/(?:[^@/\s]+@)?([A-Za-z0-9.-]+)(?::(\d+))?(\/[^\s?#]*)$/;
+// scp-like user@host:path, the path neither absolute nor starting a helper `::`.
+const SCP_REMOTE = /^[^@/:\s]+@([A-Za-z0-9.-]+):([^/:\s]\S*)$/;
 
 function pathSegments(remotePath: string): string[] {
   const segments = remotePath.split('/').filter(Boolean);
@@ -379,36 +383,31 @@ function pathSegments(remotePath: string): string[] {
 }
 
 /**
- * What a remote URL names, as git would reach it. A network remote yields its
- * host[:port], every namespace segment, the repository, and an exact identity
- * key (case-folded only on github.com, whose paths are case-insensitive). A
- * local path or file:// URL is local. Any other form (a remote helper, an
- * unknown scheme, a malformed escape, no path) is unsupported: what it names
- * is unknown.
+ * What a remote URL names. Only explicit forms are read: an https/http/ssh URL
+ * or an scp-like `user@host:path` yields its host[:port], every namespace
+ * segment, the repository, and an exact identity key (case-folded only on
+ * github.com, whose paths are case-insensitive); an absolute path or file://
+ * URL is local. Everything else (a `::` helper, any other scheme, a bare
+ * `host:path`, a malformed escape, no path) is unsupported: what it names is
+ * unknown.
  */
 export function parseRemote(url: string): ParsedRemote {
   const trimmed = url.trim();
-  if (/^[A-Za-z][A-Za-z0-9+.-]*::/.test(trimmed)) return { kind: 'unsupported' };
+  if (trimmed.startsWith('/') || trimmed.startsWith('file://')) return { kind: 'local' };
+  const urlForm = URL_REMOTE.exec(trimmed);
+  const scpForm = trimmed.includes('::') ? null : SCP_REMOTE.exec(trimmed);
   let host: string;
   let segments: string[];
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(trimmed)) {
-    if (!URL.canParse(trimmed)) return { kind: 'unsupported' };
-    const parsed = new URL(trimmed);
-    if (parsed.protocol === 'file:') return { kind: 'local' };
-    if (!NETWORK_SCHEMES.test(parsed.protocol)) return { kind: 'unsupported' };
-    const decoded = readSource(() => parsed.pathname.split('/').map((segment) => decodeURIComponent(segment)));
+  if (urlForm) {
+    const decoded = readSource(() => urlForm[3].split('/').map((segment) => decodeURIComponent(segment)));
     if (!decoded.ok) return { kind: 'unsupported' };
-    host = parsed.hostname.toLowerCase() + (parsed.port ? `:${parsed.port}` : '');
+    host = urlForm[1].toLowerCase() + (urlForm[2] ? `:${urlForm[2]}` : '');
     segments = pathSegments(decoded.value.join('/'));
+  } else if (scpForm) {
+    host = scpForm[1].toLowerCase();
+    segments = pathSegments(scpForm[2]);
   } else {
-    // git reads a path with no colon, or a slash before the first colon, as local.
-    const colon = trimmed.indexOf(':');
-    const slash = trimmed.indexOf('/');
-    if (colon < 0 || (slash >= 0 && slash < colon)) return { kind: 'local' };
-    const scpStyle = /^(?:[^/@\s]+@)?([^:/\s]+):(.*)$/.exec(trimmed);
-    if (!scpStyle) return { kind: 'unsupported' };
-    host = scpStyle[1].toLowerCase();
-    segments = pathSegments(scpStyle[2]);
+    return { kind: 'unsupported' };
   }
   const repo = segments.at(-1);
   if (!repo) return { kind: 'unsupported' };

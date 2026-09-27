@@ -700,8 +700,8 @@ describe('identifiers derived from the install', () => {
     expect(parseRemote('git@github.com:acme-co/widget.git')).toEqual(
       net('github.com', ['acme-co'], 'widget', 'github.com/acme-co/widget'),
     );
-    expect(parseRemote('github.com:acme-co/widget.git')).toEqual(
-      net('github.com', ['acme-co'], 'widget', 'github.com/acme-co/widget'),
+    expect(parseRemote('http://git.example.com/acme-co/widget')).toEqual(
+      net('git.example.com', ['acme-co'], 'widget', 'git.example.com/acme-co/widget'),
     );
     expect(parseRemote('ssh://git@ssh.github.com:443/acme-co/widget.git')).toEqual(
       net('ssh.github.com:443', ['acme-co'], 'widget', 'ssh.github.com:443/acme-co/widget'),
@@ -715,11 +715,25 @@ describe('identifiers derived from the install', () => {
     expect(parseRemote('https://github.com/solo')).toEqual(net('github.com', [], 'solo', 'github.com/solo'));
   });
 
-  it('classifies local paths as local and every other form as unsupported', () => {
-    for (const local of ['./mirrors:acme-co/widget.git', '/srv/mirrors/widget.git', 'file:///srv/acme-co/widget.git']) {
+  it('reads an absolute path or file:// as local and refuses every form outside the accepted ones', () => {
+    for (const local of ['/srv/mirrors/widget.git', 'file:///srv/acme-co/widget.git']) {
       expect(parseRemote(local)).toEqual({ kind: 'local' });
     }
     for (const unsupported of [
+      '1helper::x',
+      'helper::x',
+      '2scheme://x',
+      'foo:bar',
+      'github.com:acme-co/widget.git',
+      'git://example.com/acme-co/widget.git',
+      'git+ssh://git@example.com/acme-co/widget.git',
+      'ftp://example.com/acme-co/widget.git',
+      'git@example.com:/srv/acme-co/widget.git',
+      'git@example.com::acme-co/widget.git',
+      'git@example.com:acme-co/wid::get.git',
+      'https://github.com/acme-co/widget.git?ref=main',
+      './mirrors:acme-co/widget.git',
+      'mirrors/widget.git',
       'https://github.com/acme%zzco/widget.git',
       'https://github.com/acme-co/wid%FFget.git',
       'hg::https://example.com/acme-co/widget',
@@ -900,14 +914,19 @@ describe('identifiers derived from the install', () => {
   it('records a clone whose origin form cannot be interpreted', () => {
     const dataDir = path.join(tempRoot(), 'data');
     const dbPath = writeRegistry(dataDir);
-    addCanonical(dataDir, 'wg-fictional', 'SecretHelper', 'hg::https://example.com/acme-co/widget');
-    addCanonical(dataDir, 'wg-fictional', 'SecretEscape', 'https://github.com/acme%zzco/widget.git');
+    const refused = [
+      'hg::https://example.com/acme-co/widget',
+      'https://github.com/acme%zzco/widget.git',
+      '1helper::x',
+      'helper::x',
+      '2scheme://x',
+      'foo:bar',
+      'sso://example.com/acme-co/widget',
+    ];
+    refused.forEach((origin, index) => addCanonical(dataDir, 'wg-fictional', `SecretOrigin${index}`, origin));
     const problems: string[] = [];
     expect(loadInstallIdentifiers(dbPath, publicProject, problems)).toEqual(new Set());
-    expect(problems).toEqual([
-      'a cloned repository origin could not be interpreted',
-      'a cloned repository origin could not be interpreted',
-    ]);
+    expect(problems).toEqual(refused.map(() => 'a cloned repository origin could not be interpreted'));
   });
 
   it('records a present persona field that is not a non-empty string', () => {
