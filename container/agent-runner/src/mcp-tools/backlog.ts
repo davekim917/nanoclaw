@@ -1,4 +1,3 @@
-/** Backlog and ship-log tools: writes are system actions the host applies; reads come from the read-only /workspace/central.db. */
 import { getConfig } from '../config.js';
 import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';

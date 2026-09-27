@@ -1,4 +1,3 @@
-/** Thread search and permalink tools over the host-maintained archive, mounted read-only at /workspace/archive.db. */
 import { Database } from 'bun:sqlite';
 
 import { findByName } from '../destinations.js';

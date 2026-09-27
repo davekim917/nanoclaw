@@ -1,4 +1,3 @@
-/** Tone profile tools. `writing-rules.md` is appended to every profile; unknown names return an instruction to interpret ad-hoc. */
 import {
   listToneProfileNames,
   readToneAuxFile,

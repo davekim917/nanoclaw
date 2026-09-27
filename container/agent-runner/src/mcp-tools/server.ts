@@ -7,12 +7,6 @@
  *
  * Default when only `core.ts` is imported: the core `send_message` /
  * `send_file` / `edit_message` / `add_reaction` tools are available.
- *
- * Spawn tools are mounted bifurcated via `mountSpawnTools()`:
- * - Orchestrator tools (spawn_task, list_spawned_tasks, spawn_cancel)
- *   when getSessionSpawnTaskId() === null AND agent has orchestrator capability
- * - Child tools (spawn_progress, spawn_complete, spawn_failed)
- *   when getSessionSpawnTaskId() !== null (Phase 1: mutually exclusive)
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
