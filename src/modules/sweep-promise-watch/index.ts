@@ -1,49 +1,16 @@
 /**
- * Sweep family: promise watch.
+ * Finds sessions whose last agent message promised further work but armed
+ * nothing (no `continue_work`, no `wait`) and nothing happened since, then
+ * wakes them once per message asking the agent to do it, queue it, or drop it.
  *
- * An agent that ends a turn with "I'll confirm tomorrow that the nightly
- * succeeded" and arms nothing — no `continue_work`, no `wait` — has made a
- * promise only prose remembers, and prose has no control effect. When nothing
- * else ever happens in that session, the promise is simply dropped. A backtest
- * over 30 days of fleet finals found 4–10 such dropped promises a week that
- * nothing surfaced (Jev harness-accountability backtest, 2026-09-18).
+ * PROMISE_THRESHOLD is only valid for PROMISE_QUESTION's exact wording, and the
+ * labelled set it was chosen against was never checked in: rewording the
+ * question leaves the threshold unvalidatable.
  *
- * This duty finds them and, once per message, wakes the session with a system
- * note asking the agent to do it, queue it, or say it no longer applies.
- *
- * A session is a candidate only when all of these hold (all cheap, all local):
- *   - its newest chat row is the agent's, and the host has recorded no
- *     activity since it (by the host's clock — see `candidateReason`);
- *   - that row is QUIET_MS..MAX_AGE_MS old (a promise for "tomorrow" gets a day);
- *   - no container is running, nothing is due or future-dated in the inbox (a
- *     `wait`, a scheduled wake), and no work continuation is saved.
- * The same check runs again at admission, right before the wake row is written.
- * Only then is the message sent to TypeSafe's Jev with one question — does it
- * commit to further work on the agent's own initiative — and a probability at
- * or above PROMISE_THRESHOLD counts.
- *
- * On that threshold, honestly: it was chosen against 150 hand-labelled finals
- * that measured precision 0.92, but **that labelled set was never checked in**,
- * so the figure cannot be re-derived and this comment should not be read as
- * evidence for it. Two consequences. The threshold is carried over validly only
- * because PROMISE_QUESTION has never been reworded (`git log -p --follow` shows
- * no line removing it since `eac501613` introduced both together) — a threshold
- * does not survive a reword of its question. And until a labelled set exists in
- * the repo, a reworded question is not merely unvalidated but *unvalidatable*:
- * there is nothing to derive a new threshold against. Anything resting on this
- * classifier's precision should rest on flags hand-read during `shadow`, which
- * are checkable, not on 0.92.
- *
- * Modes (`NANOCLAW_PROMISE_WATCH`): `off` (default — agent text leaves the host
- * for TypeSafe only when an operator opts in), `shadow` (log the decision, wake
- * nothing), `nudge` (write the wake row). A nudge can make an agent speak
- * in a client-facing channel, so production decisions are read in shadow
- * before it is switched on. A wake row's id is keyed by the promising message,
- * so no message is ever nudged twice, and NUDGE_DAILY_CAP — counted in a
- * host-owned file, so a restart does not reset it — bounds a bad day.
- *
- * `tick:housekeeping`, order 136. The scan runs detached every
- * SCAN_INTERVAL_MS so a slow Jev call never holds the sweep tick.
+ * Modes (`NANOCLAW_PROMISE_WATCH`): `off` (default; agent text leaves the host
+ * for TypeSafe only on opt-in), `shadow` (log only), `nudge`. A nudge can make
+ * an agent speak in a client-facing channel. Wake ids are keyed by message and
+ * the daily cap is file-backed, so neither resets on restart.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -75,7 +42,6 @@ export function promiseWatchMode(raw: string | undefined): PromiseWatchMode {
   return raw === 'shadow' || raw === 'nudge' ? raw : 'off';
 }
 
-/** What the scan reads from one session's DBs. */
 export interface SessionSnapshot {
   latestChat: { id: string; timestamp: string; text: string } | null;
   latestInboundAt: string | null;
@@ -85,10 +51,8 @@ export interface SessionSnapshot {
 }
 
 /**
- * Why a session is or is not worth asking Jev about. Pure; the rule the tests
- * pin. Evaluated twice: at scan time, and again at admission right before the
- * wake row is written, because the Jev call opens a window in which anything
- * here can change.
+ * Evaluated twice, at scan and again at admission, because the Jev call opens
+ * a window in which any of this can change.
  */
 export function candidateReason(
   session: Pick<Session, 'status' | 'container_status' | 'archived_at' | 'last_active'>,
@@ -101,15 +65,10 @@ export function candidateReason(
   if (!snap.latestChat || !snap.latestChat.text.trim()) return 'no-chat';
   const chatAt = Date.parse(snap.latestChat.timestamp);
   if (!Number.isFinite(chatAt)) return 'bad-timestamp';
-  // "Nothing happened since" takes the later of two signals, and a tie counts
-  // as activity. sessions.last_active is the host's clock, stamped on routed
-  // inbound and container start (session-manager.ts) — it catches a row whose
-  // adapter timestamp reads earlier than its arrival. The newest inbound row's
-  // own timestamp catches host writers that insert directly without bumping
-  // last_active (host-restart notes, CLI delivery actions). Both only ever ADD
-  // activity, so each covers the other's blind spot and neither can create a
-  // false "quiet". Rows that arrived mid-turn, before the final chat, carry
-  // earlier stamps on both and correctly do not count.
+  // "Nothing happened since" takes the later of two signals, a tie counting as
+  // activity: last_active (host clock, catches adapter timestamps earlier than
+  // arrival) and the newest inbound row (catches host writers that don't bump
+  // last_active). Both only ever ADD activity.
   const lastActive = session.last_active ? Date.parse(session.last_active) : NaN;
   const lastInbound = snap.latestInboundAt ? Date.parse(snap.latestInboundAt) : NaN;
   if (
@@ -127,12 +86,7 @@ export function candidateReason(
   return 'candidate';
 }
 
-/**
- * The admission decision, taken inside the synchronous block right before the
- * write: the session still exists, no container owns it (running, spawning or
- * adopting — `containerOwnsOutbound`), the promising message is still its
- * newest chat, and it is still a candidate.
- */
+/** Taken inside the synchronous admission block, right before the write. */
 export function admissible(
   fresh: Session | undefined,
   containerOwns: boolean,
@@ -186,7 +140,6 @@ function chatText(content: string): string {
   }
 }
 
-/** Outcome of the admission step that writes a nudge. */
 export type NudgeOutcome = 'nudged' | 'duplicate' | 'stale';
 
 /** Durable per-day nudge count, so a host restart does not reset the cap. */
@@ -207,21 +160,8 @@ export interface ScanDeps {
 }
 
 /**
- * The flagged message as the log should carry it.
- *
- * This was `slice(0, 160)`, and head-truncation is exactly the wrong shape for
- * what is being logged. The first real flag (2026-09-19) carried its
- * promise — "it's mine to close. Next action after this." — two thirds into a
- * 3,125-character message, so the excerpt showed only the opening sentence,
- * which read as a flat answer. A reviewer judged it a false positive from that
- * excerpt alone. Hand-reading the full row reversed the call, and the flag
- * turned out to be real enough to become a P1.
- *
- * So: the whole message, whitespace collapsed, and when it is too long for a
- * log line, HEAD AND TAIL rather than head alone — a commitment lands at the
- * end of a message at least as often as at the start. Jev returns a
- * probability, not a span, so there is no "matched sentence" to extract; the
- * text has to be carried and read.
+ * Head AND tail when too long: a commitment lands at the end of a message at
+ * least as often as at the start, and a human judges the flag from this text.
  */
 const LOG_TEXT_LIMIT = 4_000;
 const LOG_TEXT_EDGE = 1_800;
@@ -276,10 +216,8 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
     }
     promises += 1;
 
-    // Two consumers, two lengths. The LOG carries the whole message because a
-    // human has to judge the flag from it; the NUDGE quotes a short opening
-    // back to the agent, which only needs to identify which message is meant
-    // and must not paste a 3,000-character wall into its next turn.
+    // The log carries the whole message for human review; the nudge quotes a
+    // short opening so it doesn't paste a wall into the agent's next turn.
     const excerpt = chat.text.replace(/\s+/g, ' ').trim().slice(0, 160);
     const fields = {
       sessionId: session.id,
@@ -293,9 +231,8 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
       log.info('promise-watch: would nudge (shadow)', fields);
       continue;
     }
-    // Reserve before writing: a crash after the wake row lands must not leave
-    // it uncounted. A reservation the admission then refuses is simply lost,
-    // which errs toward fewer nudges.
+    // Reserve before writing so a crash after the wake row lands can't leave
+    // it uncounted.
     if (!deps.cap.reserve(day, NUDGE_DAILY_CAP)) {
       // Not decided: tomorrow's allowance may still reach it inside the window.
       log.warn('promise-watch: daily nudge cap reached, skipping', fields);
@@ -345,11 +282,7 @@ function isCalendarDay(day: string): boolean {
   return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === day;
 }
 
-/**
- * The per-day count lives in a small host-owned file so a restart does not
- * reset it. A missing file is a fresh count; a file that exists but cannot be
- * read or parsed fails CLOSED — no slot is granted until it is repaired.
- */
+/** A missing file is a fresh count; an unreadable or malformed one fails CLOSED. */
 export function fileCapStore(file: string = CAP_FILE): NudgeCapStore {
   return {
     reserve: (day, cap) => {
@@ -394,15 +327,9 @@ function productionDeps(mode: PromiseWatchMode): ScanDeps {
       if (typeof p !== 'number' || !Number.isFinite(p)) throw new Error('malformed Jev answer');
       return p;
     },
-    // Admission: re-read the session row and the mailbox, and write only if
-    // the same message is still the newest chat and the session is still a
-    // candidate. The Jev call is the gap this closes.
-    // Admission: the mailbox callback awaits ONLY the central lease. Inside
-    // it, one synchronous block re-reads the session row, checks container
-    // ownership (running, spawning or adopting), re-snapshots the mailbox and
-    // writes — nothing can interleave between the check and the insert: an
-    // archive or close needs the same lease, and a spawn registers in the
-    // in-memory map before it ever touches the row.
+    // Only the central lease is awaited; inside it one synchronous block
+    // re-checks and writes, so nothing interleaves between check and insert
+    // (archive/close need the same lease; a spawn registers in memory first).
     nudge: async (session, messageId, text, p) => {
       const outcome = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
         withCentralSync((): NudgeOutcome => {

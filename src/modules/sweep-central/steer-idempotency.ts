@@ -8,11 +8,10 @@ import { log } from '../../log.js';
 export async function pruneSteerIdempotency(): Promise<void> {
   try {
     const db = getDb();
-    // Delete applied rows older than 60 seconds
     await db.run(
       `DELETE FROM steer_idempotency WHERE status = 'applied' AND datetime(applied_at) < datetime('now', '-60 seconds')`,
     );
-    // Delete pending rows older than 5 minutes (crash-recovery window expires)
+    // Pending rows past 5 minutes: the crash-recovery window has expired.
     await db.run(
       `DELETE FROM steer_idempotency WHERE status = 'pending' AND datetime(reserved_at) < datetime('now', '-300 seconds')`,
     );

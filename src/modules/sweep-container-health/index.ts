@@ -1,19 +1,8 @@
 /**
- * Container health.
- *
- * Owns the `session:health` chain's first and last branches (S11 provider
- * self-heal, S14 running-container SLA) plus the SLA observation hook that
- * rides inside S14's own observe session (S16 OOM / memory-pressure notice).
- * S12/S13 (the two idle reaps, the sweep-idle-reap family) stay registered in
- * `host-sweep.ts` at orders 20/30 in between — the exclusive chain's order
- * is heal (10) → idle-task-reap (20) → idle-chat-reap (30) → SLA (40,
- * fallthrough), and this module owns only the two ends of it.
- *
- * Bodies below are moved from `src/host-sweep.ts` UNCHANGED (same statements,
- * log strings, thresholds). Every kill here (`provider-failed-selfheal`,
- * `-parked`, `killForProviderHeal`'s own call, `absolute-ceiling`,
- * `claim-stuck`) runs at mailbox depth 0 — the caller's own `run`/`runIn`
- * open and close a session around it, never held across it (invariant I-3).
+ * Container health: provider self-heal (S11, first) and the running-container
+ * SLA (S14, fallthrough) on the `session:health` exclusive chain, plus the OOM
+ * notice hook inside S14's observe session. Every kill runs with no mailbox
+ * session open (the caller's own run/runIn open and close around it).
  */
 import fs from 'fs';
 
@@ -65,36 +54,18 @@ import {
 
 const oomKillObserver = new OomKillObserver();
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Failed-provider self-heal (S11).
-//
-// A container whose provider has given up writes provider_status='failed' and
-// then sits alive-but-useless until a human notices. Nothing reaps it: it holds
-// a claim so the idle reapers pass, and the absolute ceiling only fires after
-// 30 more silent minutes and then leaves the session dead until the next ping.
-//
-// Detection keys on provider_status because it is the only column carrying the
-// provider's own "I am done" verdict. Today only the Codex provider ever writes
-// it (container/agent-runner/src/providers/codex.ts) — Claude and OpenCode
-// never do — so this heals Codex sessions only until they follow. It is
-// deliberately NOT built on provider_executing: that flag says "busy", not
-// "given up", and a wedged provider can be either.
-//
-// Two consecutive sweep ticks are required so a transition the container
-// recovers from on its own never costs it a kill.
-// ─────────────────────────────────────────────────────────────────────────────
+// Failed-provider self-heal. Keys on provider_status because it is the only
+// column carrying the provider's own "I am done" verdict (today only Codex
+// writes it), not provider_executing, which means "busy". Two consecutive ticks
+// are required so a self-recovering transition never costs a kill.
 
-/** Consecutive `failed` observations required before acting. */
 const PROVIDER_HEAL_CONSECUTIVE_TICKS = 2;
 export const PROVIDER_HEAL_MAX_ATTEMPTS = 2;
 export const PROVIDER_HEAL_COOLDOWN_MS = 10 * 60 * 1000;
 const PROVIDER_HEAL_ID_PREFIX = 'provider-heal-';
 
-// sessionId → consecutive ticks observed with provider_status === 'failed'.
-// The Map itself is a driver-owned export of host-sweep.ts (imported above) —
-// its storage has to live there so the driver's own `!alive` cleanup can stay
-// synchronous (see the export's doc comment). The SEMANTICS below — the
-// two-tick debounce and its reset rules — are entirely this module's.
+// The debounce Map's storage lives in host-sweep.ts so the driver's `!alive`
+// cleanup stays synchronous; its semantics are this module's.
 
 export type ProviderHealDecision = 'none' | 'wait' | 'heal' | 'park';
 
@@ -165,9 +136,8 @@ async function applyProviderHeal(
       containerConfig,
     };
     primaryProvider = (await resolveSpawnProvider(resolveArgs)).primaryProvider;
-    // A group with no declared fallback has nowhere to route, so recording a
-    // health window would only delay the honest error an operator needs to see.
-    // Owner-approved: respawn on the primary anyway, under the same cap.
+    // No declared fallback means nowhere to route; respawn on the primary anyway
+    // under the same cap rather than delaying the honest error.
     if (containerConfig.providerFallback?.provider && failureReason) {
       await markProviderUnavailable(session.agent_group_id, primaryProvider, 'unavailable', {
         message: failureReason,
@@ -178,13 +148,9 @@ async function applyProviderHeal(
     log.warn('self-heal: provider routing lookup failed — respawning as configured', { sessionId: session.id, err });
   }
 
-  // The last provider await is above. Everything the heal decided was proven
-  // against the container `target` names, and provider resolution, the health
-  // write and this mailbox open have all yielded since. If the original exited
-  // and a wake registered a replacement in that window, the marker below would
-  // be charged to a healthy container and the kill would take it down.
-  // Refuse instead: no marker, no kill, full attempt budget kept for a failure
-  // that is still real.
+  // Everything since the decision has yielded: if a replacement registered in
+  // that window, the marker would be charged to a healthy container and the
+  // kill would take it down. Refuse, keeping the attempt budget.
   const registered = containerIdentityFor(session.id);
   if (identityChanged(registered, target)) {
     log.info('self-heal: heal target was replaced before the marker — refusing', {
@@ -221,20 +187,9 @@ async function applyProviderHeal(
 }
 
 /**
- * The kill half of a provider heal.
- *
- * Split out of `applyProviderHeal` so it can run with NO mailbox session open.
- * `killContainer`'s `onExit` respawns the session, and its status-cleanup hop
- * through `delivery.ts` opens a session of its own — both on THIS key. Running
- * either from inside a session would trip the same-key nesting guard
- * (invariant I-3); the wake row is already durable by the time we get here,
- * which is the ordering the heal has always relied on.
- *
- * Identity-fenced on `target`, the container the heal was decided against. The
- * mailbox close between the marker and this call is one more yield, and
- * `killContainer` kills whichever container is registered — so without the
- * fence a replacement spawned in that window is killed and its work reported
- * lost. Same fence `finalizeSession` applies to a late terminal event.
+ * Must run with NO mailbox session open: `killContainer`'s respawn and status
+ * cleanup open sessions on this key. Identity-fenced on `target`, because
+ * `killContainer` kills whichever container is registered.
  */
 function killForProviderHeal(session: Session, target: ContainerIdentity | null): void {
   const registered = containerIdentityFor(session.id);
@@ -256,16 +211,14 @@ function killForProviderHeal(session: Session, target: ContainerIdentity | null)
         guard: sessionStillActive(session.id),
       });
     },
-    // The heal is a restart: the wake row is already durable, so a host that
-    // dies before the respawn still owes the session a container.
+    // A restart: the wake row is durable, so a host that dies before the
+    // respawn still owes the session a container.
     'respawn_after_stop',
   );
 }
 
 /**
- * One visible notice when the attempt budget is spent, shaped like
- * notifyContinuationParked. Idempotent per heal episode: the key is the newest
- * marker row's id, which only changes when a fresh heal runs, and real inbound
+ * Idempotent per heal episode (keyed by the newest marker id); real inbound
  * resets the whole budget.
  */
 export function notifyProviderHealParked(
@@ -303,47 +256,20 @@ export function notifyProviderHealParked(
 }
 
 /**
- * Why this session must not be healed right now, or `null` when it may be.
- *
- * Every input to the decision above is stale by the time it is acted on.
- * `containerState` comes from the driver's observe read (W3), the `alive`
- * verdict that admitted this session to the health phase was taken before
- * that, and this function then awaits a mailbox open of its own for the
- * attempt budget. A container that self-exits anywhere in that window is
- * already gone by the kill: `killContainer` is a harmless no-op, but the
- * accountability wake row the heal branch writes FIRST is counted forever by
- * `countProviderHealAttemptsSinceRealInbound`, so the next genuine failure
- * starts one attempt down and parks a heal early. The park branch's kill rests
- * on the same stale read.
- *
- * Checked here, ahead of both branches, rather than immediately around
- * `killContainer`: the attempt is what must not be spent, and the attempt is
- * written before the kill.
- *
- * Cheap — one central-DB row and the container-state lookup the host already
- * keeps in memory. The DB read is the wake guard's own raw read, so it runs
- * inside the central lease; the caller takes the lease around this whole check
- * (seam 3 §4.5 I-1).
- */
-/**
- * Did the registry move to a DIFFERENT container?
- *
- * Absence is not change. A null on either side means "this host has no identity
- * for the session", which the target-availability checks already handle on
- * its own — `providerHealTargetUnavailableReason` for a container that is gone,
- * and `killContainer` itself, which is a no-op when nothing is registered. A
- * fence that refused on null would instead disable the whole self-heal wherever
- * an identity is unavailable, which is a silent feature outage rather than a
- * safety property.
- *
- * So this answers only the question the fences exist for: two identities, both
- * present, naming different containers.
+ * Absence is not change: null on either side is handled by the availability
+ * checks, and refusing on null would silently disable self-heal wherever an
+ * identity is unavailable.
  */
 function identityChanged(a: ContainerIdentity | null, b: ContainerIdentity | null): boolean {
   if (!a || !b) return false;
   return !sameContainerIdentity(a, b);
 }
 
+/**
+ * Every heal input is stale by action time, and the heal's wake row (written
+ * before the kill) is counted forever, so a container that already exited
+ * must not spend an attempt. Caller holds the central lease.
+ */
 function providerHealTargetUnavailableReason(sessionId: string): string | null {
   const liveness = sessionStillActive(sessionId)();
   if (liveness !== true) return typeof liveness === 'object' ? liveness.reason : 'session is not wakeable';
@@ -352,13 +278,8 @@ function providerHealTargetUnavailableReason(sessionId: string): string | null {
 }
 
 /**
- * Detection + action for one alive session. Always advances the debounce;
- * acts only when NANOCLAW_SELF_HEAL is armed. Returns true when the container
- * was killed, so the caller skips the reap/SLA checks for this tick.
- *
- * `containerState` is read by the caller (it needs it for the reap decisions
- * too); everything else this needs is read inside its own short session, and
- * every kill happens between two of them.
+ * Always advances the debounce; acts only when NANOCLAW_SELF_HEAL is armed.
+ * Returns true when it claims the exclusive phase.
  */
 async function sweepProviderHeal(
   run: SessionRunner,
@@ -401,25 +322,10 @@ async function sweepProviderHeal(
     return false;
   }
 
-  // Nothing below may act on a target that is already gone. Skipping
-  // costs nothing — a container that exited on its own needs no kill, and the
-  // session keeps its full attempt budget for a failure that is still real.
-  //
-  // Returns TRUE, and the distinction matters more than the saving does. This
-  // is an exclusive phase's first claimant: `false` means "not mine, try the
-  // next one", and S12/S13/S14 would then act on the SAME stale observation
-  // that brought us here — reaping, killing for the ceiling or a stuck claim,
-  // resetting claims, writing OOM telemetry and an accountability wake, all
-  // against a container that no longer exists. Before this guard existed the
-  // heal branch reached `killContainer` (a no-op on a dead container), spent an
-  // attempt and returned `true`, so the chain stopped. Claiming the slot keeps
-  // that behaviour exactly and drops only the wasted attempt, which is the
-  // whole point of the fix.
-  //
-  // The guard's own identity snapshot is taken in the SAME synchronous block:
-  // it names the container every decision below was proven against, so a
-  // replacement registered across any later await is refused rather than
-  // charged and killed.
+  // A target that is already gone needs no kill and keeps its attempt budget.
+  // Still returns TRUE: `false` would let S12/S13/S14 act on the same stale
+  // observation. The identity snapshot is taken in the SAME synchronous block
+  // so a later replacement is refused rather than charged and killed.
   const { unavailable, registered } = await withCentralSync(
     () => ({
       unavailable: providerHealTargetUnavailableReason(session.id),
@@ -435,12 +341,9 @@ async function sweepProviderHeal(
     return true;
   }
 
-  // The DECISION is only valid for the container it was made about.
-  // `decision` rests on the `failed` state W3 read, and the budget open
-  // above has yielded since: if that container exited and a wake registered a
-  // replacement, the registry now names a HEALTHY container, and a fence that
-  // re-read it here would compare that replacement against itself and pass. So
-  // the comparison is against the identity paired with the observation.
+  // The decision is valid only for the container it was made about: compare
+  // against the identity paired with the observation, not a fresh re-read
+  // (which would compare a replacement against itself).
   if (identityChanged(registered, observedContainer)) {
     log.info(`self-heal: ${decision} target was replaced since the health observation — refusing`, {
       ...bounds,
@@ -452,15 +355,10 @@ async function sweepProviderHeal(
   const target = observedContainer ?? registered;
 
   if (decision === 'park') {
-    // Kill first, then post: outbound.db has exactly one writer, and the
-    // container must be confirmed stopped before the host writes to it (same
-    // ordering as the kill-ceiling notice). No onExit — parked means no
-    // respawn until real inbound resets the budget.
+    // Kill first, then post: outbound.db has one writer and the container must
+    // be stopped first. No onExit: parked means no respawn until real inbound.
     log.warn('self-heal: provider heal budget exhausted — parking', bounds);
-    // Fenced like the heal kill: `killContainer` kills whichever container is
-    // registered, and the park path reaches it through the same stale-decision
-    // window. Re-checked here rather than trusting the check above, because a
-    // replacement can still land between them.
+    // Fenced again because a replacement can land between the checks.
     if (identityChanged(containerIdentityFor(session.id), target)) {
       log.info('self-heal: park target was replaced before the kill — leaving the live container alone', bounds);
       return true;
@@ -468,12 +366,8 @@ async function sweepProviderHeal(
     killContainer(session.id, 'provider-failed-selfheal-parked');
     try {
       await run((mailbox) =>
-        // Same yield boundary as the kill-ceiling notice: the park kill is
-        // above, this session opened after it, and a respawn in that gap owns
-        // outbound.db. The notice is one-per-episode and idempotent, so
-        // skipping it costs nothing a later tick cannot redo.
-        // `writeOutboundWhenStopped` is the single guarded body for every
-        // host-side outbound write.
+        // A respawn in the gap after the kill owns outbound.db; the notice is
+        // idempotent, so skipping it costs nothing.
         writeOutboundWhenStopped(session, mailbox, () =>
           notifyProviderHealParked(
             mailbox,
@@ -489,13 +383,10 @@ async function sweepProviderHeal(
     return true;
   }
 
-  // Wake row first (durably counted even if the kill fizzles), session closed,
-  // then the kill and its respawn.
+  // Wake row first (durably counted even if the kill fizzles), then the kill.
   const outcome = await run((mailbox) => applyProviderHeal(mailbox, session, agentGroupFolder, containerState, target));
   if (outcome === undefined) return false;
-  // A refused heal still claims the exclusive phase, for the same reason the
-  // target check above does: the branches below would act on the observation
-  // that brought us here, which named a container that is no longer registered.
+  // A refused heal still claims the phase, for the same reason as above.
   if (outcome === 'stale-target') return true;
   killForProviderHeal(session, target);
   return true;
@@ -508,9 +399,7 @@ export function _sweepProviderHealForTesting(
   agentGroupFolder: string,
   containerState: ContainerState | null,
   writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
-  // Defaulted so the existing cases read unchanged: production pairs this with
-  // the health observation, and a case that does not care about the pairing
-  // gets whatever is registered when it calls, which is the same container.
+  // Defaulted: production pairs this with the observation.
   observedContainer: ContainerIdentity | null = containerIdentityFor(session.id),
 ): Promise<boolean> {
   return sweepProviderHeal(
@@ -528,10 +417,6 @@ export function _resetProviderHealTicksForTesting(): void {
   providerFailedTicks.clear();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Running-container SLA (S14): absolute ceiling + per-claim stuck rules.
-// ─────────────────────────────────────────────────────────────────────────────
-
 function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
   const hbPath = heartbeatPath(agentGroupId, sessionId);
   try {
@@ -542,11 +427,8 @@ function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
 }
 
 /**
- * When the in-flight tool started, or null when there is no tool in flight or
- * its start cannot be read. Null means "no forgiveness" — a missing or
- * malformed `tool_started_at` fails toward the pre-existing claim rule.
- * The runner writes this column as ISO-8601 on every set
- * (container/agent-runner/src/mailbox/sqlite/connection.ts).
+ * Null means "no forgiveness": a missing or malformed start falls back to the
+ * claim rule.
  */
 function inFlightToolStartedAtMs(state: ContainerState | null): number | null {
   if (!state?.current_tool || typeof state.tool_started_at !== 'string' || state.tool_started_at === '') return null;
@@ -555,16 +437,10 @@ function inFlightToolStartedAtMs(state: ContainerState | null): number | null {
 }
 
 /**
- * True while the container's provider is mid-turn in a query that has already
- * produced at least one event: alive, and possibly quiet for a long stretch
- * (a long think emits nothing — the claude provider runs without partial
- * messages, so the heartbeat, touched once per provider event, stands still).
- * False for a query that has emitted nothing since it started, which is the
- * "hung at the gate" case the claim rule exists to catch, and false for any
- * outbound.db whose runner does not write `provider_query_event_at` (an
- * adopted container on an older runner snapshot): no forgiveness, old rule.
- * Requires a heartbeat so the ceiling check above always applies to a claim
- * this forgives.
+ * True while the provider is mid-turn in a query that has already produced an
+ * event: alive but possibly silent for long (the heartbeat moves only per
+ * provider event). False for a query that emitted nothing ("hung at the gate")
+ * and for runners that don't write `provider_query_event_at`.
  */
 function providerQueryIsLive(state: ContainerState | null, heartbeatMtimeMs: number): boolean {
   if (heartbeatMtimeMs === 0 || state?.provider_executing !== 1) return false;
@@ -577,59 +453,32 @@ function activeOperationTimeoutMs(state: ContainerState | null): number | null {
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
-/**
- * Pure decision for whether a running container should be killed this sweep
- * tick. Inputs are all deterministic; filesystem + DB reads happen in the
- * caller.
- */
+/** Pure: every filesystem and DB read happens in the caller. */
 export function decideStuckAction(args: {
   now: number;
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
-  // Wall-clock when the host spawned the current container. Optional;
-  // omit (or pass 0) to disable the grace check. Used to gate the
-  // kill-claim path so a fresh container has SPAWN_GRACE_MS to clean its
-  // own pre-existing claims before being killed for them.
+  // Omit or 0 to disable the spawn-grace check.
   spawnedAtMs?: number;
-  // True when this host ADOPTED the container from a previous host rather
-  // than spawning it. `spawnedAtMs` is then the adoption instant, not a
-  // spawn, so the "heartbeat predates the spawn" test below stops meaning
-  // what it means for a fresh container.
+  // For an ADOPTED container `spawnedAtMs` is the adoption instant, not a spawn.
   adopted?: boolean;
 }): StuckDecision {
   const { now, heartbeatMtimeMs, containerState, claims, adopted } = args;
   const spawnedAtMs = args.spawnedAtMs ?? 0;
   const declaredOperationMs = activeOperationTimeoutMs(containerState);
 
-  // Ceiling check only applies when we have an actual heartbeat timestamp.
-  // A freshly-spawned container hasn't had any SDK activity yet so no
-  // heartbeat file exists — if we treated that as infinitely stale we'd
-  // kill every container within seconds of spawn. Genuinely-dead containers
-  // that never wrote a heartbeat are caught by the separate "container
-  // process not running" cleanup path, not here. If a fresh container is
-  // hanging at the gate (claimed a message but never did anything) the
-  // claim-stuck check below handles it.
+  // No heartbeat file means a fresh container, not an infinitely stale one;
+  // a fresh container hung at the gate is the claim rule's job.
   if (heartbeatMtimeMs !== 0) {
     const heartbeatAge = now - heartbeatMtimeMs;
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredOperationMs ?? 0);
     if (heartbeatAge > ceiling) {
-      // Skip kill when the stale heartbeat is from a PRIOR container
-      // instance AND we're still inside the spawn-grace window. The
-      // heartbeat file persists across container restarts at a host-side
-      // path mounted into /workspace/.heartbeat — the new container
-      // inherits the previous instance's stale mtime until its first
-      // poll-loop iteration touches it. Without this, a host restart
-      // (or any post-crash respawn for a session whose previous heartbeat
-      // had already aged past the ceiling) SIGKILLs the fresh container
-      // before the agent-runner can mark itself alive, creating an
-      // infinite spawn → kill → respawn loop.
-      // An ADOPTED container is excluded, because for it the predicate is
-      // false by construction and would be generous for the wrong reason: its
-      // `spawnedAt` is the adoption instant, so a heartbeat older than it is
-      // this container's OWN and genuinely stale. Without the `!adopted`
-      // guard a wedged survivor would buy a fresh grace window on every host
-      // restart and never be killed (plan §3.5 divergence 11).
+      // The heartbeat file outlives container restarts, so a fresh container
+      // inherits a stale mtime until its first poll; killing then loops
+      // spawn → kill forever. Excluded for ADOPTED containers: their older
+      // heartbeat is their own, and a wedged survivor would otherwise buy a
+      // fresh grace window on every host restart.
       const inSpawnGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
       const heartbeatFromPriorContainer = !adopted && spawnedAtMs > 0 && heartbeatMtimeMs < spawnedAtMs;
       if (!(inSpawnGrace && heartbeatFromPriorContainer)) {
@@ -639,9 +488,8 @@ export function decideStuckAction(args: {
   }
 
   const tolerance = Math.max(CLAIM_STUCK_MS, declaredOperationMs ?? 0);
-  // True only for claims this container could have produced itself; older
-  // claims are leftovers from a prior crashed container and the fresh one
-  // gets SPAWN_GRACE_MS to clean them on startup before we kill for them.
+  // Claims older than this container's spawn are a prior crash's leftovers,
+  // which the fresh one gets SPAWN_GRACE_MS to clean.
   const inGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
   const toolStartedAtMs = inFlightToolStartedAtMs(containerState);
   const queryIsLive = providerQueryIsLive(containerState, heartbeatMtimeMs);
@@ -652,23 +500,11 @@ export function decideStuckAction(args: {
     if (claimAge <= tolerance) continue;
     if (heartbeatMtimeMs > claimedAt) continue;
     if (inGrace && claimedAt < spawnedAtMs) continue;
-    // A tool that was ALREADY running when this message was claimed, and is
-    // still in flight, explains why the claim has not been consumed: the runner
-    // holds a mid-turn follow-up's claim until the provider reports it consumed
-    // (container/agent-runner/src/poll-loop.ts, `pendingFollowUps`), and a
-    // turn inside a long silent tool emits no event to touch the heartbeat. The
-    // claim is not evidence of a wedge. This only forgives the CLAIM rule; the
-    // ceiling above is untouched, so a wedged tool is still reaped when the
-    // heartbeat ages past max(ABSOLUTE_CEILING_MS, declared timeout).
+    // A tool already running when the message was claimed explains the held
+    // claim (the runner holds mid-turn follow-up claims until consumed). Only
+    // the claim rule is forgiven; the ceiling above still reaps a wedged tool.
     if (toolStartedAtMs !== null && toolStartedAtMs < claimedAt) continue;
-    // The same held claim with NO tool in flight: a check-in that arrived while
-    // the model is thinking or writing a long tool input. The provider turn is
-    // executing and this query has produced events, so the container is not
-    // hung at the gate; it is quiet. Forgive the claim and leave the wedge
-    // question to the ceiling above: a provider that stops emitting is still
-    // reaped once the heartbeat ages past ABSOLUTE_CEILING_MS (or a clamped
-    // declared Bash timeout). A query that has emitted nothing since it
-    // started gets no forgiveness — that is the case this rule kills.
+    // Same for a live, event-producing query with no tool (a long think).
     if (queryIsLive) continue;
     return { action: 'kill-claim', messageId: claim.message_id, claimAgeMs: claimAge, toleranceMs: tolerance };
   }
@@ -677,46 +513,19 @@ export function decideStuckAction(args: {
 }
 
 /**
- * Post-kill follow-ups, started from the container's OWN exit (Codex final).
- *
- * `killContainer` only REQUESTS the stop: it calls `stopContainer` (or SIGKILLs)
- * and returns, while `activeContainers` is cleared by the spawn path's own
- * `close` handler whenever the child actually goes. Running the chain on the
- * next line therefore raced the exit — `containerOwnsOutbound` was still true,
- * the early-out fired, and the ceiling notice, the orphan-claim reset and the
- * accountability wake were skipped for good, with nothing to retry them. The
- * positive tests missed it because their `killContainer` mock cleared
- * `isContainerRunning` synchronously, which production does not.
- *
- * So the chain hangs off `onExit`, which `stopRunningContainer` registers as a
- * `once('close')` AFTER the spawn path's finalizer — so by the time it runs the
- * session is already out of `activeContainers` and the host may write. The
- * per-write `writeOutboundWhenStopped` guards inside each follow-up are
- * unchanged and still do the real work: `runSweepKillFollowUps` awaits between
- * follow-ups, so a replacement can still take the session mid-chain.
- *
- * Two paths `onExit` cannot cover, both handled here:
- *  - nothing to kill (the container already exited, or never ran). No callback
- *    is ever invoked, so the chain runs inline — ownership is already false.
- *  - a kill deferred behind an in-flight spawn. `killContainer` queues the
- *    callback in `pendingKills` and fires it when that spawn's container is
- *    stopped, which is the behaviour we want and needs nothing here.
- *
- * The chain is asynchronous with respect to the tick that ordered the kill, so
- * a rejection is logged and never thrown into it, exactly as the detached wake
- * does. `_settlePostKillForTesting` is how a case waits for it.
+ * Post-kill follow-ups hang off the container's own exit: `killContainer` only
+ * REQUESTS the stop, and running the chain inline raced the exit (ownership
+ * still true, every follow-up skipped for good). The per-write guards in each
+ * follow-up still do the real work, since a replacement can take the session
+ * mid-chain. Rejections are logged, never thrown into the tick.
  */
 const postKillChains = new Set<Promise<void>>();
 
 function trackPostKill(work: Promise<void>, sessionId: string): void {
   const tracked = work
     .catch((err: unknown) => {
-      // Classification survives the detach. A follow-up that throws is tagged
-      // with its duty and window by `runDutyBody`, and the per-session catch in
-      // the driver is what normally turns that tag into 'Host sweep duty
-      // failed' — but this chain outlives the tick, so that catch never sees
-      // it. Reported here in the same shape, on the same field pair every
-      // post-deploy check filters on.
+      // This chain outlives the tick, so the driver's catch never sees it;
+      // report in the same shape post-deploy checks filter on.
       const fields = dutyFailureFields(err);
       if (fields.duty) log.error('Host sweep duty failed', { err, sessionId, ...fields });
       else log.warn('Post-kill follow-up chain failed', { sessionId, err });
@@ -737,12 +546,7 @@ export function _resetPostKillForTesting(): void {
   postKillChains.clear();
 }
 
-/**
- * Kill, then run the follow-ups when the container is actually gone.
- *
- * `snapshot` is read BEFORE the kill (the claims a reset would clear), so it is
- * captured by the caller and closed over here.
- */
+/** `snapshot` is read BEFORE the kill (a reset clears the claims). */
 function killThenFollowUp(
   ctx: SweepSessionContext,
   decision: StuckDecision,
@@ -753,10 +557,7 @@ function killThenFollowUp(
   const chain = (): Promise<void> =>
     ctx
       .runIn('session:health:post-kill', (mailbox) => {
-        // Early-out only, and now a genuine one: a REPLACEMENT container took
-        // the session between the exit and this open. It is not what makes the
-        // writes safe — each follow-up carries its own
-        // `writeOutboundWhenStopped` immediately before its own mutation.
+        // Early-out only: each follow-up carries its own ownership guard.
         if (containerOwnsOutbound(sessionId)) return;
         return runSweepKillFollowUps(ctx, decision, mailbox, snapshot);
       })
@@ -771,9 +572,8 @@ function killThenFollowUp(
 
 async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<void> {
   const session = ctx.session;
-  // Read + the observation hooks in one session, so the decision and the
-  // telemetry row see the same snapshot. The kill below then runs with nothing
-  // open (invariant I-3).
+  // The decision and the telemetry see the same snapshot; the kill below runs
+  // with nothing open.
   const observed = await ctx.runIn('session:health:sla-observe', async (mailbox) => {
     const containerState = mailbox.getContainerState();
     await runSlaObservationHooks(ctx, containerState, mailbox);
@@ -785,9 +585,7 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
       spawnedAtMs: getContainerSpawnedAt(session.id),
       adopted: isAdoptedContainer(session.id),
     });
-    // Snapshot BEFORE the kill so the follow-ups have the pre-kill state —
-    // resetStuckProcessingRows clears the claims, so a read afterward would
-    // always be empty.
+    // Snapshot BEFORE the kill: the reset clears the claims.
     return {
       containerState,
       decision,
@@ -829,25 +627,10 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OOM / memory-pressure notice (S16) — the SLA duty's own observation hook.
-// ─────────────────────────────────────────────────────────────────────────────
-
 /**
- * Turn cgroup memory telemetry into something the AGENT can act on.
- *
- * The kernel kills children inside the cgroup, never PID 1, so the container
- * survives and nothing surfaces: agents read an OOM-killed chromium as "the
- * browser crashed", an OOM-killed `npm ci` as "probably buffering", and
- * vanished MCP servers as "infrastructure instability". Reconstructed
- * transcripts show they diagnose it correctly the moment they are TOLD — so
- * the notice below is the whole fix; the detection already worked and just
- * ended in a log file nobody in the container can read.
- *
- * The row is onWake=0 (the container is alive — this path only runs for
- * running containers) and trigger=0 via insertDeferredMessageWithContextIfNew,
- * so it can never wake a dead container; it rides along with the next real
- * message or the next turn.
+ * The kernel kills children inside the cgroup, never PID 1, so nothing surfaces
+ * to the agent unless it is told. The row is onWake=0/trigger=0, so it can never
+ * wake a dead container; it rides along with the next turn.
  */
 function reportContainerOomTelemetry(
   mailbox: NanoclawMailboxSession,
@@ -867,8 +650,7 @@ function reportContainerOomTelemetry(
   try {
     configuredLimitMb = resolveContainerResources(readContainerConfig(agentGroupFolder).resources).memory.limitMb;
   } catch {
-    // Resource validation already fails closed in the spawn path. Keep OOM
-    // diagnostics available even if an operator edits the file mid-run.
+    // Keep OOM diagnostics even if the file was edited into an invalid state mid-run.
   }
   const cgroupMaxMb =
     typeof state.memory_max_bytes === 'number' ? Math.round(state.memory_max_bytes / 1024 / 1024) : null;
@@ -938,12 +720,7 @@ function reportContainerOomTelemetry(
 
 export { reportContainerOomTelemetry as _reportContainerOomTelemetryForTesting };
 
-/**
- * Test-only entry point for the running-container SLA, including both post-kill
- * write paths. Builds the minimum session context the duty reads: the SLA and
- * its follow-ups touch `session`, `agentGroupId`, `agentGroupFolder` and the
- * two window openers, nothing else.
- */
+/** Test-only: builds the minimum session context the SLA and its follow-ups read. */
 export function _enforceRunningContainerSlaForTesting(
   run: SessionRunner,
   session: Session,
@@ -979,10 +756,6 @@ export function _enforceRunningContainerSlaForTesting(
   return enforceRunningContainerSla(ctx);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Registrations — S11, S14, and S16's SLA-observation hook.
-// ─────────────────────────────────────────────────────────────────────────────
-
 function registerContainerHealthSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
@@ -990,12 +763,8 @@ function registerContainerHealthSweepDuties(): void {
     name: id.S11,
     phase: 'session:health',
     order: 10,
-    // 6a. Failed-provider self-heal. Runs first: a container whose provider has
-    // given up is not idle and not merely stuck, and healing it beats both
-    // reaping it as idle and waiting out the 30-minute ceiling. Returns true
-    // only when it killed the container, in which case the reap/SLA checks
-    // below have nothing left to decide this tick — which is exactly the
-    // `claims()` contract of an exclusive phase.
+    // Runs first: healing beats reaping as idle or waiting out the ceiling.
+    // Returns true only when it acted, per the exclusive-phase `claims()` contract.
     claims: (ctx) =>
       sweepProviderHeal(
         ctx.run,
@@ -1015,17 +784,14 @@ function registerContainerHealthSweepDuties(): void {
     name: id.S14,
     phase: 'session:health',
     order: 40,
-    // 6. Running-container SLA: absolute ceiling + per-claim stuck rules. The
-    // fallthrough — no claims(), so it runs when nothing above it claimed.
+    // The fallthrough: no claims(), so it runs when nothing above claimed.
     run: (ctx) => enforceRunningContainerSla(asSessionContext(ctx)),
   });
 
   registerSlaObservationHook({
     name: id.S16,
     order: 10,
-    // OOM / memory-pressure notice. SLA-only by construction: it is reached only
-    // when the exclusive chain falls through to the SLA branch, and it must see
-    // the same containerState snapshot the decision does.
+    // Reached only on SLA fallthrough; must see the decision's containerState snapshot.
     run: (ctx, state, mailbox) => {
       reportContainerOomTelemetry(mailbox, ctx.session, ctx.agentGroupFolder, state);
     },

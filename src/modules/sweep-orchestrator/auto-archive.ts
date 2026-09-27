@@ -1,13 +1,6 @@
 /**
- * T14 completed-task-auto-archive duty body. Kept in its own file, sibling to index.ts, so
- * the acceptance-case suite (orchestrator.test.ts) can import it directly
- * without pulling in host-sweep.ts's whole registry import graph.
- *
- * Auto-archive completed tasks older than 24h. Failed tasks are excluded
- * deliberately — operator must dismiss them explicitly so they stay
- * visible until acknowledged. No per-row SSE emit: the volume is "every
- * `done` card from yesterday at once," which would flood the bus; the
- * next dashboard list refresh picks the change up naturally.
+ * Failed tasks are excluded so they stay visible until an operator dismisses
+ * them. No per-row SSE emit: a whole day of cards at once would flood the bus.
  */
 import { log } from '../../log.js';
 import { autoArchiveCompletedBefore } from '../orchestrator-dispatch/db/tasks.js';

@@ -1,18 +1,7 @@
 /**
- * Pure ceiling-follow-up decision.
- *
- * Deliberately split out of `index.ts`: `src/host-restart-warn.ts` imports
- * `decideCeilingFollowUp` from `src/host-sweep.js` and that import path is
- * outside this PR's ownership, so `host-sweep.ts` must re-export the symbol
- * from here. `index.ts` cannot be that source — it calls
- * `registerSweepDutySource` at module eval, and a re-export from
- * `host-sweep.ts` would put that side effect inside `host-sweep.ts`'s own
- * dependency cycle, where the registry's module-level `const`s are still in
- * their temporal dead zone. This file has no top-level side effect and reads
- * nothing from `host-sweep.ts` until call time, so the cycle is inert in
- * either evaluation order.
- *
- * Body moved from `src/host-sweep.ts` UNCHANGED.
+ * Kept free of top-level side effects and of eager reads from host-sweep.ts:
+ * host-sweep.ts re-exports this, and index.ts's import-time registration would
+ * run inside host-sweep's import cycle while its registry consts are in TDZ.
  */
 import { WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
@@ -27,25 +16,17 @@ export function decideCeilingFollowUp(args: {
   priorToolAttempts: number;
   now: number;
   /**
-   * The ceiling that actually fired for this kill (decideStuckAction's
-   * `ceilingMs`, itself widened by a declared Bash/CodexItem timeout). Supply
-   * it ONLY from the kill path: it buys the tool-freshness bound one extra
-   * sweep interval of detection lag. Callers that ask "is a tool in flight
-   * right now" rather than "what did this kill interrupt" — host-restart-warn
-   * runs against live state with no sweep lag — omit it and keep the plain
-   * ABSOLUTE_CEILING_MS freshness window.
+   * The ceiling that actually fired; supply it ONLY from the kill path (it adds
+   * one sweep interval of detection lag). Live-state callers omit it.
    */
   ceilingMs?: number;
 }): CeilingFollowUp {
   if (args.hasContinuation) return { action: 'wake-accountable', reason: 'continuation' };
   if (!args.currentTool || !args.toolStartedAt) return { action: 'none' };
   const startedAt = parseSqliteUtc(args.toolStartedAt);
-  // Bound against the ceiling that actually fired, plus one sweep interval of
-  // detection lag. Bounding against ABSOLUTE_CEILING_MS made this branch
-  // unreachable: starting a tool emits a provider event, which touches the
-  // heartbeat, so at kill time the tool's age is always at
-  // least the heartbeat age that just exceeded the ceiling. Every genuinely
-  // wedged tool was killed and then went dark with no accountability wake.
+  // Bound against the ceiling that fired plus one sweep of lag: bounding
+  // against ABSOLUTE_CEILING_MS alone made this branch unreachable, since a
+  // tool's age at kill time is always at least the heartbeat age.
   const maxToolAgeMs =
     args.ceilingMs === undefined
       ? ABSOLUTE_CEILING_MS
