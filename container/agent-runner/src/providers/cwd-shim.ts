@@ -24,9 +24,7 @@ export function cwdWrappedArgv(cwd: string, command: string, args: string[]): st
 }
 
 export function shimCwd(config: McpServerConfig): McpServerConfig {
-  // The fork's McpServerConfig carries a third `sse` arm upstream doesn't have
-  // (deprecated transport, rejected host-side at parseMcpServerConfig) —
-  // excluded here purely to narrow the type; it can never reach this call.
+  // `sse` is excluded only to narrow the type: it is rejected host-side and never reaches here.
   if (config.type === 'http' || config.type === 'sse' || !config.cwd) return config;
   const { cwd, ...server } = config;
   const [command, ...args] = cwdWrappedArgv(cwd, config.command, config.args ?? []);
