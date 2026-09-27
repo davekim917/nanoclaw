@@ -1,19 +1,9 @@
-/**
- * Fork inbound selection — the two-window bounded pending query, recall-unit
- * atomicity, ack/response idempotency and the repository-fence gate.
- *
- * Moved verbatim from db/messages-in.ts, which is now upstream's thin compat
- * shim. `limit` replaces the internal maxMessagesPerPrompt read so the value
- * arrives through upstream's MailboxOperations.getPendingMessages(limit, …)
- * contract; the compat shim passes exactly the same number.
- */
+/** Fork inbound selection; `limit` arrives through upstream's MailboxOperations.getPendingMessages(limit, …) contract. */
 import { getOutboundDb, openInboundDb } from '../../mailbox/sqlite/connection.js';
 import { isClearCommand } from '../../formatter.js';
 import type { MessageInRow } from '../../db/messages-in.js';
 
-// Cache whether inbound.db has the on_wake column (added in v2.0.48).
-// The container opens inbound.db read-only, so it can't ALTER —
-// gracefully degrade when running against an older session DB.
+// inbound.db is opened read-only, so an older session DB without on_wake degrades instead of ALTERing.
 let _hasOnWake: boolean | null = null;
 function hasOnWakeColumn(db: ReturnType<typeof openInboundDb>): boolean {
   if (_hasOnWake !== null) return _hasOnWake;
@@ -24,10 +14,7 @@ function hasOnWakeColumn(db: ReturnType<typeof openInboundDb>): boolean {
   return _hasOnWake;
 }
 
-// Parse the two timestamp shapes that live in the session DBs into epoch ms.
-// SQLite's datetime('now') yields 'YYYY-MM-DD HH:MM:SS' — UTC but with no
-// zone marker, which Date.parse would read as LOCAL time. scheduleTask writes
-// ISO 'YYYY-MM-DDTHH:MM:SS.SSSZ'. Normalize to explicit-UTC before parsing.
+// datetime('now') values are UTC without a zone marker, which Date.parse reads as LOCAL: normalize first.
 function parseDbUtc(value: string): number {
   let s = value.includes('T') ? value : value.replace(' ', 'T');
   if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s)) s += 'Z';
@@ -48,9 +35,8 @@ function activeRepositoryMountBarrier(db: ReturnType<typeof openInboundDb>): str
       .get() as { epoch: string; generation: string } | undefined;
     return row ? JSON.stringify([row.epoch, row.generation]) : null;
   } catch (error) {
-    // A pre-fence session DB cannot contain an active barrier. The host's
-    // activation path migrates the DB before publishing one, so every real
-    // barrier is visible here. Other read failures remain fail-closed.
+    // A pre-fence session DB cannot hold an active barrier (the host migrates before publishing one); other read
+    // failures stay fail-closed.
     if (error instanceof Error && /no such table: repo_ingress_fence/i.test(error.message)) return null;
     throw error;
   }
@@ -67,14 +53,8 @@ export function getActiveRepositoryMountBarrier(): string | null {
 }
 
 /**
- * The token the admission gate read at this poll tick's boundary
- * (`modules/mailbox/admission.ts`), consumed by the selection below so a fenced
- * poll opens `inbound.db` once instead of twice.
- *
- * Only an ACTIVE token short-circuits. A memoized `null` still lets the
- * selection do its own read, so a fence that commits between the boundary and
- * the selection is still seen — the memo can only hold rows back for one extra
- * tick, never release them early. `initTestSessionDb()` clears it.
+ * The admission gate's boundary read, consumed here to save a second open. Only an ACTIVE token
+ * short-circuits: a memoized null still reads, so the memo can hold rows back one tick, never release early.
  */
 let tickBarrier: string | null | undefined;
 
@@ -114,14 +94,8 @@ function deferredRecallTargetId(m: MessageInRow): string | null {
 }
 
 /**
- * Keep recall-enabled batches atomic in both cold-start and in-turn paths.
- *
- * A standalone harness or pre-workgroup batch with no valid recall pair keeps
- * its legacy trigger behavior. A real workgroup runtime is always
- * recall-enabled (NANOCLAW_WORKGROUP_ID is trusted host configuration), so
- * every admissible trigger must have its own recall partner even when the
- * entire observed batch is damaged. Accumulated context and /clear are not
- * recall-bearing triggers.
+ * Keep recall-enabled batches atomic. A real workgroup runtime is always recall-enabled, so every admissible
+ * trigger must have its recall partner; a harness batch with no valid pair keeps legacy behavior.
  */
 export function retainCompleteRecallUnits(rows: MessageInRow[]): MessageInRow[] {
   const ids = new Set(rows.map((row) => row.id));
@@ -145,40 +119,25 @@ export function retainCompleteRecallUnits(rows: MessageInRow[]): MessageInRow[] 
 }
 
 /**
- * Fetch pending messages that are due for processing.
- * Reads from inbound.db (read-only), filters against processing_ack in outbound.db
- * to skip messages already picked up by this or a previous container run.
- *
- * Returns the most recent `limit` logical trigger units in chronological
- * order. A host-injected `recall-<X>` row and its target `<X>` are one unit,
- * so a prompt boundary can never split the pair. Accumulated context
- * (trigger=0) still rides along with wake-eligible rows. Host's
- * countDueMessages gates waking on trigger=1 separately (see
- * src/db/session-db.ts).
+ * Most recent `limit` logical trigger units, chronological, excluding rows acked in outbound.db. A
+ * `recall-<X>` row and `<X>` are one unit, so a prompt boundary never splits the pair.
  */
 export function selectPendingRows(
   limit: number,
   isFirstPoll: boolean,
   diagnostics?: PendingSelectionDiagnostics,
 ): MessageInRow[] {
-  // The admission gate already read the fence at this tick's boundary — an
-  // active token short-circuits before the open (see setTickRepositoryBarrier).
   if (takeTickRepositoryBarrier()) return [];
   const inbound = openInboundDb();
   const outbound = getOutboundDb();
 
   try {
-    // Host publication/transfer activates this fence before quiescence. Do
-    // not even materialize accumulated trigger=0 context while it is active:
-    // the caller must reach the explicit poll-boundary acknowledgement first.
+    // While the host's fence is active, materialize nothing: the caller must reach the poll-boundary ack first.
     if (activeRepositoryMountBarrier(inbound) !== null) return [];
     const maxUnits = Math.max(1, Math.floor(limit));
     const recentLimit = maxUnits * 4 + 8;
     const wakeLimit = maxUnits + 2;
-    // One extra exact bootstrap lookup ensures a cold burst larger than the
-    // prompt limit cannot strand the only once-per-context capability/index
-    // pair outside the recent window. Its target is covered by the bounded
-    // partner query below.
+    // +2: an exact bootstrap lookup, so a cold burst can't strand the once-per-context capability/index pair.
     const inboundRowBudget = 2 * (recentLimit + wakeLimit) + 2;
     if (diagnostics) {
       diagnostics.inboundRowsRead = 0;
@@ -199,11 +158,8 @@ export function selectPendingRows(
       )
       .all(recentLimit) as MessageInRow[];
 
-    // A long trigger=0 tail can fill the recent window while an older task or
-    // mention is the row that actually woke the container. Fetch a separately
-    // bounded wake window so that tail cannot suppress every due trigger.
-    // More than one row is intentional: recently completed rows can remain
-    // pending in inbound.db until the host syncs processing_ack.
+    // Separately bounded wake window: a long trigger=0 tail must not suppress an older due trigger. More than one
+    // row because completed rows can stay pending until the host syncs processing_ack.
     const wakes = inbound
       .prepare(
         `SELECT * FROM messages_in
@@ -234,9 +190,7 @@ export function selectPendingRows(
     const candidateById = new Map<string, MessageInRow>();
     for (const row of [...recent, ...wakes, ...(bootstrap ? [bootstrap] : [])]) candidateById.set(row.id, row);
 
-    // Complete any recall pair split by either bounded window. Each candidate
-    // requests at most one exact partner id, so this query can materialize no
-    // more rows than the two initial windows combined.
+    // Complete recall pairs split by either window; at most one exact partner per candidate.
     const partnerIds = new Set<string>();
     for (const row of candidateById.values()) {
       const targetId = recallTargetId(row);
@@ -264,12 +218,8 @@ export function selectPendingRows(
       const byTimestamp = parseDbUtc(b.timestamp) - parseDbUtc(a.timestamp);
       return byTimestamp !== 0 ? byTimestamp : b.id.localeCompare(a.id);
     });
-    // Deferred host wakes are stored as trigger=0 chat plus a paired marker.
-    // Once due, a concurrent real inbound can wake a warm/fresh container
-    // before the host sweep replaces that marker with fresh recall. Hide both
-    // rows here so neither outer-turn nor in-turn admission can claim the wake
-    // as ordinary accumulated context. The exact-partner query above ensures
-    // that seeing either half is enough to identify and remove the full pair.
+    // Hide a due deferred wake and its marker until the host sweep replaces the marker with fresh recall, so no
+    // admission path claims it as ordinary context. Seeing either half identifies the pair.
     const deferredTargetIds = new Set(pending.map(deferredRecallTargetId).filter((id): id is string => id !== null));
     const visiblePending = pending.filter(
       (row) => deferredRecallTargetId(row) === null && !deferredTargetIds.has(row.id),
@@ -279,7 +229,6 @@ export function selectPendingRows(
     const candidateIds = visiblePending.map((row) => row.id);
     const candidatePlaceholders = candidateIds.map(() => '?').join(', ');
 
-    // Filter out messages already acknowledged in outbound.db
     const ackedAt = new Map(
       (
         outbound
@@ -292,21 +241,9 @@ export function selectPendingRows(
       ).map((row) => [row.message_id, parseDbUtc(row.status_changed)] as const),
     );
 
-    // Idempotency guard: a message that already has a real response in
-    // messages_out has been handled — even if processing_ack was wiped by
-    // clearStaleProcessingAcks or messages_in.status never got synced to
-    // 'completed' because the previous container died between writing
-    // messages_out and calling markCompleted. Progress/status rows are not
-    // answers; a restart after a thinking update must still retry the input.
-    //
-    // Due-aware refinement (2026-06-10): a reply can never precede its
-    // question. resolveDestinationThread used to stamp destination sends with
-    // in_reply_to = the NEWEST inbound row of the channel, so a task turn's
-    // output could claim to "answer" a sibling task's future, not-yet-due
-    // fire row — permanently suppressing that series (the row stays pending,
-    // recurrence never advances). Only honor a reply as the answer to a row
-    // if it was written at/after the row became due (process_after). Rows
-    // without process_after (chat) keep the original any-reply semantics.
+    // Idempotency: a row with a real response in messages_out is handled even if processing_ack was lost. Progress
+    // rows are not answers. A reply counts only if written at/after the row became due (process_after): a task's
+    // output must not "answer" a sibling's not-yet-due fire row and stall that series.
     const respondedAt = new Map<string, number>();
     for (const r of outbound
       .prepare(
@@ -338,21 +275,8 @@ export function selectPendingRows(
       return ts >= parseDbUtc(row.process_after);
     };
 
-    // Orphan recall_context drain: a `recall-<X>` row is paired to inbound
-    // row `<X>` by the host's recall-injection (it strips the prefix to
-    // pair). When `<X>` finishes (status='completed' in processing_ack, or
-    // a messages_out row exists) but `recall-<X>` was never claimed —
-    // happens when X is a /clear command (handled+completed inline in
-    // poll-loop) or a task gated by pre-task script — the orphan
-    // recall sits pending. Without this filter, the cold-start path's
-    // accept-any-recall_context filter would later turn the orphan into a
-    // standalone structured recall payload with no user message; the in-turn
-    // helper drops it but it stays pending forever and gets
-    // re-evaluated every poll. Drop it here so both paths see a clean view.
-    // First remove completed rows, then retain a recall row only when its
-    // target is also present in the same eligible snapshot. This drains
-    // completed-trigger orphans and also prevents a recall for a not-yet-due
-    // target from being promoted into a standalone prompt.
+    // Drop completed rows, then keep a recall row only when its target is in the same eligible snapshot: an orphan
+    // `recall-<X>` (e.g. X was /clear) would otherwise become a standalone prompt or stay pending forever.
     const eligible = visiblePending.filter((m) => !isAcked(m.id) && !isResponded(m.id));
     const paired = retainCompleteRecallUnits(eligible);
 
@@ -379,10 +303,7 @@ export function selectPendingRows(
       selectedSet.add(key);
     }
 
-    // The host emits the full capabilities/index bootstrap once per provider
-    // context. Retain that logical unit even when a cold burst exceeds the
-    // normal newest-unit limit; otherwise the first provider prompt could be
-    // fresh but under-informed.
+    // Always retain the once-per-context bootstrap unit, even past the unit limit.
     const bootstrapRow = paired.find((row) => {
       if (row.kind !== 'system') return false;
       try {
@@ -402,9 +323,7 @@ export function selectPendingRows(
       protectedKeys.add(bootstrapKey);
     }
 
-    // A large tail of trigger=0 context must not hide an older row that just
-    // became due. Keep one real wake unit in the bounded selection whenever
-    // the eligible snapshot contains one.
+    // Keep one real wake unit whenever the snapshot has one: trigger=0 context must not hide a due row.
     if (!paired.some((m) => selectedSet.has(unitKey(m)) && m.trigger === 1 && m.kind !== 'system')) {
       const newestWake = paired.find((m) => m.trigger === 1 && m.kind !== 'system');
       if (newestWake) {
@@ -426,17 +345,8 @@ export type TurnTrigger = 'human' | 'agent' | 'scheduled' | 'continuation' | 'on
 const CEILING_RESPAWN_ID_PREFIX = 'ceiling-respawn-';
 
 /**
- * Host-authored notices (ceiling-kill accountability, host-restart warnings,
- * provider-heal, self-mod on_wake, create-agent notices — see
- * src/host-sweep.ts, src/host-restart-warn.ts, src/modules/self-mod/apply.ts,
- * src/modules/agent-to-agent/create-agent.ts) all share one content
- * convention: `senderId: 'system'` (src/caller-identity.ts documents the
- * same marker for the same reason). That convention, not channel_type, is
- * the real signal — a genuine agent-to-agent message (agent-route.ts) is
- * ALSO written with channel_type='agent', since that's how the host marks
- * "this row is agent-routed, not from a real external channel" for both
- * cases. Checking channel_type first would misclassify every host notice as
- * `agent`.
+ * Host-authored notices are marked by `senderId: 'system'`, not channel_type: genuine agent-to-agent messages
+ * also carry channel_type='agent'.
  */
 function isSystemAuthored(m: MessageInRow): boolean {
   try {
@@ -448,16 +358,8 @@ function isSystemAuthored(m: MessageInRow): boolean {
 }
 
 /**
- * Classify what caused a turn, from the batch of MessageInRow about to reach
- * the provider. `ceiling_respawn` gets its own bucket (not folded into
- * `on_wake`) because those turns are dominated by "recover from a mid-work
- * kill" rather than ordinary work — the two have different cost shapes.
- * Every other host notice (host-restart, provider-heal, self-mod, create-agent)
- * collapses into `on_wake`: nothing here distinguishes them further, and
- * guessing a split the data can't support would be worse than merging.
- * `continuation` (a durable `continue_work` resume) is NOT classified here:
- * that call site has no representative inbound row to classify (the resumed
- * task's original trigger predates this turn), so poll-loop.ts hardcodes it.
+ * `ceiling_respawn` has its own bucket (recovery turns cost differently); other host notices collapse into
+ * `on_wake`. `continuation` is hardcoded by poll-loop.ts, which has no representative row.
  */
 export function classifyTrigger(rows: MessageInRow[]): TurnTrigger {
   if (rows.some(isSystemAuthored)) {
@@ -469,12 +371,7 @@ export function classifyTrigger(rows: MessageInRow[]): TurnTrigger {
   return 'unknown';
 }
 
-/**
- * Return an admitted batch to pending ownership without completing it.
- * Used when a host repository fence becomes visible between a failed provider
- * turn and an in-turn recovery: the fresh post-transition container must retry
- * the original inbound instead of losing it or deadlocking on a stale claim.
- */
+/** Return an admitted batch to pending without completing it, so a post-fence container retries it. */
 export function releaseProcessingClaims(ids: string[]): void {
   if (ids.length === 0) return;
   const db = getOutboundDb();

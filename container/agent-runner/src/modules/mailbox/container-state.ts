@@ -1,12 +1,4 @@
-/**
- * Fork-only container_state writes: provider health, the provider_executing
- * busy flag, memory telemetry, and the wider startup reset. Everything except
- * the busy flag moved verbatim from db/connection.ts.
- *
- * The four tool-in-flight columns and their UPSERT are upstream's
- * (mailbox/sqlite/connection.ts) and are NOT re-implemented here — the fork's
- * SQL for those was already byte-equivalent.
- */
+/** Fork-only container_state writes. The four tool-in-flight columns and their UPSERT are upstream's (mailbox/sqlite/connection.ts). */
 import type { Database } from 'bun:sqlite';
 
 import { getOutboundDb, sqliteClearContainerToolInFlight } from '../../mailbox/sqlite/connection.js';
@@ -65,45 +57,13 @@ export function clearProviderHealthState(outbound: Database = getOutboundDb()): 
   );
 }
 
-/* ─── provider_executing ───────────────────────────────────────────────────── */
-
 /**
- * Publish "this container is doing work right now" for the host's idle
- * reapers (`shouldReapIdleTaskContainer` in src/host-sweep.ts).
+ * Publish "busy right now" for the host's idle reapers, which otherwise see nothing during runner-driven work
+ * (pre-task scripts, pushed follow-up and continuation turns hold no claim) and kill the container mid-work.
  *
- * The reapers otherwise infer busy-ness from state the HOST can see: a due
- * inbound row, a `processing` claim in processing_ack, a work_continuation
- * record. All three are absent during work the runner drives on its own
- * behalf — a pre-task script batch (up to NANOCLAW_TASK_SCRIPT_TIMEOUT_MS,
- * 120s by default) runs before the batch is claimed; a pushed follow-up turn
- * and a durable-continuation turn both run after the initial batch was
- * completed at the previous `result`, so they hold no claim at all. In those
- * windows every term the task reaper looks at reads "idle" and the container
- * is killed mid-work.
- *
- * TWO busy scopes share the one published bit, and they are tracked
- * separately because they overlap and have different shapes:
- *
- *   - **the provider turn** — a LEVEL, not a nesting scope. It is raised by
- *     the prompt that starts a turn (the initial one, every pushToQuery) and
- *     lowered by the `result` that ends one, which are not balanced: two
- *     nudges can be pushed before a single result. The flag tracks turns and
- *     NOT stream lifetime, because a multi-turn stream stays open after
- *     `result` to accept pushes — holding the bit for the whole stream would
- *     pin it through the container's entire idle stretch and defeat the
- *     reaper. One exception holds it past `result`: a provider reporting live
- *     background work (`AgentQuery.hasBackgroundWork` — a subagent launched
- *     with `run_in_background` keeps running inside the CLI after the parent
- *     turn ends). The poll-loop lowers the level when that work drains
- *     (`background_work` event) or at the follow-up turn's own `result`.
- *   - **bracketed windows outside a turn** — the pre-task script batch, the
- *     turn-end git checkpoint. These nest, so they are counted.
- *
- * The active poll callback runs pre-task scripts CONCURRENTLY with a provider
- * turn, so one boolean cannot serve both: the script's exit would clear the
- * running turn's bit, and a `result` landing mid-script would clear the
- * script's. Publishing `turn || scopes > 0` is what makes either scope safe to
- * end while the other is still live.
+ * Two scopes share the bit: the provider turn is a LEVEL (raised by each prompt, lowered by `result`, NOT held
+ * for the stream's lifetime, except while the provider reports background work); bracketed windows outside a
+ * turn nest and are counted. Pre-task scripts run concurrently with a turn, so the bit is `turn || scopes > 0`.
  */
 let turnExecuting = false;
 let busyScopeDepth = 0;
@@ -138,17 +98,12 @@ export function beginProviderBusyScope(outbound: Database = getOutboundDb()): vo
   publishProviderExecuting(outbound);
 }
 
-/** Leave a bracketed busy window. */
 export function endProviderBusyScope(outbound: Database = getOutboundDb()): void {
   if (busyScopeDepth > 0) busyScopeDepth -= 1;
   publishProviderExecuting(outbound);
 }
 
-/**
- * Zero both scopes without touching the DB. The test harness calls this so
- * module-level scope state cannot leak between tests; production always goes
- * through `resetProviderExecuting`, which also publishes.
- */
+/** Zero both scopes without a DB write (test harness); production uses `resetProviderExecuting`. */
 export function resetProviderExecutingScopes(): void {
   turnExecuting = false;
   busyScopeDepth = 0;
@@ -160,19 +115,9 @@ export function resetProviderExecuting(outbound: Database = getOutboundDb()): vo
   publishProviderExecuting(outbound);
 }
 
-/* ─── provider_query_event_at ──────────────────────────────────────────────── */
-
 /**
- * When the CURRENT query's provider first emitted an event; NULL until it has,
- * and NULL between queries. The host sweep reads it to tell a turn that is
- * alive but quiet (a long think: the model is generating and, with no partial
- * messages, emits nothing) from one hung at the gate (the query started and
- * the provider never produced anything). Only the second may be killed for an
- * aged claim; see `decideStuckAction` (src/modules/sweep-container-health/index.ts).
- *
- * Written at most twice per query — reset at the start, stamped on the first
- * event — so it costs one DB write per query, not one per event. The heartbeat
- * stays a file touch.
+ * When the current query first emitted a provider event (NULL until then and between queries). The host tells a
+ * quiet-but-alive turn from one hung at the gate with it; only the latter may be killed. At most two writes per query.
  */
 let queryEventStamped = false;
 
@@ -201,23 +146,15 @@ export function markProviderQueryEvent(outbound: Database = getOutboundDb()): vo
   queryEventStamped = true;
 }
 
-/**
- * Clear stale processing state on container startup. If the previous
- * container crashed, processing acks and its host-visible in-flight operation
- * are leftover. Clearing both lets the new container start with a clean SLA.
- */
+/** Clear the previous container's leftover processing acks and in-flight operation on startup. */
 export function clearStaleProcessingAcks(): void {
   getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
   sqliteClearContainerToolInFlight();
   clearProviderHealthState();
-  // A query the previous container was running when it died cannot NULL its
-  // own stamp, and a leftover one would read as "this query is alive" to the
-  // host's claim rule.
+  // A dead container's query stamp would read as "alive" to the host's claim rule.
   resetProviderQueryEvent();
-  // A container killed mid-work cannot run its own `finally`, so the flag can
-  // survive in outbound.db. Clearing it here — the fresh container's startup,
-  // before its first poll — means a leaked 1 can never make the NEXT container
-  // unreapable.
+  // A killed container can't run its `finally`: clear a leaked busy flag before the first poll so the next
+  // container stays reapable.
   resetProviderExecuting();
 }
 

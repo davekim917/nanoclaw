@@ -1,23 +1,7 @@
-/**
- * Fork-only session_routing reads. `getSessionRouting`/`getTaskSeriesId` are
- * upstream's (db/session-routing.ts); the two columns below are the fork's
- * spawned-session identity, written by the host's applySpawnTask.
- */
+/** Fork-only session_routing reads: the spawned-session identity written by the host's applySpawnTask. */
 import { getInboundDb } from '../../mailbox/sqlite/connection.js';
 
-/**
- * Returns the spawn task_id for this session if it is a child of an
- * orchestrator's spawn, or null if it is a plain (non-spawned) session.
- *
- * Reads `spawn_task_id` from inbound.db's `session_routing` table.
- * The host writes this column via applySpawnTask when launching a child
- * session for a spawned task.
- *
- * Returns null when:
- * - No session_routing row exists (before first host wake)
- * - The column value is NULL (non-spawned session)
- * - The column doesn't exist (legacy session DB pre-migration)
- */
+/** The spawn task_id when this is an orchestrator's child session; null otherwise, including legacy DBs without the column. */
 export function getSessionSpawnTaskId(): string | null {
   const db = getInboundDb();
   try {
@@ -31,15 +15,7 @@ export function getSessionSpawnTaskId(): string | null {
   }
 }
 
-/**
- * Returns this session's own ID, or null if the host hasn't written it yet
- * or the session_routing table doesn't have a session_id column (legacy).
- *
- * The host writes `session_id` into session_routing when writing the
- * spawn_task_id (applySpawnTask). Non-spawned sessions and legacy sessions
- * return null; callers degrade gracefully (e.g., list_spawned_tasks returns
- * an empty list when session_id is null).
- */
+/** This session's id, or null (not written yet, non-spawned, or legacy); callers degrade gracefully. */
 export function getSessionId(): string | null {
   const db = getInboundDb();
   try {
