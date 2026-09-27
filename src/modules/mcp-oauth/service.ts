@@ -851,8 +851,9 @@ export interface RefreshOutcome {
 
 /**
  * Refresh every integration inside its margin, once per sweep tick. A token
- * failure leaves the row in `error` and the loop continues; an unreadable
- * bundle throws out of the whole pass.
+ * failure leaves the row in `error` (transient) or `needs_login` (dead grant or
+ * rejected client) and the loop continues; an unreadable bundle throws out of
+ * the whole pass.
  */
 export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike = fetch): Promise<RefreshOutcome> {
   const rows = await listMcpOAuthIntegrations();
