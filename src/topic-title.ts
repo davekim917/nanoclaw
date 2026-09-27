@@ -1,25 +1,6 @@
 /**
- * Topic-title generation for auto-created threads (Phase 5.11).
- *
- * v2's Chat SDK Discord adapter auto-creates a thread on every new
- * top-level @mention. The default title is a generic Slack-style
- * stamp ("thread created 4/17 8pm"), which makes thread archaeology
- * painful. This module:
- *
- *  1. Generates a 2–5 word topic title from the inbound message via
- *     Haiku.
- *  2. Renames the freshly-created thread via a direct Discord REST
- *     PATCH (the @chat-adapter/discord surface doesn't expose a
- *     rename helper, so we go to the REST endpoint directly — this
- *     is intentionally narrow and fits v2's "fit-into, don't
- *     rebuild-v1" principle).
- *
- * Fire-and-forget from the router: never blocks inbound processing,
- * never errors user-visibly. Failures log and move on.
- *
- * Durable state lives in the central `thread_titles` table (migration 062,
- * src/db/thread-titles.ts) — see `maybeRenameNewThread` below for why an
- * in-process Set alone was not enough.
+ * Haiku-generated titles for Discord threads the adapter auto-creates, applied by REST PATCH (the adapter has no
+ * rename helper). Fire-and-forget from the router. Durable state is the `thread_titles` table.
  */
 import { callHaiku } from './llm.js';
 import { log } from './log.js';
@@ -35,22 +16,12 @@ import {
 const MAX_TITLE_LENGTH = 100; // Discord's thread-name limit is 100 chars
 const TITLE_PROMPT_CAP = 500; // Truncate input to keep Haiku latency low
 
-// Retry sweep tuning (see retryPendingThreadTitles, called from host-sweep.ts).
 const RETRY_MAX_ATTEMPTS = 5;
 const RETRY_WINDOW_HOURS = 24;
-// Dropped from 3 to 1 alongside src/llm.ts's global credential-rotation gate:
-// this retry step, session-title-sweep's up-to-3-concurrent batch, and any
-// live maybeRenameNewThread all used to fire together on the same 60s tick,
-// bursting enough short-window requests to trip per-account rate limits on
-// otherwise-healthy credentials (see llm.ts's withCredentialRotationGate doc
-// comment). One title per minute still drains a backlog quickly, and the
-// gate means concurrency here wouldn't buy real throughput anyway.
+// One per tick: bursts with the other title sweeps tripped per-account rate limits on healthy credentials.
 const RETRY_BATCH_CAP = 1;
 
-/**
- * Generate a short topic title from a message. Returns undefined on
- * failure — caller should just skip the rename in that case.
- */
+/** Undefined on failure: skip the rename. */
 export async function generateTopicTitle(messageText: string): Promise<string | undefined> {
   const cleaned = messageText.replace(/@\w+\s*/g, '').trim();
   if (!cleaned) return undefined;
@@ -62,23 +33,14 @@ export async function generateTopicTitle(messageText: string): Promise<string | 
     const title = raw.replace(/\*+/g, '').trim().slice(0, MAX_TITLE_LENGTH);
     return title || undefined;
   } catch (err) {
-    // callHaiku attaches the subprocess stderr to err.stderr (see llm.ts),
-    // but the default JSON serializer of Error doesn't pick up custom props,
-    // so surface it explicitly. Without this, every "Topic title generation
-    // failed" warn looks like "Command failed: claude -p ..." with no clue
-    // why claude actually exited non-zero (auth, timeout, rate limit, etc.).
+    // Error serialization drops custom props, so surface callHaiku's stderr explicitly.
     const stderr = (err as { stderr?: string }).stderr;
     log.warn('Topic title generation failed', { err, stderr });
     return undefined;
   }
 }
 
-/**
- * Rename a Discord thread via REST. `threadPlatformId` is the bridge-
- * encoded form (e.g. "discord:guildId:channelId:threadId") — we peel
- * off the bare thread ID (last segment) since Discord's REST endpoint
- * just wants that.
- */
+/** `threadPlatformId` is bridge-encoded ("discord:guildId:channelId:threadId"); REST wants the last segment. */
 async function renameDiscordThread(threadPlatformId: string, newName: string, botToken: string): Promise<boolean> {
   const parts = threadPlatformId.split(':');
   const threadId = parts[parts.length - 1];
@@ -107,15 +69,8 @@ async function renameDiscordThread(threadPlatformId: string, newName: string, bo
 }
 
 /**
- * Resolve the bot token for a Discord channelType. Mirrors the round-trip
- * `discord.ts`'s `parseDiscordWorkspaces` uses when building channelTypes
- * from env vars: bare `discord` → `DISCORD_BOT_TOKEN`; `discord-<suffix>` →
- * `DISCORD_BOT_TOKEN_<SUFFIX>` where SUFFIX is the channelType's suffix
- * upper-cased with `-` swapped back to `_` (the exact inverse of
- * `rawSuffix.toLowerCase().replace(/_/g, '-')` in discord.ts).
- *
- * Falls back to the primary bot token when a sibling-specific one is absent
- * (misconfiguration) rather than silently no-op-ing the whole rename.
+ * Inverse of discord.ts's channelType-from-env mapping (`discord-<suffix>` → `DISCORD_BOT_TOKEN_<SUFFIX>`).
+ * Falls back to the primary token rather than silently no-op-ing the rename.
  */
 function resolveDiscordBotToken(channelType: string): string | undefined {
   const primary = process.env.DISCORD_BOT_TOKEN;
@@ -126,15 +81,7 @@ function resolveDiscordBotToken(channelType: string): string | undefined {
   return process.env[envVar] || primary;
 }
 
-/**
- * Generate a title and apply it via REST, then persist the outcome to
- * `thread_titles`. Shared by the real-time path (`maybeRenameNewThread`)
- * and the host-sweep retry step (`retryPendingThreadTitles`) so both use
- * IDENTICAL rename + bookkeeping logic — a retry must never diverge from
- * what the original attempt would have done.
- *
- * Returns true on a confirmed rename.
- */
+/** Shared by the live path and the retry sweep so a retry never diverges. True on a confirmed rename. */
 async function attemptThreadTitle(
   threadPlatformId: string,
   channelType: string,
@@ -170,34 +117,10 @@ async function attemptThreadTitle(
   }
 }
 
-/**
- * Fire-and-forget: generate a title for the first message in a
- * freshly-created thread and rename the thread. Only runs when the
- * channel is Discord and `sessionCreated` is true (meaning this is
- * the first message in this thread from v2's perspective).
- *
- * Call from the router after `resolveSession` returns `created=true`.
- * Does not await internally — returns an already-scheduled promise so
- * the router can continue without blocking.
- */
-// Synchronous, in-process race-claim ONLY — dedupes concurrent siblings that
-// land here in the same tick of the same process (e.g. two @-mentioned
-// siblings both engaging the same opening message: both would hit this
-// function, and the LAST to finish would clobber the first's title, plus
-// double the PATCH volume into Discord's tight rename rate limit). This Set
-// is reset on every host restart and knows nothing about session archival —
-// it is NOT the idempotency guard. The `thread_titles` DB row (checked at
-// the top of maybeRenameNewThread) is the durable, cross-restart,
-// cross-archival answer: once a row has a non-NULL title, this function
-// returns immediately regardless of what's in this Set.
-//
-// ponytail: unbounded Set, one short string per thread ever titled in this
-// process's lifetime. At this install's volume (~hundreds) it's negligible;
-// add an LRU cap only if a host ever titles millions of threads without
-// restarting.
+// In-process race claim only (concurrent siblings engaging one opener); the `thread_titles` row is the durable
+// idempotency guard.
 const renamedThreads = new Set<string>();
 
-/** Test-only: clear the in-process race-claim set to simulate a fresh host process. */
 export function _resetRenamedThreadsForTest(): void {
   renamedThreads.clear();
 }
@@ -209,31 +132,13 @@ export async function maybeRenameNewThread(
   inboundMessageId: string,
 ): Promise<void> {
   if (!threadPlatformId) return;
-  // Only Discord for now. Slack creates threads from the parent
-  // message's ts (no rename possible without message edit). Telegram
-  // is threadless. Others: add when they ship.
   if (!channelType.startsWith('discord')) return;
 
-  // Title only a thread that THIS message opened. A thread started from a
-  // message shares that message's snowflake (see installMessageThreadAutoCreate
-  // in src/channels/discord.ts), so the adapter's auto-thread on a root
-  // @mention has id === the @mention's id. Every other thread already has a
-  // name someone chose: a bot-opened one (keyed/task/turn anchors, named from
-  // the post's first line by installMessageThreadAutoCreate, or by
-  // discordCreateThread), a user-created one, or one titled before
-  // thread_titles existed. None of those has a thread_titles row, so without
-  // this check the first human reply in them — which creates a session —
-  // retitled the thread from that reply.
+  // Title only a thread THIS message opened (it shares the message's snowflake); every other thread already has
+  // a chosen name and no thread_titles row, so its first reply would otherwise retitle it.
   if (threadPlatformId.split(':').pop() !== inboundMessageId) return;
 
-  // Durable idempotency check FIRST, before any other work: a thread that
-  // already has a title must never be retitled — not across a host restart,
-  // and not when storage-manager archives an idle session and the thread's
-  // next message creates a fresh session row (which re-triggers this
-  // function with `created=true` off a FOLLOW-UP message, not the thread's
-  // original opener). This was the actual regression: the old in-memory-Set-
-  // only guard had no memory of threads titled in a previous process, or
-  // before the current session existed.
+  // Durable check first: an archived session's thread gets a fresh session row off a follow-up message.
   let existing: ThreadTitleRow | undefined;
   try {
     existing = await getThreadTitleRow(threadPlatformId);
@@ -244,17 +149,11 @@ export async function maybeRenameNewThread(
 
   const botToken = resolveDiscordBotToken(channelType);
   if (!botToken) {
-    // Was log.debug — invisible at default log level, which made a
-    // misconfigured per-channel token a silent, permanent no-op.
     log.warn('maybeRenameNewThread: no bot token configured for channel', { channelType });
     return;
   }
 
-  // Claim the thread synchronously BEFORE any await so concurrent siblings
-  // racing through here can't all pass the guard. Released on failure below so
-  // a later call for this thread in this process (e.g. a new session created
-  // on it after archival, if the retry sweep hasn't already caught it) can
-  // retry.
+  // Claimed synchronously before any await so racing siblings can't all pass.
   if (renamedThreads.has(threadPlatformId)) return;
   renamedThreads.add(threadPlatformId);
 
@@ -271,10 +170,6 @@ export async function maybeRenameNewThread(
     try {
       renamed = await attemptThreadTitle(threadPlatformId, channelType, firstMessageText);
     } finally {
-      // Keep the claim only on a confirmed rename. A failed generation or a
-      // rejected PATCH (e.g. 429) releases it so a later call in THIS process
-      // gets another shot; the DB `attempts` counter is the durable failure
-      // record either way.
       if (!renamed) renamedThreads.delete(threadPlatformId);
     }
   })().catch((err) => {
@@ -282,24 +177,10 @@ export async function maybeRenameNewThread(
   });
 }
 
-/**
- * Host-sweep retry step (see src/host-sweep.ts): picks up threads whose
- * titling attempts all failed (e.g. callHaiku's retries exhausted a 429
- * window) and retries from the STORED `first_message` — never a later
- * follow-up, which is the exact bug this whole mechanism exists to fix.
- *
- * Capped at RETRY_BATCH_CAP per tick so a backlog of permanently-broken
- * threads (e.g. a deleted Discord thread) can't itself become a Haiku/
- * Discord-REST quota hog.
- */
-// Re-entrancy guard, same reasoning as session-title-sweep.ts's
-// `sweepInProgress`: this is fired from host-sweep.ts via a non-awaited
-// `void import(...).then(...)`, so a slow tick (network hang) can still be
-// in flight when the next 60s tick fires. Without this, two overlapping
-// calls could pick the SAME candidate rows and double the Haiku + Discord-
-// REST spend for them.
+// Re-entrancy guard: the sweep fires this without awaiting, so a slow tick can overlap the next.
 let _retryInProgress = false;
 
+/** Retries from the STORED `first_message`, never a later follow-up. */
 export async function retryPendingThreadTitles(
   nowIso: string = new Date().toISOString(),
 ): Promise<{ attempted: number; titled: number }> {
@@ -328,9 +209,6 @@ async function _retryPendingThreadTitlesLocked(nowIso: string): Promise<{ attemp
       const renamed = await attemptThreadTitle(row.thread_id, row.channel_type, row.first_message);
       if (renamed) titled++;
     } catch (err) {
-      // attemptThreadTitle already catches internally and records the
-      // failure; this is defense-in-depth so one unexpected throw can't
-      // abandon the rest of the retry batch.
       log.warn('retryPendingThreadTitles: attempt threw unexpectedly', { err, threadId: row.thread_id });
     }
   }

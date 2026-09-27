@@ -1,32 +1,12 @@
 /**
- * "Who's on what right now" — work claims rendered as a board section.
- *
- * Claims are files a sibling agent writes before starting work and deletes on
- * completion (`container/skills/work-claims/`). They already answer the one
- * question a human keeps asking — *is anyone on this, and is that still true?*
- * — but only to whoever reads the directory, which is nobody.
- *
- * This is the read side. It deliberately owns no I/O beyond the directory scan
- * and no staleness rule of its own: `isStalePastGrace` and
- * `ESCALATION_GRACE_MS` come from `modules/claims/escalation.ts`, so the board
- * and the dashboard's `escalated` badge (`dashboard/api/workgroups.ts`) can
- * never disagree about what "stale" means. A third definition living here is
- * exactly how a board starts lying.
- *
- * Rendered into the existing channel canvas rather than a canvas of its own.
- * The board answers "what work exists"; claims answer "who has it". Those are
- * one status board, and a second canvas would be one more place to look — the
- * thing that made the standalone dashboard go unread.
+ * Work claims rendered as a board section. Owns no staleness rule of its own: it uses
+ * `modules/claims/escalation.ts`, so the board and the dashboard's `escalated` badge can't disagree.
  */
 
 import fs from 'fs';
 import path from 'path';
 
 import { TIMEZONE } from './config.js';
-// The one contained-read seam this fork has, reused rather than re-derived.
-// It lives under `dashboard/api/` because that is where the first caller was;
-// it depends on nothing but `fs`, `path` and `log`, so there is no cycle with
-// the dashboard modules that import THIS file.
 import { containedRealpath, readContainedFile } from './dashboard/api/attention-fs.js';
 import { log } from './log.js';
 import {
@@ -60,70 +40,19 @@ function classify(claimedAt: string, ttlHours: number, now: number): { state: Cl
 }
 
 /**
- * The largest number of claim files one read will open.
- *
- * {@link MAX_CLAIM_BYTES} bounds how big each file may be; nothing bounded how
- * MANY there are. `data/workgroups/<id>/claims/` is bind-mounted READ-WRITE at
- * `/workspace/workgroup/claims` into that workgroup's own containers
- * (`container-runner.ts`; `container/skills/work-claims/claim.sh` writes
- * straight into it), so the file COUNT is chosen by an agent — and this whole
- * loop runs synchronously inside the thread-list request
- * (`board-attention.ts` calls `readClaims` on every memo miss), which the
- * dashboard polls continuously from every open viewer. A directory grown to
- * thousands of entries is that many blocking opens and `JSON.parse`s on the
- * host's single event loop, per poll, per viewer.
- *
- * Across this install the busiest claims directory holds 38 files and the next
- * busiest 8. 500 is over thirteen times the busiest, so the cap cannot bite on
- * organic growth — not even on the known pathology of finished claims left
- * undeleted, which is what accumulates here. It bites only on a directory
- * somebody filled, which is exactly when a human should hear about it.
- * Together with the per-file cap it bounds one read at 500 × 64 KiB.
+ * The directory is agent-writable, and this loop runs synchronously on the event loop inside a dashboard poll, so
+ * both the file count and each file's size are capped. 500 is far above organic growth.
  */
 const MAX_CLAIM_FILES = 500;
 
-/**
- * The largest claim file this read will open.
- *
- * Deliberately far tighter than `attention-fs.ts`'s 2 MiB default, because
- * that seam reads a handful of declared files per request and this one reads
- * every file in a directory: what blocks the event loop is count × size. At
- * the default, one directory of 500 files could be a gigabyte of blocking read
- * and parse per poll.
- *
- * A claim is a small JSON record — owner, two timestamps, a TTL, a note. The
- * largest live claim on disk is 2.2 KB, so 64 KiB is ~30x the biggest real one
- * and still leaves room for the paragraphs of handoff detail notes routinely
- * carry. Anything past it is not a claim.
- *
- * Exported so `modules/claims/self-heal.ts` — which re-reads a claim BY SLUG
- * after the board already classified it — reads it at the same cap. Two
- * numbers for one file is exactly the divergence this seam exists to prevent.
- */
+/** Tighter than attention-fs's default because this reads every file in a directory. Shared with self-heal. */
 export const MAX_CLAIM_BYTES = 64 * 1024;
 
-/**
- * `entries` least-recently-touched first.
- *
- * Only called when the count cap bites, and the order matters precisely then:
- * `readdirSync` hands back whatever the filesystem stored, so slicing it
- * unordered would drop an ARBITRARY set. The board exists to surface work
- * nobody is coming back for, so the entries it must never drop are the ones
- * least recently written — an alphabetical or as-listed cut would throw away
- * abandoned claims and keep healthy ones about half the time, which is the
- * absence-as-fact bug this seam keeps eliminating.
- *
- * ponytail: one `lstat` per entry, on the already-paid enumeration and only
- * past the cap. If a directory ever gets large enough that the stat loop
- * itself is the cost, the fix is an mtime-ordered index, not a cheaper sort.
- */
+/** Past the count cap, keep the least recently written: abandoned claims are what the board exists to surface. */
 function oldestFirst(dir: string, entries: string[]): string[] {
   const mtime = new Map<string, number>();
   for (const entry of entries) {
-    // `lstat`, never `stat`: it never traverses a symlink (so it cannot be
-    // pointed at something expensive) and never blocks — only `open` blocks on
-    // a FIFO. An entry that vanished between `readdir` and here sorts last; it
-    // would fail the open anyway.
+    // `lstat`, never `stat`: it never traverses a symlink and never blocks on a FIFO.
     const st = fs.lstatSync(path.join(dir, entry), { throwIfNoEntry: false });
     mtime.set(entry, st ? st.mtimeMs : Infinity);
   }
@@ -131,33 +60,8 @@ function oldestFirst(dir: string, entries: string[]): string[] {
 }
 
 /**
- * Every claim in a workgroup, classified. Unparseable files are skipped with a
- * warning rather than throwing — one bad file must not blank the whole board.
- * A claim missing `claimed_at`/`ttl_hours` counts as stale for the same reason
- * `claim.sh` does: it must never read as an indefinite hold on the work.
- *
- * Every entry is read through `readContainedFile`, so a FIFO, a directory, a
- * device node, an oversized file and one symlinked out of the claims directory
- * are all skipped with a log — the same treatment malformed JSON already got,
- * for the same reason: one bad entry must not blank the board. That seam, not
- * a `readFileSync`, is what keeps a `mkfifo` in an agent-writable directory
- * from hanging the host's event loop on the open.
- */
-/**
- * The claims directory for one workgroup, resolved through symlinks and
- * proven still inside the workgroup's own folder — or `null` if there is no
- * workgroup dir yet, the `claims` subdir escapes it, or either is unreadable.
- *
- * `claims/` is agent-writable, so it can be replaced with a symlink at a
- * sibling workgroup's folder — a cross-workgroup read straight through the
- * data-pool boundary, and one that self-heal would then act on in the wrong
- * workgroup. Resolving it here also gives `readContainedFile` the realpath'd
- * root its per-file fd check needs.
- *
- * Exported so `modules/claims/self-heal.ts` re-resolves the SAME directory,
- * fresh, at its own later read of the same claim — reusing a `dir` value
- * captured before its `await`s would only narrow that race, not close it.
- * Never throws: absent and escaping take the same exit, "read nothing".
+ * Realpath'd and proven inside the workgroup's folder, or null. `claims/` is agent-writable and could be a
+ * symlink into a sibling workgroup. Self-heal re-resolves it fresh at its own later read. Never throws.
  */
 export function resolveClaimsDir(root: string, workgroupId: string): string | null {
   try {
@@ -168,10 +72,11 @@ export function resolveClaimsDir(root: string, workgroupId: string): string | nu
   }
 }
 
+/**
+ * One bad entry (unparseable, FIFO, oversized, symlinked out) is skipped, never allowed to blank the board. A claim
+ * missing `claimed_at`/`ttl_hours` counts as stale: it must never read as an indefinite hold.
+ */
 export function readClaims(workgroupId: string, now: number, root: string = claimsBaseDir()): BoardClaim[] {
-  // Absent and escaping take the same silent exit: most workgroups have no
-  // claims directory at all, so warning here would fire on every poll for
-  // every one of them. Both mean the same thing — read nothing.
   const dir = resolveClaimsDir(root, workgroupId);
   if (dir === null) return [];
 
@@ -185,11 +90,7 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
   const entries = all.length > MAX_CLAIM_FILES ? oldestFirst(dir, all).slice(0, MAX_CLAIM_FILES) : all;
   const skipped = all.length - entries.length;
   if (skipped > 0) {
-    // LOUD, never a silent truncation. There is no honest place to surface
-    // this as a row: `readClaims` returns `BoardClaim`s that self-heal
-    // (`modules/claims/self-heal.ts`) re-reads BY SLUG and stamps on disk, and
-    // that nudge/steer look up by slug — a synthetic claim would be a fake
-    // slug those paths would try to act on. So the log line is the surface.
+    // Loud, never silent; not a synthetic row, since self-heal and nudge would act on its fake slug.
     log.warn('Claims board: more claim files than the read cap, reading only the oldest', {
       workgroupId,
       total: all.length,
@@ -201,10 +102,7 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
   const claims: BoardClaim[] = [];
   for (const entry of entries) {
     const file = path.join(dir, entry);
-    // Containment, file type, size cap and the read are one operation on one
-    // descriptor — see `readContainedFile`. A per-file check that a later
-    // `readFileSync` could outrun is not a check, and a plain `readFileSync`
-    // on a FIFO blocks the open forever before any check can run.
+    // Containment, type, size and read on one descriptor; a plain readFileSync blocks forever on a FIFO.
     const read = readContainedFile('Claims board', dir, entry, workgroupId, MAX_CLAIM_BYTES);
     if (read === null) continue;
     let raw: Record<string, unknown>;
@@ -215,22 +113,12 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
       continue;
     }
 
-    // An explicit operator pause wins over every expiry path. Unlike a parked
-    // handoff, it is not an offer for another agent to pick up after a grace
-    // period: resumption requires a new explicit instruction.
+    // An operator pause wins over every expiry path; resuming needs a new explicit instruction.
     const isPaused = typeof raw.status === 'string' && raw.status.trim().toLowerCase() === 'paused';
 
-    // Parked wins over everything else: a parked note routinely says "not
-    // done" (that's the point of leaving a note), and the finished-claim
-    // filter below would otherwise have to guess whether that means finished
-    // or handed off. Checked before TTL/finished logic so neither can shadow it.
+    // Checked before the finished filter: a parked note routinely says "not done".
     const isParked = typeof raw.status === 'string' && raw.status.trim().toLowerCase() === 'parked';
 
-    // A claim that says it finished is not live work, whatever its timestamps
-    // say. 14 of 15 live claims on the first real render were completed work
-    // left on disk — rendering those as "nobody is coming back for these" is
-    // both wrong and the loudest thing on the board. Same predicate the
-    // escalation sweep uses, so the board and the alert agree by construction.
     if (!isPaused && !isParked && declaresItselfFinished(raw)) continue;
 
     let state: ClaimState;
@@ -242,14 +130,7 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
     } else if (isParked) {
       const parkedAt = typeof raw.parked_at === 'string' ? Date.parse(raw.parked_at) : NaN;
       staleMs = Number.isFinite(parkedAt) ? now - parkedAt : 0;
-      // Parked is a WAYPOINT, not a terminus. It used to return here with no
-      // expiry at all, which made it an absorbing state: a park meant "someone
-      // should pick this up" and then nothing ever did. Live evidence at the
-      // time of this fix — 7 parked claims in one workgroup, three of them
-      // with no ttl_hours at all, the oldest sitting 93 hours. A state with no
-      // exit is the shape of the whole problem, so parked now decays into
-      // stale, which is already the state everything downstream treats as
-      // "free to take, and say so out loud".
+      // Parked decays into stale; with no exit it was an absorbing state nobody picked up.
       state = staleMs > PARK_GRACE_MS ? 'stale' : 'parked';
     } else {
       const claimedAt = typeof raw.claimed_at === 'string' ? raw.claimed_at : '';
@@ -263,8 +144,6 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
     claims.push({
       slug: entry.replace(/\.json$/, ''),
       owner: typeof raw.owner === 'string' && raw.owner ? raw.owner : 'unknown',
-      // Notes routinely run to paragraphs of handoff detail. The board is a
-      // scan surface: first sentence only, full text stays in the file.
       note: typeof raw.note === 'string' ? noteHeadline(raw.note) : '',
       threadId: typeof raw.thread_id === 'string' && raw.thread_id ? raw.thread_id : null,
       state,
@@ -289,24 +168,10 @@ const SECTION: Record<ClaimState, { icon: string; label: string }> = {
   expiring: { icon: '🟡', label: 'Past TTL — still inside the grace window' },
   live: { icon: '🟢', label: 'Live' },
 };
-/**
- * How long a parked claim may sit before it is treated as abandoned. A park is
- * a handoff offer; if nobody takes it inside a day, the offer lapsed.
- */
 export const PARK_GRACE_MS = 24 * 60 * 60 * 1000;
 
 const ORDER: ClaimState[] = ['stale', 'paused', 'parked', 'expiring', 'live'];
 
-/**
- * One section per state, most urgent first, so the part that needs a human is
- * at the top of the canvas rather than under a long list of healthy work.
- *
- * `linkFor` resolves a claim's thread to a URL and is injected so this stays a
- * pure renderer — the canvas passes the Slack adapter's permalink builder, and
- * tests pass nothing.
- */
-// A projection must say on its face when it was drawn and what wins on
-// disagreement — the claims/ directory is the source of truth, this is a read.
 function stampLine(): string {
   return `_claims as of ${formatLocalTime(new Date().toISOString(), TIMEZONE)} — source of truth: the claims/ directory_`;
 }
@@ -333,8 +198,6 @@ export function renderClaims(claims: BoardClaim[], linkFor: (threadId: string) =
               : `${duration(c.staleMs)} past TTL`;
       const url = c.threadId ? linkFor(c.threadId) : null;
       const thread = url ? ` · [thread](${url})` : '';
-      // An escalated claim has already been announced; marking it here stops a
-      // reader re-reporting something the channel was told about hours ago.
       const flagged = c.escalated ? ' · _escalated_' : '';
       const note = c.note ? ` — ${c.note}` : '';
       lines.push(`- \`${c.slug}\` — **${c.owner}**, ${age}${note}${thread}${flagged}`);

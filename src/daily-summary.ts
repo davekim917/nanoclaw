@@ -1,33 +1,7 @@
 /**
- * Host-side daily summary digest — one consolidated post per WORKGROUP.
- *
- * Mirrors v1's daily-notifications, but aggregated at the workgroup layer
- * rather than per agent group. Once a day, for each workgroup that opts in,
- * build a digest of recent ship_log + backlog activity across ALL its sibling
- * agent groups (Claude + Codex + OpenCode), dedupe, and post a single message
- * through the workgroup's Codex sibling — so siblings no longer each emit their
- * own duplicate digest.
- *
- * Opt-in + routing: a workgroup gets a digest IFF its Codex sibling's
- * container.json declares `dailySummary.messagingGroupId`. That field both
- * enables the workgroup AND chooses the destination channel (e.g. Discord for
- * example-retail, Slack #agents-example for example-labs). No override → no digest, so
- * dormant workgroups stay silent without a per-group disable flag. Delivering
- * through the Codex sibling's own channel means the message posts AS the Codex
- * bot ("Example Assistant Codex", etc.), which is the intended author.
- *
- * Shipped work is split into two sections so agent-driven and human/direct
- * work are distinguishable:
- *   - 🤖 Agent Shipped — ship_log entries from the `add_ship_log` MCP tool
- *     (an agent opened a PR / recorded work inline).
- *   - 🛠 Other commits — ship_log entries from host-side `commit-scan`
- *     (default-branch commits in cloned repos, tagged `commit-digest,<repo>`),
- *     which is how non-agent / human commits surface.
- *
- * Trigger model: ticks every 5 min, fires when local hour in DAILY_SUMMARY_TZ
- * matches DAILY_SUMMARY_HOUR and we haven't already fired today (per a small
- * JSON state file). Hour-only granularity is enough for "daily at 8am ET" —
- * no cron-parser dep.
+ * Host-side daily summary digest, one post per workgroup, delivered through the workgroup's Codex sibling so it
+ * posts as that bot. A workgroup opts in (and picks its channel) only via the Codex sibling's container.json
+ * `dailySummary.messagingGroupId`. Shipped work splits into agent-recorded entries and commit-scan entries.
  */
 import fs from 'fs';
 import path from 'path';
@@ -54,9 +28,7 @@ const STATE_PATH = path.join(DATA_DIR, 'daily-summary-state.json');
 const DEFAULT_HOUR = 8;
 const DEFAULT_TZ = 'America/New_York';
 
-// Discord's per-message cap (config.maxTextLength in discord.ts) is the
-// tightest of the wired platforms; splitting the backlog thread to this size
-// keeps every chunk postable everywhere without needing per-adapter limits.
+// Discord's per-message cap is the tightest of the wired platforms.
 const THREAD_MESSAGE_LIMIT = 1900;
 
 let timer: NodeJS.Timeout | null = null;
@@ -78,8 +50,7 @@ export function stopDailySummary(): void {
   }
 }
 
-// Set DAILY_SUMMARY_ENABLED=0 to disable. A disabled duty still registers and
-// no-ops, so the registration count is stable across configurations.
+// A disabled duty still registers and no-ops, so the registration count is stable across configurations.
 onHostStart(function dailySummaryHostStart() {
   if (process.env.DAILY_SUMMARY_ENABLED !== '0') {
     // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
@@ -96,37 +67,17 @@ onHostShutdown(function dailySummaryHostShutdown() {
   }
 });
 
-/** Exposed for tests — runs one tick synchronously and returns. */
 export async function _tickForTest(): Promise<void> {
   await runTick();
 }
 
-/** Exposed for focused source-selection regression tests. */
 export async function _fireDigestsForTest(): Promise<void> {
   await fireDigests();
 }
 
 /**
- * Post the ranked backlog list as a reply to the parent digest message.
- *
- * Slack accepts any message id as a `thread_ts` — no explicit thread object
- * exists to create. Discord does: posting straight to
- * `<platform_id>:<parentId>` 404s ("Unknown Channel") because a message id is
- * not a channel id; a thread must be created from the parent message via the
- * platform's REST thread-create call first. `adapter.createThread` is the
- * platform-appropriate way to do this for both — a thin `thread_ts` wrapper
- * on Slack, a real thread-create call on Discord (see slack.ts / discord.ts).
- * Falls back to a flat post if the adapter has no thread support or the
- * parent post didn't return an id.
- *
- * The backlog list can run well past a single message's length (60-item
- * workgroups regularly exceed 10k chars), so it's split with the same
- * chunker the normal chat-delivery path uses; the first chunk becomes the
- * thread's opening message, the rest are posted into the resulting thread.
- *
- * Exported for testing — fireDigests()'s DB/adapter wiring would otherwise
- * require mocking the whole delivery + container-config + backlog stack just
- * to exercise this branch.
+ * Uses `adapter.createThread`: posting to `<platform_id>:<parentId>` 404s on Discord, where a thread must be
+ * created from the parent first. Falls back to a flat post without thread support or a parent id.
  */
 export async function deliverBacklogThread(
   adapter: Pick<ChannelDeliveryAdapter, 'deliver' | 'createThread'>,
@@ -181,10 +132,7 @@ async function fireDigests(): Promise<void> {
 
   for (const [workgroupId, members] of workgroups) {
     try {
-      // Poster = the workgroup's Codex sibling. The digest posts AS this bot,
-      // and its container.json carries the opt-in + destination override.
-      // Identify by the effective provider (container_configs/container.json),
-      // not the deprecated agent_groups.agent_provider column.
+      // By effective provider, not the deprecated agent_groups.agent_provider column.
       const poster = members.find((m) => readContainerConfig(m.folder).provider === 'codex');
       if (!poster) continue; // no Codex sibling → workgroup not eligible
 
@@ -204,10 +152,7 @@ async function fireDigests(): Promise<void> {
         includeResolved,
         includeBacklog,
       });
-      // isEmpty() above tests the DATA; the include* flags can still strip every
-      // section from a non-empty summary (a workgroup may run all three off
-      // when its board lives in an external tracker). Posting the bare
-      // "📋 Daily Summary" header every morning is worse than posting nothing.
+      // The include* flags can strip every section from non-empty data; a bare header is worse than nothing.
       if (!backlogThread && parent.trim().split('\n').length <= 1) {
         log.info('Daily summary: every section disabled for this workgroup — skipping', { workgroupId });
         continue;
@@ -225,9 +170,7 @@ async function fireDigests(): Promise<void> {
         try {
           await sendThread();
         } catch (firstErr) {
-          // The parent already posted, so the day is marked complete either
-          // way — one retry, then a loud error, is the whole recovery
-          // budget: re-running the tick would double-post every parent.
+          // The parent already posted; re-running the tick would double-post it, so one retry then a loud error.
           log.warn('Daily summary backlog thread failed — retrying once', { workgroupId, err: firstErr });
           try {
             await sendThread();
@@ -258,8 +201,6 @@ async function fireDigests(): Promise<void> {
   log.info('Daily summary cycle complete', { workgroups: workgroups.size, sent: sentCount });
 }
 
-/** Bucket agent groups by workgroup. Standalone groups (no workgroup_id) key
- *  on their folder so they form a single-member workgroup of their own. */
 function groupByWorkgroup(groups: AgentGroup[]): Map<string, AgentGroup[]> {
   const byWg = new Map<string, AgentGroup[]>();
   for (const g of groups) {
@@ -278,13 +219,7 @@ interface Summary {
   openBacklog: BacklogItem[];
 }
 
-/**
- * Aggregate one workgroup's activity across all sibling agent groups, dedupe,
- * and split shipped work by source. `ship_log` remains per-agent-group. When
- * the Codex poster declares a GitHub Issues repo, that repo is the sole source
- * of backlog state: legacy SQLite rows are deliberately not read or used as a
- * fallback, because they may be stale after a tracker migration.
- */
+/** A declared GitHub Issues repo is the sole backlog source; legacy SQLite rows may be stale after migration. */
 async function buildSummary(
   members: AgentGroup[],
   since: string,
@@ -345,9 +280,6 @@ async function buildGitHubIssueBacklog(
         (issue) => !issue.pull_request,
       );
     } catch (err) {
-      // Closed history is supplemental. Keep a successfully fetched current
-      // backlog in its existing thread, but never replace the missing resolved
-      // section with legacy SQLite rows.
       log.warn('Daily summary GitHub Issues resolved fetch failed; using empty GitHub resolved list', {
         posterAgentGroupId: poster.id,
         repo,
@@ -361,9 +293,7 @@ async function buildGitHubIssueBacklog(
         .map((issue) => mapGitHubIssue(issue, repo, poster.id)),
     };
   } catch (err) {
-    // A configured tracker is authoritative. Falling back to SQLite here would
-    // re-post rows that were intentionally migrated away, so fail closed while
-    // preserving any independent ship-log sections in the parent digest.
+    // Fail closed: SQLite would re-post rows intentionally migrated away.
     log.warn('Daily summary GitHub Issues backlog fetch failed; using empty GitHub backlog', {
       posterAgentGroupId: poster.id,
       repo,
@@ -479,11 +409,7 @@ function dedupeBy<T>(items: T[], keyFn: (item: T) => string): T[] {
   return out;
 }
 
-/**
- * A ship_log entry is non-agent ("Other commits") iff it came from commit-scan,
- * which tags entries `commit-digest,<repo>` (comma-separated string) — older
- * rows may use a JSON array. Anything else is agent-recorded via add_ship_log.
- */
+/** commit-scan tags `commit-digest,<repo>` as a comma string; older rows may use a JSON array. */
 export function isCommitScanEntry(entry: ShipLogEntry): boolean {
   if (!entry.tags) return false;
   try {
@@ -501,14 +427,7 @@ function isEmpty(s: Summary): boolean {
   );
 }
 
-/**
- * Resolve the destination channel for a workgroup's digest from its Codex
- * poster's container.json `dailySummary.messagingGroupId`. Presence of this
- * override is the opt-in signal — absence returns null and the workgroup is
- * skipped. A set-but-unresolvable id also returns null (with a warning) rather
- * than silently falling back to a different channel, since the override is the
- * deliberate routing choice (Discord vs Slack).
- */
+/** An unresolvable id returns null rather than falling back to a channel nobody chose. */
 async function resolveTarget(poster: AgentGroup): Promise<MessagingGroup | null> {
   const config = readContainerConfig(poster.folder);
   const overrideId = config.dailySummary?.messagingGroupId;
@@ -522,14 +441,6 @@ async function resolveTarget(poster: AgentGroup): Promise<MessagingGroup | null>
   return null;
 }
 
-// ── Formatting ──
-
-/**
- * Build the digest as a compact parent message plus an optional threaded
- * backlog list. The open-backlog list grows with ship rate — tens of lines in
- * the parent channel reads as spam, so the parent carries one headline and
- * the ranked list lives in the thread.
- */
 export function formatDigestParts(
   label: string,
   s: Summary,
@@ -559,20 +470,11 @@ export function formatDigestParts(
   return { parent: lines.join('\n'), backlogThread };
 }
 
-/** Back-compat single-message render (parent + list inline). */
 export function formatDigest(label: string, s: Summary): string {
   const { parent, backlogThread } = formatDigestParts(label, s);
   return backlogThread ? `${parent}\n${backlogThread}` : parent;
 }
 
-/**
- * Ranked open-backlog render. Order = what to address first:
- * in-progress before untouched, then priority high→low, then oldest first
- * (age is the tiebreak signal that something keeps not getting done).
- * Each item shows its age and, when the item carries a description, the
- * why/purpose on an indented line — items without one show nothing extra
- * (the steward task backfills descriptions over time).
- */
 export function formatBacklogThread(items: BacklogItem[]): string {
   const ranked = rankBacklog(items);
   const top = ranked.slice(0, 3);
@@ -616,11 +518,6 @@ function formatBacklogItemTitle(item: BacklogItem, max = 140): string {
   return `[${title.replace(/[\\[\]]/g, '\\$&')}](${item.url})`;
 }
 
-/**
- * Append a shipped-work section grouped by repo. No-op when empty so the
- * caller doesn't emit a bare header. Per-repo sub-headers appear only when the
- * section spans more than one repo (matches the prior single-section format).
- */
 function appendShipSection(lines: string[], header: string, entries: ShipLogEntry[]): void {
   if (entries.length === 0) return;
   lines.push('', `${header} (${entries.length}):`);
@@ -635,14 +532,6 @@ function appendShipSection(lines: string[], header: string, entries: ShipLogEntr
   }
 }
 
-/**
- * Repo extraction priority — direct port of v1's logic:
- *   1. Parse owner/repo from a github.com/.../pull|issues URL in pr_url.
- *   2. If tags include 'commit-digest', use the other tag (commit-scan
- *      writes `commit-digest,<repoName>` per scanRepo).
- *   3. Title prefix before ':' if it appears in the first 40 chars.
- *   4. 'Other'.
- */
 export function extractRepo(entry: ShipLogEntry): string {
   if (entry.pr_url) {
     const m = entry.pr_url.match(/github\.com\/([^/]+\/[^/]+)\/(?:pull|issues)/);
@@ -681,8 +570,6 @@ function groupBy<T>(items: T[], keyFn: (item: T) => string): Record<string, T[]>
   return out;
 }
 
-// ── TZ helpers ──
-
 function hourInZone(d: Date, tz: string): number {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: tz,
@@ -712,8 +599,6 @@ function parseHour(raw: string | undefined): number | null {
   if (!Number.isFinite(n) || n < 0 || n > 23) return null;
   return n;
 }
-
-// ── State file ──
 
 interface State {
   lastFiredDateKey: string | null;

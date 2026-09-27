@@ -9,114 +9,43 @@ import { providerProvidesAgentSurfaces } from './providers/provider-container-re
 import { prepareWorkgroupMemoryMember } from './modules/workgroup/shared-dirs.js';
 import type { AgentGroup } from './types.js';
 
-// Nanoclaw-managed env vars. Reconciled to trunk on every container spawn:
-// values here always win over what's on disk, keys in DEPRECATED_ENV get
-// deleted, anything outside both lists is user-owned and left alone.
+// Reconciled on every spawn: these values win over disk, DEPRECATED_ENV keys are deleted, the rest is user-owned.
 const REQUIRED_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-  // Let long foreground worker-codex calls stay attached for up to an hour.
-  // Deliberately leave BASH_DEFAULT_TIMEOUT_MS unset so ordinary Bash calls
-  // retain Claude Code's shorter default timeout.
+  // BASH_DEFAULT_TIMEOUT_MS deliberately unset so ordinary Bash calls keep the shorter default.
   BASH_MAX_TIMEOUT_MS: '3600000',
-  // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is no longer pinned — see DEPRECATED_ENV.
-  // CLAUDE_CODE_AUTO_COMPACT_WINDOW used to be pinned here at 1_000_000. It is
-  // now per-group (container.json `autoCompactWindow`, default 600k) and passed
-  // via docker -e at spawn (claudeSpawnEnv) — see DEPRECATED_ENV below.
-  // The subagent caps are fleet constants, so they CAN be pinned here: same
-  // value as the spawn `-e` (both read the constants in claude-spawn-defaults.ts),
-  // and managing them means a hand-edited settings.json cannot shadow the `-e`
-  // with a different number — the reconciler overwrites it on the next init.
+  // Fleet constants, so pinning them is safe and stops a hand-edited settings.json shadowing the spawn `-e`.
   CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH,
   CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: CLAUDE_MAX_CONCURRENT_SUBAGENTS,
-  // Disable adaptive thinking so the CLI emits visible `thinking` content
-  // blocks (the older fixed-budget mode). The CLI's internal gate only
-  // applies this to model ids containing "opus-4-6" or "sonnet-4-6"; for
-  // 4-7 it's a benign no-op but keeps 4-6 sessions consistent.
-  // CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
-  // Fixed thinking token budget. 127999 = max_output − 1 (Opus 4.7 max is
-  // 128000). Deprecated in the SDK query option surface but still honored
-  // by the CLI as an env-var knob that pairs with the disabled-adaptive
-  // mode above — gives us a large budget on fixed-budget model variants.
-  // MAX_THINKING_TOKENS: '127999',
 };
 
-// Env keys whose meaning moved or got dropped. Removed from existing
-// settings.json on next init so stale values can't leak into the SDK.
-//
-// ANTHROPIC_DEFAULT_<FAMILY>_MODEL and NANOCLAW_DEFAULT_EFFORT used to
-// be pinned here, but their single source of truth now lives in
-// flag-parser.ts (DEFAULT_OPUS_MODEL etc.) and gets passed via
-// docker -e at spawn time. Pinning them in settings.json was a
-// group-level layer that bled into every session in the group when
-// changed — wrong scope for a "default."
+// Scrubbed from existing settings.json. Spawn-env-only keys are here because a settings.json pin is a group-level
+// layer that would shadow the per-spawn `-e` for every session in the group.
 const DEPRECATED_ENV: readonly string[] = [
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_USE_EFFORT',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  // Renamed to NANOCLAW_EFFORT_OVERRIDE 2026-06-10 (it's an operator
-  // override, not a default — defaults are per-model-family in the claude
-  // provider). The old name stays here so legacy settings.json values
-  // keep getting scrubbed; the new name is spawn-env-only and must never
-  // be pinned in settings.json either.
   'NANOCLAW_DEFAULT_EFFORT',
   'NANOCLAW_EFFORT_OVERRIDE',
-  // The group's resolved model, added 2026-09-15 when it stopped riding the
-  // opus alias. Spawn-env-only for the same reason as the pair above: a
-  // settings.json pin is a group-level layer that would shadow the per-spawn
-  // `-e` for every session in the group, including the per-channel wiring.
   'NANOCLAW_CLAUDE_MODEL',
-  // Moved to a per-group spawn-time `-e` (container.json `autoCompactWindow`,
-  // docs/specs/quota-burn/plan.md §0.5). A settings.json pin would shadow the
-  // per-group value for every session in the group, so scrub it.
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
-  // Dropped 2026-09-19 (operator decision) together with the window move to
-  // 600k. The CLI's own default percentage now decides where compaction lands;
-  // fast-jev-compaction's `session.compact` hook does the compaction whichever
-  // trigger fires it, so the percentage only moves WHEN, not HOW. Listed here
-  // so the 80 this module pinned into every existing group's settings.json is
-  // scrubbed on next init rather than shadowing the new behaviour forever.
   'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE',
 ];
 
-// Nanoclaw-managed top-level settings. Same reconciliation semantics as
-// REQUIRED_ENV above.
 const REQUIRED_SETTINGS: Record<string, unknown> = {
   $schema: 'https://json.schemastore.org/claude-code-settings.json',
-  // Workgroup memory is the only durable authority. Claude's native
-  // auto-memory must not create a second, provider-specific store.
+  // Workgroup memory is the only durable authority; no second, provider-specific store.
   autoMemoryEnabled: false,
-  // Explicit opt-in to thinking for supported models. The SDK treats
-  // absent-or-true as "enabled automatically" but we keep this explicit
-  // so `/update-nanoclaw` can never leave a group with thinking disabled
-  // after a settings.json drift.
   alwaysThinkingEnabled: true,
-  // Default model alias, for any CLI path that reads settings.json rather
-  // than the `model` the runner passes per query (which outranks it).
-  // Resolves via ANTHROPIC_DEFAULT_OPUS_MODEL, shipped as a docker `-e` from
-  // DEFAULT_OPUS_MODEL (src/flag-parser.ts) by claudeSpawnEnv — so this word
-  // means Opus in every group, pinned or not.
-  //
-  // It did not until 2026-09-15: the alias var carried the group's OWN
-  // resolved model, so this pin meant "whatever this group runs" and, once
-  // the unpinned default became Sonnet in 7d0e7df3a, meant Sonnet 5. The
-  // group's model now travels as NANOCLAW_CLAUDE_MODEL
-  // (src/claude-spawn-defaults.ts).
+  // Resolves via the install-wide ANTHROPIC_DEFAULT_OPUS_MODEL, so it means Opus in every group; the group's own
+  // model travels as NANOCLAW_CLAUDE_MODEL.
   model: 'opus',
-  // Built-in "Proactive" style (act, don't ask; operator 2026-09-22, was
-  // "Concise"): container agents work unattended in chat threads. Claude-only
-  // knob (Codex/OpenCode have no output-style concept); tone for those
-  // providers still comes from the CLAUDE.md voice slot.
   outputStyle: 'Proactive',
-  // Every model call re-reads the skill listing (~6.8k tokens across ~100
-  // skills, measured 2026-09-18). Zero-use bundled skills are hidden from the
-  // agent but stay callable as `/name` (`user-invocable-only`); rarely used
-  // ones keep their name, drop the description (`name-only`). Plugin skills
-  // are not covered by skillOverrides — those are withheld per group with
-  // container.json `excludePlugins`.
+  // Every model call re-reads the skill listing, so unused bundled skills are hidden or shortened here.
   skillOverrides: {
     'update-config': 'user-invocable-only',
     'keybindings-help': 'user-invocable-only',
@@ -139,9 +68,6 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   },
 };
 
-// Pre-compaction hook (container-side): runs before the SDK auto-compacts so
-// destination/routing reminders survive the compaction window. Reconciled by
-// shape — if the file is missing the hook entry it's restored on next init.
 const REQUIRED_HOOKS = {
   PreCompact: [
     {
@@ -167,25 +93,8 @@ export function prepareGroupCanonicalMemory(
 }
 
 /**
- * Reconcile an existing settings.json against trunk.
- *
- * For keys in REQUIRED_ENV / REQUIRED_SETTINGS: overwrite to trunk value
- * (so `/update-nanoclaw` pushes model/effort/alias changes out to every
- * existing group without a manual pass). For keys in DEPRECATED_ENV:
- * delete. The PreCompact hook is restored if missing entirely. Anything
- * outside these lists is user-owned and untouched. Returns true if the
- * file was modified.
- */
-/**
- * Does a directory ENTRY exist at this path — link included, target ignored?
- *
- * `existsSync` follows symlinks, so a link whose target only resolves inside
- * the container (`spawn-template.md -> /workspace/workgroup/...`) reads as
- * absent here, and the `writeFileSync` that follows would traverse the same
- * link and throw ENOENT. initGroupFilesystem runs before every spawn, so that
- * throw would make the group unstartable. An existing link is occupied — it
- * was placed deliberately, and the placeholder exists only to stop Docker
- * creating a root-owned file where nothing exists at all.
+ * Link included, target ignored: a link whose target resolves only inside the container reads as absent to
+ * `existsSync`, and writing through it throws ENOENT before every spawn.
  */
 function entryExists(target: string): boolean {
   return fs.lstatSync(target, { throwIfNoEntry: false }) !== undefined;
@@ -220,9 +129,7 @@ function ensureRequiredSettings(settingsFile: string): boolean {
     const cur = settings[k];
     const isMap = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x);
     if (isMap(v)) {
-      // Object setting (skillOverrides): merge our entries into the group's
-      // map. Replacing it would drop an override the group set itself and
-      // silently re-enable that skill.
+      // Merge, don't replace: replacing would drop an override the group set itself.
       const merged: Record<string, unknown> = isMap(cur) ? { ...cur } : {};
       let dirty = !isMap(cur);
       for (const [ek, ev] of Object.entries(v)) {
@@ -240,11 +147,7 @@ function ensureRequiredSettings(settingsFile: string): boolean {
       changed = true;
     }
   }
-  // PreCompact hook reconciliation: present-or-add. If the file has other
-  // hooks (e.g. operator-installed Stop, PreToolUse, etc.) we leave them
-  // alone and only ensure PreCompact contains our compact-instructions
-  // command. Don't deep-merge — operators may legitimately swap the command
-  // or add to it.
+  // Present-or-add only; don't deep-merge: operators may legitimately change or extend the command.
   if (!settings.hooks || typeof settings.hooks !== 'object') {
     settings.hooks = {};
     changed = true;
@@ -296,19 +199,13 @@ export function initGroupFilesystem(
   }
   prepareGroupCanonicalMemory(group);
 
-  // Standing instructions are provider identity, not memory. The provider's
-  // project-document composer consumes this shared surface at spawn. Exclusive
-  // creation preserves any existing operator-owned instructions.
+  // Exclusive creation preserves existing operator-owned instructions.
   if (opts?.instructions && stageGroupPersona(groupDir, opts.instructions)) {
     initialized.push(STANDING_INSTRUCTIONS_FILE);
   }
 
-  // The host-shared spawn template is nested-mounted at
-  // /workspace/agent/spawn-template.md (container-runner.ts), and
-  // /workspace/agent IS this folder — so without a placeholder Docker creates
-  // the destination here ROOT-owned, leaving a file the host user can never
-  // remove. Docker leaves an existing file's ownership alone. Not gated on
-  // defaultSurfaces: the mount isn't either.
+  // The spawn template is nested-mounted into this folder; without a placeholder Docker creates it ROOT-owned.
+  // Not gated on defaultSurfaces: the mount isn't either.
   const spawnTemplateFile = path.join(groupDir, 'spawn-template.md');
   if (!entryExists(spawnTemplateFile)) {
     fs.writeFileSync(spawnTemplateFile, '');
@@ -316,22 +213,15 @@ export function initGroupFilesystem(
   }
 
   // plugins/ always exists (even for plugin-less groups) so the read-only
-  // plugins mount in container-runner.ts is unconditional. Without the dir,
-  // Docker creates that mount's destination ROOT-owned inside the group folder
-  // — the same trap spawn-template.md above exists to avoid.
+  // plugins mount in container-runner.ts is unconditional.
   const pluginsDir = path.join(groupDir, 'plugins');
   if (!fs.existsSync(pluginsDir)) {
     fs.mkdirSync(pluginsDir, { recursive: true });
     initialized.push('plugins/');
   }
 
-  // Note: the container_configs DB row is NOT created here. Local's
-  // applyCreateAgent ordering puts initGroupFilesystem BEFORE the
-  // agent_groups insert (so a DB failure can roll back the FS via
-  // safeRemoveFolder). Calling ensureContainerConfig at this point would
-  // fail the FK constraint on agent_group_id. The row is created later
-  // by backfillContainerConfigs at host startup or via explicit
-  // createContainerConfig in upstream's create-agent flow.
+  // The container_configs row is NOT created here: this runs before the agent_groups insert, so it would fail
+  // the FK.
 
   // 2. data/v2-sessions/<id>/.claude-shared/ — Claude state + per-group skills
   if (defaultSurfaces) {
@@ -351,9 +241,6 @@ export function initGroupFilesystem(
 
     // Skills directory — created empty here; symlinks are synced at spawn
     // time by container-runner.ts based on container.json skills selection.
-    // Container skills themselves live in trunk (`container/skills/`) and are
-    // bind-mounted RO; this dir just holds the symlinks that Claude Code
-    // discovers via ~/.claude/skills.
     const skillsDst = path.join(claudeDir, 'skills');
     if (!fs.existsSync(skillsDst)) {
       fs.mkdirSync(skillsDst, { recursive: true });
