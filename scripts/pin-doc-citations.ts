@@ -90,8 +90,9 @@ function introducingCommit(root: string, rev: string, doc: string, lineNumber: n
   let oldest: string | null = null;
   for (const entry of history.split('\0').filter(Boolean)) {
     const [sha, ...patch] = entry.split('\n');
-    const after = patch.filter((line) => line.startsWith('+') && !line.startsWith('+++'));
-    const before = patch.filter((line) => line.startsWith('-') && !line.startsWith('---'));
+    const body = patch.filter((line) => !/^(?:\+\+\+|---) (?:[ab]\/|\/dev\/null)/.test(line));
+    const after = body.filter((line) => line.startsWith('+')).map((line) => line.slice(1));
+    const before = body.filter((line) => line.startsWith('-')).map((line) => line.slice(1));
     if (after.length === 0 && before.length === 0) continue;
     if (!after.some((line) => citesExactly(line, cited))) break;
     oldest = sha.trim();

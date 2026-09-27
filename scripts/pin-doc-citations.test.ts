@@ -336,6 +336,32 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: retargeted })]);
   });
 
+  it('follows a note line that starts with its citation through a later prose edit', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, 'src/code.ts:1 — `drainQueue` drops items\n');
+    const introduced = commit(root, 'note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+    write(root, NOTE, 'src/code.ts:1 — `drainQueue` drops items under load\n');
+    commit(root, 'reword');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
+  });
+
+  it('reads a note line that itself starts with dashes', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, '-- `drainQueue` at `src/code.ts:1` drops items\n');
+    const introduced = commit(root, 'note');
+    write(root, 'src/code.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change the code');
+    write(root, NOTE, '-- `drainQueue` at `src/code.ts:1` drops items under load\n');
+    commit(root, 'reword');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
