@@ -1,34 +1,8 @@
 /**
- * Mount list for `/home/node/.claude` inside per-session agent containers.
- *
- * Four nested bind mounts, ordered by specificity. Docker applies mount
- * rules in the order they appear and more-specific paths override less-
- * specific ones, so this ordering is load-bearing — do not reshuffle:
- *
- *   1. Group-shared parent `.claude-shared/` → `/home/node/.claude`
- *      Keeps agents, settings.json, plugins, statsig, and shell-snapshots
- *      group-scoped (initialized once by initGroupFilesystem, read-mostly
- *      at runtime, races are benign).
- *
- *   2. Trunk skills `container/skills/` → `/home/node/.claude/skills` (ro)
- *      Container skills are framework-provided and identical across every
- *      group. Mounting trunk directly removes the per-group drift problem —
- *      a trunk fix to a skill reaches every group on its next container
- *      spawn, instead of being permanently stuck at whatever trunk looked
- *      like when the group was first initialized.
- *
- *   3. Per-session `projects/<hash>/` → `/home/node/.claude/projects/<hash>/`
- *      Isolates the SDK's active-session state: `<session_id>.jsonl`
- *      transcripts and `sessions-index.json`. Without this, concurrent
- *      sessions in the same agent group race on `sessions-index.json` and
- *      can silently lose transcripts, causing the next `resume` to start a
- *      fresh Claude session instead of reloading prior context.
- *
- *   4. Workgroup memory compatibility view →
- *      `/home/node/.claude/projects/<hash>/memory`
- *      Projects the one canonical workgroup tree read-only at Claude's native
- *      path. Claude-native auto-memory is disabled; this mount is compatibility,
- *      not an independent authority.
+ * Mount list for `/home/node/.claude` in session containers: group-shared `.claude-shared/`, trunk
+ * `container/skills/` (read-only, so a skill fix reaches every group at its next spawn), the per-session
+ * `projects/<hash>/` (concurrent sessions sharing it race on `sessions-index.json` and lose transcripts), and the
+ * workgroup memory compatibility view. Nested mounts: the order is load-bearing, most specific last.
  */
 import path from 'path';
 
@@ -43,15 +17,8 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 /**
- * Build the ordered mount triple for this session's `/home/node/.claude`.
- * Call this once at mount-list construction; the returned list MUST be
- * spread into `mounts` contiguously so the nested-mount ordering holds.
- *
- * This is the ONLY caller of `prepareSessionClaudeDir` — session creation
- * deliberately skips it, so a session that never wakes never gets a
- * `.claude-projects/` dir at all. That function now only mkdirs + chowns; the
- * shared-transcript copy it used to perform was removed on 2026-08-20 (see the
- * comment there before reintroducing anything).
+ * The returned list MUST be spread into `mounts` contiguously so the nested ordering holds. The only caller of
+ * `prepareSessionClaudeDir`, so a session that never wakes never gets a `.claude-projects/` dir.
  */
 export function getSessionClaudeMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
   prepareSessionClaudeDir(agentGroup.id, session.id);

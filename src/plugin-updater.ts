@@ -1,21 +1,6 @@
 /**
- * Plugin auto-updater (Phase 5.12).
- *
- * Every hour (configurable via PLUGIN_UPDATE_CRON env), runs
- * `git pull --ff-only` in each `~/plugins/<name>` subdir. Logs which
- * plugins updated; optionally notifies a configured JID via the
- * delivery adapter when any plugin advanced.
- *
- * Simplified from v1's src/plugin-updater.ts:
- *   - No DB-backed scheduled_tasks row. v2 has no scheduled_tasks
- *     table on the host side; task scheduling is agent-level via
- *     `ncl tasks`. Host cron work uses setInterval, the
- *     same pattern worktree-cleanup (5.0's host-side sibling) uses.
- *   - No cron-parser dep. Hourly is hard-coded; a later refactor can
- *     generalize if we need sub-hour or TZ-aware schedules.
- *
- * The notification is fire-and-forget via a callback the module builds for
- * itself at registration (below), closing over the delivery adapter.
+ * Hourly `git pull --ff-only` of each `~/plugins/<name>`, then a refresh of the derived Codex surfaces; optionally
+ * notifies `PLUGIN_UPDATE_NOTIFY_JID` when any plugin advanced.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -33,23 +18,16 @@ import { syncOpenCodeSubagents } from './opencode-sync.js';
 
 const execFileAsync = promisify(execFile);
 
-const INTERVAL_MS = 60 * 60 * 1000; // hourly
-const STARTUP_DELAY_MS = 5 * 60 * 1000; // wait 5min after startup so host is quiet
+const INTERVAL_MS = 60 * 60 * 1000;
+const STARTUP_DELAY_MS = 5 * 60 * 1000; // let the host settle after boot
 const GIT_PULL_TIMEOUT_MS = 30_000;
 const CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS = 60_000;
 
-// Once-per-process latch for the missing-codex-binary info line — the
-// refresh runs hourly and the binary won't appear without operator action,
-// so repeating it every cycle is pure log noise (223 warns before this latch).
+// The hourly refresh would repeat the missing-codex-binary line forever; log it once per process.
 let codexBinaryMissingLogged = false;
 
 export interface PluginUpdaterDeps {
-  /**
-   * Optional: send a notification when plugins updated. First arg is
-   * the host's `PLUGIN_UPDATE_NOTIFY_JID` env var (channel-qualified
-   * platform id); second is the message text. No-op if the env isn't
-   * set. The delivery adapter, not this module, decides routing.
-   */
+  /** Called with `PLUGIN_UPDATE_NOTIFY_JID` (channel-qualified platform id) and the text when plugins updated. */
   notify?: (platformId: string, text: string) => Promise<void>;
 }
 
@@ -89,11 +67,7 @@ async function updatePlugin(pluginPath: string, name: string): Promise<UpdateRes
   }
 }
 
-/**
- * Pull every `~/plugins/<name>` and return per-plugin results. No
- * notification side effect — callers (the hourly cron and the
- * /update-plugins slash command) decide what to do with the output.
- */
+/** Pull every `~/plugins/<name>`; no notification side effect. */
 export async function runPluginUpdates(): Promise<UpdateResult[]> {
   const pluginsRoot = path.join(os.homedir(), 'plugins');
   if (!fs.existsSync(pluginsRoot)) {
@@ -132,13 +106,8 @@ export async function runPluginUpdates(): Promise<UpdateResult[]> {
 }
 
 /**
- * design-artifact-loop's plugin repo is the dev home; the container tree
- * carries vendored copies under container/agent-runner/src/mcp-tools/ and
- * container/skills/, both read-only bind-mounted into containers at spawn
- * (never baked into the image) — so no rebuild is needed for this to take
- * effect. This writes directly into the fork's git-tracked tree, so unlike
- * the codex/opencode mirrors above (untracked runtime caches) it does NOT
- * commit — Operator commits + pushes the result when he next reviews it.
+ * The vendored design-artifact-loop copies are bind-mounted at spawn, so no rebuild is needed. Writes into the
+ * git-tracked tree and does NOT commit: the operator reviews and commits the result.
  */
 function vendorDesignArtifactLoopIfPresent(): void {
   try {
@@ -153,30 +122,12 @@ function vendorDesignArtifactLoopIfPresent(): void {
   }
 }
 
-/**
- * Refresh every Codex surface derived from plugin repos.
- *
- * Codex marketplaces are copied into Codex's installed plugin cache after local
- * `git pull` and after Codex's own Git marketplace checkout is upgraded. That
- * cache is bind-mounted into containers, so it is a container delivery path,
- * not a host-CLI convenience.
- *
- * Only surfaces that reach containers are refreshed here — see the note in the
- * body for why plugin skills are not mirrored to host CLI paths.
- */
+/** Refresh every Codex surface derived from plugin repos that reaches containers (the plugin cache is bind-mounted). */
 export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshResult> {
   const result: CodexSurfaceRefreshResult = {};
 
-  // NOTE: plugin SKILLS are deliberately not mirrored to host CLI paths
-  // (`~/.agents/skills`, OpenCode's XDG skill dirs). `~/plugins` is the
-  // container agents' plugin source; the operator installs plugins on the host
-  // CLIs themselves. Container agents build their own
-  // `/home/node/.agents/skills` from `/workspace/plugins` at spawn
-  // (container/agent-runner/src/codex-companion-setup.ts), so these host
-  // mirrors served nothing but the host's own Codex/OpenCode.
-  //
-  // Subagent mirrors below DO stay: they target `~/.codex*/agents`, which is
-  // bind-mounted into containers, so they are a container delivery path.
+  // Plugin skills are deliberately not mirrored to host CLI paths: containers build their own skill set from
+  // /workspace/plugins at spawn. Subagent mirrors stay: `~/.codex*/agents` is bind-mounted into containers.
   try {
     result.subagents = syncCodexSubagents();
     log.info('Codex subagent mirror refreshed', {
@@ -218,12 +169,7 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.marketplaceUpgrade = { changed: false, error: msg };
-    // ENOENT = no `codex` binary on the host PATH. This step only upgrades
-    // Git-sourced codex marketplaces; the local bootstrap marketplace is
-    // synced by syncCodexLocalMarketplacePluginCache below with pure file
-    // ops, so a missing host binary loses nothing. Hosts that never
-    // installed the codex CLI (containers carry their own) would otherwise
-    // log a spurious warn every hourly cycle.
+    // ENOENT: no host `codex` binary. Only Git-sourced marketplaces need it; the local one syncs by file ops below.
     if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
       if (!codexBinaryMissingLogged) {
         codexBinaryMissingLogged = true;
@@ -236,10 +182,8 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
     }
   }
 
-  // MUST run before the plugin cache is re-copied. A plugin whose upstream ships a
-  // symlinked SKILL.md has a materialized REAL copy under .nanoclaw/codex-skills/;
-  // that copy goes stale on `git pull`, and the cache would faithfully copy the stale
-  // file. Refreshing here makes a pull propagate all the way to what Codex reads.
+  // MUST run before the plugin cache is re-copied: materialized copies of symlinked SKILL.md files go stale on
+  // `git pull`, and the cache would copy the stale file.
   try {
     const materialized = refreshMaterializedCodexSkills();
     if (materialized.refreshed.length > 0) {
@@ -314,7 +258,6 @@ onHostStart(function pluginUpdaterHostStart() {
   // UNGUARDED — a synchronous startup failure must abort boot (§4.2).
   startPluginUpdater({
     notify: async (platformId, text) => {
-      // Parse the jid format: <channel_type>:<platform_id>[:<thread_id>]
       const parts = platformId.split(':');
       if (parts.length < 2) {
         log.warn('Plugin updater notify: malformed jid', { platformId });

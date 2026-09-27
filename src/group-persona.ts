@@ -7,12 +7,7 @@ function isErrno(err: unknown, code: string): boolean {
   return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: string }).code === code;
 }
 
-/**
- * Canonical per-group standing instructions file, prepended to every
- * provider's project document. Named for what it holds (operational standing
- * instructions), not "persona" — that name collided with the voice invariant
- * (voice lives ONLY in tone-profiles, never in a group instructions file).
- */
+/** Per-group standing instructions prepended to every provider's project document. */
 export const STANDING_INSTRUCTIONS_FILE = 'standing-instructions.md';
 
 /**
@@ -34,28 +29,10 @@ export function stageGroupPersona(groupDir: string, instructions: string): boole
 }
 
 /**
- * Read a group's standing instructions. Symlinks are followed ONLY when they
- * resolve inside the groups tree.
- *
- * Sibling agents that build together share one instruction set: the
- * sibling's path is a symlink to the source group's file. Sharing the file makes drift impossible rather
- * than merely detectable: a trio of siblings had silently diverged — two
- * running a stale revision of a rule, one missing five whole sections
- * including its QA-closure rules — because every edit landed on one copy.
- *
- * The containment check is the point. This file is inside the group directory,
- * which is mounted read-write into the container — an agent can create paths
- * here. An unrestricted symlink would therefore be a way to point its own
- * always-on prompt at content outside its trust boundary, which is source-level
- * self-modification without the approval flow that tier is supposed to have.
- *
- * `allowedRoots` must be the group's own directory plus its WORKGROUP siblings
- * — never the whole groups tree. A workgroup is the data-pool boundary and a
- * container mounts only its own group directory, so a sibling in a *different*
- * workgroup is not already-reachable content: following a link there would
- * inject another tenant's standing instructions or memory into this prompt. The
- * default is own-directory-only so a caller that forgets the set fails closed.
- * Anything resolving outside is refused and the persona omitted.
+ * Read a group's standing instructions, following a symlink (siblings share one file) only when it resolves inside
+ * `allowedRoots`: the group dir is agent-writable, so an unrestricted link would repoint its always-on prompt past
+ * its trust boundary. Pass the group plus its WORKGROUP siblings, never the whole groups tree (another workgroup is
+ * another tenant); the default is own-directory-only. Anything outside is treated as absent.
  */
 export function readGroupPersona(groupDir: string, allowedRoots?: string[]): string | null {
   const file = path.join(groupDir, STANDING_INSTRUCTIONS_FILE);
@@ -65,9 +42,7 @@ export function readGroupPersona(groupDir: string, allowedRoots?: string[]): str
     try {
       fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     } catch (err) {
-      // ELOOP is the only signal that the path IS a symlink. Resolve it and
-      // require containment before reading; a target outside the allowed set
-      // is treated as absent, not an error worth failing the spawn over.
+      // ELOOP is the only signal that the path is a symlink; an out-of-bounds target reads as absent, not an error.
       if (!isErrno(err, 'ELOOP')) throw err;
       const target = fs.realpathSync(file);
       const contained = roots.some((root) => target === root || target.startsWith(root + path.sep));
@@ -79,17 +54,12 @@ export function readGroupPersona(groupDir: string, allowedRoots?: string[]): str
         });
         return null;
       }
-      // O_NOFOLLOW again: `target` is a realpath so it is not itself a link,
-      // and re-asserting that closes the window between resolve and open.
+      // O_NOFOLLOW again closes the window between resolve and open.
       fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     }
     if (!fs.fstatSync(fd).isFile()) return null;
     const content = fs.readFileSync(fd, 'utf-8').trim();
-    // Instruction-surface budget (warn-only). Every byte here is re-read on
-    // every wake of every session in the group; policy that can be a tool, a
-    // check, or a script-emitted field should not live in the always-on
-    // prompt. Over budget = convert a sentence, not grow the prompt. Stays a
-    // log line until the fleet is under; a write refusal can ratchet later.
+    // Warn-only budget: every byte is re-read on every wake of every session in the group.
     const budget = Number(process.env.PERSONA_BUDGET_BYTES) || 24_000;
     if (content.length > budget) {
       log.warn('Group standing instructions exceed the persona byte budget', {

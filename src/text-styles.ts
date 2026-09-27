@@ -1,39 +1,19 @@
-/**
- * parseTextStyles — convert Claude's Markdown output to channel-native formatting.
- *
- * Claude outputs standard Markdown. Each channel has its own text style syntax:
- *   - Signal:    passthrough (SignalChannel handles rich text styles natively
- *                via the signal-cli JSON-RPC textStyle param — see parseSignalStyles)
- *   - Telegram:  *bold*, _italic_, no headings, plain links
- *   - Slack:     *bold*, _italic_, <url|text> links
- *   - Discord:   passthrough (already Markdown)
- *
- * Code blocks (fenced and inline) are NEVER transformed by marker substitution.
- */
+/** Claude's Markdown to channel-native formatting; code (fenced and inline) is never marker-substituted. */
 
 export type ChannelType = 'signal' | 'telegram' | 'slack' | 'discord';
 
-/** Transform Markdown text for the target channel's native format. */
 export function parseTextStyles(text: string, channel: ChannelType): string {
   if (!text) return text;
 
-  // Discord and Signal are passthrough — no marker substitution.
-  // Discord is already Markdown; Signal uses parseSignalStyles() for rich text.
   if (channel === 'discord' || channel === 'signal') return text;
 
-  // Split into protected (code) and unprotected regions, transform only the latter.
   const segments = splitProtectedRegions(text);
   return segments
     .map(({ content, protected: isProtected }) => (isProtected ? content : transformSegment(content, channel)))
     .join('');
 }
 
-// ---------------------------------------------------------------------------
-// Signal rich-text formatting
-// ---------------------------------------------------------------------------
-
 export interface SignalTextStyle {
-  /** One of Signal's supported text styles. */
   style: 'BOLD' | 'ITALIC' | 'STRIKETHROUGH' | 'MONOSPACE' | 'SPOILER';
   /** Start position in the final message string, in UTF-16 code units. */
   start: number;
@@ -42,22 +22,8 @@ export interface SignalTextStyle {
 }
 
 /**
- * Parse Claude's Markdown into a plain string + Signal textStyle ranges.
- *
- * The returned `text` has all markdown markers stripped.  The `textStyle`
- * array uses UTF-16 code-unit offsets (JavaScript's native string indexing),
- * matching what signal-cli's JSON-RPC `send.textStyle` param expects.
- *
- * Supported patterns:
- *   **bold**          → BOLD
- *   *italic*          → ITALIC
- *   _italic_          → ITALIC
- *   ~~strike~~        → STRIKETHROUGH
- *   `inline code`     → MONOSPACE
- *   ```code block```  → MONOSPACE
- *   ## Heading        → BOLD (markers stripped)
- *   [text](url)       → "text (url)"  (no style)
- *   ---               → removed
+ * Markdown to plain text plus Signal textStyle ranges, in UTF-16 code units as signal-cli's `send.textStyle`
+ * expects. Links become "text (url)", headings BOLD, horizontal rules are dropped.
  */
 export function parseSignalStyles(rawText: string): {
   text: string;
@@ -75,30 +41,25 @@ export function parseSignalStyles(rawText: string): {
   }
 
   while (i < n) {
-    // ── Fenced code block  ```[lang]\n...\n``` ──────────────────────────
     if (s[i] === '`' && s[i + 1] === '`' && s[i + 2] === '`') {
       const langNl = s.indexOf('\n', i + 3);
       if (langNl !== -1) {
-        // Find closing ``` on its own line
         const closeAt = s.indexOf('\n```', langNl);
         if (closeAt !== -1) {
           const content = s.slice(langNl + 1, closeAt);
           const startOut = out.length;
           out += content;
           addStyle('MONOSPACE', startOut, out.length);
-          // Advance past \n``` + optional trailing newline
           const afterClose = s.indexOf('\n', closeAt + 4);
           i = afterClose !== -1 ? afterClose + 1 : n;
           continue;
         }
       }
-      // Malformed fence — copy literally
       out += s[i];
       i++;
       continue;
     }
 
-    // ── Inline code  `text` ────────────────────────────────────────────
     if (s[i] === '`') {
       const end = s.indexOf('`', i + 1);
       const nl = s.indexOf('\n', i + 1);
@@ -112,7 +73,6 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── Bold  **text** ─────────────────────────────────────────────────
     if (s[i] === '*' && s[i + 1] === '*' && s[i + 2] && s[i + 2] !== ' ') {
       const end = s.indexOf('**', i + 2);
       if (end !== -1 && s[end - 1] !== ' ') {
@@ -125,7 +85,6 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── Strikethrough  ~~text~~ ────────────────────────────────────────
     if (s[i] === '~' && s[i + 1] === '~' && s[i + 2] && s[i + 2] !== ' ') {
       const end = s.indexOf('~~', i + 2);
       if (end !== -1) {
@@ -138,7 +97,6 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── Italic  *text*  (single star, not part of **) ─────────────────
     if (s[i] === '*' && s[i + 1] !== '*' && s[i + 1] !== ' ' && s[i + 1] !== undefined) {
       const end = findClosingStar(s, i + 1);
       if (end !== -1) {
@@ -151,10 +109,8 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── Italic  _text_  (only at word boundaries) ──────────────────────
     if (s[i] === '_' && s[i + 1] !== '_' && s[i + 1] !== ' ' && s[i + 1]) {
-      // Guard against snake_case: only treat as italic when preceded by a
-      // non-word character (or start of string).
+      // Not after a word character: snake_case is not italic.
       const prevChar = i > 0 ? s[i - 1] : '';
       if (!/\w/.test(prevChar)) {
         const end = findClosingUnderscore(s, i + 1);
@@ -169,7 +125,6 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── ATX Heading  ## text → text (as BOLD) ─────────────────────────
     if ((i === 0 || s[i - 1] === '\n') && s[i] === '#') {
       let j = i;
       while (j < n && s[j] === '#') j++;
@@ -187,7 +142,6 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── Links  [text](url) → text (url) ───────────────────────────────
     if (s[i] === '[') {
       const closeBracket = s.indexOf(']', i + 1);
       if (closeBracket !== -1 && s[closeBracket + 1] === '(') {
@@ -202,7 +156,6 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── Horizontal rule  --- / *** / ___ ──────────────────────────────
     if (i === 0 || s[i - 1] === '\n') {
       const hrMatch = /^(-{3,}|\*{3,}|_{3,}) *(\n|$)/.exec(s.slice(i));
       if (hrMatch) {
@@ -211,7 +164,6 @@ export function parseSignalStyles(rawText: string): {
       }
     }
 
-    // ── Default: copy character, preserving surrogate pairs ───────────
     const code = s.charCodeAt(i);
     if (code >= 0xd800 && code <= 0xdbff && i + 1 < n) {
       out += s[i] + s[i + 1];
@@ -225,11 +177,6 @@ export function parseSignalStyles(rawText: string): {
   return { text: out, textStyle };
 }
 
-// ---------------------------------------------------------------------------
-// Helpers for parseSignalStyles
-// ---------------------------------------------------------------------------
-
-/** Find the position of a closing single `*` that isn't part of `**`. */
 function findClosingStar(s: string, from: number): number {
   for (let i = from; i < s.length; i++) {
     if (s[i] === '\n') return -1; // italics don't span lines
@@ -238,7 +185,6 @@ function findClosingStar(s: string, from: number): number {
   return -1;
 }
 
-/** Find the closing `_` that isn't part of `__` and is at a word boundary. */
 function findClosingUnderscore(s: string, from: number): number {
   for (let i = from; i < s.length; i++) {
     if (s[i] === '\n') return -1;
@@ -248,10 +194,6 @@ function findClosingUnderscore(s: string, from: number): number {
   }
   return -1;
 }
-
-// ---------------------------------------------------------------------------
-// Marker-substitution helpers (Telegram / Slack)
-// ---------------------------------------------------------------------------
 
 interface Segment {
   content: string;
@@ -287,14 +229,7 @@ function splitProtectedRegions(text: string): Segment[] {
   return segments.length > 0 ? segments : [{ content: text, protected: false }];
 }
 
-/**
- * Apply `transform` to every region of `text` that is NOT inside a fenced
- * (```...```) or inline (`...`) code block. Code regions are passed through
- * unchanged. Returns the recombined string.
- *
- * Use this for Markdown→Markdown rewrites that should never touch code
- * (link rewriting, heading bumping, marker substitution).
- */
+/** Apply `transform` to every region of `text` outside fenced and inline code. */
 export function transformOutsideProtectedRegions(text: string, transform: (segment: string) => string): string {
   if (!text) return text;
   return splitProtectedRegions(text)
@@ -302,12 +237,7 @@ export function transformOutsideProtectedRegions(text: string, transform: (segme
     .join('');
 }
 
-/**
- * Apply `transform` to the CONTENT of inline code spans (`...`) only.
- * Fenced blocks and non-code text pass through unchanged — the complement
- * of transformOutsideProtectedRegions, for the rare rewrite that must reach
- * into inline code (e.g. normalizing bot IDs inside gate-syntax examples).
- */
+/** Apply `transform` to the content of inline code spans only; the complement of transformOutsideProtectedRegions. */
 export function transformInsideInlineCode(text: string, transform: (inner: string) => string): string {
   if (!text) return text;
   return splitProtectedRegions(text)
@@ -321,11 +251,8 @@ export function transformInsideInlineCode(text: string, transform: (inner: strin
 }
 
 /**
- * Markdown→Markdown: `## Heading` → `**Heading**`. For chat-adapters that
- * render ATX headings as plain text but bold natively — pre-bumping keeps
- * heading emphasis without leaving the `markdown` delivery path (which is
- * where rich-block features like Slack Block Kit tables live). Code regions
- * are passed through untouched.
+ * `## Heading` → `**Heading**`, for adapters that render ATX headings as plain text but bold natively; keeps the
+ * `markdown` delivery path (where rich blocks like Slack Block Kit tables live).
  */
 export function markdownHeadingsToBold(text: string): string {
   return transformOutsideProtectedRegions(text, (s) =>
@@ -333,33 +260,23 @@ export function markdownHeadingsToBold(text: string): string {
   );
 }
 
-/** Apply marker-substitution transformations to a non-code segment. */
 function transformSegment(text: string, channel: ChannelType): string {
   let t = text;
 
-  // Order matters: italic before bold.
-  // The italic regex won't match **bold** (it requires the char after the opening *
-  // to be a non-* non-space), so running italic first is safe.  If we ran bold
-  // first (**bold** → *bold*), the italic step would immediately re-convert *bold*
-  // to _bold_, producing wrong output.
-
-  // 1. Italic: *text* → _text_ (telegram/slack use _)
+  // Italic before bold: bold first (**b** → *b*) would be re-converted to _b_ by the italic step.
   t = t.replace(/(?<!\*)\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?!\*)/g, '_$1_');
 
-  // 2. Bold: **text** → *text* (telegram/slack use single *)
   t = t.replace(/\*\*(?=[^\s*])([^*]+?)(?<=[^\s*])\*\*/g, '*$1*');
 
-  // 3. Headings: ## Title → *Title* (any level, line-start only)
   t = t.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
 
-  // 4. Links
   if (channel === 'slack') {
     t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>');
   } else {
     t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
   }
 
-  // 5. Horizontal rules: collapse rule + surrounding blank lines into single paragraph break
+  // Collapse a rule and its surrounding blank lines into one paragraph break.
   t = t.replace(/\n*^(-{3,}|\*{3,}|_{3,})$\n*/gm, '\n\n');
 
   return t;

@@ -1,19 +1,9 @@
 /**
- * Upstream seam-port manifest (host-lifecycle seam + the seam-3 DbDriver layer).
- *
- * The file(s) listed in UPSTREAM_FILES are ported byte-for-byte from upstream
- * nanocoai/nanoclaw and must never be hand-edited — src/host-lifecycle-seam.test.ts
- * fails the build if any of them drifts from src/host-lifecycle-seam/UPSTREAM-MANIFEST.json.
- *
- * To intentionally sync with a newer upstream commit, re-run:
- *   pnpm exec tsx scripts/host-lifecycle-seam-manifest.ts --update <upstream-sha>
- * from a worktree that has upstream's commit objects (e.g. after `git fetch
- * upstream`), review the resulting diff, then commit the regenerated manifest
- * alongside the ported file changes.
- *
- * See docs/specs/upstream-host-sweep-seam/plan.md §4.6.1. Same vendor-then-CLI-shim
- * split, and the same manifest-over-`git show` reasoning (CI's clone carries no
- * upstream objects), as src/mailbox-seam-manifest.ts + scripts/mailbox-seam-manifest.ts.
+ * Upstream seam-port manifest (host-lifecycle seam and the DbDriver layer): UPSTREAM_FILES are ported byte-for-byte
+ * and must never be hand-edited (src/host-lifecycle-seam.test.ts fails on drift). Hashes live in a manifest because
+ * CI's clone carries no upstream objects. To re-pin, run
+ * `pnpm exec tsx scripts/host-lifecycle-seam-manifest.ts --update <upstream-sha>` from a worktree with upstream's
+ * objects and commit the manifest with the ported changes.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,19 +15,8 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 export const MANIFEST_PATH = path.join(REPO_ROOT, 'src/host-lifecycle-seam/UPSTREAM-MANIFEST.json');
 
 /**
- * Every file ported verbatim from upstream, across both seams that have landed
- * one: the host-lifecycle seam (`src/host-lifecycle.ts`) and the async
- * central-DB driver layer (everything under `src/db/driver*` /
- * `src/db/drivers/` / `src/db/testing/` plus `src/db/compose.ts`).
- *
- * The driver files replaced the fork's type-only `DbDriver` stand-in, whose
- * "exactly one importer" pin retired with it — a stand-in needs its blast radius
- * capped, a real upstream file needs byte-equality, and that is this manifest's
- * job. `src/db/connection.ts` is deliberately NOT here: it is fork-adapted
- * (`getRawDb`/`hasTableRaw`, fork init semantics), so the upstream ratchet
- * measures it as ordinary divergence instead.
- *
- * All entries share one pinned upstream commit, so a re-pin re-hashes them all.
+ * One pinned upstream commit for all entries. `src/db/connection.ts` is deliberately absent: it is fork-adapted
+ * (`getRawDb`/`hasTableRaw`), so the upstream ratchet measures it as ordinary divergence.
  */
 export const UPSTREAM_FILES = [
   'src/db/compose.ts',
@@ -53,16 +32,8 @@ export const UPSTREAM_FILES = [
 ] as const;
 
 /**
- * Upstream files this fork CANNOT carry byte-for-byte, with the fork-owned test that
- * covers the same invariants instead. Same shape and same reasoning as
- * src/mailbox-seam-manifest.ts's UNPORTABLE_UPSTREAM_FILES — see
- * that file's header comment for the general rationale.
- *
- * This is not a deferral and never becomes one: adding such a file to UPSTREAM_FILES
- * would put a permanently red test in CI (three of its cases hard-code assumptions this
- * fork's boot topology does not share). The seam test asserts both halves of that — the
- * fork-owned replacement exists with a written reason, and the upstream path stays out
- * of UPSTREAM_FILES.
+ * Upstream files this fork CANNOT carry byte-for-byte, each with the fork-owned test covering the same invariants.
+ * Never a deferral: in UPSTREAM_FILES they would be a permanently red test.
  */
 export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
   upstream: string;

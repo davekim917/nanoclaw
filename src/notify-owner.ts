@@ -1,45 +1,9 @@
 /**
- * src/notify-owner.ts — deliver one host-ops alert to the owner's DM, with a
- * VERIFIED receipt, depending on neither the nanoclaw-v2 host process nor the
- * OneCLI gateway.
- *
- * WHY THIS EXISTS
- * ----------------
- * Three host-ops watchdogs (check-onecli-gateway-fds.sh, health-sentinel.sh,
- * check-onecli-drift.sh) used to "deliver" their alert by writing a `to:`
- * payload to `data/cli.sock`. That socket is the CLI *channel adapter*
- * (src/channels/cli.ts) — a payload with `to:` builds an InboundEvent and
- * calls `routeInbound`. It never posts to the platform directly: it queues a
- * row in the session's inbound.db and wakes a container, which must then
- * spawn and compose a reply before the owner sees anything. Spawn is REFUSED
- * while the OneCLI gateway is unreachable (src/container-runner.ts), so the
- * agent path is undeliverable in exactly the case those watchdogs exist to
- * report. Worse, `sock.sendall()` returns success unconditionally — there is
- * no ack frame on this path — so a script had no way to tell "delivered" from
- * "queued into a hole".
- *
- * This module posts directly to Slack's Web API and only reports success on
- * a verified `ok: true` response. It has no dependency on nanoclaw-v2 being
- * up, on a container spawning, or on the OneCLI gateway.
- *
- * The CLI entry point (arg parsing, stdin, exit-code mapping) lives in
- * scripts/notify-owner.ts, which imports the core from here. This half is in
- * `src/` — not `scripts/` — because `dist/` compiles `src/**` only
- * (tsconfig.json), and src/main.ts needs to call `notifyOwner` at boot
- * (build-drift detection) without reaching outside the compiled tree.
- *
- * Usage (CLI):
- *   tsx scripts/notify-owner.ts --title "<title>" --body "<body>"
- *   tsx scripts/notify-owner.ts --title "<title>" --body -   # body from stdin
- *
- * Exit codes (distinct on purpose — shell callers branch on them):
- *   0 — delivered, receipt verified. One safe line on stdout (channel id only).
- *   2 — cannot even try: no owner DM row resolved, the owner's channel type
- *       isn't one this script can post to (Slack only, today), or no bot
- *       token is configured for it. Reason on stderr.
- *   1 — tried and failed: Slack API error, `ok:false`, or a network failure.
- *       Reason on stderr, including Slack's error code when present.
- * A token value is NEVER printed, logged, or included in any exit message.
+ * Deliver one host-ops alert to the owner's Slack DM with a VERIFIED `ok: true` receipt, depending on neither the
+ * nanoclaw-v2 host nor the OneCLI gateway. `data/cli.sock` cannot do this: it queues an inbound message whose reply
+ * needs a container spawn, which is refused while the gateway is down, and `sendall()` reports success regardless.
+ * CLI: scripts/notify-owner.ts; exit 0 delivered, 2 cannot try (no owner DM, non-Slack, no token), 1 tried and
+ * failed. A token value is NEVER printed or logged.
  */
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -52,16 +16,8 @@ import { extractSlackChannelId } from './channels/slack.js';
 import { formatLocalStamp, isValidTimezone } from './timezone.js';
 
 /**
- * This install's root, derived from THIS FILE's location — deliberately not
- * the cwd-derived paths in `src/config.ts` (`PROJECT_ROOT = process.cwd()`).
- * Every caller happens to `cd` first, but an alerting
- * primitive must not read a different install's central DB or `.env`
- * because someone invoked it from elsewhere: the failure mode is a silent
- * exit 2 ("no owner DM") at the exact moment an alert matters.
- *
- * `src/` sits at the same depth as `scripts/` (both one level below the
- * repo root), so the two `'..'` segments resolve to the repo root the same
- * way regardless of which of the two this file lives in.
+ * From THIS FILE's location, not `src/config.ts`'s cwd-derived paths: invoked from elsewhere, an alerting primitive
+ * would read another install's DB and exit 2 exactly when the alert matters.
  */
 export const INSTALL_ROOT = path.resolve(fileURLToPath(import.meta.url), '..', '..');
 export const OWNER_DB_PATH = path.join(INSTALL_ROOT, 'data', 'v2.db');
@@ -71,14 +27,7 @@ interface OwnerDm {
   channelType: string;
 }
 
-/**
- * Every resolved owner DM, newest first — not just the newest one. An owner
- * can have DMs cached on several platforms and several Slack instances (this
- * install has seven), and taking only `LIMIT 1` means one unusable row — a
- * non-Slack platform, or a Slack instance whose token is not configured —
- * silences the alert even though a perfectly good DM sits behind it.
- * Read-only; never creates or migrates the DB.
- */
+/** Every owner DM, newest first: one unusable row (non-Slack, no token) must not silence the alert. Read-only. */
 function resolveOwnerDms(dbPath: string): OwnerDm[] {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
@@ -97,28 +46,19 @@ function resolveOwnerDms(dbPath: string): OwnerDm[] {
   }
 }
 
-/**
- * The install timezone, resolved from THIS install's `.env` rather than
- * `src/config.ts`'s `TIMEZONE`, which is a module-level constant built from
- * `process.cwd()` at import time. Same precedence and the same exported
- * validator as `resolveConfigTimezone` (config.ts) — only the `.env` it
- * reads differs. config.ts is upstream-owned, so parameterizing it there
- * would grow the divergence ratchet for a two-caller helper.
- */
+/** The install timezone from THIS install's `.env`, with `resolveConfigTimezone`'s precedence and validator. */
 function resolveInstallTimezone(rootDir: string): string {
   const candidates = [process.env.TZ, readEnvValue(rootDir, 'TZ'), Intl.DateTimeFormat().resolvedOptions().timeZone];
   for (const tz of candidates) if (tz && isValidTimezone(tz)) return tz;
   return 'UTC';
 }
 
-/** Whether this channel type is one this script can post to. Slack only, today. */
 function isSlackChannelType(channelType: string): boolean {
   return channelType === 'slack' || channelType.startsWith('slack-');
 }
 
 export interface NotifyResult {
   code: 0 | 1 | 2;
-  /** stdout line on 0 (safe: names the channel, never the token); stderr reason on 1/2. */
   message: string;
 }
 
@@ -131,7 +71,7 @@ export interface NotifyOwnerOptions {
   now?: Date;
 }
 
-/** Core delivery logic, exported for tests. Never throws — every failure mode returns a NotifyResult. */
+/** Never throws: every failure mode returns a NotifyResult. */
 export async function notifyOwner(opts: NotifyOwnerOptions): Promise<NotifyResult> {
   const dbPath = opts.dbPath ?? OWNER_DB_PATH;
   const rootDir = opts.rootDir ?? INSTALL_ROOT;
@@ -149,9 +89,6 @@ export async function notifyOwner(opts: NotifyOwnerOptions): Promise<NotifyResul
   }
   if (owners.length === 0) return { code: 2, message: 'no owner DM resolved in user_dms — nobody to notify' };
 
-  // Walk the candidates newest-first and take the first one we can actually
-  // post to. Giving up on the newest row alone would let one unusable DM mute
-  // an alert that a later row could have carried.
   let owner: OwnerDm | undefined;
   let token: string | undefined;
   const skipped: string[] = [];

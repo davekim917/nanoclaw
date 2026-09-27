@@ -1,26 +1,8 @@
 /**
- * Container rebuild watcher — event-driven, not polled.
- *
- * Old design polled every 60s comparing the running image's commit label
- * against origin/main (~1440 ticks/day for ~8 real events). container-runner.ts
- * already computes the authoritative "this image is stale and is actively
- * blocking work" signal on every spawn — checkAgentRunnerDepsDrift() in
- * agent-runner-image-check.ts. When that check refuses a spawn, it calls
- * requestContainerRebuild() here instead of waiting for a timer to notice.
- *
- * requestContainerRebuild() never blocks the caller: it's a synchronous,
- * fire-and-forget kickoff. The refusal still throws immediately; host-sweep
- * retries the spawn, and by then the rebuild (if one ran) has likely landed.
- *
- * Single-flight in-process (rebuildPromise) coalesces a wake-storm of
- * concurrent refusals into one rebuild — container/build.sh's flock on
- * logs/container-build.lock is the cross-process backstop, not duplicated
- * here. A failed attempt (build failure, or a precondition that means a
- * rebuild wouldn't help anyway) starts a MIN_RETRY_INTERVAL_MS cooldown so a
- * persistently broken build doesn't get retried on every subsequent refused
- * spawn; a successful rebuild clears it. Repeated identical failures are
- * deduped (lastNotifiedDetail) so the operator gets one actionable message,
- * not one per refused spawn.
+ * Rebuilds the agent image when the spawn path's deps-drift check (agent-runner-image-check.ts) refuses a spawn.
+ * requestContainerRebuild never blocks: the refusal still throws and host-sweep retries the spawn. In-process
+ * single-flight coalesces concurrent refusals (build.sh's flock is the cross-process backstop); a failure starts a
+ * cooldown and identical failures notify once.
  */
 import { execFile } from 'child_process';
 import path from 'path';
@@ -33,16 +15,12 @@ import { log } from './log.js';
 
 const execFileAsync = promisify(execFile);
 
-// Floor between rebuild attempts once one has failed (or a precondition
-// determined a rebuild wouldn't help). Prevents a storm of back-to-back
-// rebuild attempts when spawns keep getting refused for the same unresolved
-// reason. A successful rebuild resets this to null.
+// Cooldown after a failed attempt, so a persistently refused spawn does not retry-storm the build.
 export const MIN_RETRY_INTERVAL_MS = 10 * 60_000;
 
 const BUILD_SCRIPT = path.join(REPO_ROOT, 'container', 'build.sh');
 
-// Same full reference container-runner.ts spawns from — CONTAINER_IMAGE
-// resolves to `<install-slug-base>:<tag>` (default `:latest`).
+// The exact reference container-runner.ts spawns from.
 const IMAGE_REF = CONTAINER_IMAGE;
 const tagColon = IMAGE_REF.lastIndexOf(':');
 const IMAGE_TAG = tagColon >= 0 ? IMAGE_REF.slice(tagColon + 1) : 'latest';
@@ -68,18 +46,12 @@ export function _pendingRebuildForTest(): Promise<void> | null {
   return rebuildPromise;
 }
 
-/**
- * Test-only: set the notifier directly without running startContainerRebuildWatcher's
- * startup check side effect, so requestContainerRebuild tests don't have to
- * race that check's own async settlement.
- */
+/** Test-only: set the notifier without the startup check's async side effect. */
 export function _setNotifierForTest(notifier: Notifier | null): void {
   notify = notifier;
 }
 
-// Same gotcha as repo-freshness: the service env proxies HTTPS through the
-// onecli gateway, which overrides Authorization; GitHub creds are env-only,
-// so proxied fetches always fail auth. Bypass the proxy for github.com.
+// The service env proxies HTTPS through the OneCLI gateway, which overrides Authorization and fails GitHub auth.
 const GIT_ENV = {
   ...process.env,
   NO_PROXY: [process.env.NO_PROXY, 'github.com'].filter(Boolean).join(','),
@@ -93,11 +65,7 @@ async function git(...args: string[]): Promise<string> {
 
 const short = (sha: string): string => sha.slice(0, 7);
 
-/**
- * Returns the running image's `nanoclaw.commit` label (stamped by
- * `container/build.sh`), or null when the image doesn't exist or wasn't
- * built by a version of build.sh that stamps the label.
- */
+/** The image's `nanoclaw.commit` label (stamped by build.sh), or null when the image or label is missing. */
 async function imageCommitLabel(): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
@@ -118,14 +86,8 @@ interface StalenessCheck {
 }
 
 /**
- * Decide whether the image needs a rebuild, purely from git history vs the
- * image's commit label (independent of the deps-hash check that triggers
- * requestContainerRebuild). Kept as a precondition: if this says the image
- * already reflects origin/main's container/ content, a deps-drift refusal
- * means something else is wrong — a rebuild driven by stale/local disk state
- * would just paper over it (and mislabel the image), so we say so instead of
- * looping. See headCoversOriginMainContainer() for the "would a rebuild here
- * actually pick up origin/main's fix" half of the decision.
+ * Whether the image lags origin/main's container/ content, from git history alone. Not stale while a deps-drift
+ * refusal fires means something else is wrong; a rebuild from disk would only paper over it (and mislabel the image).
  */
 async function checkStaleness(): Promise<StalenessCheck> {
   const [toSha, imageCommit] = await Promise.all([git('rev-parse', 'origin/main'), imageCommitLabel()]);
@@ -152,13 +114,8 @@ async function checkStaleness(): Promise<StalenessCheck> {
 }
 
 /**
- * True when HEAD already contains everything origin/main has under
- * container/ — building from the working tree right now bakes in the same
- * container/ content a `git pull` would produce. False means origin/main has
- * container/-relevant commits HEAD lacks: building anyway would bake
- * whatever's on disk (possibly unrelated local edits, per CLAUDE.md's
- * warning that build.sh builds from the working tree) into the canonical
- * spawn image instead of what's actually reviewed and merged upstream.
+ * True when HEAD already has everything origin/main has under container/. False: build.sh builds the working tree,
+ * so building now would bake unreviewed disk state into the spawn image instead of what was merged.
  */
 async function headCoversOriginMainContainer(originMainSha: string): Promise<boolean> {
   const headSha = await git('rev-parse', 'HEAD');
@@ -195,7 +152,6 @@ async function runStep(
   }
 }
 
-/** Failure path: start the retry cooldown, dedup, and notify. */
 async function fail(detail: string): Promise<void> {
   lastFailureAt = Date.now();
   if (detail === lastNotifiedDetail) {
@@ -212,7 +168,6 @@ async function fail(detail: string): Promise<void> {
   }
 }
 
-/** Success path: clear the cooldown/dedup state and send a quiet confirmation. */
 async function succeed(headSha: string): Promise<void> {
   lastFailureAt = null;
   lastNotifiedDetail = null;
@@ -269,16 +224,9 @@ async function attemptRebuild(reason: string): Promise<void> {
     );
   }
 
-  // Pass the exact image reference container-runner.ts spawns from. build.sh
-  // honors CONTAINER_IMAGE_REF when set — without this, build.sh derives its
-  // own base via container_image_base() and can drift from what we inspect if
-  // CONTAINER_IMAGE is overridden (env var, custom install slug, etc.).
-  //
-  // Deliberately no `git pull` here: build.sh builds from the WORKING TREE
-  // while stamping NANOCLAW_COMMIT from `git rev-parse HEAD`.
-  // Moving the operator's live checkout out from under them is out of scope
-  // for an automated process, and a build against a dirty tree would produce
-  // an image whose commit label misrepresents its actual contents anyway.
+  // build.sh honors CONTAINER_IMAGE_REF; without it, it derives its own base and can drift from IMAGE_REF. No
+  // `git pull`: the operator's live checkout is not ours to move, and build.sh stamps HEAD while building the
+  // working tree, so a dirty tree would mislabel the image.
   const result = await runStep('image rebuild', 'bash', [BUILD_SCRIPT, IMAGE_TAG], 900_000, 500, {
     ...GIT_ENV,
     CONTAINER_IMAGE_REF: IMAGE_REF,
@@ -292,13 +240,7 @@ async function attemptRebuild(reason: string): Promise<void> {
   return succeed(headSha);
 }
 
-/**
- * Request a rebuild. Fire-and-forget: returns immediately, never awaited by
- * callers on the spawn path. Concurrent calls while a rebuild is already in
- * flight coalesce into that one attempt; calls within MIN_RETRY_INTERVAL_MS
- * of a failed attempt are dropped silently (the failure was already
- * notified) so a persistently refused spawn doesn't retry-storm the build.
- */
+/** Fire-and-forget; coalesces into an in-flight attempt, and is dropped silently within the failure cooldown. */
 export function requestContainerRebuild(reason: string): void {
   if (rebuildPromise) return;
   if (lastFailureAt !== null && Date.now() - lastFailureAt < MIN_RETRY_INTERVAL_MS) return;
@@ -311,12 +253,7 @@ export function requestContainerRebuild(reason: string): void {
     });
 }
 
-/**
- * Wire the rebuild notifier. No timer/poll loop anymore — "start" just means
- * "the watcher is now listening", plus one startup check so a host that
- * boots with an already-stale image doesn't sit quiet until the first
- * refused spawn finds out.
- */
+/** Wire the notifier plus one startup check, so a host booting with a stale image hears it before a refused spawn. */
 export function startContainerRebuildWatcher(notifier?: Notifier): void {
   if (started) return;
   started = true;

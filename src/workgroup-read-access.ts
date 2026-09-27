@@ -1,10 +1,4 @@
-/**
- * Explicit, host-owned read access from one workgroup to another.
- *
- * The policy lives below DATA_DIR, outside every agent-writable group folder.
- * It names workgroup IDs from the central DB; no directory name supplied by an
- * agent or policy can be used as an arbitrary host-path segment.
- */
+/** Host-owned read access between workgroups; the policy lives outside every agent-writable folder, keyed by DB ids. */
 import fs from 'fs';
 import path from 'path';
 
@@ -118,9 +112,7 @@ function realMountSourceOrNull(hostPath: string, trustedRoot: string, directoryO
       { cause: error },
     );
   }
-  // The mount source itself must be an actual file or directory. Deliberately do not
-  // resolve or add targets of symlinks inside it: a link is data, never a
-  // cross-workgroup grant to its host target.
+  // Symlinks inside are never resolved: a link is data, never a cross-workgroup grant to its host target.
   if ((!stat.isDirectory() && !stat.isFile()) || stat.isSymbolicLink() || (directoryOnly && !stat.isDirectory())) {
     throw new Error(
       `Workgroup read-access source must be a real ${directoryOnly ? 'directory' : 'file or directory'}: ${hostPath}`,
@@ -153,9 +145,7 @@ function requestPaths(sourceId: string, mode: WorkgroupReadAccessMode): Workgrou
   const requests: WorkgroupReadAccessRequest[] = [];
   const workgroupsRoot = path.join(DATA_DIR, 'workgroups');
   const workgroupRoot = path.join(DATA_DIR, 'workgroups', sourceId);
-  // validateAdditionalMounts owns the `/workspace/extra/` prefix and accepts
-  // only relative paths. Keep requests in that form; validated mounts below
-  // carry the final absolute container path.
+  // validateAdditionalMounts accepts only paths relative to `/workspace/extra/`.
   const containerRoot = `${WORKGROUP_READ_ACCESS_RELATIVE_ROOT}/${sourceId}`;
   if (mode === 'archives') {
     const realWorkgroupRoot = realDirectoryOrNull(workgroupRoot, workgroupsRoot);
@@ -170,13 +160,9 @@ function requestPaths(sourceId: string, mode: WorkgroupReadAccessMode): Workgrou
     return requests;
   }
 
-  // Keep the entire workgroup tree available as one bounded, read-only mount.
-  // It lives below `files` so the separately stored project roots can sit next
-  // to memory/conversations without nested mounts under a read-only parent.
+  // Below `files`, so project roots can sit beside it without nesting under a read-only parent.
   addDirectoryRequest(requests, workgroupRoot, `${containerRoot}/files`, workgroupsRoot);
-  // Current project locations are separate host-owned roots, so they are not
-  // silently omitted by an "all" grant. These fixed paths are never derived
-  // from a policy-provided path.
+  // Project roots are separate host-owned fixed paths, never derived from the policy.
   const repositoriesRoot = path.join(DATA_DIR, 'repositories');
   addDirectoryRequest(
     requests,
@@ -193,9 +179,7 @@ function requestPaths(sourceId: string, mode: WorkgroupReadAccessMode): Workgrou
     `${containerRoot}/legacy-threads`,
     legacyThreadsRoot,
   );
-  // Preserve the historic archive paths for agent tools and existing operator
-  // configuration. They intentionally duplicate directories visible below
-  // `files`; both binds are read-only and neither follows source symlinks.
+  // Legacy archive paths, kept for existing tools and config; duplicates of `files`, read-only either way.
   const realWorkgroupRoot = realDirectoryOrNull(workgroupRoot, workgroupsRoot);
   if (realWorkgroupRoot !== null) {
     addDirectoryRequest(requests, path.join(workgroupRoot, 'memory'), `${containerRoot}/memory`, realWorkgroupRoot);
@@ -209,11 +193,7 @@ function requestPaths(sourceId: string, mode: WorkgroupReadAccessMode): Workgrou
   return requests;
 }
 
-/**
- * Load and validate the policy for a spawn-resolved recipient workgroup.
- * Missing policy is the safe default: no cross-workgroup mounts. Any present
- * but malformed policy aborts the spawn rather than retaining stale access.
- */
+/** Missing policy means no cross-workgroup mounts; a malformed one aborts the spawn rather than keep stale access. */
 export async function resolveWorkgroupReadAccess(recipientId: string): Promise<ResolvedWorkgroupReadAccess | null> {
   let contents: string;
   try {
@@ -253,7 +233,6 @@ export async function resolveWorkgroupReadAccess(recipientId: string): Promise<R
   };
 }
 
-/** The provider-neutral discovery text generated from the same resolved grant as the mounts. */
 export function workgroupReadAccessInstructions(
   access: ResolvedWorkgroupReadAccess | null,
   mounted: readonly Pick<VolumeMount, 'containerPath' | 'readonly'>[],
@@ -286,10 +265,8 @@ function isWithin(parent: string, child: string, separator: string): string | nu
 }
 
 /**
- * A configured additional mount may use the shared namespace only when it is
- * an exact read-only overlay of an already granted source. This keeps legacy
- * archive entries harmless while making the host policy the only authority
- * capable of adding a workgroup source.
+ * A configured mount may use the shared namespace only as an exact read-only overlay of a granted source, so only
+ * the host policy can add a workgroup source.
  */
 export function isDuplicateWorkgroupReadAccessMount(
   candidate: Pick<VolumeMount, 'hostPath' | 'containerPath' | 'readonly'>,
@@ -318,11 +295,7 @@ export function isWorkgroupReadAccessNamespace(containerPath: string): boolean {
   );
 }
 
-/**
- * Last-moment pathname check before Docker receives a policy mount. Docker
- * cannot bind an opened file descriptor, so this deliberately reduces rather
- * than claims to eliminate the final kernel pathname race.
- */
+/** Last-moment pathname check; Docker cannot bind an fd, so this narrows the kernel pathname race, not closes it. */
 export function assertWorkgroupReadAccessMountStable(mount: Pick<VolumeMount, 'hostPath'>): void {
   let stat: fs.Stats;
   let realPath: string;
