@@ -195,6 +195,8 @@ it('wider', () => {
     expect(duplicates(suite('{}, '), suite(''))).toEqual([]);
   });
 
+  const choose = `function choose(...args) {\n  backend = open(args.at(-1).task.name);\n}\n`;
+
   it.each([
     [
       'a hook registered by reference',
@@ -202,14 +204,36 @@ it('wider', () => {
     ],
     ['a hook registered conditionally', `if (enabled) beforeEach(({ task }) => {\n  backend = open(task.name);\n});\n`],
     ['the current test name', `beforeEach(() => {\n  backend = open(expect.getState().currentTestName);\n});\n`],
+    ['the runner current test', `beforeEach(() => {\n  backend = open(getCurrentTest().name);\n});\n`],
+    ['an aliased hook', `import { beforeEach as setup } from 'vitest';\n${choose}setup(choose);\n`],
+    ['a hook on a namespace', `${choose}v.beforeEach(choose);\n`],
+    ['an around hook', `${choose}aroundEach(choose);\n`],
   ])('does not judge a file whose setup can tell its cases apart through %s', (_, setup) => {
     const cases = `it('sqlite', () => {\n  expect(backend.query(1)).toEqual([1]);\n});\n`;
     expect(duplicates(setup + cases, setup + cases + cases.replace('sqlite', 'postgres'))).toEqual([]);
   });
 
+  it('does not report duplicates already on main when a change inlines a shared callback', () => {
+    const inlined = `it('a', () => {\n  expect(f(1)).toBe(2);\n});\nit('b', () => {\n  expect(f(1)).toBe(2);\n});\n`;
+    const shared = `function check() {\n  expect(f(1)).toBe(2);\n}\nit('a', check);\nit('b', check);\n`;
+    expect(duplicates(shared, inlined)).toEqual([]);
+  });
+
+  it('still judges a file whose only setup is mocks and plain hooks', () => {
+    const setup = `vi.mock('./db');\nexpect.extend({});\nprocess.env.TZ = 'UTC';\nbeforeEach(() => {\n  reset();\n});\n`;
+    const cases = `it('a', () => {\n  expect(f(1)).toBe(2);\n});\n`;
+    expect(duplicates(setup + cases, setup + cases + cases.replace("'a'", "'b'"))).toEqual(['same-as b <- a']);
+  });
+
   it('does not judge an it.for case that reads its test context', () => {
     const row = (name: string) =>
       `it.for([1])('${name}', (row, { task }) => {\n  expect(open(task.name).query(row)).toEqual([1]);\n});\n`;
+    expect(duplicates(row('sqlite'), row('sqlite') + row('postgres'))).toEqual([]);
+  });
+
+  it('does not judge an it.for case whose rest parameter receives the test context', () => {
+    const row = (name: string) =>
+      `it.for([1])('${name}', (...args) => {\n  expect(open(args[1].task.name).query(args[0])).toEqual([1]);\n});\n`;
     expect(duplicates(row('sqlite'), row('sqlite') + row('postgres'))).toEqual([]);
   });
 

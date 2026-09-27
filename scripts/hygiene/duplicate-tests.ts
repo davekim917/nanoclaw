@@ -23,7 +23,8 @@ const CASE_CALLEES = new Set(['it', 'test']);
 const SUITE_CALLEES = new Set(['describe', 'suite']);
 const NOT_RUN = new Set(['skip', 'todo', 'fails', 'skipIf', 'runIf']);
 const HOOKS = new Set(['beforeEach', 'afterEach', 'beforeAll', 'afterAll', 'onTestFinished', 'onTestFailed']);
-const READS_TEST_NAME = /\b(?:currentTestName|getState)\b/;
+const MOCKERS = new Set(['vi', 'jest', 'mock', 'expect']);
+const READS_TEST_NAME = /\b(?:currentTestName|getState|getCurrentTest)\b/;
 const ASSERTION = /^(?:expect|assert\w*)$/;
 
 interface Callee {
@@ -202,27 +203,50 @@ function inStatementList(node: ts.Node): boolean {
   return !!node.parent && !!statementList(node.parent)?.includes(node as ts.Statement);
 }
 
-const passesContext = new WeakMap<ts.Node, boolean>();
+const plainLists = new WeakMap<ts.Node, boolean>();
 
-function underContextHook(node: ts.Node): boolean {
+function plainStatement(st: ts.Statement): boolean {
+  if (
+    ts.isVariableStatement(st) ||
+    ts.isFunctionDeclaration(st) ||
+    ts.isClassDeclaration(st) ||
+    ts.isImportDeclaration(st) ||
+    ts.isTypeAliasDeclaration(st) ||
+    ts.isInterfaceDeclaration(st) ||
+    ts.isEnumDeclaration(st) ||
+    ts.isEmptyStatement(st) ||
+    isSuiteOrCase(st)
+  ) {
+    return true;
+  }
+  if (!ts.isExpressionStatement(st)) return false;
+  if (ts.isBinaryExpression(st.expression) && st.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    return !ts.isCallExpression(st.expression.right);
+  }
+  if (!ts.isCallExpression(st.expression)) return false;
+  const call = st.expression;
+  let root: ts.Expression = call.expression;
+  while (ts.isPropertyAccessExpression(root) || ts.isCallExpression(root)) root = root.expression;
+  if (ts.isIdentifier(root) && MOCKERS.has(root.text) && root !== call.expression) return true;
+  const callback = call.arguments[0];
+  return (
+    ts.isIdentifier(call.expression) &&
+    HOOKS.has(call.expression.text) &&
+    call.arguments.length <= 2 &&
+    !!callback &&
+    (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) &&
+    callback.parameters.length === 0
+  );
+}
+
+function plainSetup(node: ts.Node): boolean {
   for (let p = node.parent; p; p = p.parent) {
     const list = statementList(p);
     if (!list) continue;
-    if (!passesContext.has(p)) {
-      passesContext.set(
-        p,
-        list.some(
-          (st) =>
-            ts.isExpressionStatement(st) &&
-            ts.isCallExpression(st.expression) &&
-            !isSuiteOrCase(st) &&
-            st.expression.arguments.some((arg) => ts.isFunctionLike(arg) && arg.parameters.length > 0),
-        ),
-      );
-    }
-    if (passesContext.get(p)) return true;
+    if (!plainLists.has(p)) plainLists.set(p, list.every(plainStatement));
+    if (!plainLists.get(p)) return false;
   }
-  return false;
+  return true;
 }
 
 function isSuiteOrCase(statement: ts.Statement): boolean {
@@ -231,25 +255,10 @@ function isSuiteOrCase(statement: ts.Statement): boolean {
   return !!callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
 }
 
-function hooksOpaque(sourceFile: ts.SourceFile): boolean {
-  const opaque = (node: ts.Node): boolean => {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && HOOKS.has(node.expression.text)) {
-      const callback = node.arguments[0];
-      const statement = node.parent;
-      const list = ts.isExpressionStatement(statement) ? statement.parent : undefined;
-      const owner = list && ts.isBlock(list) ? list.parent : list;
-      if (!callback || !(ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) return true;
-      if (!owner || !(ts.isSourceFile(owner) || (ts.isFunctionLike(owner) && plainSuite(owner)))) return true;
-    }
-    return ts.forEachChild(node, opaque) ?? false;
-  };
-  return READS_TEST_NAME.test(sourceFile.text) || opaque(sourceFile);
-}
-
 export function extractCases(file: string, text: string): TestCase[] {
   const kind = file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
   const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
-  const fileJudged = !hooksOpaque(sourceFile);
+  const fileJudged = !READS_TEST_NAME.test(text);
   const outer = new Normalizer(sourceFile);
   const setup = (level: ts.Node) =>
     (ts.isBlock(level) || ts.isSourceFile(level) ? [...level.statements] : [])
@@ -279,13 +288,29 @@ export function extractCases(file: string, text: string): TestCase[] {
       const callee = calleeOf(node);
       const known = callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
       if (known && callee.modifiers.some((m) => NOT_RUN.has(m))) return;
-      const callback = callee && CASE_CALLEES.has(callee.base) ? callbackOf(node) : undefined;
+      const isCase = !!callee && CASE_CALLEES.has(callee.base);
+      const callback = isCase ? callbackOf(node) : undefined;
+      const title = node.arguments[0];
+      if (callee && isCase && !callback && title && ts.isStringLiteralLike(title)) {
+        cases.push({
+          file,
+          line: sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1,
+          name: title.text,
+          suite: suiteOf(node),
+          scope: '',
+          statements: [outer.text(node)],
+          assertions: [false],
+          judged: false,
+        });
+        return;
+      }
       if (callee && callback?.body) {
         const options = node.arguments.slice(1).filter((arg) => arg !== callback && !ts.isNumericLiteral(arg));
         const takesContext = callee.table
-          ? callee.modifiers.includes('for') && callback.parameters.length > 1
+          ? callee.modifiers.includes('for') &&
+            (callback.parameters.length > 1 || callback.parameters.some((param) => param.dotDotDotToken))
           : callback.parameters.length > 0;
-        const judged = fileJudged && !options.length && !takesContext && !underContextHook(node);
+        const judged = fileJudged && !options.length && !takesContext && plainSetup(node);
         const normalizer = new Normalizer(sourceFile, callback);
         const body = callback.body;
         const parts: ts.Node[] = ts.isBlock(body) ? [...body.statements] : [body];
@@ -298,7 +323,6 @@ export function extractCases(file: string, text: string): TestCase[] {
           statements.push(normalizer.text(part));
           assertions.push(asserts(part));
         }
-        const title = node.arguments[0];
         cases.push({
           file,
           line: sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1,
