@@ -33,17 +33,23 @@ function trackedFiles(root: string): string[] {
   return (gitRead(root, ['ls-files', '-z']) ?? '').split('\0').filter(Boolean);
 }
 
-type Resolution = { file: string } | { missing: true } | { skip: true };
+const SOURCE_NAME = /^[\w.-]+\.(?:ts|tsx|js|mjs|cjs|py|sh|md|json|ya?ml|sql|toml|jq)$/;
+
+type Resolution = { file: string } | { missing: true } | { ambiguous: number } | { skip: true };
 
 function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<string>) {
   if (tracked.has(cited)) return { file: cited } satisfies Resolution;
   const relative = path.posix.normalize(path.posix.join(path.posix.dirname(doc), cited));
   if (tracked.has(relative)) return { file: relative } satisfies Resolution;
   const shaped = cited.startsWith('.') ? relative : cited;
-  if (/^\.?[A-Za-z_][\w-]*\//.test(shaped)) return { missing: true } satisfies Resolution;
+  if (cited.startsWith('./') || cited.startsWith('../') || /^\.?[A-Za-z_][\w-]*\//.test(shaped))
+    return { missing: true } satisfies Resolution;
   if (cited.includes('/')) return { skip: true } satisfies Resolution;
   const byName = [...tracked].filter((file) => file.endsWith(`/${cited}`));
-  return byName.length === 1 ? ({ file: byName[0] } satisfies Resolution) : ({ skip: true } satisfies Resolution);
+  if (byName.length === 1) return { file: byName[0] } satisfies Resolution;
+  if (byName.length > 1) return { ambiguous: byName.length } satisfies Resolution;
+  if (SOURCE_NAME.test(cited)) return { missing: true } satisfies Resolution;
+  return { skip: true } satisfies Resolution;
 }
 
 function docCitationProblems(root: string, docs?: readonly string[]): string[] {
@@ -72,6 +78,10 @@ function docCitationProblems(root: string, docs?: readonly string[]): string[] {
           const resolved = resolveCitedPath(link.file, doc, filesAt(link.pinnedSha));
           if ('skip' in resolved) continue;
           const where = `${doc}:${index + 1}`;
+          if ('ambiguous' in resolved) {
+            problems.push(`${where}: cites \`${cited}\` by bare name, which ${resolved.ambiguous} tracked files have`);
+            continue;
+          }
           if ('missing' in resolved) {
             problems.push(`${where}: cites \`${cited}\`, but no tracked file has that path`);
             continue;
@@ -191,6 +201,26 @@ describe('docCitationProblems', () => {
     const { root } = repo({ 'container/old/code.ts': 'a\n', 'guide.md': '`old/code.ts:1`\n' });
     expect(docCitationProblems(root, ['guide.md'])).toEqual([
       'guide.md:1: cites `old/code.ts:1`, but no tracked file has that path',
+    ]);
+  });
+
+  it('fails a bare source file name that no tracked file, or more than one, has', () => {
+    const { root } = repo({
+      'a/x.ts': 'a\n',
+      'b/x.ts': 'b\n',
+      'doc.md': '`gone.ts:1`, `x.ts:1` and `api.example.com:443`\n',
+    });
+    expect(docCitationProblems(root, ['doc.md'])).toEqual([
+      'doc.md:1: cites `gone.ts:1`, but no tracked file has that path',
+      'doc.md:1: cites `x.ts:1` by bare name, which 2 tracked files have',
+    ]);
+  });
+
+  it('fails an explicit relative path to a deleted root file', () => {
+    const { root } = repo({ 'keep.ts': 'a\n', 'guide.md': '`./gone.ts:1`\n', 'docs/guide.md': '`../gone.ts:1`\n' });
+    expect(docCitationProblems(root, ['guide.md', 'docs/guide.md'])).toEqual([
+      'guide.md:1: cites `./gone.ts:1`, but no tracked file has that path',
+      'docs/guide.md:1: cites `../gone.ts:1`, but no tracked file has that path',
     ]);
   });
 

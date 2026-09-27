@@ -82,22 +82,31 @@ function citedText(lines: string[] | null, link: FileLineCitation): string | nul
   return lines.slice(link.startLine - 1, link.endLine).join('\n');
 }
 
-function citedLinks(line: string): Set<string> {
-  return new Set(citationRuns(line).flatMap((run) => run.links.map((link) => `${link.file}:${link.span}`)));
+function linkCount(line: string, cited: string): number {
+  return citationRuns(line)
+    .flatMap((run) => run.links)
+    .filter((link) => `${link.file}:${link.span}` === cited).length;
 }
 
-function introducingCommit(root: string, rev: string, doc: string, lineNumber: number, cited: string): string | null {
+function introducingCommit(
+  root: string,
+  rev: string,
+  doc: string,
+  lineNumber: number,
+  cited: string,
+): string | 'repeated' | null {
   const history = gitRead(root, ['log', `-L${lineNumber},${lineNumber}:${doc}`, '--format=%x00%H', rev]) ?? '';
   let oldest: string | null = null;
   for (const entry of history.split('\0').filter(Boolean)) {
     const [sha, ...patch] = entry.split('\n');
     const body = patch.filter((line) => !/^(?:\+\+\+|---) (?:[ab]\/|\/dev\/null)/.test(line));
-    const after = body.filter((line) => line.startsWith('+')).map((line) => line.slice(1));
-    const before = body.filter((line) => line.startsWith('-')).map((line) => line.slice(1));
+    const after = body.filter((line) => line.startsWith('+')).map((line) => linkCount(line.slice(1), cited));
+    const before = body.filter((line) => line.startsWith('-')).map((line) => linkCount(line.slice(1), cited));
     if (after.length === 0 && before.length === 0) continue;
-    if (!after.some((line) => citedLinks(line).has(cited))) break;
+    if ([...after, ...before].some((count) => count > 1)) return 'repeated';
+    if (!after.some((count) => count === 1)) break;
     oldest = sha.trim();
-    if (!before.some((line) => citedLinks(line).has(cited))) break;
+    if (!before.some((count) => count === 1)) break;
   }
   return oldest;
 }
@@ -208,14 +217,15 @@ export function pinDocs(
           refuse(`${doc} differs from ${rev} by more than pins; commit it first`);
           continue;
         }
-        const onLine = citationRuns(text).flatMap((other) => other.links.map((link) => `${link.file}:${link.span}`));
-        if (run.links.some((link) => onLine.filter((key) => key === `${link.file}:${link.span}`).length > 1)) {
-          refuse('the line cites the same file:line more than once, so its history cannot tell them apart');
-          continue;
-        }
         const linkOrigins = run.links.map((link) =>
           introducingCommit(root, rev, doc, i + 1, `${link.file}:${link.span}`),
         );
+        if (linkOrigins.includes('repeated')) {
+          refuse(
+            'the line cites the same file:line more than once in its history, so the occurrences cannot be told apart',
+          );
+          continue;
+        }
         if (linkOrigins.some((sha) => sha === null)) {
           refuse("the line's history does not show the commit that added this citation");
           continue;

@@ -30,8 +30,8 @@ Sources: `container/agent-runner/src/destinations.ts` (runtime system prompt),
 
 | Directive | Location | Note |
 |---|---|---|
-| Never ask a user to paste API keys/tokens/passwords | `destinations.ts:152` + `container/CLAUDE.md:77` at fb8bee47d | Stated twice. Both survive the cap now; the system-prompt copy is the durable one |
-| Don't fabricate credential setup; use `onecli-managed` | `self-mod.instructions.md:25` | Third statement of the credential theme, but a distinct rule |
+| Never ask a user to paste API keys/tokens/passwords | `container/agent-runner/src/destinations.ts:152` at fb8bee47d + `container/CLAUDE.md:77` at fb8bee47d | Stated twice. Both survive the cap now; the system-prompt copy is the durable one |
+| Don't fabricate credential setup; use `onecli-managed` | `container/agent-runner/src/mcp-tools/self-mod.instructions.md:25` at fb8bee47d | Third statement of the credential theme, but a distinct rule |
 | Never permanently delete an email — Trash only | a group's `CLAUDE.local.md` | **Prose-only, and Claude-sibling-only.** Belongs in the bootstrap email gate |
 | Never add Co-Authored-By / Generated-with footers | `container/CLAUDE.md:154-159` at fb8bee47d | External-facing; commits are public |
 | Never name sibling agents / AI tooling in a client org's repos | a group's `CLAUDE.local.md` | **Does not reach the agents it names** — see reach note |
