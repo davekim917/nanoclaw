@@ -179,6 +179,35 @@ describe('mutations of container.json are serialized', () => {
   });
 });
 
+describe('the projection write is part of the locked mutation', () => {
+  it('holds the lock until the projection settles, so a later writer cannot land between file and projection', async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = updateContainerConfig(
+      FOLDER,
+      (config) => {
+        config.groupName = 'first';
+      },
+      async () => {
+        order.push('first:project');
+        await gate;
+        order.push('first:projected');
+      },
+    );
+    await vi.waitFor(() => expect(order).toEqual(['first:project']));
+    const second = updateContainerConfig(FOLDER, () => {
+      order.push('second:mutate');
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(order).toEqual(['first:project']);
+
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(['first:project', 'first:projected', 'second:mutate']);
+  });
+});
+
 describe('the write leaves nothing beside the config', () => {
   it('writes IN PLACE — no sibling temp file, because that file would not be mount-protected', () => {
     // A write-to-temp-and-rename is the textbook atomic write and is wrong

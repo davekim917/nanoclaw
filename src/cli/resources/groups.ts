@@ -14,6 +14,7 @@ import {
   type McpServerConfig,
   updateContainerConfig,
   resolveGroupProvider,
+  writeContainerConfigPackages,
   writeContainerConfigScalars,
 } from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
@@ -52,7 +53,6 @@ async function requireConfiguredGroup(id: string): Promise<AgentGroup> {
   return group;
 }
 
-// Dual-write: the file is canonical (survives the restart backfill); the DB copy is what the image build reads.
 async function editPackages(
   args: Record<string, unknown>,
   edit: (list: string[], pkg: string) => string[],
@@ -66,13 +66,10 @@ async function editPackages(
   const npm = args.npm as string | undefined;
   if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
 
-  const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
-    if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
-    if (apt) cfg.packages.apt = edit(cfg.packages.apt, apt);
-    if (npm) cfg.packages.npm = edit(cfg.packages.npm, npm);
+  await writeContainerConfigPackages(id, group.folder, (packages) => {
+    if (apt) packages.apt = edit(packages.apt, apt);
+    if (npm) packages.npm = edit(packages.npm, npm);
   });
-  if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-  if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
   return { apt: apt || null, npm: npm || null };
 }
 
