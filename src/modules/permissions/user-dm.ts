@@ -168,7 +168,7 @@ async function resolveDmPlatformId(
   instance: string | undefined,
   privacySafeLogs: boolean,
 ): Promise<string | null> {
-  // Not the exact variant: an unnamed or offline instance resolves through a sibling.
+  // Not the exact variant: with no instance, a channel-type key resolves through any adapter of that type.
   const adapter = getChannelAdapter(instance ?? channelType);
   if (!adapter) {
     log.warn('ensureUserDm: no adapter for channel', { channelType, instance });
