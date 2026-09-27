@@ -1,30 +1,12 @@
 /**
- * The host's ingress producer: the one place an adapter's `onInbound`
- * message becomes a routable `InboundEvent`.
- *
- * This exists as a named function rather than a closure inside `main()` for
- * one reason — it is where `nativeId` is decided, and `nativeId` is the field
- * the router stamps into a written row's `platformMsgId` (src/router.ts, the
- * single write site) and the runner renders as `platform_msg_id`. A test can
- * only prove the CLI exclusion and the assignment itself by driving the
- * producer; poking `nativeId` into a hand-built event proves nothing about
- * either.
- *
- * Two host-side stampings happen here and nowhere else:
- *
- *   - `instance` — adapters stay instance-blind; the host stamps the
- *     receiving instance on every inbound event.
- *   - `nativeId` — the platform's own confirmed message id, set ONLY for
- *     genuine, non-CLI adapter ingress. `message.id` is the routing/dedup key
- *     and is set for every event, synthetic or not; the CLI adapter's own
- *     "plain chat" path arrives through `onInbound` too (src/channels/cli.ts)
- *     but mints a host-synthesized `cli-<ms>-<rand>` id, so it is excluded
- *     exactly as every `onInboundEvent` caller is — those build their own
- *     `InboundEvent` and never come through here at all.
+ * The host's ingress producer: where an adapter's `onInbound` message becomes a routable `InboundEvent`. A named
+ * function so tests drive the real producer rather than hand-built events.
+ * The host stamps `instance` here (adapters stay instance-blind) and `nativeId`, the platform's own message id that
+ * the router writes as `platformMsgId`. `nativeId` is set ONLY for genuine non-CLI ingress: the CLI adapter's plain
+ * chat also arrives through `onInbound` but carries a synthesized `cli-<ms>-<rand>` id.
  */
 import type { ChannelAdapter, InboundEvent, InboundMessage } from './adapter.js';
 
-/** The adapter identity this producer needs: its channel type and instance. */
 export type IngressAdapter = Pick<ChannelAdapter, 'channelType' | 'instance'>;
 
 export function adapterInboundEvent(
@@ -47,8 +29,7 @@ export function adapterInboundEvent(
       timestamp: message.timestamp,
       isMention: message.isMention,
       isGroup: message.isGroup,
-      // Trust-bearing only for genuine platform ingress — see the file
-      // comment and adapter.ts InboundEvent.message.nativeId.
+      // Trust-bearing only for genuine platform ingress; see adapter.ts InboundEvent.message.nativeId.
       nativeId: adapter.channelType === 'cli' ? undefined : message.id,
     },
   };

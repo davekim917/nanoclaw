@@ -7,12 +7,7 @@
  * and rendering.
  */
 
-/**
- * Button style hint passed down to the Chat SDK → platform adapter.
- * The SDK maps these to each platform's native button style (Slack:
- * primary/danger, Teams: positive/destructive, Discord: primary/danger).
- * `undefined` renders as the platform's neutral/default button.
- */
+/** Mapped to each platform's native button style; `undefined` is the neutral default. */
 export type OptionStyle = 'primary' | 'danger' | 'default';
 
 interface OptionInput {

@@ -125,9 +125,7 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       await adapter?.setTyping?.(platformId, threadId, status);
     },
-    // Support-thread + delivery-morph surfaces. Exact-keyed like deliver/typing
-    // so a per-issue thread or a status-message deletion never lands on a
-    // sibling bot of the same platform.
+    // Exact-keyed so a support thread or a status deletion never lands on a sibling bot of the same platform.
     async deleteMessage(
       channelType: string,
       platformId: string,
@@ -180,18 +178,12 @@ export function fallbackChannelDefaults(supportsThreads: boolean): ChannelDefaul
       unknownSenderPolicy: 'request_approval',
     },
     group: {
-      // Fork policy (owner directive 2026-05-26): plain mention, not
-      // mention-sticky — sibling agents co-reside in channels, and sticky
-      // let one agent auto-dominate threads. Declared adapter defaults
-      // still win over this fallback.
+      // Fork policy: plain mention, not mention-sticky; sibling agents share channels. Declared adapter defaults
+      // still win.
       engageMode: 'mention',
       threads: supportsThreads,
-      // Fork policy (owner directive 2026-08-06): group channels default
-      // public, matching the router auto-create branch — inviting the bot
-      // to a channel IS the access decision; teammates must not be silently
-      // black-holed behind a sender-approval cascade. DMs stay
-      // request_approval. Upstream's faithful fallback is 'request_approval'
-      // in both contexts.
+      // Fork policy: group channels default public (inviting the bot is the access decision); DMs stay
+      // request_approval.
       unknownSenderPolicy: 'public',
     },
     mentions: 'platform',
@@ -317,8 +309,8 @@ async function startRegisteredChannelAdapter(
 
   const key = adapter.instance ?? adapter.channelType;
   if (!options.replaceActive) {
-    // A failed owner releases its key without making it active. Re-check after
-    // every wait so exactly one queued alias claims the retry.
+    // A failed owner releases its key without activating it; re-check after every wait so exactly one queued alias
+    // claims the retry.
     while (true) {
       const pending = startingAdapterKeys.get(key);
       if (!pending) break;
@@ -351,10 +343,8 @@ async function startRegisteredChannelAdapter(
 
   await setupChannelAdapter(name, adapter, setupFn, 'startup');
 
-  // Adapters key by instance (default instance = channelType), so N
-  // instances of one platform coexist. Startup preserves its historical
-  // last-write-wins behavior; a hot start refuses to replace an active
-  // identity so a duplicate provisioning request cannot run two adapters.
+  // Keyed by instance so N instances of one platform coexist. Startup keeps last-write-wins; a hot start refuses to
+  // replace an active identity.
   if (activeAdapters.has(key)) {
     log.warn('Duplicate adapter instance key — overwriting previous adapter', { key, channel: name });
   }
@@ -363,10 +353,7 @@ async function startRegisteredChannelAdapter(
   return 'started';
 }
 
-/**
- * Instantiate and set up all registered channel adapters.
- * Skips adapters that return null (missing credentials).
- */
+/** Skips adapters whose factory returns null (missing credentials). */
 export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup): Promise<void> {
   hotStartSetupFn = null;
   for (const [name, registration] of registry) {
@@ -376,8 +363,7 @@ export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => 
       log.error('Failed to start channel adapter', { channel: name, err });
     }
   }
-  // Do not expose the callback until the boot pass has finished: a workspace
-  // registered during startup remains the init loop's responsibility.
+  // Exposed only after the boot pass, so startup registrations stay the init loop's responsibility.
   hotStartSetupFn = setupFn;
 }
 
@@ -413,10 +399,8 @@ export async function startChannelAdapter(name: string): Promise<'started' | 'al
   }
 }
 
-/** Tear down all active adapters. */
 export async function teardownChannelAdapters(): Promise<void> {
-  // Block a late caller first, then wait for every admitted hot start so an
-  // adapter cannot be added after this teardown clears the active map.
+  // Block late callers first, then wait for admitted hot starts so nothing is added after the active map is cleared.
   hotStartSetupFn = null;
   await Promise.allSettled([...startingAdapters.values()]);
   for (const [name, adapter] of activeAdapters) {

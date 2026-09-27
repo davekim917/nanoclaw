@@ -1,25 +1,9 @@
 /**
- * Discord slash commands — administrative surface for managing nanoclaw:
- *   /deploy           — pull main, build, rebuild image if needed, restart
- *   /update-container — audit repository dependency drift, agent opens PRs
- *   /update-plugins   — git pull every ~/plugins/<name>
- *
- * Runs a dedicated discord.js Client parallel to @chat-adapter/discord's
- * chat client, gated on ENABLE_DISCORD_SLASH_COMMANDS=1. Scoped via
- * DISCORD_SLASH_CHANNEL_IDS (comma-separated channel ids) so accidental
- * invocations in random channels don't run deploy commands.
- *
- * Multi-bot note: slash commands are bound to the PRIMARY DISCORD_BOT_TOKEN
- * only — these are operator/admin commands and shouldn't be duplicated
- * across secondary bots (e.g. an "example-agent-codex" bot). Secondary bots
- * registered via DISCORD_BOT_TOKEN_<SUFFIX> still receive @mentions through
- * the chat adapter but don't expose /deploy etc.
- *
- * /update-container injects a synthetic chat message into the router
- * (routeInbound) carrying an audit prompt. The agent (running in a
- * container for the receiving messaging group) invokes the shared deterministic
- * audit/apply CLI, asks which exact items to bump, and keeps host, container,
- * and bootstrap changes in separate approval and activation boundaries.
+ * Discord admin slash commands: /deploy, /update-container (dependency drift audit via an injected chat message that
+ * asks an agent to open PRs), /update-plugins.
+ * A dedicated discord.js Client beside the chat adapter, gated on ENABLE_DISCORD_SLASH_COMMANDS=1 and scoped by
+ * DISCORD_SLASH_CHANNEL_IDS so accidental invocations elsewhere cannot deploy. Bound to the PRIMARY DISCORD_BOT_TOKEN
+ * only.
  */
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -93,12 +77,7 @@ function deployChannelId(): string | null {
   return first ?? null;
 }
 
-/**
- * Get the parent channel id for thread interactions, or the channel id
- * itself when not in a thread. Injected synthetic messages must route to
- * the parent channel (threads on the Discord side aren't first-class to
- * the router today — messages land on the parent messaging_group).
- */
+/** Injected messages route to the parent channel: Discord threads are not first-class to the router here. */
 function getInteractionParentId(interaction: ChatInputCommandInteraction): string | null {
   const ch = interaction.channel;
   if (ch && 'isThread' in ch && typeof ch.isThread === 'function' && ch.isThread()) {
@@ -149,9 +128,8 @@ function formatFailure(status: DeployStatus): string {
 }
 
 /**
- * Poll deploy-status.json for pre-restart failures. If deploy succeeds,
- * the service restarts mid-poll — announceDeployStatus on the next boot
- * picks up the "ok" status and posts success.
+ * Catches failures before the restart; on success the service restarts mid-poll and announceDeployStatus reports it
+ * at next boot.
  */
 function pollDeployStatus(interaction: ChatInputCommandInteraction): void {
   const startTime = Date.now();
@@ -181,11 +159,7 @@ function pollDeployStatus(interaction: ChatInputCommandInteraction): void {
   setTimeout(() => void poll(), 2_000);
 }
 
-/**
- * One-shot at boot: if deploy-status.json was written in the last 5 min,
- * post the outcome (paired with pollDeployStatus which catches failures
- * *before* restart).
- */
+/** One-shot at boot: posts the outcome of a deploy-status.json written in the last 5 minutes. */
 async function announceDeployStatus(): Promise<void> {
   const status = readDeployStatus();
   if (!status) return;
@@ -260,12 +234,8 @@ export const UPDATE_CONTAINER_PROMPT = [
   '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
   'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
   '',
-  // Added after an @onecli-sh/sdk ^0.5.0 -> ^2.8.0 bump took the whole fleet down
-  // on 2026-07-25. That bump passed every gate the prompt asked for: it touched
-  // only package.json + pnpm-lock.yaml, build and tests were green, and the
-  // method names the host calls were unchanged across both majors. Only the HTTP
-  // path moved (/api -> /v1), against a gateway that serves only /api. Two
-  // reporting duties exist because of it:
+  // These reporting duties exist because a dependency major bump passed every other gate (only package files touched,
+  // tests green, same method names) while moving an HTTP path the gateway does not serve, taking the fleet down.
   '`upstreamPin` and `heldByMerge` come from a host-computed snapshot, not from git run here: `/workspace/project` is a read-only bind-mount allowlist with no `.git`, so the container can never derive these itself. Read the fields — do not re-derive them with git:',
   "- `upstreamPin` is that dependency's pin in `upstream/main`. Report it NEXT TO latest-stable and say explicitly when they differ. For anything exact-pinned, upstream parity is the DEFAULT recommendation and latest-stable is the exception: an exact pin is usually load-bearing, and upstream is the strongest evidence about what a version is compatible with. Never present latest-stable as the only option.",
   '- `heldByMerge: true` means the last upstream merge resolved that dependency KEEP-OURS — it kept our pin over a different upstream one. That is a standing decision. Report it as HELD and do not propose moving past it without saying so explicitly and asking. It is stronger than upstream parity: in #135 upstream 2.2.1 was ALSO incompatible with our gateway, so parity alone would not have caught it.',
@@ -281,12 +251,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   '- host: `pnpm install --frozen-lockfile && pnpm run build && pnpm test`, plus `pnpm run lint` and `pnpm run format:check` — CI runs format:check, and the pre-commit hook would otherwise leak an unrelated reformat into the next PR.',
   '- client/server pairs: a LIVE call against the running service, not a compile. For the OneCLI SDK that means constructing the client the way `src/container-runner.ts` does and invoking a real method; a green build proves nothing about the wire contract. If you cannot make that call, say so and mark the item unverified rather than validated.',
   '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit`.',
-  // No models-cache reset here on purpose. ~/.codex/models_cache.json carries no
-  // client-version gate (0 occurrences in the payload) and self-revalidates by
-  // ETag, so a cache still stamped with the old client_version already serves the
-  // current model list. Resetting it was folklore. Host parity stays: the host
-  // runs its own codex for `codex plugin marketplace upgrade` (plugin-updater.ts),
-  // and the operator works in it directly.
+  // No models-cache reset: ~/.codex/models_cache.json has no client-version gate and revalidates by ETag.
   '- Codex CLI: put the exact host-parity installation command in the PR checklist. Do not add a models-cache reset.',
   'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
   'Never merge, deploy, restart services, or build Docker from inside the agent container.',
@@ -301,11 +266,8 @@ async function handleUpdateContainer(interaction: ChatInputCommandInteraction): 
     return;
   }
 
-  // Refresh the host-computed upstream-policy snapshot right before the audit
-  // runs, so the interactive path always reads a current answer instead of
-  // whatever was current at last host startup. Log-and-continue: a stale or
-  // missing snapshot degrades to "signal unavailable" (see readUpstreamPolicy),
-  // it must never block the audit.
+  // Refresh the upstream-policy snapshot right before the audit. Log and continue: a stale snapshot degrades to
+  // "signal unavailable" and must never block the audit.
   try {
     await writeUpstreamPolicySnapshot(REPO_ROOT, path.join(DATA_DIR, 'upstream-policy.json'));
   } catch (err) {
@@ -325,13 +287,11 @@ async function handleUpdateContainer(interaction: ChatInputCommandInteraction): 
     await interaction.followUp({ content: '/update-container must be run in a guild channel, not a DM.' });
     return;
   }
-  // Discord chat-sdk adapter format: bare snowflakes fail downstream with
-  // "Invalid Discord thread ID".
+  // The chat-sdk adapter requires encoded ids; bare snowflakes fail with "Invalid Discord thread ID".
   const encodeId = (...parts: string[]): string => ['discord', guildId, parentChannelId, ...parts].join(':');
   const platformId = encodeId();
 
-  // In-thread mention-sticky engages without @mention, so the user can just
-  // reply "yes" inside the audit thread.
+  // Mention-sticky engages in-thread without an @mention, so the user can reply "yes" in the audit thread.
   const AUTO_ARCHIVE_24H = 1440;
   let threadId: string | null = null;
   try {
@@ -405,10 +365,8 @@ async function onInteraction(interaction: Interaction): Promise<void> {
 }
 
 /**
- * Start the slash-command client. No-op unless
- * ENABLE_DISCORD_SLASH_COMMANDS=1 AND DISCORD_BOT_TOKEN is set.
- * Also boots the container-rebuild watcher (which pushes rebuild-complete
- * notifications into the deploy channel).
+ * No-op unless ENABLE_DISCORD_SLASH_COMMANDS=1 and DISCORD_BOT_TOKEN is set. Also boots the container-rebuild
+ * watcher.
  */
 export async function startDiscordSlashCommands(): Promise<boolean> {
   if (process.env.ENABLE_DISCORD_SLASH_COMMANDS !== '1') {

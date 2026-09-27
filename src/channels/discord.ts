@@ -1,23 +1,9 @@
 /**
- * Discord channel adapter (v2) — uses Chat SDK bridge.
- * Self-registers on import.
- *
- * Multi-bot env-var convention (mirrors slack.ts):
- *   DISCORD_BOT_TOKEN=…                   → channelType "discord"
- *   DISCORD_PUBLIC_KEY=…                  (optional — slash-cmd interactions)
- *   DISCORD_APPLICATION_ID=…              (optional — same)
- *   DISCORD_BOT_TOKEN_<SUFFIX>=…          → channelType "discord-<suffix>"
- *   DISCORD_PUBLIC_KEY_<SUFFIX>=…
- *   DISCORD_APPLICATION_ID_<SUFFIX>=…
- *
- * Each suffix is a separate Discord application (created per-bot at
- * discord.com/developers). Suffix is any [A-Za-z0-9_]+, lowercased and
- * `_` → `-` for the channelType — same round-trip as slack.ts so the
- * channel-auto-wire resolver's `-` → `_` reverse mapping works.
- *
- * Slash commands (discord-slash-commands.ts) stay bound to the primary
- * DISCORD_BOT_TOKEN — secondary bots receive @mentions but don't expose
- * /deploy etc.
+ * Discord channel adapter over the Chat SDK bridge; self-registers on import.
+ * Multi-bot env convention mirrors slack.ts: `DISCORD_BOT_TOKEN` → channelType "discord";
+ * `DISCORD_BOT_TOKEN_<SUFFIX>` → "discord-<suffix>" (lowercased, `_` → `-`, the round-trip channel-auto-wire
+ * reverses), with optional `DISCORD_PUBLIC_KEY[_<SUFFIX>]` and `DISCORD_APPLICATION_ID[_<SUFFIX>]`. Slash commands
+ * stay bound to the primary token.
  */
 import { createDiscordAdapter } from '@chat-adapter/discord';
 import { Constants, MessageType, REST, RESTJSONErrorCodes, Routes } from 'discord.js';
@@ -39,7 +25,6 @@ interface DiscordRecoveryThread {
   thread_metadata?: { archive_timestamp?: string };
 }
 
-// Discord snowflakes embed a millisecond timestamp above bit 22.
 const DISCORD_EPOCH_MS = 1420070400000n;
 
 function snowflakeMs(id: string | null | undefined): number | null {
@@ -52,19 +37,9 @@ function snowflakeMs(id: string | null | undefined): number | null {
 }
 
 /**
- * A thread can only hold a missed message if it was still being written at or
- * after the gap start, so discovery filters on Discord's own last-activity
- * marker (`last_message_id`) — already in the list payload, no extra request.
- * Slack's discovery has always bounded this way (`hasGapReply || createdInGap`);
- * Discord did not, so it re-scanned every thread ever created (406 observed)
- * on every pass, and stall-triggered passes ran back-to-back for minutes.
- *
- * Applies to all reasons, not just stall passes: the comparison is against the
- * pass's own `since`, which the bridge has already floored to the durable gap
- * floor, so a long outage still widens the window correctly.
- *
- * Fails OPEN — a thread with no parseable marker is kept, so a payload change
- * can never silently drop recovery coverage.
+ * Keeps only threads active at or after the gap start (`last_message_id`, already in the list payload); without this
+ * every pass re-scans every thread ever created. `since` is already floored to the durable gap floor. Fails OPEN: a
+ * thread with no parseable marker is kept.
  */
 function threadTouchedSince(thread: DiscordRecoveryThread, sinceMs: number): boolean {
   if (!Number.isFinite(sinceMs)) return true;
@@ -86,11 +61,10 @@ function discordThreadTarget(root: ChannelRecoveryTarget, guildId: string, threa
   };
 }
 
-/** Discover threads that received messages during a gap before a session existed. */
+/** Discovers threads that received messages during a gap before a session existed. */
 /**
- * Discord error codes that mean a recovery target is unreachable by WIRING:
- * the channel/guild is gone or the bot lost access. The bridge parks these
- * targets instead of failing the pass.
+ * Errors meaning a recovery target is unreachable by wiring (channel or guild gone, access lost); the bridge parks
+ * these targets instead of failing the pass.
  */
 const PERMANENT_DISCORD_RECOVERY_CODES = new Set([10003, 10004, 50001]); // Unknown Channel, Unknown Guild, Missing Access
 
@@ -125,8 +99,7 @@ export async function discoverDiscordRecoveryTargets(
     rootsByGuild.set(guildId, guildRoots);
   }
 
-  // Per-guild / per-root fault isolation: one dead channel or guild must not
-  // abort discovery for every other root.
+  // Per-guild fault isolation: one dead channel or guild must not abort discovery for the rest.
   for (const [guildId, guildRoots] of rootsByGuild) {
     try {
       const active = (await rest.get(Routes.guildActiveThreads(guildId))) as DiscordThreadList;
@@ -164,16 +137,13 @@ export async function discoverDiscordRecoveryTargets(
           let oldestArchiveMs = Number.POSITIVE_INFINITY;
           for (const thread of threads) {
             if (threadTouchedSince(thread, sinceMs)) targets.push(discordThreadTarget(root, guildId, thread.id));
-            // Boundary detection stays over EVERY thread on the page, filtered
-            // or not — it drives pagination termination below.
+            // Boundary detection covers EVERY thread on the page, filtered or not; it drives pagination termination.
             const archivedMs = Date.parse(thread.thread_metadata?.archive_timestamp ?? '');
             if (Number.isFinite(archivedMs)) oldestArchiveMs = Math.min(oldestArchiveMs, archivedMs);
           }
-          // Public archives are ordered by archive_timestamp, so reaching the
-          // gap boundary proves older pages cannot contain a missed message.
-          // Joined private archives are ordered by thread snowflake instead;
-          // an old private thread can be reactivated during the gap, so that
-          // endpoint must be exhausted regardless of archive timestamps.
+          // Public archives are ordered by archive_timestamp, so reaching the gap boundary ends the scan. Joined
+          // private archives are ordered by snowflake and an old private thread can be reactivated in the gap, so
+          // that endpoint must be exhausted.
           const reachedTimeBoundary = archive.cursor === 'timestamp' && oldestArchiveMs <= sinceMs;
           if (reachedTimeBoundary || archived.has_more !== true) {
             coveredBoundary = true;
@@ -196,20 +166,9 @@ export async function discoverDiscordRecoveryTargets(
 }
 
 /**
- * Discord message FORWARDS carry their text and attachments in
- * `message_snapshots`, with a top-level `content` that is empty
- * (`message_reference.type === 1` is FORWARD; 0 is an ordinary reply, which
- * the adapter already handles via `referenced_message`). The chat-adapter
- * reads only `content`/`attachments`, so a forward reached the agent as an
- * empty message. Unwrap the snapshot back into the payload before the adapter
- * builds its Message, so text, attachment download and formatting all ride the
- * existing path.
- *
- * Snapshots carry no author, so the original sender is unavailable and the
- * content is labeled `[Forwarded message]`.
- *
- * Ported from upstream 437a5f064; re-homed onto this fork's per-workspace
- * adapter registration loop.
+ * Discord FORWARDS (`message_reference.type === 1`) carry text and attachments in `message_snapshots` with an empty
+ * top-level `content`, which the chat-adapter would deliver as an empty message; unwrap the snapshot into the payload
+ * before the adapter builds its Message. Snapshots carry no author, so the content is labeled `[Forwarded message]`.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function unwrapForwardedSnapshot(data: Record<string, any>): void {
@@ -234,12 +193,8 @@ export function unwrapForwardedSnapshot(data: Record<string, any>): void {
 }
 
 /**
- * Install the forward unwrap on one adapter instance.
- *
- * `handleForwardedMessage` is the live inbound seam for this install: the
- * Gateway listener runs in webhook-forwarding mode (chat-sdk-bridge passes a
- * `webhookUrl`), so every MESSAGE_CREATE arrives as raw Discord JSON through
- * `handleWebhook` → `handleForwardedGatewayEvent` → `handleForwardedMessage`.
+ * `handleForwardedMessage` is the live inbound seam: the Gateway listener runs in webhook-forwarding mode, so every
+ * MESSAGE_CREATE arrives through it as raw JSON.
  */
 export function installForwardUnwrap(adapter: ReturnType<typeof createDiscordAdapter>): void {
   const target = adapter as unknown as {
@@ -310,10 +265,8 @@ function makeFetchThreadAnchor(
     const threadId = parts[3];
     if (!channelId || !threadId) return null;
 
-    // Discord's chat-adapter auto-creates a thread anchored on the user's
-    // @mention message — `thread.id == mention.id`. On the first wake the
-    // trigger IS the anchor, so the hook bails out: prepending it would
-    // duplicate the current turn into the prepended thread context.
+    // The chat-adapter anchors an auto-created thread on the @mention message (`thread.id == mention.id`), so on the
+    // first wake the trigger IS the anchor; prepending it would duplicate the current turn.
     if (opts?.excludeMessageId && opts.excludeMessageId === threadId) return null;
 
     const url = `https://discord.com/api/v10/channels/${channelId}/messages/${threadId}`;
@@ -334,11 +287,8 @@ function makeFetchThreadAnchor(
     }
     const m1 = (await response.json()) as DiscordRawMessage;
 
-    // M0: the message M1 was Reply-ing to. Discord inlines `referenced_message`
-    // on the GET response when the parent is recent enough (~2 weeks), so no
-    // second round-trip is needed. This is the message the user actually
-    // wants the agent to act on — the anchor (M1) by itself is often a bare
-    // imperative like "fix this" that's meaningless without M0.
+    // M0, the message M1 replied to: inlined as `referenced_message` when recent (~2 weeks). The anchor alone is
+    // often a bare "fix this" that is meaningless without it.
     const out: Array<{ sender: string; text: string; timestamp: string; isAnchor: true }> = [];
     const m0 = m1.referenced_message ? parseAnchorMessage(m1.referenced_message) : null;
     if (m0) out.push(m0);
@@ -349,13 +299,8 @@ function makeFetchThreadAnchor(
 }
 
 /**
- * Mirror discord.js's `message.system` semantics: keep DEFAULT, REPLY,
- * CHAT_INPUT_COMMAND, CONTEXT_MENU_COMMAND; drop everything else.
- *
- * THREAD_STARTER_MESSAGE (the synthetic echo Discord inserts inside an
- * auto-thread) would otherwise route the parent's content twice — once at
- * the parent and again when the bridge sees the starter — so it stays
- * filtered even though it carries user-authored text.
+ * Mirrors discord.js's `message.system`: THREAD_STARTER_MESSAGE is filtered even though it carries user text, or the
+ * parent's content would route twice.
  */
 const NON_SYSTEM_TYPES = new Set<number>(Constants.NonSystemMessageTypes);
 
@@ -395,14 +340,8 @@ function rewriteBareDiscordUrl(urlWithPossiblePunctuation: string): string {
 }
 
 /**
- * Rewrite URL-shaped links into labels Discord will render.
- *
- * The Discord Chat SDK adapter parses GFM autolinks, then renders every link
- * node as `[label](url)`. For bare URLs, that makes `label === url`, and
- * Discord's anti-phishing filter leaves the literal `[url](url)` text visible.
- * Descriptive masked links render correctly and are left alone.
- *
- * Code regions are protected so URLs inside fenced/inline code stay literal.
+ * The Discord adapter renders every link as `[label](url)`, and for a bare URL (`label === url`) Discord's
+ * anti-phishing filter leaves the literal text visible, so such links are rewritten. Code regions stay literal.
  */
 export function rewriteDiscordLinks(text: string): string {
   return transformOutsideProtectedRegions(text, (segment) => {
@@ -422,24 +361,10 @@ export function rewriteDiscordLinks(text: string): string {
   });
 }
 
-// ── Sibling-bot mention registry ─────────────────────────────────────────
-//
-// Discord requires real `<@USER_SNOWFLAKE>` syntax for an @-mention to fire
-// the receiving bot's `engage_mode='mention'` wiring. Plain text like
-// `@Example Agent-codex` ships as literal characters — no Discord mention event
-// fires, no peer wake. Slack's chat-adapter rewrites bare `@username` to
-// `<@U…>` server-side via a cached lookup; the Discord adapter doesn't.
-//
-// We close the gap by maintaining a process-wide registry of every Discord
-// bot this host has loaded — keyed by channelType, populated by a one-shot
-// `GET /users/@me` call when each adapter factory runs. The outbound text
-// transform then rewrites `@bot-username` to `<@id>` so sibling handoffs
-// actually wake the peer.
-//
-// Limited to bots running in this process: a third-party bot in the same
-// guild whose token we don't carry will not be in the registry, and its
-// `@name` references will be left as plain text. That's the correct
-// fail-soft — we never invent a snowflake we can't verify.
+// Sibling-bot mention registry. A Discord @-mention only fires as real `<@SNOWFLAKE>` syntax (plain `@Name` wakes
+// nothing), and unlike Slack the adapter does not rewrite it. Every Discord bot this host loads registers its
+// identity via `GET /users/@me`, and outbound text rewrites `@bot-username` to `<@id>`. Bots whose token we do not
+// hold stay plain text: never invent a snowflake.
 
 export interface DiscordBotIdentity {
   userId: string;
@@ -449,37 +374,19 @@ export interface DiscordBotIdentity {
 const knownDiscordBots = new Map<string, DiscordBotIdentity>();
 
 /**
- * Resolve the bot's user-facing display name for a Discord channel_type.
- * Returns null when the bot isn't registered — e.g. a spawn that races
- * adapter init or a non-Discord session. The caller (`resolveAssistantName`
- * in container-runner) treats null as "try the next resolver or fall back
- * to agent_group.name".
- *
- * Discord stores a single `username` post-2023 (the legacy discriminator
- * system is gone); we surface that directly. No `display_name` distinction
- * to navigate like Slack's profile fields.
+ * Null when the bot is not registered (e.g. a spawn racing adapter init); the caller falls back to the next resolver.
  */
 export function getDiscordBotDisplayName(channelType: string): string | null {
   return knownDiscordBots.get(channelType)?.username ?? null;
 }
 
-/**
- * Read-only view of the Discord bot registry. Mirrors `getKnownSlackBots`
- * so callers needing the bot's canonical `userId` (for self-mention guard
- * text or peer @-mention resolution) can index by channel_type without
- * routing through the Slack registry.
- */
+/** Read-only view of the registry, mirroring `getKnownSlackBots`. */
 export function getKnownDiscordBots(): ReadonlyMap<string, DiscordBotIdentity> {
   return knownDiscordBots;
 }
 
-// Cross-package channel for the patched chat-adapter. The patched
-// MessageCreate / reaction handlers in @chat-adapter/discord need to know
-// which bot ids belong to sibling NanoClaw bots in this process so they
-// can let those messages through while still dropping unrelated third-
-// party bots (webhooks, music bots, MEE6, etc.). The patch reads this Set
-// off globalThis at message-arrival time so adapter init order doesn't
-// matter. Keep the property name in sync with the patch.
+// Read by the patched @chat-adapter/discord at message-arrival time to admit sibling NanoClaw bots while dropping
+// unrelated bots; keep the property name in sync with the patch.
 const NANOCLAW_DISCORD_SIBLINGS = '__nanoclawDiscordSiblings';
 
 interface GlobalWithSiblings {
@@ -493,17 +400,9 @@ function publishSiblingId(userId: string): void {
 }
 
 /**
- * Look up a bot's identity from Discord via REST. Single round-trip on
- * adapter init; the result is cached in `knownDiscordBots` for the lifetime
- * of the process. Returns null on any failure — outbound mention rewriting
- * gracefully no-ops if the registry is empty or the username can't be
- * resolved.
- *
- * Hard timeout: channel-registry awaits factories serially, so a stalled
- * Discord CDN connection at host boot would block every adapter that
- * registers after Discord. 5s is well above Discord's typical p99 for this
- * endpoint and short enough that a hung connection doesn't visibly delay
- * startup.
+ * One REST call at adapter init, cached for the process; null on any failure (mention rewriting then no-ops). Hard
+ * timeout because channel-registry awaits factories serially, so a stalled call at boot would block every later
+ * adapter.
  */
 const DISCORD_REST_TIMEOUT_MS = 5000;
 
@@ -529,22 +428,13 @@ async function fetchDiscordBotIdentity(botToken: string): Promise<DiscordBotIden
 }
 
 /**
- * Rewrite `@bot-username` (plain text) to a real Discord mention
- * `<@USER_ID>` for every bot in `bots`. Case-insensitive on the username.
- * Code regions are passed through unchanged.
- *
- * Exported with the registry as an injectable parameter so tests can supply
- * a synthetic bot set without touching the module-level Map.
+ * Rewrites `@bot-username` to `<@USER_ID>` (case-insensitive), skipping code regions. `bots` is injectable for tests.
  */
 export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBotIdentity> = knownDiscordBots): string {
   if (bots.size === 0) return text;
 
-  // Username → id, lowercased for case-insensitive matching. Each bot also
-  // contributes a separator-stripped alias (`example-agent-codex` ↔ `example-agent-codex`) so
-  // operator-typed Discord handles that diverge from the agent's logical
-  // name still resolve. Literal-first conflict resolution: an exact literal
-  // owns its slot in byName; normalized aliases fill only unowned slots.
-  // Mirrors slack-mentions.ts's normalized-fallback fix (PR-fix-slack-...).
+  // Each bot also gets a separator-stripped alias; an exact literal owns its slot and aliases fill only unowned slots
+  // (mirrors slack-mentions.ts).
   const byName = new Map<string, string>();
   const literalKeys = new Set<string>();
   for (const { userId, username } of bots.values()) {
@@ -561,39 +451,12 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
     byName.set(normalized, userId);
   }
 
-  // Discord usernames allow `[a-z0-9_.]` post-2023; we additionally accept
-  // `-` so legacy usernames like "Example Agent-Codex" still resolve.
-  //
-  // The `(?<!\w)` lookbehind anchors the `@` to a word boundary — without
-  // it, `user@domain.com` would parse as `@domain.com` and look up a bot
-  // named "domain.com". In practice that fail-softs (no match), but the
-  // boundary check makes intent explicit and avoids surprise if a bot's
-  // username ever collides with the right-hand side of an email or path.
-  //
-  // Username body: word chars and dashes, with OPTIONAL `.suffix` segments
-  // so `user.name` still resolves but a trailing sentence-ending period
-  // ("Your turn, @Example Agent-Codex.") doesn't gobble into the capture and miss
-  // the lookup. A naïve `[\w.-]+` swallows the trailing period, which then
-  // misses `byName.get("example-agent-codex.")` and falls through to the
-  // chat-sdk-adapter's own `/@(\w+)/g` pass — which captures only `@Example Agent`
-  // (no dash support) and brackets it to `<@Example Agent>`, leaving `-Codex.` as
-  // dangling text. That double-failure was the live Discord bug.
-  //
-  // Two passes by design, agent-mistake-tolerant:
-  //   1. `<@Name>` — the bracketed form agents sometimes emit when they
-  //      remember the Slack `<@U123>` template but substitute the username
-  //      instead of the snowflake. Discord would render this as literal
-  //      text. We catch it here and rewrite to `<@id>`.
-  //   2. `@Name` — the canonical bare form per container/CLAUDE.md
-  //      guidance.
-  // Real `<@SNOWFLAKE>` mentions and `<@&ROLE>` role mentions are
-  // unaffected: byName keys are usernames, so digits-only or `&`-prefixed
-  // captures don't match the lookup. The bare-form pass skips text
-  // preceded by `<` so it never re-touches what pass 1 just emitted.
-  // Boundary: `(?<![\w/:])` — the `/` and `:` exclusions keep
-  // `https://example.com/@user` from getting its path corrupted into
-  // `https://example.com/<@SNOWFLAKE>`. transformOutsideProtectedRegions
-  // only shields code spans, not URL regions. Mirrors slack-mentions.ts.
+  // `(?<![\w/:])` anchors `@` to a boundary so emails and URL paths (`https://x/@user`) are never rewritten;
+  // transformOutsideProtectedRegions only shields code. The username allows optional `.suffix` segments so a
+  // sentence-ending period is not captured (it would miss the lookup and leave the adapter's own `@(\w+)` pass to
+  // mangle the name).
+  // Two passes: bracketed `<@Name>` (agents misapplying Slack's template) then bare `@Name`. Real `<@SNOWFLAKE>` and
+  // `<@&ROLE>` never match a username key.
   const USERNAME = String.raw`[\w-]+(?:\.[\w-]+)*`;
   const BRACKETED_MENTION_RE = new RegExp(String.raw`(?<![\w/:])<@(${USERNAME})>`, 'g');
   const BARE_MENTION_RE = new RegExp(String.raw`(?<![\w/:])@(${USERNAME})`, 'g');
@@ -607,47 +470,22 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
 
     const afterBracketed = segment.replace(BRACKETED_MENTION_RE, rewriteByName);
     return afterBracketed.replace(BARE_MENTION_RE, (match, name: string, offset: number) => {
-      // Skip if `@` is preceded by `<` — pass 1 already handled bracketed
-      // forms, and `<@SNOWFLAKE>` / `<@&ROLE>` syntax stays untouched.
+      // Pass 1 already handled bracketed forms.
       if (offset > 0 && afterBracketed[offset - 1] === '<') return match;
       return rewriteByName(match, name);
     });
   });
 }
 
-/**
- * Strip Discord-handle separators (`-`, `_`, `.`) so `example-agent-codex` ≡
- * `example-agent-codex` ≡ `example-agent-codex` for fuzzy matching. Used only as a fallback
- * after literal lookup misses — never replaces literal equality. Mirrors
- * the same helper in `slack-mentions.ts`.
- */
+/** Strips `-`, `_`, `.` for fuzzy matching, used only after a literal lookup misses. Mirrors slack-mentions.ts. */
 function normalizeHandle(handle: string): string {
   return handle.replace(/[-_.]/g, '');
 }
 
 /**
- * Inbound counterpart to `resolveDiscordMentions`. Rewrites Discord's raw
- * `<@SNOWFLAKE>` / `<@!SNOWFLAKE>` user-mention syntax to `@bot_username`
- * for any registered NanoClaw bot. Unknown snowflakes (human users, bots
- * outside this process) pass through unchanged so the host can still log
- * the raw form for debugging.
- *
- * Why bots only: this exists to fix sibling handoff. The agent needs to
- * know its peer is called `Example Agent-Codex` (not just snowflake 1505...). It
- * doesn't need human display names — the chat-sdk Message envelope
- * already carries `author.fullName` for the sender, and humans aren't
- * routing targets.
- *
- * Role mentions (`<@&ROLE>`) and channel mentions (`<#CHAN>`) are not
- * touched — the regex demands a digit-only capture so `&` and `#`
- * prefixes fall through.
- *
- * Code regions are skipped via `transformOutsideProtectedRegions`,
- * mirroring the outbound rewriter. A pasted log line like
- * `` `payload: <@123>` `` stays verbatim — the user put it in code on
- * purpose, and the agent reading the inbound is better served by the
- * exact text the user typed than by a "helpful" name substitution
- * inside what is meant to be raw content.
+ * Inbound counterpart: rewrites `<@SNOWFLAKE>`/`<@!SNOWFLAKE>` to `@bot_username` for registered NanoClaw bots only,
+ * so an agent learns its peer's name; unknown ids pass through. Role and channel mentions are untouched. Code regions
+ * are skipped so pasted raw text stays verbatim.
  */
 export function resolveIncomingDiscordMentions(
   text: string,
@@ -658,8 +496,7 @@ export function resolveIncomingDiscordMentions(
   for (const { userId, username } of bots.values()) {
     byId.set(userId, username);
   }
-  // `<@123>` is a normal mention; `<@!123>` is the legacy "nickname mention"
-  // form some older Discord clients still emit. Both resolve to the same user.
+  // `<@!123>` is the legacy nickname-mention form.
   return transformOutsideProtectedRegions(text, (segment) =>
     segment.replace(/<@!?(\d+)>/g, (match, id: string) => {
       const username = byId.get(id);
@@ -668,37 +505,26 @@ export function resolveIncomingDiscordMentions(
   );
 }
 
-/** Minimal REST interface for Discord operations — narrow surface for testing. */
 export interface DiscordRestClient {
   post(route: `/${string}`, options?: { body?: unknown }): Promise<unknown>;
 }
 
 /**
- * Strip the `discord:` scheme prefix and leading `guildId:` segment from a
- * NanoClaw platform_id, leaving the raw Discord channel ID that the REST API
- * expects. Tolerates `discord:guildId:channelId`, `discord:guildId:channelId:threadId`,
- * and bare `channelId` (test inputs). The host's regular delivery path
- * normalizes via the chat-sdk bridge — these helpers are called from
- * orchestrator-dispatch directly and need to do their own normalization or
- * the REST call hits `/channels/discord:.../messages` and returns 404.
+ * Strips `discord:` and the guild segment, leaving the raw channel id the REST API expects. Callers outside the
+ * bridge (orchestrator-dispatch) must normalize here or the call hits `/channels/discord:...` and 404s.
  */
 export function extractDiscordChannelId(platformId: string): string {
   if (!platformId.startsWith('discord:')) return platformId;
   const parts = platformId.split(':');
-  // discord:{guildId}:{channelId}[:{threadId}] — the channel id we want is index 2
+  // `discord:{guildId}:{channelId}[:{threadId}]`: the channel id is index 2.
   return parts[2] ?? platformId;
 }
 
 const SNOWFLAKE = /^\d+$/;
 
 /**
- * Discord thread permalink, or null when one can't be built exactly.
- *
- * A thread id is `discord:{guildId}:{channelId}:{threadId}` (see
- * makeFetchThreadAnchor above), and a Discord thread is itself a channel, so
- * `https://discord.com/channels/{guildId}/{threadId}` opens it. Unlike Slack,
- * no workspace URL is needed. A channel-level id, a DM (`@me`), or anything not
- * made of snowflakes returns null rather than a guessed link.
+ * A Discord thread is itself a channel, so `https://discord.com/channels/{guildId}/{threadId}` opens it. Anything
+ * that is not a four-part snowflake thread id returns null rather than a guessed link.
  */
 export function discordPermalink(threadId: string | null): string | null {
   const parts = threadId?.split(':') ?? [];
@@ -708,17 +534,12 @@ export function discordPermalink(threadId: string | null): string | null {
   return `https://discord.com/channels/${guildId}/${thread}`;
 }
 
-/** Link to a Discord CHANNEL (`discord:{guildId}:{channelId}`), or null. */
 export function discordChannelPermalink(platformId: string): string | null {
   const [scheme, guildId, channelId] = platformId.split(':');
   if (scheme !== 'discord' || !SNOWFLAKE.test(guildId ?? '') || !SNOWFLAKE.test(channelId ?? '')) return null;
   return `https://discord.com/channels/${guildId}/${channelId}`;
 }
 
-/**
- * Post a message to the top level of a Discord channel.
- * Exported for unit testing.
- */
 export async function discordPostParent(
   rest: DiscordRestClient,
   platformId: string,
@@ -731,10 +552,6 @@ export async function discordPostParent(
   return { messageId: msg.id };
 }
 
-/**
- * Create a Discord thread from a parent message and post the first message.
- * Exported for unit testing.
- */
 export async function discordCreateThread(
   rest: DiscordRestClient,
   platformId: string,
@@ -752,14 +569,9 @@ export async function discordCreateThread(
   return { threadId: thread.id, messageId: firstMsg.id };
 }
 
-/** Discord caps thread names at 100 characters. */
 const DISCORD_THREAD_NAME_MAX = 100;
 
-/**
- * Thread name for a thread opened under an existing bot post: the post's first
- * non-empty line with Markdown punctuation stripped, capped at Discord's limit.
- * Exported for unit testing.
- */
+/** The post's first non-empty line, Markdown punctuation stripped, capped at Discord's limit. */
 export function discordThreadNameFrom(content: string | undefined): string {
   const line =
     (content ?? '')
@@ -782,7 +594,6 @@ export function discordThreadNameFrom(content: string | undefined): string {
   );
 }
 
-/** REST surface `installMessageThreadAutoCreate` needs — narrow for tests. */
 export interface DiscordThreadRestClient {
   get(route: `/${string}`): Promise<unknown>;
   post(route: `/${string}`, options?: { body?: unknown }): Promise<unknown>;
@@ -790,9 +601,8 @@ export interface DiscordThreadRestClient {
 }
 
 /**
- * Discord snowflakes of the install's global owners. Owner user ids are
- * `<channelType>:<snowflake>` with one row per Discord bot (`discord:`,
- * `discord-codex:`, …) for the same human, so dedupe on the snowflake.
+ * One owner user row exists per Discord bot (`discord:`, `discord-codex:`, ...) for the same human, so dedupe on the
+ * snowflake.
  */
 async function discordOwnerUserIds(): Promise<string[]> {
   const ids = new Set<string>();
@@ -804,12 +614,8 @@ async function discordOwnerUserIds(): Promise<string[]> {
 }
 
 /**
- * Add the install's owners to a thread a bot just opened. Discord's channel
- * sidebar lists only threads you are a member of; a thread opened from a
- * user's @mention includes that user, but one a bot opens under its own post
- * (keyed/task/turn anchors, createThread) has only the bot, so it stayed
- * hidden until the owner replied in it. Best-effort: a failure leaves the
- * thread working, just unlisted.
+ * Adds the install's owners to a thread a bot opened: Discord's sidebar only lists threads you are a member of, so a
+ * bot-opened thread stays hidden until the owner replies. Best-effort.
  */
 export async function addDiscordThreadMembers(
   rest: Pick<DiscordThreadRestClient, 'put'>,
@@ -826,7 +632,7 @@ export async function addDiscordThreadMembers(
     });
     return;
   }
-  // Per user, so one owner outside this guild (10007) doesn't skip the rest.
+  // Per user, so one owner outside this guild (10007) does not skip the rest.
   for (const userId of ids) {
     try {
       await rest.put(Routes.threadMembers(threadId, userId));
@@ -841,20 +647,9 @@ export async function addDiscordThreadMembers(
 }
 
 /**
- * Open the thread the live Gateway path would have opened for a channel-root
- * @mention that only channel recovery saw.
- *
- * On a root mention, @chat-adapter/discord creates a thread from the message
- * before dispatch (`handleGatewayMessage` → `createDiscordThread`), so the
- * mention routes to its own per-thread session. A mention that arrives while
- * the Gateway is down (an event-loop stall long enough to drop it) is found
- * later by REST history, which has no such step: it routed to the channel's
- * thread-less session and the reply landed at channel root.
- *
- * A thread created from a message shares its snowflake, and 160004 means one
- * already exists — both yield `<platformId>:<messageId>`. Any other failure
- * returns null, matching the adapter, which also answers at root when it
- * cannot create the thread.
+ * Opens the thread the live Gateway path would have opened for a channel-root @mention that only recovery saw;
+ * otherwise the recovered mention routes to the thread-less session and the reply lands at channel root. 160004 means
+ * the thread already exists; any other failure returns null, matching the adapter's root-reply fallback.
  */
 export async function openRecoveredMentionThread(
   rest: Pick<DiscordThreadRestClient, 'post'>,
@@ -865,7 +660,7 @@ export async function openRecoveredMentionThread(
   if (scheme !== 'discord' || !guildId || guildId === '@me' || !channelId || threadId) return null;
   try {
     await rest.post(Routes.threads(channelId, message.id), {
-      // Provisional: maybeRenameNewThread retitles it like any mention-opened thread.
+      // Provisional: maybeRenameNewThread retitles it.
       body: { name: discordThreadNameFrom(message.text?.replace(/<@!?\d+>/g, '')), auto_archive_duration: 1440 },
     });
     log.info('Discord thread opened for recovered mention', { channelId, messageId: message.id });
@@ -884,33 +679,18 @@ export async function openRecoveredMentionThread(
 }
 
 function isDiscordUnknownChannelError(err: unknown): boolean {
-  // @chat-adapter/discord@4.29.0 serialises HTTP failures into the message text, not a code field:
-  // `Discord API error: ${response.status} ${errorText}` (discordFetch) and
-  // `Failed to post message: ${response.status} ${error}` (postMessageWithFiles).
-  // Pinned against the real adapter by the "real @chat-adapter/discord" test in discord.test.ts.
+  // @chat-adapter/discord serialises HTTP failures into the message text, not a code field; pinned by the "real
+  // @chat-adapter/discord" test in discord.test.ts.
   const message = err instanceof Error ? err.message : String(err);
   return /\b404\b/.test(message) && new RegExp(`"code":\\s*${RESTJSONErrorCodes.UnknownChannel}\\b`).test(message);
 }
 
 /**
- * Make `discord:<guild>:<channel>:<messageId>` a postable thread target when
- * no thread exists on that message yet.
- *
- * Slack threads on any message's ts, so NanoClaw anchors multi-message output
- * as `<platformId>:<parentMessageId>` — delivery.ts's task/turn anchors and the
- * bridge's `threadContinuationChunks`. Discord threads are channels that must be
- * created from the message first; until then the adapter POSTs to
- * `/channels/<messageId>/messages` and gets 404 Unknown Channel (10003), and
- * every "reply" fell back to a new channel-root post. A thread created from a
- * message shares that message's snowflake, so the encoded id stays valid once
- * the thread exists.
- *
- * On exactly that 404, open a thread on the message (named from its first
- * line) and retry the post once. A concurrent creator racing us returns
- * 160004 ThreadAlreadyCreatedForMessage — the thread exists, so retry anyway.
- * Any other creation failure (DMs have no threads, missing permission, the id
- * is a deleted thread rather than a message) rethrows the ORIGINAL error, so
- * callers keep their existing root-post fallbacks.
+ * Makes `discord:<guild>:<channel>:<messageId>` postable when no thread exists on that message yet. NanoClaw anchors
+ * multi-message output as `<platformId>:<parentMessageId>` (natural on Slack), but a Discord thread must be created
+ * from the message first; until then the post 404s (10003). On exactly that 404, open a thread on the message and
+ * retry once (160004 means a concurrent creator won; retry anyway). Any other failure rethrows the ORIGINAL error so
+ * callers keep their root-post fallbacks.
  */
 export function installMessageThreadAutoCreate(
   adapter: ReturnType<typeof createDiscordAdapter>,
@@ -938,7 +718,7 @@ export function installMessageThreadAutoCreate(
         }
         await rest.post(Routes.threads(channelId, messageId), { body: { name } });
         log.info('Discord thread opened under anchor message', { channelId, messageId });
-        // Not awaited: best-effort, and the retried post shouldn't wait on it.
+        // Best-effort; the retried post does not wait on it.
         void addThreadMembers(rest, messageId);
       } catch (createErr) {
         if ((createErr as { code?: unknown }).code !== RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
@@ -963,13 +743,8 @@ export interface DiscordWorkspace {
 }
 
 /**
- * Pure helper — parse Discord workspace configs from an env key/value map.
- * Exported for testing. Mirrors parseSlackWorkspaces in `slack.ts`.
- *
- * Only DISCORD_BOT_TOKEN is required to register a workspace. publicKey
- * and applicationId are optional (only consumed when slash-command
- * interactions are configured for that app), so a token-only entry still
- * yields a working chat adapter.
+ * Only DISCORD_BOT_TOKEN is required; publicKey and applicationId are only needed for slash-command interactions.
+ * Mirrors parseSlackWorkspaces.
  */
 export function parseDiscordWorkspaces(env: Record<string, string>): DiscordWorkspace[] {
   const bySuffix = new Map<string, { botToken?: string; publicKey?: string; applicationId?: string }>();
@@ -999,8 +774,7 @@ export function parseDiscordWorkspaces(env: Record<string, string>): DiscordWork
   return workspaces;
 }
 
-// Pre-filter regex must allow `_` in the suffix so env vars like
-// DISCORD_BOT_TOKEN_example-agent-codex reach the parser intact.
+// The pre-filter must allow `_` in the suffix so every suffixed var reaches the parser.
 const workspaces = parseDiscordWorkspaces(
   readEnvFileMatching(/^DISCORD_(BOT_TOKEN|PUBLIC_KEY|APPLICATION_ID)(_[A-Za-z0-9_]+)?$/),
 );
@@ -1008,9 +782,7 @@ const workspaces = parseDiscordWorkspaces(
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
     factory: async () => {
-      // Discover this bot's user id + username so sibling bots in the same
-      // process can resolve `@username` → `<@id>` on outbound. One REST call
-      // at adapter init; cached for the lifetime of the process.
+      // Registers this bot's identity so siblings can resolve `@username` → `<@id>`.
       const identity = await fetchDiscordBotIdentity(ws.botToken);
       if (identity) {
         knownDiscordBots.set(ws.channelType, identity);
@@ -1028,19 +800,9 @@ for (const ws of workspaces) {
         applicationId: ws.applicationId,
       });
       installForwardUnwrap(discordAdapter);
-      // Multi-bot dedup isolation. The chat-adapter's message-dedup key is
-      // `dedupe:${adapter.name}:${message.id}`. createDiscordAdapter defaults
-      // `name = "discord"` for every instance (verified at
-      // @chat-adapter/discord dist:364); combined with a shared SqliteState
-      // adapter, two Discord adapters processing the same Discord message
-      // (same id) would collide on the dedup key and the second silently
-      // drops the message. This bites the two-bots-in-same-guild case (e.g.
-      // example-agent + example-agent-codex both observing user messages in #chat).
-      //
-      // Override adapter.name to the channelType so each workspace has its
-      // own dedup keyspace. The name also keys `chat.webhooks[...]` — but
-      // Discord is a gateway adapter (not webhook), so that path doesn't
-      // fire here. Mirrors the equivalent override in slack.ts.
+      // Multi-bot dedup isolation: the dedup key is `dedupe:${adapter.name}:${message.id}` and every Discord adapter
+      // defaults to name "discord", so two bots seeing the same message would collide in the shared state and the
+      // second would silently drop it. Name it after the channelType (as slack.ts does).
       (discordAdapter as unknown as { name: string }).name = ws.channelType;
       const rest = new REST({ version: '10' }).setToken(ws.botToken);
       installMessageThreadAutoCreate(discordAdapter, rest);
@@ -1051,36 +813,19 @@ for (const ws of workspaces) {
         extractReplyContext,
         supportsThreads: true,
         maxTextLength: 1900,
-        // Oversize channel-level posts: continuation chunks reply in a thread on
-        // the first chunk (opened by installMessageThreadAutoCreate) instead of
-        // landing as additional channel parents.
+        // Continuation chunks of an oversize channel post reply in a thread on the first chunk instead of landing as
+        // more channel parents.
         threadContinuationChunks: true,
         channelType: ws.channelType,
-        // Markdown delivery (not raw) keeps the chat-adapter's tableToAscii
-        // conversion in play; without it, Markdown tables would render as raw
-        // `|`-pipe text in Discord (no native table block).
-        //
-        // resolveDiscordMentions runs first so any `@bot-username` it rewrites
-        // to `<@id>` is then passed through rewriteDiscordLinks unchanged
-        // (the link rewriter only touches markdown links and bare URLs, never
-        // mention syntax).
+        // Markdown (not raw) keeps tableToAscii in play. Mentions are resolved before the link rewriter, which never
+        // touches mention syntax.
         transformOutboundMarkdown: (text, destination) =>
           linkDiscordChannelNames(rewriteDiscordLinks(resolveDiscordMentions(text)), destination?.platformId),
-        // Discord's own small-print syntax: `-# ` at the START of a line
-        // renders that line smaller and grayed (subtext, added 2024, desktop
-        // and mobile). It is ordinary message markdown, so unlike Slack this
-        // needs no payload surgery — the line just rides along in the body.
-        //
-        // The marker only fires at the start of a line with nothing before it,
-        // hence the explicit newline; `transformOutboundMarkdown` above has
-        // already run over the body by the time this is called, and it must
-        // not run over the footer (the footer contains no mentions or links,
-        // and re-running the rewriter over it would be a no-op at best).
+        // Discord subtext is plain `-# ` at the start of a line, so the footer rides in the body. The explicit
+        // newline is required, and the outbound transform above must not run over the footer.
         renderSubtext: (body, subtext) =>
           'markdown' in body ? { ...body, markdown: `${body.markdown}\n-# ${subtext}` } : body,
-        // Inbound counterpart: turn the raw `<@snowflake>` form Discord
-        // delivers into `@bot_username` for any sibling bot, so the agent
-        // can address its peer by name instead of guessing.
+        // Rewrites raw `<@snowflake>` to `@bot_username` for sibling bots.
         transformInboundText: (text) => resolveIncomingDiscordMentions(text),
         inboundFilter: isUserMessage,
         detectRecoveredMention: (message) => {
@@ -1089,8 +834,8 @@ for (const ws of workspaces) {
           return raw?.mentions?.some((mention) => mention.id === identity.userId) === true;
         },
         threadRecoveredRootMention: (platformId, message) => openRecoveredMentionThread(rest, platformId, message),
-        // Match the live Gateway patch: self echoes are removed by the bridge;
-        // among remaining bots, only known NanoClaw siblings are admissible.
+        // Matches the live Gateway patch: self echoes are removed by the bridge; among other bots only known NanoClaw
+        // siblings are admitted.
         allowRecoveredBotMessage: (message) => {
           const authorId = message.author.userId;
           return authorId !== identity?.userId && [...knownDiscordBots.values()].some((bot) => bot.userId === authorId);

@@ -1,29 +1,7 @@
 /**
- * Slack channel adapter — FORK DEVIATION from upstream /add-slack.
- *
- * Upstream ships a single-workspace adapter (one SLACK_BOT_TOKEN +
- * SLACK_SIGNING_SECRET, channelType "slack"). Our fork needs multiple
- * concurrent Slack workspaces in one host process because we run a
- * primary Slack + the Example Labs Slack side-by-side.
- *
- * Multi-workspace env-var convention:
- *   SLACK_BOT_TOKEN=xoxb-…                    → channelType "slack"
- *   SLACK_SIGNING_SECRET=…
- *   SLACK_BOT_TOKEN_<SUFFIX>=xoxb-…           → channelType "slack-<suffix>"
- *   SLACK_SIGNING_SECRET_<SUFFIX>=…
- *
- * Each workspace is a separate Slack app (created per-workspace at
- * api.slack.com/apps, "Not distributed"). Suffix is any [A-Za-z0-9_]+
- * (alphanumerics + underscore — matches the convention used by other
- * scoped env vars in this fork like GITHUB_TOKEN_EXAMPLE_RETAIL) and is
- * lowercased for the channelType.
- *
- * This file is re-applied on top of the upstream /add-slack output so
- * `/add-slack` remains an idempotent install that preserves the
- * channels-via-skills model, and the deviation is a single clearly-
- * commented overlay. Revisit upstreaming after cutover — the only piece
- * of the NanoClaw core this requires is the optional `channelType`
- * override on createChatSdkBridge (already merged upstream-compatible).
+ * Slack channel adapter, a FORK DEVIATION from upstream /add-slack: multiple concurrent Slack workspaces in one host.
+ * `SLACK_BOT_TOKEN` (+ `SLACK_SIGNING_SECRET` or `SLACK_APP_TOKEN`) → channelType "slack"; `SLACK_BOT_TOKEN_<SUFFIX>`
+ * → "slack-<suffix>". Each workspace is its own Slack app. Suffix is [A-Za-z0-9_]+, lowercased for the channelType.
  */
 import { createSlackAdapter } from '@chat-adapter/slack';
 import { WebClient } from '@slack/web-api';
@@ -56,49 +34,18 @@ import {
   type SlackBotIdentity,
 } from './slack-mentions.js';
 
-// Slack Block Kit section text objects cap at 3,000 characters. Keep a
-// little headroom for adapter-side serialization while preserving complete
-// replies by letting the shared bridge split longer chat messages.
+// Block Kit section text caps at 3,000 characters; headroom for adapter serialization, and the bridge splits longer
+// messages.
 export const SLACK_MESSAGE_MAX_TEXT_LENGTH = 2800;
 
 /**
- * Declared wiring-time defaults for every Slack instance.
- *
- * Until this existed, `registerChannelAdapter` passed no `defaults` and every
- * Slack wiring resolved through `fallbackChannelDefaults` — the lenient
- * undeclared-adapter path. That was not neutral: the `ncl`/wizard creation
- * surfaces gate declaration-derived defaults on `hasDeclaredChannelDefaults`,
- * so a Slack wiring created through `ncl` got the static schema defaults
- * (engage_mode 'mention', unknown_sender_policy 'strict') while the router's
- * auto-create branch and the card-approval flow used the fallback. The live
- * install shows the split: some Slack DM messaging_groups carry 'strict',
- * their card-approved siblings 'public'.
- *
- * Shape mirrors upstream/channels slack.ts, VALUES are the fork's policies:
- *  - group.engageMode 'mention', not upstream's 'mention-sticky' (owner
- *    directive 2026-05-26 — sibling agents co-reside in channels and sticky
- *    let one agent auto-dominate a thread);
- *  - group.unknownSenderPolicy 'public', not upstream's 'request_approval'
- *    (owner directive 2026-08-06 — inviting the bot to a channel IS the
- *    access decision);
- *  - dm.unknownSenderPolicy 'request_approval' (upstream's 'decline_notify'
- *    is not in this fork's enum);
- *  - no sessionMode: this fork's ChannelContextDefaults has no such field;
- *    session_mode 'per-thread' is stamped by `wireApprovedChannel`.
- *
- * CREATION-TIME STAMPS vs LIVE INHERIT — the rule that keeps existing
- * installs still: engageMode, engagePattern and unknownSenderPolicy are read
- * only when a wiring or messaging_groups row is CREATED, so they can differ
- * from history without touching a single existing row. `threads` is the one
- * value re-read on every routed message (`resolveThreadPolicy`, NULL =
- * inherit), so it MUST equal what the fallback resolved to or ~48 live Slack
- * wirings would silently change threading on deploy. The fallback resolves
- * `threads: supportsThreads`, and the Slack bridge declares
- * supportsThreads:true — hence true in BOTH contexts. Upstream declares
- * dm.threads:false; adopting that here would collapse every existing Slack DM
- * sub-thread into one session (this fork threads DM replies by default — see
- * the DM auto-threading block in chat-sdk-bridge.ts). Operators who want a
- * different value set it per wiring with `--threads`.
+ * Declared wiring-time defaults for every Slack instance. Without a declaration, `ncl`-created wirings got static
+ * schema defaults while auto-created ones used the fallback, splitting live policy. The values are this fork's: group
+ * engageMode 'mention' (not 'mention-sticky': sibling agents share channels), group unknownSenderPolicy 'public'
+ * (inviting the bot is the access decision), dm unknownSenderPolicy 'request_approval'.
+ * engageMode, engagePattern and unknownSenderPolicy are read only when a row is CREATED. `threads` is re-read on
+ * every routed message (NULL = inherit), so it MUST stay true in both contexts, matching the fallback
+ * (`supportsThreads`); changing it would silently re-thread every existing Slack wiring, including DM sub-threads.
  */
 export const SLACK_DEFAULTS: ChannelDefaults = {
   dm: {
@@ -116,28 +63,15 @@ export const SLACK_DEFAULTS: ChannelDefaults = {
 };
 
 /**
- * Bridge `inboundFilter` that applies the sibling-bot loop governor.
- *
- * Projects a Chat SDK message onto the three facts the governor needs. Two
- * judgments live here rather than in the governor:
- *
- *  - **Sibling detection is registry-based and team-scoped.** Only ids in this
- *    workspace's known-bot registry count as ours. Without our own identity
- *    there is no teamId to scope by, so this fails CLOSED — nothing is treated
- *    as a sibling and the governor never drops. Same discipline as
- *    resolveInboundSlackIds, and for the same reason: an unscoped id match
- *    could pick up another workspace's bot.
- *  - **"Human" is everything that is not one of ours and not flagged a bot.**
- *    The SDK's `isBot` is `boolean | 'unknown'`; an unknown author resets the
- *    counter rather than being ignored. Failing open on the RESET is the safe
- *    direction — the alternative silently mutes a channel forever.
+ * Bridge `inboundFilter` for the sibling-bot loop governor. Sibling detection is registry-based and team-scoped, and
+ * fails CLOSED without our own identity (nothing counts as a sibling, the governor never drops). "Human" is anything
+ * not ours and not flagged a bot; an `isBot: 'unknown'` author resets the counter, because failing the other way can
+ * mute a channel forever.
  */
 /**
- * Is this a bot's live task-list post? The runner renders every list with a
- * context-block footer that starts "todos as of" (or "stopped · todos as of"
- * once interrupted) — container/agent-runner/src/task-list.ts renderSubtext —
- * and nothing else posts that footer. Bot-authored only, so a human quoting
- * the phrase still reaches the agent.
+ * A bot's live task-list post, recognized by the runner's "todos as of" context footer
+ * (container/agent-runner/src/task-list.ts). Bot-authored only, so a human quoting the phrase still reaches the
+ * agent.
  */
 export function isSlackTaskListPost(message: { author?: { isBot?: boolean | 'unknown' }; raw?: unknown }): boolean {
   if (message.author?.isBot !== true) return false;
@@ -171,13 +105,8 @@ export function slackHopInboundFilter(
 }
 
 /**
- * Is this workspace member a human we would name to another human?
- *
- * Bots, Slack app users, Slackbot and deactivated accounts are not. Shared by
- * the mention directory (syncSlackWorkspaceHumans) and the group-DM roster so
- * the two cannot drift — `is_app_user` without `is_bot` is a real Slack shape,
- * and an app identity listed as a participant on an approval card reads as a
- * person who is not there.
+ * Bots, app users (`is_app_user` without `is_bot` is real), Slackbot and deactivated accounts are not. Shared by the
+ * mention directory and the group-DM roster so the two cannot drift.
  */
 export function isSlackHumanMember(
   userId: string,
@@ -187,11 +116,8 @@ export function isSlackHumanMember(
 }
 
 /**
- * Fetch the workspace's human members and register them for outbound
- * mention resolution. Bots/apps/deleted users are excluded — bot mentions
- * resolve through the sibling-bot registry, and Slackbot is never a target.
- * Fail-soft: a missing `users:read` scope logs a warning and leaves human
- * mentions unresolved (bot mentions keep working).
+ * Registers the workspace's human members for outbound mention resolution. Fail-soft: without `users:read`, human
+ * mentions stay unresolved and bot mentions still work.
  */
 async function syncSlackWorkspaceHumans(client: WebClient, teamId: string, channelType: string): Promise<void> {
   try {
@@ -228,12 +154,9 @@ async function syncSlackWorkspaceHumans(client: WebClient, teamId: string, chann
 export interface SlackWorkspace {
   channelType: string;
   botToken: string;
-  /** Webhook-mode credential. Absent when the workspace runs Socket Mode. */
+  /** Webhook-mode credential; absent under Socket Mode. */
   signingSecret?: string;
-  /**
-   * App-level token (`xapp-…`). Its presence IS the Socket Mode switch — the
-   * contract the add-slack skill already documents to operators.
-   */
+  /** App-level token (`xapp-…`); its presence IS the Socket Mode switch. */
   appToken?: string;
 }
 
@@ -289,10 +212,8 @@ export function makeSlackRecoveryPageFetcher(slackAdapter: ReturnType<typeof cre
 }
 
 /**
- * Slack error codes that mean a recovery target is unreachable by WIRING, not
- * by outage: the channel is gone, archived, or the bot was removed. Retrying
- * cannot succeed until a human changes the wiring, so the bridge parks the
- * target instead of failing the pass.
+ * Errors meaning a recovery target is unreachable by wiring, not outage; the bridge parks the target instead of
+ * failing the pass.
  */
 const PERMANENT_SLACK_RECOVERY_ERRORS = ['channel_not_found', 'is_archived', 'not_in_channel', 'missing_scope'];
 
@@ -304,7 +225,7 @@ export function classifySlackRecoveryError(err: unknown): 'permanent' | 'transie
   return PERMANENT_SLACK_RECOVERY_ERRORS.some((c) => message.includes(c)) ? 'permanent' : 'transient';
 }
 
-/** Find threads created or updated during the gap before they have a session. */
+/** Finds threads created or updated during the gap before they have a session. */
 export async function discoverSlackRecoveryTargets(
   client: WebClient,
   request: ChannelRecoveryRequest,
@@ -318,9 +239,7 @@ export async function discoverSlackRecoveryTargets(
   const failed: Array<{ target: ChannelRecoveryTarget; error: unknown }> = [];
   let complete = true;
 
-  // Per-root fault isolation: one unreachable channel must not abort
-  // discovery for every other root (it did — the bridge then failed the
-  // whole pass and froze the recovery window).
+  // Per-root fault isolation: one unreachable channel must not abort discovery for the rest.
   for (const root of request.targets) {
     if (root.threadId !== null) continue;
     const channel = root.platformId.split(':')[1];
@@ -344,10 +263,8 @@ export async function discoverSlackRecoveryTargets(
           }
         }
         const nextCursor = response.response_metadata?.next_cursor || undefined;
-        // Slack has no thread-activity index: an old channel or DM root can
-        // receive its first reply during the gap. Cover the conversation's full
-        // root history so those threads are discoverable, not just roots newer
-        // than `since`.
+        // Slack has no thread-activity index: an old root can get its first reply during the gap, so the full root
+        // history is covered, not just roots newer than `since`.
         if (!nextCursor) {
           coveredBoundary = true;
           break;
@@ -365,20 +282,9 @@ export async function discoverSlackRecoveryTargets(
   return { targets, complete, failed };
 }
 
-/**
- * Pure helper — parse workspace configs from an env key/value map.
- * Exported for testing.
- *
- * Suffix-to-channelType derivation: lowercase, then map `_` → `-`. This
- * keeps env-var names readable when an underscore appears (e.g.
- * SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX) while producing a channelType that
- * matches the existing dash-separated convention (slack-example-labs-codex).
- * The reverse direction in channel-auto-wire/index.ts already maps
- * `-` → `_` when building env-var lookups, so the round-trip is stable.
- */
+/** Suffix → channelType: lowercase, `_` → `-`; channel-auto-wire maps `-` → `_` back, so the round-trip is stable. */
 
-/** The slice of the Slack Web API these two helpers need. Structural so tests
- *  can pass a two-method stub instead of a WebClient. */
+/** Structural so tests can pass a two-method stub. */
 export interface SlackConversationClient {
   conversations: {
     info(args: { channel: string }): Promise<{
@@ -410,21 +316,9 @@ function slackUserDisplayName(u: {
 }
 
 /**
- * Classify a Slack conversation for surfaces that render it to a human: a 1:1
- * DM, a group DM (MPDM), or a channel.
- *
- * Ported from upstream/channels `resolveSlackConversation`, with two fork
- * deviations:
- *  - a 1:1 DM resolves the counterpart's profile name rather than returning
- *    `name: null`. `resolveChannelName` is built on this function and has
- *    named Slack DMs since 04f9a5f9; losing that would rename every DM
- *    messaging group back to a raw `slack:D…` id.
- *  - it runs on this fork's `WebClient` rather than upstream's adapter
- *    wrapper, which does not exist here.
- *
- * Returns null when the API cannot classify the conversation (network
- * failure, missing scope) so callers fall back to generic rendering. Never
- * throws — a naming lookup must not take down an approval card.
+ * Classifies a conversation as a 1:1 DM, group DM or channel. Fork deviations from upstream: a 1:1 DM resolves the
+ * counterpart's profile name (`resolveChannelName` relies on it), and it runs on `WebClient`. Null when the API
+ * cannot classify; never throws.
  */
 export async function resolveSlackConversation(
   client: SlackConversationClient,
@@ -442,7 +336,7 @@ export async function resolveSlackConversation(
       return { type: 'direct', name: res.ok && res.user ? slackUserDisplayName(res.user) : null };
     }
 
-    // A channel keeps its `#name`. Only an MPDM pays for the roster lookup.
+    // Only an MPDM pays for the roster lookup.
     if (!ch.is_mpim) return { type: 'channel', name: ch.name ? `#${ch.name}` : null };
 
     const participantNames = await resolveMpdmParticipants(client, id);
@@ -457,15 +351,11 @@ export async function resolveSlackConversation(
   }
 }
 
-/** Human members of an MPDM, or null when the roster can't be resolved.
- *  Bots (including our own) and deactivated accounts are excluded. */
+/** Null when the roster cannot be resolved. Bots and deactivated accounts are excluded. */
 async function resolveMpdmParticipants(client: SlackConversationClient, channelId: string): Promise<string[] | null> {
   if (!client.conversations.members || !client.users) return null;
-  // Same `.catch()` the per-member `users.info` calls carry below: a transient
-  // roster failure must degrade to "group DM, no names", not escape to
-  // `resolveSlackConversation`'s catch — that returns null for the whole
-  // conversation, which loses the one fact we already know for certain (this
-  // IS a group DM) and drops the card back to generic rendering.
+  // A transient roster failure must degrade to "group DM, no names", not escape to the caller's catch, which would
+  // lose the fact that this IS a group DM.
   const { ok, members } = await client.conversations
     .members({ channel: channelId, limit: 100 })
     .catch(() => ({ ok: false }) as { ok?: boolean; members?: string[] });
@@ -485,16 +375,12 @@ async function resolveMpdmParticipants(client: SlackConversationClient, channelI
         };
       }
     ).user;
-    // A LOOKUP FAILURE is not a filtered member. Skipping it would present a
-    // truncated roster as complete — "a group DM with Alice" when Bob's
-    // profile call merely failed — and that label is then persisted as the
-    // messaging group's name. All-or-nothing: an unresolved roster degrades
-    // the card to "a group DM", which is true.
+    // A LOOKUP FAILURE is not a filtered member: skipping it would persist a truncated roster as the group's name.
+    // All or nothing.
     if (!res.ok || !u) return null;
     if (!isSlackHumanMember(members[index]!, u)) continue;
     const name = slackUserDisplayName(u);
-    // A resolvable human with no usable name is the same problem: naming the
-    // rest would claim a completeness we do not have.
+    // Naming the rest would claim a completeness we do not have.
     if (!name) return null;
     names.push(name);
   }
@@ -502,17 +388,10 @@ async function resolveMpdmParticipants(client: SlackConversationClient, channelI
 }
 
 /**
- * Human-facing name for a Slack conversation, for `messaging_groups.name`:
- * `#name` for channels, the counterpart's profile name for a 1:1 DM, and the
- * participant list for a group DM. Null whenever the API cannot say — callers
- * keep the wiring and fall back to the platform id, so a lookup failure must
- * never throw.
- *
- * This is the fleet's only implementation of the adapter's optional
- * `resolveChannelName`: the router names every auto-wired conversation
- * through it, and until it existed every auto-wired Slack DM stayed nameless
- * forever and rendered as a raw `slack:D…` id on human surfaces. It is now a
- * projection of `resolveSlackConversation` so the two seams cannot disagree.
+ * The name for `messaging_groups.name`: `#name` for channels, the counterpart's name for a 1:1 DM, the participants
+ * for a group DM; null when the API cannot say. The fleet's only `resolveChannelName` implementation (the router
+ * names every auto-wired conversation through it), projected from `resolveSlackConversation` so the two cannot
+ * disagree.
  */
 export async function slackChannelDisplayName(
   client: SlackConversationClient,
@@ -540,9 +419,7 @@ export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspac
   const workspaces: SlackWorkspace[] = [];
   for (const [suffix, pair] of bySuffix) {
     if (!pair.botToken) continue;
-    // Each delivery mode needs only its own second credential: Socket Mode
-    // holds an outbound WebSocket (no public URL, nothing to sign), webhook
-    // delivery needs the signing secret to authenticate Slack's POSTs.
+    // Socket Mode needs no signing secret (no public URL); webhook delivery needs it to authenticate Slack's POSTs.
     if (!pair.signingSecret && !pair.appToken) {
       log.warn('Slack workspace has no signing secret and no app token, skipping', {
         suffix: suffix || '(primary)',
@@ -561,30 +438,12 @@ export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspac
 }
 
 /**
- * ChannelTypes that must carry the declaration but cannot serve traffic.
- *
- * The registration is credential-gated, but the DECLARATION must not be:
- * `getChannelDefaults` resolves through the REGISTRY when no adapter is live
- * (tier 3, "factories that returned null for missing creds"), and without an
- * entry `ncl`/setup stamp the legacy `strict` schema default on a
- * messaging_groups row — a creation-time value that survives the credentials
- * being completed.
- *
- * Two sources:
- *  - any suffix seen with a Slack env key but not a complete token/secret
- *    pair — a bot token pasted before its signing secret, or the reverse;
- *  - the default `slack` instance when NOTHING is configured, which is the
- *    state `setup/register.ts` and an offline `ncl` run in. It is added only
- *    then, so a host with real workspaces does not advertise a phantom
- *    unconfigured channel in `getRegisteredChannelNames`.
- *
- * A suffix that IS complete is excluded here — the bridge factory loop
- * registers it with a live factory.
- *
- * Exported for testing. Same suffix→channelType derivation as
- * parseSlackWorkspaces, deliberately duplicated rather than folded into it:
- * that function's contract is "workspaces that can serve traffic", and the
- * bridge factory loop depends on that.
+ * ChannelTypes that must carry the declaration but cannot serve traffic. `getChannelDefaults` falls back to the
+ * registry when no adapter is live; without an entry, `ncl`/setup stamp the legacy `strict` default on a new
+ * messaging_groups row, and it outlives the credentials being completed.
+ * Covers suffixes with an incomplete credential pair, and the default `slack` instance only when nothing is
+ * configured (so a host with real workspaces does not advertise a phantom one). Deliberately separate from
+ * parseSlackWorkspaces, whose contract is "workspaces that can serve traffic".
  */
 export function declarationOnlySlackTypes(env: Record<string, string>): string[] {
   const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
@@ -613,20 +472,16 @@ export function declarationOnlySlackTypes(env: Record<string, string>): string[]
 }
 
 /**
- * The env keys a Slack workspace is assembled from. ONE definition, because a
- * second copy is how Socket Mode broke `backlog-canvas`: it had its own
- * regex, that regex predated `APP_TOKEN`, and a socket workspace therefore
- * looked credential-less to it while working fine for the adapter.
+ * ONE definition: a second copy of this regex that predated `APP_TOKEN` made Socket Mode workspaces look
+ * credential-less.
  */
 const SLACK_ENV_PATTERN = /^SLACK_(BOT_TOKEN|SIGNING_SECRET|APP_TOKEN)(_[A-Za-z0-9_]+)?$/;
 
-/** Every configured Slack workspace, read from `.env`. The one entry point —
- *  callers outside this module must not re-derive the env pattern. */
+/** The one entry point; callers outside this module must not re-derive the env pattern. */
 export function loadSlackWorkspaces(): SlackWorkspace[] {
   return parseSlackWorkspaces(readEnvFileMatching(SLACK_ENV_PATTERN));
 }
 
-/** Minimal interface for the Slack chat.postMessage client — narrow surface for testing. */
 export interface SlackPostMessageClient {
   chat: {
     postMessage(args: { channel: string; text: string; thread_ts?: string }): Promise<{ ts?: string | null }>;
@@ -634,22 +489,13 @@ export interface SlackPostMessageClient {
 }
 
 /**
- * Strip the `slack:` scheme prefix from a NanoClaw platform_id, leaving the
- * raw Slack channel ID the Web API expects. Tolerates both prefixed
- * (`slack:CTEST00004`, the canonical messaging_groups.platform_id form) and
- * raw (`CTEST00004`, used in unit tests) inputs. The host's regular delivery
- * path normalizes via the chat-sdk bridge — these helpers are called from
- * orchestrator-dispatch directly and need to do their own normalization or
- * Slack returns `channel_not_found`.
+ * Strips `slack:`, leaving the raw channel id the Web API expects. Callers outside the bridge (orchestrator-dispatch)
+ * must normalize here or Slack returns `channel_not_found`.
  */
 export function extractSlackChannelId(platformId: string): string {
   return platformId.startsWith('slack:') ? platformId.slice('slack:'.length) : platformId;
 }
 
-/**
- * Post a message to the top level of a Slack channel.
- * Exported for unit testing.
- */
 export async function slackPostParent(
   client: SlackPostMessageClient,
   platformId: string,
@@ -660,11 +506,7 @@ export async function slackPostParent(
   return { messageId: response.ts as string };
 }
 
-/**
- * Create a Slack thread by posting a reply to an existing parent message.
- * threadId IS the parent message's ts (Slack thread_ts semantic) — NOT reply.ts.
- * Exported for unit testing.
- */
+/** threadId IS the parent message's ts (Slack's thread_ts), not reply.ts. */
 export async function slackCreateThread(
   client: SlackPostMessageClient,
   platformId: string,
@@ -681,43 +523,24 @@ export async function slackCreateThread(
   return { threadId: parentMessageId, messageId: reply.ts as string };
 }
 
-// Keep SLACK_ENV_PATTERN in sync with the suffix regex inside
-// parseSlackWorkspaces — both must allow `_` in the suffix, otherwise env vars
-// like SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX get dropped before they ever reach
-// the parser, and both must list APP_TOKEN or a Socket Mode workspace looks
-// credential-less. Read once here (rather than via loadSlackWorkspaces) so the
-// raw env dict is also available to declarationOnlySlackTypes below.
+// Read once here so the raw env is also available to declarationOnlySlackTypes.
 const slackEnv = readEnvFileMatching(SLACK_ENV_PATTERN);
 const workspaces = parseSlackWorkspaces(slackEnv);
 
-// Declaration-only registrations run BEFORE the live ones so a complete
-// workspace's real factory always wins the key. A half-configured or entirely
-// unconfigured Slack still gets its declaration into the registry, so a
-// messaging group created before the credentials land is not stamped with the
-// legacy `strict` schema default forever. The factory returns null —
-// initChannelAdapters logs the missing credentials and moves on.
+// Declaration-only registrations run BEFORE the live ones so a complete workspace's real factory wins the key, while
+// a half-configured Slack still gets its declaration.
 for (const channelType of declarationOnlySlackTypes(slackEnv)) {
   registerChannelAdapter(channelType, { defaults: SLACK_DEFAULTS, factory: () => null });
 }
 
-/**
- * Register one fully configured Slack workspace. Provisioning calls this after
- * adding a new token pair so the registry can start the exact same factory
- * without waiting for the next host restart.
- */
+/** Provisioning calls this after adding a token pair so the adapter starts without a host restart. */
 export function registerSlackWorkspace(ws: SlackWorkspace): void {
   registerChannelAdapter(ws.channelType, {
-    // Also on the registration, so offline creation paths (setup wizard,
-    // scripts, `ncl` against a host whose factory returned null for missing
-    // creds) resolve the same declaration without instantiating the adapter.
+    // Also on the registration so offline creation paths resolve the same declaration without instantiating the
+    // adapter.
     defaults: SLACK_DEFAULTS,
     factory: async () => {
       // Socket Mode when an app-level token is configured, webhook otherwise.
-      // The app token IS the switch — the contract the add-slack skill has
-      // documented to operators all along, and the reason a Socket Mode
-      // install used to write SLACK_APP_TOKEN, no signing secret, and get a
-      // bot that could send but never receive. Existing webhook instances
-      // have no app token and are unaffected.
       const slackAdapter = createSlackAdapter({
         botToken: ws.botToken,
         signingSecret: ws.signingSecret,
@@ -728,74 +551,40 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         channelType: ws.channelType,
         mode: ws.appToken ? 'socket' : 'webhook',
       });
-      // Multi-workspace dedup isolation. The @chat library's message dedup
-      // key is `dedupe:${adapter.name}:${message.id}`. SlackAdapter defaults
-      // `name = "slack"` for all instances; combined with a shared SqliteState
-      // adapter (state-sqlite.ts uses getRawDb()), two slack adapters processing
-      // the same Slack event (same `ts`) collide on the dedup key and the
-      // second one silently drops the message. This bites the two-bots-in-
-      // same-workspace case (e.g. helper + helper-codex both seeing user
-      // messages in #agents-example). Across-workspace it doesn't bite because
-      // each Slack workspace's `ts` values are disjoint.
-      //
-      // Override the adapter name to the channelType so each workspace has
-      // its own dedup keyspace. The name also keys `chat.webhooks[...]` so
-      // the webhook-server lookup matches.
+      // Multi-workspace dedup isolation: the dedup key is `dedupe:${adapter.name}:${message.id}`, every SlackAdapter
+      // defaults to "slack", and the state store is shared, so two bots in one workspace seeing the same event would
+      // collide and the second would silently drop it. The name also keys `chat.webhooks[...]`, so the webhook lookup
+      // matches.
       (slackAdapter as unknown as { name: string }).name = ws.channelType;
-      // Status subtext → Block Kit context block. Installed here, beside the
-      // adapter, because it wraps the adapter's own Web client; see
-      // slack-subtext.ts for why the rewrite happens at that layer.
+      // Installed beside the adapter because it wraps the adapter's own Web client; see slack-subtext.ts.
       installSlackSubtextBlocks(slackAdapter);
       const client = new WebClient(ws.botToken);
 
-      // Discover this bot's identity before building the bridge. Setup publishes
-      // it provisionally before Socket Mode can deliver inbound events, then
-      // rolls it back if setup fails; post-setup refresh work waits for success.
+      // Setup publishes the identity provisionally before Socket Mode can deliver inbound events, and rolls it back
+      // if setup fails.
       const identity = await fetchSlackBotIdentity(client);
 
-      // One governor per bridge instance — each instance is one bot identity.
+      // One governor per bridge instance: each is one bot identity.
       const hopGovernor = createSlackHopGovernor(ws.channelType);
 
       const bridge = createChatSdkBridge({
         adapter: slackAdapter,
-        // Slack sends a pasted table as attachments[].blocks[] — it appears in
-        // neither the message text nor the file list, so without this the agent
-        // gets only the sentence before the table.
+        // A pasted table arrives as attachments[].blocks[], in neither the text nor the file list.
         extractRawText: extractSlackRawText,
         concurrency: 'concurrent',
         supportsThreads: true,
         defaults: SLACK_DEFAULTS,
         maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,
-        // Oversize channel-level posts: continuation chunks reply in the
-        // first chunk's thread rather than landing as sibling parents that
-        // repliers thread under by mistake.
+        // Continuation chunks reply in the first chunk's thread rather than landing as sibling parents.
         threadContinuationChunks: true,
         channelType: ws.channelType,
-        // ATX headings → bold so Block Kit table delivery stays on the
-        // `markdown` path (table-block conversion only fires for markdown/ast
-        // input). The adapter handles bold/italic/links/lists/tables natively.
-        //
-        // resolveSlackMentions runs first so `@bot-username` becomes
-        // `<@USER_ID>` (Slack's required mention syntax) BEFORE Markdown
-        // heading conversion — the rewriter only touches `@…` tokens, and
-        // markdownHeadingsToBold only touches line-anchored `#` prefixes,
-        // so order is independent for correctness but consistent for
-        // intent.
-        // Slack renders the subtext as a Block Kit context block. The body
-        // only has to carry it this far — installSlackSubtextBlocks above
-        // reads it off the body and rewrites the outgoing payload.
+        // Headings become bold so tables stay on the `markdown` path (table-block conversion only fires for markdown
+        // input). The subtext rides on the body until installSlackSubtextBlocks rewrites the payload.
         renderSubtext: (body, subtext) => ({ ...body, subtext }),
         transformOutboundMarkdown: (text) => {
-          // A bot has no legitimate reason to emit a raw bot <@id> — it only
-          // shows up when the model echoes the inbound mention wire form
-          // (observed live: gate-syntax examples like "<@U…> hold 304"
-          // reaching humans as literal text, from the gate bot AND siblings
-          // quoting it, despite persona bans). Rewrite every known bot id in
-          // this workspace to its plain @name BEFORE mention resolution:
-          // inside code spans it stays literal (the documented gate syntax),
-          // in prose the resolver turns it back into a proper mention pill.
-          // Human raw ids pass through — those are legitimate deterministic
-          // mentions, and re-resolution by alias could drop an ambiguous one.
+          // A bot echoing a raw bot `<@id>` (the inbound wire form) would reach humans as literal text, so known bot
+          // ids become plain @name BEFORE mention resolution: literal inside code spans, a proper mention in prose.
+          // Human raw ids pass through; re-resolving by alias could drop an ambiguous one.
           const self = getKnownSlackBots().get(ws.channelType);
           let named = text;
           if (self && named.includes('<@')) {
@@ -810,33 +599,21 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
             ws.channelType,
           );
         },
-        // Inbound wire text carries mentions as raw <@U…>; resolving them to
-        // @name here is what stops agents from ever LEARNING the raw form —
-        // the outbound rewrite above is the backstop, this is the cure.
+        // Resolving inbound raw `<@U…>` to @name is what stops agents from learning the raw form; the outbound
+        // rewrite is the backstop.
         transformInboundText: (text) => resolveInboundSlackIds(text, ws.channelType),
-        // Chat SDK can retain a bot's immutable install-time username in
-        // author.fullName even after Slack shows a new profile name. Resolve
-        // sibling authors through the same live, workspace-scoped registry as
-        // mentions so thread context and archive rows never teach the agent a
-        // deprecated backend codename.
+        // Chat SDK can keep a bot's install-time username in author.fullName after a rename; resolve sibling authors
+        // through the live registry so agents never learn a deprecated codename.
         transformInboundSender: (author) =>
           author.userId ? getSlackBotSenderName(ws.channelType, author.userId) : null,
-        // Slack's markdown_text parser fires app_mention even for literal
-        // `@name` inside backticks (gate-syntax documentation). Demote the
-        // mention when it appears ONLY inside code regions; keep the
-        // platform verdict when identity is unavailable.
+        // Slack fires app_mention even for `@name` inside backticks; demote the mention when it appears only in code.
+        // Keep the platform verdict when identity is unavailable.
         refineInboundMention: (text) => {
           const self = getKnownSlackBots().get(ws.channelType);
           return self ? slackMentionOutsideCode(text, self) : true;
         },
-        // Loop governor: bound a sibling-bot ping-pong that no human is in.
-        // Live dispatch only. Recovery pages arrive newest-first and are
-        // sorted afterwards, so counting them would both mis-order the hop
-        // state and re-judge history the live path already judged; recovery
-        // is separately bounded by its window and allowRecoveredBotMessage.
-        // A sibling agent's live task list is its own progress, never a turn
-        // for this bot: drop it before routing so a list post can't wake an
-        // agent in a shared room.
+        // Loop governor for sibling-bot ping-pong with no human in it, on live dispatch only: recovery pages arrive
+        // newest-first and were already judged live. A sibling's task-list post is never a turn for this bot.
         inboundFilter: (message, ctx) =>
           isSlackTaskListPost(message)
             ? false
@@ -849,16 +626,12 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
           if (!raw) return false;
           const mention = `<@${identity.userId}>`;
           if (typeof raw.text === 'string' && raw.text.includes(mention)) return true;
-          // A pasted table can be the only place the bot is addressed, and a
-          // REST-fetched recovery row carries no isMention. The same
-          // projection the bridge appends to the body answers this question
-          // too — see the invariant note in slack-raw-text.ts.
+          // A pasted table can be the only place the bot is addressed, and a recovered row carries no isMention; see
+          // slack-raw-text.ts.
           return extractSlackRawText(raw)?.includes(mention) === true;
         },
-        // Sibling-bot messages are admissible in recovery (mirrors discord.ts):
-        // without this, a sibling's @-mention that arrives during an event-loop
-        // stall is dropped by recovery's default bot filter and the assignment
-        // is silently lost.
+        // Sibling-bot messages are admissible in recovery, or a sibling's @-mention that arrived during a stall is
+        // silently lost.
         allowRecoveredBotMessage: (message) => {
           const authorId = message.author.userId;
           return authorId !== identity?.userId && [...getKnownSlackBots().values()].some((b) => b.userId === authorId);
@@ -889,16 +662,14 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
           return;
         }
 
-        // Socket Mode can deliver inbound events before setup resolves. Publish the
-        // identity first so its inbound filter observes sibling bots correctly.
+        // Socket Mode can deliver inbound events before setup resolves, so the identity is published first.
         const previousIdentity = getKnownSlackBots().get(ws.channelType);
         registerSlackBot(ws.channelType, identity);
         warmChannelDirectory();
         try {
           await setupBridge(setup);
         } catch (err) {
-          // A concurrently registered adapter may have replaced this entry.
-          // Restore only our own registration so it cannot be clobbered.
+          // A concurrently registered adapter may have replaced this entry; restore only our own.
           if (getKnownSlackBots().get(ws.channelType) === identity) {
             if (previousIdentity) registerSlackBot(ws.channelType, previousIdentity);
             else unregisterSlackBot(ws.channelType, identity);
@@ -909,9 +680,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         if (startedPostSetup) return;
         startedPostSetup = true;
         void upgradeSlackBotProfile(client, ws.channelType);
-        // Workspace humans → mention registry, so agent-emitted `@Alice` /
-        // `<@bob>` resolve without a hand-maintained roster. Refresh hourly
-        // only while this bridge remains live.
+        // Workspace humans → mention registry, refreshed hourly while this bridge is live.
         void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType);
         workspaceHumansRefresh = setInterval(
           () => void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType),

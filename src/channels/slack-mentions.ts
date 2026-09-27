@@ -1,62 +1,32 @@
 /**
- * Slack outbound mention rewriter — sibling to `resolveDiscordMentions`
- * in discord.ts. Discord's adapter has had this since the sibling-handoff
- * work; Slack didn't, which meant agent-emitted `@helper-codex` rendered
- * as plain text on Slack (no chip, no notification, peer doesn't get a
- * mention-engage wake — it only wakes because the channel's full feed
- * reaches it anyway).
- *
- * Slack requires `<@USER_ID>` (a real Slack user ID like `UTEST00021`)
- * to render a mention. The bot user IDs are discovered via `auth.test`
- * at factory time and cached in `knownSlackBots`.
- *
- * Cross-workspace isolation: bots in workspace A can't @-mention bots in
- * workspace B (different Slack tenants). Lookup is scoped to bots that
- * share the current workspace's `teamId`. Without this scoping, an agent
- * in Example Retail's Slack writing `@helper-codex` (an Example Labs bot) could resolve
- * to a stale or wrong user ID.
+ * Slack outbound mention rewriter, sibling to `resolveDiscordMentions`. Slack renders a mention only as `<@USER_ID>`;
+ * plain `@name` gets no chip, no notification and no mention wake. Bot user ids come from `auth.test` at factory
+ * time.
+ * Lookup is scoped to bots sharing the current workspace's `teamId`: bots cannot mention across Slack tenants, and an
+ * unscoped match could resolve to another workspace's id.
  */
 import { log } from '../log.js';
 import { transformInsideInlineCode, transformOutsideProtectedRegions } from '../text-styles.js';
 
 export interface SlackBotIdentity {
-  /** Slack user_id, e.g. "UTEST00021" — the value to substitute into `<@…>`. */
+  /** The value substituted into `<@…>`. */
   userId: string;
   /**
-   * Slack `user.name` field as returned by `auth.test` — the legacy username
-   * fixed at app install time. Slack's UI autocomplete does NOT prefer this
-   * field when `displayName` or `realName` are present, so it's necessary
-   * but not sufficient for the rewriter on its own (e.g. Example Assistant has `name=beau`
-   * but operators @-mention it as `@beacon`).
+   * Legacy install-time `user.name` from `auth.test`. Slack's autocomplete prefers `displayName`/`realName` when
+   * present, so this alone is not enough.
    */
   username: string;
-  /**
-   * Profile `display_name` (per-workspace customizable, often empty). When
-   * present, Slack's UI autocomplete prefers this over `username` and
-   * `realName`. Registered as a rewriter alias.
-   */
+  /** Per-workspace profile `display_name`, often empty; autocomplete prefers it when set. Registered as an alias. */
   displayName?: string;
-  /**
-   * Profile `real_name`, e.g. "Example Assistant" or "Example Assistant Codex". Slack falls back to this
-   * for autocomplete when `display_name` is empty. The user-facing handle
-   * Operator actually types in Slack typically matches this lowercased.
-   * Registered as a rewriter alias.
-   */
+  /** Profile `real_name`, autocomplete's fallback when `display_name` is empty. Registered as an alias. */
   realName?: string;
-  /** Slack workspace identifier (team_id). Used to scope cross-bot resolution to siblings in the same workspace. */
+  /** Scopes cross-bot resolution to siblings in the same workspace. */
   teamId: string;
-  /**
-   * Bot avatar URL from the profile fetch (image_192 preferred). Public
-   * slack-edge CDN URL, safe to hand to a browser <img>. Optional: absent
-   * until upgradeSlackBotProfile runs, and for identities that never get one.
-   */
+  /** Public slack-edge avatar URL (image_192 preferred); absent until upgradeSlackBotProfile runs. */
   imageUrl?: string;
   /**
-   * Workspace base URL as reported by `auth.test` (`https://acme.slack.com/`).
-   * The only piece a thread permalink needs that isn't already in a thread id,
-   * and it arrives free on a call the adapter already makes at init. Optional:
-   * an older cached identity or a stubbed client may not carry it, and a
-   * missing URL degrades to no link rather than a wrong one.
+   * Workspace base URL from `auth.test`, the only piece of a permalink not in the thread id. Missing degrades to no
+   * link, never a wrong one.
    */
   workspaceUrl?: string;
 }
@@ -64,10 +34,8 @@ export interface SlackBotIdentity {
 const knownSlackBots = new Map<string, SlackBotIdentity>();
 
 /**
- * Workspace humans, keyed by teamId. Populated from `users.list` at adapter
- * init (and refreshed hourly) so agent-emitted `@Alice` / `<@bob>` resolve
- * to real mentions without any hand-maintained roster. Same identity shape
- * as bots; resolution is scoped to the current workspace like bots are.
+ * Workspace humans keyed by teamId, from `users.list` at init and hourly, so agent-emitted `@Alice` resolves without
+ * a hand-maintained roster.
  */
 const knownSlackHumans = new Map<string, SlackBotIdentity[]>();
 
@@ -75,7 +43,6 @@ export function registerSlackBot(channelType: string, identity: SlackBotIdentity
   knownSlackBots.set(channelType, identity);
 }
 
-/** Remove an identity only if it is still the registered identity for this adapter. */
 export function unregisterSlackBot(channelType: string, identity: SlackBotIdentity): void {
   if (knownSlackBots.get(channelType) === identity) knownSlackBots.delete(channelType);
 }
@@ -89,25 +56,10 @@ export function getKnownSlackBots(): ReadonlyMap<string, SlackBotIdentity> {
 }
 
 /**
- * Slack thread permalink, or null when one can't be built exactly.
- *
- * A thread id already carries both halves Slack needs — channel and the
- * parent message `ts` (`slack:C0AAA:1786621514.008659`) — and the workspace
- * base URL rides along on the identity captured at adapter init. Slack's own
- * link form drops the dot from the ts and names the thread in the query:
- * `https://acme.slack.com/archives/C0AAA/p1786621514008659?thread_ts=1786621514.008659&cid=C0AAA`.
- *
- * The query half is what makes it a THREAD link. `/archives/<C>/p<ts>` alone
- * addresses a message, and Slack opens the CHANNEL scrolled to it — which is
- * exactly what operators saw when every "open thread" on the observatory
- * dropped them in the room instead of the thread pane. `thread_ts` (the
- * top-level ts) plus `cid` is the shape chat.getPermalink itself returns for a
- * threaded message, and the ids here are the thread PARENT, so both the path
- * and the query carry the same ts.
- *
- * Returns null rather than guessing. A link that 404s is worse than no link,
- * so an unregistered workspace, a channel-level (unthreaded) destination, or
- * a thread id that isn't a Slack ts all decline instead of improvising.
+ * Thread permalink, or null when it cannot be built exactly. The query half (`?thread_ts=<ts>&cid=<C>`, as
+ * chat.getPermalink returns) is what makes it a THREAD link; `/archives/<C>/p<ts>` alone opens the channel scrolled
+ * to the message. Never guesses: an unregistered workspace, an unthreaded destination or a non-ts thread id returns
+ * null.
  */
 export function slackPermalink(channelType: string, platformId: string, threadId: string | null): string | null {
   if (!threadId) return null;
@@ -123,14 +75,8 @@ export function slackPermalink(channelType: string, platformId: string, threadId
 }
 
 /**
- * Link to a Slack CHANNEL — the room itself, not a thread in it:
- * `https://acme.slack.com/archives/C0AAA`.
- *
- * Separate from `slackPermalink` on purpose. That one is a THREAD link and
- * declines a null thread id by contract; asking it for a room link therefore
- * always returned null, which is what left the observatory's "answer in
- * #dispatch" pointing nowhere. Same decline-rather-than-guess rule: an
- * unregistered workspace or an unparseable platform id yields null.
+ * Channel link, separate from `slackPermalink`, which is a thread link and declines a null thread id by contract.
+ * Null when it cannot be built exactly.
  */
 export function slackChannelPermalink(channelType: string, platformId: string): string | null {
   const base = knownSlackBots.get(channelType)?.workspaceUrl;
@@ -144,17 +90,8 @@ export function getKnownSlackHumans(): ReadonlyMap<string, SlackBotIdentity[]> {
 }
 
 /**
- * Resolve the bot's user-facing display name for a Slack channel_type.
- * Precedence matches what Slack's UI itself uses for @-mention autocomplete:
- *   1. `profile.display_name` (per-workspace customizable; preferred)
- *   2. `profile.real_name` (autocomplete fallback when display_name is empty)
- *   3. `auth.test.user` (legacy install-time username, last resort)
- *
- * Returns null when the bot isn't registered (yet) — e.g. a spawn that
- * races adapter init before auth.test completes, or an admin/cli session
- * with no Slack adapter. The caller (`resolveAssistantName` in
- * container-runner) treats null as "fall through to the next platform
- * resolver or the agent_group.name floor".
+ * Precedence matches Slack's autocomplete: `display_name`, then `real_name`, then the `auth.test` username. Null when
+ * the bot is not registered yet (e.g. a spawn racing adapter init); the caller falls through to the next resolver.
  */
 export function getSlackBotDisplayName(channelType: string): string | null {
   const bot = knownSlackBots.get(channelType);
@@ -163,12 +100,8 @@ export function getSlackBotDisplayName(channelType: string): string | null {
 }
 
 /**
- * Resolve a sibling bot author to the name users see in this Slack workspace.
- *
- * Chat SDK author fields can retain the app's legacy install-time name even
- * after the bot profile is renamed. Trust the live bot registry instead, but
- * only inside the current bot's workspace so a matching Slack user id from a
- * different tenant can never acquire the wrong name.
+ * Chat SDK author fields can keep the app's legacy install-time name after a rename, so trust the live registry, but
+ * only within the current bot's workspace.
  */
 export function getSlackBotSenderName(channelType: string, userId: string): string | null {
   const self = knownSlackBots.get(channelType);
@@ -182,23 +115,9 @@ export function getSlackBotSenderName(channelType: string, userId: string): stri
 }
 
 /**
- * Rewrite `@beacont-username` and `<@beacont-username>` to Slack's canonical
- * `<@USER_ID>` mention syntax for every sibling bot that lives in the
- * same Slack workspace as `currentChannelType`.
- *
- * Pass-through cases (intentional):
- *   - `<@UTEST00021>` (already canonical) — left alone; the user-id
- *     character class doesn't match a username, so the lookup misses
- *     and the original text is preserved.
- *   - Mentions inside code/links — `transformOutsideProtectedRegions`
- *     skips fenced code, inline code, and bare-URL regions.
- *   - Unknown @-names — pass through as plain text (fail-soft).
- *   - Mentions of bots in a different Slack workspace — scoped out by teamId.
- *
- * Two-pass design mirrors `resolveDiscordMentions`:
- *   1. `<@Name>` bracketed form (agents sometimes emit when they
- *      recall the `<@U123>` template but substitute the username).
- *   2. `@Name` canonical bare form per container/CLAUDE.md guidance.
+ * Rewrites `@name` and `<@name>` to `<@USER_ID>` for sibling bots and humans in the same workspace. Passes through:
+ * canonical `<@U…>`, code and bare-URL regions, unknown names, and other workspaces. Two passes as in
+ * `resolveDiscordMentions`: bracketed `<@Name>` first (agents misapplying the `<@U123>` template), then bare `@Name`.
  */
 export function resolveSlackMentions(
   text: string,
@@ -211,34 +130,10 @@ export function resolveSlackMentions(
   const currentBot = bots.get(currentChannelType);
   if (!currentBot) return text;
 
-  // Build name → userId map scoped to the current Slack workspace (matches
-  // by teamId). Includes the current bot itself — harmless because
-  // self-mentions are filtered by Slack's own UI ("you can't @-mention
-  // yourself") and re-trigger by the adapter's echo filter on the inbound
-  // side.
-  //
-  // Three Slack identity fields all need to resolve to the same user_id:
-  //
-  //   1. `username` (`user.name` from auth.test) — legacy install-time
-  //      handle. Stays even if the operator renames the App's Default Name
-  //      in the App config. e.g. Example Assistant's `name` is `beau` because that was the
-  //      original install name; renaming the App to "Example Assistant" doesn't propagate
-  //      to existing bot user records.
-  //   2. `displayName` — per-workspace customizable. When set, Slack's UI
-  //      autocomplete prefers this over `name` and `realName`.
-  //   3. `realName` — Slack's autocomplete fallback when `displayName` is
-  //      empty. The user-facing handle Operator actually sees in Slack
-  //      typically matches this (lowercased). e.g. Example Assistant's `real_name` is "Example Assistant"
-  //      and that's what `@beacon` autocompletes against in Example Retail Slack.
-  //
-  // Plus separator-normalized aliases of each (`example-assistant-codex` ↔ `example-assistant-codex` ↔
-  // `example-assistant-codex`) for operator-typed handles that drop hyphens/underscores.
-  //
-  // Conflict resolution: literal `username` keys win (they match the
-  // canonical Slack handle exactly). `displayName`/`realName` literals
-  // fill empty slots. Normalized variants fill remaining empty slots only.
-  // Both bots in any A/B collision remain individually mentionable via
-  // their own literals; only the "fuzzy" path may be claimed by one side.
+  // name → userId, scoped by teamId. `username`, `displayName` and `realName` must all resolve (Slack keeps the
+  // install-time username after an app rename), plus separator-normalized aliases of each. Conflicts: literal
+  // usernames win, display/real literals fill empty slots, normalized aliases fill what remains; every bot stays
+  // mentionable by its own literal.
   const byName = new Map<string, string>();
   const literalKeys = new Set<string>();
   for (const ident of bots.values()) {
@@ -255,13 +150,11 @@ export function resolveSlackMentions(
     if (byName.has(lower)) return;
     byName.set(lower, userId);
   };
-  // Second pass: displayName + realName literals.
   for (const ident of bots.values()) {
     if (ident.teamId !== currentBot.teamId) continue;
     tryAddAlias(ident.displayName, ident.userId);
     tryAddAlias(ident.realName, ident.userId);
   }
-  // Third pass: separator-normalized aliases of every populated field.
   for (const ident of bots.values()) {
     if (ident.teamId !== currentBot.teamId) continue;
     for (const candidate of [ident.username, ident.displayName, ident.realName]) {
@@ -272,16 +165,9 @@ export function resolveSlackMentions(
       tryAddAlias(normalized, ident.userId);
     }
   }
-  // Fourth pass: workspace humans (from users.list). All human aliases go
-  // through tryAddAlias, so every bot alias — literal or normalized — wins
-  // any collision with a human handle. Same-team scoping as bots.
-  //
-  // Usernames register before display/real names: Slack guarantees usernames
-  // unique per workspace, display names are free-text — an earlier user's
-  // display name must never capture a later user's canonical username. And a
-  // display/real alias shared by two different humans is dropped entirely
-  // rather than first-writer-wins, which would silently ping the wrong person
-  // half the time.
+  // Workspace humans, after every bot alias, so bots win any collision. Usernames register before display/real names
+  // (usernames are unique per workspace, display names are free text). A display/real alias shared by two humans is
+  // dropped rather than first-writer-wins, which would ping the wrong person.
   const teamHumans = humans.get(currentBot.teamId) ?? [];
   for (const ident of teamHumans) tryAddAlias(ident.username, ident.userId);
   const humanClaims = new Map<string, string>();
@@ -311,42 +197,19 @@ export function resolveSlackMentions(
   }
   if (byName.size === 0) return text;
 
-  // The release-digest contract uses a structured `Who:` field. Models have
-  // repeatedly emitted the correct human names there while dropping the `@`
-  // required to make them real Slack mentions (the same post then mentions
-  // those people correctly elsewhere). Treat only this explicit owner field
-  // as semantic: unambiguous live-workspace names become canonical mentions;
-  // ordinary prose is untouched. This is a mechanical backstop for the
-  // contract, not a general "guess names and ping people" pass.
+  // Mechanical backstop for the release digest's `Who:` owner field, where models drop the `@`. Only that explicit
+  // field is treated as names; ordinary prose is untouched.
   const structured = resolveStructuredWhoMentions(text, currentBot.teamId, bots, humans);
 
-  // Slack usernames allow `[a-z0-9._-]` per Slack's user-handle rules.
-  // Composed as a base + optional `.SUFFIX` segments so a trailing
-  // sentence-ending period ("Your turn, @helper-codex.") doesn't get
-  // gobbled into the capture — matches Discord's pattern in discord.ts.
-  //
-  // Boundary: `(?<![\w/:])` keeps `user@domain.com` from parsing as
-  // `@domain.com` AND skips `@`-after-URL-path/scheme cases like
-  // `https://example.com/@helper-codex` or `path/@helper-codex/sub`. Without
-  // the `/` and `:` in the exclude class, the bare-mention pass corrupts
-  // URLs (path char `/` is not `\w`, so `(?<!\w)` alone would let it
-  // through). `transformOutsideProtectedRegions` only shields code spans,
-  // not URL regions — so URL safety has to live in the lookbehind itself.
-  // `\p{L}\p{M}\p{N}` widen `\w` to Unicode letters (accents via combining
-  // marks, CJK) so human display names like `@José` match whole — ASCII-only
-  // `\w` would capture `@Jos`, and a truncated prefix that happens to be a
-  // registered alias would ping the wrong person. Same classes in the
-  // lookbehind so a mention can't start mid-word after a Unicode letter.
-  // The lookbehind also excludes URL-structural chars (`=?&#` on top of
-  // `/:`) so `?owner=@alice`, `&cc=@alice`, and `#@alice` fragments inside
-  // URLs stay literal — `transformOutsideProtectedRegions` shields only
-  // code spans, so URL safety lives here.
+  // A base plus optional `.suffix` segments so a sentence-ending period is not captured. `(?<![…/:=?&#])` keeps
+  // emails, URL paths, query values and fragments literal (transformOutsideProtectedRegions shields only code).
+  // `\p{L}\p{M}\p{N}` match whole Unicode names like `@José`; ASCII `\w` would capture a truncated prefix that could
+  // ping the wrong person.
   const WORD = String.raw`\w\p{L}\p{M}\p{N}`;
   const USERNAME = String.raw`[${WORD}-]+(?:\.[${WORD}-]+)*`;
   const BRACKETED_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])<@(${USERNAME})>`, 'gu');
   const BARE_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])@(${USERNAME})`, 'gu');
 
-  // Bot-ID → name map for the inline-code normalization pass below.
   const botNameById = new Map<string, string>();
   for (const ident of bots.values()) {
     if (ident.teamId !== currentBot.teamId) continue;
@@ -355,35 +218,25 @@ export function resolveSlackMentions(
 
   const resolved = transformOutsideProtectedRegions(structured, (segment) => {
     const rewriteByName = (match: string, name: string): string => {
-      // Skip names that look like Slack user IDs (`U…` followed by 8+
-      // uppercase alphanumerics) — those are already canonical and shouldn't
-      // be looked up as usernames.
+      // Already a canonical Slack user id.
       if (/^U[A-Z0-9]{7,}$/.test(name)) return match;
       const literal = name.toLowerCase();
-      // Literal first so an exact operator-chosen Slack handle always wins
-      // over a fuzzy collision; fall back to separator-normalized lookup.
+      // Literal first so an exact handle always beats a fuzzy collision.
       const id = byName.get(literal) ?? byName.get(normalizeHandle(literal));
       return id ? `<@${id}>` : match;
     };
 
     const afterBracketed = segment.replace(BRACKETED_RE, rewriteByName);
     return afterBracketed.replace(BARE_RE, (match, name: string, offset: number) => {
-      // Skip if `@` is preceded by `<` — pass 1 already handled bracketed
-      // forms, and `<@USER_ID>` / `<#CHANNEL>` syntax stays untouched.
+      // Pass 1 already handled bracketed forms.
       if (offset > 0 && afterBracketed[offset - 1] === '<') return match;
       return rewriteByName(match, name);
     });
   });
 
-  // Agents write gate-syntax examples in inline code and — taught by their
-  // own thread transcripts — sometimes use the raw bot ID form
-  // (`<@U…> ship 297`), which humans can't read or type. Normalize known
-  // same-workspace BOT IDs inside inline code back to the plain typed name.
-  // Unknown IDs and human IDs pass through (a deliberate raw-ID display in
-  // a debugging discussion keeps its meaning); fenced blocks are untouched.
-  // Broad capture, narrow rewrite: anything `<@…>`-shaped is looked up, but
-  // only a registered same-team bot ID is replaced — the map is the gate,
-  // not the pattern.
+  // Known same-workspace BOT ids inside inline code become the plain typed name (agents copy the raw form into
+  // gate-syntax examples, which humans cannot read or type). Unknown and human ids pass through; fenced blocks are
+  // untouched. The map is the gate, not the pattern.
   return transformInsideInlineCode(resolved, (inner) =>
     inner.replace(/<@([^<>\s]+)>/g, (match, id: string) => {
       const name = botNameById.get(id);
@@ -392,16 +245,11 @@ export function resolveSlackMentions(
   );
 }
 
-/** Escape a literal value before embedding it in a RegExp. */
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * Resolve names only inside an explicit `Who:` owner field. Alias conflicts
- * fail closed: if two workspace identities claim the same visible name, the
- * name remains plain text instead of pinging the wrong person.
- */
+/** Only inside an explicit `Who:` field. Alias conflicts fail closed: a name two identities claim stays plain text. */
 function resolveStructuredWhoMentions(
   text: string,
   teamId: string,
@@ -445,7 +293,6 @@ function resolveStructuredWhoMentions(
     segment.replace(
       /^(\s*(?:[-*◦•]\s+)?(?:\*\*)?Who(?::(?:\*\*)?|\*\*:)\s*)(.*)$/gimu,
       (_line, prefix: string, owners: string) => {
-        // Preserve canonical Slack mentions already present in the field.
         const parts = owners.split(/(<@[^>\n]+>)/g);
         for (let i = 0; i < parts.length; i += 2) {
           let plain = parts[i];
@@ -463,12 +310,9 @@ function resolveStructuredWhoMentions(
 }
 
 /**
- * Keep ordered digest items in one Slack Markdown list when their detail lines
- * use the release template's visible `•`/`◦` marker. Slack resets an ordered
- * list across the template's blank item separators, rendering each explicit
- * number as `1.`. Remove only blanks whose next nonblank line is another
- * ordered item, and indent any unindented detail markers. The blank separating
- * the list from the following section is preserved.
+ * Slack resets an ordered list across the digest template's blank separators, renumbering every item `1.`. Removes
+ * only blanks followed by another ordered item and indents unindented detail markers; the blank before the next
+ * section stays.
  */
 export function normalizeSlackOrderedListContinuations(text: string): string {
   const lines = text.split('\n');
@@ -503,25 +347,14 @@ export function normalizeSlackOrderedListContinuations(text: string): string {
   return normalized.join('\n');
 }
 
-/**
- * Strip Slack-handle separators (`-`, `_`, `.`) so `example-assistant-codex` ≡ `example-assistant-codex` ≡
- * `example-assistant-codex` for fuzzy matching. Used only as a fallback after literal
- * lookup misses — never replaces literal equality.
- */
+/** Strips `-`, `_`, `.` for fuzzy matching, used only after a literal lookup misses. */
 function normalizeHandle(handle: string): string {
   return handle.replace(/[-_.]/g, '');
 }
 
 /**
- * Look up this bot's identity via Slack's `auth.test` endpoint. One round
- * trip on adapter init; the result is cached in `knownSlackBots` for the
- * lifetime of the process.
- *
- * Hard timeout: channel-registry awaits factories serially, so a stalled
- * Slack API connection at host boot would block every adapter that
- * registers after Slack. 5s is well above Slack's typical p99 for this
- * endpoint and short enough that a hung connection doesn't visibly delay
- * startup.
+ * One `auth.test` call at init, cached for the process. Hard timeout because channel-registry awaits factories
+ * serially, so a stalled call at boot would block every later adapter.
  */
 const SLACK_AUTH_TIMEOUT_MS = 5000;
 
@@ -579,24 +412,10 @@ export async function fetchSlackBotIdentity(client: SlackAuthTestClient): Promis
 }
 
 /**
- * Best-effort upgrade for an already-registered bot identity: fetch
- * `profile.display_name` + `profile.real_name` via `users.info` and rewrite
- * the existing registry entry to include them.
- *
- * Fire-and-forget — call from the adapter factory with `void`. Channel
- * adapters init serially during host boot, so awaiting this would extend
- * boot latency by up to 5s per Slack workspace when Slack's profile API is
- * slow. Running it after `registerSlackBot` lets
- * the rewriter already resolve outbound mentions on the `username` key
- * while the profile call fans out in the background; once the profile
- * arrives, the registry entry gains `displayName` + `realName` aliases.
- *
- * Why the profile fields matter: Slack's UI autocomplete resolves
- * @-mentions against `profile.display_name` (preferred when set) or
- * `profile.real_name` (fallback), NOT `auth.test.user`. Example Assistant's
- * `auth.test.user` is the legacy `legacybot` but operators type `@beacon` in Slack
- * because `profile.real_name` is "Example Assistant". Without the alias, an outbound
- * `@beacon` ships as plain text.
+ * Adds `display_name`, `real_name` and the avatar from `users.info` to an already-registered identity.
+ * Fire-and-forget: adapters init serially, so awaiting would add up to 5s per workspace to boot. Without these
+ * aliases, the name operators actually type (autocomplete resolves against profile fields, not `auth.test.user`)
+ * ships as plain text.
  */
 export async function upgradeSlackBotProfile(
   client: Pick<SlackAuthTestClient, 'users'>,
@@ -619,9 +438,7 @@ export async function upgradeSlackBotProfile(
     const realName = profile?.real_name || undefined;
     const imageUrl = profile?.image_192 || profile?.image_72 || undefined;
     if (!displayName && !realName && !imageUrl) return;
-    // Re-register with augmented identity. Re-read first in case another
-    // call to registerSlackBot happened in the meantime (unlikely — adapter
-    // factories only register once — but defensive against future callers).
+    // Re-read in case the entry changed meanwhile.
     const current = knownSlackBots.get(channelType);
     if (!current) return;
     registerSlackBot(channelType, { ...current, displayName, realName, imageUrl });
@@ -634,41 +451,15 @@ export async function upgradeSlackBotProfile(
 }
 
 /**
- * Inbound raw-id resolution. Slack wire text carries mentions as `<@U…>` (or
- * `<@U…|label>`), and unlike Discord the bridge never resolved them — so
- * every agent reading a channel where humans type gate syntax ("@skipper
- * hold 304" arrives as "<@U…> hold 304") learns the raw form and echoes it
- * back into its own output. Resolving inbound kills the echo at its origin:
- * agents only ever see `@name`, so `@name` is the only form they reproduce.
- * Scoped to the workspace's known bots and humans; unknown ids pass through
- * untouched (better a raw id the model treats as opaque than a wrong name).
+ * Inbound raw-id resolution: Slack wire text carries mentions as `<@U…>` (or `<@U…|label>`), and agents that read the
+ * raw form echo it back. Resolving inbound means agents only ever see `@name`. Scoped to the workspace's known bots
+ * and humans; unknown ids pass through (better opaque than a wrong name).
  */
 /**
- * Blank out Slack code regions so mention detection only sees prose.
- *
- * Was a single regex — `` /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g ``.
- * Its `` `{3,}…`{3,} `` alternative accepted ANY run of 3+ backticks as a
- * closer, so a longer fence wrapping content that itself contained a
- * shorter 3+ run closed early and leaked the rest as prose (e.g.
- * ` ```` ```<@UBOT> ship ```` `). This scanner instead requires the closer
- * to be a run at least as long as the opener, which is what actually closes
- * a fence — the same rule CommonMark uses.
- *
- * - A run of 3+ backticks opens a fence; it isn't required to sit alone on
- *   a line (Slack's own preformatting doesn't require that either, and
- *   neither did the regex this replaces). It's closed by the next run of
- *   backticks whose length is >= the opener's. An opener with no such
- *   closer runs to the end of the text — an unterminated fence is still
- *   code, never prose, matching CommonMark's own choice here.
- * - A run of 1-2 backticks is an inline code span, closed by the next run
- *   of EXACTLY the same length, not crossing a newline (preserves the
- *   original single-backtick behavior; Slack doesn't render a multi-line
- *   single-backtick span as code, and there's no case data that a
- *   multi-line double-backtick span behaves differently).
- * - Tildes are NOT fence delimiters here: Slack's renderer has no `~~~`
- *   code-fence syntax, only backticks, so a mention wrapped in tildes still
- *   renders live and still pings — treating it as protected would be a new
- *   false negative, not a fix.
+ * Blanks out Slack code regions so mention detection only sees prose. A fence (3+ backticks) closes only at a run at
+ * least as long as its opener (CommonMark's rule); an unterminated fence runs to the end. A 1-2 backtick span closes
+ * at the next run of exactly the same length on the same line. Tildes are NOT fences: Slack has no `~~~` syntax, so a
+ * tilde-wrapped mention still pings.
  */
 function stripSlackCodeRegions(text: string): string {
   let out = '';
@@ -685,7 +476,6 @@ function stripSlackCodeRegions(text: string): string {
     const runLen = j - i;
 
     if (runLen >= 3) {
-      // Fence: find the next run of backticks with length >= runLen.
       let k = j;
       let closeEnd = -1;
       while (k < n) {
@@ -702,12 +492,10 @@ function stripSlackCodeRegions(text: string): string {
         k = m;
       }
       out += ' ';
-      i = closeEnd === -1 ? n : closeEnd; // unterminated fence: rest is code
+      i = closeEnd === -1 ? n : closeEnd; // An unterminated fence: the rest is code.
       continue;
     }
 
-    // Inline code span (1-2 backticks): closed by the next run of exactly
-    // the same length, only on this line.
     let k = j;
     let closeStart = -1;
     let closeEnd = -1;
@@ -726,8 +514,7 @@ function stripSlackCodeRegions(text: string): string {
       k = m;
     }
     if (closeStart === -1) {
-      // No same-length closer on this line — not a code span; keep the
-      // backtick run as literal text and resume scanning after it.
+      // No same-length closer on this line: keep the backticks as literal text.
       out += text.slice(i, j);
       i = j;
     } else {
@@ -739,12 +526,9 @@ function stripSlackCodeRegions(text: string): string {
 }
 
 /**
- * True when the bot's mention appears OUTSIDE code regions of the inbound
- * text. Slack's markdown_text parser fires app_mention even for a literal
- * `@name` inside backticks (documented gate syntax like \`@gatebot ship 42\`),
- * so the platform's isMention alone wakes mention-mode agents off their own
- * documentation. Inbound text at this point has raw ids already resolved to
- * @name (resolveInboundSlackIds), so both forms are checked.
+ * True when the bot's mention appears outside code. Slack fires app_mention even for `@name` inside backticks, which
+ * would wake mention-mode agents off their own documentation. Raw ids are already resolved to @name here, so both
+ * forms are checked.
  */
 export function slackMentionOutsideCode(text: string, identity: SlackBotIdentity): boolean {
   const outsideCode = stripSlackCodeRegions(text);
@@ -756,16 +540,11 @@ export function slackMentionOutsideCode(text: string, identity: SlackBotIdentity
 }
 
 export function resolveInboundSlackIds(text: string, channelType: string): string {
-  // Chat SDK's inbound parser can hand this seam either Slack's raw
-  // `<@U…>` token or its already-flattened `@U…` form. Supporting only the
-  // former left thread-history context contaminated with raw bot IDs even
-  // after the original inbound fix.
+  // Chat SDK can pass either raw `<@U…>` or its flattened `@U…` form; both must be handled.
   if (!text.includes('<@') && !/@U[A-Z0-9_-]{2,}/u.test(text)) return text;
   const self = knownSlackBots.get(channelType);
-  // Fail closed to pass-through: without this workspace's own identity there
-  // is no teamId to scope by, and an unscoped loop would rewrite a pasted
-  // foreign raw id to ANOTHER workspace's bot name — an isolation violation
-  // worse than the raw id it hides.
+  // Fail closed to pass-through: without this workspace's identity there is no teamId, and an unscoped rewrite could
+  // name another workspace's bot.
   if (!self) return text;
   const teamId = self.teamId;
   let out = text;

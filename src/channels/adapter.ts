@@ -22,17 +22,12 @@ export interface ChannelSetup {
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void | Promise<void>;
 
   /**
-   * Called when a user clicks a button/action in a card (e.g., ask_user_question response).
-   * `messageId` is the platform id of the clicked message, null when the platform
-   * gave none: an approval resolves only from a click on its own card.
+   * A card button click. `messageId` is the clicked message's platform id, null when the platform gave none; an
+   * approval resolves only from a click on its own card.
    */
   onAction(questionId: string, selectedOption: string, userId: string, messageId: string | null): void;
 
-  /**
-   * Called when an adapter knows its inbound transport reconnected. Core also
-   * detects host event-loop stalls and invokes the same recovery surface for
-   * every active adapter, so catch-up is transport-agnostic.
-   */
+  /** The adapter's inbound transport reconnected. Core also triggers the same recovery after host event-loop stalls. */
   onConnectionRestored?(info: ChannelConnectionRestored): void | Promise<void>;
 }
 
@@ -77,22 +72,15 @@ export interface DeliveryAddress {
  */
 export interface InboundEvent {
   channelType: string;
-  /** Receiving adapter instance; stamped host-side (src/index.ts onInbound).
-   *  Absent (e.g. CLI onInboundEvent) means the default instance (= channelType). */
+  /** Stamped host-side; absent means the default instance (= channelType). */
   instance?: string;
   platformId: string;
   threadId: string | null;
   /**
-   * Platform-confirmed "this is a DM, not a group/channel" signal. When
-   * the adapter sets false (or message.isGroup is set true), the router
-   * marks auto-created messaging_groups as is_group=1. undefined AND
-   * message.isGroup also undefined means the adapter told us nothing —
-   * router now defaults to is_group=1 (group/mention-safe) rather than
-   * DM-style, since treating an actual group chat as a DM means
-   * always-engage on every message.
+   * Platform-confirmed DM signal. When neither this nor message.isGroup is set, the router defaults to is_group=1:
+   * treating a real group chat as a DM would always-engage on every message.
    */
   isDM?: boolean;
-  /** Internal replay marker identifying platform-history catch-up. */
   recovered?: boolean;
   message: {
     id: string;
@@ -107,22 +95,10 @@ export interface InboundEvent {
     /** True when the source is a group/channel thread, false for DMs. */
     isGroup?: boolean;
     /**
-     * The platform's own confirmed message id (e.g. a Slack `ts`) — set ONLY
-     * by genuine adapter ingress, never by an event this host itself
-     * synthesized. `id` above is the routing/dedup key and is set for every
-     * event, synthetic or not; `nativeId` is the narrower, trust-bearing
-     * field the router stamps into a written row's `platformMsgId`
-     * (host-origin.ts), which the runner renders as `platform_msg_id`.
-     *
-     * The one setter is `adapterInboundEvent`
-     * (src/channels/inbound-event.ts), which main.ts's `onInbound` callback
-     * delegates to for every genuine adapter ingress, and it sets the field
-     * only when the calling adapter's `channelType` isn't `'cli'` — the CLI
-     * adapter's own "plain chat" path also arrives through `onInbound`
-     * (src/channels/cli.ts) but mints its own `cli-<ms>-<rand>` id, so it is
-     * host-synthesized like every `onInboundEvent` caller (the CLI `to:`
-     * admin transport, Discord slash commands, `ncl messaging-groups send`)
-     * — none of which set this field at all.
+     * The platform's own confirmed message id (e.g. a Slack `ts`), set ONLY by genuine adapter ingress, never by a
+     * host-synthesized event. `id` is the routing/dedup key; this narrower field is what the router stamps into
+     * `platformMsgId`. The one setter is `adapterInboundEvent` (src/channels/inbound-event.ts), which skips the CLI
+     * adapter.
      */
     nativeId?: string;
   };
@@ -152,19 +128,12 @@ export interface InboundMessage {
    */
   isMention?: boolean;
   /**
-   * Platform-confirmed "this is a DM, not a group/channel" signal.
-   * Adapters set false explicitly for group/channel messages so the router's
-   * auto-created messaging_groups get is_group=1. Chat SDK bridge sets this
-   * from the SDK's onDirectMessage vs channel handlers. undefined (with
-   * isGroup also undefined) means the adapter didn't tell us → router
-   * defaults to is_group=1 (group/mention-safe): an adapter that never
-   * reports either field and turns out to be a real group chat must not
-   * get always-engage treatment.
+   * Platform-confirmed DM signal; adapters set false for group messages. With isGroup also undefined, the router
+   * defaults to is_group=1 so an unreporting adapter never gets always-engage on a real group chat.
    */
   isDM?: boolean;
-  /** Inverse of isDM. Kept alongside for upstream code paths that key off isGroup. */
+  /** Inverse of isDM, kept for upstream paths that key off isGroup. */
   isGroup?: boolean;
-  /** Internal replay marker identifying platform-history catch-up. */
   recovered?: boolean;
 }
 
@@ -188,28 +157,18 @@ export interface ConversationInfo {
   isGroup: boolean;
 }
 
-/**
- * A conversation as a human would describe it. `participantNames` is set only
- * for `group_dm`, and only when the platform could resolve them — a group DM
- * with an unresolvable roster is still a group DM.
- */
+/** `participantNames` is set only for `group_dm`, and only when the platform resolved them. */
 export interface ChannelConversation {
   type: 'direct' | 'group_dm' | 'channel';
-  /** Display name, when the conversation has one. Null for a nameless group DM. */
   name: string | null;
-  /** Human members of a group DM, excluding bots. */
   participantNames?: string[];
 }
 
-/** Longest participant roster rendered before the label starts counting. */
 const MAX_RENDERED_PARTICIPANTS = 8;
 
 /**
- * Canonical rendering of a `ChannelConversation`'s participants: "Alice",
- * "Alice and Bob", "Alice, Bob and Carol", then "+N more". Lives beside the
- * interface so the adapter that produces the list and the core surfaces that
- * render it cannot drift — core must never import a skill-installed channel
- * module to borrow a formatter.
+ * Canonical participant rendering ("Alice", "Alice and Bob", …, "+N more"). Lives beside the interface so core never
+ * imports a skill-installed channel module for a formatter.
  */
 export function formatParticipantList(names: string[]): string {
   const shown = names.slice(0, MAX_RENDERED_PARTICIPANTS);
@@ -219,13 +178,7 @@ export function formatParticipantList(names: string[]): string {
 }
 
 /**
- * The one name to show for a classified conversation. A group DM has no name
- * a human recognizes, so it is named by who is in it; everything else keeps
- * the name the platform gave it. Null when nothing nameable came back.
- *
- * Lives beside the interface for the same reason as formatParticipantList:
- * the adapter that produces the classification and the core surfaces that
- * persist or render it must not each grow their own version.
+ * A group DM is named by who is in it; everything else keeps its platform name. Null when nothing nameable came back.
  */
 export function conversationDisplayName(conversation: ChannelConversation): string | null {
   if (conversation.type !== 'group_dm') return conversation.name;
@@ -324,28 +277,15 @@ export interface ChannelAdapter {
   deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
 
   // Optional
-  /** `status` is the platform's status-line text where it has one (Slack's
-   *  "<bot> is thinking…"); adapters without one ignore it. */
+  /** `status` is the platform's status-line text where it has one; others ignore it. */
   setTyping?(platformId: string, threadId: string | null, status?: string): Promise<void>;
-  /**
-   * Delete a previously-posted message via the platform's API. Optional —
-   * adapters whose platform doesn't allow bot-message deletion (or which
-   * don't expose the capability) omit this. Used by delivery to clean up
-   * orphan thinking-block status messages once the final chat reply lands.
-   */
+  /** Used by delivery to remove orphan thinking-status messages once the final reply lands. */
   deleteMessage?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
   resolveChannelName?(platformId: string): Promise<string | null>;
   /**
-   * Richer classification of a conversation, for surfaces that render it to a
-   * human. `resolveChannelName` answers "what do I call this?"; this answers
-   * "what KIND of place is this, and who is in it?" — the difference between
-   * an approval card saying `#mpdm-alice--bob--carol-1` and one saying
-   * "a group DM with Alice, Bob and Carol".
-   *
-   * Optional and best-effort: return null when the platform API cannot
-   * classify the conversation (network failure, missing scope) so the caller
-   * falls back to its generic rendering. Never throws.
+   * What KIND of conversation this is and who is in it, for human-facing surfaces. Best-effort: null when the
+   * platform cannot classify; never throws.
    */
   resolveConversation?(platformId: string): Promise<ChannelConversation | null>;
 
@@ -361,12 +301,7 @@ export interface ChannelAdapter {
    */
   permalink?(platformId: string, threadId: string | null): string | null;
 
-  /**
-   * Human-clickable URL for the CHANNEL itself, or null when one can't be
-   * built. Same rules as `permalink`, different subject: `permalink` addresses
-   * a thread and is free to decline every thread-less call, so a caller that
-   * wants the room — "answer in #dispatch" — has to ask for the room.
-   */
+  /** Link to the CHANNEL itself, or null. `permalink` addresses a thread and may decline every thread-less call. */
   channelPermalink?(platformId: string): string | null;
 
   /**
@@ -381,15 +316,8 @@ export interface ChannelAdapter {
   subscribe?(platformId: string, threadId: string): Promise<void>;
 
   /**
-   * Fetch the recent message history of a thread so the agent has full
-   * conversational context on engagement — including messages from other
-   * bots and from the user that never reached our own pipeline (bots don't
-   * trigger us, and plain user messages in a thread don't engage us either).
-   *
-   * v1 did this via `conversations.replies` on every mention inside a
-   * thread (src/channels/slack.ts fetchThreadHistory in the ~/nanoclaw
-   * reference); v2's adapter contract surfaces it as an optional hook.
-   * Adapters without thread semantics (Telegram 1:1 DMs, etc.) omit it.
+   * Recent thread history so the agent has full context on engagement, including messages that never reached our
+   * pipeline (other bots, non-engaging user replies). Adapters without thread semantics omit it.
    */
   fetchThreadHistory?(
     threadId: string,
@@ -397,18 +325,12 @@ export interface ChannelAdapter {
   ): Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }>>;
 
   /**
-   * Replay platform history after a transport gap. Implementations must emit
-   * recovered messages through the setup callback so they traverse the normal
-   * router/access/engagement path. Core supplies known conversation targets;
-   * native adapters may augment them with platform-specific discovery.
+   * Replays platform history after a transport gap. Recovered messages must go through the setup callback so they
+   * take the normal router/access/engagement path.
    */
   recoverMissedMessages?(request: ChannelRecoveryRequest): Promise<ChannelRecoveryResult>;
 
-  /**
-   * True when recoverMissedMessages discovers every thread with activity in
-   * the recovery window from conversation roots. Core then supplies roots
-   * only instead of also fanning out across every historical session.
-   */
+  /** True when recovery discovers every active thread from conversation roots; core then supplies roots only. */
   recoveryDiscoversThreads?: boolean;
 
   /**
@@ -428,22 +350,12 @@ export interface ChannelAdapter {
    */
   openDM?(userHandle: string): Promise<string>;
 
-  /**
-   * Post a message to the top level of a channel (no thread_ts / parent).
-   * Used by the orchestrator-dispatch flow to anchor a new task thread.
-   * Returns the platform message id so the caller can reference it for
-   * createThread or later edits.
-   *
-   * Adapters that don't support parent-level posts omit this.
-   */
+  /** Posts at channel top level and returns the message id for createThread or later edits. */
   postParent?(platformId: string, text: string): Promise<{ messageId: string }>;
 
   /**
-   * Create a thread on an existing parent message and post the first message
-   * into it. Returns the thread id (used as thread_ts / reference for
-   * subsequent posts) and the id of the first message sent into the thread.
-   *
-   * Adapters that don't support threads omit this.
+   * Creates a thread on an existing parent and posts the first message; returns the thread id and the first message's
+   * id.
    */
   createThread?(
     platformId: string,

@@ -1,25 +1,12 @@
 /**
- * Shared Slack channel-layer library — the minimal fetch-based Slack Web API
- * client plus the per-instance bot-token .env key convention. Channel-layer
- * modules import Slack HTTP plumbing from here so it has exactly one home
- * (and so nothing in the channel layer reaches into feature modules for it).
- *
- * Failures become SlackApiError(step, `slack ${method} failed: ${error}`),
- * where `step` is a caller-supplied context tag naming where in the caller's
- * flow the call happened — callers with typed step ids pass them through
- * (any string union narrows to string).
- *
- * Slack's error strings are safe to surface; token values never are — tokens
- * travel only in the Authorization header and are never interpolated into
- * messages or logs.
+ * Shared Slack channel-layer library: a minimal fetch-based Web API client plus the bot-token .env key convention, so
+ * Slack HTTP plumbing has one home. Failures become SlackApiError(step, …) where `step` is the caller's context tag.
+ * Tokens travel only in the Authorization header and must never appear in messages or logs.
  */
 
 const SLACK_API = 'https://slack.com/api';
 
-/**
- * Typed failure for Slack Web API calls. `step` is the caller's context tag
- * for the call site. `message` MUST never contain a token value.
- */
+/** `message` MUST never contain a token value. */
 export class SlackApiError extends Error {
   constructor(
     readonly step: string,
@@ -31,9 +18,8 @@ export class SlackApiError extends Error {
 }
 
 /**
- * POST one Web API method with a JSON body. Returns the parsed response when
- * `ok: true`; throws SlackApiError otherwise (network failure, timeout,
- * non-JSON body, or a Slack-side error string).
+ * Returns the parsed response when `ok: true`; throws SlackApiError otherwise (network, timeout, non-JSON, or a Slack
+ * error string).
  */
 export async function slackCall(
   token: string,
@@ -67,8 +53,7 @@ export async function slackCall(
   return json;
 }
 
-/** auth.test — the calling bot's own identity. `url` is the workspace URL
- *  (`https://<domain>.slack.com/`) — canvas permalinks hang off it. */
+/** `url` is the workspace URL (`https://<domain>.slack.com/`). */
 export async function slackAuthTest(
   token: string,
   step: string,
@@ -84,10 +69,7 @@ export async function slackAuthTest(
   };
 }
 
-/**
- * conversations.open — one user id opens (or fetches) the 1:1 IM; two or
- * more open an MPIM. Idempotent on Slack's side. Returns the channel id.
- */
+/** One user id opens the 1:1 IM; two or more open an MPIM. Idempotent on Slack's side. */
 export async function slackConversationsOpen(token: string, userIds: string[], step: string): Promise<string> {
   const json = await slackCall(token, 'conversations.open', { users: userIds.join(',') }, step);
   const channel = json.channel as Record<string, unknown> | undefined;
@@ -96,7 +78,6 @@ export async function slackConversationsOpen(token: string, userIds: string[], s
   return channelId;
 }
 
-/** chat.postMessage — plain-text post into a channel, DM, or MPIM. */
 export async function slackPostMessage(
   token: string,
   channel: string,
@@ -106,10 +87,6 @@ export async function slackPostMessage(
   await slackCall(token, 'chat.postMessage', { channel, text }, step);
 }
 
-/**
- * conversations.info — minimal channel classification: is this an MPIM
- * (group DM), and what is it called?
- */
 export async function slackConversationsInfo(
   token: string,
   channelId: string,
@@ -124,11 +101,7 @@ export async function slackConversationsInfo(
   };
 }
 
-/**
- * conversations.members — the channel's full member set (user ids, bots
- * included). Cursor-paginated; the page cap bounds pathological channels —
- * membership comparisons only run over small rooms (MPIMs are ≤9 members).
- */
+/** Cursor-paginated with a page cap; membership comparisons only run over small rooms (MPIMs are ≤9 members). */
 export async function slackConversationsMembers(token: string, channelId: string, step: string): Promise<string[]> {
   const members: string[] = [];
   let cursor: string | undefined;
@@ -149,57 +122,25 @@ export async function slackConversationsMembers(token: string, channelId: string
   return members;
 }
 
-/** slug.toUpperCase().replace(/-/g, '_') — the .env key suffix shape. */
 function envSuffix(slug: string): string {
   return slug.toUpperCase().replace(/-/g, '_');
 }
 
 /**
- * ── FORK DELTA ──────────────────────────────────────────────────────────────
- * Everything above this line is a byte-copy of upstream's `src/channels/
- * slack-lib.ts` on the `channels` branch. Everything below is the fork's own
- * addition, and it exists because upstream and the fork key Slack adapters
- * differently.
- *
- * Upstream registers `slack-<slug>` as an *instance* of one `channel_type =
- * 'slack'`. The fork has no instance dimension in practice: `messaging_groups.
- * instance` is always set equal to `channel_type`, and `parseSlackWorkspaces`
- * (src/channels/slack.ts) derives a distinct channel_type per suffixed token
- * pair. So the fork's substitution rule for every upstream Slack payload is
- *
- *     channel_type = instance = slackChannelTypeForSlug(slug)
- *
- * and the helpers below are the only sanctioned way to move between the three
- * spellings of one Slack adapter identity:
- *
- *     slug          research-2              (normalizeName output)
- *     channel type  slack-research-2        (agent_groups / messaging_groups)
- *     env suffix    RESEARCH_2              (SLACK_BOT_TOKEN_RESEARCH_2)
- *
- * `src/channels/slack-lib.test.ts` pins the round trip against
- * `parseSlackWorkspaces` itself rather than against a restated regex, because
- * a second copy of that derivation is exactly how Socket Mode broke a
- * workspace once already (see the SLACK_ENV_PATTERN comment in slack.ts).
+ * FORK DELTA: everything above is a byte-copy of upstream's `channels`-branch slack-lib.ts; everything below is the
+ * fork's own. Upstream registers `slack-<slug>` as an instance of one `channel_type = 'slack'`; the fork derives a
+ * distinct channel_type per suffixed token pair (instance always equals channel_type). These helpers are the only
+ * sanctioned way to convert between slug (`research-2`), channel type (`slack-research-2`) and env suffix
+ * (`RESEARCH_2`); slack-lib.test.ts pins the round trip against `parseSlackWorkspaces` itself.
  */
 
-/** The default Slack channel type — the unsuffixed adapter. */
 const DEFAULT_SLACK_CHANNEL_TYPE = 'slack';
 
 /**
- * slug → the fork's channel type.
- *
- * ONLY the empty slug is the default adapter. `'slack'` is a perfectly legal
- * slug — it is what `normalizeName` returns for an agent named "Slack" — and
- * it maps to `slack-slack`, a separate adapter with its own
- * `SLACK_BOT_TOKEN_SLACK`. Treating it as the default instead would point the
- * token helpers at the unsuffixed `SLACK_BOT_TOKEN`, so provisioning that
- * agent would overwrite the install's existing default Slack app credentials
- * rather than creating a new bot.
- *
- * The asymmetry with `slugForSlackChannelType` is deliberate and not a broken
- * round trip: that direction takes a CHANNEL TYPE, where `slack` really is
- * the default adapter and its slug really is empty. Every non-empty slug
- * round-trips exactly.
+ * ONLY the empty slug is the default adapter. `'slack'` is a legal slug (an agent named "Slack") and maps to
+ * `slack-slack` with its own `SLACK_BOT_TOKEN_SLACK`; treating it as the default would overwrite the install's
+ * default Slack app credentials when provisioning that agent. The asymmetry with `slugForSlackChannelType` is
+ * deliberate.
  */
 export function slackChannelTypeForSlug(slug: string): string {
   const trimmed = slug.trim();
@@ -207,21 +148,15 @@ export function slackChannelTypeForSlug(slug: string): string {
   return `${DEFAULT_SLACK_CHANNEL_TYPE}-${trimmed}`;
 }
 
-/** channel type → slug. The inverse of `slackChannelTypeForSlug`; the default
- *  adapter's slug is the empty string. */
+/** Inverse of `slackChannelTypeForSlug`; the default adapter's slug is ''. */
 export function slugForSlackChannelType(channelType: string): string {
   if (channelType === DEFAULT_SLACK_CHANNEL_TYPE) return '';
   return channelType.replace(/^slack-/, '');
 }
 
 /**
- * .env bot-token key for a fork channel type — upstream's
- * `botTokenKeyForInstance` under the substitution rule above. The default
- * channel type maps to `SLACK_BOT_TOKEN`; any other maps to
- * `SLACK_BOT_TOKEN_<SUFFIX>` with the leading `slack-` stripped and the
- * remainder uppercased with dashes as underscores — the suffix shape
- * `parseSlackWorkspaces` reads back. Returns the key name only; reading the
- * value stays with the caller.
+ * The .env bot-token key name for a channel type: `SLACK_BOT_TOKEN` for the default, else `SLACK_BOT_TOKEN_<SUFFIX>`
+ * in the shape `parseSlackWorkspaces` reads back.
  */
 export function botTokenKeyForChannelType(channelType: string): string {
   if (channelType === DEFAULT_SLACK_CHANNEL_TYPE) return 'SLACK_BOT_TOKEN';
@@ -229,10 +164,8 @@ export function botTokenKeyForChannelType(channelType: string): string {
 }
 
 /**
- * .env app-token (`xapp-`) key for a fork channel type. Socket Mode's second
- * credential, and the one a provisioned app arrives with — `apps.manifest.
- * create` returns it alongside the app id, so a provisioned bot lands as the
- * BOT_TOKEN/APP_TOKEN pair a hand-made Socket Mode bot already uses.
+ * Socket Mode's second credential; `apps.manifest.create` returns it, so a provisioned bot lands as the same
+ * BOT_TOKEN/APP_TOKEN pair a hand-made Socket Mode bot uses.
  */
 export function appTokenKeyForChannelType(channelType: string): string {
   if (channelType === DEFAULT_SLACK_CHANNEL_TYPE) return 'SLACK_APP_TOKEN';
