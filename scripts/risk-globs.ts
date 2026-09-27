@@ -58,6 +58,7 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   '.github/**',
   '.husky/**',
   '.public-boundary-allowlist.json',
+  '.public-boundary-baseline.json',
   'container/skills/pr-review-loop/**',
   // Hygiene-check policy (knip and jscpd configuration); the checker itself is scripts/hygiene/**.
   'knip.json',
