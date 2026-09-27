@@ -81,6 +81,10 @@ function citedText(lines: string[] | null, link: FileLineCitation): string | nul
   return lines.slice(link.startLine - 1, link.endLine).join('\n');
 }
 
+function citesExactly(line: string, cited: string): boolean {
+  return new RegExp(`(?<![\\w./-])${cited.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(line);
+}
+
 function introducingCommit(root: string, rev: string, doc: string, lineNumber: number, cited: string): string | null {
   const history = gitRead(root, ['log', `-L${lineNumber},${lineNumber}:${doc}`, '--format=%x00%H', rev]) ?? '';
   let oldest: string | null = null;
@@ -89,9 +93,9 @@ function introducingCommit(root: string, rev: string, doc: string, lineNumber: n
     const after = patch.filter((line) => line.startsWith('+') && !line.startsWith('+++'));
     const before = patch.filter((line) => line.startsWith('-') && !line.startsWith('---'));
     if (after.length === 0 && before.length === 0) continue;
-    if (!after.some((line) => line.includes(cited))) break;
+    if (!after.some((line) => citesExactly(line, cited))) break;
     oldest = sha.trim();
-    if (!before.some((line) => line.includes(cited))) break;
+    if (!before.some((line) => citesExactly(line, cited))) break;
   }
   return oldest;
 }

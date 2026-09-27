@@ -39,11 +39,10 @@ function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<strin
   if (tracked.has(cited)) return { file: cited } satisfies Resolution;
   const relative = path.posix.normalize(path.posix.join(path.posix.dirname(doc), cited));
   if (tracked.has(relative)) return { file: relative } satisfies Resolution;
+  const shaped = cited.startsWith('.') ? relative : cited;
+  if (shaped.includes('/') && topDirs.has(shaped.split('/')[0])) return { missing: true } satisfies Resolution;
   const bySuffix = [...tracked].filter((file) => file.endsWith(`/${cited}`));
   if (bySuffix.length === 1) return { file: bySuffix[0] } satisfies Resolution;
-  const shaped = cited.startsWith('.') ? relative : cited;
-  if (bySuffix.length === 0 && shaped.includes('/') && topDirs.has(shaped.split('/')[0]))
-    return { missing: true } satisfies Resolution;
   return { skip: true } satisfies Resolution;
 }
 
@@ -178,6 +177,13 @@ describe('docCitationProblems', () => {
     });
     expect(docCitationProblems(root, ['doc.md'])).toEqual([
       'doc.md:1: cites `src/gone.ts:3`, but no tracked file has that path',
+    ]);
+  });
+
+  it('fails a deleted repo path instead of resolving it to another file with the same suffix', () => {
+    const { root } = repo({ 'src/keep.ts': 'a\n', 'container/src/code.ts': 'a\n', 'guide.md': '`src/code.ts:1`\n' });
+    expect(docCitationProblems(root, ['guide.md'])).toEqual([
+      'guide.md:1: cites `src/code.ts:1`, but no tracked file has that path',
     ]);
   });
 

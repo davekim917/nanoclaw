@@ -321,6 +321,21 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
   });
 
+  it('does not take a longer line number for the cited one in the line history', () => {
+    const root = gitRoot();
+    const lines = (body: string): string =>
+      [`function ${body}() {}`, ...Array(8).fill('x'), `function ${body}() {}`, ''].join('\n');
+    write(root, 'src/code.ts', lines('drainQueueOld'));
+    write(root, NOTE, '- `drainQueueOld` at `src/code.ts:10` is old\n');
+    commit(root, 'note on line 10');
+    write(root, 'src/code.ts', lines('drainQueue'));
+    commit(root, 'change the code');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` is current\n');
+    const retargeted = commit(root, 'point the note at line 1');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: retargeted })]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
