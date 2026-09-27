@@ -84,8 +84,6 @@ import {
   replaceUntrustedFile,
 } from './fs-safety.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
-// Owns the claude branch's model/effort resolution AND the `-e` strings it
-// emits, so both are reachable from a unit test — buildContainerArgs is not.
 import { claudeSpawnEnv } from './claude-spawn-defaults.js';
 import { CODEX_FAMILY_DEFAULTS } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
@@ -212,16 +210,8 @@ export const DATAFOLD_MCP_SERVER = {
 } as const satisfies McpServerConfig;
 
 /**
- * Host-only fields on a stored MCP entry: they exist for the capability
- * snapshot and never for the provider. The container parses this JSON straight
- * into its server map (`container/agent-runner/src/index.ts`) and hands
- * each entry to a provider's translator; its own `McpServerConfig`
- * (`container/agent-runner/src/providers/types.ts`) declares neither
- * field, so they are dropped here rather than ridden along to three providers.
- *
- * `instructions` is deliberately NOT in this list. It is not part of that type
- * either, but it already crosses the boundary today and this function is not
- * the place to change what a running container receives.
+ * Host-only fields on a stored MCP entry (capability snapshot only); the container's McpServerConfig declares
+ * neither, so they are stripped. `instructions` deliberately still crosses the boundary.
  */
 const HOST_ONLY_MCP_FIELDS = ['displayName', 'description'] as const;
 
@@ -238,7 +228,6 @@ export function serializeMcpServersEnv(servers: Record<string, unknown>): string
   return `NANOCLAW_MCP_SERVERS=${JSON.stringify(forContainer)}`;
 }
 
-/** Docker environment for an agent's explicit Git identity. */
 export function gitIdentityEnv(identity?: GitIdentity): Record<string, string> {
   if (!identity) return {};
   return {
@@ -249,77 +238,36 @@ export function gitIdentityEnv(identity?: GitIdentity): Record<string, string> {
   };
 }
 
-// timeout 30s (SDK default is 5s): createAgent/applyContainerConfig run at
-// spawn, and the gateway can be briefly slow when the host is reaping many
-// stale containers against it at once. A 5s abort there fails the spawn and
-// forces a ~60s sweep-retry (observed delaying the opencode-sibling spawns).
-// 30s rides out the transient blip without hanging spawns indefinitely.
-// @onecli-sh/sdk is EXACT-pinned, and the pin is COUPLED TO THE GATEWAY VERSION.
-// OneCLI ships as two components (SDK + gateway container) sharing a wire
-// contract: 0.5.x calls `/api/*`, 2.x calls `/v1/*`. Both must move together.
-//
-// Current state (2026-07-25): SDK 2.2.1 — upstream's pin — against gateway
-// v1.42.0. Verified live rather than by compiling: getGatewaySkill() returns
-// 200. v1.42.0 serves BOTH prefixes, which is why `src/onecli-secrets.ts`'s raw
-// `/api/<resource>` call still works; don't assume that holds forever.
-//
-// History worth not repeating: a blind `^0.5.0` -> `^2.8.0` bump took
-// the whole fleet down for ~1h against the then-current v1.18.6 gateway, which
-// served only `/api`. ensureAgent 404'd, every spawn aborted, and the sweep
-// retried at WARN forever with no escalation. Nothing caught it — build and
-// tests pass because neither touches the live gateway, and the method names are
-// IDENTICAL across both majors (only the path moved), so a surface or type check
-// cannot see it. Verify any future bump by CALLING a running gateway.
+// 30s timeout (SDK default 5s): the gateway can be slow while the host reaps many containers, and a 5s abort
+// fails the spawn. The @onecli-sh/sdk pin is COUPLED TO THE GATEWAY VERSION (0.5.x calls /api/*, 2.x calls
+// /v1/*); method names are identical across majors, so builds and tests cannot catch a mismatch. Verify any
+// bump by calling a running gateway.
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 });
 
 /**
- * Codex family aliases (`sol`, `luna`, …) are stored as typed and resolved
- * inside the container, because the Codex CLI has none of its own. Emitted by
- * BOTH spawn branches (the restricted wiki one returns early) and for every
- * provider: a Claude-primary group can fall back to Codex, and its
- * providerFallback.model may name a family.
+ * Emitted for every provider and both spawn branches: a Claude-primary group can fall back to Codex, whose CLI
+ * has no family aliases of its own.
  */
 export function codexFamilyAliasEnv(): string[] {
   return ['-e', `NANOCLAW_CODEX_MODEL_ALIASES=${JSON.stringify(CODEX_FAMILY_DEFAULTS)}`];
 }
 
-// Default model constants moved to flag-parser.ts (DEFAULT_OPUS_MODEL etc.) —
-// the chat ack has to resolve family aliases the same way this spawn path
-// does, and flag-parser is the leaf both can import without a cycle. Edit them
-// there; this file only consumes them.
-// (DEFAULT_EFFORT removed 2026-06-10 — effort defaults are per-model-family
-// in the claude provider; NANOCLAW_EFFORT_OVERRIDE is operator-override-only.)
-
 /**
- * How a tracked container's terminal is observed (plan §4.3.3).
- *
- * `spawned` is today's shape: the `docker run --rm` client is a child of this
- * process and its `close` IS the container's exit. `adopted` is a container a
- * previous host process started and this one took over at boot: there is no
- * client child, so one `docker wait <name>` observer per container supplies the
- * same `close`-is-terminal signal — with one difference the union exists to
- * make explicit. A waiter's `close` is only a HINT: a docker-daemon restart
- * exits every waiter at once, so the close is checked against the runtime
- * (`runtimeShowsRunning`) before it finalizes, and re-armed when the container
- * is still there. `waiter` is therefore mutable: a re-arm swaps a fresh child
- * into the SAME channel object, which is what the registry's identity fence
- * compares. `terminal` fires exactly once, when the container is proven gone,
- * so exit callbacks ride it rather than the raw waiter and a re-arm cannot
- * fire them spuriously.
+ * `adopted`: a container a previous host started, observed via `docker wait`. A waiter's `close` is only a
+ * HINT (a docker-daemon restart exits every waiter), so it is checked against the runtime before finalizing and
+ * re-armed in place: `waiter` is swapped inside the SAME channel object, which the registry's identity fence
+ * compares. `terminal` fires exactly once, when the container is proven gone.
  */
 export type SupervisionChannel =
   | { kind: 'spawned'; process: ChildProcess }
   | { kind: 'adopted'; waiter: ChildProcess; terminal: EventEmitter; settled: boolean };
 
-/** One tracked container. */
 interface ActiveContainerEntry {
   channel: SupervisionChannel;
   containerName: string;
   /**
-   * When this host started observing the container. For a spawned entry that
-   * is the spawn; for an adopted one it is the adoption instant — this host has
-   * no spawn time for a container a previous host started, and 0 would exempt
-   * every adopted session from the idle ceiling.
+   * When this host started observing it: the adoption instant for an adopted entry (0 would exempt it from the
+   * idle ceiling).
    */
   spawnedAt: number;
   adopted: boolean;
@@ -329,31 +277,21 @@ interface ActiveContainerEntry {
   claimIncarnation?: number;
 }
 
-/** Active containers tracked by session ID. */
 const activeContainers = new Map<string, ActiveContainerEntry>();
 
-/**
- * Run `callback` once at the container's terminal. For a spawned entry that is
- * the client's `close`; for an adopted one it is the channel's `terminal`, which
- * `finalizeSession` fires only after the runtime confirmed the container is
- * gone — never a bare waiter exit, which a daemon restart produces for free.
- */
+/** For an adopted entry this rides `terminal`, never a bare waiter exit (a daemon restart produces those for free). */
 function channelOnClose(channel: SupervisionChannel, callback: () => void): void {
   if (channel.kind === 'spawned') channel.process.once('close', callback);
   else channel.terminal.once('close', callback);
 }
 
-/** Has the channel already delivered its terminal? */
 function channelHasExited(channel: SupervisionChannel): boolean {
   return channel.kind === 'spawned' ? channel.process.exitCode !== null : channel.settled;
 }
 
 /**
- * The hard-kill fallback when `stopContainer` itself failed. Channel-aware
- * because a naive union is silently wrong here: SIGKILL on a spawned entry's
- * client stops its container, but SIGKILL on an adopted entry's WAITER would
- * abandon the container, so the adopted fallback targets the container by name
- * and only then the waiter — whose exit merely triggers the truth re-read.
+ * SIGKILL on an adopted entry's WAITER would abandon the container, so the adopted fallback stops the container
+ * by name first.
  */
 function channelKillFallback(entry: ActiveContainerEntry, sessionId: string): void {
   if (entry.channel.kind === 'spawned') {
@@ -377,75 +315,26 @@ function channelKillFallback(entry: ActiveContainerEntry, sessionId: string): vo
 }
 
 /**
- * Sessions this process has promised to bring back, each holding the TOKEN of
- * the promise — the in-memory shadow of the `respawn_after_stop` rows this host
- * wrote itself.
- *
- * The token is what makes the discharge safe against an in-flight wake. A wake
- * reads the session's token when it STARTS, and may only discharge a promise
- * whose token it read: a wake already running when the kill arrived read
- * `undefined` (or the previous promise's token) and so cannot clear the promise
- * the kill just made, even though it can still resolve `true` for a container
- * this kill is about to stop. Without that, the original wake's `true` cleared
- * the row while the replacement wake merely JOINED it, and the session went
- * down with nothing left for the next boot to recover.
- *
- * The map also keeps the discharge free for every wake that owes nothing:
- * without it `clearRespawnIntentOnWake` would put a central-DB write in front
- * of every ordinary message-driven spawn. Empty at boot by construction, which
- * is right — a promise made by a PREVIOUS host is owed to
- * `honorPendingStopIntents`, not to this map.
+ * Outstanding respawn promises (in-memory shadow of this host's `respawn_after_stop` rows), each with a token.
+ * A wake may discharge only a promise whose token it read when it STARTED, so a wake already in flight when a
+ * kill arrived cannot clear the promise that kill just made.
  */
 const respawnIntents = new Map<string, number>();
 
-/** Monotonic source of the promise tokens above; never reused within a process. */
 let respawnIntentSeq = 0;
 
-/** Test-only: drop this process's record of outstanding respawn promises. */
 export function _resetStopIntentStateForTesting(): void {
   respawnIntents.clear();
 }
 
-/**
- * Test-only: the promise token a wake starting NOW would read, or undefined
- * when this host owes the session nothing.
- */
 export function _respawnIntentTokenForTesting(sessionId: string): number | undefined {
   return respawnIntents.get(sessionId);
 }
 
 /**
- * The claimant id for `session_claims`, or null when this process has none.
- *
- * It is the host's durable lease instance id and nothing else. There is NO
- * `hostname:pid` fallback — plan §7.A′ point 2 proposed one and it is dropped
- * deliberately: a claim is only worth taking if a peer can answer it against
- * `host_instances` liveness, and an id that was never registered there always
- * reads as dead. A host running under a fallback id would therefore have every
- * one of its claims taken over by any overlapping host, which is the duplicate
- * container the claim exists to prevent. Refusing to claim is the safe half of
- * that trade, and it costs a single-host install nothing: a central DB that
- * cannot take the one-row lease INSERT could not take the claim row either.
- *
- * Fork-forward on upstream: upstream `6b0411c47` shipped the hostname:pid form
- * and its own later commit `692a0b603` ("claims answer to the host-instance
- * lease") replaced it with the lease id. The fork takes the end state directly,
- * so the claimant vocabulary never has to be migrated.
- *
- * The lease start in `main()` is fail-open by design (`shadowWrite`), so
- * a host whose registration failed at boot reaches here with no id. One late
- * start is attempted from the spawn path — the DB may well be healthy again by
- * then — and it is also `shadowWrite`-wrapped, because a failed retry must
- * refuse this one spawn, not throw out of the wake path.
- *
- * That "one" is a real once, not one per caller: `lateLeaseStart` holds the
- * single in-flight attempt so two sessions waking in the same tick share it.
- * Without it both would see a null id, both would enter the starter, and the
- * host would end up with two registered instance ids and two renewal timers
- * while `host-instance.ts` keeps only the last — the earlier row then expires
- * unrenewed, and any claim taken under it reads as dead to every peer. The
- * slot is cleared when the attempt settles, so a failure is retried by the
- * next wake rather than latched for the life of the process.
+ * Deliberately NO `hostname:pid` fallback claimant id: an id never registered in `host_instances` reads as dead,
+ * so any overlapping host would take over every claim. `lateLeaseStart` holds the single in-flight late lease
+ * start so concurrent wakes share it (two would register two instance ids); it is cleared on settle.
  */
 let lateLeaseStart: Promise<void> | null = null;
 
@@ -462,25 +351,9 @@ async function resolveClaimantId(): Promise<string | null> {
 }
 
 /**
- * Is THIS host's own lease still live, and can it be made live if not?
- *
- * `getHostInstanceId()` answers from process memory and keeps answering after
- * the renewal timer has been failing for longer than the TTL — upstream's
- * renew path only warns (src/host-instance.ts). Claiming under an expired
- * lease is the mirror image of the peer check below: our row reads as dead to
- * everyone else, so a peer takes the session over and spawns a duplicate while
- * our container is still running.
- *
- * So the lease is validated as a durable fact, not a remembered one, and one
- * inline renewal is attempted before giving up — a lapse is usually a
- * transient DB blip, and re-arming here is cheaper than refusing every spawn
- * until the 30 s timer next fires. The renewal is awaited and its failure
- * swallowed: it is shadow state, and a spawn refusal is the answer either way.
- *
- * Scope: this is the self-fence for the SPAWN path only. Containers that are
- * already running when the lease lapses are not touched — fencing those is
- * adoption's problem (series E/F), which is where a host learns what it is
- * still supervising.
+ * `getHostInstanceId()` answers from memory even after renewals have failed past the TTL, and a claim under an
+ * expired lease lets a peer take the session over while our container runs. So validate durably, with one
+ * inline renewal attempt. Spawn path only.
  */
 async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
   if (await getLiveHostInstance(instanceId, new Date().toISOString())) return true;
@@ -495,49 +368,13 @@ async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
 }
 
 /**
- * Claim a session this process is about to run. The `session_claims` row is the
- * authority for which process/incarnation owns a session: losing the
- * compare-and-set means another live claimant got there first, and the caller
- * must not start a container for it. Returns the claimed incarnation, or null
- * when the claim was lost. Throws on a failed write — a claim that cannot be
- * recorded is a claim not held.
+ * Returns the claimed incarnation, or null when the claim was lost (do not start a container). Throws on a
+ * failed write. A claim held by a LIVE peer host is refused; a stopped, lease-expired or unknown holder is
+ * takeover-able so a crashed claimant never wedges a session. This must stay the last `await` before `spawn()`.
  *
- * A claim held by a LIVE peer host (a `host_instances` row that is not stopped
- * and whose lease is unexpired) is refused outright — two live hosts must never
- * trade a session back and forth. A claim whose holder is stopped,
- * lease-expired, or unknown (older claimant-id schemes) stays takeover-able: a
- * crashed claimant must never wedge a session. A claim this same process
- * already holds is takeover-able too, which is what lets a respawn win.
- *
- * A process with no durable instance id claims nothing at all — see
- * `resolveClaimantId` — so a spawn is refused rather than fenced by an id no
- * peer can answer, and a process whose OWN lease has lapsed is refused too
- * (`selfLeaseIsLive`): a claim every peer reads as dead is not a claim.
- *
- * Both of those reads, the peer read and the container read below all happen
- * inside this function and therefore inside the single `await` the spawn path
- * makes for the claim. The ordering argument is unchanged: the claim is still
- * the last `await` before `spawn()`, and the guard point stays adjacent to it.
- *
- * Two fences, in order (plan §4.3.4):
- *
- * P2 — the container half. An UNTRACKED container is still running for this
- * session: a survivor of the previous host that this one has not adopted.
- * Fence on the container, not the incarnation — a crashed host's claim is
- * deliberately takeover-able, so the incarnation cannot tell "nobody runs this
- * session" from "a survivor runs it". Steady state never pays: a clean exit
- * nulls `container_ref`, and a session this host tracks short-circuits on the
- * registry long before here. Fails CLOSED — "cannot prove absence" never reads
- * as "absent". The adopter holds the survivor by definition and skips it. A
- * runtime call, so it sits OUTSIDE the transaction below.
- *
- * P1 — the peer half, and the incarnation CAS, as ONE atomic step. The
- * holder's liveness verdict and the conditional UPDATE were two
- * statements, and a peer whose lease had expired but renewed in between was
- * overwritten while its container kept running. `centralTransaction` opens
- * `BEGIN IMMEDIATE` under the fork's central lease, so the peer's renewal
- * waits behind the read → verdict → CAS instead of landing inside it. The
- * closure is DB calls only, sequential, with no other effect (plan §4.4).
+ * P2 (container fence): an untracked container still running for the session fails the claim; fails CLOSED,
+ * and is a runtime call so it sits outside the transaction. P1: the peer-liveness read and the incarnation CAS
+ * run in one `BEGIN IMMEDIATE` transaction so a peer's lease renewal cannot land between them.
  */
 async function claimSessionRun(
   sessionId: string,
@@ -603,8 +440,6 @@ async function claimSessionRun(
  *  self-healing (the next claimant's CAS supersedes it). */
 async function releaseClaimQuietly(sessionId: string, incarnation: number): Promise<void> {
   const self = getHostInstanceId();
-  // No id means no claim was ever taken under one (`claimSessionRun` refuses
-  // without it), so there is nothing this process could scope a release to.
   if (!self) return;
   await shadowWrite('session-claim-release', () =>
     releaseSessionClaim({
@@ -617,52 +452,30 @@ async function releaseClaimQuietly(sessionId: string, incarnation: number): Prom
 }
 
 /**
- * Wall-clock time the host spawned the container for this session, or 0 if
- * no container is tracked. Read by the host-sweep stuck-claim guard so a
- * fresh container gets a grace window to clear its own pre-existing
- * processing_ack rows before the SLA enforcer kills it.
+ * Spawn wall-clock ms, or 0 when untracked. Gives a fresh container a grace window in the stuck-claim guard.
  */
 export function getContainerSpawnedAt(sessionId: string): number {
   return activeContainers.get(sessionId)?.spawnedAt ?? 0;
 }
 
-/** Was this session's container adopted at boot rather than spawned by this host? */
 export function isAdoptedContainer(sessionId: string): boolean {
   return activeContainers.get(sessionId)?.adopted ?? false;
 }
 
-/** Sessions whose tracked container this host adopted rather than spawned. */
 export function getAdoptedSessionIds(): string[] {
   return [...activeContainers.entries()].filter(([, entry]) => entry.adopted).map(([sessionId]) => sessionId);
 }
 
 /**
- * In-flight wake promises, keyed by session id. Deduplicates concurrent
- * `wakeContainer` calls while the first spawn is still mid-setup (async
- * buildContainerArgs, OneCLI gateway apply, etc.) — otherwise a second
- * wake in that window passes the `activeContainers.has` check and spawns
- * a duplicate container against the same session directory, producing
- * racy double-replies.
+ * In-flight wakes by session: dedupes concurrent `wakeContainer` calls during async spawn setup, which would
+ * otherwise pass the `activeContainers` check and spawn a duplicate container.
  */
 const wakePromises = new Map<string, Promise<boolean>>();
 const spawningSessions = new Set<string>();
 
 /**
- * Kill requests made against a session whose container does not exist YET.
- *
- * `killContainer` used to return silently for these. That is not a no-op from
- * the caller's side: `containerOwnsOutbound` is deliberately true for a
- * SPAWNING session — a wake issued a moment ago is about to hold the file — so
- * every caller that asks "is anyone there?" before killing gets `true`, calls
- * `killContainer`, and gets nothing. The container then comes up and keeps
- * running, and the caller's `onExit` work never runs: a confirmed thread close
- * leaves the fresh container alive, a self-mod rebuild leaves the old image
- * running, a provider self-heal never respawns on the fallback.
- *
- * A request recorded here is honoured at the last point before `docker run`
- * (the spawn is cancelled) or, if the process registered first, by killing it
- * once the wake settles. Either way `onExit` fires exactly once, so exit-driven
- * work runs for a spawning session exactly as it does for a running one.
+ * Kill requests for a session still SPAWNING. Honoured at the last point before `docker run` (spawn cancelled)
+ * or by killing the process once the wake settles; either way `onExit` fires exactly once.
  */
 /** An exit callback may await (it usually re-reads the session row before a wake); its rejection is logged, never thrown into the emitter. */
 export type ContainerExitCallback = () => unknown;
@@ -672,55 +485,27 @@ const pendingKills = new Map<string, { reason: string; onExit: ContainerExitCall
 /**
  * A caller's precondition, re-proved by the WAKE PATH at the last instant.
  *
- * Same contract and same reasoning as `WriteGuard` in session-manager: `true`
- * proceeds, anything else refuses. Synchronous by requirement — it is called
- * with nothing awaited between it and `spawn()`.
+ * `true` proceeds, anything else refuses. Must be synchronous: nothing may be awaited between it and `spawn()`.
  */
 export type WakeGuardResult = boolean | { ok: false; reason: string };
 export type WakeGuard = () => WakeGuardResult;
 
 export interface WakeContainerOptions {
   /**
-   * Re-proved immediately before `spawn()`, and again when a queued wake is
-   * dequeued.
-   *
-   * Callers proved their preconditions and then called `wakeContainer`, which
-   * awaits storage admission, an unbounded wait in the memory queue, a storage
-   * lease, and all of `spawnContainer`'s preparation before the process exists.
-   * A re-read at the call site cannot see inside any of that. The proof belongs
-   * where the spawn is.
+   * Re-proved immediately before `spawn()` and when a queued wake is dequeued: the wake path awaits admission,
+   * queues and leases, so a call-site check goes stale.
    */
   guard?: WakeGuard;
 }
 
-/** What a queued wake carries: the session AND the caller's still-unproved guard. */
 interface QueuedWake {
   session: Session;
   guard?: WakeGuard;
 }
 
 /**
- * The wake guard nearly every caller wants: the central row is still ACTIVE at
- * the moment the process is created.
- *
- * Five call sites had written this by hand as a `getSession()` immediately
- * before `wakeContainer`, which proves it before the call rather than before
- * the spawn — and the wake then awaits storage admission, an unbounded memory
- * queue and all of `spawnContainer`'s preparation. One definition, evaluated in
- * the one place that is adjacent to `spawn()`.
- */
-/**
- * Why this row cannot take a wake, or `null` when it can.
- *
- * THE one definition, used by the universal re-read on the wake path and by the
- * opt-in guard alike. Two copies is how the archive axis came to be checked in
- * one place and not the other.
- *
- * `archived_at` is a SECOND axis, not a shade of `status`. `archiveSessionById`
- * stamps it and leaves `status` alone, so a thread-close that archives without
- * closing leaves a row reading `active` — and a check that asked only about
- * `status` would wave a wake straight into a thread the operator was told was
- * finished. The archive-only close is the ordinary outcome, not an edge one.
+ * Why this row cannot take a wake, or `null` when it can: THE one definition for the wake path and the opt-in
+ * guard. `archived_at` is a second axis: an archive-only thread close leaves `status` reading `active`.
  */
 function unwakeableReason(fresh: Session | undefined): string | null {
   if (!fresh) return 'session no longer exists';
@@ -736,29 +521,14 @@ export function sessionStillActive(sessionId: string): WakeGuard {
   };
 }
 
-/**
- * Seam 3 §4.5 I-1: a guard-path read that stays SYNCHRONOUS forever.
- * It executes the sessions leaf's own exported `SESSION_BY_ID_SQL` through
- * `withRawDb` — one constant, two executors, not a `*Sync` twin of
- * `getSession` (plan docs/specs/upstream-async-central-db-seam/plan.md §4.5).
- * A `WakeGuard` is `() => WakeGuardResult` and is evaluated inside a
- * `withCentralSync` block with nothing awaited between it and the spawn it
- * protects (`wakeRefusalFrom`'s three call sites); the lease is what keeps
- * this raw read out of an open driver transaction.
- */
+/** Stays SYNCHRONOUS: evaluated inside `withCentralSync` with nothing awaited before the spawn it protects. */
 function readSessionSync(sessionId: string): Session | undefined {
   return withRawDb((raw) => raw.prepare(SESSION_BY_ID_SQL).get(sessionId)) as Session | undefined;
 }
 
 /**
- * Evaluate a wake guard and normalize its answer.
- *
- * Called ONLY from inside a `withCentralSync` block. `evaluateGuardSync` is
- * the runtime half of the guard contract (§4.5 I-1): a guard that hands back a
- * promise — cast, or accidentally `async` — is a contract violation, not a
- * verdict, and it is reported as a refusal here so the caller's own refusal
- * paths (reservation release, storage-lease release) run exactly as for any
- * other "the guard did not say yes".
+ * Call ONLY inside `withCentralSync`. A guard that returns a promise, or throws, is reported as a refusal so the
+ * caller's refusal cleanup (reservation and storage-lease release) runs on one path.
  */
 function wakeRefusalFrom(guard: WakeGuard | undefined): string | null {
   if (!guard) return null;
@@ -766,19 +536,7 @@ function wakeRefusalFrom(guard: WakeGuard | undefined): string | null {
   try {
     verdict = evaluateGuardSync(guard);
   } catch (err) {
-    // A THROWN guard is a refusal, not an exception to propagate.
-    //
-    // `sessionStillActive` reads the central DB, and a DB read can throw —
-    // transient I/O, corruption, a closed handle. Propagating that from the
-    // dequeue took it out through `trackWake`'s generic catch, which resolves
-    // `false` and never releases the memory reservation the dequeue is holding:
-    // every RETURNED refusal on that path releases, a thrown one leaked a slot
-    // off the admission budget permanently. Normalizing here means there is one
-    // refusal shape and one set of cleanup paths, rather than a second exit
-    // nobody wired.
-    //
-    // Refusing is also the right answer on its own terms: a guard that cannot
-    // answer has not said yes.
+    // A thrown guard is a refusal: propagating it would skip the dequeue's memory-reservation release.
     return `guard threw: ${err instanceof Error ? err.message : String(err)}`;
   }
   if (verdict === true) return null;
@@ -836,12 +594,7 @@ function releaseMemoryReservation(sessionId: string): void {
 /**
  * Drop this session's admission entirely — reservation AND any queued request.
  *
- * `release` frees a reservation but leaves a QUEUED wake in the controller, and
- * a queued wake outlives the promise that created it: `wakeContainer` returns
- * false, `trackWake` settles, and the controller still holds the payload until
- * some later release drains it. Anything that concludes "this session has no
- * container and never will" has to say so to the controller too, or the wake it
- * thought it had cancelled starts minutes later.
+ * `release` alone leaves a QUEUED wake in the controller, which would start minutes later.
  */
 function cancelMemoryAdmission(sessionId: string): void {
   if (!memoryAdmission) return;
@@ -849,7 +602,6 @@ function cancelMemoryAdmission(sessionId: string): void {
   startDrained(memoryAdmission.cancel(sessionId));
 }
 
-/** Start whatever a release or cancel admitted in this session's place. */
 function startDrained(ready: QueuedWake[]): void {
   for (const queued of ready) {
     void startReservedWake(queued).catch((err) => {
@@ -867,17 +619,8 @@ export function isContainerRunning(sessionId: string): boolean {
 }
 
 /**
- * Which container is registered for this session RIGHT NOW.
- *
- * `isContainerRunning` answers "is there one", which is not enough for a
- * caller that decided something about a specific container and then awaited:
- * the original can exit and a wake can register a replacement in that window,
- * and the boolean reads the same either way. The name is unique per spawn
- * (`${prefix}${folder}-${Date.now()}`) and the claim incarnation moves with the
- * runtime, so the pair identifies the entry across a replacement.
- *
- * Compare with `sameContainerIdentity`, never by object identity: this is a
- * snapshot, not the registry entry.
+ * Which container is registered for this session RIGHT NOW (the name is unique per spawn; the incarnation moves
+ * with the runtime). Compare with `sameContainerIdentity`, never by object identity.
  */
 export interface ContainerIdentity {
   containerName: string;
@@ -901,23 +644,10 @@ export function isContainerSpawning(sessionId: string): boolean {
 }
 
 /**
- * Could a container be writing this session's `outbound.db` right now?
- *
- * `outbound.db` has exactly ONE writer. The host may write it only while no
- * container owns it, and "owns it" includes a container that is still
- * SPAWNING — a wake issued a moment ago has not reached `isContainerRunning`
- * yet but is about to hold the file.
- *
- * Lives here rather than in a caller because it is a question about the
- * container registry above, and it now has two callers on different paths:
- * the sweep's stopped-container writes and the thread-close finalizer's
- * archive-or-kill decision. Two copies of this predicate would be two
- * definitions of "owns", which is the drift the seam work exists to remove.
+ * `outbound.db` has ONE writer: the host may write it only while no container owns it, and a SPAWNING or
+ * pending-adoption container counts as owning it.
  */
 export function containerOwnsOutbound(sessionId: string): boolean {
-  // A pending adoption is a survivor this host could not claim: alive,
-  // untracked, and still writing. It owns the file until a runtime listing
-  // proves it gone (`retryPendingAdoption` clears the entry on that proof).
   return isContainerRunning(sessionId) || isContainerSpawning(sessionId) || pendingAdoptions.has(sessionId);
 }
 
@@ -926,40 +656,14 @@ export function getActiveContainerSessionIds(): string[] {
   return [...activeContainers.keys()];
 }
 
-/**
- * The sessions whose storage the maintenance worker must not touch: every
- * tracked container plus every pending adoption — a survivor this host could
- * not claim is alive, untracked, and still using its directories, and it holds
- * its storage-activity lease until a runtime re-list proves it gone.
- */
+/** Tracked containers plus pending adoptions: an unclaimed survivor is still using its directories. */
 export function getStorageProtectedSessionIds(): string[] {
   return [...new Set([...activeContainers.keys(), ...pendingAdoptions])];
 }
 
-// ── Workgroup reconciler ────────────────────────────────────────────────────
-//
-// Exported for unit testing. Production callers go through spawnContainer.
-
 /**
- * Reconcile workgroup membership at spawn time. Run on every container wake
- * so that workgroup_id in the DB reflects the operator's declared intent
- * from container.json — when that intent is present.
- *
- * Precedence:
- *   1. container.json.workgroup_id (operator intent — overrides everything)
- *   2. Existing DB value on agent_groups.workgroup_id (preserves migration 036
- *      pairings and prior spawn state)
- *   3. agentGroup.folder (default to workgroup-of-1 when nothing else is set)
- *
- * Critical: when container.json is silent (`workgroup_id` undefined), do NOT
- * overwrite the DB value with `agentGroup.folder`. Migration 036 pairs
- * existing `*-codex` siblings into their seed sibling's workgroup but the FS
- * reconciler does not back-fill `workgroup_id` into existing container.json
- * files. Treating "config silent" as "operator declared workgroup-of-1" would
- * sever every migrated pairing on first spawn after deploy. Operator silence
- * means "preserve whatever's there" — not "force own-folder."
- *
- * The workgroup row is created idempotently before agent_groups is updated.
+ * Precedence: container.json `workgroup_id`, then the existing DB value, then the folder. When container.json is
+ * silent, never overwrite the DB value with the folder: that would sever sibling pairings made by migration.
  */
 export async function reconcileWorkgroupAtSpawn(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
@@ -970,12 +674,7 @@ export async function reconcileWorkgroupAtSpawn(
   return persistResolvedWorkgroupAtSpawn(agentGroup, declared);
 }
 
-/**
- * Persist the exact workgroup identity already resolved at admission.
- *
- * One central transaction (`centralTransaction`, plan §4.4): two driver
- * statements, awaited in sequence, nothing else inside the closure.
- */
+/** One central transaction: two driver statements awaited in sequence, nothing else inside the closure. */
 export async function persistResolvedWorkgroupAtSpawn(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   declared: string,
@@ -993,7 +692,6 @@ export async function persistResolvedWorkgroupAtSpawn(
       new Date().toISOString(),
     );
 
-    // Atomic conditional update: only update if the column is NULL or stale.
     await db.run(
       `
       UPDATE agent_groups SET workgroup_id = ?
@@ -1005,16 +703,10 @@ export async function persistResolvedWorkgroupAtSpawn(
     );
   }, 'persistResolvedWorkgroupAtSpawn');
 
-  // Return the resolved workgroup id so spawnContainer can thread it
-  // through every downstream subsystem (buildMounts /workspace/workgroup
-  // mount, buildArchiveProjection, applyOnecliSecrets, etc.) without each
-  // re-deriving from agentGroups. Eliminates the race where two subsystems
-  // inside the same spawn observe different workgroup ids under a
-  // concurrent reconcile.
+  // Callers thread this id through every spawn subsystem so none re-derives it under a concurrent reconcile.
   return { workgroupId: declared };
 }
 
-/** Resolve the exact workgroup identity spawn reconciliation will persist. */
 export async function resolveWorkgroupIdAtSpawn(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
@@ -1028,23 +720,9 @@ export async function resolveWorkgroupIdAtSpawn(
 }
 
 /**
- * Re-read the session from the central DB and return it only while it is still
- * active. The wake path's status guard runs on the object the CALLER handed us,
- * but the path then awaits — storage admission, an unbounded wait in the memory
- * admission queue, the storage-activity lease — and a reclaim closes the row
- * (it never deletes it) at any point in that window. Spawning on a closed row
- * produces a container `getActiveSessions()` will never return: no stuck
- * detection, no heartbeat ceiling, no claim tolerance, for as long as it runs.
- *
- * So every await in the wake path is followed by this, and the fresh row — not
- * the caller's snapshot — is what continues. Callers keeping their own pre-wake
- * re-read are then belt-and-braces rather than load-bearing.
- *
- * Fail closed: a DB that cannot be read is treated as "do not spawn". The
- * inbound row stays pending and host-sweep retries on its next tick.
- *
- * Callers own the release of anything already held at their bail point — see
- * each call site; this helper deliberately holds and releases nothing.
+ * Re-read the session and return it only while still wakeable. Every await in the wake path is followed by this:
+ * a reclaim can close the row in any await window, and a container spawned on a closed row escapes stuck
+ * detection and the heartbeat ceiling. Fails closed. Holds and releases nothing; callers release what they hold.
  */
 async function refreshActiveSession(session: Session, stage: string): Promise<Session | null> {
   let fresh: Session | undefined;
@@ -1054,10 +732,7 @@ async function refreshActiveSession(session: Session, stage: string): Promise<Se
     log.warn('Container wake abandoned — session re-read failed', { sessionId: session.id, stage, err });
     return null;
   }
-  // Every wake passes through here, guarded or not — and MOST callers pass no
-  // guard: over twenty `wakeContainer` call sites hand in a session and nothing
-  // else. So this is the only place an archive-only closure can be refused for
-  // all of them, and it uses the same predicate the opt-in guard does.
+  // Most wakeContainer callers pass no guard, so this is the only place an archive-only close is refused for all.
   const reason = unwakeableReason(fresh);
   if (reason !== null) {
     log.warn('Container wake abandoned — session cannot take a wake', {
@@ -1073,16 +748,8 @@ async function refreshActiveSession(session: Session, stage: string): Promise<Se
 }
 
 /**
- * Wake up a container for a session. If already running or mid-spawn, no-op
- * (the in-flight wake promise is reused).
- *
- * The container runs the v2 agent-runner which polls the session DB.
- *
- * Contract: never throws. Returns `true` on successful spawn, `false` on
- * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
- * need to wrap — the inbound row stays pending and host-sweep retries on
- * its next tick. Callers that care (e.g. the router's typing indicator)
- * can branch on the boolean.
+ * No-op if already running or mid-spawn (the in-flight promise is reused). Never throws: `false` means a
+ * transient spawn failure; the inbound row stays pending and host-sweep retries.
  */
 export function wakeContainer(
   session: Session,
@@ -1093,10 +760,7 @@ export function wakeContainer(
     log.debug('Container wake ignored — host shutdown in progress', { sessionId: session.id });
     return Promise.resolve(false);
   }
-  // P4 (plan §4.3.4): a survivor of the previous host that this one could not
-  // claim at boot is alive and UNTRACKED, so the running fast path below cannot
-  // see it. Consulted first, and routed to the adoption retry — never to the
-  // spawn path, which would start a second container beside it.
+  // A pending adoption is an untracked live survivor: route to the adoption retry, never to a second spawn.
   const pendingAdoption = pendingAdoptions.has(session.id);
   if (!pendingAdoption && activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
@@ -1107,16 +771,7 @@ export function wakeContainer(
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  // Reclaim closes a session row (it never deletes it) and removes its dir, so
-  // every by-id caller — support threads, approvals, pending questions,
-  // dashboard steer, task completion — can still hand us an archived session.
-  // Spawning on one produces a container getActiveSessions() will never
-  // return: no stuck detection, no heartbeat ceiling, no claim tolerance, for
-  // as long as it runs. The inbound row stays pending for a live session.
-  // A fast path on the object the CALLER holds, which may be stale — the
-  // authority is `refreshActiveSession` after the first await. Same predicate,
-  // so the cheap answer and the authoritative one cannot disagree about what
-  // makes a session unwakeable.
+  // Fast path on the caller's possibly stale row; `refreshActiveSession` is the authority after the first await.
   const callerReason = unwakeableReason(session);
   if (callerReason !== null) {
     log.warn('Container wake refused — session cannot take a wake', {
@@ -1130,24 +785,18 @@ export function wakeContainer(
   return trackWake(session.id, async () => {
     if (pendingAdoption) {
       if (await retryPendingAdoption(session)) return true;
-      // The survivor is gone: a fresh spawn is the correct answer, and the
-      // ordinary path below takes it — the claim fence (P2) re-proves absence
-      // on its own before the process exists.
+      // Survivor gone: spawn normally; the claim fence (P2) re-proves absence.
     }
     return runWake(session, priority, options);
   });
 }
 
-/** The ordinary wake: storage admission → memory admission → reserved spawn. */
 async function runWake(
   session: Session,
   priority: MemoryAdmissionPriority,
   options: WakeContainerOptions,
 ): Promise<boolean> {
   if (!(await checkStorageAdmission(session, false))) return false;
-  // First await behind us. Nothing is held yet — storage admission takes no
-  // lease and the memory request has not been made — so this bail releases
-  // nothing. Everything below runs on the fresh row.
   const admitted = await refreshActiveSession(session, 'storage-admission');
   if (!admitted) return false;
 
@@ -1172,12 +821,8 @@ async function runWake(
     return false;
   }
 
-  // Priority is part of the atomic admission decision. A task-only wake must
-  // never enter as interactive and be demoted afterward: it could otherwise
-  // reserve free memory and bypass an older scheduled head before demotion.
-  // The queued payload is what startReservedWake later resumes on, so it must
-  // be the fresh row — not the caller's snapshot — even though that row is
-  // itself re-read again at dequeue.
+  // Priority is part of the atomic admission decision: a task wake entering as interactive could bypass an older
+  // scheduled head before demotion. Queue the fresh row, not the caller's snapshot.
   const decision = admission.request(
     admitted.id,
     effectiveResources.memory.requestMb,
@@ -1209,12 +854,7 @@ async function runWake(
   return spawnReservedContainer(admitted, options.guard);
 }
 
-/**
- * Temporary operator-controlled fence for controlled fleet canaries. When the
- * variable is absent every workgroup is admitted. When present, only exact,
- * comma-separated workgroup ids are admitted; an empty value deliberately
- * blocks all spawns. Inbound rows remain pending for a later ungated wake.
- */
+/** Operator canary fence: unset admits all; set admits only exact comma-separated ids; empty blocks all spawns. */
 export function isContainerSpawnWorkgroupAllowed(
   workgroupId: string,
   rawAllowlist = process.env.NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST,
@@ -1231,8 +871,7 @@ export function isContainerSpawnWorkgroupAllowed(
 
 function startReservedWake(queued: QueuedWake): Promise<boolean> {
   const { session, guard } = queued;
-  // The second running fast path, and P4 sits in front of it too: a queued
-  // wake for a pending adoption must not spend its reservation on a spawn.
+  // A queued wake for a pending adoption must not spend its reservation on a spawn.
   if (pendingAdoptions.has(session.id)) {
     releaseMemoryReservation(session.id);
     return wakeContainer(session, 'interactive', { guard });
@@ -1242,20 +881,14 @@ function startReservedWake(queued: QueuedWake): Promise<boolean> {
   if (existing) return existing;
 
   return trackWake(session.id, async () => {
-    // Dequeued from the memory-admission queue holding a reservation, carrying
-    // the session object captured when the wake was first queued — which can be
-    // an arbitrarily long wait. Re-read before spending the slot, and release
-    // the reservation on a bail so the next queued session can take it.
+    // The queue wait is unbounded: re-read before spending the slot, and release the reservation on a bail.
     const dequeued = await refreshActiveSession(session, 'memory-admission-dequeue');
     if (!dequeued) {
       releaseMemoryReservation(session.id);
       return false;
     }
-    // The caller's own precondition, asked at the dequeue too. The queue wait
-    // is unbounded, and the session row being active again says nothing about
-    // whether the caller still wants this wake — a thread the operator closed
-    // while it queued, a destination revoked, a task cancelled. Under the
-    // lease: the guard's reads are raw (§4.5 I-1).
+    // The caller's guard too: the row being active says nothing about whether the caller still wants the wake.
+    // Under the lease: the guard's reads are raw.
     const dequeueRefusal = await withCentralSync(() => wakeRefusalFrom(guard), 'wake guard at dequeue');
     if (dequeueRefusal !== null) {
       log.warn('Queued container wake refused by its guard at the dequeue', {
@@ -1279,10 +912,7 @@ function startReservedWake(queued: QueuedWake): Promise<boolean> {
 }
 
 function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<boolean> {
-  // Read at the START of this wake, which is what makes the discharge below
-  // safe: `wakeContainer` hands a caller the EXISTING promise when one is in
-  // flight, so a joined wake never reaches here and carries the original
-  // wake's token rather than earning a fresh one.
+  // Read at wake START: a joined wake gets the existing promise and never reaches here.
   const respawnToken = respawnIntents.get(sessionId);
   const tracked = run()
     .catch((err) => {
@@ -1290,10 +920,7 @@ function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<bool
       return false;
     })
     .then((woke) => {
-      // The one place every wake ends, which is why the discharge sits here
-      // rather than in each respawning caller's callback: those are all
-      // fire-and-forget `void wakeContainer(...)`, so the callback resolving
-      // says nothing about whether a container actually came back.
+      // Discharge here, where every wake ends: callers' fire-and-forget `wakeContainer` calls never observe success.
       if (woke) clearRespawnIntentOnWake(sessionId, respawnToken);
       return woke;
     })
@@ -1330,8 +957,7 @@ async function checkStorageAdmission(session: Session, queued: boolean): Promise
     );
     return false;
   } catch (err) {
-    // Fail closed: if pressure cannot be checked, leave the inbound row pending
-    // for the next sweep instead of spawning into potentially exhausted disk.
+    // Fail closed: leave the row pending rather than spawn into possibly exhausted disk.
     log.warn('Container wake deferred — background storage admission failed', {
       sessionId: session.id,
       queued,
@@ -1343,9 +969,7 @@ async function checkStorageAdmission(session: Session, queued: boolean): Promise
 
 async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promise<boolean> {
   if (containerShutdownInProgress) return false;
-  // Entry re-read. Reached both straight off an admitted request and as the
-  // memory-queue dequeue continuation; either way a reservation is held by now,
-  // so a bail here must give it back.
+  // A reservation is held by now, so a bail must release it.
   const session = await refreshActiveSession(caller, 'reserved-spawn');
   if (!session) {
     releaseMemoryReservation(caller.id);
@@ -1363,8 +987,7 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
   let spawnContainerConfig: ContainerConfig;
   let spawnWorkgroupId: string;
   try {
-    // Read once at the actual spawn boundary. The same snapshot supplies the
-    // authoritative workgroup declaration and every downstream spawn option.
+    // Read once at the spawn boundary; this snapshot supplies the workgroup and every spawn option.
     spawnContainerConfig = readContainerConfigForSpawn(
       spawnAgentGroup.folder,
       process.env.NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST !== undefined,
@@ -1392,13 +1015,9 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
     return false;
   }
   const activeCount = activeContainers.size;
-  // Storage-admission promises are tracked for dedupe but are not consuming a
-  // container slot. Count spawning sessions only until their process enters
-  // activeContainers; the brief async handoff must not double-count one
-  // process and incorrectly reject another wake at the cap.
+  // Count spawning sessions only until they enter activeContainers, or one process is double-counted at the cap.
   const inFlightWakes = [...spawningSessions].filter((sessionId) => !activeContainers.has(sessionId)).length;
-  // A pending survivor is a container this host did not admit but which is
-  // running all the same: it occupies a slot.
+  // A pending survivor occupies a slot.
   const pendingSurvivors = pendingAdoptions.size;
   if (MAX_CONCURRENT_CONTAINERS > 0 && activeCount + inFlightWakes + pendingSurvivors >= MAX_CONCURRENT_CONTAINERS) {
     log.warn('Container wake deferred — concurrency cap reached', {
@@ -1416,27 +1035,16 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
   let storageActivity: StorageActivityLease | null = null;
   try {
     storageActivity = await acquireContainerStorageActivity(session, spawnWorkgroupId);
-    // Last re-read, after the final await and immediately before the actual
-    // spawn. Two things are held here: the storage-activity lease, which the
-    // `finally` below releases because `storageActivity` is still non-null, and
-    // the memory reservation, which is ours to hand back explicitly.
+    // Last re-read before spawn. The `finally` releases the storage lease; the memory reservation is ours to release.
     const spawnSession = await refreshActiveSession(session, 'pre-spawn');
     if (!spawnSession) {
       releaseMemoryReservation(session.id);
       return false;
     }
-    // Asked here as well as at the last word before `docker run`, and asked
-    // BEFORE `spawnContainer` does its preparation: that builds mounts, writes
-    // a capabilities snapshot and clears the heartbeat file. A session someone
-    // has already asked us to kill should not do that work at all, let alone
-    // leave its traces on disk.
+    // Asked before `spawnContainer` prepares mounts, snapshots and the heartbeat file, and again before `docker run`.
     const earlyCancellation = pendingKillCancellation(spawnSession.id);
     if (earlyCancellation) throw earlyCancellation;
-    // The caller's own precondition, asked here for the same reason and again
-    // as the last word before `spawn()`. `spawnContainer` builds mounts, writes
-    // a capabilities snapshot and clears the heartbeat file; a wake whose
-    // caller no longer wants it should not do that work or leave its traces.
-    // Under the lease: the guard's reads are raw (§4.5 I-1).
+    // Same for the caller's guard. Under the lease: the guard's reads are raw.
     const earlyGuardRefusal = await withCentralSync(() => wakeRefusalFrom(guard), 'wake guard before preparation');
     if (earlyGuardRefusal !== null) {
       throw new Error(`Container spawn refused by its guard: ${earlyGuardRefusal}`);
@@ -1496,12 +1104,8 @@ export async function resolveSessionRepositoryWorkUnit(
 }
 
 export function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
-  // Checked before anything below writes into this .git. A `commondir` file
-  // sends Git to another repository's refs and objects, so the canonical
-  // carries a self-referential sentinel, bind-mounted read-only over its own
-  // path like the object-alternates placeholders below. An existing canonical
-  // gets it at its next spawn. Anything else found there is never overwritten:
-  // the caller withholds this repository's mounts and logs it.
+  // A foreign `commondir` would send Git to another repository's refs and objects, so the canonical carries a
+  // read-only self-referential sentinel; anything else found there is never overwritten (mounts are withheld).
   const commondir = canonicalCommondirPath(gitDir);
   const commondirState = ensureCanonicalCommondirSentinel(gitDir);
   if (commondirState !== 'sentinel') throw new ForeignCanonicalCommondirError(commondir, commondirState);
@@ -1520,9 +1124,8 @@ export function canonicalGitControlMounts(gitDir: string, stateDir: string): Vol
     if (indexStat.isSymbolicLink() || !indexStat.isFile()) throw new Error(`Unsafe canonical Git index: ${index}`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    // An unborn/just-initialized normal clone can legitimately lack an index.
-    // Bind a host-owned empty placeholder over the container path so the RW
-    // parent mount cannot be used to create the canonical main-worktree index.
+    // A fresh clone can lack an index: bind a host-owned empty placeholder so the RW parent mount cannot be used
+    // to create the canonical main-worktree index.
     indexSource = path.join(stateDir, 'canonical-index-unavailable');
     fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     try {
@@ -1563,7 +1166,7 @@ export function canonicalGitControlMounts(gitDir: string, stateDir: string): Vol
   ];
 }
 
-/** Module-lifetime (one boot) dedup so a repository whose hooks decision degrades doesn't alert on every spawn — see resolveScanPolicyHooksMount's doc comment. Keyed by gitDir, which is unique per canonical repository. */
+/** One alert per repository per boot. */
 const scanPolicyHooksAlerted = new Set<string>();
 
 function alertScanPolicyHooksOnce(repository: { gitDir: string }, outcome: 'refuse' | 'withhold'): void {
@@ -1571,43 +1174,23 @@ function alertScanPolicyHooksOnce(repository: { gitDir: string }, outcome: 'refu
   scanPolicyHooksAlerted.add(repository.gitDir);
   log.error('managed-git-hooks: scan-policy repository degraded below the real hook', {
     outcome,
-    // gitDir DOES contain the workgroup id and repo name as path segments
-    // — this is a host log line, not the count-only report
-    // migrateExistingCanonicalHooksPath returns to callers, so it is fine
-    // for it to be more specific.
     gitDir: repository.gitDir,
   });
 }
 
 export interface ScanPolicyHooksMountResult {
   /**
-   * true only when even the refuse hook failed validation — the caller MUST
-   * withhold every mount for this repository (gitDir, control mounts, lock,
-   * origin pin), following the transfer-tombstone `continue` precedent
-   * above, so git in that worktree fails outright rather than running with
-   * no hook at all. `mounts` is always empty when this is true.
+   * true when even the refuse hook failed validation: the caller MUST withhold every mount for this repository,
+   * so git fails outright rather than running with no hook. `mounts` is then empty.
    */
   withhold: boolean;
-  /** The managed-hooks mount to add for this repository — empty when the repo isn't scan-policy-configured at all, or `withhold` is true. */
   mounts: VolumeMount[];
 }
 
 /**
- * Resolves a canonical repository's `core.hooksPath` against
- * MANAGED_GIT_HOOKS_SCAN_DIR (the ONE value every writer uses — B12) and,
- * only for repositories actually configured that way, runs
- * decideHooksMountStrategy's scan -> refuse -> withhold fallback (see its
- * own doc comment in src/managed-git-hooks.ts for the full ordering
- * rationale). `core.hooksPath` IS the signal read here — this does not
- * re-derive "is this repo scan-policy" from the repo name; it reads
- * whatever value is already committed in the repo's own .git/config.
- *
- * Never throws for a degraded outcome: 'refuse' returns a mount (at the
- * SAME container path the real hook would use, so git still finds a hook
- * and still runs it — the refuse hook itself), and 'withhold' returns
- * `{ withhold: true }` for the caller to act on. Alerts (once per boot per
- * repository, via alertScanPolicyHooksOnce above) on both degraded
- * outcomes; the 'scan' (real hook) outcome is silent.
+ * Only for repositories whose committed `core.hooksPath` is MANAGED_GIT_HOOKS_SCAN_DIR: runs the scan -> refuse ->
+ * withhold fallback (`decideHooksMountStrategy`). Never throws for a degraded outcome; the refuse hook mounts at
+ * the same container path as the real one. Degraded outcomes alert once per boot.
  */
 export function resolveScanPolicyHooksMount(repository: { gitDir: string }): ScanPolicyHooksMountResult {
   const configuredHooksPath = safeGitConfigGet(repositoryConfigPath(repository.gitDir), 'core.hooksPath');
@@ -1640,9 +1223,6 @@ async function spawnContainer(
 ): Promise<void> {
   const wikiActor = wikiEnrollment(agentGroup.id, containerConfig.wikiMaintenance === true);
   if (wikiActor) assertWikiActorConfig(containerConfig, wikiActor, admittedWorkgroupId);
-  // Refresh the destination map and current-thread routing so any admin
-  // changes take effect on wake. Destinations come from the agent-to-agent
-  // module — skip when the module isn't installed (table absent).
   const routingWritesStartedAt = Date.now();
   if (await hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
@@ -1651,27 +1231,16 @@ async function spawnContainer(
   await writeSessionRouting(agentGroup.id, session.id);
   logSpawnStage('routing-writes', routingWritesStartedAt);
 
-  // Materialize the runner's immutable startup context before buildMounts
-  // pushes its bind mount. The SQLite mailbox has no context to hand over, so
-  // the file holds `null` — it exists so the spawn path stops diverging from
-  // upstream's, and so an implementation that DOES need one (a networked
-  // mailbox, say) is a registration away rather than a spawn-path change.
+  // Written before buildMounts pushes its bind mount. The SQLite mailbox has no context, so the file holds `null`.
   const mailboxKey = { agentGroupId: agentGroup.id, sessionId: session.id };
   const mailbox = getAgentMailbox();
   writeSessionContext(agentGroup.id, session.id, await mailbox.runnerContext(mailboxKey));
   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
 
-  // The config was read once at the reserved-spawn boundary and is threaded
-  // through workgroup reconciliation, provider resolution, mounts, and args.
   const effectiveResources = resolveContainerResources(containerConfig.resources);
 
-  // Refuse spawn if the agent-runner deps (package.json + bun.lock) on disk
-  // don't match what's baked into the image we'd spawn from. Source is
-  // bind-mounted live but node_modules is image-baked — adding a dep +
-  // import without ./container/build.sh crash-loops every spawn with no
-  // surfaced error. Passes the resolved imageTag (per-agent override or the
-  // shared base) so derived images built via install_packages are checked
-  // against their own label, not the base's. See src/agent-runner-image-check.ts.
+  // node_modules is image-baked while source is bind-mounted live: a dep added without an image rebuild
+  // crash-loops every spawn. Checked against the image actually spawned (a per-agent image carries its own label).
   const spawnImageRef = containerConfig.imageTag || CONTAINER_IMAGE;
   const depsDriftStartedAt = Date.now();
   const depsCheck = await checkAgentRunnerDepsDrift(spawnImageRef);
@@ -1689,30 +1258,17 @@ async function spawnContainer(
       retried: depsCheck.retried,
       message: depsCheck.message,
     });
-    // Fire-and-forget: only the shared base image is something this watcher
-    // can fix by rebuilding (a per-agent override image built via
-    // install_packages needs that self-mod re-run, not a base rebuild — see
-    // rebuildHint() in agent-runner-image-check.ts). Never awaited — the
-    // refusal below must return immediately; host-sweep retries the spawn
-    // and picks up the new image once the detached rebuild lands.
+    // Only the shared base image is fixable by a rebuild (a per-agent image needs its self-mod re-run). Never
+    // awaited: refuse now; host-sweep retries once the detached rebuild lands.
     if (spawnImageRef === CONTAINER_IMAGE) requestContainerRebuild(depsCheck.message);
     throw new Error(depsCheck.message);
   }
 
-  // Ensure container.json has the agent group identity fields the runner needs.
-  // Written at spawn time so the runner can read them from the RO mount.
+  // Written at spawn so the runner can read the identity fields from the RO mount.
   await ensureRuntimeFields(containerConfig, agentGroup);
 
-  // Workgroup reconciliation — runs at every spawn.
-  // Keeps agent_groups.workgroup_id and workgroups rows in sync with the
-  // operator's container.json.workgroup_id declaration. Idempotent and fast
-  // (two indexed DB ops inside a transaction). Fail-closed: if the central DB
-  // is unavailable the exception propagates up through spawnContainer and the
-  // caller retries on the next sweep tick.
-  //
-  // The returned workgroupId is threaded through buildMounts and other
-  // downstream subsystems so they don't each re-derive from agentGroups,
-  // which would race against any concurrent reconcile.
+  // Fail-closed: a central-DB error propagates and the sweep retries. The returned id is threaded downstream so no
+  // subsystem re-derives it under a concurrent reconcile.
   const workgroupPersistStartedAt = Date.now();
   const { workgroupId: resolvedWgId } = await persistResolvedWorkgroupAtSpawn(agentGroup, admittedWorkgroupId);
   logSpawnStage('workgroup-persist', workgroupPersistStartedAt);
@@ -1724,24 +1280,10 @@ async function spawnContainer(
   if (isRepositoryLifecycleClaimed(repositoryWorkUnit)) {
     throw new Error(`Repository lifecycle transition in progress for ${repositoryWorkUnit.key}; spawn will retry`);
   }
-  // The in-memory claims above close ordinary concurrent spawn admission. The
-  // per-session DB fence survives a host crash, so it is the recovery gate for
-  // a publication/transfer that died after quiescence began. A replay with the
-  // same deterministic action epoch releases it at the durable boundary.
-  // Read-only, through the seam: a spawn must never provision a mailbox here
-  // (invariant I-4). The session is closed before the read's verdict is acted
-  // on, so nothing downstream of this spawn is inside a mailbox session for
-  // this key (invariant I-3).
-  //
-  // The result is wrapped so "no mailbox" and "no fence" stay distinguishable:
-  // the seam answers `undefined` for the first and `{ fence: null }` for the
-  // second, and reading them as the same thing would let a spawn through for a
-  // session whose inbound.db has been reclaimed. That fails closed on purpose —
-  // a container with no mailbox to poll could otherwise recreate the host-owned
-  // database under the writable parent mount. The direct open this replaced
-  // threw for exactly this state. `buildMounts` refuses such a spawn
-  // outright rather than omitting the overlay, so this is now the first of two
-  // fail-closed checks rather than the only one.
+  // The per-session DB fence survives a host crash, so it gates recovery of a publication/transfer that died
+  // mid-quiescence. Read-only through the seam: a spawn must never provision a mailbox. The wrapper keeps "no
+  // mailbox" (`undefined`) distinct from "no fence" (`{ fence: null }`): conflating them would admit a spawn whose
+  // inbound.db was reclaimed, and the container could recreate the host-owned DB under its writable mount.
   const repositoryFenceRead = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => ({
     fence: mailbox.readRepoIngressFence(),
   }));
@@ -1765,17 +1307,9 @@ async function spawnContainer(
     );
   }
 
-  // Per-group filesystem state lives forever after first creation. Init is
-  // idempotent: it only writes paths that don't already exist, so this call
-  // is a no-op for groups that have spawned before. Runs before the provider
-  // contribution so a surfaces-providing provider finds the group dir ready.
-  // Spawn-time provider fallback: if the primary provider is inside a
-  // recorded unavailability window (exhausted account) and the group declares
-  // a fallback, run the fallback instead of waking a container that can only
-  // fail. Applied AFTER normal resolution because `session.agent_provider`
-  // outranks container.json — and mirrored onto the config + a synthetic
-  // session so every downstream consumer (mounts, credentials, instruction
-  // composition, worker roster) agrees on one provider.
+  // Spawn-time provider fallback: a primary inside a recorded outage window runs the declared fallback instead.
+  // Applied after normal resolution because `session.agent_provider` outranks container.json, and mirrored onto
+  // the config and a synthetic session so every downstream consumer agrees on one provider.
   logSpawnStage('repository-fence', repositoryFenceStartedAt);
 
   const providerDecisionStartedAt = Date.now();
@@ -1785,11 +1319,7 @@ async function spawnContainer(
     containerConfig,
   });
   if (providerDecision.fallbackApplied) {
-    // Assign unconditionally. A fallback that declares no model wants the new
-    // provider's own default, NOT any model/effort layer belonging to the
-    // primary. The helper drops legacy defaultModel/defaultEffort as well as
-    // top-level fields; otherwise they can leak through the target provider's
-    // normal spawn path (see parseRawConfig in the agent-runner).
+    // Assign unconditionally: a fallback with no model wants its provider's default, never the primary's model/effort.
     applyProviderFallbackRuntime(containerConfig, providerDecision);
     log.warn('Provider fallback engaged — primary is in a recorded outage window', {
       sessionId: session.id,
@@ -1800,10 +1330,7 @@ async function spawnContainer(
     });
   }
   if (!providerDecision.fallbackApplied) {
-    // The window (if any) has expired and we are giving the primary another
-    // go: close out that outage episode. Without this the failure streak
-    // grows monotonically forever, so a provider healthy for weeks would
-    // still open its next outage at the 6h backoff cap instead of 15m.
+    // Close the outage episode, or the failure streak grows forever and the next outage opens at the 6h backoff cap.
     await markProviderAvailable(agentGroup.id, providerDecision.primaryProvider);
   }
   // Local shadow: the fallback must beat a stamped session row for THIS spawn
@@ -1819,24 +1346,16 @@ async function spawnContainer(
   initGroupFilesystem({ ...agentGroup, workgroup_id: resolvedWgId }, { provider: providerName });
   logSpawnStage('group-filesystem-init', groupFilesystemStartedAt);
 
-  // Resolve the effective provider + any host-side contribution it declares
-  // (extra mounts, env passthrough). Computed once and threaded through both
-  // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
+  // Computed once and threaded through buildMounts and buildContainerArgs so its side effects fire once.
   const { provider, contribution } = await resolveProviderContribution(spawnSession, agentGroup, containerConfig);
 
-  // Wraps every stage logged inside buildMounts, so the sum of the parts can
-  // be checked against the whole rather than assumed to account for it.
   const buildMountsStartedAt = Date.now();
   const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
   logSpawnStage('build-mounts', buildMountsStartedAt);
   const containerName = `${CONTAINER_NAME_PREFIX}${agentGroup.folder}-${Date.now()}`;
-  // OneCLI agent identifier is always the agent group id — stable across
-  // sessions and reversible via getAgentGroup() for approval routing.
+  // Stable across sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  // Resolve per-channel (messaging_group_agents) default_model / default_effort
-  // so buildContainerArgs can apply them ABOVE the per-agent container.json
-  // defaults. Null/missing falls through. Agent-spawned sessions without a
-  // messaging_group (e.g. pure agent-to-agent) skip this lookup.
+  // Per-wiring defaults outrank container.json; sessions with no messaging group skip the lookup.
   let channelDefaultModel: string | null = null;
   let channelDefaultEffort: string | null = null;
   let channelDefaultTone: string | null = null;
@@ -1852,10 +1371,8 @@ async function spawnContainer(
     }
   }
 
-  // Identical to session.messaging_group_id for chat sessions; for a task
-  // session (which has none by construction) this resolves the series'
-  // delivery destination so the gate judges WHERE THE TASK POSTS instead of
-  // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
+  // For a task session (no messaging group) this is the series' delivery destination, so the Slack gate judges
+  // where the task posts instead of failing closed on null.
   const { resolveSlackSafetyMessagingGroupId } = await import('./modules/permissions/task-slack-subject.js');
   const slackSafetyMessagingGroupId = await resolveSlackSafetyMessagingGroupId(session);
 
@@ -1883,70 +1400,28 @@ async function spawnContainer(
     mailboxEnvironment,
   );
 
-  // Build args intentionally accumulate credentials late, after provider and
-  // gateway resolution. Passing those values as `docker run -e KEY=value`
-  // exposes them to any host process reader via the Docker CLI command line.
-  // Keep the value-bearing surface in a 0600 host-only file instead; Docker
-  // receives only that pathname. It is removed when the CLI process exits.
-  // The per-agent `.context` directory is host-private: only this session's
-  // individual context FILE is mounted into the container. Do not use
-  // `<session>/.host`: its whole directory is mounted read-only at
-  // `/workspace/.host`, which would make an otherwise mode-0600 env file
-  // readable by the agent process.
+  // Credentials go in a 0600 host-only env file, never `docker run -e KEY=value` (visible to any host process on
+  // the command line). It lives in the host-private `.context` dir, never `<session>/.host`, which is mounted
+  // read-only into the container.
   const dockerEnvironmentDir = path.dirname(sessionContextPath(agentGroup.id, session.id));
 
-  // Snapshot host capabilities into the session dir so the container can
-  // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
-  // credentials / plugins / channel registrations appear immediately.
-  // Deliberately AFTER buildContainerArgs: that call resolves the GitHub
-  // token (minting/refreshing the App cache), and the snapshot's expiresAt
-  // field must describe the credential THIS spawn actually injects — writing
-  // it earlier surfaced the pre-spawn cache state instead (stale-low or
-  // absent on cold start). Subject for the Slack owner-safety gate. Identical
-  // to session.messaging_group_id for chat sessions; for a task session
-  // (which has none by construction) this resolves the series' delivery
-  // destination so the gate judges WHERE THE TASK POSTS instead of
-  // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
+  // Deliberately AFTER buildContainerArgs: that resolves the GitHub token, and the snapshot's expiresAt must
+  // describe the credential this spawn injects.
   if (!wikiActor) await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId, resolvedWgId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
-  // THE CROSS-PROCESS SPAWN FENCE. Winning the claim is what licenses touching
-  // this session's runtime state — the heartbeat clear immediately below
-  // included. Losing it means another live claimant runs this session: abort,
-  // and `trackWake` turns the throw into `false` so the sweep re-checks next
-  // tick. A failed write throws for the same reason; a claim that cannot be
-  // recorded is a claim not held.
-  //
-  // This is also the LAST `await` in the spawn path. Everything from here to
-  // `spawn()` is synchronous, so the guard point below and the process creation
-  // stay adjacent — the contract the comment block there states and seam 3
-  // §4.5 I-1 pins.
+  // THE CROSS-PROCESS SPAWN FENCE: winning the claim licenses touching this session's runtime state (the heartbeat
+  // clear below included). This is the LAST `await` before the spawn; everything after it is synchronous.
   const claimIncarnation = await claimSessionRun(session.id, containerName);
   if (claimIncarnation === null) {
     throw new Error(`session ${session.id} is claimed by another live host process — not spawning a duplicate`);
   }
 
-  // THE GUARD POINT, and the spawn, in ONE synchronous block under the central
-  // lease (`withCentralSync`, plan §4.5 I-1). Everything above the claim
-  // awaits — routing writes, the mailbox context, the dependency check, mount
-  // construction, argument construction — and the caller's precondition was
-  // last proved before all of it. This is the only place in the wake path
-  // where "still true?" and "the process now exists" are adjacent, so this is
-  // where the question belongs; the lease is what makes the guard's raw read
-  // and the `spawn()` one indivisible turn that no driver transaction can
-  // interleave. `src/db/central-lease.test.ts` pins that no `await` sits
-  // between `evaluateGuardSync` and `spawn(` inside this block. The lease
-  // acquire is the one await after the claim, and both questions below are
-  // asked after it.
-  //
-  // The LAST word before the process exists, likewise inside the block: a
-  // kill request landing in any earlier window is seen here even though the
-  // check at the reserved spawn boundary already passed. Nothing awaits
-  // between the check and `activeContainers.set`, so a request either loses to
-  // this whole block and is honoured here, or arrives after registration and
-  // takes the ordinary running-container path. `trackWake` settles it either
-  // way.
+  // THE GUARD POINT and the spawn, in ONE synchronous block under the central lease: the only place where "still
+  // true?" and "the process now exists" are adjacent, and a test pins that nothing is awaited between them.
+  // Pending kills are checked here too; nothing awaits between that check and registration, so a kill either
+  // lands here or takes the running-container path.
   let channel: SupervisionChannel;
   let dockerEnvironmentFile: string | null = null;
   const stderrTail: string[] = [];
@@ -1961,15 +1436,11 @@ async function spawnContainer(
   };
   try {
     await withCentralSync(() => {
-      // Clear any orphan heartbeat from a previous container instance — the
-      // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
-      // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
-      // immediate kill before the new container touches the file itself.
+      // Clear any orphan heartbeat: its stale mtime could trigger an immediate ceiling kill before the new
+      // container touches the file.
       fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-      // Admission and container preparation are asynchronous. Shutdown may begin
-      // after wakeContainer's entry check but before the process exists; refuse
-      // that late spawn so stopAllContainers cannot miss it in its snapshot.
+      // Shutdown may have begun during async preparation; refuse so stopAllContainers cannot miss this spawn.
       if (containerShutdownInProgress) {
         throw new Error('Container spawn cancelled because host shutdown is in progress');
       }
@@ -1995,30 +1466,16 @@ async function spawnContainer(
         claimIncarnation,
       });
 
-      // Every child listener is attached HERE, in the same synchronous turn as
-      // `spawn()`, before the block returns. A runtime that
-      // cannot launch (ENOENT, EACCES) emits `error` from a `process.nextTick`
-      // queued inside `spawn()`; whether the continuation of the `await`
-      // around this block runs before that tick is a scheduler detail
-      // (Node ≥ 11 drains microtasks first, so today it does), and an `error`
-      // with no listener is an uncaught exception that takes the host down.
-      // Attaching inside the block makes the guarantee structural: the
-      // listeners exist before anything queued by `spawn()` can run.
-      // `src/session-claim-spawn.test.ts` pins it with a child whose `error`
-      // fires from a microtask.
+      // Every child listener is attached HERE, in the same synchronous turn as the spawn: a runtime that cannot
+      // launch emits `error` from a nextTick queued inside it, and an `error` with no listener crashes the host.
 
-      // Log stderr. A container that dies at boot (unknown provider, missing
-      // binary, bad config) explains itself only here — and debug is below the
-      // default log level — so keep a tail to surface on a non-zero exit.
+      // Keep a stderr tail for a non-zero exit: a container that dies at boot explains itself only here.
       captureContainerStderr(child.stderr, containerName, stderrTail);
 
       // stdout is unused in v2 (all IO is via session DB)
       child.stdout?.on('data', () => {});
 
-      // No host-side idle timeout. Stale/stuck detection is driven by the host
-      // sweep reading heartbeat mtime + processing_ack claim age + container_state
-      // (see src/host-sweep.ts). This avoids killing long-running legitimate work
-      // on a wall-clock timer.
+      // No host-side idle timeout: stuck detection is host-sweep's (heartbeat mtime, claim age, container_state).
 
       child.on('close', (code) => {
         finalizeContainer();
@@ -2033,9 +1490,7 @@ async function spawnContainer(
             stderrTail,
           });
         } else if (hostStopped) {
-          // A host stop exits 143 (SIGTERM) by design; logging it as non-zero
-          // makes the health sentinel's crash-loop vital fire on every
-          // short-interval scheduled task the reaper stops.
+          // A host stop exits 143 by design; logging it as non-zero would fire the crash-loop vital on every reap.
           log.info('Container stopped by host', { sessionId: session.id, code, containerName });
         } else if (code !== 0 && code !== null && stderrTail.length > 0) {
           log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
@@ -2052,35 +1507,19 @@ async function spawnContainer(
   } catch (err) {
     removeDockerEnvironmentFile(dockerEnvironmentFile);
     dockerEnvironmentFile = null;
-    // Every refusal in the block above happens with the claim already held and
-    // no process to release it: hand it back here, or the next legitimate wake
-    // for this session is fenced out by a spawn that never happened. This
-    // `await` is unreachable from the path that reaches `spawn()`.
+    // Refusals above hold the claim with no process to release it: release here, or the next wake is fenced out.
     await releaseClaimQuietly(session.id, claimIncarnation);
     throw err;
   }
-  // Every handler was registered inside the lease block above; only now may
-  // this function yield. The `running` status write is awaited AFTER the exit
-  // handlers exist: with a delayed driver a container that dies at boot would
-  // otherwise emit close/error while the write is pending, before
-  // finalizeContainer and the kill callbacks exist.
+  // Only now may this function yield: the `running` write is awaited after the exit handlers exist, so a
+  // container dying at boot cannot emit close/error before they do.
   await markContainerRunning(session.id);
 }
 
 /**
- * The one terminal for a tracked container, whichever channel observed it.
- *
- * Lifted out of `spawnContainer` so an adopted entry — which has no spawn
- * closure — finalizes through the same code. The identity fence is exactly as
- * strong as the closure's was: `active.channel === channel` compares the same
- * object the caller registered, which is what `active.process === container`
- * compared before. A late event from a runtime the registry has already
- * replaced deletes nothing and releases nothing shared.
- *
- * Synchronous by requirement: it runs from `close`/`error` handlers. The
- * durable writes are one detached tail (`finishSessionBookkeeping`), fenced on
- * the session claim so a peer host that took the session at N+1 is never
- * overwritten by this host's stale finish.
+ * The one terminal for a tracked container, whichever channel observed it. The identity fence
+ * (`active.channel === channel`) makes a late event from a replaced runtime delete and release nothing shared.
+ * Synchronous (runs from `close`/`error` handlers); durable writes are a detached, claim-fenced tail.
  */
 export function finalizeSession(
   sessionId: string,
@@ -2091,17 +1530,14 @@ export function finalizeSession(
   const active = activeContainers.get(sessionId);
   if (active?.channel === channel) {
     activeContainers.delete(sessionId);
-    // An adopted entry holds no lease: this host did not spawn the container
-    // and acquiring one at adoption would double-count the session against the
-    // storage admission controller.
+    // An adopted entry holds no storage lease (acquiring one would double-count the session).
     if (active.storageActivity) {
       void active.storageActivity.release().catch((err) => {
         log.warn('Failed to release container storage activity lease', { sessionId, err });
       });
     }
     releaseMemoryReservation(sessionId);
-    // Exit handlers are synchronous; the status write is fire-and-forget here
-    // exactly as it was before the driver went async, with its failure logged.
+    // Exit handlers are synchronous, so the status write is fire-and-forget.
     void finishSessionBookkeeping(sessionId, active.claimIncarnation);
     stopTypingRefresh(sessionId);
     if (active.channel.kind === 'adopted') {
@@ -2113,10 +1549,8 @@ export function finalizeSession(
     return;
   }
 
-  // A terminal event from a runtime the registry has already replaced. It
-  // owns nothing shared any more: releasing its claim would clear the
-  // REPLACEMENT's row and the status write would report a live container
-  // stopped, so only its own storage lease is handed back.
+  // A terminal from a runtime the registry already replaced: releasing its claim or writing status would clobber
+  // the REPLACEMENT, so only its own storage lease is handed back.
   log.warn('Ignoring stale session finish', { sessionId, containerName: containerName ?? active?.containerName });
   if (storageActivity) {
     void storageActivity.release().catch((err) => {
@@ -2126,27 +1560,9 @@ export function finalizeSession(
 }
 
 /**
- * The durable half of a container's finish: the `stopped` status write (and
- * the dashboard event it emits) and the claim release.
- *
- * Both are fenced on the claim row. The release always was — it matches
- * `claimed_by` AND `incarnation`, so a stale release is a no-op — but the
- * status write was not: after a peer host took the session at N+1, this host's
- * still-live child could report the peer's live container stopped. The fence
- * read and the conditional status write are ONE atomic step
- * (`centralTransaction`, `BEGIN IMMEDIATE` under the central lease): a
- * replacement wake's claim CAS runs in its own transaction and so waits behind
- * this one, which closes the interleaving where the replacement claimed N+1
- * between this finish's read and its write and was then stamped `stopped`
- * after it had marked itself running. The dashboard event is emitted after
- * the commit — the closure is DB calls only (plan §4.4).
- *
- * A row that has moved past our incarnation, or is held by someone else,
- * means the finish is not ours to record. A transaction that fails proceeds
- * unfenced, exactly as before the fence existed — a central DB that cannot
- * answer a read will refuse the status write on its own terms. Entries with no
- * incarnation (the claim was refused, or never taken under a durable id) have
- * nothing to fence on and write as they always did.
+ * The `stopped` status write and the claim release, both fenced on the claim row. The fence read and conditional
+ * write are ONE `centralTransaction`, so a replacement's claim CAS cannot interleave and be stamped `stopped`
+ * after marking itself running. The dashboard event is emitted after commit.
  */
 const FINISH_FENCE_ATTEMPTS = 3;
 const FINISH_FENCE_RETRY_MS = 100;
@@ -2200,9 +1616,7 @@ async function finishSessionBookkeeping(sessionId: string, claimIncarnation: num
   } catch (err) {
     log.warn('markContainerStopped failed after container exit', { sessionId, err });
   }
-  // The release is scoped to THIS runtime's own incarnation, so one still in
-  // flight when a fresh spawn wins the next incarnation lands as a no-op
-  // instead of unclaiming the live container.
+  // Scoped to THIS runtime's incarnation, so a late release cannot unclaim a fresh spawn's live container.
   if (claimIncarnation !== undefined) await releaseClaimQuietly(sessionId, claimIncarnation);
 }
 
@@ -2222,16 +1636,9 @@ export function captureContainerStderr(
 }
 
 /**
- * A killed container never reaches its turn boundary, so it can never emit the
- * `turn_end` row that tells the host to delete this session's 💭 status.
- * Without this the thinking label survives as the run's only visible output —
- * permanently for a scheduled task, whose NORMAL exit is the idle reaper
- * killing it mid-stream. Dynamic import: delivery.ts imports this module.
- * Fire-and-forget and never throws — cleanup must not block the kill.
- *
- * Runs for a CANCELLED spawn too. No container reached a turn, so it is
- * usually a no-op, but the two paths are one event from a caller's point of
- * view and should not differ in what they leave behind.
+ * A killed container never emits `turn_end`, so without this its 💭 status label survives (permanently for a
+ * scheduled task, whose normal exit is the idle reaper). Dynamic import: delivery.ts imports this module.
+ * Fire-and-forget, never throws. Runs for a cancelled spawn too.
  */
 function clearStatusOnKill(sessionId: string, reason: string): void {
   void import('./delivery.js')
@@ -2248,19 +1655,12 @@ function clearStatusOnKill(sessionId: string, reason: string): void {
     });
 }
 
-/**
- * Containers the host itself is stopping (every stop path runs
- * clearStatusOnKill, which settles the task list). Any other non-zero exit —
- * OOM, a runner crash — settles it from the close handler instead.
- */
+/** Containers the host itself is stopping; their stop path settles the task list, so the close handler must not. */
 const hostStoppedContainers = new Set<string>();
 
 /**
- * Settle the session's task list after an exit the host did not ask for (a
- * crash, an OOM kill, a runner that quit). Exit codes are not consulted: an
- * adopted container's `docker wait` exits 0 whatever the container did, and a
- * list is stale once its container is gone either way. Returns whether the
- * exit was unexpected, i.e. false for a host stop.
+ * Settle the task list after an exit the host did not ask for. Exit codes are not consulted (an adopted
+ * container's `docker wait` exits 0 regardless). Returns false for a host stop.
  */
 function settleUnexpectedExit(sessionId: string, containerName: string): boolean {
   if (hostStoppedContainers.delete(containerName)) return false;
@@ -2290,32 +1690,15 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
 }
 
 /**
- * What a caller owes the session after the stop.
- *
- * `'respawn_after_stop'` is a PROMISE: this host will bring the session back,
- * and if it dies before doing so the next boot must finish the job. `'stop'`
- * means the session is meant to stay down. The two are not inferable from the
- * presence of an `onExit` callback — several callers pass one purely for
- * bookkeeping (`killThenFollowUp` resets orphaned claims and writes the ceiling
- * accounting for a kill that must STAY stopped), so the caller states it.
+ * `'respawn_after_stop'` is a PROMISE that this host (or, if it dies first, the next boot) brings the session
+ * back; `'stop'` means stay down. Not inferable from `onExit`: some callers pass one purely for bookkeeping.
  */
 export type StopIntent = 'stop' | 'respawn_after_stop';
 
 /**
- * Kill a container for a session, INCLUDING one that is still spawning.
- *
- * `intent` records what the caller owes the session, durably, BEFORE the stop
- * is issued — it defaults to `'stop'`, so a caller has to opt in to a promise
- * it is going to keep.
- *
- * Three states, and only the third is a no-op:
- *   - running: stop it, and `onExit` fires on the process close, as always.
- *   - spawning: the request is recorded and honoured when the wake reaches its
- *     cancellation point or registers a process; `onExit` still fires. See
- *     `pendingKills`.
- *   - neither: nothing to kill and no exit to report, so `onExit` does NOT
- *     fire. Callers rely on that — `container-restart` treats "not running" as
- *     "this restart did not happen" rather than as an exit.
+ * Kill a container, INCLUDING one still spawning (recorded in `pendingKills`; `onExit` still fires). `intent` is
+ * recorded durably BEFORE the stop. With no container at all, `onExit` does NOT fire: container-restart relies on
+ * that to read "not running" as "this restart did not happen".
  */
 export function killContainer(
   sessionId: string,
@@ -2325,9 +1708,7 @@ export function killContainer(
 ): void {
   if (!activeContainers.has(sessionId)) {
     if (pendingAdoptions.has(sessionId)) {
-      // A survivor this host could not yet adopt: running, owned, untracked.
-      // Stopped by name and proven gone before its hold is released and the
-      // exit work runs.
+      // A survivor not yet adopted: stopped by name and proven gone before its hold is released and exit work runs.
       recordStopIntent(sessionId, intent);
       stopPendingSurvivor(sessionId, reason, onExit ? [onExit] : []);
       return;
@@ -2344,11 +1725,7 @@ export function killContainer(
   stopRunningContainer(sessionId, reason, onExit ? [onExit] : []);
 }
 
-// ── Adoption (seam 4 series E, plan §4.3, §7.E) ───────────────────────────────
-
-/** What `adoptRunningSessions` found and did, logged once per boot. */
 export interface StartupReconciliation {
-  /** Containers registered as adopted entries. */
   adopted: number;
   /** Containers stopped: no session label, no session row, or a session that cannot take a wake. */
   stopped: number;
@@ -2358,23 +1735,12 @@ export interface StartupReconciliation {
   fencedInbound: number;
 }
 
-/**
- * Sessions whose survivor could not be claimed at adoption: a write failure, a
- * lost CAS, or a claim a live peer holds. Alive and untracked — exactly what
- * the running fast path cannot see — so `wakeContainer` consults this set
- * FIRST and routes a hit to `retryPendingAdoption` rather than the spawn path.
- */
+/** Unclaimed survivors: alive and untracked, so `wakeContainer` checks this FIRST and routes to the adoption retry. */
 const pendingAdoptions = new Set<string>();
 
 /**
- * Everything a running-but-unadopted survivor holds while it is pending: the
- * storage-activity leases for its session-dir and worktree roots, and a
- * memory-accounting reservation sized as a spawn of its group would be. The
- * claim, when this host holds it, is simply not released. Taken by
- * `holdAsPending` — the ONE step every path that leaves a survivor running
- * goes through — and released in exactly two places: adoption success, where
- * the registry entry takes the hold over, and proven absence
- * (`releasePendingHold`, from the re-list or a proven stop).
+ * What a pending survivor holds (storage leases, a saturating memory reservation; a held claim is kept). Taken only
+ * by `holdAsPending`; released only on adoption success (the registry entry takes it over) or proven absence.
  */
 interface PendingHold {
   /** The container's name when it was listed; null for a survivor held on an inventory failure. */
@@ -2384,24 +1750,15 @@ interface PendingHold {
   reservedMb: number | null;
   /** False when the survivor would be refused as a spawn: its reservation is saturating and adoption stops it under its claim. */
   fits: boolean | null;
-  /** The `docker wait` exit observer, armed when the name is known. */
   waiter: ChildProcess | null;
-  /**
-   * Exit work handed to `killContainer` by a stop that could not be proven:
-   * run once, when the observer (or a re-list) proves the container gone. A
-   * one-shot caller — a restart with a wake message, a self-mod or provider
-   * restart — relies on it to request the replacement.
-   */
+  /** Exit work from a stop that could not be proven; runs once, when the container is proven gone. */
   parkedExits: ContainerExitCallback[];
 }
 const pendingHolds = new Map<string, PendingHold>();
 
 /**
- * Observe a pending survivor's exit. Without this a survivor
- * that exits with no further message keeps its holds until the next boot and
- * can starve unrelated queued sessions. Same discipline as the adopted
- * channel: a waiter close is a hint, checked against the runtime; gone →
- * release everything; still there (or unanswerable) → re-arm after backoff.
+ * Without this a survivor that exits silently keeps its holds until the next boot. A waiter close is a hint checked
+ * against the runtime: gone → release everything; still there or unanswerable → re-arm after backoff.
  */
 function armPendingWaiter(sessionId: string, hold: PendingHold, containerName: string): void {
   let waiter: ChildProcess;
@@ -2418,8 +1775,7 @@ function armPendingWaiter(sessionId: string, hold: PendingHold, containerName: s
   const onExit = (): void => {
     if (handled) return;
     handled = true;
-    // Only the waiter the hold still names may act; a released or transferred
-    // hold, or a re-armed one, has moved on.
+    // Only the waiter the hold still names may act.
     if (pendingHolds.get(sessionId)?.waiter !== waiter) return;
     if (containerProvenGone(containerName)) {
       log.info('Pending survivor exited — releasing its hold', { sessionId, containerName });
@@ -2436,12 +1792,7 @@ function armPendingWaiter(sessionId: string, hold: PendingHold, containerName: s
   waiter.on('error', onExit);
 }
 
-/**
- * Arm the exit observer once a survivor's pending state is FINAL for this
- * pass — not while `adoptRunningSession` is still deciding, because an
- * adoption that succeeds a moment later arms the registry's own waiter and
- * the extra observer would only have to be torn down again.
- */
+/** Armed only once the pending state is final for this pass; a successful adoption arms the registry's own waiter. */
 function observePending(sessionId: string): void {
   const hold = pendingHolds.get(sessionId);
   if (!hold || !hold.containerName || hold.waiter) return;
@@ -2460,12 +1811,9 @@ function disarmPendingWaiter(hold: PendingHold): void {
 }
 
 /**
- * Hold a running survivor this host is not (yet) supervising: mark it pending
- * (so `containerOwnsOutbound` is true and the wake path retries adoption),
- * lease its storage roots, and reserve its memory. Idempotent — a hold already
- * taken is kept, and a resource that could not be taken is retried on the
- * next call. `container` is null when the survivor was never listed (the
- * inventory failed) and its workgroup label is unknown.
+ * Mark a running survivor pending (so `containerOwnsOutbound` is true and wakes retry adoption), lease its storage
+ * roots and reserve its memory. Idempotent; a resource not taken is retried next call. `container` is null when
+ * the inventory failed.
  */
 async function holdAsPending(
   session: Session,
@@ -2479,9 +1827,7 @@ async function holdAsPending(
   }
   if (container && hold.containerName !== container.name) {
     if (hold.containerName !== null) {
-      // A named hold is never re-pointed: the container it names is alive
-      // and its waiter is the only thing watching it. Callers remove the
-      // second container instead (`removeDuplicateContainer`).
+      // A named hold is never re-pointed: its waiter is the only thing watching that live container.
       throw new Error(
         `pending hold for session ${session.id} names ${hold.containerName}; refusing to re-point it at ${container.name}`,
       );
@@ -2510,9 +1856,7 @@ async function holdAsPending(
     } else {
       hold.fits = false;
       if (memory.requestMb !== undefined) {
-        // The survivor is using this memory whether or not it fits: count it,
-        // saturating, so admission blocks fresh spawns until it is adopted or
-        // proven gone rather than spawning on top of it.
+        // Saturating: the survivor uses this memory whether or not it fits, so admission blocks fresh spawns.
         getMemoryAdmission().reserveSaturating(session.id, memory.requestMb);
         hold.reservedMb = memory.requestMb;
       }
@@ -2530,11 +1874,7 @@ async function holdAsPending(
   return hold;
 }
 
-/**
- * Proven absence: give back everything the pending survivor held, then run
- * the exit work a stop parked on it — exactly once, after the release, in the
- * order a tracked container's `close` would have run it.
- */
+/** Proven absence: release everything, then run parked exit work exactly once, after the release. */
 async function releasePendingHold(sessionId: string): Promise<void> {
   pendingAdoptions.delete(sessionId);
   const hold = pendingHolds.get(sessionId);
@@ -2557,25 +1897,17 @@ async function releasePendingHold(sessionId: string): Promise<void> {
   }
 }
 
-/**
- * Adoption success: the registry entry takes the hold over. The lease moves
- * onto the entry (`finalizeSession` releases it) and the reservation stays in
- * the controller under the same id (`finalizeSession` releases that too).
- */
+/** Adoption success: the lease and reservation move to the registry entry, which `finalizeSession` releases. */
 function transferPendingHold(sessionId: string): void {
   pendingAdoptions.delete(sessionId);
   const hold = pendingHolds.get(sessionId);
   pendingHolds.delete(sessionId);
-  // The registry entry arms its own waiter; the pending observer stands down.
   if (hold) disarmPendingWaiter(hold);
 }
 
 /**
- * Stop a pending survivor by name: `docker stop`, then a hard
- * kill if the stop did not take, and the hold is released — and the exit work
- * run — only once the runtime proves the container gone. A survivor that
- * cannot be stopped stays pending (owned, leased, counted) and the caller
- * retries on its next tick, exactly as it does for any owned outbound.
+ * Release (and exit work) happens only once the runtime proves the container gone; a survivor that cannot be
+ * stopped stays pending and the caller retries.
  */
 function stopPendingSurvivor(sessionId: string, reason: string, onExit: ContainerExitCallback[]): void {
   const hold = pendingHolds.get(sessionId);
@@ -2606,8 +1938,6 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
       log.warn('docker kill failed for a pending survivor', { sessionId, containerName, err });
     }
   }
-  // The exit work rides the hold either way: released now if the container is
-  // proven gone, or by the observer when it eventually exits.
   hold.parkedExits.push(...onExit);
   if (!containerProvenGone(containerName)) {
     log.warn('A pending survivor could not be stopped — keeping it pending with its exit work parked', {
@@ -2622,13 +1952,8 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
 }
 
 /**
- * Make an unlisted pending survivor stoppable: a hold seeded on
- * an inventory failure carries no container name, so nothing can stop it by
- * name. Re-list from the runtime: found → the name is recorded and the exit
- * observer armed, `'running'`; not listed → the survivor is gone and its hold
- * is released, `'gone'`; the runtime cannot be asked → `'unknown'`, and the
- * caller must not report a restart it could not perform. A hold that already
- * carries a name is `'running'` without a listing.
+ * A hold seeded on an inventory failure has no name, so nothing can stop it: re-list. `'unknown'` means the
+ * runtime could not be asked, and the caller must not report a restart it could not perform.
  */
 export async function resolvePendingSurvivor(sessionId: string): Promise<'running' | 'gone' | 'unknown'> {
   const hold = pendingHolds.get(sessionId);
@@ -2652,13 +1977,8 @@ export async function resolvePendingSurvivor(sessionId: string): Promise<'runnin
 }
 
 /**
- * The identity of the container running a session — its runtime name — for a
- * tracked entry or a pending survivor, or null when there is none. Stable
- * across adoption (the same docker process keeps its name when a pending
- * survivor is adopted), and different for every spawn (the name carries the
- * spawn instant), so a caller that must tell "the same container" from "a
- * replacement" across an await compares this, not `getContainerSpawnedAt`,
- * which flips from 0 to the adoption instant on adoption.
+ * The runtime name of the session's container (tracked or pending), or null. Stable across adoption and unique per
+ * spawn: compare this, not `getContainerSpawnedAt` (which flips from 0 on adoption), to detect a replacement.
  */
 export function getContainerIdentity(sessionId: string): string | null {
   return activeContainers.get(sessionId)?.containerName ?? pendingHolds.get(sessionId)?.containerName ?? null;
@@ -2673,18 +1993,10 @@ function containerProvenGone(containerName: string): boolean {
   }
 }
 
-/**
- * The runtime listing adoption reads, replaceable for tests. `adoptRunningSessions`
- * pins whatever it was handed so the wake-path retry re-lists through the same
- * source the boot pass did.
- */
+/** Replaceable for tests; `adoptRunningSessions` pins it so the wake-path retry re-lists through the same source. */
 let adoptionListing: () => InstallContainerScope[] = listInstallContainersWithScope;
 
-/**
- * Backoff before an adopted entry's waiter is re-armed after a close the
- * runtime contradicted. `docker wait` against an unreachable daemon exits at
- * once, so a re-arm without a pause would spin.
- */
+/** `docker wait` against an unreachable daemon exits at once, so a re-arm without this pause would spin. */
 const ADOPTED_WAITER_REARM_MS = 5_000;
 let adoptedWaiterRearmMs = ADOPTED_WAITER_REARM_MS;
 
@@ -2696,14 +2008,7 @@ export function _resetAdoptionRetryStateForTesting(): void {
   pendingAdoptions.clear();
 }
 
-/**
- * Test-only: stand in for an adoption that failed its claim write.
- *
- * Series F ships the READER of `pendingAdoptions` before series E ships the
- * writer, so its deferral case has no other way to reach that state. Keep it
- * after E's merge only until `adoptRunningSessions` gives the suite a real
- * route into the state.
- */
+/** Test-only: stand in for an adoption that failed its claim write. */
 export function _markPendingAdoptionForTesting(sessionId: string): void {
   pendingAdoptions.add(sessionId);
 }
@@ -2717,12 +2022,7 @@ export function _resetAdoptionStateForTesting(options: { waiterRearmMs?: number 
 
 type AdoptedChannel = Extract<SupervisionChannel, { kind: 'adopted' }>;
 
-/**
- * Listen on the CURRENT waiter of an adopted channel. `close` is a hint, not a
- * terminal (§4.3.3): `onWaiterClose` checks it against the runtime first.
- * `error` (the waiter could not even start) is handled the same way; the
- * `handled` latch keeps the pair from re-reading truth twice for one exit.
- */
+/** `close` is a hint checked by `onWaiterClose`; `error` (waiter could not start) is handled the same way, once. */
 function armAdoptedWaiter(sessionId: string, channel: AdoptedChannel, containerName: string): void {
   const waiter = channel.waiter;
   const stderrTail: string[] = [];
@@ -2747,12 +2047,8 @@ function armAdoptedWaiter(sessionId: string, channel: AdoptedChannel, containerN
 }
 
 /**
- * The waiter-close truth re-read (plan §4.3.3, property 5). A docker-daemon
- * restart exits every waiter at once and would read as a fleet-wide terminal;
- * so the runtime is asked before anything is finalized. Still running →
- * re-arm. Cannot be asked → treated as still running, re-arm. Gone → the
- * container's real terminal, finalize. `No such container` from `docker wait`
- * lands on the "gone" side through the same read, so it is never re-armed.
+ * A docker-daemon restart exits every waiter at once, so ask the runtime before finalizing. Running or unanswerable
+ * → re-arm; gone (including `No such container`) → finalize.
  */
 function onWaiterClose(
   sessionId: string,
@@ -2762,8 +2058,7 @@ function onWaiterClose(
   stderrTail: string[],
 ): void {
   if (activeContainers.get(sessionId)?.channel !== channel) {
-    // A waiter the registry no longer owns (the entry was replaced or already
-    // finalized). Nothing shared to touch; the fence inside logs it.
+    // A waiter the registry no longer owns; the fence inside logs it.
     finalizeSession(sessionId, channel, null, containerName);
     return;
   }
@@ -2820,16 +2115,8 @@ function scheduleWaiterRearm(sessionId: string, channel: AdoptedChannel, contain
 }
 
 /**
- * Register a container this host did not spawn, after its claim is held.
- *
- * Mirrors the spawn path's registration with two deliberate differences: the
- * channel is a `docker wait` observer, and `spawnedAt` is the adoption instant
- * — the honest ceiling anchor for a container whose real start this host
- * never saw. The storage-activity lease is the same one a spawn holds, taken
- * by the caller after `main()`'s startup reset of the previous host's markers. The heartbeat file is NOT cleared: it is the
- * survivor's own, and the sweep reads it as evidence the container is alive.
- * The `running` status write is awaited only after the waiter is armed, for
- * the same reason the spawn path attaches its exit handlers first.
+ * Adoption registration differs from a spawn's in two ways: the channel is a `docker wait` observer, and
+ * `spawnedAt` is the adoption instant. The heartbeat file is NOT cleared (it is the survivor's evidence of life).
  */
 /** The workgroup an adopted container's storage roots belong to: its label, else its group's declaration. */
 async function adoptedWorkgroupId(session: Session, labelled: string | null): Promise<string> {
@@ -2859,11 +2146,8 @@ async function registerAdoptedContainer(
     claimIncarnation,
   });
   armAdoptedWaiter(session.id, channel, containerName);
-  // F1 hook: reconcileSurvivorWakeRows(session)
   await reconcileSurvivorWakeRows(session);
-  // The waiter is armed and may have finalized during that await: the same
-  // identity fence `finalizeSession` uses decides whether a running stamp is
-  // still ours to write.
+  // The waiter may have finalized during that await: the identity fence decides if the running stamp is ours.
   if (activeContainers.get(session.id)?.channel !== channel) {
     log.debug('Adopted container finalized during reconcile — skipping the running stamp', { sessionId: session.id });
     return;
@@ -2881,16 +2165,8 @@ type AdoptionOutcome =
   | { outcome: 'stopped'; reason: string };
 
 /**
- * Reserve an adopted container's memory in the admission controller, sized
- * exactly as a spawn of the same agent group would be (`resolveContainerResources`
- * over the group's `container.json`). Without this the controller starts a
- * boot with survivors at 0 MiB reserved and can admit a full budget of fresh
- * spawns on top of containers that are already using theirs.
- *
- * A survivor the controller would refuse a spawn for — the request exceeds
- * the budget, or the budget is already spent by earlier survivors — is refused
- * here too: adoption never over-commits what a spawn could not. The caller
- * stops that container; its next wake re-enters admission like any spawn.
+ * Reserve a survivor's memory exactly as a spawn of its group would, or boot admits a full budget of fresh spawns
+ * on top of survivors. A survivor a spawn would be refused for is refused here too; the caller stops it.
  */
 async function reserveAdoptedMemory(
   session: Session,
@@ -2905,8 +2181,7 @@ async function reserveAdoptedMemory(
   }
   const decision = getMemoryAdmission().request(session.id, requestMb, { session }, 'interactive');
   if (decision.status === 'admitted') return { ok: true, requestMb };
-  // A queued request would otherwise be drained into a spawn later, for a
-  // container this host is about to stop.
+  // A queued request would otherwise drain into a spawn for a container we are about to stop.
   cancelMemoryAdmission(session.id);
   return {
     ok: false,
@@ -2919,29 +2194,22 @@ async function reserveAdoptedMemory(
 }
 
 /**
- * Take the claim for a survivor and register it. Property 1 (§7.E): claim
- * before adopt, and never adopt unfenced — every path out of a failed or lost
- * claim leaves the container running and untracked, recorded in
- * `pendingAdoptions` so the wake path retries rather than spawning into it.
+ * Claim before adopt, never unfenced: a failed or lost claim leaves the container running and untracked in
+ * `pendingAdoptions`, so wakes retry adoption rather than spawn into it.
  */
 async function adoptRunningSession(
   session: Session,
   containerName: string,
   workgroupId: string | null,
 ): Promise<AdoptionOutcome> {
-  // Hold everything FIRST. Whatever happens below, a survivor that stays
-  // running stays owned, leased and counted until it is adopted or proven
-  // gone; only those two outcomes give anything back.
+  // Hold everything FIRST: a survivor that stays running stays owned, leased and counted.
   const hold = await holdAsPending(session, { name: containerName, workgroupId });
   const pending = (): AdoptionOutcome => {
     observePending(session.id);
     return { outcome: 'pending' };
   };
   if (!hold.lease) return pending();
-  // Claim next. Only a container this host has claimed may be stopped for
-  // local admission pressure: a survivor a live peer holds is the peer's turn,
-  // and stopping it for our budget would be the interruption the lost-claim
-  // path exists to avoid. Unclaimed and over-budget both leave it running.
+  // Claim next: only a container this host claimed may be stopped for local admission pressure.
   let claimIncarnation: number | null;
   try {
     claimIncarnation = await claimSessionRun(session.id, containerName, { adopting: true });
@@ -2960,10 +2228,8 @@ async function adoptRunningSession(
     });
     return pending();
   }
-  // Memory, under our own claim. A survivor that does not fit is ours to
-  // stop — but the claim and the hold go back only once the container is
-  // PROVEN gone. A stop that fails leaves a running container that must stay
-  // claimed and pending, or a later wake would spawn a second writer beside it.
+  // Claim and hold go back only once the container is PROVEN gone: a failed stop must stay claimed and pending,
+  // or a later wake spawns a second writer beside it.
   if (!hold.fits) {
     log.warn('Adoption refused — the container does not fit the memory admission budget; stopping it', {
       sessionId: session.id,
@@ -2988,9 +2254,7 @@ async function adoptRunningSession(
   try {
     await registerAdoptedContainer(session, containerName, claimIncarnation, hold.lease);
   } catch (err) {
-    // The waiter could not be created: the claim is held with nothing to
-    // supervise it. Hand the claim back (the hold stays with the pending
-    // entry) and let the wake path retry the whole step.
+    // No waiter: hand the claim back (the hold stays pending) and let the wake path retry.
     log.error('Could not register an adopted container — releasing its claim for retry', {
       sessionId: session.id,
       containerName,
@@ -3001,9 +2265,7 @@ async function adoptRunningSession(
     return pending();
   }
   transferPendingHold(session.id);
-  // §4.3.6: a survivor may sit behind an ACTIVE fence the dead host wrote.
-  // Counted so the case is visible; `releaseOrphanedRepoIngressFencesAtStartup`
-  // owns the release and runs after adoption.
+  // Counted only; `releaseOrphanedRepoIngressFencesAtStartup` releases a dead host's fence after adoption.
   let fencedInbound = false;
   try {
     fencedInbound =
@@ -3031,12 +2293,8 @@ function stopUnadoptable(containerName: string, why: string, sessionId: string |
 }
 
 /**
- * Remove a second container for a session this host already owns (tracked or
- * held pending) under `owner`. Stop, escalate to kill, and require proven
- * absence; a duplicate this host cannot remove fails the boot — when the owned
- * container exits, finalization would release the claim, reservation and
- * leases while the duplicate keeps writing the outbound DB, so there is no
- * safe state to continue from.
+ * A duplicate this host cannot prove removed fails the boot: when the owned container exits, finalization would
+ * release claim, reservation and leases while the duplicate keeps writing the outbound DB.
  */
 function removeDuplicateContainer(
   container: { name: string; sessionId: string | null },
@@ -3063,12 +2321,7 @@ function removeDuplicateContainer(
   );
 }
 
-/**
- * Hold a survivor pending without having seen its container: the inventory
- * could not be read, and the door said this session's container survived.
- * Fail closed — owned, leased, counted, retried on wake — rather than letting
- * the sweep and the wake path treat it as unowned.
- */
+/** Inventory unreadable but the door said this session survived: fail closed (owned, leased, retried on wake). */
 async function holdUnlistedSurvivor(sessionId: string): Promise<void> {
   pendingAdoptions.add(sessionId);
   try {
@@ -3083,36 +2336,18 @@ async function holdUnlistedSurvivor(sessionId: string): Promise<void> {
 }
 
 /**
- * Adopt the containers a previous host process left running (plan §7.E).
- *
- * Runs once at boot, after the quiescence door and BEFORE every wake source and
- * before the orphaned-fence recovery (P3; `src/adoption-order.test.ts` pins
- * both). A listing failure adopts nothing and returns all zeros: adoption that
- * cannot see the runtime must not guess, and the boot door has already run its
- * own fail-closed proof. A container with no session label, no session row, or
- * a session that cannot take a wake is stopped — a survivor without an owner
- * is a writer without a reader.
+ * Runs once at boot, after the quiescence door and BEFORE every wake source and the orphaned-fence recovery
+ * (`src/adoption-order.test.ts` pins both). A listing failure adopts nothing. A container with no session label,
+ * no session row, or an unwakeable session is stopped.
  */
 export async function adoptRunningSessions(
   deps: {
     list?: () => InstallContainerScope[];
-    /**
-     * D1's boot-scope partition (`quiesceWorkgroupsForBootMountChange(...)
-     * .survivableSessionIds`): the sessions whose containers the door chose to
-     * leave running, computed before anything was stopped. When given it is
-     * THE candidate set — the same partition series G's startup warn skips —
-     * and a listed container outside it is stopped here, fail-closed, because
-     * the door meant to stop it. Absent, every listed container is a candidate
-     * (the pre-D1 tree, and tests that drive the listing directly).
-     */
+    /** The door's survivable partition: when given, THE candidate set; a listed container outside it is stopped. */
     survivableSessionIds?: ReadonlySet<string> | readonly string[];
     /**
-     * The sessions whose containers the door actually LEFT running — the
-     * fail-closed seed when this pass's own inventory cannot be taken. Defaults
-     * to `survivableSessionIds`. `main()` derives it from the door's counts:
-     * under D1 the door stops the survivable containers too, so its partition
-     * is a counterfactual and seeding it would create phantom holds for
-     * containers the door just proved gone; the seed is then empty.
+     * Sessions the door actually LEFT running: the fail-closed seed when this pass cannot list. Defaults to
+     * `survivableSessionIds`; empty when the door stopped the survivable containers too.
      */
     heldOnInventoryFailure?: ReadonlySet<string> | readonly string[];
   } = {},
@@ -3128,9 +2363,7 @@ export async function adoptRunningSessions(
     containers = adoptionListing();
   } catch (err) {
     if (heldOnFailure && heldOnFailure.size > 0) {
-      // The door left these containers running; a listing this process
-      // cannot take is no evidence they are gone. Every one is held pending —
-      // owned and leased — until `retryPendingAdoption` can re-list.
+      // An unlistable runtime is no evidence these are gone: hold each pending until a re-list succeeds.
       log.warn('Session adoption listing failed — holding every survivable session as pending', {
         err,
         sessions: [...heldOnFailure],
@@ -3149,12 +2382,7 @@ export async function adoptRunningSessions(
     log.warn('Session adoption skipped — runtime listing failed', { err });
     return counts;
   }
-  /**
-   * Stop a container adoption will not take, and PROVE it gone. A stop that
-   * fails or cannot be proven leaves a running writer, which is then held
-   * pending exactly like a survivor whose claim was lost — owned, leased,
-   * counted, retried on wake — unless there is no session to hold it for.
-   */
+  /** Stop and PROVE gone; a stop that fails or cannot be proven is held pending (unless there is no session). */
   const stopOrHold = async (container: InstallContainerScope, why: string, session: Session | undefined) => {
     if (stopUnadoptable(container.name, why, container.sessionId) && containerProvenGone(container.name)) {
       counts.stopped += 1;
@@ -3191,10 +2419,7 @@ export async function adoptRunningSessions(
   };
   for (const container of containers) {
     if (!container.sessionId) {
-      // Unreachable for a survivor under D1: a container with no session label
-      // is one adoption could never claim, so the door fails it closed into
-      // its stop set. Kept as a defensive stop for a listing the door did not
-      // partition.
+      // Defensive: under the boot door an unlabelled container is already in its stop set.
       await stopOrHold(container, 'no session label', undefined);
       continue;
     }
@@ -3222,20 +2447,14 @@ export async function adoptRunningSessions(
     }
     const tracked = activeContainers.get(container.sessionId);
     if (tracked) {
-      // A second container for a session already tracked: two writers. Not
-      // held pending on failure — the session is already owned by the tracked
-      // entry, and a pending mark would route its wakes at the wrong container.
+      // Duplicate of a tracked session: not held pending on failure (a pending mark would misroute its wakes).
       removeDuplicateContainer(container, 'tracked', tracked.containerName);
       counts.stopped += 1;
       continue;
     }
     const held = pendingHolds.get(container.sessionId)?.containerName ?? null;
     if (held !== null && held !== container.name) {
-      // A second container for a session already held pending under another
-      // name: the same two writers. The hold keeps its container and its
-      // waiter — re-pointing it would leave the first alive and untracked,
-      // free to keep writing the outbound DB after the second is adopted or
-      // exits, and a later wake would then start a third writer beside it.
+      // Duplicate of a pending hold: never re-point the hold, or the first container runs on untracked.
       removeDuplicateContainer(container, 'pending', held);
       counts.stopped += 1;
       continue;
@@ -3252,20 +2471,14 @@ export async function adoptRunningSessions(
     counts.adopted += 1;
     if (result.fencedInbound) counts.fencedInbound += 1;
   }
-  // F2 lives in `main()`, not here: `honorPendingStopIntents()` can spawn, and
-  // this pass stays a pure inventory with no wake inside it (plan §7.F).
+  // `honorPendingStopIntents()` runs in `main()`: it can spawn, and this pass must stay a pure inventory.
   log.info('Reconciled sessions at startup', { ...counts });
   return counts;
 }
 
 /**
- * P4: a wake for a session whose survivor could not be claimed at boot.
- *
- * Re-lists from the runtime. Container gone → cleared, `false`, and the caller
- * falls through to a fresh spawn, which is correct. Still there → the same
- * claim-then-register step boot took; a claim the runtime or the store refuses
- * THROWS, so `trackWake` reports the wake failed and the sweep retries — and
- * no spawn happens. A listing that cannot be taken throws for the same reason.
+ * P4: re-list. Gone → `false`, and the caller spawns fresh. Still there → claim-then-register as boot did; a
+ * refused claim or an unlistable runtime THROWS, so no spawn happens and the sweep retries.
  */
 async function retryPendingAdoption(session: Session): Promise<boolean> {
   const survivor = adoptionListing().find((container) => container.sessionId === session.id);
@@ -3278,9 +2491,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
   }
   const fresh = await refreshActiveSession(session, 'pending-adoption');
   if (!fresh) {
-    // The session stopped being wakeable while its survivor waited: the same
-    // answer boot gives such a container. Ownership is dropped only once the
-    // stop is proven; otherwise it stays pending for the next wake.
+    // Ownership is dropped only once the stop is proven; otherwise it stays pending for the next wake.
     if (
       !stopUnadoptable(survivor.name, 'session cannot take a wake', session.id) ||
       !containerProvenGone(survivor.name)
@@ -3295,8 +2506,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
     throw new Error(`session ${session.id} has a running container this host could not claim — not spawning`);
   }
   if (result.outcome === 'stopped') {
-    // Stopped for not fitting the memory budget and proven gone (the hold went
-    // back with it): the ordinary path's own admission decides a spawn.
+    // Stopped for the memory budget and proven gone: ordinary admission decides a spawn.
     return false;
   }
   log.info('Adopted a pending survivor on wake', { sessionId: session.id, containerName: survivor.name });
@@ -3304,27 +2514,9 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
 }
 
 /**
- * Record the DURABLE half of a stop request, so a host that dies mid-restart
- * does not forget it.
- *
- * A kill-with-respawn lives in an `onExit` callback, which is process memory: a
- * host that went down between the kill and the callback firing forgot the
- * restart entirely, and the operator saw "rebuild applied" with nothing coming
- * back. `honorPendingStopIntents()` consumes the row at the next startup.
- *
- * The intent comes from the CALLER, not from the presence of an `onExit`
- * callback. Several callers pass one for bookkeeping alone — the ceiling kill
- * resets orphaned claims and posts its accounting through `onExit`, and it must
- * stay stopped — so deriving the promise from the callback would resurrect
- * every one of those sessions at the next boot. Routing the write through this
- * one door is still the point: `killContainer` is the single stop every caller
- * goes through, so no caller can forget to ARM a recovery it did promise.
- *
- * Not awaited, because `killContainer` is synchronous and every one of its
- * callers depends on that. `shadowWrite` already swallows its own failures, so
- * the only thing an await would buy is ordering against the stop — and a stop
- * intent that lost its race with a host crash is exactly as recoverable as one
- * that was never written.
+ * The DURABLE half of a stop request (`onExit` is process memory), consumed by `honorPendingStopIntents()` at the
+ * next startup. The intent comes from the CALLER, never from the presence of `onExit`: deriving it would resurrect
+ * every bookkeeping-only kill at the next boot. Not awaited because `killContainer` must stay synchronous.
  */
 function recordStopIntent(sessionId: string, intent: StopIntent): void {
   if (intent === 'respawn_after_stop') respawnIntents.set(sessionId, ++respawnIntentSeq);
@@ -3333,31 +2525,8 @@ function recordStopIntent(sessionId: string, intent: StopIntent): void {
 }
 
 /**
- * Discharge a respawn promise this process made, now that the session has a
- * container again.
- *
- * Without this only `honorPendingStopIntents` ever clears the row, so a restart
- * that COMPLETED normally leaves `respawn_after_stop` behind and every later
- * boot replays it — waking a session nobody asked for, once per restart,
- * forever.
- *
- * `token` is what the waking side read from `respawnIntents` when it STARTED,
- * and only a wake that read THIS promise may discharge it. A wake already in
- * flight when the kill arrived read `undefined`, or an older promise's token,
- * and its `true` says nothing about the container this kill is about to stop —
- * clearing on it would leave the session down with nothing owed. A later wake
- * that merely joins that in-flight promise inherits its token and is refused
- * for the same reason; the replacement wake the kill's own callback starts
- * reads the current token and qualifies.
- *
- * Gated on `respawnIntents` so an ordinary message-driven wake costs no central
- * DB write: the map holds only the promises THIS process made and has not yet
- * discharged. A promise made by a host that died is not in it, which is
- * correct — that one belongs to `honorPendingStopIntents` at the next boot, and
- * it clears the row itself.
- *
- * Whoever woke the session discharges the promise: the promise is "this session
- * gets a container back", so a qualifying wake from any source satisfies it.
+ * Discharge this process's respawn promise once the session has a container again; otherwise every later boot
+ * replays it. Only a wake that read THIS promise's token when it started may discharge it (see `respawnIntents`).
  */
 function clearRespawnIntentOnWake(sessionId: string, token: number | undefined): void {
   if (token === undefined) return;
@@ -3367,23 +2536,9 @@ function clearRespawnIntentOnWake(sessionId: string, token: number | undefined):
 }
 
 /**
- * Reconcile the unconsumed `on_wake` rows an ADOPTED session is carrying.
- *
- * E integration (seam4/e-adoption): E owns the CALL SITE and ships this as a
- * no-op stub of the same name and signature, called once per adopted session
- * from `registerAdoptedContainer` after the claim fence and the registry write
- * (its `// F1 hook` marker). At the merge E's stub body is replaced by this
- * one and the call site needs no change.
- *
- * `withExistingMailboxSession`, never the provisioning opener: a session with
- * no mailbox was never adoptable in the first place, and creating one here
- * would author an `outbound.db` the host must never create (invariant I-10).
- * An absent mailbox reads as `undefined` and reconciles nothing.
- *
- * Best-effort by construction. Adoption runs before every wake source at boot,
- * so one session whose inbound DB cannot be read must not abort the pass for
- * every other survivor; the cost of the failure is a stale note, and the sweep
- * has its own paths for that.
+ * Reconcile the unconsumed `on_wake` rows an ADOPTED session carries. `withExistingMailboxSession`, never the
+ * provisioning opener: the host must never create an `outbound.db`. Best-effort: one unreadable session DB must
+ * not abort the boot pass.
  */
 export async function reconcileSurvivorWakeRows(session: Session): Promise<{ converted: number; withdrawn: number }> {
   /* eslint-disable no-catch-all/no-catch-all -- one unreadable session DB must not abort the boot pass */
@@ -3404,28 +2559,10 @@ export async function reconcileSurvivorWakeRows(session: Session): Promise<{ con
 }
 
 /**
- * Honor stop intents that outlived their process.
- *
- * A kill-with-respawn used to live only in a volatile `onExit` callback: a host
- * dying between the kill and the respawn forgot the restart entirely. The
- * durable `respawn_after_stop` row is consumed here at startup — a session
- * whose container is still up gets its kill re-issued with the respawn
- * re-armed; one without a container gets the respawn directly. The intent
- * clears only once the respawn wake actually succeeds, so a failed wake is
- * retried at the next startup while the sweep retries it sooner.
- *
- * A plain `'stop'` intent is honoured by the time this runs — by the process
- * exit that recorded it, by the boot door, or by the wake that later gave the
- * session a container again, which never touches the row — so every plain
- * row this pass reads is cleared after the respawn promises are handled
- * Left alone, the rows accumulate one per session and the table stops
- * being evidence of anything. A session still awaiting claim-fenced adoption
- * keeps its row: its container is alive and not yet re-fenced.
- *
- * `wake` and `hasContainer` are injected with their production defaults. The
- * second exists because the branch it selects is the one an interrupted restart
- * takes, and a unit test cannot put a container into the registry without a
- * container runtime; both are `activeContainers` reads in production.
+ * Consume durable `respawn_after_stop` rows at startup: a session whose container is still up gets its kill
+ * re-issued with the respawn re-armed; otherwise it is respawned directly. The intent clears only once the wake
+ * succeeds. Plain `'stop'` rows are already honoured and are cleared after. A session pending adoption keeps its
+ * row. `hasContainer` is injectable because tests cannot put a container in the registry.
  */
 export async function honorPendingStopIntents(
   wake: (session: Session) => Promise<boolean> = wakeContainer,
@@ -3443,18 +2580,12 @@ export async function honorPendingStopIntents(
   for (const intent of intents) {
     if (intent.stop_intent !== 'respawn_after_stop') continue;
     if (pendingAdoptions.has(intent.session_id)) {
-      // The session's container is alive but not yet re-fenced; acting on the
-      // intent now could kill or respawn the wrong incarnation. The row stays
-      // for the next recovery pass.
+      // Alive but not yet re-fenced: acting now could kill or respawn the wrong incarnation.
       log.warn('Deferring stop intent — session awaits claim-fenced adoption', { sessionId: intent.session_id });
       continue;
     }
     const session = await getSession(intent.session_id);
-    // `unwakeableReason`, not a `status` test: `archiveSessionById` stamps only
-    // `archived_at` and leaves `status` reading `active`, so an archive-only
-    // close looks recoverable to a status check while `wakeContainer` refuses
-    // it on the same axis. The intent would then never clear and never fire —
-    // a row this pass rereads, and declines, at every boot forever.
+    // `unwakeableReason`, not `status`: an archive-only close reads `active`, and the row would be declined forever.
     const unwakeable = session ? unwakeableReason(session) : 'session no longer exists';
     if (!session || unwakeable !== null) {
       log.info('Clearing a stop intent for a session that can no longer be woken', {
@@ -3471,8 +2602,7 @@ export async function honorPendingStopIntents(
       }
     };
     if (hasContainer(session.id)) {
-      // The kill never completed — the container outlived the host that
-      // ordered it. Re-issue the kill with the respawn re-armed.
+      // The container outlived the host that ordered the kill: re-issue it with the respawn re-armed.
       log.info('Re-issuing interrupted restart', { sessionId: session.id });
       killContainer(session.id, 'restart-intent-recovery', () => void respawn(), 'respawn_after_stop');
     } else {
@@ -3483,20 +2613,9 @@ export async function honorPendingStopIntents(
 }
 
 /**
- * Clear the plain `'stop'` rows the boot pass read, in one conditional write.
- * Each row is matched on the value AND the `updated_at` that was read,
- * so only the row version the pass saw is cleared: a kill that re-armed the
- * row to `respawn_after_stop` since, or recorded a fresh `'stop'` for the same
- * session (a thread close landing while an earlier respawn was awaited), wrote
- * a newer stamp and is left for the next boot. Never a row whose session is
- * pending adoption.
- *
- * A plain row whose session was ADOPTED at this boot — its container is still
- * running — is a STALE request: the host died between recording the stop and
- * issuing it, and the kill's reason (an idle reap, a ceiling, a cancel) may no
- * longer hold. It is cleared like the rest, named on its own line, and never
- * acted on: the sweep re-issues a kill on its own evidence if one is still
- * warranted. `respawn_after_stop` rows keep the honour path above.
+ * Clear the plain `'stop'` rows the boot pass read, matching value AND the `updated_at` read, so a row rewritten
+ * since is left for the next boot. A row whose session was ADOPTED this boot is a stale request: cleared and
+ * logged, never acted on (the sweep re-kills on its own evidence).
  */
 /** Rows per clear statement: two bound variables each, well inside SQLite's limit. */
 const STOP_INTENT_CLEAR_CHUNK = 400;
@@ -3511,18 +2630,9 @@ async function clearHonouredStopIntents(
   const honoured = plain.filter((intent) => !pendingAdoptions.has(intent.session_id));
   let cleared = 0;
   if (honoured.length > 0) {
-    // Bounded statements: one `(session_id, updated_at)` pair costs two bound
-    // variables, and one statement over an install's whole backlog would trip
-    // SQLite's bound-variable limit — then clear nothing, at every boot. The
-    // chunks run inside one transaction so the clear is all-or-nothing, and a
-    // failure is a WARN with the count, never a swallowed shadow write.
+    // Chunked to stay under SQLite's bound-variable limit, inside one transaction so the clear is all-or-nothing.
     const now = new Date().toISOString();
-    // `RETURNING session_id` names the rows the conditional UPDATE actually
-    // touched, which is a strict subset of `honoured`: a row rewritten since
-    // the read carries a newer stamp and is skipped. The per-session lines
-    // below are driven by that subset, so a line never claims a clear that did
-    // not happen. Row count and `changes` are the same number here, so
-    // the aggregate `cleared` count is unchanged.
+    // `RETURNING` names the rows actually cleared (a subset), so a log line never claims a clear that did not happen.
     let clearedIds: string[];
     /* eslint-disable no-catch-all/no-catch-all -- a failed clear must not block startup; it is reported and retried next boot */
     try {
@@ -3556,62 +2666,34 @@ async function clearHonouredStopIntents(
       }
     }
   }
-  // Logged whenever a plain row was read, so a boot that deferred every one
-  // of them reads as such rather than as a boot that had nothing to clear.
   log.info('Cleared honoured stop intents at startup', {
     cleared,
     deferredPendingAdoption: pending.length,
   });
 }
 
-/**
- * The error a spawn should abort with when a kill was requested mid-wake.
- *
- * Consulted at BOTH points a spawn can still be stopped: once at the reserved
- * spawn boundary, before any of the preparation that writes to disk, and again
- * as the last word before `docker run`. Everything between those two awaits, so
- * one check cannot cover both — the same after-every-await discipline the rest
- * of this file follows.
- */
+/** Checked at the reserved spawn boundary AND as the last word before `docker run`: everything between awaits. */
 function pendingKillCancellation(sessionId: string): Error | null {
   const pending = pendingKills.get(sessionId);
   return pending ? new Error(`Container spawn cancelled by a kill request: ${pending.reason}`) : null;
 }
 
-/**
- * Settle a kill request recorded while the session was spawning.
- *
- * Called from `trackWake`'s completion, which is the ONE place every wake ends
- * — cancelled at the pre-spawn check, failed on admission or a lease, or
- * succeeded. Putting it there rather than at the cancellation point means a
- * wake that dies before ever reaching that point still settles the request,
- * instead of leaving a caller waiting on an `onExit` that can never come.
- */
+/** Called from `trackWake`'s completion, where every wake ends, so a wake that dies early still settles the request. */
 function settlePendingKill(sessionId: string): void {
   const pending = pendingKills.get(sessionId);
   if (!pending) return;
-  // A second wake is already in flight for this session. The request is against
-  // the SESSION, not one attempt, so leave it for that wake to settle.
+  // Another wake is in flight: the request is against the SESSION, so leave it for that wake.
   if (isContainerSpawning(sessionId)) return;
   pendingKills.delete(sessionId);
   if (activeContainers.has(sessionId)) {
-    // The wake got a process registered before the request could stop it. Kill
-    // it now; the callbacks ride the real process exit, as they would have if
-    // the request had arrived a moment later.
+    // A process registered before the request could stop it: kill it; callbacks ride its exit.
     stopRunningContainer(sessionId, pending.reason, pending.onExit);
     return;
   }
-  // No container was ever started — but the wake may still be QUEUED. The
-  // memory-admission controller keeps a queued payload after the wake promise
-  // settles, so firing the exit work here without cancelling it would let a
-  // caller clear and archive the session as final, and a later reservation
-  // release would then drain the queue and spawn into it. `archiveSessionById`
-  // sets only `archived_at`, so `sessionStillActive` would not catch that
-  // spawn either: the row is still `active`.
+  // The wake may still be QUEUED in the admission controller: cancel it, or a later release would spawn into a
+  // session the caller already archived as final (an archive-only close still reads `active`).
   cancelMemoryAdmission(sessionId);
-  // There is no process close to ride, so the exit work runs now — the
-  // caller's contract is "this session has no container any more", and with the
-  // queue cleared that is now true rather than nearly true.
+  // No process close to ride, so the exit work runs now.
   clearStatusOnKill(sessionId, pending.reason);
   for (const callback of pending.onExit) {
     try {
@@ -3627,35 +2709,11 @@ function settlePendingKill(sessionId: string): void {
 }
 
 /**
- * Door 1 of host shutdown (plan §4.3.5): close the spawn path, leave every
- * running container alone.
- *
- * Replaces `stopAllContainers()` on the shutdown path. It keeps the two things
- * the shutdown flag actually buys — `containerShutdownInProgress`, which every
- * spawn re-checks up to the last word before `docker run`, and the memory
- * admission controller's shutdown, which drops its queue — and then waits only
- * for wakes still IN FLIGHT to settle, bounded by the grace period, so no
- * spawn can slip in after the snapshot. Containers already running are what
- * the next host adopts (`adoptRunningSessions`); stopping them here is the
- * per-restart interruption this seam removes. The unit file's `KillMode=mixed`
- * and the removal of its `ExecStop` are the other two doors — without those,
- * systemd still kills the client children and their containers with them.
- *
- * Returns what was left running, for the operator log and for the restart
- * warning's stopping set (series G): under this door that set is empty.
+ * Door 1 of host shutdown: close the spawn path (every spawn re-checks `containerShutdownInProgress`), drop the
+ * admission queue, wait for in-flight wakes, and leave running containers for the next host to adopt. The unit's
+ * `KillMode=mixed` and empty `ExecStop` are the other doors; without them systemd still kills the containers.
  */
-/**
- * The sessions `beginContainerShutdown()` will stop, computed without stopping
- * anything — the restart warning's input (series G), asked BEFORE the door
- * runs so the note is in place before a container dies.
- *
- * Under door 1 this is the empty set: every running container is left for the
- * next host to adopt. Until the unit-file doors land, systemd's `ExecStop`
- * sweep still stops those containers after this process exits and they get no
- * note — accepted, because the three doors ship on the same restart (plan §7)
- * and a warn sized to `ExecStop` would be a warn for every session on every
- * restart thereafter.
- */
+/** Under door 1 this is empty: every running container is left for the next host to adopt. */
 export function planContainerShutdown(): ReadonlySet<string> {
   return new Set<string>();
 }
@@ -3688,23 +2746,8 @@ export async function beginContainerShutdown(
 }
 
 /**
- * Stop every active container synchronously at host shutdown.
- *
- * NO LONGER on the shutdown path (plan §4.3.5, door 1): `beginContainerShutdown`
- * replaced it so containers survive a host restart and are adopted by the next
- * process. Kept exported, with its tests, as the rollback path — a build
- * reverted onto a unit that still stops nothing needs something that does —
- * and it is on the dead-code kill list for the day that rollback is no longer
- * plausible. Its pre-E rationale, for that reader:
- *
- * Without it, child container subprocesses lingered in the cgroup after the
- * parent exited and systemd stalled for `TimeoutStopSec` on every restart
- * before SIGKILLing them. v1 wired this into `GroupQueue.shutdown`; v2 lost it
- * during the v1→v2 rewrite and the host lingered similarly.
- *
- * Issues `docker stop` (SIGTERM then docker's own timeout → SIGKILL) to
- * every tracked container in parallel, waits for their close events up
- * to `gracePeriodMs`, then hard-kills anything still alive.
+ * NOT on the shutdown path (containers survive a host restart and are adopted); kept as the rollback path for a
+ * unit that still stops nothing. Stops every tracked container, waits up to `gracePeriodMs`, then kills.
  */
 export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise<void> {
   containerShutdownInProgress = true;
@@ -3735,7 +2778,6 @@ export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise
   });
   await Promise.race([Promise.all(exits).then(() => undefined), timeout]);
   if (timeoutHandle) clearTimeout(timeoutHandle);
-  // Hard-kill anything still tracked after the grace period.
   for (const [sessionId, entry] of activeContainers.entries()) {
     log.warn('Container did not exit within grace period; SIGKILL', {
       sessionId,
@@ -3745,13 +2787,7 @@ export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise
   }
 }
 
-/**
- * Resolve a host env var value, folder-scoped.
- *
- * Lookup order:
- *   1. `<BASE>_<FOLDER_UPPER>` (dashes→underscores) — scoped variant
- *   2. `<BASE>` — unscoped default
- */
+/** `<BASE>_<FOLDER_UPPER>` (dashes→underscores), else `<BASE>`. */
 function resolveScopedEnv(baseName: string, folder: string): string | undefined {
   const conv = `${baseName}_${folder.toUpperCase().replace(/-/g, '_')}`;
   return process.env[conv] ?? process.env[baseName];
@@ -3805,41 +2841,23 @@ export function resolveAtlassianMcpServer(configuredBaseUrl: string | undefined)
   }
 }
 
-/**
- * Resolved Anthropic credentials for a single agent group. Forwarded
- * inside the container under their unscoped names so the agent-runner's
- * existing rotation regex (`/^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/`,
- * `/^ANTHROPIC_API_KEY_(\d+)$/`) matches verbatim.
- */
+/** Forwarded under their unscoped names so the runner's `_N` rotation regexes match verbatim. */
 export interface ResolvedAnthropicAuth {
   oauthPrimary?: string;
   oauthFallbacks: { index: number; value: string }[];
   apiKeyPrimary?: string;
   apiKeyFallbacks: { index: number; value: string }[];
   /**
-   * True when the OAuth set came from a per-group `<BASE>_<FOLDER>` scope
-   * rather than the global pool. Slots are forwarded under their unscoped
-   * `_N` names either way, so this flag is the ONLY thing that distinguishes
-   * "global slot 2" from "this group's own slot 2" — different Anthropic
-   * accounts whose rate-limit windows share no denominator.
+   * The OAuth set came from a per-group scope. Slots are forwarded under unscoped `_N` names either way, so this
+   * is the ONLY thing distinguishing "global slot 2" from "this group's slot 2" (different accounts).
    */
   oauthScoped: boolean;
 }
 
 /**
- * Per-group Anthropic credentials. Default behaviour: every container
- * receives the global `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (and
- * their `_N` rotation siblings). To pin a workplace account to a single
- * agent group, set `<BASE>_<FOLDER_UPPER>` (and optional rotation
- * siblings `<BASE>_<FOLDER_UPPER>_<N>`) in `.env` — when the per-group
- * primary is present, the *entire* rotation set comes from the per-group
- * variant and the global tokens are not forwarded. This prevents a
- * workplace account from ever falling back to a personal one (or vice
- * versa) on retryable errors.
- *
- * Folder names are uppercased and hyphens are normalised to underscores,
- * matching `resolveScopedEnv`. Folder names that match `^\d+$` collide
- * with the rotation suffix and per-group resolution is skipped for them.
+ * When `<BASE>_<FOLDER_UPPER>` is set, the ENTIRE rotation set comes from the per-group variant and global tokens
+ * are not forwarded, so a workplace account never falls back to a personal one. Folders matching `^\d+$` collide
+ * with the rotation suffix and skip per-group resolution.
  */
 export function resolveAnthropicAuth(
   folder: string,
@@ -3857,11 +2875,7 @@ export function resolveAnthropicAuth(
   };
 }
 
-/**
- * Wiki actors may receive model credentials and nothing else. Prefer the
- * subscription token set when both supported families are configured, then
- * fall back to the API-key rotation set.
- */
+/** Wiki actors receive model credentials only: the subscription token set if present, else the API-key set. */
 export function wikiModelAuth(auth: ResolvedAnthropicAuth): Record<string, string> {
   if (auth.oauthPrimary) {
     return Object.fromEntries([
@@ -3883,35 +2897,14 @@ export function assertWikiEgressAllowed(egressLockdown: boolean): void {
   if (egressLockdown) throw new Error('Wiki maintenance requires direct model egress');
 }
 
-/**
- * Resolve the host-side `.codex/` directory to mount for a given agent
- * group's container. Mirrors the per-group OAuth pattern from
- * `resolveAnthropicAuth` but for Codex, which stores credentials as an
- * `auth.json` file rather than env-var tokens.
- *
- * Convention: a per-group dir at `~/.codex-<folder>/` (with a real
- * `auth.json`) wins over the global `~/.codex/`. Operators create it by
- * running `CODEX_HOME=~/.codex-<folder> codex login` once, which logs the
- * user into a SEPARATE ChatGPT/OpenAI account and writes that account's
- * tokens to the scoped dir.
- *
- * Falls back to the global `~/.codex/` when no per-group dir exists, so
- * existing single-account installs keep working unchanged.
- *
- * Exported for unit testing — keeps the resolver pure (no side effects)
- * and lets test fixtures stand in for a real homedir.
- */
+/** `~/.codex-<folder>/` with a real `auth.json` (a separate account via `CODEX_HOME=… codex login`) wins over `~/.codex/`. */
 export function resolveCodexAuthDir(folder: string, homedir: string = os.homedir()): string {
   const scoped = path.join(homedir, `.codex-${folder}`);
   if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
   return path.join(homedir, '.codex');
 }
 
-/**
- * Resolved fallback OAuth dir for a codex container: host path → container
- * mount path. Returned in declared order; index 0 maps to `.codex-fallback-1`,
- * index 1 to `.codex-fallback-2`, etc.
- */
+/** Index 0 maps to `.codex-fallback-1`, index 1 to `.codex-fallback-2`, etc. */
 export interface CodexAuthFallback {
   hostPath: string;
   containerPath: string;
@@ -3920,16 +2913,8 @@ export interface CodexAuthFallback {
 const CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH = '/home/node/.codex-host-primary';
 
 /**
- * Filter a `codexAuthFallbacks` declaration into a deduped, validated list
- * of fallback mounts. Entries are silently skipped when:
- *   - the declared host path doesn't have an `auth.json`
- *   - the path resolves to the same dir as the primary mount
- *   - the entry has already been seen earlier in the list
- *
- * `~/` is expanded relative to `homedir`. Both the mount block and the
- * env-forward block call this so they stay in sync without sharing state.
- *
- * Exported for unit testing.
+ * Entries without an `auth.json`, equal to the primary, or already seen are silently skipped. Both the mount block
+ * and the env-forward block call this so they stay in sync.
  */
 export function resolveCodexAuthFallbacks(
   declarations: string[] | undefined,
@@ -3954,32 +2939,10 @@ export function resolveCodexAuthFallbacks(
 }
 
 /**
- * True for a credential-staging failure caused by HOST STATE rather than by a
- * bug here: a SYSCALL error, or one of the `Unsafe …` refusals the staging
- * guards raise (`src/fs-safety.ts`, plus `stageCodexAuth` and
- * `materializeCodexFallbackRuntime` below).
- *
- * A PEER credential — Codex in a non-codex container, OpenCode in any of them —
- * is withheld on one of these rather than failing the spawn. Anything else
- * rethrows: swallowing a TypeError would turn a provider off fleet-wide behind
- * one warn per spawn.
- *
- * "Syscall error" means the bare-`E…` code shape (`ENOENT`, `EACCES`, `EEXIST`),
- * NOT any string `code`: Node stamps its own argument-validation TypeErrors with
- * codes too (`ERR_INVALID_ARG_TYPE`), and those are exactly the bugs this
- * predicate exists to let through. The underscore is what separates them.
- *
- * `Invalid group folder` (`src/group-folder.ts`, reached through
- * `stageOpenCodeAuth`'s defense-in-depth check on the scoped path) counts as
- * host state too: a live `agent_groups.folder` CAN fail the grammar, because
- * not every creation path checks it. `toFolder` in
- * `src/modules/permissions/channel-approval.ts` has no length cap, so a
- * channel name of 65+ characters mints a folder the 64-char pattern refuses,
- * and `setup/migrate-v2/groups.ts` carries v1 folder names over verbatim.
- * The spawn path itself never checks the grammar, so such a group spawned fine
- * before this PR; making the peer credential the one thing that renders it
- * unspawnable would be a regression. Withholding also means the scoped path is
- * never built, which is strictly safer than proceeding.
+ * A credential-staging failure caused by HOST STATE: a syscall error (bare `E…` code; Node's own `ERR_…`
+ * validation codes are bugs and must rethrow), an `Unsafe …` staging refusal, or `Invalid group folder` (live
+ * folders can fail the grammar). A PEER credential is withheld on these; anything else rethrows, or a TypeError
+ * would silently disable a provider fleet-wide.
  */
 const HOST_STATE_REFUSAL = /^(Unsafe |Invalid group folder )/;
 
@@ -3990,13 +2953,9 @@ function isHostStateFailure(err: unknown): err is Error {
 }
 
 /**
- * Stage a session-local CODEX_HOME whose only host coupling is the credential.
- * The directory itself is session-owned with a GENERATED config.toml; the host
- * home's `auth.json` is FILE-bind-mounted into it, so an OAuth refresh inside
- * the container still writes back to the host file while the rest of that home
- * — `config.toml`, `hooks.json`, `hooks/`, `AGENTS.md`, transcripts — never
- * reaches the container. Shared by the peer-mode primary home and every
- * fallback identity.
+ * A session-local CODEX_HOME whose only host coupling is `auth.json`, FILE-bind-mounted so an in-container OAuth
+ * refresh writes back to the host; the rest of the host home (config, hooks, AGENTS.md, transcripts) never reaches
+ * the container.
  */
 export function stageCodexAuth(hostHomePath: string, runtimeHostPath: string, containerPath: string): VolumeMount[] {
   fs.mkdirSync(runtimeHostPath, { recursive: true });
@@ -4021,11 +2980,7 @@ export function stageCodexAuth(hostHomePath: string, runtimeHostPath: string, co
   ];
 }
 
-/**
- * Build a session-local CODEX_HOME for one fallback identity. `stageCodexAuth`
- * contributes the credential and the generated config; this adds `sessions/`,
- * the one piece of mutable history a rotated-to identity must keep.
- */
+/** Adds `sessions/`, the one piece of mutable history a rotated-to identity must keep. */
 export function materializeCodexFallbackRuntime(fallback: CodexAuthFallback, runtimeHostPath: string): VolumeMount[] {
   const mounts = stageCodexAuth(fallback.hostPath, runtimeHostPath, fallback.containerPath);
 
@@ -4046,14 +3001,8 @@ export function materializeCodexFallbackRuntime(fallback: CodexAuthFallback, run
 }
 
 /**
- * Sentinel value injected by `onecli run --` as the host service's
- * CLAUDE_CODE_OAUTH_TOKEN. The wrapper's own proxy substitutes it for a
- * real vault token at request time — but the literal string is never a
- * usable bearer credential. If we read it as the "host primary" and
- * forward it to a container, the container's Claude Max OAuth bypass
- * path strips OneCLI's container-side substitution and sends
- * "placeholder" verbatim to api.anthropic.com, producing
- * `401 Invalid bearer token`. Treat it as absent.
+ * `onecli run --` injects this literal as the host's CLAUDE_CODE_OAUTH_TOKEN. Forwarded to a container it reaches
+ * api.anthropic.com verbatim (`401 Invalid bearer token`), so treat it as absent.
  */
 const PLACEHOLDER_SENTINEL = 'placeholder';
 
@@ -4070,20 +3019,8 @@ function resolveScopedRotationSet(
   const folderTok = folder.toUpperCase().replace(/-/g, '_');
   const isPureDigits = /^\d+$/.test(folderTok);
 
-  // Effective credential view, placeholder-filtered: process.env first, then
-  // the `.env` file OVERLAID on top (disk wins). The host loads `.env` into
-  // process.env ONCE at startup, so any per-group `<base>_<FOLDER>`, scoped
-  // numbered sibling, or global `<base>_N` that was added OR changed in `.env`
-  // after the host started is invisible in process.env until a full host
-  // restart. We read `.env` fresh at each spawn and let it win, so an operator
-  // editing per-group tokens sees the change on the next container respawn —
-  // no host bounce. Disk-wins also subsumes the placeholder-shadow recovery:
-  // `onecli run --` injects `<base>=placeholder` into process.env, which the
-  // filter strips, and the real value from `.env` shows through. Previously
-  // ONLY the global `<base>` primary was disk-recovered (a single `??`), so
-  // scoped sets and numbered siblings fell through to the global pool until a
-  // restart. (Incidents: 2026-06-25 placeholder shadow, 2026-06-27 a group ran
-  // weeks on the global pool while its scoped 3-account set sat unseen.)
+  // process.env overlaid by a fresh read of `.env` (disk wins): the host loads `.env` once at startup, so token
+  // edits would otherwise need a host restart. This also recovers values shadowed by the placeholder.
   const merged: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
     const fv = _filterPlaceholder(v);
@@ -4120,12 +3057,8 @@ function resolveScopedRotationSet(
   }
   fallbacks.sort((a, b) => a.index - b.index);
 
-  // Last resort: when even the recovered view has no real `<base>` primary
-  // (only numbered siblings exist — e.g. `onecli run --` placeholder + real
-  // `_2`/`_3` in .env), promote the first sibling so the container's rotation
-  // pool stays the same size. Without this, container-runner's `if (hostOauth)`
-  // gate skips forwarding fallbacks entirely and non-scoped groups silently
-  // lose their rotation pool, collapsing to OneCLI vault single-token mode.
+  // Only numbered siblings exist (e.g. placeholder primary + real `_2`/`_3`): promote the first, or the
+  // `if (hostOauth)` gate skips forwarding and the group loses its rotation pool.
   if (!primary && fallbacks.length > 0) {
     const promoted = fallbacks.shift()!;
     return { primary: promoted.value, fallbacks, scoped: false };
@@ -4133,11 +3066,7 @@ function resolveScopedRotationSet(
   return { primary, fallbacks, scoped: false };
 }
 
-/**
- * Remove every `-e <key>=...` pair from args whose key matches. Used to
- * delete placeholder values OneCLI injects for credentials we plan to
- * substitute with the real value ourselves. Mutates args in place.
- */
+/** Remove every `-e <key>=...` pair from args. Mutates args in place. */
 export function stripEnvEntry(args: string[], key: string, onlyValue?: string): void {
   const prefix = `${key}=`;
   for (let i = args.length - 2; i >= 0; i--) {
@@ -4149,11 +3078,8 @@ export function stripEnvEntry(args: string[], key: string, onlyValue?: string): 
 }
 
 /**
- * Append a host to the container's NO_PROXY / no_proxy env entries,
- * merging with any value OneCLI (or an earlier step) already set. Mutates
- * args in place. If neither form is present, adds both uppercase and
- * lowercase entries — Node respects uppercase, many Python/Go tools only
- * read lowercase.
+ * Merges into existing entries; adds both NO_PROXY and no_proxy when neither exists (Node reads uppercase, many
+ * Python/Go tools only lowercase). Mutates args in place.
  */
 function mergeNoProxy(args: string[], host: string): void {
   const keys = ['NO_PROXY', 'no_proxy'];
@@ -4178,52 +3104,20 @@ function mergeNoProxy(args: string[], host: string): void {
   }
 }
 
-/**
- * Host dir holding per-group GCP service-account key files. Drop a key at
- * `~/.config/nanoclaw-gcp/<credentialFolder>.json` (0600) to grant a group
- * BigQuery / gcloud / gsutil access. Mirrors the gws accounts-dir convention.
- */
+/** Per-group GCP service-account keys: `~/.config/nanoclaw-gcp/<credentialFolder>.json` (0600). */
 const GCP_SA_KEYS_DIR = path.join(os.homedir(), '.config', 'nanoclaw-gcp');
 /**
- * Container path for the mounted key — a DEDICATED dir, deliberately NOT inside
- * `~/.config/gcloud`. Bind-mounting a file under the gcloud config dir makes
- * Docker create that dir root-owned, so gcloud/bq can no longer write their own
- * state ("Could not setup log file"). `bq`/`gcloud` CLIs authenticate via the
- * agent-runner's `gcloud auth activate-service-account` at startup; client libs
- * + `gcloud auth application-default` read it through GOOGLE_APPLICATION_CREDENTIALS.
+ * A dedicated dir, deliberately NOT under `~/.config/gcloud`: a file bind there makes Docker create the dir
+ * root-owned, and gcloud/bq can no longer write their own state.
  */
 const GCP_KEY_CONTAINER_PATH = '/home/node/.gcp/service-account.json';
 
-/**
- * gcloud's config dir for these containers. Historically the default
- * `~/.config/gcloud` was unusable: the gws accounts mount
- * (`/home/node/.config/gws/accounts`) made Docker create `/home/node/.config`
- * ROOT-owned, but the container runs as `node` (uid 1001) — so gcloud/bq
- * couldn't create their config dir and activation failed with "Could not
- * create directory [/home/node/.config/gcloud]". The image now pre-creates
- * `/home/node/.config` node-owned (container/Dockerfile permissions block),
- * so the default would work again — but a dedicated dir keeps gcloud state
- * isolated from cred mounts, so CLOUDSDK_CONFIG stays pointed here. As a
- * container env var it's also inherited by `docker exec`, so manual gcloud/bq
- * invocations see the activated account too.
- */
+/** Keeps gcloud state isolated from credential mounts; as container env it is also inherited by `docker exec`. */
 const GCP_CLOUDSDK_CONFIG_CONTAINER_PATH = '/home/node/.gcloud-config';
 
 /**
- * Resolve a per-group GCP service-account key file on the host.
- *
- * Why a file mount and not the OneCLI vault: vault secrets are HTTP-header
- * injection on a host pattern (`onecli@1.4.x` types: anthropic | generic). A
- * service-account key is a private key that gcloud uses to MINT short-lived
- * tokens locally — there is no static header to inject and the vault can't
- * materialize it as a file. This follows the gws/wix code-mount pattern,
- * which deliberately bypasses the agent-facing `additionalMounts` path (that
- * blocks credential-shaped paths and sandboxes targets away from `~/.config`).
- *
- * Keyed on `credentialFolder` so sibling groups that inherit a parent's creds
- * via `credentialFolder` share the one key (e.g. example-retail-codex/-opencode
- * resolve to example-retail's key). Returns the absolute host path, or null when
- * no key is configured — the common case, leaving such groups untouched.
+ * A file mount, not the OneCLI vault: gcloud MINTS tokens from the private key locally, so there is no header to
+ * inject. Keyed on `credentialFolder` so siblings share the parent's key. Null when none is configured.
  */
 function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
   const keyPath = path.join(GCP_SA_KEYS_DIR, `${credentialFolder}.json`);
@@ -4235,16 +3129,7 @@ function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
   }
 }
 
-/**
- * Phase 5.3: write a capabilities snapshot into the session dir at
- * every container spawn. Container's get_capabilities MCP tool reads
- * this JSON directly — no round-trip, always fresh per spawn.
- */
-/**
- * The snapshot's bytes, rendered from the AWAITED capabilities. Split out so a
- * test can prove the await: `JSON.stringify` of a Promise is `{}` and no lint
- * rule sees it (seam-3 async-hazard class), so the proof is behavioural.
- */
+/** Split out so a test can prove the await: `JSON.stringify` of a Promise is `{}` and no lint rule catches it. */
 export async function renderCapabilitiesSnapshot(
   agentGroupId: string,
   sessionMessagingGroupId: string | null,
@@ -4269,12 +3154,7 @@ async function writeCapabilitiesSnapshot(
   }
 }
 
-/**
- * Credential env vars auto-forwarded per agent group via <NAME>_<FOLDER>
- * → <NAME> resolution. Non-sensitive tool-config vars belong in the image
- * or container.json — this list is for things whose *value* differs per
- * group.
- */
+/** Forwarded per group via `<NAME>_<FOLDER>` → `<NAME>`: only vars whose VALUE differs per group belong here. */
 const SCOPED_CREDENTIAL_VARS = [
   'RENDER_API_KEY',
   'RENDER_WORKSPACE_ID',
@@ -4286,70 +3166,42 @@ const SCOPED_CREDENTIAL_VARS = [
   'SNOWFLAKE_DATABASE',
   'DBT_CLOUD_ACCOUNT_ID',
   'DBT_CLOUD_API_TOKEN',
-  // dbt Cloud email/password login path — v1 carried these; skills that
-  // use the email+password flow (not just Account-ID/API-Token) need them.
   'DBT_CLOUD_EMAIL',
   'DBT_CLOUD_PASSWORD',
   'DBT_CLOUD_API_URL',
-  // dbt-mcp (dbt-labs/dbt-mcp) — Discovery + Semantic Layer + Admin API.
-  // Token reuses DBT_CLOUD_API_TOKEN; these are the additional vars dbt-mcp
-  // requires that the raw REST flow does not.
   'DBT_HOST',
   'DBT_MULTICELL_ACCOUNT_PREFIX',
   'DBT_PROD_ENV_ID',
   'DBT_DEV_ENV_ID',
   'DBT_USER_ID',
   'DBT_MCP_DISABLE_TOOLS',
-  // Looker API3 credentials — agent shell needs these to do the /login
-  // dance (POST /api/4.0/login → access_token) for direct REST calls.
-  // Previously only flowed to the looker MCP subprocess; this exposes
-  // them to the container's main env in parallel so curl/scripts can
-  // authenticate without going through the MCP tool surface.
   'LOOKER_BASE_URL',
   'LOOKER_CLIENT_ID',
   'LOOKER_CLIENT_SECRET',
   'ATLASSIAN_BASE_URL',
   'SELECT_ORGANIZATION_ID',
-  // OPENAI_API_KEY and DEEPGRAM_API_KEY removed 2026-07-27 — see the matching
-  // note in capabilities.ts SCOPED_ENV_NAMES, which this list must stay in sync
-  // with. Neither is in use; forwarding them only propagated a placeholder and a
-  // dead vault entry. The codex provider still forwards OPENAI_API_KEY itself
-  // from ctx.hostEnv (src/providers/codex.ts), so its fallback auth is intact.
+  // Must stay in sync with capabilities.ts SCOPED_ENV_NAMES.
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
   'ELEVENLABS_API_KEY',
   'RESIDENTIAL_PROXY_URL',
-  // Omni API — required by the omni skill; absent → first call fails 401.
   'OMNI_BASE_URL',
   'OMNI_API_KEY',
-  // Railway CLI / API — `railway login` uses this token; absent → CLI hangs
-  // on interactive auth inside the container.
   'RAILWAY_API_TOKEN',
-  // Browser-auth skill (Playwright geo-fenced login flows) — absent → login
-  // form can't be filled and the skill times out on the first call.
   'BROWSER_AUTH_URL',
   'BROWSER_AUTH_EMAIL',
   'BROWSER_AUTH_PASSWORD',
-  // Supabase CLI: project ref + DB password for `supabase link`, access token
-  // for management API (`supabase projects list`, etc.).
   'SUPABASE_PROJECT_REF',
   'SUPABASE_ACCESS_TOKEN',
   'SUPABASE_DB_PASSWORD',
-  // Git commit identity. Env vars take precedence over `git -c user.name=...`
-  // overrides used by the in-container git_commit MCP tool, so setting these
-  // per-group attributes commits to the human, not "agent".
+  // Env vars outrank the git_commit tool's `git -c user.name=` overrides, so these attribute commits to the human.
   'GIT_AUTHOR_NAME',
   'GIT_AUTHOR_EMAIL',
   'GIT_COMMITTER_NAME',
   'GIT_COMMITTER_EMAIL',
 ];
 
-/**
- * Resolve the scoped credentials emitted into a container at spawn. An
- * explicit gitIdentity is deliberately narrower than credentialFolder: it
- * replaces only Git attribution while every other credential keeps its
- * existing lookup order.
- */
+/** An explicit gitIdentity replaces only Git attribution; every other credential keeps its lookup order. */
 export function resolveScopedCredentialEnv(
   containerConfig: Pick<ContainerConfig, 'gitIdentity'>,
   credentialFolder: string,
@@ -4364,9 +3216,6 @@ export function resolveScopedCredentialEnv(
   return resolved;
 }
 
-// Canonical definition moved to db/container-configs.ts so light consumers
-// (router flag parsing) don't import this module, which most of the test
-// suite factory-mocks. Re-exported here for existing import sites.
 export { resolveProviderName } from './db/container-configs.js';
 
 async function resolveProviderContribution(
@@ -4390,31 +3239,10 @@ async function resolveProviderContribution(
 }
 
 /**
- * Read-only mounts for a group's per-channel operating instructions —
- * `groups/<folder>/channel-instructions/*.md` at `/workspace/channel-instructions`.
- * Selected per wiring through `messaging_group_agents.instructions_profile`;
- * a SEPARATE layer from tone, which stays voice-only.
- *
- * Mounted FILE BY FILE rather than as one directory, and that is the whole
- * trick. Workgroup siblings share one rule set by symlink (each sibling group
- * points at the owning group's channel-instructions/<name>.md),
- * and a per-file symlink cannot survive a directory bind here: the mount sits
- * at /workspace/channel-instructions, two levels from container root, while
- * its host source sits at groups/<folder>/channel-instructions, three levels
- * from the project root — so a relative link like
- * ../../<owner>/channel-instructions/<name>.md resolves to a different place on
- * each side and dangles inside the container. Resolving host-side and binding
- * the real file at a literal destination sidesteps that entirely, and matches
- * how standing-instructions.md is already shared: the host resolves that one
- * host-side too (readGroupPersona), never in the container. A directory-level
- * symlink works as well, since realpathSync covers both shapes.
- *
- * SECURITY: same boundary as the symlink overlay in buildMounts — the group
- * dir is mounted RW, so an agent could plant
- * channel-instructions/x.md -> /etc/shadow and have the host bind it into its
- * own always-on prompt. `isAllowedTarget` must be the overlay allowlist (own
- * group dir, workgroup siblings, workgroup shared tree); anything resolving
- * outside is skipped loudly rather than mounted.
+ * Mounted FILE BY FILE: sibling groups share rules by per-file symlink, and a relative link resolves differently
+ * inside a directory bind (different depth), so the host resolves each file and binds the real one.
+ * SECURITY: the group dir is agent-writable, so a planted `x.md -> /etc/shadow` would enter the agent's prompt;
+ * `isAllowedTarget` must be the overlay allowlist, and anything outside is skipped loudly.
  */
 export function channelInstructionsMounts(
   groupDir: string,
@@ -4452,8 +3280,7 @@ export function channelInstructionsMounts(
       realFile = fs.realpathSync(linkPath);
       if (!fs.statSync(realFile).isFile()) continue;
     } catch {
-      // Dangling link or vanished file — nothing to bind, and a spawn must
-      // not fail over a stale entry in an advisory directory.
+      // Dangling or vanished: a stale entry must not fail the spawn.
       continue;
     }
     if (!isAllowedTarget(realFile)) {
@@ -4473,17 +3300,7 @@ export function channelInstructionsMounts(
   return mounts;
 }
 
-/**
- * One line per synchronous stage of a spawn, so the next stall can be
- * attributed without another sampling session.
- *
- * An earlier stall cost a day of investigation because the whole window between waking a
- * container and loading the mount allowlist emitted no logs at all — roughly
- * 1,450 lines of prologue, ending at the first OneCLI line, which is why the
- * OneCLI path was blamed for a block that had already finished by then.
- * Unconditional and unsampled: a stage that only stalls occasionally is
- * exactly the one a sampled log would miss.
- */
+/** Unconditional and unsampled: an occasional stall is exactly what a sampled log would miss. */
 function logSpawnStage(stage: string, startedAt: number): void {
   log.info('Spawn stage timing', { stage, ms: Date.now() - startedAt });
 }
@@ -4494,17 +3311,10 @@ export async function buildMounts(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
-  // Resolved workgroup id from reconcileWorkgroupAtSpawn. Threaded in by
-  // spawnContainer so every subsystem sees the same value, eliminating the
-  // race where re-deriving inside buildMounts could observe a different
-  // workgroup than reconcile just settled on. Defaults to the agentGroup
-  // field for direct callers (tests, etc.) that don't go through
-  // spawnContainer.
+  // Reconciled by spawnContainer so every subsystem sees one value; direct callers (tests) fall back to the row.
   resolvedWgId?: string,
 ): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
-  // This value was reconciled under the spawn lock. It is the authority for
-  // both cross-workgroup policy and the ordinary workgroup mounts below.
   const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
   const wikiActor = wikiEnrollment(agentGroup.id, containerConfig.wikiMaintenance === true);
   if (wikiActor) {
@@ -4546,9 +3356,7 @@ export async function buildMounts(
   }
   const workgroupReadAccessStartedAt = Date.now();
   const workgroupReadAccess = await resolveWorkgroupReadAccess(wgKey);
-  // The policy chooses *which* registered roots may be offered. The existing
-  // operator allowlist remains the final host-path gate, including its blocked
-  // patterns and realpath checks. A policy grant can therefore never bypass it.
+  // The operator allowlist stays the final host-path gate: a policy grant can never bypass it.
   const validatedWorkgroupReadAccess = workgroupReadAccess
     ? validateAdditionalMounts(workgroupReadAccess.requests, `${agentGroup.name} (workgroup read access)`).map(
         (mount) => ({
@@ -4561,22 +3369,16 @@ export async function buildMounts(
   // Resolved once, against this session's /workspace, so the composed doc and the mount set agree.
   const workgroupWiki = resolveWorkgroupWiki(wgKey, sessionDir(agentGroup.id, session.id));
 
-  // Default agent surfaces (composed project doc, skill links, provider state
-  // dir) apply unless the provider's registration declares it provides its
-  // own — a capability, never a provider name. See provider-container-registry.
+  // Default agent surfaces apply unless the provider's registration declares its own (a capability, never a name).
   const defaultSurfaces = !providerProvidesAgentSurfaces(provider);
 
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
   if (defaultSurfaces) {
-    // Sync skill symlinks based on container.json selection before mounting.
     const skillSymlinksStartedAt = Date.now();
     syncSkillSymlinks(claudeDir, containerConfig);
     logSpawnStage('skill-symlinks', skillSymlinksStartedAt);
 
-    // Worker subagent defs (orchestrator mode) — Claude-only: other providers
-    // don't read ~/.claude/agents, and the defs' frontmatter is Claude-format.
-    // Best-effort: the roster is optional, a copy failure must not abort the
-    // spawn (pending messages would retry with no container at all).
+    // Claude-only (other providers don't read ~/.claude/agents). Best-effort: a copy failure must not abort the spawn.
     if (provider === 'claude') {
       const workerAgentDefsStartedAt = Date.now();
       try {
@@ -4590,8 +3392,6 @@ export async function buildMounts(
       logSpawnStage('worker-agent-defs', workerAgentDefsStartedAt);
     }
 
-    // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
-    // fragments, and MCP server instructions. See `claude-md-compose.ts`.
     const claudeMdStartedAt = Date.now();
     await composeGroupClaudeMd(agentGroup, provider, {
       workgroupId: wgKey,
@@ -4609,62 +3409,24 @@ export async function buildMounts(
   const sessDir = sessionDir(agentGroup.id, session.id);
   const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
 
-  // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/).
-  //
-  // The session dir parent is mounted RW because the container legitimately
-  // writes: outbound.db (its own), outbox/<id>/ (file deliveries), and
-  // .heartbeat (liveness touch).
-  //
-  // inbound.db, however, is host-owned and MUST be unwritable from the
-  // container. Without this, a compromised agent could forge admin
-  // approvals by directly INSERT-ing into the `delivered` table, trivially
-  // bypassing the email-gate, send_file ack, and any future host→container
-  // signaling that rides on inbound.db.
-  //
-  // A FILE-level read-only overlay is NOT sufficient, and believing it was is
-  // what an exploit used. The overlay covers the file; SQLite's rollback
-  // journal is a SIBLING PATH, and this parent mount is read-write, so a
-  // container could create `/workspace/inbound.db-journal` beside it. A
-  // journal carries no binding to its database's identity, so the host
-  // replayed the container's hand-built journal as a HOT journal on its next
-  // read-write open and wrote attacker-chosen pages into the host-owned
-  // database — a forged `delivered` row, proven by a proof of concept.
-  //
-  // So the host keeps inbound.db in `<session>/.host/` and that DIRECTORY is
-  // overlaid read-only below. SQLite only ever creates `-journal`/`-wal`/
-  // `-shm` in the database's own directory, so there is no sibling path left
-  // outside the protection. See src/modules/mailbox/host-inbound.ts.
-  //
-  // The SDK-level `readonly: true` open in container/agent-runner/src/db/
-  // connection.ts is belt and suspenders. The mounts are the real boundary.
+  // Session folder at /workspace, RW for outbound.db, outbox/ and .heartbeat. inbound.db is host-owned and MUST be
+  // unwritable: a FILE-level read-only overlay is NOT enough, because SQLite's rollback journal is a sibling path a
+  // container could plant and the host would replay as a hot journal (a proven forgery). So inbound.db lives in
+  // `<session>/.host/` and that DIRECTORY is overlaid read-only (see src/modules/mailbox/host-inbound.ts).
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
-  // The runner's immutable startup context, host-owned and outside the
-  // agent-writable session directory. spawnContainer writes it just after
-  // writeSessionRouting, before this runs, so the bind source always exists.
+  // Host-owned, outside the agent-writable session dir; written by spawnContainer before this runs.
   mounts.push({
     hostPath: sessionContextPath(agentGroup.id, session.id),
     containerPath: '/app/.nanoclaw-session.json',
     readonly: true,
   });
-  // Move this session's inbound.db under `<session>/.host/` before the mounts
-  // are built, and REFUSE THE SPAWN if it is not host-owned afterwards. A
-  // container is the only thing that can plant a journal, so this is the seam
-  // where the transitional legacy-path fallback in `resolveInboundDbPath` must
-  // stop: no container ever runs against a session whose database still sits
-  // in the directory it can write. Fail closed — a spawn that cannot migrate
-  // retries rather than coming up unprotected.
+  // Migrate inbound.db under `.host/` and REFUSE THE SPAWN unless it is host-owned: no container may run against a
+  // database in a directory it can write. Fail closed.
   await migrateInboundDbToHostDir(sessDir, { agentGroupId: agentGroup.id, sessionId: session.id });
   assertHostOwnedInboundDb(sessDir, session.id);
   mounts.push(...hostInboundMounts(sessDir));
 
-  // Repository scope is derived by one canonical work-unit resolver.
-  // Same-topic siblings therefore share a checkout; different topics receive
-  // different roots even when they use one repo.
-  //
-  // Everything from here to the workgroup-mounts stage line below is
-  // filesystem work: mkdir, realpath, readdir and lstat across the workgroup,
-  // worktree and tombstone trees. Timed as one stage because it is one
-  // contiguous run of sync fs calls with no natural seam.
+  // One canonical work-unit resolver: same-topic siblings share a checkout; different topics get different roots.
   const workgroupMountsStartedAt = Date.now();
   const repositoryWorkUnit = await resolveSessionRepositoryWorkUnit(session, wgKey);
   const worktrees = topicWorktreesDir(repositoryWorkUnit);
@@ -4674,16 +3436,8 @@ export async function buildMounts(
   mounts.push({ hostPath: worktrees, containerPath: '/workspace/worktrees', readonly: false });
   mounts.push({ hostPath: worktrees, containerPath: worktrees, readonly: false });
 
-  // Canonical working trees stay host-only. A linked worktree needs only the
-  // common `.git`, origin pin, and one shared kernel-lock inode. All are bound
-  // at their exact host paths so no container-relative back-pointer can leak
-  // into Git's administrative records.
-  //
-  // Judged one repository at a time. Discovery's throwing form aborts the
-  // whole spawn on the first unusable canonical — and a foreign `commondir`
-  // naming a missing directory makes its Git probe exit 128 — so a single
-  // tampered or half-migrated `.git` used to stop every container in the
-  // workgroup instead of withholding one repository.
+  // Canonical working trees stay host-only; linked worktrees get the common `.git`, origin pin and kernel lock at
+  // their exact host paths. Judged per repository, so one tampered `.git` withholds that repository, not the spawn.
   const canonicals = classifyCanonicalRepositories(wgKey);
   for (const broken of canonicals.unusable) {
     log.error(
@@ -4701,32 +3455,18 @@ export async function buildMounts(
     fs.mkdirSync(transfers, { recursive: true, mode: 0o700 });
     mounts.push({ hostPath: transfers, containerPath: transfers, readonly: true });
     if (readTransferTombstone(repositoryWorkUnit, repository.name)) {
-      // The exact worktree left this source topic. Withholding the common Git
-      // metadata makes the tombstone a spawn-time capability boundary too,
-      // rather than relying only on the create_worktree MCP check.
+      // Left this topic: withholding the common Git metadata makes the tombstone a spawn-time boundary too.
       continue;
     }
-    // A scan-policy repository whose managed hook AND its refuse fallback
-    // both failed validation gets every mount withheld (same `continue`
-    // shape as the tombstone check above) rather than running with no hook
-    // at all — see resolveScanPolicyHooksMount's doc comment for the full
-    // fallback order. Computed before the gitDir mount deliberately: a
-    // partial withhold (say, gitDir mounted but hooks skipped) would still
-    // let an agent push unscanned from that worktree.
+    // Hook AND refuse fallback both invalid: withhold every mount. Decided before the gitDir mount, since a partial
+    // withhold would still let an agent push unscanned.
     const hooksDecision = resolveScanPolicyHooksMount(repository);
     if (hooksDecision.withhold) {
       continue;
     }
-    // The common object/ref/worktree store is writable, but host-executable
-    // configuration, hooks, canonical main-worktree HEAD/index, the
-    // `commondir` sentinel, and object-alternate escape hatches are immutable
-    // overlays. Linked worktrees use their own .git/worktrees/<id>/HEAD and
-    // index, so container Git can fetch/commit/push without being able to
-    // clobber the host canonical checkout state.
-    //
-    // Computed before the gitDir mount, like the hooks decision above: a
-    // canonical whose commondir is not the sentinel gets every mount withheld
-    // (same `continue` shape), never the read-write .git alone.
+    // The common store is writable, but config, hooks, canonical HEAD/index, the `commondir` sentinel and
+    // object-alternates are immutable overlays, so container Git cannot clobber the canonical checkout. A
+    // canonical whose commondir is not the sentinel gets every mount withheld, never the read-write .git alone.
     let controlMounts: VolumeMount[];
     try {
       controlMounts = canonicalGitControlMounts(repository.gitDir, path.dirname(repository.lockPath));
@@ -4742,11 +3482,7 @@ export async function buildMounts(
     }
     mounts.push({ hostPath: repository.gitDir, containerPath: repository.gitDir, readonly: false });
     mounts.push(...controlMounts);
-    // Deduped by container path: two scan-policy
-    // repositories in one workgroup would otherwise both resolve to the
-    // SAME containerPath (MANAGED_GIT_HOOKS_SCAN_DIR — one host-managed
-    // directory for the whole install, not per-repo), and Docker rejects a
-    // duplicate bind mount to the same container path.
+    // Deduped: every scan-policy repository resolves to the SAME container path, and Docker rejects duplicate binds.
     for (const mount of hooksDecision.mounts) {
       if (!mounts.some((existing) => existing.containerPath === mount.containerPath)) {
         mounts.push(mount);
@@ -4756,31 +3492,12 @@ export async function buildMounts(
     mounts.push({ hostPath: repository.originPinPath, containerPath: repository.originPinPath, readonly: true });
   }
 
-  // Agent group folder at /workspace/agent (RW for working files + shared memory)
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
-  // Sibling-group symlink overlay. clone-as-codex creates relative symlinks
-  // (e.g. groups/helper-codex/EXAMPLE -> ../helper/EXAMPLE) so two siblings share the
-  // same source repos / sources / conversations on the host. Inside the
-  // container, those symlinks would dereference to /workspace/helper/EXAMPLE,
-  // which isn't mounted — so create_worktree, conversation reads, and source
-  // discovery all fail with ENOENT. Overlay each host-resolvable
-  // symlink with a bind mount at the same container path so the entry
-  // appears as a real directory inside the container, transparently
-  // pointing at the source group's files.
-  //
-  // Absolute symlinks whose targets only exist inside the container (e.g.
-  // spawn-template.md -> /workspace/workgroup/private-spawn-template.md, a
-  // workgroup-shared-fs compat link) are skipped: realpathSync fails on the
-  // host because that path doesn't resolve there, and the container's own
-  // mount for it makes the symlink work inside the container anyway.
-  //
-  // SECURITY: the group dir is mounted RW at /workspace/agent, so an agent can
-  // plant a symlink here pointing anywhere on the host and it would be
-  // RW-mounted into its own container on the next spawn. Only overlay targets
-  // that this agent is entitled to see anyway: its own group dir, a sibling
-  // group dir in the SAME workgroup, or the workgroup shared tree. Anything
-  // else is skipped with a loud warning.
+  // Sibling-group symlink overlay: a relative symlink into a sibling group would dangle inside the container, so
+  // each host-resolvable one is bind-mounted at its container path. Absolute targets that exist only in the
+  // container are skipped. SECURITY: the group dir is agent-writable, so only targets the agent is entitled to
+  // (own group, same-workgroup siblings, the workgroup shared tree) are overlaid; anything else is skipped loudly.
   const allowedOverlayRoots = [
     workgroupSharedDir(wgKey),
     ...(await getAllAgentGroups())
@@ -4815,32 +3532,11 @@ export async function buildMounts(
       });
       continue;
     }
-    // Docker resolves a mount DESTINATION through the container's own
-    // filesystem, and /workspace/agent is this group dir — so a relative
-    // symlink that escapes upward redirects the destination out of the group
-    // mount and back into the session-dir bind at /workspace (a clone-as-codex
-    // sibling link `sources -> ../<seed>/sources` really attaches at
-    // /workspace/<seed>/sources). runc then creates that parent as
-    // ROOT, and host-side session reclaim can never delete it. Declare the
-    // path Docker is going to use anyway, so the /workspace stub pre-creation
-    // in spawnContainer creates it as the host user first.
-    //
-    // Derive that path by RESOLUTION, not by inspecting the link text. Two
-    // review rounds died on lexical prediction: a `../` prefix test misses
-    // `./../sib/X`, and normalizing the raw text still misses an intermediate
-    // symlink (`foo -> sub/jump/T` where `sub/jump -> ../../sibling`), which
-    // the container resolves but no amount of string work can. `realTarget` is
-    // already fully resolved by realpathSync above, so map it back through the
-    // container's view: /workspace/agent IS groupDir, therefore GROUPS_DIR is
-    // /workspace, and a resolved sibling path is /workspace/<folder>/<rest>.
-    // Anything resolving outside those roots was already refused as an
-    // out-of-workgroup target, so it never reaches here.
-    //
-    // An ABSOLUTE raw target is the one case resolution must NOT drive: it
-    // names a host path that does not exist inside the container, so nothing
-    // there resolves it and Docker attaches at the literal name. Relative
-    // targets are the opposite — the container resolves them against
-    // /workspace/agent, chains and all — so those derive from realTarget.
+    // Docker resolves a mount DESTINATION through the container's filesystem, so an upward-escaping relative link
+    // lands in the /workspace session bind, where runc would create the parent as ROOT and reclaim could never
+    // delete it; declaring the path lets spawn pre-create it as the host user. Derive it by RESOLUTION
+    // (`realTarget`), never by lexical inspection of the link text, which misses intermediate symlinks. An
+    // ABSOLUTE raw target is the exception: nothing in the container resolves it, so Docker uses the literal name.
     const containerPathFor = (resolved: string): string => {
       if (path.isAbsolute(rawTarget)) return `/workspace/agent/${entry.name}`;
       const inOwnGroup = path.relative(groupDir, resolved);
@@ -4851,9 +3547,7 @@ export async function buildMounts(
       if (inGroups && !inGroups.startsWith('..') && !path.isAbsolute(inGroups)) {
         return path.posix.join('/workspace', ...inGroups.split(path.sep));
       }
-      // Workgroup shared tree or anything else representable only at its
-      // literal name — the stub loop then pre-creates that, which is correct
-      // because Docker has no symlink to follow.
+      // Representable only at its literal name (Docker has no symlink to follow).
       return `/workspace/agent/${entry.name}`;
     };
     mounts.push({
@@ -4864,76 +3558,40 @@ export async function buildMounts(
     });
   }
 
-  // Workgroup shared filesystem — flag-gated. Bind-mount data/workgroups/<id>/
-  // at /workspace/workgroup so every sibling in the workgroup shares one tree
-  // (the "house"); /workspace/agent stays private (the "bedroom"). The seed's
-  // shared dirs are compat-symlinked to this path by reconcileWorkgroupSharedDirs
-  // (container-absolute targets, skipped by the overlay loop above), so existing
-  // /workspace/agent/<name> reader paths resolve through it with no repoint.
-  // Also mounts when a prior migration left a .migrated marker, so flipping the
-  // flag off after enabling doesn't dangle the compat symlinks.
-  // Use the resolved wgId from spawnContainer when available — it's already
-  // been settled by reconcileWorkgroupAtSpawn under the writer lock, so every
-  // subsystem inside this spawn sees the same value. Fall back to the
-  // agentGroup field for direct callers (tests, scripts).
+  // Workgroup shared tree at /workspace/workgroup (flag-gated). Also mounted when a prior migration left a
+  // `.migrated` marker, so turning the flag off does not dangle the compat symlinks.
   const wgId = wgKey;
   const wgShared = workgroupSharedDir(wgId);
   if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
     fs.mkdirSync(wgShared, { recursive: true });
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
   }
-  // These nested mounts are unconditional. In memory-only mode
-  // /workspace/workgroup itself is container-local, so the lock needs its own
-  // host bind to make every provider and sibling flock the exact same inode.
-  // In full shared-FS mode the file overlay comes after the parent mount,
-  // which also prevents the container from unlinking/replacing the inode.
+  // Unconditional: in memory-only mode /workspace/workgroup is container-local, and the lock needs a host bind so
+  // every provider and sibling flocks the same inode.
   mounts.push(...resolveWorkgroupMemoryMounts(wgId));
 
-  // container.json — nested RO mount on top of RW group dir so the agent
-  // can read its config but cannot modify it.
+  // Nested RO mount over the RW group dir: the agent can read its config but not modify it.
   const containerJsonPath = path.join(groupDir, 'container.json');
   if (fs.existsSync(containerJsonPath)) {
     mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
-  // Stamped plugin content — nested RO mount, same pattern as container.json
-  // just above. Immutable at runtime by the Agent Plugins contract: writes go
-  // to plugin-data/, which stays RW via the group mount. initGroupFilesystem
-  // creates the dir before mounts are built, so this is unconditional and a
-  // group carrying no plugin gets an empty read-only directory. Distinct from
-  // the fleet-wide ~/plugins -> /workspace/plugins mount, which is
-  // operator-curated and shared by every group.
+  // Stamped plugin content, nested RO (writes go to plugin-data/). Unconditional: the dir always exists.
   const stampedPluginsDir = path.join(groupDir, 'plugins');
   mounts.push({ hostPath: stampedPluginsDir, containerPath: CONTAINER_PLUGINS_DIR, readonly: true });
 
-  // Composer-managed CLAUDE.md — nested RO mount. Regenerated from the
-  // shared base + fragments, all INLINED, on every spawn (claude-md-compose.ts);
-  // any agent-side write would be clobbered, so enforce read-only. The shared
-  // memory tree and standing-instructions source remain RW via the group mount.
-  //
-  // There used to be a second nested mount here for `.claude-fragments/`
-  // (per-fragment files reached through symlinks from the composed doc) plus
-  // a `/app/CLAUDE.md` mount backing a `.claude-shared.md` symlink in the
-  // group dir. Both are gone: the composer now reads every section straight
-  // from its host path and writes it into CLAUDE.md/AGENTS.md directly, so
-  // nothing inside the container ever needs those paths.
+  // Regenerated on every spawn, so any agent-side write would be clobbered: enforce read-only.
   const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
   if (defaultSurfaces && fs.existsSync(composedClaudeMd)) {
     mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
   }
 
-  // Global memory directory — always read-only.
   const globalDir = path.join(GROUPS_DIR, 'global');
   if (fs.existsSync(globalDir)) {
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
   }
 
-  // Ordered .claude mounts (group-shared parent + skills + per-session project
-  // overlay + native-memory overlay). Validate the exact final legacy
-  // native-memory mount and replace it with the canonical workgroup tree RO;
-  // the guarded provider-neutral path above remains RW. Gated on
-  // defaultSurfaces: a provider that owns its agent surfaces
-  // (providesAgentSurfaces) must not get Claude state mounted.
+  // Gated on defaultSurfaces: a provider that owns its agent surfaces must not get Claude state mounted.
   if (defaultSurfaces) {
     mounts.push(
       ...replaceClaudeNativeMemoryMount(getSessionClaudeMounts(agentGroup, session), {
@@ -4944,38 +3602,16 @@ export async function buildMounts(
     );
   }
 
-  // Per-agent archive + central projections (NOT the global files).
-  //
-  // Mounting the global archive.db / v2.db cross-exposed every tenant's
-  // chat history and topology to every container — the container has shell +
-  // raw SQLite access at /workspace, so MCP filter-by-agent_group_id was
-  // advisory-only. A compromised agent could `sqlite3 /workspace/archive.db
-  // 'SELECT text FROM messages_archive WHERE agent_group_id = X'` for any X.
-  //
-  // Each container now gets a freshly-built projection containing ONLY rows
-  // for its own agent_group_id, regenerated on every spawn at
-  // data/v2-sessions/<ag>/<sess>/{archive,central}.db.
+  // Per-agent projections, NEVER the global archive.db / v2.db: the container has raw SQLite access, so mounting
+  // the globals would expose every tenant's chat history. Each spawn gets a projection of its own rows only.
   const archiveSrc = path.join(DATA_DIR, 'archive.db');
   const archiveDst = path.join(sessionDir(agentGroup.id, session.id), 'archive.db');
-  // Ensure the session dir exists for the projection writes below. In production
-  // initSessionFolder already created it; this is a defensive no-op there. It
-  // also decouples the projections from getSessionClaudeMounts, which is now
-  // gated on defaultSurfaces and no longer creates this dir as a side effect.
+  // Defensive: projections need the session dir even when getSessionClaudeMounts (which also creates it) is skipped.
   fs.mkdirSync(sessionDir(agentGroup.id, session.id), { recursive: true });
 
-  // Resolve the workgroup member set from central DB. The archive.db source doesn't
-  // carry agent_groups/workgroups schema; the host pre-resolves and passes the set
-  // so the projection can use a parameterized IN list (R5: chat archive widens to
-  // the entire workgroup; C1: workgroup boundary enforced at projection time).
-  //
-  // W3 fail-closed: if the spawning agent has NULL workgroup_id, abort spawn.
-  // Legacy fallback: if the central DB doesn't have the workgroup_id column yet
-  // (pre-migration-036 installs), pass undefined so projection uses single-agent filter.
-  //
-  // Use the wgId resolved by spawnContainer when available — it's the same
-  // value the /workspace/workgroup mount above saw, eliminating the race
-  // where two subsystems inside the same spawn could observe different
-  // workgroup ids under a concurrent reconcile.
+  // The host pre-resolves the workgroup member set (archive.db has no agent_groups schema) so the projection can
+  // use a parameterized IN list. Fails closed when the spawning agent has no workgroup; a DB without the
+  // workgroup_id column falls back to the single-agent filter.
   logSpawnStage('workgroup-mounts', workgroupMountsStartedAt);
 
   const workgroupMembershipStartedAt = Date.now();
@@ -4990,12 +3626,8 @@ export async function buildMounts(
             const memberRows = db
               .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
               .all(resolvedWgId) as Array<{ id: string }>;
-            // W3 fail-closed: if the spawning agent is no longer a member of the
-            // workgroup reconcile settled on, refuse to build a projection that
-            // would silently drop them. The reconcile just updated
-            // agent_groups.workgroup_id for THIS agent to resolvedWgId; if that
-            // write hasn't yet been observed (or if a second reconcile undid it
-            // mid-spawn), the projection would lie.
+            // Fail closed if the agent is no longer a member of the workgroup reconcile settled on: the projection
+            // would lie.
             if (!memberRows.some((r) => r.id === agentGroup.id)) {
               throw new Error(
                 `Workgroup-scoped projection: agent ${agentGroup.id} is not a member of workgroup ${resolvedWgId} at projection time ` +
@@ -5027,9 +3659,8 @@ export async function buildMounts(
       'workgroup projection membership',
     );
   } catch (err) {
-    // Re-throw W3 fail-closed (both the NULL-workgroup error and the
-    // member-check error share the 'Workgroup-scoped projection' prefix);
-    // otherwise fall through to legacy single-agent filter.
+    // Re-throw the fail-closed errors (shared 'Workgroup-scoped projection' prefix); otherwise fall back to the
+    // single-agent filter.
     if (err instanceof Error && err.message.includes('Workgroup-scoped projection')) {
       throw err;
     }
@@ -5040,11 +3671,8 @@ export async function buildMounts(
   }
   logSpawnStage('workgroup-membership', workgroupMembershipStartedAt);
 
-  // Awaited: the projection is rebuilt on a worker thread when its inputs have
-  // moved, and skipped entirely when they have not. It used to run
-  // synchronously here on every spawn, which parked the host event loop for
-  // seconds at a time — the dominant cause of event-loop stalls. Fail-closed is unchanged:
-  // a build that runs and throws aborts the spawn.
+  // Rebuilt on a worker thread, only when its inputs moved: a synchronous rebuild stalls the host event loop for
+  // seconds. A build that throws aborts the spawn.
   const archiveProjectionStartedAt = Date.now();
   await ensureArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
   logSpawnStage('archive-projection', archiveProjectionStartedAt);
@@ -5054,18 +3682,13 @@ export async function buildMounts(
 
   const centralSrc = path.join(DATA_DIR, 'v2.db');
   const centralDst = path.join(sessionDir(agentGroup.id, session.id), 'central.db');
-  // Still synchronous and still on the main thread: same pattern as the
-  // archive projection but against the 20 MB central DB, so it was never the
-  // headline cost. Left alone deliberately, and now measured rather than
-  // assumed — see the PR body.
+  // Synchronous on the main thread, deliberately: the central DB is small and this was measured as cheap.
   const centralProjectionStartedAt = Date.now();
   buildCentralProjection(centralSrc, centralDst, agentGroup.id);
   logSpawnStage('central-projection', centralProjectionStartedAt);
   mounts.push({ hostPath: centralDst, containerPath: '/workspace/central.db', readonly: true });
 
-  // Shared agent-runner source — read-only, same code for all groups. This
-  // is the boot-time snapshot activated in main.ts, not
-  // the live checkout — see src/agent-runner-source.ts.
+  // The boot-time snapshot activated in main.ts, not the live checkout (see src/agent-runner-source.ts).
   const agentRunnerSrc = agentRunnerSourcePath();
   mounts.push({ hostPath: agentRunnerSrc, containerPath: '/app/src', readonly: true });
 
@@ -5075,13 +3698,8 @@ export async function buildMounts(
     mounts.push({ hostPath: skillsSrc, containerPath: '/app/skills', readonly: true });
   }
 
-  // Spawn-task template — host-shared, not per-group. Overlays the
-  // group folder so the worker contract path `/workspace/agent/
-  // spawn-template.md` stays stable while the canonical content lives
-  // at repo root. Spawning is a host-level primitive (`spawn_task` MCP
-  // is registered for every container that opts in), so the template
-  // should be too — not buried in a single agent group's folder where
-  // it can drift per-install.
+  // Host-shared template overlaying the group folder, so `/workspace/agent/spawn-template.md` is stable and cannot
+  // drift per group.
   const spawnTemplateSrc = path.join(projectRoot, 'container', 'spawn-template.md');
   if (fs.existsSync(spawnTemplateSrc)) {
     mounts.push({
@@ -5091,9 +3709,6 @@ export async function buildMounts(
     });
   }
 
-  // Additional mounts from container config. This is where the silent window
-  // ends — `validateAdditionalMounts` emits 'Mount allowlist loaded
-  // successfully', the first log line after the prologue.
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const mountAllowlistStartedAt = Date.now();
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
@@ -5117,42 +3732,13 @@ export async function buildMounts(
     }
   }
 
-  // Plugin mounts: every subdir of ~/plugins is mounted RO at
-  // /workspace/plugins/<name>. Claude Code SDK auto-discovers via
-  // CLAUDE_PLUGINS_ROOT (set in buildContainerArgs). Per-group
-  // excludePlugins deny list skips named plugins — useful for limiting
-  // a group's tool surface (e.g. security agents without codex).
-  //
-  // Only a TOP-LEVEL entry is honoured HERE, and that is the whole design, not
-  // a gap. An entry carrying a "/" names one sub-plugin of a monorepo the group
-  // otherwise keeps, and the mount path has no honest way to withhold it: the
-  // host cannot decide what a container's own walkers will find. Masking it by
-  // bind-mounting an empty directory over the sub-path was tried and removed,
-  // because it made the host predict container-side path resolution and the two
-  // namespaces do not have to agree — an absolute symlink inside the repo is
-  // absent to a host `statSync` and live once the repo is mounted, so the
-  // exclusion silently did not apply.
-  //
-  // A sub-path entry is honoured where the path resolves instead: each walker
-  // that would have REGISTERED the sub-plugin asks one shared predicate about a
-  // path it assembled itself (`isExcludedPluginPath`,
-  // `container/agent-runner/src/plugin-exclusions.ts`, a verbatim copy of
-  // `src/plugin-exclusions.ts`) — the Claude SDK plugin list, the Codex
-  // registration plan and its hook trust, the `~/.agents/skills` mirror, and
-  // the always-on composer (`src/claude-md-compose.ts`). The one host-side
-  // consumer is the OpenCode session XDG skill copy, which filters a mirror
-  // this mount does not feed (`src/providers/opencode.ts`). So the repo's bytes
-  // stay readable under this mount by design; what the entry withholds is
-  // registration.
-  //
-  // Special case: if codex plugin is mounted and the host's ~/.codex dir
-  // exists, mount that RW so the Codex CLI can use the host's OAuth
-  // session and persist refresh tokens.
+  // Every ~/plugins subdir is mounted RO at /workspace/plugins/<name>. Only TOP-LEVEL excludePlugins entries are
+  // honoured here; a sub-path entry is honoured by each runner/composer walker that would REGISTER the sub-plugin
+  // (`isExcludedPluginPath`), because the host cannot predict container-side path resolution (masking with an
+  // empty mount failed: an absolute symlink is absent to the host and live in the container).
   const pluginsHostDir = path.join(os.homedir(), 'plugins');
   if (fs.existsSync(pluginsHostDir)) {
-    // Plugins whose capability ships in-tree: mounting them would duplicate the
-    // in-tree skill and (via CLAUDE_PLUGINS_ROOT auto-discovery) start a second
-    // MCP server with a different allowed root. Host/OSS-only by design.
+    // Capability ships in-tree: mounting would duplicate the skill and start a second MCP server.
     const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
     const declared = splitExcludedPlugins(containerConfig.excludePlugins);
     const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...declared.topLevel]);
@@ -5164,50 +3750,11 @@ export async function buildMounts(
       log.warn('Failed to read ~/plugins directory', { err });
     }
     warnUnmatchedPluginScopes(pluginScopes, entries);
-    // An exclusion that matches nothing is the failure mode this field keeps
-    // producing, and it is the one the VALIDATOR cannot close. Three separate
-    // review rounds each found a different string that passes every shape check
-    // and still can never equal a `readdirSync` name — a NUL, a lone surrogate,
-    // a segment past NAME_MAX — and each fix was one more item on a list with no
-    // end, because "cannot name a file" is not enumerable from the string alone.
-    // Every one of them lands the same way: the operator declares `codex`
-    // withheld, nothing matches, the plugin mounts, and the host's Codex OAuth
-    // session mounts with it.
-    //
-    // Here the question IS answerable, because here both sides are present. So
-    // this is the rule that closes the class: every declared entry must equal an
-    // entry on disk, compared as the exact string `readdirSync` returned.
-    //
-    // It REFUSES the spawn rather than warning. `excludePlugins` is a
-    // withholding control, so an entry accepted at config-read time that can
-    // never match is a silent fail-open — precisely what a warning nobody reads
-    // preserves. An unresolvable `onecliSecrets` name aborts a spawn for the
-    // same reason (CLAUDE.md, Secrets). A typo, an uninstalled plugin and a byte
-    // no filename can hold are indistinguishable from the config alone and
-    // identical in consequence, so the message names the group and the entries
-    // and leaves the cause to the operator.
-    //
-    // Sub-paths are checked segment by segment against the real tree: the repo
-    // must exist, and each segment below it must exist under the last. That is
-    // what makes the rule cover the sub-path half of the field too, which no
-    // top-level-only check would.
-    //
-    // The NORMALIZED set, not the raw list. `splitExcludedPlugins` resolves the
-    // covering relation once, at the seam every consumer reads
-    // (`src/container-config.ts`), and drops a sub-path an excluded ancestor
-    // already covers — so a redundant pair like `["mono", "mono/plugins/alpha"]`
-    // is ONE entry to the mount denial a few lines above and was TWO here. Two
-    // readers of one field normalizing differently is the class once recorded
-    // for the composer's fragment keys, and it is a defect even where today's
-    // outcomes happen to agree.
-    //
-    // It also fixes the outcome for the one shape where they do not: a
-    // descendant that does NOT exist, under an ancestor that does. Refusing that
-    // spawn is the rule misapplied — the ancestor already withholds the whole
-    // subtree, so the descendant line withholds nothing WHETHER OR NOT it
-    // exists, and there is nothing for a typo there to fail open. The rule
-    // exists for an entry that withholds nothing because it matches nothing;
-    // this one withholds nothing because its ancestor withholds everything.
+    // Every declared exclusion must equal an entry on disk (exact `readdirSync` string, sub-paths segment by
+    // segment), else REFUSE the spawn: an exclusion that matches nothing silently fails open (e.g. `codex` declared
+    // withheld while the plugin and the host Codex OAuth session mount anyway), and no string validator can catch
+    // every unmatchable name. Checks the NORMALIZED set from `splitExcludedPlugins`, so a sub-path under an
+    // excluded ancestor is not refused (the ancestor already withholds it).
     const missing: string[] = [];
     for (const entry of [...declared.topLevel, ...declared.subPaths]) {
       let cursor = pluginsHostDir;
@@ -5248,12 +3795,8 @@ export async function buildMounts(
       });
     }
 
-    // Host ~/.wix mount: opt-in via container.json `wixHostAuth: true`. RW
-    // because the Wix CLI rewrites ~/.wix/auth/account.json on OAuth token
-    // refresh. Mounted straight to /home/node/.wix — NOT via additionalMounts,
-    // which validateAdditionalMounts sandboxes under /workspace/extra (where
-    // the CLI's os.homedir()-based ~/.wix lookup would never find it). The
-    // CLI's *.wix.com traffic is NO_PROXY-bypassed in the gateway block below.
+    // Opt-in via `wixHostAuth`. RW because the Wix CLI rewrites its auth on refresh; mounted at /home/node/.wix
+    // directly because additionalMounts sandboxes under /workspace/extra, where the CLI would never look.
     if (containerConfig.wixHostAuth === true) {
       const hostWix = path.join(os.homedir(), '.wix');
       if (fs.existsSync(hostWix)) {
@@ -5261,25 +3804,14 @@ export async function buildMounts(
       }
     }
 
-    // Codex credential, for every container: the staged CODEX_HOME below lets
-    // any agent drive `codex exec` headless with the fleet's own OAuth
-    // identity. The withholding lever is `excludePlugins` — a group that must
-    // not reach Codex withholds the `codex` plugin and the credential goes with
-    // it, and the refusal above makes an exclusion that matches nothing fatal
-    // rather than silently fail-open.
+    // Codex credential for every container; the withholding lever is excluding the `codex` plugin (made
+    // fail-closed by the refusal above).
     if (!excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
 
-      // Staging reads and rewrites host-side state, so a malformed home (a
-      // symlinked `auth.json` or `sessions/`) throws. For provider=codex that is
-      // fatal by design — the credential IS the session. For every other
-      // provider Codex is a PEER capability, and failing a whole container over
-      // it would be exactly the "peer codex degraded → every container
-      // crash-loops" trade the runner refuses
-      // (container/agent-runner/src/codex-companion-setup.ts). So a peer
-      // stage that throws is logged and WITHHELD: the container boots, finds no
-      // `auth.json`, and skips CODEX_HOME setup.
-      // Narrowed by `isHostStateFailure` so a bug here still surfaces.
+      // Staging throws on a malformed host home. Fatal for provider=codex (the credential IS the session); for any
+      // other provider Codex is a PEER capability, so a host-state failure is logged and WITHHELD rather than
+      // crash-looping every container.
       const stageOrWithhold = (what: string, stage: () => VolumeMount[]): VolumeMount[] => {
         try {
           return stage();
@@ -5294,15 +3826,8 @@ export async function buildMounts(
         }
       };
 
-      // provider=codex brings its own session-local /home/node/.codex (see
-      // src/providers/codex.ts's container-config registry contribution) plus
-      // the RO host home below, which `refreshCodexAuthFromHost`
-      // (container/agent-runner/src/providers/codex.ts) re-reads auth.json
-      // from when the host rotates a token mid-session. That mount is the ONE
-      // place a container still sees a whole host Codex home, read-only —
-      // narrowing it to a file bind would defeat the refresh, which exists to
-      // pick up a REPLACED file. Every other provider gets the staged peer home
-      // in the branch after it.
+      // provider=codex also gets the RO host home, the ONE place a container sees a whole host Codex home:
+      // `refreshCodexAuthFromHost` re-reads auth.json there when the host REPLACES it, which a file bind would miss.
       const primaryHostPath = resolveCodexAuthDir(agentGroup.folder);
       if (providerHasCodexMount && fs.existsSync(path.join(primaryHostPath, 'auth.json'))) {
         mounts.push({
@@ -5313,18 +3838,9 @@ export async function buildMounts(
       }
 
       if (!providerHasCodexMount && fs.existsSync(path.join(primaryHostPath, 'auth.json'))) {
-        // Codex-as-peer home, STAGED not bind-mounted: the session owns the
-        // directory and only `auth.json` is file-bound from the host home, so
-        // a prompt-injected agent cannot reach the operator's `hooks.json`,
-        // `config.toml`, `AGENTS.md` or transcripts — nor plant a hook there
-        // that the next host-side `codex` run would execute. The runner reads
-        // exactly one file from this mount (`HOST_CODEX_DIR/auth.json`, which
-        // it symlinks into its own CODEX_HOME:
-        // container/agent-runner/src/codex-companion-setup.ts).
-        //
-        // Source keyed on `agentGroup.folder`, NOT `credentialFolder`: a codex
-        // sibling usually wants its own ChatGPT identity, while credentialFolder
-        // governs env-var creds the sibling should inherit.
+        // STAGED, not bind-mounted: only `auth.json` is file-bound, so a prompt-injected agent cannot reach or plant
+        // the operator's hooks/config/AGENTS.md that the next host-side `codex` run would execute. Keyed on
+        // `agentGroup.folder`, NOT `credentialFolder`: a codex sibling usually wants its own ChatGPT identity.
         mounts.push(
           ...stageOrWithhold('/home/node/.codex', () =>
             stageCodexAuth(
@@ -5336,21 +3852,8 @@ export async function buildMounts(
         );
       }
 
-      // codexAuthFallbacks: ordered list of additional ~/.codex* dirs to stage
-      // as fallback OAuth identities at /home/node/.codex-fallback-N/, which
-      // never conflicts with /home/node/.codex — so they fire independently of
-      // where the primary came from. Resolution and dedup (against
-      // primaryHostPath) live in `resolveCodexAuthFallbacks`; the container
-      // provider reads CODEX_FALLBACK_HOMES and rotates on UsageLimitExceeded /
-      // ServerOverloaded / coarse-systemError.
-      //
-      // A fallback carries `sessions/` only where rotation actually lands mid-
-      // session and the transcript must follow it: provider=codex. A peer's
-      // fallback is a credential and nothing else — `CODEX_FALLBACK_HOMES` is
-      // read only by the Codex provider and by `setupCodexPrimaryRuntime`
-      // (container/agent-runner/src/codex-companion-setup.ts), neither of
-      // which a Claude or OpenCode container runs — so mounting that account's
-      // host transcripts RW into one would be exposure with no function.
+      // Fallback OAuth identities at /home/node/.codex-fallback-N/. Only provider=codex fallbacks carry `sessions/`
+      // (rotation lands mid-session there); a peer's fallback is a credential only, since no peer runner reads it.
       const resolvedFallbacks = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, primaryHostPath);
       resolvedFallbacks.forEach((entry, index) => {
         const fallbackRuntime = path.join(sessionDir(agentGroup.id, session.id), 'codex-fallbacks', String(index + 1));
@@ -5365,16 +3868,8 @@ export async function buildMounts(
     }
   }
 
-  // Host OpenCode credential for every non-OpenCode container, AUTH ONLY —
-  // the same `stageOpenCodeAuth` the provider calls for its own auth step, so
-  // the staging exists once. Outside the `~/plugins` block because OpenCode has
-  // no plugin for the credential to ride on.
-  //
-  // Withheld on a host-state failure for the same reason the peer Codex stage
-  // is: this is a PEER credential, and an agent that replaced
-  // `/workspace/opencode-xdg` with a symlink would otherwise fail every later
-  // spawn of its own session. An OpenCode session's own staging still throws —
-  // it runs in the provider contribution, not here.
+  // Host OpenCode credential for every non-OpenCode container, AUTH ONLY. Withheld on a host-state failure like
+  // the peer Codex stage: an agent that symlinked `/workspace/opencode-xdg` must not break its later spawns.
   if (provider !== 'opencode') {
     try {
       mounts.push(
@@ -5395,21 +3890,9 @@ export async function buildMounts(
     }
   }
 
-  // Project source tree at /workspace/project (RO). Lets agents read the
-  // NanoClaw codebase — useful for self-diagnostic questions ("why did
-  // you do X?"), self-mod context, and understanding their own runtime.
-  // We mount a selective allowlist rather than the whole project root
-  // to exclude .env, data/, groups/, repo-tokens/, node_modules/, dist/,
-  // logs/, and other sensitive or bulky paths.
-  //
-  // scripts/ and prompts/ are INTENTIONALLY excluded: v1 commit 3a31f9d
-  // removed them from the allowlist after noting that scripts/ exposes
-  // credential path topology (wire-*, migrate-*, init-* scripts reference
-  // host paths) and prompts/ was unused agent-facing content. Keep them
-  // out unless there's a specific capability that needs them and a clear
-  // review of what's in them.
-  // projectRoot (declared at top of buildMounts) is equivalent to
-  // path.resolve(GROUPS_DIR, '..') since GROUPS_DIR is <projectRoot>/groups.
+  // Project source at /workspace/project (RO), as a selective allowlist that excludes .env, data/, groups/,
+  // repo-tokens/, logs/ and bulky paths. scripts/ and prompts/ are INTENTIONALLY excluded (scripts/ exposes
+  // credential path topology); keep them out without a specific need and a review of their contents.
   const sourceEntries = [
     'src',
     'container',
@@ -5432,14 +3915,8 @@ export async function buildMounts(
     }
   }
 
-  // Narrow exception to the scripts/ exclusion above: the dependency-audit
-  // script is the one scripts/ file agents must be able to run. The weekly
-  // update-advisory pre-check and /update-container both invoke
-  // `bun /workspace/project/scripts/container-updates.ts`; without this mount
-  // that resolves to a nonexistent path and the audit dies with "Module not
-  // found". It reads only manifests already mounted here (package.json,
-  // container/*) and imports src/container-updates.ts (mounted via 'src'), so
-  // it exposes no credential-path topology — the reason scripts/ is excluded.
+  // The one scripts/ exception: agents run the dependency audit, which reads only mounted manifests and src/, so
+  // it exposes no credential-path topology.
   const auditScript = path.join(projectRoot, 'scripts', 'container-updates.ts');
   if (fs.existsSync(auditScript)) {
     mounts.push({
@@ -5449,12 +3926,8 @@ export async function buildMounts(
     });
   }
 
-  // Host-computed upstreamPin/heldByMerge snapshot for the same audit script.
-  // /workspace/project has no `.git` (it's a selective bind-mount allowlist,
-  // not a checkout), so the audit's git-based upstream-policy derivation can
-  // never run in-container. writeUpstreamPolicySnapshot() runs on the host
-  // (host startup + before each /update-container invocation) and writes
-  // this file; the container just reads it. See src/container-updates.ts.
+  // /workspace/project has no `.git`, so the audit's upstream-policy derivation runs on the host and the container
+  // reads this snapshot (src/container-updates.ts).
   const upstreamPolicySnapshot = path.join(DATA_DIR, 'upstream-policy.json');
   if (fs.existsSync(upstreamPolicySnapshot)) {
     mounts.push({
@@ -5464,9 +3937,6 @@ export async function buildMounts(
     });
   }
 
-  // Tone profiles — project-relative, shared across all groups. Read-only:
-  // groups select a profile in their CLAUDE.md; the files themselves are
-  // managed via the /add-tone-profile skill on the host.
   const toneProfilesDir = path.resolve(GROUPS_DIR, '..', 'tone-profiles');
   if (fs.existsSync(toneProfilesDir)) {
     mounts.push({
@@ -5476,12 +3946,8 @@ export async function buildMounts(
     });
   }
 
-  // Group-owned tone profiles — overlay, resolved BEFORE the shared set by
-  // the container (agent-runner/src/tone-profiles.ts). This is what lets a
-  // voice be selected per channel without publishing it: agent personas live
-  // here, in the private groups repo, invisible to other workgroups, and are
-  // chosen through `default_tone` exactly like a shared profile. A group can
-  // also shadow a shared name for itself alone.
+  // Group-owned tone profiles, resolved BEFORE the shared set, so a private persona can be selected per channel
+  // (and can shadow a shared name) without publishing it.
   const groupToneProfilesDir = path.join(groupDir, 'tone-profiles');
   if (fs.existsSync(groupToneProfilesDir)) {
     mounts.push({
@@ -5491,37 +3957,16 @@ export async function buildMounts(
     });
   }
 
-  // Per-channel operating instructions — see channelInstructionsMounts.
   mounts.push(...channelInstructionsMounts(groupDir, isAllowedOverlayTarget, agentGroup.id));
 
-  // Host-side credential dirs — gated by the per-agent `tools` allowlist in
-  // container.json. Two modes:
-  //
-  //   tools = undefined  → legacy behavior, mount every credential surface.
-  //                        Preserves the pre-v2-tools-port default.
-  //   tools = [...]      → filter + stage per-tool. E.g. `snowflake:archive-one`
-  //                        stages only the [connections.archive-one] section of
-  //                        connections.toml and its referenced private
-  //                        keys; `aws:work` stages only [work] from
-  //                        ~/.aws/credentials (scoped = exactly the named
-  //                        profiles, no implicit [default]); bare unscoped
-  //                        `aws` stages all profiles; `dbt:snowflake-db`
-  //                        stages a profiles.yml containing only that profile.
-  //
-  // Rationale for the gate (see docs/V2_BACKLOG.md → scoped credentials):
-  //   OneCLI's proxy covers API-level secrets (keys flowing through
-  //   HTTPS_PROXY). Filesystem credentials — private keys, INI/TOML with
-  //   raw passwords, service-account JSONs — are *not* OneCLI-mediated.
-  //   Without per-agent scoping every agent can `cat` every other agent's
-  //   creds. v1 enforced this at mount time; v2 now does too when `tools`
-  //   is set.
+  // Filesystem credentials (private keys, INI/TOML with raw passwords, service-account JSON) are NOT
+  // OneCLI-mediated, so they are gated by the per-agent `tools` allowlist: undefined mounts every surface (legacy);
+  // a list stages only the named scopes (e.g. `snowflake:archive-one` stages one connections.toml section + keys).
   const home = os.homedir();
   const tools = containerConfig.tools;
   const stagingRoot = path.join(sessDir, 'creds');
 
-  // Prepare a clean per-cred staging subdir. Caller passes the dir name;
-  // returns the absolute path. We rm+mkdir to avoid stale files leaking
-  // between spawns of the same session (e.g. after an agent re-scope).
+  // rm+mkdir so stale files cannot leak between spawns of the same session (e.g. after a re-scope).
   const stageDir = (name: string): string => {
     const p = path.join(stagingRoot, name);
     if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
@@ -5531,7 +3976,6 @@ export async function buildMounts(
 
   const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  // ---- Gmail MCP (legacy per-account dirs) --------------------------------
   if (isToolEnabled(tools, 'gmail') || isToolEnabled(tools, 'gmail-readonly')) {
     const g = extractToolScopes(tools, 'gmail');
     const r = extractToolScopes(tools, 'gmail-readonly');
@@ -5556,7 +4000,6 @@ export async function buildMounts(
         }
       }
     } else {
-      // Unscoped (or tools undefined): mount primary + every .gmail-mcp-*/
       const primaryDir = path.join(home, '.gmail-mcp');
       if (fs.existsSync(primaryDir)) {
         mounts.push({ hostPath: primaryDir, containerPath: '/home/node/.gmail-mcp', readonly: true });
@@ -5578,7 +4021,6 @@ export async function buildMounts(
     }
   }
 
-  // ---- Google Calendar MCP ------------------------------------------------
   if (isToolEnabled(tools, 'calendar')) {
     const calDir = path.join(home, '.config', 'google-calendar-mcp');
     const { scopes: calAccts, isScoped: calScoped } = extractToolScopes(tools, 'calendar');
@@ -5594,7 +4036,6 @@ export async function buildMounts(
             for (const a of calAccts) if (all[a]) filtered[a] = all[a];
             const dest = stageDir('google-calendar-mcp');
             fs.writeFileSync(path.join(dest, 'tokens.json'), JSON.stringify(filtered, null, 2), { mode: 0o600 });
-            // Copy non-token files (settings etc.) as-is.
             for (const entry of fs.readdirSync(calDir)) {
               if (entry === 'tokens.json') continue;
               const src = path.join(calDir, entry);
@@ -5621,9 +4062,7 @@ export async function buildMounts(
       }
     }
 
-    // Calendar reuses the Gmail OAuth app keys. If gmail isn't enabled for
-    // this agent, mount JUST the keys file (not the full gmail dir, which
-    // would leak Gmail tokens to a calendar-only scope).
+    // Calendar reuses Gmail's OAuth app keys: mount JUST the keys file (the gmail dir would leak Gmail tokens).
     if (!isToolEnabled(tools, 'gmail')) {
       const oauthKeys = path.join(home, '.gmail-mcp', 'gcp-oauth.keys.json');
       if (fs.existsSync(oauthKeys)) {
@@ -5636,14 +4075,11 @@ export async function buildMounts(
     }
   }
 
-  // ---- Google Workspace (gws-style accounts dir) --------------------------
   if (isToolEnabled(tools, 'google-workspace')) {
     const gwsAccountsDir = path.join(home, '.config', 'gws', 'accounts');
     if (fs.existsSync(gwsAccountsDir)) {
       const { scopes: gwsAccts, isScoped: gwsScoped } = extractToolScopes(tools, 'google-workspace');
       if (gwsScoped) {
-        // Each account has its own JSON file under accounts/. Stage only
-        // the allowed ones. Entries can be files (<acct>.json) or dirs.
         const dest = stageDir('gws-accounts');
         for (const acct of gwsAccts) {
           const fileCandidate = path.join(gwsAccountsDir, `${acct}.json`);
@@ -5670,15 +4106,13 @@ export async function buildMounts(
       }
     }
 
-    // Legacy google_workspace_mcp/credentials/ — same pattern.
     const gwCredsDir = path.join(home, '.google_workspace_mcp', 'credentials');
     if (fs.existsSync(gwCredsDir)) {
       const { scopes: gwAccts, isScoped: gwScoped } = extractToolScopes(tools, 'google-workspace');
       if (gwScoped) {
         const dest = stageDir('google-workspace-mcp-credentials');
         for (const entry of fs.readdirSync(gwCredsDir)) {
-          // match entries that START with an allowed account name (allows
-          // <acct>.json, <acct>_token.json, etc. — v1 pattern).
+          // Prefix match: allows <acct>.json, <acct>_token.json, etc.
           if (!gwAccts.some((a) => entry.startsWith(a))) continue;
           const src = path.join(gwCredsDir, entry);
           try {
@@ -5705,12 +4139,7 @@ export async function buildMounts(
     }
   }
 
-  // ---- GCP service-account key (BigQuery / gcloud / gsutil) ---------------
-  // Mount a per-group SA key into a dedicated container path. The agent-runner
-  // activates it for the `gcloud`/`bq` CLIs at startup; client libs read it via
-  // GOOGLE_APPLICATION_CREDENTIALS (wired in buildContainerArgs, along with the
-  // googleapis.com proxy bypass). Gated on the key file existing (see
-  // resolveGcpServiceAccountKey) — groups without one are untouched.
+  // Per-group SA key at a dedicated path; gated on the key file existing.
   {
     const gcpKey = resolveGcpServiceAccountKey(containerConfig.credentialFolder ?? agentGroup.folder);
     if (gcpKey) {
@@ -5718,7 +4147,6 @@ export async function buildMounts(
     }
   }
 
-  // ---- Snowflake (connections.toml + keys) --------------------------------
   if (isToolEnabled(tools, 'snowflake')) {
     const snowflakeDir = path.join(home, '.snowflake');
     const origToml = path.join(snowflakeDir, 'connections.toml');
@@ -5726,9 +4154,7 @@ export async function buildMounts(
       const { scopes: allowedConns, isScoped: filterConns } = extractToolScopes(tools, 'snowflake');
       const dest = stageDir('snowflake');
 
-      // Rewrite host paths → /home/node paths so in-container CLIs find
-      // their own keys. snowflake-connector-python historically doesn't
-      // expand `~`, so we normalize to absolute /home/node/... paths.
+      // Rewrite host paths to absolute /home/node paths: snowflake-connector-python does not expand `~`.
       const homePattern = new RegExp(escapeRegex(snowflakeDir) + '/', 'g');
       let tomlContent = fs.readFileSync(origToml, 'utf-8').replace(homePattern, '/home/node/.snowflake/');
       if (filterConns) tomlContent = filterConfigSections(tomlContent, allowedConns);
@@ -5740,8 +4166,7 @@ export async function buildMounts(
         fs.writeFileSync(path.join(dest, 'config.toml'), configContent, { mode: 0o600 });
       }
 
-      // Copy only key files that the (possibly filtered) toml actually
-      // references — never the whole keys/ dir under scoping.
+      // Copy only key files the (possibly filtered) toml references, never the whole keys/ dir under scoping.
       const keysDir = path.join(snowflakeDir, 'keys');
       if (fs.existsSync(keysDir)) {
         const referenced = new Set<string>();
@@ -5754,8 +4179,6 @@ export async function buildMounts(
           if (!entry.isFile()) continue;
           const srcPath = path.join(entry.parentPath, entry.name);
           const relPath = path.relative(keysDir, srcPath);
-          // When filtering, skip any key not referenced by allowed conns.
-          // When not filtering, copy everything.
           if (filterConns && referenced.size > 0 && !referenced.has(relPath)) continue;
           const destPath = path.join(destKeys, relPath);
           fs.mkdirSync(path.dirname(destPath), { recursive: true });
@@ -5767,27 +4190,15 @@ export async function buildMounts(
       // Mount RW: snow CLI writes to ~/.snowflake/logs/.
       mounts.push({ hostPath: dest, containerPath: '/home/node/.snowflake', readonly: false });
 
-      // Dual-mount at host absolute path too — some snowflake libs record
-      // the originally-resolved absolute path in session state and retry
-      // reads at that path. The container sees the same staging dir.
+      // Also at the host absolute path: some snowflake libs retry reads at the originally resolved path.
       if (snowflakeDir !== '/home/node/.snowflake') {
         mounts.push({ hostPath: dest, containerPath: snowflakeDir, readonly: false });
       }
     }
   }
 
-  // ---- AWS (~/.aws/{credentials,config}) ----------------------------------
-  // Scoped `aws:<profile>` stages EXACTLY the named profiles — no implicit
-  // `default`. A scoped group must not inherit whatever account `default`
-  // points at: that is a cross-tenant leak (e.g. an `aws:example-retail` Example Retail
-  // group silently picking up a personal/Example Labs `default`). A group that
-  // genuinely needs the default profile requests it explicitly via
-  // `aws:default[:<other>]`.
-  //
-  // Unscoped bare `aws` still stages every profile — intentional broad access
-  // (e.g. a personal cross-domain agent). Consequence: adding a new profile to
-  // the host `~/.aws` only fans out to groups that opted into unscoped `aws`,
-  // never to scoped groups.
+  // Scoped `aws:<profile>` stages EXACTLY the named profiles, no implicit `default` (inheriting whatever account
+  // `default` points at is a cross-tenant leak); request it as `aws:default`. Bare `aws` stages every profile.
   if (isToolEnabled(tools, 'aws')) {
     const awsDir = path.join(home, '.aws');
     if (fs.existsSync(awsDir)) {
@@ -5804,8 +4215,7 @@ export async function buildMounts(
       if (fs.existsSync(origConfig)) {
         let content = fs.readFileSync(origConfig, 'utf-8');
         if (filterProfiles) {
-          // AWS config uses `[profile foo]` rather than `[foo]` — transform
-          // to compare raw name against the allowlist.
+          // AWS config uses `[profile foo]` headers.
           content = filterConfigSections(content, allowedProfiles, {
             headerTransform: (h) => h.replace(/^profile\s+/, ''),
           });
@@ -5816,7 +4226,6 @@ export async function buildMounts(
     }
   }
 
-  // ---- gcloud (~/.gcloud-keys/*.json) -------------------------------------
   if (isToolEnabled(tools, 'gcloud')) {
     const gcloudKeysDir = path.join(home, '.gcloud-keys');
     if (fs.existsSync(gcloudKeysDir)) {
@@ -5824,8 +4233,7 @@ export async function buildMounts(
       const dest = stageDir('gcloud-keys');
 
       if (gcloudScoped) {
-        // v1 convention: GCLOUD_KEY_<SCOPE>=<filename.json> env var in the
-        // host process env maps scope → key file. Keep the same contract.
+        // GCLOUD_KEY_<SCOPE>=<filename.json> in the host env maps scope → key file.
         for (const s of gcloudScopes) {
           const envKey = `GCLOUD_KEY_${s.toUpperCase()}`;
           const keyFile = process.env[envKey];
@@ -5843,7 +4251,6 @@ export async function buildMounts(
           fs.chmodSync(destPath, 0o600);
         }
       } else {
-        // Unscoped: copy every .json under the keys dir.
         for (const entry of fs.readdirSync(gcloudKeysDir)) {
           if (!entry.endsWith('.json')) continue;
           const srcPath = path.join(gcloudKeysDir, entry);
@@ -5862,7 +4269,6 @@ export async function buildMounts(
     }
   }
 
-  // ---- dbt (~/.dbt/profiles.yml) ------------------------------------------
   if (isToolEnabled(tools, 'dbt')) {
     const dbtDir = path.join(home, '.dbt');
     const origProfiles = path.join(dbtDir, 'profiles.yml');
@@ -5889,7 +4295,6 @@ export async function buildMounts(
     }
   }
 
-  // Provider-contributed mounts (e.g. opencode-xdg)
   if (providerContribution.mounts) {
     mounts.push(...providerContribution.mounts);
   }
@@ -5908,13 +4313,8 @@ export function resolveWorkgroupMemoryMount(workgroupId: string, dataDir: string
 export const WORKGROUP_MEMORY_LOCK_CONTAINER_PATH = `${WORKGROUP_CONTAINER_PATH}/.memory-write.lock`;
 
 /**
- * Prepare the stable workgroup-wide kernel-lock inode and return its exact
- * file bind mount. The sidecar lives beside (never inside) the canonical
- * memory tree, so coordination metadata cannot affect memory tree hashes.
- *
- * The first caller creates the file exclusively at 0600. Later callers only
- * inspect the existing inode through O_NOFOLLOW and never truncate, unlink, or
- * rewrite it; the in-container writer owns the flock-protected metadata.
+ * The workgroup kernel-lock inode, beside (never inside) the memory tree so it cannot affect tree hashes. Created
+ * exclusively at 0600; later callers only inspect it via O_NOFOLLOW and never truncate, unlink or rewrite it.
  */
 export function resolveWorkgroupMemoryLockMount(workgroupId: string, dataDir: string = DATA_DIR): VolumeMount {
   const workgroupDir = path.dirname(workgroupMemoryDir(workgroupId, dataDir));
@@ -5991,11 +4391,7 @@ export function replaceClaudeNativeMemoryMount(
   ];
 }
 
-/**
- * Sync skill symlinks in .claude-shared/skills/ to match the container.json
- * selection. Each symlink points to a container path (/app/skills/<name>)
- * so it's dangling on the host but valid inside the container.
- */
+/** Symlinks target container paths (/app/skills/<name>), so they dangle on the host by design. */
 function syncSkillSymlinks(claudeDir: string, containerConfig: import('./container-config.js').ContainerConfig): void {
   const skillsDir = path.join(claudeDir, 'skills');
   if (!fs.existsSync(skillsDir)) {
@@ -6005,7 +4401,6 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   const desired = selectedSkillNames(containerConfig);
   const desiredSet = new Set(desired);
 
-  // Remove symlinks not in the desired set
   for (const entry of fs.readdirSync(skillsDir)) {
     const entryPath = path.join(skillsDir, entry);
     let isSymlink: boolean;
@@ -6019,7 +4414,6 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
     }
   }
 
-  // Create symlinks for desired skills (container path targets)
   for (const skill of desired) {
     const linkPath = path.join(skillsDir, skill);
     let entry: fs.Stats | undefined;
@@ -6031,10 +4425,8 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
     if (!entry) {
       fs.symlinkSync(`/app/skills/${skill}`, linkPath);
     } else if (!entry.isSymbolicLink()) {
-      // A real entry here is either a template overlay (intentional; see
-      // src/group-skills.ts) or a stale pre-refactor skill copy that shadows
-      // the shared skill. No marker distinguishes them yet, so
-      // surface the skip instead of staying silent.
+      // A template overlay (src/group-skills.ts) or a stale skill copy shadowing the shared one: nothing tells them
+      // apart, so warn rather than skip silently.
       log.warn(
         'Shared skill not symlinked: real entry occupies the path (template overlay or stale pre-refactor copy)',
         {
@@ -6047,64 +4439,29 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
 }
 
 /**
- * Every worker-def filename this feature has ever shipped. Load-bearing for
- * SECURITY: prune targets come ONLY from this trusted in-source list, never
- * from container-writable state — `.claude-shared/agents/` is RW-mounted into
- * the container (session-claude-mounts.ts), so an earlier design that read a
- * manifest file from there let an agent poison it with `../../../v2.db` and
- * make the host delete an arbitrary path on the next spawn. When you RENAME or
- * REMOVE a def from container/agents/, add its OLD filename here so it gets
- * pruned from groups that already have it. Current names may stay listed
- * (they're re-copied every spawn, so listing them is a harmless no-op).
+ * Every worker-def filename ever shipped. SECURITY: prune targets come ONLY from this in-source list, never from
+ * `.claude-shared/agents/` (container-writable), or an agent could make the host delete an arbitrary path. When a
+ * def is renamed or removed, add its OLD filename here so existing groups get it pruned.
  */
 const MANAGED_WORKER_DEFS = [
   'worker-fast.md',
   'worker.md',
   'worker-high.md',
   'worker-codex.md',
-  // Retired: renamed to worker-high.md so the tier name describes the rung
-  // rather than a Claude model (the same def is gpt-5.6-sol on Codex). Listed
-  // so groups that already have the old file get it pruned on next spawn.
+  // Retired (renamed to worker-high.md).
   'worker-opus.md',
-  // Retired: trunk no longer ships a worker def at all. Delegation is the
-  // bootstrap orchestrate plugin's effort shims, which reach a container
-  // through the plugin mount, not through this copy. Listed — not deleted —
-  // because every group on this install already has the file in
-  // `.claude-shared/agents/`, and this list is the only thing that removes it.
+  // Retired: trunk ships no worker def; this list is the only thing that removes existing copies.
   'worker-frontier.md',
 ];
 
-// NOTE on `worker-high.md` above: that name is ALSO one of the orchestrate
-// plugin's live shims (`plugins/orchestrate/agents/worker-high.md`), and the
-// two meet under one name in a container. This list only ever touches
-// `.claude-shared/agents/` — the container's user scope — while the shim is
-// registered from the plugin mount; on the HOST a plugin agent carries the
-// qualified `<plugin>:<agent>` name, but IN A CONTAINER it is exposed bare
-// (recorded in docs/specs/quota-burn/plan.md).
-// So a stale user-scope `worker-high.md` left from the retired roster sits
-// under the same bare name as the live shim.
-//
-// Which of the two a dispatch would then resolve to is NOT asserted here —
-// nothing was read that settles it. The prune does not depend on the answer:
-// one outcome runs a retired definition, the other leaves a dead file under a
-// live name for a reader or a model to pick by mistake. Removing it is what
-// makes the question moot. The same holds for any future shim whose name this
-// list has ever carried.
+// A stale user-scope `worker-high.md` shares its bare in-container name with the orchestrate plugin's live
+// `worker-high` shim; pruning it removes any ambiguity about which one a dispatch resolves to.
 
 /**
- * Copy trunk worker subagent defs (container/agents/*.md) into
- * .claude-shared/agents/ — the container's ~/.claude/agents. Copies, not
- * symlinks: agent discovery through dangling host symlinks is unverified, and
- * the files are tiny. Trunk is canonical: a managed def absent from the current
- * trunk set is pruned; operator-added defs (never in MANAGED_WORKER_DEFS) are
- * untouched. A group can shadow a trunk def with a same-name file in
- * groups/<folder>/.claude/agents/ (project scope outranks user scope).
+ * Copy trunk worker defs (container/agents/*.md) into .claude-shared/agents/; managed defs absent from trunk are
+ * pruned, operator-added defs are untouched.
  *
- * Trunk currently ships NO defs, so in practice this only prunes. That is why
- * a missing `container/agents/` is not an early return: git does not track an
- * empty directory, so deleting the last def deletes the directory, and an early
- * return there would leave every group's retired copy in place forever — the
- * exact file the list above exists to remove.
+ * Trunk ships NO defs, so a missing `container/agents/` must not return early: that would never prune retired copies.
  */
 function syncWorkerAgentDefs(claudeDir: string): void {
   const srcDir = path.join(process.cwd(), 'container', 'agents');
@@ -6115,19 +4472,12 @@ function syncWorkerAgentDefs(claudeDir: string): void {
   try {
     current = new Set(fs.readdirSync(srcDir).filter((e) => e.endsWith('.md')));
   } catch (err) {
-    // ENOENT ONLY — "trunk ships no defs", the normal state, so everything
-    // managed gets pruned below. Any other failure (EACCES, EIO, a transient
-    // read error) is NOT an answer about what trunk ships, and swallowing it
-    // here would turn an unreadable source directory into the destructive
-    // prune of every managed def in the group. Rethrow instead: the caller
-    // logs and spawns without the roster (`src/container-runner.ts`, the
-    // syncWorkerAgentDefs call site), which leaves the group's existing files
-    // untouched — the safe answer when the source cannot be read.
+    // ENOENT only (trunk ships no defs). Any other error is not an answer about trunk, and swallowing it would prune
+    // every managed def: rethrow so the caller spawns without touching the group's files.
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
     current = new Set<string>();
   }
-  // Prune managed defs retired from trunk. Names are compile-time constants,
-  // so no traversal is possible even though dstDir is container-writable.
+  // Names are compile-time constants, so no traversal is possible even though dstDir is container-writable.
   for (const name of MANAGED_WORKER_DEFS) {
     if (!current.has(name)) {
       try {
@@ -6142,12 +4492,7 @@ function syncWorkerAgentDefs(claudeDir: string): void {
   }
 }
 
-/**
- * Ensure container.json has the runtime identity fields the runner needs.
- * Written at spawn time so they're always current even if the DB values
- * change (e.g. group rename). Only writes if values differ to avoid
- * unnecessary file churn.
- */
+/** Written at spawn so identity fields track DB changes (e.g. a rename); writes only when values differ. */
 async function ensureRuntimeFields(
   containerConfig: import('./container-config.js').ContainerConfig,
   agentGroup: AgentGroup,
@@ -6161,59 +4506,29 @@ async function ensureRuntimeFields(
     containerConfig.groupName = agentGroup.name;
     dirty = true;
   }
-  // NOTE: `assistantName` is NOT force-synced here. The agent's user-facing
-  // name varies per channel — the same agent_group can show as "Example Assistant" in
-  // Slack, "Example Agent" in Discord, etc. The per-session resolver lives in
-  // `resolveAssistantName` below; container-runner passes the result as
-  // the NANOCLAW_ASSISTANT_NAME env var on every spawn so the in-container
-  // runner can prefer it over container.json's static value. Keeping the
-  // file untouched preserves whatever the operator (or
-  // `container_configs.assistant_name`) wrote without per-channel churn.
+  // `assistantName` is NOT synced here: it varies per channel and reaches the runner as NANOCLAW_ASSISTANT_NAME.
   if (dirty) {
-    // Through the ONE mutation primitive, which holds the group's file lock
-    // across read → mutate → write. This was a bare re-read plus a write,
-    // commented "race-safe": the re-read narrowed the window in which a
-    // concurrent writer's change could be overwritten, but two separate
-    // syscalls cannot close it, and what fell through was a silently discarded
-    // `excludePlugins`. The read/merge/write shape is unchanged — any
-    // operator-owned field written after the spawn began is still preserved —
-    // it is now exclusive as well.
+    // Through the ONE mutation primitive, which holds the group's file lock across read → mutate → write, so a
+    // concurrent writer's field (e.g. `excludePlugins`) is not silently discarded.
     const fresh = await updateContainerConfig(agentGroup.folder, (config) => {
       config.agentGroupId = agentGroup.id;
       config.groupName = agentGroup.name;
     });
-    // Sync the in-memory copy with anything a writer that got in before us may
-    // have added — downstream spawn code reads other fields from
-    // containerConfig and would otherwise miss those updates.
+    // Pick up fields a writer that got in first may have added; downstream spawn code reads this copy.
     if (fresh.tools !== undefined) containerConfig.tools = fresh.tools;
     if (fresh.mcpServers !== undefined) containerConfig.mcpServers = fresh.mcpServers;
   }
 }
 
 /**
- * Per-session resolution of the agent's user-facing name. Used to populate
- * `NANOCLAW_ASSISTANT_NAME` for every spawn.
- *
- * Precedence:
- *   1. `container_configs.assistant_name` (operator-set per-agent override —
- *      already merged into `containerConfig.assistantName` by readContainerConfig)
- *      WHEN it differs from `agent_group.name` (i.e., operator-intentional).
- *   2. Platform bot display from the session's channel — what users actually
- *      see in chat. Slack first (most installs), then Discord.
- *   3. `agent_group.name` (structural fallback — admin/cli sessions, freshly-
- *      booted adapters before identity fetch completes).
- *
- * Same agent_group routed to different channels gets different names; on the
- * Slack Example Retail channel "Example Assistant", on Discord "Example Agent", on admin sessions "example-retail".
+ * The agent's user-facing name for this session: an operator override (only detectable when it differs from
+ * `agent_group.name`), else the channel's platform bot display name (Slack, then Discord), else the group name.
  */
 export async function resolveAssistantName(
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
   sessionMessagingGroupId: string | null,
 ): Promise<string> {
-  // Operator-set explicit override (CLI: `ncl groups config update <id> --assistant-name=…`).
-  // `readContainerConfig` collapses `row.assistant_name ?? group.name` so we
-  // can only tell it's operator-set when it diverges from `group.name`.
   if (containerConfig.assistantName && containerConfig.assistantName !== agentGroup.name) {
     return containerConfig.assistantName;
   }
@@ -6272,13 +4587,8 @@ export interface DockerEnvironmentMaterialization {
 }
 
 /**
- * Move every Docker environment assignment out of the process argument vector.
- *
- * A Docker `--env-file` is still visible to the daemon and the container — the
- * host is the authority for both — but a local process listing sees only its
- * opaque 0600 pathname, never OAuth tokens, API keys, proxy credentials or
- * serialized MCP credentials. Preserve entry order so Docker's existing
- * duplicate-key last-wins behavior is unchanged.
+ * Move every Docker env assignment into a 0600 `--env-file`, so a host process listing never sees credential
+ * values. Order is preserved (Docker's duplicate-key last-wins behavior).
  */
 export function materializeDockerEnvironment(
   args: readonly string[],
@@ -6307,16 +4617,12 @@ export function materializeDockerEnvironment(
   if (sanitized[0] !== 'run') throw new Error('Docker environment materialization requires a docker run command');
 
   assertRealDirectory(directory);
-  // One agent group's `.context` directory is shared by its sessions. Scope
-  // stale cleanup to this session so a new concurrent session can never unlink
-  // the env file that a different Docker CLI process is still starting with.
+  // `.context` is shared by the group's sessions: scope stale cleanup to this session so a concurrent spawn's env
+  // file is never unlinked.
   const scope = createHash('sha256').update(sessionScope).digest('hex');
   const filenamePrefix = `.docker-env-${scope}-`;
-  // `docker run` reads the file during startup, so an old host may die after
-  // creating it but before its close handler can unlink it. A future spawn may
-  // remove only this session's opaque leaf names; unlink never follows a
-  // hostile symlink. The per-session run claim prevents two live spawns from
-  // sharing this scope.
+  // A host can die between creating the file and unlinking it: remove only this session's leaf names (unlink never
+  // follows a symlink); the per-session run claim prevents two live spawns sharing the scope.
   for (const entry of fs.readdirSync(directory)) {
     if (DOCKER_ENV_FILE.test(entry) && entry.startsWith(filenamePrefix)) fs.unlinkSync(path.join(directory, entry));
   }
@@ -6360,12 +4666,7 @@ export function removeDockerEnvironmentFile(file: string | null): void {
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
-  /**
-   * Session this container is being spawned for. Stamped as the
-   * `nanoclaw-session` label so a boot inventory can map a surviving
-   * container back to its session without the in-process registry, which is
-   * empty at startup.
-   */
+  /** Stamped as the `nanoclaw-session` label so boot inventory can map a survivor back to its session. */
   sessionId: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
@@ -6379,42 +4680,21 @@ async function buildContainerArgs(
     channelInstructionsProfile?: string | null;
   },
   sessionMessagingGroupId?: string | null,
-  // Resolved workgroup id from spawnContainer → reconcileWorkgroupAtSpawn.
-  // Threaded in so NANOCLAW_WORKGROUP_ID and the workgroup OneCLI secret
-  // resolution stay aligned with the /workspace/workgroup mount and the
-  // archive projection (race-fix).
   resolvedWgId?: string,
   /**
-   * Set when a spawn-time provider fallback is applied. Drives the
-   * NANOCLAW_PROVIDER_OVERRIDE/_MODEL_OVERRIDE bridge — including when a
-   * session's primary differs from the file but the fallback target happens
-   * to equal the file's provider.
+   * A spawn-time fallback was applied; the override bridge is needed even when the target equals the file's
+   * provider.
    */
   providerFallbackApplied?: boolean,
-  /**
-   * Routing id of this session's thread, surfaced as NANOCLAW_THREAD_ID.
-   * The `work-claims` skill stamps it onto a claim so an escalation can link
-   * back to where the work was happening — the field it used to write
-   * (`session_id`) was free text and resolved to nothing. Null for
-   * channel-level sessions, which have no thread to link to.
-   */
+  /** Surfaced as NANOCLAW_THREAD_ID; null for channel-level sessions. */
   sessionThreadId?: string | null,
   repositoryWorkUnit?: RepositoryWorkUnit,
   /**
-   * Messaging group the Slack owner-safety gate judges for this session.
-   * Equals `sessionMessagingGroupId` for chat sessions; for a task session it
-   * is the series' delivery destination. Kept SEPARATE from
-   * `sessionMessagingGroupId` on purpose — a task session is still not "in"
-   * that channel for assistant-name, channel-peer, or routing purposes.
+   * What the Slack owner-safety gate judges (a task session's delivery destination). Kept SEPARATE from
+   * `sessionMessagingGroupId`: a task session is not "in" that channel for naming, peers or routing.
    */
   slackSafetyMessagingGroupId?: string | null,
-  /**
-   * Non-secret runner configuration the registered mailbox contributes
-   * (`AgentMailbox.runnerEnvironment`). Empty for the SQLite mailbox — the
-   * session DBs are bind-mounted, so there is nothing to configure. Merged
-   * first so nothing below can be shadowed by it, matching upstream's
-   * spec-composition order.
-   */
+  /** Non-secret mailbox runner config; merged first so nothing below can be shadowed by it. */
   mailboxEnvironment?: Record<string, string>,
 ): Promise<string[]> {
   const wikiActor = wikiEnrollment(agentGroup.id, containerConfig.wikiMaintenance === true);
@@ -6469,9 +4749,7 @@ async function buildContainerArgs(
     args.push('--entrypoint', 'bash', CONTAINER_IMAGE, '-c', 'exec /app/entrypoint.sh');
     return args;
   }
-  // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
-  // accumulating as zombies under bun, which doesn't reap as PID 1) and still
-  // forwards signals to the entrypoint, so SIGTERM handling is unchanged.
+  // --init: tini as PID 1 reaps orphaned children (bun does not) and still forwards signals.
   const args: string[] = [
     'run',
     '--rm',
@@ -6481,113 +4759,40 @@ async function buildContainerArgs(
     ...containerLabelArgs(agentGroup.id, sessionId, resolvedWgId),
   ];
   args.push(...dockerResourceLimitArgs(containerConfig.resources));
-  // Privilege hardening — capabilities and setuid escalation. Resource
-  // ceilings came from dockerResourceLimitArgs above; these two builders
-  // never emit the same Docker flag.
   args.push(...securityArgs(containerConfig.security));
 
-  // Environment — only vars read by code we don't own.
-  // Everything NanoClaw-specific is in container.json (read by runner at startup).
+  // Only vars read by code we don't own; NanoClaw-specific config lives in container.json.
   for (const [key, value] of Object.entries(mailboxEnvironment ?? {})) args.push('-e', `${key}=${value}`);
-  // A per-group timezone override rides container.json (mirrored there by the
-  // ncl write paths). The verdict comes from `effectiveTimezone`, the same
-  // predicate `resolveGroupTimezone` applies to the DB row, so the container's
-  // POSIX `TZ` and the host's scheduling grid can never disagree about which
-  // override is honoured. Anything unconfirmed falls back to the install
-  // timezone rather than to UTC, so a hand-edited file can't silently move an
-  // agent's clock.
+  // `effectiveTimezone` is the same predicate host scheduling uses, so container `TZ` and the host grid agree;
+  // anything unconfirmed falls back to the install timezone, never UTC.
   args.push('-e', `TZ=${effectiveTimezone(containerConfig.timezone)}`);
 
-  // Claude Code behavior locks — duplicated from settings.json env block so
-  // the values are set regardless of the SDK's settings-loading order.
+  // Duplicated from settings.json so it holds regardless of the SDK's settings-loading order.
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=1');
   // Allow long foreground worker-codex calls without lengthening the default
   // timeout for ordinary Bash calls.
   args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000');
-  // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 was emitted here until 2026-09-19.
-  // Dropped with the window move to 600k: compaction now lands wherever the
-  // CLI's own default percentage puts it, and fast-jev-compaction's
-  // `session.compact` hook does the compaction whichever trigger fires it.
-  // CLAUDE_CODE_AUTO_COMPACT_WINDOW and the subagent caps are emitted by
-  // claudeSpawnEnv (src/claude-spawn-defaults.ts) so the wiki spawn branch
-  // above, which returns early, gets the same values.
-  // (Removed 2026-06-10: CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 +
-  // MAX_THINKING_TOKENS=127999. They forced the CLI's legacy fixed-budget
-  // thinking mode for explicit 4-6 selections so thinking blocks stayed
-  // visible for progress labels — superseded by the provider passing
-  // `thinking: {type: 'adaptive', display: 'summarized'}` on every query
-  // (claude.ts), which yields visible summarized thinking on every 4.6+
-  // model, and they could conflict with always-adaptive models like
-  // fable models that reject non-adaptive thinking.)
+  // CLAUDE_CODE_AUTO_COMPACT_WINDOW and the subagent caps come from claudeSpawnEnv so the early-returning wiki
+  // branch gets the same values.
 
-  // The group's default model and effort. The constants in flag-parser.ts
-  // (DEFAULT_OPUS_MODEL etc.) are the single
-  // source of truth — they're the only "default" surface. Per-channel
-  // and per-group layers can override; per-session flags override on
-  // top of those. Short aliases (opus46, opus47, etc.) live in the
-  // agent-runner flag parser's MODEL_ALIAS_MAP, independent of these.
-  //
-  // Precedence (most specific wins):
-  //   1. Per-session flag in chat (-m / -m1 / -e / -e1) — handled inside
-  //      the agent-runner's flag parser, not here.
-  //   2. Per-channel wiring (messaging_group_agents.default_model/effort)
-  //      — passed via channelDefaults when session has a messaging_group.
-  //   3. Per-agent container.json — `model`/`effort` (written by `ncl groups
-  //      config update`) then the hand-authored `defaultModel`/`defaultEffort`
-  //      — applies to every channel wired to this agent unless (2) overrides.
-  //   4. The DEFAULT_* constants above.
-  //
-  // The resolution above feeds NANOCLAW_CLAUDE_MODEL, NOT the SDK's alias
-  // short-circuit. ANTHROPIC_DEFAULT_<FAMILY>_MODEL is that short-circuit —
-  // whatever string is in it gets sent to the API verbatim when the agent or
-  // a subagent uses the bare family word — and all four carry install-wide
-  // constants, so `opus` means Opus in every group (claudeSpawnEnv).
-  // ensureOpus1mSuffix is load-bearing here: a bare `claude-opus-*` reaching
-  // the container as its model (e.g. via set_channel_model, which does not
-  // resolve aliases, or a hand-set channel/container default) makes the CLI's
-  // auto-compact window collapse to 200k under proxy auth and force-compact
-  // long sessions. Normalizing at this consumption point guarantees the 1M
-  // window regardless of how a bare value got into the DB.
-  // Bare FAMILY aliases in a channel/group default (`sonnet`, `opus`,
-  // `haiku`) resolve to the DEFAULT_* constants at this same consumption
-  // point. This lets an operator pin a channel to "current sonnet" instead
-  // of a frozen concrete id — a future family-default bump (e.g. Sonnet 5 →
-  // 5.1) then propagates on respawn with no DB edit. Without this, the bare
-  // alias would reach the API verbatim and 400 (see comment above).
-  // Channel defaults are provider-specific. A Codex wiring must not be sent
-  // through Claude's ANTHROPIC_* aliases (and, during a provider fallback,
-  // must not pin the fallback to the primary provider's model). The runner
-  // applies the channel layer only while the primary provider is active;
-  // fallback model/effort travel through the existing provider-fallback bridge
-  // below.
+  // Model precedence: per-session chat flag (runner-side), per-channel wiring, container.json `model`/`effort` then
+  // `defaultModel`/`defaultEffort`, then the flag-parser DEFAULT_* constants. Channel defaults are
+  // provider-specific: never applied during a provider fallback (the fallback bridge below carries its model).
   const activeChannelModel = providerFallbackApplied ? null : channelDefaults?.channelDefaultModel;
   const activeChannelEffort = providerFallbackApplied ? null : channelDefaults?.channelDefaultEffort;
 
   args.push(...codexFamilyAliasEnv());
   if (provider === 'codex') {
-    // The Codex provider reads model/reasoning_effort from its strict
-    // providerConfig schema. These spawn-scoped envs are overlaid into that
-    // config by agent-runner/src/config.ts, so a per-channel pin beats the
-    // per-agent container config without mutating the mounted file.
+    // Overlaid onto the Codex providerConfig by the runner, so a per-channel pin beats container.json without
+    // mutating the mounted file.
     const codexModel = activeChannelModel ?? containerConfig.model ?? containerConfig.defaultModel;
     const codexEffort = activeChannelEffort ?? containerConfig.effort ?? containerConfig.defaultEffort;
     if (codexModel) args.push('-e', `NANOCLAW_CODEX_MODEL_OVERRIDE=${codexModel}`);
     if (codexEffort) args.push('-e', `NANOCLAW_CODEX_EFFORT_OVERRIDE=${codexEffort}`);
   } else {
-    // claudeSpawnEnv applies resolveEffectiveModel: family aliases first (so
-    // `opus` keeps tracking DEFAULT_OPUS_MODEL rather than freezing), then
-    // pinned short aliases (`opus5`, `opus48`, `sonnet5`, `fable51`), then
-    // ensureOpus1mSuffix on bare ids. The chat ack calls the same function, so
-    // the confirmation the user sees is exactly what lands in
-    // NANOCLAW_CLAUDE_MODEL.
-    // Both the resolution and the `-e` strings themselves live in
-    // claude-spawn-defaults.ts so they can be executed by a test;
-    // buildContainerArgs cannot (live `onecli` shell calls). Emits
-    // NANOCLAW_CLAUDE_MODEL and the four constant
-    // ANTHROPIC_DEFAULT_<FAMILY>_MODEL aliases always, and
-    // NANOCLAW_EFFORT_OVERRIDE only when a channel wiring or the group's
-    // container.json actually configures one — absent means the claude
-    // provider applies its per-model-family default.
+    // claudeSpawnEnv resolves family and short aliases and adds the Opus 1M suffix (a bare `claude-opus-*` would
+    // collapse the auto-compact window to 200k). The chat ack uses the same function. NANOCLAW_EFFORT_OVERRIDE is
+    // emitted only when configured; absent means the per-model-family default.
     args.push(
       ...claudeSpawnEnv(containerConfig, { model: activeChannelModel, effort: activeChannelEffort }, (message) =>
         log.warn('Claude spawn default refused', {
@@ -6599,12 +4804,8 @@ async function buildContainerArgs(
     );
   }
 
-  // Provider fallback bridge. The container reads its provider and model from
-  // the bind-mounted container.json, which the host does not rewrite per
-  // spawn — so a spawn-time fallback has to travel as env, exactly like
-  // NANOCLAW_ASSISTANT_NAME beats the file's static value. The explicit
-  // marker is required even when the fallback target equals that static
-  // provider: equality alone cannot distinguish it from a normal spawn.
+  // container.json is not rewritten per spawn, so a fallback travels as env. The explicit marker is required even
+  // when the target equals the file's provider.
   if (providerFallbackApplied && containerConfig.provider) {
     for (const [key, value] of Object.entries(
       providerFallbackRuntimeEnv({ provider: containerConfig.provider, model: containerConfig.model }),
@@ -6619,34 +4820,18 @@ async function buildContainerArgs(
   // host delivery gate (TASK_LIST_ENABLED) is what reaches it.
   if (TASK_LIST_ENABLED) args.push('-e', 'NANOCLAW_TASK_LIST=1');
 
-  // Per-channel default tone profile — ports v1's "always-on tone" feature.
-  // Precedence: per-channel wiring (messaging_group_agents.default_tone) →
-  // per-agent container.json `tone` → unset (agent falls back to the
-  // get_tone_profile MCP tool for on-demand selection). Profile content
-  // injection happens container-side in agent-runner/src/index.ts.
+  // Tone: per-channel wiring, then container.json `tone`, else unset (the agent selects on demand).
   const defaultTone = channelDefaults?.channelDefaultTone ?? containerConfig.tone ?? null;
   if (defaultTone) {
     args.push('-e', `NANOCLAW_DEFAULT_TONE=${defaultTone}`);
   }
 
-  // Per-channel operating instructions — a SEPARATE always-on layer from tone
-  // above, which stays voice-only. No container.json fallback on purpose: the
-  // group-wide equivalent is standing-instructions.md, already in every
-  // prompt, so a second group-level slot here would just be a duplicate with
-  // different precedence. Resolution is per-wiring or nothing. Profile content
-  // injection happens container-side in agent-runner/src/index.ts, ahead of
-  // the tone block, from the /workspace/channel-instructions mount.
+  // Per-wiring or nothing, on purpose: the group-wide equivalent is standing-instructions.md, already in every prompt.
   const instructionsProfile = channelDefaults?.channelInstructionsProfile ?? null;
   if (instructionsProfile) {
     args.push('-e', `NANOCLAW_INSTRUCTIONS_PROFILE=${instructionsProfile}`);
   }
 
-  // Per-session assistant name. Resolved channel-aware so the same
-  // agent_group can say "I am Example Assistant" on Slack Example Retail, "I am Example Agent" on Discord, etc.
-  // The in-container runner prefers NANOCLAW_ASSISTANT_NAME over
-  // container.json's static value (see container/agent-runner/src/config.ts).
-  // Falls back to agent_group.name when no channel bot is registered
-  // (admin/cli sessions, freshly-booted adapters).
   const resolvedAssistantName = await resolveAssistantName(
     agentGroup,
     containerConfig,
@@ -6654,19 +4839,10 @@ async function buildContainerArgs(
   );
   args.push('-e', `NANOCLAW_ASSISTANT_NAME=${resolvedAssistantName}`);
   if (sessionThreadId) args.push('-e', `NANOCLAW_THREAD_ID=${sessionThreadId}`);
-  // Pre-task script timeout override — forwarded CLAMPED (config.TASK_SCRIPT_TIMEOUT_MS),
-  // unconditionally: when unset it is 120_000, identical to the container
-  // default, so an unconfigured spawn is behaviorally unchanged. The gate
-  // cannot be `process.env` alone — .env-only values never reach it at this
-  // point (config.ts's import-order trap), and silently dropping a documented
-  // operator override is what reintroduced the original 30s-kill failure.
+  // Forwarded CLAMPED and unconditionally: .env-only values never reach `process.env` here (config.ts import-order
+  // trap), and dropping the override lets tasks be killed at the container default.
   args.push('-e', `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS=${TASK_SCRIPT_TIMEOUT_MS}`);
-  // Points readUpstreamPolicy's snapshot fallback at the mounted file above
-  // regardless of --repo. Load-bearing for the post-approval re-audit: the
-  // agent reruns `container-updates.ts audit --repo <writable clone>`, and
-  // that clone has no `upstream` remote either (it's a fresh git clone of
-  // origin), so without this override the clone-relative default path
-  // (`<clone>/.upstream-policy.json`) would never resolve to this file.
+  // Forces the snapshot path: the agent's writable clone used for re-audits has no `upstream` remote either.
   args.push('-e', `NANOCLAW_UPSTREAM_POLICY=/workspace/project/.upstream-policy.json`);
   if (repositoryWorkUnit) {
     args.push('-e', `NANOCLAW_HOST_DATA_DIR=${DATA_DIR}`);
@@ -6675,26 +4851,9 @@ async function buildContainerArgs(
     args.push('-e', `${CHECKOUT_MODE_ENV}=${effectiveCheckoutMode()}`);
   }
 
-  // Workgroup awareness — the agent learns which workgroup (multi-agent
-  // tenant boundary) it belongs to, so prompts grounded in "my workgroup is
-  // X" reach the right scope. Omitted when the agent has no workgroup row
-  // (pre-migration-036 installs / fresh standalone agents).
-  //
-  // Read directly from the DB rather than from `agentGroup` because the
-  // typed `AgentGroup` interface doesn't surface workgroup_id (column was
-  // added in migration 036; the row carries it but the type predates it).
-  // Mirrors the existing W3 fail-closed lookup in this file.
-  //
-  // Try/catch fail-soft: pre-migration-036 installs don't have the
-  // workgroup_id column at all. `SELECT workgroup_id FROM ...` throws
-  // `no such column` on those schemas, which would turn a best-effort
-  // prompt addendum into a hard spawn failure.
-  // The W3 path uses PRAGMA table_info to guard the same
-  // case; here we use try/catch because the workgroup line is purely
-  // additive — silent fall-through is the right semantic.
+  // Fail-soft: the workgroup line is a best-effort prompt addendum, and schemas without the workgroup_id column
+  // throw `no such column`.
   try {
-    // Use the resolved wgId from spawnContainer when available — same value
-    // the /workspace/workgroup mount + archive projection already saw.
     const wgId =
       resolvedWgId ??
       (await withCentralSync(
@@ -6713,28 +4872,12 @@ async function buildContainerArgs(
       args.push('-e', `NANOCLAW_WORKGROUP_ID=${wgId}`);
     }
   } catch {
-    // Pre-migration-036 schema. Omit the env var; the container's
-    // buildSystemPromptAddendum already treats absence as "no workgroup".
+    // Old schema: omit the env var; the runner treats absence as "no workgroup".
   }
 
-  // Peer identity injection — every agent_group operating on the same
-  // platform-side channel as THIS session, with its bot user_id resolved
-  // for canonical `<@U…>` mentions. The container's
-  // buildSystemPromptAddendum reads NANOCLAW_PEERS and renders an
-  // identity block: "You are X (@handle, <@uid>). Peers: ...". This gives the
-  // model an explicit self and peer name→user_id mapping per turn so prose handoff
-  // ("@Example Assistant Codex" → `<@UTEST00024>`) doesn't depend on chat-history
-  // inference. Self user_id is included separately so the agent
-  // recognizes inbound @-mentions to itself.
-  //
-  // Sibling-adapter awareness: Example Assistant and Example Assistant Codex on the same Slack channel
-  // have separate messaging_groups (one per bot adapter). getChannelPeers
-  // matches on messaging_groups.platform_id, surfacing peers across
-  // sibling adapters. See src/db/messaging-groups.ts for the rationale.
-  //
-  // Empty when the agent has no session-side messaging_group (admin/cli
-  // shell) or no other agent is wired to the platform channel. The
-  // container treats absence as "no peers" and omits the section.
+  // NANOCLAW_PEERS: every agent group on the same platform channel with its bot user_id, so the model has an
+  // explicit self and peer name→`<@uid>` mapping. getChannelPeers matches on platform_id, so sibling adapters
+  // (one messaging group per bot) are included. Absent means no peers.
   if (sessionMessagingGroupId) {
     const { getChannelPeers, getMessagingGroup } = await import('./db/messaging-groups.js');
     const { getSlackBotDisplayName, getKnownSlackBots } = await import('./channels/slack-mentions.js');
@@ -6743,10 +4886,7 @@ async function buildContainerArgs(
     const slackBots = getKnownSlackBots();
     const discordBots = getKnownDiscordBots();
     const peerEntries = peers.map((p) => {
-      // Look up user_id in EITHER registry — channel_type is the disjoint
-      // key (Slack channel_types start with `slack-`, Discord with
-      // `discord-`). Slack registry wins when both happen to be populated
-      // for a given channel_type (shouldn't occur in practice).
+      // channel_type is the disjoint key between the Slack and Discord registries.
       const slackBot = slackBots.get(p.channel_type);
       const discordBot = discordBots.get(p.channel_type);
       let userId: string | undefined;
@@ -6760,12 +4900,8 @@ async function buildContainerArgs(
       }
       return { name, userId };
     });
-    // Self identity — same dual-registry lookup. The channel-facing display
-    // name is deliberately distinct from assistantName: an operator may call
-    // this agent by a shorthand nickname while Slack routes it as a different
-    // bot handle (say `@beacon-codex`). Supplying
-    // both aliases prevents the model from treating its own platform mention
-    // as a request for a sibling.
+    // The channel-facing display name is deliberately distinct from assistantName; supplying both keeps the model
+    // from treating its own platform mention as a request for a sibling.
     const selfMg = await getMessagingGroup(sessionMessagingGroupId);
     let selfUserId: string | undefined;
     let selfName: string | undefined;
@@ -6788,19 +4924,12 @@ async function buildContainerArgs(
     }
   }
 
-  // v1 settings.json env block: SDK
-  // capabilities that need explicit opt-in. Porting as plain env since
-  // v2's container reads env, not a settings.json mount point.
+  // SDK capabilities that need explicit opt-in (settings.json env block equivalents).
   args.push('-e', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1');
   args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
   args.push('-e', 'ENABLE_TOOL_SEARCH=true');
 
-  // Forward CODEX_FALLBACK_HOMES when fallback codex auth dirs were mounted.
-  // Source of truth is the mounts array — buildMounts decided which entries
-  // survived (auth.json exists, not deduped against primary). Reconstructing
-  // from mounts keeps the env var aligned with what's actually accessible.
-  // Format: colon-joined container paths in mount order, which is the same
-  // as declaration order in codexAuthFallbacks (see resolveCodexAuthFallbacks).
+  // Derived from the mounts buildMounts actually kept, in declaration order.
   const codexFallbackPaths = mounts
     .filter((m) => /^\/home\/node\/\.codex-fallback-\d+$/.test(m.containerPath))
     .map((m) => m.containerPath);
@@ -6812,56 +4941,28 @@ async function buildContainerArgs(
     args.push('-e', `CODEX_PRIMARY_HOST_HOME=${CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH}`);
   }
 
-  // Credential-lookup folder. Defaults to `agent_groups.folder`; sibling
-  // groups (codex clones, etc.) can override via container.json's
-  // `credentialFolder` field to inherit the source group's scoped env vars
-  // (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Claude
-  // OAuth, Codex auth dir, etc.) without duplicating every var with a
-  // sibling-specific suffix.
+  // `credentialFolder` lets siblings inherit the source group's scoped credentials (env vars, OAuth, Codex dir).
   //
-  // Identity-bound concerns (containerName, group dir mount, log fields)
-  // stay on `agentGroup.folder` so siblings
-  // remain individually addressable.
+  // Identity-bound concerns (container name, group dir mount, log fields) stay on `agentGroup.folder`.
   const credentialFolder = containerConfig.credentialFolder ?? agentGroup.folder;
 
-  // GCP service-account key (BigQuery / gcloud / gsutil). Resolved once here;
-  // drives the ADC env vars below and the googleapis.com proxy bypass further
-  // down. null (no key file) for every group that hasn't opted in.
+  // Null for every group without a key file; drives the ADC env vars and the googleapis.com proxy bypass.
   const gcpKey = resolveGcpServiceAccountKey(credentialFolder);
 
-  // Per-group Anthropic credentials. Default behaviour reads the global
-  // `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (and `_N` rotation
-  // siblings); the per-group form `<BASE>_<FOLDER_UPPER>` overrides the
-  // global and pins the *entire* rotation set to the workplace/account
-  // tokens for this group only — preventing fallback onto a different
-  // account on retryable errors.
-  // Pass ALL Anthropic credential keys from `.env` read fresh at spawn — base,
-  // scoped `_<FOLDER>`, and numbered `_N` (and scoped-numbered) variants — so
-  // resolveScopedRotationSet can let disk win over the host's stale startup
-  // snapshot. This makes per-group token edits take effect on the next
-  // container respawn without a full host restart, and recovers a
-  // placeholder-shadowed global primary. See resolveScopedRotationSet.
-  // (Incidents 2026-06-25, 2026-06-27.)
+  // Reads `.env` fresh at spawn so per-group token edits apply on respawn without a host restart (see
+  // resolveScopedRotationSet).
   const auth = resolveAnthropicAuth(
     credentialFolder,
     process.env,
     readEnvFileMatching(/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)(_|$)/),
   );
 
-  // Anthropic custom-upstream auth (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)
-  // is forwarded inside the OneCLI gateway block below, after the gateway
-  // applies, so the custom host can be excluded from the proxy via NO_PROXY
-  // and the forwarded key is authoritative. See the bypass block there.
+  // Custom-upstream auth (ANTHROPIC_BASE_URL + key) is forwarded in the OneCLI gateway block below, after the
+  // gateway applies, so its host can join NO_PROXY and the forwarded key is authoritative.
 
-  // OAuth path (Claude Max subscription). When CLAUDE_CODE_OAUTH_TOKEN is
-  // set on the host we forward it + any CLAUDE_CODE_OAUTH_TOKEN_N fallbacks
-  // so the provider can rotate through multiple Max accounts on retryable
-  // errors (weekly cap, 429, rate_limit). The OneCLI proxy is still applied
-  // below, but we add api.anthropic.com to NO_PROXY so Anthropic traffic
-  // bypasses OneCLI's credential-injection layer — otherwise the proxy
-  // overwrites whatever OAuth the SDK sent with the single vault entry,
-  // defeating in-process rotation. Everything else (Gmail, GitHub, Exa,
-  // Braintrust, etc.) still routes through OneCLI.
+  // OAuth primary + `_N` fallbacks are forwarded so the provider can rotate accounts on retryable errors, and
+  // api.anthropic.com joins NO_PROXY: the OneCLI proxy would overwrite the OAuth header with its single vault
+  // entry, defeating rotation.
   const hostOauth = auth.oauthPrimary;
   const oauthBypassAnthropic = Boolean(hostOauth);
   if (hostOauth) {
@@ -6869,67 +4970,35 @@ async function buildContainerArgs(
     for (const fb of auth.oauthFallbacks) {
       args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN_${fb.index}=${fb.value}`);
     }
-    // Which credential set those slots came from. Scoped tokens are forwarded
-    // under the same unscoped `_N` names as globals, so without this the
-    // container cannot tell its slot 2 from the global pool's slot 2 — and
-    // rate-limit utilization sampled against them is not comparable (see
-    // rate_limit_samples in the container's outbound.db).
+    // Scoped and global tokens share the unscoped `_N` names; this says which set the slots came from.
     const oauthCredentialSet = auth.oauthScoped ? `group:${credentialFolder}` : 'global';
     args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${oauthCredentialSet}`);
-    // Operator-declared lane per slot (`<slot>:<lane>,...`). The container
-    // reads this from its own env (see laneForSlot in providers/claude.ts),
-    // and there is NO generic env passthrough into containers — the only one
-    // is prefix-limited to RENDER_PG_/RENDER_REDIS_URL_ below. Without this
-    // explicit forward the variable is simply undefined inside every
-    // container and `lane` stays NULL forever no matter what .env says, with
-    // no error anywhere to show for it. Forwarded only when declared, so an
-    // install that never sets it sends nothing.
+    // Must be forwarded explicitly: there is no generic env passthrough, and without it `lane` stays NULL silently.
     const oauthLanes = process.env.CLAUDE_CODE_OAUTH_LANES;
     if (oauthLanes) args.push('-e', `CLAUDE_CODE_OAUTH_LANES=${oauthLanes}`);
-    // The scopes the forwarded token carries — `user:inference` only, all a
-    // `claude setup-token` credential holds. An env token has no credential
-    // record, so the CLI believes this variable. Do not add `user:profile`: it
-    // sends the CLI to profile endpoints (/api/oauth/usage among them) that
-    // answer 403 for these tokens, then 429 once the 403s drain the per-token
-    // limiter. Plan utilization does not need it — the CLI reads it from the
-    // response headers (`rate_limit_event.unifiedWindows`). Declared rather
-    // than left unset because an unset variable makes the CLI treat an env
-    // token as profile-capable for some account reads.
+    // `user:inference` only, all a setup-token credential holds. Do NOT add `user:profile`: the CLI would call
+    // profile endpoints that 403 and then 429 for these tokens. Declared because unset makes the CLI treat an env
+    // token as profile-capable.
     args.push('-e', 'CLAUDE_CODE_OAUTH_SCOPES=user:inference');
   }
 
-  // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves
-  // from container.json `githubTokenEnv`, then from
-  // `GITHUB_TOKEN_<FOLDER_UPPER>`, then falls back to `GITHUB_TOKEN`.
-  // OneCLI's proxy model doesn't fit git auth — we pass the real token.
+  // OneCLI's proxy model doesn't fit git auth, so the real token is passed.
   const ghToken = await resolveGitHubTokenForContainer(credentialFolder, containerConfig);
   if (ghToken) {
-    // BY REFERENCE by default: the token is written to a per-group file that
-    // is mounted read-only, and only the PATH goes into the container spec, so
-    // `docker inspect` and the spawn argv carry no credential value. Because
-    // the host rewrites that file in place (host sweep → refreshGroupGitHubTokenFiles),
-    // a container that outlives its ~1h App token now picks up the re-mint on
-    // its next git/gh call instead of dying with a frozen env. `GITHUB_TOKEN_IN_ENV=1`
-    // restores value-forwarding for one release. See github-token-file.ts.
+    // BY REFERENCE by default: only the PATH of a read-only per-group file reaches the container spec, so no
+    // credential is in `docker inspect` or argv, and the host sweep rewrites it in place so a long-lived container
+    // picks up the ~1h App token re-mint. `GITHUB_TOKEN_IN_ENV=1` restores value-forwarding.
     const ghPlan = planGitHubTokenSpawn({ agentGroupId: agentGroup.id, token: ghToken });
     if (ghPlan.mount) {
       mounts.push(ghPlan.mount);
-      // Re-resolution closure for the sweep. Registered per spawn so the sweep
-      // rewrites the file using this group's own lookup order (githubTokenEnv →
-      // scoped → global → App mint), not a host-wide default. Only registered
-      // when a file was actually mounted — under the rollback flag there is
-      // nothing on disk to keep fresh.
+      // Registered per spawn so the sweep re-resolves with this group's own lookup order.
       registerGroupTokenRefresher(agentGroup.id, () =>
         resolveGitHubTokenForContainer(credentialFolder, containerConfig),
       );
     }
     args.push(...ghPlan.envArgs);
-    // Optional URL-scoped credential allowlist. When set, entrypoint.sh
-    // configures git's credential helper to only return the token for the
-    // listed orgs (comma-separated), and skips the global `gh auth login`
-    // so gh's own auth store can't bypass the URL scope. Without this,
-    // a container with a broad GitHub token can clone/push to any org
-    // the token grants. Per-agent-group via GITHUB_ALLOWED_ORGS_<FOLDER>.
+    // Optional per-group org allowlist: entrypoint.sh restricts git's credential helper to these orgs and skips
+    // `gh auth login`, so a broad token cannot reach other orgs.
     const ghOrgs = resolveScopedEnv('GITHUB_ALLOWED_ORGS', credentialFolder);
     if (ghOrgs) args.push('-e', `GITHUB_ALLOWED_ORGS=${ghOrgs}`);
   } else {
@@ -6938,35 +5007,18 @@ async function buildContainerArgs(
     });
   }
 
-  // Claude Code SDK reads this to discover plugins at
-  // /workspace/plugins/<name>/ (mounted by buildMounts from ~/plugins/).
   args.push('-e', 'CLAUDE_PLUGINS_ROOT=/workspace/plugins');
-  // Loop root for the design-artifact-loop skill: the vendored SKILL.md tells the
-  // agent "$DESIGN_ARTIFACT_LOOP_ROOT if set" — export it to the agent's shell so
-  // that instruction is TRUE in containers and authoring lands where the vendored
-  // design_review tool (pinned to the same path by its wrapper) will accept it.
+  // The vendored skill honours $DESIGN_ARTIFACT_LOOP_ROOT; the design_review tool accepts only this same path.
   args.push('-e', 'DESIGN_ARTIFACT_LOOP_ROOT=/workspace/agent/design-artifact-loop');
 
-  // Scoped credential env vars: each base resolves via
-  // `<BASE>_<FOLDER_UPPER>` → `<BASE>` and is injected if found. An explicit
-  // agent Git identity intentionally wins only for Git's four attribution
-  // variables; every other scoped credential keeps its established lookup.
+  // An explicit agent Git identity wins only for Git's four attribution variables.
   for (const [base, v] of Object.entries(resolveScopedCredentialEnv(containerConfig, credentialFolder))) {
     if (v) args.push('-e', `${base}=${v}`);
   }
 
-  // Folder-scoped verbatim env vars: pass through env vars whose name starts
-  // with a known prefix AND whose post-prefix tail starts with the folder
-  // token followed by `_` or end-of-string. These are raw connection strings
-  // (RENDER_PG_URL_EXAMPLE_LABS_example-app_MAIN, etc.) that don't collapse to a base
-  // name — the agent uses the full name as-is. Gate on folder to keep
-  // cross-group data access from leaking.
-  //
-  // SECURITY (cross-tenant audit 2026-05-03): the previous check used
-  // `includes('_<TOK>_')`, which let folder=example-agent inherit EXAMPLE_DEV_* vars
-  // (substring overlap with example-dev). The strict prefix-anchored match
-  // here, combined with the folder-name collision check at create_agent
-  // time, eliminates the ambiguity.
+  // Raw connection strings (e.g. RENDER_PG_URL_<FOLDER>_MAIN) passed through verbatim. SECURITY: the tail must
+  // START with the folder token followed by `_` or end-of-string; a substring match let one folder inherit
+  // another folder's vars.
   const folderTok = credentialFolder.toUpperCase().replace(/-/g, '_');
   const verbatimPrefixes = ['RENDER_PG_', 'RENDER_REDIS_URL_'];
   for (const [k, v] of Object.entries(process.env)) {
@@ -6978,15 +5030,9 @@ async function buildContainerArgs(
     args.push('-e', `${k}=${v}`);
   }
 
-  // GCP credentials: point ADC / client libs at the mounted key and default the
-  // project from the key's own `project_id`, so client libs and `bq`/`gcloud`
-  // (once the agent-runner activates the service account at startup) need no
-  // flags. Set regardless of gateway state since ADC works without the proxy;
-  // the googleapis.com bypass is added later in the gateway block. Lockstep
-  // with the mount via `gcpKey`.
+  // ADC env and the default project come from the mounted key; set regardless of gateway state (ADC needs no proxy).
   if (gcpKey) {
     args.push('-e', `GOOGLE_APPLICATION_CREDENTIALS=${GCP_KEY_CONTAINER_PATH}`);
-    // Redirect gcloud's config dir to a node-writable path (see const comment).
     args.push('-e', `CLOUDSDK_CONFIG=${GCP_CLOUDSDK_CONFIG_CONTAINER_PATH}`);
     try {
       const projectId = (JSON.parse(fs.readFileSync(gcpKey, 'utf-8')) as { project_id?: string }).project_id;
@@ -7002,29 +5048,15 @@ async function buildContainerArgs(
     }
   }
 
-  // Pin pnpm's store to the group mount, for every provider. With no store-dir
-  // set, pnpm hardlink-tests against $HOME (the image overlay layer — a
-  // different device from any bind mount) and falls back to the nearest
-  // bind-mount boundary it can find, which was scattering duplicate
-  // multi-hundred-MB stores across every topic worktree and group dir.
-  // /workspace/agent (groups/<folder>, mounted unconditionally above) is the
-  // right target: same host filesystem as every workspace mount so hardlinks
-  // work, and shared per GROUP rather than the flag-gated, ephemeral-when-off
-  // /workspace/workgroup. Both env forms are set — pnpm 10 (current pin) and
-  // pnpm 11 both honor `npm_config_*`, and `pnpm_config_*` is the
-  // pnpm-specific form going forward — and env config outranks any .npmrc an
-  // agent or repo may carry.
+  // Pin pnpm's store to the group mount: unset, pnpm falls back to arbitrary bind-mount boundaries and scatters
+  // multi-hundred-MB stores; /workspace/agent is on the same host filesystem as every workspace mount, so
+  // hardlinks work. Both env forms for pnpm 10/11; env config outranks any .npmrc.
   args.push('-e', 'npm_config_store_dir=/workspace/agent/.pnpm-store');
   args.push('-e', 'pnpm_config_store_dir=/workspace/agent/.pnpm-store');
 
-  // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   const providerEnv = { ...(providerContribution.env ?? {}) };
-  // OpenCode reads its model/effort selectors directly from OPENCODE_* env
-  // vars (the provider contribution supplies the per-agent DB defaults). A
-  // channel wiring is more specific, so replace those values before emitting
-  // the environment rather than relying on duplicate Docker `-e` flags. The
-  // same path covers an OpenCode provider fallback, where containerConfig has
-  // already been replaced with the declared fallback model/effort.
+  // A channel wiring (or an OpenCode fallback) replaces the OPENCODE_* selectors here rather than relying on
+  // duplicate Docker `-e` flags.
   if (provider === 'opencode') {
     const opencodeModel = activeChannelModel ?? (providerFallbackApplied ? containerConfig.model : undefined);
     const opencodeEffort = activeChannelEffort ?? (providerFallbackApplied ? containerConfig.effort : undefined);
@@ -7035,74 +5067,32 @@ async function buildContainerArgs(
     args.push('-e', `${key}=${value}`);
   }
 
-  // Env half of the staged OpenCode credential. Keyed on the MOUNT rather than
-  // on `provider !== 'opencode'` directly, the same way CODEX_FALLBACK_HOMES is
-  // above: an OpenCode session gets the env from its provider contribution, so
-  // emitting it here too would duplicate it, and a container whose staging was
-  // withheld should not be pointed at a path it has no mount for.
+  // Keyed on the MOUNT: an OpenCode session gets this env from its provider contribution, and a withheld staging
+  // must not be pointed at a path it has no mount for.
   if (provider !== 'opencode' && mounts.some((m) => m.containerPath === OPENCODE_XDG_CONTAINER_PATH)) {
     for (const [key, value] of Object.entries(OPENCODE_XDG_ENV)) {
       args.push('-e', `${key}=${value}`);
     }
   }
 
-  // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection.
-  // Must ensureAgent first for non-admin groups, otherwise applyContainerConfig
-  // rejects the unknown agent identifier and returns false.
-  //
-  // The gateway runs for EVERY container so all tools (Slack, GitHub,
-  // Snowflake, Exa, …) get vault credential injection. When the operator
-  // routes Anthropic to a custom upstream via ANTHROPIC_BASE_URL, only that
-  // one host is excluded from the proxy (NO_PROXY entry added in the bypass
-  // block below, alongside the OAuth bypass) and authenticates with the
-  // forwarded ANTHROPIC_API_KEY — OneCLI keeps handling every other host.
-  // Same per-host bypass mechanism already used for snowflake/aws/github.
-  //
-  // Gateway failure is treated as transient and throws — the caller
-  // (router/host-sweep) catches, leaves the inbound message pending, and the
-  // next sweep tick retries. Spawning a container with no credentials would
-  // only mask the misconfiguration.
+  // OneCLI gateway for EVERY container. ensureAgent must run first, or applyContainerConfig rejects the unknown
+  // identifier. Gateway failure throws: the inbound message stays pending and the sweep retries (a container with
+  // no credentials would only mask the misconfiguration).
   {
-    // The OneCLI identity this container's proxy is wired to. Defaults to the
-    // per-group identity; a non-owner-safe session carrying a Slack user-token
-    // secret is reassigned to `<group>-noslack` below (Slack withheld).
+    // Defaults to the per-group identity; reassigned to `<group>-noslack` below for non-owner-safe sessions.
     let effectiveIdentifier = agentIdentifier;
     if (agentIdentifier) {
-      // Per-group + workgroup secret scoping — declarative model, fail-closed.
-      // Workgroup-level secrets are the baseline; per-group onecliSecrets extend
-      // (additive) — neither list can subtract from the other. No-op when the
-      // merged list is empty (preserves whatever assignment the operator set via
-      // UI/CLI — e.g. the 3 mode-all agents intentionally left untouched).
-      // Use the resolved wgId from spawnContainer when available — the JOIN on
-      // agent_groups.workgroup_id below can return a different workgroup if a
-      // concurrent reconcile flipped it between reconcileWorkgroupAtSpawn
-      // and this lookup (race-fix).
+      // Workgroup secrets are the baseline and per-group onecliSecrets extend them (never subtract). Fail-closed;
+      // a no-op when the merged list is empty.
       const workgroupSecrets = resolvedWgId
         ? await getWorkgroupOnecliSecretsById(resolvedWgId)
         : await getWorkgroupOnecliSecrets(agentGroup.id);
       const mergedSecrets = mergeWorkgroupAndGroupSecrets(workgroupSecrets, containerConfig.onecliSecrets);
 
-      // Slack user-token scoping — the whole Slack boundary: live Slack access
-      // is `curl https://slack.com/api/*` through the proxy, so whether the
-      // token is injected is the only control there is. The OneCLI
-      // agent identity is per-GROUP, so all sessions of this group share one
-      // secret set; we cannot strip Slack per-session on a single identity
-      // without racing concurrent sessions. Instead, non-owner-safe sessions
-      // (a Slack-credential-trust classification — NOTHING to do with
-      // session_mode; every channel stays per-thread) spawn under a SECOND
-      // identity `<group>-noslack` whose secret set excludes the Slack user
-      // token. The proxy then has no Slack token to inject for that container →
-      // `curl slack.com/api/*` fails closed. Owner-safe sessions
-      // (owner DM or also_allowed_in) keep the
-      // primary identity + full set. Only ONE extra identity per affected
-      // group, so well clear of the gateway's list-pagination ceiling.
-      //
-      // Suffix is `-noslack` (not `::shared`) because OneCLI identifiers are
-      // constrained to lowercase letters, numbers, and hyphens (`onecli agents
-      // create --identifier`). agentGroup.id already satisfies that, so the
-      // suffixed form is valid. Collision would require a real agent_group
-      // literally named `<group>-noslack`, which we never create.
+      // The Slack user token is the whole Slack boundary (Slack access is `curl slack.com/api/*` through the
+      // proxy). Identities are per-GROUP, so non-owner-safe sessions spawn under a second identity `<group>-noslack`
+      // whose secret set excludes the token, and Slack calls fail closed. `-noslack` because OneCLI identifiers
+      // allow only lowercase letters, digits and hyphens.
       const slackSecrets = slackUserTokenSecrets(mergedSecrets, containerConfig.slack_user_token?.onecli_secret_names);
       let identity = agentIdentifier;
       let effectiveSecrets = mergedSecrets;
@@ -7133,11 +5123,7 @@ async function buildContainerArgs(
         }
       }
 
-      // Awaited: these hit the OneCLI control API. They were synchronous
-      // (execFileSync curl) once, which parked the host event loop for
-      // the full round trip on every spawn. Ordering with the mount/env
-      // assembly below is unchanged — the whole block is sequential inside
-      // this one async function, and `args` is local to this call.
+      // Awaited: synchronous control-API calls stall the host event loop for the round trip.
       await ensureOnecliAgent({
         name:
           identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — non-owner-safe sessions)`,
@@ -7147,9 +5133,7 @@ async function buildContainerArgs(
       effectiveIdentifier = identity;
       args.push(...typesafeKeyPlaceholderEnv(provider, effectiveSecrets));
     }
-    // Instrumented + retried once for the proved-transient class; see
-    // `src/onecli-apply.ts` for why one retry and why only for that class.
-    // A deterministic 4xx still throws straight out of here.
+    // Retried once for the proved-transient class only (src/onecli-apply.ts); a deterministic 4xx throws.
     const applyResult = await applyOnecliContainerConfig(
       args,
       { addHostMapping: false, agent: effectiveIdentifier },
@@ -7169,105 +5153,51 @@ async function buildContainerArgs(
       durationsMs: applyResult.durationsMs,
     });
 
-    // CA bundle env vars for bundled-CA clients. OneCLI's SDK sets
-    // SSL_CERT_FILE / NODE_EXTRA_CA_CERTS / DENO_CERT, but each tool below
-    // checks its own var instead. Pointing them at the combined bundle
-    // makes future Python/curl/AWS clients trust OneCLI's MITM CA without
-    // bespoke NO_PROXY entries. The bypasses below stay as the faster path
-    // for hosts where MITM is gratuitous.
+    // Point tools that check their own CA var at the combined bundle so they trust OneCLI's MITM CA.
     args.push('-e', 'REQUESTS_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
     args.push('-e', 'PIP_CERT=/tmp/onecli-combined-ca.pem');
     args.push('-e', 'CURL_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
     args.push('-e', 'AWS_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
     args.push('-e', 'GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem');
 
-    // Proxy bypasses for hosts where OneCLI's MITM either breaks the client
-    // (bundled CA) or hijacks the auth path with provider routing.
-    //
-    // Bundled-CA bypass — OneCLI re-signs every CONNECT with its local CA
-    // even when injections_applied=0. Clients that ship their own CA bundle
-    // reject this and emit "Could not connect to <backend>".
-    //   - snowflake-connector-python (snowflake MCP + dbt-snowflake) → certifi
-    //   - boto3 / aws-sdk, especially STS → bundled cacerts
+    // NO_PROXY bypasses for hosts where OneCLI's MITM breaks the client or hijacks its auth. OneCLI re-signs every
+    // CONNECT even with no injection, so clients with a bundled CA (snowflake-connector, boto3/STS) reject it.
     if (isToolEnabled(containerConfig.tools, 'snowflake') || isToolEnabled(containerConfig.tools, 'dbt')) {
       mergeNoProxy(args, 'snowflakecomputing.com');
     }
     if (isToolEnabled(containerConfig.tools, 'aws')) {
       mergeNoProxy(args, 'amazonaws.com');
     }
-    // GitHub bypass — git's smart-HTTP protocol uses Basic auth
-    // (base64(user:GH_TOKEN)). OneCLI v1.18.6+ recognizes github.com as a
-    // known provider and tries to strip+replace that header with its
-    // connected-app credential, returning 401 "app not connected
-    // provider=github" for any agent without a vault link. Sending the
-    // forwarded GH_TOKEN directly to GitHub authenticates both git protocol
-    // and api.github.com (gh CLI) equivalently.
+    // git sends Basic auth; OneCLI treats github.com as a known provider and replaces the header with its
+    // connected-app credential (401 for agents without a vault link).
     if (ghToken) {
       mergeNoProxy(args, 'github.com');
     }
-    // GCP bypass — the SA key mints tokens at oauth2.googleapis.com and calls
-    // *.googleapis.com (BigQuery, Storage, …) directly. The key is self-
-    // authenticating, so OneCLI injection adds nothing and its MITM CA breaks
-    // gcloud/google-auth (they trust their own bundled roots, not the system
-    // store where OneCLI's CA lives). Suffix match: a bare `googleapis.com`
-    // entry covers oauth2/sts/bigquery/storage/cloudresourcemanager. Gated on
-    // the mounted key so only GCP-enabled groups bypass.
+    // The SA key is self-authenticating and gcloud/google-auth trust only their bundled roots; one `googleapis.com`
+    // entry suffix-matches every Google API host.
     if (gcpKey) {
       mergeNoProxy(args, 'googleapis.com');
     }
-    // Codex / ChatGPT bypass — codex streams via WebSocket to
-    // wss://chatgpt.com/backend-api/codex/responses. OneCLI's MITM doesn't
-    // speak WS Upgrade and returns 405 Method Not Allowed, so codex retries
-    // five times before falling back to HTTP polling. That retry storm can
-    // also stall the codex AppServer enough that getCodexAuthStatus times
-    // out and reports loggedIn:false even when auth.json is valid. Bypass
-    // is unconditional — non-codex agents don't talk to chatgpt.com.
+    // Codex streams over WebSocket to chatgpt.com, and OneCLI's MITM returns 405 for WS Upgrade (a retry storm that
+    // can make codex report loggedIn:false). Unconditional: non-codex agents don't talk to chatgpt.com.
     mergeNoProxy(args, 'chatgpt.com');
-    // pip / Python package install bypass — pip uses certifi and rejects
-    // OneCLI's CA with "SSL: CERTIFICATE_VERIFY_FAILED, self-signed
-    // certificate in certificate chain". Breaks `install_packages` self-mod
-    // and any Python tool that pip-installs at runtime (dbt extensions,
-    // ad-hoc packages). Wheels live on files.pythonhosted.org.
+    // pip trusts certifi, not OneCLI's CA, so installs (including `install_packages` self-mod) fail without this.
     mergeNoProxy(args, 'pypi.org');
     mergeNoProxy(args, 'pythonhosted.org');
 
-    // Wix CLI OAuth bypass — `wix login`/`whoami`/dev/publish talk to *.wix.com
-    // (manage/editor/users.wix.com) with the CLI's own OAuth token from the
-    // mounted ~/.wix. OneCLI's MITM on those hosts breaks the CLI ("not
-    // authenticated"), same class as the chatgpt.com case above. Bypass only
-    // `wix.com` (matches *.wix.com) — the Wix REST API on `www.wixapis.com` is
-    // a DIFFERENT domain, so it stays on the gateway and keeps getting the
-    // injected API key. Gated on the ~/.wix auth mount so only Wix-enabled
-    // groups bypass.
+    // The Wix CLI's own OAuth breaks under MITM. Only `wix.com`: the REST API on `www.wixapis.com` stays on the
+    // gateway for key injection.
     if (containerConfig.wixHostAuth === true) {
       mergeNoProxy(args, 'wix.com');
     }
 
-    // OAuth bypass: when a host OAuth token is forwarded, tell the
-    // in-container HTTPS_PROXY (just configured by OneCLI) to skip
-    // api.anthropic.com. Without this, OneCLI's proxy would intercept the
-    // Anthropic request and substitute the single vault credential,
-    // defeating the provider-level rotation across CLAUDE_CODE_OAUTH_TOKEN_N.
-    // We merge with any existing NO_PROXY rather than overwrite so localhost /
-    // onecli internal bypasses that OneCLI added stay intact.
-    //
-    // Also re-append the real OAuth token values AFTER OneCLI applied,
-    // because OneCLI injects `-e CLAUDE_CODE_OAUTH_TOKEN=placeholder` to
-    // make the SDK happy while relying on its proxy to substitute the real
-    // token at request time. Under the bypass path the proxy never fires
-    // for api.anthropic.com, so the placeholder would be sent verbatim and
-    // the API would reject it as an invalid bearer. Docker's `-e` duplicate-
-    // key semantics: last entry wins, so pushing our real values after
-    // OneCLI's placeholder is all we need.
+    // Skip the proxy for api.anthropic.com so it cannot replace the OAuth header with its single vault credential
+    // (defeating rotation), and re-append the real token AFTER OneCLI's `CLAUDE_CODE_OAUTH_TOKEN=placeholder`
+    // (Docker `-e`: last wins); under the bypass the placeholder would otherwise reach the API verbatim.
     if (oauthBypassAnthropic) {
       mergeNoProxy(args, 'api.anthropic.com');
-      // OneCLI also injects `-e ANTHROPIC_API_KEY=placeholder`. The SDK
-      // prefers ANTHROPIC_API_KEY over the OAuth token, and with
-      // api.anthropic.com bypassed the proxy never substitutes the real
-      // value — the literal "placeholder" reaches Anthropic as the bearer
-      // (401 Invalid API key; bit a provider-fallback spawn 2026-08-05).
-      // Strip only the sentinel: a real key forwarded by the
-      // custom-upstream block below is pushed after this and wins.
+      // OneCLI also injects `ANTHROPIC_API_KEY=placeholder`, which the SDK prefers over OAuth: strip only the
+      // sentinel, so a real key forwarded by the custom-upstream block below still wins.
       stripEnvEntry(args, 'ANTHROPIC_API_KEY', PLACEHOLDER_SENTINEL);
       stripEnvEntry(args, 'CLAUDE_CODE_OAUTH_TOKEN');
       args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${hostOauth}`);
@@ -7278,13 +5208,8 @@ async function buildContainerArgs(
       }
     }
 
-    // Custom-upstream Anthropic auth: when ANTHROPIC_BASE_URL routes Anthropic
-    // to a custom endpoint (e.g. a key-rotating proxy), exclude that one host
-    // from the OneCLI proxy so its MITM doesn't intercept the request, and
-    // authenticate with the forwarded ANTHROPIC_API_KEY (+ _N rotation). OneCLI
-    // does not manage Anthropic in this mode; it keeps injecting for every
-    // other host. Forwarded here, after the gateway applied, so these are the
-    // authoritative env values.
+    // Custom upstream via ANTHROPIC_BASE_URL: exclude that host from the proxy and authenticate with the forwarded
+    // key (+ `_N` rotation). Forwarded here, after the gateway applied, so these are the authoritative values.
     if (process.env.ANTHROPIC_BASE_URL) {
       args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
       if (auth.apiKeyPrimary) {
@@ -7312,7 +5237,6 @@ async function buildContainerArgs(
     args.push(...hostGatewayArgs());
   }
 
-  // User mapping
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   // Single definition, shared with the GitHub token file lane so the two
@@ -7322,14 +5246,8 @@ async function buildContainerArgs(
     args.push('-e', 'HOME=/home/node');
   }
 
-  // Pre-create every nested /workspace mountpoint host-side as the host user.
-  // /workspace is itself a bind of the session dir, so when Docker creates a
-  // missing nested mountpoint (/workspace/agent, /workspace/worktrees,
-  // /workspace/project/README.md, ...) it materializes that stub inside the
-  // session dir owned by ROOT — which the storage manager (host user) can
-  // then never delete once the session idles out. Docker leaves pre-existing
-  // stubs' ownership alone. Best-effort: a failure here just reproduces the
-  // old behavior (root-owned stub), loudly.
+  // Pre-create nested /workspace mountpoints as the host user: Docker would create missing ones inside the session
+  // dir owned by ROOT, which reclaim can then never delete. Best-effort.
   const workspaceHostRoot = mounts.find((m) => m.containerPath === '/workspace')?.hostPath;
   if (workspaceHostRoot) {
     for (const mount of mounts) {
@@ -7337,10 +5255,8 @@ async function buildContainerArgs(
       const stubPath = path.join(workspaceHostRoot, mount.containerPath.slice('/workspace/'.length));
       try {
         if (fs.existsSync(stubPath)) continue;
-        // statSync, not lstatSync: a symlink source (AGENTS.md -> CLAUDE.md)
-        // must stub as what it RESOLVES to — lstat said "not a file" for the
-        // symlink, the stub became a directory, and Docker then failed the
-        // file bind-mount with "not a directory" on every owner-group spawn.
+        // statSync, not lstatSync: a symlink source (AGENTS.md -> CLAUDE.md) must stub as what it RESOLVES to, or
+        // Docker fails the file bind with "not a directory".
         const sourceIsFile = fs.existsSync(mount.hostPath) && fs.statSync(mount.hostPath).isFile();
         if (sourceIsFile) {
           fs.mkdirSync(path.dirname(stubPath), { recursive: true });
@@ -7357,15 +5273,9 @@ async function buildContainerArgs(
     }
   }
 
-  // Volume mounts
   for (const mount of mounts) {
-    // Symlink-overlay sources live under agent-writable trees; re-validate at
-    // the last moment before the docker arg is emitted so a target swapped
-    // after buildMounts' check aborts the spawn instead of mounting. Docker's
-    // -v takes a pathname (no fd-based binds), so a sub-millisecond race
-    // between this check and runc's own resolution remains — accepted: it
-    // requires a concurrent same-workgroup process, which already shares the
-    // trees these roots allow.
+    // Overlay sources live under agent-writable trees: re-validate right before emitting the arg so a target
+    // swapped after buildMounts aborts the spawn (a residual race with runc's own resolution is accepted).
     if (mount.overlayAllowedRoots) {
       let recheck: string;
       try {
@@ -7388,50 +5298,26 @@ async function buildContainerArgs(
     }
   }
 
-  // Assemble additional MCP servers: the group's own container.json entries
-  // plus the fleet defaults it neither declares itself nor lists in
-  // `excludeMcpServers` — `effectiveMcpServers` (src/fleet-mcp-servers.ts) is
-  // the one implementation of that merge, and `src/capabilities.ts` describes
-  // exactly what it returns. Adding a tool for every group is an edit to
-  // `data/fleet-mcp-servers.json` (`ncl groups config add-mcp-server --fleet`),
-  // not an edit here.
-  //
-  // What remains below is the set this file still has to build itself: servers
-  // gated on `tools` AND on scoped host credentials this function resolves.
+  // Fleet defaults are merged by `effectiveMcpServers`; add fleet-wide tools to data/fleet-mcp-servers.json, not
+  // here. Below are only servers gated on `tools` AND on scoped host credentials resolved in this function.
   const mcpServers: Record<string, unknown> = effectiveMcpServers(containerConfig);
   const mcpExcluded = new Set(containerConfig.excludeMcpServers ?? []);
   const canInject = (name: string): boolean => !mcpExcluded.has(name) && !mcpServers[name];
 
   if (canInject('linear') && isToolEnabled(containerConfig.tools, 'linear')) {
-    // Auth header injected by the OneCLI gateway proxy at request time
-    // (vault entry "Linear" → mcp.linear.app). Linear's hosted MCP accepts
-    // a Personal API Key or OAuth access token as `Authorization: Bearer`.
-    // Gated by `tools: ["linear"]` in container.json so groups opt in.
+    // Auth header injected by the OneCLI gateway (vault entry "Linear").
     mcpServers.linear = {
       type: 'http',
       url: 'https://mcp.linear.app/mcp',
     };
   }
   if (canInject('datafold') && isToolEnabled(containerConfig.tools, 'datafold')) {
-    // Official Datafold Streamable HTTP MCP. Datafold requires
-    // `Authorization: Key <api-key>`; OneCLI overwrites the placeholder
-    // header at the proxy boundary for app.datafold.com.
+    // OneCLI overwrites the placeholder `Authorization: Key` header at the proxy boundary.
     mcpServers.datafold = DATAFOLD_MCP_SERVER;
   }
   if (canInject('atlassian') && isToolEnabled(containerConfig.tools, 'atlassian')) {
-    // sooperset/mcp-atlassian — stdio Python MCP server (72 tools across
-    // Jira + Confluence). Installed via /opt/atlassian-venv in the
-    // Dockerfile, symlinked to /usr/local/bin/mcp-atlassian.
-    //
-    // Why direct REST instead of Rovo MCP: the official Rovo MCP requires
-    // a per-user permission grant from an Atlassian org admin to expose
-    // Jira/Confluence tools — without it, the user only sees 2 Teamwork
-    // Graph tools and even those error. Direct REST against
-    // <site>.atlassian.net works with any user's standard product seats.
-    //
-    // The MCP server constructs `Authorization: Basic base64(USERNAME:
-    // API_TOKEN)` from env vars at request time. Placeholder values satisfy
-    // startup validation; OneCLI replaces the header at the proxy boundary.
+    // Direct REST (not Rovo MCP, which needs an org-admin permission grant to expose Jira/Confluence tools).
+    // Placeholder credentials satisfy startup validation; OneCLI replaces the Basic header at the proxy boundary.
     // The site URL is tenant-specific and must come from scoped host config.
     const atlassianServer = resolveAtlassianMcpServer(resolveScopedEnv('ATLASSIAN_BASE_URL', credentialFolder));
     if (!atlassianServer) {
@@ -7443,12 +5329,8 @@ async function buildContainerArgs(
     }
   }
   if (canInject('looker') && isToolEnabled(containerConfig.tools, 'looker')) {
-    // Google's MCP Toolbox for Databases (--prebuilt looker). The toolbox
-    // binary is baked into the image (see container/Dockerfile). Credentials
-    // are resolved per-group via LOOKER_*_<FOLDER> → LOOKER_* and embedded
-    // in the env block here because the MCP SDK's stdio transport only
-    // inherits HOME/LOGNAME/PATH/SHELL/TERM/USER by default — container env
-    // vars don't reach the child process unless explicitly passed.
+    // Credentials are embedded in the env block because the MCP SDK's stdio transport passes only
+    // HOME/LOGNAME/PATH/SHELL/TERM/USER to the child by default.
     const baseUrl = resolveScopedEnv('LOOKER_BASE_URL', credentialFolder);
     const clientId = resolveScopedEnv('LOOKER_CLIENT_ID', credentialFolder);
     const clientSecret = resolveScopedEnv('LOOKER_CLIENT_SECRET', credentialFolder);
@@ -7474,11 +5356,8 @@ async function buildContainerArgs(
     }
   }
   if (canInject('dbt-mcp') && isToolEnabled(containerConfig.tools, 'dbt-mcp')) {
-    // dbt-labs/dbt-mcp — Discovery + Semantic Layer + Admin API for dbt Cloud.
-    // Binary baked into image via uv (Python 3.12). Token reuses the existing
-    // DBT_CLOUD_API_TOKEN_<FOLDER> as DBT_TOKEN. Read-only by default: CLI
-    // and LSP toolsets disabled (no local dbt project mounted), and the three
-    // mutating Admin tools disabled. Override via DBT_MCP_DISABLE_TOOLS_<FOLDER>.
+    // Read-only by default: CLI/LSP toolsets and the mutating Admin tools are disabled (override per folder via
+    // DBT_MCP_DISABLE_TOOLS_<FOLDER>).
     const host = resolveScopedEnv('DBT_HOST', credentialFolder);
     const token = resolveScopedEnv('DBT_CLOUD_API_TOKEN', credentialFolder);
     const prodEnvId = resolveScopedEnv('DBT_PROD_ENV_ID', credentialFolder);
@@ -7492,9 +5371,7 @@ async function buildContainerArgs(
         DISABLE_TOOLS:
           resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ?? 'trigger_job_run,cancel_job_run,retry_job_run',
       };
-      // Every Admin API tool (list_jobs, list_jobs_runs, get_job_run_error, …)
-      // needs DBT_ACCOUNT_ID; without it dbt-mcp fails them before any HTTP
-      // call with an empty error message. Discovery/Semantic Layer don't.
+      // Every Admin API tool needs DBT_ACCOUNT_ID, or dbt-mcp fails it with an empty error before any HTTP call.
       const accountId = resolveScopedEnv('DBT_CLOUD_ACCOUNT_ID', credentialFolder);
       if (accountId) env.DBT_ACCOUNT_ID = accountId;
       const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', credentialFolder);
@@ -7524,10 +5401,8 @@ async function buildContainerArgs(
     args.push('-e', mcpServersEnv);
   }
 
-  // Override entrypoint so we skip tini's stdin-read wait (host-spawned
-  // sessions don't pipe stdin — all IO flows through the mounted session
-  // DBs). Run the image's entrypoint.sh directly via bash so credential and
-  // provider setup fires before bun starts.
+  // Skip tini's stdin-read wait (no stdin is piped) and run entrypoint.sh via bash so credential and provider
+  // setup fire before bun starts.
   args.push('--entrypoint', 'bash');
 
   const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
@@ -7539,15 +5414,8 @@ async function buildContainerArgs(
 }
 
 /**
- * Build the container SCOPE labels: the install label every container has
- * always carried, plus the four scope labels a boot inventory reads to decide
- * what a surviving container belongs to. Pure and exported for the same
- * reason `securityArgs` and `dockerResourceLimitArgs` are — the flag list is
- * testable without spawning, and only `buildContainerArgs` spreads it.
- *
- * `workgroupId` emits an EMPTY value rather than dropping the label, so
- * "this session has no workgroup" and "this container predates the labels"
- * stay distinguishable at the inventory.
+ * The install label plus the four scope labels a boot inventory reads. `workgroupId` emits an EMPTY value rather
+ * than dropping the label, so "no workgroup" and "predates the labels" stay distinguishable.
  */
 export function containerLabelArgs(agentGroupId: string, sessionId: string, workgroupId?: string): string[] {
   return [
@@ -7565,16 +5433,8 @@ export function containerLabelArgs(agentGroupId: string, sessionId: string, work
 }
 
 /**
- * Build the container PRIVILEGE hardening flags: drop every Linux capability
- * and forbid setuid escalation, overridable per-group via container.json
- * `security`. Defaults come from `resolveContainerSecurity`, the same
- * resolver `ncl groups config get` reports, so the audit and the spawn can
- * never disagree. Pure, so precedence is unit-testable without spawning.
- *
- * Resource ceilings (--memory, --pids-limit, --cpus) deliberately do NOT
- * belong here — `dockerResourceLimitArgs` below owns those, driven by
- * container.json `resources`. Emitting a flag from both builders is how a
- * spawn ends up with two contradictory values for the same Docker option.
+ * Drop every capability and forbid setuid escalation, overridable via container.json `security`. Resource
+ * ceilings belong ONLY to `dockerResourceLimitArgs`: a flag emitted by both would give Docker contradictory values.
  */
 export function securityArgs(security?: SecurityConfig): string[] {
   const effective = resolveContainerSecurity(security);
@@ -7625,10 +5485,8 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     dockerfile += `RUN apt-get update && apt-get install -y ${aptPackages.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
   }
   if (npmPackages.length > 0) {
-    // pnpm skips build scripts unless packages are allowlisted. Write both
-    // formats: pnpm 10 global installs still honor the legacy .npmrc keys,
-    // while pnpm 11 reads the global allowBuilds YAML map. Every entry here
-    // passed strict npm-name validation before the admin approved it.
+    // pnpm skips build scripts unless allowlisted: write both the legacy .npmrc keys (pnpm 10) and the allowBuilds
+    // map (pnpm 11). Every entry passed strict npm-name validation before admin approval.
     const legacyAllowlist = npmPackages
       .map((pkg) => `echo 'only-built-dependencies[]=${pkg}' >> /root/.npmrc`)
       .join(' && ');
@@ -7648,14 +5506,11 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
 
   log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages });
 
-  // Write Dockerfile to temp file and build
   const tmpDockerfile = path.join(DATA_DIR, `Dockerfile.${agentGroupId}`);
   fs.writeFileSync(tmpDockerfile, dockerfile);
   try {
     // Awaited async exec so the single-threaded host stays responsive during
-    // the build (can take minutes) instead of blocking on execSync. exec buffers
-    // stdout/stderr (matching the old stdio: 'pipe') and rejects on a non-zero
-    // exit, so error propagation is unchanged.
+    // the build (can take minutes).
     await execAsync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
       cwd: DATA_DIR,
       timeout: 900_000,
