@@ -1489,8 +1489,8 @@ class EffectLayer:
         # intake brief says so in as many words ("use its coordinatorOwnerToken
         # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
         # gate mints a FRESH token on every same-run recovery poll
-        # (smoke-pr-gate.sh:5475, written to lease/authority/state at :5504,
-        # :5509, :5554), and reconcile_claims records the new one the wake
+        # (smoke-pr-gate.sh:5491, written to lease/authority/state at :5520,
+        # :5525, :5570), and reconcile_claims records the new one the wake
         # carries. Writing wake.json only at intake left the run tree naming a
         # RETIRED token while the brief still told the owner to use it: every
         # scaffold write, and `adopt` -- the verb that exists for exactly this

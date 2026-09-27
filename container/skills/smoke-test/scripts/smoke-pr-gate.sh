@@ -121,6 +121,14 @@ BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"
 MIGRATIONS_PREFIX="${SMOKE_GATE_MIGRATIONS_PREFIX:-}"
 FREEZE_MARKER_BACKEND="${BACKEND_PREFIX}.render-freeze"
 FREEZE_MARKER_FRONTEND="${FRONTEND_PREFIX}.render-freeze"
+# Each prefix is a directory path ending in "/": without it, "api" also matches
+# "api-archive/" and the marker lands at "api.render-freeze", outside the root.
+malformed_layout_prefixes() {  # → " SMOKE_GATE_<K>" for each set prefix lacking the trailing "/"
+  local name
+  for name in FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX; do
+    [ -z "${!name}" ] || [ "${!name%/}" != "${!name}" ] || printf ' SMOKE_GATE_%s' "$name"
+  done
+}
 
 # Preview-identity disambiguation (#1536). Render has twice provisioned two
 # services sharing one display name under the same parent (PR #1533, PR
@@ -2904,8 +2912,14 @@ evaluate_pr() {
 # "not known to be a freeze", which no caller treats as "not a freeze".
 # `targetSha` is null for a freeze whose parent is missing; evaluate_pr then
 # fails closed exactly as before (fetchOk:false, never settles).
-freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha}
+freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha[, problem]}
   local sha="$1" commit ok=true is_freeze=false target=""
+  # claim and finish reach here without check/poll's config guard; an unset or
+  # malformed prefix would silently classify a real freeze head as ordinary.
+  if [ -z "$FRONTEND_PREFIX" ] || [ -z "$BACKEND_PREFIX" ] || [ -n "$(malformed_layout_prefixes)" ]; then
+    jq -cn '{ok:false, isFreeze:false, targetSha:null, problem:"SMOKE_GATE_FRONTEND_PREFIX/BACKEND_PREFIX/MIGRATIONS_PREFIX unset or missing the trailing /, so whether this head is a freeze is unknown"}'
+    return
+  fi
   if ! commit="$(timeout 10 gh api "repos/$REPO/commits/$sha" 2>/dev/null)" ||
      ! jq -e 'type == "object" and (.parents | type == "array") and (.files | type == "array")' <<<"$commit" >/dev/null 2>&1; then
     ok=false
@@ -2930,7 +2944,7 @@ freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha}
 detect_freeze() {
   local pr="$1" sha="$2" probe
   probe="$(freeze_head_probe "$sha")"
-  jq -c '{isFreezePr:.isFreeze, filesOk:.ok, targetSha:.targetSha}' <<<"$probe"
+  jq -c '{isFreezePr:.isFreeze, filesOk:.ok, targetSha:.targetSha, problem:.problem}' <<<"$probe"
 }
 
 COMMAND="${1:-poll}"
@@ -3071,6 +3085,7 @@ if [ "$COMMAND" = "check" ]; then
   for k in REPO BACKEND_SERVICE FRONTEND_SERVICE FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX; do
     [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
   done
+  MISSING="$MISSING$(malformed_layout_prefixes)"
 # A knob that fell back to its default because the deployed value was not a
 # number is a misconfiguration, not a detail — name it in the same alarm.
 MISSING="$MISSING$BAD_NUMERIC_CONFIG"
@@ -3145,8 +3160,8 @@ if [ "$COMMAND" = "claim" ]; then
   CLAIM_FREEZE=false
   CLAIM_PROBE="$(detect_freeze "$PR" "$SHA")"
   if [ "$(jq -r '.filesOk' <<<"$CLAIM_PROBE")" != true ]; then
-    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" \
-      '{ok:false,error:"could not read the head commit, so whether this head is a freeze is unknown — a freeze campaign is never admitted without its pins; retry",pr:$pr,runId:$run,sha:$sha}'
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" --arg problem "$(jq -r '.problem // empty' <<<"$CLAIM_PROBE")" \
+      '{ok:false,error:(if $problem != "" then "gate misconfigured: \($problem) — a freeze campaign is never admitted without its pins" else "could not read the head commit, so whether this head is a freeze is unknown — a freeze campaign is never admitted without its pins; retry" end),pr:$pr,runId:$run,sha:$sha}'
     exit 1
   fi
   if [ "$(jq -r '.isFreezePr' <<<"$CLAIM_PROBE")" = true ]; then
@@ -4445,7 +4460,7 @@ if [ "$COMMAND" = "finish" ]; then
     if [ "$(jq -r '.filesOk' <<<"$FREEZE_INFO")" != true ]; then
       # Not "an ordinary PR" — an unreadable diff. If this WAS a freeze PR its
       # verdict has just been dropped with nothing written and nothing said.
-      HANDOFF_REASON="could not read this PR's diff, so freeze-PR status is unknown — hold/publish/ledger not written. If this was a freeze PR the develop gate will never see this verdict; reconcile by hand"
+      HANDOFF_REASON="$(jq -r '.problem // "could not read this PR'"'"'s diff, so freeze-PR status is unknown"' <<<"$FREEZE_INFO") — hold/publish/ledger not written. If this was a freeze PR the develop gate will never see this verdict; reconcile by hand"
     fi
     if [ "$(jq -r '.isFreezePr' <<<"$FREEZE_INFO")" = true ]; then
       TARGET_SHA="$(jq -r '.targetSha // empty' <<<"$FREEZE_INFO")"
@@ -5006,6 +5021,7 @@ MISSING=""
 for k in REPO BACKEND_SERVICE FRONTEND_SERVICE FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX; do
   [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
 done
+MISSING="$MISSING$(malformed_layout_prefixes)"
 # A knob that fell back to its default because the deployed value was not a
 # number is a misconfiguration, not a detail — name it in the same alarm.
 MISSING="$MISSING$BAD_NUMERIC_CONFIG"

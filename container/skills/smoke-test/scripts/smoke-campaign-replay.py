@@ -73,6 +73,12 @@ CREDENTIAL_PATTERNS = [
 ]
 
 
+
+def pr_tag(run_id):
+    """`pr<n>-` from `<prefix>-pr<n>-<sha12>-<stamp>`, whatever the install's prefix."""
+    m = re.search(r"-(pr\d+-)", run_id)
+    return m.group(1) if m else run_id
+
 def parse_iso(s):
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
 
@@ -713,14 +719,14 @@ def aggregate(results):
             "controllerGo": sum(r["controllerVerdict"] == "GO" for r in rs),
             "actualGo": sum(r["actualVerdict"] == "GO" for r in rs),
             "verdictMismatches": sum(r["verdictMismatch"] for r in rs),
-            "mismatchDetail": sorted("{} {}->{} ({})".format(r["runId"][7:14], r["actualVerdict"], r["controllerVerdict"],
+            "mismatchDetail": sorted("{} {}->{} ({})".format(pr_tag(r["runId"]), r["actualVerdict"], r["controllerVerdict"],
                                                              r["controllerVerb"]) for r in rs if r["verdictMismatch"]),
             "finishedByController": sum(r["finishedBy"] == "controller" for r in rs),
             "finishedByGateFirst": sum(r["finishedBy"] == "gate" for r in rs),
             "duplicates": sum(r["duplicateRecordsOnReplay"] + r["duplicateEffectsOnReplay"] + r["duplicateIntents"]
                               + r["duplicateEffects"] for r in rs),
             "hardErrors": sum(len(r["hardErrors"]) for r in rs),
-            "missedObligations": sorted("{}:{}".format(r["runId"][7:14], o) for r in rs for o in r["missedObligations"]),
+            "missedObligations": sorted("{}:{}".format(pr_tag(r["runId"]), o) for r in rs for o in r["missedObligations"]),
             "issuesActual": sum(r["issuesActual"] for r in rs),
             "issuesController": sum(r["issuesController"] for r in rs),
             "issuesMissed": sum(r["issuesMissed"] for r in rs),

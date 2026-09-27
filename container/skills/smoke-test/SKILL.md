@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5475`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5491`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2617,7 +2617,7 @@ hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFI
 `/`: a diff under the frontend prefix requires the frontend preview to match,
 one under the migrations prefix refuses an ordinary PR, and the freeze markers
 are `<prefix>.render-freeze` under the backend and frontend prefixes; all
-three are required, an empty value is `gate_misconfigured`),
+three are required; empty or without the `/` is `gate_misconfigured`),
 `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
 seam and semantics as the develop gate — one readiness command run once per

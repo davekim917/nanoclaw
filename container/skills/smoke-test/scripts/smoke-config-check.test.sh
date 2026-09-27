@@ -62,6 +62,12 @@ OUT="$(bash "$CHECK" "$T/env.sh" "$T/other.sh")"; RC=$?
   && ok "cross-file disagreement named" || fail "mismatch: rc=$RC out=$OUT"
 grep -q 'server/' <<<"$OUT" && fail "mismatch output leaked a value" || true
 
+# --- 5b. A prefix without its trailing "/" is malformed, as the gate reads it --
+write_env "$T/noslash.sh" 'export SMOKE_GATE_MIGRATIONS_PREFIX="api/migrations"'
+OUT="$(bash "$CHECK" "$T/noslash.sh")"; RC=$?
+[ "$RC" -eq 2 ] && jq -e '.ok == false and .files[0].missing == [] and .files[0].malformed == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$OUT" >/dev/null \
+  && ok "prefix without trailing / named malformed" || fail "malformed: rc=$RC out=$OUT"
+
 # --- 6. Unreadable file: exit 3 ---------------------------------------------
 OUT="$(bash "$CHECK" "$T/env.sh" "$T/absent.sh")"; RC=$?
 [ "$RC" -eq 3 ] && jq -e '.ok == false and .path == "'"$T/absent.sh"'"' <<<"$OUT" >/dev/null \

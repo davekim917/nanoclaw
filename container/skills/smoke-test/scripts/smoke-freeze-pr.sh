@@ -49,8 +49,8 @@ BRANCH="${SMOKE_GATE_BRANCH:-develop}"
 LABEL="${SMOKE_GATE_LABEL:-render-preview}"
 TARGET_SHA="${1:-}"
 BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"; FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
-if [ -z "$REPO" ] || [ -z "$BACKEND_PREFIX" ] || [ -z "$FRONTEND_PREFIX" ]; then
-  jq -cn '{ok:false,error:"SMOKE_GATE_REPO, SMOKE_GATE_BACKEND_PREFIX and SMOKE_GATE_FRONTEND_PREFIX are required"}'
+if [ -z "$REPO" ] || [ "${BACKEND_PREFIX%/}" = "$BACKEND_PREFIX" ] || [ "${FRONTEND_PREFIX%/}" = "$FRONTEND_PREFIX" ]; then
+  jq -cn '{ok:false,error:"SMOKE_GATE_REPO, SMOKE_GATE_BACKEND_PREFIX and SMOKE_GATE_FRONTEND_PREFIX are required, each prefix ending in /"}'
   exit 2
 fi
 if ! printf '%s' "$TARGET_SHA" | grep -Eq '^[0-9a-f]{40}$'; then

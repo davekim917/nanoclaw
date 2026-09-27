@@ -8,9 +8,10 @@
 # Usage: smoke-config-check.sh [<file>...]
 #   default files: /workspace/agent/smoke-gate-env.sh /workspace/agent/smoke-develop-gate.sh
 #
-# One JSON line: {ok, files:[{path, missing:[NAME...]}], mismatched:[NAME...]}
-# Exit 0 every required key present everywhere and agreeing · 2 a key missing
-# or mismatched · 3 a file unreadable · 4 usage.
+# One JSON line: {ok, files:[{path, missing:[NAME...], malformed:[NAME...]}], mismatched:[NAME...]}
+# A *_PREFIX value without its trailing "/" is malformed, as the gate reads it.
+# Exit 0 every required key present, well-formed and agreeing everywhere · 2 a
+# key missing, malformed or mismatched · 3 a file unreadable · 4 usage.
 set -u
 
 # The gates' own `for k in …` required list (smoke-pr-gate.sh check/poll);
@@ -18,7 +19,7 @@ set -u
 REQUIRED="REPO BACKEND_SERVICE FRONTEND_SERVICE FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX"
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
   exit 4
 fi
 if [ "$#" -eq 0 ]; then
@@ -40,22 +41,24 @@ for f in "$@"; do
     jq -cn --arg p "$f" '{ok:false,error:"config file is missing or unreadable",path:$p}'
     exit 3
   fi
-  missing=()
+  missing=(); malformed=()
   for name in $REQUIRED; do
     v="$(env_value "$f" "SMOKE_GATE_$name")"
     if [ -z "$v" ] || [ "$v" = "=" ]; then
       missing+=("SMOKE_GATE_$name")
       continue
     fi
+    case "$name" in *_PREFIX) [ "${v%/}" != "$v" ] || malformed+=("SMOKE_GATE_$name") ;; esac
     if [ -n "${SEEN[$name]+x}" ]; then
       [ "${SEEN[$name]}" = "$v" ] || MISMATCH[$name]=1
     else
       SEEN[$name]="$v"
     fi
   done
-  [ "${#missing[@]}" -eq 0 ] || ANY_MISSING=true
+  [ "${#missing[@]}" -eq 0 ] && [ "${#malformed[@]}" -eq 0 ] || ANY_MISSING=true
   FILES_JSON="$(jq -c --arg p "$f" --argjson m "$(printf '%s\n' ${missing[@]+"${missing[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    '. + [{path:$p, missing:$m}]' <<<"$FILES_JSON")"
+    --argjson bad "$(printf '%s\n' ${malformed[@]+"${malformed[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '. + [{path:$p, missing:$m, malformed:$bad}]' <<<"$FILES_JSON")"
 done
 
 MISMATCHED_JSON='[]'

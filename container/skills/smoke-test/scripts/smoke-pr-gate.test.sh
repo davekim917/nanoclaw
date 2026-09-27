@@ -395,6 +395,12 @@ EMPTY_PREFIX="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-
   SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX="" \
   bash "$GATE" check 7 2>/dev/null || true)"
 jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$EMPTY_PREFIX" >/dev/null
+# ...and so is one without its trailing "/": "api/migrations" also matches "api/migrations-archive/".
+NO_SLASH="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base \
+  SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations \
+  bash "$GATE" check 7 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$NO_SLASH" >/dev/null ||
+  { echo "a prefix without its trailing / was accepted: $NO_SLASH" >&2; exit 1; }
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_misconfigured" and .observation.kind == "blocked"' >/dev/null
 # W2: a quiet poll's observation is one the task-observation helper accepts,
 # and the gate's own keys are all still there for the controller to read.
@@ -1801,6 +1807,14 @@ pin_file() { printf '%s/range-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DI
 journeys_fixture "$BACKEND_ONLY"
 bash "$GATE" check 13 | jq -e '.settled == true and .campaignRange.pinState == "absent" and .journeys.pinState == "absent"' >/dev/null
 [ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+# claim reaches detect_freeze without check/poll's config guard, so an unset or
+# malformed marker prefix must refuse there too, never admit the freeze as ordinary.
+for bad in "SMOKE_GATE_FRONTEND_PREFIX=" "SMOKE_GATE_BACKEND_PREFIX=api"; do
+  T5L_BAD="$(env "$bad" bash "$GATE" claim run-manual-13x 13 "$FREEZE_SHA" 2>/dev/null || true)"
+  jq -e '.ok == false and (.error | startswith("gate misconfigured"))' <<<"$T5L_BAD" >/dev/null ||
+    { echo "5l: claim with $bad did not refuse: $T5L_BAD" >&2; exit 1; }
+done
+[ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-manual-13x.json" ] || { echo "5l: a refused claim left a lease" >&2; exit 1; }
 T5L_CLAIM="$(bash "$GATE" claim run-manual-13 13 "$FREEZE_SHA")"
 jq -e '.ok == true and .runId == "run-manual-13" and .campaignRange.pinState == "valid" and
   .campaignRange.baselinePinned == true and .journeys.pinned == true and .journeys.pinState == "valid" and
