@@ -1,4 +1,3 @@
-/** Host-side Git execution policy for container-influenced repositories. */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';

@@ -1,8 +1,3 @@
-/**
- * Decodes chat-sdk-bridge's base64 `data` attachments to
- * `data/v2-sessions/<ag>/<sess>/attachments/<msgId>/<filename>` and replaces `data` with a relative `localPath`,
- * which the runner's formatter resolves to `/workspace/<localPath>`, so the agent can read the file.
- */
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';

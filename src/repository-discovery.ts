@@ -1,4 +1,3 @@
-/** Fail-closed discovery of physical Git checkouts below trusted host roots. */
 import fs from 'fs';
 import path from 'path';
 
