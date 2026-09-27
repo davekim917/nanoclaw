@@ -155,6 +155,12 @@ describe('comment-only line count', () => {
     expect(count(source)).toBe(0);
   });
 
+  it('counts nothing for a tooling directive', () => {
+    const source =
+      '// eslint-disable-next-line no-console\n/* c8 ignore next */\n// @ts-expect-error -- lagging types\nconsole.log(1);\n';
+    expect(count(source)).toBe(0);
+  });
+
   it('counts nothing for a shebang', () => {
     expect(count('#!/usr/bin/env node\nexport const a = 1;\n', 'tool.mjs')).toBe(0);
   });

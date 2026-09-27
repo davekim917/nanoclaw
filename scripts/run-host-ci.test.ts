@@ -186,9 +186,10 @@ describe('run-host-ci.sh', () => {
     expect(result.calls).toContain(`git -C ${ctx.scratch}/`);
     // Full history: a shallow clone makes review-notes.test.ts skip pinned citations.
     expect(result.calls).toContain(`fetch -q --no-tags https://github.com/example/repository.git ${HEAD}`);
-    expect(result.calls).toContain(
+    const baseFetch = result.calls.indexOf(
       `fetch -q --no-tags https://github.com/example/repository.git +${BASE}:refs/remotes/origin/develop`,
     );
+    expect(baseFetch).toBeGreaterThan(result.calls.indexOf('checkout -q --detach FETCH_HEAD'));
     expect(result.calls).not.toContain('--depth');
     expect(result.scratchLeft).toEqual([]);
   });

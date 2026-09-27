@@ -80,7 +80,7 @@ export function scanComments(fileName: string, text: string): CommentScan {
     const isDirective = DIRECTIVE.test(comment.replace(/^\/[/*]+\s*/, ''));
     const firstLine = sourceFile.getLineAndCharacterOfPosition(range.pos).line + 1;
     comment.split('\n').forEach((lineText, offset) => {
-      commentLines.add(firstLine - 1 + offset);
+      if (!isDirective) commentLines.add(firstLine - 1 + offset);
       const report = (rule: CommentRule) =>
         findings.push({ rule, line: firstLine + offset, excerpt: lineText.trim().slice(0, 160) });
       if (SUPPRESSION.test(lineText)) report('inline-suppression');
