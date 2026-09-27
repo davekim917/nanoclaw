@@ -285,7 +285,7 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   if (flagError) throw new Error(flagError);
 
   // `routing.platformId` is stamped on the session as well as the task row: the row drives the fire path, the session
-  // column places the task in the console (migration 056).
+  // column places the task in the console.
   const { session } = await resolveTaskSession(group, id, routing.platformId);
 
   const created = await withInbound(session, (mailbox) =>

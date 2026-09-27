@@ -55,7 +55,6 @@ async function claimOwnershipLock(socketPath: string): Promise<number> {
   }
 }
 
-/** Without keeping a helper process alive. */
 function lockInheritedFd(fd: number, directory: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn('flock', ['-n', '3'], { stdio: ['ignore', 'ignore', 'pipe', fd] });

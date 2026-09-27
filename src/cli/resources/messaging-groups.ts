@@ -109,7 +109,7 @@ registerResource({
       name: 'unknown_sender_policy',
       type: 'string',
       // Deliberately more specific than upstream's description: `decline_notify` is DM-only and degrades to 'strict'
-      // on a group. Keep it on upstream syncs.
+      // on a group.
       description:
         'What happens when an unrecognized sender posts. "strict" drops silently. "request_approval" sends an approval card to an admin. "decline_notify" declines the sender politely in the DM and sends the owner a one-line FYI (DM-shaped groups only; degrades to "strict" on a group). "public" allows anyone. Default: declared by the channel adapter for this context (DM vs group); "strict" when the channel has no declaration.',
       enum: ['strict', 'request_approval', 'decline_notify', 'public'],

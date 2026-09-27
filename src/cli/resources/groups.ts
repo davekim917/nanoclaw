@@ -873,7 +873,7 @@ registerResource({
         if (!sourceFolder || !siblingFolder) {
           throw new Error('Both --source <folder> and --sibling <folder> are required');
         }
-        // Before forming any filesystem path.
+        // Caller-controlled folder names: reject traversal and reserved names before any filesystem path is built.
         assertValidGroupFolder(sourceFolder);
         assertValidGroupFolder(siblingFolder);
         // Agent callers may only diff folders of their own agent group, or another group's container.json leaks.
