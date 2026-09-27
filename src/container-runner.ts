@@ -209,17 +209,22 @@ export const DATAFOLD_MCP_SERVER = {
   headers: { Authorization: 'Key onecli-managed' },
 } as const satisfies McpServerConfig;
 
-/**
- * Host-only fields on a stored MCP entry (capability snapshot only); the container's McpServerConfig declares
- * neither, so they are stripped. `instructions` deliberately still crosses the boundary.
- */
 const HOST_ONLY_MCP_FIELDS = ['displayName', 'description'] as const;
 
-export function serializeMcpServersEnv(servers: Record<string, unknown>): string | null {
+/**
+ * Omits `readFromFile`: the runner resolves container.json entries, then overlays this by name, so a raw copy undoes
+ * that. HOST_ONLY_MCP_FIELDS are snapshot metadata the container lacks; `instructions` deliberately still crosses.
+ */
+export function serializeMcpServersEnv(
+  servers: Record<string, unknown>,
+  readFromFile: Iterable<string>,
+): string | null {
+  const fromFile = new Set(readFromFile);
   const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
-  if (Object.keys(validated).length === 0) return null;
+  const additional = Object.entries(validated).filter(([name]) => !fromFile.has(name));
+  if (additional.length === 0) return null;
   const forContainer = Object.fromEntries(
-    Object.entries(validated).map(([name, server]) => {
+    additional.map(([name, server]) => {
       const copy = { ...(server as unknown as Record<string, unknown>) };
       for (const field of HOST_ONLY_MCP_FIELDS) delete copy[field];
       return [name, copy];
@@ -5396,7 +5401,7 @@ async function buildContainerArgs(
     }
   }
 
-  const mcpServersEnv = serializeMcpServersEnv(mcpServers);
+  const mcpServersEnv = serializeMcpServersEnv(mcpServers, Object.keys(containerConfig.mcpServers ?? {}));
   if (mcpServersEnv) {
     args.push('-e', mcpServersEnv);
   }
