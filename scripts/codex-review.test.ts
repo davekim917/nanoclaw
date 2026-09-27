@@ -2745,7 +2745,10 @@ describe('codex-review risk-scoped review requests', () => {
       };
     }
 
-    function cutDownFixture(root: string, opts: { files?: Page[]; comments?: Page[]; reviewLoop?: string; legacy?: boolean } = {}) {
+    function cutDownFixture(
+      root: string,
+      opts: { files?: Page[]; comments?: Page[]; reviewLoop?: string; legacy?: boolean } = {},
+    ) {
       scopeFixture(root, {
         labels: [],
         files: opts.files ?? BIG,
@@ -2820,6 +2823,10 @@ describe('codex-review risk-scoped review requests', () => {
           changedFile('pnpm-lock.yaml', undefined, 900),
           changedFile('Gemfile.lock', undefined, 900),
           changedFile('app/composer.lock', undefined, 900),
+          changedFile('src/App/packages.lock.json', undefined, 900),
+          changedFile('gradle.lockfile', undefined, 900),
+          changedFile('npm-shrinkwrap.json', undefined, 900),
+          changedFile('Package.resolved', undefined, 900),
           changedFile('scripts/test_gate.py', undefined, 90),
         ],
       ],
@@ -2828,6 +2835,19 @@ describe('codex-review risk-scoped review requests', () => {
       cutDownFixture(root, { files });
 
       expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(0);
+    });
+
+    it('counts source files whose names only mention a lock or a test', () => {
+      const root = tempRoot();
+      cutDownFixture(root, {
+        files: [
+          changedFile('src/lock.ts', undefined, 100),
+          changedFile('src/lockfile-reader.ts', undefined, 30),
+          changedFile('src/testing.ts', undefined, 21),
+        ],
+      });
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
     });
 
     it('requires a receipt when the listing reaches the 300-file cap', () => {
@@ -2920,7 +2940,11 @@ describe('codex-review risk-scoped review requests', () => {
 
       it.each([
         ['names no agent', 'claude-opus-5 (claude code)', 'must name the cut-down-reviewer agent'],
-        ['smuggles a marker', 'claude-opus-5 cut-down-reviewer <!-- pr-review-loop:x -->', 'may not contain a pr-review-loop marker'],
+        [
+          'smuggles a marker',
+          'claude-opus-5 cut-down-reviewer <!-- pr-review-loop:x -->',
+          'may not contain a pr-review-loop marker',
+        ],
       ])('refuses a reviewer that %s, posting nothing', (_case, reviewer, message) => {
         const root = tempRoot();
         cutDownFixture(root);

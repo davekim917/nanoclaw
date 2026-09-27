@@ -3,7 +3,8 @@ def cut_down_exempt:
   or test("\\.(test|spec)\\.[^/]+$")
   or test("(^|/)test_[^/]*\\.py$")
   or test("_test\\.[^/.]+$")
-  or test("(\\.lockb?|-lock\\.(json|yaml))$");
+  or test("(\\.lock(b|file|\\.json)?|-lock\\.(json|yaml))$")
+  or test("(^|/)(npm-shrinkwrap\\.json|Package\\.resolved)$");
 
 # Added lines outside tests and lockfiles in a compare response, or "unknown"
 # when the listing reaches GitHub's 300-file cap and may be missing files.
