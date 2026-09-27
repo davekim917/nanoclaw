@@ -250,12 +250,10 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       workgroup_id: workgroupId,
     };
 
-    // STEP 1: folder + baseline container.json + skills symlinks (idempotent).
     initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
 
-    // STEP 2: set provider, providerConfig and agentGroupId in container.json
-    // BEFORE the DB insert: a DB row whose container.json lacks the id is not
-    // recoverable, and a failure here still rolls back the folder.
+    // container.json BEFORE the DB insert: a DB row whose container.json lacks
+    // the id is not recoverable, and a failure here still rolls back the folder.
     try {
       await updateContainerConfig(folder, (c) => {
         c.agentGroupId = agentGroupId;
@@ -275,7 +273,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       return;
     }
 
-    // STEP 3: DB insert. On failure, roll back the folder from steps 1-2.
+    // On failure, roll back the folder.
     try {
       await createAgentGroup(newGroup);
     } catch (err) {

@@ -680,9 +680,9 @@ export function decideRefresh(row: McpOAuthIntegration, nowMs: number): RefreshD
 /**
  * Serializes every mutation of one integration: its row, bundle file and
  * OneCLI secret must move together. Without it, a refresh awaiting the token
- * endpoint while `remove --delete-secret` runs would re-write the bundle and
- * recreate the vault secret, which the untouched declaration would then grant
- * on the next spawn. In-process suffices: the host is one Node process.
+ * endpoint while `remove --delete-secret` runs would re-write the bundle,
+ * recreate the vault secret and re-declare it after the removal undeclared it.
+ * In-process suffices: the host is one Node process.
  */
 const integrationLocks = new Map<string, Promise<unknown>>();
 

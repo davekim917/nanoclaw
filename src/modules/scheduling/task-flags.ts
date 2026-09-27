@@ -9,8 +9,8 @@ export type TaskFlagIntent = Pick<FlagIntent, 'turnModel' | 'turnEffort'>;
  * Validate a `{model?, effort?}` pin against ONE named provider's vocabulary,
  * returning the intent or the parser's error. The provider is a parameter so
  * the migration audit can ask "valid AFTER the switch" through the same
- * predicate — a second copy of the model table is how a codex id once reached
- * the Anthropic API. Uses the chat parser's per-turn `-m1`/`-e1` forms.
+ * predicate — a second copy of the model table could send a codex id to the
+ * Anthropic API. Uses the chat parser's per-turn `-m1`/`-e1` forms.
  */
 export function validateTaskPin(
   pin: { model?: string | null; effort?: string | null },
@@ -52,8 +52,8 @@ export function validateTaskPin(
 
 /**
  * Resolve a `{ model?, effort? }` payload into a per-fire flagIntent validated
- * against the group's provider vocabulary; `{}` when neither is given, else
- * `{ error }`. `target.overrideProvider` wins over both the session's sticky
+ * against the group's provider vocabulary: `{}` when neither is given,
+ * `{ flagIntent }` when valid, else `{ error }`. `target.overrideProvider` wins over both the session's sticky
  * provider and the container config — bulk re-pin validates against the
  * provider a group is ABOUT to move to.
  */

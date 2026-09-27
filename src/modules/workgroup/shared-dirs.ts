@@ -731,8 +731,8 @@ export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: s
   for (const wg of workgroups) {
     // Per workgroup: this runs before boot quiescence proves container absence,
     // so any check-then-act can lose a race with a live container (EEXIST), and
-    // an uncaught throw would stop the whole host from booting. Nothing here is
-    // destructive and the next boot retries, so warn and carry on.
+    // an uncaught throw would stop the whole host from booting. The next boot
+    // retries, so warn and carry on.
     try {
       ensureOneWorkgroupWorkDir(db, wg.id, { groupsDir, dataDir, target });
     } catch (err) {

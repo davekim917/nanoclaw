@@ -58,8 +58,8 @@ describe('getAskQuestionRender — module-absent path', () => {
  *      it rather than the empty string the old raw slice produced.
  *   3. It must remain REACHABLE. An upgraded install may still hold an active
  *      one, and `findTaskSessions` is how every consumer enumerates task
- *      sessions (`src/cli/resources/tasks.ts:182` and `:996`,
- *      `auditTaskPins` in src/modules/scheduling/pin-audit.ts). Hiding it would leave a live
+ *      sessions (`src/cli/resources/tasks.ts`, `auditTaskPins` in
+ *      src/modules/scheduling/pin-audit.ts). Hiding it would leave a live
  *      task that `ncl tasks cancel` cannot reach.
  *
  * (1) is why the value never appears in new data; (3) is why the predicates
