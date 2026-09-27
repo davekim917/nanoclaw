@@ -551,9 +551,10 @@ async function wireAndAdmit(
     engage_pattern: engage.engage_pattern,
     // Deliberate card-flow choices, not channel defaults: the triggering
     // sender is auto-admitted below, so 'known' keeps other strangers gated;
-    // 'accumulate', per-thread sessions and priority 0 are the flow's fixed semantics.
+    // 'accumulate' / 'shared' / priority 0 are the flow's fixed semantics.
     sender_scope: 'known',
     ignored_message_policy: 'accumulate',
+    // per-thread, not 'shared': the fork's default session mode for every wiring origin.
     session_mode: 'per-thread',
     priority: 0,
     default_model: null,

@@ -2,7 +2,8 @@
  * CRUD for pending_sender_approvals — the in-flight state for the
  * request_approval unknown-sender flow. Rows are created when an unknown
  * sender writes into a wired messaging group with that policy, and are
- * claimed (deleted) on admin approve before the member is added, or on deny.
+ * deleted on admin approve (after adding the user as a member) or deny.
+ * (The approve handler actually claims the row first, restoring it on failure.)
  *
  * UNIQUE(messaging_group_id, sender_identity) enforces in-flight dedup:
  * a retry / second message from the same unknown sender while a card is
@@ -86,6 +87,7 @@ const DECLINE_STAMP_ID_PREFIX = 'decline:';
  */
 const DECLINE_STAMP_BODY = '{"declined":true}';
 
+/** ISO timestamp of the last decline for this pair, if any. */
 /**
  * Stamps and cards share the table and its UNIQUE key; a reader that does not
  * know which flow wrote a row has to ask.

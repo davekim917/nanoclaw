@@ -24,8 +24,8 @@
  *
  * Successful resolutions are persisted in `user_dms (user_id, channel_type
  * → messaging_group_id)`. The cache survives restarts; first-time DMs on a
- * given channel pay one `openDM` round trip, everyone after is a pure DB
- * read.
+ * given channel pay one `openDM` round trip; later hits are DB reads unless a
+ * named instance rejects a row cached from another instance.
  *
  * The underlying platform APIs (`POST /users/@me/channels` on Discord,
  * `conversations.open` on Slack, etc.) are idempotent and return the same
