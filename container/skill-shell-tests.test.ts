@@ -28,10 +28,8 @@ import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js'
  * Every `execFileSync('bash', …)` call below is this file's only subprocess
  * escape (`allowSubprocess(['bash'])` opts in visibly). `enforceHermeticity()`
  * guards this process's Node seams, not Bash descendants: each shell suite
- * must isolate its own external commands. The suite environment neutralizes ambient git
- * config — see buildSuiteEnv() — because `GIT_CONFIG_NOSYSTEM=1` plus a fresh
- * `HOME` alone still leaves `$XDG_CONFIG_HOME/git/config` reachable, and git
- * prefers that file over `$HOME/.gitconfig`.
+ * must isolate its own external commands; buildSuiteEnv() keeps ambient
+ * environment out of them.
  */
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -121,34 +119,27 @@ const ALL_SUITES = discoverShellSuites();
 const RUNNABLE_SUITES = ALL_SUITES.filter((relPath) => !EXCLUDED_REL_PATHS.has(relPath));
 
 /**
- * The environment a shell suite runs under: a fresh `HOME` (never the real
- * one) plus `GIT_CONFIG_NOSYSTEM=1`, so a suite can't pick up this host's or
- * runner's git config, gitignore, or dotfiles and behave differently between
- * a dev machine and CI.
- *
- * `HOME` and `GIT_CONFIG_NOSYSTEM` alone are not enough: git resolves its
- * "global" config from `$XDG_CONFIG_HOME/git/config` in preference to
- * `$HOME/.gitconfig`, and `GIT_CONFIG_NOSYSTEM` only silences `/etc/gitconfig`
- * (or whatever `$GIT_CONFIG_SYSTEM` names) — it does nothing about the global
- * file. Spreading `...process.env` first therefore used to let an ambient
- * `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` straight
- * through, so a hostile or merely unusual value on the host/runner (an
- * `insteadOf` rewrite, a `core.hooksPath`) could silently change what a
- * suite's own git commands read or ran. Remove the two explicit config-file
- * overrides after the spread and pin XDG under the fresh home instead. That
- * keeps host config out while still letting a suite that deliberately writes
- * `$HOME/.gitconfig` inspect its own configuration.
+ * A shell suite inherits only INHERITED_ENV from this process: no credentials,
+ * cloud profiles, tool-location variables (`GIT_DIR`) or git config overrides
+ * reach it. `HOME`, `XDG_CONFIG_HOME` and `TMPDIR` point into a fresh directory
+ * the caller removes, so ambient git config (git reads
+ * `$XDG_CONFIG_HOME/git/config` before `$HOME/.gitconfig`) stays out and a
+ * suite's temp files, including those it forgets to clean, go with it.
  */
+const INHERITED_ENV = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ'];
+
 function buildSuiteEnv(freshHome: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of INHERITED_ENV) if (process.env[name] !== undefined) env[name] = process.env[name];
+  const tmp = path.join(freshHome, 'tmp');
+  mkdirSync(tmp, { recursive: true });
+  return {
+    ...env,
     HOME: freshHome,
+    TMPDIR: tmp,
     GIT_CONFIG_NOSYSTEM: '1',
     XDG_CONFIG_HOME: path.join(freshHome, '.config'),
   };
-  delete env.GIT_CONFIG_GLOBAL;
-  delete env.GIT_CONFIG_SYSTEM;
-  return env;
 }
 
 function formatShellSuiteFailure(relPath: string, err: unknown): string {
@@ -194,7 +185,7 @@ describe('every container skill shell test suite (*.test.sh)', () => {
     }
   });
 
-  it('ignores a hostile ambient XDG_CONFIG_HOME/GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM', () => {
+  it('passes a suite no ambient git config or credential', () => {
     // Simulates a dev machine or CI runner whose ambient environment already
     // carries these three vars, pointed at a config with an `insteadOf`
     // rewrite and a bogus `core.hooksPath` — exactly the class of ambient git
@@ -204,6 +195,7 @@ describe('every container skill shell test suite (*.test.sh)', () => {
     const savedXdg = process.env.XDG_CONFIG_HOME;
     const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
     const savedSystem = process.env.GIT_CONFIG_SYSTEM;
+    const savedToken = process.env.GH_TOKEN;
     let probeCwd: string | undefined;
     try {
       mkdirSync(path.join(hostileXdg, 'git'), { recursive: true });
@@ -268,6 +260,16 @@ describe('every container skill shell test suite (*.test.sh)', () => {
       // can still make and verify an isolated `$HOME/.gitconfig` of its own.
       expect(buildSuiteEnv(freshHome).GIT_CONFIG_GLOBAL).toBeUndefined();
       expect(buildSuiteEnv(freshHome).GIT_CONFIG_SYSTEM).toBeUndefined();
+      process.env.GH_TOKEN = 'ambient-credential';
+      expect(Object.keys(buildSuiteEnv(freshHome)).sort()).toEqual(
+        [
+          ...INHERITED_ENV.filter((name) => process.env[name] !== undefined),
+          'HOME',
+          'TMPDIR',
+          'GIT_CONFIG_NOSYSTEM',
+          'XDG_CONFIG_HOME',
+        ].sort(),
+      );
     } finally {
       if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = savedXdg;
@@ -275,6 +277,8 @@ describe('every container skill shell test suite (*.test.sh)', () => {
       else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
       if (savedSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
       else process.env.GIT_CONFIG_SYSTEM = savedSystem;
+      if (savedToken === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = savedToken;
       if (probeCwd) rmSync(probeCwd, { recursive: true, force: true });
       rmSync(freshHome, { recursive: true, force: true });
       rmSync(hostileXdg, { recursive: true, force: true });
