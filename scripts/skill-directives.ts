@@ -18,13 +18,8 @@
 // from "what you do with the answer" (env, ncl, the OneCLI vault, a file).
 //
 //   copy [from-branch:<b>] [owned-by-fork]  body: `PATH` (src==dst) or `SRC -> DST`
-//        Default: overwrite. `owned-by-fork` (from-branch only) marks a copy
-//        whose destinations a fork customizes beyond the branch: a missing
-//        dest still copies fresh, but a PRESENT dest is compared to the
-//        branch and REFUSED (bounced to an agent, not overwritten) if it
-//        diverged — protects e.g. a customized Slack/Discord adapter from a
-//        stale registry-branch replay. ApplyOptions.force overrides
-//        the refusal.
+//        Default: overwrite. `owned-by-fork` (from-branch only): a PRESENT dest that
+//        diverged from the branch is refused, not overwritten, unless ApplyOptions.force.
 //   append to:<file> [at:<marker>]  body: line(s) to add             skip if present
 //   dep [manager:pnpm]      body: `pkg@<exact-semver>` line(s)        reinstall no-op
 //   run [effect:build|test|fetch|external|wire|restart|step|check] [capture:<spec>]  re-runnable
