@@ -53,11 +53,8 @@ export async function createDestination(row: AgentDestination): Promise<void> {
 }
 
 /**
- * The `getDestinations` read as a constant, so the one synchronous caller —
- * `write-destinations.ts`'s `resolve()`, which runs inside the central lease
- * immediately before a REPLACE-shaped mailbox write — executes the SAME
- * statement through `withRawDb`. One constant, two executors, not a `*Sync`
- * twin (plan docs/specs/upstream-async-central-db-seam/plan.md §4.5 I-1).
+ * `getDestinations` as a constant, for the synchronous caller inside the
+ * central lease (`write-destinations.ts`), which runs it through `withRawDb`.
  */
 export const AGENT_DESTINATIONS_BY_GROUP_SQL = 'SELECT * FROM agent_destinations WHERE agent_group_id = ?';
 
@@ -90,11 +87,7 @@ export async function getDestinationByTarget(
   );
 }
 
-/**
- * The destination-exists read as a constant: the `a2a.send` guard
- * (`../guard.ts`) is synchronous by design (§4.5 I-1) and executes this
- * statement through `withRawDb` inside its caller's lease block.
- */
+/** Destination-exists read as a constant: the synchronous `a2a.send` guard runs it through `withRawDb`. */
 export const AGENT_DESTINATION_EXISTS_SQL =
   'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1';
 

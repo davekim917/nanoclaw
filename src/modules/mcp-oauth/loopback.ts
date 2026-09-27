@@ -1,23 +1,9 @@
 /**
- * The loopback half of the login: a one-shot HTTP listener on 127.0.0.1 that
- * catches the authorization redirect.
- *
- * THE SSH SHAPE. This host is headless and the operator's browser is on their
- * laptop, so the listener is only reachable through a forwarded port:
- *
- *   ssh -L 8765:127.0.0.1:8765 <user>@<host>
- *
- * With that tunnel up, the browser's redirect to `http://127.0.0.1:8765/…`
- * leaves the laptop, crosses the tunnel, and arrives here — the operator pastes
- * nothing. Without it, their browser fails to connect, the code sits in the
- * address bar, and `ncl integrations complete --redirect-url` takes it. Both
- * paths end in the same exchange; the tunnel is a convenience, never a
- * requirement, which is why a port that will not bind degrades to a warning
- * rather than failing the login.
- *
- * ONE SHOT, AND ONLY LOOPBACK. The server binds `127.0.0.1` explicitly — never
- * `0.0.0.0` — so nothing off this host can reach it even for the minutes it is
- * up, and it closes as soon as it has a code or the deadline passes.
+ * The opt-in loopback half of the login: a one-shot listener on 127.0.0.1 that
+ * catches the authorization redirect through an operator's
+ * `ssh -L 8765:127.0.0.1:8765` tunnel. Without the tunnel the paste path
+ * finishes the login, so a port that will not bind is only a warning. Binds
+ * `127.0.0.1` explicitly, never `0.0.0.0`, and closes on the first code or the deadline.
  */
 import http from 'http';
 import os from 'os';
@@ -37,13 +23,9 @@ export interface LoopbackListener {
 }
 
 /**
- * Both interpolations below are attacker-influenced: `error` and
- * `error_description` come straight off the redirect query string, which is
- * whatever the authorization server (or anyone who can get the operator's
- * browser to hit this port) put there. Unescaped, `error_description=<img
- * src=x onerror=…>` executes in the operator's browser on a page served by
- * this host — and the ONE thing a page on 127.0.0.1 has that a remote page
- * does not is same-origin access to this port.
+ * `error` and `error_description` come off the redirect query string, i.e.
+ * from anyone who can point the operator's browser at this port. Unescaped,
+ * they would run script on a page with same-origin access to this port.
  */
 function escapeHtml(value: string): string {
   return value
@@ -59,10 +41,7 @@ const PAGE = (title: string, body: string) =>
   `<body style="font:16px/1.5 system-ui;margin:4rem auto;max-width:34rem"><h1>${escapeHtml(title)}</h1>` +
   `<p>${escapeHtml(body)}</p></body>`;
 
-/**
- * Start the listener. Rejects if the port cannot be bound — the caller treats
- * that as "paste-only", not as a failed login.
- */
+/** Start the listener. A bind failure means "paste-only", not a failed login. */
 export function startLoopbackListener(port: number, deadlineMs: number): Promise<LoopbackListener> {
   return new Promise((resolve, reject) => {
     let settle: ((c: LoopbackCapture) => void) | undefined;
@@ -73,7 +52,6 @@ export function startLoopbackListener(port: number, deadlineMs: number): Promise
     });
 
     const server = http.createServer((req, res) => {
-      // `req.url` is a path-relative URL; the base is only there to parse it.
       const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
       const capture: LoopbackCapture = {
         code: url.searchParams.get('code') ?? undefined,
@@ -117,9 +95,7 @@ export function startLoopbackListener(port: number, deadlineMs: number): Promise
 
     server.once('error', (err) => {
       clearTimeout(timer);
-      // Nothing is awaiting `captured` yet at this point; attach a no-op so an
-      // unhandled rejection cannot be raised against a promise the caller never
-      // received.
+      // Nothing awaits `captured` yet; a no-op catch avoids an unhandled rejection.
       captured.catch(() => undefined);
       fail?.(err instanceof Error ? err : new Error(String(err)));
       reject(err);
@@ -133,12 +109,7 @@ export function startLoopbackListener(port: number, deadlineMs: number): Promise
   });
 }
 
-/**
- * The exact line to paste into a second terminal, with this host's best guess
- * at its own name. `<host>` is what the operator's ssh config calls this
- * machine, which nothing here can know for certain — `os.hostname()` is the
- * closest honest answer and is usually right.
- */
+/** The line to paste into a second terminal; `os.hostname()` is a best guess at the operator's name for this host. */
 export function sshTunnelCommand(port: number): string {
   const user = os.userInfo().username;
   return `ssh -L ${port}:127.0.0.1:${port} ${user}@${os.hostname()}`;

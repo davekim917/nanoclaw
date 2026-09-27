@@ -662,7 +662,7 @@ describe('CLI', () => {
   });
 
   it('--gate on a broken scan still exits 0 and still wakes', () => {
-    // A non-zero exit makes the host discard the fire (host-script.ts:386-389),
+    // A non-zero exit makes the host discard the fire (`runHostGatedTaskScripts`),
     // which is the same silence this check exists to end.
     const { code, out } = capture(() => main(['--sessions-root', '/nonexistent/sessions/root', '--gate']));
 

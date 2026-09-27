@@ -1,27 +1,16 @@
 /**
- * The write side of the OneCLI vault: create a header-injection secret, and
- * replace its value in place.
- *
- * VERIFIED against the live gateway on 2026-09-17 (onecli@1.4.1), because none
- * of it is documented anywhere in this repo:
+ * The write side of the OneCLI vault. Verified against onecli@1.4.1:
  *
  *   POST   /api/secrets            → 201 `{id, name, …, preview}`
- *   PATCH  /api/secrets/{id}       → 200 `{"success":true}`; a body carrying
- *                                    only `value` leaves hostPattern,
- *                                    pathPattern and injectionConfig untouched
+ *   PATCH  /api/secrets/{id}       → 200; a body with only `value` leaves
+ *                                    hostPattern, pathPattern and
+ *                                    injectionConfig untouched
  *   DELETE /api/secrets/{id}       → 204
- *   PUT    /api/secrets/{id}       → 404 (the CLI's `secrets update` is PATCH)
+ *   PUT    /api/secrets/{id}       → 404
  *
- * `onecli secrets update --id <uuid> --value <token>` does the same thing, and
- * is NOT used: the value would sit in this host's process table for the life of
- * the call. The gateway API takes it on stdin instead.
- *
- * `curl` rather than `fetch`, for the same reason `src/onecli-secrets.ts`
- * gives: host `fetch` must never traverse the gateway proxy.
- *
- * NOTHING HERE READS A VALUE BACK — the API has no such route (see the note in
- * `store.ts`). Callers that need to know what the current token is keep their
- * own copy; this module is fire-and-confirm.
+ * Not the `onecli secrets update` CLI: the value would sit in the process
+ * table. `curl` rather than `fetch`: host `fetch` must never traverse the
+ * gateway proxy. Nothing reads a value back — the API has no such route.
  */
 import { execFile } from 'child_process';
 
@@ -50,19 +39,11 @@ function base(): string {
 }
 
 /**
- * The whole request as a curl CONFIG FILE, fed on stdin (`curl -K -`).
- *
- * NOTHING SENSITIVE IS IN ARGV. Two things on this path are secrets: the
- * gateway API key and the access token in the body. `/proc/<pid>/cmdline` is
- * world-readable, and — the reason this was a finding rather than a nicety —
- * Node builds an `execFile` error's `.message` out of the full argv, and this
- * module's callers write that message into `mcp_oauth_integrations.status_detail`
- * and a `log.warn` (`service.ts` `finalizeToken` / `refreshOne`). Anything in
- * argv is one gateway outage away from being in the DB and in the logs.
- *
- * The body moves into the config for a mechanical reason: `-K -` and
- * `--data-binary @-` both want stdin, so only one of them can have it. Escaping
- * is {@link curlConfigEscape}, verified against curl 8.5.0.
+ * The whole request as a curl CONFIG FILE on stdin (`curl -K -`). NOTHING
+ * SENSITIVE IS IN ARGV: `/proc/<pid>/cmdline` is world-readable, and Node puts
+ * the full argv in an `execFile` error's message, which callers write to the DB
+ * and logs. The body is in the config too, since only one of `-K -` and
+ * `--data-binary @-` can have stdin.
  */
 function curlConfig(method: 'POST' | 'PATCH' | 'DELETE' | 'GET', url: string, body?: unknown): string {
   const lines = [
@@ -84,11 +65,9 @@ function curlConfig(method: 'POST' | 'PATCH' | 'DELETE' | 'GET', url: string, bo
 }
 
 /**
- * `-f` is deliberately NOT used: the caller needs the status code to tell a
- * 409-style conflict from a real failure, and `-f` collapses every non-2xx into
- * exit code 22. The status is appended by `-w` instead. The response body is
- * returned to the caller but never logged by it — a create response carries a
- * masked `preview` of the value, which is still more than belongs in a log.
+ * No `-f`: the caller needs the status code (appended by `-w`) to tell a
+ * conflict from a failure. The response body is never logged — a create
+ * response carries a masked `preview` of the value.
  */
 function curlJson(
   method: 'POST' | 'PATCH' | 'DELETE' | 'GET',
@@ -127,10 +106,8 @@ function curlJson(
       }
       resolve({ status, body: parsed });
     });
-    // `error` on the stream, not just on the process: a curl that exits before
-    // reading its config makes this write EPIPE, and an unhandled 'error' event
-    // on a stream is an uncaught exception. The execFile callback reports the
-    // failure either way.
+    // A curl exiting before reading its config makes this write EPIPE; an
+    // unhandled stream 'error' is an uncaught exception.
     child.stdin?.on('error', () => undefined);
     child.stdin?.end(config);
   });
@@ -154,19 +131,9 @@ export async function findOnecliSecretByName(name: string): Promise<OnecliSecret
 
 /**
  * Create the bearer secret, or update the value of the one already carrying
- * this name.
- *
- * Adopting an existing name rather than failing is the whole point: a server
- * that was wired up before this existed already has a hand-made bearer secret,
- * already listed in that group's `container.json`, so a login has to be able to
- * take ownership of it in place. Creating a second secret under a generated name
- * would leave the group's agent still granted the dead one.
- *
- * Injection shape is only sent on CREATE. A PATCH carrying `value` alone leaves
- * hostPattern/pathPattern/injectionConfig as they were (verified above), which
- * is what an adopted secret wants: the operator's existing matching rule is the
- * one the gateway has been using, and silently rewriting it could stop the
- * secret matching the requests it currently serves.
+ * this name — adopting a hand-made secret the group already declares, rather
+ * than leaving the agent granted a dead one. The injection shape is sent only
+ * on CREATE, so an adopted secret keeps the matching rule it already serves.
  */
 export async function putOnecliBearerSecret(spec: OnecliInjectionSpec, value: string): Promise<OnecliSecretRef> {
   const existing = await findOnecliSecretByName(spec.name);

@@ -1,22 +1,9 @@
 /**
- * Workgroup FS reconciliation — runs once at host startup AFTER runMigrations.
- *
- * Responsibilities:
- * 1. Drain `_migration036_report` temp table (if present) into:
- *    - logs/migration-036.log (pairings, standalone, suffix_strip_unmatched)
- *    - logs/migration-036-secrets.log (per-workgroup intersection of member secrets)
- *    Then DROP the temp table.
- * 2. Guarantee the shared work-product directory, and each member's compat
- *    link to it, for every workgroup whose `/workspace/workgroup` mount is
- *    actually made (`ensureWorkgroupWorkDirs` applies the mount's own
- *    predicate per workgroup; a link to an unmounted target is worse than no
- *    link).
- * 3. Prune member compat links whose shared target is gone
- *    (`pruneDanglingWorkgroupCompatLinks`).
- * Idempotent — re-running on already-reconciled state is a no-op. Only step 1
- * and the workgroups enumeration throw on failure (the caller in src/main.ts
- * logs and exits process.exit(1)); steps 2 and 3 warn and skip per workgroup
- * and per member, so one lost race cannot stop the host booting.
+ * Workgroup FS reconciliation, run at host startup after migrations: drain the
+ * migration-036 report table into logs, ensure each workgroup's shared
+ * work-product dir and member links, and prune dangling compat links. Only the
+ * report drain and the workgroups enumeration throw (the caller exits); the
+ * other steps warn and skip per workgroup, so one lost race cannot stop boot.
  */
 import fs from 'fs';
 import path from 'path';
@@ -28,7 +15,6 @@ import { readContainerConfig } from '../../container-config.js';
 import { ensureWorkgroupWorkDirs, pruneDanglingWorkgroupCompatLinks } from './shared-dirs.js';
 
 export function reconcileWorkgroupFsState(db: Database.Database): void {
-  // ── 1. Drain migration-036 report if present ──────────────────────────
   const reportTableExists = db
     .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_migration036_report'`)
     .get() as { name: string } | undefined;
@@ -39,57 +25,31 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
       | undefined;
 
     if (reportRow) {
-      // mkdirSync before writeFileSync — let FS errors propagate to the caller
       fs.mkdirSync(path.join('logs'), { recursive: true });
 
       fs.writeFileSync(path.join('logs', 'migration-036.log'), reportRow.report + '\n');
 
-      // Compute per-workgroup intersection of member onecliSecrets (S10)
       const secretsReport = computeDuplicateSecretsReport(db);
       fs.writeFileSync(path.join('logs', 'migration-036-secrets.log'), JSON.stringify(secretsReport, null, 2) + '\n');
     }
 
-    // DROP only after both writes succeed (so a partial failure leaves the table intact)
+    // DROP only after both writes succeed, so a partial failure keeps the table.
     db.prepare(`DROP TABLE _migration036_report`).run();
     log.info('reconcileWorkgroupFsState: drained migration-036 report');
   }
 
-  // ── 2. Shared work-product directory + per-member compat links ─────────
-  // Runs on every boot, unlike the one-time report drain above: a workgroup or
-  // member added since the last boot needs it. Which workgroups it acts on is
-  // decided inside, by the mount predicate. One member losing a race, or one
-  // unusable workgroup row, warns and is skipped rather than stopping the host
-  // booting. The one uncontained throw is the workgroups enumeration itself:
-  // an unreadable central DB is fail-closed here, exactly as it is for step 1.
   ensureWorkgroupWorkDirs(db);
 
-  // ── 3. Prune compat links whose shared target is gone ──────────────────
-  // Order is NOT load-bearing between steps 2 and 3, and two earlier attempts
-  // to say why it was were both wrong. Step 3 requires the `.migrated` marker,
-  // which lives inside the shared tree, so it acts only where that tree
-  // already exists — nothing step 2 creates can change its answer, and the one
-  // name step 2 adds (`artifacts`) is reserved and never considered. Kept in
-  // this order only so a boot's shared-tree writes precede its reads.
-  //
-  // Step 3 is NOT the boot's last writer to the shared tree:
-  // after this whole function runs at boot, runBootMountQuiescence
-  // calls reconcileWorkgroupSharedDirs and the memory gate, both of which add names after this prune has read its listing.
-  // That is safe for two separate reasons, not one — `memory` and `artifacts`
-  // are held by RESERVED_SHARED_DIR_NAMES and never considered here, and
-  // migrateWorkgroup writes a name's shared entry before its compat link,
-  // so a link this prune could see can
-  // never be newer than its target. Contained the same way as step 2 — a
-  // workgroup whose shared tree cannot be listed prunes nothing.
+  // Not the boot's last writer to the shared tree (the quiescence door later adds
+  // names), which is safe: reserved names are never considered here, and the
+  // migrator writes a name's shared entry before its compat link, so a link this
+  // prune sees is never newer than its target.
   pruneDanglingWorkgroupCompatLinks(db);
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 /**
- * For each workgroup with >1 member, compute the intersection of member
- * `onecliSecrets` arrays. The result surfaces secrets that every member
- * already has declared, which may indicate they should be promoted to
- * workgroup-level secret config instead.
+ * For each workgroup with >1 member, the intersection of member `onecliSecrets`:
+ * candidates for promotion to workgroup-level secret config.
  */
 function computeDuplicateSecretsReport(db: Database.Database): Array<{ workgroup: string; intersection: string[] }> {
   const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;

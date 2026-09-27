@@ -17,24 +17,10 @@ import { withExistingMailboxSession } from '../../session-manager.js';
 import { AGENT_DESTINATIONS_BY_GROUP_SQL } from './db/agent-destinations.js';
 
 export async function writeDestinations(agentGroupId: string, sessionId: string): Promise<void> {
-  // Resolved INSIDE the session, not before it. `getDestinations` and the
-  // `getMessagingGroup`/`getAgentGroup` lookups it feeds read the central DB;
-  // the funnel below yields between that read and `replaceDestinationRows`,
-  // and this projection is REPLACE-shaped — it overwrites the whole map. A set
-  // resolved before the yield can therefore reinstate a destination an admin
-  // revoked in the window, which is the one direction that matters here: the
-  // container resolves names against this table to decide where it may send.
-  // All three lookups are synchronous, so there is no yield left between the
-  // resolution and the write.
-  //
-  // Seam 3 §4.5 I-1: that is why every read below executes its leaf's
-  // exported SQL constant (`AGENT_DESTINATIONS_BY_GROUP_SQL`,
-  // `MESSAGING_GROUP_BY_ID_SQL`, `AGENT_GROUP_BY_ID_SQL`) through `withRawDb`
-  // rather than calling the leaves' async exports — one constant, two
-  // executors, not a `*Sync` twin (plan
-  // docs/specs/upstream-async-central-db-seam/plan.md §4.5). The whole
-  // resolve-then-replace pair runs inside ONE `withCentralSync` block below,
-  // so no driver transaction can be open while these raw reads execute.
+  // Resolved INSIDE the session, synchronously: this projection is
+  // REPLACE-shaped, so a set resolved before a yield could reinstate a
+  // destination an admin revoked in the window. Hence every read runs its leaf's
+  // SQL constant through `withRawDb`, inside ONE `withCentralSync` block below.
   const resolve = (): DestinationRow[] => {
     const rows = withRawDb((raw) =>
       raw.prepare(AGENT_DESTINATIONS_BY_GROUP_SQL).all(agentGroupId),
@@ -71,15 +57,10 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
     return resolved;
   };
 
-  // Existing-only: the projection is refreshed on every wake and after admin
-  // edits, and a session with no mailbox has no container to resolve names
-  // for. Provisioning here would recreate a reclaimed directory (I-10); the
-  // old code expressed the same rule as an existsSync on inbound.db.
-  // The lease is taken AROUND the mailbox write, not inside it: the
-  // resolution and the replace are one synchronous block under
-  // `withCentralSync`, so an admin's revoke cannot land between them
-  // (plan §4.1, "sites that evaluate ... inside a synchronous mailbox action
-  // take the lease around the mailbox action").
+  // Existing-only: a session with no mailbox has no container to serve, and
+  // provisioning here would recreate a reclaimed directory. The lease is taken
+  // AROUND the mailbox write so an admin's revoke cannot land between the
+  // resolution and the replace.
   const count = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) =>
     withCentralSync(() => {
       const resolved = resolve();
