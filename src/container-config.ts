@@ -64,9 +64,9 @@ interface StdioMcpServerConfig {
    */
   plugin?: string;
   instructions?: string;
-  /** Capability-snapshot label (default: the name, capitalized). Stripped from the env payload, not container.json. */
+  /** Capability-snapshot label (default: the name, capitalized). Host-only: never reaches a provider's server map. */
   displayName?: string;
-  /** Capability-list line (default: a generic transport line). Env-stripped like displayName, unlike `instructions`. */
+  /** Capability-list line (default: a generic transport line). Host-only like displayName, unlike `instructions`. */
   description?: string;
 }
 

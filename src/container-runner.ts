@@ -5467,8 +5467,24 @@ export function dockerResourceLimitArgs(resources?: ContainerResources): string[
 
 const execAsync = promisify(exec);
 
-/** Build a per-agent-group Docker image with custom packages. */
-export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
+const imageBuildChains = new Map<string, Promise<void>>();
+
+/** One build per group at a time, reading the package lists once it holds the turn: the last to finish owns the tag. */
+export function buildAgentGroupImage(agentGroupId: string): Promise<void> {
+  const previous = imageBuildChains.get(agentGroupId) ?? Promise.resolve();
+  const run = previous.then(() => buildAgentGroupImageNow(agentGroupId));
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  imageBuildChains.set(agentGroupId, settled);
+  void settled.then(() => {
+    if (imageBuildChains.get(agentGroupId) === settled) imageBuildChains.delete(agentGroupId);
+  });
+  return run;
+}
+
+async function buildAgentGroupImageNow(agentGroupId: string): Promise<void> {
   const agentGroup = await getAgentGroup(agentGroupId);
   if (!agentGroup) throw new Error('Agent group not found');
 

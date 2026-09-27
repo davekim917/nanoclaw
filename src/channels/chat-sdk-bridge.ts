@@ -13,6 +13,9 @@ import {
   Actions,
   Button,
   LinkButton,
+  Modal,
+  TextInput,
+  type ActionEvent,
   type CardChild,
   type Adapter,
   type ConcurrencyStrategy,
@@ -464,6 +467,47 @@ export function parseRetryAfterMs(err: unknown): number | null {
  * adding more cannot push a max-length message over the cap.
  */
 const SUBTEXT_BUDGET_OVERHEAD = 8;
+
+const SECRET_INTAKE_ACTION_PREFIX = 'ncs:';
+const SECRET_INTAKE_CALLBACK_ID = 'nc-secret-intake';
+const SECRET_INTAKE_INPUT_ID = 'secret_value';
+
+/** The platform's trigger id expires in seconds (Slack: 3), so nothing slow may run before `openModal`. */
+async function openSecretIntakeForm(event: ActionEvent, setup: ChannelSetup): Promise<void> {
+  const hooks = setup.secretIntake;
+  if (!hooks) return;
+  const intakeId = event.actionId.slice(SECRET_INTAKE_ACTION_PREFIX.length);
+  const say = async (text: string): Promise<void> => {
+    try {
+      await event.thread?.post(text);
+    } catch (err) {
+      log.warn('Secret intake: could not post a reply', { intakeId, err });
+    }
+  };
+  const opened = await hooks.open(intakeId, event.user?.userId || '');
+  if (!opened.ok) {
+    await say(opened.message);
+    return;
+  }
+  const view = await event.openModal(
+    Modal({
+      callbackId: SECRET_INTAKE_CALLBACK_ID,
+      privateMetadata: intakeId,
+      title: opened.form.title,
+      submitLabel: 'Store',
+      closeLabel: 'Cancel',
+      children: [
+        CardText(opened.form.body),
+        TextInput({
+          id: SECRET_INTAKE_INPUT_ID,
+          label: opened.form.inputLabel,
+          placeholder: 'Paste it here',
+        }),
+      ],
+    }),
+  );
+  if (!view) await say('This platform cannot open a form, so the secret cannot be entered here.');
+}
 
 const MAX_RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_BUFFER_MS = 100;
@@ -1021,6 +1065,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // Handle button clicks (ask_user_question)
       chat.onAction(async (event) => {
+        if (event.actionId.startsWith(SECRET_INTAKE_ACTION_PREFIX)) {
+          await openSecretIntakeForm(event, setupConfig);
+          return;
+        }
         if (!event.actionId.startsWith('ncq:')) return;
         const parts = event.actionId.split(':');
         if (parts.length < 3) return;
@@ -1087,6 +1135,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }
 
         setupConfig.onAction(questionId, selectedOption, userId, messageId);
+      });
+
+      chat.onModalSubmit(SECRET_INTAKE_CALLBACK_ID, async (event) => {
+        const hooks = setupConfig.secretIntake;
+        if (!hooks || !event.privateMetadata) return { action: 'close' };
+        const result = await hooks.submit(
+          event.privateMetadata,
+          event.user.userId,
+          event.values[SECRET_INTAKE_INPUT_ID] ?? '',
+        );
+        return result.ok
+          ? { action: 'close' }
+          : { action: 'errors', errors: { [SECRET_INTAKE_INPUT_ID]: result.message } };
       });
 
       // The SDK acks the platform request before this runs, so a slow handler cannot hit Slack's 3s ack timeout.
@@ -1225,6 +1286,26 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       if (content.operation === 'reaction' && content.messageId && content.emoji) {
         await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
         return;
+      }
+
+      if (content.type === 'secret_intake' && typeof content.intakeId === 'string') {
+        const title = fitCardTitle(typeof content.title === 'string' ? content.title : 'Secret requested');
+        const body = typeof content.body === 'string' ? content.body : '';
+        const card = Card({
+          title,
+          subtitle: body,
+          children: [
+            Actions([
+              Button({
+                id: `${SECRET_INTAKE_ACTION_PREFIX}${content.intakeId}`,
+                label: typeof content.buttonLabel === 'string' ? content.buttonLabel : 'Enter secret',
+                style: 'primary',
+              }),
+            ]),
+          ],
+        });
+        const result = await adapter.postMessage(tid, { card, fallbackText: `${title}\n\n${body}` });
+        return result?.id;
       }
 
       // Ask question card — render as Card with buttons

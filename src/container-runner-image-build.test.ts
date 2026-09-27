@@ -14,14 +14,26 @@ vi.mock('./config.js', async (importOriginal) => ({
   GROUPS_DIR: `${TEST_DIR}/groups`,
 }));
 
-const built = vi.hoisted(() => ({ commands: [] as string[] }));
-vi.mock('child_process', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('child_process')>()),
-  exec: (command: string, _options: unknown, callback: (err: Error | null, stdout: string) => void) => {
-    built.commands.push(command);
-    callback(null, '');
-  },
+const built = vi.hoisted(() => ({
+  commands: [] as string[],
+  dockerfiles: [] as string[],
+  hold: false,
+  pending: [] as (() => void)[],
 }));
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  const { readFileSync } = await import('fs');
+  return {
+    ...actual,
+    exec: (command: string, _options: unknown, callback: (err: Error | null, stdout: string) => void) => {
+      built.commands.push(command);
+      const dockerfile = / -f (\S+) /.exec(command)?.[1];
+      built.dockerfiles.push(dockerfile ? readFileSync(dockerfile, 'utf8') : '');
+      if (built.hold) built.pending.push(() => callback(null, ''));
+      else callback(null, '');
+    },
+  };
+});
 
 import { CONTAINER_IMAGE_BASE } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
@@ -32,6 +44,9 @@ import { closeDb, initMigratedTestDb } from './db/index.js';
 
 beforeEach(async () => {
   built.commands = [];
+  built.dockerfiles = [];
+  built.hold = false;
+  built.pending = [];
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(`${TEST_DIR}/groups/agent`, { recursive: true });
   await initMigratedTestDb();
@@ -68,5 +83,33 @@ describe('buildAgentGroupImage', () => {
     expect(file.imageTag).toBe(tag);
     expect(file.onecliSecrets).toEqual(['Keep-Me']);
     expect((await getContainerConfig('ag-1'))!.image_tag).toBe(tag);
+  });
+
+  it('runs overlapping builds for one group one at a time, the later one from the newer package lists', async () => {
+    built.hold = true;
+    const first = buildAgentGroupImage('ag-1');
+    await vi.waitFor(() => expect(built.commands).toHaveLength(1));
+
+    await updateContainerConfigJson('ag-1', 'packages_apt', ['jq', 'curl']);
+    const second = buildAgentGroupImage('ag-1');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(built.commands).toHaveLength(1);
+
+    built.hold = false;
+    built.pending.shift()!();
+    await Promise.all([first, second]);
+
+    expect(built.dockerfiles.at(-1)).toContain('apt-get install -y jq curl');
+    expect(built.dockerfiles).toHaveLength(2);
+    expect(fs.existsSync(`${TEST_DIR}/Dockerfile.ag-1`)).toBe(false);
+  });
+
+  it('lets the next queued build run after one fails', async () => {
+    await updateContainerConfigJson('ag-1', 'packages_apt', []);
+    await expect(buildAgentGroupImage('ag-1')).rejects.toThrow('No packages to install');
+
+    await updateContainerConfigJson('ag-1', 'packages_apt', ['jq']);
+    await buildAgentGroupImage('ag-1');
+    expect(built.commands).toHaveLength(1);
   });
 });
