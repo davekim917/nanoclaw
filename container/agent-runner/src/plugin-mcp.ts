@@ -24,12 +24,15 @@ function pluginDataDir(pluginRoot: string): string {
   return path.posix.join(groupDir, 'plugin-data', path.posix.basename(pluginRoot));
 }
 
+const HOST_ONLY_FIELDS = ['plugin', 'displayName', 'description'] as const;
+
 export function resolvePluginServer(config: McpServerConfig): McpServerConfig {
-  // `plugin` is the host's ownership marker and must never reach a provider's server map; stripped only when
-  // present, so an unmarked server is returned by identity. `sse` is rejected host-side and only narrows the type.
-  if ((config as { plugin?: string }).plugin !== undefined) {
-    const { plugin: _owner, ...unmarked } = config as McpServerConfig & { plugin?: string };
-    return resolvePluginServer(unmarked as McpServerConfig);
+  // Host-only fields (the ownership marker, dashboard labels) must never reach a provider's server map; stripped only
+  // when present, so a plain server is returned by identity. `sse` is rejected host-side and only narrows the type.
+  if (HOST_ONLY_FIELDS.some((field) => (config as unknown as Record<string, unknown>)[field] !== undefined)) {
+    const stripped: Record<string, unknown> = { ...config };
+    for (const field of HOST_ONLY_FIELDS) delete stripped[field];
+    return resolvePluginServer(stripped as unknown as McpServerConfig);
   }
   if (config.type === 'http' || config.type === 'sse') return config;
   const { pluginRoot, ...server } = config;
