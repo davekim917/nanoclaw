@@ -19,6 +19,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/smoke-case.sh"
 CTL="$SCRIPT_DIR/smoke-campaign-controller.py"
 FAKES="$SCRIPT_DIR/testdata/controller-live-fakes.py"
 T="$(mktemp -d)"
@@ -366,6 +367,7 @@ PY
 }
 assert_once() { local r; r="$(effects_once)"; jq -e .ok <<<"$r" >/dev/null || fail "effects not exactly once ($1): $r"; }
 
+if smoke_case 1-refusals; then
 # --- 1. startup refusals -------------------------------------------------------
 new_case refusals
 rm "$C/cutover.json"
@@ -385,6 +387,8 @@ step 2026-09-18T10:00:00Z
   || fail "a shadow journal must never drive live effects: rc=$STEP_RC $STEP_OUT"
 [ ! -s "$FAKE_LOG" ] || fail "a refused live start must call nothing: $(cat "$FAKE_LOG")"
 
+fi
+if smoke_case 2-happy; then
 # --- 2. the whole campaign, every effect once --------------------------------
 new_case happy
 FINDING=F1 campaign 9
@@ -416,6 +420,7 @@ grep -q 'prompt' "$C/fake/ncl.json" && jq -e '.tasks[0].flags | index("--mute-ch
 jq -e '[.[] | select(.tool=="gate" and .op=="progress")] | length >= 5' -s "$FAKE_LOG" >/dev/null \
   || fail "each live fire stamps gate progress on its run"
 
+fi
 # --- 3. a kill at every crash point, and every ambiguous effect outcome ---------
 for point in before-run-record after-run-record after-intent:owner:intake after-effect:owner:intake \
   after-intent:dispatch:critic after-effect:dispatch:critic after-intent:send:root after-effect:send:root \
@@ -423,6 +428,7 @@ for point in before-run-record after-run-record after-intent:owner:intake after-
   after-intent:gh:pr-comment after-effect:gh:pr-comment after-intent:gh:issue:F1 after-effect:gh:issue:F1 \
   after-intent:gate:finish after-effect:gate:finish after-run-done after-intent:gh:freeze-close \
   after-effect:gh:freeze-close; do
+  smoke_case "3-crash-$point" || continue
   new_case "crash-${point//:/-}"
   FINDING=F1 CRASH="$point" campaign 10
   assert_once "$point"
@@ -441,18 +447,22 @@ for point in before-run-record after-run-record after-intent:owner:intake after-
     || fail "$point: the controller's own finish must never read as a foreign one"
 done
 for f in enqueue gh:pr-comment gh:issue-create gh:pr-close ncl:create gate:finish; do
+  smoke_case "3-ambiguous-$f" || continue
   new_case "ambiguous-${f//:/-}"
   jq -cn --arg f "$f" '{($f):["fail-after"]}' >"$C/fake/faults.json"
   FAULTY=1 FINDING=F1 campaign 11
   assert_once "fail-after $f"
   [ "$(finish_verdict)" = '"GO"' ] || fail "fail-after $f: an effect that landed is reconciled, still GO: $(finish_verdict)"
 done
+if smoke_case 3-transient-gh; then
 new_case transient-gh
 jq -cn '{"gh:api":["fail-before","fail-before"]}' >"$C/fake/faults.json"
 FAULTY=1 FINDING=F1 campaign 11
 assert_once transient-gh
 [ "$(finish_verdict)" = '"GO"' ] || fail "two transient GitHub read failures are retried, not terminal"
 
+fi
+if smoke_case 4-budget-helper; then
 # --- 4. send budget exhaustion -> failed_terminal -> BLOCKED ----------------------
 new_case budget-helper
 # The helper's own per-run count (its budget table) is already spent.
@@ -469,6 +479,8 @@ jr "[.[] | select(.kind==\"send\" and .slot==\"root\" and .state==\"failed_termi
   || fail "the refused root send is failed_terminal"
 dq '[.[] | select(.type=="finish")] | last | .failedChecks | map(select(contains("failed_terminal"))) | length > 0' \
   | grep -qx true || fail "the BLOCKED finish names the failed_terminal obligation"
+fi
+if smoke_case 4-budget-controller; then
 new_case budget-controller
 # The controller's own count: 15 journaled attempts, so enqueue is never called.
 for i in $(seq 1 15); do
@@ -483,6 +495,8 @@ budget_ids() { jq -s -c '[.[] | select(.tool=="enqueue") | .argv as $a | ($a | i
   || fail "an over-budget send never reaches the helper; only the alarm lane does: $(budget_ids)"
 jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:send-budget:")))] | last | .state == "delivered"' \
   | grep -qx true || fail "the budget refusal's alarm is delivered in its own lane"
+fi
+if smoke_case 4-failed-receipts; then
 new_case failed-receipts
 FAIL_RECEIPTS="$(key "$RUN" send root)" campaign 12
 jr "[.[] | select(.kind==\"send\" and .slot==\"root\")] | last | .state == \"failed_terminal\"" | grep -qx true \
@@ -491,6 +505,8 @@ jr "[.[] | select(.kind==\"send\" and .slot==\"root\")] | last | .state == \"fai
   || fail "each failed receipt advances the attempt (3 attempts, no more)"
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "undeliverable root -> BLOCKED: $(finish_verdict)"
 
+fi
+if smoke_case 5-dispatch-refused; then
 # --- 5. dispatch refused by the host -> terminal, escalated, GO blocked ---------
 new_case dispatch-refused
 jq -cn '{"ncl:create":["refuse"]}' >"$C/fake/faults.json"
@@ -499,6 +515,8 @@ campaign 10
 [ "$(jq -s '[.[] | select(.tool=="ncl" and .op=="refused")] | length' "$FAKE_LOG")" = 1 ] \
   || fail "a refused dispatch is not retried"
 
+fi
+if smoke_case 5b-owner-overdue; then
 # --- 5b. an alarm raised mid-run is receipted, and does not hold GO --------------
 new_case owner-overdue
 STALL=8 DEADLINE=2026-09-18T14:00:00Z campaign 20
@@ -507,6 +525,8 @@ jr '[.[] | select(.kind=="send" and (.slot|startswith("alarm:overdue:")) and .st
 [ "$(finish_verdict)" = '"GO"' ] || fail "a late-but-complete owner step still finishes GO: $(finish_verdict) $(dq '[.[]|select(.type=="finish")]')"
 unset STALL
 
+fi
+if smoke_case 5c-late-disposition; then
 # --- 5c. a frozen verdict settles even after the phase files move under it -------
 # The challenger deadline passes with lanes pending: challenger-timeout BLOCKED
 # is validated and its post enqueued. The disposition then lands before the
@@ -522,6 +542,7 @@ late_disposition_finished "late disposition" 2026-09-18T10:25:00Z 2026-09-18T10:
   || fail "late disposition: a timeout the disposition had already answered was sent to the gate"
 unset STALL LATE_DISPOSITION DEADLINE
 
+fi
 # --- 6. live and shadow apply the same rules ------------------------------------
 same_rules() { # label world-setup
   local label="$1" m
@@ -538,6 +559,7 @@ same_rules() { # label world-setup
   cmp -s "$T/rules-$label-live.obs" "$T/rules-$label-shadow.obs" \
     || fail "$label: live and shadow obligations differ: $(diff "$T/rules-$label-live.obs" "$T/rules-$label-shadow.obs")"
 }
+if smoke_case 6-same-rules; then
 same_rules go 'VERDICT=GO'
 same_rules head-moved 'VERDICT=GO; printf "{\"%s\":\"%s\"}\n" "$PR" "$SHA2" >"$C/heads.json"'
 same_rules no-go 'VERDICT=NO_GO'
@@ -545,6 +567,8 @@ grep -q '"GO"' "$T/rules-go-live.fin" || fail "the clean GO fixture finishes GO 
 grep -q '"BLOCKED"' "$T/rules-head-moved-live.fin" || fail "a moved head refuses GO in both modes"
 VERDICT=GO
 
+fi
+if smoke_case 7-never-both; then
 # --- 7. never both act on one run ---------------------------------------------
 # a) a run claimed before the flip: never recorded, stepped, stamped or finished.
 new_case cutover-legacy
@@ -694,6 +718,8 @@ claim
 out="$(bash "$C/bin/gate.sh" finish "$SHA" "$RUN" GO "$TOKEN")"
 jq -e '.claimantMismatch == true' <<<"$out" >/dev/null || fail "legacy caller refused by claimant: $out"
 
+fi
+if smoke_case 8-owner-wakes; then
 # --- 8. owner wakes: one per fire, bounded re-offers, stopped by the ack --------
 new_case wakes
 claim; wake_json
@@ -716,6 +742,8 @@ step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
 step_ok 2026-09-18T10:01:00Z
 [ "$(jq -r '.ownerWake' <<<"$STEP_OUT")" = null ] || fail "an acked brief is not re-offered: $STEP_OUT"
 
+fi
+if smoke_case 9-round1; then
 # --- 9. review round 1 (PR #945) ---------------------------------------------------
 # a) A crash inside the gate's finish, between verdict.json and the slot
 #    cleanup: the run is not done, nothing post-finish runs, and the gate's own
@@ -811,6 +839,7 @@ st = Stub(base("enqueued", "enqueued"))
 assert ctl.Controller.pick_owner_wake(st)["step"] == "lanes", "a live, due step is still offered"
 PY
 
+fi
 # --- 10. review round 2 (PR #945) -------------------------------------------------
 # A one-shot alarm is settled by its send obligation, never by a journaled
 # flag. A kill BEFORE its intent re-raises it on the next fire; a kill AFTER
@@ -842,6 +871,7 @@ recovery_fires() { # crash-spec first-tick: kill the first fire there, then keep
 }
 UNCONF="alarm:finish-unconfirmed:${RUN: -40}"
 for point in "after-intent:send:$UNCONF" "before-intent:send:$UNCONF"; do
+  smoke_case "10-unconfirmed-${point%%:*}" || continue
   new_case "unconfirmed-${point%%:*}"
   claim; wake_json
   gate_finished_elsewhere acme-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
@@ -856,6 +886,7 @@ done
 # is marked done, so a kill between them re-enters the path.
 FOREIGN="alarm:foreign-finish:${RUN: -40}"
 for point in "before-intent:send:$FOREIGN" "after-intent:send:$FOREIGN"; do
+  smoke_case "10-foreign-${point%%:*}" || continue
   new_case "foreign-${point%%:*}"
   claim; wake_json
   gate_finished_elsewhere "$RUN"
@@ -868,6 +899,7 @@ done
 # second kill, after the first made the dispatch ambiguous) and owner overdue.
 AMB="alarm:dispatch-ambiguous:$(key "$RUN" dispatch critic | cut -c1-12)"
 for point in "before-intent:send:$AMB" "after-intent:send:$AMB"; do
+  smoke_case "10-ambiguous-alarm-${point%%:*}" || continue
   new_case "ambiguous-alarm-${point%%:*}"
   CRASH=after-intent:dispatch:critic CRASH2="$point" campaign 10
   one_alarm "dispatch ambiguous, killed ${point%%:*}" "$AMB"
@@ -875,6 +907,7 @@ for point in "before-intent:send:$AMB" "after-intent:send:$AMB"; do
 done
 OVERDUE="alarm:overdue:$(key "$RUN" owner lanes | cut -c1-12)"
 for point in "before-intent:send:$OVERDUE" "after-intent:send:$OVERDUE"; do
+  smoke_case "10-overdue-alarm-${point%%:*}" || continue
   new_case "overdue-alarm-${point%%:*}"
   STALL=8 DEADLINE=2026-09-18T14:00:00Z CRASH="$point" campaign 20
   one_alarm "owner overdue, killed ${point%%:*}" "$OVERDUE"
@@ -1012,6 +1045,7 @@ for variant in budgeted spent; do
            dispatch-failed:dispatch-failed gate-refused:gate-refused overdue:overdue released:released \
            no-authority:no-authority foreign-finish:foreign-finish finish-unconfirmed:finish-unconfirmed \
            malformed-verdict:step-outcome step-error:step-error; do
+    smoke_case "11-$variant-${t%%:*}" || continue
     name="${t%%:*}"
     want="${t##*:}"
     # With no budget left the root send is refused before it can ever exhaust
@@ -1039,6 +1073,7 @@ done
 unset variant name t want
 
 
+if smoke_case 12-barrier-refusal; then
 # --- a barrier refusal must reach the OWNER ------------------------
 # Run acme-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier answered
 # `invalid: ["journeys/scope-dispositions.json"]` on the 19:51:35Z fire -- the
@@ -1088,6 +1123,8 @@ grep -q 'controller/barrier-lanes.json' "$R/controller/brief-lanes.md" \
 grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
   || fail "#2047: a barrier that is only waiting for markers must not shout like one refusing content"
 
+fi
+if smoke_case 13-owner-token-reissue; then
 # --- a re-minted owner token must be re-ISSUED to the owner --------
 # Same run. The controller's fires stopped for 40 minutes (19:51:19Z ->
 # 20:31:42Z, wrapper/fires.ndjson) while the gate's coordinator lease is 900 s
@@ -1159,6 +1196,8 @@ jq -se '[.[] | select(.kind=="owner" and .state=="intent" and (.detail.tokenReis
   || fail "#2046: a finished run re-offered an owner step it has no use for"
 
 
+fi
+if smoke_case 14-synthesis-barrier; then
 # --- round 2, finding 3: the SYNTHESIS barrier's refusal wakes the owner too ---
 # The lanes fix left the identical blind spot on the sibling path:
 # when the synthesis barrier is not ready the branch published the report and
@@ -1201,6 +1240,8 @@ jq -se '[.[] | select(.kind=="owner" and .slot=="synthesis" and .state=="enqueue
   || fail "#2047(synthesis): the owner was not woken for the step only it can repair: $STEP_OUT"
 unset SMOKE_VISUAL_DISPOSITIONS
 
+fi
+if smoke_case 15-reissue-survives-crash; then
 # --- round 2, finding 1: the re-issue survives a kill at the claim record -----
 # The claim record is fsynced BEFORE anything else and the gate latches the
 # wake, so an edge trigger on reconcile_claims' poll-reclaim branch was not
@@ -1242,6 +1283,8 @@ jq -se '[.[] | select(.kind=="owner" and .state=="intent" and (.detail.tokenReis
   "$C/out/journal.ndjson" >/dev/null \
   || fail "#2046(crash): a later fire re-offered the step again after the transition completed"
 
+fi
+if smoke_case 16-ack-outlives-brief; then
 # --- round 2, finding 2: an ack never outlives the brief it acknowledged -----
 # owner_step re-offers a wake only while `brief-<step>.ack` is ABSENT, so a
 # brief rewritten under a new token inherited the previous brief's ack and was
@@ -1264,6 +1307,8 @@ step_ok "$(tick_time 4)"
 [ "$(jq -r '.ownerWake.step // ""' <<<"$STEP_OUT")" = lanes ] \
   || fail "#2046(ack): an un-acked re-offered brief was not re-offered: $STEP_OUT"
 
+fi
+if smoke_case 17-router-cites; then
 # --- round 2, finding 4: the router doc's file:line citations are real -------
 # CLAUDE.md requires file:line for a cross-module behavioural claim, and a line
 # number that drifts is worse than none: it reads as evidence. This fails the
@@ -1290,6 +1335,8 @@ cite smoke-campaign-controller.py 1524 'os.unlink("brief-{}.ack"'
 cite smoke-campaign-controller.py 1529 'if c.get("wake"):'
 
 
+fi
+if smoke_case 18-refusal-after-ack; then
 # --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
 # Round 1 covered first arrival -- already refusing when the brief was written.
 # The likelier order, and the one run pr2055 actually took, is the reverse: the
@@ -1350,6 +1397,8 @@ jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .state=="intent"
         and (.detail.refusalChanged == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
   || fail "#2047(after-ack): a cleared refusal, or the owner's own progress, re-offered the step"
 
+fi
+if smoke_case 19-backfill; then
 # --- round 3, finding 2: the backfill reads the run tree, not the gate -------
 # A poll that re-minted BEFORE this file's upgrade leaves an obligation with no
 # `briefedToken` -- but `controller/wake.json` on disk still names the retired
@@ -1431,6 +1480,8 @@ jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .detail.briefedToken
   "$C/out/journal.ndjson" >/dev/null \
   || fail "#2046(backfill): an agreeing run tree was not backfilled, so it is re-read every fire"
 
+fi
+if smoke_case 20-pair-identity; then
 # --- a clean GO synthesis with no pair identity is caught at lanes --
 # Run pr2088's real shape: the owner never runs smoke-pair-identity.sh (neither
 # identity.json nor identity-checks.ndjson), every lane passes, the challenger
@@ -1505,6 +1556,7 @@ done
 [ ! -e "$R/controller/barrier-lanes.json" ] \
   || fail "#2092: the lanes refusal was left published after the phase passed"
 
+fi
 # --- the challenger deadline ends a run from EVERY phase ------------
 # Every negative below is paired with a positive that only happens if the code
 # under test ran: a wake or a wait decision BEFORE the deadline proves the run
@@ -1535,6 +1587,7 @@ phase_waited() { # label step at: on fire <at> -- before the deadline, with the 
 #    before the deadline; the first fire past it validates BLOCKED, the next
 #    one (its verdict post receipted) finishes -- two fires, as the issue's
 #    correction observed -- and nothing is posted or woken for a dead run.
+if smoke_case 21-t2093-no-contract; then
 new_case t2093-no-contract
 NO_CONTRACT=1 DEADLINE="$DL" campaign 6
 timed_out "#2093(no contract)"
@@ -1650,6 +1703,8 @@ assert_once "#2093(unpredicted disposition)"
 #     `finish`, the timeout is NOT recorded failed_terminal, ONE operator alarm
 #     however many fires it lasts, and the timeout is retried -- so when the
 #     mount recovers, the next fire times out through challenger-timeout.
+fi
+if smoke_case 21-t2093-gate-blind; then
 new_case t2093-gate-blind
 claim "$DL"; wake_json
 blind_fire() { # tick
@@ -1760,7 +1815,9 @@ timed_out "#2093(intake unsettled)"
 # f) phase-dispatch: lanes evidence is complete but the lanes owner never
 #    settles. The old sites were all inside phases this return sits above.
 #    STALL=1 lands the markers a tick after the lanes owner is dispatched.
+fi
 DL=2026-09-18T10:45:00Z
+if smoke_case 21-t2093-unsettled; then
 new_case t2093-lanes-unsettled
 OWNER_DISPATCH=1 SETTLE=intake NO_CHALLENGER=1 STALL=1 DEADLINE="$DL" campaign 7
 phase_waited "#2093(lanes unsettled)" lanes 2026-09-18T10:40:00Z
@@ -1775,6 +1832,7 @@ timed_out "#2093(preliminary unsettled)"
 [ -e "$R/coordinator/preliminary.md" ] || fail "#2093(g): precondition -- the preliminary exists"
 unset STALL
 
+fi
 # --- PR #1066 closing review: "could not look" never concludes a run ----------
 # One fire where the controller cannot see what is on disk must never become a
 # verdict. Every case proves the run was briefed and really sat where it says
@@ -1821,6 +1879,7 @@ certified_go() { # label: the run, once visible again, certifies GO through fini
 #     the controller wrote into and cannot find is blindness, never "not filed".
 #     main certifies GO; dcfbb93f published BLOCKED "no disposition by 10:55".
 DL=2026-09-18T10:55:00Z
+if smoke_case 22-blind-blips; then
 new_case blind-blip-after-deadline
 claim "$DL"; wake_json
 ticks 0 5
@@ -1917,7 +1976,9 @@ fi
 #      and cannot find is absent, not blind -- its deadline had already passed
 #      at the first fire, so it times out as before. Reading every missing
 #      directory as blindness would hold this run forever.
+fi
 DL=2026-09-18T10:25:00Z
+if smoke_case 23-absent-lease-fake; then
 new_case absent-never-briefed
 claim "$DL"; wake_json
 fire_at 3 --poll-json "$C/wake.json"
@@ -1959,6 +2020,8 @@ SMOKE_GATE_CLAIMANT=controller python3 "$FAKES" gate challenger-timeout "$RUN" "
 #     re-anchored deadline. Every other case's claim deadline is already past
 #     on that clock, so the fake answers `deadline-passed` there and the
 #     provisional deadline stands, silently.
+fi
+if smoke_case 24-challenger-start; then
 new_case challenger-start-at-root
 C1_DL="$(date -u -d "@$(( $(date -u +%s) + 1800 ))" +'%Y-%m-%dT%H:%M:%SZ')"
 claim "$C1_DL"; wake_json
@@ -2002,7 +2065,9 @@ certified_go c2
 #     10:20, does not land; on the next fire, past the 10:25 deadline, the
 #     gate is blind -- and the root goes out anyway, leaving the run to the
 #     timeout path.
+fi
 DL=2026-09-18T10:25:00Z
+if smoke_case 25-challenger-start-blind; then
 new_case challenger-start-blind-past-deadline
 jq -cn '{"gate:challenger-start":["refuse-code:deadline-passed","refuse-code:lease-unavailable"],"enqueue":["fail-before"]}' \
   >"$C/fake/faults.json"
@@ -2017,4 +2082,6 @@ ticks 0 3
 [ "$(jr '[.[] | select(.kind=="send" and .slot=="root" and .state=="enqueued") | .at] | first')" = '"2026-09-18T10:30:00Z"' ] \
   || fail "c3: past the deadline the root goes out despite a blind gate: $(jr '[.[]|select(.kind=="send" and .slot=="root")|{at,state}]')"
 
+fi
+smoke_cases_done
 echo "smoke campaign controller live tests passed"

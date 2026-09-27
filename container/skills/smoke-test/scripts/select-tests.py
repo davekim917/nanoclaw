@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Pick the shell suites a change can break, and optionally run them.
 
-  select-tests.py [--base <ref>] [--all] [--run [-j N]] [--explain] [<changed-path>...]
+  select-tests.py [--base <ref>] [--all] [--run [-j N] [--shards N]] [--explain] [<changed-path>...]
 
 With no paths, the change is everything that differs from the merge base with
 --base (default origin/main): committed, staged, unstaged and untracked.
 Prints one repo-relative suite per line (the *.test.sh the skill-shell gate,
 container/skill-shell-tests.test.ts, runs), or with --run executes them the
-way that gate does and exits non-zero if any fails.
+way that gate does and exits non-zero if any fails. A suite that marks its
+cases (smoke-case.sh) runs as --shards processes that split its cases between
+them, unless SMOKE_CASE picks cases.
 
 A suite is selected when it reaches a changed file through a chain of name
 references. A file references another when its code (whole-line comments
@@ -47,6 +49,7 @@ WORD = r"(?<![A-Za-z0-9_]){}(?![A-Za-z0-9_])"
 EXCLUDED_MARK = "relPath: '"
 DEFAULT_TIMEOUT_S = 400
 SLOW_MARK = ".test.sh': "
+CASES_LIB = "smoke-case.sh"
 
 
 def git(root, *args, check=True):
@@ -245,15 +248,30 @@ def suite_env(home):
     return env
 
 
-def run_one(repo, suite, logdir):
+def run_one(repo, suite, shard, logdir):
     budget = repo.budgets.get(suite, DEFAULT_TIMEOUT_S)
-    log = os.path.join(logdir, suite.replace("/", "__") + ".log")
+    label = suite if shard is None else "{} [{}]".format(suite, shard)
+    log = os.path.join(logdir, label.replace("/", "__").replace(" [", ".").replace("]", "") + ".log")
     with tempfile.TemporaryDirectory(prefix="select-tests-home-") as home, open(log, "w") as out:
+        env = suite_env(home)
+        if shard is not None:
+            env["SMOKE_SHARD"] = shard
         start = time.monotonic()
         rc = subprocess.run(["timeout", "-s", "KILL", "{}s".format(budget), "bash", os.path.join(repo.root, suite)],
-                            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                            env=suite_env(home)).returncode
-    return suite, rc, time.monotonic() - start, log
+                            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, env=env).returncode
+    return label, rc, time.monotonic() - start, log
+
+
+def jobs_for(repo, suites, shards):
+    """One job per suite; a suite that marks its cases (smoke-case.sh) is split
+    into `shards` processes that together run each case once."""
+    out = []
+    for s in suites:
+        if shards > 1 and not os.environ.get("SMOKE_CASE") and CASES_LIB in repo.code(s):
+            out += [(s, "{}/{}".format(k, shards)) for k in range(1, shards + 1)]
+        else:
+            out.append((s, None))
+    return out
 
 
 def main():
@@ -263,6 +281,7 @@ def main():
     p.add_argument("--all", action="store_true", help="every suite, whatever changed")
     p.add_argument("--run", action="store_true", help="run the selected suites")
     p.add_argument("-j", "--jobs", type=int, default=2)
+    p.add_argument("--shards", type=int, default=4, help="processes per suite that marks its cases")
     p.add_argument("--explain", action="store_true", help="print why each suite was selected, to stderr")
     a = p.parse_args()
     root = git(HERE, "rev-parse", "--show-toplevel").stdout.strip()
@@ -283,12 +302,13 @@ def main():
     logdir = tempfile.mkdtemp(prefix="select-tests-logs-")
     failed = 0
     with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
-        for fut in as_completed([pool.submit(run_one, repo, s, logdir) for s in suites]):
+        jobs = jobs_for(repo, suites, a.shards)
+        for fut in as_completed([pool.submit(run_one, repo, s, k, logdir) for s, k in jobs]):
             suite, rc, secs, log = fut.result()
             print("{} {:6.1f}s {}{}".format("PASS" if rc == 0 else "FAIL", secs, suite,
                                             "" if rc == 0 else "  (log: {})".format(log)), flush=True)
             failed += rc != 0
-    print("select-tests: {} suite(s), {} failed; logs in {}".format(len(suites), failed, logdir))
+    print("select-tests: {} suite(s) in {} job(s), {} failed; logs in {}".format(len(suites), len(jobs), failed, logdir))
     return 1 if failed else 0
 
 

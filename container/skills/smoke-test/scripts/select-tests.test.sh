@@ -76,6 +76,15 @@ put "$S/select-tests.test.sh" <<<'python3 "$(dirname "$0")/select-tests.py" --he
 put "$S/reads-gate.test.sh" <<<'grep -q relPath "$(dirname "$0")/../../../skill-shell-tests.test.ts"'
 mkdir -p "$R/$S"
 cp "$SCRIPT_DIR/select-tests.py" "$R/$S/select-tests.py"
+cp "$SCRIPT_DIR/smoke-case.sh" "$R/$S/smoke-case.sh"
+cat >"$R/$S/cased.test.sh" <<'EOF'
+. "$(dirname "$0")/smoke-case.sh"
+for c in a b c; do
+  smoke_case "$c" || continue
+  echo "$c" >>"$CASE_OUT"
+done
+smoke_cases_done
+EOF
 git -C "$R" add -A && git -C "$R" -c user.email=t@example.com -c user.name=t commit -qm base
 
 SEL="$R/$S/select-tests.py"
@@ -131,6 +140,17 @@ else
   grep -q "FAIL .*fails.test.sh" "$T/run.out" && ok "--run reports a failing suite and exits non-zero" ||
     fail "--run failure output: $(cat "$T/run.out")"
 fi
+
+CASE_OUT="$T/cases.out" python3 "$SEL" --run -j 3 --shards 3 "$S/cased.test.sh" >"$T/run.out" 2>&1
+if [ "$(grep -c "PASS .*cased.test.sh \[[1-3]/3\]" "$T/run.out")" = 3 ] && [ "$(sort "$T/cases.out" | tr '\n' ' ')" = "a b c " ]; then
+  ok "--run splits a suite that marks its cases into shards that run each case once"
+else
+  fail "sharded run: $(cat "$T/run.out") cases: $(cat "$T/cases.out")"
+fi
+: >"$T/cases.out"
+SMOKE_CASE=b CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/cased.test.sh" >"$T/run.out" 2>&1
+[ "$(grep -c "PASS" "$T/run.out")" = 1 ] && [ "$(cat "$T/cases.out")" = b ] &&
+  ok "SMOKE_CASE runs the picked cases in one process, unsharded" || fail "SMOKE_CASE run: $(cat "$T/run.out")"
 
 [ "$FAILED" = 0 ] || { echo "select-tests tests FAILED" >&2; exit 1; }
 echo "select-tests tests passed"

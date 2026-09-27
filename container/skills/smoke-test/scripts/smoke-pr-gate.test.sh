@@ -7,6 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/smoke-case.sh"
 GATE="$SCRIPT_DIR/smoke-pr-gate.sh"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 LEGACY_GATE_BASE=672f03a309a4f11f1ad194900d83a710c55765d6
@@ -331,7 +332,7 @@ reset_stubs() {
         STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
         STUB_WAIT_CLOCK_FILE STUB_WAIT_CLOCK_COUNT STUB_WAIT_SLEEP_LOG \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
-        SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS SMOKE_JOURNEYS_CATALOGUE 2>/dev/null || true
+        SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS SMOKE_JOURNEYS_CATALOGUE SMOKE_GATE_FACTS_STUCK_SECONDS 2>/dev/null || true
 }
 
 fresh_state() {
@@ -384,6 +385,7 @@ expire_lease() { # <lease-file>; no writer is live in these test fixtures
   mv "$tmp" "$lease_file"
 }
 
+if smoke_case 1-misconfig; then
 # --- 1. Misconfig: fail-closed wake, throttled on the immediate next poll --
 fresh_state
 unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE \
@@ -450,12 +452,17 @@ web/ ../api/ ["SMOKE_GATE_BACKEND_PREFIX"]
 src/ src/ ["SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX"]
 CASES
 
+fi
 # --- Common config for every scenario below ---------------------------------
 export SMOKE_GATE_REPO=org/repo
 export SMOKE_GATE_BACKEND_SERVICE=srv-backend-base
 export SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
+PARENT_SHA="$(sha e)"
+FREEZE_SHA="$(sha f)"
+BASE_SHA="$(sha a)"
 
+if smoke_case 2-4a-settle; then
 # --- 2. No labeled open PRs: quiet idle, no wake ----------------------------
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
@@ -781,6 +788,8 @@ for bad in 'http{pr}://api.example.test' '{branch}https://api.example.test'; do
 done
 unset STUB_CURL_LOG
 
+fi
+if smoke_case 5-5b-freeze-range; then
 # --- 5. Freeze-PR: CI checked on the PARENT sha, not the marker head; range
 # facts come from campaignRange = validated-GO baseline ... target.
 # A freeze target sits ON the tracked branch, so the old `compare/develop...
@@ -793,9 +802,6 @@ unset STUB_CURL_LOG
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
-PARENT_SHA="$(sha e)"
-FREEZE_SHA="$(sha f)"
-BASE_SHA="$(sha a)"
 export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 export STUB_PR_VIEW="{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
@@ -933,6 +939,7 @@ bash "$GATE" poll | jq -e '
 ' >/dev/null
 export STUB_COMPARE_EXIT=0
 
+fi
 # --- 5c..5j share one ready freeze and vary only the ledger / the compare ----
 range_case() { # <label> <jq-assertion over `check`>; expects fixture env already set
   local out
@@ -944,6 +951,7 @@ UNKNOWN_RANGE='.campaignRange.determinable == false and .migrationsInRange == nu
   .migrationsDeterminable == false and .migrationsTouched == true and
   .campaignSize == "full" and .fetchOk == true and .settled == true'
 
+if smoke_case 5c-5i-baseline; then
 # --- 5c. Producer -> reader: the receipt the REAL `finish` writes validates,
 # and a later BLOCKED on the very same target/PR does not unseat that GO
 # (BLOCKED asserts nothing about the build). NO_GO / BLOCKED on a NEWER target
@@ -1179,6 +1187,8 @@ range_case 5i "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
   .campaignRange.baselineResolved == false and (.campaignRange.reason | test(\"could not be fetched\"))"
 export STUB_BINDING_EXIT=0
 
+fi
+if smoke_case 5j-range-pin; then
 # --- 5j. The WHOLE range result is pinned at the first settled poll of a
 # freeze head, and every later poll / check / recovery wake of that head reads
 # the pin instead of recomputing. RANGE_VIEW is every range-derived fact.
@@ -1557,6 +1567,7 @@ for T5J8_KIND in dangling livelink directory; do
 done
 unset -f recover_run pin_file
 
+fi
 # --- 5k. Journey selection rides campaignRange (smoke-journeys.py) ----------
 # The catalogue is the fictional example under references/. Selection consumes
 # ONLY the baseline...target file list, is absent when the install has no
@@ -1577,6 +1588,7 @@ journeys_fixture() { # <compare-files-json>; one ready freeze (PR 13) with a val
   export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
 }
 BACKEND_ONLY='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/migrations/0042_loan_period_options.sql"},{"filename":"api/src/reports/export.ts"},{"filename":"docs/internal/changelog.md"}]}'
+if smoke_case 5k-journeys; then
 
 # No catalogue: byte-identical. Env unset (default path absent) and env naming
 # an absent file give the same bytes, with no `journeys` key; and adopting a
@@ -1918,6 +1930,8 @@ journeys_fixture "$BACKEND_ONLY"
 export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'
 bash "$GATE" check 13 | jq -e '.isFreezePr == false and (has("journeys") | not)' >/dev/null ||
   { echo "5k: an ordinary PR grew a journeys key" >&2; exit 1; }
+fi
+if smoke_case 5l-admission; then
 # --- 5l. ADMISSION: a manual `claim` of a freeze head pins exactly as `poll`
 # does (pin_freeze_head), BEFORE it takes ownership. `check` never pins, so
 # check-then-claim used to admit a freeze with both pin paths absent — and the
@@ -2092,6 +2106,8 @@ unset -f pin_file
 unset SMOKE_JOURNEYS_CATALOGUE
 unset -f range_case journeys_fixture jpin_file
 
+fi
+if smoke_case 6-7b-lifecycle; then
 # --- 6. Migrations refusal: never settles; one throttled alarm wake --------
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
@@ -2220,6 +2236,7 @@ bash "$GATE" claim run-rival 55 "$DUP_SHA" | jq -e '
 ' >/dev/null
 unset SMOKE_GATE_PROGRESS_STALE_SECONDS
 
+fi
 # --- 7c. pr_run_stalled: a claimed run whose PR stopped settling is not
 # invisible. The traced hole: the challenger files its disposition, the
 # coordinator dies before synthesis, progress goes stale, and the preview is
@@ -2248,6 +2265,7 @@ ownership_digest() { # <pr> <run>: state owner + lease + authority, for "nothing
   { jq -c '[.activeRunId,.activeLeaseOwner,.activeStartedAt,.challengerDeadline]' "$STATE_DIR/pr-$1-state.json"
     cat "$SMOKE_GATE_LEASE_DIR/lease-$2.json" "$SMOKE_GATE_LEASE_DIR/pr-$1-authority.json"; } | sha256sum
 }
+if smoke_case 7c-stalled; then
 
 STALL_SHA="$(sha 6)"
 stalled_fixture 61 "$STALL_SHA"
@@ -2422,6 +2440,8 @@ bash "$GATE" release run-stall-done owner-done >/dev/null
 stall_clear
 unset SMOKE_GATE_RUN_ROOT
 
+fi
+if smoke_case 7d-12-finish; then
 # --- 7d. challenger-timeout ends a run that never left intake ------
 # The controller now times a run out while it is still in intake -- no
 # completion contract, possibly no run directory at all (run pr2075). That
@@ -2696,6 +2716,8 @@ bash "$GATE" check 55 | jq -e '
   .migrationsTouched == true and .frontendTouched == true
 ' >/dev/null
 
+fi
+if smoke_case 12-19-handoff; then
 # --- 12. Develop-freeze-handoff: finish on a FREEZE pr writes hold/publish/
 # ledger keyed to the TARGET develop sha (the marker commit's parent), not
 # the freeze marker sha itself.
@@ -2912,6 +2934,8 @@ jq -e '.ok == false and (.retryable | not) and (.error | startswith("gate_lock_b
 # The slot survived the transient miss.
 jq -e '.activeRunId == "run-busy"' "$STATE_DIR/pr-89-state.json" >/dev/null
 
+fi
+if smoke_case 20-26-crash-safe; then
 # --- 20. finish is crash-safe: artifacts BEFORE the slot is cleared ---------
 # Clearing the slot first made finish fail OPEN and permanently: a container
 # death between the halves recorded NO_GO per-PR while the promotion hold was
@@ -3213,6 +3237,8 @@ bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO | jq -e '.ok == true and .
 tail -1 "$APPFAIL_LEDGER" | jq -e '.runId == "run-appfail"' >/dev/null
 [ "$(wc -l < "$APPFAIL_LEDGER")" -eq 1 ]
 
+fi
+if smoke_case 27-30-leases-recovery; then
 # --- 27. one shared PR cannot have two live run ids across private roots -----
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
@@ -3673,6 +3699,8 @@ jq -e --arg run "$ADOPT_RUN" '.data.trigger == "pr_build_settled" and .data.runI
 [ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ]
 unset SMOKE_GATE_RUN_ROOT
 
+fi
+if smoke_case invariant3; then
 # --- INVARIANT 3: num_env rejects the classes it was built to stop --------
 # Mirror of the develop suite's case-53 extension. "All digits" admitted three
 # shapes, each a distinct silent failure: a leading zero is octal (or fatal) in
@@ -3700,6 +3728,8 @@ export SMOKE_GATE_REPO=org/repo
 # Campaign-size classification (mechanical, install-rules-driven, fail-closed)
 # =============================================================================
 
+fi
+if smoke_case sizing-globs-policy; then
 # --- 23. No rules file at all: standard, backward compatible ---------------
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
@@ -5178,6 +5208,8 @@ echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$SHAPE_OK" | jq -e '.campaignSi
 echo '{"full":["backend/**"],"lightAllowed":["frontend/**"],"lightDeny":[]}' > "$SHAPE_OK"
 echo '["backend/x.ts"]' | python3 "$CLASSIFY" "$SHAPE_OK" | jq -e '.campaignSize == "full"' >/dev/null
 
+fi
+if smoke_case task-scoped-retained-binding; then
 # --- Task-scoped certification lease: claim/progress/release --------------
 # A certification, re-verification or evidence-recovery run has no PR — this
 # is the lifecycle smoke-run-scaffold.sh's begin_active_run_fence now accepts
@@ -5890,6 +5922,8 @@ SMOKE_GATE_STATE_DIR="$LEGACY_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_LEASE" \
 jq -e --arg sha "$CROSS_SHA_B" '.deploySha == $sha and .terminal == null' \
   "$LEGACY_LEASE/task-binding-run-legacy-lost.json" >/dev/null
 
+fi
+if smoke_case 64-preview-waiter; then
 # --- 64. PR preview waiter: pinned, bounded, and strictly read-only --------
 # A preview waiter is deliberately NOT the develop wait-settled loop copied
 # over: a PR can close or move while a caller waits. It must return those
@@ -6020,4 +6054,6 @@ for WAIT_BAD_FIELD in pr head interval max; do
   jq -e '.ok == false' "$STATE_DIR/bad-$WAIT_BAD_FIELD.json" >/dev/null
 done
 
+fi
+smoke_cases_done
 echo "smoke pr gate tests passed"

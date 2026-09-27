@@ -2854,3 +2854,5 @@ Each iteration, run only the shell suites your change can break:
 `python3 container/skills/smoke-test/scripts/select-tests.py --run` (from
 the repo checkout; `--explain` says why each was picked). Run the full set
 once before merge: `select-tests.py --all --run`.
+A long suite marks its cases (`scripts/smoke-case.sh`): `SMOKE_CASE='<glob>'
+bash <suite>` reruns only those, and `--run` splits it across `--shards` processes.
