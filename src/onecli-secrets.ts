@@ -1,31 +1,9 @@
 /**
- * Per-group OneCLI secret scoping.
+ * Per-group OneCLI secret scoping: `container.json`'s `onecliSecrets` (names or UUIDs) is resolved and the agent's
+ * grants reconciled to exactly that set on every spawn. Fail-closed: an unresolvable name throws.
  *
- * Declarative model: each group's `container.json` may carry an
- * `onecliSecrets: string[]` field listing the secrets it should have
- * access to (by NAME or UUID). On every container spawn, the host
- * resolves names → UUIDs and reconciles the agent's OneCLI secret grants
- * so it gets exactly that set — no more, no less.
- *
- * Closes the parity gap surfaced by the earlier audit: previously
- * `ensureAgent` left every new agent in `selective` mode with NOTHING
- * assigned (401 on credentialed calls), and a few operator-flipped
- * `mode all` agents could cross-tenant grab any secret whose host
- * pattern matched the URL — e.g. `helper-codex` hitting example-retail's
- * Atlassian endpoint would attach example-retail's Atlassian secret.
- *
- * Fail-closed: any declared name that doesn't resolve to a vault
- * secret throws — sweep retries and the operator gets a loud signal,
- * matching the codebase's posture throughout (spawn failures, approval
- * errors, etc.).
- *
- * SDK-bypass rationale: the `@onecli-sh/sdk@0.5.0` only exposes
- * `getGatewaySkill`, `getContainerConfig`, `applyContainerConfig`,
- * `createAgent`, `ensureAgent`, `provisionUser`, and
- * `configureManualApproval`. OneCLI v1.44 replaced the legacy agent secret
- * mode/assignment commands with grants, so reads and mutations go straight
- * to the gateway API. List operations also bypass the CLI because its list
- * output caps at 20 rows with no pagination.
+ * Uses the gateway API directly: the SDK has no list/grant operations, and the CLI's list output caps at 20 rows
+ * with no pagination.
  */
 import { execFile } from 'child_process';
 
@@ -68,20 +46,10 @@ export interface EnsureOnecliAgentResult extends EnsureOnecliAgentInput {
   created: boolean;
 }
 
-/**
- * In-memory cache mapping agent identifier → UUID. Cuts the per-spawn
- * `onecli agents list` round-trip down to one for the lifetime of the
- * host process; cache miss triggers a refresh.
- *
- * Cleared by `__resetCachesForTest` so each test gets a clean slate.
- */
+/** Agent identifier → UUID for the host's lifetime; a miss refreshes. */
 const identifierToUuid = new Map<string, string>();
 
-/**
- * UUID format — matches the `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
- * shape OneCLI emits. Anything that doesn't match is treated as a
- * secret NAME requiring lookup.
- */
+/** Anything not UUID-shaped is a secret NAME needing lookup. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CURL_TIMEOUT_ARGS = ['--connect-timeout', '2', '--max-time', '10'] as const;
 
@@ -90,30 +58,12 @@ function isUuid(s: string): boolean {
 }
 
 /**
- * Promise-wrapped `execFile('curl', …)`.
+ * Promise-wrapped `execFile('curl', …)` so gateway round trips never block the event loop; `-f` keeps non-2xx a
+ * rejection. Not `fetch`: host `fetch` must never traverse the OneCLI gateway proxy.
  *
- * The whole point: every gateway round trip yields
- * to the event loop instead of parking it. `curl -f` still turns a non-2xx
- * response into a rejection, so callers keep their fail-closed behavior
- * unchanged — only the blocking changes, not the outcomes.
- *
- * `curl` rather than `fetch`: host `fetch` must never traverse the OneCLI
- * gateway proxy (`NODE_USE_ENV_PROXY` was stripped from the daemon env after
- * it broke every spawn on 2026-09-02), and curl's behavior here is proven.
- *
- * TWO THINGS NEVER CROSS ARGV, and both are why the callers below pass a
- * `label` instead of building their own error text:
- *
- *   - the gateway API key. It goes on stdin as a curl config file
- *     (`-K -`, `src/onecli-curl.ts`), so it is not in `/proc/<pid>/cmdline`.
- *   - `execFile`'s error. Node composes its `.message` as
- *     `Command failed: <the whole argv>`, which is how a key in argv reaches
- *     every log line and DB column a caller writes. Failures are rethrown as a
- *     sanitized `OnecliCurlError` naming the operation and curl's exit code.
- *
- * The cost of (2) is the HTTP status: `-f` collapses every non-2xx into exit
- * 22, so a failure reads "HTTP error response" rather than "500". The gateway's
- * own log has the status; a credential in this host's log does not go away.
+ * Neither the API key nor execFile's error (whose message embeds the whole argv) may reach argv or a log: the key
+ * goes on stdin as a curl config (`-K -`), and failures are rethrown as a sanitized `OnecliCurlError`. The cost is
+ * that every non-2xx reads as curl exit 22, not its status.
  */
 function curl(args: string[], label: string): Promise<string> {
   const auth = onecliAuthConfigLine();
@@ -126,8 +76,7 @@ function curl(args: string[], label: string): Promise<string> {
       resolve(typeof stdout === 'string' ? stdout : String(stdout));
     });
     if (auth) {
-      // An unhandled 'error' on this stream is an uncaught exception; the
-      // execFile callback reports the failure either way.
+      // An unhandled stream 'error' is an uncaught exception; the execFile callback reports the failure anyway.
       child.stdin?.on('error', () => undefined);
       child.stdin?.end(auth);
     }
@@ -135,44 +84,17 @@ function curl(args: string[], label: string): Promise<string> {
 }
 
 /**
- * Cached vault secrets listing.
- *
- * `/api/secrets?limit=10000` used to run on EVERY spawn (the largest single
- * contributor to host event-loop stalls).
- *
- * The guarantee is one-directional, and the direction matters:
- *
- *   - A cached MISS is never final. `resolveSecretUuids` force-refreshes and
- *     re-resolves before it throws, so the cache can never turn a name that
- *     exists in the vault into a spawn refusal.
- *   - A cached HIT is only as fresh as the TTL. If an operator RENAMES a vault
- *     secret, a declaration carrying the old name keeps resolving — to that
- *     same secret's unchanged UUID — until the entry expires, and only then
- *     starts failing closed. Revalidating positive hits means re-listing on
- *     every spawn, which is the stall this PR exists to remove; the window is
- *     bounded by the TTL below instead. Nothing widens: the UUID handed back is
- *     the one the operator's own declaration resolved to on the previous spawn.
- *
- * Cleared by `__resetCachesForTest`.
+ * Vault secrets listing cache. A cached MISS is never final (`resolveSecretUuids` force-refreshes before
+ * throwing). A cached HIT lasts the TTL: a renamed secret keeps resolving under its old name to the same UUID
+ * until expiry. Nothing widens.
  */
 const SECRETS_CACHE_TTL_MS = 60 * 1000;
 let secretsCache: { at: number; secrets: OnecliSecret[] } | null = null;
 
 /**
- * One in-flight listing per resource, shared by every caller that arrives
- * while it is running.
- *
- * A host restart wakes many agent groups at once, and the per-identity lock
- * does not serialize them because they hold different identities. Without
- * this, each one sees the same empty cache and starts its own
- * `?limit=10000` listing — with a 24-container admission limit, dozens of
- * heavyweight gateway requests at once, which can hit the 10 s curl ceiling
- * and defer spawns that would otherwise have succeeded.
- *
- * Rejection is shared too, and the entry is cleared either way, so a failed
- * listing fails every waiter that was already committed to it and the next
- * caller retries from scratch. That preserves fail-closed: no caller ever
- * proceeds on a listing that did not arrive.
+ * One shared in-flight listing per resource: a host restart wakes many groups with different identities at once,
+ * and parallel `?limit=10000` listings can hit the curl timeout. A rejection fails every waiter and clears the
+ * entry, so no caller proceeds on a listing that did not arrive.
  */
 const inFlightListings = new Map<'agents' | 'secrets', Promise<unknown[]>>();
 
@@ -187,21 +109,14 @@ function listViaApiOnce(resource: 'agents' | 'secrets'): Promise<unknown[]> {
 }
 
 /**
- * Serializes the read-modify-write grant reconcile per OneCLI identity.
- *
- * `execFileSync` used to make resolve → grants-read → mutate atomic with
- * respect to every other spawn for free. Awaiting reintroduces interleaving,
- * and two concurrent spawns of the same identity whose declarations differ
- * (an operator edits `container.json` mid-flight) could each read the same
- * pre-state and write the UNION of both sets — a silently broadened grant
- * list. Chaining per identity restores last-writer-wins.
+ * Serializes the read-modify-write grant reconcile per identity: two concurrent spawns with different
+ * declarations could otherwise each write the union of both sets.
  */
 const identityLocks = new Map<string, Promise<unknown>>();
 
 async function withIdentityLock<T>(identity: string, fn: () => Promise<T>): Promise<T> {
   const previous = identityLocks.get(identity) ?? Promise.resolve();
-  // Run regardless of whether the predecessor settled or threw — one spawn's
-  // failure must not wedge the next spawn of the same group.
+  // Run whether the predecessor settled or threw, so one failure cannot wedge the next spawn.
   const run = previous.then(fn, fn);
   const guarded = run.then(
     () => undefined,
@@ -211,30 +126,12 @@ async function withIdentityLock<T>(identity: string, fn: () => Promise<T>): Prom
   try {
     return await run;
   } finally {
-    // Drop the entry only when nothing queued behind us, so the map does not
-    // grow one entry per identity for the life of the host process.
+    // Drop only when nothing queued behind us.
     if (identityLocks.get(identity) === guarded) identityLocks.delete(identity);
   }
 }
 
-/**
- * Fetch a FULL list (agents or secrets) from the OneCLI gateway API.
- *
- * Why not `onecli <resource> list`: the CLI hard-caps its output at 20 rows
- * with no pagination flag (verified against the gateway: `--limit` is ignored).
- * Once the vault holds >20 agents/secrets it silently drops the rest, which
- * fail-closes the lookups below for anything past the first page — the bug that
- * took primaries offline after the opencode rollout pushed the agent count to
- * 28. The SDK exposes no list op, so we hit the gateway API directly with a
- * high limit. Localhost gateway (ONECLI_URL), auth'd with the same key the SDK
- * uses; the API returns the full set (a bare array, or `{data:[...]}`).
- *
- * Runs asynchronously (promise-wrapped `execFile`). It used to be
- * `execFileSync`, purely so the resolve/apply call chain could stay sync; that
- * blocked the host event loop for the full round trip on EVERY container spawn.
- * `curl` is retained rather than `fetch` because host `fetch`
- * must never traverse the gateway proxy.
- */
+/** Full agents/secrets list from the gateway API (the CLI silently truncates at 20 rows, failing lookups closed). */
 async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-fsS', ...CURL_TIMEOUT_ARGS, `${base}/api/${resource}?limit=10000`];
@@ -245,11 +142,7 @@ async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
   return Array.isArray(data) ? data : [];
 }
 
-/**
- * Call the OneCLI gateway. `curl -f` turns every non-2xx response into a
- * rejected promise, preserving the fail-closed spawn behavior. No secret
- * values travel on this path; only agent and secret UUIDs are used in URLs.
- */
+/** `curl -f`: every non-2xx rejects. Only UUIDs travel in URLs, never secret values. */
 async function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): Promise<unknown> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-fsS', ...CURL_TIMEOUT_ARGS, '-X', method];
@@ -258,11 +151,7 @@ async function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): Pr
   return out.trim() ? (JSON.parse(out) as unknown) : undefined;
 }
 
-/**
- * Create an agent through the current versioned API while retaining the HTTP
- * status. A concurrent creator can legitimately win after our list read, so
- * callers must be able to distinguish that 409 from every other failure.
- */
+/** Keeps the HTTP status so callers can tell a create-race 409 from every other failure. */
 async function createAgentViaApi(input: EnsureOnecliAgentInput): Promise<{ status: number; body: unknown }> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-sS', ...CURL_TIMEOUT_ARGS, '-X', 'POST', '-H', 'Content-Type: application/json'];
@@ -320,32 +209,19 @@ async function listAgents(force = false): Promise<OnecliAgent[]> {
   return (await (force ? listViaApi('agents') : listViaApiOnce('agents'))) as OnecliAgent[];
 }
 
-/**
- * Read the vault secrets list, serving a fresh-enough cache when one exists.
- * `fromCache` tells the caller whether a miss is worth re-checking against the
- * gateway before failing the spawn.
- */
+/** `fromCache` tells the caller whether a miss is worth re-checking before failing the spawn. */
 async function loadSecrets(forceRefresh: boolean): Promise<{ secrets: OnecliSecret[]; fromCache: boolean }> {
   if (!forceRefresh && secretsCache && Date.now() - secretsCache.at < SECRETS_CACHE_TTL_MS) {
     return { secrets: secretsCache.secrets, fromCache: true };
   }
-  // A forced refresh deliberately does NOT join an in-flight listing. It runs
-  // only when a declaration missed against the cache, and its whole job is to
-  // answer "does this secret exist NOW" before refusing a spawn. Joining a
-  // listing that began before that question was asked could return data from
-  // before the secret was added, which would manufacture exactly the refusal
-  // this refresh exists to prevent.
+  // A forced refresh must NOT join an in-flight listing: one that began before the question could predate the
+  // secret and manufacture the refusal this refresh exists to prevent.
   const secrets = (await (forceRefresh ? listViaApi('secrets') : listViaApiOnce('secrets'))) as OnecliSecret[];
   secretsCache = { at: Date.now(), secrets };
   return { secrets, fromCache: false };
 }
 
-/**
- * `force` skips the shared in-flight listing. Used only after a create
- * returned 409, where the caller needs a listing that began AFTER the create
- * — an earlier one would not contain the agent and would turn a won race into
- * a spurious failure.
- */
+/** `force` skips the shared listing: after a 409, only a listing that began after the create contains the agent. */
 async function refreshAgentCache(options?: { force?: boolean }): Promise<void> {
   const agents = await listAgents(options?.force ?? false);
   const refreshed = new Map<string, string>();
@@ -366,21 +242,12 @@ async function refreshAgentCache(options?: { force?: boolean }): Promise<void> {
   for (const [identifier, uuid] of refreshed) identifierToUuid.set(identifier, uuid);
 }
 
-/**
- * Look up the UUID for an agent by its `identifier`. Refreshes the
- * cache on a miss — agents created via `ensureAgent` between cache
- * loads will be picked up on the first miss after their creation.
- *
- * Throws when the identifier doesn't exist after a fresh load (treats
- * a missing agent as a fail-closed condition rather than silently
- * proceeding without applying secrets).
- */
+/** Refreshes on a miss; throws (fail-closed) when the identifier is still absent. */
 async function resolveAgentUuid(identifier: string): Promise<string> {
   const cached = identifierToUuid.get(identifier);
   if (cached) return cached;
 
-  // Cache miss — refresh and try again. We replace the whole map so
-  // stale entries (agents renamed/deleted) get evicted.
+  // Replace the whole map so renamed/deleted agents are evicted.
   await refreshAgentCache();
   const refreshed = identifierToUuid.get(identifier);
   if (!refreshed) {
@@ -392,17 +259,8 @@ async function resolveAgentUuid(identifier: string): Promise<string> {
 }
 
 /**
- * Ensure a OneCLI agent exists without issuing a redundant create request on
- * every container spawn. The first cache miss refreshes the full agents list;
- * only a genuinely absent identifier is created.
- *
- * A 409 is the expected create race and counts as success only after a fresh
- * list confirms the agent. Every other response fails closed so the caller
- * cannot continue into an unscoped container configuration.
- *
- * Async — the spawn path awaits it rather than blocking the host
- * event loop for the gateway round trip. Serialized per identity so two
- * concurrent spawns of the same group cannot both take the create branch.
+ * Create the agent only when a fresh list lacks it. A 409 counts as success only after a fresh list confirms the
+ * agent; every other response fails closed. Serialized per identity.
  */
 export function ensureOnecliAgent(input: EnsureOnecliAgentInput): Promise<EnsureOnecliAgentResult> {
   return withIdentityLock(input.identifier, () => ensureOnecliAgentLocked(input));
@@ -436,25 +294,14 @@ async function ensureOnecliAgentLocked(input: EnsureOnecliAgentInput): Promise<E
   return { ...input, created: true };
 }
 
-/**
- * Resolve a list of declarations (names or UUIDs) to vault secret
- * UUIDs. Each declaration is either:
- *   - a UUID — passes through after a presence check
- *   - a NAME — looked up case-sensitively against `secrets list`
- *
- * Any unresolvable declaration throws — partial application would
- * leave the agent in an under-credentialed state without a clear
- * error signal.
- */
+/** Names (case-sensitive) or UUIDs (presence-checked) → UUIDs. Any unresolved declaration throws. */
 export async function resolveSecretUuids(declarations: string[]): Promise<string[]> {
   if (declarations.length === 0) return [];
 
   const first = await loadSecrets(false);
   let match = matchDeclarations(first.secrets, declarations);
 
-  // A miss against a cached listing is not yet a failure: the secret may have
-  // been added to the vault since the cache was filled. Re-read before
-  // refusing, so caching can never manufacture a spawn refusal.
+  // A miss against the cache may be a newly added secret: re-read before refusing.
   if (match.unresolved.length > 0 && first.fromCache) {
     const fresh = await loadSecrets(true);
     match = matchDeclarations(fresh.secrets, declarations);
@@ -501,18 +348,8 @@ function matchDeclarations(
 }
 
 /**
- * Apply a group's per-spawn OneCLI secret scoping. Does nothing when
- * `declarations` is empty or undefined. Async; callers in the spawn
- * path MUST await it (see the tripwire in `onecli-secrets.test.ts`).
- *
- * Steps when declarations are present:
- *   1. Resolve agent identifier → UUID (cached, with miss refresh).
- *   2. Resolve declared names/UUIDs → vault UUIDs (hard-fail on
- *      any unresolved).
- *   3. Read its current secret grants.
- *   4. Detach undeclared grants, then attach missing grants. Connection grants
- *      are deliberately untouched. OneCLI's grants-only model has no mutable
- *      all/selective mode.
+ * Reconcile the agent's secret grants to `declarations` (no-op when empty). Spawn callers MUST await it (tripwire
+ * in `onecli-secrets.test.ts`). Connection grants are left untouched.
  */
 export function applyOnecliSecrets(agentIdentifier: string, declarations: string[] | undefined): Promise<void> {
   if (!declarations || declarations.length === 0) return Promise.resolve();
@@ -528,8 +365,7 @@ async function applyOnecliSecretsLocked(agentIdentifier: string, declarations: s
   const toRemove = [...grantedSet].filter((secretUuid) => !declaredSet.has(secretUuid));
   const toAdd = [...declaredSet].filter((secretUuid) => !grantedSet.has(secretUuid));
 
-  // Remove excess access before adding missing access. If a request fails,
-  // spawn aborts instead of leaving a newly broadened partial configuration.
+  // Remove before adding: a failed request aborts the spawn instead of leaving a broadened partial state.
   for (const secretUuid of toRemove) {
     await requestViaApi(
       'DELETE',
@@ -553,17 +389,7 @@ async function applyOnecliSecretsLocked(agentIdentifier: string, declarations: s
   });
 }
 
-/**
- * Merge workgroup-level and per-group OneCLI secret declarations into a
- * single ordered, deduplicated list. Workgroup secrets come first (baseline);
- * per-group secrets are appended additively. Neither list can subtract from
- * the other — the merge is union-only.
- *
- * This implements the workgroup-baseline-∪-group-additive model from the
- * workgroup-scoped-data-layer design: workgroups.onecli_secrets provides a
- * shared floor that every member inherits, and container.json.onecliSecrets
- * can extend but not restrict.
- */
+/** Workgroup secrets first, then per-group additions. Union only: neither list can subtract from the other. */
 export function mergeWorkgroupAndGroupSecrets(
   workgroupSecrets: string[] | undefined,
   groupSecrets: string[] | undefined,
@@ -586,26 +412,10 @@ export function mergeWorkgroupAndGroupSecrets(
 }
 
 /**
- * Identify which of the given OneCLI secret names back Slack USER-token
- * access — the credentials that let an agent read the owner's Slack DMs/
- * threads (`curl https://slack.com/api/*` through the proxy). The host
- * withholds exactly these from a session's OneCLI agent when the session is
- * not owner-safe, so teammates in a shared channel can't extract the owner's
- * Slack through the agent. See `isOwnerSafeSlackSession`
- * (src/modules/permissions/slack-user-token-gate.ts) and the two-tier identity (src/container-runner.ts).
- *
- * Resolution:
- *   - If `explicitNames` is provided (from `slack_user_token.onecli_secret_names`),
- *     it is authoritative: return the intersection of it with `secrets`
- *     (case-insensitive). No convention guessing.
- *   - Otherwise fall back to the naming convention: a secret whose name
- *     contains BOTH "slack" and "user" (case-insensitive) — matches
- *     `Slack-User-Token-*` while excluding bot-token secrets like
- *     `Slack-Bot-Token-*` (bot tokens can't read arbitrary DMs, so they
- *     aren't owner-Slack-sensitive in the same way).
- *
- * Returns the matching names AS THEY APPEAR in `secrets` (so callers can
- * filter the merged list by identity).
+ * The OneCLI secrets granting Slack USER-token access (the owner's DMs), withheld from sessions that are not
+ * owner-safe (`isOwnerSafeSlackSession`). `explicitNames` is authoritative when given (case-insensitive
+ * intersection); otherwise names containing both "slack" and "user", which excludes bot tokens. Returns names as
+ * spelled in `secrets`.
  */
 export function slackUserTokenSecrets(secrets: string[], explicitNames?: string[]): string[] {
   if (explicitNames && explicitNames.length > 0) {
@@ -618,26 +428,17 @@ export function slackUserTokenSecrets(secrets: string[], explicitNames?: string[
   });
 }
 
-/** Test hook — clears the in-memory caches so each test starts clean. */
 /**
- * Declared secrets the gateway injects into DIRECT REST calls: a host pattern
- * that is not an MCP endpoint (`mcp.*` host or `/mcp` path — those reach the
- * agent through their MCP server, not curl). Returns the host so the roster
- * says where the credential actually applies, never a name-based guess.
- *
- * Never blocks: this runs on the per-turn path, so it reads only the spawn
- * path's secrets cache and refreshes a stale one in the background. A cold or
- * failed cache yields [] — the roster omits the line rather than stalling a
- * turn on the gateway (a hung gateway would otherwise cost every turn the
- * full curl timeout).
+ * Declared secrets injected into direct REST calls (not `mcp.*` hosts or `/mcp` paths), with the host they apply
+ * to. Per-turn path, so it never blocks: reads the spawn cache and refreshes a stale one in the background; a cold
+ * or failed cache yields [].
  */
 export function gatewayRestHosts(declarations: string[]): Array<{ name: string; host: string }> {
   if (declarations.length === 0) return [];
   if (!secretsCache || Date.now() - secretsCache.at >= SECRETS_CACHE_TTL_MS) {
     void loadSecrets(false).catch(() => undefined);
   }
-  // Rows are cached unvalidated (the spawn path only reads id/name); this runs
-  // on the per-turn path, so skip anything malformed rather than throw.
+  // Cached rows are unvalidated; skip malformed ones rather than throw on the per-turn path.
   const secrets = (Array.isArray(secretsCache?.secrets) ? secretsCache.secrets : []).filter(
     (secret): secret is OnecliSecret =>
       typeof secret === 'object' && secret !== null && typeof secret.id === 'string' && typeof secret.name === 'string',
@@ -659,17 +460,9 @@ export function gatewayRestHosts(declarations: string[]): Array<{ name: string; 
 const TYPESAFE_HOST = 'api.typesafe.ai';
 
 /**
- * Placeholder `TYPESAFE_API_KEY` for a Claude container whose grants already
- * route `api.typesafe.ai` through the gateway. fast-jev-compaction (a
- * `~/plugins` function-hook plugin) refuses to run with no key
- * (`~/plugins/fast-jev-compaction/hooks/fast-jev.ts`), but the real key is
- * injected at the proxy, so the container only needs a non-empty stand-in.
- *
- * Gated on the grant, not set fleet-wide: the grant is the clearance to send
- * that group's text to TypeSafe. Without it the plugin throws before any
- * request and falls back to the built-in summary.
- * Reads the cache `applyOnecliSecrets` has just warmed; a cold cache yields no
- * key, which is the same safe fallback.
+ * Placeholder `TYPESAFE_API_KEY` for a Claude container granted `api.typesafe.ai` (the real key is injected at the
+ * proxy; the fast-jev-compaction plugin only refuses an empty one). Gated on the grant, which is the clearance to
+ * send that group's text to TypeSafe. Reads the cache `applyOnecliSecrets` just warmed; cold yields no key.
  */
 export function typesafeKeyPlaceholderEnv(provider: string, grantedSecrets: string[]): string[] {
   if (provider !== 'claude') return [];
@@ -689,11 +482,4 @@ export function __resetCachesForTest(): void {
   inFlightListings.clear();
 }
 
-/**
- * Internal helpers exported solely for unit tests. Production callers
- * use `applyOnecliSecrets`. Note: `resolveSecretUuids` is ALSO exported at
- * top-level (above) for use by `scripts/set-workgroup-secrets.ts` — the
- * `__test` reference here is for legacy tests that already imported via
- * this namespace and is kept for compatibility.
- */
 export const __test = { isUuid, resolveAgentUuid };
