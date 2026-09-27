@@ -45,6 +45,7 @@ import {
   readContainerConfig,
   readContainerConfigForSpawn,
   updateContainerConfig,
+  writeContainerConfigScalars,
   validateMcpServers,
   resolveContainerSecurity,
   splitExcludedPlugins,
@@ -62,7 +63,6 @@ import {
 import { applyProviderFallbackRuntime, providerFallbackRuntimeEnv, resolveSpawnProvider } from './provider-fallback.js';
 import { markProviderAvailable } from './db/provider-health.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
-import { updateContainerConfigScalars } from './db/container-configs.js';
 import {
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
@@ -5519,8 +5519,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     fs.unlinkSync(tmpDockerfile);
   }
 
-  // Store the image tag in the DB
-  await updateContainerConfigScalars(agentGroup.id, { image_tag: imageTag });
+  await writeContainerConfigScalars(agentGroup.id, agentGroup.folder, { image_tag: imageTag });
 
   log.info('Per-agent-group image built', { agentGroupId, imageTag });
 }

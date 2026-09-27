@@ -37,14 +37,20 @@ vi.mock('../../session-manager.js', async () => {
 });
 
 import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
+import { buildAgentGroupImage } from '../../container-runner.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
-import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import {
+  ensureContainerConfig,
+  getContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../../db/container-configs.js';
 import { addDeniedModel } from '../../db/denied-models.js';
 import { createSession } from '../../db/sessions.js';
 import type { Session } from '../../types.js';
-import { applyAddMcpServer, performModelChange } from './apply.js';
+import { applyAddMcpServer, applyInstallPackages, performModelChange } from './apply.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -194,6 +200,29 @@ describe('applyAddMcpServer', () => {
 
     await expect(applyAddMcpServer(payload, session)).resolves.toBeUndefined();
     expect(readContainerConfig('agent').mcpServers.bad).toBeUndefined();
+  });
+});
+
+describe('applyInstallPackages', () => {
+  it('appends to the package lists in container.json AND the DB projection before the build', async () => {
+    writeContainerConfig('agent', { ...readContainerConfig('agent'), packages: { apt: ['curl'], npm: [] } });
+    await updateContainerConfigJson('ag-1', 'packages_apt', ['curl']);
+    let atBuild: unknown;
+    vi.mocked(buildAgentGroupImage).mockImplementationOnce(async () => {
+      atBuild = JSON.parse((await getContainerConfig('ag-1'))!.packages_apt);
+    });
+
+    await applyInstallPackages({ apt: ['jq', 'curl'], npm: ['left-pad'] }, session);
+
+    const file = readContainerConfig('agent');
+    expect(file.packages).toEqual({ apt: ['curl', 'jq'], npm: ['left-pad'] });
+    expect(file.onecliSecrets).toEqual(['Keep-Me']);
+    const row = (await getContainerConfig('ag-1'))!;
+    expect([JSON.parse(row.packages_apt), JSON.parse(row.packages_npm)]).toEqual([
+      file.packages.apt,
+      file.packages.npm,
+    ]);
+    expect(atBuild).toEqual(['curl', 'jq']);
   });
 });
 

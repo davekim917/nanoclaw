@@ -27,6 +27,7 @@ import {
   type ParsedMcpServerConfig,
   updateContainerConfig,
   validateMcpServerName,
+  writeContainerConfigPackages,
   writeContainerConfigScalars,
 } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -47,21 +48,11 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     return;
   }
 
-  // Append new packages to existing lists in the DB (deduplicated)
-  if (payload.apt) {
-    const existing = JSON.parse(configRow.packages_apt) as string[];
-    for (const pkg of payload.apt as string[]) {
-      if (!existing.includes(pkg)) existing.push(pkg);
-    }
-    await updateContainerConfigJson(agentGroup.id, 'packages_apt', existing);
-  }
-  if (payload.npm) {
-    const existing = JSON.parse(configRow.packages_npm) as string[];
-    for (const pkg of payload.npm as string[]) {
-      if (!existing.includes(pkg)) existing.push(pkg);
-    }
-    await updateContainerConfigJson(agentGroup.id, 'packages_npm', existing);
-  }
+  const merge = (list: string[], add: unknown) => [...new Set([...list, ...((add as string[] | undefined) ?? [])])];
+  await writeContainerConfigPackages(agentGroup.id, agentGroup.folder, (packages) => {
+    packages.apt = merge(packages.apt, payload.apt);
+    packages.npm = merge(packages.npm, payload.npm);
+  });
 
   const pkgs = [
     ...((payload.apt as string[] | undefined) || []),
