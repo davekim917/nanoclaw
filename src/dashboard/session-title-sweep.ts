@@ -490,8 +490,8 @@ function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
 }
 
 /**
- * Breaker/log-volume policy only, deliberately coarser than llm.ts's `classifyCredentialFailure`: rotation has
- * already moved past quota-exhausted slots, so a 429 here means the backend itself is in distress.
+ * Breaker/log-volume policy only, deliberately coarser than llm.ts's `classifyCredentialFailure`: every 429 counts
+ * toward the breaker, whatever its cause.
  */
 function isTransientBackendFailure(err: unknown): boolean {
   const status = (err as { status?: number }).status;

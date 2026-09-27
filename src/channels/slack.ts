@@ -473,7 +473,7 @@ export function declarationOnlySlackTypes(env: Record<string, string>): string[]
 
 /**
  * Must admit every key `parseSlackWorkspaces` reads (APP_TOKEN, underscore suffixes): a key filtered out here never
- * reaches it. One definition; a stale second copy once made Socket Mode workspaces look credential-less.
+ * reaches it. Keep this the only definition.
  */
 const SLACK_ENV_PATTERN = /^SLACK_(BOT_TOKEN|SIGNING_SECRET|APP_TOKEN)(_[A-Za-z0-9_]+)?$/;
 
