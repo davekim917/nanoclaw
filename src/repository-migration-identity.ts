@@ -52,8 +52,9 @@ export function normalizedGithubRepositoryIdentity(origin: string | null): strin
 }
 
 /**
- * Legacy directory names are not identities: buckets resolving to one GitHub repository coalesce, and an
- * origin-unreadable case-only alias attaches only when exactly one anchored identity shares its basename.
+ * Legacy directory names are not identities: within one workgroup, buckets resolving to one GitHub repository
+ * coalesce, and an origin-unreadable case-only alias attaches only when exactly one anchored identity in that
+ * workgroup shares its basename. Separate workgroups never coalesce.
  */
 export function planLegacyRepositoryCoalescing(
   groups: LegacyRepositoryIdentityGroup[],
