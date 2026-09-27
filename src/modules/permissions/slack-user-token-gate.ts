@@ -11,6 +11,8 @@ import type { RawStatements } from '../../db/central-lease.js';
  * (`slack-x:U0…`, `slack-x-codex:U0…`). Matching them by parsing channel_type
  * strings is unsafe (family collapse, a workspace literally named `acme-codex`),
  * so matching needs HANDLE equality AND platform prefix AND WORKGROUP membership.
+ * The Slack workspace itself is never checked: different workspaces MUST be in
+ * different workgroups, or a matching handle authorizes across them.
  */
 
 /**
