@@ -5,10 +5,8 @@ import { equivalentSlackUserIds } from '../../../slack-user-identity.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from './user-roles.js';
 
 /**
- * The membership writes as SQL constants: executed on the driver by
- * `addMember`, and through `withRawDb` by `grant.ts`, whose
- * grant/revoke apply the write in the same synchronous lease block as the
- * caller's authority re-check. One constant, two executors.
+ * Constants so `grant.ts` can run the write through `withRawDb` in the same
+ * lease block as its authority re-check.
  */
 export const ADD_MEMBER_SQL = `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
        VALUES (@user_id, @agent_group_id, @added_by, @added_at)
@@ -32,14 +30,8 @@ const MEMBERSHIP_ROW_SQL = 'SELECT 1 FROM agent_group_members WHERE user_id = ? 
  * Is the user "known" in this agent group?
  * Owner, global admin, and scoped admin are implicitly members.
  *
- * ⚠️  Synchronous and lease-only, with the three role predicates it composes
- * and `getMembershipGroupIds` below (seam-3 plan §4.5, I-1). This is the
- * authorization-predicate family: `dashboard/assign.ts`'s `canAssign` and
- * `dashboard/steer.ts`'s `canSteer` are the non-guard halves of the same
- * decision `observatory-assign-guard.ts` and `thread-close-guard.ts` make
- * inside a `decide` body. Each reads through `withRawDb`, so it works only
- * inside a `withCentralSync` block — a guard's caller already holds one; the
- * non-guard halves take the lease themselves. See `user-roles.ts`.
+ * ⚠️  Synchronous and lease-only: reads through `withRawDb`, so it works only
+ * inside a `withCentralSync` block. See `user-roles.ts`.
  */
 export function isMember(userId: string, agentGroupId: string): boolean {
   if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
@@ -54,11 +46,8 @@ export function hasMembershipRow(userId: string, agentGroupId: string): boolean 
 }
 
 /**
- * Every agent group the user is a member of, resolving same-workspace Slack
- * sibling identities (see slack-user-identity.ts) so a member who messages
- * from a sibling adapter is not locked out of their own membership.
- *
- * Synchronous, lease-only — see `isMember` above.
+ * Resolves same-workspace Slack sibling identities, so a member messaging from
+ * a sibling adapter keeps their membership. Synchronous, lease-only.
  */
 export function getMembershipGroupIds(userId: string): string[] {
   const ids = equivalentSlackUserIds(userId);
@@ -76,9 +65,7 @@ export function getMembershipGroupIds(userId: string): string[] {
  * True if the user (or an equivalent same-workspace identity) has any
  * membership row.
  *
- * Sequential, not `Promise.all`: the pre-seam body short-circuited on the
- * first candidate that matched, and the driver contract (src/db/driver.ts)
- * forbids issuing central statements concurrently.
+ * Sequential, not `Promise.all`: the driver forbids concurrent central statements.
  */
 export async function hasAnyMembership(userId: string): Promise<boolean> {
   for (const candidate of equivalentSlackUserIds(userId)) {

@@ -252,6 +252,81 @@ describe('callHaiku', () => {
       expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
     });
 
+    it('logs why it parked a slot: status, retry-after, provider error and unified rate-limit headers, never the token', async () => {
+      const warnSpy = vi.spyOn(log, 'warn').mockClear();
+      const longMessage = 'x'.repeat(400);
+      fetchMock
+        .mockResolvedValueOnce(
+          jsonResponse(
+            { type: 'error', error: { type: 'rate_limit_error', message: longMessage } },
+            {
+              status: 429,
+              headers: {
+                'retry-after': '900',
+                'anthropic-ratelimit-unified-status': 'rejected',
+                'anthropic-ratelimit-unified-5h-utilization': '0.12',
+              },
+            },
+          ),
+        )
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
+
+      expect(await callHaiku('hello')).toBe('from slot 2');
+
+      const parkCall = warnSpy.mock.calls.find(([msg]) => String(msg).includes('parking exhausted credential slot'));
+      expect(parkCall?.[1]).toEqual({
+        slot: 'oauth:primary',
+        untilIso: expect.any(String),
+        status: 429,
+        retryAfterMs: 900_000,
+        retryAfterHeader: '900',
+        providerErrorType: 'rate_limit_error',
+        providerMessage: `${'x'.repeat(300)}...`,
+        rateLimitUnifiedHeaders: {
+          'anthropic-ratelimit-unified-status': 'rejected',
+          'anthropic-ratelimit-unified-5h-utilization': '0.12',
+        },
+      });
+      const logged = JSON.stringify(warnSpy.mock.calls);
+      expect(logged).not.toContain('oauth-slot-1-token');
+      expect(logged).not.toMatch(/bearer|authorization/i);
+    });
+
+    it('logs a park with null diagnostics when the response carries no JSON body or unified headers', async () => {
+      const warnSpy = vi.spyOn(log, 'warn').mockClear();
+      fetchMock
+        .mockResolvedValueOnce(new Response('upstream busy', { status: 429, headers: { 'retry-after': '3600' } }))
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
+
+      await callHaiku('hello');
+
+      const parkCall = warnSpy.mock.calls.find(([msg]) => String(msg).includes('parking exhausted credential slot'));
+      expect(parkCall?.[1]).toMatchObject({
+        status: 429,
+        retryAfterHeader: '3600',
+        providerErrorType: null,
+        providerMessage: null,
+        rateLimitUnifiedHeaders: null,
+      });
+    });
+
+    it('carries the provider error type and message into the thrown error message for callers that log it', async () => {
+      fetchMock.mockImplementation(() =>
+        jsonResponse(
+          { error: { type: 'rate_limit_error', message: 'This request would exceed your rate limit' } },
+          { status: 429, headers: { 'retry-after': '3600' } },
+        ),
+      );
+
+      const err = await callHaiku('hello').catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(CallHaikuHttpError);
+      expect((err as Error).message).toBe(
+        'callHaiku: Anthropic returned 429 rate_limit_error: This request would exceed your rate limit',
+      );
+      expect(err).toMatchObject({ providerErrorType: 'rate_limit_error', retryAfterHeader: '3600' });
+    });
+
     it('skips a parked slot on the NEXT call entirely, rather than retrying it', async () => {
       fetchMock
         .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }))

@@ -64,47 +64,25 @@ import { isChannelVariant } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 /**
- * Resolve "what agent group should a new messaging_group in this workspace
- * inherit from?" for workspace-trust auto-wire. Returns null when the
- * workspace/guild has no prior wiring — those stay on the approval-gate path.
- *
- * Scope key:
- *   Slack: channel_type (e.g. "slack-example-labs") — already includes the workspace.
- *   Discord: guild id (first segment of "discord:<guildId>:<channelId>") — channel_type
- *     is just "discord" and doesn't differentiate guilds.
- *   Other: channel_type.
- *
- * Picks the agent_group with the most wirings in-scope (breaks ties by first
- * match). The caller creates the messaging_group_agents row using this id.
+ * The agent group a new messaging group in this workspace inherits for auto-wire, or null (approval gate).
+ * Scope: Discord guild id; any other adapter its channel_type (Slack/GitHub/Linear variants carry the workspace).
  */
 /**
- * Channel types that embed a workspace/guild identifier strong enough to make
- * "first agent wired in this scope wins" auto-wire safe. Other adapters
- * (Telegram, WhatsApp, Webex, etc.) don't have a tenant-scoped identifier
- * baked into the channel_type, so a fresh chat from an unrelated tenant
- * would auto-claim the wrong agent. Those fall through to the approval gate.
+ * Channel types carrying a tenant-scoped workspace id; without one, an unrelated tenant's fresh chat would
+ * auto-claim the wrong agent.
  */
 function adapterHasWorkspaceIdentity(channelType: string): boolean {
-  // Discord: handled separately (guild id parsed from platform_id).
-  // Includes multi-bot variants (`discord-<suffix>`) for forks running
-  // multiple Discord apps in one process.
+  // Discord: guild id parsed from platform_id; includes `discord-<suffix>` multi-bot variants.
   if (isDiscordChannelType(channelType)) return true;
-  // Slack channel types are stamped with the workspace suffix
-  // ("slack-<workspace>"); bare "slack" without suffix is ambiguous.
+  // Slack variants carry the workspace suffix; bare "slack" is ambiguous.
   if (isChannelVariant(channelType, 'slack' satisfies ChannelType)) return true;
-  // GitHub repo and Linear team are workspace-scoped via their adapter's
-  // channel_type suffix convention (`github-<owner>-<repo>`, `linear-<team>`).
+  // `github-<owner>-<repo>` and `linear-<team>` carry their scope in the suffix.
   if (isChannelVariant(channelType, 'github' satisfies ChannelType)) return true;
   if (isChannelVariant(channelType, 'linear' satisfies ChannelType)) return true;
   return false;
 }
 
-/**
- * The tone this agent group uses on this platform, but only when every one of
- * its existing channels there agrees. Returns null when they differ (or when
- * they unanimously have none), so the wiring falls through to the group
- * default rather than adopting an arbitrary channel's override.
- */
+/** The group's tone on this platform only if all its channels there agree; otherwise null (group default applies). */
 async function unanimousToneFor(agentGroupId: string, channelType: string): Promise<string | null> {
   const rows = await getDb().all<{ tone: string | null }>(
     `SELECT DISTINCT mga.default_tone AS tone
@@ -117,15 +95,7 @@ async function unanimousToneFor(agentGroupId: string, channelType: string): Prom
   return rows.length === 1 ? rows[0].tone : null;
 }
 
-/**
- * The workspace stopped having exactly one incumbent between the auto-wire
- * decision and its insert.
- *
- * Thrown so the refusal leaves through the caller's existing "could not
- * auto-wire" path — the operator approval gate — rather than duplicating that
- * fall-through. Distinguished from a real failure at the catch, because a race
- * lost on purpose is not an error to warn about.
- */
+/** The workspace stopped having one incumbent before the insert; leaves via the approval-gate path, not a warning. */
 class AutoWireUniquenessLost extends Error {}
 
 async function inheritedAgentGroupFor(
@@ -137,10 +107,7 @@ async function inheritedAgentGroupFor(
   if (isDiscordChannelType(mg.channel_type) && mg.platform_id.startsWith('discord:')) {
     const guildId = mg.platform_id.split(':')[1];
     if (!guildId) return null;
-    // Scope the lookup to the same channel_type (same bot identity). With
-    // multi-bot forks, example-agent + example-agent-codex can both have wirings in the same
-    // guild — they're separate bots, so a fresh channel under one bot should
-    // inherit only that bot's wirings, not the other's.
+    // Same channel_type (same bot): with multi-bot forks each bot inherits only its own wirings.
     rows = await getDb().all<InheritRow>(
       `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
@@ -167,20 +134,14 @@ async function inheritedAgentGroupFor(
       mg.id,
     );
   } else {
-    // Adapter without workspace identity — refuse auto-wire. Falls through
-    // to the operator approval gate (channel-registration). Without this
-    // guard, the first Telegram chat from any tenant would auto-claim the
-    // agent already wired for a different Telegram chat (cross-tenant).
+    // No workspace identity: refuse (the first chat from any tenant would auto-claim another tenant's agent).
     log.info('auto-wire refused: adapter has no workspace identity', { channelType: mg.channel_type });
     return null;
   }
 
   if (rows.length === 0) return null;
-  // SECURITY: refuse auto-wire when the workspace/guild has wirings to
-  // multiple distinct agent groups. The original "most existing wirings
-  // wins" heuristic would let the wrong tenant's agent claim a freshly
-  // created channel intended for another tenant — falls through to the
-  // operator approval gate instead.
+  // SECURITY: refuse when the workspace is wired to several agent groups, or one tenant's agent could claim
+  // another's new channel.
   if (rows.length > 1) {
     log.info('auto-wire refused: workspace has wirings to multiple agent groups', {
       channelType: mg.channel_type,
@@ -193,24 +154,9 @@ async function inheritedAgentGroupFor(
 }
 
 /**
- * Decide whether THIS messaging group's sibling bot is the one that should
- * act on an intercepted command (Bug: fan-out duplication — see routeInboundClaimed
- * section 2b). Sibling agents in one workgroup each run their own bot user /
- * channel_type "instance" (docs/workgroups.md), so a single Slack message
- * reaches the router once PER sibling as a separate InboundEvent/mg — there is
- * no single fan-out loop across them to dedupe within.
- *
- *  - Addressed straight at this bot (platform-confirmed mention, or a DM/1:1
- *    context) — always eligible; reuses the same `isMention` signal the
- *    fan-out loop's evaluateEngage() uses for engage_mode='mention', no
- *    second mention parser.
- *  - The raw text named a bot but not this one (`leadingMention` true and we
- *    weren't the addressee) — not our command to answer.
- *  - Nobody was named (bare "/command" that every sibling bot in the channel
- *    receives its own copy of) — exactly one sibling answers so the user
- *    isn't left on read: the wiring with the highest `priority` across every
- *    sibling messaging_group sharing this platform_id and workgroup, tied
- *    broken by channel_type then messaging_group id (stable, no clock).
+ * Whether THIS sibling bot answers an intercepted command: each sibling receives its own copy of a message, so
+ * there is no fan-out loop to dedupe in. Addressed to this bot (mention or DM): yes. Another bot named: no. Nobody
+ * named: exactly one sibling, the highest-priority wiring across same-platform-id siblings in the workgroup.
  */
 async function isSoleInterceptResponder(
   mg: MessagingGroup,
@@ -240,9 +186,7 @@ async function isSoleInterceptResponder(
     mg.platform_id,
   );
 
-  // No workgroup context to disambiguate against (standalone install, or the
-  // wiring/agent-group rows raced) — fail open so the request still gets
-  // answered rather than silently dropped by every candidate.
+  // No workgroup context to disambiguate: fail open so the request is answered, not dropped by every candidate.
   return winner === undefined || winner.mg_id === mg.id;
 }
 
@@ -285,19 +229,7 @@ export type AccessGateFn = (
   userId: string | null,
   mg: MessagingGroup,
   agentGroupId: string,
-  /**
-   * The thread address THIS wiring would reply on — `event.threadId` already
-   * policy-stripped by resolveThreadPolicy (null when the wiring or its
-   * channel declaration opts out of threads, or the adapter can't thread).
-   *
-   * The gate needs it because a refusal can still speak to the sender
-   * (decline_notify), and a bot-authored reply has to honor the same thread
-   * policy the agent's replies do — otherwise a wiring that deliberately
-   * collapses DM sub-threads to the root gets its declines posted inside
-   * them. Passed in rather than recomputed: fanout has already resolved it
-   * for this wiring, and duplicating the computation is how the two sides
-   * drift.
-   */
+  /** The thread THIS wiring replies on, already policy-stripped: a decline notice must honor the same thread policy. */
   effectiveThreadId: string | null,
 ) => AccessGateResult | Promise<AccessGateResult>;
 
@@ -310,30 +242,12 @@ export function setAccessGate(fn: AccessGateFn): void {
   accessGate = fn;
 }
 
-/**
- * Unwired-channel resolver hook. Runs only when a messaging group has zero
- * agents wired. A module can opt-in to auto-wire the first message to a
- * default agent group — see `src/modules/channel-auto-wire/`. The resolver
- * is expected to persist a `messaging_group_agents` row as a side effect
- * so subsequent messages resolve via the normal path; returning an empty
- * array falls through to the standard "no agent wired" drop.
- */
-/**
- * Insert the auto-created messaging group, or adopt the row a concurrent route
- * won with. The lookup above yields (async driver), so two addressed messages
- * for a never-seen channel can both see no row and both insert on the same
- * `(channel_type, platform_id, instance)` unique key; the loser re-reads the
- * winner instead of aborting its route — the same shape as
- * `resolveActiveSession` in db/scheduled-tasks.ts. Exported for its test.
- */
+/** Insert the auto-created messaging group, or adopt the row a concurrent route won (both can miss the lookup). */
 export async function autoCreateMessagingGroup(
   mg: MessagingGroup,
   instance: string,
 ): Promise<{ mg: MessagingGroup; agentCount: number }> {
-  // `getMessagingGroupWithAgentCount` returns the row AND its wiring count,
-  // but the primitive's `reload` is row-shaped — carry the count out sideways
-  // so the adopted row keeps the wirings the winner may already have, instead
-  // of the 0 a freshly-inserted row has.
+  // Carry the winner's wiring count out, so an adopted row keeps its wirings instead of reading 0.
   let adoptedAgentCount = 0;
   const { row, created } = await insertOrAdopt(mg, createMessagingGroup, async () => {
     const winner = await getMessagingGroupWithAgentCount(mg.channel_type, mg.platform_id, instance);
@@ -439,40 +353,24 @@ function safeParseContent(raw: string): ParsedContent {
 }
 
 export function isSlackChannelType(channelType: string): boolean {
-  // Bare 'slack' AND workspace variants — the default single-workspace Slack
-  // adapter uses bare 'slack', so this predicate must accept both (unlike
-  // adapterHasWorkspaceIdentity, which is deliberately variant-only).
+  // Accepts bare 'slack' too (the default single-workspace adapter), unlike adapterHasWorkspaceIdentity.
   return channelType === 'slack' || isChannelVariant(channelType, 'slack' satisfies ChannelType);
 }
 
 /**
  * Discord channel-type predicate that tolerates multi-bot variants.
  *
- * Forks running multiple Discord apps in one process tag the secondary
- * adapter with a suffix (`discord-<suffix>`) so dedupe keyspaces don't
- * collide. Every Discord-flavored gate in this file must accept both
- * bare `discord` and `discord-*`, otherwise the secondary bot would
- * silently lose Discord-specific behavior (guild-id auto-wire,
- * mention-sticky engage default, etc.).
+ * Every Discord gate must accept `discord-<suffix>` multi-bot variants too, or a secondary bot silently loses
+ * Discord-specific behavior.
  */
 export function isDiscordChannelType(channelType: string): boolean {
   return channelType === 'discord' || isChannelVariant(channelType, 'discord' satisfies ChannelType);
 }
 
 /**
- * Slack DM thread-on-first-reply.
- *
- * @chat-adapter/slack represents a root DM with no thread_ts as
- * `slack:<D-channel>:`. The chat-sdk bridge has a Slack-only normalizer for
- * bare `adapter.name === 'slack'`, but this fork intentionally renames
- * multi-workspace Slack adapters to `slack-<workspace>` so dedupe keys don't
- * collide. There is no slack.ts config knob for "use event.ts as thread_ts".
- *
- * Do the minimum router-level synthesis for per-thread Slack DMs: convert a
- * root DM address into Slack's encoded thread id `slack:<D-channel>:<event.ts>`.
- * That gives each top-level DM message its own session and makes outbound
- * replies post under the user's message. The scope is deliberately Slack-only;
- * other threaded adapters keep their adapter-provided thread id unchanged.
+ * Slack DM thread-on-first-reply: convert a root DM address (`slack:<D-channel>:`) into
+ * `slack:<D-channel>:<event.ts>` so each top-level DM gets its own session and replies thread under it. Done here
+ * because the adapter's normalizer only covers bare `slack`, not this fork's `slack-<workspace>` adapters.
  */
 function effectiveThreadIdForAgent(
   event: InboundEvent,
@@ -583,16 +481,8 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     // channels we merely sit in stays silent — no row, no DB writes.
     if (!isMention) return;
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    // Adapter tells us whether this is a DM or a group chat — prefer the
-    // explicit message.isGroup, then the isDM inverse. When BOTH are
-    // unknown (an adapter that declares neither), default to group/mention
-    // mode, not DM-style: downstream, is_group=0 resolves to
-    // engage_pattern='.' (always-engage on every message), so defaulting
-    // unknown to DM-style would make an actual group chat on an
-    // undeclared adapter reply to everything in the channel unprompted.
-    // Defaulting to group/mention mode instead means the worst case is a
-    // real DM that needs an explicit mention until the operator notices
-    // and flips it — the safe direction to be wrong in.
+    // Unknown DM/group: default to group (mention) mode. DM-style means engage-on-everything, so an undeclared
+    // adapter's group chat would answer every message.
     const isGroupChat = event.message.isGroup ?? (event.isDM === undefined ? true : event.isDM === false);
     mg = {
       id: mgId,
@@ -603,12 +493,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       instance: event.instance ?? event.channelType,
       name: null,
       is_group: isGroupChat ? 1 : 0,
-      // Declared adapters get their declared policy (DM vs group context).
-      // Fork policy for UNDECLARED adapters: public-by-default — any sender
-      // in the channel can mention the bot without a separate sender-approval
-      // cascade (sibling gate + auto-wire flow, 2026-05-13); upstream's
-      // faithful fallback would be 'request_approval'. Operator can lock
-      // individual channels down later via messaging_groups.unknown_sender_policy.
+      // Undeclared adapters: public-by-default (fork policy; upstream would use 'request_approval').
       unknown_sender_policy: hasDeclaredChannelDefaults(event.instance ?? event.channelType, event.channelType)
         ? resolveUnknownSenderPolicy(event.instance ?? event.channelType, isGroupChat, event.channelType)
         : 'public',
@@ -635,44 +520,21 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       return;
     }
 
-    // Workspace-trust auto-wire: if the workspace (Slack channel_type suffix)
-    // or Discord guild already has at least one wired channel, we know the
-    // owner trusts the bot in that workspace — wire the new channel to the
-    // incumbent agent group without an approval card. Matches v1 behavior
-    // where adding the bot to a new channel in an already-installed workspace
-    // "just worked." First channel in a new workspace/guild still escalates.
+    // Workspace-trust auto-wire: a workspace/guild that already has a wired channel wires a new one to its
+    // incumbent agent group without an approval card. The first channel in a new workspace still escalates.
     const inheritedAgent = await inheritedAgentGroupFor(mg);
     if (inheritedAgent) {
       try {
-        // Voice travels with the agent identity, so a channel auto-wired from
-        // an existing one inherits its tone. Without this every auto-wired
-        // channel ran with NO tone injection while the hand-wired ones kept
-        // theirs, so one agent sounded like two different agents depending on
-        // which of its channels you were in (owner report 2026-08-08).
-        //
-        // Only when the agent's existing channels AGREE. Copying one arbitrary
-        // wiring guesses: `inheritedAgentGroupFor` returns MIN(messaging_group_id),
-        // which has nothing to do with which channel is representative, so on a
-        // platform where tone varies per channel it propagates whichever row
-        // sorted first. Verified 2026-08-08: a new Discord guild channel would
-        // have inherited the casual tone set on the one channel deliberately
-        // different from every other. Disagreement means we don't know, so
-        // leave NULL and let the group default in container.json answer.
-        //
-        // Tone ONLY: default_model / default_effort are per-channel pins, written only by `ncl wirings create/update`
-        // and set_channel_model/_effort; spreading one channel's pin to every future channel is a worse bug than
-        // the one this fixes.
+        // Tone travels with the agent identity, but only when its channels on this platform AGREE (copying one
+        // arbitrary wiring's tone guesses). Tone ONLY: model/effort are per-channel pins and must not spread.
         const inheritedTone = await unanimousToneFor(inheritedAgent.id, mg.channel_type);
         const isGroup = event.message.isGroup ?? mg.is_group === 1;
         const wiring: MessagingGroupAgent = {
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           messaging_group_id: mg.id,
           agent_group_id: inheritedAgent.id,
-          // Group chats default to plain mention so each invocation is
-          // intentional. DMs always engage: Slack does not require or reliably
-          // emit a self-mention there, so persisting mention mode makes later
-          // unmentioned DM turns silently accumulate without waking the agent.
-          // mention-sticky stays available as an explicit group override.
+          // Groups default to plain mention; DMs always engage (Slack emits no reliable self-mention in DMs, so
+          // mention mode would silently swallow unmentioned DM turns).
           engage_mode: isGroup ? 'mention' : 'pattern',
           engage_pattern: isGroup ? null : '.',
           session_mode: 'per-thread',
@@ -682,38 +544,21 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           default_model: null,
           default_effort: null,
           default_tone: inheritedTone,
-          // Not inherited the way tone is: channel instructions are the rules
-          // of a specific room, so carrying them into a brand-new room would
-          // silently extend a scoped rule set past its scope.
+          // Not inherited: channel instructions are one room's rules.
           instructions_profile: null,
           created_at: new Date().toISOString(),
         };
-        // The uniqueness proof and the insert are ONE transaction.
-        //
-        // `inheritedAgentGroupFor` refuses a workspace wired to more than one
-        // agent group — that refusal is the whole reason a second tenant's
-        // channel cannot be auto-claimed. But it ran before the tone lookup and
-        // before this insert, both of which await, and another channel in the
-        // same workspace can be wired to a DIFFERENT agent in that window. The
-        // insert would then connect a new channel to a stale incumbent, past a
-        // gate that has since started saying no, with no approval anywhere.
-        //
-        // So it is re-run here, on the lease that also carries the insert, and
-        // the row goes in only while its own precondition still holds. The
-        // check excludes this messaging group, so re-running it is idempotent.
-        //
-        // Lookup-then-insert on the async driver: a concurrent route can win the
-        // same wiring; adopt it instead of failing this message (seam 3 primitive).
+        // The uniqueness proof and the insert are ONE transaction: the workspace could gain a second agent group
+        // while the tone lookup awaited, and a stale incumbent must not be wired past a gate that now says no.
+        // Adopts a concurrent route's identical wiring instead of failing.
         await centralTransaction(async () => {
           const incumbent = await inheritedAgentGroupFor(mg);
           if (!incumbent || incumbent.id !== inheritedAgent.id) throw new AutoWireUniquenessLost();
           await insertOrAdopt(
             wiring,
             async (candidate) => {
-              // The in-transaction leaf, not the exported wrapper: that one
-              // opens its OWN `centralTransaction`, and the lease refuses to
-              // nest, so calling it from here would throw
-              // `CentralLeaseReentrancyError` on every eligible channel.
+              // The in-transaction leaf: the exported wrapper opens its own `centralTransaction`, and the lease
+              // refuses to nest.
               await createMessagingGroupAgentInTransaction(candidate);
             },
             async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
@@ -726,19 +571,12 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           channelType: event.channelType,
           platformId: event.platformId,
         });
-        // Resolve the channel name the same way the approval path does. Only
-        // that path used to do it, so a workspace-trust auto-wire left name
-        // NULL forever — the row was invisible to any name-keyed roster query,
-        // and the agent's own pre-turn context (channelName, below) told it it
-        // was nowhere. A sibling auto-wired into #dispatch mid-thread on
-        // 2026-08-07 could not name the room it was posting in. Non-critical:
-        // never let a name lookup undo a wiring that already succeeded.
+        // Resolve the channel name as the approval path does (a NULL name hides the row from name-keyed queries).
+        // Non-critical: never undo a wiring that already succeeded.
         try {
           if (adapter?.resolveChannelName) {
             const name = await adapter.resolveChannelName(mg.platform_id);
-            // `classified`, not `adapter`: this is the classification seam's
-            // answer, and it must outrank the generic metadata fetch that will
-            // report this same channel's raw platform name later.
+            // `classified` must outrank the generic metadata fetch's raw platform name.
             if (name) {
               await updateMessagingGroup(mg.id, {
                 name,
@@ -749,7 +587,6 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         } catch {
           /* non-critical — the wiring stands either way */
         }
-        // Re-enter routing with the fresh wiring in place.
         return routeInboundClaimed(event, markReplayPending);
       } catch (err) {
         if (err instanceof AutoWireUniquenessLost) {
@@ -768,12 +605,8 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       }
     }
 
-    // Env-var auto-wire: when the operator pre-declared a default agent
-    // for this channel_type via NANOCLAW_DEFAULT_AGENT_GROUP_<TYPE>, the
-    // channel-auto-wire module's resolver persists a messaging_group_agents
-    // row as a side effect; we re-enter routing with the fresh wiring in
-    // place. Resolver returns [] when no env var is set / folder is missing
-    // / the wiring insert raced — falls through to the approval gate below.
+    // Env-var auto-wire (NANOCLAW_DEFAULT_AGENT_GROUP_<TYPE>): the resolver persists the wiring; [] falls through
+    // to the approval gate.
     if (unwiredChannelResolver) {
       const wirings = await unwiredChannelResolver(event, mg);
       if (wirings.length > 0) {
@@ -799,9 +632,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     });
 
     if (channelRequestGate) {
-      // Defer only the exact event retained by the approval row. Later
-      // messages while a card is pending remain ordinary drops and cannot
-      // strand unrelated ingress receipts indefinitely.
+      // Defer only the exact event the approval row retains; later messages stay ordinary drops.
       try {
         if (await channelRequestGate(mg, event)) markReplayPending();
       } catch (err) {
@@ -822,24 +653,9 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   //    Without the module, userId is null — downstream tolerates it.
   const userId: string | null = senderResolver ? await senderResolver(event) : null;
 
-  // 2a. Eagerly populate the user_dms cache for inbound 1:1 DMs. The cache
-  //     was historically only written lazily by ensureUserDm() on the
-  //     outbound-DM path (approvals, DMs we initiate), which meant
-  //     features depending on "is this messaging_group the user's DM?"
-  //     (Slack user-token gate, future per-user DM features) would
-  //     incorrectly deny on a first-time inbound DM until something else
-  //     prewarmed the cache. Writing here makes the cache reliable.
-  //
-  //     Guard: require event.isDM === true explicitly (not just
-  //     mg.is_group === 0). is_group=0 is not proof of a confirmed DM: the
-  //     messaging-group creation path above only defaults
-  //     is_group to 1 (group/mention-safe) when the adapter passes neither
-  //     message.isGroup nor isDM, but is_group also defaults to 0 with NO
-  //     adapter evidence at all on other paths — the CLI's `is_group`
-  //     field and the column itself both default to 0. So
-  //     "is_group happens to read 0" is a fact about that row's history,
-  //     not this event's — caching a shared channel as a user's DM off a
-  //     stale or coincidental read would poison subsequent DM resolution.
+  // 2a. Populate user_dms for inbound 1:1 DMs so DM-dependent gates don't deny a first DM. Requires isDM === true:
+  //     is_group=0 is not proof of a DM (it defaults to 0 without adapter evidence), and caching a shared channel
+  //     as a user's DM would poison DM resolution.
   if (userId !== null && event.isDM === true) {
     try {
       const { upsertUserDm } = await import('./modules/permissions/db/user-dms.js');
@@ -850,8 +666,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         resolved_at: new Date().toISOString(),
       });
     } catch (err) {
-      // Permissions module not installed — downstream features that depend
-      // on this cache will just see no row. Non-fatal.
+      // Permissions module not installed: non-fatal.
       log.debug('router: skipped user_dms upsert (permissions module unavailable)', { err: String(err) });
     }
   }
@@ -862,12 +677,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   if (userId !== null && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const preGate = await preFanoutGate(event.message.content, userId);
     if (preGate.action === 'intercept' || preGate.action === 'deny') {
-      // Sibling bots (separate channel_type/instance per bot user — see
-      // docs/workgroups.md) each get their OWN inbound event for the same
-      // underlying platform message, so this "runs once per inbound" gate
-      // still runs once per SIBLING. Without this check every sibling wired
-      // into the channel would intercept/deny the same command (observed:
-      // three bots each minted a dashboard token for one `/dashboard-token`).
+      // Each sibling bot gets its OWN inbound event for one platform message, so only one sibling may intercept.
       if (!(await isSoleInterceptResponder(mg, isMention, preGate.leadingMention === true))) {
         log.debug('Pre-fanout intercept skipped — not the addressed or deterministic sibling', {
           command: preGate.command,
@@ -913,10 +723,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     }
     if (preGate.action === 'deny') {
       log.info('Pre-fanout intercept denied (not admin)', { command: preGate.command, userId });
-      // Real incident: a user typed an intercept command before they had any
-      // role/membership and got no response at all — reads as the product
-      // being broken. Reply with a short, non-leaky refusal (no role/permission
-      // internals) through the same delivery path the intercept handlers use.
+      // A user without a role gets a short, non-leaky refusal rather than silence.
       const deliveryAdapter = getDeliveryAdapter();
       if (deliveryAdapter) {
         await deliveryAdapter
@@ -1117,12 +924,7 @@ async function evaluateEngage(
     case 'mention':
       return isMention;
     case 'mention-pattern': {
-      // Hybrid: requires both a platform @-mention AND a text-pattern match.
-      // Use when two sibling agents share one bot user (e.g. helper + helper-codex
-      // on the same Slack app) and a keyword in the message text decides
-      // which sibling fires. Without isMention, random chatter mentioning
-      // the keyword would wake the bot; without the pattern, both siblings
-      // would fire on every @-mention.
+      // Both a platform @-mention AND a pattern match: siblings sharing one bot user pick by keyword.
       if (!isMention) return false;
       const pat = agent.engage_pattern ?? '.';
       if (pat === '.') return true;
@@ -1136,18 +938,9 @@ async function evaluateEngage(
     case 'mention-sticky': {
       if (isMention) return true;
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
-      // Threaded adapters (Discord, Slack): channel-root messages have
-      // threadId=null and must not stick — we require a fresh @mention to
-      // start a new thread. Only messages inside an existing thread carry
-      // the sticky session. Non-threaded adapters (Telegram group chat etc.)
-      // always have threadId=null; for them, session-existence IS the stick.
+      // Threaded adapters: a channel-root message must not stick (a fresh @mention starts a thread).
       if (adapterSupportsThreads && threadId === null) return false;
-      // The stick is ENGAGEMENT, not session existence. Reading existence was
-      // the original mistake: it made a session row — a storage detail any
-      // path can create — carry a behavioral meaning, which is precisely what
-      // forced the non-engaged skip below to exempt mention-sticky wirings.
-      // `engaged_at` states the fact outright (migration 052), so a thread the
-      // agent has never engaged in does not stick, whether or not a row exists.
+      // The stick is ENGAGEMENT (`engaged_at`), not session existence: any path can create a session row.
       const existing = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
       return existing?.engaged_at != null;
     }
@@ -1157,18 +950,8 @@ async function evaluateEngage(
 }
 
 /**
- * Mirror an inbound user message into archive.db for future-wake thread
- * context replay. Scoped per-agent-group to match the archive's PK slicing;
- * assistant replies are archived on delivery.ts's path.
- *
- * Called from both delivery paths — the normal one before the session row is
- * written (so same-turn recall can resolve the trigger sender), and the
- * non-engaged skip below, which never resolves a session.
- * The insert is an upsert keyed on the per-agent message id, so calling it
- * twice for one message is a no-op rewrite.
- *
- * Returns whether a row was actually written. The skip path treats that
- * boolean as a precondition, not as diagnostics — see the guard.
+ * Mirror an inbound user message into archive.db (assistant replies are archived on delivery). An upsert, so both
+ * paths may call it. The return value is a precondition for the non-engaged skip, not diagnostics.
  */
 function archiveInboundUserMessage(
   agent: MessagingGroupAgent,
@@ -1207,25 +990,9 @@ function archiveInboundUserMessage(
 }
 
 /**
- * Whose non-engaged messages are eligible for the session skip below.
- *
- * THIS IS THE SCOPE LINE. It exists as its own predicate so the
- * bot-versus-human question is one auditable, revertible place rather than a
- * clause buried in a nine-term condition.
- *
- * Currently: everyone. The operator widened it from bot-only deliberately —
- * "we don't need to retain history of chatter without any agent engagement".
- * The model, not the disk, is the point: a session should not exist until an
- * agent is engaged. (`sessionActiveCap` was 2000 against 6,812 active
- * sessions, the large majority of them threads no agent ever touched.)
- *
- * To narrow back to bots only, this is the one function to change — and when
- * you do, do NOT identify bots by platform-id prefix (`U…` vs `B…`). Slack
- * puts a `U`-prefixed `event.user` on bot events, so the prefix is not a bot
- * test. The two reliable signals are the platform's own `isBot` flag on the
- * serialized author, and the install's known sibling-bot id set
- * (`isSiblingBotSender` / `setSiblingBotIdsProvider` in
- * `src/modules/permissions/`).
+ * THE scope line for the non-engaged session skip: currently every sender (a session should not exist until an
+ * agent is engaged). To narrow to bots, never test the platform-id prefix (Slack bot events carry `U…` ids); use
+ * the author's `isBot` flag and the known sibling-bot id set.
  */
 function skipEligibleSender(_parsedContent: ParsedContent, _userId: string | null): boolean {
   return true;
@@ -1254,63 +1021,19 @@ async function deliverToAgent(
     effectiveSessionMode = 'per-thread';
   }
 
-  // Slack DM thread-on-first-reply (fork): synthesize a per-thread id for
-  // root DMs. Reassigns the policy-resolved address so session resolution
-  // AND the delivery address below stay consistent. threadsEnabled implies
-  // effectiveThreadId === event.threadId, so the event view is current.
+  // Fork: synthesize a per-thread id for root Slack DMs, reassigning the policy-resolved address so session
+  // resolution and delivery agree.
   if (threadsEnabled) {
     effectiveThreadId = effectiveThreadIdForAgent(event, true, effectiveSessionMode);
   }
 
-  // ── A non-waking message does not get to mint a per-thread session. ──
-  //
-  // A session is supposed to mean "an agent is engaged in this thread". It had
-  // drifted into meaning "a message once landed here": a `mention`-mode agent
-  // wired to a busy channel minted a per-thread session for every notification
-  // and every passing human remark, none of which would ever wake. Those rows
-  // are what `sessionActiveCap` has been fighting.
-  //
-  // Skipping is only sound where the wake path can reconstruct what an
-  // accumulate would have provided, so this condition is the deliberate mirror
-  // of the thread-context backfill below — same message kinds, same thread
-  // policy, same adapter capability. When someone does engage in this thread,
-  // `engaged_at` is still NULL at that moment, so `buildThreadContextBlock`
-  // replays the whole thread and the skipped messages come back as context.
-  // That recovery is keyed on the SESSION's engagement state, not on whether
-  // this particular call created the row, so it holds no matter which path
-  // (mention, agent-to-agent, anything later) brings the session into being.
-  //
-  // Two things are deliberately NOT skipped. Messages carrying attachments:
-  // `fetchThreadHistory` returns `{sender, text, timestamp, isAnchor?}` and
-  // reconstructs no files, so a replay genuinely cannot recover them (see
-  // `src/channels/adapter.ts`). And anything the archive refused —
-  //
-  // *** The `archiveInboundUserMessage(...)` call below is the thing the skip
-  // DEPENDS ON, not a side effect on the way out. *** Skipping writes no
-  // session row, so the archive row is the message's only remaining copy: it
-  // is what `messages_archive` retrieval reads, and what the workgroup
-  // archive retains as conversation history.
-  // If the archive throws and we skip
-  // anyway, the message ceases to exist — no row, no retry, no error anyone
-  // sees. So it is evaluated LAST, and a `false` return falls through to
-  // ordinary session creation, where the message is at least durable. Do not
-  // "simplify" this into a fire-and-forget call before the `if`.
-  //
-  // ── Accepted costs, so the tradeoff is legible where it is taken ──
-  // Replay is not a lossless substitute for the stream, and these three gaps
-  // were accepted deliberately rather than overlooked:
-  //   1. The replay is capped at THREAD_CONTEXT_LIMIT (50) messages, and
-  //      effectively 49 — the triggering mention consumes one via
-  //      `excludeMessageId`. A longer thread loses its oldest messages.
-  //   2. Slack's `conversations.replies` is called once, no cursor,
-  //      `direction: backward`. Past roughly 200 messages it returns a stale
-  //      EARLY window, so a very long thread replays its beginning, not its
-  //      tail.
-  //   3. Replay reflects the platform's CURRENT state, so edits and deletes
-  //      show as they now stand — the streamed copy accumulate would have kept
-  //      is gone.
-  // The right response to any of these is a bigger cap or cursoring in the
-  // adapter, not reinstating a session row per un-engaged thread.
+  // A non-waking message does not mint a per-thread session (a session means "an agent is engaged here"). Sound
+  // only where the wake path can reconstruct it: this mirrors the thread-context backfill (same kinds, thread
+  // policy and adapter capability), which replays the thread while `engaged_at` is NULL. NOT skipped: messages
+  // with attachments (replay recovers no files) and anything the archive refused. The archive call below is what
+  // the skip DEPENDS ON (the message's only remaining copy), so it runs LAST and a `false` falls through to session
+  // creation; never make it fire-and-forget. Accepted replay gaps: the 50-message cap, Slack's uncursored
+  // `conversations.replies` (a very long thread replays its start), and edits/deletes shown as they now stand.
   if (
     !wake &&
     skipEligibleSender(parsedContent, userId) &&
@@ -1340,10 +1063,8 @@ async function deliverToAgent(
   );
   const routedMessageId = messageIdForAgent(event.message.id, agent.agent_group_id);
 
-  // A receipt table added after existing session DBs cannot retroactively know
-  // their old platform ids. Check the actual per-session id before every side
-  // effect as a migration-safe second line of defense, and also make a partial
-  // fan-out retry harmless for agents whose row was already committed.
+  // Old session DBs predate the receipt table: re-check the per-session id before any side effect (this also makes
+  // a partial fan-out retry harmless).
   if (await sessionMessageExists(agent.agent_group_id, session.id, routedMessageId)) {
     log.debug('Duplicate session message ignored before agent side effects', {
       sessionId: session.id,
@@ -1353,37 +1074,20 @@ async function deliverToAgent(
     return;
   }
 
-  // v1 behavior: a follow-up message to a session with a pending
-  // bash/destructive gate implicitly rejects the gate so the agent's
-  // PreToolUse hook unblocks, the current turn ends, and the next
-  // turn processes the new message. Guarded by an in-memory set so
-  // the common no-gate case skips the DB read.
+  // A follow-up to a session with a pending bash/destructive gate implicitly rejects it so the turn can end.
   if (!created && sessionHasActiveGates(session.id)) {
     cancelPendingGatesForSession(session.id, 'Cancelled — user sent a follow-up message.').catch((err) => {
       log.warn('cancelPendingGatesForSession failed', { sessionId: session.id, err });
     });
   }
 
-  // Rename freshly-created Discord threads to a Haiku-derived topic title.
-  // Fire-and-forget; failures log and move on. See src/topic-title.ts for
-  // the why and the platform-gating (Discord only).
-  //
-  // Gate on `wake`, not just `created`: every wired sibling with
-  // ignored_message_policy='accumulate' gets a session created here even when
-  // it DIDN'T engage (wake=false) — it's just stashing the message for later
-  // context. Those non-engaging siblings must not title the thread. Without
-  // this gate, an accumulate sibling whose session is created later in the
-  // turn (fed downstream text — e.g. the engaged sibling's tool output) would
-  // clobber the engaged sibling's correct opening-prompt title. Only the
-  // sibling actually responding to the user names the thread.
+  // Title freshly created Discord threads (src/topic-title.ts). Gated on `wake`: a non-engaging accumulate sibling
+  // must not clobber the engaged sibling's title.
   if (created && wake) {
     const firstText = parsedContent.text ?? '';
     if (firstText) await maybeRenameNewThread(event.channelType, effectiveThreadId, firstText, event.message.id);
   }
 
-  // Persist any base64-encoded attachments from chat-sdk-bridge onto the
-  // filesystem and replace their inline data URLs with file:// paths. The
-  // container sees them as regular file references.
   const persistedContent = persistInboundAttachments(
     agent.agent_group_id,
     session.id,
@@ -1413,13 +1117,8 @@ async function deliverToAgent(
       return;
     }
     if (gate.action === 'deny') {
-      // Existing-only: a denial is not a reason to provision a mailbox
-      // (invariant I-10). OUTBOUND-keyed, not the mailbox session: writing the
-      // notice needs nothing from inbound.db, and a retained session whose
-      // inbound.db has been reclaimed while outbound.db remains would answer
-      // `undefined` from the inbound-keyed funnel — the denial would be logged
-      // with no reply ever written. Pre-seam this opened outbound.db directly,
-      // so the inbound dependency would have been new.
+      // Outbound-keyed and existing-only: never provision a mailbox for a denial, and an inbound-keyed funnel would
+      // answer `undefined` when inbound.db was reclaimed but outbound.db remains, dropping the reply.
       await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) =>
         outbound.writeOutboundDirect({
           id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1435,37 +1134,16 @@ async function deliverToAgent(
     }
   }
 
-  // Host emits the flag confirmation directly to outbound so it lands
-  // without waiting for the agent turn. Structured intent is attached to
-  // messages_in.content so the container never re-parses text.
-  //
-  // Wake gate: skip the flag dispatcher entirely when `wake=false`. The
-  // accumulate path delivers the message as silent context (the agent
-  // isn't being addressed), so applying `-e`/`-m` flags from a message
-  // that was for a sibling would (a) post a duplicate "effort → X" reply
-  // from this agent's bot user — visible noise in the channel — and (b)
-  // store the flag in this session's sticky config when the operator
-  // never intended it. Observed: `@Example Assistant -e max` triggered Example Assistant Codex's
-  // accumulate path on the shared Example Retail channel; Example Assistant Codex emitted its own
-  // "effort → max" message and stored the sibling-targeted value in its own
-  // session_state even though the operator never addressed that agent.
+  // The host posts the flag confirmation directly and attaches structured intent (the container never re-parses).
+  // Only when `wake`: a sibling's accumulate path must not echo or store flags meant for another agent.
   let flagIntent: FlagIntent | undefined;
   let flagCleanedText: string | null = null;
-  // The settings line of the ⚙️ ack actually posted. Stored on the row so the
-  // runner can say "queued" in the same words, and only for rows a person
-  // typed: support-thread dispatch writes flagIntent on rows nobody acked.
+  // The posted ⚙️ ack's settings line, so the runner can say "queued" in the same words; only for rows a person typed.
   let flagAck: string | undefined;
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const rawText = parsedContent.text ?? '';
-    // Flag vocabulary is provider-specific (codex accepts gpt-5.5, rejects
-    // claude ids; claude the reverse). Precedence mirrors container spawn
-    // (sessions.agent_provider → container config → 'claude'), with
-    // agent_groups.agent_provider as the gap-filler: groups created mid-run
-    // have no container_configs row until backfillContainerConfigs runs at
-    // the next host restart (see group-init.ts — the FK ordering note), but
-    // the create flows do stamp the group row. Without this rung a fresh
-    // codex sibling would parse flags with the claude vocabulary until the
-    // next restart.
+    // Flag vocabulary is provider-specific. Reads the container_configs projection (spawn reads container.json, so
+    // the two can disagree), with agent_groups.agent_provider for groups created mid-run (no row until restart).
     const provider = resolveProviderName(
       session.agent_provider,
       (await getContainerConfig(session.agent_group_id))?.provider ?? agentGroup.agent_provider,
@@ -1478,9 +1156,7 @@ async function deliverToAgent(
       if (notice) {
         const settingsLine = notice.split('\n')[0];
         if (parsed.intent && settingsLine.startsWith('⚙️')) flagAck = settingsLine;
-        // Outbound-keyed for the same reason as the denial notice above: an
-        // inbound-keyed existence check would silently drop this confirmation
-        // for a session whose inbound.db is gone and outbound.db is not.
+        // Outbound-keyed, as for the denial notice above.
         await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) =>
           outbound.writeOutboundDirect({
             id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1495,12 +1171,8 @@ async function deliverToAgent(
     }
   }
 
-  // Thread-context parity with v1: on engaged mentions inside a thread, fetch
-  // recent thread history from the platform (covers messages from other bots,
-  // plain user messages that never engaged us, and anything the skip above
-  // declined to store) and prepend it to the trigger. The cutoff rule lives in
-  // `src/thread-context.ts` because the agent-to-agent wake path has to apply
-  // the identical rule — see that file.
+  // On engaged mentions in a thread, prepend recent platform thread history (the cutoff rule is shared with the
+  // agent-to-agent wake path in src/thread-context.ts).
   let contentForWrite = persistedContent;
   if (flagIntent || flagCleanedText !== null) {
     const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
@@ -1515,10 +1187,7 @@ async function deliverToAgent(
     effectiveThreadId !== null &&
     (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')
   ) {
-    // `session` was read before `markSessionEngaged` runs below, so its
-    // `engaged_at` still describes the state BEFORE this wake — which is the
-    // question the backfill asks. Text is already flag- and mention-free here
-    // (the flag parser ran above), so prepending is a straight concat.
+    // `session` predates `markSessionEngaged` below, so `engaged_at` is the pre-wake state the backfill asks about.
     contentForWrite = withThreadContext(
       contentForWrite,
       await buildThreadContextBlock({
@@ -1543,14 +1212,8 @@ async function deliverToAgent(
     );
   }
 
-  // Archive BEFORE the session write: writeSessionMessageIfNew synchronously
-  // builds the pre-turn recall row, whose preference lane (pre-turn-context.ts)
-  // resolves each sender's canonical users.display_name via
-  // recentConversationSenders reading messages_archive. On a thread's first
-  // message the trigger sender has no other archive rows yet, so if the
-  // archive write happened after this call, the trigger's own name couldn't
-  // resolve until their second message. Archiving first makes the trigger's
-  // row visible to that same-turn read.
+  // Archive BEFORE the session write: the pre-turn recall row resolves sender names from messages_archive, so a
+  // thread's first sender would otherwise be unnamed until their second message.
   archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
 
   const inserted = await writeSessionMessageIfNew(
@@ -1567,19 +1230,8 @@ async function deliverToAgent(
       content: contentForWrite,
       trigger: wake ? 1 : 0,
     },
-    // The genuine platform message id this row represents — the runner
-    // renders it as platform_msg_id (formatter.ts) so the agent can cite the
-    // exact message it was answering. This is the one write in the codebase
-    // that may set it (host-origin.ts PLATFORM_MSG_ID_FIELD); every other
-    // caller of writeSessionMessage/writeSessionMessageIfNew leaves it unset.
-    //
-    // event.message.id is the routing/dedup key and is set for EVERY event,
-    // including ones this host synthesized (the CLI `to:` admin transport,
-    // Discord slash commands, `ncl messaging-groups send`, and CLI's own
-    // "plain chat"). Only event.message.nativeId is trust-bearing: it is set
-    // solely by main.ts's onInbound for genuine, non-CLI adapter ingress
-    // (adapter.ts InboundEvent.message.nativeId) — undefined here for every
-    // synthetic path, so no stamp is written for them.
+    // The only write that may stamp platform_msg_id. `event.message.id` is set for every event, including
+    // host-synthesized ones; only `nativeId` is trust-bearing (genuine adapter ingress only).
     { platformMessageId: event.message.nativeId },
   );
   if (!inserted) {
@@ -1592,13 +1244,9 @@ async function deliverToAgent(
     return;
   }
 
-  // The message is durable and this wiring engaged — record the fact. Stamped
-  // AFTER the backfill read above, which needs the pre-wake state, and after
-  // the write, so a duplicate or a failed insert never claims engagement.
+  // Stamped AFTER the backfill read (needs pre-wake state) and the write (a failed or duplicate insert never engages).
   if (wake) await markSessionEngaged(session.id);
-  // The 👀 receipt, only now that the message is durable (a failed or
-  // duplicate insert never acknowledges), and only for a live human message
-  // — a replayed history message was already seen.
+  // The 👀 receipt only once durable, and only for a live human message (not a replayed one).
   if (wake && !event.recovered && isHumanChatSdkContent(event.message.kind, event.message.content)) {
     ackInboundReceipt(event.channelType, event.platformId, effectiveThreadId, event.message.id, mg.instance);
   }
@@ -1628,13 +1276,7 @@ async function deliverToAgent(
       );
     }
     {
-      // Priority is applied atomically inside wakeContainer. If this session
-      // was queued for scheduled work, the returned promise now represents
-      // the real promotion/admission result rather than a stale queued=false.
-      //
-      // The liveness proof is the wake's, not ours: a `getSession` here proved
-      // the row live before the call, and the call then awaits admission, the
-      // memory queue and the spawn preparation.
+      // Priority is applied atomically inside the wake; the liveness proof is the wake's own guard.
       const woke = await requestWake(session, 'inbound-message', {
         priority: 'interactive',
         guard: sessionStillActive(session.id),

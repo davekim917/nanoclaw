@@ -179,6 +179,70 @@ describe('mutations of container.json are serialized', () => {
   });
 });
 
+describe('the projection write is part of the locked mutation', () => {
+  it('holds the lock until the projection settles, so a later writer cannot land between file and projection', async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = updateContainerConfig(
+      FOLDER,
+      (config) => {
+        config.groupName = 'first';
+      },
+      async () => {
+        order.push('first:project');
+        await gate;
+        order.push('first:projected');
+      },
+    );
+    await vi.waitFor(() => expect(order).toEqual(['first:project']));
+    const second = updateContainerConfig(FOLDER, () => {
+      order.push('second:mutate');
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(order).toEqual(['first:project']);
+
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(['first:project', 'first:projected', 'second:mutate']);
+  });
+});
+
+describe('the container_configs projection has one writer', () => {
+  it('nothing outside container-config.ts writes a projected column directly in production code', () => {
+    // Structural, for the same reason as the container.json writer check below: the defect class is a NEW caller
+    // that writes the projection on its own, after the file lock is released or without the file at all.
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const owner = path.join(repoRoot, 'src', 'container-config.ts');
+    const definer = path.join(repoRoot, 'src', 'db', 'container-configs.ts');
+    const offenders: string[] = [];
+    let scanned = 0;
+    let ownerSeen = false;
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== 'node_modules') walk(full);
+          continue;
+        }
+        if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts') || full === definer) continue;
+        scanned++;
+        const writes = /\bupdateContainerConfig(Json|Scalars)\s*\(/.test(fs.readFileSync(full, 'utf8'));
+        if (full === owner) {
+          ownerSeen = true;
+          expect(writes).toBe(true);
+          continue;
+        }
+        if (writes) offenders.push(path.relative(repoRoot, full));
+      }
+    };
+    for (const root of ['src', 'scripts', 'setup']) walk(path.join(repoRoot, root));
+    expect(ownerSeen).toBe(true);
+    expect(scanned).toBeGreaterThan(200);
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe('the write leaves nothing beside the config', () => {
   it('writes IN PLACE — no sibling temp file, because that file would not be mount-protected', () => {
     // A write-to-temp-and-rename is the textbook atomic write and is wrong

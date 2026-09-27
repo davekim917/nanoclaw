@@ -14,7 +14,7 @@
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { getContainerConfig } from '../../db/container-configs.js';
 import { getDenialFor } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
@@ -25,8 +25,8 @@ import {
   readContainerConfig,
   resolveGroupProvider,
   type ParsedMcpServerConfig,
-  updateContainerConfig,
   validateMcpServerName,
+  writeContainerConfigJson,
   writeContainerConfigScalars,
 } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -47,21 +47,11 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     return;
   }
 
-  // Append new packages to existing lists in the DB (deduplicated)
-  if (payload.apt) {
-    const existing = JSON.parse(configRow.packages_apt) as string[];
-    for (const pkg of payload.apt as string[]) {
-      if (!existing.includes(pkg)) existing.push(pkg);
-    }
-    await updateContainerConfigJson(agentGroup.id, 'packages_apt', existing);
-  }
-  if (payload.npm) {
-    const existing = JSON.parse(configRow.packages_npm) as string[];
-    for (const pkg of payload.npm as string[]) {
-      if (!existing.includes(pkg)) existing.push(pkg);
-    }
-    await updateContainerConfigJson(agentGroup.id, 'packages_npm', existing);
-  }
+  const merge = (list: string[], add: unknown) => [...new Set([...list, ...((add as string[] | undefined) ?? [])])];
+  await writeContainerConfigJson(agentGroup.id, agentGroup.folder, ({ packages }) => {
+    packages.apt = merge(packages.apt, payload.apt);
+    packages.npm = merge(packages.npm, payload.npm);
+  });
 
   const pkgs = [
     ...((payload.apt as string[] | undefined) || []),
@@ -172,11 +162,10 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     return;
   }
 
-  const fileConfig = await updateContainerConfig(agentGroup.folder, (config) => {
+  await writeContainerConfigJson(agentGroup.id, agentGroup.folder, (config) => {
     if (!config.mcpServers) config.mcpServers = {};
     config.mcpServers[name] = serverConfig;
   });
-  await updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
   // Keyed on the placeholder VALUE, not header presence: a server with only
   // `Content-Type` has no credential to assign.

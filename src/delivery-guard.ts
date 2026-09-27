@@ -12,13 +12,8 @@ import { log } from './log.js';
 import type { PendingApproval, Session } from './types.js';
 
 /**
- * Handler shape for guard-wrapped actions.
- *
- * Same two-argument contract as `DeliveryActionHandler` since the mailbox
- * seam removed the session handle (plan §4.5b): a handler that needs session
- * state opens its own mailbox session. That is what makes an approved
- * replay identical to a fresh dispatch — the replay runs long after the drain
- * that raised the hold, and there was never a handle it could have carried.
+ * Same two-argument contract as `DeliveryActionHandler`: a handler needing session state opens its own mailbox
+ * session, which is what makes an approved replay identical to a fresh dispatch.
  */
 export type GuardedDeliveryHandler = (
   content: Record<string, unknown>,
@@ -56,8 +51,7 @@ export async function runGuarded(
 ): Promise<void | { deferAck: true }> {
   if (spec.precheck && !(await spec.precheck(content, session))) return;
 
-  // Under the central lease: the guard's reads are raw by design (seam 3
-  // §4.5 I-1).
+  // Under the central lease: the guard's reads are raw by design.
   const decision = await withCentralSync(
     () =>
       guard(spec.guardAction, {

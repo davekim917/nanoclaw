@@ -1,17 +1,9 @@
 /**
- * A workgroup's domain wiki, offered read-only to every agent in the workgroup.
- *
- * The host keeps a checkout at `data/wikis/<workgroup-id>/`. How it stays
- * current is install config (for example an hourly `git pull`); trunk never
- * clones or refreshes it. When the directory exists, every sibling in the
- * workgroup, whatever its provider, gets it mounted read-only at
- * `/workspace/wiki`, and the composed CLAUDE.md / AGENTS.md gets a short
- * section saying when to consult it. No directory, no mount, no section.
- *
- * The path segment is the spawn-resolved workgroup id, never agent input, and
- * it must be a workgroup slug. A symlink or non-directory at that path is
- * refused rather than followed, the same rule cross-workgroup read access
- * applies to its source roots (`src/workgroup-read-access.ts`).
+ * A workgroup's domain wiki at `data/wikis/<workgroup-id>/` (kept current by install config; trunk never clones or
+ * refreshes it), mounted read-only at `/workspace/wiki` for every sibling whatever its provider, plus a composed-doc
+ * section. No directory, no mount, no section. A symlink or non-directory at that path is refused, not followed.
+ * The workgroup id must be the spawn-resolved one, never agent input: the resolver checks slug syntax, not
+ * authorization, so another workgroup's valid slug would pass.
  */
 import fs from 'fs';
 import path from 'path';
@@ -22,13 +14,11 @@ import type { VolumeMount } from './providers/provider-container-registry.js';
 
 export const WORKGROUP_WIKI_CONTAINER_PATH = '/workspace/wiki';
 
-// Same slug rule as src/workgroup-read-access.ts WORKGROUP_ID_RE: letters,
-// digits and hyphens only, so no id can climb out of data/wikis/.
+// Letters, digits and hyphens only, so no id can climb out of data/wikis/.
 const WORKGROUP_ID_RE = /^[a-z][a-z0-9-]*$/;
 
 export interface WorkgroupWiki {
   mount: VolumeMount;
-  /** Whether the wiki has a top-level index.md to start from. */
   hasIndex: boolean;
 }
 
@@ -37,9 +27,8 @@ export function workgroupWikiHostPath(workgroupId: string): string {
 }
 
 /**
- * `workspaceHostRoot` is the host directory mounted at `/workspace` (the
- * agent-writable session dir). When given, the wiki is skipped if something
- * other than a directory already sits at its `wiki` mountpoint.
+ * `workspaceHostRoot` must be the agent-writable session dir mounted at `/workspace`; when given, the wiki is skipped
+ * if a non-directory already sits at its `wiki` mountpoint.
  */
 export function resolveWorkgroupWiki(
   workgroupId: string | null | undefined,
@@ -76,11 +65,8 @@ export function resolveWorkgroupWiki(
 }
 
 /**
- * An agent in a session that predates the wiki can leave a file or symlink at
- * `/workspace/wiki`. The mountpoint-stub loop keeps whatever already exists
- * there (`if (fs.existsSync(stubPath)) continue` in container-runner),
- * and Docker then fails a directory bind onto a file on every spawn of that
- * session. Skipping the optional wiki keeps the spawn alive.
+ * A pre-wiki session can leave a file or symlink at `/workspace/wiki`; the mountpoint-stub loop keeps it, and Docker
+ * then fails a directory bind onto it on every spawn. Skipping the optional wiki keeps the spawn alive.
  */
 function mountpointBlocked(mountpoint: string): boolean {
   try {
@@ -92,7 +78,6 @@ function mountpointBlocked(mountpoint: string): boolean {
   }
 }
 
-/** The composed-doc section for a mounted wiki; null when there is none. */
 export function workgroupWikiInstructions(wiki: WorkgroupWiki | null): string | null {
   if (!wiki) return null;
   const lookup = wiki.hasIndex

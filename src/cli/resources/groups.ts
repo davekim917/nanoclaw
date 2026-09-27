@@ -14,6 +14,7 @@ import {
   type McpServerConfig,
   updateContainerConfig,
   resolveGroupProvider,
+  writeContainerConfigJson,
   writeContainerConfigScalars,
 } from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
@@ -27,12 +28,7 @@ import { getDb, hasTable } from '../../db/connection.js';
 import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import {
-  ensureContainerConfig,
-  getContainerConfig,
-  resolveProviderName,
-  updateContainerConfigJson,
-} from '../../db/container-configs.js';
+import { ensureContainerConfig, getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { getDenialFor } from '../../db/denied-models.js';
 import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
@@ -52,7 +48,6 @@ async function requireConfiguredGroup(id: string): Promise<AgentGroup> {
   return group;
 }
 
-// Dual-write: the file is canonical (survives the restart backfill); the DB copy is what the image build reads.
 async function editPackages(
   args: Record<string, unknown>,
   edit: (list: string[], pkg: string) => string[],
@@ -66,13 +61,10 @@ async function editPackages(
   const npm = args.npm as string | undefined;
   if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
 
-  const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
-    if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
-    if (apt) cfg.packages.apt = edit(cfg.packages.apt, apt);
-    if (npm) cfg.packages.npm = edit(cfg.packages.npm, npm);
+  await writeContainerConfigJson(id, group.folder, ({ packages }) => {
+    if (apt) packages.apt = edit(packages.apt, apt);
+    if (npm) packages.npm = edit(packages.npm, npm);
   });
-  if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-  if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
   return { apt: apt || null, npm: npm || null };
 }
 
@@ -702,14 +694,11 @@ registerResource({
 
         const newEntry: McpServerConfig = parseMcpServerEntry(args);
 
-        // Dual-write: container.json is canonical (the spawn reads it); the DB copy is what `config get` reads and is
-        // overwritten file→DB at host start.
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
+        const fileConfig = await writeContainerConfigJson(id, group.folder, (cfg) => {
           assertMcpServerNotPluginOwned(cfg.mcpServers?.[name], name, group.folder);
           if (!cfg.mcpServers) cfg.mcpServers = {};
           cfg.mcpServers[name] = newEntry;
         });
-        await updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
         return { added: name, servers: fileConfig.mcpServers ?? {} };
       },
@@ -739,14 +728,13 @@ registerResource({
         const group = await requireConfiguredGroup(id);
 
         // Validate against the canonical file; the DB copy may be stale.
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
+        await writeContainerConfigJson(id, group.folder, (cfg) => {
           if (!cfg.mcpServers || !cfg.mcpServers[name]) {
             throw new Error(`MCP server "${name}" not found`);
           }
           assertMcpServerNotPluginOwned(cfg.mcpServers[name], name, group.folder);
           delete cfg.mcpServers[name];
         });
-        await updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
         return { removed: name };
       },
@@ -797,13 +785,12 @@ registerResource({
           containerPath,
           ...(args.ro || args.readonly ? { readonly: true } : {}),
         };
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
+        await writeContainerConfigJson(id, group.folder, (cfg) => {
           if (!cfg.additionalMounts) cfg.additionalMounts = [];
           if (!cfg.additionalMounts.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
             cfg.additionalMounts.push(mount);
           }
         });
-        await updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
 
         return { added: mount, note: `Run \`ncl groups restart --id ${id}\` for the mount to take effect.` };
       },
@@ -821,12 +808,11 @@ registerResource({
 
         const group = await requireConfiguredGroup(id);
 
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
+        await writeContainerConfigJson(id, group.folder, (cfg) => {
           cfg.additionalMounts = (cfg.additionalMounts ?? []).filter(
             (m) => !(m.hostPath === hostPath && m.containerPath === containerPath),
           );
         });
-        await updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
 
         return { removed: { hostPath, containerPath }, note: `Run \`ncl groups restart --id ${id}\` to apply.` };
       },

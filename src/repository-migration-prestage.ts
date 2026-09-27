@@ -1,8 +1,6 @@
 /**
- * Host-only, performance-only cache for the expensive byte hashes collected
- * while inventorying legacy checkouts. A cache hit is never treated as proof
- * that a checkout is unchanged: callers still enumerate paths and take a new
- * lstat snapshot at the final quiescent capture.
+ * Performance-only cache of byte hashes from legacy-checkout inventory. A hit is never proof a checkout is
+ * unchanged: callers still enumerate paths and re-snapshot at the final quiescent capture.
  */
 import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -10,8 +8,7 @@ import path from 'path';
 
 export type PrestagedFileType = 'file' | 'symlink';
 
-// The live inventory is expected to include roughly one million paths. These
-// limits cap parser/memory exposure while leaving headroom for that fleet.
+// Caps parser/memory exposure with headroom over the ~1M-path live inventory.
 const MAX_CACHE_ENTRIES = 1_250_000;
 export const MAX_CACHE_DOCUMENT_BYTES = 768 * 1024 * 1024;
 export const MAX_CACHE_PATH_BYTES = 4096;
@@ -273,11 +270,7 @@ function cacheabilityFailure(identity: PrestagedFileIdentity): string | null {
   return null;
 }
 
-/**
- * Cache persisted between a live prestage and a later offline migration.
- * Its contents are advisory only; malformed or unsafe persisted state is
- * rejected before a final offline run can consume it.
- */
+/** Persisted between a live prestage and a later offline migration; malformed or unsafe state is rejected. */
 export class RepositoryMigrationPrestageCache {
   private readonly entries = new Map<string, PrestagedFileEntry>();
   private readonly counters = {
@@ -316,8 +309,7 @@ export class RepositoryMigrationPrestageCache {
   }
 
   hash(file: string, expectedType: PrestagedFileType): PrestagedFileHash {
-    // A live prestage can race normal work. Never save a digest unless the
-    // post-read identity is byte-for-byte identical to the pre-read identity.
+    // A live prestage races normal work: save a digest only if the post-read identity matches the pre-read one.
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const before = snapshot(file, expectedType);
       const cached = this.entries.get(before.path);

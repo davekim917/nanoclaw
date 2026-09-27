@@ -701,7 +701,7 @@ def main():
             input_errors.append("ncl tasks list: rc={} {}".format(rc, (err or "").strip()[:120]))
         else:
             # The controller matches `name` against its ctl-<key8> slug; a series
-            # id is `<name slug>-<hex>` (src/modules/scheduling/create.ts:67-71).
+            # id is `<name slug>-<hex>` (`makeTaskId`, src/modules/scheduling/create.ts).
             tasks = [{"id": t.get("series_id"), "name": t.get("series_id"), "status": t.get("status")}
                      for t in resp["data"] if isinstance(t, dict)]
         summary["tasksFetched"] = True

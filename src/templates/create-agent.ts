@@ -5,12 +5,12 @@ import path from 'path';
 import { DATA_DIR, GROUPS_DIR, TIMEZONE } from '../config.js';
 import {
   CONTAINER_PLUGINS_DIR,
-  updateContainerConfig,
+  writeContainerConfigJson,
   writeContainerConfigScalars,
   type ParsedMcpServerConfig,
 } from '../container-config.js';
 import { createAgentGroup } from '../db/agent-groups.js';
-import { ensureContainerConfig, updateContainerConfigJson } from '../db/container-configs.js';
+import { ensureContainerConfig } from '../db/container-configs.js';
 import { assertValidGroupFolder, resolveGroupFolderPath } from '../group-folder.js';
 import { canonicalizeIanaTimezone } from '../timezone.js';
 import { stageGroupPersona } from '../group-persona.js';
@@ -161,13 +161,10 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
     fs.mkdirSync(path.join(groupDir, 'plugin-data', tpl.name, sub), { recursive: true });
   }
 
-  // Dual-write: container.json is what the spawn reads, and a DB-only write left stamped servers unwired on first
-  // spawn.
   const marked = withPluginOwner(markPluginServers(tpl.mcpServers, tpl.name), tpl.name);
-  await updateContainerConfig(folder, (config) => {
+  await writeContainerConfigJson(id, folder, (config) => {
     config.mcpServers = { ...(config.mcpServers ?? {}), ...marked };
   });
-  await updateContainerConfigJson(id, 'mcp_servers', marked);
 
   // Per-group skills overlay — keyed by group id, never shared. Copied through
   // the hardened copier like everything else that leaves the plugin.

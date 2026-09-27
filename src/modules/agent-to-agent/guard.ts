@@ -75,11 +75,9 @@ export const a2aSend = defineGuardedAction({
     const from = input.actor.agentGroupId;
     const to = input.resource?.to ?? '';
     const isSelf = to === from;
-    // Synchronous by design (seam-3 plan §4.5, I-1): this decide runs inside
-    // the agent-route WriteGuard — itself inside `writeSessionMessage`'s
-    // `withCentralSync` block, with nothing awaited between it and the insert
-    // — so it never awaits. Its central reads execute the leaves' exported
-    // SQL constants through `withRawDb`, not the leaves' async exports.
+    // Synchronous by design: this runs inside `writeSessionMessage`'s
+    // `withCentralSync` block with nothing awaited before the insert, so it reads
+    // through `withRawDb` with the leaves' SQL constants, never their async exports.
     if (!isSelf && withRawDb((raw) => raw.prepare(AGENT_DESTINATION_EXISTS_SQL).get(from, 'agent', to)) === undefined) {
       return DENY(`unauthorized agent-to-agent: ${from} has no destination for ${to}`);
     }
@@ -97,9 +95,7 @@ export const a2aSend = defineGuardedAction({
   },
 });
 
-// Synchronous by design (seam-3 plan §4.5, I-1): runs inside the consult
-// site's `withCentralSync` block and never awaits. The central read executes
-// the leaf's exported SQL through `withRawDb`.
+// Synchronous by design, like the a2a.send decide above.
 function cliScopeOf(agentGroupId: string): string {
   const row = withRawDb((raw) => raw.prepare(CONTAINER_CONFIG_BY_GROUP_SQL).get(agentGroupId)) as
     | { cli_scope: string | null }

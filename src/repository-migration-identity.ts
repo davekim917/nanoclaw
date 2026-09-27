@@ -25,9 +25,8 @@ export function repositoryOriginContainsCredentials(origin: string | null): bool
 }
 
 /**
- * Derive the only network origin shape migration may serialize or configure.
- * Legacy credentials are deliberately discarded here; callers that need to
- * classify their presence must use repositoryOriginContainsCredentials first.
+ * The only origin shape migration may serialize or configure; credentials are discarded, so callers that must
+ * detect them use repositoryOriginContainsCredentials first.
  */
 export function normalizedCredentialFreeGithubOrigin(origin: string | null): string | null {
   if (!origin) return null;
@@ -53,10 +52,9 @@ export function normalizedGithubRepositoryIdentity(origin: string | null): strin
 }
 
 /**
- * Legacy local directory names are not repository identities. Coalesce every
- * bucket that resolves to the same GitHub repository, then attach an
- * origin-unreadable case-only alias only when exactly one anchored identity in
- * that workgroup has the same repository basename.
+ * Legacy directory names are not identities: within one workgroup, buckets resolving to one GitHub repository
+ * coalesce, and an origin-unreadable case-only alias attaches only when exactly one anchored identity in that
+ * workgroup shares its basename. Separate workgroups never coalesce.
  */
 export function planLegacyRepositoryCoalescing(
   groups: LegacyRepositoryIdentityGroup[],

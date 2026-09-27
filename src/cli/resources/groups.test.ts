@@ -1065,6 +1065,7 @@ describe('groups config — the container.json + container_configs dual write ho
           effort: 'high',
           assistant_name: 'Dual',
           timezone: 'Europe/Lisbon',
+          image_tag: 'nanoclaw-agent:dual',
         },
       },
       { caller: 'host' },
@@ -1077,6 +1078,7 @@ describe('groups config — the container.json + container_configs dual write ho
     expect(file.effort).toBe('high');
     expect(file.assistantName).toBe('Dual');
     expect(file.timezone).toBe('Europe/Lisbon');
+    expect(file.imageTag).toBe('nanoclaw-agent:dual');
 
     const row = (await getContainerConfig(id))!;
     expect(row.provider).toBe('codex');
@@ -1084,6 +1086,7 @@ describe('groups config — the container.json + container_configs dual write ho
     expect(row.effort).toBe('high');
     expect(row.assistant_name).toBe('Dual');
     expect(row.timezone).toBe('Europe/Lisbon');
+    expect(row.image_tag).toBe('nanoclaw-agent:dual');
   });
 
   it('config update clears redundant model and effort pins from both stores', async () => {
@@ -1152,6 +1155,84 @@ describe('groups config — the container.json + container_configs dual write ho
     expect(removed.ok).toBe(true);
     expect(readContainerConfig(folder).mcpServers.both).toBeUndefined();
     expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).both).toBeUndefined();
+  });
+
+  it('config add-mount and remove-mount both write file and DB', async () => {
+    const id = 'ag-dual-write-mount';
+    const folder = 'dual-write-mount';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+    const mount = { hostPath: '/srv/data', containerPath: '/workspace/data', readonly: true };
+
+    const added = await dispatch(
+      {
+        id: 'req-mount-add',
+        command: 'groups-config-add-mount',
+        args: { id, host: mount.hostPath, container: mount.containerPath, ro: true },
+      },
+      { caller: 'host' },
+    );
+    expect(added.ok).toBe(true);
+    expect(readContainerConfig(folder).additionalMounts).toEqual([mount]);
+    expect(JSON.parse((await getContainerConfig(id))!.additional_mounts)).toEqual([mount]);
+
+    const removed = await dispatch(
+      {
+        id: 'req-mount-remove',
+        command: 'groups-config-remove-mount',
+        args: { id, host: mount.hostPath, container: mount.containerPath },
+      },
+      { caller: 'host' },
+    );
+    expect(removed.ok).toBe(true);
+    expect(readContainerConfig(folder).additionalMounts).toEqual([]);
+    expect(JSON.parse((await getContainerConfig(id))!.additional_mounts)).toEqual([]);
+  });
+
+  it('config add-package and remove-package both write file and DB', async () => {
+    const id = 'ag-dual-write-pkg';
+    const folder = 'dual-write-pkg';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+    const stores = async () => {
+      const row = (await getContainerConfig(id))!;
+      return [
+        readContainerConfig(folder).packages,
+        { apt: JSON.parse(row.packages_apt), npm: JSON.parse(row.packages_npm) },
+      ];
+    };
+
+    const added = await dispatch(
+      { id: 'req-pkg-add', command: 'groups-config-add-package', args: { id, apt: 'jq', npm: 'left-pad' } },
+      { caller: 'host' },
+    );
+    expect(added.ok).toBe(true);
+    expect(await stores()).toEqual([
+      { apt: ['jq'], npm: ['left-pad'] },
+      { apt: ['jq'], npm: ['left-pad'] },
+    ]);
+
+    const removed = await dispatch(
+      { id: 'req-pkg-remove', command: 'groups-config-remove-package', args: { id, apt: 'jq' } },
+      { caller: 'host' },
+    );
+    expect(removed.ok).toBe(true);
+    expect(await stores()).toEqual([
+      { apt: [], npm: ['left-pad'] },
+      { apt: [], npm: ['left-pad'] },
+    ]);
   });
 
   it('config add/remove-mcp-server --fleet edits the fleet defaults, not a group', async () => {

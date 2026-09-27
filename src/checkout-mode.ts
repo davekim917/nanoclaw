@@ -1,15 +1,7 @@
 /**
- * `NANOCLAW_CHECKOUT_MODE=worktree|clone` (docs/specs/repository-branch-clones/plan.md
- * §5.3, M1): how `create_worktree` makes a NEW checkout. Resolution of an
- * existing checkout is shape-aware in both modes, so switching back to
- * `worktree` strands no clone (§7 rollback).
- *
- * Read from `process.env` at first use, never at import: main.ts loads `.env`
- * into process.env inside main() (`loadEnvIntoProcess` in src/main.ts), after
- * every module has been imported, so an import-time read would
- * miss a value set only in `.env`. It is resolved at first use (the first
- * spawn), which WARNs once for a refused value, and is then fixed for the
- * process: changing it takes a restart.
+ * `NANOCLAW_CHECKOUT_MODE=worktree|clone`: how `create_worktree` makes a NEW checkout; resolving an existing one is
+ * shape-aware in both modes, so switching back strands no clone. Read at first use (the first spawn), never at
+ * import: main() loads `.env` into process.env after every module is imported. Fixed for the process thereafter.
  */
 import { containerRunsAsHostUser } from './github-token-file.js';
 import { log } from './log.js';
@@ -24,11 +16,8 @@ export interface CheckoutModeDecision {
 }
 
 /**
- * Unset -> `worktree`. Anything but the two exact names -> `worktree` with a
- * warning: a typo must never enable clones. `clone` also needs containers that
- * run as the host uid (`containerRunsAsHostUser`, src/github-token-file.ts):
- * the host creates every clone, and a container running as any other uid could
- * not write the files the host made (plan §5.2 preconditions).
+ * Unset is `worktree` silently; anything else but the two exact names is `worktree` with a warning: a typo must
+ * never enable clones. `clone` also needs containers running as the host uid, since the host creates every clone.
  */
 export function decideCheckoutMode(raw: string | undefined, containersRunAsHostUser: boolean): CheckoutModeDecision {
   if (raw === undefined || raw === 'worktree') return { mode: 'worktree', warning: null };
@@ -51,7 +40,6 @@ export function decideCheckoutMode(raw: string | undefined, containersRunAsHostU
 
 let resolved: CheckoutMode | null = null;
 
-/** The mode for this host process, resolved and logged once. */
 export function effectiveCheckoutMode(): CheckoutMode {
   if (resolved) return resolved;
   const raw = process.env[CHECKOUT_MODE_ENV];

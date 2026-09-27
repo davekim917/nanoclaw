@@ -67,6 +67,13 @@ function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: st
   fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
   // Install inventory stays untracked; snapshots resolve it from their common checkout.
   fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), 'Private Customer\n');
+  // A gating scan refuses to run without the install registry as well.
+  fs.mkdirSync(path.join(root, 'data'));
+  const db = new Database(path.join(root, 'data', 'v2.db'));
+  db.exec(
+    "CREATE TABLE workgroups (id TEXT, display_name TEXT); INSERT INTO workgroups VALUES ('fixture-workgroup', 'Private Customer');",
+  );
+  db.close();
   fs.writeFileSync(path.join(root, '.public-boundary-allowlist.json'), '{"entries": []}\n');
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
   fs.symlinkSync(
@@ -900,12 +907,6 @@ describe('.husky/pre-push', () => {
     'honors a later approved exception for an intermediate commit %s',
     (surface) => {
       const f = fixture();
-      fs.mkdirSync(path.join(f.root, 'data'));
-      const db = new Database(path.join(f.root, 'data', 'v2.db'));
-      db.exec(
-        "CREATE TABLE workgroups (id TEXT, display_name TEXT); INSERT INTO workgroups VALUES ('fixture-workgroup', 'Private Customer');",
-      );
-      db.close();
       const base = commit(f.root, 'remote-base');
       const flagged = commit(
         f.root,

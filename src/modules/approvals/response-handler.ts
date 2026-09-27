@@ -37,14 +37,7 @@ import {
 } from './primitive.js';
 import { armReasonCapture } from './reason-capture.js';
 
-/**
- * Detect whether this approval was delivered into the session's own thread/
- * channel (deliveryTarget='thread') vs DM'd to an admin (deliveryTarget='admin').
- * Compares the approval row's stored destination against the session's
- * messaging group. Thread-target cards live in the originating chat, where
- * thread access IS the approval authority — see primitive.ts. Admin-target
- * cards require clicker-identity verification (isAuthorizedApprovalClick).
- */
+/** Thread-target cards live in the originating chat, where thread access IS the approval authority. */
 async function isThreadDelivery(approval: PendingApproval, session: Session): Promise<boolean> {
   if (!session.messaging_group_id) return false;
   const mg = await getMessagingGroup(session.messaging_group_id);
@@ -53,13 +46,9 @@ async function isThreadDelivery(approval: PendingApproval, session: Session): Pr
 }
 
 /**
- * Whether a click was made on this approval's own card: the clicked message
- * must be the one the host posted, whose id is stored from deliver's return
- * (see primitive.ts and onecli-approvals.ts). Without a stored id there
- * is nothing to match. A choice card then refuses, because its id is
- * backfilled just after delivery; any other kind resolves as it did before,
- * for a row stored without one (the primitive skips storing when deliver
- * returned no id).
+ * The clicked message must be the card the host posted. With no stored id a
+ * choice card refuses (its id is backfilled just after delivery); any other
+ * kind resolves.
  */
 function isClickOnApprovalCard(approval: PendingApproval, payload: ResponsePayload): boolean {
   if (!approval.platform_message_id) return !getChoiceHandler(approval.action);
@@ -70,12 +59,9 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   const approval = await getPendingApproval(payload.questionId);
   if (!approval) return false;
 
-  // Every kind of approval, OneCLI and choice cards included, resolves only
-  // from its own card. The button names just the approval id, and an agent
-  // that writes a raw ask_question row can post a card of its own carrying
-  // that id, and a click on it decodes through the approval's own options
-  // (src/db/sessions.ts), so it reads as a real answer. Claimed, so
-  // no later handler takes the id either.
+  // Every approval resolves only from its own card: an agent can post a raw
+  // ask_question card carrying the same approval id. Claimed, so no later
+  // handler takes the id either.
   if (!isClickOnApprovalCard(approval, payload)) {
     log.warn('Ignoring a click that was not made on the approval card', {
       approvalId: approval.approval_id,
@@ -88,10 +74,8 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
-  // OneCLI credential approvals — row-keyed resolution first. The 3-arg
-  // resolver looks the row up itself and enforces its own cross-tenant
-  // approver-set auth (onecli-approvals.ts), so this runs ahead of
-  // isAuthorizedApprovalClick and claims every onecli_credential row.
+  // Ahead of isAuthorizedApprovalClick: the OneCLI resolver enforces its own
+  // approver-set auth and claims every onecli_credential row.
   if (await resolveOneCLIApproval(payload.questionId, payload.value, namespacedUserId(payload) ?? '')) {
     return true;
   }
@@ -107,12 +91,8 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   }
 
   if (approval.action === ONECLI_ACTION) {
-    // Unreachable in practice: resolveOneCLIApproval above claims every
-    // onecli_credential row it can find, and this branch is only reached when
-    // getPendingApproval found one. Kept as a guard so a future refactor can't
-    // route a credential row into the module-approval path below — that path
-    // deletes the row, which would silently kill a card that is still
-    // clickable and still has a held request behind it.
+    // Unreachable today; guards the module-approval path below, which would
+    // delete a still-clickable credential row.
     log.warn('OneCLI approval row reached the module-approval path — ignoring', {
       approvalId: approval.approval_id,
     });
@@ -129,13 +109,9 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
 }
 
 /**
- * Host-operator resolution path — `ncl approvals approve|reject`. Runs the
- * exact same resolution as an authorized card click. Exists because DM
- * delivery is best-effort (a card can land with an admin who isn't the right
- * decider, or a platform hiccup can eat it): the operator terminal must
- * always be able to resolve a pending approval. Callers MUST have rejected
- * agent-originated requests before calling — an agent must never resolve an
- * approval, least of all its own.
+ * `ncl approvals approve|reject`: the same resolution as an authorized click.
+ * Callers MUST have rejected agent-originated requests: an agent must never
+ * resolve an approval, least of all its own.
  */
 export async function resolveApprovalFromHost(
   approvalId: string,
@@ -180,9 +156,7 @@ async function handleRegisteredApproval(
     return;
   }
 
-  // Plain Reject — instant fast path. Unknown values are untrusted transport
-  // input, not a user decision: keep the approval pending instead of turning
-  // a malformed callback into a rejection.
+  // Unknown values are untrusted transport input: the approval stays pending.
   if (selectedOption === 'reject') {
     await finalizeReject(approval, session, userId);
     return;
@@ -226,8 +200,7 @@ async function handleRegisteredApproval(
     );
   }
 
-  // The bridge edits no approval card on click, so the card still shows live
-  // buttons until this lands (primitive.ts editApprovalCardResolution).
+  // The bridge edits no approval card on click; the card shows live buttons until this lands.
   await editApprovalCardResolution(approval, selectedOption, userId);
   await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
@@ -248,17 +221,13 @@ async function isAuthorizedApprovalClick(approval: PendingApproval, payload: Res
     return userId === approval.approver_user_id;
   }
 
-  // Thread-delivered cards (deliveryTarget='thread', e.g. bash/email gates)
-  // post into the originating conversation, where thread access IS the
-  // approval authority — any thread member may resolve. See primitive.ts.
-  // Choice cards never take this shortcut: an answer is a decision the agent
-  // acts on, so it needs admin privilege exactly like an admin-DM card.
+  // Any thread member may resolve a thread-delivered card. Choice cards never
+  // take this shortcut: an answer is a decision the agent acts on.
   if (approval.session_id && !getChoiceHandler(approval.action)) {
     const session = await getSession(approval.session_id);
     if (session && (await isThreadDelivery(approval, session))) return true;
   }
 
-  // A choice card may narrow who answers to named approvers (choices.ts).
   if (getChoiceHandler(approval.action) && !choiceClickAllowed(approval, userId)) return false;
 
   const agentGroupId =

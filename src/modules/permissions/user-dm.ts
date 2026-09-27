@@ -24,8 +24,8 @@
  *
  * Successful resolutions are persisted in `user_dms (user_id, channel_type
  * → messaging_group_id)`. The cache survives restarts; first-time DMs on a
- * given channel pay one `openDM` round trip, everyone after is a pure DB
- * read.
+ * given channel pay one `openDM` round trip; later hits are DB reads unless a
+ * named instance rejects a row cached from another instance.
  *
  * The underlying platform APIs (`POST /users/@me/channels` on Discord,
  * `conversations.open` on Slack, etc.) are idempotent and return the same
@@ -50,29 +50,13 @@ import { getUserDm, upsertUserDm } from './db/user-dms.js';
  *
  * Callers should treat null as "this user is unreachable on this channel".
  *
- * `instance` names the adapter instance the DM should belong to — normally
- * the instance of the conversation that prompted it. It matters only when the
- * row has to be created: `createMessagingGroup` stamps `instance =
- * channel_type` for an unset value, and on an install whose bots are all
- * NAMED instances nothing is registered under the bare channel type, so a row
- * created without it is undeliverable by any caller that dispatches on the
- * exact instance key (`getChannelAdapterExact`). Omit it and the previous
- * behavior is unchanged.
+ * `instance` stamps a created row (unset gives `instance = channel_type`,
+ * undeliverable when every bot is a named instance) and rejects a cached row
+ * from a different instance. `user_dms` is keyed (user_id, channel_type), so an
+ * unaddressed caller gets whichever instance is currently cached.
  *
- * Known limitation, unchanged here: `user_dms` is keyed
- * (user_id, channel_type), not instance, so a user already cached from one
- * instance keeps that row even when a different instance asks with no
- * instance of its own — an unaddressed caller still gets whichever instance
- * cached first. Widening the cache key is a schema change and out of scope
- * for this fix. A caller that DOES name an instance, though, never receives
- * a cached row stamped with a DIFFERENT one: see the cache-hit check below.
- *
- * Set `privacySafeLogs` for security-sensitive flows to omit user, handle,
- * messaging-group, and raw platform-error details from log data. Requested
- * only where a failure would otherwise write a stranger-facing platform
- * handle or raw platform error into the host log on the approval-delivery
- * and dashboard-token-issue paths — every other caller keeps the detailed
- * shape, which is what makes "why didn't the owner get the card" debuggable.
+ * `privacySafeLogs` omits user, handle, messaging-group and raw platform-error
+ * details from logs, for security-sensitive flows only.
  */
 export async function ensureUserDm(
   userId: string,
@@ -90,20 +74,12 @@ export async function ensureUserDm(
     return null;
   }
 
-  // Cache hit: existing user_dms row → load and return the messaging_group.
   const cached = await getUserDm(userId, channelType);
   if (cached) {
     const mg = await getMessagingGroup(cached.messaging_group_id);
     if (mg) {
-      // The cache key is (user_id, channel_type), not instance. A caller
-      // that named an instance is about to dispatch delivery on THIS row's
-      // exact instance key — handing it a row cached from a DIFFERENT
-      // instance would deliver content that originated on bot A through bot
-      // B's adapter/identity. Treat that as a miss and re-resolve on the
-      // requested instance below; the find-or-create re-caches it, so a
-      // user active on two named bots simply alternates which row is
-      // cached, always correct for whichever instance is asking. A caller
-      // that did NOT name an instance keeps today's behavior unchanged.
+      // A row cached from a DIFFERENT instance would deliver bot A's content
+      // through bot B, so a named caller treats it as a miss and re-resolves.
       const cachedInstance = mg.instance ?? channelType;
       if (!instance || cachedInstance === instance) return mg;
       log.info(
@@ -122,23 +98,15 @@ export async function ensureUserDm(
   }
 
   // Cache miss: resolve the DM platform_id either via openDM or directly.
-  // Resolved through the requested instance when there is one: on Slack the
-  // DM channel a bot opens is per-bot, so asking the wrong sibling would
-  // return a channel the intended bot cannot post in.
+  // Through the requested instance: a Slack DM channel is per-bot.
   const dmPlatformId = await resolveDmPlatformId(channelType, handle, instance, privacySafeLogs);
   if (!dmPlatformId) return null;
 
   // Find-or-create the underlying messaging_group. A DM we received
   // earlier may already have a row matching (channel_type, platform_id).
   //
-  // Scoped to the requested instance. Without it this lookup resolves
-  // default-instance-first and then the lexically-first NAMED instance, so on
-  // a multi-bot direct-addressable channel — where platform_id is the user's
-  // handle and therefore identical across bots — it returns a sibling's row
-  // and the instance we were asked for is silently discarded. The caller then
-  // dispatches on that row's exact instance and reaches the wrong bot. The
-  // table is UNIQUE(channel_type, platform_id, instance), so a per-instance
-  // row is the intended shape; exact-only here means a miss creates one.
+  // Scoped to the requested instance: on a direct-addressable channel the
+  // platform_id is identical across bots, so an unscoped lookup returns a sibling's row.
   const now = new Date().toISOString();
   let mg = await getMessagingGroupByPlatform(channelType, dmPlatformId, instance);
   if (!mg) {
@@ -146,9 +114,6 @@ export async function ensureUserDm(
     mg = {
       id: mgId,
       channel_type: channelType,
-      // Unset falls back to `instance = channel_type` in createMessagingGroup,
-      // which is right for a single-instance install and undeliverable on a
-      // named-instance one — see the doc comment.
       instance,
       platform_id: dmPlatformId,
       name: user.display_name,
@@ -160,11 +125,7 @@ export async function ensureUserDm(
       unknown_sender_policy: 'strict',
       created_at: now,
     };
-    // The lookup above yields (async driver), so two cold DMs to the same
-    // user can both miss and both insert on the UNIQUE(channel_type,
-    // platform_id, instance) key. The loser adopts the winner's row and
-    // continues to `upsertUserDm` + delivery, so both callers cache and DM the
-    // SAME messaging group rather than one aborting mid-approval.
+    // Two cold DMs can both miss and both insert; the loser adopts the winner's row.
     const { row: resolved, created } = await insertOrAdopt(mg, createMessagingGroup, () =>
       getMessagingGroupByPlatform(channelType, dmPlatformId, instance),
     );
@@ -207,9 +168,7 @@ async function resolveDmPlatformId(
   instance: string | undefined,
   privacySafeLogs: boolean,
 ): Promise<string | null> {
-  // getChannelAdapter, not the exact variant: this is one of the
-  // channelType-only call sites the fallback exists for, so an unnamed or
-  // offline instance still resolves through a sibling rather than failing.
+  // Not the exact variant: with no instance, a channel-type key resolves through any adapter of that type.
   const adapter = getChannelAdapter(instance ?? channelType);
   if (!adapter) {
     log.warn('ensureUserDm: no adapter for channel', { channelType, instance });
@@ -243,20 +202,8 @@ function parseUserId(user: User): { channelType: string; handle: string } | { ch
 }
 
 /**
- * The channel kind a user is actually reachable on — the same answer
- * `ensureUserDm` resolves internally, exposed for callers that must decide
- * reachability BEFORE paying for a DM resolution.
- *
- * Not the same thing as the user id's prefix. Teams ids carry a Bot Framework
- * `29:` prefix rather than `teams:`, so a caller that splits the id itself
- * reads `29` and compares it against a channel_type of `teams` — the match
- * fails and the approver is dropped before `ensureUserDm` is ever called.
- * Routing that question through `parseUserId` is what keeps the two layers
- * from disagreeing: whatever kind ensureUserDm would DM this user on is the
- * kind reported here.
- *
- * Returns null when the user is unknown or the id is not resolvable to a
- * channel at all — callers should read that as "not reachable on any origin".
+ * The channel kind `ensureUserDm` would DM this user on. Not the id's prefix:
+ * Teams ids carry `29:`, not `teams:`. Null means not reachable on any origin.
  */
 export async function resolveUserChannelType(userId: string): Promise<string | null> {
   const user = await getUser(userId);
