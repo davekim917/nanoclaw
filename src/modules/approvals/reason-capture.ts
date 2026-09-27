@@ -112,9 +112,8 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
   // can't arrive before the prompt is read, so there's no lost-message window.
   const expiresAt = new Date(Date.now() + REASON_CAPTURE_WINDOW_MS).toISOString();
   await markApprovalAwaitingReason(approval.approval_id, expiresAt);
-  // The bridge edits no approval card on click, so the held card would still
-  // show live buttons while the approver types their reason. finalizeReject
-  // edits it again with the final decision (primitive.ts editApprovalCardResolution).
+  // The bridge edits no card on click; without this the held card shows live
+  // buttons while the approver types. finalizeReject edits it again.
   await editApprovalCardResolution(approval, REJECT_WITH_REASON_VALUE, userId);
   awaitingReason.set(dmKey(dm.channel_type, dm.platform_id), { approvalId: approval.approval_id, userId });
   log.info('reject-with-reason: awaiting reason reply', { approvalId: approval.approval_id, userId });

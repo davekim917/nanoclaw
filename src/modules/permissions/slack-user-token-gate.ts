@@ -1,109 +1,23 @@
 import type { RawStatements } from '../../db/central-lease.js';
 
 /**
- * Slack user-token owner-safety boundary.
+ * Slack user-token owner-safety boundary. The OneCLI proxy injects the owner's
+ * user token (xoxp-), which reads from the OWNER's Slack lens, so a session
+ * that is not owner-safe spawns under the `<group>-noslack` identity whose
+ * secret set excludes it. Decided at spawn, not per call, and this function is
+ * the whole authorization decision.
  *
- * Live Slack access is `curl https://slack.com/api/<method>` through the
- * OneCLI proxy, which injects the owner's user token (xoxp-) at the boundary.
- * The token reads from the OWNER's Slack lens, so the host decides per spawn
- * whether it is injected at all: a session that is not owner-safe spawns under
- * the `<group>-noslack` OneCLI identity whose secret set excludes it (the
- * two-tier identity in `src/container-runner.ts`, which runs
- * only when `slackUserTokenSecrets` finds a secret). There is no second layer: a Slack MCP used to
- * be registered behind this same predicate and was retired, so this function
- * is the whole authorization decision.
- *
- * Fail-closed semantics:
- *   - Session has no messaging_group (e.g., admin shell) → not owner-safe
- *   - Default: owner-safe only when the session is in a 1:1 DM AND a global
- *     OWNER has been recorded with a DM in the same WORKGROUP as the
- *     session's agent. Surfacing the token in a shared channel (is_group=1)
- *     or in a workgroup where no owner has registered a DM would let
- *     teammates query the owner's Slack through the agent.
- *   - Override: `also_allowed_in` is an operator-curated list of
- *     `messaging_group.id` values that bypass the default. Use for trusted
- *     private channels (e.g., a channel that's just the owner + a vetted
- *     collaborator where queries from the owner's lens are acceptable).
- *
- * Matching identity across sibling adapters:
- *
- *   Codex twins (and any future sibling agent with its own bot user) get
- *   their own channel adapter, so the same human appears as TWO distinct
- *   `users` rows — `slack-retail:U0…` for the primary DM and
- *   `slack-retail-codex:U0…` for the example-assistant-codex DM. A naive exact-match
- *   gate only sees owner on the adapter the operator originally talked to.
- *
- *   Earlier iterations of this fix tried to fold sibling identities by
- *   parsing channel_type strings (`familyOf`, `slackWorkspaceOf` with
- *   suffix-stripping). Codex's review correctly flagged TWO bypasses with
- *   that approach: (1) `slack-*` family collapse let any Slack workspace
- *   match another's owner via handle collision, (2) stripping `-codex` from
- *   the end let a workspace literally named `acme-codex` collide with `acme`.
- *
- *   The fix uses TWO orthogonal checks, both required:
- *
- *     (a) HANDLE equality. user_ids are formatted `<channel_type>:<handle>`
- *         per the schema's documented contract. The handle segment after
- *         the first colon is reliable — no operator-defined suffixes to
- *         mis-parse. We compare the session-DM user's handle to the global
- *         owner's handle.
- *
- *     (b) WORKGROUP membership. The session's messaging_group is wired to
- *         an agent_group with a workgroup_id; the owner's recorded DM
- *         (user_dms entry) must be wired to an agent in the SAME
- *         workgroup. Different Slack workspaces have different workgroups
- *         by construction, so cross-workspace handle collision can't
- *         authorize — even if a different human in a different workspace
- *         happens to have the same Slack user-id handle.
- *
- *   For Operator's install (the production bug that motivated this check):
- *     - example-assistant-codex session DM user: `slack-retail-codex:UOWNER` (handle UOWNER,
- *       workgroup `retail`).
- *     - Global owner: `slack-retail:UOWNER` (handle UOWNER) with user_dms
- *       wired to ag-primary (workgroup `retail`).
- *     - Handle match (UOWNER) ✓ + workgroup match (`retail`) ✓ → ALLOW.
- *
- *   For the hypothetical workspace-literally-named-codex bypass attempt:
- *     - `acme-codex-ws` is a Slack workspace named `acme-codex` (legitimate).
- *     - Its agent_groups have workgroup_id `acme-codex-ws`, not `acme`.
- *     - The session's workgroup_id is `acme-codex-ws`; the `acme` owner's
- *       user_dms is wired to workgroup `acme`. Workgroup mismatch → DENY.
- *     - No string parsing involved.
- *
- * The check runs at spawn time, not per call: if it denies, the proxy has no
- * Slack token for that container, so no in-container code path — curl, a
- * script, or any MCP an operator declares — can authenticate to Slack as the
- * owner.
+ * The same human appears as distinct `users` rows on sibling adapters
+ * (`slack-x:U0…`, `slack-x-codex:U0…`). Matching them by parsing channel_type
+ * strings is unsafe (family collapse, a workspace literally named `acme-codex`),
+ * so matching needs HANDLE equality AND platform prefix AND WORKGROUP membership.
  */
 
 /**
- * Is this session a context where the OWNER's Slack may be read on the
- * owner's behalf — i.e., a private space the operator controls, with no
- * non-owner human able to query through the agent?
- *
- * This is the single source of truth for Slack user-token authorization,
- * consumed by the spawn-time credential gate (whether the Slack OneCLI secret
- * is injected into this session's OneCLI agent) and by the capabilities
- * snapshot, which tells the agent whether it has live Slack in this session.
- *
- * Independent of `slack_user_token.enabled`, which no longer gates anything:
- * the Slack secret being in the group's merged set is what makes this check
- * run, and a group carrying it is scoped to owner-safe sessions regardless of
- * that flag.
- *
- * Owner-safe iff EITHER:
- *   - `sessionMessagingGroupId` is in the operator-curated `also_allowed_in`
- *     allow-list (trusted private contexts — e.g. the owner's personal
- *     Discord server channel, which is is_group=1 and so can't be derived as
- *     owner-only without an explicit signal), OR
- *   - the session is the owner's 1:1 DM with this agent (the handle +
- *     platform-prefix + workgroup match documented below).
- *
- * Fail-closed: no messaging group (admin shell) → NOT owner-safe → Slack
- * withheld. Anything not provably owner-safe is non-owner-safe (Slack
- * withheld). NOTE: "owner-safe" is a Slack-credential-trust classification
- * and has nothing to do with `session_mode` (per-thread vs shared) — every
- * channel can be per-thread and still be non-owner-safe for Slack purposes.
+ * Owner-safe iff the session's messaging group is in the operator-curated
+ * `also_allowed_in` list, OR the session is the owner's 1:1 DM with this agent.
+ * Fail-closed: no messaging group (admin shell) → not owner-safe. Unrelated to
+ * `session_mode`, and independent of `slack_user_token.enabled`.
  */
 export function isOwnerSafeSlackSession(
   db: RawStatements,
@@ -115,31 +29,10 @@ export function isOwnerSafeSlackSession(
 
   if (alsoAllowedIn?.includes(sessionMessagingGroupId)) return true;
 
-  // The default safe path. Requires ALL of:
-  //   1. session's messaging_group is a 1:1 DM (is_group = 0) and is wired
-  //      to THIS spawning agent (mga_session.agent_group_id = agentGroupId);
-  //      filtering by the active agent prevents a multi-wired DM from
-  //      authorizing via a different agent's workgroup.
-  //   2. the spawning agent has a non-null workgroup_id (post-migration-036;
-  //      standalone agents are workgroup-of-1)
-  //   3. some global owner (role='owner', agent_group_id IS NULL) has a
-  //      user_dms entry that is wired to a 1:1 DM with an agent in the
-  //      SAME workgroup as the spawning agent
-  //   4. THAT owner's user_id and the session DM's user_id share BOTH the
-  //      same HANDLE (segment after first ':') AND the same PLATFORM PREFIX
-  //      (channel_type segment before first '-' — `slack`, `discord`,
-  //      `telegram`, etc.). Platform-prefix equality on top of handle
-  //      equality prevents cross-platform handle collision from authorizing
-  //      (`telegram:123` owner ≠ `slack-retail:123` session
-  //      user even if handles collide). Workgroup equality on top of
-  //      handle equality prevents cross-workspace collision (different
-  //      Slack workspaces have different workgroups). All three must hold.
-  //
-  // The query fetches owner-candidates that pass the workgroup + is_group
-  // constraints; the platform-prefix and handle filter is applied in JS
-  // because SQLite doesn't have a native registered helper for the
-  // channel_type-before-first-dash extraction and inlining nested
-  // substr/instr in SQL is unreadable.
+  // The default path requires ALL of: the session's messaging group is a 1:1
+  // DM wired to THIS agent (a multi-wired DM must not authorize via another
+  // agent's workgroup); the agent has a workgroup; and a global owner with a DM
+  // in that SAME workgroup shares the session user's handle AND platform prefix.
 
   type SessionRow = { user_id: string };
   const sessionRow = db
@@ -190,10 +83,6 @@ export function isOwnerSafeSlackSession(
   return false;
 }
 
-/**
- * Extract the handle from a user_id (`<channel_type>:<handle>`). Returns
- * null when there is no `:` separator or the handle is empty.
- */
 function handleOf(userId: string): string | null {
   const idx = userId.indexOf(':');
   if (idx < 0) return null;
@@ -201,18 +90,6 @@ function handleOf(userId: string): string | null {
   return handle || null;
 }
 
-/**
- * Extract the platform prefix from a user_id. The platform is the channel_type
- * segment before the first `-`, or the whole channel_type if there is no `-`.
- *   slack-retail:UOWNER       → "slack"
- *   slack-retail-codex:UOWNER → "slack"
- *   discord:608…         → "discord"
- *   discord-example-agent-codex:6 → "discord"
- *   telegram:6037840640  → "telegram"
- *
- * Same human across SIBLING adapters of the same platform satisfies — but
- * cross-platform user_ids never satisfy even if handles collide.
- */
 function platformPrefixOf(userId: string): string | null {
   const colon = userId.indexOf(':');
   if (colon <= 0) return null;

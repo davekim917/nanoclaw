@@ -12,8 +12,7 @@
  *     one-line reply after they click "Reject with reason…".
  *   - An adapter-ready callback that starts the OneCLI manual-approval handler
  *     once the delivery adapter is set.
- *   - A shutdown callback that stops the OneCLI handler cleanly, registered on
- *     the host lifecycle (upstream's own shape, src/host-lifecycle.ts).
+ *   - A shutdown callback that stops the OneCLI handler cleanly.
  *
  * Exposes `sweepAwaitingReasonRejects` for the host sweep to finalize ghosted
  * reject-with-reason holds (re-exported here, which also loads reason-capture

@@ -4,36 +4,21 @@ import { getDb } from '../../../db/connection.js';
 import { equivalentSlackUserIds } from '../../../slack-user-identity.js';
 
 /**
- * ⚠️  Four exports below are SYNCHRONOUS and run only under the central lease
- * (plan §4.5, I-1): `isOwner`, `isGlobalAdmin`, `isAdminOfAgentGroup` and
- * their composite `hasAdminPrivilege`. They are read from inside guard
- * `decide` bodies — `modules/permissions/guard.ts` (channels.register),
- * `dashboard/thread-close-guard.ts` (threads.close),
- * `dashboard/observatory-assign-guard.ts` (observatory.assign) — and a guard
- * never awaits, so they execute their statement through `withRawDb`, which
- * only works inside the caller's `withCentralSync` block. A caller that is
- * not already inside one (an HTTP handler, an approval click) takes the
- * lease itself: `await withCentralSync(() => isOwner(id), '…')`. Calling one
- * outside a block throws `RawAccessOutsideSyncBlockError` — there is no
- * silent path onto the shared connection.
- *
- * Everything else in this file is on the async driver.
+ * ⚠️  `isOwner`, `isGlobalAdmin`, `isAdminOfAgentGroup` and `hasAdminPrivilege`
+ * are SYNCHRONOUS: guard `decide` bodies never await, so they run through
+ * `withRawDb` and throw outside a `withCentralSync` block. A caller not already
+ * inside one takes the lease: `await withCentralSync(() => isOwner(id), '…')`.
  */
 
 /**
- * Run a role predicate for the caller's exact identity and, for Slack only,
- * sibling adapter identities registered to the same workspace. See
- * `slack-user-identity.ts` for the teamId-bound equivalence rule.
+ * Also matches Slack sibling identities of the same workspace (slack-user-identity.ts).
  */
 function hasEquivalentRole(userId: string, predicate: (candidate: string) => boolean): boolean {
   return equivalentSlackUserIds(userId).some(predicate);
 }
 
 /**
- * The async form of the same loop, for `isAnyAdmin`. Not a `*Sync` twin in
- * §4.2's sense — that rule is about a LEAF EXPORT gaining a second public
- * shape; this is a private helper serving one export each. Sequential, so the
- * short-circuit and the one-statement-at-a-time driver contract both hold.
+ * Sequential: short-circuits, and the driver runs one statement at a time.
  */
 async function hasEquivalentRoleAsync(
   userId: string,
@@ -45,9 +30,7 @@ async function hasEquivalentRoleAsync(
   return false;
 }
 
-/** Global (agent_group_id IS NULL) role probe — shared by the sync predicates. */
 const GLOBAL_ROLE_SQL = 'SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL LIMIT 1';
-/** Scoped role probe — shared by the sync predicates. */
 const SCOPED_ROLE_SQL = 'SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id = ? LIMIT 1';
 
 /**
@@ -55,10 +38,8 @@ const SCOPED_ROLE_SQL = 'SELECT 1 FROM user_roles WHERE user_id = ? AND role = ?
  * not by schema, so callers get a clean error path).
  */
 /**
- * The role writes as SQL constants: executed on the driver by
- * `grantRole`/`revokeRole`, and through `withRawDb` by `grant.ts`, whose
- * grant/revoke apply the write in the same synchronous lease block as the
- * caller's authority re-check. One constant, two executors.
+ * Constants so `grant.ts` can run the write through `withRawDb` in the same
+ * lease block as its authority re-check.
  */
 export const GRANT_ROLE_SQL = `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
        VALUES (@user_id, @role, @agent_group_id, @granted_by, @granted_at)`;
@@ -109,7 +90,6 @@ export function isAdminOfAgentGroup(userId: string, agentGroupId: string): boole
 
 /**
  * Any admin privilege over this agent group: global admin OR scoped admin.
- * Synchronous by design — see the file header.
  */
 export function hasAdminPrivilege(userId: string, agentGroupId: string): boolean {
   return isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId);
@@ -142,7 +122,6 @@ export async function getAdminsOfAgentGroup(agentGroupId: string): Promise<UserR
   );
 }
 
-/** True if the user has any admin role: owner or admin (global or scoped). */
 export async function isAnyAdmin(userId: string): Promise<boolean> {
   return hasEquivalentRoleAsync(userId, async (candidate) => {
     const row = await getDb().get(

@@ -21,9 +21,8 @@ export type AccessDecision =
 /**
  * Can this user interact with this agent group?
  *
- * The role predicates are synchronous and lease-only (seam-3 plan §4.5, I-1),
- * so the four checks run as one block under the central lease, in the
- * original order, after the user lookup.
+ * The role predicates are lease-only, so the checks run as one block under the
+ * central lease.
  */
 export async function canAccessAgentGroup(userId: string, agentGroupId: string): Promise<AccessDecision> {
   if (!(await getUser(userId))) return { allowed: false, reason: 'unknown_user' };
@@ -39,23 +38,9 @@ export async function canAccessAgentGroup(userId: string, agentGroupId: string):
 /**
  * Is this sender one of NanoClaw's OWN bots (a sibling agent)?
  *
- * Sender ids are namespaced `<channelType>:<platformUserId>` (e.g.
- * `discord-opencode:123456789000000001`). `botIds` is the set of platform
- * user-ids belonging to our own bots in this process — collected from the
- * channel adapters' known-bot registries and injected into the access gate
- * (see `setSiblingBotIdsProvider` in `index.ts`).
- *
- * A match authorizes the sender to engage even under a `strict` /
- * `request_approval` messaging group: sibling agents are trusted peers, not
- * unknown senders. This mirrors the Discord adapter's `__nanoclawDiscordSiblings`
- * allow-list, which already lets sibling-authored messages past the
- * "drop other bots" filter at the forwarding layer — the access gate is the
- * second layer that, without this, would re-drop them as `not_member`.
- *
- * Pure (set passed in) so it is unit-testable without standing up adapters.
- * Empty `botIds` ⇒ always false (fail-closed before the host wires the
- * provider). Platform user-ids are globally unique per account, so a human
- * sender can never collide with a bot's id — no false positives.
+ * The access gate's second layer behind the adapters' sibling allow-lists;
+ * without it siblings are re-dropped as `not_member` under `strict`. Empty
+ * `botIds` ⇒ false (fail-closed before the provider is wired).
  */
 export function isSiblingBotSender(userId: string, botIds: ReadonlySet<string>): boolean {
   if (botIds.size === 0) return false;
