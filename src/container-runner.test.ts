@@ -697,7 +697,7 @@ describe('serializeMcpServersEnv', () => {
     expect(servers.littlebird).toEqual({ type: 'http', url: 'https://mcp.littlebird.ai/mcp' });
   });
 
-  it('leaves out plugin-owned servers, which the runner resolves from container.json', () => {
+  it('leaves out servers with a plugin root, which the runner resolves from container.json', () => {
     // The runner resolves them (plugin root, placeholders, the ownership marker), then overlays this payload by name:
     // a re-sent raw copy replaced the resolved entry.
     const own = {
@@ -711,15 +711,18 @@ describe('serializeMcpServersEnv', () => {
       },
       remote: { type: 'http', url: 'https://mcp.acme.test/mcp', plugin: 'acme' },
       handAdded: { type: 'stdio', command: 'hand-tool', args: [], cwd: '/tmp' },
+      emptyProvenance: { type: 'stdio', command: 'hand-tool', args: [], cwd: '/tmp', pluginRoot: '', plugin: '' },
     } as Record<string, McpServerConfig>;
     const env = serializeMcpServersEnv(effectiveMcpServers({ mcpServers: structuredClone(own) }), own);
 
     const servers = JSON.parse(env!.replace(/^NANOCLAW_MCP_SERVERS=/, ''));
     expect(servers.stamped).toBeUndefined();
-    expect(servers.remote).toBeUndefined();
-    expect(env).not.toContain('"plugin');
-    // Not plugin-owned: still sent as the host's validated copy, which drops a cwd without plugin provenance.
+    expect(env).not.toContain('"plugin"');
+    // No plugin root, so the runner passes these through as sent: the validated copy, with a cwd lacking plugin
+    // provenance dropped.
+    expect(servers.remote).toEqual({ type: 'http', url: 'https://mcp.acme.test/mcp' });
     expect(servers.handAdded).toEqual({ type: 'stdio', command: 'hand-tool', args: [] });
+    expect(servers.emptyProvenance).toEqual({ type: 'stdio', command: 'hand-tool', args: [], pluginRoot: '' });
     expect(servers.deepwiki).toEqual({ type: 'http', url: 'https://mcp.deepwiki.com/mcp' });
   });
 });

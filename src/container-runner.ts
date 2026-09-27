@@ -209,21 +209,20 @@ export const DATAFOLD_MCP_SERVER = {
   headers: { Authorization: 'Key onecli-managed' },
 } as const satisfies McpServerConfig;
 
-const HOST_ONLY_MCP_FIELDS = ['displayName', 'description'] as const;
+const HOST_ONLY_MCP_FIELDS = ['displayName', 'description', 'plugin'] as const;
 
 /**
- * Omits the group's plugin-owned entries: the runner resolves those from container.json, then overlays this by name,
- * so a raw copy undoes that. HOST_ONLY_MCP_FIELDS are snapshot metadata; `instructions` deliberately still crosses.
+ * Omits entries with a non-empty plugin root: the runner resolves those from container.json, then overlays this by
+ * name. HOST_ONLY_MCP_FIELDS never reach a provider; `instructions` deliberately still crosses.
  */
 export function serializeMcpServersEnv(
   servers: Record<string, unknown>,
   groupServers: Record<string, McpServerConfig>,
 ): string | null {
   const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
-  const additional = Object.entries(validated).filter(([name]) => {
-    const own = groupServers[name] as { plugin?: string; pluginRoot?: string } | undefined;
-    return own?.plugin === undefined && own?.pluginRoot === undefined;
-  });
+  const additional = Object.entries(validated).filter(
+    ([name]) => !(groupServers[name] as { pluginRoot?: string } | undefined)?.pluginRoot,
+  );
   if (additional.length === 0) return null;
   const forContainer = Object.fromEntries(
     additional.map(([name, server]) => {
