@@ -1,10 +1,7 @@
 /**
- * Repository-ingress fence: the per-session mirror of a publication fence.
- *
- * While a fence is active every inbound row is auto-tagged inert by the guard
- * triggers (`schema.ts`), so nothing wakes the container mid-publication;
- * release restores each tagged row's original trigger exactly once, keyed on
- * the exact [epoch, generation] pair. Internal to `src/modules/mailbox/`.
+ * While a fence is active the guard triggers tag every inbound row inert, so
+ * nothing wakes the container mid-publication; release restores each tagged
+ * row's trigger exactly once, keyed on the exact [epoch, generation] pair.
  */
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';

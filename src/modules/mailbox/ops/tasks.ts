@@ -1,18 +1,8 @@
 /**
- * Task rows: `messages_in` rows with `kind='task'`.
- *
- * Internal to `src/modules/mailbox/`. The scheduling module used to own this
- * SQL (`src/modules/scheduling/db.ts`, 404 L) and executed it on handles its
- * callers passed in; the seam moves the statements here and leaves that file a
- * façade of these ops (plan §4.4, Ingress row).
- *
- * Five statements are byte-identical to upstream's `src/mailbox/sqlite/tasks.ts`
- * and are RE-EXPORTED from there rather than copied — invariant I-2, one
- * implementation of any SQL statement. The rest are fork-only, because the
- * fork's task rows carry routing (`platform_id`/`channel_type`/`thread_id`),
- * land inert (`trigger = 0`, admitted later by the due-time recall seam), and
- * invalidate an already-admitted recall row on every live edit — none of which
- * upstream's task writer does.
+ * Task rows: `messages_in` rows with `kind='task'`. Statements identical to
+ * upstream's `src/mailbox/sqlite/tasks.ts` are re-exported from there, not
+ * copied; the rest are fork-only because fork task rows carry routing, land
+ * inert (`trigger = 0`), and invalidate an admitted recall on every live edit.
  */
 import type Database from 'better-sqlite3';
 
@@ -22,20 +12,12 @@ import { sqliteUtcToIso } from '../sqlite-utc.js';
 import { nextEvenSeq } from './ingress.js';
 
 /**
- * Insert one pending task occurrence. `seriesId` is the series join key — equal
- * to `id` for a brand-new series, or the existing series for a recurrence clone
- * or an on-demand run.
+ * Insert one pending task occurrence. `seriesId` equals `id` for a new series.
  *
- * New-style `ncl tasks` rows fire into an isolated system session and pass no
- * routing (platform/channel/thread default NULL). Fork: MCP-scheduled tasks
- * (actions.ts) and recurrence clones DO carry routing — channel-scoped tasks
- * post to their channel and thread-scoped loops report in-thread, so the
- * columns must survive every re-arm (task-reply routing, dac5d9b3).
- *
- * Not upstream's `insertTaskRow`: that one is built from `createTaskInboundRecord`,
- * which hardcodes `trigger: true` and NULL routing. A fork task row must land
- * inert (`trigger = 0`) so neither a warm poller nor the cold-wake query can
- * claim it before the host-owned due-admission seam builds its recall context.
+ * Not upstream's `insertTaskRow`, which hardcodes `trigger: true` and NULL
+ * routing: a fork task row must land inert (`trigger = 0`) so no poller claims
+ * it before the due-admission seam builds its recall context, and channel- or
+ * thread-scoped tasks carry routing that must survive every re-arm.
  */
 export interface TaskRowInsert {
   id: string;
@@ -95,38 +77,25 @@ export function resumeTask(db: Database.Database, taskId: string): number {
 export interface TaskUpdate {
   prompt?: string;
   script?: string | null;
-  /** Fleet-hardening Phase 1.1: run --script on the host at fire time instead of in the container. */
+  /** Run --script on the host at fire time instead of in the container. */
   scriptHost?: boolean;
   /** false = never glue this series' channel posts into a rolling day-thread (one-thread-per-item series). */
   threadAnchor?: boolean;
   quietStatus?: boolean;
-  /** true = fires resume one conversation instead of starting fresh (modules/scheduling/fresh-context.ts). */
+  /** true = fires resume one conversation instead of starting fresh. */
   continuous?: boolean;
   recurrence?: string | null;
   processAfter?: string;
   /**
-   * Treat `processAfter` as an execution deadline only, leaving the row's
-   * `scheduled_for` where it is.
-   *
-   * The board's run-now fires a task early WITHOUT shifting its schedule
-   * (design §4.6), so the occurrence is still FOR its original slot and must
-   * keep announcing that slot to the agent. Every other caller is a genuine
-   * reschedule — a cron edit, a resume recomputed to the next future slot, an
-   * explicit `--process-after` — and moves both.
+   * Treat `processAfter` as an execution deadline only, leaving `scheduled_for`.
+   * Run-now fires early without shifting the schedule, so the occurrence must
+   * keep announcing its original slot; every other caller moves both.
    */
   keepScheduledFor?: boolean;
   /**
-   * Per-fire model/effort pin (merged into content.flagIntent, not replaced).
-   * Values are already validated against the agent's provider vocab by the
-   * caller (resolveTaskFlagIntent → parseMessageFlags), so effort is a plain
-   * string here — the same loose shape the chat-side FlagIntent carries.
-   *
-   * `null` on an axis CLEARS that axis — the one thing a merge cannot express
-   * by value, because every storable pin is a non-empty string and `undefined`
-   * already means "leave this axis alone". Writing `''` instead would be a
-   * different bug: `parseTaskPin` reads `''` back as an
-   * absent pin, so the series would DISPLAY unpinned while the key survives in
-   * the envelope for the next merge to resurrect.
+   * Per-fire model/effort pin, merged into content.flagIntent; values are
+   * already validated by the caller. `null` on an axis CLEARS it. Never write
+   * `''`: `parseTaskPin` reads it as absent while the key survives the next merge.
    */
   flagIntent?: { turnModel?: string | null; turnEffort?: string | null };
   chatLimit?: number;
@@ -221,11 +190,8 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
             if (value === null) delete merged[key];
             else merged[key] = value;
           }
-          // Drop the envelope key once both axes are gone, rather than leaving
-          // `flagIntent: {}` behind. Readers tolerate either (parseTaskPin
-          // answers null for a missing key), but a
-          // byte-level diff of the content is how an operator confirms a pin is
-          // actually gone, and `{}` reads as "something is still pinned here".
+          // Drop the key once both axes are gone: in a byte-level diff of the
+          // content, `flagIntent: {}` reads as "something is still pinned here".
           if (Object.keys(merged).length === 0) delete parsed.flagIntent;
           else parsed.flagIntent = merged;
         }
@@ -281,19 +247,10 @@ export interface RecurringMessage {
   series_id: string;
 }
 
-// Includes 'failed' AND 'expired' so a single bad OR missed fire doesn't strand
-// the cron series. 'failed' = the fire ran and errored; 'expired' = the fire was
-// never claimed (host down / sweep delayed) and expireStalePending reaped the
-// overdue pending row. Without 'expired' here, any recurring task that missed
-// one fire died permanently — this stranded the daily wiki-synth across all
-// memory-enabled agents on 2026-05-10. The historical row stays for audit;
-// handleRecurrence inserts the next slot as a fresh pending row (nextRun = next
-// cron occurrence after now, so a backlog of missed slots is skipped, not
-// replayed). expireStalePending no longer expires recurring rows, so going
-// forward 'expired' here mainly heals legacy strandings.
-//
-// Upstream's `getCompletedRecurring` omits 'expired' and returns four columns;
-// the fork's clone needs the routing columns too, so this one is fork-owned.
+// Includes 'failed' AND 'expired' so one bad or missed fire doesn't strand the
+// cron series. The next slot is the next cron occurrence after now, so a backlog
+// of missed slots is skipped, not replayed. Upstream's version omits 'expired'
+// and the routing columns, so this one is fork-owned.
 export function getCompletedRecurring(db: Database.Database): RecurringMessage[] {
   return db
     .prepare("SELECT * FROM messages_in WHERE status IN ('completed', 'failed', 'expired') AND recurrence IS NOT NULL")
@@ -314,8 +271,6 @@ export function insertRecurrence(
     recurrence: msg.recurrence,
     content: withoutScriptOutput(msg.content),
     status,
-    // Carry routing forward — a channel/thread-scoped series must keep
-    // posting to its channel/thread across every re-arm.
     platformId: msg.platform_id,
     channelType: msg.channel_type,
     threadId: msg.thread_id,
@@ -324,13 +279,9 @@ export function insertRecurrence(
 
 /**
  * Insert the series' next occurrence and clear the recurrence on the original
- * in ONE durable step.
- *
- * Upstream names this `armNextTask` on `InboundMailbox` and the fork keeps that
- * name, but not upstream's body: upstream arms through `insertTaskRow`, which
- * writes `trigger = 1` and NULL routing. Split writes tear on a crash — an
- * inserted successor next to a still-armed original re-clones the series on the
- * following tick (duplicate runs), while the reverse order silently kills it.
+ * in ONE transaction. Split writes tear on a crash: a successor beside a
+ * still-armed original re-clones the series (duplicate runs), while the reverse
+ * order kills it. Unlike upstream's `armNextTask`, this writes an inert, routed row.
  */
 export function armNextTask(
   db: Database.Database,
@@ -346,23 +297,13 @@ export function armNextTask(
   }).immediate();
 }
 
-/**
- * Snapshot of a single live task row, captured before a board move so the
- * source can be re-inserted faithfully on the compensation path. Mirrors the
- * `messages_in` columns the firing path reads (status is `pending` or `paused`
- * — terminal rows are never snapshotted).
- */
+/** A live (pending/paused) task row captured before a board move, for re-insert on compensation. */
 export interface TaskRowSnapshot {
   id: string;
   series_id: string;
   status: 'pending' | 'paused';
   process_after: string | null;
-  /**
-   * Optional: a snapshot recorded in a `move_intent` audit row BEFORE this
-   * column existed has no value here, and recovery must still be able to
-   * restore from it. Absent means "fall back to process_after", which is what
-   * the restored row's readers would do anyway.
-   */
+  /** Absent in snapshots recorded before this column existed; falls back to process_after. */
   scheduled_for?: string | null;
   recurrence: string | null;
   content: string;
@@ -378,21 +319,9 @@ function isoSlot(value: string | null | undefined): string | null {
 }
 
 /**
- * Re-insert a task row from a snapshot, preserving its identity (`series_id`)
- * AND its `status`. Used by the board move flow: compensation (§4.2 step 5,
- * restore source after a failed target insert) and the paused-snapshot staged
- * restore (§4.2 4a).
- *
- * This is `insertRecurrence`'s raw-insert shape with two deliberate differences:
- *   - `series_id` comes from the snapshot, NOT a fresh id. `insertTask` sets
- *     series_id = id, which would sever the series identity — exactly what a
- *     restore must not do.
- *   - `status` comes from the snapshot, overriding insertRecurrence's
- *     hardcoded `'pending'`. A paused source row must come back paused, or the
- *     restore would silently un-pause it.
- *
- * C1: writes no status value the firing path doesn't already read
- * (`pending`/`paused` are both existing live states).
+ * Re-insert a task row from a board-move snapshot, preserving its `series_id`
+ * (a fresh id would sever the series) and its `status` (a paused source must
+ * come back paused).
  */
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
   migrateMessagesInTable(db);
@@ -402,22 +331,13 @@ export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot)
   ).run({
     id: snapshot.id,
     seq: nextEvenSeq(db),
-    // ISO-8601 UTC, never datetime('now'): its naive 'YYYY-MM-DD HH:MM:SS'
-    // shape is read as LOCAL time by `new Date()`, which skews display and
-    // breaks string comparisons against the ISO values every other writer here
-    // produces.
     timestamp: new Date().toISOString(),
     kind: snapshot.kind,
     status: snapshot.status,
     processAfter: snapshot.process_after,
-    // A restore re-creates the SAME occurrence, so it carries the slot the
-    // source row was for — not the restore's own moment. `?? process_after`
-    // covers a pre-column audit snapshot.
-    //
-    // Normalized on the way through: both source columns can hold SQLite's
-    // naive `YYYY-MM-DD HH:MM:SS` on a pre-upgrade install, and copying that
-    // shape into `scheduled_for` would put a value here that every reader
-    // compares as a string against ISO ones.
+    // The SAME occurrence, so it keeps the source's slot (`?? process_after`
+    // covers a pre-column snapshot). Normalized because a pre-upgrade install can
+    // hold SQLite's naive datetime shape, which breaks ISO string comparisons.
     scheduledFor: isoSlot(snapshot.scheduled_for ?? snapshot.process_after),
     recurrence: snapshot.recurrence,
     platformId: snapshot.platform_id,
@@ -429,22 +349,9 @@ export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot)
 }
 
 /**
- * Cancel ONE task row, addressed by its exact row id.
- *
- * Upstream's `cancelTask` matches `id = ? OR series_id = ?`, so it cancels
- * whichever row of the series happens to be live when it runs. That is the
- * right verb for "cancel this series" and the wrong one for any caller acting
- * on a row it read EARLIER: between the read and the write, the occurrence it
- * approved can complete and recurrence can arm a successor, and the
- * series-wide cancel then consumes the successor while reporting success.
- *
- * The board move is exactly that caller — it snapshots one occurrence, writes
- * a durable move intent naming that row id, and cancels. Scoped to the id, a
- * changed row means zero touched, which is the move's existing abort-and-409
- * path rather than a silent swap.
- *
- * Same status filter and the same recurrence clear as `cancelTask`, so a row
- * cancelled through either name is in the same state afterwards.
+ * Cancel ONE task row by exact row id. Upstream's `cancelTask` matches the whole
+ * series, so a caller acting on a row it read earlier could cancel a successor
+ * armed in between and report success; here a changed row means zero touched.
  */
 export function cancelTaskRow(db: Database.Database, rowId: string): number {
   return db
@@ -456,13 +363,9 @@ export function cancelTaskRow(db: Database.Database, rowId: string): number {
 }
 
 /**
- * Cancel one task occurrence and write its move-cancellation receipt in the
- * same inbound-db transaction.
- *
- * A move intent is written to the central DB before cancellation, but it
- * cannot prove which of two overlapping moves changed the source. This
- * terminal system row is that proof: recovery restores a source only when the
- * exact intent owns this durable receipt. A crash commits both rows or neither.
+ * Cancel one task occurrence and write its move-cancellation receipt in one
+ * transaction. Recovery restores a source only when the exact move intent owns
+ * this receipt, which is what tells two overlapping moves apart.
  */
 export function cancelTaskRowWithMoveReceipt(db: Database.Database, rowId: string, receiptId: string): number {
   migrateMessagesInTable(db);
@@ -487,39 +390,22 @@ export function hasMoveCancellationReceipt(db: Database.Database, receiptId: str
 }
 
 /**
- * Board-cancel a series AND make it non-resurrectable. `cancelTask` cancels
- * the live row(s) and clears their recurrence, but crash residue
- * (`recurrence.ts` insert-then-clear) or a swallowed-parse strand can leave a
- * TERMINAL row (`completed`/`failed`/`expired`) still carrying recurrence —
- * which `getCompletedRecurring` would heal into a fresh successor, silently
- * undoing the cancel. This clears recurrence on those terminal rows of the same
- * series too (§4.3 resurrection guard).
- *
- * Returns touched-count = live rows cancelled + terminal recurrence-clears, so
- * the cancel verb is reachable on a PURE strand (no live row, just a terminal
- * recurrence-set row — §4.0 footnote: cancel's touched-count includes terminal
- * clears so strand cleanup never reports a misleading 0).
- *
- * C1: only sets recurrence=NULL on terminal rows — an existing data operation
- * (clearRecurrence), removing rows from the sweep's input without changing any
- * firing-path code or minting a new status value.
+ * Board-cancel a series AND make it non-resurrectable: also clears recurrence on
+ * TERMINAL rows of the series (crash residue), which `getCompletedRecurring`
+ * would otherwise heal into a fresh successor. The count includes those terminal
+ * clears, so cancelling a pure strand never reports 0.
  */
 export function cancelSeriesWithStrandClear(db: Database.Database, taskId: string): number {
   return db.transaction(() => {
-    // 1. Cancel live rows (and clear their recurrence) via existing semantics.
     const liveCancelled = cancelTask(db, taskId);
 
-    // 2. Resolve the affected series so terminal-row cleanup is scoped to them.
-    //    taskId may be a row id or a series_id; match the same way cancelTask
-    //    does, then collect distinct series_ids.
+    // taskId may be a row id or a series_id; match the way cancelTask does.
     const seriesRows = db
       .prepare("SELECT DISTINCT series_id FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task'")
       .all(taskId, taskId) as Array<{ series_id: string | null }>;
     const seriesIds = seriesRows.map((r) => r.series_id).filter((s): s is string => s !== null);
 
-    // 3. Clear recurrence on terminal rows of those series. The just-cancelled
-    //    rows already have recurrence NULL (step 1), so `recurrence IS NOT NULL`
-    //    naturally excludes them — no double-count.
+    // Rows cancelled above already have recurrence NULL, so no double-count.
     let terminalCleared = 0;
     for (const seriesId of seriesIds) {
       terminalCleared += db
@@ -537,19 +423,9 @@ export function cancelSeriesWithStrandClear(db: Database.Database, taskId: strin
 }
 
 /**
- * The ENTIRE prior row, column for column, as `SELECT *` returned it.
- *
- * Deliberately NOT a named subset, and deliberately not `TaskRowSnapshot`. The
- * first version of this was a column list, and it omitted `tries` and
- * `trigger`: `restoreTaskRow` hardcodes both to 0, which is right for its
- * board-move caller (a row arriving in a new session) and wrong for an undo,
- * so a restored row came back with its retry count zeroed. A named list is also
- * a list that goes stale the next time a column is added to `messages_in`, and
- * nothing fails loudly when it does.
- *
- * So the shape is open on purpose: whatever columns the table has, the snapshot
- * has, and `restoreTaskSeries` writes all of them back. `id` and `series_id`
- * are named only because the restore reasons about them explicitly.
+ * The ENTIRE prior row as `SELECT *` returned it, deliberately not a named
+ * column list: a named list drops columns (`tries` and `trigger` were lost this
+ * way) and goes stale when `messages_in` gains a column.
  */
 export interface TaskSeriesSnapshot {
   id: string;
@@ -557,21 +433,11 @@ export interface TaskSeriesSnapshot {
   [column: string]: unknown;
 }
 
-/**
- * What one `upsertTaskSeries` did, in the terms a compensation needs.
- *
- * `touchedId` is the row it inserted or updated — the ONLY row it may undo.
- * `prior` is that row as it stood before, or `null` when the upsert created it.
- */
+/** `touchedId` is the only row the upsert may undo; `prior` is null when the upsert created it. */
 export interface UpsertedTaskSeries {
   touchedId: string;
   prior: TaskSeriesSnapshot | null;
-  /**
-   * The `recall-<id>` context row as it stood beside `prior`, or `null`.
-   *
-   * Captured because the upsert DELETES it, and whether that deletion should be
-   * undone depends on the task row's own `trigger` — see `restoreTaskSeries`.
-   */
+  /** The `recall-<id>` row beside `prior`, which the upsert deletes; see `restoreTaskSeries` for when it comes back. */
   priorRecall: TaskSeriesSnapshot | null;
 }
 
@@ -581,49 +447,19 @@ export interface TaskSeriesCollision {
 }
 
 /**
- * Put back the ONE row an `upsertTaskSeries` inserted or updated.
+ * Put back the ONE row an `upsertTaskSeries` inserted or updated, when
+ * `scheduleTask`'s central-DB write fails (no transaction spans the two DBs).
  *
- * `scheduleTask` writes to TWO databases with no transaction spanning them: the
- * task row in the session's `inbound.db`, and `sessions.task_routing_platform_id`
- * in the central DB, which is what the Observatory renders the series' channel
- * from. Statement order cannot make that atomic in either direction — it only
- * chooses which side is left ahead when the other fails. So the second write
- * failing is compensated rather than ordered around.
+ * Addressed by ROW ID, never `series_id`: `ncl tasks run` puts a second live row
+ * in the series, and a series-wide undo would cancel it. `touchedId`/`prior` come
+ * from the upsert's own selection, since a second `LIMIT 1` query could pick a
+ * different row. `prior === null` means removing the insert is the restore.
  *
- * Addressed by ROW ID, never by `series_id`. A series can hold more than one
- * live row: `ncl tasks run` inserts a `<series>-run` occurrence alongside the
- * scheduled one, deliberately, so an on-demand fire reports to the same
- * destination (`src/cli/resources/tasks.ts`). A compensation that cleared every
- * live row of the series would cancel that sibling occurrence outright, and
- * `prior` could only put one of them back — turning a failed re-schedule into
- * silent data loss on a row it never touched.
- *
- * `touchedId` and `prior` therefore both come from `upsertTaskSeries`' OWN
- * selection rather than a second query. Two lookups over an unordered
- * `SELECT … LIMIT 1` could disagree about which live row is "the" one, and
- * disagreeing here means restoring a row that was never overwritten.
- *
- * `prior === null` means the upsert INSERTED, and removing that insert is the
- * restore.
- *
- * Two fields do not come back byte-identical, both deliberately:
- *   - `seq` is freshly allocated, because the row is re-inserted. A successful
- *     re-schedule re-seqs too, so this is a state the series reaches normally.
- *
- * The RECALL PARTNER comes back only when the task row it belongs to was
- * ADMITTED (`trigger = 1`), and that condition is the whole subtlety. An inert
- * task (`trigger = 0`) has its context rebuilt by the due-admission sweep, so
- * leaving the recall deleted is exactly where a normal re-schedule leaves it.
- * An ADMITTED task is different: the sweep rebuilds recall only for
- * `trigger = 0` rows, so it will never rebuild this one — and a restored
- * `trigger = 1` task with no recall partner is claimable by a container without
- * the context row the pair exists to guarantee. The first version of this undo
- * restored `trigger` faithfully and dropped the partner, which produced exactly
- * that.
- *
- * EVERY OTHER COLUMN comes back exactly, including ones nobody thought to name
- * — `tries`, `trigger`, `timestamp` — because the restore is built from the
- * snapshot's own keys rather than from a list written here.
+ * Every column comes back exactly except `seq`, which is reallocated as a
+ * re-schedule does. The recall partner comes back only when the task was
+ * ADMITTED (`trigger = 1`): the due-admission sweep rebuilds recall only for
+ * `trigger = 0` rows, so an admitted task without its partner would be
+ * claimable without its context.
  */
 export function restoreTaskSeries(
   db: Database.Database,
@@ -641,40 +477,23 @@ export function restoreTaskSeries(
     ).run(values);
   };
   db.transaction(() => {
-    // The update branch already removed this; the insert branch never had one.
-    // Kept so the undo is complete on its own terms rather than by relying on
-    // what the upsert happened to do first.
+    // The update branch already removed this; kept so the undo stands on its own.
     db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${touchedId}`);
     db.prepare('DELETE FROM messages_in WHERE id = ?').run(touchedId);
     if (!prior) return;
-    // EVERY column the snapshot carries, written back by name FROM THE SNAPSHOT
-    // ITSELF. Not `restoreTaskRow`: that is the board-move insert, which names
-    // its columns and hardcodes `tries` and `trigger` to 0 — correct for a row
-    // arriving in a new session, wrong for a row going back to what it was.
-    // Building the statement from the row's own keys is what makes a column
-    // added to `messages_in` tomorrow restore correctly with no edit here.
-    //
-    // `seq` is the single exception, and it is reallocated rather than
-    // restored: a successful re-schedule allocates a fresh one too, so this is
-    // a value the row reaches normally.
-    // The recall partner goes back FIRST, so the pair keeps its original order:
-    // context below its trigger, on adjacent even seqs, exactly as
-    // `insertMessageWithContext` writes it.
+    // Written back from the snapshot's own keys, not via `restoreTaskRow` (which
+    // hardcodes `tries`/`trigger` to 0). The recall partner goes first so the
+    // pair keeps its order: context below its trigger, on adjacent seqs.
     if (priorRecall && prior.trigger === 1) insertWholeRow(priorRecall);
     insertWholeRow(prior);
   })();
 }
 
 /**
- * Idempotent series upsert used by `scheduleTask`.
- *
- * Active series (pending/paused) → UPDATE in place; terminal rows
- * (completed/failed/cancelled) are treated as absent so a fresh row is
- * inserted, enabling re-scheduling after cancellation. A due row may already
- * have been admitted as recall + trigger before an operator reschedules it;
- * the stale recall is removed and the task moves to a fresh inert seq in the
- * same transaction, so the next due sweep builds current context before making
- * it wakeable again.
+ * Idempotent series upsert used by `scheduleTask`. Active series (pending/paused)
+ * update in place; terminal rows count as absent so a cancelled series can be
+ * re-scheduled. An already-admitted recall is removed and the task moved to a
+ * fresh inert seq, so the next due sweep rebuilds current context.
  */
 export function upsertTaskSeries(
   db: Database.Database,
@@ -683,12 +502,9 @@ export function upsertTaskSeries(
     seriesId: string;
     processAfter: string;
     /**
-     * The slot this occurrence is FOR, when it differs from `processAfter`.
-     * Only the board's move flow passes it: a source row in retry backoff
-     * carries the backoff deadline in `process_after`, and stamping the
-     * destination's slot from that would change the occurrence's identity as a
-     * side effect of moving it. Everyone else arms a slot and a run time that
-     * are the same instant.
+     * The slot this occurrence is FOR, when it differs from `processAfter`. Only
+     * a board move passes it: a source in retry backoff carries the backoff
+     * deadline in `process_after`, which must not become the slot.
      */
     scheduledFor?: string | null;
     recurrence: string;
@@ -705,17 +521,8 @@ export function upsertTaskSeries(
   migrateMessagesInTable(db);
   return db
     .transaction((): UpsertedTaskSeries | TaskSeriesCollision => {
-      // The WHOLE row, and selected ONCE. `scheduleTask` has to be able to undo
-      // this write when its central-DB companion fails, and the only place that
-      // knows WHICH live row was chosen is here. A caller re-running this SELECT
-      // could land on a different row when the series has more than one live
-      // occurrence (`ncl tasks run` creates exactly that), and would then
-      // restore a row this never overwrote.
-      //
-      // `SELECT *`, not a column list: a named list silently drops whatever it
-      // forgets, which is how `tries` and `trigger` were lost from the first
-      // version of this snapshot, and it goes stale the next time a column is
-      // added to `messages_in`.
+      // The WHOLE row, selected ONCE: only this selection knows which live row a
+      // compensation must restore (see `restoreTaskSeries`).
       const activeRow = db
         .prepare("SELECT * FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
         .get(row.seriesId) as TaskSeriesSnapshot | undefined;
@@ -727,9 +534,7 @@ export function upsertTaskSeries(
       if (row.rejectExistingLiveSeries && activeRow) return { collision: true };
 
       if (activeRow) {
-        // Captured BEFORE the delete below, in the same statement sequence that
-        // chose the task row, so the pair a compensation puts back is the pair
-        // this upsert actually took apart.
+        // Captured before the delete below, so a compensation restores the pair this upsert took apart.
         const priorRecall =
           (db.prepare("SELECT * FROM messages_in WHERE id = ? AND kind = 'system'").get(`recall-${activeRow.id}`) as
             | TaskSeriesSnapshot
@@ -789,21 +594,13 @@ export function upsertTaskSeries(
     .immediate();
 }
 
-/* ─── Host-gated pre-task scripts ─────────────────────────────────────────── */
-
 export interface HostGatedTaskRow {
   id: string;
   series_id: string | null;
   content: string;
 }
 
-/**
- * Due task rows that a host-side pre-task script may still gate.
- *
- * Same query shape as `admitDueTaskContexts`' own due-row select (status =
- * 'pending', trigger = 0, process_after due), narrowed to kind = 'task' since
- * only task rows carry a script.
- */
+/** Due, unadmitted task rows a host-side pre-task script may still gate (same due predicate as `admitDueTaskContexts`). */
 export function listDueTaskRows(db: Database.Database): HostGatedTaskRow[] {
   return db
     .prepare(
@@ -833,15 +630,7 @@ export function setPendingTaskContent(db: Database.Database, taskId: string, con
   );
 }
 
-/* ─── `ncl tasks` board ────────────────────────────────────────────────────── */
-
-/**
- * One task series as the admin CLI renders it.
- *
- * Wider than the dashboard's {@link ScheduledTaskRow} on purpose: the CLI's
- * table shows `tries` and the aggregated `seq`, and its `row_id`/`series_id`
- * split is what `ncl tasks get <id>` resolves a series by.
- */
+/** One task series as the admin CLI renders it; `row_id`/`series_id` split is what `ncl tasks get` resolves by. */
 export interface CliTaskRow {
   row_id: string;
   series_id: string | null;
@@ -857,20 +646,11 @@ export interface CliTaskRow {
   thread_id: string | null;
 }
 
-/**
- * The live rows of every task series, one per series, next fire first.
- *
- * `GROUP BY series_id` with `MAX(seq)` collapses a series to its newest live
- * occurrence — the CronJob-like view the CLI list shows. Without a status
- * filter it means pending AND paused; a paused series still has a next run.
- */
+/** The live rows of every task series, one per series, next fire first. No status filter means pending AND paused. */
 export function listCliTaskSeries(db: Database.Database, status?: 'pending' | 'paused'): CliTaskRow[] {
   const statusSql = status ? 'status = ?' : "status IN ('pending', 'paused')";
-  // One row per series, chosen the same way getCliTaskRow chooses: the row that
-  // carries the schedule wins over a transient `ncl tasks run` row, which shares
-  // the series_id but has a NULL recurrence. The previous GROUP BY + MAX(seq)
-  // relied on SQLite's bare-column rule and therefore returned whichever row was
-  // newest — the run row — listing a recurring series as `once` and due now.
+  // One row per series, chosen as getCliTaskRow chooses: the schedule-carrying
+  // row wins over a transient `ncl tasks run` row (same series_id, NULL recurrence).
   return db
     .prepare(
       `SELECT row_id, series_id, status, process_after, recurrence, content, timestamp, tries,
@@ -893,26 +673,12 @@ export function listCliTaskSeries(db: Database.Database, status?: 'pending' | 'p
 }
 
 /**
- * One task by row id OR series id, live occurrence preferred.
- *
- * The ORDER BY is the whole point: an agent remembers the id it created, which
- * after the first fire names a `completed` row while the series' live next
- * occurrence carries a different row id. Live first, then the row that carries
- * the schedule, then newest.
- *
- * That middle term exists because `ncl tasks run` inserts a SECOND live row for
- * the same series with `recurrence = NULL` (deliberately — see runTaskCommand:
- * a run-now row must not be re-armed into a phantom series). Both rows are
- * `pending`, so they tied on the status term and `seq DESC` handed back the
- * newer run row — making `tasks get`/`tasks list` report a recurring series as
- * `recurrence: null` / schedule `once`. The series was never damaged, but it
- * read exactly like data loss, which invites a destructive "repair".
- *
- * Preferring `recurrence IS NOT NULL` and not `id = series_id` is deliberate:
- * `insertRecurrence` re-arms each occurrence under a NEW row id while carrying
- * the recurrence forward, so after the first fire the live series row's id no
- * longer equals its series_id. One-shots keep their old behaviour — every row
- * has a NULL recurrence, so the tie falls through to `seq DESC` as before.
+ * One task by row id OR series id. Order: live first, then the row carrying the
+ * schedule, then newest. An agent remembers the id it created, which after the
+ * first fire names a completed row. The middle term keeps a `ncl tasks run` row
+ * (same series, NULL recurrence) from making a recurring series read as `once`;
+ * it keys on `recurrence IS NOT NULL`, not `id = series_id`, because re-arms
+ * mint new row ids.
  */
 export function getCliTaskRow(db: Database.Database, id: string): CliTaskRow | undefined {
   return db

@@ -1,20 +1,12 @@
 /**
  * Due-admission ops: the host-owned barrier that turns an inert scheduled or
- * deferred row into a wakeable turn.
- *
- * Internal to `src/modules/mailbox/`. The statements used to live in
- * `session-manager.ts` and executed on a handle its callers passed in (the
- * sweep's, the dashboard's run-now); the seam moves them here and leaves the
- * caller a named op on an open session (plan §4.4, Ingress row; invariant
- * I-2). The POLICY — which rows deserve a recall, what that recall says — is
- * deliberately NOT here: it stays with `session-manager.ts`, which composes
- * the recall row and hands it back for the transaction below to commit.
+ * deferred row into a wakeable turn. The recall POLICY stays in
+ * session-manager.ts; these only commit its decision.
  */
 import type Database from 'better-sqlite3';
 
 import { nextEvenSeq, type MessageInsert } from './ingress.js';
 
-/** One inert row the due sweep is considering for admission. */
 export interface DueAdmissionRow {
   id: string;
   kind: string;
@@ -29,17 +21,10 @@ export interface DueAdmissionRow {
 }
 
 /**
- * Put a crashed provider turn behind its retry deadline without exposing the
- * old pair to a warm poller.
- *
- * The existing recall row is retained as a no-schema admission marker, but
- * both rows become non-triggering and share the future `process_after`. Due
- * admission replaces that recall from current host state before restoring
- * `trigger = 1`.
- *
- * Rows without a recall keep their current trigger value. In particular, an
- * ordinary `trigger = 0` accumulated chat row cannot become a provider turn
- * merely because generic crash cleanup touched its id.
+ * Defers a crashed turn without exposing the old pair to a warm poller: both
+ * rows go non-triggering with the future `process_after`, and admission later
+ * rebuilds the recall before restoring `trigger = 1`. Rows without a recall
+ * keep their trigger, so a `trigger = 0` chat row never becomes a turn here.
  */
 export function deferForFreshContextRetry(db: Database.Database, messageId: string, backoffSec: number): void {
   const processAfter = new Date(Date.now() + backoffSec * 1000).toISOString();
@@ -65,12 +50,7 @@ export function deferForFreshContextRetry(db: Database.Database, messageId: stri
   }).immediate();
 }
 
-/**
- * Demote legacy live task rows that predate inert scheduling.
- *
- * Those were stored `trigger = 1`. Only UNPAIRED ones are demoted; an
- * already-admitted pair stays wakeable and untouched.
- */
+/** Only UNPAIRED legacy `trigger = 1` task rows are demoted; an admitted pair stays wakeable. */
 export function demoteUnpairedLegacyTasks(db: Database.Database): void {
   db.prepare(
     `UPDATE messages_in
@@ -86,7 +66,7 @@ export function demoteUnpairedLegacyTasks(db: Database.Database): void {
   ).run();
 }
 
-/** The due-row predicate, shared by the select and the in-transaction re-check. */
+/** Shared by the select and the in-transaction re-check. */
 const DUE_PREDICATE = `status = 'pending'
           AND trigger = 0
           AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
@@ -102,10 +82,8 @@ const DUE_PREDICATE = `status = 'pending'
           )`;
 
 /**
- * A pending turn with the recall partner that makes it eligible for host-side
- * admission. Both a future deferred wait (trigger=0) and an already admitted
- * due turn (trigger=1) match. A recall marker by itself does not: it is
- * historical context once its trigger has completed, failed, or expired.
+ * Matches a deferred wait (trigger=0) or an admitted due turn (trigger=1). A
+ * recall marker alone does not: its trigger has already ended.
  */
 export function hasPendingRecallPairedTrigger(db: Database.Database): boolean {
   return (
@@ -128,7 +106,6 @@ export function hasPendingRecallPairedTrigger(db: Database.Database): boolean {
   );
 }
 
-/** Every inert row that is due for admission, in seq order. */
 export function listDueAdmissionRows(db: Database.Database): DueAdmissionRow[] {
   return db
     .prepare(
@@ -142,15 +119,10 @@ export function listDueAdmissionRows(db: Database.Database): DueAdmissionRow[] {
 }
 
 /**
- * Commit one admission: append the caller's freshly built recall row and move
- * the existing turn immediately after it, flipping `trigger = 1`.
- *
- * Returns false when the row stopped being due between the select and this
- * transaction — a concurrent sweep or a cancel got there first, which is a
- * no-op, not a fault. Identity, status, tries, series, recurrence, content and
- * routing all stay on the original row; `on_wake` is cleared on BOTH halves so
- * a container that was concurrently started by real inbound can still consume
- * the now-safe pair on a later poll.
+ * Appends the caller's recall row and moves the turn right after it with
+ * `trigger = 1`. False when the row stopped being due meanwhile (a no-op, not
+ * a fault). `on_wake` is cleared on BOTH halves so a container started
+ * concurrently by real inbound can still consume the pair on a later poll.
  */
 export function admitDueRow(db: Database.Database, recall: MessageInsert, taskId: string): boolean {
   return db.transaction(() => {
@@ -179,55 +151,33 @@ export function admitDueRow(db: Database.Database, recall: MessageInsert, taskId
   })();
 }
 
-/* ─── Survivor reconciliation (restart-survival seam §7.F1) ────────────────── */
-
 /**
- * The accountability note whose own text is false for an adopted container.
- *
- * `src/host-restart-warn.ts` stamps it into `_system.kind`; it says the host
- * "stopped your container mid-work" and that the in-flight turn was lost.
+ * Its text ("the host stopped your container mid-work") is false for an adopted container.
  */
 const HOST_RESTART_NOTE_KIND = 'agent_host_restart';
 
-/** One unconsumed `on_wake` trigger row, with its note kind if it carries one. */
 interface SurvivorWakeRow {
   id: string;
   system_kind: string | null;
 }
 
 /**
- * Reconcile the `on_wake` rows a SURVIVING container can never select.
+ * `on_wake = 1` rows are selectable only on a container's FIRST poll, so an
+ * adopted survivor can never reach them. `agent_host_restart` notes are
+ * WITHDRAWN with their recall (delivering one would make the agent discard live
+ * state); the rest are CONVERTED and re-seqed to the front, because selection
+ * is `ORDER BY seq DESC LIMIT n` and an old seq may never surface. The pair
+ * keeps its `recall.seq = task.seq - 2` spacing.
  *
- * `on_wake = 1` means "only visible on a container's FIRST poll" — the runner
- * adds `AND on_wake = 0` to every selection query from poll 2 onward. A
- * container the host adopts across a restart is long past its first poll, so
- * every such row it still holds is unreachable: nothing will ever deliver it
- * and nothing will ever clear it.
- *
- * Two outcomes, chosen by the note's own `_system.kind`:
- *
- *  - `agent_host_restart` is WITHDRAWN with its recall partner. Delivering it
- *    would tell an agent whose turn was never interrupted that its work was
- *    lost, and the correct response to that note is to discard live state.
- *  - everything else is CONVERTED: `on_wake` clears on both halves and the pair
- *    is re-seqed to the front. Re-seqing is not cosmetic — the selection
- *    queries are `ORDER BY seq DESC LIMIT n`, so a row left at its old seq can
- *    fall outside the survivor's window and never surface. The pair keeps the
- *    `recall.seq = task.seq - 2` spacing the admission checker relies on.
- *
- * `claimed` is the caller's proof that no container has taken the row already;
- * it is invoked immediately before each row is touched, never read ahead. A row
- * it answers for is left exactly as it is — including the unprovable case,
- * which must answer `true`.
+ * `claimed` is invoked immediately before each row is touched; an unprovable
+ * case must answer `true`, leaving the row as it is.
  */
 export function reconcileSurvivorWakeRows(
   db: Database.Database,
   claimed: (messageId: string) => boolean,
 ): { converted: number; withdrawn: number } {
-  // `kind != 'system'`: a recall marker inherits its trigger's `on_wake`, and
-  // it is handled with the trigger it belongs to rather than on its own.
-  // `json_extract` in SQL rather than a parse-and-catch here: content is
-  // caller-supplied text and need not be JSON at all.
+  // `kind != 'system'`: recall markers move with their trigger. `json_extract`
+  // because content need not be JSON.
   const rows = db
     .prepare(
       `SELECT id,
@@ -253,7 +203,6 @@ export function reconcileSurvivorWakeRows(
   return { converted, withdrawn };
 }
 
-/** Delete an unconsumed `on_wake` trigger and its recall partner. */
 function withdrawWakePair(db: Database.Database, messageId: string): boolean {
   return db.transaction(() => {
     const gone =
@@ -265,12 +214,8 @@ function withdrawWakePair(db: Database.Database, messageId: string): boolean {
 }
 
 /**
- * Clear `on_wake` on an unconsumed pair and move it to the front of the queue.
- *
- * Both target seqs are above the current maximum, so neither collides with the
- * `seq` uniqueness constraint. A pair moves as a unit inside one transaction;
- * a lone trigger (`groups restart --message` writes one) takes the recall slot
- * itself, since there is no partner whose spacing has to be preserved.
+ * Both target seqs are above the current max, so no `seq` collision; a lone
+ * trigger takes the recall slot itself.
  */
 function convertWakePair(db: Database.Database, messageId: string): boolean {
   return db.transaction(() => {
@@ -293,11 +238,8 @@ function convertWakePair(db: Database.Database, messageId: string): boolean {
 }
 
 /**
- * Has a task row been admitted — a `trigger = 1` pending task sitting exactly
- * two seqs after its own inert recall row?
- *
- * The run-now gate asks this to prove its admission landed before it reports a
- * fire; anything less would turn a failed request into a silent later run.
+ * Proves a run-now admission landed before a fire is reported; anything less
+ * turns a failed request into a silent later run.
  */
 export function taskPairIsAdmitted(db: Database.Database, taskId: string): boolean {
   return (
@@ -319,13 +261,7 @@ export function taskPairIsAdmitted(db: Database.Database, taskId: string): boole
   );
 }
 
-/**
- * Put an inert task row back on its previous schedule.
- *
- * The run-now gate's undo: the row stayed inert, so restoring `process_after`
- * leaves only the pre-existing fire rather than converting a failed run-now
- * into an early one.
- */
+/** Run-now's undo: the row stayed inert, so no early fire results. */
 export function restoreInertTaskSchedule(db: Database.Database, taskId: string, processAfter: string | null): void {
   db.prepare(
     `UPDATE messages_in
@@ -334,14 +270,10 @@ export function restoreInertTaskSchedule(db: Database.Database, taskId: string, 
   ).run(processAfter, taskId);
 }
 
-/* ─── Startup pre-turn-context upgrade ─────────────────────────────────────── */
-
-/** An already-triggering row that predates the pre-turn context contract. */
 export interface PendingUpgradeRow extends DueAdmissionRow {
   status: 'pending' | 'processing';
 }
 
-/** The predicate for a live turn that never got a recall pair. */
 const UNPAIRED_PREDICATE = `status IN ('pending', 'processing')
           AND trigger = 1
           AND kind NOT IN ('system', 'task')
@@ -352,11 +284,8 @@ const UNPAIRED_PREDICATE = `status IN ('pending', 'processing')
           )`;
 
 /**
- * Live turns written before the pre-turn context contract was activated.
- *
- * Scheduled tasks are excluded on purpose: their due-time seam admits context
- * immediately before execution, so pairing them here would build a context
- * that is stale by the time they fire.
+ * Scheduled tasks are excluded: they are admitted immediately before
+ * execution, so pairing them now would build stale context.
  */
 export function listUnpairedPendingUpgradeRows(db: Database.Database): PendingUpgradeRow[] {
   return db
@@ -371,12 +300,9 @@ export function listUnpairedPendingUpgradeRows(db: Database.Database): PendingUp
 }
 
 /**
- * Commit one startup upgrade: append the recall row and move the turn after
- * it, returning a `processing` row to `pending`.
- *
- * Containers are absent when this runs (the migration and startup gates prove
- * that first), so a row left in `processing` can safely go back to pending.
- * Returns false when the row was paired or ended between the select and here.
+ * Runs with no containers present (proved by the startup gates), so a
+ * `processing` row can go back to pending. False when the row was paired or
+ * ended meanwhile.
  */
 export function admitPendingUpgradeRow(db: Database.Database, recall: MessageInsert, messageId: string): boolean {
   return db.transaction(() => {

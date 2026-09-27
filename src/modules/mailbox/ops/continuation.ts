@@ -1,26 +1,15 @@
 /**
- * Durable work-continuation state, stored by the runner in outbound
- * `session_state` and read (and, for recovery admission, written) by the host.
- *
- * Moved verbatim out of `src/host-sweep.ts` for the mailbox seam
- * (docs/specs/upstream-mailbox-seam/plan.md §4.4, "Sweep / container state"):
- * the SQL belongs to the module that owns the session DBs, the throttle and
- * cap policy stays in the sweep. Internal to `src/modules/mailbox/`.
- *
- * This file is the ONE host-side implementation of the continuation record —
- * its type, its size cap and its parser (invariant I-2). `ops/session-state.ts`
- * owns the neighbouring keys (raw presence, force-clear, done proposal) and
- * imports the record from here rather than parsing it a second time.
+ * The ONE host-side implementation of the work-continuation record (type,
+ * size cap, parser). The runner stores it in outbound `session_state`; the
+ * host reads it and, for recovery admission, writes it.
  */
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
 
 import { parseSqliteUtc } from '../sqlite-utc.js';
 
-/** Hard cap on automatic resume attempts for one continuation record. */
 export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
 
-/** Longest task string a continuation record may carry before it is treated as absent. */
 const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
 
 export interface HostWorkContinuation {
@@ -35,12 +24,9 @@ export interface HostWorkContinuation {
 }
 
 /**
- * Is a `work_continuation` row present at all?
- *
- * Deliberately NOT `readWorkContinuation() !== null`: that one validates the
- * record and answers null for a malformed one. The reclaim/GC gate wants the
- * conservative question — anything written there is work someone promised —
- * so a record this module would reject still retains the session's storage.
+ * Deliberately NOT `readWorkContinuation() !== null`, which is null for a
+ * malformed record: anything written there is promised work, so it still
+ * retains the session's storage.
  */
 export function hasWorkContinuationRow(outDb: Database.Database): boolean {
   return outDb.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get() !== undefined;
@@ -51,14 +37,9 @@ export function canAttemptContinuationRecovery(continuation: HostWorkContinuatio
 }
 
 /**
- * A capped record a runner already claimed. No runner picks up a queued record
- * that carries a `runner_id`, and the host authorizes no attempt past the cap,
- * so only real inbound — which arrives as a due row — can re-arm it. Holding a
- * container open for it waits out the absolute ceiling for nothing.
- *
- * A capped `running` record is deliberately not parked: a live runner writes
- * it before raising `provider_executing` for the final attempt, and the host
- * cannot tell that runner from a dead one.
+ * A capped record a runner already claimed: only real inbound can re-arm it,
+ * so holding a container open for it is pointless. A capped `running` record
+ * is not parked: the host can't tell a live final attempt from a dead one.
  */
 export function isContinuationParked(continuation: HostWorkContinuation): boolean {
   return (
@@ -108,9 +89,8 @@ export function readWorkContinuation(outDb: Database.Database): HostWorkContinua
       };
     }
 
-    // Rollout compatibility: the fresh runner owns migration/deletion because
-    // the host normally opens outbound.db read-only. A valid legacy promise is
-    // sufficient to wake once; the runner converts it before executing.
+    // The fresh runner owns legacy migration (the host normally opens
+    // outbound.db read-only); a valid legacy promise may wake once.
     const legacy = outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get() as
       | { value: string }
       | undefined;
@@ -137,9 +117,8 @@ export function readWorkContinuation(outDb: Database.Database): HostWorkContinua
 }
 
 /**
- * Durable throttle timestamp for an already-attempted recovery. The active
- * container registry is cleared on exit, but session_state survives the
- * crash, so a fast-failing replacement cannot be respawned every sweep tick.
+ * session_state survives a crash (the container registry doesn't), so a
+ * fast-failing replacement can't be respawned every sweep tick.
  */
 export function readContinuationRecoveryAttemptAt(
   outDb: Database.Database,
@@ -172,10 +151,8 @@ export function incrementWorkContinuationResumeAttempt(
     ) {
       return null;
     }
-    // The stopped-container host is authorizing one fresh runner to consume
-    // this recovery attempt. Clear the prior runner claim so the container can
-    // distinguish this authorized start from a capped attempt that has already
-    // run and is merely hitchhiking on an unrelated wake.
+    // Clear the prior runner claim so the container can tell this authorized
+    // start from a capped attempt hitchhiking on an unrelated wake.
     const updated: HostWorkContinuation = {
       ...current,
       phase: 'queued',

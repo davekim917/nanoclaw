@@ -1,48 +1,21 @@
 /**
- * Named read ops for the host's operator surfaces (dashboard, Observatory,
- * the usage rollup).
- *
- * These used to be inline SQL in the caller, executed on a handle the caller
- * opened itself. They live here for the same reason every other op does: the
- * mailbox module is the only code on the host that knows the session-DB shape
- * (docs/specs/upstream-mailbox-seam/plan.md §4.1, invariant I-2). Each op is
- * named after the QUESTION the surface asks, not after the table it reads —
- * there is deliberately no "run this SQL" escape hatch, because that is the
- * hole every ratchet pattern exists to close.
- *
- * All of these are reads. The read-only session (../read-only.ts) is what
- * binds them to handles that can never provision, migrate or write.
+ * Read ops for operator surfaces, named after the QUESTION asked, never a
+ * "run this SQL" hatch. The read-only session binds them to handles that can
+ * never provision, migrate or write.
  */
 import type Database from 'better-sqlite3';
 
-/* ─── Scheduled-task board (inbound) ───────────────────────────────────────── */
-
-/**
- * One scheduled-task row as every board surface reads it.
- *
- * A superset of the column sets the list, the detail drawer, the mutation gate
- * and the move flow each used to select for themselves — one shape, so a
- * caller that needs one more field does not mint a fifth near-identical query.
- */
+/** One shape for every board surface, so an extra field doesn't mint another near-identical query. */
 export interface ScheduledTaskRow {
   id: string;
-  /**
-   * Monotonic per-session sequence. Carried so a writer can tell "the row I
-   * approved" from "a row that has since been rewritten in place" — an id
-   * alone cannot, because admission mutates the row rather than replacing it.
-   */
+  /** Distinguishes "the row I approved" from one rewritten in place (admission mutates rows). */
   seq: number;
   series_id: string | null;
   recurrence: string | null;
   process_after: string | null;
   scheduled_for: string | null;
   status: string;
-  /**
-   * 0 = inert, 1 = admitted and fireable. NULL only on a legacy `inbound.db`
-   * that predates the column and has not met a writer yet — see
-   * {@link scheduledColumns}. Inside a mailbox session the column always
-   * exists, because opening one migrates.
-   */
+  /** 0 = inert, 1 = admitted. NULL only on a legacy, not-yet-migrated `inbound.db`. */
   trigger: number | null;
   kind: string;
   timestamp: string;
@@ -53,25 +26,15 @@ export interface ScheduledTaskRow {
 }
 
 /**
- * The scheduled-row column list, with `scheduled_for` selected conditionally.
- *
- * That column is added LAZILY, by the first WRITABLE open of a given session
- * (`../schema.ts`'s `messages_in` migration). The read-only session
- * (`../read-only.ts`) deliberately never migrates, so on an upgraded install
- * it can meet a session no writer has touched yet — and naming a missing
- * column throws, which every board surface reports as `unreadable`. The
- * dashboard serves from host start, well before the sweep reaches those
- * sessions. Selected conditionally instead: absent means NULL, and every
- * consumer of this row already falls back to `process_after` for a row
- * written before the column existed.
+ * `scheduled_for` and `trigger` are added LAZILY by the first writable open,
+ * and the read-only session never migrates: naming a missing column throws, so
+ * they are selected conditionally (absent reads as NULL).
  */
 function scheduledColumns(db: Database.Database): string {
   const columns = new Set(
     (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((column) => column.name),
   );
-  // `trigger` is lazily added by the same migration as `scheduled_for`, so it
-  // gets the same treatment for the same reason: naming a missing column
-  // throws, and the read-only session deliberately never migrates.
+  // `trigger`: same lazy migration, same treatment.
   const scheduledFor = columns.has('scheduled_for') ? 'scheduled_for' : 'NULL AS scheduled_for';
   const trigger = columns.has('trigger') ? '"trigger"' : 'NULL AS "trigger"';
   return `id, seq, series_id, recurrence, process_after, ${scheduledFor},
@@ -79,9 +42,8 @@ function scheduledColumns(db: Database.Database): string {
 }
 
 /**
- * Series ids with more than one live recurring successor. The board marks
- * the series unhealthy without giving its shared locator duplicate rows.
- * Intentional manual runs share the series id but have no recurrence.
+ * Series with more than one live recurring successor (manual runs share the
+ * series id but have no recurrence).
  */
 export function listDuplicateLiveTaskSeriesIds(db: Database.Database): string[] {
   const rows = db
@@ -95,12 +57,8 @@ export function listDuplicateLiveTaskSeriesIds(db: Database.Database): string[] 
 }
 
 /**
- * The newest recurrence-bearing row of every series, cancelled series excluded.
- * A newer manual occurrence must not hide the still-armed recurring chain.
- *
- * Terminal-but-still-recurring rows are deliberately included: the board's
- * strand detector needs to see a fired series that minted no successor, which
- * is exactly what a terminal latest row means.
+ * A newer manual occurrence must not hide the still-armed chain. Terminal
+ * recurring rows are included: the strand detector needs them.
  */
 export function listLatestRecurringSeriesRows(db: Database.Database): ScheduledTaskRow[] {
   return db
@@ -115,7 +73,7 @@ export function listLatestRecurringSeriesRows(db: Database.Database): ScheduledT
     .all() as ScheduledTaskRow[];
 }
 
-/** Live standalone one-off series; manual runs of recurring series stay in that series. */
+/** Manual runs of recurring series stay in their series. */
 export function listLiveOneOffTaskRows(db: Database.Database): ScheduledTaskRow[] {
   return db
     .prepare(
@@ -130,13 +88,7 @@ export function listLiveOneOffTaskRows(db: Database.Database): ScheduledTaskRow[
     .all() as ScheduledTaskRow[];
 }
 
-/**
- * Every live (pending|paused) task row in the session, newest first.
- *
- * Session-wide rather than per-series: the consolidation migration walks a
- * legacy session's whole scheduled backlog, and asking per series would first
- * require knowing the series, which is what this answers.
- */
+/** Session-wide: the consolidation migration walks a whole legacy backlog. */
 export function listLiveTaskRows(db: Database.Database): ScheduledTaskRow[] {
   return db
     .prepare(
@@ -148,7 +100,6 @@ export function listLiveTaskRows(db: Database.Database): ScheduledTaskRow[] {
     .all() as ScheduledTaskRow[];
 }
 
-/** Every live row of one series, not just the newest. */
 export function listLiveTaskRowsForSeries(db: Database.Database, seriesId: string): ScheduledTaskRow[] {
   return db
     .prepare(
@@ -160,11 +111,8 @@ export function listLiveTaskRowsForSeries(db: Database.Database, seriesId: strin
 }
 
 /**
- * The live recurring chain, or newest LIVE standalone one-off. A terminal
- * recurring chain resolves through getLatestSeriesRow, never a manual run.
- *
- * Kind-agnostic on purpose — the detail drawer resolves a board row the list
- * built from `recurrence IS NOT NULL`, which is not restricted to `task`.
+ * The live recurring chain, or newest LIVE one-off; a terminal chain resolves
+ * via getLatestSeriesRow, never a manual run. Kind-agnostic on purpose.
  */
 export function getLiveSeriesRow(db: Database.Database, seriesId: string): ScheduledTaskRow | null {
   return (
@@ -180,7 +128,6 @@ export function getLiveSeriesRow(db: Database.Database, seriesId: string): Sched
   );
 }
 
-/** Prefer the recurring chain, including a terminal strand, over manual-run history. */
 export function getLatestSeriesRow(db: Database.Database, seriesId: string): ScheduledTaskRow | null {
   return (
     (db
@@ -193,13 +140,9 @@ export function getLatestSeriesRow(db: Database.Database, seriesId: string): Sch
 }
 
 /**
- * The live recurring task chain, or newest LIVE standalone one-off. A terminal
- * recurring chain has no editable live schedule, even with a pending manual run.
- * Board controls target the schedule even when a newer manual run shares its id.
- *
- * The kind-filtered twin of {@link getLiveSeriesRow}: the mutation gate, the
- * move flow and the detail bodies all mean "the scheduled task", and a
- * non-task row sharing the series id must never be edited, paused or moved.
+ * Kind-filtered twin of `getLiveSeriesRow`: a non-task row sharing the series
+ * id must never be edited, paused or moved. A terminal chain has no editable
+ * schedule, even with a pending manual run.
  */
 export function getLiveTaskRow(db: Database.Database, seriesId: string): ScheduledTaskRow | null {
   return (
@@ -215,7 +158,6 @@ export function getLiveTaskRow(db: Database.Database, seriesId: string): Schedul
   );
 }
 
-/** Exact live task occurrence lookup for move ownership/recovery. */
 export function getLiveTaskRowById(db: Database.Database, rowId: string): ScheduledTaskRow | null {
   return (
     (db
@@ -227,13 +169,7 @@ export function getLiveTaskRowById(db: Database.Database, rowId: string): Schedu
   );
 }
 
-/**
- * Durable task occurrence lookup for move recovery.
- *
- * The move intent records the target row's exact id before source cancellation.
- * Recovery must still recognize that ownership after the occurrence completes:
- * a recurring completion can arm its successor before a crashed host recovers.
- */
+/** Must still find the target after it completes: a recurring completion can arm its successor before recovery. */
 export function getTaskRowById(db: Database.Database, rowId: string): ScheduledTaskRow | null {
   return (
     (db
@@ -245,7 +181,6 @@ export function getTaskRowById(db: Database.Database, rowId: string): ScheduledT
   );
 }
 
-/** The recurring task definition, including a terminal strand, or newest one-off. */
 export function getLatestTaskRow(db: Database.Database, seriesId: string): ScheduledTaskRow | null {
   return (
     (db
@@ -257,7 +192,6 @@ export function getLatestTaskRow(db: Database.Database, seriesId: string): Sched
   );
 }
 
-/** One past fire of a series, as the detail drawer's history list reads it. */
 export interface TaskFireRow {
   id: string;
   status: string;
@@ -265,7 +199,7 @@ export interface TaskFireRow {
   timestamp: string;
 }
 
-/** The last `limit` TERMINAL fires of a series, newest first. */
+/** TERMINAL fires only, newest first. */
 export function listRecentTaskFires(db: Database.Database, seriesId: string, limit: number): TaskFireRow[] {
   return db
     .prepare(
@@ -278,9 +212,6 @@ export function listRecentTaskFires(db: Database.Database, seriesId: string, lim
     .all(seriesId, limit) as TaskFireRow[];
 }
 
-/* ─── Container / claim state (outbound) ───────────────────────────────────── */
-
-/** Ids of the inbound messages a container currently holds a processing claim on. */
 export function listProcessingClaimedMessageIds(db: Database.Database): string[] {
   return (
     db.prepare("SELECT message_id FROM processing_ack WHERE status = 'processing'").all() as Array<{
@@ -289,23 +220,10 @@ export function listProcessingClaimedMessageIds(db: Database.Database): string[]
   ).map((r) => r.message_id);
 }
 
-/**
- * Is a work-continuation chain queued or running for this session?
- *
- * The continuation family owns the statement (invariant I-2); this is the
- * read-side name for it, re-exported rather than re-implemented.
- */
+/** The continuation family owns the statement; this is its read-side name. */
 export { hasWorkContinuationRow as hasWorkContinuation } from './continuation.js';
 
-/* ─── Outbound message history ─────────────────────────────────────────────── */
-
-/**
- * The newest reply timestamp per inbound message this session has answered.
- *
- * The board's fire history uses it to tell "ran and said something" from
- * "completed with no chat output"; nothing else about the reply matters, so
- * only the timestamp comes back.
- */
+/** Only whether a fire "said something" matters, so only the timestamp comes back. */
 export function latestReplyTimestampByTrigger(db: Database.Database): Map<string, string> {
   const rows = db
     .prepare(
@@ -315,14 +233,9 @@ export function latestReplyTimestampByTrigger(db: Database.Database): Map<string
   return new Map(rows.map((r) => [r.in_reply_to, r.ts]));
 }
 
-/* ─── Per-turn usage (outbound) ────────────────────────────────────────────── */
-
 /**
- * One container-written per-turn usage row.
- *
- * The optional fields postdate the original table: a row written by a
- * container older than them comes back WITHOUT those keys at all (`SELECT *`
- * returns the columns that exist), so every reader goes through `??`.
+ * Optional fields postdate the table: an older container's rows lack the keys
+ * entirely (`SELECT *`), so readers use `??`.
  */
 export interface SessionTurnUsageRow {
   id: number;
@@ -342,22 +255,14 @@ export interface SessionTurnUsageRow {
   rate_limit_resets_at?: string | null;
   turn_id?: string | null;
   /**
-   * Reasoning effort — effective (post-clamp) and as requested (pre-clamp).
-   * Optional like every other post-original column: a container older than
-   * 2026-09-07 has no such column, so the key is simply absent. Absent or
-   * NULL means "not recorded / not attributable", never "ran at no effort".
+   * Effective (post-clamp) effort. Absent or NULL means "not recorded", never
+   * "ran at no effort".
    */
   effort?: string | null;
   effort_requested?: string | null;
 }
 
-/**
- * Turn-usage rows newer than the central watermark, oldest first.
- *
- * Returns `[]` when the table is absent — a session whose container never
- * wrote usage is the normal case, not an error, and the caller must not have
- * to probe `sqlite_master` itself to find that out.
- */
+/** `[]` when the table is absent (the normal case for a container that never wrote usage). */
 export function listTurnUsageSince(db: Database.Database, afterId: number): SessionTurnUsageRow[] {
   const present =
     db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = 'turn_usage' LIMIT 1").get() !== undefined;
@@ -365,27 +270,13 @@ export function listTurnUsageSince(db: Database.Database, afterId: number): Sess
   return db.prepare('SELECT * FROM turn_usage WHERE id > ? ORDER BY id ASC').all(afterId) as SessionTurnUsageRow[];
 }
 
-/* ─── Fleet-fan-out probes (inbound) ───────────────────────────────────────── */
-
-/**
- * The id of the newest inbound row, or `null` on an empty mailbox.
- *
- * The SSE feed stamps its `inbound_message` frame with it so a console client
- * can dedupe against the row it already rendered; a mailbox with no rows falls
- * back to the caller's synthetic id.
- */
+/** `null` on an empty mailbox (the caller falls back to a synthetic id). */
 export function latestInboundMessageId(db: Database.Database): string | null {
   const row = db.prepare('SELECT id FROM messages_in ORDER BY seq DESC LIMIT 1').get() as { id: string } | undefined;
   return row?.id ?? null;
 }
 
-/**
- * Does this session hold at least one live recurring row?
- *
- * Kind-agnostic and status-scoped exactly as the sessions list asks it: a
- * session parked on the stale boundary is not idle if something is still
- * scheduled to wake it.
- */
+/** A session parked on the stale boundary is not idle if something still recurs. */
 export function hasPendingRecurrence(db: Database.Database): boolean {
   return (
     db
@@ -400,18 +291,13 @@ export function hasPendingRecurrence(db: Database.Database): boolean {
 }
 
 /**
- * Has this session ever been woken?
- *
- * `trigger` postdates the initial schema, so a DB old enough to lack the
- * column makes this THROW rather than answer false — the caller decides what
- * an unanswerable probe means (both of today's callers fail it closed to
- * "has woken", which never suppresses a real title).
+ * THROWS on a DB too old to have `trigger`; callers decide what an unanswerable
+ * probe means (today both fail closed to "has woken").
  */
 export function hasTriggeredInboundRow(db: Database.Database): boolean {
   return db.prepare('SELECT 1 FROM messages_in WHERE trigger = 1 LIMIT 1').get() !== undefined;
 }
 
-/** One message as the transcript and title surfaces read it, either direction. */
 export interface MessageTailRow {
   seq: number;
   kind: string;
@@ -422,29 +308,16 @@ export interface MessageTailRow {
 const TAIL_COLUMNS = 'seq, kind, timestamp, content';
 const TAIL_FILTER = "WHERE content IS NOT NULL AND content <> ''\n        ORDER BY seq DESC\n        LIMIT ?";
 
-/**
- * The last `limit` non-empty inbound rows, newest first.
- *
- * One shape for both readers of a session's tail — the session-detail
- * transcript and the title sweep's slice — because they ask the same question
- * and a second near-identical select is how the two would drift.
- */
+/** One shape for both tail readers (transcript and title sweep) so they can't drift. */
 export function listInboundTail(db: Database.Database, limit: number): MessageTailRow[] {
   return db.prepare(`SELECT ${TAIL_COLUMNS} FROM messages_in ${TAIL_FILTER}`).all(limit) as MessageTailRow[];
 }
 
-/** The outbound twin of {@link listInboundTail}. */
 export function listOutboundTail(db: Database.Database, limit: number): MessageTailRow[] {
   return db.prepare(`SELECT ${TAIL_COLUMNS} FROM messages_out ${TAIL_FILTER}`).all(limit) as MessageTailRow[];
 }
 
-/**
- * How many live (pending|paused) task rows this session holds for a series.
- *
- * The move flow's scoped invariant counter: asked of exactly the named
- * sessions, never fleet-wide, so an unrelated group reusing the same series id
- * cannot satisfy it.
- */
+/** Scoped to exactly the named sessions, never fleet-wide, so another group's same series id can't satisfy it. */
 export function countLiveSeriesRows(db: Database.Database, seriesId: string): number {
   return (
     db
@@ -456,21 +329,13 @@ export function countLiveSeriesRows(db: Database.Database, seriesId: string): nu
   ).c;
 }
 
-/** The delivery routing one task series last stamped on a fire. */
 export interface TaskRoutingStamp {
   platformId: string;
   channelType: string;
   threadId: string | null;
 }
 
-/**
- * The newest routed row of ONE series, thread included.
- *
- * The claim self-heal's second rung: a `system:tasks:<series>` claim has no
- * messaging group of its own, so where the series posts is the only honest
- * subject. `null` means the series was created `--isolated` and stamped no
- * routing on purpose — a real answer, not a miss.
- */
+/** `null` means the series was created `--isolated` and stamped no routing on purpose. */
 export function getLatestTaskRoutingStamp(db: Database.Database, seriesId: string): TaskRoutingStamp | null {
   return (
     (db
@@ -485,18 +350,15 @@ export function getLatestTaskRoutingStamp(db: Database.Database, seriesId: strin
   );
 }
 
-/** Channel a task session last delivered into, for the Slack owner-safety gate. */
+/** For the Slack owner-safety gate. */
 export interface TaskDeliveryRoute {
   channel_type: string | null;
   platform_id: string;
 }
 
 /**
- * The newest routed task row in the SESSION, any series.
- *
- * Insertion order (`rowid`), not `seq`: the gate wants the most recently
- * written route, and an empty `platform_id` is treated as no route at all so a
- * blank stamp cannot resolve to a messaging group.
+ * Insertion order (`rowid`), not `seq`: the most recently written route. An
+ * empty `platform_id` counts as no route.
  */
 export function getLatestTaskDeliveryRoute(db: Database.Database): TaskDeliveryRoute | null {
   return (
