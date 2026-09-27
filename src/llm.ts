@@ -571,12 +571,22 @@ async function callWithCredentialRotationAttempt<T>(options: {
   throw lastErr;
 }
 
+/** One request per configured key, in order; the first success wins. Deliberately outside the shared gate and parking. */
 export async function callHaiku(prompt: string, timeoutMs = 15_000): Promise<string> {
-  const { value } = await callWithCredentialRotation({
-    attempt: (credential) => callHaikuOnce(prompt, timeoutMs, credential),
-    logLabel: 'callHaiku',
-    noCredentialsMessage:
+  const credentials = structuredCredentials(process.env, defaultStructuredCredentialEnvFile(process.env));
+  if (credentials.length === 0) {
+    throw new Error(
       'callHaiku: no Anthropic credentials configured (set ANTHROPIC_API_KEY or a CLAUDE_CODE_OAUTH_TOKEN slot)',
-  });
-  return value;
+    );
+  }
+  let lastErr: unknown;
+  for (const credential of credentials) {
+    try {
+      return await callHaikuOnce(prompt, timeoutMs, credential);
+    } catch (err) {
+      lastErr = err;
+      log.warn('callHaiku: key failed, trying the next one', { slot: credential.slot, err: (err as Error).message });
+    }
+  }
+  throw lastErr;
 }
