@@ -1,10 +1,7 @@
 /**
- * SSE feed for the dashboard.
- *
- * Single global keepalive timer (M22). Per-user cap 20, aggregate cap 200.
- * chokidar v5 watches data/v2-sessions/ directory; emitDashboardEvent is
- * also called directly by dispatch.ts (cycle-3 M2-c3 — central DB is WAL
- * so chokidar misses writes between checkpoints).
+ * SSE feed for the dashboard: one global keepalive timer; per-user cap 20, aggregate cap 200. chokidar watches
+ * data/v2-sessions/, and emitDashboardEvent is also called directly because the central DB is WAL and chokidar misses
+ * writes between checkpoints.
  */
 import path from 'path';
 import http from 'http';
@@ -25,9 +22,7 @@ export interface InboundMessagePayload {
 }
 
 export interface TaskEventPayload {
-  // null for whole-group events (e.g., bulk_archived) where there's no
-  // single task id worth singling out — SWR consumers should treat null as
-  // "invalidate the whole list, this group changed."
+  // null for whole-group events: consumers invalidate the whole list.
   task_id: string | null;
   kind:
     | 'admit'
@@ -45,26 +40,12 @@ export interface TaskEventPayload {
 }
 
 /**
- * Push-channel signal that something on the inbox-board surface changed for
- * one session. Consumers treat it as "invalidate this session's row" — they
- * re-fetch /dashboard/api/sessions to get the new attention_state. The
- * granular `kind` tag is here so a future client can refresh a single card
- * instead of the whole list, but the v1 inbox just invalidates SWR.
- *
- *   - inbound          — router wrote a new row into the session's
- *                        inbound.db. The session's last_inbound_at moved.
- *   - outbound         — host successfully delivered an outbound row;
- *                        last_outbound_at + kind moved. `outbound_kind`
- *                        carries the granular tag from delivery.ts so a
- *                        chat-sdk:ask_question fan-out can be detected
- *                        without re-fetching.
- *   - container_state  — heartbeat-derived state transition (running→idle,
- *                        idle→stopped, etc.). `container_status` carries
- *                        the new state.
+ * Something on the inbox surface changed for one session; consumers re-fetch its row. `inbound`: the router wrote to
+ * inbound.db. `outbound`: a delivery succeeded (`outbound_kind` carries the delivery tag). `container_state`: a
+ * heartbeat-derived transition.
  */
 export interface SessionEventPayload {
-  // null for whole-group bulk events; the inbox treats null as "invalidate
-  // the visible list for this group". Matches the TaskEventPayload contract.
+  // null for whole-group bulk events, as in TaskEventPayload.
   session_id: string | null;
   agent_group_id: string;
   kind: 'inbound' | 'outbound' | 'container_state' | 'archived' | 'unarchived';
@@ -101,11 +82,8 @@ export function emitDashboardEvent(
 }
 
 /**
- * Convenience wrapper for the three session-event emit sites (inbound write,
- * outbound delivery, container-state change). Wraps the emit in a try/catch
- * because the dashboard module isn't always initialized in unit tests, and a
- * thrown SSE error from a hot delivery loop is far worse than a missed
- * push (clients poll every 30s as a backstop).
+ * Never throws: the dashboard is not always initialized in unit tests, and a thrown SSE error in a hot delivery loop
+ * is far worse than a missed push (clients poll as a backstop).
  */
 export function emitSessionEvent(payload: SessionEventPayload): void {
   try {
@@ -135,9 +113,7 @@ const AGGREGATE_CAP = 200;
 const KEEPALIVE_INTERVAL_MS = 25_000;
 const SESSIONS_ROOT = path.resolve(process.cwd(), 'data/v2-sessions');
 const SESSION_DATABASE_FILES = new Set(['inbound.db', 'outbound.db']);
-// One definition of the layout, imported rather than restated: the watcher has
-// to look exactly where the host writes, and a second copy of '.host' here
-// would be free to drift away from the writer.
+// Imported so the watcher looks exactly where the host writes.
 import { HOST_INBOUND_DIR_NAME } from '../../modules/mailbox/index.js';
 
 type SessionWatchStats = Pick<Stats, 'isDirectory' | 'isSymbolicLink'>;
@@ -149,17 +125,15 @@ export function shouldIgnoreSessionWatchPath(filePath: string, stats?: SessionWa
   }
   if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return true;
   const parts = relative.split(path.sep);
-  // Traverse only v2-sessions/<agent-group>/<session>. Session worktrees can
-  // contain hundreds of thousands of directories and are irrelevant here.
+  // Traverse only v2-sessions/<agent-group>/<session>: session worktrees can hold hundreds of thousands of
+  // directories.
   if (parts.length <= 2) {
-    // Chokidar calls a two-argument ignored function once before and once
-    // after stat. Admit the path-only pass, then require a real directory.
+    // chokidar calls a two-argument ignored function once before and once after stat; admit the path-only pass, then
+    // require a real directory.
     return stats !== undefined && (stats.isSymbolicLink() || !stats.isDirectory());
   }
-  // The host writes `<session>/.host/inbound.db`, so the watch has
-  // to reach one level deeper for that one path — otherwise every host inbound
-  // write stops raising an SSE event and the board silently goes stale. The
-  // `.host` DIRECTORY is admitted too, or chokidar never descends into it.
+  // The host writes `<session>/.host/inbound.db`, so that one directory must be admitted too, or host inbound writes
+  // raise no SSE event and the board silently goes stale.
   if (parts.length === 3 && parts[2] === HOST_INBOUND_DIR_NAME) {
     return stats !== undefined && (stats.isSymbolicLink() || !stats.isDirectory());
   }
@@ -191,7 +165,6 @@ function removeConnection(conn: SseConnection): void {
   if (aggregateCount < 0) aggregateCount = 0;
 }
 
-// Single global keepalive timer (M22 — one timer, not per-connection)
 let keepaliveTimer: NodeJS.Timeout | null = null;
 let watcher: import('chokidar').FSWatcher | null = null;
 
@@ -214,23 +187,17 @@ export function startSSEFeed(): void {
 
   void import('chokidar')
     .then(({ watch }) => {
-      // ignored function accepts both inbound.db and outbound.db (M4-c2)
-      // returning false = DO watch the file; returning true = ignore
       watcher = watch(SESSIONS_ROOT, {
         ignoreInitial: true,
         followSymlinks: false,
         awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
-        // Accept only the two session DBs and their two directory ancestors.
-        // A filename heuristic would recurse into session worktrees and exhaust
-        // the process-wide inotify budget on large repositories.
+        // Only the session DBs and their directory ancestors: a filename heuristic would recurse into worktrees and
+        // exhaust the inotify budget.
         ignored: shouldIgnoreSessionWatchPath,
       });
 
-      // Post-build QA fix SF-9: chokidar emits `error` events; without a handler
-      // they propagate as unhandled `EventEmitter` errors and crash the process on
-      // newer Node.js versions. Common trigger: SESSIONS_ROOT doesn't exist on first
-      // run before any sessions have been created. Log and continue — the SSE feed
-      // remains functional via programmatic emitDashboardEvent calls.
+      // Without an `error` handler chokidar errors crash the process on newer Node (e.g. SESSIONS_ROOT not yet
+      // created).
       watcher.on('error', (err) => {
         log.warn('chokidar SSE watcher error', { err });
       });
@@ -241,8 +208,6 @@ export function startSSEFeed(): void {
         if (parts.length < 3) return;
         const [agentGroupId, sessionId] = parts;
         if (!agentGroupId || !sessionId) return;
-        // `<ag>/<sess>/{inbound,outbound}.db`, or the host-owned
-        // `<ag>/<sess>/.host/inbound.db` the host writes.
         const filename = parts[parts.length - 1];
         const hostOwned = parts.length === 4 && parts[2] === HOST_INBOUND_DIR_NAME && filename === 'inbound.db';
         if (!hostOwned && (parts.length !== 3 || !filename || !SESSION_DATABASE_FILES.has(filename))) return;
@@ -257,10 +222,7 @@ export function startSSEFeed(): void {
 
 function _emitInboundChangeEvent(agentGroupId: string, sessionId: string, isInbound: boolean): void {
   let messageId = `fs:${agentGroupId}:${sessionId}:${Date.now()}`;
-  // Only an inbound.db change can name the row that changed. An outbound.db
-  // touch keeps the synthetic id, exactly as before the seam — the pre-seam
-  // code opened whichever file moved and asked it for `messages_in`, which on
-  // outbound.db threw and fell through to this same fallback.
+  // Only an inbound.db change can name the row that changed; an outbound.db touch keeps the synthetic id.
   if (isInbound) {
     try {
       const latest = readSessionInbound({ agentGroupId, sessionId }, (mailbox) => mailbox.latestInboundMessageId(), {
@@ -321,7 +283,6 @@ export const eventsHandler: AuthHandler = async (_req, _params, ctx) => {
   }
 
   const nodeReq: http.IncomingMessage = ctx.rawNodeReq;
-  // rawNodeRes is set by dispatch in router.ts
   const nodeRes: http.ServerResponse = (ctx as unknown as { rawNodeRes: http.ServerResponse }).rawNodeRes;
 
   nodeRes.writeHead(200, {

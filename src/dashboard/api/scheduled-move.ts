@@ -1,17 +1,9 @@
 /**
- * Scheduled Tasks Board move flow (Tasks D1 + D2):
- *   POST /dashboard/api/scheduled/:key/move/preview  — dry-run wiring + secret delta
- *   POST /dashboard/api/scheduled/:key/move           — cancel-first execute
- *
- * Move = cancel-in-source + scheduleTask-into-target, sequenced here (C2). All
- * the F1–F6 hardening lives in moveExecuteHandler: staged paused insert (F1),
- * durable move_intent before cancel + purge on resolve (F2/F5), preview→execute
- * delta TOCTOU re-check, fail-closed compensation, and the exactly-one-live-row
- * invariant. Both preview and execute are gated at the MUTATION tier
- * (canManageScheduled) — preview reads vault secret NAMES, so a scoped admin
- * must not be able to enumerate them (M5/SEC-1).
- *
- * See docs/specs/scheduled-tasks-board/design.md §4.0, §4.2, §4.4, §4.5.
+ * Scheduled Tasks Board move flow: `POST .../move/preview` (dry-run wiring + secret delta) and `POST .../move`
+ * (cancel-first execute).
+ * Move = cancel in source + scheduleTask into target, with a durable move_intent written before the cancel, a
+ * preview→execute delta re-check, fail-closed compensation, and an exactly-one-live-row invariant. Both are gated at
+ * the mutation tier because preview reveals vault secret NAMES.
  */
 import { createHash } from 'crypto';
 import fs from 'fs';
@@ -51,8 +43,6 @@ import {
   approvedRowChanged,
 } from './scheduled-shared.js';
 
-// ── Test seam ─────────────────────────────────────────────────────────────────
-
 interface MoveOptions {
   dataDir: string;
   groupsDir: string;
@@ -70,10 +60,8 @@ function moveOpts(): MoveOptions {
       nowMs: testOptions.nowMs,
     };
   }
-  // Production default MUST be DATA_DIR (matches readOpts in scheduled-read.ts).
-  // A '' default resolved session DBs under <cwd>/v2-sessions instead of
-  // <cwd>/data/v2-sessions → every real move hit the missing-source guard and
-  // returned session_unreadable (move broken outside tests, which inject a dir).
+  // Production default MUST be DATA_DIR: a '' default resolves session DBs under <cwd>/v2-sessions and every real
+  // move fails the missing-source guard.
   return { dataDir: DATA_DIR, groupsDir: GROUPS_DIR, nowMs: Date.now() };
 }
 
@@ -81,13 +69,8 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-// ── Secret-scope resolution (names only — values never leave the gateway) ───────
-
 /**
- * Read a group's per-group onecliSecrets from its container.json. Returns [] if
- * the file is absent/unparseable. Folder-based so it's testable against an
- * injected groupsDir (mirrors readContainerConfig's configPath, but with an
- * overridable root for the move test seam).
+ * A group's per-group onecliSecrets from container.json, or [] if absent/unparseable; takes an injectable groupsDir.
  */
 function groupSecretsFromFolder(folder: string, groupsDir: string): string[] {
   const p = path.join(groupsDir, folder, 'container.json');
@@ -101,11 +84,8 @@ function groupSecretsFromFolder(folder: string, groupsDir: string): string[] {
 }
 
 /**
- * Effective secret scope for a group = workgroup baseline ∪ per-group
- * onecliSecrets (the same union the host applies at spawn —
- * mergeWorkgroupAndGroupSecrets). NAMES/UUIDs only; values are never resolved
- * host-side (§4.2 step 3 — enumeration bounded to source∪target effective sets,
- * never a vault listing).
+ * Workgroup baseline ∪ per-group onecliSecrets, the same union the host applies at spawn. Names/UUIDs only; values
+ * are never resolved host-side and the vault is never listed.
  */
 async function effectiveSecrets(agentGroupId: string, folder: string, groupsDir: string): Promise<string[]> {
   const workgroup = await getWorkgroupOnecliSecrets(agentGroupId);
@@ -120,13 +100,9 @@ interface SecretDelta {
 }
 
 /**
- * Compute the move secret delta: gains = effective(target) − effective(source),
- * losses = effective(source) − effective(target). The deltaHash is a stable
- * sha256 that BINDS the move target identity (E-4) in addition to the sorted
- * gains+losses, so a preview confirmed for targetA can never be replayed on an
- * execute targeting a different targetB that happens to produce identical
- * gains/losses — execute recomputes from the BODY's target and 409s on mismatch
- * (TOCTOU, SEC-2 + target-rebind, E-4).
+ * gains = effective(target) − effective(source), losses the reverse. The deltaHash binds the target identity as well
+ * as the sorted delta, so a preview confirmed for one target can never be replayed against another with an identical
+ * delta.
  */
 async function computeSecretDelta(
   sourceAg: string,
@@ -140,8 +116,6 @@ async function computeSecretDelta(
   const tgt = new Set(await effectiveSecrets(targetAg, targetFolder, groupsDir));
   const gains = [...tgt].filter((s) => !src.has(s)).sort();
   const losses = [...src].filter((s) => !tgt.has(s)).sort();
-  // Canonical, key-ordered payload — the target identity is part of the hashed
-  // surface so the confirmed hash is tied to the exact (targetAg, targetMg) pair.
   const deltaHash = createHash('sha256')
     .update(
       JSON.stringify({
@@ -157,14 +131,9 @@ async function computeSecretDelta(
 
 export { computeSecretDelta };
 
-// ── Wiring validation (no write) ────────────────────────────────────────────────
-
 /**
- * Is `targetAgentGroupId` wired to `targetMessagingGroupId` via
- * messaging_group_agents? This is scheduleTask's destination-validation
- * predicate (scheduled-tasks.ts) run WITHOUT writing — fail-closed (C2):
- * an unwired pair means the move would route output to a chat the target agent
- * isn't authorized for.
+ * scheduleTask's destination-wiring predicate, run without writing. Fail-closed: an unwired pair would route output
+ * to a chat the target agent is not authorized for.
  */
 async function isWired(agentGroupId: string, messagingGroupId: string): Promise<boolean> {
   const row = await getDb().get(
@@ -175,21 +144,11 @@ async function isWired(agentGroupId: string, messagingGroupId: string): Promise<
   return !!row;
 }
 
-// ── Source live row (for scriptPresent + the execute snapshot) ──────────────────
-
-// Read through the mailbox module's named ops, so the row shape is the
-// module's. (The WRITE half of this flow still opens a raw inbound handle for
-// modules/scheduling/db.ts's task mutators — see the file header note.)
 type SourceLiveRow = ScheduledTaskRow;
 
 /**
- * Read the source series' live row. The result DISTINGUISHES three cases (ADV-S1,
- * mirroring resolveTarget in scheduled-mutations.ts):
- *   - { unreadable: true }       → the file exists but the read threw → 503
- *   - { unreadable: false, row } → a live row (or null when the series ended) →
- *                                  null maps to 409 stale_key, never a false 503.
- * A missing inbound.db is `row: null` (the caller's pre-cancel existsSync guard
- * already mapped that to 503 in execute; preview treats it as "no script").
+ * Distinguishes a read that threw (`unreadable`, 503) from no live row (`row: null`, 409 stale_key, never a false
+ * 503). A missing inbound.db is `row: null`.
  */
 interface SourceLiveReadResult {
   unreadable: boolean;
@@ -203,11 +162,8 @@ function readSourceLiveRow(
   seriesId: string,
 ): SourceLiveReadResult {
   try {
-    // Read-only seam: a move PREVIEW must never provision or migrate the
-    // session it is previewing (invariant I-4). The module applies the same
-    // canonicalize-and-contain check the pre-seam chokepoint did, so a
-    // locator that resolves outside data/v2-sessions — like a session with no
-    // mailbox — reads as "no live row", never as unreadable.
+    // Read-only seam: a preview must never provision or migrate the session. A locator resolving outside
+    // data/v2-sessions reads as "no live row", never as unreadable.
     const row = readSessionInbound({ dataDir, agentGroupId, sessionId }, (mailbox) => mailbox.getLiveTaskRow(seriesId));
     return { unreadable: false, row: row ?? null };
   } catch (err) {
@@ -219,8 +175,6 @@ function readSourceLiveRow(
   }
 }
 
-// ── Shared resolve + gate for both preview and execute ──────────────────────────
-
 interface MoveBody {
   targetAgentGroupId?: string;
   targetMessagingGroupId?: string;
@@ -228,10 +182,8 @@ interface MoveBody {
 }
 
 /**
- * The dashboard and the local `ncl` socket have different authentication
- * transports but the same move transaction. Keep that distinction at this
- * boundary: HTTP callers carry a scoped dashboard identity, whereas the
- * 0600 host socket is already the operator authentication boundary.
+ * HTTP callers carry a scoped dashboard identity; the 0600 host socket is already the operator authentication
+ * boundary.
  */
 interface MoveAuthorization {
   actor: string;
@@ -245,11 +197,8 @@ interface ResolvedMove {
 }
 
 /**
- * Decode + gate + resolve both ends. Every failure that could reveal the
- * existence of a resource/target to an unauthorized caller returns 404
- * disclose-as-not-found (never 403) — the mutation gate, the source-scope
- * check, and a missing source/target group all collapse to 404 (§4.2 "404
- * otherwise" + C7). Returns a Response on any reject, or the resolved ends.
+ * Every failure that could reveal a resource or target to an unauthorized caller returns 404 (never 403): the
+ * mutation gate, the source-scope check, and a missing source or target group.
  */
 async function resolveAndGate(
   key: string,
@@ -259,12 +208,11 @@ async function resolveAndGate(
   const decoded = decodeKey(key);
   if (!decoded) return { error: json({ error: 'not_found' }, 404) };
 
-  // Mutation-tier gate (preview reads secret names — M5/SEC-1). Non-manage →
-  // 404, never 403 (don't reveal the resource exists).
+  // Mutation tier because preview reads secret names; 404, never 403.
   if (!auth.hostOperator) {
     if (!(await canManageScheduled(auth.actor))) return { error: json({ error: 'not_found' }, 404) };
 
-    // Scope re-check from the decoded key (never trust the key as authz, §4.5).
+    // Scope re-check from the decoded key: the key is never authorization.
     const scopes = auth.scopes;
     if (!scopes || (!scopes.no_filter && !scopes.allowed_group_ids.includes(decoded.agentGroupId))) {
       return { error: json({ error: 'not_found' }, 404) };
@@ -306,8 +254,6 @@ export async function isCrossWorkgroup(sourceAgId: string, targetAgId: string): 
 function dashboardMoveAuthorization(ctx: AuthedRequestContext): MoveAuthorization {
   return { actor: ctx.user.id, hostOperator: false, scopes: ctx.scopes };
 }
-
-// ── D1: preview handler ─────────────────────────────────────────────────────────
 
 export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
   const { groupsDir, dataDir } = moveOpts();
@@ -353,19 +299,13 @@ export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
   });
 };
 
-// ── D2: execute handler ─────────────────────────────────────────────────────────
-
-/** Map the source live-row status to the §4.0 health state the move guard needs. */
 function moveGuardState(status: string, processAfterMs: number | null, nowMs: number): HealthState {
   if (status === 'paused') return 'paused';
-  // A pending row maps to healthy/late by overdue-ness; verbVerdict's move cell
-  // keys on processAfterMs + claimed, so 'healthy' vs 'late' both route to the
-  // same future-dated admission test. Use 'late' when overdue so the guard's
-  // isDue/isNearDue checks reflect reality.
+  // 'healthy' and 'late' route to the same admission test; 'late' when overdue so the guard's isDue/isNearDue checks
+  // reflect reality.
   return processAfterMs !== null && processAfterMs <= nowMs ? 'late' : 'healthy';
 }
 
-/** Build the TaskDef that re-schedules the snapshot into the target session. */
 function taskDefFromSnapshot(
   snapshot: SourceLiveRow,
   seriesId: string,
@@ -384,25 +324,19 @@ function taskDefFromSnapshot(
     agentGroupId: targetAgentGroupId,
     cron: snapshot.recurrence ?? '',
     processAfter: snapshot.process_after ?? new Date().toISOString(),
-    // The moved row is the SAME occurrence, so it keeps the slot it was armed
-    // for. Without this the destination's scheduled_for would be stamped from
-    // process_after — which is the staged grace time on the paused path, and
-    // the retry deadline for a source row sitting in backoff.
+    // The moved row is the SAME occurrence and keeps its slot; otherwise scheduled_for would be stamped from
+    // process_after (a staged grace time or a retry deadline).
     ...(snapshot.scheduled_for ? { scheduledFor: snapshot.scheduled_for } : {}),
     seriesId,
     prompt: typeof content.prompt === 'string' ? content.prompt : snapshot.content,
-    // Preserve every existing task control, not merely the fields this move
-    // flow knew when it was first written. `scheduleTask` otherwise rebuilds
-    // content from a short allow-list and silently drops controls such as
-    // scriptHost, threadAnchor, originSessionId, muteChat and chatLimit.
+    // Preserves every task control: `scheduleTask` otherwise rebuilds content from a short allow-list and drops
+    // controls such as scriptHost, threadAnchor, originSessionId, muteChat and chatLimit.
     rawContent: snapshot.content,
-    // A move is not a generic re-schedule. Never upsert a target task that
-    // happens to carry the same series id; the scheduler re-checks this at
-    // its mailbox write boundary to close the competing-writer race.
+    // Never upsert a target task that carries the same series id; the scheduler re-checks this at its mailbox write
+    // boundary to close the competing-writer race.
     rejectExistingLiveSeries: true,
-    // A paused source moves as paused at the target write itself. The old
-    // pending grace insert followed by a second pause left a crash window in
-    // which recovery could bless a runnable target.
+    // A paused source is written paused at the target write itself; a pending insert followed by a pause leaves a
+    // crash window where recovery blesses a runnable target.
     ...(snapshot.status === 'paused' ? { status: 'paused' as const } : {}),
     ...(typeof content.script === 'string' ? { script: content.script } : {}),
     ...(content.quietStatus ? { quietStatus: true } : {}),
@@ -416,10 +350,9 @@ function taskDefFromSnapshot(
 }
 
 /**
- * Count live rows for the series across exactly {source session, target session}
- * (H1 helper). `unreadable` callers MUST honor: never restore / never claim
- * success on an unknown post-state. Replaces the old bare-series_id fleet scan
- * (M1: an unrelated group reusing the series_id no longer causes a false count).
+ * Live rows for the series across exactly {source session, target session}, never a bare series_id fleet scan (an
+ * unrelated group reusing the series id would falsify the count). Callers MUST treat `unreadable` as unknown: never
+ * restore and never claim success on it.
  */
 function scopedLiveCount(
   dataDir: string,
@@ -434,12 +367,10 @@ function scopedLiveCount(
   return countLiveRowsInSessions(dataDir, locators, seriesId);
 }
 
-/** Resolve the target per-series system session id (after scheduleTask created it). */
 async function targetSessionIdFor(targetAgentGroupId: string, seriesId: string): Promise<string | null> {
   return (await findSystemSession(targetAgentGroupId, taskThreadId(seriesId)))?.id ?? null;
 }
 
-/** Execute the one move transaction after transport-specific authentication. */
 async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization): Promise<Response> {
   const { dataDir, groupsDir, nowMs } = moveOpts();
   const resolved = await resolveAndGate(key, body, auth);
@@ -449,15 +380,12 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
   const targetMg = await getMessagingGroup(target.messagingGroupId);
   if (!targetMg) return json({ error: 'not_found' }, 404);
 
-  // Step 0a: M4 — containment-checked source open (null → 404; decodeKey already
-  // rejects traversal, this is defense in depth — never an open outside the tree).
+  // Containment-checked open (defense in depth; decodeKey already rejects traversal).
   const sourceInbound = sessionInboundPathFor(dataDir, source.agentGroupId, source.sessionId);
   if (!sourceInbound) return json({ error: 'not_found' }, 404);
-  // Step 0b: source session unreadable → fail closed (§3a).
   if (!fs.existsSync(sourceInbound)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
 
-  // Step 1: delta TOCTOU re-check (SEC-2 + target-rebind E-4). The hash binds the
-  // target identity, so a hash confirmed for a different target won't match.
+  // Delta re-check: the hash binds the target identity, so a hash confirmed for another target will not match.
   const delta = computeSecretDelta(
     source.agentGroupId,
     source.folder,
@@ -470,18 +398,14 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
     return json({ error: 'delta_changed', reason: 'delta_changed' }, 409);
   }
 
-  // Step 2: snapshot the source live row. ADV-S1: a read THROW (corrupt-but-
-  // existent inbound.db) is 503 session_unreadable — distinguished from an empty
-  // result (the series ended/moved → 409 stale_key), never collapsed into 409.
+  // A read THROW (corrupt-but-existent inbound.db) is 503, never collapsed into the 409 for an ended series.
   const sourceRead = readSourceLiveRow(dataDir, source.agentGroupId, source.sessionId, source.seriesId);
   if (sourceRead.unreadable) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
   const snapshot = sourceRead.row;
-  // Stale key — no live source row to move (§3b: touched 0 → 409 stale_key).
   if (!snapshot) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  // Pins are persisted as source content. The destination can use a different
-  // provider, so validate the literal stored pin before cancelling anything;
-  // preserving an unusable pin would create a series that fails unattended.
+  // The destination can use a different provider, so the stored pin is validated before cancelling anything; an
+  // unusable pin would create a series that fails unattended.
   const pin = parseTaskPin(snapshot.content);
   const pinCheck = await resolveTaskFlagIntent(
     { model: pin.model ?? undefined, effort: pin.effort ?? undefined },
@@ -489,9 +413,8 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
   );
   if (pinCheck.error) return json({ error: 'target_pin_invalid', reason: 'target_pin_invalid' }, 409);
 
-  // Fast failure before source cancellation. The scheduler repeats this exact
-  // live-row exclusion inside the target mailbox transaction, because another
-  // writer can still create a series during the scheduling funnel below.
+  // Fast failure before source cancellation; the scheduler repeats this exclusion inside the target mailbox
+  // transaction because another writer can still create the series.
   const existingTargetSession = await targetSessionIdFor(target.agentGroupId, source.seriesId);
   if (
     existingTargetSession &&
@@ -503,14 +426,12 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
       );
       if (targetLive) return json({ error: 'target_conflict', reason: 'target_conflict' }, 409);
     } catch {
-      // A corrupt target is not an empty target. Refuse before cancelling the
-      // source rather than discovering the unreadable post-state only after
-      // a compensation path has begun.
+      // A corrupt target is not an empty target: refuse before cancelling the source.
       return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
     }
   }
 
-  // Step 2a: §4.0 in-flight admission guard (verbVerdict is the ONLY guard source).
+  // verbVerdict is the only guard source.
   const processAfterMs = parseUtcTimestampMs(snapshot.process_after);
   const guardState = moveGuardState(snapshot.status, processAfterMs, nowMs);
   const verdict = verbVerdict('move', {
@@ -530,13 +451,11 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
   const wasPaused = snapshot.status === 'paused';
   const correlationId = randomUUID();
   const sourceCancellationReceiptId = `scheduled-move-cancel:${correlationId}`;
-  // This ID is durable move ownership, not a series identity. It tells both
-  // compensation and crash recovery whether a target row came from THIS move
-  // or was unrelated work sharing the same series id.
+  // Durable move ownership, not a series identity: lets compensation and crash recovery tell a target row from THIS
+  // move apart from unrelated work sharing the series id.
   const targetRowId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  // Step 2b: durable move_intent BEFORE cancel (F2). Full snapshot in
-  // detail_json; correlation_id links the recovery.
+  // Durable move_intent BEFORE the cancel; correlation_id links the recovery.
   await writeAudit({
     actor: auth.actor,
     action: 'move_intent',
@@ -558,9 +477,7 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
         thread_id: snapshot.thread_id,
         kind: snapshot.kind,
       },
-      // M1: the FULL target locator so recovery can scope its live-count to
-      // exactly {source session, target session} — not a bare series_id fleet
-      // scan that an unrelated group's same-series_id row could falsely satisfy.
+      // The full target locator, so recovery counts live rows across exactly {source, target}.
       target: target.agentGroupId,
       targetAgentGroupId: target.agentGroupId,
       targetMessagingGroupId: target.messagingGroupId,
@@ -570,16 +487,13 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
   });
 
   const restoreSnapshot: TaskRowSnapshot = {
-    // FRESH id — the cancelled source row still holds snapshot.id (cancel sets
-    // status=completed, never deletes), so re-using it would PK-collide. Series
-    // identity is carried by series_id, not the row id (restoreTaskRow preserves
-    // series_id, A4).
+    // FRESH id: the cancelled source row still holds snapshot.id (cancel never deletes), so reusing it would
+    // PK-collide. Series identity is carried by series_id.
     id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     series_id: source.seriesId,
     status: wasPaused ? 'paused' : 'pending',
     process_after: snapshot.process_after,
-    // The occurrence's slot survives the move-and-compensate round trip; a
-    // restore is the SAME occurrence, not a new one.
+    // A restore is the SAME occurrence and keeps its slot.
     scheduled_for: snapshot.scheduled_for,
     recurrence: snapshot.recurrence,
     content: snapshot.content,
@@ -589,38 +503,14 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
     kind: snapshot.kind,
   };
 
-  // Step 3: cancel the source live row (→ cancelled, recurrence cleared).
-  // Capture the touched count (E-2): the §2a guard already proved the source is
-  // live, so a 0-touch cancel is unexpected — but if it happens, abort BEFORE
-  // inserting the target so a no-op cancel can never leave a target-only series.
-  //
-  // Existing-only (invariant I-10): the §2a guard just proved the source row
-  // is live, so the mailbox is there. `undefined` means it vanished under the
-  // guard, which reads as 0 touched and takes the abort branch below rather
-  // than inserting into the target — the same fail-safe direction the pre-seam
-  // open's throw had.
-  //
-  // BY ROW ID, and only if that row is still exactly what was approved.
-  // Everything above — the delta hash, the verdict, the move_intent body,
-  // `restoreSnapshot` — describes the single occurrence `snapshot.id`. The
-  // pre-seam code could cancel the SERIES here because the read and the cancel
-  // were one synchronous run with no yield between them, so nothing could
-  // change. Acquiring the mailbox now yields, and in that window the
-  // occurrence can complete and arm a successor, or be admitted and fired
-  // where it stands. Every refusal below returns 0 touched and takes the abort
-  // branch, which is what "the key went stale" already means here.
+  // Cancel BY ROW ID, and only if that row is still exactly what was approved. Acquiring the mailbox yields, and in
+  // that window the occurrence can complete and arm a successor or be admitted and fired. A 0-touch result (including
+  // a vanished mailbox) aborts BEFORE inserting the target, so a no-op cancel can never leave a target-only series.
   const cancelTouched =
     (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
-      // Re-prove the approved occurrence, inside the session, with nothing
-      // awaited between the read and the write.
-      //
-      // The id alone is not enough, and that is the whole finding: admission
-      // MUTATES a task row in place. A dashboard run-now landing in this
-      // acquisition window flips `trigger` 0 → 1 and moves `process_after`
-      // while the id and the `pending` status stay exactly as §2's read saw
-      // them — so an id-scoped cancel would cancel an occurrence that is now
-      // triggered (and possibly claimed by a container mid-fire), and the
-      // move would then recreate the stale snapshot in the target.
+      // Re-prove the approved occurrence inside the session, with nothing awaited between read and write. The id
+      // alone is not enough: admission mutates a row in place (a run-now flips `trigger` and moves `process_after`
+      // while id and status stay the same).
       const current = mailbox.getLiveTaskRow(source.seriesId);
       if (!current || current.id !== snapshot.id) return 0;
       const changed = approvedRowChanged(snapshot, current);
@@ -632,9 +522,7 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
         });
         return 0;
       }
-      // Inert, absolutely and not merely unchanged. §2a's verdict passed
-      // `claimed: false` without proving it; a move must not consume an
-      // occurrence that is armed to fire or already being fired.
+      // Inert, not merely unchanged: a move must not consume an occurrence armed to fire or being fired.
       if (current.trigger !== 0) {
         log.warn('scheduled-move: the approved occurrence is admitted — refusing', {
           seriesId: source.seriesId,
@@ -652,11 +540,9 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
       return mailbox.cancelTaskRowWithMoveReceipt(snapshot.id, sourceCancellationReceiptId);
     })) ?? 0;
   if (cancelTouched === 0) {
-    // Nothing was cancelled: this request did not change the source, so its
-    // intent has no compensation duty. Resolving it here is essential when a
-    // concurrent move won the source row first: recovery must not mistake the
-    // winner's target occurrence for an unrelated collision and resurrect the
-    // source recurrence. Do NOT insert into the target.
+    // Nothing was cancelled, so the intent has no compensation duty. Resolving it is essential when a concurrent move
+    // won the source row: recovery must not mistake the winner's target for a collision and resurrect the source. Do
+    // NOT insert into the target.
     log.warn('scheduled-move: cancel touched 0 rows — aborting before target insert', {
       seriesId: source.seriesId,
       rowId: snapshot.id,
@@ -666,18 +552,15 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
     return json({ error: 'stale_key', reason: 'stale_key' }, 409);
   }
 
-  // Step 4: re-schedule into the target. A paused snapshot is inserted as
-  // paused atomically, so it never has a runnable intermediate state.
+  // A paused snapshot is inserted as paused atomically, never runnable in between.
   try {
     await scheduledTasks.scheduleTask(
       taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg, targetRowId),
     );
   } catch (err) {
-    // Step 5: target insert failed → restore the source. Most failures require
-    // a readable zero across {source,target}: a target may have landed before
-    // throwing. A TaskSeriesCollisionError is different: the scheduler's own
-    // mailbox transaction proves this move wrote no target row, so unrelated
-    // same-series target work must not prevent restoring the cancelled source.
+    // Target insert failed → restore the source. Most failures need a readable zero across {source, target} first,
+    // because a target may have landed before throwing; a TaskSeriesCollisionError proves this move wrote no target
+    // row.
     log.warn('scheduled-move: target insert failed — restoring source', {
       seriesId: source.seriesId,
       err: err instanceof Error ? err.message : String(err),
@@ -710,31 +593,10 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
         restored =
           (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) =>
             withCentralSync(() => {
-              // The source was cancelled, then the target insert was AWAITED — a
-              // sweep tick can land in that await, see a source with no live task
-              // and mark it quiet. Restoring the pending row here puts due work
-              // back behind that mark, and the persisted mark would carry it across a
-              // restart. The central-DB invalidation is what clears it.
-              //
-              // Invalidate BEFORE the restore, in the same synchronous turn
-              // (Codex pre-pass Part C, round 3 H1): inbound.db and the central DB
-              // are two separate files with no shared transaction, so a crash
-              // between them is survivable only if the mark dies first. Its worst
-              // case is one wasted sweep of a session whose restore then fails;
-              // the reverse leaves a restored due row hidden behind a persisted
-              // quiet mark for up to `QUIET_SESSION_BACKOFF_MS` after a warmed
-              // restart. This also keeps the invalidation before `purgeIntentBody`
-              // below: a crash between the two still leaves the intent for
-              // `recoverMoveIntents` to finish.
-              //
-              // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
-              // inside `withQuietInvalidationSync` throws — on a central-DB error
-              // AND on a session row that is gone or no longer active — and the
-              // throw escapes into the `restoreErr` catch below. `restored` stays
-              // false, the `move_restore_failed` audit row is written and
-              // `purgeIntentBody` is SKIPPED, so `recoverMoveIntents` still owns
-              // the repair. A swallowed failure would restore the row behind a
-              // mark nothing clears and then purge the only record of it.
+              // A sweep tick during the awaited target insert can mark the source session quiet, hiding the restored
+              // row. Invalidate BEFORE the restore, in the same synchronous turn: inbound.db and the central DB share
+              // no transaction, so the mark must die first. FAIL-CLOSED: an invalidation error escapes to the catch
+              // below, `purgeIntentBody` is skipped, and `recoverMoveIntents` still owns the repair.
               withQuietInvalidationSync(source.sessionId, () => mailbox.restoreTaskRow(restoreSnapshot));
               return true;
             }, 'scheduled-move source restore'),
@@ -765,11 +627,8 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
     return json({ error: 'move_failed', reason: 'move_failed' }, 500);
   }
 
-  // Step 6: invariant — exactly one live row across {source, target} for the
-  // series. E-2: a violation is NOT logged-and-200'd — we return an error and
-  // LEAVE the move_intent unresolved so the recovery sweep repairs it. An
-  // UNREADABLE post-state is equally not-success (never claim a move succeeded
-  // on a state we couldn't observe).
+  // Exactly one live row across {source, target}. A violation or an unreadable post-state returns an error and LEAVES
+  // the move_intent unresolved for the recovery sweep; never claim success on a state that could not be observed.
   const tgtSessId = await targetSessionIdFor(target.agentGroupId, source.seriesId);
   let targetOwned: boolean;
   try {
@@ -817,9 +676,8 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
     return json({ error: 'move_failed', reason: 'invariant_violated' }, 500);
   }
 
-  // Step 7: resolve the intent (stamp + purge body, F5) + two-sided move audit
-  // (one row per side, shared correlation_id) + invalidate cache. Same-agent
-  // reroutes intentionally write both directions against the same group.
+  // Resolve the intent, write one audit row per side (same-agent reroutes write both against one group), invalidate
+  // the cache.
   await purgeIntentBody(correlationId);
   const secretDetail = { secretGainsCount: (await delta).gains.length, secretLossesCount: (await delta).losses.length };
   await writeAudit({
@@ -853,15 +711,12 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     return json({ error: 'invalid_request' }, 400);
   }
 
-  // Rate limit only bounds interactive dashboard keypresses. The local host
-  // socket is a separate, explicit operator command and already serializes
-  // through its own request/guard boundary.
+  // Rate limit bounds only interactive dashboard presses; the host socket serializes through its own boundary.
   const rl = rateLimit(ctx.user.id, 'move');
   if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.retryAfter }, 429);
   return executeMove(params['key'] ?? '', body, dashboardMoveAuthorization(ctx));
 };
 
-/** Exact source/target locator accepted only from the host CLI socket. */
 export interface HostTaskMoveRequest {
   sourceAgentGroupId: string;
   sourceSessionId: string;
@@ -871,12 +726,9 @@ export interface HostTaskMoveRequest {
 }
 
 /**
- * Host-operator entry point for the same move transaction the dashboard uses.
- *
- * This does not mint or fabricate a dashboard session. The local ncl socket is
- * independently authenticated by its 0600 filesystem boundary; it is the
- * existing operator surface for task mutation. The delta is still bound and
- * rechecked by `executeMove`, but names are never returned to the CLI.
+ * Host-operator entry point for the same move transaction. The local ncl socket is authenticated by its 0600
+ * filesystem boundary, so no dashboard session is minted. The delta is still bound and rechecked, but names are never
+ * returned to the CLI.
  */
 export async function moveTaskAsHost(request: HostTaskMoveRequest): Promise<{
   moved: true;

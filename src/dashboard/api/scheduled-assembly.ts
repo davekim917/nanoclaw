@@ -1,20 +1,11 @@
 /**
- * Scheduled Tasks Board read assembly + health derivation (Tasks B1 + B2).
- *
- * Assembles the fleet snapshot ON DEMAND from the session DBs — no materialized
- * table (D10 rejected; both prior scheduling incidents were derived-state-
- * diverged-from-truth). One session per event-loop tick via setImmediate
- * (§4.9 — never one contiguous synchronous block in the shared host process).
- * Single-flight + a 5s TTL cache guarded by a generation counter so a mutation
- * that lands mid-assembly forces a re-run (read-your-own-write, §3a).
- *
- * All board DB opens are { readonly: true } + busy_timeout 1000 (the
- * hasPendingRecurrence precedent in sessions.ts) — never the write
- * path's 5000ms. A per-session read failure never fails the fleet snapshot:
- * the session contributes an `unreadable` count and the rest still return
- * (§3a degraded contract, S12).
- *
- * See docs/specs/scheduled-tasks-board/design.md §3a, §4.1, §4.8, §4.9.
+ * Scheduled Tasks Board read assembly and health derivation.
+ * Assembled on demand from the session DBs, never a materialized table (derived state that diverged from truth caused
+ * past incidents). One session per event-loop tick, never one long synchronous block in the shared host process.
+ * Single-flight plus a 5s TTL cache guarded by a generation counter, so a mutation landing mid-assembly forces a
+ * re-run.
+ * Board DB opens are read-only with busy_timeout 1000, never the write path's 5000. A per-session read failure never
+ * fails the snapshot: the session adds to `unreadable` and the rest still return.
  */
 import { CronExpressionParser } from 'cron-parser';
 
@@ -39,15 +30,12 @@ import {
 
 export type { HealthState, SeriesKind, Verb };
 
-// ── Public contract (FROZEN — must match the dashboard client types) ───────────
+// Public contract: must match the dashboard client types.
 
-/** Per-fire history outcome labels (design §4.1; the D16 F-amendment merge). */
 export type FireOutcomeLabel = 'ran' | 'completed (no chat output)' | 'failed' | 'missed' | 'cancelled';
 
 export interface FireOutcome {
-  /** Live row id / fire id for this entry. */
   id?: string;
-  /** ISO timestamp of the fire (process_after for the entry). */
   ts?: string | null;
   outcome: FireOutcomeLabel;
 }
@@ -69,8 +57,7 @@ export interface ScheduledRow {
   module_owner: string | null;
   quiet_status: boolean;
   flag_intent: Record<string, unknown> | null;
-  /** Host-side pre-task script execution flag (content.scriptHost) — surfaced for the
-   *  workgroup dashboard's "host-gated" badge (fleet-hardening Phase 3). */
+  /** Host-side pre-task script flag (content.scriptHost), for the "host-gated" badge. */
   script_host: boolean;
   last_fires: FireOutcome[];
   available_verbs: Verb[];
@@ -81,17 +68,13 @@ export interface ScheduledSnapshot {
   degraded: boolean;
   counts: Record<string, number>;
   /**
-   * Per-agent_group unreadable session count (E-3). The fleet-wide
-   * `counts.unreadable` is a fleet assembly-health signal; a SCOPED caller must
-   * see only its own groups' unreadable count, so the read handler sums this map
-   * over the caller's in-scope groups rather than reusing the fleet total.
+   * Per-agent_group unreadable counts: a SCOPED caller must see only its own groups' count, never the fleet-wide
+   * `counts.unreadable`.
    */
   unreadable_by_group: Record<string, number>;
   /**
-   * Server-side ONLY search blob per row key (lowercased name/group/channel/cron
-   * PLUS parsed prompt + script). Powers the `?q=` search endpoint's prompt/script
-   * matching. NEVER serialized to the wire — the list/search handlers pick fields
-   * explicitly and never emit this map, so prompt/script stay detail-tier.
+   * Server-side ONLY search blob per row key, including prompt and script. NEVER serialized to the wire:
+   * prompt/script stay detail-tier.
    */
   search_index: Record<string, string>;
   assembled_at: string;
@@ -100,22 +83,13 @@ export interface ScheduledSnapshot {
 export type AuthScopes = { role: string; allowed_group_ids: string[]; no_filter: boolean };
 
 export interface ScheduledAssemblyOptions {
-  /** Override the session data dir (tests). Defaults to DATA_DIR. */
   dataDir?: string;
-  /** Override "now" (tests / determinism). Defaults to Date.now(). */
   nowMs?: number;
 }
 
-// Module-owned series detection now lives in scheduled-shared.ts (the single
-// registry shared with the mutation handlers) — imported as `moduleOwner`.
-
-// ── Time helpers ────────────────────────────────────────────────────────────────
-
 /**
- * Parse a SQLite timestamp/ISO string to epoch ms. SQLite TIMESTAMP columns
- * store UTC without a zone marker; Date.parse treats those as local time, so
- * append Z when no zone marker is present (parseSqliteUtc precedent in
- * host-sweep.ts).
+ * SQLite TIMESTAMP values carry no zone and `Date.parse` treats them as local time, so `Z` is appended when no zone
+ * marker is present.
  */
 function parseUtcMs(s: string | null): number | null {
   if (!s) return null;
@@ -124,7 +98,6 @@ function parseUtcMs(s: string | null): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
-/** Render an epoch-ms instant in the service timezone (with a TZ label), or null. */
 function localString(ms: number | null): string | null {
   if (ms === null) return null;
   try {
@@ -138,8 +111,6 @@ function localString(ms: number | null): string | null {
   }
 }
 
-// ── Health derivation (B2) ──────────────────────────────────────────────────────
-
 export interface HealthCtx {
   status: string;
   recurrence: string | null;
@@ -150,12 +121,8 @@ export interface HealthCtx {
   nowMs: number;
   isOneOff: boolean;
   /**
-   * The owning group's effective timezone, from `resolveGroupTimezone`. The
-   * cadence interval is derived from the cron grid, and around a DST
-   * transition that interval is 23 or 25 hours — so a group whose override
-   * transitions on a different date than the install would be measured
-   * against the wrong cadence and flip between `late` and `stalled` at the
-   * wrong moment. Absent = the install timezone.
+   * The owning group's timezone: a DST transition makes a daily cadence 23 or 25 hours, so the install zone would
+   * flip `late`/`stalled` at the wrong moment.
    */
   timezone?: string;
 }
@@ -165,25 +132,11 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'expired']);
 const TWENTY_FOUR_H_MS = 24 * 60 * 60 * 1000;
 
 /**
- * The cron interval (ms) for the occurrence this row is ARMED on — parsed
- * identically to the firing path (recurrence.ts). Returns null on parse
- * failure or for one-offs (no cron).
- *
- * `anchorMs` is the armed occurrence (`process_after`), not the wall clock.
- * A cron interval is not a constant: across a DST transition a daily grid
- * measures 23 or 25 hours. Reading it from "now" means the same overdue row
- * changes cadence the instant its own due time slips into the past — a daily
- * task armed on the occurrence before a spring-forward is measured on the 23h
- * gap that occurrence opens while it is still upcoming, and on the following
- * 24h gap a second later, so its stall grace moves and the row can flip
- * between `late` and `stalled` with nothing about it having changed. Anchoring
- * at the armed occurrence makes the grace a property of the row.
- *
- * Anchoring one millisecond BEFORE the armed instant so the first occurrence
- * the parser yields is the armed one itself (cron-parser's `next()` is
- * exclusive of `currentDate`); the interval is then the gap that occurrence
- * opens. A `process_after` that has drifted off the grid still yields the two
- * surrounding occurrences, so the answer stays deterministic.
+ * The cron interval (ms) for the occurrence the row is ARMED on, parsed as recurrence.ts does; null on parse failure
+ * or for one-offs.
+ * Anchored at the armed occurrence, not now: across DST the interval changes, and measuring from now would move the
+ * stall grace the instant the due time passes. The anchor is one millisecond before the armed instant because
+ * `next()` excludes `currentDate`.
  */
 function cronIntervalMs(cron: string | null, tz: string = TIMEZONE, anchorMs?: number | null): number | null {
   if (!cron) return null;
@@ -200,43 +153,31 @@ function cronIntervalMs(cron: string | null, tz: string = TIMEZONE, anchorMs?: n
   }
 }
 
-/**
- * Derive a series' health from its live row + observability facts — NEVER from
- * `status` alone (D6: the May/June die-off left no failed row). Exactly per
- * design §4.1.
- */
+/** Health from the live row plus observability facts, NEVER from `status` alone: a die-off can leave no failed row. */
 export function deriveHealth(ctx: HealthCtx): HealthState {
   if (ctx.status === 'paused') return 'paused';
 
-  // Residual-strand: the latest row of the series is TERMINAL yet still carries
-  // a recurrence (no live successor was minted — the swallowed-cron-parse-error
-  // signature in recurrence.ts). A stateless persistence clock excludes the
-  // legitimate transient between completion-sync and successor-insert: flag
-  // strand only once aged past 2×SWEEP_INTERVAL via now − max(timestamp,
-  // process_after) (§4.1).
+  // Residual strand: the latest row is terminal yet still has a recurrence (no successor was minted). Flagged only
+  // after 2×SWEEP_INTERVAL, to exclude the legitimate gap between completion sync and successor insert.
   if (TERMINAL_STATUSES.has(ctx.status) && ctx.recurrence !== null) {
     const anchor = Math.max(ctx.timestampMs ?? 0, ctx.processAfterMs ?? 0);
     if (anchor > 0 && ctx.nowMs - anchor > 2 * SWEEP_INTERVAL_MS) return 'strand';
-    // Within the transient grace — not yet a strand; treat as healthy (a
-    // successor is expected imminently).
+    // Within the transient grace: a successor is expected.
     return 'healthy';
   }
 
   const overdueBy = ctx.processAfterMs !== null ? ctx.nowMs - ctx.processAfterMs : 0;
   const overdue = overdueBy > 0;
 
-  // Positive claim wins over lateness — the row is actively running.
+  // A positive claim wins over lateness.
   if (ctx.ackPresent) return 'processing';
 
-  // Observability failure is NOT collapsed into "not claimed": an overdue row
-  // whose outbound.db is unreadable is `unknown`, never silently healthy (F6).
+  // An overdue row whose outbound.db is unreadable is `unknown`, never silently healthy.
   if (!ctx.outboundReadable && overdue) return 'unknown';
 
   if (!overdue) return 'healthy';
 
-  // Overdue: late (immediately visible) until it crosses the stall grace.
-  // Grace scales with cadence but is capped at an absolute 24h so a weekly/
-  // monthly series can't be silently dead for days (S11).
+  // Grace scales with cadence but is capped at 24h so a weekly or monthly series cannot be silently dead for days.
   const interval = ctx.isOneOff
     ? 2 * SWEEP_INTERVAL_MS
     : cronIntervalMs(ctx.recurrence, ctx.timezone, ctx.processAfterMs);
@@ -246,13 +187,7 @@ export function deriveHealth(ctx: HealthCtx): HealthState {
   return overdueBy > stallGrace ? 'stalled' : 'late';
 }
 
-// ── Per-session read ──────────────────────────────────────────────────────────
-
-/**
- * The board reads its rows through the mailbox module's named ops, so the row
- * shape is the module's. Aliased rather than re-declared: one definition, and
- * a column added there reaches the board without a second edit here.
- */
+/** Aliased, not re-declared, so a mailbox column reaches the board without a second edit. */
 type RawRow = ScheduledTaskRow;
 
 interface SessionDescriptor {
@@ -264,31 +199,24 @@ interface SessionDescriptor {
 
 interface SessionReadResult {
   rows: ScheduledRow[];
-  /** Per-row-key server-side search blob (incl. prompt/script). Wire-excluded. */
+  /** Includes prompt/script. Wire-excluded. */
   searchByKey: Record<string, string>;
   unreadable: number;
 }
 
-/**
- * The board's session locator. `dataDir` rides along because the read layer
- * threads an injected fixture root through its whole path (its `ReadOptions`
- * test seam) and `DATA_DIR` is a module constant with no env override.
- */
+/** `dataDir` rides along because tests inject a fixture root and `DATA_DIR` has no env override. */
 function locate(dataDir: string, agentGroupId: string, sessionId: string): SessionReadLocation {
   return { dataDir, agentGroupId, sessionId };
 }
 
-/** Channel display name for a (channel_type, platform_id) destination, or null. */
 function channelNameOf(
   mgByDest: Map<string, string>,
   channelType: string | null,
   platformId: string | null,
 ): string | null {
   if (!channelType || !platformId) return null;
-  // S7: NUL (\0) separator — channel_type + platform_id are operator-controlled
-  // and could collide under a printable separator ("a"+"b c" vs "a b"+"c"), but
-  // \0 can appear in neither. The build sites (doAssemble + buildDetailRow) must
-  // use the byte-identical key or the join silently returns null.
+  // NUL separator: channel_type and platform_id are operator-controlled and could collide under a printable
+  // separator. Every site building this map must use the identical key or the join silently returns null.
   return mgByDest.get(`${channelType}\0${platformId}`) ?? null;
 }
 
@@ -298,19 +226,13 @@ interface OutboundView {
 }
 
 /**
- * Read which fire-row ids are currently claimed (processing_ack='processing'),
- * opening outbound.db read-only. Returns `readable=false` if the file is
- * absent/corrupt (→ `unknown` health for overdue rows, never silently
- * not-claimed — F6/S9). Never throws. Fire-history replies are NOT read here —
- * the list path never needs them; the detail handler (B4) reads them on demand
- * for the single series it renders.
+ * Which fire-row ids are claimed (processing_ack='processing'). `readable=false` when outbound.db is absent or
+ * corrupt, so an overdue row reads `unknown`, never silently unclaimed. Never throws.
  */
 function readOutbound(location: SessionReadLocation): OutboundView {
   try {
     const claimed = readSessionOutbound(location, (mailbox) => new Set(mailbox.listProcessingClaimedMessageIds()));
-    // `undefined` is "this session has no outbound.db" — absent, not
-    // unobservable — which is the same not-readable answer the existsSync
-    // guard gave before the seam.
+    // `undefined` means no outbound.db: absent, reported as not readable.
     if (!claimed) return { readable: false, claimed: new Set() };
     return { readable: true, claimed };
   } catch (err) {
@@ -343,19 +265,14 @@ function parseContent(content: string): {
       parsed.flagIntent && typeof parsed.flagIntent === 'object'
         ? (parsed.flagIntent as Record<string, unknown>)
         : null,
-    // Mirrors src/cli/resources/tasks.ts's parseContent — content.scriptHost is
-    // the only place this flag lives (not a DB column).
+    // content.scriptHost is the only place this flag lives, as in src/cli/resources/tasks.ts's parseContent.
     scriptHost: parsed.scriptHost === true,
   };
 }
 
 /**
- * Server-side search blob for a row: lowercased name/group/channel/cron PLUS the
- * parsed prompt + script. Used only by the `?q=` search endpoint — NEVER
- * serialized to the wire (prompt/script stay detail-tier). Re-parses content
- * (cheap: one JSON.parse/row) to keep rawToRow's return type unchanged; the
- * malformed-JSON fallback in parseContent means the raw content is still
- * searchable even when it isn't valid prompt/script JSON.
+ * Server-side search blob including the parsed prompt and script; NEVER serialized to the wire. Malformed content
+ * stays searchable as raw text.
  */
 function searchTextFor(raw: RawRow, row: ScheduledRow): string {
   const { prompt, script } = parseContent(raw.content);
@@ -397,8 +314,7 @@ function rawToRow(
     isOneOff,
     timezone,
   });
-  // Duplicate-successor rows are always flagged (the MAX(seq) read would hide
-  // the second fireable row — §4.1). Surface them as stalled.
+  // Duplicate successor rows are always flagged: the MAX(seq) read would hide the second fireable row.
   if (forceUnhealthy && health !== 'paused' && health !== 'processing') health = 'stalled';
 
   const kind = kindOf(raw);
@@ -440,15 +356,11 @@ async function readSession(
   nowMs: number,
 ): Promise<SessionReadResult> {
   const location = locate(dataDir, desc.agentGroupId, desc.sessionId);
-  // The one central read a row needs, resolved once per session and before the
-  // read-only funnel opens, so the session read itself stays synchronous.
+  // Resolved before the read-only funnel so the session read stays synchronous.
   const timezone = await resolveGroupTimezone(desc.agentGroupId);
   try {
-    // Read-only seam, deliberately not `withExistingMailboxSession`: this runs
-    // across EVERY session in the fleet on a console poll, and a board read
-    // must never provision, schema-ensure or migrate a session it is only
-    // listing (docs/specs/upstream-mailbox-seam/plan.md I-4, and the read-only
-    // rationale in src/modules/mailbox/read-only.ts).
+    // Read-only seam, deliberately not `withExistingMailboxSession`: this runs across every session on each poll and
+    // must never provision, schema-ensure or migrate a session it only lists.
     const read = readSessionInbound(location, (mailbox) => {
       const dupSeries = new Set(mailbox.listDuplicateLiveTaskSeriesIds());
       return {
@@ -457,8 +369,7 @@ async function readSession(
         oneOffs: mailbox.listLiveOneOffTaskRows(),
       };
     });
-    // No mailbox on disk — nothing to contribute, and NOT an unreadable
-    // session: absence is a complete answer, a failed read is not.
+    // No mailbox on disk is a complete answer, not an unreadable session.
     if (!read) return { rows: [], searchByKey: {}, unreadable: 0 };
     const { dupSeries, latest, oneOffs } = read;
 
@@ -472,13 +383,12 @@ async function readSession(
       searchByKey[row.key] = searchTextFor(raw, row);
     };
 
-    // One row per series locator. Multiple recurring successors still mark the
-    // series unhealthy, but cannot become duplicate React keys or controls.
+    // One row per series; extra recurring successors mark the series unhealthy but cannot produce duplicate keys or
+    // controls.
     for (const raw of latest) {
       const seriesId = raw.series_id ?? raw.id;
       emit(raw, dupSeries.has(seriesId));
     }
-    // One-off live rows (recurrence NULL), skipping dup series.
     for (const raw of oneOffs) {
       const seriesId = raw.series_id ?? raw.id;
       if (dupSeries.has(seriesId)) continue;
@@ -495,19 +405,10 @@ async function readSession(
   }
 }
 
-// ── Single-series detail row (B4 helper) ────────────────────────────────────────
-
 /**
- * Build the FULL board row for ONE series — the detail endpoint's `row` (B4).
- * The drawer consumes a complete `ScheduledRow` (it reads `available_verbs`,
- * `health`, `agent_group_name`, `channel_name`, `module_owner`, `kind`,
- * `next_fire_local`, `quiet_status`, `flag_intent`), so the detail row must be
- * assembled with the same machinery as the list — not a thin projection.
- *
- * Resolves the live row (latest pending/paused) when present; otherwise the
- * latest row of any status so an ended/strand series still renders read-only.
- * Returns null when no row exists for the series (→ the handler maps to 404).
- * Health honors the strand verdict for a terminal-with-recurrence latest row.
+ * The FULL board row for one series, built with the same machinery as the list (the drawer reads most of its fields).
+ * Falls back to the latest row of any status so an ended or stranded series renders read-only; null when the series
+ * has no row.
  */
 export async function buildDetailRow(
   agentGroupId: string,
@@ -522,12 +423,7 @@ export async function buildDetailRow(
     'SELECT name, agent_provider FROM agent_groups WHERE id = ?',
     agentGroupId,
   );
-  // Key MUST match channelNameOf's lookup format (S7). channelNameOf is the
-  // shared getter for BOTH the list and detail paths, and it (plus doAssemble's
-  // list-path map) keys on a NUL (\0) separator — channel_type and platform_id
-  // are operator-controlled and could collide under a printable separator, but
-  // \0 cannot appear in either. All three sites must agree or the join silently
-  // returns null.
+  // Must use channelNameOf's NUL-separated key; see there.
   const mgByDest = new Map<string, string>();
   const mgRows = await getDb().all<{
     channel_type: string;
@@ -546,24 +442,20 @@ export async function buildDetailRow(
   };
 
   try {
-    // Same read-only seam as the list path: a detail render must not provision
-    // or migrate the session it is rendering.
+    // Same read-only seam as the list path.
     const raw = readSessionInbound(
       location,
       (mailbox) => mailbox.getLiveSeriesRow(seriesId) ?? mailbox.getLatestSeriesRow(seriesId),
     );
     if (!raw) return null;
-    // A cancelled series is intentionally ended and is excluded from the board
-    // list (LATEST_PER_SERIES_SQL). The detail tier 404s to match — never
-    // resolves a phantom 'strand'/'stalled' row for a task that's off the board.
+    // Cancelled series are excluded from the list, so the detail 404s too rather than rendering a phantom strand.
     if (raw.status === 'cancelled') return null;
 
     const isLive = raw.status === 'pending' || raw.status === 'paused';
     const isStrand = !isLive && raw.recurrence !== null;
     const outbound = readOutbound(location);
     const row = rawToRow(raw, desc, mgByDest, outbound, nowMs, false, timezone);
-    // A terminal-with-recurrence latest row is a residual strand; the §4.1
-    // ladder in rawToRow only sees live rows, so force the verdict here.
+    // rawToRow's health ladder sees only live rows, so a terminal-with-recurrence strand is forced here.
     if (isStrand) {
       row.health = 'strand';
       row.available_verbs = availableVerbs({
@@ -584,8 +476,6 @@ export async function buildDetailRow(
   }
 }
 
-// ── Snapshot assembly (B1) ──────────────────────────────────────────────────────
-
 const EMPTY_COUNTS: Record<string, number> = {
   healthy: 0,
   late: 0,
@@ -604,7 +494,6 @@ const CACHE_TTL_MS = 5000;
 
 let inFlight: Promise<ScheduledSnapshot> | null = null;
 
-/** Yield to the event loop — one session per tick (§4.9). */
 function yieldTick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
@@ -615,9 +504,8 @@ function countRow(counts: Record<string, number>, row: ScheduledRow): void {
 }
 
 /**
- * Assemble the fleet snapshot. Single-flight: concurrent callers await the same
- * in-flight promise. The cache is populated only if the generation the assembly
- * started under is still current (a mid-assembly mutation forces a re-run).
+ * Single-flight: concurrent callers share the in-flight promise. The cache is written only if the generation the
+ * assembly started under is still current.
  */
 export async function assembleSnapshot(
   scopes: AuthScopes,
@@ -648,12 +536,10 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
     name: string | null;
   }>('SELECT channel_type, platform_id, name FROM messaging_groups');
   const mgByDest = new Map(
-    // S7: NUL (\0) key — byte-identical to channelNameOf's lookup + buildDetailRow's
-    // build map (collision-safe; channel_type/platform_id can't contain \0).
+    // Same NUL key as channelNameOf.
     mgRows.map((m) => [`${m.channel_type}\0${m.platform_id}`, m.name ?? '']),
   );
 
-  // Enumerate authorized sessions (scope filter — C7).
   let sessionSql = "SELECT id, agent_group_id FROM sessions WHERE status = 'active'";
   const sessionParams: unknown[] = [];
   if (!scopes.no_filter) {
@@ -677,14 +563,11 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
 
   const rows: ScheduledRow[] = [];
   const counts: Record<string, number> = { ...EMPTY_COUNTS };
-  // E-3: per-group unreadable buckets so a scoped caller can sum only its own.
   const unreadableByGroup: Record<string, number> = {};
-  // Server-side search blobs (incl. prompt/script) keyed by row key. Cached on
-  // the snapshot, never serialized to the wire (see ScheduledSnapshot.search_index).
   const searchIndex: Record<string, string> = {};
 
   for (const s of sessionRows) {
-    await yieldTick(); // one session per event-loop tick — never one block (§4.9)
+    await yieldTick(); // One session per event-loop tick.
     const ag = agentGroups.get(s.agent_group_id);
     const desc: SessionDescriptor = {
       agentGroupId: s.agent_group_id,
@@ -728,9 +611,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
     assembled_at: new Date(nowMs).toISOString(),
   };
 
-  // Read-your-own-write: only populate the cache if no mutation bumped the
-  // generation while we assembled (§3a / S2). A stale assembly is returned to
-  // its caller but never cached.
+  // A stale assembly is returned to its caller but never cached.
   const cache = getScheduledCache();
   if (cache.gen === startGen) {
     cache.data = snapshot as unknown as CacheSnapshot;
@@ -740,7 +621,6 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
   return snapshot;
 }
 
-/** Test seam: drop any in-flight assembly so suites don't bleed state. */
 export function _resetAssemblyInFlightForTesting(): void {
   inFlight = null;
 }

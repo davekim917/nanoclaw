@@ -1,16 +1,7 @@
 /**
- * Scheduled Tasks Board read endpoints (Tasks B3 + B4):
- *   GET /dashboard/api/scheduled        — list (scope-filtered, health-derived)
- *   GET /dashboard/api/scheduled/:key   — detail (full prompt/script, history,
- *                                          audit tail at mutation tier only)
- *
- * Both apply the standard per-group scope filter with disclose-as-not-found
- * (C7). The list reads from the in-process snapshot cache (full-fleet, 5s TTL)
- * and filters per caller, so differently-scoped callers share one assembly.
- * The detail reads the series' session DB on demand for the full bodies +
- * last-5 fire history the snapshot doesn't carry.
- *
- * See docs/specs/scheduled-tasks-board/design.md §3a, §4.1, §4.2, §4.4, §4.5.
+ * Scheduled Tasks Board read endpoints: list and detail. Both apply the per-group scope filter with
+ * disclose-as-not-found. The list filters the shared full-fleet snapshot cache per caller; the detail reads the
+ * session DB on demand for full bodies and fire history.
  */
 import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
@@ -40,9 +31,7 @@ import {
   sessionInboundPathFor,
 } from './scheduled-shared.js';
 
-// ── Test seam ─────────────────────────────────────────────────────────────────
-// Production reads from DATA_DIR with a live clock. Tests inject a fixture dir +
-// fixed now without threading options through the AuthHandler signature.
+// Tests inject a fixture dir and a fixed clock without threading options through the AuthHandler signature.
 
 interface ReadOptions {
   dataDir: string;
@@ -59,8 +48,6 @@ function readOpts(): ReadOptions {
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
-
-// ── Scope filter (C7) ─────────────────────────────────────────────────────────
 
 function rowInScope(scopes: AuthedRequestContext['scopes'], agentGroupId: string): boolean {
   return scopes.no_filter || scopes.allowed_group_ids.includes(agentGroupId);
@@ -79,13 +66,9 @@ function countRows(rows: ScheduledRow[], unreadable: number): Record<string, num
   return counts;
 }
 
-// ── Audit-only repair rows (§4.2 step 5 / §4.4) ────────────────────────────────
-// A double-failure move is durably recorded in scheduled_audit yet can have NO
-// live row anywhere — invisible to the recurrence-filtered read shape. Surface
-// unresolved move_restore_failed rows AND stale-unresolved move_intent rows
-// (older than one sweep, no live row fleet-wide) as synthetic stalled entries
-// so the board's whole reason for existing (catch the silently-dead series)
-// holds even on the compensation path.
+// A double-failure move can leave no live row anywhere, only a scheduled_audit record. Unresolved move_restore_failed
+// rows, and move_intent rows unresolved for longer than a sweep with no live row, surface as synthetic stalled
+// entries so a silently dead series still shows.
 
 interface RepairAuditRow {
   action: string;
@@ -105,17 +88,15 @@ async function repairRows(nowMs: number, liveSeriesIds: Set<string>): Promise<Sc
           AND resolved_at IS NULL`,
     );
   } catch {
-    // Table absent (uninstalled / pre-migration) — no repair rows to surface.
+    // Table absent (pre-migration): nothing to surface.
     return [];
   }
 
   const seen = new Set<string>();
   const out: ScheduledRow[] = [];
   for (const a of auditRows) {
-    // A live row already covers this series → the move resolved fine; skip.
     if (liveSeriesIds.has(a.series_id)) continue;
-    // move_intent only counts as a repair candidate once it has been unresolved
-    // longer than one sweep (the normal in-flight window is seconds).
+    // The normal in-flight window is seconds; only an intent older than one sweep is a repair candidate.
     if (a.action === 'move_intent') {
       const tsMs = Date.parse(/[zZ]/.test(a.ts) ? a.ts : a.ts.replace(' ', 'T') + 'Z');
       if (Number.isNaN(tsMs) || nowMs - tsMs <= SWEEP_INTERVAL_MS) continue;
@@ -147,24 +128,16 @@ async function repairRows(nowMs: number, liveSeriesIds: Set<string>): Promise<Sc
   return out;
 }
 
-// ── B3: list handler ────────────────────────────────────────────────────────────
-
 /**
- * Return the full-fleet snapshot (cached, 5s TTL) filtered to the caller's
- * scope, with audit-only repair rows folded in. The cache always holds the
- * full-fleet snapshot (assembled under no_filter) so a scoped read never
- * poisons an owner's view; the per-caller scope filter happens here.
+ * The cache always holds the full-fleet snapshot (assembled unfiltered) so a scoped read never poisons an owner's
+ * view; scope filtering happens per caller here.
  */
 export const scheduledListHandler: AuthHandler = async (req, _params, ctx) => {
   const { dataDir, nowMs } = readOpts();
 
-  // M5/M6: optional `?group_id=` server-side filter (mirrors sessions.ts). An
-  // out-of-scope/nonexistent group_id yields an empty list, NOT an error
-  // (out-of-scope-as-nonexistent) — the scope filter below already restricts the
-  // row set, and ANDing the group_id naturally yields zero rows.
+  // An out-of-scope or nonexistent group_id yields an empty list, not an error.
   const groupIdFilter = new URL(req.url).searchParams.get('group_id');
 
-  // Serve a warm cache (full-fleet); else assemble it.
   const cache = getScheduledCache();
   let snapshot: ScheduledSnapshot;
   if (cache.data && cache.expiresMs > nowMs) {
@@ -177,15 +150,12 @@ export const scheduledListHandler: AuthHandler = async (req, _params, ctx) => {
   const repair = await repairRows(nowMs, liveSeriesIds);
   const allRows = [...snapshot.rows, ...repair];
 
-  // Per-caller scope filter (C7 — disclose-as-not-found: out-of-scope rows are
-  // simply absent, never a 403), ANDed with the optional group_id filter.
+  // Out-of-scope rows are simply absent, never a 403.
   const inScopeAndGroup = (agentGroupId: string): boolean =>
     rowInScope(ctx.scopes, agentGroupId) && (!groupIdFilter || agentGroupId === groupIdFilter);
   const visible = allRows.filter((r) => inScopeAndGroup(r.agent_group_id));
 
-  // E-3: the unreadable count must reflect ONLY the caller's in-scope (and
-  // group-filtered) groups — never the fleet-wide total. Sum the per-group
-  // unreadable buckets over the groups this caller can actually see.
+  // The unreadable count must cover ONLY the caller's visible groups, never the fleet-wide total.
   const unreadableByGroup = (snapshot.unreadable_by_group ?? {}) as Record<string, number>;
   let scopedUnreadable = 0;
   for (const [agId, n] of Object.entries(unreadableByGroup)) {
@@ -195,28 +165,16 @@ export const scheduledListHandler: AuthHandler = async (req, _params, ctx) => {
   return json({
     rows: visible,
     counts: countRows(visible, scopedUnreadable),
-    // `degraded` is a fleet assembly-health signal (the assembly either finished
-    // in budget or it didn't); the per-caller UNREADABLE count above is scoped.
+    // `degraded` is fleet assembly health; only the unreadable count is scoped.
     degraded: snapshot.degraded,
     assembled_at: snapshot.assembled_at,
   });
 };
 
-// ── Prompt/title search (fast-follow) ───────────────────────────────────────────
-
 /**
- * `GET /dashboard/api/scheduled/search?q=&group_id=` → `{ keys: string[] }`.
- *
- * Returns the scope-filtered row keys whose server-side search blob matches `q`.
- * The blob (assembled in scheduled-assembly) covers name/group/channel/cron PLUS
- * the task prompt + script — so this is the prompt/title search the lean list
- * snapshot can't do client-side. Only KEYS are returned: prompt/script text is
- * NEVER serialized (it stays detail-tier; the audit layer hashes it). The client
- * unions these keys with its instant on-row haystack, so list rows/counts/
- * stalled-inline are untouched — this endpoint only narrows the displayed set.
- *
- * Reuses the warm 5s snapshot cache (no extra DB reads on a cache hit). Empty `q`
- * short-circuits to no matches.
+ * `GET /dashboard/api/scheduled/search?q=&group_id=` → `{ keys }`: scope-filtered row keys whose server-side blob
+ * (including prompt and script) matches. Only KEYS are returned; prompt/script text is NEVER serialized. Empty `q`
+ * matches nothing.
  */
 export const scheduledSearchHandler: AuthHandler = async (req, _params, ctx) => {
   const { dataDir, nowMs } = readOpts();
@@ -225,7 +183,6 @@ export const scheduledSearchHandler: AuthHandler = async (req, _params, ctx) => 
   const groupIdFilter = url.searchParams.get('group_id');
   if (q === '') return json({ keys: [] });
 
-  // Serve the warm full-fleet cache; else assemble it (same source as the list).
   const cache = getScheduledCache();
   let snapshot: ScheduledSnapshot;
   if (cache.data && cache.expiresMs > nowMs) {
@@ -235,8 +192,6 @@ export const scheduledSearchHandler: AuthHandler = async (req, _params, ctx) => 
   }
 
   const index = (snapshot.search_index ?? {}) as Record<string, string>;
-  // Same scope+group predicate as the list handler (disclose-as-not-found): a
-  // caller only ever sees keys for groups it's authorized for, group-filtered.
   const inScopeAndGroup = (agentGroupId: string): boolean =>
     rowInScope(ctx.scopes, agentGroupId) && (!groupIdFilter || agentGroupId === groupIdFilter);
 
@@ -248,10 +203,6 @@ export const scheduledSearchHandler: AuthHandler = async (req, _params, ctx) => 
   return json({ keys });
 };
 
-// ── B4: detail handler ───────────────────────────────────────────────────────────
-
-// The detail bodies and the fire history are read through the mailbox
-// module's named ops, so their row shapes are the module's.
 type DetailLiveRow = ScheduledTaskRow;
 type HistoryRow = TaskFireRow;
 
@@ -263,21 +214,15 @@ function parseUtcMs(s: string | null): number | null {
 }
 
 /**
- * Label a completed/failed/expired fire row per §4.1:
- *   completed + a messages_out reply (in_reply_to = row id, ts ≥ due) → ran
- *   completed + no reply → completed (no chat output)   (the D16 merge)
- *   failed → failed · expired → missed · board-cancelled (audit) → cancelled
+ * completed + a reply (in_reply_to = row id, ts ≥ due) → ran; completed with no reply → completed (no chat output);
+ * failed → failed; expired → missed; board-cancelled → cancelled.
  */
 function outcomeFor(row: HistoryRow, replyTs: string | undefined, cancelTsMs: number | null): FireOutcomeLabel {
-  // Post-2.1.46 cancels mark the row 'cancelled' directly — label it as such.
-  // The audit-ts heuristic below still covers legacy rows cancelled while
-  // cancelTask wrote 'completed'.
+  // Current cancels mark the row 'cancelled' directly; the audit-ts check below covers legacy rows cancelled as
+  // 'completed'.
   if (row.status === 'cancelled') return 'cancelled';
-  // Label 'cancelled' ONLY for the occurrence the board-cancel actually ended — a
-  // completed row whose scheduled due (process_after) is at/after the cancel audit
-  // ts. Prior completed fires (due < cancelTs) genuinely RAN and keep their ran /
-  // no-output label. (Was a series-level boolean that relabeled every prior run as
-  // cancelled the moment the series had any cancel audit.)
+  // Only the occurrence the cancel ended (due at or after the cancel audit ts) is 'cancelled'; earlier completed
+  // fires genuinely ran.
   if (cancelTsMs !== null && row.status === 'completed') {
     const dueMs = parseUtcMs(row.process_after);
     if (dueMs !== null && dueMs >= cancelTsMs) return 'cancelled';
@@ -355,17 +300,11 @@ async function cancelAuditTsMs(seriesId: string): Promise<number | null> {
   }
 }
 
-/**
- * Read the series' live row (prompt/script + current state). Returns null when
- * no live row exists (the series ended/moved since the list — the handler maps
- * that to 404 / stale).
- */
+/** Null when the series has no row (the handler maps that to 404). */
 function readLiveRow(location: SessionReadLocation, seriesId: string): DetailLiveRow | null {
   try {
-    // Prefer the latest LIVE (pending|paused) task row — that carries the
-    // current prompt/script/schedule. Fall back to the latest row of any
-    // status so an ended series still renders its bodies (detail is
-    // read-only, and so is the seam it reads through).
+    // Prefer the latest live row (current bodies and schedule); fall back to the latest of any status so an ended
+    // series still renders.
     return (
       readSessionInbound(
         location,
@@ -385,24 +324,15 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
   const { dataDir, nowMs } = readOpts();
   const key = params['key'] ?? '';
   const decoded = decodeKey(key);
-  // Malformed key → 400. The :key is a structural locator (base64url codec,
-  // scheduled-shared.ts) — a string that cannot decode is a bad request, not a
-  // hidden resource. Out-of-scope and nonexistent are the disclose-as-not-found
-  // cases (404 below); a malformed key reveals nothing to disambiguate, so the
-  // distinct status is safe and matches the codec's documented contract.
+  // A malformed key is a bad request (400), not a hidden resource: it reveals nothing to disambiguate.
   if (!decoded) return json({ error: 'bad_key' }, 400);
 
-  // Scope re-check from the decoded key — never trust the key as authz (§4.5).
-  // Out-of-scope → 404 disclose-as-not-found (C7), never 403.
+  // The key is never authorization; out-of-scope → 404, never 403.
   if (!rowInScope(ctx.scopes, decoded.agentGroupId)) {
     return json({ error: 'not_found' }, 404);
   }
 
-  // M4: containment-checked locator. The mailbox module's read path applies
-  // the same canonicalize-and-contain check on the way in — a locator that
-  // resolves outside data/v2-sessions reads as "no mailbox" — so the null
-  // here is the disclose-as-not-found 404 the handler has always returned,
-  // kept as the caller-visible half of that guard.
+  // Containment-checked locator; null is the disclose-as-not-found 404.
   if (!sessionInboundPathFor(dataDir, decoded.agentGroupId, decoded.sessionId)) {
     return json({ error: 'not_found' }, 404);
   }
@@ -412,18 +342,12 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
     sessionId: decoded.sessionId,
   };
 
-  // Read the series' live/latest row for the full prompt + script bodies (the
-  // snapshot carries neither). null → the series ended/moved since the list →
-  // 404 (detail is read-only; a stale key just doesn't resolve).
+  // The snapshot carries neither body; a series that ended since the list → 404.
   const live = readLiveRow(location, decoded.seriesId);
   if (!live) return json({ error: 'not_found' }, 404);
 
-  // The `row` MUST be a complete ScheduledRow — the drawer reads
-  // `available_verbs`, `health`, `agent_group_name`, `channel_name`,
-  // `module_owner`, `kind`, `next_fire_local`, `quiet_status`, `flag_intent`
-  // off it. Build it with the same assembly machinery (health + verbs + joins),
-  // never a thin projection (that would make the drawer's verb buttons throw on
-  // `row.available_verbs`).
+  // Must be a complete ScheduledRow built by the assembly machinery, never a thin projection: the drawer's verb
+  // buttons read `available_verbs` and other fields off it.
   const row = (await buildDetailRow(decoded.agentGroupId, decoded.sessionId, decoded.seriesId, dataDir, nowMs)) ?? null;
   if (!row) return json({ error: 'not_found' }, 404);
 
@@ -441,9 +365,7 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
 
   const body: Record<string, unknown> = { row, prompt, script, history };
 
-  // Audit tail is served ONLY at the mutation tier (owner/global-admin). A
-  // read-only in-scope caller never sees the tail (M5 — delta hashes/previews
-  // and move provenance stay above the read tier).
+  // Mutation tier only: hashes, previews and move provenance stay above the read tier.
   if (await canManageScheduled(ctx.user.id)) {
     body.audit_tail = await readAuditTail(decoded.seriesId);
   }

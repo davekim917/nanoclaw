@@ -1,14 +1,7 @@
 /**
- * Read-only workgroup dashboard endpoints (fleet-hardening Phase 3):
- *   GET /dashboard/api/workgroups              — workgroups visible to the caller
- *   GET /dashboard/api/workgroup/:id/summary    — releases board.md + newest gate log tail
- *   GET /dashboard/api/workgroup/:id/usage      — per-agent-group usage_daily rollup
- *   GET /dashboard/api/workgroup/:id/claims     — work-claims + task-series summary
- *
- * Scopes have no workgroup dimension (`ctx.scopes.allowed_group_ids` is a list
- * of agent_group ids) — membership is derived by joining `agent_groups.workgroup_id`.
- * Same disclose-as-not-found pattern as scheduled-read.ts: an out-of-scope or
- * nonexistent workgroup id is a 404, never a 403.
+ * Read-only workgroup dashboard endpoints (list, summary, usage, claims). Scopes have no workgroup dimension, so
+ * membership is derived through `agent_groups.workgroup_id`. An out-of-scope or nonexistent workgroup is a 404, never
+ * a 403.
  */
 import fs from 'fs';
 import path from 'path';
@@ -27,19 +20,14 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-// ── Workgroup resolution + scope check ──────────────────────────────────────
-
 interface WorkgroupRow {
   id: string;
   display_name: string | null;
 }
 
 /**
- * Resolve a workgroup id to its row AND verify the caller has scope on it,
- * in one step — never trust the route param as a filesystem path or authz
- * input directly. `no_filter` callers see every workgroup; scoped callers
- * must have at least one allowed agent group whose `workgroup_id` matches.
- * Returns null on either not-found or out-of-scope (disclose-as-not-found).
+ * Resolves the id AND checks scope in one step; never trust the route param as a filesystem path or authorization.
+ * Null for not-found and out-of-scope alike.
  */
 async function resolveWorkgroup(id: string, ctx: AuthedRequestContext): Promise<WorkgroupRow | null> {
   const row = await getDb().get<WorkgroupRow>('SELECT id, display_name FROM workgroups WHERE id = ?', id);
@@ -60,8 +48,6 @@ async function workgroupAgentGroupIds(workgroupId: string): Promise<string[]> {
     (r) => r.id,
   );
 }
-
-// ── GET /dashboard/api/workgroups ───────────────────────────────────────────
 
 export const workgroupsListHandler: AuthHandler = async (_req, _params, ctx) => {
   let rows: WorkgroupRow[];
@@ -89,9 +75,6 @@ export const workgroupsListHandler: AuthHandler = async (_req, _params, ctx) => 
   return json({ workgroups: rows.map((r) => ({ id: r.id, name: r.display_name ?? r.id })) });
 };
 
-// ── GET /dashboard/api/workgroup/:id/summary ────────────────────────────────
-
-/** `groups/<workgroupId>/releases/board.md` — raw markdown, or null if absent. */
 function readBoardMd(releasesDir: string): string | null {
   try {
     return fs.readFileSync(path.join(releasesDir, 'board.md'), 'utf8');
@@ -100,7 +83,6 @@ function readBoardMd(releasesDir: string): string | null {
   }
 }
 
-/** Tail (~last `tailLines`) of the newest `releases/gates/*.jsonl` file, or []. */
 function readNewestGatesTail(releasesDir: string, tailLines: number): Record<string, unknown>[] {
   const gatesDir = path.join(releasesDir, 'gates');
   let files: string[];
@@ -146,8 +128,6 @@ export const workgroupSummaryHandler: AuthHandler = async (_req, params, ctx) =>
   });
 };
 
-// ── GET /dashboard/api/workgroup/:id/usage ──────────────────────────────────
-
 const DEFAULT_USAGE_DAYS = 14;
 const MAX_USAGE_DAYS = 90;
 
@@ -177,9 +157,7 @@ export const workgroupUsageHandler: AuthHandler = async (req, params, ctx) => {
         ...agentGroupIds,
         sinceDate,
       );
-      // The same presentation `ncl usage list` gets: cost_applicable from the
-      // provider, and the untrusted note in place of any figure inside the
-      // untrusted Claude window (src/db/usage-trust.ts).
+      // Same presentation as `ncl usage list`, including the untrusted-window note (src/db/usage-trust.ts).
       usage = rawRows.map(presentUsageDailyRow);
     }
   } catch (err) {
@@ -189,8 +167,6 @@ export const workgroupUsageHandler: AuthHandler = async (req, params, ctx) => {
 
   return json({ usage });
 };
-
-// ── GET /dashboard/api/workgroup/:id/claims ─────────────────────────────────
 
 interface RawClaim {
   owner?: unknown;
@@ -212,12 +188,8 @@ interface ClaimEntry {
 }
 
 /**
- * `data/workgroups/<id>/claims/*.json` — reuses the pure `isStalePastGrace` /
- * `shouldEscalate` functions from the claims escalation module (never
- * reimplements the staleness math). `escalated` means "currently escalated
- * and not yet eligible for a fresh escalation" — a claim that went stale,
- * escalated, and was then taken over (re-claimed) reads as un-escalated again.
- * Missing/unreadable claims dir → [], never a 500.
+ * Reuses the claims escalation module's staleness functions. `escalated` means currently escalated and not yet
+ * eligible for a fresh escalation, so a re-claimed claim reads un-escalated. Missing dir → [], never a 500.
  */
 function readClaims(dataDir: string, workgroupId: string, now: number): ClaimEntry[] {
   const dir = path.join(dataDir, 'workgroups', workgroupId, 'claims');
@@ -277,9 +249,7 @@ export const workgroupClaimsHandler: AuthHandler = async (_req, params, ctx) => 
     const agentGroupIds = new Set(await workgroupAgentGroupIds(wg.id));
     if (agentGroupIds.size > 0) {
       const nowMs = Date.now();
-      // Reuse the scheduled-board's warm full-fleet cache (never assemble
-      // scoped — that would poison the shared cache other read handlers rely
-      // on being full-fleet); same pattern as scheduled-read.ts.
+      // Never assemble scoped: that would poison the shared full-fleet cache other handlers rely on.
       const cache = getScheduledCache();
       let snapshot: ScheduledSnapshot;
       if (cache.data && cache.expiresMs > nowMs) {
