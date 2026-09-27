@@ -23,7 +23,6 @@ import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 const parsedMaxAgeHours = Number(process.env.PENDING_MESSAGE_MAX_AGE_HOURS);
 export const PENDING_MESSAGE_MAX_AGE_MS =
   (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
-// Exported so a test pins the retry ladder against the body's real numbers.
 export const MAX_TRIES = 5;
 export const BACKOFF_BASE_MS = 5000;
 

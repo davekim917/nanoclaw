@@ -46,7 +46,6 @@ export { decideCeilingFollowUp, type CeilingFollowUp } from './decide.js';
 
 export const CONTINUATION_WAKE_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
-/** Storage lives in the mailbox module; re-exported for existing import paths. */
 export {
   canAttemptContinuationRecovery,
   incrementWorkContinuationResumeAttempt,
@@ -69,7 +68,6 @@ export function _hasWorkContinuationForTesting(db: Database.Database): boolean {
   return readWorkContinuation(db) !== null;
 }
 
-/** Re-exported for the existing tests. */
 export { hasDueRecoveryWake, parkDueRecoveryWakes } from '../mailbox/ops/recovery.js';
 
 /** Throttle gate: wake only when the last spawn/recovery attempt is old. */

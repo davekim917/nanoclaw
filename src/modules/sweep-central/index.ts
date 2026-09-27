@@ -17,8 +17,8 @@ function registerCentralSweepDuties(): void {
     name: id.T7,
     phase: 'tick:housekeeping',
     order: 20,
-    // Re-mint GitHub App tokens inside their refresh margin so a respawning
-    // container never gets one about to expire. Failures retry next tick.
+    // Opportunistic re-mint inside the refresh margin: a failed mint keeps the
+    // old token and retries later.
     run: async () => {
       try {
         const { refreshExpiringGitHubAppTokens } = await import('../../github-app-token.js');
