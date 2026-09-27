@@ -188,7 +188,7 @@ async function wireIfMissing(
     // wires their own DM, so every sender is trusted ('all') and ignored
     // messages carry no value ('drop').
     sender_scope: 'all',
-    // accumulate, not drop: the owner's default for all agents.
+    // Overrides the 'drop' above: accumulate is the owner's default for all agents.
     ignored_message_policy: 'accumulate',
     session_mode: 'per-thread',
     priority: 0,

@@ -436,7 +436,7 @@
 "scripts/detect-driver-migration.ts":{"diff":176,"mode":"100644","sha256":null,"deleted":true},
 "scripts/init-cli-agent.ts":{"diff":44,"mode":"100644","sha256":"a9a41c8e5e09e3d130ac28bb1fa645594ad6f6dd2c4ba2f0393c7104171c6c02"},
 "scripts/init-first-agent.test.ts":{"diff":152,"mode":"100644","sha256":null,"deleted":true},
-"scripts/init-first-agent.ts":{"diff":163,"mode":"100644","sha256":"4a94d2047fb447396ebcd5b16b691a736522b5f6eec44e1f1d0d997b738a3814"},
+"scripts/init-first-agent.ts":{"diff":163,"mode":"100644","sha256":"bfd62f9e20ec09ec2571805f6a5c51e20f864561ec8dae45ac2817bb75f491a1"},
 "scripts/label-pr-workflow.test.ts":{"diff":403,"mode":"100644","sha256":null,"deleted":true},
 "scripts/migrate.test.ts":{"diff":32,"mode":"100644","sha256":null,"deleted":true},
 "scripts/migrate.ts":{"diff":12,"mode":"100644","sha256":null,"deleted":true},
