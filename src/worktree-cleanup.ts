@@ -2040,7 +2040,9 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
   }
   try {
     fs.rmdirSync(quarantineRoot); // only succeeds once genuinely empty
-  } catch {}
+  } catch {
+    // Non-empty (something is still stranded, already logged) or never existed: nothing to do.
+  }
 }
 
 export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string = GROUPS_DIR): Promise<GcReport> {
