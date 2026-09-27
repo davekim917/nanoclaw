@@ -38,7 +38,7 @@ const TOOL_PATH = [path.join(REPO_ROOT, 'node_modules', '.bin'), process.env.PAT
 
 const KNIP_WORKSPACES = ['.', 'container/agent-runner'];
 const SOURCE_ROOTS = ['src', 'setup', 'scripts', 'container/agent-runner/src', 'container/agent-runner/scripts'];
-const SOURCE_FILE = /\.(?:[cm]?[jt]s|tsx)$/;
+const SOURCE_FILE = /\.(?:[cm]?[jt]s|[jt]sx)$/;
 const NOT_SOURCE =
   /(?:^|\/)(?:node_modules|__fixtures__|__test-fixtures__|test-fixtures|transaction-fixtures)\/|\.test\.[cm]?[jt]sx?$/;
 

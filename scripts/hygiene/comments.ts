@@ -11,7 +11,7 @@ interface CommentFinding {
 // Checked before the directive exemption: knip honours these tags even inside an eslint-disable comment.
 const SUPPRESSION = /jscpd:ignore-|@(?:public|internal|beta|alias|lintignore)(?![A-Za-z0-9_])/;
 const DIRECTIVE =
-  /^(?:eslint-disable|eslint-enable|@ts-expect-error|@ts-ignore|@ts-nocheck|@ts-check|<reference\b|prettier-ignore|c8 ignore)/;
+  /^(?:eslint-disable|eslint-enable|@ts-expect-error|@ts-ignore|@ts-nocheck|@ts-check|<reference\b|@jsx(?:ImportSource|Runtime|Frag)?\b|prettier-ignore|c8 ignore)/;
 const PR_HISTORY = /(?<!&)#\d+\b|\bPR\s?\d+\b/;
 
 // `<name>:<digits>`, excluding a version such as `image:1.3.14`.

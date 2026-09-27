@@ -375,6 +375,11 @@ describe('comment growth', () => {
     expect(verdict(root)).toMatchObject({ net: 1, files: ['dashboard/src/main.tsx'] });
   });
 
+  it('counts a changed .jsx file', () => {
+    const root = repo({ 'dashboard/src/view.jsx': code }, { 'dashboard/src/view.jsx': `// new\n${code}` });
+    expect(verdict(root)).toMatchObject({ net: 1, files: ['dashboard/src/view.jsx'] });
+  });
+
   it('ignores test files, fixtures, non-source files and exempt files', () => {
     const root = repo(
       { 'src/a.ts': code, 'src/upstream.ts': code },

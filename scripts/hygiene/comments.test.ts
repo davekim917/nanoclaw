@@ -161,6 +161,12 @@ describe('comment-only line count', () => {
     expect(count(source)).toBe(0);
   });
 
+  it('counts nothing for a JSX pragma', () => {
+    const source =
+      '/** @jsxImportSource preact */\n/** @jsx h */\n/** @jsxFrag Fragment */\n// @jsxRuntime classic\nexport const a = 1;\n';
+    expect(count(source, 'fixture.tsx')).toBe(0);
+  });
+
   it('counts nothing for a shebang', () => {
     expect(count('#!/usr/bin/env node\nexport const a = 1;\n', 'tool.mjs')).toBe(0);
   });
