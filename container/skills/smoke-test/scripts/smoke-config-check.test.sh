@@ -13,9 +13,13 @@ ok() { echo "  ok   $1"; }
 # --- 1. The required set is the gate's own list, at both of its sites -------
 GATE_LISTS="$(sed -n -E 's/^[[:space:]]*for k in (.*); do$/\1/p' "$GATE" | sort -u)"
 [ "$(wc -l <<<"$GATE_LISTS")" -eq 1 ] || fail "smoke-pr-gate.sh's required-key loops disagree: $GATE_LISTS"
-CHECK_LIST="$(sed -n -E 's/^REQUIRED="(.*)"$/\1/p' "$CHECK")"
+CHECK_LIST="$(sed -n -E 's/^GATE_REQUIRED="(.*)"$/\1/p' "$CHECK")"
 [ "$GATE_LISTS" = "$CHECK_LIST" ] && ok "required set pinned to smoke-pr-gate.sh" \
   || fail "required set drift: gate [$GATE_LISTS] check [$CHECK_LIST]"
+# The layout prefixes come from the one validator both scripts source.
+grep -q 'smoke-gate-layout.sh' "$GATE" && grep -q 'smoke-gate-layout.sh' "$CHECK" \
+  && grep -q '^REQUIRED="\$GATE_REQUIRED \$LAYOUT_PREFIX_KEYS"$' "$CHECK" \
+  && ok "layout prefixes come from smoke-gate-layout.sh in both" || fail "layout prefixes not shared through smoke-gate-layout.sh"
 
 write_env() { # <file> <extra lines...>
   local f="$1"; shift

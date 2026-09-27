@@ -49,7 +49,7 @@ BRANCH="${SMOKE_GATE_BRANCH:-develop}"
 LABEL="${SMOKE_GATE_LABEL:-render-preview}"
 TARGET_SHA="${1:-}"
 BACKEND_PREFIX="${SMOKE_GATE_BACKEND_PREFIX:-}"; FRONTEND_PREFIX="${SMOKE_GATE_FRONTEND_PREFIX:-}"
-LAYOUT_PREFIX_RE='^([A-Za-z0-9_][A-Za-z0-9._-]*/)+$'; if [ -z "$REPO" ] || ! [[ "$BACKEND_PREFIX" =~ $LAYOUT_PREFIX_RE ]] || ! [[ "$FRONTEND_PREFIX" =~ $LAYOUT_PREFIX_RE ]]; then
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"; if [ -z "$REPO" ] || [ -n "$(layout_prefix_problems FRONTEND_PREFIX BACKEND_PREFIX)" ]; then
   jq -cn '{ok:false,error:"SMOKE_GATE_REPO, SMOKE_GATE_BACKEND_PREFIX and SMOKE_GATE_FRONTEND_PREFIX are required, each prefix a relative dir ending in /"}'
   exit 2
 fi

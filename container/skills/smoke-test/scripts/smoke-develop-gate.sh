@@ -235,6 +235,12 @@ FREEZE_HANDOFF="${SMOKE_GATE_FREEZE_HANDOFF:-false}"
 # gate_misconfigured alarm below) whenever FREEZE_HANDOFF is on — there is no
 # fallback freeze mechanism this gate could improvise.
 FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
+# The freeze helper builds its markers under the layout prefixes, so with the
+# handoff on they are validated once here (smoke-gate-layout.sh) and a bad one
+# is named in poll's gate_misconfigured alarm before any freeze is cut.
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
+LAYOUT_MISSING=""
+[ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems FRONTEND_PREFIX BACKEND_PREFIX)"
 # How long an open freeze handoff stays worth testing. A freeze pins one
 # develop SHA; past this, with develop moved on, the slot is freed so the next
 # poll re-freezes on current head rather than campaigning a superseded build.
@@ -1438,6 +1444,7 @@ MISSING=""
 [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
 [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
 [ -n "$DEV_URL" ] || MISSING="$MISSING SMOKE_GATE_DEV_URL"
+MISSING="$MISSING$LAYOUT_MISSING"
 # A knob that fell back to its default because the deployed value was not a
 # number is a misconfiguration, not a detail — name it in the same alarm.
 MISSING="$MISSING$BAD_NUMERIC_CONFIG"

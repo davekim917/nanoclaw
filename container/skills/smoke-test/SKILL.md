@@ -1679,7 +1679,7 @@ do its job without. Both used to stay in the controller's own journal.
   while the `.ack` is absent (`smoke-campaign-controller.py:2738-2740`), so that
   fire published the new refusal and woke nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
   `invalidReasons[]`, digested against what the brief was written under
-  (`refusal_digest`, `smoke-campaign-controller.py:255`; recorded as
+  (`refusal_digest`, `smoke-campaign-controller.py:258`; recorded as
   `briefedRefusal` at `:1518-1519`, carried forward at `:2731-2732`, compared by
   `_reoffer_on_new_refusal` at `:2872`) — and
   deliberately neither of its neighbours: not "the published answer changed",
@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5494`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5492`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2617,7 +2617,7 @@ hardcoded preview ids), `SMOKE_GATE_FRONTEND_PREFIX` / `SMOKE_GATE_BACKEND_PREFI
 `/`: a diff under the frontend prefix requires the frontend preview to match,
 one under the migrations prefix refuses an ordinary PR, and the freeze markers
 are `<prefix>.render-freeze` under the backend and frontend prefixes; all
-three are required, each a relative path of plain segments ending in `/`: anything else is `gate_misconfigured`),
+three are required for every gate verb, each a relative path of plain segments ending in `/`, checked once before any mode by `scripts/smoke-gate-layout.sh`: anything else is `gate_misconfigured`),
 `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
 `SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
 seam and semantics as the develop gate — one readiness command run once per

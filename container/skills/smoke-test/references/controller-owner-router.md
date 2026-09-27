@@ -45,10 +45,10 @@ to the retained technical owner, verify its artifact receipt, and stop.
    writer, pass `SMOKE_GATE_OWNER=<coordinatorOwnerToken>` from
    `<run>/controller/wake.json` — **re-read that file on every wake, not once
    at intake.** `smoke-pr-gate.sh poll` mints a fresh owner token on every
-   same-SHA recovery (`smoke-pr-gate.sh:5494`, written to the lease at `:5523`,
-   the PR authority at `:5528` and the gate state at `:5573`), so the token you
+   same-SHA recovery (`smoke-pr-gate.sh:5492`, written to the lease at `:5521`,
+   the PR authority at `:5526` and the gate state at `:5571`), so the token you
    started with is then retired. The controller refreshes `wake.json` with
-   every brief it writes (`smoke-campaign-controller.py:1526-1528`, in
+   every brief it writes (`smoke-campaign-controller.py:1529-1531`, in
    `_owner_wake` at `:1451`), which is why the file is current and your own
    copy of its value is not (XZO #2046).
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
@@ -65,7 +65,7 @@ to the retained technical owner, verify its artifact receipt, and stop.
      impersonation, not adoption.
    - Your ack does not carry over. Writing a brief removes
      `<run>/controller/brief-<step>.ack`
-     (`smoke-campaign-controller.py:1515-1525`), so a re-offered step needs a
+     (`smoke-campaign-controller.py:1518-1528`), so a re-offered step needs a
      fresh ack as its first act, exactly like any other wake.
 4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
    before you start and again before you stop. The controller rewrites it every

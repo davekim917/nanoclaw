@@ -14,9 +14,12 @@
 # key missing, malformed or mismatched · 3 a file unreadable · 4 usage.
 set -u
 
-# The gates' own `for k in …` required list (smoke-pr-gate.sh check/poll);
-# smoke-config-check.test.sh pins the two equal.
-REQUIRED="REPO BACKEND_SERVICE FRONTEND_SERVICE FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX"
+# The gate's own `for k in …` required list (smoke-pr-gate.sh check/poll;
+# smoke-config-check.test.sh pins the two equal), plus the layout prefixes,
+# which the gates and this check validate through smoke-gate-layout.sh.
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
+GATE_REQUIRED="REPO BACKEND_SERVICE FRONTEND_SERVICE"
+REQUIRED="$GATE_REQUIRED $LAYOUT_PREFIX_KEYS"
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -48,7 +51,7 @@ for f in "$@"; do
       missing+=("SMOKE_GATE_$name")
       continue
     fi
-    case "$name" in *_PREFIX) [[ "${v#=}" =~ ^([A-Za-z0-9_][A-Za-z0-9._-]*/)+$ ]] || malformed+=("SMOKE_GATE_$name") ;; esac
+    case " $LAYOUT_PREFIX_KEYS " in *" $name "*) layout_prefix_ok "${v#=}" || malformed+=("SMOKE_GATE_$name") ;; esac
     if [ -n "${SEEN[$name]+x}" ]; then
       [ "${SEEN[$name]}" = "$v" ] || MISMATCH[$name]=1
     else

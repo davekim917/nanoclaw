@@ -132,6 +132,7 @@ STUB
 chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl" "$STUB_BIN/freeze-helper"
 export PATH="$STUB_BIN:$PATH"
 export STUB_SOURCE_SHA="$BUILD_SHA"
+export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-b \
   SMOKE_GATE_FRONTEND_SERVICE=srv-f SMOKE_GATE_DEV_URL=https://dev.example.test \
   SMOKE_GATE_DEBOUNCE_SECONDS=0
@@ -918,7 +919,7 @@ done
 # Cross-gate: the REAL smoke-pr-gate.sh claims it in its own state dir — so the
 # fields this gate reads are the ones that gate writes, not a fixture's guess —
 # and the classification follows, still silent.
-SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/ SMOKE_GATE_STATE_DIR="$PR_DIR" bash "$SCRIPT_DIR/smoke-pr-gate.sh" claim run-uc-61 61 "$UC_FREEZE" |
+SMOKE_GATE_STATE_DIR="$PR_DIR" bash "$SCRIPT_DIR/smoke-pr-gate.sh" claim run-uc-61 61 "$UC_FREEZE" |
   jq -e '.ok == true' >/dev/null || uc_fail "real PR-gate claim failed"
 bash "$GATE" poll | jq -e '
   .wakeAgent == false and .data.campaignTrace.disposition == "campaign_live" and
@@ -1003,7 +1004,7 @@ bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null || uc_fail "red devel
 jq -e '.handoffUnclaimedAlertFor == null' "$STATE_DIR2/develop-state.json" >/dev/null
 uc_open 66
 export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400 STUB_FRONTEND_CI=failure
-SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/ SMOKE_GATE_STATE_DIR="$PR_DIR" bash "$SCRIPT_DIR/smoke-pr-gate.sh" claim run-uc-66 66 "$UC_FREEZE" >/dev/null
+SMOKE_GATE_STATE_DIR="$PR_DIR" bash "$SCRIPT_DIR/smoke-pr-gate.sh" claim run-uc-66 66 "$UC_FREEZE" >/dev/null
 uc_age 6000
 bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null || uc_fail "red develop alarmed over a live campaign"
 # Env unset on a red develop: inert, exact historic line, no latch.
@@ -1086,6 +1087,11 @@ SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=90m bash "$GATE" poll | jq -e '
   .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS") != null)
 ' >/dev/null || uc_fail "bad SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS was not named"
 bash "$GATE" ack develop_freeze_unclaimed "77" acked | jq -e '.ok == true and .silenceable == false' >/dev/null
+# With the handoff on, the freeze helper's layout prefixes are validated before
+# anything else; a bad one is named in the same alarm, and nothing is cut.
+SMOKE_GATE_BACKEND_PREFIX=../api/ bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null)
+' >/dev/null || uc_fail "a bad layout prefix was not named with the freeze handoff on"
 # Leave the ambient ceiling exactly as case 33 left it for the cases below.
 export SMOKE_GATE_FREEZE_STALE_SECONDS=0
 

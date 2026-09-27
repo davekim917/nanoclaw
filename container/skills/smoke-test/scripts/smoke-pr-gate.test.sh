@@ -418,6 +418,20 @@ assert d["wakeAgent"] is False and d["ok"] is False and d["data"]["trigger"] == 
 p = observation_problem(d["observation"]); sys.exit("invalid observation: " + p if p else 0)' \
   "$(dirname "$GATE")/../../task-observation"
 
+# The layout validator runs before mode dispatch, so a verb that never reads
+# the prefixes refuses too: no mode can run with a bad layout.
+for verb in progress release task-claim lease-status challenger-timeout; do
+  T1V="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=/api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/ \
+    bash "$GATE" "$verb" 2>/dev/null || true)"
+  jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$T1V" >/dev/null ||
+    { echo "1: $verb ran with a bad layout prefix: $T1V" >&2; exit 1; }
+done
+# The freeze helper validates the same way, before it touches GitHub.
+T1F="$(SMOKE_GATE_REPO=org/repo SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=../api/ \
+  bash "$(dirname "$GATE")/smoke-freeze-pr.sh" "$(printf 'a%.0s' $(seq 40))" 2>/dev/null)" && T1F_RC=0 || T1F_RC=$?
+[ "$T1F_RC" -eq 2 ] && jq -e '.ok == false and (.error | contains("SMOKE_GATE_BACKEND_PREFIX"))' <<<"$T1F" >/dev/null ||
+  { echo "1: the freeze helper accepted a bad layout prefix: rc=$T1F_RC $T1F" >&2; exit 1; }
+
 # --- Common config for every scenario below ---------------------------------
 export SMOKE_GATE_REPO=org/repo
 export SMOKE_GATE_BACKEND_SERVICE=srv-backend-base
@@ -1817,7 +1831,7 @@ bash "$GATE" check 13 | jq -e '.settled == true and .campaignRange.pinState == "
 [ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
 # claim reaches detect_freeze without check/poll's config guard, so an unset or
 # malformed marker prefix must refuse there too, never admit the freeze as ordinary.
-for bad in "SMOKE_GATE_FRONTEND_PREFIX=" "SMOKE_GATE_BACKEND_PREFIX=api"; do
+for bad in "SMOKE_GATE_FRONTEND_PREFIX=" "SMOKE_GATE_BACKEND_PREFIX=api" "SMOKE_GATE_MIGRATIONS_PREFIX="; do
   T5L_BAD="$(env "$bad" bash "$GATE" claim run-manual-13x 13 "$FREEZE_SHA" 2>/dev/null || true)"
   jq -e '.ok == false and (.error | startswith("gate misconfigured"))' <<<"$T5L_BAD" >/dev/null ||
     { echo "5l: claim with $bad did not refuse: $T5L_BAD" >&2; exit 1; }
@@ -2982,6 +2996,16 @@ bash "$GATE" finish "$BLIND_SHA" run-blind NO_GO | jq -e '
   .ok == true and .handoff.written == false and
   (.handoff.reason | test("freeze-PR status is unknown"))
 ' >/dev/null || { echo "an unreadable diff during finish was reported as an ordinary PR" >&2; exit 1; }
+unset STUB_PR_FILES_EXIT
+# ...but a misconfigured layout prefix is refused before finish runs at all, so
+# the slot and lease stay held for a retry instead of dropping a possible freeze verdict.
+bash "$GATE" claim run-blind-2 96 "$BLIND_SHA" >/dev/null
+T24="$(SMOKE_GATE_MIGRATIONS_PREFIX= bash "$GATE" finish "$BLIND_SHA" run-blind-2 NO_GO 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_MIGRATIONS_PREFIX"]' <<<"$T24" >/dev/null ||
+  { echo "24: finish with a misconfigured prefix did not refuse for retry: $T24" >&2; exit 1; }
+[ -e "$SMOKE_GATE_LEASE_DIR/lease-run-blind-2.json" ] || { echo "24: the refused finish released its lease" >&2; exit 1; }
+bash "$GATE" finish "$BLIND_SHA" run-blind-2 NO_GO | jq -e '.ok == true' >/dev/null ||
+  { echo "24: the retried finish with the prefix restored did not complete" >&2; exit 1; }
 
 
 # --- 25. Cross-target interleaving: the divergence check compares the hold
