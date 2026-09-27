@@ -13,6 +13,9 @@ Codex/OpenCode. Hook delivery is **conditional, and the condition is the manifes
 Claude always fires a plugin's SessionStart hook, Codex fires it only for a plugin it
 can register — one shipping `.codex-plugin/plugin.json` that declares a hook — and
 OpenCode has no plugin loader, so no hook path at all.
+The one OpenCode exception is a module the runner itself lists in the OpenCode config's
+`plugin` array: the destructive guard and bootstrap's comment-rule feedback
+(`commentRulePlugins` in `container/agent-runner/src/providers/opencode.ts`).
 
 ## Scope: container agent groups only — never a host CLI
 

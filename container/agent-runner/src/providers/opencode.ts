@@ -40,6 +40,8 @@ import { attachTurnEffort } from './turn-effort.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { shouldPostInfraWarning } from '../modules/mailbox/index.js';
 import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
+import { loadExcludedPlugins } from '../excluded-plugins.js';
+import { isExcludedPluginPath, type ExcludedPlugins } from '../plugin-exclusions.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
@@ -608,8 +610,16 @@ export function buildOpenCodeConfig(
     mcp,
     // Both unconditional: the managed-Git guard has no opt-out, and with the opt-out and no bootstrap mount
     // OpenCode ignores only the missing second path.
-    plugin: [MANAGED_GIT_OPENCODE_PLUGIN_PATH, GUARD_PLUGIN],
+    plugin: [MANAGED_GIT_OPENCODE_PLUGIN_PATH, GUARD_PLUGIN, ...commentRulePlugins()],
   };
+}
+
+const COMMENT_RULE_PLUGIN_DIR = 'bootstrap/plugins/comment-rule';
+const COMMENT_RULE_PLUGIN = `/workspace/plugins/${COMMENT_RULE_PLUGIN_DIR}/hooks/opencode-comment-rule.mjs`;
+
+export function commentRulePlugins(excluded?: ExcludedPlugins): string[] {
+  if (!fs.existsSync(COMMENT_RULE_PLUGIN)) return [];
+  return isExcludedPluginPath(COMMENT_RULE_PLUGIN_DIR, excluded ?? loadExcludedPlugins()) ? [] : [COMMENT_RULE_PLUGIN];
 }
 
 /** `question.reply` takes flat `{ requestID, answers }` in 1.18.23; `question.list` spans every session. */

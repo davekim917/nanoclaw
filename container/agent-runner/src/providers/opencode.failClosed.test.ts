@@ -6,12 +6,14 @@ import {
   _setOpenCodeAuthProvidersForTesting,
   buildOpenCodeConfig,
   buildOpencodeServerEnv,
+  commentRulePlugins,
   OPENCODE_PERMISSIONS,
   parseOpenCodeAuthProviders,
   runtimeConfigKey,
   shouldBypassOpenCodeProxy,
 } from './opencode.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
+import { splitExcludedPlugins } from '../plugin-exclusions.js';
 
 // The guard plugin path buildOpenCodeConfig probes via fs.existsSync. We never
 // touch the real filesystem here — every test stubs fs.existsSync so "present"
@@ -445,5 +447,29 @@ describe('buildOpenCodeConfig + buildOpencodeServerEnv — combined spawn (F3)',
     else process.env.ANTHROPIC_API_KEY = savedKey;
     if (savedExa === undefined) delete process.env.EXA_API_KEY;
     else process.env.EXA_API_KEY = savedExa;
+  });
+});
+
+describe('comment-rule feedback plugin', () => {
+  const COMMENT_RULE_PLUGIN = '/workspace/plugins/bootstrap/plugins/comment-rule/hooks/opencode-comment-rule.mjs';
+
+  function stubPresent(paths: string[]): void {
+    spies.push(spyOn(fs, 'existsSync').mockImplementation((p: fs.PathLike) => paths.includes(String(p))));
+  }
+
+  it('is added after the guards when the plugin is mounted', () => {
+    stubPresent([GUARD_PLUGIN, COMMENT_RULE_PLUGIN]);
+    const cfg = buildOpenCodeConfig({}, {}) as { plugin?: unknown };
+    expect(cfg.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN, COMMENT_RULE_PLUGIN]);
+  });
+
+  it('is left out when it is not mounted or the group excludes it', () => {
+    stubPresent([GUARD_PLUGIN]);
+    expect(commentRulePlugins(splitExcludedPlugins(undefined))).toEqual([]);
+    for (const s of spies.splice(0)) s.mockRestore();
+    stubPresent([COMMENT_RULE_PLUGIN]);
+    expect(commentRulePlugins(splitExcludedPlugins(['bootstrap/plugins/comment-rule']))).toEqual([]);
+    expect(commentRulePlugins(splitExcludedPlugins(['bootstrap']))).toEqual([]);
+    expect(commentRulePlugins(splitExcludedPlugins(['bootstrap/plugins/wwbd']))).toEqual([COMMENT_RULE_PLUGIN]);
   });
 });
