@@ -2,12 +2,7 @@
  * Haiku-generated titles for Discord threads the adapter auto-creates, applied by REST PATCH (the adapter has no
  * rename helper). Fire-and-forget from the router. Durable state is the `thread_titles` table.
  */
-import {
-  AllCredentialSlotsParkedError,
-  callHaiku,
-  CredentialRotationGateHoldTimeoutError,
-  CredentialRotationGateTimeoutError,
-} from './llm.js';
+import { callHaiku } from './llm.js';
 import { log } from './log.js';
 import {
   getThreadTitleRow,
@@ -26,7 +21,7 @@ const RETRY_WINDOW_HOURS = 24;
 // One per tick: bursting alongside the other title sweeps trips per-account rate limits on healthy credentials.
 const RETRY_BATCH_CAP = 1;
 
-/** Undefined on failure: skip the rename. Rethrows when the host LLM is unavailable, which is not the title's fault. */
+/** Undefined on failure: skip the rename. */
 export async function generateTopicTitle(messageText: string): Promise<string | undefined> {
   const cleaned = messageText.replace(/@\w+\s*/g, '').trim();
   if (!cleaned) return undefined;
@@ -40,12 +35,7 @@ export async function generateTopicTitle(messageText: string): Promise<string | 
   } catch (err) {
     // Error serialization drops custom props, so surface callHaiku's stderr explicitly.
     const stderr = (err as { stderr?: string }).stderr;
-    if (err instanceof AllCredentialSlotsParkedError) {
-      log.info('Topic title deferred: every credential slot is parked', { err: err.message });
-      throw err;
-    }
     log.warn('Topic title generation failed', { err, stderr });
-    if (isHostLlmUnavailable(err)) throw err;
     return undefined;
   }
 }
@@ -91,14 +81,6 @@ function resolveDiscordBotToken(channelType: string): string | undefined {
   return process.env[envVar] || primary;
 }
 
-function isHostLlmUnavailable(err: unknown): boolean {
-  return (
-    err instanceof AllCredentialSlotsParkedError ||
-    err instanceof CredentialRotationGateTimeoutError ||
-    err instanceof CredentialRotationGateHoldTimeoutError
-  );
-}
-
 /** Shared by the live path and the retry sweep so a retry never diverges. True on a confirmed rename. */
 async function attemptThreadTitle(
   threadPlatformId: string,
@@ -125,7 +107,6 @@ async function attemptThreadTitle(
     await markThreadTitled(threadPlatformId, title);
     return true;
   } catch (err) {
-    if (isHostLlmUnavailable(err)) return false;
     log.warn('attemptThreadTitle: rename threw', { err, threadPlatformId });
     try {
       await recordThreadTitleAttemptFailure(threadPlatformId);

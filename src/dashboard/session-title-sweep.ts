@@ -171,10 +171,7 @@ async function callTitleBackendOnce(system: string, user: string, credential: St
   }
 }
 
-/**
- * The test override is one direct call raced against its own timeout. Production rotates across every configured
- * credential slot via {@link callWithCredentialRotation}, the same policy `callHaiku` uses.
- */
+/** The test override is one direct call raced against its own timeout; production goes through {@link callWithCredentialRotation}. */
 async function callTitleBackend(system: string, user: string): Promise<string> {
   if (_backendOverride !== null) {
     const controller = new AbortController();
