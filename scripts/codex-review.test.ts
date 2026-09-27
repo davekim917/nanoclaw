@@ -2691,8 +2691,8 @@ describe('codex-review risk-scoped review requests', () => {
     });
 
     it.each([
-      ['the checker is not installed', { CLAUDE_PLUGINS_ROOT: '/nonexistent', HOME: '/nonexistent' }, 'is not installed'],
-      ['the checker cannot judge the change', { MOCK_COMMENT_RULE_STATUS: '2' }, 'gave no verdict (exit 2)'],
+      ['the checker is not installed', { CLAUDE_PLUGINS_ROOT: '/nonexistent', HOME: '/nonexistent' }, 'run `git -C ~/plugins/bootstrap pull --ff-only`'],
+      ['the checker cannot judge the change', { MOCK_COMMENT_RULE_STATUS: '2' }, 'gave no verdict (exit 2); when the report says typescript was not found, run `npm ci --ignore-scripts`'],
       ['the checker crashes', { MOCK_COMMENT_RULE_STATUS: '139' }, 'gave no verdict (exit 139)'],
       ['the fetch fails', { MOCK_GIT_FETCH_STATUS: '128' }, 'could not fetch'],
     ])('fails closed when %s', (_case, env, message) => {
