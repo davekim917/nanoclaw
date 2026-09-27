@@ -178,7 +178,7 @@ function spreadEntries(sf: ts.SourceFile, expr: ts.Expression, chain: readonly s
 
 /**
  * Identifiers REFERENCED: property names and keys are labels, and strings and
- * comments contain none (a regex once classified ops by a comment's wording).
+ * comments contain none.
  */
 function referencedIdentifiers(node: ts.Node): Set<string> {
   const names = new Set<string>();

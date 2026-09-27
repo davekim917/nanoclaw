@@ -424,8 +424,7 @@ export function cancelSeriesWithStrandClear(db: Database.Database, taskId: strin
 
 /**
  * The ENTIRE prior row as `SELECT *` returned it, deliberately not a named
- * column list: a named list drops columns (`tries` and `trigger` were lost this
- * way) and goes stale when `messages_in` gains a column.
+ * column list: a named list goes stale when `messages_in` gains a column.
  */
 export interface TaskSeriesSnapshot {
   id: string;

@@ -77,8 +77,8 @@ export interface SessionReadOptions {
   busyTimeoutMs?: number;
   /**
    * Roll a hot journal back first. A rollback is a WRITE, so it is off by
-   * default. Pass it only where the replaced open was read-write (or recovered
-   * explicitly); never add it to a fleet fan-out on the theory it is harmless.
+   * default. Pass it only where the caller may perform that write; never on a
+   * read-only fleet fan-out.
    */
   recoverJournal?: boolean;
 }
