@@ -6,7 +6,6 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-/** Where ~/plugins is mounted inside agent containers (see container-runner.ts). */
 export const CONTAINER_PLUGINS_ROOT = '/workspace/plugins';
 
 type UpdateKind =
@@ -31,38 +30,19 @@ export interface AuditItem {
   detail?: string;
   tag?: string;
   commit?: string;
-  /** Pin for this dependency in `upstream/main`, when it exists there. */
   upstreamPin?: string;
-  /**
-   * The most recent `upstream/main` merge resolved this dependency KEEP-OURS —
-   * it kept our pin over a different upstream one. That is a standing decision,
-   * so a bump past it must be raised explicitly rather than applied silently.
-   */
+  /** The last upstream merge kept our pin over upstream's: a standing decision, so a bump must be raised explicitly. */
   heldByMerge?: boolean;
-  /**
-   * This dependency is one half of a client/server pair with something running
-   * locally. Names the component that must move in the SAME change. Such pairs
-   * share a wire contract no type or unit test can see, so they can only be
-   * validated by calling the running service.
-   */
+  /** The locally-running component that must move in the SAME change (a wire contract no test can see). */
   pairedWith?: string;
 }
 
-/**
- * Dependencies that are one half of a client/server pair with a locally-running
- * component. Keyed by package name; the value names what must move with it.
- *
- * Exists because a bump of @onecli-sh/sdk ^0.5.0 -> ^2.8.0 took the whole
- * fleet down for ~1h. Both majors export the same methods, only the HTTP path
- * moved (/api -> /v1), so the build and the full test suite passed on the broken
- * version — nothing but a live call could have caught it.
- */
+/** Client halves of client/server pairs with a local component; build and tests can't catch a wire break. */
 export const LOCAL_SERVICE_PAIRS: Readonly<Record<string, string>> = {
   '@onecli-sh/sdk':
     'the OneCLI gateway container — 0.5.x calls /api/*, 2.x calls /v1/*. Upgrade the gateway in the same change and verify with a real call (e.g. getGatewaySkill()), not a build.',
 };
 
-/** Per-dependency policy derived from upstream and from merge history. */
 export interface UpstreamPolicy {
   upstreamPin?: string;
   keptOurs?: boolean;
@@ -81,16 +61,7 @@ function parseDependencyPins(manifestText: string | null): Record<string, string
   }
 }
 
-/**
- * Derive per-dependency upstream policy from manifest texts. Pure on purpose —
- * the git plumbing lives in readUpstreamPolicy so this stays testable with
- * fixtures.
- *
- * `keptOurs` is the load-bearing signal: at the merge commit M, the dependency
- * resolved to OUR side (M matches M^1) while upstream's side (M^2) differed.
- * That is a deliberate hold. The breaking @onecli-sh/sdk bump landed five hours after merge
- * ceb3fcd1 had kept ^0.5.0 over upstream's 2.2.1, and nothing connected the two.
- */
+/** `keptOurs`: at merge M the dep matches M^1 while M^2 differed, i.e. a deliberate hold. */
 export function deriveUpstreamPolicy(texts: {
   upstream?: string | null;
   mergeOurs?: string | null;
@@ -107,9 +78,7 @@ export function deriveUpstreamPolicy(texts: {
   for (const name of names) {
     const entry: UpstreamPolicy = {};
     if (upstream[name]) entry.upstreamPin = upstream[name];
-    // Only claim keep-ours when all three merge sides are known for this dep and
-    // the two sides genuinely disagreed. A merge with no conflict on this line
-    // carries no decision.
+    // A merge with no disagreement on this dep carries no decision.
     const haveMergeSides = result[name] !== undefined && ours[name] !== undefined && theirs[name] !== undefined;
     if (haveMergeSides && ours[name] !== theirs[name] && result[name] === ours[name]) {
       entry.keptOurs = true;
@@ -119,15 +88,7 @@ export function deriveUpstreamPolicy(texts: {
   return policy;
 }
 
-/**
- * Host-computed snapshot of readUpstreamPolicy's output, keyed by the
- * relative manifest path it was derived for. Exists because the audit's two
- * consumers (the weekly precheck and /update-container) run INSIDE the agent
- * container against /workspace/project — a selective read-only bind-mount
- * allowlist with no `.git` — so the git derivation below has never worked
- * where it actually runs. The host checkout's git is fine; only the
- * container view of it is blind. See writeUpstreamPolicySnapshot.
- */
+/** Host-computed, because the audit's consumers run in a container whose project mount has no `.git`. */
 interface UpstreamPolicySnapshot {
   schemaVersion: number;
   generatedAt: string;
@@ -136,14 +97,14 @@ interface UpstreamPolicySnapshot {
 
 const UPSTREAM_POLICY_SCHEMA_VERSION = 1;
 const UPSTREAM_POLICY_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-/** Manifests the snapshot covers — kept in lockstep with auditRepository's audited manifests. */
+/** Must stay in lockstep with auditRepository's audited manifests. */
 const UPSTREAM_POLICY_MANIFESTS = ['package.json', 'container/agent-runner/package.json'];
 
 function upstreamPolicySnapshotPath(repoRoot: string): string {
   return process.env.NANOCLAW_UPSTREAM_POLICY || path.join(repoRoot, '.upstream-policy.json');
 }
 
-/** Load + validate the snapshot. Any problem (missing, unparseable, wrong schema, stale) yields null — fail open. */
+/** Any problem (missing, unparseable, wrong schema, stale) yields null: fail open. */
 async function loadUpstreamPolicySnapshot(repoRoot: string): Promise<UpstreamPolicySnapshot | null> {
   try {
     const text = await readFile(upstreamPolicySnapshotPath(repoRoot), 'utf8');
@@ -165,20 +126,9 @@ async function loadUpstreamPolicySnapshot(repoRoot: string): Promise<UpstreamPol
 }
 
 /**
- * Read the manifest at several revisions and derive policy via git alone —
- * no snapshot fallback. Fails OPEN: any git problem (no upstream remote,
- * shallow clone, never merged) yields an empty map. Kept separate from
- * readUpstreamPolicy so writeUpstreamPolicySnapshot never launders a stale
- * snapshot back into "fresh" output by reading its own fallback.
- *
- * Also reports whether `upstream/main` itself was reachable. That is NOT the
- * same question as "is the returned map non-empty": a plain `git clone` of
- * this repo carries the FULL commit history (including the upstream-merge
- * commit) but no `upstream` remote, so `git log --merges --grep=...` still
- * finds the merge and yields `heldByMerge` entries even though `upstream/main`
- * can't resolve — a non-empty map with every `upstreamPin` missing. Gating
- * the snapshot fallback on map emptiness alone would keep that half-signal
- * instead of the complete host-computed one.
+ * Git only, no snapshot fallback, so the snapshot writer never launders a stale snapshot as fresh. Fails open.
+ * Reports `upstream/main` reachability separately: a clone without the remote still finds the merge and returns
+ * a non-empty but half-complete map.
  */
 async function readUpstreamPolicyFromGit(
   repoRoot: string,
@@ -186,10 +136,7 @@ async function readUpstreamPolicyFromGit(
 ): Promise<{ policy: Map<string, UpstreamPolicy>; upstreamReachable: boolean }> {
   const show = async (rev: string): Promise<string | null> => {
     try {
-      // timeout: a wedged git (e.g. a held .git/index.lock from concurrent
-      // activity, which this repo sees a lot of) must not hang host boot or
-      // the /update-container interaction ack forever. Rejection lands in
-      // this catch and fails open exactly like any other git error.
+      // A wedged git (held index.lock) must not hang host boot or the /update-container ack.
       const { stdout } = await execFileAsync('git', ['show', `${rev}:${relativeManifest}`], {
         cwd: repoRoot,
         maxBuffer: 16 * 1024 * 1024,
@@ -201,7 +148,6 @@ async function readUpstreamPolicyFromGit(
     }
   };
 
-  // timeout: same wedged-git concern as `show` above.
   const mergeCommit = await execFileAsync(
     'git',
     ['log', '--merges', '-1', '--format=%H', '--grep=Merge remote-tracking branch .upstream/main'],
@@ -223,12 +169,7 @@ async function readUpstreamPolicyFromGit(
   };
 }
 
-/**
- * Read the manifest at several revisions and derive policy. Fails OPEN: any git
- * problem (no upstream remote, shallow clone, never merged) yields an empty map
- * so the audit still runs — UNLESS a fresh host-computed snapshot is available,
- * in which case that fills the gap instead of surfacing as "signal unavailable".
- */
+/** Fails open to an empty map, unless a fresh host-computed snapshot can fill the gap. */
 export async function readUpstreamPolicy(
   repoRoot: string,
   relativeManifest: string,
@@ -242,20 +183,8 @@ export async function readUpstreamPolicy(
 }
 
 /**
- * Compute the GIT-ONLY derivation for every audited manifest and write the
- * result to `outPath`. Run once at host startup (git works on the host) and
- * again before each interactive /update-container invocation, so containers
- * — which never have `.git` — read a recent answer instead of going dark.
- * Deliberately bypasses readUpstreamPolicy's snapshot fallback: if git yields
- * nothing this round, the snapshot must say so (empty map, honest
- * provenance), never re-stamp a prior snapshot's data as newly generated.
- *
- * Writes with fs.writeFile (truncate in place), NOT write-to-temp-then-rename:
- * outPath is bind-mounted read-only into already-running containers, and a
- * rename swaps the inode backing the mount, so a container that already has
- * the file open (or whose bind mount resolved the old inode) would keep
- * seeing stale content indefinitely. Truncating in place mutates the same
- * inode the mount points at.
+ * Git-only, so an empty result is recorded honestly rather than re-stamping an older snapshot. Truncates in place,
+ * never temp-then-rename: `outPath` is bind-mounted into running containers, which would keep the old inode.
  */
 export async function writeUpstreamPolicySnapshot(repoRoot: string, outPath: string): Promise<void> {
   const manifests: Record<string, Record<string, UpstreamPolicy>> = {};
@@ -271,15 +200,9 @@ export async function writeUpstreamPolicySnapshot(repoRoot: string, outPath: str
   await writeFile(outPath, `${JSON.stringify(snapshot, null, 2)}\n`);
 }
 
-/**
- * Cheap provenance check for what readUpstreamPolicy would answer with, for
- * reporting in the audit envelope — never re-runs the heavy git derivation.
- */
 export async function describeUpstreamPolicy(
   repoRoot: string,
 ): Promise<{ source: 'git' | 'snapshot' | 'unavailable'; generatedAt: string | null }> {
-  // timeout: same wedged-git concern as readUpstreamPolicyFromGit — this runs
-  // on the interactive /update-container path and must not stall the ack.
   const gitReady = await execFileAsync('git', ['rev-parse', '--verify', 'upstream/main'], {
     cwd: repoRoot,
     timeout: 10_000,
@@ -322,17 +245,11 @@ interface DockerUpdateSource {
 interface PluginUpdateSource {
   id: string;
   name: string;
-  /** Plugin dir relative to the plugins root, e.g. `knowledge-work-plugins/data`. */
   dir: string;
   repo: string;
-  /** Path to that plugin's manifest inside the upstream repo. */
   manifestPath: string;
-  /**
-   * Manifest dir inside the local clone. Claude plugins use `.claude-plugin`;
-   * Codex-native plugins (openai/role-specific-plugins) use `.codex-plugin`.
-   */
+  /** `.claude-plugin`, or `.codex-plugin` for Codex-native plugins. */
   manifestDir?: string;
-  /** Upstream branch to compare against (default `main`). */
   ref?: string;
 }
 
@@ -523,7 +440,7 @@ function readArg(dockerfile: string, name: string): string | null {
   return match?.[1] ?? null;
 }
 
-/** id prefix per dependency manifest — every manifest the audit scans needs one. */
+/** Every manifest the audit scans needs one. */
 const DEPENDENCY_ID_PREFIX: Record<'host-dependency' | 'bun-dependency' | 'remotion-dependency', string> = {
   'host-dependency': 'host',
   'bun-dependency': 'bun',
@@ -649,15 +566,7 @@ async function auditCodexSources(manifest: UpdateSourcesManifest, fetchJson: Jso
   );
 }
 
-/**
- * Plugin clones under `~/plugins` are versioned by their `.claude-plugin/plugin.json`
- * `version` field, not by a package registry — so compare the local clone against the
- * same manifest upstream. A bump means `git pull` in the clone.
- *
- * Deliberately per-plugin rather than repo-HEAD: marketplace monorepos
- * (anthropics/knowledge-work-plugins) carry many unrelated plugins, and a commit
- * touching a sibling plugin is not an update to ours.
- */
+/** Per-plugin manifest version, not repo HEAD: a monorepo commit to a sibling plugin is not an update to ours. */
 async function auditPluginVersions(manifest: UpdateSourcesManifest, fetchJson: JsonFetcher): Promise<AuditItem[]> {
   if (!manifest.plugins?.length) return [];
   return Promise.all(
@@ -669,7 +578,6 @@ async function auditPluginVersions(manifest: UpdateSourcesManifest, fetchJson: J
         surface: 'plugins' as const,
         source: 'github' as const,
       };
-      // Container mount first, then the host clone location.
       const localManifest = await firstReadable(
         [CONTAINER_PLUGINS_ROOT, path.join(homedir(), 'plugins')].map((root) =>
           path.join(root, entry.dir, entry.manifestDir ?? '.claude-plugin', 'plugin.json'),
@@ -716,10 +624,7 @@ export async function auditRepository(
   const [host, bun, remotion, sourceText, dockerfile] = await Promise.all([
     auditDependencies(repoRoot, 'package.json', 'host-dependency', 'host', fetchJson),
     auditDependencies(repoRoot, 'container/agent-runner/package.json', 'bun-dependency', 'container', fetchJson),
-    // Remotion video runtime baked at /opt/remotion. A third dependency
-    // manifest that the audit would otherwise never see — an unaudited
-    // manifest rots silently, which is the whole failure this tool exists to
-    // prevent.
+    // Remotion runtime at /opt/remotion: an unaudited manifest rots silently.
     auditDependencies(repoRoot, 'container/remotion/package.json', 'remotion-dependency', 'container', fetchJson),
     readFile(path.join(repoRoot, 'container/update-sources.json'), 'utf8'),
     readFile(path.join(repoRoot, 'container/Dockerfile'), 'utf8'),
@@ -771,10 +676,7 @@ export function renderAuditMarkdown(items: AuditItem[]): string {
   lines.push('', `${actionable.length} outdated; ${blocked.length} blocked or unknown.`);
   for (const item of blocked) lines.push(`- ${item.id}: ${item.detail ?? item.status}`);
 
-  // Constraints that must be READ, not inferred. These exist because an SDK bump passed
-  // every gate — build green, tests green, identical method names — and still
-  // took the fleet down. Surface them next to the versions so an approval can't
-  // be given without seeing them.
+  // Surfaced next to the versions so an approval can't be given without seeing them.
   const held = actionable.filter((item) => item.heldByMerge);
   if (held.length > 0) {
     lines.push('', '**HELD by the last upstream merge — do not bump without raising it explicitly:**');
@@ -915,10 +817,7 @@ export async function applySelectedUpdates(options: {
   if (remotion.length > 0) {
     const remotionRoot = path.join(repoRoot, 'container/remotion');
     await updatePackageJson(path.join(remotionRoot, 'package.json'), remotion);
-    // --ignore-workspace is REQUIRED: the repo root's pnpm-workspace.yaml
-    // otherwise makes pnpm resolve against the host workspace and refuse to
-    // write a nested lockfile, leaving package.json bumped against a stale
-    // lock and the Dockerfile's --frozen-lockfile install failing at build.
+    // --ignore-workspace is required: otherwise pnpm won't write the nested lockfile and the frozen install fails.
     await run(['pnpm', 'install', '--lockfile-only', '--ignore-workspace'], remotionRoot);
   }
   if (docker.length > 0) {

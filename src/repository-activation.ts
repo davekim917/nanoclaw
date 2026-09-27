@@ -1,20 +1,7 @@
 /**
- * Adopt an existing workgroup-shared repository checkout as the host canonical.
- *
- * The corrected topology (one canonical clone per workgroup/repository, one
- * linked worktree per topic) is already implemented in repository-workspaces.ts
- * and mounted by container-runner.ts. What is missing on an install that grew
- * up on the shared filesystem is the canonical itself: the real clones still
- * live under `data/workgroups/<wg>/<repo>`, agent-writable, one duplicate full
- * clone per work item.
- *
- * This module moves such a clone into `data/repositories/<wg>/<repo>` and pins
- * its origin. It deliberately MOVES rather than re-clones: local-only commits,
- * unpushed branches, and tags exist nowhere else, and a fresh clone from the
- * remote would silently drop them.
- *
- * A canonical must be clean, so any dirty or untracked working state is copied
- * aside first — never discarded — and reported by path.
+ * Adopt a legacy workgroup-shared checkout as the host canonical (`data/repositories/<wg>/<repo>`). MOVES rather
+ * than re-clones: local-only commits, unpushed branches and tags exist nowhere else. Dirty state is copied aside
+ * first, never discarded.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -36,14 +23,11 @@ import {
 export interface LegacyCheckout {
   repo: string;
   path: string;
-  /** A linked worktree is owned by another checkout and is never a canonical. */
   linked: boolean;
   origin: string | null;
   head: string;
   detached: boolean;
-  /** Commits reachable from a local ref but from no remote-tracking ref. */
   localOnlyCommits: number;
-  /** Local branch tips contained in no remote-tracking branch. */
   unpushedBranches: number;
   dirtyPaths: string[];
   reusable: boolean;
@@ -87,13 +71,7 @@ function tryGit(cwd: string, args: string[], timeout = 120_000): string | null {
   }
 }
 
-/**
- * Collect paths from a NUL-separated plumbing command.
- *
- * Porcelain status is deliberately avoided here: its two-column prefix makes a
- * leading space significant, so any trimming corrupts the first path, and
- * unusual filenames get quoted. `-z` plumbing emits raw paths verbatim.
- */
+/** `-z` plumbing, not porcelain: porcelain quotes odd names and trimming corrupts its first path. */
 function gitPaths(cwd: string, args: string[], timeout = 300_000): string[] {
   let raw: string;
   try {
@@ -109,14 +87,7 @@ function gitPaths(cwd: string, args: string[], timeout = 300_000): string[] {
   return raw.split('\0').filter(Boolean);
 }
 
-/**
- * Name any half-finished Git operation holding state in `.git` rather than in
- * the working tree.
- *
- * `git reset --hard` silently discards all of it — conflict resolutions, the
- * remaining pick list of a rebase, a cherry-pick in flight — and none of it is
- * covered by the working-tree preservation pass. Adoption refuses instead.
- */
+/** State in `.git` that `reset --hard` would silently discard and preservation doesn't cover; adoption refuses. */
 function inProgressOperation(cwd: string): string | null {
   const gitDir = tryGit(cwd, ['rev-parse', '--absolute-git-dir'], 30_000);
   if (!gitDir) return null;
@@ -137,22 +108,14 @@ function inProgressOperation(cwd: string): string | null {
 }
 
 /**
- * Resolve `origin/HEAD` locally, without network and without assuming `main`.
- *
- * A checkout made by `git init` + `git remote add` never gets an origin/HEAD,
- * and both create_worktree and refreshCanonicalFromLocalRefs hard-require it —
- * so a canonical adopted without one mounts fine but can never seed a fresh
- * topic worktree or report canonical freshness. Only unambiguous evidence
- * already in the repository is used: the configured upstream of the current
- * branch, or a sole remote-tracking branch. Anything ambiguous is left unset
- * for an operator to resolve deliberately.
+ * Resolve `origin/HEAD` locally, never assuming `main`; topic worktrees and freshness require it. Only unambiguous
+ * evidence is used (the branch's upstream, or a sole remote-tracking branch); anything else is left unset.
  */
 function resolveOriginHead(cwd: string): string | null {
   const resolves = (ref: string): boolean =>
     tryGit(cwd, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], 30_000) !== null;
 
-  // An existing origin/HEAD can dangle — `git update-ref -d refs/remotes/origin/HEAD`
-  // deletes the branch it points at, not the symref — so verify before trusting it.
+  // An existing origin/HEAD can dangle, so verify before trusting it.
   const existing = tryGit(cwd, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 30_000);
   if (existing?.startsWith('refs/remotes/origin/') && resolves(existing)) return existing;
 
@@ -170,14 +133,8 @@ function resolveOriginHead(cwd: string): string | null {
 }
 
 /**
- * Paths whose index entry carries `--assume-unchanged` or `--skip-worktree`.
- *
- * `git diff` deliberately trusts the cached stat for these and reports nothing
- * even when the file on disk differs, while `git reset --hard` consults neither
- * bit and overwrites anyway. Verified: with `assume-unchanged` set, the whole
- * dirty union comes back empty and a local edit is destroyed. They are folded
- * into the preservation set unconditionally — copying a handful of possibly
- * unmodified files is a trivial cost against silently losing an edit.
+ * `--assume-unchanged`/`--skip-worktree` paths: `git diff` hides their edits but `reset --hard` overwrites them,
+ * so they are always preserved.
  */
 function untrackedByStatPaths(cwd: string): string[] {
   return gitPaths(cwd, ['ls-files', '-v', '-z'], 300_000)
@@ -185,7 +142,6 @@ function untrackedByStatPaths(cwd: string): string[] {
     .map((entry) => entry.slice(2));
 }
 
-/** Every worktree path carrying state that a fresh clone would not reproduce. */
 function dirtyWorktreePaths(cwd: string): string[] {
   return [
     ...new Set([
@@ -202,10 +158,7 @@ export function workgroupLegacyRoot(workgroupId: string, dataDir: string = DATA_
   return path.join(path.resolve(dataDir), 'workgroups', workgroupId);
 }
 
-/**
- * Normalize a remote URL to the exact shape `writeOriginPin` accepts: HTTPS
- * github.com, no credentials, no `.git` suffix, no trailing slash.
- */
+/** The exact shape `writeOriginPin` accepts: HTTPS github.com, no credentials, no `.git`, no trailing slash. */
 export function normalizeGitHubOrigin(origin: string): string | null {
   let candidate = origin.trim();
   if (!candidate) return null;
@@ -270,12 +223,7 @@ function classify(repo: string, checkoutPath: string): LegacyCheckout {
   return { ...detail, reusable: true };
 }
 
-/**
- * Choose one canonical per repository identity. Duplicate clones of the same
- * origin are the exact disease this replaces, so only the checkout whose
- * directory name matches the remote repository name is adopted; the rest are
- * disposable and recreated as topic worktrees on demand.
- */
+/** One canonical per origin; duplicate clones are skipped and recreated as topic worktrees on demand. */
 export function planRepositoryActivation(workgroupId: string, dataDir: string = DATA_DIR): RepositoryActivationPlan {
   const legacyRoot = workgroupLegacyRoot(workgroupId, dataDir);
   const plan: RepositoryActivationPlan = {
@@ -315,8 +263,7 @@ export function planRepositoryActivation(workgroupId: string, dataDir: string = 
 
   for (const [origin, bucket] of byOrigin) {
     const remoteName = origin.split('/').at(-1) ?? '';
-    // Prefer the checkout named exactly after the remote; otherwise the one
-    // carrying the most irreplaceable state, then the longest history.
+    // Named after the remote, else the most irreplaceable state.
     const chosen =
       bucket.find((candidate) => candidate.repo === remoteName) ??
       [...bucket].sort(
@@ -352,16 +299,9 @@ function fsyncDir(target: string): void {
   }
 }
 
-/**
- * Copy dirty and untracked files out of a checkout before it becomes a clean
- * canonical. Paths are reproduced verbatim so the snapshot can be replayed with
- * a plain copy back into whichever topic worktree wants them.
- */
 function preserveDirtyState(checkout: LegacyCheckout, destination: string): number {
   let copied = 0;
-  // A tracked-but-deleted path has no bytes to copy, yet `reset --hard` will
-  // resurrect the file and the deletion is a real change. Record it so the
-  // manifest, not the operator's memory, is the account of what was reverted.
+  // A deletion has no bytes to copy but `reset --hard` resurrects it, so the manifest records it.
   const reverted: string[] = [];
   for (const relative of checkout.dirtyPaths) {
     const source = path.join(checkout.path, relative);
@@ -398,8 +338,6 @@ function preserveDirtyState(checkout: LegacyCheckout, destination: string): numb
         head: checkout.head,
         detached: checkout.detached,
         copied: checkout.dirtyPaths.filter((entry) => !reverted.includes(entry)),
-        // Restored by `reset --hard`; listed here because the deletion itself
-        // was a change and nothing else records it.
         revertedDeletions: reverted,
       },
       null,
@@ -410,13 +348,7 @@ function preserveDirtyState(checkout: LegacyCheckout, destination: string): numb
   return copied;
 }
 
-/**
- * Adopt one legacy checkout as the workgroup canonical.
- *
- * The caller owns quiescence: every container in the workgroup must already be
- * stopped and fenced, because this moves a directory out from under the
- * `/workspace/workgroup` bind mount.
- */
+/** The caller owns quiescence: every workgroup container must be stopped and fenced (this moves a mounted dir). */
 export async function activateCanonicalRepository(input: {
   workgroupId: string;
   checkout: LegacyCheckout;
@@ -439,10 +371,7 @@ export async function activateCanonicalRepository(input: {
         throw new Error(`origin pin conflict for ${workgroupId}/${checkout.repo}`);
       }
       if (fs.existsSync(canonical)) {
-        // A crash between the rename and this function returning leaves the
-        // move already done. Replaying must recognize its own completed work
-        // instead of reporting a conflict during an incident — but only when
-        // the canonical really is this repository and the source is gone.
+        // A replay after a crash post-rename recognizes its own completed move, but only when provably so.
         const sameOrigin = normalizeGitHubOrigin(
           tryGit(canonical, ['config', '--get', 'remote.origin.url'], 30_000) ?? '',
         );
@@ -461,7 +390,6 @@ export async function activateCanonicalRepository(input: {
         throw new Error(`canonical already exists and was left untouched: ${canonical}`);
       }
 
-      // 1. Preserve irreplaceable working state before anything is reset.
       let preservedStatePath: string | null = null;
       let preservedFileCount = 0;
       if (checkout.dirtyPaths.length > 0) {
@@ -477,9 +405,7 @@ export async function activateCanonicalRepository(input: {
         fsyncDir(preservedStatePath);
       }
 
-      // 2. Drop worktree records that point at container-absolute gitdirs. They
-      //    are unreadable from the host and would keep branches reserved
-      //    against the topic worktrees that replace them.
+      // Container-absolute worktree records would keep branches reserved against the new topic worktrees.
       const before = (tryGit(checkout.path, ['worktree', 'list', '--porcelain'], 60_000) ?? '')
         .split('\n')
         .filter((line) => line.startsWith('worktree ')).length;
@@ -488,9 +414,6 @@ export async function activateCanonicalRepository(input: {
         .split('\n')
         .filter((line) => line.startsWith('worktree ')).length;
 
-      // 3. Detach at the fetched remote default. origin/HEAD is authoritative;
-      //    `main` is never assumed. Local branches are left untouched so a
-      //    topic worktree can still check them out.
       const remoteHead = resolveOriginHead(checkout.path);
       if (!remoteHead) {
         log.warn('Canonical has no resolvable origin/HEAD; fresh topic worktrees will refuse', {
@@ -498,32 +421,17 @@ export async function activateCanonicalRepository(input: {
           repo: checkout.repo,
         });
       }
-      // Always detach onto a resolved object id. A full ref path is ambiguous
-      // with a pathspec and `checkout --detach refs/remotes/origin/x` is
-      // rejected outright when the ref does not also resolve as a rev.
+      // Detach onto an object id: a full ref path is ambiguous with a pathspec.
       const target = git(checkout.path, ['rev-parse', '--verify', `${remoteHead ?? 'HEAD'}^{commit}`], 30_000);
       if (checkout.dirtyPaths.length > 0) {
-        // Preserved above; the canonical must present a clean tree.
-        //
-        // Deliberately no `-x`. Ignored files are not migration inputs, but
-        // they are also not all regenerable — a gitignored `.env` or
-        // profiles.yml exists nowhere else and is not covered by the
-        // preservation pass, which only walks non-ignored dirty paths. Leaving
-        // them in place moves them with the repository and still leaves a
-        // clean `git status`. Single `-f` likewise protects nested Git
-        // directories from being removed wholesale.
+        // No `-x`: an ignored `.env` exists nowhere else and isn't preserved. Single `-f` spares nested repos.
         git(checkout.path, ['reset', '--hard', '--quiet'], 300_000);
         git(checkout.path, ['clean', '-qfd'], 300_000);
       }
       git(checkout.path, ['checkout', '-q', '--detach', target], 300_000);
       const detachedAt = git(checkout.path, ['rev-parse', 'HEAD'], 30_000);
 
-      // The detach target can carry different ignore rules than the branch that
-      // was checked out, which can leave previously-ignored files visible. That
-      // does not endanger any data, but it does block
-      // refreshCanonicalFromLocalRefs, so it
-      // is reported rather than silently accepted. Throwing here would be worse
-      // than reporting: the state is already preserved and the move is next.
+      // Different ignore rules at the target can leave files visible; reported, not thrown, since it blocks refresh.
       const residue = dirtyWorktreePaths(checkout.path);
       if (residue.length > 0) {
         log.warn('Canonical is not clean after detaching; canonical refresh will refuse until resolved', {
@@ -534,13 +442,11 @@ export async function activateCanonicalRepository(input: {
         });
       }
 
-      // 4. Automatic GC must never run while linked worktrees hold refs.
+      // Automatic GC must never run while linked worktrees hold refs.
       git(checkout.path, ['config', 'gc.auto', '0'], 30_000);
       git(checkout.path, ['config', 'gc.worktreePruneExpire', 'never'], 30_000);
 
-      // 5. Publish. Pin first: a crash between pin and rename leaves a pin with
-      //    no canonical, which the next run reconciles, whereas a canonical
-      //    with no pin refuses every spawn in the workgroup.
+      // Pin first: a pin without a canonical reconciles; a canonical without a pin refuses every spawn.
       writeOriginPin(workgroupId, checkout.repo, { origin, repositoryId: origin }, dataDir);
       fs.mkdirSync(path.dirname(canonical), { recursive: true, mode: 0o700 });
       fs.renameSync(checkout.path, canonical);
@@ -572,7 +478,6 @@ export async function activateCanonicalRepository(input: {
   );
 }
 
-/** Reverse one adoption: move the canonical back and drop its pin. */
 export async function rollbackCanonicalRepository(input: {
   workgroupId: string;
   repo: string;

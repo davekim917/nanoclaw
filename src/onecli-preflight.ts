@@ -1,40 +1,9 @@
 /**
- * Boot preflight for the OneCLI control API.
- *
- * Every container spawn calls `onecli.applyContainerConfig` and refuses to
- * launch when it comes back false ("OneCLI gateway not applied — refusing to
- * spawn container without credentials", `src/container-runner.ts`). That check
- * is correct and stays. What it cannot do is tell an operator that the whole
- * fleet is deaf: the refusal is per spawn, logged at WARN by the sweep's
- * retry path, so a host whose control API is unreachable boots looking clean —
- * adapters up, zero ERROR lines — and simply never spawns anything.
- *
- * That is exactly what happened on 2026-09-02 (11 minutes, 0/8 spawns). The
- * host had been moved to Node 22.23, which honors `NODE_USE_ENV_PROXY=1`
- * where Node 20 ignored it, so the host's own `fetch()` to the OneCLI control
- * API on 127.0.0.1 was routed through the OneCLI gateway proxy and failed.
- * Nothing in the boot sequence noticed.
- *
- * This module closes that gap by making the same call once, at boot, before
- * the sweep and the delivery polls start accepting work:
- *
- *   - `getContainerConfig({ agent })` is the exact request
- *     `applyContainerConfig` issues; the SDK's apply is that fetch plus the
- *     `-e`/`-v` argument pushes and the CA-file writes. Probing the read half
- *     is therefore a true dry run, using the same client, the same URL, and
- *     the same `fetch()` under the same process environment — which is the
- *     part that broke.
- *   - Failure logs ERROR and exits non-zero, so systemd's `OnFailure=`
- *     unit alert and `deploy-crash-guard` fire. The exit happens before
- *     `markDeployBootHealthy()`, so a bad deploy stays rollback-eligible.
- *   - Success logs one INFO line, `OneCLI preflight ok`, carrying the probed
- *     agent identifier and the round-trip latency. A post-restart gate can
- *     grep for it instead of inferring health from "adapters started".
- *
- * Deliberately NOT covered: the intermittent per-spawn refusal rate seen on
- * healthy hosts. A single boot probe cannot speak to that, and the per-spawn
- * check is still the thing that keeps an uncredentialed container from
- * launching.
+ * Boot preflight for the OneCLI control API. The per-spawn credential check refuses at WARN, so a host whose
+ * control API is unreachable boots looking clean and never spawns anything; this makes the same request once
+ * (`getContainerConfig`, the read half of `applyContainerConfig`, same client and process env) before work is
+ * accepted. Failure exits non-zero before `markDeployBootHealthy()`, so a bad deploy stays rollback-eligible.
+ * Success logs `OneCLI preflight ok`, which post-restart gates grep for.
  */
 import { OneCLI } from '@onecli-sh/sdk';
 
@@ -42,21 +11,9 @@ import { ONECLI_API_KEY, ONECLI_URL } from './config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { log } from './log.js';
 
-/**
- * Attempts before the boot is failed. The transport failures worth riding out
- * are a gateway container that is still coming up after a host reboot; three
- * tries two seconds apart covers that without turning a genuinely broken
- * control API into a slow boot.
- */
 const PREFLIGHT_ATTEMPTS = 3;
 const PREFLIGHT_RETRY_DELAY_MS = 2_000;
 
-/**
- * Shorter than the spawn path's 30s. That timeout exists because spawns run
- * while the host may be hammering the gateway with container reaps; a boot
- * probe competes with nothing, and a control API that needs more than ten
- * seconds to answer one GET is not healthy.
- */
 const PREFLIGHT_TIMEOUT_MS = 10_000;
 
 export type PreflightResult =
@@ -66,11 +23,9 @@ export type PreflightResult =
   | { status: 'failed'; agent: string | null; attempts: number; httpStatus?: number; err: unknown };
 
 export interface PreflightDeps {
-  /** The dry-run call. Mirrors `OneCLI#getContainerConfig`. */
   getContainerConfig: (options: { agent?: string }) => Promise<unknown>;
-  /** Identifier to probe with, or null to probe the default agent. */
+  /** Null probes the default agent. */
   probeAgent: () => Promise<string | null>;
-  /** Whether this install is wired to a OneCLI gateway at all. */
   onecliConfigured: () => boolean;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -91,17 +46,7 @@ const realDeps: PreflightDeps = {
   exit: (code) => process.exit(code),
 };
 
-/**
- * Pick the agent identifier to probe with: the oldest agent group.
- *
- * The spawn path uses `agentGroup.id` as the OneCLI agent identifier, so any
- * group id is a representative probe. Oldest wins because it is deterministic
- * across restarts and is the group most likely to already exist in the vault
- * (`ensureOnecliAgent` creates the vault agent on first spawn, so a group that
- * has never spawned has no vault agent yet — see the 404 handling below).
- *
- * Pure, exported for tests.
- */
+/** Oldest group: deterministic, and most likely to already have a vault agent (created on first spawn). */
 export function pickProbeAgent(groups: Array<{ id: string; created_at: string }>): string | null {
   let oldest: { id: string; created_at: string } | undefined;
   for (const group of groups) {
@@ -117,33 +62,18 @@ export function pickProbeAgent(groups: Array<{ id: string; created_at: string }>
   return oldest?.id ?? null;
 }
 
-/**
- * HTTP status carried by `OneCLIRequestError`, when the failure had one.
- *
- * Exported because the spawn path classifies the same errors from the same
- * SDK client (`src/onecli-apply.ts`). One classifier, one place to correct it.
- */
 export function httpStatusOf(err: unknown): number | undefined {
   const status = (err as { statusCode?: unknown } | null | undefined)?.statusCode;
   return typeof status === 'number' ? status : undefined;
 }
 
 /**
- * 4xx statuses that describe a moment rather than a misconfiguration:
- * 408 Request Timeout, 425 Too Early, 429 Too Many Requests. A cloud gateway
- * rate-limiting one boot probe must not take the host down — these ride the
- * same retry path as a transport failure. Every other 4xx (400/401/403/404 and
- * friends) is a credential or wiring fault that no amount of retrying fixes.
- *
- * `Retry-After` is deliberately not honored: the SDK's `OneCLIRequestError`
- * carries only `url` and `statusCode`, and reading the header would mean
- * bypassing `getContainerConfig` — the very call this probe exists to make.
+ * 4xx statuses describing a moment, not a misconfiguration; every other 4xx is a fault retrying can't fix.
+ * `Retry-After` is ignored on purpose: the SDK error carries no headers, and reading them would mean bypassing
+ * `getContainerConfig`, the very call this probe exists to make.
  */
 const RETRYABLE_4XX: ReadonlySet<number> = new Set([408, 425, 429]);
 
-/**
- * Shared with the spawn path (`src/onecli-apply.ts`) — see `httpStatusOf`.
- */
 export function isRetryableStatus(status: number | undefined): boolean {
   if (status === undefined) return true; // transport failure — no response at all
   if (status >= 500) return true;
@@ -151,20 +81,8 @@ export function isRetryableStatus(status: number | undefined): boolean {
 }
 
 /**
- * Run the probe. Pure of logging and exiting so tests can assert the decision
- * separately from its consequences.
- *
- * Retry policy follows what the failure can mean:
- *   - No HTTP status (DNS, connection refused, proxy interception, timeout),
- *     a 5xx, or a momentary 4xx (408/425/429 — see RETRYABLE_4XX): the gateway
- *     may still be coming up or be briefly rate-limiting. Retry.
- *   - Any other 4xx: a deterministic misconfiguration (bad API key, unknown
- *     agent). Retrying cannot heal it, so fail immediately.
- *   - The one exception is a 404 for a NAMED agent, which means the vault has
- *     no such agent yet rather than that the control API is unreachable. Verified
- *     against a live gateway: an unknown `?agent=` returns 404 while the same
- *     endpoint with no agent returns 200. Re-probe the default agent to tell
- *     the two apart, and treat a reachable control API as a pass.
+ * A 404 for a named agent means the vault has no such agent yet (an unknown `?agent=` 404s while the agentless
+ * call returns 200), so the default agent is re-probed and a reachable control API passes.
  */
 export async function probeOnecliControlApi(deps: PreflightDeps): Promise<PreflightResult> {
   if (!deps.onecliConfigured()) {
@@ -210,13 +128,6 @@ export async function probeOnecliControlApi(deps: PreflightDeps): Promise<Prefli
   return { status: 'failed', agent, attempts: attemptsUsed, httpStatus: lastHttpStatus, err: lastErr };
 }
 
-/**
- * Boot gate. Probes the control API, emits the health signal, and exits the
- * process when the spawn path's credential call cannot succeed.
- *
- * Returns the result (rather than only exiting) so callers and tests can see
- * what was decided; in production the failure branch never returns.
- */
 export async function runOnecliBootPreflight(overrides: Partial<PreflightDeps> = {}): Promise<PreflightResult> {
   const deps: PreflightDeps = { ...realDeps, ...overrides };
   const result = await probeOnecliControlApi(deps);
@@ -235,8 +146,6 @@ export async function runOnecliBootPreflight(overrides: Partial<PreflightDeps> =
       return result;
 
     case 'ok-agent-unregistered':
-      // The control API answered; only the probe agent is missing from the
-      // vault, which the next spawn of that group fixes via ensureOnecliAgent.
       log.warn('OneCLI preflight probe agent is not registered in the vault yet', { agent: result.agent });
       log.info('OneCLI preflight ok', {
         agent: null,

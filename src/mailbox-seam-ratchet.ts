@@ -1,19 +1,7 @@
 /**
- * Raw session-DB access scanner for the mailbox-seam ratchet test
- * (src/mailbox-seam-ratchet.test.ts, docs/specs/upstream-mailbox-seam/plan.md §4.6.2).
- *
- * Finds every non-test .ts file under the two source trees, outside the mailbox
- * modules, that still touches session-DB internals directly: raw session-db
- * imports, raw opener imports, a `new Database(...)` call on an inbound/outbound
- * path, or a variable/parameter named like a passed-in session handle. The set
- * this reports must be a SUBSET of the committed RATCHET.json (the allowlist
- * only shrinks, one caller batch at a time, across PRs 2-7/R1-R3).
- *
- * Heuristic, not a parser — over-counts are acceptable (the brief allows it);
- * false negatives are not, so keep the patterns broad.
- *
- * Lives under src/ (not scripts/) so src/mailbox-seam-ratchet.test.ts can import
- * it — the host tsconfig's rootDir is src/.
+ * Raw session-DB access scanner for the mailbox-seam ratchet test; what it reports must be a subset of
+ * RATCHET.json. Heuristic: over-counts are acceptable, false negatives are not, so keep the patterns broad.
+ * Lives under src/ because the host tsconfig's rootDir is src/.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,7 +11,6 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 
 export const RATCHET_SCAN_ROOTS: readonly string[] = ['src', 'container/agent-runner/src'];
 
-/** Directories exempt from the scan — the mailbox driver and its fork module. */
 const RATCHET_EXCLUDED_DIRS: readonly string[] = [
   'src/mailbox/sqlite',
   'src/modules/mailbox',
@@ -32,26 +19,8 @@ const RATCHET_EXCLUDED_DIRS: readonly string[] = [
 ];
 
 /**
- * Files exempt from the scan by exact path.
- *
- *  - src/mailbox-seam-ratchet.ts (this module): names pattern (d)'s handle
- *    identifiers as string literals to search for them, which otherwise
- *    self-matches once this file lives under src/ (rootDir requires that —
- *    see the module doc comment above).
- *  - src/mailbox-seam-manifest.ts (sibling module): UPSTREAM_FILES /
- *    DEFERRED_UPSTREAM_FILES legitimately list upstream path strings like
- *    'src/mailbox/sqlite/session-db.ts' and 'session-db.test.ts' — pattern
- *    (a)'s whole-file 'session-db' substring check (round 5) otherwise
- *    self-matches on those string literals.
- *  - src/dashboard-pusher.ts: NOT present in the base tree — it only exists
- *    after a user runs the separate /add-dashboard skill, which copies
- *    .claude/skills/add-dashboard/resources/dashboard-pusher.ts here
- *    verbatim. That resource does raw session-DB reads for the dashboard's
- *    own message-volume charts; migrating it onto NanoclawAgentMailbox isn't
- *    buildable here. Tracked as a real, deliberate exclusion, not an oversight: this
- *    ratchet covers the mailbox-seam migration's own surface, not every
- *    skill-installed resource with its own install lifecycle and test file
- *    (dashboard-pusher.test.ts, alongside it in the skill resources dir).
+ * This module and the manifest self-match on string literals naming the patterns. dashboard-pusher.ts exists only
+ * after /add-dashboard installs it, with its own lifecycle; its exclusion is deliberate.
  */
 const RATCHET_EXCLUDED_FILES: readonly string[] = [
   'src/mailbox-seam-ratchet.ts',
@@ -69,11 +38,7 @@ const RAW_OPENER_NAMES = [
   'outboundDbPath',
   'getInboundDb',
   'getOutboundDb',
-  // The mailbox module's two transitional handle accessors, now deleted;
-  // and these entries stay as the tripwire: a caller that moves onto
-  // withMailboxSession but then hands the open handle to a helper has not
-  // finished migrating, and reintroducing an accessor under either name would
-  // make that file an offender again rather than let it pass clean.
+  // Deleted accessors kept as a tripwire against reintroduction.
   'legacyInboundHandle',
   'legacyOutboundHandle',
 ];
@@ -110,21 +75,13 @@ function listTsFiles(root: string): string[] {
   return out;
 }
 
-/** Naive comment strip — good enough for an allowlist scan, not a compiler. */
 function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
 /**
- * The same strip, but LENGTH-PRESERVING: every comment character becomes a
- * space and every newline survives, so an offset into the result is an offset
- * into the original.
- *
- * `stripComments` deletes, which shifts every offset after the first comment —
- * fine for the boolean pattern checks that consume it, wrong for any rule that
- * reports a line number. The two exist side by side rather than merged because
- * deleting also JOINS the text either side of a comment, and patterns (a)-(d)
- * were reviewed against that behaviour.
+ * Length-preserving strip, for rules that report line numbers. Not merged with `stripComments`: patterns (a)-(d)
+ * depend on its deletion joining the text either side of a removed comment.
  */
 function blankComments(src: string): string {
   const blank = (match: string): string => match.replace(/[^\n]/g, ' ');
@@ -134,35 +91,17 @@ function blankComments(src: string): string {
 }
 
 function matchesPatternA(src: string): boolean {
-  // (a) the literal 'session-db' appears anywhere in the file (comments already
-  // stripped). Broadened from "an import from a path ending in session-db.js":
-  // a static-import-shaped regex misses a dynamic
-  // `await import('.../session-db.js')`, a destructured re-export, or an alias
-  // — a whole-file substring check covers all of those in one rule, so there is
-  // no import-shape evasion of this class left to find.
+  // Whole-file substring, not an import regex, so dynamic imports and re-export aliases can't evade it.
   return src.includes('session-db');
 }
 
 function matchesPatternB(src: string): boolean {
-  // (b) any raw opener/path-helper name appears anywhere in the file as a whole
-  // word (comments already stripped). Broadened from "an import of any raw
-  // opener/path helper name" (same reasoning as (a)):
-  // covers static imports, dynamic import() with destructuring, and re-export
-  // aliases in one rule.
   const re = new RegExp(`\\b(?:${RAW_OPENER_NAMES.join('|')})\\b`);
   return re.test(src);
 }
 
 function matchesPatternC(src: string): boolean {
-  // (c) `new Database(` where either (c1) the constructor argument expression
-  // itself names an inbound/outbound path — `new Database(inboundDbPath, ...)`,
-  // `new Database(outboundPath, ...)` — regardless of where that variable was
-  // built, or (c2) the inbound.db/outbound.db literal appears ANYWHERE in the
-  // same file as a `new Database(` call — not just a 3-line window. A caller
-  // can filter/validate a generically-named path variable (e.g. `filePath`)
-  // against the literal in one function and open it with `new Database(...)`
-  // in a completely different one; a same-file check still catches that
-  // without tracking dataflow across functions.
+  // Same-file literal check, since a generically-named path can be validated in one function and opened in another.
   if (!/new\s+Database\s*\(/.test(src)) return false;
   const lines = src.split('\n');
   for (const line of lines) {
@@ -173,7 +112,6 @@ function matchesPatternC(src: string): boolean {
 }
 
 function matchesPatternD(src: string): boolean {
-  // (d) a parameter or variable named like a passed session handle
   const re = new RegExp(`\\b(?:${HANDLE_IDENTIFIERS.join('|')})\\b`);
   return re.test(src);
 }
@@ -201,27 +139,10 @@ export function computeOffenders(): OffenderMatch[] {
   return offenders.sort((x, y) => x.file.localeCompare(y.file));
 }
 
-/* ─── Inbound-keyed sessions doing outbound-only work ──────────────────────── */
-
 /**
- * A `withMailboxSession` / `withExistingMailboxSession` action whose body uses
- * ONLY outbound-side ops.
- *
- * The mailbox session's existence check is keyed on inbound.db. An action that
- * needs nothing from inbound.db but is wrapped in one therefore answers
- * `undefined` for a real cohort — a session whose inbound.db is gone while
- * outbound.db remains — and the caller reports outbound state as empty when it
- * is not. That is not hypothetical: it is the bug the usage rollup carried
- * (fixed by reading through the outbound funnel) and the one
- * `thread-close.ts`'s done-proposal read carried.
- *
- * The fix for a flagged site is `withExistingNanoclawOutbound`, the
- * outbound-keyed funnel, which asks an outbound-only existence question.
- *
- * Heuristic by construction, and deliberately conservative in the safe
- * direction: an action mentioning even one inbound-side op is not reported, and
- * an op this scanner cannot classify counts as inbound (see op-sides.ts). So it
- * under-reports rather than crying wolf.
+ * A mailbox-session action using only outbound-side ops. The session's existence check is keyed on inbound.db,
+ * so it answers `undefined` when only inbound.db is gone and outbound state reads as empty. Fix: use
+ * `withExistingNanoclawOutbound`. Unclassifiable ops count as inbound, so this under-reports.
  */
 export interface OutboundOnlySessionMatch {
   file: string;
@@ -232,17 +153,12 @@ export interface OutboundOnlySessionMatch {
 const SESSION_OPENERS = ['withMailboxSession', 'withExistingMailboxSession'];
 
 interface CallSite {
-  /** The callee's name. */
   name: string;
-  /** Offset of the callee name in `src`. */
   index: number;
-  /** Offset of the closing paren, so one call's span can contain another's. */
   end: number;
-  /** Everything between the parens — the arguments, action callback included. */
   body: string;
 }
 
-/** Every call to a function whose name matches `namePattern`, with its span. */
 function callSites(src: string, namePattern: string): CallSite[] {
   const out: CallSite[] = [];
   const re = new RegExp(`\\b(${namePattern})\\s*\\(`, 'g');
@@ -264,16 +180,10 @@ function callSites(src: string, namePattern: string): CallSite[] {
   return out;
 }
 
-/** The action body of one session call, found by balancing from its open paren. */
 function sessionCallBodies(src: string): Array<{ index: number; body: string }> {
   return callSites(src, `(?:${SESSION_OPENERS.join('|')})`).map(({ index, body }) => ({ index, body }));
 }
 
-/**
- * Every inbound-keyed session call in `roots` whose action uses only
- * outbound-side ops. `outboundOps` is injected so a test can drive the checker
- * over a string without touching the real module.
- */
 export function findOutboundOnlySessions(
   sources: Array<{ file: string; src: string }>,
   sides: { inbound: ReadonlySet<string>; outbound: ReadonlySet<string> },
@@ -281,18 +191,10 @@ export function findOutboundOnlySessions(
   const found: OutboundOnlySessionMatch[] = [];
   for (const { file, src } of sources) {
     // Length-preserving, so the reported line is the line in the real file.
-    // `stripComments` DELETES, which shifts every offset after the first
-    // comment: a call under a three-line block comment was reported three
-    // lines early. The sibling write rule below already uses this one.
     const stripped = blankComments(src);
     for (const { index, body } of sessionCallBodies(stripped)) {
-      // Ops invoked on whatever the action named its parameter. Matching
-      // `<ident>.<op>(` rather than a fixed `mailbox.` keeps it working for the
-      // handful of sites that name it something else.
       const ops = [...body.matchAll(/\b[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)\s*\(/g)].map((x) => x[1]);
-      // BOTH sides, or a mixed action reads as outbound-only: filtering the
-      // inbound ops out before the `every` below made the check vacuously true
-      // for exactly the actions it must not flag.
+      // Keep both sides, or a mixed action would read as outbound-only.
       const sessionOps = ops.filter((op) => sides.outbound.has(op) || sides.inbound.has(op));
       if (sessionOps.length === 0) continue;
       if (!sessionOps.every((op) => sides.outbound.has(op))) continue;
@@ -306,65 +208,29 @@ export function findOutboundOnlySessions(
   return found;
 }
 
-/** Non-test host sources, for the check above. */
 export function hostSourcesForOutboundScan(): Array<{ file: string; src: string }> {
   return listTsFiles('src').map((file) => ({ file, src: fs.readFileSync(path.join(REPO_ROOT, file), 'utf8') }));
 }
 
-/* ─── Host outbound writes outside the stopped-container guard ─────────────── */
-
 /**
- * The one sanctioned way for the host to write a session's `outbound.db`.
- *
- * `outbound.db` has a single writer. The host may write it only while no
- * container owns the session, and the check has to sit INSIDE the session and
- * immediately before the mutation, with no await between the two: opening a
- * mailbox session is a yield, and a wake landing in that gap starts a container
- * that now owns the file. `withStoppedContainerSession` (src/host-sweep.ts) is
- * that shape — it re-checks `containerOwnsOutbound()` inside the session and
- * resolves `undefined` when a container took it.
+ * The one sanctioned way for the host to write `outbound.db`: the no-container check sits inside the session with
+ * no await before the mutation, because opening a session yields and a wake in that gap starts an owner.
  */
 export const OUTBOUND_WRITE_GUARD = 'withStoppedContainerSession';
 
 /**
- * A host-side session action that MUTATES `outbound.db` without that guard.
- *
- * This is a structural close on a defect class rather than a lint: four
- * separate review rounds found instances of it by reading, and reading is not
- * a repeatable check. Each instance costs the same way — the write lands on a
- * file a live container owns, deleting the fresh runner's processing claim,
- * pushing its continuation back to `queued`, or contending for the write lock.
- *
- * Reach, stated plainly so the residue is not mistaken for coverage: the check
- * is LEXICAL, and it is about writes made through the MAILBOX SESSION. It does
- * NOT see:
- *
- *  - a write reached through a `SessionRunner`-style callback parameter, or
- *    one made by a helper the action calls, because the op name is not in the
- *    body it scans. Those sites carry the ownership check inline instead.
- *  - a write made through `withExistingNanoclawOutbound`, the outbound funnel,
- *    which is not a `with*Session` call. Those writes (the router's two
- *    notices, thread-close's force-clear) are a separate class made
- *    deliberately while a container may be running; this guard is not their
- *    remedy.
- *
- * All of them are outside this rule, none of them are exempt from the
- * property.
+ * A host session action that mutates `outbound.db` without the guard. Lexical only: it does not see writes via a
+ * callback parameter or helper, nor via `withExistingNanoclawOutbound`. Those are outside the rule, not exempt:
+ * the router's notices and thread-close's force-clear write deliberately while a container may be running, and this
+ * guard is not their remedy.
  */
 export interface OutboundWriteMatch {
   file: string;
   line: number;
-  /** The session opener the action was passed to. */
   opener: string;
   ops: string[];
 }
 
-/**
- * Every host-side session action that writes `outbound.db` outside the guard.
- *
- * `writeOps` is injected (from `outboundWriteOps()`) so a test can drive the
- * checker over a fixture string without touching the real module.
- */
 export function findUnguardedOutboundWrites(
   sources: Array<{ file: string; src: string }>,
   writeOps: ReadonlySet<string>,
@@ -373,8 +239,6 @@ export function findUnguardedOutboundWrites(
   for (const { file, src } of sources) {
     // Length-preserving, so the reported line is the line in the real file.
     const stripped = blankComments(src);
-    // Spans of every guarded session, so a write nested inside one is exempt
-    // however deeply it is wrapped.
     const guarded = callSites(stripped, OUTBOUND_WRITE_GUARD).map((c) => ({ from: c.index, to: c.end }));
     for (const call of callSites(stripped, 'with[A-Za-z0-9_$]*Session')) {
       if (call.name === OUTBOUND_WRITE_GUARD) continue;

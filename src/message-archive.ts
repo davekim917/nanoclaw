@@ -1,23 +1,7 @@
 /**
- * Central archive of every chat message v2 sees — inbound (from users)
- * and outbound (from agents). Stored in `data/archive.db` (separate from
- * v2.db so we can mount it read-only into agent containers) with an FTS5
- * virtual table over the text body.
- *
- * Host side (this module) writes on every chat inbound/outbound. Agent
- * containers read via the mount at `/workspace/archive.db` to power the
- * `search_threads` MCP tool (Phase 2.9) and `resolve_thread_link` (2.10).
- *
- * Design decisions:
- *  - Separate DB file (not a table in v2.db). Lets us mount RO into the
- *    container without exposing central state like pending_approvals,
- *    agent_groups, etc.
- *  - Self-bootstrapping schema on first open. Not part of v2.db's
- *    migration chain because the file lives outside v2.db.
- *  - FTS5 auto-sync via triggers. Inserts flow automatically into the
- *    virtual table.
- *  - `agent_group_id` in every row is our scoping key (v1 used
- *    `group_folder`; v2 uses the AG id).
+ * Central archive of every chat message, in `data/archive.db` with an FTS5 table. A separate file from v2.db so
+ * it can be mounted read-only into containers without exposing central state; hence its self-bootstrapping
+ * schema outside the migration chain.
  */
 import fs from 'fs';
 import path from 'path';
@@ -30,28 +14,9 @@ import { log } from './log.js';
 const ARCHIVE_PATH = path.join(DATA_DIR, 'archive.db');
 
 /**
- * A per-agent-group counter of NON-APPEND changes to `messages_archive`.
- *
- * `messages_archive` is very nearly append-only, but not quite:
- * `upsertStmt` below carries `ON CONFLICT(id) DO UPDATE SET text = ...`, so
- * re-archiving a message id — an edited chat message, a redelivered outbound
- * row — rewrites the row in place. Row count and `MAX(rowid)` do not move when
- * that happens, which makes a cheap watermark unsound on its own: the archive
- * projection in `src/db/per-agent-projections.ts` keys its freshness stamp on
- * `COUNT(*)` and `MAX(rowid)` over one workgroup's rows, and an in-place edit
- * would slip past both and leave a container serving stale text forever.
- *
- * These triggers make the un-watermarkable changes countable. They fire only
- * when a row's projected content actually moves, so an idempotent re-archive of
- * identical text costs nothing and does not invalidate anybody's projection.
- * `sent_at`, `role`, `sender_id`, `messaging_group_id` and `thread_id` are not
- * in the `WHEN` clause because no write path updates them; if one ever does,
- * add it here — the projection's dedup key includes them.
- *
- * Kept as a side table rather than an `updated_at` column on `messages_archive`
- * itself: adding a column to the live multi-hundred-megabyte archive would need
- * a second index over it to be queryable per agent group, and this table is one
- * row per agent group.
+ * Per-agent-group counter of in-place rewrites (the upsert's `DO UPDATE`), which move neither `COUNT(*)` nor
+ * `MAX(rowid)` and would otherwise slip past the archive projection's freshness stamp. Columns absent from the
+ * `WHEN` clause are ones no write path updates; if one ever does, add it (the projection's dedup key includes it).
  */
 export const ARCHIVE_MUTATION_MARKS_SQL = `
   CREATE TABLE IF NOT EXISTS archive_row_marks (
@@ -79,9 +44,7 @@ let _db: Database.Database | null = null;
 let _dbPath: string | null = null;
 
 function openDb(): Database.Database {
-  // Re-key the cache on the archive path. Under test, beforeEach wipes
-  // DATA_DIR and the previously-cached connection points at an unlinked fd;
-  // comparing paths catches the swap without requiring a test-only close API.
+  // Re-keyed on the path: under test the cached connection can point at an unlinked fd.
   if (_db && _dbPath === ARCHIVE_PATH && fs.existsSync(ARCHIVE_PATH)) return _db;
   if (_db) {
     try {
@@ -93,13 +56,7 @@ function openDb(): Database.Database {
   }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const db = new Database(ARCHIVE_PATH);
-  // TRUNCATE (not WAL). We have one writer (host) and many cross-process
-  // readers (containers reading via a read-only mount of archive.db only).
-  // In WAL mode readers need access to the -wal and -shm sidecar files; we
-  // don't mount those into the container, so WAL writes would be invisible
-  // to the MCP tools. TRUNCATE flushes every write straight to the main
-  // file, which containers see immediately. Write volume is per-chat-
-  // message so the perf delta vs WAL is a non-issue.
+  // TRUNCATE, not WAL: containers mount only archive.db, not the -wal/-shm sidecars, so WAL writes are invisible.
   db.pragma('journal_mode = TRUNCATE');
   db.pragma('synchronous = NORMAL');
   initSchema(db);
@@ -212,17 +169,7 @@ function initSchema(db: Database.Database): void {
   ensureArchiveRowMarks(db);
 }
 
-/**
- * Create `archive_row_marks` and its triggers, and say so ONCE.
- *
- * The archive projection's freshness stamp fails closed while these are
- * absent — every spawn rebuilds — so an
- * operator upgrading a live install needs to see the moment they appear. The
- * existence check reads `sqlite_master` rather than trusting the silence of
- * `IF NOT EXISTS`, which cannot tell "created" from "already there", and it
- * checks the triggers as well as the table so a partially-applied schema is
- * still reported.
- */
+/** Reads `sqlite_master` because `IF NOT EXISTS` can't tell "created" from "already there". */
 function ensureArchiveRowMarks(db: Database.Database): void {
   const present = new Set(
     (
@@ -243,33 +190,11 @@ function ensureArchiveRowMarks(db: Database.Database): void {
   log.info('Archive row-marks schema created', { ms: Date.now() - startedAt });
 }
 
-/**
- * Open the archive once at host startup so its schema exists before anything
- * reads it.
- *
- * `initSchema` is otherwise reached only through the lazy `openDb()`, which
- * runs on the first archive WRITE. On an upgraded host that means
- * `archive_row_marks` would not exist until some unrelated chat traffic
- * happened to arrive — and until it does, every archive projection stamp
- * reports an unknown mutation count and fails closed, so every spawn keeps
- * doing the full 19 s rebuild this release exists to remove. A boot that
- * spawns before anyone speaks would get none of the benefit.
- *
- * Idempotent and cheap: on every later boot the schema is already there and
- * this is a file open plus a `sqlite_master` lookup.
- */
+/** Otherwise the schema appears only on the first archive write, and until then every spawn does a full rebuild. */
 export function ensureArchiveSchema(): void {
   openDb();
 }
 
-/**
- * Test hook — drop the cached connection so the next open behaves like a fresh
- * host boot against an archive that already exists on disk.
- *
- * Needed because that is the ONLY way to exercise the `sqlite_master` gate in
- * `ensureArchiveRowMarks`: the connection cache otherwise short-circuits every
- * call after the first within one process.
- */
 export function __resetArchiveConnectionForTest(): void {
   if (!_db) return;
   try {
@@ -296,19 +221,7 @@ export interface ArchiveMessage {
   sentAt: string;
 }
 
-/**
- * The ONLY statement in the host that writes `messages_archive`.
- *
- * Exported so tests can exercise the real thing rather than a hand-copied
- * lookalike, and so `src/archive-write-path.test.ts` can hold the invariant
- * that no second write path appears: the `archive_row_marks` triggers above,
- * and therefore the archive projection's freshness stamp, are correct only
- * because every mutation the archive can undergo goes through here.
- *
- * Note the `DO UPDATE`: this is an upsert, not an append. Re-archiving a
- * message id rewrites the row in place, which is exactly what the marks
- * triggers exist to count.
- */
+/** The ONLY statement in the host that writes `messages_archive`; the freshness stamp depends on that (test-held). */
 export const ARCHIVE_UPSERT_SQL = `INSERT INTO messages_archive
        (id, agent_group_id, messaging_group_id, channel_type, channel_name, platform_id, thread_id, role, sender_id, sender_name, text, sent_at)
      VALUES (@id, @agentGroupId, @messagingGroupId, @channelType, @channelName, @platformId, @threadId, @role, @senderId, @senderName, @text, @sentAt)
@@ -329,15 +242,7 @@ export function upsertArchiveMessage(msg: ArchiveMessage): void {
   }
 }
 
-/**
- * Archive a user/assistant message.
- *
- * Throws on write failure rather than swallowing: router.ts's non-engaged
- * session skip treats the boolean as a DURABILITY PRECONDITION — when it skips,
- * the archive row is the message's only remaining copy — so a silent failure
- * there would make the message cease to exist. `upsertArchiveMessage` is the
- * best-effort variant for callers that do have another copy.
- */
+/** Throws rather than swallowing: when the router skips a message, the archive row is its only copy. */
 export function archiveMessage(msg: ArchiveMessage): boolean {
   if (!msg.text || msg.text.length === 0) return false;
   upsertStmt().run(msg);
@@ -345,15 +250,8 @@ export function archiveMessage(msg: ArchiveMessage): boolean {
 }
 
 /**
- * Whether any archived message sits in `threadId` on this channel
- * (channel_type + platform_id — `idx_archive_channel`). Outbound rows from task
- * sessions carry no messaging_group_id, so the channel is matched by its address
- * rather than by messaging group id. Sibling bots on one conversation archive it
- * under their own channel_type (`discord`, `discord-codex`, ...) with the base
- * prefix on platform_id; those copies pool by channel family, the same rule as
- * `search_threads` (container/agent-runner/src/mcp-tools/thread-search.ts),
- * while a native adapter's unprefixed id keeps exact channel_type matching. Used by
- * src/continue-thread.ts as evidence that a thread really exists on a destination.
+ * Matched by channel address, not messaging group (task outbound rows carry none). Sibling bots' copies pool by
+ * channel family, the same rule as `search_threads`; an unprefixed native id keeps exact channel_type matching.
  */
 export function archiveHasThread(channelType: string, platformId: string, threadId: string): boolean {
   const dash = channelType.indexOf('-');
@@ -473,14 +371,7 @@ export function sanitizeArchiveFtsQuery(query: string): string {
   return terms.join(' OR ');
 }
 
-/**
- * Distinct senders of recent inbound messages in the current conversation,
- * newest first. Deterministic key set for per-person preference recall — no
- * ranking, no FTS. `senderId` is the archive's stable per-message sender key
- * (e.g. `slack:U123`) — the preference lane resolves it against the central
- * `users` table to match on canonical `display_name`, not just the per-message
- * `sender_name`, so a platform rename doesn't silently break a preference file.
- */
+/** Newest first; deterministic, no ranking or FTS. */
 export function recentConversationSenders(input: {
   memberAgentGroupIds: string[];
   messagingGroupId: string | null;
@@ -513,10 +404,7 @@ export function recentConversationSenders(input: {
   const senders: Array<{ senderName: string; senderId: string | null }> = [];
   const seenKeys = new Set<string>();
   for (const row of rows) {
-    // Dedupe on stable sender_id where we have one — falling back to name
-    // for legacy/anonymous rows — so two different people who happen to
-    // share a display name aren't collapsed into one (rows are newest
-    // first, so a renamed sender_id still keeps only its newest name).
+    // Dedupe on sender_id, not name, so two people sharing a display name aren't collapsed.
     const key = row.sender_id ?? `name:${row.sender_name}`;
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
@@ -526,11 +414,7 @@ export function recentConversationSenders(input: {
   return senders;
 }
 
-/**
- * Retrieve bounded archive message candidates for a trusted workgroup member
- * set. FTS performs candidate generation only; the pre-turn builder applies
- * its deterministic lexical score and excerpt bounds.
- */
+/** FTS generates candidates only; the pre-turn builder scores and bounds them. */
 export function searchArchiveEvidence(input: {
   memberAgentGroupIds: string[];
   query: string;
@@ -683,11 +567,7 @@ export function queryArchiveExactLinks(input: {
       const encodedChannel = `discord:${link.guild}:${link.channel}`;
       const encodedThreadSuffix = `discord:${link.guild}:%:${link.channel}`;
       if (link.message) {
-        // Discord message links are /channels/<guild>/<channel-or-thread>/<message>.
-        // Inbound archive ids retain the platform message id as
-        // `<message>:<agent-group>`. Thread rows, however, retain the parent
-        // channel in platform_id and the thread channel in the final thread_id
-        // segment. Match both identities; neither one alone is sufficient.
+        // Thread rows keep the parent channel in platform_id and the thread in thread_id; match both identities.
         rows = db
           .prepare(
             `SELECT id, agent_group_id, messaging_group_id, channel_type, channel_name,
@@ -716,10 +596,7 @@ export function queryArchiveExactLinks(input: {
             remaining,
           ) as ArchiveSqlRow[];
 
-        // Outbound archive rows predate storage of the returned platform
-        // message id. If the exact id is unavailable, a URL whose channel
-        // component is a real thread still resolves to that bounded thread;
-        // never broaden a missing root-channel message to the whole channel.
+        // Outbound rows lack the platform message id; fall back to a real thread, never to a whole channel.
         if (rows.length === 0) {
           rows = db
             .prepare(
