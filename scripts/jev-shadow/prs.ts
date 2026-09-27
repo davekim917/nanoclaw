@@ -1,21 +1,10 @@
 /**
- * Replay merged fork PRs through ~14 typed Jev checks on the diff — the shape
- * @redp314 posted (one request, typed checks, code turns them into a verdict,
- * the unsure band escalates) — tuned to this repo's own recurring review
- * classes from docs/review-notes.md.
+ * Replay merged fork PRs through ~14 typed Jev checks on the diff, tuned to this repo's recurring
+ * review classes (docs/review-notes.md).
  *
- * Label: did Codex's review of the PR raise a P1? Only PRs with a review from
- * the Codex connector carry a label. That undercounts review: a PR reviewed by
- * a substitute reviewer (a receipt, not a connector review) lands in the
- * "not reviewed" bucket even when it was risk:high and reviewed. Treat "unreviewed but flagged" as a lead to check
- * against the PR's risk labels and receipts, never as a review-scope gap.
- *
- * Result on 2026-09-18 (232 PRs, 53 labelled): worst-critical-check AUC 0.547.
- * Our P1s are multi-hop (a race across an await, a fail-open through a helper,
- * a control bound on one provider only), which is Jev 1.13's documented weak
- * spot; these checks do not predict them.
- *
- * Repo content only.
+ * Label: did Codex's review raise a P1? A PR reviewed by a substitute (a receipt, not a connector
+ * review) lands in "not reviewed", so treat "unreviewed but flagged" as a lead to check against
+ * the PR's risk labels and receipts, never as a review-scope gap.
  *
  *   pnpm exec tsx scripts/jev-shadow/prs.ts [--since 2026-09-08]
  */
@@ -50,7 +39,6 @@ for (let page = 1; ; page += 1) {
   if (batch.length < 100 || batch.at(-1)!.updated_at < since) break;
 }
 
-/** Codex's verdict on one PR: reviewed at all, and the worst severity it raised. */
 function codexFindings(n: number): { reviewed: boolean; p1: number; p2: number } {
   const q = `query { repository(owner:"davekim917", name:"nanoclaw") { pullRequest(number:${n}) {
     reviews(first:50) { nodes { author { login } } }

@@ -1,28 +1,11 @@
 /**
- * THE DOCUMENTED OVERRIDE: adopt existing `<session>/.host/inbound.db` files as
- * this host's own.
+ * THE DOCUMENTED OVERRIDE: adopt existing `<session>/.host/inbound.db` files as this host's own,
+ * after a restore or a rebuilt central DB left them without a provenance record (migration 079).
  *
- * WHEN YOU NEED IT. The spawn path refuses to touch a host-owned inbound.db
- * that carries no provenance record in the central DB (migration 079), because
- * a container can create that path itself and adopting it would replace the
- * session's authoritative database. Two legitimate situations produce exactly
- * that shape, and neither is an attack:
- *
- *   - a restore from a rescue archive, where the session directories came back
- *     but the central DB did not come back with them;
- *   - a rebuilt or replaced central DB, where the files are the ones this host
- *     has been using all along but the record of creating them is gone.
- *
- * In both, the operator knows something the host cannot: that the tree is
- * trusted. This script is where that knowledge is applied deliberately, in one
- * auditable step, rather than by weakening the gate.
- *
- * READ THIS BEFORE `--all`. Adopting is a decision that the files on disk ARE
- * yours. Run it only when you know the tree is trusted — right after a restore,
- * before any container has run against it. Running it to clear an unexpected
- * refusal would adopt whatever a container planted, which is precisely the
- * outcome the refusal exists to prevent. If a refusal is unexpected, quarantine
- * instead: `scripts/quarantine-planted-host-dirs.ts`.
+ * READ THIS BEFORE `--all`. Adopting declares the files on disk ARE yours: run it only when the
+ * tree is known trusted, before any container has run against it. Running it to clear an
+ * unexpected refusal adopts whatever a container planted; quarantine instead
+ * (`scripts/quarantine-planted-host-dirs.ts`).
  *
  * Usage:
  *   pnpm exec tsx scripts/adopt-host-inbound-provenance.ts --all            # dry run

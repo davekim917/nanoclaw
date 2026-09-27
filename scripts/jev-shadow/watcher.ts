@@ -1,28 +1,14 @@
 /**
- * Replay a PR-watcher task series through Jev: would a judgment on WHAT
- * CHANGED have skipped the wake, or routed it off Opus-high?
- *
- * The series this was built for has a host script (`scriptHost`) that wakes the
- * agent whenever the fingerprint of its PR snapshot changes, plus a forced heartbeat every third idle tick, and every
- * wake runs on Opus-high (`flagIntent`). Code can see THAT the snapshot moved;
- * this asks Jev WHETHER the move matters. Code does the diff — Jev does not
- * diff reliably (docs.typesafe.ai/model-jaggedness/jev-1.13) — and Jev judges
- * the short change list.
- *
- * Two requests per fire, on separate states, so the predictor never sees the
- * outcome:
- *   input  {changes, board}  → needs_owner (Noul), tier (Choice)
- *   output {ledger_note, …}  → acted (Choice) — the label
- *
- * Reads the focus workgroups only (FOCUS_WORKGROUPS). Writes raw results to
- * $JEV_SHADOW_OUT (default ~/jev-shadow-out).
+ * Replay a PR-watcher task series through Jev: would a judgment on WHAT CHANGED have skipped the
+ * wake, or routed it off Opus-high? Code does the diff (Jev does not diff reliably) and Jev judges
+ * the short change list. Two requests per fire, on separate states, so the predictor never sees
+ * the outcome.
  *
  *   JEV_SHADOW_FOCUS=<workgroup> pnpm exec tsx scripts/jev-shadow/watcher.ts \
  *     --folder <group folder> --prefix '<task prompt prefix>' [--since 2026-09-10]
  *
- * It assumes the series' `scriptOutput` shape (watch_state, ready_to_merge,
- * stalled, …) and a `task_log` ledger note per fire; another series needs its
- * own `diff`.
+ * Assumes the series' `scriptOutput` shape and a `task_log` ledger note per fire; another series
+ * needs its own `diff`. Writes raw results to $JEV_SHADOW_OUT (default ~/jev-shadow-out).
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -48,17 +34,13 @@ const SCALAR_SIGNALS = ['codex_approved_ready', 'develop_ci', 'merge_hold', 'smo
 
 const key = (e: Record<string, unknown>) => `${e.repo}#${e.n}`;
 const checks = (e: Record<string, unknown>) => {
-  // `c` has drifted across the script's history (an array in current snapshots,
-  // not in some older ones); read any non-array as "no checks" rather than throw.
+  // `c` has drifted across the script's history: read any non-array as "no checks".
   const c: string[] = Array.isArray(e.c) ? (e.c as string[]) : [];
   const fail = c.filter((x) => x === 'FAILURE' || x === 'ERROR' || x === 'CANCELLED' || x === 'TIMED_OUT').length;
   const pend = c.filter((x) => x === '' || x === 'PENDING' || x === 'IN_PROGRESS' || x === 'QUEUED' || x == null).length;
   return fail ? `${fail} failing` : pend ? `${pend} pending` : c.length ? 'all green' : 'no checks';
 };
-// Identity of a list member. Claims and stalls carry age counters (`h`, `bucket`)
-// that tick every hour; keying on the whole object reported each tick as a
-// gained+lost pair — the most common "change" in the first run. Key on the
-// member's identity instead so a change means something happened.
+// Keyed on a member's identity, not the whole object: claims and stalls carry hourly age counters.
 const asList = (v: unknown): string[] =>
   Array.isArray(v)
     ? v.map((x) => {
@@ -195,7 +177,6 @@ const results = await pool(jobs, 8, async ({ t, changes, board }) => {
 const file = path.join(OUT, `watcher-${MODEL}-${new Date().toISOString().slice(0, 16).replace(/:/g, '')}.json`);
 fs.writeFileSync(file, JSON.stringify(results, null, 1));
 
-// ---- report ----
 const tot = results.reduce((a, r) => a + r.costUsd, 0);
 const acted = (r: (typeof results)[number]) => r.acted !== 'observed_only';
 console.log(`${results.length} fires, $${tot.toFixed(0)} agent spend; Jev cost $${results.reduce((a, r) => a + r.jevUsd, 0).toFixed(4)}`);

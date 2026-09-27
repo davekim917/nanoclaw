@@ -10,12 +10,6 @@
  *   2. wake deferrals since last restart                      (should be 0)
  *   3. absolute-ceiling kills since last restart              (should be 0)
  *   4. stuck-claim warnings repeating against same message_id (should be empty)
- *
- * Plus two diagnostic counters:
- *
- *   - expired-pending events since restart  (small healthy steady-state, large = recurring wake-failure)
- *   - oldest claimed-running session         (if DB count > docker count, this is the phantom)
- *
  * Usage:
  *   pnpm exec tsx scripts/host-health.ts
  */
@@ -57,11 +51,8 @@ function dbRunningCount(): { count: number; oldest?: { id: string; lastActive: s
 }
 
 /**
- * Boot wallclock from systemd. Returns epoch-ms of the current
- * nanoclaw-v2 service start, or null if unavailable. Used as the
- * "since restart" cutoff for log filtering — robust to log files that
- * span multiple days where lexical compare on `[HH:MM:SS.mmm]` prefixes
- * would conflate yesterday's 23:58 with today's 23:58.
+ * Epoch-ms of the current service start from systemd, or null: the "since restart" cutoff,
+ * robust to log files that span several days.
  */
 function hostBootEpochMs(): number | null {
   try {
@@ -77,16 +68,7 @@ function hostUptimeSec(bootMs: number | null): number | null {
   return bootMs === null ? null : Math.floor((Date.now() - bootMs) / 1000);
 }
 
-/**
- * Iterate matching lines in `logPath` BACKWARDS until we cross the
- * `cutoffMs` boundary. Each visited line is mapped to a wallclock by
- * parsing its `[YYYY-MM-DD HH:MM:SS.mmm]` prefix directly — the date is
- * embedded per line, so no midnight-crossing reconstruction is needed.
- * Callback returns false to stop early.
- *
- * Assumes the log is the server-local TZ — both this script and the host
- * log writer pull time-of-day from the same Node process TZ.
- */
+/** Walks matching lines backwards until `cutoffMs`; the callback returns false to stop early. */
 function walkLinesBackToCutoff(
   logPath: string,
   cutoffMs: number,
@@ -103,14 +85,8 @@ function walkLinesBackToCutoff(
       // attribute to most-recently-seen timestamp (not counted toward cutoff)
       continue;
     }
-    // `cutoffMs` comes from systemd's UTC boot stamp, so the line's instant
-    // has to be absolute too. Rebuilding it from local getters (what this did
-    // before) is off by the host process's UTC offset whenever the logger's
-    // zone differs from this script's — `TZ=America/New_York` in the unit vs
-    // a UTC `/etc/localtime` here — which pushed every line below the cutoff
-    // and ended the walk on its first iteration. The counters then read 0 for
-    // events that had in fact occurred (5 ceiling kills, 101 expired-pending
-    // on 2026-09-22), and a zero is indistinguishable from a healthy host.
+    // `cutoffMs` is an absolute UTC instant, so the line's must be too: the logger's TZ can
+    // differ from this script's, and rebuilding from local getters silently zeroes the counters.
     const parsed = parseLogStamp(m[1], m[2]);
     if (!parsed) continue;
     if (!parsed.exact) sawInexact = true;
@@ -121,16 +97,8 @@ function walkLinesBackToCutoff(
 }
 
 /**
- * Count matching lines since boot.
- *
- * `inexact` is not cosmetic. Lines written before src/log.ts started stamping
- * a UTC offset carry only local wall-clock, so their instant is reconstructed
- * in THIS process's zone. When the logger ran in a different one — the unit
- * sets `TZ=America/New_York` against a UTC `/etc/localtime` — every line lands
- * hours early, drops below `bootMs`, and ends the backward walk on its first
- * iteration. The count then reads 0 for events that did occur (on 2026-09-22:
- * 5 ceiling kills and 101 expired-pending reported as 0/0). A zero that cannot
- * be trusted must not be printed as a clean zero, so callers render the caveat.
+ * `inexact` is not cosmetic: a line without a UTC offset is reconstructed in THIS process's zone
+ * and can land hours early, so a zero that cannot be trusted must not print as a clean zero.
  */
 function countSinceBoot(
   logPath: string,
@@ -146,12 +114,7 @@ function countSinceBoot(
   return { n, inexact: sawInexact };
 }
 
-/**
- * Identify message_ids in `Killing container — message claimed then silent`
- * warnings that appear more than `repeatThreshold` times since boot.
- * Repeated kills against the same id indicate a stuck claim that never
- * clears (the old task-plugin-updater pattern).
- */
+/** message_ids killed as "claimed then silent" more than `repeatThreshold` times since boot: a stuck claim. */
 function stuckClaimHotspots(
   repeatThreshold: number,
   bootMs: number | null,

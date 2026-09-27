@@ -1,24 +1,15 @@
 /**
- * scripts/notify-owner.ts — CLI entry point for the notify-owner alert
- * primitive. The delivery core (resolveOwnerDms, notifyOwner, etc.) lives in
- * src/notify-owner.ts — `dist/` compiles `src/**` only (tsconfig.json), so
- * anything main.ts needs at runtime (the boot-time build-drift check) cannot
- * live in scripts/. This file is just arg parsing, stdin handling, and the
- * exit-code mapping three shell watchdogs (check-onecli-gateway-fds.sh,
- * health-sentinel.sh, check-onecli-drift.sh) branch on — their exit-code
- * contract is unchanged by the move.
+ * CLI entry point for the notify-owner alert primitive; the delivery core lives in
+ * src/notify-owner.ts because `dist/` compiles only `src/**`.
  *
  * Usage:
  *   tsx scripts/notify-owner.ts --title "<title>" --body "<body>"
  *   tsx scripts/notify-owner.ts --title "<title>" --body -   # body from stdin
  *
- * Exit codes (distinct on purpose — shell callers branch on them):
+ * Exit codes (distinct on purpose — shell watchdogs branch on them):
  *   0 — delivered, receipt verified. One safe line on stdout (channel id only).
- *   2 — cannot even try: no owner DM row resolved, the owner's channel type
- *       isn't one this script can post to (Slack only, today), or no bot
- *       token is configured for it. Reason on stderr.
+ *   2 — cannot even try: no owner DM row, an unsupported channel type, or no bot token.
  *   1 — tried and failed: Slack API error, `ok:false`, or a network failure.
- *       Reason on stderr, including Slack's error code when present.
  * A token value is NEVER printed, logged, or included in any exit message.
  */
 import path from 'path';
@@ -54,8 +45,7 @@ async function main(): Promise<number> {
   try {
     ({ title, body: bodyArg } = parseArgs(process.argv.slice(2)));
   } catch (err) {
-    // Malformed invocation is "cannot even try" too — same bucket as no
-    // owner row / no token, so shell callers see one consistent shape.
+    // A malformed invocation is "cannot even try" too.
     console.error(err instanceof Error ? err.message : String(err));
     return 2;
   }
