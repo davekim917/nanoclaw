@@ -29,7 +29,6 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
 
       fs.writeFileSync(path.join('logs', 'migration-036.log'), reportRow.report + '\n');
 
-      // Per-workgroup intersection of member onecliSecrets.
       const secretsReport = computeDuplicateSecretsReport(db);
       fs.writeFileSync(path.join('logs', 'migration-036-secrets.log'), JSON.stringify(secretsReport, null, 2) + '\n');
     }

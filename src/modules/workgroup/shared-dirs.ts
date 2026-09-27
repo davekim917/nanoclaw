@@ -338,8 +338,9 @@ export function inspectWorkgroupMemoryState(
 
 /**
  * Would `reconcileWorkgroupMemory` change anything for this workgroup? Pure.
- * The boot quiescence door uses it to pick which containers to stop; it is
- * deliberately a superset of the real changes, because over-stopping is safe
+ * The boot quiescence door uses it to pick which containers to stop. It must
+ * agree with the reconcile's `changed` report, which is deliberately wider than
+ * the member-symlink changes that invalidate live mounts: over-stopping is safe
  * and under-stopping is not.
  */
 export function workgroupMemoryReconcileWouldChange(

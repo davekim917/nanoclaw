@@ -1548,10 +1548,9 @@ describe('per-person preference recall', () => {
     // strip to their bare form and both resolve via the id tier.
     // Newest first: the 'River Park' row is processed first and claims
     // river-park.md via the id tier; the 'River Park Alt' row's id resolves
-    // to the same, now-claimed file. Pre-fix, that already-claimed id match
-    // fell through to name matching, and its own display name slugs to the
-    // unrelated river-park-alt.md — injecting a second, stale file for the
-    // same person. Post-fix, an id match never falls through.
+    // to the same, now-claimed file. An id match must never fall through to
+    // name matching, whose slug (river-park-alt.md) would inject a second,
+    // stale file for the same person.
     memoryFile(
       'preferences/river-park.md',
       '---\nids: [U0TEST900XYZ, U0TEST900ALT]\n---\n# River Park\nCurrent preferences.',

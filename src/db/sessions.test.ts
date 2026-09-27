@@ -80,8 +80,7 @@ describe('per-series task session threads', () => {
   it('isTaskThread still accepts a legacy bare thread — it IS a task thread', () => {
     expect(isTaskThread(taskThreadId('watch-1'))).toBe(true);
     // Narrowing this would hide an active legacy session from
-    // `findTaskSessions`, and with it from `ncl tasks cancel`
-    // (`src/cli/resources/tasks.ts:182`).
+    // `findTaskSessions`, and with it from `ncl tasks cancel`.
     expect(isTaskThread(TASKS_SYSTEM_THREAD_ID)).toBe(true);
     expect(isTaskThread('system:tasksxyz')).toBe(false);
     expect(isTaskThread(null)).toBe(false);
@@ -89,11 +88,9 @@ describe('per-series task session threads', () => {
 
   it('taskSeriesId returns null for a thread that names no series, never an empty string', () => {
     expect(taskSeriesId(taskThreadId('watch-1'))).toBe('watch-1');
-    // THE bug: `.slice(prefix.length)` took 13 characters off this 12-character
-    // string and produced ''. `appendRunLog` rejected that on its charset guard
-    // (`appendRunLog`, src/modules/scheduling/run-log.ts) before writing anything;
-    // `recordTaskRunOutcome` (`src/db/task-run-outcomes.ts:47-61`) had no
-    // guard, so the empty id landed in the central ledger instead.
+    // `.slice(prefix.length)` would take 13 characters off this 12-character
+    // string and produce ''. `appendRunLog`'s charset guard rejects that, but
+    // `recordTaskRunOutcome` has no guard and would write the empty id.
     expect(taskSeriesId(TASKS_SYSTEM_THREAD_ID)).toBeNull();
     expect(taskSeriesId(`${TASKS_SYSTEM_THREAD_ID}:`)).toBeNull();
     expect(taskSeriesId('slack:C123:1.1')).toBeNull();
