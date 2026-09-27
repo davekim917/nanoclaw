@@ -28,14 +28,13 @@ import { readContainerConfig, writeContainerConfig } from './container-config.js
 import { buildAgentGroupImage } from './container-runner.js';
 import { createAgentGroup } from './db/agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from './db/container-configs.js';
-import { closeDb, getRawDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, initMigratedTestDb } from './db/index.js';
 
 beforeEach(async () => {
   built.commands = [];
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(`${TEST_DIR}/groups/agent`, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   await createAgentGroup({
     id: 'ag-1',
     name: 'Agent',
