@@ -40,7 +40,7 @@ const KNIP_WORKSPACES = ['.', 'container/agent-runner'];
 const SOURCE_ROOTS = ['src', 'setup', 'scripts', 'container/agent-runner/src', 'container/agent-runner/scripts'];
 const SOURCE_FILE = /\.(?:[cm]?[jt]s|tsx)$/;
 const NOT_SOURCE =
-  /(?:^|\/)(?:node_modules|__fixtures__|__test-fixtures__|test-fixtures|transaction-fixtures)\/|\.test\.[cm]?[jt]s$/;
+  /(?:^|\/)(?:node_modules|__fixtures__|__test-fixtures__|test-fixtures|transaction-fixtures)\/|\.test\.[cm]?[jt]sx?$/;
 
 /**
  * Files whose findings are fixed somewhere other than this tree, so no check reports them.
@@ -87,8 +87,7 @@ function stdoutOf(tool: string, result: SpawnSyncReturns<string>): string {
   return result.stdout;
 }
 
-const isSource = (file: string) =>
-  SOURCE_ROOTS.some((dir) => file.startsWith(`${dir}/`)) && SOURCE_FILE.test(file) && !NOT_SOURCE.test(file);
+const isNonTestSource = (file: string) => SOURCE_FILE.test(file) && !NOT_SOURCE.test(file);
 
 /** Non-test source under the scanned roots, as sorted root-relative POSIX paths. */
 export function sourceFiles(root: string): string[] {
@@ -97,7 +96,7 @@ export function sourceFiles(root: string): string[] {
     if (!fs.existsSync(path.join(root, dir))) continue;
     for (const entry of fs.readdirSync(path.join(root, dir), { recursive: true, encoding: 'utf8' })) {
       const file = path.posix.join(dir, entry.split(path.sep).join('/'));
-      if (isSource(file)) files.push(file);
+      if (isNonTestSource(file)) files.push(file);
     }
   }
   return files.sort();
@@ -231,7 +230,7 @@ export function growthBase(root: string): string {
   return result.stdout.trim();
 }
 
-/** Compares the working tree with `base`, so uncommitted and untracked source counts as changed. */
+/** Every changed non-test TS/JS file, not only the scanned roots; uncommitted and untracked files count. */
 export function commentGrowth(root: string, base: string, exempt: Exempt): CommentGrowth {
   const listed = (args: string[]) => stdoutOf('git', git(root, args)).split('\0').filter(Boolean);
   const changed = new Set([
@@ -240,7 +239,7 @@ export function commentGrowth(root: string, base: string, exempt: Exempt): Comme
   ]);
   const count = (file: string, text: string | null) => (text === null ? 0 : scanComments(file, text).commentOnlyLines);
   const files = [...changed]
-    .filter((file) => isSource(file) && !isExempt(exempt, file))
+    .filter((file) => isNonTestSource(file) && !isExempt(exempt, file))
     .sort()
     .map((file) => {
       const atBase = git(root, ['cat-file', 'blob', `${base}:${file}`]);

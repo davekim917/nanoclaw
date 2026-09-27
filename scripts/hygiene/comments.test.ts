@@ -157,7 +157,7 @@ describe('comment-only line count', () => {
 
   it('counts nothing for a tooling directive', () => {
     const source =
-      '// eslint-disable-next-line no-console\n/* c8 ignore next */\n// @ts-expect-error -- lagging types\nconsole.log(1);\n';
+      '/// <reference types="node" />\n// @ts-check\n// eslint-disable-next-line no-console\n/* c8 ignore next */\n// @ts-expect-error -- lagging types\nconsole.log(1);\n';
     expect(count(source)).toBe(0);
   });
 

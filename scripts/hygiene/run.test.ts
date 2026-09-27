@@ -370,13 +370,19 @@ describe('comment growth', () => {
     expect(verdict(root).findings).toHaveLength(1);
   });
 
-  it('ignores test files, fixtures, files outside the scanned roots and exempt files', () => {
+  it('counts changed source outside the scanned roots', () => {
+    const root = repo({ 'dashboard/src/main.tsx': code }, { 'dashboard/src/main.tsx': `// new\n${code}` });
+    expect(verdict(root)).toMatchObject({ net: 1, files: ['dashboard/src/main.tsx'] });
+  });
+
+  it('ignores test files, fixtures, non-source files and exempt files', () => {
     const root = repo(
       { 'src/a.ts': code, 'src/upstream.ts': code },
       {
         'src/a.test.ts': `// test\n${code}`,
         'scripts/__fixtures__/f.ts': `// fixture\n${code}`,
-        'docs/example.ts': `// doc\n${code}`,
+        'dashboard/src/view.test.tsx': `// test\n${code}`,
+        'docs/notes.md': `// doc\n`,
         'src/upstream.ts': `// upstream\n${code}`,
         'src/vendored.ts': `// vendored\n${code}`,
       },
