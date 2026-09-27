@@ -13,7 +13,7 @@ prints one.
 
 `--group-dir` also writes `smoke-gate-env.draft.sh` there: every proposed key
 commented out, values filled in only where the repo itself shows them (the
-GitHub slug, service dir prefixes, a health route). It refuses to overwrite a
+GitHub slug, service dir prefixes, the one migration directory, a health route). It refuses to overwrite a
 file, to write inside a checkout of this skill, and to write at all when any
 proposed value looks like a credential. Review the draft, move the keys you keep into the
 install's `smoke-gate-env.sh`, then run each gate wrapper with `config`: it names any key the gate
@@ -84,8 +84,11 @@ def hit(bucket, name, where):
 
 def detect(root):
     found = {"frameworks": {}, "previewHosts": {}, "auth": {}, "databases": {}, "serviceDirs": [],
-             "healthRoutes": {}, "githubRepo": None, "ci": []}
+             "healthRoutes": {}, "migrationDirs": [], "githubRepo": None, "ci": []}
     for rel, files in walk(root):
+        parts = rel.split(os.sep) if rel else []
+        if parts[-1:] == ["migrations"] or parts[-2:] in (["db", "migrate"], ["alembic", "versions"]):
+            found["migrationDirs"].append(rel + "/")
         for f in files:
             path = os.path.join(rel, f) if rel else f
             full = os.path.join(root, path)
@@ -115,8 +118,12 @@ def detect(root):
                             found["serviceDirs"].append(rel + "/")
             elif f == "Gemfile" and re.search(r"gem ['\"]rails['\"]", read(full) or ""):
                 hit(found["frameworks"], "Rails", path)
+                if rel:
+                    found["serviceDirs"].append(rel + "/")
             elif f == "go.mod":
                 hit(found["frameworks"], "Go", path)
+                if rel:
+                    found["serviceDirs"].append(rel + "/")
             if path == "supabase/config.toml":
                 hit(found["databases"], "Supabase (local stack)", path)
             if f in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
@@ -130,6 +137,7 @@ def detect(root):
                 for m in HEALTH_RE.finditer(read(full) or ""):
                     hit(found["healthRoutes"], m.group(1), path)
     found["serviceDirs"] = sorted(set(found["serviceDirs"]))
+    found["migrationDirs"].sort()
     try:
         url = subprocess.run(["git", "-C", root, "remote", "get-url", "origin"], capture_output=True,
                              text=True, timeout=10).stdout.strip()
@@ -157,6 +165,9 @@ def propose(found):
     front = guess_prefix(dirs, {"web", "frontend", "client", "app", "ui", "site"})
     back = guess_prefix(dirs, {"api", "backend", "server", "service"})
     health = next(iter(sorted(found["healthRoutes"], key=lambda r: ("health" not in r, r))), None)
+    # Never a guessed path: a prefix that matches nothing lets every migration PR past the gate.
+    migs = found["migrationDirs"]
+    migrations = migs[0] if len(migs) == 1 else None
     mandatory = [
         {"key": "SMOKE_GATE_REPO", "value": found["githubRepo"],
          "why": "the GitHub repo whose labeled PRs the gate watches; every gate reads it through gh",
@@ -176,14 +187,16 @@ def propose(found):
         {"key": "SMOKE_GATE_BACKEND_PREFIX", "value": back,
          "why": "the backend's directory; freeze markers live under it; ends in /",
          "find": "the API app's directory in the repo"},
-        {"key": "SMOKE_GATE_MIGRATIONS_PREFIX", "value": (back + "migrations/") if back else None,
+        {"key": "SMOKE_GATE_MIGRATIONS_PREFIX", "value": migrations,
          "why": "an ordinary PR touching it is refused (migrations never run against shared dev); ends in /",
-         "find": "the directory holding schema migrations"},
+         "find": "the directory holding schema migrations" + (" (found: " + ", ".join(migs) + ")" if migs else "")},
     ]
+    if provider == "render":
+        mandatory.append(
+            {"key": "SMOKE_GATE_DEV_URL", "value": None,
+             "why": "develop gate only: the shared dev environment it smoke-tests; that gate refuses without it",
+             "find": "the dev environment's public URL"})
     recommended = [
-        {"key": "SMOKE_GATE_DEV_URL", "value": None,
-         "why": "develop watcher only (Render): the shared dev environment it smoke-tests; that gate refuses without it",
-         "find": "the dev environment's public URL"},
         {"key": "SMOKE_GATE_HEALTH_PATH", "value": health,
          "why": "the backend readiness probe; default /healthz",
          "find": "the route the backend answers 200 on once it can serve traffic"},
@@ -210,6 +223,12 @@ def propose(found):
                         "predictable URL, or open an adapter request".format(h))
     if "Expo" in found["frameworks"] or "React Native" in found["frameworks"]:
         gaps.append("native app: campaigns drive web previews only; native changes need a manual test packet")
+    if len(migs) > 1:
+        gaps.append("several migration directories ({}): the gate takes one prefix; set the one whose PRs "
+                    "must be refused".format(", ".join(migs)))
+    elif not migs:
+        gaps.append("no migration directory found: set SMOKE_GATE_MIGRATIONS_PREFIX to where schema "
+                    "migrations live")
     if not found["githubRepo"]:
         gaps.append("no GitHub origin found: every gate reads PRs, CI and trees through gh")
     if provider == "static":

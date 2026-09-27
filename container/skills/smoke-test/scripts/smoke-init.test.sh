@@ -45,6 +45,9 @@ OUT="$(python3 "$INIT" propose "$T/render")"
 check "render maps to the render provider" "$OUT" '(.mandatory[] | select(.key == "SMOKE_PREVIEW_PROVIDER") | .value) == "render"'
 check "scp-style origin parsed" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_REPO") | .value) == "acme/gizmo"'
 check "backend prefix from dir name" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_BACKEND_PREFIX") | .value) == "backend/"'
+check "no migration dir: no guessed prefix" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == null'
+check "no migration dir named as a gap" "$OUT" '.gaps | any(startswith("no migration directory"))'
+check "render: the develop gate's dev URL is mandatory" "$OUT" '[.mandatory[] | .key] | index("SMOKE_GATE_DEV_URL") != null'
 
 # --- 3. Cloudflare Pages + Vite: {branch} alias template -------------------
 mkrepo pages https://github.com/acme/site
@@ -53,6 +56,7 @@ printf 'name = "site"\npages_build_output_dir = "dist"\n' >"$T/pages/wrangler.to
 OUT="$(python3 "$INIT" propose "$T/pages")"
 check "cloudflare branch-alias template" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_FRONTEND_SERVICE") | .value) == "https://{branch}.<project>.pages.dev"'
 check "static needs a version route" "$OUT" '(.recommended[] | select(.key == "SMOKE_PREVIEW_VERSION_PATH") | .value) == "/version"'
+check "static: no develop-gate dev URL proposed" "$OUT" '[.mandatory[], .recommended[] | .key] | index("SMOKE_GATE_DEV_URL") == null'
 
 # --- 4. Hosts without an adapter, native apps, no GitHub origin -----------
 mkdir -p "$T/fly"
@@ -63,6 +67,30 @@ check "unsupported host named as a gap" "$OUT" '.gaps | any(startswith("fly: no 
 check "native app named as a gap" "$OUT" '.gaps | any(startswith("native app"))'
 check "missing GitHub origin named as a gap" "$OUT" '.gaps | any(startswith("no GitHub origin"))'
 check "detect alone lists hosts" "$(python3 "$INIT" detect "$T/fly")" '.previewHosts | has("fly")'
+
+# --- 4b. Migration dirs come from the tree; Go and Rails dirs are services ----
+mkrepo prisma https://github.com/acme/ledger
+mkdir -p "$T/prisma/api/prisma/migrations"
+echo '{"dependencies":{"express":"4.0.0"}}' >"$T/prisma/api/package.json"
+OUT="$(python3 "$INIT" propose "$T/prisma")"
+check "prisma migrations dir, not a guessed api/migrations/" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == "api/prisma/migrations/"'
+mkrepo rails https://github.com/acme/shop
+mkdir -p "$T/rails/web" "$T/rails/server/db/migrate" "$T/rails/api"
+echo '{"dependencies":{"next":"15.0.0"}}' >"$T/rails/web/package.json"
+printf "source 'https://rubygems.org'\ngem 'rails', '~> 8.0'\n" >"$T/rails/server/Gemfile"
+printf 'module example.test/api\n' >"$T/rails/api/go.mod"
+OUT="$(python3 "$INIT" propose "$T/rails")"
+check "go and rails dirs recorded as services" "$OUT" '.detected.serviceDirs == ["api/","server/","web/"]'
+check "rails db/migrate is the migrations prefix" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == "server/db/migrate/"'
+PROBLEMS="$(env $(jq -r '.mandatory[] | select(.key | endswith("_PREFIX")) | "\(.key)=\(.value)"' <<<"$OUT") \
+  bash -c '. "$1"; layout_prefix_problems' _ "$SCRIPT_DIR/smoke-gate-layout.sh")"
+[ -z "$PROBLEMS" ] && ok "go/rails prefixes pass smoke-gate-layout.sh" || fail "go/rails prefixes refused by the gate:$PROBLEMS"
+mkrepo twomig https://github.com/acme/depot
+mkdir -p "$T/twomig/api/migrations" "$T/twomig/data/migrations"
+echo '{"dependencies":{"express":"4.0.0"}}' >"$T/twomig/api/package.json"
+OUT="$(python3 "$INIT" propose "$T/twomig")"
+check "two migration dirs: no prefix chosen" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == null'
+check "two migration dirs named as a gap" "$OUT" '.gaps | any(startswith("several migration directories (api/migrations/, data/migrations/)"))'
 
 # --- 5. The draft: private dir only, never overwritten, never inside the skill
 mkdir -p "$T/group"
