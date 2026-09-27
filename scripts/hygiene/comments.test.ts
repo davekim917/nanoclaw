@@ -59,6 +59,19 @@ describe('comment scan flags', () => {
     expect(rules(source).map(([, found]) => found)).toContain(rule);
   });
 
+  it('scans a directive description like any comment', () => {
+    expect(rules('// eslint-disable-next-line no-console -- see #123\nconsole.log(1);\n')).toEqual([[1, 'pr-history']]);
+    expect(rules('// prettier-ignoreSomething: moved from core.ts:12 in #123\nconst a = 1;\n')).toEqual([
+      [1, 'file-line-citation'],
+      [1, 'pr-history'],
+    ]);
+  });
+
+  it('splits a comment on CR, CRLF and Unicode line separators', () => {
+    expect(rules('/* one\r * fixed in #123\r */\rconsole.log(1);\n')).toEqual([[2, 'pr-history']]);
+    expect(rules('/* one\u2028 * fixed in #123\u2029 */\nconsole.log(1);\n')).toEqual([[2, 'pr-history']]);
+  });
+
   it('scans a multi-line block that starts with a directive', () => {
     expect(rules('/* eslint-disable no-console\n * fixed in #123\n */\nconsole.log(1);\n')).toEqual([
       [2, 'pr-history'],
@@ -80,13 +93,7 @@ describe('comment scan flags', () => {
 
 describe('comment scan passes', () => {
   it.each([
-    [
-      'a lint directive that cites evidence',
-      '// eslint-disable-next-line no-console -- see core.ts:12 and #5\nconsole.log(1);\n',
-    ],
-    ['a type directive', '// @ts-expect-error -- upstream types lag, #44\nconst a: number = "x";\n'],
     ['a formatter directive', '// prettier-ignore\nconst m = [1,0, 0,1];\n'],
-    ['a coverage directive', '/* c8 ignore next -- see a.ts:1 */\nconst a = 1;\n'],
     ['a shebang line', '#!/usr/bin/env -S tsx --conditions=a.ts:1 #1234\nexport const a = 1;\n'],
     ['citations inside strings', 'const s = \'see src/router.ts:42 and #1144\';\nconst d = "// b.ts:2";\n'],
     ['citations inside template text', 'const t = `see src/router.ts:42 ${a} and // c.ts:3 #9`;\n'],
@@ -161,18 +168,19 @@ describe('comment-only line count', () => {
     expect(count(source)).toBe(0);
   });
 
-  it('counts nothing for a tooling directive', () => {
+  it('counts a tooling directive like any comment', () => {
     const source =
       '/// <reference types="node" />\n// @ts-check\n// eslint-disable-next-line no-console\n/* c8 ignore next */\n// @ts-expect-error -- lagging types\nconsole.log(1);\n';
-    expect(count(source)).toBe(0);
+    expect(count(source)).toBe(5);
+    expect(count('// prettier-ignoreSomething: moved from core.ts:12 in #123\nconst a = 1;\n')).toBe(1);
+  });
+
+  it('counts each line of a CR-separated block', () => {
+    expect(count('/* one\r * two\r */\rconsole.log(1);\n')).toBe(3);
   });
 
   it('counts every line of a multi-line block that starts with a directive', () => {
     expect(count('/* eslint-disable no-console\n * narration about the code\n */\nconsole.log(1);\n')).toBe(3);
-  });
-
-  it('keeps a single-line directive with its reason exempt', () => {
-    expect(count('// eslint-disable-next-line no-console -- the CLI prints\nconsole.log(1);\n')).toBe(0);
   });
 
   it('counts nothing for a shebang', () => {
