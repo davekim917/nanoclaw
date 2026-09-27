@@ -1,28 +1,9 @@
 /**
- * Host-side container config for the `codex` provider.
- *
- * Codex reads auth and MCP config from ~/.codex. We give each session its
- * own private copy of that directory. Host coupling is CREDENTIAL-ONLY:
- *
- * - auth.json comes from the per-group `~/.codex-<folder>/` when present,
- *   else the shared-account `~/.codex/auth.json` — the same scoped-override /
- *   shared-fallback semantics as Claude's .env token resolution.
- * - config.toml is GENERATED (buildContainerCodexConfig). The host's own
- *   config.toml never reaches a container: it carries host-personal state
- *   (model default, personality, the projects trust table, TUI/hook state)
- *   that is meaningless or leaky in-container. The in-container runtime
- *   appends MCP server blocks and writes hooks.json on every spawn
- *   (codex-app-server.ts), and per-query model/effort arrive via -c from
- *   container.json providerConfig.
- * - agents/ named-role definitions come from the GROUP-OWNED
- *   `groups/<folder>/.codex/agents/` (tracked in the groups repo, parallel
- *   to `.claude/agents/*.md`), populated by `src/codex-sync.ts`. There is
- *   deliberately NO fallback to any host `~/.codex*` agents dir.
- *
- * Env passthrough covers the two knobs that are read at runtime:
- *   OPENAI_API_KEY  — fallback auth when auth.json isn't a subscription token
- *   CODEX_MODEL     — model override if the user wants something other than the default
- *   OPENAI_BASE_URL — rare, but supports API-compatible alternates
+ * Host-side container config for the `codex` provider. Each session gets a private ~/.codex; host coupling is
+ * CREDENTIAL-ONLY. auth.json comes from `~/.codex-<folder>/` when present, else `~/.codex/`. config.toml is GENERATED:
+ * the host's own carries host-personal state (trust table, TUI and hook state) that is meaningless or leaky in a
+ * container. agents/ comes only from the group-owned `groups/<folder>/.codex/agents/`, with deliberately NO fallback
+ * to a host `~/.codex*` dir.
  */
 import fs from 'fs';
 import os from 'os';
@@ -40,22 +21,19 @@ import { registerProviderContainerConfig, type VolumeMount } from './provider-co
 
 function resolveCodexSourceDir(agentGroupFolder: string | undefined, agentGroupId: string, hostHome: string): string {
   const scopedFolder = agentGroupFolder || agentGroupId;
-  // Defense-in-depth — same rationale as resolveOpenCodeSourceDir in opencode.ts.
+  // folder/id reaches path.join, so traversal is rejected before the scoped path is formed.
   assertValidGroupFolder(scopedFolder);
   const scoped = path.join(hostHome, `.codex-${scopedFolder}`);
   if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
   return path.join(hostHome, '.codex');
 }
 
-/** Container working roots that codex should treat as trusted projects. */
 const CONTAINER_TRUSTED_PROJECTS = ['/workspace/agent', '/workspace/workgroup', '/workspace/worktrees', '/tmp'];
 
 /**
- * Container-owned base config.toml. Every setting a container needs is
- * declared here explicitly — nothing is inherited from the host CLI's
- * config. The values mirror what the fleet has always effectively run with;
- * [features] is load-bearing (hooks = the destructive-action guard chain,
- * multi_agent = native subagents, memories/goals = their MCP surfaces).
+ * Container-owned base config.toml: every setting is declared here, nothing is inherited from the host CLI.
+ * [features] is load-bearing (hooks = the destructive-action guard chain, multi_agent = native subagents,
+ * memories/goals = their MCP surfaces).
  */
 export function buildContainerCodexConfig(): string {
   return [
@@ -76,18 +54,10 @@ export function buildContainerCodexConfig(): string {
     'multi_agent = true',
     '',
     '[agents]',
-    // No `default_subagent_reasoning_effort` here, on purpose (operator,
-    // 2026-09-17, matching the host's own ~/.codex/config.toml): a Codex
-    // subagent runs at Codex's native default unless the spawn names a
-    // `reasoning_effort` or its ROLE carries `model_reasoning_effort` — the
-    // role is applied after the spawn argument and sets the effort
-    // unconditionally (codex-rs 0.154.0 multi-agent spawn handler and agent
-    // role), and `formatCodexAgentToml` writes that
-    // key for any agent `.md` with an `effort:` (src/claude-agent-md.ts), so
-    // the five `/orchestrate` shims each pin their own level.
-    // Kept byte-identical with CONTAINER_CODEX_CONFIG_BASE in
-    // container/agent-runner/src/codex-companion-setup.ts (parallel Bun tree,
-    // no shared modules); src/provider-surfaces.test.ts proves the two agree.
+    // No `default_subagent_reasoning_effort`, on purpose: a subagent runs at Codex's native default unless the spawn or
+    // its ROLE sets an effort, and each `/orchestrate` shim's role pins its own level.
+    // Byte-identical with CONTAINER_CODEX_CONFIG_BASE in container/agent-runner/src/codex-companion-setup.ts
+    // (src/provider-surfaces.test.ts).
     'max_concurrent_threads_per_session = 5',
     '',
     ...CONTAINER_TRUSTED_PROJECTS.flatMap((proj) => [`[projects."${proj}"]`, 'trust_level = "trusted"', '']),
@@ -98,19 +68,13 @@ registerProviderContainerConfig('codex', (ctx) => {
   const codexDir = path.join(ctx.sessionDir, 'codex');
   fs.mkdirSync(codexDir, { recursive: true });
   assertRealDirectory(codexDir);
-  // The plugin cache is derived exclusively from `/workspace/plugins`.
-  // Rebuild it on every container spawn so an unchanged plugin version cannot
-  // leave stale bytes in a long-lived session directory.
+  // Rebuilt on every spawn so an unchanged plugin version cannot leave stale bytes in a long-lived session dir.
   removeUntrustedPathEntry(codexDir, 'plugins');
-  // Remove the top-level derived temp entry, not `.tmp/marketplaces`: `.tmp`
-  // was container-writable and could otherwise redirect host cleanup through
-  // a planted intermediate symlink.
+  // The top-level `.tmp`, not `.tmp/marketplaces`: `.tmp` was container-writable and could redirect host cleanup
+  // through a planted intermediate symlink.
   removeUntrustedPathEntry(codexDir, '.tmp');
   const mounts: VolumeMount[] = [{ hostPath: codexDir, containerPath: '/home/node/.codex', readonly: false }];
 
-  // Credential-only host read: auth.json from the per-group Codex home when
-  // present (`~/.codex-<folder>/auth.json`), otherwise the shared-account
-  // fallback `~/.codex/auth.json`. Nothing else is sourced from host homes.
   const hostHome = ctx.hostEnv.HOME || os.homedir();
   let authContents: Buffer | null = null;
   if (hostHome) {
@@ -122,20 +86,14 @@ registerProviderContainerConfig('codex', (ctx) => {
   }
   const configContents = buildContainerCodexConfig();
 
-  // agents/: named subagent role definitions ([agents.*] roles read from
-  // $CODEX_HOME/agents/*.toml). Group-owned: `groups/<folder>/.codex/agents/`,
-  // written by `src/codex-sync.ts` (managed roster) plus any hand-authored
-  // role tomls (e.g. a QA worker), tracked in the groups repo exactly like
-  // `.claude/agents/*.md`. Mount RO (definitions are read-only to Codex;
-  // keeps host re-syncs live and prevents the container from mutating defs).
-  // Deliberately no fallback to `~/.codex*` — host CLI config must never
-  // shape a container agent.
+  // Mounted RO so the container cannot mutate role definitions and host re-syncs stay live. Deliberately no fallback
+  // to `~/.codex*`: host CLI config must never shape a container agent.
   const groupAgents = path.join(ctx.groupDir, '.codex', 'agents');
   const groupAgentsEntry = fs.lstatSync(groupAgents, { throwIfNoEntry: false });
   const agentsDir = groupAgentsEntry ? resolveContainedRealDirectory(ctx.groupDir, '.codex', 'agents') : null;
 
-  // Every generated entry may have been replaced while the prior container
-  // owned this RW mount. Recreate them without following prior symlinks.
+  // Every generated entry may have been replaced while the prior container owned this RW mount, so each is recreated
+  // without following prior symlinks.
   if (authContents) replaceUntrustedFile(codexDir, 'auth.json', authContents);
   else removeUntrustedPathEntry(codexDir, 'auth.json');
   replaceUntrustedFile(codexDir, 'config.toml', configContents);
@@ -146,8 +104,7 @@ registerProviderContainerConfig('codex', (ctx) => {
       hostPath: agentsDir,
       containerPath: '/home/node/.codex/agents',
       readonly: true,
-      // groupDir is agent-writable. Reuse the runner's just-before-Docker
-      // realpath check so a post-validation swap aborts instead of escaping.
+      // groupDir is agent-writable: the runner's just-before-Docker realpath check aborts a post-validation swap.
       overlayAllowedRoots: [fs.realpathSync(ctx.groupDir)],
     });
   }

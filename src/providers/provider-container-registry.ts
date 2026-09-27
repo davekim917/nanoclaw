@@ -21,17 +21,11 @@ export interface VolumeMount {
   containerPath: string;
   readonly: boolean;
   /**
-   * Set on symlink-overlay mounts whose source lives under an agent-writable
-   * tree. Spawn re-validates hostPath against these roots immediately before
-   * emitting docker args (TOCTOU window between buildMounts' realpath check
-   * and container start — codex phase-A review P1).
+   * Spawn re-validates hostPath against these roots just before emitting docker args, closing the gap after
+   * buildMounts' realpath check.
    */
   overlayAllowedRoots?: string[];
-  /**
-   * Host-owned workgroup policy mount. Revalidated immediately before Docker
-   * receives the pathname, because source archives can be mutable while a
-   * spawn is assembling its other mounts.
-   */
+  /** Revalidated just before Docker receives the pathname: source archives can change while other mounts assemble. */
   workgroupReadAccess?: true;
 }
 
@@ -96,10 +90,7 @@ interface RegistryEntry {
 const registry = new Map<string, RegistryEntry>();
 
 export function registerProviderContainerConfig(
-  // `string` (not `Provider`) so third-party providers installed via skills
-  // can register without extending the shared type. The Provider enum in
-  // types.ts covers the built-ins (claude/codex/opencode); runtime checks
-  // should narrow against PROVIDERS instead of repeating the union.
+  // `string`, not `Provider`, so skill-installed providers can register without extending the shared type.
   name: string,
   fn: ProviderContainerConfigFn,
   capabilities: ProviderHostCapabilities = {},

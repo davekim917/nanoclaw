@@ -28,15 +28,9 @@ import { log } from '../log.js';
 import { isGuardedAction, type GuardedAction } from './guard-actions.js';
 import { ALLOW, DENY, type GuardDecision, type GuardInput } from './types.js';
 
-// Synchronous by design (seam-3 plan §4.5, I-1): this decision runs inside
-// callers' guard-adjacent blocks — `guard(a2aSend)` inside the agent-route
-// WriteGuard, `guard(threadsClose)` inside thread-close's one synchronous
-// decision — so it never awaits. Its central reads execute the leaf's exported
-// SQL through `withRawDb`, which means every consult site runs inside a
-// `withCentralSync` block (the lease that keeps a synchronous central read out
-// of an open driver transaction). A consult outside a block throws
-// `RawAccessOutsideSyncBlockError` from the read — a programming error at the
-// call site, surfaced rather than silently allowed.
+// Synchronous by design: consulted inside callers' synchronous guard blocks, so it never awaits. Its central reads go
+// through `withRawDb`, so every consult site must run inside `withCentralSync`; outside one the read throws
+// `RawAccessOutsideSyncBlockError`.
 export function guard(action: GuardedAction, input: GuardInput): GuardDecision {
   if (!isGuardedAction(action)) {
     // JS-level backstop — the branded type already forbids this. A
