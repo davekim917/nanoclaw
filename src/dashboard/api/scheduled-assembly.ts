@@ -1,9 +1,7 @@
 /**
- * Scheduled Tasks Board read assembly and health derivation.
- * Assembled on demand from the session DBs, never a materialized table (derived state that diverged from truth caused
- * past incidents). One session per event-loop tick, never one long synchronous block in the shared host process.
- * Single-flight plus a 5s TTL cache guarded by a generation counter, so a mutation landing mid-assembly forces a
- * re-run.
+ * Scheduled Tasks Board read assembly and health derivation, built from the session DBs on each request (no
+ * materialized table). Yields one session per event-loop tick: the host process is shared. A 5s TTL cache is guarded
+ * by a generation counter, so a mutation landing mid-assembly forces a re-run.
  * Board DB opens are read-only with busy_timeout 1000, never the write path's 5000. A per-session read failure never
  * fails the snapshot: the session adds to `unreadable` and the rest still return.
  */
