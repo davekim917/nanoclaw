@@ -39,10 +39,8 @@ import { getRawDb as rawHandleForMigrations, initTestDb as openTestDb } from './
 import { runMigrations as applyAllMigrations } from './migrations/index.js';
 
 /**
- * Test fixture: a fresh in-memory central DB with every migration applied.
- * Tests seed through this instead of `runMigrations(getRawDb())` so a new
- * test file never has to name `getRawDb` — the raw-db ratchet pin is
- * shrink-only (plan §4.2), and this module already carries the name.
+ * Test fixture: a fresh in-memory central DB with every migration applied, so test files never name `getRawDb` (the
+ * raw-db ratchet is shrink-only).
  */
 export async function initMigratedTestDb(): Promise<void> {
   await openTestDb();

@@ -1,11 +1,6 @@
 /**
- * Rolling thread anchors for recurring task-session posts to a destination
- * (fleet-hardening Phase 1.4). See migration 048 for the "why" — this module
- * is just get/set/delete plus the rotation predicate delivery.ts consults.
- *
- * Seam 3 PR 5d: the three statements run on the async driver. Each is a single
- * statement — the setter is one `INSERT ... ON CONFLICT DO UPDATE` — so none
- * needs `centralTransaction` (plan §4.1, §4.4).
+ * Rolling thread anchors for recurring task-session posts to a destination (migration 048): get/set/delete plus the
+ * rotation predicate delivery.ts consults. Single statements only, so none needs `centralTransaction`.
  */
 import { getDb } from './connection.js';
 
@@ -63,11 +58,8 @@ export async function deleteTaskThreadAnchor(
 }
 
 /**
- * Rotation granularity: an anchor is reused only while its bucket key
- * matches "now"'s. Default bucket is the UTC calendar day (`YYYY-MM-DD`
- * prefix of an ISO-8601 timestamp) — change the slice length to retune
- * (e.g. `.slice(0, 13)` for hourly buckets). Cheap and obvious on purpose:
- * this is the one constant fleet-hardening 1.4 asked to keep easy to change.
+ * Rotation granularity: an anchor is reused only while its bucket key matches now's. The UTC calendar day; change the
+ * slice length to retune (13 for hourly).
  */
 export function anchorRotationKey(iso: string): string {
   return iso.slice(0, 10);

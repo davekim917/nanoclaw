@@ -1,25 +1,10 @@
 /**
- * Typed accessors over `host_inbound_provenance` (migration 079) — the record
- * of which `<session>/.host/inbound.db` files THIS HOST created.
- *
- * The table lives in the central DB (`data/v2.db`), which is host-only and
- * never mounted into a container. That is the entire point: a container can
- * create a convincing `.host/inbound.db` on the filesystem — review proved it
- * can, under the pre-deploy mount set — but it cannot write a
- * row here, so "the host made this" stays unforgeable. See migration 079 for
- * why no content-based or filesystem-based test can answer that question.
- *
- * ASYNC, THROUGH THE LEASE, AND NOT `getRawDb()`. The obvious shape for a gate
- * called from a synchronous migration would be a bare synchronous read. Two
- * standing ratchets forbid adding one, and both only ever shrink:
- * `raw-db-ratchet.test.ts` pins the SET of files naming `getRawDb`, and
- * `raw-outside-lease.test.ts` pins the CALL sites, because a raw statement
- * issued while `centralTransaction`'s async `BEGIN IMMEDIATE` is open silently
- * joins a transaction it knows nothing about. So these go through
- * `withCentralSync(() => withRawDb(...))` like every other central read the
- * fork added after the seam, and `migrateInboundDbToHostDir` became async to
- * match — its one production caller, `buildMounts`, was already async and holds
- * no lease at that point.
+ * Records which `<session>/.host/inbound.db` files THIS HOST created (migration 079). The table lives in the
+ * host-only central DB: a container can forge a convincing `.host/inbound.db` on disk but cannot write a row here, so
+ * "the host made this" stays unforgeable.
+ * Async through `withCentralSync(() => withRawDb(...))`, never a bare `getRawDb()` read: the raw-db ratchets forbid
+ * new call sites, since a raw statement issued while `centralTransaction`'s `BEGIN IMMEDIATE` is open silently joins
+ * that transaction.
  */
 import fs from 'fs';
 
@@ -28,28 +13,20 @@ import { withCentralSync, withRawDb } from './central-lease.js';
 export interface HostInboundProvenanceRow {
   agent_group_id: string;
   session_id: string;
-  /** `st_dev` as a decimal string — see migration 079 on why not INTEGER. */
+  /** `st_dev` as a decimal string (see migration 079 on why not INTEGER). */
   device: string;
-  /** `st_ino` as a decimal string. */
   inode: string;
   created_at: string;
 }
 
-/** The identity of a file on disk, in the exact spelling the table stores. */
 export interface FileIdentity {
   device: string;
   inode: string;
 }
 
 /**
- * Identify a file precisely enough to compare it later.
- *
- * `bigint: true` is load-bearing: `st_ino` can exceed 2^53, and a rounded
- * inode would compare equal to its neighbours — a fail-OPEN in the rare case
- * this gate exists to catch. Returns null when the file is not there, which
- * callers must read as "vanished", never as "failed provenance".
- *
- * Stays synchronous: it touches the filesystem, not the central DB.
+ * `bigint: true` is load-bearing: `st_ino` can exceed 2^53, and a rounded inode compares equal to its neighbours,
+ * failing OPEN. Null means the file is gone; callers must read that as "vanished", never "failed provenance".
  */
 export function fileIdentityOf(filePath: string): FileIdentity | null {
   try {
@@ -60,7 +37,6 @@ export function fileIdentityOf(filePath: string): FileIdentity | null {
   }
 }
 
-/** Record that this host created `.host/inbound.db` for a session. */
 export async function recordHostInboundProvenance(
   agentGroupId: string,
   sessionId: string,
@@ -81,7 +57,6 @@ export async function recordHostInboundProvenance(
   );
 }
 
-/** The recorded provenance for a session, or null when this host recorded none. */
 export async function readHostInboundProvenance(
   agentGroupId: string,
   sessionId: string,
@@ -99,7 +74,6 @@ export async function readHostInboundProvenance(
   return row ?? null;
 }
 
-/** Forget a session's provenance, for a session being destroyed. */
 export async function deleteHostInboundProvenance(agentGroupId: string, sessionId: string): Promise<void> {
   await withCentralSync(
     () =>

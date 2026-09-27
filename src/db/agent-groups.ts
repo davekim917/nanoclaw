@@ -3,26 +3,14 @@ import { getDb } from './connection.js';
 import { updateColumnsById } from './update-columns.js';
 
 /**
- * The `getAgentGroup` read, as a constant, so a synchronous guard-path caller
- * can execute the SAME statement through the raw handle.
- *
- * One constant, two executors — NOT a `*Sync` twin of the export
- * (docs/specs/upstream-async-central-db-seam/plan.md §4.5 I-1). The only such
- * caller is `modules/agent-to-agent/write-destinations.ts`, whose `resolve()`
- * must not yield between the read and the REPLACE-shaped projection it feeds.
+ * For `modules/agent-to-agent/write-destinations.ts`'s synchronous `resolve()`, which must not yield between this
+ * read and the REPLACE-shaped projection it feeds. One constant, two executors, never a `*Sync` twin.
  */
 export const AGENT_GROUP_BY_ID_SQL = 'SELECT * FROM agent_groups WHERE id = ?';
 
 /**
- * Insert an agent group.
- *
- * `workgroup_id` is bound explicitly and defaults to NULL, which is what the
- * column did implicitly before it was named here (migration 036 added it
- * nullable). Every caller that does not set it therefore writes exactly the
- * row it wrote before; the one caller that does is `applyCreateAgent`, which
- * has a parent workgroup to inherit. The parameter object is built field by
- * field rather than passing `group` through, because an `AgentGroup` read back
- * with `SELECT *` carries keys this statement does not name.
+ * `workgroup_id` defaults to NULL. The params are built field by field because an `AgentGroup` read with `SELECT *`
+ * carries keys this statement does not name.
  */
 export async function createAgentGroup(group: AgentGroup): Promise<void> {
   await getDb().run(
@@ -63,11 +51,8 @@ export async function deleteAgentGroup(id: string): Promise<void> {
 }
 
 /**
- * The OneCLI secret declarations on the workgroup this agent group belongs
- * to. These are the shared baseline every sibling inherits at spawn — the
- * host merges them (union) with the per-group `container.json.onecliSecrets`
- * before calling `applyOnecliSecrets`. Returns [] if the group has no
- * workgroup or the workgroup declares none. See `mergeWorkgroupAndGroupSecrets`.
+ * The workgroup's shared baseline, unioned at spawn with the group's own `container.json.onecliSecrets`
+ * (`mergeWorkgroupAndGroupSecrets`). [] when there is no workgroup or it declares none.
  */
 export async function getWorkgroupOnecliSecrets(agentGroupId: string): Promise<string[]> {
   const row = await getDb().get<{ secrets: string }>(
@@ -80,10 +65,8 @@ export async function getWorkgroupOnecliSecrets(agentGroupId: string): Promise<s
 }
 
 /**
- * Workgroup-keyed variant for spawnContainer's hot path. Joins on
- * `agent_groups.workgroup_id` are racey under concurrent reconcile, so this
- * variant takes the already-resolved workgroup id and queries the workgroups
- * row directly. Returns [] if no such workgroup exists.
+ * Takes the already-resolved workgroup id: joining through `agent_groups.workgroup_id` is racy under concurrent
+ * reconcile.
  */
 export async function getWorkgroupOnecliSecretsById(workgroupId: string): Promise<string[]> {
   const row = await getDb().get<{ secrets: string }>(
@@ -94,21 +77,9 @@ export async function getWorkgroupOnecliSecretsById(workgroupId: string): Promis
 }
 
 /**
- * Every workgroup's OneCLI secret declarations, keyed by workgroup id.
- *
- * For the one caller that has to ask "does ANY workgroup still declare this
- * secret?" rather than "what does this group inherit?": `ncl integrations
- * remove --delete-secret`, which must refuse instead of deleting a vault
- * secret some other declaration site still names. The merge is union-only —
- * "per-group secrets are appended additively. Neither list can subtract from
- * the other" (`mergeWorkgroupAndGroupSecrets` in `onecli-secrets.ts`) —
- * so a group's own `container.json` can never take back a workgroup
- * declaration, and deleting a secret a workgroup still names aborts every
- * spawn of every group in it.
- *
- * Installs have tens of workgroups, not thousands, and this runs once per
- * `--delete-secret`, so it reads them all rather than pushing a LIKE match
- * into SQL against a JSON text column.
+ * For `ncl integrations remove --delete-secret`, which must refuse while ANY workgroup still names the secret: the
+ * merge is union-only, so no group can take back a workgroup declaration, and deleting a still-named secret aborts
+ * every spawn in that workgroup.
  */
 export async function getAllWorkgroupOnecliSecrets(): Promise<{ id: string; secrets: string[] }[]> {
   const rows = await getDb().all<{ id: string; secrets: string }>(

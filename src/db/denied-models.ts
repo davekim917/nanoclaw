@@ -2,19 +2,9 @@ import { resolveEffectiveModel } from '../flag-parser.js';
 import { getDb } from './connection.js';
 
 /**
- * Operator-curated blocklist of forbidden (provider, slug) pairs.
- *
- * The agent's reachable model set comes from `opencode models` inside the
- * container (live, OpenCode-CLI-knows-everything). This table is the small
- * "operator says no" layer that filters that live set: anything in here is
- * never offered to the agent and `change_model` / `ncl groups config update
- * --model X` reject it with the recorded reason.
- *
- * Replaces the 037 allowlist (which was over-engineered) — see migration
- * 039 docstring for rationale.
- *
- * Seam 3 PR 5d: all four statements run on the async driver. Each is a single
- * statement, so none needs `centralTransaction` (plan §4.1, §4.4).
+ * Operator blocklist of (provider, slug) pairs, filtering the live model set the container reports: a denied model is
+ * never offered, and `change_model` / `ncl groups config update --model` reject it with the recorded reason. Single
+ * statements only, so none needs `centralTransaction`.
  */
 export interface DeniedModel {
   provider: string;
@@ -35,11 +25,9 @@ export function getDeniedModel(provider: string, slug: string): Promise<DeniedMo
 }
 
 /**
- * The deny-list row that blocks setting `model` on `provider`, matching the
- * value as typed, its lowercase form (family names resolve case-insensitively,
- * so a denied `astra` must also refuse `ASTRA`), or the id it resolves to — so
- * a family name (`sol`, `opus`) is refused when its current target is denied. Checked at write only: a
- * later bump that moves a family onto a denied id is not caught here.
+ * Matches the model as typed, lowercased (family names resolve case-insensitively), and as resolved, so a family name
+ * is refused when its current target is denied. Checked at write only: a later bump that moves a family onto a denied
+ * id is not caught.
  */
 export async function getDenialFor(provider: string, model: string): Promise<DeniedModel | undefined> {
   for (const candidate of new Set([model, model.toLowerCase(), resolveEffectiveModel(model)])) {
@@ -49,7 +37,6 @@ export async function getDenialFor(provider: string, model: string): Promise<Den
   return undefined;
 }
 
-/** True when (provider, slug) is in the blocklist. */
 export async function isDeniedModel(provider: string, slug: string): Promise<boolean> {
   return (await getDeniedModel(provider, slug)) !== undefined;
 }

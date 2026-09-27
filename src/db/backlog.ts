@@ -1,23 +1,8 @@
 /**
- * Accessors for ship_log, backlog_items, and commit_digest_state tables.
- *
- * ship_log: one row per shipped feature/change. Written by add_ship_log
- * (MCP tool) and scan_commits (commit digest).
- *
- * backlog_items: one row per open/resolved issue. Written by the backlog
- * MCP tools.
- *
- * commit_digest_state: tracks the last-scanned SHA per repo so scan_commits
- * only picks up new commits on each run.
- *
- * Seam 3 PR 5d: every export runs on the async driver. Each is a single
- * statement, so no caller needs `centralTransaction` — the lease exists to
- * keep a SYNCHRONOUS block out of an open driver transaction, and there is no
- * synchronous block left here (plan §4.1, §4.4).
+ * Accessors for ship_log, backlog_items, and commit_digest_state (the last-scanned SHA per repo, so scan_commits only
+ * sees new commits). Every export is a single statement, so none needs `centralTransaction`.
  */
 import { getDb } from './connection.js';
-
-// ---- Types ----
 
 export interface ShipLogEntry {
   id: string;
@@ -42,7 +27,7 @@ export interface BacklogItem {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
-  /** External tracker URL, present for ephemeral GitHub Issues digest rows. */
+  /** Present for ephemeral GitHub Issues digest rows. */
   url?: string;
 }
 
@@ -52,8 +37,6 @@ export interface CommitDigestState {
   last_commit_sha: string;
   last_scan: string;
 }
-
-// ---- ship_log ----
 
 export async function addShipLogEntry(entry: ShipLogEntry): Promise<void> {
   await getDb().run(
@@ -83,15 +66,9 @@ export function getShipLog(agentGroupId: string, limit = 50): Promise<ShipLogEnt
 }
 
 /**
- * COUNT and page as two sequential awaits, deliberately NOT a
- * `centralTransaction`. The pair once sat in one synchronous lease
- * block, so a concurrent insert could not land between them; now it can, and
- * `total` may exceed what `data` shows by one row for one render. That skew is
- * cosmetic, no writer reads either value back, and neither paginated helper has
- * a runtime caller (they are re-export surface — `src/db/index.ts`). Wrapping
- * them in a transaction would put a lease-acquiring call inside a leaf export,
- * which throws `CentralLeaseReentrancyError` the day a caller invokes it from
- * inside another central transaction. See plan §4.4.
+ * COUNT and page are two awaits, deliberately NOT a `centralTransaction`: `total` can be off by one for one render,
+ * which is cosmetic, while a lease-acquiring leaf export throws `CentralLeaseReentrancyError` when called inside
+ * another central transaction.
  */
 export async function getShipLogPaginated(
   agentGroupId: string,
@@ -119,8 +96,6 @@ export function getShipLogSince(agentGroupId: string, since: string): Promise<Sh
     { agent_group_id: agentGroupId, since: since },
   );
 }
-
-// ---- backlog_items ----
 
 export async function getBacklogItemById(id: string): Promise<BacklogItem | null> {
   return (await getDb().get<BacklogItem>('SELECT * FROM backlog_items WHERE id = $id', { id: id })) ?? null;
@@ -228,7 +203,7 @@ export function getBacklog(agentGroupId: string, status?: string, limit = 100): 
   );
 }
 
-/** Same two-await COUNT/page shape and rationale as `getShipLogPaginated`. */
+/** Same two-await COUNT/page shape as `getShipLogPaginated`. */
 export async function getBacklogPaginated(
   agentGroupId: string,
   status?: string,
@@ -271,8 +246,6 @@ export function getBacklogResolvedSince(agentGroupId: string, since: string): Pr
     { agent_group_id: agentGroupId, since: since },
   );
 }
-
-// ---- commit_digest_state ----
 
 export async function getCommitDigestState(repoPath: string): Promise<CommitDigestState | null> {
   return (

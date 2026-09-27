@@ -1,23 +1,14 @@
 /**
- * Registry rows for remote-MCP OAuth integrations (migration 082).
- *
- * Metadata only. The refresh token and client secret are in the host-side
- * bundle store (`src/modules/mcp-oauth/store.ts`); the access token is in
- * OneCLI. Nothing here is credential material, which is what lets
- * `ncl integrations list` render a row verbatim.
- *
- * Every statement is a single statement, so none needs `centralTransaction`
- * (the same rule `src/db/denied-models.ts` records for its four).
+ * Registry rows for remote-MCP OAuth integrations (migration 082). Metadata only: the refresh token and client secret
+ * live in the host-side bundle store and the access token in OneCLI, which is what lets `ncl integrations list`
+ * render a row verbatim.
  */
 import { getDb } from './connection.js';
 
 /**
- * - `pending` — a login has been started; the authorization code has not been
- *   exchanged yet, so no bearer has ever been written.
- * - `active` — a bearer is in OneCLI and the refresher owns its expiry.
- * - `needs_login` — the refresh token is gone or rejected (`invalid_grant`).
- *   The refresher stops touching this row; only a fresh `login` clears it.
- * - `error` — a transient refresh failure. The refresher keeps retrying.
+ * `pending`: login started, no bearer ever written. `active`: bearer in OneCLI, the refresher owns expiry.
+ * `needs_login`: refresh token gone or rejected; the refresher stops and only a fresh `login` clears it. `error`:
+ * transient refresh failure, retried.
  */
 export type McpOAuthStatus = 'pending' | 'active' | 'needs_login' | 'error';
 
@@ -25,13 +16,13 @@ export interface McpOAuthIntegration {
   name: string;
   agent_group_id: string;
   mcp_url: string;
-  /** RFC 8707 resource indicator from the protected-resource metadata. */
+  /** RFC 8707 resource indicator. */
   resource: string | null;
   authorization_endpoint: string;
   token_endpoint: string;
   registration_endpoint: string | null;
   issuer: string | null;
-  /** Space-delimited, as it travels on the wire. */
+  /** Space-delimited, as on the wire. */
   scopes: string | null;
   redirect_uri: string;
   bearer_secret_name: string;
@@ -40,7 +31,7 @@ export interface McpOAuthIntegration {
   path_pattern: string | null;
   status: McpOAuthStatus;
   status_detail: string | null;
-  /** Access-token expiry, ISO-8601 UTC. Null until the first exchange. */
+  /** Access-token expiry, ISO-8601 UTC; null until the first exchange. */
   expires_at: string | null;
   last_refresh_at: string | null;
   created_at: string;
@@ -66,14 +57,8 @@ export function getMcpOAuthIntegration(name: string): Promise<McpOAuthIntegratio
 }
 
 /**
- * The row occupying `UNIQUE(agent_group_id, mcp_url)` (migration 082:66), if
- * any.
- *
- * Exists so `login` can find out that this (group, URL) pair is already taken
- * BEFORE it registers a client: a dynamic registration that mints a client at
- * the provider and then hits the unique index leaves a credential behind that
- * nothing on this host can see or revoke, and providers do not garbage-collect
- * those.
+ * Lets `login` detect a taken (group, URL) pair BEFORE registering a client: a dynamic registration that then hits
+ * the unique index leaves a provider-side credential nothing here can see or revoke.
  */
 export function getMcpOAuthIntegrationByTarget(
   agentGroupId: string,
@@ -86,11 +71,7 @@ export function getMcpOAuthIntegrationByTarget(
   );
 }
 
-/**
- * Upsert by name — `login` is re-runnable. A re-login against a live
- * integration must not orphan the row (or its OneCLI secret) by inserting a
- * second one, and must not lose `created_at`.
- */
+/** Upsert by name: a re-login must not orphan the row or its OneCLI secret, and must keep `created_at`. */
 export async function upsertMcpOAuthIntegration(
   row: Omit<McpOAuthIntegration, 'created_at' | 'updated_at'>,
 ): Promise<void> {
@@ -123,7 +104,6 @@ export async function upsertMcpOAuthIntegration(
   );
 }
 
-/** Narrow post-exchange / post-refresh write: status, expiry, secret id. */
 export async function markMcpOAuthIntegration(
   name: string,
   patch: {
@@ -132,9 +112,10 @@ export async function markMcpOAuthIntegration(
     expires_at?: string | null;
     bearer_secret_id?: string | null;
     last_refresh_at?: string | null;
-    /** The scope set the server actually GRANTED, which can be narrower than
-     *  what was asked for. Re-sending the requested set on refresh reads as an
-     *  attempt to widen the grant. */
+    /**
+     * The scope set actually GRANTED, possibly narrower than requested; re-sending the requested set on refresh reads
+     * as widening the grant.
+     */
     scopes?: string | null;
   },
 ): Promise<void> {
