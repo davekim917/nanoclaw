@@ -1,51 +1,18 @@
 #!/usr/bin/env tsx
 /**
- * Daily control-band fleet-health check.
+ * Daily control-band fleet-health check, run by a systemd timer
+ * (data/systemd/nanoclaw-fleet-drift.{service,timer} — reference copies only). No LLM calls.
  *
- * Runs once a day via a systemd timer (data/systemd/nanoclaw-fleet-drift.{service,timer}
- * — reference copies only, not installed by this script). No LLM calls; pure
- * arithmetic over collected metrics.
+ * Collects disk usage, ERROR lines in the last 24h and scheduled-task health; fail-closed:
+ * any unreadable source throws and main() returns 1, never silently zero. Appends one line to
+ * data/fleet-drift/metrics.ndjson. disk_growth_bytes and error_events_24h breach at median +
+ * 3×MAD of the prior days; paused_series and failed_streak_max use fixed thresholds. Fewer
+ * than 7 prior days → warm-up, but the instruction-stack tripwire (no history) still runs.
+ * On breach, files one `fleet-drift` GitHub issue per metric; an open issue with the same
+ * title prefix IS the cooldown, and closing it re-arms.
  *
- * Flow:
- *   1. Collect today's metrics — disk usage/pct for data/, ERROR-line count in
- *      the last 24h from logs/nanoclaw.error.log(.1) (ANSI-stripped; src/log.ts
- *      wraps the level tag in color codes and stamps local wall-clock plus an
- *      explicit UTC offset, which is what makes the instant recoverable here),
- *      and fleet-wide scheduled-task health (paused
- *      series / oldest observed pause / worst live failure streak) via a
- *      per-session inbound.db fan-out. Fail-closed: any unreadable source
- *      throws, main() prints it and returns 1 — never silently treated as zero.
- *   2. Append one JSON line to data/fleet-drift/metrics.ndjson, and persist
- *      data/fleet-drift/state.json (first-observed-paused per series — see
- *      advancePauseState; the DB has no authoritative "when paused" signal).
- *   3. Compare today's value against a control band built from prior days:
- *      disk_growth_bytes and error_events_24h breach at median + 3×MAD (scaled
- *      ×1.4826) of the prior series, with a flat-zero guard when MAD is 0.
- *      paused_series and failed_streak_max use fixed thresholds instead (no
- *      band — see pausedSeriesBreach/failedStreakBreach). Fewer than 7 prior
- *      days of history → print a warm-up notice and exit 0 (the instruction-
- *      stack tripwire below has no history dependency and still runs).
- *   3b. instructionStack (no history, no band): a banned-pattern scan for
- *      dates/issue-refs/"Current Focus" headers over container/CLAUDE.md, the
- *      repo-root CLAUDE.md (the dev-facing doc, not the in-container agent
- *      surface) and every group's standing files (persona, plus a legacy
- *      CLAUDE.local.md if one is present — symlinks resolved, a shared file
- *      flagged once fleet-wide), plus a safety walk of the composed doc each
- *      container agent actually receives — provider-aware (container.json):
- *      codex/opencode read their on-disk AGENTS.md directly; claude/default
- *      walk CLAUDE.md's own @-import chain and any legacy CLAUDE.local.md,
- *      which Claude Code still auto-discovers even though compose retired
- *      it. No byte ceilings — see checkInstructionStack.
- *      docs/specs/instruction-stack-prune/plan.md.
- *   4. On breach, file one GitHub issue per breached metric on the origin repo
- *      via `gh`, labeled `fleet-drift`. An already-open issue whose title
- *      starts with `fleet-drift: <metric>` suppresses re-filing — the open
- *      issue IS the cooldown; closing it re-arms.
- *
- * FLEET_DRIFT_DRY_RUN=1: collect + print, write the ndjson line and pause-state
- * to a temp path instead of data/fleet-drift/, never call `gh issue create`.
- * Band computation still reads the REAL prior history (read-only) so the dry
- * run exercises genuine band logic against live data.
+ * FLEET_DRIFT_DRY_RUN=1: writes to a temp path and never calls `gh issue create`; band
+ * computation still reads the REAL prior history (read-only).
  *
  *   node_modules/.bin/tsx scripts/fleet-drift.ts
  *   FLEET_DRIFT_DRY_RUN=1 node_modules/.bin/tsx scripts/fleet-drift.ts
@@ -62,8 +29,6 @@ import { DATA_DIR, REPO_ROOT } from '../src/config.js';
 import { flattenClaudeMd } from '../src/agents-md-flatten.js';
 import { parseLogStamp } from '../src/log.js';
 
-// ─────────────────────────── pure logic (exported for tests) ──────────────
-
 export interface BandResult {
   breach: boolean;
   median: number;
@@ -71,7 +36,6 @@ export interface BandResult {
   threshold: number;
 }
 
-/** Median of a numeric array. Empty input is treated as median 0. */
 export function median(nums: number[]): number {
   if (nums.length === 0) return 0;
   const sorted = [...nums].sort((a, b) => a - b);
@@ -80,11 +44,8 @@ export function median(nums: number[]): number {
 }
 
 /**
- * Control-band breach check: today's `value` against the prior series'
- * median + 3×MAD (scaled ×1.4826 to be a normal-consistent std-dev estimate).
- * When MAD is 0 (flat/zero history), that check would flag any nonzero value,
- * so fall back to value > median×1.5 AND the absolute gap exceeds
- * `flatZeroGuardAbs` — guards a flat-zero history from a one-off small blip.
+ * median + 3×MAD (scaled ×1.4826). When MAD is 0 (flat history) that would flag any nonzero
+ * value, so the fallback also requires the gap to exceed `flatZeroGuardAbs`.
  */
 export function checkBand(value: number, priorValues: number[], flatZeroGuardAbs: number): BandResult {
   const med = median(priorValues);
@@ -108,25 +69,18 @@ export function failedStreakBreach(failedStreakMax: number): boolean {
   return failedStreakMax >= 6;
 }
 
-/** True if an already-open fleet-drift issue covers this metric (the open issue IS the cooldown). */
 export function isDuplicateBreach(openTitles: string[], metric: string): boolean {
   const prefix = `fleet-drift: ${metric}`;
   return openTitles.some((t) => t.startsWith(prefix));
 }
 
-/** Fewer than 7 prior days of history → too little signal for a control band. */
 export function isWarmingUp(priorLineCount: number): boolean {
   return priorLineCount < 7;
 }
 
 /**
- * failed_streak_max is a leading indicator for a series about to auto-pause
- * (recurrence.ts SCRIPT_FAIL_PAUSE_CAP) — exclude a series whose newest row
- * is already 'cancelled' (dead, cancelTask clears its recurrence — src/modules/scheduling/db.ts)
- * or already 'paused' (that state is separately captured by paused_series;
- * the streak that got it there isn't "about to" happen, it already did).
- * Without this a long-dead cancelled series' historical streak would breach
- * forever, since nothing ever appends a fresh non-failed row to reset it.
+ * Excludes a series whose newest row is 'cancelled' or 'paused': nothing ever appends a fresh
+ * row to reset a dead series' streak, so it would breach forever.
  */
 export function isLiveForStreak(latestStatus: string): boolean {
   return latestStatus !== 'cancelled' && latestStatus !== 'paused';
@@ -137,18 +91,9 @@ export interface PauseState {
 }
 
 /**
- * `pauseTask` (src/modules/scheduling/db.ts) only flips `status`; it never
- * stamps a fresh timestamp, so there's no authoritative "when did this
- * pause" signal in the DB — a paused row's `timestamp` is whenever that row
- * was originally inserted, not when it was paused. Track it ourselves:
- * first-observed-paused per series, persisted across runs in state.json.
- *
- * oldest_paused_days = age of the earliest first-seen among currently-paused
- * series. This measures OBSERVED pause duration (since fleet-drift started
- * watching), which LOWER-BOUNDS true pause duration — a series paused before
- * this script ever ran reads as "just paused" on first observation. A series
- * that resumes and later re-pauses is treated as newly first-seen (dropped
- * from state while resumed, so it doesn't inherit its old age).
+ * `pauseTask` never stamps a fresh timestamp, so the DB has no "when paused" signal: track
+ * first-observed-paused per series across runs. This LOWER-BOUNDS true pause duration, and a
+ * series that resumes and re-pauses starts fresh.
  */
 export function advancePauseState(
   prevState: PauseState,
@@ -179,14 +124,9 @@ interface SeriesStat {
 }
 
 /**
- * Fleet-wide scheduled-task health from one session's task rows, ordered by
- * seq DESC. Per series (keyed by COALESCE(series_id, id)):
- *   - latestStatus/latestTimestamp: the row with the highest seq (first row
- *     seen per series, since input is already seq-DESC).
- *   - failedStreak: leading run of 'failed' rows within the subsequence
- *     filtered to status IN ('completed','failed') — mirrors trailingFailedRuns'
- *     predicate in src/modules/scheduling/db.ts exactly, so intervening
- *     pending/paused/cancelled/expired rows don't break or pad the streak.
+ * Per series (keyed by COALESCE(series_id, id)), input ordered by seq DESC. `failedStreak`
+ * must match `trailingFailedRuns` in src/modules/scheduling/db.ts: only 'completed'/'failed'
+ * rows count, so other statuses neither break nor pad the streak.
  */
 export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, SeriesStat> {
   const bySeries = new Map<string, TaskRow[]>();
@@ -210,20 +150,9 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
 }
 
 /**
- * Count `[<stamp>] ERROR ...` lines in `content` whose timestamp is within
- * `windowMs` of `nowMs`. src/log.ts wraps the level tag in ANSI color codes
- * (`\x1b[31mERROR\x1b[39m`) and the message in another color, so a plain
- * `] ERROR` prefix match misses every real line — strip ANSI escapes first.
- * The stamp is LOCAL wall-clock (src/log.ts `ts()` uses local Date getters)
- * followed by an explicit UTC offset, so `parseLogStamp` recovers the
- * absolute instant without assuming anything about this script's own zone.
- *
- * That assumption used to be stated here as "both are plain host processes,
- * no TZ override" — and it was false: the systemd unit sets
- * `TZ=America/New_York` while `/etc/localtime` is `Etc/UTC`, so logger and
- * reader sat 4h apart and the 24h window silently dropped its oldest 4h.
- * Lines predating the offset (rotated logs, kept 30 days) still parse, as
- * local and inexact — the same best-effort reading as before, no worse.
+ * src/log.ts wraps the level tag in ANSI color codes, so ANSI is stripped before matching. The
+ * stamp is local wall-clock plus an explicit UTC offset, which `parseLogStamp` turns into an
+ * absolute instant; the logger's TZ differs from /etc/localtime, so never assume a zone.
  */
 // eslint-disable-next-line no-control-regex -- deliberately matches the ANSI CSI escape byte to strip src/log.ts's color codes
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
@@ -239,8 +168,6 @@ export function countRecentErrorLines(content: string, nowMs: number, windowMs =
   }
   return count;
 }
-
-// ─────────────────────────────── collectors (I/O) ──────────────────────────
 
 function collectDisk(dataDir: string): { usedBytes: number; pct: number } {
   const out = execFileSync('df', ['--output=used,pcent', dataDir], { encoding: 'utf-8' });
@@ -329,7 +256,6 @@ interface StoredMetrics {
   failed_streak_max: number;
 }
 
-/** Raw fleet facts for `now` — everything except oldest_paused_days, which needs cross-run state (see advancePauseState). */
 function collectRaw(now: Date): {
   disk: { usedBytes: number; pct: number };
   errorEvents24h: number;
@@ -350,8 +276,6 @@ function loadPriorMetrics(ndjsonPath: string): StoredMetrics[] {
     .filter((l) => l.trim().length > 0)
     .map((l) => JSON.parse(l) as StoredMetrics);
 }
-
-// ────────────────────────────── breach detection ───────────────────────────
 
 interface Breach {
   metric: string;
@@ -417,30 +341,13 @@ function detectBreaches(metrics: StoredMetrics, priorMetrics: StoredMetrics[]): 
   return breaches;
 }
 
-// ────────────────────── L4: instruction-stack tripwire ─────────────────────
-//
-// Staleness guard for the always-on instruction surface
-// (docs/specs/instruction-stack-prune/plan.md): a banned-pattern scan (dates,
-// issue/PR refs, "Current Focus" headers) that would mean an agent wrote
-// point-in-time facts into a file that's supposed to hold only timeless
-// rules, plus the unscannable-file reporting that falls out of walking a
-// container-writable tree to do it. Size is deliberately not a signal — a
-// standing file is judged by what it says, not how long it is. No LLM, no
-// history, no new timer — this reads the current tree and reports, same as
-// any other check here.
-
-// The banned-pattern scan lives in ./instruction-surface.ts so it can be
-// imported without loading this module (and better-sqlite3 with it).
-// Re-exported here so existing callers and tests are unchanged.
+// The banned-pattern scan lives in ./instruction-surface.ts so it can be imported without
+// loading this module (and better-sqlite3 with it).
 import { scanBannedPatterns } from './instruction-surface.js';
 
 export { scanBannedPatterns };
 
-/**
- * A group's standing-instructions file, plus the retired CLAUDE.local.md.
- * Compose no longer creates or composes the latter, but Claude Code still
- * auto-loads one if it exists, so a leftover is still scanned.
- */
+/** Claude Code still auto-loads a leftover CLAUDE.local.md, so it is scanned too. */
 const GROUP_STANDING_FILENAMES = ['standing-instructions.md', 'CLAUDE.local.md'];
 
 export interface InstructionStackBreach {
@@ -450,7 +357,6 @@ export interface InstructionStackBreach {
   unscannable: Array<{ file: string; reason: string }>;
 }
 
-/** container/CLAUDE.md banned-pattern check. Returns null when clean. */
 export function checkContainerPatterns(containerClaudeMdPath: string): InstructionStackBreach | null {
   const patterns = scanBannedPatterns(fs.readFileSync(containerClaudeMdPath, 'utf-8'));
   if (patterns.length === 0) return null;
@@ -462,7 +368,6 @@ export function checkContainerPatterns(containerClaudeMdPath: string): Instructi
   };
 }
 
-/** Repo-root CLAUDE.md banned-pattern check. Returns null when clean. */
 export function checkTrunkDocPatterns(trunkClaudeMdPath: string): InstructionStackBreach | null {
   const patterns = scanBannedPatterns(fs.readFileSync(trunkClaudeMdPath, 'utf-8'));
   if (patterns.length === 0) return null;
@@ -486,27 +391,17 @@ interface UnscannableFile {
 }
 
 /**
- * `groups/<name>/` is container-writable, so a candidate standing-file path
- * cannot be trusted blind: a symlink to a FIFO would hang this (daily-timer)
- * process forever on read, a symlink/file to something huge or a device
- * would exhaust memory, and a symlink resolving outside groups/ would cross
- * the trust boundary into host-side content. lstat first; a symlink is only
- * followed if its resolved target stays inside `groupsRootResolved`
- * (mirrors the containment check in src/group-persona.ts readGroupPersona,
- * minus the O_NOFOLLOW fd gymnastics — not needed for a read-only metrics
- * job); the resolved target (or the path itself, if not a symlink) must be a
- * regular file under the size cap. Nothing unsafe is ever read — a null
- * return means "doesn't exist" (normal; most groups don't have every
- * candidate filename), a `skip` return means "exists but unsafe to read."
+ * `groups/<name>/` is container-writable: a symlink to a FIFO would hang this process, a huge
+ * file or device would exhaust memory, and a symlink outside groups/ crosses the trust
+ * boundary. lstat first; follow a symlink only if it stays inside `groupsRootResolved`; read
+ * only a regular file under the size cap. `null`: absent; `skip`: exists but unsafe to read.
  */
 function resolveStandingFile(p: string, groupsRootResolved: string): { realPath: string } | { skip: string } | null {
   let stat: fs.Stats;
   try {
     stat = fs.lstatSync(p);
   } catch (err) {
-    // ENOENT is the normal case — most groups don't have every candidate
-    // filename. Anything else (EACCES, a race mid-scan, ...) is unexpected —
-    // fail closed like every other collector in this file, don't swallow it.
+    // ENOENT is normal; anything else fails closed.
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
   }
@@ -536,10 +431,9 @@ function resolveStandingFile(p: string, groupsRootResolved: string): { realPath:
   return check.ok ? { realPath } : { skip: check.reason };
 }
 
-/** ponytail: sanity cap, not a precision limit — 100x+ the real ceiling is plenty of headroom for any legitimate standing file, small enough that a planted huge file/device is never read into memory. */
+/** Sanity cap: never read a planted huge file or device into memory. */
 const MAX_STANDING_FILE_BYTES = 1_000_000;
 
-/** Shared tail check for every safety gate in this file: given an already-obtained `Stats`, is it a regular file under the size cap? */
 function checkRegularSize(stat: fs.Stats): { ok: true } | { ok: false; reason: string } {
   if (!stat.isFile()) return { ok: false, reason: 'not a regular file' };
   if (stat.size > MAX_STANDING_FILE_BYTES)
@@ -547,7 +441,7 @@ function checkRegularSize(stat: fs.Stats): { ok: true } | { ok: false; reason: s
   return { ok: true };
 }
 
-/** Reads one group's standing files, resolving symlinks to their real target so a shared file is read (and counted) once. Unsafe candidates are skipped, never read. */
+/** Symlinks resolve to their real target so a shared file is read and counted once. */
 function readGroupStandingFiles(
   groupDir: string,
   groupsRootResolved: string,
@@ -572,14 +466,8 @@ function readGroupStandingFiles(
 }
 
 /**
- * Banned-pattern check over every group's standing files under `groupsRoot`.
- *
- * Scanned per real file fleet-wide, not per group: sibling groups commonly
- * symlink some or all of their standing files to one source group (e.g. a
- * codex/opencode sibling → its Claude counterpart), and a clone can share
- * only SOME of them (one common persona across a sibling trio, another group
- * in the same workgroup keeping its own). Keying on the resolved real path reports a shared file's hit
- * once, scoped to every group that reaches it, however the sharing is shaped.
+ * Keyed by resolved real path, not group: siblings symlink some or all standing files to one
+ * source, so a shared file's hit is reported once, scoped to every group that reaches it.
  */
 export function checkGroupStandingPatterns(groupsRoot: string): InstructionStackBreach[] {
   if (!fs.existsSync(groupsRoot)) return [];
@@ -618,7 +506,6 @@ export function checkGroupStandingPatterns(groupsRoot: string): InstructionStack
   return breaches;
 }
 
-/** One breach per group with any unscannable candidate file — shared by every metric that gates reads through resolveStandingFile. */
 function unscannableBreaches(
   metric: InstructionStackBreach['metric'],
   items: UnscannableFile[],
@@ -637,18 +524,8 @@ function unscannableBreaches(
   }));
 }
 
-// Defensive translation only — compose (`src/claude-md-compose.ts`) no longer
-// writes any `.claude-shared.md`/`.claude-fragments/` symlink pointing at
-// these container paths (every section is read from its host path and
-// inlined directly),
-// so a freshly composed CLAUDE.md never contains an `@`-import that resolves
-// through this map. It stays here for two reasons: a group whose CLAUDE.md
-// predates that change still carries the old `@`-import text until its next
-// spawn recomposes it, and flattenClaudeMd's `@`-line handling (see
-// agents-md-flatten.ts) translates ANY literal `@/app/...` reference, symlink
-// or not, so this is also insurance against a stray hand-written one. Keep it
-// in sync with compose's shared-base/module-fragment host paths if those ever
-// move.
+// No longer produced by compose, kept for CLAUDE.md files that predate that change and for a
+// hand-written `@/app/...` import. Keep in sync with compose's host paths if those move.
 const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => ({
   '/app/CLAUDE.md': path.join(repoRoot, 'container', 'CLAUDE.md'),
   '/app/skills': path.join(repoRoot, 'container', 'skills'),
@@ -656,14 +533,9 @@ const COMPOSE_CONTAINER_TO_HOST = (repoRoot: string): Record<string, string> => 
 });
 
 /**
- * Which provider actually reads this group's composed doc, read from
- * `groups/<g>/container.json` (container-writable, so gated the same way as
- * any standing file). Absent field, absent file, or `'default'` all mean
- * claude — mirrors `resolveProviderName`'s container-config half
- * (`src/db/container-configs.ts`) without needing the session-level override
- * that only exists at spawn time. A present-but-unsafe or malformed file
- * returns `skip` rather than guessing: source selection depends on this, so
- * an unreadable provider must block measurement, not silently default.
+ * Which provider reads this group's composed doc (absent or `'default'` means claude). An
+ * unsafe or malformed container.json returns `skip`, never a guess: source selection depends
+ * on it.
  */
 function readGroupProvider(groupDir: string, groupsRootResolved: string): { provider: string } | { skip: string } {
   const p = path.join(groupDir, 'container.json');
@@ -683,7 +555,6 @@ function readGroupProvider(groupDir: string, groupsRootResolved: string): { prov
   try {
     raw = JSON.parse(content);
   } catch (err) {
-    // Content error (bad JSON), not an infra error — always a skip, never rethrown.
     return { skip: `malformed container.json: ${err instanceof Error ? err.message : String(err)}` };
   }
   const rawProvider =
@@ -694,18 +565,8 @@ function readGroupProvider(groupDir: string, groupsRootResolved: string): { prov
 }
 
 /**
- * `flattenClaudeMd`'s `validateRead` gate for one group's @-import chain.
- * `groups/<g>/` is container-writable, so a nested import is exactly as
- * untrusted as a top-level standing file — the same FIFO-hang /
- * huge-file-memory / trust-boundary-escape vectors apply to every hop of
- * the chain, not just the file `flattenClaudeMd` was first pointed at.
- * Allowed roots: the group's own tree (legitimate cross-group persona
- * symlinks) plus the known host-side prefixes compose's own containerToHost
- * map translates to (the shared base, skills, mcp-tools instructions —
- * host-controlled, not container-writable, but still real-file/size-capped
- * for consistency). Violations are recorded into `unscannable` via closure
- * so the caller can report them; the flattener gets back only a reason
- * string to inline as its own skip marker.
+ * `flattenClaudeMd`'s `validateRead` gate: every hop of a group's @-import chain is as
+ * untrusted as a top-level standing file. Violations are recorded into `unscannable`.
  */
 function makeFlattenGuard(
   group: string,
@@ -717,29 +578,13 @@ function makeFlattenGuard(
     try {
       lst = fs.lstatSync(realPath);
     } catch (err) {
-      // Missing target = a stale/dangling @-import — not a security issue,
-      // let flattenClaudeMd's own "failed to read" marker handle it.
+      // Missing target = a stale @-import, not a security issue: flattenClaudeMd reports it.
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw err;
     }
     if (lst.isSymbolicLink()) {
-      // resolveSymlinkChain (agents-md-flatten.ts) already tried to resolve
-      // this and gave up — either the target is genuinely dangling (benign:
-      // e.g. a stale fragment symlink pointing at a source file a later
-      // trunk change deleted) or it resolves to something non-regular like
-      // a FIFO (unsafe: reading it would hang). Both land here identically
-      // because resolveSymlinkChain's translation step (container-path
-      // prefixes aren't real host paths) means a plain follow-up stat can't
-      // tell them apart without redoing that translation.
-      //
-      // ponytail: treat both as unscannable rather than reimplementing
-      // resolveSymlinkChain's translation-aware resolution a second time
-      // just to split "dangling" from "unsafe" — safe either way (never
-      // read), and a dangling fragment symlink is itself a real staleness
-      // signal this tripwire wants surfaced. Upgrade path if the dangling
-      // case turns out to be common/noisy enough to want quieted: export
-      // resolveSymlinkChain (or a variant that reports why it gave up) from
-      // agents-md-flatten.ts and call it here instead of this lstat check.
+      // Dangling and non-regular (e.g. FIFO) targets both land here and are both treated as
+      // unscannable: never read, and a dangling fragment is itself a staleness signal.
       const reason = 'symlink does not resolve to a readable regular file (dangling target or non-regular type)';
       unscannable.push({ group, path: realPath, reason });
       return reason;
@@ -760,23 +605,9 @@ function makeFlattenGuard(
 }
 
 /**
- * Walks the composed doc one group's container agent actually receives, so
- * anything unsafe along that chain is reported rather than read. Source
- * depends on which harness actually reads it (container.json's `provider`):
- *
- * - codex/opencode: AGENTS.md alone IS the complete artifact; their harnesses
- *   read nothing else from the group folder.
- * - claude/default: compose already writes CLAUDE.md fully flat (no
- *   `@`-imports left to resolve — the flatten call below is a no-op unless a
- *   group's CLAUDE.md predates that cutover), but Claude Code auto-discovers a
- *   CLAUDE.local.md independently of compose. Compose retired that file, yet a
- *   leftover still loads, so walk CLAUDE.md's own chain plus any
- *   CLAUDE.local.md rather than trusting AGENTS.md's spawn-time snapshot.
- *
- * The flatten call's OUTPUT is deliberately discarded — it is made for its
- * `validateRead` gate, the only thing that walks nested `@`-imports and can
- * refuse an unsafe hop. Nothing to walk (never spawned, nothing composed yet)
- * is not a finding.
+ * Codex/opencode read AGENTS.md alone. Claude walks CLAUDE.md's own @-import chain plus any
+ * CLAUDE.local.md, which Claude Code auto-discovers. The flatten output is discarded: the call
+ * is made for its `validateRead` gate.
  */
 function scanEffectiveStack(groupDir: string, groupsRootResolved: string): UnscannableFile[] {
   const group = path.basename(groupDir);
@@ -795,7 +626,6 @@ function scanEffectiveStack(groupDir: string, groupsRootResolved: string): Unsca
     return unscannable;
   }
 
-  // claude / default — walk CLAUDE.md's own chain; never trust AGENTS.md's snapshot for this provider.
   const claudeMdPath = path.join(groupDir, 'CLAUDE.md');
   const claudeMd = resolveStandingFile(claudeMdPath, groupsRootResolved);
   if (claudeMd === null) return unscannable; // never spawned — nothing composed yet
@@ -820,17 +650,8 @@ function scanEffectiveStack(groupDir: string, groupsRootResolved: string): Unsca
 }
 
 /**
- * Per-group safety walk of the composed doc a container agent actually
- * receives — not just the authored standing files (which is what
- * checkGroupStandingPatterns covers). `groups/` is container-writable, so
- * every hop of that chain is a trust boundary: anything this refuses to read
- * (a symlink escaping the trusted set, a FIFO, a file over the size cap, an
- * unreadable container.json) is reported and never read.
- *
- * No banned-pattern scan here: that content was already scanned at its source
- * file by checkGroupStandingPatterns/checkContainerPatterns, and re-scanning
- * the flattened doc would re-flag the same hit under a second metric and
- * false-positive on shared-base example text that happens to get inlined.
+ * Safety walk of the composed doc each container agent receives. No banned-pattern scan: that
+ * content was already scanned at its source, and re-scanning would double-report.
  */
 export function checkEffectiveStackSafety(groupsRoot: string): InstructionStackBreach[] {
   if (!fs.existsSync(groupsRoot)) return [];
@@ -847,7 +668,7 @@ export function checkEffectiveStackSafety(groupsRoot: string): InstructionStackB
   return unscannableBreaches('effectiveStack', allUnscannable);
 }
 
-/** All four surfaces together — the core L4 check. Each reports on its own files: a hit in a shared base file must not be re-reported once per group that inherits it. */
+/** Each surface reports on its own files: a hit in a shared base file must not be re-reported per group. */
 export function checkInstructionStack(
   containerClaudeMdPath: string,
   groupsRoot: string,
@@ -870,7 +691,7 @@ function describeInstructionStackBreach(b: InstructionStackBreach): string {
   return parts.join('; ');
 }
 
-/** pattern / unscannable breaches for the same scope must not share a metric identity, or the same-day issue-title dedup collapses two distinct findings into one filed issue. */
+/** Pattern and unscannable breaches must not share a metric identity, or the issue-title dedup collapses them. */
 export function instructionStackBreachKind(b: InstructionStackBreach): string {
   return b.unscannable.length > 0 ? 'unscannable' : 'pattern';
 }
@@ -885,8 +706,6 @@ function detectInstructionStackBreaches(
     ruleDescription: describeInstructionStackBreach(b),
   }));
 }
-
-// ───────────────────────────── GitHub issue filing ─────────────────────────
 
 function fetchOpenFleetDriftTitles(): string[] {
   const out = execFileSync(
@@ -944,8 +763,6 @@ function logAndFileBreaches(breaches: Breach[], dryRun: boolean): void {
   }
 }
 
-// ──────────────────────────────────── main ─────────────────────────────────
-
 function main(): number {
   try {
     const dryRun = process.env.FLEET_DRIFT_DRY_RUN === '1';
@@ -991,8 +808,7 @@ function main(): number {
       );
     }
 
-    // Instruction-stack tripwire (L4): a static tree check, independent of the
-    // banded metrics' daily history — runs (and can file) even during warm-up.
+    // A static tree check with no history: runs (and can file) even during warm-up.
     const instructionStackBreaches = detectInstructionStackBreaches(
       path.join(REPO_ROOT, 'container', 'CLAUDE.md'),
       path.join(REPO_ROOT, 'groups'),

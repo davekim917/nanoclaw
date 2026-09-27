@@ -1,41 +1,17 @@
 #!/usr/bin/env tsx
 /**
- * Enable a `~/plugins/<name>` plugin across all three container agent providers
- * (Claude, Codex, OpenCode) — the deterministic half of the /enable-agent-plugins
- * skill.
+ * Enable a `~/plugins/<name>` plugin across the three container agent providers — the
+ * deterministic half of the /enable-agent-plugins skill:
  *
- * Each provider gets its own native delivery path:
+ *   - Claude   → auto-loaded via the mount, but ONLY with a Claude manifest; a minimal one is
+ *                generated when missing.
+ *   - Codex    → registered by the CONTAINER at spawn; this only generates the
+ *                `.codex-plugin/plugin.json` and self-referencing marketplace.json it needs.
+ *   - OpenCode → skills mirrored into `~/.config/opencode/skill/` (no plugin loader).
  *
- *   - Claude   → the mount + CLAUDE_PLUGINS_ROOT auto-loads the plugin, but ONLY
- *                if it carries a Claude manifest. We generate a minimal
- *                `.claude-plugin/plugin.json` when one is missing (the taste-skill gap).
- *   - Codex    → native `codex plugin` loading, registered by the CONTAINER at spawn
- *                (`registerContainerCodexPlugins`, which builds its own plugin cache
- *                from `/workspace/plugins`). All this script does is make the plugin
- *                registerable: generate `.codex-plugin/plugin.json` and a
- *                self-referencing `.agents/plugins/marketplace.json` when either is
- *                missing.
- *   - OpenCode → portable `skills/<n>/SKILL.md` mirror into `~/.config/opencode/skill/`
- *                (and per-sibling XDG dirs). OpenCode has no plugin loader, so the
- *                mirror is its only delivery path.
- *
- * SCOPE: container agent groups only. This script never touches a host CLI's plugin
- * state — not `~/.codex/config.toml`, not the host Claude marketplace. Containers
- * strip every inherited `[plugins.*]` / `[marketplaces.*]` table from the host Codex
- * config (see `codex-companion-setup.ts`), so host registration would buy the fleet
- * exactly nothing. Installing a plugin into your own host CLI is a separate,
- * operator-owned decision — do it by hand if you want it there.
- *
- * Per-provider opt-out is controlled by `~/plugins/<name>/.nanoclaw-plugin.json`
- * (`{ "denySiblings": [...] }`, read by `readPluginDenySiblings`). `--deny`/`--allow`
- * mutate that marker.
- *
- * Always-on rulesets (plugins like ponytail that inject a system prompt every
- * turn) reach Codex/OpenCode via `~/plugins/<name>/.nanoclaw-always-on.md`, which
- * `composeGroupClaudeMd` folds into non-Claude groups' CLAUDE.md/AGENTS.md. This
- * script does NOT author that file — it only reports whether the plugin looks
- * like an always-on plugin, so the skill can author a clean ruleset (stripping
- * runtime banners/host-specific nudges a raw hook dump would carry).
+ * Container agent groups only: never touches host CLI plugin state, since containers strip
+ * every inherited `[plugins.*]` / `[marketplaces.*]` table from the host Codex config.
+ * Per-provider opt-out lives in `~/plugins/<name>/.nanoclaw-plugin.json` (`--deny`/`--allow`).
  *
  * Usage:
  *   pnpm exec tsx scripts/enable-agent-plugin.ts <name|path> [--exclude g1,g2] [--dry-run]
@@ -64,7 +40,6 @@ interface Classification {
   codexSkillsRoot: string | null;
   codexManifestGenerated: boolean;
   codexMarketplaceGenerated: boolean;
-  /** Manifests resolve, so a Codex container can register it natively at spawn. */
   codexRegisterable: boolean;
   portableSkills: string[];
   sessionStartHook: boolean;
@@ -127,10 +102,8 @@ function parseArgs(): ParsedArgs {
   return { target, exclude, deny, allow, dryRun, reportJson };
 }
 
-/** Resolve a name or path to a real directory under ~/plugins. */
 function resolvePluginDir(target: string): { name: string; dir: string } {
   const abs = path.resolve(target.startsWith('~') ? target.replace(/^~/, os.homedir()) : target);
-  // Bare name?
   const asName = path.join(PLUGINS_ROOT, target);
   const dir = fs.existsSync(asName) && fs.statSync(asName).isDirectory() ? asName : abs;
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
@@ -161,11 +134,8 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
 }
 
 /**
- * Apply `--deny`/`--allow` to the on-disk `.nanoclaw-plugin.json` marker.
- * Writes only when the resulting set differs from what's on disk (idempotent
- * no-flags re-runs never touch the file); `--dry-run` computes but never writes.
- * An empty resulting set still writes `{ "denySiblings": [] }` rather than
- * deleting the file, so an explicit "allow everything" stays recorded.
+ * Writes only when the set changes, and writes `{ "denySiblings": [] }` rather than deleting
+ * the file, so an explicit "allow everything" stays recorded.
  */
 function resolveDenySiblings(
   dir: string,
@@ -185,7 +155,6 @@ function resolveDenySiblings(
   return next;
 }
 
-/** Does any hooks JSON declared by the plugin contain a SessionStart entry? */
 function detectSessionStartHook(dir: string): boolean {
   const candidates: string[] = [];
   try {
@@ -196,7 +165,6 @@ function detectSessionStartHook(dir: string): boolean {
   } catch {
     /* no manifest / no hooks field */
   }
-  // Common conventional hook files.
   for (const rel of ['hooks/claude-codex-hooks.json', 'hooks/hooks.json']) {
     candidates.push(path.join(dir, rel));
   }
@@ -216,8 +184,7 @@ function generateClaudeManifest(dir: string, name: string, dryRun: boolean): boo
   const marketplacePath = path.join(dir, '.claude-plugin', 'marketplace.json');
   if (fs.existsSync(manifestPath) || fs.existsSync(marketplacePath)) return false;
 
-  // Minimal functional manifest. Claude auto-discovers skills/, commands/,
-  // agents/ by convention; a non-conventional hooks file must be declared.
+  // Claude auto-discovers skills/, commands/, agents/; a non-conventional hooks file must be declared.
   const manifest: Record<string, unknown> = {
     name,
     version: '0.0.0',
@@ -236,7 +203,6 @@ function generateClaudeManifest(dir: string, name: string, dryRun: boolean): boo
   return true;
 }
 
-/** First existing candidate skills root, relative to the plugin dir (posix-style). */
 function ensureCodexPluginManifest(dir: string, name: string, skillsRoot: string, dryRun: boolean): boolean {
   const manifestPath = path.join(dir, '.codex-plugin', 'plugin.json');
   if (fs.existsSync(manifestPath)) return false;
@@ -258,7 +224,6 @@ interface CodexMarketplaceSelfEntry {
   pluginEntryName: string;
 }
 
-/** Parse an existing codex marketplace.json and find its self-referencing entry (source path `./` or `.`). */
 function parseCodexMarketplaceSelfEntry(marketplacePath: string): CodexMarketplaceSelfEntry | null {
   let raw: string;
   try {
@@ -286,23 +251,10 @@ interface CodexRegistration {
   skillsRoot: string | null;
   manifestGenerated: boolean;
   marketplaceGenerated: boolean;
-  /** Manifests resolve — a Codex CONTAINER can register this natively at spawn. */
   registerable: boolean;
   reason: string | null;
 }
 
-/** Make the plugin Codex-registerable: generate `.codex-plugin/plugin.json` + a
- * self-referencing marketplace.json when missing. Containers do the actual
- * registration at spawn; no host CLI is involved. */
-/**
- * Marketplace monorepos carry no skills at the repo root — each plugin lives one level
- * down (`claude-plugins-official/plugins/playground`, `role-specific-plugins/plugins/
- * data-analytics`, `knowledge-work-plugins/data`). Generate a `.codex-plugin` manifest
- * inside each CHECKED-OUT sub-plugin so Codex can register them; a sparse checkout then
- * naturally yields only what's on disk.
- *
- * Returns the sub-plugin dirs we generated (or already found) manifests for.
- */
 /** Marketplace name from either manifest location Codex accepts. */
 function readAnyMarketplaceName(repoDir: string): string | null {
   for (const rel of [
@@ -319,7 +271,6 @@ function readAnyMarketplaceName(repoDir: string): string | null {
   return null;
 }
 
-/** The `name` a plugin dir declares in its own .codex-plugin manifest. */
 function readDeclaredCodexName(pluginDir: string): string | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(path.join(pluginDir, '.codex-plugin', 'plugin.json'), 'utf-8')) as {
@@ -331,7 +282,6 @@ function readDeclaredCodexName(pluginDir: string): string | null {
   }
 }
 
-/** Sub-plugin dirs a repo's own codex marketplace declares (absolute paths), or null if it ships none. */
 function declaredCodexSourceDirs(repoDir: string): Set<string> | null {
   try {
     const parsed = JSON.parse(
@@ -353,11 +303,8 @@ function declaredCodexSourceDirs(repoDir: string): Set<string> | null {
 function ensureCodexSubPluginManifests(repoDir: string, dryRun: boolean): { dir: string; generated: boolean }[] {
   const out: { dir: string; generated: boolean }[] = [];
   const seen = new Set<string>();
-  // A repo that ships its own codex marketplace has already decided which
-  // sub-plugins are Codex-registerable. Generating manifests into the rest
-  // (e.g. a Claude-only twin like bootstrap's plugins/workflow) plants stray
-  // files that the repo's own drift gates then reject — and Codex never reads
-  // them anyway, since registration follows the marketplace entries.
+  // A repo that ships its own codex marketplace has already decided which sub-plugins are
+  // registerable; manifests planted into the rest trip that repo's own drift gates.
   const declared = declaredCodexSourceDirs(repoDir);
   for (const container of [path.join(repoDir, 'plugins'), repoDir]) {
     if (!isDirectory(container)) continue;
@@ -372,7 +319,6 @@ function ensureCodexSubPluginManifests(repoDir: string, dryRun: boolean): { dir:
       const subDir = path.join(container, sub);
       if (seen.has(subDir) || !isDirectory(subDir)) continue;
       if (declared !== null && !declared.has(path.resolve(subDir))) continue;
-      // Only dirs that declare themselves a plugin — the same signal the native loaders use.
       if (declared === null && !fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
       const root = findCodexSkillsRoot(subDir);
       if (root === null) continue;
@@ -388,8 +334,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
   const discoveredRoot = findCodexSkillsRoot(dir);
   const skillsRoot = discoveredRoot === null ? null : materializeSymlinkedSkills(dir, discoveredRoot, dryRun);
   if (skillsRoot === null) {
-    // No skills at the root — treat it as a marketplace monorepo and handle its
-    // sub-plugins. The repo's own marketplace.json supplies the marketplace name.
+    // No skills at the root: a marketplace monorepo, handled per sub-plugin.
     const subs = ensureCodexSubPluginManifests(dir, dryRun);
     if (subs.length > 0) {
       const self = parseCodexMarketplaceSelfEntry(path.join(dir, '.agents', 'plugins', 'marketplace.json'));
@@ -414,10 +359,8 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
 
   const manifestGenerated = ensureCodexPluginManifest(dir, name, skillsRoot, dryRun);
 
-  // The marketplace entry name MUST match the name inside .codex-plugin/plugin.json —
-  // Codex hard-errors otherwise ("plugin.json name `wix` does not match marketplace
-  // plugin name `skills`"). A pre-existing manifest can declare a name that differs
-  // from the folder (wix ships in ~/plugins/skills), so read it rather than assuming.
+  // The marketplace entry name MUST match the name inside .codex-plugin/plugin.json (Codex
+  // hard-errors otherwise), and a pre-existing manifest can differ from the folder name.
   let entryName = name;
   try {
     const declared = JSON.parse(fs.readFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), 'utf-8')) as {
@@ -453,14 +396,9 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
 }
 
 /**
- * This runs in a SEPARATE PROCESS from the host, which is why the primitive it
- * calls has to be cross-process. Its own read-modify-write used to race the
- * host's spawn-time identity write, and the field it lost — `excludePlugins` —
- * is the one that withholds a plugin from a group on purpose.
- *
- * The dry-run branch reads and reports without taking the lock: it writes
- * nothing, so there is nothing to serialize, and its answer is a snapshot
- * either way.
+ * Runs in a separate process from the host, so it must use the cross-process
+ * `updateContainerConfig`: a plain read-modify-write races the host's spawn-time write and can
+ * lose `excludePlugins`.
  */
 async function applyOptOut(exclude: string[], pluginName: string, dryRun: boolean): Promise<string[]> {
   const applied: string[] = [];
@@ -474,9 +412,7 @@ async function applyOptOut(exclude: string[], pluginName: string, dryRun: boolea
       if (!new Set(readContainerConfig(folder).excludePlugins ?? []).has(pluginName)) applied.push(folder);
       continue;
     }
-    // The "already excluded" check moves INSIDE the lock with the write it
-    // guards: deciding outside it is the same check-then-act the primitive
-    // exists to remove.
+    // The "already excluded" check stays inside the lock: deciding outside it is check-then-act.
     let added = false;
     await updateContainerConfig(folder, (cfg) => {
       const set = new Set(cfg.excludePlugins ?? []);
@@ -512,10 +448,7 @@ async function main(): Promise<void> {
       }
     : resolveCodexRegistration(dir, name, dryRun);
 
-  // The MIRROR's population, not a walk of this script's own: what this reports
-  // is what `syncOpenCodePluginSkills` below will publish, and a walk denying
-  // less would credit this plugin with a name a scoped plugin claims ahead of it
-  // (or omit one it loses to a scoped plugin) in the operator's report.
+  // What `syncOpenCodePluginSkills` will publish, so scoped-plugin precedence is reported correctly.
   const portableSkills = openCodeMirrorSkills(PLUGINS_ROOT)
     .filter((s) => s.plugin === name)
     .map((s) => s.name);
@@ -523,19 +456,9 @@ async function main(): Promise<void> {
   const alwaysOnPath = path.join(dir, '.nanoclaw-always-on.md');
   const hasAlwaysOnFile = fs.existsSync(alwaysOnPath);
   const alwaysOnIsStub = hasAlwaysOnFile && fs.readFileSync(alwaysOnPath, 'utf-8').trim().length === 0;
-  // A plugin we MAINTAIN ships its directive as its own generic `always-on.md`
-  // and needs no NanoClaw-specific file. `.nanoclaw-always-on.md` is the
-  // OVERRIDE for a third-party clone that ships no clean ruleset. Instructing
-  // an operator to author one beside a plugin that already has its own would
-  // deliver the directive twice on OpenCode (the plugin's own file plus the
-  // override) and, on Codex, the override on top of the plugin's native hook.
-  // EXACTLY the set the composer reads: the repo ROOT's own `always-on.md`,
-  // plus `<repo>/plugins/<sub>` and `<repo>/<sub>` (`subPluginDirs`,
-  // src/claude-md-compose.ts). The root belongs here because the composer now
-  // reads it — a single-plugin repo we maintain must reach OpenCode without a
-  // NanoClaw-specific file, and if this counted the root while the composer did
-  // not, the override would be suppressed for a repo whose ruleset nothing
-  // composed and the group would get neither.
+  // A plugin with its own `always-on.md` needs no `.nanoclaw-always-on.md` override: both
+  // would deliver the directive twice. Must match exactly the set the composer reads (root,
+  // `plugins/<sub>`, `<sub>`; `subPluginDirs` in src/claude-md-compose.ts).
   const hasOwnRuleset =
     fs.existsSync(path.join(dir, 'always-on.md')) ||
     [path.join(dir, 'plugins'), dir].some((container) => {
@@ -565,8 +488,6 @@ async function main(): Promise<void> {
     hasOwnRuleset,
   };
 
-  // Mirror skills to OpenCode's discovery path (idempotent). Codex now loads
-  // natively (see resolveCodexRegistration above) — no mirror needed for it.
   let opencodeCreated = 0;
   if (!dryRun) {
     opencodeCreated = syncOpenCodePluginSkills().created;

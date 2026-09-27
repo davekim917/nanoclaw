@@ -1,36 +1,16 @@
 #!/usr/bin/env tsx
 /**
- * Content-hash gate for the dashboard SPA bundle.
+ * Content-hash gate for the dashboard SPA bundle: hashes the SPA's inputs and restores the
+ * bundle from a cache instead of rebuilding when the hash matches.
  *
- * `dashboard/` is a separate Vite project outside the pnpm workspace, so every
- * host deploy used to pay a full `pnpm install --ignore-workspace
- * --frozen-lockfile` plus `vite build` — twice, in fact: once from `build:spa`
- * (reached via `pnpm run build`) and again from `build:dashboard` in
- * scripts/deploy.sh. That is the dominant cost of an under-load deploy, and it
- * is paid even when nothing under `dashboard/` changed.
- *
- * This script hashes the SPA's own inputs, keeps the last few built bundles in
- * a cache OUTSIDE `dist/`, and restores from the cache instead of rebuilding
- * when the hash matches.
- *
- * The cache lives outside `dist/` on purpose. scripts/deploy.sh does
- * `rm -rf dist` before the host `tsc` (to prune orphaned .js files), which
- * takes `dist/dashboard-spa/` with it as a side effect. A gate that only
- * skipped the rebuild would therefore serve 404s from src/dashboard/static.ts
- * until the next SPA-touching deploy. Restoring from a cache under `data/`
- * means the bundle is repopulated on every build, hit or miss.
- *
- * Cache dir is under `data/`, which .gitignore excludes (`data/*`), so it is
- * invisible to `git status --porcelain` and cannot trip the prebuild
- * tree-cleanliness guard in scripts/check-build-clean.ts.
+ * The cache lives under `data/`, outside `dist/`, on purpose: scripts/deploy.sh does
+ * `rm -rf dist` before the host `tsc`, so the bundle must be repopulated on every build, hit
+ * or miss. `data/*` is gitignored, so the cache cannot trip the prebuild clean-tree guard.
  *
  * Usage:
  *   tsx scripts/build-dashboard-spa.ts            # dev/`build:spa`: build only, never seeds the cache
  *   tsx scripts/build-dashboard-spa.ts --install  # deploy/`build:dashboard`: frozen install first, may seed the cache
  *   DASHBOARD_BUILD_FORCE=1 ...                   # ignore the cache, always rebuild
- *
- * Both modes run the same build (`tsc --noEmit && vite build`); the install is
- * the only difference, and it is what earns the right to write to the cache.
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -46,7 +26,6 @@ import ts from 'typescript';
  */
 export const CACHE_FORMAT_VERSION = 3;
 
-/** Keep the last N distinct bundles. Each is ~750KB. */
 export const CACHE_KEEP = 3;
 
 export const CACHE_SUBDIR = path.join('data', 'build-cache', 'dashboard-spa');
@@ -56,30 +35,19 @@ const VITE_ENV_REFERENCE = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|([A-Za-z_][A-
 type Environment = Record<string, string | undefined>;
 
 /**
- * Test files are inputs too, even though they never reach the bundle.
- * `dashboard/tsconfig.json` includes the whole `src` tree and `dashboard`'s own build
- * script is `tsc -p tsconfig.json --noEmit && vite build`, so the SPA build is
- * what typechecks them. Excluding them from the hash would let a type error in
- * a test file pass the top-level build silently on a cache hit; vitest's
- * transpile-only run does not replace that check. The cost is a rebuild on a
- * test-only edit, which is cheap against what the gate saves.
+ * Test files are inputs too: the SPA build's `tsc` typechecks them, so excluding them would let
+ * a test-file type error pass silently on a cache hit.
  */
 
 /**
- * Not an input, whatever git thinks. `.gitignore`'s `node_modules/` pattern
- * only matches a real directory, so an agent worktree that symlinks
- * `dashboard/node_modules` at the live checkout gets the symlink reported as
- * an untracked FILE — and its target path would then land in the hash.
+ * `.gitignore`'s `node_modules/` only matches a real directory, so a symlinked
+ * `dashboard/node_modules` shows up as an untracked FILE and would land in the hash.
  */
 export function isDependencyPath(relPath: string): boolean {
   return relPath.split('/').includes('node_modules');
 }
 
-/**
- * Every git-visible file under `dashboard/`. Tracked files plus
- * untracked-but-not-ignored ones, so a new component counts before it is
- * committed; .gitignore keeps `node_modules/` and `tsconfig.tsbuildinfo` out.
- */
+/** Tracked plus untracked-but-not-ignored files, so a new component counts before it is committed. */
 export function listInputFiles(repoRoot: string): string[] {
   const out = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', 'dashboard'], {
     cwd: repoRoot,
@@ -96,23 +64,10 @@ export function listInputFiles(repoRoot: string): string[] {
 }
 
 /**
- * Repo files OUTSIDE `dashboard/` that the dashboard's TypeScript program
- * compiles — today `src/dashboard/observatory-v2/types.ts`, which eleven
- * dashboard modules import by relative path. `dashboard/tsconfig.json`'s build
- * typechecks them, so they are inputs: without them a breaking change there
- * kept restoring the old bundle (skipping `tsc`) until an unrelated
- * `dashboard/` edit surfaced it in a later deploy.
- *
- * Derived from the program itself rather than a list, so a new import, a
- * re-export chain or a `paths` alias is covered the moment it exists. This
- * builds the program (parse + module resolution) but does not typecheck it,
- * ~1s. It uses the host's `typescript`, not `dashboard/`'s, because the
- * decision is made before the dashboard's deps are installed; with those deps
- * absent, a bare-specifier import simply fails to resolve, which cannot hide a
- * repo file — only relative/aliased paths can reach one.
- *
- * Kept: files under `repoRoot`, outside `dashboard/`, not in any
- * `node_modules` (lib `.d.ts` and package types are covered by the lockfiles).
+ * Repo files outside `dashboard/` that its TypeScript program compiles (relative imports into
+ * `src/`): the build typechecks them, so they are inputs. Derived from the program rather than
+ * a list; parse + module resolution only, with the host's `typescript` because the dashboard's
+ * deps may not be installed yet.
  */
 export function listProgramExternalFiles(repoRoot: string): string[] {
   const configPath = path.join(repoRoot, 'dashboard', 'tsconfig.json');
@@ -157,8 +112,7 @@ export function hashInputs(repoRoot: string, files: string[], env: Environment =
     try {
       digest = createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
     } catch {
-      // Listed by git but gone from disk (staged deletion). Record the absence
-      // so it still differs from the version where the file existed.
+      // Staged deletion: record the absence so it still differs from the version with the file.
       digest = 'absent';
     }
     h.update(`${rel}\0${digest}\n`);
@@ -199,10 +153,7 @@ export type BuildDecision =
   | { action: 'restore'; hash: string; cacheEntry: string; reason: 'cache-hit' }
   | { action: 'build'; hash: string; cacheEntry: string; reason: 'forced' | 'cache-miss'; cacheable: boolean };
 
-/**
- * An entry counts as usable only when its completion marker AND an
- * `index.html` are both present, so a copy interrupted midway is a miss.
- */
+/** Usable only with both the completion marker and `index.html`, so an interrupted copy is a miss. */
 export function isUsableCacheEntry(cacheEntry: string): boolean {
   return (
     fs.existsSync(path.join(cacheEntry, 'meta.json')) && fs.existsSync(path.join(cacheEntry, 'bundle', 'index.html'))
@@ -210,19 +161,9 @@ export function isUsableCacheEntry(cacheEntry: string): boolean {
 }
 
 /**
- * `depsVerified` is the answer to "were `dashboard/`'s dependencies just
- * installed from the lockfile?", and it decides whether this build's output may
- * seed the cache. Only the deploy path (`--install`) can say yes.
- *
- * Without that rule the deploy corrupts its own cache. scripts/deploy.sh calls
- * `pnpm run build` (which reaches `build:spa`, no install) BEFORE
- * `build:dashboard --install`. On a deploy that bumps `dashboard/package.json`
- * or the lockfile, the first call sees the new hash, misses, builds against the
- * PREVIOUS deploy's `node_modules`, and would store that bundle under the new
- * hash — after which the second call finds a hit and skips the frozen install
- * entirely, shipping assets built with the old dependency versions.
- *
- * So the no-install path reads the cache but never writes to it.
+ * Only the `--install` path may seed the cache. deploy.sh runs `build:spa` (no install) BEFORE
+ * `build:dashboard --install`; on a dependency bump the first call would cache a bundle built
+ * against the previous `node_modules` under the new hash, and the second would restore it.
  */
 export function decideBuild(opts: {
   hash: string;
@@ -280,7 +221,6 @@ export function pruneCache(cacheRoot: string, keep = CACHE_KEEP): string[] {
   for (const e of entries) {
     if (!e.isDirectory()) continue;
     const abs = path.join(cacheRoot, e.name);
-    // Abandoned staging dirs from an interrupted build.
     if (e.name.includes('.tmp-')) {
       fs.rmSync(abs, { recursive: true, force: true });
       removed.push(e.name);
@@ -332,25 +272,14 @@ function main(): void {
   if (withInstall) {
     run('pnpm', ['install', '--ignore-workspace', '--frozen-lockfile'], dashboardDir);
   } else if (!fs.existsSync(path.join(dashboardDir, 'node_modules'))) {
-    // Pre-existing `build:spa` behavior: a contributor who has never installed
-    // the SPA's deps still gets a working host build, just without a bundle.
+    // A contributor who never installed the SPA's deps still gets a working host build, without a bundle.
     console.warn('WARN: dashboard deps not installed — SPA not rebuilt; run: pnpm --dir dashboard install');
     return;
   }
 
   console.log(`dashboard SPA: ${decision.reason} ${decision.hash.slice(0, 12)} — building`);
-  // One build command for both entry points: `dashboard`'s own `build` script,
-  // which is `tsc -p tsconfig.json --noEmit && vite build`.
-  //
-  // The deploy path used to run bare `vite build`, matching what `build:dashboard`
-  // did before this gate existed. That was safe only because the deploy also ran
-  // `build:spa` (which typechecks) first. With a cache in play it stopped being
-  // safe: a bare-vite build seeds an entry that a later `pnpm run build` restores,
-  // and that restore skips the dashboard typecheck entirely — so a type error
-  // could be cached and then pass every subsequent build. Vite transpiles without
-  // typechecking, so only `tsc` closes this.
-  //
-  // Every cached bundle is therefore a typechecked bundle.
+  // Always `dashboard`'s own `build` (`tsc --noEmit && vite build`), never bare `vite build`:
+  // a restore skips the typecheck, so every cached bundle must already be typechecked.
   run('pnpm', ['run', 'build'], dashboardDir);
 
   if (!decision.cacheable) {
@@ -365,11 +294,8 @@ function main(): void {
   console.log(`dashboard SPA: cached ${decision.hash.slice(0, 12)}`);
 }
 
-// `tsx scripts/build-dashboard-spa.ts` runs main; importing it for tests does not.
-// fileURLToPath, not `new URL(...).pathname`: the latter stays percent-encoded,
-// so on any install whose path contains a space or non-ASCII character the
-// comparison silently fails, main() never runs, and both package scripts exit 0
-// having built nothing — after deploy.sh has already done `rm -rf dist`.
+// fileURLToPath, not `new URL(...).pathname`: the latter stays percent-encoded, so on a path with
+// a space main() would silently never run, after deploy.sh has already removed dist.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main();
 }
