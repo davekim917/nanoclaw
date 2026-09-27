@@ -2735,10 +2735,10 @@ describe('codex-review risk-scoped review requests', () => {
     const AGENT_REVIEWER = 'claude-opus-5 cut-down-reviewer (claude code)';
     const BIG = [changedFile('src/gate.ts', undefined, 151)];
 
-    function cutDownReceipt(head: string, reviewer = AGENT_REVIEWER, authorAssociation = 'OWNER'): Page {
+    function cutDownReceipt(head: string, reviewer = AGENT_REVIEWER, login = 'davekim917'): Page {
       return {
-        author: { login: 'davekim917' },
-        authorAssociation,
+        author: { login },
+        authorAssociation: 'OWNER',
         createdAt: '2026-09-05T00:20:00Z',
         fullDatabaseId: '1757031600',
         body: `### Cut-down review receipt\n\n- **Head:** \`${head}\`\n- **Reviewer and runtime:** ${reviewer}\n\n<!-- pr-review-loop:cut-down-receipt head=${head} reviewed=${head} lines-reviewed=151 lines-now=151 -->`,
@@ -2793,13 +2793,16 @@ describe('codex-review risk-scoped review requests', () => {
     });
 
     it.each([
-      ['names no agent, as the author posting its own', 'claude-opus-5 (author, self-review)', 'OWNER'],
-      ['names the agent from a small tier', 'claude-sonnet-5 cut-down-reviewer', 'OWNER'],
-      ['names the agent inside another word', 'claude-opus-5 not-cut-down-reviewer-really', 'OWNER'],
-      ['comes from an account without write access', AGENT_REVIEWER, 'NONE'],
-    ])('refuses a receipt on the head that %s', (_case, reviewer, association) => {
+      ['names no agent, as the author posting its own', 'claude-opus-5 (author, self-review)', 'davekim917'],
+      ['names the agent from a small tier', 'claude-sonnet-5 cut-down-reviewer', 'davekim917'],
+      ['names the agent inside another word', 'claude-opus-5 not-cut-down-reviewer-really', 'davekim917'],
+      ['comes from an account without write access', AGENT_REVIEWER, 'reader'],
+      ['comes from an account whose permission cannot be read', AGENT_REVIEWER, 'ghost'],
+    ])('refuses a receipt on the head that %s', (_case, reviewer, login) => {
       const root = tempRoot();
-      cutDownFixture(root, { comments: [cutDownReceipt(HEAD, reviewer, association)] });
+      cutDownFixture(root, { comments: [cutDownReceipt(HEAD, reviewer, login)] });
+      fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+      fs.writeFileSync(path.join(root, 'permission--ghost.error'), '');
 
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(24);

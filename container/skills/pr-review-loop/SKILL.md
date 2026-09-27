@@ -241,7 +241,7 @@ A PR that adds more than 150 lines outside tests and lockfiles needs a cut-down 
 
    Give it the repo path, the PR number and the head SHA, and nothing from your conversation: no rationale, no plan. It returns a numbered list of cuts.
 2. **Apply or answer every cut.** Apply it, or answer it with the required behaviour it would lose. Commit once and push through `codex-review.sh push`.
-3. **Send the same reviewer the new head and your answers.** It checks that each cut was applied or answered, then posts the receipt itself:
+3. **Send the same reviewer the new head and your answers.** It reads everything the new head adds, checks that each cut was applied or answered, and asks the same question of any other new lines. Then it posts the receipt itself:
 
    ```bash
    codex-review.sh cut-down-receipt --head <new head> --reviewed <head it first read> \
@@ -251,7 +251,7 @@ A PR that adds more than 150 lines outside tests and lockfiles needs a cut-down 
    With no cuts it posts at once, with `--reviewed` equal to `--head`. The receipt records the added lines outside tests at both heads and the difference. That is the per-PR measure for tuning the threshold or dropping the pass.
 4. **When the head moves after the receipt** (a Codex round, a base merge), the receipt no longer counts. Before merging, launch a fresh reviewer on only what changed since the receipted head; it posts the receipt for the new head.
 
-The receipt's reviewer must lead with a frontier model id, as `receipt` requires, and must name `cut-down-reviewer`. A receipt that names no agent, which is what an author posting its own looks like, does not count. Every session shares one GitHub account, so the gate cannot see who ran the command: the named agent is a recorded claim, like a substitute receipt's reviewer.
+The receipt must come from an account with write access to the repository, and its reviewer must lead with a frontier model id, as `receipt` requires, and name `cut-down-reviewer`. A receipt that names no agent, which is what an author posting its own looks like, does not count. Every session shares one GitHub account, so the gate cannot see who ran the command: the named agent is a recorded claim, like a substitute receipt's reviewer.
 
 ## Step 1 — Collect the full open set
 

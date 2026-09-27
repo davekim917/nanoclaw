@@ -751,7 +751,7 @@ cut_down_reviewer_named() {
 
 # `ok\t<why>` or `missing\t<why>` for SCOPE_HEAD; non-zero when it cannot tell.
 cut_down_state() {
-  local threshold lines pages receipts head reviewer others
+  local threshold lines pages receipts head login reviewer others
   threshold=$(review_loop_value cutDownThreshold "$CUT_DOWN_THRESHOLD" \
     'if . == false then "off" elif type == "number" and . >= 0 and floor == . then . else error("not a whole number or false") end') || return 1
   if [ "$threshold" = off ]; then
@@ -766,15 +766,15 @@ cut_down_state() {
   pages=$(paginate_connection comments receipt_comments_page) || return 1
   receipts=$(printf '%s\n' "$pages" | jq -rs --arg re "$CUT_DOWN_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" '
     .[] | .data.repository.pullRequest.comments.nodes[]
-    | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
     | (.body // "") as $body
+    | (.author.login // "") as $login
     | [ $body | capture($re) ] | first // empty
-    | "\(.head)\t\([ $body | capture($reviewerRe) ] | first | .reviewer // "")"') || return 1
+    | "\(.head)\t\($login)\t\([ $body | capture($reviewerRe) ] | first | .reviewer // "")"') || return 1
   others=""
-  while IFS=$'\t' read -r head reviewer; do
+  while IFS=$'\t' read -r head login reviewer; do
     [ -n "$head" ] || continue
     if ! reviewer_model_allowed "$reviewer" || ! cut_down_reviewer_named "$reviewer"; then continue; fi
-    if [ "$head" = "$SCOPE_HEAD" ]; then
+    if [ "$head" = "$SCOPE_HEAD" ] && may_clear "$login"; then
       printf 'ok\ta cut-down receipt names this head (%s)\n' "$reviewer"
       return 0
     fi
