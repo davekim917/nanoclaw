@@ -5230,6 +5230,19 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(getPendingMessages().map((m) => m.id)).toContain('flag-1');
   }, 15_000);
 
+  it('does not apply live a sticky effort nobody typed (no ack on the row)', async () => {
+    insertMessage('pin-1', 'chat', { sender: 'system', text: 'new email', flagIntent: { stickyEffort: 'high' } });
+    const q = liveEffortQuery();
+
+    await processQuery(q.query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(q.calls.filter((c) => c.phase === 'busy')).toEqual([]);
+    expect(q.endedWhileBusy()).toBe(false);
+  }, 15_000);
+
   it('still waits for a fresh query for max effort, which has no live control', async () => {
     insertMessage('flag-1', 'chat', { text: '', flagIntent: { stickyEffort: 'max' }, flagAck: '⚙️ effort → max' });
     const q = liveEffortQuery();
