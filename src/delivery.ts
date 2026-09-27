@@ -384,7 +384,6 @@ async function markSessionLifecycleTerminal(sessionId: string, status: StatusTra
   if (!marked) throw new Error(`Cannot mark missing lifecycle delivery ${status.outboundId} terminal`);
 }
 
-/** Best-effort lifecycle settlement after the platform accepted a public message. */
 export async function settleSessionStatusAfterPublicDelivery(
   sessionId: string,
   options: { conversation?: DeliveredConversation; waitWhenElsewhere?: boolean } = {},
@@ -1288,7 +1287,8 @@ async function deliverMessage(
       return {};
     }
     // Typed progress may update this turn's activity line but never start a public narration stream of its own;
-    // exact conversation + turn matching keeps task, sibling and redirected traffic record-only.
+    // exact conversation + turn matching keeps task, sibling and redirected traffic record-only. A host-memory reset
+    // before the turn's first progress post leaves nothing to recover, so that turn's progress stays internal.
     if (typedProgress) {
       let lifecycle = statusTracking.get(session.id);
       if (!lifecycle) {
