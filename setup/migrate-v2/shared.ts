@@ -4,18 +4,9 @@
 import fs from 'fs';
 import path from 'path';
 
-// ── File copy ───────────────────────────────────────────────────────────
-
 /**
- * Copy a directory tree, skipping entries named in `skipNames`. Never
- * overwrites existing files.
- *
- * `symlinks: 'skip'` skips every symlink instead of following it: v1 group
- * folders sometimes contain container-side paths like
- * `.claude-shared.md → /app/CLAUDE.md` that don't resolve on the host, and
- * following one with `fs.copyFileSync` would crash ENOENT and abort the rest
- * of the traversal. `'follow'` copies a symlink's target and skips only a
- * dangling one (e.g. v1's .claude/debug/latest pointer).
+ * Never overwrites existing files. `symlinks: 'skip'` exists because v1 folders hold container-side
+ * links (`.claude-shared.md → /app/CLAUDE.md`) that crash a copy; `'follow'` skips only dangling ones.
  */
 export function copyTree(
   src: string,

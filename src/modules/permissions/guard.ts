@@ -36,9 +36,7 @@ export const sendersAdmit = defineGuardedAction({
       );
     }
     if (policy === 'decline_notify') {
-      // Deny, not hold: nothing pends and there is no grant path — the
-      // caller sends the polite decline + owner FYI itself
-      // (sender-approval.ts declineAndNotify).
+      // Deny, not hold: nothing pends; the caller sends the decline + FYI itself.
       return DENY('unknown sender declined (decline-and-notify policy)');
     }
     return DENY('unknown sender on a strict messaging group');

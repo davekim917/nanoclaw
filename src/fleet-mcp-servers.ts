@@ -1,25 +1,7 @@
 /**
- * Fleet-wide MCP defaults — the ONE place a tool is added for every group.
- *
- * `data/fleet-mcp-servers.json` holds `mcpServers` entries every container
- * inherits. Adding an MCP is a data edit (`ncl groups config add-mcp-server
- * --fleet …`), never a source edit: the spawn path merges this file into the
- * container's server map (`src/container-runner.ts`, `buildContainerArgs`)
- * and the capability snapshot describes whatever the merge produced
- * (`src/capabilities.ts`), so one write reaches both.
- *
- * Merge order, unchanged from the per-name blocks this replaced:
- *   1. the group's own `container.json` mcpServers — an operator-declared
- *      entry always wins, even for a name the fleet also defines;
- *   2. every fleet entry whose name the group neither declares itself nor
- *      lists in `excludeMcpServers`.
- * That is exactly the old `canInject` predicate (`!excluded.has(name) &&
- * !mcpServers[name]`), kept in one function so the spawn and the snapshot
- * cannot drift apart.
- *
- * `DATA_DIR` is never bind-mounted into a container, and the file carries no
- * credential: remote entries carry the `onecli-managed` placeholder and the
- * OneCLI gateway substitutes the real secret at the proxy boundary.
+ * Fleet-wide MCP defaults (`data/fleet-mcp-servers.json`), inherited by every group; adding one is a data edit
+ * (`ncl groups config add-mcp-server --fleet`). A group's own container.json entry wins for a name, and
+ * `excludeMcpServers` withholds one. The file carries no credential: the OneCLI gateway injects auth.
  */
 import fs from 'fs';
 import path from 'path';
@@ -34,30 +16,14 @@ interface FleetMcpServersFile {
   mcpServers: Record<string, McpServerConfig>;
 }
 
-/**
- * What a fresh install gets before anyone edits the file: the servers that
- * used to be hardcoded, one `if (canInject('<name>'))` block each, in
- * `buildContainerArgs`. Their `description` is the exact capability text
- * `src/capabilities.ts` used to carry as a hand-written `useFor`, so the
- * snapshot reads identically through the derived path.
- *
- * This constant is the SEED, not the source of truth: `readFleetMcpServers`
- * prefers the file the moment one exists, and every `--fleet` mutation writes
- * the merged result back. Editing it is not how a tool is added — that is
- * `ncl groups config add-mcp-server --fleet`.
- */
+/** Seed only: once the file exists it wins. Add tools with `ncl groups config add-mcp-server --fleet`, not here. */
 export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
   granola: {
     type: 'stdio',
     command: 'bun',
     args: ['/app/src/granola-mcp-server.ts'],
     displayName: 'Granola',
-    // Local stdio MCP wrapping Granola's REST API. Replaces the hosted
-    // mcp.granola.ai/mcp endpoint whose OAuth session tokens expired silently
-    // every few hours and left agents stuck on "Session expired. Please sign
-    // in again." OneCLI injects the static `grn_*` bearer token at the HTTPS
-    // proxy based on the `public-api.granola.ai` host pattern — see the
-    // `GranolaAPI` vault secret. No refresh worker needed.
+    // Local wrapper, not the hosted endpoint, whose OAuth sessions expired silently every few hours.
     description:
       'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on public-api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
   },
@@ -79,8 +45,6 @@ export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
   },
   exa: {
     type: 'http',
-    // Auth header injected by the OneCLI gateway proxy at request time
-    // (vault entry "Exa-MCP" → mcp.exa.ai).
     url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run',
     displayName: 'Exa',
     description:
@@ -88,8 +52,6 @@ export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
   },
   pocket: {
     type: 'http',
-    // Auth header injected by the OneCLI gateway proxy at request time
-    // (vault entry "Pocket" → public.heypocketai.com).
     url: 'https://public.heypocketai.com/mcp',
     displayName: 'Pocket',
     description:
@@ -97,11 +59,7 @@ export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
   },
   littlebird: {
     type: 'http',
-    // Auth header injected by the OneCLI gateway proxy at request time
-    // (vault entry "Littlebird" → mcp.littlebird.ai). The bearer is an OAuth
-    // access token minted by `ncl integrations login` and kept fresh by the
-    // sweep's `mcp-oauth-refresh` duty (`src/host-sweep.ts`) — a 401 from
-    // this server means the grant needs a fresh login, not a retry.
+    // OAuth bearer kept fresh by the sweep; a 401 means the grant needs a fresh login, not a retry.
     url: 'https://mcp.littlebird.ai/mcp',
     displayName: 'Littlebird',
     description:
@@ -109,35 +67,14 @@ export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
   },
 };
 
-/**
- * Names the agent-runner deletes from the merged map on every spawn
- * (`RETIRED_MCP_SERVER_NAMES`, container/agent-runner/src/retired-mcp-servers.ts,
- * applied in container/agent-runner/src/index.ts). A fleet entry under one
- * of these would be dead config, and a capability entry for one would promise
- * the agent a tool that cannot exist — so the file refuses the name and the
- * capability snapshot skips it. `src/fleet-mcp-servers.test.ts` fails if this
- * set and the container's drift apart; a group's own stale container.json
- * entry is NOT refused here, because the runner still logs and drops it, which
- * is the operator's cue to clean the file.
- */
+/** Must match the agent-runner's `RETIRED_MCP_SERVER_NAMES`, which it drops on every spawn (test-enforced). */
 export const RETIRED_MCP_SERVER_NAMES: ReadonlySet<string> = new Set(['slack-user-token']);
 
 function fail(message: string): never {
   throw new Error(`Invalid fleet MCP defaults at ${FLEET_MCP_SERVERS_PATH}: ${message}`);
 }
 
-/**
- * Shape-check one stored entry.
- *
- * `validateMcpServers` only refuses SSE and strips a provenance-less `cwd`
- * (src/container-config.ts), so it would pass `null` or an `http`
- * entry with no `url` straight through to a container and to the capability
- * snapshot. Everything written through `ncl groups config add-mcp-server` has
- * already been through the full intake (`parseMcpServerConfig`); this is the
- * floor for a file someone edited by hand, and it deliberately does NOT
- * normalize — adding a default `args`/`env` here would silently change what an
- * existing entry sends to its container.
- */
+/** Floor for a hand-edited file. Deliberately does not normalize: that would change what an entry sends. */
 function validateFleetEntry(name: string, entry: McpServerConfig): void {
   try {
     validateMcpServerName(name);
@@ -155,14 +92,8 @@ function validateFleetEntry(name: string, entry: McpServerConfig): void {
   if (server.type !== undefined && server.type !== 'stdio' && server.type !== 'http') {
     fail(`server ${name} has unsupported transport ${JSON.stringify(server.type)}`);
   }
-  // Every remaining field, by the same shapes `parseMcpServerConfig` enforces
-  // (src/container-config.ts) — minus its normalization. A wrong shape
-  // here is inherited by EVERY group and only fails inside the container: a
-  // string `args` survives `args.length > 0` and then throws on `.map` while
-  // Codex writes its TOML (container/agent-runner/src/providers/codex-app-server.ts).
-  // Unknown keys are refused rather than passed along, because the fields that
-  // are not here (`cwd`, `plugin`, `pluginRoot`) are per-group plugin
-  // provenance that a fleet-wide entry has no way to mean.
+  // A wrong shape here is inherited by every group and fails only inside the container. Unknown keys are refused:
+  // `cwd`, `plugin`, `pluginRoot` are per-group plugin provenance a fleet entry can't mean.
   const allowed = new Set(
     hasUrl
       ? ['type', 'url', 'headers', 'instructions', 'displayName', 'description']
@@ -207,8 +138,7 @@ function validateFleetEntry(name: string, entry: McpServerConfig): void {
     } catch (error) {
       fail(`server ${name} url is not a valid URL: ${error instanceof Error ? error.message : String(error)}`);
     }
-    // Mirrors `parseMcpServerConfig` (src/container-config.ts): HTTPS,
-    // or plain HTTP only for a loopback host the gateway never sees.
+    // Plain HTTP only for a loopback host the gateway never sees.
     const loopback = ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal'].includes(parsed.hostname);
     if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
       fail(`server ${name} url must use HTTPS (plain HTTP only for localhost and host.docker.internal)`);
@@ -235,30 +165,19 @@ function parseFile(contents: string): Record<string, McpServerConfig> {
   if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) {
     fail('mcpServers must be an object keyed by server name');
   }
-  // Same validator the per-group file goes through, so an SSE entry or a
-  // provenance-less `cwd` is refused/stripped identically in both places —
-  // then the per-entry floor it does not cover.
   const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
   for (const [name, entry] of Object.entries(validated)) validateFleetEntry(name, entry);
   return validated;
 }
 
-/**
- * The fleet defaults in force right now. A missing file is the documented
- * fresh-install state, not an error: it yields `DEFAULT_FLEET_MCP_SERVERS`, so
- * an install that has never run a `--fleet` command behaves exactly as it did
- * when these servers were hardcoded. A malformed file throws — dropping every
- * group's tools silently is the failure mode this repo keeps paying for.
- */
+/** A missing file yields the defaults; a malformed one throws rather than silently dropping every group's tools. */
 export function readFleetMcpServers(): Record<string, McpServerConfig> {
   let contents: string;
   try {
     contents = fs.readFileSync(FLEET_MCP_SERVERS_PATH, 'utf-8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      // Copy each entry, not just the map: `validateMcpServers` mutates
-      // entries in place (src/container-config.ts), and these are the
-      // module-level defaults.
+      // Copy each entry: `validateMcpServers` mutates entries in place, and these are the module-level defaults.
       return Object.fromEntries(Object.entries(DEFAULT_FLEET_MCP_SERVERS).map(([name, entry]) => [name, { ...entry }]));
     }
     throw error;
@@ -266,7 +185,6 @@ export function readFleetMcpServers(): Record<string, McpServerConfig> {
   return parseFile(contents);
 }
 
-/** Read-modify-write the fleet file, seeding it from the defaults on first use. */
 export function updateFleetMcpServers(
   mutate: (servers: Record<string, McpServerConfig>) => void,
 ): Record<string, McpServerConfig> {
@@ -283,15 +201,8 @@ export function updateFleetMcpServers(
 }
 
 /**
- * Every MCP server this group's container ends up with from config alone:
- * its own `container.json` entries, plus the fleet defaults it neither
- * declares itself nor excludes.
- *
- * Deliberately NOT included are the tool-gated, host-credential-derived
- * servers `buildContainerArgs` still assembles itself (linear, datafold,
- * atlassian, looker, dbt-mcp): those depend on scoped host env this function
- * has no business reading, and each already carries a hand-written capability
- * entry.
+ * Shared by the spawn and the capability snapshot. Excludes the host-credential-derived servers
+ * `buildContainerArgs` assembles itself from scoped host env.
  */
 export function effectiveMcpServers(
   config: { mcpServers?: Record<string, McpServerConfig>; excludeMcpServers?: string[] } | undefined,
@@ -300,12 +211,7 @@ export function effectiveMcpServers(
   const excluded = new Set(config?.excludeMcpServers ?? []);
   for (const [name, entry] of Object.entries(readFleetMcpServers())) {
     if (excluded.has(name) || servers[name]) continue;
-    // A copy, not the entry itself: with no file on disk `readFleetMcpServers`
-    // hands back `DEFAULT_FLEET_MCP_SERVERS`' own objects, and
-    // `validateMcpServers` mutates what it is given in place
-    // (it deletes `cwd`). One caller's cleanup would
-    // otherwise edit the module-level defaults for every later caller in the
-    // process.
+    // A copy: `validateMcpServers` mutates in place and could otherwise edit the module-level defaults.
     servers[name] = { ...entry };
   }
   return servers;

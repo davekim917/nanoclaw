@@ -1,20 +1,6 @@
 /**
- * Live task list — host side (docs/specs/slack-task-list/plan.md).
- *
- * The runner owns the list (container/agent-runner/src/task-list.ts): it
- * decides post vs edit, renders it, and keeps the durable record in
- * `session_state.task_list`. The host does four small things, all here so the
- * upstream-owned delivery and typing modules carry only one-line hooks:
- *
- *   - coalescing queued edits of one list (`supersededTaskListEdits`);
- *   - marking a list interrupted when its container is killed mid-work,
- *     fenced so the dead container's queued updates cannot revive it
- *     (`settleTaskListOnKill`);
- *   - the platform status line's text — "is working: <current item>"
- *     (`setTypingStatusText` / `typingStatusFor`);
- *   - the 👀 receipt on a human's message (`ackInboundReceipt`).
- *
- * delivery.ts is reached by dynamic import: it statically imports this module.
+ * Live task list, host side; the runner owns the list itself. Kept here so the upstream-owned delivery and typing
+ * modules carry only one-line hooks. delivery.ts is reached by dynamic import: it statically imports this module.
  */
 import { parseRetryAfterMs } from './channels/chat-sdk-bridge.js';
 import { TASK_LIST_ENABLED } from './config.js';
@@ -24,13 +10,7 @@ import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { withExistingMailboxSession } from './session-manager.js';
 
-/**
- * Task-list edits in a delivery batch that a LATER edit of the same message
- * in the same batch replaces. Every edit carries the whole list, so only the
- * newest needs to reach the platform; the rest are recorded delivered unsent.
- * `due` is in delivery order. Posts are never superseded — an edit can only
- * target a post that already delivered.
- */
+/** Edits replaced by a later edit of the same message in this batch; `due` must be in delivery order. */
 export function supersededTaskListEdits(
   due: ReadonlyArray<{ id: string; kind: string; content: string }>,
 ): Set<string> {
@@ -53,35 +33,19 @@ export function supersededTaskListEdits(
   return superseded;
 }
 
-/** Rate-limited interrupted edits are retried this many times in all. */
 const KILL_EDIT_MAX_ATTEMPTS = 4;
 /** A cooldown longer than this is not waited out: the list keeps its last state. */
 const KILL_EDIT_MAX_WAIT_MS = 5 * 60_000;
 const KILL_EDIT_WAIT_BUFFER_MS = 250;
 
 /**
- * Edit a session's unfinished task list to its "interrupted" form because its
- * container is being killed mid-work, so a dead agent never leaves a
- * live-looking list. Never throws; its caller does not wait on it.
- *
- * Ordered and fenced through the session's delivery slot: it waits for any
- * drain in flight, records the dead container's still-queued list rows
- * delivered-unsent (durably, in inbound.db, so a host restart cannot replay
- * them over the interrupted form), then edits. Where it edits comes from
- * host-owned evidence (`getTaskListSettlement`) and must be the session's own
- * conversation; only the wording — pre-rendered by the runner on every update
- * — comes from the container's record.
- *
- * A rate limit does not lose the edit: it waits out the platform's cooldown
- * OUTSIDE the slot (answers keep flowing) and tries again, re-deciding from
- * scratch each time, so a replacement container that took the list over in
- * the meantime is left alone.
+ * Never throws. Fenced through the session's delivery slot: the dead container's queued list rows are recorded
+ * delivered-unsent durably first, so a restart can't replay them over the interrupted form. The edit target comes
+ * from host-owned evidence and must be the session's own conversation; only the wording is container-written.
+ * Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
  */
 export async function settleTaskListOnKill(sessionId: string, reason: string): Promise<void> {
   setTypingStatusText(sessionId, null);
-  // Every stop settles, idle reaps included: once the container is gone a
-  // list still showing ✱ is stale whatever the reason (a finished list is
-  // left alone by getTaskListSettlement).
   if (!TASK_LIST_ENABLED) return;
   const killedAt = new Date().toISOString();
   try {
@@ -103,8 +67,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
         if (
           edit.channelType !== origin.channel_type ||
           edit.platformId !== origin.platform_id ||
-          // A channel-level session (no thread of its own) holds its lists in
-          // the threads of the messages it answered, all in its own channel.
+          // A channel-level session holds its lists in the threads of the messages it answered.
           (session.thread_id !== null && edit.threadId !== session.thread_id)
         ) {
           log.warn('Task list is not in this session’s own conversation — not marking it interrupted', {
@@ -120,8 +83,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
             edit.platformId,
             edit.threadId,
             'task_list',
-            // Scrubbed whole, like every other outbound payload (delivery.ts):
-            // both fields are container-written.
+            // Both fields are container-written.
             scrubSecrets(
               JSON.stringify({
                 operation: 'edit',
@@ -161,19 +123,11 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
 }
 
 /**
- * Per platform (channel type), when its rate-limit cooldown ends. A task-list
- * write that hits a rate limit pauses EVERY task-list write on that platform
- * until Retry-After passes — a newer revision of the same list, another
- * session's list, the kill-time interrupted edit — so a busy list cannot keep
- * probing a limit it has already been told about. Platform-wide rather than
- * per channel because Slack's update limits are per workspace, and a pause of
- * a few seconds costs nothing: answers never consult it, and a paused row is
- * not charged a delivery attempt, so a long cooldown cannot exhaust a final
- * refresh. Memory-only: after a host restart the next write simply tries.
+ * Per platform, when its task-list rate-limit cooldown ends. Platform-wide because Slack's update limits are
+ * per workspace; answers never consult it and a paused row is not charged a delivery attempt.
  */
 const taskListCooldowns = new Map<string, number>();
 
-/** Milliseconds left in this platform's task-list cooldown; 0 when there is none. */
 export function taskListCooldownMs(channelType: string | null): number {
   const key = channelType ?? '';
   const until = taskListCooldowns.get(key);
@@ -184,7 +138,7 @@ export function taskListCooldownMs(channelType: string | null): number {
   return 0;
 }
 
-/** If `err` is a rate limit, start this platform's cooldown and return true (not a delivery failure). */
+/** True (not a delivery failure) when `err` is a rate limit. */
 export function deferTaskListOnRateLimit(channelType: string | null, err: unknown): boolean {
   const retryAfterMs = parseRetryAfterMs(err);
   if (retryAfterMs === null) return false;
@@ -193,13 +147,7 @@ export function deferTaskListOnRateLimit(channelType: string | null, err: unknow
   return true;
 }
 
-/**
- * Note an initial task-list POST the drain stepped past for a rate limit. If
- * an answer delivers after it in the same drain, the post is retired
- * (recorded delivered-unsent) rather than sent later BELOW the answer; the
- * runner reads that as a failed post and its next update posts afresh. Edits
- * can safely land late — they change a message already in place.
- */
+/** A held initial POST is retired if an answer delivers after it, rather than landing below the answer. */
 export function noteHeldTaskListPost(held: Set<string>, msg: { id: string; content: string }): void {
   try {
     if ((JSON.parse(msg.content) as { operation?: unknown }).operation !== 'edit') held.add(msg.id);
@@ -208,19 +156,11 @@ export function noteHeldTaskListPost(held: Set<string>, msg: { id: string; conte
   }
 }
 
-/** Test seam: forget every cooldown. */
 export function _clearTaskListCooldownsForTest(): void {
   taskListCooldowns.clear();
 }
 
-/**
- * Longest status line, prefix included. Slack's `assistant.threads.setStatus`
- * rejects a `loading_messages` entry of 51+ characters ("must be less than 51
- * characters"), and the adapter sends the status text as that entry
- * (`@chat-adapter/slack` startTyping). Every status line comes from
- * typingStatusFor — the typing module passes it on each of its setTyping calls
- * (modules/typing/index.ts triggerTyping callers) — so the clip lives there.
- */
+/** Slack's `assistant.threads.setStatus` rejects a `loading_messages` entry of 51+ characters. */
 const STATUS_TEXT_MAX = 50;
 
 function clipStatusText(text: string): string {
@@ -231,12 +171,6 @@ function clipStatusText(text: string): string {
   return `${cut.trimEnd()}…`;
 }
 
-/**
- * Per session, the task list's current item (set when a task_list row
- * delivers). It becomes the platform status line — "is working: Run the
- * migration" — so work with a list reads as specific, and work without one
- * as "is thinking…".
- */
 const statusTexts = new Map<string, string>();
 
 export function setTypingStatusText(sessionId: string, text: string | null): void {
@@ -244,7 +178,7 @@ export function setTypingStatusText(sessionId: string, text: string | null): voi
   else statusTexts.delete(sessionId);
 }
 
-/** Status-line text for a session; undefined (the adapter's own default) with the switch off. */
+/** Undefined (the adapter's own default) with the switch off. */
 export function typingStatusFor(sessionId: string): string | undefined {
   if (!TASK_LIST_ENABLED) return undefined;
   const item = statusTexts.get(sessionId);
@@ -252,10 +186,7 @@ export function typingStatusFor(sessionId: string): string | undefined {
   return clipStatusText(`is working: ${item}`);
 }
 
-/**
- * Update the status-line item from a delivered task_list row. A superseded
- * pointer carries no activeText and leaves it alone.
- */
+/** A superseded pointer carries no activeText and leaves the status item alone. */
 export function noteTaskListDelivered(sessionId: string, content: Record<string, unknown>): void {
   const meta = content.taskList as { activeText?: unknown } | undefined;
   if (meta && 'activeText' in meta) {
@@ -263,11 +194,7 @@ export function noteTaskListDelivered(sessionId: string, content: Record<string,
   }
 }
 
-/**
- * 👀 on a human's message the moment an agent takes it — the receipt half of
- * the UX. Slack only, like the list's rendering; fire-and-forget, a failed
- * reaction must never hold up the message it acknowledges.
- */
+/** Fire-and-forget: a failed reaction must never hold up the message it acknowledges. */
 export function ackInboundReceipt(
   channelType: string,
   platformId: string,
@@ -293,7 +220,6 @@ export function ackInboundReceipt(
     );
 }
 
-/** A chat-sdk message whose serialized author says it is not a bot. */
 export function isHumanChatSdkContent(kind: string, content: string): boolean {
   if (kind !== 'chat-sdk') return false;
   try {

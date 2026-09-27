@@ -190,7 +190,7 @@ function buildQuestionText(
  * Where the mention happened, in the most specific form the adapter could
  * give us. A group DM has no name a human recognizes — the platform's own
  * label is a slug like `mpdm-alice--bob--carol-1` — so it is described by who
- * is in it. Everything else keeps the existing channel-name rendering.
+ * is in it.
  */
 function describeWhere(
   channelName: string | null,
@@ -265,9 +265,6 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   // can auto-wire / decline / suppress for its own channel type. Runs after
   // the in-flight dedupe (a pending card already owns this channel) and
   // before the approver checks (an auto-wire needs no reachable approver).
-  // `getMessagingGroup` is one awaited driver read (seam 3), so this is a
-  // cheap extra read rather than a reason to hoist the later `originMg` (card
-  // text, instance) up to here — that lookup stays where it is.
   {
     const interceptMg = await getMessagingGroup(messagingGroupId);
     const interceptor = interceptMg ? channelCardInterceptors.get(interceptMg.channel_type) : undefined;
@@ -311,10 +308,8 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const originMg = await getMessagingGroup(messagingGroupId);
   const originChannelType = originMg?.channel_type ?? '';
 
-  // Classify the conversation once, and reuse it for both the persisted name
-  // and the card text — a second lookup would be a second API round trip for
-  // the same answer. Key by instance so a named instance's own adapter (and
-  // bot identity) does the lookup.
+  // Classified once for both the persisted name and the card text, keyed by
+  // instance so a named instance's own adapter does the lookup.
   let conversation: ChannelConversation | null = null;
   if (originMg) {
     const channelAdapter = getChannelAdapter(originMg.instance ?? originMg.channel_type);
@@ -326,21 +321,9 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       }
     }
     if (conversation) {
-      // The classification above already carries the name — deriving it
-      // here is what keeps this to ONE round trip.
-      //
-      // Written unconditionally (not gated on `!originMg.name`): this is the
-      // first inbound event for a fresh, unwired mg, and `reportChannelMetadata`
-      // (chat-sdk-bridge.ts, one-shot per channel per process) races this same
-      // event with its own, cruder name lookup. The `classified` stamp is what
-      // settles that race in one direction: it outranks the raw fetch's
-      // `adapter` stamp, so this answer wins whether it lands first or second,
-      // and the raw fetch cannot take it back on a later restart either.
-      //
-      // Rewritten when the NAME is new or when its PROVENANCE is: a name the
-      // raw fetch happened to get right still carries an `adapter` stamp, and
-      // leaving it there would let a later raw fetch overwrite an answer the
-      // classifier has since confirmed.
+      // Written unconditionally: `reportChannelMetadata` races this first event
+      // with a cruder lookup, and the `classified` stamp outranks its `adapter`
+      // stamp whichever lands first. Rewritten when the name OR its provenance is new.
       const name = conversationDisplayName(conversation);
       const nameSource = channelNameProvenance(originMg.channel_type, 'classified');
       if (name && (name !== originMg.name || originMg.name_source !== nameSource)) {
@@ -349,15 +332,8 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         originMg.name_source = nameSource;
       }
     } else if (!originMg.name && channelAdapter?.resolveChannelName) {
-      // No rich classification available (adapter lacks the seam, or the
-      // lookup failed) — fall back to the plain resolver. Set-once: an
-      // adapter without the seam can't tell a stale legacy name from a good
-      // one, so an already-set name is left alone here as before.
-      //
-      // Still stamped `classified`: `resolveChannelName` is the classification
-      // seam's other face (on Slack it is a projection of the same
-      // `resolveConversation`), so its answer must outrank the raw fetch for
-      // the same reason the branch above does.
+      // Fallback resolver. Set-once: an adapter without the seam can't tell a stale
+      // name from a good one. Still stamped `classified`, as the same classification's other face.
       try {
         const name = await channelAdapter.resolveChannelName(originMg.platform_id);
         if (name) {
@@ -372,16 +348,9 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     }
   }
 
-  // Same-channel-type only: refuse to deliver an approval card carrying
-  // a user's message body into a different workspace/platform than the
-  // one it originated in, even if the same human owner is reachable
-  // there. The dropped_messages row written by the router (reason
-  // 'no_agent_wired') already preserves operator visibility; the owner
-  // can review pending registrations via the dashboard.
-  //
-  // `instance` so a cold DM row created for this delivery is stamped with
-  // the origin's adapter instance, not the bare channel_type — see the
-  // comment on the `adapter.deliver` call below.
+  // Same-channel-type only: the card carries a user's message body, which must
+  // not leave the workspace it came from. `instance` stamps a cold DM row with
+  // the origin's adapter instance.
   const delivery = await pickApprovalDelivery(approvers, originChannelType, {
     sameChannelTypeOnly: true,
     instance: originMg?.instance ?? event.instance,
@@ -442,10 +411,8 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   }
 
   try {
-    // Instance-addressed: `delivery.messagingGroup.instance` is the exact
-    // adapter instance `pickApprovalDelivery` resolved this DM on. Without
-    // it, an install whose bots are all named instances resolves no adapter
-    // under the bare channel_type, or the wrong sibling bot answers.
+    // Instance-addressed: a bare channel_type resolves no adapter, or the wrong
+    // sibling bot, when bots are named instances.
     await adapter.deliver(
       delivery.messagingGroup.channel_type,
       delivery.messagingGroup.platform_id,
@@ -496,11 +463,8 @@ export async function buildAgentSelectionOptions(
 }
 
 /**
- * How many times folder allocation may lose the unique-key race before giving
- * up. Each loss advances the numeric suffix past the folder the winner took,
- * so exhausting this needs five approvers naming the same agent at the same
- * instant. Bounded rather than unbounded because a stuck loop here would hang
- * a router interceptor.
+ * Folder allocation may lose the unique-key race this many times; bounded
+ * because a stuck loop would hang a router interceptor.
  */
 const FOLDER_ALLOCATION_ATTEMPTS = 5;
 
@@ -508,13 +472,9 @@ const FOLDER_ALLOCATION_ATTEMPTS = 5;
  * Create a new agent group and initialize its filesystem. Handles
  * folder-name collisions with numeric suffixes.
  *
- * Concurrency: the `getAgentGroupByFolder` scan yields (async driver), so two
- * approvers naming agents that normalize to the same folder can both settle on
- * it and both INSERT; `agent_groups.folder` is UNIQUE, so one loses. Losing is
- * NOT adoptable here — the winner's row is a DIFFERENT operator's agent, with
- * its own name and its own channel to wire — so the loser re-runs allocation,
- * which now sees the taken folder and moves to the next suffix. `insertOrAdopt`
- * supplies the "did I lose?" signal; the retry policy is this function's.
+ * Concurrency: two approvers can settle on the same folder and one INSERT
+ * loses on UNIQUE(folder). Losing is NOT adoptable (the winner is a different
+ * operator's agent), so the loser re-runs allocation to the next suffix.
  */
 export async function createNewAgentGroup(name: string): Promise<AgentGroup> {
   const baseFolder = toFolder(name);
@@ -524,12 +484,8 @@ export async function createNewAgentGroup(name: string): Promise<AgentGroup> {
 
   let allocated = false;
   for (let attempt = 1; attempt <= FOLDER_ALLOCATION_ATTEMPTS && !allocated; attempt++) {
-    // Disk-aware dedupe: a folder present on disk with no claiming DB row is
-    // deleted-group residue (or a dangling symlink — groupFolderExistsOnDisk
-    // uses lstat, not existsSync, so it still counts as present). Adopting it
-    // would silently re-scope the old group's data under the new agent's
-    // identity, so skip to the next suffix instead — same behavior as the
-    // agent-reachable minted-name path (templates/create-agent.ts).
+    // A folder on disk with no DB row (or a dangling symlink) is deleted-group
+    // residue; adopting it would re-scope the old group's data under the new agent.
     while ((await getAgentGroupByFolder(folder)) || groupFolderExistsOnDisk(folder)) {
       folder = `${baseFolder}-${suffix}`;
       suffix++;

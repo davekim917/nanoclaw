@@ -107,9 +107,7 @@ export function clackResolveInput(
     const guarded = validateWithHelpEscape(check);
     // clearOnError wipes a rejected secret so the operator re-pastes cleanly
     // (a half-pasted token isn't left masked in the field).
-    // An either/or prompt renders as an arrow-key select — the options come
-    // straight from the validate regex (literalChoices). No re-ask loop and no
-    // `?` help-escape there: every choice is valid and self-describing.
+    // An either/or prompt renders as a select from the validate regex: no re-ask or `?` escape needed.
     const choices = meta.secret ? null : literalChoices(meta.validate);
     const ans = choices
       ? await p.select({ message: meta.question, options: choices.map((c) => ({ value: c, label: c })) })
@@ -464,12 +462,7 @@ export interface RunSkillOptions {
   skipEffects?: string[];
   /** Offer to reuse credentials already in `.env` instead of re-prompting. */
   reuse?: boolean;
-  /**
-   * Overrides a `copy owned-by-fork` refusal: replaces a fork-owned file that
-   * has diverged from its registry branch with the branch version instead of
-   * refusing to touch it. Mirrors the CLI's `--force`. Defaults to
-   * false — the protective behavior.
-   */
+  /** Overwrite a diverged `copy owned-by-fork` file instead of refusing it (the CLI's `--force`). */
   force?: boolean;
   /**
    * Consumer for every engine emission (step events + operator blocks). When
@@ -545,10 +538,8 @@ export async function runSkill(skillDir: string, opts: RunSkillOptions = {}): Pr
   });
 }
 
-// CLI: pnpm exec tsx setup/lib/skill-driver.ts <skillDir> [--force]   — apply a
-// skill interactively. --force overrides an owned-by-fork refusal —
-// use it only after confirming with the operator that replacing a customized
-// file with the registry-branch version is actually wanted.
+// CLI: pnpm exec tsx setup/lib/skill-driver.ts <skillDir> [--force]. Use --force only after the
+// operator confirms replacing a customized file with the registry-branch version.
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   void (async () => {
     const args = process.argv.slice(2);

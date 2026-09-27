@@ -1,4 +1,3 @@
-/** Host side of durable repository publication, refresh, and topic transfer. */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -253,7 +252,7 @@ function assertCanonicalConfigContract(
   return { origin, objectFormat };
 }
 
-/** Replace container-controlled clone config with the minimal host contract. */
+/** Rebuilt from selected values: no container-supplied setting may survive publication. */
 function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void {
   const config = path.join(repoPath, '.git', 'config');
   const objectsInfo = path.join(repoPath, '.git', 'objects', 'info');
@@ -400,7 +399,8 @@ export async function publishStagedCanonical(
         throw new Error('repository staging clone has local modifications and was left untouched');
       }
       const head = git(input.stagingPath, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
-      // The host canonical must not own a user branch.
+      // The host canonical must not own a user branch; topic worktrees may still
+      // use the remote-default branch name.
       git(input.stagingPath, ['checkout', '-q', '--detach', head], 30_000);
       // Published already carrying its commondir sentinel, so it never exists without one.
       if (ensureCanonicalCommondirSentinel(path.join(input.stagingPath, '.git')) !== 'sentinel') {
@@ -661,7 +661,9 @@ async function response(
 // the topic's staging dir (outside every container mount) and published with
 // one rename, so a checkout exists only once ready. Runs on the host because
 // in a container the canonical and topic root are different mounts: link(2)
-// returns EXDEV and Git would copy every object.
+// returns EXDEV and Git would copy every object. It takes only its work unit's
+// lifecycle claim and the repository flock: never the workgroup mount claim,
+// and it never quiesces containers.
 
 export interface CheckoutFarmPolicy {
   /** `apply` links farms, `report` logs what it would link, `off` shares nothing. */

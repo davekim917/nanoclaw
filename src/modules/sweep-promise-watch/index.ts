@@ -9,8 +9,9 @@
  *
  * Modes (`NANOCLAW_PROMISE_WATCH`): `off` (default; agent text leaves the host
  * for TypeSafe only on opt-in), `shadow` (log only), `nudge`. A nudge can make
- * an agent speak in a client-facing channel. Wake ids are keyed by message and
- * the daily cap is file-backed, so neither resets on restart.
+ * an agent speak in a client-facing channel, so read production flags in shadow
+ * before enabling it. Wake ids are keyed by message and the daily cap is
+ * file-backed, so neither resets on restart.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -98,7 +99,6 @@ export function admissible(
   return snap.latestChat?.id === messageId && candidateReason(fresh, snap, now) === 'candidate';
 }
 
-/** The promise question from the backtest (V2), plus scheduled-time wording it missed. */
 const PROMISE_QUESTION: JevQuestion = {
   type: 'noul',
   instructions:
@@ -154,7 +154,6 @@ export interface ScanDeps {
   listSessions: (sinceIso: string) => Promise<Session[]>;
   snapshot: (session: Session) => Promise<SessionSnapshot | undefined>;
   classify: (text: string) => Promise<number>;
-  /** Re-checks eligibility against fresh state, then writes the wake row. */
   nudge: (session: Session, messageId: string, text: string, p: number) => Promise<NudgeOutcome>;
   cap: NudgeCapStore;
 }
@@ -232,7 +231,7 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
       continue;
     }
     // Reserve before writing so a crash after the wake row lands can't leave
-    // it uncounted.
+    // it uncounted; a slot the admission then refuses is deliberately lost.
     if (!deps.cap.reserve(day, NUDGE_DAILY_CAP)) {
       // Not decided: tomorrow's allowance may still reach it inside the window.
       log.warn('promise-watch: daily nudge cap reached, skipping', fields);
@@ -257,7 +256,6 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
   return { asked, promises, nudged };
 }
 
-/** Test seam: forget decided ids. */
 export function _resetPromiseWatchForTesting(): void {
   decided.clear();
 }

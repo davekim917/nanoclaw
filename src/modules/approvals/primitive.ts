@@ -175,53 +175,34 @@ export async function pickOwnersFirst(agentGroupId: string | null): Promise<stri
  * pair we can actually deliver to. Returns null if nobody is reachable.
  *
  * Tie-break: prefer approvers reachable on the same channel kind as the
- * origin; else first in list. Resolution uses ensureUserDm, which may
- * trigger a platform openDM call on cache miss.
+ * origin; else first in list.
  *
- * `sameChannelTypeOnly` (default false): when true, the cross-channel-type
- * fallback loop is disabled — if no approver is reachable on the origin's
- * channel_type the function returns null instead of falling back to a
- * different workspace/platform. Callers carrying user-originated message
- * bodies (channel-registration, unknown-sender approval) set this to avoid
- * leaking a message body from workspace A into workspace B just because
- * the same human owner is registered in both. Agent-originated approvals
- * (self-mod, onecli, bash-gate) leave it false: the card content is
- * system/agent-owned, not external-user-owned, so cross-workspace fallback
- * is safe and ensures the owner is reachable.
+ * `sameChannelTypeOnly`: no cross-channel-type fallback, for cards carrying a
+ * user-originated message body, which must not leak into another workspace.
+ * Agent-originated cards leave it off: their content is system-owned, and the
+ * fallback keeps the owner reachable.
  */
 export async function pickApprovalDelivery(
   approvers: string[],
   originChannelType: string,
   /**
-   * `instance` is the origin conversation's adapter instance, used only when a
-   * cold DM row has to be created. Callers that later dispatch on the returned
-   * row's exact instance key must pass it: without it the new row is stamped
-   * with the bare channel type, which resolves no adapter on an install whose
-   * bots are all named instances. See `ensureUserDm`.
+   * `instance` stamps a cold-created DM row. Callers that dispatch on the
+   * returned row's instance must pass it: a bare channel type resolves no
+   * adapter when every bot is a named instance.
    */
   options: { sameChannelTypeOnly?: boolean; instance?: string } = {},
 ): Promise<{ userId: string; messagingGroup: MessagingGroup } | null> {
   if (originChannelType) {
     for (const userId of approvers) {
-      // resolveUserChannelType, NOT a split on the id's own `:` prefix. A
-      // Teams owner's id is `29:<aad-id>`, so the raw prefix is `29` and the
-      // comparison against a `teams` origin never matches — with
-      // sameChannelTypeOnly the whole function then returns null and no
-      // approver is reachable at all. The permissions layer already resolves
-      // this (parseUserId falls back to user.kind); asking it is what keeps
-      // the two sides from disagreeing.
+      // Not a split on the id's `:` prefix: a Teams id is `29:<aad-id>`.
       if ((await resolveUserChannelType(userId)) !== originChannelType) continue;
-      // privacySafeLogs: this DM is the delivery target for an approval
-      // card — a resolution failure here would otherwise write the
-      // approver's platform handle and any raw platform error into the
-      // host log.
+      // privacySafeLogs: keeps the approver's handle and raw platform errors out of the host log.
       const mg = await ensureUserDm(userId, { instance: options.instance, privacySafeLogs: true });
       if (mg) return { userId, messagingGroup: mg };
     }
   }
   if (options.sameChannelTypeOnly) return null;
-  // Cross-channel fallback: the origin instance belongs to a different
-  // platform here, so it must not be stamped on this user's DM row.
+  // The origin instance belongs to a different platform here; never stamp it on this DM row.
   for (const userId of approvers) {
     const mg = await ensureUserDm(userId, { privacySafeLogs: true });
     if (mg) return { userId, messagingGroup: mg };
@@ -232,13 +213,10 @@ export async function pickApprovalDelivery(
 // ── Request API ──
 
 /**
- * Send a system chat to the agent's session. Used by callers and by the response handler.
- *
- * The one writer that keeps `origin: 'host'` (WriteSessionMessageOptions.hostOrigin),
- * so the runner marks exactly these notes origin="host". `event` tags a note with
- * its purpose (e.g. `choice_response`); like origin it survives no other writer, so
- * a host note that echoes someone's text cannot pass for one. `id` pins the message
- * id for a caller that must check afterwards whether the note landed.
+ * Send a system chat to the agent's session. The one writer that keeps
+ * `origin: 'host'`, and `event` survives no other writer either, so a note that
+ * echoes someone's text cannot pass for a host event. `id` lets a caller check
+ * afterwards whether the note landed.
  */
 export async function notifyAgent(
   session: Session,
@@ -278,13 +256,7 @@ export interface RequestApprovalOptions {
   agentName: string;
   /** Free-form action identifier. Must match the key the consumer registered via registerApprovalHandler. */
   action: string;
-  /**
-   * Caller-supplied stable identifier stored in `pending_approvals.request_id`.
-   * Lets consumers look up their row later by something they already know
-   * (e.g. the gate's outbound-message id for bash-gate). When omitted, the
-   * auto-generated approvalId is used — preserves back-compat for callers
-   * that don't need the direct lookup (self-mod, onecli).
-   */
+  /** Stored in `pending_approvals.request_id`; defaults to the generated approvalId. */
   requestId?: string;
   /** JSON-serializable opaque payload. Carried on the pending_approvals row, handed to the handler on approve. */
   payload: Record<string, unknown>;
@@ -293,58 +265,28 @@ export interface RequestApprovalOptions {
   /** Card body shown to the admin. */
   question: string;
   /**
-   * Where to deliver the approval card.
-   *
-   * - `'admin'` (default) — DM the first reachable admin from pickApprover.
-   *   Use for bot-config / system-level actions that only admins should
-   *   decide (self-mod package installs, MCP server changes, new-sender
-   *   acceptance, credential releases).
-   * - `'thread'` — post into the originating conversation (session's own
-   *   messaging_group, threaded reply if the session has a thread_id).
-   *   Use for work-level gates where the requesting teammate or anyone
-   *   in the channel should be able to self-approve (bash/email gates,
-   *   destructive-command gates). Response-handler.ts does NOT check
-   *   clicker identity against pickApprover — thread access IS the
-   *   approval authority for this target. Choice actions (choices.ts)
-   *   are the exception: admin privilege always.
+   * `'admin'` (default) DMs the first reachable admin. `'thread'` posts into the
+   * originating conversation, and thread access IS the approval authority there:
+   * the clicker is not checked against pickApprover (choice actions excepted).
    */
   deliveryTarget?: 'thread' | 'admin';
   /** Deliver the card to this specific user instead of all of the session group's admins. */
   approverUserId?: string;
-  /**
-   * Ordered approver-candidate override. Replaces the default pickApprover
-   * chain (group admins → global admins → owners) when the action's audience
-   * is not "whoever administers this group" — e.g. an owner escalation whose
-   * question is addressed to the owner personally must try owners FIRST.
-   * Ignored when approverUserId is set.
-   */
+  /** Ordered override of the pickApprover chain; ignored when approverUserId is set. */
   approvers?: string[];
-  /**
-   * Custom card buttons in place of Approve / Reject / Reject with reason….
-   * Pair with registerChoiceHandler (choices.ts) on the same action: the
-   * response handler then hands any stored option to that handler instead of
-   * applying approve/reject semantics. Omitted → the standard approval buttons.
-   */
+  /** Custom buttons; pair with registerChoiceHandler on the same action, or clicks get approve/reject semantics. */
   options?: RawOption[];
   /**
-   * With deliveryTarget 'thread': post into this conversation instead of the
-   * session's own. The caller must already have authorized it (e.g. against
-   * the agent's destinations). `instance` is the delivering adapter instance,
-   * stored on the row so later edits reach the same bot.
+   * With deliveryTarget 'thread': post here instead of the session's own
+   * conversation. The caller must already have authorized it.
    */
   conversation?: { channelType: string; platformId: string; threadId: string | null; instance?: string | null };
 }
 
 /**
- * What became of a `requestApprovalOutcome` call.
- *
- * - `posted` — the row was inserted and the card delivered.
- * - `duplicate-request` — the row was NOT inserted because another live row
- *   already holds this `requestId`. Nothing was delivered and nothing was
- *   left behind, and the agent was NOT notified: the caller owns the wording,
- *   because only it knows what reusing that id means for its action.
- * - `failed` — anything else (no approver, no adapter, delivery threw). The
- *   agent has already been notified from in here.
+ * `duplicate-request`: another live row holds this `requestId`; nothing was
+ * written and the agent was NOT notified (the caller owns the wording).
+ * `failed`: the agent has already been notified.
  */
 export type ApprovalOutcome = 'posted' | 'duplicate-request' | 'failed';
 
@@ -354,14 +296,9 @@ export type ApprovalOutcome = 'posted' | 'duplicate-request' | 'failed';
  * caller's perspective — the admin's response kicks off the registered
  * approval handler for this action via the response dispatcher.
  *
- * The insert is also the RESERVATION. An action whose `requestId` must be
- * unique among live cards declares that with a partial unique index and then
- * reads this function's `duplicate-request` — `request_choice` is the one
- * that does (migration 078). Checking for a conflicting row before calling
- * here cannot stand on its own: a caller's pre-check and this insert are
- * separated by several awaits, and delivery is excluded per session
- * (src/delivery.ts `inflightDeliveries`, keyed on session.id), so two
- * sessions of one agent group can both pass a pre-check and both arrive here.
+ * The insert is also the RESERVATION: an action whose `requestId` must be
+ * unique declares a partial unique index and reads `duplicate-request`. A
+ * caller's own pre-check cannot replace it; two sessions can both pass one.
  */
 export async function requestApprovalOutcome(opts: RequestApprovalOptions): Promise<ApprovalOutcome> {
   const {
@@ -378,9 +315,6 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
   } = opts;
   const cardOptions = customOptions ?? APPROVAL_OPTIONS;
 
-  // Resolve delivery destination based on target policy.
-  // thread: originating messaging_group + session's thread_id.
-  // admin:  first reachable admin's DM (v1/v2 default behavior).
   let destination: {
     channelType: string;
     platformId: string;
@@ -414,8 +348,6 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
       label: `thread ${mg.channel_type}/${mg.platform_id}${session.thread_id ? ':' + session.thread_id : ''}`,
     };
   } else {
-    // A named approver (e.g. an a2a policy's designated user) narrows the set
-    // to exactly that user; otherwise fall back to the group's approver chain.
     const approvers = approverUserId
       ? [approverUserId]
       : (approverOverride ?? (await pickApprover(session.agent_group_id)));
@@ -452,22 +384,15 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
     title,
     question,
     options_json: JSON.stringify(normalizedOptions),
-    // Populate the routing columns so the host can edit the card later
-    // — cancel-on-follow-up (bash-gate), timeout, or other resolutions
-    // that fire after the click path. platform_message_id gets backfilled
-    // from adapter.deliver's return value immediately below.
+    // Routing columns let the host edit the card later; platform_message_id is backfilled below.
     channel_type: destination.channelType,
     platform_id: destination.platformId,
     thread_id: destination.threadId,
     instance: destination.instance ?? null,
     approver_user_id: approverUserId ?? null,
   });
-  // Honour the reservation BEFORE anything is posted. approvalId is freshly
-  // minted on every call, so the PK cannot be what was skipped: a false here
-  // is an action-scoped unique index refusing a second live row for this
-  // requestId (createPendingApproval, src/db/sessions.ts). Nothing was
-  // written, so there is nothing to clean up, and no card exists to confuse
-  // whoever answers the one that is already live.
+  // Honour the reservation BEFORE anything is posted: false here is the
+  // action-scoped unique index refusing a second live row for this requestId.
   if (!reserved) {
     log.info('Approval request refused: requestId already has a live row', {
       action,
@@ -530,28 +455,12 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
   return 'posted';
 }
 
-/**
- * `requestApprovalOutcome` for the callers that only need "did it post?".
- * An action with no uniqueness claim on its `requestId` can never see
- * 'duplicate-request' — no partial unique index covers it — so for those the
- * boolean loses nothing.
- */
+/** Only for actions with no unique index on `requestId`, which never see 'duplicate-request'. */
 export async function requestApproval(opts: RequestApprovalOptions): Promise<boolean> {
   return (await requestApprovalOutcome(opts)) === 'posted';
 }
 
-/**
- * Edit an approval card in-place (e.g. to show "cancelled" or "timed out").
- * Looks up the card's platform routing from its pending_approvals row. If
- * the row is missing any of { channel_type, platform_id, platform_message_id }
- * we skip silently — those fields are only populated for cards dispatched
- * via the current `requestApproval` code path; legacy rows or cards that
- * failed to deliver won't have them.
- *
- * The `tid` passed to editMessage mirrors what was passed to deliver:
- * `threadId ?? platformId` (the Chat SDK bridge's convention — see
- * chat-sdk-bridge.ts `deliver`).
- */
+/** Skips silently when the row lacks a routing column, including a platform message id the adapter never returned. */
 export async function editApprovalCard(approval: PendingApproval, newBody: string): Promise<void> {
   if (!approval.channel_type || !approval.platform_id || !approval.platform_message_id) return;
   const adapter = getDeliveryAdapter();
@@ -568,9 +477,7 @@ export async function editApprovalCard(approval: PendingApproval, newBody: strin
         text: newBody,
       }),
       undefined,
-      // Dispatch is exact-key: editing through the bare channel type finds no
-      // adapter at all on an install whose bots are all named instances
-      // (choices.ts editChoiceCard, onecli-approvals.ts editCardResolution).
+      // Dispatch is exact-key: a bare channel type finds no adapter when every bot is a named instance.
       approval.instance ?? approval.channel_type,
     );
   } catch (err) {
@@ -578,14 +485,7 @@ export async function editApprovalCard(approval: PendingApproval, newBody: strin
   }
 }
 
-/**
- * How a resolved card reads: the option's own label, and who chose it.
- *
- * `selectedOption` is matched against the row's stored options so the card
- * shows the label it was posted with; a value that matches none renders as
- * itself. An empty `userId` — the sweep finalizing a hold nobody answered —
- * drops the byline rather than inventing an actor.
- */
+/** An empty `userId` (the sweep finalizing an unanswered hold) drops the byline. */
 export async function approvalResolutionLine(
   approval: PendingApproval,
   selectedOption: string,
@@ -607,14 +507,9 @@ export async function approvalResolutionLine(
 }
 
 /**
- * Edit an approval card to show how a click resolved it.
- *
- * The bridge edits no approval card on click:
- * it sees only the id the button carried, so it cannot know the clicked
- * message was this approval's own card, nor that the clicker may decide it.
- * The resolution edit happens here instead — addressed to the card the ROW
- * names, and only once a click has been bound and authorized — so a refused,
- * unauthorized or losing click leaves every card exactly as it was.
+ * The bridge edits no approval card on click; this edits the card the ROW
+ * names, only once a click is bound and authorized, so a refused or losing
+ * click leaves every card as it was.
  */
 export async function editApprovalCardResolution(
   approval: PendingApproval,

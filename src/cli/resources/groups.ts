@@ -14,6 +14,7 @@ import {
   type McpServerConfig,
   updateContainerConfig,
   resolveGroupProvider,
+  writeContainerConfigScalars,
 } from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
 import { FLEET_MCP_SERVERS_PATH, readFleetMcpServers, updateFleetMcpServers } from '../../fleet-mcp-servers.js';
@@ -30,7 +31,6 @@ import {
   ensureContainerConfig,
   getContainerConfig,
   resolveProviderName,
-  updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { getDenialFor } from '../../db/denied-models.js';
@@ -265,12 +265,7 @@ registerResource({
         // `initGroupFilesystem` does not insert the config row (its create-agent caller runs before the agent_groups
         // insert, where the FK would fail), so stamp it here; otherwise the timezone write below updates zero rows.
         await ensureContainerConfig(id);
-        if (timezone) {
-          await updateContainerConfigScalars(id, { timezone });
-          await updateContainerConfig(folder, (config) => {
-            config.timezone = timezone;
-          });
-        }
+        if (timezone) await writeContainerConfigScalars(id, folder, { timezone });
         return await getAgentGroupByFolder(folder);
       },
     },
@@ -622,30 +617,7 @@ registerResource({
           }
         }
 
-        // Mirror the runtime scalars into container.json: the FILE is what the spawn and runner read, so a DB-only
-        // write left groups on their old provider while `config get` showed the new one. `updateContainerConfig`
-        // holds the file lock across read-mutate-write.
-        // THE FILE COMMITS FIRST: if one write fails, file-ahead is the recoverable disagreement (the container boots
-        // what was asked; the flag vocabulary lags until a re-run), while projection-ahead is indistinguishable from
-        // success.
-        if (
-          updates.provider !== undefined ||
-          updates.model !== undefined ||
-          updates.effort !== undefined ||
-          updates.assistant_name !== undefined ||
-          updates.timezone !== undefined
-        ) {
-          await updateContainerConfig(group.folder, (config) => {
-            if (updates.provider !== undefined) config.provider = updates.provider as string;
-            if (updates.model !== undefined) config.model = (updates.model as string) || undefined;
-            if (updates.effort !== undefined) config.effort = (updates.effort as string) || undefined;
-            if (updates.assistant_name !== undefined)
-              config.assistantName = (updates.assistant_name as string) || undefined;
-            // null must ERASE the field so the spawn falls back to the install timezone.
-            if (updates.timezone !== undefined) config.timezone = updates.timezone ?? undefined;
-            return config;
-          });
-        }
+        if (Object.keys(updates).length > 0) await writeContainerConfigScalars(id, group.folder, updates);
 
         if (statusSubtext !== undefined) {
           // `true` erases the key: only the opt-out is recorded, so the file shows what the group changed.
@@ -654,8 +626,6 @@ registerResource({
             return config;
           });
         }
-
-        if (Object.keys(updates).length > 0) await updateContainerConfigScalars(id, updates);
 
         if (hasResourceUpdate) {
           await updateContainerConfig(group.folder, (config) => {

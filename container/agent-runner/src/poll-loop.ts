@@ -26,6 +26,7 @@ import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
+import { activeRuntimeEffortUpdate } from './runtime-context.js';
 import {
   clearContinuation,
   clearCurrentInReplyTo,
@@ -1560,6 +1561,8 @@ export async function processQuery(
   // A deferred change can wait a whole long turn despite the host's ⚙️ ack; say
   // so once per pending change.
   let deferredSettingsNotice: string | null = null;
+  let runtimeUpdateNote = '';
+  let liveEffortFailedFor: string | null = null;
   let corruptionStreak = 0;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
@@ -1679,11 +1682,41 @@ export async function processQuery(
         if (liveSettingsChanged || fastChanged) {
           // Codex fast mode is fixed at app-server start: a tier change must end
           // the query even when live controls exist.
-          if (query.requiresRestartForRuntimeContext && liveSettingsChanged) {
-            // Claude's system prompt is fixed at query start, so a new model/effort
-            // needs a new query. end() is only safe between turns with no
-            // background work: closing input mid-turn closes the control channel,
-            // and open input keeps background subagents alive. Retry next idle poll.
+          let appliedLive = false;
+          if (
+            query.requiresRestartForRuntimeContext &&
+            liveSettingsChanged &&
+            !fastChanged &&
+            fb.model === liveSettings.model &&
+            fb.effort !== 'max' &&
+            query.applySettings &&
+            (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) &&
+            onlyTypedStickyEffort(keep) &&
+            liveEffortFailedFor !== JSON.stringify([fb.effort, fb.ultracode])
+          ) {
+            try {
+              await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
+              appliedLive = true;
+              modelInForce = query.resolvedModel ?? fb.model;
+              setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
+              liveSettings = { model: fb.model, effort: fb.effort, ultracode: fb.ultracode, fast: fb.fast };
+              runtimeUpdateNote = activeRuntimeEffortUpdate(query.resolvedEffort ?? null);
+              deferredSettingsNotice = null;
+              log(`Live effort change applied mid-query: effort=${query.resolvedEffort ?? '(none)'}`);
+            } catch (err) {
+              liveEffortFailedFor = JSON.stringify([fb.effort, fb.ultracode]);
+              log(
+                `Live effort change failed (${err instanceof Error ? err.message : String(err)}) — ` +
+                  'deferring to a fresh query at the next idle boundary',
+              );
+            }
+            if (done) return;
+          }
+          if (!appliedLive && query.requiresRestartForRuntimeContext && liveSettingsChanged) {
+            // Claude's system prompt is fixed at query start, so a new model, or an
+            // effort the live control cannot set, needs a new query. end() is only
+            // safe between turns with no background work: closing input mid-turn closes
+            // the control channel, and open input keeps background subagents alive.
             if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) {
               log(
                 'Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain',
@@ -1712,7 +1745,7 @@ export async function processQuery(
             query.end();
             return;
           }
-          if (fastChanged || !query.applySettings) {
+          if (!appliedLive && (fastChanged || !query.applySettings)) {
             log(
               `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +
                 `fast=${liveSettings.fast ? 'on' : 'off'} → ${fb.fast ? 'on' : 'off'}) — ` +
@@ -1721,21 +1754,22 @@ export async function processQuery(
             endedForCommand = true;
             query.end();
             return;
-          }
-          try {
-            await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
-            modelInForce = query.resolvedModel ?? fb.model;
-            // The provider's getter already reflects the retarget, so it beats the requested value.
-            setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
-            liveSettings = { model: fb.model, effort: fb.effort, ultracode: fb.ultracode, fast: fb.fast };
-          } catch (err) {
-            log(
-              `Live applySettings failed (${err instanceof Error ? err.message : String(err)}) — ` +
-                'ending stream; outer loop reopens with the new model',
-            );
-            endedForCommand = true;
-            query.end();
-            return;
+          } else if (!appliedLive && query.applySettings) {
+            try {
+              await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
+              modelInForce = query.resolvedModel ?? fb.model;
+              // The provider's getter already reflects the retarget, so it beats the requested value.
+              setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
+              liveSettings = { model: fb.model, effort: fb.effort, ultracode: fb.ultracode, fast: fb.fast };
+            } catch (err) {
+              log(
+                `Live applySettings failed (${err instanceof Error ? err.message : String(err)}) — ` +
+                  'ending stream; outer loop reopens with the new model',
+              );
+              endedForCommand = true;
+              query.end();
+              return;
+            }
           }
           // The await widens the done-race; re-check before claiming.
           if (done) return;
@@ -1795,7 +1829,8 @@ export async function processQuery(
                 'To answer now, write a complete <message to="name">...</message> block or call the ' +
                 '`send_message` tool.</system>'
             : '';
-        const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
+        const pushedId = pushToQuery(runtimeUpdateNote + prompt + midTurnNote, extractAttachments(keep));
+        runtimeUpdateNote = '';
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
         admittedInbound = true;
@@ -2999,6 +3034,24 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
     log(`Failed to request a primary-provider retry: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
+}
+
+export function onlyTypedStickyEffort(messages: MessageInRow[]): boolean {
+  let typed = 0;
+  for (const m of messages) {
+    let parsed: { flagIntent?: FlagIntent; flagAck?: unknown };
+    try {
+      parsed = JSON.parse(m.content) as typeof parsed;
+    } catch {
+      continue;
+    }
+    const fi = parsed.flagIntent;
+    if (!fi) continue;
+    if (typeof parsed.flagAck !== 'string') return false;
+    if (fi.turnEffort !== undefined || fi.turnUltracode !== undefined || fi.turnModel !== undefined) return false;
+    typed++;
+  }
+  return typed > 0;
 }
 
 /**

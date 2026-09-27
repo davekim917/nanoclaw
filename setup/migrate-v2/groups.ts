@@ -82,9 +82,7 @@ function main(): void {
 
     fs.mkdirSync(v2Folder, { recursive: true });
 
-    // Content-blind byte preservation. CLAUDE.local.md remains standing
-    // instruction state for explicit, separate legacy instruction
-    // reconciliation; it is never a memory migration input.
+    // Byte-preserved: CLAUDE.local.md is never a memory migration input.
     const v1Claude = path.join(v1Folder, 'CLAUDE.md');
     const v2Local = path.join(v2Folder, 'CLAUDE.local.md');
     if (fs.existsSync(v1Claude) && !fs.existsSync(v2Local)) {

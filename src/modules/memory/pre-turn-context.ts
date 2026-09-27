@@ -212,8 +212,8 @@ function extractSenderName(normalizedContent: string): string | null {
 }
 
 /**
- * `senderId`, else `author.userId`; null on absence or parse failure. Returns
- * the RAW (un-namespaced) platform id.
+ * `senderId`, else `author.userId`, trimmed; null on absence or parse failure.
+ * Usually a raw platform id, but a supplied namespace is kept.
  */
 function extractSenderId(normalizedContent: string): string | null {
   try {

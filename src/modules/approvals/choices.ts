@@ -9,18 +9,11 @@
  *     any-thread-member shortcut for these, requires owner/admin privilege on
  *     the agent group, and a card may narrow that further to named approvers
  *     (choiceClickAllowed).
- *   - The bridge does not edit an answer card on click (src/answer-cards.ts).
- *     The host edits it here, and only after the first authorized click has won
- *     the pending→approved compare-and-swap AND its answer was delivered. So a
- *     refused click, an unknown option and a losing click all leave the card
- *     exactly as it was, still live, with nothing to repair.
+ *   - The host edits the card only after the first authorized click has won
+ *     the pending→approved compare-and-swap AND its answer was delivered, so a
+ *     refused, unknown or losing click leaves the card live and untouched.
  *   - A click whose answer cannot be delivered is not consumed: the row goes
  *     back to pending and the card stays live.
- *   - retireChoice closes an open card without an answer (superseded).
- *
- * A leaf file like finalize.ts, so primitive.ts and response-handler.ts carry
- * only the seams. Keyed by action like the approval registry, so the rules are
- * back in force as soon as the owning module re-registers after a host restart.
  */
 import { registerAnswerCardAction } from '../../answer-cards.js';
 import type { NormalizedOption } from '../../channels/ask-question.js';
@@ -45,7 +38,6 @@ export interface ChoiceHandlerContext {
   requester: Session | undefined;
   /** Value of the clicked option, verified against the row's stored options. */
   value: string;
-  /** Button label of the clicked option. */
   label: string;
   /** Namespaced user ID (`<channel>:<handle>`) of the authorized clicker. */
   userId: string;
@@ -87,14 +79,7 @@ export function choiceClickAllowed(approval: PendingApproval, userId: string): b
   return approvers.some((approver) => clicker.has(approver));
 }
 
-/**
- * Resolve an authorized click on a choice card. Any stored option is a
- * legitimate answer — there is no approve/reject vocabulary here — and the
- * first click wins: the pending→approved compare-and-swap
- * (transitionPendingApprovalStatus) lets exactly
- * one racing click through, and the row is deleted once the answer is
- * delivered, so a later click finds nothing.
- */
+/** First click wins: the pending→approved compare-and-swap lets exactly one racing click through. */
 export async function resolveChoice(approval: PendingApproval, selectedOption: string, userId: string): Promise<void> {
   const handler = getChoiceHandler(approval.action);
   if (!handler) return;
@@ -116,9 +101,7 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
     log.info('Ignoring click on an already-resolved choice', { approvalId: approval.approval_id, userId });
     return;
   }
-  // The authorization decision is the successful CAS, not an arbitrarily
-  // delayed answer delivery or recorder write. Capture it before every await
-  // below and pass it unchanged into the immutable receipt.
+  // The decision time is the CAS, captured before any await for the immutable receipt.
   const resolvedAt = new Date().toISOString();
 
   let deliveredTo: Session | null;
@@ -187,15 +170,9 @@ async function liveSession(sessionId: string | null): Promise<Session | undefine
 }
 
 /**
- * Write the durable receipt for a resolved choice (migration 077,
- * choice_receipts) — the external release policy's evidence that THIS card
- * resolved to THIS value, for THIS user, once the `pending_approvals` row
- * that carries all three is gone. Best-effort: a write failure here must not
- * unwind a delivery that already happened, so it is caught and logged, never
- * thrown — the click stays consumed and the card stays resolved either way.
- * A consumer that finds no receipt for a request id has to treat it as
- * unverified and fail closed on its own side; that's the tradeoff for never
- * reopening an answered card over a receipt-table hiccup.
+ * Durable evidence that THIS card resolved to THIS value for THIS user.
+ * Best-effort: a failure must not unwind a delivered answer, so a consumer
+ * finding no receipt must treat the request as unverified and fail closed.
  */
 async function writeChoiceReceipt(
   approval: PendingApproval,
@@ -243,10 +220,8 @@ function receiptReleaseScopeJson(approval: PendingApproval): string | null {
 }
 
 /**
- * Edit a choice card's message to `text`. The editCardResolution pattern
- * in onecli-approvals.ts: dispatch through `instance ?? channel_type`,
- * because dispatch is exact-key, and fail loudly — the row is gone by now, so
- * a swallowed failure leaves live-looking buttons that do nothing.
+ * Dispatch through `instance ?? channel_type` (dispatch is exact-key), and log
+ * failures loudly: the row is gone, so a failed edit leaves dead live-looking buttons.
  */
 async function editChoiceCard(approval: PendingApproval, text: string): Promise<void> {
   const adapter = getDeliveryAdapter();
@@ -287,7 +262,6 @@ function storedOptions(approval: PendingApproval): NormalizedOption[] {
   }
 }
 
-/** Card body for a host-side edit of a choice card: the original ask, then what happened. */
 function cardText(approval: PendingApproval, line: string): string {
   return [approval.title, approval.question, line].filter(Boolean).join('\n\n');
 }

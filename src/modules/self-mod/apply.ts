@@ -14,11 +14,7 @@
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import {
-  getContainerConfig,
-  updateContainerConfigJson,
-  updateContainerConfigScalars,
-} from '../../db/container-configs.js';
+import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { getDenialFor } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
@@ -27,9 +23,11 @@ import {
   isOneCliPlaceholder,
   parseMcpServerConfig,
   readContainerConfig,
+  resolveGroupProvider,
   type ParsedMcpServerConfig,
   updateContainerConfig,
   validateMcpServerName,
+  writeContainerConfigScalars,
 } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -240,14 +238,12 @@ export async function performModelChange(
     await notify('change_model failed: container config missing.');
     return;
   }
-  if (!config.provider) {
-    await notify('change_model failed: group has no provider — cannot revalidate model.');
-    return;
-  }
+  // The file, not the projection: it is what the respawned container boots.
+  const provider = await resolveGroupProvider(agentGroup.id);
 
   // Opencode slugs MUST be provider-prefixed: the host derives the routing
   // provider from the prefix, and a bare slug restarts into an unresolvable model.
-  if (config.provider === 'opencode' && !isOpenCodeModelSlug(slug)) {
+  if (provider === 'opencode' && !isOpenCodeModelSlug(slug)) {
     await notify(
       `change_model failed: "${slug}" is not a valid opencode slug — it must be provider-prefixed ` +
         `(e.g. opencode-go/kimi-k2.7-code, nvidia/meta/llama-3.3-70b-instruct). Run list_models for exact ids.`,
@@ -255,19 +251,17 @@ export async function performModelChange(
     return;
   }
 
-  const denied = await getDenialFor(config.provider, slug);
+  const denied = await getDenialFor(provider, slug);
   if (denied) {
     await notify(
-      `change_model failed: "${slug}" is in the ${config.provider} deny list${
+      `change_model failed: "${slug}" is in the ${provider} deny list${
         denied.reason ? ` (${denied.reason})` : ''
       }. Aborted.`,
     );
     return;
   }
 
-  const updates: Parameters<typeof updateContainerConfigScalars>[1] = { model: slug };
-  if (effort) updates.effort = effort;
-  await updateContainerConfigScalars(agentGroup.id, updates);
+  await writeContainerConfigScalars(agentGroup.id, agentGroup.folder, { model: slug, effort: effort || undefined });
 
   log.info('Model change applied', {
     agentGroupId: session.agent_group_id,

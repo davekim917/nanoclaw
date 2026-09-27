@@ -188,8 +188,7 @@ async function wireIfMissing(
     // wires their own DM, so every sender is trusted ('all') and ignored
     // messages carry no value ('drop').
     sender_scope: 'all',
-    // accumulate (not drop) so any non-triggering context is retained for the
-    // agent. Owner directive: accumulate is the default for all agents.
+    // Overrides the 'drop' above: accumulate is the owner's default for all agents.
     ignored_message_policy: 'accumulate',
     session_mode: 'per-thread',
     priority: 0,
@@ -227,11 +226,7 @@ async function main(): Promise<void> {
   const folder = `dm-with-${normalizeName(args.displayName)}`;
   const pickedProvider = process.env.NANOCLAW_PICKED_PROVIDER?.trim().toLowerCase();
   const ag = await findOrCreateAgentGroup(folder, args.agentName, now);
-  // Seed the config row, stamped with the effective provider: the operator's
-  // setup pick (NANOCLAW_PICKED_PROVIDER) when this runs inside a setup run,
-  // otherwise the persisted instance default. Workspace scaffolding is deferred
-  // to the first spawn (group-init). A reused group keeps its provider
-  // (INSERT OR IGNORE).
+  // Stamped with the setup pick, else the instance default; a reused group keeps its provider.
   await ensureContainerConfig(ag.id, pickedProvider);
   stageGroupPersona(
     path.resolve(GROUPS_DIR, folder),

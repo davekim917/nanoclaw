@@ -2629,6 +2629,26 @@ SHA this gate's own `finish` already completed and suspended: `finish`
 suspending its preview by design produces the identical
 backendReady-true/healthzReady-false shape, and is checked first).
 
+**Setting up a new install.** `scripts/smoke-init.py detect <repo>` reads a
+target repository's manifests and prints its stack: frameworks (package.json,
+requirements/pyproject, Gemfile, go.mod), preview hosts (`render.yaml`,
+`netlify.toml`, `wrangler.toml`, `vercel.json`, `fly.toml`, `railway.*`,
+`amplify.yml`, Expo `eas.json`, compose files), auth and database libraries,
+service directories and migration directories. It reads manifests only, never
+source files or symlinks. `smoke-init.py propose <repo>` turns that into
+MANDATORY keys (the gates refuse to run without them) and RECOMMENDED ones
+(journeys, seat preflight, health path), each with why it matters and how to
+find its value, plus the gaps: a host with no preview adapter, a native app, a
+repo not on GitHub. `--group-dir <dir>` also writes `smoke-gate-env.draft.sh`
+there, every key commented out. A value is filled only where the repo settles
+it: the GitHub slug, and the provider when exactly one preview host is found.
+The three prefixes, service ids and health path are yours to choose. A wrong
+prefix passes `config` and silently weakens a gate, so the draft lists the
+directories it saw and never picks one. The draft refuses to overwrite a file,
+to write inside this skill, or to write at all when a proposed value looks like
+a credential. Review the draft, move what you keep into the install's
+`smoke-gate-env.sh`, then run each wrapper with `config` (below).
+
 **Go-time config check: run each wrapper with `config`.**
 `bash /workspace/agent/smoke-pr-gate.sh config` and
 `bash /workspace/agent/smoke-develop-gate.sh config` judge the environment each
