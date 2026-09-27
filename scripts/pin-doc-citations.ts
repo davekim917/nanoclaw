@@ -1,4 +1,5 @@
 #!/usr/bin/env tsx
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -103,6 +104,12 @@ function introducingCommit(root: string, rev: string, doc: string, lineNumber: n
 
 const unpinned = (line: string): string => line.replace(/\s+at\s+[0-9a-f]{7,40}\b/g, '');
 
+function newestOf(root: string, shas: readonly string[]): string | null {
+  const isAncestor = (a: string, b: string): boolean =>
+    spawnSync('git', ['merge-base', '--is-ancestor', a, b], { cwd: root }).status === 0;
+  return shas.find((sha) => shas.every((other) => isAncestor(other, sha))) ?? null;
+}
+
 function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] {
   const touching = (gitRead(root, ['log', '--format=%H', `-n${MAX_EARLIER_VERSIONS}`, origin, '--', ...files]) ?? '')
     .split('\n')
@@ -193,7 +200,6 @@ export function pinDocs(
         const files = runFiles(run);
         if (citedFiles.length > 0 && !files.some((file) => citedFiles.includes(file))) continue;
         const citation = text.slice(head.index, run.end).replace(/`/g, '');
-        const headText = `${head.file}:${head.span}`;
         if (!gitRead(root, ['log', '-1', '--format=%H', rev, '--', head.file])?.trim()) continue;
         const refuse = (reason: string): void => {
           outcomes.push({ kind: 'refused', doc, line: i + 1, citation, reason });
@@ -202,9 +208,16 @@ export function pinDocs(
           refuse(`${doc} differs from ${rev} by more than pins; commit it first`);
           continue;
         }
-        const origin = introducingCommit(root, rev, doc, i + 1, headText);
-        if (!origin) {
+        const linkOrigins = run.links.map((link) =>
+          introducingCommit(root, rev, doc, i + 1, text.slice(link.index, link.end).replace(/`/g, '')),
+        );
+        if (linkOrigins.some((sha) => sha === null)) {
           refuse("the line's history does not show the commit that added this citation");
+          continue;
+        }
+        const origin = newestOf(root, linkOrigins as string[]);
+        if (!origin) {
+          refuse('its citations were added on unrelated branches');
           continue;
         }
         const candidates = candidateRevisions(root, origin, files);

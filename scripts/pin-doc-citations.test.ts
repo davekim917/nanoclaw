@@ -362,6 +362,20 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: introduced })]);
   });
 
+  it('dates a joined run from the newest of its citations', () => {
+    const root = gitRoot();
+    write(root, 'src/a.ts', 'function drainQueue() {}\n');
+    write(root, 'src/b.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, '- `drainQueue` at `src/a.ts:1` drops items\n');
+    commit(root, 'note on a');
+    write(root, 'src/b.ts', 'function drainQueue(limit) {}\n');
+    commit(root, 'change b');
+    write(root, NOTE, '- `drainQueue` at `src/a.ts:1` and `src/b.ts:1` drops items\n');
+    const extended = commit(root, 'extend the note to b');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: extended })]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
