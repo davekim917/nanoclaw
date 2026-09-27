@@ -704,7 +704,7 @@ interface ResolvedCheckout {
   branch: string;
 }
 
-/** Only "nothing exists here yet": callers may fall back to creation on this error and on no other. */
+/** "Nothing exists here yet": in clone mode the only error callers may fall back to creation on. */
 class CheckoutNotFoundError extends Error {}
 
 /** A clone-shaped checkout that exists but must not be served (branch mismatch, detached HEAD, bad metadata, origin drift). */
@@ -935,7 +935,8 @@ interface FreshnessNote {
 
 /**
  * Clone-mode post-step for a network pin, under the per-checkout lock (idempotent): fetch through this
- * container's identity (the host never talks to GitHub), then advance only a pristine checkout.
+ * container's identity (the host never talks to GitHub), then advance only a pristine checkout. One started from
+ * preserved local work (`canonical-local`) is left untouched even when pristine.
  */
 async function runCloneFreshnessStep(context: RepositoryContext, checkoutPath: string): Promise<FreshnessNote> {
   return await withCheckoutLock(checkoutPath, async () => {
