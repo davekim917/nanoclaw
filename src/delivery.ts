@@ -68,10 +68,7 @@ import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js'
 import type { OutboundFile } from './channels/adapter.js';
 import { isChannelVariant, type PendingApproval, type Session } from './types.js';
 
-/**
- * Spawn-task children render thinking as durable messages (a work log) rather than post-edit-delete status. Cached
- * per process and never invalidated: a session's spawn-child status never changes.
- */
+/** Cached per process and never invalidated: a session's spawn-child status never changes. */
 const spawnChildSessionCache = new Map<string, boolean>();
 async function isSpawnChildSession(sessionId: string): Promise<boolean> {
   const cached = spawnChildSessionCache.get(sessionId);

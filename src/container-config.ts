@@ -724,7 +724,7 @@ export async function resolveGroupTimezone(agentGroupId: string, fallback: strin
  * spawn path boots (`resolveProviderName` defaults a missing value to `claude`).
  */
 export async function resolveGroupProvider(agentGroupId: string, sessionProvider?: string | null): Promise<string> {
-  // Takes the group id ALONE: a folder parameter let callers pass `undefined` and silently get the projection.
+  // Takes the group id ALONE: a folder parameter would let callers pass `undefined` and silently get the projection.
   // `sessionProvider` (per-session sticky override) outranks both stores.
   const folder = (await getAgentGroup(agentGroupId))?.folder;
   const fileProvider = folder ? readContainerConfig(folder).provider : undefined;

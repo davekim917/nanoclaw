@@ -852,11 +852,11 @@ async function writeSessionMessageLocked(
   hostOrigin: boolean,
   platformMessageId: string | undefined,
 ): Promise<boolean> {
-  // Decide AFTER the lease wait whether a reclaim deleted this session meanwhile, from state a reclaim cannot fake
-  // (comparing before/after samples of status, directory or inbound.db existence failed in every direction). The
-  // reclaim journal is the identity (appended and fsynced before any removal, never un-appended), but it records
-  // INTENT: a reclaim whose CAS lost keeps the directory. So refuse only when journaled AND inbound.db is gone.
-  // Not reclaimed + no directory (new session, rotation predecessor, operator `rm -rf`) re-provisions below.
+  // Decide AFTER the lease wait whether a reclaim deleted this session meanwhile. The reclaim journal is the identity
+  // (appended and fsynced before any removal, never un-appended) but records INTENT: a reclaim whose CAS lost keeps
+  // the directory. So refuse only when journaled AND inbound.db is gone; not reclaimed + no directory re-provisions.
+  // Deliberately, a CAS-lost reclaim whose directory an operator then deletes is refused, not reset: the rescue
+  // archive was published before the CAS lost, so the content is kept.
   const { sessionWasReclaimed } = await import('./storage-manager.js');
   if (sessionWasReclaimed(sessionId) && !fs.existsSync(sessionMailboxPath({ agentGroupId, sessionId }, 'inbound'))) {
     throw new Error(`session ${sessionId} has been reclaimed; route this message to a fresh session`);
