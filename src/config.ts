@@ -131,7 +131,7 @@ export const CONTAINER_MEMORY_RESERVATION =
 export const CONTAINER_MEMORY_SWAP_LIMIT =
   process.env.CONTAINER_MEMORY_SWAP_LIMIT || envConfig.CONTAINER_MEMORY_SWAP_LIMIT || CONTAINER_MEMORY_LIMIT;
 export const CONTAINER_MEMORY_BUDGET = process.env.CONTAINER_MEMORY_BUDGET || envConfig.CONTAINER_MEMORY_BUDGET || '';
-// Codex gives every native subagent its own MCP process tree; 512 was exhausted by one coordinator + five workers.
+// Codex gives every native subagent its own MCP process tree, so a coordinator with five workers needs over 512.
 export const DEFAULT_CONTAINER_PIDS_LIMIT = 1024;
 export const CONTAINER_PIDS_LIMIT = Math.max(
   1,
