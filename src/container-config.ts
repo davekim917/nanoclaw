@@ -121,8 +121,8 @@ function isCredentialQueryKey(key: string): boolean {
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /**
- * These pass the charset but break plain-object assignment: `__proto__`/`constructor`/`prototype` hit inherited
- * properties (the server silently vanishes), and a `nanoclaw` entry would replace the runner's built-in server.
+ * These pass the charset but are unsafe keys: assigning `__proto__` hits the prototype setter (the server silently
+ * vanishes), `constructor`/`prototype` shadow Object built-ins, and `nanoclaw` would replace the runner's server.
  */
 const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'nanoclaw']);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;

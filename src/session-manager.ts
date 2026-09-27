@@ -333,7 +333,6 @@ export async function resolveTaskSession(
     findSystemSession(agentGroupId, threadId),
   );
   if (!created) {
-    // Re-stamp the adopted winner, as above.
     if (routingPlatformId != null && resolved.task_routing_platform_id !== routingPlatformId) {
       await setTaskRoutingPlatformId(resolved.id, routingPlatformId);
       resolved.task_routing_platform_id = routingPlatformId;

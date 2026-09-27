@@ -431,7 +431,7 @@ function isDiscordChannelType(channelType: string): boolean {
 /**
  * Per-turn anchor for several channel-ROOT messages (null `thread_id`, set `in_reply_to`): the first posts fresh
  * and later ones reply under it. In memory and turn-scoped on purpose; task sessions use the persistent
- * `task_thread_anchors` instead.
+ * `task_thread_anchors` instead, except a `threadAnchor:false` task, whose posts fall back to this anchor.
  */
 interface ChatThreadAnchor {
   inReplyTo: string;
@@ -1551,7 +1551,7 @@ async function deliverMessage(
     baseThreadId === null &&
     !(await isThreadAnchorExempt(session));
 
-  // Per-turn channel-root threading (see ChatThreadAnchor) for everything but task-session posts. A task list is
+  // Per-turn channel-root threading (see ChatThreadAnchor) for every post the task anchor does not take. A task list is
   // progress: it never becomes the root the answer threads under, nor threads under an earlier message.
   const turnAnchorEligible =
     !isRoutineOutcome &&
