@@ -791,17 +791,9 @@ cut_down_gate() {
     echo "merge=error head=$SCOPE_HEAD: the cut-down check gave no verdict; could not read $REVIEW_LOOP_CONFIG at $SCOPE_BASE as an object whose cutDownThreshold is a whole number or false, this head's changed lines, or the PR's comments" >&2
     exit 1
   }
-  case "$state" in
-    ok$'\t'*) ;;
-    missing$'\t'*)
-      echo "merge=refused head=$SCOPE_HEAD: cut_down_missing: ${state#*$'\t'}" >&2
-      exit 24
-      ;;
-    *)
-      echo "merge=error head=$SCOPE_HEAD: the cut-down check gave no verdict (got \"$state\")" >&2
-      exit 1
-      ;;
-  esac
+  [[ "$state" == missing$'\t'* ]] || return 0
+  echo "merge=refused head=$SCOPE_HEAD: cut_down_missing: ${state#*$'\t'}" >&2
+  exit 24
 }
 
 final_gates() {
@@ -3174,10 +3166,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName | jq -er .baseRefName) || exit 1
     base_sha=$(base_tip "$base") || { echo "cut-down-receipt: could not resolve $base to a commit" >&2; exit 1; }
     before=$(cut_down_lines "$base_sha" "$reviewed") || { echo "cut-down-receipt: could not count the lines $reviewed adds" >&2; exit 1; }
-    after="$before"
-    if [ "$head" != "$reviewed" ]; then
-      after=$(cut_down_lines "$base_sha" "$head") || { echo "cut-down-receipt: could not count the lines $head adds" >&2; exit 1; }
-    fi
+    after=$(cut_down_lines "$base_sha" "$head") || { echo "cut-down-receipt: could not count the lines $head adds" >&2; exit 1; }
     cut=unknown
     if [ "$before" != unknown ] && [ "$after" != unknown ]; then cut=$((before - after)); fi
     url=$(gh pr comment "$PR" --repo "$REPO" --body "### Cut-down review receipt

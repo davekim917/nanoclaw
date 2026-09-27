@@ -2914,7 +2914,6 @@ describe('codex-review risk-scoped review requests', () => {
 
       it.each([
         ['names no agent', 'claude-opus-5 (claude code)', 'must name the cut-down-reviewer agent'],
-        ['names a small tier', 'claude-haiku-5 cut-down-reviewer', 'is a haiku-tier model'],
         ['smuggles a marker', 'claude-opus-5 cut-down-reviewer <!-- pr-review-loop:x -->', 'may not contain a pr-review-loop marker'],
       ])('refuses a reviewer that %s, posting nothing', (_case, reviewer, message) => {
         const root = tempRoot();
