@@ -1,37 +1,19 @@
 /**
- * Read-only, evidence-first operator-attention extract.
+ * Read-only, evidence-first operator-attention extract: durable events only, never inferred
+ * attention or reading time.
  *
- * This deliberately measures durable events, not inferred attention or reading time:
+ * - Delivery evidence is a non-null platform message id at `delivered_at`; the delivery loop
+ *   also acknowledges adapter no-ops with a null id, so a null marker is NOT delivery.
+ * - An assistant archive row is archive observation only, never delivery evidence, and an
+ *   explicit archive DB is never claimed to cover every session under the sessions root.
+ * - `quietStatus`/`chatLimit` drop rows before they are written; missing rows are never
+ *   invented as suppressed deliveries.
  *
- * - `messages_out`/`delivered` are separate tables; delivery evidence is a non-null
- *   platform message id at the host-stamped `delivered_at` event time
- *   (`src/mailbox/sqlite/schema.ts`, `src/mailbox/sqlite/session-db.ts`).
- *   The delivery loop also acknowledges valid adapter no-ops with a null id, so a
- *   null marker is explicitly *not* counted as platform delivery here
- *   (`src/delivery.ts`, `src/channels/cli.ts`).
- * - An assistant archive row is reported only as archive observation, at its own
- *   `sent_at` event time. It is not platform-delivery evidence: the archive write
- *   follows any normally returned adapter result, including the CLI no-terminal
- *   no-op above (`src/delivery.ts`). The canonical host archive is
- *   `path.join(DATA_DIR, 'archive.db')` (`src/message-archive.ts`), but this
- *   script accepts an explicit archive DB and never claims it covers every
- *   session beneath an independently supplied sessions root. Archive contents
- *   are never selected or emitted.
- * - `quietStatus` stops status rows before they are written
- *   (`container/agent-runner/src/poll-loop.ts`) and `chatLimit` can
- *   drop chat rows before their insert (`container/agent-runner/src/modules/mailbox/index.ts`).
- *   Configuration is reported separately; missing rows are never invented as
- *   suppressed delivery events.
+ * Connections are `readonly` + `PRAGMA query_only=ON`. WAL locking may still create `-shm`
+ * metadata, which the report counts; never `immutable=1`, which would ignore committed WAL data.
  *
- * SQLite connections are opened `readonly` and set `PRAGMA query_only=ON`, so this
- * script issues no logical data/schema writes. Ordinary SQLite WAL locking may
- * still create or change `-shm` filesystem metadata; the report says so and counts
- * WAL-without-SHM inputs and SHM files observed newly present after the read. It
- * never uses `immutable=1`, because that would silently ignore committed WAL data.
- *
- * It emits no message text, title, card option, selected choice, sender identity,
- * user id, payload, or PR body. Candidate samples carry only synthetic-safe
- * provenance (source, session-relative path, event id, timestamp, classifier).
+ * Emits no message text, title, card option, selected choice, sender identity, user id,
+ * payload, or PR body — only synthetic-safe provenance.
  */
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
@@ -46,17 +28,8 @@ const DEFAULT_FOLLOWUP_DAYS = 14;
 const REVIEW_OUTCOME_BASE_BRANCH = 'main' as const;
 
 /**
- * Known agent-group metadata directories, not session directories.
- *
- * Keep this explicit: session ids are normally minted as `sess-*`
- * (`src/session-manager.ts`), but an unfamiliar directory must still
- * fail closed as a possible session rather than disappear from coverage.
- * `.claude-shared` is created per group (`src/group-init.ts`) and
- * `.context` is the sibling store written by `sessionContextPathFor`
- * (`src/session-manager.ts`). `.claude-memory` is retained for stale
- * installs: `groupClaudeMemoryDir` created it at
- * `ac8582847:src/session-manager.ts` before `3198aef43` moved that state
- * beneath `.claude-shared`.
+ * Agent-group metadata directories, not sessions. Explicit on purpose: an unfamiliar
+ * directory must fail closed as a possible session rather than disappear from coverage.
  */
 const AGENT_GROUP_METADATA_DIR_NAMES = new Set(['.claude-shared', '.claude-memory', '.context']);
 
@@ -235,10 +208,7 @@ function emptyCounters(): AttentionCounters {
 
 const STRICT_ISO_UTC_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/;
 
-/**
- * `new Date()` also accepts local/naive forms. Frozen measurement windows must
- * name an exact UTC instant, matching the repository's storage convention.
- */
+/** `new Date()` also accepts local/naive forms; frozen windows must name an exact UTC instant. */
 export function isStrictIsoUtc(value: string): boolean {
   const match = STRICT_ISO_UTC_RE.exec(value);
   if (!match) return false;
@@ -371,7 +341,6 @@ function listSessionDirectories(root: string): Array<{ session: string; dir: str
   return result;
 }
 
-/** Uses the canonical host-owned-first, legacy-fallback resolver at src/modules/mailbox/host-inbound.ts. */
 function inboundPathForSession(sessionDir: string): string | null {
   const resolved = resolveInboundDbPath(sessionDir);
   return fs.existsSync(resolved) ? resolved : null;
@@ -558,9 +527,7 @@ function scanSession(input: {
             input.sampleLimit,
           );
         } else {
-          // A system row outside the one recognized question-response shape is
-          // still durable inbound evidence. Do not silently omit a new system
-          // subtype from an extract that claims source completeness.
+          // An unrecognized system subtype is still durable inbound evidence: never omit it.
           input.counters.unknownInboundMessages += 1;
         }
         continue;
@@ -573,9 +540,7 @@ function scanSession(input: {
       }
       if (parsed.knownBot) continue;
       if (!parsed.text) {
-        // A human file/attachment-only reply is not a prose candidate, but it
-        // must remain visible as unclassified evidence rather than becoming a
-        // zero-traffic window.
+        // An attachment-only human reply is not a prose candidate but must stay visible as unclassified evidence.
         input.counters.unknownInboundMessages += 1;
         continue;
       }
@@ -615,17 +580,13 @@ function scanSession(input: {
           ORDER BY timestamp, id`,
       )
       .all() as OutboundRow[];
-    // Delivery acknowledgements belong to the *inbound* database by design;
-    // `messages_out` is container-owned and never has this table
-    // (`src/mailbox/sqlite/schema.ts`). Do not ATTACH: each source DB
-    // remains independently read-only, including when its WAL is live.
+    // Acknowledgements live in the *inbound* DB (`messages_out` never has this table). No
+    // ATTACH: each source DB stays independently read-only.
     const deliveredRows = inbound
       .prepare('SELECT message_out_id, status, platform_message_id, delivered_at FROM delivered')
       .all() as DeliveredRow[];
-    // Count this metric from its authoritative table rather than from the
-    // outbound join. Acknowledgements can outlive a pruned outbound row, and
-    // a concurrent read can observe an acknowledgement before its row; either
-    // is still durable null-id delivery evidence in this time window.
+    // Counted from the authoritative table, not the outbound join: an acknowledgement can
+    // outlive a pruned outbound row, or be read before its row exists.
     for (const delivery of deliveredRows) {
       if (
         delivery.platform_message_id === null &&
@@ -648,9 +609,8 @@ function scanSession(input: {
       if (!delivery || !isIsoInWindow(delivery.delivered_at, input.since, input.until)) {
         continue;
       }
-      // Null-id rows were counted directly from `delivered` above. Do not let
-      // them enter successful-delivery classification merely because a matching
-      // container-owned outbound row happens to be present.
+      // Null-id rows were counted from `delivered` above; a matching outbound row must not
+      // promote them to successful delivery.
       if (delivery.platform_message_id === null) {
         continue;
       }
@@ -694,14 +654,8 @@ export function extractReviewOutcomeEvidence(
     throw new Error('review since must be before review until');
   if (!Number.isFinite(followupDays) || followupDays <= 0) throw new Error('followupDays must be positive');
 
-  // The half-open window is applied before both target and follow-up selection.
-  // In particular, a PR fetched past `until` cannot mature or supply evidence
-  // for an earlier target in this frozen report.
-  // Match `computeWeeklyReport`'s population exactly: it begins by retaining
-  // only PRs whose base is `main` (`scripts/review-outcomes.ts`).
-  // Apply that scope before selecting targets OR relationship candidates so a
-  // PR on another base cannot borrow a main PR's week maturity or link into a
-  // main target's evidence.
+  // The half-open window and `computeWeeklyReport`'s main-only population apply before BOTH
+  // target and follow-up selection, so a later or off-main PR can't supply evidence.
   const eligiblePrs = prs.filter(
     (pr) =>
       pr.baseRefName === REVIEW_OUTCOME_BASE_BRANCH &&
@@ -709,8 +663,6 @@ export function extractReviewOutcomeEvidence(
       isIsoInWindow(pr.mergedAt, since, until),
   );
 
-  // `computeWeeklyReport` owns the established 14-day end-of-week maturity
-  // definition (`scripts/review-outcomes.ts`); this only reuses it.
   const maturityByWeek = new Map(
     computeWeeklyReport([...eligiblePrs], [], followupDays, until).rows.map((row) => [row.isoWeek, row.immature]),
   );

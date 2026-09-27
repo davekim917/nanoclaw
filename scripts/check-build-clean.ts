@@ -1,38 +1,15 @@
 #!/usr/bin/env tsx
 /**
- * Prebuild guard: dist/ is compiled from the WORKING TREE, not from HEAD. In
- * a checkout shared by several concurrent agents, `pnpm run build` would
- * otherwise silently capture whoever's half-finished work happens to be on
- * disk. This refuses to build on a dirty tree; BUILD_ALLOW_DIRTY=1 overrides
- * (loudly) for a deliberate local build.
+ * Prebuild guard: dist/ is compiled from the WORKING TREE, not from HEAD, so in a checkout
+ * shared by concurrent agents a build would capture whoever's half-finished work is on disk.
+ * Refuses a dirty tree (docs-only dirt excepted); BUILD_ALLOW_DIRTY=1 overrides loudly.
  *
- * Docs-only dirt is exempted: `dist/` never contains docs/** or root-level
- * markdown, so a peer session's staged docs/specs/**\/*.md can't leak into a
- * build the way a src/ or scripts/ change could. The whitelist below is
- * intentionally narrow — anything under src/, container/, scripts/,
- * dashboard/, setup/, .github/, or a build-relevant manifest still blocks.
+ * HEAD must also match origin/main (BUILD_ALLOW_LOCAL=1 overrides). The HEAD sha and a content
+ * fingerprint of any allowed dirt go to dist/ so scripts/write-build-info.ts can detect HEAD or
+ * that dirt changing *during* the build.
  *
- * Second guard, same failure family: a build must also start from a HEAD
- * that matches origin/main — a peer committing then resetting local main
- * mid-build must not have its stale dist/ mistaken for current. BUILD_ALLOW_LOCAL=1
- * overrides (loudly) for a deliberate local/unpushed build. The HEAD sha this
- * check settles on is written to dist/.build-start-sha so the postbuild step
- * (scripts/write-build-info.ts) can detect HEAD moving *during* the build.
- *
- * A content fingerprint of whatever blocking dirt BUILD_ALLOW_DIRTY=1 let
- * through is written alongside it (dist/.build-allowed-dirt-fingerprint), so
- * BUILD_ALLOW_DIRTY waives the check for exactly the dirt that was present
- * at prebuild time — not for a peer's mid-build edit to an already-dirty (or
- * newly dirty) file, which would otherwise slip through unnoticed just
- * because *some* dirt was already permitted.
- *
- * Third guard, unrelated failure family: `pnpm run lint` must be green
- * before tsc runs (seam 3 — no-floating-promises / no-misused-promises /
- * projectService only gate anything if the pre-existing backlog can't just
- * sit there red forever). Runs throttled (ionice + nice), same as the manual
- * invocations this mirrors, so a build kicked off on a shared host doesn't
- * starve co-resident agent containers; falls back to an unthrottled run if
- * ionice isn't installed rather than blocking on a missing OS utility.
+ * Typecheck and lint must be green first; they run throttled (ionice + nice) so a build does
+ * not starve co-resident agent containers.
  */
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -40,16 +17,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** Path prefixes that never affect dist/ output, wherever they appear in the tree. */
 const IGNORABLE_DIRT_PREFIXES = ['docs/'];
 
-/**
- * A dirty path that cannot affect dist/ and is safe to build through
- * without the BUILD_ALLOW_DIRTY escape hatch. Root-level markdown
- * (README*, CHANGELOG.md, any other *.md directly at repo root) is
- * documentation by convention in this repo; everything nested elsewhere
- * (including dashboard/README.md, say) still blocks.
- */
+/** Root-level markdown is documentation by convention; nested markdown still blocks. */
 export function isIgnorableDirtPath(filePath: string): boolean {
   if (IGNORABLE_DIRT_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return true;
   if (!filePath.includes('/')) {
@@ -60,8 +30,7 @@ export function isIgnorableDirtPath(filePath: string): boolean {
 }
 
 function stripQuotes(p: string): string {
-  // git quotes paths containing unusual characters; docs-only dirt never
-  // needs that, so a plain strip (no C-style unescape) is sufficient here.
+  // git quotes unusual paths; docs-only dirt never needs that, so a plain strip is enough.
   if (p.length >= 2 && p.startsWith('"') && p.endsWith('"')) return p.slice(1, -1);
   return p;
 }
@@ -75,35 +44,10 @@ function pathsForLine(line: string): string[] {
 }
 
 /**
- * Stray build-artifact directories left beside `dist/` by a hand-run deploy.
- *
- * `scripts/deploy.sh` snapshots the live build for rollback as `dist.pre-deploy/`
- * and `node_modules.pre-deploy/` (plus the `.failed/` pair), and all four are
- * gitignored — so a sanctioned snapshot never reaches `git status` at all.
- * Anything of that shape that DOES reach it was created by hand, and because
- * those names are timestamped they can never be matched by a gitignore rule
- * either.
- *
- * Worth naming separately because the generic "commit or stash" remedy is wrong
- * for it and `BUILD_ALLOW_DIRTY=1` is actively dangerous: on 2026-09-07 a
- * hand-rolled `dist.pre-<label>-<timestamp>/` blocked every build on the host
- * for four hours across three sessions, while two restarts ran and silently left
- * the service on stale compiled code. The refusal was correct; nobody could tell
- * from it what to do.
- *
- * Classification is grounded in the filesystem rather than the path string,
- * because the string alone cannot decide it in either direction:
- *
- * - Under `status.showUntrackedFiles=all` git expands an untracked directory
- *   into per-file entries (`?? dist.pre-label/index.js`), so there is no
- *   trailing-slash directory entry to match. Taking the first path segment
- *   collapses those back to the one directory worth naming.
- * - A regular root file such as `dist.config.ts` has the same shape as a
- *   snapshot in porcelain output. Telling an operator to delete their source
- *   file would be worse advice than the generic message this replaces, so a
- *   real `isDirectory` check is the thing that separates them.
- *
- * Returns the deduped, sorted directory names — not the paths that led to them.
+ * Stray `dist.*`/`node_modules.*` snapshot directories a hand-run deploy left beside `dist/`
+ * (deploy.sh's own snapshots are gitignored). Named separately because "commit or stash" is
+ * the wrong remedy and BUILD_ALLOW_DIRTY is dangerous for them. Decided by a real `isDirectory`
+ * check, not the path string: a root file like `dist.config.ts` has the same porcelain shape.
  */
 export function strayBuildArtifactDirs(paths: string[], isDirectory: (relPath: string) => boolean): string[] {
   const dirs = new Set<string>();
@@ -118,13 +62,10 @@ export function strayBuildArtifactDirs(paths: string[], isDirectory: (relPath: s
 }
 
 export interface DirtPartition {
-  /** Porcelain lines that block the build. */
   blocking: string[];
-  /** Porcelain lines that are docs-only and safe to build through. */
   ignored: string[];
 }
 
-/** Splits `git status --porcelain` lines into build-blocking and safely-ignorable dirt. */
 export function partitionDirt(lines: string[]): DirtPartition {
   const blocking: string[] = [];
   const ignored: string[] = [];
@@ -139,7 +80,6 @@ export function partitionDirt(lines: string[]): DirtPartition {
   return { blocking, ignored };
 }
 
-/** The distinct paths referenced by a set of `git status --porcelain` lines, sorted for determinism. */
 export function pathsForLines(lines: string[]): string[] {
   const paths = new Set<string>();
   for (const line of lines) {
@@ -149,11 +89,8 @@ export function pathsForLines(lines: string[]): string[] {
 }
 
 /**
- * Content fingerprint of a set of blocking dirty paths, read relative to the
- * current working directory. Order-independent and stable across separate
- * processes (prebuild writes it, postbuild recomputes it) so a BUILD_ALLOW_DIRTY
- * build can detect its allowed dirt changing content mid-build, not just a
- * change in *which* paths are dirty.
+ * Order-independent and stable across processes (prebuild writes it, postbuild recomputes it),
+ * so a BUILD_ALLOW_DIRTY build detects its allowed dirt changing content mid-build.
  */
 export function fingerprintDirt(blockingLines: string[]): string {
   const hash = crypto.createHash('sha256');
@@ -176,7 +113,6 @@ export interface FreshnessCheck {
   message: string | null;
 }
 
-/** Decides whether HEAD is fresh enough to build from: it must match origin/main unless BUILD_ALLOW_LOCAL=1 overrides. */
 export function checkFreshness(head: string, originMain: string, allowLocal: boolean): FreshnessCheck {
   if (head === originMain) return { ok: true, message: null };
   if (allowLocal) {
@@ -213,11 +149,8 @@ interface EslintFileResult {
 }
 
 /**
- * Runs a command and returns its stdout whether it exited 0 or not — eslint
- * exits 1 the moment it finds a single lint error, which is the normal,
- * expected outcome here (not a tooling failure), and its JSON report is on
- * stdout either way. A genuine spawn failure (bad path, ENOENT) has no
- * `.stdout` on the thrown error, so that case still throws.
+ * eslint exits 1 on any lint error, which is expected here; its JSON report is on stdout either
+ * way. A spawn failure has no `.stdout`, so it still throws.
  */
 function execCaptureStdout(cmd: string, args: string[], options: { cwd: string }): string {
   try {
@@ -230,19 +163,13 @@ function execCaptureStdout(cmd: string, args: string[], options: { cwd: string }
 }
 
 /**
- * Absolute path to this script's own directory's parent — the repo root
- * where `node_modules/`, `src/`, and `scripts/` actually live. Resolving via
- * `import.meta.url` (not `process.cwd()`) matters here specifically:
- * check-build-clean.test.ts spawns this script with `cwd` pointed at a
- * throwaway fixture git repo that has none of those — a relative
- * `node_modules/.bin/eslint` (or relative `src/`/`scripts/` lint targets)
- * would silently resolve against the fixture instead of the real checkout.
+ * From `import.meta.url`, not `process.cwd()`: the test runs this with `cwd` in a fixture repo
+ * that has no `node_modules/`, `src/` or `scripts/`.
  */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export interface GuardStepResult {
   ok: boolean;
-  /** Printed when the guard refuses the step. */
   message?: string;
 }
 
@@ -256,7 +183,6 @@ export interface CheckBuildCleanSteps {
 }
 
 export interface CheckBuildCleanOptions {
-  /** Override individual I/O-heavy steps for decision-logic tests. */
   steps?: Partial<CheckBuildCleanSteps>;
   env?: Partial<Pick<NodeJS.ProcessEnv, 'BUILD_ALLOW_DIRTY' | 'BUILD_ALLOW_LOCAL'>>;
   log?: Pick<Console, 'error' | 'warn'>;
@@ -266,7 +192,6 @@ function failure(message: string): GuardStepResult {
   return { ok: false, message };
 }
 
-/** Prebuild lint gate: refuses to build if `pnpm run lint`'s eslint invocation finds errors. */
 function runLintGate(): GuardStepResult {
   const eslintBin = path.join(REPO_ROOT, 'node_modules', '.bin', 'eslint');
   const eslintArgs = ['src/', 'scripts/', 'setup/', '--quiet', '-f', 'json'];
@@ -277,8 +202,7 @@ function runLintGate(): GuardStepResult {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       return failure(`BUILD REFUSED: lint gate could not run.\n${err instanceof Error ? err.message : String(err)}`);
     }
-    // ionice isn't installed on this host — throttling is a courtesy to
-    // co-resident builders, not a build-correctness requirement.
+    // ionice missing: throttling is a courtesy, not a correctness requirement.
     try {
       stdout = execCaptureStdout(eslintBin, eslintArgs, { cwd: REPO_ROOT });
     } catch (fallbackError) {
@@ -315,7 +239,6 @@ function runLintGate(): GuardStepResult {
   return failure(lines.join('\n'));
 }
 
-/** Typecheck host, scripts, and setup before accepting a build. */
 function runTypecheckGate(): GuardStepResult {
   try {
     try {
@@ -334,12 +257,8 @@ function runTypecheckGate(): GuardStepResult {
 }
 
 function readStatus(): string[] {
-  // NOTE: don't .trim() the raw output before splitting — porcelain status
-  // codes can start with a leading space (e.g. " M path" for an unstaged
-  // modification), and trimming the whole multi-line string strips that
-  // leading space off the FIRST line only, shifting `pathsForLine`'s 3-char
-  // prefix slice by one and corrupting the path. Split first, then drop the
-  // empty trailing element from the output's final newline.
+  // Don't .trim() before splitting: a porcelain line can start with a space (" M path"), and
+  // trimming would shift `pathsForLine`'s 3-char prefix slice on the first line.
   const raw = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
   return raw.trim() ? raw.split('\n').filter((line) => line.length > 0) : [];
 }
@@ -367,11 +286,6 @@ const realSteps: CheckBuildCleanSteps = {
   recordBuildStart,
 };
 
-/**
- * Runs the prebuild decision flow and returns an exit code. The direct CLI
- * entry point below is intentionally the only place that calls process.exit;
- * tests inject the expensive steps and assert this return value in process.
- */
 export function runCheckBuildClean(options: CheckBuildCleanOptions = {}): number {
   const steps = { ...realSteps, ...options.steps };
   const env = options.env ?? process.env;
@@ -465,8 +379,6 @@ export function runCheckBuildClean(options: CheckBuildCleanOptions = {}): number
   return 0;
 }
 
-// tsx runs this file directly; vitest imports it for the pure helpers above,
-// so guard the side-effecting entry point behind a direct-execution check.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   process.exit(runCheckBuildClean());
 }
