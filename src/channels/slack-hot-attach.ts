@@ -1,9 +1,6 @@
 /**
- * Live attachment for a hand-created Slack app.
- *
- * Slack app tokens remain in the host's existing `.env` credential store. The
- * attach path writes that durable pair, registers the same workspace factory
- * used at boot, and starts it without a host restart.
+ * Attaches a hand-created Slack app to the running host: writes the token pair to `.env`, registers the same
+ * workspace factory used at boot, and starts it.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -82,8 +79,7 @@ function serializeAttach<T>(work: () => Promise<T>): Promise<T> {
 }
 
 function attachError(message: string): Error {
-  // Do not retain a raw `cause`: callers and log serializers can walk causes,
-  // and third-party errors are not a safe place to preserve supplied tokens.
+  // No raw `cause`: log serializers walk causes, and third-party errors may carry supplied tokens.
   return new Error(scrubSecrets(message));
 }
 
@@ -102,10 +98,8 @@ function normalizeInstance(instance: string): string {
 }
 
 /**
- * Fork policy: several sibling bots may share ONE Slack team (each agent
- * group has its own app / bot user in the same workspace). A duplicate is the
- * same bot user attached under another instance — same team alone is the
- * sibling case and is allowed. Keep the policy isolated here.
+ * Fork policy: sibling bots may share one Slack team. A duplicate is the same bot user under another instance; the
+ * same team alone is allowed.
  */
 export function duplicateSlackBotChannelType(
   channelType: string,
@@ -233,9 +227,7 @@ async function openAndWireOwnerDm(
   };
 
   return centralTransaction(async () => {
-    // Two concurrent attaches of the same channel race here: a bare
-    // check-then-insert loses the unique key instead of adopting the winner
-    // (src/db/insert-or-adopt.ts is the seam-3 primitive for exactly this).
+    // Concurrent attaches of one channel race here; insert-or-adopt instead of check-then-insert.
     const existing = await getMessagingGroupByPlatform(channelType, platformId, channelType);
     const { row: group } = existing
       ? { row: existing }
@@ -271,8 +263,8 @@ async function addSlackWorkspaceInner(input: AddSlackWorkspaceInput): Promise<Sl
   rejectSymlinkedEnvFile(REPO_ROOT);
   const configuredWorkspace = loadSlackWorkspaces().find((workspace) => workspace.channelType === channelType);
   const wasActive = getChannelAdapterExact(channelType) !== undefined;
-  // auth.test validates the bot token only. A failed Socket Mode start must
-  // permit correcting its app token on an inactive instance.
+  // auth.test validates only the bot token; a failed Socket Mode start must allow correcting the app token on an
+  // inactive instance.
   if (
     configuredWorkspace &&
     (configuredWorkspace.botToken !== input.botToken || (wasActive && configuredWorkspace.appToken !== input.appToken))
@@ -286,9 +278,8 @@ async function addSlackWorkspaceInner(input: AddSlackWorkspaceInput): Promise<Sl
   if (activeIdentity && (activeIdentity.teamId !== identity.teamId || activeIdentity.userId !== identity.userId)) {
     throw attachError(`active Slack workspace ${channelType} has a different bot identity; refusing to replace it`);
   }
-  // A configured app may be offline, so the live identity cache alone cannot
-  // identify every duplicate bot. Try those saved tokens independently so a
-  // revoked sibling cannot block attachment of an unrelated app.
+  // A configured app may be offline, so the live cache cannot see every duplicate. Each saved token is tried
+  // independently so a revoked sibling cannot block an unrelated attach.
   const knownBots = new Map<string, Pick<SlackBotIdentity, 'teamId' | 'userId'>>(getKnownSlackBots());
   for (const workspace of loadSlackWorkspaces()) {
     if (workspace.channelType === channelType || knownBots.has(workspace.channelType)) continue;
@@ -320,9 +311,8 @@ async function addSlackWorkspaceInner(input: AddSlackWorkspaceInput): Promise<Sl
     throw attachError(`Slack workspace ${channelType} does not match the validated credentials after writing`);
   }
   if (!wasActive) {
-    // Re-registering an inactive key is safe; doing so while active is
-    // deliberately avoided. The factory receives only this freshly re-read
-    // persisted object, never the CLI argument object.
+    // Re-registering an inactive key is safe; never while active. The factory gets only the freshly re-read persisted
+    // object, never the CLI argument object.
     registerSlackWorkspace(persistedWorkspace);
     const startResult = await startChannelAdapter(channelType);
     if (startResult === 'no-credentials') {
@@ -341,11 +331,10 @@ async function addSlackWorkspaceInner(input: AddSlackWorkspaceInput): Promise<Sl
   return result;
 }
 
-/** Attach one Socket Mode Slack app to the running host without a restart. */
 export async function addSlackWorkspace(input: AddSlackWorkspaceInput): Promise<SlackWorkspaceAttachResult> {
   return serializeAttach(async () => {
-    // Register supplied strings before every fallible operation so the CLI's
-    // untrusted error surface can scrub them even when validation fails.
+    // Register supplied strings before anything fallible so the CLI's error surface can scrub them even when
+    // validation fails.
     if (typeof input.botToken === 'string' || typeof input.appToken === 'string') {
       registerSecrets({
         ...(typeof input.botToken === 'string' ? { botToken: input.botToken } : {}),
@@ -360,7 +349,7 @@ export async function addSlackWorkspace(input: AddSlackWorkspaceInput): Promise<
   });
 }
 
-/** List configured Slack apps without returning token values. */
+/** Never returns token values. */
 export function listSlackWorkspaces(): SlackWorkspaceAttachment[] {
   const configured = new Set(loadSlackWorkspaces().map((workspace) => workspace.channelType));
   for (const adapter of getActiveAdapters()) {

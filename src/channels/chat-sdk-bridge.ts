@@ -71,9 +71,8 @@ export function registerSlashCommandHandler(command: string, handler: SlashComma
   slashCommandHandlers.set(command, handler);
 }
 
-/** Which dispatch an inboundFilter call is serving. */
 interface InboundFilterContext {
-  /** True on the missed-message recovery scan, false on live dispatch. */
+  /** True on the recovery scan, false on live dispatch. */
   recovered: boolean;
 }
 
@@ -92,7 +91,6 @@ type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
  */
 export type RawTextExtractor = (raw: Record<string, unknown>) => string | null;
 
-/** Race a promise against a timeout; rejects if the timeout wins. */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     p,
@@ -118,7 +116,6 @@ interface MdNode {
   children?: MdNode[];
 }
 
-/** Render a single mdast `list` node, preserving markers, nesting, and newlines. */
 function renderListNode(list: MdNode, depth: number): string {
   const ordered = list.ordered === true;
   const start = typeof list.start === 'number' ? list.start : 1;
@@ -139,11 +136,10 @@ function renderListNode(list: MdNode, depth: number): string {
         lines.push(`${indent}${marker} ${txt}`);
         firstContent = false;
       } else {
-        // continuation line within the same item, aligned under the text
         lines.push(`${indent}  ${txt}`);
       }
     }
-    // Preserve an empty item so ordered numbering stays aligned.
+    // An empty item is kept so ordered numbering stays aligned.
     if (firstContent) lines.push(`${indent}${marker}`);
   });
   return lines.join('\n');
@@ -184,17 +180,9 @@ export function reconstructInboundText(formatted: unknown): string | null {
 }
 
 /**
- * Resolve a quoted/shared MESSAGE link into reply context.
- *
- * Slack delivers a shared message — or a pasted message permalink — as a
- * `message.links[]` LinkPreview carrying a `fetchMessage()` resolver. But
- * `Message.toJSON()` strips that callback, and Slack (unlike Discord) wires no
- * `extractReplyContext` hook, so the quoted text would otherwise never reach
- * the agent (the gap behind "quoted messages don't come through to me as
- * content"). Resolve the first link exposing a `fetchMessage`, time-bounded
- * and fully defensive: any error/timeout returns null (the agent can still
- * pull the thread on demand via `resolve_thread_link`). Multiple quoted links
- * collapse to the first — the formatter renders a single <quoted_message>.
+ * Resolves a quoted or shared MESSAGE link into reply context. Slack delivers it as a LinkPreview whose
+ * `fetchMessage()` is stripped by `Message.toJSON()`, and Slack has no `extractReplyContext` hook, so otherwise the
+ * quoted text never reaches the agent. Time-bounded; any error returns null. Only the first resolvable link is used.
  */
 export async function resolveQuotedReply(
   message: ChatMessage,
@@ -275,68 +263,36 @@ export interface ChatSdkBridgeConfig {
    */
   transformOutboundText?: (text: string) => string;
   /**
-   * Optional Markdown→Markdown transform. Unlike `transformOutboundText`,
-   * the result is still standard Markdown, so the bridge keeps `markdown`
-   * delivery — the chat-adapter does its own native conversion AND any
-   * rich-block rendering it supports (e.g. Slack Block Kit tables). Set at
-   * most one of `transformOutboundText` / `transformOutboundMarkdown` per
-   * adapter; if both are set, `transformOutboundText` wins (preserves the
-   * pre-existing raw-delivery contract).
+   * Markdown→Markdown transform: the bridge keeps `markdown` delivery so the adapter's native conversion and rich
+   * blocks (e.g. Slack tables) still run. If both this and `transformOutboundText` are set, `transformOutboundText`
+   * wins.
    */
   transformOutboundMarkdown?: (markdown: string, destination?: { platformId: string }) => string;
   /**
-   * How this platform renders the status subtext — the small, de-emphasized
-   * line under an agent's own reply naming the model, effort and context it
-   * ran on (`container/agent-runner/src/turn-status.ts`).
-   *
-   * Takes the body the bridge was about to post and returns it with the
-   * subtext attached however the platform expresses "small print": Discord
-   * appends a `-# ` line to the markdown, Slack hands the adapter a field its
-   * postMessage wrapper turns into a Block Kit `context` block.
-   *
-   * OPT-IN ON PURPOSE. An adapter that does not declare this gets no subtext
-   * at all, rather than a generic fallback. Every platform can render extra
-   * text; not every platform can render it as small print, and a line of
-   * full-size body text repeating "opus-5 · high · 142k context" under every
-   * reply is worse in a conversation than simply not having the line.
+   * How this platform renders the status subtext (model, effort, context) as small print: Discord appends a `-# `
+   * line, Slack gets a Block Kit `context` block. OPT-IN: without it there is no subtext at all, because a full-size
+   * footer under every reply is worse than none.
    */
   renderSubtext?: (body: OutboundBody, subtext: string) => OutboundBody;
   /**
-   * Re-verify a platform-claimed mention against the final inbound text.
-   * Called only when the platform said isMention; returning false demotes
-   * the flag. Slack fires app_mention for a literal `@name` inside code
-   * spans (documented gate syntax), which wakes mention-mode agents off
-   * their own documentation without this.
+   * Re-verifies a platform-claimed mention against the final text; false demotes it. Slack fires app_mention for
+   * `@name` inside code spans.
    */
   refineInboundMention?: (text: string) => boolean;
   /**
-   * Optional transform applied to the inbound message's user-facing text
-   * fields before it lands in `messages_in`. Used by channels whose raw
-   * wire format leaks non-human-readable user references (Discord's
-   * `<@123456789>` snowflake mentions are the canonical case): the agent
-   * reads `content.text` and has no way to tell which snowflake is
-   * "@Example Agent-Codex" vs a stranger. Resolving here keeps the round-trip
-   * symmetric — the outbound rewriter already turns `@Example Agent-Codex` back
-   * into `<@id>` on the way out.
-   *
-   * Applied to both `serialized.text` (the message body) and
-   * `serialized.replyTo.text` (the quoted-message context the formatter
-   * surfaces to the agent). Anywhere else the raw wire form leaks would
-   * need its own pass.
+   * Applied to `serialized.text` and `serialized.replyTo.text` before they land in `messages_in`, for platforms whose
+   * wire format leaks opaque user references (Discord `<@snowflake>`). Any other place the raw form leaks needs its
+   * own pass.
    */
   transformInboundText?: (text: string) => string;
   /**
-   * Recover readable content the platform adapter left only in `message.raw`.
-   * The returned text is appended to the message body and persisted; the raw
-   * provider payload is still dropped. See appendRawText for the ordering
-   * constraints inside messageToInbound.
+   * Content the adapter left only in `message.raw`, appended to the persisted body; see appendRawText for ordering
+   * inside messageToInbound.
    */
   extractRawText?: RawTextExtractor;
   /**
-   * Optional live identity override for an inbound author. Chat SDK adapters
-   * can expose a stale install-time bot name after the platform profile has
-   * been renamed. Return a current channel-facing name for known bot authors,
-   * or null/undefined to preserve the SDK-provided human name.
+   * Live name override for known bot authors, since SDK adapters can keep a stale install-time name after a rename.
+   * Null/undefined keeps the SDK name.
    */
   transformInboundSender?: (author: {
     userId?: string;
@@ -345,59 +301,40 @@ export interface ChatSdkBridgeConfig {
     isMe?: boolean;
   }) => string | null | undefined;
   /**
-   * Optional filter applied to inbound Chat SDK messages before they reach
-   * the host router. Return false to drop. Used by channels that need to
-   * suppress platform-emitted system messages the SDK doesn't filter (e.g.
-   * Discord MESSAGE_CREATE events for thread renames, member joins, etc.)
-   * which would otherwise reach the agent as ordinary user messages.
-   *
-   * Runs on BOTH live dispatch and the recovery scan; `ctx.recovered` says
-   * which. A content filter (system messages) wants both. A filter carrying
-   * conversational state must opt out of recovery: recovery pages arrive
-   * newest-first and are sorted only afterwards, so feeding them to a
-   * stateful filter both mis-orders its state and re-judges history the live
-   * path already judged.
+   * Return false to drop, e.g. platform system messages the SDK does not filter. Runs on BOTH live dispatch and
+   * recovery (`ctx.recovered`). A filter carrying conversational state must skip recovery: recovery pages arrive
+   * newest-first and were already judged live.
    */
   inboundFilter?: (message: ChatMessage, ctx: InboundFilterContext) => boolean;
-  /** Recover mention semantics from REST-fetched history (SDK fetches may omit isMention). */
+  /** REST-fetched history may omit isMention. */
   detectRecoveredMention?: (message: ChatMessage) => boolean;
   /**
-   * Thread a recovered channel-root @mention the way live dispatch would have.
-   * Discord's live Gateway path opens a thread on a root mention before
-   * dispatch; REST history has no such step, so without this a mention seen
-   * only by recovery routes to the channel-level session and is answered at
-   * channel root. Return the thread id, or null to keep the root address.
+   * Threads a recovered channel-root @mention the way live dispatch would (Discord's Gateway opens a thread first);
+   * otherwise it is answered at channel root. Null keeps the root address.
    */
   threadRecoveredRootMention?: (platformId: string, message: ChatMessage) => Promise<string | null>;
-  /** Allow selected bot-authored history rows (default recovery policy drops bots). */
+  /** Default recovery policy drops bot-authored rows. */
   allowRecoveredBotMessage?: (message: ChatMessage) => boolean;
-  /** Platform override for history pagination when adapter.fetchMessages lacks channel-root support. */
   fetchRecoveryPage?: (
     threadId: string,
     options: { limit: number; direction: 'backward'; cursor?: string; since: string },
   ) => Promise<{ messages: ChatMessage[]; nextCursor?: string }>;
-  /** Discover thread targets that do not yet have a NanoClaw session. */
+  /** Thread targets that do not have a NanoClaw session yet. */
   discoverRecoveryTargets?: (request: ChannelRecoveryRequest) => Promise<{
     targets: ChannelRecoveryTarget[];
     complete: boolean;
-    /** Roots whose discovery failed, with the causing error, so the bridge can classify per target instead of failing the whole pass. */
+    /** Failed roots with their errors, so the bridge classifies per target instead of failing the whole pass. */
     failed?: Array<{ target: ChannelRecoveryTarget; error: unknown }>;
   }>;
   /**
-   * Classify a per-target recovery error. 'permanent' (channel deleted, bot
-   * evicted, missing scope) parks the target in the durable dead-target
-   * registry — skipped for 24h then re-probed once, never failing the pass —
-   * so one unreachable channel cannot freeze the adapter's recovery cursor
-   * or drive an infinite whole-window retry loop. Anything unclassified is
-   * 'transient': the pass fails and retries with backoff, preserving the
-   * conservative whole-window replay. Default: everything transient.
+   * 'permanent' parks the target in the durable dead-target registry (skipped for 24h, then re-probed) so one
+   * unreachable channel cannot freeze the recovery cursor or drive a whole-window retry loop. Anything unclassified
+   * is 'transient' and fails the pass for retry. Default: transient.
    */
   classifyRecoveryError?: (err: unknown) => 'permanent' | 'transient';
   /**
-   * Override the channelType (and webhook path) for this bridge. Defaults to
-   * `adapter.name`. Used by channels that register multiple instances in one
-   * process — e.g. multi-workspace Slack — so each workspace gets a distinct
-   * channelType and a distinct `/webhook/<channelType>` routing path.
+   * Defaults to `adapter.name`. Multi-instance channels (multi-workspace Slack) set a distinct channelType and
+   * `/webhook/<channelType>` path per instance.
    */
   channelType?: string;
   /**
@@ -410,37 +347,16 @@ export interface ChatSdkBridgeConfig {
    */
   maxTextLength?: number;
   /**
-   * Thread continuation chunks of an oversize channel-level post under the
-   * first chunk instead of posting them as additional channel parents. On
-   * platforms with Slack-style threads, sibling parents read as unrelated
-   * messages and repliers thread under the wrong one. Requires the adapter
-   * to accept `<platformId>:<messageId>` as a thread target (Slack does
-   * natively; Discord does via `installMessageThreadAutoCreate` in discord.ts,
-   * which opens the thread on first use). If a continuation chunk can't be
-   * posted under that thread, the rest of the message falls back to channel
-   * level rather than being truncated. Thread-targeted deliveries are
-   * unaffected — their chunks already land in the same thread.
+   * Continuation chunks of an oversize channel-level post reply under the first chunk instead of posting as more
+   * channel parents. The adapter must accept `<platformId>:<messageId>` as a thread target (Discord via
+   * `installMessageThreadAutoCreate`). A chunk that cannot thread falls back to channel level rather than being
+   * truncated.
    */
   threadContinuationChunks?: boolean;
   /**
-   * Optional fetch for the thread's anchor/starter message(s) — context
-   * that seeded the thread but lives outside `fetchMessages(threadId)`.
-   *
-   * Discord's chat-adapter auto-creates a thread when an inbound channel-
-   * root message @mentions the bot, anchored on that mention. If the
-   * mention was also a Reply to another message, *that* parent (M0) is the
-   * thing the user actually wants the agent to act on — "fix stale claims"
-   * means nothing without the wiki-lint findings it referenced. So the
-   * adapter returns up to two messages: M0 (the replied-to parent) first,
-   * then M1 (the @mention itself). Both are tagged `isAnchor: true` so
-   * the router can exempt them from the `last_active` filter on follow-up
-   * wakes (anchors don't decay; they're load-bearing thread context).
-   *
-   * `excludeMessageId` is the id of the inbound trigger so the
-   * implementation can drop the anchor when `thread.id == trigger.id`
-   * (the first wake, where anchor and trigger are the same message).
-   *
-   * Return null on no anchor, error, or when the anchor IS the trigger.
+   * The thread's anchor/starter messages, which live outside `fetchMessages(threadId)`. For a Discord auto-thread on
+   * an @mention that replied to M0, returns M0 then M1 (the mention), tagged `isAnchor: true`. `excludeMessageId`
+   * drops the anchor when it IS the trigger (first wake). Null on none or error.
    */
   fetchThreadAnchor?: (
     threadId: string,
@@ -449,9 +365,8 @@ export interface ChatSdkBridgeConfig {
 }
 
 /**
- * Serializes recovery passes without blocking live ingress. The durable gap
- * floor prevents live cursor advancement across an incomplete window, and the
- * router's ingress receipts atomically deduplicate a live/recovery race.
+ * Serializes recovery passes without blocking live ingress. The durable gap floor stops live cursor advancement
+ * across an incomplete window; ingress receipts dedupe a live/recovery race.
  */
 export class RecoveryIngressGate {
   private recoveryTail: Promise<void> = Promise.resolve();
@@ -492,9 +407,8 @@ function resolveSelectedOption(
   const candidate = eventValue || tail;
   if (!candidate) return undefined;
   if (/^\d+$/.test(candidate)) {
-    // New cards use an index to fit Telegram's callback-data limit. An
-    // unresolvable index is *not* a legacy literal option: forwarding it
-    // would make "0" fall into approval's reject-by-default branch.
+    // Index-encoded (Telegram's callback-data limit). An unresolvable index is NOT a legacy literal: forwarding "0"
+    // would fall into approval's reject-by-default branch.
     if (!render) return undefined;
     const idx = Number(candidate);
     if (render.options[idx]) return render.options[idx].value;
@@ -503,12 +417,7 @@ function resolveSelectedOption(
   return candidate;
 }
 
-/**
- * Decode the raw Discord custom_id shape emitted by @chat-adapter/discord.
- * The adapter joins a button's action id and value with a newline; forwarded
- * Gateway events bypass the adapter's normal decoder and therefore need the
- * same split here before parsing NanoClaw's `ncq:<id>:<index>` action id.
- */
+/** @chat-adapter/discord joins action id and value with a newline; forwarded Gateway events bypass its decoder. */
 function decodeDiscordCustomId(customId: string): { actionId: string; value: string | undefined } {
   const delimiter = customId.indexOf('\n');
   if (delimiter === -1) return { actionId: customId, value: undefined };
@@ -537,13 +446,11 @@ export function parseRetryAfterMs(err: unknown): number | null {
   const message = (err as { message?: unknown }).message;
   if (typeof message !== 'string') return null;
   if (!/\b429\b|rate[\s_-]?limit/i.test(message)) return null;
-  // Discord JSON shape: "retry_after": 0.3
   const m = message.match(/"retry_after"\s*:\s*([\d.]+)/);
   if (m) {
     const seconds = parseFloat(m[1]);
     if (!Number.isNaN(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
   }
-  // Slack/header shape: "Retry-After: 5"
   const h = message.match(/retry[\s_-]?after[":\s]+([\d.]+)/i);
   if (h) {
     const seconds = parseFloat(h[1]);
@@ -553,12 +460,8 @@ export function parseRetryAfterMs(err: unknown): number | null {
 }
 
 /**
- * Characters reserved beside the subtext itself when budgeting a chunk.
- *
- * Covers the separator an inline renderer adds — Discord's is a newline plus
- * the three-character `-# ` marker. Four would do; the margin is here so a
- * renderer that adds a blank line or a bullet does not silently push a
- * maximum-length message over the platform's cap.
+ * Room beside the subtext for the renderer's separator (Discord's newline plus `-# `), with margin so a renderer
+ * adding more cannot push a max-length message over the cap.
  */
 const SUBTEXT_BUDGET_OVERHEAD = 8;
 
@@ -611,10 +514,8 @@ function discordButtonStyle(style: NormalizedOption['style']): number {
 }
 
 /**
- * Post an interactive Discord question with its decision context in ordinary
- * message content. Discord clients can suppress embeds, which previously left
- * users looking at an unexplained row of buttons even though the embed payload
- * contained the title and question.
+ * Decision context goes in ordinary message content: Discord clients can suppress embeds, leaving an unexplained row
+ * of buttons.
  */
 async function postDiscordQuestion(
   threadId: string,
@@ -660,8 +561,7 @@ async function postDiscordQuestion(
     body: JSON.stringify({
       content,
       components,
-      // Moving approval context into message content must not turn user- or
-      // agent-supplied text into an accidental @everyone/user notification.
+      // Moved text must never become an accidental @everyone or user ping.
       allowed_mentions: { parse: [] },
     }),
   });
@@ -731,30 +631,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       return config.transformOutboundMarkdown(t, platformId ? { platformId } : undefined);
     return t;
   };
-  // Status (kind='status') messages are narration/thought-balloon text, not
-  // an address to anyone — but the outbound mention rewriters
-  // (resolveSlackMentions / resolveDiscordMentions) can't tell "@Barry" used
-  // as a live address from "@Barry" appearing inside prose ABOUT not
-  // mentioning Barry. Live incident 2026-08-18: Dinesh's status text "...
-  // without mentioning @Barry" got rewritten to a real `<@U…>` mention,
-  // waking Barry off narration despite mention-gating working correctly
-  // everywhere else. Status content has no legitimate need to ping anyone,
-  // so break the mention regexes (which require `@` immediately followed by
-  // a word/letter char) with a zero-width space — invisible on delivery,
-  // renders identically to the reader, but no rewriter matches it.
-  // Platform-native tokens get the same break: Slack's `<!here>`,
-  // `<!channel>`, `<!subteam^…>` and Discord's `<@&role>` notify without an
-  // `@` followed by a letter, and the markdown transform passes them through.
+  // Status text is narration, never an address, but the outbound mention rewriters cannot tell "@Name" in prose about
+  // someone from a live address. A zero-width space after `@` (and after `<` for Slack `<!here>`/`<!subteam^…>`,
+  // Discord `<@&role>`) breaks every rewriter while rendering identically.
   const neutralizeMentions = (t: string): string =>
     t.replace(/@(?=[\w\p{L}])/gu, '@\u200b').replace(/<(?=[!@])/g, '<\u200b');
-  // Status and task-list text is progress, never a ping: an @ in it would
-  // notify on a message whose edits are otherwise silent.
+  // Status and task-list text is progress, never a ping: an @ would notify on messages whose edits are otherwise
+  // silent.
   const transformStatusOrText = (t: string, kind: string, platformId?: string): string =>
     transformText(kind === 'status' || kind === 'task_list' ? neutralizeMentions(t) : t, platformId);
-  // Native-syntax transforms (e.g. Telegram mrkdwn) round-trip as `raw` so
-  // the adapter doesn't re-parse them as CommonMark and mangle links.
-  // Markdown-preserving transforms keep `markdown` delivery so adapter
-  // rich-block features (Slack Block Kit tables, etc.) still fire.
+  // Native-syntax transforms go out as `raw` so the adapter does not re-parse them as CommonMark; markdown-preserving
+  // ones keep `markdown` so rich blocks still fire.
   const wrapBody = (text: string): OutboundBody => (config.transformOutboundText ? { raw: text } : { markdown: text });
   let chat: Chat;
   let state: SqliteStateAdapter;
@@ -767,14 +654,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   const recoveryGapKey = `nanoclaw:recovery-gap:${bridgeChannelType}`;
   const recoveryDeadKey = `nanoclaw:recovery-dead:${bridgeChannelType}`;
 
-  // Dead-target registry: targets whose recovery failed with a PERMANENT
-  // error (classifyRecoveryError). Parked targets are excluded from passes
-  // without counting as failures, so the pass completes and the adapter
-  // cursor advances — one dead channel must never freeze the recovery
-  // window (observed live: a channel_not_found target held `since` at a
-  // 10-day-old floor and drove a 60s whole-window refetch loop). Entries
-  // expire after 24h so a re-invited bot heals without manual clearing; a
-  // still-dead target re-parks with one warning per day.
+  // Targets whose recovery failed PERMANENTLY are excluded without counting as failures, so the pass completes and
+  // the cursor advances; one dead channel must never freeze the recovery window. Entries expire after 24h so a
+  // re-invited bot heals.
   const DEAD_TARGET_TTL_MS = 24 * 60 * 60 * 1000;
   type DeadTargetMap = Record<string, { until: string; error: string }>;
 
@@ -842,11 +724,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   }
 
   /**
-   * Ask the SDK adapter whether a given thread id represents a DM.
-   * Some adapters don't expose isDM (older plugin builds); returns undefined
-   * so the router falls back to its own default — is_group=1
-   * (group/mention-safe) when message.isGroup is also unset, rather than
-   * this function guessing.
+   * Undefined when the SDK adapter has no isDM, so the router applies its own default (is_group=1 when isGroup is
+   * also unset).
    */
   function adapterIsDM(a: typeof adapter, threadId: string): boolean | undefined {
     const fn = (a as unknown as { isDM?: (t: string) => boolean }).isDM;
@@ -885,9 +764,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             log.warn('Failed to download attachment via fetchData', { type: att.type, err });
           }
         } else if (attUrl) {
-          // Fallback for adapters that don't supply fetchData (e.g. @chat-adapter/discord
-          // as of 4.26.0). Discord CDN URLs are signed+public, so a bare fetch works —
-          // but the signature expires, so we must pull bytes now while the URL is fresh.
+          // For adapters without fetchData (e.g. @chat-adapter/discord): Discord CDN URLs are signed and public, but
+          // the signature expires, so bytes must be pulled now.
           try {
             const response = await fetch(attUrl);
             if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -909,11 +787,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       if (replyTo) serialized.replyTo = replyTo;
     }
 
-    // Slack (and any adapter without an extractReplyContext hook): resolve a
-    // quoted/shared message link into reply context so the quoted text reaches
-    // the agent instead of being dropped. Time-bounded + defensive — see
-    // resolveQuotedReply. Runs only when no reply context was set above and the
-    // message actually carries a resolvable message link.
+    // Adapters without an extractReplyContext hook (Slack): resolve a quoted message link into reply context.
     if (!serialized.replyTo) {
       const quoted = await resolveQuotedReply(message);
       if (quoted) serialized.replyTo = quoted;
@@ -932,36 +806,20 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       serialized.senderName = name;
     }
 
-    // Rebuild the message body from the mdast AST so block structure (newlines,
-    // list markers, code fences) survives. The SDK's `.text` is a structure-less
-    // flatten of `.formatted`, which breaks `-e`/`-m` flag parsing and garbles
-    // multi-line instructions (e.g. a numbered list). Falls back to `.text`.
-    // Runs BEFORE transformInboundText so Discord snowflake resolution still
-    // applies to the rebuilt text.
+    // Rebuilt from the mdast so newlines, list markers and code fences survive; the SDK's `.text` is a structure-less
+    // flatten that breaks flag parsing and multi-line instructions. Runs BEFORE transformInboundText.
     if (serialized.formatted) {
       const rebuilt = reconstructInboundText(serialized.formatted);
       if (rebuilt !== null) serialized.text = rebuilt;
     }
 
-    // Recover platform content the Chat SDK left only in `raw` (Slack puts a
-    // pasted table in attachments[].blocks[]). Runs AFTER the mdast rebuild —
-    // reconstructInboundText REPLACES serialized.text, so appending earlier
-    // (where upstream puts it) would be silently discarded here — and BEFORE
-    // transformInboundText so raw `<@U…>` inside recovered cells resolves to
-    // @name like the rest of the body.
+    // AFTER the mdast rebuild, which REPLACES serialized.text (appending earlier would be discarded), and BEFORE
+    // transformInboundText so raw `<@U…>` in recovered cells resolves too.
     if (message.raw) {
       appendRawText(serialized, message.raw as Record<string, unknown>, config.extractRawText);
     }
 
-    // Resolve raw platform mention syntax (Discord's `<@snowflake>`) into
-    // names the agent can actually use. Slack already resolves usernames in
-    // its inbound text; without this hook Discord agents see only opaque
-    // numeric IDs and resort to placeholder names like `<@sibling>`.
-    //
-    // Also rewrites the quoted reply context — `replyTo.text` comes from
-    // `raw.referenced_message.content` (raw Discord wire format) and the
-    // agent's formatter surfaces it verbatim in <quoted_message> tags, so
-    // snowflakes there bleed through into the agent's view without this.
+    // Also rewrites `replyTo.text`, which comes from raw wire content and is surfaced verbatim to the agent.
     if (config.transformInboundText) {
       if (typeof serialized.text === 'string') {
         serialized.text = config.transformInboundText(serialized.text);
@@ -978,15 +836,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       if (sender) replyTo.sender = sender;
     }
 
-    // Re-verify platform-claimed mentions against the final text (raw ids
-    // already resolved to @name above). See refineInboundMention.
+    // Raw ids are already resolved to @name here.
     let effectiveMention = isMention;
     if (effectiveMention && config.refineInboundMention && typeof serialized.text === 'string') {
       effectiveMention = config.refineInboundMention(serialized.text);
     }
 
-    // Preserve isMention as an explicit flat field the router can read
-    // without depending on chat-sdk's internal field naming.
+    // An explicit flat field so the router does not depend on chat-sdk's internal naming.
     serialized.isMention = effectiveMention;
 
     // Drop raw to save DB space (can be very large)
@@ -1007,11 +863,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   const channelType = config.channelType ?? adapter.name;
 
   const bridge: ChannelAdapter = {
-    // This fork keys multi-instance bridges by a distinct channelType
-    // (config.channelType override — e.g. discord-opencode/discord-codex
-    // siblings), not the upstream config.instance dimension. instance is
-    // left unset; the registry falls back to channelType (instance ??
-    // channelType), so adopted channel-instances code stays consistent.
+    // This fork keys multi-instance bridges by a distinct channelType, not upstream's `instance`, which stays unset
+    // (the registry falls back to channelType).
     name: channelType,
     channelType,
     supportsThreads: config.supportsThreads,
@@ -1028,11 +881,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // chat_sdk_subscriptions/kv/locks/lists rows.
       state = new SqliteStateAdapter(config.instance && config.instance !== adapter.name ? config.instance : undefined);
 
-      // Establish the durable startup gap before Chat initializes the
-      // platform adapter or registers any live traffic. Otherwise an early
-      // webhook/Gateway event can advance the cursor past messages missed
-      // while the host was down, and the later host-startup pass has no way
-      // to recover the overwritten floor.
+      // Establish the durable startup gap before Chat initializes the adapter: an early live event could otherwise
+      // advance the cursor past messages missed while the host was down.
       await state.connect();
       recoveryCursorMs = 0;
       recoveryGapFloorMs = null;
@@ -1059,18 +909,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // flag that routeInbound evaluates; the router calls back into
       // bridge.subscribe(...) when a mention-sticky wiring engages.
 
-      // Normalize channel-root threads to null — Chat SDK's thread.id equals
-      // the channel id for messages posted at channel root (Discord format
-      // `discord:{g}:{c}`, Slack `slack:{C}`). Router's engage logic wants
-      // "real sub-thread or null"; without this normalization mention-sticky
-      // treats every channel message as an in-thread follow-up.
+      // Chat SDK's thread.id equals the channel id for channel-root posts; the router wants a real sub-thread or
+      // null, or mention-sticky treats every channel message as an in-thread follow-up.
       const resolveThreadId = (rawThreadId: string, channelId: string): string | null =>
         rawThreadId === channelId ? null : rawThreadId;
 
-      // One-shot channel metadata discovery: on first inbound we've seen for
-      // a given channel, fetch its name via the Chat SDK and forward via
-      // onMetadata so the host can populate messaging_groups.name. Without
-      // this, auto-created mgs stay nameless forever (Slack example-ops etc.).
+      // On the first inbound for a channel, fetch its name and forward it via onMetadata; otherwise auto-created
+      // messaging groups stay nameless.
       const reportedChannels = new Set<string>();
       const reportChannelMetadata = (channelId: string): void => {
         if (reportedChannels.has(channelId)) return;
@@ -1134,23 +979,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         if (!passesFilter(message)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
 
-        // Slack DM threading default: when the Slack "Agent or Assistant"
-        // toggle is OFF, Slack delivers channel-root DM messages with no
-        // `thread_ts` field, and the chat-sdk hands us a thread.id like
-        // `slack:D…:` (empty suffix). That makes downstream sessions+outbounds
-        // inherit an empty thread_id, and Bot replies post at channel root
-        // instead of threading under the user's message — fragmenting the
-        // conversation visually. Treat the originating message as its own
-        // thread root so replies thread under it. Same behavior the Agent UX
-        // provides, but driven by us rather than depending on a Slack-side
-        // toggle. Scoped to Slack DMs to avoid affecting other adapters.
+        // Slack DMs without the "Agent or Assistant" toggle arrive with no `thread_ts` (thread.id `slack:D…:`), so
+        // replies would post at channel root. Treat the originating message as the thread root. Slack DMs only.
         let normalizedThreadId = thread.id;
-        // Match any Slack adapter — bare `slack` AND multi-workspace variants
-        // (`slack-example-labs`, `slack-exampleretail`, `slack-exampleretail-codex`,
-        // etc.). The strict `=== 'slack'` check that lived here previously
-        // silently broke DM auto-threading when slack.ts started overriding
-        // adapter.name to the channelType for dedup isolation across
-        // workspaces (see slack.ts comment block around the name override).
+        // Prefix match: slack.ts renames every adapter to its channelType (`slack-<suffix>`) for dedup isolation.
         if (adapter.name.startsWith('slack') && normalizedThreadId.endsWith(':')) {
           normalizedThreadId = `${normalizedThreadId}${message.id}`;
         }
@@ -1161,7 +993,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: normalizedThreadId,
         });
-        // onDirectMessage only fires for real DMs — isDM=true unconditionally.
+        // onDirectMessage only fires for real DMs.
         await forwardInbound(channelId, normalizedThreadId, await messageToInbound(message, true, true));
       });
 
@@ -1195,9 +1027,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const questionId = parts[1];
         const tail = parts.slice(2).join(':');
         const userId = event.user?.userId || '';
-        // The clicked message itself. The button names only a questionId,
-        // which any card can carry, so approvals bind the click to their own
-        // card with this id (response-handler.ts).
+        // The button names only a questionId, which any card can carry, so approvals bind the click to this message
+        // id.
         const messageId = event.messageId || null;
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
@@ -1214,27 +1045,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
           return;
         }
-        // A card the host posted for a pending_approvals row is never edited
-        // here. All the bridge knows is the id the button carried: it has not
-        // checked that the clicked message is that approval's own card, nor
-        // that the clicker may decide it. Editing first would write the
-        // approval's title and question into whatever message was clicked — a
-        // counterfeit card carrying the same id, in a channel the approval was
-        // never delivered to, included — and label it resolved, moments before
-        // the handler refuses the click (modules/approvals/response-handler.ts).
-        // So dispatch, and let the host edit the card the row itself names once
-        // the click is bound and authorized (editApprovalCardResolution,
-        // modules/approvals/primitive.ts). A refused, unauthorized or losing
-        // click then leaves every card exactly as it was.
-        //
-        // No edit is needed to acknowledge the click: the adapter acks the
-        // platform event itself (Slack answers block_actions 200 before
-        // dispatch).
-        //
-        // `action` is set only on a pending_approvals render
-        // (db/sessions.ts), and it comes from the render read above,
-        // not a second one: a row the winning click deletes in between would
-        // otherwise read as "not an approval" and fall through to the edit.
+        // A pending_approvals card is never edited here: the bridge has not checked that the clicked message is that
+        // approval's own card or that the clicker may decide it, so editing first would stamp the approval onto a
+        // possibly counterfeit card. Dispatch, and the host edits the card the row names once the click is bound and
+        // authorized. The adapter already acks the platform event. `action` comes from the render read above, not a
+        // second read the winning click could race.
         if (render?.action !== undefined) {
           setupConfig.onAction(questionId, selectedOption, userId, messageId);
           return;
@@ -1274,11 +1089,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         setupConfig.onAction(questionId, selectedOption, userId, messageId);
       });
 
-      // Native slash commands (e.g. Slack's registered `/dashboard-token`,
-      // once added to the app manifest — see docs/slack-slash-commands.md).
-      // The SDK acks the platform request before this handler runs (see
-      // @chat-adapter/slack's handleSlashCommand/routeSocketEvent), so a slow
-      // handler never risks Slack's 3s ack timeout.
+      // The SDK acks the platform request before this runs, so a slow handler cannot hit Slack's 3s ack timeout.
       chat.onSlashCommand(async (event) => {
         const handler = slashCommandHandlers.get(event.command);
         if (!handler) return;
@@ -1327,8 +1138,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             webhookUrl,
           )
             .then(() => {
-              // startGatewayListener resolves immediately with a Response;
-              // the actual work is in the listenerPromise passed to waitUntil
+              // startGatewayListener resolves immediately; the real work is the listenerPromise passed to waitUntil.
               if (!listenerPromise) return;
               const reschedule = (err?: unknown) => {
                 if (gatewayAbort?.signal.aborted) return;
@@ -1361,10 +1171,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         startGateway();
         log.info('Gateway listener started', { adapter: adapter.name });
       } else {
-        // Non-gateway adapters (Slack, Teams, GitHub, etc.) — register on the shared webhook server.
-        // Use channelType as the routing key so multi-instance channels (e.g. multi-workspace
-        // Slack) get distinct `/webhook/<channelType>` paths even though they share the same
-        // underlying adapter.name for chat.webhooks[] lookup.
+        // Webhook adapters register under channelType so multi-instance channels get distinct
+        // `/webhook/<channelType>` paths.
         registerWebhookAdapter(chat, adapter.name, channelType);
       }
 
@@ -1383,21 +1191,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           message.kind,
           platformId,
         );
-        // Edit path is status post-then-edit only — chat replies post fresh
-        // (commit 897a5d0), so the morph-into-long-final-answer case the
-        // prior chunked-edit logic justified no longer exists. If the status
-        // text exceeds the platform's per-message limit, truncate to the
-        // first chunk with an ellipsis instead of posting additional new
-        // messages: the prior code's extra posts were not registered in
-        // delivery.ts:statusTracking and survived orphan-cleanup on chat
-        // delivery, leaving stale "thinking-block tails" visible to the
-        // user. Status is meta info and the bubble is deleted on chat
-        // delivery anyway, so visual truncation here is acceptable.
-        // An agent correcting its own reply keeps the status line: the runner
-        // stamps edit_message rows the same way it stamps the reply they
-        // replace. Status-bubble edits carry no subtext, so they are
-        // unaffected. Budget the footer before truncating, as the post path
-        // does, so Discord's in-text rendering cannot push past the limit.
+        // Only status bubbles are edited (chat replies post fresh). Oversize status text truncates to one chunk:
+        // extra posts would not be tracked by delivery.ts's statusTracking and would survive cleanup as stale
+        // thinking tails. An edited chat reply keeps its subtext; the footer is budgeted before truncating, as on the
+        // post path.
         const editSubtext =
           (message.kind === 'chat' || message.kind === 'task_list') &&
           typeof content.subtext === 'string' &&
@@ -1410,11 +1207,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           : undefined;
         const fitted = limit && editText.length > limit ? splitForLimit(editText, limit)[0].trimEnd() + '…' : editText;
         const editBody = editSubtext ? config.renderSubtext!(wrapBody(fitted), editSubtext) : wrapBody(fitted);
-        // Edits get 429 handling like posts: a live task list edits one message
-        // repeatedly, and a dropped edit leaves it showing stale progress. A
-        // task-list edit does not wait here at all — it would hold the
-        // session's queue; the host cools the row down and lets answers
-        // through instead (task-list-host.ts).
+        // Edits get 429 handling too: a dropped task-list edit leaves stale progress. A task-list edit never waits
+        // here (it would hold the session's queue); the host cools the row down instead (task-list-host.ts).
         const listEdit = message.kind === 'task_list';
         for (let attempt = 1; ; attempt++) {
           try {
@@ -1458,9 +1252,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }
         const card = Card({
           title: displayTitle,
-          // Both the Discord and Slack adapters render Card.subtitle as the
-          // native card description. Keeping the decision context here avoids
-          // a platform producing a visually blank card body beside its buttons.
+          // Both adapters render Card.subtitle as the card description; without it the card body is blank beside its
+          // buttons.
           subtitle: question,
           children: [
             Actions(
@@ -1474,10 +1267,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                   id: `ncq:${questionId}:${idx}`,
                   label: opt.label,
                   value: String(idx),
-                  // Chat SDK maps 'primary' / 'danger' to each platform's
-                  // native button color (Slack primary/danger, Discord
-                  // primary/danger, Teams positive/destructive). Unset →
-                  // platform default (grey/neutral).
                   ...(opt.style ? { style: opt.style } : {}),
                 }),
               ),
@@ -1550,41 +1339,18 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const rawText = (content.markdown as string) || (content.text as string);
       const text = rawText ? transformStatusOrText(rawText, message.kind, platformId) : rawText;
       if (text) {
-        // Host notifications use this opt-in to make an incomplete multi-chunk
-        // report fail instead of looking delivered. Ordinary chat keeps the
-        // truncation path below: rethrowing there would retry chunks that the
-        // platform already accepted and duplicate a user's reply.
+        // Opt-in for host notifications, so an incomplete multi-chunk report fails instead of looking delivered.
+        // Ordinary chat keeps truncation: retrying would duplicate chunks the platform already accepted.
         const requireCompleteDelivery = content.requireCompleteDelivery === true;
         // Attach files if present (FileUpload format: { data, filename })
         const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
           data: f.data,
           filename: f.filename,
         }));
-        // Status (kind='status') messages are meta info — a "thinking
-        // bubble" that grows during a turn and gets deleted when the chat
-        // reply lands. If the first status of a turn is itself oversize
-        // (e.g. the agent's first thinking event for the turn already
-        // exceeds the platform's per-message limit), we MUST NOT post
-        // additional chunks: only the first chunk's id is returned and
-        // tracked in delivery.ts:statusTracking, and orphan-cleanup on
-        // chat delivery deletes only that tracked id — chunks 2+ would
-        // linger as un-tracked "second thinking blocks" that look (to
-        // the user) like truncated response text.
-        //
-        // Truncate to a single chunk with an ellipsis. Edits later in
-        // the same turn target the same single bubble (delivery.ts wraps
-        // them as operation='edit' once existing tracking is set), and
-        // the edit path also truncates (see above). The user always sees
-        // exactly one thinking bubble per turn.
-        //
-        // Chat replies (kind='chat') keep the original multi-chunk
-        // behavior: they're real content the user wants in full, and the
-        // 429 retry below ensures all chunks land.
-        // Status subtext — model/effort/context, stamped by the runner onto the
-        // agent's own replies only (poll-loop.ts sendToDestination). Rendered
-        // for chat replies; a 'status' thought-balloon is transient narration
-        // the host deletes when the real reply lands, so a footer on it is
-        // noise that outlives nothing.
+        // An oversize FIRST status of a turn must NOT post extra chunks: only the first chunk's id is tracked for
+        // cleanup, so chunks 2+ would linger as untracked "thinking" text. Truncate to one chunk; chat replies keep
+        // full multi-chunk delivery.
+        // The subtext is rendered on chat replies only, not on transient status bubbles.
         const subtext =
           (message.kind === 'chat' || message.kind === 'task_list') &&
           typeof content.subtext === 'string' &&
@@ -1592,13 +1358,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           config.renderSubtext
             ? content.subtext.trim()
             : null;
-        // Reserve the footer's room in the per-message budget BEFORE splitting.
-        // Discord spends it inside the message text, so a body split to exactly
-        // the limit and then appended to would be rejected by the platform; the
-        // few characters cost nothing on a channel (Slack) that spends it in a
-        // separate block instead. Reserving before the split rather than
-        // trimming after keeps the fix in one place regardless of which
-        // rendering the adapter chose.
+        // Reserve the footer's room BEFORE splitting: Discord spends it inside the text, so a body split to the exact
+        // limit and then appended to would be rejected.
         const subtextBudget = subtext ? subtext.length + SUBTEXT_BUDGET_OVERHEAD : 0;
         const textLimit = config.maxTextLength ? Math.max(1, config.maxTextLength - subtextBudget) : undefined;
         const chunks: string[] =
@@ -1612,8 +1373,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          // Last chunk only: one reply gets one footer, wherever the splitter
-          // happened to cut it.
+          // One footer per reply, on the last chunk.
           const base = wrapBody(chunk);
           const body = subtext && i === chunks.length - 1 ? config.renderSubtext!(base, subtext) : base;
           let attempt = 0;
@@ -1629,15 +1389,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               }
               chunkPosted = true;
             } catch (err) {
-              // 429 rate limit: Discord/Slack are explicitly telling us to
-              // wait. Retry the same chunk after the requested delay rather
-              // than dropping it. Without this, sending a multi-chunk reply
-              // that tickles the per-channel rate limit silently truncates
-              // mid-stream — the user sees only the first chunk(s).
+              // 429: retry the same chunk after the requested delay; otherwise a rate-limited multi-chunk reply
+              // silently truncates.
               const retryAfterMs = parseRetryAfterMs(err);
               attempt++;
-              // A task-list post never waits here: the host cools it down
-              // and lets the session's answers through (task-list-host.ts).
+              // A task-list post never waits here (task-list-host.ts).
               if (retryAfterMs !== null && attempt <= MAX_RATE_LIMIT_RETRIES && message.kind !== 'task_list') {
                 log.info('chat-sdk-bridge: chunk rate-limited, retrying', {
                   chunkIndex: i,
@@ -1649,10 +1405,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                 await sleep(retryAfterMs + RATE_LIMIT_BUFFER_MS);
                 continue;
               }
-              // A continuation chunk that can't land under the first chunk's
-              // thread (no thread support in that context, missing permission)
-              // must not cost the rest of the message: drop back to the
-              // original target for this and every later chunk.
+              // A continuation chunk that cannot thread must not cost the rest of the message: fall back to the
+              // original target from here on.
               if (i > 0 && chunkTid !== tid) {
                 log.warn('chat-sdk-bridge: continuation chunk could not thread; posting at channel level', {
                   chunkIndex: i,
@@ -1664,13 +1418,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                 attempt = 0;
                 continue;
               }
-              // Non-429 error or retries exhausted. First-chunk failures
-              // re-throw so the host retries from scratch with no
-              // duplicates. Mid-message chunk failures truncate: letting
-              // them throw makes the host retry the whole message, which
-              // would re-post every chunk that already landed and the user
-              // sees duplicates (in extreme cases MAX_DELIVERY_ATTEMPTS ×
-              // successful chunks).
+              // First-chunk failures rethrow so the host retries cleanly. A mid-message failure truncates, because a
+              // whole-message retry would re-post every chunk that already landed.
               if (i === 0 || requireCompleteDelivery) throw err;
               log.warn('chat-sdk-bridge: chunk post failed mid-message; truncating to avoid duplicate-on-retry', {
                 chunkIndex: i,
@@ -1701,8 +1450,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async deleteMessage(platformId: string, threadId: string | null, messageId: string) {
       const tid = threadId ?? platformId;
-      // Optional on the underlying chat-adapter — Slack/Discord expose it,
-      // CLI/Telegram/etc. may not. Skip silently when absent.
+      // Optional on the underlying adapter; skip silently when absent.
       const fn = (
         adapter as unknown as {
           deleteMessage?: (t: string, m: string) => Promise<void>;
@@ -1728,10 +1476,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     ): Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }>> {
       const limit = opts?.limit ?? 50;
       const inThread: Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }> = [];
-      // Apply the same inbound text transform that messageToInbound uses, so
-      // resumed-thread context the router prepends as [Thread context] doesn't
-      // leak the raw wire form (Discord snowflakes) the live path normalizes
-      // away. Fail-soft: with no transform configured this is identity.
+      // Same inbound transform as messageToInbound, so replayed thread context does not leak the raw wire form.
       const applyInboundTransform = (t: string): string =>
         config.transformInboundText ? config.transformInboundText(t) : t;
       try {
@@ -1745,11 +1490,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }>;
         for (const m of msgs) {
           if (m.id === opts?.excludeMessageId) continue;
-          // Replayed context goes through the same raw-text recovery as the
-          // live path. Without it a Slack message whose only content is a
-          // pasted table has empty `.text` and is skipped outright, and a
-          // table with an introductory sentence replays only the sentence —
-          // the very message that made the thread worth resuming.
+          // Replayed context gets the same raw-text recovery as the live path, or a table-only message is skipped
+          // outright.
           const projected: Record<string, unknown> = { text: m.text };
           if (m.raw) appendRawText(projected, m.raw as Record<string, unknown>, config.extractRawText);
           const text = typeof projected.text === 'string' ? projected.text : '';
@@ -1770,32 +1512,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         });
       }
 
-      // Discord auto-creates threads from a parent channel message; the parent
-      // sits outside `fetchMessages(threadId)` (which only sees in-thread
-      // messages). The hook may return up to two messages — M0 (the message
-      // the mention replied to) and M1 (the mention itself) — chronologically
-      // ordered, and tagged isAnchor.
-      //
-      // The tag is descriptive, NOT an exemption. An earlier router revision
-      // did exempt anchors from the recency cutoff; 993e4bee removed that,
-      // because an anchor predates the entire thread by construction and the
-      // exemption re-prepended the same parent message on every follow-up
-      // wake. Anchors reach the agent on the engagement that matters — an
-      // unengaged session replays with no cutoff at all — and are filtered
-      // like anything else afterwards. See src/thread-context.ts.
-      //
-      // De-dupe on (sender, text) against the in-thread set — for forum
-      // threads the anchor is already the first in-thread message, and
-      // timestamps from the message-by-id endpoint and the channel-messages
-      // endpoint don't always round-trip to the same ISO string. De-dupe
-      // happens AFTER the transform on both sides so the comparison is on
-      // normalized text — otherwise a normalized in-thread copy and a raw
-      // anchor copy of the same message would both survive.
+      // Discord's anchor messages sit outside `fetchMessages(threadId)`. `isAnchor` is descriptive, NOT a recency
+      // exemption (an exemption re-prepended the parent on every follow-up wake; see src/thread-context.ts). De-dupe
+      // on (sender, text) AFTER the transform on both sides: forum threads repeat the anchor in-thread, and the two
+      // endpoints' timestamps do not always match.
       if (config.fetchThreadAnchor) {
         try {
           const anchors = await config.fetchThreadAnchor(threadId, { excludeMessageId: opts?.excludeMessageId });
           if (anchors && anchors.length > 0) {
-            // Iterate in reverse so unshift preserves the hook's chronological order.
+            // Reverse so unshift preserves chronological order.
             for (let i = anchors.length - 1; i >= 0; i--) {
               const a = anchors[i];
               if (!a.text || a.text.length === 0) continue;
@@ -1829,8 +1554,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const dead = await loadDeadTargets();
         const targetAddress = (target: ChannelRecoveryTarget): string =>
           `${target.platformId}\u0000${target.threadId ?? ''}`;
-        // A dead ROOT (threadId '') parks every target on that platformId —
-        // thread fetches against an unreachable channel fail identically.
+        // A dead root parks every target on that platformId.
         const deadRoots = new Set(
           Object.keys(dead)
             .filter((key) => key.endsWith('\u0000'))
@@ -1906,9 +1630,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }> = [];
         const seen = new Set<string>();
 
-        // Fetch newest-first pages until the requested gap boundary is covered.
-        // A fixed cap would retry the same newest pages forever on a large gap,
-        // so pagination continues to the boundary and rejects cursor loops.
+        // Page newest-first to the gap boundary; a fixed cap would retry the same pages forever on a large gap.
+        // Cursor loops are rejected.
         for (const target of targets) {
           const targetThreadId =
             target.threadId ??
@@ -1985,10 +1708,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         let recoveredMessages = 0;
         let newestRecoveredAt = 0;
         for (const { target, message } of recovered) {
-          // Routing does synchronous DB work (better-sqlite3): yield to the
-          // macrotask queue every few messages so a large recovered batch
-          // cannot block the event loop past the stall threshold and
-          // re-trigger recovery (the stall→recovery→stall feedback loop).
+          // Routing does synchronous DB work: yield every few messages so a large batch cannot stall the loop and
+          // re-trigger recovery.
           if (recoveredMessages > 0 && recoveredMessages % 10 === 0) {
             await new Promise((resolve) => setImmediate(resolve));
           }
@@ -1999,10 +1720,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               threadId = `${threadId}${message.id}`;
             }
           } else if (threadId === null && message.threadId && message.threadId !== target.platformId) {
-            // Some adapters model a channel-root post as the root of a native
-            // reply thread (Slack: slack:<channel>:<message-ts>). Preserve that
-            // address; Discord root messages use message.threadId===platformId
-            // and remain null unless threadRecoveredRootMention threads them.
+            // Some adapters model a root post as the root of a native reply thread (Slack `slack:<channel>:<ts>`);
+            // keep that address. Discord roots stay null unless threadRecoveredRootMention threads them.
             threadId = message.threadId;
           }
           const isMention =
@@ -2030,9 +1749,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           }
         }
 
-        // Never advance the durable cursor across an incomplete target. A later
-        // recovery safely replays the overlap. The gap floor also suppresses
-        // cursor advancement by later live messages until a complete pass.
+        // Never advance the durable cursor across an incomplete target; a later pass replays the overlap safely.
         if (failedTargets === 0) {
           await completeRecovery(Math.max(newestRecoveredAt, recoveryStartedAtMs));
         }
@@ -2102,10 +1819,9 @@ function startLocalWebhookServer(
       req.on('data', (chunk: Buffer) => chunks.push(chunk));
       req.on('end', () => {
         const body = Buffer.concat(chunks).toString();
-        // The Discord adapter launches one async HTTP request per raw Gateway
-        // packet. EventEmitter does not await those listeners, so READY and a
-        // following MESSAGE_CREATE can otherwise complete out of order. Queue
-        // the local handlers and hold later packets behind reconnect recovery.
+        // The Discord adapter issues one async request per raw Gateway packet and EventEmitter does not await
+        // listeners, so READY and a following MESSAGE_CREATE can complete out of order. Queue the handlers and hold
+        // later packets behind reconnect recovery.
         const handled = eventTail.then(() =>
           handleForwardedEvent(body, adapter, setupConfig, botToken, onConnectionRestored),
         );
@@ -2153,31 +1869,28 @@ export async function handleForwardedEvent(
     if (interaction.type === 3) {
       const customId = (interaction.data as Record<string, unknown>)?.custom_id as string;
       const decoded = typeof customId === 'string' ? decodeDiscordCustomId(customId) : undefined;
-      // Only NanoClaw approval cards belong to this bridge. Let the adapter
-      // receive every other component interaction unchanged below.
+      // Only NanoClaw approval cards (`ncq:`) belong to this bridge; everything else reaches the adapter unchanged.
       if (decoded?.actionId.startsWith('ncq:')) {
-        // In guilds the clicker is at interaction.member.user; in DMs it's interaction.user directly.
+        // Guild clicks carry the user at interaction.member.user; DMs at interaction.user.
         const user =
           ((interaction.member as Record<string, unknown>)?.user as Record<string, string> | undefined) ??
           (interaction.user as Record<string, string> | undefined);
         const interactionId = interaction.id as string;
         const interactionToken = interaction.token as string;
-        // The clicked message, which approvals bind the click to (see the Chat SDK path).
+        // Approvals bind the click to this message.
         const clickedMessage = (interaction.message as Record<string, unknown> | undefined)?.id;
         const messageId = typeof clickedMessage === 'string' && clickedMessage ? clickedMessage : null;
 
-        // Parse the selected option from custom_id
         let questionId: string | undefined;
         let tail: string | undefined;
         if (decoded.actionId.startsWith('ncq:')) {
-          const colonIdx = decoded.actionId.indexOf(':', 4); // after "ncq:"
+          const colonIdx = decoded.actionId.indexOf(':', 4);
           if (colonIdx !== -1) {
             questionId = decoded.actionId.slice(4, colonIdx);
             tail = decoded.actionId.slice(colonIdx + 1);
           }
         }
 
-        // Update the card to show the selected answer and remove buttons
         const originalEmbeds =
           ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
         const originalDescription = (originalEmbeds[0]?.description as string) || '';
@@ -2185,8 +1898,7 @@ export async function handleForwardedEvent(
           ((interaction.message as Record<string, unknown>)?.content as string | undefined) || ''
         ).trim();
         const render = questionId ? await getAskQuestionRender(questionId) : undefined;
-        // Discord custom_id mirrors the new index-based encoding (see Button
-        // construction). Decode back to the real option value for downstream.
+        // custom_id carries an option index; decode back to the real value.
         const selectedOption = resolveSelectedOption(render, decoded.value, tail);
         if (!questionId || !selectedOption) {
           log.warn('Ignoring Discord card action with an unresolved option', {
@@ -2199,8 +1911,7 @@ export async function handleForwardedEvent(
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                // Acknowledge without mutating the original card. The approval
-                // remains pending and, crucially, cannot be mistaken for reject.
+                // Acknowledge without touching the card: the approval stays pending and can never read as a reject.
                 type: 4,
                 data: {
                   content: 'Could not verify that approval selection. The card is still pending.',
@@ -2214,12 +1925,8 @@ export async function handleForwardedEvent(
           return;
         }
         if (render?.action !== undefined) {
-          // An approval card, classified from the render read above (see the
-          // Chat SDK path for why none is edited here): acknowledge without
-          // touching the message (type 6, DEFERRED_UPDATE_MESSAGE —
-          // InteractionResponseType.DeferredMessageUpdate in discord-api-types).
-          // The host edits
-          // the card the row names, once the click is bound and authorized.
+          // Approval cards are never edited here (see the Chat SDK path): acknowledge with type 6
+          // (DEFERRED_UPDATE_MESSAGE) and let the host edit the card once the click is bound and authorized.
           try {
             await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
               method: 'POST',
@@ -2246,11 +1953,11 @@ export async function handleForwardedEvent(
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
+              type: 7, // UPDATE_MESSAGE: acknowledge and update in one call.
               data: {
                 content: resolvedContent,
                 embeds: [],
-                components: [], // remove buttons
+                components: [],
                 allowed_mentions: { parse: [] },
               },
             }),
@@ -2259,7 +1966,6 @@ export async function handleForwardedEvent(
           log.error('Failed to update interaction', { err });
         }
 
-        // Dispatch to host
         setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId);
         return;
       }

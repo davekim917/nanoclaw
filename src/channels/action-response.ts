@@ -1,25 +1,14 @@
 /**
- * A card click, as the host turns it into a response payload.
- *
- * The channel seam hands a click to `ChannelSetup.onAction` as four values
- * (adapter.ts): the question id baked into the button, the chosen value,
- * the clicker, and the platform id of the message the click was made on. This
- * is the one place they become a `ResponsePayload`, so every adapter's clicks
- * reach the handlers behind `dispatch` in the same shape.
- *
- * It lives here rather than inline in main.ts so a test can exercise the real
- * construction instead of rebuilding it. A test that supplies its own
- * `messageId` proves nothing about production: `messageId` is optional on the
- * payload, so dropping it here would still compile and still leave such a test
- * green, while every genuine click lost the binding the approvals handler
- * refuses without (modules/approvals/response-handler.ts). Exercised by
- * src/modules/approvals/click-binding.test.ts.
+ * The one place a card click (question id, chosen value, clicker, clicked message id) becomes a `ResponsePayload`, so
+ * every adapter's clicks reach `dispatch` in the same shape. A real function so tests exercise the production
+ * construction: `messageId` is optional on the payload, so dropping it here would compile and pass a hand-built test
+ * while every real click lost the binding the approvals handler requires (see
+ * src/modules/approvals/click-binding.test.ts).
  */
 import { log } from '../log.js';
 import type { ResponsePayload } from '../response-registry.js';
 import type { ChannelSetup } from './adapter.js';
 
-/** The four values a click carries, as one payload. */
 function actionResponsePayload(
   channelType: string,
   questionId: string,
@@ -32,17 +21,15 @@ function actionResponsePayload(
     value: selectedOption,
     userId,
     channelType,
-    // platformId/threadId aren't surfaced by the current onAction signature —
-    // registered handlers look them up from the pending_question /
-    // pending_approval row.
+    // Not surfaced by the onAction signature; handlers look them up from the pending_question / pending_approval row.
     platformId: '',
     threadId: null,
-    // The clicked message, which approvals bind the click to.
+    // Approvals bind the click to this message.
     messageId,
   };
 }
 
-/** `ChannelSetup.onAction` for one channel type: build the payload, dispatch it, never throw at the adapter. */
+/** Builds the payload and dispatches it; never throws at the adapter. */
 export function makeOnAction(
   channelType: string,
   dispatch: (payload: ResponsePayload) => Promise<void>,

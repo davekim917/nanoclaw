@@ -7,23 +7,11 @@ import { log } from '../log.js';
 const MONITOR_INTERVAL_MS = 1_000;
 const EVENT_LOOP_STALL_THRESHOLD_MS = 5_000;
 
-// Stall-triggered catch-up is an amplifier when unthrottled: each pass fans
-// out REST scans across every adapter, whose response decompression alone can
-// stall the loop past the 5s threshold and trigger the next pass (observed
-// live 2026-08-05: 30-42 passes/min, ~40% of host CPU in zlib/brotli, self-
-// sustaining for hours after the original load spike ended). Rules:
-//   - At most one stall-triggered fleet pass per cooldown window. Stalls
-//     inside the window coalesce their `since` (earliest wins) into one
-//     deferred pass when the window expires — the gap is still recovered,
-//     just batched, so coverage is delayed rather than lost.
-//   - Stall passes scan a bounded target set: thread expansion only for
-//     sessions active within the horizon. A stall gap is seconds long; a
-//     thread quiet for 48h+ almost never has a message land inside one, and
-//     scanning every thread ever created (403 observed) is what made passes
-//     expensive enough to self-sustain. Roots are never bounded (they are
-//     ≤ the wired-group count and catch first messages in quiet channels),
-//     and transport-resumed / host-startup passes keep the full set — those
-//     cover long gaps where a stale thread plausibly heard something.
+// Unthrottled stall-triggered catch-up self-sustains: each pass's REST scans (and their decompression) can stall the
+// loop long enough to trigger the next. So at most one stall pass runs per cooldown window, with stalls inside the
+// window coalesced (earliest `since` wins) into one deferred pass, and stall passes expand threads only for sessions
+// active within the horizon. Roots are never bounded, and transport-resumed and host-startup passes keep the full
+// set, since those cover long gaps.
 export const STALL_RECOVERY_COOLDOWN_MS = 5 * 60_000;
 export const STALL_TARGET_ACTIVITY_HORIZON_MS = 48 * 60 * 60_000;
 
@@ -32,14 +20,10 @@ interface RecoveryDrain {
   promise: Promise<void>;
 }
 
-// Transient-failure retries back off to a 15-minute ceiling and park after
-// 8 consecutive failed passes instead of hammering forever (observed live:
-// a permanently-failing pass retried every 60s for 10 days, refetching the
-// whole recovery window each time). Parked adapters resume on the next
-// transport-level trigger (transport-ready/resumed, host-startup) — those
-// clear the breaker; stall-triggered recovery does NOT, so a recovery storm
-// cannot un-park itself. Dropping the in-memory `since` on un-park is safe:
-// the durable gap floor (chat_sdk_kv) re-applies it inside the bridge.
+// Transient failures back off to a 15-minute ceiling and park after 8 consecutive failed passes. Only transport-level
+// triggers (ready/resumed, host-startup) un-park an adapter; stall-triggered recovery does not, so a recovery storm
+// cannot un-park itself. Dropping the in-memory `since` on un-park is safe: the bridge re-applies the durable gap
+// floor.
 const RECOVERY_RETRY_MAX_DELAY_MS = 15 * 60_000;
 const RECOVERY_PARK_AFTER_ATTEMPTS = 8;
 
@@ -121,11 +105,9 @@ function scheduleRecoveryRetry(adapter: ChannelAdapter, info: ChannelConnectionR
 }
 
 /**
- * Build a bounded recovery set. Adapters with platform-native thread
- * discovery receive roots only; all others receive roots plus known threads.
- * When `activeSinceMs` is set (stall-triggered passes), thread expansion only
- * includes sessions with activity at or after it; sessions with no parseable
- * activity timestamp are included (fail-open — never silently drop coverage).
+ * Adapters with native thread discovery get roots only; others get roots plus known threads. With `activeSinceMs`,
+ * thread expansion only includes sessions active since then; sessions with no parseable activity are included
+ * (fail-open).
  */
 export async function getChannelRecoveryTargets(
   adapter: ChannelAdapter,
@@ -228,7 +210,6 @@ let lastStallPassStartedAtMs = 0;
 let pendingStallSinceMs: number | null = null;
 let pendingStallTimer: NodeJS.Timeout | null = null;
 
-/** Test seam: clear the fleet-wide stall-recovery cooldown state. */
 export function _resetStallRecoveryCooldownForTesting(): void {
   lastStallPassStartedAtMs = 0;
   pendingStallSinceMs = null;
@@ -240,8 +221,7 @@ export function recoverAllChannelsAfterStall(sinceMs: number): void {
   const now = Date.now();
   const elapsed = now - lastStallPassStartedAtMs;
   if (elapsed < STALL_RECOVERY_COOLDOWN_MS) {
-    // Inside the cooldown: coalesce this stall's gap into one deferred pass
-    // (earliest `since` wins) instead of dropping it or firing immediately.
+    // Coalesce into one deferred pass rather than dropping the gap or firing now.
     pendingStallSinceMs = Math.min(pendingStallSinceMs ?? sinceMs, sinceMs);
     if (!pendingStallTimer) {
       pendingStallTimer = setTimeout(() => {
@@ -261,7 +241,6 @@ export function recoverAllChannelsAfterStall(sinceMs: number): void {
   }
 }
 
-/** Catch up every capable adapter after host downtime, including webhooks. */
 export async function recoverAllChannelsAfterStartup(sinceMs: number): Promise<void> {
   const since = new Date(sinceMs).toISOString();
   await Promise.all(

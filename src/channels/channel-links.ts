@@ -1,15 +1,7 @@
 /**
- * Outbound `#channel-name` → link, for channels this install is wired into.
- *
- * Agents refer to channels as `#name` (inbound channel mentions reach them in
- * that form). Left as text, the reader has to go find the channel; this turns
- * a name the install knows into a real link: a Slack channel permalink in
- * markdown-link form, or Discord's native `<#id>` mention. Only exact, unique
- * names become links — an unknown or ambiguous name stays plain text.
- *
- * The directory is the central DB's messaging_groups, read asynchronously and
- * cached; the outbound transforms are synchronous, so a stale cache triggers a
- * background refresh and this call uses what is loaded.
+ * Outbound `#channel-name` → link, for channels this install is wired into: a Slack permalink in markdown-link form,
+ * or Discord's native `<#id>`. Only exact, unique names are linked. The directory is cached from messaging_groups;
+ * the transforms are synchronous, so a stale cache triggers a background refresh and the call uses what is loaded.
  */
 import { getAllMessagingGroups } from '../db/messaging-groups.js';
 import { log } from '../log.js';
@@ -49,11 +41,7 @@ function refreshChannelDirectory(): Promise<void> {
   return loading;
 }
 
-/**
- * Load the directory as an adapter comes up, so the first outbound message
- * after a restart is linked too — the transforms are synchronous and only
- * trigger a refresh, they never wait for one.
- */
+/** Load at adapter start so the first outbound message after a restart is linked too. */
 export function warmChannelDirectory(): void {
   void refreshChannelDirectory();
 }
@@ -68,10 +56,8 @@ function normalizeName(name: string): string {
 }
 
 /**
- * Markdown links, angle-bracket entities and bare URLs are consumed whole and
- * returned untouched, so a `#` inside them is never rewritten. A channel
- * reference is `#` + a name that starts with a letter or digit and is not
- * glued to a preceding word (`APP#<n>`), path or URL fragment.
+ * Markdown links, angle-bracket entities and bare URLs are consumed whole so a `#` inside them is never rewritten. A
+ * reference is `#` plus a name starting with a letter or digit, not glued to a preceding word, path or URL fragment.
  */
 const TOKEN_RE =
   /\[[^\]\n]*\]\([^)\s]*\)|<[^>\n]*>|https?:\/\/[^\s)>\]]+|(?<![\w/:=?&#-])#([a-z0-9][a-z0-9_-]*)(?![\w-])/giu;
@@ -85,7 +71,6 @@ function linkChannelNames(text: string, resolve: (name: string) => string | null
   );
 }
 
-/** One platform id for the name, or null when unknown or ambiguous. */
 function uniquePlatformId(candidates: KnownChannel[], name: string): string | null {
   const ids = new Set(candidates.filter((c) => c.name === name).map((c) => c.platformId));
   return ids.size === 1 ? [...ids][0] : null;
@@ -101,7 +86,7 @@ export function linkSlackChannelNames(
   const bots = getKnownSlackBots();
   const teamId = bots.get(currentChannelType)?.teamId;
   if (!teamId) return text;
-  // Public/private channels only (C…/G…) — DMs have no channel page to link.
+  // Public/private channels only (C…/G…); DMs have no channel page.
   const inWorkspace = channels.filter(
     (c) => bots.get(c.channelType)?.teamId === teamId && /^slack:[CG][A-Z0-9]+$/.test(c.platformId),
   );
@@ -112,11 +97,7 @@ export function linkSlackChannelNames(
   });
 }
 
-/**
- * Discord: channels in the destination's guild, as the native `<#id>`
- * mention. A mention only resolves inside its own guild, so without a guild
- * destination (a DM, or no destination given) nothing is linked.
- */
+/** A `<#id>` mention only resolves inside its own guild, so nothing is linked without a guild destination. */
 export function linkDiscordChannelNames(
   text: string,
   destinationPlatformId: string | undefined,

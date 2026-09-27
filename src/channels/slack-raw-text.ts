@@ -1,22 +1,10 @@
 /**
- * Recover pasted-table content from a raw Slack event.
- *
- * Slack sends pasted tables as attachment blocks instead of message text or
- * files. The Chat SDK adapter currently leaves those blocks only in
- * `message.raw`, which the host deliberately drops before persistence.
- *
- * THE INVARIANT, and the reason this comment exists: the projection below is
- * part of the message body. Every consumer that reads a Slack message's text
- * has to consult it, not just the one that persists the body — a table can be
- * the ONLY content of a message, including the only place the bot is
- * @-mentioned. Three consumers do today:
- *
- *  - `messageToInbound` appends it to the persisted body (chat-sdk-bridge.ts);
- *  - `fetchThreadHistory` appends it to replayed thread context (same file);
- *  - `detectRecoveredMention` searches it for the bot's id (slack.ts).
- *
- * A fourth consumer that reads `.text` and skips this is a message the agent
- * silently never sees. Add it here when you add it there.
+ * Recovers pasted-table content, which Slack sends as attachment blocks and the Chat SDK leaves only in `message.raw`
+ * (dropped before persistence).
+ * INVARIANT: this projection is part of the message body. A table can be a message's only content, including the only
+ * place the bot is @-mentioned, so every consumer of Slack message text must consult it: `messageToInbound` and
+ * `fetchThreadHistory` (chat-sdk-bridge.ts) and `detectRecoveredMention` (slack.ts). A consumer that skips it
+ * silently loses messages.
  */
 
 import { TIMEZONE } from '../config.js';
@@ -29,17 +17,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Fence code content so it cannot close its own fence.
- *
- * `slackMentionOutsideCode` strips 1-, 2- and 3-or-more-backtick regions, so a
- * fence one backtick longer than the longest run INSIDE the content is always
- * stripped whole. A single backtick would not be: a cell reading
- * `` a`b <@UBOT> `` fenced with one backtick closes at the inner backtick and
- * leaves the mention as prose, which PROMOTES it — a mention-scoped agent
- * wakes on documented gate syntax someone pasted into a table.
- *
- * Content that starts or ends with a backtick is padded so its run cannot
- * merge with the fence's.
+ * Fences code with one backtick more than the longest run inside, so `slackMentionOutsideCode` strips it whole; a
+ * too-short fence closes early and PROMOTES a mention inside it to prose, waking a mention-scoped agent. Content
+ * starting or ending with a backtick is padded.
  */
 function fenceCode(text: string): string {
   const longestRun = Math.max(0, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
@@ -49,32 +29,16 @@ function fenceCode(text: string): string {
 }
 
 /**
- * Render one rich_text element node to readable text.
- *
- * Only plain runs carry their content in `text`. A mention, emoji, channel
- * reference, unlabeled link or broadcast keeps it in `user_id` / `name` /
- * `channel_id` / `url` / `range`, so a cell built from those alone would
- * project as empty — and a table of only such cells would look like nothing
- * was pasted at all.
- *
- * Mentions and channel refs are emitted in Slack's own wire form on purpose:
- * the bridge runs `transformInboundText` over the rescued text after
- * appending it, so `<@U…>` resolves to `@name` exactly like a mention typed
- * in the message body. Returns null when the node carries no readable value.
- *
- * This switch is the single owner of "how does one Slack rich_text leaf
- * read". Slack's documented leaf set is text / link / emoji / user / usergroup
- * / channel / broadcast / date / color, and all nine are handled — an
- * unhandled leaf projects as an empty cell, which is indistinguishable from
- * nothing having been pasted. Add new leaf types HERE, not at a consumer.
+ * Renders one rich_text leaf. Only plain runs carry `text`; mentions, emoji, channels, links and broadcasts keep
+ * their value elsewhere, and missing them makes a table project as empty. Mentions and channel refs are emitted in
+ * Slack's wire form so `transformInboundText` resolves them like body text. Returns null when nothing is readable.
+ * The single owner of leaf rendering: all nine documented leaf types are handled here, and new ones belong here.
  */
 function elementText(node: Record<string, unknown>): string | null {
   const str = (key: string): string | null => (typeof node[key] === 'string' ? (node[key] as string) : null);
   if (typeof node.text === 'string') {
-    // An inline code run keeps its backticks: the Slack path DEMOTES a
-    // mention that appears only inside code (slackMentionOutsideCode), and a
-    // projection that drops the delimiters would wake a mention-scoped agent
-    // off documented gate syntax pasted into a cell.
+    // An inline code run keeps its backticks: a mention only inside code is demoted, and dropping the delimiters
+    // would wake an agent off pasted gate syntax.
     const style = isRecord(node.style) ? node.style : undefined;
     return style?.code === true ? fenceCode(node.text) : node.text;
   }
@@ -109,9 +73,7 @@ function elementText(node: Record<string, unknown>): string | null {
     case 'link':
       return str('url');
     case 'date': {
-      // Slack pre-renders the human form in `fallback`; prefer it. Otherwise
-      // render the epoch in the install timezone, like every other timestamp
-      // an agent reads.
+      // Prefer Slack's pre-rendered `fallback`; otherwise render in the install timezone.
       const fallback = str('fallback');
       if (fallback) return fallback;
       const timestamp = typeof node.timestamp === 'number' ? node.timestamp : Number(str('timestamp'));
@@ -127,10 +89,8 @@ function elementText(node: Record<string, unknown>): string | null {
 }
 
 /**
- * Structural containers inside a rich_text tree. Slack's TEXT runs already
- * carry their own spacing — `**AC**ME` is two adjacent runs "AC" and "ME" —
- * so leaves are concatenated with nothing between them, and a separator is
- * inserted only when a new section, list item or quote begins.
+ * Text runs carry their own spacing (`**AC**ME` is runs "AC" and "ME"), so leaves concatenate directly and a
+ * separator is added only at a new section, list item or quote.
  */
 const RICH_TEXT_SECTIONS = new Set([
   'rich_text_section',
@@ -139,7 +99,6 @@ const RICH_TEXT_SECTIONS = new Set([
   'rich_text_preformatted',
 ]);
 
-/** Collect the readable leaves in a Slack cell's raw_text/rich_text subtree. */
 function cellText(value: unknown): string {
   let out = '';
   const visit = (node: unknown): void => {
@@ -153,15 +112,12 @@ function cellText(value: unknown): string {
     }
     const rendered = elementText(node);
     if (rendered !== null) {
-      // A rendered node is a leaf in Slack's schema (`text` and the id-bearing
-      // fields only ever appear on leaves), so its own values carry nothing
-      // further to collect.
+      // A rendered node is always a leaf in Slack's schema.
       out += rendered;
       return;
     }
     if (node.type === 'rich_text_preformatted') {
-      // A code block is fenced in the projection for the same reason an inline
-      // code run keeps its backticks — see elementText.
+      // Fenced for the same reason as inline code; see elementText.
       const start = out.length;
       Object.values(node).forEach(visit);
       const body = out.slice(start).trim();
@@ -171,14 +127,11 @@ function cellText(value: unknown): string {
     Object.values(node).forEach(visit);
   };
   visit(value);
-  // One line per cell: a cell built from a list or a preformatted block can
-  // carry newlines, which would break the `a | b` row projection.
+  // One line per cell, or newlines break the `a | b` row projection.
   return out.replace(/\s+/g, ' ').trim();
 }
 
-/** Slice without splitting a surrogate pair — an emoji rendered from its
- *  codepoints sits right on the truncation boundary often enough to matter,
- *  and half a pair is an invalid character in the persisted body. */
+/** Never splits a surrogate pair: half a pair is an invalid character in the persisted body. */
 function sliceWholeCharacters(text: string, limit: number): string {
   const cut = text.slice(0, limit);
   const last = cut.charCodeAt(cut.length - 1);
@@ -202,8 +155,7 @@ export function extractSlackRawText(raw: Record<string, unknown>): string | null
   }
 
   const text = lines.join('\n');
-  // A table whose every cell is empty carries nothing to recover — say so with
-  // null rather than handing the bridge a body of separators and blank lines.
+  // An all-empty table carries nothing to recover.
   if (text.trim() === '') return null;
   if (text.length <= MAX_TABLE_CHARS) return text;
   return `${sliceWholeCharacters(text, MAX_TABLE_CHARS - 20)}\n[table truncated]`;
