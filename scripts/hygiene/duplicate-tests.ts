@@ -24,7 +24,8 @@ const SUITE_CALLEES = new Set(['describe', 'suite']);
 const NOT_RUN = new Set(['skip', 'todo', 'fails', 'skipIf', 'runIf']);
 const HOOKS = new Set(['beforeEach', 'afterEach', 'beforeAll', 'afterAll', 'onTestFinished', 'onTestFailed']);
 const MOCKERS = new Set(['vi', 'jest', 'mock', 'expect']);
-const READS_TEST_NAME = /\b(?:currentTestName|getState|getCurrentTest)\b/;
+const READS_TEST_NAME = /\b(?:currentTestName|getState|getCurrentTest|aroundEach|aroundAll)\b/;
+const TEST_MODULE = /^(?:vitest|bun:test|@jest\/globals|@vitest\/.*)$/;
 const ASSERTION = /^(?:expect|assert\w*)$/;
 
 interface Callee {
@@ -255,10 +256,41 @@ function isSuiteOrCase(statement: ts.Statement): boolean {
   return !!callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
 }
 
+function readsContext(fn: ts.Node): boolean {
+  return (
+    !(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) ||
+    fn.parameters.length > 0 ||
+    /\barguments\b/.test(fn.body.getText())
+  );
+}
+
+function hookSeesCase(sourceFile: ts.SourceFile): boolean {
+  const sees = (node: ts.Node): boolean => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      const bindings = node.importClause?.namedBindings;
+      if (TEST_MODULE.test(node.moduleSpecifier.text) && bindings) {
+        if (ts.isNamespaceImport(bindings)) return true;
+        if (bindings.elements.some((el) => el.propertyName && HOOKS.has(el.propertyName.text))) return true;
+      }
+    }
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const name = ts.isIdentifier(callee)
+        ? callee.text
+        : ts.isPropertyAccessExpression(callee)
+          ? callee.name.text
+          : '';
+      if (HOOKS.has(name) && (!node.arguments[0] || readsContext(node.arguments[0]))) return true;
+    }
+    return ts.forEachChild(node, sees) ?? false;
+  };
+  return READS_TEST_NAME.test(sourceFile.text) || sees(sourceFile);
+}
+
 export function extractCases(file: string, text: string): TestCase[] {
   const kind = file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
   const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
-  const fileJudged = !READS_TEST_NAME.test(text);
+  const fileJudged = !hookSeesCase(sourceFile);
   const outer = new Normalizer(sourceFile);
   const setup = (level: ts.Node) =>
     (ts.isBlock(level) || ts.isSourceFile(level) ? [...level.statements] : [])
@@ -308,8 +340,10 @@ export function extractCases(file: string, text: string): TestCase[] {
         const options = node.arguments.slice(1).filter((arg) => arg !== callback && !ts.isNumericLiteral(arg));
         const takesContext = callee.table
           ? callee.modifiers.includes('for') &&
-            (callback.parameters.length > 1 || callback.parameters.some((param) => param.dotDotDotToken))
-          : callback.parameters.length > 0;
+            (callback.parameters.length > 1 ||
+              callback.parameters.some((param) => param.dotDotDotToken) ||
+              /\barguments\b/.test(callback.body.getText()))
+          : readsContext(callback);
         const judged = fileJudged && !options.length && !takesContext && plainSetup(node);
         const normalizer = new Normalizer(sourceFile, callback);
         const body = callback.body;

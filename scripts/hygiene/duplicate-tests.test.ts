@@ -208,9 +208,24 @@ it('wider', () => {
     ['an aliased hook', `import { beforeEach as setup } from 'vitest';\n${choose}setup(choose);\n`],
     ['a hook on a namespace', `${choose}v.beforeEach(choose);\n`],
     ['an around hook', `${choose}aroundEach(choose);\n`],
+    [
+      'a fixture factory',
+      `function useBackend() {\n  beforeEach(({ task }) => {\n    active = open(task.name);\n  });\n  return {};\n}\nconst backend = useBackend();\n`,
+    ],
+    [
+      'a harness constructor',
+      `class Harness {\n  constructor() {\n    beforeEach(({ task }) => {\n      active = open(task.name);\n    });\n  }\n}\nbackend = new Harness();\n`,
+    ],
+    ['a hook reading its arguments', `beforeEach(function () {\n  backend = open(arguments[0].task.name);\n});\n`],
   ])('does not judge a file whose setup can tell its cases apart through %s', (_, setup) => {
     const cases = `it('sqlite', () => {\n  expect(backend.query(1)).toEqual([1]);\n});\n`;
     expect(duplicates(setup + cases, setup + cases + cases.replace('sqlite', 'postgres'))).toEqual([]);
+  });
+
+  it('does not judge a case that reads its arguments', () => {
+    const named = (name: string) =>
+      `it('${name}', function () {\n  expect(open(arguments[0].task.name).query(1)).toEqual([1]);\n});\n`;
+    expect(duplicates(named('sqlite'), named('sqlite') + named('postgres'))).toEqual([]);
   });
 
   it('does not report duplicates already on main when a change inlines a shared callback', () => {
