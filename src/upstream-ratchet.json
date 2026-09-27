@@ -688,7 +688,7 @@
 "src/command-gate.ts":{"diff":108,"mode":"100644","sha256":"11405dbe38f9a7d19938cf81fc940f15374a5c110450678501b85540e9e58363"},
 "src/config.ts":{"diff":119,"mode":"100644","sha256":"5457593d721401118b1496e74ac0391eec1592166320ae2dead3dbefb6427dce"},
 "src/container-config-model-defaults.test.ts":{"diff":104,"mode":"100644","sha256":null,"deleted":true},
-"src/container-config.test.ts":{"diff":1072,"mode":"100644","sha256":"054e809ee0814fcf920cc2ac0a4ba87c18015936830793bc13100cab71b97d77"},
+"src/container-config.test.ts":{"diff":1072,"mode":"100644","sha256":"0a57661ac05bc5168df71d2b4f7bd97aa837820cb1ee33038a0f827034aa7f6a"},
 "src/container-config.ts":{"diff":969,"mode":"100644","sha256":"16cbb5cad9bb6c5e51bc5e743d69e4430a988b8fadb34c2d2d128e6700d822c1"},
 "src/container-restart-shadow.test.ts":{"diff":87,"mode":"100644","sha256":null,"deleted":true},
 "src/container-restart.test.ts":{"diff":979,"mode":"100644","sha256":"aa300ea379394be434e7edd4de3bd1122942f2028799f464ed3a8bba8c540001"},

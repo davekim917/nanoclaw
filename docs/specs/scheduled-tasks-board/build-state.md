@@ -70,7 +70,7 @@ list `{rows, counts, degraded, assembled_at}`; ScheduledRow fields: key, series_
 
 ## Pending integration fixes (directive sent to builder-A — do AFTER C6, before Group C complete)
 1. **MUST (spec violation):** unify the module-owner registry. assembly.ts:93-97 ships a DIVERGENT local copy (owner='mnemon' + dead mnemon-/support- prefixes) that violates plan C5 ASSERT (owner must be 'memory') and populates the user-visible badge wrong. Fix: single `moduleOwner` in scheduled-shared.ts, imported by BOTH assembly + mutations; assembly:403 → `moduleOwner(seriesId).owner ?? null`; delete assembly's local `moduleOwnerOf`/`MODULE_OWNED_PREFIXES`. (No import cycle — verified.)
-2. **SHOULD (hygiene):** scheduled-assembly.ts has 2 raw 0x00 NUL bytes (lines 287 lookup + 653 build) as the channel-name map separator — consistent so functionally green, but reads as binary to tooling. Replace with ` ` escapes.
+2. **SHOULD (hygiene):** scheduled-assembly.ts has 2 raw 0x00 NUL bytes (lines 287 lookup + 653 build) as the channel-name map separator — consistent so functionally green, but reads as binary to tooling. Replace with `\0` escapes.
 
 ## Not yet done
 - builder-A: finish C6 + the 2 integration fixes, re-run `npx vitest run src/dashboard/api/ src/host-sweep.test.ts` green.

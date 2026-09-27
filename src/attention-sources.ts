@@ -308,7 +308,7 @@ export async function readAttentionItems(
   now: number,
   env: AttentionSourceEnv = {},
 ): Promise<AttentionRead> {
-  const key = `${workgroupId} ${env.groupsRoot ?? ''} ${env.claimsRoot ?? ''}`;
+  const key = `${workgroupId}\0${env.groupsRoot ?? ''}\0${env.claimsRoot ?? ''}`;
   const cached = memo.get(key);
   if (cached && now - cached.at < ATTENTION_MEMO_TTL_MS && now >= cached.at) return cached.read;
 

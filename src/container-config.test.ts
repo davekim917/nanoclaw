@@ -629,7 +629,7 @@ describe('parseMcpServerConfig', () => {
       }),
     ).toThrow(/control character/);
     expect(() =>
-      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'onecli-managed ' } }),
+      parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { Authorization: 'onecli-managed\0' } }),
     ).toThrow(/control character/);
     // A plain tab is not rejected — only CR/LF/NUL and other C0 controls are.
     expect(parseMcpServerConfig({ url: 'https://example.com/mcp', headers: { 'User-Agent': 'a\tb' } })).toMatchObject({
