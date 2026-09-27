@@ -1,45 +1,25 @@
 /**
- * Spawn-time provider selection.
- *
- * When a group's primary provider is inside a recorded unavailability window
- * (see `db/provider-health.ts`) and the group declares a `providerFallback`,
- * the spawn routes to the fallback instead of waking a container that can only
- * fail. The window expires on its own, so the next spawn returns to the
- * primary with no cron, probe, or operator action.
- *
- * Two rules this must respect, both learned the hard way:
- *
- * 1. `session.agent_provider` shadows `container.json` in
- *    `resolveProviderName`, so the fallback has to be applied AFTER normal
- *    resolution — overriding the file alone leaves a stamped session on the
- *    dead provider.
- * 2. The container reads its own provider from the bind-mounted
- *    `container.json`, which the host does not rewrite per spawn. The
- *    decision must therefore travel as env (`NANOCLAW_PROVIDER_OVERRIDE`,
- *    `NANOCLAW_MODEL_OVERRIDE`), mirroring how the assistant name already
- *    beats the file.
+ * Spawn-time provider selection: while the primary is in a recorded unavailability window and the group declares
+ * `providerFallback`, spawn the fallback; the window expires on its own. Applied AFTER normal resolution
+ * (`session.agent_provider` shadows container.json), and carried as env (`NANOCLAW_PROVIDER_OVERRIDE`,
+ * `NANOCLAW_MODEL_OVERRIDE`) because the container reads its provider from a container.json the host does not
+ * rewrite per spawn.
  */
 import type { ContainerConfig } from './container-config.js';
 import { isProviderUnavailable } from './db/provider-health.js';
 import { resolveProviderName } from './db/container-configs.js';
 
 export interface SpawnProviderDecision {
-  /** Provider the container should actually run. */
   provider: string;
-  /** Model/effort to force, when the fallback declares them. */
   model?: string;
   effort?: string;
-  /** The provider that would have run had it been available. */
   primaryProvider: string;
   fallbackApplied: boolean;
 }
 
 /**
- * Apply the runtime portion of a provider-fallback decision to the mutable
- * spawn config. Identity, filesystem, tools, tone and standing instructions
- * deliberately remain on the same group; all model/effort layers belong to
- * the source provider and must be removed before the target resolves its own
- * native defaults.
+ * Identity, filesystem, tools, tone and instructions stay with the group; every model/effort layer belongs to the
+ * source provider and is removed so the target resolves its own defaults.
  */
 export function applyProviderFallbackRuntime(
   containerConfig: Pick<ContainerConfig, 'provider' | 'model' | 'effort' | 'defaultModel' | 'defaultEffort'>,
@@ -52,11 +32,7 @@ export function applyProviderFallbackRuntime(
   containerConfig.defaultEffort = undefined;
 }
 
-/**
- * Environment bridge for the runner's immutable container.json. The marker
- * is independent of the provider value because the target can equal the
- * group's file provider when a session-level primary is different.
- */
+/** A marker separate from the provider: the target can equal the file provider when the session's differs. */
 export function providerFallbackRuntimeEnv(
   decision: Pick<SpawnProviderDecision, 'provider' | 'model'>,
 ): Record<string, string> {
@@ -77,9 +53,7 @@ export async function resolveSpawnProvider(options: {
   const primaryProvider = resolveProviderName(sessionProvider ?? null, containerConfig.provider);
   const fallback = containerConfig.providerFallback;
 
-  // No declaration means an outage stays loud. Silently rerouting a group
-  // that never asked for it would change which model answers a user with no
-  // trace anywhere.
+  // No declaration: the outage stays loud rather than silently changing which model answers.
   if (!fallback?.provider) {
     return { provider: primaryProvider, primaryProvider, fallbackApplied: false };
   }
@@ -91,8 +65,7 @@ export async function resolveSpawnProvider(options: {
   if (!(await isProviderUnavailable(agentGroupId, primaryProvider, { nowMs }))) {
     return { provider: primaryProvider, primaryProvider, fallbackApplied: false };
   }
-  // Never bounce onto a fallback that is itself in cooldown — running the
-  // primary and failing is more honest than thrashing between dead providers.
+  // Never onto a fallback in cooldown: failing on the primary beats thrashing between dead providers.
   if (await isProviderUnavailable(agentGroupId, fallbackProvider, { nowMs })) {
     return { provider: primaryProvider, primaryProvider, fallbackApplied: false };
   }

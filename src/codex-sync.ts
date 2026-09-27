@@ -1,12 +1,4 @@
-/**
- * Reusable Codex-sync functions.
- *
- * Both the host-side CLI scripts (`scripts/sync-codex-*.ts`) and the
- * watcher daemon (`src/codex-sync-watcher.ts`) call these. Splitting them
- * out of the CLI shims lets the watcher run sync in-process — every
- * spawned `pnpm exec tsx` adds ~1s and ~200MB Node startup, which is
- * unacceptable when the daemon may fire many times per day.
- */
+/** Codex-sync functions shared by the `scripts/sync-codex-*.ts` CLIs and the in-process watcher daemon. */
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -35,18 +27,10 @@ export interface AgentsMdSyncResult {
   target: string;
   bytes: number;
   lines: number;
-  /** True when the new content differs from the old (write happened). */
   changed: boolean;
 }
 
-/**
- * Regenerate `~/.codex/AGENTS.md` from `~/.claude/CLAUDE.md`.
- *
- * - Flattens every `@path` include inline (Codex doesn't expand them).
- * - Prepends the peer-framing header so Codex knows it's working alongside Claude.
- * - Atomic write via tmp+rename.
- * - Skips the write if content is byte-identical to the existing file (idempotent on rerun).
- */
+/** Regenerate `~/.codex/AGENTS.md` from `~/.claude/CLAUDE.md`, flattening `@path` includes Codex does not expand. */
 export function syncCodexAgentsMd(): AgentsMdSyncResult {
   const claudeMd = path.join(os.homedir(), '.claude', 'CLAUDE.md');
   if (!fs.existsSync(claudeMd)) {
@@ -55,12 +39,8 @@ export function syncCodexAgentsMd(): AgentsMdSyncResult {
 
   const flattened = flattenClaudeMd(claudeMd);
   const output = CODEX_PEER_HEADER + flattened;
-  // The host Codex CLI does NOT receive the container `-c project_doc_max_bytes`
-  // override (codex-app-server.ts) — it truncates at Codex's own built-in
-  // default. Write uncapped and warn; if this fires, set
-  // `project_doc_max_bytes` in ~/.codex/config.toml. Don't auto-edit that file
-  // here — the codex-sync-watcher reads it as input, so writing it from here
-  // risks a loop.
+  // The host Codex CLI gets no container `project_doc_max_bytes` override, so warn rather than cap. Never edit
+  // ~/.codex/config.toml from here: the watcher reads it as input, so writing it risks a loop.
   warnIfOversized(
     '~/.codex/AGENTS.md (host codex truncates at its own default; set project_doc_max_bytes in ~/.codex/config.toml)',
     output,
@@ -87,47 +67,23 @@ export function syncCodexAgentsMd(): AgentsMdSyncResult {
   return { target, bytes: output.length, lines: output.split('\n').length, changed: true };
 }
 
-// NOTE: `syncCodexPluginSkills()` (the host `~/.agents/skills` plugin-skill mirror)
-// was deleted. Codex loads ~/plugins natively via its own marketplace/plugin cache —
-// skills namespaced `<plugin>:<skill>` WITH each plugin's MCP server — so mirroring
-// plugin skills into a skills dir both duplicated them and stripped their MCP. Host
-// CLI plugin state is the operator's to manage; containers build their own skill set
-// at spawn (container/agent-runner/src/codex-companion-setup.ts), and that path now
-// mirrors container-bundled skills only for codex.
+// No host plugin-skill mirror: Codex loads ~/plugins natively with each plugin's MCP server, and a mirror would
+// duplicate the skills and strip their MCP.
 
 export interface SubagentsSyncResult {
-  /** Every Codex agents/ dir we wrote into (global + per-group siblings). */
   targets: string[];
-  /** Distinct Claude `.md` subagents found at the source. */
   discovered: number;
-  /** Per-target file write counts, summed across every target. A 6-agent
-   * sync across 2 targets where everything was newly populated reports 12
-   * writes; a subsequent idempotent re-run reports 0. */
   writes: number;
-  /** Per-target file unchanged counts, summed. */
   unchangedFiles: number;
-  /** Per-target file removals, summed (stale managed TOMLs cleaned up). */
   removedFiles: number;
-  /** Agent names that had unmanaged TOMLs in at least one target — skipped
-   * everywhere they collided. */
+  /** Names with an unmanaged TOML in at least one target; skipped wherever they collided. */
   skipped: string[];
 }
 
 /**
- * Walk every plugin agents/ dir and `~/.claude/agents/` (Claude personal scope)
- * and emit a Codex TOML for each `<name>.md`. Output written to BOTH
- * `~/.codex/agents/` (global default) AND every `~/.codex-<folder>/agents/`
- * that has an `auth.json` (per-group sibling codex accounts, e.g. example-labs-codex,
- * example-retail-codex). Per-group siblings mount their own `~/.codex-<folder>/`
- * into the container instead of the global `~/.codex/`, so the global write
- * alone wouldn't reach them.
- *
- * Idempotent. Files this sync wrote carry the `# managed by nanoclaw codex-sync`
- * marker; pre-existing TOMLs without it are left alone (manually-authored
- * subagents survive). Source-removed agents have their managed TOML cleaned up.
- *
- * Run by the sync watcher daemon on any `agents/*.md` change and by the
- * one-shot `pnpm exec tsx scripts/sync-codex-subagents.ts` script.
+ * Emit a Codex TOML for each plugin and `~/.claude/agents/` subagent into every target of
+ * discoverCodexAgentTargets. Only files carrying the managed marker are overwritten or pruned; hand-written TOMLs
+ * survive.
  */
 export function syncCodexSubagents(): SubagentsSyncResult {
   const sources = discoverClaudeSubagents();
@@ -183,15 +139,8 @@ export interface CodexLocalMarketplacePluginCacheSyncResult {
 }
 
 /**
- * Materialize enabled Codex marketplace plugins into Codex's installed
- * plugin cache.
- *
- * `codex plugin marketplace add ...` records the marketplace source, but active
- * prompt assembly reads enabled plugin skills from
- * `~/.codex/plugins/cache/<marketplace>/<plugin>/<install-id>/`. The TUI can
- * install plugins into that cache; host-managed automation needs the same
- * cache shape so version bumps and skill edits are visible to Codex and to
- * mounted container runtimes.
+ * Materialize enabled Codex marketplace plugins into `~/.codex/plugins/cache/<marketplace>/<plugin>/<install-id>/`:
+ * `marketplace add` only records the source, but prompt assembly reads skills from the cache.
  */
 export function syncCodexLocalMarketplacePluginCache(): CodexLocalMarketplacePluginCacheSyncResult {
   const home = os.homedir();
@@ -383,21 +332,9 @@ function syncOneCodexAgentsDir(target: string, sources: DiscoveredSubagent[]): O
 }
 
 /**
- * Find every Codex agents/ output directory:
- *
- * - the global `~/.codex/agents/` (the HOST codex CLI's roster);
- * - `~/.codex-<folder>/agents/` for every per-group sibling dir that has an
- *   `auth.json` (host-CLI convenience for scoped logins);
- * - `groups/<folder>/.codex/agents/` for EVERY group. Codex host auth is no
- *   longer a per-group grant, so every group can run codex — as its provider
- *   or as a peer — and every group needs the roster. This is the GROUP-OWNED
- *   dir containers actually read: the codex provider mounts it RO at
- *   /home/node/.codex/agents, and codex-companion-setup symlinks it into the
- *   peer runtime home. There is no host-dir fallback.
- *
- *   A readable `container.json` is still what makes a directory a group. The
- *   filter it used to carry (provider=codex or codexHostAuth=true) is gone;
- *   the existence check is not.
+ * Codex agents/ output dirs: the global `~/.codex/agents/`, `~/.codex-<folder>/agents/` for each sibling with an
+ * `auth.json`, and `groups/<folder>/.codex/agents/` for every group with a readable `container.json` (the dir
+ * containers actually read: mounted RO at /home/node/.codex/agents; there is no host-dir fallback).
  */
 export function discoverCodexAgentTargets(groupsDir: string = GROUPS_DIR): string[] {
   const home = os.homedir();

@@ -7,7 +7,7 @@
 # stays BLOCKED, a stale-generation receipt never counts toward the current
 # baseline, and `finish` (and the evidence barrier) refuse until every lane
 # the contract declared at the re-freeze has been redispatched after it
-# (issue #731, F3). Contracts and redispatches go through the real
+# (F3). Contracts and redispatches go through the real
 # smoke-run-scaffold.sh verbs, so the snapshot is tested against its field.
 set -euo pipefail
 
@@ -365,7 +365,7 @@ expect_rc "$(run finish "$RUN15")" 2 bypass-restored-refuses-for-the-real-reason
 out | grep -Fq 'not redispatched since the pair re-freeze: A, B;' || \
   fail "bypass-restored-refuses-for-the-real-reason: expected the ordinary un-redispatched refusal after restoring the real snapshot"
 
-# --- 5i. A LATE freeze does not launder evidence gathered before it (XZO #2092)
+# --- 5i. A LATE freeze does not launder evidence gathered before it
 # The laundering sequence: lanes run and write markers with no pair frozen;
 # `start` then freezes whatever is live NOW and one ok `check` follows. Before,
 # that cleared finish and the barrier, so markers bound to no build supported a
@@ -543,5 +543,42 @@ serve_pair 92 "$SRC_SHA2" "$SRC_SHA2"; expect_rc "$(run refreeze "$R8" "new buil
 # 8h. A develop contract binds no source: a split pair is accepted in either order.
 run8; serve_pair 93 "$A" "$B"; pr_contract "$R8" "$SRC_SHA" develop; expect_rc "$(run start "$R8")" 0 m8h-start; expect_accept "$R8" m8h
 run8; serve_pair 94 "$A" "$B"; expect_rc "$(run start "$R8")" 0 m8h2-start; pr_contract "$R8" "$SRC_SHA" develop; expect_accept "$R8" m8h2
+
+# --- 9. static provider: identity is the commit each preview serves --------
+# The two ids are the previews' URLs; a curl shim serves each host's /version
+# from $T/served/<host>. No Render call and no RENDER_API_KEY.
+mkdir -p "$T/shim" "$T/served"
+cat >"$T/shim/curl" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done
+echo "$url" >>"$SERVED_DIR/../curl.log"
+host="${url#*://}"; host="${host%%/*}"
+case "$url" in */version) [ -f "$SERVED_DIR/$host" ] && cat "$SERVED_DIR/$host" && exit 0 ;; esac
+exit 22
+SHIM
+chmod +x "$T/shim/curl"
+serve() { printf '{"sha":"%s"}' "$2" >"$T/served/$1"; }
+static_run() { env -u SMOKE_PAIR_FIXTURE_DIR -u RENDER_API_KEY PATH="$T/shim:$PATH" SERVED_DIR="$T/served" \
+  SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE=https://web-pr-7.acme.example \
+  SMOKE_GATE_BACKEND_SERVICE=https://api-pr-7.acme.example bash "$SCRIPT" "$@" >"$T/out" 2>"$T/err"; echo $?; }
+R9="$T/static-run"; mkdir -p "$R9"
+serve web-pr-7.acme.example "$A"; serve api-pr-7.acme.example "$A"
+expect_rc "$(static_run start "$R9")" 0 static-start
+jq -e --arg a "$A" '.frontend.service == "https://web-pr-7.acme.example" and .frontend.deploy == ("sha-" + $a)
+  and .backend.commit == $a' "$R9/coordinator/identity.json" >/dev/null || fail "static-start: identity.json shape wrong"
+expect_rc "$(static_run check "$R9" lane-a)" 0 static-check-unchanged
+serve api-pr-7.acme.example "$B"
+expect_rc "$(static_run check "$R9" moved)" 3 static-served-commit-drift
+R9B="$T/static-run-short"; mkdir -p "$R9B"; printf '{"sha":"short"}' >"$T/served/api-pr-7.acme.example"
+expect_rc "$(static_run start "$R9B")" 2 static-short-sha-refused
+R9C="$T/static-run-unsafe"; mkdir -p "$R9C"; serve api-pr-7.acme.example "$A"
+RC="$(env -u SMOKE_PAIR_FIXTURE_DIR PATH="$T/shim:$PATH" SERVED_DIR="$T/served" SMOKE_PREVIEW_PROVIDER=static \
+  SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-7.acme.example/?a=1&b=2' SMOKE_GATE_BACKEND_SERVICE=https://api-pr-7.acme.example \
+  bash "$SCRIPT" start "$R9C" >"$T/out" 2>"$T/err"; echo $?)"
+expect_rc "$RC" 2 static-unsafe-url-refused
+! grep -q 'api.render.com' "$T/curl.log" || fail "static: pair identity called Render"
+RC="$(SMOKE_PREVIEW_PROVIDER=elsewhere bash "$SCRIPT" read >"$T/out" 2>"$T/err"; echo $?)"
+expect_rc "$RC" 2 unknown-provider
+err | grep -q 'SMOKE_PREVIEW_PROVIDER' || fail "unknown-provider: message did not name the key"
 
 echo "smoke pair identity tests passed"

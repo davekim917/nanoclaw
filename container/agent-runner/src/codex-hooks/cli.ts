@@ -1,17 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Codex hook CLI entry-point. Invoked as a subprocess by the Codex
- * app-server via ~/.codex/hooks.json entries:
- *
- *   "command": "bun /app/agent-runner/codex-hooks/cli.js PreToolUse"
- *
- * Reads JSON from stdin, dispatches to the appropriate hook chain in
- * `./runner.ts`, writes the decision JSON to stdout, exits 0.
- *
- * Error policy: a malformed-stdin / unknown-event error exits 2 (Codex treats
- * exit 2 as a block). A runtime error from the hook chain FAILS CLOSED for
- * PreToolUse (emits a deny decision) and soft-continues for PostToolUse — see
- * the catch in main().
+ * Malformed stdin or an unknown event exits 2, which Codex treats as a block. A hook-chain error denies
+ * PreToolUse and soft-continues PostToolUse.
  */
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import '../modules/index.js';
@@ -41,23 +31,14 @@ async function main(): Promise<void> {
   }
 
   try {
-    // This is a separate process from the runner and the MCP server, so it
-    // registers and starts the mailbox itself. The email gate reaches
-    // getSessionRouting/writeMessageOut/awaitDeliveryAck through it, and an
-    // unregistered mailbox would throw into the fail-closed catch below —
-    // denying every gated Codex command instead of raising the approval card.
+    // Separate process from the runner: without its own mailbox the email gate throws, denying every gated command.
     await getAgentMailbox().start(await readMailboxContext());
     const result = await runHookForCodex(eventArg as HookEvent, input);
     process.stdout.write(JSON.stringify(result));
   } catch (err) {
     process.stderr.write(`[codex-hook] runtime error in ${eventArg}: ${err instanceof Error ? err.message : String(err)}\n`);
-    // Fail CLOSED for PreToolUse (C4): a guard chain that throws must DENY the
-    // tool, never silently allow it. A bare `{continue:true}` here is fail-OPEN
-    // — Codex treats continue:true + exit 0 as "run the tool", so a thrown guard
-    // exception (a malformed core verdict, or an approval-DB failure in the email
-    // gate) would let a gated destructive/email action proceed unguarded.
-    // PostToolUse is advisory (the tool already ran) → keep it soft so a
-    // post-hook error doesn't wedge the session.
+    // Fail closed: Codex runs the tool on continue:true + exit 0, so a throwing PreToolUse guard must deny.
+    // PostToolUse is advisory (the tool already ran), so it stays soft rather than wedging the session.
     if (eventArg === 'PreToolUse') {
       process.stdout.write(
         JSON.stringify({
@@ -71,7 +52,6 @@ async function main(): Promise<void> {
       );
       process.exit(0);
     }
-    // Soft fail for PostToolUse only.
     process.stdout.write(JSON.stringify({ continue: true }));
     process.exit(0);
   }

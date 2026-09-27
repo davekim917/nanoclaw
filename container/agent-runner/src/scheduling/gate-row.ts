@@ -1,24 +1,13 @@
 /**
- * The runner's half of the scheduled-task gate lane: one outbound row per
- * pre-task script execution, written BEFORE the occurrence is acked or handed
- * to the agent. The host judges and records it; this side only forwards what
- * the script produced.
- *
- * `in_reply_to` stays null: the host sweep completes a pending row that any
- * non-status outbound row answers, which would settle the occurrence before its
- * ack. No `auto` flag either, so a host without the gate lane treats the row as
- * a run-log note and never as a turn outcome.
+ * One outbound gate row per pre-task script execution, written BEFORE the occurrence is acked. `in_reply_to` stays
+ * null (any answering row would settle the occurrence before its ack), and no `auto` flag, so a host without the
+ * gate lane treats it as a run-log note.
  */
 import { randomUUID } from 'node:crypto';
 
 import { writeMessageOut } from '../db/messages-out.js';
 
-/**
- * Write the gate row for one execution: its parsed result, or `failure` when
- * there is none. Returns false when the row could not be written; the caller
- * then leaves the occurrence unacked so it runs again, rather than acting on a
- * result the host never saw.
- */
+/** false = not written; the caller leaves the occurrence unacked so it reruns. */
 export async function writeGateRow(
   occurrenceId: string,
   result: { wakeAgent: boolean; observation?: unknown } | null,

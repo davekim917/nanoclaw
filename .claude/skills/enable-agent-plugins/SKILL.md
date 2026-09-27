@@ -119,14 +119,14 @@ next spawn, and the enabler run is just a verification pass.
    > nothing is lost. Do **not** just delete the `skill/` dir: it can also hold skills
    > installed by hand or natively, which `syncSkillSymlinks` deliberately keeps
    > (`fs.rmSync` runs only behind an `isManagedMirror(entryPath)` gate,
-   > `src/plugin-skill-discovery.ts:465`). That protection covers **directories only**:
+   > `src/plugin-skill-discovery.ts:432-433`). That protection covers **directories only**:
    > an undesired top-level *symlink* is `unlinkSync`ed unconditionally, before the
-   > managed check is ever reached (`:459-463`), so a skill you installed as a symlink
+   > managed check is ever reached (`:426-428`), so a skill you installed as a symlink
    > is removed by any full re-sync. Materialize such a skill as a real directory, or
    > keep it outside the mirror, before syncing. If you do want the global fallback, move the dir aside and migrate
    > the non-managed entries. Identify them by the marker, not by their contents:
    > `isManagedMirror` returns `entries.includes('.nanoclaw-managed')`
-   > (`src/plugin-skill-discovery.ts:545`), and an empty dir also counts as managed.
+   > (`src/plugin-skill-discovery.ts:576`), and an empty dir also counts as managed.
    > A managed mirror holds real files — `SKILL.md` is copied, not linked, because
    > Codex auto-discovery skips symlinked `SKILL.md` — so "all children are symlinks"
    > is not the test and would misclassify in both directions:

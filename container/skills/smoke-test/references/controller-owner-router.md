@@ -45,12 +45,12 @@ to the retained technical owner, verify its artifact receipt, and stop.
    writer, pass `SMOKE_GATE_OWNER=<coordinatorOwnerToken>` from
    `<run>/controller/wake.json` — **re-read that file on every wake, not once
    at intake.** `smoke-pr-gate.sh poll` mints a fresh owner token on every
-   same-SHA recovery (`smoke-pr-gate.sh:5475`, written to the lease at `:5504`,
-   the PR authority at `:5509` and the gate state at `:5554`), so the token you
+   same-SHA recovery (`smoke-pr-gate.sh:5567`, written to the lease at `:5596`,
+   the PR authority at `:5601` and the gate state at `:5646`), so the token you
    started with is then retired. The controller refreshes `wake.json` with
-   every brief it writes (`smoke-campaign-controller.py:1526-1528`, in
+   every brief it writes (`smoke-campaign-controller.py:1529-1531`, in
    `_owner_wake` at `:1451`), which is why the file is current and your own
-   copy of its value is not (XZO #2046).
+   copy of its value is not.
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
      mid-step: the controller saw the step's `briefedToken` differ from the
      token the gate holds and re-offered it
@@ -65,14 +65,14 @@ to the retained technical owner, verify its artifact receipt, and stop.
      impersonation, not adoption.
    - Your ack does not carry over. Writing a brief removes
      `<run>/controller/brief-<step>.ack`
-     (`smoke-campaign-controller.py:1515-1525`), so a re-offered step needs a
+     (`smoke-campaign-controller.py:1518-1528`), so a re-offered step needs a
      fresh ack as its first act, exactly like any other wake.
 4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
    before you start and again before you stop. The controller rewrites it every
    fire from the real `smoke-evidence-barrier.sh` and deletes it once the phase
    passes. `invalid[]` is artifact CONTENT the barrier rejects — yours to
    repair, and no amount of lane work clears it; `missing[]` is what is not
-   written yet. A phase never passes while `invalid[]` is non-empty (XZO #2047).
+   written yet. A phase never passes while `invalid[]` is non-empty.
    - **You will be woken again if that refusal changes while you hold the
      step**, including after you have acked the brief: the controller compares
      the current `invalid[]`+`invalidReasons[]` against the ones your brief was

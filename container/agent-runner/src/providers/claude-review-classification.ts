@@ -32,7 +32,6 @@ export function isPreInferenceCredentialFailure(stdout: string): boolean {
   return QUOTA_RESULT_RE.test(record.result) || SUBSCRIPTION_BLOCKED_RE.test(record.result);
 }
 
-/** Undefined is fine; any supplied numeric usage counter must be zero. */
 function allNumbersZero(value: unknown, depth = 0): boolean {
   if (value === undefined || value === null) return true;
   if (depth > 5) return false;

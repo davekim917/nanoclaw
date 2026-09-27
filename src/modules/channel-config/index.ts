@@ -59,9 +59,10 @@ type ParsedChannelValue = { value?: string | null; error?: string };
 
 /**
  * Codex values go through the chat-flag vocabulary (dot forms normalize,
- * family names stay as typed so the wiring follows the next release). Effort
- * is validated for every provider so `max`/`ultra` can't reach a Claude or
- * OpenCode wiring by accident.
+ * family names stay as typed so the wiring follows the next release); other
+ * providers' model strings pass through for forward-compatible SDK ids. Effort
+ * is validated against each provider's vocabulary, so a Codex-only level like
+ * `ultra` can't reach a Claude or OpenCode wiring.
  */
 function parseChannelModel(model: string, provider: string): ParsedChannelValue {
   if (provider !== 'codex') return { value: model };
@@ -89,7 +90,6 @@ function parseChannelEffort(effort: string, provider: string): ParsedChannelValu
 async function handleSetChannelModel(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as ChannelConfigArgs;
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
-  // model: string = set, null = clear, anything else = reject
   const model = args.model === null ? null : typeof args.model === 'string' ? args.model : undefined;
   if (model === undefined) {
     await notifyAgent(session, 'set_channel_model failed: `model` must be a string (to pin) or null (to clear).');

@@ -1,14 +1,4 @@
-/**
- * Fork-only persistent state in outbound.db's `session_state`.
- *
- * Moved verbatim from db/session-state.ts, which is now upstream's thin compat
- * shim (continuation + in-reply-to only). Every operation here is expressed
- * over upstream's state ops so exactly one implementation of the underlying
- * SQL exists. The handful that need a transaction across keys take the
- * outbound handle from upstream's connection module — read-modify-write of a
- * single JSON row has to be atomic, and MailboxOperations exposes no
- * transaction seam.
- */
+/** Fork-only session_state ops over upstream's state ops. Multi-key read-modify-write takes the outbound handle for a transaction (MailboxOperations has no transaction seam). */
 import { randomUUID } from 'node:crypto';
 
 import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
@@ -33,22 +23,9 @@ function credentialSlotKey(providerName: string): string {
 }
 
 /**
- * The active OAuth ring slot, persisted so it survives a container respawn.
- * Rotation position otherwise lives only in provider instance state
- * (`oauthRingPos`) and resets to the primary on every fresh container — a
- * fleet that respawns constantly then burns a rejected turn and a replay on
- * every spawn before landing back on the credential that's actually healthy.
- *
- * Claude's circular `CLAUDE_CODE_OAUTH_TOKEN` ring is the ONLY writer: it
- * stores the env var NAME (e.g. `CLAUDE_CODE_OAUTH_TOKEN_2`), never the
- * credential VALUE — a pointer into config the provider already holds, not a
- * secret. Claude's forward-only `ANTHROPIC_API_KEY_N` pool deliberately does
- * not use this key (see the comment in
- * `ClaudeProvider.restorePersistedCredentialSlot`): it relies on a respawn as its reset, and
- * a persisted cursor that never wraps would turn a recoverable dead end into
- * a permanent one. Codex's ring (`CodexProvider.rotateCodexHome`) is circular
- * per turn and carries its active home in `process.env.CODEX_HOME`, so it
- * has no cursor to persist either.
+ * The active OAuth ring slot, persisted so a respawn doesn't restart at the primary and burn a rejected turn.
+ * Stores the env var NAME, never the credential. Only Claude's circular OAuth ring writes it: the forward-only
+ * API-key pool relies on a respawn as its reset, and Codex keeps its slot in CODEX_HOME.
  */
 export function getCredentialSlot(providerName: string): string | undefined {
   return getValue(credentialSlotKey(providerName));
@@ -70,12 +47,7 @@ function deleteValue(key: string): void {
   sqliteDeleteState(key);
 }
 
-/**
- * Acknowledge that the poll loop reached an admission boundary while the
- * host-owned repository ingress fence was active. The host waits for this
- * exact epoch before stopping the container, so a stale acknowledgement from
- * an earlier publication can never authorize a later mount transition.
- */
+/** The host waits for this exact epoch, so a stale ack from an earlier publication never authorizes a later mount transition. */
 export function acknowledgeRepositoryMountBarrier(epoch: string): void {
   if (!epoch) throw new Error('repository mount barrier epoch must not be empty');
   setValue(REPOSITORY_MOUNT_BARRIER_ACK_KEY, epoch);
@@ -106,13 +78,7 @@ export function advanceMemoryContextEpoch(providerName: string): number {
   })();
 }
 
-/**
- * Session-sticky model/effort overrides. Set by `-m <model>` and
- * `-e <level>` flags on an inbound message; cleared by explicit
- * `-m ''` / `-e ''`. Survives `/clear`, which resets only the provider
- * continuation and intentionally keeps user-selected runtime settings.
- * Survives container restart via session_state.
- */
+/** Session-sticky `-m`/`-e` overrides (cleared by `-m ''`/`-e ''`); survive `/clear` and container restart. */
 export function getStickyModel(): string | undefined {
   return getValue(STICKY_MODEL_KEY);
 }
@@ -137,11 +103,7 @@ export function clearStickyEffort(): void {
   deleteValue(STICKY_EFFORT_KEY);
 }
 
-/**
- * Session-sticky ultracode flag (`-e ultracode`). Stored as '1'/'0' so an
- * explicit `-e <normal-level>` can persist the off-state. Returns undefined
- * when never set (caller falls back to no ultracode). Claude-only.
- */
+/** Stored '1'/'0' so an explicit normal `-e` persists the off-state; undefined when never set. Claude-only. */
 export function getStickyUltracode(): boolean | undefined {
   const v = getValue(STICKY_ULTRACODE_KEY);
   if (v === undefined) return undefined;
@@ -287,21 +249,14 @@ export function queueWorkContinuation(task: string, sourceMessageId?: string | n
     recovery_episode: 0,
   };
   setValue(WORK_CONTINUATION_KEY, JSON.stringify(continuation));
-  // Taking on more work retracts any standing close proposal — see
-  // clearDoneProposal. Promising a next step and proposing done are
-  // contradictory statements about the same session, and the operator acts on
-  // the proposal, so the newer statement must win.
+  // Taking on more work retracts any standing done proposal: the newer statement must win.
   clearDoneProposal();
   return { accepted: true, continuation };
 }
 
 export function isWorkContinuationRunnable(continuation: WorkContinuation, _runnerId: string): boolean {
-  // A queued record with no owner is either fresh work from this runner or an
-  // attempt explicitly authorized by the stopped-container host path. Once a
-  // runner claims it, keep that claim across every pause/crash. A fresh runner
-  // may proceed only after the host counts a recovery attempt (or real inbound
-  // explicitly re-arms the work), so unrelated scheduled wakes cannot make the
-  // continuation hitchhike around the recovery throttle/cap.
+  // A runner's claim persists across pauses/crashes; a fresh runner may proceed only after the host counts a
+  // recovery attempt (or real inbound re-arms the work), so scheduled wakes can't bypass the recovery cap.
   return continuation.phase === 'queued' && continuation.runner_id === undefined;
 }
 
@@ -320,9 +275,7 @@ export function requeueWorkContinuationIfMatches(id: string, runnerId: string): 
     const current = getWorkContinuation();
     if (!current || current.id !== id || current.phase !== 'running' || current.runner_id !== runnerId) return false;
     const queued: WorkContinuation = { ...current, phase: 'queued' };
-    // Retain runner_id even below the cap. The host owns stopped-container
-    // recovery authorization and clears this claim only after counting an
-    // attempt; real inbound clears it when intentionally re-arming the work.
+    // Keep runner_id even below the cap: only the host (after counting an attempt) or real inbound clears it.
     setValue(WORK_CONTINUATION_KEY, JSON.stringify(queued));
     return true;
   })();
@@ -346,22 +299,9 @@ export function cancelWorkContinuation(): boolean {
 
 const INFRA_WARNING_KEY = 'last_infra_warning';
 
-/** Cooldown window for `shouldPostInfraWarning` — see that function's doc. */
 export const INFRA_WARNING_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
 
-/**
- * Dedupe identical infra/provider warning text (empty-response fallback,
- * retry-exhausted notices) so a flapping provider doesn't spam the channel
- * with the same notice every turn. Callers must still log unconditionally —
- * this only decides whether the text is worth posting to chat again.
- *
- * ponytail: tracks only the single most recently posted warning text + time,
- * not a per-text history. Two distinct warning types alternating within the
- * cooldown both post every time (the second overwrites the tracked slot) —
- * fine for the observed failure mode (one flapping condition repeating
- * itself verbatim); upgrade to a per-text map if overlapping warning types
- * ever need independent cooldown windows.
- */
+/** Dedupe identical infra warning text within the cooldown; tracks only the last posted text. Callers must still log unconditionally. */
 export function shouldPostInfraWarning(text: string): boolean {
   const row = sqliteGetState(INFRA_WARNING_KEY);
   if (row && row.value === text) {
@@ -372,36 +312,16 @@ export function shouldPostInfraWarning(text: string): boolean {
   return true;
 }
 
-/* ─── Primary-provider retry request ───────────────────────────────────────── */
-
 const PRIMARY_RETRY_REQUEST_KEY = 'primary_retry_requested_at';
 
 /**
- * Floor between two `provider_retry_primary` requests from one session.
- *
- * This is a LOOP BRAKE, not a nicety. The request makes the host clear the
- * group's outage window and respawn the session; if the primary is still
- * spent, that spawn fails, the outage is re-recorded, and the session lands
- * back on the fallback — where the very message that triggered the request is
- * still pending, still carrying its `flagIntent`, and would ask again. Each
- * cycle is a container start, and because the request also resets the failure
- * streak the backoff ladder never grows to damp it.
- *
- * 30 minutes is chosen against that cycle (~1-2 min), not against the user:
- * one honest attempt, then the ordinary cooldown does its job. A user who
- * genuinely waits and asks again gets a second attempt.
+ * A LOOP BRAKE: each request respawns the session; if the primary is still spent it lands back on the fallback
+ * with the same pending message, which asks again, and the request resets the backoff streak. 30 min is sized
+ * against that ~1-2 min cycle.
  */
 const PRIMARY_RETRY_REQUEST_COOLDOWN_MS = 30 * 60 * 1000;
 
-/**
- * Claim the right to ask the host for the primary provider back, at most once
- * per cooldown. Returns false when a request from this session is still
- * recent — the caller then says nothing new rather than asking again.
- *
- * Stored in `session_state`, so the claim SURVIVES the respawn the request
- * itself causes. An in-memory guard would be reset by the very restart it
- * exists to bound, which is the whole failure mode.
- */
+/** At most once per cooldown. Stored in session_state because the respawn the request causes would reset an in-memory guard. */
 export function claimPrimaryRetryRequest(nowMs = Date.now()): boolean {
   const previous = sqliteGetState(PRIMARY_RETRY_REQUEST_KEY);
   if (previous) {
@@ -414,41 +334,21 @@ export function claimPrimaryRetryRequest(nowMs = Date.now()): boolean {
   return true;
 }
 
-/**
- * Forget the claim, so a session that is demonstrably back on its primary can
- * ask again the next time it is parked. Called when a turn completes on the
- * primary — the evidence that the last request (or the clock) worked.
- */
+/** Called when a turn completes on the primary, so a later park can ask again. */
 export function clearPrimaryRetryRequest(): void {
-  // Read first: this runs on every turn of every healthy session, and a
-  // session that never asked must not author a DELETE per turn.
+  // Read first: this runs every turn, and a session that never asked must not DELETE per turn.
   if (sqliteGetState(PRIMARY_RETRY_REQUEST_KEY) === undefined) return;
   deleteValue(PRIMARY_RETRY_REQUEST_KEY);
 }
-
-/* ─── Done proposal ────────────────────────────────────────────────────────── */
 
 const DONE_PROPOSAL_KEY = 'done_proposal';
 
 export const DONE_PROPOSAL_REASON_MAX_CHARS = 500;
 
 /**
- * The agent's own "I believe this thread is finished" record.
- *
- * Stored exactly the way {@link WorkContinuation} is — one JSON row in
- * `session_state` on the container-owned outbound.db — because it is the same
- * kind of thing: a durable statement about work that has to outlive the
- * container that made it. No second store, no new table, and no outbound
- * message: proposing is not saying anything to the room.
- *
- * **Proposing is not closing.** Nothing in the runner reads this to change what
- * the agent does. The poll loop, the continuation paths and the ceiling paths
- * are all untouched by it. The host surfaces it; an operator decides.
- *
- * The timestamp is carried IN the record rather than read off
- * `session_state.updated_at`, because the host compares it against the moment
- * it asked for a wrap-up, and that comparison IS the confirmation signal — it
- * must not ride on a column any later write to this key would move.
+ * The agent's "this thread is finished" record. Proposing is NOT closing: nothing in the runner reads it; the
+ * host surfaces it and an operator decides. The timestamp lives in the record because the host compares it
+ * to its wrap-up request; it must not ride on `session_state.updated_at`.
  */
 export interface DoneProposal {
   reason: string;
@@ -470,20 +370,13 @@ export function getDoneProposal(): DoneProposal | undefined {
   }
 }
 
-/** Record (or replace) this session's close proposal. */
 export function proposeDone(reason: string): DoneProposal {
   const proposal: DoneProposal = { reason: reason.trim(), proposed_at: new Date().toISOString() };
   setValue(DONE_PROPOSAL_KEY, JSON.stringify(proposal));
   return proposal;
 }
 
-/**
- * Drop the proposal. Called when the agent takes on more work
- * ({@link queueWorkContinuation}) and when real user input arrives (poll-loop's
- * `hasRealInbound` seam) — both mean "not finished after all", and a stale
- * proposal would offer the operator a one-confirmation close over work that has
- * since restarted.
- */
+/** Dropped when the agent takes on more work or real user input arrives: a stale proposal would offer a close over restarted work. */
 export function clearDoneProposal(): boolean {
   const existed = getValue(DONE_PROPOSAL_KEY) !== undefined;
   deleteValue(DONE_PROPOSAL_KEY);

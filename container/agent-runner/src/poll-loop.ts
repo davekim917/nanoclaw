@@ -26,6 +26,7 @@ import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
+import { activeRuntimeEffortUpdate } from './runtime-context.js';
 import {
   clearContinuation,
   clearCurrentInReplyTo,
@@ -115,27 +116,13 @@ function resetProviderContext(providerName: string): void {
   advanceMemoryContextEpoch(providerName);
 }
 
-/**
- * Number of consecutive `database disk image is malformed` errors after which
- * the follow-up poll gives up and exits the process. At ACTIVE_POLL_INTERVAL_MS
- * = 500ms this is roughly 5 seconds — long enough to dodge a transient torn
- * read during a host write, short enough to recover quickly from a poisoned
- * page cache (host-sweep then respawns with a fresh mount).
- */
+/** Consecutive corrupt reads (~5s at 500ms) before exiting so host-sweep respawns with a fresh mount. */
 const CORRUPTION_STREAK_EXIT = 10;
 
-// Transient server-overload backoff (provider.isTransientOverload — the Claude
-// binary's "Server is temporarily limiting requests (not your usage limit)"
-// after its own internal retries are spent). Retry the same prompt with capped,
-// jittered exponential backoff. 30 tries × 30s cap ≈ 13 min worst case, well
-// under host-sweep's 30-min idle ceiling (heartbeat is touched across each
-// sleep). Full jitter is load-bearing: sibling containers hit the same overload
-// in lockstep, so a fixed schedule would have them all retry on the same beat.
+// Full jitter is load-bearing: sibling containers hit the same overload in
+// lockstep. 30 tries × 30s cap stays under host-sweep's 30-min idle ceiling.
 const TRANSIENT_OVERLOAD_MAX_TRIES = 30;
-/**
- * How many times one container process releases the same mid-turn follow-up
- * whose stream ended unconsumed; see the `finally` of `processQuery`.
- */
+/** Releases per container of a mid-turn follow-up whose stream ended unconsumed. */
 const FOLLOW_UP_MAX_RELEASES = 1;
 const followUpReleaseCounts = new Map<string, number>();
 const TRANSIENT_OVERLOAD_BASE_MS = 1500;
@@ -149,23 +136,9 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
 }
 
 /**
- * Credential rotation starts a fresh provider query, so its prompt is seen a
- * second time even though the inbound rows remain one unfinished batch.
- * Provenance distinguishes this retry from a new delivery without claiming the
- * interrupted attempt had no effects. The original prompt follows it, unless the
- * resumed transcript already holds it (`promptAlreadyInTranscript`, from
- * `provider.transcriptHasPrompt`) — then a one-line pointer replaces it, so the
- * batch is not in context twice for the rest of the session.
- *
- * `rotation` is the result of the `rotateApiKey()` call
- * that triggered this retry. When it reports `rotated: true` with a position/ringSize, a second
- * block tells the agent explicitly that its credential was swapped and any
- * "rate limited" narrative still sitting in its resumed transcript is stale
- * — see `formatCredentialRotationNotice`. Only this one call site (the
- * rotation retry) ever passes a rotation result; every other in-turn retry
- * (transient overload, stale session, context-too-long, …) keeps calling
- * `provider.query()` directly with the plain prompt, so the block never
- * appears for a retry that isn't actually a credential swap.
+ * The prompt is replaced by a pointer when the resumed transcript already holds
+ * it, so the batch is not in context twice. Pass `rotation` only from the
+ * rotation retry: the notice must never appear on a retry that swapped nothing.
  */
 function formatCredentialRetryPrompt(
   prompt: string,
@@ -187,21 +160,14 @@ function formatCredentialRetryPrompt(
     'Before repeating side effects, inspect durable effects already produced, then continue the unfinished work.\n' +
     '</runner-retry-provenance>\n\n' +
     rotationNotice +
-    // The resumed transcript already shows the batch (provider.transcriptHasPrompt):
-    // point at it rather than put a second copy in context for the rest of the session.
     (promptAlreadyInTranscript
       ? 'The interrupted batch is the inbound message this attempt already recorded above in this conversation; it is not repeated here.\n'
       : prompt)
   );
 }
 
-// Codex idle-watchdog recovery (provider yields classification 'idle_timeout'
-// after TURN_IDLE_TIMEOUT_MS — 5 min — of app-server silence). At a 5-min
-// floor a fire almost certainly IS a real wedge (codex's normal slowness lives
-// well under that), so retry only ONCE: a re-run rarely revives a 5-min stall,
-// and each attempt costs another full ceiling, so more retries just make the
-// user wait longer for the give-up. Short backoff — the watchdog already
-// waited out 5 minutes of silence.
+// A 5-min Codex idle-watchdog fire is almost always a real wedge, and each retry
+// costs another full 5 min, so retry once.
 const CODEX_IDLE_RETRY_MAX = 1;
 const CODEX_IDLE_RETRY_BASE_MS = 3000;
 
@@ -215,11 +181,8 @@ export function buildWorkContinuationPrompt(task: string): string {
 }
 
 /**
- * True for SQLite errors that indicate a corrupt READ view — almost always a
- * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
- * actual file damage (host-side integrity_check passes). Reopening the DB
- * handle inside this process does NOT recover; only a fresh container mount
- * does. Caller's job is to exit so host-sweep respawns the container.
+ * A corrupt READ view (usually Docker Desktop macOS cross-mount page cache), not
+ * file damage: reopening the handle does not recover, so the caller must exit.
  */
 export function isCorruptionError(msg: string): boolean {
   return (
@@ -255,31 +218,11 @@ function isProviderSystemError(err: unknown): boolean {
   return err instanceof ProviderEventError && err.classification === 'system_error';
 }
 
-/**
- * A provider-level quota wall (exhausted account / weekly limit), as opposed
- * to a per-request rate limit. Nothing inside this container can recover it:
- * the credential itself is spent until the provider's window resets.
- */
+/** Account-level quota wall: unrecoverable in this container until the provider window resets. */
 function isProviderQuotaExhausted(err: unknown): boolean {
   return err instanceof ProviderEventError && err.classification === 'quota';
 }
 
-/**
- * Report an unusable provider to the host so later spawns route to the
- * declared fallback. Reporting only happens when a fallback exists — a group
- * that never opted in keeps its outage loud.
- *
- * Returns true when the caller must NOT write a chat error — which is
- * whenever a reroute is actually about to happen. The host respawns this
- * session on the fallback and the message is requeued, so the user gets a
- * real answer moments later; posting "I'll pick up from your next message"
- * first is both noise and a lie.
- *
- * The safety property lives in `alreadyOnFallback`: a container running AS
- * the fallback never suppresses, so at most ONE attempt is ever silent. A
- * genuine bug that breaks both providers still surfaces — one turn later,
- * having been tried on two runtimes instead of one.
- */
 export interface ProviderUnavailableDetail {
   /** Provider-MEASURED recovery instant (ISO) — see ProviderEvent error `resetAt`. */
   resetAt?: string | null;
@@ -287,12 +230,7 @@ export interface ProviderUnavailableDetail {
   reason?: string | null;
 }
 
-/**
- * The `provider_unavailable` system row's content, as the host handler reads
- * it (src/modules/provider-fallback/handler.ts). `resetAt` and `reason` are
- * present only when known, so an older host that ignores them sees exactly
- * the row it always did.
- */
+/** `resetAt` and `reason` appear only when known, so an older host sees the row it always did. */
 export function buildProviderUnavailableReport(
   activeProvider: string,
   recognizedQuota: boolean,
@@ -321,18 +259,15 @@ async function reportProviderUnavailable(
   try {
     runnerConfig = getConfig();
   } catch {
-    // The production runner always loads config before polling. Keeping this
-    // best-effort outage path non-throwing preserves visible errors for tests
-    // and any future caller that invokes the event handler before bootstrap.
+    // Config not loaded (tests, pre-bootstrap): keep the visible error.
     return false;
   }
   const fallbackProvider = runnerConfig.providerFallback?.provider;
   if (!fallbackProvider) return false;
   const activeProvider = providerName ?? runnerConfig.provider;
-  // Already running AS the fallback (the host set the spawn override) and the
-  // fallback is spent too: there is nowhere left to route. Still record the
-  // outage, but let the error reach the user — silently respawning here would
-  // bounce between two dead providers forever.
+  // Already on the fallback: record the outage but let the error reach the user,
+  // or the session bounces between two dead providers forever. This keeps at
+  // most one attempt silent.
   const alreadyOnFallback = Boolean(
     typeof process !== 'undefined' ? process.env?.NANOCLAW_PROVIDER_OVERRIDE : undefined,
   );
@@ -351,8 +286,6 @@ async function reportProviderUnavailable(
     );
     return suppress;
   } catch (err) {
-    // Reporting is best-effort: if the outbound write fails we fall back to
-    // the visible error rather than swallowing the failure silently.
     log(`Failed to report provider outage: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
@@ -368,8 +301,6 @@ const FILE_EVENT_ALLOWED_PREFIXES = [
   '/tmp/',
 ];
 
-// Exported for unit testing — the prefix set is the boundary for which
-// agent-produced files get forwarded, so it is asserted directly.
 export function isAllowedFileEventPath(p: string): boolean {
   return FILE_EVENT_ALLOWED_PREFIXES.some((prefix) => {
     const boundary = prefix.endsWith(path.sep) ? prefix : `${prefix}${path.sep}`;
@@ -387,15 +318,7 @@ function sanitizeOutboundFilename(filename: string): string {
   return base && base !== '.' && base !== '..' ? base : `attachment-${Date.now()}`;
 }
 
-/**
- * True when the model's final response text is Anthropic's standard AUP
- * refusal envelope. Match conservatively on BOTH anchor phrases (the
- * Claude Code prefix and the policy URL) — checking just one risks false
- * positives on legitimate prose discussing AUP, and Anthropic has
- * historically kept this exact message format stable.
- *
- * Exported for unit testing.
- */
+/** Match BOTH anchors: either alone false-positives on prose that discusses the AUP. */
 export function isAupRefusal(text: string): boolean {
   return text.includes('Claude Code is unable to respond') && text.includes('anthropic.com/legal/aup');
 }
@@ -408,11 +331,7 @@ export interface PollLoopConfig {
    * resurrect a stale id from a different backend.
    */
   providerName: string;
-  /**
-   * This spawn is executing on a declared fallback provider. Scheduled task
-   * pins were validated for the primary provider, so they cannot safely
-   * override this target provider's fallback/default configuration.
-   */
+  /** Task pins were validated for the primary, so they must not override the fallback's config. */
   providerFallbackActive?: boolean;
   cwd: string;
   systemContext?: {
@@ -424,7 +343,6 @@ export interface PollLoopConfig {
    * polling forever and stealing messages from the next test's DB.
    */
   signal?: AbortSignal;
-  /** Optional dependency seam for deterministic turn-end checkpoint tests. */
   autosaveWorktrees?: (reason: string) => Promise<AutoSaveResult>;
 }
 
@@ -492,16 +410,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   let isFirstPoll = true;
   while (true) {
     if (config.signal?.aborted) return;
-    // Provider-idle admission boundary. Registered gates (the repository
-    // ingress fence lives in modules/mailbox/admission.ts) decide whether this
-    // container may start a turn; the loop itself knows nothing about them.
     if (evaluateAdmission()) {
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
-    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question).
-    // Exception: recall_context system messages must reach the prompt path so the agent sees recalled facts.
-    // isFirstPoll → getPendingMessages so on_wake rows only fire on the fresh container's first poll.
+    // System rows are MCP tool responses; only recall_context reaches the prompt.
+    // isFirstPoll: on_wake rows fire only on a fresh container's first poll.
     const messages = getPendingMessages(isFirstPoll).filter((m) => {
       if (m.kind !== 'system') return true;
       try {
@@ -521,15 +435,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const hasTriggeringMessage = messages.some((m) => m.trigger === 1);
 
-    // Accumulated trigger=0 context is idle from the agent's perspective: it
-    // must not starve already-promised durable work. Leave those rows pending
-    // so they still accompany the next real inbound turn.
+    // Accumulated trigger=0 context must not starve promised durable work; the
+    // rows stay pending for the next real inbound turn.
     if (!hasTriggeringMessage) {
       const pending = getWorkContinuation();
       if (pending && !idleSuppressedContinuationIds.has(pending.id) && isWorkContinuationRunnable(pending, runnerId)) {
-        // A fence can commit after the first outer-loop check and while the
-        // pending batch is being read. Do not turn durable queued work into a
-        // running provider turn once repository admission is closed.
+        // A fence can commit while the pending batch is read: never start queued
+        // work once repository admission is closed.
         if (evaluateAdmission()) continue;
         const runningWork = markWorkContinuationRunning(pending.id, runnerId);
         if (runningWork) {
@@ -541,11 +453,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           const sourceBatch = sourceMessage ? [sourceMessage] : [];
           const routing = extractRouting(sourceBatch);
           const prompt = buildWorkContinuationPrompt(runningWork.task);
-          // Budget inherits from the continuation's SOURCE row: work promised
-          // from a muted/capped task turn stays muted/capped when it resumes.
-          // If the source row is gone (deleted task, legacy pending_next),
-          // KEEP the current budget — an empty batch must not reset an
-          // active mute/cap to unlimited.
+          // Budget inherits from the continuation's source row; with no source
+          // row keep the current one, so an empty batch never lifts a mute/cap.
           if (sourceBatch.length > 0) applyChatBudget(sourceBatch);
           const settings = applyFlagBatch([], routing, config.providerName);
           log(`Resuming durable continuation: ${runningWork.task.slice(0, 120)}`);
@@ -580,9 +489,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               runnerId,
               runningWork.id,
               suppressContinuationUntilRealInbound,
-              // No representative inbound row to classify (the resumed
-              // task's original trigger predates this turn) — the resume
-              // itself IS the cause.
               'continuation',
               undefined,
               processQueryFallbackOptions,
@@ -600,10 +506,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearCurrentInReplyTo();
             clearBatchAnchors();
           }
-          // processQuery tracks the turn itself. This tail does not: the
-          // continuation record is already cleared, this path claims no
-          // inbound rows, and the turn-end git checkpoint below is real work
-          // the host would otherwise read as idle. Bounded, unlike the stream.
+          // The checkpoint below is real work the host would otherwise read as idle.
           beginProviderBusyScope();
           try {
             await emitTurnEnd();
@@ -652,13 +555,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
     // the runner handles directly is /clear (session reset).
-    //
-    // Note on claim ordering: we used to markProcessing(ids) up front,
-    // then run pre-task scripts. If a script gated all non-command rows,
-    // any trigger=0 chat in the batch would stay 'processing' until the
-    // host stale-claim sweep cleared it (~60s). Now we claim only the
-    // rows that will actually reach the prompt — same pattern as the
-    // in-turn helper.
     let normalMessages: MessageInRow[] = [];
     const commandIds: string[] = [];
 
@@ -696,9 +592,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       normalMessages.push(msg);
     }
 
-    // Command admission can remove X while recall-X was encountered earlier
-    // in the same batch. Keep the pair invariant at the actual prompt
-    // boundary: both rows survive, or neither does.
+    // Recall pairs survive command admission together or not at all.
     normalMessages = retainCompleteRecallPairs(messages, normalMessages);
 
     if (commandIds.length > 0) {
@@ -728,10 +622,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
     // MODULE-HOOK:scheduling-pre-task:end
 
-    // Re-validate post-script: if no admissible trigger survives, defer
-    // the surviving trigger=0 context rows for the next iteration. Don't
-    // claim them — leaving rows pending is the correct signal that they
-    // weren't consumed. (Mirrors selectInTurnFollowUps' deferral logic.)
+    // No admissible trigger survived the scripts: leave the context rows
+    // unclaimed so they ride the next turn.
     if (!keep.some(isAdmissibleTrigger)) {
       log(
         `All ${normalMessages.length} non-command message(s) gated by script or no admissible trigger, skipping query`,
@@ -739,16 +631,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    // Claim only the rows that will actually reach the prompt.
-    // The barrier may have committed while scripts/settings were awaited.
-    // Re-check at the final admission seam and acknowledge from this still-
-    // provider-idle boundary rather than creating a new processing claim.
+    // The barrier may have committed while scripts/settings were awaited:
+    // re-check at the final admission seam before claiming.
     if (evaluateAdmission()) continue;
     const keptIds = keep.map((m) => m.id);
-    // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
-    // classified once from the admitted batch and reused for every
-    // processQuery call this turn makes, including its in-turn retries below
-    // (same prompt/continuation, so the cause hasn't changed).
     const trigger = classifyTrigger(keep);
     markProcessing(keptIds);
     rememberRequestCandidates(keep);
@@ -775,22 +661,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
     if (hasRealInbound(keep)) {
       resetWorkContinuationForRealInbound();
-      // Real input means the thread is not finished after all — retract any
-      // standing close proposal so the console never offers a close over work
-      // that has since restarted. System rows (the close wrap-up request, the
-      // ceiling notice) are not real inbound and deliberately leave it alone.
+      // Real input retracts a standing close proposal; system rows (close
+      // wrap-up, ceiling notice) deliberately do not.
       clearDoneProposal();
       idleSuppressedContinuationIds.clear();
     }
 
     applyChatBudget(keep);
     const flagBatch = effectiveTurnSettings(keep, routing, config.providerName, config.providerFallbackActive === true);
-    // Running on the primary is the evidence that any earlier request for it
-    // (or simply the window expiring) worked, so the cooldown claim is spent.
-    // Without this a session that asked once could not ask again for 30
-    // minutes even after a clean round-trip back to the primary and a fresh
-    // outage. The helper reads before it deletes, so a session that never
-    // asked writes nothing.
+    // Running on the primary spends any earlier retry-request cooldown, so a
+    // fresh outage can ask again.
     if (config.providerFallbackActive !== true) clearPrimaryRetryRequest();
     if (flagBatch.ignoredModel !== undefined)
       await noteIgnoredModel(
@@ -807,9 +687,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
-    // A scheduled fire starts with no resumed conversation unless its series is
-    // --continuous — the /clear reset above, without its chat
-    // notice (fresh-context-task.ts).
+    // A fresh scheduled fire resets like /clear, without its chat notice.
     const freshFire = continuation !== undefined && startsFreshFire(keep);
     if (freshFire) {
       log('Fresh-context task fire: not resuming the stored session');
@@ -818,8 +696,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       freshContextBootstrapRequired = true;
     }
     const formattedPrompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
-    // A context reset that is not /clear (rotation, recovery) keeps the work
-    // going, so the fresh context gets the unfinished task list back.
+    // A reset that is not /clear keeps the work going, so it restores the task list.
     const listReminder =
       freshContextBootstrapRequired && taskListEnabled()
         ? taskListReminder(loadTaskListState(getAgentMailbox().operations))
@@ -836,19 +713,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         (config.providerName === 'codex' ? ` fast=${effectiveFast ? 'on' : 'off'}` : ''),
     );
 
-    // Fresh credential-rotation cycle for this turn: the active token stays
-    // sticky, but a since-healed credential (e.g. a reset session cap) is
-    // reachable again. Without this, a turn that exhausted the ring could
-    // never rotate again. (Incident 2026-06-25.)
+    // Per turn, so a since-healed credential is reachable again; otherwise a
+    // turn that exhausted the ring could never rotate again.
     config.provider.resetRotationCycle?.();
 
-    // Structured view of the same attachments `formatMessages` already
-    // described inline, for a provider whose SDK takes real file parts. Every
-    // retry below replays this batch, so it carries the same media.
     const batchAttachments = extractAttachments(keep);
 
-    // When this batch's first attempt began — a rotation retry only trusts a
-    // transcript copy of the prompt recorded after this (transcriptHasPrompt).
+    // A rotation retry trusts only a transcript copy of the prompt recorded after this.
     const batchStartedAt = Date.now();
     const query = config.provider.query({
       prompt,
@@ -862,14 +733,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       systemContext: config.systemContext,
     });
 
-    // Process the query while concurrently polling for new messages.
-    // processingIds == keptIds now: commands were marked completed inline,
-    // skipped task rows were marked completed by the pre-task block, and
-    // we only claimed the rows that actually reach the prompt.
+    // Commands and skipped task rows were already completed, so this is exactly what was claimed.
     const processingIds = keptIds;
-    // Set when this batch is being handed to the fallback provider: the rows
-    // must stay claimed-but-unfinished so the respawned container answers
-    // them. Marking them completed would leave the reader with silence.
+    // Fallback handoff: rows stay claimed-but-unfinished so the respawned container answers them.
     let deferredToFallback = false;
     let deferredForRepositoryBarrier = false;
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
@@ -887,44 +753,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.signal.addEventListener('abort', abortActiveQuery, { once: true });
       }
     }
-    // ONE logical fire, however many attempts it takes. `processQuery` is
-    // re-invoked by the in-turn recovery paths below (credential rotation,
-    // stale session, Codex idle, transient overload), and each call is a fresh
-    // attempt at the SAME scheduled fire. The run-outcome ledger the escalation
-    // sweep reads must see one row per fire: several failure rows would let a
-    // fire that recovered push a series to the alert threshold, and a recovery
-    // whose retries were all exhausted would otherwise write none at all
-    // (that path throws past every result branch). Later attempts overwrite
-    // earlier ones in this map, but the record itself is written once, when the
-    // first outcome is reported (`writeFireOutcome` below).
-    //
-    // INVARIANT: one admitted task turn produces exactly one outcome record.
-    //
-    // Keyed by the admitted task rows' ids, so a RETRY of a turn coalesces into
-    // the same entry (the outer loop re-invokes `processQuery` with the same
-    // batch) while a SEPARATE fire admitted into the same stream gets its own.
-    // Insertion order is admission order.
+    // INVARIANT: one outcome record per admitted task fire, however many attempts.
+    // Keyed by task row ids so retries coalesce: a recovered fire must not push a
+    // series to the alert threshold, and an exhausted one must still write a row.
     const fireOutcomes = new Map<string, FireOutcome>();
     const mergeTaskTurns = (turns: TaskTurnRecord[] | undefined): void => {
       for (const turn of turns ?? []) {
         if (turn.outcome) fireOutcomes.set(turn.key, turn.outcome);
       }
     };
-    // Written when the turn reports it, not when the fire ends. A task stream
-    // is never ended, so the fire "ends" only when the host reaps its
-    // container, and nothing can be written after that. The `finally` writes
-    // only a synthesised failure, for a fire that never reported an outcome.
-    // The key is reserved before the write, so the first outcome reported for
-    // a fire is the only one attempted: a retry of the same batch can neither
-    // add a second record nor replace the first.
+    // Written as soon as the turn reports it: a task stream never ends, and after
+    // the host reaps the container nothing can be written. The key is reserved
+    // before the write, so a retry can neither add a second record nor replace one.
     const writtenFireKeys = new Set<string>();
     const writeFireOutcome = async (key: string, outcome: FireOutcome): Promise<void> => {
       if (writtenFireKeys.has(key)) return;
       writtenFireKeys.add(key);
-      // A write that throws committed nothing: the outbound insert is its own
-      // transaction, rolled back on failure. So the same outcome is retried in place, briefly. What three
-      // short attempts do not heal (a full disk, a closed db), a later one
-      // would not either.
+      // A throwing write committed nothing (its own transaction), so retry in place briefly.
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           const taskMessageIds = key.split(',').filter((id) => getMessageIn(id)?.kind === 'task');
@@ -980,19 +825,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
-      // The failed query's CLI child may still be running (an in-body throw
-      // unwinds the generator without necessarily tearing the subprocess
-      // down — see queryAbortController in providers/claude.ts). Every recovery branch
-      // below starts a FRESH query on the same or a rotated credential, so
-      // abort the old one first: left alone, it can keep running on an
-      // exhausted/wedged credential and burn another failure minutes after
-      // the replay is already healthy (observed 2026-09-08: a rotated retry
-      // succeeded while the abandoned original hit a second 429 three
-      // minutes later). Idempotent — a provider whose abort() already ran
-      // (e.g. via config.signal) treats a second call as a no-op.
+      // The failed query's CLI child may still be running. Abort it before any
+      // recovery starts a fresh query, or it keeps burning failures on the
+      // exhausted credential. abort() is idempotent.
       query.abort();
-      // A fresh fire's first attempt stored its new session at `init`
-      // (processQuery); every retry below resumes that one, not a blank one.
+      // Retries resume the session the fresh fire's first attempt stored at `init`.
       if (freshFire && continuation === undefined) continuation = getContinuation(config.providerName);
       const pausedWork = getWorkContinuation();
       if (pausedWork?.phase === 'queued') idleSuppressedContinuationIds.add(pausedWork.id);
@@ -1007,13 +844,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         return false;
       };
 
-      // Close the no-await seam immediately after processQuery returns. Each
-      // retry branch re-checks at its own final query-admission point, which is
-      // required for the backoff branches that may sleep while a fence lands.
+      // Close the no-await seam now; each retry branch re-checks at its own
+      // admission point, since backoffs can sleep while a fence lands.
       repositoryRecoveryAllowed();
 
-      // Sleep with the heartbeat touched throughout, so the host sweep does not
-      // reap the container as stale while a recovery branch backs off.
+      // Heartbeat across the sleep, or host-sweep reaps the container as stale.
       const backOff = async (sleepMs: number): Promise<void> => {
         const beat = setInterval(touchHeartbeat, TRANSIENT_OVERLOAD_HEARTBEAT_MS);
         try {
@@ -1024,10 +859,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         touchHeartbeat();
       };
 
-      // One in-turn recovery attempt on the same batch and settings, resuming
-      // `from` on `model` (undefined drops the per-turn pin). Its query is aborted before any error propagates: an abandoned
-      // retry query leaks its CLI child the same way the original did (see the
-      // abort() at the top of this catch).
+      // `model` undefined drops the per-turn pin. The retry query is aborted before
+      // any error propagates, or it leaks its CLI child like the original.
       const retryInTurn = async (
         retryPrompt: string,
         from: string | undefined,
@@ -1073,15 +906,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       };
 
-      // Transient server-overload recovery: the provider's runtime hit a
-      // 429/529 ("temporarily limiting requests · not your usage limit"),
-      // exhausted its own internal retries, and surfaced the failure as result
-      // text (Claude) — which the provider re-threw with a `transient_overload:`
-      // marker. The credential is fine; the SERVER is busy. Rotating keys is
-      // pointless (every key hits the same overloaded backend), so back off and
-      // retry the SAME prompt+continuation in-turn, up to N times with a
-      // growing jittered sleep. Touch the heartbeat across each sleep so the
-      // host sweep doesn't kill the container as stale while we wait.
+      // Transient server overload: the credential is fine, so rotating is
+      // pointless; back off and retry the same prompt and continuation.
       const transient = config.provider.isTransientOverload?.(err) ?? false;
       if (transient && repositoryRecoveryAllowed()) {
         for (let attempt = 0; attempt < TRANSIENT_OVERLOAD_MAX_TRIES && !recovered; attempt++) {
@@ -1096,14 +922,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             await retryInTurn(prompt, continuation, effectiveModel);
             recovered = true;
           } catch (retryErr) {
-            // Still overloaded → back off and try again. A *different* error
-            // (the prompt/continuation didn't change, so context-too-long etc.
-            // is essentially impossible mid-retry) → stop and surface the clean
-            // exhausted message. ponytail: a quota-exhaustion appearing here
-            // (overload clears, then the credential's cap is hit) does NOT
-            // rotate this turn — but the next user message starts a fresh turn
-            // that hits the normal rotation path, so it self-heals; not worth
-            // threading retryErr through every downstream recovery branch.
+            // A different error ends the loop. A quota hit here does not rotate
+            // this turn; the next message takes the normal rotation path.
             if (config.provider.isTransientOverload?.(retryErr)) continue;
             log(
               `Retry during transient overload hit a non-transient error: ` +
@@ -1117,14 +937,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
-      // Codex idle-watchdog recovery: the codex-app-server went silent past
-      // TURN_IDLE_TIMEOUT_MS and the provider classified the error
-      // 'idle_timeout'. These stalls are transient (they recover on the next
-      // user message), so retry the same prompt+continuation in-place instead
-      // of dead-ending the user — the retry is functionally identical to the
-      // "next message" that's already known to work. Bounded with a short
-      // linear backoff; heartbeat touched across the sleep so host-sweep
-      // doesn't reap the container mid-retry.
+      // Codex idle stalls recover on the next message, so retry the same prompt in place, bounded.
       const codexIdle = !recovered && err instanceof ProviderEventError && err.classification === 'idle_timeout';
       if (codexIdle && repositoryRecoveryAllowed()) {
         for (let attempt = 0; attempt < CODEX_IDLE_RETRY_MAX && !recovered; attempt++) {
@@ -1136,8 +949,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             await retryInTurn(prompt, continuation, effectiveModel);
             recovered = true;
           } catch (retryErr) {
-            // Still stalled → back off and try again. Any other error → stop
-            // and let the original idle error fall through to the clean message.
             if (retryErr instanceof ProviderEventError && retryErr.classification === 'idle_timeout') {
               continue;
             }
@@ -1153,24 +964,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
-      // Retryable-upstream recovery: 429 / rate limit / overloaded /
-      // upstream_error / subscription quota exhausted. If the provider has
-      // fallback credentials configured (ANTHROPIC_API_KEY_N or
-      // CLAUDE_CODE_OAUTH_TOKEN_N), rotate and retry once in-turn. Without
-      // fallbacks OR once they're exhausted, fall through to the error
-      // write. Ordered before isContextTooLong because prompt-too-long can
-      // LOOK retryable in some error shapes, and the rotation cost is low.
-      // Keep cycling the credential pool until one succeeds or the ring is
-      // exhausted this turn. rotateApiKey is circular (wraps back to the
-      // primary); it returns rotated:false once every other credential has
-      // been tried this cycle, so the loop always terminates. Continuation is
-      // preserved across rotations: the SDK's `resume:` reads a local .jsonl,
-      // and the Anthropic API has no account-bound session object — the new
-      // credential just signs the next request. (Incident 2026-06-25: a
-      // single rotation could land on a spend-capped fallback and dead-end.)
-      // `!transient`: a transient overload also matches isRetryable (its text
-      // contains "Rate limited"), but rotation is the wrong cure — it was
-      // already handled by the backoff loop above. Exclude it here.
+      // Cycle the credential ring until one succeeds; rotateApiKey returns
+      // rotated:false once the cycle is spent, so the loop terminates. Ordered
+      // before isContextTooLong, which can look retryable. The continuation
+      // survives rotation (resume reads a local .jsonl). `!transient`: an
+      // overload also matches isRetryable but was handled by the backoff above.
       let rotation =
         !transient && !recovered && repositoryRecoveryAllowed() && config.provider.isRetryable?.(err)
           ? config.provider.rotateApiKey?.()
@@ -1190,29 +988,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after credential rotation also failed: ${retryMsg}`);
-          // Still retryable? Advance to the next credential in the ring and
-          // retry again; rotateApiKey returns rotated:false when the cycle is
-          // spent, ending the loop.
           rotation = config.provider.isRetryable?.(retryErr) ? config.provider.rotateApiKey?.() : undefined;
         }
       }
 
-      // Context-window recovery: session grew past the model's limit.
-      // Clear the continuation AND retry the same prompt once with a
-      // fresh session. Exactly one retry; a second failure surfaces to the
-      // user.
-      //
-      // Gated on `continuation` because a freshly-started session can't
-      // be "too long" — if a user's first message is already over the
-      // limit (e.g. a huge paste), the error falls through to the
-      // isSessionInvalid branch (no retry) and lands as an error chat.
-      // Not ideal for that edge case, but the alternative (retrying
-      // without continuation) is what we'd do anyway, and the chat-error
-      // pattern makes the failure explicit to the user.
-      //
-      // Recap from the per-session DB tells the agent what was just
-      // discussed so it doesn't lose the thread. The marker is for the
-      // case where there's no recap (no completed messages yet).
+      // Context-too-long: clear the continuation and retry once with a recap.
+      // Gated on `continuation`: a first message already over the limit falls
+      // through to a chat error.
       if (!recovered && repositoryRecoveryAllowed() && continuation && config.provider.isContextTooLong?.(err)) {
         log(`Context-too-long detected — clearing session and retrying once with fresh continuation`);
         continuation = undefined;
@@ -1232,18 +1014,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after context-too-long also failed: ${retryMsg}`);
-          // The failed retry's `init` event may have re-persisted a
-          // continuation. Clear it again so the next turn starts clean.
+          // The failed retry's `init` may have re-persisted a continuation; clear it again.
           continuation = undefined;
           clearContinuation(config.providerName);
         }
       } else if (!recovered && repositoryRecoveryAllowed() && continuation && config.provider.isSessionInvalid(err)) {
-        // Stale/corrupt continuation — most often a transcript .jsonl
-        // that got pruned out from under us, or a session id that was
-        // valid in a prior container but doesn't exist in this one's
-        // ~/.claude/projects/. Clear and retry once with a recap from
-        // the per-session DB so the user doesn't have to re-send and
-        // doesn't lose conversational context.
+        // Stale session (transcript pruned, or id unknown in this container):
+        // clear and retry once with a recap.
         log(`Stale session detected (${continuation}) — clearing and retrying with recap`);
         continuation = undefined;
         resetProviderContext(config.providerName);
@@ -1262,20 +1039,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after stale-session recovery also failed: ${retryMsg}`);
-          // The failed retry's `init` event may have re-persisted a
-          // continuation. Clear it again so the next turn starts clean.
+          // The failed retry's `init` may have re-persisted a continuation; clear it again.
           continuation = undefined;
           clearContinuation(config.providerName);
         }
       }
 
-      // Codex can yield a terminal thread/status systemError as a ProviderEvent
-      // instead of throwing. That means it bypasses the stale-session catch path
-      // above unless we handle it here. With a stored continuation, a Codex
-      // thread in systemError is poison: the next support-poller recurrence
-      // resumes the same dead thread and posts the same warning every 15 min.
-      // Clear once and retry fresh with a recap, mirroring stale-session
-      // recovery. If the fresh thread also fails, surface that final error.
+      // Codex yields a terminal systemError as an event, bypassing the
+      // stale-session catch. A resumed thread in systemError is poison, so clear
+      // once and retry fresh with a recap.
       if (!recovered && repositoryRecoveryAllowed() && continuation && isProviderSystemError(err)) {
         log(`Provider system_error (${continuation}) - clearing session and retrying with recap`);
         continuation = undefined;
@@ -1300,47 +1072,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
-      // Model-scoped quota recovery: the PIN is spent, not the provider.
-      //
-      // A provider account's quota is not one pool. Measured live
-      // 2026-09-21 22:35Z: a group pinned to `claude-fable-5-1[1m]` was
-      // rejected on window `seven_day_overage_included` across all four
-      // OAuth slots, the credential ring above was declared spent, and the
-      // host rerouted the session to the codex fallback — while two SIBLING
-      // sessions of the SAME agent group ran `claude-opus-5[1m]` to
-      // completion at 22:35:25Z and 22:37:57Z (`turn_usage`). The ordinary
-      // `seven_day` window was at 0.92 and still serving. Only the pinned
-      // tier was out.
-      //
-      // The rotation above replays the SAME model on every credential
-      // (`model: effectiveModel`), so a model-scoped window rejects every
-      // slot in the ring and looks exactly like a dead account. Dropping the
-      // pin re-queries on the group's configured model, because `undefined`
-      // means "no per-turn override" and every provider resolves its own
-      // default from it — verified, not assumed: claude falls through to
-      // `process.env.NANOCLAW_CLAUDE_MODEL`, codex returns the group's
-      // configured model from `resolveQueryModel(undefined, this.model)`, and
-      // opencode falls through to OPENCODE_MODEL then
-      // OPENCODE_NATIVE_DEFAULT_MODEL. That is why this is NOT gated on
-      // providerName — a codex group pinned to a limited `gpt-*` model reaches
-      // it the same way before falling back to claude.
-      //
-      // Deliberately ONE attempt on ONE credential, not a second ring pass:
-      // if the group's own default model is also rejected here, the account
-      // really is spent and the provider report below is correct. The cost of
-      // being wrong in that direction is one request.
+      // Model-scoped quota: a pinned tier can be spent while the account still
+      // serves other models, and the rotation above replays the SAME model on
+      // every credential, so it looks like a dead account. Retry once with the
+      // pin dropped (`undefined` = each provider's group default), on every
+      // provider. One attempt only: if the default fails too, the account is spent.
       const quotaExhausted = config.provider.isQuotaExhausted?.(err) ?? isProviderQuotaExhausted(err);
       if (!recovered && repositoryRecoveryAllowed() && quotaExhausted && effectiveModel !== undefined) {
         log(`Quota rejection while pinned to ${effectiveModel} — retrying once on the group's default model`);
         try {
           await retryInTurn(prompt, continuation, undefined);
           recovered = true;
-          // Clear the pin only when it was STICKY. A one-off `-m` on this
-          // message has nothing to clear, and clearing then would silently
-          // retire a pin the user never stored. Clearing a sticky one is what
-          // keeps the next turn of this session off the spent tier instead of
-          // paying this recovery again on every message until the window
-          // resets.
+          // Clear the pin only when sticky: a one-off `-m` stored nothing, and
+          // clearing then would retire a pin the user never set.
           const stickyWasPinned = getStickyModel() === effectiveModel;
           if (stickyWasPinned) clearStickyModel();
           await noteModelQuotaFallback(effectiveModel, stickyWasPinned, err, routing);
@@ -1352,24 +1096,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
-      // A spent provider account is not a turn failure the user can act on.
-      // When a fallback is declared, report it and stay silent: the host
-      // respawns this session on the fallback and the requeued message is
-      // answered there, so the conversation shows a slow reply rather than
-      // an error the reader can do nothing about.
-      // `quotaExhausted` is computed above, at the model-drop retry — the
-      // provider is asked first there (it knows its own error vocabulary and
-      // surfaces quota in more than one shape), with the classified event
-      // form as the fallback for providers that don't implement the hook.
-      // Any failure the in-turn recovery could not fix means this provider is
-      // not currently usable for this group — a spent account, a wedged
-      // app-server, a dead credential. Record it either way so the next spawn
-      // routes to the fallback; only a recognized quota also silences the
-      // chat error.
-      // Every attempt threw — including the "stream ended with only retryable
-      // events" path, which rethrows past every result branch. Recorded as a
-      // message only; the decision to WRITE it belongs to the `finally`, because
-      // `deferredToFallback` is not known until a few lines below this point.
+      // A failure in-turn recovery could not fix is reported so the next spawn
+      // routes to the fallback; only a recognized quota also silences the chat
+      // error. The fire's failure is only recorded here: the `finally` decides
+      // whether to write it, since `deferredToFallback` is set below.
       if (fireOutcomes.size === 0) fireErrorMessage = errMsg;
       if (deferredForRepositoryBarrier) releaseProcessingClaims(processingIds);
       const quotaHandled =
@@ -1388,10 +1118,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         ));
       deferredToFallback = quotaHandled;
 
-      // Only surface the error to the user if we couldn't recover inline.
       if (!recovered && !quotaHandled && !deferredForRepositoryBarrier) {
-        // Deliberately un-gated: an unclassified error can be a real bug, not
-        // a flapping provider, and shouldn't be silently swallowed by dedupe.
+        // Deliberately un-deduped: an unclassified error can be a real bug.
         const providerEventErr = err instanceof ProviderEventError && err.retryable === false;
         const isInfraWarning = transient || codexIdle || providerEventErr;
         const chatText = transient
@@ -1401,9 +1129,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             : providerEventErr
               ? `⚠️ Turn ended with an error: ${err.message}. I'll pick up from your next message.`
               : `Error: ${errMsg}`;
-        // `log(\`Query error: ${errMsg}\`)` above already covers unconditional
-        // logging for this whole branch — the dedupe below only gates the
-        // channel post, and only for the classified infra/provider notices.
         if (!isInfraWarning || shouldPostInfraWarning(chatText)) {
           await writeMessageOut({
             id: generateId(),
@@ -1416,26 +1141,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
     } finally {
-      // The fire is over — success, recovered success, or exhausted failure —
-      // so this is the one place that knows its final result AND whether the
-      // batch was deferred. Exactly one `task_log` row per fire: one run-log
-      // line, one ledger outcome.
-      //
-      // A DEFERRED batch is not a fire that ended. Both the repository-barrier
-      // and provider-fallback paths deliberately leave or release the claim so
-      // the SAME occurrence runs again, and that re-run records its own outcome.
-      // Writing here as well would give one fire two failures — enough for two
-      // occurrences to trip a threshold set at three, paging a human about a
-      // task that was merely postponed. `deferredToFallback` is only assigned
-      // after the catch's synthesis point, which is why this decision lives
-      // here and not there.
-      //
-      // Best-effort; a bookkeeping write must never mask the turn's own error.
-      // Flush ONE record per admitted task turn, in admission order, skipping
-      // any already reported when its turn answered (`writeFireOutcome`). A turn
-      // with no outcome and no error to synthesise from records nothing; a
-      // deferred batch records nothing at all, because the same occurrence runs
-      // again and that re-run records its own.
+      // Exactly one task_log row per fire, written here where the final result
+      // and deferral are both known. A DEFERRED batch (barrier, fallback) writes
+      // nothing: its re-run records its own, and two failures for one postponed
+      // fire can page a human. Best-effort: never mask the turn's own error.
       {
         const flush: Array<[string, FireOutcome | undefined]> =
           fireOutcomes.size > 0 ? [...fireOutcomes.entries()] : [[initialTurnKey, undefined]];
@@ -1454,23 +1163,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
       if (abortActiveQuery) config.signal?.removeEventListener('abort', abortActiveQuery);
-      // Always clear the per-batch in_reply_to so MCP tools don't stamp
-      // stale routing on the next turn (a2a return-path safety).
+      // Clear per-batch routing so MCP tools cannot stamp it on the next turn.
       clearCurrentInReplyTo();
       clearBatchAnchors();
     }
 
-    // Same bracket as the durable-continuation tail above, for the same
-    // reason: processQuery lowered the turn level at `result`, the batch was
-    // completed there too, and the git checkpoint below is real work the host
-    // would otherwise read as idle. Bounded, so it cannot pin the container.
+    // Busy bracket: the checkpoint below is real work the host would otherwise read as idle.
     beginProviderBusyScope();
     try {
       await emitTurnEnd();
 
-      // Compatibility callback is intentionally non-mutating in production.
-      // Sibling agents share this topic checkout, so turn-end code must never
-      // stage, commit, reset, or remove another sibling's live index lock.
+      // Sibling agents share this checkout: turn-end code must never stage,
+      // commit, reset, or remove another sibling's index lock.
       await checkpointTurnEnd(autosaveWorktrees);
     } finally {
       endProviderBusyScope();
@@ -1492,11 +1196,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   }
 }
 
-/**
- * Predicate for "this row is a real wake trigger" — non-system, trigger=1,
- * not a /clear chat command. Used by both the in-turn admission helper and
- * the post-pre-task re-validation step.
- */
 export function isAdmissibleTrigger(m: MessageInRow): boolean {
   if (m.trigger !== 1) return false;
   if (m.kind === 'system') return false;
@@ -1516,16 +1215,10 @@ function hasRealInbound(messages: MessageInRow[]): boolean {
   });
 }
 
-/**
- * The person's message that engaged the agent, if the batch holds one: an
- * admissible trigger (so not a /clear-style command — isAdmissibleTrigger),
- * not a peer agent's, not host-authored.
- */
 function triggeringHumanInbound(messages: MessageInRow[]): MessageInRow | undefined {
   return messages.find((m) => isAdmissibleTrigger(m) && m.channel_type !== 'agent' && hasRealInbound([m]));
 }
 
-/** Narrower human-only predicate for the new public accepted/working line. */
 function triggeringHumanLivenessInbound(messages: MessageInRow[]): MessageInRow | undefined {
   return triggeringHumanInbound(
     messages.filter((message) => {
@@ -1561,11 +1254,6 @@ function recallTargetId(m: MessageInRow): string | null {
   }
 }
 
-/**
- * Preserve complete host recall pairs across a later admission step. The
- * original batch defines which pairs existed; if command handling or a
- * pre-task gate removes either member, the survivor is removed too.
- */
 export function retainCompleteRecallPairs(original: MessageInRow[], admitted: MessageInRow[]): MessageInRow[] {
   const originalRecallByTarget = new Map<string, string>();
   for (const row of original) {
@@ -1588,29 +1276,14 @@ export function retainCompleteRecallPairs(original: MessageInRow[], admitted: Me
 }
 
 /**
- * Decide which pending rows to admit as a mid-turn follow-up push to an
- * in-flight query. Pure function — no DB writes — so tests can exercise
- * it directly without spinning a poll loop.
- *
- * Rules:
- * - Defer entirely (return []) when no row would survive admission as a
- *   real wake trigger. Survivors are trigger=1 chat/chat-sdk that aren't
- *   /clear, plus trigger=1 of other non-system kinds (task, webhook).
- *   /clear and non-recall system rows are NOT real triggers — letting
- *   them gate ride-along would push trigger=0 context with no actual
- *   user message in the prompt.
- * - When at least one survivor exists, admit:
- *     - chat / chat-sdk (any trigger; formatter wraps trigger=0 in
- *       <thread_context>; /clear excluded)
- *     - non-system other kinds, trigger=1 only
- *     - recall_context system rows whose paired trigger id is in the
- *       surviving-triggers set
- * - All other system rows are dropped.
+ * Pure (no DB writes). Admits nothing unless a real trigger survives: /clear and
+ * non-recall system rows must not carry trigger=0 context into a prompt alone.
+ * With a survivor: chat at any trigger, other non-system kinds at trigger=1, and
+ * recall_context rows paired to a surviving trigger.
  */
 export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[] {
-  // A fresh-context task fire must not join the running conversation: it stays
-  // pending, and the outer loop resets before prompting it once this query ends.
-  // With open work in the session it resumes instead, so it may join.
+  // A fresh-context task fire must not join the running conversation unless the
+  // session has open work; it resets once this query ends.
   const holdFresh = allPending.some((m) => isFreshContextTaskBatch([m])) && !sessionHasOpenWork();
   const completePending = retainCompleteRecallUnits(
     holdFresh ? allPending.filter((m) => !isFreshContextTaskBatch([m])) : allPending,
@@ -1636,13 +1309,8 @@ export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[
   });
 }
 
-// Invariant: the `recall-` prefix is reserved for the host-side paired write in
-// `src/session-manager.ts` (`buildRecallRow`/`writeSessionMessageInternal`).
-// Platform message ids written by router.ts always carry the shape
-// `<platform-baseId>:<agentGroupId>`; no
-// adapter produces baseIds starting with `recall-`, so the strip below
-// cannot collide with a real inbound id. Keep this contract — adding an
-// adapter that breaks it would silently corrupt recall pairing.
+// The `recall-` id prefix is reserved for host-written recall rows: an adapter
+// id starting with it would silently corrupt recall pairing.
 
 /**
  * Format messages, handling passthrough commands differently.
@@ -1658,11 +1326,8 @@ export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlash
     if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
       const cmdInfo = categorizeMessage(msg);
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
-        // The host inserts recall_context immediately BEFORE its wake trigger
-        // (host src/modules/mailbox/ops/ingress.ts). Native slash dispatch
-        // is only recognized when the command starts the SDK prompt, so never
-        // flush preceding recall/context rows before it. They are preserved
-        // below, after the command, along with any router-provided transcript.
+        // Native slash dispatch fires only when the command starts the prompt,
+        // so never flush the preceding recall/context rows before it.
         commands.push(nativeSlashCommandPrompt(msg, cmdInfo.text));
         continue;
       }
@@ -1677,19 +1342,12 @@ export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlash
 interface QueryResult {
   continuation?: string;
   /**
-   * One entry per task turn admitted into this attempt, in admission order,
-   * each with the terminal result that answered it (absent if none did).
-   *
-   * A list, not a slot. A long-lived stream admits later task rows mid-turn,
-   * so one `processQuery` call can carry several fires; a single slot recorded
-   * the first and silently dropped the rest. `key` is the admitted task rows'
-   * ids, which is stable across retries OF THAT TURN and distinct between
-   * fires — so the caller coalesces retries and keeps separate fires separate.
+   * One entry per admitted task turn, in admission order: a stream can carry
+   * several fires. `key` is stable across retries of a turn, distinct between fires.
    */
   taskTurns?: TaskTurnRecord[];
 }
 
-/** One admitted task turn and the outcome that answered it. */
 export interface TaskTurnRecord {
   key: string;
   outcome?: FireOutcome;
@@ -1705,29 +1363,17 @@ export async function processQuery(
   onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
   initialPrompt: string,
   initialContinuation: string | undefined,
-  // The model/effort/ultracode/fast settings this query was created with. The follow-up
-  // handler compares the current effective values against these to detect a
-  // mid-turn change (flag OR change_model) and end-and-reopen on the new model.
+  // Compared against current effective settings to detect a mid-turn change and reopen the query.
   querySettings: { model?: string; effort?: string; ultracode?: boolean; fast?: boolean },
   runnerId: string = randomUUID(),
   initialContinuationId?: string,
   onContinuationPaused?: (id: string) => void,
-  // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up): what
-  // caused the batch that started THIS processQuery call. Applied to every
-  // `result` event this call produces, including any later follow-up admitted
-  // mid-stream or durable continuation launched via maybeLaunchContinuation —
-  // the stream has no cheaper way to reclassify mid-flight, and a turn that
-  // changes cause partway through is rare enough that merging it into the
-  // call's original trigger beats fabricating a per-event reclassification.
+  // What caused the batch that started this call; applied to every result it
+  // produces, including mid-stream follow-ups.
   trigger: TurnTrigger = 'unknown',
-  // Called as soon as a task turn's outcome is known, so the caller records it
-  // then rather than when this call returns. A Claude stream stays open after
-  // its result (claude.ts ends it only on end()/abort) and a task stream is
-  // never ended, so this call can outlive its container: the host reaps it
-  // first, and an outcome held for the return is never written.
+  // Called as soon as an outcome is known: a task stream never ends, so this
+  // call can outlive its container and a held outcome would be lost.
   onTaskOutcome?: (key: string, outcome: FireOutcome) => Promise<void>,
-  // `providerFallbackActive` selects the wording of the ignored-pin note on the
-  // follow-up path (`noteIgnoredModel`); the opening batch reads it off config.
   options: { ignoreTaskFlagIntents?: boolean; providerFallbackActive?: boolean } = {},
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
@@ -1735,24 +1381,15 @@ export async function processQuery(
   let unwrappedNudged = false;
   let taskBlockNudged = false;
   let notificationWatermark = maxOutboundSeq();
-  // Complete <message> blocks already delivered from this turn's interim text.
   const deliveredInterimBlocks = new Set<string>();
   const suppressedInterimTaskBlocks: TaskMessageBlock[] = [];
   // Set when a person's triggering message is admitted: the outbound watermark
-  // at that moment and the conversation it came from. Null when no such
-  // message is owed a reply. Read at an empty `result`. Decided from the
-  // admitted ROWS, not `trigger`: classifyTrigger is cost accounting and calls
-  // a batch holding both a task and a person's message `scheduled`
-  // (modules/mailbox/selection.ts, task check precedes chat).
-  // `routing.taskRun` is the OPENING batch's, on purpose: it is the same
-  // authority the result handler dispatches under, and in a task run final-text
-  // <message> blocks are inert (formatter.ts, RoutingContext.taskRun), so the
-  // nudge would ask for a reply that cannot be delivered.
+  // and its conversation, read at an empty `result`. Decided from admitted ROWS,
+  // not `trigger`, which labels a mixed batch `scheduled`. Uses the opening
+  // batch's `taskRun`: in a task run final-text <message> blocks are inert.
   type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null };
-  // The channel is the PERSON'S row's, not the batch anchor's: extractRouting
-  // anchors a mixed batch on its task row (formatter.ts, "task row" anchor),
-  // which is the task's destination, not where the person is. "Has its own
-  // routing" is extractRouting's test — a platform_id.
+  // The person's row's channel, not the batch anchor: a mixed batch anchors on
+  // its task row, which is the task's destination.
   const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null => {
     const human = routing.taskRun ? undefined : triggeringHumanInbound(rows);
     if (!human) return null;
@@ -1767,62 +1404,29 @@ export async function processQuery(
     initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null),
     routing,
   );
-  // Retryable (e.g. SDK `api_retry`) events are the SDK's own mid-stream retry
-  // signal, NOT a turn-ending error. Record the last one but keep consuming so
-  // the SDK's internal retry can still produce a result; only surface it if the
-  // stream ends without ever yielding one. (2026-06-26: throwing on the first
-  // api_retry dead-turned long ultracode turns with a bogus "Error: API retry".)
+  // Retryable events (SDK `api_retry`) are the SDK's own mid-stream retry, not
+  // turn-ending: surface the last only if the stream ends without a result.
   let sawResult = false;
   let lastRetryableErr: ProviderEventError | undefined;
-  // The model actually in force. `querySettings` is the snapshot this query was
-  // OPENED with and never changes; a follow-up wake with a new pin applies
-  // `fb.model` through `query.applySettings` and keeps the same stream, so the
-  // snapshot goes stale mid-turn. An escalation that named the snapshot would
-  // diagnose the OLD pin as the failing model, which is the one fact the alert
-  // exists to get right (Codex round 2).
-  // Attribution reads the PROVIDER's resolved model, never what was requested.
-  // `querySettings.model` is undefined for an unpinned pure task fire — that
-  // absence means "the group default", and only the provider can say what it
-  // resolved to. Recording the request wrote NULL to task_run_outcomes for
-  // exactly the fires this change reroutes.
+  // The provider's resolved model, never the request: `querySettings` goes stale
+  // when a follow-up applies a pin live, and an unpinned task fire requests
+  // nothing at all (the group default).
   let modelInForce = query.resolvedModel ?? querySettings.model;
-  // The status subtext reads the same resolved value, for the same reason the
-  // comment above gives: what the turn REQUESTED can be nothing at all, and a
-  // line that says "you are on the group default" answers nothing.
-  // Effort reads the PROVIDER's resolved value for the same reason the model
-  // does, and the asymmetry was a real bug: `querySettings.effort` is USER
-  // INTENT ONLY (the contract applyFlagBatch states at :3789), so a group
-  // carrying its effort in container.json requested nothing and the line
-  // showed no effort, while a sticky effort the model cannot support is
-  // clamped away and the line showed a level the turn never ran at.
-  // No `?? querySettings.effort` fallback: `resolvedEffort` is REQUIRED and
-  // `null` is a stated answer ("this turn runs with no effort setting"), not
-  // an absence to paper over. Falling back would resurrect the exact bug —
-  // a clamped-away sticky effort reappearing as though it had run.
+  // Effort is the provider's resolved value too: `querySettings.effort` is user
+  // intent only. No `?? querySettings.effort`: `null` means no effort setting,
+  // and falling back would show a clamped-away sticky effort as if it ran.
   setTurnSettings(modelInForce, query.resolvedEffort, querySettings.ultracode);
-  // Which conversation counts as "mine", for the subtext's own-voice gate.
   setOwnConversation(routing.channelType, routing.platformId);
   /**
-   * What the live stream is ACTUALLY set to. `querySettings` is the immutable
-   * creation snapshot, so once a live settings change lands it stops
-   * describing the stream — and comparing the next batch against it makes a
-   * genuine change look like no change. Concretely: a task fire applies its
-   * settings live, then chat arrives whose sticky values happen to equal the
-   * stale creation snapshot, the comparison says "unchanged", applySettings is
-   * skipped, and the human's turn silently inherits the TASK's effort and
-   * ultracode. That is this PR's own bug pointed the other way, so the
-   * baseline has to move with the stream.
+   * What the live stream is ACTUALLY set to. Comparing a batch against the
+   * immutable `querySettings` after a live retarget makes a real change look
+   * like none, and a human's turn silently inherits a task's settings.
    */
   let liveSettings: { model?: string; effort?: string; ultracode?: boolean; fast?: boolean } = { ...querySettings };
   /**
-   * One slot per ADMITTED TASK TURN, in admission order — the invariant this
-   * whole path exists to hold: *one admitted task turn produces exactly one
-   * outcome record*.
-   *
-   * Reported up rather than written here, through `onTaskOutcome` as each turn
-   * is answered and again in the return value, because one `processQuery`
-   * call is one ATTEMPT, not one fire: the outer loop re-invokes it for in-turn
-   * recovery, so only the caller can keep a fire's record to exactly one.
+   * One slot per admitted task turn, reported up via `onTaskOutcome`, never
+   * written here: this call is one ATTEMPT, so only the caller can keep a fire
+   * to exactly one record.
    */
   const taskTurns: TaskTurnRecord[] = [];
   if (routing.taskRun && initialBatchIds.length > 0) {
@@ -1831,23 +1435,16 @@ export async function processQuery(
       ...(query.initialPromptId ? { promptIds: [query.initialPromptId] } : {}),
     });
   }
-  // The latest result that answered none of the runner's prompts, held in case
-  // the provider later settles a prompt whose echo was dropped: that result is
-  // the one that consumed it. Keyed to the prompts of the fires still open when
-  // it arrived, and dropped only once those fires are answered or settled, so
-  // a result for some other prompt (a nudge the CLI ran straight after it)
-  // cannot clear it first. See the `settled` branch.
+  // Latest result that answered none of the runner's prompts, held in case the
+  // provider later settles a prompt whose echo was dropped. Dropped only when the
+  // fires open at its arrival are answered or settled; see the `settled` branch.
   let provisional: { outcome: FireOutcome; promptIds: string[] } | undefined;
   const openPromptIds = (): string[] => taskTurns.filter((t) => !t.outcome).flatMap((t) => t.promptIds ?? []);
   /**
-   * Fill the task turns a result answered. With prompt ids (`answered`), that
-   * is every open turn whose prompt the result consumed: a merged result
-   * answers each fire it took in, and a nudge's answer fills none. Without
-   * them, fill the OLDEST unanswered turn, matching the documented stream
-   * semantics that "each result event consumes the oldest unanswered prompt".
-   * When every turn is already answered the result is an in-stream
-   * nudge/wrapping retry of the turn that just closed, and is deliberately
-   * dropped: coalescing is scoped to retries OF a turn, never across turns.
+   * With prompt ids, fills every open turn the result consumed (a nudge's answer
+   * fills none); without, the OLDEST unanswered turn. A result arriving when all
+   * are answered is a retry of the closed turn and is dropped: coalescing never
+   * crosses turns.
    */
   const recordTaskTurn = async (outcome: FireOutcome, answered?: string[]): Promise<void> => {
     const oldest = taskTurns.find((t) => !t.outcome);
@@ -1862,10 +1459,8 @@ export async function processQuery(
       await onTaskOutcome?.(slot.key, outcome);
     }
   };
-  // Prompt queue for the exchange hook — each result event consumes the
-  // oldest unanswered prompt, except a wrapping-retry result, which answers
-  // the same prompt again. Unused (and unmaintained) when the provider
-  // doesn't implement `onExchangeComplete`.
+  // Each result consumes the oldest unanswered prompt, except a wrapping-retry
+  // result. Unmaintained when the provider lacks `onExchangeComplete`.
   interface PromptLedgerEntry {
     prompt: string;
     continuationId?: string;
@@ -1875,33 +1470,11 @@ export async function processQuery(
   ];
 
   /**
-   * Follow-up rows pushed into this query whose ack is not terminal yet, with
-   * the prompt id the provider stamped on each push (undefined when the
-   * provider does not track prompt ids).
-   *
-   * A mid-turn push used to be `markCompleted` on the line after
-   * `pushToQuery` — seconds after the message arrived, with no evidence the
-   * model had consumed it. `completed` is the terminal ack the host syncs onto
-   * `messages_in.status` (host `syncProcessingAcks`),
-   * and once a row is `completed` nothing re-delivers it: the wake duty stops
-   * counting it due and `completeAnsweredPendingRows` never looks at it. So a
-   * turn that died before it ever read the push took the message with it.
-   * Observed live 2026-09-22: a person's messages during a 30-minute wedged
-   * turn were acked and lost, and the thread stayed silent.
-   *
-   * A push is completed only once the provider says a result CONSUMED it: its
-   * prompt id is in that result's `answeredPrompts`, or in a later `settled`
-   * (the provider went idle holding it, so its echo was dropped and it was
-   * consumed — see the `settled` branch). Any `result` is NOT enough: the CLI
-   * can answer a turn while a pushed prompt is still queued behind it
-   * (claude.ts's `outstanding`), and completing it there loses it if the
-   * container dies before the queued turn runs. Only a provider that reports
-   * no prompt ids at all (`answeredPrompts` undefined, or a push that returned
-   * no id) falls back to completing on any `result`.
-   *
-   * If the stream ends with a push still unconsumed, the `finally` below
-   * RELEASES its claim, so the still-`pending` row is selected again —
-   * redelivery, not loss.
+   * Pushed follow-ups not yet terminally acked. `completed` is final (nothing
+   * re-delivers it), so a push completes only once a result CONSUMED its prompt
+   * id (`answeredPrompts`, or a later `settled`): the CLI can answer a turn while
+   * a push is still queued behind it. Providers without prompt ids fall back to
+   * any `result`. Pushes still unconsumed are released in the `finally`.
    */
   type PendingFollowUp = { ids: string[]; promptId: string | undefined };
   let pendingFollowUps: PendingFollowUp[] = [];
@@ -1919,26 +1492,16 @@ export async function processQuery(
     if (suppress) onContinuationPaused?.(continuationId);
   };
 
-  // Whether the provider is between turns. A `result` event says it is; every
-  // push into the stream says it isn't. This is the launch gate the ledger
-  // below cannot be: when the SDK MERGES a mid-turn push into the running turn
-  // it emits ONE result for TWO ledger entries, so `archivePrompts` over-counts
-  // from then on and its "FIFO is empty" gate never opens again. Observed in
-  // production 2026-08-16 — a queued continuation sat stranded for 52 minutes
-  // until the idle ceiling killed the container.
+  // Provider between turns: set by `result`, cleared by every push. The ledger
+  // cannot gate launches: a merged mid-turn push yields one result for two
+  // entries, so its FIFO never empties again.
   let turnIdle = false;
-  // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up): wall
-  // time from the prompt that starts a turn to the `result` event that
-  // answers it. Reset at the same choke point as `turnIdle` above, so every
-  // real push (initial batch, in-turn follow-up, durable continuation
-  // launch) restarts the clock for the turn it starts.
+  // Reset at the same push choke point as `turnIdle`.
   let turnStartedAtMs = Date.now();
   const pushToQuery = (message: string, attachments?: PromptAttachment[]): string | undefined => {
     turnIdle = false;
-    // Same boundary as `turnIdle`, published for the host. A pushed turn runs
-    // with no processing claim of its own (the initial batch was completed at
-    // the previous `result`), so this is the only thing standing between it
-    // and the idle reaper.
+    // A pushed turn has no processing claim of its own, so this flag is all that
+    // keeps the idle reaper off it.
     setProviderTurnExecuting(true);
     turnStartedAtMs = Date.now();
     const id = query.push(message, attachments);
@@ -1951,17 +1514,12 @@ export async function processQuery(
   };
 
   /**
-   * Launch the queued durable continuation, if any. `ignoreLedger` is set by
-   * the poll tick, which has already established provider idleness first-hand
-   * (turnIdle) and confirmed it had no real inbound of its own to admit.
-   * Double-launch is impossible either way: markWorkContinuationRunning is a
-   * transactional single-flight claim on the record id.
+   * `ignoreLedger`: the poll tick saw provider idleness first-hand. Double launch
+   * is impossible: markWorkContinuationRunning is a single-flight claim.
    */
   const maybeLaunchContinuation = (ignoreLedger: boolean): void => {
-    // Real inbounds already queued in the stream take priority. Their result
-    // will revisit this function; only launch durable work when the prompt FIFO
-    // is otherwise empty. This lets an explicit user stop cancel the record
-    // before its prompt is ever pushed.
+    // Queued real inbounds go first (their result revisits this), so a user stop
+    // can cancel the record before its prompt is pushed.
     if (!ignoreLedger && archivePrompts.length > 0) return;
     if (getActiveRepositoryMountBarrier() !== null) return;
     // Work the provider has accepted but not yet answered would merge with the
@@ -1998,30 +1556,27 @@ export async function processQuery(
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
-  // Slash commands push the active stream toward end-of-turn so the outer loop
-  // can dispatch them through the canonical command path. Once we've decided to
-  // end, gate further polling so we don't reclaim the rows mid-teardown.
+  // Once ending for a command, stop polling so rows are not reclaimed mid-teardown.
   let endedForCommand = false;
-  // The host's ⚙️ ack reads as "applied", but a deferred change can wait for
-  // the whole of a long turn. Say so once per pending change, not every poll.
+  // A deferred change can wait a whole long turn despite the host's ⚙️ ack; say
+  // so once per pending change.
   let deferredSettingsNotice: string | null = null;
+  let runtimeUpdateNote = '';
+  let liveEffortFailedFor: string | null = null;
   let corruptionStreak = 0;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
 
     void (async () => {
-      // Set when this tick pushed a real inbound (which outranks durable work)
-      // and when it failed outright — both suppress the continuation launch at
-      // the bottom.
+      // Either suppresses the continuation launch at the bottom.
       let admittedInbound = false;
       let pollFailed = false;
       try {
         const repositoryBarrier = getActiveRepositoryMountBarrier();
         if (repositoryBarrier !== null) {
-          // Stop accepting follow-ups and let the current provider turn/tool
-          // finish. The outer loop acknowledges only after processQuery has
-          // returned, which proves this active query is fully drained.
+          // The outer loop acknowledges only after processQuery returns, which
+          // proves this query is drained.
           log(`Repository mount barrier ${repositoryBarrier} observed — ending active query after current work`);
           endedForCommand = true;
           query.end();
@@ -2045,15 +1600,9 @@ export async function processQuery(
           query.abort();
           return;
         }
-        // A due fresh-context task fire needs the outer loop's reset, and this
-        // stream otherwise stays open after its result. end() is only safe
-        // between turns with no background work (the immutable-settings gate
-        // below): Claude's end() closes stdin once the first result
-        // is in (SDK 0.3.280 `Query.streamInput`), while Codex and OpenCode read
-        // `ended` only between turns,
-        // so for them the gate only defers. Until then the fire stays pending,
-        // since selectInTurnFollowUps never pushes it, and the next poll
-        // retries. Other rows are still admitted meanwhile.
+        // A due fresh-context fire needs the outer loop's reset. end() is safe
+        // only between turns with no background work; until then the fire stays
+        // pending (never pushed) and the next poll retries.
         if (
           allPending.some((m) => m.trigger === 1 && startsFreshFire([m])) &&
           turnIdle &&
@@ -2067,33 +1616,16 @@ export async function processQuery(
           return;
         }
 
-        // Flag-bearing messages (-m/-e/-f) are handled after admission, below:
-        // stickies are persisted and live-capable settings are applied via
-        // provider control requests (query.applySettings). Providers with
-        // immutable runtime context defer the new batch until the current turn
-        // is idle, then reopen; ending an active Claude input stream cuts off
-        // its control channel while the current turn can still need tools.
+        // Providers with immutable runtime context defer a flag batch until idle:
+        // ending an active Claude input stream cuts off its control channel.
 
-        // Filtering on thread_id here caused deadlocks when the initial batch
-        // and follow-ups had mismatched thread_ids (e.g. a host-generated welcome
-        // trigger with null thread vs a Discord DM reply); per-thread sessions
-        // already isolate threads, so the router's routing is sufficient.
-        //
-        // Admission rules live in selectInTurnFollowUps so they can be unit-
-        // tested. Defers (returns []) when no admissible trigger=1 row is
-        // present in the snapshot; otherwise admits accumulated trigger=0
-        // chat context plus paired recall_context. The helper also drops
-        // system rows except recall_context, replacing the older `kind !==
-        // 'system'` filter from upstream's poll-loop.
+        // No thread_id filter: mismatched thread ids between batch and follow-ups
+        // deadlocked, and per-thread sessions already isolate threads.
         const candidates = selectInTurnFollowUps(allPending);
         if (candidates.length === 0) return;
 
-        // Run pre-task scripts BEFORE claiming rows. A scripted task with
-        // wakeAgent=false can drop the only admissible trigger from the
-        // batch; if we'd already markProcessing'd the trigger=0 chat
-        // context, those rows would be hidden behind processing acks even
-        // though they were never sent to the agent. Deferring the claim
-        // lets us walk away cleanly when no real trigger survives.
+        // Run pre-task scripts BEFORE claiming: a gated trigger would otherwise
+        // leave the context rows hidden behind processing acks.
         // MODULE-HOOK:scheduling-pre-task-followup:start
         const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
         const preTask = await applyPreTaskScripts(candidates);
@@ -2101,11 +1633,8 @@ export async function processQuery(
         const skipped = preTask.skipped;
         // MODULE-HOOK:scheduling-pre-task-followup:end
 
-        // Re-validate post-script: if the only admissible trigger was a
-        // task that the script gated, keep would be trigger=0 chat (and
-        // possibly orphaned recall_context). Don't push context-only into
-        // an active stream — defer it for the next real wake. Skipped task
-        // IDs still get marked completed so the script is not re-run.
+        // No admissible trigger survived: never push context-only into the stream.
+        // Skipped task ids are still completed so the script is not re-run.
         if (!keep.some(isAdmissibleTrigger)) {
           if (skipped.length > 0) {
             markScriptSkipped(skipped);
@@ -2123,45 +1652,16 @@ export async function processQuery(
           return;
         }
 
-        // Settings change since this query was created — from a flag
-        // row OR a mid-turn change_model tool call (which writes sticky_model
-        // directly, with NO flag row). applyFlagBatch persists any flag stickies
-        // (previously this never ran on the follow-up path, so flags were acked
-        // by the host then silently dropped; observed live 2026-06-10) AND
-        // re-reads the current effective model/effort — idempotent on a no-flag
-        // batch — so comparing it to the query's creation values catches BOTH
-        // paths. (Previously gated on hasFlagIntent, so a change_model sticky
-        // write was silently pushed into the old-model stream — Codex P1.) A
-        // provider without live controls (opencode/codex) ends the stream so the
-        // outer loop reopens on the new model, leaving these rows pending; one
-        // with live controls (claude) applies it in place, same stream.
-        // applyFlagBatch, NOT effectiveTurnSettings — deliberately, and this is
-        // the one place scheduled-task suppression does NOT apply.
-        //
-        // `keep` here is the newly-admitted SUB-BATCH, not the turn. A task row
-        // becoming due while an interactive query is still streaming makes
-        // `keep` a lone task row, so `isPureTaskWake` is true — but the turn it
-        // would retarget may be a human's, mid-answer. Suppressing here moved
-        // someone's in-progress work off their own model and effort: the exact
-        // inverse of the bug this file's suppression exists to prevent.
-        //
-        // `isPureTaskWake` is not the wrong IDEA here, it is the wrong
-        // QUESTION. It answers "is this batch a task wake"; deciding whether to
-        // retarget a running turn needs to know whether that TURN is idle, and
-        // a fragment of a turn cannot say. Doing it properly needs turn-level
-        // state, which is new machinery on a seam that has already failed
-        // twice — see the follow-up issue linked from CHANGELOG.
-        //
-        // So the pre-existing behaviour stands: a task occurrence joining a
-        // running stream inherits that stream's settings. Documented as a known
-        // limitation rather than left for someone to rediscover.
+        // applyFlagBatch persists flag stickies and re-reads effective settings,
+        // catching both flag rows and mid-turn change_model writes. Providers
+        // without live controls end the stream (rows stay pending); Claude applies
+        // in place. Task suppression deliberately does NOT apply: `keep` is a
+        // sub-batch, and a lone due task row would retarget a human's running turn.
+        // Known limitation: a task joining a running stream inherits its settings.
         const fb = applyFlagBatch(keep, extractRouting(keep), providerName, {
           ignoreTaskFlagIntents: options.ignoreTaskFlagIntents,
         });
-        // Same note as the opening batch: a `-m`/`-m1` for the other provider
-        // arriving mid-stream resolves to undefined — often equal to the live
-        // default, so nothing below restarts anything and the host's ⚙️ ack is
-        // the last word the user saw. Say it is being ignored here too.
+        // A `-m` for the other provider resolves to undefined and changes nothing: say it is ignored.
         if (fb.ignoredModel !== undefined) {
           await noteIgnoredModel(
             fb.ignoredModel,
@@ -2170,9 +1670,8 @@ export async function processQuery(
             extractRouting(keep),
             fb.ignoredModelWasExplicit === true,
           );
-          // Re-check after the await, as `applySettings` below does before
-          // claiming: the stream can end during this yield, and rows marked
-          // processing against a dead query sit claimed until stale detection.
+          // The stream can end during this await; rows claimed against a dead
+          // query sit until stale detection.
           if (done) return;
         }
         const liveSettingsChanged =
@@ -2181,18 +1680,43 @@ export async function processQuery(
           fb.ultracode !== liveSettings.ultracode;
         const fastChanged = fb.fast !== (liveSettings.fast ?? false);
         if (liveSettingsChanged || fastChanged) {
-          // Codex fast mode is selected when its app-server starts. Even if a
-          // provider supports live model/effort controls, a tier change must
-          // end this query so the outer loop can respawn with new overrides.
-          if (query.requiresRestartForRuntimeContext && liveSettingsChanged) {
-            // Claude's system prompt is fixed when the SDK query starts. It
-            // cannot honestly accept a new model/effort until the next query,
-            // but end() is only safe between turns: closing streaming input
-            // while a turn runs also closes its control channel.
-            // Leave these rows pending and retry on the next idle poll.
-            // Live background work is the same hazard between turns: the
-            // open input is what keeps a background subagent alive, so
-            // end() here would kill the worker the busy hold protects.
+          // Codex fast mode is fixed at app-server start: a tier change must end
+          // the query even when live controls exist.
+          let appliedLive = false;
+          if (
+            query.requiresRestartForRuntimeContext &&
+            liveSettingsChanged &&
+            !fastChanged &&
+            fb.model === liveSettings.model &&
+            fb.effort !== 'max' &&
+            query.applySettings &&
+            (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) &&
+            onlyTypedStickyEffort(keep) &&
+            liveEffortFailedFor !== JSON.stringify([fb.effort, fb.ultracode])
+          ) {
+            try {
+              await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
+              appliedLive = true;
+              modelInForce = query.resolvedModel ?? fb.model;
+              setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
+              liveSettings = { model: fb.model, effort: fb.effort, ultracode: fb.ultracode, fast: fb.fast };
+              runtimeUpdateNote = activeRuntimeEffortUpdate(query.resolvedEffort ?? null);
+              deferredSettingsNotice = null;
+              log(`Live effort change applied mid-query: effort=${query.resolvedEffort ?? '(none)'}`);
+            } catch (err) {
+              liveEffortFailedFor = JSON.stringify([fb.effort, fb.ultracode]);
+              log(
+                `Live effort change failed (${err instanceof Error ? err.message : String(err)}) — ` +
+                  'deferring to a fresh query at the next idle boundary',
+              );
+            }
+            if (done) return;
+          }
+          if (!appliedLive && query.requiresRestartForRuntimeContext && liveSettingsChanged) {
+            // Claude's system prompt is fixed at query start, so a new model, or an
+            // effort the live control cannot set, needs a new query. end() is only
+            // safe between turns with no background work: closing input mid-turn closes
+            // the control channel, and open input keeps background subagents alive.
             if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) {
               log(
                 'Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain',
@@ -2221,7 +1745,7 @@ export async function processQuery(
             query.end();
             return;
           }
-          if (fastChanged || !query.applySettings) {
+          if (!appliedLive && (fastChanged || !query.applySettings)) {
             log(
               `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +
                 `fast=${liveSettings.fast ? 'on' : 'off'} → ${fb.fast ? 'on' : 'off'}) — ` +
@@ -2230,34 +1754,24 @@ export async function processQuery(
             endedForCommand = true;
             query.end();
             return;
+          } else if (!appliedLive && query.applySettings) {
+            try {
+              await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
+              modelInForce = query.resolvedModel ?? fb.model;
+              // The provider's getter already reflects the retarget, so it beats the requested value.
+              setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
+              liveSettings = { model: fb.model, effort: fb.effort, ultracode: fb.ultracode, fast: fb.fast };
+            } catch (err) {
+              log(
+                `Live applySettings failed (${err instanceof Error ? err.message : String(err)}) — ` +
+                  'ending stream; outer loop reopens with the new model',
+              );
+              endedForCommand = true;
+              query.end();
+              return;
+            }
           }
-          try {
-            await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
-            // Same read as at creation — one source, so a retarget and an open
-            // cannot disagree about what ran.
-            modelInForce = query.resolvedModel ?? fb.model;
-            // A mid-turn `-m`/`-e` retargets the live stream, so every message
-            // written after this point is genuinely on the new settings and the
-            // subtext has to move with them.
-            // Post-retarget the provider's getter is already updated
-            // (claude.ts `applySettings` reassigns activeEffort), so it
-            // still beats the requested value here.
-            setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
-            // The stream has moved; the comparison baseline moves with it, or
-            // the next batch is measured against a snapshot that no longer
-            // describes anything.
-            liveSettings = { model: fb.model, effort: fb.effort, ultracode: fb.ultracode, fast: fb.fast };
-          } catch (err) {
-            log(
-              `Live applySettings failed (${err instanceof Error ? err.message : String(err)}) — ` +
-                'ending stream; outer loop reopens with the new model',
-            );
-            endedForCommand = true;
-            query.end();
-            return;
-          }
-          // The await above widens the done-race window — re-check before
-          // claiming so rows aren't marked processing against a dead stream.
+          // The await widens the done-race; re-check before claiming.
           if (done) return;
         }
 
@@ -2279,11 +1793,8 @@ export async function processQuery(
           log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.map((s) => s.id).join(', ')}`);
         }
         const prompt = formatMessages(keep);
-        // Refresh the per-batch in_reply_to so MCP send_message stamps
-        // outbound rows with the follow-up batch's anchor, not the outer
-        // turn's. Without this, an a2a inbound pushed mid-turn has its
-        // reply routed back to the outer-turn source session, which can
-        // be a different session in a different mg.
+        // Refresh in_reply_to to the follow-up batch, or a mid-turn a2a reply
+        // routes to the outer turn's source session.
         const followUpRouting = extractRouting(keep);
         setCurrentInReplyTo(followUpRouting.inReplyTo);
         setCurrentBatchAnchors(keep);
@@ -2292,16 +1803,13 @@ export async function processQuery(
         unwrappedNudged = false;
         taskBlockNudged = false;
         notificationWatermark = maxOutboundSeq();
-        // Every new check-in restarts the watermark: a progress message sent
-        // for the earlier request is not an answer to this one.
+        // A new check-in restarts the watermark: progress sent for an earlier
+        // request does not answer this one.
         const pushedDebt = replyDebt(keep, followUpRouting);
         const pushedHumanTrigger = pushedDebt !== null;
         if (pushedDebt) humanReplyOwed = pushedDebt;
-        // A later occurrence joining this stream is a SEPARATE fire and needs
-        // its own outcome slot. Without this it answered into the first fire's
-        // slot — or, once that was filled, vanished — so a frequently failing
-        // series could sit below the escalation threshold forever, which is
-        // precisely the outcome this feature exists to prevent.
+        // A later occurrence is a SEPARATE fire with its own outcome slot, or a
+        // failing series can stay under the escalation threshold forever.
         let admittedTurn: TaskTurnRecord | undefined;
         if (routing.taskRun) {
           const admittedTaskIds = keep.filter((m) => m.kind === 'task').map((m) => m.id);
@@ -2310,12 +1818,8 @@ export async function processQuery(
             taskTurns.push(admittedTurn);
           }
         }
-        // A push into a RUNNING turn is merged into it, and that turn's
-        // `result` may be an hour away. Text written between tool calls is
-        // never dispatched (only the result text is — dispatchResultText), so
-        // an "on it" typed there reaches nobody. Observed live 2026-09-17: a
-        // person's five check-ins over 23 hours were each answered that way
-        // and none was delivered.
+        // A push into a RUNNING turn is merged, and only result text is
+        // dispatched, so an acknowledgment typed between tool calls reaches nobody.
         const midTurnNote =
           pushedHumanTrigger && !turnIdle
             ? outcomeReportingEnabled()
@@ -2325,18 +1829,15 @@ export async function processQuery(
                 'To answer now, write a complete <message to="name">...</message> block or call the ' +
                 '`send_message` tool.</system>'
             : '';
-        const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
+        const pushedId = pushToQuery(runtimeUpdateNote + prompt + midTurnNote, extractAttachments(keep));
+        runtimeUpdateNote = '';
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
         admittedInbound = true;
-        // NOT markCompleted here — see `pendingFollowUps`. The claim stays
-        // `processing` until the provider reports this prompt consumed.
+        // NOT markCompleted here — see `pendingFollowUps`.
         pendingFollowUps.push({ ids: keptIds, promptId: pushedId });
-        // Deliberately no touchHeartbeat() here: that would restart the idle
-        // ceiling on every inbound message. A claim held across a long silent
-        // tool, or a long think, is forgiven host-side instead —
-        // `decideStuckAction`'s tool-in-flight and live-query rules
-        // (src/modules/sweep-container-health/index.ts).
+        // No touchHeartbeat() here: it would restart the idle ceiling on every
+        // inbound. Long silent tools are forgiven host-side (`decideStuckAction`).
       } catch (err) {
         pollFailed = true;
         // Without this catch the rejection escapes the void IIFE and Node
@@ -2346,12 +1847,7 @@ export async function processQuery(
         const errMsg = err instanceof Error ? err.message : String(err);
         log(`Follow-up poll error: ${errMsg}`);
 
-        // Detect SQLite cross-mount corruption (Docker Desktop macOS virtiofs /
-        // gRPC-FUSE coherency bug — the kernel page cache for the inbound.db
-        // bind mount can latch a torn snapshot mid-host-write, after which
-        // every fresh openInboundDb() in this process sees the same broken
-        // view. Reopening inside the container does NOT recover; only a fresh
-        // container mount does. Exit so the host sweep respawns us.
+        // Cross-mount corruption (see isCorruptionError): exit so host-sweep respawns a fresh mount.
         if (isCorruptionError(errMsg)) {
           corruptionStreak += 1;
           if (corruptionStreak >= CORRUPTION_STREAK_EXIT) {
@@ -2371,10 +1867,8 @@ export async function processQuery(
           corruptionStreak = 0;
         }
       } finally {
-        // Second launch site for durable continuations, reached from every
-        // early return above (the tick found nothing admissible). It gates on
-        // observed provider idleness rather than the prompt ledger, which a
-        // merged mid-turn push permanently corrupts — see `turnIdle`.
+        // Second continuation launch site: gates on observed idleness, since a
+        // merged push corrupts the prompt ledger (see `turnIdle`).
         if (!admittedInbound && !pollFailed && turnIdle && !done && !endedForCommand) {
           maybeLaunchContinuation(true);
         }
@@ -2384,21 +1878,10 @@ export async function processQuery(
   }, ACTIVE_POLL_INTERVAL_MS);
 
   /**
-   * A bounded busy scope held across `result` HANDLING, not just the turn.
-   *
-   * Lowering the turn level at `result` is correct — the turn really is over —
-   * but the handling that follows completes the initial batch's processing
-   * claim and only THEN decides whether to push a corrective follow-up (a
-   * task-block nudge, a wrapping retry, a queued continuation). Between the
-   * `markCompleted` and that push, a task container has no due row, no claim,
-   * no continuation and no raised turn: every reaper term reads idle and a
-   * sweep tick landing there kills the container and loses the follow-up this
-   * change exists to protect. The scope spans that gap, and because the
-   * published bit is the union, closing it leaves the flag raised whenever
-   * handling did push a new turn.
-   *
-   * Idempotent, and also closed in the outer `finally`, so an exception thrown
-   * mid-handling cannot leak a scope and pin the container until the ceiling.
+   * Busy scope across `result` HANDLING: between completing the batch and
+   * pushing a corrective follow-up, every reaper term reads idle and a sweep
+   * would kill the container. Idempotent; also closed in the outer `finally`, so
+   * a throw cannot pin the container until the ceiling.
    */
   let resultScopeOpen = false;
   const openResultScope = (): void => {
@@ -2413,60 +1896,36 @@ export async function processQuery(
   };
 
   /**
-   * Lower the turn level unless the provider is holding work it has accepted
-   * but not started.
-   *
-   * `claude.ts` merges a mid-turn push into the running turn, so its `result`
-   * really does settle everything pushed so far. `opencode.ts` has no merge
-   * path: every push is queued as a separate future turn, so the same `result`
-   * can arrive with a follow-up already accepted and not yet dispatched.
-   * Lowering there publishes idle across the gap between this result and the
-   * queued turn's first event — the follow-up rows were completed when they
-   * were pushed, so no due row, claim or continuation covers it either — and a
-   * sweep tick landing in that gap kills the container and loses the follow-up.
-   *
-   * The queued turn's own `result` re-runs this check with the queue drained,
-   * so the flag still drops on the tick the container really goes idle.
-   *
-   * Deliberately asks the PROVIDER, not `archivePrompts`: a merged push leaves
-   * a phantom ledger entry behind forever (see `turnIdle`), so gating on the
-   * ledger would pin every Claude session busy after its first merge.
+   * Lower the turn level unless the provider holds accepted-but-unstarted work:
+   * a queuing provider (opencode) can reach `result` with a follow-up pending,
+   * and publishing idle across that gap lets a sweep kill the container. Asks
+   * the PROVIDER, not `archivePrompts`, whose phantom merged entries would pin
+   * every Claude session busy.
    */
   const lowerTurnLevelUnlessQueued = (): void => {
     if (query.hasQueuedWork?.()) return;
-    // Same gap, different work: a background agent launched this turn is
-    // still running inside the CLI after `result`. Lowering here published
-    // idle for it and the task reaper killed the container — and the agent —
-    // within one sweep tick (2026-09-15: a task session's parent ended each
-    // turn on a `wait`, was reaped 15–60s later nine times in 80 minutes, and
-    // every delegated worker died mid-flight). The `background_work` report
-    // at the CLI's idle re-runs this once that work is done.
+    // A background agent launched this turn still runs inside the CLI after
+    // `result`; lowering here lets the reaper kill it. The `background_work`
+    // report re-runs this once that work is done.
     if (query.hasBackgroundWork?.()) return;
     setProviderTurnExecuting(false);
   };
 
-  // The initial prompt is a turn the same way a push is; `result` clears it.
   setProviderTurnExecuting(true);
-  // A new query has emitted nothing yet. Until its first event the host's claim
-  // rule treats it as possibly hung at the gate (`markProviderQueryEvent`).
+  // Until its first event the host treats a new query as possibly hung at the gate.
   resetProviderQueryEvent();
   try {
     for await (const event of query.events) {
       if (event.type === 'error') {
         const err = new ProviderEventError(event);
         if (event.retryable) {
-          // SDK's own mid-stream retry signal (api_retry). Don't abort — the
-          // SDK retries internally and a result usually follows. Surfaced
-          // after the loop only if no result ever arrives.
+          // Don't abort: the SDK retries internally and a result usually follows.
           log(`Retryable upstream event (${event.message}) — continuing; SDK is retrying`);
           lastRetryableErr = err;
           continue;
         }
-        // Report the failure upward instead of writing it. This branch throws,
-        // so the OUTER loop decides what happens next: it may recover in-turn
-        // (credential rotation, stale-session retry, Codex idle) and call
-        // `processQuery` again. Writing here would give one logical fire several
-        // failure rows and could alert on a task that recovered moments later.
+        // Report upward, never write here: the outer loop may recover in-turn,
+        // and a write per attempt gives one fire several failure rows.
         notifyExchangeComplete(onExchangeComplete, {
           prompt: archivePrompts[0]?.prompt ?? initialPrompt,
           result: `Error: ${event.message}`,
@@ -2494,27 +1953,10 @@ export async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
-        // The SDK emits `init` at the start of EVERY turn, including one it
-        // starts on its own inside an already-open stream (e.g. a resume
-        // whose first turn answers empty, then genuinely does the work on a
-        // second turn nobody pushed). That second turn is not a `pushToQuery`
-        // call, and a provider that cannot tell it is still queued has let the
-        // prior empty `result` lower the flag, so without this, the
-        // task reaper sees it as idle and kills it mid-work on the next tick.
-        //
-        // `turnIdle` and `turnStartedAtMs` are normally only touched by
-        // `pushToQuery` (a runner-initiated push) and the `result` handler
-        // below — this SDK-started turn is neither. Left stale-true, the poll
-        // tick's continuation launch (turnIdle-gated, a few lines down) reads
-        // "provider idle" and pushes a queued continuation INTO this running
-        // turn: the SDK merges it, so one `result` answers two ledger
-        // entries, which is exactly what `turnIdle` exists to prevent (see
-        // its own comment above). Reset both here — but ONLY when `turnIdle`
-        // was still true, i.e. this `init` was never preceded by a push for
-        // this turn: a pushed turn's `init` arrives after `pushToQuery`
-        // already cleared it and stamped the real push-time clock, and
-        // re-stamping here would throw away that earlier, more accurate
-        // start time.
+        // `init` also starts SDK-initiated turns nobody pushed. Mark them running,
+        // or the reaper kills them mid-work and a continuation launch merges
+        // into them. Only when `turnIdle` was still true: a pushed turn already
+        // stamped the more accurate push-time clock.
         if (turnIdle) {
           turnIdle = false;
           turnStartedAtMs = Date.now();
@@ -2522,20 +1964,15 @@ export async function processQuery(
         setProviderTurnExecuting(true);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
-        // Interim deliveries belong to the turn this result ends, whatever its
-        // text — an empty result must not leave them to eat the NEXT turn's
-        // identical block.
+        // Interim deliveries belong to the turn this result ends, even an empty
+        // one, or they eat the next turn's identical block.
         const interimThisTurn = [...deliveredInterimBlocks];
         deliveredInterimBlocks.clear();
         const interimTaskBlocks = suppressedInterimTaskBlocks.splice(0);
-        // A turn that consumed none of the runner's prompts never answers a
-        // task fire: the CLI's synthetic "Continue from where you left off."
-        // turn on resuming an interrupted session, or a turn a background-task
-        // notification started. Recorded, it would take the fire's one outcome
-        // slot and drop the real turn's result. A provider that tracks
-        // prompt ids says which prompts each result answered
-        // (`answeredPrompts`, empty for none); one that does not leaves every
-        // result eligible.
+        // A turn that consumed none of the runner's prompts (the CLI's synthetic
+        // resume turn, a background-task notification) never answers a task
+        // fire: recording it would take the fire's one outcome slot. Providers
+        // without prompt ids leave every result eligible.
         const answersRunnerPrompt = event.answeredPrompts === undefined || event.answeredPrompts.length > 0;
         if (routing.taskRun && !answersRunnerPrompt) {
           log('Result answered no runner prompt (a turn the CLI started itself); not recorded as the task outcome');
@@ -2547,39 +1984,18 @@ export async function processQuery(
               ? { outcome: { text: event.text ?? '', isError: event.isError === true, model: modelInForce }, promptIds }
               : undefined;
         }
-        // The provider is between turns as of right now. Set before the
-        // handling below, so any push it makes (nudge, continuation launch)
-        // clears the flag again and leaves it truthful on exit.
+        // Set before handling, so any push it makes clears it again.
         turnIdle = true;
-        // The host's copy of that same fact. It has to be published HERE and
-        // not around the whole call: a multi-turn stream stays open after
-        // `result` to accept pushes (claude.ts's generator exits only on
-        // end()/abort), so a flag cleared on return would sit at 1 through
-        // the entire idle stretch and keep the task reaper off a container
-        // that has nothing left to do. It lowers only the TURN level: a
-        // pre-task script the poll callback started concurrently keeps its own
-        // scope, so this cannot cut the ground out from under it. The scope
-        // opened first keeps the published bit raised across the handling
-        // below, which completes this batch's claim before it decides whether
-        // to push a follow-up turn.
-        // A provider that QUEUES pushes instead of merging them holds the
-        // level up for itself — see lowerTurnLevelUnlessQueued.
+        // Published here, not around the call: the stream stays open after
+        // `result`, so a flag cleared on return would keep the reaper off an
+        // idle container. Lowers only the TURN level (a concurrent pre-task
+        // script keeps its own scope); the result scope holds the bit across
+        // the handling below.
         openResultScope();
         lowerTurnLevelUnlessQueued();
-        // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
-        // written here because every provider's query converges on this
-        // event regardless of which one ran. Whatever the provider didn't
-        // expose comes through as NULL — see TurnUsageInfo. A turn spanning
-        // multiple models (event.usage as an array) writes one row per model
-        // so each is attributed separately instead of collapsing to NULL.
-        // steps/duration/trigger/turnId (Phase 0.1 follow-up) are turn-level,
-        // not per-model, so every row from a multi-model turn carries the
-        // same values — computed once, right here, before anything below can
-        // push a follow-up and reset turnStartedAtMs for the NEXT turn.
-        // turnId in particular MUST be generated here (once per `result`
-        // event), not inside the per-model loop below — it's the field that
-        // lets a multi-model turn's split rows be recognized as one turn
-        // (usage_daily's row-count-based `turns` over-counts them).
+        // One turn_usage row per model per completed turn. Turn-level fields
+        // are computed once, before any follow-up push resets turnStartedAtMs;
+        // the shared turnId marks a multi-model turn's rows as one turn.
         const turnMeta = {
           turnId: randomUUID(),
           steps: event.steps ?? null,
@@ -2589,55 +2005,26 @@ export async function processQuery(
           rateLimitUtilization: event.rateLimit?.utilization ?? null,
           rateLimitResetsAt: event.rateLimit?.resetsAt ?? null,
         };
-        // The continuation is the accounting scope for providers that report
-        // a running total (Claude's SDK session, Codex's thread) — see
-        // turn-usage.ts's toTurnDelta. Without it, the first turn of a new
-        // series can be silently subtracted against the previous one's
-        // stored total. Empty string when the provider hasn't produced a
-        // continuation yet, which just means "one implicit series".
+        // The continuation scopes running-total usage (toTurnDelta); without it
+        // a new series' first turn is subtracted against the previous total.
         const usageScope = queryContinuation ?? initialContinuation ?? '';
         for (const usage of Array.isArray(event.usage) ? event.usage : [event.usage]) {
           recordTurnUsage(providerName, usage, turnMeta, usageScope);
         }
-        // A `result` event signals the assistant's turn is complete, but the
-        // provider's events generator stays open for follow-up `push()` calls
-        // (see the query generator in providers/claude.ts — the
-        // generator only exits on `stream.end()`/abort). We must NOT flip
-        // the `done` flag here; the polling interval depends on `done` to
-        // gate follow-up admission, and stopping it after the first result
-        // would
-        // starve every subsequent inbound trigger=1 row in this session
-        // (codex F4, 2026-05-05). The race the prior synchronous flip
-        // claimed to fix was illusory: pushes into an open multi-turn stream
-        // become the next turn, they're not eaten by the SDK.
-        //
-        // Mark the initial batch completed now so the host sweep doesn't see
-        // stale 'processing' claims while the query stays open for follow-up
-        // pushes. The agent may have responded via MCP (send_message)
-        // mid-turn, or the message may not need a response at all — either
-        // way the per-turn work for these rows is finished.
+        // Do NOT set `done` here: the generator stays open for follow-up pushes
+        // and polling gates on `done`, so it would starve every later trigger.
+        // Complete the initial batch now so the sweep sees no stale claims
+        // while the query stays open.
         markCompleted(initialBatchIds);
-        // Pushes this result CONSUMED — not every push outstanding: one still
-        // queued behind the answered prompt stays claimed until its own
-        // result or a `settled`. See `pendingFollowUps`.
+        // Only pushes this result CONSUMED; one still queued stays claimed.
         const answered = event.answeredPrompts;
         completeConsumedFollowUps(
           (f) => answered === undefined || f.promptId === undefined || answered.includes(f.promptId),
         );
         if (event.text) {
-          // AUP refusal fast-fail: when Anthropic's content policy filter
-          // fires mid-task, the SDK returns a terminal chat response with
-          // the literal "API Error: Claude Code is unable to respond...
-          // violates our Usage Policy" text. The agent has no further turn
-          // and falls silent. If this is a spawned child, sit-and-wait
-          // until the parent's no-progress watchdog reaps the task — which
-          // it does after 30 minutes, burning real wallclock for no reason
-          // and surfacing the failure as the opaque `no_progress_timeout`
-          // rather than the actual cause. Emit spawn_failed here so the
-          // parent knows immediately and the dashboard card reflects the
-          // real reason. Match conservatively: require both anchor phrases
-          // (Claude Code prefix + Usage Policy URL) so legitimate prose
-          // discussing policy doesn't trip the detector.
+          // AUP refusal: the agent falls silent, and a spawned child would wait
+          // 30 min for the parent's no-progress watchdog; emit spawn_failed so
+          // the parent learns the real cause now.
           const aupRefusal = isAupRefusal(event.text);
           if (aupRefusal) {
             const taskId = getSessionSpawnTaskId();
@@ -2658,8 +2045,7 @@ export async function processQuery(
               });
             }
           }
-          // An agent that posted an update mid-turn often repeats it verbatim in
-          // its final text; the person already has it.
+          // A mid-turn update is often repeated verbatim in the final text.
           const {
             sent,
             hasUnwrapped,
@@ -2750,25 +2136,18 @@ export async function processQuery(
               humanReplyOwed = null;
           }
         } else {
-          // `ProviderEvent.text` is `string | null`, so a terminal result can
-          // carry no text at all. That is still a fire that happened, and
-          // recording it is what lets a recovered run RESET a stale failure
-          // streak — skipping it would leave the streak frozen at its last
-          // failing value across a recovery.
+          // A result with null text is still a fire; recording it lets a
+          // recovery reset a stale failure streak.
           if (routing.taskRun && (event.answeredPrompts !== undefined || (!taskBlockNudged && answersRunnerPrompt))) {
             await recordTaskTurn(
               { text: '', isError: event.isError === true, model: modelInForce },
               event.answeredPrompts,
             );
           }
-          // An empty result is normally fine — the agent answered through
-          // `send_message`, or the message needed no answer. It is NOT fine
-          // when a person's triggering message is owed a reply and nothing
-          // readable was written since it was admitted: the wrapping nudge
-          // above keys on unwrapped RESULT text, so an agent that typed its
-          // answer between tool calls and then ended the turn empty got no
-          // nudge at all (2026-09-17, same thread as the mid-turn note).
-          // One nudge per batch, shared with the wrapping retry.
+          // An empty result is NOT fine when a person is owed a reply and
+          // nothing readable was written since: the wrapping nudge keys on
+          // result text and misses an answer typed between tool calls. One
+          // nudge per batch, shared with the wrapping retry.
           if (
             outcomeReportingEnabled() &&
             shouldNudgeTaskBlocks(routing.taskRun, interimTaskBlocks, taskBlockNudged) &&
@@ -2815,28 +2194,17 @@ export async function processQuery(
           const stillOpen = openPromptIds();
           if (!provisional.promptIds.some((id) => stillOpen.includes(id))) provisional = undefined;
         }
-        // The context figure belongs to the turn that measured it, and THIS is
-        // the turn boundary — not emitTurnEnd. `processQuery` deliberately
-        // consumes many `result` events while the provider's generator stays
-        // open for follow-up pushes (see the note at the top of this branch),
-        // so emitTurnEnd runs once per QUERY, after the last of them. Clearing
-        // there would let turn N+1 inherit turn N's figure whenever N+1
-        // produced no usable usage frame. Safe here specifically: every
-        // dispatch for this result has already run above.
+        // Clear per result, not at emitTurnEnd (once per QUERY), or turn N+1
+        // inherits turn N's figure. Safe here: this result's dispatches have run.
         clearContextTokens();
-        // The roster has the same per-turn lifetime as the context figure and
-        // must clear at the same boundary: one query serves many turns, so a
-        // roster left standing would name workers a LATER turn never deployed.
+        // Same boundary for the roster, or it names workers a later turn never deployed.
         clearSubagents();
-        // Handling is done deciding. If it pushed, the turn level is raised
-        // again and the published bit stays 1; if it did not, this is where
-        // the container becomes reapable.
+        // If handling pushed, the level stays raised; otherwise the container
+        // becomes reapable here.
         closeResultScope();
       } else if (event.type === 'settled') {
-        // The provider went idle holding prompts it never saw answered, so
-        // their echo was dropped (sdk.d.ts lists the cases). The last result
-        // that answered none of the runner's prompts is the one that consumed
-        // them.
+        // The provider went idle holding prompts never seen answered, so their
+        // echo was dropped; the last unmatched result consumed them.
         const settledIds = event.unansweredPrompts;
         completeConsumedFollowUps((f) => f.promptId !== undefined && settledIds.includes(f.promptId));
         if (routing.taskRun && provisional) {
@@ -2845,26 +2213,18 @@ export async function processQuery(
           if (covered.length > 0) await recordTaskTurn(held.outcome, covered);
         }
         provisional = undefined;
-        // `result` kept the level up while these prompts looked queued
-        // (lowerTurnLevelUnlessQueued). The turn is over now.
+        // `result` held the level while these looked queued; the turn is over now.
         lowerTurnLevelUnlessQueued();
       } else if (event.type === 'background_work') {
-        // The level was held at `result` for this work (lowerTurnLevelUnlessQueued).
-        // The provider reports the level at the CLI's idle, which that CLI
-        // withholds until background agents are done and any follow-up turn
-        // they start has run — so `live: 0` with no turn running means the
-        // container is genuinely idle, with no init still on its way. A
-        // report mid-turn changes nothing: the turn's own `result` decides.
+        // The CLI withholds this report until background agents and any turn
+        // they start are done, so `live: 0` with no turn running is genuinely
+        // idle. A mid-turn report changes nothing.
         if (event.live === 0 && turnIdle && !resultScopeOpen) lowerTurnLevelUnlessQueued();
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);
-        // The SDK auto-compacted the conversation. After compaction the
-        // model can lose both the once-per-context bootstrap and learned
-        // `<message to="…">` wrapping discipline. Re-inject the bounded
-        // canonical index + capabilities immediately, before any queued
-        // follow-up can run against the compacted context. This is the
-        // runner fallback only: the next host-admitted turn observes the
-        // advanced epoch and resumes normal relevant-delta recall.
+        // Compaction can drop the bootstrap and `<message to>` wrapping
+        // discipline: re-inject the canonical index and capabilities before any
+        // queued follow-up runs.
         const destinations = getAllDestinations();
         let reminder = '[system] Context was just compacted. Canonical memory and capabilities were refreshed.';
         if (destinations.length > 1) {
@@ -2890,9 +2250,8 @@ export async function processQuery(
         await dispatchFileAttachment(event, routing);
       }
     }
-    // Stream ended with only retryable (api_retry) events and no result → the
-    // SDK's internal retries were exhausted. Surface it via the catch below so
-    // the user sees a real failure instead of silence. Any result clears this.
+    // Only retryable events and no result: the SDK's retries are exhausted.
+    // Throw so the user sees a failure, not silence.
     if (!sawResult && lastRetryableErr) throw lastRetryableErr;
     requeueLedgerHead(true);
   } catch (err) {
@@ -2911,30 +2270,17 @@ export async function processQuery(
     // Floor for the abort/throw paths, which never reach a `result`.
     closeResultScope();
     setProviderTurnExecuting(false);
-    // This query has ended; the host must not read its first event as a live
-    // query's (see `markProviderQueryEvent`).
+    // The host must not read this ended query's first event as a live one's.
     try {
       resetProviderQueryEvent();
     } catch (err) {
       log(`Failed to reset provider_query_event_at: ${err instanceof Error ? err.message : String(err)}`);
     }
-    // A push that never got consumed (abort, throw, a stream ended for a
-    // command) must NOT keep a claim the runner will then filter out of every
-    // later selection: the container stays alive across queries, so nothing
-    // would clear it until the container exits and the message would be
-    // silently undeliverable in the meantime. Release the claim instead — the
-    // inbound row is still `pending`, so the next query re-selects it. This is
-    // the same op the repository-fence deferral uses
-    // and it is deliberately a RELEASE the first time: completing is what lost
-    // the message in the first place.
-    //
-    // Bounded: ONE release per row per container process
-    // (`FOLLOW_UP_MAX_RELEASES`). A row whose stream ends unconsumed a second
-    // time is completed instead, so a poison follow-up that kills every turn it
-    // joins cannot be redelivered forever. That is the same terminal handling
-    // an initial batch gets when its turn ends without a result. The container cannot bump `messages_in.tries` —
-    // inbound.db is host-written — so the count lives here; a container death
-    // instead goes through the host's MAX_TRIES ladder.
+    // Release, never complete, a push that was never consumed: completing loses
+    // the message, and a claim kept across queries hides it until the container
+    // exits. Bounded by FOLLOW_UP_MAX_RELEASES per container (it cannot bump the
+    // host-written `tries`), so a poison follow-up is completed, not redelivered
+    // forever.
     if (pendingFollowUps.length > 0) {
       const unconsumed = pendingFollowUps.flatMap((f) => f.ids);
       pendingFollowUps = [];
@@ -2987,24 +2333,13 @@ export async function handleEvent(event: ProviderEvent, routing: RoutingContext)
       log(
         `Error: ${event.message} (retryable: ${event.retryable}${event.classification ? `, ${event.classification}` : ''})`,
       );
-      // Surface terminal errors to the user. Retryable errors (transient
-      // upstream blips, mid-stream retries) stay quiet — only the final
-      // failure mode is worth a Slack/Discord post. Without this write the
-      // provider yields its error event, the for-await exits, the outer
-      // poll-loop iterates into the next turn, and the user sees nothing
-      // for up to the host-sweep ABSOLUTE_CEILING_MS (30 min). The thrown-
-      // error branch in runPollLoop has its own chat write (search for
-      // `Error: ${errMsg}` in this file) — this case is its yielded-event
-      // sibling.
-      // Quota exhaustion with a declared fallback is reported to the host
-      // instead of shown: the session respawns on the fallback provider.
-      // See the thrown-error sibling branch for the same decision.
+      // Terminal errors must reach the user, or they see nothing until the
+      // 30-min ceiling; retryable ones stay quiet. Quota with a declared
+      // fallback is reported to the host instead (respawn on the fallback).
       if (event.retryable === false && event.classification === 'quota') {
         if (await reportProviderUnavailable(null, event.message, true, { resetAt: event.resetAt ?? null })) break;
       }
       if (event.retryable === false) {
-        // `log()` above already covers unconditional logging for this
-        // branch — dedupe below only gates the repeated channel post.
         const chatText = `⚠️ Turn ended with an error: ${event.message}. I'll pick up from your next message.`;
         if (shouldPostInfraWarning(chatText)) {
           await writeMessageOut({
@@ -3020,25 +2355,13 @@ export async function handleEvent(event: ProviderEvent, routing: RoutingContext)
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
-      // Skip internal MCP tool descriptions ("Using <mcp-tool-name>") — these
-      // are implementation details not useful to end users. Only surface
-      // substantive progress messages (Bash output, search results, etc.).
+      // Internal MCP tool descriptions (`Using <tool>`) are not user progress.
       if (event.message.startsWith('Using ')) break;
-      // Quiet-status mode (set by tasks with quietStatus: true): suppress
-      // all streaming status writes. The agent's final chat message — if
-      // any — still goes out via dispatchResultText.
+      // quietStatus suppresses streaming status only; the final chat still goes out.
       if (routing.quietStatus) break;
-      // Emit a kind='status' message so the host can deliver it as a
-      // post-then-edit progress line. Host tracks the platform_message_id
-      // per session so subsequent progress events edit in place, and the
-      // tracking clears when a real chat message lands.
-      // Stamp the turn's batch anchor so the host can tell this status apart
-      // from a prior turn's. When a turn ends without a chat-final (no
-      // <message> block emitted), the host's chat-final orphan cleanup never
-      // runs; the next turn's status carries a different anchor, which the
-      // host uses to delete the stale 💭 and post fresh rather than editing
-      // the prior turn's message in place. Mirrors the anchor stamped on chat
-      // rows (dispatchResultText / dispatchFileAttachment).
+      // The host edits the status line in place per session. The batch anchor
+      // tells this turn's status from a prior turn's that ended without a
+      // chat-final, so the host posts fresh instead of editing the stale 💭.
       const statusAnchor =
         routing.channelType && routing.platformId
           ? (getBatchAnchor(routing.channelType, routing.platformId) ?? routing.inReplyTo)
@@ -3111,11 +2434,8 @@ export async function dispatchFileAttachment(
 
   await writeMessageOut({
     id,
-    // in_reply_to anchors to the CLAIMED BATCH: this destination's message
-    // from the batch if present, else the batch's triggering message. Never
-    // a freshly-resolved "latest inbound row" — that row can be a sibling
-    // scheduled task's future fire, and stamping it as replied-to permanently
-    // suppresses that series (see getPendingMessages' due-aware guard).
+    // Anchor to the CLAIMED batch, never the newest inbound row: that can be a
+    // sibling task's future fire, and stamping it replied-to suppresses the series.
     in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
     kind: 'chat',
     platform_id: platformId,
@@ -3140,14 +2460,8 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
       id: generateId(),
       in_reply_to: routing.inReplyTo,
       kind: 'chat',
-      // Marked, deliberately: this is the TURN'S OWN text going to the session's
-      // own conversation, which is exactly what the subtext describes. The same
-      // text routed through sendToDestination is stamped, and leaving this path
-      // unmarked would make an error reply the one place the line silently
-      // disappears — precisely when knowing the model and context is most
-      // useful. Model and effort are accurate on an error turn; the context
-      // figure is this turn's, since it is cleared per result (just before
-      // closeResultScope in processQuery).
+      // Marked: the turn's own text to its own conversation is what the subtext
+      // describes, and an error reply is when it matters most.
       agentReply: true,
       platform_id: routing.platformId,
       channel_type: routing.channelType,
@@ -3165,26 +2479,12 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
  * The agent must always wrap output in <message to="name">...</message>
  * blocks, even with a single destination. Bare text is scratchpad only.
  *
- * Tolerant of unclosed openers: when the agent emits a `<message to=…>`
- * without a matching `</message>` (a common degradation mode after long
- * turns, auto-compaction, or extended thinking), the body extends to
- * either the next opener or end-of-text. Without this tolerance, the old
- * regex required a closing tag — a missing close produced zero matches,
- * the entire text fell through to the unwrapped-output fallback, and the
- * literal `<message to=…>` markup leaked to Slack/Discord verbatim.
- *
- * Tag-stripping safety net: if the scratchpad ends up carrying any
- * residual `<message…>` opener/closer text (e.g. the agent emitted
- * `<message to="">` with an empty name that doesn't capture, or other
- * malformed XML), we strip those tokens before posting to the fallback
- * destination so users never see raw wrapper markup.
+ * Tolerates unclosed openers (the body runs to the next opener or end of
+ * text), and strips stray wrapper markup so raw tags never reach users.
  */
 const MESSAGE_OPENER_RE = /<message\s+to="([^"]*)"\s*>/g;
 const MESSAGE_CLOSER = '</message>';
-// Tokens we strip from scratchpad / fallback text so the user never sees
-// raw wrapper markup even if the parser couldn't pair an opener with a
-// closer (e.g. opener with empty `to=""` that we ignored). Anything that
-// pairs cleanly is already consumed before this strip runs.
+// Wrapper markup the parser could not pair (e.g. an empty `to=""`).
 const STRAY_WRAPPER_RE = /<\/?message(?:\s+to="[^"]*")?\s*>/g;
 
 export interface TaskMessageBlock {
@@ -3222,12 +2522,9 @@ export async function dispatchInterimMessageBlocks(
 ): Promise<string[]> {
   if (routing.taskRun && !outcomeReportingEnabled()) return [];
   const delivered: string[] = [];
-  // Mask, never delete: code spans are blanked to equal-length spaces only to
-  // decide WHERE blocks are, and each block is then cut from the original
-  // text — a real update keeps the backticked shas and fenced output in its
-  // body, and the recorded span is byte-identical to a verbatim repeat. A
-  // block wholly inside a code span has its own opener blanked, so it never
-  // matches.
+  // Mask, never delete: blanking only locates blocks, and each block is cut
+  // from the original text, so code in its body stays byte-identical. A block
+  // inside a code span has its opener blanked and never matches.
   const masked = text.replace(CODE_SPAN_RE, (span) => ' '.repeat(span.length));
   for (const m of masked.matchAll(COMPLETE_MESSAGE_BLOCK_RE)) {
     const block = text.slice(m.index, m.index + m[0].length);
@@ -3248,26 +2545,15 @@ export async function dispatchInterimMessageBlocks(
  * task session (inbox poller, scheduled job), which never gets a next turn whose
  * differing batch anchor would reset it.
  *
- * Emitted UNCONDITIONALLY. An earlier version fired only when the turn wrote no
- * chat row, which was wrong three ways: an agent-to-agent reply counts as a chat
- * row but returns from delivery before the orphan cleanup; the flag latched, so
- * status rows produced AFTER an early `send_message` were never cleaned; and a
- * failed insert still marked the turn as having replied. The host is the only
- * component that knows whether a status is actually tracked, and its handler is
- * a no-op when none is — so let it decide rather than guessing here.
+ * Emitted UNCONDITIONALLY: only the host knows whether a status is tracked, and
+ * its handler is a no-op when none is.
  *
- * Called from every turn exit, including the durable work-continuation branch,
- * which returns through its own path. Emitted BEFORE `checkpointTurnEnd` and
- * `markCompleted`: the checkpoint shells out to git and can take seconds, and
- * there is no reason to leave a stale 💭 on screen for it. Callers must not
- * assume inbound rows are already marked completed when this row lands.
+ * Called from every turn exit, BEFORE `checkpointTurnEnd` (seconds of git) and
+ * `markCompleted`: inbound rows may not be completed yet when this row lands.
  */
 async function emitTurnEnd(): Promise<void> {
-  // The context figure is cleared per RESULT (see closeResultScope above), not
-  // here: one query can serve many turns, so this fires too coarsely to be the
-  // turn boundary. Kept as a backstop for a query that ends without a result.
+  // Backstop for a query that ends without a result; the real clear is per result.
   clearContextTokens();
-  // Backstop only, same as above — the real clear is per result.
   clearSubagents();
   const lifecycleStatusId = getCurrentLifecycleStatus();
   await writeMessageOut({
@@ -3281,13 +2567,9 @@ async function emitTurnEnd(): Promise<void> {
 export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
-  // `alreadyDelivered`: exact block spans that went out mid-turn
-  // (dispatchInterimMessageBlocks). They are not sent again but still COUNT as
-  // sent — removing them from `text` instead would leave `sent === 0` and hand
-  // the narration around them to the unwrapped-output fallback below.
-  // `blocksOnly`: mid-turn text. Blocks route as usual; nothing else does — no
-  // fallback, no unwrapped verdict — and `sent` counts only blocks routed as
-  // addressed.
+  // `alreadyDelivered`: spans sent mid-turn. Not resent, but they still COUNT as
+  // sent, or the narration around them hits the unwrapped fallback.
+  // `blocksOnly`: mid-turn text; only blocks route, with no fallback or verdict.
   opts: { alreadyDelivered?: ReadonlySet<string>; blocksOnly?: boolean } = {},
 ): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] }> {
   type Opener = { index: number; endIndex: number; toName: string };
@@ -3350,7 +2632,6 @@ export async function dispatchResultText(
     }
     const toName = opener.toName;
     if (!toName) {
-      // Opener with empty to="" — treat as malformed; body becomes scratchpad.
       log(`Empty destination in <message to="">, dropping block`);
       if (body) scratchpadParts.push(body);
       continue;
@@ -3365,11 +2646,7 @@ export async function dispatchResultText(
     }
     const dest = findByName(toName);
     if (!dest) {
-      // "here" alias: current-conversation shorthand for the origin
-      // destination. A real destination literally named "here" wins over
-      // the alias — findByName above already checked, so we only get here
-      // when no such destination exists. Checked before peer recovery
-      // since 'here' is never a peer name.
+      // A real destination named "here" wins over the alias (findByName ran first).
       if (toName.trim().toLowerCase() === 'here') {
         const origin = findByRouting(routing.channelType, routing.platformId);
         if (origin) {
@@ -3378,15 +2655,9 @@ export async function dispatchResultText(
           sent++;
           continue;
         }
-        // Origin unresolvable — fall through to the unknown-destination
-        // handling below instead of inventing new behavior.
       }
-      // Recovery: the agent addressed a PEER (sibling) as a destination — a
-      // common mistake, esp. opencode (observed: `<message to="Example Agent-Codex">`
-      // dropped). Peers aren't destinations; you reach them by @-mentioning in
-      // the body of a channel message. Convert it: route the body to the
-      // conversation's ORIGIN channel with `@<peer>` ensured in the body, so the
-      // handoff actually posts AND wakes the peer instead of vanishing.
+      // Agents often address a PEER as a destination. Peers are reached by
+      // @-mention, so route the body to the origin with `@<peer>` ensured.
       const peerName = findPeerName(toName);
       const originDest = peerName ? findByRouting(routing.channelType, routing.platformId) : undefined;
       if (peerName && originDest) {
@@ -3412,40 +2683,12 @@ export async function dispatchResultText(
     scratchpadParts.push(text.slice(cursor));
   }
 
-  // Strip any stray opener/closer tokens that escaped the structured
-  // pairing above — these would otherwise reach Slack/Discord verbatim
-  // via the unwrapped-output fallback below.
   const scratchpad = stripInternalTags(scratchpadParts.join('').replace(STRAY_WRAPPER_RE, '')).trim();
 
-  // Unwrapped-output fallback: if the agent forgot to wrap (a common
-  // failure mode after long turns, auto-compaction, or extended thinking),
-  // route the cleaned scratchpad to the most-likely-correct destination
-  // instead of silently dropping the reply. Two-tier resolution:
-  //
-  //   1. Origin (preferred): the destination corresponding to the channel
-  //      that triggered this turn. Looked up by (channelType, platformId)
-  //      from the routing context. Unambiguous regardless of how many
-  //      destinations the agent has wired — the user spoke from one place
-  //      and expects the reply there. Works for chat, task, and a2a
-  //      inbounds (extractRouting falls back to sessionRouting when the
-  //      message itself has no platform_id, so routing fields are
-  //      populated for every well-formed turn).
-  //
-  //   2. Single-destination (legacy): if origin can't be resolved
-  //      (routing.platformId is null AND there's no sessionRouting fallback)
-  //      AND the group has exactly one destination, send there.
-  //
-  // The original multi-destination concerns (routing drift on null-routed
-  // cron tasks, cross-channel thread bleed in agent-shared sessions;
-  // commit 9db39b2) don't apply: sendToDestination resolves fresh
-  // per-destination routing via resolveDestinationThread, and we route to
-  // the origin (not blindly broadcast) so we never bleed into another
-  // channel.
-  // Self-wake turns are excluded: their unwrapped output is almost always
-  // self-narration of the "nothing changed, no post" decision, and the
-  // fallback turned that into channel spam (one no-op status line per wake).
-  // A wake that HAS news posts it via the send_message tool — the scheduled
-  // wake prompt states this contract.
+  // Unwrapped-output fallback: route the cleaned scratchpad to the origin (or
+  // the only destination when origin is unresolvable) instead of dropping the
+  // reply. Self-wake turns are excluded: their unwrapped text is no-op
+  // narration, and a wake with news posts via send_message.
   if (opts.blocksOnly) return { sent, hasUnwrapped: false, taskBlocks };
 
   if (!routing.taskRun && !routing.selfWake && sent === 0 && scratchpad) {
@@ -3513,7 +2756,6 @@ function escapePromptXml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-/** What one terminal task fire should record, if anything. */
 export interface FireOutcome {
   text: string;
   isError: boolean;
@@ -3521,23 +2763,10 @@ export interface FireOutcome {
 }
 
 /**
- * Decide the single outcome a logical fire records — the contract the poll
- * loop's `finally` implements, extracted so it is checkable without driving a
- * provider.
- *
- * Two ways to record nothing, and they are different:
- *
- *   - not a task run: there is no series to attribute an outcome to;
- *   - DEFERRED: the batch was handed to a provider fallback or interrupted by a
- *     repository barrier, both of which leave or release the claim so the SAME
- *     occurrence runs again. That re-run records its own outcome, so recording
- *     here too would give one fire two rows — enough for two occurrences to
- *     trip a threshold set at three, paging a human about a task that was only
- *     postponed (Codex round 3).
- *
- * A reported outcome always wins over a synthesised one: it came from a real
- * terminal result, whereas the synthesised failure exists only for the case
- * where every attempt threw.
+ * The single outcome a logical fire records. Nothing when not a task run, or
+ * when DEFERRED (fallback, repository barrier): the same occurrence re-runs and
+ * records its own, and two rows for one fire can page a human. A reported
+ * outcome beats a synthesised one.
  */
 export function resolveFireOutcome(input: {
   taskRun: boolean;
@@ -3562,24 +2791,10 @@ export function resolveFireOutcome(input: {
  * `task_log` outbound row; the host appends it to the series' tasks/<id>.md
  * with its usual timestamp stamp. Never delivered to anyone.
  *
- * `auto`, `isError` and `model` ride along for the host's durable run-outcome
- * record (`src/db/task-run-outcomes.ts`, migration 075):
- *
- *   - `auto: true` distinguishes this end-of-run summary from a mid-run
- *     `ncl tasks append-log` note. Only the summary is one-per-fire, so only
- *     the summary may count toward a failure streak.
- *   - `isError` is the PROVIDER's own verdict on the turn, which until now the
- *     task path threw away: the result handler acts on `event.isError` only
- *     when `!routing.taskRun`, so a task whose turn errored was recorded
- *     exactly like one that succeeded. That is why a series pinned to a model
- *     its group's provider could not run failed 21 times in 14 hours with
- *     every occurrence row reading `completed` and nobody being told
- *     (2026-09-07, migration 075).
- *   - `model` is what actually ran, so the host can say "pinned to X, group is
- *     on Y" without re-deriving a pin that may since have been edited.
- *
- * An errored turn writes the row even when the text is empty. A failure that
- * leaves no line is precisely the silence this record exists to end.
+ * `auto` marks the one-per-fire summary (only it counts toward a failure
+ * streak); `isError` is the provider's verdict, which the result handler ignores
+ * for task runs; `model` is what actually ran. An errored turn writes the row
+ * even with empty text.
  */
 export async function autoAppendTaskLog(
   text: string,
@@ -3595,10 +2810,8 @@ export async function autoAppendTaskLog(
     (_m, to: string, body: string) => `[undelivered → ${to}] ${body.trim()}`,
   );
   const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, 500);
-  // No early return on empty text. Every call here is a TERMINAL task fire, and
-  // the host's run-outcome ledger has to see all of them: a failure that
-  // returned nothing is the silence this record exists to end, and a blank
-  // SUCCESS is what resets a stale failure streak after a recovery.
+  // No early return on empty text: every terminal fire must reach the outcome
+  // ledger, and a blank success resets a stale failure streak.
   await writeMessageOut({
     id: generateId(),
     kind: 'task_log',
@@ -3622,23 +2835,18 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
   const destRouting = resolveDestinationThread(channelType, platformId);
-  // Dashboard messages can have no routing stamp in a freshly bound session.
-  // Only that origin may inherit the resolved session route. A routed inbound,
-  // including an explicit channel-root null, remains authoritative.
+  // Only the own-conversation origin may inherit the session route (a freshly
+  // bound dashboard has no stamp); a routed inbound, even channel-root null, wins.
   const ownConversation = channelType === routing.channelType && platformId === routing.platformId;
   const threadId = destRouting ? destRouting.threadId : ownConversation ? routing.threadId : null;
-  // `send_message` (mcp-tools/core.ts) bypasses this function and is the
-  // default reply path when outcome reporting is on — it stamps itself through
-  // the same withStatusSubtext.
+  // `send_message` bypasses this function (and is the default reply path), so it
+  // stamps itself through the same withStatusSubtext.
   await writeMessageOut(
     withStatusSubtext({
       id: generateId(),
-      // Batch anchor, not the channel's latest inbound row — see the poison
-      // note in dispatchFileAttachment / getPendingMessages.
+      // Batch anchor, never the channel's latest inbound row.
       in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
       kind: 'chat',
-      // Agent-composed reply text — eligible for the status subtext. The
-      // own-conversation gate still applies inside stampStatusSubtext.
       agentReply: true,
       platform_id: platformId,
       channel_type: channelType,
@@ -3649,22 +2857,13 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
 }
 
 /**
- * Find the thread_id from the most recent inbound message matching the given
- * channel+platform. Returns null if no match found.
- *
- * Thread context ONLY. This used to also return the row's id for use as
- * in_reply_to, which poisoned scheduled-task series: right after a task
- * fires, the newest inbound row for a quiet channel is often a sibling
- * task's freshly-inserted future fire row, and stamping it as "replied to"
- * made getPendingMessages' idempotency guard suppress that fire forever
- * (killed every interleaved daily task between 2026-05-27 and 05-31).
- * in_reply_to must always come from the turn's triggering batch.
+ * Thread context of the most recent inbound on this channel+platform, or null.
+ * Never its row id as in_reply_to: that row can be a sibling task's future
+ * fire, and stamping it replied-to suppresses the series forever.
  */
 function resolveDestinationThread(channelType: string, platformId: string): { threadId: string | null } | null {
   try {
-    // getLatestInboundRoute is the same newest-row-per-channel query this ran
-    // by hand. Its `inReplyTo` (the row id) is deliberately DROPPED here — see
-    // the poison note above; thread context is all this function may return.
+    // The route's `inReplyTo` is deliberately dropped: thread context only.
     const route = getAgentMailbox().operations.getLatestInboundRoute(channelType, platformId);
     if (route) return { threadId: route.threadId };
   } catch (err) {
@@ -3703,18 +2902,9 @@ interface FlagIntent {
   turnFast?: boolean;
 }
 
-// Precedence: turn override → sticky. Effort defaults (operator override env +
-// per-model-family) are applied inside the claude provider, not here.
-// ultracode follows the same precedence; effort is already forced to xhigh
-// host-side when ultracode is requested, so it rides alongside effort here.
-// Physical chat budget: a task created with muteChat (or chatLimit N) caps
-// chat-kind outbound writes for the turn — set BEFORE the provider runs,
-// reset at every TURN BOUNDARY (sticky module state would otherwise leak
-// across turns). Deliberately NOT part of applyFlagBatch: that also runs
-// mid-turn on follow-up batches (see the settings-change path), and a
-// mid-turn batch with no task row must not clear an active mute — observed
-// live 2026-08-02: a deferred recall row arriving two minutes into a muted
-// task turn reset the budget and the "muted" agent posted to the channel.
+// Chat budget (muteChat / chatLimit) is set before the provider runs and reset
+// at every turn boundary. Not in applyFlagBatch, which also runs mid-turn: a
+// follow-up without a task row must not clear an active mute.
 export function applyChatBudget(messages: MessageInRow[]): void {
   let limit: number | null = null;
   for (const m of messages) {
@@ -3747,23 +2937,17 @@ export function applyFlagBatch(
   fast: boolean;
   ignoredModel?: string;
   /**
-   * The ignored pin came from an `-m` typed in THIS batch, not from a sticky
-   * stored before the outage. Only a fresh one is an operator asking for the
-   * primary provider back; a leftover sticky would ask on every single turn.
+   * The ignored pin was typed in THIS batch. Only a fresh `-m` asks for the
+   * primary back; a leftover sticky would ask on every turn.
    */
   ignoredModelWasExplicit?: boolean;
 } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
-    // Tasks carry flagIntent the same way chat messages do — used by scheduled
-    // wake tasks (for example, scheduled reports) to pin model+effort per fire without a
-    // global agent-group config change.
+    // Task rows carry per-fire flagIntent pins too.
     if (m.kind !== 'chat' && m.kind !== 'chat-sdk' && m.kind !== 'task') continue;
-    // Scheduled pins are admitted against the primary provider's vocabulary.
-    // A fallback may have a different model namespace (Claude vs Codex), so
-    // treating that pin as target-provider input can produce a failed request
-    // or a misleading hybrid model/effort. The fallback's explicit config—or
-    // its native default—is the only model authority for that task fire.
+    // Scheduled pins were validated for the primary; under a fallback only its
+    // own config picks the model.
     if (options.ignoreTaskFlagIntents && m.kind === 'task') continue;
     try {
       const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntent };
@@ -3802,29 +2986,17 @@ export function applyFlagBatch(
   }
 
   const requestedModel = intent?.turnModel ?? getStickyModel();
-  // A pin is admitted on the host against the PRIMARY provider's vocabulary
-  // (router.ts → `parseMessageFlags`) and the sticky persists in
-  // session_state, so under a spawn-time provider fallback it can name the
-  // other provider's model. Observed live 2026-09-16: `-m astra` earlier in a
-  // thread, codex parked, the claude fallback then asked the Anthropic API
-  // for `gpt-6-astra` on every turn of the session. Ignore it for THIS
-  // provider only — the sticky stays stored and applies again when the
-  // primary is back (or until the user re-pins after a provider migration);
-  // `ignoredModel` lets the caller say so once.
+  // Pins are validated against the PRIMARY provider and stickies persist, so
+  // under a fallback a pin can name the other provider's model. Ignore it for
+  // this provider only; the sticky stays, and `ignoredModel` says so once.
   const model =
     requestedModel !== undefined && !modelBelongsToProvider(requestedModel, providerName) ? undefined : requestedModel;
   const ignoredModel = model === requestedModel ? undefined : requestedModel;
-  // `turnModel`/`stickyModel` are only set when this batch actually carried a
-  // `-m`; `getStickyModel()` above reads the stored one, which is not a fresh
-  // request for anything.
+  // Explicit only when this batch carried a `-m`; the stored sticky is not a fresh request.
   const ignoredModelWasExplicit =
     ignoredModel !== undefined && (intent?.turnModel !== undefined || intent?.stickyModel !== undefined);
-  // Effort here is USER INTENT ONLY (turn flag → sticky flag). Defaults are
-  // provider business: the claude provider resolves the operator override
-  // (NANOCLAW_EFFORT_OVERRIDE) and per-model-family defaults itself, because
-  // only it knows the final model (and e.g. haiku ignores effort). Codex and
-  // opencode have their own default surfaces (codex config schema default,
-  // opencode model-native) and never consumed this env fold.
+  // Effort here is USER INTENT ONLY: defaults belong to each provider, since
+  // only it knows the final model.
   const effort = intent?.turnEffort ?? getStickyEffort();
   const ultracode = intent?.turnUltracode ?? getStickyUltracode() ?? false;
   // Preserve a Codex sticky across provider migrations, but never let it
@@ -3841,26 +3013,13 @@ export function applyFlagBatch(
 }
 
 /**
- * Ask the host to end this group's provider-fallback window early.
- *
- * The container cannot route itself: the provider is chosen at spawn, from
- * `provider_health`, which only the host writes. This is the mirror of
- * `reportProviderUnavailable` — that one records an outage, this one says the
- * operator wants the primary tried anyway — and it is deliberately the weaker
- * of the two: it only CLEARS a window, and only for the reporting session's
- * own agent group.
- *
- * Worst case if the primary really is still spent: one failing turn, which
- * re-records the window and puts the session straight back on the fallback.
- * That is the honest answer to an explicit request, and it is bounded —
- * only a freshly typed `-m` reaches here.
+ * Ask the host to end this group's fallback window early (only the host writes
+ * `provider_health`). It only clears the window; if the primary is still spent,
+ * one failing turn re-records it.
  */
 async function requestPrimaryProviderRetry(requestedModel: string): Promise<boolean> {
-  // The claim is the loop brake — see PRIMARY_RETRY_REQUEST_COOLDOWN_MS. The
-  // request makes the host respawn this session, and if the primary is still
-  // spent the triggering message comes back pending with its `flagIntent`
-  // intact and would ask again, forever, on a failure streak this very
-  // request keeps resetting to zero.
+  // The claim is the loop brake: the respawned session re-reads the same pending
+  // `-m` and would otherwise ask again forever.
   if (!claimPrimaryRetryRequest()) return false;
   try {
     await writeMessageOut({
@@ -3870,19 +3029,34 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
     });
     return true;
   } catch (err) {
-    // Best-effort, exactly like the outage report: a failed write must not
-    // swallow the chat line that tells the user what happened. The claim is
-    // deliberately NOT released — a write that may or may not have landed is
-    // not a reason to try again inside the cooldown.
+    // Best-effort. The claim is deliberately NOT released: a write that may have
+    // landed is no reason to ask again inside the cooldown.
     log(`Failed to request a primary-provider retry: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }
 
+export function onlyTypedStickyEffort(messages: MessageInRow[]): boolean {
+  let typed = 0;
+  for (const m of messages) {
+    let parsed: { flagIntent?: FlagIntent; flagAck?: unknown };
+    try {
+      parsed = JSON.parse(m.content) as typeof parsed;
+    } catch {
+      continue;
+    }
+    const fi = parsed.flagIntent;
+    if (!fi) continue;
+    if (typeof parsed.flagAck !== 'string') return false;
+    if (fi.turnEffort !== undefined || fi.turnUltracode !== undefined || fi.turnModel !== undefined) return false;
+    typed++;
+  }
+  return typed > 0;
+}
+
 /**
- * The last row in the batch whose flag the host acked in chat. Only the
- * router's typed-flag path stamps `flagAck`; support-thread and task rows
- * carry flagIntent without one, and nobody was told anything about those.
+ * Only the router's typed-flag path stamps `flagAck`; task and support-thread
+ * rows carry flagIntent without one.
  */
 export function findAckedFlag(messages: MessageInRow[]): { row: MessageInRow; ack: string } | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -3901,14 +3075,9 @@ export function queuedSettingsNotice(ack: string): string {
 }
 
 /**
- * One chat line, once per cooldown, when a stored model pin is being ignored
- * because it belongs to another provider (`applyFlagBatch`). The pin itself
- * stays in session_state. What happens next depends on WHY the provider
- * differs: under a spawn-time fallback (`fallbackActive`, the host's
- * NANOCLAW_PROVIDER_FALLBACK_APPLIED marker, read in config.ts) the primary comes
- * back on its own and the pin applies again; after a deliberate provider
- * migration the new provider IS the primary, nothing reverts, and the user
- * has to re-pin or clear it.
+ * Once per cooldown. The pin stays stored: under a spawn-time fallback it
+ * applies again when the primary returns; after a deliberate provider migration
+ * the user must re-pin or clear it.
  */
 export async function noteIgnoredModel(
   model: string,
@@ -3917,17 +3086,9 @@ export async function noteIgnoredModel(
   routing: RoutingContext,
   explicit = false,
 ): Promise<void> {
-  // A `-m` TYPED NOW, while the session is serving from a fallback, is an
-  // operator asking for the primary provider back — the router already
-  // validated it against the PRIMARY's vocabulary before it reached the DB
-  // (src/router.ts `parseMessageFlags`), which is exactly why it reads as
-  // "not a ${providerName} model" here. Before this, that request had no
-  // effect at all: the pin was dropped and the user was told to wait out a
-  // window they cannot see. Ask the host to reopen the primary instead.
-  //
-  // Gated on `explicit` because the same ignore fires for a sticky stored
-  // BEFORE the outage, which would otherwise ask on every turn and hold the
-  // group in a re-probe loop for the whole window.
+  // A `-m` typed NOW while on a fallback asks for the primary back (the router
+  // validated it against the primary). Gated on `explicit`: a sticky stored
+  // before the outage would ask every turn and hold the group in a re-probe loop.
   const requestingPrimary = fallbackActive && explicit && (await requestPrimaryProviderRetry(model));
   const text =
     `⚙️ model pin ${model} is not a ${providerName} model — ignored while this session runs on ${providerName}; ` +
@@ -3949,18 +3110,9 @@ export async function noteIgnoredModel(
 }
 
 /**
- * One chat line when a model-scoped quota rejection was recovered by dropping
- * the pin and re-running the turn on the group's configured model.
- *
- * Said out loud rather than swallowed, because the turn the user reads was
- * answered by a DIFFERENT model than the one they pinned, and nothing else in
- * the transcript would say so. `cleared` distinguishes the two outcomes the
- * next turn depends on: a sticky pin is retired (re-pin when the window
- * resets), a one-off `-m` never persisted and needs no action.
- *
- * `resetAt` is the provider's own stated recovery instant when it gave one
- * (ProviderEvent error `resetAt`) — rendered in the install timezone like
- * every other agent-facing time (`formatLocalTime`), never raw ISO.
+ * Said out loud: the reply came from a different model than the one pinned.
+ * `cleared`: a sticky pin was retired (re-pin after reset); a one-off needs
+ * nothing. `resetAt` renders in the install timezone, never raw ISO.
  */
 export async function noteModelQuotaFallback(
   pinnedModel: string,
@@ -3987,43 +3139,12 @@ export async function noteModelQuotaFallback(
 }
 
 /**
- * The per-turn model/effort a batch should actually run on.
- *
- * A scheduled task has NO default of its own — but it must not inherit an
- * INTERACTIVE one either, and those are two different statements.
- *
- * `applyFlagBatch` resolves `turnModel ?? getStickyModel()`, and the sticky
- * lives in `session_state`: the session's own durable DB, so it survives turns
- * and container restarts for the life of the session. Chat and task messages
- * share a session (which is exactly why `isPureTaskWake` has to ask whether a
- * batch is task-only), so without this an unpinned nightly task fires on
- * whatever `-m` a human last typed in that thread. That is the bug the
- * 2026-07-02 `sonnet`/`xhigh` block was written to fix; the block was right
- * about the disease and wrong about the cure, substituting a hardcoded default
- * the group's own config could neither see nor override. In July it had no
- * alternative — container.json's model did not reach the container.
- *
- * So: SUPPRESS the sticky rather than replace it. `undefined` is not "no
- * model", it is "no per-TURN override", which lets the group's configured
- * model apply exactly as it does for interactive chat — the host exports it as
- * NANOCLAW_CLAUDE_MODEL at spawn (`claudeSpawnEnv`) and the provider
- * reads it at
- * `input.model ?? stickyConfig.model ?? process.env.NANOCLAW_CLAUDE_MODEL`.
- *
- * Deliberately NOT gated on `providerName === 'claude'`: the sticky is
- * provider-neutral, so a codex or opencode task inherits an interactive `-m`
- * the same way. Only the SUPPRESSION is shared — each provider still resolves
- * its own default from its own config, and codex's `stickyFast` passes through
- * untouched.
- *
- * Called ONLY where a batch OPENS a query. The live-query follow-up path
- * deliberately uses `applyFlagBatch` instead: there, the batch is a fragment
- * of a turn that may belong to a human, and suppressing on it retargeted
- * someone's in-progress answer. See the comment at that call site.
- *
- * `applyFlagBatch` also PERSISTS flag stickies, so this wraps it rather than
- * skipping it — the side effect must still happen for a task batch that
- * carries an explicit flag row.
+ * Per-turn model/effort for a batch that OPENS a query. A pure task wake
+ * SUPPRESSES the interactive sticky (`undefined` = no per-turn override, so the
+ * group's configured model applies) rather than inherit a human's last `-m` in
+ * the shared session; provider-neutral. Not for the live follow-up path, where
+ * the batch may be a fragment of a human's turn. Wraps applyFlagBatch because
+ * its sticky persistence must still happen.
  */
 function effectiveTurnSettings(
   messages: MessageInRow[],
@@ -4044,29 +3165,17 @@ function effectiveTurnSettings(
   return {
     model: task.turnModel,
     effort: task.turnEffort,
-    // A task pin cannot express ultracode — `validateTaskPin` refuses it,
-    // because only the effort half would survive storage — so on a pure task
-    // wake a sticky ultracode is inheritance with nothing on the task's side
-    // that could have asked for it.
+    // Task pins cannot express ultracode (`validateTaskPin` refuses it), so a
+    // sticky one is pure inheritance.
     ultracode: false,
     fast: flagBatch.fast,
   };
 }
 
-// A scheduled-task wake is a batch driven purely by kind='task' rows with no
-// interactive chat riding along. Returns the task's own per-fire model/effort
-// (its stored flagIntent) so the caller can suppress the interactive sticky
-// only when the task itself didn't pin one — and skip suppression entirely for
-// a mixed chat+task turn (don't downgrade a chat turn a task coincided with).
-//
-// This asks a DIFFERENT question from the task-turn outcome keying in
-// `processQuery`, which reads admitted task-row ids to decide how many outcome
-// records a turn produces. That is per admitted TURN and counts fires; this is
-// per BATCH and picks a model. Both phrase themselves as "the task rows in
-// this batch" and they must not be collapsed: a batch can carry more than one
-// admitted turn, so one batch-level model decision can span several outcome
-// slots, and that is correct — the model is fixed when the query opens, while
-// each joining occurrence still gets its own slot.
+// A pure task wake (no interactive chat): returns the task's own pin so the
+// caller suppresses the interactive sticky only when the task set none. Per
+// BATCH, choosing a model; not processQuery's per-turn outcome keying, and the
+// two must not be collapsed.
 function taskWakeIntent(
   messages: MessageInRow[],
   ignoreTaskFlagIntents = false,
@@ -4077,15 +3186,8 @@ function taskWakeIntent(
 } {
   let hasTask = false;
   let hasChat = false;
-  // The FIRST task carrying a pin wins, and its axes are taken TOGETHER —
-  // matching `applyFlagBatch`, which takes the first intent and `break`s.
-  //
-  // Reading the last value of each axis independently (as this did) is wrong
-  // twice over when a batch carries two differently-pinned tasks: the batch
-  // runs under the later task's pin rather than the one that opened it, and
-  // model and effort can come from DIFFERENT tasks — synthesising a pair no
-  // one configured and which neither task would have validated. Two rules for
-  // "which intent governs this batch" is one rule too many.
+  // The FIRST pinned task wins with its axes TOGETHER, matching applyFlagBatch;
+  // mixing axes across tasks synthesises a pair no one configured.
   let pin: FlagIntent | undefined;
   for (const m of messages) {
     if (m.kind === 'task') {

@@ -132,6 +132,7 @@ STUB
 chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl" "$STUB_BIN/freeze-helper"
 export PATH="$STUB_BIN:$PATH"
 export STUB_SOURCE_SHA="$BUILD_SHA"
+export SMOKE_GATE_FRONTEND_PREFIX=web/ SMOKE_GATE_BACKEND_PREFIX=api/ SMOKE_GATE_MIGRATIONS_PREFIX=api/migrations/
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-b \
   SMOKE_GATE_FRONTEND_SERVICE=srv-f SMOKE_GATE_DEV_URL=https://dev.example.test \
   SMOKE_GATE_DEBOUNCE_SECONDS=0
@@ -331,9 +332,9 @@ fresh_state() {
 # changed → the lag is accepted and the run claims, flagged in the payload.
 fresh_state
 export STUB_FRONTEND_SHA="$OLD_SHA"
-export STUB_COMPARE_FILES='[{"filename":"XZO-BACKEND/src/approvals.ts"},{"filename":"docs/notes.md"}]'
-export SMOKE_GATE_FRONTEND_PATHS="XZO-FRONTEND/,frontend/"
-export SMOKE_GATE_BACKEND_PATHS="XZO-BACKEND/"
+export STUB_COMPARE_FILES='[{"filename":"api/src/approvals.ts"},{"filename":"docs/notes.md"}]'
+export SMOKE_GATE_FRONTEND_PATHS="web/,frontend/"
+export SMOKE_GATE_BACKEND_PATHS="api/"
 bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null          # debounce
 bash "$GATE" poll | jq -e --arg old "$OLD_SHA" --arg sha "$BUILD_SHA" '
   .wakeAgent == true and .data.trigger == "develop_build_settled" and
@@ -345,8 +346,8 @@ bash "$GATE" poll | jq -e --arg old "$OLD_SHA" --arg sha "$BUILD_SHA" '
 # 17. Same lag, but a frontend file DID change → never settles (fail-closed).
 fresh_state
 export STUB_FRONTEND_SHA="$OLD_SHA"
-export STUB_COMPARE_FILES='[{"filename":"XZO-FRONTEND/src/App.tsx"}]'
-export SMOKE_GATE_FRONTEND_PATHS="XZO-FRONTEND/"
+export STUB_COMPARE_FILES='[{"filename":"web/src/App.tsx"}]'
+export SMOKE_GATE_FRONTEND_PATHS="web/"
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_settled_build"' >/dev/null
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_settled_build"' >/dev/null
 
@@ -1086,6 +1087,19 @@ SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=90m bash "$GATE" poll | jq -e '
   .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS") != null)
 ' >/dev/null || uc_fail "bad SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS was not named"
 bash "$GATE" ack develop_freeze_unclaimed "77" acked | jq -e '.ok == true and .silenceable == false' >/dev/null
+# With the handoff on, the freeze helper's layout prefixes are validated before
+# anything else; a bad one is named in the same alarm, and nothing is cut.
+SMOKE_GATE_BACKEND_PREFIX=../api/ bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null)
+' >/dev/null || uc_fail "a bad backend prefix was not named with the freeze handoff on"
+SMOKE_GATE_FRONTEND_PREFIX=../web/ bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_FRONTEND_PREFIX") != null)
+  and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") == null)
+' >/dev/null || uc_fail "a bad frontend prefix was not named with the freeze handoff on"
+SMOKE_GATE_FRONTEND_PREFIX=api/ SMOKE_GATE_BACKEND_PREFIX=api/ bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_FRONTEND_PREFIX") != null)
+  and (.data.missing | index("SMOKE_GATE_BACKEND_PREFIX") != null)
+' >/dev/null || uc_fail "equal frontend and backend prefixes were not named with the freeze handoff on"
 # Leave the ambient ceiling exactly as case 33 left it for the cases below.
 export SMOKE_GATE_FREEZE_STALE_SECONDS=0
 
@@ -1304,12 +1318,12 @@ OOB_SHA="$(printf '9%.0s' $(seq 40))"
 export STUB_SOURCE_SHA="$OOB_SHA"
 export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
 jq -cn --arg target "$OOB_SHA" --arg freeze "deadbeef" --argjson pr 1195 \
-  --arg run "xzo-pr-pr1195-oob" --arg verdict "HUMAN_DECISION" --arg now "2026-08-25T10:45:07Z" \
+  --arg run "acme-pr-pr1195-oob" --arg verdict "HUMAN_DECISION" --arg now "2026-08-25T10:45:07Z" \
   '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
   > "$STATE_DIR2/handoff-ledger.jsonl"
 bash "$GATE" poll >/dev/null
 bash "$GATE" poll | jq -e '.data.trigger == "already_completed"' >/dev/null
-jq -e --arg sha "$OOB_SHA" --arg run "xzo-pr-pr1195-oob" '
+jq -e --arg sha "$OOB_SHA" --arg run "acme-pr-pr1195-oob" '
   .completedSha == $sha and .completedRunId == $run and .completedVerdict == "HUMAN_DECISION"
 ' "$STATE_DIR2/develop-state.json" >/dev/null
 
@@ -1333,7 +1347,7 @@ bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_ledger_tampered"' >/
 jq -e '.completedRunId != "rival-run"' "$STATE_DIR2/develop-state.json" >/dev/null
 
 # --- 39c. A deliberate re-smoke of the SAME SHA is adopted (#1108) -------
-# Live: develop@6a0b65df froze as XZO #2121 (void, BLOCKED, adopted), then was
+# Live: develop@6a0b65df froze as one campaign (void, BLOCKED, adopted), then was
 # re-smoked as #2126 (HUMAN_DECISION, hold raised). Adoption keyed on SHA only,
 # so state kept the void BLOCKED -- which implies no hold, so the reconciler
 # watched nothing and the live hold could be deleted unnoticed. A newer line
@@ -1389,7 +1403,7 @@ bash "$GATE" poll | jq -e '.data.trigger == "gate_hold_tampered" and .data.holdI
 unset SMOKE_GATE_HOLD_FILE
 
 # --- 39d. A freeze whose target develop has moved past is adopted (#1134) --
-# XZO #2176 froze fe92bc76; develop reached ef798620 mid-run. Keyed on the
+# Another campaign froze fe92bc76; develop reached ef798620 mid-run. Keyed on the
 # current head, its NO_GO line was never adopted: state kept #2161 while the
 # hold named #2176, and the reconciler woke gate_hold_tampered "mismatched".
 # The newest later line is adopted whatever its target; completedAt never

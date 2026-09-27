@@ -1,12 +1,4 @@
-/**
- * NanoclawAgentMailbox — the fork's implementation of upstream's agent-mailbox
- * seam. See README.md; `../../mailbox/` is upstream's and is never edited.
- *
- * Every fork-only session-DB operation is exported from here under the name it
- * had in db/*.ts, so the 25 caller files changed import paths and nothing else.
- * The class exposes the same operations through `operations` for callers that
- * hold the mailbox rather than the module.
- */
+/** The fork's implementation of upstream's agent-mailbox seam. `../../mailbox/` is upstream's and is never edited. */
 import type { Database } from 'bun:sqlite';
 
 import { registerAdmissionGate } from '../../admission-gate.js';
@@ -65,32 +57,14 @@ export * from './rate-limit-samples.js';
 export * from './wiki-lint.js';
 export { setMailboxTestMode } from './test-mode.js';
 
-/* ─── Admission ────────────────────────────────────────────────────────────── */
-
-// The one runner lifecycle seam the storage seam cannot express (plan §4.5).
-// Registering here — the module the singular composition slot already imports —
-// keeps the fence out of poll-loop.ts without patching any upstream barrel.
+// Registered here so the fence stays out of poll-loop.ts without patching an upstream barrel.
 registerAdmissionGate(repositoryFenceAdmissionGate);
 
-/* ─── Chat budget ──────────────────────────────────────────────────────────── */
-
 /**
- * Chat mute — physical send suppression for tasks created with muteChat
- * (e.g. a watcher task whose contract is "never post"). Set per-turn by the
- * poll loop from the task row's content; when active, chat-kind writes are
- * dropped at this choke point — every send path (final <message> blocks,
- * send_message MCP tool) funnels through the mailbox's writeMessageOut, so no
- * instruction drift can reach the channel. Non-chat kinds (system actions,
- * processing acks) pass through untouched.
+ * Per-turn chat budget for tasks (null = unlimited, 0 = muted, N = at most N new posts). Enforced at this choke
+ * point because every send path funnels through writeMessageOut, and instructions demonstrably do not hold.
+ * Non-chat kinds, edits and reactions pass through.
  */
-// null = unlimited; 0 = fully muted; N>0 = at most N new chat posts this turn
-// (e.g. a standup task whose contract is ONE digest post — the trailing
-// "summary for the work log" message gets dropped here instead of relying
-// on instructions, which demonstrably do not hold).
-// Edits and reactions (content carries an `operation` field) are exempt: the
-// budget caps how many messages land in the channel, and amending an
-// already-sent message is the sanctioned way to add essential detail after
-// the budget is spent.
 let chatBudget: number | null = null;
 let chatLimitInitial: number | null = null;
 
@@ -129,19 +103,9 @@ function admitChatWrite(id: string, kind: string, content: string): boolean {
   return true;
 }
 
-/* ─── Inbound record mapping ───────────────────────────────────────────────── */
-
-// The fork's selection returns rows, so it maps them with upstream's
-// row→record mapping (and the same skip-and-log on a row that fails the
-// canonical parse). The fork writes only upstream's five kinds
-// (inbound-kinds.ts), so upstream's parser is sufficient.
 /**
- * Upstream's inbound record plus the fork-only columns it does not model.
- *
- * `scheduled_for` is the host's; upstream's `InboundRecord` has no field for
- * it and `mailbox/types.ts` is upstream's file, so the value would be dropped
- * by the row→record mapping below and never reach the formatter. Carried here
- * instead, and read back in `db/messages-in.ts`'s `messageRow`.
+ * Upstream's inbound record plus fork-only columns: upstream's mapping would drop `scheduled_for`, and
+ * mailbox/types.ts is upstream's file.
  */
 export interface NanoclawInboundMessage extends InboundMessage {
   /** Which scheduled slot a task occurrence is FOR. NULL on non-task rows. */
@@ -151,12 +115,7 @@ export interface NanoclawInboundMessage extends InboundMessage {
 function inboundMessage(row: MessageInRow): NanoclawInboundMessage {
   return {
     ...upstreamInboundMessage(row),
-    // Through sqliteTimestamp for the same reason `process_after` is: the
-    // host's one-time backfill copies `process_after` verbatim, so a row
-    // migrated on an install whose older writers used SQLite's naive
-    // `YYYY-MM-DD HH:MM:SS` shape carries that shape here. `new Date()` reads
-    // it as LOCAL time, which would shift the announced slot by the install's
-    // offset and, near midnight, onto the wrong day.
+    // Through sqliteTimestamp: backfilled rows may carry SQLite's naive shape, which `new Date()` reads as LOCAL time.
     scheduledFor: row.scheduled_for == null ? null : sqliteTimestamp(row.scheduled_for),
   };
 }
@@ -180,19 +139,13 @@ function getMaxMessagesPerPrompt(): number {
   }
 }
 
-/**
- * The selection path for callers that want the bounded-read diagnostics.
- * `db/messages-in.ts`'s compat `getPendingMessages(isFirstPoll)` remains the
- * default path and goes through the mailbox.
- */
+/** The selection path with bounded-read diagnostics; `getPendingMessages` stays the default. */
 export function getPendingMessagesWithDiagnostics(
   isFirstPoll = false,
   diagnostics?: PendingSelectionDiagnostics,
 ): MessageInRow[] {
   return selectPendingRows(getMaxMessagesPerPrompt(), isFirstPoll, diagnostics);
 }
-
-/* ─── The mailbox ──────────────────────────────────────────────────────────── */
 
 export interface NanoclawMailboxOperations extends MailboxOperations {
   /** JSON `[epoch, generation]` while the host holds a repository ingress fence. */
@@ -205,11 +158,7 @@ export interface NanoclawMailboxOperations extends MailboxOperations {
   getSessionId(): string | null;
   setProviderHealthState(state: ProviderHealthState, outbound?: Database): void;
   clearProviderHealthState(outbound?: Database): void;
-  /**
-   * The host-visible "busy right now" flag (`container_state.provider_executing`),
-   * read by the sweep's idle reapers. The turn level and the bracketed windows
-   * are separate scopes whose union is published — see container-state.ts.
-   */
+  /** Host-visible busy flag read by the idle reapers; the published value is the union of both scopes (container-state.ts). */
   setProviderTurnExecuting(executing: boolean, outbound?: Database): void;
   beginProviderBusyScope(outbound?: Database): void;
   endProviderBusyScope(outbound?: Database): void;
@@ -231,12 +180,7 @@ export interface NanoclawMailboxOperations extends MailboxOperations {
 export class NanoclawAgentMailbox extends SqliteAgentMailbox {
   override readonly operations: NanoclawMailboxOperations = this;
 
-  /**
-   * Upstream's start() is a no-op; the fork's adds the schema this install's
-   * tables need on top of upstream's baseline, once per process, on the
-   * outbound singleton. `key` stays optional (I-1): a host that predates the
-   * seam writes no context file and passes null.
-   */
+  /** Adds the fork schema on top of upstream's baseline once per process. `key` stays optional: an older host passes null. */
   override async start(key: MailboxSessionKey | null): Promise<void> {
     await super.start(key);
     if (!isMailboxTestMode()) prepareOutboundFile();
@@ -250,11 +194,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
     });
   }
 
-  /**
-   * `blocked` (a destructive pre-task script the classifier refused) acks as a
-   * failed run exactly like `error`, so the host's recurrence back-off sees the
-   * failed streak. Upstream maps only `error`.
-   */
+  /** `blocked` acks as a failed run like `error`, so the host's recurrence back-off sees the streak. */
   override markScriptSkipped(skips: Array<{ id: string; reason: string }>): void {
     if (skips.length === 0) return;
     const db = getOutboundDb();

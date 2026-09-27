@@ -375,7 +375,7 @@ n_fd3="$(grep -c '>&3' "$W")"
 grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anything runs"
 ! grep -q 'wakeAgent:true\|"wakeAgent": *true\|wakeAgent=true' "$W" || fail "the wrapper must never render wakeAgent true"
 
-# --- the env file is the list of keys (XZO #2047) ----------------------------
+# --- the env file is the list of keys ----------------------------
 # This wrapper used to keep its own allowlist of names owned by the INSTALL's
 # env file, so a key the install added -- SMOKE_GATE_LEASE_DIR -- was dropped
 # and the evidence barrier the controller step spawns with this environment

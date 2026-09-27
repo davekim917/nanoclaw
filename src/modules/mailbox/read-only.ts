@@ -77,13 +77,12 @@ export interface SessionReadOptions {
   busyTimeoutMs?: number;
   /**
    * Roll a hot journal back first. A rollback is a WRITE, so it is off by
-   * default. Pass it only where the caller may perform that write; never on a
-   * read-only fleet fan-out.
+   * default. Pass it only when replacing an opener that already recovered
+   * journals; never on a read-only caller or fleet fan-out.
    */
   recoverJournal?: boolean;
 }
 
-/** Reads only, by construction. */
 export interface InboundSessionRead {
   inboundHasMessage(messageId: string): boolean;
   listDuplicateLiveTaskSeriesIds(): string[];
@@ -206,7 +205,6 @@ export function readSessionInbound<T>(
   }
 }
 
-/** As `readSessionInbound`, for outbound.db. */
 export function readSessionOutbound<T>(
   location: SessionReadLocation,
   action: (session: OutboundSessionRead) => T,

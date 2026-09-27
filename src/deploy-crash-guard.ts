@@ -1,37 +1,20 @@
 /**
- * Post-deploy crash-loop guard with automatic rollback.
+ * Post-deploy crash-loop guard with automatic rollback. Runs from src/index.ts BEFORE the app module graph is
+ * imported, because a bad dependency bump crashes at import time where nothing else can observe it.
  *
- * Runs from the entry bootstrap (src/index.ts) BEFORE the application module
- * graph is imported, because a bad dependency bump crashes at import time —
- * the circuit breaker at src/circuit-breaker.ts never gets to run, and
- * deploy.sh's own process group dies with the systemctl restart, so neither
- * can observe a post-restart crash loop. This guard is the only code that
- * provably executes on every boot of a broken build.
+ * deploy.sh snapshots dist/ and node_modules/, retags the image :pre-deploy and writes data/deploy-rollback.json;
+ * each boot inside the manifest window counts an attempt, and the Nth restores snapshots, resets the checkout,
+ * restarts `restartedUnits`, retags and exits. markDeployBootHealthy() disarms it.
  *
- * Protocol: deploy.sh snapshots dist/ and node_modules/ (hardlink copies),
- * retags the spawn image as :pre-deploy, and writes data/deploy-rollback.json
- * just before restarting. Each boot while that manifest is fresh increments
- * data/deploy-boot-attempts.json. On the Nth boot (i.e. after N-1 straight
- * crashes) the guard restores the snapshots, resets the checkout, restarts the
- * long-running services that deploy recorded in `restartedUnits`, retags the
- * image, writes a "rolled-back" deploy status for the announcer, and exits so
- * systemd restarts into the restored build. A successful startup calls
- * markDeployBootHealthy() which disarms the guard.
- *
- * Must stay dependency-free (node builtins only): anything it imports becomes
- * part of the surface it is supposed to survive.
+ * Must stay dependency-free (node builtins only): anything it imports is part of the surface it must survive.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// 3rd boot = 2 consecutive crashes after a deploy. One crash can be a fluke
-// (OOM, transient port clash); two in a row right after a deploy is the
-// deploy.
+// 3rd boot = 2 consecutive crashes after a deploy; one crash can be a fluke.
 const MAX_BOOT_ATTEMPTS = 3;
-// A manifest older than this is not "right after a deploy" — a crash 40
-// minutes in is an application problem, not a rollback trigger.
 const MANIFEST_WINDOW_MS = 30 * 60 * 1000;
 
 // dist/deploy-crash-guard.js -> repo root; also correct for tsx on src/.
@@ -41,45 +24,22 @@ interface RollbackManifest {
   commit: string;
   imageBase: string;
   timestamp: string;
-  /**
-   * `node --version` at deploy time. The node_modules snapshot is ABI-tied
-   * to this runtime (native modules like better-sqlite3 install per
-   * NODE_MODULE_VERSION prebuilds): restoring it under a different Node
-   * would produce a build that cannot load its native modules.
-   */
+  /** `node --version` at deploy time; the node_modules snapshot is ABI-tied to it. */
   node?: string;
   /**
-   * The long-running services this deploy restarted onto the deployed commit
-   * (`long_running_repo_units` in scripts/deploy.sh; nanoclaw-v2 is never in
-   * here — it is the service this guard is running inside). Rolling the
-   * checkout back without restarting them leaves each one resident on the code
-   * the reset just removed — the same defect as in the pre-handoff shell
-   * trap, reproduced in the path that runs after that shell is dead.
-   *
-   * ABSENT and `[]` are different answers and are reported differently:
-   * absent means a deploy.sh that predates sibling restarts wrote this manifest and
-   * restarted nothing, `[]` means this deploy looked and found no siblings.
+   * Sibling services this deploy restarted onto the deployed commit; a rollback must restart them too.
+   * Absent means an older deploy.sh restarted nothing; `[]` means it looked and found none.
    */
   restartedUnits?: unknown;
 }
 
-/** A systemd unit id as `systemctl show -p Id` spells one. */
 const UNIT_ID = /^[A-Za-z0-9:_.\\@-]+\.service$/;
 
 type RestartedUnits = { kind: 'absent' } | { kind: 'units'; units: string[] } | { kind: 'malformed'; detail: string };
 
 /**
- * Read `restartedUnits` fail-closed. A field that is present but not a list of
- * plain unit ids is never quietly downgraded to "nothing to restart" — that is
- * the shape that let a half-done rollback read as a complete one. It is
- * reported as malformed so the operator sees the rollback was partial.
- *
- * Only a MISSING KEY is `absent`. JSON cannot express `undefined`, so a parsed
- * manifest yields `undefined` exactly when the writer omitted the key — which
- * is the legacy signal. An explicit `null` is a manifest that says something
- * and says it wrong, and reading it as legacy-absence would collapse
- * present-but-malformed back into "nothing to do", which is the whole point of
- * having three answers rather than two.
+ * Fail-closed: a present field that isn't a list of unit ids is malformed, never "nothing to restart", so a
+ * partial rollback can't read as complete. Only a missing key is `absent`; an explicit `null` is malformed.
  */
 export function readRestartedUnits(raw: unknown): RestartedUnits {
   if (raw === undefined) return { kind: 'absent' };
@@ -133,7 +93,6 @@ function unlinkQuiet(file: string): void {
   }
 }
 
-/** Pure decision: what should this boot do? Exported for tests. */
 export function evaluateBoot(
   manifest: RollbackManifest | null,
   priorAttempts: number,
@@ -143,15 +102,12 @@ export function evaluateBoot(
   if (!manifest) return 'no-op';
   const age = nowMs - Date.parse(manifest.timestamp);
   if (!Number.isFinite(age) || age < 0 || age > MANIFEST_WINDOW_MS) return 'stale';
-  // The Node executable changed between deploy and this boot (e.g. a runtime
-  // upgrade). The snapshots are ABI-tied to the old runtime — rolling back
-  // onto them would trade one broken build for another. Refuse, loudly.
+  // Snapshots are ABI-tied to the deploy-time runtime; rolling back onto them under another Node breaks the build.
   if (manifest.node && manifest.node !== nodeVersion) return 'runtime-changed';
   if (priorAttempts + 1 >= MAX_BOOT_ATTEMPTS) return 'rollback';
   return 'arm';
 }
 
-/** Swap a directory with its .pre-deploy snapshot; previous content -> .failed. */
 function restoreSnapshot(root: string, name: string): boolean {
   const live = path.join(root, name);
   const snapshot = path.join(root, `${name}.pre-deploy`);
@@ -170,13 +126,10 @@ export function performRollback(
   deps: GuardDeps = realDeps,
 ): never {
   const restored: string[] = [];
-  // Every step is individually caught: a throw escaping this function would
-  // itself crash the boot with the manifest still armed — an infinite
-  // rollback loop, i.e. the guard causing the downtime it exists to prevent.
+  // Every step is individually caught: an escaping throw would crash the boot with the manifest still armed,
+  // an infinite rollback loop.
   for (const name of ['dist', 'node_modules']) {
     try {
-      // Renaming dist/ out from under the running process is safe on Linux —
-      // this file is already loaded from its inode.
       if (restoreSnapshot(root, name)) restored.push(name);
     } catch (err) {
       console.error(`deploy-crash-guard: could not restore ${name}`, err);
@@ -195,23 +148,9 @@ export function performRollback(
   } catch (err) {
     console.error('deploy-crash-guard: git reset failed', err);
   }
-  // Put the services this deploy restarted back onto the restored checkout.
-  // Same reasoning as the pre-handoff shell trap, in the path that runs after
-  // that shell is dead: nanoclaw-codex-sync runs `tsx src/...`, loads the
-  // source once at process start, and would otherwise keep serving — and
-  // mirroring — the commit this rollback just rejected, while the host reports
-  // a successful automatic rollback.
-  //
-  // Gated on the commit actually being reset, exactly as the shell trap is: if
-  // it was skipped to preserve tracked changes, src/ is the new commit plus
-  // uncommitted edits, and restarting would move the sibling onto THAT rather
-  // than back. Leaving it alone is the conservative half of an already
-  // ambiguous state, and the status line above says the state exists.
-  //
-  // Never throws: every restart is caught individually, because an escape here
-  // would crash the boot with the manifest still armed — an infinite rollback
-  // loop. But a failure is never silent either: it goes into `restored`, which
-  // is the operator-facing status the announcer reads.
+  // Sibling services load source once at start and would keep running the rejected commit. Gated on the reset
+  // having happened: otherwise src/ is the new commit plus edits, and a restart would move them onto that.
+  // Failures go into `restored`, the operator-facing status.
   const siblings = readRestartedUnits(manifest.restartedUnits);
   if (siblings.kind === 'malformed') {
     restored.push(`SIBLING SERVICES NOT RESTARTED — ${siblings.detail}; restart them by hand`);
@@ -221,8 +160,6 @@ export function performRollback(
       restored.push(`${siblings.units.length} sibling service(s) left running (commit reset skipped)`);
     }
   } else if (siblings.kind === 'absent') {
-    // Said, not inferred from silence: an older manifest restarted nothing,
-    // so there is nothing to undo — which is a different fact from `[]`.
     console.error('deploy-crash-guard: manifest predates sibling restarts — no services to put back');
   } else {
     for (const unit of siblings.units) {
@@ -246,10 +183,7 @@ export function performRollback(
       // No pre-deploy tag (deploy didn't rebuild the image) — nothing to undo.
     }
   }
-  // Deliberately `failed`, not a new status value: if the FIRST deploy
-  // carrying this guard is the one that crash-loops, the restored dist's
-  // announcer only understands ok/failed and silently consumes anything
-  // else. `failed` + this step/error reads correctly on every build.
+  // `failed`, not a new status: an older restored announcer understands only ok/failed.
   const status = {
     status: 'failed',
     step: 'crash guard',
@@ -269,10 +203,7 @@ export function performRollback(
   return deps.exit(1);
 }
 
-/**
- * Entry gate. Never throws: a bug here must not block a normal boot.
- * Runs before the app module graph is imported.
- */
+/** Never throws: a bug here must not block a normal boot. */
 export function runDeployCrashGuard(root: string = DEFAULT_ROOT, deps: GuardDeps = realDeps): void {
   let rollback: { manifest: RollbackManifest; attempts: number } | null = null;
   try {
@@ -286,8 +217,6 @@ export function runDeployCrashGuard(root: string = DEFAULT_ROOT, deps: GuardDeps
       return;
     }
     if (verdict === 'runtime-changed') {
-      // Disarm and say why: automatic rollback across a Node change would
-      // restore ABI-mismatched native modules. The operator owns this one.
       try {
         fs.mkdirSync(path.dirname(statusPath(root)), { recursive: true });
         fs.writeFileSync(
@@ -319,12 +248,10 @@ export function runDeployCrashGuard(root: string = DEFAULT_ROOT, deps: GuardDeps
   } catch (err) {
     console.error('deploy-crash-guard: non-fatal error, continuing boot', err);
   }
-  // Outside the never-throw envelope: performRollback contains its own
-  // per-step error handling and always ends in deps.exit.
+  // Outside the never-throw envelope: performRollback handles its own errors and always exits.
   if (rollback) performRollback(root, rollback.manifest, rollback.attempts, deps);
 }
 
-/** Called by main once startup completed — the deploy is good; disarm. */
 export function markDeployBootHealthy(root: string = DEFAULT_ROOT): void {
   unlinkQuiet(manifestPath(root));
   unlinkQuiet(attemptsPath(root));

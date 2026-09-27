@@ -22,7 +22,7 @@ import path from 'path';
 import { DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { validateContainerResources, type ContainerResources } from './container-resources.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
+import { getContainerConfig, resolveProviderName, updateContainerConfigScalars } from './db/container-configs.js';
 import { withFileLock } from './file-lock.js';
 import { log } from './log.js';
 import { validateExcludePlugins } from './plugin-exclusions.js';
@@ -1588,6 +1588,31 @@ export async function updateContainerConfig(
     },
     { label: `container.json for ${folder}` },
   );
+}
+
+/**
+ * Write scalar config to both stores: the runtime fields to container.json, which the spawn and runner read, and
+ * every field to the `container_configs` projection. THE FILE COMMITS FIRST: if one write fails, file-ahead is the
+ * recoverable disagreement (the container boots what was asked; the flag vocabulary lags until a re-run), while
+ * projection-ahead is indistinguishable from success.
+ */
+export async function writeContainerConfigScalars(
+  agentGroupId: string,
+  folder: string,
+  updates: Parameters<typeof updateContainerConfigScalars>[1],
+): Promise<void> {
+  const { provider, model, effort, assistant_name, timezone } = updates;
+  if ([provider, model, effort, assistant_name, timezone].some((v) => v !== undefined)) {
+    await updateContainerConfig(folder, (config) => {
+      if (provider !== undefined) config.provider = provider ?? undefined;
+      if (model !== undefined) config.model = model || undefined;
+      if (effort !== undefined) config.effort = effort || undefined;
+      if (assistant_name !== undefined) config.assistantName = assistant_name || undefined;
+      // null must ERASE the field so the spawn falls back to the install timezone.
+      if (timezone !== undefined) config.timezone = timezone ?? undefined;
+    });
+  }
+  await updateContainerConfigScalars(agentGroupId, updates);
 }
 
 /**

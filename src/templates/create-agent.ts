@@ -3,13 +3,14 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR, TIMEZONE } from '../config.js';
-import { CONTAINER_PLUGINS_DIR, updateContainerConfig, type ParsedMcpServerConfig } from '../container-config.js';
-import { createAgentGroup } from '../db/agent-groups.js';
 import {
-  ensureContainerConfig,
-  updateContainerConfigJson,
-  updateContainerConfigScalars,
-} from '../db/container-configs.js';
+  CONTAINER_PLUGINS_DIR,
+  updateContainerConfig,
+  writeContainerConfigScalars,
+  type ParsedMcpServerConfig,
+} from '../container-config.js';
+import { createAgentGroup } from '../db/agent-groups.js';
+import { ensureContainerConfig, updateContainerConfigJson } from '../db/container-configs.js';
 import { assertValidGroupFolder, resolveGroupFolderPath } from '../group-folder.js';
 import { canonicalizeIanaTimezone } from '../timezone.js';
 import { stageGroupPersona } from '../group-persona.js';
@@ -127,13 +128,7 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
   await createAgentGroup(group);
   await ensureContainerConfig(id);
-  // Dual-write: the DB row serves `config get` and scheduling; container.json is what the spawn reads for TZ.
-  if (timezone) {
-    await updateContainerConfigScalars(id, { timezone });
-    await updateContainerConfig(folder, (config) => {
-      config.timezone = timezone;
-    });
-  }
+  if (timezone) await writeContainerConfigScalars(id, folder, { timezone });
 
   // group-init.ts owns the mkdir at first spawn, but it isn't called here — so we
   // create the dir ourselves to land the standing-instructions file + context/.

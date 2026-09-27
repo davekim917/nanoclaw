@@ -26,23 +26,9 @@ import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { recordContextTokens, recordServedModel, recordSubagent } from '../turn-status.js';
 
 /**
- * Tokens occupying the context window, from one API response's `usage`.
- *
- * ANTHROPIC'S THREE PROMPT COUNTERS ARE DISJOINT. `input_tokens` counts only
- * the UNCACHED remainder of the prompt; the cached prefix is reported
- * separately as `cache_read_input_tokens` and a freshly written cache segment
- * as `cache_creation_input_tokens`. Occupancy is therefore the SUM. Reading
- * `input_tokens` alone is the silent failure this function exists to prevent:
- * on a warm thread it is a few hundred tokens, so a nearly full window would
- * render as almost empty.
- *
- * Contrast providers/codex.ts, where `cachedInputTokens` is a SUBSET of
- * `inputTokens` and the same sum would double-count. Each provider converts
- * its own report to a finished number for exactly this reason.
- *
- * Returns 0 when there is nothing usable — `recordContextTokens` ignores it,
- * so a response with no usage leaves the previous reading standing rather
- * than zeroing the display.
+ * Tokens occupying the context window. Anthropic's three prompt counters are DISJOINT (`input_tokens` is only the
+ * uncached remainder), so occupancy is their SUM; in codex.ts cached is a subset of input and must not be added.
+ * Returns 0 when nothing is usable, which `recordContextTokens` ignores.
  */
 export function claudeContextOccupancy(
   usage:
@@ -55,8 +41,6 @@ export function claudeContextOccupancy(
     | undefined,
 ): number {
   if (!usage) return 0;
-  // Nullable in the SDK's own types, and a null must read as "nothing cached",
-  // never as a missing term that quietly shrinks the total.
   const count = (value: number | null | undefined): number =>
     typeof value === 'number' && Number.isFinite(value) ? value : 0;
   return count(usage.input_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens);
@@ -93,7 +77,6 @@ import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 import { transcriptContainsUserText } from './claude-transcript-prompt.js';
 
-// Per D9 / D7 / A6: the runtime schema is compiler-checked against the SDK.
 export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
 type ClaudeEffortLevel = (typeof CLAUDE_EFFORT_LEVELS)[number];
 type ExactUnion<Left, Right> = [Exclude<Left, Right>, Exclude<Right, Left>] extends [never, never] ? true : false;
@@ -117,17 +100,12 @@ export interface SdkRateLimitInfo {
   utilization?: number;
   errorCode?: string;
   overageDisabledReason?: string;
-  /**
-   * Per-window readings from the response headers. Internal to the SDK (absent
-   * from its public types), so `unknown`: read only through
-   * `unifiedWindowsToSamples`, which feature-detects the shape.
-   */
+  /** SDK-internal: read only through `unifiedWindowsToSamples`, which feature-detects the shape. */
   unifiedWindows?: unknown;
 }
 
 /**
- * The SDK reports `resetsAt` as either epoch seconds or epoch ms (observed
- * both); normalize to the project's ISO-8601 UTC storage convention.
+ * The SDK reports `resetsAt` in epoch seconds or epoch ms (observed both).
  */
 function resetsAtIso(resetsAt: number | undefined): string | null {
   if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt)) return null;
@@ -136,9 +114,7 @@ function resetsAtIso(resetsAt: number | undefined): string | null {
 }
 
 /**
- * SDK rate-limit events are telemetry unless the SDK explicitly rejects the
- * request. Rejected credit exhaustion is quota; other rejected windows are
- * transient rate limits and retain their reset metadata.
+ * Rate-limit events are telemetry unless the SDK explicitly rejects the request.
  */
 export function classifyRateLimitEvent(
   info: SdkRateLimitInfo | undefined,
@@ -155,26 +131,13 @@ export function classifyRateLimitEvent(
 }
 
 /**
- * Plan utilization per window, from the response headers — no request of our
- * own.
+ * Plan utilization per window, parsed by the CLI from the rate-limit headers of calls it already makes.
  *
- * `rate_limit_info.unifiedWindows` is `{ five_hour, seven_day,
- * seven_day_overage_included }`, each `{ utilization, resetsAt }`, parsed by
- * the CLI from the `anthropic-ratelimit-unified-*` headers of inference calls
- * it already makes. The CLI emits an event whenever a window's rounded
- * percentage or reset moves, so this covers accounts nowhere near a limit; the
- * top-level `utilization` is set only past a warning threshold.
+ * Do not reintroduce a `/api/oauth/usage` pull (SDK `get_usage`): ring slots are scoped `user:inference` only, the
+ * endpoint needs `user:profile`, and its 403s drain the per-token limiter into a ~1h 429.
  *
- * Do not reintroduce a `/api/oauth/usage` pull (the SDK `get_usage` request):
- * ring slots are `claude setup-token` credentials scoped `user:inference`
- * only, and that endpoint needs `user:profile`. It answers 403, and the 403s
- * drain its per-token limiter into a 429 with a retry-after near an hour.
- *
- * The field is internal to the SDK and can change without notice, so it is
- * parsed defensively: anything that is not an object of entries with a finite
- * numeric `utilization` yields no row, never a throw. Window names pass
- * through as sent. `utilization` is a 0-1 fraction that can exceed 1 (usage
- * past a window's cap) and is stored as sent; `resetsAt` is epoch seconds.
+ * The field is SDK-internal and can change without notice: anything malformed yields no row, never a throw.
+ * `utilization` is a 0-1 fraction that can exceed 1; `resetsAt` is epoch seconds.
  */
 export function unifiedWindowsToSamples(windows: unknown, who: AccountIdentity): RateLimitSample[] {
   if (typeof windows !== 'object' || windows === null || Array.isArray(windows)) return [];
@@ -197,20 +160,13 @@ export function unifiedWindowsToSamples(windows: unknown, who: AccountIdentity):
   return rows;
 }
 
-/** Log once per container when an OAuth session's events stop carrying windows. */
 let warnedNoUnifiedWindows = false;
 
-/** Test-only: re-arm the one-shot "no unifiedWindows" log. */
 export function _resetUnifiedWindowsWarningForTesting(): void {
   warnedNoUnifiedWindows = false;
 }
 
-/**
- * Rows for one `rate_limit_event`: the top-level row (it carries the SDK
- * `status`, which no per-window row has), plus one `rate_limit_headers` row
- * per window when `unifiedWindows` is present. Never throws — a shape change
- * must not fail the turn.
- */
+/** Never throws: an SDK shape change must not fail the turn. */
 export function rateLimitEventToSamples(info: SdkRateLimitInfo | undefined, who: AccountIdentity): RateLimitSample[] {
   const rows: RateLimitSample[] = [
     {
@@ -230,9 +186,7 @@ export function rateLimitEventToSamples(info: SdkRateLimitInfo | undefined, who:
   } catch (err) {
     log(`unifiedWindows unreadable (top-level row only): ${err instanceof Error ? err.message : String(err)}`);
   }
-  // Only an OAuth session is expected to carry windows (the SDK documents the
-  // field as always absent for API-key, Bedrock and Vertex). Logged once, so a
-  // CLI that stops sending it is visible without flooding the log.
+  // Only an OAuth session carries windows (always absent for API-key, Bedrock and Vertex).
   if (windows.length === 0 && who.account !== null && !warnedNoUnifiedWindows) {
     warnedNoUnifiedWindows = true;
     log('rate_limit_event carried no usable unifiedWindows — recording the top-level reading only');
@@ -241,15 +195,8 @@ export function rateLimitEventToSamples(info: SdkRateLimitInfo | undefined, who:
 }
 
 /**
- * Operator-declared lane for an OAuth slot, from `CLAUDE_CODE_OAUTH_LANES`
- * (`"1:agentic-primary,3:shared-dev"` — slot number, then label).
- *
- * Which slots are reserved for agents and which are shared with a human's
- * interactive login is INSTALL POLICY, not a fact about this code, so it is
- * declared in the operator's `.env` and never hardcoded here. An undeclared
- * slot returns null, which means "undeclared" — not "agentic".
- *
- * ponytail: parsed per call on a two-entry string, at most once per turn.
+ * Operator-declared lane for an OAuth slot, from `CLAUDE_CODE_OAUTH_LANES` (`"1:agentic-primary,3:shared-dev"`).
+ * Install policy, so never hardcoded here; null means "undeclared", not "agentic".
  */
 export function laneForSlot(declaration: string | undefined, slotName: string | null): string | null {
   if (!declaration || !slotName) return null;
@@ -262,21 +209,9 @@ export function laneForSlot(declaration: string | undefined, slotName: string | 
   return null;
 }
 
-/**
- * Test-only override for the SDK `query` that `ClaudeProvider.query` calls.
- * The real one spawns the Claude Code CLI (`pathToClaudeCodeExecutable`
- * below), which inside an agent container exists and reaches the Anthropic
- * API through the credential proxy. Null in production, so the call
- * site resolves `sdkQuery` at call time exactly as before (the live import
- * binding, which the existing `mock.module` suites also rely on).
- */
 let sdkQueryOverride: typeof sdkQuery | null = null;
 
-/**
- * Test-only: replace the SDK `query` so a unit test drives the provider
- * without spawning the CLI. Call with no argument to restore the real one.
- * A seam rather than `mock.module`, which Bun cannot undo across files.
- */
+/** Test-only. A seam rather than `mock.module`, which Bun cannot undo across files. */
 export function _setSdkQueryForTesting(impl?: typeof sdkQuery): void {
   sdkQueryOverride = impl ?? null;
 }
@@ -288,47 +223,19 @@ const TASK_NOTIFICATION_EMOJI: Record<string, string> = {
 };
 
 /**
- * Tool names that launch a subagent, newest first.
- *
- * The tool is called **`Agent`** on this SDK — `sdk-tools.d.ts` declares
- * `AgentInput` (with `subagent_type` / `run_in_background`) and has no
- * `TaskInput` at all; `Task` is the OLD name, and the `Task*` types that do
- * still exist (`TaskCreateInput`, `TaskGetInput`, `TaskStopInput`,
- * `TaskOutputInput`) are the unrelated task-management tools. `Task` is kept
- * here only so an older CLI still classifies; do NOT drop it, and do NOT
- * assume either name is the live one.
+ * The tool is `Agent` on this SDK; `Task` is the old name, kept so an older CLI still classifies. Drop neither.
  */
 export const SUBAGENT_TOOL_NAMES = ['Agent', 'Task'] as const;
 
 /**
- * Hook matcher covering every subagent tool name.
- *
- * Matcher semantics, verified against the installed CLI (2.1.258) rather than
- * assumed: a matcher of the plain-list shape `/^[a-zA-Z0-9_|]+$/` is split on
- * `|` and compared to the tool name by EXACT membership; only a matcher that
- * fails that shape test is compiled as an (unanchored) `new RegExp`. So
- * `'Agent|Task'` matches exactly those two tools and cannot leak onto
- * `TaskOutput` / `TaskStop` / `TaskCreate` the way an unanchored `Task` regex
- * would. The CLI's own config help states the same contract: "The matcher is
- * a string: a tool name ("Bash"), pipe-separated list ("Edit|Write"), or empty
- * to match all." (`HookCallbackMatcher.matcher?: string` in sdk.d.ts.)
+ * The CLI matches a plain `A|B` list by EXACT name (only other shapes compile as an unanchored regex), so this
+ * cannot leak onto `TaskOutput` / `TaskStop` / `TaskCreate`.
  */
 export const SUBAGENT_TOOL_MATCHER = SUBAGENT_TOOL_NAMES.join('|');
 
 /**
- * The SDK fires `task_notification` for two very different things: real
- * subagent (Agent, formerly Task) completions AND auto-backgrounded Bash
- * commands. For a backgrounded Bash task the `summary` is the *raw command
- * text* (env-var unsets, pipelines, python heredocs) — internal noise that
- * leaked into user channels as "> ✅ <command>" and stranded there whenever
- * the command settled after the turn's real reply. Forward completion lines
- * only for genuine subagent work; a known non-subagent tool (Bash) is
- * suppressed. An unknown/absent tool_use_id means a planned task not tied to a
- * single tool — forward it (the case the feature was built for).
- *
- * Accepting `Agent` is load-bearing, not defensive: this SDK names the tool
- * `Agent`, so while this checked `'Task'` alone every real subagent's
- * notification was silently suppressed.
+ * `task_notification` also fires for auto-backgrounded Bash, whose summary is the raw command text: forward only
+ * subagent work. An absent tool name is a planned task not tied to one tool, so it is forwarded.
  */
 export function shouldForwardTaskNotification(toolName: string | undefined): boolean {
   return toolName === undefined || (SUBAGENT_TOOL_NAMES as readonly string[]).includes(toolName);
@@ -374,17 +281,8 @@ export const SDK_DISALLOWED_TOOLS = [
   'ReportFindings',
 ];
 
-// No explicit `allowedTools` list is set. The SDK's `allowedTools` is
-// "auto-allow without a permission prompt" (not an include-filter). Since
-// we already run with `permissionMode: 'bypassPermissions'` +
-// `allowDangerouslySkipPermissions: true`, every tool that the SDK
-// surfaces is auto-allowed — enumerating them added zero protection and
-// created a silent-regression risk: when the SDK added a new built-in
-// (Task, TaskOutput, TeamCreate, ScheduleWakeup, etc.) and we forgot
-// to append it here, the tool's user-visible command prompt would
-// surface despite bypassPermissions — inconsistent UX. Omitting the
-// enumeration keeps the surface open-by-default and relies on
-// `disallowedTools` above for explicit blocks.
+// No `allowedTools`: it means auto-allow, not an include-filter, and bypassPermissions already allows every tool,
+// so a list only risked prompts for newly added SDK tools. `disallowedTools` above is the explicit block list.
 
 interface SDKUserMessage {
   type: 'user';
@@ -401,20 +299,11 @@ class MessageStream {
   private queue: SDKUserMessage[] = [];
   private waiting: (() => void) | null = null;
   private done = false;
-  /**
-   * Every uuid this stream stamped on a prompt. The CLI echoes a consumed
-   * prompt's uuid on the result of the turn that answered it
-   * (`user_message_uuid`/`user_message_uuids` on SDKResultSuccess and
-   * SDKResultError in sdk.d.ts) and echoes none on a turn it started itself.
-   * Matching against this set, rather than accepting any echoed id, ignores
-   * ids the CLI mints for its own queued work.
-   */
+  /** Every uuid stamped here; matching echoes against it ignores ids the CLI mints for its own queued work. */
   readonly stamped = new Set<string>();
   /**
-   * Stamped prompts no result has echoed yet: accepted, not yet answered. The
-   * CLI can answer a turn it started itself while one of these is still
-   * queued behind it, so this, not the turn count, says whether work is
-   * queued. An echo clears an id; so does `settle()` at idle.
+   * Stamped prompts no result has echoed yet. The CLI can answer a turn it started itself while one of these is
+   * still queued, so this, not the turn count, says whether work is queued.
    */
   readonly outstanding = new Set<string>();
   /** Outstanding as of the last result: the only ids `settle()` may clear. */
@@ -435,7 +324,6 @@ class MessageStream {
     return uuid;
   }
 
-  /** A result arrived: clear the prompts it echoed and return them. */
   answer(echoed: string[]): string[] {
     const answered = [...new Set(echoed)].filter((id) => this.stamped.has(id));
     for (const id of answered) this.outstanding.delete(id);
@@ -444,18 +332,9 @@ class MessageStream {
   }
 
   /**
-   * The CLI went idle: a prompt still outstanding since the last result was
-   * consumed with no echo. The CLI does not go idle between queued turns, so
-   * nothing it has yet to run is settled here. A prompt pushed after that
-   * result is left alone too, since this idle may predate its arrival.
-   *
-   * The snapshot is taken when the runner READS a result, not when the CLI
-   * produced it, so a prompt pushed in the milliseconds between can still be
-   * settled at an idle that predates it and credited with that result.
-   * Leaving recent pushes out instead would strand a prompt that really was
-   * consumed with no echo: nothing would ever clear it, and the turn level
-   * would stay up until the ceiling. One misattributed record in that race is
-   * the cheaper failure.
+   * The CLI went idle: a prompt outstanding since the last result was consumed with no echo (the CLI never idles
+   * between queued turns). The snapshot is taken when the runner READS a result, so a push in that window can be
+   * misattributed; excluding it instead would strand a truly unechoed prompt until the ceiling.
    */
   settle(): string[] {
     const settled = [...this.settleable].filter((id) => this.outstanding.has(id));
@@ -535,31 +414,12 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 }
 
 /**
- * Tool calls this query currently has in flight, keyed by the SDK's
- * `tool_use_id` (the PreToolUse, PostToolUse and PostToolUseFailure inputs
- * all carry it).
+ * Tool calls in flight, keyed by `tool_use_id`: with PARALLEL tools only identity tells which call finished, and
+ * clearing on any PostToolUse erased a still-running Bash's state, collapsing the host's ceiling. The published row
+ * is the WIDEST declared timeout in flight, so a short Read inside a long Bash cannot narrow it.
  *
- * WHY A KEYED MAP AND NOT A MATCHER. `postToolUseHook` is registered without a
- * matcher and used to clear `container_state` unconditionally, so with tools
- * running in PARALLEL the first one to finish erased the state belonging to a
- * still-running Bash — and `activeOperationTimeoutMs`
- * (src/modules/sweep-container-health/index.ts) then returns null, which
- * collapses the host's ceiling back to ABSOLUTE_CEILING_MS and its claim
- * tolerance back to CLAIM_STUCK_MS. A matcher cannot fix that: `matcher: 'Bash'`
- * still cannot tell TWO parallel Bash calls apart, and it would additionally
- * stop clearing state that a non-Bash tool set. Identity is the only thing that
- * distinguishes the calls, so the clear keys on identity.
- *
- * The published row is the WIDEST declared timeout still in flight, not the most
- * recent: while a 30-minute Bash is running, a Read that starts and finishes
- * inside it must not narrow the host's tolerance back down.
- *
- * LEAK, bounded and deliberate: a tool DENIED by another PreToolUse hook never
- * reaches PostToolUse, so its entry stays. That can only make the host MORE
- * patient (a wider ceiling), never less, and it is bounded twice — the map is
- * reset when a query is created and again on every `result` (a turn that has
- * ended has no foreground tool in flight; a backgrounded Bash no longer blocks
- * the turn, so not tracking it is correct).
+ * A call denied by another PreToolUse hook never reaches PostToolUse and leaks; that only widens the host's
+ * patience, and the map resets at query creation and on every `result`.
  */
 const toolsInFlight = new Map<string, { tool: string; declaredTimeoutMs: number | null }>();
 
@@ -569,7 +429,6 @@ const toolsInFlight = new Map<string, { tool: string; declaredTimeoutMs: number 
  */
 let publishedToolUseId: string | null | undefined;
 
-/** Write `container_state` from the widest-declared call still in flight. */
 function publishToolInFlight(): void {
   let widestId: string | null = null;
   let widest: { tool: string; declaredTimeoutMs: number | null } | null = null;
@@ -579,21 +438,9 @@ function publishToolInFlight(): void {
       widestId = id;
     }
   }
-  // Write only when the DESCRIBED CALL changes. The writer stamps
-  // `tool_started_at = now` on every call (container/agent-runner/src/mailbox/
-  // sqlite/connection.ts), and the host reads that stamp as the start
-  // of the tool it describes: `decideCeilingFollowUp` ages it against the
-  // ceiling that fired to decide a wedged-tool wake
-  // (src/modules/sweep-continuation/decide.ts), the wake's dedupe key is
-  // built from it (sweep-continuation/index.ts), host-restart-warn feeds it
-  // to the same decision and keys its note on it (src/host-restart-warn.ts),
-  // the dashboard marks a thread stalled by its age
-  // (src/dashboard/api/threads.ts), and `decideStuckAction` forgives a
-  // claim made after it while that tool is in flight
-  // (src/modules/sweep-container-health/index.ts). Re-publishing the
-  // same long Bash because a parallel Read started or finished would move that
-  // start forward: it would re-key the recovery, make a wedged tool look fresh,
-  // and withdraw that claim forgiveness mid-operation.
+  // Write only when the DESCRIBED CALL changes: every write stamps `tool_started_at = now`, which the host reads as
+  // that tool's start (ceiling follow-up, wake dedupe key, stall display, claim forgiveness). Re-publishing the same
+  // long Bash when a parallel call starts would make a wedged tool look fresh and re-key its recovery.
   if (widestId === publishedToolUseId) return;
   try {
     if (widest === null) clearContainerToolInFlight();
@@ -605,36 +452,19 @@ function publishToolInFlight(): void {
   }
 }
 
-/** Forget every tracked call and clear the row. Called at query creation and on `result`. */
 export function resetToolInFlightTracking(): void {
   if (toolsInFlight.size === 0) return;
   toolsInFlight.clear();
   publishToolInFlight();
 }
 
-/**
- * Claude Code's Bash ceiling when `BASH_MAX_TIMEOUT_MS` is unset: the Bash
- * tool's input schema documents `timeout` as "max 600000"
- * (@anthropic-ai/claude-agent-sdk sdk-tools.d.ts, SDK 0.3.280).
- */
+/** The CLI's Bash cap when `BASH_MAX_TIMEOUT_MS` is unset (the Bash tool schema documents "max 600000"). */
 const CLAUDE_CODE_DEFAULT_BASH_MAX_TIMEOUT_MS = 600_000;
 
 /**
- * The declared Bash timeout the host may trust, or null.
- *
- * The model's `tool_input.timeout` is whatever number it typed, and the host
- * uses the published value unbounded — `Math.max(ABSOLUTE_CEILING_MS, declared)`
- * for the ceiling and `Math.max(CLAIM_STUCK_MS, declared)` for the claim
- * tolerance (src/modules/sweep-container-health/index.ts). The CLI
- * never runs a Bash call longer than `BASH_MAX_TIMEOUT_MS`, which the host pins
- * to 3600000 in the container env (src/group-init.ts, and the spawn's
- * `-e` in src/container-runner.ts). So a declared `86400000` (or `1e12`) plus a
- * wedged CLI or a leaked denied call would hold off both kills for a day (or
- * forever) while the Bash itself was long dead. Clamping to the enforced cap
- * bounds that at what the CLI would allow anyway.
- *
- * Non-numbers, NaN, ±Infinity and non-positive values are not a declaration:
- * null, so the host falls back to its own defaults.
+ * The declared Bash timeout the host may trust, clamped to the cap the CLI enforces: the host widens its ceiling and
+ * claim tolerance by the published value unbounded, so an absurd declaration plus a wedged CLI would hold off both
+ * kills long after the Bash died. Anything not a positive finite number is null (host defaults).
  */
 export function clampDeclaredBashTimeoutMs(declared: unknown): number | null {
   if (typeof declared !== 'number' || !Number.isFinite(declared) || declared <= 0) return null;
@@ -649,15 +479,9 @@ export function clampDeclaredBashTimeoutMs(declared: unknown): number | null {
  * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
  * block the call here instead of letting the agent hang.
  *
- * MUST stay registered in the claude provider's `PreToolUse` table. It is the
- * ONLY writer of `container_state.current_tool` / `tool_started_at` /
- * `tool_declared_timeout_ms`, and without it the host kills every
- * claude-provider container at the 30-minute idle ceiling no matter how long
- * the agent declared its Bash call would take. That registration has been lost
- * in upstream merge resolution repeatedly (wired at 6a815190c 2026-04-20, lost
- * again at ceb3fcd1a 2026-07-24; `git log -S'hooks: [preToolUseHook]'` shows no
- * ordinary commit ever removing it) — `claude.preToolUse-registration.test.ts`
- * exists to make the seventh loss fail CI instead of production.
+ * MUST stay registered in the claude provider's `PreToolUse` table: it is the only writer of `container_state`'s
+ * tool fields, and without it the host kills every claude container at the 30-minute ceiling regardless of the
+ * declared Bash timeout. Upstream merges have dropped the registration before; the registration test guards it.
  */
 export const preToolUseHook: HookCallback = async (input) => {
   const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; tool_use_id?: string };
@@ -668,8 +492,7 @@ export const preToolUseHook: HookCallback = async (input) => {
       stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
     } as unknown as ReturnType<HookCallback>;
   }
-  // Bash exposes its timeout via the tool_input.timeout field (ms), clamped to
-  // what the CLI will actually enforce. Any other tool: no declared timeout.
+  // `tool_input.timeout` is in ms.
   const declaredTimeoutMs = toolName === 'Bash' ? clampDeclaredBashTimeoutMs(i.tool_input?.timeout) : null;
   toolsInFlight.set(i.tool_use_id ?? '', { tool: toolName, declaredTimeoutMs });
   publishToolInFlight();
@@ -677,10 +500,8 @@ export const preToolUseHook: HookCallback = async (input) => {
 };
 
 /**
- * Clear in-flight tool on PostToolUse / PostToolUseFailure — but only the call
- * that actually finished. A missing `tool_use_id` falls back to clearing
- * everything, which is exactly the behaviour this hook had before, so an SDK
- * that stops supplying it degrades to today rather than to a stuck row.
+ * Clears only the call that finished. A missing `tool_use_id` clears everything, so an SDK that stops supplying it
+ * degrades to a cleared row rather than a stuck one.
  */
 export const postToolUseHook: HookCallback = async (input) => {
   const id = (input as { tool_use_id?: string })?.tool_use_id;
@@ -750,10 +571,8 @@ export function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
     const preCompact = input as PreCompactHookInput;
 
-    // The compatibility autosave is deliberately non-mutating. Topic
-    // siblings share HEAD/index, so PreCompact must never stage or commit a
-    // sibling's partial work; the persistent dirty worktree is the recovery
-    // artifact.
+    // Deliberately non-mutating: topic siblings share HEAD/index, so PreCompact must never stage or commit a
+    // sibling's partial work.
     try {
       const autosave = await autoCommitDirtyWorktrees('pre-compact');
       if (autosave.committed.length > 0 || autosave.failed.length > 0) {
@@ -769,89 +588,36 @@ export function createPreCompactHook(assistantName?: string): HookCallback {
   };
 }
 
-// ── Credential rotation patterns ──
-
-// ANTHROPIC_API_KEY _N fallback variants (_2, _5, ...). The base-name match
-// (ANTHROPIC_KEY_RE) lives in secret-env.ts.
 const ANTHROPIC_FALLBACK_RE = /^ANTHROPIC_API_KEY_(\d+)$/;
 
-// CLAUDE_CODE_OAUTH_TOKEN (Claude Max subscription) _N fallback variants.
-// Parallel rotation list to API-key fallbacks — when the host operates on
-// OAuth (no ANTHROPIC_API_KEY), retryable errors advance through these.
 const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 
-// Retryable upstream errors.
-// `subscription_quota_exhausted` is our own marker (see QUOTA_RESULT_RE
-// below) — when the SDK returns the Claude Max quota message as a
-// normal result text instead of throwing, we re-throw with this prefix
-// so the existing rotation+retry path picks it up.
+// `subscription_quota_exhausted` / `subscription_access_disabled` are our own markers: a quota or access failure
+// the SDK returns as result text is re-thrown with them so the rotation+retry path picks it up.
 const RETRYABLE_ERROR_RE =
   /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted|subscription_access_disabled/i;
 
-// Result-text quota/access classification is SDK-free and shared with the
-// constrained cross-model review launcher. Keeping one classifier prevents a
-// new Claude wording from healing native rotation while silently blocking it
-// for review calls (or the reverse).
-
-// Poisoned continuation: the SDK surfaces the thinking-signature 400 as plain
-// result text ("API Error: 400 ... Invalid `signature` in `thinking` block"),
-// not a thrown error — same delivery quirk as QUOTA_RESULT_RE above, so the
-// catch-block isSessionInvalid path never fires on its own. Detect and
-// re-throw; the message keeps the original text so STALE_SESSION_RE matches
-// and poll-loop's stale-session branch clears the continuation and retries
-// with a recap. See STALE_SESSION_RE for how continuations get poisoned.
+// The SDK surfaces the thinking-signature 400 as result text, not a thrown error, so isSessionInvalid never fires on
+// its own. Re-thrown with the original text so STALE_SESSION_RE matches and the continuation is cleared.
 export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? block/i;
 
-// Transient server-side rate limit / overload (HTTP 429/529). After the Claude
-// binary exhausts its OWN internal api_retry attempts, it renders the failure
-// as the turn's RESULT TEXT (not a thrown error, not a rate_limit_event) via
-// `Ml({content, error:"rate_limit"})`:
-//   "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
-//   "API Error: Request rejected (429) · …"
-// Without interception the poll-loop dispatches this 88-char string to the
-// user's channel as the agent's answer and ends the turn silently — the user
-// then has to re-prompt (Operator, 2026-06-26: "extremely disrupting" on long
-// tasks). Throw with a distinct `transient_overload:` marker so poll-loop's
-// catch retries the SAME prompt+continuation with backoff. Rotation is the
-// WRONG cure here — "not your usage limit" means the credential is fine, the
-// server is busy; another key hits the same overloaded server.
-//
-// Anchored on the rendered "API Error:" prefix + the specific server-limit
-// phrase so an agent quoting these words in prose can't trip it (a normal
-// result is the agent's own text, never prefixed "API Error:").
-//
-// Same single-source body/anchored/embedded split as QUOTA_PATTERN_BODY, for
-// the same reason: the subagent classifier needs the EMBEDDED form (a
-// subagent's transient overload arrives wrapped in the CLI's
-// "Agent terminated early due to an API error: …" template, so the prefix is
-// no longer at position 0), while the top-level result path keeps the
-// anchored form. Two hand-maintained copies would drift, and the drift is
-// silent in the worst direction: a transient overload misread as quota
-// exhaustion burns a credential slot rotating away from a server that is
-// merely busy.
+// After the CLI exhausts its own retries, a 429/529 renders as the turn's RESULT TEXT; uncaught, it is delivered as
+// the agent's answer. It is re-thrown as `transient_overload:` so poll-loop retries the same prompt with backoff.
+// Never rotate on it: "not your usage limit" means the credential is fine and the server is busy.
+// Anchored on the rendered "API Error:" prefix so an agent quoting the words in prose can't trip it; the embedded
+// twin serves subagent errors wrapped in the CLI's termination template. One body for both, since drift that
+// misreads an overload as quota burns a credential slot.
 const TRANSIENT_OVERLOAD_PATTERN_BODY =
   'API Error:\\s*(?:Server is temporarily limiting requests|Request rejected \\(429\\))';
 
 export const TRANSIENT_OVERLOAD_RESULT_RE = new RegExp(`^${TRANSIENT_OVERLOAD_PATTERN_BODY}`, 'i');
 
-/** Unanchored twin of TRANSIENT_OVERLOAD_RESULT_RE — see QUOTA_EMBEDDED_RE. */
 export const TRANSIENT_OVERLOAD_EMBEDDED_RE = new RegExp(TRANSIENT_OVERLOAD_PATTERN_BODY, 'i');
 
-// ── Subagent quota exhaustion (PostToolUse: Task) ──
-
 /**
- * What the parent agent sees in place of a quota-exhausted subagent's output.
- *
- * Two hard requirements:
- *  - It must NOT match QUOTA_EMBEDDED_RE / SUBSCRIPTION_BLOCKED_EMBEDDED_RE.
- *    The hook rewrites the tool output it just matched on; text that
- *    re-matched would make every replayed turn look quota-exhausted again.
- *    The self-match guard lives in claude.subagentQuota.test.ts.
- *  - It must not repeat the SDK's "ask your admin to raise it at
- *    claude.ai/settings/usage" remediation. The bug this whole path fixes is
- *    the parent reading that sentence as an instruction and telling the user
- *    to go raise their org limits — which is neither true nor actionable when
- *    the real fix is rotating to the next credential slot.
+ * What the parent sees in place of a quota-exhausted subagent's output. It must NOT match QUOTA_EMBEDDED_RE /
+ * SUBSCRIPTION_BLOCKED_EMBEDDED_RE (a re-match makes every replayed turn look exhausted again), and must not repeat
+ * the SDK's "ask your admin to raise it" remediation, which the parent would relay to the user.
  */
 export const SUBAGENT_QUOTA_REPLACEMENT_TEXT =
   '[nanoclaw] The subagent was aborted before it produced any result: the credential slot ' +
@@ -861,11 +627,8 @@ export const SUBAGENT_QUOTA_REPLACEMENT_TEXT =
   'anyone to change an account, billing, or plan setting.';
 
 /**
- * Flatten a PostToolUse `tool_response` (typed `unknown`) to text we can run
- * the quota regexes over. The Agent tool's (formerly Task) result is normally
- * an array of content blocks, but the field is untyped by contract — a string, a bare
- * object, or something unexpected are all legal. Never throws; depth-capped so
- * a cyclic structure can't spin.
+ * Flattens an untyped PostToolUse `tool_response` for the quota regexes. Never throws; depth-capped so a cyclic
+ * structure can't spin.
  */
 function stringifyToolResponse(response: unknown, depth = 0): string {
   if (response == null || depth > 4) return '';
@@ -887,69 +650,32 @@ function stringifyToolResponse(response: unknown, depth = 0): string {
   return '';
 }
 
-// ── Tier 2: the CLI's structured termination template ──
-//
-// Tier 1 (QUOTA_EMBEDDED_RE / SUBSCRIPTION_BLOCKED_EMBEDDED_RE) enumerates
-// PROSE, and prose is not a stable contract: four times now a new Anthropic
-// wording has slipped past it and silently killed rotation (see the incident
-// list on QUOTA_PATTERN_BODY). Tier 2 stops guessing at the sentence and keys
-// off the wrapper the CLI puts around EVERY subagent API death instead.
-//
-// Verified against the claude 2.1.259 binary. `AgentApiErrorTerminationError`
-// is constructed as `Agent terminated early due to an API error: ${body}`,
-// where `body` is the model's own error prose followed by a parenthesized
-// field list assembled from `error`, `apiErrorStatus`, `requestId` and the
-// model name and joined with ", ":
-//
+// Tier 2: tier 1 matches PROSE, and new Anthropic wordings have repeatedly slipped past it and silently killed
+// rotation. Tier 2 keys off the CLI's wrapper around EVERY subagent API death (verified against claude 2.1.259):
 //   Agent "<desc>" failed: Agent terminated early due to an API error: <prose>
 //   (error type rate_limit, HTTP 429, request id req_…, model sent to the API: …)
-//
-// The prose slot changes; the wrapper and the field list do not. Both subagent
-// surfaces carry it — a synchronous Agent tool_result and an async
-// task_notification summary — so one pair of patterns covers both.
-//
-// `error type rate_limit, HTTP 429` is the credential-side signal. It is NOT
-// sufficient on its own: a TRANSIENT server overload also renders as
-// error type rate_limit / HTTP 429, and rotating away from a busy server is
-// the wrong cure (see TRANSIENT_OVERLOAD_RESULT_RE). The transient exclusion
-// in classifySubagentQuotaText is therefore load-bearing, not belt-and-braces.
+// `error type rate_limit, HTTP 429` alone is NOT sufficient: a transient server overload renders the same, so the
+// transient exclusion in classifySubagentQuotaText is load-bearing.
 
-/** The CLI wrapper around any subagent that died on an API error. */
 export const AGENT_API_ERROR_TERMINATION_RE = /Agent terminated early due to an API error/i;
 
 /**
- * The parenthesized field list's rate-limited opening. Whitespace is flexible
- * because the field list is a `join(', ')` whose spacing is not a contract;
- * the field ORDER is (`error`, `apiErrorStatus`), and `error` is only omitted
- * when the API returned no error kind at all — in which case there is nothing
- * to classify anyway.
+ * Whitespace is flexible because the field list's `join(', ')` spacing is not a contract.
  */
 export const AGENT_API_RATE_LIMIT_SUFFIX_RE = /\(\s*error\s+type\s+rate_limit\s*,\s*HTTP\s+429\b/i;
 
-/** Marker a subagent-quota detection throws under, consumed by poll-loop's rotation catch. */
 export type SubagentQuotaMarker = 'subscription_quota_exhausted' | 'subscription_access_disabled';
 
 /**
- * The one classifier both subagent-quota detection sites run.
- *
- * A subagent's quota death reaches the parent turn on TWO different surfaces
- * depending on how it was launched: a synchronous Agent call carries the prose
- * in its `tool_response` (the PostToolUse hook below), while an ASYNC subagent
- * returns "Async agent launched successfully…" immediately and reports its
- * death later as a `system`/`task_notification` summary. Same wording, two
- * seams — so the decision lives here once, for the same reason the pattern
- * bodies above are single-source: two hand-maintained copies drift, and the
- * drift is silent (one surface keeps rotating, the other stops).
+ * The one classifier both subagent surfaces run (a sync tool_response and an async task_notification summary):
+ * two hand-maintained copies would drift silently.
  */
 export function classifySubagentQuotaText(text: string): SubagentQuotaMarker | null {
   if (!text) return null;
-  // Tier 1 — known prose. Runs first because it is the only tier that can tell
-  // an org access block apart from a quota exhaustion.
+  // Tier 1 first: only it can tell an org access block from quota exhaustion.
   if (QUOTA_EMBEDDED_RE.test(text)) return 'subscription_quota_exhausted';
   if (SUBSCRIPTION_BLOCKED_EMBEDDED_RE.test(text)) return 'subscription_access_disabled';
-  // Tier 2 — the CLI's structured termination template, for a wording tier 1
-  // has never seen. Excluding the transient-overload forms is what keeps this
-  // from rotating away from a merely busy server.
+  // Excluding the transient-overload forms keeps tier 2 from rotating away from a merely busy server.
   if (
     AGENT_API_ERROR_TERMINATION_RE.test(text) &&
     AGENT_API_RATE_LIMIT_SUFFIX_RE.test(text) &&
@@ -960,35 +686,17 @@ export function classifySubagentQuotaText(text: string): SubagentQuotaMarker | n
   return null;
 }
 
-/** Collapse whitespace and cap at the length the throw message carries. */
 function quotaSnippet(text: string): string {
   return text.replace(/\s+/g, ' ').trim().slice(0, 300);
 }
 
 /**
- * Decide whether a `system`/`task_notification` message is an ASYNC subagent
- * that died on the credential slot's quota. Returns the `<marker>: <snippet>`
- * throw message, or null to leave the notification alone.
+ * Returns the `<marker>: <snippet>` throw message when an ASYNC subagent died on quota, else null.
  *
- * This is the async twin of createSubagentQuotaHook. An agent that launches a
- * subagent asynchronously gets an `Agent` `tool_result` of just "Async agent
- * launched successfully…" — nothing for the PostToolUse hook to match on. The
- * failure arrives later as this notification (verbatim, 2026-09-02 03:17 UTC:
- * `status: failed`, summary `Agent "…" failed: Agent terminated early due to
- * an API error: You've hit your session limit · resets 12am …`), which the CLI
- * also folds back into the session as a `<task-notification>` user message
- * that auto-continues the turn — so without this, the parent runs on with a
- * dead subagent and no rotation ever happens.
- *
- * Three conditions, all required:
- *  - `status === 'failed'` — strict. The SDK's vocabulary is exactly
- *    'completed' | 'failed' | 'stopped' (SDKTaskNotificationMessage in
- *    sdk.d.ts), and a completed/stopped subagent whose summary merely QUOTES
- *    the quota string is a report, not an outage. This is the false-positive
- *    framing the synchronous surface has no equivalent of.
- *  - a real subagent, not a backgrounded Bash command whose summary is raw
- *    command text — same classification the forwarding path uses.
- *  - the shared classifier matches the summary.
+ * The async twin of createSubagentQuotaHook: an async launch's tool_result is just "Async agent launched…", and the
+ * CLI folds the later failure notification back in as a user message that auto-continues the turn, so without this
+ * the parent runs on with a dead subagent and never rotates. `status === 'failed'` is strict: a completed or stopped
+ * subagent whose summary merely QUOTES the quota string is a report, not an outage.
  */
 export function subagentQuotaFromTaskNotification(
   tn: { summary?: string; status?: string },
@@ -1003,30 +711,14 @@ export function subagentQuotaFromTaskNotification(
 }
 
 /**
- * PostToolUse hook matched on the subagent tool — `Agent` on this SDK,
- * formerly `Task`, hence SUBAGENT_TOOL_MATCHER covering both: catch Claude Max
- * quota exhaustion (or an org access block) that a SUBAGENT hit.
- *
- * A subagent's quota failure never becomes a top-level `type:'result'` — it
- * comes back as a tool_result inside the parent's still-running turn, so the
- * result-branch throws below never fire, no rotation happens, and the parent
- * reads "…ask your admin to raise it…" as an instruction.
- *
- * Rotation cannot happen mid-flight (the CLI subprocess is started with this
- * query's env, so the credential is fixed for the query's life — see the
- * comment on `oauthSlot` in query()). Recovery therefore requires aborting the
- * query and letting poll-loop's existing rotation/retry machinery replay the
- * turn. So this hook does two things: it records the detection for
- * translateEvents to throw on, and it interrupts the query so the turn
- * actually stops instead of running on with a dead subagent.
- *
- * The rewrite is belt-and-braces: if the abort races the next model request,
- * the misleading prose still never enters the parent's context.
+ * PostToolUse on the subagent tools: a subagent's quota failure returns as a tool_result inside the parent's running
+ * turn, never a top-level result, so the parent would read "…ask your admin to raise it…" as an instruction.
+ * The credential is fixed for the query's life, so recovery means interrupting the query and letting poll-loop's
+ * rotation replay the turn. The output rewrite covers an interrupt that races the next model request.
  */
 export function createSubagentQuotaHook(options: {
   /** Called once per detection with the full `<marker>: <text>` throw message. */
   onDetect: (markedMessage: string) => void;
-  /** Aborts the in-flight query (i.e. `sdkResult.interrupt`). */
   interrupt: () => Promise<unknown>;
 }): HookCallback {
   return async (input) => {
@@ -1036,9 +728,8 @@ export function createSubagentQuotaHook(options: {
       if (!text) return { continue: true };
 
       const marker = classifySubagentQuotaText(text);
-      // No match: return NO rewrite at all. An identity rewrite here would
-      // race sibling PostToolUse hooks last-write-wins and could clobber a
-      // real redaction (sdk.d.ts, PostToolUseHookSpecificOutput).
+      // No match: return NO rewrite. An identity rewrite races sibling PostToolUse hooks last-write-wins and could
+      // clobber a real redaction.
       if (!marker) return { continue: true };
 
       const snippet = quotaSnippet(text);
@@ -1067,88 +758,34 @@ export function createSubagentQuotaHook(options: {
   };
 }
 
-// Credential model for container shells: secret-env.ts (SDK-free).
-
-// ── Every CLAUDE Bash command gets /dev/null on stdin (this provider ONLY) ──
-//
-// The Claude Code Bash tool's fd 0 is a unix socket never written and never
-// closed, so a program reading stdin blocks forever. No Codex tool is known to
-// share it; runPreToolUseChain applies none. Two hangs, both on this path:
-//   • `codex exec` appends stdin to its prompt ("If stdin is piped and a prompt
-//     is also provided, stdin is appended as a <stdin> block"), so it blocked
-//     and died at the turn timeout (2026-06-27, a03dc6787: a CLAUDE agent).
-//   • snowflake-cli 3.23.0 treats an EMPTY `--query` as "no source given" and
-//     falls back to `sys.stdin.read()` (snowflake/cli/_plugins/sql/commands.py).
-//     On 2026-09-22 `snow sql -c mr --query "$(cat /tmp/why0.sql)"` with the
-//     file never written left a production thread silent for 30 minutes
-//     (argv's last element was '' per /proc/<pid>/cmdline; wchan =
-//     unix_stream_data_wait).
-//
-// Nothing legitimately reads that socket, so the fix is not to detect the
-// programs that do. An earlier version pattern-matched `snow` invocations and
-// every patch to that shell parser produced the next miss: `rows=$(snow …)`,
-// a piped snow exempting a later unpiped one, separators inside quotes. The
-// wrap is now unconditional and there is nothing to detect.
-//
-// `exec </dev/null` on its own line, before the command:
-//   • A PREFIX, with no closing token, so nothing the command ends with can
-//     collide with the wrap. A brace group (`{\n<cmd>\n} </dev/null`) turned
-//     two shapes bash accepts today into hard syntax errors: a heredoc with no
-//     terminator line and a trailing line-continuation `\` both swallowed the
-//     closing `}`.
-//   • Redirects on individual commands still override it, so `… | snow sql -i`,
-//     `cmd < file` and heredocs keep their own stdin.
-//   • Same shell, no subshell: `cd` and `export` persist. The harness runs
-//     `bash -c "… && eval '<cmd>' && pwd -P >| <cwdfile>"` with the command
-//     in argv, not on stdin, so closing fd 0 inside the eval cannot cut the
-//     harness off from its own input.
-//   • NOT a wall-clock timeout: a legitimately long query is waiting on the
-//     server, not on fd 0, and runs as long as it needs.
+// Every CLAUDE Bash command gets /dev/null on stdin: the Claude Code Bash tool's fd 0 is a unix socket never
+// written or closed, so any program reading stdin (`codex exec`, `snow sql` with an empty `--query`) blocks forever.
+// Unconditional, because detecting such programs kept missing cases.
+// `exec </dev/null` is a PREFIX with no closing token, so a heredoc without terminator or a trailing `\` cannot
+// swallow it (a brace group broke both). Per-command redirects still override it, and it runs in the same shell,
+// so `cd`/`export` persist; the harness passes the command in argv, so closing fd 0 cannot cut the harness off.
 const STDIN_PREFIX = 'exec </dev/null\n';
 
-/** Give a command /dev/null on stdin. Idempotent. Exported for tests. */
 export function wrapDevNullStdin(command: string): string {
   return command.startsWith(STDIN_PREFIX) ? command : `${STDIN_PREFIX}${command}`;
 }
 
-// Two concurrent jest runs will OOM-kill this container no matter how each one
-// is configured. On 2026-08-09 one agent had two background suites going and
-// its container was OOM-killed 109 times in a single session; two siblings hit
-// 46 and 36. Worker sizing bounds ONE run to fit the cgroup, but
-// a run cannot see a sibling process, so the multiplication survives it.
-//
-// The invariant is "one jest at a time in this container", and the mechanical
-// form of that is a lock on the resource, not a rule about intent. `flock -n`
-// fails immediately rather than queueing: a second suite that waits would sit
-// there burning the turn and then die at the idle ceiling anyway, so refusing
-// with a message the agent can act on is strictly better.
-//
-// Deliberately NOT a "did you pass a path filter" check. That polices intent,
-// is trivially lawyered (`--testPathPattern .`), and misses the actual failure —
-// two *small* suites at once OOM just as dead as one big one.
-//
-// The oom_kill delta is the other half. Killed workers surface to jest as
-// ordinary test failures, so an OOM-shredded run reads as "93 tests failed" and
-// an agent chases phantom assertions — the same fail-open shape as every other
-// silent failure this fleet has hit. Reporting the delta turns that into a
-// visible "results void".
+// Two concurrent jest runs OOM-kill the container however each is configured (worker sizing bounds one run, not a
+// sibling). `flock -n` refuses rather than queues: a waiting suite would die at the idle ceiling anyway.
+// OOM-killed workers surface as ordinary test failures, so the oom_kill delta is reported to mark results void.
 const JEST_RE = /(?:^|[\s;&|(])(?:npx\s+)?jest\b|\bnpm\s+(?:run\s+)?test\b|\byarn\s+(?:run\s+)?test\b/;
 const ALREADY_FLOCKED_RE = /\bflock\b/;
 const JEST_LOCK = '/tmp/.nanoclaw-jest.lock';
 
-/** Serialise jest and report any OOM kills the run took. Exported for tests. */
 export function wrapJestSerialized(command: string): string {
-  // cgroup v2 exposes the counter; when it is absent (v1, or no cgroupfs) the
-  // reads yield empty and the delta is simply skipped rather than failing.
+  // Without cgroup v2's counter the reads are empty and the delta is skipped.
   const oomRead = `$(awk '/^oom_kill /{print $2}' /sys/fs/cgroup/memory.events 2>/dev/null)`;
   return [
     `__nc_oom0=${oomRead};`,
     `flock -n -E 126 ${JEST_LOCK} bash -c ${JSON.stringify(command)};`,
     '__nc_rc=$?;',
     `__nc_oom1=${oomRead};`,
-    // `-E 126` because flock's DEFAULT conflict exit is 1 — the same code jest
-    // returns for ordinary test failures, which would make a refused run and a
-    // red suite indistinguishable. 126 is otherwise unused here.
+    // `-E 126`: flock's default conflict exit (1) is also jest's ordinary failure code.
     'if [ "$__nc_rc" = 126 ]; then',
     '  echo "REFUSED: another jest run holds this container\'s test lock. Two concurrent suites OOM-kill the container regardless of worker settings. Wait for it, or kill it, then retry." >&2;',
     'fi;',
@@ -1160,31 +797,14 @@ export function wrapJestSerialized(command: string): string {
 }
 
 /**
- * Rewrites a Bash command before it runs: the jest serialization lock
- * (wrapJestSerialized) — a SEMANTIC rewrite that guards may legitimately see —
- * and, only when `closeStdin` is set, the `/dev/null` stdin prefix
- * (wrapDevNullStdin). No `unset <secrets>` prefix any more — see
- * secret-env.ts's header.
+ * Rewrites a Bash command before it runs: the jest serialization lock, and only with `closeStdin` the /dev/null
+ * stdin prefix.
  *
- * INVARIANT: the stdin prefix is a transport detail no guard may ever see.
- * The email gate's bypass check fails closed on `<` and newlines, so a guard
- * reading `exec </dev/null\n…` would turn a harmless `--dry-run` into an
- * hour-long approval wait. It is applied on the CLAUDE PATH ONLY, once:
- *   • Claude SDK: this hook with `closeStdin: true`, the ONLY hook in the Bash
- *     PreToolUse list returning `updatedInput` — the one emit point. Read from
- *     the CLI binary at SDK 0.3.280 (logic unchanged from 0.3.272): all of our
- *     hooks share one tier (only policySettings hooks run in an earlier tier,
- *     and may rewrite the input first), whose hooks run CONCURRENTLY (a
- *     Promise.race merge), each on the same `hookInput`, never reassigned; the
- *     fold keeps the last `updatedInput` to COMPLETE. So list position orders
- *     neither execution nor merge: safety is one emitter plus unmodified input.
- *     A second emitter would race this one. It sits last only for
- *     claude.stdinEmit.test.ts, whose threaded model is stricter.
- *   • Codex (runPreToolUseChain): this hook WITHOUT `closeStdin`, first, so
- *     guards see the jest rewrite. That chain applies NO prefix anywhere (the
- *     fd-0 condition is the Claude Bash tool's, header above), so none reaches
- *     a guard or an approval card. That asymmetry is the scope, not an
- *     oversight: do not "fix" it by adding one.
+ * INVARIANT: the stdin prefix is a transport detail no guard may ever see (the email gate fails closed on `<` and
+ * newlines). On the Claude SDK this hook, with `closeStdin`, must be the ONLY Bash PreToolUse hook returning
+ * `updatedInput`: the tier's hooks run concurrently on the same input and the last `updatedInput` to complete wins,
+ * so a second emitter would race it. Codex (runPreToolUseChain) runs it without `closeStdin`, first, and applies no
+ * prefix at all; that asymmetry is deliberate.
  */
 export function createBashCommandRewriteHook(opts: { closeStdin?: boolean } = {}): HookCallback {
   return async (input) => {
@@ -1196,8 +816,7 @@ export function createBashCommandRewriteHook(opts: { closeStdin?: boolean } = {}
     if (JEST_RE.test(command) && !ALREADY_FLOCKED_RE.test(command)) {
       rewritten = wrapJestSerialized(rewritten);
     }
-    // Emit point for the Claude chain (see the INVARIANT above). The prefix goes
-    // outermost, so jest's inner `bash -c` inherits /dev/null too.
+    // The prefix goes outermost so jest's inner `bash -c` inherits /dev/null too.
     if (opts.closeStdin) rewritten = wrapDevNullStdin(rewritten);
     if (rewritten === command) return {};
 
@@ -1213,15 +832,11 @@ export function createBashCommandRewriteHook(opts: { closeStdin?: boolean } = {}
   };
 }
 
-/** The live task list's tool, as the Claude CLI names the nanoclaw MCP server's tools. */
 export const TASK_LIST_TOOL_NAME = 'mcp__nanoclaw__update_task_list';
 
 /**
- * PreToolUse: the live task list belongs to the conversation's main agent.
- * A delegated subagent shares the nanoclaw MCP server, so without this a worker
- * can rewrite (and finish) its parent's on-screen list. The SDK marks a hook
- * call made inside a subagent with `agent_id`; the main thread never carries
- * it, even under `--agent`.
+ * A subagent shares the nanoclaw MCP server and could rewrite its parent's live task list. The SDK sets `agent_id`
+ * only on hook calls made inside a subagent, never on the main thread, even under `--agent`.
  */
 export function createSubagentTaskListDenyHook(): HookCallback {
   return async (input) => {
@@ -1250,36 +865,23 @@ function denyBash(reason: string) {
   };
 }
 
-// ── Shared block-destructive-core evaluator loader ──
-// The advisory bash guards (self-approval, snowflake-connector, git-clone) all
-// delegate to PURE evaluators in the shared guard core (block-destructive-core.ts),
-// the same module the OpenCode plugin and the Codex runner consume. Each adapter
-// dynamic-imports it from the mounted bootstrap plugin (bun caches the module).
-// The inline regexes below are a fail-CLOSED FALLBACK only, used when the mount
-// is absent (e.g. unit tests, a plugin-less install). Single source of truth =
-// the core; the fallbacks reproduce its verdict and must stay in sync.
+// The advisory bash guards delegate to pure evaluators in the shared guard core. The inline regexes are a
+// fail-CLOSED fallback for when the mount is absent, and must reproduce the core's verdict.
 type CommandEvaluator = (command: string) => { action: 'allow' | 'block'; reason?: string };
 
-// Default container path to the mounted bootstrap guard core. Overridable via
-// NANOCLAW_DESTRUCTIVE_GUARD_CORE (same env var the Codex runner uses) so unit
-// tests can point at a fixture core. Resolved fresh per call so a test that sets
-// the override sees it even after an earlier default-path attempt cached a miss.
+// Resolved per call so a test's override is seen even after an earlier default-path miss was cached.
 const DEFAULT_GUARD_CORE_PATH =
   '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 function guardCorePath(): string {
   return process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
 }
 
-// Memo keyed by `<resolvedPath>::<exportName>`: undefined = not yet attempted,
-// null = unavailable/mistyped. Keying on the path means an override swap (tests)
-// re-imports instead of returning a stale verdict for a different core.
+// Keyed by path so an override swap re-imports. undefined = not yet attempted, null = unavailable.
 const _coreEvaluators: Record<string, CommandEvaluator | null | undefined> = {};
 
 /**
- * Dynamic-import a named pure evaluator from the shared guard core and validate
- * it is a function. Returns null (memoized) when the core can't be imported or
- * the export is missing / not a function — callers MUST then fall back to their
- * inline fail-closed policy.
+ * Returns null (memoized) when the core can't be imported or the export isn't a function; callers MUST then fall
+ * back to their inline fail-closed policy.
  */
 async function loadCoreEvaluator(exportName: string): Promise<CommandEvaluator | null> {
   const corePath = guardCorePath();
@@ -1295,16 +897,8 @@ async function loadCoreEvaluator(exportName: string): Promise<CommandEvaluator |
   return _coreEvaluators[key]!;
 }
 
-// ── Self-approval block ──
-// The bootstrap/plugins/workflow plugin's block-destructive hook gates
-// destructive filesystem ops behind a file-based approval at
-// `.claude-destructive-gate`. This hook prevents the agent from bypassing
-// that gate by writing the approval file itself via Bash (`touch
-// .claude-destructive-gate`, `echo … > .claude-destructive-gate`, etc.).
-// Admin approval must come through the chat channel, not the agent's own
-// filesystem writes. v1 `createSelfApprovalBlockHook` equivalent.
-// Delegates to the shared core's evaluateSelfApproval; the inline regex is the
-// fail-closed fallback when the core is unavailable.
+// Blocks the agent from approving its own destructive op by writing `.claude-destructive-gate` via Bash: approval
+// must come from the user through the chat channel.
 const SELF_APPROVAL_RE = /\.claude-destructive-gate/;
 const SELF_APPROVAL_BLOCK_MSG =
   'Self-approval of destructive operation gates is not allowed. Approval must come from the user via the chat channel, not by writing .claude-destructive-gate yourself.';
@@ -1327,26 +921,13 @@ export function createSelfApprovalBlockHook(): HookCallback {
       }
     }
 
-    // Fallback: shared core unavailable/threw — apply the inline policy, fail-closed.
     if (SELF_APPROVAL_RE.test(command)) return denyBash(SELF_APPROVAL_BLOCK_MSG);
     return {};
   };
 }
 
-// ── Block ad-hoc Python snowflake.connector ──
-// `snow` CLI is gated by destructive-operation controls (and scoped
-// credential mounts); the Python connector bypasses those. Only blocks
-// direct python execution — grep, echo, pip install, and existing
-// scripts that happen to contain the string are unaffected.
-//
-// This is ADVISORY, not a security boundary. The regex is bypassable
-// with base64-decoded source, heredocs, script files, or point-version
-// binaries (python3.11). The real mitigation is only mounting Snowflake
-// credentials when the snow CLI is actually invoked — a larger arch
-// change. In the current model the hook nudges the agent toward `snow
-// sql` for normal cases and raises the friction for unintended paths.
-// Delegates to the shared core's evaluateSnowflakeConnector; the inline regex
-// is the fail-closed fallback when the core is unavailable.
+// ADVISORY, not a security boundary: `snow` is gated by destructive-operation controls and the Python connector
+// bypasses them, so direct python use of it is blocked. Base64, heredocs or script files still evade the regex.
 const SNOWFLAKE_CONNECTOR_EXEC_RE = /\bpython[23]?\b.*\bsnowflake[._]connector\b/i;
 const SNOWFLAKE_CONNECTOR_BLOCK_MSG =
   "Direct use of Python snowflake.connector is blocked. Use `snow sql` for ad-hoc queries. If `snow` isn't working, report the error rather than falling back to the Python connector.";
@@ -1369,24 +950,14 @@ export function createBlockSnowflakeConnectorHook(): HookCallback {
       }
     }
 
-    // Fallback: shared core unavailable/threw — apply the inline policy, fail-closed.
     if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) return denyBash(SNOWFLAKE_CONNECTOR_BLOCK_MSG);
     return {};
   };
 }
 
-// ── Block the codex companion (/codex:* skills) in-container ──
-// `/codex:rescue` and `/codex:review` both run `node …/codex-companion.mjs`,
-// whose runAppServerTurn hardcodes a read-only/workspace-write OS sandbox.
-// That sandbox cannot create its landlock/seccomp namespaces under nested
-// Docker, so codex hangs at sandbox init — observed 2026-06-27: a turn frozen
-// ~14s in with no output for 12+ min, misread as "the codex runtime is
-// wedged" (it isn't — `codex exec --yolo` round-trips in ~13s and generates
-// images fine). The container is already the isolation boundary; the correct
-// in-container path is `codex exec --yolo` (danger-full-access, no inner
-// sandbox). Block the companion with a redirect so the agent fast-fails to the
-// working path instead of hanging. Lives here in NanoClaw (not the codex
-// plugin) so a plugin-repo merge can't clobber it.
+// The codex companion (/codex:* skills) forces an OS sandbox that cannot initialize under nested Docker, so it hangs;
+// `codex exec --yolo` is the working in-container path. Lives here, not in the codex plugin, so a plugin-repo merge
+// can't clobber it.
 const CODEX_COMPANION_RE = /codex-companion(\.mjs)?\b/;
 const CODEX_COMPANION_BLOCK_MSG =
   'The /codex:* plugin skills (codex-companion.mjs) hang under nested Docker — their app-server forces an OS sandbox that cannot initialize in-container. Use `codex exec --yolo "<prompt>"` directly instead (no inner sandbox; the container is already the isolation boundary). It supports everything the skills do, including image generation.';
@@ -1401,77 +972,30 @@ export function createBlockCodexCompanionHook(): HookCallback {
   };
 }
 
-// ── Email gate ──
-// Intercept agent-initiated outbound Gmail sends and require admin approval
-// before the command runs. Two surfaces matter, both via the gws CLI:
-//   1. Helper verbs:   gws gmail +send | +reply | +reply-all | +forward
-//   2. Raw API form:   gws gmail users (messages|drafts) send …
-// The raw form takes the same code path as the helper verbs and produces an
-// identical send — an earlier version of this hook only matched (1), and an
-// agent reaching for the raw API surface bypassed the gate entirely.
-//
-// Drafts are intentionally NOT gated when only being created
-// (`gws gmail users drafts create`) — drafts never deliver until separately
-// sent. The helper-verb `--draft` flag and `--dry-run` likewise bypass.
-//
-// Out of scope (cannot be caught at this layer reliably):
-//   • Direct REST calls (curl/wget to gmail.googleapis.com).
-//   • Python/Node SDK calls (`users.messages().send()`, nodemailer, etc.).
-//   • SMTP CLIs (sendmail, swaks, msmtp) — none ship in the container image,
-//     and `install_packages` is itself admin-gated.
-//   • eval / alias / variable-indirection / base64-decoded subshells.
-// The only sound place to catch all of those is the egress proxy. OneCLI
-// 1.x's gateway only supports `block`/`rate_limit` rule actions today; when
-// it grows an `approve` action this hook should become a UX-fast-path on top
-// of the gateway rule rather than the source of truth.
-//
-// Approval round-trip uses the existing send_file delivery-ack surface:
-// write a system action with action='request_bash_gate' to outbound.db;
-// host's bash-gate module calls requestApproval and writes the decision
-// back to inbound.db's `delivered` table; we poll it via
-// awaitDeliveryAck. Up to 60 minutes (must match host-side BASH_GATE_TIMEOUT_MS).
+// Email gate: agent-initiated Gmail sends via the gws CLI need admin approval before they run. The helper verbs
+// (+send/+reply/+reply-all/+forward) and the raw `users (messages|drafts) send` form send identically, so both are
+// gated; creating a draft is not. Direct REST, SDK and SMTP sends are out of reach at this layer (only the egress
+// proxy could catch them). The approval wait is up to 60 minutes and must match host-side BASH_GATE_TIMEOUT_MS.
 export const GWS_EMAIL_SEND_RE =
   /\bgws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)\b/;
-/** Inline mirror of email-gate-core.ts (this is the fail-closed FALLBACK, so it
- *  can't import the core). Keep in sync with the SoT. */
+/** Inline mirror of email-gate-core.ts (the fail-closed fallback cannot import it); keep in sync. */
 const EMAIL_BYPASS_FLAGS = new Set(['--dry-run', '--draft', '--help', '-h']);
-// Includes `#` (comment: `… --body x # --dry-run` drops the flag at runtime) and
-// the NEWLINE separator `\n\r` — the bypass check runs on the WHOLE command, so a
-// `--dry-run\n<real send>` decoy must fail closed here (else `\s+` token-splitting
-// treats the newline as whitespace and the decoy's --dry-run reads as real argv
-// while bash runs the second line). Mirrors the SoT SHELL_METACHAR_RE.
+// `#` and newlines included: the bypass check runs on the WHOLE command, so a `--dry-run\n<real send>` decoy must
+// fail closed rather than read the decoy's flag as real argv. Mirrors the core's SHELL_METACHAR_RE.
 const EMAIL_SHELL_METACHAR_RE = /[<>|;&$`(){}#\n\r]/;
 
-/** A bypass flag (--dry-run/--draft/--help/-h) is honored only as a real argv
- *  token in a SIMPLE gws command: strip quoted content in all four bash quote
- *  forms (ANSI-C `$'…'` and locale `$"…"` first, then plain `'…'`/`"…"`,
- *  escape-aware), fail closed on unbalanced quotes, on any unquoted BACKSLASH
- *  (a shell escape — `--body \ --dry-run` joins `\ ` into the body so gws gets no
- *  real flag), OR any unquoted shell metacharacter (redirects / pipes /
- *  expansions / grouping / comments / newlines can divert the token from gws's
- *  argv while the mail still sends), then split on bash IFS (space/tab/newline,
- *  not JS \s) and match a whole flag token. After these rejections the tokens
- *  EXACTLY equal bash's argv words. Mirrors the SoT bypassFlagIsRealArgvToken. */
-// Non-IFS, non-flag, non-metachar placeholder for a stripped quoted span. Using
-// a sentinel (not a space) keeps bash word-concatenation: `--body 'x'--dry-run`
-// joins to one word `x--dry-run` (no real flag), so the replacement must keep it
-// one token — a space would manufacture a bogus --dry-run. Mirrors SoT.
+// A sentinel, not a space, preserves bash word concatenation: `--body 'x'--dry-run` is one word with no real flag.
 const EMAIL_QUOTED_SPAN_SENTINEL = '\x00';
 const EMAIL_LEADING_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
-/** Mirrors SoT bypassFlagIsRealArgvToken: quote→sentinel, reject quote/backslash/
- *  metachar, then bind to a DIRECT gws invocation (skip VAR=value, require first
- *  word `gws` so a wrapper like `exec -a --dry-run gws …` can't swallow the flag)
- *  and honor a bypass flag only in OPTION position (not as a prior bare
- *  option's value). Fail-closed: every step only makes bypass LESS likely. */
+/**
+ * A bypass flag counts only as a real argv token of a SIMPLE, DIRECT gws command, in option position. Quoted spans
+ * are stripped, and any unbalanced quote, unquoted backslash or shell metacharacter fails closed, so the remaining
+ * tokens equal bash's argv words. Mirrors the core's bypassFlagIsRealArgvToken; every step only makes bypass less
+ * likely.
+ */
 function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
-  // Strip NON-expanding quotes first (single + ANSI-C $'…' — no expansion), then
-  // fail closed on a `$(`/backtick inside an EXPANDING span ("…" / locale $"…"):
-  // bash still runs COMMAND SUBSTITUTION there, so `--dry-run --body "$(gws …
-  // +send --to victim)"` would shell out a REAL send before the no-op flag — the
-  // NUL-strip would otherwise hide it from the metachar check. Inspect the span
-  // CONTENT (capture group) so the locale `$` prefix isn't counted. Only command
-  // substitution executes — bare `$VAR`/`$5` is parameter expansion, so a legit
-  // `--body "cost is $5"` must still bypass. Mirrors SoT.
+  // Command substitution still runs inside expanding quotes (`"…"`, `$"…"`), so `$(` or a backtick there refuses
+  // the bypass before the sentinel hides it. Bare `$VAR` is only expansion, so `--body "cost is $5"` still bypasses.
   const safeStripped = gwsSegment
     .replace(/\$'(?:[^'\\]|\\.)*'/g, EMAIL_QUOTED_SPAN_SENTINEL)
     .replace(/'[^']*'/g, EMAIL_QUOTED_SPAN_SENTINEL);
@@ -1498,9 +1022,8 @@ function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
   return false;
 }
 
-// Narrow read-only help form: optional export assignments, one direct gws
-// invocation, then only stderr-to-stdout plus a bounded head reader. The
-// regular argv verifier still proves help is a real gws option.
+// Read-only help probe: optional exports, one direct gws call, then only `2>&1 | head -N`. The argv verifier still
+// proves help is a real gws option.
 const EMAIL_SAFE_HELP_PROBE_RE =
   /^(?:export\s+(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+)(?:\s+[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+)*\s+&&\s+)?((?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+\s+)*gws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)(?:\s+[^\s;&|<>\x60$(){}#'"]+)*)\s+2>&1\s*\|\s*head\s+-\d+\s*$/;
 
@@ -1511,11 +1034,7 @@ function emailSafeHelpProbeIsReadOnly(command: string): boolean {
   return /(?:^|[ \t])(?:--help|-h)(?:$|[ \t])/.test(gwsSegment) && emailBypassIsRealArgvToken(gwsSegment);
 }
 
-/**
- * Decode the RFC 822 envelope from `--json '{"raw":"<base64url>"}'` so the
- * approval card shows real recipient/subject when the agent uses the raw API
- * form. Returns {} on any failure — caller falls back to "unknown recipient".
- */
+/** Envelope of the raw-API `--json '{"raw":"<base64url>"}'` form, for the approval card; {} on any failure. */
 export function envelopeFromJsonRaw(segment: string): {
   to?: string;
   from?: string;
@@ -1558,12 +1077,10 @@ export function envelopeFromJsonRaw(segment: string): {
   return out;
 }
 
-// Email-gate verdict shape (mirrors email-gate-core.ts EmailGateVerdict). PURE.
+// Mirrors email-gate-core.ts EmailGateVerdict.
 type EmailGateVerdict = { action: 'allow' | 'gate'; label?: string; summary?: string; reason?: string };
 type EmailGateEvaluator = (command: string, env: { isScheduledTask: boolean }) => EmailGateVerdict;
 
-// Default container path to the vendored email-gate core. Overridable via
-// NANOCLAW_EMAIL_GATE_CORE for unit tests (mirrors the guard-core override).
 const DEFAULT_EMAIL_GATE_CORE_PATH =
   '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/email-gate-core.ts';
 function emailGateCorePath(): string {
@@ -1585,41 +1102,25 @@ async function loadEmailGateEvaluator(): Promise<EmailGateEvaluator | null> {
 }
 
 /**
- * Inline fail-CLOSED fallback that reproduces evaluateEmailSend's decision +
- * card-build when the shared core can't be imported (unit tests, plugin-less
- * install). Verbatim port of the policy in email-gate-core.ts so the fallback
- * can never drift OPEN relative to the core. Keep in sync with the core.
+ * Inline fail-CLOSED fallback for when the core can't be imported: a verbatim port of email-gate-core.ts's policy so
+ * it can never drift OPEN. Keep in sync with the core.
  */
 function evaluateEmailSendInline(command: string, env: { isScheduledTask: boolean }): EmailGateVerdict {
   if (!command || !GWS_EMAIL_SEND_RE.test(command)) return { action: 'allow' };
 
-  // Bypass ONLY when the WHOLE command is a single, simple send carrying a real
-  // bypass flag — no shell separators, no metacharacters, no second command.
-  // Checking the whole command (not a per-segment slice) collapses the decoy
-  // class: `: gws gmail +send --dry-run; <real send>` contains a `;`, so the
-  // metacharacter check refuses the bypass and the gate fires — whether the real
-  // send is regex-visible OR obfuscated (`+se''nd`). A determined adversary can
-  // still evade DETECTION at the shell layer (egress proxy is the sound boundary
-  // — see email-gate-core.ts header), but no bypass-flag decoy rides past the
-  // gate. The only shell-operator exception is the bounded read-only help
-  // probe above. Keep in sync with email-gate-core.ts evaluateEmailSend.
+  // Bypass only when the WHOLE command is one simple send with a real bypass flag: checking the whole command makes
+  // a `: gws gmail +send --dry-run; <real send>` decoy hit the metacharacter check, even with an obfuscated send.
+  // The bounded read-only help probe is the only shell-operator exception.
   if (emailSafeHelpProbeIsReadOnly(command) || emailBypassIsRealArgvToken(command)) return { action: 'allow' };
 
-  // Scheduled tasks intentionally bypass — v1 also did this so
-  // automated email reports aren't prompted every run.
+  // Scheduled tasks bypass so automated email reports aren't gated on every run.
   if (env.isScheduledTask) return { action: 'allow' };
 
-  // Card fields are extracted from the WHOLE command: in a decoy chain the real
-  // send (and its recipient) may live in a segment that doesn't cleanly match
-  // GWS_EMAIL_SEND_RE (obfuscated verb), so a per-segment pick can miss it. The
-  // gate has already fired; the card is best-effort (raw command is in the
-  // tool-call log). Mirrors email-gate-core.ts.
+  // Card fields come from the WHOLE command: in a decoy chain the real send may sit in a segment GWS_EMAIL_SEND_RE
+  // misses. The card is best-effort; the gate has already fired.
   const gwsSegment = command;
 
-  // Parse the email envelope so the card shows structured fields
-  // instead of raw shell. Each matcher handles both --flag 'quoted'
-  // and --flag unquoted. Helper-verb sends carry envelope as flags;
-  // raw-API sends carry it as base64url RFC 822 inside `--json '{"raw":…}'`.
+  // Helper-verb sends carry the envelope as flags; raw-API sends as base64url RFC 822 inside `--json`.
   const matchFlag = (flag: string): string | undefined => {
     const quoted = gwsSegment.match(new RegExp(`${flag}\\s+['"]([^'"]+)['"]`));
     if (quoted) return quoted[1];
@@ -1634,21 +1135,14 @@ function evaluateEmailSendInline(command: string, env: { isScheduledTask: boolea
   const cc = matchFlag('--cc') ?? envelope.cc;
   const bcc = matchFlag('--bcc') ?? envelope.bcc;
   const isHtml = /\s--html(?:\s|$)/.test(gwsSegment);
-  // Parse the sending identity from GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE.
-  // Path convention: /home/node/.config/gws/accounts/<slug>.json.
-  // The slug is the human-facing account name the user configured.
+  // The sending identity is the credentials file's slug: /home/node/.config/gws/accounts/<slug>.json.
   const credsMatch = command.match(/GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=\S*?\/accounts\/([\w.-]+)\.json/);
   const fromAccount = credsMatch?.[1] ?? 'default';
-  // Anchor to the four allowed helper verbs only — the prior `\+(\w[\w-]*)`
-  // could capture spurious `+ABC` substrings from a base64 payload in the
-  // raw-API form. Falls back to "send" for the raw form (which has no +verb).
+  // Only the four helper verbs: a looser `\+\w+` matched `+ABC` inside a raw-form base64 payload.
   const action = gwsSegment.match(/\+(send|reply|reply-all|forward)\b/)?.[1] ?? 'send';
   const label = subject ? `Email ${action} to ${to}: "${subject}"` : `Email ${action} to ${to}`;
 
-  // No `command` field on the payload → host's buildCardBody skips
-  // its code-block branch entirely. Full raw command is still in the
-  // SDK tool-call log for audit; we just don't surface shell noise
-  // to the approver.
+  // No `command` field: the host's card then shows no shell noise; the raw command stays in the tool-call log.
   const lines: string[] = [`*From:* ${fromAccount}`, `*To:* ${to}`];
   if (cc) lines.push(`*Cc:* ${cc}`);
   if (bcc) lines.push(`*Bcc:* ${bcc}`);
@@ -1662,18 +1156,14 @@ function evaluateEmailSendInline(command: string, env: { isScheduledTask: boolea
   return { action: 'gate', label, summary };
 }
 
-/** Derive the email verb for user-facing deny wording ("Email reply blocked: …").
- *  The core verdict carries only label/summary, not the bare verb, so re-derive
- *  it here the same way the core does. */
+/** The core verdict carries no bare verb, so it is re-derived the way the core does. */
 function emailActionVerb(command: string): string {
   const segments = command.split(/[;&|]\s*|\s*&&\s*|\s*\|\|\s*|\n/);
   const gwsSegment = segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) ?? command;
   return gwsSegment.match(/\+(send|reply|reply-all|forward)\b/)?.[1] ?? 'send';
 }
 
-/** A dynamically-imported core verdict is trusted only when its action is a
- *  known value. Mirrors the codex-runner wellFormedVerdict guard so a malformed
- *  email-core return can't fall through to allow. */
+/** A core verdict is trusted only with a known action, so a malformed return can't fall through to allow. */
 function isWellFormedEmailVerdict(v: unknown): v is EmailGateVerdict {
   const a = (v as { action?: unknown } | null | undefined)?.action;
   return a === 'allow' || a === 'gate';
@@ -1681,9 +1171,8 @@ function isWellFormedEmailVerdict(v: unknown): v is EmailGateVerdict {
 
 export function createEmailGateHook(opts?: {
   /**
-   * Join the shared one-card-per-tool-call claim. Set ONLY by the in-tree Codex
-   * chain, which knows the plugin adapter is gating the same tool call. See the
-   * comment above `GateClaimApi`.
+   * Join the shared one-card-per-tool-call claim. Set ONLY by the in-tree Codex chain, which knows the plugin
+   * adapter gates the same tool call.
    */
   sharedApprovalClaim?: boolean;
 }): HookCallback {
@@ -1692,25 +1181,16 @@ export function createEmailGateHook(opts?: {
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
 
-    // The rewrite hook prepends no `unset …;` prefix, so the gate evaluates
-    // exactly what the agent wrote.
     const evalCommand = command;
 
-    // Verdict (allow vs gate + pre-built card) comes from the shared core's
-    // evaluateEmailSend; the inline evaluator is the fail-CLOSED fallback when
-    // the core can't be imported. The faithful policy (scheduled bypasses,
-    // interactive gates, --dry-run/--draft bypass) lives in the core.
     const isScheduledTask = process.env.NANOCLAW_IS_SCHEDULED_TASK === '1';
     const coreEvaluator = await loadEmailGateEvaluator();
     let verdict: EmailGateVerdict;
     if (coreEvaluator) {
       try {
         const v = coreEvaluator(evalCommand, { isScheduledTask });
-        // A dynamically-imported core can return a malformed verdict (bad shape /
-        // unknown action). Anything that isn't a well-formed allow|gate is
-        // untrusted → fall back to the inline fail-CLOSED evaluator. Without this,
-        // `{action:'bogus'}` / `{}` would hit the non-'gate' branch below and ALLOW
-        // a real send unapproved. Mirrors the codex-runner verdict-shape guard.
+        // A malformed core verdict is untrusted: without the shape check `{}` or `{action:'bogus'}` would ALLOW a
+        // real send unapproved.
         verdict = isWellFormedEmailVerdict(v) ? v : evaluateEmailSendInline(evalCommand, { isScheduledTask });
       } catch {
         verdict = evaluateEmailSendInline(evalCommand, { isScheduledTask });
@@ -1725,24 +1205,17 @@ export function createEmailGateHook(opts?: {
     const label = verdict.label ?? `Email ${action}`;
     const summary = verdict.summary ?? '';
 
-    // Approval round-trip — UNCHANGED from the pre-core implementation: write a
-    // request_bash_gate system action to outbound.db and block on the host's
-    // decision via awaitDeliveryAck (60 min, matches host BASH_GATE_TIMEOUT_MS).
-    // Dynamic imports avoid any risk of circular-import with the DB module graph
-    // during provider init.
+    // Dynamic imports avoid a circular import with the DB module graph during provider init.
     const { writeMessageOut } = await import('../db/messages-out.js');
     const { getSessionRouting } = await import('../db/session-routing.js');
     const { awaitDeliveryAck } = await import('../db/delivery-acks.js');
 
-    // Share ONE card with the peer guard gating this same tool call. Opt-in per
-    // the comment on `GateClaimApi`: never armed on the Claude path, where no
-    // peer exists.
+    // Share ONE card with the peer guard gating this same tool call. Opt-in (see `GateClaimApi`): never armed on the
+    // Claude path, where no peer exists.
     const claimApi = opts?.sharedApprovalClaim ? await loadGateClaimApi() : null;
     const toolUseId = (pre as { tool_use_id?: unknown }).tool_use_id;
-    // Keyed on the tool call and the gate, NOT the command: this hook gates the
-    // SANITIZED command while the plugin adapter gates the raw one (codex hands
-    // every handler one `input_json`, built before any of them runs), so a
-    // command-keyed claim would give each its own card again.
+    // Keyed on the tool call and gate, NOT the command: this hook gates the SANITIZED command while the plugin
+    // adapter gates the raw one, so a command-keyed claim would give each its own card.
     const claimKey =
       claimApi && typeof toolUseId === 'string' && toolUseId
         ? claimApi.gateClaimKey(toolUseId, 'request_bash_gate')
@@ -1750,8 +1223,7 @@ export function createEmailGateHook(opts?: {
     if (claimKey && claimApi) {
       const claim = claimApi.claimGateRequest(claimKey);
       if (!claim.owner && claim.requestId && !claimApi.gateRequestAlreadyDecided(claim.requestId)) {
-        // A peer staged this exact card. Wait on ITS decision so the human
-        // answers once and both guards honour that one answer.
+        // A peer staged this card: wait on ITS decision so the human answers once.
         const peerAck = await awaitDeliveryAck(claim.requestId, 60 * 60 * 1000);
         if (!peerAck) {
           return denyBash(
@@ -1763,13 +1235,11 @@ export function createEmailGateHook(opts?: {
           `Email ${action} blocked: ${peerAck.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`,
         );
       }
-      // We own the claim, or nobody published in time. Both stage below; the
-      // second is the fail-closed fallback — two cards beats no gate.
+      // We own the claim, or nobody published in time: stage below. Two cards beats no gate.
     }
 
-    // Everything from the routing lookup on is inside the try: a throw ANYWHERE
-    // after the claim is taken has to release it, or the peer waits out the full
-    // publish window for a card that will never exist.
+    // A throw anywhere after the claim is taken must release it, or the peer waits out the full publish window for
+    // a card that will never exist.
     let requestId: string;
     try {
       const routing = getSessionRouting();
@@ -1785,9 +1255,7 @@ export function createEmailGateHook(opts?: {
           requestId,
           label,
           summary,
-          // The host renders a bounded head+tail preview and retains the full
-          // command in the approval record. Approvers need enough context to
-          // make a real decision, even when this fallback owns the gate.
+          // The host previews a bounded head+tail and keeps the full command in the approval record.
           command: evalCommand,
         }),
       });
@@ -1808,25 +1276,11 @@ export function createEmailGateHook(opts?: {
   };
 }
 
-// ── One approval card per tool call (Codex only) ──
-// In a Codex container this hook and the plugin's `codex-guard.ts` BOTH run on
-// every tool call — concurrently, with the same `tool_use_id` (codex-rs 0.154.0
-// `hooks/src/engine/dispatcher.rs` pushes every matched handler onto a
-// `FuturesUnordered`; measured 0.7 ms apart) — and both reach the outbound-email
-// gate. Without a claim, one gated send raises TWO approval cards for one
-// command.
-//
-// OPT-IN, and that is load-bearing. `tool_use_id` is a REQUIRED field of the
-// Claude SDK's PreToolUse input too, so keying on its presence would arm the
-// claim on the Claude path as well — where this hook is the only gate and no
-// peer will ever publish, so the claim could only ever cost (a wait, and one
-// more agent-writable file the gate would read). Only `codex-hooks/runner.ts`
-// passes `sharedApprovalClaim`, and only because it knows a peer guard exists.
-//
-// The claim lives in the SHARED guard core so this staging path and the core's
-// `runGateRequest` agree on the key and the directory; a core from an older
-// container image has none of these exports and the behaviour is exactly as it
-// was — two cards, never a skipped gate.
+// One approval card per tool call (Codex only): in a Codex container this hook and the plugin's `codex-guard.ts`
+// both run concurrently on every tool call with the same `tool_use_id`, and both reach the email gate.
+// OPT-IN is load-bearing: the Claude SDK also supplies `tool_use_id`, but there this hook is the only gate, so a
+// claim could only cost a wait and another agent-writable file. Only `codex-hooks/runner.ts` passes
+// `sharedApprovalClaim`. A core without the claim exports degrades to two cards, never a skipped gate.
 
 interface GateClaimApi {
   gateClaimKey: (toolUseId: string, action: string) => string;
@@ -1834,16 +1288,9 @@ interface GateClaimApi {
   publishGateClaim: (key: string, requestId: string) => void;
   abandonGateClaim: (key: string) => void;
   /**
-   * The check that makes the claim safe to read at all. The claim directory is
-   * under /tmp, which an agent can write to, so a published requestId that has
-   * ALREADY been decided is not a live peer — it is a past approval being
-   * replayed at a different command. Required, not optional: a core without it
-   * disables the claim entirely (two cards), which is the safe default.
-   *
-   * DECIDED is `delivered` or `failed`, never `pending`. The host writes a
-   * `pending` row the moment it posts the card, so `pending` is precisely the
-   * state a loser should wait on — the same reading `awaitDeliveryAck` uses
-   * (`../db/delivery-acks.ts`).
+   * Makes the claim safe to read: the claim dir is agent-writable /tmp, so an ALREADY-decided requestId is a replayed
+   * past approval, not a live peer. Required; a core without it disables the claim. DECIDED is `delivered` or
+   * `failed`, never `pending`, which is the state a loser should wait on.
    */
   gateRequestAlreadyDecided: (requestId: string) => boolean;
 }
@@ -1867,34 +1314,14 @@ async function loadGateClaimApi(): Promise<GateClaimApi | null> {
   return _gateClaimApi;
 }
 
-/** Test seam: drop the memoized claim API so a swapped core path is re-read. */
 export function resetGateClaimApiForTest(): void {
   _gateClaimApi = undefined;
 }
 
-// ── Block ad-hoc `git clone` outside /tmp ──
-// Agents must use create_worktree / clone_repo MCP tools to land a repo
-// inside the managed worktree tree. Direct `git clone` into
-// /workspace/agent or /workspace/worktrees skips the managed-worktree
-// path (auto-commit safety, credential scoping, index registration).
-//
-// Earlier we only rejected clones whose destination-arg wasn't /tmp/,
-// which was trivially bypassable: `git clone … /tmp/x && mv /tmp/x
-// /workspace/agent/stolen` passed because the clone segment targeted
-// /tmp and the move happened as a separate shell segment. This hook
-// now rejects the entire command if it mentions a managed-dir path
-// ANYWHERE alongside `git clone`, regardless of segment order. False
-// positives (e.g. `git clone /tmp/x && echo /workspace/agent exists`)
-// are acceptable — the agent can rephrase.
-// ADVISORY git-clone nudge (not a security boundary — the agent already has RW
-// to managed dirs). Single source of truth is the shared guard core
-// (block-destructive-core.ts), the same module the OpenCode plugin and the Codex
-// runner consume. We dynamic-import it from the mounted bootstrap plugin (bun
-// caches the module). The inline regexes are a fail-CLOSED FALLBACK only, used
-// when the mount is absent (e.g. unit tests). KNOWN residual bypasses (bare
-// `git clone <url>` into cwd=/workspace/agent, `git -C`, renamed binary,
-// symlink) are documented in the core; this guard catches literal-managed-path
-// forms and steers agents to clone_repo/create_worktree.
+// ADVISORY git-clone nudge, not a security boundary (the agent already has RW to managed dirs): agents must use the
+// create_worktree / clone_repo MCP tools. The whole command is rejected when it mentions a managed dir anywhere
+// alongside `git clone`, since `git clone … /tmp/x && mv /tmp/x /workspace/agent/…` defeated a per-segment check.
+// Known residual bypasses are documented in the core.
 const GIT_CLONE_RE = /\bgit\s+clone\b/;
 const MANAGED_DIR_RE = /\/workspace\/(?:agent|worktrees|workgroup|global|extra|thread|plugins)\b/;
 const GIT_CLONE_BLOCK_MSG =
@@ -1918,22 +1345,13 @@ export function createBlockGitCloneHook(): HookCallback {
       }
     }
 
-    // Fallback: shared core unavailable/threw — apply the inline policy, fail-closed.
     if (!GIT_CLONE_RE.test(command)) return {};
     if (MANAGED_DIR_RE.test(command)) return denyBash(GIT_CLONE_BLOCK_MSG);
-    // Allow pure /tmp-only clones (tool installs, scratch builds).
     return {};
   };
 }
 
-// ── SDK env denylist ──
-
-// These secrets are either rotating short-lived tokens (Granola) or
-// HTTP-header-only auth values (Exa, Braintrust MCP). They are intentionally
-// passed as MCP server headers at registration time, not as Bash-visible env.
-// Forwarding them into the SDK's child-process env defeats that isolation.
-// Single source shared with the OpenCode provider (secret-env.ts) so the two
-// providers' env-hygiene can't drift apart.
+// Header-only MCP secrets must never reach the SDK's child-process env.
 const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set(MCP_HEADER_ONLY_SECRET_VARS);
 
 function filterSdkEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
@@ -1945,35 +1363,18 @@ function filterSdkEnv(env: Record<string, string | undefined>): Record<string, s
   return out;
 }
 
-// ── Plugin discovery ──
-
-/**
- * Walk /workspace/plugins/<repo>/(<sub>/(<sub2>/)?).claude-plugin/plugin.json
- * and return them as SDK `plugins:` entries. Without this pass-through, the
- * SDK doesn't load plugin-declared hooks (hooks.json) even if the plugins
- * directory is mounted and CLAUDE_PLUGINS_ROOT is set. Mirrors v1
- * `container/agent-runner/src/index.ts:discoverPlugins`.
- */
+/** Without passing plugins to the SDK, their hooks.json never loads even when the plugins dir is mounted. */
 export interface PluginDiscovery {
   plugins: SdkPluginConfig[];
   preToolUseGuards: string[];
 }
 
 /**
- * Discover Claude plugins and their optional NanoClaw guard capabilities.
+ * `nanoclaw-plugin.json` is deliberately separate from Claude's plugin manifest: an explicit integration contract
+ * rather than undocumented manifest extension fields.
  *
- * `nanoclaw-plugin.json` is deliberately separate from Claude's plugin
- * manifest: it is an explicit host/plugin integration contract without
- * relying on undocumented Claude-manifest extension fields.
- *
- * `excludePlugins` is honoured HERE, in the namespace where these paths
- * resolve, against the relative path this walk assembles from its own
- * `readdirSync` names — never a `realpath` or a host-side prediction of it
- * (`../plugin-exclusions.ts`). A top-level entry never reaches this walk at all
- * (the host omits it from the mount, `src/container-runner.ts`); a sub-plugin
- * entry does, and dropping it here removes the plugin from the SDK `plugins:`
- * list, which is what carries its hooks — its SessionStart hook and any
- * `preToolUseGuards` it declares go with it.
+ * `excludePlugins` is honoured here against the relative path assembled from this walk's own `readdirSync` names,
+ * never a `realpath`. Dropping a sub-plugin removes it from `plugins:`, which also drops its hooks and guards.
  */
 export function discoverPlugins(
   pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins',
@@ -2035,9 +1436,7 @@ export function discoverPlugins(
         addPlugin(subPath);
         continue;
       }
-      // `<repo>/deprecated/` (no manifest of its own) holds retired plugins kept
-      // for reference; the host skill discovery skips them too
-      // (src/plugin-skill-discovery.ts).
+      // `<repo>/deprecated/` holds retired plugins; host skill discovery skips them too.
       if (sub === 'deprecated') continue;
       let sub2s: string[] = [];
       try {
@@ -2061,27 +1460,21 @@ export function discoverPlugins(
   }
   return { plugins, preToolUseGuards: [...preToolUseGuards] };
 }
-// ── Continuation rotation (cold-resume guard) ──
 
 /**
- * Resume cost is dominated by transcript size. Past this many bytes a fresh
- * cold container can't reload the .jsonl before the host's 30-min idle ceiling
- * fires, so the session is dropped and started clean. Operator-overridable.
+ * Past this many transcript bytes a cold container can't reload the .jsonl before the host's 30-min idle ceiling,
+ * so the session is dropped and started clean.
  */
 function transcriptRotateBytes(): number {
   return Number(process.env.CLAUDE_TRANSCRIPT_ROTATE_BYTES) || 12 * 1024 * 1024;
 }
 
-/**
- * Secondary age trigger, measured from the transcript's first entry. 0 (or a
- * non-positive value) disables the age check; size alone then governs.
- */
+/** Measured from the transcript's first entry; a non-positive value disables the age check. */
 function transcriptRotateAgeMs(): number {
   const raw = process.env.CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS;
   if (raw === undefined || raw.trim() === '') return 14 * 86_400_000;
   const days = Number(raw);
   if (!Number.isFinite(days)) return 14 * 86_400_000;
-  // Explicit non-positive override disables the age check; size alone governs.
   return days > 0 ? days * 86_400_000 : Infinity;
 }
 
@@ -2094,16 +1487,8 @@ function claudeConfigDir(): string {
 }
 
 function writeMemorySessionHook(hook: MemorySessionHookRegistration): void {
-  // `claudeConfigDir()` falls back to $HOME/.claude when CLAUDE_CONFIG_DIR is
-  // unset, and containers rely on that fallback resolving to /home/node/.claude.
-  // Run this same code on the host — a test, a script, anything importing this
-  // module outside a container — and the fallback resolves to the developer's own
-  // ~/.claude instead, registering a SessionStart hook whose module does not exist
-  // there. Every host session then errors on startup. That has happened twice.
-  //
-  // The module the hook runs ships only in the container image, so its presence is
-  // a direct check of the invariant that actually matters: never register a hook
-  // pointing at a module that isn't there.
+  // Container-only: outside a container $HOME/.claude is a developer's own config, and a hook pointing at a module
+  // that isn't there breaks every host session on startup. The module ships only in the image, so check it exists.
   if (!fs.existsSync(hook.modulePath)) {
     console.warn(
       `[memory] refusing to register the session hook: ${hook.modulePath} does not exist. ` +
@@ -2153,9 +1538,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Locate the .jsonl backing a session id. The SDK names project dirs by a
- * mangled cwd; rather than reproduce that convention we scan project dirs for
- * `<sessionId>.jsonl` (session ids are UUIDs, so this is unambiguous).
+ * Scans project dirs for `<sessionId>.jsonl` rather than reproducing the SDK's mangled-cwd dir naming (session ids
+ * are UUIDs, so this is unambiguous).
  */
 function findTranscriptPath(sessionId: string): string | null {
   const projects = claudeProjectsDir();
@@ -2173,18 +1557,8 @@ function findTranscriptPath(sessionId: string): string | null {
 }
 
 /**
- * Read has to cover the WHOLE first line — it is one JSON object, and a
- * truncated prefix never parses. The old 4KB buffer returned null for 66% of
- * live transcripts (2693 sampled; the host's `[Trusted runtime capability
- * state]` entry alone runs ~16KB, and the first `"timestamp"` key sits as deep
- * as 12KB in), which silently disabled the age half of
- * `maybeRotateContinuation`: only the size cap ever fired, so long-lived task
- * sessions resumed 17+ day transcripts against a 14-day cap.
- *
- * ponytail: one bounded read, no chunk loop. 1 MiB is ~10x the largest first
- * line observed across those 2693 transcripts (105,694 bytes). A longer one
- * logs and skips the age check instead of failing silently — make this a
- * grow-until-newline loop if that log ever shows up.
+ * The WHOLE first line must be read: a truncated JSON prefix never parses (first entries run to ~100KB), and a null
+ * here silently disables age-based rotation. A longer line logs and skips the age check.
  */
 const TRANSCRIPT_FIRST_LINE_MAX_BYTES = 1024 * 1024;
 
@@ -2195,8 +1569,6 @@ function transcriptStartMs(transcriptPath: string): number | null {
     const fd = fs.openSync(transcriptPath, 'r');
     try {
       // +1 so a filled buffer means the line is genuinely LONGER than the cap.
-      // At exactly the cap with no trailing newline the old sizing read
-      // `n === buf.length` and cried truncation on a complete line.
       const buf = Buffer.alloc(TRANSCRIPT_FIRST_LINE_MAX_BYTES + 1);
       const n = fs.readSync(fd, buf, 0, buf.length, 0);
       const nl = buf.indexOf(0x0a);
@@ -2217,60 +1589,24 @@ function transcriptStartMs(transcriptPath: string): number | null {
   }
 }
 
-// ── Provider ──
-
-/**
- * Claude Code auto-compacts context at this window (tokens). Kept here so
- * the generic bootstrap doesn't need to know about Claude-specific env vars.
- *
- * Operator override: set CLAUDE_CODE_AUTO_COMPACT_WINDOW in the host env to
- * raise or lower the threshold without editing source — useful when running
- * with a 1M-context model variant or when emergency-tuning a deployment.
- */
+/** Auto-compact window in tokens; operator-overridable via CLAUDE_CODE_AUTO_COMPACT_WINDOW. */
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
 
 /**
- * Opus is only supported in its 1M-context form in this fork. Auto-append
- * `[1m]` to a bare `claude-opus-X-Y` id before it reaches the SDK as the
- * mainLoopModel. Load-bearing for the auto-compact window: the CLI grants the
- * 1M window deterministically only when the model id literally carries `[1m]`
- * (`PG(model) = /\[1m\]/.test(model)`). A bare opus id falls back to a gate
- * (`firstParty && ANTHROPIC_BASE_URL===api.anthropic.com`) that is false under
- * proxy auth, collapsing the window to 200k and force-compacting long sessions.
- * Mirrors the host-side `ensureOpus1mSuffix` in src/flag-parser.ts. No-op for
- * aliases (`opus`), non-opus ids, or ids that already carry a `[Nm]` suffix.
+ * Opus runs only in its 1M-context form here. The CLI grants the 1M window only when the id literally carries
+ * `[1m]`; a bare opus id under proxy auth collapses to 200k and force-compacts long sessions. Mirrors
+ * `ensureOpus1mSuffix` in src/flag-parser.ts; a no-op for aliases and ids already carrying a suffix.
  */
 function ensureOpus1mSuffix(model: string): string {
-  // Fable shares the opus 1M-only policy and now spans both version schemes
-  // too: claude-fable-5 (single-digit) and claude-fable-5-1 (two-segment).
-  // Opus itself spans both version schemes: claude-opus-4-8 and claude-opus-5.
-  // Keep in sync with src/flag-parser.ts ensureOpus1mSuffix.
+  // Fable shares the opus 1M-only policy; both span single- and two-segment version ids. Keep in sync with
+  // src/flag-parser.ts ensureOpus1mSuffix.
   return /^claude-(?:opus-\d+(?:-\d+)?|fable-\d+(?:-\d+)?)$/i.test(model) ? `${model}[1m]` : model;
 }
 
 /**
- * The concrete model id a bare alias will actually run as — what `modelUsage`
- * will be keyed by, and therefore the only form that can be compared against
- * it.
- *
- * Attribution bug this fixes: the model we hand the SDK is often a BARE ALIAS
- * (`sonnet` from an unpinned scheduled-task wake in poll-loop.ts, or from a
- * live `-m sonnet`), while `modelUsage` comes back keyed by the canonical id
- * the CLI expanded it to (`claude-sonnet-5`). An exact comparison between the
- * two matched nothing, so every row of a multi-model turn recorded NULL effort
- * even though the turn demonstrably ran at one — a NULL that reads as "effort
- * was never configured" for a turn where it was configured AND applied, which
- * is the exact failure this column exists to prevent.
- *
- * Resolving through the CLI's own alias env is what keeps both sides in the
- * same vocabulary. `ensureOpus1mSuffix` is reapplied because the comparison
- * target carries the suffix (live: 2,924 rows keyed `claude-opus-5[1m]`); it
- * is idempotent, so a host that already injected the suffixed id is unchanged.
- *
- * An alias with no env answer (unit tests, a host too old, the `default`
- * alias, which no family env resolves) is returned unchanged: it will simply
- * fail to match and the row stays NULL. That under-claims, which is the
- * intended direction — never a guess.
+ * The concrete id a bare alias runs as, which is what `modelUsage` is keyed by: a bare alias compared against those
+ * keys matches nothing, recording NULL effort. `ensureOpus1mSuffix` is reapplied because the keys carry the suffix.
+ * An alias with no env answer is returned unchanged and simply won't match (under-claims, never guesses).
  */
 function canonicalUsageModel(model: string | undefined, env: Record<string, string | undefined>): string | undefined {
   if (!model) return model;
@@ -2281,86 +1617,42 @@ function canonicalUsageModel(model: string | undefined, env: Record<string, stri
 }
 
 /**
- * Per-model-family default effort, applied only when nothing upstream chose
- * one (-e flag, group provider config, operator NANOCLAW_EFFORT_OVERRIDE).
- *
- *   opus → high — operator decision 2026-09-24 (was `high` from 2026-07-27, then
- *           `medium` from 2026-09-22, which coincided with rework). An UNPINNED group
- *           runs Opus (DEFAULT_OPUS_MODEL in src/flag-parser.ts), so this is the
- *           fleet baseline. Applies to the bare `opus` alias and every
- *           concrete claude-opus-* id; this install only runs Opus 5+.
- *           Operators dial down or up per group, per channel, per task or
- *           per turn via -e / NANOCLAW_EFFORT_OVERRIDE.
- *   fable → medium — stays medium (operator, 2026-09-24: no Fable at high);
- *           operators dial up via -e or NANOCLAW_EFFORT_OVERRIDE.
- *   sonnet → xhigh — Sonnet 5 (the bare `sonnet` alias) defaults to xhigh, the
- *           recommended setting for coding/agentic work; fleet decision.
- *           (This fork only runs Sonnet 5.)
- *   haiku → undefined — no effort control at the API level.
- *
- * `-e <level>` (turn or sticky) always wins over all of these — subject to
- * clampEffortForModel below.
+ * Per-family default effort, applied only when nothing upstream (-e, group config, NANOCLAW_EFFORT_OVERRIDE) chose
+ * one. The values are operator policy; haiku gets none because it has no effort control at the API.
  */
 function defaultEffortForModel(model: string | undefined): string | undefined {
   if (!model) return 'high';
   const m = model.toLowerCase();
-  // Opus 5+ only — every opus id (and the bare alias, which resolves to
-  // DEFAULT_OPUS_MODEL via ANTHROPIC_DEFAULT_OPUS_MODEL) defaults to
-  // `high`, which every opus generation supports (history in the doc above).
   if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
-  // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
-  // Bare `fable` is a family alias (the CLI resolves it through
-  // ANTHROPIC_DEFAULT_FABLE_MODEL); without this branch it would fall
-  // through to `high`.
   if (m === 'fable' || m.startsWith('claude-fable-')) return 'medium';
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
   return 'high';
 }
 
 /**
- * Effort support per model family — the provider-side safety net. Mismatches
- * can reach here from layers that never see model and effort together:
- * an operator NANOCLAW_EFFORT_OVERRIDE (single value, model-blind), a sticky
- * `-e xhigh` followed by `-m1 sonnet` on a later turn (flag-parser only
- * cross-validates -m/-e when they arrive in the same message), or a group
- * container.json effort paired with a per-turn model switch. An unsupported
- * value would 400 at the API, so clamp to the family default instead.
- * Keep the support sets consistent with MODEL_EFFORT_SUPPORT in
- * src/flag-parser.ts (host tree — not importable from this Bun package).
+ * Provider-side safety net: model/effort mismatches arrive from layers that never see both (a model-blind
+ * NANOCLAW_EFFORT_OVERRIDE, a sticky -e with a later -m), and an unsupported value would 400 at the API. Keep the
+ * support sets consistent with MODEL_EFFORT_SUPPORT in src/flag-parser.ts (not importable from this package).
  */
 function clampEffortForModel(model: string | undefined, effort: string | undefined): string | undefined {
   if (!effort) return effort;
   const m = (model ?? '').toLowerCase();
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return defaultEffortForModel(model);
-  // All non-haiku models (opus 5+, sonnet 5, fable) support the full effort
-  // surface. Pre-5 opus ids are no longer used in this install.
+  // Every non-haiku model this install runs supports the full effort surface.
   return effort;
 }
 
-// ── Provider ──
-
 /**
- * Stale-session detection. Matches Claude Code's error text when a
- * resumed session can't be found — missing transcript .jsonl, unknown
- * session ID, etc.
+ * Claude Code's error text when a resumed session can't be found. An invalid thinking signature (the continuation
+ * was signed by a different serving upstream after an auth-path change) is treated the same: reset and start fresh.
  */
-// `Invalid signature in thinking block`: the stored continuation replays
-// thinking blocks signed by a different serving upstream (observed in the
-// 2026-06-09 auth-flip drill — turns produced under a custom ANTHROPIC_BASE_URL
-// proxy fail signature validation when replayed to api.anthropic.com, and vice
-// versa is possible). The history is unusable under the current auth path, so
-// treat it like a stale session: reset the continuation and start fresh.
 const STALE_SESSION_RE =
   /no conversation found|ENOENT.*\.jsonl|session.*not found|invalid `?signature`? in `?thinking`? block/i;
 
 /**
- * Prompt-too-long detection. Matches the text variations Anthropic has
- * used across SDK versions when the cumulative session prompt exceeds
- * the model's context window. Distinct from STALE_SESSION_RE because the
- * recovery strategy differs: stale-session just needs a cleared
- * continuation; prompt-too-long needs that PLUS an in-turn retry with a
- * fresh session, otherwise the same message fails on the next poll too.
+ * Distinct from STALE_SESSION_RE: prompt-too-long needs a cleared continuation PLUS an in-turn retry on a fresh
+ * session, otherwise the same message fails on the next poll too.
  */
 const PROMPT_TOO_LONG_RE = /prompt is too long|prompt_too_long|maximum context length|context[_ ]length.*exceed/i;
 
@@ -2374,32 +1666,19 @@ export class ClaudeProvider implements AgentProvider {
   private readonly stickyConfig: z.infer<typeof claudeConfigSchema>;
 
   /**
-   * Ordered fallback API keys from ANTHROPIC_API_KEY_N env vars (sorted by
-   * N). Used when an upstream error suggests the current key is blocked
-   * and rotation would help. Only populated when the user has configured
-   * a non-Anthropic routing proxy via ANTHROPIC_BASE_URL; under the
-   * default OneCLI path, key selection happens at the proxy and this
-   * array stays empty.
+   * API-key fallbacks (ANTHROPIC_API_KEY_N, sorted by N). Populated only under a non-Anthropic routing proxy
+   * (ANTHROPIC_BASE_URL); under OneCLI the proxy picks the key and this stays empty.
    */
   private fallbackKeys: Array<{ name: string; value: string }>;
   private nextFallback = 0;
 
   /**
-   * Parallel fallback list for OAuth (Claude Max subscription) tokens.
-   * Host forwards CLAUDE_CODE_OAUTH_TOKEN + CLAUDE_CODE_OAUTH_TOKEN_N and
-   * adds api.anthropic.com to NO_PROXY so OneCLI's proxy doesn't substitute
-   * the token mid-flight. Rotation is keyed on OAuth being the active auth
-   * path — if ANTHROPIC_API_KEY is also set we prefer API-key rotation
-   * (it's the only thing the SDK actually uses in that case).
+   * OAuth fallback tokens (CLAUDE_CODE_OAUTH_TOKEN_N). If ANTHROPIC_API_KEY is also set, API-key rotation is used
+   * instead: it is the only credential the SDK uses then.
    */
   private fallbackOauth: Array<{ name: string; value: string }>;
-  // Circular OAuth rotation ring: [primary, ...numbered fallbacks], deduped by
-  // value. rotateApiKey advances around it and wraps back to the primary, so a
-  // transient blip on one credential can't strand the container on a worse one
-  // for its whole life. Position is sticky across turns; the per-turn cycle
-  // budget (oauthRotationsThisCycle) is reset by resetRotationCycle each turn.
-  // (Incident 2026-06-25: a non-scoped group's single promoted fallback was a
-  // spend-capped account, and forward-only rotation could never escape it.)
+  // Circular ring [primary, ...fallbacks]: wrapping back to the primary means a transient blip can't strand the
+  // container on a worse credential. Position is sticky across turns; the per-turn cycle budget resets each turn.
   private oauthRing: Array<{ name: string; value: string }> = [];
   private oauthRingPos = 0;
   private oauthRotationsThisCycle = 0;
@@ -2407,10 +1686,8 @@ export class ClaudeProvider implements AgentProvider {
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
-    // The Agent SDK's McpStdioServerConfig has no cwd field (checked against
-    // 0.3.197) — shim any cwd-bearing stdio server through cwd-shim.ts so a
-    // plugin server that declares one launches in the right directory instead
-    // of silently starting at the container's default cwd.
+    // The SDK's stdio MCP config has no cwd field (checked against 0.3.197), so cwd-bearing servers go through
+    // cwd-shim.ts rather than silently starting in the container's default cwd.
     this.mcpServers = Object.fromEntries(
       Object.entries(options.mcpServers ?? {}).map(([name, server]) => [name, shimCwd(server)]),
     );
@@ -2449,13 +1726,8 @@ export class ClaudeProvider implements AgentProvider {
         `Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`,
       );
     }
-    // Build the circular OAuth rotation ring: primary + numbered fallbacks,
-    // deduped by value so a token that appears in two slots isn't visited
-    // twice. The primary occupies position 0; rotateApiKey wraps past the last
-    // fallback back to it.
-    // Host-side container-runner already strips OneCLI's "placeholder"
-    // sentinel before forwarding; guard defensively anyway so a stray
-    // placeholder never enters the ring as a usable credential.
+    // Deduped by value so a token in two slots isn't visited twice. The host already strips OneCLI's `placeholder`
+    // sentinel; guarded again so it never enters the ring as a usable credential.
     const ringPrimary = this.env.CLAUDE_CODE_OAUTH_TOKEN;
     if (ringPrimary && ringPrimary !== 'placeholder') {
       const seenRing = new Set<string>();
@@ -2468,36 +1740,13 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   /**
-   * Restore the credential slot a previous instance of this container last
-   * rotated onto, so a respawn doesn't burn a rejected turn on the primary
-   * before replaying its way back to the credential that's actually healthy.
-   * Position only, never the token value — the value already lives in
-   * `oauthRing` from env.
+   * Restores the ring position a previous container of this session rotated onto, so a respawn doesn't burn a
+   * rejected turn on the primary. Position only; the token value comes from env.
    *
-   * NOT called from the constructor, and not from `query()` either: it reads
-   * session state, and `getCredentialSlot` opens the outbound session DB
-   * directly (`getOutboundDb` in mailbox/sqlite/connection.ts — it does not go through
-   * the mailbox registry, so "no mailbox registered" is not a guard). A
-   * constructor that touched the DB would make every unit test that builds
-   * a provider create a session DB at the production path. The runner
-   * entrypoint (`index.ts`) calls this exactly once, after the mailbox has
-   * started and the provider is built; tests call it
-   * explicitly when they want the restore.
-   *
-   * OAuth ring ONLY — see the comment below where the `ANTHROPIC_API_KEY_N`
-   * lookup used to be for why the forward-only fallback pool is deliberately
-   * excluded: only the circular ring's wrap guarantees every slot stays
-   * reachable after a restore, so only it is safe to persist across a
-   * respawn.
-   *
-   * Best-effort: no persisted slot (fresh install, first-ever rotation)
-   * falls through to the default primary silently, and a session-DB read
-   * failure is logged and ignored — a respawn must never fail to boot over a
-   * position hint it can re-derive by rotating.
-   *
-   * This is the only thing that moves the ring at boot. Plan utilization never
-   * does: slot order is the operator's numbered priority, operator decision
-   * 2026-09-16.
+   * Never called from the constructor or `query()`: `getCredentialSlot` opens the outbound session DB directly, so a
+   * provider built in a unit test would create a session DB at the production path. The runner entrypoint calls it
+   * once, after the mailbox has started. Best-effort: a read failure is logged and ignored. Plan utilization never
+   * reorders the ring; slot order is the operator's priority.
    */
   restorePersistedCredentialSlot(): void {
     let persisted: string | undefined;
@@ -2519,22 +1768,11 @@ export class ClaudeProvider implements AgentProvider {
       return;
     }
 
-    // Deliberately no ANTHROPIC_API_KEY_N fallback branch here: `fallbackKeys`
-    // is forward-only/exhaust-once (`nextFallback` never wraps — see
-    // `rotateApiKey` below), unlike the circular OAuth ring above. Restoring a
-    // persisted position onto a forward-only pool can only ever advance the
-    // cursor, never reopen it — so a respawn after the LAST fallback also
-    // failed would restore straight past the end and the primary would never
-    // become eligible again, whereas an unpersisted respawn today resets to
-    // the primary and gives the whole pool another chance. A container
-    // respawn is that pool's only reset by design; persisting across it would
-    // turn a recoverable dead end into a permanent one. `persistCredentialSlot`
-    // is therefore never called from the API-key branch of `rotateApiKey`
-    // either — see that method.
+    // Deliberately no ANTHROPIC_API_KEY_N branch: that pool is forward-only (`nextFallback` never wraps), so a
+    // restored position could only advance past the end and the primary would never be eligible again. A respawn is
+    // that pool's only reset, so it is never persisted.
 
-    // Named a slot that's no longer present (env changed since the value was
-    // written) — ignore and stay on the primary. Log once so a stale slot
-    // never rotting silently is at least visible.
+    // A slot no longer in the pool (env changed since it was written): stay on the primary.
     log(`Persisted credential slot "${persisted}" is not in the current pool — ignoring, staying on primary`);
   }
 
@@ -2577,39 +1815,6 @@ export class ClaudeProvider implements AgentProvider {
     return msg.startsWith('transient_overload:');
   }
 
-  /**
-   * Advance the active Anthropic credential to the next fallback. Prefers
-   * OAuth rotation (Claude Max) when OAuth is the active auth path — that
-   * is, when CLAUDE_CODE_OAUTH_TOKEN is set and ANTHROPIC_API_KEY is not.
-   * Otherwise rotates ANTHROPIC_API_KEY through its _N fallbacks. Returns
-   * `rotated: false` when no more fallbacks of either kind remain.
-   *
-   * The stored continuation is preserved on every rotation. The SDK's
-   * `resume:` loads conversation history from a local `.jsonl` file
-   * (`~/.claude/projects/<hash>/<session>.jsonl`), and the Anthropic API
-   * has no server-side session object that's account-bound — the next
-   * turn just replays the prior messages under whichever token signs the
-   * request. Same shape as `/login`-mid-session in interactive Claude Code.
-   *
-   * Position persists for the container lifetime — once slot N fires a
-   * retryable error, slot N+1 stays active for all subsequent queries. On
-   * the circular OAuth ring it also survives a container respawn: the slot
-   * NAME is persisted to session state here and restored by the runner
-   * entrypoint (`restorePersistedCredentialSlot`). The forward-only
-   * `ANTHROPIC_API_KEY_N` pool is different: nothing is persisted, and a
-   * respawn is its only reset — see the comment in that branch below.
-   *
-   * Process-wide propagation: rotations are mirrored to `process.env` so
-   * other in-process consumers that issue direct Anthropic calls — future
-   * MCP tools, anything reading process.env — pick up the active credential without their own
-   * rotation logic. Safe because (a) container code reads env fresh at
-   * call time (no module-load captures), (b) Bash subprocesses inherit
-   * the same rotated value, so a `claude -p` an agent launches signs with
-   * the active slot rather than a stale one, and
-   * (c) host-side container-runner.ts adds api.anthropic.com to NO_PROXY
-   * and re-injects the real token values, so direct callers bypass the
-   * OneCLI proxy and use process.env directly.
-   */
   transcriptHasPrompt(continuation: string | undefined, prompt: string, sinceMs: number): boolean {
     if (!continuation) return false;
     const transcriptPath = findTranscriptPath(continuation);
@@ -2623,12 +1828,9 @@ export class ClaudeProvider implements AgentProvider {
 
   rotateApiKey(): { rotated: boolean; slot?: string; position?: number; ringSize?: number } {
     if (this.usingOauth()) {
-      // Circular: advance around the ring (wrapping past the last fallback
-      // back to the primary). Give up only once we've visited every OTHER
-      // credential this cycle — so a transient failure on the current token
-      // can recover via any healthy peer, and a since-healed primary is
-      // reachable again on a later turn. The cycle budget is reset per turn
-      // by resetRotationCycle. (Incident 2026-06-25.)
+      // Circular, giving up only once every OTHER credential was tried this cycle, so a healed primary is reachable
+      // again on a later turn. Rotations are mirrored to process.env so Bash subprocesses (`claude -p`) and other
+      // in-process callers sign with the active slot.
       if (this.oauthRing.length <= 1) return { rotated: false };
       if (this.oauthRotationsThisCycle >= this.oauthRing.length - 1) return { rotated: false };
       this.oauthRingPos = (this.oauthRingPos + 1) % this.oauthRing.length;
@@ -2646,26 +1848,19 @@ export class ClaudeProvider implements AgentProvider {
     if (this.nextFallback >= this.fallbackKeys.length) return { rotated: false };
     const next = this.fallbackKeys[this.nextFallback++];
     if (this.env.ANTHROPIC_API_KEY === next.value) {
-      // Already rotated to this one (e.g. base key already matched a
-      // fallback by coincidence). Try the next one instead.
+      // The base key already equals this fallback: skip to the next.
       return this.rotateApiKey();
     }
     this.env.ANTHROPIC_API_KEY = next.value;
     process.env.ANTHROPIC_API_KEY = next.value;
     log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
-    // No persistCredentialSlot() here — see the comment on the ANTHROPIC_API_KEY_N
-    // branch in restorePersistedCredentialSlot for why this forward-only pool
-    // deliberately does not persist across a respawn.
+    // Never persisted: see restorePersistedCredentialSlot on the forward-only pool.
     return { rotated: true, slot: next.name, position: this.nextFallback + 1, ringSize: this.fallbackKeys.length + 1 };
   }
 
   /**
-   * Reset the per-turn OAuth rotation cycle budget. Called once at the start
-   * of every turn so a fresh full pass around the ring is available — the
-   * active position stays sticky, but a credential that has since healed
-   * (e.g. a 5-hour session cap that reset) becomes reachable again. The
-   * ANTHROPIC_API_KEY fallback path is intentionally untouched: it remains
-   * forward-only / exhaust-once, and is never active alongside OAuth.
+   * Called at the start of every turn so a since-healed credential (e.g. a reset 5-hour cap) is reachable again.
+   * The API-key pool stays forward-only.
    */
   resetRotationCycle(): void {
     this.oauthRotationsThisCycle = 0;
@@ -2710,96 +1905,29 @@ export class ClaudeProvider implements AgentProvider {
     if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
     const stream = new MessageStream();
     const initialPromptId = stream.push(input.prompt);
-    // Set by the first `session_state_changed`: proof this CLI emits the idle
-    // that ends every wait on an outstanding prompt. Until then, report no
-    // queued work, as before, so a CLI without the events cannot pin a turn.
+    // Set by the first `session_state_changed`. Until the CLI proves it emits idle, report no queued work, so a CLI
+    // without the events cannot pin a turn.
     let sessionStateSeen = false;
-    // Live background tasks as the CLI last reported them
-    // (`background_tasks_changed`, sdk.d.ts: a level signal with REPLACE
-    // semantics — swap the set for each payload, never pair start/finish
-    // bookends, so a missed bookend cannot wedge a stale indicator). Per CLI
-    // process, so per query: nothing is emitted at startup and this starts
-    // empty. Ambient entries (live-update watchers, skip_transcript tasks) are
-    // not work and are excluded, as the SDK asks.
+    // Live background tasks from `background_tasks_changed`, a level signal with REPLACE semantics (swap the set per
+    // payload, never pair start/finish). Ambient entries are excluded, as the SDK asks.
     const liveBackgroundTasks = new Set<string>();
-    // The hold `hasBackgroundWork` reports. Latched: raised by the first
-    // non-empty level report, released ONLY at the CLI's idle with the set
-    // empty — never at the membership change that empties it. Between that
-    // drain and the idle (or the `init` of the follow-up turn the CLI starts
-    // on completion) the set is empty but the work is not over, and every
-    // consumer of the predicate — the poll-loop's lowering at `result`, its
-    // restart gate for a settings change — would otherwise act in that gap.
-    // The invariant lives here so no consumer has to know about it.
-    //
-    // The CLI gates its idle on a NARROWER set than it reports: background
-    // subagents (`local_agent`) withhold idle, but a backgrounded Bash
-    // (`local_bash`), a dream, a parked MCP task, a long-running remote
-    // agent, and a monitor with no timeout do not (CLI 2.1.272, its idle
-    // predicate excludes those types by name). For those, idle arrives with
-    // the set still non-empty and no second idle ever comes, so "release at
-    // idle with the set empty" alone would pin the hold for the rest of the
-    // query. `idleSeenWithHold` records that the CLI has shown it will not
-    // withhold idle for what is left; from then on the membership change
-    // that empties the set releases the hold and reports it, which for those
-    // types is the same protection they had before this hold existed (none
-    // past their completion; a completion-started follow-up turn's `init`
-    // re-raises the level itself).
-    // `idleSeenWithHold` is evidence about the tasks that were live at that
-    // idle, not about the query: a gating task (a subagent) joining the set
-    // afterwards withholds idle again, and releasing at ITS drain would
-    // reopen the drain→follow-up gap. `idleCoveredTasks` is the set the idle
-    // vouched for; any membership change that adds an id outside it drops
-    // the evidence, and the release waits for the next idle.
+    // `hasBackgroundWork`'s hold. Latched: released only at the CLI's idle with the set empty, never at the
+    // membership change that empties it, because between that drain and the idle (or the follow-up turn's `init`)
+    // the work is not over. The CLI withholds idle only for background subagents; for other task types (backgrounded
+    // Bash, monitors, …) idle arrives with them still live and never comes again, so `idleSeenWithHold` lets their
+    // drain release the hold. That evidence covers only `idleCoveredTasks`: a task joining afterwards drops it.
     let backgroundHold = false;
-    // Top-level assistant text not yet known to be mid-turn or final — see the
-    // `assistant` branch and ProviderEvent `interim_text`.
+    // Top-level assistant text not yet known to be mid-turn or final (see ProviderEvent `interim_text`).
     let pendingAssistantText: string | null = null;
     let idleSeenWithHold = false;
     let idleCoveredTasks = new Set<string>();
 
-    // Per-turn input takes precedence over sticky config (A3).
-    // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
-    // regardless of auth path (see ensureOpus1mSuffix).
-    //
-    // Final fallback is the CONCRETE id the host already resolved for this
-    // spawn's group (channel wiring → container.json → the install default),
-    // read from NANOCLAW_CLAUDE_MODEL (`claudeSpawnEnv` in
-    // src/claude-spawn-defaults.ts).
-    //
-    // That used to be read from ANTHROPIC_DEFAULT_OPUS_MODEL, which the host
-    // set to the same resolved id. It is the SDK's `opus` ALIAS answer, so
-    // sharing it meant the word "opus" — in a subagent's frontmatter, in the
-    // `"model": "opus"` pin group-init writes into every group's
-    // settings.json — resolved to whatever the group ran; once the unpinned
-    // default moved to Sonnet, every one of those silently ran Sonnet 5. The
-    // alias now carries the install's Opus constant and the group's model
-    // travels in its own variable. Never read the alias var for THIS chain
-    // again; reading it below in `canonicalUsageModel` is the opposite
-    // direction (alias → id) and is correct.
-    //
-    // Never undefined: with model undefined the CLI uses its own
-    // built-in default — whatever Opus was current at the pinned binary's
-    // release (2.1.156 → opus-4-7, observed live 2026-06-09) — silently
-    // ignoring the configured chain (channel default → container.json →
-    // DEFAULT_OPUS_MODEL). ANTHROPIC_DEFAULT_OPUS_MODEL is kept as the next
-    // fallback for the ROLLING case only — a container spawned by a host that
-    // predates NANOCLAW_CLAUDE_MODEL, where that var still holds the group's
-    // resolved id — and the bare alias is the last resort for spawns that
-    // carry no env at all (unit tests).
-    //
-    // Reading the concrete id here rather than the alias is what makes the
-    // effort default below correct. `defaultEffortForModel` is the ONLY place
-    // a family default is chosen, and it sits at the point the model is
-    // finally picked — but with `rawModel` set to the literal string 'opus' it
-    // was answering for Opus no matter which model the alias resolved to. A
-    // group pinned to Sonnet got Opus's `high` instead of Sonnet's `xhigh`; a
-    // group pinned to Haiku, which supports no effort at all, got `high` on
-    // every turn. The host cannot fix that from its side: absence of
-    // NANOCLAW_EFFORT_OVERRIDE means "the container decides", and there is no
-    // env value that means "explicitly no effort".
-    //
-    // `stickyConfig.model` still wins over this, unchanged — a per-agent
-    // providerConfig is more specific than the group's default model.
+    // Per-turn input wins over sticky config, then the CONCRETE id the host resolved for this group
+    // (NANOCLAW_CLAUDE_MODEL). ANTHROPIC_DEFAULT_OPUS_MODEL is the `opus` ALIAS answer, read here only as a fallback
+    // for containers from a host predating NANOCLAW_CLAUDE_MODEL; never make the alias carry the group's model again
+    // (every `model: opus` subagent would silently run it). Never undefined: the CLI would fall back to its own
+    // built-in model, ignoring the configured chain. A concrete id also keeps defaultEffortForModel answering for the
+    // model that actually runs. Bare opus gets `[1m]` (see ensureOpus1mSuffix).
     const rawModel =
       input.model ??
       this.stickyConfig.model ??
@@ -2807,37 +1935,28 @@ export class ClaudeProvider implements AgentProvider {
       process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ??
       'opus';
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
-    // Effort precedence: -e flag (turn/sticky, arrives as input.effort) →
-    // group container.json provider config → operator override env
-    // (NANOCLAW_EFFORT_OVERRIDE, injected by the host only when a channel or
-    // group default is explicitly configured) → per-model-family default.
+    // Effort precedence: -e (turn/sticky) → group providerConfig → NANOCLAW_EFFORT_OVERRIDE (set by the host only
+    // when a channel or group default is configured) → family default.
     const requestedEffort =
       input.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(model);
-    // Safety clamp: drop to the family default when the resolved effort is
-    // unsupported by the resolved model (would 400 at the API otherwise).
+    // Clamp: an effort the model doesn't support would 400 at the API.
     const effort = clampEffortForModel(model, requestedEffort);
     const instructions = appendActiveRuntimeContext(input.systemContext?.instructions, {
       provider: 'claude',
       model: model ?? 'claude:cli-default',
       effort: effort ?? null,
     });
-    // ultracode is a session flag (xhigh + standing dynamic-workflow
-    // orchestration), NOT an effort value — applied via the SDK control
-    // request below. Effort is already forced to xhigh upstream when set.
+    // ultracode is a session flag applied via the SDK control request below, not an effort value; effort is already
+    // forced to xhigh when it is set.
     const ultracode = input.ultracode === true;
-    // Boundary instrumentation: the resolved model+effort per turn. This is
-    // the ONLY runtime surface that shows what we asked for — the CLI never
-    // logs the request body and OAuth traffic has no proxy dashboard.
-    // Verify via `docker logs <container>` while it's alive.
+    // The only runtime record of the requested model+effort: the CLI never logs the request body.
     log(
       `query: model=${model ?? '(cli default)'} effort=${effort ?? '(none)'}` +
         `${effort !== requestedEffort ? ` (clamped from ${requestedEffort ?? '(none)'})` : ''}` +
         `${ultracode ? ' ultracode' : ''}`,
     );
 
-    // Discover plugins each query so hot-mounted plugin drops are picked up
-    // without a container restart. Cheap (just fs.readdir under
-    // /workspace/plugins); if it grows expensive, hoist to constructor.
+    // Discovered per query so hot-mounted plugins load without a container restart.
     const pluginDiscovery = discoverPlugins();
     const plugins = pluginDiscovery.plugins;
     const pluginOwnsBashEmailGate = pluginDiscovery.preToolUseGuards.includes('bash-email');
@@ -2848,67 +1967,33 @@ export class ClaudeProvider implements AgentProvider {
       log('Delegating Bash email approval gate to loaded plugin');
     }
 
-    // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks
-    // per-invocation and frontmatter model selection, pinning every subagent
-    // to the group model; subagents without an explicit model already inherit
-    // the main model. The family env vars only resolve matching bare aliases
-    // (docs: code.claude.com/docs/en/sub-agents.md), and they arrive here from
-    // the spawn env (`claudeSpawnEnv`) carrying install-wide constants.
-    //
-    // This used to REWRITE the resolved model's own family alias to that model
-    // for the query — the last place the group's model still redefined a
-    // family word. It made the fix above true only at the docker boundary: a
-    // group pinned to a non-current opus (say `opus48`) had `opus` rewritten
-    // back to claude-opus-4-8[1m] here, so its `model: opus` subagents ran the
-    // group's pin rather than the install's Opus. The
-    // family words are install constants in every layer now; the model in
-    // force travels as the SDK's own `model` option, which is set from
-    // `model` directly and needs no alias.
+    // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks frontmatter model selection, pinning every
+    // subagent to the group model. Never rewrite a family alias to the group's model here: family words are install
+    // constants, and the model in force travels as the SDK's own `model` option.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
 
-    // Which OAuth ring slot this query runs on. Rate-limit utilization is an
-    // ACCOUNT property, and rotation means one container can burn through
-    // four of them — unlabelled samples would blend four series into one
-    // meaningless line. Captured here, not read at sample time: the CLI
-    // subprocess is started with this query's env, so the slot is fixed for
-    // the life of the query even if the ring advances afterwards.
-    // A container can hold the ring AND an API key; the key is then what the
-    // CLI uses, so its samples belong to no slot.
+    // The ring slot is fixed for the query's life (the CLI subprocess starts with this env), so it is captured here,
+    // not at sample time; utilization is per account, and unlabelled samples would blend accounts. When an API key is
+    // also set the CLI uses it, so samples belong to no slot.
     const usingOauth = this.usingOauth();
     const oauthSlot = usingOauth ? (this.oauthRing[this.oauthRingPos]?.name ?? null) : null;
-    // The slot name alone is ambiguous: scoped per-group tokens are forwarded
-    // under the same `_N` names as the global pool, so identity is the PAIR
-    // (credentialSet, account). `lane` is operator-declared install policy.
+    // Scoped per-group tokens reuse the global pool's `_N` names, so identity is the PAIR (credentialSet, account).
     const who: AccountIdentity = {
       account: oauthSlot,
       credentialSet: usingOauth ? (process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null) : null,
       lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, oauthSlot),
     };
 
-    // Set when a SUBAGENT hits the Claude Max quota — by the PostToolUse
-    // subagent-tool hook for a synchronous one, or by the task_notification
-    // branch for an async one. Both write here.
-    //
-    // Rotation can't happen mid-query — the credential is fixed for this
-    // query's life (see `oauthSlot` above) — so the detection interrupts the
-    // query and translateEvents throws this, landing in poll-loop's existing
-    // rotation/retry catch exactly like the result-branch throws below.
+    // Set when a SUBAGENT hits quota (sync PostToolUse hook or async task_notification). The credential is fixed for
+    // the query's life, so detection interrupts the query and translateEvents throws this into poll-loop's rotation
+    // catch.
     let subagentQuotaError: string | null = null;
 
-    // Owns the CLI subprocess's lifetime. Without this, `abort()` below only
-    // set a flag and ended the input stream — the SDK's own graceful-close
-    // path runs on stdin EOF, but nothing forced it, so an abandoned query
-    // (e.g. one interrupted by a credential rotation) could keep its CLI
-    // child running on the exhausted credential and burn another 429 minutes
-    // after the replay was already healthy on a different one. Passing this
-    // as `options.abortController` gives the SDK an immediate, unambiguous
-    // signal to tear the process down (stdin EOF → short grace window →
-    // kill) instead of relying on the async generator being abandoned by its
-    // consumer, which the SDK's own cleanup does not reliably observe.
+    // Passed as `options.abortController` so abort() really tears the CLI child down: stdin EOF alone was not
+    // reliably observed, and an abandoned query could keep burning an exhausted credential after the replay moved on.
     const queryAbortController = new AbortController();
 
-    // Outer bound on the in-flight leak described on `toolsInFlight`: a fresh
-    // query has no tool running, whatever a denied call from the last one left.
+    // Outer bound on the `toolsInFlight` leak: a fresh query has no tool running.
     resetToolInFlightTracking();
 
     const sdkResult = (sdkQueryOverride ?? sdkQuery)({
@@ -2920,8 +2005,7 @@ export class ClaudeProvider implements AgentProvider {
         model: model,
         abortController: queryAbortController,
         ...(effort ? { effort: effort as EffortLevel } : {}),
-        // `display: 'summarized'` makes thinking text visible in content
-        // blocks; default is empty-text + signature only.
+        // `display: 'summarized'` makes thinking text visible; the default is empty text plus signature.
         thinking: { type: 'adaptive', display: 'summarized' },
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions
@@ -2938,10 +2022,8 @@ export class ClaudeProvider implements AgentProvider {
           PreToolUse: [
             {
               matcher: 'Bash',
-              // List position does NOT order execution: the CLI runs these
-              // concurrently, each on the original input, so no guard sees the
-              // prefix. The rewrite must stay the ONLY hook returning
-              // updatedInput — see createBashCommandRewriteHook's INVARIANT.
+              // List position does NOT order execution: these run concurrently on the original input. The rewrite must
+              // stay the ONLY hook returning updatedInput (see createBashCommandRewriteHook).
               hooks: [
                 createManagedGitMaintenanceHook(),
                 createSelfApprovalBlockHook(),
@@ -2952,30 +2034,16 @@ export class ClaudeProvider implements AgentProvider {
                 createBashCommandRewriteHook({ closeStdin: true }),
               ],
             },
-            // NO MATCHER, deliberately. `preToolUseHook` records
-            // `container_state` for EVERY tool (that is what lets the host
-            // widen its ceiling past ABSOLUTE_CEILING_MS for a long-declared
-            // Bash) and enforces SDK_DISALLOWED_TOOLS as defense-in-depth,
-            // which no Bash matcher would ever reach. Its position orders
-            // nothing: the CLI runs it concurrently with the Bash hooks above,
-            // so it records a call they go on to deny; `toolsInFlight`'s own
-            // comment covers the entry that leaves behind.
-            //
-            // DO NOT DROP THIS ENTRY IN A MERGE RESOLUTION. It has been lost
-            // six times; claude.preToolUse-registration.test.ts asserts it is
-            // here.
+            // NO MATCHER, deliberately: `preToolUseHook` records `container_state` for EVERY tool and enforces
+            // SDK_DISALLOWED_TOOLS, which no Bash matcher would reach.
+            // DO NOT DROP THIS ENTRY IN A MERGE RESOLUTION; claude.preToolUse-registration.test.ts asserts it is here.
             { hooks: [preToolUseHook] },
             { matcher: TASK_LIST_TOOL_NAME, hooks: [createSubagentTaskListDenyHook()] },
           ],
           PostToolUse: [
             { hooks: [postToolUseHook] },
-            // A synchronous subagent's quota exhaustion arrives as a
-            // tool_result inside this still-running turn, never as a top-level
-            // result — this hook is the only place it can be seen. (An ASYNC
-            // subagent's does not reach here at all; that one lands on the
-            // task_notification branch in translateEvents.) The subagent tool
-            // is not matched by any other rewriting hook, so there's no
-            // rewrite collision.
+            // A sync subagent's quota exhaustion arrives only as a tool_result inside this turn, so this hook is the
+            // only place to see it (async ones land on task_notification in translateEvents).
             {
               matcher: SUBAGENT_TOOL_MATCHER,
               hooks: [
@@ -3000,10 +2068,6 @@ export class ClaudeProvider implements AgentProvider {
     const usageCounterScope = randomUUID();
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
-      // Fleet Hardening Phase 0.1 (see TurnUsageInfo). Both SDKResultSuccess
-      // and SDKResultError carry usage/total_cost_usd/modelUsage — the
-      // existing narrow-cast pattern below (`m = message as {...}`) already
-      // sidesteps the subtype union for `result`/`is_error`; this reuses it.
       type ResultModelUsage = {
         inputTokens?: number;
         outputTokens?: number;
@@ -3022,10 +2086,8 @@ export class ClaudeProvider implements AgentProvider {
         modelUsage?: Record<string, ResultModelUsage>;
       }): TurnUsageInfo | TurnUsageInfo[] {
         const modelEntries = m.modelUsage ? Object.entries(m.modelUsage) : [];
-        // modelUsage is keyed by model and carries its own per-model
-        // tokens/cost, including children on the SAME model as their parent.
-        // result.usage has a different denominator (per-turn main loop), so
-        // model count must never switch the accounting source.
+        // modelUsage carries its own per-model tokens (children included) while result.usage covers only the main
+        // loop, so model count must never switch the accounting source.
         if (modelEntries.length > 0) {
           return modelEntries.map(([model, u]) => ({
             accounting: { kind: 'cumulative' as const, scope: usageCounterScope },
@@ -3038,9 +2100,8 @@ export class ClaudeProvider implements AgentProvider {
           }));
         }
         return {
-          // SDKResultSuccess.usage is per-turn MAIN LOOP only; unlike
-          // modelUsage it excludes child/auxiliary calls. Never combine it
-          // with cumulative total_cost_usd or subtract another turn from it.
+          // Per-turn MAIN LOOP only, excluding child calls: never combine it with cumulative total_cost_usd or
+          // subtract another turn from it.
           accounting: { kind: 'per-turn' },
           model: null,
           inputTokens: m.usage?.input_tokens ?? null,
@@ -3051,31 +2112,19 @@ export class ClaudeProvider implements AgentProvider {
         };
       }
       let messageCount = 0;
-      // Throttle tool-call progress so every Bash/Grep doesn't spam status
-      // updates. One tool-call-derived progress per ~1.5s is enough to show
-      // "it's alive and doing something."
       let lastToolProgressAt = 0;
       const TOOL_PROGRESS_MIN_INTERVAL_MS = 1500;
 
-      // tool_use_id → tool name, so task_notification can tell a real subagent
-      // (Task) completion from an auto-backgrounded Bash command whose summary
-      // is raw command text. Turn-scoped, bounded by tool calls — no eviction.
+      // Lets task_notification tell a real subagent from an auto-backgrounded Bash. Turn-scoped and bounded by tool
+      // calls, so no eviction.
       const toolNameById = new Map<string, string>();
 
-      // Per-turn cost attribution (rate-limit persistence): the most recent
-      // `rate_limit_event` observed since the last `result`. "What share of
-      // our weekly allowance have we burned" is otherwise undiscoverable —
-      // this is the one place the SDK reports it. Cleared after each result
-      // so a turn with NO fresh rate_limit_event reports NULL rather than a
-      // stale reading from an earlier turn.
+      // Latest `rate_limit_event` since the last result; cleared after each result so a turn with none reports NULL
+      // rather than a stale reading.
       let lastRateLimitInfo: SdkRateLimitInfo | undefined;
 
-      // Enable ultracode for the session before consuming the stream. It's a
-      // flag SETTING (not an effort value, not read from settings.json), so the
-      // SDK's apply_flag_settings control request is the only programmatic
-      // lever — available because we run in streaming-input mode. Non-fatal:
-      // if the underlying CLI build doesn't honor it, log and continue at the
-      // already-set xhigh effort rather than failing the turn.
+      // ultracode is a flag SETTING, settable only through the apply_flag_settings control request. Non-fatal: a CLI
+      // that doesn't honor it continues at the already-set xhigh effort.
       if (ultracode) {
         try {
           await sdkResult.applyFlagSettings({ ultracode: true });
@@ -3087,42 +2136,26 @@ export class ClaudeProvider implements AgentProvider {
         }
       }
 
-      // An intentional abort() tears the CLI subprocess down via
-      // queryAbortController, and the SDK surfaces that teardown as a thrown
-      // "aborted"-classified error out of the async iterator itself — not
-      // as a message the loop body ever sees, so the `if (aborted) return;`
-      // guard inside the loop can't catch it. The try/catch below swallows
-      // ONLY that case (checked via the `aborted` flag, not the error's
-      // shape, so it can't misclassify a real SDK error as an intentional
-      // teardown); every other error — including every deliberate throw
-      // inside the loop below, all of which fire before `aborted` is ever
-      // set — still propagates unchanged.
+      // An intentional abort() surfaces as an error thrown by the iterator itself, not as a message. The catch
+      // swallows ONLY that, keyed on the `aborted` flag rather than the error's shape; every deliberate throw in the
+      // loop fires before `aborted` is set and still propagates.
       try {
         for await (const message of sdkResult) {
           if (aborted) return;
-          // A subagent hit the credential slot's quota (PostToolUse hook).
-          // Throw here so poll-loop's catch rotates the OAuth ring and replays
-          // the turn — identical to the result-branch throws below, which a
-          // subagent failure never reaches.
+          // Thrown here because a subagent's quota failure never reaches the result-branch throws below.
           if (subagentQuotaError) throw new Error(subagentQuotaError);
           messageCount++;
 
-          // Yield activity for every SDK event so the poll loop knows the agent is working
           yield { type: 'activity' };
 
           if (message.type === 'system' && message.subtype === 'init') {
             yield { type: 'init', continuation: message.session_id };
           } else if (message.type === 'result') {
             pendingAssistantText = null;
-            // Inner bound on the in-flight leak (`toolsInFlight`): a turn that
-            // has produced its result has no FOREGROUND tool left running. A
-            // backgrounded Bash keeps running but no longer blocks the turn, so
-            // it is correctly not holding the host's ceiling open either.
+            // Inner bound on the `toolsInFlight` leak: a turn with a result has no FOREGROUND tool left running.
             resetToolInFlightTracking();
-            // `result` text exists only on subtype:"success"; error subtypes
-            // (e.g. a non-retryable 403 billing_error) carry their message in
-            // `errors[]` instead. Surface either so the poll-loop can deliver a
-            // billing/quota notice to the user rather than dropping the turn.
+            // Error subtypes carry their message in `errors[]`, not `result`; surface either so a billing or quota
+            // notice reaches the user.
             const m = message as {
               result?: string;
               is_error?: boolean;
@@ -3139,69 +2172,43 @@ export class ClaudeProvider implements AgentProvider {
               };
               total_cost_usd?: number;
               modelUsage?: Record<string, ResultModelUsage>;
-              // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
-              // the SDK's own count of assistant/tool round-trips this turn made
-              // — the most authoritative `steps` signal of the three providers,
-              // since it comes straight from the harness rather than being
-              // inferred from the event stream.
+              // The SDK's own round-trip count for the turn: the `steps` signal.
               num_turns?: number;
             };
             const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
-            // Retry-path guards run FIRST — these turn error text into a throw so
-            // poll-loop's rotation / recap / backoff machinery retries instead of
-            // posting the raw error to the user's channel.
+            // Retry-path guards run FIRST: they turn error text into a throw so poll-loop retries instead of posting
+            // the raw error to the user's channel.
             if (text && QUOTA_RESULT_RE.test(text)) {
-              // Throw so poll-loop's catch path can rotate to the next OAuth
-              // fallback and retry instead of dispatching the quota message
-              // to the user.
               throw new Error(`subscription_quota_exhausted: ${text}`);
             }
             if (text && SUBSCRIPTION_BLOCKED_RE.test(text)) {
-              // Org-disabled account: same rotation path as quota exhaustion,
-              // distinct marker for diagnosability.
+              // Same rotation path as quota exhaustion; a distinct marker for diagnosability.
               throw new Error(`subscription_access_disabled: ${text}`);
             }
             if (text && POISONED_CONTINUATION_RE.test(text)) {
-              // Throw so poll-loop's isSessionInvalid branch clears the
-              // poisoned continuation and retries with a recap instead of
-              // dispatching the raw 400 to the user (and dead-stopping the
-              // session — the same history would fail every future turn).
+              // The same history would fail every future turn; poll-loop's isSessionInvalid branch clears it.
               throw new Error(text);
             }
             if (text && TRANSIENT_OVERLOAD_RESULT_RE.test(text)) {
-              // Throw so poll-loop's transient-overload branch backs off and
-              // retries the same prompt instead of posting the rate-limit error
-              // to the user's channel as the agent's reply.
               throw new Error(`transient_overload: ${text}`);
             }
             const effortHeldAllTurn = effortTransitionsThisTurn === 0;
-            // Cleared BEFORE the yield, not after. The generator suspends at the
-            // yield below and poll-loop does its applySettings/push during that
-            // suspension, so a reset placed after it would wipe transitions that
-            // belong to the NEXT turn — the same erasure, one frame later.
+            // Cleared BEFORE the yield: poll-loop applies settings while the generator is suspended there, so a later
+            // reset would wipe transitions belonging to the NEXT turn.
             effortTransitionsThisTurn = 0;
             yield {
               type: 'result',
               text,
               isError: m.is_error === true,
-              // The runner's prompts this turn consumed, as echoed. Cleared from
-              // the outstanding set before the yield, so hasQueuedWork is
-              // already truthful when poll-loop reads it at this result.
+              // Cleared from the outstanding set before the yield, so hasQueuedWork is truthful at this result.
               answeredPrompts: stream.answer([
                 ...(m.user_message_uuids ?? []),
                 ...(m.user_message_uuid ? [m.user_message_uuid] : []),
               ]),
-              // Effort is a request parameter — no API bills it back, so it is
-              // stamped on here rather than read out of `modelUsage`. On a
-              // multi-model turn only the entry for `activeModel` gets it; the
-              // subagent entries stay NULL because we never set their effort.
-              // See providers/turn-effort.ts.
+              // Only the `activeModel` entry gets effort; see providers/turn-effort.ts.
               usage: attachTurnEffort(extractUsage(m), {
                 model: activeUsageModel,
-                // Unequal = the effort moved mid-turn, so no single value
-                // describes this aggregate. NULL both halves: `requested` is
-                // just as ambiguous as `effective` once the turn straddles a
-                // change, and a half-labelled row invites the same wrong read.
+                // Unequal means the effort moved mid-turn, so neither half describes the aggregate: NULL both.
                 effective: effortHeldAllTurn ? activeEffort : null,
                 requested: effortHeldAllTurn ? activeRequestedEffort : null,
               }),
@@ -3241,22 +2248,14 @@ export class ClaudeProvider implements AgentProvider {
           } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
             const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
             const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-            // Not a `result`: the poll loop treats result text as the agent's turn
-            // output — a synthetic "Context compacted." result has no <message>
-            // block, so it triggers the "response was not delivered — please
-            // re-send" nudge and the agent duplicates its previous message.
-            // Compaction is bookkeeping: log it, count it as activity only.
+            // Not a `result`: a synthetic result without a <message> block triggers the re-send nudge and the agent
+            // duplicates its previous message.
             log(`Context compacted${detail}.`);
             yield { type: 'activity' };
           } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
             const tn = message as { summary?: string; status?: string; tool_use_id?: string };
             const toolName = tn.tool_use_id ? toolNameById.get(tn.tool_use_id) : undefined;
-            // An ASYNC subagent's quota death lands HERE, not on the
-            // PostToolUse subagent-tool hook — its tool_result was just "Async agent
-            // launched successfully…", with nothing to match. The CLI folds this
-            // notification back in as a `<task-notification>` user message that
-            // auto-continues the turn, so left alone the parent runs on with a
-            // dead subagent and the credential ring never rotates.
+            // An ASYNC subagent's quota death lands here, not on the PostToolUse hook.
             const asyncQuotaError = subagentQuotaFromTaskNotification(tn, toolName);
             if (asyncQuotaError) {
               if (!subagentQuotaError) subagentQuotaError = asyncQuotaError;
@@ -3265,9 +2264,8 @@ export class ClaudeProvider implements AgentProvider {
                 `Subagent hit ${asyncQuotaError.slice(0, split)} — interrupting turn so poll-loop can rotate: ` +
                   asyncQuotaError.slice(split + 2),
               );
-              // Yield the label BEFORE throwing: the throw unwinds straight to
-              // poll-loop's rotation catch, so this is the last chance to tell
-              // the user why their turn restarted.
+              // Yield the label BEFORE throwing: the throw unwinds straight to poll-loop, so this is the last chance
+              // to tell the user why the turn restarted.
               yield {
                 type: 'progress',
                 message: formatBlockquoteLabel('↻', "subagent hit the credential slot's limit — rotating and retrying"),
@@ -3279,8 +2277,7 @@ export class ClaudeProvider implements AgentProvider {
               } catch (err) {
                 log(`Subagent quota interrupt threw: ${err instanceof Error ? err.message : String(err)}`);
               }
-              // Throw directly rather than waiting for the loop-top check: an
-              // interrupted stream may never emit another message.
+              // Thrown directly: an interrupted stream may never emit another message.
               throw new Error(subagentQuotaError);
             }
             if (shouldForwardTaskNotification(toolName)) {
@@ -3301,8 +2298,7 @@ export class ClaudeProvider implements AgentProvider {
             if (idleSeenWithHold) {
               for (const id of liveBackgroundTasks) {
                 if (!idleCoveredTasks.has(id)) {
-                  // Evidence and its scope go together: a snapshot without the
-                  // flag is a dropped window nothing may consult.
+                  // Evidence and its scope go together: drop both.
                   idleSeenWithHold = false;
                   idleCoveredTasks = new Set();
                   break;
@@ -3311,8 +2307,7 @@ export class ClaudeProvider implements AgentProvider {
             }
             const releasedAtDrain = liveBackgroundTasks.size === 0 && idleSeenWithHold;
             if (releasedAtDrain) {
-              // The CLI already went idle over these tasks: no idle will follow
-              // this drain, so this is the release (see idleSeenWithHold).
+              // The CLI already went idle over these tasks and no idle follows this drain, so this is the release.
               backgroundHold = false;
               idleSeenWithHold = false;
               idleCoveredTasks = new Set();
@@ -3330,18 +2325,8 @@ export class ClaudeProvider implements AgentProvider {
             if ((message as { state?: string }).state === 'idle') {
               const unansweredPrompts = stream.settle();
               if (unansweredPrompts.length > 0) yield { type: 'settled', unansweredPrompts };
-              // Report the background level HERE, not at the membership change:
-              // on this CLI idle is withheld while background agents run and
-              // fires only once the bg-agent loop exits (sdk.d.ts on
-              // SDKSessionStateChangedMessage; CLI 2.1.272 changelog — headless
-              // sessions stopped reporting idle with agents still running,
-              // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING defaults on). So `live: 0`
-              // at idle is the CLI confirming no follow-up turn is coming, and
-              // the poll-loop can lower the level it held for that work without
-              // opening a gap before a completion-started turn's `init`. The
-              // hold releases here for the same reason — or, for task types
-              // the CLI does not gate idle on, at the drain that follows an
-              // idle like this one (idleSeenWithHold).
+              // Report the background level HERE, not at the membership change: the CLI withholds idle while
+              // background agents run (CLI 2.1.272), so `live: 0` at idle confirms no follow-up turn is coming.
               if (liveBackgroundTasks.size === 0) backgroundHold = false;
               else if (backgroundHold) {
                 idleSeenWithHold = true;
@@ -3350,44 +2335,18 @@ export class ClaudeProvider implements AgentProvider {
               yield { type: 'background_work', live: liveBackgroundTasks.size };
             }
           } else if (message.type === 'assistant') {
-            // Record tool_use id → name so a later task_notification can be
-            // classified (Agent/Task subagent vs backgrounded Bash). See
-            // shouldForwardTaskNotification.
             const blocks = (message as { message?: { content?: unknown } }).message?.content;
-            // A subagent's assistant messages ride this stream too, tagged with
-            // the tool call that spawned them; only the parent speaks to people.
+            // A subagent's assistant messages ride this stream too; only the parent speaks to people.
             const topLevel = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null;
-            // Context occupancy for the status subtext: this message's `usage`
-            // is the API response's own report of the request that produced it,
-            // so its prompt side IS what the window currently holds. Anthropic
-            // splits that prompt across three counters — `input_tokens` counts
-            // only the UNCACHED remainder, with the cached prefix reported
-            // separately as `cache_read_input_tokens` and any freshly written
-            // cache segment as `cache_creation_input_tokens` — so occupancy is
-            // the sum. Reading `input_tokens` alone would show a few hundred
-            // tokens on a warm thread and render a full window as near-empty.
-            // Top-level only: a subagent's usage measures ITS window, not ours.
+            // Top-level only: a subagent's usage measures ITS context window, not ours.
             if (topLevel) {
               recordContextTokens(claudeContextOccupancy(message.message?.usage));
-              // What actually answered, not what was asked for: a `-m opus`
-              // request is the alias `opus` until the API serves it.
+              // What actually answered, not what was asked for: `opus` stays an alias until the API serves it.
               recordServedModel(message.message?.model);
             } else {
-              // A subagent frame — the exact set the context reading above
-              // skips, reused here for what it CAN answer: which worker this
-              // turn deployed and on which model.
-              //
-              // Both fields are OBSERVED. `subagent_type` is the agent type
-              // the Task call named, carried on the frame by the SDK, and
-              // `message.model` is the model that actually served the request
-              // — never the one that was asked for. Effort is not on this
-              // frame and is deliberately left null rather than inferred from
-              // the type name: `worker-xhigh` reads like an effort only
-              // because of one plugin's naming convention, and parsing it
-              // would be a guess wearing a measurement's clothes.
-              //
-              // Keyed by parent_tool_use_id — one Task call is one worker, so
-              // a worker that streams twenty frames is counted once.
+              // A subagent frame: which worker ran and on which model, both OBSERVED. Effort is not on the frame and
+              // stays null rather than parsed from a type name like `worker-xhigh`. Keyed by parent_tool_use_id, so a
+              // worker streaming many frames counts once.
               const key = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id;
               if (key) {
                 recordSubagent(key, {
@@ -3402,33 +2361,23 @@ export class ClaudeProvider implements AgentProvider {
                 const b = block as { type?: string; id?: string; name?: string; text?: unknown };
                 if (b.type === 'tool_use' && b.id && b.name) toolNameById.set(b.id, b.name);
                 if (!topLevel) continue;
-                // Text is only known to be mid-turn once a tool call follows it
-                // (the CLI emits blocks as separate messages, so "follows" spans
-                // messages). Text still pending at `result` is the final text,
-                // which the result carries — dropped there, never emitted twice.
+                // Text is mid-turn only once a tool call follows it, possibly in a later message. Text still pending
+                // at `result` is the final text the result carries, so it is never emitted twice.
                 if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
                   pendingAssistantText = pendingAssistantText ? `${pendingAssistantText}\n${b.text}` : b.text;
                 } else if (b.type === 'tool_use') {
                   sawToolUse = true;
                 }
               }
-              // A message that calls a tool is not the turn's last, so ALL the
-              // text buffered so far is mid-turn — text placed after the
-              // tool_use block in the same message included.
+              // A message that calls a tool is not the turn's last, so ALL buffered text is mid-turn, including text
+              // after the tool_use block.
               if (sawToolUse && pendingAssistantText) {
                 const text = pendingAssistantText;
                 pendingAssistantText = null;
                 yield { type: 'interim_text', text };
               }
             }
-            // SDK task_notification only fires for multi-step planned tasks, so
-            // simple turns (single tool call, direct answers) never get a
-            // status line. Derive labels from thinking + tool_use blocks on
-            // each assistant turn. Thinking forwarding gives the user visibility
-            // into the reasoning process; the tool_use label shows what the
-            // agent chose to do next. Both honor TOOL_PROGRESS_MIN_INTERVAL_MS
-            // across the whole label group — throttling is a per-turn floor,
-            // not a per-label rate limit.
+            // The label group shares one throttle window; it is not a per-label rate limit.
             const labels = deriveProgressLabels(message);
             if (labels.length > 0) {
               const now = Date.now();
@@ -3445,177 +2394,67 @@ export class ClaudeProvider implements AgentProvider {
         if (aborted) return;
         throw err;
       }
-      // Second gate, and the load-bearing one: `interrupt()` may end the
-      // stream without emitting a further message, in which case the
-      // top-of-loop check above never runs again and the turn would complete
-      // normally — dead subagent, no rotation, silently. Re-check after the
-      // loop so the throw is guaranteed regardless of how the SDK winds the
-      // interrupted stream down.
+      // Second, load-bearing gate: `interrupt()` may end the stream with no further message, so the top-of-loop check
+      // never runs again and the turn would complete silently with a dead subagent.
       if (subagentQuotaError) throw new Error(subagentQuotaError);
       log(`Query completed after ${messageCount} SDK messages`);
     }
 
-    // Tracks the model the live query is currently on — updated by
-    // applySettings so a later effort-only change clamps against the
-    // model actually in effect, not the one the query started with.
+    // Updated by applySettings so an effort-only change clamps against the model actually in effect.
     let activeModel = model;
-    // Same idea for effort, and for the same reason turn_usage needs it: a
-    // mid-stream `-e` lands through applySettings, so the value resolved at
-    // query() time stops describing the turns that follow it. `translateEvents`
-    // reads these when it stamps a `result` event's usage — see
-    // providers/turn-effort.ts. `activeRequestedEffort` is the PRE-clamp value,
-    // which is what makes a Haiku turn ("high was configured, none was sent")
-    // distinguishable from one that was never configured at all.
+    // Same for effort, which `result` stamps onto usage. `activeRequestedEffort` is the PRE-clamp value, which tells a
+    // Haiku turn ("high configured, none sent") apart from one never configured.
     let activeEffort = effort;
     let activeRequestedEffort = requestedEffort;
-    // Effort in force when the CURRENT turn began, and whether a new turn is
-    // about to start.
-    //
-    // A follow-up that arrives while a turn is still executing does NOT open a
-    // new query: poll-loop.ts calls applySettings and then pushes it into the
-    // same stream (see its `liveSettingsChanged` branch), and the SDK merges
-    // both inputs into one eventual `result`. That result's usage therefore
-    // covers work done under the OLD effort and the new one — or, if the
-    // control request raced completion, entirely under the old one. Stamping
-    // the aggregate with whichever value happened to be current at `result`
-    // reports tokens under an effort they did not all run at, and
-    // `usage summary --by effort` would carry that straight through.
-    //
-    // Snapshot-and-compare instead: equal at `result` means one setting
-    // covered the whole turn, unequal means the turn is not attributable and
-    // records NULL. Same discipline as the model side — never a
-    // plausible-looking wrong value.
-    //
-    // Re-snapshotted at the first message of the NEXT turn rather than at
-    // `result`, because settings also change BETWEEN turns (the ordinary
-    // path: no turn in flight, applySettings, then push). Snapshotting at
-    // `result` would capture the pre-change value and wrongly mark that next,
-    // entirely-clean turn as mixed.
-    // How many times the effort actually MOVED during the current turn.
-    //
-    // Endpoint comparison is not enough: a turn admitting two follow-ups can
-    // go high -> low -> high and land back where it started, and comparing
-    // only the ends calls that constant while part of the turn ran at `low`.
-    // Counting transitions is indifferent to where the value lands, so any
-    // movement at all makes the turn unattributable.
-    //
-    // Delimited by the SDK's own `result` events and NOTHING else. Cleared
-    // where a turn demonstrably ends (see the `result` branch), never by an
-    // external signal.
-    //
-    // Two earlier shapes put the reset on the input side and both were wrong,
-    // in opposite directions. The first SDK message leaves a gap: once a
-    // prompt is pushed the CLI may already have issued the request under the
-    // old effort while no message has been emitted yet. The push itself is
-    // worse, because it is not a boundary at all — poll-loop pushes a
-    // follow-up INTO a running turn and the SDK merges it into that turn's
-    // single `result`, so resetting there erased exactly the mid-turn
-    // transitions this counter exists to catch. Whether a push starts a turn
-    // or merges into one is not knowable at push time, by the provider or by
-    // anyone else, so the input side cannot answer this question and is no
-    // longer asked to.
-    //
-    // The cost is deliberate: a change made BETWEEN turns also counts, so that
-    // turn records NULL even though it arguably ran wholly under the new
-    // value. That is the invariant holding — never emit a non-NULL effort you
-    // cannot PROVE governed the whole turn — and the timing of a between-turns
-    // change relative to the CLI picking up the prompt is precisely what
-    // cannot be proven from here. NULL means "not attributable"; declining to
-    // answer is always safe, and a confidently wrong value never is.
+    // How many times the effort MOVED during the current turn; any movement makes that turn's usage unattributable
+    // (NULL). The SDK merges a follow-up pushed mid-turn into that turn's single `result`, and comparing endpoints
+    // misses high → low → high. Cleared only at `result`: whether a push starts or merges into a turn is unknowable
+    // at push time. A change BETWEEN turns therefore also NULLs the next turn; declining to answer is safe, a
+    // confidently wrong effort is not.
     let effortTransitionsThisTurn = 0;
-    // The canonical id `modelUsage` will be keyed by. Tracked SEPARATELY from
-    // activeModel rather than replacing it: activeModel must stay in the form
-    // the SDK expects for setModel/clampEffortForModel, while attribution can
-    // only compare canonical ids. See canonicalUsageModel.
+    // Separate from activeModel, which must stay in the form setModel/clampEffortForModel expect; attribution can only
+    // compare canonical ids (see canonicalUsageModel).
     let activeUsageModel = canonicalUsageModel(model, perQueryEnv);
 
     return {
       push: (msg) => stream.push(msg),
       initialPromptId,
-      // Holds the turn level while a prompt is unanswered. The hold ends at the
-      // prompt's echo or at the CLI's idle; there is no runner-side timer. On
-      // this CLI (2.1.272) idle is withheld while background agents run
-      // (CLAUDE_CODE_BG_TASKS_REPORT_RUNNING defaults on — verified in the
-      // binary's changelog), so a dropped echo during background work holds
-      // the level for that work's duration, which is also what
-      // hasBackgroundWork below wants; the 30-minute ceiling stays the bound.
+      // Holds the turn level while a prompt is unanswered, until its echo or the CLI's idle; there is no runner-side
+      // timer, and the 30-minute ceiling stays the bound.
       hasQueuedWork: () => sessionStateSeen && stream.outstanding.size > 0,
-      // Background agents outlive the turn that launched them; the CLI reports
-      // them back into this same stream when they finish (task_notification,
-      // then a turn it starts itself). Holding the busy level while any are
-      // live is what keeps the task reaper off a container whose parent turn
-      // ended on a `wait`. Latched until the CLI's idle — see backgroundHold
-      // and AgentQuery.hasBackgroundWork.
-      // Gated on sessionStateSeen like hasQueuedWork above: the raise comes
-      // from a message the CLI always emits, the release from one it emits
-      // only behind CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS — a CLI that has
-      // not shown the latter must not be able to pin a container.
+      // Background agents outlive their launching turn and report back into this stream; holding busy while any are
+      // live keeps the task reaper off the container (see backgroundHold). Gated on sessionStateSeen: the release
+      // arrives only behind CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, so a CLI without it must not pin a container.
       hasBackgroundWork: () => sessionStateSeen && backgroundHold,
       end: () => stream.end(),
       events: translateEvents(),
-      // The SDK installs systemPrompt at query creation and exposes no control
-      // request to replace it. The poll-loop waits for an idle boundary before
-      // a live model/effort change opens a fresh authoritative query.
+      // The SDK installs systemPrompt at query creation and has no control request to replace it.
       requiresRestartForRuntimeContext: true,
-      // Live view of `activeModel`, which is the resolved creation model and
-      // is reassigned by applySettings. A getter rather than a snapshot so
-      // creation and mid-stream retarget cannot report different things.
+      // A getter so creation and a mid-stream retarget cannot report different models.
       get resolvedModel() {
         return activeModel;
       },
-      // Live view of `activeEffort` — the effort that actually RAN, after the
-      // precedence chain (`-e` → group config → env override → family default,
-      // :2784) and the `clampEffortForModel` safety drop (:2788). A getter for
-      // the same reason as resolvedModel: applySettings reassigns it on a
-      // mid-stream retarget (:3559).
-      //
-      // The status subtext needs this, not the request: `querySettings.effort`
-      // holds USER INTENT only (the contract `applyFlagBatch` states in
-      // poll-loop.ts), so a group carrying its effort in container.json
-      // requests nothing and a clamped turn requests something it never ran at.
+      // The effort that actually RAN, after precedence and clamp. Status must read this: `querySettings.effort` holds
+      // user intent only.
       get resolvedEffort() {
         return activeEffort ?? null;
       },
       abort: () => {
         aborted = true;
         stream.end();
-        // Idempotent: AbortController#abort() on an already-aborted
-        // controller is a documented no-op, so a caller that ends up
-        // calling abort() more than once for the same query (e.g. both the
-        // poll-loop's error-path abort and a config.signal listener firing)
-        // never double-tears-down.
+        // Idempotent: aborting an already-aborted controller is a documented no-op.
         queryAbortController.abort();
       },
-      // In-flight -m/-e: same conversation, same stream — the SDK control
-      // requests mirror interactive Claude Code's /model. Re-runs the same
-      // effort resolution chain as query() so a model switch without an
-      // explicit -e lands on the new model's family default (e.g. -m fable
-      // mid-turn → fable@medium, not fable@inherited-xhigh).
+      // Re-runs query()'s effort chain so a model switch without -e lands on the new model's family default.
       applySettings: async (s) => {
-        // `s.model === undefined` means LEAVE THE LIVE MODEL UNCHANGED, and
-        // that is not an inconsistency with query creation — it is what every
-        // caller on this path means. A flagless message arriving mid-turn
-        // resolves to `undefined` from `applyFlagBatch` simply because nobody
-        // asked for a model; a turn opened with a one-shot `-m1` override
-        // would then be dragged off it mid-answer.
-        //
-        // This was briefly "resolve absence to the group default", to serve a
-        // scheduled-task suppression on this path. That caller has since been
-        // reverted (see the follow-up issue in CHANGELOG) and the reading went
-        // with it. The rule worth keeping: a future attempt to retarget a live
-        // model must not do it by REINTERPRETING `undefined`, because this
-        // seam is shared with ordinary chat, which legitimately means
-        // "unchanged" by it. Pass the model you want explicitly instead.
-        //
-        // (The effort branch below does resolve its own absence. That is not
-        // the same case: effort has no "leave alone" caller here — it is
-        // recomputed for the model in force on every call.)
+        // `s.model === undefined` means LEAVE THE LIVE MODEL UNCHANGED: a flagless mid-turn message resolves to it,
+        // and reinterpreting it would drag a one-shot `-m1` turn off its model mid-answer. To retarget, pass the model
+        // explicitly. Effort, by contrast, is recomputed for the model in force on every call.
         const newModel = s.model ? ensureOpus1mSuffix(s.model) : undefined;
         if (newModel && newModel !== activeModel) {
           await sdkResult.setModel(newModel);
           activeModel = newModel;
-          // A live `-m sonnet` lands here as a bare alias too, so the
-          // attribution target has to be re-resolved alongside it.
+          // A live `-m sonnet` arrives as a bare alias too, so re-resolve the attribution target.
           activeUsageModel = canonicalUsageModel(newModel, perQueryEnv);
         }
         const requested =
@@ -3625,9 +2464,7 @@ export class ClaudeProvider implements AgentProvider {
           defaultEffortForModel(activeModel);
         const clamped = clampEffortForModel(activeModel, requested);
         if (clamped === 'max') {
-          // Settings.effortLevel has no 'max' — signal the poll-loop to
-          // fall back to reopening the query (where effort is a creation
-          // option that does accept max).
+          // Settings.effortLevel has no 'max': throw so the poll-loop reopens the query, where effort accepts max.
           throw new Error("effortLevel control cannot express 'max'");
         }
         const settings: { effortLevel: 'low' | 'medium' | 'high' | 'xhigh' | null; ultracode?: boolean } = {
@@ -3635,13 +2472,8 @@ export class ClaudeProvider implements AgentProvider {
         };
         if (s.ultracode !== undefined) settings.ultracode = s.ultracode;
         await sdkResult.applyFlagSettings(settings);
-        // Only AFTER the control request lands — the 'max' throw above and any
-        // SDK failure must leave the trackers describing what is really in
-        // effect, or turn_usage would record an effort the API never saw.
-        //
-        // Counted only when the value actually MOVES: poll-loop calls this for
-        // a model-only change too, and one that resolves to the same effort
-        // introduces no ambiguity to account for.
+        // Only AFTER the control request lands, so a throw leaves the trackers describing what is really in effect.
+        // Counted only when the value MOVES: model-only changes call this too.
         if (clamped !== activeEffort || requested !== activeRequestedEffort) effortTransitionsThisTurn++;
         activeEffort = clamped;
         activeRequestedEffort = requested;

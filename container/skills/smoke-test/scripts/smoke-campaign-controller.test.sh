@@ -40,7 +40,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA2=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 PR=7
-RUN=xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z
+RUN=acme-pr-pr7-aaaaaaaaaaaa-20260918T100000Z
 
 key() { python3 -c 'import hashlib,sys; print(hashlib.sha256("|".join(sys.argv[1:]).encode()).hexdigest())' "$@"; }
 
@@ -405,7 +405,7 @@ expect_blocked() { # name jq-merge-for-synthesis expected-check-substring [setup
     || fail "$1: failed checks must name '$3': $(dq '[.[] | select(.type=="finish")]')"
 }
 expect_blocked sha ".sourceSha = \"$SHA2\"" "sourceSha binding"
-expect_blocked runid '.runId = "xzo-pr-pr7-other"' "runId"
+expect_blocked runid '.runId = "acme-pr-pr7-other"' "runId"
 expect_blocked generation '.laneGenerations.B1 = 1' "evidence generation: lane B1"
 head_moved() { printf '{"%s":"%s"}\n' "$PR" "$SHA2" >"$C/heads.json"; }
 expect_blocked headmoved '.' "moved off the frozen sha" head_moved
@@ -660,7 +660,7 @@ new_case earlystale
 claim; contract
 marker A1 1 pass
 seed run claim enqueued 1 '{"pr":7}'
-synthesis BLOCKED '.runId = "xzo-pr-pr7-aaaaaaaaaaaa-20260917T100000Z"'
+synthesis BLOCKED '.runId = "acme-pr-pr7-aaaaaaaaaaaa-20260917T100000Z"'
 step_ok 2026-09-18T10:00:00Z
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "an early stale synthesis still finishes only BLOCKED"
 dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(startswith("runId"))' | grep -qx true \
@@ -706,7 +706,7 @@ import importlib.util, sys
 spec = importlib.util.spec_from_file_location("ctl", sys.argv[1]); m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 assert not any(m.RUN_ID_RE.match(x) for x in (".", "..", ".hidden", "../x", "a/b", ""))
-assert m.RUN_ID_RE.match("xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z")
+assert m.RUN_ID_RE.match("acme-pr-pr7-aaaaaaaaaaaa-20260918T100000Z")
 PY
 
 # A symlinked decisions file is refused (O_NOFOLLOW), the fire fails closed,

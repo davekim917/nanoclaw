@@ -17,7 +17,7 @@ cat > "$STUB_BIN/curl" <<'STUB'
 set -u
 [ -n "${STUB_HTML+x}" ] || STUB_HTML='<html><head></head><body><script type="module" src="/assets/index-ABC123.js"></script></body></html>'
 [ -n "${STUB_HTML_EXIT+x}" ] || STUB_HTML_EXIT=0
-[ -n "${STUB_BUNDLE+x}" ] || STUB_BUNDLE='fetch("https://xzo-dev-backend-pr-42.onrender.com/api")'
+[ -n "${STUB_BUNDLE+x}" ] || STUB_BUNDLE='fetch("https://widget-api-pr-42.onrender.com/api")'
 [ -n "${STUB_BUNDLE_EXIT+x}" ] || STUB_BUNDLE_EXIT=0
 [ -n "${STUB_HEALTHZ_CODE+x}" ] || STUB_HEALTHZ_CODE=200
 ARGS="$*"
@@ -37,8 +37,8 @@ reset_stubs() {
         SMOKE_BUILD_ID_STALE_HOSTS SMOKE_BUILD_ID_BUNDLE_PATTERN 2>/dev/null || true
 }
 
-FRONTEND="https://xzo-dev-react-pr-42.onrender.com"
-BACKEND="https://xzo-dev-backend-pr-42.onrender.com"
+FRONTEND="https://widget-web-pr-42.onrender.com"
+BACKEND="https://widget-api-pr-42.onrender.com"
 
 # --- usage: missing args ----------------------------------------------------
 OUT="$(bash "$SCRIPT" 2>&1 || true)"
@@ -55,7 +55,7 @@ fi
 [ "$RC" -eq 0 ] || { echo "expected happy path to exit 0, got $RC: $(cat "$STUB_BIN/out1.json")" >&2; exit 1; }
 jq -e '
   .ok == true and
-  .expectedHost == "xzo-dev-backend-pr-42.onrender.com" and
+  .expectedHost == "widget-api-pr-42.onrender.com" and
   .expectedHostCount == 1 and
   .staleHostsFound == {} and
   .backendReachable == true and
@@ -73,7 +73,7 @@ jq -e '.ok == false and .expectedHostCount == 0 and (.reason | test("does not ap
 
 # --- 3. Stale host present: bundle references the wrong/shared-dev host ----
 reset_stubs
-export STUB_BUNDLE='fetch("https://xzo-dev-backend-pr-42.onrender.com/api"); fetch("https://api.legacy.example/legacy")'
+export STUB_BUNDLE='fetch("https://widget-api-pr-42.onrender.com/api"); fetch("https://api.legacy.example/legacy")'
 export SMOKE_BUILD_ID_STALE_HOSTS='api.legacy.example,another.stale.example'
 OUT="$(bash "$SCRIPT" "$FRONTEND" "$BACKEND" 2>&1)" && RC=0 || RC=$?
 [ "$RC" -eq 1 ] || { echo "expected exit 1 for stale host, got $RC" >&2; exit 1; }

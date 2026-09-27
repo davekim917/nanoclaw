@@ -51,11 +51,7 @@ export type OriginPin =
       repositoryId: string;
     }
   | {
-      /**
-       * A migration-only preservation state for a repository that never had a
-       * remote. It remains usable through linked worktrees, but fetch/push/PR
-       * operations fail closed until an operator deliberately publishes it.
-       */
+      /** Migration-only state for a repository that never had a remote: linked worktrees work; fetch/push/PR fail closed. */
       kind: 'local-only';
       origin: null;
       repositoryId: string;
@@ -127,12 +123,7 @@ export function ensureRepositoryLock(workgroupId: string, repo: string, dataDir:
   return ensureLockFile(repositoryLockPath(workgroupId, repo, dataDir));
 }
 
-/**
- * The flock holder, the acquisition timeout and the lock-identity re-check now
- * live in `file-lock.ts`, shared with `container.json`'s mutation primitive —
- * same mechanism, same guarantees, one place to fix. Behaviour here is
- * unchanged: exclusive, 120s wait, identity verified after acquisition.
- */
+/** Exclusive, 120s wait, lock identity verified after acquisition (mechanism in `file-lock.ts`). */
 export async function withHostRepositoryLock<T>(
   workgroupId: string,
   repo: string,
@@ -186,9 +177,7 @@ function sha256(value: string): string {
 }
 
 function workUnitKey(kind: RepositoryWorkUnitKind, ...identity: string[]): string {
-  // External identifiers may contain any delimiter used by a chat adapter.
-  // A structured tuple keeps their boundaries unambiguous before the key is
-  // hashed or used by lifecycle claims, transfers, and branch derivation.
+  // A structured tuple keeps adapter identifiers' delimiters unambiguous before hashing.
   return JSON.stringify([kind, ...identity]);
 }
 
@@ -352,16 +341,7 @@ export interface CanonicalRepositoryClassification {
 
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-/**
- * Why `repoPath` cannot be served as a canonical, or null when it can.
- *
- * The `commondir` inspection comes BEFORE the Git probe on purpose:
- * Git follows a `commondir` in any git dir, so probing a repository that
- * holds a foreign one either answers for another repository or, when it
- * names a missing directory, exits 128. Reading the file first keeps a
- * tampered repository away from Git entirely, and keeps its failure to
- * itself rather than aborting the caller's whole pass.
- */
+/** Why `repoPath` cannot be served, or null. `commondir` is read BEFORE any Git probe: Git follows a foreign commondir. */
 function containedNormalCloneProblem(repoPath: string, root: string): { reason: string; commondir: boolean } | null {
   const gitDir = path.join(repoPath, '.git');
   let repoReal: string;
@@ -428,15 +408,8 @@ function containedNormalCloneProblem(repoPath: string, root: string): { reason: 
 }
 
 /**
- * Every canonical repository in the workgroup, split into the ones that can be
- * served and the ones that cannot, judged one repository at a time.
- *
- * A problem with the workgroup NAMESPACE itself still throws — it disqualifies
- * every repository under it, so there is nothing to serve. A problem with one
- * repository is that repository's alone: the caller decides between skipping
- * it and refusing everything. The spawn path skips it, so one tampered or
- * half-migrated canonical withholds only its own mounts instead of
- * stopping every container in the workgroup.
+ * Every canonical repository, split into servable and not, judged one repository at a time: a namespace problem
+ * still throws, but a bad repository withholds only its own mounts.
  */
 export function classifyCanonicalRepositories(
   workgroupId: string,
@@ -468,10 +441,7 @@ export function classifyCanonicalRepositories(
           ? { reason: `invalid entry in canonical repository namespace: ${repoPath}`, commondir: false }
           : containedNormalCloneProblem(repoPath, workgroupRoot);
       if (!problem) {
-        // Inside the try as well: this repository's coordination files are its
-        // own, and an I/O fault on one of them (a symlinked `repository.lock`,
-        // say) must make that repository unusable rather than throw out of the
-        // classifier and stop the whole workgroup spawning.
+        // Inside the try: an I/O fault on one repository's coordination files makes only that repository unusable.
         served = {
           name: entry.name,
           path: repoPath,
@@ -496,32 +466,14 @@ export function classifyCanonicalRepositories(
   return { repositories, unusable };
 }
 
-/**
- * The all-or-nothing form: the first unusable repository, in entry order,
- * throws its reason.
- *
- * Two callers depend on that and are deliberately left on it, because for them
- * a bad repository means the workgroup's answer is untrustworthy as a whole:
- * `migrateExistingCanonicalHooksPath` (managed-git-hooks) and
- * `discoverCanonicalRefreshTargets` (repo-freshness) both catch it
- * and skip the entire workgroup. The spawn path calls
- * classifyCanonicalRepositories instead.
- */
+/** All-or-nothing form (the first unusable repository throws), for callers that skip the whole workgroup on any bad repository. */
 export function discoverCanonicalRepositories(workgroupId: string, dataDir: string = DATA_DIR): CanonicalRepository[] {
   const { repositories, unusable } = classifyCanonicalRepositories(workgroupId, dataDir);
   if (unusable.length > 0) throw new Error(unusable[0].reason);
   return repositories;
 }
 
-/**
- * A pin's identity in the one form every consumer compares: `github.com/<owner>/<repo>`,
- * lowercase. Repository activation stores the origin URL itself as the identity,
- * while publication derives the github.com form and compares the two strictly, so
- * without this mapping a re-publish of an activated repository is refused. Every pin read
- * and write passes through validateOriginPin, so mapping the URL form here serves
- * every caller. Anything that is not an HTTPS github.com owner/repository URL is
- * returned unchanged.
- */
+/** A pin's identity as lowercase `github.com/<owner>/<repo>`, so activation's URL form and publication's form compare equal. */
 function normalizedPinIdentity(repositoryId: string): string {
   if (!/^https:\/\//i.test(repositoryId) || !URL.canParse(repositoryId)) return repositoryId;
   const parsed = new URL(repositoryId);
@@ -625,12 +577,9 @@ export function writeOriginPin(
   }
 }
 
-// ── Checkout layout (plan §5.1) ──────────────────────────────────────────────
-//
-// `worktrees/<repo>` is the thread's primary checkout and `worktrees/<repo>@<slug>`
-// any other branch's; `@` is outside SAFE_SEGMENT, so names parse unambiguously.
-// Duplicated on purpose in container/agent-runner/src/mcp-tools/checkout-layout.ts,
-// and both copies are pinned by checkout-layout.fixtures.json beside it.
+// Checkout layout: `worktrees/<repo>` is the primary checkout, `worktrees/<repo>@<slug>` any other branch's.
+// Duplicated on purpose in container/agent-runner/src/mcp-tools/checkout-layout.ts; both are pinned by
+// checkout-layout.fixtures.json.
 
 const CHECKOUT_SLUG = /^[A-Za-z0-9._-]+$/;
 const CHECKOUT_SLUG_MAX_CHARS = 80;
@@ -703,18 +652,9 @@ function checkoutShape(checkoutPath: string): CheckoutShape {
   return stat.isFile() ? 'linked' : 'unknown';
 }
 
-// ── Checkout staging and metadata (plan §5.2) ────────────────────────────────
-//
-// The host builds a clone under `<topic>/checkout-staging/<requestId>/<name>`
-// and publishes it into `<topic>/worktrees/` with one rename on the same
-// filesystem, so a checkout exists only once it is fully initialized.
-//
-// Staging sits BESIDE `worktrees/`, never inside it. `worktrees/` is mounted
-// read-write into the topic's containers, so an
-// agent can plant anything there, a symlink included, and the host's staging
-// mkdir and crash-residue removal would follow it into host data. The topic
-// state dir itself is not mounted, so nothing a container writes can steer
-// them, and no lister or sweep of `worktrees/` ever sees a half-built clone.
+// Clones are built under `<topic>/checkout-staging/` and published into `worktrees/` by one rename. Staging sits
+// BESIDE `worktrees/`, never inside: `worktrees/` is container-writable, so a planted symlink could steer the
+// host's staging into host data.
 
 const CHECKOUT_STAGING_DIRNAME = 'checkout-staging';
 const CHECKOUT_METADATA_FILENAME = 'nanoclaw-checkout.json';
@@ -797,24 +737,10 @@ export function writeCheckoutMetadata(checkoutPath: string, metadata: CheckoutMe
   }
 }
 
-// ── Inherited tags ─────────────────────────────────────────────────────
-//
-// A clone copies every canonical tag, and the clone disposability proof counts
-// every local ref's commits against origin, so one release tag off every origin
-// branch would keep every clone of that repository forever. When the host
-// builds a clone it records the tags the clone holds; the proof drops a tag
-// only while the clone still holds it exactly as recorded. The record sits in
-// the topic state dir beside `worktrees/`, which no container mounts (see the
-// staging note above). The canonical is never read at proof time: its refs are
-// container-writable, and a tag a sibling topic planted there could exempt
-// another thread's tag-only work.
-//
-// A record names a path, and whatever occupies that path later may be another
-// clone: one an agent put there by hand, or one a quarantine rollback left
-// beside a record it restored separately. So the record also holds the
-// identity of the clone it was written for (cloneIdentity). A rename keeps it,
-// so quarantine and rollback moving the same directory keep the record valid;
-// any replacement changes it, and the record is then ignored.
+// Inherited tags: a clone copies every canonical tag, and the disposability proof would count them as unpushed
+// work. The host records the tags a new clone holds (outside every container mount) and the proof drops a tag
+// only while it is unchanged. The canonical is never read at proof time: its refs are container-writable. The
+// record carries the clone's identity, so a replacement clone at the same path ignores it.
 
 const CHECKOUT_TAGS_DIRNAME = 'checkout-tags';
 
@@ -837,13 +763,7 @@ export function checkoutInheritedTagsPath(checkoutPath: string): string {
   return path.join(path.dirname(path.dirname(checkoutPath)), CHECKOUT_TAGS_DIRNAME, path.basename(checkoutPath));
 }
 
-/**
- * Record `forEachRef`, the output of `git for-each-ref --format='%(objectname)
- * %(refname)' refs/tags` in a clone the host just built, as the tags that
- * clone inherited. `identity` is the clone's cloneIdentity, and `checkoutPath`
- * the path it is about to be published at. One rename replaces any earlier
- * record for that name.
- */
+/** Record the tags a just-built clone inherited (`for-each-ref` output), keyed to its cloneIdentity. */
 export function writeCheckoutInheritedTags(checkoutPath: string, identity: string, forEachRef: string): void {
   const file = checkoutInheritedTagsPath(checkoutPath);
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -864,13 +784,7 @@ export function writeCheckoutInheritedTags(checkoutPath: string, identity: strin
   }
 }
 
-/**
- * The tags recorded for the clone now at `checkoutPath`, full ref name to
- * object id; `null` when there is no record, it cannot be read, it was written
- * for another clone than the one at `checkoutPath`, or a line is not
- * `<object> refs/tags/<name>`. Null only withdraws the exemption: every tag
- * counts.
- */
+/** Recorded tags for the clone at `checkoutPath`; null (no exemption) when absent, unreadable, for another clone, or malformed. */
 export function readCheckoutInheritedTags(recordPath: string, checkoutPath: string): Map<string, string> | null {
   let text: string;
   let fd: number;
@@ -905,16 +819,7 @@ export function removeCheckoutInheritedTags(checkoutPath: string): void {
   fs.rmSync(checkoutInheritedTagsPath(checkoutPath), { force: true });
 }
 
-/**
- * Delete `checkout-staging/<requestId>` entries, other than `keep`, whose mtime is at
- * least `maxAgeMs` old. Returns the removed names.
- *
- * Safe only where no job can be building inside one of them: the caller must
- * be the one job its topic's lane is running (job-runner lanes run one job at a
- * time per work unit), or otherwise prove the lane idle. A staging entry only
- * ever holds a host-built clone that was never published, so removing it loses
- * no agent work.
- */
+/** Delete stale staging entries. Safe only when the caller is its topic lane's one running job (or proves the lane idle). */
 export function removeStaleCheckoutStaging(
   topicWorktreesDir: string,
   options: { now: number; keep?: string; maxAgeMs?: number },

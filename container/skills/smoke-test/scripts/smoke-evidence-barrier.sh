@@ -531,7 +531,7 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # this, the only enforcement point was the campaign controller's verdict
 # (validate_synthesis, GO branch only), reached after every lane had run: two
 # campaigns synthesised GO and published BLOCKED on "pair identity not ok
-# (last check: none)" alone (XZO #2092: pr2088 never ran `start`, pr2045 ran
+# (last check: none)" alone (pr2088 never ran `start`, pr2045 ran
 # `start` and never `check`), while this barrier reported ready with the file
 # absent. Here it is refused where the owner can still act on it, and through
 # the channel the controller already publishes and re-offers on

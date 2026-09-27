@@ -7,9 +7,7 @@ export interface AgentGroup {
   /** @deprecated Use container_configs.provider instead. */
   agent_provider: string | null;
   created_at: string;
-  /** Workgroup this group belongs to (migration 036). Standalone groups have
-   *  workgroup_id === folder. Selected via `SELECT *`; may be absent on rows
-   *  written before the migration. */
+  /** Standalone groups have workgroup_id === folder; may be absent on old rows. */
   workgroup_id?: string | null;
 }
 
@@ -50,13 +48,8 @@ export interface MessagingGroup {
   instance?: string;
   name: string | null;
   /**
-   * Provenance of `name`, as `"<platform>:<source>"` (e.g. `slack:classified`).
-   * Decides whether a later metadata refresh is allowed to overwrite the name
-   * — see `resolveChannelMetadataUpdates` (main.ts) and migration 069.
-   *
-   * Optional on the TS type per the `denied_at` / `instance` convention so
-   * fixtures that build MessagingGroup objects don't need updating; NULL means
-   * "unknown", which is read as an adapter-sourced name.
+   * `"<platform>:<source>"`; decides whether a metadata refresh may overwrite `name`. NULL reads as
+   * adapter-sourced.
    */
   name_source?: string | null;
   is_group: number; // 0 | 1
@@ -125,16 +118,10 @@ type EngageMode = 'pattern' | 'mention' | 'mention-pattern' | 'mention-sticky';
 type SenderScope = 'all' | 'known';
 export type IgnoredMessagePolicy = 'drop' | 'accumulate';
 
-// Session-mode enum shared across router.ts, session-manager.ts, channel-auto-wire,
-// agent-route.ts, and types.ts. The local type that used to live in
-// channel-auto-wire/index.ts is re-exported from here so there's one source of truth.
 export type SessionMode = 'shared' | 'per-thread' | 'agent-shared';
 export const SESSION_MODES: readonly SessionMode[] = ['shared', 'per-thread', 'agent-shared'] as const;
 
-// Channel-type enum. Covers external adapters (slack, discord, telegram, ...),
-// hybrid variants (whatsapp-cloud), and the internal synthetic channels
-// ('agent' for agent-to-agent, 'cli' for ncl). Setup migrations may use the
-// older alias 'gchat'; normalize via the channel-registry when reading.
+// Setup migrations may use the older alias 'gchat'; normalize via the channel-registry when reading.
 export type ChannelType =
   | 'slack'
   | 'discord'
@@ -154,18 +141,8 @@ export type ChannelType =
   | 'cli';
 
 /**
- * Match a channel_type against a base adapter name. Channel variants are
- * encoded as `<base>-<variant>` (e.g. `slack-thread`, `discord-guild`); this
- * helper returns true for any string that starts with `<base>-`. To check
- * `channelType === 'slack'` specifically (bare base, no variant), use plain
- * equality — bare-base matches must stay separate from variant-prefix matches
- * because some call sites (e.g. router.ts workspace-trust auto-wire) treat
- * bare base as ambiguous and intentionally exclude it.
- *
- * Note: passing `whatsapp` here will also match `whatsapp-cloud`. That's a
- * false positive for that pair (they're distinct channels, not a base/variant
- * relationship). Callers should compare against the specific channel name,
- * not pass 'whatsapp' as a base for that reason.
+ * True only for `<base>-<variant>`, never the bare base (some callers treat bare base as ambiguous).
+ * Don't pass 'whatsapp': it would falsely match the distinct `whatsapp-cloud` channel.
  */
 export function isChannelVariant(channelType: string, base: ChannelType): boolean {
   return channelType.startsWith(`${base}-`);
@@ -186,36 +163,13 @@ export interface MessagingGroupAgent {
   ignored_message_policy: IgnoredMessagePolicy;
   session_mode: SessionMode;
   priority: number;
-  /**
-   * Per-channel model override (this channel's conversations with this
-   * agent use this model by default). Null = fall through to the agent's
-   * container.json defaultModel, then the install-wide DEFAULT_OPUS_MODEL
-   * constant in src/flag-parser.ts.
-   */
+  /** Null = fall through to the group's container config, then the install default. */
   default_model: string | null;
-  /**
-   * Per-channel effort override. Provider-specific: Claude/OpenCode use their
-   * supported levels; Codex additionally supports 'xhigh' | 'max' | 'ultra'.
-   * Null = fall through to the agent container config / provider default.
-   */
+  /** Provider-specific vocabulary. Null = fall through to the group's container config / provider default. */
   default_effort: string | null;
-  /**
-   * Per-channel default tone profile name (matches a file under
-   * `tone-profiles/<name>.md`). When set, the host injects the full profile
-   * into the container's system prompt on spawn — always-on, not gated by an
-   * MCP call. Null = no tone injected; agent falls back to the
-   * get_tone_profile MCP tool for on-demand overrides.
-   */
+  /** Name under `tone-profiles/`, injected into the system prompt at spawn. */
   default_tone: string | null;
-  /**
-   * Per-channel operating-instructions profile name (matches a file under
-   * `groups/<folder>/channel-instructions/<name>.md`). When set, the host
-   * forwards the name and the container injects the file ahead of the tone
-   * block, so operating rules are read before voice. A SEPARATE layer from
-   * `default_tone`, which stays voice-only. Null = no channel instructions;
-   * the group's standing-instructions.md is the group-wide equivalent and
-   * always applies.
-   */
+  /** Name under `groups/<folder>/channel-instructions/`, injected ahead of the tone block; separate from tone. */
   instructions_profile: string | null;
   /**
    * Per-wiring thread-policy override (migration 019). NULL = inherit the
@@ -235,50 +189,19 @@ export interface Session {
   messaging_group_id: string | null;
   thread_id: string | null;
   agent_provider: string | null;
-  /**
-   * 'archiving' is the in-flight reclaim state: the storage manager holds the
-   * row there from the moment it commits to archiving until the rescue archive
-   * is published. It is deliberately not 'active', so every status='active'
-   * lookup (routing, the sweep, the unique active-triple index) skips it.
-   */
+  /** 'archiving' is the in-flight reclaim state, deliberately not 'active' so every active lookup skips it. */
   status: 'active' | 'closed' | 'archiving';
-  /**
-   * Set when the session has been archived — thread-close's terminal marker.
-   *
-   * A distinct axis from `status`: `archiveSessionById` stamps this and leaves
-   * `status` alone, so an archived session normally still reads `active`. Any
-   * check that means "is this session still live" has to read BOTH, which is
-   * why the column is on the type rather than only in the table.
-   */
+  /** Independent of `status` (an archived session usually still reads `active`): liveness checks need both. */
   archived_at?: string | null;
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   last_outbound_at?: string | null;
   last_outbound_kind?: string | null;
-  /**
-   * When an agent first genuinely engaged in this session's thread — a
-   * mention, a wake, or an inbound agent-to-agent message. NULL means the row
-   * exists but nobody has engaged, which is what `mention-sticky` engagement
-   * and the thread-history backfill both read. See migration 052.
-   */
+  /** NULL = the row exists but no agent has engaged yet (read by `mention-sticky` and thread backfill). */
   engaged_at?: string | null;
-  /**
-   * Task sessions only: the `messaging_groups.platform_id` this series was
-   * ROUTED to at definition time — "where an unaddressed reply lands", not
-   * where the task posts. The agent picks its destination at fire time, and
-   * `task_thread_anchors` is what records where a post actually landed. NULL
-   * on every non-task session, and on task sessions scheduled with no routing
-   * (`--isolated`, or a host caller passing no `--messaging-group`). See
-   * migration 056.
-   */
+  /** Task sessions only: where an unaddressed reply lands, not where the task posts. */
   task_routing_platform_id?: string | null;
-  /**
-   * The host sweep's quiet mark, ISO-8601 UTC: this session was found fully
-   * quiet and may be skipped until then. NULL means no mark — sweep it. Kept
-   * in central so the cache survives a host restart instead of the first tick
-   * after every boot sweeping every active session. Cleared by `updateSession`
-   * in the same statement that moves `last_active`. See migration 068.
-   */
+  /** The sweep may skip this session until then; NULL = sweep it. Cleared when `last_active` moves. */
   sweep_quiet_until?: string | null;
   created_at: string;
 }
@@ -324,12 +247,7 @@ export interface PendingApproval {
   options_json: string;
   /** When set, only this exact user may resolve the approval. */
   approver_user_id: string | null;
-  /**
-   * Adapter instance that delivered the card. Outbound dispatch is exact-key,
-   * so a later edit (expiry, late decision) must be addressed to the instance
-   * that owns the conversation. NULL on rows written before migration 066 and
-   * on single-instance installs — callers fall back to `channel_type`.
-   */
+  /** Dispatch is exact-key, so later edits must address this instance. NULL = fall back to `channel_type`. */
   instance: string | null;
 }
 

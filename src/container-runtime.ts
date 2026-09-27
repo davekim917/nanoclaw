@@ -1,7 +1,3 @@
-/**
- * Container runtime abstraction for NanoClaw.
- * All runtime-specific logic lives here so swapping runtimes means changing one file.
- */
 import { execFileSync, execSync, spawn, type ChildProcess } from 'child_process';
 import os from 'os';
 
@@ -16,7 +12,6 @@ import { log } from './log.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
-/** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
   // On Linux, host.docker.internal isn't built-in — add it explicitly
   if (os.platform() === 'linux') {
@@ -25,35 +20,25 @@ export function hostGatewayArgs(): string[] {
   return [];
 }
 
-/** Returns CLI args for a readonly bind mount. */
 export function readonlyMountArgs(hostPath: string, containerPath: string): string[] {
   return ['-v', `${hostPath}:${containerPath}:ro`];
 }
 
-/**
- * Refuse anything that is not a plain container name. The stop path below
- * interpolates the name into a shell command; the argv-form helpers do not,
- * but they share the check so a name the runtime would reject never reaches
- * a subprocess at all.
- */
+/** Plain container names only: the stop path interpolates the name into a shell command. */
 function assertContainerName(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
 }
 
-/** Stop a container by name after validating the name against shell metacharacters. */
 export function stopContainer(name: string): void {
   assertContainerName(name);
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
 }
 
 /**
- * SIGKILL a container by name — the fallback when `stopContainer` itself
- * failed. For a container this host SPAWNED the equivalent is killing the
- * `docker run` client; for one it ADOPTED there is no client to kill, only a
- * `docker wait` observer, and killing that would abandon the container rather
- * than stop it (plan §7.E, the one place a naive channel union is wrong).
+ * SIGKILL by name, the fallback when `stopContainer` failed. For an ADOPTED container there is no `docker run`
+ * client to kill, and killing its `docker wait` observer would abandon it rather than stop it.
  */
 export function killContainerHard(name: string): void {
   assertContainerName(name);
@@ -61,19 +46,10 @@ export function killContainerHard(name: string): void {
 }
 
 /**
- * Is a container of THIS install with exactly this name running right now?
- *
- * A listing, deliberately not `docker inspect`: after a crash every session
- * whose container exited during the outage still carries its `container_ref`
- * (`releaseSessionClaim` nulls it only on a tracked exit), and `inspect` on an
- * auto-removed container THROWS exactly as a dead daemon does. With `ps`, an
- * empty result is a successful proof of absence and a throw is "the runtime
- * could not be asked" — the two callers want opposite closed sides for that
- * throw, so it is left to them: the claim fence refuses the spawn, the adopted
- * waiter re-arms (plan §4.3.3, §4.3.4 P2).
- *
- * The `name=` filter is a substring match in the runtime; the exact-name check
- * is made here so the answer never depends on the runtime's regex anchoring.
+ * Is a container of THIS install with exactly this name running? A listing, not `docker inspect`: inspect on an
+ * auto-removed container throws exactly as a dead daemon does, while an empty listing proves absence. A throw means
+ * "could not ask", left to callers (the claim fence refuses, the adopted waiter re-arms). The `name=` filter is a
+ * substring match, so the exact-name check is made here.
  */
 export function runtimeShowsRunning(name: string): boolean {
   assertContainerName(name);
@@ -86,23 +62,15 @@ export function runtimeShowsRunning(name: string): boolean {
 }
 
 /**
- * The supervision channel for a container this host did not spawn: a
- * `docker wait <name>` child whose `close` is the container's terminal, so the
- * `.once('close', …)` shape the kill, shutdown and finalize paths already use
- * keeps working for an adopted entry (plan §4.3.3).
- *
- * Exit vocabulary the caller classifies: exit 0 with the container's exit code
- * on stdout means it exited; exit 1 with `No such container` on stderr means
- * it is already gone (terminal, never re-armed); exit 1 with `Cannot connect
- * to the Docker daemon` means the daemon went away, which is NOT a terminal —
- * the caller re-reads truth and re-arms.
+ * Supervision for a container this host did not spawn: a `docker wait <name>` child whose `close` is the container's
+ * terminal. Exit 0 prints the exit code; exit 1 with `No such container` is already gone (terminal); exit 1 with
+ * `Cannot connect to the Docker daemon` is NOT terminal: the caller re-reads truth and re-arms.
  */
 export function waitForContainerExit(name: string): ChildProcess {
   assertContainerName(name);
   return spawn(CONTAINER_RUNTIME_BIN, ['wait', name], { stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-/** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
   try {
     execSync(`${CONTAINER_RUNTIME_BIN} info`, {
@@ -126,13 +94,7 @@ export function ensureContainerRuntimeRunning(): void {
   }
 }
 
-/**
- * Kill orphaned NanoClaw containers from THIS install's previous runs.
- *
- * Scoped by label `nanoclaw-install=<slug>` so a crash-looping peer install
- * cannot reap our containers, and we cannot reap theirs. The label is
- * stamped onto every container at spawn time — see container-runner.ts.
- */
+/** Kill orphans of THIS install only (label `nanoclaw-install=<slug>`), so peer installs never reap each other. */
 export function cleanupOrphans(): void {
   try {
     const output = execSync(
@@ -173,14 +135,10 @@ function listInstallContainersStrict(): string[] {
   }
 }
 
-/** One install-labeled container as the boot inventory sees it. */
 export interface InstallContainerScope {
   name: string;
-  /** `nanoclaw-workgroup` label, or null when the container carries none. */
   workgroupId: string | null;
-  /** `nanoclaw-session` label, or null when the container carries none. */
   sessionId: string | null;
-  /** `nanoclaw-group` label, or null when the container carries none. */
   groupId: string | null;
 }
 
@@ -191,14 +149,9 @@ function labelOrNull(value: string | undefined): string | null {
 }
 
 /**
- * Every install-labeled container with the scope labels the boot quiescence
- * door needs (docs/specs/upstream-restart-survival-seam/plan.md §7.D).
- *
- * One `docker ps`, same install filter and same fail-closed contract as
- * `listInstallContainersStrict`: a listing failure is never read as "none
- * running". A container spawned before the scope labels shipped carries none
- * of them, so every field but `name` reads as null and the caller must treat
- * it as unknown scope (plan §3.5, divergence 7).
+ * Every install-labeled container with its scope labels, for the boot quiescence door. Fails closed like
+ * `listInstallContainersStrict`. A container older than the scope labels reads null in every field but `name`, which
+ * the caller must treat as unknown scope.
  */
 export function listInstallContainersWithScope(): InstallContainerScope[] {
   const format = [
@@ -232,13 +185,7 @@ export function listInstallContainersWithScope(): InstallContainerScope[] {
     .filter((entry) => entry.name !== '');
 }
 
-/**
- * Stop leftovers from this install and prove the install is quiescent.
- *
- * Unlike the legacy best-effort cleanup above, this is a hard precondition for
- * filesystem authority changes. Listing, stopping, and the post-stop listing
- * all fail closed.
- */
+/** Stop this install's leftovers and prove quiescence; a precondition for filesystem authority changes, fail-closed. */
 export function cleanupOrphansStrict(): string[] {
   const orphans = listInstallContainersStrict();
   for (const name of orphans) {

@@ -1,48 +1,23 @@
 /**
- * Scoped tool + credential env helpers (ported from v1).
- *
- * Container-runner reads a per-agent-group `tools` array from container.json.
- * Each entry is either bare (`snowflake`) or scoped (`snowflake:archive-one`).
- * Scoping gates which credentials the agent's mounts expose — e.g.
- * `snowflake:archive-one` stages a filtered `connections.toml` containing only
- * the `[connections.archive-one]` section and its referenced private keys.
- *
- * Fallback modes for `scopedEnvKey`:
- *   - 'bare':  unscoped → `${PREFIX}`,           scoped → `${PREFIX}_${SCOPE}`
- *   - 'group': unscoped → `${PREFIX}_${GROUP}`,  scoped → `${PREFIX}_${SCOPE}`
- *
- * GitHub uses 'bare' (no group-folder suffix when unscoped). Render / browser
- * auth use either pattern depending on whether the unscoped form should fall
- * back to a group-folder-keyed secret. Gcloud's multi-scope mapping and
- * Slack's user-defined-suffix pattern don't fit either shape and stay
- * open-coded at their call sites.
+ * Scoped tool and credential env helpers. A container.json `tools` entry is bare (`snowflake`) or scoped
+ * (`snowflake:archive-one`); a scope limits which credentials the agent's mounts expose. `scopedEnvKey` fallback
+ * modes: 'bare' (unscoped → `${PREFIX}`) or 'group' (unscoped → `${PREFIX}_${GROUP}`); scoped is always
+ * `${PREFIX}_${SCOPE}`.
  */
 import { log } from './log.js';
 
-/**
- * Safe scope pattern: alphanumeric + dashes + underscores only. Rejects
- * anything that could traverse out of the expected credential dir (path
- * separators, parent refs, shell metachars). Enforced inside
- * `extractToolScopes` — unsafe values are dropped with a warning.
- */
+/** Scopes name credential files, so anything that could traverse (separators, `..`, metachars) is dropped. */
 const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
 
-/**
- * Check whether a tool is enabled for a group, by bare name or by any scope.
- * Returns true when `tools` is undefined (no filter configured → all on)
- * so existing installs without a `tools` field keep working unchanged.
- */
+/** True when `tools` is undefined: no filter configured means every tool is on. */
 export function isToolEnabled(tools: string[] | undefined, name: string): boolean {
   if (!tools) return true;
   return tools.some((t) => t === name || t.startsWith(name + ':'));
 }
 
 /**
- * Pull scope values for a tool out of a `tools` array. A tools entry like
- * `gmail:example-labs` contributes the scope `example-labs`. Scopes failing
- * SAFE_SCOPE_RE are dropped (logged). `isScoped` is true when the caller
- * listed ONLY scoped forms (no bare entry) — i.e. the agent does not have
- * access to every scope.
+ * `gmail:example-labs` contributes the scope `example-labs`; unsafe scopes are dropped with a warning. `isScoped` is
+ * true when only scoped forms are listed, i.e. the agent lacks access to every scope.
  */
 export function extractToolScopes(
   tools: string[] | undefined,
@@ -96,14 +71,8 @@ export function normalizeScopedSecret(secrets: Record<string, string>, scopedKey
 }
 
 /**
- * Filter INI/TOML-style config sections. Splits on section headers (`[name]`)
- * and keeps only allowed ones. Used for AWS `~/.aws/{credentials,config}` and
- * Snowflake `connections.toml`.
- *
- * `headerTransform` lets AWS config strip the `profile ` prefix from
- * `[profile foo]` so `foo` can be matched against the allowlist.
- * `alwaysInclude` keeps structural sections like `[default]` that the CLI
- * needs even when the agent is scoped to specific profiles.
+ * Keep only allowed `[name]` sections of an INI/TOML config (AWS credentials/config, Snowflake connections.toml).
+ * `headerTransform` maps `[profile foo]` to `foo`; `alwaysInclude` keeps sections like `[default]` the CLI needs.
  */
 export function filterConfigSections(
   content: string,

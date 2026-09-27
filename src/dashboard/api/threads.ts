@@ -708,8 +708,8 @@ interface TaskAnchor {
 }
 
 /**
- * `task_thread_anchors.session_id` → the channel it most recently posted in (migration 048), which lets a task thread
- * live in its real channel. A task that never posted has no anchor and stays in the `system:tasks` bucket.
+ * `task_thread_anchors.session_id` → the channel it most recently posted in, so a task thread lives in its real
+ * channel. Without an anchor the routing stamp decides; only a task with neither stays in `system:tasks`.
  */
 async function readTaskThreadAnchors(sessionIds: string[]): Promise<Map<string, TaskAnchor>> {
   const bySession = new Map<string, TaskAnchor>();

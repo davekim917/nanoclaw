@@ -451,15 +451,10 @@ export async function upgradeSlackBotProfile(
 }
 
 /**
- * Inbound raw-id resolution: Slack wire text carries mentions as `<@U…>` (or `<@U…|label>`), and agents that read the
- * raw form echo it back. Resolving inbound means agents only ever see `@name`. Scoped to the workspace's known bots
- * and humans; unknown ids pass through (better opaque than a wrong name).
- */
-/**
- * Blanks out Slack code regions so mention detection only sees prose. A fence (3+ backticks) closes only at a run at
- * least as long as its opener (CommonMark's rule); an unterminated fence runs to the end. A 1-2 backtick span closes
- * at the next run of exactly the same length on the same line. Tildes are NOT fences: Slack has no `~~~` syntax, so a
- * tilde-wrapped mention still pings.
+ * Blanks out Slack code regions so mention detection only sees prose. A fence (3+ backticks) may open and close
+ * mid-line, as in Slack, and closes only at a run at least as long as its opener; an unterminated fence runs to the
+ * end. A 1-2 backtick span closes at the next run of exactly the same length on the same line. Tildes are NOT fences:
+ * Slack has no `~~~` syntax, so a tilde-wrapped mention still pings.
  */
 function stripSlackCodeRegions(text: string): string {
   let out = '';
@@ -539,6 +534,10 @@ export function slackMentionOutsideCode(text: string, identity: SlackBotIdentity
     .some((name) => lower.includes(`@${name.toLocaleLowerCase('en-US')}`));
 }
 
+/**
+ * Agents only ever see `@name`: they would echo the raw `<@U…>` form back. Unknown ids pass through (better opaque than
+ * a wrong name).
+ */
 export function resolveInboundSlackIds(text: string, channelType: string): string {
   // Chat SDK can pass either raw `<@U…>` or its flattened `@U…` form; both must be handled.
   if (!text.includes('<@') && !/@U[A-Z0-9_-]{2,}/u.test(text)) return text;

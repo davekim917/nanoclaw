@@ -1,20 +1,6 @@
 /**
- * Wait for host delivery result (container side).
- *
- * The host's delivery.ts writes to inbound.db's `delivered` table after
- * each outbound message send attempt. Rows appear as:
- *   status='delivered' → adapter.deliver returned; row has platform_message_id
- *   status='failed'    → adapter.deliver threw MAX_DELIVERY_ATTEMPTS times;
- *                        row has `error` with the last adapter error string
- *
- * send_file uses this to turn v2's default fire-and-forget writeMessageOut
- * into a synchronous-looking call: write the row, poll `delivered` until
- * a matching row appears or a timeout expires, surface the outcome to the
- * agent. Without this, upload errors (missing OAuth scope, file too large
- * for the channel, transient adapter failures past retry count) are
- * invisible to the agent.
- *
- * Read-only against inbound.db — no schema changes on the container side.
+ * Wait for the host's delivery verdict in inbound.db's `delivered` table, so send_file can surface upload
+ * failures instead of fire-and-forget.
  */
 import { readDeliveredRow, type DeliveredRow } from '../modules/mailbox/index.js';
 
@@ -28,13 +14,7 @@ const POLL_INTERVAL_MS = 300;
 
 function readRow(messageId: string): DeliveredRow | undefined {
   const row = readDeliveredRow(messageId);
-  // Host writes status='pending' to stop the delivery loop from
-  // re-dispatching a gate on every poll. From the container's
-  // perspective a pending row is "not yet resolved" — keep polling until
-  // the host upgrades it to 'delivered' (approved) or 'failed'
-  // (rejected/timeout). Without this filter, toAck() below would treat
-  // pending as failed (its catch-all branch) and deny the command before
-  // the human even saw the card.
+  // 'pending' is the host holding a gate: keep polling, or toAck() would treat it as failed before the human saw the card.
   if (row && row.status === 'pending') return undefined;
   return row;
 }
@@ -52,19 +32,12 @@ function toAck(row: DeliveredRow): DeliveryAck {
   };
 }
 
-/**
- * Poll the delivered table for a row matching `messageId`. Resolves with
- * the ack shape once the host records delivery, or `null` on timeout. On
- * timeout the file has been staged and the host may still deliver it —
- * callers should report "sent; delivery unconfirmed" rather than failure.
- */
+/** null on timeout: the host may still deliver, so callers report "sent; delivery unconfirmed", not failure. */
 export async function awaitDeliveryAck(
   messageId: string,
   timeoutMs: number,
 ): Promise<DeliveryAck | null> {
   const deadline = Date.now() + timeoutMs;
-  // Fast path: maybe the host delivered between writeMessageOut and the
-  // first poll (unlikely, but cheap to check).
   const first = readRow(messageId);
   if (first) return toAck(first);
 

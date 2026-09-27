@@ -434,7 +434,7 @@ rm -rf "$FLOOR_DIR"
 # smoke-pair-identity.sh `refreeze` snapshots the contract's lane generations
 # into coordinator/identity.json. A lane whose contract generation is not above
 # its snapshot still carries old-pair evidence, so it must not clear `lanes` or
-# `synthesis` even with an otherwise valid marker (issue #731, F3). The full
+# `synthesis` even with an otherwise valid marker (F3). The full
 # flow through the real verbs is smoke-pair-identity.test.sh section 5.
 RF="$FIXTURE_DIR/rf-run with spaces"
 RF_SHA="ffffffffffffffffffffffffffffffffffffffff"
@@ -567,7 +567,7 @@ echo "$RESULT" | jq -e '
 ' >/dev/null || {
   echo "expected a lane the snapshot never named, above its highest generation, not to be flagged as un-redispatched" >&2; echo "$RESULT" >&2; exit 1; }
 
-# --- pair identity, when the contract requires it (XZO #2092) ---------------
+# --- pair identity, when the contract requires it ---------------
 # Two campaigns synthesised GO and published BLOCKED on "pair identity not ok
 # (last check: none)" alone, because the only enforcement point was the
 # controller's verdict and this barrier reported ready with no identity record

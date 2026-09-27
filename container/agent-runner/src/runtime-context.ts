@@ -17,3 +17,11 @@ export function appendActiveRuntimeContext(instructions: string | undefined, run
   ].join('\n');
   return [instructions, activeRuntime].filter((part): part is string => Boolean(part)).join('\n\n');
 }
+
+export function activeRuntimeEffortUpdate(effort: string | null): string {
+  const value = effort === null ? 'not set' : JSON.stringify(effort);
+  return (
+    `<system>Active Runtime update: reasoning effort is now ${value} from this point on. ` +
+    'It replaces the effort in the Active Runtime block of your instructions; the provider and model there are unchanged.</system>'
+  );
+}

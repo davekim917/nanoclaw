@@ -15,25 +15,15 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-// Session provisioning goes through the registered mailbox; this standalone
-// entrypoint loads the composition slot itself.
+// Side-effect import: session provisioning needs the registered mailbox.
 import '../../src/mailbox/compose.js';
 import { DATA_DIR } from '../../src/config.js';
 import { initDb, closeDb, getRawDb } from '../../src/db/connection.js';
 import { getAgentGroupByFolder } from '../../src/db/agent-groups.js';
 import { getMessagingGroupByPlatform } from '../../src/db/messaging-groups.js';
 import { runMigrations } from '../../src/db/migrations/index.js';
-// PRE-EXISTING BREAK, repaired here: this named `insertTask`, which that
-// module has never exported (it is `insertTaskRow`). Phase 1e therefore
-// aborted at ESM instantiation before any task was migrated, independently of
-// the mailbox seam. Left unfixed, this file still would not instantiate.
 import { insertTaskRow } from '../../src/modules/scheduling/db.js';
 import { resolveSession } from '../../src/session-manager.js';
-// The mailbox module's path-addressed open funnel plus the layout helper.
-// `session-manager`'s ids-addressed `openInboundDb` went away with the seam's
-// raw surface, and the seam itself is not reachable here: this runs under
-// `tsx` from migrate-v2.sh, before any host boot, so `mailbox/compose.js` has
-// not registered an implementation.
 import { openInboundDb } from '../../src/modules/mailbox/openers.js';
 import { migrateMessagesInTable } from '../../src/modules/mailbox/schema.js';
 import { inboundDbPath } from '../../src/mailbox/sqlite/paths.js';
@@ -170,7 +160,6 @@ async function main(): Promise<void> {
       const { session } = await resolveSession(ag.id, mg.id, null, 'shared');
       const inboxDb = openInboundDb(inboundDbPath(ag.id, session.id));
       try {
-        // What the removed session-manager wrapper did on every open.
         migrateMessagesInTable(inboxDb);
         // Idempotence check
         const existing = inboxDb.prepare("SELECT id FROM messages_in WHERE id = ? AND kind = 'task'").get(t.id) as
@@ -183,8 +172,7 @@ async function main(): Promise<void> {
 
         insertTaskRow(inboxDb, {
           id: t.id,
-          // A migrated v1 task starts its own series, exactly as a freshly
-          // created one does (createScheduledTask, ncl tasks create).
+          // A migrated v1 task starts its own series, as a freshly created one does.
           seriesId: t.id,
           processAfter: scheduling.processAfter,
           recurrence: scheduling.recurrence,

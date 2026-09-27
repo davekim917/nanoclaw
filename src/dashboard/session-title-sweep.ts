@@ -213,8 +213,8 @@ export function postProcessTitle(raw: string): string {
 }
 
 /**
- * Up to `cap` sessions needing a title, gated purely on columns; the new-message threshold is checked per session in
- * `shouldGenerate`.
+ * Up to `cap` sessions needing a title, gated purely on columns; the new-message threshold is checked per session
+ * from the mailbox's `seq` in `shouldGenerate` (inbound.db size and mtime are unreliable proxies).
  */
 async function pickCandidates(cap: number): Promise<CandidateRow[]> {
   const cooldownIso = new Date(Date.now() - COOLDOWN_HOURS * 3600_000).toISOString();
@@ -490,8 +490,8 @@ function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
 }
 
 /**
- * Breaker/log-volume policy only, deliberately coarser than llm.ts's `classifyCredentialFailure`: by the time an
- * error reaches here every credential slot has already been tried, so any 429 means real backend distress.
+ * Breaker/log-volume policy only, deliberately coarser than llm.ts's `classifyCredentialFailure`: every 429 counts
+ * toward the breaker, whatever its cause.
  */
 function isTransientBackendFailure(err: unknown): boolean {
   const status = (err as { status?: number }).status;

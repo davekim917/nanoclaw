@@ -1,41 +1,18 @@
 /**
  * Quarantine every `<session>/.host/` this host did not create.
  *
- * WHY THIS EXISTS. `.host/` is the directory the host keeps `inbound.db` in,
- * overlaid read-only into the container. A container can nevertheless CREATE
- * it: under a mount set built before the directory existed, `/workspace` is
- * bind-mounted read-write and nothing is overlaid over a path that is not
- * there, so `mkdir` and a write inside it both succeed and land host-side
- * (verified in Docker against the production image). The next spawn's
- * migration would then find a host-owned file present, see the inodes diverge,
- * and re-link the legacy name onto the PLANTED inode — adopting the attacker's
- * database whole. The provenance gate (migration 079) refuses that at spawn;
- * this is the same question asked at the deploy boundary, so a planted
- * directory is removed rather than merely refused.
+ * `.host/` holds `inbound.db`, overlaid read-only into the container, but a container can CREATE
+ * it under a mount set built before it existed; the next spawn's migration would then adopt the
+ * planted database. Migration 079's provenance gate refuses that at spawn; this removes it at the
+ * deploy boundary.
  *
- * THE PREDICATE IS PROVENANCE, NOT AGE OR SHAPE, so this is safe to run on
- * EVERY deploy rather than once:
+ * THE PREDICATE IS PROVENANCE, NOT AGE OR SHAPE, so this is safe on every deploy: only a
+ * directory with no matching host record is quarantined. A missing `host_inbound_provenance`
+ * table reads as "no rows": migrations run at host startup, after this deploy-time step.
  *
- *  - Before this layout ships, no host binary has ever created `.host/`, and no
- *    provenance row exists, so everything found is container-created and every
- *    one is quarantined. Exactly right.
- *  - Afterwards the host records what it creates, so only a directory with no
- *    matching record is quarantined — which is precisely the planted case.
- *
- * A missing `host_inbound_provenance` table reads as "no rows", which is the
- * correct answer on this change's first deploy: migrations run at host startup
- * (`src/main.ts`), not from the deploy script, so at pre-restart time the table
- * legitimately does not exist yet.
- *
- * QUARANTINE NEVER LOSES DATA, which is what makes failing closed acceptable
- * here. `<session>/inbound.db` is a hard link to the same inode, so moving
- * `.host/` aside leaves the database reachable under the legacy name; the next
- * spawn migrates from it again and records fresh provenance. A directory
- * quarantined in error costs one re-migration, not a mailbox.
- *
- * Directories are MOVED, never deleted, to a location outside `v2-sessions/`
- * so no container mount can reach them again and an operator can still inspect
- * what was planted.
+ * QUARANTINE NEVER LOSES DATA, which is what makes failing closed acceptable: `inbound.db` is a
+ * hard link to the same inode, so the next spawn re-migrates. Directories are MOVED, never
+ * deleted, outside `v2-sessions/` where no container mount can reach them.
  *
  * Usage:
  *   pnpm exec tsx scripts/quarantine-planted-host-dirs.ts           # dry run
@@ -60,13 +37,7 @@ if (!fs.existsSync(sessionsRoot)) {
   process.exit(0);
 }
 
-/**
- * Is this `.host/` one the host recorded creating?
- *
- * Every failure answers "no": a missing table (this change's first deploy), an
- * unreadable database, a row that names a different file. Quarantine is
- * recoverable — see the header — so the unanswerable cases fail closed.
- */
+/** Every failure answers "no" (quarantine is recoverable, so unanswerable cases fail closed). */
 async function hostCreatedIt(agentGroupId: string, sessionId: string, hostDb: string): Promise<boolean> {
   const identity = fileIdentityOf(hostDb);
   if (!identity) return false;

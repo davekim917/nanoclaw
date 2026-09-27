@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Controller finding issues against a repo's real label set (#1107).
 
-XZO #2126 wedged its finish for an hour: an owner wrote `labels: ["P3"]`, the
+One campaign wedged its finish for an hour: an owner wrote `labels: ["P3"]`, the
 repo has no `P3` (its convention is `severity:p3`), GitHub refused the whole
 `gh issue create`, and the controller threw gh's stderr away -- so the
 decision said `effect: unknown` and the overdue alarm said nothing about why.
@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("controller", HERE / "smoke-campaign-controller.py")
 ctl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ctl)
-RUN = "xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
+RUN = "acme-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
 FAKES = HERE / "testdata" / "controller-live-fakes.py"
 
 
@@ -59,7 +59,7 @@ class FindingIssue(unittest.TestCase):
         journal = root / "journal"
         journal.mkdir()
         gh = "{} {} gh".format(sys.executable, FAKES)
-        self.fx = ctl.EffectLayer("live", {"repo": "org/xzo", "send_to": "x", "gate_cmd": "/unused",
+        self.fx = ctl.EffectLayer("live", {"repo": "acme/widget", "send_to": "x", "gate_cmd": "/unused",
                                        "enqueue_cmd": "/unused", "gh_cmd": gh, "ncl_cmd": "/unused"})
         c = ctl.Controller.__new__(ctl.Controller)
         c.journal = ctl.Journal.__new__(ctl.Journal)
@@ -251,7 +251,7 @@ class FindingIssue(unittest.TestCase):
         first = self.filed()[0]
         ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
         self.assertEqual((ob["detail"]["via"], ob["detail"]["url"]), ("write", first["html_url"]))
-        self.assertIn(["api", "repos/org/xzo/issues/{}".format(first["number"])],
+        self.assertIn(["api", "repos/acme/widget/issues/{}".format(first["number"])],
                       [c["argv"][:2] for c in self.calls(["api"])])
 
     def test_no_printed_url_falls_back_to_the_listing_and_never_reads_as_not_created(self):
@@ -284,19 +284,19 @@ class FindingIssue(unittest.TestCase):
         self.gh(labels=["smoke-finding", "severity:p3"])
         wrote = (0, "https://github.test/issues/100\n", "")
         (self.state / "gh.json").write_text(json.dumps({"comments": {}, "issues": [other], "prs": {}}))
-        self.assertIsNone(self.fx._created_issue("org/xzo", wrote, "<!-- smoke-ctl:abc -->"))
-        self.assertIsNone(self.fx._created_issue("org/xzo", (0, "created\n", ""), "<!-- smoke-ctl:abc -->"))
-        self.assertIsNone(self.fx._created_issue("org/xzo", (None, "", "timed out"), "<!-- smoke-ctl:abc -->"))
+        self.assertIsNone(self.fx._created_issue("acme/widget", wrote, "<!-- smoke-ctl:abc -->"))
+        self.assertIsNone(self.fx._created_issue("acme/widget", (0, "created\n", ""), "<!-- smoke-ctl:abc -->"))
+        self.assertIsNone(self.fx._created_issue("acme/widget", (None, "", "timed out"), "<!-- smoke-ctl:abc -->"))
 
     def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
         self.gh(labelListRaw='{"message": "Not Found"}')
-        self.assertIsNone(self.fx._labels_of("org/xzo"))
+        self.assertIsNone(self.fx._labels_of("acme/widget"))
         self.fx._repo_labels = {}
         self.gh(labels=["label-{}".format(k) for k in range(1000)])
-        self.assertIsNone(self.fx._labels_of("org/xzo"))
+        self.assertIsNone(self.fx._labels_of("acme/widget"))
         self.fx._repo_labels = {}
         self.gh(labels=["label-{}".format(k) for k in range(999)])
-        self.assertEqual(len(self.fx._labels_of("org/xzo")), 999)
+        self.assertEqual(len(self.fx._labels_of("acme/widget")), 999)
 
     def test_a_recovered_listing_still_puts_the_dropped_note_in_the_filed_body(self):
         # Fire 1: the listing fails, the owner's labels go out unchanged, the

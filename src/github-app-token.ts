@@ -4,24 +4,11 @@ import fs from 'fs';
 import { log } from './log.js';
 
 /**
- * Sentinel value for `GITHUB_TOKEN[_<FOLDER_UPPER>]` in `.env`: "this group
- * authenticates as the GitHub App, not with a static PAT". Anything else
- * passes through untouched, so PAT-based groups are unaffected.
- *
- * Installation tokens live ~1h and the container idle ceiling is 30 min, so a
- * token minted at spawn USUALLY outlives the container it is injected into.
- * That assumption broke on 2026-08-23: a container working past one hour
- * watched its token die mid-session. A running container's env is frozen at
- * spawn, so nothing here can fix that case once it happens — what this module
- * adds is (a) `refreshExpiringGitHubAppTokens`, called from the host sweep, so
- * any RESPAWN gets a freshly minted token instead of one near death, and (b)
- * TTL surfaced through the capabilities snapshot, so an agent can tell "my
- * container's copy expired" (restart fixes it) from "the credential is dead"
- * (a human must act).
+ * `GITHUB_TOKEN[_<FOLDER_UPPER>]` value meaning "authenticate as the GitHub App". Installation tokens live ~1h
+ * and a running container's env is frozen at spawn, so a long-lived container can outlive its token.
  */
 export const GITHUB_APP_SENTINEL = 'app:github';
 
-/** Re-mint this far ahead of the stated expiry. */
 const REFRESH_MARGIN_MS = 10 * 60 * 1000;
 /** A hung mint must not hang a container spawn. */
 const MINT_TIMEOUT_MS = 10_000;
@@ -31,24 +18,15 @@ interface CachedToken {
   expiresAtMs: number;
 }
 
-/**
- * In-process cache, keyed by installation id. Bounded by the number of
- * installations configured (one), so it is safe over a multi-day host run.
- */
 const tokenCache = new Map<string, CachedToken>();
 
-/** Test hook — the cache is process-global and would leak across cases. */
 export function clearGitHubAppTokenCache(): void {
   tokenCache.clear();
   refreshFailures.clear();
   mintsInFlight.clear();
 }
 
-/**
- * Expiry of the CACHED installation token, without minting or any network
- * IO. Used by the capabilities snapshot so agents can see how much life the
- * credential has; `undefined` means nothing cached yet (or PAT-based auth).
- */
+/** No network IO; `undefined` means nothing cached yet (or PAT-based auth). */
 export function peekGitHubAppTokenExpiry(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const installationId = env.GITHUB_APP_INSTALLATION_ID;
   if (!installationId) return undefined;
@@ -56,15 +34,10 @@ export function peekGitHubAppTokenExpiry(env: NodeJS.ProcessEnv = process.env): 
   return cached ? new Date(cached.expiresAtMs).toISOString() : undefined;
 }
 
-/**
- * App JWT, signed locally with the private key — the key never leaves the
- * host. Mirrors the standalone minting helper kept with the install's ops scripts.
- */
 function appJwt(appId: string, privateKey: string): string {
   const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
   const now = Math.floor(Date.now() / 1000);
-  // `iat` is backdated 60s: GitHub rejects a JWT whose iat is in the future,
-  // and small clock skew between this host and GitHub is enough to trip it.
+  // `iat` backdated 60s: GitHub rejects a future iat, and small clock skew trips it.
   const header = b64({ alg: 'RS256', typ: 'JWT' });
   const payload = b64({ iat: now - 60, exp: now + 540, iss: appId });
   const signer = crypto.createSign('RSA-SHA256');
@@ -73,19 +46,9 @@ function appJwt(appId: string, privateKey: string): string {
 }
 
 /**
- * Mint (or reuse) a GitHub App installation access token.
- *
- * FAIL-SAFE: returns `undefined` rather than throwing or returning the
- * sentinel, for every failure mode — missing config, unreadable key, network
- * error, GitHub 5xx, clock skew. The caller then omits `GITHUB_TOKEN`
- * entirely: `gh`/`git` report "not authenticated" (which is true and
- * debuggable) and the container keeps working on everything else. Injecting
- * the sentinel string would produce baffling 401s; substituting a different
- * identity's PAT would silently undo the migration and mis-attribute writes.
- *
- * Note the deliberate use of global `fetch` (no proxy dispatcher): the host
- * sets no global undici dispatcher, so this bypasses the OneCLI gateway. It
- * must — the gateway overrides `authorization`, which would clobber the JWT.
+ * Fail-safe: returns `undefined` on every failure, so the caller omits `GITHUB_TOKEN` (never the sentinel, which
+ * gives baffling 401s, nor another identity's PAT, which mis-attributes writes).
+ * Uses global `fetch` to bypass the OneCLI gateway, which would override `authorization` and clobber the JWT.
  */
 export async function resolveGitHubAppToken(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
   const resolved = await mintOrReuseGitHubAppToken(env);
@@ -97,10 +60,6 @@ export interface GitHubAppTokenInfo {
   expiresAtMs: number;
 }
 
-/**
- * Mint (or reuse) the installation token, returning its expiry alongside the
- * secret so callers can surface TTL to agents (capabilities snapshot).
- */
 export async function mintOrReuseGitHubAppToken(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<GitHubAppTokenInfo | undefined> {
@@ -121,18 +80,8 @@ export async function mintOrReuseGitHubAppToken(
     return { token: cached.token, expiresAtMs: cached.expiresAtMs };
   }
 
-  // Backoff: skip a FRESH mint attempt while the proactive sweep's own
-  // recent attempt for this installation is still in its 10-minute
-  // stand-down (review finding, 2026-09-03). An in-flight mint is always
-  // worth awaiting — dedup only saves a network call, it never skips a real
-  // attempt — so backoff only guards starting a NEW one. This applies to
-  // every caller of this shared mint path, not just the proactive sweep:
-  // during a real GitHub outage a spawn's own attempt would fail identically,
-  // and skipping it returns the FAIL-SAFE `undefined`/stale-cache result
-  // immediately instead of blocking the spawn for the full mint timeout. The
-  // narrow cost is a spawn landing in the few minutes GitHub recovers but
-  // before the next proactive tick clears the backoff — strictly better than
-  // the alternative of re-attempting a doomed mint on every call.
+  // Backoff guards only starting a new mint (an in-flight one is always awaited), so during an outage a spawn
+  // gets the fail-safe result at once instead of blocking for the full mint timeout.
   if (!mintsInFlight.has(installationId) && isGitHubAppMintBackedOff(installationId)) {
     if (cached && cached.expiresAtMs > Date.now()) {
       return { token: cached.token, expiresAtMs: cached.expiresAtMs };
@@ -140,14 +89,9 @@ export async function mintOrReuseGitHubAppToken(
     return undefined;
   }
 
-  // In-flight dedup: a sweep refresh and a spawn mint can race on the same
-  // installation. Sharing one promise means one network mint, and whichever
-  // caller started first wins the cache write — no stale-over-fresh overwrite.
   try {
     return await mintWithDedup(env, installationId);
   } catch (err) {
-    // A cached token inside the refresh margin but not yet expired still works
-    // — strictly better than nothing while GitHub is having a bad minute.
     if (cached && cached.expiresAtMs > Date.now()) {
       log.warn('GitHub App token mint failed — reusing unexpired cached token', {
         err,
@@ -160,38 +104,19 @@ export async function mintOrReuseGitHubAppToken(
   }
 }
 
-/**
- * Re-mint every cached installation token that is inside its refresh margin,
- * WITHOUT a live consumer asking. Called from the host sweep so the cache
- * usually holds a fresh-margined token for the next spawn.
- *
- * SCOPE HONESTY (review finding, 2026-08-25): this does NOT and cannot fix a
- * token dying inside an already-running container — that container's env was
- * frozen at its spawn and nothing re-reads the host cache. What it fixes is
- * the respawn path: a container respawning at any moment gets a token minted
- * seconds ago, not one already 55 minutes into a 60-minute life (the on-demand
- * path would re-mint anyway, but only by paying the mint latency inline; this
- * keeps spawns fast and failures pre-warmed). Failures are logged with a
- * per-installation backoff so a persistently broken config cannot warn-spam
- * every sweep tick forever. Returns the number of tokens re-minted.
- */
 const REFRESH_FAILURE_BACKOFF_MS = 10 * 60 * 1000;
 const refreshFailures = new Map<string, number>();
-/** Per-installation in-flight mint promises — dedupes concurrent spawn/refresh mints. */
 const mintsInFlight = new Map<string, Promise<CachedToken>>();
 
-/**
- * Is a fresh mint for this installation currently backed off after a recent
- * failure? The one definition of "backed off", shared by the proactive
- * sweep step below and the on-demand mint path in `mintOrReuseGitHubAppToken`
- * — exported so both cannot drift, and so a test (or a caller that just wants
- * to know without minting) can ask directly.
- */
 export function isGitHubAppMintBackedOff(installationId: string, now: number = Date.now()): boolean {
   const lastFail = refreshFailures.get(installationId);
   return lastFail !== undefined && now - lastFail < REFRESH_FAILURE_BACKOFF_MS;
 }
 
+/**
+ * Re-mints cached tokens inside their refresh margin, for the NEXT spawn: it cannot fix a token dying inside an
+ * already-running container. Returns the number re-minted.
+ */
 export async function refreshExpiringGitHubAppTokens(env: NodeJS.ProcessEnv = process.env): Promise<number> {
   if (tokenCache.size === 0) return 0;
   const now = Date.now();
@@ -199,13 +124,8 @@ export async function refreshExpiringGitHubAppTokens(env: NodeJS.ProcessEnv = pr
   for (const installationId of tokenCache.keys()) {
     const cached = tokenCache.get(installationId);
     if (!cached || cached.expiresAtMs - REFRESH_MARGIN_MS > now) continue;
-    // Backoff: a failed refresh leaves the old (still-unexpired) token in
-    // place; retrying every 60s tick adds nothing until GitHub or the config
-    // changes, so stand down for ten minutes after each failure.
     if (isGitHubAppMintBackedOff(installationId, now)) continue;
     try {
-      // Same deduped path as spawn-time mints — one network mint even when
-      // the sweep and a spawn race on the same installation.
       const fresh = await mintWithDedup(env, installationId);
       refreshFailures.delete(installationId);
       minted += 1;
@@ -222,7 +142,6 @@ export async function refreshExpiringGitHubAppTokens(env: NodeJS.ProcessEnv = pr
   return minted;
 }
 
-/** Single mint implementation — both the on-demand and proactive paths call this. */
 async function mintInstallationToken(env: NodeJS.ProcessEnv, installationId: string): Promise<CachedToken> {
   const privateKey = fs.readFileSync(env.GITHUB_APP_PRIVATE_KEY_PATH ?? '', 'utf-8');
   const res = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
@@ -244,11 +163,7 @@ async function mintInstallationToken(env: NodeJS.ProcessEnv, installationId: str
   return fresh;
 }
 
-/**
- * Mint with per-installation in-flight dedup. A sweep refresh and a spawn
- * mint racing on the same installation share one promise and one network
- * mint; whichever caller started first wins the cache write.
- */
+/** Racing sweep and spawn mints share one promise, so a stale result can't overwrite a fresh one. */
 function mintWithDedup(env: NodeJS.ProcessEnv, installationId: string): Promise<CachedToken> {
   const inflight = mintsInFlight.get(installationId);
   if (inflight) return inflight;

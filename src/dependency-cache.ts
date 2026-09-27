@@ -1,25 +1,12 @@
 /**
- * Host-side npm dependency cache: one sealed, read-only copy of `node_modules`
- * per lockfile per workgroup, hardlinked into each workspace (a "farm"). The
- * one file never shared is the hidden lockfile, which npm rewrites on every
- * run: each tree holds its own copy.
+ * Host-side npm dependency cache: one sealed, read-only `node_modules` per lockfile per workgroup, hardlinked into
+ * each workspace (a "farm"); only the hidden lockfile, which npm rewrites on every run, stays per-tree. Sole owner
+ * of verify/adopt/convert/link/seal/recovery (spec: docs/specs/repository-branch-clones/plan.md §5.7); the storage
+ * sweep only decides WHEN.
  *
- * Normative spec: docs/specs/repository-branch-clones/plan.md §5.7. This module
- * is the ONE owner of verify, adopt, convert, link, seal and recovery (§3
- * invariant table). The storage sweep decides WHEN (storage-manager.ts,
- * `collectTopicRegenerableActions`) and never re-derives any of it.
- *
- * Layout: `<cacheRoot>/<workgroup>/<key>/{node_modules/, SEALED}`. The cache
- * root is a sibling of `v2-topics` under the same data dir, so every link is on
- * one filesystem and one mount (`link(2)` returns EXDEV across mounts, §4.6).
- *
- * Trust: agents share the host uid, so read-only bits are proof against
- * accidents, not a security boundary (§5.7.6). Verified completeness and the
- * inventory check catch incomplete or modified trees, not deliberate tampering
- * before adoption (§10).
- *
- * Every operation takes a pass. A `report` pass decides and logs exactly what
- * an `apply` pass would do, and mutates nothing.
+ * The cache root must share a filesystem and mount with `v2-topics` (`link(2)` returns EXDEV across mounts).
+ * Agents share the host uid, so read-only bits guard against accidents, not tampering. A `report` pass mutates
+ * nothing.
  */
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
@@ -33,13 +20,8 @@ import { log } from './log.js';
 export const DEPENDENCY_CACHE_DIRNAME = 'dependency-cache';
 /** Convert/link build target. Only ever holds farm links, never private bytes. */
 export const FARM_NEW_NAME = '.node_modules.nanoclaw-new';
-/** Where a private tree waits while its private root dot entries move out. */
 export const FARM_OLD_NAME = '.node_modules.nanoclaw-old';
-/**
- * The two temp names a package dir can hold mid-operation. The regenerable
- * sweep must never descend into them (they hold private bytes mid-convert) and
- * hands every package dir holding one to `recoverPackageDir` first.
- */
+/** Never descended into by the regenerable sweep (they hold private bytes mid-convert). */
 export const DEPENDENCY_CACHE_TEMP_NAMES: readonly string[] = [FARM_NEW_NAME, FARM_OLD_NAME];
 
 export type DependencyCacheMode = 'off' | 'report' | 'apply';
@@ -56,26 +38,12 @@ const QUARANTINED_PATTERN = /^([0-9a-f]{64})\.quarantined-(\d+)$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ENTRY_GC_AGE_MS = 14 * DAY_MS;
 const QUARANTINE_GC_AGE_MS = 7 * DAY_MS;
-// GC ages entries in days, so `lastLinkedAt` needs no finer grain than this.
-// Rewriting SEALED (which carries the whole inventory) on every link of a busy
-// key would be pure write amplification.
+// Hourly is enough for day-granular GC; rewriting SEALED on every link would be write amplification.
 const LAST_LINKED_REFRESH_MS = 60 * 60 * 1000;
-/**
- * Adopts plus convert attempts per pass — every whole-tree content read takes
- * one of these slots, mismatch or not, so the cap bounds a pass's I/O as well
- * as its mutations. Each can mean reading and hardlinking a tree of 56k files
- * (§4.6) on the host that serves the fleet; the rest wait for the next hourly
- * pass. Recovery, verification and GC are not capped.
- */
+/** Adopts plus convert attempts per pass; each reads a whole tree, so this bounds a pass's I/O too. */
 export const DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS = 5;
 
-// ── Environment fingerprint ─────────────────────────────────────────────────
-
-/**
- * The platform every keyed install is for: the agent container's (§5.7.2).
- * The key names it, and verified completeness refuses a tree holding a package
- * built for any other (§5.7.3 rule 4), so an entry's contents match its key.
- */
+/** The agent container's platform; the key names it and completeness refuses trees built for another. */
 export interface InstallPlatform {
   readonly os: string;
   readonly cpu: string;
@@ -90,10 +58,8 @@ export function envFingerprint(nodeVersion: string, arch: string = INSTALL_PLATF
 }
 
 /**
- * The agent image's `NODE_VERSION` plus `linux` and `process.arch` (§5.7.2),
- * memoized per process on success. `null` when the image cannot be inspected
- * or declares no NODE_VERSION: callers then skip cache operations for the pass
- * rather than guess, and a failure is retried next pass.
+ * The agent image's NODE_VERSION plus linux/arch, memoized on success. `null` when uninspectable: callers skip the
+ * pass rather than guess.
  */
 export function agentImageFingerprint(image: string = CONTAINER_IMAGE): string | null {
   const memo = fingerprintByImage.get(image);
@@ -124,17 +90,9 @@ export function agentImageFingerprint(image: string = CONTAINER_IMAGE): string |
 }
 
 /**
- * Content-mismatch verdicts, by package dir, so a tree whose inventory matches
- * its entry but whose bytes do not is read once, not every hourly pass. A
- * verdict holds while the tree's inventory, its hidden lockfile's mtime (npm
- * rewrites that file on every run) and the entry's content manifest are all
- * unchanged. A stale verdict can only keep a tree private, never delete it.
- *
- * Module memory, not a file: the sweep runs in ONE persistent storage worker
- * that serves every pass (storage-maintenance-worker.ts owns one persistent
- * worker, reused by `ensureWorker`, one module-level instance), so this map
- * outlives passes. A host restart or worker
- * crash forgets it, which costs one capped re-read per tree.
+ * Content-mismatch verdicts by package dir, so a mismatching tree is read once, not every pass. Valid while the
+ * inventory, hidden-lockfile mtime and entry content manifest are unchanged; a stale verdict only keeps a tree
+ * private. Lives in the one persistent storage worker, so a restart costs one capped re-read per tree.
  */
 interface ConvertMismatchVerdict {
   inventorySha256: string;
@@ -144,7 +102,6 @@ interface ConvertMismatchVerdict {
 
 const convertMismatchMemo = new Map<string, ConvertMismatchVerdict>();
 
-/** Bounds the memo: a verdict for a package dir that no longer exists is dropped each pass. */
 function pruneConvertMismatchMemo(): void {
   for (const pkgDir of convertMismatchMemo.keys()) {
     if (!fs.existsSync(pkgDir)) convertMismatchMemo.delete(pkgDir);
@@ -168,8 +125,6 @@ export function _convertMismatchMemoSizeForTesting(): number {
   return convertMismatchMemo.size;
 }
 
-// ── Eligibility and key ─────────────────────────────────────────────────────
-
 type JsonObject = Record<string, unknown>;
 
 function isJsonObject(value: unknown): value is JsonObject {
@@ -185,11 +140,7 @@ function readJsonObject(file: string): JsonObject | null {
   }
 }
 
-/**
- * §5.7.1: `package.json` without a `workspaces` field, and a `package-lock.json`
- * with `lockfileVersion` >= 2. Everything else (pnpm, yarn, bun, npm
- * workspaces, lockfile-less) keeps the existing sweep rule untouched.
- */
+/** §5.7.1: npm lockfile v2+ and no `workspaces`; everything else keeps the existing sweep rule. */
 export function isEligiblePackageDir(pkgDir: string): boolean {
   const manifest = readJsonObject(path.join(pkgDir, 'package.json'));
   if (!manifest || Object.prototype.hasOwnProperty.call(manifest, 'workspaces')) return false;
@@ -208,12 +159,7 @@ function sha256(bytes: Buffer | string): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-/**
- * §5.7.2: sha256 over package-lock bytes, package.json bytes, the package dir's
- * `.npmrc` bytes (empty when absent) and the environment fingerprint. Each
- * input is length-framed so no two input tuples can hash alike. `null` when an
- * input cannot be read.
- */
+/** §5.7.2: length-framed sha256 of lockfile, package.json, `.npmrc` and fingerprint. `null` when unreadable. */
 export function dependencyKey(pkgDir: string, fingerprint: string): { key: string; inputs: KeyInputs } | null {
   let lock: Buffer;
   let manifest: Buffer;
@@ -250,8 +196,6 @@ export function dependencyKey(pkgDir: string, fingerprint: string): { key: strin
     },
   };
 }
-
-// ── Tree walk and inventory ─────────────────────────────────────────────────
 
 type InventoryItem = [relativePath: string, type: 'f' | 'l', size: number];
 
@@ -294,11 +238,7 @@ function lstatOrNull(target: string): fs.Stats | null {
   }
 }
 
-/**
- * Every regular file and symlink under `root`, sorted by relative path, with
- * private root dot entries skipped. Never follows a symlink. `null` when any
- * part of the tree cannot be read.
- */
+/** Regular files and symlinks sorted by path, private root dot entries skipped, symlinks never followed. */
 function walkTree(root: string): TreeWalk | null {
   const files: TreeFile[] = [];
   let unsupported: string | null = null;
@@ -356,12 +296,8 @@ function fileSha256(file: string): string {
 }
 
 /**
- * The content manifest's sha256: per inventory item, in inventory order, the
- * sha256 of a regular file's bytes (streamed in 1 MiB chunks) or of a
- * symlink's target, plus its exec bits. The inventory proves the same paths,
- * types and sizes; this proves the same content, which is what makes deleting
- * a private tree in favour of the entry lossless. Reads every byte, so only
- * adopt and convert compute it — never verify or GC. `null` when unreadable.
+ * sha256 over every file's bytes (or symlink target) and exec bits: proves the content equality that makes
+ * deleting a private tree lossless. Reads every byte, so only adopt and convert compute it.
  */
 function contentManifestSha256(root: string, walk: TreeWalk): string | null {
   const manifest = createHash('sha256');
@@ -390,8 +326,6 @@ function firstInventoryDifference(expected: InventoryItem[], actual: InventoryIt
   return NODE_MODULES;
 }
 
-// ── Verified completeness (§5.7.3, M4) ──────────────────────────────────────
-
 export type Completeness =
   | { complete: true; walk: TreeWalk; inventory: Inventory }
   | { complete: false; reason: string };
@@ -412,11 +346,7 @@ function isContainedPackageKey(key: string): boolean {
   );
 }
 
-/**
- * npm's os/cpu list match, as npm-install-checks 7.1.2 `checkList` decides it:
- * a `!value` naming the platform refuses; otherwise the list must name it,
- * hold only negations, or be exactly `any`.
- */
+/** npm-install-checks 7.1.2 `checkList`: `!value` refuses; else named, only negations, or exactly `any`. */
 function platformListAccepts(value: string, list: unknown): boolean {
   const entries = typeof list === 'string' ? [list] : list;
   if (!Array.isArray(entries)) return true;
@@ -450,30 +380,15 @@ function foreignPlatform(entry: JsonObject, platform: InstallPlatform): string |
 
 /**
  * A tree is complete when:
- *   (1) every hidden-lockfile package entry (the root excluded) is in
- *       package-lock.json with equal {version, resolved, integrity}, and every
- *       package-lock entry ABSENT from the hidden lockfile is `optional: true`;
- *   (2) every hidden-lockfile package path is a real directory whose
- *       package.json name and version match;
+ *   (1) every hidden-lockfile package entry (root excluded) matches package-lock.json {version, resolved,
+ *       integrity}, and every package-lock entry absent from the hidden lockfile is `optional: true`;
+ *   (2) every hidden-lockfile package path is a real directory whose package.json name and version match;
  *   (3) no regular file is newer than the hidden lockfile; and
- *   (4) every installed package that declares `os` or `cpu` accepts the
- *       install platform.
+ *   (4) every installed package that declares `os` or `cpu` accepts the install platform.
  *
- * (1) deliberately does not ask WHY an optional package is absent (skipped for
- * this platform, skipped with its dependent, or failed to install). Phase 1
- * never changes a workspace's file set: adopt shares the source tree's own
- * inodes, and convert requires inventory equality with the entry, so only
- * identical installs merge and no working tree is replaced by a degraded one.
- * Requiring the platform's own optional packages to be present belongs to
- * linking into a workspace that never installed (plan Phase 2).
- *
- * (4) keeps an entry true to its key, whose fingerprint names the platform: a
- * tree installed for another CPU passes (1)-(3), and the first report pass on
- * the host found arm64 trees under x64 keys. Only installed packages are
- * checked, and without --force npm never installs one whose os/cpu excludes the
- * platform it installs for (npm-install-checks), so a
- * genuine install is never refused. libc is not checked: real trees hold the
- * -gnu and -musl builds of a native package side by side.
+ * (1) does not ask why an optional package is absent: adopt and convert never change a workspace's file set.
+ * Linking into a fresh workspace needs `checkLinkCompleteness`. libc is not checked in (4): real trees hold -gnu
+ * and -musl builds side by side.
  */
 export function checkCompleteness(pkgDir: string, platform: InstallPlatform = INSTALL_PLATFORM): Completeness {
   const nm = path.join(pkgDir, NODE_MODULES);
@@ -530,8 +445,6 @@ export function checkCompleteness(pkgDir: string, platform: InstallPlatform = IN
   return { complete: true, walk, inventory: inventoryFromWalk(walk) };
 }
 
-// ── Seal and verify (§5.7.4, §5.7.6) ────────────────────────────────────────
-
 interface SealedRecord {
   version: 1;
   key: string;
@@ -547,7 +460,6 @@ interface SealedRecord {
   contentSha256: string;
 }
 
-/** What convert compares a private tree against. */
 interface EntryIdentity {
   inventory: InventoryItem[];
   inventorySha256: string;
@@ -580,11 +492,7 @@ function readSealed(entryDir: string): SealedRecord | null {
   return raw as unknown as SealedRecord;
 }
 
-/**
- * The precondition of every link, convert and GC decision. One walk checks:
- * no write bits on any regular file, no mtime later than `sealedAt`, and an
- * inventory equal to SEALED's. A failure names the first offending path.
- */
+/** Precondition of every link, convert and GC decision: no write bits, no mtime after sealedAt, same inventory. */
 export function verifyEntry(entryDir: string): VerifyResult {
   const fail = (offendingPath: string, reason: string): VerifyResult => ({ ok: false, offendingPath, reason });
   const sealed = readSealed(entryDir);
@@ -613,8 +521,6 @@ export function verifyEntry(entryDir: string): VerifyResult {
   }
   return { ok: true, sealed, allSingleLinked };
 }
-
-// ── Pass ────────────────────────────────────────────────────────────────────
 
 interface DependencyCacheCounters {
   recovered: number;
@@ -655,11 +561,7 @@ export interface DependencyCachePass {
   readonly cacheRoot: string;
   /** Pass clock for GC ages. Seals use the wall clock: they are compared with file mtimes. */
   readonly now: number;
-  /**
-   * The environment fingerprint, resolved on first use so a pass that only
-   * recovers or collects garbage never inspects the image. `null` means this
-   * pass cannot compute a key: adopt, convert and link are skipped.
-   */
+  /** Resolved lazily so recover/GC-only passes never inspect the image. `null`: skip adopt/convert/link. */
   readonly fingerprint: () => string | null;
   readonly fingerprintState: { resolved: boolean; value: string | null };
   readonly counters: DependencyCacheCounters;
@@ -779,11 +681,7 @@ function verifyFresh(pass: DependencyCachePass, entryDir: string): VerifyResult 
   return result;
 }
 
-/**
- * §5.7.6: rename to `<key>.quarantined-<ts>` with a WARN naming the first
- * offending path. A quarantined entry is never linked again; the next complete
- * private tree for the key re-adopts.
- */
+/** §5.7.6: rename aside with a WARN; never linked again, and the next complete private tree re-adopts. */
 function quarantineEntry(
   pass: DependencyCachePass,
   entryDir: string,
@@ -820,11 +718,7 @@ function quarantinedDirsFor(pass: DependencyCachePass, workgroupId: string, key:
   return names.filter((name) => name.startsWith(`${key}.quarantined-`)).map((name) => path.join(wgDir, name));
 }
 
-/**
- * A key with no entry is ordinary (a branch with its own lockfile, a cold
- * cache), so it logs at INFO. A key whose entry was quarantined is not (§5.7.6),
- * so that one WARNs.
- */
+/** No entry is ordinary (INFO); a quarantined entry is not (WARN). */
 function warnNoEntry(pass: DependencyCachePass, workgroupId: string, key: string, pkgDir: string): void {
   const quarantined = quarantinedDirsFor(pass, workgroupId, key).length > 0;
   const detail = { path: pkgDir, key, quarantined };
@@ -833,10 +727,8 @@ function warnNoEntry(pass: DependencyCachePass, workgroupId: string, key: string
 }
 
 /**
- * The file farm detection samples: the first regular file in the entry's
- * inventory other than the hidden lockfile, which every tree holds as its own
- * copy. With no readable SEALED (a quarantined entry can lack one), the first
- * such file a short walk finds.
+ * The first regular file in the entry's inventory other than the hidden lockfile (every tree holds its own copy
+ * of that); with no readable SEALED, the first such file a short walk finds.
  */
 function sampleSharedFile(entryDir: string, sealed: SealedRecord | null): string | null {
   const record = sealed ?? readSealed(entryDir);
@@ -870,10 +762,8 @@ function sharesEntryInodes(nodeModulesDir: string, entryDir: string, sealed: Sea
 }
 
 /**
- * True while a package dir holds a convert/link temp name. An operation is
- * pending there: `.node_modules.nanoclaw-old` can hold private bytes, and the
- * `node_modules` beside it can hold private entries already moved out of it.
- * The regenerable sweep never deletes that `node_modules`, in any flag mode.
+ * A pending convert/link temp name: `.old` can hold private bytes and `node_modules` beside it private entries
+ * already moved out, so the sweep never deletes that `node_modules`.
  */
 export function hasPendingConversion(pkgDir: string): boolean {
   return DEPENDENCY_CACHE_TEMP_NAMES.some((name) => lstatOrNull(path.join(pkgDir, name)) !== null);
@@ -890,12 +780,7 @@ function privateRootNames(dir: string): string[] {
   }
 }
 
-/**
- * Our own renames add and remove entries in the package dir, which moves its
- * mtime — and a checkout's mtime is part of the sweep's idle signal
- * (`worktreeContentMtimeMs` in storage-manager.ts). Put it back, so the cache
- * never reads as agent activity.
- */
+/** Restore the package dir's times: its mtime is part of the sweep's idle signal, and our renames move it. */
 function withPackageDirTimesPreserved<T>(pkgDir: string, fn: () => T): T {
   const before = lstatOrNull(pkgDir);
   try {
@@ -912,16 +797,9 @@ function withPackageDirTimesPreserved<T>(pkgDir: string, fn: () => T): T {
 }
 
 /**
- * `cp -al` semantics with one exception: recreate the directory structure,
- * hardlink every regular file, recreate every symlink as a symlink (never
- * followed), and skip private root dot entries. The root hidden lockfile is
- * COPIED instead (owner-writable, mtime preserved): npm rewrites it on every
- * run (@npmcli/arborist reify → shrinkwrap),
- * so a shared read-only inode would be unlinked by the next run and a shared
- * writable one would carry one workspace's edit into every other. `dst` must
- * not exist. On any failure the partial `dst` — links, that copy and our own
- * dirs only — is removed and the error rethrown, so EPERM or EXDEV leaves the
- * source exactly as it was.
+ * `cp -al` minus private root dot entries, symlinks recreated, never followed. The root hidden lockfile is COPIED
+ * (owner-writable, mtime kept): npm rewrites it every run, so a shared inode would be unlinked or leak one
+ * workspace's edit into all. `dst` must not exist; on failure the partial `dst` is removed and the source is untouched.
  */
 function linkTree(src: string, dst: string): void {
   fs.mkdirSync(dst);
@@ -989,11 +867,7 @@ function convertReclaimBytes(pass: DependencyCachePass, nodeModulesDir: string):
   return Math.max(0, pass.reclaimableBytes(nodeModulesDir) - privateBytes);
 }
 
-/**
- * Convert step 4, and recovery's completion of it: move each private root dot
- * entry from `.old` into `node_modules`, one rename each. A name already in
- * `node_modules` stops the move and keeps `.old`.
- */
+/** Move each private root dot entry from `.old` into `node_modules`; a name already there stops and keeps `.old`. */
 function movePrivateEntries(
   oldDir: string,
   nodeModulesDir: string,
@@ -1012,8 +886,6 @@ function movePrivateEntries(
   }
   return 'moved';
 }
-
-// ── Operations ──────────────────────────────────────────────────────────────
 
 export type PackageOutcome =
   | 'ineligible'
@@ -1039,16 +911,7 @@ export type LinkOutcome =
   | 'incomplete'
   | 'failed';
 
-// ── Strict completeness for link-at-checkout (§5.7.5, Phase 2) ──────────────
-
-/**
- * The platform a farm is linked for: the install platform plus its libc
- * family. The agent image is Debian bookworm (node:22-slim), glibc 2.36, x64:
- * verified 2026-09-11 in nanoclaw-agent-v2-2a38bd3e:latest with `ldd --version`
- * and `process.report` (glibcVersionRuntime 2.36, arch x64), with no musl loader
- * present. npm names that family `glibc` (npm-install-checks 7.1.2
- * `current-env`).
- */
+/** Install platform plus libc family; the agent image (node:22-slim, Debian) is glibc, npm's `glibc`. */
 export interface LinkPlatform extends InstallPlatform {
   readonly libc: string;
 }
@@ -1060,11 +923,7 @@ const MUSL_BUILD_NAME = /(^|[-/])(linux)?musl($|[-/])/;
 
 export type LinkCompleteness = { complete: true } | { complete: false; reason: string };
 
-/**
- * The package-lock key `from` reaches for `name`, by node resolution: the
- * nearest `node_modules/<name>` walking up from `from`'s own directory, which
- * is where npm installs it. `null` when the lockfile holds none.
- */
+/** Node resolution: the nearest `node_modules/<name>` walking up from `from`. `null` when the lockfile has none. */
 function resolveDependency(packages: JsonObject, from: string, name: string): string | null {
   let base = from;
   for (;;) {
@@ -1076,11 +935,7 @@ function resolveDependency(packages: JsonObject, from: string, name: string): st
   }
 }
 
-/**
- * The names an installed `entry` makes npm install: its dependencies, optional
- * dependencies and non-optional peers; for the root alone, its dev
- * dependencies too (a dependency's own devDependencies are never installed).
- */
+/** Dependencies, optional deps and non-optional peers; the root's devDependencies too (never a dependency's). */
 function requiredNames(key: string, entry: JsonObject): string[] {
   const names = new Set<string>();
   const addAll = (field: unknown): void => {
@@ -1106,34 +961,18 @@ function platformExcludes(entry: JsonObject, platform: LinkPlatform): boolean {
 }
 
 /**
- * Strict completeness: the precondition of LINKING an entry into a package dir
- * that never installed it (plan §5.7.5, Phase 2). `checkCompleteness` rule (1)
- * lets any optional package be absent, which is sound only while no operation
- * changes a workspace's file set. A link does: it must also refuse an entry
- * missing an optional package npm WOULD install on this platform, or a fresh
- * checkout gets a tree without its native binary (run.md "Phase 2 evidence"
- * class C: `@esbuild/linux-x64` absent from 14 real trees whose `esbuild` is
- * installed).
+ * Precondition of LINKING an entry into a package dir that never installed it (§5.7.5): unlike rule (1), refuses
+ * an entry missing an optional package npm WOULD install here, or a fresh checkout loses its native binary.
  *
  * An absent package-lock entry is excused when:
- *   (a) its lockfile `os`/`cpu` exclude this platform, or it declares a `libc`
- *       that excludes it. That is npm's own test (npm-install-checks 7.1.2;
- *       lists matched by `checkList`, which `platformListAccepts` mirrors).
- *   (b) it declares `os` or `cpu`, declares no `libc`, and is named as a musl
- *       build, while this platform is glibc. Lockfiles written before npm
- *       recorded `libc` omit it, and npm skips these builds after reading the
- *       package manifest's `libc` (run.md class B). The platform's own glibc
- *       build is a separate lockfile entry, judged on its own.
- *   (c) at least one entry requires it, and every one that does is itself
- *       absent and excused: a transitive dependency of a skipped optional
- *       (run.md class A). Requirers are found by node resolution from each
- *       requiring entry, not by name, and (c) is a least fixpoint, so a cycle
- *       of absent packages with no excused root excuses nothing.
- * Anything else absent refuses the link. So does an absent entry that is not
- * `optional`, which rule (1) already refuses at adopt.
+ *   (a) its lockfile `os`/`cpu`, or a declared `libc`, exclude this platform (npm-install-checks 7.1.2);
+ *   (b) it declares `os`/`cpu` but no `libc`, is named as a musl build, and this platform is glibc (older
+ *       lockfiles omit `libc`; npm skips these after reading the package manifest);
+ *   (c) every entry requiring it (by node resolution, at least one) is itself absent and excused. Least
+ *       fixpoint, so a cycle with no excused root excuses nothing.
+ * Anything else absent refuses the link, as does an absent non-`optional` entry.
  *
- * Reads `package-lock.json` from `pkgDir` (the key pins its bytes, so it equals
- * the entry source's) and the hidden lockfile from `nodeModulesDir`.
+ * Reads `package-lock.json` from `pkgDir` (the key pins its bytes) and the hidden lockfile from `nodeModulesDir`.
  */
 export function checkLinkCompleteness(
   pkgDir: string,
@@ -1231,10 +1070,8 @@ function preparePackage(
 }
 
 /**
- * True once the pass has used its adopt/convert slots: the tree is deferred,
- * left exactly as it is, and the existing sweep rule applies to it. A caller
- * that goes on to mutate takes its slot with `pass.mutations += 1`. A report
- * pass counts its decisions the same way, so it predicts apply.
+ * True once the pass has used its adopt/convert slots: the tree is left as is for the existing sweep rule. A
+ * mutating caller takes its slot with `pass.mutations += 1`; report passes count the same way to predict apply.
  */
 function deferIfCapped(pass: DependencyCachePass, pkg: PreparedPackage): boolean {
   if (pass.mutations < DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS) return false;
@@ -1247,13 +1084,9 @@ function deferIfCapped(pass: DependencyCachePass, pkg: PreparedPackage): boolean
 }
 
 /**
- * Adopt (§5.7.4): link the tree into `<key>.tmp/node_modules` (private dot
- * entries skipped, the hidden lockfile copied), `chmod a-w` every regular
- * file, write SEALED with the inventory and content manifest, rename to
- * `<key>`. The source keeps every byte and its own writable hidden lockfile;
- * its other files become the entry's inodes, so it is the entry's first farm.
- * A report pass records what it would seal, so a later tree with the same key
- * reports the convert it would get rather than a second adopt.
+ * Adopt (§5.7.4): link into `<key>.tmp/node_modules`, `chmod a-w`, write SEALED, rename to `<key>`. The source
+ * becomes the entry's first farm. A report pass records what it would seal, so later same-key trees report a
+ * convert, not a second adopt.
  */
 function adopt(
   pass: DependencyCachePass,
@@ -1357,13 +1190,9 @@ function convertMismatch(pass: DependencyCachePass, pkg: PreparedPackage, firstD
 }
 
 /**
- * Convert (§5.7.4, M3), after the entry was verified and the private tree
- * proven complete. Convert deletes the private bytes, so it requires the tree
- * to equal the entry in inventory AND content; anything else keeps it private.
- * Order is load-bearing: `.new` only ever holds farm links, and private bytes
- * move only after `.new` is in place, so every interruption point is finished
- * or reversed by `recoverPackageDir`. `sealed` is null only for a report
- * pass's would-be entry, which never reaches the mutating half.
+ * Convert (§5.7.4): deletes private bytes, so requires inventory AND content equality with the entry. Order is
+ * load-bearing: `.new` only ever holds farm links and private bytes move only after `.new` is in place, so
+ * `recoverPackageDir` can finish or reverse every interruption. `sealed` is null only for a report pass.
  */
 function convertVerified(
   pass: DependencyCachePass,
@@ -1385,8 +1214,7 @@ function convertVerified(
   };
   const known = convertMismatchMemo.get(pkg.pkgDir);
   if (known && sameVerdict(known, verdict)) {
-    // Failed the content check before, and nothing it depends on has changed:
-    // no read and no slot.
+    // Known mismatch, nothing changed: no read, no slot.
     pass.counters.convertMismatch += 1;
     decide(pass, 'convert-mismatch', pkg.pkgDir, {
       key: pkg.key,
@@ -1394,8 +1222,7 @@ function convertVerified(
     });
     return 'convert-mismatch';
   }
-  // The slot is taken before the read, so a mismatch uses one too and the cap
-  // bounds the pass's reads; a deferred tree costs no I/O.
+  // Slot taken before the read so the cap bounds reads.
   if (deferIfCapped(pass, pkg)) return 'deferred';
   pass.mutations += 1;
   pass.counters.contentReads += 1;
@@ -1449,11 +1276,7 @@ function convertVerified(
   return 'converted';
 }
 
-/**
- * Convert a complete private tree into a farm of its key's verified entry.
- * With no verified entry for the key this is a no-op with a WARN; adoption is
- * `processPackageDir`'s job.
- */
+/** No-op with a WARN when the key has no verified entry; adoption is `processPackageDir`'s job. */
 export function convertPackageDir(
   pass: DependencyCachePass,
   workgroupId: string,
@@ -1482,12 +1305,8 @@ export function convertPackageDir(
 }
 
 /**
- * The sweep's per-package decision: an eligible tree that is not already a
- * farm is converted when its key has a verified entry, and adopted when it has
- * none. A tree sharing inodes with a quarantined entry is left private (the
- * existing 2-day rule then applies to it); it is never re-sealed. In a report
- * pass, an entry the pass would have sealed counts as existing, so a cold
- * cache reports one adopt and a convert (with its bytes) for the rest.
+ * Convert when the key has a verified entry, adopt when none. A tree sharing inodes with a quarantined entry
+ * stays private and is never re-sealed. Report passes count a would-be entry as existing.
  */
 export function processPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): PackageOutcome {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
@@ -1534,10 +1353,7 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
   return adopt(pass, pkg, completeness);
 }
 
-/**
- * Link (§5.7.4): a package dir with no `node_modules` whose key has a verified
- * entry gets a farm, built as `.new` and renamed into place.
- */
+/** Link (§5.7.4): build `.new` from the verified entry and rename it into place. */
 export function linkPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): LinkOutcome {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
   if (typeof pkg === 'string') return pkg;
@@ -1590,10 +1406,7 @@ export function linkPackageDir(pass: DependencyCachePass, workgroupId: string, p
   return 'linked';
 }
 
-/**
- * True when `.new` is a complete farm of the key's verified entry — the only
- * case in which renaming it into place finishes an interrupted link.
- */
+/** The only case in which renaming `.new` into place finishes an interrupted link. */
 function newDirIsCompleteFarm(pass: DependencyCachePass, workgroupId: string, pkgDir: string): boolean {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
   if (typeof pkg === 'string' || !isRealDir(pkg.entryDir)) return false;
@@ -1677,11 +1490,7 @@ export function recoverPackageDir(pass: DependencyCachePass, workgroupId: string
   return outcome;
 }
 
-/**
- * Read-only: is this package dir a farm of its key's verified entry? For
- * decisions that must not mutate (mounted topics, a refused claim). Does not
- * quarantine; the same pass's GC does.
- */
+/** Read-only farm check for decisions that must not mutate; never quarantines (the pass's GC does). */
 export function isFarmPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): boolean {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
   if (typeof pkg === 'string' || !isRealDir(pkg.entryDir)) return false;
@@ -1701,11 +1510,8 @@ function deleteCacheDir(pass: DependencyCachePass, dir: string, detail: string):
 }
 
 /**
- * Cache GC (§5.7.7), in the same pass as the sweep. Every entry is verified
- * (this is the at-least-hourly verify of §5.7.6) and deleted once no farm
- * shares any of its files (every regular file has nlink 1) and it is 14 days
- * past max(sealedAt, lastLinkedAt). Quarantined entries go after 7 days, and a
- * leftover `<key>.tmp` from an interrupted adopt holds links only.
+ * Cache GC (§5.7.7), also the hourly verify. Deletes an entry no farm shares (every file nlink 1) 14 days past
+ * max(sealedAt, lastLinkedAt); quarantined after 7 days; a leftover `<key>.tmp` holds links only.
  */
 export function collectCacheGarbage(pass: DependencyCachePass): void {
   let workgroups: fs.Dirent[];

@@ -58,7 +58,7 @@ def rl_lane_snapshot:
 # Also true for a LATE freeze: `start` that found lane evidence already on
 # disk records `lateFreeze` and snapshots the lanes exactly as `refreeze`
 # does, because evidence gathered before any freeze is bound to no pair at all
-# (smoke-pair-identity.sh, LATE FREEZE; XZO #2092).
+# (smoke-pair-identity.sh, LATE FREEZE).
 def rl_refrozen:
   ((.history // []) | if type == "array" then length > 0 else true end)
   or ((.freezeGeneration // 1) != 1)

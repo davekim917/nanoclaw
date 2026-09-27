@@ -43,11 +43,6 @@ function generateId(): string {
 
 /**
  * Write a cli_request through the registered mailbox.
- *
- * The mailbox's writeMessageOut is the same statement this used to run by
- * hand: BEGIN IMMEDIATE before reading max(seq) across both files, so the
- * odd container-side sequence can never collide with a concurrent
- * agent-runner write.
  */
 export async function writeRequest(mailbox: AgentMailbox, req: RequestFrame): Promise<void> {
   await mailbox.run(() =>
@@ -66,11 +61,6 @@ export async function writeRequest(mailbox: AgentMailbox, req: RequestFrame): Pr
 
 /**
  * Poll the mailbox for a cli_response matching our requestId.
- *
- * findCliResponse opens a fresh read-only inbound handle with mmap_size=0 per
- * call — the cross-mount visibility rule this loop has always depended on.
- * Marking the row completed writes the processing_ack the agent-runner reads
- * to skip it.
  */
 export async function pollResponse(
   mailbox: AgentMailbox,

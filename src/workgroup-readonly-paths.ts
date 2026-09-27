@@ -1,21 +1,9 @@
 /**
- * Workgroup subpaths that containers may read but never write.
- *
- * The workgroup tree is bind-mounted read-write into every sibling container
- * (buildMounts, src/container-runner.ts). Anything the host itself executes
- * from inside that tree — a systemd unit's script, a host-gated task script —
- * is therefore editable by every agent in the workgroup. A subpath declared
- * here is bound read-only on top of every writable mount that exposes it, so
- * agents can still read and run it but only an operator on the host can
- * change it.
- *
- * Policy file: data/workgroup-readonly-paths.json
- *   { "version": 1, "workgroups": { "<workgroup id>": ["<relative subpath>", ...] } }
- *
- * No file means nothing is protected. A file that exists but does not parse
- * throws, like data/workgroup-read-access.json and data/plugin-scopes.json:
- * the spawn aborts rather than silently dropping a protection. A declared
- * subpath that does not exist yet is skipped.
+ * Workgroup subpaths containers may read but never write: the workgroup tree is mounted read-write into every
+ * sibling, so anything the host executes from it (unit scripts, host-gated task scripts) is otherwise agent-editable.
+ * Policy: data/workgroup-readonly-paths.json `{ "version": 1, "workgroups": { "<id>": ["<subpath>", ...] } }`. No
+ * file protects nothing; an unparseable file throws so the spawn aborts rather than dropping a protection; a
+ * declared subpath that does not exist yet is skipped.
  */
 import fs from 'fs';
 import path from 'path';
@@ -71,24 +59,15 @@ export function parseWorkgroupReadonlyPaths(contents: string): ReadonlyMap<strin
 }
 
 export interface WorkgroupReadonlyPaths {
-  /** Real host paths to bind read-only wherever a writable mount exposes them. */
   protectedPaths: string[];
-  /**
-   * Workgroup roots whose declarations could not be resolved safely. Nothing
-   * under them can be protected precisely, so every writable mount that
-   * reaches into one is made read-only instead. The failure stays inside that
-   * workgroup: other groups spawn as usual.
-   */
+  /** Workgroups whose declarations could not resolve safely: every writable mount reaching into one goes read-only. */
   lockedRoots: string[];
 }
 
 /**
- * Resolve every declared subpath across all workgroups: a mount of one
- * workgroup's tree into another group's container must not expose it writable
- * either. A missing subpath is skipped. Anything else that stops a subpath
- * resolving to itself (a permission error or symlink loop an agent can plant,
- * or a symlink on the way) locks that workgroup rather than throwing, which
- * would stop every spawn on the host.
+ * Resolve declared subpaths across ALL workgroups (another group's mount of this tree must not expose them either).
+ * Anything but a missing path that stops a subpath resolving to itself (permission error, loop, symlink on the way)
+ * locks that workgroup rather than throwing, which would stop every spawn on the host.
  */
 export function readWorkgroupReadonlyPaths(dataDir: string = DATA_DIR): WorkgroupReadonlyPaths {
   const policyPath = path.join(dataDir, POLICY_FILE);
@@ -124,9 +103,7 @@ export function readWorkgroupReadonlyPaths(dataDir: string = DATA_DIR): Workgrou
         lock('could not be resolved', { subpath, error: code ?? String(error) });
         break;
       }
-      // A symlink anywhere on the way is replaceable by whoever can write its
-      // parent, so a bind of its current target would protect a path the host
-      // may no longer be reading.
+      // A symlink on the way is replaceable by whoever can write its parent, so binding its target protects nothing.
       if (real !== path.join(realRoot, subpath)) {
         lock('traverses a symlink', { subpath, real });
         break;
@@ -139,12 +116,8 @@ export function readWorkgroupReadonlyPaths(dataDir: string = DATA_DIR): Workgrou
 }
 
 /**
- * The read-only bind protects names, not inodes. Once it is in place a
- * container cannot add another name for a file under it (link(2) across mount
- * points fails with EXDEV), but a hard link made while the path was still
- * writable survives, and so does a symlink pointing out of it; a write through
- * either changes what the host runs. They are reported, never removed: the
- * host cannot tell which name is the intended one.
+ * The read-only bind protects names, not inodes: a hard link made while the path was writable survives, as does a
+ * symlink pointing out of it. Such aliases are reported, never removed: the host cannot tell the intended name.
  */
 function reportAliases(root: string, workgroupId: string, subpath: string): void {
   const hardLinked: string[] = [];
@@ -196,17 +169,10 @@ function isInside(child: string, parent: string): boolean {
 }
 
 /**
- * Re-mount each protected path read-only wherever a writable mount exposes it.
- * A writable mount whose source sits at or under a protected path, or that
- * reaches into a locked workgroup, becomes read-only itself; one whose source
- * contains a protected path gains a nested read-only bind after it.
- *
- * A nested read-only bind is not enough on its own: from inside the container
- * the writable parent directory can be renamed away and the path recreated,
- * and the host then runs whatever is in the new directory. Every directory
- * between the writable mount and the protected path is therefore bound onto
- * itself, read-write, which makes it a mount point the container can neither
- * rename nor remove.
+ * Re-mount each protected path read-only wherever a writable mount exposes it: a mount at or under it (or into a
+ * locked workgroup) becomes read-only; one containing it gains a nested read-only bind. Every directory between
+ * the mount and the protected path is also bound onto itself, since a container could otherwise rename a writable
+ * parent away and recreate the path.
  */
 export function protectReadonlyHostPaths(
   mounts: VolumeMount[],
@@ -234,8 +200,7 @@ export function protectReadonlyHostPaths(
       for (let depth = 1; depth <= segments.length; depth++) {
         const hostPath = path.join(source, ...segments.slice(0, depth));
         const containerPath = path.posix.join(mount.containerPath, ...segments.slice(0, depth));
-        // An explicit mount already sits here and shadows everything below it;
-        // that mount is checked against the protected paths on its own.
+        // An explicit mount here shadows everything below; it is checked against the protected paths on its own.
         if (existing.has(containerPath)) break;
         nested.set(containerPath, {
           hostPath,

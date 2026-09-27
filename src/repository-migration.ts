@@ -149,11 +149,7 @@ export interface RepositoryMigrationManifest {
   repo: string;
   /** Null preserves a repository that never had a remote. */
   origin: string | null;
-  /**
-   * Historical-only repositories are imported and bundled under the
-   * migration evidence root, but are never published into the active
-   * canonical namespace or exposed as topic worktrees.
-   */
+  /** Imported and bundled as evidence only: never published as a canonical or exposed as topic worktrees. */
   archiveOnly: boolean;
   repositoryId: string;
   objectStores: string[];
@@ -374,8 +370,7 @@ function allocatedInventoryBytes(checkoutPath: string, files: FileInventoryEntry
     try {
       allocated += fs.lstatSync(path.join(checkoutPath, entry.path)).blocks * 512;
     } catch {
-      // captureCheckout's file hash is authoritative; a concurrent removal is
-      // caught by the final status/hash comparison under quiescence.
+      // captureCheckout's hash is authoritative; a concurrent removal fails the final comparison under quiescence.
     }
   }
   const blockSize = Number(fs.statfsSync(checkoutPath).bsize);
@@ -387,8 +382,7 @@ function allocatedInventoryBytes(checkoutPath: string, files: FileInventoryEntry
     for (let index = 1; index < parts.length; index += 1) directories.add(parts.slice(0, index).join('/'));
   }
   dense += directories.size * blockSize;
-  // Rescue blobs and checkout restoration can densify sparse files. Capacity
-  // therefore uses the larger of current allocated blocks and logical bytes.
+  // Rescue blobs and restoration can densify sparse files, so capacity takes the larger of blocks and bytes.
   return Math.max(allocated, dense);
 }
 
@@ -563,8 +557,7 @@ function resolveLegacyGitAdmin(
             owned.add(admin);
           }
         } catch {
-          // Ignore malformed unrelated admin entries; gitDirWorks validates a
-          // matching candidate below.
+          // Malformed unrelated admin entry; gitDirWorks validates a matching candidate below.
         }
       }
     }
@@ -577,8 +570,7 @@ function resolveLegacyGitAdmin(
   }
   const valid = [...attempts].filter((entry) => fs.existsSync(entry) && gitDirWorks(entry, candidate.checkoutPath));
   if (valid.length === 0) throw new Error(`no usable Git admin directory for ${candidate.checkoutPath}`);
-  // Exact existing pointers win. If collision recovery produces multiple
-  // candidates, refuse rather than attach the wrong index to ongoing work.
+  // Exact pointers win; several collision-recovery candidates refuse rather than attach the wrong index.
   const workgroupMarker = `/data/workgroups/${candidate.workgroupId}/`;
   const preferred = pointer?.replaceAll('\\', '/').startsWith('/workspace/workgroup/')
     ? valid.filter((entry) => entry.replaceAll('\\', '/').includes(workgroupMarker))
@@ -708,10 +700,8 @@ function inventoryFiles(
 }
 
 /**
- * Populate only the advisory content-hash cache while the legacy runtime is
- * still live. This deliberately does not capture or persist HEAD/index/status,
- * create refs, write a manifest, or publish any repository state. The offline
- * manifest capture still takes all of those snapshots afresh under quiescence.
+ * Fills only the advisory content-hash cache while the legacy runtime is live: no HEAD/index/status capture, refs,
+ * manifest or publication. The offline capture re-takes every snapshot under quiescence.
  */
 export function prestageLegacyCheckoutFileHashes(
   candidate: LegacyCheckoutCandidate,
@@ -1031,8 +1021,7 @@ function recoverMissingAdmin(
       try {
         git(['--git-dir', common, '--work-tree', checkoutPath, 'update-index', '--refresh'], { env });
       } catch {
-        // A non-zero refresh means at least one path differs. diff-files below
-        // is the authoritative exact comparison after the stat cache update.
+        // Non-zero means some path differs; diff-files below is the exact comparison.
       }
       try {
         git(['--git-dir', common, '--work-tree', checkoutPath, 'diff-files', '--quiet'], { env });
@@ -1513,9 +1502,7 @@ export function createReviewedExactGitAdminRecoveryProposal(input: {
 }
 
 function manifestHash(input: Omit<RepositoryMigrationManifest, 'manifestSha256'>): string {
-  // Rollback paths are as security- and loss-sensitive as captured source
-  // evidence. The manifest hash therefore binds the complete cutover plan;
-  // execution never appends operational paths after this hash is calculated.
+  // Binds the complete cutover plan, rollback paths included: execution never appends paths after this hash.
   return sha256(canonicalJson(input));
 }
 
@@ -1532,8 +1519,6 @@ function migrationRootForIdentity(input: {
   if (!SAFE_MIGRATION_RUN_ID.test(input.runId) || input.runId === '.' || input.runId === '..') {
     throw new Error(`invalid repository migration run id: ${input.runId}`);
   }
-  // canonicalRepoDir performs the shared strict workgroup/repository segment
-  // validation even for archive-only migrations.
   canonicalRepoDir(input.workgroupId, input.repo, input.dataDir);
   return path.join(input.dataDir, 'repository-migrations', input.runId, input.workgroupId, input.repo);
 }
@@ -1555,9 +1540,7 @@ function expectedRenamedObjectStores(
   const renamed: Record<string, string> = {};
   for (const store of objectStores) {
     if (protectedObjectStores.has(path.resolve(store))) continue;
-    // Legacy repository stores were rooted under a literal `.repos` segment.
-    // Their destination is derived only from the hash-bound source path, not
-    // from mutable filesystem state encountered midway through cutover.
+    // Legacy stores sit under a literal `.repos` segment; the destination derives only from the hash-bound path.
     if (!path.resolve(store).split(path.sep).includes('.repos')) continue;
     renamed[store] = path.join(root, 'renamed-object-stores', sha256(store).slice(0, 20));
   }
@@ -1872,10 +1855,8 @@ export function createRepositoryMigrationManifest(input: {
         'it cannot publish an active canonical',
     );
   }
-  // A standalone clone can live below another physical checkout of the same
-  // repository. Its source must be moved out before its ancestor is renamed;
-  // rollback then walks this hash-bound order in reverse and restores the
-  // ancestor before the nested checkout.
+  // A standalone clone can live below another checkout of the same repo: move it out before its ancestor is
+  // renamed; rollback walks this order in reverse.
   captures.splice(0, captures.length, ...orderCapturesDeepestFirst(captures));
   const missingAdminCaptures = captures.filter(
     (capture) => capture.recoveredMissingAdmin !== undefined && !capture.reviewedRecovery,
@@ -1971,17 +1952,10 @@ export function createRepositoryMigrationManifest(input: {
   const worktreeAdminBytes = selectedCaptures.reduce((sum, capture) => {
     const rawIndexBytes = capture.indexBytesBase64 ? Buffer.from(capture.indexBytesBase64, 'base64').length : 0;
     const auxiliaryBytes = capture.indexAuxiliaryFiles.reduce((fileSum, entry) => fileSum + entry.size, 0);
-    // Include room for the linked-worktree admin files, logs, and pointer in
-    // addition to the exact captured index allocation.
     return sum + rawIndexBytes + auxiliaryBytes + 64 * 1024;
   }, 0);
-  // Only status-visible content can introduce rescue blobs not already present
-  // in a captured object store. Staged blobs already live in that store, while
-  // unstaged/untracked bytes may exist in the source store, replacement
-  // canonical, and external bundle during overlap. Missing-admin visible-state
-  // seeds are included in objectStores above. Counting every clean tracked byte
-  // once per historical checkout produced a many-times-duplicated false upper
-  // bound for monorepos with hundreds of linked worktrees.
+  // Only status-visible content can add rescue blobs absent from a captured object store (staged blobs are already
+  // there; missing-admin seeds are counted in objectStores), so clean tracked bytes are not counted.
   const novelVisibleBytes = captures.reduce((sum, capture) => sum + allocatedChangedWorktreeBytes(capture), 0);
   const rescueObjectBytes = novelVisibleBytes * 3;
   const core = uniqueGitBytes * 2 + worktreeBytes + canonicalWorktreeBytes + worktreeAdminBytes + rescueObjectBytes;
@@ -2215,11 +2189,8 @@ function createSyntheticCommit(capture: CheckoutCapture, manifest: RepositoryMig
     const env = { ...objectEnv, GIT_INDEX_FILE: tempIndex };
     git(['--git-dir', rescueGitDir, 'read-tree', '--empty'], { env });
 
-    // Construct the worktree tree directly from the verified byte inventory.
-    // `git add` is forbidden here: repository-defined filters, autocrlf, or
-    // fsmonitor commands could both execute host code and change the bytes
-    // represented by the rescue commit. Preserve gitlinks from the raw index;
-    // regular files and symlinks are hashed with --no-filters.
+    // Build the tree from the verified byte inventory, never `git add`: repository filters, autocrlf or fsmonitor
+    // could execute host code and change the rescued bytes. Gitlinks come from the raw index; files use --no-filters.
     const entries: Buffer[] = [];
     const inventoryPaths = new Set(capture.files.map((entry) => entry.path));
     for (const record of Buffer.from(capture.indexEntriesZBase64, 'base64').toString('utf8').split('\0')) {
@@ -2410,10 +2381,8 @@ function restoreCheckout(canonical: string, capture: CheckoutCapture, migrationD
     if (gitBranchCheckedOut(canonical, capture.assignedBranch)) {
       throw new Error(`original branch is already checked out during restore: ${capture.assignedBranch}`);
     }
-    // Imported legacy refs are intentionally namespaced. Materialize the
-    // original user branch only when branch assignment proved it is uniquely
-    // claimed, preserving existing PR continuity without letting the host
-    // canonical itself own that branch.
+    // Imported legacy refs stay namespaced; materialize the user branch only when assignment proved it unique, so
+    // the host canonical never owns it.
     git(['-C', canonical, 'update-ref', `refs/heads/${capture.assignedBranch}`, capture.head]);
     git(['-C', canonical, 'worktree', 'add', '--no-checkout', capture.destinationPath, capture.assignedBranch]);
   } else {
@@ -2472,8 +2441,7 @@ function restoreCheckout(canonical: string, capture: CheckoutCapture, migrationD
   } else {
     fs.rmSync(path.join(destinationGitDir, 'index'), { force: true });
   }
-  // Ensure HEAD stays at the original commit even when an existing branch ref
-  // had moved after the manifest was captured.
+  // Pin HEAD to the original commit even if an existing branch ref moved after capture.
   if (capture.head) git(['--git-dir', destinationGitDir, 'update-ref', 'HEAD', capture.head]);
 }
 
@@ -2763,9 +2731,7 @@ async function executeRepositoryMigrationLocked(
     refreshQuiescent?: () => Promise<void> | void;
   },
 ): Promise<RepositoryMigrationManifest> {
-  // The outer preflight avoids taking the lock for an already-busy repo. This
-  // second proof is load-bearing: it closes the writer race under the exact
-  // lock immediately before the first durable migration mutation.
+  // Load-bearing second proof: closes the writer race under the lock right before the first durable mutation.
   await options.assertQuiescent();
   verifyRepositoryMigrationManifest(manifest);
   validateManifestRecoverySeeds(manifest);
@@ -2801,9 +2767,7 @@ async function executeRepositoryMigrationLocked(
           throw new Error(`canonical destination is not owned by this migration: ${canonical}`);
         }
       } else {
-        // A crash while cloning can leave only this run-specific staging path.
-        // It has never been agent-visible, so rebuilding it from the retained
-        // source topology is safer than trying to resume a partial clone.
+        // A crash mid-clone leaves only this never-agent-visible staging path; rebuild rather than resume it.
         if (fs.existsSync(temp)) fs.rmSync(temp, { recursive: true, force: true });
         fs.mkdirSync(path.dirname(canonical), { recursive: true, mode: 0o700 });
         if (manifest.objectStores.length === 0) throw new Error('manifest has no canonical object source');
@@ -2811,9 +2775,7 @@ async function executeRepositoryMigrationLocked(
         git(['-C', temp, 'init', '-q', `--object-format=${manifest.canonicalBase.objectFormat}`]);
         writeMigrationOwner(temp, manifest);
         if (manifest.origin !== null) git(['-C', temp, 'remote', 'add', 'origin', manifest.origin]);
-        // Scan-policy repos (today: the wiki canonical repo) point at the
-        // ONE host-managed, read-only-mounted hook directory instead of
-        // /dev/null — see managed-git-hooks.ts's header.
+        // Scan-policy repos use the one host-managed read-only hook directory instead of /dev/null.
         git([
           '-C',
           temp,
@@ -2931,9 +2893,8 @@ async function executeRepositoryMigrationLocked(
     return manifest;
   } catch (error) {
     const proveCurrentTopologyQuiescent = options.refreshQuiescent ?? options.assertQuiescent;
-    // A failure can leave newly created migration inodes that were absent from
-    // the pre-mutation proof. Refresh and prove them quiet before rollback;
-    // otherwise preserve the journaled topology for controlled recovery.
+    // A failure can leave migration inodes the pre-mutation proof never saw: prove them quiet before rollback,
+    // else preserve the journaled topology for controlled recovery.
     await proveCurrentTopologyQuiescent();
     await rollbackRepositoryMigration(manifest);
     await proveCurrentTopologyQuiescent();
@@ -2983,9 +2944,8 @@ export async function rollbackRepositoryMigration(manifest: RepositoryMigrationM
     (hasMigrationOwner(canonical, manifest) ||
       (journal?.phases.includes('canonical-published') === true && canonicalMatchesManifest(canonical, manifest)));
   if (canonicalOwned) {
-    // Remove migration-owned replacements before restoring in-place legacy
-    // paths. Otherwise an occupied checkoutPath causes restore to skip, then
-    // removal strands the original under renamed-old.
+    // Remove migration-owned replacements first, or an occupied checkoutPath skips the restore and removal
+    // strands the original under renamed-old.
     for (const capture of deduplicateCaptures(manifest.captures)) {
       if (!capture.destinationPath || !fs.existsSync(capture.destinationPath)) continue;
       try {
@@ -2995,8 +2955,7 @@ export async function rollbackRepositoryMigration(manifest: RepositoryMigrationM
       }
     }
   }
-  // Restore source paths only after replacement worktrees are gone. Existing
-  // ambiguous paths are never overwritten.
+  // Restore sources only after replacements are gone; ambiguous paths are never overwritten.
   for (const capture of [...manifest.captures].reverse()) {
     if (capture.renamedOldPath && fs.existsSync(capture.renamedOldPath) && !fs.existsSync(capture.checkoutPath)) {
       fs.renameSync(capture.renamedOldPath, capture.checkoutPath);
