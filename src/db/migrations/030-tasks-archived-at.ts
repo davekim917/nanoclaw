@@ -2,21 +2,9 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Operator-side archive flag for terminal tasks. NULL = visible on the
- * board; ISO timestamp = hidden by default, recoverable via the dashboard's
- * "Show archived" toggle.
- *
- *   - Completed tasks auto-archive after 24h via the host sweep loop
- *     (`src/host-sweep.ts:sweep`).
- *   - Failed tasks never auto-archive — operator must explicitly dismiss
- *     them via `POST /dashboard/api/tasks/:id/archive`.
- *   - Bulk dismiss for "I've addressed all failures" lives at
- *     `POST /dashboard/api/tasks/bulk-archive`.
- *
- * Partial index on `archived_at IS NOT NULL` keeps the default-view query
- * cheap (predicate is highly selective once the auto-archive sweep starts
- * running) while leaving the common `WHERE archived_at IS NULL` path free
- * to use existing per-status indexes.
+ * Operator-side archive flag for terminal tasks: NULL is visible, a timestamp hides it by default. Completed tasks
+ * auto-archive after 24h in the host sweep; failed ones only by explicit dismissal. The partial index keeps the
+ * default view cheap without disturbing the per-status indexes.
  */
 export const migration030: Migration = {
   version: 30,

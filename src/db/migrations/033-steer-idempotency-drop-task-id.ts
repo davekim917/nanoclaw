@@ -2,20 +2,8 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Finishes the generalization started in 031.
- *
- *   - 031 added `target_type` + `target_id` and backfilled them from
- *     `task_id`. Code kept writing task_id for the dual-write window so
- *     migration 031 wouldn't break the running app.
- *   - 033 (this migration) closes that window: enforces NOT NULL on the new
- *     columns and drops `task_id`. The C5 code change lands in the same
- *     commit, so the column is unused by the time this migration runs on
- *     deploy.
- *
- * SQLite 3.35 supports `ALTER TABLE DROP COLUMN`, but only for plain columns —
- * the original `task_id` was `NOT NULL` and is not part of any index, so it
- * qualifies. The `target_*` NOT NULL constraints need a table rebuild because
- * ALTER TABLE can't tighten nullability in place.
+ * Finishes 031: NOT NULL on `target_*` (a table rebuild, since ALTER TABLE cannot tighten nullability) and drops
+ * `task_id`.
  */
 export const migration033: Migration = {
   version: 33,

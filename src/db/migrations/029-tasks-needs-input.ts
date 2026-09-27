@@ -2,17 +2,8 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Adds explicit needs-input state to the tasks table.
- *
- *   needs_input     — 1 when the spawned worker has stopped to ask the
- *                     operator something and is idle waiting for steer.
- *                     0 by default. Auto-cleared on next steer write.
- *   steer_question  — optional free-text question the worker passed when
- *                     it called spawn_request_steer.
- *
- * Designed for the dashboard's "Needs you" attention group: without this,
- * an idle-waiting worker is indistinguishable from a worker actively
- * chewing on Phase 2.
+ * `needs_input` is 1 while a spawned worker waits on the operator (auto-cleared on the next steer write);
+ * `steer_question` is the question it passed to spawn_request_steer.
  */
 export const migration029: Migration = {
   version: 29,

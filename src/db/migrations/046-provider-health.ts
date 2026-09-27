@@ -1,8 +1,6 @@
 /**
- * Per-agent-group provider availability, so a spawn can route around a
- * provider whose account is exhausted instead of waking a container that can
- * only fail. Mirrors the shape already proven by `memory_curation_credentials`
- * (cooldown window + failure streak + last error class).
+ * Per-agent-group provider availability, so a spawn can route around an exhausted account instead of waking a
+ * container that can only fail.
  */
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';

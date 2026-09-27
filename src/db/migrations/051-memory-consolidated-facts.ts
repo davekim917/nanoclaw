@@ -5,37 +5,13 @@ import type { Migration } from './index.js';
 import { DATA_DIR } from '../../config.js';
 
 /**
- * Migration 051 — memory_consolidated_facts
- *
- * Pillar-2 semantic consolidation (docs/specs/workgroup-cerebro/plan.md
- * §P2.4) tracks which episodic-ledger facts have already been folded into a
- * curator-maintained topic file with an order-independent membership set
- * rather than a `captured=`-stamp cursor — a late-arriving or
- * equal-timestamped episode can otherwise land at or behind a cursor and be
- * skipped forever. The "tail" a pass consolidates is every ledger fact whose
- * marker id is absent from this table for its workgroup.
- *
- * Backfill: every workgroup whose ledger already holds at least one fact is
- * enqueued for maintenance one time, so existing stores are not stuck
- * waiting for 50 NEW updates before their first consolidation pass. The
- * fleet-wide claim/lease serialization (one maintenance job claimed per host
- * sweep tick) plus the 150-fact-per-pass cap mean this enqueue does not
- * storm — it bounds to one pass per sweep round per workgroup.
- *
- * DELIBERATELY SELF-CONTAINED. A migration is frozen logic: once it has
- * shipped, its behavior must never move underneath it just because an
- * application module it happened to import changed shape later. This one
- * used to call into message-archive.ts and modules/memory/curator-*.ts for
- * the ledger read and the maintenance-pending upsert; migrations/index.ts is
- * loaded by every DB-touching test, so that pulled curator-contract.ts's
- * `../../secret-scrubber.js` import — and its `setLogScrubber(scrubSecrets)`
- * module-load side effect — into the import graph of tests that partial-mock
- * `log.js` and never expected it, breaking them at collection. The ledger
- * read below (path join + a marker substring check) and the
- * `memory_curation_state` upsert below are therefore hand-duplicated from
- * `workgroupMemoryDir`/`readGeneratedMemory` and
- * `enqueueMemoryMaintenanceBacklog` respectively — on purpose. Do not
- * "simplify" this back to an application import.
+ * Which episodic-ledger facts are already folded into a topic file, as an order-independent membership set rather
+ * than a timestamp cursor (a late or equal-timestamped fact could land behind a cursor and be skipped forever). The
+ * backfill enqueues maintenance once per workgroup that already has facts; one claimed job per sweep tick keeps it
+ * from storming.
+ * DELIBERATELY SELF-CONTAINED: a migration is frozen logic, and migrations/index.ts is loaded by every DB test, so
+ * importing application modules dragged module-load side effects into unrelated tests. The ledger read and the
+ * `memory_curation_state` upsert are hand-duplicated on purpose; do not "simplify" them back to imports.
  */
 
 const MEMORY_MARKER_PREFIX = '<!-- nanoclaw-memory:id=';
@@ -55,10 +31,8 @@ function ledgerIsNonEmpty(workgroupId: string): boolean {
 function enqueueMaintenanceBacklog(workgroupId: string): void {
   const archiveDb = new Database(path.join(DATA_DIR, 'archive.db'));
   try {
-    // Mirrors only the one table this backfill touches — archive.db's full
-    // self-bootstrapping schema lives in message-archive.ts and is not
-    // duplicated here; CREATE TABLE IF NOT EXISTS makes this safe whether
-    // that schema has already run on this file or not.
+    // Mirrors only the one table this backfill touches; IF NOT EXISTS is safe whether or not archive.db's own schema
+    // has run.
     archiveDb.exec(`
       CREATE TABLE IF NOT EXISTS memory_curation_state (
         workgroup_id                       TEXT PRIMARY KEY,

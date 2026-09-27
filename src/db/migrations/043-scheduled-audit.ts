@@ -2,48 +2,13 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Migration 043 — scheduled_audit
- *
- * Central-DB (`data/v2.db`) provenance table for the Scheduled Tasks Board.
- * `cancelTask` marks rows `completed` (C1 forbids new status values), so
- * board-cancellation is indistinguishable from a natural completion in the
- * session DBs alone. Distinguishability — and the move/edit/pause/resume/
- * run_now audit trail the drawer renders — comes from THIS table, not a
- * content stamp. See docs/specs/scheduled-tasks-board/design.md §4.3, §4.4.
- *
- * Central-DB only: this migration never touches a session `inbound.db`
- * (C1/C3 — the firing path is untouched).
- *
- * Columns (design §4.4):
- *   ts                 — server timestamp; defaults to datetime('now').
- *   actor              — the user_id that performed the action.
- *   action             — edit|pause|resume|run_now|cancel|move|move_intent|
- *                        move_restore_failed. No CHECK constraint — values are
- *                        enforced in the app layer so the enum can widen without
- *                        a migration.
- *   agent_group_id/    — locate the affected series. Move rows are written one
- *   session_id/          per side (source + target groups), sharing a
- *   series_id            correlation_id so each side's audit tail is complete
- *                        without a cross-scope read.
- *   before_hash/        — sha256 of the prompt body before/after an edit
- *   after_hash           (createHash precedent, steer.ts). Scripts are
- *                        hash-only — never stored verbatim.
- *   before_preview/     — first 512 chars of the prompt body before/after.
- *   after_preview        Scripts are NOT previewed (hash-only).
- *   before_len/         — body lengths, for at-a-glance diff size.
- *   after_len
- *   detail_json         — non-body structured detail: cron change, move
- *                        source→target, secret-delta COUNTS + hashes only
- *                        (names are never persisted — that would re-open the
- *                        enumeration hole §4.5 closes). move_intent rows carry
- *                        the FULL source-row snapshot here, purged on resolve.
- *   correlation_id      — links the two sides of a move; prune-exempt.
- *   resolved_at         — move_intent / move_restore_failed rows: stamped on
- *                        success by the execute handler or the sweep recovery
- *                        hook; the detail_json body is purged at the same time.
- *
- * Indexes: series (drawer tail by series), correlation (move two-sided join),
- * unresolved (sweep recovery scan: WHERE action=? AND resolved_at IS NULL).
+ * Provenance for the Scheduled Tasks Board. `cancelTask` marks rows `completed`, so a board cancellation is
+ * indistinguishable from a natural completion in the session DBs; this table is what tells them apart and carries the
+ * audit trail. Central DB only, never a session inbound.db.
+ * `action` has no CHECK: the enum is enforced in the app so it can widen without a migration. Move rows are written
+ * once per side, sharing a `correlation_id`. Prompt bodies are hashed and previewed (512 chars); scripts are
+ * hash-only. `detail_json` never holds secret names, only counts and hashes; a move_intent row carries the full
+ * source-row snapshot there until it resolves, when it is purged and `resolved_at` stamped.
  */
 export const migration043: Migration = {
   version: 43,

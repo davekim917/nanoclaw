@@ -81,14 +81,7 @@ export function runMnemonIngestMigrations(db: Database.Database): void {
 
   if (!applied.has('mnemon-ingest-counters-v2')) {
     db.transaction(() => {
-      // Per-pair / per-source instrumentation columns. The chat-pair filter
-      // (classifier.ts) and source-ingest filter (source-ingest.ts) both
-      // gate at importance >= MIN_FACT_IMPORTANCE; without these counters the
-      // operator can't see the drop rate by group/path. Codex F1 follow-up:
-      // emitted = total facts the classifier produced (pre any filter);
-      // dropped_low_importance = facts filtered by the threshold; the existing
-      // facts_written column = facts actually stored. Redaction drops can be
-      // derived as emitted - facts_written - dropped_low_importance.
+      // Redaction drops are derivable as emitted − facts_written − dropped_low_importance.
       db.exec(`
         ALTER TABLE processed_pairs ADD COLUMN facts_emitted INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE processed_pairs ADD COLUMN facts_dropped_low_importance INTEGER NOT NULL DEFAULT 0;
@@ -108,12 +101,8 @@ export function runMnemonIngestMigrations(db: Database.Database): void {
 
   if (!applied.has('mnemon-idempotency-keys-v1')) {
     db.transaction(() => {
-      // action + fact_id are stored so an idempotent replay returns the
-      // original successful RememberResult shape (action ∈ {added,updated,
-      // replaced}, factId from mnemon). Returning {action:'skipped',
-      // factId:''} on replay would be misread by callers as a write
-      // failure and lose remaining facts in a multi-fact retry — see
-      // mnemon-impl.ts:remember() for the full reasoning.
+      // action and fact_id are stored so an idempotent replay returns the original result: a `skipped` replay would
+      // read as a write failure and lose the remaining facts of a multi-fact retry.
       db.exec(`
         CREATE TABLE IF NOT EXISTS idempotency_keys (
           agent_group_id  TEXT NOT NULL,
