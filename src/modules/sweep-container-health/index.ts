@@ -720,7 +720,6 @@ function reportContainerOomTelemetry(
 
 export { reportContainerOomTelemetry as _reportContainerOomTelemetryForTesting };
 
-/** Test-only: builds the minimum session context the SLA and its follow-ups read. */
 export function _enforceRunningContainerSlaForTesting(
   run: SessionRunner,
   session: Session,

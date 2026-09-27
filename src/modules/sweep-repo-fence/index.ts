@@ -25,7 +25,6 @@ function registerSweepRepoFenceDuties(): void {
     name: id.T5,
     phase: 'tick:housekeeping',
     order: 10,
-    // Finalize "Reject with reason…" holds whose reply window elapsed.
     run: async () => {
       try {
         const { sweepAwaitingReasonRejects } = await import('../approvals/index.js');
