@@ -369,7 +369,7 @@ async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
 /**
  * Returns the claimed incarnation, or null when the claim was lost (do not start a container). Throws on a
  * failed write. A claim held by a LIVE peer host is refused; a stopped, lease-expired or unknown holder is
- * takeover-able so a crashed claimant never wedges a session. This must stay the last `await` before `spawn()`.
+ * takeover-able so a crashed claimant never wedges a session. After it, only the central lease may be awaited.
  * P2 (container fence): an untracked container still running for the session fails the claim; fails CLOSED,
  * and is a runtime call so it sits outside the transaction. P1: the peer-liveness read and the incarnation CAS
  * run in one `BEGIN IMMEDIATE` transaction so a peer's lease renewal cannot land between them.
