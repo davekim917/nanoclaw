@@ -71,9 +71,9 @@ function shortApprovalId(): string {
 
 /**
  * Derived from the row at click time, so it survives a restart and a role
- * revoked between card and click takes effect immediately. Deliberately wider
- * than upstream (any eligible approver, not only the DM'd one): DM delivery is
- * best-effort and can land with an admin who is not the right decider.
+ * revoked between card and click takes effect immediately. Any eligible
+ * approver may resolve an unpinned request: DM delivery is best-effort and can
+ * land with an admin who is not the right decider.
  */
 async function approversFor(row: PendingApproval): Promise<string[]> {
   if (row.approver_user_id) return [row.approver_user_id];

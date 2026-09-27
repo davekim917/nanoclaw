@@ -90,7 +90,6 @@ function handleOf(userId: string): string | null {
   return handle || null;
 }
 
-/** The channel_type segment before the first `-`: `slack-x-codex:U1` → "slack". */
 function platformPrefixOf(userId: string): string | null {
   const colon = userId.indexOf(':');
   if (colon <= 0) return null;

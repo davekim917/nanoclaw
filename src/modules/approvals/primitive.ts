@@ -460,7 +460,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
   return (await requestApprovalOutcome(opts)) === 'posted';
 }
 
-/** Skips silently when the row lacks its routing columns (the card never delivered). */
+/** Skips silently when the row lacks a routing column, including a platform message id the adapter never returned. */
 export async function editApprovalCard(approval: PendingApproval, newBody: string): Promise<void> {
   if (!approval.channel_type || !approval.platform_id || !approval.platform_message_id) return;
   const adapter = getDeliveryAdapter();
