@@ -72,7 +72,7 @@ export async function backfillContainerConfigs(): Promise<void> {
       additional_mounts: JSON.stringify(legacy.additionalMounts ?? []),
       cli_scope: 'group',
       security_json: null,
-      // Follow the install-global timezone; the spawn path reads a legacy container.json override from the file.
+      // A valid legacy container.json override is kept; otherwise NULL follows the install-global timezone.
       timezone: honouredTimezoneOverride(legacy.timezone) ?? null,
       updated_at: new Date().toISOString(),
     };

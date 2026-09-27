@@ -2,6 +2,8 @@
  * A workgroup's domain wiki at `data/wikis/<workgroup-id>/` (kept current by install config; trunk never clones or
  * refreshes it), mounted read-only at `/workspace/wiki` for every sibling whatever its provider, plus a composed-doc
  * section. No directory, no mount, no section. A symlink or non-directory at that path is refused, not followed.
+ * The workgroup id must be the spawn-resolved one, never agent input: the resolver checks slug syntax, not
+ * authorization, so another workgroup's valid slug would pass.
  */
 import fs from 'fs';
 import path from 'path';

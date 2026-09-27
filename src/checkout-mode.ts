@@ -16,8 +16,8 @@ export interface CheckoutModeDecision {
 }
 
 /**
- * Anything but the two exact names is `worktree` with a warning: a typo must never enable clones. `clone` also
- * needs containers running as the host uid, since the host creates every clone.
+ * Unset is `worktree` silently; anything else but the two exact names is `worktree` with a warning: a typo must
+ * never enable clones. `clone` also needs containers running as the host uid, since the host creates every clone.
  */
 export function decideCheckoutMode(raw: string | undefined, containersRunAsHostUser: boolean): CheckoutModeDecision {
   if (raw === undefined || raw === 'worktree') return { mode: 'worktree', warning: null };
