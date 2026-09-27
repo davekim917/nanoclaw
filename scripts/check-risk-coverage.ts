@@ -25,9 +25,7 @@
  * container lcov (unless `--allow-missing-container-report`); CI passes neither allow-flag.
  *
  * Producing an honest baseline: never run full-suite coverage on the production host. Commit the
- * candidate ci-full.yml's "Generate coverage baseline candidate" step uploads; a local `--write`
- * against CI's raw reports resolves paths against the wrong root and silently writes an all-zero
- * baseline that can never fail again.
+ * candidate ci-full.yml's "Generate coverage baseline candidate" step uploads.
  *
  * Raising the baseline: only `--write` locks in a gain; a normal run prints a hint for files more
  * than 2 points above baseline.
@@ -274,7 +272,7 @@ export function evaluate(
     } else if (baselineEntry === 'untested') {
       status = 'ok';
     } else {
-      const effectiveCurrent = typeof current === 'number' ? current : 0; // 'untested' reads as 0
+      const effectiveCurrent = typeof current === 'number' ? current : 0;
       delta = effectiveCurrent - baselineEntry;
       // Integer hundredths, not the raw float delta: 63.51 - 64.01 lands a hair past -0.5 and
       // would fail a drop of exactly the threshold.

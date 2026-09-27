@@ -1,6 +1,7 @@
 /**
  * Does Jev's difficulty rating of a request track how much work the turn took on the SAME model?
- * If not, it cannot route models. Held to one model+effort (Opus-high) so the model is not the
+ * If not, it cannot route models. This tests only that precondition: whether a cheaper model would
+ * have succeeded needs a live A/B. Held to one model+effort (Opus-high) so the model is not the
  * confound. Human-triggered turns in the focus workgroups only.
  *
  *   pnpm exec tsx scripts/jev-shadow/routing.ts [--since 2026-09-10]

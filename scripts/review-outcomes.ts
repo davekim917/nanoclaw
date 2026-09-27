@@ -391,7 +391,10 @@ export interface MergeCommitShape {
   parentOids: string[];
 }
 
-/** Anything but a 2-parent merge onto the PR head or a squash is `null`, so the caller fails closed to `review`. */
+/**
+ * Anything but a 2-parent merge onto the PR head or a squash is `null`, so the caller fails closed
+ * to `review`. Unlike `audit`, no GitHub-signature check: this is measurement, not enforcement.
+ */
 export function resolveAtMergeBaseSha(shape: MergeCommitShape): string | null {
   if (shape.mergeCommitOid === null) return null;
   if (shape.parentOids.length === 2 && shape.parentOids[1] === shape.headRefOid) return shape.parentOids[0];

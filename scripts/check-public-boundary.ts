@@ -163,7 +163,7 @@ const GENERIC_IDENTIFIERS = new Set([
   'agent',
   'claude',
   'codex',
-  // Common words a channel name put in the registry set; the channel's platform ID stays banned.
+  // Common words that can also be channel names; the channel's platform ID stays banned.
   'commercial',
   'dbt cloud',
   'discord',
@@ -922,8 +922,10 @@ const EMPTY_BASELINE_OUTCOME: BaselineOutcome = {
  * `#` line is fail-open, while scanning git's own template (branch name, staged paths) blocks
  * routine commits. The hook sees only the file, so the template is inferred narrowly: scissors
  * must be git's exact line, and only a CONTIGUOUS TRAILING comment block containing a bare `#`
- * line is blanked. Do NOT "simplify" this in either direction; each half closed a bypass that
- * shipped. Blanking, not removing, keeps line numbers matching the author's editor.
+ * line is blanked. Accepted residual fail-open: a `-m` body that reproduces that trailing-block
+ * shape escapes the scan, because scanning git's template instead blocks routine commits. Do NOT
+ * "simplify" this in either direction. Blanking, not removing, keeps line numbers matching the
+ * author's editor.
  */
 const GIT_SCISSORS = /^# -{24} >8 -{24}$/m;
 const GIT_BARE_COMMENT = /^#[ \t]*$/;

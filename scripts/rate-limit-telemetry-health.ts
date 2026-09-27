@@ -26,6 +26,7 @@ const EXIT_USAGE = 2;
 /** Findings embedded in `--gate` data are injected into a prompt. */
 const GATE_FINDING_LIMIT = 20;
 
+// Daily cadence plus two hours' slack.
 const GATE_BOUND = '26h';
 
 type PairVerdict =
@@ -142,7 +143,8 @@ type DirListing = { names: string[] } | { error: string };
 
 /**
  * THE ONE PLACE A DIRECTORY IS LISTED. A union, never a bare array: an unlistable directory must not
- * read as empty and healthy.
+ * read as empty and healthy. A symlink stays a candidate so a non-directory target fails loudly
+ * later instead of vanishing.
  */
 function listSubdirectories(dir: string): DirListing {
   let entries: fs.Dirent[];
