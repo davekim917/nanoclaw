@@ -990,7 +990,7 @@ export async function writeContainerConfigPackages(
   return packages;
 }
 
-/** Idempotent; under the same lock so two concurrent first spawns cannot both see "absent". */
+/** Idempotent; under the same lock so two concurrent calls cannot both see "absent". */
 export async function initContainerConfig(folder: string): Promise<boolean> {
   return withFileLock(
     containerConfigLockPath(folder),
