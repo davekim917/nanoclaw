@@ -1,8 +1,9 @@
 /**
  * Read-only operator-attention extract from durable events only. Delivery evidence is a non-null
  * platform message id at `delivered_at`: adapter no-ops are acknowledged with a null id. An
- * assistant archive row is never delivery evidence. Never `immutable=1`, which would ignore
- * committed WAL data. Emits no message text, identity or payload, only provenance.
+ * assistant archive row is never delivery evidence. `quietStatus`/`chatLimit` drop rows before they
+ * are written, so missing rows never count as suppressed deliveries. Never `immutable=1`, which
+ * would ignore committed WAL data. Emits no message text, identity or payload, only provenance.
  */
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
