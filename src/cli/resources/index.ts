@@ -19,3 +19,4 @@ import './tasks.js';
 import './repositories.js';
 import './usage.js';
 import './integrations.js';
+import './secrets.js';

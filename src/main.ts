@@ -69,6 +69,7 @@ import {
   stopChannelRecoveryMonitor,
 } from './channels/channel-recovery.js';
 import { makeOnAction } from './channels/action-response.js';
+import { secretIntakeHooks } from './modules/secret-intake/service.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
@@ -647,6 +648,7 @@ export async function main(): Promise<void> {
         });
       },
       onAction: makeOnAction(adapter.channelType, dispatchResponse),
+      secretIntake: secretIntakeHooks(adapter.channelType),
     };
   });
   // Lets our own sibling bots engage each other under a `strict` messaging group, where they would otherwise be

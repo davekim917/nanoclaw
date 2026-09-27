@@ -41,7 +41,7 @@ vi.mock('../../log.js', () => ({
   isSurvivableIoError: () => false,
 }));
 
-// `ensureSecretDeclared` writes `groups/<folder>/container.json`, which is a
+// `declareGroupSecret` writes `groups/<folder>/container.json`, which is a
 // real repo path the hermeticity guard denylists — and it is not what these
 // cases are about.
 const declared: string[] = [];
@@ -70,7 +70,7 @@ vi.mock('../../container-config.js', () => ({
 /** Every value that reached the vault, every id deleted from it, and a switch
  *  to take the vault down. */
 const vault = { fail: false, writes: [] as { name: string; value: string }[], deleted: [] as string[] };
-vi.mock('./onecli-secret-writer.js', () => ({
+vi.mock('../../onecli-secret-writer.js', () => ({
   putOnecliBearerSecret: async (spec: { name: string }, value: string) => {
     if (vault.fail) throw new Error('gateway unreachable');
     vault.writes.push({ name: spec.name, value });

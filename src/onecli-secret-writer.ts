@@ -14,8 +14,8 @@
  */
 import { execFile } from 'child_process';
 
-import { ONECLI_URL } from '../../config.js';
-import { curlConfigEscape, onecliAuthConfigLine, sanitizeCurlFailure } from '../../onecli-curl.js';
+import { ONECLI_URL } from './config.js';
+import { curlConfigEscape, onecliAuthConfigLine, sanitizeCurlFailure } from './onecli-curl.js';
 
 const CURL_CONNECT_TIMEOUT_SECONDS = 2;
 const CURL_MAX_TIME_SECONDS = 10;
@@ -130,19 +130,24 @@ export async function findOnecliSecretByName(name: string): Promise<OnecliSecret
 }
 
 /**
- * Create the bearer secret, or update the value of the one already carrying
- * this name — adopting a hand-made secret the group already declares, rather
- * than leaving the agent granted a dead one. The injection shape is sent only
- * on CREATE, so an adopted secret keeps the matching rule it already serves.
+ * Adopts a hand-made secret of the same name rather than leaving the agent granted a dead one; the injection shape
+ * is sent only on CREATE, so an adopted secret keeps the matching rule it already serves.
  */
 export async function putOnecliBearerSecret(spec: OnecliInjectionSpec, value: string): Promise<OnecliSecretRef> {
   const existing = await findOnecliSecretByName(spec.name);
   if (existing) {
-    const { status } = await curlJson('PATCH', `secrets/${encodeURIComponent(existing.id)}`, { value });
-    if (status !== 200) throw new Error(`OneCLI secret update failed with HTTP ${status} for "${spec.name}"`);
+    await updateOnecliSecretValue(existing, value);
     return existing;
   }
+  return createOnecliSecret(spec, value);
+}
 
+export async function updateOnecliSecretValue(ref: OnecliSecretRef, value: string): Promise<void> {
+  const { status } = await curlJson('PATCH', `secrets/${encodeURIComponent(ref.id)}`, { value });
+  if (status !== 200) throw new Error(`OneCLI secret update failed with HTTP ${status} for "${ref.name}"`);
+}
+
+export async function createOnecliSecret(spec: OnecliInjectionSpec, value: string): Promise<OnecliSecretRef> {
   const { status, body } = await curlJson('POST', 'secrets', {
     name: spec.name,
     type: 'generic',

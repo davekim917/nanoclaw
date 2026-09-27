@@ -46,7 +46,7 @@ const secretWrites: { name: string; value: string }[] = [];
  *  observable as the number of attempts made during an outage. */
 const secretWriteAttempts = { count: 0 };
 let secretWriteFails = false;
-vi.mock('./onecli-secret-writer.js', () => ({
+vi.mock('../../onecli-secret-writer.js', () => ({
   putOnecliBearerSecret: async (spec: { name: string }, value: string) => {
     secretWriteAttempts.count++;
     if (secretWriteFails) throw new Error('gateway unreachable');
