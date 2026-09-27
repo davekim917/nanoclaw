@@ -4967,7 +4967,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     insertMessage('occ-2', 'task', {
       continuous: true,
       prompt: 'second fire',
-      flagIntent: { turnModel: 'claude-sonnet-5' },
+      flagIntent: { turnEffort: 'medium' },
     });
     let firstResult = false;
 
@@ -5073,12 +5073,12 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     insertMessage('support-1', 'chat', {
       sender: 'system',
       text: 'new email',
-      flagIntent: { turnModel: 'claude-sonnet-5' },
+      flagIntent: { turnEffort: 'low' },
     });
     insertMessage('occ-2', 'task', {
       continuous: true,
       prompt: 'second fire',
-      flagIntent: { turnModel: 'claude-sonnet-5' },
+      flagIntent: { turnEffort: 'high' },
     });
 
     await processQuery(busyQuery(), TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
@@ -5093,7 +5093,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     insertRouted('occ-2', 'task', 'task-channel', 'task-thread', {
       continuous: true,
       prompt: 'second fire',
-      flagIntent: { turnModel: 'claude-sonnet-5' },
+      flagIntent: { turnEffort: 'high' },
     });
     insertRouted('flag-1', 'chat', 'human-channel', 'human-thread', {
       text: '',
@@ -5175,6 +5175,61 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(queuedNotices()).toEqual([]);
   }, 15_000);
 
+  it('does not retarget a running turn for a one-turn -e1', async () => {
+    insertMessage('flag-1', 'chat', {
+      text: 'look at this',
+      flagIntent: { turnEffort: 'high' },
+      flagAck: '⚙️ effort (this turn) → high',
+    });
+    const q = liveEffortQuery();
+
+    await processQuery(q.query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(q.calls.filter((c) => c.phase === 'busy')).toEqual([]);
+    expect(q.endedWhileBusy()).toBe(false);
+  }, 15_000);
+
+  it('restarts cleanly instead of applying live when the turn is already idle', async () => {
+    let effort: string | null = 'medium';
+    const calls: string[] = [];
+    let ended = false;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'done', isError: true };
+      // Idle from here: the typed flag arrives now.
+      insertMessage('flag-1', 'chat', { text: '', flagIntent: { stickyEffort: 'high' }, flagAck: '⚙️ effort → high' });
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      push: () => undefined,
+      end: () => {
+        ended = true;
+      },
+      abort: () => {},
+      applySettings: async (s) => {
+        calls.push(s.effort ?? '');
+        effort = s.effort ?? null;
+      },
+      get resolvedEffort() {
+        return effort;
+      },
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'medium',
+      ultracode: false,
+    });
+
+    expect(calls).toEqual([]);
+    expect(ended).toBe(true);
+    expect(getPendingMessages().map((m) => m.id)).toContain('flag-1');
+  }, 15_000);
+
   it('still waits for a fresh query for max effort, which has no live control', async () => {
     insertMessage('flag-1', 'chat', { text: '', flagIntent: { stickyEffort: 'max' }, flagAck: '⚙️ effort → max' });
     const q = liveEffortQuery();
@@ -5212,7 +5267,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     insertMessage('occ-2', 'task', {
       continuous: true,
       prompt: 'second fire',
-      flagIntent: { turnModel: 'claude-sonnet-5' },
+      flagIntent: { turnEffort: 'medium' },
     });
     let live = 1;
     let drained = false;
@@ -5260,7 +5315,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     insertMessage('occ-2', 'task', {
       continuous: true,
       prompt: 'second fire',
-      flagIntent: { turnModel: 'claude-sonnet-5' },
+      flagIntent: { turnEffort: 'medium' },
     });
     let beginOutcome!: () => void;
     const outcomeStarted = new Promise<void>((resolve) => {

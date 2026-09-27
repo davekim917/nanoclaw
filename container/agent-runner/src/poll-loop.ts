@@ -1690,6 +1690,8 @@ export async function processQuery(
             fb.model === liveSettings.model &&
             fb.effort !== 'max' &&
             query.applySettings &&
+            (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) &&
+            onlyTypedStickyEffort(keep) &&
             liveEffortFailedFor !== JSON.stringify([fb.effort, fb.ultracode])
           ) {
             try {
@@ -3032,6 +3034,24 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
     log(`Failed to request a primary-provider retry: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
+}
+
+export function onlyTypedStickyEffort(messages: MessageInRow[]): boolean {
+  let typed = 0;
+  for (const m of messages) {
+    let parsed: { flagIntent?: FlagIntent; flagAck?: unknown };
+    try {
+      parsed = JSON.parse(m.content) as typeof parsed;
+    } catch {
+      continue;
+    }
+    const fi = parsed.flagIntent;
+    if (!fi) continue;
+    if (typeof parsed.flagAck !== 'string') return false;
+    if (fi.turnEffort !== undefined || fi.turnUltracode !== undefined || fi.turnModel !== undefined) return false;
+    typed++;
+  }
+  return typed > 0;
 }
 
 /**
