@@ -192,7 +192,7 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
   }
 
   // Never-engaged sessions (an inbound arrived but nothing woke the agent) would clutter the idle lane forever.
-  // Engaged = a reply was ever sent, the container is running now, or an in-flight task is attached; all are
+  // Engaged = a reply was ever sent, the container is not stopped, or an in-flight task is attached; all are
   // central-DB columns, no file I/O. No toggle.
   conditions.push("(s.last_outbound_at IS NOT NULL OR s.container_status <> 'stopped' OR t.task_id IS NOT NULL)");
 

@@ -320,7 +320,7 @@ const APPROVAL_FIELDS = [
  * The first field that differs from the approved row, or null. An id check is not enough: admission mutates a row in
  * place (a concurrent run-now flips `trigger` and moves `process_after` with id and status unchanged), and every
  * board writer acquires its mailbox asynchronously. `content` is deliberately not compared: some verbs exist to edit
- * it.
+ * it, and a move carries the snapshot's copy forward by design.
  */
 export function approvedRowChanged(approved: ApprovedTaskRow, current: ApprovedTaskRow): string | null {
   for (const field of APPROVAL_FIELDS) {
