@@ -1,12 +1,5 @@
 #!/usr/bin/env bun
-/**
- * Generic stdio-to-Streamable-HTTP MCP bridge.
- *
- * Some runtimes only accept stdio MCP servers, while NanoClaw commonly wires
- * hosted HTTP MCPs through OneCLI so credentials are injected at the proxy
- * boundary. This bridge exposes the remote HTTP MCP as a local stdio server
- * without placing real credentials in container.json or process env.
- */
+/** stdio-to-Streamable-HTTP MCP bridge, so stdio-only runtimes reach OneCLI-proxied HTTP MCPs without holding credentials. */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -41,14 +34,7 @@ function remoteUrl(): string {
   return url;
 }
 
-/**
- * The full header map the host/container parser already validated
- * (src/container-config.ts / self-mod.ts's `normalizeMcpHeaders`), passed
- * through as JSON — not just Authorization. A server declared with
- * X-Api-Version or a custom OneCLI-managed placeholder header had every
- * header past Authorization silently dropped here, a narrower set than the
- * one the CLI/template/approval flow validated and reported success on.
- */
+/** The full validated header map, not just Authorization: dropping the rest silently narrows what the CLI validated. */
 export function requestHeaders(): HeadersInit | undefined {
   const raw = process.env.REMOTE_MCP_HEADERS;
   if (!raw) return undefined;

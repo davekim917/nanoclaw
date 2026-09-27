@@ -68,21 +68,12 @@ function realCurl(args: string[], input?: string): CurlResult {
 
 let curlOverride: CurlImpl | null = null;
 
-/**
- * Every HTTP call in this module goes through here. Unset (production), it is
- * exactly `realCurl`. Inside an agent container the OneCLI proxy injects the
- * user's HF token, so a test that reached `realCurl` would make a credentialed
- * call to huggingface.co.
- */
+/** All HTTP goes through here. In a container the OneCLI proxy injects the user's HF token, so a test reaching `realCurl` makes a credentialed call. */
 function curl(args: string[], input?: string): CurlResult {
   return (curlOverride ?? realCurl)(args, input);
 }
 
-/**
- * Test-only: replace the curl call so `uploadTrace()` never reaches the
- * network. Call with no argument to restore the real one. A seam rather than
- * `mock.module`, which Bun cannot undo across files.
- */
+/** Test-only curl seam (Bun's `mock.module` cannot be undone across files); no argument restores the real one. */
 export function _setCurlForTesting(impl?: CurlImpl): void {
   curlOverride = impl ?? null;
 }

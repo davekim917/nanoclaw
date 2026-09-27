@@ -1,11 +1,6 @@
 /**
- * Compatibility seam for the retired per-session worktree autosave.
- *
- * Topic worktrees are shared by sibling agents. A turn-end or PreCompact
- * callback from one sibling therefore cannot safely stage, commit, or remove
- * index locks: another sibling may be in the middle of an edit or Git command.
- * Dirty topic worktrees are persistent and conservative host cleanup refuses
- * to remove them, so exact working/index state survives without mutation.
+ * Compatibility seam for the retired per-session worktree autosave. Topic worktrees are shared by siblings, so a
+ * callback from one must never stage, commit, or remove index locks: another may be mid-edit.
  */
 export interface AutoSaveResult {
   committed: string[];

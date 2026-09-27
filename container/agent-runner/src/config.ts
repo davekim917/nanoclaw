@@ -20,41 +20,17 @@ export interface RunnerConfig {
   mcpServers: Record<string, McpServerConfig>;
   excludeMcpServers: string[];
 
-  // ADDED: per-provider sticky config from container.json.providerConfig
   providerConfig: Record<string, unknown>;
   model?: string;
   effort?: string;
 
-  /**
-   * True only when this particular spawn is running on the group's declared
-   * secondary provider. The marker is needed below the host/container
-   * boundary: task pins were validated for the primary provider and must not
-   * cross into a different provider as if they were target-native settings.
-   */
+  /** True only when this spawn runs on the group's declared secondary provider; task pins validated for the primary must not cross into it. */
   fallbackApplied: boolean;
 
-  /**
-   * Where the host routes spawns while this provider is unavailable. The
-   * runner only needs to know whether one EXISTS: when a turn dies on a
-   * provider-level quota and a fallback is declared, the failure is reported
-   * to the host and the session respawns onto the fallback instead of
-   * surfacing a dead-end error to the user.
-   */
+  /** The runner only checks that one exists: a provider-quota death is then reported to the host for respawn. */
   providerFallback?: { provider: string; model?: string; effort?: string };
 
-  /**
-   * Stamp the model/effort/context subtext under this group's own replies.
-   *
-   * ON unless the group's container.json says `"statusSubtext": false`. The
-   * line is operator telemetry, and the groups that want it silenced are the
-   * ones whose conversations include people outside the fleet — so the opt-out
-   * is per group rather than a fleet switch.
-   *
-   * Only an explicit `false` disables it. A missing key, a null, or a
-   * non-boolean is the default ON: a malformed config must not silently strip
-   * a signal the operator is relying on, and "off" is the state that has to be
-   * asked for.
-   */
+  /** Only an explicit `false` disables it; missing, null or non-boolean means ON. */
   statusSubtext: boolean;
 }
 
@@ -73,49 +49,26 @@ function validateMcpServers(servers: Record<string, McpServerConfig>): Record<st
   return servers;
 }
 
-/**
- * Pure parse — exported so unit tests can verify schema mapping without
- * touching the filesystem.
- */
 export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
-  // NANOCLAW_ASSISTANT_NAME is per-spawn, set by the host (container-runner)
-  // after resolving the agent's user-facing name for THIS session's channel
-  // (Slack display, Discord username, or agent_group.name fallback). When
-  // present it wins over container.json's static value — the JSON is
-  // operator-static while the env is channel-aware. See
-  // src/container-runner.ts `resolveAssistantName`.
+  // Per-spawn, channel-aware name from the host; wins over container.json's static value.
   const envAssistantName = typeof process !== 'undefined' ? process.env?.NANOCLAW_ASSISTANT_NAME : undefined;
-  // Spawn-time provider fallback. The host decides which provider this
-  // container runs (it owns the outage record and the credentials it
-  // mounted); container.json is static per group and cannot express "the
-  // primary is exhausted right now". Same precedence shape as the assistant
-  // name: env is per-spawn truth, the file is the static default.
+  // Env is per-spawn truth (the host owns the outage record); the file is the static default.
   const env = typeof process !== 'undefined' ? process.env : undefined;
   const envProvider = env?.NANOCLAW_PROVIDER_OVERRIDE;
   const envModel = env?.NANOCLAW_MODEL_OVERRIDE;
-  // Provider equality cannot tell us whether this is a fallback: a session
-  // may be pinned to Codex while its group file names Claude, then legitimately
-  // fall back to Claude. Carry the host's decision explicitly so the runner
-  // still discards the file's source-provider settings in that case.
+  // Provider equality cannot detect a fallback (a Codex-pinned session may fall back to the file's provider),
+  // so the host's decision is carried explicitly.
   const envFallbackApplied = env?.NANOCLAW_PROVIDER_FALLBACK_APPLIED === '1';
-  // Channel defaults are injected by the host at spawn time. Keep them on a
-  // provider-specific surface: Codex's config schema uses `model` and
-  // `reasoning_effort`, while Claude uses `model` and `effort`. They must be
-  // applied only to the primary Codex provider; a provider fallback gets its
-  // own model/effort from providerFallback / the generic bridge above.
+  // Codex-only channel defaults: applied to the primary Codex provider, never to a fallback.
   const envCodexModel = env?.NANOCLAW_CODEX_MODEL_OVERRIDE;
   const envCodexEffort = env?.NANOCLAW_CODEX_EFFORT_OVERRIDE;
   const fileProvider = (raw.provider as string) || 'claude';
   const provider = envProvider || fileProvider;
-  // `providerConfig`, `model` and `effort` in the file describe the PRIMARY
-  // provider. Under a spawn-time override they are the wrong provider's
-  // settings, and the provider config schemas are strict — codex's
-  // `reasoning_effort` key is a fatal boot error under claude, which turned
-  // every fallback spawn into an instant crash loop. Take the declared
-  // fallback's own model/effort instead; drop the primary's sticky config.
+  // The file's providerConfig/model/effort describe the PRIMARY provider. Under an override they are the wrong
+  // provider's settings and strict schemas crash boot (codex `reasoning_effort` under claude), so use the
+  // declared fallback's own model/effort and drop the primary's sticky config.
   const declaredFallback = raw.providerFallback as RunnerConfig['providerFallback'];
-  // Keep the provider-difference check for hosts deployed before the explicit
-  // marker. The marker is required for the equal-to-file case above.
+  // The provider-difference check covers hosts deployed before the explicit marker.
   const onFallback = envFallbackApplied || provider !== fileProvider;
   const activeFallback = onFallback && declaredFallback?.provider === provider ? declaredFallback : undefined;
   const configuredProviderConfig = (raw.providerConfig as Record<string, unknown>) ?? {};
@@ -128,10 +81,8 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   const activeCodexModel = !onFallback && provider === 'codex' ? envCodexModel : undefined;
   const activeCodexEffort = !onFallback && provider === 'codex' ? envCodexEffort : undefined;
   if (!onFallback && provider === 'codex') {
-    // Channel values beat the per-agent provider config, which in turn beats
-    // the provider-level model/effort fields materialized by `ncl groups
-    // config`. Copy into the strict providerConfig object because Codex reads
-    // its sticky values there at app-server startup.
+    // Precedence: channel > per-agent providerConfig > provider-level fields. Copied into providerConfig because
+    // Codex reads its sticky values there at app-server startup.
     const codexModel = activeCodexModel || configuredProviderModel || configuredModel;
     const codexEffort = activeCodexEffort || configuredProviderEffort || configuredEffort;
     if (codexModel) providerConfig.model = codexModel;
@@ -195,13 +146,7 @@ export function _resetConfig(): void {
   _config = null;
 }
 
-/**
- * Test seam — install a parsed config without reading the file.
- *
- * `loadConfig` reads one fixed absolute path that does not exist outside a
- * container, so a test that needs a NON-default field (a group that opted out
- * of the status subtext, say) has no other way to express it.
- */
+/** Test seam: install a parsed config without reading the fixed in-container path. */
 export function _setConfigForTest(raw: Record<string, unknown>): void {
   _config = parseRawConfig(raw);
 }
