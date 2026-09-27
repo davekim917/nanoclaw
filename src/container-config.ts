@@ -1,20 +1,9 @@
 /**
  * Container config types and access layer.
  *
- * `groups/<folder>/container.json` is the canonical source of truth for every
- * non-DB field (onecliSecrets, tools, credentialFolder, codexAuthFallbacks,
- * dailySummary, etc.) — read by `readContainerConfig`, written by
- * `writeContainerConfig`, modified directly on disk by skills and operators.
- *
- * The `container_configs` table mirrors a subset of operationally-mutated
- * scalars (provider, model, effort, image_tag, assistant_name, skills,
- * mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope) so
- * those fields are addressable via `ncl groups config get/update` and survive
- * across container respawns. `configFromDb` reconstructs ONLY those scalars;
- * it does NOT carry the file-only fields. Any code path that writes the file
- * from DB state alone would silently drop those fields — which is why no such
- * path exists. The DB row is a read-side projection, not an authoritative
- * source for the full config.
+ * `groups/<folder>/container.json` is the source of truth except `agentGroupId`/`groupName`, which spawn overwrites
+ * from the DB. The `container_configs` row mirrors only the operational scalars (`configFromDb` reconstructs ONLY
+ * those), so never write the file from DB state alone: that would silently drop every file-only field.
  */
 import fs from 'fs';
 import path from 'path';
@@ -36,28 +25,15 @@ import { isIanaTimezone } from './timezone.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 /**
- * Per-MCP-server config. Stdio (default) runs a subprocess inside the
- * container; http hits a remote Streamable HTTP URL with credentials injected
- * at the HTTPS_PROXY layer by OneCLI — the container never sees the token.
- * SSE is deprecated and rejected by config validation.
- */
-/**
  * Container-side path where a group's stamped plugins are mounted read-only.
  * Lockstep: create-agent.ts records `pluginRoot` under this prefix and
  * container-runner.ts mounts groups/<folder>/plugins here.
- *
- * Not the fork's fleet-wide `~/plugins` -> /workspace/plugins mount, which is
- * operator-curated, live, and shared by every group.
  */
 export const CONTAINER_PLUGINS_DIR = '/workspace/agent/plugins';
 
 export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
 
-/**
- * What `parseMcpServerConfig` may produce — the deprecated SSE transport is
- * rejected there, so callers narrowing on `type === 'http'` get a clean
- * two-way discriminated union.
- */
+/** SSE is rejected by `parseMcpServerConfig`, so this is a clean two-way union. */
 export type ParsedMcpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig;
 
 interface StdioMcpServerConfig {
@@ -70,10 +46,7 @@ interface StdioMcpServerConfig {
    * ${PLUGIN_DATA}[/p]). For plugin servers the agent-runner (plugin-mcp.ts)
    * resolves it to an absolute container path; providers consume it natively
    * (codex) or via a launch shim (cwd-shim.ts). Without a pluginRoot there is
-   * nothing to resolve against, so `validateMcpServers` strips it — the only
-   * layer that does; the runtime passes provenance-less servers through
-   * untouched. No CLI flag or self-mod tool param exposes it, and the
-   * self-mod intake (`validateAddMcpServer`) refuses a request carrying one.
+   * nothing to resolve against, so `validateMcpServers` strips it (the only layer that does).
    */
   cwd?: string;
   /**
@@ -86,27 +59,14 @@ interface StdioMcpServerConfig {
   /**
    * Name of the plugin that stamped this server. Ownership marker: plugin-owned
    * servers reject CLI/self-mod edits and are swapped wholesale on restamp
-   * (`ncl groups create --template`). Internal — never CLI input, and never
-   * written to container.json: that file IS the spawn-time config here, so the
-   * marker would flow into every provider's server map. Ownership is read from
-   * the `container_configs.mcp_servers` projection, which every guard site
-   * already has in hand.
+   * (`ncl groups create --template`). Never CLI input. Written to container.json and the projection alike; guards
+   * read the file. The runner's `resolvePluginServer` strips it, but not every path to a provider's map does.
    */
   plugin?: string;
   instructions?: string;
-  /**
-   * Human label for the capability snapshot (`src/capabilities.ts`), e.g.
-   * "DeepWiki" for the server named `deepwiki`. Absent means the server name
-   * with its first letter capitalized. Host-only metadata: stripped before the
-   * map reaches a container (`serializeMcpServersEnv`).
-   */
+  /** Capability-snapshot label (default: the name, capitalized). Stripped from the env payload, not container.json. */
   displayName?: string;
-  /**
-   * What this server is for, in the agent's own capability list. Absent means
-   * a generic line naming the transport. Host-only metadata, like
-   * `displayName` — distinct from `instructions`, which is always-in-context
-   * text the host imports into the composed CLAUDE.md.
-   */
+  /** Capability-list line (default: a generic transport line). Env-stripped like displayName, unlike `instructions`. */
   description?: string;
 }
 
@@ -118,19 +78,9 @@ interface HttpMcpServerConfig {
   plugin?: string;
   // Optional always-in-context guidance; host imports into composed CLAUDE.md.
   instructions?: string;
-  /**
-   * Human label for the capability snapshot (`src/capabilities.ts`), e.g.
-   * "DeepWiki" for the server named `deepwiki`. Absent means the server name
-   * with its first letter capitalized. Host-only metadata: stripped before the
-   * map reaches a container (`serializeMcpServersEnv`).
-   */
+  /** See StdioMcpServerConfig.displayName. */
   displayName?: string;
-  /**
-   * What this server is for, in the agent's own capability list. Absent means
-   * a generic line naming the transport. Host-only metadata, like
-   * `displayName` — distinct from `instructions`, which is always-in-context
-   * text the host imports into the composed CLAUDE.md.
-   */
+  /** See StdioMcpServerConfig.description. */
   description?: string;
 }
 
@@ -148,24 +98,9 @@ interface SseMcpServerConfig {
 }
 
 /**
- * Query keys that name a credential.
- *
- * Two passes, because one was never enough. Word-bounded matching after
- * camelCase splitting catches `authToken`, `api_key` and `x-auth`, but not
- * the all-lowercase compounds `apikey`, `accesskey` and `authtoken`, which
- * have no boundary to find. So the noun is also matched as a SUFFIX of the
- * whole key: credential names in the wild put it last.
- *
- * Deliberate cost: `monkey` and `turnkey` end in a credential noun and are
- * refused. An earlier revision protected them with word boundaries, which is
- * exactly what let `apikey` through — and nobody passes `?monkey=` to an MCP
- * endpoint, while `?apikey=` is how half the vendors on the internet spell
- * authentication. A false positive costs a clear error message; a false
- * negative writes a credential to container.json.
- *
- * Ordinary query params stay legal: they are endpoint config, not credentials
- * (the install's own `exa` wiring carries `?tools=web_search_exa,...`, and a
- * search endpoint's `?keyword=` is a prefix, not a suffix).
+ * Query keys that name a credential: word-bounded after camelCase splitting, plus the noun as a SUFFIX of the
+ * whole key to catch `apikey`/`accesskey`. Deliberate cost: `monkey`/`turnkey` are refused; a false negative
+ * would write a credential to container.json.
  */
 const CREDENTIAL_NOUNS = 'o?auth(orization)?|token|key|secret|passw(or)?d|pwd|credentials?|bearer|jwt|sig(nature)?';
 const SECRET_QUERY_WORD_RE = new RegExp(`(^|[_.-])(${CREDENTIAL_NOUNS})([_.-]|$)`, 'i');
@@ -174,7 +109,6 @@ const SECRET_QUERY_SUFFIX_RE = new RegExp(`(${CREDENTIAL_NOUNS})$`, 'i');
 /** camelCase → snake_case before matching, so `authToken` hits the word list. */
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
 
-/** Whether a query parameter NAME signals a credential. */
 function isCredentialQueryKey(key: string): boolean {
   const normalized = key.replace(CAMEL_SPLIT_RE, '$1_$2');
   return SECRET_QUERY_WORD_RE.test(normalized) || SECRET_QUERY_SUFFIX_RE.test(normalized);
@@ -182,25 +116,13 @@ function isCredentialQueryKey(key: string): boolean {
 
 /**
  * Server names and env keys end up in provider config writers that emit
- * formats with structural syntax: the codex writer emits TOML table
- * headers, and the Claude SDK collapses any character outside
- * [A-Za-z0-9_-] to `_` when forming MCP tool call prefixes
- * (`mcp__<name>__<tool>`) for permission matching — so unvalidated names
- * can collide. Allowlist the charset at every entry point so no downstream
- * writer has to defend.
+ * formats with structural syntax (TOML headers, `mcp__<name>__<tool>` prefixes), so the charset is allowlisted at
+ * every entry point.
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /**
- * `mcpServers[name] = config` at every write site (CLI, `applyAddMcpServer`,
- * `parseTemplateMcpServers`) is a plain-object assignment. `__proto__`,
- * `constructor`, and `prototype` all pass MCP_SERVER_NAME_RE's charset but
- * hit an inherited Object.prototype setter/property instead of creating an
- * own enumerable entry — the server silently vanishes from JSON.stringify
- * while every caller reports success. `nanoclaw` is reserved for a different
- * reason: `container/agent-runner/src/index.ts` seeds a built-in `nanoclaw`
- * MCP server, then layers every `container.json` mcpServers entry on top
- * with the same plain assignment — a static entry named `nanoclaw` would
- * silently replace the built-in and the agent loses its core tools.
+ * These pass the charset but are unsafe keys: assigning `__proto__` hits the prototype setter (the server silently
+ * vanishes), `constructor`/`prototype` shadow Object built-ins, and `nanoclaw` would replace the runner's server.
  */
 const RESERVED_MCP_SERVER_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'nanoclaw']);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -215,13 +137,8 @@ export function mcpServerPluginOwner(entry: unknown): string | undefined {
 }
 
 /**
- * The ONE refusal for every mutation path that writes `mcpServers[name]`:
- * `ncl groups config add/remove-mcp-server` and the self-mod approval apply
- * both call this, so a plugin-stamped entry cannot be overwritten (and its
- * provenance marker dropped) through either door. Plugin-owned entries are
- * template content; the fork has no in-place restamp verb yet (deferred to
- * the templates theme), so the only sanctioned remediation today is editing
- * the plugin itself or explicitly taking manual ownership.
+ * The ONE refusal for every `mcpServers[name]` write path (CLI and self-mod apply), so a plugin-stamped entry and
+ * its provenance marker cannot be overwritten.
  */
 export function assertMcpServerNotPluginOwned(entry: unknown, name: string, folder: string): void {
   const owner = mcpServerPluginOwner(entry);
@@ -236,19 +153,8 @@ export function assertMcpServerNotPluginOwned(entry: unknown, name: string, fold
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
 /**
- * The ONLY header names a remote MCP server may set to a literal value.
- *
- * This is deliberately an allowlist of configuration, not a denylist of
- * credentials. Two earlier shapes of this rule both leaked, for the same
- * reason: credential header NAMES are an open set (`X-Functions-Key`,
- * `X-Client-Key`, whatever the next vendor ships) and so are credential
- * VALUES (`abc123` is a perfectly good API key and looks like nothing).
- * Neither side can be enumerated, so neither can gate. Configuration headers
- * ARE a small closed set, so that is what gets enumerated, and everything
- * else must be the OneCLI placeholder.
- *
- * A genuinely non-credential vendor header that is missing here is a one-line
- * addition. A credential that is missing from a denylist is a secret on disk.
+ * The ONLY header names that may carry a literal value; everything else must be the OneCLI placeholder.
+ * Deliberately an allowlist: credential header names and values are open sets, configuration headers are not.
  */
 const LITERAL_HEADER_ALLOWLIST = new Set([
   'accept',
@@ -263,61 +169,25 @@ const LITERAL_HEADER_ALLOWLIST = new Set([
 /** The value the OneCLI gateway replaces at the proxy boundary. */
 const ONECLI_PLACEHOLDER = 'onecli-managed';
 /**
- * The ONLY accepted forms for a credential header: the bare placeholder, or a
- * single auth-scheme token in front of it (`Bearer onecli-managed`,
- * `Key onecli-managed`). A substring test accepted
- * `Bearer real-secret onecli-managed`, which persists the real secret while
- * passing the rule that exists to stop exactly that.
+ * The bare placeholder or one auth-scheme token before it. A substring test would accept
+ * `Bearer real-secret onecli-managed`.
  */
 const ONECLI_HEADER_VALUE_RE = new RegExp(`^(?:[A-Za-z][A-Za-z0-9-]* )?${ONECLI_PLACEHOLDER}$`);
-/**
- * Prefixes of real credentials that TOKEN_SHAPE_PATTERNS doesn't carry —
- * that list is scoped to shapes worth scrubbing from agent-echoed text
- * (SDK/vendor API keys, bearer tokens, JWTs), not to every credential shape
- * that could reach a URL or header here. A GitHub fine-grained PAT, an AWS
- * access key id, and a PEM key block are exactly as real a leak in a remote
- * MCP URL or header, so they're kept as a small local addition rather than
- * folded into the scrubber (which has no outbound-text reason to carry them).
- */
+/** Real-credential prefixes TOKEN_SHAPE_PATTERNS (scoped to outbound-text scrubbing) does not carry. */
 const MCP_ONLY_SECRET_PREFIX_RE = /(^|\s)(github_pat_|AKIA|-----BEGIN )/;
 
 /**
- * Whether `value` contains a recognizable raw-credential shape that must
- * never be written into container.json — a header value, a URL path
- * segment, or a URL query value, all tested as an isolated string with no
- * surrounding context.
- *
- * TOKEN_SHAPE_PATTERNS (src/secret-scrubber.ts) is imported rather than
- * hand-copied: earlier rounds of review each caught one more prefix missing
- * from a hand-maintained list here (a JWT, then GitLab/Stripe tokens) — the
- * scrubber already carries these shapes for outbound-text redaction, so a
- * future addition there is inherited here automatically instead of costing
- * this file its own review round. Each pattern is rebuilt without the `g`
- * flag before testing: the scrubber's copies are `.replace()`d in a loop and
- * so carry global regexes, and `.test()` on a shared global-flag instance
- * would silently start each check from wherever the previous call's
- * `lastIndex` left off.
- *
- * `?code=eyJ...` in a neutral-named query parameter has no credential-shaped
- * NAME to catch it via `isCredentialQueryKey`, and `looksOpaque` excludes
- * dotted values on purpose, so this is the only net that catches a JWT (or
- * any of these shapes) there.
+ * A recognizable raw-credential shape (tested on an isolated header value, path segment or query value). Patterns
+ * are rebuilt without `g`: `.test()` on the scrubber's shared global regexes would resume from a stale
+ * `lastIndex`. The only net for a JWT in a neutral-named query parameter.
  */
 function isKnownRawSecret(value: string): boolean {
   if (MCP_ONLY_SECRET_PREFIX_RE.test(value)) return true;
   return TOKEN_SHAPE_PATTERNS.some(([re]) => new RegExp(re.source, re.flags.replace('g', '')).test(value));
 }
 /**
- * A path segment or query value long and mixed enough that it could be a
- * bearer token — or could equally be a tenant id, workspace slug, or build
- * hash. Nothing in the string distinguishes those, which is why this is NOT a
- * rejection rule: a threshold strict enough to catch `/s/<token>/mcp` rejects
- * hosted endpoints that carry a workspace id in the path, and one loose enough
- * to admit those misses short tokens. It drives an explicit warning on the
- * approval card instead, so the human already in the loop is told which
- * segment to look at. The hard rejection stays on shapes we can actually
- * recognize (`isKnownRawSecret`) and on credential-named headers and query
- * keys.
+ * Could be a bearer token or equally a tenant id: nothing distinguishes them, so this drives a warning on the
+ * approval card, NOT a rejection.
  */
 function looksOpaque(value: string): boolean {
   if (value.length < 16) return false;
@@ -350,27 +220,9 @@ export function validateMcpServerName(name: string): void {
 }
 
 /**
- * Validate one `headers` map for a remote MCP server. Returns a fresh copy.
- *
- * Two rules a hand-rolled character check can't safely stand in for, so both
- * defer to the thing that will actually consume this map:
- *
- * - Duplicate names, after lowercasing. HTTP header names are
- *   case-insensitive, so `{ Authorization: "...", authorization: "..." }`
- *   looks like two headers to this plain-object copy but is ONE header on
- *   the wire — `Headers` combines them with a comma
- *   (`Bearer x, Key onecli-managed`), which no longer matches the
- *   placeholder form this function already validated and can leave the
- *   server unauthenticated. Rejected outright rather than merged or
- *   silently overwritten.
- * - Value validity, by constructing `new Headers({ [key]: value })` — the
- *   same constructor the runtime hands the request to, not a maintained
- *   copy of its rules. It throws on control characters (CR/LF/NUL — what
- *   the old hand-written check caught) AND on any code point above U+00FF:
- *   header values are Latin-1 bytes on the wire, not arbitrary Unicode, so
- *   `User-Agent: "测试"` passed a control-character-only check and then
- *   failed when the actual MCP connection tried to send it — the server was
- *   approved and restarted, then unusable.
+ * Returns a fresh copy. Duplicate names after lowercasing are rejected (`Headers` would comma-join them into a
+ * value that no longer matches the placeholder form). Values are validated by constructing `Headers` itself, the
+ * runtime's own rules (control characters, code points above U+00FF).
  */
 function normalizeMcpHeaders(raw: unknown): Record<string, string> {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -398,10 +250,7 @@ function normalizeMcpHeaders(raw: unknown): Record<string, string> {
         { cause: err },
       );
     }
-    // Allowlisted configuration headers may hold a literal; everything else
-    // must be the placeholder, whatever it is named and however short its
-    // value. `abc123` is a perfectly good API key, so value length and
-    // character mix cannot decide this.
+    // Only allowlisted configuration headers may hold a literal; value length or character mix cannot decide this.
     if (!LITERAL_HEADER_ALLOWLIST.has(lowerName) && !ONECLI_HEADER_VALUE_RE.test(value)) {
       throw new Error(
         `header "${key}" is not a known configuration header, so its value must be exactly "${ONECLI_PLACEHOLDER}" or an auth scheme followed by it (e.g. "Bearer ${ONECLI_PLACEHOLDER}") — the gateway substitutes the real secret at the proxy boundary. Configuration headers that carry no credential: ${[...LITERAL_HEADER_ALLOWLIST].join(', ')}`,
@@ -418,10 +267,8 @@ function normalizeMcpHeaders(raw: unknown): Record<string, string> {
 }
 
 /**
- * Parse one CLI, template, or approval payload into the persisted MCP config
- * shape. Exactly one of `command` (local stdio subprocess) or `url` (remote
- * Streamable HTTP) is required. The only validator of an agent's
- * `add_mcp_server` request: the container forwards raw fields.
+ * Exactly one of `command` (stdio) or `url` (Streamable HTTP). The only validator of an agent's `add_mcp_server`
+ * request: the container forwards raw fields.
  */
 export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpServerConfig {
   const declaredType = input.type === undefined ? undefined : String(input.type);
@@ -436,9 +283,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     throw new Error('MCP instructions must be a string');
   }
 
-  // Host-only metadata for the capability snapshot. Validated here like every
-  // other field so a bad value is refused at intake rather than surfacing as
-  // a malformed capability line in some agent's context days later.
+  // Host-only capability-snapshot metadata, validated at intake.
   const displayName = input.displayName;
   if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim() === '')) {
     throw new Error('MCP displayName must be a non-empty string');
@@ -454,9 +299,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
 
   if (url !== undefined) {
     if (input.command !== undefined) throw new Error('Provide exactly one of command or url');
-    // A declared type that contradicts the fields is a mistake, not something
-    // to silently rewrite — the whole point of parsing strictly is that a
-    // pasted vendor snippet fails loudly.
+    // A declared type that contradicts the fields fails loudly rather than being rewritten.
     if (declaredType === 'stdio') throw new Error('type "stdio" cannot be used with url; use "http"');
     if (input.args !== undefined || input.env !== undefined || input.cwd !== undefined) {
       throw new Error('args, env, and cwd are only valid with command');
@@ -486,10 +329,8 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
         );
       }
     }
-    // Some vendors put the token in the PATH (a Zapier-style
-    // https://host/s/<token>/mcp). The URL is persisted verbatim to
-    // container.json and to the approval row, so a credential there is an
-    // on-disk secret no amount of card redaction undoes — reject at intake.
+    // A credential in the PATH (e.g. https://host/s/<token>/mcp) would persist verbatim to container.json and the
+    // approval row: reject at intake.
     for (const segment of parsed.pathname.split('/')) {
       if (isKnownRawSecret(decodeURIComponent(segment))) {
         throw new Error(
@@ -535,9 +376,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     env[key] = value;
   }
   const cwd = parseCwd(input.cwd);
-  // No explicit `type` on the stdio branch: it is the union's default and the
-  // pre-existing writers omit it, so emitting one would churn every
-  // container.json without changing behavior.
+  // No explicit `type` on stdio: emitting one would churn every container.json for no behavior change.
   return {
     command,
     args,
@@ -574,10 +413,7 @@ export function validateMcpServers(servers: Record<string, McpServerConfig>): Re
         `MCP server "${name}" uses deprecated SSE transport. Use Streamable HTTP (type: "http") instead.`,
       );
     }
-    // cwd resolves against a plugin root; without provenance nothing can
-    // resolve it. This strip is the ONLY layer (the runtime passes
-    // provenance-less servers through untouched, per plugin-mcp.ts), and it
-    // runs on both the read and write paths since both flow through here.
+    // cwd resolves against a plugin root; this strip is the ONLY layer, on both read and write paths.
     if (server && server.type !== 'http' && server.cwd && !server.pluginRoot) {
       delete server.cwd;
       log.warn('Stripping cwd from stored MCP server without plugin provenance', { server: name });
@@ -593,16 +429,8 @@ export interface AdditionalMountConfig {
 }
 
 /**
- * Per-group container PRIVILEGE hardening. Absent fields fall back to the
- * safe defaults resolved by `resolveContainerSecurity` (cap-drop ALL,
- * no-new-privileges).
- *
- * Deliberately narrower than upstream's shape: resource ceilings (memory,
- * pids-limit, cpu) are NOT here. This install already owns those in
- * `resources` / `ContainerResources`, resolved by `resolveContainerResources`
- * and emitted by `dockerResourceLimitArgs`. Two places to set one Docker flag
- * is how a spawn ends up with contradictory `--memory` args, so privilege
- * flags live here and resource ceilings live there — one mechanism each.
+ * Privilege hardening only; defaults via `resolveContainerSecurity`. Resource ceilings deliberately live in
+ * `resources` (`dockerResourceLimitArgs`): one Docker flag set in two places yields contradictory args.
  */
 export interface SecurityConfig {
   /** Linux capabilities to drop. Default `['ALL']`. */
@@ -613,12 +441,7 @@ export interface SecurityConfig {
   noNewPrivileges?: boolean;
 }
 
-/**
- * Resolve a declared `security` block against the safe defaults, mirroring
- * `resolveContainerResources`. Single owner of the defaults: `securityArgs`
- * turns this into Docker flags and `ncl groups config get` reports it as
- * `effective_security`, so an audit sees exactly what the spawn will do.
- */
+/** Single owner of the defaults: `securityArgs` emits them and `ncl groups config get` reports them. */
 export function resolveContainerSecurity(security?: SecurityConfig): Required<SecurityConfig> {
   return {
     capDrop: security?.capDrop ?? ['ALL'],
@@ -627,11 +450,7 @@ export function resolveContainerSecurity(security?: SecurityConfig): Required<Se
   };
 }
 
-/**
- * Explicit Git author and committer identity for one agent group. This is
- * intentionally separate from credentialFolder: siblings may share credentials
- * while retaining attribution that identifies the individual agent.
- */
+/** Separate from credentialFolder: siblings may share credentials but keep individual attribution. */
 export interface GitIdentity {
   name: string;
   email: string;
@@ -647,11 +466,7 @@ function hasGitIdentityControlCharacter(value: string): boolean {
   });
 }
 
-/**
- * Validate the all-or-nothing per-agent Git identity declaration. Git will
- * otherwise silently fall back to a repository or inherited identity, which
- * defeats the point of explicitly configuring attribution for an agent.
- */
+/** All-or-nothing: a partial identity lets Git silently fall back to an inherited one. */
 function validateGitIdentity(value: unknown): GitIdentity | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -675,22 +490,10 @@ function validateGitIdentity(value: unknown): GitIdentity | undefined {
   return { name, email };
 }
 
-/**
- * Smallest honoured `autoCompactWindow`. Compaction fires at the CLI's default
- * percentage of the window; below ~100k a large standing-instruction set
- * (~14k tokens on the heaviest group) plus a few tool results would compact every handful
- * of calls, and the session would lose more context to summaries than the
- * window saves.
- */
+/** Below ~100k, standing instructions plus a few tool results would compact every handful of calls. */
 export const MIN_AUTO_COMPACT_WINDOW = 100_000;
 
-/**
- * Validate the optional `autoCompactWindow` override. Absent means the fleet
- * default; anything present must be an integer token count at or above
- * `MIN_AUTO_COMPACT_WINDOW`. A typo throws, like `validateContainerResources`,
- * rather than silently reading as the 1M default — a lowered window that
- * quietly reverts is a fail-open.
- */
+/** Absent = fleet default. A typo throws rather than silently reverting to the default (a fail-open). */
 function validateAutoCompactWindow(value: unknown): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < MIN_AUTO_COMPACT_WINDOW) {
@@ -699,33 +502,13 @@ function validateAutoCompactWindow(value: unknown): number | undefined {
   return value;
 }
 
-/**
- * `excludePlugins` validation and the covering relation live in
- * `src/plugin-exclusions.ts`, the import-free file the container runs a
- * verbatim copy of (`container/agent-runner/src/plugin-exclusions.ts`), so the
- * host's reading of an entry and each in-container walker's are one
- * implementation. Re-exported here because this module is where every host
- * consumer already reaches for container.json's schema.
- */
+/** Re-exported from src/plugin-exclusions.ts, which the container runs a verbatim copy of. */
 export { splitExcludedPlugins, validateExcludePlugins } from './plugin-exclusions.js';
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   /** Structured reporting override. Absent is the fleet default; false is rollback. */
   outcomeReporting?: boolean;
-  /**
-   * Stamp the model/effort/context subtext under this group's own replies.
-   *
-   * ON everywhere unless a group sets `false`, because the whole point is the
-   * operator not having to remember what a long-lived thread is running on.
-   * The opt-out is per group rather than fleet-wide: the groups that want it
-   * silenced are the ones whose conversations include people outside the
-   * fleet, for whom the line is noise and a small disclosure of how the fleet
-   * is configured.
-   *
-   * Read by the runner straight out of the bind-mounted container.json
-   * (`container/agent-runner/src/config.ts`); the host only needs to preserve
-   * it across a read-modify-write of this file.
-   */
+  /** Model/effort subtext under replies; ON unless `false`. Read by the runner from the mounted file. */
   statusSubtext?: boolean;
   /** Physical channel addresses whose routine outcomes belong to an existing external reporter. */
   outcomeReportingExternalChannels?: string[];
@@ -741,49 +524,23 @@ export interface ContainerConfig {
   assistantName?: string;
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
-  /** Per-session container resource request and hard ceilings. */
   resources?: ContainerResources;
 
-  /** Per-session container privilege hardening (capabilities, no-new-privileges). */
   security?: SecurityConfig;
 
-  /**
-   * Provider-level model / reasoning effort tracked in the container_configs
-   * DB row (upstream's 014 schema). Distinct from the per-group default*
-   * fields below — those are intent ("opus" alias resolution); these are
-   * what the DB row materializes for ops tooling that scopes via `ncl`.
-   */
+  /** What the container_configs row materializes for `ncl` (distinct from the default* intent fields below). */
   model?: string;
   effort?: string;
 
-  /**
-   * IANA timezone for this group's container (`TZ` env at spawn) — the zone
-   * the agent's own clock and `formatLocalTime` render in. Absent = follow
-   * the install-global timezone. Mirrored from `container_configs.timezone`
-   * by the `ncl groups create`/`groups config update` write paths, the same
-   * dual-write provider/model/effort use.
-   */
+  /** IANA zone for the container's `TZ`; absent = install timezone. Mirrored from `container_configs.timezone`. */
   timezone?: string;
 
-  /**
-   * Claude Code auto-compact window (tokens) for this group's containers —
-   * `CLAUDE_CODE_AUTO_COMPACT_WINDOW` at spawn. Absent = the fleet default
-   * (600,000). Lowering it makes compaction fire earlier
-   * and bounds the per-step context a long session carries. Not mirrored to
-   * the DB; only the spawn path reads it. docs/specs/quota-burn/plan.md §0.5.
-   */
+  /** `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (tokens); absent = fleet default. Not mirrored to the DB. */
   autoCompactWindow?: number;
 
   /**
-   * Where to route spawns while `provider` is recorded unavailable (an
-   * exhausted account, a suspended key). Opt-in per group: with no
-   * declaration a provider outage still fails loudly rather than silently
-   * changing which model answers a user.
-   *
-   * A fallback is a deliberate degradation — a different vendor means
-   * different failure modes and, for adversarial roles, a loss of the
-   * independence the pairing was built for. Groups that care must say so in
-   * their own output; this field only keeps them running.
+   * Opt-in route while `provider` is recorded unavailable; without it an outage fails loudly. A different vendor
+   * loses an adversarial pairing's independence: groups that care must say so in their own output.
    */
   providerFallback?: {
     provider: string;
@@ -792,157 +549,42 @@ export interface ContainerConfig {
   };
 
   /**
-   * Per-group OneCLI secret declaration. Each entry is either a secret
-   * NAME (e.g. "Datafold-ExampleRetail") or a UUID. Names resolve via
-   * `onecli secrets list` at apply time. When non-empty, the host
-   * forces the agent's secret mode to `selective` and assigns exactly
-   * these secrets (declarative — replaces any prior assignment).
-   *
-   * Missing/empty/absent = no-op: agent keeps whatever assignment and
-   * mode the operator set via the UI or CLI. Use this when you want a
-   * group to have access to only a specific subset of vault secrets
-   * (e.g. `example-retail` should not see `Example Labs-*` keys).
-   *
-   * Hard-fails the container spawn if any declared name doesn't resolve
-   * to a vault secret — matches the codebase's fail-closed posture so
-   * misconfigurations are loud rather than silently broken.
+   * OneCLI secret names or UUIDs. Non-empty: the agent's secret mode is forced to `selective` with exactly these
+   * (declarative). Absent/empty: no-op, the operator's assignment stands. An unresolvable name fails the spawn.
    */
   onecliSecrets?: string[];
 
-  /**
-   * Name of the env var on the host that holds this group's GitHub token.
-   * If unset, container-runner derives a name from the folder
-   * (`GITHUB_TOKEN_<FOLDER_UPPER>` with dashes as underscores) and falls
-   * back to `GITHUB_TOKEN`.
-   */
+  /** Host env var holding this group's GitHub token; default `GITHUB_TOKEN_<FOLDER_UPPER>`, then `GITHUB_TOKEN`. */
   githubTokenEnv?: string;
 
   /**
-   * Plugin paths under `~/plugins/` to NOT deliver to this group. Plugins
-   * under `~/plugins/` are mounted into every container by default (RO at
-   * `/workspace/plugins/<name>`). Use this when a group shouldn't have access
-   * to a specific plugin — e.g., security-sensitive agents excluding the
-   * `codex` plugin to avoid handing them a CLI with the host's Codex OAuth
-   * session.
-   *
-   * Two granularities, one field. Both reach every provider; what differs is
-   * whether the BYTES go or only the REGISTRATION:
-   *   - `"bootstrap"` — a top-level entry. Its mount is never created, so the
-   *     plugin is absent from `/workspace/plugins` for every provider. (One
-   *     documented exception: OpenCode's skills arrive through the host's
-   *     per-sibling mirror rather than this mount, and the session XDG copy of
-   *     that mirror is filtered for SUB-PATH entries only, so a top-level entry
-   *     there drops the mount and the ruleset and keeps the skills. See
-   *     `excludedOpenCodeSkillNames`, `src/providers/opencode.ts`.)
-   *   - `"bootstrap/plugins/orchestrate"` — one sub-plugin of a monorepo whose
-   *     other sub-plugins the group keeps. The repo still mounts whole, so the
-   *     sub-plugin's FILES stay readable at `/workspace/plugins/<repo>/<sub>`.
-   *     What is withheld is REGISTRATION, by each walker that would have
-   *     performed it: the Claude SDK `plugins:` list (and with it the
-   *     sub-plugin's SessionStart hook and PreToolUse guards), the Codex
-   *     registration plan (and, keyed off it, hook trust), the
-   *     `~/.agents/skills` mirror both Codex and OpenCode read, the OpenCode
-   *     session XDG skill copy, and the standing directive in the composed
-   *     prompt (`src/claude-md-compose.ts`). One thing a sub-path entry does
-   *     NOT withhold: the guard files the runner imports by absolute path,
-   *     which never pass through a walker. Three sites load
-   *     `bootstrap/plugins/workflow-agents/hooks/guards/*-core.ts` by file
-   *     presence and fall back to an inline policy when it is gone
-   *     (`providers/claude.ts`, `codex-hooks/runner.ts`,
-   *     `scheduling/task-script.ts`); `providers/opencode.ts` loads
-   *     `bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts` — a
-   *     DIFFERENT sub-plugin — and REFUSES THE SPAWN rather than degrading if
-   *     that file is absent. So excluding `workflow-agents` keeps the guard
-   *     everywhere, and excluding `workflow` keeps it too, because the entry
-   *     withholds registration, not bytes.
-   *
-   * Every one of those decisions is made where the path resolves, against a
-   * path the walker assembled itself, through one shared predicate
-   * (`src/plugin-exclusions.ts`, copied verbatim to
-   * `container/agent-runner/src/plugin-exclusions.ts`). Masking the sub-path
-   * host-side with an empty bind mount was tried and removed first: it required
-   * the host to predict what a container's own walkers would resolve, and an
-   * absolute symlink inside the repo is absent to a host `statSync` while live
-   * once the repo is mounted, so the exclusion silently did not apply. Nothing
-   * here predicts. An entry naming a path this install does not carry REFUSES
-   * THE SPAWN, top-level and sub-path alike: the mount builder walks each entry
-   * segment by segment against the real tree and throws when one is missing
-   * (`src/container-runner.ts`). An exclusion that matches nothing withholds
-   * nothing, and a warning nobody reads is how that stays invisible.
-   *
-   * Validated by `validateExcludePlugins` — a malformed entry throws rather
-   * than being silently ignored.
+   * `~/plugins` paths NOT delivered to this group (validated by `validateExcludePlugins`). A top-level entry is
+   * never mounted, guard files included (OpenCode's skills still arrive via a mirror filtered only for sub-path
+   * entries). A sub-path entry (`"bootstrap/plugins/orchestrate"`) withholds only REGISTRATION: the repo mounts
+   * whole, so absolute-path guard files stay, and each walker that would register it skips it via
+   * `src/plugin-exclusions.ts`. An entry naming a path this install lacks REFUSES THE SPAWN: an exclusion that
+   * matches nothing silently withholds nothing.
    */
   excludePlugins?: string[];
 
-  /**
-   * Named MCP servers to suppress for this group. Universal MCPs
-   * (granola, deepwiki, context7, exa, pocket) are injected by default
-   * in every container; add entries here to opt OUT per group.
-   */
   excludeMcpServers?: string[];
 
-  /**
-   * When true, mount the host `~/.wix` directory into the container RW so the
-   * Wix CLI uses the host's OAuth session (operator ran `wix login` once on the
-   * host). RW because the CLI rewrites `~/.wix/auth/account.json` on token
-   * refresh. Mounted straight to `/home/node/.wix` via a dedicated path in
-   * container-runner — NOT `additionalMounts`, which `validateAdditionalMounts`
-   * sandboxes under `/workspace/extra` (where the CLI's `os.homedir()`-based
-   * `~/.wix` lookup would never find it). Default OFF — unlike the Codex and
-   * OpenCode credentials, which every container carries, Wix is one tenant's
-   * CLI and has no fleet-wide use.
-   */
+  /** Mount host `~/.wix` RW for the Wix CLI's OAuth session. Default OFF: one tenant's CLI, no fleet-wide use. */
   wixHostAuth?: boolean;
 
   /**
-   * Ordered list of additional host `~/.codex*` directories to mount as
-   * fallback OAuth identities. Each entry is a host path (e.g.
-   * `~/.codex`, `~/.codex-other`). At spawn, container-runner resolves
-   * `~`, drops entries that lack an `auth.json`, mounts each survivor RW
-   * at `/home/node/.codex-fallback-N/`, and forwards
-   * `CODEX_FALLBACK_HOMES=/home/node/.codex-fallback-1:/home/node/.codex-fallback-2`.
-   *
-   * The container's codex provider rotates through these on
-   * UsageLimitExceeded / ServerOverloaded / coarse-systemError by
-   * copying the active thread's rollout `.jsonl` into the next CODEX_HOME's
-   * sessions tree, killing the codex app-server, and respawning under the
-   * new CODEX_HOME. Conversation history is preserved (the rollout file
-   * is self-contained — codex reconstructs history inline).
-   *
-   * Gated only by the `codex` plugin being mounted for the group — the same
-   * condition as the primary `~/.codex` mount, which is otherwise
-   * unconditional. Per-group by design: the primary identity is shared, the
-   * fallback identities are whatever this group was given.
+   * Host `~/.codex*` dirs mounted as fallback OAuth identities (entries without `auth.json` dropped); the codex
+   * provider rotates through them on usage-limit/overload errors, carrying the rollout so history is preserved.
    */
   codexAuthFallbacks?: string[];
 
   /**
-   * Optional override for the folder used as the lookup key when resolving
-   * per-group credentials (LOOKER_*, DBT_*, GITHUB_TOKEN, RENDER_PG_*,
-   * GIT_AUTHOR_*, Claude OAuth, Codex auth dir, etc.) via the
-   * `<BASE>_<FOLDER_UPPER>` scoped-env convention.
-   *
-   * Default (when undefined): `agent_groups.folder` is the lookup key, so
-   * each group needs its own scoped env vars.
-   *
-   * Set when a sibling agent group should inherit another group's credentials
-   * — most commonly a Codex sibling cloned from a Claude source. Example:
-   * `groups/example-retail-codex/container.json` sets
-   * `"credentialFolder": "example-retail"` so example-assistant-codex picks up
-   * `LOOKER_BASE_URL_EXAMPLE_RETAIL` instead of looking for the non-existent
-   * `LOOKER_BASE_URL_EXAMPLE_RETAIL_CODEX`.
-   *
-   * Does NOT affect identity-bound paths such as container name, group dir
-   * mount, and log fields; those stay on `agent_groups.folder`.
+   * Folder used as the `<BASE>_<FOLDER_UPPER>` credential lookup key (default: the group's own folder), so a
+   * sibling can inherit its source group's credentials. Identity-bound paths stay on `agent_groups.folder`.
    */
   credentialFolder?: string;
 
-  /**
-   * Optional author and committer identity for Git commands in this agent's
-   * container. Omit it to retain the established credentialFolder-scoped Git
-   * environment resolution.
-   */
+  /** Git author/committer identity; omit to keep credentialFolder-scoped Git env resolution. */
   gitIdentity?: GitIdentity;
 
   /**
@@ -952,122 +594,44 @@ export interface ContainerConfig {
   gitnexusInjectAgentsMd?: boolean;
 
   /**
-   * Per-group default model for this agent's turns — exported as
-   * NANOCLAW_CLAUDE_MODEL (`claudeSpawnEnv`, src/claude-spawn-defaults.ts).
-   * Overrides the install-wide default (DEFAULT_OPUS_MODEL, src/flag-parser.ts).
-   * Per-channel wiring overrides this; per-session `-m <model>` flags override
-   * on top of that.
-   *
-   * It does NOT set what the bare `opus` alias resolves to: the SDK's
-   * ANTHROPIC_DEFAULT_OPUS_MODEL short-circuit is the install's Opus constant
-   * for every group. It carried this value until 2026-09-15, which is why a
-   * `model: opus` pin or subagent ran whatever the group ran.
+   * Group default model (NANOCLAW_CLAUDE_MODEL); per-channel wiring and per-session `-m` override it. It does NOT
+   * change what the bare `opus` alias resolves to: that stays the install's Opus constant for every group.
    */
   defaultModel?: string;
 
-  /**
-   * Per-group default reasoning effort when the agent doesn't pass
-   * `-e <level>`. One of 'low' | 'medium' | 'high' | 'xhigh' | 'max'.
-   * Overrides the install-wide DEFAULT_EFFORT constant in
-   * container-runner.ts. Per-channel wiring overrides this; per-session
-   * `-e <level>` flags override on top of that.
-   */
+  /** Group default effort; per-channel wiring and per-session `-e` override it. */
   defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-  /**
-   * Per-agent-group default tone profile name (matches a file under
-   * `tone-profiles/<name>.md`). Acts as the fallback when a per-channel
-   * wiring doesn't set `default_tone` on `messaging_group_agents`.
-   */
+  /** Tone profile (`tone-profiles/<name>.md`) used when the wiring sets no `default_tone`. */
   tone?: string;
 
   /**
-   * Per-agent credential/tool allowlist. Each entry is either a bare tool
-   * name (`snowflake`) or scoped (`snowflake:archive-one`, `aws:example-data`).
-   * Omit to grant every credential surface; include to filter per-tool
-   * before mount. Supported tool names: gmail, gmail-readonly, calendar,
-   * google-workspace, snowflake, aws, gcloud, dbt, github, render, datafold,
-   * linear, atlassian, looker, dbt-mcp.
-   *
-   * This is a FILTER, not a grant — an entry here only permits a surface some
-   * other code path mounts or injects. A name that nothing honors is silently
-   * inert, so do not read a `tools` entry as evidence that a credential is
-   * wired. `browser-auth` was listed here for a long time and never had an
-   * implementation: no `isToolEnabled('browser-auth')` call, no `.env` section,
-   * no staged `creds/` dir. Groups declaring `browser-auth:<account>` read as
-   * though browser credentials were scoped per agent when nothing was
-   * delivered; browser logins are supplied by an explicit `additionalMounts`
-   * entry or a shared workgroup file instead. Removed 2026-08-07 after it cost
-   * a live debugging session.
+   * Per-agent credential/tool allowlist (`snowflake`, `snowflake:archive-one`); omit to grant every credential
+   * surface. A FILTER, not a grant: an entry only permits a surface some code path actually mounts or injects, so
+   * a name nothing honors is silently inert and is no evidence a credential is wired.
    */
   tools?: string[];
 
   /**
-   * Per-provider sticky config for the agent that runs in this group.
-   * Populated by `create_agent`'s host handler after container-side Zod
-   * validation (decision D4 — container is the validation authority).
-   * Each provider reads only its own slice.
-   *
-   * Source of truth for valid keys per provider:
-   *   container/agent-runner/src/providers/<name>.ts — see the exported
-   *   `<name>ConfigSchema`. Currently:
-   *     - 'claude': { model?: string, effort?: 'low'|'medium'|'high'|'xhigh'|'max' }
-   *     - 'codex':  { model?: string,
-   *                   reasoning_effort?: 'low'|'medium'|'high'|'xhigh'|'max'|'ultra',
-   *                   max_concurrent_threads_per_session?: positive integer }
-   *     - Others (e.g. opencode, mock): no configSchema — must be empty {}.
-   *
-   * Provider schemas are the durable source of truth; historical planning
-   * artifacts are intentionally not tracked in the public repository.
+   * Per-provider sticky config, validated container-side (the provider's exported `<name>ConfigSchema` defines
+   * the keys). Each provider reads only its own slice; providers without a schema must get `{}`.
    */
   providerConfig?: Record<string, unknown>;
 
-  /**
-   * Per-group daily summary digest config. The host-side daily-summary timer
-   * (src/daily-summary.ts) posts a per-workgroup activity digest once a day.
-   * `messagingGroupId` is the explicit opt-in and destination; without it,
-   * the workgroup has no digest and the host does not fall back to a primary
-   * wired channel.
-   */
+  /** Daily digest; `messagingGroupId` is the opt-in and destination (no fallback to a wired channel). */
   dailySummary?: {
     messagingGroupId?: string;
-    /**
-     * Optional GitHub Issues source for this Codex poster's workgroup backlog,
-     * as `owner/repo`. When set, the host summary reads open and recently
-     * closed issues from GitHub instead of legacy SQLite backlog rows.
-     */
+    /** GitHub `owner/repo` backlog source instead of legacy SQLite rows. */
     githubIssuesRepo?: string;
-    /**
-     * Include the shipped-work sections (🤖 Agent Shipped / 🛠 Other commits)
-     * in the digest. Defaults to true. Workgroups whose ship state already
-     * lives in a dedicated release channel (a release scrum-master agent)
-     * set false so the digest carries only backlog activity.
-     */
+    /** Shipped-work sections; default true. */
     shipLog?: boolean;
-    /**
-     * Include backlog items resolved during the digest window. Defaults to
-     * true. Set false when another workflow already reports completed work
-     * and this digest should be an open-backlog-only reminder.
-     */
+    /** Resolved backlog items; default true. */
     resolved?: boolean;
-    /**
-     * Include the ranked open-backlog list (parent headline + threaded list).
-     * Defaults to true. Set false once the workgroup's backlog lives in a real
-     * tracker and is rendered by `backlogCanvas` — the daily repost of a list
-     * that barely changes day to day is noise, and the canvas is always current.
-     */
+    /** Ranked open-backlog list; default true. */
     backlog?: boolean;
   };
 
-  /**
-   * Per-workgroup live backlog board, rendered into a Slack channel canvas by
-   * `src/backlog-canvas.ts`. Presence of `messagingGroupId` is the opt-in — no
-   * declaration means no canvas, so other workgroups are unaffected.
-   *
-   * Declare this on the group whose Slack bot holds the `canvases:write` scope;
-   * the canvas is a property of the channel, not of the posting bot, so the
-   * choice of writer is invisible to readers.
-   */
+  /** Slack channel canvas board (src/backlog-canvas.ts); declare it on the group whose bot holds `canvases:write`. */
   backlogCanvas?: {
     /** Destination channel. Its channel_type also selects the bot token. */
     messagingGroupId?: string;
@@ -1076,13 +640,8 @@ export interface ContainerConfig {
   };
 
   /**
-   * Observatory presentation for this agent's WORKGROUP. Declared on any one
-   * member group (same convention as backlogCanvas); the first declaration
-   * found wins.
-   *
-   * `platforms` is an allow-list of channel-type prefixes the office floor
-   * shows — `["slack"]` hides a workgroup's dormant Discord wiring without
-   * un-wiring it. Absent = show every platform.
+   * Observatory presentation for this agent's WORKGROUP; the first member declaration found wins. `platforms`
+   * allow-lists channel-type prefixes (absent = all).
    */
   observatory?: {
     platforms?: string[];
@@ -1090,28 +649,12 @@ export interface ContainerConfig {
     hideRooms?: string[];
   };
 
-  /**
-   * The workgroup this agent belongs to. Set by migration 036 and written
-   * into container.json for workgroup-scoped retrieval.
-   *
-   * Value matches workgroups.id (e.g. "example-retail" for both example-retail
-   * and example-retail-codex agents).
-   */
+  /** Matches workgroups.id (shared by an agent and its codex sibling). */
   workgroup_id?: string;
 
   /**
-   * Slack user-token (xoxp-) scoping. The token lives in the OneCLI vault and
-   * is injected at the proxy, so live Slack is `curl https://slack.com/api/*`
-   * from the container, reading from the OWNER'S Slack lens.
-   *
-   * Fail-closed defaults: the token is injected only in the owner's 1:1 DM
-   * with this agent. A shared channel spawns under the `<group>-noslack`
-   * OneCLI identity with the token withheld, unless the operator explicitly
-   * extends `also_allowed_in` with the channel's messaging_group_id.
-   *
-   * The OneCLI vault must have a token entry for the agent's workspace
-   * (e.g., `Slack-User-Token-Example Labs`) assigned via the workgroup's
-   * `onecli_secrets`. See docs/slack-user-token.md.
+   * Slack user-token scoping. Fail-closed: the token is injected only in the owner's 1:1 DM; other sessions spawn
+   * under the `<group>-noslack` OneCLI identity with it withheld, unless listed in `also_allowed_in`.
    */
   slack_user_token?: SlackUserTokenConfig;
 }
@@ -1124,42 +667,18 @@ interface SlackUserTokenConfig {
    */
   enabled?: boolean;
 
-  /**
-   * Override allow-list. By default the Slack user token is injected only
-   * when the spawning session is the owner's 1:1 DM with this agent. Add
-   * specific `messaging_group_id` values here to inject it in additional
-   * contexts (e.g., a private channel that's just the owner + trusted
-   * collaborators where it's OK to query the owner's lens).
-   *
-   * Format: messaging_groups.id strings. Use `pnpm exec tsx scripts/q.ts
-   * data/v2.db "SELECT id, name FROM messaging_groups"` to find ids.
-   */
+  /** messaging_groups.id values where the owner's token may also be injected (beyond the owner DM). */
   also_allowed_in?: string[];
 
   /**
-   * Names (or UUIDs) of the OneCLI secrets that back Slack user-token access
-   * for this agent — the credentials that let it read the OWNER's Slack via
-   * the proxy (`curl https://slack.com/api/*`). In SHARED sessions (not
-   * owner-safe per `also_allowed_in` / owner-DM) these secrets are WITHHELD
-   * from the session's OneCLI agent, so nothing in that container can reach
-   * Slack as the owner — the boundary is enforced at the credential layer.
-   *
-   * When unset, the host falls back to a naming convention: any merged
-   * OneCLI secret whose name contains both "slack" and "user" (case-
-   * insensitive — matches `Slack-User-Token-*`). Set this explicitly when
-   * your secret doesn't follow that convention, so the security control
-   * doesn't rely on a regex guess. See `slackUserTokenSecrets`.
+   * OneCLI secrets backing Slack user-token access, WITHHELD from non-owner-safe sessions. Unset falls back to any
+   * merged secret whose name contains both "slack" and "user"; set it explicitly rather than rely on that guess.
    */
   onecli_secret_names?: string[];
 }
 
 function emptyConfig(): ContainerConfig {
-  // tools defaults to `[]` (default-deny) for new groups so a child
-  // spawned via create_agent doesn't inherit every credential surface
-  // (snowflake, gws, aws, dbt, etc.). Operators add tool entries to
-  // explicitly grant credential access. Pre-2026-05-03 this field was
-  // omitted, which made `isToolEnabled()` allow every tool — pairing
-  // dangerously with create_agent. See cross-tenant audit.
+  // tools defaults to `[]` (default-deny) so a child spawned via create_agent inherits no credential surface.
   return {
     mcpServers: {},
     packages: { apt: [], npm: [] },
@@ -1174,42 +693,23 @@ function configPath(folder: string): string {
 }
 
 /**
- * Decide whether a stored override is honoured — THE predicate, and the only
- * place `isIanaTimezone` is consulted about a stored value. The ncl write path
- * validates and canonicalizes on the way in, but a hand-edited value must not
- * silently flip a group's clock: anything the zone database cannot confirm (a
- * fixed offset, an abbreviation, wrong case, a retired alias, and on a host
- * with no zone database, any id at all) is ignored, exactly as if no override
- * were set.
+ * THE predicate for honouring a stored override: anything the zone database cannot confirm (offsets,
+ * abbreviations, wrong case, retired aliases; every id on a host with no zone database) is ignored.
  */
 export function honouredTimezoneOverride(override: string | null | undefined): string | undefined {
   return override && isIanaTimezone(override) ? override : undefined;
 }
 
 /**
- * The same verdict expressed as a timezone to use — the honoured override, or
- * `fallback`. `fallback` exists for the one caller with a better default than
- * the config's `TIMEZONE`: the fleet report reads the running service's own
- * `TZ` off its systemd unit.
+ * The honoured override, or `fallback` (the fleet report passes the service's own systemd `TZ`).
  */
 export function effectiveTimezone(override: string | null | undefined, fallback: string = TIMEZONE): string {
   return honouredTimezoneOverride(override) ?? fallback;
 }
 
 /**
- * Effective timezone for an agent group: per-group override → install global.
- * THE resolver — every caller that needs to know which timezone applies to a
- * group goes through here, so the answer is derived in one place: scheduling
- * (cron interpretation, `--process-after`, run-log stamps), recurrence,
- * dashboard assembly and mutations, host-gated task scripts, and the operator
- * scripts under `scripts/`. There is no second lookup of
- * `container_configs.timezone` anywhere.
- *
- * This is the DB side. The container's own `TZ` comes from `container.json`
- * at spawn — mirrored by the same write paths, the identical split
- * provider/model/effort already live under — and reaches the same verdict
- * through `effectiveTimezone`, which the spawn path calls directly because it
- * holds the file value rather than a group id.
+ * THE resolver: every caller needing a group's timezone goes through here. The spawn path reaches the same verdict
+ * via `effectiveTimezone` on the container.json value.
  */
 export async function resolveGroupTimezone(agentGroupId: string, fallback: string = TIMEZONE): Promise<string> {
   return effectiveTimezone((await getContainerConfig(agentGroupId))?.timezone, fallback);
@@ -1219,43 +719,13 @@ export async function resolveGroupTimezone(agentGroupId: string, fallback: strin
  * Effective agent provider for a group: the AUTHORITATIVE `container.json`,
  * and NEVER from the `container_configs` projection.
  *
- * THE resolver — every caller that needs to know which provider a group
- * actually runs goes through here, for the same reason `resolveGroupTimezone`
- * above exists: the answer must be derived in one place or the copies drift.
- * The file is what the spawn path bind-mounts and what the in-container runner
- * reads; the DB row is a read-side projection for flag vocabulary and image
- * builds, and it CAN lag — a DB-only edit, a restore, an older code path.
- *
- * Reading the projection instead is not a style question, it is a
- * wrong-answer: a group whose row says `claude` while its file still says
- * `codex` is running codex, so a provider-migration audit consulting the row
- * reports "nothing stranded" for a group that has stranded pins, and a bulk
- * repin resolves aliases and validates replacements in the wrong vocabulary.
- * Both of those were found as separate defects at separate call sites before
- * this resolver existed, which is the argument for it.
- *
- * An ABSENT `provider` key resolves to `claude`, not to the projection.
- * That is not a preference — it is what actually boots: the spawn path calls
- * `resolveProviderName(session.agent_provider, containerConfig.provider)` on
- * the file it bind-mounts (`container-runner.ts`), and `resolveProviderName`
- * defaults a missing value to `claude`. Consulting the row for the absent
- * case reintroduces the whole bug one level down: a group with no `provider`
- * key and a stale `codex` row runs Claude, but this resolver would answer
- * `codex`, so `config update --provider codex` reads as a no-op, skips the
- * pin audit entirely, and then writes `codex` into the authoritative file —
- * stranding every Claude pin in exactly the migration this resolver exists
- * to make safe. The resolver must agree with the spawn path even where the
- * spawn path's answer comes from a default rather than from a stored value.
+ * THE resolver. The projection CAN lag, and reading it gives wrong answers (e.g. a migration audit reporting
+ * nothing stranded). An ABSENT `provider` resolves to `claude`, never to the projection, because that is what the
+ * spawn path boots (`resolveProviderName` defaults a missing value to `claude`).
  */
 export async function resolveGroupProvider(agentGroupId: string, sessionProvider?: string | null): Promise<string> {
-  // Takes the group id ALONE and finds the folder itself. An earlier shape
-  // required callers to pass the folder, which is how a resolver acquires a
-  // second way to be called wrong — a caller with no folder in hand quietly
-  // passes `undefined` and silently gets the projection back, i.e. exactly the
-  // bug this exists to prevent, reintroduced by its own signature.
-  //
-  // `sessionProvider` is the per-session sticky override the MCP scheduling
-  // path carries; it outranks both stores when set, unchanged from before.
+  // Takes the group id ALONE: a folder parameter would let callers pass `undefined` and silently get the projection.
+  // `sessionProvider` (per-session sticky override) outranks both stores.
   const folder = (await getAgentGroup(agentGroupId))?.folder;
   const fileProvider = folder ? readContainerConfig(folder).provider : undefined;
   // Deliberately the same two arguments the spawn path passes, and no third.
@@ -1286,11 +756,8 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
 }
 
 /**
- * Read the container config for a group, returning sensible defaults for
- * any missing fields (or an entirely empty config if the file is absent).
- * Never throws for missing / malformed JSON — corruption logs a warning
- * via console.error and falls back to empty. Unsupported MCP transports fail
- * closed after the file is parsed.
+ * Never throws for a missing or malformed file (warns and falls back to empty); unsupported MCP transports fail
+ * closed after parsing.
  */
 export function readContainerConfig(folder: string): ContainerConfig {
   const p = configPath(folder);
@@ -1333,12 +800,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
   return {
     wikiMaintenance: raw.wikiMaintenance,
     outcomeReporting: raw.outcomeReporting,
-    // Only an explicit `false` opts out. A missing key, a null, or a
-    // non-boolean is the default ON — a malformed config must not silently
-    // strip a signal the operator relies on, and silence is the state that has
-    // to be asked for. `undefined` here keeps the key out of a rewritten
-    // container.json, so a group that never opted out does not accumulate a
-    // field it did not set.
+    // Only an explicit `false` opts out; `undefined` keeps the key out of a rewritten container.json.
     statusSubtext: raw.statusSubtext === false ? false : undefined,
     outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
       ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
@@ -1365,11 +827,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
     excludePlugins: validateExcludePlugins(raw.excludePlugins),
-    // NB: no `codexHostAuth`. The field was removed when the Codex host-auth
-    // mount became unconditional; every existing `groups/*/container.json`
-    // still carries it. This projection is an ALLOWLIST — a key with no line
-    // here is dropped, silently and by construction — so those files keep
-    // parsing and the stale value reaches nothing.
+    // This projection is an ALLOWLIST: a key with no line here is silently dropped.
     wixHostAuth: raw.wixHostAuth,
     codexAuthFallbacks: raw.codexAuthFallbacks,
     credentialFolder: raw.credentialFolder,
@@ -1390,14 +848,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
   };
 }
 
-/**
- * Fleet default without materializing it into operator-owned container.json.
- *
- * Mirrors effectiveOutcomeReporting: only an explicit `false` opts out, so a
- * missing key reads as ON. Callers that show an operator what a group is set
- * to must present BOTH this and the stored value — "unset" and "explicitly on"
- * are the same behaviour but not the same operator intent.
- */
+/** Only an explicit `false` opts out. Operator views must show this AND the stored value (unset ≠ explicitly on). */
 export function effectiveStatusSubtext(config: Pick<ContainerConfig, 'statusSubtext'>): boolean {
   return config.statusSubtext !== false;
 }
@@ -1408,56 +859,11 @@ export function effectiveOutcomeReporting(config: Pick<ContainerConfig, 'outcome
 }
 
 /**
- * Write the container config for a group, creating the groups/<folder>/
- * directory if necessary. Pretty-printed JSON so diffs in the activation
- * flow are reviewable.
- *
- * UNLOCKED, and the last step of a mutation rather than a mutation itself.
- * Every change to an EXISTING config must go through `updateContainerConfig`,
- * which holds the group's lock across read → mutate → write; calling this
- * directly on a live group races every other writer and silently loses writes.
- * It stays exported for seeding a config from whole cloth (tests, fixtures),
- * where there is nothing to lose.
- *
- * Refuses to overwrite an existing file the reader cannot understand as an
- * object. `readContainerConfig` is deliberately tolerant — it reads every field
- * and defaults a document it cannot understand, so a READ never fails on one
- * bad field — and every caller here is read-modify-write
- * (`updateContainerConfig`, and `ensureRuntimeFields`'s race-safe re-read on
- * the spawn path, `src/container-runner.ts`). Composed, those two turn a root
- * the reader could not understand into a materialized default written back over
- * the original: `[{"excludePlugins": […]}]` is replaced, on disk, by a config
- * declaring no exclusions, before any container reads it. That is the
- * operator's file destroyed and a deny policy silently dropped in one step, and
- * no fail-closed reader downstream can see it happen — it runs before the
- * mount. Tolerance is the right shape for READING a field; it is not a licence
- * to normalize away a document nobody has agreed to discard.
- *
- * Unparseable bytes are refused on the same terms — which the third substitute
- * pass argued for, and which this function originally got wrong by carving them
- * out. A truncated write leaves exactly the realistic case,
- * `{"excludePlugins": ["…"],` — the entries visibly in the file, the tolerant
- * reader answering "none" — and nothing here can tell that from any other parse
- * failure. The objection to refusing it was that a corrupt file would then have
- * no repair path; the answer is that automatic replacement was never one. Every
- * caller is read-modify-write over the tolerant reader
- * (`updateContainerConfig`, `ensureRuntimeFields` on the spawn path, and
- * `applyOptOut` in `scripts/enable-agent-plugin.ts`), so each would write the
- * reader's guess rather than the operator's file. The one caller that
- * legitimately CREATES a config, `initContainerConfig`, returns before writing
- * when the file exists, so nothing about first-time setup changes. Repair is a
- * person editing the file, and the error message says so.
- *
- * OPERATIONAL CONSEQUENCE, stated plainly because it is a change in how a
- * broken install behaves: a group whose `container.json` exists but is
- * malformed no longer spawns at all. `ensureRuntimeFields` runs on every spawn
- * and writes whenever the identity fields are missing, which they are for a
- * file the reader had to default, so the refusal aborts that spawn. It used to
- * silently repair the file into a config declaring no exclusions and carry on.
- * Wedging one group until a person looks at it is the intended trade against
- * dropping a deny policy nobody was told about, but it IS a trade: the earlier
- * claim that a group with an unreadable config still boots is no longer true
- * once the file exists.
+ * UNLOCKED: every change to an EXISTING config must go through `updateContainerConfig`; this is exported only for
+ * seeding a config from whole cloth. Refuses to overwrite a file that is not a JSON object, including unparseable
+ * bytes: every caller is read-modify-write over the tolerant reader, which would write its defaulted guess (e.g.
+ * no `excludePlugins`) over the operator's file. Consequence: a group with a malformed container.json does not
+ * spawn until a person repairs it.
  */
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
   validateMcpServers(config.mcpServers ?? {});
@@ -1468,39 +874,13 @@ export function writeContainerConfig(folder: string, config: ContainerConfig): v
   assertOverwritableContainerConfig(p);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  // IN PLACE, deliberately — NOT write-to-temp-and-rename.
-  //
-  // The rename is the textbook atomic write, and an earlier draft of this
-  // change used it. It is wrong HERE, and the reason is a mount:
-  // `groups/<folder>/` is bind-mounted read-WRITE into the agent container at
-  // `/workspace/agent` (`src/container-runner.ts`), the container runs as
-  // the host's own uid, and the ONLY thing protecting this file is a
-  // nested read-only single-file mount of `container.json` itself.
-  // An in-place write stays inside that protection. A sibling
-  // temp file gets none of it — an agent watching the directory can overwrite
-  // the temp file between our close and our rename, and the host then installs
-  // the agent's bytes as the authoritative config: `excludePlugins` emptied,
-  // `onecliSecrets` widened, `mcpServers` rewritten, with nothing downstream
-  // able to tell (`assertOverwritableContainerConfig` inspects only the file
-  // being replaced). That is a worse version of the very harm the lock prevents.
-  //
-  // What the rename would have bought is the torn-write case: a crash
-  // mid-`writeFileSync` leaves `{"excludePlugins": ["…"],`, which the tolerant
-  // reader answers "no exclusions" for. That case is already REFUSED rather
-  // than silently repaired by `assertOverwritableContainerConfig` above, and it
-  // is unchanged here. Serializing the writers is what the lost-write race needs;
-  // atomicity against a crash is a separate question and does not justify
-  // handing the agent a write it never had.
+  // IN PLACE, deliberately NOT write-to-temp-and-rename: the group dir is agent-writable and only a nested RO mount
+  // protects this file, so an agent could replace a sibling temp file before the rename and have the host install
+  // its bytes as the config. Torn writes are refused by `assertOverwritableContainerConfig` instead.
   fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
 }
 
-/**
- * Throw unless `p` is absent or holds a JSON object — see
- * `writeContainerConfig`. ABSENCE is the one state that passes, and it is
- * distinguished from a failed read rather than inferred from one: a file that
- * cannot be read or parsed may hold fields the writer is about to discard,
- * while a file that is not there holds none.
- */
+/** Throw unless `p` is absent or a JSON object. Absence is distinguished from a failed read, never inferred. */
 function assertOverwritableContainerConfig(p: string): void {
   const refuse = (why: string): never => {
     throw new Error(
@@ -1527,57 +907,18 @@ function assertOverwritableContainerConfig(p: string): void {
 }
 
 /**
- * Sidecar lock guarding every mutation of a group's `container.json`.
- *
- * A SIDECAR rather than the config file itself. Two reasons, and the second is
- * the one that decided the path: a lock that IS the data file is fragile
- * against any future change to how that file is committed (a write-to-temp and
- * rename would leave every holder locked on an inode the write had already
- * replaced), and it forces the lock to live wherever the data lives — which
- * here is exactly where it must not.
- *
- * Under DATA_DIR, deliberately NOT beside the config. `groups/<folder>/` is
- * bind-mounted into the agent container as `/workspace/agent`, so a lock file
- * there would be visible to the agent and, on a writable mount, deletable by
- * it — and `withFileLock` treats a changed lock inode as a hard failure
- * (`file-lock.ts`), which would turn an agent's `rm` into a refused spawn.
- * `data/` is host-only and never mounted. It also keeps the group folder's
- * tracked surface exactly what an operator authored.
- *
- * Stateless: the file carries no content and is safe to delete while the host
- * is stopped.
+ * A SIDECAR lock under host-only DATA_DIR, never beside the config: the group dir is mounted into the container,
+ * where an agent could delete the lock, and `withFileLock` treats a changed lock inode as a hard failure.
+ * Stateless; safe to delete while the host is stopped.
  */
 export function containerConfigLockPath(folder: string): string {
   return path.join(DATA_DIR, 'locks', 'container-config', `${path.basename(folder)}.lock`);
 }
 
 /**
- * THE mutation primitive for `groups/<folder>/container.json`. Every writer of
- * an existing config goes through here — the CLI (`ncl groups config update`),
- * the self-mod apply path, the spawn path's identity sync
- * (`ensureRuntimeFields`, `src/container-runner.ts`) and the plugin enabler's
- * opt-out (`applyOptOut`, `scripts/enable-agent-plugin.ts`, a SEPARATE
- * process).
- *
- * WHAT IT FIXES. All four were read-modify-write over the tolerant
- * `readContainerConfig` with no lock, version or compare-and-swap anywhere, so
- * process A's read, process B's whole write, then A's write silently discarded
- * B's change. `excludePlugins` is what made that more than a config annoyance:
- * losing it re-enables a plugin an operator deliberately withheld from a group,
- * with no error anywhere and no reader downstream able to tell. The spawn
- * path's `ensureRuntimeFields` re-read NARROWED that window and was commented
- * as "race-safe"; a re-read cannot close it, because the write that follows is
- * still a separate syscall.
- *
- * The lock spans read → mutate → write, so the mutator always sees the freshest
- * disk state and nothing lands between its read and its commit. It is held
- * across an `await` of the mutator's own return only if the mutator is async;
- * keep mutators synchronous and trivial — this is a file lock on the spawn
- * path, and anything slow inside it blocks every other writer for that group.
- *
- * Cross-process by construction (kernel `flock`, see `file-lock.ts`), which is
- * the requirement: one of the four writers is a hand-run script, so an
- * in-process mutex would have protected nothing that actually broke.
+ * THE mutation primitive for an existing `container.json`: the lock (cross-process `flock`, since one writer is a
+ * hand-run script) spans read → mutate → write, so no concurrent writer's change (e.g. `excludePlugins`) is
+ * silently lost. Keep mutators synchronous and trivial: anything slow blocks every other writer for that group.
  */
 export async function updateContainerConfig(
   folder: string,
@@ -1646,17 +987,7 @@ export async function writeContainerConfigJson(
   });
 }
 
-/**
- * Initialize an empty container.json for a group if one doesn't already
- * exist. Idempotent. (This doc used to name `group-init.ts` as the caller; it
- * has none in `src/` today — `readContainerConfig` tolerates an absent file and
- * the first real write creates it.)
- *
- * Under the same lock as every other writer, and for the same reason: the
- * check-then-create was not exclusive either, so two concurrent first spawns
- * could both see "absent" and the loser's empty config could land on top of
- * whatever the winner's caller wrote next.
- */
+/** Idempotent; under the same lock so two concurrent calls cannot both see "absent". */
 export async function initContainerConfig(folder: string): Promise<boolean> {
   return withFileLock(
     containerConfigLockPath(folder),

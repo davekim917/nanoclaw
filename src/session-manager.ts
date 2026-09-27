@@ -40,11 +40,7 @@ import {
 import { insertOrAdopt } from './db/insert-or-adopt.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import type { MailboxSession, MailboxSessionKey } from './mailbox/types.js';
-// The host's registered implementation is NanoclawAgentMailbox, so every
-// session() here hands the action the fork's narrowed session (plan §4.2).
-// Typing the helpers with it is what lets a caller reach a fork op without a
-// cast; an action written against upstream's narrower `MailboxSession` is
-// still accepted, since the parameter only widens.
+// Helpers take the fork's narrowed session type (the registered NanoclawAgentMailbox), so callers need no cast.
 import {
   sessionMailboxPath,
   type MessageInsert,
@@ -72,28 +68,16 @@ export function sessionContextPath(agentGroupId: string, sessionId: string): str
 }
 
 /**
- * The same path, derived from a session DIRECTORY rather than from DATA_DIR.
- *
- * The storage reclaim walks an injected sessions root, so it cannot go through
- * `sessionContextPath`. One definition of the layout keeps the two from
- * drifting — and they must not: the context file is a SIBLING of the session
- * directory, so removing that directory does not take it, and a reclaim that
- * misses it leaks one file per session forever.
+ * The same path from a session DIRECTORY (the reclaim walks an injected root). The file is a SIBLING of the
+ * session dir, so a reclaim that misses it leaks one file per session.
  */
 export function sessionContextPathFor(sessionPath: string): string {
   return path.join(path.dirname(sessionPath), '.context', `${path.basename(sessionPath)}.json`);
 }
 
 /**
- * Materialize the immutable context the runner receives at startup.
- *
- * The container READS this file and runs as a different UID than the host, so
- * it takes the mode of `inbound.db` and its directory the mode of the session
- * dir — the file and directory the container already reads today. Upstream's
- * 0700/0600 would be unreadable inside the container on any install whose
- * image UID differs from the host's, which is every install where
- * `buildContainerArgs` omits `--user`. Safe by upstream's own contract:
- * `runnerContext` is non-secret runner configuration, never credentials.
+ * Non-secret runner context. Takes the modes of `inbound.db` and the session dir, not upstream's 0700/0600: the
+ * container runs as a different UID wherever `--user` is omitted and must be able to read it.
  */
 export function writeSessionContext(agentGroupId: string, sessionId: string, mailbox: unknown): void {
   const contextPath = sessionContextPath(agentGroupId, sessionId);
@@ -118,63 +102,27 @@ function mailboxKey(agentGroupId: string, sessionId: string): MailboxSessionKey 
   return { agentGroupId, sessionId };
 }
 
-/** Root directory for all thread-scoped worktrees. */
 export function threadsBaseDir(): string {
   return path.join(DATA_DIR, 'v2-threads');
 }
 
-/**
- * Sanitize a thread-id (or messaging-group-id) into a filesystem-safe slug.
- * Slack uses `1234567890.123456` (period), Discord uses `123456789012345678`
- * (digits), and platform-internal ids may have other separators. Keep it
- * minimal — replace anything not [A-Za-z0-9._-] with `_`.
- */
+/** Replace anything outside [A-Za-z0-9._-] with `_` (no colons: Docker's `-v` splits on `:`). */
 function fsSlug(s: string): string {
   return s.replace(/[^A-Za-z0-9._-]/g, '_');
 }
 
 /**
- * Thread-scoped worktree directory. All sibling agents in the same thread
- * (e.g. helper + helper-codex) bind-mount this same host path at
- * `/workspace/worktrees` inside their containers so they collaborate on
- * the same checkout.
- *
- * Key derivation: `<thread-id>` (preferred) or `dm-<platform-id>` fallback.
- * Slack thread ids encode `slack:<channel>:<ts>` and Discord encodes
- * `discord:<guild>:<channel>:<thread>` — both globally unique, including
- * the platform prefix. So just using the thread_id alone is enough.
- *
- * For DM / non-threaded channels (thread_id=null), `dm-<platform_id>` keeps
- * the dir stable per conversation. Critically, when TWO sibling agents are
- * wired to the same channel via TWO Slack apps (`slack-example-labs` +
- * `slack-helpercodex` both seeing `slack:CTEST00004`), they share the same
- * platform_id and therefore the same worktree path — that's what makes
- * cross-bot collaboration work.
- *
- * Nested dirs (not a flat `<mg>:<thread>` key) because Docker's `-v` flag
- * uses `:` as the field separator between source:target:options. A colon in
- * the host path turns `-v src:dst` into a three-part `src:dst:opts` which
- * Docker rejects with exit 125. fsSlug strips any embedded colons too.
+ * Thread-scoped worktrees shared by every sibling agent in the thread, keyed by `<thread-id>` or
+ * `dm-<platform-id>`, so two bot apps on one channel share a checkout. Nested dirs, never a `<mg>:<thread>` key:
+ * Docker's `-v` treats `:` as a field separator.
  */
 export function threadWorktreeDir(platformId: string, threadId: string | null, workgroupId?: string): string {
   return path.join(threadStateDir(platformId, threadId, workgroupId), 'worktrees');
 }
 
 /**
- * Workgroup-namespaced thread-state base dir.
- *
- * The platform/thread key alone is ambiguous across workgroups: an identical
- * platform_id can be the same real channel via a sibling bot app (same
- * workgroup — must share) or an unrelated channel from a colliding workspace
- * (different workgroup — must NOT share; see the getChannelPeers
- * tenant-boundary tests). Adding the workgroup segment makes cross-workgroup
- * rows resolve to different directories while same-workgroup siblings keep
- * sharing.
- *
- * Legacy fallback: pre-namespace threads live at `<base>/<tid>/`. If that
- * dir exists and no workgroup-scoped dir does, keep serving it so in-flight
- * threads don't lose their worktrees on upgrade; the repo-store migration
- * relocates them and ends the fallback window.
+ * Workgroup-namespaced: an identical platform/thread key can be an unrelated channel in another workgroup, which
+ * must NOT share. A pre-namespace legacy dir is still served when no scoped dir exists, until migrated.
  */
 function threadStateDir(platformId: string, threadId: string | null, workgroupId?: string): string {
   const tid = threadId ?? `dm-${platformId}`;
@@ -182,10 +130,7 @@ function threadStateDir(platformId: string, threadId: string | null, workgroupId
   if (!workgroupId) return legacy;
   const scoped = path.join(threadsBaseDir(), `wg-${fsSlug(workgroupId)}`, fsSlug(tid));
   if (fs.existsSync(legacy) && !fs.existsSync(scoped)) {
-    // Ownership check: without it, workgroup B would adopt workgroup A's
-    // legacy dir on a colliding platform/thread key — the exact leak the
-    // namespace exists to prevent. The marker is stamped by container spawn
-    // (buildMounts) on first post-upgrade use; an unstamped dir is adoptable.
+    // Ownership check, or workgroup B adopts A's legacy dir on a colliding key; an unstamped dir is adoptable.
     const owner = readThreadDirOwner(legacy);
     if (owner === null || owner === workgroupId) return legacy;
   }
@@ -201,11 +146,7 @@ export function legacyThreadStateDir(platformId: string, threadId: string | null
   return path.join(threadsBaseDir(), fsSlug(tid));
 }
 
-/**
- * Sentinel owner that matches no real workgroup id (real ids never contain
- * spaces). Stamped when DB ownership of a legacy dir is ambiguous — every
- * workgroup then resolves to its own scoped dir and nobody adopts.
- */
+/** Matches no real workgroup id (real ids have no spaces): stamped when ownership is ambiguous, so nobody adopts. */
 export const THREAD_DIR_OWNER_CONFLICT = '!! conflict';
 
 export function readThreadDirOwner(stateDir: string): string | null {
@@ -231,36 +172,18 @@ export function heartbeatPath(agentGroupId: string, sessionId: string): string {
   return path.join(sessionDir(agentGroupId, sessionId), '.heartbeat');
 }
 
-/**
- * Claude Code's project-dir name hash for the container cwd. v2's cwd is
- * `/workspace/agent` (set in the agent-runner's index.ts as `CWD`
- * and passed to the SDK via poll-loop), which hashes to `-workspace-agent`.
- * v1 used `/workspace/group` → `-workspace-group`; do not copy-paste that
- * constant without verifying the current cwd. If the cwd ever changes,
- * regenerate by launching claude-code once in the new cwd and reading the
- * created `~/.claude/projects/<dir>/` name.
- */
+/** Claude Code's project-dir hash for the container cwd `/workspace/agent`; regenerate if the cwd changes. */
 export const CLAUDE_CODE_PROJECTS_DIR = '-workspace-agent';
 
 /**
- * Per-session `projects/<hash>/` dir on the host. Mounted INTO each container's
- * `/home/node/.claude/projects/<hash>/` as a nested bind mount on top of the
- * group-shared `.claude` parent. Isolates the SDK's per-session state —
- * `<session_id>.jsonl` transcripts, `sessions-index.json`, and any other files
- * the SDK writes under its active project dir — so concurrent sessions in the
- * same agent group don't race and silently clobber each other's resume state.
+ * Per-session SDK state (transcripts, sessions index), nested-mounted so concurrent sessions in a group cannot
+ * clobber each other's resume state.
  */
 export function sessionClaudeProjectsDir(agentGroupId: string, sessionId: string): string {
   return path.join(sessionDir(agentGroupId, sessionId), '.claude-projects', CLAUDE_CODE_PROJECTS_DIR);
 }
 
-/**
- * Recognized legacy Claude-native memory source for this agent group.
- *
- * `/migrate-memory` inventories this path and, after verified cutover, replaces
- * it with a compatibility view of the workgroup canon. It is never a separate
- * runtime memory authority.
- */
+/** Legacy Claude-native memory source; after `/migrate-memory` cutover a compatibility view, never an authority. */
 export function groupClaudeMemoryDir(agentGroupId: string): string {
   return path.join(
     DATA_DIR,
@@ -274,20 +197,8 @@ export function groupClaudeMemoryDir(agentGroupId: string): string {
 }
 
 /**
- * Pre-create the per-session `projects/<hash>/` dir on the host with uid 1001
- * ownership BEFORE docker mounts it.
- *
- * This is load-bearing. The parent `/home/node/.claude` is a bind
- * mount; if the inner `projects/<hash>/` path doesn't already exist on the host
- * when docker starts the container, the daemon creates the missing
- * intermediates AS ROOT. The container runs as uid 1001 and can't write inside
- * a root-owned dir, so SDK session jsonls appear to save in-memory but vanish
- * on exit. The next `resume: <session_id>` then fails silently (no file found)
- * and the agent starts fresh with no prior context.
- *
- * chown is best-effort — on platforms that can't chown (or when the process
- * isn't root) we log and continue; the subsequent write attempt will fail
- * loudly if ownership is wrong, which beats the silent-amnesia failure mode.
+ * Pre-create the per-session dir as uid 1001 BEFORE docker mounts it: docker would create missing intermediates
+ * AS ROOT, transcripts would silently fail to persist, and resume would start fresh. chown is best-effort.
  */
 export function prepareSessionClaudeDir(agentGroupId: string, sessionId: string): void {
   const projectsDir = sessionClaudeProjectsDir(agentGroupId, sessionId);
@@ -295,22 +206,7 @@ export function prepareSessionClaudeDir(agentGroupId: string, sessionId: string)
   const memoryDir = groupClaudeMemoryDir(agentGroupId);
   fs.mkdirSync(memoryDir, { recursive: true });
 
-  // Creates dirs and copies NOTHING. Do not reintroduce a copy from the
-  // group-shared `.claude-shared/projects/<hash>/` dir.
-  //
-  // Until 2026-08-20 this function migrated forward from the pre-per-session
-  // layout, where every session in a group wrote its transcripts into that one
-  // shared dir. The copy was deliberately unfiltered — session ownership of a
-  // given `.jsonl` cannot be recovered from the filename, because the SDK's
-  // sdk_session_id diverges from the on-disk name after compact-boundary
-  // rotations — and that is the detail that made it look load-bearing at a
-  // glance and kept it alive this long.
-  //
-  // It was dead. The shared dirs stopped being written on 2026-04-21, and zero
-  // sessions in the central DB were created before that date, so the migration
-  // had no beneficiaries left and the source can never be replenished. What it
-  // did have was a cost: ~9MB of transcripts no session owned, copied into
-  // every session that ever spawned, ~23GB across this install.
+  // Creates dirs and copies NOTHING: do not reintroduce a copy from the group-shared `.claude-shared/projects/`.
 
   try {
     fs.chownSync(projectsDir, 1001, 1001);
@@ -344,7 +240,6 @@ export async function resolveSession(
   threadId: string | null,
   sessionMode: SessionMode,
 ): Promise<{ session: Session; created: boolean }> {
-  // agent-shared: single session per agent group, regardless of messaging group
   if (sessionMode === 'agent-shared') {
     const existing = await findSessionByAgentGroup(agentGroupId);
     if (existing) {
@@ -362,11 +257,7 @@ export async function resolveSession(
 
   const id = generateId();
   const lookupThreadId = sessionMode === 'per-thread' ? threadId : null;
-  // Agent-shared sessions have no mg binding by definition — they're the
-  // single session shared across all messaging groups for this agent. Force
-  // null on creation so findSessionByAgentGroup's `messaging_group_id IS
-  // NULL` lookup re-finds them on subsequent calls (and so foreign-mg
-  // callers don't accidentally treat them as "their" mg session).
+  // Agent-shared sessions have no mg binding: null, so findSessionByAgentGroup's `IS NULL` lookup re-finds them.
   const sessionMessagingGroupId = sessionMode === 'agent-shared' ? null : messagingGroupId;
   const session: Session = {
     id,
@@ -380,10 +271,8 @@ export async function resolveSession(
     created_at: new Date().toISOString(),
   };
 
-  // The lookup above yields (async driver), so two concurrent first messages
-  // for the same target can both see no session and both insert; the unique
-  // active-session index lets exactly one win and the loser adopts it. `reload`
-  // repeats the exact lookup this function opened with.
+  // Two concurrent first messages can both miss the lookup; the unique active-session index lets one insert win
+  // and the loser adopts it.
   const { row: resolved, created } = await insertOrAdopt(session, createSession, () =>
     sessionMode === 'agent-shared'
       ? findSessionByAgentGroup(agentGroupId)
@@ -406,24 +295,9 @@ export async function resolveSession(
 
 /** Find or create the per-agent-group session used for scheduled tasks. */
 /**
- * Find or create the isolated session for one task series (thread
- * `system:tasks:<seriesId>`).
- *
- * `routingPlatformId` is the series' ROUTING STAMP — the
- * `messaging_groups.platform_id` this task was scheduled against, which the
- * `ncl tasks` surface documents as "where an unaddressed reply lands". Callers
- * that hold it (the two sites that write the task's `messages_in` row with the
- * same `platform_id`: `createTask` in `src/cli/resources/tasks.ts` and
- * `scheduleTask` in `src/db/scheduled-tasks.ts`) pass it so the console can
- * show a task in the channel it is routed to instead of an "Unrouted tasks"
- * bucket. Callers with no routing (`--isolated`, a host caller with no
- * `--messaging-group`, `createScheduledTask`'s template path) pass nothing and
- * the column stays NULL — absent is honest.
- *
- * `messaging_group_id` stays NULL and MUST stay NULL. It is the discriminator
- * `src/delivery.ts` uses to recognize a task session (`task_log` run-log
- * appends, `isTaskSessionPost`); the routing stamp is a separate column
- * precisely so this one is never tempted into carrying it. See migration 056.
+ * The isolated session for one task series (`system:tasks:<seriesId>`). `routingPlatformId` is the series'
+ * routing stamp (NULL when unrouted). `messaging_group_id` MUST stay NULL: delivery uses it to recognize a task
+ * session.
  */
 export async function resolveTaskSession(
   agentGroupId: string,
@@ -433,9 +307,7 @@ export async function resolveTaskSession(
   const threadId = taskThreadId(seriesId);
   const existing = await findSystemSession(agentGroupId, threadId);
   if (existing) {
-    // Re-scheduling an existing series (including `scheduled-move`, which
-    // re-`scheduleTask`s into the target) re-stamps: the column answers "where
-    // is this series routed NOW", not "where was it first routed".
+    // Re-stamp: the column answers where the series is routed NOW.
     if (routingPlatformId != null && existing.task_routing_platform_id !== routingPlatformId) {
       await setTaskRoutingPlatformId(existing.id, routingPlatformId);
       existing.task_routing_platform_id = routingPlatformId;
@@ -456,15 +328,11 @@ export async function resolveTaskSession(
     created_at: new Date().toISOString(),
   };
 
-  // Same race as `resolveSession`: two scheduling operations on one series can
-  // both yield at the lookup; the unique active-session index lets one insert
-  // win, and the loser adopts it.
+  // Same race as `resolveSession`: one insert wins, the loser adopts.
   const { row: resolved, created } = await insertOrAdopt(session, createSession, () =>
     findSystemSession(agentGroupId, threadId),
   );
   if (!created) {
-    // Re-stamp the adopted winner exactly as the cache-hit branch above does —
-    // the column answers "where is this series routed NOW".
     if (routingPlatformId != null && resolved.task_routing_platform_id !== routingPlatformId) {
       await setTaskRoutingPlatformId(resolved.id, routingPlatformId);
       resolved.task_routing_platform_id = routingPlatformId;
@@ -482,24 +350,15 @@ export async function resolveTaskSession(
 }
 
 /**
- * Create the session folder and initialize both DBs.
- *
- * Deliberately does NOT call `prepareSessionClaudeDir` — the transcript copy
- * it performs belongs to the spawn path (`getSessionClaudeMounts`, called from
- * `buildMounts`), which already runs it before every container start. Sessions
- * are minted for non-waking accumulate traffic too, and copying the group's
- * whole shared transcript set into a session that never wakes cost 20GB on one
- * agent group. Both DBs are small and needed immediately for those writes.
+ * Deliberately does NOT prepare the Claude dir: sessions are minted for non-waking traffic too, and that is
+ * spawn-path work.
  */
 export function initSessionFolder(agentGroupId: string, sessionId: string): void {
   const dir = sessionDir(agentGroupId, sessionId);
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(path.join(dir, 'outbox'), { recursive: true });
 
-  // prepare() is the single provisioning path: it creates whichever mailbox
-  // files are absent, with upstream's baseline schema plus the fork's tables,
-  // columns, triggers and index. Legacy-shape migrations on an EXISTING file
-  // run at that session's first session() instead, never here.
+  // The single provisioning path; legacy-shape migrations run at an existing file's first session(), never here.
   getAgentMailbox().prepare(mailboxKey(agentGroupId, sessionId));
 }
 
@@ -510,18 +369,12 @@ export async function destroySessionMailbox(agentGroupId: string, sessionId: str
 }
 
 /**
- * Detects same-key session() nesting, which is forbidden: implementations may
- * serialize session() per key, so a nested call may deadlock. Tracked per async context so
- * legitimately concurrent top-level sessions on the same key don't trip it.
+ * Detects same-key session() nesting, which may deadlock (implementations may serialize per key). Per async
+ * context, so concurrent top-level sessions on one key don't trip it.
  */
 const activeMailboxKeys = new AsyncLocalStorage<ReadonlySet<string>>();
 
-/** Run one host operation against a session mailbox. The implementation owns persistence.
- *
- * Never call this (directly or via helpers like writeSessionMessage) from
- * inside another withMailboxSession action on the same session — finish the
- * open session first. See AgentMailbox.session in src/mailbox/types.ts.
- */
+/** Never call this (directly or via helpers) inside another action on the same session: that may deadlock. */
 export function withMailboxSession<T>(
   agentGroupId: string,
   sessionId: string,
@@ -530,16 +383,7 @@ export function withMailboxSession<T>(
   return runMailboxSession(agentGroupId, sessionId, action, true) as Promise<T>;
 }
 
-/**
- * Test-only: how many mailbox sessions the CURRENT async context holds open.
- *
- * The nesting guard's own store, read rather than thrown on. Seam 2's R-10
- * asserts depth 0 at every `killContainer`/`wakeContainer` call site: a kill
- * respawns through `onExit` and clears status through `delivery.ts`, both of
- * which open a session on the same key, so holding one across it deadlocks
- * (invariant I-3). Asserting `ctx.mailbox === null` is not the same assertion —
- * a duty could open its own session and kill inside the callback.
- */
+/** Test-only: mailbox sessions the CURRENT async context holds open (must be 0 around kill/wake). */
 export function _mailboxSessionDepthForTesting(): number {
   return activeMailboxKeys.getStore()?.size ?? 0;
 }
@@ -569,12 +413,7 @@ async function runMailboxSession<T>(
   if (provision) store.prepare(key);
   else if (!(await store.exists(key))) return undefined;
   return activeMailboxKeys.run(new Set(held).add(keyId), () =>
-    // One cast, here and nowhere else. `mailbox/compose.ts` registers
-    // NanoclawAgentMailbox, whose session() hands the action the fork's
-    // narrowed session; upstream's `AgentMailbox` interface can only promise
-    // the narrower `MailboxSession`, and TypeScript checks that parameter
-    // contravariantly. A different implementation registered here would break
-    // this, which is exactly what `compose.ts` being the singular slot rules out.
+    // The one cast: `mailbox/compose.ts` registers NanoclawAgentMailbox, whose session() yields the narrowed type.
     store.session(key, action as (mailbox: MailboxSession) => T | Promise<T>),
   );
 }
@@ -591,13 +430,8 @@ async function runMailboxSession<T>(
  * place, including after admin rewiring.
  */
 export async function writeSessionRouting(agentGroupId: string, sessionId: string): Promise<void> {
-  // Resolved INSIDE the session. The route is read from the central DB and the
-  // funnel below yields before the upsert, so a session rewired or closed in
-  // that window would otherwise be stamped with the route it had on entry.
-  // The session read is a driver call and yields once; the upsert follows it
-  // with no further yield. Routing has no write guard — a stale stamp is
-  // refreshed on the next wake — so that yield is tolerable here where it is
-  // not in `writeSessionMessage`.
+  // Resolved INSIDE the session so a session rewired or closed during the funnel's yield is not stamped with a
+  // stale route; a stale stamp is refreshed on the next wake anyway.
   const resolveRoute = async (): Promise<
     { channelType: string | null; platformId: string | null; threadId: string | null } | undefined
   > => {
@@ -622,10 +456,7 @@ export async function writeSessionRouting(agentGroupId: string, sessionId: strin
   // opened. The authoritative read is the one inside the callback.
   if (!(await resolveRoute())) return;
 
-  // Existing-only. Routing is refreshed on every wake, and a session whose
-  // mailbox is gone has nothing to route to; provisioning one here would
-  // resurrect a reclaimed directory (invariant I-10). The old code expressed
-  // the same rule as an existsSync on inbound.db.
+  // Existing-only: provisioning here would resurrect a reclaimed directory.
   const written = await withExistingMailboxSession(agentGroupId, sessionId, async (mailbox) => {
     const route = await resolveRoute();
     if (!route) return undefined;
@@ -649,10 +480,7 @@ export async function writeSessionRouting(agentGroupId: string, sessionId: strin
 
 /**
  * Write a message to a session's inbound DB (messages_in). Host-only.
- *
- * ⚠ Opens and closes the DB on every call. Do not refactor to reuse a
- * long-lived connection — see the "Cross-mount visibility invariants" note
- * at the top of this file.
+ * Opens and closes the DB per call: never reuse a long-lived connection (see the invariants at the top).
  */
 export interface SessionMessageInput {
   id: string;
@@ -666,23 +494,11 @@ export interface SessionMessageInput {
   content: string;
   processAfter?: string | null;
   recurrence?: string | null;
-  /**
-   * 1 = this message should wake the agent (the default); 0 = accumulate
-   * as context only, don't wake. Host's countDueMessages gates on this
-   * column; the container still reads all prior messages as context when
-   * a trigger-1 message does arrive.
-   */
+  /** 1 (default) wakes the agent; 0 accumulates as context only. */
   trigger?: 0 | 1;
-  /**
-   * For agent-to-agent inbound: the source session id that emitted the
-   * outbound message which became this inbound row. Used as the return
-   * path so the target's reply routes back to that exact session.
-   */
+  /** Agent-to-agent return path: the source session whose outbound row became this inbound row. */
   sourceSessionId?: string | null;
-  /**
-   * 1 = only deliver on the container's first poll (fresh start).
-   * Dying containers (past first poll) skip these rows.
-   */
+  /** 1 = deliver only on the container's first poll; a dying container skips it. */
   onWake?: 0 | 1;
 }
 
@@ -720,14 +536,7 @@ export function isAdmissiblePreTurnTrigger(message: SessionMessageInput): boolea
   return true;
 }
 
-/**
- * The four recall reads a pre-turn context is built from.
- *
- * Every caller now passes its open `NanoclawMailboxSession`, which satisfies
- * this structurally. It is still named rather than taking the whole session
- * type, because these four are the entire dependency the recall builder has —
- * and saying so is what keeps a fifth from being reached for by accident.
- */
+/** The four recall reads a pre-turn context needs, named so a fifth is not reached for by accident. */
 interface RecallSource {
   readProviderRecallState(provider: string): ProviderRecallState;
   listOpenChatContents(): Array<{ content: string }>;
@@ -736,13 +545,8 @@ interface RecallSource {
 }
 
 /**
- * The one central-DB fact a recall row needs: which provider's bootstrap and
- * epoch the pair is built for. Resolved by the caller BEFORE it opens the
- * mailbox session, so the recall build and the paired insert stay one
- * synchronous block — the write guard is proved immediately before the row
- * lands, with nothing awaited in between (seam-3 plan §4.5). A provider read a
- * few milliseconds earlier is the same value the block used to read inline:
- * provider changes take effect at the group's next restart, not mid-write.
+ * Resolved by the caller BEFORE opening the mailbox session, so the recall build and the paired insert stay one
+ * synchronous block with nothing awaited before the row lands. Provider changes take effect at the next restart.
  */
 export interface RecallCentral {
   provider: string;
@@ -863,10 +667,7 @@ function resolveRecallLifecycle(
   let contextEpoch = 0;
   let hasContinuation = false;
   try {
-    // Reached through the session's own outbound handle now, not a second
-    // open of the same file. The catch is unchanged and load-bearing: an
-    // unreadable outbound.db means "admit a fresh bootstrap", never a throw
-    // that would drop the inbound message.
+    // An unreadable outbound.db means "admit a fresh bootstrap", never a throw that drops the inbound message.
     ({ contextEpoch, hasContinuation } = mailbox.readProviderRecallState(provider));
   } catch (error) {
     log.warn('Unable to read provider recall lifecycle; admitting a fresh bootstrap', {
@@ -877,11 +678,8 @@ function resolveRecallLifecycle(
     });
   }
 
-  // A /clear already queued ahead of this message will reset the provider
-  // before the message is prompted. The runner owns the epoch write, so the
-  // host cannot observe that future epoch yet; treat the pending boundary as
-  // fresh now so same-batch follow-ups carry full canon and unsuppressed
-  // relevant evidence into the reset context.
+  // A /clear queued ahead of this message will reset the provider first; treat it as fresh now so same-batch
+  // follow-ups carry full canon.
   const pendingClear =
     resetPending ||
     mailbox
@@ -918,8 +716,7 @@ export async function sessionMessageExists(
   sessionId: string,
   messageId: string,
 ): Promise<boolean> {
-  // A read, so existing-only: no mailbox means the message is provably not
-  // there, and a replay guard must never be the thing that creates a session.
+  // Existing-only: a replay guard must never create a session.
   return (
     (await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.inboundHasMessage(messageId))) ??
     false
@@ -927,47 +724,23 @@ export async function sessionMessageExists(
 }
 
 /**
- * A caller's precondition, handed to the WRITER so the writer can prove it.
- *
- * `true` proceeds; `false` or `{ ok: false, reason }` refuses and nothing is
- * written. Must be synchronous — that is the entire point. The writer calls it
- * inside the mailbox action, after every await it performs, with no await
- * between the call and the insert. An async guard would reintroduce exactly the
- * window it exists to close.
+ * A caller's precondition, re-proved by the WRITER: `true` proceeds, anything else refuses and nothing is written.
+ * Must be synchronous: it runs with no await between it and the insert, and an async guard reopens the window.
  */
 export type WriteGuardResult = boolean | { ok: false; reason: string };
 export type WriteGuard = () => WriteGuardResult;
 
 export interface WriteSessionMessageOptions {
-  /**
-   * Re-proved by the writer immediately before the insert.
-   *
-   * Callers used to prove their preconditions themselves and then call this
-   * function, which awaits — `acquireStorageActivityLease`, the reclaim-journal
-   * import, both mailbox funnels — before the row lands. Every one of those is
-   * a window in which the proof goes stale, and no amount of care at the call
-   * site can close a window inside the callee. So the proof moves to where the
-   * write is.
-   */
+  /** Re-proved immediately before the insert (the writer awaits leases and funnels, so a call-site proof goes stale). */
   guard?: WriteGuard;
   /**
-   * Keep the host-only `origin` and `event` fields in the content. Every other
-   * chat write has them removed (withoutHostFields), so the runner's `origin="host"`
-   * and `event="..."` markers (container/agent-runner/src/formatter.ts) can only
-   * come from the host's own notes: a person or a peer agent controls `sender`
-   * and `senderId` in content they author, but never a field that survives this
-   * writer. The one caller is notifyAgent (modules/approvals/primitive.ts).
+   * Keep the host-only `origin`/`event` fields, which every other chat write strips, so the runner's host markers
+   * can only come from the host's own notes. Sole caller: notifyAgent.
    */
   hostOrigin?: boolean;
   /**
-   * The platform-native id of the specific inbound message this write
-   * represents (e.g. a Slack `ts`). Stamped into content as PLATFORM_MSG_ID_FIELD
-   * (host-origin.ts) so the runner can render `platform_msg_id` on it — but
-   * only for this call: every write, regardless of this option, first strips
-   * any `platformMsgId` the caller's own content already carries
-   * (stripPlatformMessageId), so a chat write can never forge or echo one.
-   * The one caller is the router's own routed-message write (router.ts),
-   * which is the sole place that knows the id is genuine.
+   * The genuine platform id of the inbound message (e.g. Slack `ts`), stamped as PLATFORM_MSG_ID_FIELD. Every
+   * write first strips any caller-claimed id, so only the router's own routed-message write can set one.
    */
   platformMessageId?: string;
 }
@@ -981,15 +754,9 @@ export class SessionWriteRefusedError extends Error {
 }
 
 /**
- * Evaluate a guard and normalize its answer.
- *
- * Called ONLY from inside a `withCentralSync` block — the one wrapping the
- * mailbox insert action, with nothing awaited between here and the insert,
- * and the pre-extract ask. `evaluateGuardSync` is the runtime half of the
- * guard contract (seam 3 §4.5 I-1): a guard that hands back a promise — cast,
- * or accidentally `async` — is a contract violation, not a verdict, and it is
- * reported as a refusal so the caller's `SessionWriteRefusedError` contract
- * ("nothing was written") holds for it too.
+ * Call ONLY inside the `withCentralSync` block around the insert (or the pre-extract ask). A guard returning a
+ * promise is a contract violation, reported as a refusal so `SessionWriteRefusedError` still means nothing was
+ * written.
  */
 function refusalFrom(guard: WriteGuard | undefined): string | null {
   if (!guard) return null;
@@ -997,12 +764,7 @@ function refusalFrom(guard: WriteGuard | undefined): string | null {
   try {
     verdict = evaluateGuardSync(guard);
   } catch (err) {
-    // A THROWN guard is a refusal. Letting it propagate out of the mailbox
-    // action would surface as the funnel's own error rather than a refusal,
-    // and the caller's contract — `SessionWriteRefusedError` means nothing was
-    // written — would be silently unavailable for the one case where the
-    // precondition could not even be evaluated. A guard that cannot answer has
-    // not said yes.
+    // A thrown guard is a refusal, so `SessionWriteRefusedError` (nothing written) still holds.
     return `guard threw: ${err instanceof Error ? err.message : String(err)}`;
   }
   if (verdict === true) return null;
@@ -1054,30 +816,16 @@ async function writeSessionMessageInternal(
   hostOrigin: boolean,
   platformMessageId: string | undefined,
 ): Promise<boolean> {
-  // A session mid-archival is about to lose its directory. Re-provisioning it
-  // below would resurrect the dir seconds before the reclaim removes it, and
-  // the message would vanish with it. Ordinary routing never gets here —
-  // findSessionForAgent filters status='active' — so this only fires on a
-  // raw-session-id path, and it must be loud rather than silent.
+  // A session mid-archival is about to lose its directory; re-provisioning would resurrect it and lose the
+  // message. Only raw-session-id paths reach here, so fail loudly.
   const statusBefore = (await getSession(sessionId))?.status;
   if (statusBefore === 'archiving') {
     throw new Error(`session ${sessionId} is being archived; route this message to a fresh session`);
   }
 
-  // The check above is a read, so on its own it loses the write-after-check
-  // race: a writer that has passed it and opened inbound.db but not yet
-  // written produces NO observable signal — no unconsumed row, no mtime change
-  // — so the reclaim's open-work and mtime-equality guards both see a quiet
-  // session, archive it, and rmSync the directory out from under the open fd.
-  // The insert then lands in an unlinked inode: accepted, acknowledged, and
-  // absent from the rescue archive.
-  //
-  // The storage-activity lease is the existing two-sided lock for exactly this
-  // (`storage-activity.ts`): the reclaim runs its whole archive-and-delete
-  // inside tryRunWithStorageCleanupClaim, which refuses to act while any
-  // activity marker is present, and acquire double-checks the claim after
-  // planting its marker. Either the reclaim sees our marker and skips, or we
-  // see its claim and wait for it to finish.
+  // The status check alone loses the write-after-check race: an open-but-unwritten writer leaves no signal, so the
+  // reclaim could delete the directory under our fd and the insert lands in an unlinked inode. The storage-activity
+  // lease is the two-sided lock: either the reclaim sees our marker and skips, or we wait out its claim.
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
     return await writeSessionMessageLocked(
@@ -1103,56 +851,11 @@ async function writeSessionMessageLocked(
   hostOrigin: boolean,
   platformMessageId: string | undefined,
 ): Promise<boolean> {
-  // Waiting for the claim above can mean waiting out a reclaim that archived
-  // and deleted this session while we queued. Re-provisioning it here would
-  // resurrect a session nothing polls, so this has to be decided AFTER the
-  // wait — and it has to be decided from something a reclaim cannot fake.
-  //
-  // Three earlier attempts compared a property sampled before the wait against
-  // the same property after it, and each was wrong in a different direction.
-  // `status` equality passes when a session was already `closed` on arrival.
-  // Adding directory existence refuses brand-new sessions. An `inbound.db`
-  // existence flip misses `true -> false -> true`, and is blind when the file
-  // was already absent at sample time. Neither field is an identity: a row is
-  // `closed` for reasons other than reclaim — rotation closes the predecessor
-  // of a lineage, and those rows may never have had a directory at all — and a
-  // path can be deleted and recreated.
-  //
-  // The reclaim journal is the identity. It is appended, fsynced, before the
-  // directory is removed, on every path that removes one, and no path removes
-  // a line. A session id is never reused, so the answer only ever goes
-  // false -> true, once. See `sessionWasReclaimed`.
-  //
-  // The line records the reclaim's INTENT, not its completion: storage-manager
-  // writes it before the archiving->closed CAS, and that CAS can fail — in
-  // which case the reclaim logs and deliberately keeps the directory
-  // ("removing it is not our call"). A crash before the rmSync leaves the
-  // same shape. So the line alone would brick a session
-  // that is still live. inbound.db answers the second half — the reclaim
-  // removes the whole directory, and nothing in the lease recreates that file
-  // (the lease mkdirs only the session ROOT, which is why the root's
-  // existence is useless here).
-  //
-  // Both terms are read now, once, from current state. Neither is a sample
-  // compared against its own earlier value, which is what made status
-  // equality, status+directory and the inbound.db flip fail in three
-  // different directions. And the flip's ABA — a second writer re-provisioning
-  // inside the window — is closed rather than papered over: the recreate it
-  // needed was the old guard letting that second writer through to
-  // `initSessionFolder` below. The only other in-process creator,
-  // `initStubSessionFolder` (db/scheduled-tasks), runs on a freshly
-  // generated id. Remove the leak and the interleave has no producer.
-  //
-  // One composition is deliberate: a CAS-lost session that an operator THEN
-  // `rm -rf`s satisfies both terms and is refused, even though a reset is
-  // meant to re-provision. That is the honest answer — the rescue archive was
-  // published before the CAS lost, so the content is kept, and refusing is
-  // both the safe direction and a loud one.
-  //
-  // Not reclaimed and no directory means a brand-new session, a rotation
-  // predecessor (deliberately `closed`, may never have had a directory), or
-  // the documented operator `rm -rf`. All three re-provision below, as they
-  // must.
+  // Decide AFTER the lease wait whether a reclaim deleted this session meanwhile. The reclaim journal is the identity
+  // (appended and fsynced before any removal, never un-appended) but records INTENT: a reclaim whose CAS lost keeps
+  // the directory. So refuse only when journaled AND inbound.db is gone; not reclaimed + no directory re-provisions.
+  // Deliberately, a CAS-lost reclaim whose directory an operator then deletes is refused, not reset: the rescue
+  // archive was published before the CAS lost, so the content is kept.
   const { sessionWasReclaimed } = await import('./storage-manager.js');
   if (sessionWasReclaimed(sessionId) && !fs.existsSync(sessionMailboxPath({ agentGroupId, sessionId }, 'inbound'))) {
     throw new Error(`session ${sessionId} has been reclaimed; route this message to a fresh session`);
@@ -1168,17 +871,9 @@ async function writeSessionMessageLocked(
     initSessionFolder(agentGroupId, sessionId);
   }
 
-  // THE GUARD, ASKED BEFORE THE BYTES LAND TOO.
-  //
-  // `extractAttachmentFiles` below decodes inline base64 into the target
-  // session's mounted `inbox`, which its container reads — so the extraction is
-  // itself a delivery, and it happens before the mailbox action where the guard
-  // used to run for the first time. A precondition already false here should
-  // never write those bytes at all.
-  //
-  // Cheap to ask twice: the guard is synchronous by contract, and the second
-  // ask inside the insert is the one that closes the window this function's own
-  // awaits open. Under the lease, because the guard's reads are raw.
+  // Asked BEFORE extraction too: `extractAttachmentFiles` writes into the container-readable inbox, itself a
+  // delivery. The ask inside the insert is the one that closes the window. Under the lease: the guard's reads are
+  // raw.
   const refusedBeforeExtract = await withCentralSync(() => refusalFrom(guard), 'write guard before extract');
   if (refusedBeforeExtract !== null) {
     log.warn('Session write refused by its guard before extracting attachments', {
@@ -1193,10 +888,7 @@ async function writeSessionMessageLocked(
   // Extract base64 attachment data, save to inbox, replace with file paths
   // The host-only fields survive only a host note (WriteSessionMessageOptions.hostOrigin).
   const strippedContent = hostOrigin ? message.content : withoutHostFields(message.content, message.kind);
-  // platformMsgId has its own, independent trust rule (host-origin.ts):
-  // stripped from whatever the caller's content claims, on every write
-  // regardless of hostOrigin, then reapplied only when this write's own
-  // caller passed platformMessageId explicitly.
+  // platformMsgId: stripped from caller content on every write, reapplied only from `platformMessageId`.
   const withoutClaimedPlatformMsgId = stripPlatformMessageId(strippedContent, message.kind);
   const messageContent =
     platformMessageId !== undefined
@@ -1222,57 +914,16 @@ async function writeSessionMessageLocked(
     sourceSessionId: message.sourceSessionId ?? null,
     onWake: message.onWake ?? 0,
   };
-  // One session for the whole write: the recall lifecycle reads and the paired
-  // insert are one logical step against this session's mailbox, and the pair
-  // must be decided from the same snapshot the insert lands in.
-  //
-  // EXISTING-ONLY first, and that is the point. The provisioning funnel runs
-  // `prepare()`, which runs `ensureSchema(..., 'outbound')` — it opens the
-  // CONTAINER-owned outbound.db read-write and executes DDL. Routine ingress
-  // runs while that container is live and writing the same file across the
-  // mount, and pre-seam this path only ever opened inbound.db, so taking the
-  // provisioning funnel per message made the host a second writer for no gain.
-  //
-  // Nothing is lost by skipping `prepare()` here. Both branches above already
-  // provision explicitly when they must, so the mailbox exists by this line;
-  // and the inbound repair `prepare()` would do is done by `session()` itself
-  // on either funnel — the first touch of a path in a process runs upstream's
-  // `migrateMessagesInTable` plus `ensureNanoclawInboundSchema`, which creates
-  // and migrates `session_routing`. What is skipped is exactly the write to
-  // the file the host does not own.
-  //
-  // The provisioning fallback is the reclaim race between the check above and
-  // this open, and it keeps this path's behavior identical to what it replaced.
-  //
-  // Callers must not already hold a session on this key: both funnels throw on
-  // same-key nesting. Every host caller was audited for this in the ingress
-  // batch; delivery action handlers in particular run with no session open
-  // (plan §4.5b, invariant I-9).
-  // The recall's one central read happens here, with the other awaits, so the
-  // action below never yields: the provider is data the pair is built for, not
-  // a precondition the guard proves.
+  // One session for the recall reads and the paired insert (same snapshot). EXISTING-ONLY first: the provisioning
+  // funnel runs outbound DDL, making the host a second writer of the live container's outbound.db; the fallback
+  // covers only the reclaim race. Callers must not hold a session on this key (same-key nesting throws). The
+  // recall's central read happens here, with the other awaits, so the action below never yields.
   const recallCentral = isScheduledTask ? null : await resolveRecallCentral(agentGroupId, sessionId);
 
-  // THE GUARD POINT. Inside the mailbox action, after every await this function
-  // performs — the storage-activity lease, the reclaim-journal import, the
-  // provider read, the funnel's own open, the central lease — and with nothing
-  // awaited between it and the insert below. A caller's precondition proved
-  // out here is proved at the instant the row lands, which is the only instant
-  // that matters. The block handed to `withCentralSync` is deliberately NOT
-  // async: the funnel admits promises, and a yield between the guard and the
-  // insert would reopen exactly the window this closes — `withCentralSync`
-  // refuses a promise-returning block at runtime, and
-  // `src/db/central-lease.test.ts` pins that no `await` sits between
-  // `evaluateGuardSync` and the insert inside it.
-  //
-  // The lease is taken AROUND the mailbox action, not inside it (plan §4.1):
-  // the guard's reads are raw, and the lease is what keeps them out of an
-  // open driver transaction. A sync block never has to REFUSE a legitimate
-  // write because a transaction happened to be open — it waits its turn.
-  //
-  // The refusal is carried out rather than thrown from inside the action: the
-  // mailbox session should close normally, and the caller's error is raised
-  // once, after it does.
+  // THE GUARD POINT: inside the mailbox action, after every await, with nothing awaited before the insert. The
+  // `withCentralSync` block is deliberately NOT async (a test pins that nothing is awaited between guard and
+  // insert); the lease wraps the action so the guard's raw reads never interleave with a driver transaction. A
+  // refusal is carried out and thrown after the session closes normally.
   let refusedReason: string | null = null;
   const insertUnderLease = (mailbox: NanoclawMailboxSession): boolean => {
     refusedReason = refusalFrom(guard);
@@ -1289,14 +940,9 @@ async function writeSessionMessageLocked(
     (await withExistingMailboxSession(agentGroupId, sessionId, insert)) ??
     (await withMailboxSession(agentGroupId, sessionId, insert));
 
-  // A refusal is loud. `void` has no room for a result, and a silent return
-  // would let a caller that forgets to check believe it wrote — the dangerous
-  // default. Every existing caller already treats a failed write as an
-  // exception, so this composes with what they do today.
+  // A refusal is loud: a silent return would let a caller that forgets to check believe it wrote.
   if (refusedReason !== null) {
-    // The bytes went in before this point, so the refusal has something to
-    // undo. The caller's own cleanup cannot reach these — it knows only the
-    // files it forwarded, not the ones decoded from inline `data` here.
+    // Undo the attachment bytes decoded here; the caller only knows the files it forwarded.
     removeExtractedAttachments(writtenPaths);
     log.warn('Session write refused by its guard at the insert', {
       agentGroupId,
@@ -1314,10 +960,7 @@ async function writeSessionMessageLocked(
 
   await updateSession(sessionId, { last_active: new Date().toISOString() });
 
-  // Push an inbox-board SSE notification — the session's last_inbound_at and
-  // attention_state just changed. Lazy-imported because the dashboard module
-  // can't be loaded eagerly here (init order between session-manager and the
-  // dashboard wiring), and a missing module must not break message routing.
+  // Inbox-board SSE. Lazy import (init order with the dashboard); a missing module must not break routing.
   void import('./dashboard/api/events.js')
     .then((mod) =>
       mod.emitSessionEvent({
@@ -1333,22 +976,17 @@ async function writeSessionMessageLocked(
 }
 
 /**
- * Pair non-task turns that were already live when the automatic pre-turn
- * context contract was activated. Containers are absent when this runs (the
- * migration and startup gates prove that first), so a row left in processing
- * can safely return to pending. Scheduled tasks stay untouched: their existing
- * due-time seam admits context immediately before execution.
+ * Pair non-task turns live when the pre-turn contract activated. Containers are absent (gated), so a processing
+ * row can return to pending; scheduled tasks are admitted by their due-time seam instead.
  */
 export async function admitPendingUpgradeContexts(
   mailbox: NanoclawMailboxSession,
   agentGroupId: string,
   sessionId: string,
 ): Promise<number> {
-  // The one central read, before the first inbound read: the loop below is one
-  // synchronous pass over a single snapshot of the unpaired rows.
+  // The one central read, first: the loop below is one synchronous pass over a single snapshot.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
-  // Under the lease: `buildRecallRow`'s pre-turn context carries a lease-only
-  // central read (seam 3 §4.5), and the pass is synchronous anyway.
+  // Under the lease: the pre-turn context carries a lease-only central read.
   return withCentralSync(() => {
     let admitted = 0;
     for (const message of mailbox.listUnpairedPendingUpgradeRows()) {
@@ -1400,11 +1038,7 @@ const UPGRADE_MTIME_EDGE_TOLERANCE_MS = 2000;
 /** Signals this pass never writes — if one moved after the manifest, work happened. */
 const UNTOUCHED_ACTIVITY_FILES = ['outbound.db', 'archive.db', '.heartbeat'];
 
-/**
- * Did anything that ISN'T the migration pass record activity for this session
- * after the manifest was written? The bumped-mtime window alone cannot tell a
- * DDL write from a message that landed two minutes later; these can.
- */
+/** Evidence of real (non-migration) activity after the manifest: the mtime window alone cannot tell them apart. */
 function sawRealActivityAfter(
   inboundPath: string,
   sinceMs: number,
@@ -1414,19 +1048,8 @@ function sawRealActivityAfter(
   const dir = path.dirname(inboundPath);
   for (const name of UNTOUCHED_ACTIVITY_FILES) {
     try {
-      // Floor before comparing. `sinceMs` is a Date.now() reading — integer
-      // milliseconds — while statSync reports mtimeMs as a float carrying the
-      // filesystem's sub-millisecond precision. A file touched microseconds
-      // BEFORE the manifest was written therefore compares as after it
-      // (1234.567 > 1234), and the pass reads its own quiescent session as
-      // live traffic. Measured on this host: 36.6% of writes landing in the
-      // same millisecond as the following Date.now() produce that phantom.
-      // The consequence is not cosmetic — a phantom here skips the mtime
-      // restore, so the session keeps the clock the DDL bumped and stops
-      // aging out, which is the fleet-wide archival freeze this manifest
-      // exists to prevent. Flooring can only remove false positives: a write
-      // that genuinely lands in a later millisecond still floors above
-      // `sinceMs`.
+      // Floor before comparing: mtimeMs carries sub-millisecond precision, so a file touched just BEFORE the
+      // manifest compares as after it, and the skipped restore would freeze the session's archival clock.
       if (Math.floor(fs.statSync(path.join(dir, name)).mtimeMs) > sinceMs) return true;
     } catch {
       // Absent signal file.
@@ -1459,11 +1082,8 @@ function writeUpgradeMtimeManifest(dataDir: string, manifest: UpgradeMtimeManife
 }
 
 /**
- * Restore mtimes a previous, interrupted migration pass bumped.
- *
- * Deliberately conservative on both ends: a file whose mtime is still what the
- * manifest recorded was never touched, and a file bumped past the replay
- * window saw real traffic after the pass — neither is restored.
+ * Restore mtimes an interrupted migration pass bumped. Conservative: an untouched file, or one that saw real
+ * traffic after the pass, is left alone.
  */
 export function replayUpgradeMtimeManifest(dataDir = DATA_DIR, centralDb?: Database.Database): number {
   const manifestPath = upgradeMtimeManifestPath(dataDir);
@@ -1480,9 +1100,7 @@ export function replayUpgradeMtimeManifest(dataDir = DATA_DIR, centralDb?: Datab
       if (current.mtimeMs <= entry.mtimeMs) continue;
       if (current.mtimeMs < manifest.writtenAtMs - UPGRADE_MTIME_EDGE_TOLERANCE_MS) continue;
       if (current.mtimeMs > manifest.writtenAtMs + UPGRADE_MTIME_REPLAY_WINDOW_MS) continue;
-      // The window says "this could be the pass". Untouched evidence says
-      // whether it actually was — a message that landed inside the window is
-      // real activity and its clock is not ours to rewind.
+      // In the window, but real activity since means the clock is not ours to rewind.
       if (sawRealActivityAfter(entry.path, manifest.writtenAtMs, entry.sessionId, centralDb)) continue;
       fs.utimesSync(entry.path, entry.atimeMs / 1000, entry.mtimeMs / 1000);
       restored += 1;
@@ -1496,16 +1114,9 @@ export function replayUpgradeMtimeManifest(dataDir = DATA_DIR, centralDb?: Datab
 }
 
 /**
- * Run the lazy session-DB migration over every session of the given
- * workgroups, and admit any pending pre-turn contexts.
- *
- * The mtime bookkeeping is load-bearing, not cosmetic. Session reclaim reads
- * `max(newest file mtime, central last_active)` as the idle clock, so the DDL
- * this pass runs once per schema-adding deploy used to reset the clock for
- * EVERY session at once — 5,027 files in 90 seconds on 2026-08-15, which froze
- * archival fleet-wide until the whole cohort aged out together. A migration is
- * bookkeeping, not session activity: the pre-pass mtime is restored afterward.
- * A session that ADMITS work here is genuinely active and keeps its new clock.
+ * Lazy session-DB migration over the workgroups' sessions, plus pending pre-turn admission. Pre-pass mtimes are
+ * restored afterward: reclaim reads mtime as the idle clock, so migration DDL would otherwise reset every session's
+ * clock at once and freeze archival fleet-wide. A session that ADMITS work keeps its new clock.
  */
 export async function reconcilePendingUpgradeContexts(
   centralDb: Database.Database,
@@ -1534,14 +1145,8 @@ export async function reconcilePendingUpgradeContexts(
       } catch {
         continue;
       }
-      // A 0-byte inbound.db is provably never-provisioned: `ensureSchema` is
-      // the only host-side creator and it writes the schema in the same call
-      // that creates the file, and SQLite writes nothing to a fresh file until
-      // that first schema write. So this is the residue of a failed open, not
-      // a session — before this fix, `new Database(path)` created the file and
-      // the schema migration then threw, leaving the stub behind. Removing it
-      // restores the two-signal reclaimed state (reclaimed AND no inbound.db)
-      // the stub was defeating.
+      // A 0-byte inbound.db is provably never provisioned (residue of a failed open); removing it restores the
+      // reclaimed-and-no-inbound.db state the stub was defeating.
       if (stat.size === 0) {
         log.warn('Removed empty inbound.db stub left by a failed open of a reclaimed session', {
           sessionId: row.id,
@@ -1579,18 +1184,10 @@ export async function reconcilePendingUpgradeContexts(
   let skipped = 0;
   for (const target of targets) {
     let admittedHere = 0;
-    // Per-target isolation. This pass runs on the startup path and its caller
-    // exits the process on a throw, so one unreadable session DB used to take
-    // the whole fleet down (2026-09-01: a stub inbound.db crash-looped the host
-    // seven times). A bad session DB is that session's problem; the pass owns
-    // every other session and the manifest bookkeeping below.
+    // Per-target isolation: the caller exits the process on a throw, so one bad session DB must not take the
+    // fleet down.
     try {
-      // Existing-only: `targets` was built from a successful stat of each
-      // inbound.db, so `undefined` here means the session vanished between
-      // that stat and now — nothing to admit, and never something to
-      // re-provision on the startup path (invariant I-10). The legacy
-      // migrations the raw open used to run by hand are what session() runs on
-      // its first touch of a path.
+      // Existing-only: `undefined` means the session vanished since the stat; never re-provision on the startup path.
       await withExistingMailboxSession(target.agentGroupId, target.id, async (mailbox) => {
         sessions++;
         admittedHere = await admitPendingUpgradeContexts(mailbox, target.agentGroupId, target.id);
@@ -1604,15 +1201,8 @@ export async function reconcilePendingUpgradeContexts(
         err,
       });
       skipped += 1;
-      // A failed session keeps whatever clock it has. `admitPendingUpgradeContexts`
-      // commits ONE TRANSACTION PER MESSAGE, so a throw on a later row leaves
-      // earlier admissions committed — and `admittedHere` is still 0, because
-      // the assignment never ran. Restoring here would therefore rewind the
-      // clock over real, durable work and report an active session as idle to
-      // the reclaim. The two errors are not symmetric: a clock left bumped at
-      // worst delays this one session's reclaim until the next pass, while a
-      // clock rewound over committed rows can hand a session with admitted
-      // work to the archiver. Keep the bumped clock.
+      // Keep the bumped clock: admissions commit per message, so earlier rows may be durable even though
+      // `admittedHere` is 0, and rewinding over committed work could hand an active session to the archiver.
       continue;
     }
     if (admittedHere > 0) continue;
@@ -1624,12 +1214,8 @@ export async function reconcilePendingUpgradeContexts(
       // Session removed underneath the pass.
     }
   }
-  // Deleted once the loop has run to the end. A per-target failure is handled
-  // inline (skipped, and its clock deliberately left alone), so it leaves
-  // nothing for the manifest to recover. Only a failure OUTSIDE this loop — the
-  // central DB query, the manifest write — still escapes to startup, which
-  // exits; the manifest is then the only record of what this pass bumped, so a
-  // `finally` that removes it would destroy the recovery it exists for.
+  // Deleted only after the loop completes: a failure outside the loop exits startup, and the manifest is then the
+  // only record of what this pass bumped (so no `finally`).
   fs.rmSync(upgradeMtimeManifestPath(dataDir), { force: true });
   if (mtimesRestored > 0) {
     log.info('Session migration pass left the idle clock untouched', { sessions, mtimesRestored });
@@ -1637,14 +1223,7 @@ export async function reconcilePendingUpgradeContexts(
   return { sessions, admitted, mtimesRestored, skipped, stubsRemoved };
 }
 
-/**
- * Put a crashed provider turn behind its retry deadline without exposing the
- * old pair to a warm poller.
- *
- * A thin pass-through to the module's admission op — kept here because the
- * sweep and the recovery paths reach it through this file's vocabulary, not
- * because any SQL lives here any more.
- */
+/** Put a crashed provider turn behind its retry deadline without exposing the old pair to a warm poller. */
 export function deferMessageForFreshContextRetry(
   mailbox: NanoclawMailboxSession,
   messageId: string,
@@ -1654,22 +1233,10 @@ export function deferMessageForFreshContextRetry(
 }
 
 /**
- * Admit due scheduled occurrences and paired crash retries through the same
- * fresh recall seam as channel and agent ingress.
- *
- * Scheduled rows are persisted with trigger=0, so neither a warm poller nor
- * the cold-wake query can claim them before this host-owned step. Admission
- * builds current context, then atomically appends the recall row and moves the
- * existing turn immediately after it while flipping trigger=1. Identity,
- * status, tries, series, recurrence, content, and routing stay on the original
- * row. A repeated sweep sees the paired trigger and is a no-op. Ordinary
- * trigger=0 accumulated chat has no recall marker and is never promoted.
- * Deferred on-wake rows keep on_wake=1 only until this host-owned barrier;
- * admission clears it on both halves so a fresh container that was concurrently
- * started by real inbound can still consume the now-safe pair on a later poll.
- *
- * What stays here is the POLICY — which rows get a recall and what it says.
- * Every statement it commits lives in the mailbox module's admission ops.
+ * Admit due scheduled occurrences and paired crash retries through the fresh recall seam. Scheduled rows are
+ * stored trigger=0, so nothing can claim them before this host-owned step appends the recall row and flips
+ * trigger=1 atomically; repeats are no-ops. Deferred on-wake rows keep on_wake=1 only until this barrier. Policy
+ * lives here; every statement lives in the mailbox module.
  */
 export async function admitDueTaskContexts(
   mailbox: NanoclawMailboxSession,
@@ -1677,24 +1244,16 @@ export async function admitDueTaskContexts(
   sessionId: string,
   withheld: ReadonlySet<string> = new Set(),
 ): Promise<number> {
-  // The one central read a recall needs, taken BEFORE the first inbound read so
-  // the admission itself is one synchronous pass: fence check, legacy
-  // demotion, due-row select and each paired admission see a single snapshot.
+  // The one central read, BEFORE the first inbound read, so the admission is one synchronous snapshot pass.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
-  // Under the lease: the recall rows read one lease-only central fact each
-  // (seam 3 §4.5); the dashboard's run-now caller already holds the lease.
+  // Under the lease: the recall rows read one lease-only central fact each.
   return withCentralSync(
     () => admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central, withheld),
     'admitDueTaskContexts',
   );
 }
 
-/**
- * The synchronous half of `admitDueTaskContexts`, for a caller whose mailbox
- * action must not yield (the dashboard's run-now mutation proves its verdict
- * and mutates in one block). Such a caller resolves the central facts with
- * `resolveRecallCentral` before opening its session.
- */
+/** The synchronous half, for a caller whose mailbox action must not yield (resolve `resolveRecallCentral` first). */
 export function admitDueTaskContextsFor(
   mailbox: NanoclawMailboxSession,
   agentGroupId: string,
@@ -1702,17 +1261,11 @@ export function admitDueTaskContextsFor(
   central: RecallCentral,
   withheld: ReadonlySet<string> = new Set(),
 ): number {
-  // An active repository ingress fence means this session must admit nothing:
-  // the whole point is that no new turn starts while its mounts change. The
-  // admission below sets trigger = 1, which a fenced row may never carry, so
-  // proceeding aborts the sweep for this session on the fence guard. Release
-  // has its own admission path (admitTaggedRows) and replays the deferred rows
-  // with their original triggers, so skipping here defers rather than drops.
+  // An active repository ingress fence admits nothing (no new turn while mounts change); release replays the
+  // deferred rows with their original triggers, so this defers rather than drops.
   if (mailbox.readRepoIngressFence()?.state === 'active') return 0;
 
-  // Legacy rows predate inert scheduling and were stored trigger=1. Demote
-  // only unpaired live tasks before selecting due work; already-admitted
-  // pairs remain wakeable and untouched.
+  // Legacy rows were stored trigger=1: demote only unpaired live tasks before selecting due work.
   mailbox.demoteUnpairedLegacyTasks();
 
   let admitted = 0;
@@ -1737,8 +1290,6 @@ export function admitDueTaskContextsFor(
           onWake: 0,
         },
         task.content,
-        // The open session IS the recall source: it exposes the same four
-        // reads the adapter used to wrap, on the handle already in hand.
         mailbox,
         central,
       )!;
@@ -1852,10 +1403,8 @@ function extractAttachmentFiles(
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException;
       if (e.code === 'EEXIST') {
-        // A host crash can land after the exclusive file write but before the
-        // messages_in insert. Accept only an identical, regular file inside
-        // the already-validated inbox directory so the exact platform replay
-        // can finish without weakening the symlink/overwrite defenses.
+        // A crash can land between the exclusive write and the insert: accept only an identical regular file in the
+        // validated inbox, so the replay finishes without weakening the symlink/overwrite defenses.
         try {
           const existing = fs.lstatSync(filePath);
           const realFile = fs.realpathSync(filePath);
@@ -1902,15 +1451,9 @@ function extractAttachmentFiles(
 /**
  * Take back attachment bytes this writer wrote for a message it then refused.
  *
- * The bytes are the side effect a refusal cannot otherwise undo: they land in
- * the target session's mounted `inbox`, which its container reads, with or
- * without a row pointing at them. The caller's own cleanup cannot cover these —
- * it only knows about files IT forwarded, not the ones this function decoded
- * out of inline `data`.
+ * They land in the container-readable inbox with or without a row; the caller only knows files it forwarded.
  *
- * Best-effort, and the refusal stands either way: failing to tidy up must never
- * turn a refused write into a successful one. The message directory goes only
- * if it is actually empty, so a concurrent writer's file is never taken with it.
+ * Best-effort; the refusal stands either way. A message dir goes only if empty (never a concurrent writer's file).
  */
 function removeExtractedAttachments(writtenPaths: string[]): void {
   const dirs = new Set<string>();
@@ -2029,15 +1572,8 @@ export function clearOutbox(agentGroupId: string, sessionId: string, messageId: 
 }
 
 /**
- * Push an inbox-board `session_event` for a container-state transition.
- * Looks up agent_group_id by sessionId because the three markContainer*
- * helpers are called from places that don't all carry that context.
- * Best-effort: lookup miss or unavailable dashboard module → no emit.
- */
-/**
- * Exported for the fenced finish in container-runner, which writes the
- * `stopped` status inside a central transaction (DB calls only) and emits the
- * dashboard event after it commits.
+ * Push an inbox-board `session_event` for a container-state transition (best-effort). Exported for the fenced
+ * finish in container-runner, which emits after its transaction commits.
  */
 export async function _emitContainerStateEvent(
   sessionId: string,

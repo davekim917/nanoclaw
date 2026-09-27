@@ -1,13 +1,8 @@
 import { canonicalWorkItem, isAdmissibleOutcomeRequestSource, renderWorkOutcome } from './outcome-reporting-schema.js';
 import { claimWorkOutcome, settleWorkOutcome } from './db/work-outcome-receipts.js';
 /**
- * Outbound message delivery.
- * Polls session outbound DBs for undelivered messages, delivers through channel adapters.
- *
- * Two-DB architecture:
- *   - Reads messages_out from outbound.db (container-owned, opened read-only)
- *   - Tracks delivery in inbound.db's `delivered` table (host-owned)
- *   - Never writes to outbound.db — preserves single-writer-per-file invariant
+ * Outbound message delivery: reads messages_out from outbound.db (container-owned, opened read-only) and tracks
+ * delivery in inbound.db's `delivered` table. Never writes outbound.db (single writer per file).
  */
 import {
   bumpLastOutbound,
@@ -73,20 +68,7 @@ import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js'
 import type { OutboundFile } from './channels/adapter.js';
 import { isChannelVariant, type PendingApproval, type Session } from './types.js';
 
-/**
- * A session is a spawn-task child when a row in the `tasks` table names it
- * as `child_session_id`. For these sessions the dashboard becomes a
- * persistent work log: thinking blocks render as fresh, durable messages in
- * the spawn thread rather than the ephemeral post-then-edit-then-delete
- * pattern that chat UX uses. Without this, only the final answer survives
- * in the thread and all in-flight progress vanishes when the answer posts.
- *
- * The cache is per-host-process and never invalidated — once a session is a
- * spawn child, it stays one for its entire lifetime, so a single positive
- * result is permanent. Negative results (regular chat session) are cached
- * too because we'd otherwise hit the central DB on every status delivery
- * for every chat session.
- */
+/** Cached per process and never invalidated: a session's spawn-child status never changes. */
 const spawnChildSessionCache = new Map<string, boolean>();
 async function isSpawnChildSession(sessionId: string): Promise<boolean> {
   const cached = spawnChildSessionCache.get(sessionId);
@@ -105,19 +87,8 @@ const MAX_DELIVERY_ATTEMPTS = 3;
  * host restart: a poison message gets MAX_DELIVERY_ATTEMPTS total, not
  * MAX_DELIVERY_ATTEMPTS per process lifetime (the old in-memory counter
  * reset on every restart, so a crash-looping host retried it forever).
- * Bookkeeping failures must never break delivery: a failed read delivers
- * without a stored count, a failed record skips the give-up decision for this
- * tick (the message just retries next poll), and a failed clear leaves a stale
- * row the next lifecycle of the same id clears.
- *
- * The count is consulted BEFORE the adapter is called, not only after a
- * failure, because recording attempt N and marking the message permanently
- * failed are two separate writes. A host that dies between them leaves a row
- * at the cap with no terminal `delivered` row, and a successor that only ever
- * read the count after its own failure would call the adapter again — attempt
- * N+1, unbounded across repeated crashes in that window, and a duplicate
- * user-visible message whenever the failure happened after the send left the
- * host. Reading first makes the stored row terminal on its own.
+ * Bookkeeping failures never break delivery. The count is read BEFORE calling the adapter: recording attempt N and
+ * marking the message failed are separate writes, so a host dying between them would otherwise re-send forever.
  */
 async function recordAttemptRow(messageId: string, sessionId: string, err: unknown): Promise<number | null> {
   /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
@@ -140,12 +111,7 @@ async function recordAttemptRow(messageId: string, sessionId: string, err: unkno
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/**
- * The stored row, or `undefined` when there is none and when the read failed.
- * The whole row rather than just the count: `last_error` is the only surviving
- * description of why the message failed under the previous host, and the
- * terminal give-up has to carry it forward.
- */
+/** The stored row, or `undefined` (none, or the read failed). Carries `last_error` from a previous host. */
 async function readAttemptRow(messageId: string): Promise<DeliveryAttemptRow | undefined> {
   /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never block delivery */
   try {
@@ -167,27 +133,10 @@ async function clearAttemptRow(messageId: string): Promise<void> {
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-// ── Sweep change-gate (docs/specs/bounded-periodic-work/plan.md) ──
-//
-// The sweep opened both SQLite files for every session active in the last 7
-// days — ~1,657 per cycle — to find the ~17 that had actually changed. Session
-// DBs use journal_mode=DELETE, so every commit lands in the main file and moves
-// its mtime; a stat answers "could this session possibly have work?" for the
-// cost of one syscall. Same shape as `usageRollupMtimeCache` in host-sweep.
-//
-// Two rules keep the failure mode bounded, because a wrong skip here is a
-// silently undelivered chat message rather than an error:
-//
-//   1. Arm only after a drain proves the session has NOTHING outstanding —
-//      not even a future `deliver_after` row, and not after a delivery error.
-//      Retry state now lives in the central DB's `delivery_attempts` rows
-//      rather than in process memory, but THE RULE IS UNCHANGED and must not
-//      be relaxed on that basis: the retry itself is still driven by polling
-//      the session's own outbound.db, and a failed delivery writes nothing
-//      there, so its mtime does not move. Arming on a drain that ended in an
-//      error would skip that session until the backoff in rule 2 expires.
-//   2. Expire the skip on time as well as on the change signal, so a bug in
-//      the signal costs bounded delay instead of permanent silence.
+// Sweep change-gate: a stat of the session DB (journal_mode=DELETE, so every commit moves the main file's mtime)
+// decides whether a session can have work. A wrong skip is a silently undelivered message, so: (1) arm only after
+// a drain proves NOTHING is outstanding, never after a delivery error (a failed delivery writes nothing to
+// outbound.db, so its mtime never moves); (2) expire the skip on time too, bounding the cost of a signal bug.
 export const QUIET_DELIVERY_BACKOFF_MS = 10 * 60_000;
 
 export interface QuietDeliveryMark {
@@ -207,20 +156,12 @@ function sessionJitterFraction(sessionId: string): number {
   return ((h >>> 0) % 100_000) / 100_000;
 }
 
-/**
- * When a quiet session must be polled regardless of its change signal.
- *
- * Jittered per session across the second half of the window: sessions armed in
- * the same cycle would otherwise expire in the same cycle and re-create the
- * very ~1,657-session burst this gate exists to remove, once every backoff
- * period.
- */
+/** Jittered across the second half of the window, or sessions armed together would expire together in one burst. */
 export function quietDeliveryDeadlineMs(sessionId: string, armedAtMs: number): number {
   const half = QUIET_DELIVERY_BACKOFF_MS / 2;
   return armedAtMs + half + Math.floor(sessionJitterFraction(sessionId) * half);
 }
 
-/** Pure so the skip decision has one thing to unit-test. */
 export function shouldSkipQuietDelivery(
   cached: QuietDeliveryMark | undefined,
   current: { mtimeNs: bigint; size: number },
@@ -232,7 +173,6 @@ export function shouldSkipQuietDelivery(
   return nowMs <= quietDeliveryDeadlineMs(sessionId, cached.armedAtMs);
 }
 
-/** Test seam — the cache is process-local and rebuilt from disk on restart. */
 export function peekQuietDeliveryMark(sessionId: string): QuietDeliveryMark | undefined {
   return quietDeliveryCache.get(sessionId);
 }
@@ -241,36 +181,17 @@ export function _resetQuietDeliveryCacheForTest(): void {
   quietDeliveryCache.clear();
 }
 
-/**
- * Test seam: force the cache into a state the public path refuses to produce —
- * "armed" while the session still has a due row. That is exactly the corrupted
- * change-signal the time bound exists to survive, and it cannot be reached by
- * arming legitimately (arming requires a clean drain) or by freezing the file
- * (utimes has no nanosecond precision).
- */
+/** Test seam: an "armed" mark while a due row exists, the corrupted state the time bound must survive. */
 export function _setQuietDeliveryMarkForTest(sessionId: string, mark: QuietDeliveryMark): void {
   quietDeliveryCache.set(sessionId, mark);
 }
 
-/**
- * What a drain concluded about the session.
- *
- * `clean` is the only outcome that may arm the skip: it means every row in
- * `messages_out` has a `delivered` row. `busy` exists because a concurrent
- * `pollActive` drain makes `deliverSessionMessages` a no-op — arming on that
- * would mark a session quiet without ever having looked at it.
- */
+/** Only `clean` may arm the skip. `busy`: a concurrent drain made this one a no-op, so nothing was looked at. */
 export type DrainOutcome = 'busy' | 'clean' | 'pending' | 'error';
 
 /**
- * Per-session tracking of the currently-visible status line. First
- * `kind='status'` in a turn posts a fresh message and caches the route
- * + platform message id here; subsequent status events in the same turn
- * edit that message in place. On real chat delivery the orphan is
- * deleted via `deleteMessage` (using the *stored* route, not the chat
- * delivery's route — `send_message` can target a different
- * channel/thread than the session's status was posted to) and tracking
- * is cleared.
+ * The visible status line per session: the first status in a turn posts, later ones edit in place. Deleted via
+ * the STORED route on chat delivery (`send_message` may target a different channel/thread).
  */
 interface StatusTrack {
   outboundId: string;
@@ -281,22 +202,13 @@ interface StatusTrack {
   /** Instance the status was posted through — the orphan delete must reuse it
    *  or it routes through the default-instance adapter (a sibling bot). */
   instance?: string;
-  /** Batch anchor (turn id) the tracked status belongs to. The container
-   *  stamps it on every status row's `in_reply_to`. A status whose anchor
-   *  differs from the tracked one belongs to a NEW turn — used to detect the
-   *  prior turn ending without a chat-final (which would otherwise leave the
-   *  💭 orphan undeleted and the next turn editing it in place above the
-   *  user's newer message). Null only when the turn had no inbound anchor. */
+  /** Turn anchor (`in_reply_to`); a status with a different anchor means the prior turn ended without a chat-final. */
   inReplyTo: string | null;
-  /** Discord rejected further edits to this message with code 30046. Keep
-   *  the route until a replacement post succeeds, but never retry the doomed
-   *  edit while the replacement is pending. */
+  /** Discord refused further edits (code 30046): never retry the edit while a replacement post is pending. */
   editExhausted?: boolean;
   /** True only for the runner-authored deterministic lifecycle row. */
   lifecycle?: boolean;
-  /** The lifecycle row is tracked but was never posted: the human sees no
-   *  "working" line until the first typed progress posts one. `messageId` is
-   *  empty while this is set, so nothing may edit or delete it. */
+  /** Tracked but never posted; `messageId` is empty, so nothing may edit or delete it. */
   unposted?: boolean;
 }
 const statusTracking = new Map<string, StatusTrack>();
@@ -309,36 +221,9 @@ export function _resetStatusTrackingForTest(): void {
 }
 
 /**
- * Delete this session's tracked 💭 status and clear the tracking entry.
- *
- * Two callers, one rule — a status line is scaffolding, never an outcome:
- *   - a chat-final landed, so the status has been superseded;
- *   - the turn ended without one, so the status is all the user would see.
- *
- * Uses the *stored* route (pinned when the status was first posted), not the
- * caller's — `send_message` can deliver a chat reply to a different
- * channel/thread than the status went to, and deleting via the reply's route
- * would target the wrong channel.
- *
- * Errors are swallowed: a failed delete (network, permission revoked, message
- * already gone) leaves the orphan visible but must never block `markDelivered`
- * for the real answer — that would retry and duplicate it.
- */
-/**
- * Drop a session's 💭 status because its container is being killed.
- *
- * The container signals a graceful turn end with a `turn_end` row, but a killed
- * container never gets to — and for scheduled-task sessions that is the NORMAL
- * exit, not an edge case. `markCompleted` fires inside processQuery on the first
- * result (so the sweep doesn't see stale claims while the stream stays open for
- * follow-ups), which drops processingClaimCount to 0; the idle reaper then kills
- * the container seconds later with the stream still open, so the batch tail —
- * and its emitTurnEnd — is never reached. Observed on the support-inbox poller:
- * ack at 13:31:18.689Z, kill at 13:31:30, leaving the thinking label as the
- * run's only visible output in #support.
- *
- * Covers every kill reason (idle reap, 30-min ceiling, host restart, OOM), so
- * the host never depends on a dying process to clean up after itself.
+ * Drop a session's 💭 status because its container is being killed: a killed container never emits `turn_end`,
+ * and for scheduled tasks that is the NORMAL exit (the idle reaper kills after the first result). Covers every
+ * kill reason, so the host never depends on a dying process to clean up.
  */
 export async function clearSessionStatusOnKill(sessionId: string): Promise<void> {
   await stopSessionLifecycleStatus(sessionId, 'Stopped.', undefined);
@@ -499,7 +384,6 @@ async function markSessionLifecycleTerminal(sessionId: string, status: StatusTra
   if (!marked) throw new Error(`Cannot mark missing lifecycle delivery ${status.outboundId} terminal`);
 }
 
-/** Best-effort lifecycle settlement after the platform accepted a public message. */
 export async function settleSessionStatusAfterPublicDelivery(
   sessionId: string,
   options: { conversation?: DeliveredConversation; waitWhenElsewhere?: boolean } = {},
@@ -544,27 +428,9 @@ function isDiscordChannelType(channelType: string): boolean {
 }
 
 /**
- * Per-session anchor for threading a turn's multiple channel-root messages.
- *
- * When a session emits several user-facing messages in one turn to a channel
- * *root* — i.e. the outbound row's `thread_id` is null because the session
- * isn't bound to a thread — the first message posts fresh and becomes the
- * thread parent; later messages of the same turn reply under it instead of
- * each landing as a separate top-level post.
- *
- * Turn-scoped and in-memory on purpose: a scheduled task MUST stay
- * thread-unbound (binding it to a thread would tie its lifetime to a session
- * that dies), and within one fire this is the right fix — the anchor lives
- * delivery-side, keyed by the turn's `in_reply_to`. It does NOT survive
- * across fires (each fire gets a fresh inbound id, so a new turn always
- * resets it) — that's `task_thread_anchors` (db/task-thread-anchors.ts), a
- * persistent, rotating anchor keyed by (session, destination). Task-session
- * posts use that one instead; this one only ever engages for everything
- * else (see `taskAnchorEligible` / `turnAnchorEligible` in deliverMessage).
- *
- * Sessions already bound to a thread (per-thread channel replies carry a
- * non-null `thread_id`) are untouched — the anchor only engages when
- * `thread_id` is null AND `in_reply_to` is set.
+ * Per-turn anchor for several channel-ROOT messages (null `thread_id`, set `in_reply_to`): the first posts fresh
+ * and later ones reply under it. In memory and turn-scoped on purpose; task sessions use the persistent
+ * `task_thread_anchors` instead, except a `threadAnchor:false` task, whose posts fall back to this anchor.
  */
 interface ChatThreadAnchor {
   inReplyTo: string;
@@ -574,21 +440,12 @@ interface ChatThreadAnchor {
 }
 const chatThreadAnchor = new Map<string, ChatThreadAnchor>();
 
-/**
- * Sessions whose turn anchor proved unusable, keyed sessionId -> that turn's
- * `in_reply_to`. Set when a threaded send under the anchor throws; the rest of
- * that turn then posts at root without re-paying a failing call. A new turn has
- * a different `in_reply_to`, so threading is retried — a transient failure
- * costs one turn, not the session.
- */
+/** Turns whose anchor failed (sessionId → `in_reply_to`): the rest of that turn posts at root; the next retries. */
 const chatThreadAnchorDisabled = new Map<string, string>();
 
 /**
- * The agent-named incident/topic key on an outbound row (`content.threadKey`,
- * written by send_message/send_file — container/agent-runner/src/mcp-tools/core.ts).
- * A malformed key is ignored rather than refused: the row still delivers exactly
- * as an unkeyed one would, which is the pre-feature behaviour, instead of burning
- * retries and dropping the message.
+ * `content.threadKey` from send_message/send_file. A malformed key is ignored (the row delivers as unkeyed) rather
+ * than refused.
  */
 function readThreadKey(content: { threadKey?: unknown }, msgId: string, sessionId: string): string | null {
   const raw = content.threadKey;
@@ -599,15 +456,8 @@ function readThreadKey(content: { threadKey?: unknown }, msgId: string, sessionI
 }
 
 /**
- * Keyed-anchor bookkeeping after a keyed post, which has already landed on the
- * platform by the time this runs. So a failed write here is logged, never thrown:
- * a throw would fail the row and re-post a message the channel already shows.
- *   - threaded under the anchor → bump last_used_at
- *   - threaded into a thread adopted via continueThread → record that thread
- *   - root post with an id (new key, expired key, or a threaded failure that
- *     fell back) → upsert the record, then prune stale keys
- *   - fell back to root but got no id → drop the dead record, so the next post
- *     doesn't pay the same failed threaded call
+ * Keyed-anchor bookkeeping after the post already landed: a failed write is logged, never thrown, or the row would
+ * fail and re-post a message the channel already shows.
  */
 async function settleThreadKeyAnchor(
   addr: ThreadKeyAddress,
@@ -636,11 +486,8 @@ async function settleThreadKeyAnchor(
 }
 
 /**
- * Serializes lookup → post → record per keyed destination. Delivery is excluded
- * per session only (`inflightDeliveries` below), but a thread key is scoped to the
- * agent group, so two sessions of one group posting the same new key at once
- * would otherwise both miss the lookup and both post a root. The host is one
- * process, so an in-memory chain is the whole exclusion.
+ * Serializes lookup → post → record per keyed destination: a thread key is group-scoped, so two sessions posting
+ * the same new key would both miss the lookup and both post a root. One process, so an in-memory chain suffices.
  */
 const threadKeyLocks = new Map<string, Promise<void>>();
 let threadKeyLockWaiters = 0;
@@ -663,11 +510,7 @@ async function withThreadKeyLock<T>(
     return deliver();
   }
   if (typeof threadKey !== 'string' || !THREAD_KEY_PATTERN.test(threadKey)) return deliver();
-  // Coarser than the anchor's identity on purpose: the anchor is per messaging
-  // group (instance), which only deliverMessage resolves, so the lock covers every
-  // instance on this address, and also keyed rows with an explicit thread_id that
-  // never read the anchor. Over-serializing those is harmless; it keeps the one
-  // eligibility and routing rule inside deliverMessage.
+  // Coarser than the anchor's identity on purpose (all instances on this address); over-serializing is harmless.
   const lockKey = JSON.stringify([session.agent_group_id, msg.channel_type, msg.platform_id, threadKey]);
   const prior = threadKeyLocks.get(lockKey) ?? Promise.resolve();
   let release!: () => void;
@@ -701,12 +544,8 @@ async function withThreadKeyLock<T>(
 const inflightDeliveries = new Set<string>();
 
 /**
- * Run `fn` holding this session's delivery slot, waiting (bounded) for a drain
- * already in flight to finish rather than skipping. For work that must be
- * ORDERED against the session's deliveries — the live task list's kill-time
- * edit (src/task-list-host.ts) must land after anything the drain already
- * sent. Never runs unowned: past the wait it returns `undefined` without
- * calling `fn`.
+ * Run `fn` holding the session's delivery slot, waiting (bounded) for an in-flight drain; for work that must be
+ * ORDERED after the drain's sends. Past the wait it returns `undefined` without calling `fn`.
  */
 export async function withSessionDeliverySlot<T>(
   sessionId: string,
@@ -776,11 +615,7 @@ let sweepPolling = false;
 type AdapterReadyCallback = (adapter: ChannelDeliveryAdapter) => void | Promise<void>;
 const adapterReadyCallbacks: AdapterReadyCallback[] = [];
 
-/**
- * Invariant guard: channel_type and platform_id must BOTH be null or BOTH be non-null.
- * A mix (one null, one set) indicates corrupted routing state and should fail loudly
- * before any adapter call or DB write that relies on this pair.
- */
+/** channel_type and platform_id must BOTH be null or BOTH set; a mix is corrupted routing state. */
 export function assertChannelRoutingConsistency({
   channelType,
   platformId,
@@ -830,8 +665,7 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
   activePolling = true;
-  // pollActive wraps its own body in try/catch and always reschedules itself,
-  // so its returned promise never rejects — void is safe here.
+  // pollActive never rejects (it catches and reschedules itself), so void is safe.
   void pollActive();
 }
 
@@ -839,8 +673,7 @@ export function startActiveDeliveryPoll(): void {
 export function startSweepDeliveryPoll(): void {
   if (sweepPolling) return;
   sweepPolling = true;
-  // pollSweep wraps its own body in try/catch and always reschedules itself,
-  // so its returned promise never rejects — void is safe here.
+  // pollSweep never rejects (it catches and reschedules itself), so void is safe.
   void pollSweep();
 }
 
@@ -870,22 +703,13 @@ async function pollActive(): Promise<void> {
   }, ACTIVE_POLL_MS);
 }
 
-// A session idle past this horizon has no deliverable outbound left — its
-// container hasn't written in a week. Iterating EVERY active session ever
-// created (3k+, synchronous SQLite each) cost ~3s of event-loop time per
-// minute; the recent-activity bound keeps the cycle in the tens of ms.
+// A session idle past this horizon has no deliverable outbound left; iterating every session ever created stalls
+// the event loop.
 const SWEEP_POLL_ACTIVITY_HORIZON_MS = 7 * 24 * 60 * 60 * 1000;
 
 async function pollSweep(): Promise<void> {
   if (!sweepPolling) return;
-  // The 7-day horizon stopped bounding this loop once session volume grew
-  // (2350 sessions/cycle observed) and every stall drops live Discord inbound
-  // at the local forward hop, so the per-session change-gate inside the cycle
-  // is what keeps the work proportional to what actually changed.
-  //
-  // try/catch mirrors pollActive: without it, a throw here would reject this
-  // function's promise and skip the reschedule below, silently killing the
-  // sweep loop forever instead of just skipping one cycle.
+  // A throw must not skip the reschedule below, or the sweep loop dies silently.
   try {
     await runSweepDeliveryCycle();
   } catch (err) {
@@ -896,16 +720,7 @@ async function pollSweep(): Promise<void> {
   }, SWEEP_POLL_MS);
 }
 
-/**
- * Granular kind tag for the inbox board. For `chat-sdk` messages, the raw
- * `messages_out.kind` is just `chat-sdk` — too coarse for the dashboard to
- * tell "agent asked you a question" from "agent posted a streaming status".
- * Returning `chat-sdk:<content.type>` (or plain `chat-sdk` if the payload
- * doesn't carry a type) gives the inbox a single string to compare against.
- *
- * Anything that fails to parse falls back to the raw `msg.kind` — the inbox
- * treats unknown tags as plain outbound activity, which is the safe default.
- */
+/** `chat-sdk:<content.type>` for chat-sdk rows so the inbox can tell a question from a status; else the raw kind. */
 function outboundKindTag(msg: { kind: string; content: string }): string {
   if (msg.kind !== 'chat-sdk') return msg.kind;
   try {
@@ -916,15 +731,13 @@ function outboundKindTag(msg: { kind: string; content: string }): string {
   } catch {
     /* malformed JSON — fall through */
   }
-  // Keep the `chat-sdk:*` namespace contract so inbox consumers can
-  // pattern-match by prefix; a bare `chat-sdk` would split the schema.
+  // Keep the `chat-sdk:*` namespace so inbox consumers can match by prefix.
   return 'chat-sdk:unknown';
 }
 
 export async function deliverSessionMessages(session: Session): Promise<DrainOutcome> {
   // Reject re-entry from a concurrent poll on the same session — see the
-  // comment on inflightDeliveries above. `busy` rather than a bare return so
-  // the sweep cannot mistake "another poll owns this" for "nothing to do".
+  // comment on inflightDeliveries above. `busy`, not a bare return, so the sweep never reads it as "nothing to do".
   if (inflightDeliveries.has(session.id)) return 'busy';
   inflightDeliveries.add(session.id);
 
@@ -939,36 +752,24 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return 'pending';
 
-  // The whole queue snapshot in ONE mailbox session, closed before anything
-  // else runs. Nothing below this block may execute while a session is open on
-  // this key: a delivery action handler that writes to the session it is
-  // delivering for — `spawn_cancel` notifying its parent is the live case —
-  // opens its own session and would hit the nesting guard, and the channel
-  // adapter call is a network round trip with no business holding SQLite
-  // handles. Plan §4.5b, invariants I-3 and I-9.
+  // The queue snapshot in ONE mailbox session, closed before anything else runs: a delivery action handler may open
+  // its own session on this key (nesting guard), and adapter calls must not hold SQLite handles.
   let snapshot: { delivered: ReadonlySet<string>; outstanding: string[]; due: OutboundMessage[] } | undefined;
   try {
     snapshot = await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => {
       const delivered = mailbox.getDeliveredIds();
       return {
         delivered,
-        // Everything outstanding, not just what is due — a row scheduled for
-        // later sits in a file that may never change again, so it must block
-        // arming.
+        // Everything outstanding, not just due: a row scheduled for later must block arming.
         outstanding: mailbox.listOutboundMessageIds().filter((id) => !delivered.has(id)),
         due: mailbox.getDueOutboundMessages(),
       };
     });
   } catch {
-    // Same answer the two raw opens gave: a session whose files are present
-    // but unopenable (a stale reclaim claim, a descriptor ceiling) is
-    // 'pending', so the sweep retries and never arms the quiet gate off a
-    // failure.
+    // Present but unopenable: 'pending', so the sweep retries and never arms the quiet gate off a failure.
     return 'pending';
   }
-  // `undefined` is the vanished/not-yet-provisioned session: a read never
-  // provisions one (invariant I-4), and there is nothing to deliver from a
-  // mailbox that does not exist.
+  // Vanished or never provisioned (a read never provisions one): nothing to deliver.
   if (snapshot === undefined) return 'pending';
   const { delivered, outstanding } = snapshot;
 
@@ -976,9 +777,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
 
   const due = snapshot.due.filter((m) => !delivered.has(m.id));
   if (due.length === 0) return 'pending';
-  // A task-list edit that a later queued edit of the same message replaces is
-  // never sent: the list is whole in every edit, so only the newest matters,
-  // and skipping the rest keeps a busy list off the platform's rate limit.
+  // Superseded task-list edits are never sent: each edit carries the whole list, so only the newest matters.
   const supersededEdits = supersededTaskListEdits(due);
   const undelivered = orderGateRowsBySeq(due.filter((m) => !supersededEdits.has(m.id)));
   if (supersededEdits.size > 0) {
@@ -990,16 +789,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     }
   }
 
-  // Bump `tasks.last_progress_at` once per drain if this session is a
-  // spawn-task child. Only `spawn_progress` MCP calls update that column
-  // today, so an agent that's actively thinking, posting status, and
-  // running tool calls but hasn't explicitly pinged `spawn_progress`
-  // within 30 minutes gets reaped by the no-progress watchdog as if it
-  // were stuck. Observed against spawn-9048e8cfbcc024c2 (EXAMPLE-61) at
-  // 20:11:05 UTC on 2026-05-11: the watchdog reaped exactly 33 seconds
-  // before the child called spawn_complete — the agent was delivering
-  // status messages within the same second. Counting any outbound row as
-  // "progress" makes the no-progress timer mean what it says.
+  // Any outbound row counts as spawn-child progress, or an active child that never calls `spawn_progress` gets
+  // reaped by the no-progress watchdog as stuck.
   if (await isSpawnChildSession(session.id)) {
     try {
       await getDb().run(
@@ -1018,12 +809,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   let sawError = false;
   const deliveredNow = new Set<string>(supersededEdits);
 
-  /**
-   * Terminal drop for one message, reached either from this tick's own
-   * failure or from a stored count that is already at the cap. `decidedFrom`
-   * says which, so the operator reading the first `giving up` line after a
-   * restart can tell a fresh exhaustion from an inherited one.
-   */
+  /** `decidedFrom` tells a fresh exhaustion from one inherited from a previous host's stored count. */
   const giveUpOnMessage = async (
     msg: (typeof undelivered)[number],
     attempts: number,
@@ -1040,15 +826,9 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     });
     await ackDelivery(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id, errMsg));
     await clearAttemptRow(msg.id);
-    // Incident 2026-09-01: the row dropped here was a repository
-    // publication that had already fenced ~1400 session inbound DBs in
-    // its workgroup. Its strict release fails fast on the first bad
-    // session, so every session behind that one stayed fenced — deaf,
-    // unspawnable, and with no code path left to free it. Giving up on
-    // the message is the last moment the host knows the transition has
-    // ended, so release any fence no live publication still owns.
-    // Lazy import: session-manager already imports delivery, so a static
-    // edge here would close a module-init cycle (CLAUDE.md).
+    // Giving up is the last moment the host knows a transition has ended: release any repo-ingress fence no live
+    // publication owns, or sessions behind a failed publication stay fenced forever. Lazy import: session-manager
+    // imports delivery (module-init cycle).
     try {
       const { releaseOrphanedRepoIngressFencesForDroppedMessage } = await import('./repo-fence-recovery.js');
       await releaseOrphanedRepoIngressFencesForDroppedMessage(msg, session);
@@ -1070,23 +850,13 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       noteHeldTaskListPost(heldListPosts, msg);
       continue;
     }
-    // A stored count already at the cap is terminal on its own — the crash
-    // window described on the helpers above leaves exactly that row behind.
-    // Deciding from it BEFORE the adapter runs is what stops a successor host
-    // spending attempt N+1, and stops a re-send of a message whose failure
-    // happened after it had already left the previous host.
+    // A stored count at the cap is terminal on its own: decide BEFORE the adapter runs, so a successor host never
+    // re-sends (see the attempt helpers above).
     const stored = isGateRow(msg) ? undefined : await readAttemptRow(msg.id);
     if (stored !== undefined && stored.attempts >= MAX_DELIVERY_ATTEMPTS) {
-      // Terminal, like the give-up below, so the drain must not arm the quiet
-      // cache this tick. The `delivered` row it writes takes the message out
-      // of `outstanding` on the next drain.
+      // Terminal: must not arm the quiet cache this tick.
       sawError = true;
-      // The persisted adapter error, verbatim, because it is what the failure
-      // actually was: the runner surfaces `delivered.error` to synchronous
-      // callers (`send_file` and friends, container/agent-runner/src/db/
-      // delivery-acks.ts), and a missing scope or an oversized file is only
-      // actionable if that text survives the restart. The generic line is a
-      // fallback for a row with no error stored, never a replacement.
+      // The persisted adapter error verbatim: the runner surfaces `delivered.error` to synchronous callers.
       await giveUpOnMessage(
         msg,
         stored.attempts,
@@ -1095,16 +865,13 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
           : `delivery abandoned: ${stored.attempts} attempts recorded before this host started`,
         'a count stored before this host started',
       );
-      // Nothing was sent, so nothing can overtake this row: unlike the retry
-      // branch below, a terminal decision does not have to break the drain.
+      // Nothing was sent, so nothing can overtake this row: no need to break the drain.
       continue;
     }
     try {
       const result = await withThreadKeyLock(msg, session, () => deliverMessage(msg, session));
-      // System actions like request_bash_gate return deferAck:true — the
-      // handler owns the `delivered` row lifecycle and writes it later
-      // (on admin approval or timeout). Auto-acking here would race
-      // ahead of the human and silently unblock a gated command.
+      // deferAck: the handler owns the `delivered` row (e.g. request_bash_gate on approval); auto-acking would
+      // silently unblock a gated command.
       if (!result.deferAck) {
         await ackDelivery(agentGroup.id, session.id, (mailbox) => {
           mailbox.markDelivered(msg.id, result.platformMsgId ?? null);
@@ -1113,13 +880,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         });
         if (msg.kind === 'chat' && !result.recordOnly) heldListPosts.clear();
         deliveredNow.add(msg.id);
-        // Mirror the outbound timestamp into the central sessions row so
-        // the inbox board can compute attention-state without opening
-        // every per-session outbound.db. Only bump for messages that
-        // actually went to a platform — system actions handled in-host
-        // and agent-to-agent internal traffic aren't operator-visible
-        // and would otherwise keep dormant sessions out of the stale
-        // lane forever. Mirrors the typing-indicator gate below.
+        // Mirror into the central row for the inbox board; only operator-visible platform sends count, or dormant
+        // sessions never reach the stale lane.
         if (!result.recordOnly && msg.kind !== 'system' && msg.channel_type !== 'agent') {
           const tag = outboundKindTag(msg);
           try {
@@ -1130,8 +892,6 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
               err: err instanceof Error ? err.message : String(err),
             });
           }
-          // Push the inbox-board SSE so an operator watching the inbox
-          // sees the new last_outbound_at without waiting for poll.
           emitSessionEvent({
             session_id: session.id,
             agent_group_id: session.agent_group_id,
@@ -1142,13 +902,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       }
       await clearAttemptRow(msg.id);
 
-      // Pause the typing indicator after a real user-facing message
-      // lands on the user's screen, so the client has time to visually
-      // clear the indicator before the next heartbeat tick brings it
-      // back. Skip the pause for internal traffic (system actions,
-      // agent-to-agent routing) — the user doesn't see those and
-      // shouldn't get a gap in their typing indicator for them.
-      // A task-list post or edit is not a reply: the agent is still working.
+      // Pause typing after a user-visible message so the client clears the indicator; not for internal traffic or
+      // a task-list post (the agent is still working).
       if (!result.recordOnly && msg.kind !== 'system' && msg.kind !== 'task_list' && msg.channel_type !== 'agent') {
         pauseTypingRefreshAfterDelivery(session.id);
       }
@@ -1177,13 +932,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
           maxAttempts: MAX_DELIVERY_ATTEMPTS,
           err,
         });
-        // Preserve outbound ordering across retries. Continuing would let a
-        // newer status/chat overtake this row; if the failed row later
-        // retries, it can overwrite newer progress or appear after the final
-        // answer. The next poll resumes from this oldest undelivered row.
-        // Except a task-list row: progress must never hold an answer back,
-        // and a newer edit of the list supersedes this one (above). A first
-        // post an answer overtakes is retired, not posted below the answer.
+        // Preserve ordering: break so a newer status/chat cannot overtake this row. Except a task-list row:
+        // progress must never hold an answer back, and a newer edit supersedes it.
         if (msg.kind === 'task_list') {
           noteHeldTaskListPost(heldListPosts, msg);
           continue;
@@ -1199,15 +949,9 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
 }
 
 /**
- * Write one `delivered` row in its own short mailbox session.
- *
- * `withExistingMailboxSession`, not `withMailboxSession`: the mailbox this
- * acks was open moments ago to read the row, so provisioning can only mean the
- * session was reclaimed underneath us — and provisioning would then recreate
- * the directory a reclaim had just removed and create the outbound.db the host
- * must never author (`modules/mailbox/openers.ts`). A vanished session loses
- * its ack, which leaves the row outstanding exactly as an unwritable handle
- * did before, and says so instead of writing into an unlinked inode.
+ * `withExistingMailboxSession`, never the provisioning opener: provisioning here would recreate a reclaimed
+ * session and the outbound.db the host must never author. A vanished session loses its ack (the row stays
+ * outstanding).
  */
 async function ackDelivery(
   agentGroupId: string,
@@ -1221,25 +965,11 @@ async function ackDelivery(
   if (!acked) log.warn('Delivery ack skipped — session mailbox is gone', { sessionId });
 }
 
-/**
- * One session's turn in the sweep: stat, gate, drain, arm.
- *
- * The stat is taken BEFORE the DBs are opened and that value is what gets
- * stored, so a commit landing mid-drain leaves a newer mtime on disk than the
- * armed one and is re-polled next cycle instead of being swallowed.
- */
+/** The stat is taken BEFORE the drain and that value is stored, so a commit mid-drain is re-polled next cycle. */
 export async function sweepDeliverSession(session: Session, nowMs: number): Promise<DrainOutcome | 'skipped'> {
-  // A live container is about to write, and pollActive already drains it every
-  // second — never gate it. `isContainerRunning` is the authoritative signal:
-  // spawn records the container in its in-memory map (container-runner.ts,
-  // `activeContainers.set`) before the central row is updated, and the sweep
-  // snapshots every session up front, so `session.container_status` can still
-  // read 'stopped' for a container that is already writing. The row is kept as
-  // a fallback for the reverse skew.
-  // Imported lazily: a static import would pull container-runner (docker,
-  // spawn, image builds) into the module graph of everything that imports
-  // delivery. Node caches the module, so this is a map lookup after the first
-  // call.
+  // Never gate a live container (pollActive drains it). `isContainerRunning` is authoritative: the sweep's session
+  // snapshot can still read 'stopped' for a container already writing. Lazy import keeps container-runner out of
+  // every delivery importer's module graph.
   const { isContainerRunning } = await import('./container-runner.js');
   const containerLive =
     isContainerRunning(session.id) || session.container_status === 'running' || session.container_status === 'idle';
@@ -1261,11 +991,7 @@ export async function sweepDeliverSession(session: Session, nowMs: number): Prom
   return outcome;
 }
 
-/**
- * One sweep cycle over every session in the delivery horizon.
- *
- * Exported so the counters are testable without driving the 60s timer chain.
- */
+/** Exported so the counters are testable without driving the 60s timer chain. */
 export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise<{ polled: number; skipped: number }> {
   const startedAtMs = Date.now();
   let polled = 0;
@@ -1275,10 +1001,7 @@ export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise
     const sessions = await getSessionsActiveSince(new Date(nowMs - SWEEP_POLL_ACTIVITY_HORIZON_MS).toISOString());
     for (const session of sessions) {
       seen.add(session.id);
-      // One unreadable session must not abort the cycle for every session
-      // behind it. The drain now touches `delivered` for every swept session,
-      // not just ones with due rows, so a legacy or corrupt session DB has a
-      // wider blast radius than it used to.
+      // One unreadable session must not abort the cycle.
       try {
         const outcome = await sweepDeliverSession(session, nowMs);
         if (outcome === 'skipped') skipped++;
@@ -1288,13 +1011,10 @@ export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise
         quietDeliveryCache.delete(session.id); // never arm off a failure
         polled++;
       }
-      // Yield after EVERY session, not every 25 — same correction host-sweep
-      // made for the same reason. Each drain opens two SQLite files
-      // synchronously, so a batch was one contiguous event-loop freeze.
+      // Yield after EVERY session: each drain opens two SQLite files synchronously.
       await new Promise((resolve) => setImmediate(resolve));
     }
-    // Bounded to sessions still in the horizon, mirroring host-sweep's
-    // quiet-cache cleanup — otherwise the map grows with every session ever seen.
+    // Bounded to sessions still in the horizon, or the map grows forever.
     for (const id of quietDeliveryCache.keys()) if (!seen.has(id)) quietDeliveryCache.delete(id);
   } catch (err) {
     log.error('Sweep delivery poll error', { err });
@@ -1306,12 +1026,8 @@ export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise
 }
 
 /**
- * Per-series thread-anchor opt-out (`content.threadAnchor === false`, set via
- * `ncl tasks … --thread-anchor false`). Read from the series' own task row in
- * the session's inbound.db and cached briefly so the flag costs one DB open
- * per session per TTL, not one per delivered message. Any failure (legacy
- * shared task thread, missing row, unparseable content) means NOT exempt —
- * the anchored default is the safe one for the storm shape.
+ * Per-series opt-out (`--thread-anchor false`), cached per TTL to avoid a DB open per message. Any failure means
+ * NOT exempt (the anchored default is the safe one).
  */
 const threadAnchorExemptCache = new Map<string, { exempt: boolean; at: number }>();
 const THREAD_ANCHOR_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -1359,12 +1075,8 @@ async function deliverMessage(
 
   const content = JSON.parse(msg.content);
 
-  // Live task list (docs/specs/slack-task-list/plan.md). The host switch is the
-  // gate that reaches adopted containers too: off, their list rows go nowhere
-  // and the 💭 status posts below come back. A row from a container the host
-  // already marked interrupted must not revive the list.
-  // A spawn-task child's thread is a work log the dashboard shows; its list
-  // stays internal like its 💭 did.
+  // The host switch also reaches adopted containers (off: list rows go nowhere); a row from an interrupted
+  // container must not revive the list. A spawn child's list stays internal.
   if (msg.kind === 'task_list' && (!TASK_LIST_ENABLED || (await isSpawnChildSession(session.id)))) {
     return { recordOnly: true };
   }
@@ -1382,24 +1094,9 @@ async function deliverMessage(
     }
   }
 
-  // An agent's ask_question must never reuse a pending approval's id: its
-  // buttons would carry that id, and a click on them would decode through the
-  // approval's own options (src/db/sessions.ts), leaving only the card
-  // binding in response-handler.ts between it and the approval.
-  //
-  // Compare the id a CLICK will decode, not the one that was written. Both
-  // click parsers cut the question id out of `ncq:<questionId>:<index>` at the
-  // first ':' after the prefix (chat-sdk-bridge.ts), so
-  // `appr-real:x` is stored whole, walks straight past an exact-match check,
-  // and then reaches the handlers as `appr-real`. A suffixed id is unusable
-  // for the agent's own card either way — pending_questions is keyed by the
-  // whole id, so the click decodes to an id that row does not have — which is
-  // why an ambiguous id is refused outright rather than only when it collides.
-  //
-  // ask_user_question mints its own id
-  // (container/agent-runner/src/mcp-tools/interactive.ts), so only a raw
-  // outbound row can carry either shape. Refused whole: no card, no pending
-  // question.
+  // An ask_question id must never be decodable as a pending approval's id (a click would decode through the
+  // approval's options). Click parsers cut at the first ':' after `ncq:`, so compare the id a CLICK decodes, and
+  // refuse an ambiguous (suffixed) id outright.
   if (
     content &&
     typeof content === 'object' &&
@@ -1424,11 +1121,7 @@ async function deliverMessage(
     }
   }
 
-  // Spawn-child workers sometimes ask via chat-sdk's `ask_question` instead
-  // of calling `spawn_request_steer`. Both signal "operator attention
-  // wanted" — light up the dashboard's Needs You lane for either. Worker
-  // continuing autonomously is fine; the flag clears on the next steer
-  // write per src/dashboard/steer.ts.
+  // An `ask_question` from a spawn child lights the dashboard's Needs You lane like `spawn_request_steer`.
   if (msg.kind === 'chat-sdk' && content && typeof content === 'object') {
     const c = content as Record<string, unknown>;
     if (c.type === 'ask_question') {
@@ -1455,8 +1148,6 @@ async function deliverMessage(
     }
   }
 
-  // System actions — handle internally (self-mod, cli_request, agent routing, etc.)
-
   if (msg.kind === 'system') {
     const result = await handleSystemAction(content, session);
     if (result && result.deferAck) return { deferAck: true };
@@ -1468,22 +1159,8 @@ async function deliverMessage(
   // the only delivery path from a task session). Append to the series log,
   // never deliver. The caller marks it delivered so it isn't retried.
   if (msg.kind === 'task_log') {
-    // `taskSeriesId` rather than a raw slice: the bare `system:tasks` a
-    // pre-migration install may still hold is 12 characters, and slicing 13 off
-    // it yielded an EMPTY series id.
-    //
-    // Where that landed is worth being exact about, because the two writes
-    // below are protected differently. `appendRunLog` was never at risk: its
-    // charset guard (`/^[a-z0-9-]+$/`)
-    // requires at least one character, so `''` threw before any filesystem
-    // write and the `catch` below turned it into a warning. Execution then
-    // continued to `recordTaskRunOutcome`, which is an unguarded
-    // `INSERT OR IGNORE` — so the malformed series id reached the central
-    // ledger that T24 reads to decide escalations. The file was
-    // safe; the ledger was not.
-    //
-    // A session naming no series has no run log to append to and no series to
-    // record against, so say so and drop the row rather than inventing one.
+    // `taskSeriesId`, not a raw slice (a legacy `system:tasks` yields an EMPTY id that would reach the run-outcome
+    // ledger). A session naming no series has nothing to append or record: drop the row.
     const series = taskSeriesId(session.thread_id);
     if (session.messaging_group_id === null && series !== null) {
       const text = typeof content.text === 'string' ? content.text : '';
@@ -1492,15 +1169,8 @@ async function deliverMessage(
       } catch (err) {
         log.warn('Failed to append task run log', { id: msg.id, sessionId: session.id, err });
       }
-      // The run log is a markdown file nothing queries. Mirror the same event
-      // into the central run-outcome ledger, which the escalation sweep reads
-      // and which outlives S19's close of the spent task session (migration
-      // 075). Only the runner's END-OF-RUN summary carries `auto: true`; a
-      // mid-run `ncl tasks append-log` note is not a fire and must never move
-      // a streak.
-      //
-      // Best-effort and separately caught: a task run's log line reaching the
-      // series file must not depend on the ledger write, nor the reverse.
+      // Mirror END-OF-RUN summaries (`auto: true`) into the run-outcome ledger the escalation sweep reads; a mid-run
+      // `append-log` note must never move a streak. Caught separately from the log append.
       if (content.auto === true) {
         try {
           await recordTaskRunOutcome({
@@ -1510,11 +1180,7 @@ async function deliverMessage(
             outboundId: msg.id,
             outcome: content.isError === true ? 'failed' : 'ok',
             model: typeof content.model === 'string' ? content.model : null,
-            // Scrubbed HERE, not at read time: this row is durable and the
-            // text is agent output. `scrubSecrets` runs on the outbound
-            // delivery path below, never inside the adapter, so a value
-            // recorded raw would sit in the central DB — and then ride into an
-            // operator DM — having passed no scrubber at all.
+            // Scrubbed HERE: this durable row can later reach an operator DM without passing any other scrubber.
             detail: scrubSecrets(text).slice(0, 500) || null,
           });
         } catch (err) {
@@ -1600,22 +1266,10 @@ async function deliverMessage(
     deliverMessagingGroupId = mg.id;
   }
 
-  // Status messages — post-then-edit per session. First status in a turn
-  // posts a fresh line; subsequent statuses edit it in place. The tracking
-  // clears when a real chat message delivers (handled at the end), so the
-  // next turn starts with a new status line instead of clobbering history.
-  //
-  // EXCEPTION: spawn-task child sessions render their thread as a durable
-  // work log — every thinking block is a fresh, persistent message in the
-  // spawn thread. Edit-in-place and the on-chat orphan delete are bypassed
-  // so progress survives the final answer.
+  // Status: the first in a turn posts, later ones edit in place; a real chat message clears the tracking.
   if (msg.kind === 'status') {
-    // The task list and the platform's status line replace the 💭 stream. The
-    // row stays in outbound.db (the dashboard's session view still reads it);
-    // it just never posts. An agent-shared session (no messaging group, not a
-    // task session) has no conversation of its own
-    // to show a list in, and the runner refuses the tool there, so it keeps
-    // its 💭 progress.
+    // The task list and platform status line replace the 💭 stream (row kept for the dashboard, never posted). An
+    // agent-shared session has no conversation for a list, so it keeps its 💭 progress.
     const agentShared = session.messaging_group_id === null && !isTaskThread(session.thread_id);
     if (TASK_LIST_ENABLED && !agentShared) return { recordOnly: true };
     const typedProgress = content.reporting?.version === 1 && content.reporting?.purpose === 'progress';
@@ -1625,29 +1279,16 @@ async function deliverMessage(
     }
     const appendMode = await isSpawnChildSession(session.id);
     if (appendMode) {
-      // Spawn-task child sessions used to render every thinking block as a
-      // durable message in the worker's Slack/Discord thread — a "durable
-      // work log" pattern. Operator feedback after the inbox board
-      // shipped: the 💭 stream is just noise in chat, and SessionDetail
-      // already surfaces thinking blocks as a collapsible group in the
-      // dashboard. Suppress channel delivery for spawn-child status only;
-      // the outbound.db row stays (so SessionDetail still sees the
-      // thinking), markDelivered fires in the caller, and the
-      // last_outbound bump + SSE downstream of this branch still notify
-      // the inbox. Final spawn_progress / spawn_complete / spawn_failed
-      // messages flow through their own MCP handlers, not this branch.
+      // Spawn-child status is suppressed in chat (the dashboard shows thinking); the row is still marked delivered.
       log.info('Status suppressed in chat for spawn-child session', {
         id: msg.id,
         sessionId: session.id,
       });
       return {};
     }
-    // Typed provider progress may update the deterministic activity line for
-    // this human turn, but it may never create a public narration stream of
-    // its own. The lifecycle row is written before the provider is invoked
-    // and tracked unposted; a host-memory reset before the first progress
-    // post leaves nothing to recover, so that turn's progress stays internal. Exact conversation + turn matching keeps task,
-    // sibling, and redirected traffic record-only.
+    // Typed progress may update this turn's activity line but never start a public narration stream of its own;
+    // exact conversation + turn matching keeps task, sibling and redirected traffic record-only. A host-memory reset
+    // before the turn's first progress post leaves nothing to recover, so that turn's progress stays internal.
     if (typedProgress) {
       let lifecycle = statusTracking.get(session.id);
       if (!lifecycle) {
@@ -1666,15 +1307,8 @@ async function deliverMessage(
         return { recordOnly: true };
       }
     }
-    // Turn-boundary reset. A status row carries its turn's batch anchor in
-    // `in_reply_to`. If a tracked status belongs to a DIFFERENT turn than the
-    // one now arriving, the prior turn ended without a chat-final to run the
-    // orphan cleanup (the agent thought/used tools but emitted no user-facing
-    // <message> block — common in multi-bot threads or pure-tool turns). That
-    // orphan still sits in the thread, now ABOVE the user's newer message.
-    // Without this reset the next turn's status would edit that stale message
-    // in place. Delete it via the *stored* route and drop tracking so the new
-    // turn posts a fresh status line below the user's message instead.
+    // Turn-boundary reset: a tracked status from a DIFFERENT turn is an orphan above the user's newer message.
+    // Delete it via the stored route so this turn posts a fresh line below instead of editing the stale one.
     const stale = statusTracking.get(session.id);
     if (stale && stale.inReplyTo !== msg.in_reply_to) {
       if (!stale.unposted && deliveryAdapter.deleteMessage) {
@@ -1697,9 +1331,8 @@ async function deliverMessage(
       statusTracking.delete(session.id);
     }
 
-    // The deterministic liveness row stays unposted: the typing indicator
-    // already says the agent is working. It is tracked so the turn's first
-    // typed progress may post the activity line and own its lifecycle.
+    // The liveness row stays unposted (the typing indicator already shows work); tracked so the first typed
+    // progress can post the activity line.
     if (content.reporting?.version === 1 && content.reporting?.purpose === 'liveness') {
       statusTracking.set(session.id, {
         outboundId: msg.id,
@@ -1745,9 +1378,7 @@ async function deliverMessage(
     } catch (err) {
       if (!existing || !isDiscordChannelType(msg.channel_type) || !isDiscordStatusEditLimitError(err)) throw err;
 
-      // Discord code 30046 makes further edits to this message useless. Keep
-      // the old status visible and tracked until its replacement posts, but
-      // mark the edit path exhausted so a retry goes straight to a fresh post.
+      // Discord 30046: further edits are useless. Keep the old line tracked until the replacement posts.
       existing.editExhausted = true;
       platformMsgId = await deliveryAdapter.deliver(
         msg.channel_type,
@@ -1768,11 +1399,8 @@ async function deliverMessage(
       throw new Error('Discord replacement status post returned no message id');
     }
     if (platformMsgId && mode !== 'edit') {
-      // Pin the route at post-time. The cleanup branch on chat delivery uses
-      // *this* route to delete the orphan, NOT the chat-final's route — the
-      // agent's send_message MCP tool can target a different channel/thread,
-      // and using the wrong (channel, ts) pair on Slack's chat.delete could
-      // delete an unrelated message if the timestamps happened to collide.
+      // Pin the route at post time: cleanup must use it, not the chat-final's route (a wrong (channel, ts) pair on
+      // Slack's chat.delete could delete an unrelated message).
       statusTracking.set(session.id, {
         outboundId: lifecycleOwner?.outboundId ?? msg.id,
         channelType: msg.channel_type,
@@ -1783,12 +1411,8 @@ async function deliverMessage(
         inReplyTo: msg.in_reply_to,
         lifecycle: lifecycleOwner !== undefined,
       });
-      // The first progress post (the liveness row itself is never posted), or
-      // a Discord repost after its edit cap. Keep the lifecycle receipt
-      // pointed at the visible line so a
-      // later host-memory recovery deletes the visible line, not its retired
-      // predecessor. This write is best-effort after platform success: a DB
-      // fault must not retry and duplicate the public post.
+      // Keep the lifecycle receipt pointed at the visible line. Best-effort after platform success: a DB fault
+      // must not retry and duplicate the public post.
       if (lifecycleOwner) {
         try {
           await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
@@ -1882,22 +1506,12 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
-  // Scrub any registered secret values out of outbound text before it
-  // reaches the adapter. Defense-in-depth — OneCLI already keeps API keys
-  // away from the agent, but scrub content anyway in case an agent ever
-  // ends up with a secret (e.g. by reading a file) and tries to echo it.
-  // Gate-verdict tokens (`NO_GO`, …) are rewritten to plain English here too:
-  // this is the one door every agent-authored chat post — send_message and
-  // final response text alike — passes through. See src/verdict-tokens.ts.
+  // Defense in depth: scrub registered secret values from every agent-authored post; verdict tokens are humanized
+  // here too (the one door all chat posts pass through).
   const scrubbedContent = humanizeOutboundContent(scrubSecrets(msg.content));
 
-  // Final chat replies always post fresh (not as an edit of the in-flight
-  // status bubble). When a user follow-up message arrives during the turn,
-  // morphing the status into the answer would land the answer above the
-  // follow-up in the thread — visually confusing. Status updates still
-  // post-then-edit on their own (kind='status' branch above), so the
-  // thinking bubble remains a single growing message; only the final
-  // answer separates out into its own message at the bottom.
+  // Final replies always post fresh, never as an edit of the status bubble, so the answer lands below any
+  // follow-up that arrived mid-turn.
 
   const isRoutineOutcome = content.reporting?.version === 1 && content.reporting.purpose === 'outcome';
   let baseThreadId = msg.thread_id && msg.thread_id.length > 0 ? msg.thread_id : null;
@@ -1913,37 +1527,16 @@ async function deliverMessage(
     }
   }
 
-  // Rolling task-session thread anchor (fleet-hardening Phase 1.4). A task
-  // session is 1:1 with a series (thread_id = system:tasks:<seriesId>, see
-  // resolveTaskSession) and lives for the series' whole life, but each fire
-  // is a fresh turn with a fresh in_reply_to — so the per-turn anchor below
-  // resets every fire, and every fire minted a brand-new top-level post
-  // (and, on Slack, a brand-new thread every wired sibling had to re-notice).
-  // task_thread_anchors persists the anchor ACROSS fires instead, keyed by
-  // (session, destination) in the central DB, and rotates to a fresh
-  // top-level post once `anchorRotationKey` disagrees (default: UTC day
-  // change). Scoped to task sessions with no explicit thread_id — an
-  // agent-targeted thread (baseThreadId set) is always left untouched.
-  // Per-series opt-out (`ncl tasks … --thread-anchor false`): a series whose
-  // contract is one NEW thread per logical item — a smoke campaign's
-  // one-root-per-SHA, a per-ticket dispatcher — must never have consecutive
-  // roots glued into one day-thread. content.threadAnchor === false exempts
-  // the whole series; the anchor default stays ON because the storm shape
-  // (repeated status posts) is the common case.
-  // Edits/reactions target a message, not a new post: they follow the anchor to reach in-thread
-  // messages, but address the anchor message itself at root and never drop/record an anchor.
+  // Rolling task-session anchor: each fire is a fresh turn, so `task_thread_anchors` persists the anchor ACROSS
+  // fires per (session, destination), rotating on `anchorRotationKey` (default: UTC day). Never overrides an
+  // explicit thread_id. A series with `threadAnchor === false` (one NEW thread per item) is exempt. Edits and
+  // reactions follow the anchor to reach in-thread messages but never drop or record one.
   const isInPlaceOp = content.operation === 'edit' || content.operation === 'reaction';
   const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
 
-  // Keyed thread anchor (`content.threadKey`, migration 081). The agent names
-  // the incident or topic a post belongs to: the first post under a key lands
-  // at root and is recorded, every later post under that key threads beneath
-  // it with no day rotation, and a new key is a new top-level post. It takes
-  // precedence over both anchors below, and like them never overrides an
-  // explicit thread_id. Keyed per agent group, so a recreated task session
-  // keeps its open incidents, and per messaging group — the resolved
-  // (channel, address, instance) above — so two adapter instances wired to one
-  // conversation never share a parent.
+  // Keyed anchor (`content.threadKey`): the first post under a key lands at root and is recorded; later posts
+  // thread beneath it with no rotation. Beats both other anchors, never an explicit thread_id. Keyed per agent
+  // group and per messaging group, so two adapter instances never share a parent.
   const threadKey = isRoutineOutcome ? null : readThreadKey(content, msg.id, session.id);
   const keyAddr: ThreadKeyAddress | null =
     threadKey !== null && baseThreadId === null && deliverMessagingGroupId !== undefined
@@ -1958,13 +1551,8 @@ async function deliverMessage(
     baseThreadId === null &&
     !(await isThreadAnchorExempt(session));
 
-  // Per-turn channel-root threading (see ChatThreadAnchor above) — everything
-  // that isn't a task-session post. Only engages when the agent didn't
-  // already target a thread (thread_id null) and the turn has an inbound
-  // anchor (in_reply_to set). The first message of the turn posts at root
-  // and is recorded below; later messages of the same turn reply under it.
-  // A task list is progress, not the turn's reply: it never becomes the root
-  // the answer threads under, and never threads under an earlier message.
+  // Per-turn channel-root threading (see ChatThreadAnchor) for every post the task anchor does not take. A task list is
+  // progress: it never becomes the root the answer threads under, nor threads under an earlier message.
   const turnAnchorEligible =
     !isRoutineOutcome &&
     !taskAnchorEligible &&
@@ -2014,19 +1602,8 @@ async function deliverMessage(
       anchor.platformId === msg.platform_id &&
       !(isInPlaceOp && content.messageId === anchor.messageId)
     ) {
-      // Adapters decode a thread id as `<platform-address>:<thread>` —
-      // `discord:<guild>:<channel>:<thread>`, `slack:<channel>:<ts>`. `platform_id`
-      // IS that address, so appending the anchor's message id produces the encoded
-      // form both decoders accept.
-      //
-      // This previously passed the BARE message id, which no adapter can decode:
-      // @chat-adapter/discord's decodeThreadId requires parts[0] === 'discord',
-      // slack's requires parts[0] === 'slack'. So every message after a turn's
-      // first threw ValidationError, burned 3 retries, and was dropped — silently
-      // truncating every multi-message scheduled task on both platforms. Observed
-      // 2026-07-25: the example-retail meeting digest posted its first 1.7KB chunk
-      // and lost the next three ("Invalid Discord thread ID: 123456789000000009"
-      // — that snowflake is a *message* id, never a thread id).
+      // Adapters decode `<platform-address>:<thread>` (e.g. `slack:<channel>:<ts>`); a BARE message id throws
+      // ValidationError and the message is dropped after its retries.
       effectiveThreadId = `${anchor.platformId}:${anchor.messageId}`;
       usedAnchor = true;
     }
@@ -2140,14 +1717,8 @@ async function deliverMessage(
       return { deferAck: true };
     }
     if (!usedAnchor) throw err;
-    // Platforms disagree on whether a parent message is addressable as a thread.
-    // Slack threads on the parent's ts; Discord's adapter opens a thread on first use
-    // (installMessageThreadAutoCreate), which can fail (DMs, permission). Post at root.
-    //
-    // Also record that anchoring is off for the REST OF THIS TURN (turn anchor)
-    // or drop the stale anchor outright (task anchor — the next fire just
-    // starts a fresh one), so the remaining messages go straight to root
-    // rather than each paying a failed call.
+    // Not every platform can thread on a parent (Discord's auto-thread can fail). Post at root, and turn anchoring
+    // off for the rest of this turn (or drop a task anchor) so later messages skip the failing call.
     log.warn('Threaded delivery under anchor failed — posting at root', {
       id: msg.id,
       sessionId: session.id,
@@ -2184,10 +1755,8 @@ async function deliverMessage(
     await settleWorkOutcome(outcomeClaim.workgroup, outcomeClaim.key, platformMsgId);
   }
 
-  // Record a fresh root post as the anchor for what follows. Only when we
-  // actually posted at root (effectiveThreadId still null) — a message that
-  // already threaded under an existing anchor must not overwrite it, or the
-  // next post would chain off it instead of the original root.
+  // Record only a fresh ROOT post as the anchor; overwriting it with a threaded reply would chain later posts off
+  // the wrong message.
   if (keyAddr && !isInPlaceOp) {
     await settleThreadKeyAnchor(keyAddr, {
       threaded: effectiveThreadId !== null,
@@ -2220,25 +1789,14 @@ async function deliverMessage(
   if (msg.kind === 'task_list')
     noteTaskListDelivered(session.id, JSON.parse(scrubbedContent) as Record<string, unknown>);
 
-  // A real chat message supersedes any in-flight progress status. Delete
-  // the orphan thinking-block message so it doesn't linger in the thread,
-  // then clear the tracking entry. Uses the *stored* route (pinned when
-  // the status was first posted) — `send_message` can deliver this chat
-  // reply to a different channel/thread than the status was posted to,
-  // and using the chat reply's route to call `chat.delete` would target
-  // the wrong channel.
-  //
-  // Errors are swallowed: a delete failure (network, permission revoked,
-  // message already gone) leaves the orphan visible but must NOT block
-  // markDelivered for the chat reply itself — that would cause retry/
-  // duplicate of the real answer.
+  // A real chat message supersedes in-flight status: delete the orphan via its stored route. Failures are
+  // swallowed so they never block markDelivered (which would duplicate the answer).
   if (msg.kind === 'chat' || msg.kind === 'chat-sdk') {
     await settleSessionStatusAfterPublicDelivery(session.id);
   }
 
   if (msg.kind === 'chat') {
-    // Mirror agent replies into the central archive (2.9). Scrubbed text
-    // so any accidentally-included secret stays out of searchable history.
+    // Scrubbed text, so a leaked secret stays out of searchable history.
     try {
       const parsed = JSON.parse(scrubbedContent) as Record<string, unknown>;
       const text =
@@ -2252,9 +1810,7 @@ async function deliverMessage(
           channelType: msg.channel_type,
           channelName: mg?.name ?? null,
           platformId: msg.platform_id,
-          // Where the post actually landed: an anchored post (keyed, task day,
-          // or turn) has a null row thread_id but lives in the anchor's thread,
-          // which is the id read_thread and link search look it up by.
+          // Where the post actually landed (an anchored post has a null row thread_id).
           threadId: effectiveThreadId,
           role: 'assistant',
           senderId: session.agent_group_id,
@@ -2292,16 +1848,8 @@ async function deliverMessage(
  * justified, at the registration site.
  */
 /**
- * Return value for a system-action delivery handler.
- *
- * - `undefined` / `void` — default: the outer delivery loop marks the
- *   message as delivered in inbound.db after the handler returns.
- * - `{ deferAck: true }` — handler takes ownership of the `delivered` row
- *   for this message. The outer loop must NOT call markDelivered — the
- *   handler will mark delivered/failed itself later (e.g. after an async
- *   admin approval). Required for bash-gate: the gate's requestId IS the
- *   msg.id, and the container polls `delivered` for that id as its ack
- *   signal, so a premature auto-ack would short-circuit the gate.
+ * `{ deferAck: true }`: the handler owns the `delivered` row and the outer loop must NOT mark it (bash-gate: the
+ * container polls `delivered` for its requestId as the ack, so an auto-ack would short-circuit the gate).
  */
 export type DeliveryActionResult = void | { deferAck: true };
 export type DeliveryActionHandler = (
@@ -2399,22 +1947,9 @@ export function stopDeliveryPolls(): void {
 }
 
 /**
- * Turn boundary from the container, emitted once per turn exit (including the
- * durable work-continuation path). Sweeps up a 💭 status the turn never
- * superseded with a chat-final. Without it, a turn that thought + acted but
- * emitted no `<message>` leaves the thinking label as its only visible output —
- * and in a task session (support-inbox poller, scheduled job) there is no next
- * turn to reset it, so it stands as the "answer" forever.
- *
- * ORDERING: the container writes this row BEFORE `checkpointTurnEnd` and
- * `markCompleted`, so the inbound rows for the turn may still be claimed as
- * `processing` when it arrives — the checkpoint shells out to git and can take
- * seconds. Do not treat this as a signal that the turn's inbound state has
- * settled.
- *
- * No-op when a chat-final already cleared tracking, which is the common case.
- * That no-op is load-bearing: the container emits unconditionally precisely
- * because the host is the only side that knows whether a status is tracked.
+ * Turn boundary from the container: sweeps up a 💭 status no chat-final superseded (a task session has no next
+ * turn to reset it). Written BEFORE `checkpointTurnEnd`/`markCompleted`, so the turn's inbound rows may still be
+ * `processing`. Usually a no-op; emitted unconditionally because only the host knows whether a status is tracked.
  */
 registerDeliveryAction(
   'turn_end',
