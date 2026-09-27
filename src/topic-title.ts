@@ -40,11 +40,12 @@ export async function generateTopicTitle(messageText: string): Promise<string | 
   } catch (err) {
     // Error serialization drops custom props, so surface callHaiku's stderr explicitly.
     const stderr = (err as { stderr?: string }).stderr;
-    if (isHostLlmUnavailable(err)) {
-      log.info('Topic title deferred: host LLM unavailable', { err: (err as Error).message });
+    if (err instanceof AllCredentialSlotsParkedError) {
+      log.info('Topic title deferred: every credential slot is parked', { err: err.message });
       throw err;
     }
     log.warn('Topic title generation failed', { err, stderr });
+    if (isHostLlmUnavailable(err)) throw err;
     return undefined;
   }
 }
