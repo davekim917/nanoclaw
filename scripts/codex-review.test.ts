@@ -449,10 +449,10 @@ function ciPr(opts: { mergeable?: string; head?: string; state?: string } = {}):
 }
 
 // One entry of `pulls/<n>/files`; a rename also names the path it left.
-function changedFile(filename: string, previousFilename?: string): Page {
+function changedFile(filename: string, previousFilename?: string, additions = 1): Page {
   return previousFilename
-    ? { filename, previous_filename: previousFilename, status: 'renamed' }
-    : { filename, status: 'modified' };
+    ? { filename, previous_filename: previousFilename, status: 'renamed', additions }
+    : { filename, status: 'modified', additions };
 }
 
 // The Risk label workflow's run on a head, as `actions/runs` lists it. The
@@ -2728,6 +2728,203 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain('as an object with a boolean commentRule');
       expect(result.stdout).not.toContain('merge=defer');
+    });
+  });
+
+  describe('the cut-down rule, above the size threshold', () => {
+    const AGENT_REVIEWER = 'claude-opus-5 cut-down-reviewer (claude code)';
+    const BIG = [changedFile('src/gate.ts', undefined, 151)];
+
+    function cutDownReceipt(head: string, reviewer = AGENT_REVIEWER, authorAssociation = 'OWNER'): Page {
+      return {
+        author: { login: 'davekim917' },
+        authorAssociation,
+        createdAt: '2026-09-05T00:20:00Z',
+        fullDatabaseId: '1757031600',
+        body: `### Cut-down review receipt\n\n- **Head:** \`${head}\`\n- **Reviewer and runtime:** ${reviewer}\n\n<!-- pr-review-loop:cut-down-receipt head=${head} reviewed=${head} lines-reviewed=151 lines-now=151 -->`,
+      };
+    }
+
+    function cutDownFixture(root: string, opts: { files?: Page[]; comments?: Page[]; reviewLoop?: string; legacy?: boolean } = {}) {
+      scopeFixture(root, {
+        labels: [],
+        files: opts.files ?? BIG,
+        comments: opts.comments,
+        reviewLoop: opts.reviewLoop,
+        ...(opts.legacy ? { baseConfig: null } : {}),
+      });
+    }
+
+    it.each([
+      ['risk-scoped', false],
+      ['legacy', true],
+    ])('refuses a %s head over the threshold with no receipt', (_mode, legacy) => {
+      const root = tempRoot();
+      cutDownFixture(root, { legacy });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(
+        `merge=refused head=${HEAD}: cut_down_missing: this change adds 151 lines outside tests, over the threshold of 150`,
+      );
+      expect(result.stdout).not.toMatch(/merge=(allowed|defer)/);
+    });
+
+    it.each([
+      ['risk-scoped', false, 0],
+      ['legacy', true, 26],
+    ])('lets a %s head through with a receipt from the agent on that head', (_mode, legacy, status) => {
+      const root = tempRoot();
+      cutDownFixture(root, { legacy, comments: [cutDownReceipt(HEAD)] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(status);
+      expect(result.stdout).toMatch(legacy ? /merge=defer mode=legacy/ : /merge=allowed head=\S+ mode=risk-scoped/);
+    });
+
+    it('refuses a receipt that names an older head, and says which', () => {
+      const root = tempRoot();
+      cutDownFixture(root, { comments: [cutDownReceipt(OLD_HEAD)] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('cut_down_missing:');
+      expect(result.stderr).toContain(`the latest names ${OLD_HEAD.slice(0, 12)}: review only what changed since`);
+    });
+
+    it.each([
+      ['names no agent, as the author posting its own', 'claude-opus-5 (author, self-review)', 'OWNER'],
+      ['names the agent from a small tier', 'claude-sonnet-5 cut-down-reviewer', 'OWNER'],
+      ['names the agent inside another word', 'claude-opus-5 not-cut-down-reviewer-really', 'OWNER'],
+      ['comes from an account without write access', AGENT_REVIEWER, 'NONE'],
+    ])('refuses a receipt on the head that %s', (_case, reviewer, association) => {
+      const root = tempRoot();
+      cutDownFixture(root, { comments: [cutDownReceipt(HEAD, reviewer, association)] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('cut_down_missing:');
+    });
+
+    it.each([
+      ['at the threshold', [changedFile('src/gate.ts', undefined, 150)]],
+      [
+        'over it only in tests and lockfiles',
+        [
+          changedFile('src/gate.ts', undefined, 100),
+          changedFile('src/gate.test.ts', undefined, 400),
+          changedFile('container/agent-runner/tests/fixtures/big.json', undefined, 400),
+          changedFile('pnpm-lock.yaml', undefined, 900),
+          changedFile('scripts/test_gate.py', undefined, 90),
+        ],
+      ],
+    ])('needs no receipt for a head %s', (_case, files) => {
+      const root = tempRoot();
+      cutDownFixture(root, { files });
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(0);
+    });
+
+    it('requires a receipt when the listing reaches the 300-file cap', () => {
+      const root = tempRoot();
+      const files = Array.from({ length: 300 }, (_, i) => changedFile(`docs/page-${i}.md`, undefined, 0));
+      cutDownFixture(root, { files, legacy: true });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('this change adds unknown lines outside tests');
+    });
+
+    it.each([
+      ['lowers the threshold', '{ "cutDownThreshold": 10 }\n', [changedFile('src/gate.ts', undefined, 11)], 24],
+      ['raises it', '{ "cutDownThreshold": 500 }\n', BIG, 0],
+      ['switches the rule off', '{ "cutDownThreshold": false }\n', BIG, 0],
+    ])('reads the base config when it %s', (_case, reviewLoop, files, status) => {
+      const root = tempRoot();
+      cutDownFixture(root, { reviewLoop, files });
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(status);
+    });
+
+    it.each([
+      ['a string', '{ "cutDownThreshold": "150" }\n'],
+      ['a fraction', '{ "cutDownThreshold": 1.5 }\n'],
+      ['negative', '{ "cutDownThreshold": -1 }\n'],
+      ['true', '{ "cutDownThreshold": true }\n'],
+    ])('gives no verdict when the threshold is %s', (_case, reviewLoop) => {
+      const root = tempRoot();
+      cutDownFixture(root, { reviewLoop });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('the cut-down check gave no verdict');
+    });
+
+    it('reports the verdict alone with `cut-down`', () => {
+      const root = tempRoot();
+      cutDownFixture(root);
+      const missing = runHelper(root, ['cut-down']);
+      expect(missing.status).toBe(24);
+      expect(missing.stdout).toContain(`cut_down=missing head=${HEAD}:`);
+
+      cutDownFixture(root, { comments: [cutDownReceipt(HEAD)] });
+      const ok = runHelper(root, ['cut-down']);
+      expect(ok.status).toBe(0);
+      expect(ok.stdout).toContain(`cut_down=ok head=${HEAD}: a cut-down receipt names this head (${AGENT_REVIEWER})`);
+    });
+
+    describe('cut-down-receipt', () => {
+      function receiptRun(root: string, reviewer: string, reviewed = OLD_HEAD) {
+        const body = path.join(root, 'cuts.md');
+        fs.writeFileSync(body, '1. src/gate.ts: drop the unused `opts` parameter. Applied.\n');
+        return runHelper(root, [
+          'cut-down-receipt',
+          '--head',
+          HEAD,
+          '--reviewed',
+          reviewed,
+          '--reviewer',
+          reviewer,
+          '--body-file',
+          body,
+        ]);
+      }
+
+      it('posts a receipt carrying the lines cut between the reviewed head and this one, which the gate accepts', () => {
+        const root = tempRoot();
+        cutDownFixture(root);
+        writeJson(root, `compare--${BASE_OID}...${OLD_HEAD}.json`, {
+          status: 'ahead',
+          files: [changedFile('src/gate.ts', undefined, 190), changedFile('src/gate.test.ts', undefined, 50)],
+        });
+
+        const posted = receiptRun(root, AGENT_REVIEWER);
+        expect(posted.status).toBe(0);
+        expect(posted.stdout).toContain(`cut-down-receipt: head=${HEAD} cut=39`);
+        expect(posted.posted).toContain('**Added lines outside tests:** 190 when reviewed, 151 now; cut 39');
+        expect(posted.posted).toContain(
+          `<!-- pr-review-loop:cut-down-receipt head=${HEAD} reviewed=${OLD_HEAD} lines-reviewed=190 lines-now=151 -->`,
+        );
+
+        cutDownFixture(root, {
+          comments: [{ ...cutDownReceipt(HEAD), body: posted.posted as string }],
+        });
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(0);
+      });
+
+      it.each([
+        ['names no agent', 'claude-opus-5 (claude code)', 'must name the cut-down-reviewer agent'],
+        ['names a small tier', 'claude-haiku-5 cut-down-reviewer', 'is a haiku-tier model'],
+        ['smuggles a marker', 'claude-opus-5 cut-down-reviewer <!-- pr-review-loop:x -->', 'may not contain a pr-review-loop marker'],
+      ])('refuses a reviewer that %s, posting nothing', (_case, reviewer, message) => {
+        const root = tempRoot();
+        cutDownFixture(root);
+
+        const result = receiptRun(root, reviewer, HEAD);
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain(message);
+        expect(result.posted).toBeNull();
+      });
     });
   });
 
@@ -5766,7 +5963,7 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
       files: null,
       body: 'Review-notes: none (covered by the line #700 added)',
       comments: [CHANGES_EARLIER, APPROVED],
-      reviewLoop: '{ "commentRule": false }\n',
+      reviewLoop: '{ "commentRule": false, "cutDownThreshold": false }\n',
     });
     const allowed = runHelper(said, ['merge-check', '--head', HEAD]);
     expect(allowed.status).toBe(0);
