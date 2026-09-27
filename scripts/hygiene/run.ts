@@ -7,9 +7,10 @@ import { fileURLToPath } from 'node:url';
 
 import { vendoredEngineFiles } from '../../src/design-artifact-loop-vendor.js';
 import { scanComments } from './comments.js';
+import { addedCases, extractCases, findDuplicateTests, TEST_FILE } from './duplicate-tests.js';
 
 export interface Finding {
-  check: 'knip' | 'jscpd' | 'comments' | 'comment-growth';
+  check: 'knip' | 'jscpd' | 'comments' | 'comment-growth' | 'duplicate-tests';
   kind: string;
   location: string;
   message: string;
@@ -39,8 +40,8 @@ const TOOL_PATH = [path.join(REPO_ROOT, 'node_modules', '.bin'), process.env.PAT
 const KNIP_WORKSPACES = ['.', 'container/agent-runner'];
 const SOURCE_ROOTS = ['src', 'setup', 'scripts', 'container/agent-runner/src', 'container/agent-runner/scripts'];
 const SOURCE_FILE = /\.(?:[cm]?[jt]s|[jt]sx)$/;
-const NOT_SOURCE =
-  /(?:^|\/)(?:node_modules|__fixtures__|__test-fixtures__|test-fixtures|transaction-fixtures)\/|\.test\.[cm]?[jt]sx?$/;
+const NOT_SOURCE_DIR = /(?:^|\/)(?:node_modules|__fixtures__|__test-fixtures__|test-fixtures|transaction-fixtures)\//;
+const NOT_SOURCE = new RegExp(`${NOT_SOURCE_DIR.source}|${TEST_FILE.source}`);
 
 /**
  * Files whose findings are fixed somewhere other than this tree, so no check reports them.
@@ -230,25 +231,60 @@ export function growthBase(root: string): string {
   return result.stdout.trim();
 }
 
+function changedFiles(root: string, base: string): string[] {
+  const listed = (args: string[]) => stdoutOf('git', git(root, args)).split('\0').filter(Boolean);
+  return [
+    ...new Set([
+      ...listed(['diff', '--name-only', '--no-renames', '-z', base]),
+      ...listed(['ls-files', '--others', '--exclude-standard', '-z']),
+    ]),
+  ].sort();
+}
+
+function textAt(root: string, base: string, file: string): { base: string | null; head: string | null } {
+  const atBase = git(root, ['cat-file', 'blob', `${base}:${file}`]);
+  const onDisk = fs.lstatSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()
+    ? fs.readFileSync(path.join(root, file), 'utf8')
+    : null;
+  return { base: atBase.status === 0 ? atBase.stdout : null, head: onDisk };
+}
+
 /** Every changed non-test TS/JS file, not only the scanned roots; uncommitted and untracked files count. */
 export function commentGrowth(root: string, base: string, exempt: Exempt): CommentGrowth {
-  const listed = (args: string[]) => stdoutOf('git', git(root, args)).split('\0').filter(Boolean);
-  const changed = new Set([
-    ...listed(['diff', '--name-only', '--no-renames', '-z', base]),
-    ...listed(['ls-files', '--others', '--exclude-standard', '-z']),
-  ]);
   const count = (file: string, text: string | null) => (text === null ? 0 : scanComments(file, text).commentOnlyLines);
-  const files = [...changed]
+  const files = changedFiles(root, base)
     .filter((file) => isNonTestSource(file) && !isExempt(exempt, file))
-    .sort()
     .map((file) => {
-      const atBase = git(root, ['cat-file', 'blob', `${base}:${file}`]);
-      const onDisk = fs.lstatSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()
-        ? fs.readFileSync(path.join(root, file), 'utf8')
-        : null;
-      return { file, base: count(file, atBase.status === 0 ? atBase.stdout : null), head: count(file, onDisk) };
+      const text = textAt(root, base, file);
+      return { file, base: count(file, text.base), head: count(file, text.head) };
     });
   return { base, files };
+}
+
+const DUPLICATE_WAIVER = /^Duplicate-test:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*\S.*$/gm;
+
+export function duplicateTestFindings(root: string, base: string): Finding[] {
+  const log = stdoutOf('git', git(root, ['log', '--format=%B', `${base}..HEAD`]));
+  const waived = new Set([...log.matchAll(DUPLICATE_WAIVER)].map(([, file, name]) => `${file}|${name}`));
+  return changedFiles(root, base)
+    .filter((file) => TEST_FILE.test(file) && !NOT_SOURCE_DIR.test(file))
+    .flatMap((file) => {
+      const text = textAt(root, base, file);
+      if (text.head === null) return [];
+      const head = extractCases(file, text.head);
+      const added = addedCases(text.base === null ? [] : extractCases(file, text.base), head);
+      return findDuplicateTests(added, head);
+    })
+    .filter(({ test }) => !waived.has(`${test.file}|${test.name}`))
+    .map(({ kind, test, keeper }) => ({
+      check: 'duplicate-tests' as const,
+      kind,
+      location: `${test.file}:${test.line}`,
+      message:
+        `"${test.name}" ${kind === 'same-as' ? 'runs the same statements as' : 'runs only the first statements of'} ` +
+        `line ${keeper.line} "${keeper.name}"; delete it or fold it into that case, or justify it with a commit ` +
+        `trailer: Duplicate-test: ${test.file} | ${test.name} | <reason>`,
+    }));
 }
 
 const GROWTH_GUIDANCE = 'delete narration in the files you touched, or keep only comments that name a hazard';
@@ -299,7 +335,7 @@ export function hygieneFindings(root: string, exempt: Exempt): Finding[] {
 }
 
 function print(findings: Finding[]): void {
-  for (const check of ['knip', 'jscpd', 'comments', 'comment-growth'] as const) {
+  for (const check of ['knip', 'jscpd', 'comments', 'comment-growth', 'duplicate-tests'] as const) {
     const group = findings.filter((finding) => finding.check === check);
     const kinds = new Map<string, number>();
     for (const finding of group) kinds.set(finding.kind, (kinds.get(finding.kind) ?? 0) + 1);
@@ -322,8 +358,13 @@ function main(): void {
     process.exit(2);
   }
   const exempt = exemptFiles(REPO_ROOT);
-  const growth = commentGrowth(REPO_ROOT, growthBase(REPO_ROOT), exempt);
-  const findings = [...hygieneFindings(REPO_ROOT, exempt), ...commentGrowthFindings(growth)];
+  const base = growthBase(REPO_ROOT);
+  const growth = commentGrowth(REPO_ROOT, base, exempt);
+  const findings = [
+    ...hygieneFindings(REPO_ROOT, exempt),
+    ...commentGrowthFindings(growth),
+    ...duplicateTestFindings(REPO_ROOT, base),
+  ];
   print(findings);
   console.log(
     `\nexempt: ${exempt.upstream.size} file(s) byte-identical to upstream, ${exempt.vendored.size} vendored design-review file(s)`,

@@ -12,6 +12,7 @@ import {
   commentFindings,
   commentGrowth,
   commentGrowthFindings,
+  duplicateTestFindings,
   exemptFiles,
   growthBase,
   hygieneFindings,
@@ -283,48 +284,48 @@ describe('exempt files', () => {
   );
 });
 
+function git(root: string, ...args: string[]): string {
+  const result = spawnSync(
+    'git',
+    ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.com', '-c', 'commit.gpgsign=false', ...args],
+    {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    },
+  );
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.error?.message ?? result.stderr}`);
+  return result.stdout.trim();
+}
+
+function write(root: string, files: Record<string, string | null>): void {
+  for (const [file, text] of Object.entries(files)) {
+    if (text === null) {
+      fs.rmSync(path.join(root, file));
+      continue;
+    }
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), text);
+  }
+}
+
+/** A repository whose origin/main is `main`, with HEAD on a branch that commits `change` on top. */
+function repo(main: Record<string, string>, change: Record<string, string | null>): string {
+  const root = project('growth', {});
+  fs.mkdirSync(root, { recursive: true });
+  git(root, 'init', '-q', '-b', 'work');
+  write(root, main);
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '--allow-empty', '-m', 'main');
+  git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+  write(root, change);
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '--allow-empty', '-m', 'change');
+  return root;
+}
+
 describe('comment growth', () => {
   const NO_EXEMPT = { upstream: new Set<string>(), vendored: new Set<string>() };
-
-  function git(root: string, ...args: string[]): string {
-    const result = spawnSync(
-      'git',
-      ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.com', '-c', 'commit.gpgsign=false', ...args],
-      {
-        cwd: root,
-        encoding: 'utf8',
-        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
-      },
-    );
-    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.error?.message ?? result.stderr}`);
-    return result.stdout.trim();
-  }
-
-  function write(root: string, files: Record<string, string | null>): void {
-    for (const [file, text] of Object.entries(files)) {
-      if (text === null) {
-        fs.rmSync(path.join(root, file));
-        continue;
-      }
-      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
-      fs.writeFileSync(path.join(root, file), text);
-    }
-  }
-
-  /** A repository whose origin/main is `main`, with HEAD on a branch that commits `change` on top. */
-  function repo(main: Record<string, string>, change: Record<string, string | null>): string {
-    const root = project('growth', {});
-    fs.mkdirSync(root, { recursive: true });
-    git(root, 'init', '-q', '-b', 'work');
-    write(root, main);
-    git(root, 'add', '-A');
-    git(root, 'commit', '-q', '--allow-empty', '-m', 'main');
-    git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
-    write(root, change);
-    git(root, 'add', '-A');
-    git(root, 'commit', '-q', '--allow-empty', '-m', 'change');
-    return root;
-  }
 
   const verdict = (root: string, exempt = NO_EXEMPT) => {
     const growth = commentGrowth(root, growthBase(root), exempt);
@@ -421,5 +422,22 @@ describe('comment growth', () => {
     const root = repo({ 'src/a.ts': code }, {});
     git(root, 'update-ref', '-d', 'refs/remotes/origin/main');
     expect(() => growthBase(root)).toThrow(/^hygiene: cannot find the merge base of HEAD and origin\/main/);
+  });
+});
+
+describe('duplicate tests', () => {
+  const spec = (cases: string) => `import { expect, it } from 'vitest';\nimport { f } from './f.js';\n${cases}`;
+  const keeper = "it('keeper', () => {\n  expect(f(1)).toBe(2);\n});\n";
+
+  it('fails a new case that repeats one already on main, unless a commit trailer justifies it', () => {
+    const root = repo(
+      { 'src/f.test.ts': spec(keeper) },
+      { 'src/f.test.ts': spec(`${keeper}it('copy', () => {\n  expect(f(1)).toBe(2);\n});\n`) },
+    );
+    expect(summary(duplicateTestFindings(root, growthBase(root)))).toEqual([
+      expect.stringMatching(/^same-as src\/f\.test\.ts:6 "copy" runs the same statements as line 3 "keeper"; /),
+    ]);
+    git(root, 'commit', '-q', '--allow-empty', '-m', 'why\n\nDuplicate-test: src/f.test.ts | copy | pins a title');
+    expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
   });
 });
