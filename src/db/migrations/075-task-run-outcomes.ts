@@ -2,53 +2,15 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * A scheduled task whose AGENT TURN fails leaves no record any consumer can see.
- *
- * Observed 2026-09-07: a group migrated codex → claude at 03:37Z kept four
- * tasks pinned to a model belonging to its old provider. The pin is validated
- * at CREATE time and never re-validated at fire time, so every later fire
- * handed the wrong provider's model to the agent and the turn errored. One
- * `15,45 * * * *` series failed 21 consecutive times over ~14 hours and nobody
- * was told.
- *
- * The failures were NOT unrecorded — all 21 occurrence rows exist, and the
- * series run log holds 21 verbatim copies of the error. Every record said
- * SUCCESS, because three independent things stand between an errored agent turn
- * and the occurrence status:
- *
- *   1. `poll-loop.ts` marks the batch completed BEFORE the result event is
- *      handled (`markCompleted(initialBatchIds)`, ~30 lines earlier).
- *   2. `markFailed` (container/agent-runner/src/db/messages-in.ts) has zero
- *      callers in the runner.
- *   3. The host's ack sync maps only `script-skip:error` to failed
- *      (`src/mailbox/sqlite/index.ts`, `ack.status === 'script-skip:error' ?
- *      fail : complete`), so a literal `'failed'` ack would record `completed`
- *      anyway — and both statements guard `status NOT IN ('completed','failed')`,
- *      making the mark terminal-once so (1) cannot be corrected afterwards.
- *
- * So `trailingFailedRuns` — the streak `recurrence.ts` throttles and auto-pauses
- * on — reads 0 for an erroring agent, and always has. It counts pre-task script
- * failures and stuck-message MAX_TRIES failures, never a turn outcome.
- *
- * Fixing that chain is the true root cause and is a turn-lifecycle change
- * (when an occurrence becomes terminal, plus the ack mapping). This table is
- * the OBSERVER that closes the visibility gap without touching the lifecycle:
- * one row per automatic task-run summary, carrying the provider's own `is_error`
- * verdict and the model that actually ran.
- *
- * Central DB, not the session's `inbound.db`, because S19 `spent-task-session-gc`
- * closes spent task sessions and this history has to outlive that.
- *
- * `escalated_at` is the anti-spam marker, deliberately a column on the outcome
- * it marks rather than a second table. An episode is open when the CURRENT
- * trailing-failure streak contains a stamped row, so re-arming needs no
- * operation at all: a successful run ends the streak, and the next streak
- * contains no stamp. A separate ledger could disagree with the outcomes it
- * summarizes; a column cannot.
- *
- * No FK to `agent_groups`: the trace's job is to survive, and a cascade delete
- * would erase the evidence of exactly the group whose tasks were dying. The
- * sweep's retention prune bounds the table instead.
+ * A task whose AGENT TURN fails leaves no record any consumer can see: every occurrence still records SUCCESS,
+ * because the runner marks the batch completed before the result is handled, `markFailed` has no caller, and the
+ * host's ack sync maps only `script-skip:error` to failed (the mark is terminal-once). So `trailingFailedRuns` reads
+ * 0 for an erroring agent. This table is an OBSERVER that closes the visibility gap without changing that lifecycle:
+ * one row per task-run summary with the provider's `is_error` and the model that ran.
+ * Central, because spent task sessions are garbage-collected and this history must outlive them. `escalated_at` is
+ * the anti-spam marker on the outcome itself: an episode is escalated when its current failure streak contains a
+ * stamp, so a success re-arms with no operation. No FK to `agent_groups`: a cascade would erase the evidence for the
+ * very group whose tasks were dying; the retention prune bounds the table.
  */
 export const migration075: Migration = {
   version: 75,

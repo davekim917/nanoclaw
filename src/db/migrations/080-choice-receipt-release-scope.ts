@@ -3,10 +3,8 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Adds optional canonical release scope to the durable choice receipt.  The
- * table predates the scope, so existing/generic rows intentionally stay NULL.
- * Receipt rows attest a resolved action and must never be altered afterwards;
- * deletion remains available to the existing agent-group teardown lifecycle.
+ * Existing and generic rows stay NULL. Receipt rows attest a resolved action and are never altered afterwards; only
+ * agent-group teardown deletes them.
  */
 export const migration080: Migration = {
   version: 80,
