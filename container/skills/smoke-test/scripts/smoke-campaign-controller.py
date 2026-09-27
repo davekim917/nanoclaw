@@ -1498,8 +1498,8 @@ class EffectLayer:
         # intake brief says so in as many words ("use its coordinatorOwnerToken
         # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
         # gate mints a FRESH token on every same-run recovery poll
-        # (smoke-pr-gate.sh:5570, written to lease/authority/state at :5599,
-        # :5604, :5649), and reconcile_claims records the new one the wake
+        # (smoke-pr-gate.sh:5612, written to lease/authority/state at :5641,
+        # :5646, :5693), and reconcile_claims records the new one the wake
         # carries. Writing wake.json only at intake left the run tree naming a
         # RETIRED token while the brief still told the owner to use it: every
         # scaffold write, and `adopt` -- the verb that exists for exactly this
@@ -3229,7 +3229,7 @@ class Controller:
         An owner step records `brief_written`/`admitted`/`briefedToken`/
         `dispatchIntent` only once <run>/controller/brief-<step>.md is on disk
         (_owner_wake writes the brief before either route records anything,
-        :1510 and :1529; owner_step journals it after the effect returns,
+        :1516 and :1535; owner_step journals it after the effect returns,
         :2723-2733) -- a bare `intent` is deliberately NOT proof, since a fire
         can die before the brief lands. A `send:root` obligation is proof too:
         the root is posted only from a readable completion contract (step_run's
