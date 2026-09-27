@@ -35,6 +35,29 @@ FRONTEND_SERVICE="${SMOKE_GATE_FRONTEND_SERVICE:-}"
 LABEL="${SMOKE_GATE_LABEL:-render-preview}"
 STATE_DIR="${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}"
 RUN_PREFIX="${SMOKE_GATE_RUN_PREFIX:-smoke}"
+# Where each PR's preview comes from. `render` (default): *_SERVICE are the
+# parent service ids and previews are found through Render's API. `static`:
+# *_SERVICE are URL templates with `{pr}` and/or `{branch}`, and a preview's deploy
+# identity is the commit it serves (smoke-preview-static.sh).
+PREVIEW_PROVIDER="${SMOKE_PREVIEW_PROVIDER:-render}"
+HEALTH_PATH="${SMOKE_GATE_HEALTH_PATH:-/healthz}"
+# A static template names each PR's preview with {pr} and/or {branch} and is
+# otherwise a plain http(s) URL (host, optional port and path, no query):
+# the URL it resolves to is pasted unquoted into shell commands in briefs.
+static_template_ok() {
+  local url="${1//\{pr\}/1}"
+  url="${url//\{branch\}/b}"
+  [ "$url" != "$1" ] && [[ "$url" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]
+}
+provider_config_problems() {  # → " NAME" for each preview-provider key this install cannot run on
+  case "$PREVIEW_PROVIDER" in
+    render) ;;
+    static)
+      [ -z "$FRONTEND_SERVICE" ] || static_template_ok "$FRONTEND_SERVICE" || printf ' SMOKE_GATE_FRONTEND_SERVICE'
+      [ -z "$BACKEND_SERVICE" ] || static_template_ok "$BACKEND_SERVICE" || printf ' SMOKE_GATE_BACKEND_SERVICE' ;;
+    *) printf ' SMOKE_PREVIEW_PROVIDER' ;;
+  esac
+}
 # Ported verbatim from smoke-develop-gate.sh — a claimed run is live while its
 # newest liveness signal is fresh AND under the hard age ceiling. Not called
 # out as a separate contract knob because it is the same plumbing every claim/
@@ -1610,7 +1633,16 @@ find_pr_for_any_run() {
 # // .)` covers both.
 # ponytail: limit=100, no cursor pagination. The account runs a handful of
 # services; add pagination if the account ever exceeds one page.
-fetch_services() {
+fetch_services() {  # [<pr> <head ref>]
+  if [ "$PREVIEW_PROVIDER" = static ]; then
+    # The one lookup a static preview needs: the branch alias, from the head
+    # ref already fetched when the caller has it. A failed lookup fails the
+    # fetch, so the gate reports fetchOk:false rather than an absent preview.
+    local alias=""
+    case "$FRONTEND_SERVICE$BACKEND_SERVICE" in *'{branch}'*) alias="$(preview_branch_alias "${1:-}" "${2:-}")" || return 1 ;; esac
+    jq -cn --arg alias "$alias" '[{branchAlias:$alias}]'
+    return 0
+  fi
   timeout 10 curl -fsS --max-time 10 "https://api.render.com/v1/services?limit=100" 2>/dev/null
 }
 
@@ -1618,6 +1650,16 @@ fetch_services() {
 # defect). Returns a JSON array of {id,name,url}, empty when nothing matches.
 find_preview_candidates() {
   local services_json="$1" parent_id="$2" pr="$3"
+  if [ "$PREVIEW_PROVIDER" = static ]; then
+    local url="${parent_id//\{pr\}/$pr}" branch
+    branch="$(jq -r '.[0].branchAlias // empty' <<<"$services_json" 2>/dev/null)"
+    if [[ "$url" == *'{branch}'* ]]; then
+      [ -n "$branch" ] || { printf '[]'; return 0; }
+      url="${url//\{branch\}/$branch}"
+    fi
+    jq -cn --arg url "$url" '[{id:$url, name:$url, url:$url}]'
+    return 0
+  fi
   jq -c --arg pid "$parent_id" --arg suffix "PR #$pr" '
     [.[]? | (.service // .) | select(.serviceDetails.parentServer.id == $pid) | select(.name | endswith($suffix))
      | {id:(.id // null), name:(.name // null), url:(.serviceDetails.url // null)}]
@@ -1788,15 +1830,34 @@ resolve_frontend_identity() {
 
 latest_live_deploy_sha() {
   local service_id="$1" out
+  if [ "$PREVIEW_PROVIDER" = static ]; then served_sha "$service_id"; return; fi
   out="$(timeout 10 curl -fsS --max-time 10 "https://api.render.com/v1/services/$service_id/deploys?limit=5" 2>/dev/null)" || return 1
   jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' <<<"$out" 2>/dev/null
 }
 
+# static provider: the PR head branch as a host alias — lowercased, every
+# non-alphanumeric character a "-" (Cloudflare Pages' branch-alias rule).
+preview_branch_alias() {  # <pr> [<head ref>] -- looked up when not given
+  local ref="${2:-}"
+  [ -n "$ref" ] || ref="$(timeout 10 gh pr view "$1" -R "$REPO" --json headRefName 2>/dev/null | jq -r '.headRefName // empty' 2>/dev/null)"
+  [ -n "$ref" ] || return 1
+  printf '%s' "$ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]/-/g'
+}
+
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-preview-static.sh"
+
 healthz_ok() {
   local url="$1" code
   [ -n "$url" ] && [ "$url" != "null" ] || return 1
-  code="$(timeout 10 curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "${url%/}/healthz" 2>/dev/null)" || return 1
+  code="$(timeout 10 curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "${url%/}$HEALTH_PATH" 2>/dev/null)" || return 1
   [ "$code" = "200" ]
+}
+
+# Best-effort Render teardown of a finished backend preview. Prints the HTTP
+# status, empty on a network failure.
+suspend_preview() {
+  timeout 10 curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    -X POST "https://api.render.com/v1/services/$1/suspend" 2>/dev/null
 }
 
 # Prints one `{campaignSize, sizeReason}` JSON object. Classification is
@@ -2672,7 +2733,7 @@ evaluate_pr() {
     fi
   fi
 
-  if ! services_json="$(fetch_services)" || ! jq -e 'type == "array"' <<<"$services_json" >/dev/null 2>&1; then
+  if ! services_json="$(fetch_services "$pr" "$head_ref")" || ! jq -e 'type == "array"' <<<"$services_json" >/dev/null 2>&1; then
     fetch_ok=false
     services_json='[]'
   fi
@@ -2944,7 +3005,7 @@ gate_config_missing() {
   for k in REPO BACKEND_SERVICE FRONTEND_SERVICE; do
     [ -n "${!k}" ] || MISSING="$MISSING SMOKE_GATE_$k"
   done
-  MISSING="$MISSING$LAYOUT_MISSING"
+  MISSING="$MISSING$LAYOUT_MISSING$(provider_config_problems)"
   # A knob that fell back to its default because the deployed value was not a
   # number is a misconfiguration, not a detail — name it in the same alarm.
   MISSING="$MISSING$BAD_NUMERIC_CONFIG"
@@ -4421,7 +4482,7 @@ if [ "$COMMAND" = "finish" ]; then
   SUSPEND_OK=false
   SUSPEND_STATUS="null"
   SUSPEND_REASON=""
-  if SERVICES_JSON="$(fetch_services)" && jq -e 'type == "array"' <<<"$SERVICES_JSON" >/dev/null 2>&1; then
+  if SERVICES_JSON="$(fetch_services "$PR")" && jq -e 'type == "array"' <<<"$SERVICES_JSON" >/dev/null 2>&1; then
     # THE mutating site (#1536) — a wrong-twin pick here POSTs suspend against
     # a service nobody chose. Same candidate-enumeration + bundle-oracle
     # resolution as evaluate_pr, so this site can never disagree with what a
@@ -4441,10 +4502,11 @@ if [ "$COMMAND" = "finish" ]; then
       printf 'smoke-pr-gate: %s\n' "$SUSPEND_REASON" >&2
     elif [ "$BACKEND_PREVIEW" != "null" ]; then
       BACKEND_PREVIEW_ID="$(jq -r '.id // empty' <<<"$BACKEND_PREVIEW")"
-      if [ -n "$BACKEND_PREVIEW_ID" ]; then
+      if [ "$PREVIEW_PROVIDER" = static ]; then
+        SUSPEND_REASON="the static preview provider has no suspend; the preview's own lifecycle tears it down"
+      elif [ -n "$BACKEND_PREVIEW_ID" ]; then
         SUSPEND_ATTEMPTED=true
-        HTTP_CODE="$(timeout 10 curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-          -X POST "https://api.render.com/v1/services/$BACKEND_PREVIEW_ID/suspend" 2>/dev/null)"
+        HTTP_CODE="$(suspend_preview "$BACKEND_PREVIEW_ID")"
         if [ -z "$HTTP_CODE" ]; then
           SUSPEND_REASON="suspend request failed (network/timeout)"
         else

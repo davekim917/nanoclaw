@@ -99,4 +99,21 @@ PY
     || fail "$name: the snapshot check cannot see config dispatched after state init"
 done
 
+# The PR gate's preview-provider keys are part of the same refusal list.
+GATE="$SCRIPT_DIR/smoke-pr-gate.sh"
+OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=elsewhere)"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_PREVIEW_PROVIDER"]' <<<"$OUT" >/dev/null \
+  && ok "unknown preview provider named" || fail "unknown provider: rc=$RC $OUT"
+OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static)"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_FRONTEND_SERVICE","SMOKE_GATE_BACKEND_SERVICE"]' <<<"$OUT" >/dev/null \
+  && ok "static provider without URL templates named" || fail "static no template: rc=$RC $OUT"
+OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.acme.example' SMOKE_GATE_BACKEND_SERVICE=)"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_BACKEND_SERVICE"]' <<<"$OUT" >/dev/null \
+  && ok "an empty template is named once" || fail "static empty: rc=$RC $OUT"
+OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web.acme.example/?pr={pr}&x=1' SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.acme.example')"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_FRONTEND_SERVICE"]' <<<"$OUT" >/dev/null \
+  && ok "a template with a query or shell metacharacter named" || fail "static unsafe template: rc=$RC $OUT"
+OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.acme.example' SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.acme.example')"; RC=$?
+[ "$RC" -eq 0 ] && ok "static provider with templates ok" || fail "static ok: rc=$RC $OUT"
+
 [ "$FAIL" -eq 0 ] && echo "PASS smoke-gate-config.test.sh" || { echo "FAIL smoke-gate-config.test.sh" >&2; exit 1; }
