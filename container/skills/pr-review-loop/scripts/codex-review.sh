@@ -668,7 +668,7 @@ comment_rule_checker() {
 comment_rule_run() {
   local checker merge_base head
   checker=$(comment_rule_checker) || {
-    echo "the comment-rule checker is not installed: no $COMMENT_RULE_CHECKER under \$CLAUDE_PLUGINS_ROOT or ~/plugins (pull the bootstrap plugin)"
+    echo "the comment-rule checker is not installed: no $COMMENT_RULE_CHECKER under \$CLAUDE_PLUGINS_ROOT or ~/plugins; on the host, run \`git -C ~/plugins/bootstrap pull --ff-only\`, or \`git clone https://github.com/davekim917/bootstrap ~/plugins/bootstrap\` when there is no checkout"
     return 2
   }
   command -v node >/dev/null 2>&1 || { echo "the comment-rule checker needs node on PATH"; return 2; }
@@ -724,7 +724,7 @@ comment_rule_gate() {
       ;;
     *)
       printf '%s\n' "$report" >&2
-      echo "merge=error head=$SCOPE_HEAD: the comment-rule check gave no verdict (exit $status); fix the checker, or opt the repo out with \"commentRule\": false in $REVIEW_LOOP_CONFIG" >&2
+      echo "merge=error head=$SCOPE_HEAD: the comment-rule check gave no verdict (exit $status); when the report says typescript was not found, run \`npm ci --ignore-scripts\` in the bootstrap plugin directory plugins/comment-rule" >&2
       exit 1
       ;;
   esac
