@@ -372,7 +372,7 @@ them, quotes from them, and the after-the-fact check verifies against them —
 never against the live body.
 
 **Acceptance contract (contract steps).** Active only when the QA pair's
-standing instructions say `Acceptance contract (pilot): active`; every
+standing instructions carry `Acceptance contract (<any label>): active`; every
 step marked *(contract)* applies then and never otherwise, and without that
 line this skill runs exactly as before. *(contract)* Also freeze every request
 the PR body's `acceptance-v1` block (`references/acceptance.example.json`)
