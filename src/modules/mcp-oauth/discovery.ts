@@ -127,10 +127,6 @@ export function assertIssuerMatches(declared: string | undefined, requested: str
 }
 
 /**
- * RFC 9728 §3.3: the protected-resource document's `resource` must cover the
- * MCP URL — same origin, and a path that is equal to or a segment-boundary
- * prefix of it.
-/**
  * RFC 9728 §3.3: the document's `resource` must cover the MCP URL — same origin
  * and a segment-boundary path prefix. An origin-only `resource` deliberately
  * covers every path (a live server declares its origin while serving `/mcp`).

@@ -4,7 +4,9 @@
  * session for life and the runner resumes its continuation every batch, so
  * context would otherwise compound fire after fire. A thread-bound row still
  * starts fresh: the thread is where it posts, not a conversation it resumes.
- * Mirrors the runner's `taskRowFiresFresh`; keep the two in step.
+ * Mirrors the runner's `taskRowFiresFresh`; keep the two in step. The runner
+ * alone also resumes a retry of an interrupted fire (`tries > 0`), which this
+ * helper never sees.
  */
 
 export function taskFiresFresh(rawContent: string): boolean {
