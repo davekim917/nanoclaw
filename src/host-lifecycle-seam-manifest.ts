@@ -15,8 +15,8 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 export const MANIFEST_PATH = path.join(REPO_ROOT, 'src/host-lifecycle-seam/UPSTREAM-MANIFEST.json');
 
 /**
- * One pinned upstream commit for all entries. `src/db/connection.ts` is deliberately absent: it is fork-adapted, so
- * the upstream ratchet measures it as ordinary divergence.
+ * One pinned upstream commit for all entries. `src/db/connection.ts` is deliberately absent: it is fork-adapted
+ * (`getRawDb`/`hasTableRaw`), so the upstream ratchet measures it as ordinary divergence.
  */
 export const UPSTREAM_FILES = [
   'src/db/compose.ts',
