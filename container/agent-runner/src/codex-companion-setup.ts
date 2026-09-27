@@ -1,7 +1,7 @@
 /**
- * Peer-mode CODEX_HOME for a Claude/OpenCode container: `/home/node/.codex-runtime/`, whose only host input is the
- * auth.json symlink (OAuth refresh must persist to the host); config, MCP servers and plugins are generated
- * in-container, and agents/ links the host-populated group roster. `~/.codex/config.toml` cannot hold them because
+ * Peer-mode CODEX_HOME for a Claude/OpenCode container: `/home/node/.codex-runtime/`. Its only input from the host
+ * CLI's Codex home is the auth.json symlink (OAuth refresh must persist there); config, MCP servers and plugins are
+ * generated in-container, and agents/ links the host-populated group roster. `~/.codex/config.toml` can't hold them:
  * the host regenerates it on every spawn.
  */
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
