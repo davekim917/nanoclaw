@@ -4,6 +4,7 @@ export interface TestCase {
   file: string;
   line: number;
   name: string;
+  suite: string;
   scope: string;
   statements: string[];
   assertions: boolean[];
@@ -67,6 +68,8 @@ function isPropertyName(node: ts.Identifier): boolean {
     (ts.isPropertyAssignment(parent) && parent.name === node) ||
     (ts.isMethodDeclaration(parent) && parent.name === node) ||
     (ts.isPropertyDeclaration(parent) && parent.name === node) ||
+    (ts.isGetAccessorDeclaration(parent) && parent.name === node) ||
+    (ts.isSetAccessorDeclaration(parent) && parent.name === node) ||
     (ts.isQualifiedName(parent) && parent.right === node) ||
     (ts.isBindingElement(parent) && parent.propertyName === node) ||
     ts.isLabeledStatement(parent)
@@ -87,11 +90,18 @@ function scopeDeclares(node: ts.Node): Set<string> {
   } else if (ts.isFunctionLike(node)) {
     for (const param of node.parameters) bindingNames(param.name, names);
     if ((ts.isFunctionExpression(node) || ts.isClassExpression(node)) && node.name) names.add(node.name.text);
+    const hoisted = (n: ts.Node): void => {
+      if (ts.isVariableDeclarationList(n) && !(n.flags & ts.NodeFlags.BlockScoped)) bindAll(n);
+      if (!ts.isFunctionLike(n)) ts.forEachChild(n, hoisted);
+    };
+    const fnBody = (node as { body?: ts.Node }).body;
+    if (fnBody) ts.forEachChild(fnBody, hoisted);
   } else if (ts.isCatchClause(node) && node.variableDeclaration) {
     bindingNames(node.variableDeclaration.name, names);
   } else if (ts.isBlock(node) || ts.isSourceFile(node) || ts.isCaseClause(node) || ts.isDefaultClause(node)) {
     for (const st of node.statements) {
-      if (ts.isVariableStatement(st)) bindAll(st.declarationList);
+      if (ts.isVariableStatement(st) && st.declarationList.flags & ts.NodeFlags.BlockScoped)
+        bindAll(st.declarationList);
       else if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st) || ts.isEnumDeclaration(st)) && st.name) {
         names.add(st.name.text);
       }
@@ -115,18 +125,24 @@ function asserts(node: ts.Node): boolean {
   return ts.forEachChild(node, asserts) ?? false;
 }
 
-function innermostScope(node: ts.Node): ts.Node {
-  let p = node.parent;
-  while (
-    !ts.isSourceFile(p) &&
-    !ts.isBlock(p) &&
-    !ts.isFunctionLike(p) &&
-    !ts.isIterationStatement(p, false) &&
-    !ts.isCaseOrDefaultClause(p)
-  ) {
-    p = p.parent;
+function plainSuite(fn: ts.Node): ts.CallExpression | undefined {
+  const call = fn.parent;
+  if (!ts.isCallExpression(call) || call.arguments.length !== 2 || call.arguments[1] !== fn) return undefined;
+  const callee = calleeOf(call);
+  return callee && SUITE_CALLEES.has(callee.base) && callee.modifiers.length === 0 ? call : undefined;
+}
+
+function suiteLevels(call: ts.CallExpression): ts.Node[] | undefined {
+  const levels: ts.Node[] = [];
+  for (let node: ts.Node = call; ; ) {
+    const container = ts.isExpressionStatement(node.parent) ? node.parent.parent : node.parent;
+    if (ts.isSourceFile(container)) return [...levels, container];
+    const fn = ts.isBlock(container) ? container.parent : container;
+    const suite = ts.isFunctionLike(fn) ? plainSuite(fn) : undefined;
+    if (!suite) return undefined;
+    levels.push(container);
+    node = suite;
   }
-  return p;
 }
 
 class Normalizer {
@@ -152,7 +168,7 @@ class Normalizer {
     for (let p = node.parent; p && this.root && within(p, this.root); p = p.parent) {
       if (!scopeDeclares(p).has(name)) continue;
       const key = `${name}@${p.pos}`;
-      if (!this.locals.has(key)) this.locals.set(key, `$${this.locals.size}`);
+      if (!this.locals.has(key)) this.locals.set(key, `%${this.locals.size}`);
       return this.locals.get(key)!;
     }
     return name;
@@ -162,8 +178,8 @@ class Normalizer {
     const out: string[] = [];
     const visit = (n: ts.Node) => {
       if (ts.isIdentifier(n)) out.push(this.identifier(n));
-      else if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) out.push(JSON.stringify(n.text));
-      else if (n.kind === ts.SyntaxKind.SemicolonToken) return;
+      else if (ts.isStringLiteral(n)) out.push(JSON.stringify(n.text));
+      else if (n.kind === ts.SyntaxKind.SemicolonToken && !ts.isForStatement(n.parent)) return;
       else if (n.getChildCount(this.sourceFile) === 0) out.push(n.getText(this.sourceFile));
       else for (const child of n.getChildren(this.sourceFile)) visit(child);
     };
@@ -178,39 +194,31 @@ function isSuiteOrCase(statement: ts.Statement): boolean {
   return !!callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
 }
 
-function environment(scope: ts.Node, text: (n: ts.Node) => string): string {
-  const parts: ts.Node[] = [];
-  if (ts.isSourceFile(scope) || ts.isBlock(scope) || ts.isCaseOrDefaultClause(scope)) {
-    parts.push(...scope.statements.filter((st) => !isSuiteOrCase(st)));
-  } else if (ts.isFunctionLike(scope)) {
-    parts.push(...scope.parameters);
-    if (ts.isCallExpression(scope.parent)) parts.push(scope.parent.expression);
-  } else if (ts.isForOfStatement(scope) || ts.isForInStatement(scope)) {
-    parts.push(scope.initializer, scope.expression);
-  } else if (ts.isForStatement(scope)) {
-    for (const n of [scope.initializer, scope.condition, scope.incrementor]) if (n) parts.push(n);
-  } else if (ts.isWhileStatement(scope) || ts.isDoStatement(scope)) {
-    parts.push(scope.expression);
-  }
-  return `${ts.SyntaxKind[scope.kind]}(${parts.map(text).join(';')})`;
-}
-
 export function extractCases(file: string, text: string): TestCase[] {
   const kind = file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
   const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
   const outer = new Normalizer(sourceFile);
-  const environments = new Map<ts.Node, string>();
-  const scopeOf = (node: ts.Node): string => {
-    const levels: string[] = [];
-    for (let s = innermostScope(node); ; s = innermostScope(s)) {
-      if (!environments.has(s))
-        environments.set(
-          s,
-          environment(s, (n) => outer.text(n)),
-        );
-      levels.push(environments.get(s)!);
-      if (ts.isSourceFile(s)) return levels.join('\n');
+  const setup = (level: ts.Node) =>
+    (ts.isBlock(level) || ts.isSourceFile(level) ? [...level.statements] : [])
+      .filter((st) => !isSuiteOrCase(st))
+      .map((st) => outer.text(st))
+      .join('\n');
+  const scopeOf = (node: ts.CallExpression): string => {
+    const levels = suiteLevels(node);
+    if (levels) return levels.map(setup).join('\n--\n');
+    const container = ts.isExpressionStatement(node.parent) ? node.parent.parent : node.parent;
+    const shared = ts.isBlock(container) || ts.isSourceFile(container) || ts.isCaseOrDefaultClause(container);
+    return `@${shared ? container.pos : node.pos}`;
+  };
+  const suiteOf = (node: ts.Node): string => {
+    const titles: string[] = [];
+    for (let p = node.parent; p; p = p.parent) {
+      if (!ts.isCallExpression(p)) continue;
+      const callee = calleeOf(p);
+      const title = p.arguments[0];
+      if (callee && SUITE_CALLEES.has(callee.base)) titles.unshift(title ? title.getText(sourceFile) : '');
     }
+    return titles.join(' > ');
   };
   const cases: TestCase[] = [];
   const visit = (node: ts.Node): void => {
@@ -220,6 +228,8 @@ export function extractCases(file: string, text: string): TestCase[] {
       if (known && callee.modifiers.some((m) => NOT_RUN.has(m))) return;
       const callback = callee && CASE_CALLEES.has(callee.base) ? callbackOf(node) : undefined;
       if (callee && callback?.body) {
+        const options = node.arguments.slice(1).filter((arg) => arg !== callback && !ts.isNumericLiteral(arg));
+        if (options.length) return;
         const normalizer = new Normalizer(sourceFile, callback);
         const body = callback.body;
         const parts: ts.Node[] = ts.isBlock(body) ? [...body.statements] : [body];
@@ -237,7 +247,8 @@ export function extractCases(file: string, text: string): TestCase[] {
           file,
           line: sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1,
           name: title && ts.isStringLiteralLike(title) ? title.text : title ? title.getText(sourceFile) : '',
-          scope: `${callee.modifiers.join('.')}\n${scopeOf(node)}`,
+          suite: suiteOf(node),
+          scope: `${[callee.base, ...callee.modifiers].join('.')}\n${scopeOf(node)}`,
           statements,
           assertions,
         });
@@ -285,18 +296,20 @@ export function findDuplicateTests(newCases: TestCase[], allCases: TestCase[]): 
 const shapeKey = (c: TestCase) => c.statements.join('\n');
 
 export function addedCases(base: TestCase[], head: TestCase[]): TestCase[] {
-  const named = new Map<string, number>();
-  const shaped = new Map<string, number>();
+  const count = (keys: string[]) => {
+    const counts = new Map<string, number>();
+    for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+    return counts;
+  };
   const take = (counts: Map<string, number>, key: string) => {
     const left = counts.get(key) ?? 0;
     if (left > 0) counts.set(key, left - 1);
     return left > 0;
   };
-  for (const c of base) {
-    named.set(`${c.name}\n${shapeKey(c)}`, (named.get(`${c.name}\n${shapeKey(c)}`) ?? 0) + 1);
-    shaped.set(shapeKey(c), (shaped.get(shapeKey(c)) ?? 0) + 1);
-  }
-  const kept = new Set<TestCase>();
-  for (const c of head) if (take(named, `${c.name}\n${shapeKey(c)}`) && take(shaped, shapeKey(c))) kept.add(c);
-  return [...head].sort(order).filter((c) => !kept.has(c) && !take(shaped, shapeKey(c)));
+  const titleKey = (c: TestCase) => `${c.suite}\n${c.name}`;
+  const headTitles = count(head.map(titleKey));
+  const unmatched = base.filter((c) => !take(headTitles, titleKey(c)));
+  const titled = count(base.map(titleKey));
+  const shaped = count(unmatched.map(shapeKey));
+  return [...head].sort(order).filter((c) => !take(titled, titleKey(c)) && !take(shaped, shapeKey(c)));
 }

@@ -83,6 +83,38 @@ it('wider', () => {
       'the same table under each and for, whose callbacks receive different arguments',
       "it.each([[1, 2]])('a', (x) => {\n  expect(f(x)).toBe(2);\n});\nit.for([[1, 2]])('b', (x) => {\n  expect(f(x)).toBe(2);\n});",
     ],
+    [
+      'the same body in the two branches of an if',
+      "if (process.platform === 'win32') it('a', () => {\n  expect(f(1)).toBe(2);\n});\nelse it('b', () => {\n  expect(f(1)).toBe(2);\n});",
+    ],
+    [
+      'the same body under a wrapper called with different arguments',
+      "withBackend('sqlite', () => {\n  it('a', () => {\n    expect(f(1)).toBe(2);\n  });\n});\nwithBackend('postgres', () => {\n  it('b', () => {\n    expect(f(1)).toBe(2);\n  });\n});",
+    ],
+    [
+      'a copy inside a suite that carries options',
+      "describe('off', { skip: true }, () => {\n  it('copy', () => {\n    const out = f(1);\n    expect(out).toBe(2);\n  });\n});",
+    ],
+    [
+      'the same body under test and it, which may carry different fixtures',
+      "test('copy', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n});",
+    ],
+    [
+      'a var that one body hoists and the other reads from outside',
+      "it('a', () => {\n  if (g(0)) { var x = 1; }\n  expect(f(x)).toBe(2);\n});\nit('b', () => {\n  if (g(0)) { var y = 1; }\n  expect(f(x)).toBe(2);\n});",
+    ],
+    [
+      'bodies that differ only in a getter name',
+      "it('a', () => {\n  const a = 1;\n  expect(f({ get a() { return a; } })).toBe(2);\n});\nit('b', () => {\n  const b = 1;\n  expect(f({ get b() { return b; } })).toBe(2);\n});",
+    ],
+    [
+      'raw templates with different raw text',
+      "it('a', () => {\n  expect(f(String.raw`\\n`)).toBe(2);\n});\nit('b', () => {\n  expect(f(String.raw`\n`)).toBe(2);\n});",
+    ],
+    [
+      'loop headers that differ only in where a semicolon falls',
+      "it('a', () => {\n  for (let i = 0; i++; ) g(i);\n  expect(f(1)).toBe(2);\n});\nit('b', () => {\n  for (let i = 0; ; i++) g(i);\n  expect(f(1)).toBe(2);\n});",
+    ],
   ])('does not flag %s', (_label, added) => {
     expect(duplicates(keeper, `${keeper}${added}\n`)).toEqual([]);
   });
@@ -125,6 +157,24 @@ it('wider', () => {
   it('reports the added copy, not the existing case, when the copy is inserted above it', () => {
     const copy = "it('copy', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n});\n";
     expect(duplicates(keeper, copy + keeper)).toEqual(['same-as copy <- keeper']);
+  });
+
+  it('does not treat a case skipped through its options as the keeper', () => {
+    const skipped = keeper.replace("it('keeper', ", "it('keeper', { skip: true }, ");
+    const copy = "it('copy', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n});\n";
+    expect(duplicates(skipped, skipped + copy)).toEqual([]);
+  });
+
+  it('does not report duplicates already on main when a change edits both of them', () => {
+    const pair = (n: number) =>
+      `it('a', () => {\n  expect(f(${n})).toBe(2);\n});\nit('b', () => {\n  expect(f(${n})).toBe(2);\n});\n`;
+    expect(duplicates(pair(1), pair(2))).toEqual([]);
+  });
+
+  it('flags a copy under a second suite set up the same way', () => {
+    const suite = (title: string, name: string) =>
+      `describe('${title}', () => {\n  beforeEach(() => g(1));\n  it('${name}', () => {\n    expect(f(1)).toBe(2);\n  });\n});\n`;
+    expect(duplicates(suite('s', 'a'), suite('s', 'a') + suite('t', 'b'))).toEqual(['same-as b <- a']);
   });
 
   it('does not treat a skipped case as the keeper', () => {
