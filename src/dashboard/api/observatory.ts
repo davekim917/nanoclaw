@@ -1,13 +1,6 @@
 /**
- * Observatory scene graph (read-only, derived entirely at request time — no
- * new tables, no caching, no stored state):
- *
- *   GET /dashboard/api/observatory?workgroup=<workgroupId>
- *
- * Same disclose-as-not-found spirit as workgroups.ts, but flattened to one
- * status code: an unknown or out-of-scope workgroup id returns 200 with the
- * same empty-array shape rather than 404/403 — this endpoint has no route
- * param to gate, just a query string, so there's nothing to 404 on.
+ * Observatory scene graph, derived entirely at request time (no tables, no cache). An unknown or out-of-scope
+ * workgroup returns 200 with the empty shape, not 404/403.
  */
 import fs from 'fs';
 import path from 'path';
@@ -34,14 +27,11 @@ function json(body: unknown, status = 200): Response {
 }
 
 type ObservatoryClaim = BoardClaim & {
-  /** Resolved permalink to the thread the work was claimed in — every row on the
-   *  board links back to where it actually happened. Null when unresolvable. */
+  /** Permalink to the thread the work was claimed in; null when unresolvable. */
   threadUrl: string | null;
   /**
-   * The session whose transcript IS this claim's conversation — what a slug
-   * like `xzo-whats-new-817` actually MEANS, readable without leaving the
-   * board. Null when the claim has no thread, or no session on it. See
-   * {@link attachClaimSessions} for which session wins when siblings share one.
+   * The session whose transcript is this claim's conversation; null when there is none. See
+   * {@link attachClaimSessions} for which sibling wins.
    */
   sessionId: string | null;
 };
@@ -59,64 +49,36 @@ interface ObservatoryAgent {
   id: string;
   /** Channel-facing persona name (resolveAssistantName) — what claim owners are written as. */
   name: string;
-  /** agent_groups.name — infrastructure identity, secondary UI detail only. */
   canonicalName: string;
   folder: string;
   provider: string;
   /**
-   * The bot's real Slack avatar (public slack-edge URL), drawn UNMODIFIED.
-   * Null when no wired bot has one — a face is never invented; the UI falls
-   * back to initials.
-   *
-   * An earlier note here said the UI pixelated it client-side. It does not, and
-   * no code ever in this tree did: the comment was the last trace of a retired
-   * treatment, and DESIGN.md §11 rules it out for good — real faces.
+   * The bot's real Slack avatar, drawn unmodified; null when no wired bot has one (the UI falls back to initials,
+   * never an invented face).
    */
   avatarUrl: string | null;
   awake: boolean;
   /**
-   * Doing something HERE, right now — the floor's pulse.
-   *
-   * `awake` is container liveness across every session the agent owns, and an
-   * agent whose task container is merely up reads as awake for as long as it
-   * runs. Combined with `location`'s deliberately sticky 8h window that made a
-   * seat pulse hours after its last word in the room (observed live: an agent
-   * whose newest #room outbound was 4h50m old, drawn working). Where an agent
-   * SITS is allowed to be sticky; whether it PULSES is not.
-   *
-   * So: awake AND the seated room session spoke within WORKING_WINDOW_MS. Same
-   * session `location` and `liveSession` already picked — this only adds the
-   * recency gate, so an agent is never "working" in a room it isn't standing in.
+   * Pulsing here right now: `awake` AND the seated room session spoke within WORKING_WINDOW_MS. `awake` alone covers
+   * every session the agent owns, and `location` is deliberately sticky, so without the recency gate a seat pulses
+   * hours after its last word in the room.
    */
   active: boolean;
   location: string | null;
   lastSeenAt: string | null;
   /**
-   * The session this agent most recently spoke in — the one a steer should
-   * land in. Null when it has never produced outbound. Deliberately tracks
-   * `lastSeenAt`, not `location`: steering follows the conversation the agent
-   * is actually in, including a room-less task session, whereas location is a
-   * PLACE and only counts sessions with a room.
+   * The session this agent most recently spoke in, where a steer lands; null when it has never produced outbound.
+   * Tracks `lastSeenAt`, not `location`, so it includes room-less task sessions.
    */
   lastSessionId: string | null;
   holding: string[];
-  // ponytail: no cheap source for a task's display title exists yet — the
-  // scheduled-board snapshot deliberately keeps prompt/script text server-side
-  // only (scheduled-assembly.ts's search_index, "NEVER serialized to the
-  // wire"), and reading it back out would mean opening every agent's session
-  // inbound.db on every observatory poll. Wire it once a titled read exists.
+  // No cheap source for a task's display title exists: prompt text stays server-side, and reading it would open every
+  // session's inbound.db on every poll.
   nextTask: { title: string; at: string } | null;
   /**
-   * The agent's most-recent session that carries a room — same source and
-   * same LOCATION_WINDOW_MS gate as `location`, but carrying enough to link
-   * to the actual live thread rather than just naming the channel. Null when
-   * the agent has no room-scoped session inside the window.
-   *
-   * This is a single "where do I currently point" value, not a per-room map:
-   * a caller that wants a ROOM-SCOPED drawer must compare
-   * `liveSession.channelKey` against the room it is asking about and treat a
-   * mismatch as "no live thread here" — an agent live in #ops has no live
-   * session to show in #dispatch, however active #ops is.
+   * The agent's most recent room-carrying session within LOCATION_WINDOW_MS, with enough to link to the live thread;
+   * null when none. One value, not a per-room map: a room-scoped caller must treat a `channelKey` mismatch as "no
+   * live thread here".
    */
   liveSession: {
     channelKey: string;
@@ -140,23 +102,16 @@ export interface ReleaseStateItem {
   dueAt?: string | null;
   /** One line: what the current mover does next. */
   nextAction?: string;
-  /** Slack channel the work lives in, e.g. '#qa-room' — how the floor and
-   *  the assign path route an item to its room. Emitted 73/73 as of the
-   *  2026-08-17 board wake. */
+  /** Slack channel the work lives in, e.g. '#qa-room'; how the floor and the assign path route an item to its room. */
   channel?: string;
   /**
-   * Ids of items on this same board that must land first. OMITTING the field
-   * means "nobody checked"; an explicit `[]` means "checked, nothing blocks
-   * it". The dependency view treats those as different states on purpose —
-   * undeclared must never render as independent — so the watcher publishing
-   * `[]` is a real assertion, not a filler value.
+   * Ids of items on this board that must land first. Omitted means "nobody checked"; `[]` means "checked, nothing
+   * blocks it". Undeclared must never render as independent.
    */
   dependsOn?: string[];
   /**
-   * The thread somebody already steered this item into, decorated onto the
-   * board at read time from `observatory_item_threads` — the board's own memory
-   * of a one-click ship. Null when nobody has. Never published by the watcher:
-   * this is host state about an item, not a fact about the work.
+   * The thread this item was already steered into, decorated at read time from `observatory_item_threads`; null when
+   * nobody has. Host state, never published by the watcher.
    */
   steeredThread?: SteeredThread | null;
 }
@@ -177,14 +132,9 @@ export interface ReleaseState {
 }
 
 /**
- * The release desk's machine artifact, written by the workgroup's own release
- * watcher every ~30 minutes (see the workgroup runbook + decisions.md
- * 2026-08-16). The observatory only RENDERS it — one aggregator, one
- * renderer, so the desk and the dashboard can never tell two stories. Member
- * folders are scanned because the file lives in the owning group's folder
- * (siblings reach it via a symlink the host must not depend on); newest
- * mtime wins. Absent or unparseable → null, and the UI says "no release
- * desk" rather than inventing one.
+ * The release desk artifact the workgroup's release watcher writes; the observatory only renders it. Member folders
+ * are scanned because the file lives in the owning group's folder (siblings reach it via a symlink the host must not
+ * depend on); newest mtime wins. Absent or unparseable → null.
  */
 export async function readReleaseState(
   workgroupId: string,
@@ -212,15 +162,8 @@ export async function readReleaseState(
 }
 
 /**
- * Decorate a board with the threads its items have already been steered into.
- *
- * One query per poll, not one per item, and a LEFT JOIN for the name so a user
- * row that has since been deleted degrades to the raw id rather than dropping
- * the whole decoration — knowing a thread exists matters more than knowing who
- * opened it.
- *
- * Read-time resolution on purpose: `observatory_item_threads` stores a
- * `users.id`, so a display-name change is never frozen into the table.
+ * Decorates a board with the threads its items were steered into: one query per poll. The LEFT JOIN degrades a
+ * deleted user to the raw id rather than dropping the decoration; names resolve at read time so renames show.
  */
 export async function decorateSteeredThreads(
   workgroupId: string,
@@ -238,8 +181,7 @@ export async function decorateSteeredThreads(
       workgroupId,
     );
   } catch (err) {
-    // The table arrives with migration 050; a host running an older schema must
-    // still render its board rather than blanking the scene.
+    // The table arrives with migration 050; an older schema must still render its board.
     log.warn('observatory: could not read steered item threads', { workgroupId, err });
     return state;
   }
@@ -266,11 +208,7 @@ export async function decorateSteeredThreads(
   };
 }
 
-/**
- * One room's live-state indicator. `active` is always stated: a bound room that
- * is quiet is a different fact from a room nobody bound, and the UI must be
- * able to tell them apart without inferring anything.
- */
+/** `active` is always stated: a quiet bound room is a different fact from a room nobody bound. */
 export interface ObservatorySignal {
   room: string;
   vignette: string;
@@ -297,15 +235,10 @@ function emptyScene(workgroupId: string): ObservatoryScene {
 let themeConfigWarned = false;
 
 /**
- * Themed-floor slot bindings (normalized channel name → office-map.js slot),
- * install config only — see office-data.ts's buildOfficeData. A channel name
- * is install identity, which `check:public-boundary` rightly refuses to let
- * live in trunk source, so the real mapping is the operator's own untracked
- * `.nanoclaw/office-themes.json`, resolved the same repo-root-relative way
- * the boundary checker resolves its own identifier file. Missing or
- * unparseable → undefined, logged once (not every 15s poll) rather than on
- * every call, and the scene must never blank over it — the floor just falls
- * back to plain order-fill.
+ * Themed-floor slot bindings (normalized channel name → office-map.js slot). Channel names are install identity,
+ * which `check:public-boundary` keeps out of trunk, so they come from the operator's untracked
+ * `.nanoclaw/office-themes.json`. Missing or unparseable → undefined, logged once rather than every poll; the floor
+ * falls back to order-fill.
  */
 export function readOfficeThemes(repoRoot: string = REPO_ROOT): Record<string, string> | undefined {
   const file = path.join(repoRoot, '.nanoclaw', 'office-themes.json');
@@ -335,7 +268,7 @@ let signalConfigWarned = false;
 /** Clock skew a producer's timestamp is allowed to be ahead by. */
 const SIGNAL_FUTURE_SKEW_MS = 60_000;
 
-/** The closed entry schema. An entry carrying anything else is not this shape. */
+/** Closed entry schema: an entry carrying any other key is rejected. */
 const SIGNAL_KEYS = new Set(['room', 'file', 'freshKey', 'maxAgeSeconds', 'vignette']);
 const SIGNAL_VIGNETTES = new Set(['smoke']);
 
@@ -348,10 +281,8 @@ interface SignalBinding {
 }
 
 /**
- * A binding entry, or null if it is not one. CLOSED on purpose: a key this
- * doesn't know is a config written against a contract this build does not
- * implement, and quietly ignoring it would render a room's state from a rule
- * nobody applied.
+ * CLOSED on purpose: an unknown key means config written against a contract this build does not implement, and
+ * ignoring it would render state from a rule nobody applied.
  */
 function parseSignalBinding(raw: unknown): SignalBinding | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -367,19 +298,10 @@ function parseSignalBinding(raw: unknown): SignalBinding | null {
 }
 
 /**
- * The state file this binding names, resolved inside the workgroup directory —
- * or null if it escapes.
- *
- * REALPATH, not string prefixing: `..` and an absolute path are the obvious
- * escapes, but a symlink planted inside the workgroup directory pointing at
- * `/etc` passes every textual check. The parent is resolved rather than the
- * file itself because the file legitimately may not exist yet (a campaign that
- * has never run), and an absent file is inactive, not rejected.
- *
- * This covers the DIRECTORY chain only. The final component is the other half,
- * and it is handled at read time with `O_NOFOLLOW` — see readContainedState.
- * Splitting it that way is what lets an absent file stay inactive rather than
- * rejected while a symlinked one is refused outright.
+ * The state file resolved inside the workgroup directory, or null if it escapes.
+ * REALPATH, not string prefixing: a symlink inside the workgroup pointing at `/etc` passes every textual check. The
+ * parent is resolved rather than the file because an absent file is inactive, not rejected; the final component is
+ * guarded at read time with `O_NOFOLLOW` (see readContainedState).
  */
 function containedStatePath(workgroupDir: string, file: string): string | null {
   if (path.isAbsolute(file)) return null;
@@ -393,51 +315,30 @@ function containedStatePath(workgroupDir: string, file: string): string | null {
     if (realRel.startsWith('..') || path.isAbsolute(realRel)) return null;
     return path.join(realParent, path.basename(target));
   } catch {
-    // The workgroup dir (or the file's directory) does not exist. Nothing can
-    // escape a directory that isn't there, and the read below will simply
-    // report the signal inactive.
+    // The directory does not exist; nothing can escape it, and the read reports the signal inactive.
     return target;
   }
 }
 
 /**
- * Exactly what `Date.prototype.toISOString` emits, and nothing else.
- *
- * `Date.parse` is far more forgiving than R7's contract: it accepts
- * "12/25/2026", "Dec 25 2026 10:00", and a pile of other shapes whose meaning
- * is engine- and locale-dependent. A liveness stamp that only PARSES is not a
- * timestamp a room's state may be asserted from.
+ * Exactly what `Date.prototype.toISOString` emits: `Date.parse` accepts engine- and locale-dependent shapes that no
+ * liveness stamp may be asserted from.
  */
 const ISO_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 /**
- * Read the state file WITHOUT ever following a symlink on its final component.
- *
- * `containedStatePath` proves the file's directory chain resolves inside the
- * workgroup; this closes the other half. A state file that is ITSELF a symlink
- * pointing out of the workgroup passes every parent check — `readFileSync`
- * would happily follow it and read whatever it aimed at. `O_NOFOLLOW` makes the
- * kernel refuse (ELOOP) instead, `fstat` on the descriptor rejects anything
- * that is not a regular file (a fifo would block the poll; a directory is not
- * state), and the read comes FROM THE DESCRIPTOR — so nothing can be swapped
- * underneath between the check and the read.
- *
- * Returns null for absent, unreadable, not-a-regular-file, symlinked, or
- * oversized. Every one of those means "not running", which is the honest
- * reading of a liveness marker that is not simply there.
+ * Reads the state file without following a symlink on its final component (`O_NOFOLLOW`), rejects non-regular files
+ * via `fstat`, and reads from the descriptor so nothing can be swapped between check and read.
+ * Returns null for absent, unreadable, not-a-regular-file, symlinked, or oversized; each means "not running".
  */
 function readContainedState(statePath: string): string | null {
   let fd: number | undefined;
   try {
-    // O_NONBLOCK matters as much as O_NOFOLLOW: opening a FIFO for reading
-    // BLOCKS until a writer shows up, and that open happens before fstat can
-    // reject it — so without this a fifo in the state path hangs the poll
-    // itself, not just this read. On a regular file it is a no-op.
+    // O_NONBLOCK matters as much as O_NOFOLLOW: opening a FIFO blocks until a writer appears, before fstat can reject
+    // it, which would hang the poll.
     fd = fs.openSync(statePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const st = fs.fstatSync(fd);
     if (!st.isFile()) return null;
-    // A liveness marker is a few hundred bytes. Anything else is not one, and
-    // the poll must not be made to read it.
     if (st.size > 1_000_000) return null;
     return fs.readFileSync(fd, 'utf8');
   } catch {
@@ -453,7 +354,6 @@ function readContainedState(statePath: string): string | null {
   }
 }
 
-/** Whether the producer's own freshness stamp says this signal is live NOW. */
 function signalIsFresh(statePath: string, freshKey: string, maxAgeSeconds: number, now: number): boolean {
   const text = readContainedState(statePath);
   if (text === null) return false;
@@ -468,33 +368,18 @@ function signalIsFresh(statePath: string, freshKey: string, maxAgeSeconds: numbe
   if (typeof stamp !== 'string' || !ISO_STAMP.test(stamp)) return false;
   const at = Date.parse(stamp);
   if (!Number.isFinite(at)) return false;
-  // Open at the old end, closed at the new: exactly at the age limit the
-  // producer itself calls stale, so does this. A stamp in the future is a clock
-  // that disagrees, tolerated only as far as the skew window.
+  // Open at the old end, closed at the new, matching the producer's own staleness rule. A future stamp is tolerated
+  // only within the skew window.
   return at > now - maxAgeSeconds * 1000 && at <= now + SIGNAL_FUTURE_SKEW_MS;
 }
 
 /**
- * Per-room live-state indicators, install config only.
- *
- * A room name and the file a producer writes are both install identity, which
- * `check:public-boundary` rightly refuses to let live in trunk source — so the
- * binding is the operator's own untracked `.nanoclaw/office-signals.json`,
- * resolved the same repo-root-relative way `readOfficeThemes` resolves its own.
- *
- * The contract is TOTAL, and every branch of it matters:
- *
- * - no config file, unreadable, malformed JSON, or not an array → `undefined`,
- *   and the scene ships without a `signals` key at all — byte-identical to
- *   before this existed;
- * - an entry that fails the closed schema is dropped, the rest still render;
- * - a duplicate `room` is dropped, first binding wins;
- * - a `file` that escapes the workgroup directory by any route — absolute,
- *   `..`, or a symlink — drops the ENTRY rather than reading it;
- * - every surviving entry ALWAYS emits `{room, vignette, active}`. A missing,
- *   unreadable, or unparseable state file is `active: false`, never a throw and
- *   never a dropped entry: a bound room that is quiet is a fact, and it is a
- *   different fact from a room nobody bound.
+ * Per-room live-state indicators from the operator's untracked `.nanoclaw/office-signals.json` (room names and
+ * producer files are install identity, kept out of trunk).
+ * The contract is total: no/unreadable/malformed config → `undefined` and no `signals` key at all; an entry failing
+ * the closed schema or duplicating a `room` is dropped; a `file` escaping the workgroup directory by any route drops
+ * the entry; every surviving entry always emits `{room, vignette, active}`, with an unreadable state file meaning
+ * `active: false`, never a throw.
  */
 export function readWorkgroupSignals(
   workgroupId: string,
@@ -523,8 +408,7 @@ export function readWorkgroupSignals(
   try {
     workgroupDir = workgroupLegacyRoot(workgroupId, dataDir);
   } catch {
-    // An id that is not a single safe path segment never reaches a real
-    // workgroup directory, so there is nothing to read for it.
+    // An id that is not a single safe path segment cannot name a real workgroup directory.
     return undefined;
   }
 
@@ -546,14 +430,9 @@ export function readWorkgroupSignals(
 }
 
 /**
- * Whether the caller may see this workgroup at all — same scope predicate as
- * workgroups.ts's resolveWorkgroup, minus the "row exists" check (a
- * nonexistent workgroup id naturally yields empty query results below, so
- * there's no separate not-found branch to maintain).
- *
- * Exported for issue-brief.ts, whose endpoint takes the same `workgroup` query
- * value and must refuse it on the same predicate before it touches that
- * workgroup's board or its scoped GitHub token.
+ * Same scope predicate as workgroups.ts's resolveWorkgroup, minus the existence check (an unknown id yields empty
+ * results anyway). issue-brief.ts must refuse on this same predicate before touching the workgroup's board or its
+ * scoped GitHub token.
  */
 export async function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): Promise<boolean> {
   if (ctx.scopes.no_filter) return true;
@@ -570,17 +449,9 @@ export async function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequest
 const LOCATION_WINDOW_MS = 8 * 60 * 60 * 1000;
 
 /**
- * How recently a room session must have spoken for the agent to read as
- * WORKING there — see ObservatoryAgent.active.
- *
- * Picked off the live cadence, not a round number: inside a session that is
- * genuinely mid-turn, consecutive `messages_out` rows land seconds to ~2
- * minutes apart (status narration plus chat), so 10 minutes is five times the
- * observed live gap and never blinks an agent off mid-task. It is also
- * strictly tighter than the host's own two "this is over" clocks —
- * CHAT_IDLE_REAP_MS (15m) and ABSOLUTE_CEILING_MS (30m) — so the floor can
- * never claim someone is working in a room the host is about to reap them out
- * of.
+ * How recently a room session must have spoken for the agent to read as working there. 10 minutes is about five times
+ * the observed gap between outbound rows mid-turn, and tighter than CHAT_IDLE_REAP_MS (15m) and ABSOLUTE_CEILING_MS
+ * (30m), so the floor never shows someone working in a room the host is about to reap.
  */
 const WORKING_WINDOW_MS = 10 * 60 * 1000;
 
@@ -607,11 +478,8 @@ interface WiringRow {
 }
 
 /**
- * Platform allow-list for a workgroup's floor, declared as
- * `observatory.platforms` on any one member's container.json (same
- * one-declaration convention as backlogCanvas). Lets a workgroup that lives on
- * Slack hide dormant wiring on another platform without un-wiring it. Absent =
- * every platform shows.
+ * Platform allow-list from `observatory.platforms` on any one member's container.json; absent means every platform
+ * shows.
  */
 async function observatoryHiddenRooms(workgroupId: string): Promise<string[]> {
   const members = await getDb().all<{ folder: string }>(
@@ -646,16 +514,8 @@ async function observatoryPlatforms(workgroupId: string): Promise<string[] | nul
 }
 
 /**
- * Rooms are WORKING ROOMS. Two things get filtered off the floor:
- *
- * - **Direct messages.** A 1:1 conversation is not a place the team works; it
- *   is a private line. Slack DM ids carry a `D` in the channel segment, which
- *   is how the platform itself distinguishes them.
- * - **Anything explicitly hidden** via `observatory.hideRooms`. The live case
- *   is a Slack CANVAS whose backing object the API reports as
- *   `is_channel: true` (with no member count) — it renders as a tab inside
- *   another channel, so it looks like a room to the API and like a document
- *   to the humans. Trust the humans.
+ * Filtered off the floor: DMs (Slack DM ids carry a `D` in the channel segment) and anything in
+ * `observatory.hideRooms`, e.g. a Slack canvas the API reports as `is_channel: true`.
  */
 export function isNotARoom(platformId: string, hidden: string[]): boolean {
   if (hidden.includes(platformId)) return true;
@@ -665,15 +525,10 @@ export function isNotARoom(platformId: string, hidden: string[]): boolean {
 }
 
 /**
- * Channel-level permalink for a room, resolved through the adapter that owns
- * its platform. Null when the adapter is absent or has no channelPermalink() —
- * an adapter must never fail the caller, and a fabricated URL is worse than
- * none.
- *
- * `channelPermalink`, NOT `permalink(platformId, null)`: `permalink` addresses
- * a THREAD and declines a null thread id by contract (slackPermalink's own
- * test asserts it), so asking it for a room link returned null on every room
- * of every floor — which is why "answer in #dispatch" rendered as dead text.
+ * Channel-level permalink via the owning adapter; null when it cannot build one (a fabricated URL is worse than
+ * none).
+ * `channelPermalink`, NOT `permalink(platformId, null)`: `permalink` addresses a thread and declines a null thread id
+ * by contract.
  */
 export function roomPermalink(platform: string, platformId: string): string | null {
   try {
@@ -684,19 +539,10 @@ export function roomPermalink(platform: string, platformId: string): string | nu
 }
 
 /**
- * Channel types that could own this thread, best first.
- *
- * A thread id's prefix is the bare PLATFORM (`slack:C0AAA:171…`), which is a
- * registered adapter key only in a single-workspace install. This install
- * registers per-workspace types (`slack-acme`, `slack-acme-support`, …), so
- * the bare prefix matched nothing and every genuine Slack thread resolved
- * to null. `messaging_groups` already carries the mapping — the
- * thread's channel is one row's `platform_id` — so ask it, and keep the bare
- * prefix as the last candidate for installs where it IS the key.
- *
- * All rows for one `platform_id` are the same workspace (channel ids don't
- * collide across workspaces), so which sibling type wins doesn't change the
- * resulting link — only whether the owning adapter happens to be online.
+ * Channel types that could own this thread, best first. The thread id prefix is the bare platform, which is an
+ * adapter key only in a single-workspace install; per-workspace types (`slack-acme`, …) are looked up via
+ * `messaging_groups`, with the bare prefix as the last candidate. Rows for one `platform_id` are one workspace, so
+ * which sibling type wins does not change the link.
  */
 async function threadChannelTypes(threadId: string): Promise<string[]> {
   const prefix = threadId.split(':')[0] ?? '';
@@ -713,10 +559,8 @@ async function threadChannelTypes(threadId: string): Promise<string[]> {
 }
 
 /**
- * Permalink for a claim's thread, or null when no online adapter can build one
- * exactly. Exported: the claims board and the nudge write path must link to the
- * same place. Never throws — a dead link is worse than none, and a blank scene
- * is worse than both.
+ * Permalink for a claim's thread, or null when no online adapter can build one exactly. The claims board and the
+ * nudge write path must link to the same place. Never throws.
  */
 export async function threadPermalink(threadId: string): Promise<string | null> {
   const platformId = await threadPlatformId(threadId);
@@ -732,21 +576,8 @@ export async function threadPermalink(threadId: string): Promise<string | null> 
 }
 
 /**
- * A thread id → the `messaging_groups.platform_id` key of the CHANNEL it lives in.
- *
- * The old body here was `slice(0, 2)`, which is true for Slack
- * (`slack:<channel>:<ts>`) and false for Discord, where a channel is
- * `discord:<guild>:<channel>` and the two-segment slice yields the GUILD.
- * That matched no row, so every caller below silently resolved a Discord
- * thread to nothing — 216 of the 1035 "no deliverable target" warnings in one
- * log were a single Discord claim retrying forever.
- *
- * `threadChannelKey` (threads.ts) already answers exactly this question for the
- * display side, including the `EXTRA_SEGMENT_PLATFORMS` rule DESIGN.md §3.2
- * documents. Delegate to it rather than keep a second copy: two answers to
- * "what channel does this thread belong to" is how the board and the delivery
- * path drift apart, and the display side is where the rule is already tested.
- * The wired platform ids are the authority it prefers, so pass them in.
+ * Delegates to `threadChannelKey` so the board and the delivery path share one answer: a two-segment slice yields the
+ * GUILD for Discord (`discord:<guild>:<channel>`) and matches nothing.
  */
 export async function threadPlatformId(threadId: string): Promise<string> {
   let known: Set<string> | undefined;
@@ -802,14 +633,8 @@ async function buildRooms(
   for (const room of byPlatformId.values()) {
     const mgIds = [...room.messagingGroupIds];
     const placeholders = mgIds.map(() => '?').join(', ');
-    // Ordered by `datetime(...)`, NOT by `MAX(last_outbound_at)`. The column is
-    // TEXT, so MAX() is a byte comparison: space (0x20) sorts below 'T' (0x54),
-    // which means a naive `2026-08-20 23:00:00` loses to an ISO
-    // `2026-08-20T07:00:00.000Z` — eleven at night ranking below seven in the
-    // morning on the same date. Harmless only while every stored value shares
-    // one shape, which is luck rather than a guarantee: any writer using
-    // `datetime('now')` reintroduces the naive form and silently re-breaks this.
-    // `datetime()` parses both shapes, so this stays correct by construction.
+    // Ordered by `datetime(...)`, NOT `MAX(last_outbound_at)`: the column is TEXT, and a naive `2026-08-20 23:00:00`
+    // sorts below an ISO `2026-08-20T07:00:00.000Z` byte-wise.
     const activityRow = await getDb().get<{ last: string | null }>(
       `SELECT last_outbound_at AS last FROM sessions
         WHERE messaging_group_id IN (${placeholders})
@@ -832,12 +657,8 @@ async function buildRooms(
 }
 
 /**
- * Persona name for the scene — resolveAssistantName is what wrote the claim
- * owners, so it's what `holding` must match against. `null` session context:
- * the observatory shows an agent generally, not scoped to one channel; the
- * operator-set `container_configs.assistant_name` override (which doesn't
- * need a session) is the common case in practice. A resolution failure must
- * never blank the scene — log and fall back to the infrastructure name.
+ * resolveAssistantName is what wrote the claim owners, so `holding` must match against it. `null` session context:
+ * the scene shows an agent generally, not per channel. A resolution failure falls back to the infrastructure name.
  */
 async function resolvePersonaName(
   agentGroup: AgentGroup,
@@ -855,10 +676,7 @@ async function resolvePersonaName(
   }
 }
 
-/**
- * Persona name for an agent group with nothing pre-loaded — same resolution
- * the scene uses, for callers (the assign endpoint) that hold only the DB row.
- */
+/** Same persona resolution as the scene, for callers that hold only the DB row. */
 export async function personaName(agentGroup: AgentGroup): Promise<string> {
   return resolvePersonaName(agentGroup, readContainerConfig(agentGroup.folder), defaultDeps);
 }
@@ -878,12 +696,8 @@ async function buildAgents(
       const sessions = await getSessionsByAgentGroup(row.id);
       const awake = sessions.some((s) => activeSessionIds.has(s.id));
 
-      // Two separate trackers on purpose. lastSeenAt is "last spoke anywhere",
-      // including task sessions with no destination room. location is a PLACE,
-      // so only sessions carrying a messaging group count — otherwise an
-      // agent whose newest outbound is a room-less task session gets pulled to
-      // its desk while its real in-room activity is minutes old (observed live:
-      // a 01:25 task outbound shadowing a 00:54 #dispatch post).
+      // Two separate trackers on purpose: lastSeenAt is "last spoke anywhere", including room-less task sessions;
+      // location is a PLACE, so only sessions with a messaging group count.
       let mostRecentAt: string | null = null;
       let mostRecentSessionId: string | null = null;
       let mostRecentMs = -Infinity;
@@ -915,8 +729,6 @@ async function buildAgents(
           : null;
       const active = awake && location !== null && nowMs - roomMs <= WORKING_WINDOW_MS;
 
-      // Same window and same winning session as `location` — this just also
-      // carries the thread link, so a caller doesn't have to re-derive it.
       const linkForThread = deps.resolveThreadUrl ?? threadPermalink;
       const liveSession =
         location && roomSessionId
@@ -934,8 +746,6 @@ async function buildAgents(
 
       const holding = claims.filter((c) => ownerMatchesAgent(c.owner, { name, folder: row.folder })).map((c) => c.slug);
 
-      // The agent's face: its own bot's Slack avatar, found via whichever of
-      // its wired channel types carries a registered identity with an image.
       const lookup = deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
       const channelTypes = await getDb().all<{ channel_type: string }>(
         `SELECT DISTINCT mg.channel_type FROM messaging_group_agents mga
@@ -970,19 +780,9 @@ async function buildAgents(
 }
 
 /**
- * Fill in each claim's `sessionId` in place, once the agents are known.
- *
- * A claim records a THREAD; sessions are keyed by (agent_group,
- * messaging_group, thread), so a thread names more than one session whenever
- * siblings sit in the same room. The OWNER's session wins — that is the
- * conversation the claim is a claim on. Failing that (owner unresolved, or
- * holding nothing on this thread) the session that most recently SPOKE there
- * stands in: reading a sibling's copy of the room beats reading nothing, and
- * the one that said the last thing holds the most of the room. Same
- * `last_outbound_at` recency `location` and `liveSession` are picked by.
- *
- * Mutates rather than re-maps because `buildAgents` already consumed the claim
- * array to compute `holding`, and that join is exactly what names the owner.
+ * Fills each claim's `sessionId` in place. Siblings in one room each have a session on the thread; the OWNER's
+ * session wins, else the one that most recently spoke there. Mutates because `buildAgents` already consumed the array
+ * to compute `holding`.
  */
 async function attachClaimSessions(
   workgroupId: string,
@@ -1030,26 +830,18 @@ async function attachClaimSessions(
 
 export interface ObservatoryDeps {
   getActiveContainerSessionIds: () => string[];
-  /** Injected claims root for tests; defaults to readClaims' own live claimsBaseDir(). */
   claimsRoot?: string;
-  /** Injected groups dir for tests; defaults to the live GROUPS_DIR. */
   groupsDir?: string;
   resolveAssistantName: (
     agentGroup: AgentGroup,
     containerConfig: ContainerConfig,
     sessionMessagingGroupId: string | null,
   ) => Promise<string>;
-  /** Bot avatar by channel type — defaults to the live Slack bot registry. Injected so tests never need an adapter. */
   avatarByChannelType?: (channelType: string) => string | null;
-  /** Thread-id → permalink; defaults to resolving through the owning channel adapter. */
   resolveThreadUrl?: (threadId: string) => string | null | Promise<string | null>;
-  /** Platform allow-list override for tests; defaults to the workgroup's declared observatory.platforms. */
   platforms?: string[] | null;
-  /** Explicitly hidden room ids; defaults to the workgroup's declared observatory.hideRooms. */
   hiddenRooms?: string[];
-  /** Themed-floor slot bindings, injected for tests; defaults to the live readOfficeThemes(). */
   themedSlots?: Record<string, string>;
-  /** Room signals, injected for tests; defaults to the live readWorkgroupSignals(). */
   signals?: ObservatorySignal[] | undefined;
 }
 
@@ -1059,15 +851,13 @@ export async function buildObservatoryScene(
   workgroupId: string,
   deps: ObservatoryDeps = defaultDeps,
 ): Promise<ObservatoryScene> {
-  // deps.claimsRoot undefined → readClaims falls back to its own live claimsBaseDir().
   const rawClaims =
     deps.claimsRoot !== undefined
       ? readClaims(workgroupId, Date.now(), deps.claimsRoot)
       : readClaims(workgroupId, Date.now());
 
-  // Every claim carries a link back to the thread it was worked in. A claim's
-  // thread_id already encodes its channel type + channel + ts, so the adapter
-  // that owns that platform resolves it — one hop, no extra state.
+  // A claim's thread_id encodes channel type, channel and ts, so the owning adapter resolves the link with no extra
+  // state.
   const linkFor = deps.resolveThreadUrl ?? threadPermalink;
   const claims: ObservatoryClaim[] = await Promise.all(
     rawClaims.map(async (c) => ({

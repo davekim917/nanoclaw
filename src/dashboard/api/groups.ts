@@ -1,13 +1,7 @@
 /**
- * GET /dashboard/api/groups — list agent groups visible to the caller.
- *
- * Owners and global admins (`ctx.scopes.no_filter === true`) see every row in
- * `agent_groups`. Scoped admins and members see only the groups enumerated in
- * `ctx.scopes.allowed_group_ids`. Out-of-scope ids are not leaked.
- *
- * `workgroup_id` rides along so the SPA can resolve a selected workgroup to its
- * siblings client-side without a second round trip — the Schedule lens filters
- * its rows on `agent_group_id` and needs that mapping.
+ * GET /dashboard/api/groups: agent groups visible to the caller. `no_filter` callers see every row; scoped callers
+ * only `allowed_group_ids`. `workgroup_id` rides along so the client can resolve a workgroup's siblings without a
+ * second request.
  */
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
@@ -16,7 +10,6 @@ import type { AuthHandler } from '../router.js';
 interface GroupRow {
   id: string;
   name: string;
-  /** The workgroup this sibling belongs to — the console's primary filter axis. */
   workgroup_id: string | null;
 }
 

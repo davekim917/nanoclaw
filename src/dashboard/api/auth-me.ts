@@ -12,5 +12,4 @@ export const authMeHandler: AuthHandler = async (_req, _params, ctx) => {
   });
 };
 
-// Side-effect registration
 register('GET', '/dashboard/api/auth/me', requireAuth(authMeHandler));
