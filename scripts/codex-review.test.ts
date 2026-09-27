@@ -2648,7 +2648,9 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stderr).toContain(FAIL_REPORT);
       expect(result.stderr).toContain(`merge=refused head=${HEAD}: comment_rule:`);
       expect(result.stdout).not.toMatch(/merge=(allowed|defer)/);
-      expect(result.calls).toContain(`git fetch -q --no-tags --depth=1 --filter=blob:none origin ${MERGE_BASE} ${HEAD}\n`);
+      expect(result.calls).toContain(
+        `git fetch -q --no-tags --depth=1 --filter=blob:none origin ${MERGE_BASE} ${HEAD}\n`,
+      );
       expect(result.calls).toContain(`git commit-tree ${HEAD}^{tree} -p ${MERGE_BASE} -m ${HEAD}\n`);
       expect(result.calls).toMatch(
         new RegExp(`comment-rule check --repo \\S+ --base ${MERGE_BASE} --head ${COMMENT_RULE_HEAD}\\n`),
@@ -2691,8 +2693,16 @@ describe('codex-review risk-scoped review requests', () => {
     });
 
     it.each([
-      ['the checker is not installed', { CLAUDE_PLUGINS_ROOT: '/nonexistent', HOME: '/nonexistent' }, 'run `git -C ~/plugins/bootstrap pull --ff-only`'],
-      ['the checker cannot judge the change', { MOCK_COMMENT_RULE_STATUS: '2' }, 'gave no verdict (exit 2); when the report says typescript was not found, run `npm ci --ignore-scripts`'],
+      [
+        'the checker is not installed',
+        { CLAUDE_PLUGINS_ROOT: '/nonexistent', HOME: '/nonexistent' },
+        'or `git clone https://github.com/davekim917/bootstrap ~/plugins/bootstrap` when there is no checkout',
+      ],
+      [
+        'the checker cannot judge the change',
+        { MOCK_COMMENT_RULE_STATUS: '2' },
+        'gave no verdict (exit 2); when the report says typescript was not found, run `npm ci --ignore-scripts`',
+      ],
       ['the checker crashes', { MOCK_COMMENT_RULE_STATUS: '139' }, 'gave no verdict (exit 139)'],
       ['the fetch fails', { MOCK_GIT_FETCH_STATUS: '128' }, 'could not fetch'],
     ])('fails closed when %s', (_case, env, message) => {

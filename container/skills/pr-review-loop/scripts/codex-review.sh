@@ -668,7 +668,7 @@ comment_rule_checker() {
 comment_rule_run() {
   local checker merge_base head
   checker=$(comment_rule_checker) || {
-    echo "the comment-rule checker is not installed: no $COMMENT_RULE_CHECKER under \$CLAUDE_PLUGINS_ROOT or ~/plugins; on the host, run \`git -C ~/plugins/bootstrap pull --ff-only\`"
+    echo "the comment-rule checker is not installed: no $COMMENT_RULE_CHECKER under \$CLAUDE_PLUGINS_ROOT or ~/plugins; on the host, run \`git -C ~/plugins/bootstrap pull --ff-only\`, or \`git clone https://github.com/davekim917/bootstrap ~/plugins/bootstrap\` when there is no checkout"
     return 2
   }
   command -v node >/dev/null 2>&1 || { echo "the comment-rule checker needs node on PATH"; return 2; }
