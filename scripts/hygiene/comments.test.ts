@@ -59,6 +59,12 @@ describe('comment scan flags', () => {
     expect(rules(source).map(([, found]) => found)).toContain(rule);
   });
 
+  it('scans a multi-line block that starts with a directive', () => {
+    expect(rules('/* eslint-disable no-console\n * fixed in #123\n */\nconsole.log(1);\n')).toEqual([
+      [2, 'pr-history'],
+    ]);
+  });
+
   it('reports every offending line of a multi-line comment at its own line', () => {
     const source = 'export const a = 1;\n/**\n * See x.ts:1.\n * Fixed in #12.\n */\nexport const b = 2;\n';
     expect(rules(source)).toEqual([
@@ -161,10 +167,12 @@ describe('comment-only line count', () => {
     expect(count(source)).toBe(0);
   });
 
-  it('counts nothing for a JSX pragma', () => {
-    const source =
-      '/** @jsxImportSource preact */\n/** @jsx h */\n/** @jsxFrag Fragment */\n// @jsxRuntime classic\nexport const a = 1;\n';
-    expect(count(source, 'fixture.tsx')).toBe(0);
+  it('counts every line of a multi-line block that starts with a directive', () => {
+    expect(count('/* eslint-disable no-console\n * narration about the code\n */\nconsole.log(1);\n')).toBe(3);
+  });
+
+  it('keeps a single-line directive with its reason exempt', () => {
+    expect(count('// eslint-disable-next-line no-console -- the CLI prints\nconsole.log(1);\n')).toBe(0);
   });
 
   it('counts nothing for a shebang', () => {

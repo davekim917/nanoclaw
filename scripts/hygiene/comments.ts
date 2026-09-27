@@ -11,7 +11,7 @@ interface CommentFinding {
 // Checked before the directive exemption: knip honours these tags even inside an eslint-disable comment.
 const SUPPRESSION = /jscpd:ignore-|@(?:public|internal|beta|alias|lintignore)(?![A-Za-z0-9_])/;
 const DIRECTIVE =
-  /^(?:eslint-disable|eslint-enable|@ts-expect-error|@ts-ignore|@ts-nocheck|@ts-check|<reference\b|@jsx(?:ImportSource|Runtime|Frag)?\b|prettier-ignore|c8 ignore)/;
+  /^(?:eslint-disable|eslint-enable|@ts-expect-error|@ts-ignore|@ts-nocheck|@ts-check|<reference\b|prettier-ignore|c8 ignore)/;
 const PR_HISTORY = /(?<!&)#\d+\b|\bPR\s?\d+\b/;
 
 // `<name>:<digits>`, excluding a version such as `image:1.3.14`.
@@ -78,7 +78,7 @@ export function scanComments(fileName: string, text: string): CommentScan {
   const commentLines = new Set<number>();
   for (const range of ranges) {
     const comment = text.slice(range.pos, range.end);
-    const isDirective = DIRECTIVE.test(comment.replace(/^\/[/*]+\s*/, ''));
+    const isDirective = !comment.includes('\n') && DIRECTIVE.test(comment.replace(/^\/[/*]+\s*/, ''));
     const firstLine = sourceFile.getLineAndCharacterOfPosition(range.pos).line + 1;
     comment.split('\n').forEach((lineText, offset) => {
       if (!isDirective) commentLines.add(firstLine - 1 + offset);
