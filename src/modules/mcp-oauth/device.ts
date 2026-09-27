@@ -1,17 +1,7 @@
 /**
- * Device authorization grant (RFC 8628) — the flow designed for exactly this
- * situation: the machine running the client has no browser.
- *
- * NOT THE DEFAULT, and the reason is discovery, not preference. RFC 8628 §4
- * puts the endpoint in authorization-server metadata as
- * `device_authorization_endpoint`, and neither first target publishes one:
- * Amplitude's metadata does not list the grant at all, and Dropbox's lists
- * `device_code` in `grant_types_supported` while publishing no endpoint to
- * start it at (verified 2026-09-17 against
- * https://www.dropbox.com/.well-known/oauth-authorization-server). So `--device`
- * refuses with that fact rather than guessing a URL, unless the operator supplies
- * `--device-endpoint`. When a server does publish one, this is the nicest flow
- * on an ssh session: no tunnel, no paste, no redirect at all.
+ * Device authorization grant (RFC 8628), opt-in. Servers rarely publish
+ * `device_authorization_endpoint` in their metadata, so `--device` refuses
+ * rather than guessing a URL unless `--device-endpoint` is supplied.
  */
 import { assertHttpsEndpoint, type FetchLike } from './discovery.js';
 import { OAuthTokenError, type TokenResponse } from './oauth-client.js';
@@ -67,8 +57,7 @@ export async function requestDeviceAuthorization(
   return {
     deviceCode: parsed.device_code,
     userCode: parsed.user_code,
-    // Printed for a human to open, so it is held to the same bar as a URL this
-    // host would fetch — see `assertHttpsEndpoint`'s note on the one gate.
+    // Printed for a human to open, so held to the same HTTPS bar as a fetched URL.
     verificationUri: assertHttpsEndpoint('verification_uri', verificationUri),
     verificationUriComplete:
       typeof parsed.verification_uri_complete === 'string'
@@ -80,20 +69,16 @@ export async function requestDeviceAuthorization(
   };
 }
 
-/** Injected so the polling test does not spend real seconds sleeping. */
+/** Injected so tests do not sleep for real. */
 export type Sleep = (ms: number) => Promise<void>;
 
 const realSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Poll the token endpoint until the human approves (RFC 8628 §3.4-3.5).
- *
- * The two non-terminal codes are the whole point of the loop:
- * `authorization_pending` means keep waiting at the current interval, and
- * `slow_down` means the server wants the interval increased by five seconds
- * permanently — treating either as a failure would abandon a login the operator
- * is in the middle of completing. Everything else, including `access_denied`
- * and `expired_token`, is terminal.
+ * `authorization_pending` keeps waiting and `slow_down` adds five seconds for
+ * good — treating either as failure would abandon a login in progress.
+ * Everything else, including `access_denied` and `expired_token`, is terminal.
  */
 export async function pollDeviceToken(
   fetchImpl: FetchLike,
@@ -138,8 +123,7 @@ export async function pollDeviceToken(
     try {
       parsed = JSON.parse(text) as Record<string, unknown>;
     } catch {
-      // Same rule as the other token path: an unparseable error body is never
-      // echoed, because it can contain what was sent to it.
+      // An unparseable error body is never echoed: it can contain what was sent.
     }
 
     if (res.ok) {

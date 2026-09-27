@@ -1,14 +1,9 @@
 /**
  * The OAuth 2.0 half of an MCP "connect": dynamic client registration
- * (RFC 7591), the authorization-code request with PKCE (RFC 6749 §4.1,
- * RFC 7636), and the two token-endpoint grants.
+ * (RFC 7591), the PKCE authorization-code request, and the token grants.
  *
- * Every function takes an injected fetch so the whole flow is testable without
- * a network. Plain `fetch` is what the host uses for outbound HTTPS elsewhere
- * (`src/github-app-token.ts`); it does NOT traverse the OneCLI gateway
- * proxy, because `NODE_USE_ENV_PROXY` is stripped from the daemon env (see
- * `src/onecli-secrets.ts`). That matters
- * here: a token request routed through the gateway would have the dead bearer
+ * Plain host `fetch` does NOT traverse the OneCLI gateway proxy, which matters:
+ * a token request routed through the gateway would get the dead bearer
  * injected over its own Authorization header.
  */
 import type { FetchLike } from './discovery.js';
@@ -33,11 +28,8 @@ export interface TokenResponse {
 }
 
 /**
- * An error the token endpoint reported in the RFC 6749 §5.2 shape, with the
- * machine-readable `error` code preserved. The refresher keys on
- * `invalid_grant` to decide "this refresh token is dead, stop retrying" versus
- * "something transient, try again next tick", so the code has to survive the
- * trip rather than being flattened into a message.
+ * A token-endpoint error (RFC 6749 §5.2) with its `error` code preserved: the
+ * refresher keys on `invalid_grant` to tell a dead refresh token from a transient failure.
  */
 export class OAuthTokenError extends Error {
   constructor(
@@ -59,9 +51,8 @@ export function isUnrecoverableGrantError(err: unknown): boolean {
 }
 
 /**
- * Dynamic client registration (RFC 7591). Public client by default: no
- * `client_secret` is requested, PKCE is the proof, and a secret we did not ask
- * for is still stored if the server insists on issuing one.
+ * Dynamic client registration (RFC 7591). Public client: PKCE is the proof, but
+ * a secret the server insists on issuing is still stored.
  */
 export async function registerClient(
   fetchImpl: FetchLike,
@@ -113,10 +104,8 @@ export interface AuthorizeUrlInput {
   /** RFC 8707 resource indicator; omitted when the resource metadata had none. */
   resource?: string;
   /**
-   * Escape hatch for a server that needs a non-standard parameter to issue a
-   * refresh token at all. Dropbox is the reason it exists: its authorize
-   * endpoint only returns one when `token_access_type=offline` is present, and
-   * nothing in its metadata says so.
+   * Non-standard authorize parameters, for a server that issues a refresh token
+   * only when asked (e.g. `token_access_type=offline`) without saying so in metadata.
    */
   extraParams?: Record<string, string>;
 }
@@ -137,14 +126,9 @@ export function buildAuthorizeUrl(input: AuthorizeUrlInput): string {
 }
 
 /**
- * Pull `code` and `state` out of whatever the operator pasted back — a whole
- * redirect URL from the browser's address bar, or a bare `?code=…&state=…`
- * query string, or just the code.
- *
- * The redirect target is a loopback address on the OPERATOR's machine that
- * nothing is listening on, so their browser shows a connection error and the
- * address bar is the only place the code exists. Accepting the full URL means
- * they copy one thing instead of reading a parameter out of it.
+ * Pull `code` and `state` out of what the operator pasted back: the whole
+ * redirect URL from the address bar (the loopback target fails to load on
+ * their machine), a bare query string, or just the code.
  */
 export function parseRedirectResponse(pasted: string): {
   code?: string;
@@ -155,13 +139,8 @@ export function parseRedirectResponse(pasted: string): {
   const trimmed = pasted.trim();
   const queryStart = trimmed.indexOf('?');
   const candidate = queryStart >= 0 ? trimmed.slice(queryStart + 1) : trimmed;
-  // A BARE CODE IS NOT A QUERY STRING, even when it contains `=`. The old test
-  // was `trimmed.includes('=')`, which mis-read any base64 code carrying its
-  // padding (`…Ab9==`) as a parameter list: `URLSearchParams` then yields a
-  // parameter NAMED after the code, `code` is absent, and the operator is told
-  // "No authorization code found in the pasted value" about a code that is
-  // right there. Decide on the presence of a parameter this flow actually
-  // uses instead — those names cannot appear in a bare token by accident.
+  // A BARE CODE IS NOT A QUERY STRING, even with `=` in it (base64 padding):
+  // decide on the presence of a parameter this flow actually uses.
   if (!/(^|&)(code|state|error|error_description)=/.test(candidate)) {
     return { code: trimmed || undefined };
   }
@@ -188,9 +167,8 @@ async function postToken(fetchImpl: FetchLike, tokenEndpoint: string, form: URLS
   try {
     parsed = JSON.parse(text) as Record<string, unknown>;
   } catch {
-    // Left empty: a non-JSON body is reported through the status path below,
-    // and its text is NOT echoed — a token endpoint's error body can contain
-    // the credential that was sent to it.
+    // A non-JSON body goes through the status path below, and its text is NOT
+    // echoed: a token endpoint's error body can contain the credential sent to it.
   }
   if (!res.ok) {
     const code = typeof parsed.error === 'string' ? parsed.error : `http_${res.status}`;
@@ -250,9 +228,8 @@ export async function refreshAccessToken(
     client_id: input.clientId,
   });
   if (input.clientSecret) form.set('client_secret', input.clientSecret);
-  // RFC 6749 §6 allows narrowing scope on refresh but never widening. Sending
-  // the scopes the grant already has is a no-op for a server that honours it
-  // and is required by servers that treat an omitted scope as "none".
+  // Re-send the scopes the grant already has: never widening (RFC 6749 §6), and
+  // some servers read an omitted scope as "none".
   if (input.scopes) form.set('scope', input.scopes);
   if (input.resource) form.set('resource', input.resource);
   return postToken(fetchImpl, input.tokenEndpoint, form);

@@ -2,39 +2,15 @@
  * Host-side OAuth bundle store — the ONE place refresh tokens and client
  * secrets live.
  *
- * WHY NOT ONECLI. The stated model for this install is "secrets live in the
- * OneCLI vault" (CLAUDE.md, Secrets / Credentials / OneCLI), and that is still
- * true for the value a CONTAINER consumes: the access token goes into a OneCLI
- * header-injection secret and is never handed to the agent directly. But the
- * refresher has to READ its refresh token back on every cycle, and
- * `onecli@1.4.1`'s gateway API is write-only for secret values — verified
- * 2026-09-17 against the live gateway: `POST /api/secrets` → 201,
- * `PATCH /api/secrets/{id}` → 200, `DELETE /api/secrets/{id}` → 204,
- * `GET /api/secrets?limit=…` returns metadata with no value field, and
- * `GET /api/secrets/{id}`, `…/value`, `…/reveal`, `?reveal=true` and
- * `?include=value` all 404 or return the same value-free listing. A refresh
- * token parked in OneCLI could be written and never read, which is the same as
- * not having one.
+ * Not OneCLI: the refresher must READ its refresh token back every cycle, and
+ * the OneCLI gateway API is write-only for secret values (onecli@1.4.1). Same
+ * shape as the GitHub App private key: a long-lived minting credential held by
+ * the HOST. No container sees these files — `mcp-oauth/` is not among the
+ * `DATA_DIR` subpaths that are mounted.
  *
- * SO IT LIVES HERE, and the precedent is exact: the GitHub App PRIVATE KEY
- * already sits on this host's filesystem at `GITHUB_APP_PRIVATE_KEY_PATH`, read
- * by the host to mint short-lived installation tokens
- * (`src/github-app-token.ts`). This store is that same shape — a long-lived
- * minting credential the HOST holds, producing a short-lived credential the
- * container gets. The invariant that matters is unchanged: no container ever
- * sees either file. `DATA_DIR` itself is never bind-mounted; only named
- * subpaths under it are (see the mount builders in `src/container-runner.ts`),
- * and `mcp-oauth/` is not one of them.
- *
- * WHAT IS NOT HERE: the ACCESS token. The exception this file represents is
- * narrow — the credentials needed to MINT the next bearer, and nothing else. The
- * bearer itself lives only in OneCLI, where the gateway injects it, so a read of
- * this directory yields the means to ask for a token and never a token that
- * works right now.
- *
- * Mode 0700 on the directory and 0600 on each file, written through a
- * same-directory temp file and `rename` so a crash mid-write cannot leave a
- * truncated bundle where a valid one was.
+ * The ACCESS token is never stored here, only in OneCLI, so this directory
+ * yields the means to ask for a token, never a working one. Mode 0700/0600,
+ * written via same-directory temp file + `rename` so a crash cannot truncate a bundle.
  */
 import fs from 'fs';
 import path from 'path';
@@ -42,7 +18,7 @@ import path from 'path';
 import { DATA_DIR } from '../../config.js';
 
 export interface McpOAuthBundle {
-  /** Integration name — the row key in `mcp_oauth_integrations`. */
+  /** The row key in `mcp_oauth_integrations`. */
   name: string;
   clientId: string;
   /** Absent for a public client (`token_endpoint_auth_method: none`). */
@@ -54,11 +30,7 @@ export interface McpOAuthBundle {
     startedAt: string;
   };
   refreshToken?: string;
-  /**
-   * Set when the authorization server rejected this registration
-   * (`invalid_client` / `unauthorized_client`). A rejected client id is not
-   * reusable, so the next `login` must register a new one rather than replay it.
-   */
+  /** Set when the AS rejected this registration; the next `login` must register a new client. */
   clientRejectedAt?: string;
   scopes?: string;
   updatedAt: string;
@@ -69,10 +41,8 @@ function mcpOAuthStoreDir(dataDir: string = DATA_DIR): string {
 }
 
 /**
- * Integration names are the file name, so they are constrained at the CLI
- * (`assertIntegrationName`) rather than escaped here — a name that reached
- * this function unchecked would be a path-traversal bug, not a formatting one,
- * so it throws instead of sanitizing.
+ * Names are constrained at the CLI rather than escaped here: an unchecked name
+ * would be a path-traversal bug, so this throws instead of sanitizing.
  */
 function bundlePath(name: string, dataDir: string): string {
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(name) || name.includes('..')) {
@@ -96,9 +66,7 @@ export function readMcpOAuthBundle(name: string, dataDir: string = DATA_DIR): Mc
 export function writeMcpOAuthBundle(bundle: McpOAuthBundle, dataDir: string = DATA_DIR): void {
   const dir = mcpOAuthStoreDir(dataDir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  // mkdirSync's `mode` is ignored for a directory that already exists, and the
-  // umask can have narrowed it further on create. An explicit chmod makes the
-  // 0700 true in both cases.
+  // `mode` is ignored for an existing directory and narrowed by umask on create.
   fs.chmodSync(dir, 0o700);
 
   const target = bundlePath(bundle.name, dataDir);
@@ -111,14 +79,10 @@ export function writeMcpOAuthBundle(bundle: McpOAuthBundle, dataDir: string = DA
   } catch (err) {
     try {
       fs.unlinkSync(tmp);
-    } catch {
-      // Best effort — the rename failure is the error worth reporting.
-    }
+    } catch {}
     throw err;
   }
-  // `writeFileSync`'s mode applies only when the temp file is CREATED; after a
-  // rename over an existing target the mode travels with the new inode, so this
-  // is belt-and-braces for a file whose predecessor was created differently.
+  // The temp file's mode applies only when it is created; belt-and-braces.
   fs.chmodSync(target, 0o600);
 }
 

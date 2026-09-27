@@ -1,28 +1,13 @@
 /**
- * Workgroup shared filesystem — "same house, own bedrooms".
+ * Workgroup shared filesystem: each workgroup's shared dirs live in
+ * `data/workgroups/<id>/`, bind-mounted into every member at `/workspace/workgroup`;
+ * each member keeps its private `/workspace/agent`.
  *
- * Consolidates each workgroup's shared directories out of the seed sibling's
- * group folder into a dedicated `data/workgroups/<workgroup_id>/` directory
- * that is bind-mounted into EVERY member's container at `/workspace/workgroup`
- * (container-runner). Each member keeps its private `/workspace/agent` (the
- * bedroom). See docs/specs/workgroup-shared-fs.md for the full design.
- *
- * Gated by the `WORKGROUP_SHARED_FS` flag (caller checks it). The migration is
- * the live-data move; it is idempotent (per-workgroup `.migrated` marker +
- * per-entry skip-if-exists), EXDEV-safe (rename within a filesystem, else
- * copy→verify→remove), reversible (the `.migrated` report records every move),
- * and conservative: it moves only PROVABLY-shareable dirs (top-level git repos
- * + `sources` + `conversations` + any dir a sibling already symlinks). Other
- * top-level dirs (and all loose files) are left in the seed bedroom and logged
- * as candidates for manual sharing — the migration never mis-moves an
- * ambiguous directory.
- *
- * After a move, the seed's old path and every sibling's old symlink become a
- * CONTAINER-ABSOLUTE compat symlink `<name> -> /workspace/workgroup/<name>`.
- * That dangles on the host (so container-runner's symlink-overlay skips it,
- * while host tooling reads the canonical data/workgroups root directly) but
- * resolves correctly inside the container via the mount, so
- * existing `/workspace/agent/<name>` reader paths keep working with no repoint.
+ * The migration moves only provably-shareable dirs (top-level git repos,
+ * `sources`, `conversations`, any dir a sibling already symlinks). A moved name
+ * becomes a CONTAINER-ABSOLUTE compat symlink `<name> -> /workspace/workgroup/<name>`:
+ * it dangles on the host (so the symlink overlay skips it) but resolves inside
+ * the container.
  */
 import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -33,12 +18,10 @@ import { DATA_DIR, GROUPS_DIR, WORKGROUP_SHARED_FS } from '../../config.js';
 import type { RawStatements } from '../../db/central-lease.js';
 import { log } from '../../log.js';
 
-/** Host path of a workgroup's shared directory. */
 export function workgroupSharedDir(workgroupId: string, dataDir: string = DATA_DIR): string {
   return path.resolve(dataDir, 'workgroups', workgroupId);
 }
 
-/** Container path the shared dir is mounted at. */
 export const WORKGROUP_CONTAINER_PATH = '/workspace/workgroup';
 export const WORKGROUP_MEMORY_CONTAINER_PATH = `${WORKGROUP_CONTAINER_PATH}/memory`;
 
@@ -68,38 +51,23 @@ export interface WorkgroupMemoryDirs {
   /** Restrict BOTH the report set and the mutations to these workgroups. */
   workgroupIds?: string[];
   /**
-   * Restrict only the MUTATIONS. Every workgroup still gets a report, built
-   * from the non-mutating inventory, so a caller that derives work from the
-   * report set keeps seeing all of them.
-   *
-   * This exists because the boot door may mutate only the workgroups it proved
-   * quiescent, while `src/main.ts` derives the pending-pre-turn-context targets
-   * and the migration-required operator warnings from the SAME reports. Scoping
-   * the report set to the changed workgroups would make an ordinary boot — one
-   * where nothing would change — skip both.
+   * Restrict only the MUTATIONS; every workgroup still gets a report. Boot may
+   * mutate only workgroups it proved quiescent, but derives other per-workgroup
+   * work from the SAME reports, so they must cover everyone.
    */
   mutateWorkgroupIds?: string[];
 }
 
 const MEMORY_MANIFEST = '.memory-migration.json';
 /**
- * The per-workgroup consolidation marker. Also the second half of the
- * `/workspace/workgroup` mount predicate in container-runner.ts: the mount is
- * made when `WORKGROUP_SHARED_FS` is set OR this file is present, so a
- * workgroup migrated before the flag was turned off keeps its mount.
+ * The per-workgroup consolidation marker. Also half of the `/workspace/workgroup`
+ * mount predicate: a workgroup migrated before the flag was turned off keeps its mount.
  */
 const MIGRATION_MARKER = '.migrated';
-// Canonical memory has its own lossless inventory/migration/reconciliation
-// lifecycle below. The older generic shared-directory migrator must never move,
-// adopt, repoint, or report this name, even during crash recovery.
-/** The workgroup's shared work-product directory, in the house rather than a bedroom. */
 export const SHARED_WORK_DIR_NAME = 'artifacts';
-// `memory` has its own lifecycle (above); `artifacts` is created empty and
-// ahead of the migrator by `ensureWorkgroupWorkDirs`, which breaks the move
-// loop's premise that a present `dst` is a COMPLETE one (the interrupted-move
-// branch at the `isRealDir(src)` arm deletes `src` on that basis). Reserving
-// the name keeps it out of every discovery source, including the wgDir
-// crash-recovery scan that would otherwise re-add it on every boot.
+// `memory` has its own lifecycle; `artifacts` is created empty ahead of the
+// migrator, which would read a present-but-empty `dst` as a completed move and
+// delete the seed's `src`. Reserved names are kept out of every discovery source.
 const RESERVED_SHARED_DIR_NAMES = new Set(['memory', SHARED_WORK_DIR_NAME]);
 const MEMORY_TEMPLATES_DIR = fileURLToPath(
   new URL('../../../container/agent-runner/src/memory/templates/', import.meta.url),
@@ -223,11 +191,9 @@ export function isExactShippedMemoryScaffold(memoryPath: string): boolean {
 }
 
 /**
- * Prepare one member's view of canonical memory.
- *
- * This is the only policy seam that may create a missing canon or replace an
- * exact shipped scaffold with the container-absolute compatibility link.
- * Substantive or ambiguous paths always require the operator migration.
+ * Prepare one member's view of canonical memory. The only seam that may create a
+ * missing canon or replace an exact shipped scaffold with the compat link;
+ * substantive or ambiguous paths require the operator migration.
  */
 export function prepareWorkgroupMemoryMember(
   member: { id: string; folder: string },
@@ -371,22 +337,10 @@ export function inspectWorkgroupMemoryState(
 }
 
 /**
- * Would `reconcileWorkgroupMemory` change anything for this workgroup?
- *
- * Pure. It re-reads exactly the `lstat` facts the reconcile acts on and
- * returns true when any of its mutations would fire: the canonical directory
- * being created, a member's local path not already being the exact
- * container-absolute compatibility link, `preferences/` being created, or the
- * `exact-empty`-with-no-members canon creation. `migration-required` reports
- * false — the reconcile skips those workgroups untouched, so nothing has to be
- * stopped for them.
- *
- * The boot quiescence door (src/container-restart.ts) uses this to decide
- * which workgroups' containers must be stopped before the cutover. Only the
- * member-symlink branch actually invalidates a live container's mount targets;
- * the predicate is deliberately a superset, because over-stopping is safe and
- * under-stopping is not. Its agreement with the reconcile's own `changed`
- * report is asserted over a fixture matrix in shared-dirs.wouldchange.test.ts.
+ * Would `reconcileWorkgroupMemory` change anything for this workgroup? Pure.
+ * The boot quiescence door uses it to pick which containers to stop; it is
+ * deliberately a superset of the real changes, because over-stopping is safe
+ * and under-stopping is not.
  */
 export function workgroupMemoryReconcileWouldChange(
   db: RawStatements,
@@ -399,7 +353,6 @@ export function workgroupMemoryReconcileWouldChange(
   if (before.status === 'migration-required') return false;
 
   const members = memoryMembers(db, workgroupId);
-  // reconcileWorkgroupMemory's own no-member canon creation (`:388-392`).
   if (before.status === 'exact-empty' && members.length === 0) return true;
 
   const canonical = workgroupMemoryDir(workgroupId, dataDir);
@@ -433,14 +386,9 @@ function linkMembersToCanonical(db: RawStatements, workgroupId: string, groupsDi
 }
 
 /**
- * Canonical-only automatic reconciliation. It may materialize a genuinely
- * empty/scaffold-only canon and compatibility links, but never imports or
- * replaces substantive provider-local bytes.
- *
- * Two selectors, and the difference matters: `workgroupIds` narrows the whole
- * pass (report and mutation), while `mutateWorkgroupIds` narrows only the
- * mutations and still reports every workgroup from the inventory. See
- * `WorkgroupMemoryDirs`.
+ * Canonical-only automatic reconciliation: may materialize an empty/scaffold-only
+ * canon and compat links, never imports or replaces substantive provider-local
+ * bytes. `mutateWorkgroupIds` narrows only mutations (see `WorkgroupMemoryDirs`).
  */
 export function reconcileWorkgroupMemory(db: RawStatements, dirs: WorkgroupMemoryDirs = {}): WorkgroupMemoryReport[] {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
@@ -458,9 +406,7 @@ export function reconcileWorkgroupMemory(db: RawStatements, dirs: WorkgroupMemor
       continue;
     }
     if (mutable && !mutable.has(id)) {
-      // Outside the quiesced scope: inventory only. `changed: false` is the
-      // truth here — nothing was written — and the report still reaches the
-      // callers that derive per-workgroup work from it.
+      // Outside the quiesced scope: inventory only, still reported.
       reports.push({ workgroupId: id, state: before, changed: false });
       continue;
     }
@@ -494,15 +440,9 @@ interface MigrationReport {
 
 /**
  * Consolidate every workgroup's shared dirs into `data/workgroups/<id>/`.
- * Idempotent + fail-closed: a per-workgroup failure throws so the caller
- * (src/index.ts) can `process.exit(1)` rather than spawn containers against a
- * half-migrated tree. Runs at startup only from inside a quiescence door
- * (docs/specs/upstream-restart-survival-seam/plan.md §4.2), so the containers
- * whose mounts this cutover invalidates are already stopped.
- *
- * `workgroupIds` narrows the pass to the named workgroups, the same selector
- * `reconcileWorkgroupMemory` already accepts, so the boot door can confine the
- * cutover to the workgroups it proved quiescent.
+ * Fail-closed: a per-workgroup failure throws so the caller exits rather than
+ * spawn containers against a half-migrated tree. Runs only inside the boot
+ * quiescence door, so containers whose mounts this invalidates are stopped.
  */
 export function reconcileWorkgroupSharedDirs(
   db: RawStatements,
@@ -527,11 +467,8 @@ interface SharedDirPlan {
 }
 
 /**
- * The consolidation set for one workgroup, computed without mutation.
- *
- * Discovery is shared by `migrateWorkgroup` and `sharedDirsReconcileWouldChange`
- * so the predicate cannot drift from the reconcile it predicts. Returns null
- * when there is no seed folder to consolidate.
+ * The consolidation set for one workgroup, computed without mutation. Shared
+ * by the migrator and its would-change predicate so the two cannot drift.
  */
 function planWorkgroupSharedDirs(
   db: RawStatements,
@@ -544,13 +481,11 @@ function planWorkgroupSharedDirs(
 
   const wgDir = path.join(dataDir, 'workgroups', workgroupId);
 
-  // Sibling folders in this workgroup (excluding the seed itself).
   const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
     folder: string;
   }>;
   const siblingFolders = members.map((m) => m.folder).filter((f) => f !== workgroupId);
 
-  // ── Compute the shared set ────────────────────────────────────────────────
   const shared = new Set<string>();
   const candidates: string[] = [];
   for (const entry of fs.readdirSync(seedDir, { withFileTypes: true })) {
@@ -587,15 +522,10 @@ function planWorkgroupSharedDirs(
     }
   }
 
-  // Crash recovery: any real dir already in wgDir was moved by a prior
-  // interrupted run. A crash AFTER the move but BEFORE the compat
-  // symlink/sibling-repoint would otherwise drop that name from the
-  // seed-derived set above (its source is already gone), orphaning the
-  // `/workspace/agent/<name>` path. Re-include it so the move loop finishes the
-  // cutover. Staging dirs are hidden (`.<name>.partial`) and shared dirs are
-  // never dot-named (both the seed scan and the sibling union exclude dot dirs),
-  // so the single dotfile skip cleanly excludes incomplete copies WITHOUT
-  // excluding a real shared dir whose name happens to end in `.partial`.
+  // Crash recovery: a real dir already in wgDir was moved by an interrupted run
+  // whose source is gone; re-include it so the cutover finishes. Staging dirs are
+  // dot-named (`.<name>.partial`) and shared dirs never are, so the dotfile skip
+  // excludes incomplete copies only.
   try {
     for (const e of fs.readdirSync(wgDir, { withFileTypes: true })) {
       if (e.isDirectory() && !e.name.startsWith('.') && !RESERVED_SHARED_DIR_NAMES.has(e.name)) {
@@ -614,13 +544,8 @@ function planWorkgroupSharedDirs(
 }
 
 /**
- * Would `reconcileWorkgroupSharedDirs` change anything for this workgroup?
- *
- * Pure, and a mirror of `migrateWorkgroup`'s `changed` decision: it shares the
- * discovery pass above and then asks each mutation the migrator would make
- * whether it is already satisfied. Used by the boot quiescence door to scope
- * the stop set (plan §7.D). `changed` is what gates the marker rewrite, so a
- * true here is exactly a boot at which the shared tree moves under a container.
+ * Would `reconcileWorkgroupSharedDirs` change anything for this workgroup? Pure
+ * mirror of the migrator's `changed` decision, used by the boot quiescence door.
  */
 export function sharedDirsReconcileWouldChange(
   db: RawStatements,
@@ -691,19 +616,9 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
   const { seedDir, wgDir, siblingFolders, shared, candidates } = plan;
 
   const markerPath = path.join(wgDir, MIGRATION_MARKER);
-  // RE-RUNS EVERY STARTUP, deliberately. This used to `return` here on the
-  // marker, which made the shared tree a one-shot snapshot of whenever it first
-  // ran. On one install a workgroup's marker predated a later seed dir by two
-  // months — the release desk's board, ledger and runbook — so the
-  // union rule below (share any seed dir a sibling already symlinks) never got
-  // to see it. It ended up reachable only by the three siblings someone
-  // remembered to hand-symlink it into and invisible to the two QA agents,
-  // which is exactly the scattered-symlink drift docs/workgroups.md says
-  // workgroups exist to end.
-  //
-  // Every step below already skips when it is already correct, so a re-run on
-  // settled state touches nothing and rewrites nothing. The marker is now a
-  // record (it keeps its original `migratedAt`), not a latch.
+  // RE-RUNS EVERY STARTUP, deliberately: a one-shot latch missed seed dirs added
+  // after the first run. Every step skips when already correct, so a settled
+  // re-run writes nothing; the marker is a record (keeps `migratedAt`), not a latch.
   const priorReport = readMigrationReport(markerPath);
 
   if (shared.size === 0) {
@@ -711,7 +626,6 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
     return;
   }
 
-  // ── Choose move strategy (rename within a filesystem, else copy) ──────────
   fs.mkdirSync(wgDir, { recursive: true });
   const strategy: 'rename' | 'copy' = sameFilesystem(groupsDir, dataDir) ? 'rename' : 'copy';
 
@@ -725,10 +639,7 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
     siblings: siblingFolders,
   });
 
-  // ── Move each shared dir, then drop a container-absolute compat symlink ───
-  // `changed` gates the marker rewrite and the log line below: a re-run that
-  // finds everything already in place must be a true no-op, or the "reversible
-  // record" gets a fresh `migratedAt` every boot and stops being a record.
+  // `changed` gates the marker rewrite: a settled re-run must not refresh `migratedAt`.
   let changed = false;
   const moved: string[] = [];
   for (const name of [...shared].sort()) {
@@ -766,10 +677,7 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
     moved.push(name);
   }
 
-  // ── Repoint every sibling's old symlink to the shared mount ───────────────
   for (const { sibling, name, linkPath, lst, state } of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
-    // Already pointing at the mount — nothing to do. Without this a re-run
-    // would unlink and re-create every sibling's every link on every boot.
     if (state === 'current') continue;
     if (state === 'real') {
       log.warn('reconcileWorkgroupSharedDirs: sibling has a real entry, not overlaying', {
@@ -786,7 +694,6 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
 
   if (!changed) return; // settled — re-run is a true no-op
 
-  // ── Write the marker + report (reversible record) ─────────────────────────
   const report: MigrationReport = {
     migratedAt: priorReport?.migratedAt ?? new Date().toISOString(),
     seedFolder: workgroupId,
@@ -806,39 +713,15 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
 }
 
 /**
- * Guarantee every workgroup has ONE shared place for work products, reachable
- * from every member's own folder.
+ * Guarantee every workgroup has ONE shared `artifacts/` for work products,
+ * linked from every member's folder. The migrator only moves dirs it discovers
+ * in existing state, so a seed that never had one would leave every sibling
+ * writing into private storage.
  *
- * Why this cannot ride on `reconcileWorkgroupSharedDirs`: that pass only moves
- * a directory it DISCOVERS, and every one of its three discovery sources reads
- * existing state — a readdir of the seed member's folder (`planWorkgroupSharedDirs`,
- * the `sources`/`conversations`/`isGitRepo` scan), the union of any dir a
- * sibling already symlinks, and a readdir of `wgDir` for crash recovery. A
- * workgroup whose seed never had this directory therefore never gets one, and
- * every sibling writes work products into its own private `/workspace/agent`.
- * That is the mechanism behind an agent reporting a sibling's file as
- * unreachable.
- *
- * This function creates `data/workgroups/<id>/artifacts/` and links each member
- * to it. `SHARED_WORK_DIR_NAME` is in `RESERVED_SHARED_DIR_NAMES`, so the
- * generic migrator treats the name as owned here and never moves, adopts,
- * repoints or reports it — without that, creating `dst` empty and ahead of the
- * migrator makes its `existsSync(dst)` arm read "interrupted move" and delete a
- * seed's real `artifacts/`.
- *
- * Gated per workgroup on the SAME predicate as the `/workspace/workgroup` mount
- * (`WORKGROUP_SHARED_FS`, or a `.migrated` marker): without that mount the link
- * target does not exist in the container, and `container/CLAUDE.md` would be
- * sending work products into container-local storage that `--rm` destroys.
- *
- * Links only where nothing is there. `ensureCompatSymlink` replaces any
- * non-matching symlink, which is correct for its own callers — they repoint a
- * name AFTER moving its content — but wrong here, where nothing is moved: a
- * member whose `artifacts` is a host-resolvable relative link would be
- * retargeted at an empty directory and its content left unreachable.
- *
- * Idempotent, and cheap enough to run on every boot: a settled workgroup does
- * one `mkdirSync` on an existing dir plus one `lstat` per member.
+ * Gated on the SAME predicate as the `/workspace/workgroup` mount: without the
+ * mount the link target is container-local storage that `--rm` destroys.
+ * Links only where nothing is there, unlike `ensureCompatSymlink`, which
+ * repoints any non-matching symlink and would strand a member's linked content.
  */
 export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: string; dataDir?: string } = {}): void {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
@@ -846,16 +729,10 @@ export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: s
   const target = `${WORKGROUP_CONTAINER_PATH}/${SHARED_WORK_DIR_NAME}`;
   const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
   for (const wg of workgroups) {
-    // Per workgroup, because this runs BEFORE runBootMountQuiescence proves
-    // container absence (src/main.ts) — every check-then-act below spans a
-    // window in which the previous host's containers still hold these
-    // directories read-write. An agent creating `artifacts` between the lstat
-    // and the symlinkSync is an EEXIST, and one uncaught throw here is
-    // `process.exit(1)` in reconcileWorkgroupFsState's caller: a whole host
-    // that will not boot because one member lost one race. Nothing here is
-    // destructive and the next boot's lstat sees the entry, so warn and carry
-    // on. A bad `workgroups` row is caught the same way rather than being
-    // permanently fatal.
+    // Per workgroup: this runs before boot quiescence proves container absence,
+    // so any check-then-act can lose a race with a live container (EEXIST), and
+    // an uncaught throw would stop the whole host from booting. Nothing here is
+    // destructive and the next boot retries, so warn and carry on.
     try {
       ensureOneWorkgroupWorkDir(db, wg.id, { groupsDir, dataDir, target });
     } catch (err) {
@@ -889,10 +766,8 @@ function ensureOneWorkgroupWorkDir(
     let st = lstatOrNull(linkPath);
     if (st?.isSymbolicLink() && safeReadlink(linkPath) === ctx.target) continue; // already correct
     if (st?.isDirectory()) {
-      // A member that kept its own real directory here is the divergence this
-      // whole mechanism exists to end: its agent reads an instruction naming
-      // the shared tree while writing into private storage no sibling can
-      // read. Consolidate it, then fall through and link.
+      // A member's own real directory is the divergence this exists to end:
+      // consolidate it, then fall through and link.
       consolidateMemberWorkDir(linkPath, path.join(wgDir, SHARED_WORK_DIR_NAME), {
         workgroupId,
         member: member.folder,
@@ -922,53 +797,25 @@ function ensureOneWorkgroupWorkDir(
 }
 
 /**
- * Drain a member's own real `artifacts/` into the workgroup's shared tree, so
- * the caller can replace it with the compat link.
+ * Drain a member's own real `artifacts/` into the shared tree so the caller can
+ * replace it with the compat link. Every path here is writable by a live
+ * container (this runs before boot quiescence), so:
  *
- * Every path here is writable by a live container: the shared tree is mounted
- * read-write into every sibling, this runs before `runBootMountQuiescence`
- * proves container absence, and the member's own folder is that member's
- * `/workspace/agent`. The rules below are what makes that survivable.
+ * - A file is published with `link(2)`, never renamed onto a name: `rename`
+ *   silently replaces a sibling's file, `link` fails `EEXIST` in the kernel.
+ * - A directory is claimed with a non-recursive `mkdir`, then renamed over the
+ *   claim, which fails `ENOTEMPTY` if a sibling wrote into it.
+ * - A taken name is not merged: the entry goes to `<name>.from-<member>`, and
+ *   if that is taken too it stays put. Derived names are single safe segments:
+ *   `.`/`..` are rejected at the call site and `ctx.member` is a trusted segment.
+ * - The source directory is removed with `rmdirSync`, which refuses when entries
+ *   could not all move.
  *
- * - **A file is published with `link(2)`, never renamed onto a name.**
- *   `rename(2)` replaces an existing file silently, so anything that renames
- *   onto a name in this tree — even over a reservation it made itself — can
- *   destroy bytes a sibling wrote there. `link` fails `EEXIST` in the kernel:
- *   the name appears only with the content already in it, and a name that is
- *   taken stays the sibling's. There is no claim, so there is nothing to
- *   release and no empty name for a hard death to leave behind.
- * - **A directory is published by claim, then rename.** Directories cannot be
- *   hard-linked. A non-recursive `mkdir` reserves the name (`EEXIST` if taken),
- *   and renaming onto a directory fails `ENOTEMPTY` if a sibling has written
- *   into the claim — the kernel's refusal, not a check.
- * - **A taken name is not merged.** It moves to `<name>.from-<member>`, so the
- *   content still becomes shared and neither side loses a byte; taken twice,
- *   the entry stays put. `name` is either a `readdir` component or the capture
- *   of `HELD_NAME` from one, with `.` and `..` rejected at the call site, and
- *   `ctx.member` passed `assertTrustedPathSegment` there — so the derived
- *   names are single safe segments too.
- * - **The source directory is removed with `rmdirSync`**, which fails
- *   `ENOTEMPTY` rather than recursing. A member whose entries could not all
- *   move keeps its directory and everything in it.
- *
- * The cross-device branch is the one place that copies instead of renaming,
- * and its source removal spans the whole copy — bytes written into the source
- * during it are lost. It cannot be made atomic without a rewrite this does not
- * need, so it is entered only when the two paths are PROVEN to be on different
- * filesystems. An unreadable `stat` is not that proof: it skips the member for
- * this boot rather than picking the destructive strategy, which is the
- * opposite of `sameFilesystem`'s own "unknown → copy" advice — written for the
- * migrator, where copy is the safe fallback, and wrong for this caller.
- *
- * Failures are per entry: one unreadable file does not abandon the rest, and
- * the next boot retries whatever is left. A file interrupted mid-publish is
- * left holding its bytes under `.<name>.publishing` and resumes next boot;
- * under the rename strategy an already-linked file is additionally recognised
- * by inode and simply finished, while under copy it republishes to
- * `.from-<member>` (a duplicate, never a loss). A hard death between a
- * directory claim and its move leaves an empty directory at the real name,
- * which the next boot moves aside to `.from-<member>`. No bytes are lost in
- * any of these.
+ * The cross-device copy branch loses bytes written into the source during the
+ * copy, so it runs only when the paths are PROVEN to be on different
+ * filesystems; an unreadable `stat` skips the member for this boot (the
+ * opposite of `sameFilesystem`'s unknown→copy). Interrupted publishes resume
+ * next boot from their `.<name>.publishing` hold.
  */
 function consolidateMemberWorkDir(
   memberWorkDir: string,
@@ -1033,13 +880,9 @@ function consolidateMemberWorkDir(
 }
 
 /**
- * `rename` when both paths are proven to be on one filesystem, `copy` when
- * they are proven to be on two, and `null` when neither is proven.
- *
- * Deliberately not `sameFilesystem`, whose `catch` answers "different" so its
- * caller takes the copy path. That is the safe default for the directory
- * migrator; here copy is the branch with the unguarded window, so an unknown
- * device must decline rather than choose it.
+ * `rename` when both paths are proven on one filesystem, `copy` when proven on
+ * two, `null` when neither. Not `sameFilesystem`, whose unknown→copy default is
+ * wrong here: copy is the branch with the unguarded window.
  */
 function moveStrategy(a: string, b: string): 'rename' | 'copy' | null {
   try {
@@ -1057,10 +900,8 @@ function candidateNames(name: string, ctx: PublishCtx): [string, string] {
 }
 
 function warnNoName(name: string, ctx: PublishCtx, err?: unknown): void {
-  // Both names are taken. The second may be an earlier consolidation of this
-  // same member, or anything a sibling wrote — the shared tree is read-write
-  // to all of them, so this cannot be narrowed further from here. Either way
-  // the entry stays put, and the caller's `rmdirSync` then refuses the member.
+  // Both names are taken (by an earlier consolidation or a sibling). The entry
+  // stays put, and the caller's `rmdirSync` then refuses the member.
   log.warn('ensureWorkgroupWorkDirs: could not claim a name in the shared tree, left in place', {
     ...ctx,
     name,
@@ -1070,12 +911,9 @@ function warnNoName(name: string, ctx: PublishCtx, err?: unknown): void {
 }
 
 /**
- * This function's own hold on an entry whose real name it has already taken.
- *
- * Recognised by PATTERN, never derived: the random segment is what makes the
- * hold path unforgeable, so `rename(2)` — which cannot refuse a name — can
- * still be used to take it. A guess-able hold name would need a check before
- * that rename, and a check is what a live member's write races.
+ * This function's own hold on an entry whose real name it has taken. Recognised
+ * by PATTERN: the random segment makes the hold path unforgeable, so `rename`
+ * can take it without a check a live member's write could race.
  */
 const HELD_NAME = /^\.(.+)\.[0-9a-f]{12}\.publishing$/;
 
@@ -1084,40 +922,20 @@ function newHoldPath(dir: string, name: string): string {
 }
 
 /**
- * Publish a non-directory entry into the shared tree and return the name it
- * landed under, or `null` when it stays in the member (logged).
+ * Publish a non-directory entry into the shared tree; returns the name it
+ * landed under, or `null` when it stays in the member (logged). Order matters:
  *
- * Three steps, in this order, because each one closes a window the others
- * cannot:
+ * 1. `rename` the entry off its real name to an unguessable
+ *    `.<name>.<random>.publishing` hold. Unlinking the source after the link
+ *    instead would delete a new version the live member saved in between.
+ * 2. `link` the held bytes into the shared tree (`EEXIST` keeps a sibling's name
+ *    theirs; ours goes to `<name>.from-<member>`). Cross-device, copy to a
+ *    staging name and link that.
+ * 3. Remove the hold, by path. A member writing to the hold's name in the
+ *    microseconds before this loses those bytes; POSIX has no unlink-by-inode.
  *
- * 1. **`rename` the entry off its real name**, to `.<name>.<random>.publishing`
- *    beside it. This is the member-side reservation. `unlink`ing the source
- *    after the link instead would remove whatever sits at that PATH — and the
- *    member's own container is live here, so an agent saving the file (write
- *    temp, rename over it) between the link and the unlink would have its new
- *    version deleted while the shared tree kept the old one. After the rename
- *    the member may recreate `<name>` freely; this function never touches that
- *    path again, and the next boot publishes it as a separate entry.
- *    `rename(2)` cannot refuse an occupied name, so the hold path is made
- *    UNFORGEABLE rather than checked: 48 random bits the live member cannot
- *    guess, recognised next boot by pattern.
- * 2. **`link` the held bytes into the shared tree**, which fails `EEXIST` in
- *    the kernel. That is the sibling-side reservation: the shared name appears
- *    only with content already in it, and a name a sibling holds stays theirs
- *    — ours goes to `<name>.from-<member>`. Cross-device, where `link(2)`
- *    cannot reach, the held bytes are copied to a staging name in the shared
- *    tree and that copy is linked.
- * 3. **Remove the hold.** By then it is a second name for a published inode —
- *    but the removal is by PATH, and once step 1 has run the hold is an
- *    ordinary visible entry in the member's live folder. A member writing
- *    there in the microseconds before this `rmSync` loses those bytes. POSIX
- *    has no unlink-by-inode, so the window cannot be closed; the hold's name
- *    is unguessable in ADVANCE, which is what step 1 needs, and merely obscure
- *    afterwards.
- *
- * A death between 1 and 3 leaves the hold in the member folder. `HELD_NAME`
- * matches it on the next boot, which resumes at step 2 (`heldAlready`), so no
- * bytes are stranded under a name nothing looks for.
+ * A death between 1 and 3 leaves the hold; `HELD_NAME` matches it next boot and
+ * resumes at step 2.
  */
 function publishFile(
   src: string,
@@ -1133,10 +951,8 @@ function publishFile(
   let landed: string | null = null;
   try {
     if (!heldAlready) {
-      // Nothing can be at `held`: the name carries 48 random bits a live
-      // member cannot guess, so this rename lands on an unused name without a
-      // check in front of it. An earlier boot's hold has a different random
-      // segment, is its own readdir entry, and is published on its own.
+      // The hold name carries 48 random bits a live member cannot guess, so this
+      // rename needs no check in front of it.
       fs.renameSync(src, held);
       holdMade = true;
     }
@@ -1185,15 +1001,9 @@ function publishFile(
 }
 
 /**
- * Give an unpublished hold its real name back, so the entry is where its agent
- * expects it and the next boot retries from the ordinary path.
- *
- * `link` then remove, NOT `lstat` then `rename`. The member's container is
- * live and the whole reason a hold exists is that the member may write a new
- * `<name>` at any moment; `rename(2)` would replace that file silently, and a
- * check before it is the same window this function's caller was rewritten to
- * remove. `EEXIST` from `link` is the kernel refusing instead — the hold then
- * keeps its hidden name and is resumed on the next boot.
+ * Give an unpublished hold its real name back. `link` then remove, NOT `rename`:
+ * the live member may have written a new `<name>`, which `rename` would silently
+ * replace. On `EEXIST` the hold keeps its hidden name and resumes next boot.
  */
 function releaseHold(held: string, name: string, ctx: PublishCtx): void {
   const real = path.join(path.dirname(held), name);
@@ -1207,15 +1017,10 @@ function releaseHold(held: string, name: string, ctx: PublishCtx): void {
 }
 
 /**
- * Publish a directory: claim the name with a non-recursive `mkdir`, then
- * rename (or copy then rename) over that claim. Returns the name used, or
- * `null` when the directory stays in the member (logged).
- *
- * Directories cannot be hard-linked, so a claim is unavoidable here. It is
- * safe for a directory in a way it is not for a file: renaming onto a
- * directory a sibling has written into fails `ENOTEMPTY`, and giving back a
- * claim is an `rmdir` that fails the same way — the kernel refuses in both
- * places, so nothing a sibling put there can be replaced or removed.
+ * Publish a directory: claim the name with a non-recursive `mkdir`, then rename
+ * (or copy then rename) over the claim; `null` when it stays in the member.
+ * Safe because renaming onto, or `rmdir`-ing, a claim a sibling wrote into
+ * fails `ENOTEMPTY`.
  */
 function publishDir(
   src: string,
@@ -1279,8 +1084,6 @@ function sameInode(a: string, b: string): boolean {
   return !!sa && !!sb && sa.dev === sb.dev && sa.ino === sb.ino;
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 function isGitRepo(dir: string): boolean {
   return fs.existsSync(path.join(dir, '.git'));
 }
@@ -1298,8 +1101,7 @@ function lstatOrNull(p: string): fs.Stats | null {
   }
 }
 
-/** Create (or replace) a container-absolute compat symlink at `<dir>/<name>`. */
-/** @returns true if it actually wrote a link (i.e. state changed). */
+/** Create (or replace) a container-absolute compat symlink at `<dir>/<name>`; true if it wrote one. */
 function ensureCompatSymlink(dir: string, name: string): boolean {
   const linkPath = path.join(dir, name);
   const target = `${WORKGROUP_CONTAINER_PATH}/${name}`;
@@ -1359,49 +1161,22 @@ function sameFilesystem(a: string, b: string): boolean {
 }
 
 /**
- * Remove a member's workgroup compat symlinks whose shared target is gone.
+ * Remove a member's workgroup compat symlinks whose shared target is gone (the
+ * migrator only ever adds them). A wrong predicate would hit every compat link
+ * in the fleet, so an entry is removed only when ALL of:
  *
- * `migrateWorkgroup` drops `<name> -> /workspace/workgroup/<name>` into the
- * seed and every sibling for each consolidated name, and re-runs every boot.
- * It only ever ADDS: when an agent later deletes the shared entry those links
- * stay, one per member, dangling inside every container at `/workspace/agent/`
- * forever. Nothing else prunes them — on this install 137 had accumulated
- * across 18 of 24 groups, the oldest three months old, mirrored sibling for
- * sibling because that is how they are created.
+ * - the workgroup carries the `.migrated` marker;
+ * - it is a symlink whose text is EXACTLY `/workspace/workgroup/<its own name>`
+ *   (anything else is somebody else's link);
+ * - its name is not reserved;
+ * - the name is absent from a SUCCESSFUL `readdir` of the shared tree, and still
+ *   absent on an `lstat` immediately before the unlink;
+ * - the SEED holds no real dir of that name: the migrator's sibling union
+ *   re-derives the shared set from these links later in the same boot, so
+ *   deleting one silently un-shares a directory.
  *
- * The blast radius if the predicate is wrong is every compat link in the
- * fleet, so it is deliberately narrow — an entry is removed only when ALL of:
- *
- * - the workgroup carries the `.migrated` marker (see the gate's own comment:
- *   the flag alone is fail-OPEN here, unlike in the steps that copy it);
- * - it is a symlink. This one is a FAST PATH, not the guarantee: `readlink`
- *   below already fails on every real entry, so a real directory survives on
- *   the clause after this one even with this removed — no test can kill it
- *   alone, and it is kept because saying so explicitly is cheaper to read than
- *   re-deriving it;
- * - its text is EXACTLY `/workspace/workgroup/<its own name>`, the one shape
- *   `ensureCompatSymlink` writes. An agent's `foo -> /workspace/workgroup/bar`
- *   or a clone-as-codex `../<seed>/x` is somebody else's link and is left;
- * - its name is not in `RESERVED_SHARED_DIR_NAMES`, which dedicated
- *   reconcilers own and repair rather than delete;
- * - the name is absent from a SUCCESSFUL `readdir` of the shared tree;
- * - it is STILL absent on a re-confirming `lstat` taken immediately before the
- *   unlink, which closes the window between that listing and this member's
- *   scan;
- * - the SEED holds no real dir of that name. That one is not hygiene: the
- *   sibling union at `:567` re-derives the shared set from exactly these
- *   links later in the same boot, so deleting one silently un-shares a
- *   directory. Do not remove it without reading that union.
- *
- * The `readdir` clause is why the listing is read once per workgroup and a
- * failure returns instead of continuing. `existsSync` per link would answer
- * "gone" for every name the moment the shared tree is unreadable — a transient
- * mount problem would then delete every compat link in the workgroup, which is
- * the one outcome worse than the stale links this removes.
- *
- * Deleting a broken symlink destroys no data, so unlike the movers here this
- * needs no claim protocol: a container racing it either sees the link or does
- * not, and both answers were already wrong before the unlink.
+ * A failed listing returns rather than continuing: per-link `existsSync` would
+ * read an unreadable shared tree as "all gone" and delete every link.
  */
 export function pruneDanglingWorkgroupCompatLinks(
   db: RawStatements,
@@ -1429,21 +1204,9 @@ function pruneOneWorkgroupCompatLinks(
 ): void {
   assertTrustedPathSegment(workgroupId, 'workgroup id');
   const wgDir = workgroupSharedDir(workgroupId, ctx.dataDir);
-  // The marker, NOT the mount predicate the other steps use. A link of the
-  // shape this function deletes can only have been written by
-  // `migrateWorkgroup`, which writes the marker at `:782` — so no marker means
-  // nothing of that shape is this function's to judge. (`ensureWorkgroupWorkDirs`
-  // also writes a compat link under the flag alone, but only for `artifacts`,
-  // which is reserved and never reaches the loop below.)
-  //
-  // Accepting the flag alone here would be fail-OPEN in the shape most likely
-  // to occur. If `wgDir` is lost — an unmounted volume, a partial restore, an
-  // agent's `rm -rf` — the marker goes with it, and step 2's
-  // `mkdirSync(wgDir/artifacts, { recursive: true })` (`:861`) RECREATES the
-  // directory before this runs. The listing below then succeeds, returning
-  // `['artifacts']`, and every real name reads as gone: on a six-member
-  // workgroup that is every compat link deleted in one boot. The
-  // `readdir`-throws bail cannot catch it, because nothing throws.
+  // The marker, NOT the mount predicate: with the flag alone, a lost `wgDir` is
+  // recreated (holding only `artifacts`) by an earlier boot step, the listing
+  // succeeds, and every real name would read as gone.
   if (!fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
 
   // One listing, and a failure means "cannot tell", never "nothing is there".
@@ -1474,26 +1237,12 @@ function pruneOneWorkgroupCompatLinks(
       if (sharedNames.has(entry.name)) continue;
       const linkPath = path.join(memberDir, entry.name);
       if (safeReadlink(linkPath) !== `${WORKGROUP_CONTAINER_PATH}/${entry.name}`) continue;
-      // The listing above was taken before this member was scanned, and this
-      // runs before runBootMountQuiescence proves containers are gone, so a
-      // live agent can have created the target in between — `mkdir
-      // /workspace/workgroup/foo` then `ln -s` into its own bedroom. Without
-      // this the link is unlinked while its target exists, which is wrong at
-      // the moment it happens rather than already-wrong. `lstat`, NOT
-      // `existsSync`: the listing counts a name whether or not it resolves, so
-      // `existsSync` here would prune links whose shared entry is itself a
-      // dangling symlink — the opposite of what the listing decided. This can
-      // only ever KEEP more links than the listing did.
+      // Re-confirm: a live agent can have created the target since the listing.
+      // `lstat`, not `existsSync`, so a shared entry that is itself a dangling
+      // symlink still counts as present, as the listing did.
       if (lstatOrNull(path.join(wgDir, entry.name))) continue;
-      // `reconcileWorkgroupSharedDirs` runs LATER in this same boot and
-      // re-derives the established shared set from exactly these links: a
-      // sibling symlink whose name the seed still holds as a real dir is
-      // unioned back in (`planWorkgroupSharedDirs`, gated on
-      // `isRealDir(seedEntry)`; seed folder == workgroup id).
-      // Deleting one first would silently un-share that directory —
-      // it falls into `candidates` and stays private to the seed, with no
-      // warn. Keep the link and let the migrator re-point it; the empty
-      // `wgDir` entry it is waiting for is the migrator's to create.
+      // The seed still holds a real dir of this name: the migrator later this
+      // boot unions it back in via this link, so deleting it would un-share it.
       if (isRealDir(path.join(ctx.groupsDir, workgroupId, entry.name))) continue;
       try {
         fs.unlinkSync(linkPath);
