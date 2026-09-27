@@ -18,8 +18,8 @@ function registerMcpOAuthSweepDuties(): void {
         const { refreshExpiringMcpOAuthIntegrations } = await import('./service.js');
         await refreshExpiringMcpOAuthIntegrations();
       } catch (err) {
-        // Token failures are already row statuses; a listing or bundle-read
-        // failure lands here and must not take housekeeping down.
+        // Token and bundle failures are already row statuses; a pass-level
+        // failure (the listing) lands here and must not take housekeeping down.
         log.warn('MCP OAuth refresh sweep step failed', { err });
       }
     },
