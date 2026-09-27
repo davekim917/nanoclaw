@@ -183,6 +183,36 @@ it('wider', () => {
     expect(duplicates(pair(1), pair(2))).toEqual([]);
   });
 
+  it('does not report duplicates already on main when a change only drops an unused context parameter', () => {
+    const suite = (param: string) =>
+      `describe('s', () => {\n  beforeEach((${param}) => g(0));\n  it('a', () => {\n    expect(f(1)).toBe(2);\n  });\n  it('b', () => {\n    expect(f(1)).toBe(2);\n  });\n});\n`;
+    expect(duplicates(suite('ctx'), suite(''))).toEqual([]);
+  });
+
+  it('does not report duplicates already on main when a change only drops empty options', () => {
+    const suite = (opts: string) =>
+      `it('a', ${opts}() => {\n  expect(f(1)).toBe(2);\n});\nit('b', ${opts}() => {\n  expect(f(1)).toBe(2);\n});\n`;
+    expect(duplicates(suite('{}, '), suite(''))).toEqual([]);
+  });
+
+  it.each([
+    [
+      'a hook registered by reference',
+      `function setup({ task }) {\n  backend = open(task.name);\n}\nbeforeEach(setup);\n`,
+    ],
+    ['a hook registered conditionally', `if (enabled) beforeEach(({ task }) => {\n  backend = open(task.name);\n});\n`],
+    ['the current test name', `beforeEach(() => {\n  backend = open(expect.getState().currentTestName);\n});\n`],
+  ])('does not judge a file whose setup can tell its cases apart through %s', (_, setup) => {
+    const cases = `it('sqlite', () => {\n  expect(backend.query(1)).toEqual([1]);\n});\n`;
+    expect(duplicates(setup + cases, setup + cases + cases.replace('sqlite', 'postgres'))).toEqual([]);
+  });
+
+  it('does not judge an it.for case that reads its test context', () => {
+    const row = (name: string) =>
+      `it.for([1])('${name}', (row, { task }) => {\n  expect(open(task.name).query(row)).toEqual([1]);\n});\n`;
+    expect(duplicates(row('sqlite'), row('sqlite') + row('postgres'))).toEqual([]);
+  });
+
   it('flags a copy under a second suite set up the same way', () => {
     const suite = (title: string, name: string) =>
       `describe('${title}', () => {\n  beforeEach(() => g(1));\n  it('${name}', () => {\n    expect(f(1)).toBe(2);\n  });\n});\n`;

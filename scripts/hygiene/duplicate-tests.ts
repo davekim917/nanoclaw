@@ -6,6 +6,7 @@ export interface TestCase {
   name: string;
   suite: string;
   scope: string;
+  judged: boolean;
   statements: string[];
   assertions: boolean[];
 }
@@ -21,6 +22,8 @@ export const TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
 const CASE_CALLEES = new Set(['it', 'test']);
 const SUITE_CALLEES = new Set(['describe', 'suite']);
 const NOT_RUN = new Set(['skip', 'todo', 'fails', 'skipIf', 'runIf']);
+const HOOKS = new Set(['beforeEach', 'afterEach', 'beforeAll', 'afterAll', 'onTestFinished', 'onTestFailed']);
+const READS_TEST_NAME = /\b(?:currentTestName|getState)\b/;
 const ASSERTION = /^(?:expect|assert\w*)$/;
 
 interface Callee {
@@ -228,9 +231,25 @@ function isSuiteOrCase(statement: ts.Statement): boolean {
   return !!callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
 }
 
+function hooksOpaque(sourceFile: ts.SourceFile): boolean {
+  const opaque = (node: ts.Node): boolean => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && HOOKS.has(node.expression.text)) {
+      const callback = node.arguments[0];
+      const statement = node.parent;
+      const list = ts.isExpressionStatement(statement) ? statement.parent : undefined;
+      const owner = list && ts.isBlock(list) ? list.parent : list;
+      if (!callback || !(ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) return true;
+      if (!owner || !(ts.isSourceFile(owner) || (ts.isFunctionLike(owner) && plainSuite(owner)))) return true;
+    }
+    return ts.forEachChild(node, opaque) ?? false;
+  };
+  return READS_TEST_NAME.test(sourceFile.text) || opaque(sourceFile);
+}
+
 export function extractCases(file: string, text: string): TestCase[] {
   const kind = file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
   const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
+  const fileJudged = !hooksOpaque(sourceFile);
   const outer = new Normalizer(sourceFile);
   const setup = (level: ts.Node) =>
     (ts.isBlock(level) || ts.isSourceFile(level) ? [...level.statements] : [])
@@ -263,7 +282,10 @@ export function extractCases(file: string, text: string): TestCase[] {
       const callback = callee && CASE_CALLEES.has(callee.base) ? callbackOf(node) : undefined;
       if (callee && callback?.body) {
         const options = node.arguments.slice(1).filter((arg) => arg !== callback && !ts.isNumericLiteral(arg));
-        if (options.length || (!callee.table && callback.parameters.length) || underContextHook(node)) return;
+        const takesContext = callee.table
+          ? callee.modifiers.includes('for') && callback.parameters.length > 1
+          : callback.parameters.length > 0;
+        const judged = fileJudged && !options.length && !takesContext && !underContextHook(node);
         const normalizer = new Normalizer(sourceFile, callback);
         const body = callback.body;
         const parts: ts.Node[] = ts.isBlock(body) ? [...body.statements] : [body];
@@ -285,6 +307,7 @@ export function extractCases(file: string, text: string): TestCase[] {
           scope: `${[callee.base, ...callee.modifiers].join('.')}\n${scopeOf(node)}`,
           statements,
           assertions,
+          judged,
         });
         return;
       }
@@ -303,14 +326,14 @@ const order = (a: TestCase, b: TestCase) => a.file.localeCompare(b.file) || a.li
 export function findDuplicateTests(newCases: TestCase[], allCases: TestCase[]): DuplicateTest[] {
   const byScope = new Map<string, TestCase[]>();
   for (const c of allCases) {
-    if (!c.assertions.some(Boolean)) continue;
+    if (!c.judged || !c.assertions.some(Boolean)) continue;
     const key = `${c.file}|${c.scope}`;
     byScope.set(key, [...(byScope.get(key) ?? []), c]);
   }
   const fresh = new Set(newCases.map(at));
   const found: DuplicateTest[] = [];
   for (const test of [...newCases].sort(order)) {
-    if (!test.assertions.some(Boolean)) continue;
+    if (!test.judged || !test.assertions.some(Boolean)) continue;
     const others = (byScope.get(`${test.file}|${test.scope}`) ?? []).filter((c) => at(c) !== at(test));
     const same = others.find(
       (c) => sameStatements(c.statements, test.statements) && (!fresh.has(at(c)) || order(c, test) < 0),
