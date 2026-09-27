@@ -37,11 +37,8 @@ export interface ColumnDef {
   /** Allowed values (shown in help). */
   enum?: string[];
   /**
-   * Column is meaningfully NULL, and `--flag ""` clears it back to NULL on
-   * update. Without this a nullable column can be SET from the CLI but never
-   * UNSET, which is a trap: for per-channel overrides, empty string and NULL
-   * are not the same thing — NULL falls through to the group default, `''`
-   * suppresses it.
+   * Meaningfully NULL: `--flag ""` clears it on update. Without this a column could be set but never unset, and for
+   * per-channel overrides NULL (fall through to the group default) and `''` (suppress it) differ.
    */
   nullable?: boolean;
 }
@@ -100,10 +97,7 @@ export interface ResourceDef {
    * safe to re-apply).
    */
   naturalKey?: string[];
-  /**
-   * Portable ORDER BY expression for `list`. Defaults to the first timestamp
-   * (`_at`) column descending, then the resource id for deterministic ties.
-   */
+  /** Defaults to the first `_at` column descending, then the id for deterministic ties. */
   listOrder?: string;
   /** Non-standard verbs (grant, revoke, add, remove, restart, etc.). */
   customOperations?: Record<string, CustomOperation>;
@@ -177,10 +171,8 @@ function visibleColumns(def: ResourceDef): string[] {
   return def.columns.map((c) => c.name);
 }
 
-// Coerces a raw `--flag value` list-filter argument to the column's declared
-// type before it is bound as a SQL parameter. Without this a boolean column
-// stored as SQLite integer 0/1 never matched the raw string 'true'/'false'
-// argv gave it — `ncl <res> list --enabled true` silently returned nothing.
+// Coerces a list filter to the column's type before binding: a 0/1 boolean column never matched argv's
+// 'true'/'false'.
 function coerceListFilter(column: ColumnDef, value: unknown): unknown {
   switch (column.type) {
     case 'number': {
@@ -199,11 +191,8 @@ function coerceListFilter(column: ColumnDef, value: unknown): unknown {
   }
 }
 
-// Portable `ORDER BY` for `list`: the resource's own declaration wins, else
-// `created_at` if present, else the first `_at` column — DESC with the id as
-// tiebreak. Fork-ahead: `created_at` is preferred because a nullable event
-// stamp declared earlier (messaging-groups' `denied_at`) would order ordinary
-// rows by random id and let a small LIMIT hide the newest row.
+// `created_at` is preferred over an earlier nullable event stamp (e.g. `denied_at`), which would order rows by random
+// id and let a small LIMIT hide the newest.
 function listOrder(def: ResourceDef): string {
   if (def.listOrder) return def.listOrder;
   const timestamp =
@@ -291,12 +280,9 @@ function genericCreate(def: ResourceDef) {
 
     const colNames = Object.keys(values);
     const placeholders = colNames.map((c) => `@${c}`);
-    // Single central transaction so a postCreate throw rolls back the parent
-    // INSERT, so no partial state survives. `postCreate` is awaited inside the closure, so it is bound by
-    // the closure rule (plan §4.4): central-DB companion rows through the
-    // driver, nothing else. Anything outside the central DB — filesystem,
-    // session-DB projection — belongs in `postCommit`, which runs after the
-    // commit below and never after a rollback.
+    // One central transaction so a postCreate throw rolls back the INSERT. `postCreate` runs inside the closure, so
+    // it may only write central-DB companion rows through the driver; filesystem and session-DB effects belong in
+    // `postCommit`, which never runs after a rollback.
     const insert = (): Promise<void> =>
       centralTransaction(async () => {
         await getDb().run(
@@ -319,11 +305,8 @@ function genericCreate(def: ResourceDef) {
     // the primitive for exactly that race: the loser adopts the winner's row
     // instead of throwing a raw unique-constraint error at the caller.
     if (def.naturalKey && def.naturalKey.length > 0) {
-      // `IS NOT DISTINCT FROM` (not `=`) so a NULL natural-key column still
-      // matches: `=` against NULL is never true in SQL, so a natural key that
-      // includes a nullable column (e.g. one left unset with no default) made
-      // "idempotent create" not idempotent — it inserted a duplicate or hit
-      // the unique constraint instead of returning the existing row.
+      // `IS NOT DISTINCT FROM`, not `=`: a NULL natural-key column never matches `=`, which made idempotent create
+      // insert a duplicate or hit the unique constraint.
       const where = def.naturalKey.map((c) => `${c} IS NOT DISTINCT FROM ?`).join(' AND ');
       const params = def.naturalKey.map((c) => values[c]);
       const reload = (): Promise<Record<string, unknown> | undefined> =>
@@ -357,9 +340,7 @@ function genericUpdate(def: ResourceDef) {
     for (const col of updatableCols) {
       const v = args[col.name];
       if (v !== undefined) {
-        // `--flag ""` on a nullable column means "clear it", not "set empty
-        // string". Checked before the enum test so clearing never has to
-        // satisfy the enum.
+        // Clears before the enum check, so clearing never has to satisfy the enum.
         if (col.nullable && v === '') {
           updates[col.name] = null;
           continue;
@@ -377,21 +358,10 @@ function genericUpdate(def: ResourceDef) {
     }
 
     if (def.preUpdate) {
-      // `preUpdate` validates `updates` against a point-in-time snapshot of
-      // the row (e.g. wirings' validateEngageAgainstChannel checks the
-      // engage_mode/engage_pattern pairing across BOTH `current` and
-      // `updates`). Under the async driver the read and the write below are
-      // no longer one synchronous step, so two concurrent updates can each
-      // read the same stale `current`, each individually pass validation,
-      // and then both write — landing a combination neither update's own
-      // validation would have allowed on its own.
-      //
-      // Fix: make the write conditional on the exact row state `preUpdate`
-      // just validated (optimistic concurrency) rather than an unconditional
-      // `WHERE id = ?`. If the row moved between read and write, `changes`
-      // is 0 — re-read and re-validate once against the fresh row and retry;
-      // a second miss is a genuine conflict, not a transient race, and is
-      // surfaced as a normal CLI refusal rather than silently overwriting.
+      // `preUpdate` validates against a snapshot, and the read and write are separate awaits, so two concurrent
+      // updates could each pass and land a combination neither allows. The write is conditional on the exact
+      // validated row (optimistic concurrency); on 0 changes re-read, re-validate and retry once, and a second miss
+      // is refused as a conflict.
       let current = await getDb().get<Record<string, unknown>>(
         `SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`,
         id,
@@ -404,22 +374,15 @@ function genericUpdate(def: ResourceDef) {
         const setClause = Object.keys(updates)
           .map((k) => `${k} = @${k}`)
           .join(', ');
-        // `IS` (not `=`) so a NULL column in `current` still pins correctly —
-        // SQLite's `IS` is a null-safe equality, `=` against NULL is never true.
+        // `IS` is SQLite's null-safe equality; `=` against NULL is never true.
         const checkClause = Object.keys(current)
           .map((k) => `${k} IS @__orig_${k}`)
           .join(' AND ');
         const checkParams: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(current)) checkParams[`__orig_${k}`] = v;
 
-        // `RETURNING` makes the write and the reload ONE statement: a separate `getDb().get`
-        // reload after the UPDATE is itself an awaited step, so a concurrent
-        // delete of this same row in that gap made the reload find nothing
-        // and the handler return `undefined` — an `{ ok: true }` response
-        // with no row, not the documented not-found/conflict error. Folding
-        // the reload into the UPDATE's own RETURNING clause closes that gap:
-        // there is no longer a second await between "the write landed" and
-        // "here is the row it produced".
+        // `RETURNING` folds the reload into the write: a separate reload could find the row deleted in between and
+        // return `{ ok: true }` with no row.
         const updated = await getDb().get<Record<string, unknown>>(
           `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id AND ${checkClause} RETURNING ${cols}`,
           { ...updates, ...checkParams, _id: id },
@@ -441,8 +404,7 @@ function genericUpdate(def: ResourceDef) {
     const setClause = Object.keys(updates)
       .map((k) => `${k} = @${k}`)
       .join(', ');
-    // Same RETURNING fold as the preUpdate branch above — a separate reload
-    // after the UPDATE would have the identical gap, just without a `preUpdate` validating it.
+    // Same RETURNING fold as above.
     const updated = await getDb().get<Record<string, unknown>>(
       `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id RETURNING ${cols}`,
       { ...updates, _id: id },

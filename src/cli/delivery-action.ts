@@ -43,23 +43,10 @@ registerDeliveryAction(
 
     const response = await executeOnce(req, ctx);
 
-    // Write response to inbound.db so the container can read it. Its own
-    // short mailbox session, because the delivery loop holds none while a
-    // handler runs (plan §4.5b).
-    //
-    // Existing-only, never provisioning. `prepare()` opens the CONTAINER-owned
-    // outbound.db read-write to apply its schema, and this handler runs after
-    // `dispatch()` has already executed the command — so a prepare that lost a
-    // race for that file would fail a completed mutation, the loop would retry
-    // the outbound row, and the command would run twice. The request row was
-    // just read out of this session's own mailbox, so it exists; if it has
-    // vanished, no container is left to read the response.
-    // trigger=0: don't wake the agent — this is an inline response to a tool call.
-    //
-    // `insertMessageIfNew`, not `insertMessage`: the row id is derived from the
-    // request id, so a retry that reaches this line after the response already
-    // landed (the write succeeded and the delivery loop failed afterwards) must
-    // be a no-op rather than a primary-key error that fails the handler again.
+    // Existing-only, never provisioning: `prepare()` opens the container-owned outbound.db read-write, and failing
+    // here after `dispatch()` ran would make the loop retry and run the command twice. trigger=0: an inline tool
+    // response must not wake the agent. `insertMessageIfNew` because the row id derives from the request id, so a
+    // retry after the response landed must be a no-op, not a primary-key error.
     const written = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
       mailbox.insertMessageIfNew({
         id: `cli-resp-${requestId}`,
@@ -94,24 +81,9 @@ registerDeliveryAction(
 );
 
 /**
- * Dispatch the command at most once across every delivery attempt for this
- * request id.
- *
- * Three outcomes:
- *  - fresh      → dispatch, record the frame, return it.
- *  - done       → a previous attempt already ran it; replay the stored frame.
- *  - executing  → a previous attempt claimed it and never recorded an outcome:
- *                 the host died mid-dispatch, or `dispatch()` itself threw.
- *                 Whether the command applied is unknowable, so answer the
- *                 agent honestly instead of guessing by re-running it.
- *
- * A thrown `dispatch()` deliberately leaves its claim standing. It is tempting
- * to hand the claim back on the grounds that `dispatch()` converts every
- * command-handler failure into an error frame, so a throw must have come from
- * its own pre-handler plumbing — but "the command handler never ran" is not
- * "nothing happened". The hold path posts an approval card (writing the
- * pending_approvals row, then delivering it) and can still reject afterwards,
- * and a released claim would card the same request a second time.
+ * Dispatches at most once per request id. `executing` (claimed, never completed) is answered honestly rather than
+ * guessed by re-running. A thrown `dispatch()` deliberately keeps its claim: the hold path posts an approval card and
+ * can still throw afterwards, so releasing the claim would card the same request twice.
  */
 async function executeOnce(
   req: RequestFrame,
@@ -150,8 +122,7 @@ async function executeOnce(
 
   log.info('CLI request from agent', { requestId: req.id, command: req.command, sessionId: ctx.sessionId });
 
-  // A throw propagates with the claim still standing, so the delivery loop's
-  // retry takes the `executing` branch above rather than dispatching again.
+  // A throw keeps the claim, so the retry takes the `executing` branch.
   const response = await dispatch(req, ctx);
   await completeCliRequest(ctx.sessionId, req.id, response);
   return response;

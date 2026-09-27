@@ -23,33 +23,19 @@ let heldOwnershipFd: number | null = null;
 let startPromise: Promise<void> | null = null;
 let stopPromise: Promise<void> | null = null;
 
-// Requests are refused with `not-ready` until markCliServerReady() is called.
-// The socket binds (and claims ownership) well before archive init, FS
-// reconciliation, the OneCLI preflight, container-config backfill, and
-// channel-adapter setup finish — early ownership and early
-// request-handling are different guarantees, and only the first is safe this
-// soon.
+// Requests get `not-ready` until markCliServerReady(): the socket binds and claims ownership long before the boot
+// gates finish, and early ownership is safe where early request handling is not.
 let ready = false;
 
 const PROBE_TIMEOUT_MS = 1000;
 
-// Bounded retries for the bind race below: a
-// concurrent second host process can win the gap between our probe and our
-// bind, so we must be able to re-probe and retry a few times rather than
-// assume our own stale verdict is still true by the time we act on it. This
-// is defense in depth for a peer that binds the path WITHOUT going through
-// claimOwnershipLock below (e.g. anything else listening on the path) — the
-// lock is what actually closes the race between two callers of
-// startCliServer() itself; five is generous for a race that, if it recurs
-// every attempt, means something is persistently recreating the path — not
-// worth retrying forever.
+// Bind retries: a peer that binds the path without `claimOwnershipLock` can win the gap between probe and bind, so
+// re-probe and retry a bounded number of times.
 const MAX_BIND_ATTEMPTS = 5;
 
 /**
- * Claim the data-directory inode with a kernel-held flock before the central
- * database is opened. The transient flock process locks its inherited fd 3;
- * the parent keeps the same open-file description for the host lifetime.
- * Closing that final parent fd releases the lock on graceful or crashed exit.
+ * Claims the data-directory inode with a kernel-held flock before the central DB opens. The parent keeps the locked
+ * open-file description for the host's lifetime; closing its last fd releases the lock on graceful or crashed exit.
  */
 async function claimOwnershipLock(socketPath: string): Promise<number> {
   const directory = path.dirname(socketPath);
@@ -69,7 +55,6 @@ async function claimOwnershipLock(socketPath: string): Promise<number> {
   }
 }
 
-/** Acquire the kernel flock without keeping a helper process alive. */
 function lockInheritedFd(fd: number, directory: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn('flock', ['-n', '3'], { stdio: ['ignore', 'ignore', 'pipe', fd] });
@@ -144,12 +129,7 @@ function probeLiveServer(socketPath: string): Promise<boolean> {
   });
 }
 
-/**
- * Bind and listen, once. Rejects with the raw `EADDRINUSE` error when the
- * path is occupied — by a live listener or a stale leftover file, either
- * way `bind(2)` cannot tell the difference and neither can we without a
- * separate probe.
- */
+/** Rejects with the raw `EADDRINUSE`: bind(2) cannot tell a live listener from a stale file. */
 function bindOnce(s: net.Server, socketPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     s.once('error', reject);
@@ -199,14 +179,8 @@ async function bindWithRetry(socketPath: string): Promise<void> {
       const e = err as NodeJS.ErrnoException;
       if (e.code !== 'EADDRINUSE') throw err;
 
-      // The path is occupied. Re-probe fresh on THIS attempt rather than
-      // trusting an earlier verdict — the check-then-act gap between a
-      // probe and an unlink is exactly where a concurrent second host
-      // process can win the race (reproduced with two
-      // Node processes racing this same sequence): treating the bind's own
-      // EADDRINUSE as the trigger to re-probe, instead of unlinking once
-      // up front and never looking again, is what closes that window. A
-      // live listener still means refuse, unconditionally.
+      // Re-probe on THIS attempt rather than trust an earlier verdict: the gap between probe and unlink is where a
+      // concurrent host wins. A live listener always means refuse.
       if (await probeLiveServer(socketPath)) {
         throw new Error(
           `another host instance is already serving ncl at ${socketPath} — ` +
@@ -231,25 +205,17 @@ async function bindWithRetry(socketPath: string): Promise<void> {
           log.warn('Failed to unlink stale ncl socket (will try to bind anyway)', { socketPath, err: unlinkErr });
         }
       }
-      // Loop and retry the bind — the next iteration re-probes before
-      // acting again, so a competitor that won this round is caught then.
+      // The next iteration re-probes before acting again.
     }
   }
 }
 
 /**
- * Flip once startup has cleared every boot gate the socket does not wait
- * for: archive init, FS reconciliation, the OneCLI preflight, container-
- * config backfill, and channel-adapter setup.
- * Before this, `startCliServer` has already bound the socket and claimed
- * ownership — that part is intentionally early, see `claimOwnershipLock` —
- * but `handleFrame` refuses to call `dispatch()` until this is set, because
- * `ncl` can mutate central-DB state those gates are still establishing.
+ * Set once startup clears the boot gates the socket does not wait for; `handleFrame` refuses `dispatch()` until then
+ * because `ncl` can mutate state those gates are still establishing.
  */
 export function markCliServerReady(): void {
-  // Shutdown can race an async startup after it has claimed ownership. Once
-  // the listener has been closed, a late startup continuation must not leave
-  // readiness set for a later standalone restart in this process.
+  // A late startup continuation after shutdown closed the listener must not leave readiness set.
   if (server) ready = true;
 }
 
@@ -266,9 +232,8 @@ export async function stopCliServer({ retainOwnership = false }: { retainOwnersh
 }
 
 async function stopCliServerInner(retainOwnership: boolean): Promise<void> {
-  // A signal can arrive while the transient flock subprocess is still
-  // acquiring the claim. Wait for that start to bind, then close it, so this
-  // stop can never release a claim belonging to an in-flight start.
+  // Wait for an in-flight start to bind and then close it, so this stop never releases a claim belonging to that
+  // start.
   const pendingStart = startPromise;
   if (pendingStart) await pendingStart.catch(() => undefined);
 
@@ -276,8 +241,8 @@ async function stopCliServerInner(retainOwnership: boolean): Promise<void> {
   server = null;
   if (s) await new Promise<void>((resolve) => s.close(() => resolve()));
   if (!retainOwnership) {
-    // Keep ownership until the listener has closed, so a new host cannot
-    // acquire the directory lock while this server still owns the socket.
+    // Released only after the listener closes, so a new host cannot take the lock while this server still owns the
+    // socket.
     releaseOwnershipLock();
   }
 }

@@ -43,10 +43,8 @@ export function commandGuardSpec(cmd: CommandDef): GuardedActionSpec {
   };
 }
 
-// Synchronous by design (seam-3 plan §4.5, I-1): this decision runs inside
-// the consult site's `withCentralSync` block (`cli/dispatch.ts`) and never
-// awaits. Its central read executes the leaf's exported SQL through
-// `withRawDb`.
+// Synchronous by design: runs inside dispatch's `withCentralSync` block and never awaits; its central read goes
+// through `withRawDb`.
 function commandDecide(cmd: CommandDef, input: GuardInput) {
   const { actor } = input;
   if (actor.kind === 'host') return ALLOW('host caller (trusted socket)');
@@ -90,12 +88,8 @@ function commandDecide(cmd: CommandDef, input: GuardInput) {
       return DENY('Cannot change cli_scope from a group-scoped agent.');
     }
 
-    // `--fleet` (groups config add/remove-mcp-server, config get) edits the
-    // install-wide MCP defaults every group inherits — the one flag on a
-    // group-scoped resource whose blast radius is the whole fleet. The scope
-    // check above keys on the group id, which a fleet write does not carry, so
-    // refuse the flag itself. Reading is refused with it: `config get --fleet`
-    // would otherwise enumerate other groups' inherited tooling.
+    // `--fleet` edits install-wide MCP defaults, and the group-id scope check above cannot see that, so the flag
+    // itself is refused, reads included (`config get --fleet` would enumerate other groups' tooling).
     if (args.fleet !== undefined && args.fleet !== false) {
       return DENY('CLI access is scoped to this agent group. Cannot use --fleet.');
     }
@@ -108,7 +102,7 @@ function commandDecide(cmd: CommandDef, input: GuardInput) {
   return ALLOW('open command');
 }
 
-/** Raw, synchronous, inside the caller's lease block: see the note on `commandDecide`. */
+/** Raw, synchronous, inside the caller's lease block. */
 function cliScopeOf(agentGroupId: string): string {
   const row = withRawDb((raw) => raw.prepare(CONTAINER_CONFIG_BY_GROUP_SQL).get(agentGroupId)) as
     | { cli_scope: string | null }
