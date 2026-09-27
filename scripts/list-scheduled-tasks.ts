@@ -1,15 +1,7 @@
 /**
- * Fleet-wide scheduled-task inventory.
- *
- * Scheduled tasks live as recurring rows in each session's inbound.db
- * (messages_in WHERE recurrence IS NOT NULL). This sweeps every session,
- * joins agent group + channel from the central DB, and prints one block per
- * active series: who runs it, where output lands, the cron (rendered in the
- * service timezone), next fire, and the prompt/script it carries.
- *
- * The report goes to stdout; sweep progress and warnings go to stderr, so
- * `> report.txt` keeps the report clean while a stuck run still narrates
- * where it stopped. Run with `--help` for the flag list.
+ * Fleet-wide scheduled-task inventory: one block per active recurring series across every
+ * session's inbound.db. The report goes to stdout; progress and warnings go to stderr, so a
+ * redirected report stays clean while a stuck run still shows where it stopped.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -22,18 +14,12 @@ import { DATA_DIR, TIMEZONE as CONFIG_TIMEZONE } from '../src/config.js';
 import { resolveGroupTimezone } from '../src/container-config.js';
 import { initDb } from '../src/db/connection.js';
 
-/**
- * Wall-clock ceiling for the whole sweep. The fleet sweep is ~30s over ~1200
- * session DBs on a warm cache, so this is ~10x headroom — it exists because an
- * unbounded sweep of this shape once burned 28 hours of CPU on the production
- * host before anyone noticed. `--timeout 0` opts out.
- */
+/** Wall-clock ceiling for the whole sweep, ~10x a normal run: an unbounded sweep once burned 28h of CPU. `--timeout 0` opts out. */
 export const DEFAULT_BUDGET_MS = 300_000;
 
 /** A single session DB slower than this gets named on stderr. */
 const SLOW_DB_MS = 2_000;
 
-/** Heartbeat cadence, in session DBs. */
 const PROGRESS_EVERY = 100;
 
 export const EXIT_USAGE = 2;
@@ -69,14 +55,7 @@ export interface Options {
   budgetMs: number;
 }
 
-/**
- * Parse argv, rejecting anything unrecognized.
- *
- * The rejection is the point. This used to be two `process.argv.includes()`
- * calls, so `--help` — and any typo — fell through as "no flags" and silently
- * started a 1,200-database fleet sweep. A destructive-feeling amount of work
- * must not be what a mistyped flag does.
- */
+/** Rejects anything unrecognized: a typo must not silently start a fleet-wide sweep. */
 export function parseArgs(argv: readonly string[]): Options {
   const opts: Options = { help: false, showAll: false, full: false, budgetMs: DEFAULT_BUDGET_MS };
 
@@ -104,11 +83,8 @@ export function parseArgs(argv: readonly string[]): Options {
 }
 
 /**
- * Cron expressions are interpreted by the HOST process (recurrence.ts), whose
- * timezone comes from its own environment — on Linux that's the systemd
- * unit's Environment=TZ=..., which an ad-hoc shell doesn't inherit. Read it
- * from the unit so this report matches what the service actually does;
- * fall back to the local config resolution.
+ * Cron is interpreted by the HOST process, whose TZ comes from the systemd unit's environment,
+ * which an ad-hoc shell doesn't inherit: read it from the unit.
  */
 function resolveServiceTimezone(): string {
   try {
@@ -152,11 +128,8 @@ async function run(opts: Options): Promise<void> {
   const startedAt = Date.now();
   const elapsed = () => ((Date.now() - startedAt) / 1000).toFixed(1);
   /**
-   * Progress is unconditional and goes to stderr because the failure this
-   * script actually produced was an invisible one: no output, no indication of
-   * which of ~1,200 databases it was on. A synchronous spin also blocks the
-   * event loop, so a timer-based watchdog would never fire — the only thing
-   * that survives is an eager write before each step.
+   * Unconditional, to stderr, and written eagerly before each step: a synchronous spin blocks the
+   * event loop, so a timer-based watchdog would never fire.
    */
   const note = (msg: string) => process.stderr.write(`[list-scheduled-tasks +${elapsed()}s] ${msg}\n`);
 
@@ -194,15 +167,9 @@ async function run(opts: Options): Promise<void> {
       }>
     ).map((s) => [s.id, s]),
   );
-  // Channel destination → messaging group name, for rows whose output target
-  // differs from the session's own messaging group.
   const mgByDestination = new Map([...messagingGroups.values()].map((m) => [`${m.channel_type}\0${m.platform_id}`, m]));
   central.close();
-  // Reopened through the shared connection so this report resolves a group's
-  // timezone the same way the firing path does, instead of re-reading
-  // container_configs itself. `readonly` is load-bearing, not decoration: this
-  // is a report, and it runs against the live central DB of a running host, so
-  // it must not take a write handle or touch the journal mode.
+  // `readonly` is load-bearing: this runs against the live central DB of a running host.
   await initDb(path.join(DATA_DIR, 'v2.db'), { role: 'tool', readonly: true });
 
   const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
@@ -217,18 +184,13 @@ async function run(opts: Options): Promise<void> {
   outer: for (const groupDir of groupDirs) {
     const groupPath = path.join(sessionsRoot, groupDir);
     if (!fs.statSync(groupPath).isDirectory()) continue;
-    // The directory name IS the agent group id. A
-    // group with a timezone override runs its whole series on that grid, so both
-    // the cron interpretation and the rendered fire time report it — every line
-    // already names the zone it is in, so nothing here reads ambiguously.
+    // The directory name IS the agent group id; a group timezone override applies to the whole series.
     const groupTz = await resolveGroupTimezone(groupDir, TIMEZONE);
     for (const sessDir of fs.readdirSync(groupPath).sort()) {
       const inboundPath = path.join(groupPath, sessDir, 'inbound.db');
       if (!fs.existsSync(inboundPath)) continue;
 
-      // Checked before starting more work, so it bounds the sweep as a whole.
-      // A spin inside one database is not interruptible here — that is what the
-      // eager line below is for.
+      // Bounds the sweep as a whole; a spin inside one database is not interruptible here.
       if (opts.budgetMs > 0 && Date.now() - startedAt > opts.budgetMs) {
         aborted = true;
         note(
@@ -239,12 +201,8 @@ async function run(opts: Options): Promise<void> {
       }
 
       lastOpened = `${groupDir}/${sessDir}`;
-      // Written BEFORE the open, not after the query. If opening or querying a
-      // database wedges — the one case the ceiling above cannot interrupt —
-      // this is the only record that names it: `lastOpened` is process memory
-      // that dies with the kill, and the every-100 heartbeat can be up to 99
-      // databases stale. One line per database is the cost of the last stderr
-      // line being the answer.
+      // Written BEFORE the open: if a database wedges, the last stderr line is the only record
+      // that names it.
       note(`> ${lastOpened}`);
       scanned++;
       const openedAt = Date.now();
@@ -252,8 +210,7 @@ async function run(opts: Options): Promise<void> {
       const db = new Database(inboundPath, { readonly: true });
       let rows: TaskRow[];
       try {
-        // Latest row per series tells the series' current state; older rows of
-        // the same series are history (recurrence cleared on completion).
+        // Latest row per series is its current state; older rows are history.
         rows = db
           .prepare(
             `SELECT id, series_id, recurrence, process_after, status, kind,
@@ -315,11 +272,8 @@ async function run(opts: Options): Promise<void> {
     }
   }
 
-  // The check above only fires before starting another database, so it misses
-  // two ways the ceiling is breached: the last database overrunning while it
-  // renders, and pre-sweep work overrunning when there is no database to stop
-  // at. Neither is a partial sweep — the report is complete — but both breached
-  // a limit the operator asked to be held to, so both are said out loud.
+  // The check above can't catch the last database or pre-sweep work overrunning; the report is
+  // complete, but the breached limit is still reported.
   const overran = !aborted && opts.budgetMs > 0 && Date.now() - startedAt > opts.budgetMs;
   if (overran) {
     note(

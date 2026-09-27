@@ -1,31 +1,12 @@
 /**
- * scripts/set-workgroup-secrets.ts — operator CLI to set workgroup-level
- * OneCLI secret declarations.
+ * Operator CLI to set a workgroup's OneCLI secret declarations.
  *
- * Usage:
  *   pnpm exec tsx scripts/set-workgroup-secrets.ts <workgroup-id> --secrets <name1,name2,...>
  *
- * Exit codes:
- *   0 — success (workgroups.onecli_secrets updated; updated_at set)
- *   1 — workgroup not found OR any secret name unresolvable (no DB write)
- *   2 — invalid arguments
- *
- * What this does:
- *   1. Validates all secret names resolve in the OneCLI vault (fail before
- *      any DB write — the same fail-closed posture as applyOnecliSecrets).
- *   2. Writes the names (not the resolved UUIDs) to workgroups.onecli_secrets
- *      as a JSON string array. The container-runner resolves names → UUIDs at
- *      spawn time via the existing mergeWorkgroupAndGroupSecrets + applyOnecliSecrets
- *      pipeline, so a vault rename is handled by the next spawn rather than
- *      requiring this script to be re-run.
- *   3. Sets updated_at to the current UTC timestamp.
- *
- * Intent: workgroup secrets are the baseline that every member inherits.
- * Per-group container.json.onecliSecrets extends (additive) but cannot
- * subtract from the workgroup floor.
- *
- * Example:
- *   pnpm exec tsx scripts/set-workgroup-secrets.ts example-labs --secrets Anthropic,Exa
+ * Exit: 0 success, 1 workgroup not found or a name unresolvable (no DB write), 2 invalid arguments.
+ * Names are validated against the vault before any write and stored as names, not UUIDs, so a
+ * vault rename is picked up at the next spawn. Workgroup secrets are a floor every member
+ * inherits; a group's container.json can add to it, never subtract.
  */
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -42,16 +23,11 @@ export interface SetWorkgroupSecretsOptions {
   dbPath?: string;
 }
 
-/**
- * Core logic — exported so tests can call it directly without spawning a
- * subprocess. Returns the exit code.
- */
 export async function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): Promise<number> {
   const { workgroupId, secrets, dbPath = DEFAULT_DB_PATH } = opts;
 
   const db = new Database(dbPath);
   try {
-    // Step 1: verify workgroup exists
     const row = db.prepare('SELECT id FROM workgroups WHERE id = ?').get(workgroupId) as { id: string } | undefined;
     if (!row) {
       console.error(`Error: workgroup "${workgroupId}" not found in workgroups table`);
@@ -60,8 +36,7 @@ export async function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): Pro
       return 1;
     }
 
-    // Step 2: validate secret names against the vault BEFORE any DB write.
-    // resolveSecretUuids throws on unresolvable names — we catch and exit 1.
+    // Validated BEFORE any DB write.
     if (secrets.length > 0) {
       try {
         await resolveSecretUuids(secrets);
@@ -71,9 +46,6 @@ export async function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): Pro
       }
     }
 
-    // Step 3: persist names (not UUIDs) to workgroups.onecli_secrets.
-    // Names are stored so a vault rename is handled by the next spawn
-    // rather than requiring this script to be re-run.
     const secretsJson = JSON.stringify(secrets);
     const now = new Date().toISOString();
 
@@ -91,8 +63,6 @@ export async function setWorkgroupSecrets(opts: SetWorkgroupSecretsOptions): Pro
 }
 
 function parseArgv(argv: string[]): SetWorkgroupSecretsOptions | null {
-  // argv = process.argv.slice(2) — first positional is workgroupId, then
-  // --secrets <csv>
   const workgroupId = argv[0];
   if (!workgroupId || workgroupId.startsWith('-')) {
     return null;
@@ -116,7 +86,6 @@ function parseArgv(argv: string[]): SetWorkgroupSecretsOptions | null {
   return { workgroupId, secrets };
 }
 
-// Only run when executed directly (not when imported by tests)
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const opts = parseArgv(process.argv.slice(2));
   if (!opts) {

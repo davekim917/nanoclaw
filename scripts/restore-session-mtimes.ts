@@ -1,25 +1,11 @@
 /**
- * scripts/restore-session-mtimes.ts — one-off recovery for the 2026-08-15
- * migration burst.
+ * One-off recovery for the 2026-08-15 migration burst, which bumped ~5,000 `inbound.db` mtimes
+ * and so reset session reclaim's idle clock. Restores each affected `inbound.db` to the newest
+ * surviving signal it did not touch (sibling file mtimes or central `last_active`), so the
+ * result is never newer than real activity.
  *
- * The startup pass that lazily migrates every session's `inbound.db` ran real
- * DDL against ~5,030 files in ninety seconds on 2026-08-15. Session reclaim
- * reads `max(newest file mtime, central last_active)` as the idle clock, so
- * every one of those sessions now reads as days old instead of months, and
- * archival has produced nothing since. The code fix (session-storage-health
- * C1) stops the next recurrence; it cannot recover the mtimes already lost.
- *
- * This script reconstructs a TRUTHFUL, deliberately conservative clock: for
- * each affected session it takes the newest surviving signal it did not touch
- * — `outbound.db` / `archive.db` / `central.db` / `.heartbeat` mtimes, or the
- * central DB's `COALESCE(last_active, created_at)` — and restores `inbound.db`
- * to that. Those were never mass-touched (outbound.db mtimes still span back
- * to April), so the result is never NEWER than the session's real activity and
- * never older than its newest surviving evidence.
- *
- * ORDERING IS LOAD-BEARING. Run this only after the capped archiver is
- * deployed and verified live. Against the uncapped code, handing ~5,800
- * suddenly-eligible sessions to a single sweep tick is a tar+rm stampede.
+ * ORDERING IS LOAD-BEARING: run only after the capped archiver is deployed and verified live, or
+ * the suddenly-eligible sessions stampede one sweep tick.
  *
  * Usage:
  *   tsx scripts/restore-session-mtimes.ts --dry-run [--window <ISO>[±<min>]]...
@@ -59,7 +45,6 @@ interface RestoreEntry {
   inode: number;
   currentMtimeMs: number;
   restoreMtimeMs: number;
-  /** Which surviving signal supplied `restoreMtimeMs`. */
   provenance: string;
 }
 
@@ -97,7 +82,6 @@ export function parseWindow(spec: string): BurstWindow {
   return { label: `${iso}±${radiusMinutes}m`, startMs: centerMs - radiusMs, endMs: centerMs + radiusMs };
 }
 
-/** The window this mtime falls in, or null. Each window carries its own bound. */
 function matchWindow(mtimeMs: number, windows: BurstWindow[]): BurstWindow | null {
   return windows.find((window) => mtimeMs >= window.startMs && mtimeMs <= window.endMs) ?? null;
 }
@@ -114,11 +98,7 @@ function mtimeOf(target: string): number | null {
   }
 }
 
-/**
- * The newest evidence of real activity that ISN'T the file the migration
- * bumped. Newest, not oldest: reclaim must never act on a clock that claims
- * more idleness than the session can prove.
- */
+/** Newest, not oldest: reclaim must never act on a clock that claims more idleness than the session can prove. */
 export function chooseRestoreTarget(
   sessPath: string,
   centralActivityMs: number | null,
@@ -187,9 +167,8 @@ export function planRestore(options: {
       } catch {
         continue;
       }
-      // Bound against THIS mtime's own window. With two disjoint windows a
-      // shared minimum would reject a session whose activity predates its own
-      // burst but follows the earlier one.
+      // Bound against THIS mtime's own window: a shared minimum would wrongly reject across
+      // disjoint windows.
       const window = matchWindow(stat.mtimeMs, options.windows);
       if (!window) continue;
 
@@ -199,9 +178,7 @@ export function planRestore(options: {
         continue;
       }
       const centralActivityMs = row.last_activity ? parseSqliteUtc(row.last_activity) : NaN;
-      // The whole premise: the central DB says this session was already idle
-      // BEFORE the burst, so the bumped file mtime is the migration's, not the
-      // session's.
+      // The premise: the central DB says the session was idle BEFORE the burst.
       if (!Number.isFinite(centralActivityMs) || centralActivityMs >= window.startMs) {
         skipped.push({ sessionId, reason: 'central-activity-after-burst' });
         continue;
@@ -243,11 +220,7 @@ export function planRestore(options: {
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-/**
- * Rebuild the path from validated components under the manifest's own data
- * root, then require it to still be that path after realpath. A manifest is an
- * editable JSON file on disk; its `inboundPath` string is a hint, not authority.
- */
+/** A manifest is editable JSON: rebuild the path from validated components and require it after realpath. */
 function resolveEntryPath(dataDir: string, entry: RestoreEntry): string | null {
   if (!SAFE_ID.test(entry.agentGroupId) || !SAFE_ID.test(entry.sessionId)) return null;
   const sessPath = path.join(dataDir, 'v2-sessions', entry.agentGroupId, entry.sessionId);
@@ -314,11 +287,8 @@ export interface ExecuteResult {
 }
 
 /**
- * Apply a manifest. Every entry is pinned by inode AND mtime, so anything that
- * moved since the dry-run is reported rather than acted on, and a rerun after a
- * successful pass is a no-op. The utimes happens inside the same exclusive
- * cleanup claim the storage manager takes, so a concurrent archival of that
- * session cannot interleave.
+ * Every entry is pinned by inode AND mtime, so anything that moved since the dry-run is reported,
+ * not acted on. The utimes runs inside the storage manager's exclusive cleanup claim.
  */
 export function executeRestore(manifestPath: string, preimagePath?: string): ExecuteResult {
   const manifest = readManifest(manifestPath);
@@ -330,8 +300,7 @@ export function executeRestore(manifestPath: string, preimagePath?: string): Exe
     missing: 0,
     claimBusy: 0,
     unsafePath: 0,
-    // A preimage is the record of what a PARTICULAR run overwrote. Deriving it
-    // from the manifest name meant a rerun truncated the real one.
+    // Never derived from the manifest name: a rerun would truncate the real preimage.
     preimagePath: preimagePath ?? `${manifestPath.replace(/\.json$/, '')}.preimage.${Date.now()}.json`,
   };
 

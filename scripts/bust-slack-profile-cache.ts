@@ -1,21 +1,8 @@
 /**
- * Drop the chat-sdk's cached Slack user profiles so the next message refetches
- * `users.info`.
- *
- * Why this exists: `@chat-adapter/slack` caches each user's displayName and
- * realName in `chat_sdk_kv` for EIGHT DAYS (`USER_CACHE_TTL_MS`), persisted, so
- * it survives host restarts. Nothing invalidates it when a profile changes. So
- * renaming a bot in Slack has no visible effect for up to a week: siblings keep
- * receiving the old `sender` name and — because that is what they read in the
- * transcript — keep writing the old name back out in prose.
- *
- * Seen in practice: after a batch of bot renames, a sibling kept referring to
- * another agent by its retired name for six days in ordinary prose, while
- * Slack itself had been serving the new `real_name` the whole time.
- *
- * Safe to run any time. The cache is a pure read-through of Slack, which is
- * authoritative, so the only cost of a needless bust is one `users.info` per
- * user on next contact.
+ * Drop the chat-sdk's cached Slack user profiles so the next message refetches `users.info`.
+ * `@chat-adapter/slack` caches display names for EIGHT DAYS, persisted across restarts, and
+ * nothing invalidates it on a profile change, so a renamed bot keeps its old `sender` name.
+ * Safe any time: the cache is a pure read-through of Slack.
  *
  * Usage: pnpm exec tsx scripts/bust-slack-profile-cache.ts [--dry-run]
  */

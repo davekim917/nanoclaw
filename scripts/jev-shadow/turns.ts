@@ -1,23 +1,14 @@
 /**
- * Rebuild each billed agent turn from data the host already persists — no
- * change to the router, sweep or runner, and nothing leaves the host here.
+ * Rebuild each billed agent turn from data the host already persists (turn_usage, each session's
+ * inbound and outbound DBs); nothing leaves the host.
  *
- *   turn_usage (central DB)             cost, model, effort, trigger, end time, duration
- *   <session>/inbound.db messages_in    the trigger=1 rows the turn consumed
- *   <session>/outbound.db messages_out  what it wrote: `chat` replies and everything else
+ * Attribution is per session, keyed on turn START (`ts` minus `duration_ms`): a row is consumed
+ * by the first turn that starts after it is due. Keying on the previous turn's END mis-credits
+ * rows that fell due mid-turn. "Due" is `process_after` when set, because a recurring task's row
+ * is written about a day before it fires. An approximation, good enough to size a prize.
  *
- * Attribution is by time window per session, keyed on turn START (`ts` minus
- * `duration_ms`): a row is consumed by the first turn that starts after it is
- * due. Keying on the previous turn's END mis-credits every row that fell due
- * while a turn was running — measured on 2026-09-18, that sent ~$860 of
- * scheduled turns to "no trigger". "Due" is `process_after` when set, because a
- * recurring task's row is written about a day before it fires, so its
- * `timestamp` is its creation time. Still an approximation — good enough to
- * size a prize, not to bill one.
- *
- * Session DBs are opened read-only, queried once, and closed at once: they are
- * live, and a long-held reader would stall a container's commit
- * (`journal_mode=DELETE`, container/agent-runner/src/mailbox/sqlite/connection.ts).
+ * Session DBs are live: open read-only, query once, close at once, or a long-held reader stalls a
+ * container's commit (`journal_mode=DELETE`).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -29,14 +20,8 @@ import { CLAUDE_USAGE_TRUSTED_FROM, isUntrustedTurnUsage, UNTRUSTED_USAGE_NOTE }
 const ROOT = process.env.NANOCLAW_ROOT ?? '/home/ubuntu/nanoclaw-v2';
 
 /**
- * Workgroups the Jev work is focused on for now — a SCOPE choice, not a
- * data-sharing restriction. The operator approved sending every workgroup's
- * content to TypeSafe on 2026-09-18 and chose one workgroup to start with;
- * widening the focus needs only a go on the work. Set it per run with
- * JEV_SHADOW_FOCUS (comma-separated workgroup ids); it defaults to `main`, the
- * operator's own. Keyed on workgroup id, not folder
- * name, so a new sibling group lands in its workgroup's focus automatically.
- * `scope: 'all'` reads every group.
+ * The workgroups in focus: a scope choice, not a data-sharing restriction. Set per run with
+ * JEV_SHADOW_FOCUS (comma-separated workgroup ids, default `main`); `scope: 'all'` reads every group.
  */
 const FOCUS_WORKGROUPS = new Set(
   (process.env.JEV_SHADOW_FOCUS ?? 'main')
@@ -69,7 +54,6 @@ export interface TurnRecord {
   steps: number | null;
   costUsd: number;
   inputs: TurnInput[];
-  /** Delivered `chat` replies only. */
   outputs: string[];
   /** Every other outbound kind written in the turn (status, task_log, system, …) with counts. */
   otherWrites: Record<string, number>;
@@ -163,10 +147,8 @@ export function loadTurns(opts: {
     const windowHi = iso(startMs + START_SLACK_MS);
     prevStartMs = startMs;
 
-    // After the window bookkeeping above, like the other skips, so the next
-    // turn's attribution window still starts where this one did. Every report
-    // here sums cost_usd, and inside the untrusted-usage window that column is
-    // not a figure — the turn is dropped, not zeroed, and counted below.
+    // After the window bookkeeping, so the next turn's window still starts here. Inside the
+    // untrusted-usage window `cost_usd` is not a figure: the turn is dropped, not zeroed.
     if (isUntrustedTurnUsage(String(r.provider), ts)) {
       untrustedCost += 1;
       continue;

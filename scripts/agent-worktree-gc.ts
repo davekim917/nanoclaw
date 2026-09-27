@@ -1,20 +1,13 @@
 #!/usr/bin/env tsx
 /**
- * Agent-session worktree report.
- *
- * Classifies every registered worktree and prints the commands to reclaim the
- * safe ones. It does NOT delete anything, by design — see the header of
- * src/agent-worktree-gc.ts for why the destructive mode was removed.
+ * Agent-session worktree report: classifies every registered worktree and prints the commands to
+ * reclaim the safe ones. It deletes nothing, by design.
  *
  *   sudo pnpm worktrees
  *
- * Run it as root. Reading another user's /proc/<pid>/cwd needs it, and without
- * it every worktree reports `probe-failed` because idleness cannot be proven.
- * Give it GH_TOKEN too, or branch-carrying worktrees report `pr-unknown`.
- *
- * Covers agent-session worktrees (/tmp scratch, ad-hoc topic dirs,
- * .claude/worktrees) — NOT the repo-store topic worktrees that
- * scripts/storage-gc.ts already collects, and not .codex/worktrees.
+ * Needs root to read other users' /proc/<pid>/cwd (else every worktree is `probe-failed`), and
+ * GH_TOKEN (else branch-carrying worktrees are `pr-unknown`). Does not cover the repo-store topic
+ * worktrees scripts/storage-gc.ts collects.
  */
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -22,14 +15,8 @@ import { fileURLToPath } from 'url';
 import { runAgentWorktreeGcOnce, type Verdict } from '../src/agent-worktree-gc.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-// Without root, /proc/<pid>/cwd for other users is unreadable, every worktree
-// reports `probe-failed`, and the run is a confusing no-op. Say so once, up
-// front, instead of leaving the reader to decode a hundred identical lines.
 if (typeof process.getuid === 'function' && process.getuid() !== 0) {
-  // Exit, do not carry on. Printing the hint and then running anyway still
-  // emits a probe-failed row per worktree, which IS the confusing no-op this
-  // message exists to replace — the reader would have to scroll a hundred
-  // identical lines past the one line that mattered.
+  // Exit rather than carry on: a probe-failed row per worktree is the confusing no-op this replaces.
   console.error('agent-worktree-gc: not running as root — re-run as `sudo pnpm worktrees`.');
   console.error("  Without root, another user's /proc/<pid>/cwd is unreadable, so every");
   console.error('  worktree would report `probe-failed` and nothing could be classified.');
@@ -43,8 +30,7 @@ if (report === null) {
   process.exit(1);
 }
 
-// Every verdict must appear here. A missing one is silently dropped from the
-// summary, which is how a run reporting 19 of 102 worktrees once looked fine.
+// Every verdict must appear here: a missing one is silently dropped from the summary.
 const ORDER: Verdict[] = [
   'eligible',
   'live-process',
@@ -80,20 +66,14 @@ function shq(p: string): string {
 }
 
 if (eligible.length > 0) {
-  // Deliberately WITHOUT --force. git refuses a worktree carrying
-  // modifications or untracked files, which is the last gate and the one that
-  // has never been wrong. Anything git refuses here should be investigated,
-  // not forced.
+  // Deliberately WITHOUT --force: git refusing a modified worktree is the last gate. Investigate, don't force.
   console.log(`\nSafe to reclaim (${eligible.length}) — run from ${report.mainWorktreePath}:\n`);
   for (const a of eligible) console.log(`  git worktree remove ${shq(a.row.path)}`);
 }
 
 if (orphans.length > 0) {
-  // NOT `git worktree prune`. That is repository-wide: it drops EVERY stale
-  // registration, including ones this run refused because their HEAD is not
-  // merged and the registration may be a commit's only reference. Printing it
-  // would recommend an action broader than the evidence gathered — the exact
-  // overreach this tool exists to avoid. `remove` names one target.
+  // NOT `git worktree prune`: it is repository-wide and would drop registrations this run
+  // refused, which may be a commit's only reference.
   console.log(`\nOrphaned registrations verified merged (${orphans.length}) — run from ${report.mainWorktreePath}:\n`);
   for (const o of orphans) console.log(`  git worktree remove ${shq(o)}`);
   console.log(`\n  (Do NOT use \`git worktree prune\`: it also drops stale registrations this run refused.)`);
@@ -103,9 +83,7 @@ if (eligible.length === 0 && orphans.length === 0) {
   console.log('\nNothing is safe to reclaim right now.');
 }
 
-// Print what was SPARED and why. A report that only lists its candidates gives
-// no way to notice it has started refusing everything for a bad reason — an
-// unreadable /proc marking all 100 `probe-failed`, say.
+// Print what was SPARED and why, so a run refusing everything for a bad reason is noticeable.
 const spared = report.assessments.filter(
   (a) => a.verdict !== 'eligible' && a.verdict !== 'main' && a.verdict !== 'out-of-scope',
 );

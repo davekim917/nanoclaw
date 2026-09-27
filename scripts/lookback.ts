@@ -1,25 +1,12 @@
 /**
- * scripts/lookback.ts — recent-thread review report.
- *
- * Walks central DB → recently-active sessions → per-session inbound/outbound DBs,
- * surfaces threads that look half-baked or open. Owner reviews the markdown
- * report and decides what to follow up on.
+ * Recent-thread review report: surfaces threads that look half-baked or open, for the owner to
+ * follow up. Heuristics are deliberately conservative: better to surface a closed session than to
+ * miss an open one.
  *
  * Usage:
  *   pnpm exec tsx scripts/lookback.ts                 # last 7 days
  *   pnpm exec tsx scripts/lookback.ts --days 14
  *   pnpm exec tsx scripts/lookback.ts --days 7 --quiet  # skip 'idle' rows
- *
- * Status classification (per session):
- *   user-waiting   — last message was inbound (user → agent), no agent reply since
- *   agent-pending  — last agent reply contains commitment language (I'll, let me,
- *                    checking, investigating, next step, follow up, TODO, will do)
- *   approval-open  — pending_approvals row references this session, no resolution
- *   task-stale     — task scheduled to run, process_after passed, status != 'delivered'
- *   idle           — otherwise; last activity was a clean exchange
- *
- * Heuristics intentionally conservative — better to surface a session that
- * was actually closed than to miss one that's open.
  */
 
 import path from 'path';
@@ -136,10 +123,7 @@ interface PendingTask {
 }
 
 function findStaleTasks(sessionDir: string, now: Date): PendingTask[] {
-  // A task is stale only if it's still `pending` (not `completed`/`failed`)
-  // AND its process_after is in the past. For recurring tasks (series_id set),
-  // surface only the OLDEST pending occurrence per series — the host is
-  // behind on that series, but listing every queued occurrence is noise.
+  // Stale = still `pending` with process_after past; for a series only the OLDEST such occurrence.
   const inPath = path.join(sessionDir, 'inbound.db');
   if (!fs.existsSync(inPath)) return [];
   const db = new Database(inPath, { readonly: true });
@@ -321,7 +305,6 @@ function main(): void {
 
   const filtered = args.quiet ? classified.filter((c) => c.status !== 'idle') : classified;
 
-  // Group by agent group, ordered by attention-needed first.
   const groups = new Map<string, ClassifiedSession[]>();
   for (const c of filtered) {
     const key = `${c.session.agent_group_name} (${c.session.agent_group_folder})`;

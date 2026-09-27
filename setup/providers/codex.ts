@@ -1,26 +1,15 @@
 /**
- * Codex provider setup — auth walk-through + install verification.
+ * Codex provider setup — auth walk-through + install verification. Codex-owned payload: its only
+ * trunk reach-ins are one import and one picker entry in setup/auto.ts.
  *
- * Codex-owned payload code: when the codex provider moves to the `providers`
- * branch, this file travels with it and `/add-codex` copies it back in. The
- * only trunk reach-in is one import + one picker entry in setup/auto.ts.
+ * Everything lands in the OneCLI vault, nothing in .env or the container. A ChatGPT login runs
+ * with CODEX_HOME pointed at a throwaway dir and its auth.json is vaulted WHOLE; an API key is
+ * stored as an `openai` secret.
  *
- * Auth honors the v2 credential invariant — everything lands in the OneCLI
- * vault, nothing in .env, nothing in the container:
- *   - ChatGPT subscription (the common case): `codex login` (browser) or
- *     `codex login --device-auth` (URL + pairing code) runs with CODEX_HOME
- *     pointed at a throwaway dir; the auth.json written there is stored
- *     WHOLE in the vault (`--file … --host-pattern chatgpt.com`) and the dir
- *     is deleted. The gateway injects it in flight; the container only ever
- *     sees the `onecli-managed` placeholder.
- *   - API key: pasted once, stored as an `openai` secret for api.openai.com.
- *
- * Session-isolation invariant: the vaulted ChatGPT session must be DEDICATED
- * to the gateway. Never vault a copy of the user's live ~/.codex/auth.json.
- * OpenAI rotates refresh tokens, so two consumers sharing one OAuth session
- * strand each other on refresh, and replaying the stale token trips reuse
- * detection — which invalidates the whole session family server-side
- * (`token_invalidated`) for the gateway AND the user's personal Codex CLI.
+ * The vaulted ChatGPT session must be DEDICATED to the gateway — never a copy of the user's live
+ * ~/.codex/auth.json. OpenAI rotates refresh tokens, so two consumers of one session strand each
+ * other, and replaying a stale token invalidates the whole session family server-side, for the
+ * gateway AND the user's own Codex CLI.
  */
 import { execFileSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
@@ -36,8 +25,6 @@ import { brandBody, note } from '../lib/theme.js';
 import * as setupLog from '../logs.js';
 import { effectiveDockerArgBeforeFinalRun, finalDockerArg, hasDockerRunConsumer } from '../lib/dockerfile-version.js';
 import { type FailureAssistResult, registerSetupProvider } from './registry.js';
-
-// ─── OneCLI vault helpers ────────────────────────────────────────────────
 
 export interface OnecliSecret {
   id: string;
@@ -73,8 +60,6 @@ function openAISecretExists(): boolean {
     return false;
   }
 }
-
-// ─── auth step ───────────────────────────────────────────────────────────
 
 function ensureAnswer<T>(value: T | symbol): T {
   if (p.isCancel(value)) {
@@ -201,9 +186,7 @@ export async function runCodexLoginAuth(method: 'browser' | 'device'): Promise<v
   }
   console.log();
 
-  // Session-isolation invariant (see file header): the login runs under a
-  // throwaway CODEX_HOME so the vaulted session is dedicated to the gateway
-  // and never shared with the user's personal ~/.codex.
+  // Throwaway CODEX_HOME: the vaulted session must never be shared with ~/.codex (see file header).
   const loginHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-vault-login-'));
   // Holds a live credential after login — must go on every exit path. The
   // failure branches call process.exit, which skips finally blocks, so each
@@ -281,24 +264,13 @@ function runInherit(cmd: string, args: string[], extraEnv?: Record<string, strin
   });
 }
 
-// ─── failure assist ──────────────────────────────────────────────────────
-
-/**
- * The Codex CLI can debug a setup failure only if the binary runs AND
- * ~/.codex/auth.json exists (API-key-only installs keep the key in the
- * OneCLI vault, so the host-side CLI has nothing to authenticate with).
- */
+/** Needs ~/.codex/auth.json too: an API-key-only install keeps the key in the vault, so the host CLI can't authenticate. */
 function isCodexCliUsable(): boolean {
   const codexCheck = spawnSync('codex', ['--version'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
   if (codexCheck.status !== 0) return false;
   return fs.existsSync(path.join(os.homedir(), '.codex', 'auth.json'));
 }
 
-/**
- * Failure prompt handed to the interactive Codex session — same content as
- * the dispatcher's Claude system prompt: what failed, the job ("diagnose and
- * fix, be concise, exit when done"), and a de-duped file reference list.
- */
 export function buildCodexFailurePrompt(ctx: AssistContext, projectRoot: string): string {
   const references = failureReferences(ctx, projectRoot);
 
@@ -325,11 +297,7 @@ export function buildCodexFailurePrompt(ctx: AssistContext, projectRoot: string)
   return lines.join('\n');
 }
 
-/**
- * Registry hook: offer to debug a setup failure with the Codex CLI. Returns
- * 'unavailable' when the CLI can't run here so the dispatcher can fall back
- * to its guarded Claude offer.
- */
+/** Returns 'unavailable' when the CLI can't run here, so the dispatcher falls back to its Claude offer. */
 async function offerCodexFailureAssist(ctx: AssistContext, projectRoot: string): Promise<FailureAssistResult> {
   if (!isCodexCliUsable()) return 'unavailable';
 
@@ -367,14 +335,7 @@ async function offerCodexFailureAssist(ctx: AssistContext, projectRoot: string):
   });
 }
 
-// ─── install verification ────────────────────────────────────────────────
-
-/**
- * Verify the codex provider payload is fully wired — the same pre-flight the
- * /add-codex skill checks. While codex ships in trunk these always pass; once
- * the payload moves to the providers branch, a failed check means the install
- * step should run (or the user finishes via /add-codex).
- */
+/** The same pre-flight as /add-codex: a failed check means the install step should run. */
 export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problems: string[] } {
   const problems: string[] = [];
 
@@ -433,9 +394,7 @@ async function runCodexInstallCheck(): Promise<void> {
   );
 }
 
-// Self-registration: the setup picker and the standalone `provider-auth` step
-// render from the registry — this call is codex's only reach-in to the setup
-// flow (guarded by the barrel-driven registration test).
+// Codex's only reach-in to the setup flow, guarded by the barrel-driven registration test.
 registerSetupProvider({
   value: 'codex',
   label: 'Codex',
