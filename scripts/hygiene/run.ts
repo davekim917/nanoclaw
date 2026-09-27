@@ -9,7 +9,7 @@ import { vendoredEngineFiles } from '../../src/design-artifact-loop-vendor.js';
 import { scanComments } from './comments.js';
 
 export interface Finding {
-  check: 'knip' | 'jscpd' | 'comments';
+  check: 'knip' | 'jscpd' | 'comments' | 'comment-growth';
   kind: string;
   location: string;
   message: string;
@@ -36,7 +36,6 @@ interface JscpdFragment {
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..');
 const TOOL_PATH = [path.join(REPO_ROOT, 'node_modules', '.bin'), process.env.PATH ?? ''].join(path.delimiter);
 
-/** Each directory is analysed with the `knip.json` it holds. */
 const KNIP_WORKSPACES = ['.', 'container/agent-runner'];
 const SOURCE_ROOTS = ['src', 'setup', 'scripts', 'container/agent-runner/src', 'container/agent-runner/scripts'];
 const SOURCE_FILE = /\.(?:[cm]?[jt]s|tsx)$/;
@@ -88,6 +87,9 @@ function stdoutOf(tool: string, result: SpawnSyncReturns<string>): string {
   return result.stdout;
 }
 
+const isSource = (file: string) =>
+  SOURCE_ROOTS.some((dir) => file.startsWith(`${dir}/`)) && SOURCE_FILE.test(file) && !NOT_SOURCE.test(file);
+
 /** Non-test source under the scanned roots, as sorted root-relative POSIX paths. */
 export function sourceFiles(root: string): string[] {
   const files: string[] = [];
@@ -95,7 +97,7 @@ export function sourceFiles(root: string): string[] {
     if (!fs.existsSync(path.join(root, dir))) continue;
     for (const entry of fs.readdirSync(path.join(root, dir), { recursive: true, encoding: 'utf8' })) {
       const file = path.posix.join(dir, entry.split(path.sep).join('/'));
-      if (SOURCE_FILE.test(file) && !NOT_SOURCE.test(file)) files.push(file);
+      if (isSource(file)) files.push(file);
     }
   }
   return files.sort();
@@ -198,13 +200,87 @@ export function jscpdFindings(
 
 export function commentFindings(root: string, files: string[]): Finding[] {
   return files.flatMap((file) =>
-    scanComments(file, fs.readFileSync(path.join(root, file), 'utf8')).map((finding) => ({
+    scanComments(file, fs.readFileSync(path.join(root, file), 'utf8')).findings.map((finding) => ({
       check: 'comments' as const,
       kind: finding.rule,
       location: `${file}:${finding.line}`,
       message: finding.excerpt,
     })),
   );
+}
+
+const GROWTH_BASE_REF = 'origin/main';
+
+export interface CommentGrowth {
+  base: string;
+  files: { file: string; base: number; head: number }[];
+}
+
+function git(root: string, args: string[]): SpawnSyncReturns<string> {
+  return spawnSync('git', args, toolOptions(root));
+}
+
+export function growthBase(root: string): string {
+  const result = git(root, ['merge-base', 'HEAD', GROWTH_BASE_REF]);
+  if (result.error || result.status !== 0) {
+    const reason = result.error?.message ?? (result.stderr ?? '').trim();
+    throw new Error(
+      `hygiene: cannot find the merge base of HEAD and ${GROWTH_BASE_REF} to measure comment growth from; fetch ${GROWTH_BASE_REF} with history (${reason})`,
+    );
+  }
+  return result.stdout.trim();
+}
+
+/** Compares the working tree with `base`, so uncommitted and untracked source counts as changed. */
+export function commentGrowth(root: string, base: string, exempt: Exempt): CommentGrowth {
+  const listed = (args: string[]) => stdoutOf('git', git(root, args)).split('\0').filter(Boolean);
+  const changed = new Set([
+    ...listed(['diff', '--name-only', '--no-renames', '-z', base]),
+    ...listed(['ls-files', '--others', '--exclude-standard', '-z']),
+  ]);
+  const count = (file: string, text: string | null) => (text === null ? 0 : scanComments(file, text).commentOnlyLines);
+  const files = [...changed]
+    .filter((file) => isSource(file) && !isExempt(exempt, file))
+    .sort()
+    .map((file) => {
+      const atBase = git(root, ['cat-file', 'blob', `${base}:${file}`]);
+      const onDisk = fs.lstatSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()
+        ? fs.readFileSync(path.join(root, file), 'utf8')
+        : null;
+      return { file, base: count(file, atBase.status === 0 ? atBase.stdout : null), head: count(file, onDisk) };
+    });
+  return { base, files };
+}
+
+const GROWTH_GUIDANCE = 'delete narration in the files you touched, or keep only comments that name a hazard';
+
+export function commentGrowthFindings(growth: CommentGrowth): Finding[] {
+  const net = growth.files.reduce((sum, file) => sum + file.head - file.base, 0);
+  if (net <= 0) return [];
+  return [
+    {
+      check: 'comment-growth',
+      kind: 'net-growth',
+      location: `since ${growth.base.slice(0, 12)}`,
+      message: `+${net} comment-only line(s) on net in the changed files; ${GROWTH_GUIDANCE}`,
+    },
+  ];
+}
+
+function printGrowth(growth: CommentGrowth): void {
+  const base = growth.files.reduce((sum, file) => sum + file.base, 0);
+  const head = growth.files.reduce((sum, file) => sum + file.head, 0);
+  const net = head - base;
+  console.log(
+    `\ncomment growth since ${growth.base.slice(0, 12)}: ${growth.files.length} changed source file(s), ` +
+      `comment-only lines base ${base}, head ${head}, net ${net > 0 ? '+' : ''}${net}`,
+  );
+  const gains = growth.files
+    .map((file) => ({ file: file.file, gain: file.head - file.base }))
+    .filter((file) => file.gain > 0)
+    .sort((a, b) => b.gain - a.gain || a.file.localeCompare(b.file))
+    .slice(0, 10);
+  for (const { file, gain } of gains) console.log(`  +${gain}  ${file}`);
 }
 
 /** Every finding the tree owns: exempt files are still analysed, so knip and jscpd see their references. */
@@ -224,7 +300,7 @@ export function hygieneFindings(root: string, exempt: Exempt): Finding[] {
 }
 
 function print(findings: Finding[]): void {
-  for (const check of ['knip', 'jscpd', 'comments'] as const) {
+  for (const check of ['knip', 'jscpd', 'comments', 'comment-growth'] as const) {
     const group = findings.filter((finding) => finding.check === check);
     const kinds = new Map<string, number>();
     for (const finding of group) kinds.set(finding.kind, (kinds.get(finding.kind) ?? 0) + 1);
@@ -247,11 +323,13 @@ function main(): void {
     process.exit(2);
   }
   const exempt = exemptFiles(REPO_ROOT);
-  const findings = hygieneFindings(REPO_ROOT, exempt);
+  const growth = commentGrowth(REPO_ROOT, growthBase(REPO_ROOT), exempt);
+  const findings = [...hygieneFindings(REPO_ROOT, exempt), ...commentGrowthFindings(growth)];
   print(findings);
   console.log(
     `\nexempt: ${exempt.upstream.size} file(s) byte-identical to upstream, ${exempt.vendored.size} vendored design-review file(s)`,
   );
+  printGrowth(growth);
   const report = args.includes('--report');
   console.log(`\nhygiene: ${findings.length} finding(s)${report ? ' (report mode, not failing)' : ''}`);
   process.exitCode = findings.length > 0 && !report ? 1 : 0;

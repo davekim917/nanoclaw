@@ -170,6 +170,8 @@ git init -q "$src"
 # citation it cannot resolve — host CI would then pass a stale citation that
 # ci.yml's `fetch-depth: 0` checkout (.github/workflows/ci.yml:48-50) fails.
 git -C "$src" fetch -q --no-tags "https://github.com/$repo.git" "$head"
+# The base as origin/<base>, as ci.yml's checkout has it: the hygiene run measures comment growth from its merge base.
+git -C "$src" fetch -q --no-tags "https://github.com/$repo.git" "+$base_sha:refs/remotes/origin/$base_ref"
 git -C "$src" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
 got=$(git -C "$src" rev-parse HEAD)
 [ "$got" = "$head" ] || { echo "run-host-ci: fetched $got, not $head" >&2; exit 1; }

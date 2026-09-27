@@ -10,7 +10,7 @@ import { commentFindings, sourceFiles } from './run.js';
 enforceHermeticity();
 
 const rules = (source: string, fileName = 'fixture.ts') =>
-  scanComments(fileName, source).map((finding) => [finding.line, finding.rule]);
+  scanComments(fileName, source).findings.map((finding) => [finding.line, finding.rule]);
 
 describe('comment scan flags', () => {
   it.each([
@@ -126,5 +126,36 @@ describe('scanned files', () => {
       'pr-history scripts/tool.mjs:1',
       'file-line-citation src/a.ts:1',
     ]);
+  });
+});
+
+describe('comment-only line count', () => {
+  const count = (source: string, fileName = 'fixture.ts') => scanComments(fileName, source).commentOnlyLines;
+
+  it('counts every line of a multi-line JSDoc, blank ones included', () => {
+    expect(count('/**\n * One.\n *\n * Two.\n */\nexport const a = 1;\n')).toBe(5);
+  });
+
+  it('counts line and block comments on their own lines, not ones sharing a line with code', () => {
+    expect(count('// a\nconst a = 1; // b\n/* c */ const b = 2;\nconst c = 3; /* d\n e */\n')).toBe(2);
+  });
+
+  it('does not count comment markers inside a template literal, a string or a regex', () => {
+    const source = [
+      'const t = `first',
+      '// not a comment',
+      '/* nor this */',
+      '${a}',
+      '// nor this',
+      '`;',
+      "const s = '// no';",
+      'const r = /\\/\\/ no/;',
+      '',
+    ].join('\n');
+    expect(count(source)).toBe(0);
+  });
+
+  it('counts nothing for a shebang', () => {
+    expect(count('#!/usr/bin/env node\nexport const a = 1;\n', 'tool.mjs')).toBe(0);
   });
 });
