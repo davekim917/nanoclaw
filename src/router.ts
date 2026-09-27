@@ -1142,8 +1142,8 @@ async function deliverToAgent(
   let flagAck: string | undefined;
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const rawText = parsedContent.text ?? '';
-    // Flag vocabulary is provider-specific; precedence mirrors spawn, with agent_groups.agent_provider filling the
-    // gap for groups created mid-run (no container_configs row until the next restart).
+    // Flag vocabulary is provider-specific. Reads the container_configs projection (spawn reads container.json, so
+    // the two can disagree), with agent_groups.agent_provider for groups created mid-run (no row until restart).
     const provider = resolveProviderName(
       session.agent_provider,
       (await getContainerConfig(session.agent_group_id))?.provider ?? agentGroup.agent_provider,
