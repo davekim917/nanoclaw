@@ -83,6 +83,22 @@ it('wider', () => {
     expect(duplicates(keeper, keeper + copy)).toEqual([]);
   });
 
+  it('does not report duplicates a change only moves under a renamed suite', () => {
+    const suite = (title: string) =>
+      `describe('${title}', () => {\n  const v = 1;\n  it('a', () => {\n    expect(f(v)).toBe(2);\n  });\n  it('b', () => {\n    expect(f(v)).toBe(2);\n  });\n});\n`;
+    expect(duplicates(suite('old'), suite('new'))).toEqual([]);
+  });
+
+  it('does not flag a case whose longer match adds no assertion', () => {
+    const longer = "it('longer', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n  g(0);\n});\n";
+    expect(duplicates(longer, longer + keeper)).toEqual([]);
+  });
+
+  it('reports the added copy, not the existing case, when the copy is inserted above it', () => {
+    const copy = "it('copy', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n});\n";
+    expect(duplicates(keeper, copy + keeper)).toEqual(['same-as copy <- keeper']);
+  });
+
   it('does not treat a skipped case as the keeper', () => {
     const skipped = keeper.replace("it('keeper'", "it.skip('keeper'");
     const copy = "it('copy', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n});\n";

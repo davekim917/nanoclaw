@@ -198,7 +198,7 @@ export function extractCases(file: string, text: string): TestCase[] {
 
   const cases: TestCase[] = [];
   const scopes = [{ id: '', names: fileNames }];
-  const seenTitles = new Map<string, number>();
+  let suites = 0;
   const contexts: string[] = [];
 
   const normalize = (node: ts.Node, stop: ts.Node) => new Normalizer(sourceFile, imports, scopes, stop).text(node);
@@ -237,12 +237,7 @@ export function extractCases(file: string, text: string): TestCase[] {
               else if ((ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s)) && s.name) names.add(s.name.text);
             }
             for (const p of callback.parameters) bindingNames(p.name, names);
-            const title = node.arguments[0];
-            const parent = scopes[scopes.length - 1].id;
-            const label = `${parent}>${title && ts.isStringLiteralLike(title) ? title.text : ''}`;
-            const nth = (seenTitles.get(label) ?? 0) + 1;
-            seenTitles.set(label, nth);
-            scopes.push({ id: `${label}#${nth}`, names });
+            scopes.push({ id: `@s${++suites}`, names });
             visitBlock(callback.body.statements, false, callback.body);
             scopes.pop();
             return;
@@ -307,20 +302,32 @@ export function findDuplicateTests(newCases: TestCase[], allCases: TestCase[]): 
       found.push({ kind: 'same-as', test, keeper: same });
       continue;
     }
-    const wider = others.find((c) => isProperPrefix(test.statements, c.statements));
+    const wider = others.find(
+      (c) =>
+        isProperPrefix(test.statements, c.statements) &&
+        c.statements.slice(test.statements.length).some((s) => ASSERTION.test(s)),
+    );
     if (wider) found.push({ kind: 'subsumed-by', test, keeper: wider });
   }
   return found;
 }
 
-const caseKey = (c: TestCase) => `${c.context}\n==\n${c.statements.join('\n')}`;
+const SUITE_SCOPE = /@s\d+::/g;
+const shapeKey = (c: TestCase) => `${c.context}\n==\n${c.statements.join('\n')}`.replace(SUITE_SCOPE, '@s::');
 
 export function addedCases(base: TestCase[], head: TestCase[]): TestCase[] {
-  const remaining = new Map<string, number>();
-  for (const c of base) remaining.set(caseKey(c), (remaining.get(caseKey(c)) ?? 0) + 1);
-  return [...head].sort(order).filter((c) => {
-    const left = remaining.get(caseKey(c)) ?? 0;
-    remaining.set(caseKey(c), left - 1);
-    return left <= 0;
-  });
+  const named = new Map<string, number>();
+  const shaped = new Map<string, number>();
+  const take = (counts: Map<string, number>, key: string) => {
+    const left = counts.get(key) ?? 0;
+    if (left > 0) counts.set(key, left - 1);
+    return left > 0;
+  };
+  for (const c of base) {
+    named.set(`${c.name}\n${shapeKey(c)}`, (named.get(`${c.name}\n${shapeKey(c)}`) ?? 0) + 1);
+    shaped.set(shapeKey(c), (shaped.get(shapeKey(c)) ?? 0) + 1);
+  }
+  const kept = new Set<TestCase>();
+  for (const c of head) if (take(named, `${c.name}\n${shapeKey(c)}`) && take(shaped, shapeKey(c))) kept.add(c);
+  return [...head].sort(order).filter((c) => !kept.has(c) && !take(shaped, shapeKey(c)));
 }
