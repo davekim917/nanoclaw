@@ -15,6 +15,7 @@
  * basenames the operator did not choose (`c++-tools`), and refusing a legal name takes the group's spawn down.
  * Refused only: NUL and unpaired UTF-16 surrogates, which no filename can hold. Such an entry would pass the
  * shape checks, never match, and silently deliver an excluded plugin (and the credential mount riding on it).
+ * `src/plugin-scopes.ts` keeps its narrower PLUGIN_NAME_RE on purpose (operator-authored policy): don't unify them.
  */
 // `\p{Surrogate}` under the `u` flag matches a LONE surrogate only, so valid astral names pass.
 const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\0\p{Surrogate}]+$/su;

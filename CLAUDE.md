@@ -75,7 +75,7 @@ Per-agent-group container runtime config (provider, model, packages, MCP servers
 | Value | Behavior |
 |-------|----------|
 | `disabled` | Agent never learns about ncl (excluded from CLAUDE.md); host rejects any `cli_request`. |
-| `group` (default) | Scoped to own agent group (`groups`, `sessions`, `destinations`, `members`, `tasks`); `--id` auto-filled; cross-group access rejected; `cli_scope` changes blocked. |
+| `group` (default) | Scoped to own agent group (`groups`, `sessions`, `destinations`, `members`, `tasks`, `secrets`); `--id` auto-filled; cross-group access rejected; `cli_scope` changes blocked. |
 | `global` | Unrestricted. Set only by `scripts/init-first-agent.ts --role owner` — not implied by ownership; zero `global` groups is valid and tighter-than-default, never a drift to "fix" by widening. |
 
 ## Container Restart
@@ -89,6 +89,8 @@ Per-agent-group container runtime config (provider, model, packages, MCP servers
 Secrets live in the OneCLI gateway, injected per-request at the proxy boundary — never env vars, chat, or on-disk. `src/onecli-secrets.ts`, `container/skills/onecli-gateway/SKILL.md`.
 
 **Remote MCP servers use OAuth, not a pasted key**: `ncl integrations login|complete|list|remove` runs MCP authorization (discovery → dynamic client registration → PKCE authorization-code), writes the access token into the group's bearer secret, and a sweep duty keeps it fresh. The refresh token is host-side (`data/mcp-oauth/`, 0600) because OneCLI secret values are **write-only** — `PATCH /api/secrets/{id}` exists, no read route does. [docs/mcp-oauth-integrations.md](docs/mcp-oauth-integrations.md)
+
+**API keys arrive through a form, never chat**: `ncl secrets intake` posts a card to an owner's DM whose Slack modal writes the value straight to the vault (`src/modules/secret-intake/`); the requester only learns "stored". `ncl secrets grant` adds an existing name to groups/workgroups. Pending intakes are in memory — a host restart expires them. [docs/secret-intake.md](docs/secret-intake.md)
 
 **Fail-closed, declarative scoping**: `container.json`'s `onecliSecrets` (names/UUIDs) resolves and assigns on every spawn; an unresolvable name aborts the spawn (sweep retries). Workgroup secrets merge as a union with per-group additions — extend only, never subtract. [docs/workgroups.md](docs/workgroups.md) **Gotcha — auto-created agents default to `selective` mode with nothing assigned**: symptom is a `401` from an API whose credential *is* in the vault; fix is declaring `onecliSecrets` above, or `onecli agents set-secrets` / `set-secret-mode --mode all` (looser). Verified against `onecli@1.4.1`. Approval gating is two-sided — a configured gateway rule with no host callback running hangs every credentialed call until timeout.
 

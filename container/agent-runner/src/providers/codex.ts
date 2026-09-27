@@ -445,6 +445,7 @@ export function isCodexOAuthRotationEligible(classification: string | undefined)
  * A child agent's quota failure reaches the parent only as injected prose, where CODEX_USAGE_LIMIT_RE alone would
  * fire on an agent merely writing those words. Detection therefore requires this framing (line-start, since versions
  * may prefix a nickname), the turn-failed sentence and the quota phrase together. Literals are verbatim from 0.151.0.
+ * Accepted residual: prose reproducing the whole framed error at a line start still rotates a healthy turn.
  */
 export const CODEX_CHILD_AGENT_ERROR_FRAMING_RE = /^[\s>*_`[\]()-]*Agent errored:/m;
 
@@ -569,8 +570,8 @@ function* rolloutFilesFor(threadId: string, codexHome: string): Generator<{ path
 }
 
 /**
- * Mirrors the date subpath under the target's sessions/. Copying mid-turn is safe: Codex appends and fsyncs per
- * record.
+ * Mirrors the date subpath under the target's sessions/. Copying mid-turn misses the failed attempt's later
+ * records, which is fine: rotation replays that attempt on the new server.
  */
 export function copyRolloutToFallback(srcRollout: string, srcCodexHome: string, dstCodexHome: string): string | null {
   const srcSessionsRoot = path.join(srcCodexHome, 'sessions');

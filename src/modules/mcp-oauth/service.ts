@@ -25,6 +25,7 @@ import {
   type McpOAuthIntegration,
 } from '../../db/mcp-oauth-integrations.js';
 import { readContainerConfig, updateContainerConfig } from '../../container-config.js';
+import { declareGroupSecret } from '../../onecli-secret-grants.js';
 import { log } from '../../log.js';
 import { assertHttpsEndpoint, discoverAuthorization, type FetchLike } from './discovery.js';
 import {
@@ -42,7 +43,7 @@ import {
   findOnecliSecretByName,
   putOnecliBearerSecret,
   type OnecliSecretRef,
-} from './onecli-secret-writer.js';
+} from '../../onecli-secret-writer.js';
 import { pollDeviceToken, requestDeviceAuthorization } from './device.js';
 import { startLoopbackListener, sshTunnelCommand } from './loopback.js';
 import { createPkcePair, createState } from './pkce.js';
@@ -520,7 +521,7 @@ async function finalizeToken(
     last_refresh_at: new Date(nowMs).toISOString(),
   });
 
-  const grantedToGroup = await ensureSecretDeclared(row.agent_group_id, row.bearer_secret_name);
+  const grantedToGroup = await declareGroupSecret(row.agent_group_id, row.bearer_secret_name);
 
   log.info('MCP OAuth integration connected', {
     integration: row.name,
@@ -600,29 +601,7 @@ async function completeLoginLocked(
 }
 
 /**
- * Add the bearer secret to the group's `container.json` `onecliSecrets`, which
- * is what grants it: the spawn reconciles the OneCLI agent to the merged
- * workgroup and group declarations (when that set is non-empty), so an
- * undeclared bearer is a 401 however fresh its value. True when added.
- */
-async function ensureSecretDeclared(agentGroupId: string, secretName: string): Promise<boolean> {
-  const group = await getAgentGroup(agentGroupId);
-  if (!group) return false;
-  // Read-only fast path: called on every refresh, and `updateContainerConfig`
-  // rewrites the file unconditionally under a lock.
-  if ((readContainerConfig(group.folder).onecliSecrets ?? []).includes(secretName)) return false;
-  let added = false;
-  await updateContainerConfig(group.folder, (config) => {
-    const current = config.onecliSecrets ?? [];
-    if (current.includes(secretName)) return;
-    config.onecliSecrets = [...current, secretName];
-    added = true;
-  });
-  return added;
-}
-
-/**
- * Inverse of `ensureSecretDeclared`, called only by `remove --delete-secret`
+ * Inverse of `declareGroupSecret`, called only by `remove --delete-secret`
  * just before deleting the secret. `spellings` is the name and, when resolved,
  * the UUID: `onecliSecrets` accepts either, and once the secret is deleted a
  * leftover declaration in EITHER spelling aborts the spawn. True when removed.
@@ -631,7 +610,7 @@ async function ensureSecretUndeclared(agentGroupId: string, spellings: string[])
   const group = await getAgentGroup(agentGroupId);
   if (!group) return false;
   const drop = new Set(spellings);
-  // Read-only fast path, mirroring `ensureSecretDeclared`.
+  // Read-only fast path, mirroring `declareGroupSecret`.
   if (!(readContainerConfig(group.folder).onecliSecrets ?? []).some((name) => drop.has(name))) return false;
   let removed = false;
   await updateContainerConfig(group.folder, (config) => {
@@ -807,7 +786,7 @@ async function retryPendingSecretWrite(
       last_refresh_at: new Date(parked.mintedAtMs).toISOString(),
     });
     // Same tail as `finalizeToken`: the bearer must be declared to be granted at spawn.
-    await ensureSecretDeclared(row.agent_group_id, row.bearer_secret_name);
+    await declareGroupSecret(row.agent_group_id, row.bearer_secret_name);
     outcome.refreshed.push(row.name);
     log.info('MCP OAuth bearer write recovered', {
       integration: row.name,
@@ -974,7 +953,7 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
     // would otherwise never be retried. Logged, not rethrown: the bearer is in
     // the vault, and `error` would force a fresh grant per tick for a config problem.
     try {
-      await ensureSecretDeclared(row.agent_group_id, row.bearer_secret_name);
+      await declareGroupSecret(row.agent_group_id, row.bearer_secret_name);
     } catch (err) {
       log.warn('MCP OAuth bearer refreshed but declaring it in container.json failed', {
         integration: row.name,

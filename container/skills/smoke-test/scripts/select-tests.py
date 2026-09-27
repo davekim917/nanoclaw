@@ -49,6 +49,7 @@ WORD = r"(?<![A-Za-z0-9_]){}(?![A-Za-z0-9_])"
 EXCLUDED_MARK = "relPath: '"
 DEFAULT_TIMEOUT_S = 400
 SLOW_MARK = ".test.sh': "
+INHERITED_MARK = re.compile(r"^const INHERITED_ENV = \[(.*)\];$", re.M)
 SOURCES_CASES = re.compile(r"^\s*(?:\.|source)\s+.*smoke-case\.sh\b")
 HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
 
@@ -93,6 +94,10 @@ class Repo:
             elif SLOW_MARK in l:
                 rel, ms = l.strip().split("': ")
                 self.budgets[rel.strip("'")] = int(ms.rstrip(",").replace("_", "")) // 1000
+        inherited = INHERITED_MARK.search(gate_text)
+        if not inherited:
+            sys.exit("select-tests: {} no longer declares INHERITED_ENV on one line".format(GATE))
+        self.inherited_env = set(re.findall(r"'([A-Z_]+)'", inherited.group(1)))
         self.suites = sorted(
             f for f in self.files
             if f.endswith(".test.sh") and f.startswith(SUITE_ROOTS) and f not in self.excluded
@@ -242,10 +247,13 @@ def changed_files(repo, base):
     return sorted(set(diff) | set(untracked))
 
 
-def suite_env(home):
-    env = dict(os.environ, HOME=home, GIT_CONFIG_NOSYSTEM="1", XDG_CONFIG_HOME=os.path.join(home, ".config"))
-    env.pop("GIT_CONFIG_GLOBAL", None)
-    env.pop("GIT_CONFIG_SYSTEM", None)
+def suite_env(repo, home):
+    """The gate's environment, plus this runner's own case filter."""
+    keep = repo.inherited_env | {"SMOKE_CASE", "SMOKE_CASE_LOG"}
+    env = {k: v for k, v in os.environ.items() if k in keep}
+    tmp = os.path.join(home, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    env.update(HOME=home, TMPDIR=tmp, GIT_CONFIG_NOSYSTEM="1", XDG_CONFIG_HOME=os.path.join(home, ".config"))
     return env
 
 
@@ -254,7 +262,7 @@ def run_one(repo, suite, shard, logdir):
     label = suite if shard is None else "{} [{}]".format(suite, shard)
     log = os.path.join(logdir, label.replace("/", "__").replace(" [", ".").replace("]", "") + ".log")
     with tempfile.TemporaryDirectory(prefix="select-tests-home-") as home, open(log, "w") as out:
-        env = suite_env(home)
+        env = suite_env(repo, home)
         if shard is not None:
             env["SMOKE_SHARD"] = shard
         start = time.monotonic()

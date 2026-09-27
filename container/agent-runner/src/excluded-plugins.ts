@@ -49,7 +49,8 @@ export function loadExcludedPlugins(configPath = CONTAINER_CONFIG_PATH): Exclude
   }
   const split = parseExcludedPlugins(raw);
   if (split.topLevel.size || split.subPaths.size) {
-    // Reports what was declared: the host already refused the spawn if an entry matched nothing.
+    // Reports what was declared: when ~/plugins exists the host already refused a spawn whose entry matched
+    // nothing; without it nothing is mounted, so there is nothing to withhold.
     log(
       `excludePlugins: ${[...split.topLevel, ...split.subPaths].sort().join(', ')} ` +
         `(read from ${configPath}; applied by every plugin walker in this container)`,
