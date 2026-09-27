@@ -753,7 +753,7 @@ cut_down_reviewer_named() {
 cut_down_state() {
   local threshold lines pages receipts head login reviewer others
   threshold=$(review_loop_value cutDownThreshold "$CUT_DOWN_THRESHOLD" \
-    'if . == false then "off" elif type == "number" and . >= 0 and floor == . then . else error("not a whole number or false") end') || return 1
+    'if . == false then "off" elif type == "number" and . >= 0 and floor == . then [., 1000000000] | min else error("not a whole number or false") end') || return 1
   if [ "$threshold" = off ]; then
     printf 'ok\t%s on %s sets "cutDownThreshold": false\n' "$REVIEW_LOOP_CONFIG" "$SCOPE_BASE_REF"
     return 0

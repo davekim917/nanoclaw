@@ -2818,6 +2818,8 @@ describe('codex-review risk-scoped review requests', () => {
           changedFile('src/gate.test.ts', undefined, 400),
           changedFile('container/agent-runner/tests/fixtures/big.json', undefined, 400),
           changedFile('pnpm-lock.yaml', undefined, 900),
+          changedFile('Gemfile.lock', undefined, 900),
+          changedFile('app/composer.lock', undefined, 900),
           changedFile('scripts/test_gate.py', undefined, 90),
         ],
       ],
@@ -2841,6 +2843,7 @@ describe('codex-review risk-scoped review requests', () => {
     it.each([
       ['lowers the threshold', '{ "cutDownThreshold": 10 }\n', [changedFile('src/gate.ts', undefined, 11)], 24],
       ['raises it', '{ "cutDownThreshold": 500 }\n', BIG, 0],
+      ['raises it past the shell integer range', '{ "cutDownThreshold": 100000000000000000000 }\n', BIG, 0],
       ['switches the rule off', '{ "cutDownThreshold": false }\n', BIG, 0],
     ])('reads the base config when it %s', (_case, reviewLoop, files, status) => {
       const root = tempRoot();
