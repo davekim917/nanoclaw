@@ -851,9 +851,8 @@ export interface RefreshOutcome {
 
 /**
  * Refresh every integration inside its margin, once per sweep tick. A token
- * failure leaves the row in `error` (transient) or `needs_login` (dead grant or
- * rejected client) and the loop continues; an unreadable bundle throws out of
- * the whole pass.
+ * failure or an unreadable bundle leaves the row in `error` (retried next tick)
+ * or `needs_login` (dead grant or rejected client) and the loop continues.
  */
 export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike = fetch): Promise<RefreshOutcome> {
   const rows = await listMcpOAuthIntegrations();
@@ -896,7 +895,13 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
     }
   }
 
-  const bundle = readMcpOAuthBundle(row.name);
+  let bundle;
+  try {
+    bundle = readMcpOAuthBundle(row.name);
+  } catch (err) {
+    await recordRefreshFailure(row.name, outcome, err);
+    return;
+  }
   if (!bundle?.refreshToken) {
     if (!warnedNeedsLogin.has(row.name)) {
       warnedNeedsLogin.add(row.name);
@@ -1007,13 +1012,17 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
       }
       return;
     }
-    await markMcpOAuthIntegration(row.name, {
-      status: 'error',
-      status_detail: err instanceof Error ? err.message : String(err),
-    });
-    outcome.failed.push(row.name);
-    log.warn('MCP OAuth refresh failed — will retry next sweep', { integration: row.name, err });
+    await recordRefreshFailure(row.name, outcome, err);
   }
+}
+
+async function recordRefreshFailure(name: string, outcome: RefreshOutcome, err: unknown): Promise<void> {
+  await markMcpOAuthIntegration(name, {
+    status: 'error',
+    status_detail: err instanceof Error ? err.message : String(err),
+  });
+  outcome.failed.push(name);
+  log.warn('MCP OAuth refresh failed — will retry next sweep', { integration: name, err });
 }
 
 export interface RemoveResult {

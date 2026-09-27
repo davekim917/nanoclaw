@@ -309,6 +309,26 @@ describe('refreshExpiringMcpOAuthIntegrations', () => {
     expect(outcome.refreshed).toEqual(['b-mr']);
   });
 
+  it('an unreadable bundle fails its own integration, not the pass', async () => {
+    await seed({ name: 'a-mr', mcp_url: 'https://a.test/mcp' });
+    await seed({ name: 'b-mr', mcp_url: 'https://b.test/mcp', bearer_secret_name: 'B-Secret' });
+    fs.writeFileSync(path.join(tmpRoot, 'mcp-oauth', 'a-mr.json'), 'rt-secret-value-not-json');
+
+    const outcome = await refreshExpiringMcpOAuthIntegrations(async () =>
+      tokenResponse({ access_token: 'at-new', expires_in: 3600, token_type: 'Bearer' }),
+    );
+
+    expect(outcome.failed).toEqual(['a-mr']);
+    expect(outcome.refreshed).toEqual(['b-mr']);
+    const broken = (await getMcpOAuthIntegration('a-mr'))!;
+    expect(broken.status).toBe('error');
+    expect(broken.status_detail).toBe('OAuth bundle for "a-mr" is not valid JSON');
+    // V8's parse message quotes the text it choked on, which in a bundle can be a refresh token.
+    const warned = logged.warn.map(([, ctx]) => ((ctx as { err?: Error }).err ?? new Error('')).message);
+    expect(warned).toContain('OAuth bundle for "a-mr" is not valid JSON');
+    expect(warned.join('\n')).not.toContain('rt-secret');
+  });
+
   // Round-1 review F1: the OneCLI write is the fallible step, and a server that
   // rotated its refresh token has already killed the old one. Writing OneCLI
   // first and crashing would leave a dead token on disk.

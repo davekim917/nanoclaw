@@ -60,7 +60,12 @@ export function readMcpOAuthBundle(name: string, dataDir: string = DATA_DIR): Mc
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw err;
   }
-  return JSON.parse(raw) as McpOAuthBundle;
+  try {
+    return JSON.parse(raw) as McpOAuthBundle;
+  } catch (err) {
+    // Not the parse message: V8 quotes the start of the offending text, which here can be a refresh token.
+    throw new Error(`OAuth bundle for "${name}" is not valid JSON`, { cause: err });
+  }
 }
 
 export function writeMcpOAuthBundle(bundle: McpOAuthBundle, dataDir: string = DATA_DIR): void {
