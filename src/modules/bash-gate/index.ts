@@ -137,7 +137,7 @@ function createGateHandler(category: GateCategory) {
   ): Promise<{ deferAck: true }> {
     const label = typeof content.label === 'string' ? content.label : category.defaultLabel;
     const summary = typeof content.summary === 'string' ? content.summary : category.defaultSummary;
-    // Keep the full command: truncating here dropped the trailing flags.
+    // Keep the full command: truncating would drop consequential trailing flags.
     const command = typeof content.command === 'string' ? content.command : '';
     const requestId = typeof content.requestId === 'string' ? (content.requestId as string) : '';
     if (!requestId) {
