@@ -1,9 +1,4 @@
-/**
- * Narrow, named reads that used to be raw-handle queries in caller files
- * (destinations.ts, session-recap.ts, db/delivery-acks.ts). The rows are
- * returned in their on-disk shape so the callers' mapping code — and its
- * tolerance for partially populated rows — is unchanged.
- */
+/** Narrow named reads returning on-disk row shapes, so callers' mapping code is unchanged. */
 import { getInboundDb, getOutboundDb, openInboundDb } from '../../mailbox/sqlite/connection.js';
 
 export interface DestinationRow {
@@ -84,35 +79,10 @@ export function maxOutboundSeq(): number {
 }
 
 /**
- * Whether a reply the PERSON can read was written after `seq`. Asked of the DB
- * rather than counted in-process because `send_message`/`send_file` run in the
- * MCP server's own process (mcp-tools/server.ts) and write here directly.
- *
- * The two ways to be wrong are not equal. Answering "yes" wrongly skips a
- * nudge, which is what happened before this existed. Answering "no" wrongly
- * nudges an agent that already replied, and it replies twice. So this matches
- * loosely and fails open:
- *
- *   - kind: `chat` (send_message, send_file, dispatched result blocks) and
- *     `chat-sdk` (send_card / ask_user_question).
- *     One `system` action also counts: `request_choice` posts a card the
- *     person sees and returns without waiting.
- *     With no `to` it targets the session's own conversation and its row
- *     carries no routing; with `to` the content names `channelType`/`platformId`.
- *     Every other `system` action is host-facing or goes elsewhere
- *     (`escalate_to_owner` → the owner's DM), as are `status` (a progress
- *     label) and `task_log`.
- *   - where: the person's channel + platform. A row to a peer agent or another
- *     channel is `send_message(to: …)` delegating, not an answer.
- *   - NOT the thread, and NOT `threadKey`. No single authority decides the
- *     thread a reply lands in: the MCP tools stamp `getSessionRouting()`,
- *     final-text blocks stamp the channel's newest
- *     inbound row or the batch anchor (`sendToDestination`, poll-loop.ts), and
- *     delivery re-parents null-thread rows under the turn or key anchor. Any
- *     narrower rule produces a false "no"; any row in the person's channel counts.
- *
- * With no routing to match (legacy sessions), any non-agent row counts. An
- * unreadable DB answers `true`.
+ * Whether a reply the PERSON can read was written after `seq`. Asked of the DB because the MCP server writes
+ * from its own process. Matches loosely and fails open (unreadable DB = true): a false "no" makes the agent
+ * reply twice. Counts chat/chat-sdk rows and `request_choice` system cards in the person's channel and
+ * platform, in ANY thread: no single authority decides a reply's thread.
  */
 export function hasChatOutboundAfter(
   seq: number,
@@ -143,12 +113,7 @@ export function hasChatOutboundAfter(
   }
 }
 
-/**
- * Whether a `wait` wake is still pending and not yet due (host row
- * `schedule-wake-<id>`). Read through a
- * fresh handle: the host writes messages_in continuously. bun:sqlite answers a
- * missing row with null, not undefined.
- */
+/** Is a `wait` wake still pending and not yet due? Fresh handle: the host writes continuously. bun:sqlite returns null for a missing row. */
 export function hasFutureSelfWake(): boolean {
   const db = openInboundDb();
   try {

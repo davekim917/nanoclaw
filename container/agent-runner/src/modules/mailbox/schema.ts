@@ -1,74 +1,22 @@
 /**
- * Fork-only session-DB schema, applied on top of upstream's baseline.
+ * Fork-only session-DB schema on top of upstream's baseline, applied once per process from
+ * NanoclawAgentMailbox.start().
  *
- * Upstream's mailbox/sqlite/connection.ts creates the outbound baseline
- * (session_state, container_state's four tool columns) when it opens the
- * singleton. Everything this fork adds beyond that baseline lives here and is
- * applied exactly once per process, from NanoclawAgentMailbox.start().
- *
- * ⚠ Cross-mount visibility: inbound.db MUST be journal_mode=DELETE (set by
- * the host when the file is created). WAL's `-shm` is memory-mapped and
- * VirtioFS does not propagate mmap coherency from host to guest, so a
- * WAL-mode inbound.db would leave this reader frozen on an early snapshot
- * and it would silently never see new host messages. See
- * src/session-manager.ts for the full set of cross-mount invariants and
- * scripts/sanity-live-poll.ts for the empirical validation.
- *
- * The container is the sole writer of outbound.db across the host/container
- * boundary, but the runner and provider-spawned MCP subprocesses hold separate
- * connections and may write concurrently. `prepareOutboundFile` installs the
- * busy handler BEFORE journal-mode so first-use initialization waits out a
- * sibling write instead of failing immediately — upstream's opener sets
- * journal_mode first, and journal_mode is a persistent database property, so
- * pre-setting it here turns upstream's PRAGMA into a lock-free no-op read.
+ * inbound.db MUST be journal_mode=DELETE: VirtioFS does not propagate WAL's mmapped `-shm` from host to guest,
+ * so a WAL inbound.db leaves this reader frozen on an old snapshot.
  */
 import { Database } from 'bun:sqlite';
 
 export const OUTBOUND_DB_PATH = '/workspace/outbound.db';
 
 /**
- * Account-level rate-limit utilization samples.
+ * Account-level rate-limit samples, one row per (sample, window); separate from turn_usage because utilization
+ * belongs to the account, not the turn. `available = 0` means plan limits don't apply; no row means never
+ * sampled. Claude and Codex only (OpenCode exposes nothing), so never imply fleet-wide coverage.
  *
- * Separate from `turn_usage` on purpose: utilization is a property of the
- * ACCOUNT (an OAuth ring slot), not of a turn. Stamping it onto every
- * turn_usage row would repeat one reading across every turn in the same
- * minute, and turn_usage has room for exactly ONE window while the plan
- * exposes up to four. One row per (sample, window) instead.
- *
- * `available = 0` means plan limits do not apply to this session at all
- * (API key, Bedrock, Vertex, missing profile scope) — a normal answer, not a
- * failure. NO ROW means we never sampled. Those are different states and the
- * table keeps them apart.
- *
- * Claude and Codex. Codex rows come from the app-server's
- * `account/rateLimits/read` pull and `account/rateLimits/updated` push
- * (providers/codex-rate-limits.ts); `account` is the ChatGPT account id and
- * `credential_set` the CODEX_HOME slot (`codex:.codex`,
- * `codex:.codex-fallback-N`). OpenCode exposes nothing equivalent, so a read
- * surface over this table must never imply fleet-wide coverage.
- *
- * TWO WAYS THESE ROWS ARE NOT COMPARABLE. Both have already fooled a reader.
- *
- * 1. ACROSS CREDENTIAL SETS. A group with per-group tokens
- *    (`CLAUDE_CODE_OAUTH_TOKEN_<FOLDER>` in the host's .env) runs on an
- *    entirely separate set of Anthropic accounts, and the host forwards those
- *    under the SAME unscoped `_N` names as the global pool. So `account` alone
- *    is ambiguous: `credential_set` is what makes it an identity. Two rows are
- *    the same account series only if BOTH `credential_set` AND `account`
- *    match. Comparing a scoped group's utilization against a global-pool
- *    group's is comparing two different accounts, not two burn rates.
- *
- * 2. ACROSS LANES WITHIN THE GLOBAL POOL. Which global slots are reserved for
- *    agents and which are shared with a human's interactive login is INSTALL
- *    POLICY, not a property of this code — so it is deliberately not encoded
- *    here. `lane` carries whatever the operator declared for that slot in
- *    `CLAUDE_CODE_OAUTH_LANES` (e.g. `1:agentic-primary,3:shared-dev`), and is
- *    NULL when they declared nothing. A slot shared with an interactive
- *    login legitimately shows utilization that no agent caused. That is
- *    correct behaviour and must not be "fixed" by excluding the slot: primary
- *    assignment is not a partition, and failover onto a shared slot is
- *    deliberate resilience — restricting it turns a soft delay into a hard
- *    stall until the window resets.
+ * Rows are the same account series only if BOTH `credential_set` AND `account` match: per-group tokens reuse
+ * the global pool's `_N` names. `lane` is operator-declared install policy; a slot shared with an interactive
+ * login legitimately shows utilization no agent caused, and must not be excluded.
  */
 const RATE_LIMIT_SAMPLES_DDL = `
   CREATE TABLE IF NOT EXISTS rate_limit_samples (
@@ -117,16 +65,9 @@ const RATE_LIMIT_SAMPLES_DDL = `
 `;
 
 /**
- * Open the outbound file just long enough to install the busy handler and
- * pin journal_mode=DELETE, then close it.
- *
- * Upstream's getOutboundDb() runs `PRAGMA journal_mode = DELETE` BEFORE
- * `PRAGMA busy_timeout`, and switching journal mode needs an exclusive lock —
- * so with a sibling MCP subprocess mid-write, that first PRAGMA would fail
- * immediately instead of waiting. journal_mode is persistent in the file
- * header, so setting it here (behind a busy handler) makes upstream's PRAGMA a
- * no-op read that never takes the lock. Regression covered by
- * modules/mailbox/mailbox.test.ts's concurrent-writer case.
+ * Pin journal_mode=DELETE behind a busy handler before upstream's opener runs: its journal_mode PRAGMA precedes
+ * busy_timeout and needs an exclusive lock, so a sibling MCP writer would fail it immediately. journal_mode is
+ * persistent, so upstream's PRAGMA then becomes a lock-free no-op.
  */
 export function prepareOutboundFile(create: () => Database = () => new Database(OUTBOUND_DB_PATH)): void {
   const db = create();
@@ -143,10 +84,7 @@ export function prepareOutboundFile(create: () => Database = () => new Database(
  * upstream's baseline. Safe to call on an already-migrated DB.
  */
 export function ensureNanoclawOutboundSchema(outbound: Database): void {
-  // container_state: tracks the current host-visible long operation. Claude
-  // publishes declared Bash timeouts; Codex publishes a bounded deadline
-  // while native items are in flight. Upstream creates the table with only
-  // the four tool columns; everything below is the fork's.
+  // Upstream creates container_state with only the four tool columns; everything below is the fork's.
   outbound.exec(`
       CREATE TABLE IF NOT EXISTS container_state (
         id                       INTEGER PRIMARY KEY CHECK (id = 1),
@@ -175,20 +113,12 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
     (outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
   );
   const forwardColumns: Array<[string, string]> = [
-    // The tool-in-flight columns were RENAMED in the CREATE TABLE
-    // (last_tool/last_tool_at/last_tool_timeout_ms -> these) without a
-    // migration, so pre-rename DBs lack them; the stale last_* columns
-    // stay behind as harmless dead weight.
+    // Renamed in CREATE TABLE without a migration, so pre-rename DBs need these backfills.
     ['current_tool', 'TEXT'],
     ['tool_declared_timeout_ms', 'INTEGER'],
     ['tool_started_at', 'TEXT'],
     ['provider_status', 'TEXT'],
-    // The host's idle reaper reads this column to tell "busy but holding no
-    // inbound claim" from "finished". It was in the HOST schema and the reap
-    // decision from day one with no writer on either side, so the guard was
-    // permanently false; the writer in container-state.ts is what makes it
-    // real. Older outbound.db files predate the column, hence this backfill
-    // entry alongside the CREATE TABLE above.
+    // The host's idle reaper reads this; older outbound.db files predate it.
     ['provider_executing', 'INTEGER NOT NULL DEFAULT 0'],
     ['provider_last_event_at', 'TEXT'],
     ['provider_last_probe_at', 'TEXT'],
@@ -202,26 +132,15 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
     ['memory_oom_kill_events', 'INTEGER'],
     ['memory_max_events', 'INTEGER'],
     ['memory_telemetry_at', 'TEXT'],
-    // When the current query first produced a provider event (container-state.ts,
-    // `markProviderQueryEvent`). The host's claim rule reads it through a
-    // column tier and treats a DB without it as "no forgiveness", so an
-    // outbound.db created by an older runner is safe before and after this
-    // backfill.
+    // The host reads this through a column tier, so DBs without it are safe before and after the backfill.
     ['provider_query_event_at', 'TEXT'],
-    // Added to CREATE TABLE without a backfill entry — any outbound.db older
-    // than the column made every INSERT throw at boot, so the session
-    // crash-looped on each sweep wake and never answered again (observed
-    // live: a channel-root session silent for 3+ weeks).
+    // Every CREATE TABLE column needs a backfill entry: a missing one made every INSERT throw at boot on older DBs.
     ['updated_at', "TEXT NOT NULL DEFAULT ''"],
   ];
   for (const [name, type] of forwardColumns) {
     if (!containerCols.has(name)) outbound.exec(`ALTER TABLE container_state ADD COLUMN ${name} ${type}`);
   }
-  // turn_usage: added after the initial v2 schema (Fleet Hardening Phase
-  // 0.1), so older outbound.db files don't have it. CREATE IF NOT EXISTS
-  // backfills it on the next connect — same forward-compat pattern as
-  // session_state/container_state above. Column names/types are a fixed
-  // contract with the host-side usage_daily rollup — do not rename.
+  // Column names/types are a fixed contract with the host's usage_daily rollup: do not rename.
   outbound.exec(`
       CREATE TABLE IF NOT EXISTS turn_usage (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,11 +154,7 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
         cost_usd           REAL
       );
     `);
-  // steps/duration_ms/trigger: added after the table above (Fleet Hardening
-  // Phase 0.1 follow-up — per-turn cost attribution). Additive ALTER, same
-  // forward-compat pattern as container_state's forwardColumns loop, so an
-  // outbound.db that already has turn_usage without these columns keeps
-  // working instead of throwing on every INSERT.
+  // Additive ALTERs so older turn_usage tables keep accepting INSERTs.
   const turnUsageCols = new Set(
     (outbound.prepare("PRAGMA table_info('turn_usage')").all() as Array<{ name: string }>).map((c) => c.name),
   );
@@ -247,47 +162,21 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
     ['steps', 'INTEGER'],
     ['duration_ms', 'INTEGER'],
     ['trigger', 'TEXT'],
-    // rate_limit_*: added after the columns above (per-turn cost attribution
-    // follow-up — persist the SDK's weekly-allowance utilization instead of
-    // discarding it). Claude and Codex; always NULL for OpenCode.
+    // Claude and Codex; always NULL for OpenCode.
     ['rate_limit_type', 'TEXT'],
     ['rate_limit_utilization', 'REAL'],
     ['rate_limit_resets_at', 'TEXT'],
-    // turn_id: added after the columns above — correlates the N rows one
-    // multi-model turn writes (see poll-loop.ts's per-model recordTurnUsage
-    // loop), so COUNT(DISTINCT turn_id) is the honest turn count instead of
-    // usage_daily's row-count-based `turns` (which over-counts a split turn).
     ['turn_id', 'TEXT'],
-    // effort/effort_requested: added after the columns above. Every other
-    // column here is a MEASUREMENT (what the API billed); effort is a REQUEST
-    // parameter no provider bills back, so it is stamped on at the provider
-    // (see providers/turn-effort.ts). `effort` is post-clamp — what actually
-    // ran; `effort_requested` is the pre-clamp resolution result, which is
-    // what tells "Haiku dropped a configured high" apart from "nothing was
-    // ever configured".
-    //
-    // NO BACKFILL IS POSSIBLE and none was attempted: the value never existed
-    // for turns written before 2026-09-07, so every row older than the
-    // container that first wrote these columns is NULL. A NULL here means
-    // "not recorded / not attributable", NEVER "ran at no effort" — see the
-    // same cutoff note on migration 076 and in turn-usage.ts.
+    // NULL means not recorded (rows before 2026-09-07), never "ran at no effort"; no backfill is possible.
     ['effort', 'TEXT'],
     ['effort_requested', 'TEXT'],
   ] as const) {
     if (!turnUsageCols.has(name)) outbound.exec(`ALTER TABLE turn_usage ADD COLUMN ${name} ${type}`);
   }
-  // rate_limit_samples: added after turn_usage — same forward-compat pattern.
   outbound.exec(RATE_LIMIT_SAMPLES_DDL);
 }
 
-/**
- * The fork's inbound additions, for in-memory test DBs only.
- *
- * Production inbound.db is host-owned and opened read-only here — the host's
- * migrateMessagesInTable creates these. The test harness builds its inbound
- * schema from upstream's baseline, so the fork columns the runner reads
- * (repository fence, recall pairing) have to be added on top.
- */
+/** Fork inbound columns for in-memory test DBs only: production inbound.db is host-owned and read-only here. */
 export function ensureNanoclawInboundTestSchema(inbound: Database): void {
   const cols = new Set(
     (inbound.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name),
@@ -296,11 +185,7 @@ export function ensureNanoclawInboundTestSchema(inbound: Database): void {
     ['repo_fence_epoch', 'TEXT'],
     ['repo_fence_original_trigger', 'INTEGER'],
     ['source_session_id', 'TEXT'],
-    // Which scheduled slot a task occurrence is FOR, as distinct from
-    // process_after's "when to run next". The HOST owns inbound.db and adds
-    // this in its own migrateMessagesInTable; the container only reads it, so
-    // this entry exists for the in-memory test pair built from upstream's
-    // baseline CREATE TABLE.
+    // The scheduled slot an occurrence is FOR, distinct from process_after ("when to run next").
     ['scheduled_for', 'TEXT'],
   ] as const) {
     if (!cols.has(name)) inbound.exec(`ALTER TABLE messages_in ADD COLUMN ${name} ${type}`);

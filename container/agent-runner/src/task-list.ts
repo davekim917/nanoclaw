@@ -1,23 +1,9 @@
 /**
- * Live task list — the agent's visible progress checklist in a conversation
- * (docs/specs/slack-task-list/plan.md).
- *
- * The agent calls `update_task_list` (mcp-tools/task-list.ts) with the WHOLE
- * list every time; this module owns everything after that: which message the
- * list lives in, whether an update edits it or posts a fresh one, how it
- * renders, and the durable record the host reads if the container dies.
- *
- * One list per session, stored in `session_state.task_list` (outbound.db).
- * The list is posted once as a `kind: 'task_list'` row and then edited in
- * place with `operation: 'edit'` rows of the same kind, so it rides the
- * ordinary delivery path (routing, permission, anchors, secret scrub) while
- * the host can still tell it apart from a reply: it never counts as the
- * answer, never pauses the typing indicator, never lands in the archive.
- *
- * Identity is a GENERATION, never the title — a headline naturally changes as
- * work moves, and keying on it would post a new list every step. A new
- * generation starts only when the agent asks (`new_list`), the previous list
- * is finished (every item done) or was left behind by a context reset.
+ * Live task list: the agent's progress checklist in a conversation. The agent sends the WHOLE list each time;
+ * this module decides post vs edit vs repost and keeps the durable record the host reads if the container dies.
+ * Posted as `kind: 'task_list'` rows so it rides normal delivery yet never counts as the answer. Identity is a
+ * GENERATION, never the title: a new list starts only on `new_list`, when the previous one finished, or after a
+ * context reset.
  */
 import { TIMEZONE } from './timezone.js';
 
@@ -64,23 +50,13 @@ export interface TaskListState {
   postSeq: number | null;
   /** Highest inbound seq when the post was written — the repost check's inbound cursor. */
   postInboundSeq?: number | null;
-  /**
-   * The list still on screen that this post replaces (a busy-thread repost's
-   * old copy, or the previous generation). It is collapsed into a pointer only
-   * once this post has a platform id — until then it IS the visible list, so
-   * it is also what the host marks interrupted if the container dies first.
-   */
+  /** The list this post replaces on screen; collapsed into a pointer only once this post has a platform id (until then it IS the visible list). */
   supersedes?: { outboundId: string; platformMessageId: string } | null;
   /** Platform id of the visible post, once the host has delivered it. */
   platformMessageId: string | null;
   postedAt: string | null;
   updatedAt: string;
-  /**
-   * When this container last wrote the record — on EVERY save, unlike
-   * `updatedAt`, which an unchanged or still-pending update leaves alone
-   * because it is the time on screen. The host's kill fence reads it: a
-   * record touched after a kill began belongs to the replacement container.
-   */
+  /** Set on EVERY save (unlike `updatedAt`, the on-screen time); the host's kill fence reads it. */
   touchedAt?: string;
   /** Every item done: the next update starts a new list. */
   finished: boolean;
@@ -137,11 +113,7 @@ export function parseTaskListInput(args: Record<string, unknown>): TaskListInput
   return { title, items, newList: args.new_list === true };
 }
 
-/**
- * The time in a platform's own self-updating form. Slack and Discord render
- * both the clock time AND "(25 minutes ago)" client-side, so the footer ages
- * without an edit; anything else gets a fixed local time.
- */
+/** Slack and Discord render clock time and relative age client-side, so the footer ages without an edit. */
 function renderTime(channelType: string, iso: string, timezone = TIMEZONE): string {
   const unix = Math.floor(Date.parse(iso) / 1000);
   const local = new Date(iso).toLocaleTimeString('en-US', {
@@ -196,12 +168,7 @@ function activeText(items: TaskItem[]): string | null {
   return active ? active.text : null;
 }
 
-/**
- * A link to the new list for the superseded one to point at. Slack only, and
- * only when every part is a real Slack id; otherwise the pointer is plain
- * text — a link that 404s is worse than none. The domain-less
- * `slack.com/archives` form redirects to the reader's workspace.
- */
+/** Slack only, and only with real Slack ids: a link that 404s is worse than plain text. */
 export function latestListLink(
   channelType: string,
   platformId: string,
@@ -233,10 +200,6 @@ export function parseTaskListState(raw: string | undefined): TaskListState | nul
   }
 }
 
-/**
- * Everything a store/transport must provide. Injected so the decision logic
- * is testable without a mailbox.
- */
 export interface TaskListDeps {
   load(): TaskListState | null;
   save(state: TaskListState): void;
@@ -271,10 +234,7 @@ function sameRoute(a: TaskListRouting, b: TaskListState): boolean {
   return a.channelType === b.channelType && a.platformId === b.platformId && a.threadId === b.threadId;
 }
 
-/**
- * Apply one `update_task_list` call. The single writer of the task_list
- * record: every decision about post vs edit vs repost is made here.
- */
+/** The single writer of the task_list record: every post/edit/repost decision is made here. */
 export async function applyTaskListUpdate(
   input: TaskListInput,
   routing: TaskListRouting,
@@ -287,7 +247,6 @@ export async function applyTaskListUpdate(
   const finished = input.items.every((item) => item.status === 'done');
   const text = renderBody(input.title, input.items);
   const subtext = renderSubtext(routing.channelType, now);
-  // Point a replaced list at the one now on screen.
   const collapse = async (messageId: string, latest: string): Promise<void> => {
     const link = latestListLink(routing.channelType, routing.platformId, routing.threadId, latest);
     await deps.write(
@@ -296,9 +255,7 @@ export async function applyTaskListUpdate(
     );
   };
 
-  // The list this update continues, if any, and the platform id of its
-  // visible post. A post the host reported as failed is no post at all:
-  // start over rather than edit nothing.
+  // A post the host reported as failed is no post at all: start over.
   let current: TaskListState | null =
     prev && !prev.finished && prev.stale !== true && !input.newList && sameRoute(routing, prev) ? prev : null;
   let target: string | null = null;
@@ -310,23 +267,17 @@ export async function applyTaskListUpdate(
       else target = ack.platformId;
     }
     if (current && !target) {
-      // Delivery still pending. Keep the new items so the next call carries
-      // them, and say so rather than stack a second list under this one.
+      // Delivery still pending: keep the new items for the next call rather than stack a second list.
       save({ ...current, title: input.title, items: input.items, revision: current.revision + 1 });
       return { ok: false, error: 'the task list post has not been delivered yet; call update_task_list again shortly' };
     }
     if (current && target && current.supersedes) {
-      // The post is on screen now: the list it replaced can become a pointer.
       await collapse(current.supersedes.platformMessageId, target);
       current = { ...current, supersedes: null };
     }
   }
 
-  // A new list whose finished predecessor is still the last thing in this
-  // conversation takes over that post instead of stacking under it, which
-  // would leave a "Latest task list" pointer aimed at the message right below.
-  // Only a finished list — an unfinished one replaced by `new_list` stays
-  // visible as it was.
+  // A new list whose finished predecessor is still the last message takes over that post instead of stacking under it.
   let reused = false;
   if (
     !current &&
@@ -390,10 +341,8 @@ export async function applyTaskListUpdate(
 
   if (current && target && !busy) {
     if (current.text === text) {
-      // The platform already shows this render (only the footer time would
-      // change); skip the edit (rate limits). Compared against what was last
-      // WRITTEN, not the stored items: an update saved while the post was
-      // still undelivered is not on screen yet and must go out on the retry.
+      // Skip an edit that only changes the footer time (rate limits). Compare against what was last WRITTEN: an
+      // update saved while undelivered must still go out.
       save({ ...next, text: current.text, subtext: current.subtext, updatedAt: current.updatedAt });
       return { ok: true, action: 'unchanged', state: next };
     }
@@ -402,11 +351,7 @@ export async function applyTaskListUpdate(
     return { ok: true, action: 'edited', state: next };
   }
 
-  // Post a fresh list: a new generation, or a repost at the bottom of a busy thread.
-  // What it replaces on screen: on a repost this list's own copy; otherwise the
-  // previous generation's post, or — when that post never showed — whatever
-  // it was itself going to replace. Same conversation only: a list left in
-  // another thread stays as it was.
+  // Replace only within the same conversation; a list in another thread stays as it was.
   const replaced =
     busy && current?.postOutboundId && target
       ? { outboundId: current.postOutboundId, platformMessageId: target }
@@ -426,10 +371,7 @@ export async function applyTaskListUpdate(
   const ack = await deps.awaitPlatformId(post.id, POST_ACK_TIMEOUT_MS);
   if (ack.platformId) {
     next.platformMessageId = ack.platformId;
-    // Collapse the replaced list only now that its replacement is on screen;
-    // a pending post collapses it on the next update, a failed one never
-    // does (the next fresh post inherits `supersedes`). Best effort: a
-    // missing pointer only leaves the old list showing its last state.
+    // Collapse only once the replacement is on screen (a failed post passes `supersedes` on). Best effort.
     if (replaced) {
       await collapse(replaced.platformMessageId, ack.platformId);
       next.supersedes = null;
@@ -456,11 +398,7 @@ export function describeOutcome(outcome: Extract<TaskListOutcome, { ok: true }>)
   }
 }
 
-/**
- * The reminder re-injected after a context compaction or into a fresh
- * context that inherits an unfinished list: the list is state the model
- * must keep maintaining, and compaction can summarize it away.
- */
+/** Re-injected after compaction or into a fresh context with an unfinished list: compaction can summarize it away. */
 export function taskListReminder(state: TaskListState | null): string | null {
   if (!state || state.finished || state.stale) return null;
   const lines = state.items.map((item) => `${STATUS_MARK[item.status]} ${item.text}`).join('\n');
@@ -470,7 +408,6 @@ export function taskListReminder(state: TaskListState | null): string | null {
   );
 }
 
-/** The two state operations the runner-side helpers below need. */
 interface TaskListStore {
   getState(key: string): { value: string } | undefined;
   setState(key: string, value: string): void;
@@ -480,11 +417,7 @@ export function loadTaskListState(store: TaskListStore): TaskListState | null {
   return parseTaskListState(store.getState(TASK_LIST_STATE_KEY)?.value);
 }
 
-/**
- * `/clear` started the conversation over: the list on screen belongs to the
- * old context, so the next update starts a new one (and points the old one
- * at it) instead of editing a list the model no longer knows.
- */
+/** After `/clear` the next update starts a new list instead of editing one the model no longer knows. */
 export function markTaskListStale(store: TaskListStore): void {
   const state = loadTaskListState(store);
   if (!state || state.finished || state.stale) return;

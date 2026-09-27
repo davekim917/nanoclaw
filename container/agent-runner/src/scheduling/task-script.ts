@@ -8,14 +8,8 @@ import { evaluateManagedGitCommand } from '../managed-git-guard.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 import { writeGateRow } from './gate-row.js';
 
-// Pre-task scripts get 120s by default (env-overridable). The old flat 30s
-// killed a working 56s watcher script eight times in a row on 2026-08-22,
-// which auto-paused the series and left the board blind for ~6h the day
-// before a release. A script that truly hangs still dies here — just later.
-// Read per call, not once at module load: the value is fixed for the life of a
-// container in production (the env is set at spawn), so this changes nothing
-// there — but it lets the seam test drive a real timeout through
-// applyPreTaskScripts instead of waiting out the full ceiling.
+// 120s default (env-overridable): a flat 30s killed working watcher scripts and auto-paused their series.
+// Read per call so tests can drive a real timeout.
 function scriptTimeoutMs(): number {
   const parsed = Number.parseInt(process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
@@ -31,16 +25,8 @@ function log(msg: string): void {
   console.error(`[task-script] ${msg}`);
 }
 
-// ── Destructive-command classifier (fleet-hardening Phase 4, P1 leg 2) ────────
-// A pre-task script runs unattended, pre-turn, with no approval round-trip —
-// so `ncl tasks create --script` (access:'open') was an ungated bash-exec path
-// that let an agent do what the interactive Bash gate would have blocked. Fix:
-// run the script through the SAME evaluator the interactive Bash PreToolUse
-// hook uses (claude.ts loadCoreEvaluator → block-destructive-core), and refuse
-// anything it would block OR gate. Reusing the core (not a private regex) means
-// this path inherits future matrix additions (e.g. P2 git history-mutation)
-// for free. Destructive work belongs inside the awakened turn, where the real
-// gate can card an approver.
+// Pre-task scripts run unattended with no approval round-trip, so they go through the SAME evaluator as the
+// interactive Bash hook, and anything it would block OR gate is refused.
 const DEFAULT_GUARD_CORE_PATH =
   '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 type BashEvaluator = (
@@ -61,12 +47,7 @@ async function loadBashEvaluator(): Promise<BashEvaluator | null> {
   return _evalBash;
 }
 
-// Fail-closed fallback for a plugin-less install / a core that fails to import:
-// the egregious hard-block set, same shape as the host-side classifier
-// (src/modules/scheduling/host-script.ts). ponytail: intentionally narrow —
-// the mounted core above is the source of truth and is present in every
-// production container (every Bash command depends on it); this only backstops
-// its absence so the refusal never silently fails open.
+// Fail-closed fallback when the core is missing or fails to import, so the refusal never fails open.
 const FALLBACK_BLOCK: RegExp[] = [
   /\brm\s+(?:-\w*[rf]\w*\s+)+/i,
   /\b(?:unlink|shred|truncate)\b/i,
@@ -80,10 +61,7 @@ const FALLBACK_BLOCK: RegExp[] = [
 
 /** Refuse a pre-task script the interactive Bash gate would block or gate. */
 async function classifyScript(script: string): Promise<{ safe: boolean; reason?: string }> {
-  // Managed canonical metadata is shared by every topic worktree in a
-  // workgroup. Enforce its host-only maintenance boundary before consulting
-  // the Bootstrap evaluator so unattended scripts cannot reach a command the
-  // interactive provider hooks would deny.
+  // Managed canonical metadata is host-only; enforce that before the Bootstrap evaluator.
   const managedGit = evaluateManagedGitCommand(script);
   if (managedGit.action === 'deny') return { safe: false, reason: managedGit.reason };
 
@@ -101,13 +79,7 @@ async function classifyScript(script: string): Promise<{ safe: boolean; reason?:
   return hit ? { safe: false, reason: 'destructive command (fallback classifier)' } : { safe: true };
 }
 
-/**
- * Env for a pre-task subprocess — parity with the interactive Bash path
- * (secret-env.ts). Strips the MCP header-only secrets, which no shell needs.
- * Provider credentials, data-tool creds and the OneCLI proxy vars stay, so a
- * scheduled script can drive `claude -p` / `codex exec` and keep its
- * credentialed monitors working, exactly as an interactive Bash command can.
- */
+/** Parity with the interactive Bash env (secret-env.ts): strip only the MCP header-only secrets. */
 function scriptEnv(): NodeJS.ProcessEnv {
   const strip = new Set<string>(MCP_HEADER_ONLY_SECRET_VARS);
   const env: NodeJS.ProcessEnv = {};
@@ -227,14 +199,7 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
       continue;
     }
 
-    // Fleet-hardening Phase 1.1: a host-gated fire (content.scriptHost) already
-    // ran this script on the host and wrote its scriptOutput before the
-    // container was even spawned — see runHostGatedTaskScripts in
-    // src/modules/scheduling/host-script.ts. Running it again here would
-    // double-execute a script that may have side effects (state files, API
-    // calls) for no reason. A due row the host classifier routed back to the
-    // container (hard-block/gated script, or scriptHost unset) never carries
-    // scriptOutput and reaches the normal execution path below.
+    // A host-gated fire already ran the script on the host; running it again would double its side effects.
     if (content.scriptOutput !== undefined) {
       keep.push(msg);
       continue;
@@ -250,16 +215,9 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     }
 
     log(`running script for task ${msg.id}`);
-    // The batch is deliberately claimed only AFTER these scripts run (see the
-    // caller in poll-loop.ts), so for as long as a script executes the host
-    // sees no processing claim for it. The heartbeat alone does not save the
-    // container: the poll loop touches it every iteration, so it means "alive",
-    // not "busy", and the task reaper does not look at it. provider_executing
-    // is the signal that does mean busy — without it a script that outlives a
-    // sweep tick is killed mid-run once its row stops counting as due.
-    //
-    // A scope, not the turn level: the active poll callback runs this path
-    // concurrently with a provider turn, and neither side may clear the other.
+    // The batch is claimed only AFTER scripts run, and the heartbeat means "alive", not "busy", so publish a busy
+    // scope or the task reaper kills a long script mid-run. A scope, not the turn level: this runs concurrently
+    // with a provider turn.
     touchHeartbeat();
     beginProviderBusyScope();
     let result: ScriptResult | null;
