@@ -55,7 +55,8 @@ import { normalizeName } from '../src/modules/agent-to-agent/db/agent-destinatio
 import { addMember } from '../src/modules/permissions/db/agent-group-members.js';
 import { getUserRoles, grantRole } from '../src/modules/permissions/db/user-roles.js';
 import { upsertUser } from '../src/modules/permissions/db/users.js';
-import { ensureContainerConfig, updateContainerConfigScalars } from '../src/db/container-configs.js';
+import { writeContainerConfigScalars } from '../src/container-config.js';
+import { ensureContainerConfig } from '../src/db/container-configs.js';
 import { namespacedPlatformId } from '../src/platform-id.js';
 import type { AgentGroup, MessagingGroup } from '../src/types.js';
 
@@ -255,7 +256,7 @@ async function main(): Promise<void> {
       });
     }
     // Owner's agent group gets global CLI access
-    await updateContainerConfigScalars(ag.id, { cli_scope: 'global' });
+    await writeContainerConfigScalars(ag.id, ag.folder, { cli_scope: 'global' });
   } else if (args.role === 'admin') {
     const alreadyAdmin = existingRoles.some((r) => r.role === 'admin' && r.agent_group_id === ag.id);
     if (!alreadyAdmin) {

@@ -1157,6 +1157,44 @@ describe('groups config — the container.json + container_configs dual write ho
     expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).both).toBeUndefined();
   });
 
+  it('config add-mount and remove-mount both write file and DB', async () => {
+    const id = 'ag-dual-write-mount';
+    const folder = 'dual-write-mount';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+    const mount = { hostPath: '/srv/data', containerPath: '/workspace/data', readonly: true };
+
+    const added = await dispatch(
+      {
+        id: 'req-mount-add',
+        command: 'groups-config-add-mount',
+        args: { id, host: mount.hostPath, container: mount.containerPath, ro: true },
+      },
+      { caller: 'host' },
+    );
+    expect(added.ok).toBe(true);
+    expect(readContainerConfig(folder).additionalMounts).toEqual([mount]);
+    expect(JSON.parse((await getContainerConfig(id))!.additional_mounts)).toEqual([mount]);
+
+    const removed = await dispatch(
+      {
+        id: 'req-mount-remove',
+        command: 'groups-config-remove-mount',
+        args: { id, host: mount.hostPath, container: mount.containerPath },
+      },
+      { caller: 'host' },
+    );
+    expect(removed.ok).toBe(true);
+    expect(readContainerConfig(folder).additionalMounts).toEqual([]);
+    expect(JSON.parse((await getContainerConfig(id))!.additional_mounts)).toEqual([]);
+  });
+
   it('config add-package and remove-package both write file and DB', async () => {
     const id = 'ag-dual-write-pkg';
     const folder = 'dual-write-pkg';
