@@ -51,7 +51,6 @@ export interface SourceDeps {
 export interface SignalData extends SignalOverview {
   rawDecisions: SourceDecision[];
 }
-/** Read the declared board at its canonical contained workgroup root. */
 export async function readSignalRelease(
   workgroupId: string,
   env: { groupsRoot?: string; dataRoot?: string } = {},

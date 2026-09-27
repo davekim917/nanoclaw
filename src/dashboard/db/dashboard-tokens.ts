@@ -32,21 +32,9 @@ export async function issueDashboardToken(
 }
 
 export async function consumeDashboardToken(tokenHmac: string): Promise<DashboardTokenRecord | null> {
-  // One bound ISO value for both the comparison and the write. NOT
-  // `datetime('now')`, and NOT `datetime(expires_at) > datetime('now')` either:
-  //
-  // `expires_at` is written as ISO (`...T...Z`) while `datetime('now')` yields
-  // the naive `YYYY-MM-DD HH:MM:SS` shape, and SQLite compares them as TEXT. At
-  // index 10, 'T' (0x54) beats ' ' (0x20), so an ISO timestamp always sorts
-  // above a naive one from the same date — meaning a token that expired at 01:00
-  // still satisfied `expires_at > datetime('now')` at 08:10 the same day. That
-  // was a live auth bypass: expired tokens stayed valid for the remainder of the
-  // UTC day they died on, bounded only by the date rolling over and by
-  // `used_at IS NULL` keeping them single-use.
-  //
-  // Wrapping both sides in `datetime()` would fix the comparison but leave
-  // `used_at` still writing the naive shape, so the same class of bug simply
-  // moves to the next reader of that column. Binding one ISO value fixes both.
+  // One bound ISO value for the comparison and the write, never `datetime('now')`: `expires_at` is ISO and a TEXT
+  // comparison against the naive shape sorts ISO above naive on the same date, which kept expired tokens valid for
+  // the rest of their UTC day. Wrapping both sides in `datetime()` would still leave `used_at` naive.
   const nowIso = new Date().toISOString();
   const row = await getDb().get<DashboardTokenRecord>(
     `UPDATE dashboard_tokens
@@ -61,13 +49,7 @@ export async function consumeDashboardToken(tokenHmac: string): Promise<Dashboar
 }
 
 /**
- * Prune dashboard_tokens rows. Called from the host sweep tick (post-build QA
- * fix SF-6 — without this the table grew unbounded as every /dashboard-token
- * invocation added a row that was never reaped).
- *
- * Retention: 1 day past the token's `expires_at`. The grace period preserves
- * "expired" rows briefly so an operator chasing an issue can confirm a token was
- * issued; production cookies are tied to fresh tokens that get consumed quickly.
+ * Called from the host sweep so the table does not grow unbounded. Keeps rows 1 day past `expires_at` for debugging.
  */
 export async function pruneDashboardTokens(): Promise<void> {
   await getDb().run(`DELETE FROM dashboard_tokens WHERE expires_at < datetime('now', '-1 day')`);

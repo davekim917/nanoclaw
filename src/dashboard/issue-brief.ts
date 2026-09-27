@@ -1,25 +1,11 @@
 /**
- * Read path for `GET /dashboard/api/observatory/issue-brief`.
- *
- * The Decisions view names an ask in one line, but a person deciding usually
- * needs what the ISSUE says — the body QA wrote, the labels, and the latest
- * comments (which is where a proposed default and its do-by live). This
- * fetches that live from GitHub when a row is expanded, so the board itself
- * stays light and never goes stale between watcher runs.
- *
- * Security shape matches assign/steer: the client sends ids only. The URL
- * fetched is read out of the workgroup's own release-state.json and must
- * parse as a github.com issue/PR path — the browser can pick which item,
- * never which host gets called.
- *
- * Scope: the `workgroup` query value is caller-chosen, and workgroups are the
- * data-pool boundary (different clients live in different workgroups). So the
- * first thing after argument validation is `hasWorkgroupAccess` — the same
- * predicate `observatoryHandler` gates the board itself on — and a caller who
- * cannot see the workgroup gets the same 404 an unknown workgroup gets. That
- * check runs before the board read, before the cache (keyed by workgroup, so it
- * would otherwise hand one caller another's fetch), and before the workgroup's
- * scoped GitHub token is resolved.
+ * `GET /dashboard/api/observatory/issue-brief`: fetches an item's issue body, labels and latest comments live from
+ * GitHub when a Decisions row is expanded.
+ * The client sends ids only; the fetched URL comes from the workgroup's own release-state.json and must parse as a
+ * github.com issue/PR path, so the browser picks the item, never the host.
+ * `workgroup` is caller-chosen and workgroups are the data-pool boundary, so `hasWorkgroupAccess` runs first: before
+ * the board read, before the workgroup-keyed cache (which would otherwise hand one caller another's fetch), and
+ * before the scoped GitHub token is resolved. No access is the same 404 as unknown.
  */
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
@@ -32,7 +18,7 @@ const json = (status: number, body: unknown): Response =>
 interface IssueBrief {
   state: string;
   labels: string[];
-  /** Issue/PR body, truncated server-side. */
+  /** Truncated server-side. */
   body: string;
   bodyTruncated: boolean;
   comments: { author: string; at: string; body: string }[];
@@ -48,12 +34,11 @@ const FETCH_TIMEOUT_MS = 8000;
 
 const cache = new Map<string, { at: number; brief: IssueBrief }>();
 
-/** Test-only. */
 export function _resetIssueBriefCacheForTesting(): void {
   cache.clear();
 }
 
-/** Mirror of capabilities.ts resolveScopedEnvVar — deliberate duplication, same as there. */
+/** Deliberately duplicates capabilities.ts resolveScopedEnvVar. */
 async function githubTokenFor(workgroupId: string): Promise<string | null> {
   const folders = await getDb().all<{ folder: string }>(
     'SELECT folder FROM agent_groups WHERE workgroup_id = ?',
@@ -88,9 +73,7 @@ export const observatoryIssueBriefHandler: AuthHandler = async (req, _params, ct
   const itemId = url.searchParams.get('item');
   if (!workgroupId || !itemId) return json(400, { error: 'workgroup and item are required' });
 
-  // Before the board read, the cache and the token: a workgroup the caller
-  // cannot see is absent — 404, never 403, so its existence does not leak.
-  // Same predicate as observatoryHandler (api/observatory.ts).
+  // Before the board read, the cache and the token: an invisible workgroup is absent (404, never 403).
   if (!(await hasWorkgroupAccess(workgroupId, ctx))) return json(404, { error: 'not_found' });
 
   const state = await readReleaseState(workgroupId);
@@ -98,7 +81,7 @@ export const observatoryIssueBriefHandler: AuthHandler = async (req, _params, ct
   if (!item) return json(404, { error: 'item_not_on_board' });
   if (!item.url) return json(404, { error: 'item_has_no_url' });
 
-  // Only ever call api.github.com, with pieces parsed from the recorded URL.
+  // Only ever calls api.github.com, with pieces parsed from the recorded URL.
   const m = item.url.match(/^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/(?:issues|pull)\/(\d+)(?:[/#?].*)?$/);
   if (!m) return json(404, { error: 'item_url_not_github' });
   const [, owner, repo, num] = m;
@@ -111,7 +94,7 @@ export const observatoryIssueBriefHandler: AuthHandler = async (req, _params, ct
   if (!token) return json(502, { error: 'no_github_token' });
 
   try {
-    // The issues endpoint serves PRs too (body/labels/state are shared).
+    // The issues endpoint serves PRs too.
     const issue = (await gh(`/repos/${owner}/${repo}/issues/${num}`, token)) as {
       state: string;
       body: string | null;

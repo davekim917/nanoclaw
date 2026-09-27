@@ -1,12 +1,7 @@
 /**
- * Steer write path for `POST /dashboard/api/sessions/:id/message`.
- *
- * Flow: input validation, §2a scope filter, role gate, per-(user, child)
- * rate-limit, reserve-before-write idempotency, partial-write recovery,
- * SSE emit, wakeContainer, fire-and-forget echo to the originating
- * Slack/Discord thread via setImmediate. `_writeAndEchoSteer` is the core;
- * `applySessionSteer` is a thin loader that resolves the session and its
- * echo destination.
+ * Steer write path for `POST /dashboard/api/sessions/:id/message`: validation, scope filter, role gate, per-(user,
+ * child) rate limit, reserve-before-write idempotency, partial-write recovery, SSE emit, wake, and a fire-and-forget
+ * echo to the originating chat thread.
  */
 import { randomUUID } from 'crypto';
 import { createHash } from 'crypto';
@@ -32,8 +27,6 @@ import {
 import { emitDashboardEvent } from './api/events.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
-// ── In-memory rate-limit: keyed by `${user_id}:${child_session_id}` ──────────
-
 interface RateWindow {
   count: number;
   windowStart: number;
@@ -43,11 +36,8 @@ const rateLimitMap = new Map<string, RateWindow>();
 const RATE_LIMIT_MAX = 30;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
-// Opportunistic eviction threshold for rate-limit Map. The map is in-memory and
-// per-(user, child_session) — entries accumulate over time as new sessions are
-// created. Without eviction the map grows unbounded over the host's lifetime
-// (post-build QA fix SF-7). When size crosses this threshold we sweep stale
-// entries (those whose windows have fully expired).
+// Soft cap that triggers a sweep of expired windows, so the per-(user, session) map cannot grow unbounded over the
+// host's lifetime.
 const RATE_LIMIT_MAP_SOFT_CAP = 1024;
 
 function _sweepExpiredRateWindows(now: number): void {
@@ -85,16 +75,12 @@ export function _resetRateLimitForTesting(): void {
   rateLimitMap.clear();
 }
 
-// ── Role check ────────────────────────────────────────────────────────────────
-
 /**
- * Exported for `thread-message.ts`, which must run this BEFORE it resolves a
- * session: assigning to an agent that has never spoken on the thread CREATES a
- * session row, and creating one is a side effect a caller who cannot steer must
- * never be able to cause. It is the same gate, run earlier — not a second one.
+ * `thread-message.ts` must run this BEFORE resolving a session: resolving can CREATE a session row, a side effect a
+ * caller who cannot steer must never cause.
  */
 export function canSteer(userId: string, agentGroupId: string): Promise<{ ok: boolean; reason?: string }> {
-  // The role predicates are lease-only (§4.5 I-1); one block for the whole decision.
+  // Lease-only role predicates; one block for the whole decision.
   return withCentralSync((): { ok: boolean; reason?: string } => {
     if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
       return { ok: true };
@@ -105,8 +91,6 @@ export function canSteer(userId: string, agentGroupId: string): Promise<{ ok: bo
     return { ok: false, reason: 'not_found' };
   }, 'canSteer');
 }
-
-// ── Shared executor ───────────────────────────────────────────────────────────
 
 type SteerStatus = 202 | 400 | 403 | 404 | 409 | 422 | 429 | 503;
 type SteerResult = { status: SteerStatus; body: Record<string, unknown> };
@@ -119,21 +103,14 @@ interface EchoConfig {
 
 interface SteerExecution {
   target: SteerTarget;
-  // Agent group the target lives under — used for both the scope check and
-  // SSE routing. For tasks: parent_agent_group_id. For sessions: agent_group_id.
+  // Scope check and SSE routing. Tasks: parent_agent_group_id; sessions: agent_group_id.
   agentGroupId: string;
-  // Where the inbound write lands. For tasks: task.child_session_id. For
-  // sessions: the session itself.
+  // Tasks: task.child_session_id; sessions: the session itself.
   childAgentGroupId: string;
   childSessionId: string;
-  // Where the echo posts. For tasks: child_messaging_group_id +
-  // child_platform_thread_id + surface_mode. For sessions: the session's own
-  // messaging_group_id + thread_id (or headless when MG is null).
+  // Sessions with a null messaging group are headless (no echo).
   echo: EchoConfig;
-  // Optional task-only side effect after the inbound write commits.
   onWrite?: () => void;
-  // What goes into the inbound message envelope's `_steer` block. Lets
-  // session-targeted writes carry a different attribution payload.
   envelope: Record<string, unknown>;
 }
 
@@ -149,12 +126,11 @@ async function _writeAndEchoSteer(
   if (!text || !text.trim()) return { status: 400, body: { error: 'empty_message' } };
   if (text.length > 4000) return { status: 400, body: { error: 'message_too_long' } };
 
-  // §2a scope filter — disclose-as-not-found.
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(exec.agentGroupId)) {
     return { status: 404, body: { error: 'not_found' } };
   }
 
-  // Role gate — same disclose-as-not-found pattern.
+  // Same not-found shape as the scope filter.
   const roleCheck = await canSteer(userId, exec.agentGroupId);
   if (!roleCheck.ok) {
     return { status: 404, body: { error: 'not_found' } };
@@ -185,12 +161,8 @@ async function _writeAndEchoSteer(
   }
 
   if (reserved.status === 'applied' && reserved.cached) {
-    // Echo-recovery on idempotent replay. If the original run crashed
-    // between `applyIdempotency` and the setImmediate echo schedule,
-    // `echo_attempted` stays 0 and the operator's Slack/Discord thread
-    // never sees the message. claim+fire here closes that window —
-    // single CAS guarantees we don't double-echo if the original
-    // setImmediate already ran.
+    // Echo recovery on idempotent replay: a crash between reservation and the echo schedule leaves `echo_attempted` 0
+    // and the chat never sees the message. The single CAS prevents a double echo.
     if (!reserved.echoAttempted && (await claimEchoAttempted(reserved.id))) {
       setImmediate(() => {
         void (async () => {
@@ -206,15 +178,9 @@ async function _writeAndEchoSteer(
   }
 
   const resolvedMessageId = reserved.messageId;
-  // Read-only seam: this is the partial-write recovery probe (D5), so it must
-  // answer without provisioning or migrating the child's mailbox. `undefined`
-  // (no mailbox yet) is "the message is not there", which is what the write
-  // below then fixes. `recoverJournal` keeps the pre-seam behavior: rolling a
-  // hot journal back is the only reason a read-only handle can answer a
-  // session whose host write was interrupted, and this caller owns that
-  // session's write anyway. 5s busy_timeout, the write path's, not the
-  // console fan-out's 1s — one named session, and a false "not there" here
-  // costs a duplicate insert.
+  // Partial-write recovery probe through the read-only seam: no provisioning or migrating. `undefined` means not
+  // there yet. `recoverJournal` rolls back a hot journal from an interrupted host write; the 5s busy_timeout matters
+  // because a false "not there" costs a duplicate insert.
   const inboundExists =
     readSessionInbound(
       { agentGroupId: exec.childAgentGroupId, sessionId: exec.childSessionId },
@@ -302,12 +268,7 @@ async function _writeAndEchoSteer(
   return { status: 202, body: _responseShapeForTarget(steerResponse) };
 }
 
-/**
- * Re-shape the generic `SteerResponse` for HTTP. The task endpoint has
- * carried `task_id` in the body since v1; the session endpoint exposes
- * `session_id`. `target_type`/`target_id` are also included so future
- * clients can stay generic.
- */
+/** The task endpoint's body carries `task_id`, the session endpoint's `session_id`. */
 function _responseShapeForTarget(r: SteerResponse): Record<string, unknown> {
   const base: Record<string, unknown> = {
     target_type: r.target_type,
@@ -372,8 +333,6 @@ async function _emitEchoStatus(
   }
 }
 
-// ── Session steer ─────────────────────────────────────────────────────────────
-
 export async function applySessionSteer(
   sessionId: string,
   body: { idempotency_key: string; text: string },
@@ -386,9 +345,7 @@ export async function applySessionSteer(
     return { status: 404, body: { error: 'session_not_found' } };
   }
 
-  // Session lives in chat when messaging_group_id is set. Agent-shared
-  // sessions (mg=null) have no chat surface to echo into — analogous to a
-  // task in `headless` surface mode.
+  // A session with no messaging group has no chat surface to echo into.
   const echo: EchoConfig = session.messaging_group_id
     ? {
         kind: 'thread',
@@ -415,8 +372,6 @@ export async function applySessionSteer(
   }
   return result;
 }
-
-// ── Handlers ──────────────────────────────────────────────────────────────────
 
 async function _readSteerBody(req: Request): Promise<{ idempotency_key: string; text: string } | { error: Response }> {
   let body: { idempotency_key?: string; text?: string };

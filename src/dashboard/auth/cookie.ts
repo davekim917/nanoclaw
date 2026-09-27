@@ -9,11 +9,8 @@ export interface CookiePayload {
 }
 
 /**
- * Shared TTL used by both the dashboard-token issuer and the cookie's
- * Max-Age. Env-overridable via NANOCLAW_DASHBOARD_SESSION_TTL_HOURS so an
- * operator can shorten it on a shared host. Default 30 days (720h) — the
- * SPA forced a re-token every 12h before this, which Operator (sole user on
- * his deployment) found needlessly annoying.
+ * Shared TTL for the dashboard token and the cookie Max-Age; NANOCLAW_DASHBOARD_SESSION_TTL_HOURS overrides the
+ * 30-day default.
  */
 export function dashboardSessionTtlHours(): number {
   const raw = process.env.NANOCLAW_DASHBOARD_SESSION_TTL_HOURS;
@@ -57,21 +54,15 @@ export function resolveServerKey(): Buffer {
 }
 
 /**
- * Build a Set-Cookie header value for the spawn_board session cookie.
- *
- * `secure` controls the `Secure` attribute. Set to `false` for direct HTTP
- * access from non-loopback hosts (the only deployment shape where browsers
- * silently refuse Secure cookies on plain HTTP). The exchange handler
- * detects this via `X-Forwarded-Proto` header + Host loopback check and
- * passes the right value. Default `true` preserves the security-strict
- * behavior for HTTPS deployments and localhost.
+ * `secure: false` only for direct HTTP from non-loopback hosts, where browsers silently refuse Secure cookies; the
+ * exchange handler decides. Default true.
  */
 export function buildSetCookie(payload: CookiePayload, serverKey: Buffer, options: { secure?: boolean } = {}): string {
   const payloadJson = JSON.stringify(payload);
   const payloadB64 = Buffer.from(payloadJson).toString('base64');
   const hmac = crypto.createHmac('sha256', serverKey).update(payloadB64).digest('base64');
   const encoded = `${payloadB64}.${hmac}`;
-  const secure = options.secure !== false; // default true
+  const secure = options.secure !== false;
   const secureAttr = secure ? 'Secure; ' : '';
   const maxAgeSec = Math.floor(dashboardSessionTtlHours() * 3600);
   return `spawn_board=${encoded}; HttpOnly; ${secureAttr}SameSite=Strict; Max-Age=${maxAgeSec}; Path=/dashboard`;

@@ -1,33 +1,10 @@
 /**
- * Thread snooze — the triage mode's `S` verdict (DESIGN.md §11).
- *
- *   POST /dashboard/api/threads/:id/snooze
- *   POST /dashboard/api/threads/:id/unsnooze
- *
- * **Why this is not archive.** `archived_at` is what DESIGN §5 computes the
- * `done` state from, so archiving a thread to hide it says "finished" about
- * work that is anything but, and nothing un-archives on activity — the thread
- * would never come back. A snooze is the opposite promise: hide it *until it
- * moves*.
- *
- * **Why there is no timer.** The snooze records the thread's activity stamp at
- * the moment it was taken and expires by comparison ({@link isSnoozed}). A
- * thread is snoozed for exactly as long as its newest activity has not moved
- * past that mark, so the sweep does not have to know this feature exists.
- *
- * **Role gate — deliberately stricter than the capability requires. Do not
- * "correct" it back.** On the merits a snooze needs only visibility: it changes
- * nothing an agent can see, the row is keyed by `user_id`, and the only reader
- * is this operator's own list. Gating it on visibility alone would be
- * defensible. It is gated on `hasAdminPrivilege` anyway — the same privilege
- * `archive.ts` demands — because it would otherwise be the ONE endpoint in this
- * surface where a scoped member may act, and a lone exception outlives the
- * argument that justified it: the next reader inherits the widening without the
- * reasoning. Opening it to members later is a decision someone can make with
- * this paragraph in front of them; discovering it was already open is not.
- *
- * §2a still applies on top: out-of-scope, unprivileged and nonexistent all
- * collapse to one 404, so the gate never discloses that a thread exists.
+ * Thread snooze: the triage `S` verdict (`POST .../snooze`, `.../unsnooze`). Not archive: archiving says "finished"
+ * and nothing un-archives on activity. A snooze hides a thread until it moves.
+ * No timer: the snooze records the thread's activity stamp and expires by comparison ({@link isSnoozed}).
+ * Role gate deliberately stricter than the capability needs; do not "correct" it. A snooze only needs visibility, but
+ * it is gated on `hasAdminPrivilege` so it is not the one endpoint on this surface where a scoped member may act.
+ * Out-of-scope, unprivileged and nonexistent all collapse to one 404.
  */
 import { withCentralSync } from '../db/central-lease.js';
 import { getDb } from '../db/connection.js';
@@ -45,11 +22,8 @@ interface ThreadSnoozeRow {
 }
 
 /**
- * Is a snooze still in force?
- *
- * `snoozedAtActivity` is the thread's newest activity when the snooze was
- * taken. It holds while the thread has not moved past that mark; a snooze
- * taken on a thread with no activity at all (null) holds until it has any.
+ * Holds while the thread's newest activity has not moved past `snoozedAtActivity`; a snooze on a thread with no
+ * activity (null) holds until it has any.
  */
 export function isSnoozed(snoozedAtActivity: string | null | undefined, lastActivityAt: string | null): boolean {
   const s = parseUtcTimestampMs(snoozedAtActivity);
@@ -59,11 +33,7 @@ export function isSnoozed(snoozedAtActivity: string | null | undefined, lastActi
 }
 
 /**
- * The caller's snoozes for exactly the threads on the page, indexed by thread.
- *
- * One query per list build, bounded by the page — never a per-row lookup.
- * A read failure degrades to "nothing is snoozed", which shows the operator
- * more than they asked for rather than silently hiding live work.
+ * One query per page. A read failure degrades to "nothing is snoozed": showing more beats silently hiding live work.
  */
 export async function readThreadSnoozes(userId: string, threadIds: string[]): Promise<Map<string, string | null>> {
   const out = new Map<string, string | null>();
@@ -83,13 +53,7 @@ export async function readThreadSnoozes(userId: string, threadIds: string[]): Pr
   return out;
 }
 
-/**
- * The thread's newest activity, and whether the caller may see it at all.
- *
- * Mirrors the list path's synthetic-key rule (`session:<id>` for a session with
- * a NULL `thread_id`) so the same id the console renders addresses the same
- * thread here.
- */
+/** Uses the list path's `session:<id>` synthetic-key rule so the rendered id addresses the same thread. */
 async function loadThreadForSnooze(
   threadId: string,
   ctx: AuthedRequestContext,
@@ -111,10 +75,8 @@ async function loadThreadForSnooze(
     ? rows
     : rows.filter((r) => ctx.scopes.allowed_group_ids.includes(r.agent_group_id));
   if (visible.length === 0) return null;
-  // Admin on at least one agent group backing the thread — see the header on
-  // why this is stricter than the capability needs. The activity mark below is
-  // still taken over every VISIBLE session, so it compares like-for-like with
-  // the `last_activity_at` the list computes.
+  // The activity mark is taken over every VISIBLE session so it compares like-for-like with the list's
+  // `last_activity_at`.
   const admin = await withCentralSync(
     () => visible.some((r) => hasAdminPrivilege(ctx.user.id, r.agent_group_id)),
     'thread snooze authority',
@@ -126,14 +88,9 @@ async function loadThreadForSnooze(
     const ms = parseUtcTimestampMs(r.last_outbound_at ?? r.last_active ?? r.created_at);
     if (ms !== null && ms > bestMs) bestMs = ms;
   }
-  // NORMALIZED, never stored verbatim. `sessions.last_outbound_at` is written
-  // naive by `bumpLastOutbound` (see the note in api/threads.ts), so copying the
-  // column through would mint a permanently naive column: migration 053's
-  // normalizer runs off an explicit allowlist and skips tables it does not name,
-  // so nothing downstream would ever fix it. Comparisons happen to survive
-  // either shape because `isSnoozed` parses both sides, but a later
-  // `MAX(col)` or `col >= ?` over a mixed column would silently pick the wrong
-  // row — which is exactly the failure 053 exists to prevent.
+  // NORMALIZED, never stored verbatim: `last_outbound_at` is written naive, and migration 053's normalizer skips
+  // tables it does not name, so a copied value would leave a permanently mixed-format column that later `MAX()` or
+  // `>=` comparisons would get wrong.
   return { lastActivityAt: bestMs === -Infinity ? null : new Date(bestMs).toISOString() };
 }
 

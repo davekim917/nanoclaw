@@ -37,11 +37,9 @@ export const exchangeHandler: Handler = async (req) => {
     });
   }
 
-  // Detect whether the request was made over HTTPS or to a loopback host.
-  // Browsers refuse Secure cookies over plain HTTP for non-loopback hosts; if
-  // the dashboard is reached at http://<lan-ip>:3000, we must omit Secure or
-  // the cookie silently doesn't get set and the user loops back to AuthGate.
-  // Reverse proxies set X-Forwarded-Proto when terminating TLS in front of us.
+  // Browsers refuse Secure cookies over plain HTTP to non-loopback hosts, so for http://<lan-ip> the Secure attribute
+  // must be omitted or the user loops back to the auth gate. Reverse proxies set X-Forwarded-Proto when terminating
+  // TLS.
   const xfp = req.headers.get('x-forwarded-proto');
   const hostHeader = req.headers.get('host') ?? '';
   const hostname = hostHeader.split(':')[0] ?? '';
@@ -61,5 +59,4 @@ export const exchangeHandler: Handler = async (req) => {
   });
 };
 
-// Side-effect registration
 register('POST', '/dashboard/api/auth/exchange', exchangeHandler);

@@ -1,29 +1,8 @@
 /**
- * Haiku-generated session titles for the inbox board.
- *
- * Why: a bare session id is meaningless on the inbox board. A short
- * Haiku-generated label ("EXAMPLE-71 — rollout fix", "Slack auto-wire") makes
- * the card scannable without opening the thread.
- *
- * What the sweep does, once per host-sweep tick (60s by default):
- *   1. Picks up to {@link CONCURRENCY_CAP} sessions that need a title:
- *      either no title yet, OR last generated ≥1h ago AND ≥10 new
- *      messages since `title_basis_seq`.
- *   2. For each, opens the session's `inbound.db` + `outbound.db`,
- *      grabs the last few messages, calls Haiku via {@link callTitleBackend},
- *      writes the result back to `sessions.title` along with the basis
- *      seq + timestamp.
- *
- * Why a sweep, not on-write: title generation is best-effort and bounded
- * by API cost. Doing it on every inbound write would amplify by 1 LLM
- * call per message; once-per-minute capped at 3 concurrent keeps the cost
- * predictable and the operator never waits on it (the inbox renders the
- * session id or last-progress text as a fallback).
- *
- * Why ≥10 new messages for refresh: a stale title is better than a churning
- * title. If only a handful of messages came in, the topic almost certainly
- * hasn't changed — and a refresh that reshuffles a card's label on every
- * inbox refresh would be more distracting than useful.
+ * Haiku-generated session titles for the inbox board, refreshed by a sweep: each tick picks up to
+ * {@link CONCURRENCY_CAP} sessions with no title, or with a title older than the cooldown AND at least
+ * REFRESH_MIN_NEW_MESSAGES new messages. A sweep rather than on-write keeps LLM cost bounded; a stale title beats a
+ * churning one.
  */
 import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
@@ -37,31 +16,9 @@ import {
   type StructuredCredential,
 } from '../llm.js';
 
-// `callTitleBackend` rotates credentials through src/llm.ts's
-// `callWithCredentialRotation`, which keeps its "which slot last succeeded"
-// and "which slots are currently parked" state at MODULE level in llm.ts —
-// not per-call, not per-caller. That state is shared across every
-// concurrent candidate in a single sweep tick, not just across ticks: once
-// candidate 1 discovers a slot needs parking (quota-exhausted with a long
-// retry-after) or has already rotated past a dead one, candidates 2 and 3
-// see that same state on every attempt they make AFTER that point — a
-// dead/parked slot does not get separately re-tried by all CONCURRENCY_CAP
-// candidates in the same tick. This is "for free" from llm.ts, not
-// something this file implements — verified via src/llm.test.ts's
-// credential-rotation/parking suites, which exercise the same shared state
-// this sweep's production path (below, non-test-override branch) goes
-// through.
-//
-// CONCURRENCY_CAP no longer means real concurrency at the request level:
-// `callWithCredentialRotation` now queues behind a process-wide gate
-// (`withCredentialRotationGate` in llm.ts) that allows at most one in-flight
-// request at a time, spaced by a minimum interval — added because this cap's
-// "up to 3 at once" WAS the concurrency that produced the short-window
-// bursts tripping otherwise-healthy accounts' rate limits (see llm.ts's gate
-// doc comment). This constant now just bounds how many candidates get
-// PICKED per tick (`pickCandidates(CONCURRENCY_CAP)` below) and dispatched
-// into that queue — the queue itself, not this cap, is what limits in-flight
-// requests.
+// Bounds how many candidates are PICKED per tick, not in-flight requests: `callWithCredentialRotation` (src/llm.ts)
+// queues behind a process-wide gate allowing one request at a time, because bursts from this sweep tripped account
+// rate limits. Slot rotation and parking state is module-level in llm.ts, so candidates in one tick share it.
 export const CONCURRENCY_CAP = 3;
 export const COOLDOWN_HOURS = 1;
 export const REFRESH_MIN_NEW_MESSAGES = 10;
@@ -84,11 +41,6 @@ interface CandidateRow {
   title_basis_seq: number | null;
 }
 
-/**
- * Title backend override hook for tests + dependency injection. Production
- * default is the Anthropic /v1/messages call below; tests inject a
- * synchronous stub so the sweep is deterministic.
- */
 export type TitleBackendFn = (system: string, user: string) => Promise<string>;
 
 let _backendOverride: TitleBackendFn | null = null;
@@ -102,30 +54,17 @@ export function _resetTitleBackendForTest(): void {
 }
 
 /**
- * Sweep-level cooldown, engaged by the circuit breaker (see
- * `logFailuresWithBreaker` / `BREAKER_CONSECUTIVE_FAILURES` below).
- *
- * The per-tick breaker alone only de-duplicates LOG LINES — with
- * CONCURRENCY_CAP=3 candidates per tick, a fully-failed batch has nothing
- * left in it to "abandon". It does nothing to reduce the actual call volume:
- * the sweep would keep issuing 3 Haiku calls every 60s (~180/hr) regardless
- * of whether the backend is 429ing, starving the other host Haiku callers
- * (thread titling included) with a steady drumbeat of doomed requests. This
- * cooldown is what actually cuts spend during a sustained rate-limit window,
- * the same way `isBackendConfigured()` below already fails closed instead of
- * burning 3 doomed calls/tick when there's no credential at all.
+ * Sweep-level cooldown engaged by the circuit breaker. The per-tick breaker only de-duplicates log lines; this is
+ * what actually stops doomed calls during a sustained 429 window, which would otherwise starve the other host Haiku
+ * callers.
  */
 export const BREAKER_COOLDOWN_BASE_MS = 5 * 60_000;
 export const BREAKER_COOLDOWN_CAP_MS = 30 * 60_000;
 
-/** 0 = no cooldown in effect. */
 let _cooldownUntilMs = 0;
 /**
- * Duration of the most recently engaged cooldown, in ms. 0 means either no
- * cooldown has ever been engaged, or the escalation was reset by a
- * subsequent success. Doubles (capped) when the very next batch to actually
- * run after a cooldown expires trips the breaker again — a sustained
- * rate-limit shouldn't be re-probed every 5 minutes.
+ * Duration of the most recent cooldown, 0 when none or after a success. Doubles (capped) when the first batch after a
+ * cooldown trips again.
  */
 let _lastCooldownMs = 0;
 
@@ -144,42 +83,31 @@ function engageCooldown(nowMs: number): void {
   });
 }
 
-/** Any successful title means the backend is not (fully) rate-limited — drop the escalation. */
 function resetCooldownEscalation(): void {
   _lastCooldownMs = 0;
 }
 
-/** Test-only: clear cooldown state so it doesn't leak between tests (or into production on a module reload race). */
+/** Test-only: clears cooldown state between tests. */
 export function _resetCooldownForTest(): void {
   _cooldownUntilMs = 0;
   _lastCooldownMs = 0;
 }
 
-/** Test-only: read current cooldown state for deterministic assertions. */
 export function _getCooldownStateForTest(): { cooldownUntilMs: number; lastCooldownMs: number } {
   return { cooldownUntilMs: _cooldownUntilMs, lastCooldownMs: _lastCooldownMs };
 }
 
 /**
- * Returns true when the host process has a viable path to Anthropic —
- * ANY configured credential slot, not just the primary. Resolved through
- * the same {@link listClaudeStructuredCredentialSlots} (src/llm.ts) that
- * backs `callHaiku` and this sweep's own {@link callTitleBackend}, so
- * "is a backend configured" and "which slot will actually be tried" can
- * never drift apart — a stale slot 1 alone used to report "configured"
- * here while the request path had 3 more slots it never tried.
- *
- * The test backend override is always considered configured so unit
- * tests don't need to set any env vars.
+ * True when ANY configured credential slot exists, resolved through the same
+ * {@link listClaudeStructuredCredentialSlots} the request path rotates across, so "configured" and "what gets tried"
+ * cannot drift. The test override always counts as configured.
  */
 export function isBackendConfigured(): boolean {
   if (_backendOverride !== null) return true;
   return listClaudeStructuredCredentialSlots().length > 0;
 }
 
-// Lazy-init the proxy dispatcher on first use so tests do not inherit stale
-// state from earlier proxy env, and a service restart after env changes works
-// without another initialization path.
+// Lazy so tests do not inherit stale proxy env and a restart after env changes needs no other init path.
 let _envProxyDispatcher: Dispatcher | null | undefined;
 function getProxyDispatcher(): Dispatcher | null {
   if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
@@ -199,21 +127,12 @@ export function _resetProxyDispatcherForTest(): void {
 
 let _missingBackendLogged = false;
 
-/**
- * One request against a single resolved credential — the request-builder
- * callback {@link callWithCredentialRotation} (src/llm.ts) needs, since this
- * sweep's request shape (system + user messages, its own model/token
- * settings, its own per-attempt timeout) differs from `callHaiku`'s fixed
- * prompt shape. Rotation/retry policy does NOT live here — see
- * {@link callTitleBackend}.
- */
+/** One request against a single resolved credential; rotation and retry live in {@link callTitleBackend}. */
 async function callTitleBackendOnce(system: string, user: string, credential: StructuredCredential): Promise<string> {
   const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
   const model = process.env['NANOCLAW_SESSION_TITLE_MODEL'] ?? DEFAULT_MODEL;
 
-  // When a proxy is configured, route through undici with EnvHttpProxyAgent
-  // so the OneCLI gateway can swap the placeholder OAuth token for the
-  // real vault token at request time.
+  // Through the proxy so the OneCLI gateway can swap the placeholder OAuth token for the vault token.
   const dispatcher = getProxyDispatcher();
   const fetchImpl: typeof fetch = dispatcher
     ? (url, init) =>
@@ -253,16 +172,8 @@ async function callTitleBackendOnce(system: string, user: string, credential: St
 }
 
 /**
- * Generate one title. The test override bypasses credential resolution and
- * rotation entirely — a single direct call, raced against its own timeout —
- * so unit tests stay deterministic without touching real credentials.
- *
- * The production path rotates across every configured Anthropic credential
- * slot via {@link callWithCredentialRotation} (src/llm.ts) — the SAME
- * rotation policy `callHaiku` uses, rather than a second copy pinned to the
- * primary slot. Previously this only ever tried
- * `process.env['CLAUDE_CODE_OAUTH_TOKEN']` (slot 1), so once that slot's
- * quota was exhausted this sweep 429'd forever while slots 2-4 sat unused.
+ * The test override is one direct call raced against its own timeout. Production rotates across every configured
+ * credential slot via {@link callWithCredentialRotation}, the same policy `callHaiku` uses.
  */
 async function callTitleBackend(system: string, user: string): Promise<string> {
   if (_backendOverride !== null) {
@@ -289,12 +200,7 @@ async function callTitleBackend(system: string, user: string): Promise<string> {
   return value;
 }
 
-/**
- * Strip surrounding quotes / "Title: " preambles / trailing periods and cap
- * the label at {@link HAIKU_MAX_TITLE_CHARS}. Haiku is reliable about
- * following the system prompt's "no preamble" rule but the post-process
- * costs nothing and earns the corner case.
- */
+/** Strips quotes, "Title: " preambles and trailing periods, and caps at {@link HAIKU_MAX_TITLE_CHARS}. */
 export function postProcessTitle(raw: string): string {
   let s = raw.trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
@@ -302,36 +208,19 @@ export function postProcessTitle(raw: string): string {
   }
   s = s.replace(/^(title:|topic:|label:)\s*/i, '');
   s = s.replace(/\.+$/, '');
-  // Drop newlines — title is a single line by contract.
   s = s.replace(/\s+/g, ' ').trim();
   return s.slice(0, HAIKU_MAX_TITLE_CHARS);
 }
 
 /**
- * Pick up to `cap` sessions that need a title. SQL keeps the gate purely
- * column-driven so we don't iterate every session, and the WHERE clause
- * matches the refresh contract (no title, OR cooldown + new message
- * threshold). The "newer messages" predicate is delegated to a
- * per-session probe below — checking the session's inbound.db file size
- * mtime would be faster but unreliable; we just open the DB and run a
- * MAX(seq) lookup.
+ * Up to `cap` sessions needing a title, gated purely on columns; the new-message threshold is checked per session in
+ * `shouldGenerate`.
  */
 async function pickCandidates(cap: number): Promise<CandidateRow[]> {
   const cooldownIso = new Date(Date.now() - COOLDOWN_HOURS * 3600_000).toISOString();
-  // Gate purely on `title_generated_at` — a stamped failure-backoff row
-  // (see `stampFailureBackoff`) shouldn't slip back into the candidate
-  // set just because its `title` column is still NULL. The refresh case
-  // (title present + new messages) is gated in JS by `shouldGenerate`.
-  //
-  // ORDER: untitled sessions first (`title IS NOT NULL` sorts 0 before 1), then
-  // most-recently-active first. This is load-bearing: the old "oldest
-  // title_generated_at ASC" surfaced the oldest-CREATED sessions, which on a
-  // long-lived install are overwhelmingly empty/churned shells with no content
-  // to summarize. The sweep would pick LIMIT empties, skip them all (0
-  // generated), and — because an empty session was never stamped — get the SAME
-  // empties next tick, starving every real session forever. Prioritizing
-  // recently-active untitled sessions titles the visible inbox cards first; the
-  // empty-skip stamp in the loop below drains the rest of the shells.
+  // Gate on `title_generated_at` so a failure-backoff stamp keeps a NULL-title row out. ORDER is load-bearing:
+  // untitled first, then most recently active. Oldest-first picks empty shells that are skipped every tick, starving
+  // every real session forever.
   return getDb().all<CandidateRow>(
     `SELECT id, agent_group_id, title, title_generated_at, title_basis_seq
        FROM sessions
@@ -348,29 +237,15 @@ interface SliceResult {
   text: string;
   maxSeq: number;
   /**
-   * True when every inbound row for this session has `trigger = 0`
-   * ("accumulate as context only" — see messages_in.trigger in
-   * db/session-db.ts). A session with no `trigger = 1` row was never woken:
-   * `engage_mode` never let it spawn a container or produce an agent
-   * response, so there is nothing for Haiku to summarize even though the
-   * content column is non-empty. This is the bot-spam-thread case
-   * (Snowflake/Linear notifications into a `mention`-mode channel) — the
-   * sweep treats it the same as an empty slice rather than burning a Haiku
-   * call on a transcript with no agent side. A later real wake (trigger=1)
-   * flips this back to false and the session re-enters titling normally.
+   * True when no inbound row has `trigger = 1`: the session never woke the agent (e.g. bot notifications into a
+   * `mention`-mode channel), so there is nothing to summarize. A later real wake flips it back.
    */
   neverWoken: boolean;
 }
 
 /**
- * Read the last N inbound + outbound message contents from the per-session
- * DBs, in seq order, and concatenate into a single user-prompt slice for
- * Haiku. `maxSeq` is returned so the caller can stamp `title_basis_seq`
- * — if the slice was empty (file missing or no messages) we return -1
- * which the sweep treats as "skip this session for now".
- *
- * Best-effort: any IO failure returns an empty slice rather than throwing
- * so the rest of the sweep's session list can still be processed.
+ * The last N inbound and outbound contents in seq order as one prompt slice. `maxSeq` is -1 for an empty slice ("skip
+ * for now"). Best-effort: IO failures return an empty slice.
  */
 function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult {
   const location = { agentGroupId, sessionId };
@@ -382,11 +257,8 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
   try {
     readSessionInbound(location, (mailbox) => {
       inboundLines = mailbox.listInboundTail(MAX_MESSAGES_PER_SLICE);
-      // `trigger` was added after the initial schema (the module's inbound
-      // migration backfills existing rows to 1). A missing column on an
-      // old/test DB is caught separately so it fails closed to "has woken" —
-      // never suppresses a real title, and never triggers the "read failed"
-      // warning below for what is otherwise a clean read.
+      // A missing `trigger` column on an old DB fails closed to "has woken": it must never suppress a real title or
+      // trip the read-failed warning.
       try {
         neverWoken = !mailbox.hasTriggeredInboundRow();
       } catch {
@@ -409,7 +281,6 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
     });
   }
 
-  // Merge by seq ascending and trim to a window.
   const merged = [...inboundLines, ...outboundLines].sort((a, b) => a.seq - b.seq);
   if (merged.length === 0) return { text: '', maxSeq: -1, neverWoken };
 
@@ -445,50 +316,26 @@ async function persistTitle(sessionId: string, title: string, basisSeq: number, 
 }
 
 /**
- * Stamp `title_generated_at` to a near-future timestamp so the same row
- * doesn't re-enter the candidate set on the next sweep tick. Without this,
- * a session whose Haiku call keeps failing (network flake, content too
- * short to summarize) would be picked 3-per-tick on every 60s tick,
- * starving fresher sessions.
- *
- * Backoff is calibrated to {@link FAILURE_BACKOFF_MINUTES} from "now" so
- * the cooldown predicate (`title_generated_at < now-1h`) hides the row
- * for at least one quarter-hour. We do NOT write a fake `title` because
- * a NULL title is still the operator-visible truth (the inbox falls back
- * to the session id).
+ * Stamps `title_generated_at` so the cooldown predicate hides the row for FAILURE_BACKOFF_MINUTES; otherwise a
+ * session that keeps failing is re-picked every tick and starves fresher ones. Never writes a fake `title`: NULL is
+ * the truth.
  */
 async function stampFailureBackoff(sessionId: string): Promise<void> {
   const stamp = new Date(Date.now() - (COOLDOWN_HOURS * 60 - FAILURE_BACKOFF_MINUTES) * 60_000).toISOString();
   await getDb().run(`UPDATE sessions SET title_generated_at = ? WHERE id = ?`, stamp, sessionId);
 }
 
-/**
- * Decide whether a candidate's existing title is still fresh enough to skip
- * regeneration this tick. Returns true if we should generate. The "≥10 new
- * messages since last basis seq" rule is implemented here using the slice's
- * maxSeq — the slice has already been read, so the marginal cost is zero.
- */
+/** True if the title should be (re)generated. */
 function shouldGenerate(row: CandidateRow, sliceMaxSeq: number): boolean {
-  if (sliceMaxSeq < 0) return false; // empty session — nothing to summarize
-  if (!row.title) return true; // first-time
-  if (row.title_basis_seq == null) return true; // legacy / corrupted
+  if (sliceMaxSeq < 0) return false;
+  if (!row.title) return true;
+  if (row.title_basis_seq == null) return true;
   if (sliceMaxSeq - row.title_basis_seq < REFRESH_MIN_NEW_MESSAGES) return false;
   return true;
 }
 
-/**
- * One sweep tick. Picks candidates, generates titles for up to
- * {@link CONCURRENCY_CAP} of them in parallel. Each call is independently
- * try/caught — a single backend failure must not poison the rest of the
- * batch (the next sweep will retry the same candidate naturally).
- *
- * Returns a small status struct for tests + logs.
- */
-// Re-entrancy guard: prevents a 60s tick from kicking off a second batch
-// while the previous batch's Haiku calls are still mid-flight. Without this
-// a slow Anthropic response (5-6s near the timeout) overlapped with a fast
-// `pickCandidates` query could trigger a second concurrent batch on the
-// next tick, exceeding the documented concurrency cap of 3.
+/** One sweep tick. Each candidate is independently try/caught so one backend failure does not poison the batch. */
+// Re-entrancy guard: a slow response must not overlap a second batch on the next tick.
 let sweepInProgress = false;
 
 export async function runSessionTitleSweep(): Promise<{ generated: number; skipped: number }> {
@@ -502,11 +349,7 @@ export async function runSessionTitleSweep(): Promise<{ generated: number; skipp
 }
 
 async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipped: number }> {
-  // Fail-closed early when no viable Anthropic backend is wired. Without
-  // this gate every tick burns 3 doomed Haiku calls and stamps 3 failure
-  // backoffs, churning ~150 wasted attempts/hour for nothing. Log once
-  // per process lifetime so the operator sees it but the log doesn't
-  // flood every 60s.
+  // Fail closed with no backend: otherwise every tick burns doomed calls and failure stamps. Logged once per process.
   if (!isBackendConfigured()) {
     if (!_missingBackendLogged) {
       _missingBackendLogged = true;
@@ -517,12 +360,8 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     return { generated: 0, skipped: 0 };
   }
 
-  // Fail-closed while the circuit breaker's cooldown is in effect (see
-  // engageCooldown / BREAKER_CONSECUTIVE_FAILURES). Same reasoning as the
-  // isBackendConfigured() gate above: a sustained 429 wave produces
-  // identical waste (3 doomed calls/tick) that gate doesn't cover, since a
-  // credential IS configured — it's just being rate-limited. Logged once at
-  // the moment the cooldown is engaged, not on every suppressed tick.
+  // Fail closed during the breaker cooldown: a rate-limited but configured credential produces the same waste the
+  // gate above cannot see.
   if (isCoolingDown(Date.now())) {
     return { generated: 0, skipped: 0 };
   }
@@ -537,14 +376,9 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
   for (const row of candidates) {
     if (tasks.length >= CONCURRENCY_CAP) break;
     const slice = readSessionSlice(row.agent_group_id, row.id);
-    // Empty / no-usable-content session, OR a session that has never woken the
-    // agent (bot-spam threads under engage_mode=mention — see `neverWoken`
-    // above): nothing to summarize. STAMP a backoff so it exits the candidate
-    // pool rather than re-entering every tick. Without this, a backlog of
-    // empty/unwoken NULL-title shells permanently occupies the LIMIT and
-    // starves real sessions (the sweep skips all N and generates 0 forever —
-    // the clog this fix targets). A stamped shell that later gains content or
-    // a real wake re-enters after the cooldown ages out and gets titled then.
+    // Empty, contentless, or never-woken session: stamp a backoff so it leaves the candidate pool, or a backlog of
+    // such shells occupies the LIMIT and starves real sessions forever. A stamped shell that later gains content
+    // re-enters after the cooldown.
     if (slice.maxSeq < 0 || !slice.text || slice.neverWoken) {
       try {
         await stampFailureBackoff(row.id);
@@ -554,9 +388,7 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
       skipped++;
       continue;
     }
-    // Has content but not enough NEW messages to justify a refresh — leave it on
-    // its natural cooldown (it already has a title + title_generated_at); do NOT
-    // re-stamp, which would churn its refresh clock.
+    // Not enough new messages: leave it on its natural cooldown; re-stamping would churn its refresh clock.
     if (!shouldGenerate(row, slice.maxSeq)) {
       skipped++;
       continue;
@@ -564,11 +396,8 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     tasks.push(
       (async (): Promise<TaskOutcome> => {
         try {
-          // Timeout/abort is per-attempt inside callTitleBackend now — a
-          // credential rotation may make several attempts across several
-          // slots, and each needs its own fresh timeout budget rather than
-          // sharing one controller across all of them (see
-          // callTitleBackendOnce).
+          // Timeouts are per attempt inside callTitleBackend: a rotation may try several slots, each needing its own
+          // budget.
           const raw = await callTitleBackend(SYSTEM_PROMPT, slice.text);
           const title = postProcessTitle(raw);
           if (!title) {
@@ -599,12 +428,8 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
   const outcomes = await Promise.all(tasks);
   const breakerTripped = logFailuresWithBreaker(outcomes);
 
-  // Any successful title this tick proves the backend isn't (fully)
-  // rate-limited — drop the escalation so a LATER, unrelated trip starts
-  // fresh at the base cooldown instead of picking up where a stale one left
-  // off. A tripped breaker (only possible when the WHOLE batch failed
-  // transiently, so it can never coincide with generated > 0) engages/
-  // escalates the cooldown that actually cuts call volume.
+  // A success proves the backend is not fully rate-limited, so the escalation resets; a trip (only possible when the
+  // whole batch failed) engages the cooldown.
   if (generated > 0) {
     resetCooldownEscalation();
   } else if (breakerTripped) {
@@ -622,26 +447,13 @@ interface TaskOutcome {
 }
 
 /**
- * A run of {@link BREAKER_CONSECUTIVE_FAILURES} consecutive transient
- * failures (candidate order — the deterministic, testable analog of
- * "consecutive" under a concurrently-dispatched batch, and equivalent to it
- * whenever CONCURRENCY_CAP <= this threshold, as it is today) collapses into
- * ONE warn naming the breaker instead of one warn per candidate. This sweep
- * is the dominant consumer of the shared OAuth quota (120 failed 429s
- * measured in a single day) and starves the other host Haiku callers —
- * including thread titling (src/topic-title.ts) — so a tick where the
- * backend is clearly rate-limited must not also flood the log on top of
- * flooding the quota. Non-transient failures are never batched: they're
- * real per-candidate problems (bad content, etc.), not backend-wide distress.
+ * A run of this many consecutive transient failures, in candidate order, collapses into one warn instead of one per
+ * candidate. Non-transient failures are always logged individually.
  */
 const BREAKER_CONSECUTIVE_FAILURES = 3;
 
-/** Returns true iff the breaker tripped (a run of >= BREAKER_CONSECUTIVE_FAILURES occurred). */
 function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
-  // Buffer each run of consecutive transient failures and decide how to log
-  // it only once the run ends (a success, a non-transient failure, or the
-  // end of the batch) — a run that reaches the threshold collapses into ONE
-  // warn; a shorter run logs individually, same as before the breaker.
+  // Each run is buffered and logged once it ends; runs shorter than the threshold log individually.
   let run: TaskOutcome[] = [];
   let tripped = false;
 
@@ -678,20 +490,8 @@ function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
 }
 
 /**
- * 429/529/timeout/network-blip — used only to decide whether a FINAL,
- * all-slots-exhausted failure counts toward the circuit breaker's
- * consecutive-failure run (see {@link logFailuresWithBreaker}) and cooldown
- * escalation above. This is coarser than — and serves a different purpose
- * from — `classifyCredentialFailure` in src/llm.ts: by the time an error
- * reaches here, {@link callWithCredentialRotation} has already rotated
- * across every configured credential slot for quota-exhaustion 429s and
- * backed off in place for transient ones, so a 429 surfacing here means
- * EVERY slot was tried and still failed — "the backend is in real
- * distress" either way. It intentionally does NOT distinguish
- * transient-vs-quota-exhausted the way llm.ts's rotation loop does; that
- * split is retry/rotation policy, this one is breaker/log-volume policy,
- * and conflating the two here would just be a second copy of the same
- * concern living in the wrong layer.
+ * Breaker/log-volume policy only, deliberately coarser than llm.ts's `classifyCredentialFailure`: by the time an
+ * error reaches here every credential slot has already been tried, so any 429 means real backend distress.
  */
 function isTransientBackendFailure(err: unknown): boolean {
   const status = (err as { status?: number }).status;

@@ -1,10 +1,6 @@
 /**
- * Minimal route table for the dashboard HTTP server.
- *
- * First-match dispatch. Supports :param segments and terminal *tail splat.
- * requireAuth HOF verifies the spawn_board cookie via a registered verifier
- * (injected by Group B B5 at startup) and enforces CSRF origin check on
- * mutating methods.
+ * First-match route table with `:param` segments and a terminal `*tail` splat. requireAuth verifies the session
+ * cookie through a registered verifier and enforces a CSRF origin check on mutating methods.
  */
 import http from 'http';
 
@@ -33,8 +29,7 @@ export interface AuthedRequestContext extends RequestContext {
   scopes: { role: GroupScope['role']; allowed_group_ids: string[]; no_filter: boolean };
 }
 
-// Dependency injection: B5 registers the real verifier via registerCookieVerifier().
-// Returns { user_id, expires_at } on success or null on invalid/missing cookie.
+// Returns null on an invalid or missing cookie.
 export type CookieVerifier = (cookieHeader: string | null) => { user_id: string; expires_at: string } | null;
 
 let cookieVerifier: CookieVerifier | null = null;
@@ -59,16 +54,12 @@ export function register(method: Method, pattern: string, handler: Handler): voi
   routes.push({ method, pattern, handler });
 }
 
-/** Expose the route table for testing (read-only snapshot). */
+/** Read-only snapshot for tests. */
 export function getRoutes(): ReadonlyArray<Readonly<Route>> {
   return routes;
 }
 
-/**
- * Match a URL path against a pattern.
- * :name captures a single segment; *tail is terminal and captures the rest.
- * Returns null on mismatch.
- */
+/** `:name` captures one segment; `*tail` is terminal and captures the rest. Null on mismatch. */
 export function pathMatch(pattern: string, urlPath: string): Record<string, string> | null {
   const patternSegments = pattern.split('/');
   const urlSegments = urlPath.split('/');
@@ -79,7 +70,6 @@ export function pathMatch(pattern: string, urlPath: string): Record<string, stri
     const ps = patternSegments[i];
 
     if (ps !== undefined && ps.startsWith('*')) {
-      // Terminal splat — captures remaining segments joined with /
       const name = ps.slice(1);
       params[name] = urlSegments.slice(i).join('/');
       return params;
@@ -96,7 +86,6 @@ export function pathMatch(pattern: string, urlPath: string): Record<string, stri
     }
   }
 
-  // Pattern exhausted — url must also be exhausted
   if (urlSegments.length !== patternSegments.length) return null;
 
   return params;
@@ -113,7 +102,7 @@ function isLocalhostOrigin(origin: string): boolean {
   }
 }
 
-/** CSRF origin check: POST/PUT/DELETE with an Origin that doesn't match Host (localhost origins always pass). */
+/** CSRF: POST/PUT/DELETE whose Origin does not match Host is refused; localhost origins always pass. */
 export function checkOrigin(req: Request): Response | null {
   const method = req.method;
   if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
@@ -142,17 +131,12 @@ export function checkOrigin(req: Request): Response | null {
   return null;
 }
 
-/**
- * HOF: wraps a handler with auth verification.
- * Checks spawn_board cookie via the registered CookieVerifier, enforces CSRF
- * origin check on POST/PUT/DELETE, and populates ctx.user + ctx.scopes.
- */
+/** Verifies the cookie, enforces the origin check, and populates ctx.user and ctx.scopes. */
 export function requireAuth(handler: AuthHandler): Handler {
   return async (req, params, ctx) => {
     const originDeny = checkOrigin(req);
     if (originDeny) return originDeny;
 
-    // Verify cookie via injected verifier (B5 registers the real one)
     const cookieHeader = req.headers.get('cookie');
     const payload = cookieVerifier ? cookieVerifier(cookieHeader) : null;
     if (!payload) {
@@ -162,20 +146,13 @@ export function requireAuth(handler: AuthHandler): Handler {
       });
     }
 
-    // Populate scopes by enumerating user_roles directly. Post-build QA fix MF-3:
-    // previously called canAccessAgentGroup(payload.user_id, '*') and hardcoded
-    // allowed_group_ids=[], which silently locked scoped admins out of every
-    // §2a-filtered query. The shared computeScopes helper enumerates real groups.
-    // Lazy import keeps the auth/cookie dynamic-import wire-up clean (compute-scopes
-    // depends on db/connection which can't be imported at module-init time before
-    // initDb runs).
+    // Scopes must enumerate real user_roles groups; a hardcoded empty allow-list locks scoped admins out of every
+    // scope-filtered query. Lazy import because compute-scopes depends on db/connection, which cannot load before
+    // initDb.
     const { computeScopes } = await import('./auth/compute-scopes.js');
     const scopes = await computeScopes(payload.user_id);
 
-    // Same lazy-import reason as computeScopes above: db/connection can't load
-    // before initDb runs. Resolves the real display_name so every ctx.user.display_name
-    // consumer — nudge, steer, assign, observatory-steer — stops falling back to the
-    // raw id; getUser() returning undefined (never provisioned) is the only null case.
+    // Lazy for the same reason. Resolves the real display name; null only for a never-provisioned user.
     const { getUser } = await import('../modules/permissions/db/users.js');
     const user: User = {
       id: payload.user_id,
@@ -194,10 +171,7 @@ export function requireAuth(handler: AuthHandler): Handler {
   };
 }
 
-/**
- * Dispatch an incoming request through the route table.
- * Returns Response (caller should write it) or null (handler wrote raw to nodeRes).
- */
+/** Returns the Response to write, or null when the handler wrote to nodeRes itself. */
 export async function dispatch(
   req: Request,
   nodeReq: http.IncomingMessage,

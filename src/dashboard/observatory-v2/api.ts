@@ -157,7 +157,7 @@ export async function reviewDecision(
   );
 }
 
-/** Reserve destination, sender, stable exact text and delivery key before IO. */
+/** Reserves destination, sender, exact text and delivery key before any IO. */
 export async function dispatchDecision(
   id: string,
   body: unknown,

@@ -1,56 +1,21 @@
 /**
- * Assign guard adapter — the catalog entry for `observatory.assign`, composed
- * at this feature's module edge (imported by `assign.ts`).
- *
- * Assigning is privileged for the plainest possible reason: it CAUSES AN AGENT
- * TO DO WORK. A browser press turns into a one-shot task with a server-composed
- * prompt, a real container boot, and an agent talking in a room full of people.
- * That is the same class of act as steering a thread or admitting a sender, so
- * it passes the same seam they do rather than resting on a handler-local `if`.
- *
- * **Allow/deny only, no `grantActionName`.** Assignment is not a request that
- * waits for a second person: the operator standing in front of the queue is the
- * one deciding where the work goes, and a HOLD would turn a queue-triage action
- * into an approval card someone has to chase. Nothing pairs with an approval
- * handler here because nothing is ever waiting for one — the same call
- * `thread-close-guard.ts` makes, for the same reason.
- *
- * **Both rules live in `decide`, not in the handler.** The seam is the
- * authority, so a second caller arriving later cannot bring its own looser
- * copy:
- *
- *  1. **Admin privilege over the target agent group.** Identical to
- *     `canAssign`'s allow condition (owner / global admin / admin of that
- *     group) — `hasAdminPrivilege` IS that predicate, so the two cannot drift.
- *  2. **The target agent is wired to the item's own channel.** This is the
- *     invariant that keeps a browser from making an agent speak somewhere it
- *     does not belong, and it is exactly the rule an assign path is most likely
- *     to lose: the caller is the one that knows the channel, so leaving the
- *     check in the caller means every future caller re-decides it. The handler
- *     RE-DERIVES the wiring from `messaging_group_agents` and reports what it
- *     found; the guard is what refuses when the answer is no.
- *
- * Scope (§2a) is deliberately NOT here. An out-of-scope agent group must be
- * indistinguishable from one that does not exist — the handler resolves it to
- * absent before a decision is ever asked for, because a guard that decided it
- * would have to answer "denied", which is the authorization oracle §2a exists
- * to prevent.
+ * Guard catalog entry for `observatory.assign`: a press becomes a one-shot task, a container boot, and an agent
+ * talking in a room, so it passes the same seam as other privileged acts.
+ * Allow/deny only, no `grantActionName`: a HOLD would turn queue triage into an approval card to chase.
+ * Both rules live in `decide` so no later caller brings a looser copy: (1) admin privilege over the target group
+ * (`hasAdminPrivilege`, identical to `canAssign`'s allow condition); (2) the target agent is wired to the item's own
+ * channel, which the handler re-derives and the guard enforces.
+ * Scope is deliberately NOT here: an out-of-scope group must be indistinguishable from a missing one, and a guard can
+ * only answer "denied".
  */
 import { ALLOW, DENY, defineGuardedAction } from '../guard/index.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 
 export interface ObservatoryAssignPayload extends Record<string, unknown> {
-  /** The agent group the work is being handed to. */
   agentGroupId: string;
-  /**
-   * The item's channel key, as the ATTENTION SOURCE declared it — never a value
-   * off the request body. On the payload so a denial can name the room.
-   */
+  /** As the attention source declared it, never from the request body. */
   channelKey: string;
-  /**
-   * The caller re-derived the wiring and found the target agent on this
-   * channel. A fact the handler looked up, not a claim the client made.
-   */
+  /** Looked up by the handler, never claimed by the client. */
   wiredToItemChannel: boolean;
 }
 
@@ -59,9 +24,7 @@ export const observatoryAssign = defineGuardedAction({
   decide: (input) => {
     const actor = input.actor;
     if (actor.kind !== 'human') {
-      // An agent handing work to another agent is not this surface's job — that
-      // is what a2a is for, with its own guard. Nothing in the host should be
-      // able to mint an assignment nobody asked for.
+      // Agent-to-agent handoff is a2a's job, with its own guard.
       return DENY('assigning a work item is an operator action');
     }
     const payload = input.payload as Partial<ObservatoryAssignPayload>;

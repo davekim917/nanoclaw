@@ -9,30 +9,21 @@ import { ensureUserDm } from '../../modules/permissions/user-dm.js';
 import { log } from '../../log.js';
 
 /**
- * Mint a fresh dashboard token for `userId` and build its one-shot login URL.
- * Shared by every entry point that can issue a dashboard link — the chat
- * intercept command below and the native Slack slash-command handler
- * (`../../channels/slash-commands.ts`) — so the token/HMAC/URL logic exists
- * exactly once.
+ * Mints a dashboard token and its one-shot login URL; shared by the chat intercept and the Slack slash command so the
+ * token/HMAC/URL logic exists once.
  */
 export async function mintDashboardTokenUrl(userId: string): Promise<{ url: string; ttlHours: number }> {
   const rawToken = crypto.randomBytes(32).toString('hex');
   const serverKey = resolveServerKey();
   const tokenHmac = crypto.createHmac('sha256', serverKey).update(rawToken).digest('hex');
 
-  // Token TTL must match cookie Max-Age (post-build QA fix MF-2). Both
-  // server-side cookie expiry and client-side cookie deletion end at the
-  // same wall-clock time — both read from `dashboardSessionTtlHours()`.
+  // Token TTL must match the cookie Max-Age; both come from `dashboardSessionTtlHours()`.
   const ttlHours = dashboardSessionTtlHours();
   await issueDashboardToken(userId, tokenHmac, ttlHours);
 
-  // Build the URL to send to the user. Three env vars give precise control:
-  //   NANOCLAW_DASHBOARD_URL      — full URL (e.g. https://dash.example.com); takes precedence
-  //   NANOCLAW_DASHBOARD_HOST     — hostname (default 'localhost')
-  //   NANOCLAW_DASHBOARD_PROTOCOL — 'http' | 'https' (default: derived from host — http for loopback, http for direct LAN/WAN access without TLS, https only when explicitly set)
-  //   WEBHOOK_PORT                — port (default 3000)
-  // Default protocol is http because the host bind is plain HTTP. Set NANOCLAW_DASHBOARD_PROTOCOL=https
-  // when terminating TLS upstream (Cloudflare Tunnel, Caddy, nginx, Tailscale Funnel, etc.).
+  // NANOCLAW_DASHBOARD_URL (full URL) wins; otherwise NANOCLAW_DASHBOARD_HOST (default localhost),
+  // NANOCLAW_DASHBOARD_PROTOCOL and WEBHOOK_PORT (default 3000). The protocol defaults to http because the host binds
+  // plain HTTP; set https when TLS terminates upstream.
   const dashboardUrl = (() => {
     const fullUrl = process.env.NANOCLAW_DASHBOARD_URL;
     if (fullUrl) return fullUrl.replace(/\/+$/, '') + '/observatory/';
@@ -42,16 +33,12 @@ export async function mintDashboardTokenUrl(userId: string): Promise<{ url: stri
     return `${protocol}://${host}:${port}/observatory/`;
   })();
 
-  // The token rides in the URL FRAGMENT, which browsers never send to the
-  // server, so it cannot land in an access or proxy log on the way in; the
-  // SPA reads it, exchanges it, and scrubs it from the address bar and
-  // history. Single-use and TTL-bound either way.
+  // The token rides in the URL FRAGMENT, which browsers never send to the server, so it cannot land in an access or
+  // proxy log. Single-use and TTL-bound.
   return { url: `${dashboardUrl}#token=${rawToken}`, ttlHours };
 }
 
-/** Login-link text, shared by the DM-direct and DM-redirect paths below. */
 function loginLinkText(url: string, ttlHours: number): string {
-  // One clickable link, not a token to copy by hand.
   return `Open your dashboard (valid ${formatTtl(ttlHours)}, works once):\n${url}`;
 }
 
@@ -68,23 +55,14 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
     return;
   }
 
-  // The token is a bearer credential: whoever loads the URL first
-  // authenticates as `ctx.userId`, no matter who actually clicked it. A DM
-  // is safe (only the invoker is present). A group/channel is NOT — every
-  // member sees the message, so the token must never be posted there. Route
-  // it to the invoker's DM instead, opening one lazily if needed (same
-  // primitive approvals/host notifications already use to cold-DM a user).
-  // privacySafeLogs: this DM is about to carry a bearer dashboard token — a
-  // resolution failure here must not write the invoker's platform handle or
-  // any raw platform error into the host log.
+  // The token is a bearer credential: whoever loads the URL first authenticates as the invoker. In a group every
+  // member sees the message, so the link is routed to the invoker's DM instead. `privacySafeLogs`: a resolution
+  // failure must not log the invoker's handle or a raw platform error.
   const deliveryMg = mg.is_group ? await ensureUserDm(ctx.userId, { privacySafeLogs: true }) : mg;
 
   if (!deliveryMg) {
-    // No DM path on this platform (no adapter openDM support, or it threw —
-    // e.g. the user has DMs closed). Fail closed: mint nothing, and say
-    // nothing that reveals a credential exists to mint.
-    // Same privacy rule as the ensureUserDm call above: the invoker's
-    // namespaced handle stays out of the host log on the failure path too.
+    // No DM path: fail closed. Mint nothing, and say nothing that reveals a credential exists to mint. The handle
+    // stays out of the log here too.
     log.warn('dashboardTokenIssue: no private delivery path, refusing to mint', {
       channelType: mg.channel_type,
     });
@@ -107,9 +85,7 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
     JSON.stringify({ text: loginLinkText(url, ttlHours) }),
   );
 
-  // Redirected to a DM from a group — leave a credential-free breadcrumb in
-  // the channel so the invoker knows to check DMs instead of assuming the
-  // command silently failed.
+  // Leave a credential-free breadcrumb in the channel so the invoker checks DMs.
   if (deliveryMg.id !== mg.id) {
     await adapter.deliver(
       mg.channel_type,
@@ -129,5 +105,4 @@ export function formatTtl(hours: number): string {
   return `${hours}h`;
 }
 
-// Side-effect registration — importing this file registers the handler.
 registerInterceptHandler('dashboard_token_issue', dashboardTokenIssue);
