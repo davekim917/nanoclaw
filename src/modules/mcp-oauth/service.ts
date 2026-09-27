@@ -14,7 +14,7 @@
  * loopback redirect. `--listen` (needs an `ssh -L` tunnel) and `--device`
  * (RFC 8628) are opt-in. Nothing here ever tries to open a browser on this host.
  */
-import { getAgentGroup } from '../../db/agent-groups.js';
+import { getAgentGroup, getAllAgentGroups, getAllWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import {
   deleteMcpOAuthIntegration,
   getMcpOAuthIntegration,
@@ -25,7 +25,7 @@ import {
   type McpOAuthIntegration,
 } from '../../db/mcp-oauth-integrations.js';
 import { readContainerConfig, updateContainerConfig } from '../../container-config.js';
-import { declareGroupSecret, findSecretDeclarations } from '../../onecli-secret-grants.js';
+import { declareGroupSecret } from '../../onecli-secret-grants.js';
 import { log } from '../../log.js';
 import { assertHttpsEndpoint, discoverAuthorization, type FetchLike } from './discovery.js';
 import {
@@ -1054,9 +1054,11 @@ interface SecretDeclarationSite {
  *      UNIQUE index is on (agent_group_id, mcp_url), not the secret), whose
  *      next refresh would self-heal only hours later.
  *
- * Sources 1-2 match both spellings (name or vault UUID). The millisecond window
- * between this scan and the delete is deliberately left open: closing it would
- * mean locking every group's config across a vault round-trip.
+ * Sources 1-2 match both spellings (name or vault UUID). Group files are read
+ * with `readContainerConfig`, as the spawn path does, so the scan cannot refuse
+ * on declarations the spawn never sees. The millisecond window between this
+ * scan and the delete is deliberately left open: closing it would mean locking
+ * every group's config across a vault round-trip.
  */
 async function findForeignSecretDeclarations(
   ownerGroupId: string,
@@ -1065,21 +1067,26 @@ async function findForeignSecretDeclarations(
 ): Promise<SecretDeclarationSite[]> {
   const wanted = new Set(spellings);
   const sites: SecretDeclarationSite[] = [];
-  const declarations = await findSecretDeclarations(spellings);
-  for (const { id, declared } of declarations.workgroups) {
-    sites.push({
-      where: `workgroup ${id} (workgroups.onecli_secrets) declares "${declared}"`,
-      fix: `pnpm exec tsx scripts/set-workgroup-secrets.ts ${id} --secrets <the list without "${declared}">`,
-      declared,
-    });
+  for (const workgroup of await getAllWorkgroupOnecliSecrets()) {
+    for (const declared of workgroup.secrets) {
+      if (!wanted.has(declared)) continue;
+      sites.push({
+        where: `workgroup ${workgroup.id} (workgroups.onecli_secrets) declares "${declared}"`,
+        fix: `pnpm exec tsx scripts/set-workgroup-secrets.ts ${workgroup.id} --secrets <the list without "${declared}">`,
+        declared,
+      });
+    }
   }
-  for (const { id, folder, declared } of declarations.groups) {
-    if (id === ownerGroupId) continue;
-    sites.push({
-      where: `agent group ${id} (groups/${folder}/container.json onecliSecrets) declares "${declared}"`,
-      fix: `remove "${declared}" from groups/${folder}/container.json`,
-      declared,
-    });
+  for (const group of await getAllAgentGroups()) {
+    if (group.id === ownerGroupId) continue;
+    for (const declared of readContainerConfig(group.folder).onecliSecrets ?? []) {
+      if (!wanted.has(declared)) continue;
+      sites.push({
+        where: `agent group ${group.id} (groups/${group.folder}/container.json onecliSecrets) declares "${declared}"`,
+        fix: `remove "${declared}" from groups/${group.folder}/container.json`,
+        declared,
+      });
+    }
   }
   for (const other of await listMcpOAuthIntegrations()) {
     if (other.name === integrationName) continue;

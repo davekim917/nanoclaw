@@ -32,14 +32,18 @@ ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 ## Who may enter a secret
 
 - An **owner or global admin**: any intake.
-- An **admin of the requesting agent's group** (`user_roles` scoped admin): that agent's intakes. Enable a user
-  by granting them admin on the group. Plain group members cannot. A rotation by a group admin is refused
-  when any workgroup other than theirs, or any group outside it, declares the secret
-  (`findSecretDeclarations`, `src/onecli-secret-grants.ts`), because a rotation changes the value every holder
-  uses; an owner can still rotate it.
+- An **admin of the requesting agent's group** (`user_roles` scoped admin): that agent's new secrets. Enable a
+  user by granting them admin on the group. Plain group members cannot.
+- **Rotation is owner or global admin only.** A rotation changes the value every holder uses, and who holds a
+  secret is decided by OneCLI agent grants, some made outside any `container.json` or workgroup declaration —
+  so no declaration scan can prove a secret is the workgroup's alone.
 
-Every store by a group admin sends the owner a DM naming who, which secret, the host and the grants — never
-the value. A key a group admin stores for their workgroup is used by every agent in it.
+Every store by a group admin sends an owner a DM, right after the vault write and before any other follow-up,
+naming who, which secret, the host and the grants — never the value. A failed notice is logged at error. A key
+a group admin stores for their workgroup is used by every agent in it.
+
+A card goes into the requesting thread only on Slack, the one platform whose adapter opens the form; any
+other origin gets it in an owner's DM.
 
 ## What to check on the card
 
