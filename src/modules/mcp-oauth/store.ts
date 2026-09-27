@@ -79,14 +79,15 @@ export function writeMcpOAuthBundle(bundle: McpOAuthBundle, dataDir: string = DA
   } catch (err) {
     try {
       fs.unlinkSync(tmp);
-    } catch {}
+    } catch {
+      // Best effort: the rename failure is the error worth reporting.
+    }
     throw err;
   }
   // The temp file's mode applies only when it is created; belt-and-braces.
   fs.chmodSync(target, 0o600);
 }
 
-/** Returns true when a bundle was removed; false when there was none. */
 export function deleteMcpOAuthBundle(name: string, dataDir: string = DATA_DIR): boolean {
   try {
     fs.unlinkSync(bundlePath(name, dataDir));
