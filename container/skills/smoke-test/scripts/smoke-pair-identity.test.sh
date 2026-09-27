@@ -571,6 +571,11 @@ serve api-pr-7.acme.example "$B"
 expect_rc "$(static_run check "$R9" moved)" 3 static-served-commit-drift
 R9B="$T/static-run-short"; mkdir -p "$R9B"; printf '{"sha":"short"}' >"$T/served/api-pr-7.acme.example"
 expect_rc "$(static_run start "$R9B")" 2 static-short-sha-refused
+R9C="$T/static-run-unsafe"; mkdir -p "$R9C"; serve api-pr-7.acme.example "$A"
+RC="$(env -u SMOKE_PAIR_FIXTURE_DIR PATH="$T/shim:$PATH" SERVED_DIR="$T/served" SMOKE_PREVIEW_PROVIDER=static \
+  SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-7.acme.example/?a=1&b=2' SMOKE_GATE_BACKEND_SERVICE=https://api-pr-7.acme.example \
+  bash "$SCRIPT" start "$R9C" >"$T/out" 2>"$T/err"; echo $?)"
+expect_rc "$RC" 2 static-unsafe-url-refused
 ! grep -q 'api.render.com' "$T/curl.log" || fail "static: pair identity called Render"
 RC="$(SMOKE_PREVIEW_PROVIDER=elsewhere bash "$SCRIPT" read >"$T/out" 2>"$T/err"; echo $?)"
 expect_rc "$RC" 2 unknown-provider

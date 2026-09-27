@@ -1492,8 +1492,8 @@ class EffectLayer:
         # intake brief says so in as many words ("use its coordinatorOwnerToken
         # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
         # gate mints a FRESH token on every same-run recovery poll
-        # (smoke-pr-gate.sh:5551, written to lease/authority/state at :5580,
-        # :5585, :5630), and reconcile_claims records the new one the wake
+        # (smoke-pr-gate.sh:5558, written to lease/authority/state at :5587,
+        # :5592, :5637), and reconcile_claims records the new one the wake
         # carries. Writing wake.json only at intake left the run tree naming a
         # RETIRED token while the brief still told the owner to use it: every
         # scaffold write, and `adopt` -- the verb that exists for exactly this
@@ -1683,9 +1683,10 @@ class EffectLayer:
             fe, be = frozen["frontend"].get("service"), frozen["backend"].get("service")
             return ("**PAIR IDENTITY: frozen (frontend `{fe}`, backend `{be}`).** Every check passes those two ids "
                     "on the command line -- the gate env you source names the develop pair, and a check against it "
-                    "records a drift that BLOCKS this run: `SMOKE_GATE_FRONTEND_SERVICE={fe} "
-                    "SMOKE_GATE_BACKEND_SERVICE={be} bash {tool} check {run} <label>`.{tail}").format(
-                fe=fe, be=be, tool=PAIR_IDENTITY, run=shlex.quote(run), tail=tail)
+                    "records a drift that BLOCKS this run: `SMOKE_GATE_FRONTEND_SERVICE={qfe} "
+                    "SMOKE_GATE_BACKEND_SERVICE={qbe} bash {tool} check {run} <label>`.{tail}").format(
+                fe=fe, be=be, qfe=shlex.quote(str(fe)), qbe=shlex.quote(str(be)), tool=PAIR_IDENTITY,
+                run=shlex.quote(run), tail=tail)
         pr = contract.get("pr") or claim.get("pr") or "<pr>"
         gate = self.cfg.get("gate_cmd") or "smoke-pr-gate.sh"
         return ("**PAIR IDENTITY: NOT FROZEN -- do this before dispatching any lane.** A freeze made after a lane "

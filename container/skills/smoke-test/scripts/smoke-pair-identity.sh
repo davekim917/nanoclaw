@@ -86,7 +86,7 @@ read_pair() { local fe be
 import json, sys, os, re, datetime
 DEP = re.compile(r"^dep-[a-z0-9]{10,}$"); SVC = re.compile(r"^srv-[a-z0-9]{10,}$"); SHA = re.compile(r"^[0-9a-f]{40}$")
 if os.environ["PROVIDER"] == "static":
-    DEP = re.compile(r"^sha-[0-9a-f]{40}$"); SVC = re.compile(r"^https?://[^\s/]+(/\S*)?$")
+    DEP = re.compile(r"^sha-[0-9a-f]{40}$"); SVC = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$")
 def pick(raw, svc):
     try:
         arr = json.loads(raw)

@@ -110,6 +110,9 @@ OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static)"; RC=$?
 OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.acme.example' SMOKE_GATE_BACKEND_SERVICE=)"; RC=$?
 [ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_BACKEND_SERVICE"]' <<<"$OUT" >/dev/null \
   && ok "an empty template is named once" || fail "static empty: rc=$RC $OUT"
+OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web.acme.example/?pr={pr}&x=1' SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.acme.example')"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_FRONTEND_SERVICE"]' <<<"$OUT" >/dev/null \
+  && ok "a template with a query or shell metacharacter named" || fail "static unsafe template: rc=$RC $OUT"
 OUT="$(run_config "$GATE" SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.acme.example' SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.acme.example')"; RC=$?
 [ "$RC" -eq 0 ] && ok "static provider with templates ok" || fail "static ok: rc=$RC $OUT"
 

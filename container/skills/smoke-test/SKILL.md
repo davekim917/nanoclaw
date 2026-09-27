@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5551`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5558`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2650,8 +2650,9 @@ a self-hosted preview): `SMOKE_GATE_FRONTEND_SERVICE` / `SMOKE_GATE_BACKEND_SERV
 become URL templates containing `{pr}` (the PR number, e.g. Netlify's
 `https://deploy-preview-{pr}--<site>.netlify.app`) and/or `{branch}` (the PR
 head lowercased with every non-alphanumeric character a `-`, Cloudflare Pages'
-`https://{branch}.<project>.pages.dev` alias); a template with neither is
-`gate_misconfigured`. A preview's deploy identity is the full 40-character
+`https://{branch}.<project>.pages.dev` alias); a template with neither, or one
+that is not a plain http(s) URL (host, optional port and path; no query, since
+the resolved URL is pasted into shell commands), is `gate_misconfigured`. A preview's deploy identity is the full 40-character
 commit SHA it serves, read from `SMOKE_PREVIEW_VERSION_PATH` (default `/version`,
 JSON `sha`, `commit` or `gitSha`) or else a `<meta name="build-sha" content="…">`
 tag in its page (`scripts/smoke-preview-static.sh`, read by the gate and by

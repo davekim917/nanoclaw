@@ -41,12 +41,20 @@ RUN_PREFIX="${SMOKE_GATE_RUN_PREFIX:-smoke}"
 # identity is the commit it serves (smoke-preview-static.sh).
 PREVIEW_PROVIDER="${SMOKE_PREVIEW_PROVIDER:-render}"
 HEALTH_PATH="${SMOKE_GATE_HEALTH_PATH:-/healthz}"
+# A static template names each PR's preview with {pr} and/or {branch} and is
+# otherwise a plain http(s) URL (host, optional port and path, no query):
+# the URL it resolves to is pasted unquoted into shell commands in briefs.
+static_template_ok() {
+  local rest="${1//\{pr\}/}"
+  rest="${rest//\{branch\}/}"
+  [ "$rest" != "$1" ] && [[ "$rest" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]
+}
 provider_config_problems() {  # → " NAME" for each preview-provider key this install cannot run on
   case "$PREVIEW_PROVIDER" in
     render) ;;
     static)
-      case "$FRONTEND_SERVICE" in ""|*'{pr}'*|*'{branch}'*) ;; *) printf ' SMOKE_GATE_FRONTEND_SERVICE' ;; esac
-      case "$BACKEND_SERVICE" in ""|*'{pr}'*|*'{branch}'*) ;; *) printf ' SMOKE_GATE_BACKEND_SERVICE' ;; esac ;;
+      [ -z "$FRONTEND_SERVICE" ] || static_template_ok "$FRONTEND_SERVICE" || printf ' SMOKE_GATE_FRONTEND_SERVICE'
+      [ -z "$BACKEND_SERVICE" ] || static_template_ok "$BACKEND_SERVICE" || printf ' SMOKE_GATE_BACKEND_SERVICE' ;;
     *) printf ' SMOKE_PREVIEW_PROVIDER' ;;
   esac
 }
@@ -1827,7 +1835,6 @@ preview_branch_alias() {
   printf '%s' "$ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]/-/g'
 }
 
-# static provider: served_sha (smoke-preview-static.sh) is the commit a preview serves.
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-preview-static.sh"
 
 healthz_ok() {
