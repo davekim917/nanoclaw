@@ -14,20 +14,39 @@ ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 ## Flow
 
 1. `intake` validates the name, the injection rule and the grant targets, checks the vault (a new name must
-   not exist; a rotation must), and posts a card to the first reachable owner or global admin DM
-   (`pickOwnersFirst` → `pickApprovalDelivery`). The card states who asked, the host the key will be sent to,
-   and who gets it. The call returns at once with an intake id.
-2. The card's button (`ncs:<intakeId>`) opens a Slack modal. Opening checks only that the intake is still
-   pending: nothing inside Slack's 3-second trigger window waits on the central DB lease.
+   not exist; a rotation must), and posts a card. An agent's request goes into the conversation and thread it
+   was asked from; a host request, or an agent session with no conversation, goes to the first reachable owner
+   or global admin DM (`pickOwnersFirst` → `pickApprovalDelivery`). The card states who asked, the host the key
+   will be sent to, who gets it, and who may enter it. The call returns at once with an intake id.
+2. The card's button (`ncs:<intakeId>`) opens a Slack modal, private to whoever clicked it: others in the channel
+   see the card, never the value. Opening refuses a clicker with no authority when the central DB lease answers
+   within a second, and otherwise lets the click through; nothing waits past Slack's 3-second trigger window.
 3. Submit validates (non-empty, no whitespace), claims the intake and closes the modal. Only then does the host
-   check that the submitter is an owner or global admin; anyone else's submit stores nothing and returns the
-   intake to pending. The vault write and grants follow: `POST /api/secrets` for a new secret, `PATCH` of the
+   check authority (below); a refused submit stores nothing, returns the intake to pending, and says why in
+   the card's conversation. The vault write and grants follow: `POST /api/secrets` for a new secret, `PATCH` of the
    value for a rotation — through `src/onecli-secret-writer.ts`, which keeps the value out of argv. Any failure
    before the store completes marks the intake failed, on the card and to the requester.
 4. The card is edited to the outcome, and the requesting agent session (if any) gets a host note: stored or
    not, and who it is granted to. The value never appears in either.
 
-## What the owner must check on the card
+## Who may enter a secret
+
+- An **owner or global admin**: any intake.
+- An **admin of the requesting agent's group** (`user_roles` scoped admin): that agent's new secrets. Enable a
+  user by granting them admin on the group. Plain group members cannot.
+- **Rotation is owner or global admin only.** A rotation changes the value every holder uses, and who holds a
+  secret is decided by OneCLI agent grants, some made outside any `container.json` or workgroup declaration —
+  so no declaration scan can prove a secret is the workgroup's alone.
+
+Every store by a group admin sends an owner a DM, right after the vault write and before any other follow-up,
+naming who, which secret, the host and the grants — never the value. A failed notice is logged at error. A key
+a group admin stores for their workgroup is used by every agent in it.
+
+A card goes into the requesting thread only for an agent's new secret on Slack, the one platform whose adapter
+opens the form. A rotation (which only an owner can fill), a host request, and any other origin get it in the
+first owner or global admin with a Slack DM.
+
+## What to check on the card
 
 The **host pattern**: one exact host, no wildcards. The gateway injects the key into any request to that host,
 so a wrong or hostile host gets the key. It is the one decision the form cannot make for you.

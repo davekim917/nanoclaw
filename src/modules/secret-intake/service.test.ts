@@ -20,6 +20,10 @@ const h = vi.hoisted(() => ({
   owners: new Set<string>(['slack:UOWNER']),
   groups: new Map<string, { id: string; name: string; folder: string; workgroup_id: string | null }>(),
   workgroups: new Set<string>(['wg-a', 'wg-b']),
+  groupAdmins: new Set<string>(['slack:UADMIN1|ag-1', 'slack:UADMIN2|ag-2']),
+  originType: 'slack',
+  notifyFails: false,
+  ownerIds: ['slack:UOWNER'],
 }));
 
 vi.mock('../../onecli-secret-writer.js', () => ({
@@ -50,10 +54,20 @@ vi.mock('../../db/agent-groups.js', () => ({
   }),
 }));
 vi.mock('../../db/sessions.js', () => ({
-  getSession: vi.fn(async (id: string) => ({ id, agent_group_id: 'ag-1', messaging_group_id: 'mg-1' })),
+  getSession: vi.fn(async (id: string) => ({
+    id,
+    agent_group_id: 'ag-1',
+    messaging_group_id: 'mg-1',
+    thread_id: 'T1',
+  })),
 }));
 vi.mock('../../db/messaging-groups.js', () => ({
-  getMessagingGroup: vi.fn(async () => ({ id: 'mg-1', channel_type: 'slack', platform_id: 'slack:C1' })),
+  getMessagingGroup: vi.fn(async () => ({
+    id: 'mg-1',
+    channel_type: h.originType,
+    platform_id: 'slack:C1',
+    name: 'ops',
+  })),
 }));
 vi.mock('../../db/central-lease.js', () => ({
   withCentralSync: vi.fn(async (fn: () => unknown) => fn()),
@@ -67,18 +81,33 @@ vi.mock('../../delivery.js', () => ({
   }),
 }));
 vi.mock('../approvals/primitive.js', () => ({
-  pickOwnersFirst: vi.fn(async () => ['slack:UOWNER']),
-  pickApprovalDelivery: vi.fn(async (approvers: string[]) => ({
-    userId: approvers[0],
-    messagingGroup: { channel_type: 'slack', platform_id: 'slack:D1', instance: 'slack' },
-  })),
+  pickOwnersFirst: vi.fn(async () => h.ownerIds),
+  pickApprovalDelivery: vi.fn(async (approvers: string[]) =>
+    approvers[0].startsWith('discord')
+      ? {
+          userId: approvers[0],
+          messagingGroup: { channel_type: 'discord', platform_id: 'discord:D9', instance: 'discord' },
+        }
+      : { userId: approvers[0], messagingGroup: { channel_type: 'slack', platform_id: 'slack:D1', instance: 'slack' } },
+  ),
   notifyAgent: vi.fn(async (_session: unknown, text: string) => {
+    if (h.notifyFails) throw new Error('session DB unavailable');
     h.notes.push(text);
   }),
 }));
 vi.mock('../permissions/db/user-roles.js', () => ({
   isOwner: (id: string) => h.owners.has(id),
   isGlobalAdmin: () => false,
+  isAdminOfAgentGroup: (id: string, group: string) => h.groupAdmins.has(`${id}|${group}`),
+}));
+vi.mock('../permissions/user-dm.js', () => ({
+  resolveUserChannelType: vi.fn(async (id: string) => id.slice(0, id.indexOf(':'))),
+}));
+vi.mock('../permissions/db/users.js', () => ({
+  getUser: vi.fn(async (id: string) => ({ id, display_name: `name-of-${id}` })),
+}));
+vi.mock('../../router.js', () => ({
+  isSlackChannelType: (type: string) => type === 'slack' || type.startsWith('slack-'),
 }));
 vi.mock('../../log.js', () => {
   const record = (...args: unknown[]) => {
@@ -132,7 +161,10 @@ beforeEach(() => {
   h.groupGrants.length = 0;
   h.workgroupGrants.length = 0;
   h.groups.clear();
-  h.groups.set('ag-1', { id: 'ag-1', name: 'Helper', folder: 'donny', workgroup_id: 'wg-a' });
+  h.originType = 'slack';
+  h.notifyFails = false;
+  h.ownerIds = ['slack:UOWNER'];
+  h.groups.set('ag-1', { id: 'ag-1', name: 'Helper', folder: 'helper', workgroup_id: 'wg-a' });
   h.groups.set('ag-2', { id: 'ag-2', name: 'Other', folder: 'other', workgroup_id: 'wg-b' });
 });
 
@@ -141,6 +173,32 @@ afterEach(() => {
 });
 
 describe('startSecretIntake', () => {
+  it('posts the card into the requesting thread, or to an owner DM for the host', async () => {
+    await startSecretIntake({ ...newKey, caller: agentCaller });
+    expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:C1', 'T1']);
+    await startSecretIntake({ ...newKey, name: 'Host-Key', caller: { kind: 'host' } });
+    expect(h.deliveries[1].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
+    expect(JSON.parse(h.deliveries[1].args[4] as string).body).toContain('Only an owner or global admin can enter it.');
+  });
+
+  it('sends a rotation to an owner DM, since only an owner can fill it', async () => {
+    h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
+    await startSecretIntake({ name: 'Linear-API-Key', rotate: true, groups: [], workgroups: [], caller: agentCaller });
+    expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
+  });
+
+  it("picks an owner's Slack DM over an earlier owner's Discord DM", async () => {
+    h.ownerIds = ['discord:UFIRST', 'slack-inst:UOWNER'];
+    await startSecretIntake({ ...newKey, caller: { kind: 'host' } });
+    expect(h.deliveries[0].args.slice(0, 2)).toEqual(['slack', 'slack:D1']);
+  });
+
+  it('sends a card from a platform that cannot open forms to an owner DM instead', async () => {
+    h.originType = 'discord';
+    await startSecretIntake({ ...newKey, caller: agentCaller });
+    expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
+  });
+
   it('posts a card naming the host and grants, and grants the calling group by default', async () => {
     const view = await startSecretIntake({ ...newKey, caller: agentCaller });
     expect(view).toMatchObject({ secretName: 'Linear-API-Key', mode: 'create', status: 'pending', groups: ['ag-1'] });
@@ -208,16 +266,88 @@ describe('startSecretIntake', () => {
 });
 
 describe('the form', () => {
-  it('stores nothing for a submit by someone other than an owner or global admin, and stays open', async () => {
+  it('stores nothing for a submit by someone with no authority, says so in the thread, and stays open', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
     expect(await hooks.submit(intakeId, 'USTRANGER', SECRET)).toEqual({ ok: true });
     await settle();
     expect(h.createCalls).toHaveLength(0);
     expect(getSecretIntake(intakeId)?.status).toBe('pending');
+    const note = h.deliveries.at(-1)!.args;
+    expect(note.slice(0, 4)).toEqual(['slack', 'slack:C1', 'T1', 'chat']);
+    expect(JSON.parse(note[4] as string).text).toMatch(/Only an owner, a global admin or an admin of "Helper"/);
     expect(everythingObservable()).not.toContain(SECRET);
     await hooks.submit(intakeId, 'UOWNER', SECRET);
     await settle();
     expect(h.createCalls).toHaveLength(1);
+  });
+
+  it('refuses the form up front when the lease answers in time and the clicker has no authority', async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    expect(await hooks.open(intakeId, 'USTRANGER')).toMatchObject({
+      ok: false,
+      message: expect.stringMatching(/Only/),
+    });
+    expect(await hooks.open(intakeId, 'UADMIN2')).toMatchObject({ ok: false });
+    expect(await hooks.open(intakeId, 'UADMIN1')).toMatchObject({ ok: true });
+  });
+
+  it("lets an admin of the requesting agent's group store it, and tells the owner without the value", async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    await hooks.submit(intakeId, 'UADMIN1', SECRET);
+    await settle();
+    expect(h.createCalls).toHaveLength(1);
+    const fyi = h.deliveries.find((d) => d.args[1] === 'slack:D1' && d.args[3] === 'chat');
+    expect(fyi).toBeDefined();
+    const text = JSON.parse(fyi!.args[4] as string).text as string;
+    expect(text).toContain('name-of-slack:UADMIN1');
+    expect(text).toContain('Linear-API-Key');
+    expect(text).toContain('api.linear.app');
+    expect(everythingObservable()).not.toContain(SECRET);
+  });
+
+  it('sends the owner no notice when an owner stores it', async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await settle();
+    expect(h.deliveries.some((d) => d.args[1] === 'slack:D1')).toBe(false);
+  });
+
+  it('refuses an admin of another group', async () => {
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    await hooks.submit(intakeId, 'UADMIN2', SECRET);
+    await settle();
+    expect(h.createCalls).toHaveLength(0);
+    expect(getSecretIntake(intakeId)?.status).toBe('pending');
+  });
+
+  it('never lets a group admin rotate; an owner still can', async () => {
+    h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
+    const { intakeId } = await startSecretIntake({
+      name: 'Linear-API-Key',
+      rotate: true,
+      groups: [],
+      workgroups: [],
+      caller: agentCaller,
+    });
+    expect(JSON.parse(h.deliveries[0].args[4] as string).body).toContain('Only an owner or global admin can enter it.');
+    expect(await hooks.open(intakeId, 'UADMIN1')).toMatchObject({ ok: false });
+    await hooks.submit(intakeId, 'UADMIN1', SECRET);
+    await settle();
+    expect(h.updateCalls).toHaveLength(0);
+    expect(getSecretIntake(intakeId)?.status).toBe('pending');
+    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await settle();
+    expect(h.updateCalls).toHaveLength(1);
+  });
+
+  it('sends the owner notice even when a later follow-up fails', async () => {
+    h.notifyFails = true;
+    const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
+    await hooks.submit(intakeId, 'UADMIN1', SECRET);
+    await settle();
+    expect(h.createCalls).toHaveLength(1);
+    expect(h.deliveries.some((d) => d.args[1] === 'slack:D1' && d.args[3] === 'chat')).toBe(true);
+    expect(getSecretIntake(intakeId)?.status).toBe('stored');
   });
 
   it('answers open and submit without waiting on the central lease', async () => {
