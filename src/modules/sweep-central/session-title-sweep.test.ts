@@ -28,11 +28,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY, type SweepTickContext } from '../../host-sweep.js';
-import {
-  __resetCallHaikuSlotCacheForTest,
-  __resetCredentialRotationGateForTest,
-  __setCredentialRotationGateMinIntervalForTest,
-} from '../../llm.js';
 import { log } from '../../log.js';
 import {
   CONCURRENCY_CAP,
@@ -164,9 +159,6 @@ beforeEach(async () => {
   db.pragma('foreign_keys = ON');
   runMigrations(db);
   await createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: now() });
-  __resetCallHaikuSlotCacheForTest();
-  __resetCredentialRotationGateForTest();
-  __setCredentialRotationGateMinIntervalForTest(0);
 });
 
 afterEach(async () => {
@@ -181,8 +173,6 @@ afterEach(async () => {
   // no "original" to restore to), silently turning every later call-through
   // into a no-op and breaking the direct-call cases above. Any test that
   // uses vi.spyOn restores it itself.
-  __resetCallHaikuSlotCacheForTest();
-  __resetCredentialRotationGateForTest();
 });
 
 describe('F-4.3a — session-title sweep keeps its cap, cooldown and new-message threshold', () => {

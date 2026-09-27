@@ -32,11 +32,6 @@ vi.mock('../env.js', async (importOriginal) => ({
 
 import Database from 'better-sqlite3';
 import {
-  __resetCallHaikuSlotCacheForTest,
-  __resetCredentialRotationGateForTest,
-  __setCredentialRotationGateMinIntervalForTest,
-} from '../llm.js';
-import {
   runSessionTitleSweep,
   setTitleBackendForTest,
   _resetTitleBackendForTest,
@@ -171,19 +166,6 @@ beforeEach(async () => {
     originalCredentialEnv[key] = process.env[key];
     delete process.env[key];
   }
-  // Shared "which credential slot is alive" cache lives in src/llm.ts and is
-  // process-wide by design (see callWithCredentialRotation) — reset it so
-  // tests don't inherit a sticky slot from an earlier test in this file.
-  __resetCallHaikuSlotCacheForTest();
-  __resetCredentialRotationGateForTest();
-  // The "production credential rotation" tests below exercise the real
-  // callWithCredentialRotation path (src/llm.ts), which now serializes
-  // behind a process-wide gate with a real 1s minimum spacing between
-  // calls. These tests use REAL timers (no vi.useFakeTimers() in this
-  // file's default describe blocks), so leaving the real interval in place
-  // would make the suite measurably slower without testing anything this
-  // file cares about — gate timing itself is covered in src/llm.test.ts.
-  __setCredentialRotationGateMinIntervalForTest(0);
 });
 
 afterEach(async () => {
@@ -204,8 +186,6 @@ afterEach(async () => {
     if (original === undefined) delete process.env[key];
     else process.env[key] = original;
   }
-  __resetCallHaikuSlotCacheForTest();
-  __resetCredentialRotationGateForTest();
 });
 
 describe('postProcessTitle', () => {
@@ -310,7 +290,7 @@ describe('runSessionTitleSweep', () => {
     expect(row.title).toBe('refreshed title');
   });
 
-  it('honors concurrency cap of 3', async () => {
+  it('titles up to 3 per tick, one request at a time', async () => {
     // Seed 5 candidates that all need a title.
     for (let i = 1; i <= 5; i++) {
       seedSession(`sess-c-${i}`, 'ag-1');
@@ -327,7 +307,7 @@ describe('runSessionTitleSweep', () => {
     });
 
     const result = await runSessionTitleSweep();
-    expect(peak).toBeLessThanOrEqual(CONCURRENCY_CAP);
+    expect(peak).toBe(1);
     expect(result.generated).toBe(CONCURRENCY_CAP);
   });
 
@@ -430,14 +410,8 @@ describe('runSessionTitleSweep', () => {
   });
 
   describe('production credential rotation (real callTitleBackend, no test override)', () => {
-    // These tests exercise the ACTUAL production path — isBackendConfigured()
-    // and callTitleBackend()'s real HTTP call through src/llm.ts's
-    // callWithCredentialRotation — rather than setTitleBackendForTest()'s
-    // stub. That is the path that used to pin to
-    // process.env.CLAUDE_CODE_OAUTH_TOKEN (slot 1) with no rotation, so it
-    // 429'd forever on an exhausted primary credential while slots 2-4 sat
-    // unused. beforeEach() above already strips ambient credential/proxy env
-    // and mocks readEnvFileMatching() so this never touches a real token.
+    // The real callHaiku path, not setTitleBackendForTest()'s stub. beforeEach() strips ambient credential and
+    // proxy env and mocks readEnvFileMatching(), so this never touches a real token.
     let fetchMock: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {

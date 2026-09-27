@@ -11,21 +11,7 @@ vi.mock('./env.js', async (importOriginal) => ({
   readEnvFileMatching: vi.fn(() => ({})),
 }));
 
-import { log } from './log.js';
-import {
-  callHaiku,
-  anthropicCredentialHttpError,
-  callWithCredentialRotation,
-  CallHaikuHttpError,
-  AllCredentialSlotsParkedError,
-  CredentialRotationGateHoldTimeoutError,
-  CredentialRotationGateTimeoutError,
-  __resetCallHaikuSlotCacheForTest,
-  __resetCredentialParkingForTest,
-  __resetCredentialRotationGateForTest,
-  __setCredentialRotationGateMinIntervalForTest,
-  __getParkedUntilMsForTest,
-} from './llm.js';
+import { callHaiku, CallHaikuHttpError } from './llm.js';
 
 function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -61,25 +47,10 @@ describe('callHaiku', () => {
     delete process.env.http_proxy;
     fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
-    vi.useFakeTimers();
-    __resetCallHaikuSlotCacheForTest();
-    __resetCredentialParkingForTest();
-    __resetCredentialRotationGateForTest();
-    // Existing tests below assert call counts/ordering with NO fake-timer
-    // advance between multiple calls in the same test — they predate the
-    // gate's real 1s minimum spacing (see the dedicated "credential rotation
-    // gate" describe block, which restores the real interval). Disabling
-    // spacing here keeps every test that doesn't care about gate timing from
-    // having to advance fake timers just to let a second call through.
-    __setCredentialRotationGateMinIntervalForTest(0);
   });
 
   afterEach(() => {
-    vi.useRealTimers();
     vi.unstubAllGlobals();
-    __resetCallHaikuSlotCacheForTest();
-    __resetCredentialParkingForTest();
-    __resetCredentialRotationGateForTest();
     if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
     if (originalOauthPrimary === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -148,353 +119,24 @@ describe('callHaiku', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
-    it('starts from the first key on every call and ignores the shared rotation’s parked slots', async () => {
-      fetchMock.mockImplementation(() => jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }));
-      await callWithCredentialRotation({
-        attempt: async () => {
-          throw Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 3_600_000 });
-        },
-        logLabel: 'other-caller',
-        noCredentialsMessage: 'none',
-      }).catch(() => {});
-
-      fetchMock.mockReset();
-      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 1' }] }));
-
-      expect(await callHaiku('hello')).toBe('from slot 1');
-      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
-    });
-  });
-
-  describe('credential parking (long retry-after) — the shared rotation, not callHaiku', () => {
-    function viaRotation(prompt: string): Promise<string> {
-      return callWithCredentialRotation({
-        attempt: async (credential) => {
-          const res = (await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: credential.headers,
-            body: prompt,
-          })) as Response;
-          if (!res.ok) throw await anthropicCredentialHttpError(res);
-          const data = (await res.json()) as { content: Array<{ text: string }> };
-          return data.content[0]!.text;
-        },
-        logLabel: 'test-rotation',
-        noCredentialsMessage: 'no credentials configured',
-      }).then((r) => r.value);
-    }
-
-    beforeEach(() => {
-      delete process.env.ANTHROPIC_API_KEY;
-      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-slot-1-token';
-      process.env.CLAUDE_CODE_OAUTH_TOKEN_2 = 'oauth-slot-2-token';
-    });
-
-    it('reuses the last-known-good slot on the next call instead of re-failing through slot 1', async () => {
+    it('starts from the first key on every call', async () => {
       fetchMock
-        .mockResolvedValueOnce(jsonResponse({ error: { type: 'rate_limit_error' } }, { status: 429 }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'first call, slot 2' }] }));
+        .mockResolvedValueOnce(jsonResponse({}, { status: 429 }))
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'first' }] }))
+        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'second' }] }));
 
-      expect(await viaRotation('hello')).toBe('first call, slot 2');
-
-      fetchMock.mockClear();
-      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'second call, slot 2' }] }));
-
-      expect(await viaRotation('hello again')).toBe('second call, slot 2');
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-2-token');
+      expect(await callHaiku('hello')).toBe('first');
+      expect(await callHaiku('hello again')).toBe('second');
+      expect(authHeader(fetchMock.mock.calls[2])).toBe('Bearer oauth-slot-1-token');
     });
 
-    it('parks a slot whose retry-after exceeds the short-retry threshold and rotates immediately, without sleeping', async () => {
-      // retry-after=3600s (1 hour) is the "this credential is genuinely
-      // exhausted" shape (live evidence showed 149184s / 41 hours) — not a
-      // momentarily-busy backend. It must park, not back off.
-      fetchMock
-        .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
+    it('sends the optional system prompt and model', async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'ok' }] }));
 
-      const result = await viaRotation('hello');
+      await callHaiku('user text', { system: 'be brief', model: 'claude-test-model' });
 
-      expect(result).toBe('from slot 2');
-      // Exactly slots.length (2) requests — one per slot, no retry.
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-1-token');
-      expect(authHeader(fetchMock.mock.calls[1])).toBe('Bearer oauth-slot-2-token');
-    });
-
-    it('logs why it parked a slot: status, retry-after, provider error and unified rate-limit headers, never the token', async () => {
-      const warnSpy = vi.spyOn(log, 'warn').mockClear();
-      const longMessage = 'x'.repeat(400);
-      fetchMock
-        .mockResolvedValueOnce(
-          jsonResponse(
-            { type: 'error', error: { type: 'rate_limit_error', message: longMessage } },
-            {
-              status: 429,
-              headers: {
-                'retry-after': '900',
-                'anthropic-ratelimit-unified-status': 'rejected',
-                'anthropic-ratelimit-unified-5h-utilization': '0.12',
-              },
-            },
-          ),
-        )
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
-
-      expect(await viaRotation('hello')).toBe('from slot 2');
-
-      const parkCall = warnSpy.mock.calls.find(([msg]) => String(msg).includes('parking exhausted credential slot'));
-      expect(parkCall?.[1]).toEqual({
-        slot: 'oauth:primary',
-        untilIso: expect.any(String),
-        status: 429,
-        retryAfterMs: 900_000,
-        retryAfterHeader: '900',
-        providerErrorType: 'rate_limit_error',
-        providerMessage: `${'x'.repeat(300)}...`,
-        rateLimitUnifiedHeaders: {
-          'anthropic-ratelimit-unified-status': 'rejected',
-          'anthropic-ratelimit-unified-5h-utilization': '0.12',
-        },
-      });
-      const logged = JSON.stringify(warnSpy.mock.calls);
-      expect(logged).not.toContain('oauth-slot-1-token');
-      expect(logged).not.toMatch(/bearer|authorization/i);
-    });
-
-    it('logs a park with null diagnostics when the response carries no JSON body or unified headers', async () => {
-      const warnSpy = vi.spyOn(log, 'warn').mockClear();
-      fetchMock
-        .mockResolvedValueOnce(new Response('upstream busy', { status: 429, headers: { 'retry-after': '3600' } }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'from slot 2' }] }));
-
-      await viaRotation('hello');
-
-      const parkCall = warnSpy.mock.calls.find(([msg]) => String(msg).includes('parking exhausted credential slot'));
-      expect(parkCall?.[1]).toMatchObject({
-        status: 429,
-        retryAfterHeader: '3600',
-        providerErrorType: null,
-        providerMessage: null,
-        rateLimitUnifiedHeaders: null,
-      });
-    });
-
-    it('carries the provider error type and message into the thrown error message for callers that log it', async () => {
-      fetchMock.mockImplementation(() =>
-        jsonResponse(
-          { error: { type: 'rate_limit_error', message: 'This request would exceed your rate limit' } },
-          { status: 429, headers: { 'retry-after': '3600' } },
-        ),
-      );
-
-      const err = await viaRotation('hello').catch((e: unknown) => e);
-
-      expect(err).toBeInstanceOf(CallHaikuHttpError);
-      expect((err as Error).message).toBe(
-        'callHaiku: Anthropic returned 429 rate_limit_error: This request would exceed your rate limit',
-      );
-      expect(err).toMatchObject({ providerErrorType: 'rate_limit_error', retryAfterHeader: '3600' });
-    });
-
-    it('skips a parked slot on the NEXT call entirely, rather than retrying it', async () => {
-      fetchMock
-        .mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }))
-        .mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'first call, slot 2' }] }));
-
-      const first = await viaRotation('hello');
-      expect(first).toBe('first call, slot 2');
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-
-      // Reset the STICKY-slot cache but NOT the parking state, so the next
-      // call's ordering falls back to [slot1, slot2] — this isolates
-      // "slot 1 is skipped because it's parked" from "slot 1 is skipped
-      // because slot 2 is the sticky last-known-good slot" (a different
-      // mechanism that would also explain skipping slot 1).
-      __resetCallHaikuSlotCacheForTest();
-      fetchMock.mockClear();
-      fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'second call, slot 2' }] }));
-
-      const second = await viaRotation('hello again');
-
-      expect(second).toBe('second call, slot 2');
-      // Only ONE fetch call: slot 1 is still parked (1-hour retry-after from
-      // the first call), so it is skipped entirely — never attempted.
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(authHeader(fetchMock.mock.calls[0])).toBe('Bearer oauth-slot-2-token');
-    });
-
-    it('fails fast with AllCredentialSlotsParkedError when every slot is parked, without sleeping', async () => {
-      // mockImplementation (not mockResolvedValue) — a fresh Response per
-      // call, since the error body is read via .json() and a shared Response
-      // instance can't be read twice.
-      fetchMock.mockImplementation(() => jsonResponse({}, { status: 429, headers: { 'retry-after': '3600' } }));
-
-      const first = await viaRotation('hello').catch((err: unknown) => err);
-      expect(first).toBeInstanceOf(CallHaikuHttpError);
-      // Both slots tried (and parked) on this first call.
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-
-      fetchMock.mockClear();
-      const second = viaRotation('hello again');
-
-      await expect(second).rejects.toBeInstanceOf(AllCredentialSlotsParkedError);
-      // No request at all on the second call — both slots were already
-      // known-parked, so it fails fast instead of sleeping or re-trying a
-      // credential that just told us it's dead for the next hour.
-      expect(fetchMock).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('credential rotation gate (process-wide serialization — fixes the burst-parking loop)', () => {
-    // These tests exercise the gate directly via callWithCredentialRotation
-    // rather than through callHaiku/fetch, to isolate gate mechanics
-    // (queueing, spacing, timeout, park-clearing) from HTTP-mocking noise.
-    // The outer beforeEach leaves ANTHROPIC_API_KEY set (single
-    // api-key:primary slot) and disables gate spacing
-    // (__setCredentialRotationGateMinIntervalForTest(0)); restore the REAL
-    // interval here so these tests can prove real spacing behavior against
-    // fake timers.
-    beforeEach(() => {
-      __setCredentialRotationGateMinIntervalForTest(1000);
-    });
-
-    function call<T>(attempt: () => Promise<T>) {
-      return callWithCredentialRotation({
-        attempt,
-        logLabel: 'test-gate',
-        noCredentialsMessage: 'no credentials configured',
-      });
-    }
-
-    it('serializes concurrent calls and spaces them by the minimum interval — never more than one in flight', async () => {
-      let active = 0;
-      let peakActive = 0;
-      const startTimes: number[] = [];
-
-      async function attempt(n: number): Promise<number> {
-        active++;
-        peakActive = Math.max(peakActive, active);
-        startTimes.push(Date.now());
-        await Promise.resolve();
-        active--;
-        return n;
-      }
-
-      const p1 = call(() => attempt(1));
-      const p2 = call(() => attempt(2));
-      const p3 = call(() => attempt(3));
-
-      await vi.advanceTimersByTimeAsync(3000);
-
-      const results = await Promise.all([p1, p2, p3]);
-      expect(results.map((r) => r.value)).toEqual([1, 2, 3]);
-      expect(peakActive).toBe(1); // at most one in-flight request at a time
-      expect(startTimes[1]! - startTimes[0]!).toBeGreaterThanOrEqual(1000);
-      expect(startTimes[2]! - startTimes[1]!).toBeGreaterThanOrEqual(1000);
-    });
-
-    it('a throwing call releases the gate so the next queued call still proceeds (no deadlock)', async () => {
-      const boom = Object.assign(new Error('boom'), { status: 400 }); // fatal — classify() rejects immediately
-      const attempt1 = vi.fn(async () => {
-        throw boom;
-      });
-      const attempt2 = vi.fn(async () => 'ok');
-
-      const p1 = call(attempt1);
-      p1.catch(() => {});
-      const p2 = call(attempt2);
-
-      await expect(p1).rejects.toBe(boom);
-      await vi.advanceTimersByTimeAsync(1500);
-      const result2 = await p2;
-
-      expect(result2.value).toBe('ok');
-      expect(attempt2).toHaveBeenCalledTimes(1);
-    });
-
-    it('fails fast with CredentialRotationGateTimeoutError when queued past the max wait, without deadlocking the queue for later callers', async () => {
-      // A holder that never resolves on its own — released manually once
-      // we've confirmed the queued-too-long caller gave up.
-      let releaseHolder!: () => void;
-      const holderGate = new Promise<void>((resolve) => {
-        releaseHolder = resolve;
-      });
-      const holder = call(async () => {
-        await holderGate;
-        return 'holder done';
-      });
-
-      const queuedTooLong = call(async () => 'should never run');
-      queuedTooLong.catch(() => {});
-
-      // Push past the 30s max-wait cap while the holder is still running —
-      // queuedTooLong must give up rather than wait indefinitely for a
-      // predecessor that's still in flight.
-      await vi.advanceTimersByTimeAsync(31_000);
-      await expect(queuedTooLong).rejects.toBeInstanceOf(CredentialRotationGateTimeoutError);
-
-      // Let the true holder finish and unwind the chain.
-      releaseHolder();
-      await vi.advanceTimersByTimeAsync(100);
-      expect((await holder).value).toBe('holder done');
-
-      // A FRESH call issued now (well after the timeout episode) must not be
-      // stuck behind a corrupted queue — proving the timed-out caller's
-      // bail-out didn't leave the mutex permanently held.
-      const afterThat = call(async () => 'after');
-      await vi.advanceTimersByTimeAsync(1500);
-      expect((await afterThat).value).toBe('after');
-    });
-
-    it('abandons a call that holds the gate past the max hold, so queued callers are not starved', async () => {
-      const warnSpy = vi.spyOn(log, 'warn');
-      const hung = call(() => new Promise<string>(() => {}));
-      hung.catch(() => {});
-
-      await vi.advanceTimersByTimeAsync(120_000);
-      await expect(hung).rejects.toBeInstanceOf(CredentialRotationGateHoldTimeoutError);
-      expect(warnSpy).toHaveBeenCalledWith(
-        'Host LLM gate: call exceeded max hold — releasing the gate',
-        expect.objectContaining({ logLabel: 'test-gate' }),
-      );
-
-      const next = call(async () => 'next');
-      await vi.advanceTimersByTimeAsync(1500);
-      expect((await next).value).toBe('next');
-    });
-
-    it('caps a park at the 15-minute ceiling even when retry-after claims hours', async () => {
-      const startMs = Date.now();
-      const err = Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 41 * 3600_000 }); // 41h, live-observed shape
-      const promise = call(async () => {
-        throw err;
-      });
-
-      await expect(promise).rejects.toBe(err);
-
-      const untilMs = __getParkedUntilMsForTest('api-key:primary');
-      expect(untilMs).toBeDefined();
-      expect(untilMs! - startMs).toBe(15 * 60_000); // capped, not the claimed 41 hours
-    });
-
-    it('clears a slot park and logs recovery once a call through it succeeds again', async () => {
-      const infoSpy = vi.spyOn(log, 'info');
-      const err = Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 90_000 }); // parks ~90s, under the 15-min ceiling
-      const failingAttempt = vi.fn(async () => {
-        throw err;
-      });
-
-      await expect(call(failingAttempt)).rejects.toBe(err);
-      expect(__getParkedUntilMsForTest('api-key:primary')).toBeDefined();
-
-      await vi.advanceTimersByTimeAsync(91_000); // past the park window
-      const succeedingAttempt = vi.fn(async () => 'back online');
-      const result = await call(succeedingAttempt);
-
-      expect(result.value).toBe('back online');
-      expect(__getParkedUntilMsForTest('api-key:primary')).toBeUndefined();
-      expect(infoSpy.mock.calls.some(([msg]) => String(msg).includes('recovered'))).toBe(true);
+      const body = JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body) as Record<string, unknown>;
+      expect(body).toMatchObject({ system: 'be brief', model: 'claude-test-model' });
     });
   });
 });
