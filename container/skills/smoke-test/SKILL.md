@@ -1706,7 +1706,7 @@ do its job without. Both used to stay in the controller's own journal.
   branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3502`,
   reading that obligation at `:3508-3509`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
-  every same-SHA recovery (`smoke-pr-gate.sh:5505`), which is how a coordinator
+  every same-SHA recovery (`smoke-pr-gate.sh:5563`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
@@ -2641,6 +2641,25 @@ state or calls anything remote. The freeze helper runs under the develop
 wrapper's environment, so the develop gate's `config` covers its keys too. Run
 both before a gate change goes live: `gate_misconfigured` after a pull means a
 key `config` would have named.
+
+**Preview providers.** `SMOKE_PREVIEW_PROVIDER` picks where a PR's previews
+come from. `render` (default) is everything above: base service ids, Render's
+services/deploys API, and a best-effort suspend on `finish`. `static` fits any
+host that gives each PR a predictable URL (Cloudflare Pages, Netlify, Vercel,
+a self-hosted preview): `SMOKE_GATE_FRONTEND_SERVICE` / `SMOKE_GATE_BACKEND_SERVICE`
+become URL templates containing `{pr}` (the PR number, e.g. Netlify's
+`https://deploy-preview-{pr}--<site>.netlify.app`) and/or `{branch}` (the PR
+head lowercased with every non-alphanumeric character a `-`, Cloudflare Pages'
+`https://{branch}.<project>.pages.dev` alias); a template with neither is
+`gate_misconfigured`. A preview's deploy identity is the full 40-character
+commit SHA it serves, read from `SMOKE_PREVIEW_VERSION_PATH` (default `/version`,
+JSON `sha`, `commit` or `gitSha`) or else a `<meta name="build-sha" content="…">`
+tag in its page. `static` never calls a provider API and never suspends.
+`SMOKE_GATE_HEALTH_PATH` (default `/healthz`) is the backend readiness probe for
+both providers and for `smoke-build-identity.sh`. The develop gate, the freeze
+helper and `smoke-pair-identity.sh` still read Render's API; a `static` install
+runs PR-scoped campaigns only. A hard assumption for every provider: the repo
+is on GitHub (`gh` reads PRs, CI runs and trees).
 
 **Preview identity is never a positional pick.** Render has provisioned two
 services sharing one display name under the same parent more than once (a

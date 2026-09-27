@@ -28,6 +28,7 @@
 #                                 the Vite/Rollup hashed entry every sampled
 #                                 run has actually used.
 #   SMOKE_BUILD_ID_TIMEOUT       per-fetch curl --max-time, default 10s.
+#   SMOKE_GATE_HEALTH_PATH       backend readiness path, default /healthz.
 #
 # One JSON line on stdout, same convention as the sibling gate scripts.
 # Exit 0 on ok:true, 1 on a failed check (a caller gates a campaign start on
@@ -99,7 +100,7 @@ fi
 # here, loudly, independent of whether the bundle checks above passed.
 BACKEND_REACHABLE=false
 BACKEND_HTTP_CODE=""
-CODE="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" "${BACKEND_URL}/healthz" 2>/dev/null)"
+CODE="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" "${BACKEND_URL}${SMOKE_GATE_HEALTH_PATH:-/healthz}" 2>/dev/null)"
 if [ $? -eq 0 ] && [ "$CODE" = "200" ]; then
   BACKEND_REACHABLE=true
   BACKEND_HTTP_CODE="$CODE"
@@ -126,7 +127,7 @@ elif [ "$STALE_FOUND" != '{}' ]; then
   REASON="bundle references a stale/wrong API host: $(jq -c 'keys' <<<"$STALE_FOUND")"
 elif [ "$BACKEND_REACHABLE" != true ]; then
   OK=false
-  REASON="backend ${BACKEND_URL}/healthz did not return 200 (frontend build identity is correct, but the backend is not reachable/bound) — got ${BACKEND_HTTP_CODE:-no response}"
+  REASON="backend ${BACKEND_URL}${SMOKE_GATE_HEALTH_PATH:-/healthz} did not return 200 (frontend build identity is correct, but the backend is not reachable/bound) — got ${BACKEND_HTTP_CODE:-no response}"
 fi
 
 jq -cn \

@@ -194,6 +194,7 @@ set -u
 [ -n "${STUB_BUNDLE_EXIT+x}" ] || STUB_BUNDLE_EXIT=0
 [ -n "${STUB_BUNDLE_JS+x}" ] || STUB_BUNDLE_JS=''
 ARGS="$*"
+[ -z "${STUB_CURL_LOG:-}" ] || printf '%s\n' "$ARGS" >> "$STUB_CURL_LOG"
 if printf '%s' "$ARGS" | grep -qF '/suspend'; then
   # Receipt of every suspend POST that actually went out, so a test can
   # assert a refusal issued NONE rather than inferring it from a status field.
@@ -233,6 +234,10 @@ if printf '%s' "$ARGS" | grep -qF '/deploys'; then
     printf '%s' "$STUB_FRONTEND_DEPLOYS"
   fi
   exit 0
+fi
+if printf '%s' "$ARGS" | grep -qF '/version'; then
+  [ -n "${STUB_VERSION_JSON:-}" ] || exit 22
+  printf '%s' "$STUB_VERSION_JSON"; exit 0
 fi
 if printf '%s' "$ARGS" | grep -qF '/services?limit'; then
   printf '%s' "$STUB_SERVICES"; exit 0
@@ -715,6 +720,52 @@ bash "$GATE" check 7 | jq -e --arg head "$HEAD_SHA" --arg stale "$STALE_SHA" '
   .eligible == true and .settled == false and .backendReady == false and
   .backendDeploySha == $stale and .headSha == $head
 ' >/dev/null
+
+# --- 4a. `static` preview provider: each preview's URL comes from its
+# *_SERVICE template, its deploy identity is the SHA it serves at /version, a
+# configured health path replaces /healthz, and Render's API is never called.
+fresh_state
+HEAD_SHA="$(sha 4)"
+export STUB_PR_VIEW="{\"number\":48,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"api/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_HEALTHZ_CODE=200 STUB_CURL_LOG="$STATE_DIR/curl-4a.log"
+# A static template with no placeholder cannot name a PR's preview: misconfigured.
+T4A="$(SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_BACKEND_SERVICE='https://api.example.test' \
+  SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.example.test' bash "$GATE" check 48 2>/dev/null || true)"
+jq -e '.ok == false and .error == "gate misconfigured" and .missing == ["SMOKE_GATE_BACKEND_SERVICE"]' <<<"$T4A" >/dev/null ||
+  { echo "4a: a placeholder-less static template was accepted: $T4A" >&2; exit 1; }
+T4A="$(SMOKE_PREVIEW_PROVIDER=heroku bash "$GATE" check 48 2>/dev/null || true)"
+jq -e '.ok == false and .missing == ["SMOKE_PREVIEW_PROVIDER"]' <<<"$T4A" >/dev/null ||
+  { echo "4a: an unknown provider was accepted: $T4A" >&2; exit 1; }
+static_check() {
+  SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_HEALTH_PATH=/healthz/ready \
+    SMOKE_GATE_BACKEND_SERVICE='https://api-pr-{pr}.example.test' \
+    SMOKE_GATE_FRONTEND_SERVICE='https://web-pr-{pr}.example.test' bash "$GATE" check 48
+}
+T4A="$(STUB_VERSION_JSON="{\"sha\":\"$HEAD_SHA\"}" static_check)"
+jq -e --arg head "$HEAD_SHA" '
+  .settled == true and .backendReady == true and .backendDeploySha == $head and
+  .backendPreviewUrl == "https://api-pr-48.example.test" and
+  .frontendPreviewUrl == "https://web-pr-48.example.test"' <<<"$T4A" >/dev/null ||
+  { echo "4a: a static preview serving the head did not settle: $T4A" >&2; exit 1; }
+grep -qF 'https://api-pr-48.example.test/healthz/ready' "$STUB_CURL_LOG" ||
+  { echo "4a: the configured health path was not probed" >&2; exit 1; }
+! grep -qF 'api.render.com' "$STUB_CURL_LOG" || { echo "4a: the static provider called Render" >&2; exit 1; }
+# A preview serving another commit, or naming none, is not ready.
+T4A="$(STUB_VERSION_JSON="{\"sha\":\"$(sha 5)\"}" static_check)"
+jq -e '.settled == false and .backendReady == false' <<<"$T4A" >/dev/null ||
+  { echo "4a: a static preview serving a stale commit settled: $T4A" >&2; exit 1; }
+T4A="$(STUB_VERSION_JSON='{"sha":"short"}' static_check)"
+jq -e '.settled == false and .backendReady == false' <<<"$T4A" >/dev/null ||
+  { echo "4a: a malformed served sha settled: $T4A" >&2; exit 1; }
+# `{branch}` is the PR head as a host alias: lowercased, non-alphanumerics "-".
+T4A="$(STUB_VERSION_JSON="{\"sha\":\"$HEAD_SHA\"}" SMOKE_PREVIEW_PROVIDER=static \
+  SMOKE_GATE_BACKEND_SERVICE='https://{branch}.api.example.test' \
+  SMOKE_GATE_FRONTEND_SERVICE='https://{branch}.web.example.test' bash "$GATE" check 48)"
+jq -e '.settled == true and .backendPreviewUrl == "https://feature-x.api.example.test"' <<<"$T4A" >/dev/null ||
+  { echo "4a: a {branch} template did not resolve to the head alias: $T4A" >&2; exit 1; }
+unset STUB_CURL_LOG
 
 # --- 5. Freeze-PR: CI checked on the PARENT sha, not the marker head; range
 # facts come from campaignRange = validated-GO baseline ... target.
