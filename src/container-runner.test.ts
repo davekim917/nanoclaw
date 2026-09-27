@@ -633,7 +633,7 @@ describe('memory admission budget', () => {
 
 describe('serializeMcpServersEnv', () => {
   it('serializes Datafold as native Streamable HTTP without the bridge', () => {
-    const env = serializeMcpServersEnv({ datafold: DATAFOLD_MCP_SERVER }, []);
+    const env = serializeMcpServersEnv({ datafold: DATAFOLD_MCP_SERVER }, {});
     expect(env).not.toBeNull();
     expect(env).not.toContain('remote-mcp-bridge');
 
@@ -647,7 +647,7 @@ describe('serializeMcpServersEnv', () => {
   });
 
   it('rejects deprecated SSE before serializing the container env var', () => {
-    expect(() => serializeMcpServersEnv({ legacy: { type: 'sse', url: 'https://example.test/sse' } }, [])).toThrow(
+    expect(() => serializeMcpServersEnv({ legacy: { type: 'sse', url: 'https://example.test/sse' } }, {})).toThrow(
       /deprecated SSE transport/,
     );
   });
@@ -663,7 +663,7 @@ describe('serializeMcpServersEnv', () => {
           instructions: 'Always-in-context text.',
         },
       },
-      [],
+      {},
     );
 
     const servers = JSON.parse(env!.replace(/^NANOCLAW_MCP_SERVERS=/, ''));
@@ -684,7 +684,7 @@ describe('serializeMcpServersEnv', () => {
     // what those blocks emitted, or a "pure data move" quietly reconfigures
     // every group's tooling.
     const servers = JSON.parse(
-      serializeMcpServersEnv(effectiveMcpServers({ mcpServers: {} }), [])!.replace(/^NANOCLAW_MCP_SERVERS=/, ''),
+      serializeMcpServersEnv(effectiveMcpServers({ mcpServers: {} }), {})!.replace(/^NANOCLAW_MCP_SERVERS=/, ''),
     );
     expect(servers.granola).toEqual({ type: 'stdio', command: 'bun', args: ['/app/src/granola-mcp-server.ts'] });
     expect(servers.deepwiki).toEqual({ type: 'http', url: 'https://mcp.deepwiki.com/mcp' });
@@ -697,23 +697,30 @@ describe('serializeMcpServersEnv', () => {
     expect(servers.littlebird).toEqual({ type: 'http', url: 'https://mcp.littlebird.ai/mcp' });
   });
 
-  it('leaves out the servers the container reads from its own container.json', () => {
-    // The runner resolves container.json entries (plugin root, placeholders, the ownership marker), then overlays
-    // this payload by name: a re-sent raw copy replaced the resolved entry.
-    const stamped = {
-      type: 'stdio',
-      command: './bin/tool',
-      args: ['--data', '${PLUGIN_DATA}'],
-      cwd: '${PLUGIN_ROOT}',
-      pluginRoot: '/workspace/agent/plugins/acme',
-      plugin: 'acme',
-    } as McpServerConfig;
-    const env = serializeMcpServersEnv(effectiveMcpServers({ mcpServers: { stamped } }), ['stamped']);
+  it('leaves out plugin-owned servers, which the runner resolves from container.json', () => {
+    // The runner resolves them (plugin root, placeholders, the ownership marker), then overlays this payload by name:
+    // a re-sent raw copy replaced the resolved entry.
+    const own = {
+      stamped: {
+        type: 'stdio',
+        command: './bin/tool',
+        args: ['--data', '${PLUGIN_DATA}'],
+        cwd: '${PLUGIN_ROOT}',
+        pluginRoot: '/workspace/agent/plugins/acme',
+        plugin: 'acme',
+      },
+      remote: { type: 'http', url: 'https://mcp.acme.test/mcp', plugin: 'acme' },
+      handAdded: { type: 'stdio', command: 'hand-tool', args: [], cwd: '/tmp' },
+    } as Record<string, McpServerConfig>;
+    const env = serializeMcpServersEnv(effectiveMcpServers({ mcpServers: structuredClone(own) }), own);
 
     const servers = JSON.parse(env!.replace(/^NANOCLAW_MCP_SERVERS=/, ''));
     expect(servers.stamped).toBeUndefined();
+    expect(servers.remote).toBeUndefined();
+    expect(env).not.toContain('"plugin');
+    // Not plugin-owned: still sent as the host's validated copy, which drops a cwd without plugin provenance.
+    expect(servers.handAdded).toEqual({ type: 'stdio', command: 'hand-tool', args: [] });
     expect(servers.deepwiki).toEqual({ type: 'http', url: 'https://mcp.deepwiki.com/mcp' });
-    expect(env).not.toContain('pluginRoot');
   });
 });
 

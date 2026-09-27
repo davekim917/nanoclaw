@@ -212,16 +212,18 @@ export const DATAFOLD_MCP_SERVER = {
 const HOST_ONLY_MCP_FIELDS = ['displayName', 'description'] as const;
 
 /**
- * Omits `readFromFile`: the runner resolves container.json entries, then overlays this by name, so a raw copy undoes
- * that. HOST_ONLY_MCP_FIELDS are snapshot metadata the container lacks; `instructions` deliberately still crosses.
+ * Omits the group's plugin-owned entries: the runner resolves those from container.json, then overlays this by name,
+ * so a raw copy undoes that. HOST_ONLY_MCP_FIELDS are snapshot metadata; `instructions` deliberately still crosses.
  */
 export function serializeMcpServersEnv(
   servers: Record<string, unknown>,
-  readFromFile: Iterable<string>,
+  groupServers: Record<string, McpServerConfig>,
 ): string | null {
-  const fromFile = new Set(readFromFile);
   const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
-  const additional = Object.entries(validated).filter(([name]) => !fromFile.has(name));
+  const additional = Object.entries(validated).filter(([name]) => {
+    const own = groupServers[name] as { plugin?: string; pluginRoot?: string } | undefined;
+    return own?.plugin === undefined && own?.pluginRoot === undefined;
+  });
   if (additional.length === 0) return null;
   const forContainer = Object.fromEntries(
     additional.map(([name, server]) => {
@@ -5401,7 +5403,7 @@ async function buildContainerArgs(
     }
   }
 
-  const mcpServersEnv = serializeMcpServersEnv(mcpServers, Object.keys(containerConfig.mcpServers ?? {}));
+  const mcpServersEnv = serializeMcpServersEnv(mcpServers, containerConfig.mcpServers ?? {});
   if (mcpServersEnv) {
     args.push('-e', mcpServersEnv);
   }
