@@ -1,20 +1,6 @@
 /**
- * Capability self-awareness (Phase 5.3).
- *
- * Single source of truth for "what can this NanoClaw install actually
- * do right now?" Reads the current state of channels, mounted
- * credentials, plugins, agent groups, and feature flags, and returns
- * a structured snapshot.
- *
- * Consumers:
- *   - Agent, via the `get_capabilities` MCP tool (so the agent can
- *     answer "can I send email from this install?" without probing).
- *   - External HTTP caller or future UI — any consumer reads the same
- *     shape. v1 built this as a Web UI dependency; v2 inverts that
- *     so Web-UI (or any other consumer) reads core.
- *
- * Nothing here depends on a UI; the UI (if/when one exists) reads
- * this module.
+ * Capability self-awareness: what this install can do right now (channels, credentials, plugins, agent groups,
+ * flags), read by the agent's `get_capabilities` tool and any other consumer.
  */
 import fs from 'fs';
 import os from 'os';
@@ -35,27 +21,24 @@ import { getAllMessagingGroups } from './db/messaging-groups.js';
 import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import { extractToolScopes } from './scoped-env.js';
 
-// Read version once at module load.
 let cachedVersion = '0.0.0';
 try {
   const pkgPath = path.resolve(GROUPS_DIR, '..', 'package.json');
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
   cachedVersion = pkg.version || '0.0.0';
 } catch {
-  // fall back — version is informational only
+  // Version is informational only.
 }
 
 export interface HostCapabilities {
   version: string;
 
-  /** Which channel adapters have self-registered at startup. */
   channels: {
     registered: string[];
-    /** Channels with at least one wired messaging_group (i.e., actually in use). */
+    /** Channels with at least one wired messaging_group. */
     active: string[];
   };
 
-  /** Which credential dirs the host has mounted (determines agent tool scope). */
   credentials: {
     gws: boolean; // Google Workspace (Gmail/Calendar/Drive/Docs)
     gmailMcp: boolean; // legacy Gmail MCP creds
@@ -68,13 +51,11 @@ export interface HostCapabilities {
     codex: boolean;
   };
 
-  /** Which plugin repos are available to containers. */
   plugins: {
     builtin: string[]; // reserved for future always-on built-ins; currently empty
     installed: string[]; // ~/plugins/* subdirs
   };
 
-  /** Agent groups + their per-group feature flags. */
   agentGroups: Array<{
     id: string;
     name: string;
@@ -83,20 +64,15 @@ export interface HostCapabilities {
     githubTokenEnv: string | null;
   }>;
 
-  /** Messaging group count by channel type (how many places this install is wired into). */
   messagingGroupsByChannel: Record<string, number>;
 
-  /** Which host-side credential env vars are set (for per-tool scoping). Values are never returned — only which names are populated. */
+  /** Which scoped credential env names are set. Values are never returned. */
   credentialEnvSet: string[];
 
   /**
-   * Per-service snapshot scoped to the agent_group that owns this session.
-   * Lists the accounts/scopes actually wired in for this container and —
-   * critically — the exact activation step (e.g. which env var to export)
-   * that most CLIs require. Without this, the agent sees `credentials.gws:
-   * true` and `gws auth status → auth_method: none` and concludes (wrongly)
-   * that it isn't authenticated. Populated only when `forAgentGroupId` is
-   * passed to getHostCapabilities.
+   * Per-service view for the owning agent group, including the exact CLI activation step: without it the agent
+   * sees `credentials.gws: true` plus `auth_method: none` and wrongly concludes it is unauthenticated. Present
+   * only when `forAgentGroupId` is passed.
    */
   session?: SessionServicesSnapshot;
 }
@@ -104,70 +80,37 @@ export interface HostCapabilities {
 export interface SessionServicesSnapshot {
   agentGroupId: string;
   /**
-   * The standing instruction that heads the pre-turn roster. Carried on the
-   * snapshot (rather than only in host code) so the runner's fresh-context
-   * fallback renders the SAME two sentences from the mounted
-   * `/workspace/capabilities.json` instead of keeping its own copy to drift
-   * (container/agent-runner/src/memory/bootstrap.ts).
+   * The roster's standing instruction, carried on the snapshot so the runner's fresh-context fallback renders
+   * the same text from `/workspace/capabilities.json` instead of a drifting copy.
    */
   howToUse?: string;
   services: Array<{
-    /**
-     * Human label, e.g. "Google Workspace". Also the lookup key for
-     * `get_capabilities({ service })`, which matches case-insensitively on
-     * this, on `cli`, and on `mcpNamespace` — so keep it short and typeable.
-     */
+    /** Also the case-insensitive lookup key for `get_capabilities({ service })`, so keep it short and typeable. */
     name: string;
-    /** CLI binary the agent invokes. Omitted for MCP-only services. */
+    /** Omitted for MCP-only services. */
     cli?: string;
-    /** MCP tool namespace (e.g. `mcp__exa__*`). Used for usage-guided entries. */
     mcpNamespace?: string;
-    /** Tool names in container.json.tools that imply this service. */
     declaredTools: string[];
-    /** Scope names parsed from tool entries (e.g. ['example-labs','support-example-labs']). */
     scopes: string[];
-    /** What files / paths the container sees. Container path, not host path. */
+    /** Container paths, not host paths. */
     credentialPaths: string[];
-    /** Concise activation instruction for the CLI, if any. */
     activation?: string;
     /**
-     * The one line this service gets in the ALWAYS-ON pre-turn roster: what it
-     * is good for, short enough that every wired service fits the block. Aim
-     * at ~80 characters — the roster's whole job is awareness ("you have this,
-     * never say you don't"), and the how-to prose below (`useFor` /
-     * `activation`) is what the agent fetches on demand with
-     * `get_capabilities({ service })` before first use.
-     *
-     * Hand-written for the hand-written entries; derived from an MCP server's
-     * stored `description` for the derived ones (`summarizeCapabilityText`).
-     * Absent means the roster derives one from `activation`/`useFor`, which is
-     * a fallback, not the intent.
+     * The ~80-char line this service gets in the always-on roster; the how-to prose (`useFor`/`activation`) is
+     * fetched on demand. Absent means the roster derives one from that prose, as a fallback.
      */
     summary?: string;
     /**
-     * When the host's cached copy of this credential expires (ISO-8601), for
-     * short-TTL tokens like GitHub App installation tokens. Precision matters:
-     * a RUNNING container's own env copy was frozen at its spawn, so if its
-     * calls 401 while this shows future expiry, the container holds a stale
-     * spawn-time token — restart fixes that. Absent on the first wake after a
-     * cold host start (nothing minted yet).
+     * Host-cached credential expiry (ISO-8601) for short-TTL tokens. A running container's env copy was frozen
+     * at spawn, so 401s while this shows a future expiry mean a stale spawn-time token: restart fixes it.
      */
     expiresAt?: string;
-    /**
-     * When-to-use guidance for services where the gap is "agent doesn't
-     * reach for the tool" rather than "agent can't authenticate". Populated
-     * for exa, granola, etc. where there's no scope/account choice.
-     */
+    /** When-to-use guidance, for services where the gap is reaching for the tool rather than authenticating. */
     useFor?: string;
     /**
-     * Never evicted by a capability budget while any entry without it can be
-     * evicted instead. For an entry whose absence makes the agent deny an
-     * ability it has. Honoured through `evictCapability`
-     * (src/modules/memory/pre-turn-context.ts) at all three host eviction
-     * sites — the service-count limit, the total budget
-     * and `enforceFinalBound` — and by the runner's
-     * fresh-context fallback through its own `evictCapability`
-     * (container/agent-runner/src/memory/bootstrap.ts).
+     * Never evicted by a capability budget while an entry without it can be, for entries whose absence makes
+     * the agent deny an ability it has. Honoured by `evictCapability` at every host eviction site and in the
+     * runner's fresh-context fallback.
      */
     retainUnderBudget?: boolean;
   }>;
@@ -178,57 +121,33 @@ function hostDirExists(...parts: string[]): boolean {
 }
 
 /**
- * The standing instruction that heads the always-on capability roster.
- *
- * Sentence one is the whole reason the block exists: agents were telling
- * users "I can't do that" about tools sitting wired in their own container.
- * Sentence two is what makes the roster affordable — the mini-manual for any
- * one service is a tool call away, so the block does not have to carry 23 of
- * them (13,247 chars on the widest live group, against a 10,000 budget that
- * silently dropped six services from the end, Hex and Looker among them).
- *
- * Sentence three is the one class of text that must NOT be detail-on-demand.
- * The rest of a service's prose is reference an agent looks up before acting;
- * these are prohibitions that only work if the agent reads them WITHOUT having
- * decided to look anything up — by the time it runs `wix login` or adds its
- * own `Authorization` header to test a 401, the harm is done and the tool call
- * that would have warned it was never made. Per-service instances live in the
- * relevant roster hints; this sentence is the class, so a service with no
- * hand-written hint is still covered.
+ * Heads the always-on roster. Sentence one exists because agents denied tools wired in their own container;
+ * sentence two keeps the roster affordable by putting each manual one call away. Sentence three must stay
+ * always-on: prohibitions only work if read before the agent decides to look anything up.
  */
 export const CAPABILITY_ROSTER_PREAMBLE =
   'EVERY service listed here is wired into THIS session right now — never tell the user you lack one of them, and never ask for its credentials. ' +
   'These are one-line reminders, not instructions: before you first use a service in a session, call `get_capabilities` with `{"service":"<name>"}` for its full usage notes (auth, exact tool names, known failure shapes). ' +
   'Credentials are injected for you at spawn, so NEVER run an interactive login or auth command in this container (`gh auth login`, `wix login`, `hex auth login`, `aws configure`, `aws sso login`, `snow login`, …) and NEVER set your own `Authorization` header on a gateway-injected service — the gateway overwrites it, so a 401 there is not evidence the credential is missing. If a credential genuinely fails, report it to the operator instead of re-authenticating.';
 
-/** One roster line: the name, how you reach it, and a short hint. */
 export interface CapabilityRosterEntry {
-  /** Lookup key for `get_capabilities({ service })`. */
   name: string;
-  /** How the agent reaches it — `mcp__looker__*`, `gws`, `curl`, … */
+  /** `mcp__looker__*`, `gws`, `curl`, … */
   via: string;
   /** ~80-char hint. Absent only when a service carries no text at all. */
   use?: string;
-  /** Short-TTL credential expiry; see SessionServicesSnapshot.services.expiresAt. */
+  /** See SessionServicesSnapshot.services.expiresAt. */
   expiresAt?: string;
-  /** See SessionServicesSnapshot.services.retainUnderBudget. */
   retainUnderBudget?: boolean;
 }
 
-/** What the pre-turn block carries, in place of the full snapshot. */
 export interface CapabilityRoster {
   agentGroupId: string;
   howToUse: string;
   services: CapabilityRosterEntry[];
 }
 
-/**
- * Fallback hint for an entry authored without a `summary`: the leading clause
- * of its how-to prose, cut at a word boundary so the line never ends mid-word.
- *
- * Cutting at a sentence end first keeps the common case readable; the
- * character cut is the backstop for a first sentence that runs long.
- */
+/** Fallback hint: the leading clause of the how-to prose, cut at a sentence end, else at a word boundary. */
 function summarizeCapabilityText(text: string, limit = 96): string {
   const flat = text.replace(/\s+/g, ' ').trim();
   if (flat.length <= limit) return flat;
@@ -240,15 +159,8 @@ function summarizeCapabilityText(text: string, limit = 96): string {
 }
 
 /**
- * Reduce a full services snapshot to the always-on roster.
- *
- * This is the shape the pre-turn block carries. It is deliberately lossy: the
- * `useFor` / `activation` prose stays in `/workspace/capabilities.json`, whole
- * and byte-identical, and reaches the agent through
- * `get_capabilities({ service })`. Budget eviction
- * (`src/modules/memory/pre-turn-context.ts`) still runs over the result, but
- * on a roster this size it is a safety net rather than the thing that decides
- * which services an agent is told it has.
+ * Reduce a services snapshot to the always-on roster. Deliberately lossy: the full prose stays in
+ * `/workspace/capabilities.json` and reaches the agent through `get_capabilities({ service })`.
  */
 export function buildCapabilityRoster(snapshot: SessionServicesSnapshot): CapabilityRoster {
   return {
@@ -268,19 +180,8 @@ export function buildCapabilityRoster(snapshot: SessionServicesSnapshot): Capabi
 }
 
 /**
- * Render a scope/account/profile list for a roster hint without letting it
- * push the hint past `PRE_TURN_BOUNDS.capabilityRosterUseChars`.
- *
- * Load-bearing, not cosmetic. These lists are the only UNBOUNDED part of a
- * hand-written hint — a group can hold any number of gws accounts, snowflake
- * connections, aws profiles or dbt profiles — and `boundedText` clips a hint
- * from the END, where the safety imperative is written. Without this, five
- * modestly named accounts silently amputate "`auth_method: none` means that
- * var is unset", which is the whole reason that entry exists.
- *
- * Over budget the list collapses to a count: the names are still one
- * `get_capabilities` call away in `scopes` and the full prose, and a count the
- * agent can act on beats a truncated list it cannot.
+ * A name list bounded to fit the roster hint; over budget it collapses to a count. Load-bearing: these lists are
+ * the only unbounded part of a hint, and `boundedText` clips from the end, where the safety imperative is.
  */
 export function boundedNameList(names: string[], budget = ROSTER_NAME_LIST_CHARS): string {
   const joined = names.join(', ');
@@ -288,12 +189,7 @@ export function boundedNameList(names: string[], budget = ROSTER_NAME_LIST_CHARS
   return `${names.length} available — get_capabilities for names`;
 }
 
-/**
- * Budget for the interpolated list above. Derived: the longest fixed part of a
- * hint that carries one is Google Workspace's, at 152 characters, against a
- * 200-character cap. Guarded by `src/capabilities.test.ts`, which builds the
- * worst case rather than trusting this arithmetic.
- */
+/** Derived from the longest fixed hint part (152 of a 200-char cap); `capabilities.test.ts` checks the worst case. */
 const ROSTER_NAME_LIST_CHARS = 48;
 
 function rosterFallbackUse(service: SessionServicesSnapshot['services'][number]): string | undefined {
@@ -301,7 +197,7 @@ function rosterFallbackUse(service: SessionServicesSnapshot['services'][number])
   return text === undefined ? undefined : summarizeCapabilityText(text);
 }
 
-/** Env names we scope per-agent-group (must stay in sync with SCOPED_CREDENTIAL_VARS in container-runner). */
+/** Must stay in sync with SCOPED_CREDENTIAL_VARS in container-runner. */
 const SCOPED_ENV_NAMES = [
   'GITHUB_TOKEN',
   'RENDER_API_KEY',
@@ -314,13 +210,8 @@ const SCOPED_ENV_NAMES = [
   'SNOWFLAKE_DATABASE',
   'DBT_CLOUD_ACCOUNT_ID',
   'DBT_CLOUD_API_TOKEN',
-  // OPENAI_API_KEY and DEEPGRAM_API_KEY removed 2026-07-27: neither is in use.
-  // Deepgram is commented out of .env (vault-only since 2026-04-28) and its vault
-  // value 401s; OpenAI's only .env value is the `placeholder_for_onecli_proxy`
-  // sentinel and there is no key to rotate. Advertising them here told agents the
-  // services were wired when every call 401s. The codex provider keeps its own
-  // OPENAI_API_KEY fallback (src/providers/codex.ts reads ctx.hostEnv directly),
-  // so that path is unaffected and still works the day a real key appears.
+  // OPENAI_API_KEY and DEEPGRAM_API_KEY are deliberately absent: neither has a working key, so advertising them
+  // made every call 401. The codex provider reads its own OPENAI_API_KEY fallback.
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
   'ELEVENLABS_API_KEY',
@@ -336,11 +227,8 @@ const SCOPED_ENV_NAMES = [
 ];
 
 /**
- * Host plugins as one agent group may see them. Inside a container the
- * snapshot must not name another workgroup's scoped plugin
- * (src/plugin-scopes.ts), so a group snapshot filters by `workgroupId`, the
- * spawn-resolved workgroup the plugin mount also keys on. Without one, every
- * scoped plugin is withheld. The host-wide view (no group) lists everything.
+ * Host plugins as one agent group may see them: a group snapshot must not name another workgroup's scoped
+ * plugin, so it filters by the spawn-resolved `workgroupId`; with none, every scoped plugin is withheld.
  */
 function installedPluginsFor(agentGroupId: string | undefined, workgroupId: string | undefined): string[] {
   const installed = listHostPlugins();
@@ -366,14 +254,7 @@ function listHostPlugins(): string[] {
   }
 }
 
-/**
- * Per-service scoped view for a specific agent group. Consumed by the
- * get_capabilities MCP tool (via writeCapabilitiesSnapshot) so the agent can
- * see exactly which accounts / connections / profiles apply to the session
- * it's running in — and how to activate the CLI when the CLI's own
- * auth-status check is blind (gws is the classic case).
- */
-/** Mirror of container-runner.ts resolveScopedEnv — duplicated to avoid cross-module coupling. */
+/** Mirror of container-runner.ts resolveScopedEnv, duplicated to avoid cross-module coupling. */
 function resolveScopedEnvVar(baseName: string, folder: string): { name: string; set: boolean } {
   const conv = `${baseName}_${folder.toUpperCase().replace(/-/g, '_')}`;
   if (process.env[conv]) return { name: conv, set: true };
@@ -381,7 +262,7 @@ function resolveScopedEnvVar(baseName: string, folder: string): { name: string; 
   return { name: baseName, set: false };
 }
 
-/** Extract section headers from an INI-like file. Used for aws credentials + snowflake connections.toml. */
+/** Section headers of an INI-like file (aws credentials, snowflake connections.toml). */
 function iniSections(absPath: string): string[] {
   try {
     const content = fs.readFileSync(absPath, 'utf-8');
@@ -396,7 +277,7 @@ function iniSections(absPath: string): string[] {
   }
 }
 
-/** Top-level keys in a dbt profiles.yml (or any simple YAML keyed at col 0). */
+/** Top-level keys of a dbt profiles.yml (any simple YAML keyed at column 0). */
 function yamlTopLevelKeys(absPath: string): string[] {
   try {
     const content = fs.readFileSync(absPath, 'utf-8');
@@ -412,12 +293,8 @@ function yamlTopLevelKeys(absPath: string): string[] {
 }
 
 /**
- * The central-DB facts a services snapshot is built from. Resolved by the
- * caller BEFORE any synchronous block that needs the snapshot: the recall row
- * is built between a write guard and its insert, where nothing may be awaited
- * (seam-3 plan §4.5), so the snapshot's two central reads happen here and the
- * build itself (`buildSessionServicesSnapshotFrom`) touches only the
- * filesystem.
+ * The central-DB facts a services snapshot needs, resolved by the caller beforehand: the recall row is built
+ * between a write guard and its insert, where nothing may be awaited.
  */
 export interface SessionServicesCentral {
   agentGroup: AgentGroup | undefined;
@@ -443,10 +320,8 @@ export async function buildSessionServicesSnapshot(
 }
 
 /**
- * Synchronous: filesystem and config, plus ONE lease-only central read (the
- * Slack owner-safety probe below, through `withRawDb`); every other central
- * fact arrives in `central`. Callable only inside a `withCentralSync` block —
- * the recall-row insert holds one, `buildSessionServicesSnapshot` takes one.
+ * Synchronous: filesystem and config plus one lease-only central read (the Slack owner-safety probe); callable
+ * only inside a `withCentralSync` block.
  */
 export function buildSessionServicesSnapshotFrom(
   agentGroupId: string,
@@ -455,14 +330,8 @@ export function buildSessionServicesSnapshotFrom(
 ): SessionServicesSnapshot {
   const ag = central.agentGroup;
   const cfg = ag ? readContainerConfig(ag.folder) : undefined;
-  // Env-scoped services (Looker, dbt-mcp, dbt Cloud, GitHub, Render) resolve
-  // their host creds by FOLDER via resolveScopedEnvVar. Sibling groups (e.g.
-  // example-retail-codex) set `credentialFolder` to the seed folder so they
-  // share the seed's scoped creds, and the real MCP wiring keys on
-  // credentialFolder too (container-runner resolveScopedEnv). The snapshot
-  // MUST use the same folder, or it looks for LOOKER_*_EXAMPLE_RETAIL_CODEX
-  // (which never exists), falls through to unscoped, and falsely reports
-  // "credentials missing — Ask Operator" for every sibling.
+  // Must resolve by the same credential folder the MCP wiring uses: a sibling group sets `credentialFolder` to
+  // the seed's, and its own folder's scoped vars never exist, which would falsely report credentials missing.
   const folder = cfg?.credentialFolder ?? ag?.folder ?? '';
   const tools = cfg?.tools;
   const listAccounts = (absDir: string): string[] => {
@@ -492,7 +361,6 @@ export function buildSessionServicesSnapshotFrom(
 
   const services: SessionServicesSnapshot['services'] = [];
 
-  // Google Workspace — the headline case this exists for.
   const gwsToolNames = ['gmail', 'gmail-readonly', 'calendar', 'google-workspace'];
   const gwsDeclared = gwsToolNames.filter((n) => {
     if (!tools) return true; // undefined tools = unrestricted
@@ -507,23 +375,13 @@ export function buildSessionServicesSnapshotFrom(
     const accounts = listAccounts(hostDir);
     const effective = scopes.size > 0 ? accounts.filter((a) => scopes.has(a)) : accounts;
     services.push({
-      // Short enough to be a roster line and a typeable `get_capabilities`
-      // key; the product list it used to carry moved into `summary`, which is
-      // where an ~80-char hint belongs.
       name: 'Google Workspace',
       cli: 'gws',
       declaredTools: gwsDeclared,
       scopes: [...scopes].sort(),
       credentialPaths: effective.map((a) => `/home/node/.config/gws/accounts/${a}.json`),
-      // Names the env var and the symptom, not just "export the creds file":
-      // this entry exists BECAUSE `gws auth status` reports `auth_method: none`
-      // when the var is unset, and an agent that reads only "export the creds
-      // file first" still has no way to recognise that report for what it is.
-      // Both branches name the env var AND the symptom. `gws auth status`
-      // reporting `auth_method: none` is the misreading this entry exists to
-      // prevent, and it misleads just as badly on the branch where the host
-      // has no account file yet — an agent that reads "no account file" and
-      // then sees `auth_method: none` has had its wrong conclusion confirmed.
+      // Names the env var and the `auth_method: none` symptom on both branches: that report is the misreading
+      // this entry exists to prevent.
       summary:
         effective.length > 0
           ? `Gmail/Calendar/Drive/Docs/Sheets/Slides (${boundedNameList(effective)}); export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE — \`auth_method: none\` means that var is unset, not missing creds`
@@ -535,8 +393,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Snowflake — connection names live in connections.toml; scope suffix is the
-  // connection the agent passes to `snow -c <name>`.
+  // Scope suffix is the connection passed to `snow -c <name>`.
   if (declared(['snowflake'])) {
     const connsPath = path.join(os.homedir(), '.snowflake', 'connections.toml');
     const all = iniSections(connsPath);
@@ -558,7 +415,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // AWS — profile names from ~/.aws/credentials; scope suffix is --profile.
+  // Scope suffix is --profile.
   if (declared(['aws'])) {
     const credsPath = path.join(os.homedir(), '.aws', 'credentials');
     const all = iniSections(credsPath).filter((n) => n !== 'default');
@@ -580,8 +437,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // dbt — profile names from ~/.dbt/profiles.yml top-level keys; scope suffix
-  // is --profile.
+  // Profiles are ~/.dbt/profiles.yml top-level keys; scope suffix is --profile.
   if (declared(['dbt'])) {
     const profilesPath = path.join(os.homedir(), '.dbt', 'profiles.yml');
     const all = yamlTopLevelKeys(profilesPath);
@@ -603,9 +459,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // dbt Cloud — env-var-scoped (no `tools` declaration needed; surfaced
-  // whenever the host can resolve a token for this folder). DBT_CLOUD_API_TOKEN
-  // is the load-bearing var; URL/ACCOUNT_ID are useful context if also set.
+  // Env-var-scoped, surfaced whenever a token resolves for this folder; no `tools` declaration needed.
   const dbtCloudToken = resolveScopedEnvVar('DBT_CLOUD_API_TOKEN', folder);
   if (dbtCloudToken.set) {
     const dbtCloudUrl = resolveScopedEnvVar('DBT_CLOUD_API_URL', folder);
@@ -625,15 +479,8 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // GitHub — env-var-scoped. Host resolves GITHUB_TOKEN_<FOLDER> at spawn and
-  // forwards as GITHUB_TOKEN; the scoped var may also be visible in-container
-  // depending on the forwarding loop. We report which env name the host would
-  // have picked.
-  // Gated on env-var presence OR explicit tools declaration: the host
-  // injects GITHUB_TOKEN unconditionally based on folder-name resolution,
-  // so credential availability — not the tools array — is what determines
-  // whether the agent actually has GitHub access. The `declared` arm
-  // preserves the old "configured but token missing" diagnostic.
+  // Gated on the token OR a tools declaration: the host injects GITHUB_TOKEN by folder regardless of `tools`, so
+  // credential availability decides access; the `declared` arm keeps the "configured but token missing" case.
   {
     const tokenEnvName = cfg?.githubTokenEnv ?? null;
     const resolved =
@@ -643,14 +490,12 @@ export function buildSessionServicesSnapshotFrom(
     if (resolved.set || declared(['github'])) {
       const scopeList = extractToolScopes(tools, 'github').scopes;
       const allowedOrgs = resolveScopedEnvVar('GITHUB_ALLOWED_ORGS', folder);
-      // Expiry only means something when THIS group authenticates as the App:
-      // peek reads the host-wide App cache, and a PAT group must never be told
-      // its static token "expires" on someone else's installation schedule.
+      // Expiry applies only when this group authenticates as the App: a PAT group must never be told its token
+      // expires on another installation's schedule.
       const resolvedTokenValue = resolved.set ? process.env[resolved.name] : undefined;
       const isAppSentinel = resolvedTokenValue === GITHUB_APP_SENTINEL;
       const githubTokenExpiresAt = isAppSentinel ? peekGitHubAppTokenExpiry() : undefined;
-      // App-token 403 shapes are App-specific; a PAT group must never have a
-      // real authorization failure explained away as "healthy app behavior".
+      // A PAT group must never have a real authorization failure explained away as App behavior.
       const tokenShapeNote = isAppSentinel
         ? ` **Known token shape:** \`gh api user\` returns 403 even on a HEALTHY App installation token — apps cannot call \`/user\`; probe liveness with \`gh api repos/{owner}/{repo} --jq .full_name\`. On some app installations \`gh pr checks\` and \`/commits/{sha}/check-runs\` 403 while the Actions runs API still works — if a Checks-path call 403s, read CI via \`gh api repos/{owner}/{repo}/actions/runs?head_sha=<sha>\` (and \`.../actions/runs/{id}/jobs\` for per-job detail) instead.`
         : '';
@@ -673,10 +518,7 @@ export function buildSessionServicesSnapshotFrom(
     }
   }
 
-  // Render — env-var-scoped (RENDER_API_KEY + RENDER_WORKSPACE_ID); also lists
-  // the scoped PG/Redis URL env vars the host has forwarded.
-  // Gated on env-var presence OR explicit tools declaration (same rationale
-  // as GitHub above).
+  // Gated on env-var presence OR a tools declaration, as for GitHub.
   {
     const apiKey = resolveScopedEnvVar('RENDER_API_KEY', folder);
     if (apiKey.set || declared(['render'])) {
@@ -704,26 +546,11 @@ export function buildSessionServicesSnapshotFrom(
     }
   }
 
-  // Where the derived MCP entries land. The five universals that moved into
-  // the fleet file (exa, deepwiki, context7, pocket, granola) were pushed
-  // exactly here, and both capability budgets evict from the END
-  // (`evictCapability`, src/modules/memory/pre-turn-context.ts), so
-  // appending them instead would have moved every one of them into the
-  // eviction zone. The 19 -> 22 services / 8,954 -> 9,773 chars figure quoted
-  // in `src/capabilities.test.ts` is that file's own hermetic wide-group
-  // fixture, not a production group — the widest LIVE group measured 23
-  // services / 13,247 chars of raw snapshot when the roster replaced the
-  // full-prose block, i.e. six services past the 10,000-char budget
-  // (`PRE_TURN_BOUNDS.capabilityTotalChars`). The entries are built at the end
-  // of this function, where every hand-written `mcpNamespace` is known, and
-  // spliced in at this index.
+  // Derived MCP entries are spliced in here, not appended: both capability budgets evict from the end, and the
+  // fleet universals must not land in the eviction zone.
   const derivedMcpIndex = services.length;
 
-  // Linear — gated by tool entry. Container-runner injects when 'linear' is in
-  // container.json.tools and the OneCLI gateway proxy injects auth at request
-  // time (vault entry "Linear" → mcp.linear.app). Only surface in the
-  // capabilities snapshot for groups that opted in, so other groups don't
-  // claim Linear access they don't actually have.
+  // Only for groups that opted in, so others do not claim Linear access they lack.
   if (declared(['linear'])) {
     services.push({
       name: 'Linear',
@@ -737,11 +564,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Datafold — gated by tool entry. Container-runner injects the official
-  // Datafold Streamable HTTP MCP when 'datafold' is in container.json.tools.
-  // OneCLI gateway overwrites the placeholder `Authorization: Key ...` header
-  // at request time; the raw Datafold API key is never placed in container.json
-  // or process env.
+  // The OneCLI gateway overwrites the placeholder header; the raw key is never in container.json or env.
   if (declared(['datafold'])) {
     services.push({
       name: 'Datafold',
@@ -755,16 +578,11 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Atlassian via sooperset/mcp-atlassian (stdio Python MCP, ~72 tools).
-  // Gated by tool entry. Hits the tenant's direct Atlassian REST API rather
-  // than Rovo MCP. OneCLI injects the Basic credential at request time; the
-  // non-secret tenant URL is resolved from scoped host configuration.
+  // OneCLI injects the credential; the tenant URL comes from scoped host configuration.
   if (declared(['atlassian'])) {
     const baseUrl = resolveScopedEnvVar('ATLASSIAN_BASE_URL', folder);
     services.push({
-      // Renamed from "Atlassian (Jira + Confluence)": the product list belongs
-      // in the roster hint, and the name doubles as the lookup key for
-      // `get_capabilities({ service })`.
+      // Also the `get_capabilities` lookup key; the product list belongs in the hint.
       name: 'Atlassian',
       mcpNamespace: 'mcp__atlassian__*',
       declaredTools: declaredMatchingTools(['atlassian']),
@@ -779,13 +597,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // dbt-mcp — gated by tool entry. dbt-labs/dbt-mcp baked into image via uv
-  // (Python 3.12, isolated venv). Container-runner wires the stdio MCP server
-  // with credentials resolved per-group: DBT_HOST_<FOLDER>, reuses
-  // DBT_CLOUD_API_TOKEN_<FOLDER> as DBT_TOKEN, plus DBT_PROD_ENV_ID/
-  // DBT_DEV_ENV_ID/DBT_USER_ID/DBT_MULTICELL_ACCOUNT_PREFIX. Read-only by
-  // default: CLI/LSP toolsets disabled, mutating Admin tools (trigger/cancel/
-  // retry job_run) blocked via DISABLE_TOOLS.
+  // Read-only by default: CLI/LSP toolsets disabled and mutating Admin tools blocked via DISABLE_TOOLS.
   if (declared(['dbt-mcp'])) {
     const host = resolveScopedEnvVar('DBT_HOST', folder);
     const token = resolveScopedEnvVar('DBT_CLOUD_API_TOKEN', folder);
@@ -806,11 +618,6 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Looker — gated by tool entry. Google's MCP Toolbox (--prebuilt looker) is
-  // baked into the image; container-runner wires the stdio MCP server with
-  // credentials resolved per-group from LOOKER_*_<FOLDER> env vars. The
-  // toolbox exchanges client_id/client_secret for a session token via
-  // /api/4.0/login on first call.
   if (declared(['looker'])) {
     const baseUrl = resolveScopedEnvVar('LOOKER_BASE_URL', folder);
     const clientId = resolveScopedEnvVar('LOOKER_CLIENT_ID', folder);
@@ -831,16 +638,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Hex — gated by tool entry. The `hex` CLI is baked into the image and
-  // wrapped to read XDG_DATA_HOME=/workspace/extra/.local/share so it picks
-  // up the mounted host data dir. Auth is OAuth-only (no static-token mode);
-  // operator runs `hex auth login` once on host, tokens land in
-  // ~/.local/share/hex/default-credentials.json which mounts RW so the CLI's
-  // refresh flow can update access tokens. The container-skill at
-  // /app/skills/hex/SKILL.md (Hex-authored, regenerated via `hex install
-  // agent-skill --claude`) covers the full surface including CLI-only
-  // features (cell run, project export/import, suggestion triage, guide
-  // preview/publish) that REST does not expose.
+  // OAuth-only; the mounted credentials file is RW so the CLI's refresh flow can update tokens.
   if (declared(['hex'])) {
     const credsExist = hostDirExists('.local', 'share', 'hex');
     services.push({
@@ -858,36 +656,13 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Slack — SESSION-AWARE, because the user token (which reads the OWNER's
-  // Slack lens) is scoped per session by the owner-safe boundary:
-  //
-  //   - owner-safe session (owner 1:1 DM, or messaging_group in
-  //     slack_user_token.also_allowed_in): the Slack OneCLI secret is injected
-  //     → the agent has live Slack read/write access here.
-  //   - non-owner-safe session (anything else): the host spawns under the
-  //     `-noslack` OneCLI identity with the Slack secret WITHHELD → no Slack
-  //     access here, by design, so teammates can't extract the owner's Slack
-  //     through the agent. (isOwnerSafeSlackSession in slack-user-token-gate.ts;
-  //     the two-tier identity in src/container-runner.ts.)
-  //
-  // The access itself is one surface: the Slack Web API through the OneCLI
-  // proxy (`curl https://slack.com/api/<method>`, no auth header). There is no
-  // Slack MCP — the korotovsky server that used to sit on top was retired
-  // after it failed to connect on every spawn and its failure notice led an
-  // agent to conclude Slack was down. `slack_user_token.enabled` no longer
-  // gates anything, so the entry keys on the secret alone.
-  //
-  // `retainUnderBudget`: this entry is what stops the agent telling the owner
-  // it can't read a Slack link, and it was the one the pre-turn capability
-  // budget dropped (it sits late in this list and budget eviction pops from
-  // the end). See evictCapability in src/modules/memory/pre-turn-context.ts.
+  // Session-aware: the user token reads the owner's Slack, so it is injected only in owner-safe sessions (owner
+  // DM or `also_allowed_in`); elsewhere the spawn withholds it so teammates cannot extract the owner's Slack.
+  // `retainUnderBudget`: this is the entry that stops the agent claiming it cannot read a Slack link.
   const mergedSecrets = mergeWorkgroupAndGroupSecrets(central.workgroupSecrets, cfg?.onecliSecrets);
   const hasSlackSecret = slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names).length > 0;
   if (hasSlackSecret) {
-    // ownerSafe is only knowable with a session context. When the snapshot is
-    // built group-level (no session — e.g. the get_capabilities tool with no
-    // messaging group), describe the capability generically rather than
-    // fail-closed-withholding, which would under-claim.
+    // Without a session context, describe generically rather than withhold, which would under-claim.
     const sessionKnown = sessionMessagingGroupId !== undefined;
     const ownerSafe =
       sessionKnown &&
@@ -903,13 +678,10 @@ export function buildSessionServicesSnapshotFrom(
     const archive =
       '`resolve_thread_link` resolves a pasted Slack OR Discord permalink from the workgroup chat archive (`/workspace/archive.db`) in any session. ';
     let useFor: string;
-    // The roster line, not a shortened manual. The withheld branch is the one
-    // case where the hint changes what the agent may DO, so it says so first
-    // and in full — a truncated "WITHHELD…" would read as availability.
+    // The withheld branch changes what the agent may do, so it says so first and in full.
     let summary: string;
     if (sessionKnown && !ownerSafe) {
-      // Shared session: Slack is genuinely withheld here. Be explicit so the
-      // agent does NOT try curl and does NOT promise the owner a read.
+      // Explicit so the agent neither tries curl nor promises the owner a read.
       useFor =
         'WITHHELD IN THIS SESSION (by design): this session is not one of the owner’s private/owner-safe Slack contexts (their 1:1 DM, or a messaging group in `slack_user_token.also_allowed_in`), so the Slack user token is NOT injected into your OneCLI agent. You CANNOT read the owner’s Slack DMs/channels/threads here — `curl https://slack.com/api/*` will fail auth. This protects the owner’s Slack from being queried by others through you. (Unrelated to `session_mode` — every channel is still per-thread; this is purely about whose Slack credentials are in scope.) ' +
         archive +
@@ -944,10 +716,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Cloudflare — official Cloudflare API MCP, gated on BOTH the workgroup's
-  // OneCLI secret and the per-group MCP declaration. The secret alone is not
-  // a usable agent surface, and the MCP without the secret cannot authenticate;
-  // requiring both prevents the capabilities prompt from over-claiming access.
+  // Requires both the secret and the MCP declaration: either alone is not a usable surface.
   const hasCloudflareSecret = mergedSecrets.some((s) => /^cloudflare(-|$)/i.test(s));
   const hasCloudflareMcp = !!cfg?.mcpServers?.['cloudflare-api'];
   if (hasCloudflareSecret && hasCloudflareMcp) {
@@ -957,12 +726,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['cloudflare']),
       scopes: folder ? [folder] : [],
       credentialPaths: [],
-      // Both imperatives are always-on, not detail-on-demand: each one exists
-      // because the diagnosis it forbids was already made and believed — the
-      // `/user/tokens/verify` probe produced a false "credential is dead" call
-      // twice, and a self-added header makes Cloudflare reject its FORMAT,
-      // which reads like a token problem. An agent only reads the full entry
-      // if it already suspects it is wrong about something.
+      // Both imperatives are always-on: each forbids a misdiagnosis already made and believed.
       summary:
         'Cloudflare account APIs (DNS, Workers, Pages, R2) via docs → search → execute. Never verify with /user/tokens/verify, and send no Authorization header of your own',
       useFor:
@@ -970,10 +734,7 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Wix — gated on a Wix OneCLI secret (REST) and/or a mounted ~/.wix (CLI).
-  // REST: the gateway injects the API key on www.wixapis.com. CLI: OAuth via the
-  // mounted ~/.wix (operator ran `wix login` on the host). The site/account IDs
-  // are NOT secret and differ per site, so they're supplied per task, never baked in.
+  // Site/account IDs differ per site and are supplied per task, never baked in.
   const hasWixSecret = mergedSecrets.some((s) => /wix/i.test(s));
   const hasWixCli = cfg?.wixHostAuth === true;
   if (hasWixSecret || hasWixCli) {
@@ -990,18 +751,12 @@ export function buildSessionServicesSnapshotFrom(
     }
     services.push({
       name: 'Wix',
-      // `curl` when only the REST secret is wired, not `undefined`: the roster
-      // renders `via` from `mcpNamespace ?? cli`, and this was the one entry
-      // that could produce a line with no "how you reach it" at all. `curl` is
-      // what every other gateway-injected REST entry here uses (Slack, SELECT,
-      // Profound, Fivetran), and it is a lookup handle for `get_capabilities`.
+      // Never `undefined`: the roster renders `via` from `mcpNamespace ?? cli`, and it is a lookup handle.
       cli: hasWixCli ? 'wix' : 'curl',
       declaredTools: [],
       scopes: [],
       credentialPaths: hasWixCli ? ['/home/node/.wix/auth/account.json'] : [],
-      // "never guessed" and "never `wix login`" are always-on: a guessed site
-      // id writes to the WRONG SITE, and neither mistake announces itself as a
-      // reason to go read the full entry first.
+      // Always-on: a guessed site id writes to the wrong site, and neither mistake prompts a lookup first.
       summary: [
         hasWixSecret
           ? 'www.wixapis.com REST — add exactly one wix-site-id/wix-account-id header, taken from the user, never hardcoded or guessed'
@@ -1014,15 +769,12 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // SELECT (select.dev) — REST-only via the OneCLI gateway, gated on a
-  // `Select-*` OneCLI secret. The organization id is non-secret, but still
-  // tenant-specific, so it is resolved from scoped host configuration.
+  // The organization id is tenant-specific, so it comes from scoped host configuration.
   if (mergedSecrets.some((s) => /^select(-|$)/i.test(s))) {
     const selectOrg = resolveScopedEnvVar('SELECT_ORGANIZATION_ID', folder);
     const organizationPath = selectOrg.set ? process.env[selectOrg.name] : '<organization_id>';
     services.push({
-      // Renamed from "SELECT (select.dev)" — the domain belongs in the hint,
-      // and the name doubles as the `get_capabilities` lookup key.
+      // Also the `get_capabilities` lookup key; the domain belongs in the hint.
       name: 'SELECT',
       cli: 'curl',
       declaredTools: [],
@@ -1035,9 +787,6 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Profound — REST/reporting API via OneCLI. Gated on the workgroup OneCLI
-  // secret name "Profound". No MCP/CLI surface is wired: agents call
-  // api.tryprofound.com directly and the gateway injects X-API-Key.
   if (mergedSecrets.some((s) => /^profound$/i.test(s))) {
     services.push({
       name: 'Profound',
@@ -1051,9 +800,6 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Fivetran — REST-only via the OneCLI gateway, gated on a `Fivetran-*` OneCLI
-  // secret. The gateway injects `Authorization: Basic <base64(apiKey:apiSecret)>`
-  // at the boundary (e.g. vault entry "Fivetran-ExampleRetail" → api.fivetran.com).
   if (mergedSecrets.some((s) => /^fivetran(-|$)/i.test(s))) {
     services.push({
       name: 'Fivetran',
@@ -1067,61 +813,27 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
-  // Every MCP server this container actually gets that no entry above already
-  // describes. `effectiveMcpServers` is the SAME merge the spawn path runs
-  // (src/container-runner.ts, buildContainerArgs) — fleet defaults from
-  // data/fleet-mcp-servers.json plus this group's own container.json entries,
-  // minus `excludeMcpServers` — so a server the agent has is a server the
-  // agent is told about, with no second list to keep in sync. Adding a tool is
-  // one `ncl groups config add-mcp-server` away, with or without `--fleet`.
-  //
-  // "Already described" is matched on the namespace, not the label: an entry
-  // whose `mcpNamespace` is `mcp__<name>__*` owns that server's text (Linear,
-  // Datafold, Atlassian, dbt-mcp and Looker still write their own, because
-  // each says something the stored entry cannot).
+  // Every MCP server this container gets that no entry above describes. `effectiveMcpServers` is the same merge
+  // the spawn runs, so there is no second list. "Already described" matches on namespace, not label.
   const describedMcpServers = new Set(
     services
       .map((service) => service.mcpNamespace)
       .filter((namespace): namespace is string => typeof namespace === 'string')
       .map((namespace) => namespace.replace(/^mcp__/, '').replace(/__\*$/, '')),
   );
-  // Fleet entries are the fleet-wide baseline every group inherits; a
-  // group-specific server is the one a budget should give up first. Marking
-  // the baseline `retainUnderBudget` is the same mechanism used for
-  // Slack, and for the same reason: an agent that loses the line stops
-  // believing it has the tool. Keyed on the fleet REGISTRY, not on which copy
-  // won the merge — a group that declares `littlebird` itself (all 24 do
-  // today) holds the same capability. If every entry is retained the budget
-  // still terminates: `evictCapability` pops the last one outright.
+  // The fleet baseline is retained under budget (an agent that loses the line stops believing in the tool);
+  // keyed on the fleet registry, not on which copy won the merge. `evictCapability` still terminates.
   const fleetProvided = new Set(Object.keys(readFleetMcpServers()));
   const derived: SessionServicesSnapshot['services'] = [];
   for (const [name, server] of Object.entries(effectiveMcpServers(cfg))) {
     if (describedMcpServers.has(name)) continue;
-    // A retired name still sitting in some group's container.json is deleted
-    // from the merged map by the runner on every spawn
-    // (container/agent-runner/src/retired-mcp-servers.ts, applied in
-    // container/agent-runner/src/index.ts), so advertising it would
-    // promise a tool that cannot exist — the exact failure docs/slack-user-token.md
-    // documents. The entry stays in the spawn payload, where the runner logs
-    // the drop for the operator; it just never reaches the agent's capability
-    // list.
+    // The runner deletes retired names on every spawn (retired-mcp-servers.ts), so advertising one would promise
+    // a tool that cannot exist.
     if (RETIRED_MCP_SERVER_NAMES.has(name)) continue;
-    // A hand-edited container.json can hold a malformed entry: the group file's
-    // `validateMcpServers` refuses only SSE (src/container-config.ts),
-    // so `null` reaches here. One bad entry must not cost the whole snapshot —
-    // an agent with no capability list is the worse failure by far.
+    // A hand-edited container.json can hold a malformed entry; one bad entry must not cost the whole snapshot.
     if (server === null || typeof server !== 'object') continue;
-    // Every string this block reads off a stored server goes through
-    // `storedString`. The type says these are strings, but a hand-edited
-    // container.json is not type-checked on the way in: `validateMcpServers`
-    // refuses only SSE, and
-    // `parseMcpServerConfig`, which DOES type-check `displayName` and
-    // `description`, only runs on CLI
-    // intake. Untyped values reaching the string helpers here throw, and this
-    // function's caller catches — so `buildPreTurnContext` degrades to an
-    // empty roster and `writeCapabilitiesSnapshot` logs and writes nothing.
-    // One malformed entry would hide every valid service, which is the same
-    // failure the `server === null` skip above exists to prevent.
+    // Stored strings go through `storedString`: container.json is not type-checked on the way in, and a throw
+    // here would empty the whole roster.
     const displayName = storedString(server.displayName);
     const description = storedString(server.description);
     derived.push({
@@ -1130,35 +842,23 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools([name]),
       scopes: [],
       credentialPaths: [],
-      // A stored server has no hand-written roster line, so derive one from
-      // the same `description` the full entry carries — its leading clause is
-      // written to say what the server is for, which is what the roster needs.
-      // With no description there is nothing to say but where it dials:
-      // `genericMcpUseFor`'s full sentence would spend ~60 roster characters
-      // restating the namespace that the entry's `via` already carries.
+      // No hand-written line: derive from `description`; without one, just the endpoint.
       summary: description === undefined ? mcpEndpoint(server) : summarizeCapabilityText(description, 80),
       useFor: description ?? genericMcpUseFor(name, server),
       ...(fleetProvided.has(name) ? { retainUnderBudget: true } : {}),
     });
   }
-  // Fleet entries first inside the derived block, group-specific after, so the
-  // block reads in the order the hardcoded universals used to (exa, deepwiki,
-  // …) and a group's own servers sit later — nearer the end the budgets eat
-  // from. `Object.entries` would otherwise lead with the group's own map.
+  // Fleet entries first, group-specific after, so a group's own servers sit nearer the end the budgets eat from.
   derived.sort((a, b) => Number(Boolean(b.retainUnderBudget)) - Number(Boolean(a.retainUnderBudget)));
   services.splice(derivedMcpIndex, 0, ...derived);
 
-  // Secrets the gateway injects into DIRECT REST calls, named by the host they
-  // apply to (from OneCLI's own metadata, not the secret's name — a name does
-  // not prove REST injection; MCP-scoped secrets are excluded upstream).
-  // Derived from `mergedSecrets`, the declaration the spawn grants, so there is
-  // no second list. Without it, an agent that finds no `<SERVICE>_API_KEY` in
-  // env concludes the service is unwired and substitutes a stub.
+  // Secrets the gateway injects into direct REST calls, keyed by host from OneCLI metadata (a name does not prove
+  // REST injection). Without it, an agent finding no `<SERVICE>_API_KEY` in env concludes the service is unwired.
   const slackSecrets = new Set(slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names));
   const restHosts = [
     ...new Set(
       gatewayRestHosts(mergedSecrets.filter((secret) => !slackSecrets.has(secret)))
-        // Slack has its own entry, which carries the owner-safe withholding rule.
+        // Slack's own entry carries the owner-safe withholding rule.
         .filter((entry) => !PROVIDER_SECRET.test(entry.name) && !/^slack(-|$)/i.test(entry.name))
         .map((entry) => entry.host),
     ),
@@ -1182,44 +882,20 @@ export function buildSessionServicesSnapshotFrom(
 const PROVIDER_SECRET = /^(anthropic|openai|opencode)(-|$)/i;
 
 /**
- * Capability text for a stored MCP server that carries no `description`.
- *
- * Deliberately says nothing about what the server does — that is the
- * `description` field's job — and names only the endpoint the agent needs to
- * reason about, in one short line: every derived entry costs the capability
- * budget (`PRE_TURN_BOUNDS.capabilityTotalChars`), and a described server
- * spends those characters saying something useful instead.
- *
- * A URL is safe to print: `parseMcpServerConfig` refuses one carrying
- * credentials at intake (src/container-config.ts), and the agent reads
- * the same value in its own read-only container.json mount. `env` and `headers` are never rendered —
- * those DO carry placeholder credentials.
+ * Capability text for a stored MCP server with no `description`: the endpoint only, in one short line. A URL is
+ * safe to print (intake refuses credentialed URLs); `env` and `headers` are never rendered.
  */
 function genericMcpUseFor(name: string, server: McpServerConfig): string {
   return `MCP server \`${name}\` (${mcpEndpoint(server)}); tools self-describe under \`mcp__${name}__*\`.`;
 }
 
 /**
- * What to print as a server's endpoint.
- *
- * Every remote MCP this fork wires as stdio is the bridge pattern — `command:
- * "bun"`, `args: ["/app/src/remote-mcp-bridge.ts", "<endpoint>"]` (see
- * `container/agent-runner/src/remote-mcp-bridge.ts`, and the `dropbox` /
- * `amplitude` entries on this install) — so printing `command` alone says "bun" for
- * all of them and identifies nothing. Print what the bridge dials instead; a
- * genuine local subprocess still prints its command.
- *
- * Keyed on the PRESENCE of `url`, not on `type`. `HttpMcpServerConfig.type` is
- * required in the type, but a hand-edited
- * container.json reaches here unvalidated for this field — `validateMcpServers`
- * refuses only SSE — and a `{ url }` entry with
- * no `type` then narrowed to the stdio arm and printed `undefined`, because
- * stdio's `command` is absent on it. Same defensive reasoning as the
- * `server === null` skip above.
+ * The endpoint the server dials: for the stdio bridge pattern (`bun remote-mcp-bridge.ts <endpoint>`) that is
+ * the bridge argument, not "bun". Keyed on the presence of `url`, not `type`, because a hand-edited
+ * container.json can omit `type`.
  */
 function mcpEndpoint(server: McpServerConfig): string {
-  // Read as `unknown` rather than through the union's arms: the value came
-  // off disk, so its runtime shape may not match either arm (see `storedString`).
+  // Read as `unknown`: the value came off disk and may match neither arm.
   const stored = server as { url?: unknown; args?: unknown; command?: unknown };
   const url = storedString(stored.url);
   if (url !== undefined) return url;
@@ -1232,15 +908,8 @@ function mcpEndpoint(server: McpServerConfig): string {
 }
 
 /**
- * A string field read off a stored MCP server, or `undefined` when the stored
- * value is not a usable string.
- *
- * `McpServerConfig` types these as strings, but nothing type-checks a
- * hand-edited `container.json` on the way in — see the block in
- * `buildSessionServicesSnapshotFrom` where the derived entries are built.
- * Every read of `displayName`, `description`, `url` and `command` in this file
- * goes through here, so one bad value degrades that one field instead of
- * throwing out of the whole snapshot.
+ * A stored MCP server string field, or `undefined` when unusable. Nothing type-checks a hand-edited
+ * container.json, so one bad value degrades one field instead of throwing out of the snapshot.
  */
 function storedString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;

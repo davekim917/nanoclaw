@@ -2,13 +2,8 @@ import { addDeniedModel, getDeniedModel, listDeniedModels, removeDeniedModel } f
 import { registerResource } from '../crud.js';
 
 /**
- * Operator-curated blocklist of (provider, slug) pairs the agent must
- * never use. The agent's reachable model set comes live from
- * `opencode models` (inside the container) — this table is the small
- * "operator says no" layer subtracted from that set.
- *
- * Composite primary key (provider, slug) — the generic CRUD's single-`id`
- * verbs don't fit, so list/add/remove are exposed as customOperations.
+ * Operator blocklist of (provider, slug) pairs subtracted from the live model set. The composite key does not fit the
+ * generic single-`id` verbs, hence customOperations.
  */
 registerResource({
   name: 'denied-model',

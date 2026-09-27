@@ -6,20 +6,14 @@ import { migration002 } from './002-chat-sdk-state.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleAgentToAgentDestinations } from './module-agent-to-agent-destinations.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
-// Upstream's 017/018 — file numbers clash with local 017/018 (uniqueness is by
-// `name`); aliased to dodge the JS identifier collisions.
+// Several upstream and fork files share a number; uniqueness is by `name`, so the clashing imports are aliased.
 import { migration017 as agentMessagePolicies } from './017-agent-message-policies.js';
 import { migration018 as approvalsApproverUserId } from './018-approvals-approver-user-id.js';
 import { migration008 } from './008-dropped-messages.js';
 import { migration009 } from './009-drop-pending-credentials.js';
-// Upstream v2 migrations (012/011/010 on disk = 12/11/10 in code):
 import { migration010 } from './010-engage-modes.js';
 import { migration011 } from './011-pending-sender-approvals.js';
 import { migration012 } from './012-channel-registration.js';
-// Operator's migrations (custom) and upstream's 013 live side-by-side; both files
-// happen to be numbered 013 but carry distinct `name` fields (names are the
-// uniqueness key for schema_version). Import-alias upstream's to dodge the
-// JS identifier collision with `013-memories.js`.
 import { migration013 } from './013-memories.js';
 import { migration013 as approvalRenderMetadata } from './013-approval-render-metadata.js';
 import { migration014 } from './014-channel-defaults.js';
@@ -47,12 +41,8 @@ import { migration041 } from './041-support-threads.js';
 import { migration042 } from './042-support-threads-subject-sender.js';
 import { migration043 } from './043-scheduled-audit.js';
 import { migration044 } from './044-channel-ingress-receipts.js';
-// Fork 045 is a strict SUPERSET of upstream's 021-approval-question
-// ('approval-question-render-metadata' — the same `name`, so only one of them
-// can ever be in this list): it adds the `question` column on
-// `pending_questions` as well as on the three approval tables. Upstream's 021 is
-// therefore deliberately NOT imported; importing both would share a `name` and
-// break FRESH installs (see src/db/migrations/registry.test.ts).
+// Fork 045 is a strict SUPERSET of upstream's 021 under the same `name`, so upstream's 021 is deliberately NOT
+// imported: both would break fresh installs (registry.test.ts).
 import { migration045 } from './045-approval-question-render-metadata.js';
 import { migration046 } from './046-provider-health.js';
 import { migration047 } from './047-usage-daily.js';
@@ -76,9 +66,7 @@ import { migration064 } from './064-container-config-security-json.js';
 import { migration067 } from './067-cli-request-executions.js';
 import { migration068 } from './068-sessions-sweep-quiet-until.js';
 import { migration069 } from './069-messaging-group-name-source.js';
-// Upstream's 022/024, adopted under upstream's `name` at fork file numbers so
-// they sort after this fork's local migrations. 071 is shadow schema: zero
-// fork writers (plan §4.3).
+// Upstream's 022/024 under upstream's `name`, numbered to sort after the fork's migrations.
 import { migration070 } from './070-messaging-group-detached-at.js';
 import { migration071 } from './071-host-coordination.js';
 import { migration072 } from './072-observatory-signal.js';
@@ -94,19 +82,12 @@ import { migration081 } from './081-thread-key-anchors.js';
 import { migration082 } from './082-mcp-oauth-integrations.js';
 import { migration083 } from './083-work-outcome-receipts.js';
 import { migration084 } from './084-task-run-outcome-lanes.js';
-// Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
-// Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
 import { migration015 as cliScope } from './015-cli-scope.js';
-// Upstream's 016 — channel-instance dimension. File number clashes with the
-// local 016-channel-tone above; aliased (uniqueness is by `name`). Idempotent
-// recreate that backfills instance = channel_type; safe on existing DBs.
+// Upstream's 016: an idempotent messaging_groups recreate that backfills instance = channel_type.
 import { migration016 as messagingGroupInstance } from './016-messaging-group-instance.js';
 import { migration019 } from './019-wiring-threads.js';
-// Upstream's 020/023 — adopted verbatim, replacing this fork's 065/066, which
-// carried the same `name` and the same SQL under a fork file number. Live
-// installs already hold both ledger rows, so these are skipped there; fresh
-// installs get exactly what upstream's files produce.
+// Upstream's 020/023 replace fork 065/066 (same `name` and SQL), so live installs skip them.
 import { migration020 } from './020-container-config-timezone.js';
 import { migration023 } from './023-approvals-instance.js';
 
@@ -115,13 +96,8 @@ export interface Migration {
   name: string;
   up: (db: Database.Database) => void;
   /**
-   * Inert in this fork, and deliberately so.
-   *
-   * Upstream's async runner uses it to refuse a SQLite-specific migration on a
-   * non-SQLite dialect and to route the allowed ones through its raw escape
-   * hatch. The fork's runner is synchronous and SQLite-only, so it never reads
-   * the flag — the field exists purely so upstream's migration files can land
-   * BYTE-IDENTICAL instead of diverging on one line each.
+   * Inert in this fork (its runner is synchronous and SQLite-only); present so upstream migration files land
+   * byte-identical.
    */
   sqliteOnly?: true;
   /**
@@ -183,23 +159,13 @@ export const migrations: Migration[] = [
   migration050,
   migration051,
   migration052,
-  // Runs before 053 below, which is fine and deliberate: 053 normalizes an
-  // explicit table/column allowlist that does not include thread_snoozes and
-  // never will, so position cannot rescue a naive value here. 054 therefore
-  // writes ISO at the write site instead of relying on a later sweep.
+  // 053 below normalizes only an explicit column allowlist, so every later-registered migration writes ISO at the
+  // write site rather than relying on position.
   migration054,
-  // Same reasoning as 054: `thread_closures` and `sessions.done_proposal` are
-  // written from JS as ISO-8601 UTC at the write site, so 053's allowlisted
-  // normalizer has nothing to do here and position does not matter.
   migration055,
-  // Adds a nullable column and writes no timestamp, so 053's position is
-  // irrelevant here — same reasoning as 054/055 above.
   migration056,
   migration057,
-  // Writes ISO-8601 UTC from JS at the write site, so 053's allowlisted
-  // normalizer has nothing to do here — same reasoning as 054/055/056 above.
   migration058,
-  // Same reasoning as 058: writes ISO-8601 UTC from JS at the write site.
   migration059,
   migration060,
   migration061,
@@ -207,71 +173,38 @@ export const migrations: Migration[] = [
   migration063,
   containerConfigs,
   cliScope,
-  // After cliScope: 064 ALTERs container_configs, which upstream's aliased
-  // `containerConfigs` creates. Ordering here is execution order, not file
-  // number — registering 064 next to 063 runs it before the table exists.
+  // Array order is execution order, not file number: 064 and 020 ALTER container_configs, which the aliased
+  // `containerConfigs` creates.
   migration064,
-  // Same constraint as 064: upstream's 020 ALTERs container_configs, so it must
-  // run after the aliased `containerConfigs` creates the table. Position is
-  // unchanged from the fork's 065, which this replaces.
   migration020,
   migration023,
-  // Standalone CREATE TABLE with no timestamp for 053 to normalize — position
-  // relative to 053 is irrelevant, same reasoning as 054/055/056 above.
   migration067,
-  // Adds a nullable column and writes no timestamp, so 053's position below is
-  // irrelevant here — same reasoning as 054/055/056 above.
   migration068,
   messagingGroupInstance,
   migration019,
-  // After messagingGroupInstance: upstream's 016 RECREATES messaging_groups
-  // (DROP + RENAME) to add the instance dimension, and its column list is
-  // fixed — a name_source added before it would be silently dropped on a
-  // fresh DB. Execution order, not file number.
+  // After messagingGroupInstance: upstream's 016 RECREATES messaging_groups with a fixed column list, so a column
+  // added before it (069, 070) is silently dropped on a fresh DB.
   migration069,
-  // After migration069 for the same reason it is there: upstream's 016
-  // RECREATES messaging_groups with a fixed column list, so detached_at has to
-  // be added after that recreate or a fresh DB silently loses it.
   migration070,
-  // Shadow schema — four tables with zero fork writers. Creates no timestamp
-  // for 053 to normalize, so its position relative to 053 is irrelevant.
   migration071,
   migration072,
   migration073,
-  // After messagingGroupInstance above, which RECREATES messaging_groups: this
-  // recreates the child table that references it. Creates no timestamp for 053
-  // to normalize, so its position relative to 053 is irrelevant.
+  // After messagingGroupInstance, which recreates the parent table this references.
   migration074,
   migration075,
-  // Additive ALTER on turn_usage (created by 059). No ordering constraint
-  // beyond that — nothing below recreates the table.
   migration076,
-  // Standalone CREATE TABLE with no timestamp for 053 to normalize (every
-  // write is ISO-8601 UTC from JS at the write site) — position relative to
-  // 053 is irrelevant, same reasoning as 054/055/056 above.
   migration077,
-  // Indexes an EXISTING table (pending_approvals, created by 003) and retires
-  // any pre-existing live duplicate before adding the unique index, so it has
-  // to run after every migration that could still insert one — i.e. here, at
-  // the end. Nothing below recreates pending_approvals, so 053's timestamp
-  // pass cannot drop the index back off.
+  // Runs after every migration that could still insert a duplicate pending_approvals row; nothing below recreates the
+  // table.
   migration078,
-  // Creates its own standalone table with no foreign keys and no timestamp for
-  // 053 to normalize, so it has no ordering constraint at all — and it touches
-  // none of the tables 077/078 above do.
   migration079,
-  // Additive receipt column and immutable-update trigger. Nothing after this
-  // recreates choice_receipts, and legacy rows must remain readable as NULL.
+  // Nothing after this recreates choice_receipts.
   migration080,
-  // Standalone CREATE TABLE with no foreign keys; every timestamp is written as
-  // ISO-8601 UTC from JS, so 053 has nothing to normalize and position is free.
   migration081,
   migration082,
   migration083,
   migration084,
-  // Last on purpose: normalizes whatever naive timestamps every migration
-  // above has left behind (016's messaging_groups recreate copies created_at
-  // through as-is).
+  // Last on purpose: normalizes naive timestamps left by everything above (016's recreate copies created_at as-is).
   migration053,
 ];
 
@@ -298,11 +231,7 @@ export function runMigrations(db: Database.Database, list: Migration[] = migrati
     CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_version_name ON schema_version(name);
   `);
 
-  // Uniqueness is keyed on `name`, not `version`. This lets module
-  // migrations (added later by install skills) pick arbitrary version
-  // numbers without coordinating across modules. `version` stays on
-  // the Migration object as an ordering hint within the barrel array;
-  // the stored `version` column is auto-assigned at insert time as an
+  // Uniqueness is by `name`, not `version`, so module migrations can pick any version; the stored `version` is an
   // applied-order number.
   const applied = new Set<string>(
     (db.prepare('SELECT name FROM schema_version').all() as { name: string }[]).map((r) => r.name),
@@ -313,19 +242,13 @@ export function runMigrations(db: Database.Database, list: Migration[] = migrati
   log.info('Running migrations', { count: pending.length });
 
   for (const m of pending) {
-    // Table recreates need FK enforcement off for the DROP+RENAME window.
-    // The pragma must be toggled OUTSIDE the transaction (it's a silent
-    // no-op inside one); foreign_key_check runs INSIDE so a violating
-    // recreate rolls back atomically with nothing committed.
+    // The pragma is a silent no-op inside a transaction, so it is toggled OUTSIDE; foreign_key_check runs inside so a
+    // violating recreate rolls back.
     if (m.disableForeignKeys) db.pragma('foreign_keys = OFF');
     try {
       db.transaction(() => {
-        // Snapshot violations BEFORE up() runs: live DBs can carry latent
-        // FK orphans (e.g. parents deleted through a FK-OFF sqlite3 CLI
-        // session — ensureUserDm tolerates exactly this at runtime). The
-        // migration must only fail for violations it INTRODUCED; throwing
-        // on pre-existing ones would crash-loop the host at every boot
-        // (runMigrations runs on startup) until manual DB surgery.
+        // Only violations the migration INTRODUCED fail it: live DBs can carry latent orphans, and throwing on those
+        // would crash-loop the host at every boot.
         const preexisting = m.disableForeignKeys
           ? new Set((db.pragma('foreign_key_check') as FkViolation[]).map(fkIdentity))
           : null;

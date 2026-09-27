@@ -1,31 +1,9 @@
 /**
- * Host sweep — periodic maintenance of all session DBs.
- *
- * Two-DB architecture:
- *   - Reads processing_ack + container_state from outbound.db
- *   - Writes to inbound.db (host-owned) for status updates + recurrence
- *   - Uses heartbeat file mtime for liveness (never polls DB for it)
- *   - Writes outbound.db only while the session container is confirmed stopped
- *     (continuation recovery counters / visible parked notice)
- *
- * Stuck / idle detection (replaces the old IDLE_TIMEOUT setTimeout + 10-min
- * heartbeat threshold):
- *
- *   If the container isn't running and there are 'processing' rows left over
- *   (e.g. it crashed mid-turn) → reset them to pending with backoff +
- *   tries++. Existing retry machinery does the rest.
- *
- *   If the container IS running:
- *     1. Absolute ceiling: heartbeat age > max(30 min, current_bash_timeout)
- *        → kill. Covers the "alive but silent for 30 min" case. Extended
- *        only while Bash is declared as running longer, honouring the
- *        user's own timeout directive. Kill then resets processing rows.
- *
- *     2. Message-scoped stuck: for each 'processing' row, tolerance =
- *        max(60s, current_bash_timeout_ms_if_Bash_running). If
- *        (claim_age > tolerance) AND (heartbeat_mtime <= status_changed)
- *        → kill + reset this message + tries++. Semantics: "container
- *        claimed a message and went quiet past tolerance since the claim."
+ * Host sweep: periodic maintenance of all session DBs. Reads processing_ack and container_state from outbound.db,
+ * writes inbound.db (host-owned), and writes outbound.db only while the container is confirmed stopped. Liveness
+ * comes from the heartbeat file mtime, never the DB. A stopped container's leftover 'processing' rows reset to
+ * pending with backoff. A running container is killed when its heartbeat is older than max(30 min, the declared
+ * Bash timeout), or when a claim outlives max(60s, Bash timeout) with no heartbeat since the claim.
  */
 import {
   getActiveSessions,
@@ -52,28 +30,17 @@ import {
 } from './container-runner.js';
 import type { Session } from './types.js';
 
-/**
- * Session-DB timestamp parsing now lives with the mailbox module that owns
- * those columns; re-exported here so existing importers are unchanged.
- */
 export { parseSqliteUtc } from './modules/mailbox/sqlite-utc.js';
 import { parseSqliteUtc } from './modules/mailbox/sqlite-utc.js';
 
 export const SWEEP_INTERVAL_MS = 60_000;
 
-// Quiet-session cache — see the sweep loop. A fully-quiet session is skipped
-// for at most this long (or until its next scheduled row is due, if sooner).
+// A fully quiet session is skipped for at most this long, or until its next scheduled row is due if sooner.
 export const QUIET_SESSION_BACKOFF_MS = 30 * 60_000;
 /**
- * Floor of the per-session jitter band, as a fraction of the cap: a mark
- * expires somewhere in [floor, 1) x the backoff above, never past it.
- *
- * Without a jitter every session marked in the same tick expires in the same
- * tick. Live: the whole quiet population — ~840 sessions — came back on
- * one exact 30-minute grid 48 times a day, and each of those was a ~30 s tick
- * that swept every active session at once. This spreads that cohort across the
- * 15 minutes below the cap. It only ever SHORTENS a skip, so plan.md §4.4's
- * 30-minute ceiling still holds and no session waits longer than it does today.
+ * Floor of the per-session jitter band as a fraction of the cap: a mark expires in [floor, 1) x the backoff.
+ * Without it every session marked in one tick expires together, one fleet-wide sweep per window. It only ever
+ * shortens a skip, so the 30-minute ceiling still holds.
  */
 const QUIET_SESSION_JITTER_FLOOR = 0.5;
 interface QuietMark {
@@ -84,14 +51,8 @@ const quietSessions = new Map<string, QuietMark>();
 let lastSkippedQuiet = 0;
 
 /**
- * Per-session jitter in [0, 1), derived from the session id — deterministic,
- * deliberately NOT `Math.random()`: two ticks must agree on the same session,
- * and the acceptance cases have to reproduce the spread across runs.
- *
- * FNV-1a with a murmur3 finalizer. The finalizer is load-bearing, not
- * ceremony: raw FNV-1a over ids that differ only in their last characters —
- * which is exactly what `sess-<epoch-ms>-<suffix>` ids are — puts 200 sessions
- * into five distinct buckets, which is a smaller herd rather than no herd.
+ * Per-session jitter in [0, 1), deterministic (not `Math.random()`): two ticks must agree on a session. The
+ * murmur3 finalizer is load-bearing: raw FNV-1a over `sess-<epoch-ms>-<suffix>` ids lands in a handful of buckets.
  */
 function quietSessionJitter(sessionId: string): number {
   let hash = 0x811c9dc5;
@@ -104,12 +65,11 @@ function quietSessionJitter(sessionId: string): number {
   hash ^= hash >>> 13;
   hash = Math.imul(hash, 0xc2b2ae35);
   hash ^= hash >>> 16;
-  // `^` yields a SIGNED 32-bit int; without the shift back to unsigned this
-  // returns a negative fraction for half the ids and LENGTHENS their backoff.
+  // `^` yields a SIGNED 32-bit int; without `>>> 0` half the ids get a negative fraction and a LONGER backoff.
   return (hash >>> 0) / 0x1_0000_0000;
 }
 
-/** This session's jittered backoff cap, in ms. Never exceeds the constant. */
+/** Never exceeds the constant. */
 function quietSessionBackoffMs(sessionId: string): number {
   const factor = QUIET_SESSION_JITTER_FLOOR + (1 - QUIET_SESSION_JITTER_FLOOR) * quietSessionJitter(sessionId);
   return Math.round(QUIET_SESSION_BACKOFF_MS * factor);
@@ -122,28 +82,11 @@ export function _resetQuietSessionCacheForTesting(): void {
 }
 
 /**
- * Rebuild the quiet cache from `sessions.sweep_quiet_until` at boot.
- *
- * The map is process-local, so before this every restart threw the whole cache
- * away and the first tick swept every active session — ~850 of them, a 457 s
- * tick, nine times in 22 hours of log. One query,
- * no session-DB opens.
- *
- * Safe by construction rather than by re-derivation, on three counts:
- *  - the persisted value was computed as `min(getNextFutureProcessAfter(),
- *    jittered cap)`, so it can never cross a due row that existed at mark time;
- *  - a row whose `last_active` has moved since is not returned at all — every
- *    write that changes when work is next due goes through
- *    `withQuietInvalidationSync`, which nulls the column and advances
- *    `last_active` in one statement immediately BEFORE the row lands, so a
- *    newly due row always clears the mark;
- *  - a session whose container is alive is never quiet, whatever the row says.
- * Due-ness itself lives only in the session's own `inbound.db`, which this path
- * deliberately does not open; the jittered cap is the outer bound, so the worst
- * case for anything the three checks miss is one backoff window, exactly as it
- * is for a mark taken in this process.
- *
- * Advisory: a failed warm degrades to today's behavior — a cold first tick.
+ * Rebuild the quiet cache from `sessions.sweep_quiet_until` at boot (one query, no session-DB opens), so a restart
+ * does not sweep every active session on its first tick. Safe because the persisted value never crosses a due row
+ * that existed at mark time; every write that changes when work is next due nulls the column and advances
+ * `last_active` in one statement before the row lands, so moved rows are not returned; and a live container is
+ * never quiet. Advisory: a failed warm means a cold first tick.
  */
 async function warmQuietSessionCache(): Promise<void> {
   try {
@@ -163,50 +106,28 @@ async function warmQuietSessionCache(): Promise<void> {
   }
 }
 
-// Absolute idle ceiling for a running container. If the heartbeat file hasn't
-// been touched in this long, the container is either stuck or doing genuinely
-// nothing — kill and restart on the next inbound.
+// Absolute idle ceiling for a running container: a heartbeat file untouched this long means stuck or idle; kill.
 export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
-// Stuck tolerance window applied per 'processing' claim — "did we see any
-// signs of life since this message was claimed?"
+// Per-claim stuck tolerance: any sign of life since this message was claimed?
 export const CLAIM_STUCK_MS = 60 * 1000;
-// Grace window after a fresh spawn during which the SLA enforcer ignores
-// pre-existing claims (claims made before this container started). Lets
-// the new container's startup hook in agent-runner clean its own orphan
-// processing_ack rows. Without this, a session whose previous container
-// crashed mid-task gets stuck in a wake → kill loop forever — the new
-// container is killed within ms of spawn for a 4-day-old claim it hadn't
-// had a chance to clear.
+// After a fresh spawn the SLA ignores claims made before the container started, so its startup hook can clear
+// orphan processing_ack rows; otherwise a crashed session loops wake -> kill forever on an old claim.
 export const SPAWN_GRACE_MS = 60 * 1000;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sweep duty registry
-//
-// The tick used to be a prose list of statements. It is now a driver over this
-// registry: a duty declares WHICH window it runs in (`phase`) and WHERE in that
-// window (`order`), and the driver opens each window once and hands the
-// already-open mailbox session to every duty in it. That is the perf invariant
-// — one `getActiveSessions()` per tick, one mailbox open per duty-group per
-// window — expressed as data instead of as the order of statements in one
-// function. docs/specs/upstream-host-sweep-seam/plan.md §4.3-§4.5.
-//
-// The registry is behavior-preserving: the same duty bodies run in the same windows
-// with the same guards, the same cadences and the same two error strings. What
-// is new is structure — both error lines now carry `duty` and `window`, and a
-// family PR can move a body into `src/modules/sweep-<family>/` by moving its
-// registration, without touching the driver.
-// ─────────────────────────────────────────────────────────────────────────────
+// Sweep duty registry: a duty declares its window (`phase`) and position (`order`); the driver opens each window
+// once and hands the open mailbox session to every duty in it. That keeps one `getActiveSessions()` per tick and
+// one mailbox open per duty group per window.
 
 export type SweepPhase =
   /** Before the fan-out; `ctx.sessions` is not loaded yet. */
   | 'tick:pre-session'
-  /** W1 — inside one plan session. */
+  /** W1: inside one plan session. */
   | 'session:plan'
-  /** W2 — NOTHING open; the wake and its attempt bookkeeping. */
+  /** W2: NOTHING open; the wake and its attempt bookkeeping. */
   | 'session:wake'
-  /** W4 — EXCLUSIVE chain; nothing open; duties open their own windows. */
+  /** W4: EXCLUSIVE chain; nothing open; duties open their own windows. */
   | 'session:health'
-  /** W5 — inside one tail session. */
+  /** W5: inside one tail session. */
   | 'session:tail'
   /** After the fan-out; container state is current. */
   | 'tick:post-session'
@@ -224,11 +145,8 @@ export const SWEEP_PHASES: readonly SweepPhase[] = [
 ];
 
 /**
- * 'all' runs every duty in the phase in ascending `order`. 'exclusive' is an
- * if/else-if chain: the first duty whose `claims()` predicate holds runs and
- * the rest do NOT — `session:health`'s shape, where registering the SLA before
- * the reaps would reclassify an idle container past the ceiling from
- * `scheduled-task-idle` to `absolute-ceiling`.
+ * 'all' runs every duty in ascending `order`. 'exclusive' is an if/else-if chain: the first duty whose `claims()`
+ * holds runs and the rest do NOT (registering the SLA before the reaps would misclassify an idle container).
  */
 export type PhaseKind = 'all' | 'exclusive';
 
@@ -247,14 +165,11 @@ export function sweepPhaseKind(phase: SweepPhase): PhaseKind {
 }
 
 /**
- * The opening boundary a duty (or an opener) ran at — the `window` field on
- * both sweep error lines. Every phase is a window; three more exist inside
- * windows a duty owns rather than the driver: the driver's own observe read,
- * and the two sessions the running-container SLA opens around its kill.
+ * The `window` field on both sweep error lines: every phase, plus the driver's observe read and the two sessions
+ * the SLA opens around its kill.
  */
 export type SweepWindow = SweepPhase | 'session:observe' | 'session:health:sla-observe' | 'session:health:post-kill';
 
-/** The plan `session:plan` builds and every later phase reads. */
 export interface WakePlan {
   dueCount: number;
   wakePriority: 'interactive' | 'scheduled';
@@ -271,19 +186,11 @@ export interface ContainerObservation {
   processingClaimCount: number;
   lastOutboundAtMs: number | null;
   lastInboundAtMs: number | null;
-  /**
-   * WHICH container the state above is about, read in the same turn so a duty
-   * can tell it apart from a replacement registered while the duty awaited.
-   * Null when nothing is registered.
-   */
+  /** Which container the state is about, so a duty can tell it from a replacement registered while it awaited. */
   containerIdentity: ContainerIdentity | null;
 }
 
-/**
- * What the SLA duty snapshotted INSIDE its observe session, before the kill.
- * `resetStuckProcessingRows` clears the claims, so a post-kill read would
- * always come back empty — constraint 12's "snapshotted before the kill".
- */
+/** Snapshotted inside the SLA's observe session before the kill: `resetStuckProcessingRows` clears the claims. */
 export interface SweepKillSnapshot {
   reason: string;
   containerState: ContainerState | null;
@@ -304,41 +211,24 @@ export interface SweepSessionContext extends SweepTickContext {
   readonly agentGroupFolder: string;
   /** The window's handle; null in the 'nothing open' phases. */
   readonly mailbox: NanoclawMailboxSession | null;
-  /** Constraint 20 — the W1 snapshot, the only outbound guard the context exposes. */
+  /** The W1 snapshot, the only outbound guard the context exposes. */
   readonly hasOutbound: boolean;
   readonly alive: boolean;
   readonly justWoke: boolean;
   readonly plan: WakePlan;
   readonly observed: ContainerObservation | null;
   readonly killSnapshot: SweepKillSnapshot | null;
-  /** A short session in the phase's own window, for a duty that must kill (constraint 18). */
+  /** A short session in the phase's own window, for a duty that must kill. */
   readonly run: SessionRunner;
   /** Same, for a duty that owns more than one window of its own (the SLA). */
   runIn<T>(window: SweepWindow, action: (mailbox: NanoclawMailboxSession) => T | Promise<T>): Promise<T | undefined>;
-  /**
-   * The one thing a duty tells the driver rather than the other way round:
-   * `session:wake` reports whether it actually woke the container this tick,
-   * which gates the observe read and the whole health chain (constraint 10).
-   */
+  /** Whether `session:wake` actually woke the container, which gates the observe read and the health chain. */
   reportWoke(woke: boolean): void;
-  /**
-   * Wake instrumentation. A duty that starts a container wake says so,
-   * and says whether the per-session loop waited for it and for how long.
-   *
-   * `sessionsMs` alone mixed "walked N sessions" with "waited on M container
-   * spawns", and the two differ by three orders of magnitude per unit: a cold
-   * tick's cost tracked spawn COUNT, not session count, and every comparison
-   * between two ticks was really a comparison of how many containers happened
-   * to be due. These three counters separate the two on the tick-timing line.
-   */
+  /** Wake instrumentation, so tick timing separates spawn waits from session walking. */
   reportWake(stats: { awaited: boolean; waitMs: number }): void;
 }
 
-/**
- * Narrow the union `SweepDuty.run` declares. A session-phase duty can only be
- * reached through the per-session driver, so this is a shape assertion with a
- * loud failure rather than a silent cast.
- */
+/** A session-phase duty is reached only through the per-session driver; a loud shape assertion, not a cast. */
 export function asSessionContext(ctx: SweepTickContext | SweepSessionContext): SweepSessionContext {
   if (!('session' in ctx)) throw new Error('a session-phase duty ran with a tick context');
   return ctx;
@@ -376,13 +266,8 @@ interface SweepDutySource {
   registrar: () => void;
 }
 
-// Registration sources, in registration order. The in-file built-ins are the
-// first source (registered below, at module init); a family module
-// (`src/modules/sweep-<family>/`) registers itself as a further source at its
-// own import time. The test reset replays every recorded source's registrar
-// so a family module's duties survive `_resetSweepRegistryForTesting()`
-// instead of silently dropping out (found by two family builders: R-7 fell
-// 39→33 under the old builtins-only reset).
+// Registration sources in order: the in-file built-ins, then each family module at its import time. The test reset
+// replays every recorded source so family duties survive `_resetSweepRegistryForTesting()`.
 const sweepDutySources: SweepDutySource[] = [];
 
 export function registerSweepDutySource(name: string, registrar: () => void): void {
@@ -421,9 +306,8 @@ export function registerSweepDuty(duty: SweepDuty): void {
 }
 
 /**
- * Runs inside the SLA duty's OWN observe session, before `decideStuckAction`,
- * so the decision and the telemetry row see one snapshot. Reached only when the
- * exclusive chain falls through to the SLA branch — never on heal or reap paths.
+ * Runs inside the SLA duty's own observe session before `decideStuckAction`, so the decision and the telemetry row
+ * see one snapshot. Reached only when the exclusive chain falls through to the SLA branch.
  */
 export function registerSlaObservationHook(hook: SlaObservationHook): void {
   const clash = slaObservationHooks.find((h) => h.order === hook.order);
@@ -433,10 +317,8 @@ export function registerSlaObservationHook(hook: SlaObservationHook): void {
 }
 
 /**
- * Runs inside the post-kill session the SLA duty opens AFTER `killContainer`
- * returns. A kill respawns through `onExit` and clears status through
- * `delivery.ts`, both of which open a session on the same key, so nothing may
- * be held across it (invariant I-3).
+ * Runs inside the post-kill session the SLA opens after `killContainer` returns. The kill's respawn and status
+ * clear both open a session on the same key, so nothing may be held across it (invariant I-3).
  */
 export function registerSweepKillFollowUp(followUp: SweepKillFollowUp): void {
   const clash = sweepKillFollowUps.find((f) => f.order === followUp.order);
@@ -446,9 +328,7 @@ export function registerSweepKillFollowUp(followUp: SweepKillFollowUp): void {
   sweepKillFollowUps.sort((a, b) => a.order - b.order);
 }
 
-// Memoized: `dutiesForPhase` runs four times per swept session, and the tick
-// walks ~3,200 of them. Registration is import-time, so the only invalidation
-// is a registration (and the test-only reset).
+// Memoized (four lookups per swept session); invalidated only by registration and the test-only reset.
 let dutiesByPhase = new Map<SweepPhase, SweepDuty[]>();
 
 function dutiesForPhase(phase: SweepPhase): SweepDuty[] {
@@ -474,12 +354,8 @@ export function _listSweepRegistrationsForTesting(): {
 }
 
 /**
- * Test-only: clear the registry. `builtins: false` leaves it EMPTY so a test
- * can drive the driver over its own probes; the default replays every
- * recorded duty source's registrar, in registration order — the in-file
- * built-ins plus any family module that registered itself via
- * `registerSweepDutySource` — restoring the full registration set rather
- * than only the 39 the built-ins alone would give.
+ * Test-only: clear the registry. `builtins: false` leaves it EMPTY; the default replays every recorded duty source
+ * in registration order, family modules included.
  */
 export function _resetSweepRegistryForTesting(options: { builtins?: boolean } = {}): void {
   sweepDuties.length = 0;
@@ -492,15 +368,9 @@ export function _resetSweepRegistryForTesting(options: { builtins?: boolean } = 
 }
 
 /**
- * Test-only: drop exactly the named duty source, so a test that registered a
- * fake source via `registerSweepDutySource` doesn't leak it into later tests'
- * registry state. Throws on `'host-sweep:builtin'` — that source is not
- * test-owned. A no-op if `name` isn't currently registered. Does not touch
- * the duty/hook/follow-up registries — call this after
- * `_resetSweepRegistryForTesting()` has already restored them, not instead
- * of it. Never clear the whole source list: a real family module's source
- * (registered at its own import time, same as the built-ins) would be wiped
- * along with it for the rest of the test file.
+ * Test-only: drop exactly one fake source registered via `registerSweepDutySource`; throws on the built-in source.
+ * Call after `_resetSweepRegistryForTesting()`. Never clear the whole list: a real family module's source would be
+ * lost for the rest of the file.
  */
 export function _unregisterSweepDutySourceForTesting(name: string): void {
   if (name === 'host-sweep:builtin') {
@@ -510,41 +380,16 @@ export function _unregisterSweepDutySourceForTesting(name: string): void {
   if (index !== -1) sweepDutySources.splice(index, 1);
 }
 
-// ── Duty failure handling ────────────────────────────────────────────────────
-//
-// Every duty body runs through `runDutyBody`, which tags the error with the
-// duty name and the window and rethrows. What happens next depends on the
-// phase, and the difference is the point:
-//
-//   TICK phases isolate. `runTickPhase` catches, logs 'Host sweep duty failed'
-//   with `duty` and `window`, and runs the next duty. Registration IS the
-//   guard, so an unguarded duty is impossible — before this seam an unguarded
-//   throw from the reconciler or the receipts prune silently skipped every
-//   later duty in the tick, which is one of the failures this seam was booked
-//   against (constraint 5).
-//
-//   SESSION phases do not. A duty that threw leaves work still due, so the
-//   throw propagates out of `sweepSession` to `sweepOnce`'s per-session catch,
-//   which logs the same line and — critically — does NOT quiet-cache the
-//   session, so the next 60s tick retries it. Isolation there is per session,
-//   not per duty, exactly as before.
-//
-// Both paths emit one line, from one place, so each gate stays single-cause
-// (constraint 17).
+// Duty failures: `runDutyBody` tags the error with duty and window and rethrows. TICK phases isolate: the next
+// duty still runs. SESSION phases propagate to `sweepOnce`'s per-session catch, which does NOT quiet-cache the
+// session, so the next tick retries it. Both log the same one line from one place.
 
-/**
- * The driver's own W3 observe read. Not a registration — the `driver:` prefix
- * says so — but it needs a stable `duty` value because it reads the mailbox and
- * can therefore fail like a duty.
- */
+/** The driver's W3 observe read reads the mailbox and can fail like a duty, so it has a stable `duty` value. */
 const DRIVER_OBSERVE_DUTY = 'driver:observe';
 
 /**
- * The per-session yield, injectable so a test can OBSERVE it.
- *
- * It is behavior, not decoration: deleting it turns a batch of swept sessions
- * back into one contiguous event-loop freeze, and a test that only watches duty
- * order stays green while that happens. R-2b records a marker through this seam.
+ * The per-session yield, injectable so a test can observe it. Removing it turns a batch of sessions back into one
+ * contiguous event-loop freeze.
  */
 const defaultSweepYield = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 let sweepYield: () => Promise<void> = defaultSweepYield;
@@ -561,9 +406,8 @@ interface SweepDutyTag {
 }
 
 /**
- * A later window's opener failed (or its mailbox vanished mid-tick). Already
- * classified and, where it warrants one, already logged — the per-session frame
- * turns it into "no quiet mark, retried next tick" without a second line.
+ * A later window's opener failed or its mailbox vanished mid-tick. Already classified and logged where warranted;
+ * the per-session frame turns it into "no quiet mark, retried next tick".
  */
 export class SweepWindowAbort extends Error {
   constructor(readonly window: SweepWindow) {
@@ -580,16 +424,9 @@ function tagDutyFailure(err: unknown, duty: string, window: SweepWindow): unknow
   return err;
 }
 
-/** The `duty`/`window` fields for whichever body threw, or nothing. */
 /**
- * The duty and window a tagged failure carries, or `{}` for an untagged one.
- *
- * Exported for one caller: the post-kill follow-up chain, which the container
- * exit now drives (Codex final). That chain outlives the tick, so its failures
- * no longer reach the per-session catch below that classifies them — and a
- * follow-up that throws must still be reported as 'Host sweep duty failed' with
- * the duty and window the tag names, not flattened into a generic message.
- * Error-rule surface, the same category as `SweepWindowAbort`.
+ * The duty and window a tagged failure carries, or `{}`. Exported for the post-kill follow-up chain, which outlives
+ * the tick and must still report 'Host sweep duty failed' with the tagged fields.
  */
 export function dutyFailureFields(err: unknown): { duty?: string; window?: SweepWindow } {
   if (err === null || typeof err !== 'object' || !(SWEEP_DUTY_TAG in err)) return {};
@@ -621,10 +458,7 @@ async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase, generation
     try {
       await runDutyBody(duty.name, phase, () => duty.run(ctx));
     } catch (err) {
-      // Isolated: one failing central duty must not cost the tick every duty
-      // ordered after it. The `duty` and `window` fields say which body, so a
-      // family PR's post-deploy check filters on its own duty names rather
-      // than counting a shared string.
+      // Isolated: one failing central duty must not cost the tick every later duty.
       log.error('Host sweep duty failed', { err, duty: duty.name, window: phase });
     } finally {
       tickDutiesRunning.delete(duty.name);
@@ -677,10 +511,8 @@ export async function runSweepKillFollowUps(
   mailbox: NanoclawMailboxSession,
   snapshot: SweepKillSnapshot,
 ): Promise<void> {
-  // The snapshot was taken inside the observe session, BEFORE the kill —
-  // resetStuckProcessingRows clears the claims, so a read here would always be
-  // empty (constraint 12). `Object.create` shadows one field and leaves every
-  // other accessor live on the driver's own context.
+  // The snapshot was taken before the kill (the kill clears the claims). `Object.create` shadows one field and
+  // leaves every other accessor live on the driver's context.
   const followUpCtx: SweepSessionContext = Object.create(ctx, {
     killSnapshot: { value: snapshot, enumerable: true },
   }) as SweepSessionContext;
@@ -690,15 +522,9 @@ export async function runSweepKillFollowUps(
 }
 
 /**
- * A short session tagged with the window it belongs to.
- *
- * Classification is per OPENING BOUNDARY, not one flag per session. Only a W1
- * opener failure backs the session off, and that is deliberate: W1 already
- * proved the mailbox openable this tick, so a failure at a later window is far
- * more likely a reclaim race than a persistent EACCES — and a genuinely
- * persistent fault fails at W1 on the very next tick and takes the backoff
- * there. Extending the backoff later would hold an already-due scheduled task
- * for 30 minutes on a transient condition. plan.md §4.5.
+ * A short session tagged with its window. Only a W1 opener failure backs the session off: W1 already proved the
+ * mailbox openable this tick, so a later failure is likely a reclaim race, and backing off would hold due work for
+ * 30 minutes on a transient condition.
  */
 function windowedRunner(run: SessionRunner, sessionId: string, window: () => SweepWindow): SessionRunner {
   return async <T>(action: (mailbox: NanoclawMailboxSession) => T | Promise<T>): Promise<T | undefined> => {
@@ -710,8 +536,7 @@ function windowedRunner(run: SessionRunner, sessionId: string, window: () => Swe
         return action(mailbox);
       });
     } catch (err) {
-      // A session that vanished under us is the ordinary steady state — not a
-      // fault, not logged, and retried on the next tick rather than backed off.
+      // A vanished session is steady state: not logged, retried next tick rather than backed off.
       if (err instanceof SessionDbMissingError) throw new SweepWindowAbort(at);
       if (err instanceof SessionDbUnopenableError || !entered) {
         log.error('Host sweep mailbox unopenable', { err, sessionId, window: at });
@@ -722,7 +547,7 @@ function windowedRunner(run: SessionRunner, sessionId: string, window: () => Swe
   };
 }
 
-/** The 37 duties this module still owns, as 38 registrations. Ids from seam2-inventory.md §3. */
+/** Inventory id to registered duty name; the only place this file names a duty. */
 export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T2: 'egress-network-reheal',
   T5: 'approvals-reason-sweep',
@@ -743,31 +568,12 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T21: 'claims-self-heal',
   T22: 'orphaned-repo-fence-release',
   T23: 'cli-request-execution-prune',
-  // Fork addition (2026-09-07): a recurring task whose agent turn keeps erroring
-  // used to fail forever in silence — every occurrence row read `completed`, so
-  // the recurrence streak in `recurrence.ts` never engaged. Body in
-  // `src/modules/sweep-task-escalation/index.ts`.
   T24: 'task-failure-escalation',
-  // Fork addition, not part of the upstream seam-2 port: by-reference GitHub
-  // credential delivery (src/github-token-file.ts). Kept in this inventory
-  // so the registration drift guard in host-sweep-registry.test.ts stays an
-  // exact accounting of every registered duty.
+  // Fork additions (FORK*), kept so the drift guard in host-sweep-registry.test.ts accounts for every duty.
   FORK1: 'github-token-file-refresh',
-  // Fork addition: the coordination tables of
-  // migration 071 gained writers, and a write that lands after session teardown
-  // leaves a row behind that no foreign key removes. Body in
-  // `src/modules/sweep-central/coordination-orphans.ts`.
   FORK2: 'coordination-orphans',
   FORK3: 'wiki-admission-recovery',
-  // Fork addition (2026-09-17): a remote MCP server authenticates with a
-  // short-lived OAuth access token, and the OneCLI secret injecting it used to
-  // hold a value a human pasted once. When it expired the gateway kept
-  // injecting the dead token and every spawn's stdio bridge died with
-  // CONNECTION_CLOSED. Body in `src/modules/mcp-oauth/`.
   FORK4: 'mcp-oauth-refresh',
-  // Fork addition (2026-09-18): an agent's promise of later work with nothing
-  // armed to keep it ("I'll confirm tomorrow") was dropped whenever the session
-  // went quiet. Body in `src/modules/sweep-promise-watch/`.
   FORK5: 'promise-watch',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
@@ -790,26 +596,15 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   S19: 'spent-task-session-gc',
 };
 
-/**
- * The decision `enforceRunningContainerSla` (S14, moved to
- * `src/modules/sweep-container-health/index.ts`) computes and acts on. Stays
- * here because `SweepKillFollowUp.run` and the S15/S10 kill follow-ups below
- * (owned by other family PRs) reference it by name.
- */
+/** Computed by `enforceRunningContainerSla`; defined here because the kill follow-ups reference it by name. */
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
 /**
- * The ceiling-kill accountability family lives in
- * `src/modules/sweep-continuation/`. `src/host-restart-warn.ts` imports
- * `decideCeilingFollowUp` and `WORK_CONTINUATION_RESUME_MAX_ATTEMPTS` from
- * here and is outside that PR's ownership, so both keep resolving from this
- * module. The re-export is from the family's side-effect-free leaf, never from
- * its `index.ts`: that file registers its duties at eval time, and pulling it
- * into this module's own dependency cycle would run the registrar while the
- * registry's `const`s below are still in their temporal dead zone.
+ * Re-exported for `src/host-restart-warn.ts`, from the family's side-effect-free leaf, never its `index.ts`: that
+ * file registers duties at eval time and would run the registrar while this module's `const`s are still in TDZ.
  */
 export { decideCeilingFollowUp, type CeilingFollowUp } from './modules/sweep-continuation/decide.js';
 export {
@@ -817,26 +612,11 @@ export {
   type HostWorkContinuation,
 } from './modules/mailbox/ops/continuation.js';
 /**
- * THE guard for every host-side write to the container-owned `outbound.db`.
- *
- * `outbound.db` has one writer. The host may write it only while no container
- * owns it, and after the seam made these paths async that check has to sit
- * immediately before the write with no await in between — an open, a kill, or
- * any other yield is a window a replacement wake can land in.
- *
- * Two entry points, one implementation:
- *  - this one, for a write inside a session the caller already holds;
- *  - `withStoppedContainerSession`, which opens a short session and delegates
- *    here, for a write that needs its own.
- *
- * Both exist because the nesting guard forbids opening a second session for a
- * key while one is open (invariant I-3), so the in-session writes physically
- * cannot route through the session-opening form. Every outbound write in this
- * file is an argument to one of these two, which is what makes the property
- * checkable by grep rather than by reading.
- *
- * Returns `undefined` when a container owns the file — never an error. Every
- * caller's write is idempotent or retried on the next tick.
+ * THE guard for every host-side write to the container-owned `outbound.db`: it may be written only while no
+ * container owns it, checked immediately before the write with no await between (any yield lets a replacement
+ * wake in). `withStoppedContainerSession` is the session-opening form; both exist because a second session for a
+ * key may not open while one is (I-3). Returns `undefined` when a container owns the file; callers' writes are
+ * idempotent or retried next tick.
  */
 export function writeOutboundWhenStopped<T>(
   session: Session,
@@ -851,22 +631,9 @@ export function writeOutboundWhenStopped<T>(
 }
 
 /**
- * Run a host write against the container-owned `outbound.db`, but only while
- * the container is confirmed stopped.
- *
- * The check is INSIDE the session and immediately before the mutation, with no
- * await between the two — that ordering is the whole point. Opening a mailbox
- * session is a yield, and a concurrent inbound wake can start a container in
- * it. Pre-seam this path was a synchronous check-then-write on a handle that
- * was already open, so no such gap existed; restoring the property, rather
- * than re-checking at each call site, is what keeps the next writer from
- * reintroducing it.
- *
- * Runs through the caller's WINDOWED runner, so an opener failure is still
- * classified and unwound by the window that owns it.
- *
- * Resolves `undefined` when the mailbox is gone OR a container took ownership
- * during the open. Callers treat both as "did not run" — never as failure.
+ * Opens a short session through the caller's windowed runner and delegates to `writeOutboundWhenStopped`: opening
+ * a session is a yield, so the check must sit inside it. Resolves `undefined` when the mailbox is gone or a
+ * container took ownership; callers treat both as "did not run".
  */
 export async function withStoppedContainerSession<T>(
   run: SessionRunner,
@@ -877,9 +644,8 @@ export async function withStoppedContainerSession<T>(
 }
 
 /**
- * Write one deferred, on-wake accountability row (plus its inert recall marker)
- * into the host-owned inbound DB. The row id doubles as the durable marker the
- * per-class attempt caps count, so every self-heal action goes through here.
+ * Write one deferred on-wake accountability row (plus its inert recall marker) into inbound. The row id doubles as
+ * the durable marker the per-class attempt caps count, so every self-heal action goes through here.
  */
 export function writeSystemWake(
   mailbox: NanoclawMailboxSession,
@@ -887,11 +653,7 @@ export function writeSystemWake(
   id: string,
   text: string,
   system: Record<string, unknown>,
-  /**
-   * 1 = only the NEXT fresh container's first poll sees it (the dying-container
-   * accountability case). 0 = the container that is running RIGHT NOW picks it
-   * up on its next poll — what a live-container notice such as OOM needs.
-   */
+  /** 1 = only the NEXT fresh container's first poll sees it; 0 = the running container sees it on its next poll. */
   onWake: 0 | 1 = 1,
 ): boolean {
   return mailbox.insertDeferredMessageWithContextIfNew({
@@ -908,39 +670,19 @@ export function writeSystemWake(
   });
 }
 
-// Failed-provider self-heal (S11), running-container SLA (S14) and the OOM /
-// memory-pressure notice (S16) moved to
-// `src/modules/sweep-container-health/index.ts`.
-//
-// `providerFailedTicks` itself stays here, exported, rather than moving with
-// the rest of S11's body: the driver's own `!alive` cleanup below must stay
-// SYNCHRONOUS (a dynamic import there proved to add an await suspension
-// point the pre-seam code never had, letting a concurrent wake observe a
-// stale `alive=false` across the gap). The map's
-// SEMANTICS — the two-tick debounce, read and written only by
-// `observeProviderStatus`/`decideProviderHeal` — belong entirely to S11 in
-// `sweep-container-health`; that module imports this export directly
-// (module → host-sweep.js, the same direction every family already uses for
-// `SWEEP_DUTY_INVENTORY` — no cycle, no TDZ).
+// Stays here, not in sweep-container-health: the driver's `!alive` cleanup below must stay synchronous (a dynamic
+// import there adds an await a concurrent wake can observe). Its semantics belong to that module, which imports it.
 export const providerFailedTicks = new Map<string, number>();
 
 /**
- * Run one short mailbox session for a session id.
- *
- * Threaded through the sweep duties that must OPEN AND CLOSE a session around
- * a `killContainer` call rather than hold one across it (invariant I-3):
- * a kill respawns through `onExit` and clears the session's status through
- * `delivery.ts`, and both of those open a mailbox session on this same key.
- * Production passes `withExistingMailboxSession`; a test passes a runner over
- * its own in-memory handles.
- *
- * Resolves `undefined` when the mailbox is gone — the read-path contract.
+ * One short mailbox session, for duties that must open and close a session around `killContainer` rather than
+ * hold one across it (I-3). Resolves `undefined` when the mailbox is gone.
  */
 export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T | Promise<T>) => Promise<T | undefined>;
 
 let running = false;
 
-/** A tick past this is stuck on an await that may never settle; it is abandoned. 2× the worst live tick (7m30s). */
+/** A tick past this is stuck on an await that may never settle; it is abandoned. 2x the worst live tick. */
 export const SWEEP_TICK_STALL_MS = 15 * 60_000;
 /** Bumped at each tick start and on abandonment; a tick compares it at its checkpoints. */
 let tickGeneration = 0;
@@ -953,10 +695,7 @@ const sessionsRunning = new Map<string, number>(); // session → the generation
 export function startHostSweep(): void {
   if (running) return;
   running = true;
-  // sweep() wraps its own body in try/catch and always reschedules itself
-  // (see the comment above sweep()), so its returned promise never rejects —
-  // void is safe here. The quiet-cache warm runs once per start, at the head
-  // of the first tick, before anything writes the map (see sweep()).
+  // sweep() always reschedules itself and never rejects, so void is safe. The quiet-cache warm runs once per start.
   quietCacheWarmed = false;
   void sweep();
 }
@@ -966,14 +705,8 @@ export function stopHostSweep(): void {
 }
 
 /**
- * The timer chain, and the only thing that must never be skipped. An unguarded
- * throw anywhere in the tick used to reject sweep()'s promise, so the
- * reschedule never ran while `running` stayed true — making startHostSweep() a
- * permanent no-op. log.ts swallows the unhandledRejection, so the process did
- * not crash, systemd never restarted it, the sentinel's `service` vital stayed
- * green, and a dead sweep emits no tick-timing lines so the `sweep` vital saw
- * zero slow ticks. Live: 2026-08-06 ~22:20 ET. Rescheduling is unconditional
- * for the same reason it always was: nothing else re-arms this.
+ * The timer chain must never be skipped: a rejected sweep() promise once left the reschedule unrun while
+ * `running` stayed true, silently killing the sweep with every health signal green. Rescheduling is unconditional.
  */
 let quietCacheWarmed = false;
 
@@ -982,10 +715,7 @@ async function sweep(): Promise<void> {
   let stallTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     const tick = (async () => {
-      // Once, before the first tick's body, never per tick: a warm that ran
-      // every tick would be a second source of truth racing the map the tick is
-      // writing. It is awaited here (the warm reads the central DB through the
-      // async driver) so the first tick starts from the warmed map.
+      // Once per start, before the first tick: a per-tick warm would race the map the tick writes.
       if (!quietCacheWarmed) {
         quietCacheWarmed = true;
         await warmQuietSessionCache();
@@ -993,9 +723,8 @@ async function sweep(): Promise<void> {
       await sweepOnce(generation);
       return 'done' as const;
     })();
-    // A throw is caught below; a tick that never settles held the reschedule
-    // forever (dead ~7h on 2026-09-11, every vital green). Race it
-    // against the stall bound; a loser that resumes stops at its checkpoints.
+    // A tick that never settles would hold the reschedule forever: race it against the stall bound; a loser that
+    // resumes stops at its checkpoints.
     const stalled = new Promise<'stalled'>((resolve) => {
       stallTimer = setTimeout(() => resolve('stalled'), SWEEP_TICK_STALL_MS);
     });
@@ -1022,11 +751,7 @@ function abandonStalledTick(generation: number): void {
   });
 }
 
-/**
- * Last completed tick, for the acceptance cases that assert on the FIRST tick
- * after a restart. `Host sweep tick timing` only logs above 1 s, so a spy on it
- * cannot see a fast tick; `ticks` is what lets a test await one.
- */
+/** Last completed tick, so tests can await a fast tick that `Host sweep tick timing` (> 1 s only) never logs. */
 const lastTickStats = {
   ticks: 0,
   sweptSessions: 0,
@@ -1036,12 +761,7 @@ const lastTickStats = {
   spawnWaitMs: 0,
 };
 
-/**
- * This tick's wake instrumentation, reset at the top of every tick and
- * copied into `lastTickStats` at the end. Module-level rather than a field on
- * `SweepTickContext` because the per-session contexts are built one at a time
- * and every one of them has to add into the same tick total.
- */
+/** This tick's wake instrumentation; module-level because every per-session context adds into one total. */
 const tickWakeStats = { wakesStarted: 0, spawnsAwaited: 0, spawnWaitMs: 0 };
 
 /** Test-only: the counters from the last completed tick. */
@@ -1057,10 +777,7 @@ export function _lastSweepTickStatsForTesting(): {
 }
 
 async function sweepOnce(generation: number): Promise<void> {
-  // Stall attribution: the sweep is the main 60s-periodic bulk worker, so a
-  // slow tick is the first suspect whenever the event-loop stall detector
-  // fires. One line per slow tick, with the per-session share, convicts or
-  // clears it from the log alone.
+  // One timing line per slow tick, with the per-session share, to convict or clear the sweep in stall hunts.
   const sweepStartedAtMs = Date.now();
   tickWakeStats.wakesStarted = 0;
   tickWakeStats.spawnsAwaited = 0;
@@ -1068,9 +785,7 @@ async function sweepOnce(generation: number): Promise<void> {
   let sweptSessions = 0;
   if (!running) return;
 
-  // ONE context per tick. `sessions` is the single getActiveSessions() scan
-  // every duty shares; `activeContainerSessionIds` is read lazily so it is
-  // still taken at the point in the tick the duty that wants it runs.
+  // One context per tick; `activeContainerSessionIds` is read lazily, at the point the duty that wants it runs.
   let sessions: Session[] | undefined;
   let activeContainerSessionIds: ReadonlySet<string> | undefined;
   const tick: SweepTickContext = {
@@ -1096,25 +811,12 @@ async function sweepOnce(generation: number): Promise<void> {
   }
   if (generation !== tickGeneration) return; // abandoned: reset nothing the live tick has recorded
 
-  // Isolate failures per-session — a throw from one stuck session's
-  // cleanup must not skip every later session for the rest of the tick.
-  //
-  // Quiet cache: iterating EVERY active session ever created (3k+ rows of
-  // synchronous SQLite) blocked the event loop 4-5s per tick — the residual
-  // stall source after the recovery-storm fix. A session the previous sweep
-  // found fully quiet (no container, nothing due, no continuation) is skipped
-  // until its next scheduled row is due or the backoff cap, whichever is
-  // sooner. Any new inbound bumps `last_active`, which invalidates the mark —
-  // so fresh activity is swept on the very next tick, and future wakes can
-  // never be skipped past their due time.
+  // Failures are isolated per session. Quiet cache: a session the previous sweep found fully quiet is skipped
+  // until its next scheduled row is due or the backoff cap; any new inbound bumps `last_active`, invalidating it.
   const sessionsStartedAtMs = Date.now();
   unreadableSessions = [];
   let skippedQuiet = 0;
-  // Marks taken THIS tick, flushed once at the end. One statement per tick,
-  // never one per session, and only on the transition into quiet — a re-write
-  // on every confirming tick would be ~840 UPDATEs a minute, a new cost rather
-  // than a saving. A session already holding a valid mark `continue`s above and
-  // never reaches the write.
+  // Marks taken this tick, flushed once at the end, and only on the transition into quiet.
   const newQuietMarks: QuietSessionMark[] = [];
   for (const session of sessions) {
     if (generation !== tickGeneration) return; // abandoned: sweep no further
@@ -1131,10 +833,7 @@ async function sweepOnce(generation: number): Promise<void> {
       if (generation !== tickGeneration) return; // abandoned: a verdict from phases it skipped
       if (quietUntil !== null) {
         quietSessions.set(session.id, { skipUntilMs: quietUntil, lastActive: session.last_active });
-        // Carry the basis: the flush happens after the whole fan-out, and
-        // ingress during one of the yields below can move `last_active` (and
-        // clear the column) in between. The write compares this and no-ops on
-        // the rows that moved, so a stale expiry is never put back.
+        // Carry the basis: ingress during a yield can move `last_active`; the flush no-ops on rows that moved.
         newQuietMarks.push({
           sessionId: session.id,
           quietUntil: new Date(quietUntil).toISOString(),
@@ -1143,60 +842,37 @@ async function sweepOnce(generation: number): Promise<void> {
       }
       sweptSessions++;
     } catch (err) {
-      // A duty threw and sweepSession rethrew it: the mailbox is fine and the
-      // work is still due, so this session is NOT quiet-cached and the next
-      // 60s tick retries it. Distinct from 'Host sweep mailbox unopenable',
-      // which is the session the host could not get into at all. `duty` and
-      // `window` name which body and which opening boundary produced it, so a
-      // family PR's post-deploy check filters on its own duty names rather
-      // than counting a shared string.
+      // A duty threw: the work is still due, so NOT quiet-cached and retried next tick. Distinct from 'Host sweep
+      // mailbox unopenable'.
       log.error('Host sweep duty failed', { err, sessionId: session.id, ...dutyFailureFields(err) });
     } finally {
       sessionsRunning.delete(session.id);
     }
-    // Yield to the macrotask queue so a large sweep batch cannot trip the
-    // event-loop stall detector even on a cold tick.
-    // Yield after EVERY swept session, not every 25. A swept session costs
-    // up to ~1.5s of synchronous SQLite/filesystem work, so a 10-session
-    // batch between yields was one contiguous 15s event-loop freeze — the
-    // dominant source of the residual 5-8s stall detections (and delivery
-    // latency) after the recovery-storm fixes. Per-session setImmediate
-    // overhead is microseconds against that cost.
+    // Yield after EVERY swept session: one can cost ~1.5s of synchronous SQLite/fs work.
     await sweepYield();
   }
   if (generation !== tickGeneration) return; // abandoned: persist nothing against reset state
-  // Bound the cache to sessions that still exist (closed sessions drop out
-  // of getActiveSessions and would otherwise accumulate forever).
+  // Bound the cache to sessions that still exist.
   if (quietSessions.size > sessions.length + 500) {
     const live = new Set(sessions.map((s) => s.id));
     for (const id of quietSessions.keys()) if (!live.has(id)) quietSessions.delete(id);
   }
-  // "I cannot read this session" is not "this session is quiet". `skipUnreadable`
-  // returns the same backoff, and in-process that is right — but its causes are
-  // PROCESS-local (descriptor exhaustion, a hot-journal recovery this process
-  // failed, an agent group this process could not resolve), and a restart is
-  // exactly the event that can clear them. Persisting that mark would carry a
-  // dead process's verdict into a fresh one and hold the session for a further
-  // backoff window. Only the W5 quiet hint is durable.
+  // An unreadable mark is not persisted: its causes are process-local and a restart can clear them. Only the W5
+  // quiet hint is durable.
   const unreadableIds = new Set(unreadableSessions.map((u) => u.sessionId));
   const durableQuietMarks = newQuietMarks.filter((mark) => !unreadableIds.has(mark.sessionId));
   if (durableQuietMarks.length > 0) {
     try {
       await persistQuietSessionMarks(durableQuietMarks);
     } catch (err) {
-      // Advisory, and it degrades DOWNWARD on purpose: the in-memory marks go
-      // with the failed write, so the next tick sweeps these sessions instead
-      // of skipping them on a mark no restart could recover. Worst case is the
-      // pre-cache cold sweep, loudly — never a session held past due work.
+      // Degrades downward on purpose: the next tick sweeps these sessions rather than trusting a lost mark.
       log.warn('Host sweep quiet mark persistence failed', { count: durableQuietMarks.length, err });
       for (const mark of durableQuietMarks) quietSessions.delete(mark.sessionId);
     }
   }
   const sessionsMs = Date.now() - sessionsStartedAtMs;
   lastSkippedQuiet = skippedQuiet;
-  // One line per tick, never one per session: this loop runs every 60s over
-  // ~1600 sessions. Live: 24 session dirs have no inbound.db and were skipped
-  // in total silence, indistinguishable from healthy quiet.
+  // One line per tick, never per session.
   if (unreadableSessions.length > 0) {
     log.warn('Host sweep: sessions skipped as UNREADABLE (not quiet)', {
       count: unreadableSessions.length,
@@ -1217,9 +893,7 @@ async function sweepOnce(generation: number): Promise<void> {
 
   const sweepMs = Date.now() - sweepStartedAtMs;
   if (sweepMs >= 1_000) {
-    // `wakesStarted`/`spawnsAwaited`/`spawnWaitMs` are what make `sessionsMs`
-    // readable: with spawnsAwaited 0 and spawnWaitMs near zero,
-    // sessionsMs is the cost of walking the sessions and nothing else.
+    // With spawnsAwaited 0, sessionsMs is the cost of walking the sessions and nothing else.
     log.info('Host sweep tick timing', {
       sweepMs,
       sessionsMs,
@@ -1232,11 +906,7 @@ async function sweepOnce(generation: number): Promise<void> {
   }
 }
 
-/**
- * Test-only entry point for one whole tick, without the timer chain. Drives the
- * registry exactly as production does — the acceptance cases in
- * `host-sweep-registry.test.ts` need the driver, not the 60s `setTimeout`.
- */
+/** Test-only: one whole tick through the registry, without the timer chain. */
 export async function _sweepOnceForTesting(): Promise<void> {
   const wasRunning = running;
   running = true;
@@ -1247,7 +917,6 @@ export async function _sweepOnceForTesting(): Promise<void> {
   }
 }
 
-/** Most recent messages_in timestamp for a session, or null if it has none. */
 function getLastInboundAtMs(mailbox: NanoclawMailboxSession): number | null {
   const timestamp = mailbox.latestInboundTimestamp();
   if (timestamp === null) return null;
@@ -1255,7 +924,6 @@ function getLastInboundAtMs(mailbox: NanoclawMailboxSession): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-/** Most recent messages_out timestamp for a session, or null if it has never produced output. */
 function getLastOutboundAtMs(mailbox: NanoclawMailboxSession): number | null {
   const timestamp = mailbox.latestOutboundTimestamp();
   if (timestamp === null) return null;
@@ -1263,11 +931,7 @@ function getLastOutboundAtMs(mailbox: NanoclawMailboxSession): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
-/**
- * "I cannot read this session" is not "this session is quiet", but both took
- * the same silent quiet-until return. Same backoff — a session the host cannot
- * open has nothing to sweep — but it is now counted so the tick can say so.
- */
+/** Unreadable sessions take the quiet backoff too, but are counted so the tick can report them. */
 let unreadableSessions: { sessionId: string; reason: string }[] = [];
 function skipUnreadable(sessionId: string, reason: string): number {
   unreadableSessions.push({ sessionId, reason });
@@ -1275,17 +939,15 @@ function skipUnreadable(sessionId: string, reason: string): number {
 }
 
 /**
- * Sweep one session. Returns a quiet-until timestamp (ms) when the session is
- * fully quiet and safe to skip until then, or null when it must stay hot.
+ * Sweep one session. Returns a quiet-until timestamp (ms) when the session is fully quiet and safe to skip until
+ * then, or null when it must stay hot.
  */
 async function sweepSession(session: Session, tick: SweepTickContext): Promise<number | null> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return skipUnreadable(session.id, 'agent group missing');
 
-  // Every duty below runs inside one of these — a short session, opened and
-  // closed, never held across a wake or a kill (invariant I-3). Reads never
-  // provision (invariant I-4): a session whose mailbox is gone resolves
-  // undefined and is counted as unreadable rather than silently recreated.
+  // Every duty runs inside one of these short sessions, never held across a wake or kill (I-3). Reads never
+  // provision (I-4): a vanished mailbox resolves undefined and counts as unreadable.
   const baseRun: SessionRunner = (action) => withExistingMailboxSession(agentGroup.id, session.id, action);
 
   // `session:plan` fills this in; every later phase reads it.
@@ -1347,13 +1009,8 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
     },
   };
 
-  // ── W1: session:plan ───────────────────────────────────────────────────────
-  // Distinguishes "a duty threw" from "the mailbox would not open". The INBOUND
-  // open happens before the action body, so this flag alone settles that one —
-  // but the OUTBOUND handle opens lazily, partway through the action, and by
-  // then the flag is already true. Position cannot classify that, so the funnel
-  // does: it raises SessionDbUnopenableError, which the catch routes to the
-  // backoff whatever this flag says.
+  // W1: session:plan. The flag separates "a duty threw" from "the inbound open failed"; a lazily opened outbound
+  // handle raises SessionDbUnopenableError instead, which the catch routes to the backoff.
   let enteredPlanSession = false;
   let planned: { ok: true } | undefined;
   try {
@@ -1369,62 +1026,36 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
       return { ok: true };
     });
   } catch (err) {
-    // A session that vanished under us is the ordinary steady state — counted,
-    // backed off, not logged as a fault.
+    // A vanished session is steady state: counted and backed off, not logged as a fault.
     if (err instanceof SessionDbMissingError) return skipUnreadable(session.id, 'session mailbox vanished');
-    // Present but unopenable: EACCES, descriptor exhaustion, a corrupt file, a
-    // failed hot-journal recovery. There is nothing to sweep until that
-    // changes, and retrying every 60s is what produced ~4k identical errors in
-    // the hot-journal incident — so this takes the backoff, with an error line
-    // so it is never silently filed as a quiet session. The error CLASS is what
-    // decides, not how far we got: a lazily-opened outbound handle fails after
-    // the duties have started and must still land here.
+    // Present but unopenable: nothing to sweep until that changes, and retrying every tick floods the log. Backoff
+    // with an error line. The error class decides, not how far we got.
     if (err instanceof SessionDbUnopenableError || !enteredPlanSession) {
       log.error('Host sweep mailbox unopenable', { err, sessionId: session.id, window: 'session:plan' });
       return skipUnreadable(session.id, `session mailbox unreadable: ${String(err)}`);
     }
-    // A DUTY threw — a transient SQLite lock during task admission, say. The
-    // mailbox is fine and the work is still due, so this must retry on the next
-    // 60s tick, exactly as it did before the seam. Quiet-caching it would hold
-    // an already-due scheduled task or recovery wake for the full 30-minute
-    // backoff, and `last_active` does not move on failure, so nothing would
-    // clear it early. `sweepOnce`'s per-session catch logs and isolates it.
+    // A duty threw: the work is still due, so retry next tick. Quiet-caching would hold due work for the full
+    // backoff, and `last_active` does not move on failure to clear it.
     throw err;
   }
-  // The seam is the ONLY gate on "does this session have a mailbox". There is
-  // deliberately no `fs.existsSync` pre-check beside it: two answers to that
-  // question drift, and the one that matters is the implementation's own. It
-  // answers on inbound.db alone, so a never-woken session with no outbound.db
-  // is swept normally (its outbound reads answer empty) — only a session with
-  // no inbound.db at all is skipped, and a read never re-creates one (I-4).
+  // The seam is the only gate on "does this session have a mailbox" (no parallel `fs.existsSync`): it answers on
+  // inbound.db alone, so a never-woken session with no outbound.db is still swept.
   if (!planned) return skipUnreadable(session.id, 'no session mailbox');
 
   try {
-    // ── W2: session:wake — NOTHING open ──────────────────────────────────────
-    // Deliberately outside any mailbox session: the spawn path reads this
-    // session's repository ingress fence through a session of its own, and the
-    // recovery admission writes through one too (invariant I-3).
+    // W2: session:wake, NOTHING open: the spawn path and recovery admission open sessions of their own (I-3).
     window = 'session:wake';
     await runSessionPhase(ctx, 'session:wake');
 
     alive = isContainerRunning(session.id);
 
-    // ── W3: the driver's observe read ────────────────────────────────────────
-    // Machinery, not a duty: it feeds ctx.observed, which is what the
-    // session:health predicates consult. Skipped on the same iteration that
-    // just woke the container — it hasn't had a chance to clear stale
-    // processing_ack rows from a previous crash yet, and without this grace
-    // period stale claims cause an immediate spawn-kill loop. `hasOutbound`
-    // reproduces the pre-seam `outDb !== null` guard exactly.
+    // W3: the driver's observe read. Skipped on the iteration that just woke the container, which has not yet
+    // cleared stale processing_ack rows; reading them would cause an immediate spawn-kill loop.
     if (alive && !justWoke && plan.hasOutbound) {
       window = 'session:observe';
       observed =
         (await ctx.run((m) =>
-          // Machinery, but it reads the mailbox like a duty does, so it carries
-          // a duty identifier of its own. Without one, a throw from any of
-          // these four reads logged 'Host sweep duty failed' with no `duty` and
-          // no `window` at all — the field pair every family PR's post-deploy
-          // check filters on. The `driver:` prefix is not a registrable name.
+          // Carries its own duty identifier so a throw logs with `duty` and `window`.
           runDutyBody(DRIVER_OBSERVE_DUTY, 'session:observe', () => ({
             containerState: m.getContainerState(),
             processingClaimCount: m.getProcessingClaimRows().length,
@@ -1434,33 +1065,26 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
           })),
         )) ?? null;
 
-      // ── W4: session:health — EXCLUSIVE, nothing open ───────────────────────
+      // W4: session:health, EXCLUSIVE, nothing open.
       if (observed) {
         window = 'session:health';
         await runExclusiveSessionPhase(ctx, 'session:health');
       }
     }
 
-    // A container that is gone cannot be mid-failure. Clearing here stops a
-    // fresh container from inheriting the dead one's half-finished debounce and
-    // being killed on its first 'failed' observation. Synchronous, same as
-    // pre-seam: a dynamic import here would add an await suspension point on
-    // this branch that never existed before, letting a concurrent wake
-    // observe a stale `alive=false` across the gap.
+    // A gone container cannot be mid-failure: clear its debounce so a fresh container does not inherit it.
+    // Synchronous on purpose (see providerFailedTicks).
     if (!alive) providerFailedTicks.delete(session.id);
 
-    // ── W5: session:tail ─────────────────────────────────────────────────────
+    // W5: session:tail.
     window = 'session:tail';
     let quietUntil: number | null = null;
     const tail = await ctx.run(async (m): Promise<{ ok: true }> => {
       mailbox = m;
       try {
         await runSessionPhase(ctx, 'session:tail');
-        // Quiet-cache hint: nothing live here — no container, nothing due or
-        // admitted, no continuation. Safe to skip until the next scheduled row
-        // is due (never past it) or the backoff cap. New inbound invalidates
-        // via last_active in the sweep loop. Driver machinery, computed after
-        // the last phase.
+        // Quiet hint: no container, nothing due or admitted, no continuation. Skip until the next scheduled row
+        // (never past it) or the cap.
         if (plan.dueCount === 0 && plan.admittedTasks === 0 && !justWoke && plan.workContinuation === null && !alive) {
           const nextDue = m.getNextFutureProcessAfter();
           const cap = Date.now() + quietSessionBackoffMs(session.id);
@@ -1474,9 +1098,7 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
     });
     return tail ? quietUntil : null;
   } catch (err) {
-    // A later window's opener failed, or its mailbox vanished mid-tick. Already
-    // classified at the boundary; the session takes no quiet mark and is swept
-    // again on the next tick, exactly as it was before the seam.
+    // Already classified at the boundary; no quiet mark, swept again next tick.
     if (err instanceof SweepWindowAbort) return null;
     throw err;
   }
@@ -1484,11 +1106,7 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
 
 /** Test-only entry point for one session's sweep tick, over a one-session tick context. */
 export async function _sweepSessionForTesting(session: Session): Promise<number | null> {
-  // Seam 3: `SweepTickContext.sessions` is a SYNCHRONOUS getter that duties
-  // read inside a window, so the list cannot be fetched lazily behind an
-  // `await` any more. Resolved up front instead — which is what the real
-  // `sweepOnce` already does (`sessions = await getActiveSessions()` before it
-  // builds the tick), so this helper now matches production ordering.
+  // `SweepTickContext.sessions` is a synchronous getter, so resolve the list up front, as `sweepOnce` does.
   const sessions: Session[] = await getActiveSessions();
   let activeContainerSessionIds: ReadonlySet<string> | undefined;
   const tick: SweepTickContext = {
@@ -1503,26 +1121,8 @@ export async function _sweepSessionForTesting(session: Session): Promise<number 
   return sweepSession(session, tick);
 }
 
-// G64: the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
-// back-compat shims that used to live here are gone — callers use
-// storage-manager.ts's own exports (which already default `isContainerRunning`
-// and the sessions/threads roots) directly.
-
-// Running-container SLA (S14) and the OOM / memory-pressure notice (S16)
-// moved to src/modules/sweep-container-health/index.ts.
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The 37 duty names, 38 registrations — none of them here any more.
-//
-// Every duty this driver runs is registered by its own `src/modules/sweep-*`
-// module at import time (the modules barrel `src/modules/index.ts` is what
-// production loads). `SWEEP_DUTY_INVENTORY` above is the map from the inventory
-// id in plan.md §4.3 to the registered name, and it is the only place this file
-// names a duty. The built-in source stays registered and empty: it is part of
-// the registry's own contract — `_resetSweepRegistryForTesting()` replays every
-// recorded source, and `_unregisterSweepDutySourceForTesting` refuses this one
-// as not test-owned.
-// ─────────────────────────────────────────────────────────────────────────────
+// Every duty is registered by its own `src/modules/sweep-*` module. The built-in source stays registered and empty:
+// the test reset replays every recorded source and refuses to unregister this one.
 
 function registerBuiltInSweepDuties(): void {}
 

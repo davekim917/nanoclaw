@@ -10,21 +10,6 @@
  *
  * install_packages: update DB + rebuild image + kill container + on_wake.
  * add_mcp_server: update DB + kill container + on_wake.
- *
- * getContainerConfig/updateContainerConfigJson/updateContainerConfigScalars
- * (../../db/container-configs.js) below are generic DB persistence CRUD,
- * shared by every operationally-mutated container-config field (provider,
- * model, packages, mcp_servers, timezone, …) — they hold no MCP-specific
- * validation. The credential/URL/header/name invariants for a remote MCP
- * server all live one layer down, in `parseMcpServerConfig`,
- * `validateMcpServerName`, `isKnownRawSecret`, and `normalizeMcpHeaders`
- * (../../container-config.js) — the single primitive every one of those
- * rules is enforced in, called before any of the DB writes below ever run.
- * A server that reaches these DB writes has already had every header
- * validated as ByteString, deduplicated case-insensitively, and checked
- * against the OneCLI placeholder — this file only persists what
- * normalizeMcpHeaders already approved, and claims nothing about whether the
- * placeholder's underlying secret is actually assigned to this group.
  */
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
@@ -116,13 +101,8 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     );
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
-    // Best-effort: updateContainerConfigJson above (before this try block)
-    // already committed the package list. This handler is reached almost
-    // exclusively via approval-replay (reenterGuardedDeliveryAction) — an
-    // awaited rejection here would propagate to response-handler.ts's catch,
-    // which attempts its own fallback notify; if that ALSO fails, the
-    // approval row is never deleted and stays clickable, risking a second
-    // buildAgentGroupImage + killContainer for an already-updated config.
+    // Not awaited: a rejection here could leave the approval row clickable,
+    // risking a second rebuild for an already-committed package list.
     void Promise.resolve(
       notifyAgent(
         session,
@@ -148,9 +128,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     return;
   }
 
-  // Re-validate the approved payload before it reaches container.json. The
-  // request path already parsed it, but this is the last gate before a config
-  // the container will actually load, so it fails closed on its own.
+  // Re-validated here: the last gate before a config the container will load.
   const name = typeof payload.name === 'string' ? payload.name : '';
   if (!name) {
     await notifyAgent(session, 'add_mcp_server approved but server name is missing.').catch((err) =>
@@ -179,21 +157,13 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     return;
   }
 
-  // Dual-write, exactly as `ncl groups config add-mcp-server` does: the FILE
-  // is what the spawn path reads (`readContainerConfig`), the DB column is the
-  // projection `groups config get` reports and the next file-to-DB backfill
-  // would otherwise overwrite. Writing only the DB restarted the container
-  // without the server the admin just approved.
-  // Same refusal as the CLI door: an approved add_mcp_server naming a
-  // plugin-owned server must not overwrite the plugin's entry or drop its
-  // provenance marker. Checked before either store is touched.
+  // Dual-write as the CLI does: the spawn reads the FILE, `groups config get`
+  // reads the DB. A plugin-owned server is refused before either is touched.
   try {
     assertMcpServerNotPluginOwned(readContainerConfig(agentGroup.folder).mcpServers?.[name], name, agentGroup.folder);
     // eslint-disable-next-line no-catch-all/no-catch-all -- the refusal is the outcome; the notification is best-effort
   } catch (err) {
-    // Best-effort like the invalid-payload branch above: a rejected notify must
-    // not throw out of the approval handler, or the refused approval stays
-    // pending and re-clickable.
+    // A rejected notify must not throw, or the refused approval stays re-clickable.
     await notifyAgent(session, `add_mcp_server refused: ${err instanceof Error ? err.message : String(err)}`).catch(
       (notifyErr) =>
         log.warn('Failed to notify agent about refused add_mcp_server approval', {
@@ -210,11 +180,8 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   });
   await updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
-  // Declaring the placeholder wires the header; it does not grant the secret.
-  // Keyed on the placeholder VALUE, not on headers being present at all — a
-  // server carrying only `Content-Type` authenticates with nothing, and
-  // telling its operator to go assign a vault secret would send them after a
-  // credential that does not exist.
+  // Keyed on the placeholder VALUE, not header presence: a server with only
+  // `Content-Type` has no credential to assign.
   const needsCredential =
     serverConfig.type === 'http' && Object.values(serverConfig.headers ?? {}).some(isOneCliPlaceholder);
 
@@ -226,12 +193,6 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     channelType: 'agent',
     threadId: null,
     content: JSON.stringify({
-      // A remote server declared with a placeholder header still needs the
-      // matching vault secret ASSIGNED to this group before the gateway can
-      // substitute it. Auto-created agents default to `selective` mode with
-      // nothing assigned, so the symptom is a 401 from an API whose
-      // credential is in the vault — name the remedy here rather than leave
-      // the agent to rediscover it (CLAUDE.md, Secrets / Credentials / OneCLI).
       text:
         `MCP server "${name}" added. Verify it's available (e.g. list your tools) and report the result to the user.` +
         (needsCredential
@@ -259,13 +220,8 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
 }
 
 /**
- * Apply a model (+ optional effort) change to an agent group's container config
- * and restart the container. Model changes do NOT require admin approval — the
- * agent's `change_model` tool calls this DIRECTLY (see request.ts); the
- * operator deny list is the only guardrail (re-checked here as defense-in-depth,
- * since a denial may land between an in-flight request and apply). Mirrors how
- * a user changes models with the no-approval `-m` flag. `notify` surfaces
- * failures to the caller's audience (the agent for the direct path).
+ * No admin approval: the operator deny list is the only guardrail, re-checked
+ * here because a denial may land between request and apply.
  */
 export async function performModelChange(
   session: Session,
@@ -289,11 +245,8 @@ export async function performModelChange(
     return;
   }
 
-  // Opencode slugs MUST be provider-prefixed (`<provider>/<id>`) — the host
-  // derives the routing provider from the prefix. A bare slug (e.g.
-  // `kimi-k2.7-code`) would persist and restart into a container that can't
-  // resolve the model. The `-m` flag path validates this; mirror it here since
-  // change_model now applies with no approval checkpoint. Same check, one source.
+  // Opencode slugs MUST be provider-prefixed: the host derives the routing
+  // provider from the prefix, and a bare slug restarts into an unresolvable model.
   if (config.provider === 'opencode' && !isOpenCodeModelSlug(slug)) {
     await notify(
       `change_model failed: "${slug}" is not a valid opencode slug — it must be provider-prefixed ` +
@@ -312,8 +265,6 @@ export async function performModelChange(
     return;
   }
 
-  // Update both model and (optionally) effort scalars in container_configs.
-  // Effort is applied alongside so the agent gets a coherent next-spawn state.
   const updates: Parameters<typeof updateContainerConfigScalars>[1] = { model: slug };
   if (effort) updates.effort = effort;
   await updateContainerConfigScalars(agentGroup.id, updates);
@@ -358,11 +309,7 @@ export async function performModelChange(
   );
 }
 
-/**
- * Legacy approval-path wrapper, retained so any change_model approval record
- * still in flight at deploy time applies cleanly. New requests no longer create
- * approvals (request.ts calls performModelChange directly).
- */
+/** Approval-path wrapper for change_model approval rows; new requests do not create them. */
 export const applyChangeModel: ApprovalHandler = async ({ session, payload, userId, notify }) => {
   await performModelChange(session, payload.slug as string, payload.effort as string | null, notify, { userId });
 };

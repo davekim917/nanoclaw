@@ -52,8 +52,7 @@ async function requireConfiguredGroup(id: string): Promise<AgentGroup> {
   return group;
 }
 
-// Dual-write packages: file (canonical, survives backfill at host
-// restart) + DB (cache, read by buildAgentGroupImage at rebuild time).
+// Dual-write: the file is canonical (survives the restart backfill); the DB copy is what the image build reads.
 async function editPackages(
   args: Record<string, unknown>,
   edit: (list: string[], pkg: string) => string[],
@@ -108,9 +107,8 @@ function parseTimezoneFlag(value: unknown): string | null | undefined {
 
 /** Deserialize JSON columns for display. */
 /**
- * One parse for both doors — a group's container.json and the fleet defaults —
- * so `--fleet` cannot end up with a looser intake than `--id` (the URL
- * credential refusals live in `parseMcpServerConfig`).
+ * One parse for both a group's container.json and the fleet defaults, so `--fleet` cannot get a looser intake than
+ * `--id`.
  */
 function parseMcpServerEntry(args: Record<string, unknown>): McpServerConfig {
   return parseMcpServerConfig({
@@ -143,15 +141,10 @@ function presentConfig(row: ContainerConfigRow, folder?: string): Record<string,
     timezone: row.timezone,
     resources: fileConfig?.resources ?? null,
     effective_resources: fileConfig ? resolveContainerResources(fileConfig.resources) : null,
-    // Privilege overrides are the whole point of auditing this: a config that
-    // narrows capDrop, adds a capability back, or turns off no-new-privileges
-    // must be visible here, not only in the spawn's docker args.
+    // Privilege overrides must be visible here, not only in the spawn's docker args.
     security: fileConfig?.security ?? null,
     effective_security: fileConfig ? resolveContainerSecurity(fileConfig.security) : null,
-    // Stored AND effective, like resources/security above: the stored value is
-    // `false` only for a group that explicitly opted out, and null otherwise,
-    // so an operator auditing `--status-subtext off` can tell a deliberate
-    // opt-out from a group riding the default.
+    // Stored and effective: stored `false` is a deliberate opt-out, null rides the default.
     status_subtext: fileConfig?.statusSubtext ?? null,
     effective_status_subtext: fileConfig ? effectiveStatusSubtext(fileConfig) : null,
     updated_at: row.updated_at,
@@ -222,10 +215,7 @@ registerResource({
       handler: async (args) => {
         const timezone = parseTimezoneFlag(args.timezone) ?? undefined;
         if (args.template) {
-          // `report` names every plugin component that was skipped (a
-          // non-conforming skill, an invalid server, an ignored manifest field).
-          // Surfaced to the operator who ran the stamp, not only logged; the
-          // result shape is unchanged when the plugin was clean.
+          // `report` names every skipped plugin component, surfaced to the operator, not only logged.
           const { group: stamped, report } = await createAgentFromTemplate(String(args.template), {
             name: args.name ? String(args.name) : undefined,
             timezone,
@@ -237,14 +227,11 @@ registerResource({
         const name = (args.name as string) ?? folder;
         const existing = await getAgentGroupByFolder(folder);
         if (existing) {
-          initGroupFilesystem(existing); // ensure a reused group is fully configured too (idempotent; also repairs a missing workspace folder)
+          initGroupFilesystem(existing); // Idempotent; also repairs a missing workspace folder.
           return existing;
         }
-        // A folder on disk with no claiming DB row is deleted-group residue
-        // (delete never removes groups/<folder>/) or an operator-placed dir —
-        // minting a new id over it would silently re-scope the old group's
-        // data under a new identity. Checked before the grammar validation
-        // below on purpose (see that comment).
+        // A folder on disk with no claiming row is deleted-group residue or operator-placed; minting a new id over it
+        // would re-scope the old data under a new identity.
         if (groupFolderExistsOnDisk(folder)) {
           throw new Error(
             `group folder 'groups/${folder}' already exists on disk but no agent group claims it — ` +
@@ -252,22 +239,13 @@ registerResource({
               `adopt the old group's data under a new identity. Move or remove the folder, or pick a different --folder.`,
           );
         }
-        // Fresh-create branch only, and after both the lookup above and the
-        // on-disk probe say the folder is genuinely absent — validating
-        // earlier would refuse to reuse a LIVE group whose folder predates
-        // the current grammar (accepted by an older bare-create path),
-        // breaking documented idempotence on --folder for it. The template path validates through
-        // createAgentFromTemplate; the bare path used to validate nowhere for
-        // a truly fresh create, minting folders the runtime label grammar
-        // refuses at every spawn.
+        // Validated only on a truly fresh create: validating earlier would refuse to reuse a live group whose folder
+        // predates the current grammar.
         assertValidGroupFolder(folder);
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
-        // `getAgentGroupByFolder` yields (async driver), so two concurrent
-        // `groups create` calls for one folder can both miss and both insert
-        // on the UNIQUE folder key. This operation is documented idempotent on
-        // --folder, so the loser adopts the winner and provisions it exactly as
-        // the existing-row branch above does — both callers return ok, one row.
+        // The lookup yields, so two concurrent creates for one folder can both insert; the loser adopts the winner
+        // and provisions it like the existing-row branch.
         const { row: adopted, created } = await insertOrAdopt(group, createAgentGroup, () =>
           getAgentGroupByFolder(folder),
         );
@@ -284,14 +262,8 @@ registerResource({
         // path. Mirrors what `setup/register.ts` does after creating an agent
         // group via the setup flow.
         initGroupFilesystem(group);
-        // `initGroupFilesystem` deliberately does NOT insert the config row —
-        // its caller in the create-agent flow runs it before the agent_groups
-        // insert, where the FK would fail (see the note in group-init.ts). The
-        // row exists by here only because the insert above already ran, so
-        // stamp it explicitly. Idempotent (INSERT OR IGNORE), and without it
-        // the scalar write below silently updates zero rows and the group's
-        // scheduling keeps following the install timezone until the next host
-        // startup backfill.
+        // `initGroupFilesystem` does not insert the config row (its create-agent caller runs before the agent_groups
+        // insert, where the FK would fail), so stamp it here; otherwise the timezone write below updates zero rows.
         await ensureContainerConfig(id);
         if (timezone) {
           await updateContainerConfigScalars(id, { timezone });
@@ -331,36 +303,16 @@ registerResource({
 
         const db = getDb();
 
-        // FK-ordered cascade. One central transaction (`centralTransaction`,
-        // plan §4.4) — the driver rolls back the whole thing if any statement
-        // throws (e.g. an FK constraint we missed), so the central DB stays
-        // consistent. The driver opens it IMMEDIATE, so a parallel INSERT into
-        // agent_groups between the sibling-refuse check and the dependent
-        // DELETEs can't slip through and surface as a FK error. The closure is
-        // DB-only: driver statements, awaited in sequence.
-        //
-        // The `removed` counts are sourced from each DELETE's `changes` so
-        // they describe exactly what the transaction did, not a separate
-        // pre-flight snapshot.
+        // FK-ordered cascade in one IMMEDIATE central transaction, so a parallel insert cannot slip in between the
+        // sibling check and the DELETEs. `removed` counts come from each DELETE's `changes`.
         const cascade = async (groupId: string) => {
-          // The AUTHORITATIVE existence check — repeated here, inside the
-          // transaction, because the awaited one above can go stale between
-          // two overlapping deletes for the same id. Without this, the
-          // second caller runs the whole cascade below against a row that's
-          // already gone: every DELETE matches 0 rows, and the handler would
-          // return `{ deleted: id, removed: {...all zeros} }` as if it had
-          // succeeded. The driver opens the transaction IMMEDIATE, so the
-          // writer lock is held by the time this runs and nothing can delete
-          // the row out from under this check before the DELETEs run.
+          // The AUTHORITATIVE existence check: the awaited one above can go stale between two overlapping deletes,
+          // and the second would otherwise report success with all-zero counts.
           if (!(await db.get('SELECT 1 FROM agent_groups WHERE id = ?', groupId))) {
             throw new Error(`group not found: ${groupId}`);
           }
-          // Pre-flight: refuse to delete a paired sibling. A workgroup is the
-          // data-pool boundary (CLAUDE.md, docs/workgroups.md) — deleting the
-          // seed leaves the twin with a dangling workgroup_id, which after
-          // any later workgroups-row cleanup silently falls through to
-          // per-agent store = amnesia. Force the operator to unpair (set
-          // sibling workgroup_id = NULL) or migrate the twin before retrying.
+          // Refuse to delete a paired sibling: the survivor would keep a dangling workgroup_id and eventually lose
+          // its shared store. The operator must unpair or migrate it first.
           let workgroupIdToCleanup: string | null = null;
           if (hasWorkgroups) {
             const ag = await db.get<{ workgroup_id: string | null }>(
@@ -416,21 +368,15 @@ registerResource({
               groupId,
             )
           ).changes;
-          // The ncl execution ledger (src/cli/request-ledger.ts) retains its
-          // newest claim per session on a terminal signal, not a clock, so a
-          // deleted session's claim would otherwise never expire. Must run
-          // before the sessions delete below — it resolves them by subquery.
+          // The ncl ledger retains a claim per session on a terminal signal, not a clock, so it would never expire.
+          // Runs before the sessions delete, which its subquery needs.
           counts.cli_request_executions = (
             await db.run(
               'DELETE FROM cli_request_executions WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
               groupId,
             )
           ).changes;
-          // Delivery retry counts (migration 071) are keyed to the session and
-          // have no cascading foreign key. Nothing clears an orphan afterwards:
-          // the row is only ever cleared by a delivery loop for a session that
-          // no longer exists. Must run before the sessions delete below — it
-          // resolves them by subquery.
+          // No cascading FK and nothing else clears these. Runs before the sessions delete, which its subquery needs.
           counts.delivery_attempts = (
             await db.run(
               'DELETE FROM delivery_attempts WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
@@ -466,10 +412,7 @@ registerResource({
             await db.run('DELETE FROM container_configs WHERE agent_group_id = ?', groupId)
           ).changes;
           await db.run('DELETE FROM agent_groups WHERE id = ?', groupId);
-          // Clean up the now-orphan workgroup row (only set when no siblings
-          // existed at pre-flight; the sibling-refuse path above never reaches
-          // this point). Done last so the FK from agent_groups.workgroup_id is
-          // already gone.
+          // The orphan workgroup row goes last, after the agent_groups FK to it is gone.
           if (workgroupIdToCleanup) {
             counts.workgroups = (await db.run('DELETE FROM workgroups WHERE id = ?', workgroupIdToCleanup)).changes;
           }
@@ -524,8 +467,7 @@ registerResource({
                   }
                 }
               : undefined,
-            // `--message` is what makes this a restart rather than a stop, on
-            // the durable row as well as in process memory.
+            // `--message` is what makes this a restart rather than a stop, durably as well as in memory.
             message ? 'respawn_after_stop' : 'stop',
           );
           return { restarted: 1, rebuilt: !!args.rebuild };
@@ -589,9 +531,8 @@ registerResource({
         if (args.provider !== undefined) updates.provider = args.provider as string;
         const timezone = parseTimezoneFlag(args.timezone);
         if (timezone !== undefined) updates.timezone = timezone;
-        // Empty is an explicit clear, mirroring --timezone "". A group that
-        // matches the provider default must not retain a redundant per-group
-        // pin: that would silently defeat a later fleet-wide default change.
+        // Empty is an explicit clear. A group matching the provider default must not keep a redundant pin that would
+        // silently defeat a later fleet-wide default change.
         if (args.model !== undefined) updates.model = String(args.model) || null;
         if (args.effort !== undefined) updates.effort = String(args.effort) || null;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
@@ -606,11 +547,7 @@ registerResource({
           updates.cli_scope = scope;
         }
 
-        // container.json-only, no DB projection: the flag is read by the
-        // in-container runner and by nothing on the host, so a column in
-        // `container_configs` — whose job is the `-m`/`-e` flag vocabulary,
-        // task-pin validation and image builds — would be a second copy with
-        // no reader.
+        // container.json only: only the in-container runner reads it, so a DB column would be a copy with no reader.
         const statusSubtextArg = args['status-subtext'] ?? args.status_subtext;
         let statusSubtext: boolean | undefined;
         if (statusSubtextArg !== undefined) {
@@ -640,11 +577,8 @@ registerResource({
           );
         }
 
-        // Model deny enforcement: when --model is set, reject if the (provider,
-        // slug) pair is in denied_models. Host can't tell whether a model is
-        // ACTUALLY reachable (that depends on container-side opencode CLI +
-        // auth.json), but it CAN enforce the operator's hard-no list. Use the
-        // new provider if it's being changed in the same call; otherwise current.
+        // The host cannot tell whether a model is reachable, but it can enforce the operator's deny list, against the
+        // new provider when it changes in the same call.
         if (updates.model !== undefined && updates.model !== null) {
           const effectiveProvider = updates.provider ?? row.provider;
           if (!effectiveProvider) {
@@ -661,29 +595,15 @@ registerResource({
           }
         }
 
-        // Provider-migration pin audit (2026-09-07 incident). Pins are validated
-        // at CREATE time against the then-current provider and never
-        // re-validated at fire time, so a bare `--provider` switch strands
-        // every pin the new vocabulary rejects and the only symptom is a
-        // per-fire provider error nobody is watching for. REFUSE rather than
-        // warn: this verb already runs behind an approval gate, so a refusal is
-        // read and acted on, while a warning printed into a scrollback is
-        // precisely what produced a 14-hour outage. The audit never rewrites a
-        // pin — that is the operator's call, via `ncl tasks repin`, whose
-        // --target-provider makes the remedy reachable BEFORE the switch and is
-        // therefore what makes refusing safe rather than a wedge.
-        //
-        // Runs before any write, so a refusal leaves both stores untouched.
-        // Recorded so the post-write re-audit below knows a switch happened.
+        // Provider-switch pin audit. Pins are validated at create time and never at fire time, so a bare `--provider`
+        // switch strands every pin the new vocabulary rejects, surfacing only as per-fire errors. REFUSE rather than
+        // warn (this verb is approval-gated, so a refusal gets acted on); the remedy is `ncl tasks repin
+        // --target-provider` before the switch. Runs before any write.
         let auditedProvider: string | undefined;
         let fromProviderForReport: string | undefined;
         if (updates.provider !== undefined) {
-          // `resolveGroupProvider` is THE resolver (container-config.ts): the
-          // authoritative `container.json`, projection only as fallback. Read
-          // the projection here instead and a group whose row already says
-          // `claude` while its file still says `codex` skips the audit — and
-          // this handler then writes the file, performing the real switch with
-          // every gpt-* pin carried in unexamined.
+          // `resolveGroupProvider` reads the authoritative container.json; the projection could already say the new
+          // provider while the file does not, skipping the audit.
           const fromProvider = await resolveGroupProvider(id);
           const toProvider = resolveProviderName(null, updates.provider);
           if (fromProvider !== toProvider) {
@@ -702,25 +622,12 @@ registerResource({
           }
         }
 
-        // Mirror the runtime-selecting scalars into container.json. The DB row
-        // is a read-side projection (flag vocabulary, task-flag validation);
-        // the FILE is what the spawn path and the in-container runner actually
-        // read for provider/model/effort/assistantName. Writing only the DB silently left a
-        // group running its old provider after `config update --provider`,
-        // which reads as "the command did nothing" — the update appears in
-        // `config get` while the container keeps booting the old runtime.
-        // `updateContainerConfig` holds the group's file lock across its
-        // read-mutate-write, so a concurrent spawn-time identity write can
-        // neither be clobbered by this one nor clobber it.
-        //
-        // THE FILE COMMITS FIRST, and the projection follows. Either
-        // write can fail, so one of the two disagreements has to be the one
-        // this command can leave behind; file-ahead is the recoverable half.
-        // The container boots what the operator asked for and the CLI's flag
-        // vocabulary lags until the command is re-run. Projection-ahead was the
-        // other way round: `config get` reports the new provider while the
-        // container keeps booting the old one, which is indistinguishable from
-        // success at every later read.
+        // Mirror the runtime scalars into container.json: the FILE is what the spawn and runner read, so a DB-only
+        // write left groups on their old provider while `config get` showed the new one. `updateContainerConfig`
+        // holds the file lock across read-mutate-write.
+        // THE FILE COMMITS FIRST: if one write fails, file-ahead is the recoverable disagreement (the container boots
+        // what was asked; the flag vocabulary lags until a re-run), while projection-ahead is indistinguishable from
+        // success.
         if (
           updates.provider !== undefined ||
           updates.model !== undefined ||
@@ -734,18 +641,14 @@ registerResource({
             if (updates.effort !== undefined) config.effort = (updates.effort as string) || undefined;
             if (updates.assistant_name !== undefined)
               config.assistantName = (updates.assistant_name as string) || undefined;
-            // `--timezone ""` maps to null here, which must ERASE the field so
-            // the spawn falls back to the install timezone.
+            // null must ERASE the field so the spawn falls back to the install timezone.
             if (updates.timezone !== undefined) config.timezone = updates.timezone ?? undefined;
             return config;
           });
         }
 
         if (statusSubtext !== undefined) {
-          // `true` ERASES the key rather than writing it, so a group that is
-          // simply on the default carries no field. Only the opt-out is
-          // recorded, which keeps "what has this group changed?" answerable by
-          // reading the file.
+          // `true` erases the key: only the opt-out is recorded, so the file shows what the group changed.
           await updateContainerConfig(group.folder, (config) => {
             config.statusSubtext = statusSubtext ? undefined : false;
             return config;
@@ -771,26 +674,10 @@ registerResource({
           });
         }
 
-        // ── THE CHECK-TO-WRITE WINDOW, narrowed and made loud ──
-        //
-        // The audit above runs before the writes below, and the socket server
-        // handles each connection independently, so a `tasks create`/`update`
-        // (or a recurrence re-arm) can land an old-provider-valid pin in
-        // between — stranded by a switch whose audit had already passed.
-        //
-        // This is NOT closed by a lock here, deliberately. Task pin writes take
-        // the central lease via `withCentralSync`, and `assertLeaseNotHeld`
-        // forbids nesting, so serializing this handler against them means
-        // restructuring how `config update` acquires the lease across its
-        // several writes. That is a transactional change to a path that also
-        // writes container.json and resource limits, and doing it inside a
-        // change about pin semantics is how a fix becomes the next incident.
-        //
-        // What IS fixed is the outcome that actually hurt: silence. A pin that
-        // slips through the window is now REPORTED — the same information the
-        // refusal would have carried, after the fact instead of before it. The
-        // operator learns immediately rather than at a failed fire, and
-        // scheduled-task failure escalation is the backstop underneath.
+        // CHECK-TO-WRITE WINDOW: a task pin write can land between the audit and these writes. Not closed by a lock
+        // on purpose (task pin writes take the central lease and nesting is forbidden, so it would mean restructuring
+        // how this multi-write command takes the lease). Instead a pin that slips through is REPORTED immediately,
+        // with failed-task escalation as the backstop.
         if (auditedProvider !== undefined) {
           const late = await auditTaskPins(id, auditedProvider);
           if (late.length > 0) {
@@ -803,8 +690,7 @@ registerResource({
             return {
               ...presentConfig(updatedLate, group.folder),
               stranded_after_switch: late,
-              // NOT formatStrandedPins: that text says the switch is being
-              // refused, and by here it has already landed.
+              // Not formatStrandedPins: that text says the switch is refused, and by here it has landed.
               warning: formatLateStrandedPins(late, id, fromProviderForReport!, auditedProvider),
             };
           }
@@ -846,12 +732,8 @@ registerResource({
 
         const newEntry: McpServerConfig = parseMcpServerEntry(args);
 
-        // Dual-write: container.json (canonical — what the spawn reads via
-        // readContainerConfig) + container_configs.mcp_servers (cache — what
-        // `ncl groups config get` reads). DB-only writes were silently dead
-        // for mcp_servers/additional_mounts since the spawn path never reads
-        // those fields from the DB; the backfill-container-configs sync is
-        // file→DB one-way, so DB drift gets overwritten on next host start.
+        // Dual-write: container.json is canonical (the spawn reads it); the DB copy is what `config get` reads and is
+        // overwritten file→DB at host start.
         const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           assertMcpServerNotPluginOwned(cfg.mcpServers?.[name], name, group.folder);
           if (!cfg.mcpServers) cfg.mcpServers = {};
@@ -886,8 +768,7 @@ registerResource({
 
         const group = await requireConfiguredGroup(id);
 
-        // Validate against the canonical file (DB cache may be stale post-
-        // operator-edit; file is the source of truth).
+        // Validate against the canonical file; the DB copy may be stale.
         const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           if (!cfg.mcpServers || !cfg.mcpServers[name]) {
             throw new Error(`MCP server "${name}" not found`);
@@ -992,14 +873,10 @@ registerResource({
         if (!sourceFolder || !siblingFolder) {
           throw new Error('Both --source <folder> and --sibling <folder> are required');
         }
-        // Reject path-traversal + reserved names before forming any filesystem
-        // path. assertValidGroupFolder enforces `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`.
+        // Caller-controlled folder names: reject traversal and reserved names before any filesystem path is built.
         assertValidGroupFolder(sourceFolder);
         assertValidGroupFolder(siblingFolder);
-        // cli_scope='group' isolation: agent callers may only diff folders that
-        // belong to their own agent_group (matches the post-handler scope filter
-        // applied to generic ops). Both folders must resolve to the caller's
-        // agent_group_id; otherwise we'd leak another group's container.json.
+        // Agent callers may only diff folders of their own agent group, or another group's container.json leaks.
         if (ctx.caller === 'agent') {
           const srcGroup = await getAgentGroupByFolder(sourceFolder);
           const sibGroup = await getAgentGroupByFolder(siblingFolder);

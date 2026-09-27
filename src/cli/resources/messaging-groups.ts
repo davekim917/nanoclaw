@@ -13,8 +13,8 @@ import type { MessagingGroup } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 /**
- * Select through the host role predicate, which includes same-workspace Slack
- * sibling identities after the adapters have registered their team ids.
+ * The host role predicate includes same-workspace Slack sibling identities once adapters have registered their team
+ * ids.
  */
 async function resolveLatestOwnerDm(): Promise<MessagingGroup | undefined> {
   const candidates = await getDb().all<MessagingGroup & { user_id: string }>(
@@ -108,13 +108,8 @@ registerResource({
     {
       name: 'unknown_sender_policy',
       type: 'string',
-      // Deliberately more specific than upstream's description (which stops
-      // at "declines the sender politely and sends the owner a one-line
-      // FYI"): decline_notify is a DM-only promise (declineAndNotify) and
-      // degrades to 'strict' on a group, so an operator naming this policy
-      // on a group needs to know it won't do what the name implies. Keep
-      // this wording on the next upstream sync — it isn't drift, it's a real
-      // fork behavior this field documents.
+      // Deliberately more specific than upstream's description: `decline_notify` is DM-only and degrades to 'strict'
+      // on a group.
       description:
         'What happens when an unrecognized sender posts. "strict" drops silently. "request_approval" sends an approval card to an admin. "decline_notify" declines the sender politely in the DM and sends the owner a one-line FYI (DM-shaped groups only; degrades to "strict" on a group). "public" allows anyone. Default: declared by the channel adapter for this context (DM vs group); "strict" when the channel has no declaration.',
       enum: ['strict', 'request_approval', 'decline_notify', 'public'],

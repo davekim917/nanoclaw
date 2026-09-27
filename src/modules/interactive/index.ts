@@ -29,12 +29,8 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
     return true; // claimed — we owned this questionId even though the session is gone
   }
 
-  // trigger: 0 — a question response can only be consumed by the blocked
-  // ask_user_question poller inside an already-running turn. If that container
-  // is gone, no future container can consume the row, so it must never wake
-  // one: a trigger-1 row here re-woke a dead session every sweep for 24h
-  // (until expireStalePending reaped it), holding a memory-budget slot the
-  // whole time. The live poller reads pending rows directly, no wake needed.
+  // trigger: 0 — only the blocked ask_user_question poller in a running turn
+  // can consume this row; a waking row would re-wake a dead session every sweep.
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: `qr-${payload.questionId}-${Date.now()}`,
     kind: 'system',
@@ -63,5 +59,4 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
 
 registerResponseHandler(handleInteractiveResponse);
 
-// request_choice — the non-blocking, approvals-backed sibling of ask_user_question.
 import './choice.js';

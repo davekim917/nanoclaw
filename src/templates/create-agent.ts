@@ -40,16 +40,10 @@ function groupSkillsOverlayDir(agentGroupId: string): string {
 }
 
 /**
- * Mark a template's servers for the CONTAINER: the container-side `pluginRoot`
- * on stdio servers so the agent-runner can expand ${PLUGIN_ROOT}/${PLUGIN_DATA}
- * and inject both env vars. A stdio server that omits `cwd` gets
- * `${PLUGIN_ROOT}` here — the spec default (§7.2.1: the plugin root MUST be the
- * working directory) materialized once at stamp time so every provider's config
- * writer sees an explicit value. All values are container paths — a host path
- * never leaks into config.
- *
- * The `plugin` OWNERSHIP marker is deliberately not added here; see
- * `withPluginOwner`.
+ * Marks a template's servers for the CONTAINER: `pluginRoot` on stdio servers so the runner can expand
+ * ${PLUGIN_ROOT}/${PLUGIN_DATA}, and `${PLUGIN_ROOT}` as the `cwd` of a stdio server that omits one (the spec default,
+ * made explicit for every provider's config writer). All values are container paths. The ownership marker is added
+ * separately, by `withPluginOwner`.
  */
 export function markPluginServers(
   servers: Record<string, ParsedMcpServerConfig>,
@@ -65,17 +59,8 @@ export function markPluginServers(
 }
 
 /**
- * Add the `plugin` ownership marker — to BOTH stores.
- *
- * The fork is file-first: container.json IS what the spawn reads, and all
- * three mutation guards read the FILE, not the row (two in `groups.ts` and
- * one in `modules/self-mod/apply.ts` call `assertMcpServerNotPluginOwned`
- * with an entry from `readContainerConfig`). A marker written only to the DB
- * projection therefore guards nothing: an `ncl groups config add-mcp-server`
- * or an approved `add_mcp_server` would silently overwrite a plugin's server.
- * The marker rides the file alongside `pluginRoot`, which is
- * already a host bookkeeping field there; the runner strips both in
- * `resolvePluginServer` before any provider sees the config.
+ * Adds the `plugin` ownership marker, written to BOTH stores: every mutation guard reads container.json, so a marker
+ * only in the DB projection guards nothing. The runner strips it (with `pluginRoot`) before any provider sees it.
  */
 export function withPluginOwner(
   servers: Record<string, ParsedMcpServerConfig>,
@@ -115,9 +100,6 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   // config row below, BEFORE tasks are created, so a template task's first
   // run and its later re-arms agree on the same zone.
   const timezone = (opts?.timezone && canonicalizeIanaTimezone(opts.timezone)) || undefined;
-  // TODO: route through `prepareTemplateTasks` (src/templates/tasks.ts)
-  // once the scheduling theme lands `taskNameSlug` — restamp needs the id-slug
-  // collision gate to match a live series.
   const tasks = tpl.tasks.map((task) => {
     try {
       return prepareScheduledTask({
@@ -139,16 +121,13 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   const name = opts?.name ?? tpl.agentName ?? path.basename(dir);
   let folder = normalizeName(name);
   assertValidGroupFolder(folder);
-  // Folder uniqueness is a filesystem check plus a random suffix, never a DB
-  // read — see the allowlist reason in src/db/insert-or-adopt.test.ts.
+  // Uniqueness is a filesystem check plus a random suffix, never a DB read (see insert-or-adopt.test.ts).
   if (fs.existsSync(resolveGroupFolderPath(folder))) folder = `${folder}-${randomUUID().slice(0, 8)}`;
 
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
   await createAgentGroup(group);
   await ensureContainerConfig(id);
-  // Dual-write, same as `groups config update`: the DB row is the read-side
-  // projection (`config get`, scheduling), container.json is what the spawn
-  // path hands the container as its TZ.
+  // Dual-write: the DB row serves `config get` and scheduling; container.json is what the spawn reads for TZ.
   if (timezone) {
     await updateContainerConfigScalars(id, { timezone });
     await updateContainerConfig(folder, (config) => {
@@ -187,11 +166,8 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
     fs.mkdirSync(path.join(groupDir, 'plugin-data', tpl.name, sub), { recursive: true });
   }
 
-  // Dual-write, same as every other MCP write path: container.json is what
-  // the spawn reads. Writing only the DB projection left a stamped template's
-  // servers unwired on first spawn, where the absent file materializes as an
-  // empty config. The file carries the container-side marks; the ownership
-  // marker rides only on the projection (see `withPluginOwner`).
+  // Dual-write: container.json is what the spawn reads, and a DB-only write left stamped servers unwired on first
+  // spawn.
   const marked = withPluginOwner(markPluginServers(tpl.mcpServers, tpl.name), tpl.name);
   await updateContainerConfig(folder, (config) => {
     config.mcpServers = { ...(config.mcpServers ?? {}), ...marked };

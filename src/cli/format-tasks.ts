@@ -18,8 +18,7 @@ interface TaskListRow {
   log?: string | null;
   created_at?: string | null;
   prompt?: string | null;
-  /** Per-fire pins. Rendered because an operator told to fix a pin has to be
-   *  able to SEE it — the --json path is not where `ncl tasks list` is read. */
+  /** Rendered because an operator told to fix a pin must be able to see it here, not only in --json. */
   model_pin?: string | null;
   effort_pin?: string | null;
 }
@@ -71,11 +70,7 @@ function age(iso: string | null | undefined, now: number): string {
   return Number.isNaN(t) ? '-' : duration(now - t);
 }
 
-/**
- * The per-fire pin as one cell: `model@effort`, either half alone, `-` when
- * unpinned. Compact on purpose — two more columns would push PROMPT off an
- * 80-column terminal, and the pin is read as one thing.
- */
+/** One compact cell so PROMPT stays on an 80-column terminal. */
 function pin(model: string | null | undefined, effort: string | null | undefined): string {
   if (!model && !effort) return '-';
   if (model && effort) return `${model}@${effort}`;

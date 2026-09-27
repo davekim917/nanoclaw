@@ -116,9 +116,7 @@ registerResource({
   },
 });
 
-/** Reject an unknown `--by` value loudly — a silent fallback to `group` would
- *  hand the operator a table that answers a different question than they
- *  asked, with nothing on screen saying so. */
+/** Unknown `--by` is rejected: a silent fallback would answer a different question with nothing saying so. */
 function parseDimensions(by: string | undefined): UsageDimension[] | undefined {
   if (!by) return undefined;
   const dims = by

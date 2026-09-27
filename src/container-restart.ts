@@ -38,7 +38,7 @@ async function waitUntil(
   }
 }
 
-/** True only when EVERY session satisfies an async predicate. Sequential by design: the drain probe opens a session per call. */
+/** True only when EVERY session satisfies the predicate. Sequential: the drain probe opens a session per call. */
 async function everySession(sessions: Session[], predicate: (session: Session) => Promise<boolean>): Promise<boolean> {
   for (const session of sessions) if (!(await predicate(session))) return false;
   return true;
@@ -50,7 +50,7 @@ export interface RepositoryMountQuiescence {
   sessions: Session[];
   /** Every session DB fenced against concurrent ingress until release. */
   barrierSessions: Session[];
-  /** Exact fresh/adopted activation token expected from each running session. */
+  /** Exact activation token expected from each running session. */
   barrierAcks: Record<string, string>;
   barrierGenerations: Record<string, string>;
 }
@@ -75,15 +75,8 @@ export class RepositoryMountQuiescenceError extends Error {
 }
 
 /**
- * Activation failed AND the rollback could not un-fence every session it had
- * already fenced.
- *
- * Incident 2026-09-01: this case threw a bare `AggregateError`, so the caller's
- * `error instanceof RepositoryMountQuiescenceError` branch never matched, its
- * `quiescence` stayed null, and no barrier release was ever attempted for the
- * sessions the rollback had missed. Carrying the stranded set on a typed error
- * lets `quiesceSessionsForRepositoryMounts` hand it back through the recovery
- * shape that already exists for exactly this (`barriersReleased: false`).
+ * Activation failed AND the rollback could not un-fence every session it had fenced. Typed so the caller's
+ * recovery path (`barriersReleased: false`) receives the stranded set instead of an untyped AggregateError.
  */
 class RepositoryMountBarrierRollbackError extends Error {
   readonly epoch: string;
@@ -104,12 +97,9 @@ function uniqueSessions(sessions: Session[]): Session[] {
 }
 
 /**
- * A session row whose inbound DB was never created (or was reclaimed) has no
- * ingress path to fence: messages_in only exists inside that file, and the only
- * writer that could create it is a spawn, which is already rejected at the
- * workgroup mount claim or the drained work unit's lifecycle claim
- * (container-runner.ts) for the whole quiescence window. Opening it instead throws inside
- * better-sqlite3 ("directory does not exist") and fails the entire publication.
+ * A session whose inbound DB was never created (or was reclaimed) has no ingress to fence: only a spawn could
+ * create it, and spawns are rejected by the mount or lifecycle claim for the whole window. Opening it would
+ * throw and fail the entire publication.
  */
 function sessionInboundPath(session: Session): string {
   return sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'inbound');
@@ -120,54 +110,32 @@ function hasFenceableIngress(session: Session): boolean {
 }
 
 /**
- * A session whose inbound DB vanished BETWEEN the eligibility filter and the
- * open below carries exactly the invariant `hasFenceableIngress` documents:
- * there is no ingress path left to fence, and no spawn can create one while
- * the workgroup mount claim or the work unit's lifecycle claim is held. It is skipped rather than fatal — the
- * 2026-09-01 incident was a storage reclaim landing inside precisely this
- * window, which failed an unrelated publication permanently.
- *
- * A session with a LIVE container is the one exception: it must own a DB to
- * poll, so its absence is an inconsistent host view and still fails closed.
+ * An inbound DB that vanished between the eligibility filter and the open (e.g. a storage reclaim) is skipped,
+ * not fatal. A session with a LIVE container must own a DB to poll, so its absence still fails closed.
  */
 function vanishedSessionIsSkippable(err: unknown, session: Session): boolean {
   if (!(err instanceof SessionDbMissingError)) return false;
   return sessionVanishIsSkippable(session);
 }
 
-/**
- * A session whose mailbox `withExistingMailboxSession` reports as absent is the
- * same case `vanishedSessionIsSkippable` decides for a thrown
- * `SessionDbMissingError` — the seam resolves `undefined` where the raw opener
- * threw. A LIVE container is still the exception: it must own a mailbox to
- * poll, so its absence is an inconsistent host view and fails closed.
- */
+/** The mailbox-seam equivalent of `vanishedSessionIsSkippable`; a live container still fails closed. */
 function sessionVanishIsSkippable(session: Session): boolean {
   return !sessionHasLiveContainer(session);
 }
 
 /**
- * Is a container running for this session as far as the host can tell —
- * tracked, still spawning, or a pending survivor adoption could not yet claim?
- * The barrier predicates ask this rather than the
- * registry alone: a pending survivor is live, holds the mounts, and must
- * acknowledge the fence and drain its work before it is stopped.
+ * Running as far as the host can tell: tracked, still spawning, or a pending survivor adoption has not claimed.
+ * A pending survivor holds the mounts and must acknowledge the fence and drain before it is stopped.
  */
 function sessionHasLiveContainer(session: Session): boolean {
   return isContainerRunning(session.id) || isContainerSpawning(session.id) || hasPendingAdoption(session.id);
 }
 
-/** Sentinel for "the mailbox is gone", distinct from any value an action returns. */
 const MAILBOX_GONE = Symbol('mailbox-gone');
 
 /**
- * One fence operation against a session, with the vanished case surfaced as a
- * value rather than an exception.
- *
- * `withExistingMailboxSession` is deliberate here rather than the provisioning
- * variant: fencing a session the storage reclaim has already removed would
- * recreate its directory (invariant I-4), and the 2026-09-01 incident was
- * exactly a reclaim landing inside this window.
+ * One fence operation, with the vanished case surfaced as a value. Existing-only on purpose: fencing a session the
+ * reclaim already removed would recreate its directory (invariant I-4).
  */
 async function inSessionMailbox<T>(
   session: Session,
@@ -198,12 +166,8 @@ function barrierSessionError(err: unknown, session: Session, phase: string): Err
 }
 
 /**
- * Fencing writes one commit per session DB under `journal_mode=DELETE`, which
- * costs ~9ms of synchronous fsync each. A workgroup with thousands of sessions
- * therefore blocks the host event loop for a minute or more, starving every
- * unrelated channel adapter and workgroup. Yielding keeps the stall scoped to
- * the workgroup being reconciled; the mount claim (not this loop) is what holds
- * admission closed, so a yield here cannot let a spawn through.
+ * Each fence commit costs ~9ms of synchronous fsync, so thousands of sessions would stall the host event loop for
+ * a minute. Yielding is safe: the mount claim, not this loop, holds admission closed.
  */
 async function yieldEventLoop(index: number): Promise<void> {
   if (index > 0 && index % 100 === 0) await new Promise((resolve) => setImmediate(resolve));
@@ -214,10 +178,8 @@ async function activateRepositoryMountBarriers(
   epoch: string,
 ): Promise<{ fenced: Session[]; barrierAcks: Record<string, string>; barrierGenerations: Record<string, string> }> {
   const activated: Session[] = [];
-  // The sessions this pass actually fenced. Returned so the quiescence's
-  // barrierSessions, barrierAcks and barrierGenerations stay one consistent
-  // set — a session skipped here must never reach release, which would then
-  // fail on its missing generation.
+  // Only the sessions actually fenced, so barrierSessions/Acks/Generations stay one set: a skipped session reaching
+  // release would fail on its missing generation.
   const fenced: Session[] = [];
   const barrierAcks: Record<string, string> = {};
   const barrierGenerations: Record<string, string> = {};
@@ -229,10 +191,8 @@ async function activateRepositoryMountBarriers(
         const active = mailbox.activateRepoIngressFence(epoch);
         return {
           active,
-          // A replay may be adopting a crash-left active barrier with this
-          // exact deterministic epoch. It did not create that barrier and
-          // therefore must never roll it back if a later session activation
-          // fails.
+          // A replay may adopt a crash-left active barrier with this exact epoch; it did not create it and must
+          // never roll it back.
           created: prior?.state !== 'active' || prior.epoch !== epoch,
         };
       });
@@ -249,8 +209,7 @@ async function activateRepositoryMountBarriers(
       if (outcome.created) activated.push(session);
     }
   } catch (error) {
-    // No topology mutation has happened yet. Restore every DB fenced by this
-    // attempt so an activation failure cannot strand unrelated inbound work.
+    // No topology mutation yet: restore every DB this attempt fenced so a failure strands no inbound work.
     const releaseErrors: unknown[] = [];
     const stranded: Session[] = [];
     for (const session of activated.reverse()) {
@@ -259,9 +218,7 @@ async function activateRepositoryMountBarriers(
         if (!generation) {
           throw new Error(`repository mount barrier generation missing for session ${session.id}`, { cause: error });
         }
-        // A session reclaimed since we fenced it has no fence row left to
-        // restore — the whole mailbox is gone. Skipping reaches the same end
-        // state a successful release would.
+        // A reclaimed session has no fence row left to restore; skipping reaches the released end state.
         const rolledBack = await inSessionMailbox(session, 'activation rollback', (mailbox) =>
           mailbox.releaseRepoIngressFence(epoch, generation),
         );
@@ -296,28 +253,18 @@ async function activateRepositoryMountBarriers(
 async function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): Promise<boolean> {
   if (!sessionHasLiveContainer(session)) return true;
   try {
-    // OUTBOUND-keyed: all three reads are outbound-owned and nothing here
-    // touches inbound.db, so outbound.db's existence is the question to ask.
-    // The inbound-keyed funnel added a gate the pre-seam probe never had — it
-    // opened outbound.db alone — and a session whose inbound.db is reclaimed
-    // mid-transition could then never report drained, burning the full barrier
-    // timeout and turning a survivable transition into a quiescence failure
-    // that kills every affected container.
+    // Outbound-keyed: all three reads are outbound-owned. An inbound-keyed funnel would never report drained for a
+    // session whose inbound.db was reclaimed mid-transition, burn the barrier timeout, and kill every container.
     const drained = await withExistingNanoclawOutbound(
       session.agent_group_id,
       session.id,
       (outbound) =>
-        // The EXACT activation token, never merely "some ack": a stale
-        // generation from a previous barrier on this session would otherwise
-        // read as drained.
+        // The exact activation token: a stale generation from an earlier barrier must not read as drained.
         outbound.readRepositoryMountBarrierAck() === expectedAck &&
         outbound.getProcessingClaimRows().length === 0 &&
         !outbound.getContainerState()?.current_tool,
     );
-    // undefined = no outbound.db at all for a session the host believes is
-    // running. Unknown acknowledgement or work state is never safe to stop,
-    // and neither is a present-but-unreadable file, which raises into the
-    // catch below.
+    // No outbound.db for a session the host believes is running: unknown ack or work state is never safe to stop.
     return drained ?? false;
   } catch {
     return false;
@@ -325,9 +272,8 @@ async function sessionReachedRepositoryBarrier(session: Session, expectedAck: st
 }
 
 /**
- * Release the exact durable ingress epoch after the mount transition and its
- * on-wake confirmation are committed. Idempotent for an already-released
- * matching epoch; any different/missing state fails closed.
+ * Release the exact durable ingress epoch after the mount transition and its on-wake confirmation are committed.
+ * Idempotent for an already-released matching epoch; any different or missing state fails closed.
  */
 export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMountQuiescence): Promise<Session[]> {
   const wakeRequired: Session[] = [];
@@ -335,10 +281,7 @@ export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMou
     await yieldEventLoop(index);
     const generation = quiescence.barrierGenerations[session.id];
     if (!generation) throw new Error(`repository mount barrier generation missing for session ${session.id}`);
-    // Consistent for the maps too: barrierAcks/barrierGenerations are keyed
-    // by session id and only ever read for a session this loop reaches, so
-    // dropping one strands nothing — and a reclaimed session has no fence row
-    // left to release and no due rows left to wake for.
+    // A reclaimed session has no fence row to release and no due rows to wake for; dropping it strands nothing.
     const outcome = await inSessionMailbox(session, 'release', (mailbox) => {
       const result = mailbox.releaseRepoIngressFence(quiescence.epoch, generation);
       if (!result.released) {
@@ -352,9 +295,7 @@ export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMou
           throw new Error(`repository mount barrier state changed for session ${session.id}`);
         }
       }
-      // Recompute from durable state even on an idempotent replay. This closes
-      // the crash-after-release-before-wake boundary for both rows tagged by
-      // this epoch and ordinary due rows that predated the fence.
+      // Recomputed from durable state even on replay, closing the crash-after-release-before-wake boundary.
       return { wake: mailbox.countDueMessages() > 0 };
     });
     if (outcome === MAILBOX_GONE) {
@@ -370,9 +311,8 @@ export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMou
 }
 
 /**
- * Called while a workgroup-wide repository mount claim blocks new spawns.
- * It catches spawns already past the claim check, then stops every affected
- * running container and returns the exact sessions to wake after claim release.
+ * Called while a workgroup-wide repository mount claim blocks new spawns: catches spawns already past the claim
+ * check, stops every affected running container, and returns the sessions to wake after release.
  */
 export async function quiesceAgentGroupsForRepositoryMounts(
   agentGroupIds: string[],
@@ -390,41 +330,28 @@ export async function quiesceSessionsForRepositoryMounts(
 ): Promise<RepositoryMountQuiescence> {
   if (!epoch) throw new Error('repository mount barrier epoch must not be empty');
   const known = uniqueSessions(sessions);
-  // Runtime process maps are authoritative. A stale inactive DB row can still
-  // own a live RW mount and must not escape quiescence — so the stop set is
-  // derived before the fenceable filter, never from it. A pending adoption is
-  // a survivor this host has not claimed but which is running and holds the
-  // mounts all the same: it is stopped here like
-  // any running container, through `killContainer`, which routes it.
+  // Runtime process maps are authoritative: a stale inactive row can still own a live RW mount, so the stop set is
+  // derived before the fenceable filter. A pending adoption is stopped like any running container.
   const affected = known.filter(
     (session) => isContainerRunning(session.id) || isContainerSpawning(session.id) || hasPendingAdoption(session.id),
   );
   const barrierSessions = known.filter(hasFenceableIngress);
-  // A live container always owns an inbound DB to poll. If one is running
-  // without a fenceable DB the host's view is inconsistent, and proceeding
-  // would wait the full barrier timeout for an ack that can never be written.
+  // A live container without a fenceable DB is an inconsistent host view; waiting would burn the full barrier
+  // timeout for an ack that can never be written.
   const unfenceable = affected.filter((session) => !hasFenceableIngress(session));
   if (unfenceable.length > 0) {
     throw new Error(
       `running session(s) have no inbound database to fence: ${unfenceable.map((session) => session.id).join(', ')}`,
     );
   }
-  // The fence returns `fenced` — the subset this pass actually fenced, after
-  // skipping sessions whose inbound DB vanished — so barrierSessions,
-  // barrierAcks and barrierGenerations stay one consistent set.
   let fenced: Session[];
   let barrierAcks: Record<string, string>;
   let barrierGenerations: Record<string, string>;
   try {
     ({ fenced, barrierAcks, barrierGenerations } = await activateRepositoryMountBarriers(barrierSessions, epoch));
   } catch (error) {
-    // A partial rollback leaves real fences behind, and the caller's only
-    // recovery affordance is RepositoryMountQuiescenceError. Re-shape into it
-    // with the stranded set as the barrier sessions and `barriersReleased:
-    // false`, so `applyRepositoryPublishAction` / `applyRepositoryTransferAction`
-    // retry the release instead of dropping them (incident 2026-09-01). A
-    // session skipped as vanished is never in `strandedSessions` — it holds no
-    // fence to release, so it is neither an error nor recovery work.
+    // Re-shape a partial rollback into RepositoryMountQuiescenceError with the stranded set and
+    // `barriersReleased: false`, so the publish/transfer callers retry the release. Vanished sessions hold no fence.
     if (error instanceof RepositoryMountBarrierRollbackError) {
       throw new RepositoryMountQuiescenceError(
         error,
@@ -465,11 +392,8 @@ export async function quiesceSessionsForRepositoryMounts(
     );
     return quiescence;
   } catch (error) {
-    // Every container that observed the barrier has permanently ended its SDK
-    // query input stream, so it can never do useful work again. Leaving one
-    // alive surfaces as cancelled tool calls the agent misreads as revoked
-    // permissions. Kill failures are logged, never allowed to mask `error` or
-    // skip the barrier release below.
+    // Every container that observed the barrier has ended its SDK input stream for good; leaving one alive shows
+    // up as cancelled tool calls misread as revoked permissions. Kill failures never mask `error` or skip release.
     for (const session of affected) {
       try {
         if (isContainerRunning(session.id) || hasPendingAdoption(session.id)) {
@@ -501,104 +425,50 @@ export async function quiesceSessionsForRepositoryMounts(
 }
 
 /**
- * One boot quiescence pass: the §6 `Boot quiescence scope` counts, plus the
- * partition the later series consume.
- *
- * The arrays are the consumer contract, not decoration. Seam-4 E adopts the
- * survivors by session id, and seam-4 G skips the host-restart warn for
- * exactly those sessions; both need the identity, not the count. D1 still
- * stops everything, so under D1 they are measurement — `survivableSessionIds`
- * is the milestone-1 counterfactual named session by session.
+ * One boot quiescence pass: the counts plus the partition later series consume. Adoption takes the survivors by
+ * session id, and the host-restart warn skips exactly those sessions.
  */
 export interface BootQuiescenceScope {
-  /** Workgroups the predicates were asked about — the §6 denominator. */
   workgroups: number;
   /**
-   * The changed set the partition below was computed against: the caller's
-   * post-stop re-evaluation when it supplied one, otherwise the set passed in.
-   * The caller reconciles exactly these workgroups, so the scope and the
-   * cutover can never disagree about which workgroups changed.
+   * The changed set the partition was computed against (the post-stop re-evaluation when supplied). The caller
+   * reconciles exactly these, so scope and cutover cannot disagree.
    */
   changedWorkgroupIds: string[];
-  /** Install-labeled containers the runtime reported. */
   containers: number;
-  /** Containers this pass actually stopped. */
   stopped: number;
-  /**
-   * Containers that carry a workgroup AND a session label, whose workgroup is
-   * outside the changed set — the ones the door LEFT RUNNING for adoption
-   * (seam 4 D2). Counted from the post-stop inventory against the post-stop
-   * re-evaluation, so it is exactly what adoption can find.
-   */
+  /** Containers with workgroup and session labels outside the changed set, left running for adoption. */
   survivable: number;
   /** Containers carrying no workgroup label: unknown scope, always stopped. */
   unlabeled: number;
-  /** Session ids of the survivable containers. Length equals `survivable`. */
+  /** Length equals `survivable`. */
   survivableSessionIds: string[];
-  /**
-   * Session ids of the containers that must be stopped whatever D2 does.
-   *
-   * A container with no session label is in the must-stop partition but
-   * contributes no id here — it is stopped by name, and there is no session to
-   * hand to adoption. That is the fail-closed direction: an unidentifiable
-   * container is never survivable.
-   */
+  /** Sessions that must be stopped; an unlabeled container is stopped by name and contributes no id. */
   mustStopSessionIds: string[];
 }
 
-/**
- * The boot door's second argument: the measurement context plus the runtime
- * seam. `list`/`stop` default to real docker; tests inject fakes.
- */
+/** `list`/`stop` default to real docker; tests inject fakes. */
 export interface BootQuiescenceOptions {
   /**
-   * Every workgroup id the central DB currently holds.
-   *
-   * Two uses, one source of truth. Its length is the `workgroups` field of the
-   * §6 `Boot quiescence scope` line — the denominator `changed` is read
-   * against. Its membership decides whether a container's workgroup label
-   * still names something: an approved `ncl groups delete` leaves the
-   * container running, and a survivor whose workgroup is gone has no reconcile
-   * to be scoped by and nothing for adoption to resolve. Unknown is stopped.
-   *
-   * Omitted, the door falls back to the changed set, which makes every
-   * container's label look unknown — fail-closed, and only reachable from a
-   * caller that forgot to pass it. The boot block always supplies it.
+   * Every workgroup id in the central DB: the `workgroups` count, and whether a container's label still names
+   * something (a deleted group's survivor has nothing to reconcile or adopt). Omitted, every label looks unknown
+   * (fail closed).
    */
   knownWorkgroupIds?: string[];
   /**
-   * Every session id the central DB currently holds as active.
-   *
-   * Same rule as `knownWorkgroupIds`, one level down: a container whose
-   * session label names a row that is gone or archived has nothing for
-   * adoption to resolve, so leaving it running under D2 would leak it.
-   *
-   * Omitted, NOTHING is survivable. That is deliberately harsher than the
-   * workgroup fallback: a caller that cannot say which sessions exist cannot
-   * license any container to outlive the boot. The boot block always supplies
-   * it (src/main.ts).
+   * Every active session id in the central DB. Omitted, NOTHING is survivable: a caller that cannot say which
+   * sessions exist cannot license any container to outlive the boot.
    */
   knownSessionIds?: string[];
   /**
-   * Re-evaluate the change predicates once the install is proved quiescent.
-   *
-   * The set passed as `changedWorkgroupIds` is a snapshot taken while
-   * containers were still running, and the group directories it was computed
-   * from are container-writable. This callback runs after the stop proof,
-   * when nothing can write to them, and its answer is what the partition and
-   * the returned scope are built from. Omitted, the passed-in set is used.
+   * Re-evaluate the change predicates once the install is quiescent: the passed-in set was snapshotted while
+   * containers could still write the group dirs. Its answer builds the partition and the returned scope.
    */
   reevaluateChanged?: () => string[] | Promise<string[]>;
   /**
-   * Runs before each stop pass with that pass's partition. Pass 1 is the
-   * PRE-stop partition: the boot block writes the host-restart accountability
-   * note here for every session marked running by the previous host EXCEPT
-   * the survivors, whose containers are not being interrupted — before the
-   * stop pass, which can outlast the heartbeat freshness window. Pass 2
-   * runs only when the post-stop re-evaluation moved sessions INTO must-stop
-   * (a flipped workgroup, a newcomer): `mustStopSessionIds` is then exactly
-   * those newly reclassified sessions, which the first note skipped and which
-   * are about to be interrupted after all.
+   * Runs before each stop pass with its partition. Pass 1 (pre-stop) writes the host-restart note for every
+   * session the previous host marked running except survivors. Pass 2 runs only when the post-stop re-evaluation
+   * moved sessions into must-stop, and then carries exactly those.
    */
   beforeStop?: (partition: {
     pass: 1 | 2;
@@ -610,29 +480,10 @@ export interface BootQuiescenceOptions {
 }
 
 /**
- * Split an inventory into the containers that must be stopped and the ones a
- * narrowed stop set could leave running.
- *
- * A container is survivable only if it is IDENTIFIED, KNOWN and UNCHANGED:
- *
- *   - a workgroup label — a missing one is unknown scope (plan §3.5,
- *     divergence 7), and on the first restart after C that is every container;
- *   - a session label — a container adoption could never claim, so leaving it
- *     running under D2 would leak it;
- *   - a workgroup that still exists in the central DB — an approved
- *     `ncl groups delete` leaves the container running, and its workgroup is
- *     in no reconcile scope and resolves to no row;
- *   - a session that still exists and is active — the same rule one level down;
- *   - a workgroup outside the changed set.
- *
- * Everything else fails closed into must-stop, and the split is exact: every
- * container is on one side or the other.
- *
- * ONE function, called twice by the door (seam 4 D2): once with the pre-stop
- * set to choose what to stop, and once over the post-stop inventory with the
- * post-stop set for the partition it hands adoption. A workgroup that flips
- * between the two is must-stop in the second pass, so the stop set is the
- * union.
+ * Split an inventory into must-stop and survivable. Survivable requires a workgroup label, a session label, a
+ * workgroup still in the central DB, an active session, and a workgroup outside the changed set; everything else
+ * fails closed into must-stop. Called twice by the door: pre-stop to choose the stop set, post-stop for the
+ * partition handed to adoption.
  */
 function partitionInstallContainers(
   containers: InstallContainerScope[],
@@ -654,47 +505,13 @@ function partitionInstallContainers(
 }
 
 /**
- * The BOOT quiescence door (docs/specs/upstream-restart-survival-seam/plan.md
- * §4.2, §7.D). Stops the containers whose mounts a startup reconcile is about
- * to invalidate, and proves they are gone before the caller mutates anything.
- *
- * The stop set comes from the container runtime by label, not from
- * `activeContainers`: the in-process registry is empty at boot, so the runtime
- * door (`quiesceSessionsForRepositoryMounts`, above) cannot see a container
- * left by the previous host (plan §3.5, divergence 2). Two doors, two
- * authorities; both are pinned by src/workgroup-reconcile-doors.test.ts.
- *
- * A container with no workgroup label is unknown scope and is always stopped
- * (divergence 7) — on the first restart after the scope labels ship, that is
- * every container.
- *
- * D2 STOPS ONLY `mustStop` (plan §4.1, §7.D2): the containers of workgroups a
- * reconcile is about to change, plus everything not provably survivable — no
- * workgroup or session label, an unknown workgroup, a session that is gone or
- * cannot take a wake. Survivable containers are left running and reach
- * adoption (`adoptRunningSessions`) by session id, through the returned scope.
- *
- * Two partitions, because `changedWorkgroupIds` is a snapshot taken BEFORE
- * this door runs and the group directories it was computed from are
- * container-writable — a live agent can flip a workgroup from settled to
- * needs-reconcile while the stops are in flight:
- *
- *   1. PRE-stop, against the snapshot: chooses the stop set, and is handed to
- *      `beforeStop` so the accountability note skips exactly the sessions
- *      whose containers are not interrupted.
- *   2. POST-stop, over the second inventory against the re-evaluated set: a
- *      workgroup that flipped is must-stop NOW and is stopped in a second
- *      pass; so is a container that appeared between the listings and is not
- *      provably survivable. The third inventory must show nothing left in
- *      must-stop, or the boot fails — a container that will not stop is never
- *      argued away. The survivors of THAT partition are the adoption contract.
- *
- * Survivors keep running through the re-evaluation, so a workgroup can flip
- * after the second partition too; the reconcile is scoped to the re-evaluated
- * set and such a flip is reconciled at the next boot, exactly as under D1.
- *
- * Fail-closed like the call it replaces: a listing failure, or a stop that does
- * not take, throws — startup stops before any reconcile runs.
+ * The BOOT quiescence door: stops the containers a startup reconcile is about to invalidate and proves them gone
+ * before the caller mutates anything. The stop set comes from runtime labels, since the in-process registry is
+ * empty at boot (src/workgroup-reconcile-doors.test.ts pins both doors). Only must-stop containers are stopped.
+ * Two partitions, because live agents can flip a workgroup while stops are in flight: pre-stop against the
+ * snapshot (stop set, note skip set), then post-stop over a fresh inventory against the re-evaluated set, with a
+ * second stop pass. A final inventory must show nothing in must-stop or boot fails; its survivors are the adoption
+ * contract. A listing failure or a stop that does not take throws.
  */
 export async function quiesceWorkgroupsForBootMountChange(
   changedWorkgroupIds: string[],
@@ -708,8 +525,7 @@ export async function quiesceWorkgroupsForBootMountChange(
   const containers = list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
 
-  // Partition 1: pre-stop, against the caller's snapshot. This chooses the
-  // stop set and the accountability note's skip set.
+  // Partition 1: chooses the stop set and the accountability note's skip set.
   const preStop = partitionInstallContainers(containers, changedWorkgroupIds, known, knownSessions);
   await options.beforeStop?.({
     pass: 1,
@@ -732,29 +548,12 @@ export async function quiesceWorkgroupsForBootMountChange(
   };
   stopAll(preStop.mustStop);
 
-  // The reconcile set is re-evaluated NOW, after the first pass: nothing in a
-  // changed workgroup can write to its group directory any more. The set that
-  // came in was a snapshot taken while those containers were still running,
-  // and a live agent's last write could have flipped a workgroup since.
-  // Partition against the answer from here, not that snapshot — otherwise a
-  // flipped workgroup's sessions read as survivable in the very scope that
-  // says its mounts are about to move.
-  //
-  // Nothing here has to carry which containers it managed to stop: the
-  // accountability note was written by `beforeStop` before the first stop,
-  // so a failure at any point leaves it already written for every session
-  // that was marked running (src/main.ts, `runBootMountQuiescence`).
+  // Re-evaluated now that nothing in a changed workgroup can write its group dir; partitioning against the stale
+  // snapshot would call a flipped workgroup's sessions survivable.
   const finalChanged = (await options.reevaluateChanged?.()) ?? changedWorkgroupIds;
 
-  // The proof is over a SECOND inventory, taken only once the re-evaluation
-  // has been awaited, by each container's OWN labels, never over the names
-  // from the first: a container that appeared since — another host, a spawn
-  // racing the boot, a `docker run` the previous process left completing
-  // while the predicates were re-run — is classified like every other, and a
-  // must-stop one that is still here (a stop that did not take, a newcomer in
-  // a changed workgroup) is stopped in the second pass. An inventory taken
-  // BEFORE that await would hold no record of a newcomer that arrived during
-  // it, and the mounts would be reconciled under a live container.
+  // A SECOND inventory, taken after the re-evaluation is awaited, classified by each container's own labels: a
+  // newcomer arriving during the await would otherwise go unrecorded and be reconciled under a live container.
   const afterFirstPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
   if (afterFirstPass.mustStop.length > 0) {
     log.info('Boot quiescence second pass', {
@@ -762,8 +561,7 @@ export async function quiesceWorkgroupsForBootMountChange(
       containers: afterFirstPass.mustStop.map((entry) => entry.name),
     });
   }
-  // Sessions the first note skipped as survivable and which this pass is
-  // about to interrupt after all get their note now, before the stop.
+  // Sessions the first note skipped and this pass will interrupt get their note now, before the stop.
   const alreadyMustStop = new Set(sessionIdsOf(preStop.mustStop));
   const reclassified = sessionIdsOf(afterFirstPass.mustStop).filter((id) => !alreadyMustStop.has(id));
   if (reclassified.length > 0) {
@@ -774,11 +572,7 @@ export async function quiesceWorkgroupsForBootMountChange(
     });
   }
   stopAll(afterFirstPass.mustStop);
-  // The door's last word is always a listing, whether or not the second pass
-  // stopped anything: the scope handed to adoption is built from an inventory
-  // nothing was awaited after, and a must-stop container still in it — a stop
-  // that did not take, a newcomer that slipped in behind the pass-2 note — is
-  // one this boot cannot prove absent.
+  // The door's last word is always a listing: a must-stop container still present cannot be proven absent.
   const afterSecondPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
   if (afterSecondPass.mustStop.length > 0) {
     throw new Error(
@@ -797,10 +591,7 @@ export async function quiesceWorkgroupsForBootMountChange(
     survivableSessionIds: survivors.map((entry) => entry.sessionId as string),
     mustStopSessionIds: [...new Set(sessionIdsOf([...preStop.mustStop, ...afterFirstPass.mustStop]))],
   };
-  // Plan §6's measurement shape, in its order. `changed` is the post-stop
-  // count, the same set the caller reconciles. The session-id arrays stay out
-  // of the line: they are the consumer contract for E and G, and a boot with a
-  // large fleet would bury the counts an operator reads.
+  // Session-id arrays stay out of the line: a large fleet would bury the counts.
   log.info('Boot quiescence scope', {
     workgroups: scope.workgroups,
     changed: finalChanged.length,
@@ -808,7 +599,6 @@ export async function quiesceWorkgroupsForBootMountChange(
     stopped: scope.stopped,
     survivable: scope.survivable,
     unlabeled: scope.unlabeled,
-    // Every container either pass classified must-stop; under D2 it equals `stopped`.
     mustStop: mustStopNames.size,
   });
   return scope;
@@ -841,9 +631,7 @@ export async function restartAgentGroupContainers(
   wakeMessage?: string,
   options: { respawnAll?: boolean } = {},
 ): Promise<number> {
-  // A pending survivor (adoption could not yet claim it) is
-  // running the OLD image and configuration too; it is selected like a tracked
-  // container and stopped through `killContainer`, which routes it.
+  // A pending survivor runs the old image too; it is stopped through `killContainer`, which routes it.
   const sessions = (await getSessionsByAgentGroup(agentGroupId)).filter(
     (s) => s.status === 'active' && (isContainerRunning(s.id) || hasPendingAdoption(s.id)),
   );
@@ -851,11 +639,8 @@ export async function restartAgentGroupContainers(
   let restarted = 0;
   let failed = 0;
   for (const session of sessions) {
-    // A pending survivor held on an adoption-inventory failure has no
-    // container name yet, and nothing can stop a container it cannot name.
-    // Resolve it from the runtime BEFORE the wake row is written: gone means
-    // there is nothing to restart (and no row to leave behind); unknown means
-    // this restart cannot be performed or reported.
+    // A pending survivor has no container name yet: resolve it from the runtime before writing the wake row. Gone
+    // means nothing to restart; unknown means this restart cannot be performed.
     if (hasPendingAdoption(session.id)) {
       const resolved = await resolvePendingSurvivor(session.id);
       if (resolved === 'gone') continue;
@@ -868,22 +653,9 @@ export async function restartAgentGroupContainers(
         continue;
       }
     }
-    // WRITE FIRST. `on_wake` rows are visible only on a container's FIRST poll
-    // (`selection.ts` adds `AND on_wake = 0` to every later one), so the row
-    // has to exist before any fresh container looks — writing it after the
-    // checks instead means a replacement that completes its first poll during
-    // the write never sees it, and the row then waits for an unrelated future
-    // spawn. Deferring the write does not remove that failure, it relocates it.
-    //
-    // The paths below that decline to restart therefore COMPENSATE rather than
-    // reorder: `withdrawWake` removes the row if, and only if, nothing has
-    // consumed it. See `withdrawUnconsumedWake`.
-    //
-    // Awaited so the row is durable before `killContainer`, and a failure costs
-    // this session only: before the await existed the write was
-    // fire-and-forget and its rejection escaped as an unhandledRejection, so
-    // the loop always finished; letting it throw here would kill the sessions
-    // ahead of it and strand every one behind it, half-restarting the group.
+    // WRITE FIRST: `on_wake` rows are visible only on a container's first poll, so the row must exist before any
+    // fresh container looks. Paths that decline to restart compensate via `withdrawWake` rather than reorder.
+    // Awaited, and a failure costs this session only, so the loop never half-restarts the group.
     const wakeId = wakeMessage ? `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : null;
     if (wakeMessage && wakeId) {
       try {
@@ -912,15 +684,8 @@ export async function restartAgentGroupContainers(
       }
     }
 
-    // Take back the promise when the restart it announced does not happen.
-    // Existing-only and best-effort: a session whose mailbox is gone has no row
-    // to withdraw, and failing to withdraw must not itself abort the loop — the
-    // worst case is the stale notice this exists to prevent, logged.
-    //
-    // The ownership probe is passed as a thunk, not as a value: the op invokes
-    // it immediately before its delete, so a container that came up while this
-    // decline path was being taken is still seen. Reading it here instead would
-    // reintroduce the stale precondition every other fix in this PR removes.
+    // Withdraw the wake when the announced restart does not happen. Best-effort. The ownership probe is a thunk
+    // the op invokes right before its delete, so a container that came up meanwhile is still seen.
     const withdrawWake = async (): Promise<void> => {
       if (!wakeId) return;
       try {
@@ -937,40 +702,25 @@ export async function restartAgentGroupContainers(
       }
     };
 
-    // The container can exit during the awaited write above, and killContainer
-    // no-ops on a session it no longer tracks — counting that as a restart
-    // reports work that did not happen. A pending survivor is still a
-    // container to restart; its exit clears the pending mark the same way.
+    // The container can exit during the awaited write, and killContainer no-ops on it: do not count a restart.
     if (!isContainerRunning(session.id) && !hasPendingAdoption(session.id)) {
       await withdrawWake();
       continue;
     }
-    // Identity of the container we are about to kill. The pending read below
-    // is async, so the snapshotted container can exit and an inbound wake can
-    // install a REPLACEMENT before control returns — and killing that one is
-    // both wrong and silent: if the read saw no due rows, no onExit is
-    // installed, so the replacement's freshly claimed input goes dark until a
-    // later recovery pass. The container NAME identifies the process: every
-    // spawn mints a new one, and a pending survivor adopted during the await
-    // keeps its own — `getContainerSpawnedAt` would flip from 0 to the adoption
-    // instant there and misread adoption as replacement.
+    // Identity of the container about to be killed: during the async read below a replacement can start, and
+    // killing it would silently strand its claimed input. The name identifies the process (a spawn mints a new one;
+    // an adopted survivor keeps its own), unlike `getContainerSpawnedAt`.
     const identity = getContainerIdentity(session.id);
 
     // Always respawn after the kill when there is anything to process: an
     // explicit wake message, or in-flight messages the dying container had
     // claimed. Without this, a provider switch mid-conversation leaves the
     // claimed messages dark until the next inbound or a slow sweep backoff.
-    //
-    // This open can throw, now that the inbound funnel refuses under a reclaim
-    // claim — same rule as the write: cost this session, not the loop.
+    // This open can throw under a reclaim claim: cost this session, not the loop.
     let hasPending: boolean;
     try {
-      // Read-only, so `withExistingMailboxSession` — never the provisioning
-      // variant, which would resurrect a reclaimed session (invariant I-4).
-      // `undefined` (no mailbox) is treated exactly like a read failure rather
-      // than as "nothing pending": this session's container is RUNNING, so a
-      // missing mailbox is an inconsistent host view, and the conservative
-      // answer is to leave it alone.
+      // Existing-only (the provisioning variant would resurrect a reclaimed session). No mailbox for a running
+      // container is an inconsistent view: leave it alone rather than read it as "nothing pending".
       const due = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
         mailbox.countDueMessages(),
       );
@@ -986,11 +736,8 @@ export async function restartAgentGroupContainers(
       await withdrawWake();
       continue;
     }
-    // Re-check the generation, not just liveness: a replacement is "running"
-    // too. Leave it alone — it is doing the work this restart wanted done. If
-    // that replacement's first poll already took the wake row, the withdrawal
-    // is a no-op and it keeps it; if it polled before the row landed, the
-    // withdrawal is what stops the row outliving this restart.
+    // Re-check identity, not liveness: a replacement is doing the work this restart wanted; the withdrawal stops
+    // the wake row outliving this restart if the replacement polled before it landed.
     if (getContainerIdentity(session.id) !== identity) {
       log.info('Restart: container was replaced while reading pending work; leaving the replacement alone', {
         agentGroupId,
@@ -1004,19 +751,14 @@ export async function restartAgentGroupContainers(
       reason,
       wakeMessage || hasPending || options.respawnAll
         ? () => {
-            // The liveness proof rides WITH the wake instead of preceding it:
-            // `wakeContainer` awaits admission, the memory queue and the whole
-            // spawn preparation, and a `getSession` here proves nothing about
-            // any of that.
+            // The liveness proof rides with the wake: `wakeContainer` awaits admission and spawn preparation.
             void requestWake(session, 'container-restart', {
               priority: 'interactive',
               guard: sessionStillActive(session.id),
             });
           }
         : undefined,
-      // The durable half of the same decision. The branch above is the only
-      // one that brings the session back, so it is the only one that may
-      // promise a boot after this host dies that it still owes a respawn.
+      // Only the branch that brings the session back may promise a post-crash respawn.
       wakeMessage || hasPending || options.respawnAll ? 'respawn_after_stop' : 'stop',
     );
     restarted += 1;

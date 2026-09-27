@@ -8,30 +8,12 @@
  * matching a high-confidence secret pattern rejects the whole plugin so a
  * real key never lands in a registry install.
  *
- * FORK NOTE — this layers on `parseMcpServerConfig`, which is strictly
- * stricter here than upstream's. Three fork rules have no upstream
- * counterpart and all of them still bite through this reader:
- *
- *   - a raw credential in a URL PATH SEGMENT (the Zapier-style
- *     `https://host/s/<token>/mcp`) is refused;
- *   - a credential-named QUERY KEY (`?apikey=`, `?authToken=`) is refused,
- *     via two-pass word + suffix matching;
- *   - a credential header on a LOOPBACK url is refused, because the OneCLI
- *     gateway cannot inject into a container-local endpoint.
- *
- * And the fork's credential-header contract differs from upstream's: a header
- * that is not one of a small closed set of configuration headers must carry
- * the OneCLI placeholder (`onecli-managed`, optionally behind one auth-scheme
- * token), not the Agent Plugins literal `placeholder`. A plugin shipping
- * `Authorization: placeholder` therefore has that ONE server skipped with a
- * named report line — the gateway would not substitute such a header, so
- * accepting it would stamp a server that 401s on first use. `placeholder` in
- * an `env` value is unaffected and accepted, which is where the Agent Plugins
- * convention actually carries weight.
- *
- * Ordering matters: the fatal secret lint runs on the RAW entry, BEFORE the
- * fork's parser, so a real credential is a whole-plugin rejection rather than
- * being downgraded to a per-server skip by the stricter header allowlist.
+ * FORK NOTE: `parseMcpServerConfig` is stricter than upstream's. It refuses a raw credential in a URL path segment, a
+ * credential-named query key, and a credential header on a loopback URL (the OneCLI gateway cannot inject there). A
+ * non-configuration header must carry the OneCLI placeholder (`onecli-managed`), not the Agent Plugins literal
+ * `placeholder`, which the gateway would not substitute, so such a server is skipped; `placeholder` in `env` is fine.
+ * The fatal secret lint runs on the RAW entry BEFORE that parser, so a real credential rejects the whole plugin
+ * rather than becoming a per-server skip.
  */
 import fs from 'fs';
 import path from 'path';
@@ -49,10 +31,7 @@ import { MCP_SCHEMA_URL } from './manifest.js';
 const PLACEHOLDER_VALUE = 'placeholder';
 
 /**
- * Values the lint never questions: the Agent Plugins literal, and this fork's
- * OneCLI placeholder (`onecli-managed`, optionally behind one auth-scheme
- * token). The second is what the warn line below tells authors to write, so
- * warning about it would be advice that contradicts itself.
+ * The Agent Plugins literal and the fork's OneCLI placeholder, which the warn line below tells authors to write.
  */
 function isDeclaredPlaceholder(value: string): boolean {
   return value === PLACEHOLDER_VALUE || isOneCliPlaceholder(value);
@@ -94,15 +73,9 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
   }
   if (!fs.existsSync(file)) return { servers: {}, report };
 
-  // CLASS INVARIANT: no plugin whose `mcp.json` cannot be
-  // PROVEN free of credentials may be stamped. `createAgentFromTemplate` copies
-  // the whole plugin directory into the agent-readable
-  // `groups/<folder>/plugins/<name>` mount, so every skip below ships the file
-  // anyway. A file that cannot be parsed cannot be linted — a trailing comma
-  // beside `API_KEY: "sk-…"` would otherwise carry the credential straight to
-  // the agent — so an unreadable or unparseable mcp.json rejects the plugin
-  // outright rather than degrading to a skip. Skips remain only for shapes the
-  // lint has already inspected.
+  // CLASS INVARIANT: a plugin whose mcp.json cannot be PROVEN credential-free is never stamped. The whole plugin dir
+  // is copied into the agent-readable mount, so a skip still ships the file; an unreadable or unparseable file
+  // therefore rejects the plugin instead of degrading to a skip.
   let raw: unknown;
   // eslint-disable-next-line no-catch-all/no-catch-all -- a malformed template file is expected input, reported as a rejection
   try {
@@ -121,12 +94,8 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
     );
   }
 
-  // FATAL lint before ANY component-level skip below. A skipped component
-  // still ships: `createAgentFromTemplate` copies the whole plugin directory
-  // into the agent-readable `groups/<folder>/plugins/<name>` tree, so a
-  // credential sitting in a well-formed entry under a wrong `$schema` or an
-  // unknown top-level key would have reached the agent unlinted. The severity
-  // belongs to the credential, whatever else is malformed.
+  // FATAL lint before ANY component-level skip: a skipped component still ships, so a credential under a wrong
+  // `$schema` or an unknown key would otherwise reach the agent unlinted.
   lintDocumentCredentials(raw, report);
 
   if (raw.$schema !== MCP_SCHEMA_URL) {
@@ -159,17 +128,9 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
 }
 
 /**
- * Lint the WHOLE parsed mcp.json for smuggled credentials before anything
- * decides to skip part of it. Throws (whole-plugin rejection) on a real
- * credential; shape problems are left to the readers below.
- *
- * Scanning the document rather than a walk of the entries it recognises is the
- * point. Every earlier version of this scan inspected a SUBSET — first two
- * fields, then every field of every object entry — and each subset had an edge
- * just outside it that still shipped: a credential in `args`, a header scheme
- * off the list, a bare string entry (`"crm": "sk-live-…"`). The file is copied
- * verbatim into the agent-readable `groups/<folder>/plugins/<name>` mount, so
- * the unit that must be proven credential-free is the file.
+ * Lints the WHOLE parsed mcp.json and throws (whole-plugin rejection) on a real credential. The document, not a walk
+ * of recognised entries: every subset scan had an edge that shipped (a credential in `args`, a bare string entry),
+ * and the file is copied verbatim into the agent-readable mount.
  */
 function lintDocumentCredentials(raw: Record<string, unknown>, report: string[]): void {
   if (isPlainObject(raw.mcpServers)) {
@@ -179,18 +140,13 @@ function lintDocumentCredentials(raw: Record<string, unknown>, report: string[])
       for (const kind of ['env', 'headers'] as const) assertLintableValues(name, kind, entry[kind]);
     }
   }
-  // `raw`, not `raw.mcpServers`: the FILE is what ships, so a credential parked
-  // in a sibling key (`metadata: { token: "sk-live-…" }`, or a secret-shaped
-  // `$schema`) reaches the agent just the same.
+  // `raw`, not `raw.mcpServers`: a credential in a sibling key ships just the same.
   for (const [where, value] of entryStrings(raw)) {
     lintSecrets(where.split('.')[1] ?? 'mcp.json', where, value, report);
   }
 }
 
-/**
- * Every string anywhere under a value, paired with a dotted path naming where
- * it came from (`mcpServers.crm.args[0]`, `mcpServers.crm.env.API_KEY`).
- */
+/** Every string under a value, with a dotted path naming where it came from (`mcpServers.crm.args[0]`). */
 function entryStrings(value: unknown, prefix = ''): [string, string][] {
   if (typeof value === 'string') return [[prefix || 'value', value]];
   if (Array.isArray(value)) return value.flatMap((item, i) => entryStrings(item, `${prefix}[${i}]`));
@@ -290,10 +246,8 @@ function readServerEntry(name: string, entry: unknown): ParsedMcpServerConfig | 
  */
 function lintSecrets(server: string, where: string, value: string, report: string[]): void {
   if (isDeclaredPlaceholder(value)) return;
-  // SECRET_VALUE_RE is ^-anchored, so strip a leading auth scheme first. The
-  // surrounding parser accepts ANY single-token scheme, so match that rather
-  // than a fixed list — "Key sk-…" hid its credential from a Bearer/Token/Basic
-  // list while the parser happily accepted the header.
+  // SECRET_VALUE_RE is ^-anchored, so strip a leading auth scheme first: ANY single-token scheme, as the parser
+  // accepts, not a fixed list.
   const bare = value.replace(/^[A-Za-z][A-Za-z0-9-]*\s+/, '');
   if (SECRET_VALUE_RE.test(value) || SECRET_VALUE_RE.test(bare)) {
     throw new Error(
