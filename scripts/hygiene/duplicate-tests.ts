@@ -1,14 +1,12 @@
-import path from 'node:path';
-
 import ts from 'typescript';
 
 export interface TestCase {
   file: string;
   line: number;
   name: string;
-  context: string;
+  scope: string;
   statements: string[];
-  asserts: boolean;
+  assertions: boolean[];
 }
 
 export interface DuplicateTest {
@@ -21,9 +19,8 @@ export const TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
 
 const CASE_CALLEES = new Set(['it', 'test']);
 const SUITE_CALLEES = new Set(['describe', 'suite']);
-const HOOKS = new Set(['beforeEach', 'beforeAll', 'afterEach', 'afterAll']);
 const NOT_RUN = new Set(['skip', 'todo', 'fails', 'skipIf', 'runIf']);
-const ASSERTION = /(?:^|[^\w$])(?:expect|assert\w*)(?:[^\w$]|$)/;
+const ASSERTION = /^(?:expect|assert\w*)$/;
 
 interface Callee {
   base: string;
@@ -61,11 +58,6 @@ function bindingNames(name: ts.BindingName, into: Set<string>): Set<string> {
   if (ts.isIdentifier(name)) into.add(name.text);
   else for (const element of name.elements) if (!ts.isOmittedExpression(element)) bindingNames(element.name, into);
   return into;
-}
-
-function moduleId(file: string, specifier: string): string {
-  if (!specifier.startsWith('.')) return specifier;
-  return path.posix.join(path.posix.dirname(file), specifier).replace(/\.(?:[cm]?[jt]sx?)$/, '');
 }
 
 function isPropertyName(node: ts.Identifier): boolean {
@@ -114,15 +106,35 @@ function within(node: ts.Node, root: ts.Node): boolean {
   return false;
 }
 
+function asserts(node: ts.Node): boolean {
+  if (ts.isCallExpression(node)) {
+    let callee: ts.Expression = node.expression;
+    while (ts.isPropertyAccessExpression(callee) || ts.isCallExpression(callee)) callee = callee.expression;
+    if (ts.isIdentifier(callee) && ASSERTION.test(callee.text)) return true;
+  }
+  return ts.forEachChild(node, asserts) ?? false;
+}
+
+function innermostScope(node: ts.Node): ts.Node {
+  let p = node.parent;
+  while (
+    !ts.isSourceFile(p) &&
+    !ts.isBlock(p) &&
+    !ts.isFunctionLike(p) &&
+    !ts.isIterationStatement(p, false) &&
+    !ts.isCaseOrDefaultClause(p)
+  ) {
+    p = p.parent;
+  }
+  return p;
+}
+
 class Normalizer {
   private locals = new Map<string, string>();
-  private root: ts.Node | undefined;
 
   constructor(
     private readonly sourceFile: ts.SourceFile,
-    private readonly imports: Map<string, string>,
-    private readonly scopes: { id: string; names: Set<string> }[],
-    private readonly stop: ts.Node,
+    private readonly root?: ts.Node,
   ) {}
 
   private identifier(node: ts.Identifier): string {
@@ -137,27 +149,16 @@ class Normalizer {
 
   private resolve(node: ts.Identifier): string {
     const name = node.text;
-    for (let p = node.parent; p && p !== this.stop; p = p.parent) {
+    for (let p = node.parent; p && this.root && within(p, this.root); p = p.parent) {
       if (!scopeDeclares(p).has(name)) continue;
-      if (this.root && within(p, this.root)) {
-        const key = `${name}@${p.pos}`;
-        if (!this.locals.has(key)) this.locals.set(key, `$${this.locals.size}`);
-        return this.locals.get(key)!;
-      }
-      if ((ts.isForOfStatement(p) || ts.isForInStatement(p)) && p.expression) {
-        return `${new Normalizer(this.sourceFile, this.imports, this.scopes, this.stop).text(p.expression)}::${name}`;
-      }
-      const named = (p as { name?: ts.Node }).name;
-      return `${ts.SyntaxKind[p.kind]}${named && ts.isIdentifier(named) ? `:${named.text}` : ''}::${name}`;
+      const key = `${name}@${p.pos}`;
+      if (!this.locals.has(key)) this.locals.set(key, `$${this.locals.size}`);
+      return this.locals.get(key)!;
     }
-    for (let i = this.scopes.length - 1; i >= 0; i--) {
-      if (this.scopes[i].names.has(name)) return `${this.scopes[i].id}::${name}`;
-    }
-    return this.imports.get(name) ?? name;
+    return name;
   }
 
-  text(node: ts.Node, localRoot: ts.Node = node): string {
-    this.root = localRoot;
+  text(node: ts.Node): string {
     const out: string[] = [];
     const visit = (n: ts.Node) => {
       if (ts.isIdentifier(n)) out.push(this.identifier(n));
@@ -171,109 +172,81 @@ class Normalizer {
   }
 }
 
+function isSuiteOrCase(statement: ts.Statement): boolean {
+  if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return false;
+  const callee = calleeOf(statement.expression);
+  return !!callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
+}
+
+function environment(scope: ts.Node, text: (n: ts.Node) => string): string {
+  const parts: ts.Node[] = [];
+  if (ts.isSourceFile(scope) || ts.isBlock(scope) || ts.isCaseOrDefaultClause(scope)) {
+    parts.push(...scope.statements.filter((st) => !isSuiteOrCase(st)));
+  } else if (ts.isFunctionLike(scope)) {
+    parts.push(...scope.parameters);
+    if (ts.isCallExpression(scope.parent)) parts.push(scope.parent.expression);
+  } else if (ts.isForOfStatement(scope) || ts.isForInStatement(scope)) {
+    parts.push(scope.initializer, scope.expression);
+  } else if (ts.isForStatement(scope)) {
+    for (const n of [scope.initializer, scope.condition, scope.incrementor]) if (n) parts.push(n);
+  } else if (ts.isWhileStatement(scope) || ts.isDoStatement(scope)) {
+    parts.push(scope.expression);
+  }
+  return `${ts.SyntaxKind[scope.kind]}(${parts.map(text).join(';')})`;
+}
+
 export function extractCases(file: string, text: string): TestCase[] {
   const kind = file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
   const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
-  const imports = new Map<string, string>();
-  const fileNames = new Set<string>();
-  for (const statement of sourceFile.statements) {
-    if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
-      const id = moduleId(file, statement.moduleSpecifier.text);
-      const clause = statement.importClause;
-      if (clause?.name) imports.set(clause.name.text, `${id}#default`);
-      const bindings = clause?.namedBindings;
-      if (bindings && ts.isNamespaceImport(bindings)) imports.set(bindings.name.text, `${id}#*`);
-      if (bindings && ts.isNamedImports(bindings)) {
-        for (const el of bindings.elements) imports.set(el.name.text, `${id}#${(el.propertyName ?? el.name).text}`);
-      }
-    } else if (ts.isVariableStatement(statement)) {
-      for (const decl of statement.declarationList.declarations) bindingNames(decl.name, fileNames);
-    } else if (
-      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement)) &&
-      statement.name
-    ) {
-      fileNames.add(statement.name.text);
+  const outer = new Normalizer(sourceFile);
+  const environments = new Map<ts.Node, string>();
+  const scopeOf = (node: ts.Node): string => {
+    const levels: string[] = [];
+    for (let s = innermostScope(node); ; s = innermostScope(s)) {
+      if (!environments.has(s))
+        environments.set(
+          s,
+          environment(s, (n) => outer.text(n)),
+        );
+      levels.push(environments.get(s)!);
+      if (ts.isSourceFile(s)) return levels.join('\n');
     }
-  }
-
+  };
   const cases: TestCase[] = [];
-  const scopes = [{ id: '', names: fileNames }];
-  let suites = 0;
-  const contexts: string[] = [];
-
-  const normalize = (node: ts.Node, stop: ts.Node) => new Normalizer(sourceFile, imports, scopes, stop).text(node);
-
-  const isSuiteOrCase = (statement: ts.Statement) => {
-    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return false;
-    const callee = calleeOf(statement.expression);
-    return !!callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
-  };
-
-  const blockContext = (statements: ts.NodeArray<ts.Statement>, fileLevel: boolean, stop: ts.Node) =>
-    statements
-      .filter((s) => {
-        if (!ts.isExpressionStatement(s) || isSuiteOrCase(s)) return false;
-        if (fileLevel) return true;
-        const call = s.expression;
-        return ts.isCallExpression(call) && ts.isIdentifier(call.expression) && HOOKS.has(call.expression.text);
-      })
-      .map((s) => normalize(s, stop))
-      .join('\n');
-
-  const visitBlock = (statements: ts.NodeArray<ts.Statement>, fileLevel: boolean, stop: ts.Node) => {
-    contexts.push(blockContext(statements, fileLevel, stop));
-    const visit = (node: ts.Node) => {
-      if (ts.isCallExpression(node)) {
-        const callee = calleeOf(node);
-        const callback = callee && callbackOf(node);
-        const known = callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
-        if (known && callee.modifiers.some((m) => NOT_RUN.has(m))) return;
-        if (callee && callback) {
-          if (SUITE_CALLEES.has(callee.base) && callback.body && ts.isBlock(callback.body)) {
-            const names = new Set<string>();
-            for (const s of callback.body.statements) {
-              if (ts.isVariableStatement(s))
-                for (const d of s.declarationList.declarations) bindingNames(d.name, names);
-              else if ((ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s)) && s.name) names.add(s.name.text);
-            }
-            for (const p of callback.parameters) bindingNames(p.name, names);
-            scopes.push({ id: `@s${++suites}`, names });
-            visitBlock(callback.body.statements, false, callback.body);
-            scopes.pop();
-            return;
-          }
-          if (CASE_CALLEES.has(callee.base) && callback.body) {
-            const normalizer = new Normalizer(sourceFile, imports, scopes, stop);
-            const body = callback.body;
-            const statements = [
-              ...(callee.table ? [`each ${normalize(callee.table, stop)}`] : []),
-              ...(callback.parameters.length
-                ? [callback.parameters.map((p) => normalizer.text(p, callback)).join(' , ')]
-                : []),
-              ...(ts.isBlock(body)
-                ? body.statements.map((s) => normalizer.text(s, callback))
-                : [normalizer.text(body, callback)]),
-            ];
-            const title = node.arguments[0];
-            cases.push({
-              file,
-              line: sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1,
-              name: title && ts.isStringLiteralLike(title) ? title.text : title ? title.getText(sourceFile) : '',
-              context: contexts.join('\n--\n'),
-              statements,
-              asserts: statements.some((s) => ASSERTION.test(s)),
-            });
-            return;
-          }
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const callee = calleeOf(node);
+      const known = callee && (SUITE_CALLEES.has(callee.base) || CASE_CALLEES.has(callee.base));
+      if (known && callee.modifiers.some((m) => NOT_RUN.has(m))) return;
+      const callback = callee && CASE_CALLEES.has(callee.base) ? callbackOf(node) : undefined;
+      if (callee && callback?.body) {
+        const normalizer = new Normalizer(sourceFile, callback);
+        const body = callback.body;
+        const parts: ts.Node[] = ts.isBlock(body) ? [...body.statements] : [body];
+        const statements = [
+          ...(callee.table ? [`each ${normalizer.text(callee.table)}`] : []),
+          ...(callback.parameters.length ? [callback.parameters.map((p) => normalizer.text(p)).join(' , ')] : []),
+        ];
+        const assertions = statements.map(() => false);
+        for (const part of parts) {
+          statements.push(normalizer.text(part));
+          assertions.push(asserts(part));
         }
+        const title = node.arguments[0];
+        cases.push({
+          file,
+          line: sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1,
+          name: title && ts.isStringLiteralLike(title) ? title.text : title ? title.getText(sourceFile) : '',
+          scope: `${callee.modifiers.join('.')}\n${scopeOf(node)}`,
+          statements,
+          assertions,
+        });
+        return;
       }
-      ts.forEachChild(node, visit);
-    };
-    for (const statement of statements) visit(statement);
-    contexts.pop();
+    }
+    ts.forEachChild(node, visit);
   };
-
-  visitBlock(sourceFile.statements, true, sourceFile);
+  visit(sourceFile);
   return cases;
 }
 
@@ -283,18 +256,17 @@ const at = (c: TestCase) => `${c.file}:${c.line}`;
 const order = (a: TestCase, b: TestCase) => a.file.localeCompare(b.file) || a.line - b.line;
 
 export function findDuplicateTests(newCases: TestCase[], allCases: TestCase[]): DuplicateTest[] {
-  const byContext = new Map<string, TestCase[]>();
+  const byScope = new Map<string, TestCase[]>();
   for (const c of allCases) {
-    if (!c.asserts) continue;
-    const group = byContext.get(c.context) ?? [];
-    group.push(c);
-    byContext.set(c.context, group);
+    if (!c.assertions.some(Boolean)) continue;
+    const key = `${c.file}|${c.scope}`;
+    byScope.set(key, [...(byScope.get(key) ?? []), c]);
   }
   const fresh = new Set(newCases.map(at));
   const found: DuplicateTest[] = [];
   for (const test of [...newCases].sort(order)) {
-    if (!test.asserts) continue;
-    const others = (byContext.get(test.context) ?? []).filter((c) => c.file === test.file && at(c) !== at(test));
+    if (!test.assertions.some(Boolean)) continue;
+    const others = (byScope.get(`${test.file}|${test.scope}`) ?? []).filter((c) => at(c) !== at(test));
     const same = others.find(
       (c) => sameStatements(c.statements, test.statements) && (!fresh.has(at(c)) || order(c, test) < 0),
     );
@@ -303,17 +275,14 @@ export function findDuplicateTests(newCases: TestCase[], allCases: TestCase[]): 
       continue;
     }
     const wider = others.find(
-      (c) =>
-        isProperPrefix(test.statements, c.statements) &&
-        c.statements.slice(test.statements.length).some((s) => ASSERTION.test(s)),
+      (c) => isProperPrefix(test.statements, c.statements) && c.assertions.slice(test.statements.length).some(Boolean),
     );
     if (wider) found.push({ kind: 'subsumed-by', test, keeper: wider });
   }
   return found;
 }
 
-const SUITE_SCOPE = /@s\d+::/g;
-const shapeKey = (c: TestCase) => `${c.context}\n==\n${c.statements.join('\n')}`.replace(SUITE_SCOPE, '@s::');
+const shapeKey = (c: TestCase) => c.statements.join('\n');
 
 export function addedCases(base: TestCase[], head: TestCase[]): TestCase[] {
   const named = new Map<string, number>();

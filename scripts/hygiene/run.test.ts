@@ -441,6 +441,25 @@ describe('duplicate tests', () => {
     expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
   });
 
+  it('accepts a trailer for a title that contains a pipe', () => {
+    const root = repo(
+      { 'src/f.test.ts': spec(keeper) },
+      { 'src/f.test.ts': spec(`${keeper}it('a | b', () => {\n  expect(f(1)).toBe(2);\n});\n`) },
+    );
+    expect(duplicateTestFindings(root, growthBase(root))).toHaveLength(1);
+    git(root, 'commit', '-q', '--allow-empty', '-m', 'why\n\nDuplicate-test: src/f.test.ts | a | b | pins a title');
+    expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
+  });
+
+  it('survives a deleted test whose directory became a file', () => {
+    const root = repo({ 'src/d/old.test.ts': spec(keeper) }, { 'src/d/old.test.ts': null });
+    fs.rmdirSync(path.join(root, 'src/d'));
+    write(root, { 'src/d': 'now a file\n' });
+    git(root, 'add', '-A');
+    git(root, 'commit', '-q', '-m', 'dir to file');
+    expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
+  });
+
   it('does not report a duplicate that a renamed file already held', () => {
     const pair = spec(`${keeper}it('copy', () => {\n  expect(f(1)).toBe(2);\n});\n`);
     const root = repo(

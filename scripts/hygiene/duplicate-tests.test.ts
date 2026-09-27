@@ -67,6 +67,22 @@ it('wider', () => {
       'the same body in loops over different rows',
       "for (const x of [1]) it('a', () => {\n  expect(f(x)).toBe(2);\n});\nfor (const x of [5]) it('b', () => {\n  expect(f(x)).toBe(2);\n});",
     ],
+    [
+      'the same body in sibling blocks with different bindings',
+      "{\n  const v = 1;\n  it('a', () => {\n    expect(f(v)).toBe(2);\n  });\n}\n{\n  const v = 5;\n  it('b', () => {\n    expect(f(v)).toBe(2);\n  });\n}",
+    ],
+    [
+      'the same body in suites under loops over different rows',
+      "for (const x of [1]) describe('s', () => {\n  it('a', () => {\n    expect(f(x)).toBe(2);\n  });\n});\nfor (const x of [5]) describe('s', () => {\n  it('b', () => {\n    expect(f(x)).toBe(2);\n  });\n});",
+    ],
+    [
+      'the same body in sibling suites whose aliased setup hooks differ',
+      "describe('s', () => {\n  setup(() => g(1));\n  it('a', () => {\n    expect(f(1)).toBe(2);\n  });\n});\ndescribe('t', () => {\n  setup(() => g(5));\n  it('b', () => {\n    expect(f(1)).toBe(2);\n  });\n});",
+    ],
+    [
+      'the same table under each and for, whose callbacks receive different arguments',
+      "it.each([[1, 2]])('a', (x) => {\n  expect(f(x)).toBe(2);\n});\nit.for([[1, 2]])('b', (x) => {\n  expect(f(x)).toBe(2);\n});",
+    ],
   ])('does not flag %s', (_label, added) => {
     expect(duplicates(keeper, `${keeper}${added}\n`)).toEqual([]);
   });
@@ -92,6 +108,18 @@ it('wider', () => {
   it('does not flag a case whose longer match adds no assertion', () => {
     const longer = "it('longer', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n  g(0);\n});\n";
     expect(duplicates(longer, longer + keeper)).toEqual([]);
+  });
+
+  it('does not treat assertion words inside a string as an assertion', () => {
+    const longer =
+      "it('longer', () => {\n  const out = f(1);\n  expect(out).toBe(2);\n  g('assertion complete');\n});\n";
+    expect(duplicates(longer, longer + keeper)).toEqual([]);
+  });
+
+  it('does not report duplicates already on main when a change only edits their setup hook', () => {
+    const suite = (n: number) =>
+      `describe('s', () => {\n  beforeEach(() => g(${n}));\n  it('a', () => {\n    expect(f(1)).toBe(2);\n  });\n  it('b', () => {\n    expect(f(1)).toBe(2);\n  });\n});\n`;
+    expect(duplicates(suite(1), suite(2))).toEqual([]);
   });
 
   it('reports the added copy, not the existing case, when the copy is inserted above it', () => {

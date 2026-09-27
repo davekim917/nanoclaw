@@ -241,12 +241,20 @@ function changedFiles(root: string, base: string): string[] {
   ].sort();
 }
 
+function readRegularFile(file: string): string | null {
+  try {
+    return fs.lstatSync(file).isFile() ? fs.readFileSync(file, 'utf8') : null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ENOTDIR') {
+      return null;
+    }
+    throw err;
+  }
+}
+
 function textAt(root: string, base: string, file: string): { base: string | null; head: string | null } {
   const atBase = git(root, ['cat-file', 'blob', `${base}:${file}`]);
-  const onDisk = fs.lstatSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()
-    ? fs.readFileSync(path.join(root, file), 'utf8')
-    : null;
-  return { base: atBase.status === 0 ? atBase.stdout : null, head: onDisk };
+  return { base: atBase.status === 0 ? atBase.stdout : null, head: readRegularFile(path.join(root, file)) };
 }
 
 /** Every changed non-test TS/JS file, not only the scanned roots; uncommitted and untracked files count. */
@@ -261,11 +269,18 @@ export function commentGrowth(root: string, base: string, exempt: Exempt): Comme
   return { base, files };
 }
 
-const DUPLICATE_WAIVER = /^Duplicate-test:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*\S.*$/gm;
+const waiverKey = (text: string) => text.trim().replace(/\s*\|\s*/g, '|');
 
 export function duplicateTestFindings(root: string, base: string): Finding[] {
   const log = stdoutOf('git', git(root, ['log', '--format=%B', `${base}..HEAD`]));
-  const waived = new Set([...log.matchAll(DUPLICATE_WAIVER)].map(([, file, name]) => `${file}|${name}`));
+  const waivers = log
+    .split('\n')
+    .filter((line) => line.startsWith('Duplicate-test:'))
+    .map((line) => waiverKey(line.slice('Duplicate-test:'.length)));
+  const isWaived = (file: string, name: string) => {
+    const key = `${waiverKey(`${file} | ${name}`)}|`;
+    return waivers.some((w) => w.startsWith(key) && w.length > key.length);
+  };
   const renames = stdoutOf('git', git(root, ['diff', '--name-status', '-M', '--diff-filter=R', '-z', base]))
     .split('\0')
     .filter(Boolean);
@@ -281,7 +296,7 @@ export function duplicateTestFindings(root: string, base: string): Finding[] {
       const headCases = extractCases(file, head);
       return findDuplicateTests(addedCases(before === null ? [] : extractCases(origin, before), headCases), headCases);
     })
-    .filter(({ test }) => !waived.has(`${test.file}|${test.name}`))
+    .filter(({ test }) => !isWaived(test.file, test.name))
     .map(({ kind, test, keeper }) => ({
       check: 'duplicate-tests' as const,
       kind,
