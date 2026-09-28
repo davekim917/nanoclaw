@@ -34,11 +34,9 @@ function trackedFiles(root: string): string[] {
   return (gitRead(root, ['ls-files', '-z']) ?? '').split('\0').filter(Boolean);
 }
 
-const SOURCE_NAME = /^[\w.-]+\.(?:ts|tsx|js|mjs|cjs|py|sh|md|json|ya?ml|sql|toml|jq)$/;
-
 type Resolution = { file: string } | { missing: true } | { ambiguous: number } | { skip: true };
 
-function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<string>) {
+function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<string>, deletedNames: ReadonlySet<string>) {
   if (tracked.has(cited)) return { file: cited } satisfies Resolution;
   const relative = path.posix.normalize(path.posix.join(path.posix.dirname(doc), cited));
   if (tracked.has(relative)) return { file: relative } satisfies Resolution;
@@ -49,12 +47,18 @@ function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<strin
   const byName = [...tracked].filter((file) => file.endsWith(`/${cited}`));
   if (byName.length === 1) return { file: byName[0] } satisfies Resolution;
   if (byName.length > 1) return { ambiguous: byName.length } satisfies Resolution;
-  if (SOURCE_NAME.test(cited)) return { missing: true } satisfies Resolution;
+  if (deletedNames.has(cited)) return { missing: true } satisfies Resolution;
   return { skip: true } satisfies Resolution;
 }
 
 function docCitationProblems(root: string, docs?: readonly string[]): string[] {
   const all = trackedFiles(root);
+  const deletedNames = new Set(
+    (gitRead(root, ['log', '--format=', '--name-only', '--diff-filter=D']) ?? '')
+      .split('\n')
+      .filter(Boolean)
+      .map((file) => path.posix.basename(file)),
+  );
   const tracked = new Set(all);
   const treeCache = new Map<string, Set<string>>();
   const filesAt = (sha: string | null): Set<string> => {
@@ -76,7 +80,7 @@ function docCitationProblems(root: string, docs?: readonly string[]): string[] {
         for (const link of run.links) {
           const cited = `${link.file}:${link.span}`;
           if (ILLUSTRATIVE_CITATIONS.has(`${doc} ${cited}`)) continue;
-          const resolved = resolveCitedPath(link.file, doc, filesAt(link.pinnedSha));
+          const resolved = resolveCitedPath(link.file, doc, filesAt(link.pinnedSha), deletedNames);
           if ('skip' in resolved) continue;
           const where = `${doc}:${index + 1}`;
           if ('ambiguous' in resolved) {
@@ -205,14 +209,14 @@ describe('docCitationProblems', () => {
     ]);
   });
 
-  it('fails a bare source file name that no tracked file, or more than one, has', () => {
-    const { root } = repo({
-      'a/x.ts': 'a\n',
-      'b/x.ts': 'b\n',
-      'doc.md': '`gone.ts:1`, `x.ts:1` and `api.example.com:443`\n',
-    });
+  it('fails a bare file name that no tracked file has any more, or that several have, and skips hosts', () => {
+    const { root } = repo({ 'a/x.ts': 'a\n', 'b/x.ts': 'b\n', 'settings.ini': 'enabled=true\n' });
+    fs.rmSync(path.join(root, 'settings.ini'));
+    fs.writeFileSync(path.join(root, 'doc.md'), '`settings.ini:1`, `x.ts:1` and `api.example.com:443`\n');
+    spawnSync('git', ['add', '-A'], { cwd: root });
+    spawnSync('git', ['commit', '-q', '-m', 'delete', '--no-gpg-sign'], { cwd: root });
     expect(docCitationProblems(root, ['doc.md'])).toEqual([
-      'doc.md:1: cites `gone.ts:1`, but no tracked file has that path',
+      'doc.md:1: cites `settings.ini:1`, but no tracked file has that path',
       'doc.md:1: cites `x.ts:1` by bare name, which 2 tracked files have',
     ]);
   });

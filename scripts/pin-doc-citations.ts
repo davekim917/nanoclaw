@@ -12,9 +12,9 @@ const USAGE =
   '  Appends " at <sha>" to each unpinned file:line citation (of the listed files, or all) in the docs\n' +
   '  (default: docs/review-notes.md and docs/review-notes/*.md). The sha is the revision, from the commit\n' +
   "  that introduced the citation back through the cited file's earlier versions, whose cited lines hold\n" +
-  "  the most identifiers the note names beside the citation; the note's own commit wins a tie unless it\n" +
-  '  changed the cited file. No identifier, no matching revision, or any other tie is refused and left for\n' +
-  '  a manual pin, and the run exits 1. Each doc must match --rev apart from pins: commit a new note first.';
+  '  the most identifiers the note names beside the citation. No identifier, no matching revision, or a\n' +
+  '  tie between different versions of the cited lines is refused and left for a manual pin, and the run\n' +
+  '  exits 1. Each doc must match --rev apart from pins: commit a new note first.';
 
 export type PinOutcome =
   | { kind: 'pinned'; doc: string; line: number; citation: string; sha: string; origin: string }
@@ -154,7 +154,6 @@ function choosePin(
   links: readonly FileLineCitation[],
   anchors: readonly string[],
   candidates: readonly string[],
-  originTouchedFile: boolean,
 ): { sha: string } | { refused: string } {
   if (anchors.length === 0)
     return { refused: 'the note names no identifier next to it to check the cited lines against' };
@@ -171,8 +170,7 @@ function choosePin(
       refused: `no revision among ${candidates.map((rev) => shortSha(root, rev)).join(', ')} has ${anchors.join(', ')} at the cited lines`,
     };
   const top = scored.filter((candidate) => candidate.score === best);
-  const originWinsTie = top[0].rev === candidates[0] && !originTouchedFile;
-  if (new Set(top.map((candidate) => candidate.texts)).size > 1 && !originWinsTie)
+  if (new Set(top.map((candidate) => candidate.texts)).size > 1)
     return {
       refused: `${top.map((candidate) => shortSha(root, candidate.rev)).join(' and ')} hold the same number of the note's identifiers at the cited lines with different code`,
     };
@@ -234,12 +232,9 @@ export function pinDocs(
           continue;
         }
         const candidates = candidateRevisions(root, origin, files);
-        const originTouchedFile = Boolean(
-          gitRead(root, ['diff', '--name-only', `${origin}^`, origin, '--', ...files])?.trim(),
-        );
         const runStart = text[head.index - 1] === '`' ? head.index - 1 : head.index;
         const anchors = noteAnchors(citationClause(text, runStart, run.end), files);
-        const decision = choosePin(root, run.links, anchors, candidates, originTouchedFile);
+        const decision = choosePin(root, run.links, anchors, candidates);
         if ('refused' in decision) {
           refuse(decision.refused);
           continue;
