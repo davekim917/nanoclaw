@@ -232,7 +232,7 @@ Three details it encodes, each of which has cost real debugging time — keep th
 
 ## Cut-down pass — after the PR opens, before Codex review
 
-A PR that adds more than 150 lines outside tests and lockfiles needs a cut-down receipt on the head it merges at; `merge-check` refuses it without one (`cut_down_missing`, 24) in either mode. The base branch's `.github/pr-review-loop.json` may set `"cutDownThreshold"` to another whole number, or to `false`. `codex-review.sh cut-down` says whether the current head needs a receipt and has one.
+A PR that adds more than 150 lines outside tests and lockfiles needs a cut-down receipt on the head it merges at. Lines holding only comment do not count, since the comment rule already judges them: the shared checker (comment-rule 1.1.0+) classifies them, and every added line counts when it cannot, or the base sets `"commentRule": false`; `merge-check` refuses it without one (`cut_down_missing`, 24) in either mode. The base branch's `.github/pr-review-loop.json` may set `"cutDownThreshold"` to another whole number, or to `false`. `codex-review.sh cut-down` says whether the current head needs a receipt and has one.
 
 1. **Launch the reviewer** right after opening the PR, before `request`. In a legacy repo Codex has already started; run it anyway. It is the `cut-down-reviewer` agent from the bootstrap orchestrate plugin, run by your own provider as a native subagent with a fresh context. It is never a cross-model call and never your own session:
    - Claude: Agent tool, `subagent_type: "bootstrap-orchestrate:cut-down-reviewer"`, with no `model`. The agent inherits yours, and a per-call model would override that.
@@ -248,7 +248,7 @@ A PR that adds more than 150 lines outside tests and lockfiles needs a cut-down 
      --reviewer "<its model id> cut-down-reviewer (<runtime>)" --body-file <its list, each cut applied or answered>
    ```
 
-   With no cuts it posts at once, with `--reviewed` equal to `--head`. The receipt records the added lines outside tests at both heads and the difference. That is the per-PR measure for tuning the threshold or dropping the pass.
+   With no cuts it posts at once, with `--reviewed` equal to `--head`. The receipt records that count (added lines outside tests, less comment-only lines) at both heads and the difference. That is the per-PR measure for tuning the threshold or dropping the pass.
 4. **When the head moves after the receipt** (a Codex round, a base merge), the receipt no longer counts. Before merging, launch a fresh reviewer on only what changed since the receipted head; it posts the receipt for the new head.
 
 The receipt must come from an account with write access to the repository, and its reviewer must lead with a frontier model id, as `receipt` requires, and name `cut-down-reviewer`. A receipt that names no agent, which is what an author posting its own looks like, does not count. Every session shares one GitHub account, so the gate cannot see who ran the command: the named agent is a recorded claim, like a substitute receipt's reviewer.

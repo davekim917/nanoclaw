@@ -673,9 +673,8 @@ comment_rule_checker() {
   return 1
 }
 
-# The checker's report on SCOPE_HEAD against its merge base, and its exit status.
-# The two commits are fetched without history, and two shallow roots have no merge
-# base, so the checker reads a commit carrying the head's tree on the merge base.
+# The checker's report on $2 against its merge base with $1, extra arguments passed through,
+# and its exit status. Two shallow commits share no merge base, so it reads $2's tree on that base.
 comment_rule_run() {
   local checker merge_base head
   checker=$(comment_rule_checker) || {
@@ -683,9 +682,9 @@ comment_rule_run() {
     return 2
   }
   command -v node >/dev/null 2>&1 || { echo "the comment-rule checker needs node on PATH"; return 2; }
-  merge_base=$(gh api "repos/$REPO/compare/$SCOPE_BASE...$SCOPE_HEAD?per_page=1" \
+  merge_base=$(gh api "repos/$REPO/compare/$1...$2?per_page=1" \
     | jq -er '.merge_base_commit.sha | strings | select(test("^[0-9a-f]{40}$"))') || {
-    echo "could not read the merge base of $SCOPE_HEAD with $SCOPE_BASE"
+    echo "could not read the merge base of $2 with $1"
     return 2
   }
   COMMENT_RULE_DIR=$(mktemp -d)
@@ -696,15 +695,15 @@ comment_rule_run() {
     git init -q "$dir" &&
       git -C "$dir" remote add origin "https://github.com/$REPO" &&
       git -C "$dir" config credential.helper '!gh auth git-credential' &&
-      git -C "$dir" fetch -q --no-tags --depth=1 --filter=blob:none origin "$merge_base" "$SCOPE_HEAD" &&
+      git -C "$dir" fetch -q --no-tags --depth=1 --filter=blob:none origin "$merge_base" "$2" &&
       head=$(git -C "$dir" -c user.name=merge-check -c user.email=merge-check@localhost \
-        commit-tree "$SCOPE_HEAD^{tree}" -p "$merge_base" -m "$SCOPE_HEAD") &&
+        commit-tree "$2^{tree}" -p "$merge_base" -m "$2") &&
       git -C "$dir" diff --no-ext-diff --no-textconv -M --numstat "$merge_base" "$head" >/dev/null
   } 2>&1 >/dev/null || {
-    echo "could not fetch $SCOPE_HEAD and its merge base $merge_base from $REPO"
+    echo "could not fetch $2 and its merge base $merge_base from $REPO"
     return 2
   }
-  node "$checker" check --repo "$dir" --base "$merge_base" --head "$head" 2>&1
+  node "$checker" check --repo "$dir" --base "$merge_base" --head "$head" "${@:3}"
 }
 
 # Refuses (24) a head whose change grows comment lines or adds a prohibited
@@ -725,7 +724,7 @@ comment_rule_gate() {
       exit 1
       ;;
   esac
-  report=$(comment_rule_run) || status=$?
+  report=$(comment_rule_run "$SCOPE_BASE" "$SCOPE_HEAD" 2>&1) || status=$?
   case "$status" in
     0) ;;
     1)
@@ -742,7 +741,25 @@ comment_rule_gate() {
 }
 
 cut_down_lines() {
-  gh api "repos/$REPO/compare/$1...$2?per_page=1" | jq -r -L "$HERE" 'include "cut-down"; cut_down_lines'
+  gh api "repos/$REPO/compare/$1...$2?per_page=1" \
+    | jq -r -L "$HERE" --argjson comments "${3:-null}" 'include "cut-down"; cut_down_lines($comments)'
+}
+
+# Null when the base turns the comment rule off: nothing else would judge comment lines then.
+cut_down_comment_lines() {
+  local enabled report status=0 classified
+  enabled=$(review_loop_flag commentRule true) || enabled=error
+  [ "$enabled" = true ] || { echo null; return 0; }
+  report=$(comment_rule_run "$1" "$2" --json 2>/dev/null) || status=$?
+  [ "$status" -le 1 ] || { echo null; return 0; }
+  classified=$(printf '%s' "$report" | jq -c '
+    if (.status == "pass" or .status == "fail") and (.files | type) == "array"
+      and all(.files[]; (.path | type) == "string" and (.added_lines | type) == "number"
+        and (.added_comment_lines | type) == "number" and 0 <= .added_comment_lines and .added_comment_lines <= .added_lines)
+      and (.files | map(.path) | length == (unique | length))
+    then .files | map({ key: .path, value: { added: .added_lines, comments: .added_comment_lines } }) | from_entries
+    else null end' 2>/dev/null) || classified=null
+  echo "${classified:-null}"
 }
 
 cut_down_reviewer_named() {
@@ -751,7 +768,7 @@ cut_down_reviewer_named() {
 
 # `ok\t<why>` or `missing\t<why>` for SCOPE_HEAD; non-zero when it cannot tell.
 cut_down_state() {
-  local threshold lines pages receipts head login reviewer others
+  local threshold lines comments counted='lines outside tests' note='' pages receipts head login reviewer others
   threshold=$(review_loop_value cutDownThreshold "$CUT_DOWN_THRESHOLD" \
     'if . == false then "off" elif type == "number" and . >= 0 and floor == . then [., 1000000000] | min else error("not a whole number or false") end') || return 1
   if [ "$threshold" = off ]; then
@@ -759,8 +776,17 @@ cut_down_state() {
     return 0
   fi
   lines=$(cut_down_lines "$SCOPE_BASE" "$SCOPE_HEAD") || return 1
+  if [ "$lines" != unknown ] && [ "$lines" -gt "$threshold" ]; then
+    comments=$(cut_down_comment_lines "$SCOPE_BASE" "$SCOPE_HEAD")
+    if [ "$comments" = null ]; then
+      note=' Comment-only lines count too: the comment-rule checker classified none (it is off, missing, older than 1.1.0 or failed).'
+    else
+      lines=$(cut_down_lines "$SCOPE_BASE" "$SCOPE_HEAD" "$comments") || return 1
+      counted='lines outside tests that are not only comment'
+    fi
+  fi
   if [ "$lines" != unknown ] && [ "$lines" -le "$threshold" ]; then
-    printf 'ok\t%s added lines outside tests, within the threshold of %s\n' "$lines" "$threshold"
+    printf 'ok\t%s added %s, within the threshold of %s\n' "$lines" "$counted" "$threshold"
     return 0
   fi
   pages=$(paginate_connection comments receipt_comments_page) || return 1
@@ -781,8 +807,8 @@ cut_down_state() {
     fi
     others="$head"
   done <<< "$receipts"
-  printf 'missing\tthis change adds %s lines outside tests, over the threshold of %s, and no cut-down receipt from %s names this head%s. Run the %s agent on the change (SKILL.md, "Cut-down pass"); it posts the receipt with `codex-review.sh cut-down-receipt`\n' \
-    "$lines" "$threshold" "$CUT_DOWN_AGENT" "${others:+ (the latest names ${others:0:12}: review only what changed since)}" "$CUT_DOWN_AGENT"
+  printf 'missing\tthis change adds %s %s, over the threshold of %s, and no cut-down receipt from %s names this head%s. Run the %s agent on the change (SKILL.md, "Cut-down pass"); it posts the receipt with `codex-review.sh cut-down-receipt`.%s\n' \
+    "$lines" "$counted" "$threshold" "$CUT_DOWN_AGENT" "${others:+ (the latest names ${others:0:12}: review only what changed since)}" "$CUT_DOWN_AGENT" "$note"
 }
 
 cut_down_gate() {
@@ -3165,9 +3191,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     fi
     [ -z "$refusal" ] || { echo "cut-down-receipt: $refusal" >&2; exit 2; }
     base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName | jq -er .baseRefName) || exit 1
-    base_sha=$(base_tip "$base") || { echo "cut-down-receipt: could not resolve $base to a commit" >&2; exit 1; }
-    before=$(cut_down_lines "$base_sha" "$reviewed") || { echo "cut-down-receipt: could not count the lines $reviewed adds" >&2; exit 1; }
-    after=$(cut_down_lines "$base_sha" "$head") || { echo "cut-down-receipt: could not count the lines $head adds" >&2; exit 1; }
+    SCOPE_BASE=$(base_tip "$base") || { echo "cut-down-receipt: could not resolve $base to a commit" >&2; exit 1; }
+    before=$(cut_down_lines "$SCOPE_BASE" "$reviewed" "$(cut_down_comment_lines "$SCOPE_BASE" "$reviewed")") || { echo "cut-down-receipt: could not count the lines $reviewed adds" >&2; exit 1; }
+    after=$(cut_down_lines "$SCOPE_BASE" "$head" "$(cut_down_comment_lines "$SCOPE_BASE" "$head")") || { echo "cut-down-receipt: could not count the lines $head adds" >&2; exit 1; }
     cut=unknown
     if [ "$before" != unknown ] && [ "$after" != unknown ]; then cut=$((before - after)); fi
     url=$(gh pr comment "$PR" --repo "$REPO" --body "### Cut-down review receipt
@@ -3175,7 +3201,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
 - **Head:** \`$head\`
 - **Reviewed head:** \`$reviewed\`
 - **Reviewer and runtime:** $reviewer
-- **Added lines outside tests:** $before when reviewed, $after now; cut $cut
+- **Added lines outside tests, less comment-only lines:** $before when reviewed, $after now; cut $cut
 
 $body
 
