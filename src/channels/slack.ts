@@ -471,10 +471,6 @@ export function declarationOnlySlackTypes(env: Record<string, string>): string[]
   return types;
 }
 
-/**
- * Must admit every key `parseSlackWorkspaces` reads (APP_TOKEN, underscore suffixes): a key filtered out here never
- * reaches it. Keep this the only definition.
- */
 const SLACK_ENV_PATTERN = /^SLACK_(BOT_TOKEN|SIGNING_SECRET|APP_TOKEN)(_[A-Za-z0-9_]+)?$/;
 
 /** The one entry point; callers outside this module must not re-derive the env pattern. */

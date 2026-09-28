@@ -86,6 +86,7 @@ function setSessionFields(
     last_outbound_kind: string;
     title: string;
     archived_at: string;
+    container_status: string;
   }>,
 ): void {
   const pairs = Object.keys(fields)
@@ -474,6 +475,15 @@ describe('sessionsHandler — D4', () => {
       const respAfter = await sessionsHandler(makeReq(), {}, ctx);
       const bodyAfter = (await respAfter!.json()) as { sessions: Array<{ session_id: string }> };
       expect(bodyAfter.sessions.map((s) => s.session_id)).toContain('sess-becomes-engaged');
+    });
+
+    it('a session whose container is idle, not only running, counts as engaged', async () => {
+      insertSession('sess-idle-container', 'ag-1');
+      setSessionFields('sess-idle-container', { container_status: 'idle' });
+      const ctx = makeCtx('u1', { no_filter: true });
+      const resp = await sessionsHandler(makeReq(), {}, ctx);
+      const body = (await resp!.json()) as { sessions: Array<{ session_id: string }> };
+      expect(body.sessions.map((s) => s.session_id)).toContain('sess-idle-container');
     });
 
     it('a session with an in-flight (pending/running) task is included even with no outbound yet', async () => {

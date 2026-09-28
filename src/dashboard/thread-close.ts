@@ -1,14 +1,8 @@
 /**
- * Thread close (`POST /dashboard/api/threads/:id/close`): the console's one action that actually ENDS work. Every
- * step is load-bearing: (a) ask the agent to wrap up in its own thread, (b) make sure no `work_continuation` survives,
- * (c) stop the container (for an owned session this comes before (b), so outbound.db keeps one writer), (d) let the
- * sweep release processing claims (`resetStuckProcessingRows` already does), (e) archive, as the terminal marker only.
- * (b) MUST precede the archive: `work_continuation` is read on any wake and `decideCeilingFollowUp` returns
- * `wake-accountable` on it first, so a killed container's promise would resurface on the next message.
- * Confirmations: one if an agent proposed the close (`propose_done`), two if not; the guard decides the required
- * count (`thread-close-guard.ts`). Nothing closes by silence; a timer only stops waiting for the AGENT after the
- * operator has confirmed. Not snooze, and not a general archive endpoint: `archiveSessionById` is reachable only as
- * step (e).
+ * Thread close (`POST /dashboard/api/threads/:id/close`): the console's one action that actually ENDS work: ask the
+ * agent to wrap up in its own thread, stop the container, clear any `work_continuation` (read on any wake, so a killed
+ * container's promise would otherwise resurface on the next message), let the sweep release processing claims, then
+ * archive as the terminal marker. Not snooze, and not a general archive endpoint.
  */
 import { containerOwnsOutbound, killContainer } from '../container-runner.js';
 import { getDb } from '../db/connection.js';

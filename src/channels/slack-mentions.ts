@@ -450,12 +450,7 @@ export async function upgradeSlackBotProfile(
   }
 }
 
-/**
- * Blanks out Slack code regions so mention detection only sees prose. A fence (3+ backticks) may open and close
- * mid-line, as in Slack, and closes only at a run at least as long as its opener; an unterminated fence runs to the
- * end. A 1-2 backtick span closes at the next run of exactly the same length on the same line. Tildes are NOT fences:
- * Slack has no `~~~` syntax, so a tilde-wrapped mention still pings.
- */
+/** Blanks out Slack code regions so mention detection only sees prose. */
 function stripSlackCodeRegions(text: string): string {
   let out = '';
   let i = 0;
