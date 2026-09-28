@@ -18,6 +18,9 @@ put() { mkdir -p "$(dirname "$R/$1")" && cat >"$R/$1"; }
 git init -q "$R"
 put container/skill-shell-tests.test.ts <<'EOF'
 const INHERITED_ENV = ['PATH', 'CASE_OUT'];
+const SHARDED_SUITES: ReadonlyArray<string> = [
+  'container/skills/demo/scripts/cased.test.sh',
+];
 const EXCLUDED_SUITES = [
   {
     relPath: 'container/needs-docker.test.sh',
@@ -87,10 +90,8 @@ for c in a b c; do
 done
 smoke_cases_done
 EOF
-cat >"$R/$S/writes-cased.test.sh" <<'EOF'
-cat >"$CASE_OUT.fixture" <<'FX'
+cat >"$R/$S/unlisted-cased.test.sh" <<'EOF'
 . "$(dirname "$0")/smoke-case.sh"
-FX
 echo "shard=${SMOKE_SHARD:-none} probe=${AMBIENT_PROBE:-none}" >>"$CASE_OUT"
 EOF
 git -C "$R" add -A && git -C "$R" -c user.email=t@example.com -c user.name=t commit -qm base
@@ -151,7 +152,7 @@ fi
 
 CASE_OUT="$T/cases.out" python3 "$SEL" --run -j 3 --shards 3 "$S/cased.test.sh" >"$T/run.out" 2>&1
 if [ "$(grep -c "PASS .*cased.test.sh \[[1-3]/3\]" "$T/run.out")" = 3 ] && [ "$(sort "$T/cases.out" | tr '\n' ' ')" = "a b c " ]; then
-  ok "--run splits a suite that marks its cases into shards that run each case once"
+  ok "--run splits a suite the gate shards into shards that run each case once"
 else
   fail "sharded run: $(cat "$T/run.out") cases: $(cat "$T/cases.out")"
 fi
@@ -160,10 +161,10 @@ SMOKE_CASE=b CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/cased.t
 [ "$(grep -c "PASS" "$T/run.out")" = 1 ] && [ "$(cat "$T/cases.out")" = b ] &&
   ok "SMOKE_CASE runs the picked cases in one process, unsharded" || fail "SMOKE_CASE run: $(cat "$T/run.out")"
 : >"$T/cases.out"
-AMBIENT_PROBE=leaked CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/writes-cased.test.sh" >"$T/run.out" 2>&1
+AMBIENT_PROBE=leaked CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/unlisted-cased.test.sh" >"$T/run.out" 2>&1
 [ "$(cat "$T/cases.out")" = "shard=none probe=none" ] &&
-  ok "a heredoc-only suite is not sharded, and gets only the gate's INHERITED_ENV" ||
-  fail "heredoc suite was sharded or saw ambient env: $(cat "$T/cases.out")"
+  ok "a suite the gate does not shard runs once, with only the gate's INHERITED_ENV" ||
+  fail "unlisted suite was sharded or saw ambient env: $(cat "$T/cases.out")"
 
 [ "$FAILED" = 0 ] || { echo "select-tests tests FAILED" >&2; exit 1; }
 echo "select-tests tests passed"

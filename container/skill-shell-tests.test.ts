@@ -1,8 +1,9 @@
-import { execFileSync } from 'child_process';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs';
+import { execFile, execFileSync } from 'child_process';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { promisify } from 'util';
 
 import type { Dirent } from 'fs';
 
@@ -58,6 +59,15 @@ const SLOW_SUITE_TIMEOUT_MS: Readonly<Record<string, number>> = {
   'container/skills/smoke-test/scripts/smoke-campaign-controller-live.test.sh': 900_000,
   'container/skills/smoke-test/scripts/smoke-pr-gate.test.sh': 800_000,
 };
+
+/** Each runs as SHARDS_PER_SUITE concurrent SMOKE_SHARD processes; select-tests.py parses this list. */
+const SHARDED_SUITES: ReadonlyArray<string> = [
+  'container/skills/smoke-test/scripts/smoke-campaign-controller-live.test.sh',
+  'container/skills/smoke-test/scripts/smoke-pr-gate.test.sh',
+];
+
+// Every shard of a suite runs at once, beside other vitest workers: keep it at 4 or below.
+const SHARDS_PER_SUITE = 4;
 
 function suiteTimeoutMs(relPath: string): number {
   return SLOW_SUITE_TIMEOUT_MS[relPath] ?? SUITE_TIMEOUT_MS;
@@ -150,6 +160,32 @@ function formatShellSuiteFailure(relPath: string, err: unknown): string {
   }`;
 }
 
+const execFileAsync = promisify(execFile);
+
+async function runSuite(suitePath: string, budgetMs: number, shard: string | undefined): Promise<void> {
+  const freshHome = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-home-'));
+  try {
+    // The budget is enforced on the suite's whole PROCESS GROUP: vitest's own
+    // timeout only stops waiting. coreutils `timeout` runs the suite in its
+    // own process group and KILLs the group, so a hung grandchild (the 09-13
+    // orphans were a `trash` under a suite, alive 9 days) dies with it instead
+    // of outliving the run. execFile's own timeout is the backstop if
+    // `timeout` itself wedges.
+    await execFileAsync(
+      'bash',
+      ['-c', 'exec timeout -s KILL "$0" bash "$1" </dev/null', `${Math.ceil(budgetMs / 1000)}s`, suitePath],
+      {
+        encoding: 'utf-8',
+        env: { ...buildSuiteEnv(freshHome), ...(shard ? { SMOKE_SHARD: shard } : {}) },
+        timeout: budgetMs + 15_000,
+        killSignal: 'SIGKILL',
+      },
+    );
+  } finally {
+    rmSync(freshHome, { recursive: true, force: true });
+  }
+}
+
 describe('every container skill shell test suite (*.test.sh)', () => {
   it('discovery found the known shell suites (floor, not a fixed count)', () => {
     // A regression in the discovery glob (wrong directory depth, wrong
@@ -169,6 +205,13 @@ describe('every container skill shell test suite (*.test.sh)', () => {
         RUNNABLE_SUITES,
         `slow-suite budget for ${relPath} names no runnable suite — update or remove it`,
       ).toContain(relPath);
+    }
+  });
+
+  it('every sharded suite is runnable and sources smoke-case.sh', () => {
+    for (const relPath of SHARDED_SUITES) {
+      expect(RUNNABLE_SUITES, `sharded suite ${relPath} names no runnable suite`).toContain(relPath);
+      expect(readFileSync(path.join(REPO_ROOT, relPath), 'utf-8')).toMatch(/^\s*(?:\.|source)\s+.*smoke-case\.sh\b/m);
     }
   });
 
@@ -293,39 +336,22 @@ describe('every container skill shell test suite (*.test.sh)', () => {
   for (const relPath of RUNNABLE_SUITES) {
     const suitePath = path.join(REPO_ROOT, relPath);
     const budgetMs = suiteTimeoutMs(relPath);
+    const shards = SHARDED_SUITES.includes(relPath)
+      ? Array.from({ length: SHARDS_PER_SUITE }, (_, i) => `${i + 1}/${SHARDS_PER_SUITE}`)
+      : [undefined];
     it(
       `passes: ${relPath}`,
-      () => {
-        const freshHome = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-home-'));
-        try {
-          // The budget is enforced on the suite's whole PROCESS GROUP.
-          // execFileSync is synchronous, so vitest's own timeout cannot
-          // interrupt it: without this a suite that really hangs blocks the run
-          // forever, and one that is merely slow is reported "timed out" only
-          // after it has finished anyway. coreutils `timeout` runs the suite in
-          // its own process group and KILLs the group, so a hung grandchild
-          // (the 09-13 orphans were a `trash` under a suite, alive 9 days) dies
-          // with it instead of outliving the run. execFileSync's own timeout
-          // is the backstop if `timeout` itself wedges.
-          execFileSync(
-            'bash',
-            ['-c', 'exec timeout -s KILL "$0" bash "$1"', `${Math.ceil(budgetMs / 1000)}s`, suitePath],
-            {
-              encoding: 'utf-8',
-              stdio: ['ignore', 'pipe', 'pipe'],
-              env: buildSuiteEnv(freshHome),
-              timeout: budgetMs + 15_000,
-              killSignal: 'SIGKILL',
-            },
-          );
-        } catch (err) {
-          throw new Error(formatShellSuiteFailure(relPath, err));
-        } finally {
-          rmSync(freshHome, { recursive: true, force: true });
-        }
+      async () => {
+        const results = await Promise.allSettled(shards.map((shard) => runSuite(suitePath, budgetMs, shard)));
+        const failures = results.flatMap((result, i) =>
+          result.status === 'rejected'
+            ? [formatShellSuiteFailure(shards[i] ? `${relPath} [SMOKE_SHARD=${shards[i]}]` : relPath, result.reason)]
+            : [],
+        );
+        if (failures.length > 0) throw new Error(failures.join('\n'));
       },
-      // Headroom over both kills above, so one of them is what fires and the
-      // suite's output reaches formatShellSuiteFailure.
+      // Headroom over both kills in runSuite, so one of them is what fires and
+      // the suite's output reaches formatShellSuiteFailure.
       budgetMs + 30_000,
     );
   }
