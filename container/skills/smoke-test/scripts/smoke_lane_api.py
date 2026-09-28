@@ -30,6 +30,7 @@ NAME_KEYS = {"name", "title", "label", "filename"}
 ID_SEGMENT = re.compile(r".*\d.*")
 VERSION_SEGMENT = re.compile(r"v\d{1,2}")
 PASSWORD_HELPER = "/workspace/extra/qa-seat-password.sh"
+SECRET_KEY = re.compile(r"password|secret|token", re.I)
 
 
 class WriteScopeRefused(Exception):
@@ -104,11 +105,11 @@ def record_fixture(run_dir, create_path, fixture_id, name):
 
 
 def scalars(value):
-    if isinstance(value, list):
+    if isinstance(value, list) and value:
         return [v for item in value for v in scalars(item)]
     if isinstance(value, dict):
         return [str(value["id"])] if "id" in value else ["<object>"]
-    return [] if value is None else [str(value)]
+    return ["<empty>"] if value in (None, "", []) else [str(value)]
 
 
 def walk(value):
@@ -167,9 +168,20 @@ def created_ids(response, name):
     dicts = [response] + [v for v in response.values() if isinstance(v, dict)]
     with_id = [d for d in dicts if d.get("id") not in (None, "")]
     named = [d for d in with_id if name in (d.get(k) for k in NAME_KEYS)]
-    unnamed = not any(k in d for d in with_id for k in NAME_KEYS)
-    direct = [d for d in with_id if unnamed and (d is response or d is response.get("data"))]
-    return [d["id"] for d in (named or (direct if len(direct) == 1 else []))]
+    if len(named) == 1:
+        return [named[0]["id"]]
+    only = with_id[0] if len(with_id) == 1 else None
+    if not named and only is not None and only in (response, response.get("data")) and not NAME_KEYS & set(only):
+        return [only["id"]]
+    return []
+
+
+def redacted(body):
+    if isinstance(body, dict):
+        return {k: "<redacted>" if SECRET_KEY.search(k) else redacted(v) for k, v in body.items()}
+    if isinstance(body, list):
+        return [redacted(v) for v in body]
+    return body
 
 
 def claims(token):
@@ -203,7 +215,7 @@ class H:
             return judge(self.run_dir, method, path, body)
         except WriteScopeRefused as e:
             self.save(tag, {"harnessBlocked": True, "refusal": "WRITE_SCOPE_REFUSED", "reason": str(e),
-                            "seat": seat, "method": method, "path": path, "body": body, "at": now()})
+                            "seat": seat, "method": method, "path": path, "body": redacted(body), "at": now()})
             self.emit("{} [{}] {} {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason={} (no request sent)".format(
                 now(), tag, seat, method, path, e))
             raise

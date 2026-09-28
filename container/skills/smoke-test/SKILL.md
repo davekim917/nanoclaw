@@ -394,10 +394,12 @@ account/tenant/brand in a body or query key; on a POST, a top-level
 `<create path>/<id>` for an id that an earlier QA-named POST returned
 (`<run-dir>/write-scope-fixtures.ndjson`; one backend per run, so the ledger
 keeps no origin). Foreign: any other digit-bearing path segment (only a
-leading `/v<n>/` is exempt), or an account/tenant/brand key, scalar, object or
-blank, outside the allowlist. The guard cannot tell a create route from an action route, so never
+leading `/v<n>/` is exempt), or an account/tenant/brand key outside the
+allowlist, whether scalar, object, null or empty. A fixture id is ledgered only
+when the create response identifies exactly one object. The guard cannot tell a create route from an action route, so never
 put a QA name in the body of a call that is not a create. A missing, unreadable or other-run scope refuses every write.
-A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true`, logs
+A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true` (password,
+secret and token fields redacted), logs
 `HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason=...` and raises
 `WriteScopeRefused`: record the check `blocked` with the target it needed,
 never as a product refusal, a pass or a finding. A write-refusal probe targets

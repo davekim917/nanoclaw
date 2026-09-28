@@ -34,8 +34,9 @@ class Backend(http.server.BaseHTTPRequestHandler):
             {"owner": {"id": 191}, "report": {"id": "rp-77", "filename": PREFIX + "f.pdf"}} if self.path == "/reports/nested" else (
             {"owner": {"id": 192}} if self.path == "/reports/anon" else (
                 {"id": "ex-5", "name": "Existing"} if self.path == "/reports/upsert" else (
-                    {"id": "owner-1", "data": {"id": "report-2"}} if self.path == "/reports/ambig"
-                    else {"id": "fx-901", "ok": True}))))
+                    {"id": "owner-1", "report": {"id": "report-2"}} if self.path == "/reports/ambig" else (
+                        {"a": {"id": "t1", "name": PREFIX + "twin"}, "b": {"id": "t2", "name": PREFIX + "twin"}}
+                        if self.path == "/reports/twin" else {"id": "fx-901", "ok": True})))))
         raw = json.dumps(out).encode()
         self.send_response(201 if self.command == "POST" else 200)
         self.send_header("Content-Length", str(len(raw)))
@@ -112,6 +113,20 @@ class Guard(unittest.TestCase):
         self.assertEqual(Backend.seen[0][:2], ("POST", "/users/login"))
         self.assertIn("M", h.tok)
 
+    def test_refused_login_evidence_holds_no_password(self):
+        self.pin()
+        scope = os.path.join(self.run_dir, api.SCOPE_FILE)
+        with open(self.helper, "w") as f:
+            f.write('rm -f "%s"\necho fictional-pw\n' % scope)
+        h = self.client()
+        with self.assertRaises(api.WriteScopeRefused):
+            h.login("M")
+        self.assertEqual(Backend.seen, [])
+        with open(os.path.join(h.out, "login-M.json")) as f:
+            saved = f.read()
+        self.assertNotIn("fictional-pw", saved)
+        self.assertIn("<redacted>", saved)
+
     def test_seat_lease_refusal_sends_no_login(self):
         self.pin()
         with self.assertRaises(SystemExit):
@@ -132,6 +147,8 @@ class Guard(unittest.TestCase):
         self.assert_blocked(h, "w10", "POST", "/notes", {"name": PREFIX + "n", "account": {"id": 4401}}, "foreign-target")
         self.assert_blocked(h, "w11", "POST", "/notes", {"name": PREFIX + "n", "accounts": [{"ref": 1}]}, "foreign-target")
         self.assert_blocked(h, "w12", "POST", "/notes?accountId=", {"name": PREFIX + "n"}, "foreign-target")
+        for i, empty in enumerate((None, [], [None])):
+            self.assert_blocked(h, "w12e%d" % i, "POST", "/notes", {"name": PREFIX + "n", "accountId": empty}, "foreign-target")
         self.assert_blocked(h, "w13", "POST", "/reports/v12", {"name": PREFIX + "n"}, "foreign-target")
         self.assert_blocked(h, "w13b", "POST", "/v4401/notes", {"name": PREFIX + "n"}, "foreign-target")
         self.assertEqual(h.call("w14", "M", "POST", "/v1/notes", {"name": PREFIX + "n"})[0], 201)
@@ -165,6 +182,8 @@ class Guard(unittest.TestCase):
         self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "a response naming another object is not ours")
         h.call("c8", "M", "POST", "/reports/ambig", {"name": PREFIX + "amb"})
         self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "two candidate ids and no name: neither is ledgered")
+        h.call("c9", "M", "POST", "/reports/twin", {"name": PREFIX + "twin"})
+        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "two objects carrying the name: neither is ledgered")
 
     def test_allowlisted_account_is_writable(self):
         self.pin(dict(SCOPE, accounts=["7001"]))
