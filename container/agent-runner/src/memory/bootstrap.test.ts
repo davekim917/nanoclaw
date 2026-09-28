@@ -319,6 +319,8 @@ describe('ensureFreshContextBootstrap', () => {
     expect(result).not.toContain('x'.repeat(1_000));
     expect(result).toContain('keep the current user input');
     expect(result).toContain('Snowflake facts live here.');
+    expect(result).toContain('"name":"Snowflake"');
     expect(result).not.toContain('runner-index-bootstrap-truncated');
+    expect(result).not.toContain('runner-capability-bootstrap-truncated');
   });
 });
