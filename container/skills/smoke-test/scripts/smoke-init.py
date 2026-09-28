@@ -256,8 +256,6 @@ def write_draft(group_dir, plan):
     if not os.path.isdir(target_dir):
         refuse("--group-dir does not exist")
     out = os.path.join(target_dir, "smoke-gate-env.draft.sh")
-    if os.path.exists(out):
-        refuse("{} already exists; move it aside first".format(out))
     lines = ["# Draft from smoke-init.py propose. Review each line, then move the keys you",
              "# keep into smoke-gate-env.sh. Credentials never go here: the gateway injects them.",
              "# Then run each gate wrapper with `config` to confirm the gate accepts them.", ""]
@@ -274,8 +272,13 @@ def write_draft(group_dir, plan):
     if any(UNSAFE_DRAFT_RE.search(line) for line in lines) or any(
             "'" in str(e["value"]) for e in plan["mandatory"] + plan["recommended"] if e["value"] is not None):
         refuse("a proposed line is not safe to write into a shell file; no draft written")
-    with open(out, "x", encoding="utf8") as fh:
-        fh.write("\n".join(lines))
+    # Exclusive create, never a pre-check: an existence test follows a dangling symlink and
+    # answers "absent", and a plain write would then create the file wherever it points.
+    try:
+        with open(out, "x", encoding="utf8") as fh:
+            fh.write("\n".join(lines))
+    except FileExistsError:
+        refuse("{} already exists; move it aside first".format(out))
     return out
 
 

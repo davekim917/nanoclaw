@@ -33,6 +33,25 @@ check "the dirs seen are listed for each prefix" "$OUT" "$E"' (e("SMOKE_GATE_FRO
 check "the health path is never filled in" "$OUT" "$E"' e("SMOKE_GATE_HEALTH_PATH").value == null'
 check "the next step is the gates' config check" "$OUT" '.next | test("config")'
 check "every entry says why and how to find it" "$OUT" '[.mandatory[], .recommended[] | (.why | length > 0) and (.find | length > 0)] | all'
+check "every mandatory key is proposed" "$OUT" '[.mandatory[].key] == ["SMOKE_GATE_REPO","SMOKE_PREVIEW_PROVIDER","SMOKE_GATE_FRONTEND_SERVICE","SMOKE_GATE_BACKEND_SERVICE","SMOKE_GATE_FRONTEND_PREFIX","SMOKE_GATE_BACKEND_PREFIX","SMOKE_GATE_MIGRATIONS_PREFIX"]'
+check "static: only the repo and provider are filled in" "$OUT" '[.mandatory[] | select(.value != null) | .key] == ["SMOKE_GATE_REPO","SMOKE_PREVIEW_PROVIDER"]'
+OPENED="$(python3 - "$INIT" "$T/netlify" <<'PY'
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("smoke_init", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+root, opened = os.path.realpath(sys.argv[2]), []
+def hook(event, args):
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        p = os.path.realpath(os.fsdecode(args[0]))
+        if p.startswith(root + os.sep):
+            opened.append(os.path.relpath(p, root))
+sys.addaudithook(hook)
+mod.detect(sys.argv[2])
+print(json.dumps(sorted(opened)))
+PY
+)"
+check "detect opens the manifests and nothing else (no source, no host file)" "$OPENED" '. == ["api/requirements.txt","web/package.json"]'
 
 # --- 2. Render: the render provider, no template ---------------------------
 mkrepo render git@github.com:acme/gizmo.git
@@ -45,6 +64,7 @@ check "scp-style origin parsed" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GA
 check "backend dir listed from its name" "$OUT" "$E"' e("SMOKE_GATE_BACKEND_PREFIX").find | contains("backend/")'
 check "no migration dir: no guessed prefix" "$OUT" '(.mandatory[] | select(.key == "SMOKE_GATE_MIGRATIONS_PREFIX") | .value) == null'
 check "render: the develop gate's dev URL is mandatory" "$OUT" '[.mandatory[] | .key] | index("SMOKE_GATE_DEV_URL") != null'
+check "render: only the repo and provider are filled in, not the backend service" "$OUT" '[.mandatory[] | select(.value != null) | .key] == ["SMOKE_GATE_REPO","SMOKE_PREVIEW_PROVIDER"] and ([.mandatory[].key] | index("SMOKE_GATE_BACKEND_SERVICE") != null)'
 
 # --- 3. Cloudflare Pages + Vite: {branch} alias template -------------------
 mkrepo pages https://github.com/acme/site
@@ -115,6 +135,11 @@ echo '{"dependencies":{"next":"15.0.0"}}' >"$T/outside/web/package.json"
 ln -s "$T/outside/web/package.json" "$T/linked/web/package.json"
 OUT="$(python3 "$INIT" detect "$T/linked")"
 check "a symlinked manifest is not read" "$OUT" '.frameworks == {} and .serviceDirs == []'
+mkrepo dirlink https://github.com/acme/dirlink
+mkdir -p "$T/outside/migrations"
+ln -s "$T/outside" "$T/dirlink/ext"
+OUT="$(python3 "$INIT" detect "$T/dirlink")"
+check "a symlinked directory is not traversed" "$OUT" '.frameworks == {} and .serviceDirs == [] and .migrationDirs == []'
 
 # --- 5. The draft: private dir only, never overwritten, never inside the skill
 mkdir -p "$T/group"
@@ -123,6 +148,11 @@ check "draft path reported" "$OUT" '.draft | endswith("/smoke-gate-env.draft.sh"
 if grep -q "^# export SMOKE_GATE_REPO='acme/widget'$" "$T/group/smoke-gate-env.draft.sh"; then ok "draft carries the known values, commented out"; else fail "draft content"; fi
 OUT="$(python3 "$INIT" propose "$T/netlify" --group-dir "$T/group")"; RC=$?
 [ "$RC" -eq 2 ] && check "an existing draft is never overwritten" "$OUT" '.ok == false and (.error | contains("already exists"))' || fail "overwrite: rc=$RC $OUT"
+mkdir -p "$T/group-dangling"
+ln -s "$T/dangling-target" "$T/group-dangling/smoke-gate-env.draft.sh"
+OUT="$(python3 "$INIT" propose "$T/netlify" --group-dir "$T/group-dangling")"; RC=$?
+[ "$RC" -eq 2 ] && check "a dangling symlink at the draft path is refused" "$OUT" '.ok == false and (.error | contains("already exists"))' || fail "dangling symlink: rc=$RC $OUT"
+[ ! -e "$T/dangling-target" ] && ok "nothing written through a dangling symlink" || fail "draft written through a dangling symlink"
 OUT="$(python3 "$INIT" propose "$T/netlify" --group-dir "$SCRIPT_DIR")"; RC=$?
 [ "$RC" -eq 2 ] && check "a draft inside the skill is refused" "$OUT" '.ok == false and (.error | contains("inside the skill"))' || fail "skill dir: rc=$RC $OUT"
 [ ! -e "$SCRIPT_DIR/smoke-gate-env.draft.sh" ] && ok "nothing written into the skill" || fail "draft written into the skill"
