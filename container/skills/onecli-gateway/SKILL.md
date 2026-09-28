@@ -93,7 +93,8 @@ request. If the retry still fails, ask if they need help with the setup.
 
 When a service needs a key the vault lacks, or the user wants to add or
 rotate one, run `ncl secrets intake` (`ncl secrets help intake` for flags).
-It posts a form to the owner's DM; the value typed there goes straight to
+It posts a form into this conversation for an owner or an admin of your group
+to fill in; the value typed there goes straight to
 the vault, and you are told when it is stored. Name the API host exactly
 with `--host-pattern`: the gateway sends the key only there. If the user
 pastes a key into chat anyway, do not use or repeat it; tell them to rotate

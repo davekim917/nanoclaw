@@ -33,7 +33,7 @@ export interface ChannelSetup {
   onConnectionRestored?(info: ChannelConnectionRestored): void | Promise<void>;
 }
 
-/** Both run inside the platform's trigger window (Slack: 3 s), so neither may wait on anything slow. */
+/** Both run inside the platform's trigger window (Slack: 3 s); neither may wait past it. */
 export interface SecretIntakeHooks {
   open(
     intakeId: string,

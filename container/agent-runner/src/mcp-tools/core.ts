@@ -17,9 +17,7 @@ import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { chatBudgetExhausted, isChatMuted } from '../modules/mailbox/index.js';
 
-// Shared refusal copy for send paths under the physical chat budget. Edits and
-// reactions stay allowed — amending the already-sent message is the sanctioned
-// escape hatch once the budget is spent.
+// Edits and reactions stay allowed past the chat budget: amending the sent message is the sanctioned escape hatch.
 function chatSendDenial(): string | null {
   if (isChatMuted()) {
     return 'Chat sends are disabled for this task (muteChat). Alerts go through the outbox file contract; your completion report goes in the ledger.';
@@ -38,7 +36,6 @@ import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 import { CONTINUE_THREAD_DESCRIPTION, parseContinueThread } from './continue-thread.js';
 
-// send_file safety constants — mirror v1's ipc-mcp-stdio.ts behavior.
 const SEND_FILE_MAX_BYTES = 50 * 1024 * 1024; // Slack's own cap is 1GB but most adapters fail long before
 const SEND_FILE_ALLOWED_PREFIXES = [
   '/workspace/agent',
@@ -49,22 +46,11 @@ const SEND_FILE_ALLOWED_PREFIXES = [
 ];
 const SEND_FILE_ACK_TIMEOUT_MS = 30_000;
 
-// Content-hash dedup for send_file. Browser-driver agents often take
-// snapshots of the same rendered page multiple times — without dedup the
-// user gets flooded with identical images. Map is per-container, resets
-// on restart; that's fine since the dedup window only needs to cover the
-// lifespan of a turn-chain on the same topic.
+// Content-hash dedup: browser-driver agents often send the same snapshot repeatedly. Per-container.
 const sentFileHashes = new Map<string, string>();
 
-// Exported for unit testing — the prefix set is the security boundary for
-// send_file, so it is asserted directly rather than only through the full
-// send_file path (which short-circuits on a non-existent file before the
-// allowlist check is reached).
-//
-// Match on a path-separator boundary, not bare startsWith, so a prefix-lookalike
-// (e.g. /workspace/workgroup-evil) cannot satisfy /workspace/workgroup. Mirrors
-// poll-loop.ts's isAllowedFileEventPath. `p === prefix` still allows the exact
-// dir itself.
+// The prefix set is send_file's security boundary. Match on a path-separator boundary so a lookalike
+// (/workspace/workgroup-evil) cannot satisfy /workspace/workgroup. Mirrors poll-loop.ts's isAllowedFileEventPath.
 export function isAllowedFilePath(p: string): boolean {
   return SEND_FILE_ALLOWED_PREFIXES.some((prefix) => {
     const boundary = prefix.endsWith(path.sep) ? prefix : `${prefix}${path.sep}`;
@@ -78,43 +64,16 @@ function destinationList(): string {
   return all.map((d) => d.name).join(', ');
 }
 
-// Final response routing uses this envelope, but an MCP tool already has an
-// explicit routing field. A model can carry the final-response habit into a
-// send_message call, which otherwise exposes the envelope as literal chat
-// text. Recognize only one complete, top-level routing envelope: XML in prose
-// or code blocks remains user content.
+// A model can carry the final-response envelope habit into send_message; strip only one complete top-level
+// envelope, so XML in prose or code blocks stays user content.
 const ROUTING_MESSAGE_OPENER_RE = /<message\s+to="([^"]*)"\s*>/g;
-// Matches ONLY the leading opener (used to find where its content starts,
-// and to short-circuit text that isn't a routing envelope at all).
 const ROUTING_MESSAGE_LEADING_OPENER_RE = /^\s*<message\s+to="[^"]*"\s*>/;
 const ROUTING_MESSAGE_CLOSER = '</message>';
 
 /**
- * Recognize a leading `<message to="...">...</message>` envelope, terminating
- * at the FIRST closing tag — never the last, and never a nested one.
- *
- * This used to be a single regex whose inner group was a tempered token,
- * `(?:(?!<\/message>)[\s\S])*` — "anything that isn't the start of a
- * closing tag" — to stop at the first `</message>` instead of a plain
- * greedy `[\s\S]*` backtracking to the last one. But a tempered token still
- * re-runs its negative lookahead at every character position, and under
- * Bun/JSC that per-character backtracking hits an internal engine limit:
- * on a legitimate body at roughly 688KB and up the match SILENTLY fails —
- * no error, no timeout, just "not a routing envelope" — and even below
- * that threshold it costs on the order of 0.4s/MB. A chat message or
- * send_file caption can legitimately be that large (a long report, a
- * pasted log), so this scans with `indexOf` instead: O(n), no
- * backtracking, no size cliff.
- *
- * Terminating at the first closing tag (rather than requiring a UNIQUE one)
- * is deliberate, not just an artifact of the scan: a nested, un-addressed
- * `<message>` inside the envelope — e.g. `<message to="x">See <message>hi
- * </message> for detail</message>` — must not be silently unwrapped past
- * the inner tag to the outer one. Stopping at the first `</message>` (the
- * inner one here) leaves "for detail</message>" as trailing, non-whitespace
- * content, which fails the check below and rejects the whole thing as not
- * one complete envelope — the same outcome as an unclosed envelope, not a
- * guess at which closing tag was "really" meant.
+ * Recognize a leading `<message to="...">...</message>` envelope ending at the FIRST closing tag. Uses indexOf,
+ * not a tempered regex: under Bun/JSC that regex silently fails to match bodies above ~688KB. A nested
+ * un-addressed `<message>` leaves trailing content, so the whole thing is rejected rather than unwrapped.
  */
 function stripRoutingEnvelope(text: string): string | undefined {
   const opener = text.match(ROUTING_MESSAGE_LEADING_OPENER_RE);
@@ -131,9 +90,6 @@ function normalizeToolMessageText(
   text: string,
   callerTool: 'send_message' | 'send_file' | 'edit_message',
 ): { text: string } | { error: string } {
-  // An inline example or fenced code block does not begin with an envelope,
-  // so preserve it exactly. `<message>` without a routing attribute is also
-  // ordinary XML, not a NanoClaw routing instruction.
   if (!ROUTING_MESSAGE_LEADING_OPENER_RE.test(text)) return { text };
 
   const openers = [...text.matchAll(ROUTING_MESSAGE_OPENER_RE)];
@@ -160,9 +116,7 @@ function normalizeToolMessageText(
   };
 }
 
-// Mirrors the host's THREAD_KEY_PATTERN (src/db/thread-key-anchors.ts), which
-// re-checks every row: the runner's check is for a useful error, the host's is
-// the one that holds.
+// Mirrors the host's THREAD_KEY_PATTERN (src/db/thread-key-anchors.ts); the host's check is the one that holds.
 const THREAD_KEY_MAX_LENGTH = 128;
 const THREAD_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
@@ -172,7 +126,6 @@ const THREAD_KEY_DESCRIPTION =
 const IN_PLACE_THREAD_KEY_DESCRIPTION =
   'Optional. The thread_key the target message was sent with, when it went into an incident thread — routes this to the message inside that thread. Omit otherwise.';
 
-/** Validate an optional thread_key argument. Blank or absent → no key. Exported for tests. */
 export function parseThreadKey(raw: unknown): { threadKey: string | null } | { error: string } {
   if (raw === undefined || raw === null) return { threadKey: null };
   if (typeof raw !== 'string') return { error: 'thread_key must be a string' };
@@ -218,9 +171,7 @@ function resolveRouting(
       };
     }
 
-    // Legacy/internal sessions may not have a routing row. Preserve the
-    // unambiguous one-destination fallback while failing closed when several
-    // destinations exist.
+    // Legacy/internal sessions may lack a routing row: fall back only when exactly one destination exists.
     const all = getAllDestinations();
     if (all.length === 0) return { error: 'No destinations configured.' };
     if (all.length > 1) {
@@ -234,8 +185,7 @@ function resolveRouting(
   const dest = findByName(to);
   if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
   if (dest.type === 'channel') {
-    // Same chat as the session (by platform_id, not bot instance — siblings reach
-    // one channel through different channel_types) → keep the thread.
+    // Compare by platform_id, not bot instance: siblings reach one channel through different channel_types.
     const session = getSessionRouting();
     const threadId = session.platform_id === dest.platformId ? session.thread_id : null;
     return {
@@ -348,9 +298,7 @@ export const sendMessage: McpToolDefinition = {
         id,
         in_reply_to: getCurrentInReplyTo(),
         kind: internal ? 'work_log' : 'chat',
-        // Agent-composed reply text — eligible for the status subtext. With
-        // outcome reporting on (the fleet default) this is THE reply path, not
-        // an alternative to the `<message>` envelope.
+        // Agent-composed reply text, eligible for the status subtext.
         agentReply: !internal,
         platform_id: routing.platform_id,
         channel_type: routing.channel_type,
@@ -415,9 +363,7 @@ export const sendFile: McpToolDefinition = {
     const filePath = args.path as string;
     if (!filePath) return err('path is required');
 
-    // Same final-response habit send_message guards against: a caption wrapped
-    // in a routing envelope would otherwise reach the channel as literal
-    // `<message to="...">` text. Rejects before anything is staged.
+    // Reject a caption wrapped in a routing envelope before anything is staged.
     let caption = '';
     if (args.text) {
       const normalized = normalizeToolMessageText(args.text as string, 'send_file');
@@ -462,8 +408,6 @@ export const sendFile: McpToolDefinition = {
     // path.basename strips any traversal in the optional display name.
     const filename = path.basename((args.filename as string) || path.basename(realPath));
 
-    // SHA-256 dedup — browser-driver agents frequently snapshot the same
-    // page, producing identical images the user doesn't need twice.
     const fileContent = fs.readFileSync(realPath);
     const contentHash = crypto.createHash('sha256').update(fileContent).digest('hex');
     const prior = sentFileHashes.get(contentHash);
@@ -483,10 +427,7 @@ export const sendFile: McpToolDefinition = {
         id,
         in_reply_to: getCurrentInReplyTo(),
         kind: 'chat',
-        // A caption is agent-composed text: often the whole report, with the
-        // file attached to it. Stamped like any reply, own conversation only.
-        // A bare file with no caption gets no line, since there is no reply text
-        // to sit under.
+        // A captioned file is stamped like a reply; a bare file gets no subtext line.
         agentReply: caption.trim() !== '',
         platform_id: routing.platform_id,
         channel_type: routing.channel_type,
@@ -506,15 +447,10 @@ export const sendFile: McpToolDefinition = {
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename}), awaiting host ack`);
 
-    // Wait for the host to actually deliver. Without this, the agent would
-    // report success for Slack uploads that silently failed (missing OAuth
-    // scope, size limit, adapter transient error past retry count). v2's
-    // host-owned `delivered` table carries the outcome (migration adds the
-    // `error` column).
+    // Wait for the host's delivery ack, or uploads that silently failed (scope, size) would report success.
     const ack = await awaitDeliveryAck(id, SEND_FILE_ACK_TIMEOUT_MS);
     if (!ack) {
-      // Treat timeout as "sent — delivery unconfirmed". Record the hash
-      // anyway so a retry with the same content is deduped.
+      // Timeout means sent but unconfirmed; record the hash so a retry is still deduped.
       sentFileHashes.set(contentHash, filename);
       return ok(
         `File "${filename}" sent to ${routing.resolvedName} (id: ${id}) — delivery unconfirmed (host did not respond within ${SEND_FILE_ACK_TIMEOUT_MS / 1000}s).`,
@@ -526,9 +462,7 @@ export const sendFile: McpToolDefinition = {
         `File "${filename}" delivered to ${routing.resolvedName} (id: ${id}${ack.platformMessageId ? `, platform_message_id: ${ack.platformMessageId}` : ''}).`,
       );
     }
-    // Failed — surface the host's error to the agent. Do not record the
-    // hash: a corrected retry (different file, or after fixing the scope)
-    // should be allowed through.
+    // Don't record the hash, so a corrected retry is allowed.
     return err(
       `File upload failed for "${filename}" to ${routing.resolvedName}: ${ack.error ?? 'unknown error'}. The file is staged at ${realPath}.`,
     );
@@ -573,8 +507,6 @@ export const editMessage: McpToolDefinition = {
       withStatusSubtext({
         id,
         kind: 'chat',
-        // The agent's own corrected text, stamped like the reply it replaces;
-        // the own-conversation gate still applies.
         agentReply: true,
         platform_id: routing.platform_id,
         channel_type: routing.channel_type,

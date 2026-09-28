@@ -1,16 +1,4 @@
-/**
- * request_choice MCP tool — the non-blocking sibling of ask_user_question.
- *
- * Writes a `request_choice` system action and returns. The host
- * (src/modules/interactive/choice.ts) posts an approvals-backed card — into
- * this session's own conversation, or top-level into a named channel
- * destination — and, on an authorized click, relays the answer as a chat
- * message into the session a reply in the card's thread would reach.
- *
- * A kind='system' row never touches the chat budget (admitChatWrite returns
- * early for anything but kind 'chat'), so a
- * muted task can still post a card — the same lane escalate_to_owner uses.
- */
+/** Non-blocking sibling of ask_user_question. A kind='system' row never touches the chat budget, so a muted task can still post a card. */
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { findByName, getAllDestinations } from '../destinations.js';
@@ -172,9 +160,7 @@ export const requestChoice: McpToolDefinition = {
       return err(`approvers must hold 1 to ${MAX_CHOICE_APPROVERS} namespaced user ids (<channel>:<user id>)`);
     }
 
-    // Routing: a named channel destination (the host re-authorizes it), or
-    // nothing — the host then posts into this session's own conversation and
-    // thread, where send_message and ask_user_question land too.
+    // A named channel destination (the host re-authorizes it), or nothing: the session's own conversation and thread.
     let target: { to: string; channelType: string; platformId: string } | undefined;
     if (to !== undefined) {
       if (typeof to !== 'string' || !to) return err('to must be a destination name');

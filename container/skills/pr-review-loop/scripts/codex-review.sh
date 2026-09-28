@@ -28,6 +28,8 @@
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
 #                                             # post a substitute review's receipt for exactly that head — --reviewer
 #                                             # must start with a frontier model id (see REVIEWER_DENIED_TIERS)
+#   codex-review.sh cut-down                  # does the current head need a cut-down receipt, and has one: 0 yes/no need, 24 missing
+#   codex-review.sh cut-down-receipt --head <sha> --reviewed <sha> --reviewer "<model> cut-down-reviewer (<runtime>)" --body-file <file>
 #
 # Exit codes, one contract across commands (0 and 3 are the originals):
 #   0   pass; verdict printed; merge allowed. For merge-check, only `merge=allowed`
@@ -48,7 +50,8 @@
 #       asked for changes and it neither adds docs/review-notes/<this PR>.md nor
 #       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`), or
 #       it grows comment lines or adds a prohibited comment form (`comment_rule`;
-#       on unless the base's .github/pr-review-loop.json sets "commentRule": false)
+#       on unless the base's .github/pr-review-loop.json sets "commentRule": false),
+#       or it is over CUT_DOWN_THRESHOLD with no cut-down receipt (`cut_down_missing`)
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
@@ -57,7 +60,7 @@
 #       (admin_readiness); only `admin=ready` licenses `gh pr merge --admin`. A legacy
 #       head still gets 24 first when a check GitHub marks required for the PR is red on it
 #       (`required_red`) or the newest independent-review-receipt:v1 for it is not
-#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule`
+#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule` or `cut_down_missing`
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
 #   28  audit: merge-check would have refused this PR at its merge, or it merged by a
 #       method the gate does not authorize (rebase or manual) — a gate bypass
@@ -563,6 +566,11 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # in (replaces_state). A zero-width space or word joiner alone is no value.
 REPLACES_LINE_RE='(^|\n)Replaces:(?<value>[^\n]*)'
 REVIEW_LOOP_CONFIG='.github/pr-review-loop.json'
+# The base's REVIEW_LOOP_CONFIG may replace CUT_DOWN_THRESHOLD with its own
+# "cutDownThreshold", a whole number, or false to switch the rule off.
+CUT_DOWN_THRESHOLD=150
+CUT_DOWN_AGENT='cut-down-reviewer'
+CUT_DOWN_MARKER_RE='(^|\n)<!-- pr-review-loop:cut-down-receipt head=(?<head>[0-9a-f]{40}) reviewed=(?<reviewed>[0-9a-f]{40}) lines-reviewed=(?<before>[0-9]+|unknown) lines-now=(?<after>[0-9]+|unknown) -->'
 # The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
 # a PR any substitute receipt asked for changes on adds a current-PR fragment
 # under REVIEW_NOTES_DIR, or its body carries this line, read the way the Fixes-PR
@@ -609,23 +617,26 @@ fix_link_state() {
     )'
 }
 
-# Boolean key $1 of REVIEW_LOOP_CONFIG at the base commit scope_eval resolved,
-# or $2 when the file or the key is absent. A config that cannot be read, or is
-# not an object whose key is a boolean, returns non-zero: no verdict, never a pass.
-review_loop_flag() {
+# Key $1 of REVIEW_LOOP_CONFIG at the base commit scope_eval resolved, through jq
+# filter $3, or $2 when the file or key is absent. A config that cannot be read, or
+# holds a value $3 rejects, returns non-zero: no verdict, never a pass.
+review_loop_value() {
   local config status=0
   config=$(base_file "$SCOPE_BASE" "$REVIEW_LOOP_CONFIG") || status=$?
   case "$status" in
     0)
-      printf '%s' "$config" | jq -r --arg key "$1" --argjson default "$2" '
+      printf '%s' "$config" | jq -r --arg key "$1" --argjson default "$2" "def valid: $3;"'
         if type != "object" then error("not a JSON object")
         elif has($key) | not then $default
-        elif .[$key] | type != "boolean" then error("\($key) is not a boolean")
-        else .[$key] end'
+        else .[$key] | valid end'
       ;;
     3) echo "$2" ;;
     *) return 1 ;;
   esac
+}
+
+review_loop_flag() {
+  review_loop_value "$1" "$2" 'if type == "boolean" then . else error("not a boolean") end'
 }
 
 # `missing` when the base requires a `Replaces:` line and the {body} JSON
@@ -668,7 +679,7 @@ comment_rule_checker() {
 comment_rule_run() {
   local checker merge_base head
   checker=$(comment_rule_checker) || {
-    echo "the comment-rule checker is not installed: no $COMMENT_RULE_CHECKER under \$CLAUDE_PLUGINS_ROOT or ~/plugins (pull the bootstrap plugin)"
+    echo "the comment-rule checker is not installed: no $COMMENT_RULE_CHECKER under \$CLAUDE_PLUGINS_ROOT or ~/plugins; on the host, run \`git -C ~/plugins/bootstrap pull --ff-only\`, or \`git clone https://github.com/davekim917/bootstrap ~/plugins/bootstrap\` when there is no checkout"
     return 2
   }
   command -v node >/dev/null 2>&1 || { echo "the comment-rule checker needs node on PATH"; return 2; }
@@ -724,10 +735,72 @@ comment_rule_gate() {
       ;;
     *)
       printf '%s\n' "$report" >&2
-      echo "merge=error head=$SCOPE_HEAD: the comment-rule check gave no verdict (exit $status); fix the checker, or opt the repo out with \"commentRule\": false in $REVIEW_LOOP_CONFIG" >&2
+      echo "merge=error head=$SCOPE_HEAD: the comment-rule check gave no verdict (exit $status); when the report says typescript was not found, run \`npm ci --ignore-scripts\` in the bootstrap plugin directory plugins/comment-rule" >&2
       exit 1
       ;;
   esac
+}
+
+cut_down_lines() {
+  gh api "repos/$REPO/compare/$1...$2?per_page=1" | jq -r -L "$HERE" 'include "cut-down"; cut_down_lines'
+}
+
+cut_down_reviewer_named() {
+  [[ "$1" =~ (^|[^[:alnum:]_-])${CUT_DOWN_AGENT}($|[^[:alnum:]_-]) ]]
+}
+
+# `ok\t<why>` or `missing\t<why>` for SCOPE_HEAD; non-zero when it cannot tell.
+cut_down_state() {
+  local threshold lines pages receipts head login reviewer others
+  threshold=$(review_loop_value cutDownThreshold "$CUT_DOWN_THRESHOLD" \
+    'if . == false then "off" elif type == "number" and . >= 0 and floor == . then [., 1000000000] | min else error("not a whole number or false") end') || return 1
+  if [ "$threshold" = off ]; then
+    printf 'ok\t%s on %s sets "cutDownThreshold": false\n' "$REVIEW_LOOP_CONFIG" "$SCOPE_BASE_REF"
+    return 0
+  fi
+  lines=$(cut_down_lines "$SCOPE_BASE" "$SCOPE_HEAD") || return 1
+  if [ "$lines" != unknown ] && [ "$lines" -le "$threshold" ]; then
+    printf 'ok\t%s added lines outside tests, within the threshold of %s\n' "$lines" "$threshold"
+    return 0
+  fi
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  receipts=$(printf '%s\n' "$pages" | jq -rs --arg re "$CUT_DOWN_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" '
+    .[] | .data.repository.pullRequest.comments.nodes[]
+    | select(.author.login | type == "string" and . != "")
+    | .author.login as $login
+    | (.body // "") as $body
+    | [ $body | capture($re) ] | first // empty
+    | [ .head, $login, ([ $body | capture($reviewerRe) ] | first | .reviewer // "") ] | @tsv') || return 1
+  others=""
+  while IFS=$'\t' read -r head login reviewer; do
+    [ -n "$head" ] || continue
+    if ! reviewer_model_allowed "$reviewer" || ! cut_down_reviewer_named "$reviewer"; then continue; fi
+    if [ "$head" = "$SCOPE_HEAD" ] && may_clear "$login"; then
+      printf 'ok\ta cut-down receipt names this head (%s)\n' "$reviewer"
+      return 0
+    fi
+    others="$head"
+  done <<< "$receipts"
+  printf 'missing\tthis change adds %s lines outside tests, over the threshold of %s, and no cut-down receipt from %s names this head%s. Run the %s agent on the change (SKILL.md, "Cut-down pass"); it posts the receipt with `codex-review.sh cut-down-receipt`\n' \
+    "$lines" "$threshold" "$CUT_DOWN_AGENT" "${others:+ (the latest names ${others:0:12}: review only what changed since)}" "$CUT_DOWN_AGENT"
+}
+
+cut_down_gate() {
+  local state
+  [ -n "$SCOPE_BASE" ] || return 0
+  state=$(cut_down_state) || {
+    echo "merge=error head=$SCOPE_HEAD: the cut-down check gave no verdict; could not read $REVIEW_LOOP_CONFIG at $SCOPE_BASE as an object whose cutDownThreshold is a whole number or false, this head's changed lines, or the PR's comments" >&2
+    exit 1
+  }
+  [[ "$state" == missing$'\t'* ]] || return 0
+  echo "merge=refused head=$SCOPE_HEAD: cut_down_missing: ${state#*$'\t'}" >&2
+  exit 24
+}
+
+final_gates() {
+  comment_rule_gate
+  cut_down_gate
+  refuse_if_base_moved
 }
 
 # Reviewer eligibility is a tier rule stated as a DENYLIST: any model may write
@@ -796,6 +869,21 @@ reviewer_model_allowed() {
   local refusal
   refusal=$(reviewer_model_refusal "${1:-}") || return 1
   [ -z "$refusal" ]
+}
+
+# merge-check reads the reviewer back through the single-line RECEIPT_REVIEWER_LINE_RE,
+# and a marker smuggled into either argument would be read before the command's own.
+receipt_input_refusal() {
+  case "$1" in
+    *$'\n'*|*$'\r'*) echo "--reviewer may not contain a newline or carriage return"; return 0 ;;
+  esac
+  if ! reviewer_model_allowed "$1"; then
+    echo "--reviewer refused — $(reviewer_model_refusal "$1")"
+    return 0
+  fi
+  case "$1$2" in
+    *pr-review-loop:*) echo "--reviewer and the body may not contain a pr-review-loop marker" ;;
+  esac
 }
 
 # Prints file $2 as it is at base commit $1. Read through the API, never the
@@ -1973,8 +2061,7 @@ merge_check_main() {
       exit 24
     fi
     legacy_precheck
-    comment_rule_gate
-    refuse_if_base_moved
+    final_gates
     if [ -n "$LEGACY_CI_HOST" ]; then
       local admin
       echo "merge-check: required $LEGACY_CI_HOST never started on Actions; the $HOST_CI_CONTEXT success on this head stands in" >&2
@@ -2087,8 +2174,7 @@ merge_check_main() {
       ;;
   esac
   if [ "$SCOPE_VERDICT" = skip ]; then
-    comment_rule_gate
-    refuse_if_base_moved
+    final_gates
     echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=$ci_word base=$SCOPE_BASE: $SCOPE_REASON"
     exit 0
   fi
@@ -2109,8 +2195,7 @@ merge_check_main() {
       echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: the approving substitute receipt names a disallowed reviewer — $(reviewer_model_refusal "$receipt_reviewer"). Post a new receipt (codex-review.sh receipt ...) from a frontier model" >&2
       exit 24
     fi
-    comment_rule_gate
-    refuse_if_base_moved
+    final_gates
     echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: the latest substitute receipt for this head approves ($receipt_reviewer)"
     exit 0
   fi
@@ -2123,8 +2208,7 @@ merge_check_main() {
   observation=$(status_observation "$SCOPE_HEAD" "$since") || exit 1
   case "$observation" in
     codex=clean*)
-      comment_rule_gate
-      refuse_if_base_moved
+      final_gates
       echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: $observation"
       ;;
     *)
@@ -2399,7 +2483,7 @@ ci_wait_main() {
   done
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|claim|merge-check|merge|audit|receipt}" in
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|claim|merge-check|merge|audit|receipt|cut-down|cut-down-receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -3042,6 +3126,62 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         ;;
     esac
     ;;
+  cut-down)
+    scope_eval || exit 1
+    [ -n "$SCOPE_BASE" ] || { echo "cut-down: could not resolve base branch $SCOPE_BASE_REF to a commit" >&2; exit 1; }
+    state=$(cut_down_state) || { echo "cut-down: no verdict for $SCOPE_HEAD" >&2; exit 1; }
+    echo "cut_down=${state%%$'\t'*} head=$SCOPE_HEAD: ${state#*$'\t'}"
+    [ "${state%%$'\t'*}" = ok ] || exit 24
+    ;;
+  cut-down-receipt)
+    shift
+    head="" reviewed="" reviewer="" body_file=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head|--reviewed|--reviewer|--body-file)
+          [ $# -ge 2 ] || { echo "cut-down-receipt: $1 needs a value" >&2; exit 2; }
+          case "$1" in
+            --head) head="$2" ;;
+            --reviewed) reviewed="$2" ;;
+            --reviewer) reviewer="$2" ;;
+            *) body_file="$2" ;;
+          esac
+          shift 2 ;;
+        *) echo "cut-down-receipt: unknown argument $1" >&2; exit 2 ;;
+      esac
+    done
+    if ! [[ "$head" =~ ^[0-9a-f]{40}$ && "$reviewed" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "cut-down-receipt: --head (the PR head now) and --reviewed (the head the pass read) must be full 40-character SHAs" >&2
+      exit 2
+    fi
+    if [ -z "$reviewer" ] || [ -z "$body_file" ] || [ ! -s "$body_file" ]; then
+      echo "cut-down-receipt: needs --reviewer and a non-empty --body-file (every cut, and whether it was applied or answered)" >&2
+      exit 2
+    fi
+    body=$(cat "$body_file")
+    refusal=$(receipt_input_refusal "$reviewer" "$body")
+    if [ -z "$refusal" ] && ! cut_down_reviewer_named "$reviewer"; then
+      refusal="--reviewer must name the $CUT_DOWN_AGENT agent that ran the pass, after its model id; the PR's author does not post this receipt"
+    fi
+    [ -z "$refusal" ] || { echo "cut-down-receipt: $refusal" >&2; exit 2; }
+    base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName | jq -er .baseRefName) || exit 1
+    base_sha=$(base_tip "$base") || { echo "cut-down-receipt: could not resolve $base to a commit" >&2; exit 1; }
+    before=$(cut_down_lines "$base_sha" "$reviewed") || { echo "cut-down-receipt: could not count the lines $reviewed adds" >&2; exit 1; }
+    after=$(cut_down_lines "$base_sha" "$head") || { echo "cut-down-receipt: could not count the lines $head adds" >&2; exit 1; }
+    cut=unknown
+    if [ "$before" != unknown ] && [ "$after" != unknown ]; then cut=$((before - after)); fi
+    url=$(gh pr comment "$PR" --repo "$REPO" --body "### Cut-down review receipt
+
+- **Head:** \`$head\`
+- **Reviewed head:** \`$reviewed\`
+- **Reviewer and runtime:** $reviewer
+- **Added lines outside tests:** $before when reviewed, $after now; cut $cut
+
+$body
+
+<!-- pr-review-loop:cut-down-receipt head=$head reviewed=$reviewed lines-reviewed=$before lines-now=$after -->")
+    echo "cut-down-receipt: head=$head cut=$cut $url"
+    ;;
   receipt)
     # A substitute review's durable receipt (docs/review-policy.md, "Review
     # availability"), tied to exactly one head. The reviewer is a fresh
@@ -3091,33 +3231,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
       echo "receipt: --claim-owner must be a 1-64 character session label ([A-Za-z0-9._:-])" >&2
       exit 2
     fi
-    # merge-check re-reads --reviewer back out of the posted comment body via a
-    # single-line regex (RECEIPT_REVIEWER_LINE_RE); a newline or CR embedded in
-    # --reviewer here would post fine but be read back differently there. Refuse
-    # it at the source instead of letting the two ends disagree.
-    case "$reviewer" in
-      *$'\n'*|*$'\r'*)
-        echo "receipt: --reviewer may not contain a newline or carriage return" >&2
-        exit 2
-        ;;
-    esac
-    # Reviewer eligibility is a tier rule, not prose: --reviewer's FIRST
-    # whitespace-delimited token must be a concrete model id outside
-    # REVIEWER_DENIED_TIERS. Only that token is read, so whatever follows it is
-    # free text. See reviewer_model_refusal above and docs/review-policy.md.
-    if ! reviewer_model_allowed "$reviewer"; then
-      echo "receipt: --reviewer refused — $(reviewer_model_refusal "$reviewer")" >&2
-      exit 2
-    fi
     body=$(cat "$body_file")
-    # This command writes the receipt's only marker. One smuggled in through the
-    # body or the reviewer would be read first and could approve another head.
-    case "$reviewer$body" in
-      *pr-review-loop:*)
-        echo "receipt: --reviewer and the body may not contain a pr-review-loop marker" >&2
-        exit 2
-        ;;
-    esac
+    refusal=$(receipt_input_refusal "$reviewer" "$body")
+    [ -z "$refusal" ] || { echo "receipt: $refusal" >&2; exit 2; }
     claim_completion=""
     if [ -n "$claim_id" ]; then
       claim_completion="
