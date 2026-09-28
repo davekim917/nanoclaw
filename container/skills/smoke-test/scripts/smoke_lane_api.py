@@ -14,19 +14,7 @@ import urllib.request
 
 USAGE = """usage:
   smoke_lane_api.py init  <run-dir> --from <scope.json>
-  smoke_lane_api.py check <run-dir> <METHOD> <path> [--body <json>]
-
-Lane API client with a write-scope guard. `init` pins the deployment's scope
-into <run-dir>/write-scope.json once, at intake. `check` exits 0 when the
-request may be sent and 77 when the harness refuses it, printing
-WRITE_SCOPE_REFUSED on stderr. In a lane script:
-
-  import smoke_lane_api
-  h = smoke_lane_api.H(outdir, run_dir=RUN, base=BACKEND, seats={"M": "..."})
-  h.login("M"); h.call("10-M-read", "M", "GET", "/path")
-
-A refused call sends nothing, saves <tag>.json with harnessBlocked true, and
-raises WriteScopeRefused: record the check blocked, never as a product result."""
+  smoke_lane_api.py check <run-dir> <METHOD> <path> [--body <json>]"""
 
 REFUSED = 77
 SCOPE_FILE = "write-scope.json"
@@ -45,9 +33,7 @@ PASSWORD_HELPER = "/workspace/extra/qa-seat-password.sh"
 
 
 class WriteScopeRefused(Exception):
-    def __init__(self, reason):
-        super().__init__(reason)
-        self.reason = reason
+    pass
 
 
 def now():
@@ -71,15 +57,9 @@ def init_scope(run_dir, source):
     run_id = os.path.basename(os.path.normpath(run_dir))
     with open(source) as f:
         scope = validated_scope(json.load(f))
-    scope.update(schemaVersion=1, runId=run_id, fixturePrefix="QA-{}-".format(run_id))
-    target = os.path.join(run_dir, SCOPE_FILE)
-    tmp = "{}.{}.tmp".format(target, os.getpid())
-    with open(tmp, "x") as f:
+    scope.update(schemaVersion=1, runId=run_id)
+    with open(os.path.join(run_dir, SCOPE_FILE), "x") as f:
         json.dump(scope, f, indent=1)
-    try:
-        os.link(tmp, target)
-    finally:
-        os.unlink(tmp)
     return scope
 
 
@@ -212,10 +192,10 @@ class H:
         try:
             return judge(self.run_dir, method, path, body)
         except WriteScopeRefused as e:
-            self.save(tag, {"harnessBlocked": True, "refusal": "WRITE_SCOPE_REFUSED", "reason": e.reason,
+            self.save(tag, {"harnessBlocked": True, "refusal": "WRITE_SCOPE_REFUSED", "reason": str(e),
                             "seat": seat, "method": method, "path": path, "body": body, "at": now()})
             self.emit("{} [{}] {} {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason={} (no request sent)".format(
-                now(), tag, seat, method, path, e.reason))
+                now(), tag, seat, method, path, e))
             raise
 
     def req(self, method, path, tok=None, body=None):
@@ -281,7 +261,7 @@ class H:
 
 
 def main(argv):
-    if len(argv) >= 4 and argv[1] == "init" and argv[3] == "--from" and len(argv) == 5:
+    if len(argv) == 5 and argv[1] == "init" and argv[3] == "--from":
         try:
             init_scope(argv[2], argv[4])
         except FileExistsError:
@@ -296,7 +276,7 @@ def main(argv):
         try:
             print(judge(argv[2], argv[3], argv[4], body))
         except WriteScopeRefused as e:
-            print("WRITE_SCOPE_REFUSED reason={}".format(e.reason), file=sys.stderr)
+            print("WRITE_SCOPE_REFUSED reason={}".format(e), file=sys.stderr)
             return REFUSED
         return 0
     print(USAGE, file=sys.stderr)
