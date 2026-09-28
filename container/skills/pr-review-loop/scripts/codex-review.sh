@@ -160,6 +160,8 @@ NAME="${REPO#*/}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHURN_JS="$HERE/review-churn.mjs"
 
+jq_here() { (cd "$HERE" && jq -L "$HERE" "$@"); }
+
 # The classifier is dependency-free ESM so it runs on whatever JS runtime the
 # box has — node on the host, node or bun inside an agent container. Nothing is
 # installed for it, and jq stays the only other hard dependency.
@@ -600,7 +602,7 @@ REVIEW_NOTES_REASON_SPLIT_RE='^(?<reason>[^()]*)\)(?<trailing>.*)$'
 # inside a code fence or an HTML comment is an example or a template, not a
 # link, so both are cut first (pr_body_text, pr-body.jq).
 fix_link_state() {
-  jq -r -L "$HERE" --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
+  jq_here -r --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
     include "pr-body";
     # A replacement pr-body.jq can drop the shape check in pr_body_text, and the
     # `and` below never reads $body for a non-fix title, so the shape is asserted
@@ -649,7 +651,7 @@ replaces_state() {
     true) ;;
     *) return 1 ;;
   esac
-  printf '%s' "$1" | jq -r -L "$HERE" --arg lineRe "$REPLACES_LINE_RE" '
+  printf '%s' "$1" | jq_here -r --arg lineRe "$REPLACES_LINE_RE" '
     include "pr-body";
     include "visible-text";
     pr_body_text | if [ capture($lineRe; "gi") ] | any(.value | has_visible_text) then "ok" else "missing" end'
@@ -742,7 +744,7 @@ comment_rule_gate() {
 
 cut_down_lines() {
   gh api "repos/$REPO/compare/$1...$2?per_page=1" \
-    | jq -r -L "$HERE" --argjson comments "${3:-null}" 'include "cut-down"; cut_down_lines($comments)'
+    | jq_here -r --argjson comments "${3:-null}" 'include "cut-down"; cut_down_lines($comments)'
 }
 
 # Null when the base turns the comment rule off: nothing else would judge comment lines then.
@@ -1078,7 +1080,7 @@ scope_eval() {
   # matches. complete_listing is every check that makes the verdict fail
   # closed on the listing, defined once so the `files` this also returns (for
   # SCOPE_FILES) have passed exactly the checks the verdict's files did.
-  decision=$(printf '%s' "$files" | jq -c -L "$HERE" --arg yml "$LABELER_YML" --argjson pr "$pr_json" '
+  decision=$(printf '%s' "$files" | jq_here -c --arg yml "$LABELER_YML" --argjson pr "$pr_json" '
     include "risk-scope";
     def complete_listing:
       if (.files | type) == "array" then .files else error("the comparison lists no files") end
@@ -1313,7 +1315,7 @@ receipt_comments_page() {
 receipt_outcome() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  printf '%s\n' "$pages" | jq -rs -L "$HERE" --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
+  printf '%s\n' "$pages" | jq_here -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
@@ -1395,7 +1397,7 @@ review_notes_state() {
   local state
   state=$(changes_receipt_state) || return 1
   if [ "$state" = none ]; then echo ok; return 0; fi
-  printf '%s' "$1" | jq -r -L "$HERE" --arg state "$state" --arg lineRe "$REVIEW_NOTES_NONE_LINE_RE" \
+  printf '%s' "$1" | jq_here -r --arg state "$state" --arg lineRe "$REVIEW_NOTES_NONE_LINE_RE" \
     --arg candidateRe "$REVIEW_NOTES_NONE_CANDIDATE_RE" --arg anywhereRe "$REVIEW_NOTES_NONE_ANYWHERE_RE" \
     --arg splitRe "$REVIEW_NOTES_REASON_SPLIT_RE" \
     --arg notes "$REVIEW_NOTES_FILE" --arg fragment "$REVIEW_NOTES_DIR/$PR.md" \
@@ -1656,10 +1658,10 @@ never_started_runs() {
         # run on the head, e.g. before a reopen — is the per-push check, not
         # a genuine failure of the head: it neither disqualifies the workflow
         # nor makes the run a candidate.
-        if printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; quick_only' >/dev/null 2>&1; then
+        if printf '%s\n' "$jobs" | jq_here -e 'include "never-started"; quick_only' >/dev/null 2>&1; then
           continue
         fi
-        printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; run_never_started' >/dev/null 2>&1 || { clean=0; break; }
+        printf '%s\n' "$jobs" | jq_here -e 'include "never-started"; run_never_started' >/dev/null 2>&1 || { clean=0; break; }
         saw_never=1
       done
     else
@@ -1697,7 +1699,7 @@ quick_tier_runs() {
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     [[ "$attempt" =~ ^[0-9]+$ ]] && [ "$attempt" -ge 1 ] || attempt=1
     jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/attempts/$attempt/jobs?per_page=100" 2>/dev/null) || continue
-    if printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; quick_only' >/dev/null 2>&1; then
+    if printf '%s\n' "$jobs" | jq_here -e 'include "never-started"; quick_only' >/dev/null 2>&1; then
       found=$(jq -cn --argjson f "$found" --argjson id "$id" --argjson a "$attempt" '$f + [{ id: $id, attempt: $a }]') || return 1
     fi
   done <<< "$rows"
@@ -1781,7 +1783,7 @@ may_clear() {
 # with the clear receipts of every login in the JSON array $3 left out. Prints
 # `clear\t<login>` for a clear newest receipt, so its author can be checked.
 independent_receipt_newest() {
-  printf '%s\n' "$1" | jq -rs -L "$HERE" --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --argjson denied "$3" \
+  printf '%s\n' "$1" | jq_here -rs --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --argjson denied "$3" \
     --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg head "$2" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
@@ -1894,7 +1896,7 @@ required_status_red() {
   for id in $candidates; do
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     job=$(gh api "repos/$REPO/actions/jobs/$id" 2>/dev/null) || continue
-    printf '%s\n' "$job" | jq -e -L "$HERE" 'include "never-started"; never_started and .conclusion == "failure"' >/dev/null 2>&1 || continue
+    printf '%s\n' "$job" | jq_here -e 'include "never-started"; never_started and .conclusion == "failure"' >/dev/null 2>&1 || continue
     # And its run must be one of the excusable ones. A job whose run_id names
     # no such run — including a job read that carries no run_id — stays red.
     printf '%s\n' "$job" | jq -e --argjson excusable "$excusable" '(.run_id // null) as $r | $r != null and ($r | IN($excusable[]))' >/dev/null 2>&1 || continue

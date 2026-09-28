@@ -1845,6 +1845,20 @@ describe('codex-review risk-scoped review requests', () => {
     expect(merge.stderr).toContain(`changes risk:high path ${file}`);
   });
 
+  it("keeps the gate's risk-scope.jq when the caller's cwd holds a same-named module", () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], files: [changedFile('src/router.ts')] });
+    fs.writeFileSync(
+      path.join(root, 'risk-scope.jq'),
+      'def risk_high_globs: []; def glob_regex: .; def matching($regexes): [];\n',
+    );
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(24);
+    expect(merge.stderr).toContain('changes risk:high path src/router.ts');
+    expect(merge.stdout).not.toContain('merge=allowed');
+  });
+
   it('names the first three risky paths, counts the rest, then the scope labels', () => {
     const root = tempRoot();
     scopeFixture(root, {
@@ -2783,6 +2797,17 @@ describe('codex-review risk-scoped review requests', () => {
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(status);
       expect(result.stdout).toMatch(legacy ? /merge=defer mode=legacy/ : /merge=allowed head=\S+ mode=risk-scoped/);
+    });
+
+    it("keeps the gate's cut-down.jq when the caller's cwd holds a same-named module", () => {
+      const root = tempRoot();
+      cutDownFixture(root);
+      fs.writeFileSync(path.join(root, 'cut-down.jq'), 'def cut_down_lines($comments): 0;\n');
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('cut_down_missing: this change adds 151 lines outside tests');
+      expect(result.stdout).not.toMatch(/merge=(allowed|defer)/);
     });
 
     it('refuses a receipt that names an older head, and says which', () => {
