@@ -174,7 +174,7 @@ default; a repo opts out only with `"commentRule": false` in the base branch's
 `.github/pr-review-loop.json`, and a checker that cannot run refuses rather
 than passes.
 
-A PR that adds more than 150 lines outside tests and lockfiles also needs a
+A PR that adds more than 150 lines outside tests and lockfiles (not counting lines of only comment, which the comment rule judges) also needs a
 cut-down receipt on the head it merges at: a fresh-context `cut-down-reviewer`
 agent, run by the author's own provider, asked only what in the diff can be
 deleted or simplified without losing required behaviour. It never proposes

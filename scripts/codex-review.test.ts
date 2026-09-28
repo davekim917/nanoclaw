@@ -2910,6 +2910,98 @@ describe('codex-review risk-scoped review requests', () => {
       expect(ok.stdout).toContain(`cut_down=ok head=${HEAD}: a cut-down receipt names this head (${AGENT_REVIEWER})`);
     });
 
+    describe('comment-only lines, as the comment-rule checker classifies them', () => {
+      const MERGE_BASE = '6666666666666666666666666666666666666666';
+      const report = (files: Array<[string, number, number]>) =>
+        JSON.stringify({
+          status: 'pass',
+          files: files.map(([path, added, comments]) => ({
+            path,
+            added_lines: added,
+            added_comment_lines: comments,
+          })),
+        });
+
+      function classifiedFixture(root: string, files: Page[], reviewLoop?: string) {
+        cutDownFixture(root, { files, reviewLoop });
+        for (const head of [HEAD, OLD_HEAD])
+          writeJson(root, `compare--${BASE_OID}...${head}.json`, {
+            status: 'ahead',
+            merge_base_commit: { sha: MERGE_BASE },
+            files: head === HEAD ? files : [changedFile('src/gate.ts', undefined, 190)],
+          });
+      }
+
+      it('needs no receipt for a comment-only change over the threshold', () => {
+        const root = tempRoot();
+        classifiedFixture(root, [changedFile('src/gate.ts', undefined, 200)]);
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD], {
+          MOCK_COMMENT_RULE_REPORT: report([['src/gate.ts', 200, 200]]),
+        });
+        expect(result.status).toBe(0);
+        expect(result.calls).toMatch(new RegExp(`comment-rule check --repo \\S+ --base ${MERGE_BASE} --head \\S+ --json\\n`));
+      });
+
+      it('counts only the code lines of a mixed change', () => {
+        const root = tempRoot();
+        classifiedFixture(root, [changedFile('src/gate.ts', undefined, 200), changedFile('src/gate.test.ts', undefined, 90)]);
+
+        const result = runHelper(root, ['cut-down'], {
+          MOCK_COMMENT_RULE_REPORT: report([
+            ['src/gate.ts', 200, 60],
+            ['src/gate.test.ts', 90, 0],
+          ]),
+        });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain(
+          `cut_down=ok head=${HEAD}: 140 added lines outside tests that are not only comment, within the threshold of 150`,
+        );
+      });
+
+      it('counts every added line of a file whose added count the checker does not share with GitHub', () => {
+        const root = tempRoot();
+        classifiedFixture(root, [changedFile('src/gate.ts', undefined, 200)]);
+
+        const result = runHelper(root, ['cut-down'], { MOCK_COMMENT_RULE_REPORT: report([['src/gate.ts', 201, 201]]) });
+        expect(result.status).toBe(24);
+        expect(result.stdout).toContain('this change adds 200 lines outside tests that are not only comment, over the threshold');
+      });
+
+      it.each<[string, Record<string, string>, string?]>([
+        ['the checker cannot judge the change', { MOCK_COMMENT_RULE_STATUS: '2' }],
+        ['the checker predates the added-line counts', { MOCK_COMMENT_RULE_REPORT: '{"status":"pass","files":[{"path":"src/gate.ts"}]}' }],
+        ['the checker prints no JSON', { MOCK_COMMENT_RULE_REPORT: 'comment-rule: PASS' }],
+        ['the base turns the comment rule off', {}, '{ "commentRule": false }\n'],
+      ])('counts every added line when %s', (_case, env, reviewLoop) => {
+        const root = tempRoot();
+        classifiedFixture(root, [changedFile('src/gate.ts', undefined, 200)], reviewLoop);
+
+        const result = runHelper(root, ['cut-down'], {
+          MOCK_COMMENT_RULE_REPORT: report([['src/gate.ts', 200, 200]]),
+          ...env,
+        });
+        expect(result.status).toBe(24);
+        expect(result.stdout).toContain('this change adds 200 lines outside tests, over the threshold of 150');
+        expect(result.stdout).toContain('Comment-only lines count too');
+      });
+
+      it('records the same measure in a receipt', () => {
+        const root = tempRoot();
+        classifiedFixture(root, [changedFile('src/gate.ts', undefined, 151)]);
+        const body = path.join(root, 'cuts.md');
+        fs.writeFileSync(body, 'No cuts.\n');
+
+        const posted = runHelper(
+          root,
+          ['cut-down-receipt', '--head', HEAD, '--reviewed', OLD_HEAD, '--reviewer', AGENT_REVIEWER, '--body-file', body],
+          { MOCK_COMMENT_RULE_REPORT: report([['src/gate.ts', 151, 51]]) },
+        );
+        expect(posted.status).toBe(0);
+        expect(posted.posted).toContain('**Added lines outside tests, less comment-only lines:** 190 when reviewed, 100 now; cut 90');
+      });
+    });
+
     describe('cut-down-receipt', () => {
       function receiptRun(root: string, reviewer: string, reviewed = OLD_HEAD) {
         const body = path.join(root, 'cuts.md');
@@ -2938,7 +3030,7 @@ describe('codex-review risk-scoped review requests', () => {
         const posted = receiptRun(root, AGENT_REVIEWER);
         expect(posted.status).toBe(0);
         expect(posted.stdout).toContain(`cut-down-receipt: head=${HEAD} cut=39`);
-        expect(posted.posted).toContain('**Added lines outside tests:** 190 when reviewed, 151 now; cut 39');
+        expect(posted.posted).toContain('**Added lines outside tests, less comment-only lines:** 190 when reviewed, 151 now; cut 39');
         expect(posted.posted).toContain(
           `<!-- pr-review-loop:cut-down-receipt head=${HEAD} reviewed=${OLD_HEAD} lines-reviewed=190 lines-now=151 -->`,
         );
