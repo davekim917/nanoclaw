@@ -25,7 +25,10 @@ function flag(raw: unknown): boolean {
 
 function parseExtraParams(raw: unknown): Record<string, string> | undefined {
   if (raw === undefined) return undefined;
-  const items = (Array.isArray(raw) ? raw : String(raw).split(',')).map((s) => String(s).trim()).filter(Boolean);
+  const items = (Array.isArray(raw) ? raw : [raw])
+    .flatMap((s) => String(s).split(','))
+    .map((s) => s.trim())
+    .filter(Boolean);
   if (items.length === 0) return undefined;
   const out: Record<string, string> = {};
   for (const item of items) {
@@ -131,6 +134,7 @@ registerResource({
         {
           name: 'authorize_param',
           type: 'string',
+          multiple: true,
           description:
             'Extra authorize-endpoint parameter, key=value. Repeatable. Dropbox needs token_access_type=offline to issue a refresh token.',
         },

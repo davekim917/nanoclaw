@@ -241,9 +241,22 @@ describe('startSecretIntake', () => {
     ).rejects.toThrow(/nothing to rotate/);
   });
 
-  it('refuses a second pending intake for the same name', async () => {
-    await startSecretIntake({ ...newKey, caller: agentCaller });
-    await expect(startSecretIntake({ ...newKey, caller: agentCaller })).rejects.toThrow(/already waiting/);
+  it("refuses a second pending intake for the same name from someone else, but replaces the requester's own", async () => {
+    const first = await startSecretIntake({ ...newKey, caller: agentCaller });
+    await expect(startSecretIntake({ ...newKey, caller: { kind: 'host' } })).rejects.toThrow(/already waiting/);
+    const second = await startSecretIntake({ ...newKey, hostPattern: 'api2.linear.app', caller: agentCaller });
+    expect(getSecretIntake(first.intakeId)?.status).toBe('expired');
+    expect(JSON.parse(h.deliveries[1].args[4] as string)).toMatchObject({ operation: 'edit', messageId: 'msg-1' });
+    expect(JSON.parse(h.deliveries[1].args[4] as string).text).toContain('Replaced by a newer request');
+    expect(await hooks.open(first.intakeId, 'UOWNER')).toMatchObject({ ok: false });
+    expect(getSecretIntake(second.intakeId)?.status).toBe('pending');
+  });
+
+  it('lets a session at its cap replace one of its own requests', async () => {
+    for (const n of ['A', 'B', 'C']) await startSecretIntake({ ...newKey, name: `Key-${n}`, caller: agentCaller });
+    await expect(startSecretIntake({ ...newKey, name: 'Key-A', caller: agentCaller })).resolves.toMatchObject({
+      status: 'pending',
+    });
   });
 
   it('caps the pending requests one session can hold', async () => {
@@ -664,6 +677,9 @@ describe('declared fields', () => {
     const notice = h.deliveries.find((d) => d.args[1] === 'slack:D1');
     expect(JSON.parse(notice?.args[4] as string).text).toContain('stored secret "Example-API-api_key" for agent');
     expect(JSON.parse(notice?.args[4] as string).text).not.toContain('Example-API-api_secret');
+    expect(JSON.parse(notice?.args[4] as string).text).toContain('nothing was granted');
+    expect(JSON.parse(notice?.args[4] as string).text).not.toContain('Granted to');
+    expect(h.notes[0]).toContain('was only partly stored');
     expect(getSecretIntake(intakeId)?.detail).toContain('"Example-API-api_key" stored but granted to no one');
     expect(h.groupGrants).toEqual([]);
     expect(everythingObservable()).not.toContain(API_SECRET);

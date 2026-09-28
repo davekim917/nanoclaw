@@ -468,9 +468,11 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
   // Checked here, after the last await, so two concurrent requests cannot both pass.
   const pending = [...intakes.values()].filter((other) => other.status === 'pending' || other.status === 'storing');
   const names = new Set(targets.map((target) => target.name));
-  const duplicate = pending.find(
+  const overlapping = pending.filter(
     (other) => other.secretName === name || other.targets.some((target) => names.has(target.name)),
   );
+  const replaceable = (other: Intake) => other.status === 'pending' && other.sessionId === intake.sessionId;
+  const duplicate = overlapping.find((other) => !replaceable(other));
   if (duplicate) {
     throw new Error(
       `An intake for "${name}" is already waiting (${duplicate.id}); it expires at ${formatLocalTime(new Date(duplicate.expiresAt).toISOString(), TIMEZONE)}.`,
@@ -478,11 +480,17 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
   }
   if (
     intake.sessionId &&
-    pending.filter((other) => other.sessionId === intake.sessionId).length >= MAX_PENDING_PER_SESSION
+    pending.filter((other) => other.sessionId === intake.sessionId && !overlapping.includes(other)).length >=
+      MAX_PENDING_PER_SESSION
   ) {
     throw new Error(
       `This session already has ${MAX_PENDING_PER_SESSION} secret requests waiting; let them finish or expire.`,
     );
+  }
+  for (const old of overlapping) {
+    old.status = 'expired';
+    old.finishedAt = now;
+    void editCard(old, `${cardTitle(old)}\n\nReplaced by a newer request — nothing was stored.`);
   }
   intakes.set(intake.id, intake);
   try {
@@ -571,14 +579,22 @@ async function slackOwnerDm(): ReturnType<typeof pickApprovalDelivery> {
   return null;
 }
 
-async function noticeOwners(intake: Intake, namespacedUserId: string, stored: string[]): Promise<void> {
+async function noticeOwners(
+  intake: Intake,
+  namespacedUserId: string,
+  stored: string[],
+  partial: boolean,
+): Promise<void> {
   try {
     const adapter = getDeliveryAdapter();
     const target = await pickApprovalDelivery(await pickOwnersFirst(null), '');
     if (!adapter || !target) throw new Error('no owner DM is reachable');
     const who = (await getUser(namespacedUserId))?.display_name || namespacedUserId;
     const where = targetLines({ ...intake, targets: intake.targets.filter((x) => stored.includes(x.name)) }).join(' ');
-    const text = `🔐 ${who} stored ${quoted(stored)} for agent "${intake.requester?.agentName}". ${where} ${grantsLine(intake.groups, intake.workgroups, intake.rotate)}.`;
+    const granted = partial
+      ? 'A later write failed, so nothing was granted.'
+      : `${grantsLine(intake.groups, intake.workgroups, intake.rotate)}.`;
+    const text = `🔐 ${who} stored ${quoted(stored)} for agent "${intake.requester?.agentName}". ${where} ${granted}`;
     await adapter.deliver(
       target.messagingGroup.channel_type,
       target.messagingGroup.platform_id,
@@ -604,6 +620,8 @@ function unavailable(intake: Intake | undefined): string | null {
   return intake.status === 'pending' ? null : `This secret request is already ${intake.status}.`;
 }
 
+class PartialStoreError extends Error {}
+
 async function failIntake(intake: Intake, err: unknown): Promise<void> {
   if (intake.status !== 'storing') {
     log.warn('Secret intake: follow-up after the store failed', { intakeId: intake.id, err });
@@ -612,9 +630,10 @@ async function failIntake(intake: Intake, err: unknown): Promise<void> {
   intake.status = 'failed';
   intake.finishedAt = Date.now();
   intake.detail = err instanceof Error ? err.message : String(err);
+  const outcome = err instanceof PartialStoreError ? 'only partly stored' : 'NOT stored';
   log.warn('Secret intake: not stored', { intakeId: intake.id, detail: intake.detail });
-  await editCard(intake, `${cardTitle(intake)}\n\nNot stored: ${intake.detail}`);
-  await tellRequester(intake, `Secret "${intake.secretName}" was NOT stored: ${intake.detail}`);
+  await editCard(intake, `${cardTitle(intake)}\n\n${outcome}: ${intake.detail}`);
+  await tellRequester(intake, `Secret "${intake.secretName}" was ${outcome}: ${intake.detail}`);
 }
 
 function quoted(names: string[]): string {
@@ -656,12 +675,14 @@ async function completeIntake(
     return;
   }
   const { stored, failure } = await writeVault(writes);
-  if (authority === 'group-admin' && stored.length) await noticeOwners(intake, namespacedUserId, stored);
+  if (authority === 'group-admin' && stored.length) await noticeOwners(intake, namespacedUserId, stored, !!failure);
   if (failure) {
     if (!stored.length) throw failure.err;
     const reason = failure.err instanceof Error ? failure.err.message : String(failure.err);
     const done = intake.rotate ? 'replaced, now live for every holder' : 'stored but granted to no one';
-    throw new Error(`${quoted(stored)} ${done}; then "${failure.name}" failed: ${reason}`, { cause: failure.err });
+    throw new PartialStoreError(`${quoted(stored)} ${done}; then "${failure.name}" failed: ${reason}`, {
+      cause: failure.err,
+    });
   }
 
   const failedGrants: string[] = [];

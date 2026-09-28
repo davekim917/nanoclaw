@@ -93,7 +93,8 @@ consent through); from the host it runs directly.
 ## Limits
 
 - Pending intakes are in memory: a host restart drops them, and an old card's button answers "expired".
-  Expiry is 24 hours; finished intakes stay visible to `intake-status` for an hour.
+  Expiry is 24 hours. A new request for the same secret from the same session (or the host) replaces its own
+  pending card; anyone else's pending request for it refuses the new one. Finished intakes stay visible to `intake-status` for an hour.
 - Built and tested for Slack. Elsewhere it depends on the adapter's modal support; where there is none, the
   button says so.
 - The value crosses Slack's servers as a form submission. It is never a message, so it is not in channel

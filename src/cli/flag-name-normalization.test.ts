@@ -50,7 +50,7 @@ describe('ncl integrations accepts its hyphenated flags through the real parser'
     // Normalized to the keys the handler reads
     // (`src/cli/resources/integrations.ts` login handler).
     expect(parsed).toMatchObject({
-      authorize_param: 'token_access_type=offline',
+      authorize_param: ['token_access_type=offline'],
       redirect_uri: 'http://127.0.0.1:9000/callback',
       client_name: 'NanoClaw',
     });
