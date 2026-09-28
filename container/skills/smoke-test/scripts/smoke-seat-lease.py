@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -89,17 +90,21 @@ def ledger_dir():
     real = os.path.realpath(path)
     if os.path.commonpath([real_root, real]) != real_root:
         raise Refusal("no-ledger", detail="{} resolves outside the shared root".format(path))
-    if os.path.lexists(path) and not (os.path.isdir(path) and os.access(path, os.R_OK | os.X_OK)):
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        return path
+    except OSError as e:
+        raise Refusal("no-ledger", detail="{}: {}".format(path, e.__class__.__name__))
+    if not (stat.S_ISDIR(mode) and os.access(path, os.R_OK | os.X_OK)):
         raise Refusal("no-ledger", detail="{} is not a readable directory".format(path))
     return path
 
 
 def read_lease(directory, seat):
     path = os.path.join(directory, seat + ".json")
-    if not os.path.lexists(path):
-        return None
     try:
-        if os.path.islink(path) or not os.path.isfile(path):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
             raise ValueError("not a regular file")
         with open(path) as f:
             lease = json.load(f)
@@ -108,6 +113,8 @@ def read_lease(directory, seat):
         if not isinstance(lease.get("holder"), str) or not GROUP_RE.fullmatch(lease["holder"]):
             raise ValueError("no usable holder")
         lease["_until"] = parse_time(lease.get("until"))
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError, AttributeError, TypeError) as e:
         raise Refusal("unreadable-lease", seat=seat, detail="{}: {}".format(path, e))
     return lease

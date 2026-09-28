@@ -130,6 +130,20 @@ if smoke_case unreadable-identity-or-ledger-refuses; then
   rm "$LEDGER"
   printf 'x' >"$LEDGER"
   expect_refused group-a "ledger is a file" no-ledger
+  rm "$LEDGER"
+  as group-a grant "$SEAT" --to group-b --until "$(future)"
+  expect_refused group-a "live lease before the ledger turns unreadable" leased-elsewhere
+  if [ "$(id -u)" != 0 ]; then
+    chmod 000 "$ROOT/qa-coordinator"
+    expect_refused group-a "unsearchable ledger parent" no-ledger
+    chmod 755 "$ROOT/qa-coordinator"
+    chmod 000 "$LEDGER"
+    expect_refused group-a "unsearchable ledger" no-ledger
+    chmod 755 "$LEDGER"
+  fi
+  mv "$ROOT/qa-coordinator" "$T/ledger/moved"
+  printf 'x' >"$ROOT/qa-coordinator"
+  expect_refused group-a "ledger parent is a file" no-ledger
 fi
 
 if smoke_case expired-lease-is-unleased; then
