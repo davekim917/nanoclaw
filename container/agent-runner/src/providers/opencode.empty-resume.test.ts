@@ -291,7 +291,9 @@ describe('OpenCodeProvider — empty-resume recovery', () => {
       [
         [
           assistantWithUsage(own, 'm1', { input: 100, output: 10 }, 0.01),
-          textPart(own, 'm1', 'p1', 'answer'),
+          textPart(own, 'm1', 'p1', 'working'),
+          assistantWithUsage(own, 'm3', { input: 50, output: 5 }, 0.005),
+          textPart(own, 'm3', 'p3', 'answer'),
           assistantWithUsage(sub, 'm2', { input: 500, output: 50 }, 0.05),
           idle(own),
         ],
@@ -302,8 +304,8 @@ describe('OpenCodeProvider — empty-resume recovery', () => {
     const query = newProvider(deps).query({ prompt: 'hello', cwd: '/workspace/agent' });
     const seen = await drainUntilResult(query.events);
     const result = seen.at(-1) as Extract<ProviderEvent, { type: 'result' }>;
-    expect(result.usage).toMatchObject({ inputTokens: 600, outputTokens: 60 });
-    expect(result.steps).toBe(2);
+    expect(result.usage).toMatchObject({ inputTokens: 650, outputTokens: 65 });
+    expect(result.steps).toBe(3);
     query.abort();
   });
 
