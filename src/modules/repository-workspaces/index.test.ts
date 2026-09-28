@@ -107,7 +107,7 @@ vi.mock('../mailbox/read-only.js', async () => {
 const lifecycleProbe = vi.hoisted(() => ({ onRelease: null as null | (() => void) }));
 const lockProbe = vi.hoisted(() => ({
   onAcquire: null as null | (() => void),
-  onRelease: null as null | (() => void),
+  onRelease: null as null | ((key: [string, string, string | undefined]) => void),
 }));
 vi.mock('../../repository-workspaces.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../repository-workspaces.js')>();
@@ -130,7 +130,7 @@ vi.mock('../../repository-workspaces.js', async (importOriginal) => {
           try {
             return await fn();
           } finally {
-            lockProbe.onRelease?.();
+            lockProbe.onRelease?.([workgroupId, repo, dataDir]);
           }
         },
         dataDir,
@@ -2770,13 +2770,13 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     const cloned = (): boolean =>
       fs.existsSync(staging) &&
       (fs.readdirSync(staging, { recursive: true }) as string[]).some((entry) => entry.endsWith(`.git${path.sep}HEAD`));
-    const spans: Array<[boolean, boolean]> = [];
+    const spans: unknown[][] = [];
     let atAcquire = false;
     lockProbe.onAcquire = () => {
       atAcquire = cloned();
     };
-    lockProbe.onRelease = () => {
-      spans.push([atAcquire, cloned()]);
+    lockProbe.onRelease = (key) => {
+      spans.push([...key, atAcquire, cloned()]);
     };
     let claimedWhileStaging = false;
     _setRepositoryCheckoutHooksForTesting({
@@ -2790,7 +2790,7 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
       lockProbe.onAcquire = null;
       lockProbe.onRelease = null;
     }
-    expect(spans).toContainEqual([false, true]);
+    expect(spans).toContainEqual([WG, 'proj', root, false, true]);
     expect(claimedWhileStaging).toBe(true);
   });
 
