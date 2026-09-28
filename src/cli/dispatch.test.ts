@@ -257,6 +257,16 @@ register({
   handler: async (args) => ({ echo: args }),
 });
 
+register({
+  name: 'groups-listy',
+  description: 'declares one list arg',
+  resource: 'groups',
+  access: 'open',
+  listArgs: ['field'],
+  parseArgs: (raw) => raw,
+  handler: async (args) => ({ echo: args }),
+});
+
 import { dispatch } from './dispatch.js';
 import type { CallerContext } from './frame.js';
 
@@ -289,6 +299,24 @@ function agentCtx(overrides?: Partial<Extract<CallerContext, { caller: 'agent' }
 }
 
 // --- Tests ---
+
+describe('list-valued args', () => {
+  it('refuses a repeated flag on any command that does not declare it a list, before running it', async () => {
+    const resp = await dispatch(
+      { id: '1', command: 'groups-config-update', args: { model: ['a', 'b'] } },
+      { caller: 'host' },
+    );
+    expect(resp).toMatchObject({
+      ok: false,
+      error: { code: 'invalid-args', message: expect.stringContaining('--model') },
+    });
+  });
+
+  it('passes a list through where the command declares it', async () => {
+    const resp = await dispatch({ id: '1', command: 'groups-listy', args: { field: ['a', 'b'] } }, { caller: 'host' });
+    expect(resp).toMatchObject({ ok: true, data: { echo: { field: ['a', 'b'] } } });
+  });
+});
 
 describe('host-only commands (operator-only)', () => {
   it('rejects an agent caller even at global scope', async () => {

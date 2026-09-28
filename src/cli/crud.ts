@@ -36,6 +36,7 @@ export interface ColumnDef {
   defaultFrom?: string;
   /** Allowed values (shown in help). */
   enum?: string[];
+  multiple?: boolean;
   /**
    * Meaningfully NULL: `--flag ""` clears it on update. Without this a column could be set but never unset, and for
    * per-channel overrides NULL (fall through to the group default) and `''` (suppress it) differ.
@@ -478,6 +479,12 @@ export function validateArgs(
       if (def.default !== undefined) out[def.name] = def.default;
       continue;
     }
+    if (def.multiple) {
+      const values = Array.isArray(v) ? v : [v];
+      if (values.some((item) => item === true)) throw new Error(`${flag} requires a value`);
+      out[def.name] = values.map(String);
+      continue;
+    }
     // The client parses a value-less `--flag` as boolean true.
     if (v === true && def.type !== 'boolean') {
       throw new Error(`${flag} requires a value`);
@@ -522,6 +529,7 @@ export function validateArgs(
 
 export function registerResource(def: ResourceDef): void {
   resources.set(def.plural, def);
+  const jsonColumns = def.columns.filter((c) => c.type === 'json').map((c) => c.name);
 
   if (def.operations.list) {
     register({
@@ -531,6 +539,7 @@ export function registerResource(def: ResourceDef): void {
       access: def.operations.list,
       resource: def.plural,
       generic: 'list',
+      listArgs: jsonColumns,
       parseArgs: (raw) => normalizeArgs(raw),
       handler: genericList(def),
     });
@@ -544,6 +553,7 @@ export function registerResource(def: ResourceDef): void {
       access: def.operations.get,
       resource: def.plural,
       generic: 'get',
+      listArgs: jsonColumns,
       parseArgs: (raw) => normalizeArgs(raw),
       handler: genericGet(def),
     });
@@ -556,6 +566,7 @@ export function registerResource(def: ResourceDef): void {
       description: `Create a new ${def.name}.`,
       access: def.operations.create,
       resource: def.plural,
+      listArgs: jsonColumns,
       parseArgs: (raw) => normalizeArgs(raw),
       handler: genericCreate(def),
     });
@@ -568,6 +579,7 @@ export function registerResource(def: ResourceDef): void {
       description: `Update a ${def.name}.`,
       access: def.operations.update,
       resource: def.plural,
+      listArgs: jsonColumns,
       parseArgs: (raw) => normalizeArgs(raw),
       handler: genericUpdate(def),
     });
@@ -580,6 +592,7 @@ export function registerResource(def: ResourceDef): void {
       description: `Delete a ${def.name}.`,
       access: def.operations.delete,
       resource: def.plural,
+      listArgs: jsonColumns,
       parseArgs: (raw) => normalizeArgs(raw),
       handler: genericDelete(def),
     });
@@ -598,6 +611,7 @@ export function registerResource(def: ResourceDef): void {
         access: op.access,
         hostOnly: op.hostOnly,
         resource: def.plural,
+        listArgs: (declared ?? []).filter((a) => a.multiple || a.type === 'json').map((a) => a.name),
         parseArgs: declared
           ? (raw) => {
               try {

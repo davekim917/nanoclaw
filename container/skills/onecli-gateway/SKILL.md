@@ -96,9 +96,15 @@ rotate one, run `ncl secrets intake` (`ncl secrets help intake` for flags).
 It posts a form into this conversation for an owner or an admin of your group
 to fill in; the value typed there goes straight to
 the vault, and you are told when it is stored. Name the API host exactly
-with `--host-pattern`: the gateway sends the key only there. If the user
-pastes a key into chat anyway, do not use or repeat it; tell them to rotate
-it, since chat history keeps it.
+with `--host-pattern`: the gateway sends the key only there. For a
+credential in parts, declare each secret part with `--field 'name|Label'`:
+`--compose basic` for HTTP Basic or an OAuth client ID + secret at a token
+endpoint; `--compose separate` when the API takes key and secret as separate
+headers (`--field 'name|Label|Header'`, `?` after the name if optional); one
+field otherwise. A non-secret part (user id, subdomain, account id) never
+goes in the form: take it in chat or config. Never ask the user to run a
+command to combine or encode a value. If the user pastes a key into chat anyway, do not
+use or repeat it; tell them to rotate it, since chat history keeps it.
 
 ## Rules
 

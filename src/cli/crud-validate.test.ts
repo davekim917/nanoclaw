@@ -175,3 +175,19 @@ describe('resource help command', () => {
     expect(out).toContain('widgets: Test widgets.');
   });
 });
+
+describe('validateArgs repeated flags', () => {
+  const defs = [
+    { name: 'field', type: 'string' as const, description: '', multiple: true },
+    { name: 'name', type: 'string' as const, description: '' },
+  ];
+
+  it('keeps every value of a repeatable flag, and wraps a single one', () => {
+    expect(validateArgs(defs, { field: ['a', 'b'] }).field).toEqual(['a', 'b']);
+    expect(validateArgs(defs, { field: 'a' }).field).toEqual(['a']);
+  });
+
+  it('refuses a value-less repeatable flag', () => {
+    expect(() => validateArgs(defs, { field: ['a', true] })).toThrow('--field requires a value');
+  });
+});

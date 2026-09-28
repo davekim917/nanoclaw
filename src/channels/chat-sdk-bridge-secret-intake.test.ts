@@ -53,7 +53,11 @@ async function harness(hooks?: Partial<SecretIntakeHooks>, supportsModals = true
     hooks?.open ??
       (async () => ({
         ok: true as const,
-        form: { title: 'Store secret', body: 'Linear-API-Key', inputLabel: 'Secret value' },
+        form: {
+          title: 'Store secret',
+          body: 'Linear-API-Key',
+          inputs: [{ id: 'secret_value', label: 'Secret value' }],
+        },
       })),
   );
   const submit = vi.fn(hooks?.submit ?? (async () => ({ ok: true as const })));
@@ -83,7 +87,7 @@ async function clickIntake(h: Harness, intakeId: string): Promise<void> {
   );
 }
 
-async function submitForm(h: Harness, intakeId: string, value: string) {
+async function submitForm(h: Harness, intakeId: string, value: string | Record<string, string>) {
   return h.chat.processModalSubmit(
     {
       adapter: h.adapter,
@@ -91,7 +95,7 @@ async function submitForm(h: Harness, intakeId: string, value: string) {
       privateMetadata: intakeId,
       raw: {},
       user: { userId: 'U1', userName: 'owner' } as never,
-      values: { secret_value: value },
+      values: typeof value === 'string' ? { secret_value: value } : value,
       viewId: 'V1',
     },
     h.modals[0]?.contextId,
@@ -174,7 +178,7 @@ describe('secret intake through the Chat SDK bridge', () => {
     const h = await harness();
     await clickIntake(h, 'si-abc');
     const response = await submitForm(h, 'si-abc', SECRET);
-    expect(h.hooks.submit).toHaveBeenCalledWith('si-abc', 'U1', SECRET);
+    expect(h.hooks.submit).toHaveBeenCalledWith('si-abc', 'U1', { secret_value: SECRET });
     expect(response).toEqual({ action: 'close' });
     expect(JSON.stringify(h.posts)).not.toContain(SECRET);
   });
@@ -185,6 +189,39 @@ describe('secret intake through the Chat SDK bridge', () => {
     expect(await submitForm(h, 'si-abc', '   ')).toEqual({
       action: 'errors',
       errors: { secret_value: 'Paste the secret value.' },
+    });
+  });
+
+  it('renders every input the host asks for and puts an error on the field it names', async () => {
+    const h = await harness({
+      open: async () => ({
+        ok: true as const,
+        form: {
+          title: 'Store secret',
+          body: 'Example-Client',
+          inputs: [
+            { id: 'basic_user', label: 'Client ID' },
+            { id: 'basic_secret', label: 'Client secret', optional: true },
+          ],
+        },
+      }),
+      submit: async () => ({
+        ok: false as const,
+        field: 'basic_secret',
+        message: 'Paste a value for "Client secret".',
+      }),
+    });
+    await clickIntake(h, 'si-abc');
+    const inputs = h.modals[0].modal.children
+      .filter((c) => c.type === 'text_input')
+      .map((c) => (c as { id: string }).id);
+    expect(inputs).toEqual(['basic_user', 'basic_secret']);
+    expect(h.modals[0].modal.children.find((c) => c.type === 'text_input' && c.id === 'basic_secret')).toMatchObject({
+      optional: true,
+    });
+    expect(await submitForm(h, 'si-abc', { basic_user: 'cid', basic_secret: '' })).toEqual({
+      action: 'errors',
+      errors: { basic_secret: 'Paste a value for "Client secret".' },
     });
   });
 });

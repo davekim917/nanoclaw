@@ -74,6 +74,17 @@ export async function dispatch(
     return err(req.id, 'unknown-command', unknownCommandMessage(req.command));
   }
 
+  const listed = Object.entries(req.args).find(
+    ([key, value]) => Array.isArray(value) && !cmd.listArgs?.includes(key.replace(/-/g, '_')),
+  );
+  if (listed) {
+    return err(
+      req.id,
+      'invalid-args',
+      `--${listed[0].replace(/_/g, '-')} takes one value, not a list (repeated flag or JSON array)`,
+    );
+  }
+
   // Group-scope mechanics for agent callers (visibility, not policy — the
   // allow/hold/deny decisions live in the guard decision, cli/guard.ts).
   if (ctx.caller === 'agent') {

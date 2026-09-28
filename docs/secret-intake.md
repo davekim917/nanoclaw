@@ -5,8 +5,9 @@ Adding or rotating an API key without the key passing through chat, a session DB
 
 ```
 ncl secrets intake --name <n> --host-pattern <api-host> [--header <h>] [--value-format '<fmt with {value}>']
-                   [--path-pattern <p>] [--groups <ids>] [--workgroups <ids>]
-ncl secrets intake --name <n> --rotate [--groups …] [--workgroups …]
+                   [--path-pattern <p>] [--field '<name>[?]|<Label>[|<Header>[|<Format>]]' …]
+                   [--compose basic|separate] [--groups <ids>] [--workgroups <ids>]
+ncl secrets intake --name <n> --rotate [--field '<name>|<Label>' … --compose …] [--groups …] [--workgroups …]
 ncl secrets intake-status --id <si-…>
 ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 ```
@@ -21,13 +22,38 @@ ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 2. The card's button (`ncs:<intakeId>`) opens a Slack modal, private to whoever clicked it: others in the channel
    see the card, never the value. Opening refuses a clicker with no authority when the central DB lease answers
    within a second, and otherwise lets the click through; nothing waits past Slack's 3-second trigger window.
-3. Submit validates (non-empty, no whitespace), claims the intake and closes the modal. Only then does the host
+3. Submit validates each field (non-empty, no whitespace), claims the intake and closes the modal. Only then does the host
    check authority (below); a refused submit stores nothing, returns the intake to pending, and says why in
    the card's conversation. The vault write and grants follow: `POST /api/secrets` for a new secret, `PATCH` of the
    value for a rotation — through `src/onecli-secret-writer.ts`, which keeps the value out of argv. Any failure
    before the store completes marks the intake failed, on the card and to the requester.
 4. The card is edited to the outcome, and the requesting agent session (if any) gets a host note: stored or
    not, and who it is granted to. The value never appears in either.
+
+## Credentials in parts
+
+With no `--field` the form has one field and the value is the secret. Declare 1–5 fields to ask for more;
+each field is required unless its name ends in `?`. `--field` is repeatable (the `ncl` parsers keep every
+occurrence of a flag declared `multiple`; any other flag given twice is refused rather than last-one-wins).
+
+- `--compose basic`: exactly two required fields, stored as one secret, base64 of `<first>:<second>`
+  (RFC 7617; the first may not contain a colon), `--value-format` default `Basic {value}`. For HTTP Basic and
+  OAuth client credentials sent as `client_secret_basic`.
+- `--compose separate` (the default for two or more fields): each field is its own secret `<name>-<field>`
+  with its own header, `--field 'name|Label|Header[|Format]'` (format default `{value}`); `--header` and
+  `--value-format` are refused. Headers must differ. A blank optional field stores nothing. Grants apply to
+  every secret stored. If one write fails after another succeeded, the intake fails naming what was
+  written; a group admin's partial store still sends the owner notice. On a create, the written secrets are
+  ungranted: request each missing one as a single-field intake under its full name (`<name>-<field>`) and
+  grant the rest with `ncl secrets grant`. On a rotation the written values are already live, so the pair
+  may be mismatched until the missing field is rotated.
+
+A rotation repeats the field names (and `--compose`) without headers, since the vault's values are
+write-only and the form cannot tell their shape. Every named secret must exist. A separate rotation marks
+every field optional and replaces only those filled in; a basic rotation needs both.
+
+Only secret values go in the form. A part that is not secret (a user id, subdomain, account id) belongs in
+chat or config. No step asks the user to encode or join anything themselves.
 
 ## Who may enter a secret
 
@@ -67,7 +93,8 @@ consent through); from the host it runs directly.
 ## Limits
 
 - Pending intakes are in memory: a host restart drops them, and an old card's button answers "expired".
-  Expiry is 15 minutes; finished intakes stay visible to `intake-status` for an hour.
+  Expiry is 24 hours. A new request for the same secret from the same session (or the host) replaces its own
+  pending card; anyone else's pending request for it refuses the new one. Finished intakes stay visible to `intake-status` for an hour.
 - Built and tested for Slack. Elsewhere it depends on the adapter's modal support; where there is none, the
   button says so.
 - The value crosses Slack's servers as a form submission. It is never a message, so it is not in channel

@@ -24,12 +24,10 @@ export function parseArgv(argv: string[]): ParsedArgv {
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith('--')) {
-        args[key] = true;
-      } else {
-        args[key] = next;
-        i++;
-      }
+      const value = next === undefined || next.startsWith('--') ? true : next;
+      if (value !== true) i++;
+      const prior = args[key];
+      args[key] = prior === undefined ? value : [...(Array.isArray(prior) ? prior : [prior]), value];
       continue;
     }
     positional.push(arg);
