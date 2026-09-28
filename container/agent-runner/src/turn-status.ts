@@ -139,8 +139,7 @@ interface Snapshot {
 
 /**
  * True in the process that SETS turn state. Its memory is authoritative and is
- * never hydrated from the DB, which may be stale after a failed persist. A process
- * that never sets state (the MCP subprocess, long-lived across turns) re-reads every time.
+ * never hydrated from the DB, which may be stale after a failed persist.
  */
 let ownsStore = false;
 

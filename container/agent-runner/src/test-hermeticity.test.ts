@@ -7,7 +7,7 @@
  * that must be observed rather than thrown from — that is the "remove the
  * tripwire and assert the recorded attempt count is non-zero" case.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -67,7 +67,10 @@ describe('hermeticity tripwire', () => {
   });
 
   test('records the subprocess attempt even with enforcement off', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
     const output = withHermeticityMode('warn', () => execFileSync('git', ['--version'], { encoding: 'utf8' }));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('subprocess escape — execFileSync(git)'));
+    warn.mockRestore();
     expect(output).toMatch(/^git version/);
     expect(hermeticityAttempts().length).toBeGreaterThan(0);
     expect(hermeticityAttempts()[0]!.kind).toBe('subprocess');

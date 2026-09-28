@@ -1654,6 +1654,10 @@ describe('buildMounts agent surfaces', async () => {
       // ...and when the sub-path ancestor itself is absent, nothing covers
       // either entry and the spawn still refuses.
       await expect(build(['bootstrap/absent', 'bootstrap/absent/deeper'])).rejects.toThrow(/do not exist under/);
+
+      fs.rmSync(path.join(homedir, 'plugins'), { recursive: true });
+      const bare = await build(['never-installed']);
+      expect(bare.filter((m) => m.containerPath.startsWith('/workspace/plugins'))).toEqual([]);
     } finally {
       homedirSpy.mockRestore();
     }

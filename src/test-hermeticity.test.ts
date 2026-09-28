@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
   allowSubprocess,
@@ -60,7 +60,10 @@ describe('subprocess guard', () => {
   it('records the attempt even when enforcement is off', () => {
     // The tripwire "removed": callers that swallow errors would otherwise let a
     // real escape pass as a green test, so the record is the load-bearing half.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const output = withHermeticityMode('warn', () => execFileSync('git', ['--version'], { encoding: 'utf8' }));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('subprocess escape — execFileSync(git)'));
+    warn.mockRestore();
     expect(output).toMatch(/^git version/);
     expect(hermeticityAttempts().length).toBeGreaterThan(0);
     expect(hermeticityAttempts()[0]).toMatchObject({ kind: 'subprocess', api: 'execFileSync', target: 'git' });
