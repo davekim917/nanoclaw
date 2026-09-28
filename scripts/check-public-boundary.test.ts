@@ -1542,6 +1542,25 @@ describe('tracked content that cannot be read fails closed', () => {
     expect(stderr.mock.calls.flat().join('')).toContain('unreadable-content: a tracked file');
   });
 
+  it('reports a conflicted index path, which has no single blob to commit', () => {
+    const root = initRepo();
+    const commit = (text: string, message: string) => {
+      fs.writeFileSync(path.join(root, 'notes.md'), text);
+      execFileSync('git', ['add', 'notes.md'], { cwd: root });
+      execFileSync('git', ['commit', '-q', '-m', message], { cwd: root });
+    };
+    commit('base\n', 'base');
+    execFileSync('git', ['checkout', '-q', '-b', 'side'], { cwd: root });
+    commit('side\n', 'side');
+    execFileSync('git', ['checkout', '-q', '-'], { cwd: root });
+    commit('trunk\n', 'trunk');
+    expect(() => execFileSync('git', ['merge', '-q', 'side'], { cwd: root, stdio: 'ignore' })).toThrow();
+    expect(execFileSync('git', ['ls-files', '-u'], { cwd: root, encoding: 'utf8' })).toContain('notes.md');
+    expect(run(resolveOptions(['--root', root, '--index', '--portable'], root))).toEqual([
+      { file: 'notes.md', line: 1, category: 'unreadable-content' },
+    ]);
+  });
+
   it('reports a worktree file it may not read, but reads a deleted one as having no content', () => {
     const root = stagedRepo();
     fs.chmodSync(path.join(root, 'clean.md'), 0o000);
@@ -1593,6 +1612,26 @@ describe('identifier sources', () => {
     `);
     db.close();
     expect(loadRegistryIdentifiers(dbPath)).toEqual(new Set(['slack:fictional-person']));
+  });
+
+  it('reads a registry view whose dependency is gone as unreadable, failing a gating scan closed', () => {
+    const brokenViews = [
+      'CREATE TABLE people (id TEXT, display_name TEXT); CREATE VIEW users AS SELECT id, display_name FROM people; DROP TABLE people;',
+      'CREATE TABLE people (id TEXT, display_name TEXT); CREATE VIEW users AS SELECT id, display_name FROM people; DROP TABLE people; CREATE TABLE people (id TEXT);',
+    ];
+    for (const sql of brokenViews) {
+      const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+      const dbPath = path.join(root, 'data', 'v2.db');
+      const db = new Database(dbPath);
+      db.exec(`DROP TABLE users; ${sql}`);
+      db.close();
+      expect(() => loadRegistryIdentifiers(dbPath)).toThrow('install registry is unreadable');
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      expect(main(['--root', root, '--index'])).toBe(1);
+      expect(stderr.mock.calls.flat().join('')).toContain('gating scans require');
+      vi.restoreAllMocks();
+    }
   });
 
   it('never lets a linked worktree`s own inventory stand in for the main checkout`s', () => {
@@ -1666,6 +1705,22 @@ describe('allowlist authority', () => {
       'allowlist is missing',
     );
     expect(() => resolveOptions(['--allowlist'], root)).toThrow('--allowlist requires a path');
+  });
+
+  it('refuses an allowlist committed as a symlink, so even a link whose text is an allowlist exempts nothing', () => {
+    const root = initRepo();
+    fs.writeFileSync(path.join(root, 'contact.md'), `${email}\n`);
+    execFileSync('git', ['add', 'contact.md'], { cwd: root });
+    execFileSync('git', ['rm', '-q', '--cached', '.public-boundary-allowlist.json'], { cwd: root });
+    fs.rmSync(path.join(root, '.public-boundary-allowlist.json'));
+    fs.symlinkSync(entry, path.join(root, '.public-boundary-allowlist.json'));
+    execFileSync('git', ['add', '.public-boundary-allowlist.json'], { cwd: root });
+    expect(
+      execFileSync('git', ['ls-files', '-s', '.public-boundary-allowlist.json'], { cwd: root, encoding: 'utf8' }),
+    ).toMatch(/^120000 /);
+    expect(() => run(resolveOptions(['--root', root, '--index', '--portable'], root))).toThrow(
+      'allowlist is not a regular file in the index',
+    );
   });
 
   it('exempts a serialized allowlist value only in the root allowlist file', () => {
