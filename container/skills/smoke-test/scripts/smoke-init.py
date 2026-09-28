@@ -272,8 +272,6 @@ def write_draft(group_dir, plan):
     if any(UNSAFE_DRAFT_RE.search(line) for line in lines) or any(
             "'" in str(e["value"]) for e in plan["mandatory"] + plan["recommended"] if e["value"] is not None):
         refuse("a proposed line is not safe to write into a shell file; no draft written")
-    # Exclusive create, never a pre-check: an existence test follows a dangling symlink and
-    # answers "absent", and a plain write would then create the file wherever it points.
     try:
         with open(out, "x", encoding="utf8") as fh:
             fh.write("\n".join(lines))
