@@ -1871,7 +1871,8 @@ task with a token-free script gate:
 1. poll the remote `develop` SHA;
 2. return `wakeAgent:false` when it matches the last completed or active run;
 3. wait for CI and the dev deployment to settle;
-4. debounce merge bursts into one immutable SHA;
+4. debounce merge bursts into one immutable SHA, the quiet period measured from
+   when that SHA landed on the branch;
 5. create one channel root thread per SHA and return `wakeAgent:true` once;
 6. persist the run state so a restart cannot duplicate work.
 
@@ -1885,7 +1886,14 @@ the group's values and execs the skill copy at
 propagate without touching the deployment. The gate requires GitHub checks to
 settle and the live frontend and backend deploy commits (read from the Render
 API; adapt the wrapper's env or the fetch block for other deploy hosts) to
-equal the exact branch SHA across two observations before it wakes. It records
+equal the exact branch SHA, and that SHA to have been the branch tip for
+`SMOKE_GATE_DEBOUNCE_SECONDS` (default 600), before it wakes. The quiet period
+runs from when the tip landed, read from GitHub's repository activity (the
+newest update of the branch ref, accepted only when it names the tip), so a tip
+that landed long before an hourly poll settles on that poll. When the landing
+time cannot be read it runs from the poll that first saw the tip, which then
+needs a second poll; every debounce and settled line names the clock it used in
+`debounceFrom` (`landed` or `first_seen`). It records
 candidate, active, and completed SHAs in the agent workspace, refuses
 duplicates, and reclaims an abandoned active run on exactly one signal: the
 liveness window (no `progress` stamp for 30 minutes,
