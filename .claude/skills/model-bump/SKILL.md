@@ -14,8 +14,8 @@ A model release touches three layers. Only the first two need a PR.
 | **Fleet pins** | `groups/<g>/container.json`, channel wirings, task pins, subagent frontmatter, session stickies | `ncl` / file edits, no deploy |
 
 **Pins that name a family — `opus` / `sonnet` / `haiku` / `fable`, or Codex `sol` / `luna` / `astra` / `terra` — follow that family's default automatically, on every write path; full ids (`claude-opus-5[1m]`, `gpt-6-sol`) and version aliases (`opus5`, `fable51`, `gpt6-sol`) do not.** The family names are stored as typed and resolved at use:
-- **Claude** (`FAMILY_DEFAULTS`, `src/flag-parser.ts:112`): the host resolves a group/wiring/fallback value at spawn, and the CLI resolves a per-turn or subagent family word through `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`, which `claudeSpawnEnv` sets from the same constants (`src/claude-spawn-defaults.ts:254` for Fable).
-- **Codex** (`CODEX_FAMILY_DEFAULTS`, `src/flag-parser.ts:128`): the Codex CLI has no aliases, so the host sends the map to every container as `NANOCLAW_CODEX_MODEL_ALIASES` and the Codex provider resolves every model value through it (`resolveCodexFamily`, `container/agent-runner/src/providers/model-vocabulary.ts:36`; the map is emitted by `codexFamilyAliasEnv`, `src/container-runner.ts:282`). A container spawned before the host carried the map ignores a family word (logged) instead of sending it.
+- **Claude** (`FAMILY_DEFAULTS`, `src/flag-parser.ts`): the host resolves a group/wiring/fallback value at spawn, and the CLI resolves a per-turn or subagent family word through `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`, which `claudeSpawnEnv` (`src/claude-spawn-defaults.ts`) sets from the same constants.
+- **Codex** (`CODEX_FAMILY_DEFAULTS`, `src/flag-parser.ts`): the Codex CLI has no aliases, so the host sends the map to every container as `NANOCLAW_CODEX_MODEL_ALIASES` and the Codex provider resolves every model value through it (`resolveCodexFamily`, `container/agent-runner/src/providers/model-vocabulary.ts`; the map is emitted by `codexFamilyAliasEnv`, `src/container-runner.ts`). A container spawned before the host carried the map ignores a family word (logged) instead of sending it.
 
 `ncl tasks list --json` shows a task pinned with `--model sol` as `sol`. When the user wants "the current X", write the family name. A Fable or Codex bump therefore means moving `DEFAULT_FABLE_MODEL` / the `CODEX_FAMILY_DEFAULTS` entry (and `DEFAULT_CODEX_MODEL`, kept equal to `sol` by `setup/lib/codex-model-min-cli.test.ts`), *and* repinning every full id the step-1 inventory finds: task pins, stickies, channel wirings (`messaging_group_agents.default_model`), group `container.json` `model` / legacy `defaultModel` / `providerConfig.model` / `providerFallback.model`, and, for Codex, a host `CODEX_MODEL` if the step-1 check finds one (step 4).
 
@@ -27,8 +27,8 @@ Check a user's claim ("X is on Sonnet") against what actually ran before changin
 # Group config (authoritative). An indented line is inside providerConfig OR providerFallback: open the file to tell which.
 grep -HE '"(provider|model|effort|reasoning_effort|defaultModel|defaultEffort)":' groups/*/container.json   # defaultModel/defaultEffort = legacy keys, still honoured
 # Host-wide Codex default (below providerConfig.model, above DEFAULT_CODEX_MODEL). Check BOTH sources:
-# the host loads .env into process.env after exec, so the service environ alone misses it (src/main.ts:230-253, called at :618).
-# Either one set = the effective default. The environ wins over .env, because .env never overrides an existing key (src/main.ts:249).
+# the host loads .env into process.env after exec, so the service environ alone misses it (loadEnvIntoProcess in src/main.ts).
+# Either one set = the effective default. The environ wins over .env, because .env never overrides an existing key (loadEnvIntoProcess in src/main.ts).
 tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value nanoclaw-v2)/environ | grep -E '^CODEX_MODEL='
 grep -E '^\s*CODEX_MODEL=' .env
 # Channel wiring overrides
@@ -48,7 +48,7 @@ Session stickies: use the `outbound.db` sweep in the **Detect** block of `docs/c
 
 Test against the **container's** pinned CLI, never the host's.
 
-Use **this install's** image. Each install has its own image name (`container/build.sh:39-44`), and a group with `imageTag` in its `container.json` spawns from that image instead (`src/container-runner.ts:1688`). If you're probing for one group, use its running container's image.
+Use **this install's** image. Each install has its own image name (`container/build.sh:39-44`), and a group with `imageTag` in its `container.json` spawns from that image instead (`spawnImageRef`, `src/container-runner.ts`). If you're probing for one group, use its running container's image.
 
 - **Claude**: an id the CLI binary doesn't contain silently loses its family behaviour (1M window, effort ladder). Grep the image, with the current default as a control:
   ```bash
@@ -65,7 +65,7 @@ Work in a scratch worktree off `origin/main`, never the live checkout. **One PR 
 
 Code:
 - New Claude id: add pinned aliases to `MODEL_ALIAS_MAP` (e.g. `opus55`, `opus5-5`, `opus-5-5` → `claude-opus-5-5[1m]`; Opus and Fable always carry `[1m]`), and add a `MODEL_EFFORT_SUPPORT` row.
-- Default: change the constant for the family that shipped: `DEFAULT_OPUS_MODEL`, `DEFAULT_SONNET_MODEL`, `DEFAULT_HAIKU_MODEL`, or `DEFAULT_FABLE_MODEL` (`src/flag-parser.ts:98-101`; bare `opus`/`sonnet`/`haiku`/`fable` resolve through these), or, for Codex, that family's entry in `CODEX_FAMILY_DEFAULTS` (`src/flag-parser.ts:128`) and, for Sol, `DEFAULT_CODEX_MODEL` with it (`setup/lib/codex-model-min-cli.test.ts` fails when the two differ). Never add a bare family name to `MODEL_ALIAS_MAP` or `CODEX_MODEL_ALIAS_MAP`: those resolve at write and would freeze the pin. Update that family's resolution tests in `src/flag-parser.test.ts`.
+- Default: change the constant for the family that shipped: `DEFAULT_OPUS_MODEL`, `DEFAULT_SONNET_MODEL`, `DEFAULT_HAIKU_MODEL`, or `DEFAULT_FABLE_MODEL` (`src/flag-parser.ts`; bare `opus`/`sonnet`/`haiku`/`fable` resolve through these), or, for Codex, that family's entry in `CODEX_FAMILY_DEFAULTS` (`src/flag-parser.ts`) and, for Sol, `DEFAULT_CODEX_MODEL` with it (`setup/lib/codex-model-min-cli.test.ts` fails when the two differ). Never add a bare family name to `MODEL_ALIAS_MAP` or `CODEX_MODEL_ALIAS_MAP`: those resolve at write and would freeze the pin. Update that family's resolution tests in `src/flag-parser.test.ts`.
 - Default effort: `defaultEffortForModel` is the only place a Claude family default lives (`src/claude-spawn-defaults.ts` derives none). For Codex it is `DEFAULT_CODEX_EFFORT`.
 - CLI/SDK pins: never hand-edit the manifests. Go through the audited flow (`docs/dependency-updates.md`), which rejects prerelease and yanked releases and regenerates the lock deterministically:
   ```bash
@@ -79,8 +79,8 @@ Code:
 Contract (CONTRIBUTING.md "Breaking Changes"). A moved default is breaking:
 - A `[BREAKING]` CHANGELOG entry saying what moves, what's required (CLI minimum, image rebuild), and a link to the migration doc.
 - A migration section in `docs/claude-default-model.md` or `docs/codex-default-model.md` with **detect / why / fix / verify / rollback**. Mark the old section as history. Facts the first draft got wrong last time:
-  - a pure task fire ignores session stickies (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts:3164`);
-  - a group's `providerConfig.model` outranks the wiring (`container/agent-runner/src/providers/claude.ts:1932`: `input.model ?? stickyConfig.model ?? NANOCLAW_CLAUDE_MODEL ?? ANTHROPIC_DEFAULT_OPUS_MODEL`);
+  - a pure task fire ignores session stickies (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts`);
+  - a group's `providerConfig.model` outranks the wiring (`container/agent-runner/src/providers/claude.ts`: `input.model ?? stickyConfig.model ?? NANOCLAW_CLAUDE_MODEL ?? ANTHROPIC_DEFAULT_OPUS_MODEL`);
   - a host restart **adopts** running containers, which keep their spawn-time runner and CLI. Tell operators to recycle with `ncl groups restart`.
 
 Tests:
@@ -93,20 +93,20 @@ Then follow the repo's merge gate. Deploy is the deployer's job, and the restart
 
 ### Before the host restart: per-group images
 
-Do this after the base `./container/build.sh` and before the host restart. A group with `imageTag` in its `container.json` spawns from that image (`src/container-runner.ts:1688`), and a base rebuild doesn't rebuild it (`src/agent-runner-image-check.ts:275-281`). If it isn't rebuilt, the group breaks in one of two ways:
+Do this after the base `./container/build.sh` and before the host restart. A group with `imageTag` in its `container.json` spawns from that image (`spawnImageRef`, `src/container-runner.ts`), and a base rebuild doesn't rebuild it (`checkAgentRunnerDepsDrift`, `src/agent-runner-image-check.ts`). If it isn't rebuilt, the group breaks in one of two ways:
 - **Codex-only bump:** the deps hash doesn't change, so the group spawns the new default on its old baked CLI and gets the HTTP 400.
 - **Claude SDK bump:** the group fails the deps-drift check and refuses to spawn.
 
 List them with `grep -lE '"imageTag"' groups/*/container.json`, then rebuild according to how each image was made:
-- A package image built by `install_packages` (tag `<image base>:<group-id>`, packages set in `container_configs`): `ncl groups restart --id <group-id> --rebuild` (`buildAgentGroupImage`, `src/container-runner.ts:7606`). This also recycles the group's containers and kills in-flight work, so run it at a quiet moment.
-- Any other tag is an operator-supplied custom image. `--rebuild` would fail ("No packages to install", `src/container-runner.ts:7614-7615`) or build a different tag. Rebuild it with its own build process, on top of the new base.
+- A package image built by `install_packages` (tag `<image base>:<group-id>`, packages set in `container_configs`): `ncl groups restart --id <group-id> --rebuild` (`buildAgentGroupImage`, `src/container-runner.ts`). This also recycles the group's containers and kills in-flight work, so run it at a quiet moment.
+- Any other tag is an operator-supplied custom image. `--rebuild` would fail ("No packages to install", `buildAgentGroupImage`) or build a different tag. Rebuild it with its own build process, on top of the new base.
 
 ## 4. Fleet pins (no deploy)
 
 **Never pin a live task or wiring to an id the running image can't serve.** Wait until the deploy that carries the CLI is live.
 
-**Deployed is not enough for task pins and stickies.** They apply per turn inside whatever container is already running (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts:3149`; `resolveQueryModel`, `container/agent-runner/src/providers/codex.ts:833`). A host restart *adopts* running containers, and they keep their old CLI. So a repin right after deploy can send the new id to an old-CLI container; for Codex that's the HTTP 400. Before repinning a task or setting a sticky:
-1. Check that the session's container is gone or on the new image. Find it in `docker ps` by its `nanoclaw-session=<session-id>` label, or all of a group's containers by `nanoclaw-group=<agent-group-id>` (the id, not the folder: `src/container-runner.ts:7552`, fed `agentGroup.id`; the two coincide only for groups whose id is their folder name). Then compare `docker inspect -f '{{.Image}}' <container>` (always a `sha256:` id) with `docker image inspect -f '{{.Id}}' "$IMG"` (`$IMG` from step 2; for an `imageTag` group, that group's own tag). As a quick visual check: after the base rebuild, `docker ps`'s IMAGE column shows a bare hex id for an old-image container instead of the tag.
+**Deployed is not enough for task pins and stickies.** They apply per turn inside whatever container is already running (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts`; `resolveQueryModel`, `container/agent-runner/src/providers/codex.ts`). A host restart *adopts* running containers, and they keep their old CLI. So a repin right after deploy can send the new id to an old-CLI container; for Codex that's the HTTP 400. Before repinning a task or setting a sticky:
+1. Check that the session's container is gone or on the new image. Find it in `docker ps` by its `nanoclaw-session=<session-id>` label, or all of a group's containers by `nanoclaw-group=<agent-group-id>` (the id, not the folder: `CONTAINER_GROUP_LABEL_KEY` in `src/container-runner.ts`, fed `agentGroup.id`; the two coincide only for groups whose id is their folder name). Then compare `docker inspect -f '{{.Image}}' <container>` (always a `sha256:` id) with `docker image inspect -f '{{.Id}}' "$IMG"` (`$IMG` from step 2; for an `imageTag` group, that group's own tag). As a quick visual check: after the base rebuild, `docker ps`'s IMAGE column shows a bare hex id for an old-image container instead of the tag.
 2. If it's still on the old image, recycle the group first with `ncl groups restart --id <group-id>`, at a quiet moment.
 3. For `ncl tasks repin --all`, which repins every group at once: run the step-5 rollover listing first, and recycle every group that still has an old-image container.
 
@@ -118,28 +118,28 @@ ncl wirings update <mga-id> --default-model opus --default-effort low          #
 ncl groups config update --id <ag-id> --model <full-id> --effort medium        # writes DB + container.json; applies at restart
 ```
 
-- **`providerConfig.model`, `providerFallback.model`, and legacy `defaultModel` have no `ncl` verb.** `groups config update --model` writes only `model` (`src/cli/resources/groups.ts:693`). Repin those three by editing `groups/<g>/container.json` directly:
+- **`providerConfig.model`, `providerFallback.model`, and legacy `defaultModel` have no `ncl` verb.** `groups config update --model` writes only `model` (`src/cli/resources/groups.ts`). Repin those three by editing `groups/<g>/container.json` directly:
   - check `git -C groups status` first, since another session may have uncommitted edits;
   - the edit applies at the group's next restart;
   - the `container_configs` DB projection doesn't see it, so `ncl groups config get` won't show it. Read the file to confirm.
 
-- **Host `CODEX_MODEL`** (found by the step-1 check) overrides `DEFAULT_CODEX_MODEL` for every Codex group with nothing more specific set, so a Codex bump does nothing for them while it's set. Change or remove it at its source: the service unit's environment wins (`systemctl show nanoclaw-v2 -p Environment`, set in a unit drop-in); otherwise `.env`, since `.env` never overrides an existing key (`src/main.ts:249`). The host reads it once at startup, and each container gets it at spawn (`src/providers/codex.ts:157-160`). So the change needs a host restart (operator approval) and then a recycle of each running Codex group.
+- **Host `CODEX_MODEL`** (found by the step-1 check) overrides `DEFAULT_CODEX_MODEL` for every Codex group with nothing more specific set, so a Codex bump does nothing for them while it's set. Change or remove it at its source: the service unit's environment wins (`systemctl show nanoclaw-v2 -p Environment`, set in a unit drop-in); otherwise `.env`, since `.env` never overrides an existing key (`loadEnvIntoProcess`, `src/main.ts`). The host reads it once at startup, and each container gets it at spawn (`src/providers/codex.ts`). So the change needs a host restart (operator approval) and then a recycle of each running Codex group.
 
 - **Subagent defs**: edit the canonical source.
   - Group-local: `groups/<g>/.claude/agents/*.md`. Check `git -C groups status` first; another session may have uncommitted edits.
   - Plugin agents: the plugin's own repo.
   - `.codex/agents/*.toml` carrying `# managed by nanoclaw codex-sync` are generated mirrors (`src/codex-sync.ts`); never edit one.
   - Keep model names out of descriptions and prose. Frontmatter is the only place a model is named.
-- **Session stickies** come from a chat `-m`/`-e`, which writes `sticky_model`/`sticky_effort` to that session's `outbound.db` `session_state` (`setStickyModel` in `applyFlagBatch`, `container/agent-runner/src/poll-loop.ts:2967`). They override the wiring and the group for that session only, and a bump doesn't move them. Report them; clear or set one only when asked. There is no `ncl` verb. The container owns `outbound.db`, so write only while that session's container is stopped: check `sessions.container_status` and the `nanoclaw-session` label in `docker ps`.
+- **Session stickies** come from a chat `-m`/`-e`, which writes `sticky_model`/`sticky_effort` to that session's `outbound.db` `session_state` (`setStickyModel` in `applyFlagBatch`, `container/agent-runner/src/poll-loop.ts`). They override the wiring and the group for that session only, and a bump doesn't move them. Report them; clear or set one only when asked. There is no `ncl` verb. The container owns `outbound.db`, so write only while that session's container is stopped: check `sessions.container_status` and the `nanoclaw-session` label in `docker ps`.
 - **A task pin covers the task's own fires only.** The support poller also passes its pin to the issue threads it dispatches to, but as a one-turn flag on its own seed and customer-reply messages (`getSupportTaskContext`, `src/modules/support-threads/dispatch.ts`), so it never becomes a thread sticky. A human reply in a task post's thread routes to that channel's thread session. That session's order depends on the provider:
-  - **Claude**: sticky → `providerConfig.model` → wiring → `container.json` `model` → legacy `defaultModel` → install default. The host folds the last four into `NANOCLAW_CLAUDE_MODEL` (`src/claude-spawn-defaults.ts:146-163`), and the runner puts `providerConfig.model` above that env (the `rawModel` chain, `container/agent-runner/src/providers/claude.ts:1931`). **Setting the wiring does nothing for a Claude group whose `providerConfig` sets a model**; change that group's config instead.
-  - **Codex**: sticky (per turn, `container/agent-runner/src/providers/codex.ts:833`) → wiring → `container.json` `model` → legacy `defaultModel` → `providerConfig.model` → host `CODEX_MODEL` env → install default. The host folds wiring, `model`, and `defaultModel` into `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts:6553-6555`), and the runner takes that env ahead of `providerConfig.model` (`container/agent-runner/src/config.ts:84-89`). So a Codex group's `providerConfig.model` counts only when no wiring, `model`, or `defaultModel` is set, and a repin that touches only `providerConfig` leaves such a group on the old model. Below all of those, the host's own `CODEX_MODEL` env is forwarded to the container (`src/providers/codex.ts:157-160`) and sits just above `DEFAULT_CODEX_MODEL` (`container/agent-runner/src/providers/codex.ts:748-751`): if it's set, it becomes the effective default, not the bump.
+  - **Claude**: sticky → `providerConfig.model` → wiring → `container.json` `model` → legacy `defaultModel` → install default. The host folds the last four into `NANOCLAW_CLAUDE_MODEL` (`modelLayers`, `src/claude-spawn-defaults.ts`), and the runner puts `providerConfig.model` above that env (the `rawModel` chain, `container/agent-runner/src/providers/claude.ts`). **Setting the wiring does nothing for a Claude group whose `providerConfig` sets a model**; change that group's config instead.
+  - **Codex**: sticky (per turn, `container/agent-runner/src/providers/codex.ts`) → wiring → `container.json` `model` → legacy `defaultModel` → `providerConfig.model` → host `CODEX_MODEL` env → install default. The host folds wiring, `model`, and `defaultModel` into `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts`), and the runner takes that env ahead of `providerConfig.model` (`container/agent-runner/src/config.ts`). So a Codex group's `providerConfig.model` counts only when no wiring, `model`, or `defaultModel` is set, and a repin that touches only `providerConfig` leaves such a group on the old model. Below all of those, the host's own `CODEX_MODEL` env is forwarded to the container (`src/providers/codex.ts`) and sits just above `DEFAULT_CODEX_MODEL` (`container/agent-runner/src/providers/codex.ts`): if it's set, it becomes the effective default, not the bump.
 
   To make follow-ups match the task, set the channel's wiring (subject to the Claude exception above), or send `-e <level>` in the thread.
 
 ## 5. Verify after deploy
 
-- A fresh container's env shows the new default for the family that moved: `ANTHROPIC_DEFAULT_OPUS_MODEL`, `_SONNET_MODEL`, or `_HAIKU_MODEL` (`src/claude-spawn-defaults.ts:240-249`). Unpinned groups run Opus, so a Sonnet, Haiku, or Fable bump shows in `turn_usage` only on a turn pinned to that family. For Codex, `docker exec <c> codex --version` shows the new CLI.
+- A fresh container's env shows the new default for the family that moved: `ANTHROPIC_DEFAULT_OPUS_MODEL`, `_SONNET_MODEL`, or `_HAIKU_MODEL` (`claudeSpawnEnv`, `src/claude-spawn-defaults.ts`). Unpinned groups run Opus, so a Sonnet, Haiku, or Fable bump shows in `turn_usage` only on a turn pinned to that family. For Codex, `docker exec <c> codex --version` shows the new CLI.
 - `turn_usage` shows the new id for unpinned work. A config write proves only that the config was written.
 - Every `imageTag` group's running container is on its rebuilt image (see "Before the host restart").
 - Rollover: use plain `docker ps --format '{{.Names}} {{.Image}} {{.Label "nanoclaw-session"}}'`. `--filter ancestor=<old id>` misses containers whose image is now untagged. An old-image container is not a reason to kill in-flight work. Report it, and let it roll over or be recycled at a quiet moment.

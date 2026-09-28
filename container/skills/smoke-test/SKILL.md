@@ -90,7 +90,7 @@ corrections and remaining work. Native handles resume only through the
 spawning parent; a CLI session resumes only on its own session UUID with
 the same runtime home and accessible history. A matching home path in another container
 is insufficient: NanoClaw mounts per-session Claude project history
-(`src/session-claude-mounts.ts:56`), and provider session state may be isolated.
+(`src/session-claude-mounts.ts`), and provider session state may be isolated.
 Do not copy credentials or histories across those boundaries.
 
 When the task deliberately transfers from a scheduled session to a thread

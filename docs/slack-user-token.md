@@ -58,7 +58,7 @@ In the OneCLI UI:
 2. **Auth method**: `Bearer` header.
 3. Same for `Slack-User-Token-ExampleRetail`.
 
-File bytes (`url_private`) live on `files.slack.com`, which the gateway matches separately. To let the agent download attachments, add a second vault entry with the same token, host `files.slack.com`, path `*`, and make sure it is withheld in the same sessions: give it `slack` and `user` in its name, **and if the group sets `slack_user_token.onecli_secret_names`, add this entry's name to that list too** — a non-empty list is authoritative and the naming convention is not consulted (`slackUserTokenSecrets`, `src/onecli-secrets.ts:589-592`), so an unlisted file credential would be injected into shared-channel sessions.
+File bytes (`url_private`) live on `files.slack.com`, which the gateway matches separately. To let the agent download attachments, add a second vault entry with the same token, host `files.slack.com`, path `*`, and make sure it is withheld in the same sessions: give it `slack` and `user` in its name, **and if the group sets `slack_user_token.onecli_secret_names`, add this entry's name to that list too** — a non-empty list is authoritative and the naming convention is not consulted (`slackUserTokenSecrets`, `src/onecli-secrets.ts`), so an unlisted file credential would be injected into shared-channel sessions.
 
 ### 4. Assign secrets to workgroups
 

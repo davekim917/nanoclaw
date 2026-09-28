@@ -39,11 +39,11 @@ jobs:
     steps:
       # Full history, as ci-full.yml's `correctness` job does
       # (.github/workflows/ci-full.yml:51-53) and for the same reason:
-      # scripts/review-notes.test.ts (below) resolves every pinned `at <sha>`
-      # citation (scripts/review-notes.test.ts:218-220) and, only when
-      # `git rev-parse --is-shallow-repository` says true
-      # (scripts/review-notes.test.ts:183-185), skips one it cannot resolve
-      # with only a warning (scripts/review-notes.test.ts:232-237). Costs a
+      # the citation tests (below) resolve every pinned `at <sha>` citation
+      # (checkLineCitation, scripts/lib/doc-citations.ts) and, only when
+      # `git rev-parse --is-shallow-repository` says true, skip one they
+      # cannot resolve with only a warning, so a shallow checkout would pass
+      # a stale pin. Costs a
       # few seconds. run-host-ci.sh fetches full history for the same reason
       # (container/skills/pr-review-loop/scripts/run-host-ci.sh:165-175).
       - uses: actions/checkout@v4
@@ -88,9 +88,9 @@ jobs:
       # docs/review-notes fragments are usually added in a PR's last commit;
       # with this check nightly-only, main went red twice on 2026-09-23 (#1089's
       # fragment, then a stale citation). ~60 tests, ~8s, git-only.
-      - name: Review notes
+      - name: Review notes and doc citations
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: pnpm exec vitest run scripts/review-notes.test.ts --maxWorkers=1
+        run: pnpm exec vitest run scripts/review-notes.test.ts scripts/doc-citations.test.ts --maxWorkers=1
       # src/upstream-ratchet.json must be regenerated whenever an upstream-owned
       # file changes (CLAUDE.md:105); a stale hash (#1103) otherwise first
       # shows at ci-full's drift tests. The suite is fs + crypto only, no git

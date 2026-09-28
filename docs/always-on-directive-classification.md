@@ -30,32 +30,32 @@ Sources: `container/agent-runner/src/destinations.ts` (runtime system prompt),
 
 | Directive | Location | Note |
 |---|---|---|
-| Never ask a user to paste API keys/tokens/passwords | `destinations.ts:152` + `container/CLAUDE.md:77` | Stated twice. Both survive the cap now; the system-prompt copy is the durable one |
-| Don't fabricate credential setup; use `onecli-managed` | `self-mod.instructions.md:25` | Third statement of the credential theme, but a distinct rule |
+| Never ask a user to paste API keys/tokens/passwords | `container/agent-runner/src/destinations.ts:152` at fb8bee47d + `container/CLAUDE.md:77` at fb8bee47d | Stated twice. Both survive the cap now; the system-prompt copy is the durable one |
+| Don't fabricate credential setup; use `onecli-managed` | `container/agent-runner/src/mcp-tools/self-mod.instructions.md:25` at fb8bee47d | Third statement of the credential theme, but a distinct rule |
 | Never permanently delete an email — Trash only | a group's `CLAUDE.local.md` | **Prose-only, and Claude-sibling-only.** Belongs in the bootstrap email gate |
-| Never add Co-Authored-By / Generated-with footers | `container/CLAUDE.md:154-159` | External-facing; commits are public |
+| Never add Co-Authored-By / Generated-with footers | `container/CLAUDE.md:154-159` at fb8bee47d | External-facing; commits are public |
 | Never name sibling agents / AI tooling in a client org's repos | a group's `CLAUDE.local.md` | **Does not reach the agents it names** — see reach note |
-| Container dies at ~30min; checkpoint to durable paths, never `/tmp` | `container/CLAUDE.md:3, 17-31` | Data-loss prevention |
-| Never announce a next step and end the turn; use `continue_work` | `container/CLAUDE.md:25` | Prevents silently dropped work |
-| Post done/lost/next after a ceiling kill | `container/CLAUDE.md:30` | Accountability |
-| Truth-grounding; training data never assumed; no guessing | `container/CLAUDE.md:36-38` | Anti-fabrication |
-| Read referenced content end-to-end | `container/CLAUDE.md:40` | Anti-fabrication. **Conflict C4** — clarify, don't cut |
-| Read source before answering about own infrastructure | `container/CLAUDE.md:46-48` | Anti-fabrication |
-| An existing test is the current contract | `container/CLAUDE.md:62` | Prevents silently rewriting contracts |
-| Don't claim completion without verification | `container/CLAUDE.md:44` (intent) | **Intent only.** The mandated 3-part form is bucket 3 |
+| Container dies at ~30min; checkpoint to durable paths, never `/tmp` | `container/CLAUDE.md:3`, `:17-31` at fb8bee47d | Data-loss prevention |
+| Never announce a next step and end the turn; use `continue_work` | `container/CLAUDE.md:25` at fb8bee47d | Prevents silently dropped work |
+| Post done/lost/next after a ceiling kill | `container/CLAUDE.md:30` at fb8bee47d | Accountability |
+| Truth-grounding; training data never assumed; no guessing | `container/CLAUDE.md:36-38` at fb8bee47d | Anti-fabrication |
+| Read referenced content end-to-end | `container/CLAUDE.md:40` at fb8bee47d | Anti-fabrication. **Conflict C4** — clarify, don't cut |
+| Read source before answering about own infrastructure | `container/CLAUDE.md:46-48` at fb8bee47d | Anti-fabrication |
+| An existing test is the current contract | `container/CLAUDE.md:62` at fb8bee47d | Prevents silently rewriting contracts |
+| Don't claim completion without verification | `container/CLAUDE.md:44` at fb8bee47d (intent) | **Intent only.** The mandated 3-part form is bucket 3 |
 | Never lazy about validation at trust boundaries, data-loss error handling, security, accessibility | ponytail `:25-27` | Ponytail already carves out its own invariants |
 
 ## Bucket 3 — style mandates. The actual target.
 
 | Directive | Location | Bytes | Why |
 |---|---|---|---|
-| **Prose Drafting Pipeline** — humanizer hard gate "applies every turn", incl. *"The humanizer skill description does not narrow this rule"* | `container/CLAUDE.md:67-75` | ~1,430 | A directive written **specifically to overrule a skill's own scope judgment**. The purest instance in the tree. Scope is ambiguous enough to arguably capture every chat reply |
-| **"Default to overachieving, then trim"** | `container/CLAUDE.md:54` | ~90 | Disposition stated as law. **Conflict C1** |
-| **Completion Protocol's mandated 3-part recitation** | `container/CLAUDE.md:44` | ~180 | Keep the invariant, drop the fixed form. **Conflict C2** |
-| **"Be concise… outcomes over play-by-play… not a transcript"** | `container/CLAUDE.md:15` | ~300 | Format mandate. **Conflicts C2, C3** |
+| **Prose Drafting Pipeline** — humanizer hard gate "applies every turn", incl. *"The humanizer skill description does not narrow this rule"* | `container/CLAUDE.md:67-75` at fb8bee47d | ~1,430 | A directive written **specifically to overrule a skill's own scope judgment**. The purest instance in the tree. Scope is ambiguous enough to arguably capture every chat reply |
+| **"Default to overachieving, then trim"** | `container/CLAUDE.md:54` at fb8bee47d | ~90 | Disposition stated as law. **Conflict C1** |
+| **Completion Protocol's mandated 3-part recitation** | `container/CLAUDE.md:44` at fb8bee47d | ~180 | Keep the invariant, drop the fixed form. **Conflict C2** |
+| **"Be concise… outcomes over play-by-play… not a transcript"** | `container/CLAUDE.md:15` at fb8bee47d | ~300 | Format mandate. **Conflicts C2, C3** |
 | **"Communicate your plan before starting work"** | per-group `CLAUDE.local.md` | ~200 | **Conflict C3** — direct opposite of the above |
 | **Ponytail ladder + Rules + Output** | ponytail `:5-31` | ~1,900 | Disposition stated as law. **Conflicts C1, C2** |
-| **"Engage, don't mirror"** | `container/CLAUDE.md:11` | ~60 | Pure style |
+| **"Engage, don't mirror"** | `container/CLAUDE.md:11` at fb8bee47d | ~60 | Pure style |
 | `cli.instructions.md` — CLI manual for a self-documenting CLI | fragment | 5,739 | `ncl help` is richer and current. Not a rule at all — redundancy |
 | `interactive.instructions.md` — schema restated in prose | fragment | ~1,400 of 1,642 | Already in `interactive.ts` |
 | `core.instructions.md` — `send_file`/`add_reaction` params restated | fragment | ~700 of 1,181 | Already in the schema |
@@ -83,7 +83,7 @@ Two rules pulling opposite ways on the same decision. This is the post's core
 harm — *"Claude must think more carefully about these overlapping and
 conflicting messages before deciding what to do."*
 
-**C1 — scope disposition.** `container/CLAUDE.md:50-54` "fix it in the same
+**C1 — scope disposition.** `container/CLAUDE.md:50-54` at fb8bee47d "fix it in the same
 session… **default to overachieving**" vs ponytail `:5-21` "**does this need to
 exist at all?** … deletion over addition … shortest working diff". Opposed
 answers to *do I widen or minimize scope?*, both always-on, all 21 groups. This
