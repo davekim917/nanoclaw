@@ -72,7 +72,7 @@ function linesAt(root: string, rev: string, file: string, cache: Map<string, str
   const key = `${rev}:${file}`;
   if (!cache.has(key)) {
     const content = gitRead(root, ['show', key]);
-    cache.set(key, content === null ? null : content.split('\n'));
+    cache.set(key, content === null ? null : content === '' ? [] : content.replace(/\n$/, '').split('\n'));
   }
   return cache.get(key) ?? null;
 }

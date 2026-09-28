@@ -545,6 +545,15 @@ describe('pinDocs', () => {
     ]);
   });
 
+  it('does not count the trailing newline as a line', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1-2` decides it\n');
+    commit(root);
+
+    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
