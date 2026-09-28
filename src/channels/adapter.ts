@@ -49,7 +49,7 @@ export interface SecretIntakeHooks {
 interface SecretIntakeForm {
   title: string;
   body: string;
-  inputs: Array<{ id: string; label: string }>;
+  inputs: Array<{ id: string; label: string; optional?: boolean }>;
 }
 
 export interface ChannelConnectionRestored {

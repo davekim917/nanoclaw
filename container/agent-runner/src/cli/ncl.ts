@@ -112,12 +112,10 @@ export function parseArgv(argv: string[]): {
     if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith('--')) {
-        args[key] = true;
-      } else {
-        args[key] = next;
-        i++;
-      }
+      const value = next === undefined || next.startsWith('--') ? true : next;
+      if (value !== true) i++;
+      const prior = args[key];
+      args[key] = prior === undefined ? value : [...(Array.isArray(prior) ? prior : [prior]), value];
       continue;
     }
     positional.push(a);
@@ -241,7 +239,6 @@ export async function main(
   argv = process.argv.slice(2),
   stdin: StdinJsonStream & { isTTY?: boolean } = process.stdin,
 ): Promise<void> {
-
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
     printUsage();
     return;

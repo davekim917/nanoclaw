@@ -498,7 +498,7 @@ async function openSecretIntakeForm(event: ActionEvent, setup: ChannelSetup): Pr
       children: [
         CardText(opened.form.body),
         ...opened.form.inputs.map((input) =>
-          TextInput({ id: input.id, label: input.label, placeholder: 'Paste it here' }),
+          TextInput({ id: input.id, label: input.label, placeholder: 'Paste it here', optional: input.optional }),
         ),
       ],
     }),

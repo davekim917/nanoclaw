@@ -36,6 +36,7 @@ export interface ColumnDef {
   defaultFrom?: string;
   /** Allowed values (shown in help). */
   enum?: string[];
+  multiple?: boolean;
   /**
    * Meaningfully NULL: `--flag ""` clears it on update. Without this a column could be set but never unset, and for
    * per-channel overrides NULL (fall through to the group default) and `''` (suppress it) differ.
@@ -478,6 +479,13 @@ export function validateArgs(
       if (def.default !== undefined) out[def.name] = def.default;
       continue;
     }
+    if (def.multiple) {
+      const values = Array.isArray(v) ? v : [v];
+      if (values.some((item) => item === true)) throw new Error(`${flag} requires a value`);
+      out[def.name] = values.map(String);
+      continue;
+    }
+    if (Array.isArray(v) && def.type !== 'json') throw new Error(`${flag} was given more than once`);
     // The client parses a value-less `--flag` as boolean true.
     if (v === true && def.type !== 'boolean') {
       throw new Error(`${flag} requires a value`);

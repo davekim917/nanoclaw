@@ -201,7 +201,7 @@ describe('secret intake through the Chat SDK bridge', () => {
           body: 'Example-Client',
           inputs: [
             { id: 'basic_user', label: 'Client ID' },
-            { id: 'basic_secret', label: 'Client secret' },
+            { id: 'basic_secret', label: 'Client secret', optional: true },
           ],
         },
       }),
@@ -216,6 +216,9 @@ describe('secret intake through the Chat SDK bridge', () => {
       .filter((c) => c.type === 'text_input')
       .map((c) => (c as { id: string }).id);
     expect(inputs).toEqual(['basic_user', 'basic_secret']);
+    expect(h.modals[0].modal.children.find((c) => c.type === 'text_input' && c.id === 'basic_secret')).toMatchObject({
+      optional: true,
+    });
     expect(await submitForm(h, 'si-abc', { basic_user: 'cid', basic_secret: '' })).toEqual({
       action: 'errors',
       errors: { basic_secret: 'Paste a value for "Client secret".' },

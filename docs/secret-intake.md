@@ -5,9 +5,9 @@ Adding or rotating an API key without the key passing through chat, a session DB
 
 ```
 ncl secrets intake --name <n> --host-pattern <api-host> [--header <h>] [--value-format '<fmt with {value}>']
-                   [--path-pattern <p>] [--basic-auth [--basic-labels '<first>,<second>']]
-                   [--groups <ids>] [--workgroups <ids>]
-ncl secrets intake --name <n> --rotate [--basic-auth …] [--groups …] [--workgroups …]
+                   [--path-pattern <p>] [--field '<name>[?]|<Label>[|<Header>[|<Format>]]' …]
+                   [--compose basic|separate] [--groups <ids>] [--workgroups <ids>]
+ncl secrets intake --name <n> --rotate [--field '<name>|<Label>' … --compose …] [--groups …] [--workgroups …]
 ncl secrets intake-status --id <si-…>
 ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 ```
@@ -30,14 +30,27 @@ ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 4. The card is edited to the outcome, and the requesting agent session (if any) gets a host note: stored or
    not, and who it is granted to. The value never appears in either.
 
-## Two-part credentials
+## Credentials in parts
 
-HTTP Basic auth, and OAuth client credentials sent as Basic to a token endpoint (`client_secret_basic`), need
-two values sent as one: base64 of `<first>:<second>`. `--basic-auth` gives the form two fields (labels from
-`--basic-labels`, default "Username or client ID" / "Password or client secret"), and the host composes and
-stores the encoded value, with `--value-format` defaulting to `Basic {value}`. The first field may not contain
-a colon (RFC 7617). A rotation of such a secret passes `--basic-auth` again, since the vault's value is
-write-only and the form cannot tell. No step asks the user to encode or join anything themselves.
+With no `--field` the form has one field and the value is the secret. Declare 1–5 fields to ask for more;
+each field is required unless its name ends in `?`. `--field` is repeatable (the `ncl` parsers keep every
+occurrence of a flag declared `multiple`; any other flag given twice is refused rather than last-one-wins).
+
+- `--compose basic`: exactly two required fields, stored as one secret, base64 of `<first>:<second>`
+  (RFC 7617; the first may not contain a colon), `--value-format` default `Basic {value}`. For HTTP Basic and
+  OAuth client credentials sent as `client_secret_basic`.
+- `--compose separate` (the default for two or more fields): each field is its own secret `<name>-<field>`
+  with its own header, `--field 'name|Label|Header[|Format]'` (format default `{value}`); `--header` and
+  `--value-format` are refused. Headers must differ. A blank optional field stores nothing. Grants apply to
+  every secret stored. If one write fails after another succeeded, the intake fails naming what was stored,
+  ungranted: rotate it or grant it by hand.
+
+A rotation repeats the field names (and `--compose`) without headers, since the vault's values are
+write-only and the form cannot tell their shape. Every named secret must exist. A separate rotation marks
+every field optional and replaces only those filled in; a basic rotation needs both.
+
+Only secret values go in the form. A part that is not secret (a user id, subdomain, account id) belongs in
+chat or config. No step asks the user to encode or join anything themselves.
 
 ## Who may enter a secret
 

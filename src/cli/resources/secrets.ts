@@ -65,7 +65,7 @@ registerResource({
         "Ask for a secret. Posts a card into the requesting thread (host callers: an owner's DM); its button opens a form that an owner, a global admin, or (new secrets only) an admin of the requesting agent's group fills in, and the value typed there goes straight to the vault — you never see it. Returns at once; the requesting agent is told when it is stored (host callers: `ncl secrets intake-status`).\n\n" +
         'New secret: --host-pattern is required and decides where the gateway sends the value, so name the API host exactly. ' +
         'Rotation (--rotate): replaces only the value; the secret keeps its host, header and grants, and takes effect on the next request.\n\n' +
-        'Two-part credentials (HTTP Basic auth, or an OAuth client ID and secret sent as Basic to a token endpoint): pass --basic-auth. The form then has two fields and the host stores base64("<first>:<second>"), with value format "Basic {value}" by default. Rotating such a secret needs --basic-auth again. Never ask a user to encode or combine values themselves.\n\n' +
+        'Multi-part credentials: declare each part with --field \'name|Label\' (repeatable, up to 5; a trailing ? on the name makes it optional). --compose basic joins exactly two required fields into one secret, base64("<first>:<second>"), sent as "Basic {value}" by default: HTTP Basic auth, or an OAuth client ID and secret at a token endpoint. --compose separate (the default for two or more fields) stores each field as its own secret <name>-<field>, each with its own header: --field \'name|Label|Header[|Format]\', format default "{value}"; a blank optional field stores nothing. A rotation repeats the --field names (no header) and replaces only the fields filled in. Only secret values go in the form: take a user id, subdomain or account id in chat. Never ask a user to encode or combine values themselves.\n\n' +
         'From an agent with no --groups/--workgroups, a new secret is granted to the calling group; a rotation grants nothing new. A new grant takes effect at the next container start.',
       args: [
         { name: 'name', type: 'string', description: 'Vault name, e.g. Linear-API-Key.', required: true },
@@ -83,23 +83,25 @@ registerResource({
           description: 'Header value template containing {value} (default "Bearer {value}").',
         },
         {
-          name: 'basic_auth',
-          type: 'boolean',
+          name: 'field',
+          type: 'string',
+          multiple: true,
           description:
-            'Two-field form (user/client ID and password/secret); the host stores their Basic-auth encoding.',
+            "Repeatable form field: 'name[?]|Label[|Header[|Format]]'. Header and format only with --compose separate.",
         },
         {
-          name: 'basic_labels',
+          name: 'compose',
           type: 'string',
-          description:
-            'With --basic-auth: the two field labels, comma-separated (default "Username or client ID,Password or client secret").',
+          enum: ['basic', 'separate'],
+          description: 'How two or more fields become secrets: basic (one Basic-auth secret) or separate (default).',
         },
         ...grantArgs,
       ],
       examples: [
         'ncl secrets intake --name Linear-API-Key --host-pattern api.linear.app --value-format "{value}"',
         'ncl secrets intake --name Exa-API-Key --host-pattern api.exa.ai --header x-api-key --value-format "{value}" --workgroups example-wg',
-        'ncl secrets intake --name Example-Client --host-pattern auth.example.com --path-pattern /token --basic-auth --basic-labels "Client ID,Client secret"',
+        "ncl secrets intake --name Example-Client --host-pattern auth.example.com --path-pattern /token --compose basic --field 'client_id|Client ID' --field 'client_secret|Client secret'",
+        "ncl secrets intake --name Example-API --host-pattern api.example.com --field 'api_key|API key|X-Api-Key' --field 'api_secret?|API secret|X-Api-Secret'",
         'ncl secrets intake --name Linear-API-Key --rotate',
       ],
       handler: async (args, ctx) =>
@@ -110,8 +112,8 @@ registerResource({
           pathPattern: optionalString(args.path_pattern),
           headerName: optionalString(args.header),
           valueFormat: optionalString(args.value_format),
-          basicAuth: args.basic_auth === true || args.basic_auth === 'true',
-          basicLabels: optionalString(args.basic_labels),
+          fields: list(args.field),
+          compose: optionalString(args.compose),
           groups: list(args.groups),
           workgroups: list(args.workgroups),
           caller: callerOf(ctx),

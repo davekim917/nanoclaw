@@ -421,7 +421,7 @@ describe('the form', () => {
     const edit = JSON.parse(h.deliveries[1].args[4] as string);
     expect(edit).toMatchObject({ operation: 'edit', messageId: 'msg-1' });
     expect(edit.text).toContain('Stored');
-    expect(h.notes[0]).toContain('is stored in the vault');
+    expect(h.notes[0]).toContain('Secret "Linear-API-Key" stored in the vault');
 
     expect(everythingObservable()).not.toContain(SECRET);
     expect(JSON.stringify(getSecretIntake(intakeId))).not.toContain(SECRET);
@@ -499,89 +499,215 @@ describe('the form', () => {
   });
 });
 
-describe('basic-auth intake', () => {
+describe('declared fields', () => {
   const CLIENT_ID = 'cid-SENTINEL-4f1a';
+  const API_SECRET = 'as-SENTINEL-77b0';
   const COMPOSED = Buffer.from(`${CLIENT_ID}:${SECRET}`).toString('base64');
-  const basic = { ...newKey, name: 'Example-Client', hostPattern: 'auth.example.com', basicAuth: true };
+  const basic = {
+    ...newKey,
+    name: 'Example-Client',
+    hostPattern: 'auth.example.com',
+    compose: 'basic',
+    fields: ['client_id|Client ID', 'client_secret|Client secret'],
+  };
+  const separate = {
+    ...newKey,
+    name: 'Example-API',
+    hostPattern: 'api.example.com',
+    fields: ['api_key|API key|X-Api-Key', 'api_secret?|API secret|X-Api-Secret|Token {value}'],
+  };
+  const rotation = {
+    rotate: true,
+    groups: [] as string[],
+    workgroups: [] as string[],
+    caller: { kind: 'host' as const },
+  };
 
-  it('opens a two-field form, says what goes in each, and defaults to Basic', async () => {
-    const { intakeId } = await startSecretIntake({
-      ...basic,
-      basicLabels: 'Client ID, Client secret',
-      caller: agentCaller,
-    });
+  it('opens one input per field and lists them on the card, basic defaulting to Basic', async () => {
+    const { intakeId } = await startSecretIntake({ ...basic, caller: agentCaller });
     const body = JSON.parse(h.deliveries[0].args[4] as string).body as string;
-    expect(body).toContain('two fields, "Client ID" and "Client secret"');
+    expect(body).toContain('asks for "Client ID", "Client secret"');
     expect(body).toContain('Basic <secret>');
-    const opened = await hooks.open(intakeId, 'UOWNER');
-    expect(opened).toMatchObject({
+    expect(await hooks.open(intakeId, 'UOWNER')).toMatchObject({
       ok: true,
       form: {
         inputs: [
-          { id: 'basic_user', label: 'Client ID' },
-          { id: 'basic_secret', label: 'Client secret' },
+          { id: 'client_id', label: 'Client ID', optional: false },
+          { id: 'client_secret', label: 'Client secret', optional: false },
         ],
       },
     });
   });
 
-  it('stores base64 of "<first>:<second>" and exposes none of the three values', async () => {
+  it('basic stores base64 of "<first>:<second>" as one secret, exposing none of the three values', async () => {
     const { intakeId } = await startSecretIntake({ ...basic, caller: agentCaller });
     expect(
-      await hooks.submit(intakeId, 'UADMIN1', { basic_user: ` ${CLIENT_ID} `, basic_secret: `${SECRET}\n` }),
+      await hooks.submit(intakeId, 'UADMIN1', { client_id: ` ${CLIENT_ID} `, client_secret: `${SECRET}\n` }),
     ).toEqual({ ok: true });
     await settle();
     expect(h.createCalls).toEqual([
-      { spec: expect.objectContaining({ valueFormat: 'Basic {value}' }), value: COMPOSED },
+      { spec: expect.objectContaining({ name: 'Example-Client', valueFormat: 'Basic {value}' }), value: COMPOSED },
     ]);
     const observed = everythingObservable() + JSON.stringify(getSecretIntake(intakeId));
     for (const leaked of [CLIENT_ID, SECRET, COMPOSED]) expect(observed).not.toContain(leaked);
   });
 
-  it('rotates a basic-auth secret through the same two fields', async () => {
+  it('separate stores each field as its own secret with its own header, and grants every one', async () => {
+    const { intakeId } = await startSecretIntake({ ...separate, workgroups: ['wg-a'], caller: agentCaller });
+    const body = JSON.parse(h.deliveries[0].args[4] as string).body as string;
+    expect(body).toContain('"API key" → Example-API-api_key');
+    expect(body).toContain('"API secret" (optional)');
+    expect(await hooks.open(intakeId, 'UOWNER')).toMatchObject({
+      form: {
+        inputs: [
+          { id: 'api_key', optional: false },
+          { id: 'api_secret', optional: true },
+        ],
+      },
+    });
+    await hooks.submit(intakeId, 'UOWNER', { api_key: SECRET, api_secret: API_SECRET });
+    await settle();
+    expect(h.createCalls).toEqual([
+      {
+        spec: expect.objectContaining({ name: 'Example-API-api_key', headerName: 'X-Api-Key', valueFormat: '{value}' }),
+        value: SECRET,
+      },
+      {
+        spec: expect.objectContaining({
+          name: 'Example-API-api_secret',
+          headerName: 'X-Api-Secret',
+          valueFormat: 'Token {value}',
+        }),
+        value: API_SECRET,
+      },
+    ]);
+    expect(h.workgroupGrants).toEqual(['wg-a:Example-API-api_key', 'wg-a:Example-API-api_secret']);
+    expect(getSecretIntake(intakeId)?.secrets).toEqual(['Example-API-api_key', 'Example-API-api_secret']);
+    const observed = everythingObservable() + JSON.stringify(getSecretIntake(intakeId));
+    for (const leaked of [SECRET, API_SECRET]) expect(observed).not.toContain(leaked);
+  });
+
+  it('stores nothing, and grants nothing, for a blank optional field', async () => {
+    const { intakeId } = await startSecretIntake({ ...separate, caller: agentCaller });
+    await hooks.submit(intakeId, 'UOWNER', { api_key: SECRET, api_secret: '' });
+    await settle();
+    expect(h.createCalls.map((c) => (c.spec as { name: string }).name)).toEqual(['Example-API-api_key']);
+    expect(h.groupGrants).toEqual(['ag-1:Example-API-api_key']);
+  });
+
+  it('a rotation replaces only the fields filled in', async () => {
+    h.vault.set('Example-API-api_key', { id: 'k', name: 'Example-API-api_key' });
+    h.vault.set('Example-API-api_secret', { id: 's', name: 'Example-API-api_secret' });
+    const { intakeId } = await startSecretIntake({
+      ...rotation,
+      name: 'Example-API',
+      fields: ['api_key|API key', 'api_secret|API secret'],
+    });
+    expect(await hooks.open(intakeId, 'UOWNER')).toMatchObject({
+      form: { inputs: [{ optional: true }, { optional: true }] },
+    });
+    expect(await hooks.submit(intakeId, 'UOWNER', { api_key: '', api_secret: '' })).toMatchObject({
+      ok: false,
+      message: 'Fill in at least one field.',
+    });
+    await hooks.submit(intakeId, 'UOWNER', { api_key: '', api_secret: API_SECRET });
+    await settle();
+    expect(h.updateCalls).toEqual([{ ref: { id: 's', name: 'Example-API-api_secret' }, value: API_SECRET }]);
+    expect(everythingObservable()).not.toContain(API_SECRET);
+  });
+
+  it('a basic rotation takes both fields again', async () => {
     h.vault.set('Example-Client', { id: 'id-1', name: 'Example-Client' });
     const { intakeId } = await startSecretIntake({
+      ...rotation,
       name: 'Example-Client',
-      rotate: true,
-      basicAuth: true,
-      groups: [],
-      workgroups: [],
-      caller: { kind: 'host' },
+      compose: 'basic',
+      fields: basic.fields,
     });
-    await hooks.submit(intakeId, 'UOWNER', { basic_user: CLIENT_ID, basic_secret: SECRET });
+    await hooks.submit(intakeId, 'UOWNER', { client_id: CLIENT_ID, client_secret: SECRET });
     await settle();
     expect(h.updateCalls).toEqual([{ ref: { id: 'id-1', name: 'Example-Client' }, value: COMPOSED }]);
     expect(everythingObservable()).not.toContain(COMPOSED);
   });
 
-  it('refuses an empty field, whitespace, or a colon in the first field, naming the field and keeping it open', async () => {
+  it('refuses an empty required field, whitespace, or a colon in a basic first field, keeping it open', async () => {
     const { intakeId } = await startSecretIntake({ ...basic, caller: agentCaller });
-    expect(await hooks.submit(intakeId, 'UOWNER', { basic_user: CLIENT_ID, basic_secret: ' ' })).toMatchObject({
+    expect(await hooks.submit(intakeId, 'UOWNER', { client_id: CLIENT_ID, client_secret: ' ' })).toMatchObject({
       ok: false,
-      field: 'basic_secret',
+      field: 'client_secret',
     });
-    expect(await hooks.submit(intakeId, 'UOWNER', { basic_user: 'a b', basic_secret: SECRET })).toMatchObject({
+    expect(await hooks.submit(intakeId, 'UOWNER', { client_id: 'a b', client_secret: SECRET })).toMatchObject({
       ok: false,
-      field: 'basic_user',
+      field: 'client_id',
     });
-    expect(await hooks.submit(intakeId, 'UOWNER', { basic_user: 'a:b', basic_secret: SECRET })).toMatchObject({
+    expect(await hooks.submit(intakeId, 'UOWNER', { client_id: 'a:b', client_secret: SECRET })).toMatchObject({
       ok: false,
-      field: 'basic_user',
+      field: 'client_id',
       message: expect.stringMatching(/colon/),
     });
     expect(h.createCalls).toHaveLength(0);
     expect(getSecretIntake(intakeId)?.status).toBe('pending');
   });
 
-  it('keeps an explicit value format and refuses labels without --basic-auth or not exactly two', async () => {
-    await startSecretIntake({ ...basic, valueFormat: '{value}', caller: agentCaller });
-    expect(h.deliveries[0].args[4]).not.toContain('Basic <secret>');
+  it('reports the secrets already stored when a later one fails, and grants none', async () => {
+    const { intakeId } = await startSecretIntake({ ...separate, caller: agentCaller });
+    const { createOnecliSecret } = await import('../../onecli-secret-writer.js');
+    vi.mocked(createOnecliSecret).mockImplementationOnce(async (spec, value) => {
+      h.createCalls.push({ spec, value });
+      h.vault.set(spec.name, { id: 'x', name: spec.name });
+      return { id: 'x', name: spec.name };
+    });
+    h.createFails = true;
+    await hooks.submit(intakeId, 'UOWNER', { api_key: SECRET, api_secret: API_SECRET });
+    await settle();
+    expect(getSecretIntake(intakeId)?.status).toBe('failed');
+    expect(getSecretIntake(intakeId)?.detail).toContain('"Example-API-api_key" stored, ungranted');
+    expect(h.groupGrants).toEqual([]);
+    expect(everythingObservable()).not.toContain(API_SECRET);
+  });
+
+  it.each([
+    [{ fields: ['a|A|X-A', 'a|B|X-B'] }, /declared twice/],
+    [{ fields: ['a|A|Bad Header', 'b|B|X-B'] }, /Invalid header name/],
+    [{ fields: ['a|A|X-Same', 'b|B|x-same'] }, /Two fields are sent as header/],
+    [{ fields: ['a|A', 'b|B|X-B'] }, /"a" needs a header/],
+    [{ fields: ['a|A|X-A', 'b|B|X-B'], headerName: 'X-C' }, /its own header/],
+    [{ compose: 'basic', fields: ['a|A', 'b?|B'] }, /exactly two required fields/],
+    [{ compose: 'basic', fields: ['a|A', 'b|B', 'c|C'] }, /exactly two required fields/],
+    [{ compose: 'basic', fields: ['a|A|X-A', 'b|B'] }, /only --compose separate/],
+    [{ compose: 'separate', fields: ['a|A|X-A'] }, /two or more fields/],
+    [{ fields: ['a?|A'] }, /cannot be optional/],
+    [{ compose: 'basic' }, /--compose needs --field/],
+    [{ fields: ['Bad-Name|A'] }, /Field name/],
+    [{ fields: ['a|A|X-A', 'b|B|X-B', 'c|C|X-C', 'd|D|X-D', 'e|E|X-E', 'f|F|X-F'] }, /At most 5/],
+  ])('refuses %o', async (overrides, error) => {
+    await expect(startSecretIntake({ ...newKey, ...overrides, caller: agentCaller })).rejects.toThrow(error);
+    expect(h.deliveries).toHaveLength(0);
+  });
+
+  it('refuses a request whose secrets overlap one already waiting', async () => {
+    await startSecretIntake({ ...separate, caller: agentCaller });
     await expect(
-      startSecretIntake({ ...newKey, name: 'Other', basicLabels: 'A,B', caller: agentCaller }),
-    ).rejects.toThrow(/needs --basic-auth/);
+      startSecretIntake({ ...newKey, name: 'Example-API-api_secret', caller: { kind: 'host' } }),
+    ).rejects.toThrow(/already waiting/);
+  });
+
+  it('refuses a header or format on a rotation field', async () => {
+    h.vault.set('Example-API-api_key', { id: 'k', name: 'Example-API-api_key' });
+    h.vault.set('Example-API-api_secret', { id: 's', name: 'Example-API-api_secret' });
     await expect(
-      startSecretIntake({ ...basic, name: 'Third', basicLabels: 'Only one', caller: agentCaller }),
-    ).rejects.toThrow(/two comma-separated labels/);
+      startSecretIntake({ ...rotation, name: 'Example-API', fields: ['api_key|K|X-Api-Key', 'api_secret|S'] }),
+    ).rejects.toThrow(/drop the header and format/);
+  });
+
+  it('refuses a separate secret name that would exist, and a rotation of one that does not', async () => {
+    h.vault.set('Example-API-api_secret', { id: 's', name: 'Example-API-api_secret' });
+    await expect(startSecretIntake({ ...separate, caller: agentCaller })).rejects.toThrow(
+      /"Example-API-api_secret" already exists/,
+    );
+    await expect(
+      startSecretIntake({ ...rotation, name: 'Example-API', fields: ['api_key|K', 'api_secret|S'] }),
+    ).rejects.toThrow(/"Example-API-api_key" is not in the vault/);
   });
 });
 
