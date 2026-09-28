@@ -105,6 +105,10 @@ function isPropertyName(node: ts.Identifier): boolean {
     (ts.isSetAccessorDeclaration(parent) && parent.name === node) ||
     (ts.isQualifiedName(parent) && parent.right === node) ||
     (ts.isBindingElement(parent) && parent.propertyName === node) ||
+    (ts.isJsxAttribute(parent) && parent.name === node) ||
+    ((ts.isJsxOpeningElement(parent) || ts.isJsxSelfClosingElement(parent) || ts.isJsxClosingElement(parent)) &&
+      parent.tagName === node &&
+      /^[a-z]|-/.test(node.text)) ||
     ts.isLabeledStatement(parent)
   );
 }
@@ -190,7 +194,11 @@ class Normalizer {
     const name = node.text;
     if (isPropertyName(node)) return name;
     const parent = node.parent;
-    if (ts.isShorthandPropertyAssignment(parent) || (ts.isBindingElement(parent) && !parent.propertyName)) {
+    if (
+      ts.isShorthandPropertyAssignment(parent) ||
+      (ts.isBindingElement(parent) && !parent.propertyName) ||
+      (ts.isParameter(parent) && ts.isParameterPropertyDeclaration(parent, parent.parent))
+    ) {
       return `${name}:${this.resolve(node)}`;
     }
     return this.resolve(node);
@@ -374,7 +382,7 @@ export function extractCases(file: string, text: string): TestCase[] {
         return;
       }
       if (callee && callback?.body) {
-        const options = node.arguments.slice(1).filter((arg) => arg !== callback && !ts.isNumericLiteral(arg));
+        const options = node.arguments.slice(1).filter((arg) => arg !== callback);
         const takesContext = callee.table
           ? callee.modifiers.includes('for') &&
             (callback.parameters.length > 1 ||

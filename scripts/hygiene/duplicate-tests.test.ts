@@ -243,6 +243,23 @@ it('wider', () => {
     expect(duplicates(shared, inlined)).toEqual([]);
   });
 
+  it.each([
+    ['intrinsic elements', 'button', 'input', (tag: string) => `render(<${tag} />)`],
+    ['JSX attributes', 'disabled', 'hidden', (attr: string) => `render(<Field ${attr}={${attr}} />)`],
+  ])('keeps %s apart', (_, one, other, render) => {
+    const named = (name: string) =>
+      `it('${name}', () => {\n  const ${name} = true;\n  const out = ${render(name)};\n  expect(out.container.firstChild).toBeTruthy();\n});\n`;
+    const file = 'src/f.test.tsx';
+    const cases = extractCases(file, header + named(one) + named(other));
+    expect(findDuplicateTests(cases.slice(1), cases)).toEqual([]);
+  });
+
+  it('does not judge cases that differ only by timeout', () => {
+    const timed = (name: string, ms: number) =>
+      `it('${name}', async () => {\n  expect(await work()).toBe(true);\n}, ${ms});\n`;
+    expect(duplicates(timed('a', 1000), timed('a', 1000) + timed('b', 50))).toEqual([]);
+  });
+
   it('does not judge a case that reads its arguments', () => {
     const named = (name: string) =>
       `it('${name}', function () {\n  expect(open(arguments[0].task.name).query(1)).toEqual([1]);\n});\n`;
