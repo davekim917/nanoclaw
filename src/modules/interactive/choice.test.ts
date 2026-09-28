@@ -470,6 +470,7 @@ describe('request_choice click authority and resolution', () => {
       operation: 'edit',
       messageId: 'pm-1',
       text: `${ASK_TEXT}\n\n✅ Ship all (2) — Admin One`,
+      clearActions: true,
     });
   });
 
@@ -786,8 +787,8 @@ describe('replace, never stack (key)', () => {
     expect(delivered.some((d) => d.content.operation === 'edit')).toBe(false);
   });
 
-  it('retires the old row even when the edit fails, and logs it at error', async () => {
-    const errorSpy = vi.spyOn(log, 'error');
+  it('retires the old row even when the edit fails, and logs it at warn', async () => {
+    const warnSpy = vi.spyOn(log, 'warn');
     try {
       const first = (await ask(session, { key: 'release:web' }, 'choice-1'))!;
       await backdate(first.approval_id);
@@ -796,12 +797,12 @@ describe('replace, never stack (key)', () => {
 
       expect(await getPendingApproval(first.approval_id)).toBeUndefined();
       expect(second.status).toBe('pending');
-      expect(errorSpy).toHaveBeenCalledWith(
-        'Failed to edit choice card',
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Failed to edit approval card',
         expect.objectContaining({ approvalId: first.approval_id }),
       );
     } finally {
-      errorSpy.mockRestore();
+      warnSpy.mockRestore();
     }
   });
 });
