@@ -100,13 +100,15 @@ function introducingCommit(
   for (const entry of history.split('\0').filter(Boolean)) {
     const [sha, ...patch] = entry.split('\n');
     const body = patch.filter((line) => !/^(?:\+\+\+|---) (?:[ab]\/|\/dev\/null)/.test(line));
-    const after = body.filter((line) => line.startsWith('+')).map((line) => linkCount(line.slice(1), cited));
-    const before = body.filter((line) => line.startsWith('-')).map((line) => linkCount(line.slice(1), cited));
-    if (after.length === 0 && before.length === 0) continue;
-    if ([...after, ...before].some((count) => count > 1)) return 'repeated';
-    if (!after.some((count) => count === 1)) break;
+    const count = (marker: string): number =>
+      body.filter((line) => line.startsWith(marker)).reduce((sum, line) => sum + linkCount(line.slice(1), cited), 0);
+    if (!body.some((line) => line.startsWith('+') || line.startsWith('-'))) continue;
+    const after = count('+');
+    const before = count('-');
+    if (after > 1 || before > 1) return 'repeated';
+    if (after === 0) break;
     oldest = sha.trim();
-    if (!before.some((count) => count === 1)) break;
+    if (before === 0) break;
   }
   return oldest;
 }

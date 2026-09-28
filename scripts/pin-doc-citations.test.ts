@@ -431,6 +431,21 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
   });
 
+  it('refuses when a neighbouring note line with the same citation shares a change', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'drainQueue(old);\n');
+    write(root, NOTE, '- old `drainQueue` at `src/code.ts:1`\n');
+    commit(root, 'old note');
+    write(root, 'src/code.ts', 'drainQueue(newLimit);\n');
+    commit(root, 'change the code');
+    write(root, NOTE, '- old `drainQueue` at `src/code.ts:1`\n- new `drainQueue` at `src/code.ts:1`\n');
+    commit(root, 'new note');
+    write(root, NOTE, '- old `drainQueue` at `src/code.ts:1` (historical finding retained)\n');
+    commit(root, 'drop the new note, reword the old');
+
+    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
