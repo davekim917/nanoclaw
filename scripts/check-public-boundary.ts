@@ -893,7 +893,7 @@ function indexEntries(root: string): Map<string, IndexEntry> {
     const match = /^(\d+) ([0-9a-f]+) (\d)\t(.+)$/s.exec(record);
     if (!match) throw new Error('the tracked file list could not be parsed');
     const [, mode, oid, stage, file] = match;
-    entries.set(file, { mode, oid, merged: stage === '0' && !entries.has(file) });
+    entries.set(file, { mode, oid, merged: stage === '0' });
   }
   return entries;
 }

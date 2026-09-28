@@ -117,10 +117,6 @@ function git(args: string[], cwd = INSTALL_ROOT): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
 
-export interface CheckerInvocation {
-  root: string;
-}
-
 interface CheckerResult {
   status: number | null;
   stderr: string;
@@ -128,10 +124,10 @@ interface CheckerResult {
 }
 
 /** Injected so tests pin the checker invocation. */
-export type RunChecker = (invocation: CheckerInvocation) => CheckerResult;
+export type RunChecker = (root: string) => CheckerResult;
 
 // No --allowlist: an index scan reads the snapshot's committed copy, never the install checkout's.
-const REAL_RUN_CHECKER: RunChecker = ({ root }) => {
+const REAL_RUN_CHECKER: RunChecker = (root) => {
   const result = spawnSync('pnpm', ['run', 'check:public-boundary', '--', '--root', root, '--index'], {
     cwd: INSTALL_ROOT,
     encoding: 'utf8',
@@ -141,7 +137,7 @@ const REAL_RUN_CHECKER: RunChecker = ({ root }) => {
 };
 
 export function scanSnapshot(snapshot: string, runChecker: RunChecker = REAL_RUN_CHECKER): BoundaryScan {
-  const result = runChecker({ root: snapshot });
+  const result = runChecker(snapshot);
   if (result.error) throw result.error;
   return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr) };
 }

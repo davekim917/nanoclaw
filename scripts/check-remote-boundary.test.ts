@@ -24,7 +24,6 @@ import {
   scanSnapshot,
   trimDetail,
   type Alert,
-  type CheckerInvocation,
   type Reporter,
 } from './check-remote-boundary.js';
 
@@ -156,12 +155,12 @@ describe('reportScan', () => {
 
 describe('scanSnapshot', () => {
   it('scans the snapshot root and leaves the allowlist to the checker', () => {
-    const calls: CheckerInvocation[] = [];
-    const result = scanSnapshot('/tmp/snapshot', (invocation) => {
-      calls.push(invocation);
+    const calls: string[] = [];
+    const result = scanSnapshot('/tmp/snapshot', (root) => {
+      calls.push(root);
       return { status: 0, stderr: '' };
     });
-    expect(calls).toEqual([{ root: '/tmp/snapshot' }]);
+    expect(calls).toEqual(['/tmp/snapshot']);
     expect(result).toEqual({ code: 0, detail: '' });
   });
 
