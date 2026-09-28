@@ -224,7 +224,7 @@ function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function main(): Promise<number> {
+export async function main(): Promise<number> {
   let scan: BoundaryScan;
   let commit: string;
   let cleanupError: string | null;

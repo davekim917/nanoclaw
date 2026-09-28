@@ -1,15 +1,14 @@
 /**
- * The remote-boundary job's decision logic, exercised without git, a network,
- * a real Slack workspace or systemd. The actual `pnpm run check:public-boundary`
- * subprocess (`REAL_RUN_CHECKER`) is deliberately not covered here — faking it
- * would test the fake. Everything around that one call IS covered: `scanSnapshot`
- * is tested with an injected `RunChecker` fake standing in for the subprocess.
+ * The remote-boundary job's logic, run without git, a network, Slack or systemd.
+ * `node:child_process` and `notifyOwner` are mocked file-wide: the checker never
+ * runs (faking its verdict would test the fake), but its argv and `main()`'s
+ * git/worktree sequence are pinned against those mocks.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { enforceHermeticity } from '../src/test-hermeticity.js';
 import {
@@ -18,6 +17,7 @@ import {
   cleanupSnapshot,
   decideAlert,
   describeDelivery,
+  main,
   reportCleanup,
   reportOutcome,
   reportScan,
@@ -26,6 +26,11 @@ import {
   type Alert,
   type Reporter,
 } from './check-remote-boundary.js';
+
+const childProcess = vi.hoisted(() => ({ execFileSync: vi.fn(), spawnSync: vi.fn() }));
+vi.mock('node:child_process', () => childProcess);
+const notifyOwner = vi.hoisted(() => vi.fn());
+vi.mock('../src/notify-owner.js', () => ({ notifyOwner }));
 
 enforceHermeticity();
 
@@ -178,6 +183,26 @@ describe('scanSnapshot', () => {
       scanSnapshot('/tmp/snapshot', () => ({ status: null, stderr: '', error: new Error('spawn failed') })),
     ).toThrow('spawn failed');
   });
+
+  describe('with the default checker runner', () => {
+    afterEach(() => childProcess.spawnSync.mockReset());
+
+    it('runs an index scan of the snapshot from the install root, with no --allowlist', () => {
+      // An --allowlist into the install checkout would exempt edits never committed to the snapshot.
+      childProcess.spawnSync.mockReturnValue({ status: 0, stderr: '' });
+      expect(scanSnapshot('/tmp/snapshot')).toEqual({ code: 0, detail: '' });
+      expect(childProcess.spawnSync).toHaveBeenCalledTimes(1);
+      const [command, args, options] = childProcess.spawnSync.mock.calls[0];
+      expect(command).toBe('pnpm');
+      expect(args).toEqual(['run', 'check:public-boundary', '--', '--root', '/tmp/snapshot', '--index']);
+      expect(options).toMatchObject({ cwd: repoRoot });
+    });
+
+    it('reads a signal-killed checker (no status, no stderr) as could-not-run', () => {
+      childProcess.spawnSync.mockReturnValue({ status: null, stderr: null, signal: 'SIGKILL' });
+      expect(scanSnapshot('/tmp/snapshot')).toEqual({ code: 2, detail: '' });
+    });
+  });
 });
 
 describe('cleanupSnapshot', () => {
@@ -302,6 +327,100 @@ describe('reportOutcome', () => {
     expect(r.alerts).toEqual([]);
     expect(r.logs[0]).toContain('clean');
     expect(r.errors[0]).toContain('device busy');
+  });
+});
+
+describe('main', () => {
+  const REF = 'refs/remotes/origin/main';
+  let gitCalls: { args: string[]; cwd: unknown }[];
+  let logs: string[];
+  let errors: string[];
+  let fetchError: Error | null;
+
+  function addedSnapshot(): string {
+    const add = gitCalls.find((c) => c.args.includes('add'));
+    if (!add) throw new Error('no worktree add');
+    return add.args[add.args.length - 2];
+  }
+
+  beforeEach(() => {
+    gitCalls = [];
+    logs = [];
+    errors = [];
+    fetchError = null;
+    childProcess.execFileSync.mockImplementation((file: string, args: string[], options: { cwd?: unknown }) => {
+      expect(file).toBe('git');
+      gitCalls.push({ args, cwd: options.cwd });
+      if (args[0] === 'fetch' && fetchError) throw fetchError;
+      if (args[0] === 'rev-parse') return 'abc1234\n';
+      if (args.includes('add')) fs.mkdirSync(args[args.length - 2]);
+      if (args[1] === 'remove') fs.rmSync(args[3], { recursive: true, force: true });
+      return '';
+    });
+    vi.spyOn(console, 'log').mockImplementation((line: string) => void logs.push(line));
+    vi.spyOn(console, 'error').mockImplementation((line: string) => void errors.push(line));
+  });
+
+  afterEach(() => {
+    childProcess.execFileSync.mockReset();
+    childProcess.spawnSync.mockReset();
+    notifyOwner.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it('scans the fetched origin/main commit in a hook-free detached worktree, then removes it', async () => {
+    childProcess.spawnSync.mockReturnValue({ status: 0, stderr: '' });
+
+    await expect(main()).resolves.toBe(0);
+
+    const snapshot = addedSnapshot();
+    expect(gitCalls.map((c) => c.args)).toEqual([
+      ['fetch', '--quiet', 'origin', 'main'],
+      ['rev-parse', '--short', REF],
+      ['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', snapshot, 'abc1234'],
+      ['worktree', 'remove', '--force', snapshot],
+    ]);
+    expect(gitCalls.every((c) => c.cwd === repoRoot)).toBe(true);
+    expect(childProcess.spawnSync.mock.calls[0][1]).toContain(snapshot);
+    expect(fs.existsSync(path.dirname(snapshot))).toBe(false);
+    expect(notifyOwner).not.toHaveBeenCalled();
+    expect(logs).toEqual(['remote-boundary: clean (origin/main @ abc1234)']);
+  });
+
+  it('sends the finding to the owner and fails the run when that DM fails', async () => {
+    childProcess.spawnSync.mockReturnValue({ status: 1, stderr: FINDING });
+    notifyOwner.mockResolvedValue({ code: 1, message: 'no owner DM wired' });
+
+    await expect(main()).resolves.toBe(1);
+
+    expect(notifyOwner).toHaveBeenCalledTimes(1);
+    const sent = notifyOwner.mock.calls[0][0] as Alert;
+    expect(sent.title).toBe('Public boundary scan of the origin/main tree');
+    expect(sent.body).toContain('src/example.ts:12 identifier');
+    expect(sent.body).toContain('origin/main @ abc1234');
+    expect(errors.join('\n')).toContain('owner DM failed: no owner DM wired');
+    expect(errors.join('\n')).toContain('NOBODY WAS TOLD');
+  });
+
+  it('fails without creating a snapshot when origin cannot be fetched', async () => {
+    fetchError = new Error('could not resolve host');
+
+    await expect(main()).resolves.toBe(1);
+
+    expect(gitCalls.map((c) => c.args[0])).toEqual(['fetch']);
+    expect(childProcess.spawnSync).not.toHaveBeenCalled();
+    expect(errors).toEqual(['remote-boundary: could not scan origin/main: could not resolve host']);
+  });
+
+  it('still removes the snapshot when the checker cannot be spawned', async () => {
+    childProcess.spawnSync.mockReturnValue({ status: null, stderr: null, error: new Error('spawn pnpm ENOENT') });
+
+    await expect(main()).resolves.toBe(1);
+
+    const snapshot = addedSnapshot();
+    expect(gitCalls.at(-1)?.args).toEqual(['worktree', 'remove', '--force', snapshot]);
+    expect(fs.existsSync(path.dirname(snapshot))).toBe(false);
+    expect(errors).toEqual(['remote-boundary: could not scan origin/main: spawn pnpm ENOENT']);
   });
 });
 
