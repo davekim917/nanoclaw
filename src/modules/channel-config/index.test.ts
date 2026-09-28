@@ -67,10 +67,15 @@ describe('set_channel_model / set_channel_effort', () => {
     expect(fixture.updates).toEqual([{ id: 'wiring-1', patch: { default_model: model } }]);
   });
 
-  it.each(['claude', 'opencode'])('refuses a Codex-only effort level on a %s wiring', async (provider) => {
+  it.each([
+    ['codex', 'ultra', true],
+    ['claude', 'ultra', false],
+    ['opencode', 'ultra', false],
+    ['claude', 'xhigh', true],
+    ['opencode', 'xhigh', false],
+  ])('on a %s wiring, effort %s is accepted: %s', async (provider, effort, accepted) => {
     fixture.provider = provider;
-    await run('set_channel_effort', { effort: 'ultra' });
-    expect(fixture.updates).toEqual([]);
-    expect(fixture.notices[0]).toMatch(/^set_channel_effort failed/);
+    await run('set_channel_effort', { effort });
+    expect(fixture.updates).toEqual(accepted ? [{ id: 'wiring-1', patch: { default_effort: effort } }] : []);
   });
 });
