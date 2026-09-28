@@ -187,6 +187,9 @@ codex-review.sh audit                     # a merged PR as of its merge, by the 
 codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file> [--claim <id> --claim-owner <session-label>]
                                          # post a substitute review's receipt for exactly that head — --reviewer
                                          # must start with a frontier model ID (small tiers refused: REVIEWER_DENIED_TIERS in codex-review.sh)
+codex-review.sh cut-down                  # whether this head needs a cut-down receipt and has one: 0 yes or no need, 24 missing
+codex-review.sh cut-down-receipt --head <sha> --reviewed <sha> --reviewer "<model id> cut-down-reviewer (<runtime>)" --body-file <file>
+                                         # the cut-down reviewer's receipt for that head (see Cut-down pass)
 ```
 
 An in-flight claim is a visible coordination signal, not review evidence or
@@ -226,6 +229,29 @@ Three details it encodes, each of which has cost real debugging time — keep th
 - The reviewer is `chatgpt-codex-connector` in GraphQL. Match case-insensitively on a prefix, never `==` against one spelling.
 - `status` and `wait` page through GraphQL `reviewThreads`, reviews, top-level comments, and reactions separately. They verify the current PR head still starts with the supplied SHA, count unresolved Codex threads from every round, ignore stale reviews and 👍 reactions, and treat an authenticated connector usage-limit notice for this head as unavailable unless a later valid review supersedes it.
 - Codex signals a clean review two ways: a review with no unresolved threads, **or** just a 👍 reaction on the PR. An `eyes` reaction means the review is still running — not a result.
+
+## Cut-down pass — after the PR opens, before Codex review
+
+A PR that adds more than 150 lines outside tests and lockfiles needs a cut-down receipt on the head it merges at; `merge-check` refuses it without one (`cut_down_missing`, 24) in either mode. The base branch's `.github/pr-review-loop.json` may set `"cutDownThreshold"` to another whole number, or to `false`. `codex-review.sh cut-down` says whether the current head needs a receipt and has one.
+
+1. **Launch the reviewer** right after opening the PR, before `request`. In a legacy repo Codex has already started; run it anyway. It is the `cut-down-reviewer` agent from the bootstrap orchestrate plugin, run by your own provider as a native subagent with a fresh context. It is never a cross-model call and never your own session:
+   - Claude: Agent tool, `subagent_type: "bootstrap-orchestrate:cut-down-reviewer"`, with no `model`. The agent inherits yours, and a per-call model would override that.
+   - Codex: `spawn_agent` with `agent_type: "cut-down-reviewer"` and `fork_turns: "none"` (v1: `fork_context: false`).
+   - OpenCode: `task` tool, agent `cut-down-reviewer`.
+
+   Give it the repo path, the PR number and the head SHA, and nothing from your conversation: no rationale, no plan. It returns a numbered list of cuts.
+2. **Apply or answer every cut.** Apply it, or answer it with the required behaviour it would lose. Commit once and push through `codex-review.sh push`.
+3. **Send the same reviewer the new head and your answers.** It reads everything the new head adds, checks that each cut was applied or answered, and asks the same question of any other new lines. Then it posts the receipt itself:
+
+   ```bash
+   codex-review.sh cut-down-receipt --head <new head> --reviewed <head it first read> \
+     --reviewer "<its model id> cut-down-reviewer (<runtime>)" --body-file <its list, each cut applied or answered>
+   ```
+
+   With no cuts it posts at once, with `--reviewed` equal to `--head`. The receipt records the added lines outside tests at both heads and the difference. That is the per-PR measure for tuning the threshold or dropping the pass.
+4. **When the head moves after the receipt** (a Codex round, a base merge), the receipt no longer counts. Before merging, launch a fresh reviewer on only what changed since the receipted head; it posts the receipt for the new head.
+
+The receipt must come from an account with write access to the repository, and its reviewer must lead with a frontier model id, as `receipt` requires, and name `cut-down-reviewer`. A receipt that names no agent, which is what an author posting its own looks like, does not count. Every session shares one GitHub account, so the gate cannot see who ran the command: the named agent is a recorded claim, like a substitute receipt's reviewer.
 
 ## Step 1 — Collect the full open set
 
@@ -491,7 +517,7 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch nam
    or copying just the script has the same failure mode — no sibling file, gate
    fails closed.
 
-   Either verdict needs green CI on that head: each workflow in `CODEX_REVIEW_REQUIRED_WORKFLOWS` (comma-separated, default `CI`) has a latest run that concluded `success`, every other latest run concluded `success`, `neutral`, or `skipped`, and the newest commit status per context is `success` (release-policy's `Release policy` and `Release approval` contexts are a policy gate, not CI, and are skipped). A `review` head also needs `status` to read `clean` for it since its request (so `open=0`), or an approving substitute receipt for that exact head. A `fix:` or `fix(...)` title also needs a body line naming the PR it fixes, `Fixes-PR: #<n>`, or `Fixes-PR: none`, outside any code fence or HTML comment; merge-check refuses without one. A repo whose base branch sets `"requireReplacesLine": true` in `.github/pr-review-loop.json` also needs a `Replaces: <what this change supersedes>` or `Replaces: nothing` line in every PR body, read the same way; write it when you open the PR. merge-check reads the body as it is at merge time, and a repo without that file requires nothing. A PR any substitute receipt said `changes` on, for any head, also needs its own non-deleted `docs/review-notes/<that PR number>.md` fragment in the diff or a `Review-notes: none (<reason>)` body line, read the same way (`review_notes_missing`). Every head merge-check would allow or defer, in either mode, must also pass the shared comment checker (bootstrap plugin `comment-rule`, `check` from the merge base to the head): no net comment-line growth in TS/JS, Python, SQL or shell and no prohibited comment form (`comment_rule`, exit 24). A checker that is missing or cannot judge the change is no verdict (exit 1), never a pass; a repo opts out only with `"commentRule": false` in the base branch's `.github/pr-review-loop.json`.
+   Either verdict needs green CI on that head: each workflow in `CODEX_REVIEW_REQUIRED_WORKFLOWS` (comma-separated, default `CI`) has a latest run that concluded `success`, every other latest run concluded `success`, `neutral`, or `skipped`, and the newest commit status per context is `success` (release-policy's `Release policy` and `Release approval` contexts are a policy gate, not CI, and are skipped). A `review` head also needs `status` to read `clean` for it since its request (so `open=0`), or an approving substitute receipt for that exact head. A `fix:` or `fix(...)` title also needs a body line naming the PR it fixes, `Fixes-PR: #<n>`, or `Fixes-PR: none`, outside any code fence or HTML comment; merge-check refuses without one. A repo whose base branch sets `"requireReplacesLine": true` in `.github/pr-review-loop.json` also needs a `Replaces: <what this change supersedes>` or `Replaces: nothing` line in every PR body, read the same way; write it when you open the PR. merge-check reads the body as it is at merge time, and a repo without that file requires nothing. A PR any substitute receipt said `changes` on, for any head, also needs its own non-deleted `docs/review-notes/<that PR number>.md` fragment in the diff or a `Review-notes: none (<reason>)` body line, read the same way (`review_notes_missing`). Every head merge-check would allow or defer, in either mode, must also pass the shared comment checker (bootstrap plugin `comment-rule`, `check` from the merge base to the head): no net comment-line growth in TS/JS, Python, SQL or shell and no prohibited comment form (`comment_rule`, exit 24). A checker that is missing or cannot judge the change is no verdict (exit 1), never a pass; a repo opts out only with `"commentRule": false` in the base branch's `.github/pr-review-loop.json`. A head over the cut-down threshold, in either mode, also needs a cut-down receipt for exactly that head (`cut_down_missing`, exit 24; see [Cut-down pass](#cut-down-pass--after-the-pr-opens-before-codex-review)).
 
    After the merge, main-provenance.yml's `gate-audit` job re-judges the merged PR (`codex-review.sh audit`): at its merged head, from the commit it merged onto, with the title, body and labels it had then. It counts only evidence from before the merge: receipts and review requests not edited since, Codex reviews, and CI that had finished by then. Only a merge commit or a squash is judged, since only those name the commit a PR merged onto; a rebase merge or one made by hand is flagged outright. Review-thread resolution is read as it stands now, because GitHub keeps no time for it, but a Codex-review basis still needs the clean review itself to predate the merge. The rules are the audit code of the commit being judged, since the job checks out the merge commit. Running `audit` by hand with newer code applies newer rules to older merges. It files one `gate-bypass` issue for a merge the gate would have refused, and the daily `gate-audit-sweep` job audits any merge from the last 50 hours whose own audit left no result. It blocks nothing; it only makes a bypass visible.
 
