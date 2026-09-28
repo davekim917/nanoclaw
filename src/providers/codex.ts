@@ -54,8 +54,8 @@ export function buildContainerCodexConfig(): string {
     'multi_agent = true',
     '',
     '[agents]',
-    // No `default_subagent_reasoning_effort`, on purpose: a subagent runs at Codex's native default unless the spawn or
-    // its ROLE sets an effort, and each `/orchestrate` shim's role pins its own level.
+    // No `default_subagent_reasoning_effort`, on purpose: a subagent inherits its spawner's effort unless the spawn or
+    // its ROLE sets one, and each `/orchestrate` shim's role pins its own level.
     // Byte-identical with CONTAINER_CODEX_CONFIG_BASE in container/agent-runner/src/codex-companion-setup.ts
     // (src/provider-surfaces.test.ts).
     'max_concurrent_threads_per_session = 5',

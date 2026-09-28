@@ -1,12 +1,4 @@
-/**
- * The `wait` tool — an in-session delayed wake ("check CI in 15 minutes").
- *
- * Writes a kind='system' outbound row with action 'schedule_wake'; the host
- * converts it into a process_after row in THIS session's inbound.db. The
- * wake fires in this thread with full conversation context — unlike
- * `ncl tasks create`, which creates a standalone scheduled job in an
- * isolated task session whose output posts to a destination.
- */
+/** In-session delayed wake: fires in THIS thread with full context, unlike `ncl tasks create` (isolated task session). */
 import { writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { randomUUID } from 'node:crypto';

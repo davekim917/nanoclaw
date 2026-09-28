@@ -17,6 +17,7 @@ put() { mkdir -p "$(dirname "$R/$1")" && cat >"$R/$1"; }
 
 git init -q "$R"
 put container/skill-shell-tests.test.ts <<'EOF'
+const INHERITED_ENV = ['PATH', 'CASE_OUT'];
 const EXCLUDED_SUITES = [
   {
     relPath: 'container/needs-docker.test.sh',
@@ -90,7 +91,7 @@ cat >"$R/$S/writes-cased.test.sh" <<'EOF'
 cat >"$CASE_OUT.fixture" <<'FX'
 . "$(dirname "$0")/smoke-case.sh"
 FX
-echo "shard=${SMOKE_SHARD:-none}" >>"$CASE_OUT"
+echo "shard=${SMOKE_SHARD:-none} probe=${AMBIENT_PROBE:-none}" >>"$CASE_OUT"
 EOF
 git -C "$R" add -A && git -C "$R" -c user.email=t@example.com -c user.name=t commit -qm base
 
@@ -159,9 +160,10 @@ SMOKE_CASE=b CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/cased.t
 [ "$(grep -c "PASS" "$T/run.out")" = 1 ] && [ "$(cat "$T/cases.out")" = b ] &&
   ok "SMOKE_CASE runs the picked cases in one process, unsharded" || fail "SMOKE_CASE run: $(cat "$T/run.out")"
 : >"$T/cases.out"
-CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/writes-cased.test.sh" >"$T/run.out" 2>&1
-[ "$(cat "$T/cases.out")" = "shard=none" ] && ok "a suite that only writes a heredoc sourcing smoke-case.sh is not sharded" ||
-  fail "heredoc suite was sharded: $(cat "$T/cases.out")"
+AMBIENT_PROBE=leaked CASE_OUT="$T/cases.out" python3 "$SEL" --run --shards 3 "$S/writes-cased.test.sh" >"$T/run.out" 2>&1
+[ "$(cat "$T/cases.out")" = "shard=none probe=none" ] &&
+  ok "a heredoc-only suite is not sharded, and gets only the gate's INHERITED_ENV" ||
+  fail "heredoc suite was sharded or saw ambient env: $(cat "$T/cases.out")"
 
 [ "$FAILED" = 0 ] || { echo "select-tests tests FAILED" >&2; exit 1; }
 echo "select-tests tests passed"

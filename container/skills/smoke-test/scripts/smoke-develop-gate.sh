@@ -242,6 +242,8 @@ FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
 LAYOUT_MISSING=""
 [ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems)"
+[ -z "$FRONTEND_PATHS" ] || LAYOUT_MISSING="$LAYOUT_MISSING$(layout_prefix_problems FRONTEND_PATHS)"
+[ -z "$BACKEND_PATHS" ] || LAYOUT_MISSING="$LAYOUT_MISSING$(layout_prefix_problems BACKEND_PATHS)"
 # The PR gate detects the freeze this gate cuts by the same prefixes, read from
 # ITS env file (the one the controller renewer reads). If the two files
 # disagree, the freeze head reads as an ordinary PR and nothing alarms, so with
@@ -1618,7 +1620,7 @@ deploy_lag_safe() {
   [ "$files" -lt 300 ] || { printf 'false'; return; }
   hits="$(jq -r --arg p "$paths" '
     [ .files[].filename ] as $files
-    | ($p | split(",") | map(select(length > 0))) as $pre
+    | ($p | split(",")) as $pre
     | [ $files[] as $f | $pre[] as $x | select($f | startswith($x)) ] | length' <<<"$out" 2>/dev/null)"
   printf '%s' "$hits" | grep -Eq '^[0-9]+$' || { printf 'false'; return; }
   if [ "$hits" -eq 0 ]; then printf 'true'; else printf 'false'; fi
@@ -1801,12 +1803,14 @@ emit_handoff_unclaimed() {  # <trace-json> <age-seconds> <freeze-pr> <target-sha
 # The same alarm from the UNSETTLED branch. All other handoff bookkeeping sits
 # behind the settled check, but a never-started freeze means the PR-campaign
 # watcher is not running — which has nothing to do with develop's CI state, and
-# a watcher outage during a red develop must not be the silent one. Because
-# the ledger-adoption and abandonment steps have not run on this path, this
-# refuses to fire over either: a matching ledger row (finished — adoption
-# handles it once settled) or a freeze PR confirmed CLOSED/MERGED (abandonment
-# handles it). A failed PR lookup does NOT suppress: not knowing is no reason
-# for silence, and the lookup only happens on the one poll that would alarm.
+# a watcher outage during a red develop must not be the silent one. Ledger
+# adoption has already run on this path (adopt_ledger_outcomes, above the
+# settled check), but abandonment has not, so this refuses to fire over either:
+# a matching ledger row (finished; normally already adopted and the handoff
+# freed, the check stays for a line that landed mid-poll) or a freeze PR
+# confirmed CLOSED/MERGED (abandonment handles it once settled). A failed PR
+# lookup does NOT suppress: not knowing is no reason for silence, and the
+# lookup only happens on the one poll that would alarm.
 emit_handoff_unclaimed_unsettled() {
   local pr target age trace
   [ "$FREEZE_HANDOFF" = true ] && [ -n "$PR_STATE_DIR" ] || return 0
@@ -1829,6 +1833,99 @@ emit_handoff_unclaimed_unsettled() {
   esac
   emit_handoff_unclaimed "$trace" "$age" "$pr" "$target"
 }
+
+# Ledger adoption, split out of the handoff block below so it also runs BEFORE
+# the settled check. A finished freeze's verdict is a fact about a run that has
+# already ended, not a decision about develop's current head, so a red or moving
+# develop must not defer it: behind the settled exit, a finished campaign stayed
+# unadopted for as long as develop kept moving. State-only: no fetch, no wake,
+# no exit, and idempotent, so the settled path calling these again is a no-op.
+
+# The open handoff's own outcome, already bound to its freeze PR by the caller.
+# The freeze run finished: smoke-pr-gate.sh already wrote the verdict. Adopt it
+# as this gate's own completed record and free the handoff slot — the "same
+# develop SHA never re-freezes" dedup advance.
+adopt_handoff_entry() {  # <ledger-line>
+  local target run verdict finished
+  target="$(jq -r '.handoffTargetSha // empty' <<<"$STATE")"
+  run="$(jq -r '.runId' <<<"$1")"
+  verdict="$(jq -r '.verdict' <<<"$1")"
+  finished="$(jq -r '.finishedAt' <<<"$1")"
+  STATE="$(jq -c --arg sha "$target" --arg run "$run" --arg verdict "$verdict" --arg now "$finished" \
+    '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+     .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null |
+     .ledgerTamperAlertFor=null' <<<"$STATE")"
+}
+
+# Out-of-band freeze adoption. A human-requested campaign cuts its freeze PR
+# by calling smoke-freeze-pr.sh directly — a supported, documented flow that
+# "bypasses the scheduled cadence floor: deliberate, a human asked". It also
+# bypasses the handoff bookkeeping below, because only THIS file's own freeze
+# cut writes handoffFreezePr/handoffTargetSha. So its campaign produces a real
+# hold, a real published verdict and a correct ledger line that the block
+# below can never adopt, `completedSha` never advances, and the very SHA that
+# was just tested stays eligible to be frozen and tested again. Live: PR #1211
+# was created 2h09m after the previous cut, inside the 6h floor this gate
+# enforces, so the gate cannot have cut it — and its ledger line was still
+# unadopted ten hours later. Same shape re-froze `8dfca446` as #1195 after
+# #1188 had already produced a verdict for it.
+#
+# Only fires with NO handoff open (nothing to hijack). It cannot launder a
+# verdict past the tamper shield below, which guards adoption INTO an open
+# handoff: there is none here, adoption never touches the hold, and a forged
+# GO line lands as completedVerdict=GO with a hold present, which the
+# reconciler below reports as `unexpected` and alarms on.
+#
+# WHICH line: the newest one, by finishedAt, that is a different run and
+# finished LATER than the verdict state holds -- whatever its targetSha, and
+# completedSha becomes that line's own target. Keyed on develop's current
+# head instead (as it was through #1108), a freeze whose target develop had
+# already moved past was never adopted: one campaign froze fe92bc76, develop
+# reached ef798620 mid-run, and state kept #2161 while the hold named #2176,
+# so the reconciler woke gate_hold_tampered "mismatched" (#1134). The
+# same-SHA re-smoke (#1108: #2121 void BLOCKED, then #2126) and the
+# never-adopted #1211 line are both just "a newer line". Only-later means
+# completedAt never moves backwards; a finishedAt that does not parse never
+# adopts, and neither does a non-empty completedAt that does not (fail
+# closed). A state with no completedAt yet adopts the newest line.
+adopt_out_of_band() {
+  local entry
+  [ -z "$(jq -r '.handoffTargetSha // empty' <<<"$STATE")" ] && [ -s "$HANDOFF_LEDGER" ] || return 0
+  entry="$(jq -cR 'fromjson? | select(type == "object")' "$HANDOFF_LEDGER" 2>/dev/null |
+    jq -cs --argjson s "$STATE" '
+      def t: try fromdateiso8601 catch null;
+      (($s.completedAt // "") as $c | if $c == "" then 0 else ($c | t) end) as $old |
+      if $old == null then empty else
+        [.[] | select((.runId | type == "string" and length > 0) and .runId != $s.completedRunId and
+                      (.targetSha | type == "string" and test("^[0-9a-f]{40}$")))
+             | ((.finishedAt | t) // null) as $f | select($f != null and $f > $old) | . + {_at: $f}]
+        | (max_by(._at) // empty) | del(._at)
+      end' 2>/dev/null)"
+  [ -n "$entry" ] || return 0
+  STATE="$(jq -c --argjson e "$entry" \
+    '.completedSha=$e.targetSha | .completedAt=$e.finishedAt | .completedRunId=$e.runId |
+     .completedVerdict=$e.verdict' <<<"$STATE")"
+}
+
+# The same selection the handoff block makes: the LAST line for the open
+# handoff's target, adopted only when it names the handoff's own freeze PR. A
+# mismatched last line is left for the block's tamper latch, never adopted here.
+adopt_ledger_outcomes() {
+  [ "$FREEZE_HANDOFF" = true ] || return 0
+  local target pr entry
+  target="$(jq -r '.handoffTargetSha // empty' <<<"$STATE")"
+  pr="$(jq -r '.handoffFreezePr // empty' <<<"$STATE")"
+  if [ -n "$target" ] && [ -n "$pr" ] && [ -s "$HANDOFF_LEDGER" ]; then
+    entry="$(jq -cR --arg t "$target" \
+      'fromjson? | select(type == "object") | select(.targetSha == $t)' \
+      "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
+    if [ -n "$entry" ] && [ "$(jq -r '.freezePr' <<<"$entry")" = "$pr" ]; then
+      adopt_handoff_entry "$entry"
+    fi
+  fi
+  adopt_out_of_band
+}
+adopt_ledger_outcomes
 
 if [ "$CI_READY" != true ] || [ "$DEPLOY_READY" != true ]; then
   # Track how long THIS head has been unsettled and wake once when it exceeds
@@ -1911,16 +2008,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     [ -n "$LEDGER_ENTRY" ] && L_FREEZE_PR="$(jq -r '.freezePr' <<<"$LEDGER_ENTRY")"
 
     if [ -n "$LEDGER_ENTRY" ] && [ "$L_FREEZE_PR" = "$HANDOFF_PR" ]; then
-      # The freeze run finished: smoke-pr-gate.sh already wrote the verdict.
-      # Adopt it as this gate's own completed record and free the handoff
-      # slot — the "same develop SHA never re-freezes" dedup advance.
-      L_RUN="$(jq -r '.runId' <<<"$LEDGER_ENTRY")"
-      L_VERDICT="$(jq -r '.verdict' <<<"$LEDGER_ENTRY")"
-      L_FINISHED="$(jq -r '.finishedAt' <<<"$LEDGER_ENTRY")"
-      STATE="$(jq -c --arg sha "$HANDOFF_TARGET" --arg run "$L_RUN" --arg verdict "$L_VERDICT" --arg now "$L_FINISHED" \
-        '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
-         .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null |
-         .ledgerTamperAlertFor=null' <<<"$STATE")"
+      adopt_handoff_entry "$LEDGER_ENTRY"
     elif [ -n "$HANDOFF_PR" ]; then
       # Either no ledger outcome yet, or one that names a DIFFERENT freeze PR
       # (tamper-shaped — handled below). Either way, check abandonment
@@ -2030,55 +2118,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     fi
   fi
 
-  # Out-of-band freeze adoption. A human-requested campaign cuts its freeze PR
-  # by calling smoke-freeze-pr.sh directly — a supported, documented flow that
-  # "bypasses the scheduled cadence floor: deliberate, a human asked". It also
-  # bypasses the handoff bookkeeping above, because only THIS file's own freeze
-  # cut writes handoffFreezePr/handoffTargetSha. So its campaign produces a real
-  # hold, a real published verdict and a correct ledger line that the block
-  # above can never adopt, `completedSha` never advances, and the very SHA that
-  # was just tested stays eligible to be frozen and tested again. Live: PR #1211
-  # was created 2h09m after the previous cut, inside the 6h floor this gate
-  # enforces, so the gate cannot have cut it — and its ledger line was still
-  # unadopted ten hours later. Same shape re-froze `8dfca446` as #1195 after
-  # #1188 had already produced a verdict for it.
-  #
-  # Only fires with NO handoff open (nothing to hijack). It cannot launder a
-  # verdict past the tamper shield above, which guards adoption INTO an open
-  # handoff: there is none here, adoption never touches the hold, and a forged
-  # GO line lands as completedVerdict=GO with a hold present, which the
-  # reconciler below reports as `unexpected` and alarms on.
-  #
-  # WHICH line: the newest one, by finishedAt, that is a different run and
-  # finished LATER than the verdict state holds -- whatever its targetSha, and
-  # completedSha becomes that line's own target. Keyed on develop's current
-  # head instead (as it was through #1108), a freeze whose target develop had
-  # already moved past was never adopted: one campaign froze fe92bc76, develop
-  # reached ef798620 mid-run, and state kept #2161 while the hold named #2176,
-  # so the reconciler woke gate_hold_tampered "mismatched" (#1134). The
-  # same-SHA re-smoke (#1108: #2121 void BLOCKED, then #2126) and the
-  # never-adopted #1211 line are both just "a newer line". Only-later means
-  # completedAt never moves backwards; a finishedAt that does not parse never
-  # adopts, and neither does a non-empty completedAt that does not (fail
-  # closed). A state with no completedAt yet adopts the newest line.
-  if [ -z "$(jq -r '.handoffTargetSha // empty' <<<"$STATE")" ] &&
-     [ -s "$HANDOFF_LEDGER" ]; then
-    OOB_ENTRY="$(jq -cR 'fromjson? | select(type == "object")' "$HANDOFF_LEDGER" 2>/dev/null |
-      jq -cs --argjson s "$STATE" '
-        def t: try fromdateiso8601 catch null;
-        (($s.completedAt // "") as $c | if $c == "" then 0 else ($c | t) end) as $old |
-        if $old == null then empty else
-          [.[] | select((.runId | type == "string" and length > 0) and .runId != $s.completedRunId and
-                        (.targetSha | type == "string" and test("^[0-9a-f]{40}$")))
-               | ((.finishedAt | t) // null) as $f | select($f != null and $f > $old) | . + {_at: $f}]
-          | (max_by(._at) // empty) | del(._at)
-        end' 2>/dev/null)"
-    if [ -n "$OOB_ENTRY" ]; then
-      STATE="$(jq -c --argjson e "$OOB_ENTRY" \
-        '.completedSha=$e.targetSha | .completedAt=$e.finishedAt | .completedRunId=$e.runId |
-         .completedVerdict=$e.verdict' <<<"$STATE")"
-    fi
-  fi
+  adopt_out_of_band
 fi
 
 # Hold-file reconciliation. The hold lives on the shared workgroup mount so the

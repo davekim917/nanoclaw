@@ -78,9 +78,16 @@ transport/session requirements; switching to one is not a native-child resume.
 
 Record default, requested and actual model/effort separately in the existing
 run record, plus transport, original parent session, owner handle, and
-assigned scope. Mark unavailable runtime metadata unverified. Retain the same
-owner for corrections and remaining work. Native handles resume only through
-the spawning parent; a CLI session resumes only on its own session UUID with
+assigned scope. Mark unavailable runtime metadata unverified. A native Codex
+child cannot observe its own runtime: `spawn_agent` copies the root thread's
+Active Runtime block into every descendant verbatim. Derive each field
+instead: the role file's model or effort wins; else the spawn call's or a
+configured subagent default (a model given without an effort takes that
+model's default effort); else the spawning agent's. Record that derived value
+as the child's actual runtime and state it in the child's brief; never record
+or halt on the child's self-report. Retain the same owner for
+corrections and remaining work. Native handles resume only through the
+spawning parent; a CLI session resumes only on its own session UUID with
 the same runtime home and accessible history. A matching home path in another container
 is insufficient: NanoClaw mounts per-session Claude project history
 (`src/session-claude-mounts.ts`), and provider session state may be isolated.
@@ -2060,7 +2067,9 @@ Two further wrapper-optional artifacts and behaviours:
   fetch error, non-ancestor state, or a truncated compare. The wake payload
   reports `deployLagAccepted`; the coordinator then freezes the build as a
   documented SHA **pair** and says so in the run record. Unset = strict
-  equality.
+  equality. Each element must be a layout prefix (repository-relative, plain
+  segments, ending in `/`); a malformed list (`/web/`, `web`, `,,`) is named
+  by `config` and in `gate_misconfigured` rather than accepting a lag.
 - A head that stays unsettled beyond `SMOKE_GATE_UNSETTLED_ALERT_SECONDS`
   (default 45 min) produces exactly one `develop_unsettled` wake naming the
   failing workflows and lagging deploys — one per SHA, never a re-spam. A red

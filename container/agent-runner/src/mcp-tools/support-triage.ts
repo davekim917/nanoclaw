@@ -1,24 +1,7 @@
 /**
- * Classify-on-arrival for support emails, using TypeSafe's Jev
- * (docs.typesafe.ai). `dispatch_support_issue` calls this before it hands the
- * email to the host, so every per-issue session starts knowing what it is
- * looking at: which product, which feature or process, what kind of ask, how
- * urgent, and how likely it is to be a user-facing defect.
- *
- * Opt-in per group, and generic: the taxonomy is the GROUP's file
- * (`/workspace/agent/support-taxonomy.json`). With no file there is no
- * classification and no network call — trunk carries no product names.
- *
- * Fail-open, always. A support email must never wait on, or be lost to, a
- * classifier: a missing key, an HTTP error, a timeout or a malformed answer
- * returns null and the dispatch proceeds exactly as it did before this existed.
- *
- * The key is never in this process. Requests go through the OneCLI proxy, which
- * injects the group's `TypeSafe` secret at the boundary.
- *
- * Product is decided by rules, not the model: most emails never name the
- * product, and a sunset product is recognisable by name. Jev answers only the
- * questions that need meaning.
+ * Classify-on-arrival for support emails via TypeSafe's Jev. Opt-in per group (the group's support-taxonomy.json;
+ * none means no network call). Fail-open always: a support email must never wait on or be lost to the
+ * classifier. The key never enters this process; OneCLI injects it.
  */
 import fs from 'fs';
 
@@ -29,11 +12,7 @@ const DEFAULT_TIMEOUT_MS = 4_000;
 const MAX_EMAIL_CHARS = 12_000; // well inside Jev's 32k state budget; the head carries the ask
 
 export interface SupportTaxonomy {
-  /**
-   * Product rules, first match wins: a rule matches when any of its keywords
-   * appears as whole words in subject + body, case-insensitive. Keywords, not
-   * regexes, so matching is linear in the email and no rule can stall a dispatch.
-   */
+  /** First match wins; whole-word keywords, not regexes, so matching is linear and no rule can stall a dispatch. */
   productRules?: { product: string; keywords: string[] }[];
   defaultProduct?: string;
   /** Option key → plain-language description. `none` is added when absent. */
@@ -194,11 +173,7 @@ function chosen(answer: JevAnswer | undefined, type: string, options: Record<str
     : null;
 }
 
-/**
- * Strict: any answer of the wrong type, an option that wasn't offered, or a
- * number out of range discards the whole triage (fail-open), rather than
- * passing a partial or repaired hint downstream.
- */
+/** Strict: any wrong-typed, unoffered or out-of-range answer discards the whole triage (fail-open). */
 function parseTriage(
   answers: Record<string, JevAnswer>,
   product: string | null,

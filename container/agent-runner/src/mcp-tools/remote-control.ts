@@ -1,13 +1,3 @@
-/**
- * Remote Control MCP tools (Phase 5.7).
- *
- * Thin agent-facing wrappers around the host's `claude remote-control`
- * CLI. The agent emits a system-action via messages_out; the host
- * spawns / stops / queries Claude's OOTB remote-control command and
- * sends a chat-kind message back into the session with the URL or
- * status. The agent picks that up as normal inbound and relays to
- * the user.
- */
 import { registerTools } from './server.js';
 import { emitSystemAction, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';

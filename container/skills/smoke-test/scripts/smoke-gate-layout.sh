@@ -12,10 +12,10 @@
 # prefix classes every file under it as a migration. Nesting (migrations under
 # the backend) is the normal layout and stays allowed.
 #
-# SMOKE_GATE_MIGRATIONS_PREFIX alone may list several trees, comma-separated
-# (`api/migrations/,data/migrations/`): each element is checked like a single
-# prefix and against every other element and prefix. The frontend and backend
-# prefixes stay single values, because each names exactly one freeze marker.
+# SMOKE_GATE_MIGRATIONS_PREFIX, and each deploy-lag list (*_PATHS, checked alone
+# since the two share trees), may hold several comma-separated trees: each element
+# is checked like a single prefix and against every other element and prefix. The
+# frontend and backend prefixes stay single, each naming exactly one freeze marker.
 
 LAYOUT_PREFIX_KEYS="FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX"
 LAYOUT_PREFIX_RE='^([A-Za-z0-9_][A-Za-z0-9._-]*/)+$'
@@ -27,7 +27,10 @@ layout_prefix_ok() {  # <value> → status 0 when it is a usable layout prefix
 # The prefixes <KEY>'s <value> holds, one per line. Empty elements are kept, so
 # "a/,,b/" and a trailing comma are refused rather than skipped.
 layout_prefix_elements() {  # <KEY> <value>
-  if [ "$1" = MIGRATIONS_PREFIX ]; then printf '%s\n' "$2" | tr ',' '\n'; else printf '%s\n' "$2"; fi
+  case "$1" in
+    MIGRATIONS_PREFIX | *_PATHS) printf '%s\n' "$2" | tr ',' '\n' ;;
+    *) printf '%s\n' "$2" ;;
+  esac
 }
 
 # <value> as a canonical comma list (sorted, one of each), so two files that

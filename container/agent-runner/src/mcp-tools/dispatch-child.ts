@@ -1,14 +1,4 @@
-/**
- * Child-only MCP tools: spawn_progress, spawn_complete, spawn_failed,
- * spawn_request_steer.
- *
- * Mounted ONLY when getSessionSpawnTaskId() !== null — i.e., this container
- * is running as a child of an orchestrator's spawn.
- *
- * All tools write kind='system' outbound rows. task_id is auto-filled
- * from session metadata (getSessionSpawnTaskId) so the agent doesn't need
- * to pass it explicitly — the tool injection layer fills it in.
- */
+/** Child-only spawn_* tools, mounted only when this container runs as an orchestrator's spawn; task_id is filled from session metadata. */
 import { writeMessageOut, type WriteMessageOut } from '../db/messages-out.js';
 import { getSessionSpawnTaskId } from '../modules/mailbox/index.js';
 import type { McpToolDefinition } from './types.js';
@@ -36,12 +26,6 @@ const DEFAULT_DEPENDENCIES: SpawnChildDependencies = {
   log,
 };
 
-/**
- * Resolve task_id, write a kind='system' envelope carrying the action, log.
- * Shared scaffolding for every spawn_* handler. `extra` lets each caller
- * attach action-specific fields (message / summary / fail_reason / question)
- * to the envelope. `logSuffix` is appended to the log line for grep-ability.
- */
 async function emitSpawnAction(
   dependencies: SpawnChildDependencies,
   action: 'spawn_progress' | 'spawn_complete' | 'spawn_failed' | 'spawn_request_steer',

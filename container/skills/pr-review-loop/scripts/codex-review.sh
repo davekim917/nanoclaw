@@ -28,6 +28,8 @@
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
 #                                             # post a substitute review's receipt for exactly that head — --reviewer
 #                                             # must start with a frontier model id (see REVIEWER_DENIED_TIERS)
+#   codex-review.sh cut-down                  # does the current head need a cut-down receipt, and has one: 0 yes/no need, 24 missing
+#   codex-review.sh cut-down-receipt --head <sha> --reviewed <sha> --reviewer "<model> cut-down-reviewer (<runtime>)" --body-file <file>
 #
 # Exit codes, one contract across commands (0 and 3 are the originals):
 #   0   pass; verdict printed; merge allowed. For merge-check, only `merge=allowed`
@@ -46,7 +48,10 @@
 #       .github/pr-review-loop.json requires a Replaces line and the body has none,
 #       or a substitute receipt on the PR
 #       asked for changes and it neither adds docs/review-notes/<this PR>.md nor
-#       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`)
+#       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`), or
+#       it grows comment lines or adds a prohibited comment form (`comment_rule`;
+#       on unless the base's .github/pr-review-loop.json sets "commentRule": false),
+#       or it is over CUT_DOWN_THRESHOLD with no cut-down receipt (`cut_down_missing`)
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
@@ -55,7 +60,7 @@
 #       (admin_readiness); only `admin=ready` licenses `gh pr merge --admin`. A legacy
 #       head still gets 24 first when a check GitHub marks required for the PR is red on it
 #       (`required_red`) or the newest independent-review-receipt:v1 for it is not
-#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck
+#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule` or `cut_down_missing`
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
 #   28  audit: merge-check would have refused this PR at its merge, or it merged by a
 #       method the gate does not authorize (rebase or manual) — a gate bypass
@@ -557,26 +562,26 @@ RECEIPT_REVIEWER_LINE_RE='\*\*Reviewer and runtime:\*\* (?<reviewer>[^\n]+)'
 # docs/specs/risk-based-review/plan.md links a fix to its PR through this line.
 FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
 FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
-# The body line naming what a PR supersedes, or `nothing`. Required only in a
-# repo whose base branch sets `"requireReplacesLine": true` in
-# REVIEW_LOOP_CONFIG, so every other repo merges exactly as before
-# (replaces_state). Its value must show a character (has_visible_text,
-# visible-text.jq): a zero-width space or word joiner alone is not one.
+# The body line naming what a PR supersedes, or `nothing`, where the base opts
+# in (replaces_state). A zero-width space or word joiner alone is no value.
 REPLACES_LINE_RE='(^|\n)Replaces:(?<value>[^\n]*)'
 REVIEW_LOOP_CONFIG='.github/pr-review-loop.json'
+# The base's REVIEW_LOOP_CONFIG may replace CUT_DOWN_THRESHOLD with its own
+# "cutDownThreshold", a whole number, or false to switch the rule off.
+CUT_DOWN_THRESHOLD=150
+CUT_DOWN_AGENT='cut-down-reviewer'
+CUT_DOWN_MARKER_RE='(^|\n)<!-- pr-review-loop:cut-down-receipt head=(?<head>[0-9a-f]{40}) reviewed=(?<reviewed>[0-9a-f]{40}) lines-reviewed=(?<before>[0-9]+|unknown) lines-now=(?<after>[0-9]+|unknown) -->'
 # The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
 # a PR any substitute receipt asked for changes on adds a current-PR fragment
 # under REVIEW_NOTES_DIR, or its body carries this line, read the way the Fixes-PR
 # line is (review_notes_state). The reason is ONE parenthesised phrase, with no
 # parenthesis inside it and nothing after it on the line, so `none ()x)` and
-# `none ( ) )` never pass for one, and the reason must show a character
-# (has_visible_text, visible-text.jq, #707 P3-b).
+# `none ( ) )` never pass for one, and the reason must show a character.
 REVIEW_NOTES_FILE='docs/review-notes.md'
 REVIEW_NOTES_DIR='docs/review-notes'
 REVIEW_NOTES_NONE_LINE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<reason>[^()\n]*)\)[ \t]*\r?(?=\n|\z)'
-# Looser than REVIEW_NOTES_NONE_LINE_RE: matches an attempted line (up to end
-# of line, whatever its shape) so review_notes_state can name which shape rule
-# it failed, rather than a blanket "no verdict" (#707 P3-c).
+# Looser than REVIEW_NOTES_NONE_LINE_RE, so review_notes_state can name which
+# shape rule an attempted line failed.
 REVIEW_NOTES_NONE_CANDIDATE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<rest>[^\n]*)'
 # Unanchored so it also finds an attempt GitHub's own line breaks would not
 # otherwise show as line-initial — an inline HTML comment ("<!-- Review-notes:
@@ -585,12 +590,9 @@ REVIEW_NOTES_NONE_CANDIDATE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<rest>[^\
 # comment" apart from "no line at all", never to parse the reason itself.
 REVIEW_NOTES_NONE_ANYWHERE_RE='Review-notes:[ \t]*none[ \t]*\('
 # Splits a candidate's `rest` (everything after `none (`) into the reason and
-# whatever follows the closing parenthesis, without jq's `index`/slice, which
-# disagree on offsets below jq 1.8: `index` counts bytes, a slice counts
-# codepoints, so a non-ASCII reason (multi-byte UTF-8) misaligned them and cut
-# the reason short (#713 P3). No match at all — no unescaped `)`, or a `(`
-# before one — means an unmatched or nested parenthesis, read by capture's
-# empty result rather than a byte offset.
+# what follows it. Below jq 1.8 `index` counts bytes and a slice codepoints, so
+# offsets would cut a multi-byte reason short; no match means an unmatched or
+# nested parenthesis.
 REVIEW_NOTES_REASON_SPLIT_RE='^(?<reason>[^()]*)\)(?<trailing>.*)$'
 
 # `missing` when a fix title's body has no Fixes-PR line, else `ok`, for a
@@ -600,15 +602,9 @@ REVIEW_NOTES_REASON_SPLIT_RE='^(?<reason>[^()]*)\)(?<trailing>.*)$'
 fix_link_state() {
   jq -r -L "$HERE" --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
     include "pr-body";
-    # pr_body_text checks its own shape inside pr-body.jq, but a stub or
-    # replacement module can drop that check along with the rest of the
-    # module (#707 P3-a). The boolean `and` below short-circuits away from
-    # ever touching $body when the title is not a fix title, so a
-    # wrong-typed pr_body_text on a feat PR would otherwise never surface as
-    # an error — assert the shape up front, before ever reading .title,
-    # whenever pr_body_text yields exactly one value of the wrong type.
-    # Empty or doubled output is left alone: the case statement in each
-    # caller of this function still reads that as "no verdict", same as before.
+    # A replacement pr-body.jq can drop the shape check in pr_body_text, and the
+    # `and` below never reads $body for a non-fix title, so the shape is asserted
+    # first. Empty or doubled output stays "no verdict" for the caller.
     (
       [pr_body_text] as $pr_body
       | if ($pr_body | length) == 1 and ($pr_body[0] | type) != "string"
@@ -621,29 +617,36 @@ fix_link_state() {
     )'
 }
 
-# `missing` when the base commit scope_eval resolved requires a `Replaces:`
-# line and the {body} JSON object $1 has none, else `ok`; read like the
-# Fixes-PR line. A base with no REVIEW_LOOP_CONFIG requires nothing. A config
-# that cannot be read, or is not an object whose requireReplacesLine is a
-# boolean, returns non-zero: no verdict, never a pass.
-replaces_state() {
-  local config status=0 required
+# Key $1 of REVIEW_LOOP_CONFIG at the base commit scope_eval resolved, through jq
+# filter $3, or $2 when the file or key is absent. A config that cannot be read, or
+# holds a value $3 rejects, returns non-zero: no verdict, never a pass.
+review_loop_value() {
+  local config status=0
   config=$(base_file "$SCOPE_BASE" "$REVIEW_LOOP_CONFIG") || status=$?
   case "$status" in
     0)
-      required=$(printf '%s' "$config" | jq -r '
+      printf '%s' "$config" | jq -r --arg key "$1" --argjson default "$2" "def valid: $3;"'
         if type != "object" then error("not a JSON object")
-        elif has("requireReplacesLine") | not then "optional"
-        elif .requireReplacesLine | type != "boolean" then error("requireReplacesLine is not a boolean")
-        elif .requireReplacesLine then "required"
-        else "optional" end') || return 1
+        elif has($key) | not then $default
+        else .[$key] | valid end'
       ;;
-    3) required=optional ;;
+    3) echo "$2" ;;
     *) return 1 ;;
   esac
+}
+
+review_loop_flag() {
+  review_loop_value "$1" "$2" 'if type == "boolean" then . else error("not a boolean") end'
+}
+
+# `missing` when the base requires a `Replaces:` line and the {body} JSON
+# object $1 has none, else `ok`; read like the Fixes-PR line.
+replaces_state() {
+  local required
+  required=$(review_loop_flag requireReplacesLine false) || return 1
   case "$required" in
-    optional) echo ok; return 0 ;;
-    required) ;;
+    false) echo ok; return 0 ;;
+    true) ;;
     *) return 1 ;;
   esac
   printf '%s' "$1" | jq -r -L "$HERE" --arg lineRe "$REPLACES_LINE_RE" '
@@ -655,6 +658,149 @@ replaces_state() {
 replaces_refusal() {
   printf "the PR body has no 'Replaces:' line, which %s on %s requires. Add one line naming what this change supersedes, e.g. 'Replaces: the hand-rolled retry loop in the sync worker', or 'Replaces: nothing' when it supersedes nothing. It must start its own line, outside any code fence or HTML comment. Edit the body and re-run merge-check; no new commit is needed" \
     "$REVIEW_LOOP_CONFIG" "${SCOPE_BASE_REF:-the base branch}"
+}
+
+COMMENT_RULE_CHECKER='bootstrap/plugins/comment-rule/bin/comment-rule.mjs'
+
+comment_rule_checker() {
+  local root
+  for root in "${CLAUDE_PLUGINS_ROOT:-}" "${HOME:+$HOME/plugins}"; do
+    if [ -n "$root" ] && [ -f "$root/$COMMENT_RULE_CHECKER" ]; then
+      printf '%s' "$root/$COMMENT_RULE_CHECKER"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The checker's report on SCOPE_HEAD against its merge base, and its exit status.
+# The two commits are fetched without history, and two shallow roots have no merge
+# base, so the checker reads a commit carrying the head's tree on the merge base.
+comment_rule_run() {
+  local checker merge_base head
+  checker=$(comment_rule_checker) || {
+    echo "the comment-rule checker is not installed: no $COMMENT_RULE_CHECKER under \$CLAUDE_PLUGINS_ROOT or ~/plugins; on the host, run \`git -C ~/plugins/bootstrap pull --ff-only\`, or \`git clone https://github.com/davekim917/bootstrap ~/plugins/bootstrap\` when there is no checkout"
+    return 2
+  }
+  command -v node >/dev/null 2>&1 || { echo "the comment-rule checker needs node on PATH"; return 2; }
+  merge_base=$(gh api "repos/$REPO/compare/$SCOPE_BASE...$SCOPE_HEAD?per_page=1" \
+    | jq -er '.merge_base_commit.sha | strings | select(test("^[0-9a-f]{40}$"))') || {
+    echo "could not read the merge base of $SCOPE_HEAD with $SCOPE_BASE"
+    return 2
+  }
+  COMMENT_RULE_DIR=$(mktemp -d)
+  trap 'rm -rf "$COMMENT_RULE_DIR"' EXIT
+  local dir="$COMMENT_RULE_DIR"
+  export GIT_TERMINAL_PROMPT=0
+  {
+    git init -q "$dir" &&
+      git -C "$dir" remote add origin "https://github.com/$REPO" &&
+      git -C "$dir" config credential.helper '!gh auth git-credential' &&
+      git -C "$dir" fetch -q --no-tags --depth=1 --filter=blob:none origin "$merge_base" "$SCOPE_HEAD" &&
+      head=$(git -C "$dir" -c user.name=merge-check -c user.email=merge-check@localhost \
+        commit-tree "$SCOPE_HEAD^{tree}" -p "$merge_base" -m "$SCOPE_HEAD") &&
+      git -C "$dir" diff --no-ext-diff --no-textconv -M --numstat "$merge_base" "$head" >/dev/null
+  } 2>&1 >/dev/null || {
+    echo "could not fetch $SCOPE_HEAD and its merge base $merge_base from $REPO"
+    return 2
+  }
+  node "$checker" check --repo "$dir" --base "$merge_base" --head "$head" 2>&1
+}
+
+# Refuses (24) a head whose change grows comment lines or adds a prohibited
+# comment form, unless the base's REVIEW_LOOP_CONFIG sets "commentRule": false.
+# A checker that is missing or cannot judge the change is no verdict (1).
+comment_rule_gate() {
+  local enabled report status=0
+  [ -n "$SCOPE_BASE" ] || return 0
+  enabled=$(review_loop_flag commentRule true) || enabled=error
+  case "$enabled" in
+    true) ;;
+    false)
+      echo "merge-check: comment rule off: $REVIEW_LOOP_CONFIG on $SCOPE_BASE_REF sets \"commentRule\": false" >&2
+      return 0
+      ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: could not read $REVIEW_LOOP_CONFIG at $SCOPE_BASE as an object with a boolean commentRule" >&2
+      exit 1
+      ;;
+  esac
+  report=$(comment_rule_run) || status=$?
+  case "$status" in
+    0) ;;
+    1)
+      printf '%s\n' "$report" >&2
+      echo "merge=refused head=$SCOPE_HEAD: comment_rule: this change adds comment lines on net or a prohibited comment form (report above); cut them and push a new head" >&2
+      exit 24
+      ;;
+    *)
+      printf '%s\n' "$report" >&2
+      echo "merge=error head=$SCOPE_HEAD: the comment-rule check gave no verdict (exit $status); when the report says typescript was not found, run \`npm ci --ignore-scripts\` in the bootstrap plugin directory plugins/comment-rule" >&2
+      exit 1
+      ;;
+  esac
+}
+
+cut_down_lines() {
+  gh api "repos/$REPO/compare/$1...$2?per_page=1" | jq -r -L "$HERE" 'include "cut-down"; cut_down_lines'
+}
+
+cut_down_reviewer_named() {
+  [[ "$1" =~ (^|[^[:alnum:]_-])${CUT_DOWN_AGENT}($|[^[:alnum:]_-]) ]]
+}
+
+# `ok\t<why>` or `missing\t<why>` for SCOPE_HEAD; non-zero when it cannot tell.
+cut_down_state() {
+  local threshold lines pages receipts head login reviewer others
+  threshold=$(review_loop_value cutDownThreshold "$CUT_DOWN_THRESHOLD" \
+    'if . == false then "off" elif type == "number" and . >= 0 and floor == . then [., 1000000000] | min else error("not a whole number or false") end') || return 1
+  if [ "$threshold" = off ]; then
+    printf 'ok\t%s on %s sets "cutDownThreshold": false\n' "$REVIEW_LOOP_CONFIG" "$SCOPE_BASE_REF"
+    return 0
+  fi
+  lines=$(cut_down_lines "$SCOPE_BASE" "$SCOPE_HEAD") || return 1
+  if [ "$lines" != unknown ] && [ "$lines" -le "$threshold" ]; then
+    printf 'ok\t%s added lines outside tests, within the threshold of %s\n' "$lines" "$threshold"
+    return 0
+  fi
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  receipts=$(printf '%s\n' "$pages" | jq -rs --arg re "$CUT_DOWN_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" '
+    .[] | .data.repository.pullRequest.comments.nodes[]
+    | select(.author.login | type == "string" and . != "")
+    | .author.login as $login
+    | (.body // "") as $body
+    | [ $body | capture($re) ] | first // empty
+    | [ .head, $login, ([ $body | capture($reviewerRe) ] | first | .reviewer // "") ] | @tsv') || return 1
+  others=""
+  while IFS=$'\t' read -r head login reviewer; do
+    [ -n "$head" ] || continue
+    if ! reviewer_model_allowed "$reviewer" || ! cut_down_reviewer_named "$reviewer"; then continue; fi
+    if [ "$head" = "$SCOPE_HEAD" ] && may_clear "$login"; then
+      printf 'ok\ta cut-down receipt names this head (%s)\n' "$reviewer"
+      return 0
+    fi
+    others="$head"
+  done <<< "$receipts"
+  printf 'missing\tthis change adds %s lines outside tests, over the threshold of %s, and no cut-down receipt from %s names this head%s. Run the %s agent on the change (SKILL.md, "Cut-down pass"); it posts the receipt with `codex-review.sh cut-down-receipt`\n' \
+    "$lines" "$threshold" "$CUT_DOWN_AGENT" "${others:+ (the latest names ${others:0:12}: review only what changed since)}" "$CUT_DOWN_AGENT"
+}
+
+cut_down_gate() {
+  local state
+  [ -n "$SCOPE_BASE" ] || return 0
+  state=$(cut_down_state) || {
+    echo "merge=error head=$SCOPE_HEAD: the cut-down check gave no verdict; could not read $REVIEW_LOOP_CONFIG at $SCOPE_BASE as an object whose cutDownThreshold is a whole number or false, this head's changed lines, or the PR's comments" >&2
+    exit 1
+  }
+  [[ "$state" == missing$'\t'* ]] || return 0
+  echo "merge=refused head=$SCOPE_HEAD: cut_down_missing: ${state#*$'\t'}" >&2
+  exit 24
+}
+
+final_gates() {
+  comment_rule_gate
+  cut_down_gate
+  refuse_if_base_moved
 }
 
 # Reviewer eligibility is a tier rule stated as a DENYLIST: any model may write
@@ -723,6 +869,21 @@ reviewer_model_allowed() {
   local refusal
   refusal=$(reviewer_model_refusal "${1:-}") || return 1
   [ -z "$refusal" ]
+}
+
+# merge-check reads the reviewer back through the single-line RECEIPT_REVIEWER_LINE_RE,
+# and a marker smuggled into either argument would be read before the command's own.
+receipt_input_refusal() {
+  case "$1" in
+    *$'\n'*|*$'\r'*) echo "--reviewer may not contain a newline or carriage return"; return 0 ;;
+  esac
+  if ! reviewer_model_allowed "$1"; then
+    echo "--reviewer refused — $(reviewer_model_refusal "$1")"
+    return 0
+  fi
+  case "$1$2" in
+    *pr-review-loop:*) echo "--reviewer and the body may not contain a pr-review-loop marker" ;;
+  esac
 }
 
 # Prints file $2 as it is at base commit $1. Read through the API, never the
@@ -1218,12 +1379,8 @@ review_notes_state() {
     --argjson files "$SCOPE_FILES" '
     include "pr-body";
     include "visible-text";
-    # pr_body_text checks its own shape inside pr-body.jq, but a replacement
-    # module can drop that check along with the rest of the module (#707
-    # P3-a) — assert the shape up front, whenever pr_body_text yields exactly
-    # one value of the wrong type. Empty or doubled output is left alone: the
-    # case statement in each caller of this function still reads that as "no
-    # verdict", same as before.
+    # A replacement pr-body.jq can drop the shape check in pr_body_text, so it is
+    # asserted here. Empty or doubled output stays "no verdict" for the caller.
     (
       [pr_body_text] as $pr_body
       | if ($pr_body | length) == 1 and ($pr_body[0] | type) != "string"
@@ -1240,20 +1397,15 @@ review_notes_state() {
           else "whether a substitute receipt asked for changes is unknown: \($why)" end ) as $whyText
         | ( if ($files | type) == "array" then "this head does not add or amend \($fragment)"
             else "the files this head changes could not be checked, so no addition of \($fragment) counts" end ) as $touch
-        # Names which shape rule the line failed, instead of a blanket "no
-        # reason" (#707 P3-c): the loose candidate regex finds an attempted
-        # line even where the strict one refuses to, so its tail can be
-        # inspected for what specifically is wrong with it.
+        # The loose candidate regex finds an attempted line the strict one
+        # refuses, so the refusal can name which shape rule it failed.
         | ( [ $body | capture($candidateRe; "gi") ] ) as $candidates
         | ( ((.body // "") | test($anywhereRe; "i")) and (($body | test($anywhereRe; "i")) | not) ) as $hiddenByStripping
         | ( if ($candidates | length) > 0 then
               ($candidates[0].rest) as $rest
-              # capture, not index/slice: a byte offset from index and a
-              # codepoint offset from a slice disagree once $rest holds a
-              # multi-byte UTF-8 reason, and this must never depend on which
-              # one wins (#713 P3). No match — no unescaped `)`, or a `(`
-              # before the first `)` — comes back as an empty array, same as
-              # the old "unmatched or nested" branch.
+              # capture, not index/slice: index counts bytes and a slice counts
+              # codepoints, which disagree on a multi-byte reason. No match
+              # (unmatched or nested parentheses) is an empty array.
               | ( [ $rest | capture($splitRe) ] ) as $split
               | if ($split | length) == 0 then
                   "the body carries a `Review-notes: none (...)` line, but its reason has an unmatched or nested parenthesis, which the check cannot parse. Remove the inner parenthesis, or add the lesson in \($fragment)"
@@ -1909,7 +2061,7 @@ merge_check_main() {
       exit 24
     fi
     legacy_precheck
-    refuse_if_base_moved
+    final_gates
     if [ -n "$LEGACY_CI_HOST" ]; then
       local admin
       echo "merge-check: required $LEGACY_CI_HOST never started on Actions; the $HOST_CI_CONTEXT success on this head stands in" >&2
@@ -2022,7 +2174,7 @@ merge_check_main() {
       ;;
   esac
   if [ "$SCOPE_VERDICT" = skip ]; then
-    refuse_if_base_moved
+    final_gates
     echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=$ci_word base=$SCOPE_BASE: $SCOPE_REASON"
     exit 0
   fi
@@ -2043,7 +2195,7 @@ merge_check_main() {
       echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: the approving substitute receipt names a disallowed reviewer — $(reviewer_model_refusal "$receipt_reviewer"). Post a new receipt (codex-review.sh receipt ...) from a frontier model" >&2
       exit 24
     fi
-    refuse_if_base_moved
+    final_gates
     echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: the latest substitute receipt for this head approves ($receipt_reviewer)"
     exit 0
   fi
@@ -2056,7 +2208,7 @@ merge_check_main() {
   observation=$(status_observation "$SCOPE_HEAD" "$since") || exit 1
   case "$observation" in
     codex=clean*)
-      refuse_if_base_moved
+      final_gates
       echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: $observation"
       ;;
     *)
@@ -2331,7 +2483,7 @@ ci_wait_main() {
   done
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|claim|merge-check|merge|audit|receipt}" in
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|claim|merge-check|merge|audit|receipt|cut-down|cut-down-receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -2716,11 +2868,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
   merge)
     # The one merge path for a risk-scoped repo (SKILL.md, Risk-scoped repos):
     # merge-check for exactly this head, and `gh pr merge --match-head-commit`
-    # on its exit 0 and nothing else. Twice a pipeline swallowed a refusal —
-    # `merge-check | tail -1 && gh pr merge` merged #675 over a missing
-    # Fixes-PR line, and a grep pipe hid a red vitest before #401 merged — so
-    # the decision and the merge are one command, and the decision is
-    # merge-check itself, merge_check_main, not a restatement of it. Exit 25
+    # on its exit 0 and nothing else. A pipeline between the two can swallow a
+    # refusal, so they are one command, and the decision is merge_check_main
+    # itself, not a restatement of it. Exit 25
     # (the base moved during the check) runs it once more; every other refusal
     # passes its own code through, and nothing merges. It never deletes the
     # branch: `gh pr merge --delete-branch` also switches the local checkout,
@@ -2976,6 +3126,62 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         ;;
     esac
     ;;
+  cut-down)
+    scope_eval || exit 1
+    [ -n "$SCOPE_BASE" ] || { echo "cut-down: could not resolve base branch $SCOPE_BASE_REF to a commit" >&2; exit 1; }
+    state=$(cut_down_state) || { echo "cut-down: no verdict for $SCOPE_HEAD" >&2; exit 1; }
+    echo "cut_down=${state%%$'\t'*} head=$SCOPE_HEAD: ${state#*$'\t'}"
+    [ "${state%%$'\t'*}" = ok ] || exit 24
+    ;;
+  cut-down-receipt)
+    shift
+    head="" reviewed="" reviewer="" body_file=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head|--reviewed|--reviewer|--body-file)
+          [ $# -ge 2 ] || { echo "cut-down-receipt: $1 needs a value" >&2; exit 2; }
+          case "$1" in
+            --head) head="$2" ;;
+            --reviewed) reviewed="$2" ;;
+            --reviewer) reviewer="$2" ;;
+            *) body_file="$2" ;;
+          esac
+          shift 2 ;;
+        *) echo "cut-down-receipt: unknown argument $1" >&2; exit 2 ;;
+      esac
+    done
+    if ! [[ "$head" =~ ^[0-9a-f]{40}$ && "$reviewed" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "cut-down-receipt: --head (the PR head now) and --reviewed (the head the pass read) must be full 40-character SHAs" >&2
+      exit 2
+    fi
+    if [ -z "$reviewer" ] || [ -z "$body_file" ] || [ ! -s "$body_file" ]; then
+      echo "cut-down-receipt: needs --reviewer and a non-empty --body-file (every cut, and whether it was applied or answered)" >&2
+      exit 2
+    fi
+    body=$(cat "$body_file")
+    refusal=$(receipt_input_refusal "$reviewer" "$body")
+    if [ -z "$refusal" ] && ! cut_down_reviewer_named "$reviewer"; then
+      refusal="--reviewer must name the $CUT_DOWN_AGENT agent that ran the pass, after its model id; the PR's author does not post this receipt"
+    fi
+    [ -z "$refusal" ] || { echo "cut-down-receipt: $refusal" >&2; exit 2; }
+    base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName | jq -er .baseRefName) || exit 1
+    base_sha=$(base_tip "$base") || { echo "cut-down-receipt: could not resolve $base to a commit" >&2; exit 1; }
+    before=$(cut_down_lines "$base_sha" "$reviewed") || { echo "cut-down-receipt: could not count the lines $reviewed adds" >&2; exit 1; }
+    after=$(cut_down_lines "$base_sha" "$head") || { echo "cut-down-receipt: could not count the lines $head adds" >&2; exit 1; }
+    cut=unknown
+    if [ "$before" != unknown ] && [ "$after" != unknown ]; then cut=$((before - after)); fi
+    url=$(gh pr comment "$PR" --repo "$REPO" --body "### Cut-down review receipt
+
+- **Head:** \`$head\`
+- **Reviewed head:** \`$reviewed\`
+- **Reviewer and runtime:** $reviewer
+- **Added lines outside tests:** $before when reviewed, $after now; cut $cut
+
+$body
+
+<!-- pr-review-loop:cut-down-receipt head=$head reviewed=$reviewed lines-reviewed=$before lines-now=$after -->")
+    echo "cut-down-receipt: head=$head cut=$cut $url"
+    ;;
   receipt)
     # A substitute review's durable receipt (docs/review-policy.md, "Review
     # availability"), tied to exactly one head. The reviewer is a fresh
@@ -3025,33 +3231,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
       echo "receipt: --claim-owner must be a 1-64 character session label ([A-Za-z0-9._:-])" >&2
       exit 2
     fi
-    # merge-check re-reads --reviewer back out of the posted comment body via a
-    # single-line regex (RECEIPT_REVIEWER_LINE_RE); a newline or CR embedded in
-    # --reviewer here would post fine but be read back differently there. Refuse
-    # it at the source instead of letting the two ends disagree.
-    case "$reviewer" in
-      *$'\n'*|*$'\r'*)
-        echo "receipt: --reviewer may not contain a newline or carriage return" >&2
-        exit 2
-        ;;
-    esac
-    # Reviewer eligibility is a tier rule, not prose: --reviewer's FIRST
-    # whitespace-delimited token must be a concrete model id outside
-    # REVIEWER_DENIED_TIERS. Only that token is read, so whatever follows it is
-    # free text. See reviewer_model_refusal above and docs/review-policy.md.
-    if ! reviewer_model_allowed "$reviewer"; then
-      echo "receipt: --reviewer refused — $(reviewer_model_refusal "$reviewer")" >&2
-      exit 2
-    fi
     body=$(cat "$body_file")
-    # This command writes the receipt's only marker. One smuggled in through the
-    # body or the reviewer would be read first and could approve another head.
-    case "$reviewer$body" in
-      *pr-review-loop:*)
-        echo "receipt: --reviewer and the body may not contain a pr-review-loop marker" >&2
-        exit 2
-        ;;
-    esac
+    refusal=$(receipt_input_refusal "$reviewer" "$body")
+    [ -z "$refusal" ] || { echo "receipt: $refusal" >&2; exit 2; }
     claim_completion=""
     if [ -n "$claim_id" ]; then
       claim_completion="

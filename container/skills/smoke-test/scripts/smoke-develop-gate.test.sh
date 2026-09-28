@@ -361,6 +361,16 @@ export STUB_FRONTEND_SHA="$OLD_SHA"
 export STUB_COMPARE_FILES='[{"filename":"docs/notes.md"}]'
 bash "$GATE" poll | jq -e '.data.trigger == "waiting_for_settled_build"' >/dev/null
 
+for bad in '/web/' ',,' 'web' 'web/,,shared/'; do
+  fresh_state
+  export STUB_FRONTEND_SHA="$OLD_SHA"
+  export STUB_COMPARE_FILES='[{"filename":"web/changed.ts"}]'
+  export SMOKE_GATE_FRONTEND_PATHS="$bad"
+  bash "$GATE" poll | jq -e '
+    .data.trigger == "gate_misconfigured" and .data.missing == ["SMOKE_GATE_FRONTEND_PATHS"]
+  ' >/dev/null
+done
+
 # 18. Red CI: one wake per stuck head after the alert window, never a re-spam.
 fresh_state
 export STUB_FRONTEND_CI=failure
@@ -1491,6 +1501,43 @@ mv_line "$OLD_T" run-late-append GO 2026-09-24T12:00:00Z
 bash "$GATE" poll >/dev/null
 [ "$(mv_state)" = '["b","run-2176","NO_GO","2026-09-24T17:52:05Z"]' ] || mv_fail "adopted an older line: $(mv_state)"
 unset SMOKE_GATE_HOLD_FILE
+
+# --- 39e. A finished freeze is adopted while develop is unsettled -----------
+# Adoption sat behind the settled check, so every poll that saw develop red or
+# moving exited before it: a campaign's verdict stayed unadopted, and the hold
+# unreconciled against it, for as long as develop kept moving. Adoption is
+# bookkeeping about a run that already ended, so it now runs first. The tamper
+# shield and the out-of-band rules are unchanged on this path.
+fresh_state
+UN_T="$(printf 'd%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$UN_T"
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+export STUB_FREEZE_JSON="{\"prNumber\":88,\"branch\":\"smoke/freeze-un\",\"freezeSha\":\"abc\",\"targetSha\":\"$UN_T\"}"
+LEDGER="$STATE_DIR2/handoff-ledger.jsonl"
+un_fail() { echo "39e: $1" >&2; exit 1; }
+un_state() { jq -c '[.completedRunId, .completedVerdict, .handoffFreezePr]' "$STATE_DIR2/develop-state.json"; }
+un_line() {  # <target> <freezePr> <run> <finishedAt>
+  jq -cn --arg t "$1" --argjson pr "$2" --arg run "$3" --arg at "$4" \
+    '{schemaVersion:1,targetSha:$t,freezeSha:"abc",freezePr:$pr,runId:$run,verdict:"NO_GO",finishedAt:$at}' >>"$LEDGER"
+}
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null || un_fail "freeze not opened"
+# develop goes red; a line naming ANOTHER freeze PR for our target is not adopted.
+export STUB_FRONTEND_CI=failure
+un_line "$UN_T" 99 rival-run 2026-09-27T10:00:00Z
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_settled_build"' >/dev/null ||
+  un_fail "red develop with a mismatched line did not wait"
+[ "$(un_state)" = '[null,null,88]' ] || un_fail "mismatched line adopted on a red develop: $(un_state)"
+# Our freeze's own line lands while develop is still red: adopted on this poll.
+un_line "$UN_T" 88 run-un-88 2026-09-27T11:00:00Z
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_settled_build"' >/dev/null ||
+  un_fail "adoption changed the unsettled line"
+[ "$(un_state)" = '["run-un-88","NO_GO",null]' ] || un_fail "finished freeze not adopted on a red develop: $(un_state)"
+# Out-of-band: no handoff open, a newer line for another target, develop red.
+un_line "$(printf 'e%.0s' $(seq 40))" 5 run-oob-red 2026-09-27T12:00:00Z
+bash "$GATE" poll >/dev/null
+[ "$(un_state)" = '["run-oob-red","NO_GO",null]' ] || un_fail "out-of-band line not adopted on a red develop: $(un_state)"
+unset STUB_FRONTEND_CI STUB_FREEZE_JSON
 
 # --- 40. `ack`: terminal disposition for an alarm wake ---------------------
 # Argument validation first. A typo'd trigger filed under a key nothing reads

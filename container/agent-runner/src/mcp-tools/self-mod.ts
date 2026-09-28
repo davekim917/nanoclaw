@@ -23,15 +23,8 @@ import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 /**
- * Fields forwarded to the host. The container is untrusted, so it does not
- * validate them: the host's precheck does, before any approval card, and
- * reports a rejection to the agent as a message.
- *
- * Deliberately a subset of what `parseMcpServerConfig` accepts. `cwd` has no
- * self-mod form that survives: the host's `parseCwd` rejects an absolute path
- * and its `validateMcpServers` strips the plugin forms without a `pluginRoot`.
- * `displayName` and `description` are persisted and shown to agents, but the
- * host's `requestAddMcpServerHold` does not put them on the approval card.
+ * Forwarded unvalidated: the container is untrusted and the host's precheck validates before any approval card.
+ * Deliberately a subset of what `parseMcpServerConfig` accepts: `cwd` has no self-mod form the host would keep.
  */
 const MCP_SERVER_FIELDS = ['type', 'command', 'args', 'env', 'url', 'headers', 'instructions'] as const;
 
@@ -154,9 +147,7 @@ export const listModels: McpToolDefinition = {
     const unavailable = unavailableModelInventory(provider);
     if (unavailable) return unavailable;
 
-    // Live source of truth: `opencode models` enumerates every reachable
-    // model given the container's auth.json + env. We then subtract the
-    // operator-curated deny list (central.db: denied_models).
+    // `opencode models` is the live source of truth; the operator deny list is subtracted from it.
     let opencodeOut: string;
     try {
       const proc = Bun.spawn(['opencode', 'models'], {
@@ -173,21 +164,16 @@ export const listModels: McpToolDefinition = {
       return err(`Failed to run opencode models: ${e instanceof Error ? e.message : String(e)}`);
     }
 
-    // Each non-blank line is a slug like "opencode-go/kimi-k2.6" or
-    // "nvidia/deepseek-ai/deepseek-v4-pro". Group by the FIRST path segment.
     const slugs = opencodeOut
       .split('\n')
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !l.startsWith('#'));
 
-    // Pull the deny list for this provider from central.db so we can filter.
     const central = getCentralDb();
     const agentGroupId = getConfig().agentGroupId;
     if (!agentGroupId) return err('No agent group ID — container not properly initialized.');
 
-    // Both tables come from the per-session central-db projection
-    // (src/db/per-agent-projections.ts). Missing tables on an older session
-    // shouldn't kill the tool — we still want the model list to surface.
+    // Missing projection tables on an older session must not kill the tool.
     let config: { provider: string | null; model: string | null; effort: string | null } | undefined;
     let deniedSet = new Set<string>();
     if (central) {
@@ -266,13 +252,8 @@ export const changeModel: McpToolDefinition = {
     }
 
     const provider = getConfig().provider;
-    // OpenCode slugs MUST be a well-formed provider-prefixed `<provider>/<id>`
-    // (the routing provider is derived from the prefix). Mirrors the host
-    // flag-parser's OPENCODE_VALID_MODEL_RE / isOpenCodeModelSlug exactly —
-    // replicated here because the container can't import the host module. A
-    // looser "contains a slash" check would let `opencode-go/`, `/kimi`, or
-    // garbage chars persist into session_state, after which splitModelSlug
-    // silently drops body.model while the prompt claims a switch.
+    // Mirrors the host flag-parser's OPENCODE_VALID_MODEL_RE exactly (the container can't import it): a looser check
+    // lets malformed slugs persist, after which splitModelSlug silently drops the model.
     if (provider === 'opencode' && !OPENCODE_MODEL_SLUG_RE.test(slug)) {
       return err(
         `"${slug}" is not a valid opencode model slug — use the provider-prefixed form ` +
@@ -280,9 +261,7 @@ export const changeModel: McpToolDefinition = {
       );
     }
 
-    // Operator deny list (central.db projection) — block wrong-subscription models.
-    // Match the slug as typed, lowercased, and resolved: a family word (`sol`,
-    // `ASTRA`) runs its current concrete id, so a denial of either must hold.
+    // Deny-list match on the slug as typed, lowercased, and resolved: a family word runs its concrete id.
     const central = getCentralDb();
     if (central) {
       try {
@@ -302,10 +281,7 @@ export const changeModel: McpToolDefinition = {
       }
     }
 
-    // Behave EXACTLY like the user's `-m`/`-e` flags: set the SESSION-sticky model
-    // (+ effort) in session_state. The provider applies it per-turn on the NEXT
-    // turn (this turn finishes on the prior model). No container restart, no
-    // group-DB change — seamless and session-scoped, identical to `-m`.
+    // Same as the user's `-m`/`-e`: a session-sticky model applied from the NEXT turn, no restart.
     setStickyModel(slug);
     if (effort) setStickyEffort(effort);
     log(`change_model: session sticky → ${slug}${effort ? ` (effort=${effort})` : ''}`);
@@ -316,9 +292,7 @@ export const changeModel: McpToolDefinition = {
   },
 };
 
-// `list_models` shells out to OpenCode and therefore cannot describe a Codex
-// or Claude catalog. Register the shared tools at import time, then let the
-// MCP barrel add that provider-specific tool after it has loaded config.
+// `list_models` shells out to OpenCode, so it is registered only for that provider, after config loads.
 registerTools([installPackages, addMcpServer, changeModel]);
 
 export function registerProviderSpecificSelfModTools(provider: string = getConfig().provider): void {

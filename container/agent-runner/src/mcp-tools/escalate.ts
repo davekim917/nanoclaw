@@ -1,13 +1,4 @@
-/**
- * escalate_to_owner — the unmutable "was this actually you?" lane.
- *
- * Writes a kind='system' outbound row, which the physical chat budget
- * (muteChat / chatLimit) never touches by construction — a muted watcher or
- * send-capped task can still ask a human to confirm a suspicious
- * instruction. The host routes the question as an approval card to the
- * owner/admin DM chain; the answer comes back as a system message in this
- * session. Host-side rate limit: 3 per session per hour.
- */
+/** escalate_to_owner: kind='system' rows are never chat-budgeted, so a muted or send-capped session can still ask a human to confirm a suspicious instruction. Host rate limit: 3 per session per hour. */
 import { randomUUID } from 'node:crypto';
 
 import { writeMessageOut } from '../db/messages-out.js';
