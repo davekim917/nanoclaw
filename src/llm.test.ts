@@ -63,6 +63,14 @@ describe('callHaiku', () => {
     else process.env.HTTP_PROXY = originalHttpProxy;
   });
 
+  it('calls Anthropic directly even when a proxy is configured, so the gateway cannot swap the key', async () => {
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
+    fetchMock.mockResolvedValueOnce(jsonResponse({ content: [{ type: 'text', text: 'ok' }] }));
+
+    expect(await callHaiku('hello')).toBe('ok');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('makes one request and throws when the only configured key fails', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({}, { status: 429, headers: { 'retry-after': '2' } }));
 
