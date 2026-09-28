@@ -1,10 +1,8 @@
 /**
- * The remote-boundary job's decision logic, exercised without git, a network,
- * a real Slack workspace or systemd. `node:child_process` and `notifyOwner` are
- * mocked for the whole file: the `pnpm run check:public-boundary` subprocess is
- * never run (faking its verdict would test the fake), but the argv that reaches
- * it and `main()`'s git/worktree sequence around it are pinned against those
- * mocks. Everything else takes injected fakes.
+ * The remote-boundary job's logic, run without git, a network, Slack or systemd.
+ * `node:child_process` and `notifyOwner` are mocked file-wide: the checker never
+ * runs (faking its verdict would test the fake), but its argv and `main()`'s
+ * git/worktree sequence are pinned against those mocks.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -190,8 +188,7 @@ describe('scanSnapshot', () => {
     afterEach(() => childProcess.spawnSync.mockReset());
 
     it('runs an index scan of the snapshot from the install root, with no --allowlist', () => {
-      // An --allowlist pointing into the install checkout would exempt edits
-      // that were never committed to the tree being scanned.
+      // An --allowlist into the install checkout would exempt edits never committed to the snapshot.
       childProcess.spawnSync.mockReturnValue({ status: 0, stderr: '' });
       expect(scanSnapshot('/tmp/snapshot')).toEqual({ code: 0, detail: '' });
       expect(childProcess.spawnSync).toHaveBeenCalledTimes(1);
