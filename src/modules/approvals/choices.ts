@@ -218,10 +218,6 @@ function receiptReleaseScopeJson(approval: PendingApproval): string | null {
   }
 }
 
-/**
- * Dispatch through `instance ?? channel_type` (dispatch is exact-key), and log
- * failures loudly: the row is gone, so a failed edit leaves dead live-looking buttons.
- */
 function payloadApprovers(approval: PendingApproval): string[] | undefined {
   try {
     const approvers = (JSON.parse(approval.payload) as { approvers?: unknown }).approvers;
