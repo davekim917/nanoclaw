@@ -197,7 +197,7 @@ describe('pinDocs', () => {
     commit(root, 'change and note');
 
     expect(pinDocs(root, [NOTE], [])).toEqual([
-      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/both .* match/) }),
+      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/same number .* different code/) }),
     ]);
   });
 
@@ -211,7 +211,7 @@ describe('pinDocs', () => {
     commit(root, 'change b and note');
 
     expect(pinDocs(root, [NOTE], [])).toEqual([
-      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/both .* match/) }),
+      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/same number .* different code/) }),
     ]);
   });
 
@@ -444,6 +444,18 @@ describe('pinDocs', () => {
     commit(root, 'drop the new note, reword the old');
 
     expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
+  });
+
+  it("prefers the version holding more of the note's identifiers over a later docs-only commit", () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'if (drainQueue()) skip();\n');
+    const described = commit(root, 'code');
+    write(root, 'src/code.ts', 'if (drainQueue()) retry();\n');
+    commit(root, 'change the code');
+    write(root, NOTE, '- old `drainQueue` at `src/code.ts:1` called `skip` and dropped items\n');
+    commit(root, 'late note');
+
+    expect(pinDocs(root, [NOTE], [])).toEqual([expect.objectContaining({ kind: 'pinned', sha: described })]);
   });
 
   it('matches a named identifier whole, not inside a longer one', () => {

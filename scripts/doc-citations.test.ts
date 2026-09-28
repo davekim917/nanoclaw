@@ -16,7 +16,8 @@ enforceHermeticity();
  * Every `path:line` citation in the repo's markdown (skills, docs, top-level guides) must still land inside its file:
  * at HEAD, or at the commit named by a trailing `at <sha>`. docs/review-notes has its own check
  * (review-notes.test.ts). The docs below are frozen records of past work whose citations described the code of their
- * day; they are not maintained against HEAD.
+ * day; they are not maintained against HEAD. A citation names a path with an extension or a directory
+ * (`container/Dockerfile:3`); a bare extensionless `Dockerfile:3` is not read as one.
  */
 const EXCLUDED_DOC_PREFIXES = ['docs/specs/', 'docs/retros/', 'docs/review-notes', 'CHANGELOG.md', 'PROGRESS.md'];
 
@@ -90,20 +91,6 @@ function docCitationProblems(root: string, docs?: readonly string[]): string[] {
           if (check.ok === 'skipped') console.warn(`doc-citations: skipping ${check.reason}; not checked`);
           else if (!check.ok) problems.push(`${where}: ${check.problem}`);
         }
-      for (const [, name, start, end] of text.matchAll(/(?<![\w./-])([A-Za-z][\w-]*):(\d+)(?:-(\d+))?(?![\w.])/g)) {
-        const matches = [...tracked].filter((file) => path.posix.basename(file) === name);
-        if (matches.length !== 1) continue;
-        const span = end ? `${start}-${end}` : start;
-        const link = {
-          file: matches[0],
-          span,
-          startLine: Number(start),
-          endLine: Number(end ?? start),
-          pinnedSha: null,
-        };
-        const check = checkLineCitation(root, link, `\`${name}:${span}\``);
-        if (check.ok === false) problems.push(`${doc}:${index + 1}: ${check.problem}`);
-      }
     });
   }
   return problems;
@@ -150,16 +137,6 @@ describe('docCitationProblems', () => {
     });
     expect(docCitationProblems(root, ['doc.md'])).toEqual([
       'doc.md:1: cites `container/Dockerfile:99`, but container/Dockerfile has only 1 lines',
-    ]);
-  });
-
-  it('checks a bare extensionless file name that exactly one tracked file has', () => {
-    const { root } = repo({
-      Dockerfile: 'FROM node\n',
-      'doc.md': '`Dockerfile:1`, `Dockerfile:999`, localhost:8080\n',
-    });
-    expect(docCitationProblems(root, ['doc.md'])).toEqual([
-      'doc.md:1: cites `Dockerfile:999`, but Dockerfile has only 1 lines',
     ]);
   });
 

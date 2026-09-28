@@ -10,11 +10,11 @@ const MAX_EARLIER_VERSIONS = 5;
 const USAGE =
   'usage: pnpm exec tsx scripts/pin-doc-citations.ts [--doc <path>]... [--rev <rev>] [--dry-run] [<cited file>...]\n' +
   '  Appends " at <sha>" to each unpinned file:line citation (of the listed files, or all) in the docs\n' +
-  '  (default: docs/review-notes.md and docs/review-notes/*.md). The sha is the newest revision, from the\n' +
-  "  commit that introduced the citation back through the cited file's earlier versions, whose cited lines\n" +
-  '  hold an identifier the note names next to the citation. A citation with no such identifier, no\n' +
-  '  matching revision, or two different matching versions around its own commit is refused and left\n' +
-  '  for a manual pin; the run then exits 1. Each doc must match --rev apart from pins: commit a new note first.';
+  '  (default: docs/review-notes.md and docs/review-notes/*.md). The sha is the revision, from the commit\n' +
+  "  that introduced the citation back through the cited file's earlier versions, whose cited lines hold\n" +
+  "  the most identifiers the note names beside the citation; the note's own commit wins a tie unless it\n" +
+  '  changed the cited file. No identifier, no matching revision, or any other tie is refused and left for\n' +
+  '  a manual pin, and the run exits 1. Each doc must match --rev apart from pins: commit a new note first.';
 
 export type PinOutcome =
   | { kind: 'pinned'; doc: string; line: number; citation: string; sha: string; origin: string }
@@ -159,28 +159,24 @@ function choosePin(
   if (anchors.length === 0)
     return { refused: 'the note names no identifier next to it to check the cited lines against' };
   const cache = new Map<string, string[] | null>();
-  const view = (rev: string): string[] | null => {
+  const scored = candidates.map((rev) => {
     const texts = links.map((link) => citedText(linesAt(root, rev, link.file, cache), link));
-    return texts.every((text): text is string => text !== null) ? texts : null;
-  };
-  const matches = (texts: string[] | null): boolean =>
-    texts !== null && texts.every((text) => anchors.some((anchor) => mentions(text, anchor)));
-  const index = candidates.findIndex((rev) => matches(view(rev)));
-  if (index === -1)
+    const valid = texts.every((text) => text !== null && anchors.some((anchor) => mentions(text, anchor)));
+    const score = valid ? anchors.filter((anchor) => texts.some((text) => mentions(text!, anchor))).length : 0;
+    return { rev, texts: JSON.stringify(texts), score };
+  });
+  const best = Math.max(...scored.map((candidate) => candidate.score));
+  if (best === 0)
     return {
       refused: `no revision among ${candidates.map((rev) => shortSha(root, rev)).join(', ')} has ${anchors.join(', ')} at the cited lines`,
     };
-  if (index === 0 && originTouchedFile && candidates.length > 1) {
-    const origin = view(candidates[0]);
-    const before = view(candidates[1]);
-    if (matches(before) && JSON.stringify(before) !== JSON.stringify(origin))
-      return {
-        refused:
-          `both ${shortSha(root, candidates[0])} (the note's own commit) and ${shortSha(root, candidates[1])} (just before it) ` +
-          'match with different code at the cited lines',
-      };
-  }
-  return { sha: candidates[index] };
+  const top = scored.filter((candidate) => candidate.score === best);
+  const originWinsTie = top[0].rev === candidates[0] && !originTouchedFile;
+  if (new Set(top.map((candidate) => candidate.texts)).size > 1 && !originWinsTie)
+    return {
+      refused: `${top.map((candidate) => shortSha(root, candidate.rev)).join(' and ')} hold the same number of the note's identifiers at the cited lines with different code`,
+    };
+  return { sha: top[0].rev };
 }
 
 function runFiles(run: CitationRun): string[] {
