@@ -420,11 +420,12 @@ if [ -e "$RUN_DIR/$IDENTITY_REL" ] &&
   REFREEZE_WHY="since the pair was frozen LATE (contract generation %s is not above the snapshot taken at the freeze) — this lane ran before any pair was frozen, so its evidence is bound to no build and cannot count"
 fi
 if [ -e "$RUN_DIR/$IDENTITY_REL" ]; then
-  refreeze_result="$(jq -cs -L "$SCRIPT_DIR" --slurpfile c "$CONTRACT" '
+  run_abs="$(cd "$RUN_DIR" && pwd)"
+  refreeze_result="$(cd "$SCRIPT_DIR" && jq -cs -L "$SCRIPT_DIR" --slurpfile c "$run_abs/completion-contract.json" '
     include "refreeze-lanes";
     if length != 1 then {error: "identity.json is not exactly one JSON document"}
     else .[0] | rl_stale_after_refreeze(if ($c | length) == 1 then $c[0] else "unparsable" end) end
-  ' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null)" ||
+  ' "$run_abs/$IDENTITY_REL" 2>/dev/null)" ||
     refreeze_result='{"error":"identity.json is not valid JSON"}'
   refreeze_error="$(jq -r '.error // empty' <<<"$refreeze_result")"
   if [ -n "$refreeze_error" ]; then

@@ -61,6 +61,7 @@
 # yet snapshots no lanes (none was dispatched); one with markers but no contract refuses.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+jq_here() { (cd "$HERE" && jq -L "$HERE" "$@"); }
 FE="${SMOKE_GATE_FRONTEND_SERVICE:-}"
 BE="${SMOKE_GATE_BACKEND_SERVICE:-}"
 PROVIDER="${SMOKE_PREVIEW_PROVIDER:-render}"
@@ -233,7 +234,7 @@ case "${1:-}" in
     if [ -n "$MARKED" ]; then
       [ "$CJSON" != null ] || {
         echo "REFUSED: lane markers exist under $RUN but there is no completion contract — cannot tell which lanes must be redispatched after this late freeze; nothing frozen (exit 2)" >&2; exit 2; }
-      SNAP="$(jq -cn -L "$HERE" --argjson c "$CJSON" 'include "refreeze-lanes"; $c | rl_lane_snapshot')" || {
+      SNAP="$(jq_here -cn --argjson c "$CJSON" 'include "refreeze-lanes"; $c | rl_lane_snapshot')" || {
         echo "REFUSED: could not snapshot the contract's lane generations for a late freeze — nothing frozen (exit 2)" >&2; exit 2; }
       SNAP_ERR="$(jq -r '.error // empty' <<<"$SNAP")"
       [ -z "$SNAP_ERR" ] || { echo "REFUSED: $SNAP_ERR — cannot snapshot lane generations for a late freeze; nothing frozen (exit 2)" >&2; exit 2; }
@@ -305,7 +306,7 @@ PY
       done
       CJSON=null
     fi
-    SNAP="$(jq -cn -L "$HERE" --argjson c "$CJSON" 'include "refreeze-lanes"; $c | rl_lane_snapshot')" || {
+    SNAP="$(jq_here -cn --argjson c "$CJSON" 'include "refreeze-lanes"; $c | rl_lane_snapshot')" || {
       echo "REFUSED: could not snapshot the contract's lane generations — nothing re-frozen (exit 2)" >&2; exit 2; }
     SNAP_ERR="$(jq -r '.error // empty' <<<"$SNAP")"
     [ -z "$SNAP_ERR" ] || { echo "REFUSED: $SNAP_ERR — cannot snapshot lane generations; nothing re-frozen (exit 2)" >&2; exit 2; }
@@ -365,7 +366,7 @@ PY
       # Redispatch after re-freeze (header). Checked first, because it names the remedy the
       # journal checks below cannot see. With no re-freeze this reads nothing but
       # identity.json, so a run that never re-froze behaves exactly as before.
-      REFROZEN="$(jq -rs -L "$HERE" 'include "refreeze-lanes"; if length == 1 then (.[0] | rl_refrozen) else error("not one JSON document") end' "$F" 2>/dev/null)"
+      REFROZEN="$(jq_here -rs 'include "refreeze-lanes"; if length == 1 then (.[0] | rl_refrozen) else error("not one JSON document") end' 2>/dev/null < "$F")"
       case "$REFROZEN" in
         false) ;;
         true)
@@ -373,7 +374,7 @@ PY
           if [ -e "$C" ]; then
             CJSON="$(jq -cs 'if length == 1 then .[0] else "unparsable" end' "$C" 2>/dev/null)" || CJSON='"unparsable"'
           else CJSON=null; fi
-          RES="$(jq -cs -L "$HERE" --argjson c "$CJSON" 'include "refreeze-lanes"; .[0] | rl_stale_after_refreeze($c)' "$F" 2>/dev/null)" || {
+          RES="$(jq_here -cs --argjson c "$CJSON" 'include "refreeze-lanes"; .[0] | rl_stale_after_refreeze($c)' 2>/dev/null < "$F")" || {
             echo "finish: unreadable — could not evaluate the re-freeze lane snapshot (exit 2)"; exit 2; }
           ERR="$(jq -r '.error // empty' <<<"$RES")"
           [ -z "$ERR" ] || { echo "finish: unreadable — $ERR (exit 2)"; exit 2; }
