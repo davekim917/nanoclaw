@@ -42,8 +42,11 @@ occurrence of a flag declared `multiple`; any other flag given twice is refused 
 - `--compose separate` (the default for two or more fields): each field is its own secret `<name>-<field>`
   with its own header, `--field 'name|Label|Header[|Format]'` (format default `{value}`); `--header` and
   `--value-format` are refused. Headers must differ. A blank optional field stores nothing. Grants apply to
-  every secret stored. If one write fails after another succeeded, the intake fails naming what was stored,
-  ungranted: rotate it or grant it by hand.
+  every secret stored. If one write fails after another succeeded, the intake fails naming what was
+  written; a group admin's partial store still sends the owner notice. On a create, the written secrets are
+  ungranted: request each missing one as a single-field intake under its full name (`<name>-<field>`) and
+  grant the rest with `ncl secrets grant`. On a rotation the written values are already live, so the pair
+  may be mismatched until the missing field is rotated.
 
 A rotation repeats the field names (and `--compose`) without headers, since the vault's values are
 write-only and the form cannot tell their shape. Every named secret must exist. A separate rotation marks

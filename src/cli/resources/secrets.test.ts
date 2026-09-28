@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { getResource } from '../crud.js';
+import { lookup } from '../registry.js';
 import './secrets.js';
 
 describe('ncl secrets arguments', () => {
@@ -12,5 +13,10 @@ describe('ncl secrets arguments', () => {
     expect(declared).toContain('groups');
     expect(declared).not.toContain('group');
     expect(declared).not.toContain('agent_group_id');
+  });
+
+  it('lets only --field arrive as a list, so dispatch refuses any other repeated flag', () => {
+    expect(lookup('secrets-intake')?.listArgs).toEqual(['field']);
+    expect(lookup('secrets-grant')?.listArgs).toEqual([]);
   });
 });

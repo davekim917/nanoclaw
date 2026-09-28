@@ -649,7 +649,7 @@ describe('declared fields', () => {
     expect(getSecretIntake(intakeId)?.status).toBe('pending');
   });
 
-  it('reports the secrets already stored when a later one fails, and grants none', async () => {
+  it('reports the secrets already stored when a later one fails, grants none, and still tells the owner', async () => {
     const { intakeId } = await startSecretIntake({ ...separate, caller: agentCaller });
     const { createOnecliSecret } = await import('../../onecli-secret-writer.js');
     vi.mocked(createOnecliSecret).mockImplementationOnce(async (spec, value) => {
@@ -658,10 +658,13 @@ describe('declared fields', () => {
       return { id: 'x', name: spec.name };
     });
     h.createFails = true;
-    await hooks.submit(intakeId, 'UOWNER', { api_key: SECRET, api_secret: API_SECRET });
+    await hooks.submit(intakeId, 'UADMIN1', { api_key: SECRET, api_secret: API_SECRET });
     await settle();
     expect(getSecretIntake(intakeId)?.status).toBe('failed');
-    expect(getSecretIntake(intakeId)?.detail).toContain('"Example-API-api_key" stored, ungranted');
+    const notice = h.deliveries.find((d) => d.args[1] === 'slack:D1');
+    expect(JSON.parse(notice?.args[4] as string).text).toContain('stored secret "Example-API-api_key" for agent');
+    expect(JSON.parse(notice?.args[4] as string).text).not.toContain('Example-API-api_secret');
+    expect(getSecretIntake(intakeId)?.detail).toContain('"Example-API-api_key" stored but granted to no one');
     expect(h.groupGrants).toEqual([]);
     expect(everythingObservable()).not.toContain(API_SECRET);
   });

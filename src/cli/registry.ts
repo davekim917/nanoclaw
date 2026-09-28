@@ -54,6 +54,7 @@ export type CommandDef<TArgs = unknown, TData = unknown> = {
    * Custom operations return ad-hoc shapes and leave this undefined.
    */
   generic?: 'list' | 'get';
+  listArgs?: readonly string[];
   /** Validates `frame.args` and produces the typed handler input. Throws on invalid. */
   parseArgs: (raw: Record<string, unknown>) => TArgs;
   handler: (args: TArgs, ctx: CallerContext) => Promise<TData>;

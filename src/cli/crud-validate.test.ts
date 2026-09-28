@@ -187,8 +187,7 @@ describe('validateArgs repeated flags', () => {
     expect(validateArgs(defs, { field: 'a' }).field).toEqual(['a']);
   });
 
-  it('refuses a repeat of a flag that is not repeatable, and a value-less repeatable one', () => {
-    expect(() => validateArgs(defs, { name: ['a', 'b'] })).toThrow('--name was given more than once');
+  it('refuses a value-less repeatable flag', () => {
     expect(() => validateArgs(defs, { field: ['a', true] })).toThrow('--field requires a value');
   });
 });

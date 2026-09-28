@@ -577,7 +577,7 @@ async function noticeOwners(intake: Intake, namespacedUserId: string, stored: st
     const target = await pickApprovalDelivery(await pickOwnersFirst(null), '');
     if (!adapter || !target) throw new Error('no owner DM is reachable');
     const who = (await getUser(namespacedUserId))?.display_name || namespacedUserId;
-    const where = targetLines(intake).join(' ');
+    const where = targetLines({ ...intake, targets: intake.targets.filter((x) => stored.includes(x.name)) }).join(' ');
     const text = `🔐 ${who} stored ${quoted(stored)} for agent "${intake.requester?.agentName}". ${where} ${grantsLine(intake.groups, intake.workgroups, intake.rotate)}.`;
     await adapter.deliver(
       target.messagingGroup.channel_type,
@@ -621,7 +621,9 @@ function quoted(names: string[]): string {
   return `secret${names.length > 1 ? 's' : ''} ${names.map((n) => `"${n}"`).join(', ')}`;
 }
 
-async function writeVault(writes: Array<{ target: VaultTarget; value: string }>): Promise<string[]> {
+async function writeVault(
+  writes: Array<{ target: VaultTarget; value: string }>,
+): Promise<{ stored: string[]; failure: { name: string; err: unknown } | null }> {
   const stored: string[] = [];
   for (const { target, value } of writes) {
     try {
@@ -633,13 +635,11 @@ async function writeVault(writes: Array<{ target: VaultTarget; value: string }>)
         await updateOnecliSecretValue(existing, value);
       }
     } catch (err) {
-      if (!stored.length) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      throw new Error(`${quoted(stored)} stored, ungranted; then "${target.name}" failed: ${reason}`, { cause: err });
+      return { stored, failure: { name: target.name, err } };
     }
     stored.push(target.name);
   }
-  return stored;
+  return { stored, failure: null };
 }
 
 async function completeIntake(
@@ -655,8 +655,14 @@ async function completeIntake(
     await deliverToCard(intake, 'chat', { text: `${refusal} Nothing was stored; the request is still open.` });
     return;
   }
-  const stored = await writeVault(writes);
-  if (authority === 'group-admin') await noticeOwners(intake, namespacedUserId, stored);
+  const { stored, failure } = await writeVault(writes);
+  if (authority === 'group-admin' && stored.length) await noticeOwners(intake, namespacedUserId, stored);
+  if (failure) {
+    if (!stored.length) throw failure.err;
+    const reason = failure.err instanceof Error ? failure.err.message : String(failure.err);
+    const done = intake.rotate ? 'replaced, now live for every holder' : 'stored but granted to no one';
+    throw new Error(`${quoted(stored)} ${done}; then "${failure.name}" failed: ${reason}`, { cause: failure.err });
+  }
 
   const failedGrants: string[] = [];
   for (const name of stored) {
