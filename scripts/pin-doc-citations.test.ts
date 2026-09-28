@@ -474,6 +474,22 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
   });
 
+  it('compares against every earlier version, not only the recent ones', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() { return false; }\nx\n');
+    commit(root, 'code');
+    write(root, 'src/code.ts', 'function drainQueue() { return true; }\nx\n');
+    commit(root, 'fix');
+    for (let n = 0; n < 6; n++) {
+      write(root, 'src/code.ts', `function drainQueue() { return true; }\nx${n}\n`);
+      commit(root, `touch line 2 (${n})`);
+    }
+    write(root, NOTE, 'Before the fix, `drainQueue` at `src/code.ts:1` always returned false.\n');
+    commit(root, 'late note');
+
+    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

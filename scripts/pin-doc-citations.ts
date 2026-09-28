@@ -6,12 +6,12 @@ import path from 'node:path';
 import { walkArgs } from './lib/cli-args.js';
 import { citationRuns, gitRead, type CitationRun, type FileLineCitation } from './lib/doc-citations.js';
 
-const MAX_EARLIER_VERSIONS = 5;
+const MAX_EARLIER_VERSIONS = 1000;
 const USAGE =
   'usage: pnpm exec tsx scripts/pin-doc-citations.ts [--doc <path>]... [--rev <rev>] [--dry-run] [<cited file>...]\n' +
   '  Appends " at <sha>" to each unpinned file:line citation (of the listed files, or all) in the docs\n' +
   '  (default: docs/review-notes.md and docs/review-notes/*.md). The sha is the revision, from the commit\n' +
-  "  that introduced the citation back through the cited file's earlier versions, whose cited lines hold\n" +
+  '  that introduced the citation back through every earlier version of the cited file, whose cited lines hold\n' +
   '  the most identifiers the note names beside the citation. No identifier, no matching revision, or a\n' +
   '  tie between different versions of the cited lines is refused and left for a manual pin, and the run\n' +
   '  exits 1. Each doc must match --rev apart from pins: commit a new note first.';
@@ -121,10 +121,9 @@ function newestOf(root: string, shas: readonly string[]): string | null {
   return shas.find((sha) => shas.every((other) => isAncestor(other, sha))) ?? null;
 }
 
-function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] {
-  const touching = (gitRead(root, ['log', '--format=%H', `-n${MAX_EARLIER_VERSIONS}`, origin, '--', ...files]) ?? '')
-    .split('\n')
-    .filter(Boolean);
+function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] | null {
+  const touching = (gitRead(root, ['log', '--format=%H', origin, '--', ...files]) ?? '').split('\n').filter(Boolean);
+  if (touching.length > MAX_EARLIER_VERSIONS) return null;
   const revs = [origin, ...touching.map((sha) => `${sha}^`)];
   const seenVersions = new Set<string>();
   const out: string[] = [];
@@ -232,6 +231,10 @@ export function pinDocs(
           continue;
         }
         const candidates = candidateRevisions(root, origin, files);
+        if (!candidates) {
+          refuse(`the cited files have more than ${MAX_EARLIER_VERSIONS} earlier versions to compare`);
+          continue;
+        }
         const runStart = text[head.index - 1] === '`' ? head.index - 1 : head.index;
         const anchors = noteAnchors(citationClause(text, runStart, run.end), files);
         const decision = choosePin(root, run.links, anchors, candidates);

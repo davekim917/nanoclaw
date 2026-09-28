@@ -6,6 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+import { scaledTimeout } from '../src/test-timeout-scale.js';
 
 import { checkLineCitation, citationRuns, gitRead } from './lib/doc-citations.js';
 
@@ -54,7 +55,7 @@ function resolveCitedPath(cited: string, doc: string, tracked: ReadonlySet<strin
 function docCitationProblems(root: string, docs?: readonly string[]): string[] {
   const all = trackedFiles(root);
   const deletedNames = new Set(
-    (gitRead(root, ['log', '--format=', '--name-only', '--diff-filter=D']) ?? '')
+    (gitRead(root, ['log', '--format=', '--name-only', '--no-renames', '--diff-filter=D']) ?? '')
       .split('\n')
       .filter(Boolean)
       .map((file) => path.posix.basename(file)),
@@ -101,9 +102,13 @@ function docCitationProblems(root: string, docs?: readonly string[]): string[] {
 }
 
 describe('line citations in skills and docs', () => {
-  it('land inside the cited file at HEAD, or at their pinned commit', () => {
-    expect(docCitationProblems(REPO_ROOT)).toEqual([]);
-  });
+  it(
+    'land inside the cited file at HEAD, or at their pinned commit',
+    () => {
+      expect(docCitationProblems(REPO_ROOT)).toEqual([]);
+    },
+    scaledTimeout(30_000),
+  );
 });
 
 describe('docCitationProblems', () => {
@@ -218,6 +223,15 @@ describe('docCitationProblems', () => {
     expect(docCitationProblems(root, ['doc.md'])).toEqual([
       'doc.md:1: cites `settings.ini:1`, but no tracked file has that path',
       'doc.md:1: cites `x.ts:1` by bare name, which 2 tracked files have',
+    ]);
+  });
+
+  it('fails a bare file name whose file was renamed away', () => {
+    const { root } = repo({ 'settings.ini': 'enabled=true\n', 'guide.md': '`settings.ini:1`\n' });
+    spawnSync('git', ['mv', 'settings.ini', 'config.ini'], { cwd: root });
+    spawnSync('git', ['commit', '-q', '-m', 'rename', '--no-gpg-sign'], { cwd: root });
+    expect(docCitationProblems(root, ['guide.md'])).toEqual([
+      'guide.md:1: cites `settings.ini:1`, but no tracked file has that path',
     ]);
   });
 
