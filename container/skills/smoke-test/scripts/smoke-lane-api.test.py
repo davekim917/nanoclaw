@@ -35,7 +35,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
             out = {"access_token": "h.eyJzdWIiOiAiMSJ9.s"}
         elif self.command == "POST":
             new_id = "fx-{}".format(900 + len(Backend.store))
-            Backend.store["{}/{}".format(self.path, new_id)] = body
+            Backend.store["{}/{}".format(self.path, new_id)] = dict(body or {}, id=new_id)
             out = {"owner": {"id": 191}, "report": {"id": new_id}}
         elif self.command == "GET" and self.path in Backend.store:
             out = {"data": Backend.store[self.path]}
@@ -184,15 +184,22 @@ class Guard(unittest.TestCase):
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             h.own("c7", "M", "/reports", 191, name)
         self.assertIn("unverified-fixture", str(ctx.exception), "the owner id in the response is not the object")
+        Backend.store["/accounts/4401"] = {"id": 4401, "name": "Existing client", "notes": [{"name": name}]}
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             h.own("c8", "M", "/accounts", 4401, name)
-        self.assertIn("unverified-fixture", str(ctx.exception))
+        self.assertIn("unverified-fixture", str(ctx.exception), "a QA-named child does not make its parent ours")
+        Backend.store["/accounts/4402"] = {"id": "fx-777", "name": name}
+        with self.assertRaises(api.WriteScopeRefused):
+            h.own("c8b", "M", "/accounts", 4402, name)
+        quoted = PREFIX + 'say "hi"'
+        _, qjs = h.call("c8q", "M", "POST", "/reports", {"name": quoted})
+        h.own("c8r", "M", "/reports", qjs["report"]["id"], quoted)
         before = len(Backend.seen)
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             h.own("c9", "M", "/reports", js["report"]["id"], PREFIX)
         self.assertIn("not-a-qa-name", str(ctx.exception))
         self.assertEqual(len(Backend.seen), before, "a bad name is refused before any read")
-        self.assertEqual(len(api.ledger_ids(self.run_dir)), 1)
+        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2)
         with open(os.path.join(h.out, "c7-own.json")) as f:
             self.assertTrue(json.load(f)["harnessBlocked"])
 
@@ -232,6 +239,14 @@ class Guard(unittest.TestCase):
         self.assertIn("unreadable-scope", str(ctx.exception))
         os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
         self.pin()
+        real = os.path.join(self.tmp.name, "scope-copy.json")
+        os.rename(os.path.join(self.run_dir, api.SCOPE_FILE), real)
+        os.symlink(real, os.path.join(self.run_dir, api.SCOPE_FILE))
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            api.judge(self.run_dir, "POST", "/notes", {"name": PREFIX + "n"})
+        self.assertIn("no-scope", str(ctx.exception), "a symlinked scope is refused, not followed")
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        os.rename(real, os.path.join(self.run_dir, api.SCOPE_FILE))
         with open(os.path.join(self.run_dir, api.LEDGER_FILE), "w") as f:
             f.write("not json\n")
         with self.assertRaises(api.WriteScopeRefused) as ctx:

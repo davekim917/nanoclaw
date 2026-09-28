@@ -162,6 +162,18 @@ def judge(run_dir, method, path, body=None):
     return "write"
 
 
+def names_itself(response, fixture_id, name):
+    if not isinstance(response, dict):
+        return False
+    inner = response.get("data")
+    if not isinstance(inner, dict):
+        wrapped = [v for v in response.values() if isinstance(v, dict)]
+        inner = wrapped[0] if len(wrapped) == 1 else None
+    matches = [d for d in (response, inner) if isinstance(d, dict)
+               and str(d.get("id")) == str(fixture_id) and name in (d.get(k) for k in NAME_KEYS)]
+    return len(matches) == 1
+
+
 def redacted(body):
     if isinstance(body, dict):
         return {k: "<redacted>" if SECRET_KEY.search(k) else redacted(v) for k, v in body.items()}
@@ -214,7 +226,7 @@ class H:
 
     def guarded(self, tag, seat, method, path, body):
         try:
-            return judge(self.run_dir, method, path, body)
+            judge(self.run_dir, method, path, body)
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)
 
@@ -224,7 +236,7 @@ class H:
         if not (isinstance(name, str) and name.startswith(prefix) and len(name) > len(prefix)):
             self.refuse(tag, seat, "OWN", path, None, WriteScopeRefused("not-a-qa-name name={!r}".format(name)))
         code, js = self.call(tag, seat, "GET", path)
-        if not (200 <= code < 300 and name in json.dumps(js, ensure_ascii=False)):
+        if not (200 <= code < 300 and names_itself(js, fixture_id, name)):
             self.refuse(tag + "-own", seat, "OWN", path, None,
                         WriteScopeRefused("unverified-fixture status={} (the object does not carry {})".format(code, name)))
         record_fixture(self.run_dir, create_path, fixture_id, name)

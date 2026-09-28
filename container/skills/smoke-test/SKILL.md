@@ -393,8 +393,9 @@ account/tenant/brand in a body or query key; on a POST, a top-level
 `name`/`title`/`label`/`filename` starting `QA-<runId>-`; or a path under
 `<create path>/<id>` for a fixture the lane registered with `h.own(tag, seat,
 create_path, id, name)`, which reads `<create path>/<id>` back and ledgers it
-(`<run-dir>/write-scope-fixtures.ndjson`) only when that object carries the
-QA name. Create responses are never parsed for ownership, so call `own` after
+(`<run-dir>/write-scope-fixtures.ndjson`) only when the object read back (at
+the root, under `data`, or in its one wrapper) has that id and exactly that
+name; a QA-named child or mention does not count. Create responses are never parsed for ownership, so call `own` after
 a create and before editing or deleting the fixture. One backend per run, so
 the ledger keeps no origin. Foreign: any other digit-bearing path segment (only a
 leading `/v<n>/` is exempt), or an account/tenant/brand key outside the
