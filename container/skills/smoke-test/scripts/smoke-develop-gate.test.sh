@@ -2320,6 +2320,7 @@ land_fallback "fetch failed" "$(activity "$LAND_SHA" "$LANDED_OLD")" 1
 land_fallback "newest update names another sha" "$(activity "$LAND_SHA2" "$LANDED_OLD")" 0
 land_fallback "landed in the future" "$(activity "$LAND_SHA" "$(ago -3600)")" 0
 land_fallback "unparseable timestamp" "$(activity "$LAND_SHA" "yesterday")" 0
+land_fallback "sub-second timestamp" "$(activity "$LAND_SHA" "${LANDED_OLD%Z}.5Z")" 0
 land_fallback "not a list" '{"message":"Resource not accessible by integration"}' 0
 jq --arg t "$(ago 660)" '.candidateFirstSeen=$t' "$STATE_DIR2/develop-state.json" >"$STATE_DIR2/s.tmp" &&
   mv "$STATE_DIR2/s.tmp" "$STATE_DIR2/develop-state.json"

@@ -2270,7 +2270,7 @@ tip_landed_at() {
   local at
   at="$(jq -r --arg sha "$SOURCE_SHA" '.[0] | select(.after == $sha) | .timestamp // empty' \
     "$TMP_DIR/activity.json" 2>/dev/null)"
-  printf '%s' "$at" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$' || return 0
+  printf '%s' "$at" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 0
   [ "$(epoch_or_zero "$at")" -gt 0 ] && [ "$(epoch_or_zero "$at")" -le "$NOW_EPOCH" ] && printf '%s' "$at"
 }
 LANDED_AT="$(tip_landed_at)"
