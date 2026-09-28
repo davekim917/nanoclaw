@@ -2860,6 +2860,17 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stderr).toContain('this change adds unknown lines outside tests');
     });
 
+    it('never reads an authorless receipt, or reviewer text, as the author to check', () => {
+      const root = tempRoot();
+      const forged = { ...cutDownReceipt(HEAD, `davekim917\t${AGENT_REVIEWER}`), author: null };
+      cutDownFixture(root, { comments: [forged, cutDownReceipt(HEAD, `x\tdavekim917\t${AGENT_REVIEWER}`, 'reader')] });
+      fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('cut_down_missing:');
+    });
+
     it.each([
       ['lowers the threshold', '{ "cutDownThreshold": 10 }\n', [changedFile('src/gate.ts', undefined, 11)], 24],
       ['raises it', '{ "cutDownThreshold": 500 }\n', BIG, 0],

@@ -766,10 +766,11 @@ cut_down_state() {
   pages=$(paginate_connection comments receipt_comments_page) || return 1
   receipts=$(printf '%s\n' "$pages" | jq -rs --arg re "$CUT_DOWN_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" '
     .[] | .data.repository.pullRequest.comments.nodes[]
+    | select(.author.login | type == "string" and . != "")
+    | .author.login as $login
     | (.body // "") as $body
-    | (.author.login // "") as $login
     | [ $body | capture($re) ] | first // empty
-    | "\(.head)\t\($login)\t\([ $body | capture($reviewerRe) ] | first | .reviewer // "")"') || return 1
+    | [ .head, $login, ([ $body | capture($reviewerRe) ] | first | .reviewer // "") ] | @tsv') || return 1
   others=""
   while IFS=$'\t' read -r head login reviewer; do
     [ -n "$head" ] || continue
