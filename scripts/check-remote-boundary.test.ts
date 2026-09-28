@@ -340,7 +340,6 @@ describe('main', () => {
   let errors: string[];
   let fetchError: Error | null;
 
-  /** The snapshot path `worktree add` was given, i.e. what should have been scanned and removed. */
   function addedSnapshot(): string {
     const add = gitCalls.find((c) => c.args.includes('add'));
     if (!add) throw new Error('no worktree add');
