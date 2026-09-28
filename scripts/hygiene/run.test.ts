@@ -464,6 +464,15 @@ describe('duplicate tests', () => {
     expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
   });
 
+  it('survives a deleted test whose directory became a symlink loop', () => {
+    const root = repo({ 'src/d/old.test.ts': spec(keeper) }, { 'src/d/old.test.ts': null });
+    fs.rmSync(path.join(root, 'src/d'), { recursive: true, force: true });
+    fs.symlinkSync('d', path.join(root, 'src/d'));
+    git(root, 'add', '-A');
+    git(root, 'commit', '-q', '-m', 'dir to loop');
+    expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
+  });
+
   it('does not report a duplicate that a renamed file already held', () => {
     const pair = spec(`${keeper}it('copy', () => {\n  expect(f(1)).toBe(2);\n});\n`);
     const root = repo(

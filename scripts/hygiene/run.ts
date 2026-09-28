@@ -245,9 +245,7 @@ function readRegularFile(file: string): string | null {
   try {
     return fs.lstatSync(file).isFile() ? fs.readFileSync(file, 'utf8') : null;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ENOTDIR') {
-      return null;
-    }
+    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes((err as NodeJS.ErrnoException).code ?? '')) return null;
     throw err;
   }
 }
