@@ -22,6 +22,7 @@ SCOPE = {"tenants": [], "brands": [], "accounts": [],
 
 class Backend(http.server.BaseHTTPRequestHandler):
     seen = []
+    store = {}
 
     def log_message(self, format, *args):
         pass
@@ -30,13 +31,16 @@ class Backend(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n)) if n else None
         Backend.seen.append((self.command, self.path, body))
-        out = {"access_token": "h.eyJzdWIiOiAiMSJ9.s"} if self.path == "/users/login" else (
-            {"owner": {"id": 191}, "report": {"id": "rp-77", "filename": PREFIX + "f.pdf"}} if self.path == "/reports/nested" else (
-            {"owner": {"id": 192}} if self.path == "/reports/anon" else (
-                {"id": "ex-5", "name": "Existing"} if self.path == "/reports/upsert" else (
-                    {"id": "owner-1", "report": {"id": "report-2"}} if self.path == "/reports/ambig" else (
-                        {"a": {"id": "t1", "name": PREFIX + "twin"}, "b": {"id": "t2", "name": PREFIX + "twin"}}
-                        if self.path == "/reports/twin" else {"id": "fx-901", "ok": True})))))
+        if self.path.startswith("/users/login"):
+            out = {"access_token": "h.eyJzdWIiOiAiMSJ9.s"}
+        elif self.command == "POST":
+            new_id = "fx-{}".format(900 + len(Backend.store))
+            Backend.store["{}/{}".format(self.path, new_id)] = body
+            out = {"owner": {"id": 191}, "report": {"id": new_id}}
+        elif self.command == "GET" and self.path in Backend.store:
+            out = {"data": Backend.store[self.path]}
+        else:
+            out = {"ok": True}
         raw = json.dumps(out).encode()
         self.send_response(201 if self.command == "POST" else 200)
         self.send_header("Content-Length", str(len(raw)))
@@ -59,6 +63,7 @@ class Guard(unittest.TestCase):
 
     def setUp(self):
         Backend.seen.clear()
+        Backend.store.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.run_dir = os.path.join(self.tmp.name, RUN_ID)
         os.makedirs(self.run_dir)
@@ -163,34 +168,52 @@ class Guard(unittest.TestCase):
         self.assertEqual(h.call("q1", "M", "POST", "/widgets/search", {"markets": ["M1"]})[0], 201)
         self.assert_blocked(h, "q2", "POST", "/widgets/search/save", {"markets": ["M1"]}, "no-qa-target")
 
-    def test_qa_named_create_ledgers_its_id(self):
+    def test_ownership_needs_a_verified_readback(self):
         self.pin()
         h = self.client()
-        self.assertEqual(h.call("c1", "M", "POST", "/reports", {"name": PREFIX + "coord-r1", "segmentId": 81})[0], 201)
-        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/fx-901"})
-        self.assertEqual(h.call("c2", "M", "PATCH", "/reports/fx-901", {"name": PREFIX + "renamed"})[0], 200)
-        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/fx-901"}, "only a POST create is ledgered")
-        self.assertEqual(h.call("c3", "M", "DELETE", "/reports/fx-901")[0], 200)
-        self.assert_blocked(h, "c4", "DELETE", "/reports/fx-902", None, "foreign-target")
-        self.assert_blocked(h, "c4b", "PATCH", "/users/fx-901", {"role": "admin"}, "foreign-target")
-        self.assertEqual(h.call("c5", "M", "POST", "/reports/nested", {"filename": PREFIX + "f.pdf"})[0], 201)
-        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/fx-901", "/reports/nested/rp-77"},
-                         "the named object's id, not its owner's")
-        h.call("c6", "M", "POST", "/reports/anon", {"name": PREFIX + "anon"})
-        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "a nested id that is not the named object stays foreign")
-        h.call("c7", "M", "POST", "/reports/upsert", {"name": PREFIX + "up"})
-        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "a response naming another object is not ours")
-        h.call("c8", "M", "POST", "/reports/ambig", {"name": PREFIX + "amb"})
-        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "two candidate ids and no name: neither is ledgered")
-        h.call("c9", "M", "POST", "/reports/twin", {"name": PREFIX + "twin"})
-        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "two objects carrying the name: neither is ledgered")
+        name = PREFIX + "coord-r1"
+        code, js = h.call("c1", "M", "POST", "/reports", {"name": name, "segmentId": 81})
+        self.assertEqual(code, 201)
+        self.assertEqual(api.ledger_ids(self.run_dir), set(), "a create response is never parsed for ownership")
+        self.assert_blocked(h, "c2", "PATCH", "/reports/" + js["report"]["id"], {"slot": 2}, "foreign-target")
+        h.own("c3", "M", "/reports", js["report"]["id"], name)
+        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/" + js["report"]["id"]})
+        self.assertEqual(h.call("c4", "M", "PATCH", "/reports/" + js["report"]["id"], {"slot": 2})[0], 200)
+        self.assertEqual(h.call("c5", "M", "DELETE", "/reports/" + js["report"]["id"])[0], 200)
+        self.assert_blocked(h, "c6", "PATCH", "/users/" + js["report"]["id"], {"role": "admin"}, "foreign-target")
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.own("c7", "M", "/reports", 191, name)
+        self.assertIn("unverified-fixture", str(ctx.exception), "the owner id in the response is not the object")
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.own("c8", "M", "/accounts", 4401, name)
+        self.assertIn("unverified-fixture", str(ctx.exception))
+        before = len(Backend.seen)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.own("c9", "M", "/reports", js["report"]["id"], PREFIX)
+        self.assertIn("not-a-qa-name", str(ctx.exception))
+        self.assertEqual(len(Backend.seen), before, "a bad name is refused before any read")
+        self.assertEqual(len(api.ledger_ids(self.run_dir)), 1)
+        with open(os.path.join(h.out, "c7-own.json")) as f:
+            self.assertTrue(json.load(f)["harnessBlocked"])
+
+    def test_evidence_holds_no_secrets(self):
+        self.pin()
+        h = self.client()
+        with self.assertRaises(api.WriteScopeRefused):
+            h.call("s1", "M", "POST", "/notes?access_token=FICTIONAL-TOKEN&x=1", {"k": 1})
+        h.call("s2", "M", "POST", "/users/login", {"email": "m@example.test", "password": "fictional-pw"})
+        for f in ("s1.json", "s2.json", "00-timeline.txt"):
+            with open(os.path.join(h.out, f)) as fh:
+                text = fh.read()
+            for secret in ("FICTIONAL-TOKEN", "fictional-pw", "eyJzdWIiOiAiMSJ9"):
+                self.assertNotIn(secret, text, "{} leaks {}".format(f, secret))
 
     def test_allowlisted_account_is_writable(self):
         self.pin(dict(SCOPE, accounts=["7001"]))
         h = self.client()
         self.assertEqual(h.call("a1", "M", "POST", "/cards", {"accountId": 7001})[0], 201)
         self.assert_blocked(h, "a2", "DELETE", "/users/7001", None, "foreign-target")
-        self.assertEqual(api.ledger_ids(self.run_dir), set(), "only QA-named creates are ledgered")
+        self.assertEqual(api.ledger_ids(self.run_dir), set(), "writes never ledger on their own")
 
     def test_scope_from_another_run_refused(self):
         self.pin()

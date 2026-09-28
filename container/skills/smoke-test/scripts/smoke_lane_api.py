@@ -162,26 +162,21 @@ def judge(run_dir, method, path, body=None):
     return "write"
 
 
-def created_ids(response, name):
-    if not isinstance(response, dict):
-        return []
-    dicts = [response] + [v for v in response.values() if isinstance(v, dict)]
-    with_id = [d for d in dicts if d.get("id") not in (None, "")]
-    named = [d for d in with_id if name in (d.get(k) for k in NAME_KEYS)]
-    if len(named) == 1:
-        return [named[0]["id"]]
-    only = with_id[0] if len(with_id) == 1 else None
-    if not named and only is not None and only in (response, response.get("data")) and not NAME_KEYS & set(only):
-        return [only["id"]]
-    return []
-
-
 def redacted(body):
     if isinstance(body, dict):
         return {k: "<redacted>" if SECRET_KEY.search(k) else redacted(v) for k, v in body.items()}
     if isinstance(body, list):
         return [redacted(v) for v in body]
     return body
+
+
+def sanitized(path):
+    parts = urllib.parse.urlsplit(path)
+    if not parts.query:
+        return path
+    query = [(k, "<redacted>" if SECRET_KEY.search(k) else v)
+             for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
 
 def claims(token):
@@ -210,18 +205,33 @@ class H:
         with open(os.path.join(self.out, "{}.json".format(tag)), "w") as f:
             json.dump(record, f, indent=1, default=str)
 
+    def refuse(self, tag, seat, method, path, body, error):
+        self.save(tag, {"harnessBlocked": True, "refusal": "WRITE_SCOPE_REFUSED", "reason": str(error),
+                        "seat": seat, "method": method, "path": sanitized(path), "body": redacted(body), "at": now()})
+        self.emit("{} [{}] {} {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason={} (no request sent)".format(
+            now(), tag, seat, method, sanitized(path), error))
+        raise error
+
     def guarded(self, tag, seat, method, path, body):
         try:
             return judge(self.run_dir, method, path, body)
         except WriteScopeRefused as e:
-            self.save(tag, {"harnessBlocked": True, "refusal": "WRITE_SCOPE_REFUSED", "reason": str(e),
-                            "seat": seat, "method": method, "path": path, "body": redacted(body), "at": now()})
-            self.emit("{} [{}] {} {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason={} (no request sent)".format(
-                now(), tag, seat, method, path, e))
-            raise
+            self.refuse(tag, seat, method, path, body, e)
+
+    def own(self, tag, seat, create_path, fixture_id, name):
+        path = "{}/{}".format(create_path.rstrip("/"), urllib.parse.quote(str(fixture_id), safe=""))
+        prefix = fixture_prefix(self.run_dir)
+        if not (isinstance(name, str) and name.startswith(prefix) and len(name) > len(prefix)):
+            self.refuse(tag, seat, "OWN", path, None, WriteScopeRefused("not-a-qa-name name={!r}".format(name)))
+        code, js = self.call(tag, seat, "GET", path)
+        if not (200 <= code < 300 and name in json.dumps(js, ensure_ascii=False)):
+            self.refuse(tag + "-own", seat, "OWN", path, None,
+                        WriteScopeRefused("unverified-fixture status={} (the object does not carry {})".format(code, name)))
+        record_fixture(self.run_dir, create_path, fixture_id, name)
+        self.emit("{} [{}] {} OWN {} -> ledgered as {}".format(now(), tag, seat, path, name))
 
     def req(self, method, path, tok=None, body=None, tag="req", seat="-"):
-        kind = self.guarded(tag, seat, method, path, body)
+        self.guarded(tag, seat, method, path, body)
         data = json.dumps(body).encode() if body is not None else None
         r = urllib.request.Request(self.base + path, data=data, method=method)
         if tok:
@@ -235,12 +245,12 @@ class H:
         except urllib.error.HTTPError as e:
             code, raw = e.code, e.read()
         except (urllib.error.URLError, OSError) as e:
-            return -1, {"_error": str(e)[:300]}, time.time() - t0, kind
+            return -1, {"_error": str(e)[:300]}, time.time() - t0
         try:
             js = json.loads(raw)
         except ValueError:
             js = {"_raw": raw[:300].decode("utf8", "replace")}
-        return code, js, time.time() - t0, kind
+        return code, js, time.time() - t0
 
     def login(self, seat):
         if seat in self.tok:
@@ -252,7 +262,7 @@ class H:
             why = "SEAT_LEASE_REFUSED (seat unavailable)" if pr.returncode == 69 else "derive rc={}".format(pr.returncode)
             self.emit("{} login {} REFUSED locally: {}, no request sent".format(now(), seat, why))
             raise SystemExit(2)
-        code, js, _, _ = self.req("POST", self.login_path, body={"email": self.seats[seat], "password": pw},
+        code, js, _ = self.req("POST", self.login_path, body={"email": self.seats[seat], "password": pw},
                                   tag="login-" + seat, seat=seat)
         pw = None
         token = None
@@ -268,19 +278,15 @@ class H:
         return code
 
     def call(self, tag, seat, method, path, body=None, save=True):
-        code, js, dt, kind = self.req(method, path, self.tok.get(seat), body, tag, seat)
-        if kind == "write" and method.upper() == "POST" and 200 <= code < 300:
-            name = qa_name(body, fixture_prefix(self.run_dir))
-            for fixture_id in created_ids(js, name) if name else []:
-                record_fixture(self.run_dir, urllib.parse.urlsplit(path).path, fixture_id, name)
+        code, js, dt = self.req(method, path, self.tok.get(seat), body, tag, seat)
         if save:
-            self.save(tag, {"status": code, "seat": seat, "method": method, "path": path, "body": body,
-                            "at": now(), "response": js})
+            self.save(tag, {"status": code, "seat": seat, "method": method, "path": sanitized(path),
+                            "body": redacted(body), "at": now(), "response": redacted(js)})
         d = js.get("data", js) if isinstance(js, dict) else js
         shape = "list[{}]".format(len(d)) if isinstance(d, list) else (
             "keys={}".format(list(d.keys())[:12]) if isinstance(d, dict) else type(d).__name__)
         self.emit("{} [{}] {} {} {} {} -> {} {:.2f}s {}".format(
-            now(), tag, seat, method, path, json.dumps(body) if body is not None else "", code, dt, shape))
+            now(), tag, seat, method, sanitized(path), json.dumps(redacted(body)) if body is not None else "", code, dt, shape))
         return code, js
 
 

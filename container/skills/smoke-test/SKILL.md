@@ -391,15 +391,18 @@ routes), both as full-match path patterns. Reads always go. A write goes only
 when it names a QA-owned target and no foreign one. Owned: an allowlisted
 account/tenant/brand in a body or query key; on a POST, a top-level
 `name`/`title`/`label`/`filename` starting `QA-<runId>-`; or a path under
-`<create path>/<id>` for an id that an earlier QA-named POST returned
-(`<run-dir>/write-scope-fixtures.ndjson`; one backend per run, so the ledger
-keeps no origin). Foreign: any other digit-bearing path segment (only a
+`<create path>/<id>` for a fixture the lane registered with `h.own(tag, seat,
+create_path, id, name)`, which reads `<create path>/<id>` back and ledgers it
+(`<run-dir>/write-scope-fixtures.ndjson`) only when that object carries the
+QA name. Create responses are never parsed for ownership, so call `own` after
+a create and before editing or deleting the fixture. One backend per run, so
+the ledger keeps no origin. Foreign: any other digit-bearing path segment (only a
 leading `/v<n>/` is exempt), or an account/tenant/brand key outside the
-allowlist, whether scalar, object, null or empty. A fixture id is ledgered only
-when the create response identifies exactly one object. The guard cannot tell a create route from an action route, so never
+allowlist, whether scalar, object, null or empty. The guard cannot tell a create route from an action route, so never
 put a QA name in the body of a call that is not a create. A missing, unreadable or other-run scope refuses every write.
 A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true` (password,
-secret and token fields redacted), logs
+secret and token fields and query values redacted, as in every saved call),
+logs
 `HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason=...` and raises
 `WriteScopeRefused`: record the check `blocked` with the target it needed,
 never as a product refusal, a pass or a finding. A write-refusal probe targets
