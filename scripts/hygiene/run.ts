@@ -231,11 +231,11 @@ export function growthBase(root: string): string {
   return result.stdout.trim();
 }
 
-function changedFiles(root: string, base: string): string[] {
+function changedFiles(root: string, base: string, present = false): string[] {
   const listed = (args: string[]) => stdoutOf('git', git(root, args)).split('\0').filter(Boolean);
   return [
     ...new Set([
-      ...listed(['diff', '--name-only', '--no-renames', '-z', base]),
+      ...listed(['diff', '--name-only', '--no-renames', ...(present ? ['--diff-filter=d'] : []), '-z', base]),
       ...listed(['ls-files', '--others', '--exclude-standard', '-z']),
     ]),
   ].sort();
@@ -245,14 +245,20 @@ function readRegularFile(file: string): string | null {
   try {
     return fs.lstatSync(file).isFile() ? fs.readFileSync(file, 'utf8') : null;
   } catch (err) {
-    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes((err as NodeJS.ErrnoException).code ?? '')) return null;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ENOTDIR') {
+      return null;
+    }
     throw err;
   }
 }
 
-function textAt(root: string, base: string, file: string): { base: string | null; head: string | null } {
+function baseText(root: string, base: string, file: string): string | null {
   const atBase = git(root, ['cat-file', 'blob', `${base}:${file}`]);
-  return { base: atBase.status === 0 ? atBase.stdout : null, head: readRegularFile(path.join(root, file)) };
+  return atBase.status === 0 ? atBase.stdout : null;
+}
+
+function textAt(root: string, base: string, file: string): { base: string | null; head: string | null } {
+  return { base: baseText(root, base, file), head: readRegularFile(path.join(root, file)) };
 }
 
 /** Every changed non-test TS/JS file, not only the scanned roots; uncommitted and untracked files count. */
@@ -284,13 +290,13 @@ export function duplicateTestFindings(root: string, base: string): Finding[] {
     .filter(Boolean);
   const renamedFrom = new Map<string, string>();
   for (let i = 0; i + 2 < renames.length; i += 3) renamedFrom.set(renames[i + 2], renames[i + 1]);
-  return changedFiles(root, base)
+  return changedFiles(root, base, true)
     .filter((file) => TEST_FILE.test(file) && !NOT_SOURCE_DIR.test(file))
     .flatMap((file) => {
       const head = textAt(root, base, file).head;
       if (head === null) return [];
       const origin = renamedFrom.get(file) ?? file;
-      const before = textAt(root, base, origin).base;
+      const before = baseText(root, base, origin);
       const headCases = extractCases(file, head);
       return findDuplicateTests(addedCases(before === null ? [] : extractCases(origin, before), headCases), headCases);
     })

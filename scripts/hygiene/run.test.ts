@@ -464,10 +464,17 @@ describe('duplicate tests', () => {
     expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
   });
 
-  it('survives a deleted test whose directory became a symlink loop', () => {
-    const root = repo({ 'src/d/old.test.ts': spec(keeper) }, { 'src/d/old.test.ts': null });
+  it.each([
+    ['a symlink loop', 'd', null],
+    ['a symlink to an overlong name', 'x'.repeat(256), null],
+    ['a symlink loop after its test moved', 'd', 'src/e/old.test.ts'],
+  ])('does not read a test path that is gone: its directory became %s', (_, target, movedTo) => {
+    const root = repo(
+      { 'src/d/old.test.ts': spec(keeper) },
+      movedTo ? { 'src/d/old.test.ts': null, [movedTo]: spec(keeper) } : { 'src/d/old.test.ts': null },
+    );
     fs.rmSync(path.join(root, 'src/d'), { recursive: true, force: true });
-    fs.symlinkSync('d', path.join(root, 'src/d'));
+    fs.symlinkSync(target, path.join(root, 'src/d'));
     git(root, 'add', '-A');
     git(root, 'commit', '-q', '-m', 'dir to loop');
     expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
