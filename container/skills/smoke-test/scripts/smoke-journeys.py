@@ -424,17 +424,17 @@ def stale_after_refreeze(run_dir, jid):
     rl_stale_after_refreeze in refreeze-lanes.jq, the ONE definition the
     barrier and `smoke-pair-identity.sh finish` read; it is invoked here
     exactly as smoke-evidence-barrier.sh invokes it, never mirrored."""
-    identity = os.path.join(run_dir, "coordinator", "identity.json")
+    identity = os.path.join(os.getcwd(), run_dir, "coordinator", "identity.json")
     if not os.path.exists(identity):
         return False
-    contract = os.path.join(run_dir, "completion-contract.json")
+    contract = os.path.join(os.getcwd(), run_dir, "completion-contract.json")
     try:
         out = subprocess.run(
             ["jq", "-cs", "-L", _HERE, "--slurpfile", "c", contract,
              'include "refreeze-lanes"; if length != 1 then {error: "identity.json is not exactly one JSON document"} '
              'else .[0] | rl_stale_after_refreeze(if ($c | length) == 1 then $c[0] else "unparsable" end) end',
              identity],
-            capture_output=True, text=True, timeout=20, check=False)
+            capture_output=True, text=True, timeout=20, check=False, cwd=_HERE)
         verdict = json.loads(out.stdout) if out.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         verdict = None

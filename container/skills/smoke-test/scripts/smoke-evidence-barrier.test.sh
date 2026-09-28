@@ -483,6 +483,17 @@ for phase in lanes synthesis; do
       echo "expected runnable redispatch guidance including the quoted run directory and lane" >&2; exit 1; }
   done
 done
+printf 'def rl_stale_after_refreeze($c): {stale: []};\n' > "$FIXTURE_DIR/refreeze-lanes.jq"
+RESULT="$(cd "$FIXTURE_DIR" && bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "rf-run with spaces" synthesis || true)"
+echo "$RESULT" | jq -e '.ready == false and (.invalid | sort) == ["markers/X.json","markers/Y.json"]' >/dev/null || {
+  echo "expected a same-named module in the caller's cwd, with a relative run dir, not to replace refreeze-lanes.jq" >&2; echo "$RESULT" >&2; exit 1; }
+rm "$FIXTURE_DIR/refreeze-lanes.jq"
+NL_RUN="$FIXTURE_DIR/nl-run"$'\n'
+cp -R "$RF" "$NL_RUN"; cp -R "$RF" "$FIXTURE_DIR/nl-run"
+printf '{"ok":true,"freezeGeneration":1,"history":[]}\n' > "$FIXTURE_DIR/nl-run/coordinator/identity.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$NL_RUN" synthesis || true)"
+echo "$RESULT" | jq -e '.ready == false and (.invalid | sort) == ["markers/X.json","markers/Y.json"]' >/dev/null || {
+  echo "expected a run dir ending in a newline to be read as itself, not as its sibling without one" >&2; echo "$RESULT" >&2; exit 1; }
 # The challenger never waits on lanes, re-freeze or not.
 rf_barrier disposition | jq -e '.ready == true' >/dev/null || {
   echo "expected the disposition gate to ignore the re-freeze snapshot" >&2; exit 1; }
