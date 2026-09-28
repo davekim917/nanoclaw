@@ -23,7 +23,7 @@ import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/u
 import { getUser } from '../permissions/db/users.js';
 import { resolveUserChannelType } from '../permissions/user-dm.js';
 
-const INTAKE_TTL_MS = 15 * 60_000;
+const INTAKE_TTL_MS = 24 * 60 * 60_000;
 const FINISHED_RETENTION_MS = 60 * 60_000;
 const SECRET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,128}$/;
@@ -32,6 +32,8 @@ const PATH_PATTERN_RE = /^\/[!-~]{0,255}$/;
 const VALUE_FORMAT_RE = /^[ -~]{1,200}$/;
 const MAX_PENDING_PER_SESSION = 3;
 const OPEN_AUTHORITY_WAIT_MS = 1000;
+const LABEL_RE = /^[^,\n]{1,40}$/;
+const DEFAULT_BASIC_LABELS: [string, string] = ['Username or client ID', 'Password or client secret'];
 
 type SecretIntakeStatus = 'pending' | 'storing' | 'stored' | 'failed' | 'expired';
 
@@ -44,16 +46,21 @@ export interface StartSecretIntakeInput {
   pathPattern?: string;
   headerName?: string;
   valueFormat?: string;
+  basicAuth?: boolean;
+  basicLabels?: string;
   groups: string[];
   workgroups: string[];
   caller: SecretIntakeCaller;
 }
+
+type FormField = { id: string; label: string };
 
 interface Intake {
   id: string;
   secretName: string;
   rotate: boolean;
   injection: OnecliInjectionSpec | null;
+  fields: FormField[];
   groups: string[];
   workgroups: string[];
   sessionId: string | null;
@@ -157,7 +164,7 @@ function validateInjection(input: StartSecretIntakeInput): OnecliInjectionSpec |
   }
   const headerName = input.headerName?.trim() || 'Authorization';
   if (!HEADER_NAME_RE.test(headerName)) throw new Error(`Invalid header name: "${headerName}"`);
-  const valueFormat = input.valueFormat ?? 'Bearer {value}';
+  const valueFormat = input.valueFormat ?? (input.basicAuth ? 'Basic {value}' : 'Bearer {value}');
   if (!VALUE_FORMAT_RE.test(valueFormat) || !valueFormat.includes('{value}')) {
     throw new Error('--value-format must be one line of plain text containing {value}.');
   }
@@ -166,6 +173,51 @@ function validateInjection(input: StartSecretIntakeInput): OnecliInjectionSpec |
     throw new Error('--path-pattern must start with / and contain no spaces.');
   }
   return { name: input.name, hostPattern, pathPattern, headerName, valueFormat };
+}
+
+function formFields(input: StartSecretIntakeInput): FormField[] {
+  if (!input.basicAuth) {
+    if (input.basicLabels !== undefined) throw new Error('--basic-labels needs --basic-auth.');
+    return [{ id: 'secret_value', label: input.rotate ? 'New value' : 'Secret value' }];
+  }
+  const labels =
+    input.basicLabels === undefined ? DEFAULT_BASIC_LABELS : input.basicLabels.split(',').map((l) => l.trim());
+  if (labels.length !== 2 || !labels.every((l) => LABEL_RE.test(l))) {
+    throw new Error(
+      '--basic-labels takes two comma-separated labels of up to 40 characters, e.g. "Client ID,Client secret".',
+    );
+  }
+  return [
+    { id: 'basic_user', label: labels[0] },
+    { id: 'basic_secret', label: labels[1] },
+  ];
+}
+
+function fieldsLine(fields: FormField[]): string {
+  if (fields.length === 1) return 'The form has one field: paste the key exactly as issued.';
+  return `The form has two fields, "${fields[0].label}" and "${fields[1].label}": paste each exactly as issued. The host joins and encodes them, so nothing needs preparing first.`;
+}
+
+type Composed = { ok: true; value: string } | { ok: false; message: string; field: string };
+
+function composeValue(fields: FormField[], values: Record<string, string>): Composed {
+  const parts: string[] = [];
+  for (const field of fields) {
+    const value = (values[field.id] ?? '').trim();
+    if (!value) return { ok: false, field: field.id, message: `Paste a value for "${field.label}".` };
+    if (/\s/.test(value)) {
+      return {
+        ok: false,
+        field: field.id,
+        message: `"${field.label}" contains spaces or line breaks; paste only the value.`,
+      };
+    }
+    parts.push(value);
+  }
+  if (parts.length === 1) return { ok: true, value: parts[0] };
+  if (parts[0].includes(':'))
+    return { ok: false, field: fields[0].id, message: `"${fields[0].label}" cannot contain a colon.` };
+  return { ok: true, value: Buffer.from(`${parts[0]}:${parts[1]}`, 'utf8').toString('base64') };
 }
 
 /** An agent may grant only to its own group and its own workgroup, whatever its cli_scope. */
@@ -207,6 +259,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
     );
   }
   const injection = validateInjection({ ...input, name });
+  const fields = formFields(input);
 
   const caller = input.caller;
   const callerGroup = caller.kind === 'agent' ? await getAgentGroup(caller.agentGroupId) : undefined;
@@ -251,6 +304,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
     secretName: name,
     rotate: input.rotate,
     injection,
+    fields,
     groups,
     workgroups,
     sessionId: caller.kind === 'agent' ? caller.sessionId : null,
@@ -274,6 +328,7 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
     callerGroup && !input.rotate
       ? `An owner, a global admin, or an admin of "${callerGroup.name}" can enter it.`
       : 'Only an owner or global admin can enter it.',
+    fieldsLine(fields),
     `The value goes straight to the vault — no agent sees it. Expires ${formatLocalTime(new Date(intake.expiresAt).toISOString(), TIMEZONE)}.`,
   ].join('\n');
 
@@ -501,20 +556,19 @@ export function secretIntakeHooks(channelType: string): SecretIntakeHooks {
         form: {
           title: intake.rotate ? 'Rotate secret' : 'Store secret',
           body: `*${intake.secretName}*\n${intake.injection ? injectionLine(intake.injection) : 'Replaces the current value.'}`,
-          inputLabel: intake.rotate ? 'New value' : 'Secret value',
+          inputs: intake.fields,
         },
       };
     },
-    async submit(intakeId, userId, value) {
+    async submit(intakeId, userId, values) {
       prune(Date.now());
       const intake = intakes.get(intakeId);
       const refused = unavailable(intake);
       if (refused || !intake) return { ok: false, message: refused ?? 'This secret request no longer exists.' };
-      const trimmed = value.trim();
-      if (!trimmed) return { ok: false, message: 'Paste the secret value.' };
-      if (/\s/.test(trimmed)) return { ok: false, message: 'Paste only the key: it contains spaces or line breaks.' };
+      const composed = composeValue(intake.fields, values);
+      if (!composed.ok) return composed;
       intake.status = 'storing';
-      completeIntake(intake, namespaced(userId), trimmed)
+      completeIntake(intake, namespaced(userId), composed.value)
         .catch((err) => failIntake(intake, err))
         .catch((err) => log.error('Secret intake: completion failed', { intakeId: intake.id, err }));
       return { ok: true };

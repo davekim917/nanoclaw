@@ -65,6 +65,7 @@ registerResource({
         "Ask for a secret. Posts a card into the requesting thread (host callers: an owner's DM); its button opens a form that an owner, a global admin, or (new secrets only) an admin of the requesting agent's group fills in, and the value typed there goes straight to the vault — you never see it. Returns at once; the requesting agent is told when it is stored (host callers: `ncl secrets intake-status`).\n\n" +
         'New secret: --host-pattern is required and decides where the gateway sends the value, so name the API host exactly. ' +
         'Rotation (--rotate): replaces only the value; the secret keeps its host, header and grants, and takes effect on the next request.\n\n' +
+        'Two-part credentials (HTTP Basic auth, or an OAuth client ID and secret sent as Basic to a token endpoint): pass --basic-auth. The form then has two fields and the host stores base64("<first>:<second>"), with value format "Basic {value}" by default. Rotating such a secret needs --basic-auth again. Never ask a user to encode or combine values themselves.\n\n' +
         'From an agent with no --groups/--workgroups, a new secret is granted to the calling group; a rotation grants nothing new. A new grant takes effect at the next container start.',
       args: [
         { name: 'name', type: 'string', description: 'Vault name, e.g. Linear-API-Key.', required: true },
@@ -81,11 +82,24 @@ registerResource({
           type: 'string',
           description: 'Header value template containing {value} (default "Bearer {value}").',
         },
+        {
+          name: 'basic_auth',
+          type: 'boolean',
+          description:
+            'Two-field form (user/client ID and password/secret); the host stores their Basic-auth encoding.',
+        },
+        {
+          name: 'basic_labels',
+          type: 'string',
+          description:
+            'With --basic-auth: the two field labels, comma-separated (default "Username or client ID,Password or client secret").',
+        },
         ...grantArgs,
       ],
       examples: [
         'ncl secrets intake --name Linear-API-Key --host-pattern api.linear.app --value-format "{value}"',
         'ncl secrets intake --name Exa-API-Key --host-pattern api.exa.ai --header x-api-key --value-format "{value}" --workgroups example-wg',
+        'ncl secrets intake --name Example-Client --host-pattern auth.example.com --path-pattern /token --basic-auth --basic-labels "Client ID,Client secret"',
         'ncl secrets intake --name Linear-API-Key --rotate',
       ],
       handler: async (args, ctx) =>
@@ -96,6 +110,8 @@ registerResource({
           pathPattern: optionalString(args.path_pattern),
           headerName: optionalString(args.header),
           valueFormat: optionalString(args.value_format),
+          basicAuth: args.basic_auth === true || args.basic_auth === 'true',
+          basicLabels: optionalString(args.basic_labels),
           groups: list(args.groups),
           workgroups: list(args.workgroups),
           caller: callerOf(ctx),

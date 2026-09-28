@@ -39,13 +39,17 @@ export interface SecretIntakeHooks {
     intakeId: string,
     userId: string,
   ): Promise<{ ok: true; form: SecretIntakeForm } | { ok: false; message: string }>;
-  submit(intakeId: string, userId: string, value: string): Promise<{ ok: true } | { ok: false; message: string }>;
+  submit(
+    intakeId: string,
+    userId: string,
+    values: Record<string, string>,
+  ): Promise<{ ok: true } | { ok: false; message: string; field?: string }>;
 }
 
 interface SecretIntakeForm {
   title: string;
   body: string;
-  inputLabel: string;
+  inputs: Array<{ id: string; label: string }>;
 }
 
 export interface ChannelConnectionRestored {

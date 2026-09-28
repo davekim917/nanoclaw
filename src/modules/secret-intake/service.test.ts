@@ -126,6 +126,8 @@ import {
 } from './service.js';
 
 const hooks = secretIntakeHooks('slack');
+const submitValue = (intakeId: string, userId: string, value: string) =>
+  hooks.submit(intakeId, userId, { secret_value: value });
 const agentCaller = { kind: 'agent' as const, sessionId: 'sess-1', agentGroupId: 'ag-1' };
 const newKey = {
   name: 'Linear-API-Key',
@@ -268,7 +270,7 @@ describe('startSecretIntake', () => {
 describe('the form', () => {
   it('stores nothing for a submit by someone with no authority, says so in the thread, and stays open', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    expect(await hooks.submit(intakeId, 'USTRANGER', SECRET)).toEqual({ ok: true });
+    expect(await submitValue(intakeId, 'USTRANGER', SECRET)).toEqual({ ok: true });
     await settle();
     expect(h.createCalls).toHaveLength(0);
     expect(getSecretIntake(intakeId)?.status).toBe('pending');
@@ -276,7 +278,7 @@ describe('the form', () => {
     expect(note.slice(0, 4)).toEqual(['slack', 'slack:C1', 'T1', 'chat']);
     expect(JSON.parse(note[4] as string).text).toMatch(/Only an owner, a global admin or an admin of "Helper"/);
     expect(everythingObservable()).not.toContain(SECRET);
-    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await submitValue(intakeId, 'UOWNER', SECRET);
     await settle();
     expect(h.createCalls).toHaveLength(1);
   });
@@ -293,7 +295,7 @@ describe('the form', () => {
 
   it("lets an admin of the requesting agent's group store it, and tells the owner without the value", async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    await hooks.submit(intakeId, 'UADMIN1', SECRET);
+    await submitValue(intakeId, 'UADMIN1', SECRET);
     await settle();
     expect(h.createCalls).toHaveLength(1);
     const fyi = h.deliveries.find((d) => d.args[1] === 'slack:D1' && d.args[3] === 'chat');
@@ -307,14 +309,14 @@ describe('the form', () => {
 
   it('sends the owner no notice when an owner stores it', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await submitValue(intakeId, 'UOWNER', SECRET);
     await settle();
     expect(h.deliveries.some((d) => d.args[1] === 'slack:D1')).toBe(false);
   });
 
   it('refuses an admin of another group', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    await hooks.submit(intakeId, 'UADMIN2', SECRET);
+    await submitValue(intakeId, 'UADMIN2', SECRET);
     await settle();
     expect(h.createCalls).toHaveLength(0);
     expect(getSecretIntake(intakeId)?.status).toBe('pending');
@@ -331,11 +333,11 @@ describe('the form', () => {
     });
     expect(JSON.parse(h.deliveries[0].args[4] as string).body).toContain('Only an owner or global admin can enter it.');
     expect(await hooks.open(intakeId, 'UADMIN1')).toMatchObject({ ok: false });
-    await hooks.submit(intakeId, 'UADMIN1', SECRET);
+    await submitValue(intakeId, 'UADMIN1', SECRET);
     await settle();
     expect(h.updateCalls).toHaveLength(0);
     expect(getSecretIntake(intakeId)?.status).toBe('pending');
-    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await submitValue(intakeId, 'UOWNER', SECRET);
     await settle();
     expect(h.updateCalls).toHaveLength(1);
   });
@@ -343,7 +345,7 @@ describe('the form', () => {
   it('sends the owner notice even when a later follow-up fails', async () => {
     h.notifyFails = true;
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    await hooks.submit(intakeId, 'UADMIN1', SECRET);
+    await submitValue(intakeId, 'UADMIN1', SECRET);
     await settle();
     expect(h.createCalls).toHaveLength(1);
     expect(h.deliveries.some((d) => d.args[1] === 'slack:D1' && d.args[3] === 'chat')).toBe(true);
@@ -355,7 +357,7 @@ describe('the form', () => {
     vi.mocked(withCentralSync).mockImplementation(() => new Promise(() => {}));
     try {
       expect(await hooks.open(intakeId, 'UOWNER')).toMatchObject({ ok: true, form: { title: 'Store secret' } });
-      expect(await hooks.submit(intakeId, 'UOWNER', SECRET)).toEqual({ ok: true });
+      expect(await submitValue(intakeId, 'UOWNER', SECRET)).toEqual({ ok: true });
     } finally {
       vi.mocked(withCentralSync).mockImplementation((async (fn: () => unknown) => fn()) as never);
     }
@@ -365,7 +367,7 @@ describe('the form', () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
     vi.mocked(withCentralSync).mockImplementation(() => new Promise(() => {}));
     try {
-      await hooks.submit(intakeId, 'UOWNER', SECRET);
+      await submitValue(intakeId, 'UOWNER', SECRET);
       expect(getSecretIntake(intakeId)?.status).toBe('storing');
       await expect(startSecretIntake({ ...newKey, caller: agentCaller })).rejects.toThrow(/already waiting/);
     } finally {
@@ -378,7 +380,7 @@ describe('the form', () => {
     vi.mocked(withCentralSync).mockImplementationOnce(async () => {
       throw new Error('central DB unavailable');
     });
-    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await submitValue(intakeId, 'UOWNER', SECRET);
     await settle();
     expect(getSecretIntake(intakeId)).toMatchObject({ status: 'failed', detail: 'central DB unavailable' });
     expect(h.createCalls).toHaveLength(0);
@@ -388,14 +390,18 @@ describe('the form', () => {
 
   it('refuses an empty value or one with whitespace, keeping the intake pending', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    expect(await hooks.submit(intakeId, 'UOWNER', '  ')).toEqual({ ok: false, message: 'Paste the secret value.' });
-    expect(await hooks.submit(intakeId, 'UOWNER', 'sk one')).toMatchObject({ ok: false });
+    expect(await submitValue(intakeId, 'UOWNER', '  ')).toEqual({
+      ok: false,
+      field: 'secret_value',
+      message: 'Paste a value for "Secret value".',
+    });
+    expect(await submitValue(intakeId, 'UOWNER', 'sk one')).toMatchObject({ ok: false });
     expect(getSecretIntake(intakeId)?.status).toBe('pending');
   });
 
   it('stores the value, grants after the store, edits the card and tells the agent — without the value', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, workgroups: ['wg-a'], caller: agentCaller });
-    expect(await hooks.submit(intakeId, 'UOWNER', `  ${SECRET}\n`)).toEqual({ ok: true });
+    expect(await submitValue(intakeId, 'UOWNER', `  ${SECRET}\n`)).toEqual({ ok: true });
     await settle();
 
     expect(h.createCalls).toEqual([
@@ -419,14 +425,14 @@ describe('the form', () => {
 
     expect(everythingObservable()).not.toContain(SECRET);
     expect(JSON.stringify(getSecretIntake(intakeId))).not.toContain(SECRET);
-    expect(await hooks.submit(intakeId, 'UOWNER', SECRET)).toMatchObject({ ok: false });
+    expect(await submitValue(intakeId, 'UOWNER', SECRET)).toMatchObject({ ok: false });
   });
 
   it('writes once when two submits race past the authority check', async () => {
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
     const results = await Promise.all([
-      hooks.submit(intakeId, 'UOWNER', SECRET),
-      hooks.submit(intakeId, 'UOWNER', SECRET),
+      submitValue(intakeId, 'UOWNER', SECRET),
+      submitValue(intakeId, 'UOWNER', SECRET),
     ]);
     await settle();
     expect(results.filter((r) => r.ok)).toHaveLength(1);
@@ -445,7 +451,7 @@ describe('the form', () => {
     expect(view.groups).toEqual([]);
     expect(JSON.parse(h.deliveries[0].args[4] as string).body).toContain('New grants: none; current holders keep it');
     expect(JSON.parse(h.deliveries[0].args[4] as string).body).not.toContain('nobody yet');
-    await hooks.submit(view.intakeId, 'UOWNER', SECRET);
+    await submitValue(view.intakeId, 'UOWNER', SECRET);
     await settle();
     expect(h.groupGrants).toEqual([]);
     expect(JSON.parse(h.deliveries[1].args[4] as string).text).toContain('New grants: none; current holders keep it');
@@ -461,7 +467,7 @@ describe('the form', () => {
       workgroups: [],
       caller: { kind: 'host' },
     });
-    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await submitValue(intakeId, 'UOWNER', SECRET);
     await settle();
     expect(h.updateCalls).toEqual([{ ref: { id: 'id-1', name: 'Linear-API-Key' }, value: SECRET }]);
     expect(h.createCalls).toHaveLength(0);
@@ -471,7 +477,7 @@ describe('the form', () => {
   it('grants nothing when the vault write fails, and says so', async () => {
     h.createFails = true;
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    await hooks.submit(intakeId, 'UOWNER', SECRET);
+    await submitValue(intakeId, 'UOWNER', SECRET);
     await settle();
     expect(getSecretIntake(intakeId)?.status).toBe('failed');
     expect(h.groupGrants).toHaveLength(0);
@@ -479,15 +485,103 @@ describe('the form', () => {
     expect(everythingObservable()).not.toContain(SECRET);
   });
 
-  it('expires after 15 minutes', async () => {
+  it('stays open for a day, then expires', async () => {
     vi.useFakeTimers();
     const { intakeId } = await startSecretIntake({ ...newKey, caller: agentCaller });
-    vi.advanceTimersByTime(15 * 60_000);
+    vi.advanceTimersByTime(24 * 60 * 60_000 - 1);
+    expect(getSecretIntake(intakeId)?.status).toBe('pending');
+    vi.advanceTimersByTime(1);
     expect(await hooks.open(intakeId, 'UOWNER')).toMatchObject({
       ok: false,
       message: expect.stringMatching(/expired/),
     });
     expect(getSecretIntake(intakeId)?.status).toBe('expired');
+  });
+});
+
+describe('basic-auth intake', () => {
+  const CLIENT_ID = 'cid-SENTINEL-4f1a';
+  const COMPOSED = Buffer.from(`${CLIENT_ID}:${SECRET}`).toString('base64');
+  const basic = { ...newKey, name: 'Example-Client', hostPattern: 'auth.example.com', basicAuth: true };
+
+  it('opens a two-field form, says what goes in each, and defaults to Basic', async () => {
+    const { intakeId } = await startSecretIntake({
+      ...basic,
+      basicLabels: 'Client ID, Client secret',
+      caller: agentCaller,
+    });
+    const body = JSON.parse(h.deliveries[0].args[4] as string).body as string;
+    expect(body).toContain('two fields, "Client ID" and "Client secret"');
+    expect(body).toContain('Basic <secret>');
+    const opened = await hooks.open(intakeId, 'UOWNER');
+    expect(opened).toMatchObject({
+      ok: true,
+      form: {
+        inputs: [
+          { id: 'basic_user', label: 'Client ID' },
+          { id: 'basic_secret', label: 'Client secret' },
+        ],
+      },
+    });
+  });
+
+  it('stores base64 of "<first>:<second>" and exposes none of the three values', async () => {
+    const { intakeId } = await startSecretIntake({ ...basic, caller: agentCaller });
+    expect(
+      await hooks.submit(intakeId, 'UADMIN1', { basic_user: ` ${CLIENT_ID} `, basic_secret: `${SECRET}\n` }),
+    ).toEqual({ ok: true });
+    await settle();
+    expect(h.createCalls).toEqual([
+      { spec: expect.objectContaining({ valueFormat: 'Basic {value}' }), value: COMPOSED },
+    ]);
+    const observed = everythingObservable() + JSON.stringify(getSecretIntake(intakeId));
+    for (const leaked of [CLIENT_ID, SECRET, COMPOSED]) expect(observed).not.toContain(leaked);
+  });
+
+  it('rotates a basic-auth secret through the same two fields', async () => {
+    h.vault.set('Example-Client', { id: 'id-1', name: 'Example-Client' });
+    const { intakeId } = await startSecretIntake({
+      name: 'Example-Client',
+      rotate: true,
+      basicAuth: true,
+      groups: [],
+      workgroups: [],
+      caller: { kind: 'host' },
+    });
+    await hooks.submit(intakeId, 'UOWNER', { basic_user: CLIENT_ID, basic_secret: SECRET });
+    await settle();
+    expect(h.updateCalls).toEqual([{ ref: { id: 'id-1', name: 'Example-Client' }, value: COMPOSED }]);
+    expect(everythingObservable()).not.toContain(COMPOSED);
+  });
+
+  it('refuses an empty field, whitespace, or a colon in the first field, naming the field and keeping it open', async () => {
+    const { intakeId } = await startSecretIntake({ ...basic, caller: agentCaller });
+    expect(await hooks.submit(intakeId, 'UOWNER', { basic_user: CLIENT_ID, basic_secret: ' ' })).toMatchObject({
+      ok: false,
+      field: 'basic_secret',
+    });
+    expect(await hooks.submit(intakeId, 'UOWNER', { basic_user: 'a b', basic_secret: SECRET })).toMatchObject({
+      ok: false,
+      field: 'basic_user',
+    });
+    expect(await hooks.submit(intakeId, 'UOWNER', { basic_user: 'a:b', basic_secret: SECRET })).toMatchObject({
+      ok: false,
+      field: 'basic_user',
+      message: expect.stringMatching(/colon/),
+    });
+    expect(h.createCalls).toHaveLength(0);
+    expect(getSecretIntake(intakeId)?.status).toBe('pending');
+  });
+
+  it('keeps an explicit value format and refuses labels without --basic-auth or not exactly two', async () => {
+    await startSecretIntake({ ...basic, valueFormat: '{value}', caller: agentCaller });
+    expect(h.deliveries[0].args[4]).not.toContain('Basic <secret>');
+    await expect(
+      startSecretIntake({ ...newKey, name: 'Other', basicLabels: 'A,B', caller: agentCaller }),
+    ).rejects.toThrow(/needs --basic-auth/);
+    await expect(
+      startSecretIntake({ ...basic, name: 'Third', basicLabels: 'Only one', caller: agentCaller }),
+    ).rejects.toThrow(/two comma-separated labels/);
   });
 });
 

@@ -5,8 +5,9 @@ Adding or rotating an API key without the key passing through chat, a session DB
 
 ```
 ncl secrets intake --name <n> --host-pattern <api-host> [--header <h>] [--value-format '<fmt with {value}>']
-                   [--path-pattern <p>] [--groups <ids>] [--workgroups <ids>]
-ncl secrets intake --name <n> --rotate [--groups …] [--workgroups …]
+                   [--path-pattern <p>] [--basic-auth [--basic-labels '<first>,<second>']]
+                   [--groups <ids>] [--workgroups <ids>]
+ncl secrets intake --name <n> --rotate [--basic-auth …] [--groups …] [--workgroups …]
 ncl secrets intake-status --id <si-…>
 ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 ```
@@ -21,13 +22,22 @@ ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
 2. The card's button (`ncs:<intakeId>`) opens a Slack modal, private to whoever clicked it: others in the channel
    see the card, never the value. Opening refuses a clicker with no authority when the central DB lease answers
    within a second, and otherwise lets the click through; nothing waits past Slack's 3-second trigger window.
-3. Submit validates (non-empty, no whitespace), claims the intake and closes the modal. Only then does the host
+3. Submit validates each field (non-empty, no whitespace), claims the intake and closes the modal. Only then does the host
    check authority (below); a refused submit stores nothing, returns the intake to pending, and says why in
    the card's conversation. The vault write and grants follow: `POST /api/secrets` for a new secret, `PATCH` of the
    value for a rotation — through `src/onecli-secret-writer.ts`, which keeps the value out of argv. Any failure
    before the store completes marks the intake failed, on the card and to the requester.
 4. The card is edited to the outcome, and the requesting agent session (if any) gets a host note: stored or
    not, and who it is granted to. The value never appears in either.
+
+## Two-part credentials
+
+HTTP Basic auth, and OAuth client credentials sent as Basic to a token endpoint (`client_secret_basic`), need
+two values sent as one: base64 of `<first>:<second>`. `--basic-auth` gives the form two fields (labels from
+`--basic-labels`, default "Username or client ID" / "Password or client secret"), and the host composes and
+stores the encoded value, with `--value-format` defaulting to `Basic {value}`. The first field may not contain
+a colon (RFC 7617). A rotation of such a secret passes `--basic-auth` again, since the vault's value is
+write-only and the form cannot tell. No step asks the user to encode or join anything themselves.
 
 ## Who may enter a secret
 
@@ -67,7 +77,7 @@ consent through); from the host it runs directly.
 ## Limits
 
 - Pending intakes are in memory: a host restart drops them, and an old card's button answers "expired".
-  Expiry is 15 minutes; finished intakes stay visible to `intake-status` for an hour.
+  Expiry is 24 hours; finished intakes stay visible to `intake-status` for an hour.
 - Built and tested for Slack. Elsewhere it depends on the adapter's modal support; where there is none, the
   button says so.
 - The value crosses Slack's servers as a form submission. It is never a message, so it is not in channel

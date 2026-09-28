@@ -470,7 +470,6 @@ const SUBTEXT_BUDGET_OVERHEAD = 8;
 
 const SECRET_INTAKE_ACTION_PREFIX = 'ncs:';
 const SECRET_INTAKE_CALLBACK_ID = 'nc-secret-intake';
-const SECRET_INTAKE_INPUT_ID = 'secret_value';
 
 /** The platform's trigger id expires in seconds (Slack: 3), so nothing slow may run before `openModal`. */
 async function openSecretIntakeForm(event: ActionEvent, setup: ChannelSetup): Promise<void> {
@@ -498,11 +497,9 @@ async function openSecretIntakeForm(event: ActionEvent, setup: ChannelSetup): Pr
       closeLabel: 'Cancel',
       children: [
         CardText(opened.form.body),
-        TextInput({
-          id: SECRET_INTAKE_INPUT_ID,
-          label: opened.form.inputLabel,
-          placeholder: 'Paste it here',
-        }),
+        ...opened.form.inputs.map((input) =>
+          TextInput({ id: input.id, label: input.label, placeholder: 'Paste it here' }),
+        ),
       ],
     }),
   );
@@ -1155,14 +1152,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       chat.onModalSubmit(SECRET_INTAKE_CALLBACK_ID, async (event) => {
         const hooks = setupConfig.secretIntake;
         if (!hooks || !event.privateMetadata) return { action: 'close' };
-        const result = await hooks.submit(
-          event.privateMetadata,
-          event.user.userId,
-          event.values[SECRET_INTAKE_INPUT_ID] ?? '',
-        );
-        return result.ok
-          ? { action: 'close' }
-          : { action: 'errors', errors: { [SECRET_INTAKE_INPUT_ID]: result.message } };
+        const result = await hooks.submit(event.privateMetadata, event.user.userId, event.values);
+        if (result.ok) return { action: 'close' };
+        return { action: 'errors', errors: { [result.field ?? Object.keys(event.values)[0] ?? '']: result.message } };
       });
 
       // The SDK acks the platform request before this runs, so a slow handler cannot hit Slack's 3s ack timeout.
