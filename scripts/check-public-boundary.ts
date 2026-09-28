@@ -1206,9 +1206,8 @@ const EMPTY_BASELINE_OUTCOME: BaselineOutcome = {
  * routine commits. The hook sees only the file, so the template is inferred narrowly: scissors
  * must be git's exact line, and only a CONTIGUOUS TRAILING comment block containing a bare `#`
  * line is blanked. Accepted residual fail-open: a `-m` body that reproduces that trailing-block
- * shape escapes the scan, because scanning git's template instead blocks routine commits. Do NOT
- * "simplify" this in either direction. Blanking, not removing, keeps line numbers matching the
- * author's editor.
+ * shape escapes the scan, because scanning git's template instead blocks routine commits. Blanking,
+ * not removing, keeps line numbers matching the author's editor.
  */
 const GIT_SCISSORS = /^# -{24} >8 -{24}$/m;
 const GIT_BARE_COMMENT = /^#[ \t]*$/;
