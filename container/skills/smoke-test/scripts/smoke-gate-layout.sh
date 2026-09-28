@@ -16,6 +16,10 @@
 # (`api/migrations/,data/migrations/`): each element is checked like a single
 # prefix and against every other element and prefix. The frontend and backend
 # prefixes stay single values, because each names exactly one freeze marker.
+#
+# The develop gate's deploy-lag lists (SMOKE_GATE_FRONTEND_PATHS/BACKEND_PATHS)
+# are comma lists of the same kind, checked one key at a time: the two lists
+# routinely share a tree, and a bad element would otherwise accept a lag.
 
 LAYOUT_PREFIX_KEYS="FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX"
 LAYOUT_PREFIX_RE='^([A-Za-z0-9_][A-Za-z0-9._-]*/)+$'
@@ -27,7 +31,10 @@ layout_prefix_ok() {  # <value> → status 0 when it is a usable layout prefix
 # The prefixes <KEY>'s <value> holds, one per line. Empty elements are kept, so
 # "a/,,b/" and a trailing comma are refused rather than skipped.
 layout_prefix_elements() {  # <KEY> <value>
-  if [ "$1" = MIGRATIONS_PREFIX ]; then printf '%s\n' "$2" | tr ',' '\n'; else printf '%s\n' "$2"; fi
+  case "$1" in
+    MIGRATIONS_PREFIX | *_PATHS) printf '%s\n' "$2" | tr ',' '\n' ;;
+    *) printf '%s\n' "$2" ;;
+  esac
 }
 
 # <value> as a canonical comma list (sorted, one of each), so two files that

@@ -2060,7 +2060,9 @@ Two further wrapper-optional artifacts and behaviours:
   fetch error, non-ancestor state, or a truncated compare. The wake payload
   reports `deployLagAccepted`; the coordinator then freezes the build as a
   documented SHA **pair** and says so in the run record. Unset = strict
-  equality.
+  equality. Each element must be a layout prefix (repository-relative, plain
+  segments, ending in `/`); a malformed list (`/web/`, `web`, `,,`) is named
+  by `config` and in `gate_misconfigured` rather than accepting a lag.
 - A head that stays unsettled beyond `SMOKE_GATE_UNSETTLED_ALERT_SECONDS`
   (default 45 min) produces exactly one `develop_unsettled` wake naming the
   failing workflows and lagging deploys — one per SHA, never a re-spam. A red

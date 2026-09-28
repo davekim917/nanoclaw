@@ -242,6 +242,8 @@ FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
 LAYOUT_MISSING=""
 [ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems)"
+[ -z "$FRONTEND_PATHS" ] || LAYOUT_MISSING="$LAYOUT_MISSING$(layout_prefix_problems FRONTEND_PATHS)"
+[ -z "$BACKEND_PATHS" ] || LAYOUT_MISSING="$LAYOUT_MISSING$(layout_prefix_problems BACKEND_PATHS)"
 # The PR gate detects the freeze this gate cuts by the same prefixes, read from
 # ITS env file (the one the controller renewer reads). If the two files
 # disagree, the freeze head reads as an ordinary PR and nothing alarms, so with
@@ -1618,7 +1620,7 @@ deploy_lag_safe() {
   [ "$files" -lt 300 ] || { printf 'false'; return; }
   hits="$(jq -r --arg p "$paths" '
     [ .files[].filename ] as $files
-    | ($p | split(",") | map(select(length > 0))) as $pre
+    | ($p | split(",")) as $pre
     | [ $files[] as $f | $pre[] as $x | select($f | startswith($x)) ] | length' <<<"$out" 2>/dev/null)"
   printf '%s' "$hits" | grep -Eq '^[0-9]+$' || { printf 'false'; return; }
   if [ "$hits" -eq 0 ]; then printf 'true'; else printf 'false'; fi

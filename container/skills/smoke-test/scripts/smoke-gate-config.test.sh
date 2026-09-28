@@ -128,6 +128,16 @@ printf '%s\n' 'export SMOKE_GATE_FRONTEND_PREFIX=web/' 'export SMOKE_GATE_BACKEN
 OUT="$(run_config "$GATE" SMOKE_CONTROLLER_ENV_FILE="$T/controller-env-diverged.sh")"; RC=$?
 [ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null && ! grep -q 'server/' <<<"$OUT" \
   && ok "develop config names a prefix the PR gate's env file states differently" || fail "develop disagreement: rc=$RC $OUT"
+# The deploy-lag path lists: unset is strict equality and stays valid, two lists
+# may share a tree, and a malformed element names its key.
+OUT="$(run_config "$GATE" SMOKE_GATE_FRONTEND_PATHS=web/,shared/ SMOKE_GATE_BACKEND_PATHS=api/,shared/)"; RC=$?
+[ "$RC" -eq 0 ] && ok "deploy-lag path lists sharing a tree accepted" || fail "develop path lists: rc=$RC $OUT"
+OUT="$(run_config "$GATE" SMOKE_GATE_FRONTEND_PATHS=/web/ SMOKE_GATE_BACKEND_PATHS=api/,)"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_FRONTEND_PATHS","SMOKE_GATE_BACKEND_PATHS"]' <<<"$OUT" >/dev/null \
+  && ok "malformed deploy-lag path lists named" || fail "develop bad path lists: rc=$RC $OUT"
+OUT="$(run_config "$GATE" SMOKE_GATE_FREEZE_HANDOFF=false SMOKE_GATE_BACKEND_PATHS=../api/)"; RC=$?
+[ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_BACKEND_PATHS"]' <<<"$OUT" >/dev/null \
+  && ok "path lists checked with the freeze handoff off" || fail "develop path lists, handoff off: rc=$RC $OUT"
 rm -rf "$T/mut"; mkdir "$T/mut"
 for f in "$SCRIPT_DIR"/*; do ln -s "$f" "$T/mut/"; done
 rm "$T/mut/smoke-develop-gate.sh"
