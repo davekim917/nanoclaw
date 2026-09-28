@@ -371,6 +371,36 @@ failure or an auth finding, and never retry the login. Check the helper's exit
 status before typing its output anywhere; an empty password submitted to a
 login form reads exactly like a product auth bug and can count toward a
 lockout on the holder's seat.
+**Lane writes go through the guarded client, and the harness refuses the rest.**
+A prose write rule is not delivery either: lanes whose API client was copied
+forward from run to run wrote to preexisting client rows and ran tenant-wide
+jobs while the brief said "nothing else is". Lane API scripts import
+`/app/skills/smoke-test/scripts/smoke_lane_api.py` (`H(outdir, run_dir=,
+base=, seats=)`), never a harness copied from an earlier run. At intake pin the
+deployment's scope once:
+
+```bash
+python3 /app/skills/smoke-test/scripts/smoke_lane_api.py init <run-dir> --from <deployment scope file>
+python3 /app/skills/smoke-test/scripts/smoke_lane_api.py check <run-dir> POST <path> --body '<json>'   # 0 sent, 77 refused
+```
+
+The scope file (deployment data, never skill text) lists `tenants`, `brands`
+and `accounts` the seats may write to (empty when the seats sit in shared client
+tenants), `authPaths` (the login route) and `readOnlyPosts` (POST-as-query
+routes), both as full-match path patterns. Reads always go. A write goes only
+when it names a QA-owned target (an allowlisted account/tenant/brand, a body
+`name`/`title`/`label`/`filename` starting `QA-<runId>-`, or an id an earlier QA-named
+create returned, kept in `<run-dir>/write-scope-fixtures.ndjson`) and names no
+foreign one (another id in the path, or an account/tenant/brand key outside
+the allowlist). A missing, unreadable or other-run scope refuses every write.
+A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true`, logs
+`HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason=...` and raises
+`WriteScopeRefused`: record the check `blocked` with the target it needed,
+never as a product refusal, a pass or a finding. A write-refusal probe targets
+a QA-named fixture; when none can be made, the probe is blocked. The guard
+covers this client only: browser-driven writes and hand-rolled HTTP still rest
+on the brief.
+
 Resolve the approved credential location from the deploying group's standing
 instructions and mounts before declaring auth unavailable. Never print or copy
 credential values, search other agent folders for them, or reset a shared
@@ -693,9 +723,12 @@ fenced `adopt` backfills it — never read as "no pin". At intake:
    flags (`PREVIEW-STALE`, below), seat capability, fixture availability.
    Fixtures are allocated per run **and side** (`QA-<runId>-<side>-*`), so two
    owners on one seat cannot collide, and are cleaned up after a failure too.
-   Every worker brief carries this sentence verbatim: "creating/deleting objects
-   named QA-<runId>-* inside the QA tenant with a QA seat is pre-authorized;
-   nothing else is."
+   Pin the write scope now (`smoke_lane_api.py init`, "Lane writes", below).
+   Every worker brief carries this sentence verbatim: "QA seats act on shared
+   client data; creating, changing or deleting objects named QA-<runId>-*, or
+   ids this run created under that name, is pre-authorized; nothing else is."
+   Say which tenants the seats sit in; never call a shared client tenant a QA
+   tenant.
 
 **A journey that only renders an area does not cover a changed backend
 behaviour.** For each one, name the endpoint or job and every affected web and
