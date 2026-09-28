@@ -242,7 +242,6 @@ function planForm(
   const duplicate = specs.find((spec, i) => specs.findIndex((other) => other.id === spec.id) !== i);
   if (duplicate) throw new Error(`Field "${duplicate.id}" is declared twice.`);
   const compose = (input.compose ?? (specs.length === 1 ? 'single' : 'separate')) as Compose;
-  if (!['single', 'basic', 'separate'].includes(compose)) throw new Error('--compose must be basic or separate.');
   const plain = (spec: FieldSpec): FormField => ({ id: spec.id, label: spec.label, optional: spec.optional });
 
   if (compose !== 'separate') {
@@ -257,7 +256,7 @@ function planForm(
         '--compose basic needs exactly two required fields (user or client ID, then password or secret).',
       );
     }
-    if (compose === 'single' && (specs.length !== 1 || specs[0].optional)) {
+    if (compose === 'single' && specs[0].optional) {
       throw new Error('A single field is the whole secret, so it cannot be optional; declare two or more to compose.');
     }
     const defaultFormat = compose === 'basic' ? 'Basic {value}' : 'Bearer {value}';
