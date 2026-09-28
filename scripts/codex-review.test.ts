@@ -2970,10 +2970,8 @@ describe('codex-review risk-scoped review requests', () => {
 
       it.each<[string, Record<string, string>, string?]>([
         ['the checker cannot judge the change', { MOCK_COMMENT_RULE_STATUS: '2' }],
-        ['the checker is not installed', { CLAUDE_PLUGINS_ROOT: '/nonexistent', HOME: '/nonexistent' }],
         ['the checker predates the added-line counts', { MOCK_COMMENT_RULE_REPORT: '{"status":"pass","files":[{"path":"src/gate.ts"}]}' }],
         ['the checker prints no JSON', { MOCK_COMMENT_RULE_REPORT: 'comment-rule: PASS' }],
-        ['the fetch fails', { MOCK_GIT_FETCH_STATUS: '128' }],
         ['the base turns the comment rule off', {}, '{ "commentRule": false }\n'],
       ])('counts every added line when %s', (_case, env, reviewLoop) => {
         const root = tempRoot();

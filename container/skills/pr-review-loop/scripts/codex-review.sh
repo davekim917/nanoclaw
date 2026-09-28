@@ -747,16 +747,13 @@ cut_down_lines() {
 
 # Null when the base turns the comment rule off: nothing else would judge comment lines then.
 cut_down_comment_lines() {
-  local enabled report status=0 classified
-  enabled=$(review_loop_flag commentRule true) || enabled=error
-  [ "$enabled" = true ] || { echo null; return 0; }
+  local report status=0 classified
+  [ "$(review_loop_flag commentRule true)" = true ] || { echo null; return 0; }
   report=$(comment_rule_run "$1" "$2" --json 2>/dev/null) || status=$?
   [ "$status" -le 1 ] || { echo null; return 0; }
   classified=$(printf '%s' "$report" | jq -c '
-    if (.status == "pass" or .status == "fail") and (.files | type) == "array"
-      and all(.files[]; (.path | type) == "string" and (.added_lines | type) == "number"
-        and (.added_comment_lines | type) == "number" and 0 <= .added_comment_lines and .added_comment_lines <= .added_lines)
-      and (.files | map(.path) | length == (unique | length))
+    if (.files | type) == "array" and all(.files[]; (.added_lines | type) == "number"
+      and (.added_comment_lines | type) == "number" and 0 <= .added_comment_lines and .added_comment_lines <= .added_lines)
     then .files | map({ key: .path, value: { added: .added_lines, comments: .added_comment_lines } }) | from_entries
     else null end' 2>/dev/null) || classified=null
   echo "${classified:-null}"

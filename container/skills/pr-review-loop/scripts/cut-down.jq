@@ -17,4 +17,4 @@ def cut_down_lines($comments):
     error("a changed file has no filename or added-line count")
   else [ .files[] | select(.filename | cut_down_exempt | not)
          | .additions as $added | $comments[.filename] as $c
-         | if $c != null and $c.added == $added then $added - $c.comments else $added end ] | add // 0 end;
+         | if $c.added == $added then $added - $c.comments else $added end ] | add // 0 end;
