@@ -24,7 +24,35 @@ const SUITE_CALLEES = new Set(['describe', 'suite']);
 const NOT_RUN = new Set(['skip', 'todo', 'fails', 'skipIf', 'runIf']);
 const HOOKS = new Set(['beforeEach', 'afterEach', 'beforeAll', 'afterAll', 'onTestFinished', 'onTestFailed']);
 const MOCKERS = new Set(['vi', 'jest', 'mock', 'expect']);
-const READS_TEST_NAME = /\b(?:currentTestName|getState|getCurrentTest|aroundEach|aroundAll)\b/;
+const READS_TEST_NAME = /\b(?:currentTestName|getState|getCurrentTest|getCurrentSuite|aroundEach|aroundAll)\b/;
+const PLAIN_API = new Set([
+  ...CASE_CALLEES,
+  ...SUITE_CALLEES,
+  ...HOOKS,
+  ...MOCKERS,
+  'assert',
+  'assertType',
+  'expectTypeOf',
+  'spyOn',
+  'setSystemTime',
+]);
+const CASE_MODIFIERS = new Set([...NOT_RUN, 'each', 'for', 'only', 'concurrent', 'sequential', 'shuffle']);
+const EXPECT_MEMBERS = new Set([
+  'not',
+  'soft',
+  'poll',
+  'assertions',
+  'hasAssertions',
+  'unreachable',
+  'any',
+  'anything',
+  'objectContaining',
+  'arrayContaining',
+  'stringContaining',
+  'stringMatching',
+  'closeTo',
+]);
+const FIXTURE_MEMBERS = new Set(['extend', 'override', 'scoped']);
 const TEST_MODULE = /^(?:vitest|bun:test|@jest\/globals|@vitest\/.*)$/;
 const ASSERTION = /^(?:expect|assert\w*)$/;
 
@@ -264,14 +292,23 @@ function readsContext(fn: ts.Node): boolean {
   );
 }
 
-function hookSeesCase(sourceFile: ts.SourceFile): boolean {
+function frameworkSeesCase(sourceFile: ts.SourceFile): boolean {
   const sees = (node: ts.Node): boolean => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-      const bindings = node.importClause?.namedBindings;
-      if (TEST_MODULE.test(node.moduleSpecifier.text) && bindings) {
-        if (ts.isNamespaceImport(bindings)) return true;
-        if (bindings.elements.some((el) => el.propertyName && HOOKS.has(el.propertyName.text))) return true;
+      const clause = node.importClause;
+      if (TEST_MODULE.test(node.moduleSpecifier.text) && clause && !clause.isTypeOnly) {
+        const bindings = clause.namedBindings;
+        if (clause.name || (bindings && ts.isNamespaceImport(bindings))) return true;
+        const imported = bindings && ts.isNamedImports(bindings) ? bindings.elements : [];
+        if (imported.some((el) => !el.isTypeOnly && (el.propertyName || !PLAIN_API.has(el.name.text)))) return true;
       }
+    }
+    if (ts.isPropertyAccessExpression(node) && FIXTURE_MEMBERS.has(node.name.text)) return true;
+    if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
+      const owner = node.expression.text;
+      const member = node.name.text;
+      if ((CASE_CALLEES.has(owner) || SUITE_CALLEES.has(owner)) && !CASE_MODIFIERS.has(member)) return true;
+      if (owner === 'expect' && !EXPECT_MEMBERS.has(member)) return true;
     }
     if (ts.isCallExpression(node)) {
       const callee = node.expression;
@@ -290,7 +327,7 @@ function hookSeesCase(sourceFile: ts.SourceFile): boolean {
 export function extractCases(file: string, text: string): TestCase[] {
   const kind = file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
   const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
-  const fileJudged = !hookSeesCase(sourceFile);
+  const fileJudged = !frameworkSeesCase(sourceFile);
   const outer = new Normalizer(sourceFile);
   const setup = (level: ts.Node) =>
     (ts.isBlock(level) || ts.isSourceFile(level) ? [...level.statements] : [])
@@ -323,11 +360,11 @@ export function extractCases(file: string, text: string): TestCase[] {
       const isCase = !!callee && CASE_CALLEES.has(callee.base);
       const callback = isCase ? callbackOf(node) : undefined;
       const title = node.arguments[0];
-      if (callee && isCase && !callback && title && ts.isStringLiteralLike(title)) {
+      if (callee && isCase && !callback && title && callee.modifiers.every((m) => CASE_MODIFIERS.has(m))) {
         cases.push({
           file,
           line: sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1,
-          name: title.text,
+          name: ts.isStringLiteralLike(title) ? title.text : title.getText(sourceFile),
           suite: suiteOf(node),
           scope: '',
           statements: [outer.text(node)],

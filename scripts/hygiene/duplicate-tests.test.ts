@@ -216,10 +216,31 @@ it('wider', () => {
       'a harness constructor',
       `class Harness {\n  constructor() {\n    beforeEach(({ task }) => {\n      active = open(task.name);\n    });\n  }\n}\nbackend = new Harness();\n`,
     ],
+    [
+      'an automatic fixture',
+      `const it = base.extend({\n  backend: [async ({ task }, use) => {\n    await use(open(task.name));\n  }, { auto: true }],\n});\n`,
+    ],
+    [
+      'a custom matcher',
+      `expect.extend({\n  toMatchFixture(received) {\n    return { pass: received === load(this.task.name), message: () => '' };\n  },\n});\n`,
+    ],
+    ['a runner import', `import { onTestFailed as failed } from 'vitest';\n`],
     ['a hook reading its arguments', `beforeEach(function () {\n  backend = open(arguments[0].task.name);\n});\n`],
   ])('does not judge a file whose setup can tell its cases apart through %s', (_, setup) => {
     const cases = `it('sqlite', () => {\n  expect(backend.query(1)).toEqual([1]);\n});\n`;
     expect(duplicates(setup + cases, setup + cases + cases.replace('sqlite', 'postgres'))).toEqual([]);
+  });
+
+  it('does not judge sibling suites that override a fixture', () => {
+    const suite = (engine: string) =>
+      `describe('${engine}', () => {\n  test.override({ engine: '${engine}' });\n  test('query', () => {\n    expect(backend.query(1)).toEqual([1]);\n  });\n});\n`;
+    expect(duplicates(suite('sqlite'), suite('sqlite') + suite('postgres'))).toEqual([]);
+  });
+
+  it('does not report duplicates already on main when a change inlines a callback titled by a constant', () => {
+    const inlined = `it(A, () => {\n  expect(f(1)).toBe(2);\n});\nit(B, () => {\n  expect(f(1)).toBe(2);\n});\n`;
+    const shared = `function check() {\n  expect(f(1)).toBe(2);\n}\nit(A, check);\nit(B, check);\n`;
+    expect(duplicates(shared, inlined)).toEqual([]);
   });
 
   it('does not judge a case that reads its arguments', () => {
@@ -235,7 +256,7 @@ it('wider', () => {
   });
 
   it('still judges a file whose only setup is mocks and plain hooks', () => {
-    const setup = `vi.mock('./db');\nexpect.extend({});\nprocess.env.TZ = 'UTC';\nbeforeEach(() => {\n  reset();\n});\n`;
+    const setup = `vi.mock('./db');\nprocess.env.TZ = 'UTC';\nbeforeEach(() => {\n  reset();\n});\n`;
     const cases = `it('a', () => {\n  expect(f(1)).toBe(2);\n});\n`;
     expect(duplicates(setup + cases, setup + cases + cases.replace("'a'", "'b'"))).toEqual(['same-as b <- a']);
   });
