@@ -389,6 +389,18 @@ describe('scanBannedPatterns', () => {
   it('flags a "Current Focus" header', () => {
     expect(scanBannedPatterns('## Current Focus\n\nShip the new dashboard.')).toContain('current_focus_header');
   });
+  it.each([
+    'corrections = ONE batched push after verdict; max 3 pushes/PR; after 3 failed full rounds stop',
+    'Standing rule: at most three pushes per PR.',
+    'The 3-push cap is spent.',
+  ])('flags a push cap: %s', (rule) => {
+    expect(scanBannedPatterns(rule)).toContain('push_cap');
+  });
+  it('passes batching rules that set no push cap', () => {
+    expect(
+      scanBannedPatterns('Corrections = ONE batched push after verdict; push through codex-review.sh push.'),
+    ).toEqual([]);
+  });
   it('passes clean timeless prose', () => {
     expect(scanBannedPatterns('Always verify claims before reporting them done.')).toEqual([]);
   });
