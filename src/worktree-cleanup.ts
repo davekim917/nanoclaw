@@ -1348,7 +1348,6 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
   }
 }
 
-/** A missing `b` is never later; a real `b` after a missing `a` is. */
 function laterThan(a: number | null, b: number | null): boolean {
   if (b === null) return false;
   if (a === null) return true;

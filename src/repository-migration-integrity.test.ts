@@ -293,6 +293,11 @@ describe('repository migration cutover integrity', () => {
     expect(repositoryMigrationPath(archived)).toBe(
       path.join(dataDir, 'repository-migrations', archived.runId, 'wg-a', archived.repo, 'preserved-repository'),
     );
+    for (const unsafe of [{ workgroupId: '../escape' }, { repo: '..' }, { repo: '.git' }]) {
+      expect(() => repositoryMigrationPath({ ...archived, ...unsafe })).toThrow(
+        /Invalid (workgroup id|repository name)/,
+      );
+    }
   });
 
   it('fails a canary audit when the canonical registers an unexpected linked worktree', async () => {

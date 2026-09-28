@@ -1002,7 +1002,7 @@ describe('branch clone checkouts', () => {
    * re-checks before anything is trashed, so the pass must roll back.
    */
   async function runWithLateActivity(
-    worktreesRoot: string,
+    worktreesRoot: string | null,
     afterQuarantine: (quarantinePath: string) => void = () => {},
   ): Promise<{ report: GcReport; quarantinePath: string }> {
     const realRename = fs.renameSync.bind(fs);
@@ -1010,7 +1010,7 @@ describe('branch clone checkouts', () => {
     const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
       realRename(from, to);
       quarantinePath = String(to);
-      state.mounts = [worktreesRoot];
+      if (worktreesRoot) state.mounts = [worktreesRoot];
       afterQuarantine(quarantinePath);
     });
     process.env.NANOCLAW_STORAGE_GC = 'apply';
@@ -1041,6 +1041,22 @@ describe('branch clone checkouts', () => {
     // Nothing is left in quarantine and no marker survives, in either place.
     expect(fs.readdirSync(path.join(state.dataDir, '.gc-quarantine'))).toEqual([]);
     expect(fs.readdirSync(primary.topicDir)).toEqual(['worktrees']);
+    expect(state.trashed).toEqual([]);
+  });
+
+  it('an inbound.db that first appears after the idle snapshot is late activity', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'late-inbound', 'repo-a', 'nc-topic');
+    state.rows = [idleRow('late-inbound')];
+    const inbound = path.join(state.dataDir, 'v2-sessions', 'ag-s-late-inbound', 's-late-inbound', 'inbound.db');
+    expect(fs.existsSync(inbound)).toBe(false);
+
+    const { report } = await runWithLateActivity(null, () => {
+      fs.mkdirSync(path.dirname(inbound), { recursive: true });
+      fs.writeFileSync(inbound, '');
+    });
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
     expect(state.trashed).toEqual([]);
   });
 

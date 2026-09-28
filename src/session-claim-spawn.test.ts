@@ -1085,14 +1085,11 @@ describe('claim-first spawn', () => {
 });
 
 /**
- * The ordering argument, as a source property.
- *
- * The claim is the last `await` in `spawnContainer`, so the guard evaluation
- * and `spawn()` stay adjacent — a request landing in any earlier window is seen
- * at the guard point, and one landing after registration takes the ordinary
- * running-container path. Seam 3 §4.5 I-1 pins that adjacency; the release on
- * refusal is the one `await` in the span, and it sits in a `catch` clause,
- * which is unreachable from the path that reaches `spawn()`.
+ * The ordering argument, as a source property: after the claim, only the
+ * central-lease acquisition is awaited, and the guard, `spawn()` and the
+ * registration run synchronously inside that one callback. A request landing
+ * in any earlier window is seen at the guard point; one landing after
+ * registration takes the ordinary running-container path.
  */
 describe('nothing is awaited between the guard and spawn', () => {
   it('has no await on the control-flow path from the guard point to spawn()', () => {
@@ -1150,6 +1147,28 @@ describe('nothing is awaited between the guard and spawn', () => {
     for (const release of releases) {
       expect(inCatch(release), 'the claim release is not in a catch clause').toBe(true);
       expect(release.getStart(source)).toBeGreaterThan(spawnCall!.getEnd());
+    }
+
+    const claimAwait = awaits.find((node) => text(node.expression).startsWith('claimSessionRun('));
+    expect(claimAwait, 'spawnContainer no longer awaits claimSessionRun').toBeDefined();
+    const afterClaim = awaits.filter(
+      (node) => node.getStart(source) > claimAwait!.getEnd() && node.getStart(source) < spawnCall!.getStart(source),
+    );
+    expect(afterClaim).toHaveLength(1);
+    const leaseCall = afterClaim[0]!.expression;
+    expect(ts.isCallExpression(leaseCall) && text(leaseCall.expression)).toBe('withCentralSync');
+
+    const callback = (leaseCall as ts.CallExpression).arguments[0]!;
+    const insideCallback = (node: ts.Node): boolean =>
+      node.getStart(source) >= callback.getStart(source) && node.getEnd() <= callback.getEnd();
+    const registration = calls.find((call) => text(call.expression) === 'activeContainers.set');
+    expect(registration, 'spawnContainer no longer registers the spawned container').toBeDefined();
+    for (const [label, call] of [
+      ['guard', guardCall!],
+      ['spawn', spawnCall!],
+      ['registration', registration!],
+    ] as const) {
+      expect(insideCallback(call), `${label} is outside the withCentralSync callback`).toBe(true);
     }
   });
 });

@@ -609,6 +609,31 @@ describe('buildMounts agent surfaces', async () => {
     expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf8')).not.toContain('## Workgroup wiki');
   });
 
+  it('mounts the workgroup memory lock after the writable workgroup tree it sits inside', async () => {
+    const ag = group('ag-memory-lock-order', 'memory-lock-order');
+    await createAgentGroup(ag);
+    assignWorkgroup(ag, 'lock-wg');
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+    fs.mkdirSync(path.join(DATA_DIR, 'workgroups', 'lock-wg'), { recursive: true });
+    fs.writeFileSync(path.join(DATA_DIR, 'workgroups', 'lock-wg', '.migrated'), '');
+
+    const mounts = await buildMounts(
+      ag,
+      session('s-memory-lock-order', ag.id),
+      containerConfig(),
+      'claude',
+      {},
+      'lock-wg',
+    );
+    const containerPaths = mounts.map((mount) => mount.containerPath);
+    const tree = containerPaths.indexOf('/workspace/workgroup');
+    const lock = containerPaths.indexOf('/workspace/workgroup/.memory-write.lock');
+
+    expect(tree).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeGreaterThan(tree);
+  });
+
   it('mounts the workgroup wiki read-only for every provider sibling and composes its section', async () => {
     const claudeAg = group('ag-wiki-main', 'wiki-main');
     const siblingAg = group('ag-wiki-codex', 'wiki-codex');
