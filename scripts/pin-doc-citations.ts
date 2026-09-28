@@ -4,7 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { walkArgs } from './lib/cli-args.js';
-import { citationRuns, gitRead, type CitationRun, type FileLineCitation } from './lib/doc-citations.js';
+import {
+  citationRuns,
+  gitIsShallowRepo,
+  gitRead,
+  type CitationRun,
+  type FileLineCitation,
+} from './lib/doc-citations.js';
 
 const MAX_EARLIER_VERSIONS = 1000;
 const USAGE =
@@ -189,6 +195,7 @@ export function pinDocs(
   citedFiles: readonly string[],
   options: { rev?: string; write?: boolean } = {},
 ): PinOutcome[] {
+  if (gitIsShallowRepo(root)) throw new Error('a shallow clone hides earlier versions; fetch full history first');
   const rev = options.rev ?? 'HEAD';
   const outcomes: PinOutcome[] = [];
   for (const doc of docs) {
@@ -293,7 +300,13 @@ function main(): void {
     else files.push(arg);
   });
   const root = (gitRead(process.cwd(), ['rev-parse', '--show-toplevel']) ?? fail('not inside a git repo')).trim();
-  const outcomes = pinDocs(root, docs.length > 0 ? docs : reviewNotesDocs(root), files, { rev, write: !dryRun });
+  let outcomes: PinOutcome[];
+  try {
+    outcomes = pinDocs(root, docs.length > 0 ? docs : reviewNotesDocs(root), files, { rev, write: !dryRun });
+  } catch (err) {
+    console.error(`pin-doc-citations: ${(err as Error).message}`);
+    process.exit(2);
+  }
   for (const outcome of outcomes) {
     if (outcome.kind === 'pinned')
       console.log(

@@ -511,6 +511,19 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
   });
 
+  it('refuses to run in a shallow clone', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() {}\n');
+    commit(root, 'one');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` decides it\n');
+    commit(root, 'two');
+    const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'pin-doc-citations-shallow-'));
+    roots.push(shallow);
+    spawnSync('git', ['clone', '-q', '--depth', '1', `file://${root}`, shallow]);
+
+    expect(() => pinDocs(shallow, [NOTE], [])).toThrow(/shallow clone/);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
