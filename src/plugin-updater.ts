@@ -1,6 +1,6 @@
 /**
- * Hourly `git pull --ff-only` of each `~/plugins/<name>`, then a refresh of the derived Codex surfaces; optionally
- * notifies `PLUGIN_UPDATE_NOTIFY_JID` when any plugin advanced.
+ * Hourly `git pull --ff-only` of each `~/plugins/<name>`, `npm ci --ignore-scripts` wherever it changed a lockfile,
+ * then a refresh of the derived Codex surfaces; notifies `PLUGIN_UPDATE_NOTIFY_JID` (if set) when any plugin advanced.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -22,6 +22,9 @@ const INTERVAL_MS = 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 5 * 60 * 1000; // let the host settle after boot
 const GIT_PULL_TIMEOUT_MS = 30_000;
 const CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS = 60_000;
+const NPM_CI_TIMEOUT_MS = 5 * 60_000;
+const NPM_CI_ARGS = ['ci', '--ignore-scripts'];
+const NPM_LOCKFILE = 'package-lock.json';
 
 // The hourly refresh would repeat the missing-codex-binary line forever; log it once per process.
 let codexBinaryMissingLogged = false;
@@ -48,16 +51,28 @@ export interface CodexSurfaceRefreshResult {
   localPluginCache?: ReturnType<typeof syncCodexLocalMarketplacePluginCache>;
 }
 
+async function gitHead(pluginPath: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+    cwd: pluginPath,
+    timeout: GIT_PULL_TIMEOUT_MS,
+    encoding: 'utf-8',
+  });
+  return stdout.trim();
+}
+
 async function updatePlugin(pluginPath: string, name: string): Promise<UpdateResult> {
   try {
+    const before = await gitHead(pluginPath);
     const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
       cwd: pluginPath,
       timeout: GIT_PULL_TIMEOUT_MS,
       encoding: 'utf-8',
     });
-    const changed = !stdout.includes('Already up to date.');
+    const after = await gitHead(pluginPath);
+    const changed = before !== after;
     if (changed) {
       log.info('Plugin updated', { plugin: name, output: stdout.trim() });
+      await installChangedLockfiles(pluginPath, name, before, after);
     }
     return { plugin: name, changed };
   } catch (err) {
@@ -65,6 +80,65 @@ async function updatePlugin(pluginPath: string, name: string): Promise<UpdateRes
     log.warn('Plugin update failed', { plugin: name, err: msg });
     return { plugin: name, changed: false, error: msg };
   }
+}
+
+async function installChangedLockfiles(pluginPath: string, name: string, from: string, to: string): Promise<void> {
+  let lockfiles: string[];
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['diff', '--name-only', '-z', '--diff-filter=d', `${from}..${to}`, '--', `:(glob)**/${NPM_LOCKFILE}`],
+      { cwd: pluginPath, timeout: GIT_PULL_TIMEOUT_MS, encoding: 'utf-8' },
+    );
+    lockfiles = stdout.split('\0').filter(Boolean);
+  } catch (err) {
+    log.warn('Plugin lockfile diff failed; skipping dependency install', {
+      plugin: name,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  for (const lockfile of lockfiles) {
+    const dir = path.dirname(lockfile);
+    const cwd = path.join(pluginPath, dir);
+    const command = ['npm', ...NPM_CI_ARGS].join(' ');
+    const refusal = lockfileRefusal(path.join(pluginPath, lockfile));
+    if (refusal) {
+      log.warn('Plugin dependency install refused', { plugin: name, dir, command, reason: refusal });
+      continue;
+    }
+    try {
+      await execFileAsync('npm', NPM_CI_ARGS, { cwd, timeout: NPM_CI_TIMEOUT_MS, encoding: 'utf-8' });
+      log.info('Plugin dependencies installed', { plugin: name, dir, command });
+    } catch (err) {
+      log.warn('Plugin dependency install failed', {
+        plugin: name,
+        dir,
+        command,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+function lockfileRefusal(lockfilePath: string): string | null {
+  let lock: { lockfileVersion?: unknown; packages?: Record<string, { resolved?: unknown; link?: unknown }> };
+  try {
+    lock = JSON.parse(fs.readFileSync(lockfilePath, 'utf-8'));
+  } catch (err) {
+    return `unreadable lockfile: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (typeof lock.lockfileVersion !== 'number' || lock.lockfileVersion < 2 || !lock.packages) {
+    return 'lockfile predates lockfileVersion 2';
+  }
+  const nonRegistry = Object.entries(lock.packages)
+    .filter(([, entry]) => entry.link !== true && typeof entry.resolved === 'string')
+    .filter(([, entry]) => !(entry.resolved as string).startsWith('https://'))
+    .map(([key]) => key);
+  return nonRegistry.length > 0
+    ? `non-registry dependencies, whose prepare scripts npm runs despite --ignore-scripts: ${nonRegistry.join(', ')}`
+    : null;
 }
 
 /** Pull every `~/plugins/<name>`; no notification side effect. */
