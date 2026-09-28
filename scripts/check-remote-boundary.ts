@@ -117,39 +117,8 @@ function git(args: string[], cwd = INSTALL_ROOT): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
 
-/**
- * The snapshot's own committed allowlist, never the install checkout's (it lags origin/main and
- * can hold uncommitted edits). `lstat`, not `stat`: a symlink would otherwise exempt whatever it
- * points at. Missing → an empty temp allowlist (exempts nothing); present but not a regular file
- * → throws.
- */
-export function resolveAllowlistPath(snapshot: string): { path: string; usedFallback: boolean; cleanup: () => void } {
-  const treeAllowlist = path.join(snapshot, '.public-boundary-allowlist.json');
-  let stat: fs.Stats;
-  try {
-    stat = fs.lstatSync(treeAllowlist);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-remote-boundary-allowlist-'));
-    const emptyAllowlist = path.join(dir, 'allowlist.json');
-    fs.writeFileSync(emptyAllowlist, '{"entries": []}\n');
-    return {
-      path: emptyAllowlist,
-      usedFallback: true,
-      cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
-    };
-  }
-  if (!stat.isFile()) {
-    throw new Error(
-      `${treeAllowlist} is committed but is not a regular file (a symlink, most likely) — refusing to treat it as the allowlist`,
-    );
-  }
-  return { path: treeAllowlist, usedFallback: false, cleanup: () => {} };
-}
-
 export interface CheckerInvocation {
   root: string;
-  allowlistPath: string;
 }
 
 interface CheckerResult {
@@ -158,36 +127,23 @@ interface CheckerResult {
   error?: Error;
 }
 
-/** Injected so tests pin which path actually reaches `--allowlist`. */
+/** Injected so tests pin the checker invocation. */
 export type RunChecker = (invocation: CheckerInvocation) => CheckerResult;
 
-const REAL_RUN_CHECKER: RunChecker = ({ root, allowlistPath }) => {
-  const result = spawnSync(
-    'pnpm',
-    ['run', 'check:public-boundary', '--', '--root', root, '--index', '--allowlist', allowlistPath],
-    { cwd: INSTALL_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
-  );
+// No --allowlist: an index scan reads the snapshot's committed copy, never the install checkout's.
+const REAL_RUN_CHECKER: RunChecker = ({ root }) => {
+  const result = spawnSync('pnpm', ['run', 'check:public-boundary', '--', '--root', root, '--index'], {
+    cwd: INSTALL_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   return { status: result.status, stderr: result.stderr ?? '', error: result.error };
 };
 
-export function scanSnapshot(
-  snapshot: string,
-  commit: string,
-  runChecker: RunChecker = REAL_RUN_CHECKER,
-): BoundaryScan {
-  const allowlist = resolveAllowlistPath(snapshot);
-  if (allowlist.usedFallback) {
-    console.error(
-      `remote-boundary: ${REF_LABEL} @ ${commit} has no committed .public-boundary-allowlist.json — scanning with an empty allowlist`,
-    );
-  }
-  try {
-    const result = runChecker({ root: snapshot, allowlistPath: allowlist.path });
-    if (result.error) throw result.error;
-    return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr) };
-  } finally {
-    allowlist.cleanup();
-  }
+export function scanSnapshot(snapshot: string, runChecker: RunChecker = REAL_RUN_CHECKER): BoundaryScan {
+  const result = runChecker({ root: snapshot });
+  if (result.error) throw result.error;
+  return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr) };
 }
 
 interface SnapshotRun<T> {
@@ -279,7 +235,7 @@ async function main(): Promise<number> {
   try {
     git(['fetch', '--quiet', 'origin', 'main']);
     commit = git(['rev-parse', '--short', REF]);
-    ({ value: scan, cleanupError } = withSnapshot(commit, (snapshot) => scanSnapshot(snapshot, commit)));
+    ({ value: scan, cleanupError } = withSnapshot(commit, (snapshot) => scanSnapshot(snapshot)));
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (err) {
     // Nothing was scanned: fail the unit and let OnFailure carry it.

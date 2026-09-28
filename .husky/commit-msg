@@ -14,21 +14,4 @@
 msg_path=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 
-# Version skew is expected and must NOT hard-block.
-#
-# The hook always runs the MAIN checkout's script, but the hook file itself
-# comes from whichever worktree is committing. So a worktree that has this hook
-# while main's script predates `--message` would fail every commit with
-# "unknown argument" — which is what happened the first time this was wired.
-# A gate that blocks all work because it cannot run is worse than one that
-# announces it is not running: the first gets disabled with --no-verify, and
-# then nothing is checked at all.
-#
-# Skip loudly instead. This self-heals the moment main carries the flag, and
-# pre-commit and pre-push still gate the actual file content meanwhile.
-if ! grep -q "'--message'" "$repo_root/scripts/check-public-boundary.ts" 2>/dev/null; then
-  echo "commit-msg boundary gate SKIPPED — $repo_root/scripts/check-public-boundary.ts predates --message" >&2
-  exit 0
-fi
-
 (cd "$repo_root" && pnpm run check:public-boundary -- --message "$msg_path")

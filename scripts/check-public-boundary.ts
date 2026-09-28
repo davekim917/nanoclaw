@@ -20,7 +20,8 @@ export type ScanCategory =
   | 'linear-workspace-url'
   | 'vendor-organization-id'
   | 'forbidden-artifact-path'
-  | 'unscannable-content';
+  | 'unscannable-content'
+  | 'unreadable-content';
 
 export interface Finding {
   file: string;
@@ -38,7 +39,8 @@ interface AllowlistEntry {
 
 interface ScanInput {
   file: string;
-  content: Buffer | null;
+  /** Null: no content on this surface (deleted, or a submodule), though the path still publishes. */
+  content: Buffer | null | 'unreadable';
 }
 
 export interface ScanOptions {
@@ -49,7 +51,8 @@ export interface ScanOptions {
   dbPath?: string;
   // Undefined: resolve the local default, then the main checkout's.
   identifiersPath?: string;
-  allowlistPath: string;
+  // Undefined: the scanned surface's own copy (the index copy for an index scan).
+  allowlistPath?: string;
   // Scan ONE text file (the commit-msg hook's message file): messages publish with the branch.
   messagePath?: string;
   // A committed message is history, not an editor buffer: scan its scissors and comment text too.
@@ -62,6 +65,7 @@ export interface ScanOptions {
 const DEFAULT_DB_RELATIVE = path.join('data', 'v2.db');
 const DEFAULT_IDENTIFIERS_RELATIVE = path.join('.nanoclaw', 'public-boundary-identifiers');
 const DEFAULT_BASELINE_RELATIVE = '.public-boundary-baseline.json';
+const DEFAULT_ALLOWLIST_RELATIVE = '.public-boundary-allowlist.json';
 
 // A repository name built only from these words names a kind of repository, not a client.
 const GENERIC_REPOSITORY_WORDS = new Set([
@@ -382,6 +386,15 @@ function addIdentifier(target: Set<string>, value: unknown): void {
   }
 }
 
+// SELECT * rather than naming columns: a column an older or newer schema lacks costs only that column.
+const REGISTRY_COLUMNS: Record<string, string[]> = {
+  workgroups: ['id', 'display_name'],
+  agent_groups: ['id', 'name', 'folder', 'workgroup_id'],
+  messaging_groups: ['id', 'platform_id', 'instance', 'name'],
+  users: ['id', 'display_name'],
+  container_configs: ['assistant_name'],
+};
+
 export function loadRegistryIdentifiers(dbPath: string): Set<string> {
   if (!fs.existsSync(dbPath)) throw new Error('install registry is missing');
   let db: Database.Database;
@@ -392,23 +405,22 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
   }
 
   const identifiers = new Set<string>();
-  const queries = [
-    'SELECT id, display_name FROM workgroups',
-    'SELECT id, name, folder, workgroup_id FROM agent_groups',
-    'SELECT id, platform_id, instance, name FROM messaging_groups',
-    // system:* ids are constants in tracked host scripts, not install-private.
-    "SELECT id, display_name FROM users WHERE id NOT LIKE 'system:%'",
-    'SELECT assistant_name FROM container_configs',
-  ];
   try {
-    for (const query of queries) {
-      const rows = readSource(() => db.prepare(query).all() as Record<string, unknown>[], isMissingSchema);
-      if (!rows.ok) {
-        if (rows.absent) continue;
-        throw new Error('install registry is unreadable');
+    for (const [table, columns] of Object.entries(REGISTRY_COLUMNS)) {
+      let rows: Record<string, unknown>[];
+      try {
+        const exists = db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ? COLLATE NOCASE")
+          .get(table);
+        if (!exists) continue;
+        rows = db.prepare(`SELECT * FROM "${table}"`).all() as Record<string, unknown>[];
+      } catch (err) {
+        throw new Error('install registry is unreadable', { cause: err });
       }
-      for (const row of rows.value) {
-        for (const value of Object.values(row)) addIdentifier(identifiers, value);
+      for (const row of rows) {
+        // system:* ids are constants in tracked host scripts, not install-private.
+        if (table === 'users' && /^system:/i.test(String(row.id))) continue;
+        for (const column of columns) addIdentifier(identifiers, row[column]);
       }
     }
   } finally {
@@ -517,17 +529,12 @@ function isMissingPath(err: unknown): boolean {
   return errorCode(err) === 'ENOENT' || errorCode(err) === 'ENOTDIR';
 }
 
-// An older registry schema lacks a table or column; that is absence, not damage.
-function isMissingSchema(err: unknown): boolean {
-  return err instanceof Error && /^no such (?:table|column)\b/.test(err.message);
-}
-
 // Absent is fine; any other failure means a source's names are unknown and discovery is incomplete.
-function readSource<T>(read: () => T, isAbsent: (err: unknown) => boolean = isMissingPath): SourceRead<T> {
+function readSource<T>(read: () => T): SourceRead<T> {
   try {
     return { ok: true, value: read() };
   } catch (err) {
-    return { ok: false, absent: isAbsent(err) };
+    return { ok: false, absent: isMissingPath(err) };
   }
 }
 
@@ -614,12 +621,24 @@ export function loadLocalIdentifiers(identifiersPath: string): Set<string> {
   return identifiers;
 }
 
-function loadAllowlist(allowlistPath: string): AllowlistEntry[] {
+// An explicit path must exist. The surface's own copy may be absent, which exempts nothing.
+function loadAllowlist(options: ScanOptions): AllowlistEntry[] {
+  let text: string | null;
+  if (options.allowlistPath !== undefined) {
+    try {
+      text = fs.readFileSync(options.allowlistPath, 'utf8');
+    } catch (err) {
+      throw new Error('public boundary allowlist is missing or unreadable', { cause: err });
+    }
+  } else {
+    text = readSurfaceFile(options, DEFAULT_ALLOWLIST_RELATIVE, 'public boundary allowlist');
+  }
+  if (text === null) return [];
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(allowlistPath, 'utf8'));
+    parsed = JSON.parse(text);
   } catch (err) {
-    throw new Error('public boundary allowlist is missing or invalid', { cause: err });
+    throw new Error('public boundary allowlist is invalid JSON', { cause: err });
   }
   if (
     !parsed ||
@@ -645,29 +664,25 @@ function isAllowed(file: string, value: string, allowlist: AllowlistEntry[]): bo
 }
 
 function isSerializedAllowlistValue(file: string, value: string, allowlist: AllowlistEntry[]): boolean {
-  return path.basename(file) === '.public-boundary-allowlist.json' && allowlist.some((entry) => entry.value === value);
+  return file === DEFAULT_ALLOWLIST_RELATIVE && allowlist.some((entry) => entry.value === value);
 }
 
-function lineNumber(content: string, offset: number): number {
-  let line = 1;
-  for (let i = 0; i < offset; i += 1) {
-    if (content.charCodeAt(i) === 10) line += 1;
-  }
-  return line;
-}
-
-function addFinding(target: Finding[], finding: Finding): void {
-  if (
-    !target.some(
-      (existing) =>
-        existing.file === finding.file &&
-        existing.line === finding.line &&
-        existing.category === finding.category &&
-        existing.inPath === finding.inPath,
-    )
-  ) {
-    target.push(finding);
-  }
+function lineLocator(text: string): (offset: number) => number {
+  let starts: number[] | null = null;
+  return (offset) => {
+    if (!starts) {
+      starts = [0];
+      for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) starts.push(i + 1);
+    }
+    let low = 0;
+    let high = starts.length - 1;
+    while (low < high) {
+      const mid = (low + high + 1) >> 1;
+      if (starts[mid] <= offset) low = mid;
+      else high = mid - 1;
+    }
+    return low + 1;
+  };
 }
 
 // Content that is neither NUL-free nor BOM-marked UTF-16 passes unscanned only under one of these extensions.
@@ -756,6 +771,8 @@ function findMatches(
   allowlist: AllowlistEntry[],
 ): Match[] {
   const matches: Match[] = [];
+  const textLine = lineLocator(text);
+  const identifierLine = identifierText === text ? textLine : lineLocator(identifierText);
   for (const rule of STRUCTURAL_RULES) {
     rule.pattern.lastIndex = 0;
     for (const match of text.matchAll(rule.pattern)) {
@@ -767,7 +784,7 @@ function findMatches(
       )
         continue;
       matches.push({
-        line: lineNumber(text, match.index),
+        line: textLine(match.index),
         category: rule.category,
         start: match.index,
         end: match.index + value.length,
@@ -782,7 +799,7 @@ function findMatches(
       for (const match of identifierText.matchAll(pattern)) {
         const start = match.index + (match[1]?.length ?? 0);
         matches.push({
-          line: lineNumber(identifierText, start),
+          line: identifierLine(start),
           category: 'private-identifier',
           start,
           end: match.index + match[0].length,
@@ -812,7 +829,11 @@ export function scanInputs(
   privateIdentifiers: Set<string>,
   allowlist: AllowlistEntry[],
 ): Finding[] {
-  const findings: Finding[] = [];
+  const findings = new Map<string, Finding>();
+  const addFinding = (finding: Finding): void => {
+    const key = [finding.file, finding.line, finding.category, finding.inPath ?? ''].join('\0');
+    if (!findings.has(key)) findings.set(key, finding);
+  };
   const matchers = [...privateIdentifiers].map(identifierMatcher);
   const normalize = matchers.some((matcher) => matcher.unicode);
   const forIdentifiers = (text: string): string => (normalize ? text.normalize('NFC') : text);
@@ -820,42 +841,113 @@ export function scanInputs(
     const pathText = forIdentifiers(input.file);
     const pathMatches = findMatches(input.file, pathText, pathText, matchers, allowlist);
     const file = pathMatches.length > 0 ? redactPath(pathText, pathMatches) : input.file;
-    for (const match of pathMatches) addFinding(findings, { file, line: 0, category: match.category, inPath: true });
+    for (const match of pathMatches) addFinding({ file, line: 0, category: match.category, inPath: true });
 
     if (FORBIDDEN_PATHS.some((pattern) => pattern.test(input.file))) {
-      addFinding(findings, { file, line: 1, category: 'forbidden-artifact-path' });
+      addFinding({ file, line: 1, category: 'forbidden-artifact-path' });
     }
     if (input.content === null) continue;
+    if (input.content === 'unreadable') {
+      addFinding({ file, line: 1, category: 'unreadable-content' });
+      continue;
+    }
     const decoded = decodeContent(input.file, input.content);
     if (decoded.kind === 'binary') continue;
     if (decoded.kind === 'unscannable') {
-      addFinding(findings, { file, line: 1, category: 'unscannable-content' });
+      addFinding({ file, line: 1, category: 'unscannable-content' });
       continue;
     }
     for (const match of findMatches(input.file, decoded.text, forIdentifiers(decoded.text), matchers, allowlist)) {
-      addFinding(findings, { file, line: match.line, category: match.category });
+      addFinding({ file, line: match.line, category: match.category });
     }
   }
-  return findings.sort(
+  return [...findings.values()].sort(
     (a, b) => a.file.localeCompare(b.file) || a.line - b.line || a.category.localeCompare(b.category),
   );
 }
 
-function trackedInputs(root: string, index: boolean): ScanInput[] {
-  const files = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
-  const inputs: ScanInput[] = [];
-  for (const file of files) {
-    let content: Buffer | null = null;
-    try {
-      content = index
-        ? execFileSync('git', ['show', `:${file}`], { cwd: root, encoding: 'buffer', maxBuffer: 32 * 1024 * 1024 })
-        : fs.readFileSync(path.join(root, file));
-    } catch {
-      // A tracked file deleted from the selected surface has no content to scan; its path still publishes.
-    }
-    inputs.push({ file, content });
+const GITLINK_MODE = '160000';
+// One read of every index blob; a tree past this reads as unreadable rather than partly scanned.
+const MAX_INDEX_BYTES = 1024 * 1024 * 1024;
+
+// A replacement ref would substitute an object that commit and push still publish as the original.
+function originalObjectsEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' };
+}
+
+interface IndexEntry {
+  mode: string;
+  oid: string;
+  /** False for a conflicted path, which has no single blob to commit. */
+  merged: boolean;
+}
+
+function indexEntries(root: string): Map<string, IndexEntry> {
+  const listed = execFileSync('git', ['ls-files', '-z', '--stage'], {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 256 * 1024 * 1024,
+  });
+  const entries = new Map<string, IndexEntry>();
+  for (const record of listed.split('\0').filter(Boolean)) {
+    const match = /^(\d+) ([0-9a-f]+) (\d)\t(.+)$/s.exec(record);
+    if (!match) throw new Error('the tracked file list could not be parsed');
+    const [, mode, oid, stage, file] = match;
+    entries.set(file, { mode, oid, merged: stage === '0' && !entries.has(file) });
   }
-  return inputs;
+  return entries;
+}
+
+// An object git reports missing, or output that cannot be parsed, leaves that blob out of the map.
+function readIndexBlobs(root: string, oids: string[]): Map<string, Buffer> {
+  const blobs = new Map<string, Buffer>();
+  if (oids.length === 0) return blobs;
+  const result = spawnSync('git', ['cat-file', '--batch'], {
+    cwd: root,
+    env: originalObjectsEnv(),
+    input: `${oids.join('\n')}\n`,
+    stdio: ['pipe', 'pipe', 'ignore'],
+    maxBuffer: MAX_INDEX_BYTES,
+  });
+  if (result.status !== 0 || !Buffer.isBuffer(result.stdout)) return blobs;
+  const out = result.stdout;
+  let at = 0;
+  for (const oid of oids) {
+    const headerEnd = out.indexOf(10, at);
+    if (headerEnd === -1) break;
+    const header = /^(\S+) (?:missing|(\S+) (\d+))$/.exec(out.toString('utf8', at, headerEnd));
+    if (header?.[1] !== oid) break;
+    if (header[3] === undefined) {
+      at = headerEnd + 1;
+      continue;
+    }
+    const end = headerEnd + 1 + Number(header[3]);
+    if (end >= out.length || out[end] !== 10) break;
+    if (header[2] === 'blob') blobs.set(oid, out.subarray(headerEnd + 1, end));
+    at = end + 1;
+  }
+  return blobs;
+}
+
+function worktreeContent(root: string, file: string): Buffer | null | 'unreadable' {
+  const full = path.join(root, file);
+  try {
+    // A symlink publishes its target text, which is what git stores as its blob.
+    return fs.lstatSync(full).isSymbolicLink() ? fs.readlinkSync(full, { encoding: 'buffer' }) : fs.readFileSync(full);
+  } catch (err) {
+    return isMissingPath(err) ? null : 'unreadable';
+  }
+}
+
+function trackedInputs(root: string, index: boolean): ScanInput[] {
+  const entries = indexEntries(root);
+  const wanted = [...entries.values()].filter((entry) => entry.merged && entry.mode !== GITLINK_MODE);
+  const blobs = index ? readIndexBlobs(root, [...new Set(wanted.map((entry) => entry.oid))]) : null;
+  return [...entries].map(([file, entry]) => {
+    if (entry.mode === GITLINK_MODE) return { file, content: null };
+    if (!blobs) return { file, content: worktreeContent(root, file) };
+    return { file, content: (entry.merged && blobs.get(entry.oid)) || 'unreadable' };
+  });
 }
 
 export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions {
@@ -865,7 +957,6 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     portable: false,
     allowStructural: false,
     messageRaw: false,
-    allowlistPath: '.public-boundary-allowlist.json',
     writeBaseline: false,
     acceptGrowth: false,
   };
@@ -890,6 +981,7 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
   if (options.messagePath === '') throw new Error('--message requires a path');
   if (options.messageRaw && !options.messagePath) throw new Error('--message-raw requires --message');
   if (options.baselinePath === '') throw new Error('--baseline requires a path');
+  if (options.allowlistPath === '') throw new Error('--allowlist requires a path');
   if (options.acceptGrowth && !options.writeBaseline) throw new Error('--accept-growth requires --write-baseline');
   if (options.writeBaseline && (options.messagePath || options.portable))
     throw new Error('--write-baseline scans the tracked tree with install identifiers');
@@ -897,7 +989,7 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
   if (options.messagePath) options.messagePath = path.resolve(options.root, options.messagePath);
   if (options.identifiersPath !== undefined)
     options.identifiersPath = path.resolve(options.root, options.identifiersPath);
-  options.allowlistPath = path.resolve(options.root, options.allowlistPath);
+  if (options.allowlistPath) options.allowlistPath = path.resolve(options.root, options.allowlistPath);
   if (options.dbPath) options.dbPath = path.resolve(options.root, options.dbPath);
   if (options.baselinePath) options.baselinePath = path.resolve(options.root, options.baselinePath);
   return options;
@@ -917,8 +1009,9 @@ function findMainCheckoutRoot(root: string): string | null {
   return candidateRoot === path.resolve(root) ? null : candidateRoot;
 }
 
-// A bad explicit path throws; a missing or broken default is a soft miss, so it can't block the
-// main-checkout fallback.
+// A bad explicit path throws; a missing or broken default is a soft miss (origin 'none'). A linked
+// worktree reads only the main checkout's copy: its own (a stub, or a file force-added to a pushed
+// snapshot) must never stand in for the install's.
 function resolveIdentifierSet(
   explicitPath: string | undefined,
   root: string,
@@ -929,22 +1022,16 @@ function resolveIdentifierSet(
   if (explicitPath !== undefined) {
     return { identifiers: loader(explicitPath), origin: 'explicit', attemptedPaths: [explicitPath] };
   }
-  const attemptedPaths = [path.join(root, defaultRelative)];
+  const attemptedPaths = [path.join(mainCheckoutRoot ?? root, defaultRelative)];
   try {
-    return { identifiers: loader(attemptedPaths[0]), origin: 'local', attemptedPaths };
+    return {
+      identifiers: loader(attemptedPaths[0]),
+      origin: mainCheckoutRoot ? 'main-checkout' : 'local',
+      attemptedPaths,
+    };
   } catch {
-    // fall through to the main-checkout fallback below
+    return { identifiers: new Set(), origin: 'none', attemptedPaths };
   }
-  if (mainCheckoutRoot) {
-    const mainCheckoutPath = path.join(mainCheckoutRoot, defaultRelative);
-    attemptedPaths.push(mainCheckoutPath);
-    try {
-      return { identifiers: loader(mainCheckoutPath), origin: 'main-checkout', attemptedPaths };
-    } catch {
-      // fall through to "none"
-    }
-  }
-  return { identifiers: new Set(), origin: 'none', attemptedPaths };
 }
 
 export interface RunReport {
@@ -1014,45 +1101,44 @@ function runGit(args: string[], cwd: string, env: NodeJS.ProcessEnv): { status: 
   return { status: result.status, stdout: typeof result.stdout === 'string' ? result.stdout : '' };
 }
 
-function readBlob(root: string, objectId: string, env: NodeJS.ProcessEnv): string {
-  const blob = runGit(['cat-file', 'blob', objectId], root, env);
-  if (blob.status !== 0) throw new Error('public boundary baseline object could not be read');
-  return blob.stdout;
-}
-
 // From the index a partial commit will commit. Only the exact path as a regular stage-0 file is
 // policy: a directory, symlink, or another spelling grants nothing.
-function readIndexBaseline(root: string): string | null {
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_LITERAL_PATHSPECS: '1' };
+function readIndexFile(root: string, relative: string, what: string): string | null {
+  const env: NodeJS.ProcessEnv = { ...originalObjectsEnv(), GIT_LITERAL_PATHSPECS: '1' };
   delete env.GIT_ICASE_PATHSPECS;
   delete env.GIT_GLOB_PATHSPECS;
   delete env.GIT_NOGLOB_PATHSPECS;
-  const listed = runGit(['ls-files', '-z', '--stage', '--', DEFAULT_BASELINE_RELATIVE], root, env);
-  if (listed.status !== 0) throw new Error('public boundary baseline could not be read from the index');
+  const listed = runGit(['ls-files', '-z', '--stage', '--', relative], root, env);
+  if (listed.status !== 0) throw new Error(`${what} could not be read from the index`);
   const entry = listed.stdout
     .split('\0')
     .map((line) => /^(\d+) ([0-9a-f]+) (\d)\t(.*)$/s.exec(line))
-    .find((match) => match?.[4] === DEFAULT_BASELINE_RELATIVE);
+    .find((match) => match?.[4] === relative);
   if (!entry) return null;
-  if (entry[1] !== '100644' || entry[3] !== '0')
-    throw new Error('public boundary baseline is not a regular file in the index');
-  return readBlob(root, entry[2], env);
+  if (entry[1] !== '100644' || entry[3] !== '0') throw new Error(`${what} is not a regular file in the index`);
+  const blob = runGit(['cat-file', 'blob', entry[2]], root, env);
+  if (blob.status !== 0) throw new Error(`${what} object could not be read`);
+  return blob.stdout;
 }
 
-function readWorktreeBaseline(root: string): string | null {
+function readWorktreeFile(root: string, relative: string, what: string): string | null {
   let fd: number;
   try {
-    fd = fs.openSync(path.join(root, DEFAULT_BASELINE_RELATIVE), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(path.join(root, relative), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   } catch (err) {
     if (errorCode(err) === 'ENOENT') return null;
-    throw new Error('public boundary baseline is unreadable or a symlink', { cause: err });
+    throw new Error(`${what} is unreadable or a symlink`, { cause: err });
   }
   try {
-    if (!fs.fstatSync(fd).isFile()) throw new Error('public boundary baseline is not a regular file');
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`${what} is not a regular file`);
     return fs.readFileSync(fd, 'utf8');
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function readSurfaceFile(options: ScanOptions, relative: string, what: string): string | null {
+  return options.index ? readIndexFile(options.root, relative, what) : readWorktreeFile(options.root, relative, what);
 }
 
 // Explicit --baseline must exist. A tree without its own copy borrows nothing, so every
@@ -1067,7 +1153,7 @@ function loadBaseline(options: ScanOptions): Baseline | null {
     }
     return parseBaseline(text);
   }
-  const own = options.index ? readIndexBaseline(options.root) : readWorktreeBaseline(options.root);
+  const own = readSurfaceFile(options, DEFAULT_BASELINE_RELATIVE, 'public boundary baseline');
   return own === null ? null : parseBaseline(own);
 }
 
@@ -1156,7 +1242,7 @@ export function runReport(options: ScanOptions): RunReport {
   let identifiersOrigin: IdentifierOrigin | 'skipped' = 'skipped';
   let registryPathsTried: string[] = [];
   let identifiersPathsTried: string[] = [];
-  let discoveryProblems: string[] = [];
+  const discoveryProblems: string[] = [];
 
   if (!options.portable) {
     const mainCheckoutRoot = findMainCheckoutRoot(options.root);
@@ -1167,8 +1253,6 @@ export function runReport(options: ScanOptions): RunReport {
       DEFAULT_DB_RELATIVE,
       (dbPath) => {
         const values = loadRegistryIdentifiers(dbPath);
-        // Reset per attempt: only the install that supplies the names reports on them.
-        discoveryProblems = [];
         const installRoot = installRootOf(dbPath);
         const remotes = publicRemotes(installRoot ? [options.root, installRoot] : [options.root]);
         for (const value of loadInstallIdentifiers(dbPath, remotes, discoveryProblems)) values.add(value);
@@ -1204,7 +1288,7 @@ export function runReport(options: ScanOptions): RunReport {
       `${inexpressible} loaded identifier(s) have no letter or digit the matcher can express; remove them or add a letter or digit`,
     );
   }
-  const allowlist = loadAllowlist(options.allowlistPath);
+  const allowlist = loadAllowlist(options);
   const base = {
     mode,
     registryOrigin,
@@ -1244,6 +1328,9 @@ export function writeBaseline(options: ScanOptions): { written: string; refused:
   }
   if (report.findings.some((finding) => finding.inPath)) {
     throw new Error('--write-baseline refuses while a tracked path matches; rename it first');
+  }
+  if (report.findings.some((f) => f.category === 'unscannable-content' || f.category === 'unreadable-content')) {
+    throw new Error('--write-baseline refuses while a tracked file cannot be scanned; its count would read as removed');
   }
   const target = options.baselinePath ?? path.join(options.root, DEFAULT_BASELINE_RELATIVE);
   const recorded = loadBaseline(options)?.files ?? {};
@@ -1353,6 +1440,11 @@ export function main(argv = process.argv.slice(2)): number {
     if (findings.some((finding) => finding.category === 'unscannable-content')) {
       process.stderr.write(
         'unscannable-content: a NUL byte without a UTF-16 BOM; escape the NUL or re-encode the file, or give a binary file a binary extension\n',
+      );
+    }
+    if (findings.some((finding) => finding.category === 'unreadable-content')) {
+      process.stderr.write(
+        'unreadable-content: a tracked file or its index object could not be read (permissions, I/O, a conflicted path); fix it and rerun\n',
       );
     }
     for (const { file, count, recorded } of exceeded) {

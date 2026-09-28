@@ -1520,3 +1520,159 @@ describe('short and Unicode identifiers', () => {
     );
   });
 });
+
+describe('tracked content that cannot be read fails closed', () => {
+  function stagedRepo(): string {
+    const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    fs.writeFileSync(path.join(root, 'clean.md'), 'nothing private\n');
+    execFileSync('git', ['add', 'clean.md'], { cwd: root });
+    return root;
+  }
+
+  it('reports an index entry whose object cannot be read, and refuses to write a baseline from it', () => {
+    const root = stagedRepo();
+    const absent = 'a'.repeat(40);
+    execFileSync('git', ['update-index', '--add', '--cacheinfo', `100644,${absent},lost.md`], { cwd: root });
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toEqual([
+      { file: 'lost.md', line: 1, category: 'unreadable-content' },
+    ]);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(main(['--root', root, '--index'])).toBe(1);
+    expect(stderr.mock.calls.flat().join('')).toContain('unreadable-content: a tracked file');
+  });
+
+  it('reports a worktree file it may not read, but reads a deleted one as having no content', () => {
+    const root = stagedRepo();
+    fs.chmodSync(path.join(root, 'clean.md'), 0o000);
+    try {
+      expect(run(resolveOptions(['--root', root], root))).toEqual([
+        { file: 'clean.md', line: 1, category: 'unreadable-content' },
+      ]);
+      expect(() => writeBaseline(resolveOptions(['--root', root, '--write-baseline'], root))).toThrow(
+        'cannot be scanned',
+      );
+    } finally {
+      fs.chmodSync(path.join(root, 'clean.md'), 0o644);
+    }
+    fs.rmSync(path.join(root, 'clean.md'));
+    expect(run(resolveOptions(['--root', root], root))).toEqual([]);
+  });
+
+  it('scans a worktree symlink as the target text git stores, not the file it points at', () => {
+    const root = stagedRepo();
+    const outside = path.join(tempRoot(), 'notes.md');
+    fs.writeFileSync(outside, 'Fictional Registry House\n');
+    fs.symlinkSync(outside, path.join(root, 'link.md'));
+    execFileSync('git', ['add', 'link.md'], { cwd: root });
+    expect(run(resolveOptions(['--root', root], root))).toEqual([]);
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toEqual([]);
+  });
+
+  it('reads the original blob when a replacement ref would substitute a clean one', () => {
+    const root = stagedRepo();
+    fs.writeFileSync(path.join(root, 'leak.md'), 'Fictional Registry House\n');
+    execFileSync('git', ['add', 'leak.md'], { cwd: root });
+    const blob = (text: string) =>
+      execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: root, input: text, encoding: 'utf8' }).trim();
+    execFileSync('git', ['replace', blob('Fictional Registry House\n'), blob('nothing private\n')], { cwd: root });
+    expect(run(resolveOptions(['--root', root, '--index'], root))).toEqual([
+      { file: 'leak.md', line: 1, category: 'private-identifier' },
+    ]);
+  });
+});
+
+describe('identifier sources', () => {
+  it('keeps the rest of a registry table when one of its columns is missing', () => {
+    const dbPath = path.join(tempRoot(), 'data', 'v2.db');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE users (id TEXT);
+      INSERT INTO users VALUES ('slack:fictional-person'), ('system:host');
+    `);
+    db.close();
+    expect(loadRegistryIdentifiers(dbPath)).toEqual(new Set(['slack:fictional-person']));
+  });
+
+  it('never lets a linked worktree`s own inventory stand in for the main checkout`s', () => {
+    const mainRoot = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
+    const worktreeRoot = addLinkedWorktree(mainRoot);
+    addIdentifierInventory(worktreeRoot, 'Decoy Placeholder');
+    addInstallRegistry(worktreeRoot, 'Decoy Placeholder');
+    fs.writeFileSync(path.join(worktreeRoot, 'leak.md'), 'Fictional Local Team\nFictional Registry House\n');
+    execFileSync('git', ['add', 'leak.md'], { cwd: worktreeRoot });
+    const report = runReport(resolveOptions(['--root', worktreeRoot, '--index'], worktreeRoot));
+    expect(report.registryOrigin).toBe('main-checkout');
+    expect(report.identifiersOrigin).toBe('main-checkout');
+    expect(report.findings).toEqual([
+      { file: 'leak.md', line: 1, category: 'private-identifier' },
+      { file: 'leak.md', line: 2, category: 'private-identifier' },
+    ]);
+  });
+
+  it('records a groups directory it cannot list and a clone marker it cannot stat', () => {
+    const installRoot = tempRoot();
+    const dbPath = path.join(installRoot, 'data', 'v2.db');
+    addInstallRegistry(installRoot, 'Fictional Registry House');
+    const groups = path.join(installRoot, 'groups');
+    const clone = path.join(installRoot, 'data', 'repositories', 'wg-fictional', 'WIDGET');
+    fs.mkdirSync(groups);
+    fs.mkdirSync(path.join(clone, '.git'), { recursive: true });
+    fs.chmodSync(groups, 0o000);
+    fs.chmodSync(clone, 0o600);
+    const problems: string[] = [];
+    try {
+      loadInstallIdentifiers(dbPath, { owners: new Set(), repositories: new Set() }, problems);
+    } finally {
+      fs.chmodSync(groups, 0o755);
+      fs.chmodSync(clone, 0o755);
+    }
+    expect(problems.sort()).toEqual([
+      'a cloned repository could not be read',
+      'the groups directory could not be listed',
+    ]);
+  });
+});
+
+describe('allowlist authority', () => {
+  const at = String.fromCharCode(64);
+  const email = `person${at}company.dev`;
+  const entry = JSON.stringify({ entries: [{ path: 'contact.md', value: email, reason: 'reviewed contact' }] });
+
+  it('reads the index copy for an index scan, so an unstaged allowlist edit exempts nothing', () => {
+    const root = initRepo();
+    fs.writeFileSync(path.join(root, 'contact.md'), `${email}\n`);
+    execFileSync('git', ['add', 'contact.md'], { cwd: root });
+    fs.writeFileSync(path.join(root, '.public-boundary-allowlist.json'), entry);
+    expect(run(resolveOptions(['--root', root, '--index', '--portable'], root))).toEqual([
+      { file: 'contact.md', line: 1, category: 'email-address' },
+    ]);
+    expect(run(resolveOptions(['--root', root, '--portable'], root))).toEqual([]);
+    execFileSync('git', ['add', '.public-boundary-allowlist.json'], { cwd: root });
+    expect(run(resolveOptions(['--root', root, '--index', '--portable'], root))).toEqual([]);
+  });
+
+  it('treats a surface without its own allowlist as exempting nothing, but requires an explicit one to exist', () => {
+    const root = initRepo();
+    execFileSync('git', ['rm', '-q', '--cached', '.public-boundary-allowlist.json'], { cwd: root });
+    fs.rmSync(path.join(root, '.public-boundary-allowlist.json'));
+    fs.writeFileSync(path.join(root, 'contact.md'), `${email}\n`);
+    execFileSync('git', ['add', 'contact.md'], { cwd: root });
+    for (const surface of [['--index'], []]) {
+      expect(run(resolveOptions(['--root', root, '--portable', ...surface], root))).toHaveLength(1);
+    }
+    expect(() => run(resolveOptions(['--root', root, '--portable', '--allowlist', 'absent.json'], root))).toThrow(
+      'allowlist is missing',
+    );
+    expect(() => resolveOptions(['--allowlist'], root)).toThrow('--allowlist requires a path');
+  });
+
+  it('exempts a serialized allowlist value only in the root allowlist file', () => {
+    const allowlist = [{ path: 'contact.md', value: email, reason: 'reviewed contact' }];
+    expect(scanInputs([input('.public-boundary-allowlist.json', entry)], new Set(), allowlist)).toEqual([]);
+    expect(scanInputs([input('docs/.public-boundary-allowlist.json', entry)], new Set(), allowlist)).toEqual([
+      { file: 'docs/.public-boundary-allowlist.json', line: 1, category: 'email-address' },
+    ]);
+  });
+});
