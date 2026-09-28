@@ -1007,6 +1007,11 @@ describe('slackMentionOutsideCode fence scanning (#256)', () => {
     expect(slackMentionOutsideCode('run ```<@UBOT> ship``` later', identity)).toBe(false);
   });
 
+  it('a fence closes at a longer run, but a span only at a run of its own length', () => {
+    expect(slackMentionOutsideCode('```code````\n<@UBOT> ship', identity)).toBe(true);
+    expect(slackMentionOutsideCode('`<@UBOT> ship`` later', identity)).toBe(true);
+  });
+
   it('a 1-2 backtick span never closes across a line break', () => {
     expect(slackMentionOutsideCode('`<@UBOT> ship\nnow`', identity)).toBe(true);
   });
