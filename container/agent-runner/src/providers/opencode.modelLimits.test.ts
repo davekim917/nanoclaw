@@ -182,10 +182,14 @@ describe('buildOpenCodeConfig — model capability declarations', () => {
     process.env.OPENCODE_MODEL = 'nvidia/test-model';
     process.env.OPENCODE_MODEL_CONTEXT_LIMIT = '128000';
     process.env.OPENCODE_MODEL_OUTPUT_LIMIT = '8192';
+    process.env.OPENCODE_MODEL_INPUT_MODALITIES = 'image';
     const cfg = buildOpenCodeConfig({}, { model: 'nvidia/test-model' }) as {
       provider?: Record<string, { models?: Record<string, Record<string, unknown>> }>;
     };
-    expect(cfg.provider?.nvidia?.models?.['test-model']?.limit).toEqual({ context: 128000, output: 8192 });
+    const entry = cfg.provider?.nvidia?.models?.['test-model'];
+    expect(entry?.limit).toEqual({ context: 128000, output: 8192 });
+    expect(entry?.attachment).toBe(true);
+    expect(entry?.modalities).toEqual({ input: ['text', 'image'], output: ['text'] });
   });
 
   it('test_oc_limits_half_set_is_dropped: a context limit with no output limit emits nothing', () => {

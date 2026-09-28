@@ -351,8 +351,7 @@ export function writeCodexHooksAndTrust(opts?: {
 
 /**
  * Returns `null` only when the codex auth mount is absent; every filesystem failure returns the FAILED_CODEX_HOME
- * sentinel instead (see `failClosed`). Set `process.env.CODEX_HOME` to the result BEFORE constructing the
- * provider: it snapshots process.env for every child it spawns.
+ * sentinel instead (see `failClosed`).
  */
 export function setupCodexRuntime(
   mcpServers: Record<string, McpServerConfig>,
