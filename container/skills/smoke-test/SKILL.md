@@ -388,11 +388,13 @@ The scope file (deployment data, never skill text) lists `tenants`, `brands`
 and `accounts` the seats may write to (empty when the seats sit in shared client
 tenants), `authPaths` (the login route) and `readOnlyPosts` (POST-as-query
 routes), both as full-match path patterns. Reads always go. A write goes only
-when it names a QA-owned target (an allowlisted account/tenant/brand, a body
-`name`/`title`/`label`/`filename` starting `QA-<runId>-`, or an id an earlier QA-named
-create returned, kept in `<run-dir>/write-scope-fixtures.ndjson`) and names no
-foreign one (another id in the path, or an account/tenant/brand key outside
-the allowlist). A missing, unreadable or other-run scope refuses every write.
+when it names a QA-owned target and no foreign one. Owned: an allowlisted
+account/tenant/brand; on a POST, a top-level `name`/`title`/`label`/`filename`
+starting `QA-<runId>-`; or a path under `<create path>/<id>` for an id that an
+earlier QA-named POST returned (`<run-dir>/write-scope-fixtures.ndjson`).
+Foreign: any other id in the path, or an account/tenant/brand key outside the
+allowlist. The guard cannot tell a create route from an action route, so never
+put a QA name in the body of a call that is not a create. A missing, unreadable or other-run scope refuses every write.
 A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true`, logs
 `HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason=...` and raises
 `WriteScopeRefused`: record the check `blocked` with the target it needed,

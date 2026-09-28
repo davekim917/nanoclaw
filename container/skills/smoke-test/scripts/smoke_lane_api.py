@@ -83,17 +83,18 @@ def load_scope(run_dir):
 def ledger_ids(run_dir):
     try:
         with open(os.path.join(run_dir, LEDGER_FILE)) as f:
-            return {str(json.loads(line)["id"]) for line in f if line.strip()}
+            rows = [json.loads(line) for line in f if line.strip()]
+        return {"{}/{}".format(r["path"].rstrip("/"), r["id"]) for r in rows}
     except FileNotFoundError:
         return set()
     except (OSError, ValueError, KeyError) as e:
         raise WriteScopeRefused("unreadable-ledger error={}".format(e))
 
 
-def record_fixture(run_dir, fixture_id, name):
+def record_fixture(run_dir, create_path, fixture_id, name):
     with open(os.path.join(run_dir, LEDGER_FILE), "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(json.dumps({"id": str(fixture_id), "name": name, "at": now()}) + "\n")
+        f.write(json.dumps({"id": str(fixture_id), "path": create_path, "name": name, "at": now()}) + "\n")
 
 
 def scalars(value):
@@ -115,7 +116,7 @@ def walk(value):
 
 
 def qa_name(body, prefix):
-    for key, value in walk(body):
+    for key, value in (body.items() if isinstance(body, dict) else []):
         if key.lower() in NAME_KEYS and isinstance(value, str) and value.startswith(prefix):
             return value
     return None
@@ -134,10 +135,12 @@ def judge(run_dir, method, path, body=None):
         return "read-only-post"
     fixtures = ledger_ids(run_dir)
     owned, foreign = [], []
-    for segment in route.split("/"):
+    segments = route.split("/")
+    for i, segment in enumerate(segments):
         segment = urllib.parse.unquote(segment)
         if ID_SEGMENT.fullmatch(segment) and not VERSION_SEGMENT.fullmatch(segment):
-            (owned if segment in fixtures or segment in scope["accounts"] else foreign).append(segment)
+            mine = "/".join(segments[:i + 1]) in fixtures or segment in scope["accounts"]
+            (owned if mine else foreign).append(segment)
     pairs = list(walk(body)) + urllib.parse.parse_qsl(parsed.query)
     for key, value in pairs:
         norm = key.lower().replace("_", "")
@@ -147,7 +150,7 @@ def judge(run_dir, method, path, body=None):
                     (owned if v in scope[kind] else foreign).append("{}={}".format(key, v))
     if foreign:
         raise WriteScopeRefused("foreign-target targets={}".format(",".join(foreign)))
-    if not owned and not qa_name(body, scope["fixturePrefix"]):
+    if not owned and not (method == "POST" and qa_name(body, scope["fixturePrefix"])):
         raise WriteScopeRefused("no-qa-target (names no {}* object and no id this run created)".format(scope["fixturePrefix"]))
     return "write"
 
@@ -158,7 +161,8 @@ def created_ids(response, name):
     dicts = [response] + [v for v in response.values() if isinstance(v, dict)]
     with_id = [d for d in dicts if d.get("id") not in (None, "")]
     named = [d for d in with_id if name in (d.get(k) for k in NAME_KEYS)]
-    direct = [d for d in with_id if d is response or d is response.get("data")]
+    unnamed = not any(k in d for d in with_id for k in NAME_KEYS)
+    direct = [d for d in with_id if unnamed and (d is response or d is response.get("data"))]
     return [d["id"] for d in (named or direct[:1])]
 
 
@@ -245,10 +249,10 @@ class H:
     def call(self, tag, seat, method, path, body=None, save=True):
         kind = self.guarded(tag, seat, method, path, body)
         code, js, dt = self.req(method, path, self.tok.get(seat), body)
-        if kind == "write" and 200 <= code < 300:
+        if kind == "write" and method.upper() == "POST" and 200 <= code < 300:
             name = qa_name(body, "QA-{}-".format(os.path.basename(os.path.normpath(self.run_dir))))
             for fixture_id in created_ids(js, name) if name else []:
-                record_fixture(self.run_dir, fixture_id, name)
+                record_fixture(self.run_dir, urllib.parse.urlsplit(path).path, fixture_id, name)
         if save:
             self.save(tag, {"status": code, "seat": seat, "method": method, "path": path, "body": body,
                             "at": now(), "response": js})

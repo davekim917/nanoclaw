@@ -32,7 +32,8 @@ class Backend(http.server.BaseHTTPRequestHandler):
         Backend.seen.append((self.command, self.path, body))
         out = {"access_token": "h.eyJzdWIiOiAiMSJ9.s"} if self.path == "/users/login" else (
             {"owner": {"id": 191}, "report": {"id": "rp-77", "filename": PREFIX + "f.pdf"}} if self.path == "/reports/nested" else (
-            {"owner": {"id": 192}} if self.path == "/reports/anon" else {"id": "fx-901", "ok": True}))
+            {"owner": {"id": 192}} if self.path == "/reports/anon" else (
+                {"id": "ex-5", "name": "Existing"} if self.path == "/reports/upsert" else {"id": "fx-901", "ok": True})))
         raw = json.dumps(out).encode()
         self.send_response(201 if self.command == "POST" else 200)
         self.send_header("Content-Length", str(len(raw)))
@@ -124,6 +125,8 @@ class Guard(unittest.TestCase):
         self.assert_blocked(h, "w5", "POST", "/notes?tenant=globex", {"title": PREFIX + "n"}, "foreign-target")
         self.assert_blocked(h, "w6", "POST", "/notes", {"title": PREFIX + "n", "brand_id": 3}, "foreign-target")
         self.assert_blocked(h, "w7", "POST", "/notes", {"title": "QA-other-run-n"}, "no-qa-target")
+        self.assert_blocked(h, "w8", "POST", "/budget/save", {"meta": {"name": PREFIX + "n"}}, "no-qa-target")
+        self.assert_blocked(h, "w9", "PATCH", "/notes", {"name": PREFIX + "n"}, "no-qa-target")
 
     def test_read_only_post_is_an_explicit_list(self):
         self.pin()
@@ -135,14 +138,19 @@ class Guard(unittest.TestCase):
         self.pin()
         h = self.client()
         self.assertEqual(h.call("c1", "M", "POST", "/reports", {"name": PREFIX + "coord-r1", "segmentId": 81})[0], 201)
-        self.assertEqual(api.ledger_ids(self.run), {"fx-901"})
-        self.assertEqual(h.call("c2", "M", "PATCH", "/reports/fx-901", {"slot": 2})[0], 200)
+        self.assertEqual(api.ledger_ids(self.run), {"/reports/fx-901"})
+        self.assertEqual(h.call("c2", "M", "PATCH", "/reports/fx-901", {"name": PREFIX + "renamed"})[0], 200)
+        self.assertEqual(api.ledger_ids(self.run), {"/reports/fx-901"}, "only a POST create is ledgered")
         self.assertEqual(h.call("c3", "M", "DELETE", "/reports/fx-901")[0], 200)
         self.assert_blocked(h, "c4", "DELETE", "/reports/fx-902", None, "foreign-target")
+        self.assert_blocked(h, "c4b", "PATCH", "/users/fx-901", {"role": "admin"}, "foreign-target")
         self.assertEqual(h.call("c5", "M", "POST", "/reports/nested", {"filename": PREFIX + "f.pdf"})[0], 201)
-        self.assertEqual(api.ledger_ids(self.run), {"fx-901", "rp-77"}, "the named object's id, not its owner's")
+        self.assertEqual(api.ledger_ids(self.run), {"/reports/fx-901", "/reports/nested/rp-77"},
+                         "the named object's id, not its owner's")
         h.call("c6", "M", "POST", "/reports/anon", {"name": PREFIX + "anon"})
-        self.assertNotIn("192", api.ledger_ids(self.run), "a nested id that is not the named object stays foreign")
+        self.assertEqual(len(api.ledger_ids(self.run)), 2, "a nested id that is not the named object stays foreign")
+        h.call("c7", "M", "POST", "/reports/upsert", {"name": PREFIX + "up"})
+        self.assertEqual(len(api.ledger_ids(self.run)), 2, "a response naming another object is not ours")
 
     def test_allowlisted_account_is_writable(self):
         self.pin(dict(SCOPE, accounts=["7001"]))
