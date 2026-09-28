@@ -643,7 +643,7 @@
 "src/cli/crud.ts":{"diff":170,"mode":"100644","sha256":"c2eb7d39e8c388fe05b01095199355003ceea647919b129f2076271761395d92"},
 "src/cli/delivery-action.ts":{"diff":117,"mode":"100644","sha256":"b6583d21cf2a888920c735af1b08a1fd3a14818ea447f4247725f556e3bc3942"},
 "src/cli/dispatch.test.ts":{"diff":213,"mode":"100644","sha256":"0d3ffc2b739d969d9dd8cbaa2e423fdad9b66d89505c09a3cfa143600bc43476"},
-"src/cli/dispatch.ts":{"diff":68,"mode":"100644","sha256":"62866cee4a3129f658cb722baa43b734bb6fe58875864e7a03f877b402ff4ab0"},
+"src/cli/dispatch.ts":{"diff":68,"mode":"100644","sha256":"4d7b1156af95e37236206f09435b4e90df792c20edb8a71a17e422ec0a49dc1d"},
 "src/cli/format-tasks.ts":{"diff":24,"mode":"100644","sha256":"8f84c38f7088feb4a3da81634a9211450476636279af6ba8e23f4ff095275722"},
 "src/cli/format.ts":{"diff":0,"mode":"100644","sha256":"64920b23cd6045771f3cb6fba2a0784207a0119063ee7fa0e28d597603b9948f"},
 "src/cli/frame.ts":{"diff":5,"mode":"100644","sha256":"3ea0e92c5879a1ae04e0551d5a00d440fd63e16962b7ec6baa56fe3ca794d461"},

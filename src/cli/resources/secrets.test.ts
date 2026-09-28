@@ -15,8 +15,8 @@ describe('ncl secrets arguments', () => {
     expect(declared).not.toContain('agent_group_id');
   });
 
-  it('lets only --field arrive as a list, so dispatch refuses any other repeated flag', () => {
-    expect(lookup('secrets-intake')?.listArgs).toEqual(['field']);
-    expect(lookup('secrets-grant')?.listArgs).toEqual([]);
+  it('declares which args may arrive as a list, so dispatch refuses a list anywhere else', () => {
+    expect(lookup('secrets-intake')?.listArgs).toEqual(['field', 'groups', 'workgroups']);
+    expect(lookup('secrets-grant')?.listArgs).toEqual(['groups', 'workgroups']);
   });
 });

@@ -81,7 +81,7 @@ export async function dispatch(
     return err(
       req.id,
       'invalid-args',
-      `--${listed[0].replace(/_/g, '-')} takes one value; it was given more than once`,
+      `--${listed[0].replace(/_/g, '-')} takes one value, not a list (repeated flag or JSON array)`,
     );
   }
 

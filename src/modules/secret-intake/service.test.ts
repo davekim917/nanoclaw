@@ -12,6 +12,8 @@ const h = vi.hoisted(() => ({
   createCalls: [] as Array<{ spec: unknown; value: string }>,
   updateCalls: [] as Array<{ ref: unknown; value: string }>,
   createFails: false,
+  deliverFails: false,
+  deliverGate: null as Promise<void> | null,
   deliveries: [] as Array<{ args: unknown[] }>,
   notes: [] as string[],
   logs: [] as unknown[],
@@ -75,6 +77,8 @@ vi.mock('../../db/central-lease.js', () => ({
 vi.mock('../../delivery.js', () => ({
   getDeliveryAdapter: () => ({
     deliver: vi.fn(async (...args: unknown[]) => {
+      if (h.deliverFails) throw new Error('Slack is down');
+      if (h.deliverGate) await h.deliverGate;
       h.deliveries.push({ args });
       return `msg-${h.deliveries.length}`;
     }),
@@ -157,6 +161,8 @@ beforeEach(() => {
   h.createCalls.length = 0;
   h.updateCalls.length = 0;
   h.createFails = false;
+  h.deliverFails = false;
+  h.deliverGate = null;
   h.deliveries.length = 0;
   h.notes.length = 0;
   h.logs.length = 0;
@@ -246,10 +252,35 @@ describe('startSecretIntake', () => {
     await expect(startSecretIntake({ ...newKey, caller: { kind: 'host' } })).rejects.toThrow(/already waiting/);
     const second = await startSecretIntake({ ...newKey, hostPattern: 'api2.linear.app', caller: agentCaller });
     expect(getSecretIntake(first.intakeId)?.status).toBe('expired');
-    expect(JSON.parse(h.deliveries[1].args[4] as string)).toMatchObject({ operation: 'edit', messageId: 'msg-1' });
-    expect(JSON.parse(h.deliveries[1].args[4] as string).text).toContain('Replaced by a newer request');
+    expect(JSON.parse(h.deliveries[1].args[4] as string)).toMatchObject({ type: 'secret_intake' });
+    expect(JSON.parse(h.deliveries[2].args[4] as string)).toMatchObject({ operation: 'edit', messageId: 'msg-1' });
+    expect(JSON.parse(h.deliveries[2].args[4] as string).text).toContain('Replaced by a newer request');
     expect(await hooks.open(first.intakeId, 'UOWNER')).toMatchObject({ ok: false });
     expect(getSecretIntake(second.intakeId)?.status).toBe('pending');
+  });
+
+  it('keeps the old card live when the replacement cannot be posted', async () => {
+    const first = await startSecretIntake({ ...newKey, caller: agentCaller });
+    h.deliverFails = true;
+    await expect(startSecretIntake({ ...newKey, caller: agentCaller })).rejects.toThrow(/Could not post/);
+    expect(getSecretIntake(first.intakeId)?.status).toBe('pending');
+  });
+
+  it('leaves an old card alone if it was submitted while its replacement was posting', async () => {
+    const first = await startSecretIntake({ ...newKey, caller: agentCaller });
+    let open!: () => void;
+    h.deliverGate = new Promise((resolve) => {
+      open = resolve;
+    });
+    const second = startSecretIntake({ ...newKey, caller: agentCaller });
+    await settle();
+    await submitValue(first.intakeId, 'UOWNER', SECRET);
+    open();
+    h.deliverGate = null;
+    await second;
+    await settle();
+    expect(getSecretIntake(first.intakeId)?.status).toBe('stored');
+    expect(JSON.stringify(h.deliveries)).not.toContain('Replaced by a newer request');
   });
 
   it('lets a session at its cap replace one of its own requests', async () => {

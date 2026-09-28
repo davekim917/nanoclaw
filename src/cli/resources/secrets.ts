@@ -40,11 +40,13 @@ const grantArgs = [
   {
     name: 'groups',
     type: 'string' as const,
+    multiple: true,
     description: 'Agent group id(s) to grant it to, comma-separated. An agent may name only its own group.',
   },
   {
     name: 'workgroups',
     type: 'string' as const,
+    multiple: true,
     description: 'Workgroup id(s) to grant it to, comma-separated; every member group inherits it.',
   },
 ];

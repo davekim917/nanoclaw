@@ -145,6 +145,10 @@ function splitList(values: string[]): string[] {
   ];
 }
 
+function replacedText(intake: Intake): string {
+  return `${cardTitle(intake)}\n\nReplaced by a newer request — nothing was stored.`;
+}
+
 function cardTitle(intake: Pick<Intake, 'rotate' | 'secretName'>): string {
   return `🔐 ${intake.rotate ? 'Rotate' : 'New'} secret: ${intake.secretName}`;
 }
@@ -487,11 +491,6 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
       `This session already has ${MAX_PENDING_PER_SESSION} secret requests waiting; let them finish or expire.`,
     );
   }
-  for (const old of overlapping) {
-    old.status = 'expired';
-    old.finishedAt = now;
-    void editCard(old, `${cardTitle(old)}\n\nReplaced by a newer request — nothing was stored.`);
-  }
   intakes.set(intake.id, intake);
   try {
     intake.card.messageId =
@@ -516,6 +515,13 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
       cause: err,
     });
   }
+  for (const old of overlapping) {
+    if (old.status !== 'pending') continue;
+    old.status = 'expired';
+    old.finishedAt = Date.now();
+    void editCard(old, replacedText(old));
+  }
+  if (intake.status === 'expired') void editCard(intake, replacedText(intake));
   log.info('Secret intake posted', { intakeId: intake.id, secretName: name, rotate: input.rotate });
   return view(intake);
 }
