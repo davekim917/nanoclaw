@@ -1288,7 +1288,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let attempt = 1; ; attempt++) {
           try {
             await adapter.editMessage(tid, content.messageId as string, editBody);
-            break;
+            // The Discord adapter's text edit omits `components`, which Discord reads as "keep the buttons".
+            if (content.clearActions === true && isDiscordBridge && config.botToken) {
+              await clearDiscordComponents(tid, config.botToken, content.messageId as string);
+            }
+            return;
           } catch (err) {
             const retryAfterMs = parseRetryAfterMs(err);
             if (retryAfterMs === null || listEdit || attempt > MAX_RATE_LIMIT_RETRIES) throw err;
@@ -1296,11 +1300,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             await sleep(retryAfterMs + RATE_LIMIT_BUFFER_MS);
           }
         }
-        // The Discord adapter's text edit omits `components`, which Discord reads as "keep the buttons".
-        if (content.clearActions === true && isDiscordBridge && config.botToken) {
-          await clearDiscordComponents(tid, config.botToken, content.messageId as string);
-        }
-        return;
       }
 
       if (content.operation === 'reaction' && content.messageId && content.emoji) {

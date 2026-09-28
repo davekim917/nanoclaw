@@ -483,7 +483,9 @@ describe("a click made on the approval's own card still resolves it", () => {
 
     expect(answered.map((a) => [a.value, a.label, a.userId])).toEqual([['ship', 'Ship production', OWNER]]);
     expect(await getPendingApproval('appr-choice')).toBeUndefined();
-    expect(deliveries).toEqual([expect.objectContaining({ operation: 'edit', messageId: 'real-choice-card' })]);
+    expect(deliveries).toEqual([
+      expect.objectContaining({ operation: 'edit', messageId: 'real-choice-card', clearActions: true }),
+    ]);
   });
 
   it('Discord', async () => {

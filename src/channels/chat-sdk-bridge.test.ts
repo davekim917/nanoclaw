@@ -915,6 +915,26 @@ describe('createChatSdkBridge.deliver — edit path (status post-then-edit)', ()
     expect(JSON.parse(init?.body as string)).toEqual({ components: [] });
   });
 
+  it('Discord: a rate-limited component clear is retried', async () => {
+    const fetchMock = vi
+      .fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{"retry_after": 0}', { status: 429 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', editMessage: async () => {} } as unknown as Partial<Adapter>),
+      channelType: 'discord',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+    });
+
+    await bridge.deliver('discord:GUILD:PARENT', null, {
+      kind: 'chat-sdk',
+      content: { operation: 'edit', messageId: 'card-1', text: 'Resolved', clearActions: true },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('Discord: an ordinary edit makes no component-clearing call', async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
