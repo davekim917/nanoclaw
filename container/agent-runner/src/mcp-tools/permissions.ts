@@ -1,26 +1,7 @@
 /**
- * Permissions MCP tools (fork addition).
- *
- * Chat-invokable access grants so power users don't need to SSH into the
- * host to run SQL when they want to add a teammate to a strict channel.
- * Host-side authorization is deliberate: these tools emit system actions,
- * the host determines the real caller from the session's latest inbound
- * message (not from anything the agent can fake), checks the caller has
- * the right role, and performs the DB write. See
- * `src/modules/permissions/grant.ts` for the host half.
- *
- * Target resolution. `user` accepts three shapes:
- *   - Already-namespaced id: `slack-example-labs:U12345`, `discord:602…`
- *   - Platform mention as it appears in chat: `<@U12345>` (Slack),
- *     `<@602…>` (Discord) — the leading `<@` and trailing `>` are
- *     stripped and the current session's channel_type is prepended.
- *   - Bare platform id (no prefix, no `<@>`): prepended with the current
- *     session's channel_type.
- *
- * Role. `member` (default) — allowed-to-invoke, no admin powers. `admin`
- * — scoped admin of the target agent group (granular; host's primitive
- * gates what admin can do). Owner is intentionally not grantable via
- * tool; set via `/init-first-agent` or direct DB edit.
+ * Chat-invokable access grants. The host derives the real caller from the session's latest inbound message and
+ * checks its role. `user` accepts a namespaced id, a platform mention (`<@U123>`) or a bare id; the latter two
+ * get the session's channel_type prepended. Owner is intentionally not grantable via tool.
  */
 import { registerTools } from './server.js';
 import { emitSystemAction, ok } from './tool-helpers.js';

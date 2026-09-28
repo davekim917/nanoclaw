@@ -1,16 +1,4 @@
-/**
- * Support-inbox MCP tool: `dispatch_support_issue`.
- *
- * The inbox-poller agent calls this once per triaged support email — after it
- * has confirmed the email is real support and created/located the Linear ticket
- * — to route the issue into its own Slack working thread + per-issue session.
- *
- * Like the scheduling tools, the container can't touch host state directly: it
- * writes a `kind='system'` outbound action that the host applies in
- * `src/modules/support-threads/dispatch.ts`. The host is idempotent on
- * `gmailThreadId` — calling this again for the same Gmail thread routes the
- * follow-up into the existing thread/session instead of opening a new one.
- */
+/** `dispatch_support_issue`: routes a triaged support email into its own thread and session via a host action, idempotent on `gmailThreadId`. */
 import { writeMessageOut } from '../db/messages-out.js';
 import type { WriteMessageOut } from '../db/messages-out.js';
 import { registerTools } from './server.js';
@@ -32,12 +20,7 @@ function isTransientSqliteLock(error: unknown): boolean {
   return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || /database (?:table )?is locked/i.test(error.message);
 }
 
-/**
- * The MCP server and poll loop are separate processes that share the
- * container-owned outbound DB. Their short writes can overlap even though the
- * host only reads this file. Retry that narrow transient collision here so a
- * support email does not wait another 15-minute poll cycle.
- */
+/** The MCP server and poll loop both write the outbound DB; retry their transient write collision so a support email doesn't wait a poll cycle. */
 export async function writeSupportAction(
   message: WriteMessageOut,
   dependencies: SupportActionWriteDependencies = {},
@@ -72,8 +55,6 @@ export async function handleDispatchSupportIssue(
     if (typeof args[field] !== 'string') return err(`${field} is required`);
   }
 
-  // Classify on arrival (opt-in via the group's support-taxonomy.json). Fail-open:
-  // null just means the email is dispatched without triage, as before.
   const triage = await (dependencies.triage ?? triageSupportEmail)({
     subject: args.subject as string,
     sender: args.sender as string,

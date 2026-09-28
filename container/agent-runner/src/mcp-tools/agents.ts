@@ -12,11 +12,7 @@
  * not here — the container is untrusted and cannot be relied on to gate itself.
  */
 import { writeMessageOut } from '../db/messages-out.js';
-// Side-effect import: the MCP server runs as a separate subprocess
-// (see container-runner.ts mcp-config "nanoclaw" entry). Without this,
-// the provider registry stays empty in this process and explicit
-// `provider:` calls fail with "not registered" even when the main
-// agent-runner process sees them fine.
+// Side-effect import: otherwise this MCP subprocess has an empty provider registry.
 import '../providers/index.js';
 import { listProviderNames, validateProviderConfig } from '../providers/provider-registry.js';
 import { registerTools } from './server.js';

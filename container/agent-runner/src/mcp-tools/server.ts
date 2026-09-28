@@ -7,12 +7,6 @@
  *
  * Default when only `core.ts` is imported: the core `send_message` /
  * `send_file` / `edit_message` / `add_reaction` tools are available.
- *
- * Spawn tools are mounted bifurcated via `mountSpawnTools()`:
- * - Orchestrator tools (spawn_task, list_spawned_tasks, spawn_cancel)
- *   when getSessionSpawnTaskId() === null AND agent has orchestrator capability
- * - Child tools (spawn_progress, spawn_complete, spawn_failed)
- *   when getSessionSpawnTaskId() !== null (Phase 1: mutually exclusive)
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -52,9 +46,7 @@ function hasOrchestratorCapability(): boolean {
 
 /**
  * Mount spawn tools bifurcated based on session role.
- *
- * Phase 1 simplification (acked in drift-acks.json entry B1):
- * orchestrator and child tool sets are mutually exclusive.
+ * Orchestrator and child tool sets are mutually exclusive.
  *
  * Call this from the barrel (index.ts) after loadConfig() and before startMcpServer().
  */
@@ -63,14 +55,12 @@ export async function mountSpawnTools(): Promise<void> {
   const spawnTaskId = getSessionSpawnTaskId();
 
   if (spawnTaskId !== null) {
-    // Child session — mount child tools
     const { spawnProgress, spawnComplete, spawnFailed, spawnRequestSteer } = await import('./dispatch-child.js');
     registerTools([spawnProgress, spawnComplete, spawnFailed, spawnRequestSteer]);
     log('Spawn: mounted child tools (spawn_progress, spawn_complete, spawn_failed, spawn_request_steer)');
     return;
   }
 
-  // Not a child session — check orchestrator capability
   if (hasOrchestratorCapability()) {
     const { spawnTask, listSpawnedTasks, spawnCancel } = await import('./dispatch.js');
     registerTools([spawnTask, listSpawnedTasks, spawnCancel]);

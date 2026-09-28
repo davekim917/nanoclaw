@@ -1,12 +1,4 @@
-/**
- * `update_task_list` — the agent's live progress checklist in the current
- * conversation. Decision logic and rendering live in ../task-list.ts; this
- * file is the tool surface and the mailbox wiring.
- *
- * Registered only when the host spawned this container with the task list
- * on (`NANOCLAW_TASK_LIST=1`). Spawn-scoped like outcome reporting: flipping
- * the host switch never changes a running container's tool list.
- */
+/** `update_task_list` tool surface (logic in ../task-list.ts). Registered only when spawned with NANOCLAW_TASK_LIST=1; spawn-scoped, so flipping the host switch never changes a running container's tools. */
 import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
@@ -55,13 +47,8 @@ export const updateTaskList: McpToolDefinition = {
   tool: {
     name: 'update_task_list',
     description: TASK_LIST_DESCRIPTION,
-    // Claude Code defers MCP tools behind tool search by default, leaving the
-    // model only the name until it loads the schema — enough friction that a
-    // live test saw Claude skip the list on 7 minutes of unprompted
-    // multi-step work while OpenCode (no deferral) used it. The CLI keeps a
-    // tool loaded when `_meta['anthropic/alwaysLoad'] === true` (claude-agent-
-    // sdk 0.3.281 sdk.d.ts: "Applied via `_meta['anthropic/alwaysLoad']` on
-    // each tool"). Other providers ignore _meta.
+    // Keep the tool loaded: Claude Code defers MCP tools behind tool search by default, and a deferred list goes
+    // unused. Other providers ignore _meta.
     _meta: { 'anthropic/alwaysLoad': true },
     inputSchema: {
       type: 'object' as const,
@@ -105,9 +92,7 @@ export const updateTaskList: McpToolDefinition = {
       return err('this session has no conversation to show a task list in');
     }
     const ops = getAgentMailbox().operations;
-    // A channel-level session (Discord channel, shared-mode Slack) has no
-    // thread of its own and answers in the thread of the message it is
-    // replying to; the list goes there too, so it sits above its answer.
+    // A channel-level session has no thread of its own; post the list in the replied-to message's thread.
     let threadId = session.thread_id;
     if (threadId === null) {
       const inReplyTo = getCurrentInReplyTo();
@@ -136,9 +121,7 @@ export const updateTaskList: McpToolDefinition = {
       async awaitPlatformId(outboundId, timeoutMs) {
         const ack = await awaitDeliveryAck(outboundId, timeoutMs);
         if (!ack) return { platformId: null, failed: false };
-        // Delivered with no platform id = the host recorded it without posting
-        // (its task-list switch is off): as good as failed — the next update
-        // posts afresh instead of waiting on a post that will never exist.
+        // Delivered without a platform id means the host recorded it without posting: treat as failed so the next update posts afresh.
         if (ack.status === 'delivered' && ack.platformMessageId)
           return { platformId: ack.platformMessageId, failed: false };
         return { platformId: null, failed: true };

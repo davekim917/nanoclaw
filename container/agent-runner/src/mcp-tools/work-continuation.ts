@@ -38,8 +38,7 @@ export const continueWork: McpToolDefinition = {
     if (Object.keys(args).some((key) => key !== 'task')) return err('unknown input field');
     const task = typeof args.task === 'string' ? args.task.trim() : '';
     if (!task) return err(`task is required (1-${WORK_CONTINUATION_TASK_MAX_CHARS} chars after trimming)`);
-    // Report the received length — a bare "max N chars" made an agent burn
-    // three calls binary-searching the cap (observed 2026-08-16).
+    // Report the received length, not just the cap, or agents binary-search it.
     if (task.length > WORK_CONTINUATION_TASK_MAX_CHARS) {
       return err(
         `task is ${task.length} chars after trimming; max is ${WORK_CONTINUATION_TASK_MAX_CHARS} — shorten it and retry`,
@@ -70,17 +69,7 @@ export const cancelContinuation: McpToolDefinition = {
   },
 };
 
-/**
- * The other end of `continue_work`: the agent's own statement that there is
- * nothing left.
- *
- * It is deliberately a PROPOSAL and not a close. Nothing here stops the agent,
- * kills anything, or archives anything — the record just becomes visible to an
- * operator, who is the only one who can actually end the work. That split is
- * the point: the previous surface let an operator hide a thread without
- * stopping it, and an agent that could close its own thread would be the same
- * blindness from the other side.
- */
+/** A PROPOSAL, not a close: nothing is stopped or archived; only an operator can end the work. */
 export const proposeDone: McpToolDefinition = {
   tool: {
     name: 'propose_done',

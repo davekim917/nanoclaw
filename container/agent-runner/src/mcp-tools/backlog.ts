@@ -1,20 +1,3 @@
-/**
- * Backlog + ship-log MCP tools.
- *
- * Write operations (add_ship_log, add/update/delete_backlog_item) are sent
- * as system-kind outbound messages — the host applies them to the central DB
- * via delivery actions.
- *
- * Read operations (list_backlog, get_activity_summary) read directly from
- * /workspace/central.db (mounted read-only).
- *
- * Note: a container-side `scan_commits` tool used to live here. It was
- * removed once the host-side commit scanner (src/commit-scan.ts) took over
- * the "discover external commits" job — the host fetches origin and walks
- * every group's repos every 10 min. The agent's own shipping flow uses
- * `add_ship_log` after `open_pr`; if it ever needs an ad-hoc commit list
- * it can call `git log` via Bash.
- */
 import { getConfig } from '../config.js';
 import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
@@ -48,7 +31,7 @@ async function sendAction(action: string, data: Record<string, unknown>): Promis
   });
 }
 
-// ---- Types matching host-side db/backlog.ts ----
+// Types matching host-side db/backlog.ts.
 
 interface ShipLogEntry {
   id: string;
@@ -76,8 +59,6 @@ interface BacklogItem {
 }
 
 const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END`;
-
-// ---- Tool definitions ----
 
 const addShipLog: McpToolDefinition = {
   tool: {
@@ -309,7 +290,6 @@ const getActivitySummary: McpToolDefinition = {
     const days = (args.days as number) ?? 7;
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-    // Backlog counts
     const counts = db
       .prepare(
         `SELECT status, COUNT(*) AS c FROM backlog_items WHERE agent_group_id = ? GROUP BY status`,
@@ -318,14 +298,12 @@ const getActivitySummary: McpToolDefinition = {
     const countByStatus = Object.fromEntries(counts.map((r) => [r.status, r.c]));
     const totalBacklog = counts.reduce((s, r) => s + r.c, 0);
 
-    // Recent ship log
     const shipLog = db
       .prepare(
         `SELECT * FROM ship_log WHERE agent_group_id = ? AND shipped_at >= ? ORDER BY shipped_at DESC LIMIT 20`,
       )
       .all(agentGroupId, since) as ShipLogEntry[];
 
-    // Recently resolved
     const resolved = db
       .prepare(
         `SELECT * FROM backlog_items WHERE agent_group_id = ? AND resolved_at >= ? ORDER BY resolved_at DESC LIMIT 10`,

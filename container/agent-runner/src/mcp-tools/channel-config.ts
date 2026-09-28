@@ -1,36 +1,13 @@
 /**
- * Channel-config MCP tools (fork addition — v1 had equivalents named
- * `set_group_model` / `set_group_effort`, but v1's "group" conflated
- * channel and agent-group; v2 names are aligned with the entity model).
- *
- * Terminology (v2):
- *   - channel = messaging_group (one chat on one platform)
- *   - agent   = agent_group (one persona/workspace)
- *   - wiring  = messaging_group_agents row (channel ↔ agent link)
- *
- * These tools mutate the default_model / default_effort columns on the
- * wiring row for (current agent_group, named channel). That's the
- * per-channel layer — it overrides the agent's container.json defaults
- * and the host-env defaults, but is still overridden by a user's
- * per-session `-m` / `-e` flags.
- *
- * Host-side authorization (trust-minimal):
- *   - Container emits a system action; it doesn't write the DB.
- *   - Host derives caller identity from the session's latest inbound
- *     chat message (not from anything the agent can fake).
- *   - Only owners / admins of the agent group / global admins may
- *     mutate. Non-admins get a notify reply; no SQL side effect.
- *
- * See `src/modules/channel-config/index.ts` for the host half.
+ * Channel-config tools: set the wiring row's default_model / default_effort (overrides container.json and host
+ * defaults; overridden by per-session `-m`/`-e`). The host authorizes from the session's latest inbound message,
+ * not from anything the agent can fake.
  */
 import { registerTools } from './server.js';
 import { emitSystemAction, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
-// The host validates the final value against the target provider. Keep the
-// MCP-side gate broad enough for Codex's max/ultra surface; Claude/OpenCode
-// requests that are not valid for their provider are rejected host-side before
-// any DB mutation.
+// Deliberately broad (Codex's max/ultra); the host validates against the target provider before any mutation.
 const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
 const setChannelModelTool: McpToolDefinition = {
