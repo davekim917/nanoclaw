@@ -23,6 +23,8 @@ import {
   invalidateScheduledCache,
   _resetScheduledRateLimitForTesting,
   SWEEP_INTERVAL_MS,
+  approvedRowChanged,
+  type ApprovedTaskRow,
 } from './scheduled-shared.js';
 
 const OWNER = 'discord:owner';
@@ -356,5 +358,30 @@ describe('scheduledCache', () => {
 describe('SWEEP_INTERVAL_MS', () => {
   it('matches the host sweep cadence (60s)', async () => {
     expect(SWEEP_INTERVAL_MS).toBe(60_000);
+  });
+});
+
+describe('approvedRowChanged', () => {
+  const approved = {
+    id: 'task-1',
+    seq: 2,
+    status: 'pending',
+    trigger: 0,
+    process_after: '2999-01-01T00:00:00.000Z',
+    scheduled_for: '2999-01-01T00:00:00.000Z',
+    recurrence: null,
+    series_id: 'series-1',
+    platform_id: 'slack:C1',
+    channel_type: 'slack',
+    thread_id: null,
+    content: '{"prompt":"approved"}',
+  } as ApprovedTaskRow;
+
+  it('names a field an admission rewrote in place', () => {
+    expect(approvedRowChanged(approved, { ...approved, trigger: 1 })).toBe('trigger');
+  });
+
+  it('ignores content: edit verbs change it, and a move carries the snapshot copy forward', () => {
+    expect(approvedRowChanged(approved, { ...approved, content: '{"prompt":"edited"}' } as ApprovedTaskRow)).toBeNull();
   });
 });

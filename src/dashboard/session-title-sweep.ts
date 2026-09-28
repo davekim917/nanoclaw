@@ -137,8 +137,8 @@ export function postProcessTitle(raw: string): string {
 }
 
 /**
- * Up to `cap` sessions needing a title, gated purely on columns; the new-message threshold is checked per session
- * from the mailbox's `seq` in `shouldGenerate` (inbound.db size and mtime are unreliable proxies).
+ * Up to `cap` sessions needing a title, gated purely on columns; the new-message threshold is checked per session in
+ * `shouldGenerate`.
  */
 async function pickCandidates(cap: number): Promise<CandidateRow[]> {
   const cooldownIso = new Date(Date.now() - COOLDOWN_HOURS * 3600_000).toISOString();
@@ -409,7 +409,6 @@ function logFailuresWithBreaker(outcomes: TaskOutcome[]): boolean {
   return tripped;
 }
 
-/** Breaker policy only: every 429 counts toward the breaker, whatever its cause. */
 function isTransientBackendFailure(err: unknown): boolean {
   const status = (err as { status?: number }).status;
   return status === 429 || status === 529 || (err as Error).name === 'AbortError' || !status;
