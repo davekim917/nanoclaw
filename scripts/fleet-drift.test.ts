@@ -231,12 +231,13 @@ describe('countRecentErrorLines — logger and reader in different zones', () =>
   });
 
   it("keeps parsing pre-change lines that carry no offset, in the reader's zone", () => {
+    const fixedNow = Date.parse('2026-06-15T12:00:00.000Z');
     const originalTz = process.env.TZ;
     try {
       for (const tz of ['UTC', 'America/New_York', 'Asia/Tokyo']) {
         process.env.TZ = tz;
-        const line = `[${localStamp(new Date(now - 30_000))}] \x1b[31mERROR\x1b[39m legacy`;
-        expect(countRecentErrorLines(line, now, WINDOW)).toBe(1);
+        const line = `[${localStamp(new Date(fixedNow - 30_000))}] \x1b[31mERROR\x1b[39m legacy`;
+        expect(countRecentErrorLines(line, fixedNow, WINDOW)).toBe(1);
       }
     } finally {
       if (originalTz === undefined) delete process.env.TZ;
