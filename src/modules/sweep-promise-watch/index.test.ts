@@ -205,6 +205,21 @@ describe('scanOnce', () => {
     expect(nudge).toHaveBeenCalledTimes(NUDGE_DAILY_CAP);
   });
 
+  it('spends the slot before the wake write, and keeps it spent when the admission refuses', async () => {
+    const counts = new Map<string, number>();
+    let countAtWrite: number | undefined;
+    const { d } = deps({
+      cap: memoryCap(counts),
+      nudge: async () => {
+        countAtWrite = counts.get('2026-09-18');
+        return 'stale';
+      },
+    });
+    await scanOnce(d);
+    expect(countAtWrite).toBe(1);
+    expect(counts.get('2026-09-18')).toBe(1);
+  });
+
   it('keeps the daily cap across a restart (the cap store outlives process state)', async () => {
     const cap = memoryCap(new Map([['2026-09-18', NUDGE_DAILY_CAP]]));
     _resetPromiseWatchForTesting();

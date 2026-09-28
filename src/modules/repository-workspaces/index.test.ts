@@ -104,6 +104,40 @@ vi.mock('../mailbox/read-only.js', async () => {
   return { ...actual, readSessionOutbound: hostActionMocks.readSessionOutbound };
 });
 
+const lifecycleProbe = vi.hoisted(() => ({ onRelease: null as null | (() => void) }));
+const lockProbe = vi.hoisted(() => ({
+  onAcquire: null as null | (() => void),
+  onRelease: null as null | ((key: [string, string, string | undefined]) => void),
+}));
+vi.mock('../../repository-workspaces.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../repository-workspaces.js')>();
+  return {
+    ...actual,
+    withRepositoryLifecycleClaims: <T>(units: readonly RepositoryWorkUnit[], fn: () => Promise<T> | T) =>
+      actual.withRepositoryLifecycleClaims(units, async () => {
+        try {
+          return await fn();
+        } finally {
+          lifecycleProbe.onRelease?.();
+        }
+      }),
+    withHostRepositoryLock: <T>(workgroupId: string, repo: string, fn: () => Promise<T> | T, dataDir?: string) =>
+      actual.withHostRepositoryLock(
+        workgroupId,
+        repo,
+        async () => {
+          lockProbe.onAcquire?.();
+          try {
+            return await fn();
+          } finally {
+            lockProbe.onRelease?.([workgroupId, repo, dataDir]);
+          }
+        },
+        dataDir,
+      ),
+  };
+});
+
 // Pass-through, except that one test makes the file check report no commondir
 // to stand for the check-then-use race: a container planted one after the
 // host's file check read, before Git did. Only the Git common-dir check then
@@ -582,6 +616,25 @@ describe('durable canonical publication core', () => {
       repositoryId: `github.com/example/${repo}`,
     });
     expect(JSON.stringify(pin)).not.toContain('.git');
+  });
+
+  it('publishes the canonical detached, so a linked worktree can still take the default branch', async () => {
+    const repo = 'detached-publish';
+    const stage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-detached', repo);
+    cloneTo(stage);
+    const origin = `https://github.com/Example/${repo}`;
+    git(stage, ['remote', 'set-url', 'origin', origin]);
+
+    await publishStagedCanonical({
+      workgroupId: 'wg-a',
+      repo,
+      origin,
+      repositoryId: `github.com/Example/${repo}`,
+      stagingPath: stage,
+      dataDir: root,
+    });
+    const canonical = canonicalRepoDir('wg-a', repo, root);
+    git(canonical, ['worktree', 'add', '-q', path.join(root, 'default-branch-worktree'), 'main']);
   });
 
   it('a re-publish matches an existing canonical whose pin holds the legacy URL-form identity (#697)', async () => {
@@ -2701,6 +2754,60 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     expect(mailboxAcks).toEqual(
       expect.arrayContaining(requests.map(({ requestId }) => ({ kind: 'delivered', id: requestId }))),
     );
+  });
+
+  it('completes while mount reconciliation holds the workgroup claim, and quiesces nothing', async () => {
+    networkCanonical(root);
+    const result = await withWorkgroupRepositoryMountClaim(WG, () => checkout(threadUnit('mount-held'), 'feat', root));
+    expect(result).toMatchObject({ created: true });
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
+  });
+
+  it('clones into staging under the repository lock, inside its own lifecycle claim', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('lock-span');
+    const staging = checkoutStagingRoot(topicWorktreesDir(unit, root));
+    const cloned = (): boolean =>
+      fs.existsSync(staging) &&
+      (fs.readdirSync(staging, { recursive: true }) as string[]).some((entry) => entry.endsWith(`.git${path.sep}HEAD`));
+    const spans: unknown[][] = [];
+    let atAcquire = false;
+    lockProbe.onAcquire = () => {
+      atAcquire = cloned();
+    };
+    lockProbe.onRelease = (key) => {
+      spans.push([...key, atAcquire, cloned()]);
+    };
+    let claimedWhileStaging = false;
+    _setRepositoryCheckoutHooksForTesting({
+      afterStagingPopulated: () => {
+        claimedWhileStaging = isRepositoryLifecycleClaimed(unit);
+      },
+    });
+    try {
+      await expect(checkout(unit, 'feat', root)).resolves.toMatchObject({ created: true });
+    } finally {
+      lockProbe.onAcquire = null;
+      lockProbe.onRelease = null;
+    }
+    expect(spans).toContainEqual([WG, 'proj', root, false, true]);
+    expect(claimedWhileStaging).toBe(true);
+  });
+
+  it('holds its lifecycle claim until the checkout is published', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('claim-span');
+    const clone = path.join(topicWorktreesDir(unit, root), 'proj');
+    let publishedAtRelease: boolean | undefined;
+    lifecycleProbe.onRelease = () => {
+      publishedAtRelease = fs.existsSync(clone);
+    };
+    try {
+      await checkout(unit, 'feat', root);
+    } finally {
+      lifecycleProbe.onRelease = null;
+    }
+    expect(publishedAtRelease).toBe(true);
   });
 
   it('same-thread siblings get one path, including while the first checkout is still initializing', async () => {

@@ -188,8 +188,11 @@ describe('channel-auto-wire resolver', () => {
     const result = await resolver(makeEvent('slack-example-labs', 'slack:CI1'), mg);
 
     expect(result[0].ignored_message_policy).toBe('accumulate');
-    const persisted = await getMessagingGroupAgents('mg-ignored-1');
-    expect(persisted[0].ignored_message_policy).toBe('accumulate');
+    // Raw, not through the reader: it COALESCEs a NULL column to the same default.
+    const raw = getRawDb()
+      .prepare('SELECT ignored_message_policy FROM messaging_group_agents WHERE messaging_group_id = ?')
+      .get('mg-ignored-1') as { ignored_message_policy: string | null };
+    expect(raw.ignored_message_policy).toBe('accumulate');
   });
 
   it('honors an explicit ignored_message_policy override', async () => {

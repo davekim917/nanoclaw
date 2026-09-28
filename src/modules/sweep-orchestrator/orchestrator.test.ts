@@ -217,7 +217,7 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
       .run(taskId, taskId, completedAt, completedAt, completedAt);
   }
 
-  it('archives completed tasks older than 24 hours', async () => {
+  it('archives completed tasks older than 24 hours, with no group holding the orchestrator capability', async () => {
     insertCompletedTask('old', new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString());
     insertCompletedTask('fresh', new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString());
 

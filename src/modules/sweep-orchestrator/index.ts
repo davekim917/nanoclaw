@@ -1,7 +1,7 @@
 /**
  * T6 is DORMANT: no agent group holds the `orchestrator` capability, so it is a
  * no-op in production, and restoring the capability also needs a task reaper
- * this module no longer has. T14 archives completed tasks regardless.
+ * this module no longer has.
  */
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { runReconcilerSweep } from '../orchestrator-dispatch/reconciler.js';

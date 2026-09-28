@@ -59,10 +59,7 @@ type ParsedChannelValue = { value?: string | null; error?: string };
 
 /**
  * Codex values go through the chat-flag vocabulary (dot forms normalize,
- * family names stay as typed so the wiring follows the next release); other
- * providers' model strings pass through for forward-compatible SDK ids. Effort
- * is validated against each provider's vocabulary, so a Codex-only level like
- * `ultra` can't reach a Claude or OpenCode wiring.
+ * family names stay as typed so the wiring follows the next release).
  */
 function parseChannelModel(model: string, provider: string): ParsedChannelValue {
   if (provider !== 'codex') return { value: model };

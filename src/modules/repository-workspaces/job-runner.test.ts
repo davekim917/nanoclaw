@@ -404,6 +404,25 @@ describe('repository drain marker (#718)', () => {
     expect(fs.existsSync(drainMarker)).toBe(false);
   });
 
+  it('still runs and acks a draining action whose marker cannot be written', async () => {
+    const blocker = path.join(path.dirname(drainMarker), 'not-a-dir');
+    fs.writeFileSync(blocker, '');
+    _setRepositoryDrainMarkerPathForTesting(path.join(blocker, 'repository-drain-in-flight.json'));
+    const id = requestId('74');
+    let ran = false;
+    await runRepositoryActionDetached(
+      'repository_publish',
+      async () => {
+        ran = true;
+      },
+      { requestId: id },
+      session,
+    );
+    await _repositoryActionChainForTesting();
+    expect(ran).toBe(true);
+    expect(marks).toEqual([{ kind: 'delivered', id }]);
+  });
+
   it('does not mark an action that never drains', async () => {
     let present = true;
     await runRepositoryActionDetached(

@@ -1638,6 +1638,30 @@ describe('per-person preference recall', () => {
     expect(paths).toContain('preferences/fallback-two.md');
   });
 
+  it.each([
+    ['keeps a namespace the payload already carries', { senderId: 'slack:U0TESTKEEP' }, 'slack:U0TESTKEEP'],
+    ['keeps a namespace author.userId carries', { author: { userId: 'slack:U0TESTKEEP' } }, 'slack:U0TESTKEEP'],
+    ['trims the payload id', { senderId: '  U0TESTTRIM  ' }, 'U0TESTTRIM'],
+    ['trims author.userId', { author: { userId: '  U0TESTTRIM  ' } }, 'U0TESTTRIM'],
+  ])('%s', async (_label, id, declared) => {
+    memoryFile('preferences/sender-shape.md', `---\nids: [${declared}]\n---\n# Sender Shape\nPrefers tables.`);
+
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Unrelated Name', ...id }),
+        }),
+      'test',
+    );
+
+    expect(result.memoryEvidence.excerpts.map((row) => row.path)).toContain('preferences/sender-shape.md');
+  });
+
   it('namespaces the fallback trigger id so it hits a namespace-exact ids: declaration', async () => {
     // Empty archive: the only involved-sender group is the [triggerSender]
     // fallback. This file declares ONLY the namespace-exact form for the
