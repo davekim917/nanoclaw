@@ -44,7 +44,7 @@ Hand off by mentioning peer's bot username. Stop after a few no-progress rounds.
 ## Misc
 
 No display: send files as attachments; screenshots via `agent-browser`.
-Code comments: a constraint belongs in a test, type, assert or lint rule; a comment is only for what code can't check (an external system's quirk, why the obvious approach was wrong). No net comment-line growth in a change; never cite file:line or a PR/issue/ticket number in one (history belongs in git). The merge gate (`codex-review.sh merge-check`) refuses a change that breaks this.
+Code comments: a constraint belongs in a test, type, assert or lint rule; a comment is only for what code can't check (an external system's quirk, why the obvious approach was wrong). No net comment-line growth in a change; never cite file:line or a PR/issue/ticket number in one (history belongs in git). The merge gate (`codex-review.sh merge-check`) refuses comment growth and those citations.
 Codex: `codex exec --yolo "<prompt>"`, never `/codex:*` skills.
 Behavior change, trust boundary, rollback risk, or coordinated build → start with `/team-plan`; after approval `/team-build` → `/team-review --implementation`. `/team-auto`: approved plan → PR. `/team-ship`: asks human only for deploy/irreversible. Trivial fixes, chat: skip.
 Monitors, continuations, recovery wakes, scheduled reasoning: read `/workspace/project/docs/workflow-automation.md` first. Image gen (~3–4 min) from Claude/OpenCode: set Bash `timeout` to `3600000`, one image per call; prefer a Codex sibling.
