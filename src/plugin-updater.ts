@@ -31,7 +31,6 @@ const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 interface LockEntry {
   resolved?: unknown;
   version?: unknown;
-  link?: unknown;
 }
 
 // The hourly refresh would repeat the missing-codex-binary line forever; log it once per process.
@@ -137,7 +136,7 @@ async function installChangedLockfiles(pluginPath: string, name: string, from: s
 
 async function hasHostMadeInstall(pluginPath: string, dir: string, rev: string): Promise<boolean> {
   const nodeModules = path.join(dir, 'node_modules');
-  if (!fs.existsSync(path.join(pluginPath, nodeModules))) return false;
+  if (!fs.lstatSync(path.join(pluginPath, nodeModules), { throwIfNoEntry: false })?.isDirectory()) return false;
   const { stdout } = await execFileAsync('git', ['ls-tree', '--name-only', rev, '--', `:(literal)${nodeModules}`], {
     cwd: pluginPath,
     timeout: GIT_PULL_TIMEOUT_MS,
@@ -159,10 +158,10 @@ function lockfileRefusal(dir: string): string | null {
     return 'lockfile predates lockfileVersion 2';
   }
   const nonRegistry = Object.entries(lock.packages)
-    .filter(([key, entry]) => key.includes('node_modules/') && entry.link !== true && !fromRegistry(entry))
+    .filter(([key, entry]) => key !== '' && (!key.startsWith('node_modules/') || !fromRegistry(entry)))
     .map(([key]) => key);
   return nonRegistry.length > 0
-    ? `non-registry dependencies, whose prepare scripts npm runs despite --ignore-scripts: ${nonRegistry.join(', ')}`
+    ? `linked, workspace or non-registry packages (npm runs a git dependency's prepare despite --ignore-scripts, and cleans linked directories): ${nonRegistry.join(', ')}`
     : null;
 }
 

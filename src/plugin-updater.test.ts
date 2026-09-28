@@ -62,7 +62,6 @@ const REGISTRY_LOCK = JSON.stringify({
   packages: {
     '': { name: 'p' },
     'node_modules/a': { version: '1.0.0', resolved: 'https://registry.npmjs.org/a/-/a-1.0.0.tgz' },
-    'node_modules/local': { resolved: '../local', link: true },
   },
 });
 
@@ -339,6 +338,7 @@ describe('with fake git: failures stay inside their plugin', () => {
     ['a relative file path', { version: '1.0.0', resolved: 'file:../dep' }],
     ['no resolved and a non-semver version', { version: 'github:o/r' }],
     ['no resolved and no version', {}],
+    ['a link to a local directory', { resolved: '../dep', link: true }],
   ])('refuses a lockfile whose dependency has %s', async (_label, entry) => {
     fakePlugin(
       'p',
@@ -353,6 +353,41 @@ describe('with fake git: failures stay inside their plugin', () => {
       'Plugin dependency install refused',
       expect.objectContaining({ plugin: 'p', reason: expect.stringContaining('node_modules/dep') }),
     );
+  });
+
+  it('refuses a lockfile with a workspace package', async () => {
+    const lock = JSON.stringify({
+      lockfileVersion: 3,
+      packages: { '': { name: 'p' }, 'packages/w': { version: '1.0.0' } },
+    });
+    fakePlugin('p', { 'upstream-moved': '', 'diff-out': 'package-lock.json\n' }, { 'package-lock.json': lock });
+
+    await runPluginUpdates();
+
+    expect(npmCalls()).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Plugin dependency install refused',
+      expect.objectContaining({ plugin: 'p', reason: expect.stringContaining('packages/w') }),
+    );
+  });
+
+  it('skips a directory whose node_modules is a symlink, not an install', async () => {
+    const dir = fakePlugin(
+      'p',
+      { 'upstream-moved': '', 'diff-out': 'package-lock.json\n' },
+      { 'package-lock.json': REGISTRY_LOCK },
+    );
+    fs.rmSync(path.join(dir, 'node_modules'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, 'elsewhere'));
+    fs.symlinkSync(path.join(tmp, 'elsewhere'), path.join(dir, 'node_modules'));
+
+    await runPluginUpdates();
+
+    expect(npmCalls()).toEqual([]);
+    expect(log.info).toHaveBeenCalledWith('Plugin lockfile changed; no existing install to refresh', {
+      plugin: 'p',
+      dir: '.',
+    });
   });
 
   it('installs a lockfile whose dependency has no resolved but a semver version', async () => {
