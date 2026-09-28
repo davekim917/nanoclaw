@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { MessageInRow } from '../db/messages-in.js';
@@ -15,6 +15,11 @@ function scriptTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
 }
 const SCRIPT_MAX_BUFFER = 1024 * 1024;
+// On timeout the group gets SIGTERM, so a script can trap it and clean up as it could under execFile, then SIGKILL
+// after the grace. Worst case a timed-out script holds the queue for timeout + grace + reap cap.
+const SCRIPT_KILL_GRACE_MS = 2_000;
+// SIGKILL is not synchronous; wait this long for the group to vanish before moving on.
+const SCRIPT_KILL_REAP_MS = 1_000;
 
 export interface ScriptResult {
   wakeAgent: boolean;
@@ -97,60 +102,136 @@ export async function runScript(
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
 
   return new Promise((resolve) => {
-    execFile(
-      'bash',
-      [scriptPath],
-      { timeout: timeoutMs, maxBuffer: SCRIPT_MAX_BUFFER, env: scriptEnv() },
-      (error, stdout, stderr) => {
-        try {
-          fs.unlinkSync(scriptPath);
-        } catch {
-          /* best-effort cleanup */
-        }
+    // Bash forks the last command of a script file instead of exec'ing it, so killing bash alone orphans that child
+    // and its side effects still land. Run the script in its own process group and kill the whole group.
+    const child = spawn('bash', [scriptPath], { detached: true, env: scriptEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
 
-        if (stderr) {
-          log(`[${taskId}] stderr: ${stderr.slice(0, 500)}`);
-        }
-        const fail = (reason: string): void => {
-          log(`[${taskId}] ${reason}`);
-          onFailure?.(reason);
-          resolve(null);
-        };
+    const out = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
+    const bytes = { stdout: 0, stderr: 0 };
+    let killed = false;
+    let overflow: 'stdout' | 'stderr' | null = null;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
 
-        if (error) {
-          // execFile kills on timeout, so a script that ran too long arrives
-          // here as a generic "Command failed: bash /tmp/task-script-<id>.sh"
-          // — the same string a script that exited non-zero on its first line
-          // produces. `killed` is the only thing that separates them.
-          //
-          // This matters more here than upstream: a timeout acks as reason
-          // 'error', and eight consecutive 'error' acks auto-pause the whole
-          // series (recurrence.ts SCRIPT_FAIL_PAUSE_CAP). An operator reading
-          // "error: Command failed" goes hunting for a bug in a script that is
-          // merely slow, when the fix is NANOCLAW_TASK_SCRIPT_TIMEOUT_MS. Name
-          // the timeout and the ceiling it hit.
-          return fail(
-            (error as { killed?: boolean }).killed
-              ? `timed out after ${timeoutMs}ms and was killed; output discarded — raise NANOCLAW_TASK_SCRIPT_TIMEOUT_MS if the script is legitimately this slow`
-              : `error: ${error.message}`,
-          );
-        }
+    const signalGroup = (signal: NodeJS.Signals | 0): boolean => {
+      try {
+        process.kill(-child.pid!, signal);
+        return true;
+      } catch {
+        return false; // group already gone
+      }
+    };
 
-        const lines = stdout.trim().split('\n');
-        const lastLine = lines[lines.length - 1];
-        if (!lastLine) return fail('no output');
+    // After a kill, resolve only once the group is gone, so the next task's script never overlaps this one and no
+    // signal is sent after the PGID could be reused.
+    let closed = false;
+    let groupGone = false;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const tryFinish = (): void => {
+      if (closed && (!killed || groupGone)) finish(null);
+    };
+    const endGroup = (): void => {
+      clearInterval(poll);
+      clearTimeout(graceTimer);
+      groupGone = true;
+      // A process that left the group can still hold the pipes open; drop them so 'close' fires, as execFile does.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      tryFinish();
+    };
+    const killGroup = (): void => {
+      if (killed) return;
+      killed = true;
+      if (!signalGroup('SIGTERM')) return endGroup();
+      poll = setInterval(() => {
+        if (!signalGroup(0)) endGroup();
+      }, 100);
+      graceTimer = setTimeout(() => {
+        signalGroup('SIGKILL');
+        graceTimer = setTimeout(() => {
+          log(`[${taskId}] process group still alive ${SCRIPT_KILL_REAP_MS}ms after SIGKILL; moving on`);
+          endGroup();
+        }, SCRIPT_KILL_REAP_MS);
+      }, SCRIPT_KILL_GRACE_MS);
+    };
 
-        try {
-          const result = JSON.parse(lastLine);
-          if (typeof result.wakeAgent !== 'boolean') {
-            return fail(`output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`);
-          }
-          resolve(result as ScriptResult);
-        } catch {
-          fail(`output is not valid JSON: ${lastLine.slice(0, 200)}`);
+    const timer = setTimeout(killGroup, timeoutMs);
+
+    const collect = (stream: 'stdout' | 'stderr') => (chunk: Buffer) => {
+      if (killed) return; // output is discarded anyway; keep draining without buffering
+      out[stream].push(chunk);
+      bytes[stream] += chunk.length;
+      if (!overflow && bytes[stream] > SCRIPT_MAX_BUFFER) {
+        overflow = stream;
+        killGroup();
+      }
+    };
+    child.stdout.on('data', collect('stdout'));
+    child.stderr.on('data', collect('stderr'));
+
+    let settled = false;
+    const finish = (error: Error | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(poll);
+      clearTimeout(graceTimer);
+      try {
+        fs.unlinkSync(scriptPath);
+      } catch {
+        /* best-effort cleanup */
+      }
+
+      const stdout = Buffer.concat(out.stdout).toString('utf8');
+      const stderr = Buffer.concat(out.stderr).toString('utf8');
+      if (stderr) {
+        log(`[${taskId}] stderr: ${stderr.slice(0, 500)}`);
+      }
+      const fail = (reason: string): void => {
+        log(`[${taskId}] ${reason}`);
+        onFailure?.(reason);
+        resolve(null);
+      };
+
+      if (error) return fail(`error: ${error.message}`);
+      if (overflow) return fail(`error: ${overflow} maxBuffer length exceeded`);
+      // A timeout acks as reason 'error', and eight consecutive 'error' acks auto-pause the whole series
+      // (SCRIPT_FAIL_PAUSE_CAP). Name the ceiling, or an operator hunts for a bug in a script that is merely slow.
+      if (killed) {
+        return fail(
+          `timed out after ${timeoutMs}ms and was killed; output discarded — raise NANOCLAW_TASK_SCRIPT_TIMEOUT_MS if the script is legitimately this slow`,
+        );
+      }
+      if (exitCode !== 0) {
+        const cause = exitCode === null ? `signal ${exitSignal}` : `exit code ${exitCode}`;
+        return fail(`error: Command failed: bash ${scriptPath} (${cause})`);
+      }
+
+      const lines = stdout.trim().split('\n');
+      const lastLine = lines[lines.length - 1];
+      if (!lastLine) return fail('no output');
+
+      try {
+        const result = JSON.parse(lastLine);
+        if (typeof result.wakeAgent !== 'boolean') {
+          return fail(`output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`);
         }
-      },
-    );
+        resolve(result as ScriptResult);
+      } catch {
+        fail(`output is not valid JSON: ${lastLine.slice(0, 200)}`);
+      }
+    };
+
+    child.on('error', finish);
+    // 'close' waits for every holder of the stdio pipes, including background children of the script, so the
+    // timeout still covers them.
+    child.on('close', (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+      closed = true;
+      tryFinish();
+    });
   });
 }
 
