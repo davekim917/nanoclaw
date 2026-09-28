@@ -393,9 +393,9 @@ account/tenant/brand in a body or query key; on a POST, a top-level
 `name`/`title`/`label`/`filename` starting `QA-<runId>-`; or a path under
 `<create path>/<id>` for a fixture the lane registered with `h.own(tag, seat,
 create_path, id, name)`, which reads `<create path>/<id>` back and ledgers it
-(`<run-dir>/write-scope-fixtures.ndjson`) only when the object read back (at
-the root, under `data`, or in its one wrapper) has that id and exactly that
-name; a QA-named child or mention does not count. Create responses are never parsed for ownership, so call `own` after
+(`<run-dir>/write-scope-fixtures.ndjson`) only when the object read back has
+that id and exactly that name: the root when it carries an id, else the
+envelope's `data` or one wrapper; a QA-named child or mention does not count. Create responses are never parsed for ownership, so call `own` after
 a create and before editing or deleting the fixture. One backend per run, so
 the ledger keeps no origin. Foreign: any other digit-bearing path segment (only a
 leading `/v<n>/` is exempt), or an account/tenant/brand key outside the
@@ -409,7 +409,9 @@ logs
 never as a product refusal, a pass or a finding. A write-refusal probe targets
 a QA-named fixture; when none can be made, the probe is blocked. The guard
 covers this client only: browser-driven writes and hand-rolled HTTP still rest
-on the brief.
+on the brief. It stops an honest lane's mistakes, not a lane set on bypassing
+it. Request paths must be single-slash absolute paths, and redirects are
+reported (3xx), never followed.
 
 Resolve the approved credential location from the deploying group's standing
 instructions and mounts before declaring auth unavailable. Never print or copy

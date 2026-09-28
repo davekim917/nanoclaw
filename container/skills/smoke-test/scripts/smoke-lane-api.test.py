@@ -31,6 +31,12 @@ class Backend(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n)) if n else None
         Backend.seen.append((self.command, self.path, body))
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/elsewhere")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/users/login"):
             out = {"access_token": "h.eyJzdWIiOiAiMSJ9.s"}
         elif self.command == "POST":
@@ -38,7 +44,8 @@ class Backend(http.server.BaseHTTPRequestHandler):
             Backend.store["{}/{}".format(self.path, new_id)] = dict(body or {}, id=new_id)
             out = {"owner": {"id": 191}, "report": {"id": new_id}}
         elif self.command == "GET" and self.path in Backend.store:
-            out = {"data": Backend.store[self.path]}
+            stored = Backend.store[self.path]
+            out = stored if self.path.startswith("/bare/") else {"data": stored}
         else:
             out = {"ok": True}
         raw = json.dumps(out).encode()
@@ -161,6 +168,16 @@ class Guard(unittest.TestCase):
         with self.assertRaises(api.WriteScopeRefused):
             h.req("DELETE", "/users/4401")
         self.assertEqual(len(Backend.seen), before, "the client's own send method is guarded too")
+        self.assert_blocked(h, "w15", "POST", "//4401/cards", {"name": PREFIX + "n"}, "bad-path")
+        with self.assertRaises(api.WriteScopeRefused):
+            h.call("w16", "M", "GET", "relative/path")
+        self.assertEqual(len(Backend.seen), before, "a malformed path is refused even for a read")
+
+    def test_redirects_are_not_followed(self):
+        self.pin()
+        h = self.client()
+        self.assertEqual(h.call("r1", "M", "GET", "/redirect")[0], 302)
+        self.assertEqual([p for _, p, _ in Backend.seen], ["/redirect"], "a redirect is reported, never followed")
 
     def test_read_only_post_is_an_explicit_list(self):
         self.pin()
@@ -188,6 +205,11 @@ class Guard(unittest.TestCase):
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             h.own("c8", "M", "/accounts", 4401, name)
         self.assertIn("unverified-fixture", str(ctx.exception), "a QA-named child does not make its parent ours")
+        Backend.store["/bare/4403"] = {"id": 4403, "name": "Existing", "report": {"id": 4403, "name": name}}
+        Backend.store["/bare/4404"] = {"id": 4404, "name": "Existing", "data": {"id": 4404, "name": name}}
+        for acct in (4403, 4404):
+            with self.assertRaises(api.WriteScopeRefused):
+                h.own("c8e%d" % acct, "M", "/bare", acct, name)
         Backend.store["/accounts/4402"] = {"id": "fx-777", "name": name}
         with self.assertRaises(api.WriteScopeRefused):
             h.own("c8b", "M", "/accounts", 4402, name)
@@ -209,7 +231,9 @@ class Guard(unittest.TestCase):
         with self.assertRaises(api.WriteScopeRefused):
             h.call("s1", "M", "POST", "/notes?access_token=FICTIONAL-TOKEN&x=1", {"k": 1})
         h.call("s2", "M", "POST", "/users/login", {"email": "m@example.test", "password": "fictional-pw"})
-        for f in ("s1.json", "s2.json", "00-timeline.txt"):
+        with self.assertRaises(api.WriteScopeRefused):
+            h.call("s3", "M", "POST", "/notes", {"name": PREFIX + "n", "account": {"id": {"access_token": "FICTIONAL-TOKEN"}}})
+        for f in ("s1.json", "s2.json", "s3.json", "00-timeline.txt"):
             with open(os.path.join(h.out, f)) as fh:
                 text = fh.read()
             for secret in ("FICTIONAL-TOKEN", "fictional-pw", "eyJzdWIiOiAiMSJ9"):

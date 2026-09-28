@@ -37,6 +37,11 @@ class WriteScopeRefused(Exception):
     pass
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -108,7 +113,8 @@ def scalars(value):
     if isinstance(value, list) and value:
         return [v for item in value for v in scalars(item)]
     if isinstance(value, dict):
-        return [str(value["id"])] if "id" in value else ["<object>"]
+        inner = value.get("id")
+        return [str(inner)] if isinstance(inner, (str, int)) and not isinstance(inner, bool) else ["<object>"]
     return ["<empty>"] if value in (None, "", []) else [str(value)]
 
 
@@ -165,13 +171,11 @@ def judge(run_dir, method, path, body=None):
 def names_itself(response, fixture_id, name):
     if not isinstance(response, dict):
         return False
-    inner = response.get("data")
-    if not isinstance(inner, dict):
+    entity = response
+    if "id" not in response:
         wrapped = [v for v in response.values() if isinstance(v, dict)]
-        inner = wrapped[0] if len(wrapped) == 1 else None
-    matches = [d for d in (response, inner) if isinstance(d, dict)
-               and str(d.get("id")) == str(fixture_id) and name in (d.get(k) for k in NAME_KEYS)]
-    return len(matches) == 1
+        entity = response["data"] if isinstance(response.get("data"), dict) else wrapped[0] if len(wrapped) == 1 else {}
+    return str(entity.get("id")) == str(fixture_id) and name in (entity.get(k) for k in NAME_KEYS)
 
 
 def redacted(body):
@@ -206,7 +210,7 @@ class H:
         self.out, self.run_dir, self.base, self.seats = outdir, run_dir, base.rstrip("/"), seats
         self.login_path, self.password_helper, self.tok = login_path, password_helper, {}
         os.makedirs(outdir, exist_ok=True)
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def emit(self, line):
         print(line, flush=True)
@@ -226,6 +230,8 @@ class H:
 
     def guarded(self, tag, seat, method, path, body):
         try:
+            if not path.startswith("/") or path.startswith("//"):
+                raise WriteScopeRefused("bad-path (a request path is a single-slash absolute path)")
             judge(self.run_dir, method, path, body)
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)
