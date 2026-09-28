@@ -14,7 +14,7 @@ export function appendActiveRuntimeContext(instructions: string | undefined, run
     '## Active Runtime',
     `This turn is running on provider ${provider}, model ${model}, and reasoning effort ${effort}.`,
     'Treat this block as the source of truth when asked which provider or model you are using. Do not infer it from agent identity, instructions, worker rosters, or generic documentation.',
-    'A subagent spawned from this thread can inherit this block verbatim, yet it runs on the model and effort its role or spawn call set. If another agent spawned you, this block describes that agent, not you: report your own runtime as not visible from inside your context, never as this one.',
+    'A subagent spawned from this thread, directly or through another subagent, can inherit this block verbatim, yet it runs on the model and effort its role or spawn call set. If another agent spawned you, this block describes the thread NanoClaw started, not you: report your own runtime as not visible from inside your context, never as this one.',
   ].join('\n');
   return [instructions, activeRuntime].filter((part): part is string => Boolean(part)).join('\n\n');
 }

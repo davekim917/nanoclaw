@@ -79,11 +79,13 @@ transport/session requirements; switching to one is not a native-child resume.
 Record default, requested and actual model/effort separately in the existing
 run record, plus transport, original parent session, owner handle, and
 assigned scope. Mark unavailable runtime metadata unverified. A native Codex
-child cannot observe its own runtime: `spawn_agent` copies the parent's
-instructions, Active Runtime block included, into the child, which runs on its
-role file's model/effort, else the spawn call's, else the parent's. Record that
-derived value as the child's actual runtime and state it in the child's brief;
-never record or halt on the child's self-report. Retain the same owner for
+child cannot observe its own runtime: `spawn_agent` copies the root thread's
+Active Runtime block into every descendant verbatim. Derive each field
+instead: the role file's model or effort wins; else the spawn call's or a
+configured subagent default (a model given without an effort takes that
+model's default effort); else the spawning agent's. Record that derived value
+as the child's actual runtime and state it in the child's brief; never record
+or halt on the child's self-report. Retain the same owner for
 corrections and remaining work. Native handles resume only through the
 spawning parent; a CLI session resumes only on its own session UUID with
 the same runtime home and accessible history. A matching home path in another container
