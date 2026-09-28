@@ -112,16 +112,16 @@ async function installChangedLockfiles(pluginPath: string, name: string, from: s
     const cwd = path.join(pluginPath, dir);
     const args = ['ci', '--ignore-scripts', '--prefix', cwd];
     const command = ['npm', ...args].join(' ');
-    if (!fs.existsSync(path.join(cwd, 'node_modules'))) {
-      log.info('Plugin lockfile changed; no existing install to refresh', { plugin: name, dir });
-      continue;
-    }
-    const refusal = lockfileRefusal(cwd);
-    if (refusal) {
-      log.warn('Plugin dependency install refused', { plugin: name, dir, command, reason: refusal });
-      continue;
-    }
     try {
+      if (!(await hasHostMadeInstall(pluginPath, dir, to))) {
+        log.info('Plugin lockfile changed; no existing install to refresh', { plugin: name, dir });
+        continue;
+      }
+      const refusal = lockfileRefusal(cwd);
+      if (refusal) {
+        log.warn('Plugin dependency install refused', { plugin: name, dir, command, reason: refusal });
+        continue;
+      }
       await execFileAsync('npm', args, { cwd, timeout: NPM_CI_TIMEOUT_MS, encoding: 'utf-8' });
       log.info('Plugin dependencies installed', { plugin: name, dir, command });
     } catch (err) {
@@ -133,6 +133,17 @@ async function installChangedLockfiles(pluginPath: string, name: string, from: s
       });
     }
   }
+}
+
+async function hasHostMadeInstall(pluginPath: string, dir: string, rev: string): Promise<boolean> {
+  const nodeModules = path.join(dir, 'node_modules');
+  if (!fs.existsSync(path.join(pluginPath, nodeModules))) return false;
+  const { stdout } = await execFileAsync('git', ['ls-tree', '--name-only', rev, '--', `:(literal)${nodeModules}`], {
+    cwd: pluginPath,
+    timeout: GIT_PULL_TIMEOUT_MS,
+    encoding: 'utf-8',
+  });
+  return stdout.trim() === '';
 }
 
 function lockfileRefusal(dir: string): string | null {

@@ -49,6 +49,7 @@ case "$1" in
     [ -e "$state/pull-fails" ] && { echo "fatal: pull boom" >&2; exit 1; }
     [ -e "$state/upstream-moved" ] && : > "$state/pulled"
     echo "Updating" ;;
+  ls-tree) if [ -e "$state/ls-tree-fails" ]; then echo "fatal: ls-tree boom" >&2; exit 128; fi ;;
   diff)
     [ -e "$state/diff-fails" ] && { echo "fatal: diff boom" >&2; exit 128; }
     [ -e "$state/diff-out" ] && tr '\\n' '\\0' < "$state/diff-out" ;;
@@ -149,6 +150,7 @@ describe('with real git: installs only where the pulled range changed a lockfile
     write(path.join(upstream, 'plugins/deleted/package-lock.json'), REGISTRY_LOCK);
     write(path.join(upstream, 'plugins/gitdep/package-lock.json'), REGISTRY_LOCK);
     write(path.join(upstream, 'plugins/never-installed/package-lock.json'), REGISTRY_LOCK);
+    write(path.join(upstream, 'plugins/tracked/package-lock.json'), REGISTRY_LOCK);
     write(path.join(upstream, 'README.md'), 'v1\n');
     git(upstream, 'add', '-A');
     git(upstream, 'commit', '-q', '-m', 'v1');
@@ -168,6 +170,8 @@ describe('with real git: installs only where the pulled range changed a lockfile
     fs.rmSync(path.join(upstream, 'plugins/deleted/package-lock.json'));
     write(path.join(upstream, 'plugins/gitdep/package-lock.json'), GIT_DEP_LOCK);
     write(path.join(upstream, 'plugins/never-installed/package-lock.json'), REGISTRY_LOCK + '\n');
+    write(path.join(upstream, 'plugins/tracked/package-lock.json'), REGISTRY_LOCK + '\n');
+    write(path.join(upstream, 'plugins/tracked/node_modules/planted.js'), '');
     write(path.join(upstream, 'plugins/unchanged/package.json'), '{}');
     write(path.join(upstream, 'plugins/new/package-lock.json.bak'), REGISTRY_LOCK);
     git(upstream, 'add', '-A');
@@ -196,6 +200,10 @@ describe('with real git: installs only where the pulled range changed a lockfile
     expect(log.info).toHaveBeenCalledWith('Plugin lockfile changed; no existing install to refresh', {
       plugin: 'bootstrap',
       dir: 'plugins/never-installed',
+    });
+    expect(log.info).toHaveBeenCalledWith('Plugin lockfile changed; no existing install to refresh', {
+      plugin: 'bootstrap',
+      dir: 'plugins/tracked',
     });
     expect(vi.mocked(log.warn).mock.calls).toEqual([
       [
@@ -285,6 +293,23 @@ describe('with fake git: failures stay inside their plugin', () => {
     expect(log.warn).toHaveBeenCalledWith(
       'Plugin lockfile diff failed; skipping dependency install',
       expect.objectContaining({ plugin: 'p' }),
+    );
+  });
+
+  it('a failing install-provenance check warns and installs nothing for that lockfile', async () => {
+    fakePlugin(
+      'p',
+      { 'upstream-moved': '', 'diff-out': 'package-lock.json\n', 'ls-tree-fails': '' },
+      { 'package-lock.json': REGISTRY_LOCK },
+    );
+
+    const results = await runPluginUpdates();
+
+    expect(results).toEqual([{ plugin: 'p', changed: true }]);
+    expect(npmCalls()).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Plugin dependency install failed',
+      expect.objectContaining({ plugin: 'p', err: expect.stringContaining('ls-tree boom') }),
     );
   });
 
