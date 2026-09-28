@@ -143,8 +143,7 @@ type DirListing = { names: string[] } | { error: string };
 
 /**
  * THE ONE PLACE A DIRECTORY IS LISTED. A union, never a bare array: an unlistable directory must not
- * read as empty and healthy. A symlink stays a candidate so a non-directory target fails loudly
- * later instead of vanishing.
+ * read as empty and healthy.
  */
 function listSubdirectories(dir: string): DirListing {
   let entries: fs.Dirent[];

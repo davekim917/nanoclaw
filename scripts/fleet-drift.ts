@@ -132,14 +132,11 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
   return result;
 }
 
-/**
- * src/log.ts colors the level tag with ANSI; never assume a zone. A legacy line without a UTC offset
- * still counts, parsed in this process's zone, so its window membership is best-effort.
- */
 // eslint-disable-next-line no-control-regex -- deliberately matches the ANSI CSI escape byte to strip src/log.ts's color codes
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const ERROR_LINE_RE =
   /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})([+-]\d{2}:\d{2})?\] ERROR\b/;
+// An offset-less legacy line's true instant is unrecoverable, so its window membership is best-effort.
 export function countRecentErrorLines(content: string, nowMs: number, windowMs = 24 * 60 * 60 * 1000): number {
   let count = 0;
   for (const rawLine of content.split('\n')) {

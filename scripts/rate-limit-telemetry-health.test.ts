@@ -440,6 +440,19 @@ describe('scanRateLimitTelemetry — a failure is never a zero', () => {
     expect(report.counts.agentGroups).toBe(1);
     expect(report.errors).toEqual([]);
   });
+
+  it('reports a group symlink to a non-directory as an error instead of dropping it', () => {
+    const root = makeRoot();
+    const target = path.join(root, 'not-a-dir');
+    fs.writeFileSync(target, '');
+    fs.symlinkSync(target, path.join(root, 'group-link'));
+
+    const report = scan(root);
+
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0]).toMatchObject({ path: 'group-link', code: 'group_unlistable' });
+    expect(report.errors[0].detail).toMatch(/ENOTDIR/);
+  });
 });
 
 /**

@@ -204,10 +204,6 @@ export function extractFixesPrNumber(body: string): number | null {
   return numbers.length > 0 ? numbers[0] : null;
 }
 
-/**
- * `none` counts: it is evidence the convention was in use, which `findConventionStartIso` dates. A
- * contradictory declaration also counts here, though `extractFixesPrNumbers` credits it nothing.
- */
 export function hasFixesPrLine(body: string): boolean {
   return /^[ \t]*Fixes-PR:[ \t]*(?:#\d+|none)\b/im.test(stripFencedAndCommented(body));
 }
@@ -1240,7 +1236,6 @@ export function formatWeeklyWindowLine(window: WeeklyWindowInfo): string {
   return `window: ${window.sinceIso}..${window.untilIso} (origin/main ${window.tip.shortSha} @ ${window.tip.tipIso})`;
 }
 
-// Must stay well above UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS, or the deliberate search-lag margin alone trips the note.
 export const WINDOW_AGE_NOTE_THRESHOLD_MS = 60 * 60 * 1000;
 
 export function formatWindowAgeNote(

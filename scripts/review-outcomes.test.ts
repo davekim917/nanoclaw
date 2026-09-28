@@ -744,6 +744,13 @@ describe('hasFixesPrLine', () => {
   it('is false when the trailer is absent entirely', () => {
     expect(hasFixesPrLine('nothing here')).toBe(false);
   });
+
+  it('counts a contradictory declaration as convention use, which extractFixesPrNumbers credits nothing', () => {
+    for (const body of ['Fixes-PR: none #2', 'Fixes-PR: none\nFixes-PR: #2']) {
+      expect(hasFixesPrLine(body)).toBe(true);
+      expect(extractFixesPrNumbers(body)).toEqual([]);
+    }
+  });
 });
 
 describe('findConventionStartIso', () => {
@@ -1520,6 +1527,14 @@ describe('formatWindowAgeNote — mutation coverage for the window-age compariso
     expect(formatWindowAgeNote(untilIso, wellBelow)).toBeNull();
     expect(formatWindowAgeNote(untilIso, atThreshold)).toBeNull();
     expect(formatWindowAgeNote(untilIso, justPast)).toContain('report window ends 1.0h before this run');
+  });
+
+  it('is not tripped by the search-lag margin plus a slow run on a just-landed tip', () => {
+    const tipMs = new Date('2026-09-12T00:00:00.000Z').getTime();
+    const untilIso = new Date(tipMs - UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS).toISOString();
+    const slowRunNowIso = new Date(tipMs + 15 * 60 * 1000).toISOString();
+
+    expect(formatWindowAgeNote(untilIso, slowRunNowIso)).toBeNull();
   });
 
   it('does not render NaN for invalid timestamps', () => {
