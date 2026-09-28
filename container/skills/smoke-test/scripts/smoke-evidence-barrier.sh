@@ -420,7 +420,7 @@ if [ -e "$RUN_DIR/$IDENTITY_REL" ] &&
   REFREEZE_WHY="since the pair was frozen LATE (contract generation %s is not above the snapshot taken at the freeze) — this lane ran before any pair was frozen, so its evidence is bound to no build and cannot count"
 fi
 if [ -e "$RUN_DIR/$IDENTITY_REL" ]; then
-  run_abs="$(cd "$RUN_DIR" && pwd)"
+  case "$RUN_DIR" in /*) run_abs="$RUN_DIR" ;; *) run_abs="$PWD/$RUN_DIR" ;; esac
   refreeze_result="$(cd "$SCRIPT_DIR" && jq -cs -L "$SCRIPT_DIR" --slurpfile c "$run_abs/completion-contract.json" '
     include "refreeze-lanes";
     if length != 1 then {error: "identity.json is not exactly one JSON document"}
