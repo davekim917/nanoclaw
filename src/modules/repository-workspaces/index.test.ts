@@ -104,6 +104,22 @@ vi.mock('../mailbox/read-only.js', async () => {
   return { ...actual, readSessionOutbound: hostActionMocks.readSessionOutbound };
 });
 
+const lifecycleProbe = vi.hoisted(() => ({ onRelease: null as null | (() => void) }));
+vi.mock('../../repository-workspaces.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../repository-workspaces.js')>();
+  return {
+    ...actual,
+    withRepositoryLifecycleClaims: <T>(units: readonly RepositoryWorkUnit[], fn: () => Promise<T> | T) =>
+      actual.withRepositoryLifecycleClaims(units, async () => {
+        try {
+          return await fn();
+        } finally {
+          lifecycleProbe.onRelease?.();
+        }
+      }),
+  };
+});
+
 // Pass-through, except that one test makes the file check report no commondir
 // to stand for the check-then-use race: a container planted one after the
 // host's file check read, before Git did. Only the Git common-dir check then
@@ -2755,6 +2771,22 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     );
     await expect(pending).resolves.toMatchObject({ created: true });
     expect(claimedWhileStaging).toBe(true);
+  });
+
+  it('holds its lifecycle claim until the checkout is published', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('claim-span');
+    const clone = path.join(topicWorktreesDir(unit, root), 'proj');
+    let publishedAtRelease: boolean | undefined;
+    lifecycleProbe.onRelease = () => {
+      publishedAtRelease = fs.existsSync(clone);
+    };
+    try {
+      await checkout(unit, 'feat', root);
+    } finally {
+      lifecycleProbe.onRelease = null;
+    }
+    expect(publishedAtRelease).toBe(true);
   });
 
   it('same-thread siblings get one path, including while the first checkout is still initializing', async () => {
