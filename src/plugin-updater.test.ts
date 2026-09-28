@@ -90,7 +90,7 @@ function npmCalls(): string[] {
     .trim()
     .split('\n')
     .filter(Boolean)
-    .map((line) => line.replace(`${home}/plugins/`, ''));
+    .map((line) => line.replaceAll(`${home}/plugins/`, ''));
 }
 
 function write(file: string, content: string): void {
@@ -175,18 +175,18 @@ describe('with real git: installs only where the pulled range changed a lockfile
 
     expect(results).toEqual([{ plugin: 'bootstrap', changed: true }]);
     expect(npmCalls().sort()).toEqual([
-      'bootstrap ci --ignore-scripts',
-      'bootstrap/plugins/changed ci --ignore-scripts',
+      'bootstrap ci --ignore-scripts --prefix bootstrap',
+      'bootstrap/plugins/changed ci --ignore-scripts --prefix bootstrap/plugins/changed',
     ]);
     expect(log.info).toHaveBeenCalledWith('Plugin dependencies installed', {
       plugin: 'bootstrap',
       dir: 'plugins/changed',
-      command: 'npm ci --ignore-scripts',
+      command: `npm ci --ignore-scripts --prefix ${home}/plugins/bootstrap/plugins/changed`,
     });
     expect(log.info).toHaveBeenCalledWith('Plugin dependencies installed', {
       plugin: 'bootstrap',
       dir: '.',
-      command: 'npm ci --ignore-scripts',
+      command: `npm ci --ignore-scripts --prefix ${home}/plugins/bootstrap`,
     });
     expect(vi.mocked(log.warn).mock.calls).toEqual([
       [
@@ -249,10 +249,17 @@ describe('with fake git: failures stay inside their plugin', () => {
       { plugin: 'broken', changed: true },
       { plugin: 'healthy', changed: true },
     ]);
-    expect(npmCalls().sort()).toEqual(['broken ci --ignore-scripts', 'healthy/sub ci --ignore-scripts']);
+    expect(npmCalls().sort()).toEqual([
+      'broken ci --ignore-scripts --prefix broken',
+      'healthy/sub ci --ignore-scripts --prefix healthy/sub',
+    ]);
     expect(log.warn).toHaveBeenCalledWith(
       'Plugin dependency install failed',
-      expect.objectContaining({ plugin: 'broken', dir: '.', command: 'npm ci --ignore-scripts' }),
+      expect.objectContaining({
+        plugin: 'broken',
+        dir: '.',
+        command: `npm ci --ignore-scripts --prefix ${home}/plugins/broken`,
+      }),
     );
   });
 
@@ -281,7 +288,62 @@ describe('with fake git: failures stay inside their plugin', () => {
 
     expect(results.find((r) => r.plugin === 'down')).toMatchObject({ changed: false, error: expect.any(String) });
     expect(results.find((r) => r.plugin === 'up')).toEqual({ plugin: 'up', changed: true });
-    expect(npmCalls()).toEqual(['up ci --ignore-scripts']);
+    expect(npmCalls()).toEqual(['up ci --ignore-scripts --prefix up']);
+  });
+
+  const lockWith = (entry: Record<string, unknown>) =>
+    JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'p' }, 'node_modules/dep': entry } });
+
+  it.each([
+    ['a git URL over https', { version: '1.0.0', resolved: 'https://github.com/o/r.git#abc' }],
+    ['a git+ssh URL', { version: '1.0.0', resolved: 'git+ssh://git@example.com/o/r.git#abc' }],
+    ['another registry host', { version: '1.0.0', resolved: 'https://registry.example.com/dep/-/dep-1.0.0.tgz' }],
+    ['a plain http registry URL', { version: '1.0.0', resolved: 'http://registry.npmjs.org/dep/-/dep-1.0.0.tgz' }],
+    ['a relative file path', { version: '1.0.0', resolved: 'file:../dep' }],
+    ['no resolved and a non-semver version', { version: 'github:o/r' }],
+    ['no resolved and no version', {}],
+  ])('refuses a lockfile whose dependency has %s', async (_label, entry) => {
+    fakePlugin(
+      'p',
+      { 'upstream-moved': '', 'diff-out': 'package-lock.json\n' },
+      { 'package-lock.json': lockWith(entry) },
+    );
+
+    await runPluginUpdates();
+
+    expect(npmCalls()).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Plugin dependency install refused',
+      expect.objectContaining({ plugin: 'p', reason: expect.stringContaining('node_modules/dep') }),
+    );
+  });
+
+  it('installs a lockfile whose dependency has no resolved but a semver version', async () => {
+    fakePlugin(
+      'p',
+      { 'upstream-moved': '', 'diff-out': 'package-lock.json\n' },
+      { 'package-lock.json': lockWith({ version: '1.2.3-beta.1' }) },
+    );
+
+    await runPluginUpdates();
+
+    expect(npmCalls()).toEqual(['p ci --ignore-scripts --prefix p']);
+  });
+
+  it('refuses a directory whose npm-shrinkwrap.json would take precedence', async () => {
+    fakePlugin(
+      'p',
+      { 'upstream-moved': '', 'diff-out': 'package-lock.json\n' },
+      { 'package-lock.json': REGISTRY_LOCK, 'npm-shrinkwrap.json': GIT_DEP_LOCK },
+    );
+
+    await runPluginUpdates();
+
+    expect(npmCalls()).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Plugin dependency install refused',
+      expect.objectContaining({ plugin: 'p', reason: expect.stringContaining('npm-shrinkwrap.json') }),
+    );
   });
 
   it('refuses a lockfile that predates lockfileVersion 2', async () => {

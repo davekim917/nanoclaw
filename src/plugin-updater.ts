@@ -23,8 +23,16 @@ const STARTUP_DELAY_MS = 5 * 60 * 1000; // let the host settle after boot
 const GIT_PULL_TIMEOUT_MS = 30_000;
 const CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS = 60_000;
 const NPM_CI_TIMEOUT_MS = 5 * 60_000;
-const NPM_CI_ARGS = ['ci', '--ignore-scripts'];
 const NPM_LOCKFILE = 'package-lock.json';
+const NPM_SHRINKWRAP = 'npm-shrinkwrap.json';
+const NPM_REGISTRY_HOST = 'registry.npmjs.org';
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+interface LockEntry {
+  resolved?: unknown;
+  version?: unknown;
+  link?: unknown;
+}
 
 // The hourly refresh would repeat the missing-codex-binary line forever; log it once per process.
 let codexBinaryMissingLogged = false;
@@ -102,14 +110,15 @@ async function installChangedLockfiles(pluginPath: string, name: string, from: s
   for (const lockfile of lockfiles) {
     const dir = path.dirname(lockfile);
     const cwd = path.join(pluginPath, dir);
-    const command = ['npm', ...NPM_CI_ARGS].join(' ');
-    const refusal = lockfileRefusal(path.join(pluginPath, lockfile));
+    const args = ['ci', '--ignore-scripts', '--prefix', cwd];
+    const command = ['npm', ...args].join(' ');
+    const refusal = lockfileRefusal(cwd);
     if (refusal) {
       log.warn('Plugin dependency install refused', { plugin: name, dir, command, reason: refusal });
       continue;
     }
     try {
-      await execFileAsync('npm', NPM_CI_ARGS, { cwd, timeout: NPM_CI_TIMEOUT_MS, encoding: 'utf-8' });
+      await execFileAsync('npm', args, { cwd, timeout: NPM_CI_TIMEOUT_MS, encoding: 'utf-8' });
       log.info('Plugin dependencies installed', { plugin: name, dir, command });
     } catch (err) {
       log.warn('Plugin dependency install failed', {
@@ -122,10 +131,12 @@ async function installChangedLockfiles(pluginPath: string, name: string, from: s
   }
 }
 
-function lockfileRefusal(lockfilePath: string): string | null {
-  let lock: { lockfileVersion?: unknown; packages?: Record<string, { resolved?: unknown; link?: unknown }> };
+function lockfileRefusal(dir: string): string | null {
+  if (fs.existsSync(path.join(dir, NPM_SHRINKWRAP)))
+    return `${NPM_SHRINKWRAP} present; npm would install from it instead`;
+  let lock: { lockfileVersion?: unknown; packages?: Record<string, LockEntry> };
   try {
-    lock = JSON.parse(fs.readFileSync(lockfilePath, 'utf-8'));
+    lock = JSON.parse(fs.readFileSync(path.join(dir, NPM_LOCKFILE), 'utf-8'));
   } catch (err) {
     return `unreadable lockfile: ${err instanceof Error ? err.message : String(err)}`;
   }
@@ -133,12 +144,18 @@ function lockfileRefusal(lockfilePath: string): string | null {
     return 'lockfile predates lockfileVersion 2';
   }
   const nonRegistry = Object.entries(lock.packages)
-    .filter(([, entry]) => entry.link !== true && typeof entry.resolved === 'string')
-    .filter(([, entry]) => !(entry.resolved as string).startsWith('https://'))
+    .filter(([key, entry]) => key.includes('node_modules/') && entry.link !== true && !fromRegistry(entry))
     .map(([key]) => key);
   return nonRegistry.length > 0
     ? `non-registry dependencies, whose prepare scripts npm runs despite --ignore-scripts: ${nonRegistry.join(', ')}`
     : null;
+}
+
+function fromRegistry(entry: LockEntry): boolean {
+  if (entry.resolved === undefined) return typeof entry.version === 'string' && SEMVER.test(entry.version);
+  if (typeof entry.resolved !== 'string' || !URL.canParse(entry.resolved)) return false;
+  const url = new URL(entry.resolved);
+  return url.protocol === 'https:' && url.host === NPM_REGISTRY_HOST;
 }
 
 /** Pull every `~/plugins/<name>`; no notification side effect. */
