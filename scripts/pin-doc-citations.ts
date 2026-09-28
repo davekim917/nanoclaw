@@ -127,12 +127,22 @@ function newestOf(root: string, shas: readonly string[]): string | null {
   return shas.find((sha) => shas.every((other) => isAncestor(other, sha))) ?? null;
 }
 
-function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] | null {
+function shallowBoundary(root: string): Set<string> {
+  const file = gitRead(root, ['rev-parse', '--path-format=absolute', '--git-path', 'shallow'])?.trim();
+  return new Set(file && fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
+}
+
+function candidateRevisions(
+  root: string,
+  origin: string,
+  files: readonly string[],
+  shallow: ReadonlySet<string>,
+): string[] | null {
   const touching = (gitRead(root, ['log', '--full-history', '--format=%H %P', origin, '--', ...files]) ?? '')
     .split('\n')
     .filter(Boolean)
     .map((line) => line.split(' ').filter(Boolean));
-  if (touching.length > MAX_EARLIER_VERSIONS) return null;
+  if (touching.length > MAX_EARLIER_VERSIONS || touching.some(([sha]) => shallow.has(sha))) return null;
   const revs = [origin, ...touching.flat()];
   const seenVersions = new Set<string>();
   const out: string[] = [];
@@ -195,8 +205,8 @@ export function pinDocs(
   citedFiles: readonly string[],
   options: { rev?: string; write?: boolean } = {},
 ): PinOutcome[] {
-  if (gitIsShallowRepo(root)) throw new Error('a shallow clone hides earlier versions; fetch full history first');
   const rev = options.rev ?? 'HEAD';
+  const shallow = shallowBoundary(root);
   const outcomes: PinOutcome[] = [];
   for (const doc of docs) {
     const lines = fs.readFileSync(path.join(root, doc), 'utf8').split('\n');
@@ -240,9 +250,11 @@ export function pinDocs(
           refuse('its citations were added on unrelated branches');
           continue;
         }
-        const candidates = candidateRevisions(root, origin, files);
-        if (!candidates) {
-          refuse(`the cited files have more than ${MAX_EARLIER_VERSIONS} earlier versions to compare`);
+        const candidates = candidateRevisions(root, origin, files, shallow);
+        if (!candidates || (linkOrigins as string[]).some((sha) => shallow.has(sha))) {
+          refuse(
+            `the cited files' history runs past ${MAX_EARLIER_VERSIONS} versions or into this clone's shallow boundary`,
+          );
           continue;
         }
         const runStart = text[head.index - 1] === '`' ? head.index - 1 : head.index;

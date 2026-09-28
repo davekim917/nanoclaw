@@ -511,7 +511,7 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
   });
 
-  it('refuses to run in a shallow clone', () => {
+  it("refuses a citation whose history reaches a shallow clone's boundary", () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
     commit(root, 'one');
@@ -521,7 +521,9 @@ describe('pinDocs', () => {
     roots.push(shallow);
     spawnSync('git', ['clone', '-q', '--depth', '1', `file://${root}`, shallow]);
 
-    expect(() => pinDocs(shallow, [NOTE], [])).toThrow(/shallow clone/);
+    expect(pinDocs(shallow, [NOTE], [])).toEqual([
+      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/shallow boundary/) }),
+    ]);
   });
 
   it('matches a named identifier whole, not inside a longer one', () => {
