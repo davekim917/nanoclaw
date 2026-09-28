@@ -2677,7 +2677,6 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     });
     _setRepositoryCheckoutHooksForTesting({
       afterStagingPopulated: async (stagingCheckout) => {
-        expect(isWorkgroupRepositoryMountClaimed(WG)).toBe(false);
         reached.add(stagingCheckout);
         if (reached.size === 2) bothReached();
         await withTimeout(barrier, 30_000, 'the other thread never reached staging');
@@ -2721,6 +2720,13 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     expect(mailboxAcks).toEqual(
       expect.arrayContaining(requests.map(({ requestId }) => ({ kind: 'delivered', id: requestId }))),
     );
+  });
+
+  it('completes while mount reconciliation holds the workgroup claim, and quiesces nothing', async () => {
+    networkCanonical(root);
+    const result = await withWorkgroupRepositoryMountClaim(WG, () => checkout(threadUnit('mount-held'), 'feat', root));
+    expect(result).toMatchObject({ created: true });
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
   });
 
   it('same-thread siblings get one path, including while the first checkout is still initializing', async () => {

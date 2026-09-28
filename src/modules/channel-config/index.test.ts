@@ -58,12 +58,17 @@ beforeEach(() => {
 });
 
 describe('set_channel_model / set_channel_effort', () => {
-  it('pins a non-Codex model id the flag vocabulary does not know, verbatim', async () => {
-    await run('set_channel_model', { model: 'claude-future-model-9' });
-    expect(fixture.updates).toEqual([{ id: 'wiring-1', patch: { default_model: 'claude-future-model-9' } }]);
+  it.each([
+    ['claude', 'claude-future-model-9'],
+    ['opencode', 'openrouter/future-model:free'],
+  ])('pins a %s model id the flag vocabulary does not know, verbatim', async (provider, model) => {
+    fixture.provider = provider;
+    await run('set_channel_model', { model });
+    expect(fixture.updates).toEqual([{ id: 'wiring-1', patch: { default_model: model } }]);
   });
 
-  it('refuses a Codex-only effort level on a Claude wiring', async () => {
+  it.each(['claude', 'opencode'])('refuses a Codex-only effort level on a %s wiring', async (provider) => {
+    fixture.provider = provider;
     await run('set_channel_effort', { effort: 'ultra' });
     expect(fixture.updates).toEqual([]);
     expect(fixture.notices[0]).toMatch(/^set_channel_effort failed/);
