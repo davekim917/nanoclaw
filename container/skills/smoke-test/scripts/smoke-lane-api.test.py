@@ -23,7 +23,7 @@ SCOPE = {"tenants": [], "brands": [], "accounts": [],
 class Backend(http.server.BaseHTTPRequestHandler):
     seen = []
 
-    def log_message(self, *a):
+    def log_message(self, format, *args):
         pass
 
     def reply(self):
@@ -33,7 +33,9 @@ class Backend(http.server.BaseHTTPRequestHandler):
         out = {"access_token": "h.eyJzdWIiOiAiMSJ9.s"} if self.path == "/users/login" else (
             {"owner": {"id": 191}, "report": {"id": "rp-77", "filename": PREFIX + "f.pdf"}} if self.path == "/reports/nested" else (
             {"owner": {"id": 192}} if self.path == "/reports/anon" else (
-                {"id": "ex-5", "name": "Existing"} if self.path == "/reports/upsert" else {"id": "fx-901", "ok": True})))
+                {"id": "ex-5", "name": "Existing"} if self.path == "/reports/upsert" else (
+                    {"id": "owner-1", "data": {"id": "report-2"}} if self.path == "/reports/ambig"
+                    else {"id": "fx-901", "ok": True}))))
         raw = json.dumps(out).encode()
         self.send_response(201 if self.command == "POST" else 200)
         self.send_header("Content-Length", str(len(raw)))
@@ -57,8 +59,8 @@ class Guard(unittest.TestCase):
     def setUp(self):
         Backend.seen.clear()
         self.tmp = tempfile.TemporaryDirectory()
-        self.run = os.path.join(self.tmp.name, RUN_ID)
-        os.makedirs(self.run)
+        self.run_dir = os.path.join(self.tmp.name, RUN_ID)
+        os.makedirs(self.run_dir)
         self.helper = os.path.join(self.tmp.name, "pw.sh")
         with open(self.helper, "w") as f:
             f.write('[ "$1" = held@example.test ] && exit 69\necho fictional-pw\n')
@@ -70,10 +72,10 @@ class Guard(unittest.TestCase):
         src = os.path.join(self.tmp.name, "scope.json")
         with open(src, "w") as f:
             json.dump(SCOPE if scope is None else scope, f)
-        return api.init_scope(self.run, src)
+        return api.init_scope(self.run_dir, src)
 
     def client(self):
-        return api.H(os.path.join(self.run, "lanes", "l1"), run_dir=self.run, base=self.base,
+        return api.H(os.path.join(self.run_dir, "lanes", "l1"), run_dir=self.run_dir, base=self.base,
                      seats={"M": "m@example.test", "X": "held@example.test"}, password_helper=self.helper)
 
     def assert_blocked(self, h, tag, method, path, body, reason):
@@ -103,7 +105,7 @@ class Guard(unittest.TestCase):
         with self.assertRaises(api.WriteScopeRefused):
             self.client().login("M")
         self.assertEqual(Backend.seen, [])
-        os.unlink(os.path.join(self.run, api.SCOPE_FILE))
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
         self.pin()
         h = self.client()
         self.assertEqual(h.login("M"), 201)
@@ -127,6 +129,16 @@ class Guard(unittest.TestCase):
         self.assert_blocked(h, "w7", "POST", "/notes", {"title": "QA-other-run-n"}, "no-qa-target")
         self.assert_blocked(h, "w8", "POST", "/budget/save", {"meta": {"name": PREFIX + "n"}}, "no-qa-target")
         self.assert_blocked(h, "w9", "PATCH", "/notes", {"name": PREFIX + "n"}, "no-qa-target")
+        self.assert_blocked(h, "w10", "POST", "/notes", {"name": PREFIX + "n", "account": {"id": 4401}}, "foreign-target")
+        self.assert_blocked(h, "w11", "POST", "/notes", {"name": PREFIX + "n", "accounts": [{"ref": 1}]}, "foreign-target")
+        self.assert_blocked(h, "w12", "POST", "/notes?accountId=", {"name": PREFIX + "n"}, "foreign-target")
+        self.assert_blocked(h, "w13", "POST", "/reports/v12", {"name": PREFIX + "n"}, "foreign-target")
+        self.assert_blocked(h, "w13b", "POST", "/v4401/notes", {"name": PREFIX + "n"}, "foreign-target")
+        self.assertEqual(h.call("w14", "M", "POST", "/v1/notes", {"name": PREFIX + "n"})[0], 201)
+        before = len(Backend.seen)
+        with self.assertRaises(api.WriteScopeRefused):
+            h.req("DELETE", "/users/4401")
+        self.assertEqual(len(Backend.seen), before, "the client's own send method is guarded too")
 
     def test_read_only_post_is_an_explicit_list(self):
         self.pin()
@@ -138,48 +150,59 @@ class Guard(unittest.TestCase):
         self.pin()
         h = self.client()
         self.assertEqual(h.call("c1", "M", "POST", "/reports", {"name": PREFIX + "coord-r1", "segmentId": 81})[0], 201)
-        self.assertEqual(api.ledger_ids(self.run), {"/reports/fx-901"})
+        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/fx-901"})
         self.assertEqual(h.call("c2", "M", "PATCH", "/reports/fx-901", {"name": PREFIX + "renamed"})[0], 200)
-        self.assertEqual(api.ledger_ids(self.run), {"/reports/fx-901"}, "only a POST create is ledgered")
+        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/fx-901"}, "only a POST create is ledgered")
         self.assertEqual(h.call("c3", "M", "DELETE", "/reports/fx-901")[0], 200)
         self.assert_blocked(h, "c4", "DELETE", "/reports/fx-902", None, "foreign-target")
         self.assert_blocked(h, "c4b", "PATCH", "/users/fx-901", {"role": "admin"}, "foreign-target")
         self.assertEqual(h.call("c5", "M", "POST", "/reports/nested", {"filename": PREFIX + "f.pdf"})[0], 201)
-        self.assertEqual(api.ledger_ids(self.run), {"/reports/fx-901", "/reports/nested/rp-77"},
+        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/fx-901", "/reports/nested/rp-77"},
                          "the named object's id, not its owner's")
         h.call("c6", "M", "POST", "/reports/anon", {"name": PREFIX + "anon"})
-        self.assertEqual(len(api.ledger_ids(self.run)), 2, "a nested id that is not the named object stays foreign")
+        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "a nested id that is not the named object stays foreign")
         h.call("c7", "M", "POST", "/reports/upsert", {"name": PREFIX + "up"})
-        self.assertEqual(len(api.ledger_ids(self.run)), 2, "a response naming another object is not ours")
+        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "a response naming another object is not ours")
+        h.call("c8", "M", "POST", "/reports/ambig", {"name": PREFIX + "amb"})
+        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2, "two candidate ids and no name: neither is ledgered")
 
     def test_allowlisted_account_is_writable(self):
         self.pin(dict(SCOPE, accounts=["7001"]))
         h = self.client()
         self.assertEqual(h.call("a1", "M", "POST", "/cards", {"accountId": 7001})[0], 201)
-        self.assertEqual(api.ledger_ids(self.run), set(), "only QA-named creates are ledgered")
+        self.assert_blocked(h, "a2", "DELETE", "/users/7001", None, "foreign-target")
+        self.assertEqual(api.ledger_ids(self.run_dir), set(), "only QA-named creates are ledgered")
 
     def test_scope_from_another_run_refused(self):
         self.pin()
         other = os.path.join(self.tmp.name, "acme-pr-pr8-0123456789ab-20260102T000000Z")
         os.makedirs(other)
-        os.rename(os.path.join(self.run, api.SCOPE_FILE), os.path.join(other, api.SCOPE_FILE))
+        os.rename(os.path.join(self.run_dir, api.SCOPE_FILE), os.path.join(other, api.SCOPE_FILE))
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             api.judge(other, "POST", "/notes", {"title": PREFIX + "x"})
         self.assertIn("scope-run-mismatch", str(ctx.exception))
 
     def test_unreadable_scope_and_ledger_refuse(self):
-        with open(os.path.join(self.run, api.SCOPE_FILE), "w") as f:
+        with open(os.path.join(self.run_dir, api.SCOPE_FILE), "w") as f:
             f.write("{")
         with self.assertRaises(api.WriteScopeRefused) as ctx:
-            api.judge(self.run, "PUT", "/x", None)
+            api.judge(self.run_dir, "PUT", "/x", None)
         self.assertIn("unreadable-scope", str(ctx.exception))
-        os.unlink(os.path.join(self.run, api.SCOPE_FILE))
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
         self.pin()
-        with open(os.path.join(self.run, api.LEDGER_FILE), "w") as f:
+        with open(os.path.join(self.run_dir, api.LEDGER_FILE), "w") as f:
             f.write("not json\n")
         with self.assertRaises(api.WriteScopeRefused) as ctx:
-            api.judge(self.run, "DELETE", "/reports/fx-901", None)
+            api.judge(self.run_dir, "DELETE", "/reports/fx-901", None)
         self.assertIn("unreadable-ledger", str(ctx.exception))
+        os.unlink(os.path.join(self.run_dir, api.LEDGER_FILE))
+        elsewhere = os.path.join(self.tmp.name, "other-ledger.ndjson")
+        with open(elsewhere, "w") as f:
+            f.write(json.dumps({"id": "x1", "path": "/reports"}) + "\n")
+        os.symlink(elsewhere, os.path.join(self.run_dir, api.LEDGER_FILE))
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            api.judge(self.run_dir, "POST", "/notes", {"name": PREFIX + "n"})
+        self.assertIn("unreadable-ledger", str(ctx.exception), "a symlinked ledger is refused, not followed")
 
     def test_cli(self):
         src = os.path.join(self.tmp.name, "scope.json")
@@ -188,11 +211,11 @@ class Guard(unittest.TestCase):
         cli = [sys.executable, os.path.join(HERE, "smoke_lane_api.py")]
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         run = lambda *a: subprocess.run(cli + list(a), capture_output=True, text=True, env=env)
-        self.assertEqual(run("init", self.run, "--from", src).returncode, 0)
-        self.assertEqual(run("init", self.run, "--from", src).returncode, 3, "the scope is pinned once")
-        ok = run("check", self.run, "POST", "/notes", "--body", json.dumps({"title": PREFIX + "x"}))
+        self.assertEqual(run("init", self.run_dir, "--from", src).returncode, 0)
+        self.assertEqual(run("init", self.run_dir, "--from", src).returncode, 3, "the scope is pinned once")
+        ok = run("check", self.run_dir, "POST", "/notes", "--body", json.dumps({"title": PREFIX + "x"}))
         self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "write"))
-        no = run("check", self.run, "POST", "/cards", "--body", '{"accountId": 4401}')
+        no = run("check", self.run_dir, "POST", "/cards", "--body", '{"accountId": 4401}')
         self.assertEqual(no.returncode, 77)
         self.assertIn("WRITE_SCOPE_REFUSED reason=foreign-target", no.stderr)
         with open(src, "w") as f:

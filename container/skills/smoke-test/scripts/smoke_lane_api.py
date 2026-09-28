@@ -28,7 +28,7 @@ TARGET_KEYS = {
 }
 NAME_KEYS = {"name", "title", "label", "filename"}
 ID_SEGMENT = re.compile(r".*\d.*")
-VERSION_SEGMENT = re.compile(r"v\d+")
+VERSION_SEGMENT = re.compile(r"v\d{1,2}")
 PASSWORD_HELPER = "/workspace/extra/qa-seat-password.sh"
 
 
@@ -57,10 +57,14 @@ def init_scope(run_dir, source):
     run_id = os.path.basename(os.path.normpath(run_dir))
     with open(source) as f:
         scope = validated_scope(json.load(f))
-    scope.update(schemaVersion=1, runId=run_id)
+    pinned = {**scope, "schemaVersion": 1, "runId": run_id}
     with open(os.path.join(run_dir, SCOPE_FILE), "x") as f:
-        json.dump(scope, f, indent=1)
-    return scope
+        json.dump(pinned, f, indent=1)
+    return pinned
+
+
+def fixture_prefix(run_dir):
+    return "QA-{}-".format(os.path.basename(os.path.normpath(run_dir)))
 
 
 def load_scope(run_dir):
@@ -76,17 +80,19 @@ def load_scope(run_dir):
     run_id = os.path.basename(os.path.normpath(run_dir))
     if raw.get("runId") != run_id:
         raise WriteScopeRefused("scope-run-mismatch scope={} run={}".format(raw.get("runId"), run_id))
-    scope["fixturePrefix"] = "QA-{}-".format(run_id)
     return scope
 
 
 def ledger_ids(run_dir):
+    path = os.path.join(run_dir, LEDGER_FILE)
+    if not os.path.lexists(path):
+        return set()
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise WriteScopeRefused("unreadable-ledger path={}".format(path))
     try:
-        with open(os.path.join(run_dir, LEDGER_FILE)) as f:
+        with open(path) as f:
             rows = [json.loads(line) for line in f if line.strip()]
         return {"{}/{}".format(r["path"].rstrip("/"), r["id"]) for r in rows}
-    except FileNotFoundError:
-        return set()
     except (OSError, ValueError, KeyError) as e:
         raise WriteScopeRefused("unreadable-ledger error={}".format(e))
 
@@ -101,7 +107,7 @@ def scalars(value):
     if isinstance(value, list):
         return [v for item in value for v in scalars(item)]
     if isinstance(value, dict):
-        return []
+        return [str(value["id"])] if "id" in value else ["<object>"]
     return [] if value is None else [str(value)]
 
 
@@ -138,10 +144,9 @@ def judge(run_dir, method, path, body=None):
     segments = route.split("/")
     for i, segment in enumerate(segments):
         segment = urllib.parse.unquote(segment)
-        if ID_SEGMENT.fullmatch(segment) and not VERSION_SEGMENT.fullmatch(segment):
-            mine = "/".join(segments[:i + 1]) in fixtures or segment in scope["accounts"]
-            (owned if mine else foreign).append(segment)
-    pairs = list(walk(body)) + urllib.parse.parse_qsl(parsed.query)
+        if ID_SEGMENT.fullmatch(segment) and not (i == 1 and VERSION_SEGMENT.fullmatch(segment)):
+            (owned if "/".join(segments[:i + 1]) in fixtures else foreign).append(segment)
+    pairs = list(walk(body)) + urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     for key, value in pairs:
         norm = key.lower().replace("_", "")
         for kind, keys in TARGET_KEYS.items():
@@ -150,8 +155,9 @@ def judge(run_dir, method, path, body=None):
                     (owned if v in scope[kind] else foreign).append("{}={}".format(key, v))
     if foreign:
         raise WriteScopeRefused("foreign-target targets={}".format(",".join(foreign)))
-    if not owned and not (method == "POST" and qa_name(body, scope["fixturePrefix"])):
-        raise WriteScopeRefused("no-qa-target (names no {}* object and no id this run created)".format(scope["fixturePrefix"]))
+    prefix = fixture_prefix(run_dir)
+    if not owned and not (method == "POST" and qa_name(body, prefix)):
+        raise WriteScopeRefused("no-qa-target (names no {}* object and no id this run created)".format(prefix))
     return "write"
 
 
@@ -163,7 +169,7 @@ def created_ids(response, name):
     named = [d for d in with_id if name in (d.get(k) for k in NAME_KEYS)]
     unnamed = not any(k in d for d in with_id for k in NAME_KEYS)
     direct = [d for d in with_id if unnamed and (d is response or d is response.get("data"))]
-    return [d["id"] for d in (named or direct[:1])]
+    return [d["id"] for d in (named or (direct if len(direct) == 1 else []))]
 
 
 def claims(token):
@@ -202,7 +208,8 @@ class H:
                 now(), tag, seat, method, path, e))
             raise
 
-    def req(self, method, path, tok=None, body=None):
+    def req(self, method, path, tok=None, body=None, tag="req", seat="-"):
+        kind = self.guarded(tag, seat, method, path, body)
         data = json.dumps(body).encode() if body is not None else None
         r = urllib.request.Request(self.base + path, data=data, method=method)
         if tok:
@@ -216,12 +223,12 @@ class H:
         except urllib.error.HTTPError as e:
             code, raw = e.code, e.read()
         except (urllib.error.URLError, OSError) as e:
-            return -1, {"_error": str(e)[:300]}, time.time() - t0
+            return -1, {"_error": str(e)[:300]}, time.time() - t0, kind
         try:
             js = json.loads(raw)
         except ValueError:
             js = {"_raw": raw[:300].decode("utf8", "replace")}
-        return code, js, time.time() - t0
+        return code, js, time.time() - t0, kind
 
     def login(self, seat):
         if seat in self.tok:
@@ -233,13 +240,15 @@ class H:
             why = "SEAT_LEASE_REFUSED (seat unavailable)" if pr.returncode == 69 else "derive rc={}".format(pr.returncode)
             self.emit("{} login {} REFUSED locally: {}, no request sent".format(now(), seat, why))
             raise SystemExit(2)
-        code, js, _ = self.req("POST", self.login_path, body={"email": self.seats[seat], "password": pw})
+        code, js, _, _ = self.req("POST", self.login_path, body={"email": self.seats[seat], "password": pw},
+                                  tag="login-" + seat, seat=seat)
         pw = None
         token = None
         if isinstance(js, dict):
-            d = js.get("data") if isinstance(js.get("data"), dict) else {}
-            for k in ("access_token", "accessToken", "token"):
-                token = token or js.get(k) or d.get(k)
+            data = js.get("data")
+            for d in (js, data if isinstance(data, dict) else {}):
+                for k in ("access_token", "accessToken", "token"):
+                    token = token or (d.get(k) if isinstance(d.get(k), str) else None)
         if token:
             self.tok[seat] = token
         self.emit("{} login {} -> {} token={} claims={}".format(
@@ -247,10 +256,9 @@ class H:
         return code
 
     def call(self, tag, seat, method, path, body=None, save=True):
-        kind = self.guarded(tag, seat, method, path, body)
-        code, js, dt = self.req(method, path, self.tok.get(seat), body)
+        code, js, dt, kind = self.req(method, path, self.tok.get(seat), body, tag, seat)
         if kind == "write" and method.upper() == "POST" and 200 <= code < 300:
-            name = qa_name(body, "QA-{}-".format(os.path.basename(os.path.normpath(self.run_dir))))
+            name = qa_name(body, fixture_prefix(self.run_dir))
             for fixture_id in created_ids(js, name) if name else []:
                 record_fixture(self.run_dir, urllib.parse.urlsplit(path).path, fixture_id, name)
         if save:
