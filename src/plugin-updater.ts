@@ -1,6 +1,6 @@
 /**
- * Hourly `git pull --ff-only` of each `~/plugins/<name>`, then a refresh of the derived Codex surfaces; optionally
- * notifies `PLUGIN_UPDATE_NOTIFY_JID` when any plugin advanced.
+ * Hourly `git pull --ff-only` of each `~/plugins/<name>`, `npm ci --ignore-scripts` for each existing install whose
+ * lockfile it changed, a refresh of the derived Codex surfaces, and a `PLUGIN_UPDATE_NOTIFY_JID` note if any advanced.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -22,6 +22,16 @@ const INTERVAL_MS = 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 5 * 60 * 1000; // let the host settle after boot
 const GIT_PULL_TIMEOUT_MS = 30_000;
 const CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS = 60_000;
+const NPM_CI_TIMEOUT_MS = 5 * 60_000;
+const NPM_LOCKFILE = 'package-lock.json';
+const NPM_SHRINKWRAP = 'npm-shrinkwrap.json';
+const NPM_REGISTRY_HOST = 'registry.npmjs.org';
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+interface LockEntry {
+  resolved?: unknown;
+  version?: unknown;
+}
 
 // The hourly refresh would repeat the missing-codex-binary line forever; log it once per process.
 let codexBinaryMissingLogged = false;
@@ -48,16 +58,28 @@ export interface CodexSurfaceRefreshResult {
   localPluginCache?: ReturnType<typeof syncCodexLocalMarketplacePluginCache>;
 }
 
+async function gitHead(pluginPath: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+    cwd: pluginPath,
+    timeout: GIT_PULL_TIMEOUT_MS,
+    encoding: 'utf-8',
+  });
+  return stdout.trim();
+}
+
 async function updatePlugin(pluginPath: string, name: string): Promise<UpdateResult> {
   try {
+    const before = await gitHead(pluginPath);
     const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
       cwd: pluginPath,
       timeout: GIT_PULL_TIMEOUT_MS,
       encoding: 'utf-8',
     });
-    const changed = !stdout.includes('Already up to date.');
+    const after = await gitHead(pluginPath);
+    const changed = before !== after;
     if (changed) {
       log.info('Plugin updated', { plugin: name, output: stdout.trim() });
+      await installChangedLockfiles(pluginPath, name, before, after);
     }
     return { plugin: name, changed };
   } catch (err) {
@@ -65,6 +87,89 @@ async function updatePlugin(pluginPath: string, name: string): Promise<UpdateRes
     log.warn('Plugin update failed', { plugin: name, err: msg });
     return { plugin: name, changed: false, error: msg };
   }
+}
+
+async function installChangedLockfiles(pluginPath: string, name: string, from: string, to: string): Promise<void> {
+  let lockfiles: string[];
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['diff', '--name-only', '-z', '--diff-filter=d', `${from}..${to}`, '--', `:(glob)**/${NPM_LOCKFILE}`],
+      { cwd: pluginPath, timeout: GIT_PULL_TIMEOUT_MS, encoding: 'utf-8' },
+    );
+    lockfiles = stdout.split('\0').filter(Boolean);
+  } catch (err) {
+    log.warn('Plugin lockfile diff failed; skipping dependency install', {
+      plugin: name,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  for (const lockfile of lockfiles) {
+    const dir = path.dirname(lockfile);
+    const cwd = path.join(pluginPath, dir);
+    const args = ['ci', '--ignore-scripts', '--prefix', cwd];
+    const command = ['npm', ...args].join(' ');
+    try {
+      if (!(await hasHostMadeInstall(pluginPath, dir, to))) {
+        log.info('Plugin lockfile changed; no existing install to refresh', { plugin: name, dir });
+        continue;
+      }
+      const refusal = lockfileRefusal(cwd);
+      if (refusal) {
+        log.warn('Plugin dependency install refused', { plugin: name, dir, command, reason: refusal });
+        continue;
+      }
+      await execFileAsync('npm', args, { cwd, timeout: NPM_CI_TIMEOUT_MS, encoding: 'utf-8' });
+      log.info('Plugin dependencies installed', { plugin: name, dir, command });
+    } catch (err) {
+      log.warn('Plugin dependency install failed', {
+        plugin: name,
+        dir,
+        command,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+async function hasHostMadeInstall(pluginPath: string, dir: string, rev: string): Promise<boolean> {
+  const nodeModules = path.join(dir, 'node_modules');
+  if (!fs.lstatSync(path.join(pluginPath, nodeModules), { throwIfNoEntry: false })?.isDirectory()) return false;
+  const { stdout } = await execFileAsync('git', ['ls-tree', '--name-only', rev, '--', `:(literal)${nodeModules}`], {
+    cwd: pluginPath,
+    timeout: GIT_PULL_TIMEOUT_MS,
+    encoding: 'utf-8',
+  });
+  return stdout.trim() === '';
+}
+
+function lockfileRefusal(dir: string): string | null {
+  if (fs.existsSync(path.join(dir, NPM_SHRINKWRAP)))
+    return `${NPM_SHRINKWRAP} present; npm would install from it instead`;
+  let lock: { lockfileVersion?: unknown; packages?: Record<string, LockEntry> };
+  try {
+    lock = JSON.parse(fs.readFileSync(path.join(dir, NPM_LOCKFILE), 'utf-8'));
+  } catch (err) {
+    return `unreadable lockfile: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (typeof lock.lockfileVersion !== 'number' || lock.lockfileVersion < 2 || !lock.packages) {
+    return 'lockfile predates lockfileVersion 2';
+  }
+  const nonRegistry = Object.entries(lock.packages)
+    .filter(([key, entry]) => key !== '' && (!key.startsWith('node_modules/') || !fromRegistry(entry)))
+    .map(([key]) => key);
+  return nonRegistry.length > 0
+    ? `linked, workspace or non-registry packages (npm runs a git dependency's prepare despite --ignore-scripts, and cleans linked directories): ${nonRegistry.join(', ')}`
+    : null;
+}
+
+function fromRegistry(entry: LockEntry): boolean {
+  if (entry.resolved === undefined) return typeof entry.version === 'string' && SEMVER.test(entry.version);
+  if (typeof entry.resolved !== 'string' || !URL.canParse(entry.resolved)) return false;
+  const url = new URL(entry.resolved);
+  return url.protocol === 'https:' && url.host === NPM_REGISTRY_HOST;
 }
 
 /** Pull every `~/plugins/<name>`; no notification side effect. */

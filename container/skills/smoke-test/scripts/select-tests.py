@@ -7,9 +7,9 @@ With no paths, the change is everything that differs from the merge base with
 --base (default origin/main): committed, staged, unstaged and untracked.
 Prints one repo-relative suite per line (the *.test.sh the skill-shell gate,
 container/skill-shell-tests.test.ts, runs), or with --run executes them the
-way that gate does and exits non-zero if any fails. A suite that marks its
-cases (smoke-case.sh) runs as --shards processes that split its cases between
-them, unless SMOKE_CASE picks cases.
+way that gate does and exits non-zero if any fails. A suite the gate lists in
+SHARDED_SUITES runs as --shards processes that split its cases between them,
+unless SMOKE_CASE picks cases.
 
 A suite is selected when it reaches a changed file through a chain of name
 references. A file references another when its code (whole-line comments
@@ -50,8 +50,7 @@ EXCLUDED_MARK = "relPath: '"
 DEFAULT_TIMEOUT_S = 400
 SLOW_MARK = ".test.sh': "
 INHERITED_MARK = re.compile(r"^const INHERITED_ENV = \[(.*)\];$", re.M)
-SOURCES_CASES = re.compile(r"^\s*(?:\.|source)\s+.*smoke-case\.sh\b")
-HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+SHARDED_MARK = re.compile(r"^const SHARDED_SUITES\b.*?\[(.*?)\];$", re.M | re.S)
 
 
 def git(root, *args, check=True):
@@ -98,6 +97,10 @@ class Repo:
         if not inherited:
             sys.exit("select-tests: {} no longer declares INHERITED_ENV on one line".format(GATE))
         self.inherited_env = set(re.findall(r"'([A-Z_]+)'", inherited.group(1)))
+        sharded = SHARDED_MARK.search(gate_text)
+        if not sharded:
+            sys.exit("select-tests: {} no longer declares SHARDED_SUITES".format(GATE))
+        self.sharded = set(re.findall(r"'([^']+)'", sharded.group(1)))
         self.suites = sorted(
             f for f in self.files
             if f.endswith(".test.sh") and f.startswith(SUITE_ROOTS) and f not in self.excluded
@@ -271,26 +274,12 @@ def run_one(repo, suite, shard, logdir):
     return label, rc, time.monotonic() - start, log
 
 
-def marks_cases(text):
-    """The suite itself sources smoke-case.sh -- not a heredoc it writes for a fixture."""
-    end = None
-    for line in text.splitlines():
-        if end is not None:
-            end = None if line.strip() == end else end
-            continue
-        if SOURCES_CASES.match(line):
-            return True
-        m = HEREDOC.search(line)
-        end = m.group(1) if m else None
-    return False
-
-
 def jobs_for(repo, suites, shards):
-    """One job per suite; a suite that marks its cases (smoke-case.sh) is split
-    into `shards` processes that together run each case once."""
+    """One job per suite; a suite the gate shards is split into `shards`
+    processes that together run each case once."""
     out = []
     for s in suites:
-        if shards > 1 and not os.environ.get("SMOKE_CASE") and marks_cases(repo.read(s)):
+        if shards > 1 and not os.environ.get("SMOKE_CASE") and s in repo.sharded:
             out += [(s, "{}/{}".format(k, shards)) for k in range(1, shards + 1)]
         else:
             out.append((s, None))
@@ -304,7 +293,7 @@ def main():
     p.add_argument("--all", action="store_true", help="every suite, whatever changed")
     p.add_argument("--run", action="store_true", help="run the selected suites")
     p.add_argument("-j", "--jobs", type=int, default=2)
-    p.add_argument("--shards", type=int, default=4, help="processes per suite that marks its cases")
+    p.add_argument("--shards", type=int, default=4, help="processes per suite the gate shards")
     p.add_argument("--explain", action="store_true", help="print why each suite was selected, to stderr")
     a = p.parse_args()
     root = git(HERE, "rev-parse", "--show-toplevel").stdout.strip()

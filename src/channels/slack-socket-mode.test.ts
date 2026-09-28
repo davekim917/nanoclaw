@@ -24,7 +24,8 @@ const webApiCalls = vi.hoisted(() => ({ auth: 0, usersList: 0, usersInfo: 0 }));
 
 vi.mock('../env.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../env.js')>()),
-  readEnvFileMatching: () => env.values,
+  readEnvFileMatching: (pattern: RegExp) =>
+    Object.fromEntries(Object.entries(env.values).filter(([key]) => pattern.test(key))),
   readEnvFile: () => env.values,
 }));
 
