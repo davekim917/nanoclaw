@@ -1256,45 +1256,6 @@ describe('model pin under a provider fallback', () => {
     // the pin on every turn does not narrate it on every turn.
     expect(onlyChatText()).toHaveLength(1);
   });
-
-  const noticed = () => onlyChatText().some((t) => t.includes('model pin gpt-6-astra is not a claude model'));
-
-  it('tells the user when the batch opening a query carries the other provider -m', async () => {
-    insertMessage('m-open', 'chat', { sender: 'Operator', text: 'hi', flagIntent: { stickyModel: 'gpt-6-astra' } });
-    const abort = new AbortController();
-    const loop = runPollLoop({
-      provider: new MockProvider({}, () => 'ok') as never,
-      providerName: 'claude',
-      cwd: '/tmp',
-      signal: abort.signal,
-      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
-    });
-    try {
-      const deadline = Date.now() + 3_000;
-      while (!noticed()) {
-        if (Date.now() >= deadline) throw new Error('no ignored-model notice');
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-    } finally {
-      abort.abort();
-      await loop;
-    }
-  }, 5_000);
-
-  it('tells the user when a live follow-up carries the other provider -m', async () => {
-    insertMessage('m-live', 'chat', { sender: 'Operator', text: 'switch', flagIntent: { turnModel: 'gpt-6-astra' } });
-    let release!: () => void;
-    const ended = new Promise<void>((resolve) => (release = resolve));
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'live-session' };
-      await ended;
-    }
-    const query: AgentQuery = { push: () => void release(), end: release, abort: release, events: events() };
-
-    await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'initial', undefined, {});
-
-    expect(noticed()).toBe(true);
-  }, 30_000);
 });
 
 describe('model-scoped quota: the pin is spent, not the provider', () => {
@@ -6510,4 +6471,48 @@ describe('a follow-up pushed mid-turn is acked only once consumed', () => {
       provider_query_event_at: null,
     });
   });
+});
+
+describe('an ignored model pin is announced on both query paths', () => {
+  const noticed = () =>
+    getUndeliveredMessages().some(
+      (m) => m.kind === 'chat' && m.content.includes('model pin gpt-6-astra is not a claude model'),
+    );
+
+  it('tells the user when the batch opening a query carries the other provider -m', async () => {
+    insertMessage('m-open', 'chat', { sender: 'Operator', text: 'hi', flagIntent: { stickyModel: 'gpt-6-astra' } });
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: new MockProvider({}, () => 'ok') as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    try {
+      const deadline = Date.now() + 3_000;
+      while (!noticed()) {
+        if (Date.now() >= deadline) throw new Error('no ignored-model notice');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
+  it('tells the user when a live follow-up carries the other provider -m', async () => {
+    insertMessage('m-live', 'chat', { sender: 'Operator', text: 'switch', flagIntent: { turnModel: 'gpt-6-astra' } });
+    let release!: () => void;
+    const ended = new Promise<void>((resolve) => (release = resolve));
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'live-session' };
+      await ended;
+    }
+    const query: AgentQuery = { push: () => void release(), end: release, abort: release, events: events() };
+
+    await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'initial', undefined, {});
+
+    expect(noticed()).toBe(true);
+  }, 30_000);
 });
