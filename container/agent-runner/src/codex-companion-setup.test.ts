@@ -241,12 +241,12 @@ describe('buildRuntimeConfig', () => {
 
   it("the runner exports setupCodexRuntime's home before the provider snapshots process.env", () => {
     const source = fs.readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
-    const setup = source.indexOf('setupCodexRuntime(mcpServers');
-    const assign = source.indexOf('process.env.CODEX_HOME = codexHome;');
+    const setup = source.indexOf('const codexHome = setupCodexRuntime(mcpServers');
     const construct = source.indexOf('createProvider(providerName, {');
     expect(setup).toBeGreaterThan(-1);
-    expect(assign).toBeGreaterThan(setup);
-    expect(construct).toBeGreaterThan(assign);
+    expect(source.slice(setup, construct)).toMatch(
+      /^const codexHome = setupCodexRuntime\([^;]+\);\s*if \(codexHome\) \{\s*process\.env\.CODEX_HOME = codexHome;\s*\}\s*\}\s*const provider = $/,
+    );
     expect(source.slice(construct, source.indexOf('});', construct))).toContain('env: { ...process.env },');
   });
 });
