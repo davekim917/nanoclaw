@@ -128,8 +128,6 @@ printf '%s\n' 'export SMOKE_GATE_FRONTEND_PREFIX=web/' 'export SMOKE_GATE_BACKEN
 OUT="$(run_config "$GATE" SMOKE_CONTROLLER_ENV_FILE="$T/controller-env-diverged.sh")"; RC=$?
 [ "$RC" -eq 1 ] && jq -e '.missing == ["SMOKE_GATE_BACKEND_PREFIX"]' <<<"$OUT" >/dev/null && ! grep -q 'server/' <<<"$OUT" \
   && ok "develop config names a prefix the PR gate's env file states differently" || fail "develop disagreement: rc=$RC $OUT"
-# The deploy-lag path lists: unset is strict equality and stays valid, two lists
-# may share a tree, and a malformed element names its key.
 OUT="$(run_config "$GATE" SMOKE_GATE_FRONTEND_PATHS=web/,shared/ SMOKE_GATE_BACKEND_PATHS=api/,shared/)"; RC=$?
 [ "$RC" -eq 0 ] && ok "deploy-lag path lists sharing a tree accepted" || fail "develop path lists: rc=$RC $OUT"
 OUT="$(run_config "$GATE" SMOKE_GATE_FRONTEND_PATHS=/web/ SMOKE_GATE_BACKEND_PATHS=api/,)"; RC=$?

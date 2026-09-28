@@ -361,9 +361,6 @@ export STUB_FRONTEND_SHA="$OLD_SHA"
 export STUB_COMPARE_FILES='[{"filename":"docs/notes.md"}]'
 bash "$GATE" poll | jq -e '.data.trigger == "waiting_for_settled_build"' >/dev/null
 
-# 17c. A path list that cannot match any file ("/web/", only commas) would
-# accept the lag of case 17; it is named in gate_misconfigured instead, as
-# are a bare name that also matches "web-archive/" and an empty element.
 for bad in '/web/' ',,' 'web' 'web/,,shared/'; do
   fresh_state
   export STUB_FRONTEND_SHA="$OLD_SHA"

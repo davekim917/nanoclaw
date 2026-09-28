@@ -12,14 +12,10 @@
 # prefix classes every file under it as a migration. Nesting (migrations under
 # the backend) is the normal layout and stays allowed.
 #
-# SMOKE_GATE_MIGRATIONS_PREFIX alone may list several trees, comma-separated
-# (`api/migrations/,data/migrations/`): each element is checked like a single
-# prefix and against every other element and prefix. The frontend and backend
-# prefixes stay single values, because each names exactly one freeze marker.
-#
-# The develop gate's deploy-lag lists (SMOKE_GATE_FRONTEND_PATHS/BACKEND_PATHS)
-# are comma lists of the same kind, checked one key at a time: the two lists
-# routinely share a tree, and a bad element would otherwise accept a lag.
+# SMOKE_GATE_MIGRATIONS_PREFIX, and each deploy-lag list (*_PATHS, checked alone
+# since the two share trees), may hold several comma-separated trees: each element
+# is checked like a single prefix and against every other element and prefix. The
+# frontend and backend prefixes stay single, each naming exactly one freeze marker.
 
 LAYOUT_PREFIX_KEYS="FRONTEND_PREFIX BACKEND_PREFIX MIGRATIONS_PREFIX"
 LAYOUT_PREFIX_RE='^([A-Za-z0-9_][A-Za-z0-9._-]*/)+$'
