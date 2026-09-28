@@ -60,18 +60,13 @@ const SLOW_SUITE_TIMEOUT_MS: Readonly<Record<string, number>> = {
   'container/skills/smoke-test/scripts/smoke-pr-gate.test.sh': 800_000,
 };
 
-/**
- * Suites that mark their cases (smoke-case.sh), each run as SHARDS_PER_SUITE
- * concurrent processes that split its cases between them. select-tests.py
- * reads this list, so both runners shard the same suites.
- */
+/** Each runs as SHARDS_PER_SUITE concurrent SMOKE_SHARD processes; select-tests.py parses this list. */
 const SHARDED_SUITES: ReadonlyArray<string> = [
   'container/skills/smoke-test/scripts/smoke-campaign-controller-live.test.sh',
   'container/skills/smoke-test/scripts/smoke-pr-gate.test.sh',
 ];
 
-/** Also the concurrency: every shard of a suite runs at once, beside whatever
- * vitest runs in parallel, so keep it at 4 or below. */
+// Every shard of a suite runs at once, beside other vitest workers: keep it at 4 or below.
 const SHARDS_PER_SUITE = 4;
 
 function suiteTimeoutMs(relPath: string): number {
