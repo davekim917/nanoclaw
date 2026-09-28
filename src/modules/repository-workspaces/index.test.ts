@@ -105,6 +105,10 @@ vi.mock('../mailbox/read-only.js', async () => {
 });
 
 const lifecycleProbe = vi.hoisted(() => ({ onRelease: null as null | (() => void) }));
+const lockProbe = vi.hoisted(() => ({
+  onAcquire: null as null | (() => void),
+  onRelease: null as null | (() => void),
+}));
 vi.mock('../../repository-workspaces.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../repository-workspaces.js')>();
   return {
@@ -117,6 +121,20 @@ vi.mock('../../repository-workspaces.js', async (importOriginal) => {
           lifecycleProbe.onRelease?.();
         }
       }),
+    withHostRepositoryLock: <T>(workgroupId: string, repo: string, fn: () => Promise<T> | T, dataDir?: string) =>
+      actual.withHostRepositoryLock(
+        workgroupId,
+        repo,
+        async () => {
+          lockProbe.onAcquire?.();
+          try {
+            return await fn();
+          } finally {
+            lockProbe.onRelease?.();
+          }
+        },
+        dataDir,
+      ),
   };
 });
 
@@ -148,7 +166,6 @@ import {
   readTransferTombstone,
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
-  withHostRepositoryLock,
   withRepositoryLifecycleClaims,
   withWorkgroupRepositoryMountClaim,
   writeOriginPin,
@@ -2746,30 +2763,34 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
   });
 
-  it('stages inside its own lifecycle claim, and waits for the repository lock', async () => {
+  it('clones into staging under the repository lock, inside its own lifecycle claim', async () => {
     networkCanonical(root);
-    const unit = threadUnit('lock-held');
+    const unit = threadUnit('lock-span');
+    const staging = checkoutStagingRoot(topicWorktreesDir(unit, root));
+    const cloned = (): boolean =>
+      fs.existsSync(staging) &&
+      (fs.readdirSync(staging, { recursive: true }) as string[]).some((entry) => entry.endsWith(`.git${path.sep}HEAD`));
+    const spans: Array<[boolean, boolean]> = [];
+    let atAcquire = false;
+    lockProbe.onAcquire = () => {
+      atAcquire = cloned();
+    };
+    lockProbe.onRelease = () => {
+      spans.push([atAcquire, cloned()]);
+    };
     let claimedWhileStaging = false;
     _setRepositoryCheckoutHooksForTesting({
       afterStagingPopulated: () => {
         claimedWhileStaging = isRepositoryLifecycleClaimed(unit);
       },
     });
-    let settled = false;
-    let pending!: Promise<unknown>;
-    await withHostRepositoryLock(
-      WG,
-      'proj',
-      async () => {
-        pending = checkout(unit, 'feat', root).finally(() => {
-          settled = true;
-        });
-        await new Promise((resolve) => setTimeout(resolve, 1_500));
-        expect(settled).toBe(false);
-      },
-      root,
-    );
-    await expect(pending).resolves.toMatchObject({ created: true });
+    try {
+      await expect(checkout(unit, 'feat', root)).resolves.toMatchObject({ created: true });
+    } finally {
+      lockProbe.onAcquire = null;
+      lockProbe.onRelease = null;
+    }
+    expect(spans).toContainEqual([false, true]);
     expect(claimedWhileStaging).toBe(true);
   });
 
