@@ -158,6 +158,36 @@ if smoke_case unreadable-identity-or-ledger-refuses; then
   expect_refused group-a "ledger parent is a file" no-ledger
 fi
 
+if smoke_case ledger-swapped-mid-check-still-refuses; then
+  for swap in qa-coordinator seat-leases; do
+    fresh "swap-$swap"
+    as group-b grant "$SEAT" --to group-b --until "$(future)"
+    SMOKE_SEAT_LEASE_IDENTITY_FILE="$IDS/group-a.json" SWAP="$swap" python3 - "$L" "$SEAT" 2>"$T/err" <<'PY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("lease", sys.argv[1])
+lease = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lease)
+swap, root = os.environ["SWAP"], os.environ["SMOKE_GATE_SHARED_ROOT"]
+target = os.path.join(root, "qa-coordinator") if swap == "qa-coordinator" else os.path.join(root, "qa-coordinator", "seat-leases")
+done = []
+def swapping(real):
+    def call(path, *a, **k):
+        out = real(path, *a, **k)
+        if not done and str(path).endswith(swap):
+            done.append(1)
+            os.rename(target, target + ".moved")
+            os.symlink(target + ".gone", target)
+        return out
+    return call
+os.open, os.lstat, os.stat = swapping(os.open), swapping(os.lstat), swapping(os.stat)
+sys.exit(lease.main(["check", sys.argv[2]]))
+PY
+    RC=$?
+    [ "$RC" = 69 ] || fail "ledger $swap swapped for a dangling symlink mid-check: rc=$RC, want 69"
+    grep -q "reason=leased-elsewhere" "$T/err" || fail "swap $swap: the held directory must still show the live lease: $(cat "$T/err")"
+  done
+fi
+
 if smoke_case expired-lease-is-unleased; then
   fresh expired
   mkdir -p "$LEDGER"

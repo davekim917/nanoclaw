@@ -7,7 +7,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 
 USAGE = """usage:
   smoke-seat-lease.py check <seat>
@@ -76,7 +75,10 @@ def identity():
     return group
 
 
-def ledger_dir():
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def open_ledger(create=False):
     root = os.environ.get("SMOKE_GATE_SHARED_ROOT", "/workspace/workgroup")
     try:
         mounted = subprocess.run(["mountpoint", "-q", root], stdout=subprocess.DEVNULL,
@@ -85,37 +87,50 @@ def ledger_dir():
         mounted = False
     if not mounted:
         raise Refusal("no-ledger", detail="shared root {} is not a mounted filesystem".format(root))
-    path = root
-    for part in ("qa-coordinator", "seat-leases"):
-        path = os.path.join(path, part)
-        try:
-            mode = os.lstat(path).st_mode
-        except FileNotFoundError:
-            return os.path.join(root, "qa-coordinator", "seat-leases")
-        except OSError as e:
-            raise Refusal("no-ledger", detail="{}: {}".format(path, e.__class__.__name__))
-        if not stat.S_ISDIR(mode):
-            raise Refusal("no-ledger", detail="{} is not a real directory".format(path))
-    if not os.access(path, os.R_OK | os.X_OK):
-        raise Refusal("no-ledger", detail="{} is not readable".format(path))
-    return path
-
-def read_lease(directory, seat):
-    path = os.path.join(directory, seat + ".json")
     try:
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            raise ValueError("not a regular file")
-        with open(path) as f:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        raise Refusal("no-ledger", detail="{}: {}".format(root, e.__class__.__name__))
+    for part in ("qa-coordinator", "seat-leases"):
+        try:
+            if create:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+        except FileNotFoundError:
+            os.close(fd)
+            return None
+        except OSError as e:
+            os.close(fd)
+            raise Refusal("no-ledger", detail="{}/{}: {}".format(root, part, e.__class__.__name__))
+        os.close(fd)
+        fd = child
+    return fd
+
+
+def read_lease(dfd, seat):
+    if dfd is None:
+        return None
+    try:
+        lfd = os.open(seat + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Refusal("unreadable-lease", seat=seat, detail=e.__class__.__name__)
+    try:
+        with os.fdopen(lfd) as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                raise ValueError("not a regular file")
             lease = json.load(f)
         if lease.get("seat") != seat:
             raise ValueError("names another seat")
         if not isinstance(lease.get("holder"), str) or not GROUP_RE.fullmatch(lease["holder"]):
             raise ValueError("no usable holder")
         lease["_until"] = parse_time(lease.get("until"))
-    except FileNotFoundError:
-        return None
     except (OSError, ValueError, AttributeError, TypeError) as e:
-        raise Refusal("unreadable-lease", seat=seat, detail="{}: {}".format(path, e))
+        raise Refusal("unreadable-lease", seat=seat, detail=str(e))
     return lease
 
 
@@ -125,23 +140,28 @@ def live(lease):
 
 def check(seat):
     me = identity()
-    lease = read_lease(ledger_dir(), seat)
+    dfd = open_ledger()
+    try:
+        lease = read_lease(dfd, seat)
+    finally:
+        if dfd is not None:
+            os.close(dfd)
     if live(lease) and lease["holder"] != me:
         raise Refusal("leased-elsewhere", seat=seat, holder=lease["holder"], until=iso(lease["_until"]), caller=me)
     return 0
 
 
 def status(seat):
-    directory = ledger_dir()
+    dfd = open_ledger()
     if seat:
         seats = [seat]
-    elif os.path.isdir(directory):
-        seats = sorted(n[:-5] for n in os.listdir(directory) if n.endswith(".json"))
+    elif dfd is not None:
+        seats = sorted(n[:-5] for n in os.listdir(dfd) if n.endswith(".json"))
     else:
         seats = []
     for s in seats:
         try:
-            lease = read_lease(directory, s)
+            lease = read_lease(dfd, s)
         except Refusal as r:
             print(json.dumps({"seat": s, "state": "unreadable", "detail": r.fields.get("detail")}))
             continue
@@ -155,12 +175,14 @@ def status(seat):
 
 def write(seat, verb, to, until):
     me = identity()
-    directory = ledger_dir()
-    os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, ".lock"), "a") as lock:
+    dfd = open_ledger(create=True)
+    if dfd is None:
+        raise Refusal("no-ledger", detail="the ledger disappeared while it was being created")
+    lock = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+    try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        lease = read_lease(directory, seat)
-        path = os.path.join(directory, seat + ".json")
+        lease = read_lease(dfd, seat)
+        name = seat + ".json"
         if verb == "grant" and live(lease):
             return refuse_op("{} is leased to {} until {}; only its holder can transfer it".format(
                 seat, lease["holder"], iso(lease["_until"])))
@@ -171,19 +193,22 @@ def write(seat, verb, to, until):
             if lease["holder"] != me:
                 return refuse_op("{} is held by {}, not {}".format(seat, lease["holder"], me))
         if verb == "release":
-            os.unlink(path)
+            os.unlink(name, dir_fd=dfd)
             print(json.dumps({"seat": seat, "state": "unleased", "releasedBy": me}))
             return 0
         record = {"seat": seat, "holder": to, "until": iso(until), "grantedBy": me, "at": iso(now())}
-        fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + seat + ".")
-        with os.fdopen(fd, "w") as f:
+        tmp = ".{}.{}".format(name, os.getpid())
+        tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        with os.fdopen(tfd, "w") as f:
             json.dump(record, f)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
         print(json.dumps(record))
         return 0
+    finally:
+        os.close(lock)
+        os.close(dfd)
 
 
 def refuse_op(message):
