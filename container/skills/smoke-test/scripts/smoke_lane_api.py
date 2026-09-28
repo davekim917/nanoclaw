@@ -137,6 +137,8 @@ def qa_name(body, prefix):
 
 def judge(run_dir, method, path, body=None):
     method = method.upper()
+    if not path.startswith("/") or path.startswith("//"):
+        raise WriteScopeRefused("bad-path (a request path is a single-slash absolute path)")
     if method in READ_METHODS:
         return "read"
     scope = load_scope(run_dir)
@@ -230,8 +232,6 @@ class H:
 
     def guarded(self, tag, seat, method, path, body):
         try:
-            if not path.startswith("/") or path.startswith("//"):
-                raise WriteScopeRefused("bad-path (a request path is a single-slash absolute path)")
             judge(self.run_dir, method, path, body)
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)

@@ -299,6 +299,8 @@ class Guard(unittest.TestCase):
         no = run("check", self.run_dir, "POST", "/cards", "--body", '{"accountId": 4401}')
         self.assertEqual(no.returncode, 77)
         self.assertIn("WRITE_SCOPE_REFUSED reason=foreign-target", no.stderr)
+        slashes = run("check", self.run_dir, "POST", "//4401/cards", "--body", json.dumps({"title": PREFIX + "x"}))
+        self.assertEqual(slashes.returncode, 77, "the CLI applies the same path rule as the client")
         with open(src, "w") as f:
             json.dump(dict(SCOPE, readOnlyPosts=["("]), f)
         self.assertEqual(run("init", os.path.join(self.tmp.name, "fresh"), "--from", src).returncode, 2)
