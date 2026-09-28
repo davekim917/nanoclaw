@@ -342,6 +342,35 @@ When browser credentials are shared, assign one explicit browser owner and an
 authentication lease before anyone attempts login. Other workers use API,
 source, or automated-test lanes until the lease is transferred explicitly.
 Never let parallel login retries extend a lockout or invalidate the live run.
+
+**A seat that one side must hold alone is leased, not announced.** A file in
+the run or a STOP note is not delivery; lease the seat in the shared ledger:
+
+```bash
+L=/app/skills/smoke-test/scripts/smoke-seat-lease.py
+python3 $L grant    <seat-email> --to <agent-group> --until <ISO-8601 UTC>
+python3 $L transfer <seat-email> --to <agent-group> --until <ISO-8601 UTC>   # holder only
+python3 $L release  <seat-email>                                             # holder only
+python3 $L status   [<seat-email>]
+```
+
+The holder is an agent group (`groupName` in the host-owned
+`/workspace/agent/container.json`), so the lease separates the coordinator's
+group from the challenger's; it does not separate two sessions of one group.
+The ledger is `qa-coordinator/seat-leases/` under the mounted workgroup root.
+A lease past `--until` no longer binds, `status` shows it `expired`, and it can
+be re-granted but not transferred or released.
+
+The deploying group's credential helper must call `smoke-seat-lease.py check
+<seat-email>` before it issues anything, and issue nothing unless it exits 0.
+Exit 69 with `SEAT_LEASE_REFUSED reason=<why>` on stderr means this group may
+not have that seat now: a live lease names another group, or the lease, the
+ledger or this container's identity cannot be read. Treat it as **seat
+unavailable**: record the check `blocked` naming the holder, never as a login
+failure or an auth finding, and never retry the login. Check the helper's exit
+status before typing its output anywhere; an empty password submitted to a
+login form reads exactly like a product auth bug and can count toward a
+lockout on the holder's seat.
 Resolve the approved credential location from the deploying group's standing
 instructions and mounts before declaring auth unavailable. Never print or copy
 credential values, search other agent folders for them, or reset a shared
