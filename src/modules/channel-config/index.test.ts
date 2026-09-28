@@ -73,6 +73,7 @@ describe('set_channel_model / set_channel_effort', () => {
     ['opencode', 'ultra', false],
     ['claude', 'xhigh', true],
     ['opencode', 'xhigh', false],
+    ['opencode', 'high', true],
   ])('on a %s wiring, effort %s is accepted: %s', async (provider, effort, accepted) => {
     fixture.provider = provider;
     await run('set_channel_effort', { effort });

@@ -1639,9 +1639,11 @@ describe('per-person preference recall', () => {
   });
 
   it.each([
-    ['keeps a namespace the payload already carries', 'slack:U0TESTKEEP', 'slack:U0TESTKEEP'],
-    ['trims the payload id', '  U0TESTTRIM  ', 'U0TESTTRIM'],
-  ])('%s', async (_label, senderId, declared) => {
+    ['keeps a namespace the payload already carries', { senderId: 'slack:U0TESTKEEP' }, 'slack:U0TESTKEEP'],
+    ['keeps a namespace author.userId carries', { author: { userId: 'slack:U0TESTKEEP' } }, 'slack:U0TESTKEEP'],
+    ['trims the payload id', { senderId: '  U0TESTTRIM  ' }, 'U0TESTTRIM'],
+    ['trims author.userId', { author: { userId: '  U0TESTTRIM  ' } }, 'U0TESTTRIM'],
+  ])('%s', async (_label, id, declared) => {
     memoryFile('preferences/sender-shape.md', `---\nids: [${declared}]\n---\n# Sender Shape\nPrefers tables.`);
 
     const result = await withCentralSync(
@@ -1652,7 +1654,7 @@ describe('per-person preference recall', () => {
           sessionId: 'sess-a',
           kind: 'chat-sdk',
           trigger: 1,
-          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Unrelated Name', senderId }),
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Unrelated Name', ...id }),
         }),
       'test',
     );

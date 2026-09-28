@@ -132,6 +132,7 @@ import {
   readTransferTombstone,
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
+  withHostRepositoryLock,
   withRepositoryLifecycleClaims,
   withWorkgroupRepositoryMountClaim,
   writeOriginPin,
@@ -2727,6 +2728,33 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     const result = await withWorkgroupRepositoryMountClaim(WG, () => checkout(threadUnit('mount-held'), 'feat', root));
     expect(result).toMatchObject({ created: true });
     expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
+  });
+
+  it('stages inside its own lifecycle claim, and waits for the repository lock', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('lock-held');
+    let claimedWhileStaging = false;
+    _setRepositoryCheckoutHooksForTesting({
+      afterStagingPopulated: () => {
+        claimedWhileStaging = isRepositoryLifecycleClaimed(unit);
+      },
+    });
+    let settled = false;
+    let pending!: Promise<unknown>;
+    await withHostRepositoryLock(
+      WG,
+      'proj',
+      async () => {
+        pending = checkout(unit, 'feat', root).finally(() => {
+          settled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        expect(settled).toBe(false);
+      },
+      root,
+    );
+    await expect(pending).resolves.toMatchObject({ created: true });
+    expect(claimedWhileStaging).toBe(true);
   });
 
   it('same-thread siblings get one path, including while the first checkout is still initializing', async () => {
