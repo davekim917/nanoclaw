@@ -148,10 +148,14 @@ describe('with real git: installs only where the pulled range changed a lockfile
     write(path.join(upstream, 'plugins/unchanged/package-lock.json'), REGISTRY_LOCK);
     write(path.join(upstream, 'plugins/deleted/package-lock.json'), REGISTRY_LOCK);
     write(path.join(upstream, 'plugins/gitdep/package-lock.json'), REGISTRY_LOCK);
+    write(path.join(upstream, 'plugins/never-installed/package-lock.json'), REGISTRY_LOCK);
     write(path.join(upstream, 'README.md'), 'v1\n');
     git(upstream, 'add', '-A');
     git(upstream, 'commit', '-q', '-m', 'v1');
     git(tmp, 'clone', '-q', upstream, path.join(home, 'plugins', 'bootstrap'));
+    for (const dir of ['.', 'plugins/changed', 'plugins/unchanged', 'plugins/deleted', 'plugins/gitdep']) {
+      fs.mkdirSync(path.join(home, 'plugins', 'bootstrap', dir, 'node_modules'), { recursive: true });
+    }
   });
 
   afterEach(() => {
@@ -163,6 +167,7 @@ describe('with real git: installs only where the pulled range changed a lockfile
     write(path.join(upstream, 'plugins/changed/package-lock.json'), REGISTRY_LOCK + '\n');
     fs.rmSync(path.join(upstream, 'plugins/deleted/package-lock.json'));
     write(path.join(upstream, 'plugins/gitdep/package-lock.json'), GIT_DEP_LOCK);
+    write(path.join(upstream, 'plugins/never-installed/package-lock.json'), REGISTRY_LOCK + '\n');
     write(path.join(upstream, 'plugins/unchanged/package.json'), '{}');
     write(path.join(upstream, 'plugins/new/package-lock.json.bak'), REGISTRY_LOCK);
     git(upstream, 'add', '-A');
@@ -187,6 +192,10 @@ describe('with real git: installs only where the pulled range changed a lockfile
       plugin: 'bootstrap',
       dir: '.',
       command: `npm ci --ignore-scripts --prefix ${home}/plugins/bootstrap`,
+    });
+    expect(log.info).toHaveBeenCalledWith('Plugin lockfile changed; no existing install to refresh', {
+      plugin: 'bootstrap',
+      dir: 'plugins/never-installed',
     });
     expect(vi.mocked(log.warn).mock.calls).toEqual([
       [
@@ -222,7 +231,10 @@ describe('with fake git: failures stay inside their plugin', () => {
   function fakePlugin(name: string, state: Record<string, string>, lockfiles: Record<string, string> = {}): string {
     const dir = path.join(home, 'plugins', name);
     for (const [file, content] of Object.entries(state)) write(path.join(dir, '.git/fake', file), content);
-    for (const [file, content] of Object.entries(lockfiles)) write(path.join(dir, file), content);
+    for (const [file, content] of Object.entries(lockfiles)) {
+      write(path.join(dir, file), content);
+      fs.mkdirSync(path.join(dir, path.dirname(file), 'node_modules'), { recursive: true });
+    }
     return dir;
   }
 

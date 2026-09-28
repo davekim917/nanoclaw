@@ -1,6 +1,6 @@
 /**
- * Hourly `git pull --ff-only` of each `~/plugins/<name>`, `npm ci --ignore-scripts` wherever it changed a lockfile,
- * then a refresh of the derived Codex surfaces; notifies `PLUGIN_UPDATE_NOTIFY_JID` (if set) when any plugin advanced.
+ * Hourly `git pull --ff-only` of each `~/plugins/<name>`, `npm ci --ignore-scripts` for each existing install whose
+ * lockfile it changed, a refresh of the derived Codex surfaces, and a `PLUGIN_UPDATE_NOTIFY_JID` note if any advanced.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -112,6 +112,10 @@ async function installChangedLockfiles(pluginPath: string, name: string, from: s
     const cwd = path.join(pluginPath, dir);
     const args = ['ci', '--ignore-scripts', '--prefix', cwd];
     const command = ['npm', ...args].join(' ');
+    if (!fs.existsSync(path.join(cwd, 'node_modules'))) {
+      log.info('Plugin lockfile changed; no existing install to refresh', { plugin: name, dir });
+      continue;
+    }
     const refusal = lockfileRefusal(cwd);
     if (refusal) {
       log.warn('Plugin dependency install refused', { plugin: name, dir, command, reason: refusal });
