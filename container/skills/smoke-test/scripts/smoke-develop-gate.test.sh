@@ -98,6 +98,7 @@ case "$1 $2" in
       "$STUB_SOURCE_SHA" "$FRONTEND_CI" "$STUB_SOURCE_SHA" ;;
   *)
     case "$2" in
+      */activity\?*) printf '%s' "${STUB_ACTIVITY_JSON:-{\}}"; exit "${STUB_ACTIVITY_EXIT:-0}" ;;
       */compare/*)
         printf '{"status":"%s","behind_by":0,"files":%s}' \
           "${STUB_COMPARE_STATUS:-ahead}" "${STUB_COMPARE_FILES:-[]}" ;;
@@ -2275,6 +2276,58 @@ UNSAFE_DEV_OUT="$(bash "$GATE" claim ../escaped "$AUTO_DEV_SHA")"
 jq -e '.ok == false and (.error | test("unsafe"))' <<<"$UNSAFE_DEV_OUT" >/dev/null || {
   echo "60d: traversal-shaped develop run id reached shared storage: $UNSAFE_DEV_OUT" >&2; exit 1; }
 [ ! -e "$TEST_SHARED_ROOT/qa-coordinator/task-lease-escaped.lock" ]
+
+fresh_state
+export SMOKE_GATE_DEBOUNCE_SECONDS=600
+ago() { /usr/bin/date -u -d "@$(( $(/usr/bin/date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%SZ; }
+activity() { printf '[{"after":"%s","timestamp":"%s","activity_type":"pr_merge"}]' "$1" "$2"; }
+LAND_SHA="$(printf 'a1%.0s' $(seq 20))"
+export STUB_SOURCE_SHA="$LAND_SHA"
+LANDED_OLD="$(ago 1200)"
+LAND_OUT="$(STUB_ACTIVITY_JSON="$(activity "$LAND_SHA" "$LANDED_OLD")" bash "$GATE" poll)"
+jq -e --arg sha "$LAND_SHA" --arg at "$LANDED_OLD" '.wakeAgent == true and .data.trigger == "develop_build_settled" and
+  .data.sourceSha == $sha and .data.debounceFrom == "landed" and .data.landedAt == $at' <<<"$LAND_OUT" >/dev/null || {
+  echo "61a: a tip that landed 20 min before its first sighting did not settle on it: $LAND_OUT" >&2; exit 1; }
+
+fresh_state
+export SMOKE_GATE_DEBOUNCE_SECONDS=600
+LAND_SHA2="$(printf 'b2%.0s' $(seq 20))"
+export STUB_SOURCE_SHA="$LAND_SHA2"
+LANDED_NEW="$(ago 300)"
+for _ in 1 2; do
+  LAND_OUT="$(STUB_ACTIVITY_JSON="$(activity "$LAND_SHA2" "$LANDED_NEW")" bash "$GATE" poll)"
+  jq -e --arg at "$LANDED_NEW" '.wakeAgent == false and .data.trigger == "debouncing_candidate" and
+    .data.debounceFrom == "landed" and .data.landedAt == $at' <<<"$LAND_OUT" >/dev/null || {
+    echo "61b: a tip that landed 5 min ago was not held for the quiet period: $LAND_OUT" >&2; exit 1; }
+done
+LAND_OUT="$(STUB_ACTIVITY_JSON="$(activity "$LAND_SHA2" "$(ago 660)")" bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "develop_build_settled" and .data.debounceFrom == "landed"' <<<"$LAND_OUT" >/dev/null || {
+  echo "61b: a known candidate did not settle once its landing was past the quiet period: $LAND_OUT" >&2; exit 1; }
+
+land_fallback() {
+  fresh_state
+  export SMOKE_GATE_DEBOUNCE_SECONDS=600
+  export STUB_SOURCE_SHA="$LAND_SHA"
+  local out
+  for _ in 1 2; do
+    out="$(STUB_ACTIVITY_JSON="$2" STUB_ACTIVITY_EXIT="$3" bash "$GATE" poll)"
+    jq -e '.wakeAgent == false and .data.trigger == "debouncing_candidate" and
+      .data.debounceFrom == "first_seen" and .data.landedAt == null' <<<"$out" >/dev/null || {
+      echo "61c ($1): an unreadable landing time did not fall back to first-seen: $out" >&2; exit 1; }
+  done
+}
+land_fallback "fetch failed" "$(activity "$LAND_SHA" "$LANDED_OLD")" 1
+land_fallback "newest update names another sha" "$(activity "$LAND_SHA2" "$LANDED_OLD")" 0
+land_fallback "landed in the future" "$(activity "$LAND_SHA" "$(ago -3600)")" 0
+land_fallback "unparseable timestamp" "$(activity "$LAND_SHA" "yesterday")" 0
+land_fallback "sub-second timestamp" "$(activity "$LAND_SHA" "${LANDED_OLD%Z}.5Z")" 0
+land_fallback "not a list" '{"message":"Resource not accessible by integration"}' 0
+jq --arg t "$(ago 660)" '.candidateFirstSeen=$t' "$STATE_DIR2/develop-state.json" >"$STATE_DIR2/s.tmp" &&
+  mv "$STATE_DIR2/s.tmp" "$STATE_DIR2/develop-state.json"
+LAND_OUT="$(STUB_ACTIVITY_EXIT=1 bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "develop_build_settled" and .data.debounceFrom == "first_seen"' <<<"$LAND_OUT" >/dev/null || {
+  echo "61c: the first-seen fallback did not settle once first-seen was past the quiet period: $LAND_OUT" >&2; exit 1; }
+export SMOKE_GATE_DEBOUNCE_SECONDS=0
 
 # W2: a poll that cannot read the branch is unreadable, never empty; a
 # non-poll verb's output is unchanged. Keys the gate already printed survive.

@@ -1523,14 +1523,11 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # ---- network derivation phase: the lock is DROPPED from here ---------------
-# Everything between this line and the `relock_or_exit` calls below is pure
-# read-only derivation from the forge and the deploy API — four parallel
-# fetches plus up to two `compare` calls, ~10-30s of wall clock. STATE was read
-# once at the top and is not touched again until we re-take the lock and RE-READ
-# it, so there is no read-modify-write spanning the unlock. This is what test
-# case 20 already proves for `check`; a scheduled `poll` holding the lock across
-# the same fetches is what made a coordinator's `progress` stamp lose its flock
-# wait. (`check` already unlocked above; a second unlock is a no-op.)
+# Everything from here to the `relock_or_exit` calls below is read-only
+# derivation from the forge and the deploy API (~10-30s). STATE is not touched
+# again until the lock is re-taken and STATE RE-READ, so no read-modify-write
+# spans the unlock; holding the lock across these fetches made a coordinator's
+# `progress` stamp lose its flock wait. (`check` already unlocked; no-op.)
 flock -u 9
 
 timeout 10 gh api "repos/$REPO/branches/$BRANCH" >"$TMP_DIR/branch.json" 2>/dev/null &
@@ -1544,12 +1541,16 @@ PID_BACKEND=$!
 timeout 10 curl -fsS "https://api.render.com/v1/services/$FRONTEND_SERVICE/deploys?limit=10" \
   >"$TMP_DIR/frontend.json" 2>/dev/null &
 PID_FRONTEND=$!
+timeout 10 gh api "repos/$REPO/activity?ref=refs/heads/$BRANCH&direction=desc&per_page=1" \
+  >"$TMP_DIR/activity.json" 2>/dev/null &
+PID_ACTIVITY=$!
 
 FETCH_OK=true
 wait "$PID_BRANCH" || FETCH_OK=false
 wait "$PID_CHECKS" || FETCH_OK=false
 wait "$PID_BACKEND" || FETCH_OK=false
 wait "$PID_FRONTEND" || FETCH_OK=false
+wait "$PID_ACTIVITY" || : >"$TMP_DIR/activity.json"
 
 SOURCE_SHA="$(jq -r '.commit.sha // empty' "$TMP_DIR/branch.json" 2>/dev/null)"
 CHECK_TOTAL="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha)] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
@@ -2262,16 +2263,32 @@ if [ -n "$ACTIVE_SHA" ]; then
   ABANDONED_SHA="$ACTIVE_SHA"
 fi
 
+# Quiet period runs from when the tip became the tip (newest ref update, never a
+# commit date, which predates a direct push or queue fast-forward); unreadable
+# keeps first-seen. Develop-only: smoke-pr-gate.sh has no debounce.
+tip_landed_at() {
+  local at
+  at="$(jq -r --arg sha "$SOURCE_SHA" '.[0] | select(.after == $sha) | .timestamp // empty' \
+    "$TMP_DIR/activity.json" 2>/dev/null)"
+  printf '%s' "$at" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 0
+  [ "$(epoch_or_zero "$at")" -gt 0 ] && [ "$(epoch_or_zero "$at")" -le "$NOW_EPOCH" ] && printf '%s' "$at"
+}
+LANDED_AT="$(tip_landed_at)"
+DEBOUNCE_TRACE="$(jq -cn --arg at "$LANDED_AT" \
+  'if $at == "" then {debounceFrom:"first_seen",landedAt:null} else {debounceFrom:"landed",landedAt:$at} end')"
+
 if [ "$CANDIDATE_SHA" != "$SOURCE_SHA" ]; then
   STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" '.candidateSha=$sha | .candidateFirstSeen=$now' <<<"$STATE")"
-  emit_no_wake "debouncing_candidate"
-  exit 0
+  CANDIDATE_FIRST="$NOW"
+  if [ -z "$LANDED_AT" ]; then
+    emit_no_wake "debouncing_candidate" "$DEBOUNCE_TRACE"
+    exit 0
+  fi
 fi
 
-CANDIDATE_EPOCH="$(epoch_or_zero "$CANDIDATE_FIRST")"
-CANDIDATE_AGE="$(( NOW_EPOCH - CANDIDATE_EPOCH ))"
+CANDIDATE_AGE="$(( NOW_EPOCH - $(epoch_or_zero "${LANDED_AT:-$CANDIDATE_FIRST}") ))"
 if [ "$CANDIDATE_AGE" -lt "$DEBOUNCE_SECONDS" ]; then
-  emit_no_wake "debouncing_candidate"
+  emit_no_wake "debouncing_candidate" "$DEBOUNCE_TRACE"
   exit 0
 fi
 
@@ -2551,13 +2568,13 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   write_state "$STATE"
   declare_quiet "$(jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --arg sha "$SOURCE_SHA" --arg previous "$PREVIOUS_SHA" \
-    --argjson pr "$FREEZE_PR_NUM" --arg freezeSha "$FREEZE_SHA_OUT" \
-    '{wakeAgent:false,data:{
+    --argjson pr "$FREEZE_PR_NUM" --arg freezeSha "$FREEZE_SHA_OUT" --argjson trace "$DEBOUNCE_TRACE" \
+    '{wakeAgent:false,data:({
       schemaVersion:1, trigger:"develop_freeze_opened",
       repo:$repo, branch:$branch, sourceSha:$sha,
       previousCompletedSha:(if $previous == "" then null else $previous end),
       freezePr:$pr, freezeSha:$freezeSha, targetSha:$sha
-    }}')"
+    } + $trace)}')"
   exit $?
 fi
 
@@ -2613,7 +2630,8 @@ jq -cn \
   --argjson recovery "$RECOVERY" \
   --argjson backendLag "$BACKEND_LAG_ACCEPTED" \
   --argjson frontendLag "$FRONTEND_LAG_ACCEPTED" \
-  '{wakeAgent:true,data:{
+  --argjson trace "$DEBOUNCE_TRACE" \
+  '{wakeAgent:true,data:({
     schemaVersion:1,
     trigger:"develop_build_settled",
     repo:$repo,
@@ -2628,4 +2646,4 @@ jq -cn \
     recovery:$recovery,
     abandonedActiveSha:(if $abandoned == "" then null else $abandoned end),
     deployLagAccepted:{backend:$backendLag,frontend:$frontendLag}
-  }}'
+  } + $trace)}'
