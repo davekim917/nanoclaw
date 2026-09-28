@@ -4,13 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { walkArgs } from './lib/cli-args.js';
-import {
-  citationRuns,
-  gitIsShallowRepo,
-  gitRead,
-  type CitationRun,
-  type FileLineCitation,
-} from './lib/doc-citations.js';
+import { citationRuns, gitRead, type CitationRun, type FileLineCitation } from './lib/doc-citations.js';
 
 const MAX_EARLIER_VERSIONS = 1000;
 const USAGE =
@@ -121,10 +115,12 @@ function introducingCommit(
 
 const unpinned = (line: string): string => line.replace(/\s+at\s+[0-9a-f]{7,40}\b/g, '');
 
+function isAncestor(root: string, ancestor: string, descendant: string): boolean {
+  return spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: root }).status === 0;
+}
+
 function newestOf(root: string, shas: readonly string[]): string | null {
-  const isAncestor = (a: string, b: string): boolean =>
-    spawnSync('git', ['merge-base', '--is-ancestor', a, b], { cwd: root }).status === 0;
-  return shas.find((sha) => shas.every((other) => isAncestor(other, sha))) ?? null;
+  return shas.find((sha) => shas.every((other) => isAncestor(root, other, sha))) ?? null;
 }
 
 function shallowBoundary(root: string): Set<string> {
@@ -132,17 +128,12 @@ function shallowBoundary(root: string): Set<string> {
   return new Set(file && fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
 }
 
-function candidateRevisions(
-  root: string,
-  origin: string,
-  files: readonly string[],
-  shallow: ReadonlySet<string>,
-): string[] | null {
+function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] | null {
   const touching = (gitRead(root, ['log', '--full-history', '--format=%H %P', origin, '--', ...files]) ?? '')
     .split('\n')
     .filter(Boolean)
     .map((line) => line.split(' ').filter(Boolean));
-  if (touching.length > MAX_EARLIER_VERSIONS || touching.some(([sha]) => shallow.has(sha))) return null;
+  if (touching.length > MAX_EARLIER_VERSIONS) return null;
   const revs = [origin, ...touching.flat()];
   const seenVersions = new Set<string>();
   const out: string[] = [];
@@ -250,11 +241,13 @@ export function pinDocs(
           refuse('its citations were added on unrelated branches');
           continue;
         }
-        const candidates = candidateRevisions(root, origin, files, shallow);
-        if (!candidates || (linkOrigins as string[]).some((sha) => shallow.has(sha))) {
-          refuse(
-            `the cited files' history runs past ${MAX_EARLIER_VERSIONS} versions or into this clone's shallow boundary`,
-          );
+        if ([...shallow].some((boundary) => isAncestor(root, boundary, origin))) {
+          refuse("this clone's shallow boundary hides history below the note's commit; fetch full history");
+          continue;
+        }
+        const candidates = candidateRevisions(root, origin, files);
+        if (!candidates) {
+          refuse(`the cited files have more than ${MAX_EARLIER_VERSIONS} earlier versions to compare`);
           continue;
         }
         const runStart = text[head.index - 1] === '`' ? head.index - 1 : head.index;

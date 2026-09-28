@@ -526,6 +526,25 @@ describe('pinDocs', () => {
     ]);
   });
 
+  it('refuses when the shallow boundary sits below the note even if the file was absent there', () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function drainQueue() { return false; }\n');
+    commit(root, 'add');
+    fs.rmSync(path.join(root, 'src/code.ts'));
+    commit(root, 'delete');
+    write(root, 'src/code.ts', 'function drainQueue() { return true; }\n');
+    commit(root, 'recreate');
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` decides it\n');
+    commit(root, 'note');
+    const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'pin-doc-citations-shallow-'));
+    roots.push(shallow);
+    spawnSync('git', ['clone', '-q', '--depth', '3', `file://${root}`, shallow]);
+
+    expect(pinDocs(shallow, [NOTE], [])).toEqual([
+      expect.objectContaining({ kind: 'refused', reason: expect.stringMatching(/shallow boundary/) }),
+    ]);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');
