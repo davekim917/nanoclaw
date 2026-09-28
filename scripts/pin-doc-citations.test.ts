@@ -490,6 +490,27 @@ describe('pinDocs', () => {
     expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
   });
 
+  it("compares a merged branch's versions too", () => {
+    const root = gitRoot();
+    write(root, 'src/code.ts', 'function unrelated() {}\n');
+    commit(root, 'base');
+    const main = (gitRead(root, ['branch', '--show-current']) ?? '').trim();
+    spawnSync('git', ['checkout', '-qb', 'side'], { cwd: root });
+    write(root, 'src/code.ts', 'function drainQueue() { return false; }\n');
+    commit(root, 'side');
+    spawnSync('git', ['checkout', '-q', main], { cwd: root });
+    write(root, 'src/code.ts', 'function different() {}\n');
+    commit(root, 'main');
+    spawnSync('git', ['merge', '-q', 'side', '--no-edit', '--no-gpg-sign'], { cwd: root });
+    write(root, 'src/code.ts', 'function drainQueue() { return true; }\n');
+    spawnSync('git', ['add', '-A'], { cwd: root });
+    spawnSync('git', ['commit', '-q', '--no-edit', '--no-gpg-sign'], { cwd: root });
+    write(root, NOTE, '- `drainQueue` at `src/code.ts:1` decides it\n');
+    commit(root, 'note');
+
+    expect(pinDocs(root, [NOTE], []).map((outcome) => outcome.kind)).toEqual(['refused']);
+  });
+
   it('matches a named identifier whole, not inside a longer one', () => {
     const root = gitRoot();
     write(root, 'src/code.ts', 'function drainQueue() {}\n');

@@ -122,9 +122,12 @@ function newestOf(root: string, shas: readonly string[]): string | null {
 }
 
 function candidateRevisions(root: string, origin: string, files: readonly string[]): string[] | null {
-  const touching = (gitRead(root, ['log', '--format=%H', origin, '--', ...files]) ?? '').split('\n').filter(Boolean);
+  const touching = (gitRead(root, ['log', '--full-history', '--format=%H %P', origin, '--', ...files]) ?? '')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => line.split(' ').filter(Boolean));
   if (touching.length > MAX_EARLIER_VERSIONS) return null;
-  const revs = [origin, ...touching.map((sha) => `${sha}^`)];
+  const revs = [origin, ...touching.flat()];
   const seenVersions = new Set<string>();
   const out: string[] = [];
   for (const rev of revs) {
