@@ -14,6 +14,7 @@ import {
   commentGrowthFindings,
   duplicateTestFindings,
   exemptFiles,
+  failsRun,
   growthBase,
   hygieneFindings,
   jscpdFindings,
@@ -429,14 +430,17 @@ describe('duplicate tests', () => {
   const spec = (cases: string) => `import { expect, it } from 'vitest';\nimport { f } from './f.js';\n${cases}`;
   const keeper = "it('keeper', () => {\n  expect(f(1)).toBe(2);\n});\n";
 
-  it('fails a new case that repeats one already on main, unless a commit trailer justifies it', () => {
+  it('reports a new case that repeats one already on main, unless a commit trailer justifies it', () => {
     const root = repo(
       { 'src/f.test.ts': spec(keeper) },
       { 'src/f.test.ts': spec(`${keeper}it('copy', () => {\n  expect(f(1)).toBe(2);\n});\n`) },
     );
-    expect(summary(duplicateTestFindings(root, growthBase(root)))).toEqual([
+    const findings = duplicateTestFindings(root, growthBase(root));
+    expect(summary(findings)).toEqual([
       expect.stringMatching(/^same-as src\/f\.test\.ts:6 "copy" runs the same statements as line 3 "keeper"; /),
     ]);
+    expect(failsRun(findings)).toBe(false);
+    expect(failsRun([...findings, { ...findings[0], check: 'comments' }])).toBe(true);
     git(root, 'commit', '-q', '--allow-empty', '-m', 'why\n\nDuplicate-test: src/f.test.ts | copy | pins a title');
     expect(duplicateTestFindings(root, growthBase(root))).toEqual([]);
   });

@@ -355,13 +355,16 @@ export function hygieneFindings(root: string, exempt: Exempt): Finding[] {
   ];
 }
 
+export const failsRun = (findings: Finding[]) => findings.some((finding) => finding.check !== 'duplicate-tests');
+
 function print(findings: Finding[]): void {
   for (const check of ['knip', 'jscpd', 'comments', 'comment-growth', 'duplicate-tests'] as const) {
     const group = findings.filter((finding) => finding.check === check);
     const kinds = new Map<string, number>();
     for (const finding of group) kinds.set(finding.kind, (kinds.get(finding.kind) ?? 0) + 1);
     const breakdown = [...kinds].map(([kind, count]) => `${kind} ${count}`).join(', ');
-    console.log(`\n${check}: ${group.length} finding(s)${breakdown ? ` (${breakdown})` : ''}`);
+    const advisory = check === 'duplicate-tests' && group.length ? ', report only' : '';
+    console.log(`\n${check}: ${group.length} finding(s)${breakdown ? ` (${breakdown}${advisory})` : ''}`);
     for (const finding of group) console.log(`  ${finding.kind}  ${finding.location}  ${finding.message}`);
   }
 }
@@ -393,7 +396,7 @@ function main(): void {
   printGrowth(growth);
   const report = args.includes('--report');
   console.log(`\nhygiene: ${findings.length} finding(s)${report ? ' (report mode, not failing)' : ''}`);
-  process.exitCode = findings.length > 0 && !report ? 1 : 0;
+  process.exitCode = failsRun(findings) && !report ? 1 : 0;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
