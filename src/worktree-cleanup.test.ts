@@ -19,6 +19,7 @@ const state = vi.hoisted(() => ({
   /** Every path handed to the trash binary, in order. */
   trashed: [] as string[],
   trashDir: '',
+  afterGit: null as null | ((args: readonly string[], cwd: string) => void),
 }));
 
 // The GC's removal is `/usr/bin/trash` (TRASH_BIN in worktree-cleanup.ts).
@@ -42,7 +43,11 @@ vi.mock('child_process', async (importOriginal) => {
         );
         return Buffer.alloc(0);
       }
-      return actual.execFileSync(...args);
+      const result = actual.execFileSync(...args);
+      if (file === 'git' && state.afterGit && Array.isArray(fileArgs)) {
+        state.afterGit(fileArgs as string[], String((args[2] as { cwd?: string } | undefined)?.cwd));
+      }
+      return result;
     },
   };
 });
@@ -1240,6 +1245,36 @@ describe('branch clone checkouts', () => {
 
     expect(fs.readdirSync(sentinels).filter((name) => !name.endsWith('.sh'))).toEqual([]);
     expect(verdicts.map((verdict) => verdict.reason)).toEqual(['clean-and-pushed', 'unpushed', 'submodule']);
+  });
+
+  it('a repository staged between the submodule check and status is not recursed into', () => {
+    const canon = canonicalFixture('repo-a');
+    const fixture = cloneCheckout(canon, 'exec-late-submodule', 'repo-a@feat', 'feat');
+    const sentinel = path.join(state.dataDir, 'fixtures', 'late-submodule-filter-ran');
+    const filter = path.join(state.dataDir, 'fixtures', 'late-submodule-filter.sh');
+    fs.mkdirSync(path.dirname(filter), { recursive: true });
+    fs.writeFileSync(filter, `#!/bin/sh\ntouch ${sentinel}\ncat\n`, { mode: 0o755 });
+    const nested = path.join(fixture.checkout, 'nested');
+    fs.mkdirSync(nested);
+    git(nested, ['init', '-q']);
+    commitFile(nested, 'inner.txt');
+    git(nested, ['config', 'filter.inner.clean', filter]);
+    fs.writeFileSync(path.join(nested, '.git', 'info', 'attributes'), '* filter=inner\n');
+    fs.utimesSync(path.join(nested, 'inner.txt'), OLD, OLD);
+
+    state.afterGit = (args, cwd) => {
+      if (!args.includes('ls-files') || cwd !== fixture.checkout) return;
+      state.afterGit = null;
+      git(fixture.checkout, ['add', 'nested']);
+    };
+    try {
+      disposability.proveCheckoutDisposable({ path: fixture.checkout, shape: 'clone' });
+    } finally {
+      state.afterGit = null;
+    }
+
+    expect(git(fixture.checkout, ['ls-files', '-s', 'nested'])).toMatch(/^160000 /);
+    expect(fs.existsSync(sentinel)).toBe(false);
   });
 
   it('orphan-topic GC enumerates through the lister, proves clones with scope all, and refuses unknown shapes', async () => {

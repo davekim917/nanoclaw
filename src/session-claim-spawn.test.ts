@@ -1159,8 +1159,12 @@ describe('nothing is awaited between the guard and spawn', () => {
     expect(ts.isCallExpression(leaseCall) && text(leaseCall.expression)).toBe('withCentralSync');
 
     const callback = (leaseCall as ts.CallExpression).arguments[0]!;
-    const insideCallback = (node: ts.Node): boolean =>
-      node.getStart(source) >= callback.getStart(source) && node.getEnd() <= callback.getEnd();
+    const insideCallback = (node: ts.Node): boolean => {
+      for (let cursor = node.parent; cursor; cursor = cursor.parent) {
+        if (ts.isFunctionLike(cursor)) return cursor === callback;
+      }
+      return false;
+    };
     const registration = calls.find((call) => text(call.expression) === 'activeContainers.set');
     expect(registration, 'spawnContainer no longer registers the spawned container').toBeDefined();
     for (const [label, call] of [
@@ -1168,7 +1172,7 @@ describe('nothing is awaited between the guard and spawn', () => {
       ['spawn', spawnCall!],
       ['registration', registration!],
     ] as const) {
-      expect(insideCallback(call), `${label} is outside the withCentralSync callback`).toBe(true);
+      expect(insideCallback(call), `${label} does not run directly in the withCentralSync callback`).toBe(true);
     }
   });
 });

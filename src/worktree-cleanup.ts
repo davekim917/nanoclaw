@@ -678,8 +678,7 @@ function provenDisposable(
 
   // Host git runs in a repository a container may have configured: signature programs are off and every filter
   // is neutralized by name. An embedded repository is refused before `status` could recurse into it; one whose
-  // config or index cannot be read is unprovable. `--ignore-submodules=all` still matters: a submodule added between
-  // the two commands would carry filters outside the overrides.
+  // config or index cannot be read is unprovable.
   const filters = repositoryFilterNames(dir, env);
   if (filters === null) return { ok: false, reason: 'status-unprovable' };
   const modes = git(dir, ['ls-files', '-z', '--format=%(objectmode)'], env, filters);
