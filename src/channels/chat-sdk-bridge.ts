@@ -620,6 +620,22 @@ async function postDiscordQuestion(
   return posted.id;
 }
 
+async function clearDiscordComponents(threadId: string, botToken: string, messageId: string): Promise<void> {
+  const channelId = discordDeliveryChannelId(threadId);
+  const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bot ${botToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ components: [] }),
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 500);
+    throw new Error(`Discord component clear failed (${response.status}): ${detail}`);
+  }
+}
+
 export function splitForLimit(text: string, limit: number): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
@@ -1106,7 +1122,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const matched = render?.options.find((o) => o.value === selectedOption);
         const selectedLabel = matched?.selectedLabel ?? selectedOption;
 
-        // Update the card to show the selected answer, who acted, and remove buttons
         const actorName = event.user?.userName || event.user?.fullName || '';
         const byLine = actorName ? ` — ${actorName}` : '';
         const resolution = `${selectedLabel}${byLine}`;
@@ -1273,7 +1288,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let attempt = 1; ; attempt++) {
           try {
             await adapter.editMessage(tid, content.messageId as string, editBody);
-            return;
+            break;
           } catch (err) {
             const retryAfterMs = parseRetryAfterMs(err);
             if (retryAfterMs === null || listEdit || attempt > MAX_RATE_LIMIT_RETRIES) throw err;
@@ -1281,6 +1296,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             await sleep(retryAfterMs + RATE_LIMIT_BUFFER_MS);
           }
         }
+        // The Discord adapter's text edit omits `components`, which Discord reads as "keep the buttons".
+        if (content.clearActions === true && isDiscordBridge && config.botToken) {
+          await clearDiscordComponents(tid, config.botToken, content.messageId as string);
+        }
+        return;
       }
 
       if (content.operation === 'reaction' && content.messageId && content.emoji) {

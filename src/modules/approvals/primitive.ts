@@ -475,6 +475,7 @@ export async function editApprovalCard(approval: PendingApproval, newBody: strin
         operation: 'edit',
         messageId: approval.platform_message_id,
         text: newBody,
+        clearActions: true,
       }),
       undefined,
       // Dispatch is exact-key: a bare channel type finds no adapter when every bot is a named instance.

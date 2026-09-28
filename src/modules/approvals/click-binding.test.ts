@@ -688,7 +688,12 @@ describe('an accepted press edits the card the approval row names', () => {
     expect(approved).toEqual([{ approvalId: 'appr-dm', userId: OWNER }]);
     expect(bridgeEdits).toEqual([]);
     expect(deliveries).toEqual([
-      expect.objectContaining({ operation: 'edit', messageId: 'real-dm-card', text: 'Run this?\n\nApprove — Owner' }),
+      expect.objectContaining({
+        operation: 'edit',
+        messageId: 'real-dm-card',
+        text: 'Run this?\n\nApprove — Owner',
+        clearActions: true,
+      }),
     ]);
   });
 
