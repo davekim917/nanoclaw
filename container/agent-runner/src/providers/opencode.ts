@@ -67,7 +67,7 @@ const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
 
 /**
  * Audio/video only when declared (closed by default), resolved through `resolveModelCapabilities` so this and the
- * config writer cannot disagree. Images and PDFs always forward: a rejection is visible, a withheld file is not.
+ * config writer cannot disagree.
  */
 export function forwardableAttachmentMime(
   mime: string,
@@ -135,8 +135,7 @@ export function buildPromptParts(
 /**
  * Enumerated rather than `permission: 'allow'` so `question` is a deterministic `deny`: a headless container cannot
  * answer it and the session wedges. Every other key stays `allow`, so the destructive-action plugin remains the only
- * guard. Values must be `allow`/`deny` only: an invalid action fails the whole spawn. Undocumented categories are
- * omitted on purpose, so unlisted and future keys keep OpenCode's defaults rather than an implicit allow.
+ * guard. Values must be `allow`/`deny` only: an invalid action fails the whole spawn.
  */
 export const OPENCODE_PERMISSIONS: Record<string, string> = {
   read: 'allow',
@@ -542,7 +541,6 @@ export function buildOpenCodeConfig(
   const modelsToRegister = [defaultModelId, smallModelId]
     .filter((mid): mid is string => Boolean(mid))
     .filter((mid, i, a) => a.indexOf(mid) === i);
-  // Declarations attach only when the effective model is the configured OPENCODE_MODEL (a matching `-m` included).
   const { limit: modelLimit, modalities: modelModalities } = resolveModelCapabilities(model);
   const modelsBlock =
     modelsToRegister.length > 0

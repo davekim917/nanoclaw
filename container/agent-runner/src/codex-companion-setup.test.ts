@@ -238,6 +238,17 @@ describe('buildRuntimeConfig', () => {
     expect(helper).toContain('return FAILED_CODEX_HOME;');
     expect(helper).not.toMatch(/\bthrow new\b/);
   });
+
+  it("the runner exports setupCodexRuntime's home before the provider snapshots process.env", () => {
+    const source = fs.readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+    const setup = source.indexOf('setupCodexRuntime(mcpServers');
+    const assign = source.indexOf('process.env.CODEX_HOME = codexHome;');
+    const construct = source.indexOf('createProvider(providerName, {');
+    expect(setup).toBeGreaterThan(-1);
+    expect(assign).toBeGreaterThan(setup);
+    expect(construct).toBeGreaterThan(assign);
+    expect(source.slice(construct, source.indexOf('});', construct))).toContain('env: { ...process.env },');
+  });
 });
 
 describe('stripPluginsAndMarketplaces', () => {

@@ -125,7 +125,7 @@ describe('buildPromptParts', () => {
 });
 
 describe('forwardableAttachmentMime', () => {
-  it('test_oc_forward_images_and_pdfs_unconditionally: the long-standing behavior is unchanged', () => {
+  it('test_oc_forward_images_and_pdfs_unconditionally: a rejection is visible, a withheld file is not', () => {
     expect(forwardableAttachmentMime('image/png', undefined, {})).toBe(true);
     expect(forwardableAttachmentMime('image/heic', undefined, {})).toBe(true);
     expect(forwardableAttachmentMime('application/pdf', undefined, {})).toBe(true);
