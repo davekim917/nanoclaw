@@ -832,6 +832,8 @@ describe('parseRetryAfterMs', () => {
 });
 
 describe('createChatSdkBridge.deliver — edit path (status post-then-edit)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it('truncates to a single edit instead of posting additional chunks for oversize status text', async () => {
     // Bug B regression guard. Previously, oversize status edits called
     // editMessage(chunk0) THEN postMessage(chunk1..N). The new posts were
@@ -882,6 +884,73 @@ describe('createChatSdkBridge.deliver — edit path (status post-then-edit)', ()
       content: { operation: 'edit', messageId: 'msg-x', text: 'short status' },
     });
     expect(edits[0].body.markdown).toBe('short status');
+  });
+
+  it("Discord: a clearActions edit strips the resolved card's buttons after the text edit", async () => {
+    const order: string[] = [];
+    const editMessage = vi.fn(async () => {
+      order.push('edit');
+    });
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => {
+      order.push('clear');
+      return new Response(JSON.stringify({ id: 'card-1' }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', editMessage } as unknown as Partial<Adapter>),
+      channelType: 'discord',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+    });
+
+    await bridge.deliver('discord:GUILD:PARENT', 'discord:GUILD:PARENT:THREAD', {
+      kind: 'chat-sdk',
+      content: { operation: 'edit', messageId: 'card-1', text: 'Ship\n\n✅ Ship — Owner', clearActions: true },
+    });
+
+    expect(order).toEqual(['edit', 'clear']);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://discord.com/api/v10/channels/THREAD/messages/card-1');
+    expect(init?.method).toBe('PATCH');
+    expect(JSON.parse(init?.body as string)).toEqual({ components: [] });
+  });
+
+  it('Discord: a rate-limited component clear is retried', async () => {
+    const fetchMock = vi
+      .fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{"retry_after": 0}', { status: 429 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', editMessage: async () => {} } as unknown as Partial<Adapter>),
+      channelType: 'discord',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+    });
+
+    await bridge.deliver('discord:GUILD:PARENT', null, {
+      kind: 'chat-sdk',
+      content: { operation: 'edit', messageId: 'card-1', text: 'Resolved', clearActions: true },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('Discord: an ordinary edit makes no component-clearing call', async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', editMessage: async () => {} } as unknown as Partial<Adapter>),
+      channelType: 'discord',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+    });
+
+    await bridge.deliver('discord:GUILD:PARENT', null, {
+      kind: 'status',
+      content: { operation: 'edit', messageId: 'status-1', text: 'thinking…' },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

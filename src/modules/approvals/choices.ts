@@ -24,12 +24,11 @@ import {
   transitionPendingApprovalStatus,
   updatePendingApprovalStatus,
 } from '../../db/sessions.js';
-import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import { equivalentSlackUserIds } from '../../slack-user-identity.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { getUser } from '../permissions/db/users.js';
-import { notifyApprovalResolved } from './primitive.js';
+import { editApprovalCard, notifyApprovalResolved } from './primitive.js';
 import { parseReleaseShipScope, releaseShipScopeJson } from './release-ship-scope.js';
 
 export interface ChoiceHandlerContext {
@@ -145,7 +144,7 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
   await writeChoiceReceipt(approval, deliveredTo, option, userId, resolvedAt);
   await deletePendingApproval(approval.approval_id);
   const name = (await getUser(userId))?.display_name || userId;
-  await editChoiceCard(approval, cardText(approval, `✅ ${option.label} — ${name}`));
+  await editApprovalCard(approval, cardText(approval, `✅ ${option.label} — ${name}`));
   // A choice resolves as approval of the chosen option.
   await notifyApprovalResolved({ approval, session: deliveredTo, outcome: 'approve', userId });
 }
@@ -159,7 +158,7 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
 export async function retireChoice(approval: PendingApproval, line: string): Promise<boolean> {
   if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'expired'))) return false;
   await deletePendingApproval(approval.approval_id);
-  await editChoiceCard(approval, cardText(approval, line));
+  await editApprovalCard(approval, cardText(approval, line));
   return true;
 }
 
@@ -216,29 +215,6 @@ function receiptReleaseScopeJson(approval: PendingApproval): string | null {
     // eslint-disable-next-line no-catch-all/no-catch-all -- corrupt payload is unscoped, never an authority grant
   } catch {
     return null;
-  }
-}
-
-/**
- * Dispatch through `instance ?? channel_type` (dispatch is exact-key), and log
- * failures loudly: the row is gone, so a failed edit leaves dead live-looking buttons.
- */
-async function editChoiceCard(approval: PendingApproval, text: string): Promise<void> {
-  const adapter = getDeliveryAdapter();
-  if (!adapter || !approval.platform_message_id || !approval.channel_type || !approval.platform_id) return;
-  try {
-    await adapter.deliver(
-      approval.channel_type,
-      approval.platform_id,
-      approval.thread_id,
-      'chat-sdk',
-      JSON.stringify({ operation: 'edit', messageId: approval.platform_message_id, text }),
-      undefined,
-      approval.instance ?? approval.channel_type,
-    );
-    // eslint-disable-next-line no-catch-all/no-catch-all -- the card edit is cosmetic; the row's state is already decided
-  } catch (err) {
-    log.error('Failed to edit choice card', { approvalId: approval.approval_id, err });
   }
 }
 

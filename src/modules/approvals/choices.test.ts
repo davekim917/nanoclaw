@@ -6,7 +6,7 @@
  *
  * Real central DB (initMigratedTestDb); resolveChoice is exercised directly
  * with a stub ChoiceHandler, no delivery adapter/channel registry needed
- * (editChoiceCard no-ops without one — see choices.ts).
+ * (editApprovalCard no-ops without one — see primitive.ts).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 

@@ -483,7 +483,9 @@ describe("a click made on the approval's own card still resolves it", () => {
 
     expect(answered.map((a) => [a.value, a.label, a.userId])).toEqual([['ship', 'Ship production', OWNER]]);
     expect(await getPendingApproval('appr-choice')).toBeUndefined();
-    expect(deliveries).toEqual([expect.objectContaining({ operation: 'edit', messageId: 'real-choice-card' })]);
+    expect(deliveries).toEqual([
+      expect.objectContaining({ operation: 'edit', messageId: 'real-choice-card', clearActions: true }),
+    ]);
   });
 
   it('Discord', async () => {
@@ -688,7 +690,12 @@ describe('an accepted press edits the card the approval row names', () => {
     expect(approved).toEqual([{ approvalId: 'appr-dm', userId: OWNER }]);
     expect(bridgeEdits).toEqual([]);
     expect(deliveries).toEqual([
-      expect.objectContaining({ operation: 'edit', messageId: 'real-dm-card', text: 'Run this?\n\nApprove — Owner' }),
+      expect.objectContaining({
+        operation: 'edit',
+        messageId: 'real-dm-card',
+        text: 'Run this?\n\nApprove — Owner',
+        clearActions: true,
+      }),
     ]);
   });
 
