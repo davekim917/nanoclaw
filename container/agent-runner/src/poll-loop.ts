@@ -1141,8 +1141,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
     } finally {
-      // Exactly one task_log row per fire: any not already written (writtenFireKeys) is written
-      // here, where the final result and deferral are both known. A DEFERRED batch (barrier, fallback) writes
+      // Unwritten fire outcomes are written here, where the final result and deferral are both known. A
+      // DEFERRED batch (barrier, fallback) writes
       // nothing: its re-run records its own, and two failures for one postponed
       // fire can page a human. Best-effort: never mask the turn's own error.
       {
@@ -1661,7 +1661,6 @@ export async function processQuery(
         const fb = applyFlagBatch(keep, extractRouting(keep), providerName, {
           ignoreTaskFlagIntents: options.ignoreTaskFlagIntents,
         });
-        // A `-m` for the other provider is ignored (it resolves to undefined): say so.
         if (fb.ignoredModel !== undefined) {
           await noteIgnoredModel(
             fb.ignoredModel,
@@ -3142,7 +3141,7 @@ export async function noteModelQuotaFallback(
  * Per-turn model/effort for a batch that OPENS a query. A pure task wake
  * SUPPRESSES the interactive sticky (`undefined` = no per-turn override, so the
  * group's configured model applies) rather than inherit a human's last `-m` in
- * the shared session; provider-neutral, and Codex's sticky fast passes through. Not for the live follow-up path, where
+ * the shared session; provider-neutral. Not for the live follow-up path, where
  * the batch may be a fragment of a human's turn. Wraps applyFlagBatch because
  * its sticky persistence must still happen.
  */

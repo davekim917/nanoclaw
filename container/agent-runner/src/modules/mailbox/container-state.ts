@@ -117,8 +117,7 @@ export function resetProviderExecuting(outbound: Database = getOutboundDb()): vo
 
 /**
  * When the current query first emitted a provider event (NULL until then and between queries). The host tells a
- * quiet-but-alive turn from one hung at the gate with it; only the latter may be killed for an aged claim (the
- * absolute ceiling still applies to both). At most two writes per query.
+ * quiet-but-alive turn from one hung at the gate with it. At most two writes per query.
  */
 let queryEventStamped = false;
 

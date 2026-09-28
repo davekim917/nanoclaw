@@ -673,6 +673,30 @@ describe('repository mount poll and tool admission barrier', () => {
     expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Answered without an echo.']);
   }, 5_000);
 
+  it('records a fire whose every attempt threw, once the turn ends', async () => {
+    insertMessage('task-all-threw', 'task', { prompt: 'Summarise the release queue once.' });
+    const fake = openAfterResultProvider();
+    const provider = {
+      ...fake.provider,
+      isRetryable: () => false,
+      query: () => ({
+        push: () => undefined,
+        end: () => {},
+        abort: () => {},
+        events: (async function* (): AsyncGenerator<ProviderEvent> {
+          throw new Error('upstream refused the turn');
+        })(),
+      }),
+    };
+    const run = startOpenStreamLoop({ ...fake, provider });
+    try {
+      await waitForTaskLog();
+    } finally {
+      await run.stop();
+    }
+    expect(taskLogRowsNow()).toHaveLength(1);
+  }, 5_000);
+
   it('retries an outcome write that failed, and still writes exactly one record', async () => {
     // The outbound insert is its own transaction, so a write that throws
     // committed nothing and the same outcome can be written again.
@@ -1680,6 +1704,22 @@ describe('accumulate gate (trigger column)', () => {
       const raw = getInboundDb().prepare('SELECT * FROM messages_in ORDER BY rowid').all() as any[];
       expect(selectInTurnFollowUps(raw)).toEqual([]);
       expect(getPendingMessages()).toEqual([]);
+    } finally {
+      if (priorWorkgroupId === undefined) delete process.env.NANOCLAW_WORKGROUP_ID;
+      else process.env.NANOCLAW_WORKGROUP_ID = priorWorkgroupId;
+    }
+  });
+
+  it('in a trusted workgroup runtime, holds back only an unpaired admissible trigger', () => {
+    const priorWorkgroupId = process.env.NANOCLAW_WORKGROUP_ID;
+    process.env.NANOCLAW_WORKGROUP_ID = 'alpha';
+    try {
+      insertMessage('context', 'chat', { sender: 'C', text: 'accumulated' }, { trigger: 0 });
+      insertMessage('sys', 'system', { subtype: 'host_note', text: 'note' }, { trigger: 1 });
+      insertMessage('clear', 'chat', { sender: 'C', text: '/clear' }, { trigger: 1 });
+      insertMessage('half-pair', 'chat', { sender: 'C', text: 'missing context' }, { trigger: 1 });
+      const ids = getPendingMessages().map((row) => row.id);
+      expect(ids.sort()).toEqual(['clear', 'context', 'sys']);
     } finally {
       if (priorWorkgroupId === undefined) delete process.env.NANOCLAW_WORKGROUP_ID;
       else process.env.NANOCLAW_WORKGROUP_ID = priorWorkgroupId;

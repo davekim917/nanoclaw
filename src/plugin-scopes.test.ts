@@ -20,6 +20,7 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
+import { validateExcludePlugins } from './plugin-exclusions.js';
 import {
   PLUGIN_SCOPES_POLICY_PATH,
   loadPluginScopes,
@@ -72,6 +73,13 @@ describe('loadPluginScopes', () => {
     ['a workgroup ID that is not a slug', { version: 1, plugins: { 'client-plugin': ['Client WG'] } }],
   ])('throws on %s', (_label, policy) => {
     expect(() => parsePluginScopes(JSON.stringify(policy))).toThrow('Invalid plugin scope policy');
+  });
+
+  it('keeps a narrower plugin-name rule than excludePlugins, whose names the operator did not choose', () => {
+    expect(validateExcludePlugins(['c++-tools'])).toEqual(['c++-tools']);
+    expect(() => parsePluginScopes(JSON.stringify({ version: 1, plugins: { 'c++-tools': ['client-wg'] } }))).toThrow(
+      'Invalid plugin scope policy',
+    );
   });
 });
 

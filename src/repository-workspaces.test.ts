@@ -465,6 +465,13 @@ describe('host-only origin pins', () => {
       root,
     );
     expect(readOriginPin('wg-a', 'odd', root)?.repositoryId).toBe('https://gitlab.com/a/b');
+    writeOriginPin(
+      'wg-a',
+      'plain',
+      { origin: 'https://github.com/acme/plain', repositoryId: 'http://github.com/Acme/Plain' },
+      root,
+    );
+    expect(readOriginPin('wg-a', 'plain', root)?.repositoryId).toBe('http://github.com/Acme/Plain');
   });
 
   it('rejects query and fragment data on both pin write and persisted-pin read without rewriting it', () => {

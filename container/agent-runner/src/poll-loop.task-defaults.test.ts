@@ -27,7 +27,7 @@ import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { MockProvider } from './providers/mock.js';
-import { getStickyModel, getStickyEffort } from './modules/mailbox/session-state.js';
+import { getStickyModel, getStickyEffort, setStickyFast } from './modules/mailbox/session-state.js';
 import type { AgentQuery, QueryInput } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
@@ -184,6 +184,16 @@ describe('scheduled-task model/effort resolution (claude)', () => {
 
     expect(provider.inputs[0].model).toBeUndefined();
     expect(provider.inputs[0].effort).toBeUndefined();
+  });
+
+  it("an unpinned task keeps Codex's sticky fast mode", async () => {
+    setStickyFast(true);
+    insertTask('t-fast', { prompt: 'nightly' });
+    const provider = new RecordingProvider({}, () => '<message to="discord-test">done</message>');
+
+    await runUntilQueried(provider, { providerName: 'codex' });
+
+    expect(provider.inputs[0].fast).toBe(true);
   });
 
   it('a MODEL-only pin no longer drags an xhigh effort along with it', async () => {
