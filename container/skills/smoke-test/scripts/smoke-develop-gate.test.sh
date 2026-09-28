@@ -361,6 +361,16 @@ export STUB_FRONTEND_SHA="$OLD_SHA"
 export STUB_COMPARE_FILES='[{"filename":"docs/notes.md"}]'
 bash "$GATE" poll | jq -e '.data.trigger == "waiting_for_settled_build"' >/dev/null
 
+for bad in '/web/' ',,' 'web' 'web/,,shared/'; do
+  fresh_state
+  export STUB_FRONTEND_SHA="$OLD_SHA"
+  export STUB_COMPARE_FILES='[{"filename":"web/changed.ts"}]'
+  export SMOKE_GATE_FRONTEND_PATHS="$bad"
+  bash "$GATE" poll | jq -e '
+    .data.trigger == "gate_misconfigured" and .data.missing == ["SMOKE_GATE_FRONTEND_PATHS"]
+  ' >/dev/null
+done
+
 # 18. Red CI: one wake per stuck head after the alert window, never a re-spam.
 fresh_state
 export STUB_FRONTEND_CI=failure
