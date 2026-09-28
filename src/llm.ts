@@ -1,8 +1,8 @@
 /**
- * Lightweight Haiku calls for host-side utility tasks (titles, classification, reranking), straight to
- * `/v1/messages` over the OneCLI gateway proxy; the systemd unit's placeholder token is swapped by the gateway.
+ * Host Haiku calls go straight to `/v1/messages`, never via the OneCLI gateway: it swaps the Authorization header for
+ * one fixed account's credential, which defeats key rotation.
  */
-import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
+import { EnvHttpProxyAgent, type Dispatcher } from 'undici';
 
 import { readEnvFileMatching } from './env.js';
 import { log } from './log.js';
@@ -170,19 +170,10 @@ async function callHaikuOnce(
 ): Promise<string> {
   const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
 
-  const dispatcher = getProxyDispatcher();
-  const fetchImpl: typeof fetch = dispatcher
-    ? (url, init) =>
-        undiciFetch(
-          url as string,
-          { ...init, dispatcher } as Parameters<typeof undiciFetch>[1],
-        ) as unknown as Promise<Response>
-    : fetch;
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs);
   try {
-    const resp = await fetchImpl(`${baseUrl}/v1/messages`, {
+    const resp = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...credential.headers, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
