@@ -230,8 +230,6 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
       log.info('promise-watch: would nudge (shadow)', fields);
       continue;
     }
-    // Reserve before writing so a crash after the wake row lands can't leave
-    // it uncounted; a slot the admission then refuses is deliberately lost.
     if (!deps.cap.reserve(day, NUDGE_DAILY_CAP)) {
       // Not decided: tomorrow's allowance may still reach it inside the window.
       log.warn('promise-watch: daily nudge cap reached, skipping', fields);

@@ -721,10 +721,6 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
  *
  * Gated on the SAME predicate as the `/workspace/workgroup` mount: without the
  * mount the link target is container-local storage that `--rm` destroys.
- * Links only where nothing is left once a member's real directory has been
- * consolidated (see `consolidateMemberWorkDir` for its cross-device loss window),
- * unlike `ensureCompatSymlink`, which repoints any non-matching symlink and
- * would strand a member's linked content.
  */
 export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: string; dataDir?: string } = {}): void {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;

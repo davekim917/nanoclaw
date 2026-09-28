@@ -57,8 +57,7 @@ const DEFAULT_BLOCKED_PATTERNS = [
   'private_key',
   // GitHub App keys are conventionally `<app>.<date>.private-key.pem`.
   'private-key',
-  // Host-side OAuth bundles (refresh tokens, client secrets). Kept beside the
-  // containment check: it also catches bundle copies outside DATA_DIR.
+  // Host-side OAuth bundles (refresh tokens, client secrets).
   'mcp-oauth',
   '.secret',
 ];

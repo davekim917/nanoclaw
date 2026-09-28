@@ -211,10 +211,7 @@ function extractSenderName(normalizedContent: string): string | null {
   }
 }
 
-/**
- * `senderId`, else `author.userId`, trimmed; null on absence or parse failure.
- * Usually a raw platform id, but a supplied namespace is kept.
- */
+/** `senderId`, else `author.userId`; null on absence or parse failure. */
 function extractSenderId(normalizedContent: string): string | null {
   try {
     const parsed = JSON.parse(normalizedContent) as { senderId?: unknown; author?: unknown };

@@ -131,9 +131,7 @@ export function migrateMessagesInTable(db: Database.Database): void {
       db.prepare('ALTER TABLE messages_in ADD COLUMN scheduled_for TEXT').run();
       // Backfill TASK rows from process_after; NULL would make a legacy task's
       // first post-upgrade crash lose its slot. Done here because it must precede
-      // every writer of process_after. A row already in backoff takes its retry
-      // deadline as its slot, as the NULL fallback rendered, until rescheduled.
-      // Through strftime: a naive `YYYY-MM-DD HH:MM:SS` value is UTC.
+      // every writer of process_after.
       db.prepare(
         `UPDATE messages_in
             SET scheduled_for = strftime('%Y-%m-%dT%H:%M:%fZ', process_after)

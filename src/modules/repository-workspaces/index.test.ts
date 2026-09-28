@@ -584,6 +584,25 @@ describe('durable canonical publication core', () => {
     expect(JSON.stringify(pin)).not.toContain('.git');
   });
 
+  it('publishes the canonical detached, so a linked worktree can still take the default branch', async () => {
+    const repo = 'detached-publish';
+    const stage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-detached', repo);
+    cloneTo(stage);
+    const origin = `https://github.com/Example/${repo}`;
+    git(stage, ['remote', 'set-url', 'origin', origin]);
+
+    await publishStagedCanonical({
+      workgroupId: 'wg-a',
+      repo,
+      origin,
+      repositoryId: `github.com/Example/${repo}`,
+      stagingPath: stage,
+      dataDir: root,
+    });
+    const canonical = canonicalRepoDir('wg-a', repo, root);
+    git(canonical, ['worktree', 'add', '-q', path.join(root, 'default-branch-worktree'), 'main']);
+  });
+
   it('a re-publish matches an existing canonical whose pin holds the legacy URL-form identity (#697)', async () => {
     const repo = 'legacy-identity';
     const origin = `https://github.com/Example/${repo}`;
@@ -2658,6 +2677,7 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     });
     _setRepositoryCheckoutHooksForTesting({
       afterStagingPopulated: async (stagingCheckout) => {
+        expect(isWorkgroupRepositoryMountClaimed(WG)).toBe(false);
         reached.add(stagingCheckout);
         if (reached.size === 2) bothReached();
         await withTimeout(barrier, 30_000, 'the other thread never reached staging');
