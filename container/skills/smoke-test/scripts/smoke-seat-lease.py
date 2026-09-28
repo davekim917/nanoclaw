@@ -75,9 +75,6 @@ def identity():
     return group
 
 
-DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-
-
 def open_ledger(create=False):
     root = os.environ.get("SMOKE_GATE_SHARED_ROOT", "/workspace/workgroup")
     try:
@@ -98,14 +95,13 @@ def open_ledger(create=False):
                     os.mkdir(part, 0o755, dir_fd=fd)
                 except FileExistsError:
                     pass
-            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
         except FileNotFoundError:
-            os.close(fd)
             return None
         except OSError as e:
-            os.close(fd)
             raise Refusal("no-ledger", detail="{}/{}: {}".format(root, part, e.__class__.__name__))
-        os.close(fd)
+        finally:
+            os.close(fd)
         fd = child
     return fd
 
@@ -178,8 +174,9 @@ def write(seat, verb, to, until):
     dfd = open_ledger(create=True)
     if dfd is None:
         raise Refusal("no-ledger", detail="the ledger disappeared while it was being created")
-    lock = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+    lock = None
     try:
+        lock = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
         fcntl.flock(lock, fcntl.LOCK_EX)
         lease = read_lease(dfd, seat)
         name = seat + ".json"
@@ -207,7 +204,8 @@ def write(seat, verb, to, until):
         print(json.dumps(record))
         return 0
     finally:
-        os.close(lock)
+        if lock is not None:
+            os.close(lock)
         os.close(dfd)
 
 

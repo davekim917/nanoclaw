@@ -162,7 +162,7 @@ if smoke_case ledger-swapped-mid-check-still-refuses; then
   for swap in qa-coordinator seat-leases; do
     fresh "swap-$swap"
     as group-b grant "$SEAT" --to group-b --until "$(future)"
-    SMOKE_SEAT_LEASE_IDENTITY_FILE="$IDS/group-a.json" SWAP="$swap" python3 - "$L" "$SEAT" 2>"$T/err" <<'PY'
+    SMOKE_SEAT_LEASE_IDENTITY_FILE="$IDS/group-a.json" SWAP="$swap" python3 -B - "$L" "$SEAT" 2>"$T/err" <<'PY'
 import importlib.util, os, sys
 spec = importlib.util.spec_from_file_location("lease", sys.argv[1])
 lease = importlib.util.module_from_spec(spec)
@@ -180,9 +180,11 @@ def swapping(real):
         return out
     return call
 os.open, os.lstat, os.stat = swapping(os.open), swapping(os.lstat), swapping(os.stat)
-sys.exit(lease.main(["check", sys.argv[2]]))
+rc = lease.main(["check", sys.argv[2]])
+sys.exit(rc if done else 99)
 PY
     RC=$?
+    [ "$RC" != 99 ] || fail "swap $swap: the hook never fired, so this case proved nothing"
     [ "$RC" = 69 ] || fail "ledger $swap swapped for a dangling symlink mid-check: rc=$RC, want 69"
     grep -q "reason=leased-elsewhere" "$T/err" || fail "swap $swap: the held directory must still show the live lease: $(cat "$T/err")"
   done
