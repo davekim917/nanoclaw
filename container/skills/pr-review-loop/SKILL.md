@@ -253,6 +253,10 @@ A PR that adds more than 150 lines outside tests and lockfiles needs a cut-down 
 
 The receipt must come from an account with write access to the repository, and its reviewer must lead with a frontier model id, as `receipt` requires, and name `cut-down-reviewer`. A receipt that names no agent, which is what an author posting its own looks like, does not count. Every session shares one GitHub account, so the gate cannot see who ran the command: the named agent is a recorded claim, like a substitute receipt's reviewer.
 
+## Lost-constraint review — a PR that deletes or shortens comments
+
+Before merge, run a fresh-context reviewer (the same kind the cut-down pass uses) with `bootstrap/plugins/comment-rule/review/lost-constraint.md` under `$CLAUDE_PLUGINS_ROOT` or `~/plugins` as its prompt, `{{BASE}}` set to the merge base. Each lost constraint comes back with the test, type, assert or lint rule that replaces it, or `none` and why code can't check it. Write that enforcement and delete the comment in this PR, or keep the comment and list the conversion in the PR body as follow-up work; never delete it before its enforcement exists.
+
 ## Step 1 — Collect the full open set
 
 ```bash

@@ -104,7 +104,7 @@ Before a PR, a skill, or any contribution, you MUST read [CONTRIBUTING.md](CONTR
 
 **Verify another module's behaviour before relying on it, and cite it in the PR, not the code.** A branch that rests on how some other module behaves — what a predicate returns for a missing file, whether a subclass overrides a method, what an existence check keys on — must be checked against the source first. An unverified premise does not fail loudly: it produces code that looks right and a test oracle that paraphrases the same wrong belief and passes. PR #583 spent four review rounds on one (`dbHasRows` short-circuits an absent path to `false` on its first line; it was believed to answer `null`). Read the whole declaration, since guard clauses live on the first lines, and `grep override` before asserting what a method does. Put the `file:line` you read in the PR description or review reply, where it is evidence for that change — never in a source comment, where it goes stale as soon as the cited file moves.
 
-**Comments only where a reader would otherwise get the code wrong** — a non-obvious constraint or hazard. No narration of what the code does, no change history or PR numbers. Tooling directives (`eslint-disable`, `@ts-expect-error`) are not comments in this sense and stay.
+**A constraint belongs in a test, type, assert or lint rule; a comment is only for what code can't check** — an external system's quirk, why the obvious approach was wrong. No narration of what the code does, no change history or PR numbers. Tooling directives (`eslint-disable`, `@ts-expect-error`) are not comments in this sense and stay.
 
 Any change to an upstream-owned file must regenerate `src/upstream-ratchet.json` (`pnpm run ratchet:report -- --write`); growth needs `--accept` and a reason in the PR body.
 
@@ -116,7 +116,7 @@ Beyond correctness, a reviewer checks:
 - **Hard-coded values** that belong in config.
 - **A new helper where one already exists** — name the existing one.
 - **Code that belongs in a shared component** — logic re-implemented or copied across modules instead of centralised.
-- **Comments that narrate or restate the code, or carry history/backstory** — a new comment must name a constraint or hazard a reader would otherwise get wrong.
+- **Comments that narrate or restate the code, or carry history/backstory** — a new comment must say what code can't check; a constraint it states belongs in a test, type, assert or lint rule instead.
 
 Dead code, copy-paste clones, `file:line` citations and PR-number history in comments are flagged in CI by `scripts/hygiene/run.ts`; exemptions live only in `knip.json`, `container/agent-runner/knip.json` and `.jscpd.json`, which are `risk:high`, apart from two derived sets it skips: files still byte-identical to upstream (`src/upstream-ratchet.json`) and the vendored design-review engine.
 The same run fails a change that adds comment-only lines on net in the non-test TS/JS files it changes, measured from its merge base with `origin/main`.
