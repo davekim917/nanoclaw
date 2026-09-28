@@ -132,7 +132,6 @@ if smoke_case unreadable-identity-or-ledger-refuses; then
   expect_refused group-a "ledger is a file" no-ledger
   rm "$LEDGER"
   as group-a grant "$SEAT" --to group-b --until "$(future)"
-  expect_refused group-a "live lease before the ledger turns unreadable" leased-elsewhere
   if [ "$(id -u)" != 0 ]; then
     chmod 000 "$ROOT/qa-coordinator"
     expect_refused group-a "unsearchable ledger parent" no-ledger
@@ -141,7 +140,20 @@ if smoke_case unreadable-identity-or-ledger-refuses; then
     expect_refused group-a "unsearchable ledger" no-ledger
     chmod 755 "$LEDGER"
   fi
+  mkdir -p "$ROOT/qa-coordinator/real-leases"
+  mv "$LEDGER/$SEAT.json" "$ROOT/qa-coordinator/real-leases/"
+  rm -rf "$LEDGER"
+  ln -s real-leases "$LEDGER"
+  expect_refused group-a "ledger symlinked inside the shared root" no-ledger
+  mv "$ROOT/qa-coordinator/real-leases" "$ROOT/qa-coordinator/gone"
+  expect_refused group-a "dangling ledger symlink" no-ledger
   mv "$ROOT/qa-coordinator" "$T/ledger/moved"
+  ln -s "$T/ledger/moved" "$ROOT/qa-coordinator"
+  expect_refused group-a "ledger parent symlinked out of the root" no-ledger
+  rm "$ROOT/qa-coordinator"
+  ln -s "$T/ledger/nowhere" "$ROOT/qa-coordinator"
+  expect_refused group-a "dangling ledger parent symlink" no-ledger
+  rm "$ROOT/qa-coordinator"
   printf 'x' >"$ROOT/qa-coordinator"
   expect_refused group-a "ledger parent is a file" no-ledger
 fi

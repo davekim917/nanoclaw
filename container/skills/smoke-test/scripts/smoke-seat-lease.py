@@ -85,21 +85,20 @@ def ledger_dir():
         mounted = False
     if not mounted:
         raise Refusal("no-ledger", detail="shared root {} is not a mounted filesystem".format(root))
-    real_root = os.path.realpath(root)
-    path = os.path.join(root, "qa-coordinator", "seat-leases")
-    real = os.path.realpath(path)
-    if os.path.commonpath([real_root, real]) != real_root:
-        raise Refusal("no-ledger", detail="{} resolves outside the shared root".format(path))
-    try:
-        mode = os.stat(path).st_mode
-    except FileNotFoundError:
-        return path
-    except OSError as e:
-        raise Refusal("no-ledger", detail="{}: {}".format(path, e.__class__.__name__))
-    if not (stat.S_ISDIR(mode) and os.access(path, os.R_OK | os.X_OK)):
-        raise Refusal("no-ledger", detail="{} is not a readable directory".format(path))
+    path = root
+    for part in ("qa-coordinator", "seat-leases"):
+        path = os.path.join(path, part)
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return os.path.join(root, "qa-coordinator", "seat-leases")
+        except OSError as e:
+            raise Refusal("no-ledger", detail="{}: {}".format(path, e.__class__.__name__))
+        if not stat.S_ISDIR(mode):
+            raise Refusal("no-ledger", detail="{} is not a real directory".format(path))
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise Refusal("no-ledger", detail="{} is not readable".format(path))
     return path
-
 
 def read_lease(directory, seat):
     path = os.path.join(directory, seat + ".json")
