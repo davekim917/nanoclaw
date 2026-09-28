@@ -4,6 +4,8 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  assertRepositoryName,
+  assertWorkgroupId,
   atomicJson,
   canonicalRepoDir,
   defaultTopicBranch,
@@ -1517,8 +1519,8 @@ function migrationRootForIdentity(input: {
   if (!SAFE_MIGRATION_RUN_ID.test(input.runId) || input.runId === '.' || input.runId === '..') {
     throw new Error(`invalid repository migration run id: ${input.runId}`);
   }
-  // Called for its workgroup/repository segment validation, even for archive-only migrations; the path is unused.
-  canonicalRepoDir(input.workgroupId, input.repo, input.dataDir);
+  assertWorkgroupId(input.workgroupId);
+  assertRepositoryName(input.repo);
   return path.join(input.dataDir, 'repository-migrations', input.runId, input.workgroupId, input.repo);
 }
 

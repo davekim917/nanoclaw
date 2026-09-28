@@ -375,7 +375,7 @@ async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
 /**
  * Returns the claimed incarnation, or null when the claim was lost (do not start a container). Throws on a
  * failed write. A claim held by a LIVE peer host is refused; a stopped, lease-expired or unknown holder is
- * takeover-able so a crashed claimant never wedges a session. After it, only the central lease may be awaited.
+ * takeover-able so a crashed claimant never wedges a session.
  * P2 (container fence): an untracked container still running for the session fails the claim; fails CLOSED,
  * and is a runtime call so it sits outside the transaction. P1: the peer-liveness read and the incarnation CAS
  * run in one `BEGIN IMMEDIATE` transaction so a peer's lease renewal cannot land between them.
@@ -1413,8 +1413,7 @@ async function spawnContainer(
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
   // THE CROSS-PROCESS SPAWN FENCE: winning the claim licenses touching this session's runtime state (the heartbeat
-  // clear below included). Only the central-lease acquisition awaits after it; the guard, spawn and registration run
-  // synchronously inside that callback.
+  // clear below included).
   const claimIncarnation = await claimSessionRun(session.id, containerName);
   if (claimIncarnation === null) {
     throw new Error(`session ${session.id} is claimed by another live host process — not spawning a duplicate`);
@@ -3566,8 +3565,7 @@ export async function buildMounts(
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
   }
   // Unconditional: in memory-only mode /workspace/workgroup is container-local, and the lock needs a host bind so
-  // every provider and sibling flocks the same inode. In shared-FS mode it must follow the writable parent mount,
-  // so the container cannot unlink or replace the inode.
+  // every provider and sibling flocks the same inode.
   mounts.push(...resolveWorkgroupMemoryMounts(wgId));
 
   // Nested RO mount over the RW group dir: the agent can read its config but not modify it.
