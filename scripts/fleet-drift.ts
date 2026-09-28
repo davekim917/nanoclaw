@@ -136,6 +136,7 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const ERROR_LINE_RE =
   /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})([+-]\d{2}:\d{2})?\] ERROR\b/;
+// An offset-less legacy line's true instant is unrecoverable, so its window membership is best-effort.
 export function countRecentErrorLines(content: string, nowMs: number, windowMs = 24 * 60 * 60 * 1000): number {
   let count = 0;
   for (const rawLine of content.split('\n')) {
