@@ -43,8 +43,6 @@ def iso(t):
 
 
 def parse_time(value):
-    if not isinstance(value, str) or not value:
-        raise ValueError("not a timestamp")
     t = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     if t.tzinfo is None:
         raise ValueError("timestamp has no zone")
@@ -129,7 +127,6 @@ def check(seat):
 
 def status(seat):
     directory = ledger_dir()
-    me = identity()
     if seat:
         seats = [seat]
     elif os.path.isdir(directory):
@@ -146,7 +143,7 @@ def status(seat):
             print(json.dumps({"seat": s, "state": "unleased"}))
             continue
         print(json.dumps({"seat": s, "state": "live" if live(lease) else "expired", "holder": lease["holder"],
-                          "until": iso(lease["_until"]), "mine": lease["holder"] == me}))
+                          "until": iso(lease["_until"])}))
     return 0
 
 
@@ -172,8 +169,6 @@ def write(seat, verb, to, until):
             print(json.dumps({"seat": seat, "state": "unleased", "releasedBy": me}))
             return 0
         record = {"seat": seat, "holder": to, "until": iso(until), "grantedBy": me, "at": iso(now())}
-        if verb == "transfer":
-            record["previousHolder"] = lease["holder"]
         fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + seat + ".")
         with os.fdopen(fd, "w") as f:
             json.dump(record, f)

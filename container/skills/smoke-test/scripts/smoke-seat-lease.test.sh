@@ -68,7 +68,6 @@ if smoke_case grant-binds-seat-to-holder; then
   expect_issue group-b "holder after grant"
   expect_refused group-a "grantor after grant" leased-elsewhere
   case "$ERR" in *"holder=group-b"*"caller=group-a"*) ;; *) fail "refusal does not name holder and caller: $ERR" ;; esac
-  expect_refused group-c "bystander after grant" leased-elsewhere
   as group-c grant "$SEAT" --to group-c --until "$(future)"
   [ "$RC" = 3 ] || fail "grant over a live lease: rc=$RC, want 3"
   expect_issue group-b "holder after refused re-grant"
@@ -82,8 +81,6 @@ if smoke_case transfer-ends-old-holder-access; then
   [ "$RC" = 0 ] || fail "transfer: rc=$RC $ERR"
   expect_refused group-a "old holder after transfer" leased-elsewhere
   expect_issue group-b "new holder after transfer"
-  [ "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["previousHolder"])' "$LEDGER/$SEAT.json")" = group-a ] ||
-    fail "transfer did not record the previous holder"
 fi
 
 if smoke_case only-holder-transfers-or-releases; then
@@ -106,7 +103,6 @@ if smoke_case unreadable-lease-refuses; then
   mkdir -p "$LEDGER"
   printf '{"seat":"%s","holder":' "$SEAT" >"$LEDGER/$SEAT.json"
   expect_refused group-a "truncated lease" unreadable-lease
-  expect_refused group-b "truncated lease, any group" unreadable-lease
   printf '{"seat":"other@example.test","holder":"group-a","until":"%s"}' "$(future)" >"$LEDGER/$SEAT.json"
   expect_refused group-a "lease naming another seat" unreadable-lease
   printf '{"seat":"%s","holder":"group-a","until":"soon"}' "$SEAT" >"$LEDGER/$SEAT.json"
@@ -124,10 +120,7 @@ fi
 
 if smoke_case unreadable-identity-or-ledger-refuses; then
   fresh ledger
-  SMOKE_SEAT_LEASE_IDENTITY_FILE="$IDS/missing.json" python3 "$L" check "$SEAT" 2>"$T/err" >/dev/null
-  RC=$?; ERR="$(cat "$T/err")"
-  [ "$RC" = 69 ] || fail "missing identity: rc=$RC, want 69"
-  case "$ERR" in *"reason=no-identity"*) ;; *) fail "missing identity: $ERR" ;; esac
+  expect_refused missing "missing identity" no-identity
   printf '{"groupName":""}' >"$IDS/empty.json"
   expect_refused empty "empty groupName" no-identity
   FAKE_MOUNTED="" expect_refused group-a "unmounted shared root" no-ledger

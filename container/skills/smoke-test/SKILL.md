@@ -344,11 +344,7 @@ source, or automated-test lanes until the lease is transferred explicitly.
 Never let parallel login retries extend a lockout or invalidate the live run.
 
 **A seat that one side must hold alone is leased, not announced.** A file in
-the run or a STOP note is not delivery: on 2026-09-28 a coordinator released a
-seat to the challenger by writing a release file, and the lanes owner, which
-had never read it, logged in as that seat four more times from three lanes over
-the next half hour, contaminating both sides' evidence. Lease it in the shared
-ledger instead:
+the run or a STOP note is not delivery; lease the seat in the shared ledger:
 
 ```bash
 L=/app/skills/smoke-test/scripts/smoke-seat-lease.py
