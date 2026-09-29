@@ -6,7 +6,7 @@
  * stay bound to the primary token.
  */
 import { createDiscordAdapter } from '@chat-adapter/discord';
-import { Constants, MessageType, REST, RESTJSONErrorCodes, Routes } from 'discord.js';
+import { Constants, MessageType, REST, RESTJSONErrorCodes, Routes, ThreadAutoArchiveDuration } from 'discord.js';
 
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
@@ -561,7 +561,7 @@ export async function discordCreateThread(
 ): Promise<{ threadId: string; messageId: string }> {
   const channelId = extractDiscordChannelId(platformId);
   const thread = (await rest.post(Routes.threads(channelId, parentMessageId), {
-    body: { name: title },
+    body: { name: title, auto_archive_duration: ThreadAutoArchiveDuration.OneWeek },
   })) as { id: string };
   const firstMsg = (await rest.post(Routes.channelMessages(thread.id), {
     body: { content: firstMessage },
@@ -661,7 +661,10 @@ export async function openRecoveredMentionThread(
   try {
     await rest.post(Routes.threads(channelId, message.id), {
       // Provisional: maybeRenameNewThread retitles it.
-      body: { name: discordThreadNameFrom(message.text?.replace(/<@!?\d+>/g, '')), auto_archive_duration: 1440 },
+      body: {
+        name: discordThreadNameFrom(message.text?.replace(/<@!?\d+>/g, '')),
+        auto_archive_duration: ThreadAutoArchiveDuration.OneWeek,
+      },
     });
     log.info('Discord thread opened for recovered mention', { channelId, messageId: message.id });
     // eslint-disable-next-line no-catch-all/no-catch-all -- every failure degrades to a root reply, as the adapter's does
