@@ -452,32 +452,35 @@ payload_json() {
     '{ findings: $findings, receipts: $receipts, repoRoot: $root }'
 }
 
-checkpoint_state() {
-  local pages logins login
+# Receipts and checkpoints steer the gates, so only an author with write access
+# may post one that counts; association alone admits read and triage members.
+comments_by_writers() {
+  local pages comments login writers='[]'
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  logins=$(printf '%s\n' "$pages" | jq -rs --arg re "$CHECKPOINT_MARKER_RE" --arg head "$1" '
+  comments=$(printf '%s\n' "$pages" | jq -cs '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | .author.login as $login
-      | [ (.body // "") | capture($re) ] | first // empty
-      | select(.head == $head) | { decision, login: $login } ]
-    | if any(.[]; .decision == "churning") then "churning" else [ .[] | .login // "" ] | unique | .[] end') || return 1
+      | { login: (.author.login // ""), id: .fullDatabaseId, createdAt, body } ]') || return 1
   while IFS= read -r login; do
-    [ "$login" = churning ] && break
-    if [ -n "$login" ] && may_clear "$login"; then echo converging; return 0; fi
-  done <<< "$logins"
-  echo none
+    if [ -n "$login" ] && may_clear "$login"; then
+      writers=$(jq -cn --argjson w "$writers" --arg l "$login" '$w + [$l]')
+    fi
+  done < <(printf '%s' "$comments" | jq -r '[ .[].login ] | unique | .[]')
+  printf '%s' "$comments" | jq -c --argjson w "$writers" '[ .[] | select(.login as $l | $w | index($l)) ]'
 }
 
-# PR comments from the authors receipt_outcome trusts; the classifier reads
-# which are receipts asking for changes, and counts those as rounds.
+checkpoint_state() {
+  local comments
+  comments=$(comments_by_writers) || return 1
+  printf '%s' "$comments" | jq -r --arg re "$CHECKPOINT_MARKER_RE" --arg head "$1" '
+    [ .[] | [ (.body // "") | capture($re) ] | first // empty | select(.head == $head) | .decision ] | unique
+    | if . == ["converging"] then "converging" else "none" end'
+}
+
 receipts_json() {
-  local pages
-  pages=$(paginate_connection comments receipt_comments_page) || return 1
-  printf '%s\n' "$pages" | jq -s '
-    [ .[] | .data.repository.pullRequest.comments.nodes[]
-      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | { id: .fullDatabaseId, createdAt, body } ]'
+  local comments
+  comments=$(comments_by_writers) || return 1
+  printf '%s' "$comments" | jq '[ .[] | { id, createdAt, body } ]'
 }
 
 # An override is not a private decision: it goes in the PR body where the

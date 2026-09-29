@@ -1305,10 +1305,27 @@ describe('review-churn gate beyond the import graph', () => {
     expect(decision.reported[0].reason).toBe('no finding names a file');
   });
 
-  it('keeps receipts with no comment id as separate rounds', () => {
-    const receipts = staleRounds.map((f, i) => ({
-      ...substituteReceipt(0, f.createdAt, 'changes', `- **P1 — \`${f.path}\`:** Reads a stale cached snapshot.`),
+  it('keeps receipts with no comment id as separate rounds, even within one second', () => {
+    const receipts = staleRounds.map((f) => ({
+      ...substituteReceipt(
+        0,
+        '2026-09-01T10:00:00Z',
+        'changes',
+        `- **P1 — \`${f.path}\`:** Reads a stale cached snapshot.`,
+      ),
       id: null as unknown as number,
+    }));
+    expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
+  });
+
+  it('counts an independent receipt whose verdict key is given twice as not clear', () => {
+    const receipts = staleRounds.map((f, i) => ({
+      id: 60 + i,
+      createdAt: f.createdAt,
+      body:
+        '<!-- independent-review-receipt:v1 -->\n```json\n' +
+        '{"verdict":"CHANGES","blocking_findings":1,"verdict":"CLEAR","blocking_findings":0}\n```\n' +
+        `- \`${f.path}\` reads a stale cached snapshot.\n`,
     }));
     expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
   });

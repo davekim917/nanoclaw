@@ -2528,9 +2528,9 @@ describe('codex-review risk-scoped review requests', () => {
 
   describe('past the round cap, a converging checkpoint at the head', () => {
     const capped = ['1', '2', '3'].map((c, i) => marker(c.repeat(40), i + 1));
-    function checkpoint(head: string, decision: string, authorAssociation = 'OWNER'): Page {
+    function checkpoint(head: string, decision: string, authorAssociation = 'OWNER', login = 'davekim917'): Page {
       return {
-        author: { login: 'davekim917' },
+        author: { login },
         authorAssociation,
         createdAt: '2026-09-05T04:00:00Z',
         fullDatabaseId: '1757044800',
@@ -2567,6 +2567,14 @@ describe('codex-review risk-scoped review requests', () => {
       scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging', 'MEMBER')] });
       fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
       expect(runHelper(root, ['request']).status).toBe(23);
+    });
+
+    it('ignores a churning checkpoint whose author cannot write to the repository', () => {
+      const root = tempRoot();
+      const readOnly = checkpoint(HEAD, 'churning', 'MEMBER', 'reader');
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), readOnly] });
+      fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+      expect(runHelper(root, ['request']).status).toBe(0);
     });
 
     it('still lets the churn gate refuse a recurring class', () => {
@@ -2624,7 +2632,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.posted).toContain(`head=${HEAD} round=3 -->`);
   });
 
-  it('hands the churn gate every comment from a trusted author, beside the Codex threads', () => {
+  it('hands the churn gate every comment from an author with write access, beside the Codex threads', () => {
     const root = tempRoot();
     const other = '6'.repeat(40);
     scopeFixture(root, {
@@ -2637,6 +2645,7 @@ describe('codex-review risk-scoped review requests', () => {
       ],
     });
     const payload = path.join(root, 'gate-payload.json');
+    fs.writeFileSync(path.join(root, 'permission--release-desk'), 'read\n');
 
     const result = runHelper(root, ['gate'], { MOCK_GATE_PAYLOAD: payload });
     expect(result.status).toBe(0);
@@ -2645,11 +2654,7 @@ describe('codex-review risk-scoped review requests', () => {
       receipts: { createdAt: string }[];
     };
     expect(sent.findings).toEqual([]);
-    expect(sent.receipts.map((r) => r.createdAt)).toEqual([
-      '2026-09-05T01:00:00Z',
-      '2026-09-05T03:00:00Z',
-      '2026-09-05T04:00:00Z',
-    ]);
+    expect(sent.receipts.map((r) => r.createdAt)).toEqual(['2026-09-05T01:00:00Z', '2026-09-05T04:00:00Z']);
   });
 
   it('propagates a churn-gate REFRAME from request without posting', () => {

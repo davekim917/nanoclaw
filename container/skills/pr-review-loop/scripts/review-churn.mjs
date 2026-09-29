@@ -278,6 +278,7 @@ const INDEPENDENT_RECEIPT =
 const LIST_ITEM = /^\s{0,3}(?:[-*+]|\d+[.)])\s+/;
 
 function receiptClear(json) {
+  if (!['verdict', 'blocking_findings'].every((k) => json.split(`"${k}"`).length === 2)) return false;
   try {
     const doc = JSON.parse(json);
     return doc.verdict === 'CLEAR' && doc.blocking_findings === 0;
@@ -312,7 +313,7 @@ function locate(text, files) {
   return null;
 }
 
-function receiptFindings(receipt, files) {
+function receiptFindings(receipt, files, index) {
   const body = receipt.body ?? '';
   const substitute = SUBSTITUTE_RECEIPT.exec(body);
   const independent = substitute ? null : INDEPENDENT_RECEIPT.exec(body);
@@ -325,7 +326,7 @@ function receiptFindings(receipt, files) {
   return items.map(({ text, file }) => {
     const severity = /\bP([0-9])\b/.exec(text.slice(0, 40));
     return {
-      reviewId: `receipt:${receipt.id ?? `at:${receipt.createdAt}`}`,
+      reviewId: `receipt:${receipt.id ?? `#${index}`}`,
       commentId: receipt.id,
       createdAt: receipt.createdAt,
       path: file,
@@ -345,7 +346,7 @@ function withReceiptFindings(payload) {
   const files = trackedFiles(payload);
   return {
     ...payload,
-    findings: [...(payload.findings ?? []), ...payload.receipts.flatMap((r) => receiptFindings(r, files))],
+    findings: [...(payload.findings ?? []), ...payload.receipts.flatMap((r, i) => receiptFindings(r, files, i))],
   };
 }
 
