@@ -81,6 +81,15 @@ describe('family-default effort follows the RESOLVED model, not the opus alias',
     expect(o?.effort).toBe('xhigh');
   });
 
+  it('test_sonnet_5_5_defaults_to_xhigh_by_id_and_by_family_word', () => {
+    const byId = turn({}, { groupModel: 'claude-sonnet-5-5' });
+    expect(byId?.model).toBe('claude-sonnet-5-5');
+    expect(byId?.effort).toBe('xhigh');
+    const byFamilyWord = turn({}, {}, { model: 'sonnet' });
+    expect(byFamilyWord?.model).toBe('sonnet');
+    expect(byFamilyWord?.effort).toBe('xhigh');
+  });
+
   it('test_haiku_pinned_group_sends_no_effort_at_all', () => {
     // Haiku has no effort control at the API level. The alias path sent it
     // `high` on every turn; there is no env value meaning "explicitly none",

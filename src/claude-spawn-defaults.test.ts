@@ -176,7 +176,7 @@ describe('claudeSpawnEnv', () => {
       '-e',
       `ANTHROPIC_DEFAULT_OPUS_MODEL=${DEFAULT_OPUS_MODEL}`,
       '-e',
-      'ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5',
       '-e',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001',
       '-e',
@@ -204,7 +204,7 @@ describe('claudeSpawnEnv', () => {
     expect(pairs(env)).toEqual({
       NANOCLAW_CLAUDE_MODEL: DEFAULT_OPUS_MODEL,
       ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_OPUS_MODEL,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: DEFAULT_SONNET_MODEL,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
       ANTHROPIC_DEFAULT_FABLE_MODEL: DEFAULT_FABLE_MODEL,
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '600000',
@@ -241,7 +241,7 @@ describe('claudeSpawnEnv', () => {
 
   it('claude_spawn_env_resolves_a_bare_family_alias', () => {
     const env = pairs(claudeSpawnEnv(cfg({ defaultModel: 'sonnet' })));
-    expect(env.NANOCLAW_CLAUDE_MODEL).toBe('claude-sonnet-5');
+    expect(env.NANOCLAW_CLAUDE_MODEL).toBe(DEFAULT_SONNET_MODEL);
     // ...and no effort is invented for it. The container derives Sonnet's
     // xhigh from this very id (agent-runner defaultEffortForModel).
     expect(env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();

@@ -95,7 +95,7 @@ describe('END-TO-END after the deletion', () => {
     expect(r.systemPrompt).toMatchObject({
       type: 'preset',
       preset: 'claude_code',
-      append: expect.stringContaining('provider "claude", model "claude-sonnet-5", and reasoning effort "xhigh"'),
+      append: expect.stringContaining('provider "claude", model "claude-sonnet-5-5", and reasoning effort "xhigh"'),
     });
   });
 
@@ -122,7 +122,7 @@ describe('END-TO-END after the deletion', () => {
     const r = spawn({ model: 'claude-sonnet-5' });
     expect(r.env.NANOCLAW_CLAUDE_MODEL).toBe('claude-sonnet-5');
     expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5-5[1m]');
-    expect(r.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5');
+    expect(r.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5-5');
     // ...and the group still runs the model it pinned.
     expect(r.model).toBe('claude-sonnet-5');
     expect(r.effort).toBe('xhigh');

@@ -48,6 +48,9 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   // Always 1M on the API with no [1m] variant, so no suffix.
   sonnet5: 'claude-sonnet-5',
   'sonnet-5': 'claude-sonnet-5',
+  sonnet55: 'claude-sonnet-5-5',
+  'sonnet5-5': 'claude-sonnet-5-5',
+  'sonnet-5-5': 'claude-sonnet-5-5',
   haiku45: 'claude-haiku-4-5',
   'haiku4-5': 'claude-haiku-4-5',
 };
@@ -55,7 +58,7 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
 // Single source of truth for what `opus`/`sonnet`/`haiku` mean: the spawn env (ANTHROPIC_DEFAULT_*_MODEL) and the
 // chat ack both read these. Per-channel, per-group and per-session layers override on top.
 export const DEFAULT_OPUS_MODEL = 'claude-opus-5-5[1m]';
-export const DEFAULT_SONNET_MODEL = 'claude-sonnet-5';
+export const DEFAULT_SONNET_MODEL = 'claude-sonnet-5-5';
 export const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 export const DEFAULT_FABLE_MODEL = 'claude-fable-5-1[1m]';
 
@@ -97,7 +100,7 @@ export function resolveEffectiveModel(raw: string): string {
 
 const VALID_MODEL_RE =
   // Haiku ids carry an optional date segment: DEFAULT_HAIKU_MODEL is dated, and rejecting it silently ran Opus.
-  /^(?:opus|sonnet|haiku|fable|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
+  /^(?:opus|sonnet|haiku|fable|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:-\d+)?(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
 
 /**
  * Append `[1m]` to a bare opus/fable id. Load-bearing: the CLI grants the 1M auto-compact window unconditionally
@@ -123,6 +126,7 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   'claude-haiku-4-5-20251001': new Set(),
   sonnet: new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   'claude-sonnet-5': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  'claude-sonnet-5-5': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   'claude-opus-4-6[1m]': new Set(['low', 'medium', 'high', 'max']),
   opus: new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   'claude-opus-4-7[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
