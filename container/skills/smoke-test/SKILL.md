@@ -371,47 +371,52 @@ failure or an auth finding, and never retry the login. Check the helper's exit
 status before typing its output anywhere; an empty password submitted to a
 login form reads exactly like a product auth bug and can count toward a
 lockout on the holder's seat.
-**Lane writes go through the guarded client, and the harness refuses the rest.**
+**Lane writes go through the guarded client, and the harness refuses the denied ones.**
 A prose write rule is not delivery either: lanes whose API client was copied
-forward from run to run wrote to preexisting client rows and ran tenant-wide
-jobs while the brief said "nothing else is". Lane API scripts import
-`/app/skills/smoke-test/scripts/smoke_lane_api.py` (`H(outdir, run_dir=,
-base=, seats=)`), never a harness copied from an earlier run. At intake pin the
-deployment's scope once:
+forward from run to run ran tenant-wide jobs the brief ruled out. Lane API
+scripts import `/app/skills/smoke-test/scripts/smoke_lane_api.py` (`H(outdir,
+run_dir=, base=, seats=)`), never a harness copied from an earlier run. At
+intake pin the deployment's scope once:
 
 ```bash
 python3 /app/skills/smoke-test/scripts/smoke_lane_api.py init <run-dir> --from <deployment scope file>
-python3 /app/skills/smoke-test/scripts/smoke_lane_api.py check <run-dir> POST <path> --body '<json>'   # 0 allowed, 77 refused; sends nothing
+python3 /app/skills/smoke-test/scripts/smoke_lane_api.py check <run-dir> POST <path> --tenant <seat tenant> [--body '<json>']   # 0 allowed, 77 refused; sends nothing
 ```
 
-The scope file (deployment data, never skill text) lists `tenants`, `brands`
-and `accounts` the seats may write to (empty when the seats sit in shared client
-tenants), `authPaths` (the login route) and `readOnlyPosts` (POST-as-query
-routes), both as full-match path patterns. Reads always go. A write goes only
-when it names a QA-owned target and no foreign one. Owned: an allowlisted
-account/tenant/brand in a body or query key; on a POST, a top-level
-`name`/`title`/`label`/`filename` starting `QA-<runId>-`; or a path under
-`<create path>/<id>` for a fixture the lane registered with `h.own(tag, seat,
-create_path, id, name)`, which reads `<create path>/<id>` back and ledgers it
-(`<run-dir>/write-scope-fixtures.ndjson`) only when the object read back has
-that id and exactly that name: the root when it carries an id, else the
-envelope's `data` or one wrapper; a QA-named child or mention does not count. Create responses are never parsed for ownership, so call `own` after
-a create and before editing or deleting the fixture. One backend per run, so
-the ledger keeps no origin. Foreign: any other digit-bearing path segment (only a
-leading `/v<n>/` is exempt), or an account/tenant/brand key outside the
-allowlist, whether scalar, object, null or empty. The guard cannot tell a create route from an action route, so never
-put a QA name in the body of a call that is not a create. A missing, unreadable or other-run scope refuses every write.
+The scope file (deployment data, never skill text) is a denylist:
+`"mode": "deny"`, the dev `tenants` the seats may write in, `authPaths` (login
+and token refresh) and `readOnlyPosts` (POST-as-query routes), `denyPaths`
+(full-match path patterns) and `denyPrefixes` (a path and everything below
+it). `tenants`, `denyPaths` and `denyPrefixes` are required (empty is fine),
+unknown keys are refused, and rules must be canonical (lowercase prefixes, no
+trailing or doubled slash, no percent-encoding), so a typo fails closed. Rules
+name server routes: the client's `base` path is prepended before matching.
+Reads always go. A write goes unless one of these refuses it, in this
+order: its path matches `denyPaths` or `denyPrefixes`, whatever the method;
+it is a POST on `authPaths` or `readOnlyPosts` (allowed, no tenant needed);
+its path has a tenant-wide job shape (`sync`, `publish`, `archive`,
+`refresh`, `rebuild`, `reindex`, `backfill` or `cron` anywhere in it, or
+`jobs/.../run`, `runs`, `execute` or `trigger`), which catches a new job route before anyone lists it; a
+tenant key in the body or query (`tenantId`, `tenant_id`, `tenant-id`,
+`filter[tenantId]`, ...) names a tenant outside `tenants` (null or
+empty counts as outside); or the seat's token carries no tenant claim, or one
+outside `tenants`. Paths are compared lowercased, percent-decoded and with
+empty segments dropped; dot segments are refused. An allowlist-era scope file
+(no `mode`), a missing, unreadable or other-run scope refuses every write.
+`h.own(tag, seat, create_path, id, name)` still ledgers a QA fixture it reads
+back by id and exact name (`<run-dir>/write-scope-fixtures.ndjson`), for
+cleanup; no write needs it.
 A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true` (password,
 secret and token fields and query values redacted, as in every saved call),
 logs
 `HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason=...` and raises
-`WriteScopeRefused`: record the check `blocked` with the target it needed,
-never as a product refusal, a pass or a finding. A write-refusal probe targets
-a QA-named fixture; when none can be made, the probe is blocked. The guard
-covers this client only: browser-driven writes and hand-rolled HTTP still rest
-on the brief. It stops an honest lane's mistakes, not a lane set on bypassing
-it. Request paths must be single-slash absolute paths, and redirects are
-reported (3xx), never followed.
+`WriteScopeRefused`: record the step `blocked` with the rule that denied it (it
+lands on the verdict's Untested line), never as a product refusal, a pass or a
+finding. The guard covers this client
+only: browser-driven writes and hand-rolled HTTP rest on the standing
+instructions, which must state the same denylist in words. It stops an honest
+lane's mistakes, not a lane set on bypassing it. Request paths must be
+single-slash absolute paths, and redirects are reported (3xx), never followed.
 
 Resolve the approved credential location from the deploying group's standing
 instructions and mounts before declaring auth unavailable. Never print or copy
@@ -736,11 +741,11 @@ fenced `adopt` backfills it — never read as "no pin". At intake:
    Fixtures are allocated per run **and side** (`QA-<runId>-<side>-*`), so two
    owners on one seat cannot collide, and are cleaned up after a failure too.
    Pin the write scope now (`smoke_lane_api.py init`, "Lane writes", below).
-   Every worker brief carries this sentence verbatim: "QA seats act on shared
-   client data; creating, changing or deleting objects named QA-<runId>-*, or
-   ids this run created under that name, is pre-authorized; nothing else is."
-   Say which tenants the seats sit in; never call a shared client tenant a QA
-   tenant.
+   Every worker brief carries this sentence verbatim: "QA seats act in the
+   scoped dev tenants; ordinary writes there are pre-authorized; the scope's
+   denied routes and the actions the standing instructions deny are not, and a
+   step that needs one is recorded blocked, on the Untested line." Say which tenants the seats sit
+   in; never call a shared client tenant a QA tenant.
 
 **A journey that only renders an area does not cover a changed backend
 behaviour.** For each one, name the endpoint or job and every affected web and

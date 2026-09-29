@@ -14,21 +14,24 @@ import urllib.request
 
 USAGE = """usage:
   smoke_lane_api.py init  <run-dir> --from <scope.json>
-  smoke_lane_api.py check <run-dir> <METHOD> <path> [--body <json>]"""
+  smoke_lane_api.py check <run-dir> <METHOD> <path> [--body <json>] [--tenant <seat tenant>]"""
 
 REFUSED = 77
 SCOPE_FILE = "write-scope.json"
 LEDGER_FILE = "write-scope-fixtures.ndjson"
+SCOPE_MODE = "deny"
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
-SCOPE_LISTS = ("tenants", "brands", "accounts", "authPaths", "readOnlyPosts")
-TARGET_KEYS = {
-    "accounts": {"accountid", "accountids", "account", "accounts"},
-    "tenants": {"tenantid", "tenantids", "tenant", "tenants"},
-    "brands": {"brandid", "brandids", "brand", "brands"},
-}
+SCOPE_LISTS = ("tenants", "authPaths", "readOnlyPosts", "denyPaths", "denyPrefixes")
+REQUIRED_LISTS = ("tenants", "denyPaths", "denyPrefixes")
+PINNED_KEYS = {"mode", "schemaVersion", "runId"}
+PATTERN_LISTS = ("authPaths", "readOnlyPosts", "denyPaths")
+TENANT_KEYS = {"tenantid", "tenantids", "tenant", "tenants"}
+TENANT_CLAIMS = ("tenantId", "tenant_id", "tenant")
+DENY_PATTERNS = (
+    re.compile(r"sync|publish|archive|refresh|rebuild|reindex|backfill|cron"),
+    re.compile(r"(?:^|/)jobs?/(?:[^/]+/)*(?:runs?|execute|trigger)(?:[/-]|$)"),
+)
 NAME_KEYS = {"name", "title", "label", "filename"}
-ID_SEGMENT = re.compile(r".*\d.*")
-VERSION_SEGMENT = re.compile(r"v\d{1,2}")
 PASSWORD_HELPER = "/workspace/extra/qa-seat-password.sh"
 SECRET_KEY = re.compile(r"password|secret|token", re.I)
 
@@ -49,21 +52,38 @@ def now():
 def validated_scope(raw):
     if not isinstance(raw, dict):
         raise ValueError("scope is not an object")
+    if raw.get("mode") != SCOPE_MODE:
+        raise ValueError("mode must be {!r} (an allowlist scope file is no longer accepted)".format(SCOPE_MODE))
+    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS)
+    if unknown:
+        raise ValueError("unknown keys {}".format(unknown))
     for key in SCOPE_LISTS:
+        if key in REQUIRED_LISTS and key not in raw:
+            raise ValueError("{} is required (an empty list is fine)".format(key))
         value = raw.get(key, [])
-        if not isinstance(value, list) or not all(isinstance(v, (str, int)) for v in value):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ValueError("{} must be a list of strings".format(key))
-    for key in ("authPaths", "readOnlyPosts"):
+    for key in PATTERN_LISTS:
         for pattern in raw.get(key, []):
-            re.compile(str(pattern))
-    return {key: [str(v) for v in raw.get(key, [])] for key in SCOPE_LISTS}
+            re.compile(pattern)
+            if not pattern.startswith("/") or pattern.endswith("/") or "//" in pattern or "%" in pattern:
+                raise ValueError("{} pattern {!r} is not a canonical path pattern".format(key, pattern))
+    for prefix in raw.get("denyPrefixes", []):
+        try:
+            canonical = route_of(prefix)
+        except WriteScopeRefused:
+            canonical = None
+        if prefix != canonical or canonical == "/":
+            raise ValueError("denyPrefixes entry {!r} is not a canonical path below the root".format(prefix))
+    scope = {key: [str(v) for v in raw.get(key, [])] for key in SCOPE_LISTS}
+    return dict(scope, mode=SCOPE_MODE)
 
 
 def init_scope(run_dir, source):
     run_id = os.path.basename(os.path.normpath(run_dir))
     with open(source) as f:
         scope = validated_scope(json.load(f))
-    pinned = {**scope, "schemaVersion": 1, "runId": run_id}
+    pinned = {**scope, "schemaVersion": 2, "runId": run_id}
     with open(os.path.join(run_dir, SCOPE_FILE), "x") as f:
         json.dump(pinned, f, indent=1)
     return pinned
@@ -87,20 +107,6 @@ def load_scope(run_dir):
     if raw.get("runId") != run_id:
         raise WriteScopeRefused("scope-run-mismatch scope={} run={}".format(raw.get("runId"), run_id))
     return scope
-
-
-def ledger_ids(run_dir):
-    path = os.path.join(run_dir, LEDGER_FILE)
-    if not os.path.lexists(path):
-        return set()
-    if os.path.islink(path) or not os.path.isfile(path):
-        raise WriteScopeRefused("unreadable-ledger path={}".format(path))
-    try:
-        with open(path) as f:
-            rows = [json.loads(line) for line in f if line.strip()]
-        return {"{}/{}".format(r["path"].rstrip("/"), r["id"]) for r in rows}
-    except (OSError, ValueError, KeyError) as e:
-        raise WriteScopeRefused("unreadable-ledger error={}".format(e))
 
 
 def record_fixture(run_dir, create_path, fixture_id, name):
@@ -128,46 +134,65 @@ def walk(value):
             yield from walk(item)
 
 
-def qa_name(body, prefix):
-    for key, value in (body.items() if isinstance(body, dict) else []):
-        if key.lower() in NAME_KEYS and isinstance(value, str) and value.startswith(prefix):
-            return value
+def route_of(path):
+    if not path.startswith("/") or path.startswith("//"):
+        raise WriteScopeRefused("bad-path (a request path is a single-slash absolute path)")
+    segments = [urllib.parse.unquote(s) for s in urllib.parse.urlsplit(path).path.split("/")]
+    if any(s in (".", "..") for s in segments):
+        raise WriteScopeRefused("bad-path (no dot segments)")
+    return "/" + "/".join(s for s in segments if s).lower()
+
+
+def denied(scope, route):
+    for pattern in scope["denyPaths"]:
+        if re.fullmatch(pattern, route, re.I):
+            return "denyPaths {}".format(pattern)
+    for prefix in scope["denyPrefixes"]:
+        if route == prefix or route.startswith(prefix + "/"):
+            return "denyPrefixes {}".format(prefix)
     return None
 
 
-def judge(run_dir, method, path, body=None):
+def tenant_key(key):
+    return any(part.replace("_", "").replace("-", "") in TENANT_KEYS
+               for part in re.split(r"[\[\]]", key.lower()) if part)
+
+
+def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
     method = method.upper()
-    if not path.startswith("/") or path.startswith("//"):
-        raise WriteScopeRefused("bad-path (a request path is a single-slash absolute path)")
+    route = route_of(path)
+    if base_path:
+        route = route_of(base_path.rstrip("/") + route)
     if method in READ_METHODS:
         return "read"
     scope = load_scope(run_dir)
-    parsed = urllib.parse.urlsplit(path)
-    route = parsed.path
-    if method == "POST" and any(re.fullmatch(p, route) for p in scope["authPaths"]):
+    rule = denied(scope, route)
+    if rule:
+        raise WriteScopeRefused("denied-path rule={}".format(rule))
+    if method == "POST" and any(re.fullmatch(p, route, re.I) for p in scope["authPaths"]):
         return "auth"
-    if method == "POST" and any(re.fullmatch(p, route) for p in scope["readOnlyPosts"]):
+    if method == "POST" and any(re.fullmatch(p, route, re.I) for p in scope["readOnlyPosts"]):
         return "read-only-post"
-    fixtures = ledger_ids(run_dir)
-    owned, foreign = [], []
-    segments = route.split("/")
-    for i, segment in enumerate(segments):
-        segment = urllib.parse.unquote(segment)
-        if ID_SEGMENT.fullmatch(segment) and not (i == 1 and VERSION_SEGMENT.fullmatch(segment)):
-            (owned if "/".join(segments[:i + 1]) in fixtures else foreign).append(segment)
-    pairs = list(walk(body)) + urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    for key, value in pairs:
-        norm = key.lower().replace("_", "")
-        for kind, keys in TARGET_KEYS.items():
-            if norm in keys:
-                for v in scalars(value):
-                    (owned if v in scope[kind] else foreign).append("{}={}".format(key, v))
+    shape = next((p.pattern for p in DENY_PATTERNS if p.search(route)), None)
+    if shape:
+        raise WriteScopeRefused("denied-path rule=tenant-wide-shape {}".format(shape))
+    query = urllib.parse.parse_qsl(urllib.parse.urlsplit(path).query, keep_blank_values=True)
+    foreign = ["{}={}".format(key, v) for key, value in list(walk(body)) + query
+               if tenant_key(key)
+               for v in scalars(value) if v not in scope["tenants"]]
     if foreign:
-        raise WriteScopeRefused("foreign-target targets={}".format(",".join(foreign)))
-    prefix = fixture_prefix(run_dir)
-    if not owned and not (method == "POST" and qa_name(body, prefix)):
-        raise WriteScopeRefused("no-qa-target (names no {}* object and no id this run created)".format(prefix))
+        raise WriteScopeRefused("foreign-tenant targets={}".format(",".join(foreign)))
+    if not token_tenants:
+        raise WriteScopeRefused("no-tenant (a write needs a seat token naming a scoped tenant)")
+    outside = [t for t in token_tenants if t not in scope["tenants"]]
+    if outside:
+        raise WriteScopeRefused("foreign-tenant seat-tenant={}".format(",".join(outside)))
     return "write"
+
+
+def seat_tenants(token):
+    c = claims(token) if token else {}
+    return [v for k in TENANT_CLAIMS if k in c for v in scalars(c[k])]
 
 
 def names_itself(response, fixture_id, name):
@@ -202,7 +227,7 @@ def claims(token):
         part = token.split(".")[1]
         part += "=" * (-len(part) % 4)
         c = json.loads(base64.urlsafe_b64decode(part))
-        return {k: c[k] for k in ("sub", "userId", "id", "role", "tenantId", "tenant", "isAdmin") if k in c}
+        return {k: c[k] for k in ("sub", "userId", "id", "role", "isAdmin") + TENANT_CLAIMS if k in c}
     except (IndexError, ValueError):
         return {}
 
@@ -230,9 +255,9 @@ class H:
             now(), tag, seat, method, sanitized(path), error))
         raise error
 
-    def guarded(self, tag, seat, method, path, body):
+    def guarded(self, tag, seat, method, path, body, tok=None):
         try:
-            judge(self.run_dir, method, path, body)
+            judge(self.run_dir, method, path, body, seat_tenants(tok), urllib.parse.urlsplit(self.base).path)
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)
 
@@ -249,7 +274,7 @@ class H:
         self.emit("{} [{}] {} OWN {} -> ledgered as {}".format(now(), tag, seat, path, name))
 
     def req(self, method, path, tok=None, body=None, tag="req", seat="-"):
-        self.guarded(tag, seat, method, path, body)
+        self.guarded(tag, seat, method, path, body, tok)
         data = json.dumps(body).encode() if body is not None else None
         r = urllib.request.Request(self.base + path, data=data, method=method)
         if tok:
@@ -319,10 +344,13 @@ def main(argv):
             print("init: {}".format(e), file=sys.stderr)
             return 2
         return 0
-    if len(argv) in (5, 7) and argv[1] == "check" and (len(argv) == 5 or argv[5] == "--body"):
-        body = json.loads(argv[6]) if len(argv) == 7 else None
+    flags = dict(zip(argv[5::2], argv[6::2]))
+    if (len(argv) >= 5 and argv[1] == "check" and len(argv) % 2 == 1
+            and set(flags) <= {"--body", "--tenant"} and len(flags) == (len(argv) - 5) // 2):
+        body = json.loads(flags["--body"]) if "--body" in flags else None
+        tenants = [flags["--tenant"]] if "--tenant" in flags else []
         try:
-            print(judge(argv[2], argv[3], argv[4], body))
+            print(judge(argv[2], argv[3], argv[4], body, tenants))
         except WriteScopeRefused as e:
             print("WRITE_SCOPE_REFUSED reason={}".format(e), file=sys.stderr)
             return REFUSED
