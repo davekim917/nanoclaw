@@ -307,7 +307,6 @@ function locate(text, files) {
       const tail = parts.slice(i).join('/');
       const hits = [...files].filter((f) => f === tail || f.endsWith(`/${tail}`));
       if (hits.length === 1) return hits[0];
-      if (hits.length > 1) break;
     }
   }
   return null;
