@@ -3,7 +3,8 @@ import { randomBytes } from 'crypto';
 
 import type { SecretIntakeHooks } from '../../channels/adapter.js';
 import { TIMEZONE } from '../../config.js';
-import { withCentralSync } from '../../db/central-lease.js';
+import { withCentralSync, withRawDb } from '../../db/central-lease.js';
+import { readContainerConfig } from '../../container-config.js';
 import { addWorkgroupOnecliSecret, getAgentGroup, workgroupExists } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
@@ -16,10 +17,12 @@ import {
   updateOnecliSecretValue,
   type OnecliInjectionSpec,
 } from '../../onecli-secret-writer.js';
-import { isSlackChannelType } from '../../router.js';
+import { isDiscordChannelType, isSlackChannelType } from '../../router.js';
 import { formatLocalTime } from '../../timezone.js';
+import type { AgentGroup } from '../../types.js';
 import { notifyAgent, pickApprovalDelivery, pickOwnersFirst } from '../approvals/primitive.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
+import { isOwnerSafeSlackSession } from '../permissions/slack-user-token-gate.js';
 import { getUser } from '../permissions/db/users.js';
 import { resolveUserChannelType } from '../permissions/user-dm.js';
 
@@ -380,6 +383,15 @@ async function grantTargets(
   return { groups, workgroups };
 }
 
+/** A rotation only an owner can fill goes into the thread only where the operator already judged an owner present. */
+async function ownerSafeConversation(group: AgentGroup, messagingGroupId: string): Promise<boolean> {
+  const alsoAllowedIn = readContainerConfig(group.folder).slack_user_token?.also_allowed_in;
+  return withCentralSync(
+    () => withRawDb((db) => isOwnerSafeSlackSession(db, group.id, messagingGroupId, alsoAllowedIn)),
+    'secret intake owner-safe check',
+  );
+}
+
 export async function startSecretIntake(input: StartSecretIntakeInput): Promise<SecretIntakeView> {
   const now = Date.now();
   prune(now);
@@ -410,7 +422,13 @@ export async function startSecretIntake(input: StartSecretIntakeInput): Promise<
   const originMg = session?.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
   let card: Intake['card'];
   let deliveredTo: string;
-  if (originMg && session && isSlackChannelType(originMg.channel_type) && callerGroup && !input.rotate) {
+  const formInThread =
+    originMg &&
+    session &&
+    callerGroup &&
+    (isSlackChannelType(originMg.channel_type) || isDiscordChannelType(originMg.channel_type)) &&
+    (!input.rotate || (await ownerSafeConversation(callerGroup, originMg.id)));
+  if (formInThread) {
     card = {
       channelType: originMg.channel_type,
       platformId: originMg.platform_id,
@@ -533,7 +551,12 @@ export function getSecretIntake(intakeId: string): SecretIntakeView | undefined 
 
 async function editCard(intake: Intake, text: string): Promise<void> {
   if (!intake.card.messageId) return;
-  await deliverToCard(intake, 'chat-sdk', { operation: 'edit', messageId: intake.card.messageId, text });
+  await deliverToCard(intake, 'chat-sdk', {
+    operation: 'edit',
+    messageId: intake.card.messageId,
+    text,
+    clearActions: true,
+  });
 }
 
 async function deliverToCard(intake: Intake, kind: string, content: Record<string, unknown>): Promise<void> {

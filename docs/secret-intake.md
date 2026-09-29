@@ -1,7 +1,8 @@
 # Secret intake
 
 Adding or rotating an API key without the key passing through chat, a session DB, a log or argv. The agent
-(or the operator's shell) handles every part except the value itself; an owner enters the value in a Slack form.
+(or the operator's shell) handles every part except the value itself; a person enters the value in a Slack or
+Discord form.
 
 ```
 ncl secrets intake --name <n> --host-pattern <api-host> [--header <h>] [--value-format '<fmt with {value}>']
@@ -19,9 +20,14 @@ ncl secrets grant --name <n> [--groups <ids>] [--workgroups <ids>]
    was asked from; a host request, or an agent session with no conversation, goes to the first reachable owner
    or global admin DM (`pickOwnersFirst` → `pickApprovalDelivery`). The card states who asked, the host the key
    will be sent to, who gets it, and who may enter it. The call returns at once with an intake id.
-2. The card's button (`ncs:<intakeId>`) opens a Slack modal, private to whoever clicked it: others in the channel
+2. The card's button (`ncs:<intakeId>`) opens a modal, private to whoever clicked it: others in the channel
    see the card, never the value. Opening refuses a clicker with no authority when the central DB lease answers
-   within a second, and otherwise lets the click through; nothing waits past Slack's 3-second trigger window.
+   within a second, and otherwise lets the click through; nothing waits past the platform's 3-second window.
+   Slack goes through the Chat SDK's `openModal`. The Discord adapter has no modals, so the bridge answers the
+   forwarded button interaction itself with a modal (`handleDiscordSecretIntake`), and answers the modal submit
+   with a private (ephemeral) reply. Both skip the forwarded-event queue, which could otherwise hold them past
+   the window. A Discord modal cannot mark a field invalid, so a refused submit says why privately and the
+   person clicks the button again.
 3. Submit validates each field (non-empty, no whitespace), claims the intake and closes the modal. Only then does the host
    check authority (below); a refused submit stores nothing, returns the intake to pending, and says why in
    the card's conversation. The vault write and grants follow: `POST /api/secrets` for a new secret, `PATCH` of the
@@ -68,9 +74,14 @@ Every store by a group admin sends an owner a DM, right after the vault write an
 naming who, which secret, the host and the grants — never the value. A failed notice is logged at error. A key
 a group admin stores for their workgroup is used by every agent in it.
 
-A card goes into the requesting thread only for an agent's new secret on Slack, the one platform whose adapter
-opens the form. A rotation (which only an owner can fill), a host request, and any other origin get it in the
-first owner or global admin with a Slack DM.
+An agent's new-secret request goes into its own thread on Slack or Discord, the platforms that open the form.
+A rotation, which only an owner can fill, goes into that thread only when the conversation is already judged
+the owner's own: their DM with the agent, or a messaging group listed in the group's
+`slack_user_token.also_allowed_in` (`isOwnerSafeSlackSession`, the same judgement that decides where the owner's
+Slack token is injected). The host cannot tell which person's message led the agent to ask, so it relies on
+that operator-curated judgement rather than guessing. Every other rotation, a host request, and any other
+origin get the card in the first owner or global admin with a Slack DM. On Discord a finished card's edit also
+clears its button (`clearActions`), since a Discord text edit otherwise keeps the components.
 
 ## What to check on the card
 

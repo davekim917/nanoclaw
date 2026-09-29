@@ -93,8 +93,10 @@ request. If the retry still fails, ask if they need help with the setup.
 
 When a service needs a key the vault lacks, or the user wants to add or
 rotate one, run `ncl secrets intake` (`ncl secrets help intake` for flags).
-It posts a form into this conversation for an owner or an admin of your group
-to fill in; the value typed there goes straight to
+It posts a form into this conversation (Slack or Discord; anywhere else, an
+owner's Slack DM) for an owner or an admin of your group to fill in. A
+rotation goes to an owner's DM unless this is the owner's own conversation
+with you. The value typed there goes straight to
 the vault, and you are told when it is stored. Name the API host exactly
 with `--host-pattern`: the gateway sends the key only there. For a
 credential in parts, declare each secret part with `--field 'name|Label'`:
