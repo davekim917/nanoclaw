@@ -163,6 +163,7 @@ SETTLE_INTERVAL_MS=400
 FREEZE_JS='(function(){var i="smoke-contact-sheet-freeze";if(!document.getElementById(i)){var s=document.createElement("style");s.id=i;s.textContent="*,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;animation-iteration-count:1!important;transition-duration:0s!important;transition-delay:0s!important;scroll-behavior:auto!important;caret-color:transparent!important}";document.documentElement.appendChild(s)}return "frozen"})()'
 
 die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
+. "$SCRIPT_DIR/smoke-run-path.sh"
 
 RUN_DIR="${1:-}"
 BASE_URL="${2:-}"
@@ -196,12 +197,12 @@ fi
 # (no existence requirement) since a test double or a host without
 # /workspace/workgroup must still compare correctly.
 WORKGROUP_ROOT="${SMOKE_WORKGROUP_ROOT:-/workspace/workgroup}"
-RUN_DIR_RESOLVED="$(realpath -e "$RUN_DIR")"
-WORKGROUP_ROOT_RESOLVED="$(realpath -m "$WORKGROUP_ROOT")"
+capture_exact RUN_DIR_RESOLVED realpath -e -- "$RUN_DIR"
+capture_exact WORKGROUP_ROOT_RESOLVED realpath -m -- "$WORKGROUP_ROOT"
 
 refuse_shared_auth() {
   local resolved
-  resolved="$(realpath -e "$1")"
+  capture_exact resolved realpath -e -- "$1"
   case "$resolved" in
     "$RUN_DIR_RESOLVED"|"$RUN_DIR_RESOLVED"/*)
       die "auth state must not live inside the run dir (shared, readable evidence tree): $1"

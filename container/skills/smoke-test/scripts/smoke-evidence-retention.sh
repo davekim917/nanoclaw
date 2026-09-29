@@ -211,12 +211,12 @@ OLDEST_RUN=""
 NEWEST_AGE=999999999
 NEWEST_RUN=""
 
-while IFS= read -r run_dir; do
-  [ -n "$run_dir" ] || continue
-  run_id="$(basename "$run_dir")"
+while IFS= read -r -d '' run_dir; do
+  run_id="${run_dir##*/}"
   SCANNED=$((SCANNED + 1))
 
-  if is_protected "$run_id"; then
+  # The one-id-per-line protection set cannot name a run holding a newline.
+  if [[ $run_id == *$'\n'* ]] || is_protected "$run_id"; then
     PROTECTED_COUNT=$((PROTECTED_COUNT + 1))
     continue
   fi
@@ -229,12 +229,11 @@ while IFS= read -r run_dir; do
   fi
 
   MEDIA_LIST="$TMP_DIR/media-$SCANNED.txt"
-  find "$run_dir" -type f \( "${FIND_EXPR[@]}" \) > "$MEDIA_LIST" 2>/dev/null
-  file_count="$(wc -l < "$MEDIA_LIST" | tr -d ' ')"
+  find "$run_dir" -type f \( "${FIND_EXPR[@]}" \) -print0 > "$MEDIA_LIST" 2>/dev/null
+  file_count="$(tr -cd '\0' < "$MEDIA_LIST" | wc -c | tr -d ' ')"
   byte_total=0
   if [ "$file_count" -gt 0 ]; then
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
+    while IFS= read -r -d '' f; do
       sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
       byte_total=$((byte_total + sz))
     done < "$MEDIA_LIST"
@@ -247,7 +246,7 @@ while IFS= read -r run_dir; do
 
   if [ "$DELETE" = true ]; then
     if [ "$file_count" -gt 0 ]; then
-      xargs -r rm -f -- < "$MEDIA_LIST"
+      xargs -0 -r rm -f -- < "$MEDIA_LIST"
     fi
     if [ "$will_remove_whole_run" = true ]; then
       rm -rf -- "$run_dir"
@@ -274,7 +273,7 @@ while IFS= read -r run_dir; do
     if [ "$age_days" -gt "$OLDEST_AGE" ]; then OLDEST_AGE="$age_days"; OLDEST_RUN="$run_id"; fi
     if [ "$age_days" -lt "$NEWEST_AGE" ]; then NEWEST_AGE="$age_days"; NEWEST_RUN="$run_id"; fi
   fi
-done < <(find "$RUN_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+done < <(find "$RUN_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
 
 jq -cn \
   --argjson ok true \

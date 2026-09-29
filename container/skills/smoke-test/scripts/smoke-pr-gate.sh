@@ -27,6 +27,7 @@ for _a in "$@"; do
 done
 set -- ${_ARGS[@]+"${_ARGS[@]}"}; GATE_VERB="${1:-poll}"; . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-pr-gate-observe.sh"
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-run-path.sh"
 
 REPO="${SMOKE_GATE_REPO:-}"
 BRANCH="${SMOKE_GATE_BRANCH:-develop}"
@@ -220,11 +221,6 @@ num_env LOCK_WAIT SMOKE_GATE_LOCK_WAIT_SECONDS 15
 # the gate cannot rely on writing.
 run_dir()          { printf '%s/runs/%s' "$STATE_DIR" "$1"; }
 run_verdict_file() { printf '%s/runs/%s/verdict.json' "$STATE_DIR" "$1"; }
-
-# Run ids reach the gate from a caller (`claim` takes an arbitrary one) and are
-# used as PATH components below, so they are constrained here rather than
-# trusted. Rejects `..`, `/`, and anything that would escape the state dir.
-run_id_ok() { printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._-]{1,200}$' && [ "${1:-}" != ".." ]; }
 
 # The canonical verdict payload. Key ORDER is part of the contract — jq emits
 # in insertion order, so two invocations reasoning about the same terminal

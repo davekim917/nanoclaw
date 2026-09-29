@@ -932,4 +932,11 @@ jq -e '.status == "fail"' "$IDENT/markers/B1.json" >/dev/null   # the evidence s
 SMOKE_GATE_OWNER=owner-successor barrier "$IDENT" lanes | jq -e '.ready == true' >/dev/null
 gate_owns "$(basename "$FIXTURE_DIR")"
 
+NL_RUN="$FIXTURE_DIR"$'\n'; mkdir -p "$NL_RUN"
+OUT="$(scaffold contract "$NL_RUN" "$SHA" B1:browser 2>&1 || true)"
+jq -e '.ok == false and (.error | test("not a run id"))' <<<"$OUT" >/dev/null || {
+  echo "expected a run dir ending in a newline to be refused, not fenced as its sibling, got: $OUT" >&2; exit 1; }
+[ ! -e "$NL_RUN/completion-contract.json" ] || { echo "a contract was written for a run the gate never claimed" >&2; exit 1; }
+rm -rf "$NL_RUN"
+
 echo "smoke run scaffold tests passed"
