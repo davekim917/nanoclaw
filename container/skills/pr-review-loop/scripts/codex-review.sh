@@ -390,7 +390,7 @@ status_observation() {
 
 # A round is a head any reviewer reviewed. Cut-down receipts are not rounds: that
 # pass only deletes and is mandatory above CUT_DOWN_THRESHOLD. Comments count only
-# from the authors receipt_outcome trusts, so an outsider cannot run a PR into the cap.
+# from the authors receipt_outcome trusts; reviews trust the connector login prefix.
 review_rounds_of() {
   printf '%s\n%s\n' "$1" "$2" | jq -rs --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" \
     --arg requestRe "$REQUEST_MARKER_RE" --arg receiptRe "$RECEIPT_MARKER_RE" \
