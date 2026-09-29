@@ -124,10 +124,6 @@ function gate(payload: Payload, env: Record<string, string> = {}) {
   return { status: out.status, decision: JSON.parse(out.stdout) as Decision, text: out.stderr };
 }
 
-/**
- * A class gated on where its sites are. No import is substantiated there, so
- * the refusal names no primitive — never the module the classifier guessed.
- */
 function expectPlaceGate(payload: Payload, place: string) {
   const { status, decision } = gate(payload);
   expect(status).toBe(3);
@@ -137,7 +133,6 @@ function expectPlaceGate(payload: Payload, place: string) {
   return decision;
 }
 
-/** The same findings with no file named, which no place can hold. */
 function withoutPaths(payload: Payload): Payload {
   return { ...payload, findings: (payload.findings as object[]).map((f) => ({ ...f, path: null })) };
 }
@@ -533,8 +528,6 @@ describe('review-churn gate', () => {
   });
 
   it('gates a guessed seam on its place, never naming the guessed module', () => {
-    // Naming the guess would refuse with a primitive the fix has no reason to
-    // touch, leaving the override as the only way past.
     const decision = expectPlaceGate(fixture('guessed-seam'), 'src/');
     expect(decision.unlifted[0].key).toBe('inv:race @ src/');
     expect(decision.report.classes[0].seam).toBe('src/db/messages-out.ts');
@@ -1195,8 +1188,6 @@ describe('review-churn gate beyond the import graph', () => {
   });
 
   it('does not gate a directory whose rounds share no invariant', () => {
-    // A PR draws unrelated findings wherever it changes code; three rounds of
-    // them in one directory are review, not churn.
     const findings = [
       codexFinding('PRR_D1', 'tools/ingest/loader.py', 'Handle a null batch id', '2026-09-01T10:00:00Z'),
       codexFinding(
@@ -1239,8 +1230,6 @@ describe('review-churn gate beyond the import graph', () => {
   });
 
   it('counts findings from substitute receipts that asked for changes', () => {
-    // Paths as receipts write them: an absolute path into the reviewer's
-    // worktree, a partial path, and a bare filename.
     const receipts = [
       substituteReceipt(
         11,
@@ -1354,8 +1343,6 @@ describe('review-churn gate beyond the import graph', () => {
   });
 
   it('never refuses on how many receipts there are, only on a recurring class', () => {
-    // Receipts are rounds for the classifier, not a round budget: five
-    // reviewers asking for five unrelated changes is not churn.
     const titles = [
       'Handle a null batch id',
       'Retry without writing duplicates',

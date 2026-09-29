@@ -29,8 +29,6 @@
 #                                             # post a substitute review's receipt for exactly that head — --reviewer
 #                                             # must start with a frontier model id (see REVIEWER_DENIED_TIERS)
 #   codex-review.sh checkpoint --head <sha> --decision converging|churning --assessor "<model + runtime>" --assessment "<one line>"
-#                                             # a fresh-context assessor's verdict at the round cap; past the cap,
-#                                             # request asks Codex again only on a converging one for that head
 #   codex-review.sh cut-down                  # does the current head need a cut-down receipt, and has one: 0 yes/no need, 24 missing
 #   codex-review.sh cut-down-receipt --head <sha> --reviewed <sha> --reviewer "<model> cut-down-reviewer (<runtime>)" --body-file <file>
 #
@@ -452,8 +450,6 @@ payload_json() {
     '{ findings: $findings, receipts: $receipts, repoRoot: $root }'
 }
 
-# Receipts and checkpoints steer the gates, so only an author with write access
-# may post one that counts; association alone admits read and triage members.
 comments_by_writers() {
   local pages comments login permission writers='[]'
   pages=$(paginate_connection comments receipt_comments_page) || return 1
