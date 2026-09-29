@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import http.server
 import importlib
 import json
@@ -16,8 +17,16 @@ api = importlib.import_module("smoke_lane_api")
 
 RUN_ID = "acme-pr-pr7-0123456789ab-20260101T000000Z"
 PREFIX = "QA-{}-".format(RUN_ID)
-SCOPE = {"tenants": [], "brands": [], "accounts": [],
-         "authPaths": ["/users/login"], "readOnlyPosts": ["/widgets/search"]}
+SCOPE = {"mode": "deny", "tenants": ["sandbox", "playground"],
+         "authPaths": ["/users/login", "/users/refresh"], "readOnlyPosts": ["/widgets/search"],
+         "denyPaths": ["/ledger/close", "/widgets/[^/]+/broadcast"], "denyPrefixes": ["/media", "/profile/photo/"]}
+SEAT_TENANTS = {"m@example.test": {"tenantId": "sandbox"}, "g@example.test": {"tenantId": "globex"},
+                "n@example.test": {"sub": "9"}, "w@example.test": {"tenantId": "sandbox", "tenant_id": "globex"}}
+
+
+def token_for(claims):
+    raw = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return "h.{}.s".format(raw)
 
 
 class Backend(http.server.BaseHTTPRequestHandler):
@@ -38,7 +47,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.path.startswith("/users/login"):
-            out = {"access_token": "h.eyJzdWIiOiAiMSJ9.s"}
+            out = {"access_token": token_for(SEAT_TENANTS[(body or {}).get("email")])}
         elif self.command == "POST":
             new_id = "fx-{}".format(900 + len(Backend.store))
             Backend.store["{}/{}".format(self.path, new_id)] = dict(body or {}, id=new_id)
@@ -87,14 +96,25 @@ class Guard(unittest.TestCase):
             json.dump(SCOPE if scope is None else scope, f)
         return api.init_scope(self.run_dir, src)
 
-    def client(self):
-        return api.H(os.path.join(self.run_dir, "lanes", "l1"), run_dir=self.run_dir, base=self.base,
-                     seats={"M": "m@example.test", "X": "held@example.test"}, password_helper=self.helper)
+    def client(self, *login):
+        h = api.H(os.path.join(self.run_dir, "lanes", "l1"), run_dir=self.run_dir, base=self.base,
+                  seats={"M": "m@example.test", "X": "held@example.test", "G": "g@example.test",
+                         "N": "n@example.test", "W": "w@example.test"}, password_helper=self.helper)
+        for seat in login:
+            h.login(seat)
+        return h
 
-    def assert_blocked(self, h, tag, method, path, body, reason):
+    def ledger(self):
+        path = os.path.join(self.run_dir, api.LEDGER_FILE)
+        if not os.path.exists(path):
+            return set()
+        with open(path) as f:
+            return {"{}/{}".format(r["path"], r["id"]) for r in map(json.loads, f)}
+
+    def assert_blocked(self, h, tag, method, path, body, reason, seat="M"):
         before = len(Backend.seen)
         with self.assertRaises(api.WriteScopeRefused) as ctx:
-            h.call(tag, "M", method, path, body)
+            h.call(tag, seat, method, path, body)
         self.assertIn(reason, str(ctx.exception))
         self.assertEqual(len(Backend.seen), before, "a refused write must send nothing")
         with open(os.path.join(h.out, tag + ".json")) as f:
@@ -103,7 +123,13 @@ class Guard(unittest.TestCase):
         self.assertEqual(rec["refusal"], "WRITE_SCOPE_REFUSED")
         self.assertNotIn("status", rec, "a refusal must never look like a product response")
         with open(os.path.join(h.out, "00-timeline.txt")) as f:
-            self.assertIn("[{}] M {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED".format(tag, method, path), f.read())
+            self.assertIn("[{}] {} {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED".format(tag, seat, method, path), f.read())
+
+    def assert_sent(self, h, tag, method, path, body=None, seat="M"):
+        before = len(Backend.seen)
+        code, _ = h.call(tag, seat, method, path, body)
+        self.assertIn(code, (200, 201))
+        self.assertEqual(len(Backend.seen), before + 1)
 
     def test_no_scope_refuses_writes_but_not_reads(self):
         h = self.client()
@@ -145,32 +171,79 @@ class Guard(unittest.TestCase):
             self.client().login("X")
         self.assertEqual(Backend.seen, [])
 
-    def test_foreign_and_targetless_writes_refused(self):
+    def test_ordinary_writes_in_a_scoped_tenant_go(self):
         self.pin()
+        h = self.client("M")
+        self.assert_sent(h, "o1", "POST", "/notes", {"body": "any note"})
+        self.assert_sent(h, "o2", "PATCH", "/cards/4402", {"stage": "b"})
+        self.assert_sent(h, "o3", "DELETE", "/users/4401")
+        self.assert_sent(h, "o4", "PUT", "/widgets/7/settings", {"tenantId": "sandbox"})
+        self.assert_sent(h, "o5", "POST", "/jobs", {"kind": "one-off"})
+        self.assert_sent(h, "o6", "POST", "/mediakit/items", {"k": 1})
+        self.assertEqual(self.ledger(), set(), "writes never ledger on their own")
+
+    def test_deny_paths_refused_whatever_the_spelling(self):
+        self.pin()
+        h = self.client("M")
+        for i, path in enumerate(("/ledger/close", "/Ledger/CLOSE", "/ledger/close/", "/ledger//close",
+                                  "/ledger/%63lose", "/ledger/close?dryRun=false", "/widgets/9/broadcast")):
+            self.assert_blocked(h, "d%d" % i, "POST", path, {"k": 1}, "denied-path rule=denyPaths")
+        self.assert_blocked(h, "d-del", "DELETE", "/ledger/close", None, "denied-path")
+        self.assert_blocked(h, "d-dot", "POST", "/ledger/x/../close", None, "bad-path")
+        self.assert_sent(h, "d-near", "POST", "/ledger/close-preview", {"k": 1})
+
+    def test_deny_prefixes_refuse_every_write_method_but_not_reads(self):
+        self.pin()
+        h = self.client("M")
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            for path in ("/media", "/media/5", "/MEDIA/5/thumb/", "/profile/photo/upload"):
+                self.assert_blocked(h, "p-{}-{}".format(method, len(Backend.seen)) + path.replace("/", "_"),
+                                    method, path, {"k": 1}, "denied-path rule=denyPrefixes")
+        self.assert_sent(h, "p-get", "GET", "/media/5")
+        self.assert_sent(h, "p-sibling", "PATCH", "/profile/settings", {"k": 1})
+        self.assert_sent(h, "p-seg", "POST", "/media-library", {"k": 1})
+
+    def test_a_new_tenant_wide_route_is_refused_by_shape(self):
+        self.pin()
+        h = self.client("M")
+        for i, path in enumerate(("/forecasts/nightly-resync", "/catalog/Rebuild", "/orders/archive",
+                                  "/stats/reindex/all", "/history/backfill", "/admin/cron/trigger",
+                                  "/budget/publishDraft", "/reports/jobs/run", "/imports/jobs/77/run",
+                                  "/cache/refresh-all")):
+            self.assertFalse(api.denied(api.load_scope(self.run_dir), api.route_of(path)), "not an exact rule")
+            self.assert_blocked(h, "s%d" % i, "POST", path, {"k": 1}, "tenant-wide-shape")
+        self.assert_blocked(h, "s-patch", "PATCH", "/users/refresh", {"k": 1}, "tenant-wide-shape")
+        self.assert_sent(h, "s-auth", "POST", "/users/refresh", {"k": 1})
+        self.assert_sent(h, "s-runner", "POST", "/runners/7/rerun-notes", {"k": 1})
+
+    def test_explicit_deny_beats_exemptions(self):
+        self.pin(dict(SCOPE, readOnlyPosts=["/media/search"], authPaths=["/ledger/close"]))
         h = self.client()
-        self.assert_blocked(h, "w1", "POST", "/audits/jobs", {"accountId": "4401", "kind": "x"}, "foreign-target")
-        self.assert_blocked(h, "w2", "PATCH", "/cards/4402", {"stage": "b"}, "foreign-target")
-        self.assert_blocked(h, "w4", "POST", "/sync/run", {"module": "all"}, "no-qa-target")
-        self.assert_blocked(h, "w5", "POST", "/notes?tenant=globex", {"title": PREFIX + "n"}, "foreign-target")
-        self.assert_blocked(h, "w6", "POST", "/notes", {"title": PREFIX + "n", "brand_id": 3}, "foreign-target")
-        self.assert_blocked(h, "w7", "POST", "/notes", {"title": "QA-other-run-n"}, "no-qa-target")
-        self.assert_blocked(h, "w8", "POST", "/budget/save", {"meta": {"name": PREFIX + "n"}}, "no-qa-target")
-        self.assert_blocked(h, "w9", "PATCH", "/notes", {"name": PREFIX + "n"}, "no-qa-target")
-        self.assert_blocked(h, "w10", "POST", "/notes", {"name": PREFIX + "n", "account": {"id": 4401}}, "foreign-target")
-        self.assert_blocked(h, "w11", "POST", "/notes", {"name": PREFIX + "n", "accounts": [{"ref": 1}]}, "foreign-target")
-        self.assert_blocked(h, "w12", "POST", "/notes?accountId=", {"name": PREFIX + "n"}, "foreign-target")
-        for i, empty in enumerate((None, [], [None])):
-            self.assert_blocked(h, "w12e%d" % i, "POST", "/notes", {"name": PREFIX + "n", "accountId": empty}, "foreign-target")
-        self.assert_blocked(h, "w13", "POST", "/reports/v12", {"name": PREFIX + "n"}, "foreign-target")
-        self.assert_blocked(h, "w13b", "POST", "/v4401/notes", {"name": PREFIX + "n"}, "foreign-target")
-        self.assertEqual(h.call("w14", "M", "POST", "/v1/notes", {"name": PREFIX + "n"})[0], 201)
+        self.assert_blocked(h, "e1", "POST", "/media/search", {"q": 1}, "denyPrefixes")
+        self.assert_blocked(h, "e2", "POST", "/ledger/close", None, "denyPaths")
+
+    def test_writes_outside_the_scoped_tenants_refused(self):
+        self.pin()
+        h = self.client("M", "G", "N", "W")
+        self.assert_blocked(h, "t1", "POST", "/notes", {"k": 1}, "foreign-tenant seat-tenant=globex", seat="G")
+        self.assert_blocked(h, "t2", "POST", "/notes", {"k": 1}, "foreign-tenant seat-tenant=globex", seat="W")
+        self.assert_blocked(h, "t3", "POST", "/notes", {"k": 1}, "no-tenant", seat="N")
+        self.assert_blocked(h, "t4", "POST", "/notes", {"k": 1}, "no-tenant", seat="X")
+        self.assert_blocked(h, "t5", "POST", "/notes", {"tenantId": "globex"}, "foreign-tenant targets=tenantId=globex")
+        self.assert_blocked(h, "t6", "POST", "/notes?tenant=globex", {"k": 1}, "foreign-tenant")
+        self.assert_blocked(h, "t7", "POST", "/notes", {"meta": {"tenant_id": "globex"}}, "foreign-tenant")
+        for i, empty in enumerate((None, [], [None], "")):
+            self.assert_blocked(h, "t8e%d" % i, "POST", "/notes", {"tenantId": empty}, "foreign-tenant")
+        self.assert_blocked(h, "t9", "POST", "/notes", {"tenants": ["sandbox", "globex"]}, "foreign-tenant")
+        self.assert_sent(h, "t10", "POST", "/notes", {"tenants": ["sandbox", "playground"]})
+        self.assertEqual(h.call("t11", "G", "GET", "/notes")[0], 200, "reads go from any seat")
         before = len(Backend.seen)
         with self.assertRaises(api.WriteScopeRefused):
             h.req("DELETE", "/users/4401")
         self.assertEqual(len(Backend.seen), before, "the client's own send method is guarded too")
-        self.assert_blocked(h, "w15", "POST", "//4401/cards", {"name": PREFIX + "n"}, "bad-path")
+        self.assert_blocked(h, "t12", "POST", "//4401/cards", {"k": 1}, "bad-path")
         with self.assertRaises(api.WriteScopeRefused):
-            h.call("w16", "M", "GET", "relative/path")
+            h.call("t13", "M", "GET", "relative/path")
         self.assertEqual(len(Backend.seen), before, "a malformed path is refused even for a read")
 
     def test_redirects_are_not_followed(self):
@@ -183,28 +256,23 @@ class Guard(unittest.TestCase):
         self.pin()
         h = self.client()
         self.assertEqual(h.call("q1", "M", "POST", "/widgets/search", {"markets": ["M1"]})[0], 201)
-        self.assert_blocked(h, "q2", "POST", "/widgets/search/save", {"markets": ["M1"]}, "no-qa-target")
+        self.assert_blocked(h, "q2", "POST", "/widgets/search/save", {"markets": ["M1"]}, "no-tenant")
 
-    def test_ownership_needs_a_verified_readback(self):
+    def test_own_ledgers_only_a_verified_readback(self):
         self.pin()
-        h = self.client()
+        h = self.client("M")
         name = PREFIX + "coord-r1"
         code, js = h.call("c1", "M", "POST", "/reports", {"name": name, "segmentId": 81})
         self.assertEqual(code, 201)
-        self.assertEqual(api.ledger_ids(self.run_dir), set(), "a create response is never parsed for ownership")
-        self.assert_blocked(h, "c2", "PATCH", "/reports/" + js["report"]["id"], {"slot": 2}, "foreign-target")
+        self.assertEqual(self.ledger(), set(), "a create response is never parsed for ownership")
         h.own("c3", "M", "/reports", js["report"]["id"], name)
-        self.assertEqual(api.ledger_ids(self.run_dir), {"/reports/" + js["report"]["id"]})
-        self.assertEqual(h.call("c4", "M", "PATCH", "/reports/" + js["report"]["id"], {"slot": 2})[0], 200)
-        self.assertEqual(h.call("c5", "M", "DELETE", "/reports/" + js["report"]["id"])[0], 200)
-        self.assert_blocked(h, "c6", "PATCH", "/users/" + js["report"]["id"], {"role": "admin"}, "foreign-target")
+        self.assertEqual(self.ledger(), {"/reports/" + js["report"]["id"]})
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             h.own("c7", "M", "/reports", 191, name)
         self.assertIn("unverified-fixture", str(ctx.exception), "the owner id in the response is not the object")
         Backend.store["/accounts/4401"] = {"id": 4401, "name": "Existing client", "notes": [{"name": name}]}
-        with self.assertRaises(api.WriteScopeRefused) as ctx:
+        with self.assertRaises(api.WriteScopeRefused):
             h.own("c8", "M", "/accounts", 4401, name)
-        self.assertIn("unverified-fixture", str(ctx.exception), "a QA-named child does not make its parent ours")
         Backend.store["/bare/4403"] = {"id": 4403, "name": "Existing", "report": {"id": 4403, "name": name}}
         Backend.store["/bare/4404"] = {"id": 4404, "name": "Existing", "data": {"id": 4404, "name": name}}
         for acct in (4403, 4404):
@@ -221,7 +289,7 @@ class Guard(unittest.TestCase):
             h.own("c9", "M", "/reports", js["report"]["id"], PREFIX)
         self.assertIn("not-a-qa-name", str(ctx.exception))
         self.assertEqual(len(Backend.seen), before, "a bad name is refused before any read")
-        self.assertEqual(len(api.ledger_ids(self.run_dir)), 2)
+        self.assertEqual(len(self.ledger()), 2)
         with open(os.path.join(h.out, "c7-own.json")) as f:
             self.assertTrue(json.load(f)["harnessBlocked"])
 
@@ -231,20 +299,15 @@ class Guard(unittest.TestCase):
         with self.assertRaises(api.WriteScopeRefused):
             h.call("s1", "M", "POST", "/notes?access_token=FICTIONAL-TOKEN&x=1", {"k": 1})
         h.call("s2", "M", "POST", "/users/login", {"email": "m@example.test", "password": "fictional-pw"})
+        h.login("M")
         with self.assertRaises(api.WriteScopeRefused):
-            h.call("s3", "M", "POST", "/notes", {"name": PREFIX + "n", "account": {"id": {"access_token": "FICTIONAL-TOKEN"}}})
+            h.call("s3", "M", "POST", "/media", {"meta": {"access_token": "FICTIONAL-TOKEN"}})
+        issued = h.tok["M"].split(".")[1]
         for f in ("s1.json", "s2.json", "s3.json", "00-timeline.txt"):
             with open(os.path.join(h.out, f)) as fh:
                 text = fh.read()
-            for secret in ("FICTIONAL-TOKEN", "fictional-pw", "eyJzdWIiOiAiMSJ9"):
+            for secret in ("FICTIONAL-TOKEN", "fictional-pw", issued):
                 self.assertNotIn(secret, text, "{} leaks {}".format(f, secret))
-
-    def test_allowlisted_account_is_writable(self):
-        self.pin(dict(SCOPE, accounts=["7001"]))
-        h = self.client()
-        self.assertEqual(h.call("a1", "M", "POST", "/cards", {"accountId": 7001})[0], 201)
-        self.assert_blocked(h, "a2", "DELETE", "/users/7001", None, "foreign-target")
-        self.assertEqual(api.ledger_ids(self.run_dir), set(), "writes never ledger on their own")
 
     def test_scope_from_another_run_refused(self):
         self.pin()
@@ -252,38 +315,34 @@ class Guard(unittest.TestCase):
         os.makedirs(other)
         os.rename(os.path.join(self.run_dir, api.SCOPE_FILE), os.path.join(other, api.SCOPE_FILE))
         with self.assertRaises(api.WriteScopeRefused) as ctx:
-            api.judge(other, "POST", "/notes", {"title": PREFIX + "x"})
+            api.judge(other, "POST", "/notes", {"k": 1}, ["sandbox"])
         self.assertIn("scope-run-mismatch", str(ctx.exception))
 
-    def test_unreadable_scope_and_ledger_refuse(self):
-        with open(os.path.join(self.run_dir, api.SCOPE_FILE), "w") as f:
+    def test_unreadable_or_allowlist_scope_refuses(self):
+        path = os.path.join(self.run_dir, api.SCOPE_FILE)
+        with open(path, "w") as f:
             f.write("{")
         with self.assertRaises(api.WriteScopeRefused) as ctx:
-            api.judge(self.run_dir, "PUT", "/x", None)
+            api.judge(self.run_dir, "PUT", "/x", None, ["sandbox"])
         self.assertIn("unreadable-scope", str(ctx.exception))
-        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        legacy = {k: v for k, v in SCOPE.items() if k != "mode"}
+        with open(path, "w") as f:
+            json.dump(dict(legacy, accounts=[], brands=[], runId=RUN_ID), f)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            api.judge(self.run_dir, "PUT", "/x", None, ["sandbox"])
+        self.assertIn("mode must be", str(ctx.exception), "an allowlist-era scope file fails closed")
+        os.unlink(path)
+        with self.assertRaises(ValueError):
+            self.pin(legacy)
+        with self.assertRaises(ValueError):
+            self.pin(dict(SCOPE, denyPrefixes=["/"]))
         self.pin()
         real = os.path.join(self.tmp.name, "scope-copy.json")
-        os.rename(os.path.join(self.run_dir, api.SCOPE_FILE), real)
-        os.symlink(real, os.path.join(self.run_dir, api.SCOPE_FILE))
+        os.rename(path, real)
+        os.symlink(real, path)
         with self.assertRaises(api.WriteScopeRefused) as ctx:
-            api.judge(self.run_dir, "POST", "/notes", {"name": PREFIX + "n"})
+            api.judge(self.run_dir, "POST", "/notes", {"k": 1}, ["sandbox"])
         self.assertIn("no-scope", str(ctx.exception), "a symlinked scope is refused, not followed")
-        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
-        os.rename(real, os.path.join(self.run_dir, api.SCOPE_FILE))
-        with open(os.path.join(self.run_dir, api.LEDGER_FILE), "w") as f:
-            f.write("not json\n")
-        with self.assertRaises(api.WriteScopeRefused) as ctx:
-            api.judge(self.run_dir, "DELETE", "/reports/fx-901", None)
-        self.assertIn("unreadable-ledger", str(ctx.exception))
-        os.unlink(os.path.join(self.run_dir, api.LEDGER_FILE))
-        elsewhere = os.path.join(self.tmp.name, "other-ledger.ndjson")
-        with open(elsewhere, "w") as f:
-            f.write(json.dumps({"id": "x1", "path": "/reports"}) + "\n")
-        os.symlink(elsewhere, os.path.join(self.run_dir, api.LEDGER_FILE))
-        with self.assertRaises(api.WriteScopeRefused) as ctx:
-            api.judge(self.run_dir, "POST", "/notes", {"name": PREFIX + "n"})
-        self.assertIn("unreadable-ledger", str(ctx.exception), "a symlinked ledger is refused, not followed")
 
     def test_cli(self):
         src = os.path.join(self.tmp.name, "scope.json")
@@ -292,15 +351,26 @@ class Guard(unittest.TestCase):
         cli = [sys.executable, os.path.join(HERE, "smoke_lane_api.py")]
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         run = lambda *a: subprocess.run(cli + list(a), capture_output=True, text=True, env=env)
+        missing = run("check", self.run_dir, "POST", "/notes", "--tenant", "sandbox")
+        self.assertEqual(missing.returncode, 77, "a missing scope file refuses through the CLI too")
+        self.assertIn("no-scope", missing.stderr)
         self.assertEqual(run("init", self.run_dir, "--from", src).returncode, 0)
         self.assertEqual(run("init", self.run_dir, "--from", src).returncode, 3, "the scope is pinned once")
-        ok = run("check", self.run_dir, "POST", "/notes", "--body", json.dumps({"title": PREFIX + "x"}))
+        ok = run("check", self.run_dir, "PATCH", "/cards/4402", "--body", '{"stage": "b"}', "--tenant", "sandbox")
         self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "write"))
-        no = run("check", self.run_dir, "POST", "/cards", "--body", '{"accountId": 4401}')
-        self.assertEqual(no.returncode, 77)
-        self.assertIn("WRITE_SCOPE_REFUSED reason=foreign-target", no.stderr)
-        slashes = run("check", self.run_dir, "POST", "//4401/cards", "--body", json.dumps({"title": PREFIX + "x"}))
-        self.assertEqual(slashes.returncode, 77, "the CLI applies the same path rule as the client")
+        flipped = run("check", self.run_dir, "PATCH", "/cards/4402", "--tenant", "sandbox", "--body", "{}")
+        self.assertEqual(flipped.returncode, 0)
+        for args, reason in ((("POST", "/notes"), "no-tenant"),
+                             (("POST", "/notes", "--tenant", "globex"), "foreign-tenant"),
+                             (("DELETE", "/media/5", "--tenant", "sandbox"), "denied-path"),
+                             (("POST", "/stock/resync", "--tenant", "sandbox"), "tenant-wide-shape"),
+                             (("POST", "//4401/cards", "--tenant", "sandbox"), "bad-path")):
+            no = run("check", self.run_dir, *args)
+            self.assertEqual(no.returncode, 77, args)
+            self.assertTrue(no.stderr.startswith("WRITE_SCOPE_REFUSED reason="), no.stderr)
+            self.assertIn(reason, no.stderr)
+        self.assertEqual(run("check", self.run_dir, "POST", "/notes", "--tenants", "sandbox").returncode, 2)
+        self.assertEqual(run("check", self.run_dir, "POST", "/notes", "--tenant").returncode, 2)
         with open(src, "w") as f:
             json.dump(dict(SCOPE, readOnlyPosts=["("]), f)
         self.assertEqual(run("init", os.path.join(self.tmp.name, "fresh"), "--from", src).returncode, 2)
