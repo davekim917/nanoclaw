@@ -22,7 +22,7 @@ A pin stored as a full id (`gpt-6-sol`, or a 5.6 id) does not move.
 ```bash
 # Codex primaries and Codex fallbacks with no model (these move):
 node -e 'const fs=require("fs");for(const g of fs.readdirSync("groups")){let c;try{c=JSON.parse(fs.readFileSync(`groups/${g}/container.json`,"utf8"))}catch{continue}const fb=c.providerFallback||{};if(String(c.provider||"").toLowerCase()==="codex"&&!c.model&&!c.defaultModel&&!(c.providerConfig||{}).model)console.log("primary",g);if(String(fb.provider||"").toLowerCase()==="codex"&&!fb.model)console.log("fallback",g)}'
-# Pins stored as the word `sol` (these move) and full-id `gpt-6-sol` pins (these do NOT): wirings, tasks, container.json
+# Pins stored as the word `sol` (these move) and full-id `gpt-6-sol` pins (these do NOT): wirings, tasks, container.json. The task list shows pending and paused series only, so repeat that check once in-flight fires have finished and before you deploy
 pnpm exec tsx scripts/q.ts data/v2.db "select id, agent_group_id, default_model, default_effort from messaging_group_agents where lower(default_model) in ('sol','gpt-6-sol')"
 ncl tasks list --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const d=JSON.parse(s);for(const t of (Array.isArray(d)?d:d.data)) if(/^(sol|gpt-6-sol)$/i.test(t.model_pin||"")) console.log(t.agent_group_id,t.series_id,t.model_pin,t.effort_pin||"-")})'
 grep -HiE '"(model|defaultModel)": *"(sol|gpt-6-sol)"' groups/*/container.json
