@@ -473,7 +473,12 @@ author_standing() {
       return 1
     }
     case "$permission" in
-      admin|write) standing=$(jq -cn --argjson s "$standing" --arg l "$login" '$s + {($l): "yes"}') || return 1 ;;
+      admin|maintain|write) standing=$(jq -cn --argjson s "$standing" --arg l "$login" '$s + {($l): "yes"}') || return 1 ;;
+      read|triage|none) ;;
+      *)
+        echo "$login's permission on $REPO read as \"$permission\", which is none of admin, maintain, write, triage, read or none; it is never judged from that" >&2
+        return 1
+        ;;
     esac
   done <<< "$logins"
   printf '%s\n' "$1" | jq -c --argjson s "$standing" '

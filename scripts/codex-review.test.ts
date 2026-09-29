@@ -4310,6 +4310,20 @@ describe('codex-review risk-scoped review requests', () => {
         },
       );
 
+      it.each(['', 'null', 'owner'])(
+        'refuses when a receipt author\'s permission reads as "%s"',
+        (permission) => {
+          const root = tempRoot();
+          legacy(root, { comments: FORGED });
+          fs.writeFileSync(path.join(root, 'permission--reader'), `${permission}\n`);
+
+          const result = runHelper(root, ['merge-check', '--head', HEAD]);
+          expect(result.status).not.toBe(0);
+          expect(result.status).not.toBe(26);
+          expect(result.stderr).toContain("reader's permission on example/repository read as");
+        },
+      );
+
       it('refuses when a receipt author cannot be looked up', () => {
         const root = tempRoot();
         legacy(root, { comments: FORGED });
@@ -5771,6 +5785,16 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
         expect(result.stdout).toContain('audit=pass');
       },
     );
+
+    it.each(['', 'null', 'owner'])('errors when an approving author\'s permission reads as "%s"', (permission) => {
+      const root = tempRoot();
+      auditFixture(root, { labels: ['risk:high'], comments: APPROVAL });
+      fs.writeFileSync(path.join(root, 'permission--davekim917'), `${permission}\n`);
+
+      const result = runHelper(root, ['audit']);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("davekim917's permission on example/repository read as");
+    });
 
     it('errors when an edited comment\'s author cannot be looked up', () => {
       const root = tempRoot();
