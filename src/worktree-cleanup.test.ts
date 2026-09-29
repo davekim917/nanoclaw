@@ -1065,6 +1065,42 @@ describe('branch clone checkouts', () => {
     expect(state.trashed).toEqual([]);
   });
 
+  it('an inbound.db that becomes unstatable after the idle snapshot is late activity', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'lost-inbound', 'repo-a', 'nc-topic');
+    state.rows = [idleRow('lost-inbound')];
+    const inbound = path.join(state.dataDir, 'v2-sessions', 'ag-s-lost-inbound', 's-lost-inbound', 'inbound.db');
+    fs.mkdirSync(path.dirname(inbound), { recursive: true });
+    fs.writeFileSync(inbound, '');
+
+    const { report } = await runWithLateActivity(null, () => fs.rmSync(inbound));
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(state.trashed).toEqual([]);
+  });
+
+  it('an inbound.db whose stat fails for a reason other than absence is late activity', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'emfile-inbound', 'repo-a', 'nc-topic');
+    state.rows = [idleRow('emfile-inbound')];
+    const inbound = path.join(state.dataDir, 'v2-sessions', 'ag-s-emfile-inbound', 's-emfile-inbound', 'inbound.db');
+    fs.mkdirSync(path.dirname(inbound), { recursive: true });
+    fs.writeFileSync(inbound, '');
+    const realStat = fs.statSync.bind(fs);
+    const stat = vi.spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      if (String(target) === inbound) throw Object.assign(new Error('EMFILE'), { code: 'EMFILE' });
+      return realStat(target, options);
+    }) as typeof fs.statSync);
+
+    try {
+      const { report } = await runWithLateActivity(null);
+      expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    } finally {
+      stat.mockRestore();
+    }
+    expect(state.trashed).toEqual([]);
+  });
+
   it('a rollback that leaves a locked superseded copy behind keeps the recovery marker', async () => {
     const canonA = canonicalFixture('repo-a');
     const canonB = canonicalFixture('repo-b');
