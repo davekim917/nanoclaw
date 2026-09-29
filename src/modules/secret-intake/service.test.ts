@@ -26,6 +26,8 @@ const h = vi.hoisted(() => ({
   originType: 'slack',
   notifyFails: false,
   ownerIds: ['slack:UOWNER'],
+  ownerSafe: false,
+  ownerSafeCalls: [] as unknown[][],
 }));
 
 vi.mock('../../onecli-secret-writer.js', () => ({
@@ -73,6 +75,16 @@ vi.mock('../../db/messaging-groups.js', () => ({
 }));
 vi.mock('../../db/central-lease.js', () => ({
   withCentralSync: vi.fn(async (fn: () => unknown) => fn()),
+  withRawDb: (fn: (db: unknown) => unknown) => fn('raw-db'),
+}));
+vi.mock('../../container-config.js', () => ({
+  readContainerConfig: (folder: string) => ({ slack_user_token: { also_allowed_in: [`allowed-for-${folder}`] } }),
+}));
+vi.mock('../permissions/slack-user-token-gate.js', () => ({
+  isOwnerSafeSlackSession: (...args: unknown[]) => {
+    h.ownerSafeCalls.push(args);
+    return h.ownerSafe;
+  },
 }));
 vi.mock('../../delivery.js', () => ({
   getDeliveryAdapter: () => ({
@@ -112,6 +124,7 @@ vi.mock('../permissions/db/users.js', () => ({
 }));
 vi.mock('../../router.js', () => ({
   isSlackChannelType: (type: string) => type === 'slack' || type.startsWith('slack-'),
+  isDiscordChannelType: (type: string) => type === 'discord' || type.startsWith('discord-'),
 }));
 vi.mock('../../log.js', () => {
   const record = (...args: unknown[]) => {
@@ -172,6 +185,8 @@ beforeEach(() => {
   h.originType = 'slack';
   h.notifyFails = false;
   h.ownerIds = ['slack:UOWNER'];
+  h.ownerSafe = false;
+  h.ownerSafeCalls.length = 0;
   h.groups.set('ag-1', { id: 'ag-1', name: 'Helper', folder: 'helper', workgroup_id: 'wg-a' });
   h.groups.set('ag-2', { id: 'ag-2', name: 'Other', folder: 'other', workgroup_id: 'wg-b' });
 });
@@ -189,10 +204,23 @@ describe('startSecretIntake', () => {
     expect(JSON.parse(h.deliveries[1].args[4] as string).body).toContain('Only an owner or global admin can enter it.');
   });
 
-  it('sends a rotation to an owner DM, since only an owner can fill it', async () => {
+  it("sends a rotation to an owner DM unless the conversation is already the owner's own", async () => {
     h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
-    await startSecretIntake({ name: 'Linear-API-Key', rotate: true, groups: [], workgroups: [], caller: agentCaller });
+    const rotation = { name: 'Linear-API-Key', rotate: true, groups: [], workgroups: [], caller: agentCaller };
+    await startSecretIntake(rotation);
     expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
+    expect(h.ownerSafeCalls[0]).toEqual(['raw-db', 'ag-1', 'mg-1', ['allowed-for-helper']]);
+
+    h.ownerSafe = true;
+    await startSecretIntake(rotation);
+    expect(h.deliveries[1].args.slice(0, 3)).toEqual(['slack', 'slack:C1', 'T1']);
+    expect(JSON.parse(h.deliveries[1].args[4] as string).body).toContain('Only an owner or global admin can enter it.');
+  });
+
+  it('never consults owner-safety for a new secret, which a group admin may fill in the thread', async () => {
+    await startSecretIntake({ ...newKey, caller: agentCaller });
+    expect(h.ownerSafeCalls).toEqual([]);
+    expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:C1', 'T1']);
   });
 
   it("picks an owner's Slack DM over an earlier owner's Discord DM", async () => {
@@ -201,8 +229,23 @@ describe('startSecretIntake', () => {
     expect(h.deliveries[0].args.slice(0, 2)).toEqual(['slack', 'slack:D1']);
   });
 
+  it('posts a Discord request in its thread, a Discord rotation there only when owner-safe', async () => {
+    h.originType = 'discord-codex';
+    await startSecretIntake({ ...newKey, caller: agentCaller });
+    expect(h.deliveries[0].args.slice(0, 3)).toEqual(['discord-codex', 'slack:C1', 'T1']);
+
+    h.vault.set('Linear-API-Key', { id: 'id-1', name: 'Linear-API-Key' });
+    const rotation = { name: 'Linear-API-Key', rotate: true, groups: [], workgroups: [], caller: agentCaller };
+    await startSecretIntake(rotation);
+    expect(h.deliveries[1].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
+    h.ownerSafe = true;
+    await startSecretIntake(rotation);
+    expect(h.deliveries[2].args.slice(0, 3)).toEqual(['discord-codex', 'slack:C1', 'T1']);
+  });
+
   it('sends a card from a platform that cannot open forms to an owner DM instead', async () => {
-    h.originType = 'discord';
+    h.originType = 'telegram';
+    h.ownerSafe = true;
     await startSecretIntake({ ...newKey, caller: agentCaller });
     expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
   });
@@ -463,7 +506,7 @@ describe('the form', () => {
     expect(h.workgroupGrants).toEqual(['wg-a:Linear-API-Key']);
     expect(getSecretIntake(intakeId)?.status).toBe('stored');
     const edit = JSON.parse(h.deliveries[1].args[4] as string);
-    expect(edit).toMatchObject({ operation: 'edit', messageId: 'msg-1' });
+    expect(edit).toMatchObject({ operation: 'edit', messageId: 'msg-1', clearActions: true });
     expect(edit.text).toContain('Stored');
     expect(h.notes[0]).toContain('Secret "Linear-API-Key" stored in the vault');
 

@@ -1888,13 +1888,142 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   return bridge;
 }
 
+const DISCORD_MODAL_TEXT_MAX = 45;
+const DISCORD_INTERACTION_COMPONENT = 3;
+const DISCORD_INTERACTION_MODAL_SUBMIT = 5;
+const DISCORD_SECRET_MODAL_PREFIX = `${SECRET_INTAKE_CALLBACK_ID}:`;
+
+function fitDiscordModalText(text: string): string {
+  const codePoints = Array.from(text);
+  if (codePoints.length <= DISCORD_MODAL_TEXT_MAX) return text;
+  return codePoints.slice(0, DISCORD_MODAL_TEXT_MAX - 1).join('') + '…';
+}
+
+function discordSecretIntakeTarget(
+  interaction: Record<string, unknown>,
+): { kind: 'open' | 'submit'; intakeId: string } | null {
+  const customId = (interaction.data as Record<string, unknown> | undefined)?.custom_id;
+  if (typeof customId !== 'string') return null;
+  if (interaction.type === DISCORD_INTERACTION_COMPONENT) {
+    const { actionId } = decodeDiscordCustomId(customId);
+    if (actionId.startsWith(SECRET_INTAKE_ACTION_PREFIX)) {
+      return { kind: 'open', intakeId: actionId.slice(SECRET_INTAKE_ACTION_PREFIX.length) };
+    }
+  }
+  if (interaction.type === DISCORD_INTERACTION_MODAL_SUBMIT && customId.startsWith(DISCORD_SECRET_MODAL_PREFIX)) {
+    return { kind: 'submit', intakeId: customId.slice(DISCORD_SECRET_MODAL_PREFIX.length) };
+  }
+  return null;
+}
+
+export function isDiscordSecretIntakeEvent(body: string): boolean {
+  if (!body.includes('"GATEWAY_INTERACTION_CREATE"')) return false;
+  try {
+    const event = JSON.parse(body) as { type?: unknown; data?: unknown };
+    return (
+      event.type === 'GATEWAY_INTERACTION_CREATE' &&
+      !!event.data &&
+      discordSecretIntakeTarget(event.data as Record<string, unknown>) !== null
+    );
+  } catch {
+    return false;
+  }
+}
+
+function discordModalValues(interaction: Record<string, unknown>): Record<string, string> {
+  const values: Record<string, string> = {};
+  const rows = ((interaction.data as Record<string, unknown> | undefined)?.components ?? []) as Array<
+    Record<string, unknown>
+  >;
+  for (const row of rows) {
+    const inputs = [
+      ...((row.components as Array<Record<string, unknown>> | undefined) ?? []),
+      ...(row.component ? [row.component as Record<string, unknown>] : []),
+    ];
+    for (const input of inputs) {
+      if (typeof input.custom_id === 'string' && typeof input.value === 'string') values[input.custom_id] = input.value;
+    }
+  }
+  return values;
+}
+
+async function respondToDiscordInteraction(interaction: Record<string, unknown>, body: unknown): Promise<void> {
+  try {
+    const response = await fetch(
+      `https://discord.com/api/v10/interactions/${interaction.id as string}/${interaction.token as string}/callback`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    );
+    if (!response.ok) log.warn('Secret intake: Discord interaction response refused', { status: response.status });
+  } catch (err) {
+    log.warn('Secret intake: Discord interaction response failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function discordEphemeral(content: string) {
+  return { type: 4, data: { content, flags: 64, allowed_mentions: { parse: [] } } };
+}
+
+/** Discord allows 3 s to answer the button or the submit, and a modal can only be opened as the button's answer. */
+async function handleDiscordSecretIntake(interaction: Record<string, unknown>, setup: ChannelSetup): Promise<boolean> {
+  const target = discordSecretIntakeTarget(interaction);
+  if (!target) return false;
+  const userId =
+    ((interaction.member as Record<string, unknown> | undefined)?.user as Record<string, unknown> | undefined)?.id ??
+    (interaction.user as Record<string, unknown> | undefined)?.id;
+  const hooks = setup.secretIntake;
+  if (!hooks || typeof userId !== 'string' || !userId) {
+    await respondToDiscordInteraction(interaction, discordEphemeral('This bot cannot take secrets.'));
+    return true;
+  }
+  if (target.kind === 'open') {
+    const opened = await hooks.open(target.intakeId, userId);
+    if (!opened.ok) {
+      await respondToDiscordInteraction(interaction, discordEphemeral(opened.message));
+      return true;
+    }
+    await respondToDiscordInteraction(interaction, {
+      type: 9,
+      data: {
+        custom_id: `${DISCORD_SECRET_MODAL_PREFIX}${target.intakeId}`,
+        title: fitDiscordModalText(opened.form.title),
+        components: opened.form.inputs.slice(0, DISCORD_COMPONENT_ROW_MAX).map((input) => ({
+          type: 1,
+          components: [
+            {
+              type: 4,
+              custom_id: input.id,
+              label: fitDiscordModalText(input.label),
+              style: 1,
+              required: !input.optional,
+              placeholder: 'Paste it here',
+            },
+          ],
+        })),
+      },
+    });
+    return true;
+  }
+  const result = await hooks.submit(target.intakeId, userId, discordModalValues(interaction));
+  await respondToDiscordInteraction(
+    interaction,
+    discordEphemeral(
+      result.ok
+        ? 'Received. It goes straight to the vault; the card updates when it is stored.'
+        : `${result.message} Nothing was stored. Click the button to try again.`,
+    ),
+  );
+  return true;
+}
+
 /**
  * Start a local HTTP server to receive forwarded Gateway events.
  * This is needed because the Gateway listener in webhook-forwarding mode
  * sends ALL raw events (including INTERACTION_CREATE for button clicks)
  * to the webhookUrl, which we handle here.
  */
-function startLocalWebhookServer(
+export function startLocalWebhookServer(
   adapter: GatewayAdapter,
   setupConfig: ChannelSetup,
   botToken?: string,
@@ -1910,10 +2039,11 @@ function startLocalWebhookServer(
         // The Discord adapter issues one async request per raw Gateway packet and EventEmitter does not await
         // listeners, so READY and a following MESSAGE_CREATE can complete out of order. Queue the handlers and hold
         // later packets behind reconnect recovery.
-        const handled = eventTail.then(() =>
-          handleForwardedEvent(body, adapter, setupConfig, botToken, onConnectionRestored),
-        );
-        eventTail = handled.catch(() => undefined);
+        const urgent = isDiscordSecretIntakeEvent(body);
+        const handled = urgent
+          ? handleForwardedEvent(body, adapter, setupConfig, botToken, onConnectionRestored)
+          : eventTail.then(() => handleForwardedEvent(body, adapter, setupConfig, botToken, onConnectionRestored));
+        if (!urgent) eventTail = handled.catch(() => undefined);
         handled
           .then(() => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1950,11 +2080,10 @@ export async function handleForwardedEvent(
     return;
   }
 
-  // Handle interaction events (button clicks) — not handled by adapter's handleForwardedGatewayEvent
   if (event.type === 'GATEWAY_INTERACTION_CREATE' && event.data) {
     const interaction = event.data;
-    // type 3 = MessageComponent (button/select)
-    if (interaction.type === 3) {
+    if (await handleDiscordSecretIntake(interaction, setupConfig)) return;
+    if (interaction.type === DISCORD_INTERACTION_COMPONENT) {
       const customId = (interaction.data as Record<string, unknown>)?.custom_id as string;
       const decoded = typeof customId === 'string' ? decodeDiscordCustomId(customId) : undefined;
       // Only NanoClaw approval cards (`ncq:`) belong to this bridge; everything else reaches the adapter unchanged.
