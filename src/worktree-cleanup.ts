@@ -84,8 +84,8 @@ interface TopicParticipant {
   status: string;
   /** COALESCE(last_active, created_at), ISO-8601 UTC. */
   idleSince: string;
-  /** mtime of inbound.db (the durable admission write, which precedes last_active), or null if unstatable. */
-  inboundMtimeMs: number | null;
+  /** mtime of inbound.db (the durable admission write, which precedes last_active). */
+  inboundMtimeMs: InboundMtime;
 }
 
 export interface TopicWorktreeTarget {
@@ -181,11 +181,13 @@ function readTopicCheckouts(worktreeRoot: string): TopicCheckout[] | null {
   }
 }
 
-function statMtimeMs(filePath: string): number | null {
+type InboundMtime = number | 'absent' | 'unknown';
+
+function inboundMtime(filePath: string): InboundMtime {
   try {
     return fs.statSync(filePath).mtimeMs;
-  } catch {
-    return null;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'unknown';
   }
 }
 
@@ -244,7 +246,7 @@ function participantsByTopic(
         agentGroupId: row.agent_group_id,
         status: row.status,
         idleSince: row.idle_since,
-        inboundMtimeMs: statMtimeMs(
+        inboundMtimeMs: inboundMtime(
           sessionMailboxPath({ agentGroupId: row.agent_group_id, sessionId: row.session_id }, 'inbound'),
         ),
       });
@@ -625,7 +627,7 @@ export interface GcCandidate {
    * Only for an orphan topic collected via the idle path: scan-time state of every owning participant, re-verified
    * after the move and before the real trash (finalizeIdleCollection).
    */
-  idleSnapshot?: Array<{ sessionId: string; status: string; idleSince: string; inboundMtimeMs: number | null }>;
+  idleSnapshot?: Array<{ sessionId: string; status: string; idleSince: string; inboundMtimeMs: InboundMtime }>;
 }
 
 export interface GcReport {
@@ -1347,10 +1349,10 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
   }
 }
 
-function mtimeAdvanced(prior: number | null, current: number | null): boolean {
-  if (prior === null) return current !== null;
-  if (current === null) return true;
-  return current > prior;
+function inboundAdvanced(prior: InboundMtime, current: InboundMtime): boolean {
+  if (prior === 'unknown' || current === 'unknown') return true;
+  if (prior === 'absent') return current !== 'absent';
+  return current === 'absent' || current > prior;
 }
 
 /** Durable record of the exact deregistrations a trash requires, so a crash after the trash is recoverable. */
@@ -1857,10 +1859,12 @@ async function finalizeIdleCollection(
     const activityAdvanced = (owner?.participants ?? []).some((p) => {
       const prior = before.get(p.sessionId);
       // status/idleSince lag admission (inbound.db is written before last_active), so fence on inbound.db's mtime:
-      // a file that appeared, moved forward or became unstatable is new activity.
-      const inboundMoved = mtimeAdvanced(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+      // a file that appeared, moved forward, vanished or could not be statted is new activity.
       return (
-        !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved
+        !prior ||
+        prior.status !== p.status ||
+        Date.parse(p.idleSince) > Date.parse(prior.idleSince) ||
+        inboundAdvanced(prior.inboundMtimeMs, p.inboundMtimeMs)
       );
     });
     if (activityAdvanced) {
