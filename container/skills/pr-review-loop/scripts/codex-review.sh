@@ -453,7 +453,9 @@ payload_json() {
 # The comment pages $1 with each comment's `standing`: yes when it may steer a
 # gate, unknown when that cannot be told, else no. Permission, not association,
 # decides: a MEMBER or COLLABORATOR can hold read or triage only, so a trusted
-# association is only the precondition for a lookup. `audit` reads the
+# association is only the precondition for a lookup. `permission` folds maintain
+# into write and triage into read (role_name has the granular role), so
+# admin|write is every role that may push. `audit` reads the
 # permission its merge recorded, since a lookup now would judge an old merge by
 # today's grants; a login the record does not name is unknown there. Otherwise
 # every lookup is appended to GATE_PERMISSION_RECORD, which `merge` writes into
