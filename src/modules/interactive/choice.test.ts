@@ -421,6 +421,11 @@ describe('request_choice delivery', () => {
       { ifItShips: 'See [the table](https://x.example)' },
       'decision text must not hold markdown links: put the link in evidence',
     ],
+    [
+      'spoiler bars that would hide a fact',
+      { ifItShips: 'Saved exports keep working. ||Deletes all saved exports.||' },
+      'decision text must not hold || (Discord hides text between bars)',
+    ],
     ['a non-https evidence link', { evidence: 'http://x.example' }, 'decision.evidence must be one https link'],
     [
       'evidence that is not one link',

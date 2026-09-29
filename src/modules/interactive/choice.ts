@@ -165,6 +165,7 @@ function parseReleaseDecision(value: unknown): ReleaseDecision | string {
   if (text.some((t) => CONTROL_RE.test(t))) return 'decision text must not hold control characters';
   if (text.some((t) => HEX_RUN_RE.test(t))) return 'decision text must not hold a commit SHA: the host pins the head';
   if (text.some((t) => t.includes(']('))) return 'decision text must not hold markdown links: put the link in evidence';
+  if (text.some((t) => t.includes('||'))) return 'decision text must not hold || (Discord hides text between bars)';
   if (!EVIDENCE_RE.test(evidence) || !URL.canParse(evidence)) return 'decision.evidence must be one https link';
   return { question: neutralize(question.trim()), ifItShips: lines.map(neutralize), evidence };
 }
