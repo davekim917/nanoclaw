@@ -547,7 +547,7 @@ The reviewer reads that diff: every line, including deletions. A regenerated `sr
 **Round 3 is a checkpoint for you, not a stop that waits for the operator.** `REVIEW_ROUND_CAP` (default 3) counts review rounds of every kind: `request` exits 23 at the cap, and the gate refuses a push once a review has landed past it. On exit 23, decide yourself, and never escalate to the operator because the cap was reached:
 
 1. **Assess.** Classify the rounds by file and by class (above, `review-churn.mjs`). For a second opinion, give a fresh-context subagent the diff and the finding history with one question: are these rounds hardening the right parts of this PR, or is each fix creating the next finding?
-2. **Converging** (severity falling, no class recurring): fix the open findings in one batch and push. Then get a fresh-context substitute review of the new head, post it with `receipt`, and merge on `approve`.
+2. **Converging** (severity falling, no class recurring): fix the open findings in one batch and push (once the PR is past the cap the gate refuses that push: merge the head or rebuild). Then get a fresh-context substitute review of the new head, post it with `receipt`, and merge on `approve`.
 3. **Churning** (a class or seam recurring, or the substitute review still finds new defects): stop patching sites. Rebuild instead: fix the shared seam once, split the PR, or close it and redo the change in a fresh session with a reframed plan. A PR that needs more than six review rounds in total is the wrong PR, not an unlucky one. PR #566 went 12 rounds by patching.
 4. **The operator** hears only about a decision that is genuinely theirs (scope, product behaviour, an authority gate), in one or two lines with your recommendation.
 

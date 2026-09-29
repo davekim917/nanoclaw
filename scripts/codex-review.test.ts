@@ -5521,7 +5521,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       'codex=pending',
     ],
     [
-      'a review request edited after the merge',
+      'a review request from an untrusted author, edited after the merge',
       {
         comments: [
           {
@@ -7355,6 +7355,9 @@ describe('codex-review review round cap, one count across every reviewer', () =>
     const status = run(root, 'status');
     expect(status.stdout).toContain('rounds=4');
     expect(status.stderr).toContain('STOP: 4 review rounds on this PR, over REVIEW_ROUND_CAP=3');
+    const open = runHelper(root, ['open']);
+    expect(open.status).toBe(0);
+    expect(open.stderr).toContain('STOP: 4 review rounds on this PR, over REVIEW_ROUND_CAP=3');
   });
 
   it('does not count a Codex usage-limit notice or a receipt from an author outside the repository', () => {
