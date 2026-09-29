@@ -15,6 +15,13 @@ const REPOSITORY_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.
 const BASE_RE = /^[^\s\x00-\x1F\x7F]{1,255}$/;
 const HEAD_RE = /^[a-f0-9]{40}$/;
 const RELEASE_SCOPE_KEYS = ['purpose', 'repository', 'pullRequest', 'base', 'headSha'] as const;
+const DECISION_KEYS = ['question', 'ifItShips', 'evidence'];
+
+interface ReleaseDecision {
+  question: string;
+  ifItShips: string;
+  evidence: string;
+}
 
 interface ReleaseShipScope {
   purpose: 'release_ship';
@@ -51,6 +58,16 @@ function parseReleaseShipScope(value: unknown): ReleaseShipScope | undefined {
     base: record.base,
     headSha: record.headSha,
   };
+}
+
+function isReleaseDecision(value: unknown): value is ReleaseDecision {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  return (
+    keys.length === DECISION_KEYS.length &&
+    DECISION_KEYS.every((k) => typeof record[k] === 'string' && (record[k] as string).trim() !== '')
+  );
 }
 
 function channelDestinationNames(): string {
@@ -105,7 +122,7 @@ export const requestChoice: McpToolDefinition = {
         approvalScope: {
           type: 'object',
           description:
-            'Optional host-canonical release approval scope. When supplied, omit title/question/options: the host renders exact Ship and Hold buttons from this scope.',
+            'Optional host-canonical release approval scope. When supplied, omit title/question/options: the host renders exact Ship and Hold buttons from this scope. Pass `decision` with it.',
           properties: {
             purpose: { type: 'string', enum: ['release_ship'] },
             repository: { type: 'string', description: 'Exact owner/repository' },
@@ -116,13 +133,38 @@ export const requestChoice: McpToolDefinition = {
           required: ['purpose', 'repository', 'pullRequest', 'base', 'headSha'],
           additionalProperties: false,
         },
+        decision: {
+          type: 'object',
+          description:
+            'With approvalScope only: what the approver decides, shown on the card under the host\'s Ship line, labelled as your words. The host refuses a release card without it once that rule is switched on, and refuses a commit SHA or a markdown link in question or ifItShips; a refusal arrives later as a "request_choice failed" message.',
+          properties: {
+            question: {
+              type: 'string',
+              description: 'The one question in client terms, one sentence ending in "?" (up to 300 characters)',
+            },
+            ifItShips: {
+              type: 'string',
+              description: 'What changes for the client, one fact per line (up to 10 lines, 1200 characters)',
+            },
+            evidence: {
+              type: 'string',
+              description: 'One https link to the evidence the approver should open (up to 500 characters)',
+            },
+          },
+          required: ['question', 'ifItShips', 'evidence'],
+          additionalProperties: false,
+        },
       },
     },
   },
   async handler(args) {
-    const { title, question, options: rawOptions, to, key, approvers, approvalScope } = args;
+    const { title, question, options: rawOptions, to, key, approvers, approvalScope, decision } = args;
     const releaseScope = approvalScope === undefined ? undefined : parseReleaseShipScope(approvalScope);
     if (approvalScope !== undefined && !releaseScope) return err('approvalScope is malformed');
+    if (decision !== undefined && !releaseScope) return err('decision belongs only on an approvalScope release card');
+    if (decision !== undefined && !isReleaseDecision(decision)) {
+      return err('decision needs exactly question, ifItShips and evidence, each non-empty text');
+    }
     if (
       !releaseScope &&
       (typeof title !== 'string' || !title.trim() || typeof question !== 'string' || !question.trim())
@@ -188,6 +230,7 @@ export const requestChoice: McpToolDefinition = {
         choiceId,
         ...(!releaseScope ? { title, question, options } : {}),
         ...(releaseScope ? { approvalScope: releaseScope } : {}),
+        ...(decision !== undefined ? { decision } : {}),
         ...(key !== undefined ? { key } : {}),
         ...(approvers !== undefined ? { approvers } : {}),
         ...(target ?? {}),

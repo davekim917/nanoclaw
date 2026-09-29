@@ -55,6 +55,13 @@ vi.mock('../../session-manager.js', async () => {
 });
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-request-choice') }));
+const envFile = vi.hoisted(() => ({ values: {} as Record<string, string> }));
+
+vi.mock('../../env.js', async () => ({
+  ...(await vi.importActual<typeof import('../../env.js')>('../../env.js')),
+  readEnvFile: (keys: string[]) =>
+    Object.fromEntries(keys.filter((k) => k in envFile.values).map((k) => [k, envFile.values[k]])),
+}));
 
 // A Slack variant (isChannelVariant, types.ts:194-196), so the Slack
 // thread-id composition applies, under its own registry key.
@@ -81,6 +88,12 @@ const RELEASE_SCOPE = {
   base: 'main',
   headSha: 'a'.repeat(40),
 };
+const DECISION = {
+  question: 'Retire the legacy export button?',
+  ifItShips: 'The export menu loses one entry.\n\nSaved exports keep working.',
+  evidence: 'https://github.com/owner/repository/pull/42#issuecomment-1',
+};
+const PIN = `Ship owner/repository#42 from main at ${'a'.repeat(40)}?`;
 
 registerChannelAdapter(CHANNEL, {
   factory: (): ChannelAdapter => ({
@@ -205,6 +218,7 @@ async function destinationOnly(mgId: string, name: string): Promise<void> {
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  envFile.values = {};
   vi.mocked(sessionMessageExists).mockResolvedValue(false);
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -347,6 +361,96 @@ describe('request_choice delivery', () => {
         { label: 'Hold', value: 'hold', style: 'danger' },
       ],
     });
+  });
+
+  it('shows the decision under the host pin, labelled as the agent’s words, and keeps it on the answered card', async () => {
+    const row = (await ask(session, { approvalScope: RELEASE_SCOPE, decision: DECISION }))!;
+    const shown = [
+      PIN,
+      '',
+      'The requesting agent’s brief (its words, not checked by the host):',
+      'The question: Retire the legacy export button?',
+      'If it ships:',
+      '• The export menu loses one entry.',
+      '• Saved exports keep working.',
+      'Evidence: https://github.com/owner/repository/pull/42#issuecomment-1',
+    ].join('\n');
+    expect(delivered[0].content.question).toBe(shown);
+    expect(JSON.parse(row.payload)).toEqual({ choiceId: 'choice-1', approvalScope: RELEASE_SCOPE });
+
+    await click(row.approval_id, 'ship', ADMIN);
+    expect(after(1).find((d) => d.content.operation === 'edit')?.content.text).toContain(shown);
+  });
+
+  it('renders platform link and mention syntax in the decision as plain text', async () => {
+    await ask(session, {
+      approvalScope: RELEASE_SCOPE,
+      decision: { ...DECISION, question: 'Ship <!here> <https://evil.example|the tested build>?' },
+    });
+    expect(delivered[0].content.question).toContain(
+      'The question: Ship ‹!here› ‹https://evil.example|the tested build›?',
+    );
+  });
+
+  it('posts a decision-less release card until the rule is switched on, then refuses it', async () => {
+    expect((await ask(session, { approvalScope: RELEASE_SCOPE }))!.question).toBe(PIN);
+
+    envFile.values = { NANOCLAW_RELEASE_CARD_DECISION_REQUIRED: '1' };
+    expect(await ask(session, { approvalScope: RELEASE_SCOPE }, 'choice-2')).toBeUndefined();
+    expect(await ask(session, { approvalScope: RELEASE_SCOPE, decision: DECISION }, 'choice-3')).toBeDefined();
+    expect(delivered).toHaveLength(2);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: a release card needs decision {question, ifItShips, evidence}: an approver must see what ships',
+    ]);
+  });
+
+  it.each([
+    ['a decision on a generic card', { decision: DECISION }, 'decision belongs only on an approvalScope release card'],
+    [
+      'a SHA in the question',
+      { question: `Ship ${'b'.repeat(40)}?` },
+      'decision text must not hold a commit SHA: the host pins the head',
+    ],
+    [
+      'a SHA in a changed line',
+      { ifItShips: `Rebuilds at ${'B'.repeat(40)}` },
+      'decision text must not hold a commit SHA: the host pins the head',
+    ],
+    [
+      'a markdown link',
+      { ifItShips: 'See [the table](https://x.example)' },
+      'decision text must not hold markdown links: put the link in evidence',
+    ],
+    ['a non-https evidence link', { evidence: 'http://x.example' }, 'decision.evidence must be one https link'],
+    [
+      'evidence that is not one link',
+      { evidence: 'https://x.example and more' },
+      'decision.evidence must be one https link',
+    ],
+    ['a missing question', { question: ' ' }, 'decision.question is required'],
+    ['an extra key', { recommend: 'Ship' }, 'decision takes only question, ifItShips, evidence'],
+    ['a multi-line question', { question: 'Ship?\nReally' }, 'decision text must not hold control characters'],
+    ['an over-long question', { question: `${'q'.repeat(300)}?` }, 'decision.question is over 300 characters'],
+    [
+      'too many changed lines',
+      { ifItShips: Array.from({ length: 11 }, (_, i) => `line ${i}`).join('\n') },
+      'decision.ifItShips has over 10 lines',
+    ],
+  ])('refuses %s without opening a row', async (_name, change, error) => {
+    const decision = 'decision' in change ? undefined : { ...DECISION, ...change };
+    await ask(session, decision ? { approvalScope: RELEASE_SCOPE, decision } : change);
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([`request_choice failed: ${error}`]);
+  });
+
+  it('refuses a decision that would not fit on one card', async () => {
+    const long = { ...RELEASE_SCOPE, base: 'b'.repeat(255) };
+    const ifItShips = Array.from({ length: 10 }, () => 'x'.repeat(115)).join('\n');
+    await ask(session, { approvalScope: long, decision: { ...DECISION, question: `${'q'.repeat(299)}?`, ifItShips } });
+    expect(delivered).toHaveLength(0);
+    expect(notes()[0].text).toMatch(
+      /^request_choice failed: decision is too long for one card: shorten it by \d+ characters$/,
+    );
   });
 
   it('refuses a malformed request without opening a row', async () => {

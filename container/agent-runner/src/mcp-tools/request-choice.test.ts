@@ -56,6 +56,11 @@ const RELEASE_SCOPE = {
   base: 'main',
   headSha: 'a'.repeat(40),
 };
+const DECISION = {
+  question: 'Retire the legacy export button?',
+  ifItShips: 'The export menu loses one entry.\nSaved exports keep working.',
+  evidence: 'https://github.com/owner/repository/pull/42#issuecomment-1',
+};
 
 function inConversation(): void {
   seedSessionRouting('slack', 'slack:chan-1', 'slack:chan-1:100.1');
@@ -113,6 +118,14 @@ describe('request_choice', () => {
       choiceId: outbound('system')[0].id,
       approvalScope: RELEASE_SCOPE,
     });
+  });
+
+  it('carries a release decision through to the host', async () => {
+    inConversation();
+    const result = await requestChoice.handler({ approvalScope: RELEASE_SCOPE, decision: DECISION });
+
+    expect(result.isError).toBeUndefined();
+    expect(outbound('system')[0].content).toMatchObject({ approvalScope: RELEASE_SCOPE, decision: DECISION });
   });
 
   it('with `to`: resolves the channel destination into the action', async () => {
@@ -207,6 +220,12 @@ describe('request_choice', () => {
     ['an upper-case SHA in release scope', { approvalScope: { ...RELEASE_SCOPE, headSha: 'A'.repeat(40) } }, /approvalScope/],
     ['a wrong purpose in release scope', { approvalScope: { ...RELEASE_SCOPE, purpose: 'other' } }, /approvalScope/],
     ['an extra release scope key', { approvalScope: { ...RELEASE_SCOPE, extra: true } }, /approvalScope/],
+    ['a decision on a generic card', { ...ASK, decision: DECISION }, /only on an approvalScope/],
+    [
+      'a decision missing a field',
+      { approvalScope: RELEASE_SCOPE, decision: { question: 'Q?', evidence: DECISION.evidence } },
+      /exactly question, ifItShips and evidence/,
+    ],
     ['a malformed key', { ...ASK, key: 'has spaces' }, /key must be/],
     ['an over-long key', { ...ASK, key: 'k'.repeat(129) }, /key must be/],
     ['approvers that are not a list', { ...ASK, approvers: 'slack:admin-1' }, /approvers must hold/],
