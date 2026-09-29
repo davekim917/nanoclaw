@@ -298,17 +298,17 @@ function receiptItems(prose) {
 }
 
 // Receipts cite absolute paths into the reviewer's worktree, partial paths and
-// bare filenames; the last two count only when one tracked file ends with them.
+// bare filenames: a cited path is the tracked file sharing its longest tail, and
+// a tail two tracked files share names neither.
 function locate(text, files) {
   for (const token of text.match(/[\w./-]+\.[A-Za-z]\w*/g) ?? []) {
     const parts = token.split('/').filter((p) => p && p !== '.');
     for (let i = 0; i < parts.length; i++) {
-      const suffix = parts.slice(i).join('/');
-      if (files.has(suffix)) return suffix;
+      const tail = parts.slice(i).join('/');
+      const hits = [...files].filter((f) => f === tail || f.endsWith(`/${tail}`));
+      if (hits.length === 1) return hits[0];
+      if (hits.length > 1) break;
     }
-    const tail = `/${parts.join('/')}`;
-    const hits = [...files].filter((f) => f.endsWith(tail));
-    if (hits.length === 1) return hits[0];
   }
   return null;
 }
@@ -991,22 +991,6 @@ export function decideGate(payload, options = {}) {
     if (c.rounds < CLASS_ROUND_LIMIT) continue;
     if (c.seam && c.seamSubstantiated) {
       flagged.push({ kind: 'class', ...c, reason: `${c.rounds} rounds on one finding class` });
-    } else if (c.place) {
-      // Naming a guessed module as the primitive would refuse with something
-      // the fix has no reason to touch, so only an introduced primitive lifts.
-      flagged.push({
-        kind: 'class',
-        ...c,
-        key: `${c.signature} @ ${c.place}`,
-        seam: c.place,
-        seamKind: 'path',
-        seamInRepo: false,
-        primitives: [],
-        reason: `${c.rounds} rounds on one finding class in one place`,
-      });
-    } else {
-      // Listed, or "no finding class is gated" would hide a class at the limit.
-      reported.push({ key: c.key, rounds: c.rounds, reason: 'no finding names a file' });
     }
   }
   for (const s of report.seams) {
@@ -1030,6 +1014,27 @@ export function decideGate(payload, options = {}) {
         severityFalling: false,
         reason: `${s.rounds} rounds on one seam with severity not falling`,
       });
+    }
+  }
+  const rolledUp = new Set(flagged.filter((f) => f.kind === 'seam').map((f) => f.seam));
+  for (const c of report.classes) {
+    if (c.rounds < CLASS_ROUND_LIMIT || (c.seam && c.seamSubstantiated) || rolledUp.has(c.seam)) continue;
+    if (c.place) {
+      // Naming a guessed module as the primitive would refuse with something
+      // the fix has no reason to touch, so only an introduced primitive lifts.
+      flagged.push({
+        kind: 'class',
+        ...c,
+        key: `${c.signature} @ ${c.place}`,
+        seam: c.place,
+        seamKind: 'path',
+        seamInRepo: false,
+        primitives: [],
+        reason: `${c.rounds} rounds on one finding class in one place`,
+      });
+    } else {
+      // Listed, or "no finding class is gated" would hide a class at the limit.
+      reported.push({ key: c.key, rounds: c.rounds, reason: 'no finding names a file' });
     }
   }
 

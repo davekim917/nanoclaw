@@ -50,6 +50,7 @@ interface ClassRow {
   key: string;
   signature: string;
   seam: string | null;
+  place?: string | null;
   seamSubstantiated?: boolean;
   primitives: string[];
   rounds: number;
@@ -687,9 +688,18 @@ describe('review-churn gate', () => {
     // class as "not gated" — two answers to one question.
     const { status, decision, text } = gate(fixture('guessed-seam-with-named-sibling'));
     expect(status).toBe(3);
-    expect(decision.flagged.map((f) => f.key)).toContain('seam src/db/messages-out.ts');
+    expect(decision.flagged).toHaveLength(1);
+    expect(decision.flagged[0].key).toBe('seam src/db/messages-out.ts');
     expect(decision.reported).toHaveLength(0);
     expect(text).not.toContain('reported, not gated');
+  });
+
+  it('lifts a seam the rollup gates on a commit at its primitive, with no second refusal on the place', () => {
+    const payload = fixture('guessed-seam-with-named-sibling');
+    payload.commits = [
+      { sha: 'ddd4444', date: AFTER, message: 'fix: guard the write', files: ['src/db/messages-out.ts'] },
+    ];
+    expect(gate(payload).status).toBe(0);
   });
 
   it('gates signature drift no single class can substantiate', () => {
@@ -1244,6 +1254,20 @@ describe('review-churn gate beyond the import graph', () => {
       'tools/ingest/writer.py',
       'tools/ingest/steps/merge.py',
     ]);
+  });
+
+  it('resolves a cited path to the tracked file sharing its longest tail, and an ambiguous one to none', () => {
+    const files = ['writer.py', ...INGEST];
+    const cite = (id: number, at: string, where: string) =>
+      substituteReceipt(id, at, 'changes', `- **P1 — \`${where}\`:** Writes from a stale cached snapshot.`);
+    const partial = [11, 12, 13].map((id, i) => cite(id, `2026-09-01T1${i}:00:00Z`, 'ingest/writer.py:88'));
+    const decision = expectPlaceGate({ findings: [], receipts: partial, files }, 'tools/ingest/');
+    expect(new Set(decision.unlifted[0].sites.map((site) => site.file))).toEqual(new Set(['tools/ingest/writer.py']));
+
+    const bare = [11, 12, 13].map((id, i) => cite(id, `2026-09-01T1${i}:00:00Z`, 'writer.py'));
+    const { status, decision: none } = gate({ findings: [], receipts: bare, files });
+    expect(status).toBe(0);
+    expect(none.reported[0].reason).toBe('no finding names a file');
   });
 
   it('counts an independent receipt that is not clear, and nothing from one that is', () => {
