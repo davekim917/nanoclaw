@@ -24,6 +24,7 @@ import { readVersionPin } from './version-pins.js';
 // turn_usage 2026-09-22).
 const MIN_CODEX_CLI: Record<string, string> = {
   'gpt-6-sol': '0.155.1',
+  'gpt-6.1-sol': '0.159.0',
   'gpt-6-luna': '0.155.1',
   'gpt-6-astra': '0.154.0',
   'gpt-5.6-terra': '0.154.0',
@@ -78,5 +79,7 @@ describe('the pinned codex-cli serves every Codex model the fleet defaults to', 
   it('refuses a pin below a model minimum (mutation guard)', () => {
     expect(atLeast('0.154.0', MIN_CODEX_CLI['gpt-6-sol'])).toBe(false);
     expect(atLeast('0.156.0', MIN_CODEX_CLI['gpt-6-sol'])).toBe(true);
+    expect(atLeast('0.158.0', MIN_CODEX_CLI['gpt-6.1-sol'])).toBe(false);
+    expect(atLeast('0.159.0', MIN_CODEX_CLI['gpt-6.1-sol'])).toBe(true);
   });
 });

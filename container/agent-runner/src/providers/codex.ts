@@ -308,7 +308,7 @@ export function materializeRawImageGeneration(
  * Claude → Codex fallback resolve identically. Keep equal to the `sol` family target (`CODEX_FAMILY_DEFAULTS`,
  * src/flag-parser.ts); setup/lib/codex-model-min-cli.test.ts fails when they differ.
  */
-export const DEFAULT_CODEX_MODEL = 'gpt-6-sol';
+export const DEFAULT_CODEX_MODEL = 'gpt-6.1-sol';
 export const DEFAULT_CODEX_EFFORT = 'high' as const;
 
 export const codexConfigSchema = z.strictObject({

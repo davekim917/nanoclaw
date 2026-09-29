@@ -42,6 +42,7 @@ import { addDeniedModel } from '../../db/denied-models.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
 import { readFleetMcpServers } from '../../fleet-mcp-servers.js';
+import { CODEX_FAMILY_DEFAULTS } from '../../flag-parser.js';
 import {
   ensureContainerConfig,
   getContainerConfig,
@@ -521,7 +522,7 @@ describe('groups CLI resource config', () => {
          VALUES (?, 'codex', NULL, NULL, NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
       )
       .run(id, now());
-    await addDeniedModel('codex', 'gpt-6-sol', 'no sol');
+    await addDeniedModel('codex', CODEX_FAMILY_DEFAULTS.sol, 'no sol');
 
     const response = await dispatch(
       { id: 'req-deny-family', command: 'groups-config-update', args: { id, model: 'sol' } },
@@ -530,8 +531,8 @@ describe('groups CLI resource config', () => {
 
     expect(response.ok).toBe(false);
     const message = JSON.stringify(response);
-    expect(message).toContain('matches denied \\"gpt-6-sol\\"');
-    expect(message).toContain('--slug gpt-6-sol');
+    expect(message).toContain(`matches denied \\"${CODEX_FAMILY_DEFAULTS.sol}\\"`);
+    expect(message).toContain(`--slug ${CODEX_FAMILY_DEFAULTS.sol}`);
   });
 
   it('test_groups_config_update_mirrors_runtime_scalars_into_container_json', async () => {
