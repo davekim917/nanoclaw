@@ -33,11 +33,11 @@ ncl tasks update --id <series> --group <group-id> --model claude-sonnet-5 --effo
 ncl tasks repin --all --from-model sonnet --to-model claude-sonnet-5 --dry-run   # bulk, MODEL ONLY: literal match, then apply without --dry-run
 ```
 
-`repin` writes only the axes it is given, so the bulk command freezes the model but leaves a task that has no effort pin on the new `high` default. Run the per-series `ncl tasks update ... --effort xhigh` for every series that must keep `xhigh`.
+`repin` writes only the axes it is given, so the bulk command freezes the model but leaves a task that has no effort pin on whatever effort its other layers give it: the new `high` default when no other layer sets one. Run the per-series `ncl tasks update ... --effort xhigh` for every series that must keep `xhigh`.
 
 For `providerConfig.model`, `providerFallback.model` and legacy `defaultModel`, edit `groups/<g>/container.json` directly (no `ncl` verb writes them); the edit applies at the group's next restart.
 
-**Deploy.** Run `scripts/deploy.sh`; it rebuilds the agent image because `container/` changed. The rebuild is required: the SDK bump changes the runner's deps hash, and `src/agent-runner-image-check.ts` refuses a spawn from the base image until it matches. A group with `imageTag` in its `container.json` spawns from its own image, which a base rebuild does not touch, and an `imageTag` image with no deps label is opted out of that check with a warning, so nothing forces its rebuild: rebuild those first and confirm each CLI yourself (`grep -lE '"imageTag"' groups/*/container.json`). A host restart **adopts** running containers, which keep their spawn-time runner, CLI and `ANTHROPIC_DEFAULT_SONNET_MODEL`, so a `sonnet` pin in an adopted container still means Sonnet 5 until it exits. Recycle a group with `ncl groups restart --id <group-id>` at a quiet moment.
+**Deploy.** Run `scripts/deploy.sh`; it rebuilds the agent image because `container/` changed. The rebuild is required: the SDK bump changes the runner's deps hash, and `src/agent-runner-image-check.ts` refuses a spawn from the base image until it matches. A group with `imageTag` in its `container.json` spawns from its own image, which a base rebuild does not touch, and an `imageTag` image with no deps label is opted out of that check, so nothing forces its rebuild: rebuild those first and confirm each CLI yourself (`grep -lE '"imageTag"' groups/*/container.json`). A host restart **adopts** running containers, which keep their spawn-time runner, CLI and `ANTHROPIC_DEFAULT_SONNET_MODEL`, so a `sonnet` pin in an adopted container still means Sonnet 5 until it exits. Recycle a group with `ncl groups restart --id <group-id>` at a quiet moment.
 
 **Verify.**
 
