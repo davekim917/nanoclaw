@@ -80,6 +80,8 @@ interface Payload {
   findings: unknown[];
   sources?: Record<string, string>;
   repoRoot?: string;
+  receipts?: { id: number; createdAt: string; body: string }[];
+  files?: string[];
   commits?: {
     sha: string;
     date: string;
@@ -119,6 +121,24 @@ function classify(payload: Payload): Report {
 function gate(payload: Payload, env: Record<string, string> = {}) {
   const out = spawn(['gate', '--json'], payload, env);
   return { status: out.status, decision: JSON.parse(out.stdout) as Decision, text: out.stderr };
+}
+
+/**
+ * A class gated on where its sites are. No import is substantiated there, so
+ * the refusal names no primitive — never the module the classifier guessed.
+ */
+function expectPlaceGate(payload: Payload, place: string) {
+  const { status, decision } = gate(payload);
+  expect(status).toBe(3);
+  const atPlace = decision.unlifted.filter((e) => e.seam === place);
+  expect(atPlace.length).toBeGreaterThan(0);
+  for (const e of atPlace) expect(e.primitives).toEqual([]);
+  return decision;
+}
+
+/** The same findings with no file named, which no place can hold. */
+function withoutPaths(payload: Payload): Payload {
+  return { ...payload, findings: (payload.findings as object[]).map((f) => ({ ...f, path: null })) };
 }
 
 const AFTER = '2026-09-02T00:00:00Z'; // later than every finding in toctou-class
@@ -176,10 +196,11 @@ describe('review-churn classifier', () => {
     }
   });
 
-  it('reports a class whose sites share no seam, with no seam to name', () => {
+  it('reports a class whose sites share no seam, with no seam to name, at the place they share', () => {
     const churning = classify(fixture('seamless-class')).classes.filter((c) => c.rounds >= 3);
     expect(churning).toHaveLength(1);
     expect(churning[0].seam).toBeNull();
+    expect(churning[0].place).toBe('src/');
     expect(churning[0].primitives).toEqual([]);
   });
 
@@ -323,7 +344,7 @@ describe('review-churn classifier', () => {
     expect(churning.rounds).toBe(3);
     expect(churning.seam).toBe('src/db/messages-out.ts');
     expect(churning.seamSubstantiated).toBe(false);
-    expect(gate(fixture('commented-import-seam')).status).toBe(0);
+    expectPlaceGate(fixture('commented-import-seam'), 'src/');
   });
 
   it('will not seam on a module that does not exist', () => {
@@ -336,7 +357,7 @@ describe('review-churn classifier', () => {
     expect(churning.rounds).toBe(3);
     expect(churning.seam).toBe('src/db/messages-out.ts');
     expect(churning.seamSubstantiated).toBe(false);
-    expect(gate(fixture('commented-import-seam')).status).toBe(0);
+    expectPlaceGate(fixture('commented-import-seam'), 'src/');
   });
 
   it('substantiates a seam reached through a destructured dynamic import', () => {
@@ -511,15 +532,12 @@ describe('review-churn gate', () => {
     expect(falling.decision.flagged).toHaveLength(0);
   });
 
-  it('reports a guessed seam without gating it', () => {
-    // The refusal would name a primitive the fix has no reason to touch, so
-    // the only way past would be the override — the failure the gate exists to
-    // prevent, arrived at by the gate itself.
-    const { status, decision } = gate(fixture('guessed-seam'));
-    expect(status).toBe(0);
-    expect(decision.status).toBe('pass');
-    expect(decision.flagged).toHaveLength(0);
-    expect(decision.report.classes[0].rounds).toBe(3);
+  it('gates a guessed seam on its place, never naming the guessed module', () => {
+    // Naming the guess would refuse with a primitive the fix has no reason to
+    // touch, leaving the override as the only way past.
+    const decision = expectPlaceGate(fixture('guessed-seam'), 'src/');
+    expect(decision.unlifted[0].key).toBe('inv:race @ src/');
+    expect(decision.report.classes[0].seam).toBe('src/db/messages-out.ts');
   });
 
   it('still gates a single-file class when the findings name what the seam exports', () => {
@@ -670,7 +688,7 @@ describe('review-churn gate', () => {
     // class as "not gated" — two answers to one question.
     const { status, decision, text } = gate(fixture('guessed-seam-with-named-sibling'));
     expect(status).toBe(3);
-    expect(decision.flagged[0].key).toBe('seam src/db/messages-out.ts');
+    expect(decision.flagged.map((f) => f.key)).toContain('seam src/db/messages-out.ts');
     expect(decision.reported).toHaveLength(0);
     expect(text).not.toContain('reported, not gated');
   });
@@ -682,9 +700,8 @@ describe('review-churn gate', () => {
   });
 
   it('does not gate a seam substantiated only by a substring of a finding', () => {
-    const { status, decision } = gate(fixture('substring-name-seam'));
-    expect(status).toBe(0);
-    expect(decision.reported[0].rounds).toBe(3);
+    const decision = expectPlaceGate(fixture('substring-name-seam'), 'src/');
+    expect(decision.report.classes[0].seamSubstantiated).toBe(false);
   });
 
   it('accepts any shape the commit introduced, method or otherwise', () => {
@@ -744,29 +761,22 @@ describe('review-churn gate', () => {
   it('says so when a class at three rounds is reported rather than gated', () => {
     // "no finding class has reached 3 rounds" would be false here, and these
     // commands do not print the class table.
-    const { status, text } = gate(fixture('guessed-seam'));
+    const { status, text } = gate(withoutPaths(fixture('guessed-seam')));
     expect(status).toBe(0);
     expect(text).toContain('reported, not gated');
-    expect(text).toContain('inv:race @ src/db/messages-out.ts');
-    expect(text).toContain('3 rounds');
+    expect(text).toContain('3 rounds; no finding names a file');
     expect(text).not.toContain('no finding class has reached 3 rounds');
   });
 
-  it('does not gate a class whose only shared import is a Node internal', () => {
-    const { status, decision } = gate(fixture('internal-builtin-seam'));
-    expect(status).toBe(0);
-    expect(decision.status).toBe('pass');
-    expect(decision.report.classes[0].rounds).toBe(3);
+  it('gates a class whose only shared import is a Node internal on its place, not the internal', () => {
+    expectPlaceGate(fixture('internal-builtin-seam'), 'src/');
   });
 
-  it('does not gate a class whose only shared import is a builtin', () => {
+  it('gates a class whose only shared import is a builtin on its place, not the builtin', () => {
     // Seamed on `path`, the refusal named `path` as the primitive: no diff
     // could lift it, because the lift-by-diff path only matches in-repo
-    // modules. A gate whose only exit is the override is worse than no gate.
-    const { status, decision } = gate(fixture('builtin-seam'));
-    expect(status).toBe(0);
-    expect(decision.status).toBe('pass');
-    expect(decision.flagged).toHaveLength(0);
+    // modules.
+    expectPlaceGate(fixture('builtin-seam'), 'src/');
   });
 
   it('passes a PR whose worst class has run two rounds', () => {
@@ -795,10 +805,9 @@ describe('review-churn gate', () => {
     expect(partial.decision.unlifted[0].seam).toBe('src/db/tasks.ts');
   });
 
-  it('never gates a class with no seam, because nothing could lift it', () => {
-    const { status, decision } = gate(fixture('seamless-class'));
+  it('never gates a class whose findings name no file, because nothing places it', () => {
+    const { status, decision } = gate(withoutPaths(fixture('seamless-class')));
     expect(status).toBe(0);
-    expect(decision.status).toBe('pass');
     expect(decision.flagged).toHaveLength(0);
     expect(decision.report.classes[0].rounds).toBe(3);
   });
@@ -1090,6 +1099,201 @@ describe('review-churn gate', () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('review-churn gate beyond the import graph', () => {
+  const INGEST = [
+    'tools/ingest/loader.py',
+    'tools/ingest/writer.py',
+    'tools/ingest/steps/merge.py',
+    'tools/export/sink.py',
+  ];
+  const SHA = 'a'.repeat(40);
+
+  function codexFinding(reviewId: string, file: string, title: string, createdAt: string, severity = 1) {
+    return {
+      reviewId,
+      path: file,
+      line: 10,
+      createdAt,
+      body: `**<sub><sub>![P${severity} Badge](https://img.shields.io/badge/P${severity}-orange?style=flat)</sub></sub>  ${title}**\n\n${title}.`,
+    };
+  }
+
+  function substituteReceipt(id: number, createdAt: string, outcome: string, finding: string) {
+    return {
+      id,
+      createdAt,
+      body:
+        `### Substitute review receipt\n\n- **Head:** \`${SHA}\`\n- **Reviewer and runtime:** gpt-6-sol high (codex exec)\n` +
+        `- **Outcome:** ${outcome}\n\nSubstitute review of the full diff.\n\n${finding}\n\nVERDICT: ${outcome}\n\n` +
+        `<!-- pr-review-loop:substitute-receipt head=${SHA} outcome=${outcome} -->`,
+    };
+  }
+
+  function independentReceipt(id: number, createdAt: string, verdict: string, blocking: number, prose: string) {
+    const json = JSON.stringify({ head: SHA, fresh_context: true, verdict, blocking_findings: blocking });
+    return { id, createdAt, body: `<!-- independent-review-receipt:v1 -->\n\`\`\`json\n${json}\n\`\`\`\n${prose}\n` };
+  }
+
+  const staleRounds = [
+    codexFinding(
+      'PRR_P1',
+      'tools/ingest/loader.py',
+      'Refresh the stale cached checkpoint before loading',
+      '2026-09-01T10:00:00Z',
+    ),
+    codexFinding(
+      'PRR_P2',
+      'tools/ingest/writer.py',
+      'Write from the reloaded state, not a stale snapshot',
+      '2026-09-01T12:00:00Z',
+    ),
+    codexFinding(
+      'PRR_P3',
+      'tools/ingest/steps/merge.py',
+      'Merge against fresh rows, not the cached snapshot',
+      '2026-09-01T14:00:00Z',
+    ),
+  ];
+
+  it('gates one invariant recurring in one Python directory, where no import names a seam', () => {
+    const payload: Payload = { findings: staleRounds, files: INGEST };
+    const decision = expectPlaceGate(payload, 'tools/ingest/');
+    expect(decision.unlifted[0].key).toBe('inv:staleness @ tools/ingest/');
+    const { text } = gate(payload);
+    expect(text).toContain('seam: tools/ingest/  (where the sites are; no import names a primitive)');
+    expect(text).toContain('it lifts on the\ntrailer alone');
+  });
+
+  it('keeps an invariant in two directories apart', () => {
+    const findings = [...staleRounds.slice(0, 2), { ...staleRounds[2], path: 'tools/export/sink.py' }];
+    expect(gate({ findings, files: INGEST }).status).toBe(0);
+  });
+
+  it('does not gate a directory whose rounds share no invariant', () => {
+    // A PR draws unrelated findings wherever it changes code; three rounds of
+    // them in one directory are review, not churn.
+    const findings = [
+      codexFinding('PRR_D1', 'tools/ingest/loader.py', 'Handle a null batch id', '2026-09-01T10:00:00Z'),
+      codexFinding(
+        'PRR_D2',
+        'tools/ingest/writer.py',
+        'Retry the upload without writing duplicates',
+        '2026-09-01T12:00:00Z',
+      ),
+      codexFinding('PRR_D3', 'tools/ingest/steps/merge.py', 'Stop the unbounded page scan', '2026-09-01T14:00:00Z'),
+    ];
+    const { status, decision } = gate({ findings, files: INGEST });
+    expect(status).toBe(0);
+    expect(decision.flagged).toHaveLength(0);
+  });
+
+  it('lifts a place only on a trailer naming a primitive the commit introduces', () => {
+    const after = '2026-09-02T00:00:00Z';
+    const patch = {
+      sha: 'bbb1111',
+      date: after,
+      message: 'fix: reload in the writer',
+      files: ['tools/ingest/writer.py'],
+    };
+    expect(gate({ findings: staleRounds, files: INGEST, commits: [patch] }).status).toBe(3);
+
+    const namesTheDirectory = { ...patch, message: 'fix: reload\n\nReframe: staleness enforced in ingest\n' };
+    expect(gate({ findings: staleRounds, files: INGEST, commits: [namesTheDirectory] }).status).toBe(3);
+
+    const reframe = {
+      sha: 'ccc2222',
+      date: after,
+      message: 'fix: one fresh read for every step\n\nReframe: staleness enforced in fresh_checkpoint\n',
+      files: ['tools/ingest/state.py'],
+      before: { 'tools/ingest/state.py': '' },
+      after: { 'tools/ingest/state.py': 'def fresh_checkpoint(store):\n    return store.reload()\n' },
+    };
+    const { status, decision } = gate({ findings: staleRounds, files: INGEST, commits: [reframe] });
+    expect(status).toBe(0);
+    expect(decision.flagged[0].liftedBy).toBe('reframe trailer');
+  });
+
+  it('counts findings from substitute receipts that asked for changes', () => {
+    // Paths as receipts write them: an absolute path into the reviewer's
+    // worktree, a partial path, and a bare filename.
+    const receipts = [
+      substituteReceipt(
+        11,
+        '2026-09-01T10:00:00Z',
+        'changes',
+        '- **P1 — [loader.py:40](/home/someone/wt-x/tools/ingest/loader.py:40):** Loads from a stale cached checkpoint.',
+      ),
+      substituteReceipt(
+        12,
+        '2026-09-01T12:00:00Z',
+        'changes',
+        '- **P1 — `ingest/writer.py:88`:** Writes from a stale snapshot after the reload.',
+      ),
+      substituteReceipt(
+        13,
+        '2026-09-01T14:00:00Z',
+        'changes',
+        '- **P2 — `merge.py`:** Merges against the stale cached rows.',
+      ),
+    ];
+    const decision = expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
+    expect(decision.unlifted[0].sites.map((site) => site.file)).toEqual([
+      'tools/ingest/loader.py',
+      'tools/ingest/writer.py',
+      'tools/ingest/steps/merge.py',
+    ]);
+  });
+
+  it('counts an independent receipt that is not clear, and nothing from one that is', () => {
+    const changes = independentReceipt(
+      21,
+      '2026-09-01T12:00:00Z',
+      'CHANGES',
+      1,
+      'One blocking finding.\n\n- R2-1: `tools/ingest/writer.py:88` writes from a stale cached snapshot.',
+    );
+    const findings = [staleRounds[0], staleRounds[2]];
+    expect(gate({ findings, receipts: [changes], files: INGEST }).status).toBe(3);
+
+    const clear = independentReceipt(
+      21,
+      '2026-09-01T12:00:00Z',
+      'CLEAR',
+      0,
+      'No blocking findings. `tools/ingest/writer.py` reads a stale snapshot, non-blocking.',
+    );
+    expect(gate({ findings, receipts: [clear], files: INGEST }).status).toBe(0);
+  });
+
+  it('counts nothing from a substitute receipt that approves', () => {
+    const approve = substituteReceipt(
+      31,
+      '2026-09-01T12:00:00Z',
+      'approve',
+      '- **P3 — `tools/ingest/writer.py`:** A stale snapshot comment.',
+    );
+    expect(gate({ findings: [staleRounds[0], staleRounds[2]], receipts: [approve], files: INGEST }).status).toBe(0);
+  });
+
+  it('never refuses on how many receipts there are, only on a recurring class', () => {
+    // Receipts are rounds for the classifier, not a round budget: five
+    // reviewers asking for five unrelated changes is not churn.
+    const titles = [
+      'Handle a null batch id',
+      'Retry without writing duplicates',
+      'Stop the unbounded scan',
+      'Check tenant ownership',
+      'Order the steps before commit',
+    ];
+    const receipts = titles.map((title, i) =>
+      substituteReceipt(40 + i, `2026-09-01T1${i}:00:00Z`, 'changes', `- **P1 — \`${INGEST[i % 4]}\`:** ${title}.`),
+    );
+    const { status, decision } = gate({ findings: [], receipts, files: INGEST });
+    expect(decision.report.totalRounds).toBe(5);
+    expect(status).toBe(0);
   });
 });
 

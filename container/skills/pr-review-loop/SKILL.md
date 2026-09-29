@@ -131,21 +131,19 @@ either:
 
 A commit that touches one more call site lifts nothing, which is the point.
 
-Two rounds counted are not gated. Neither is a class whose seam the classifier
-cannot **substantiate** — it is reported in the table and left alone. That
-covers two cases:
+Two rounds counted are not gated. A round is a Codex review or a substitute or
+independent receipt that asked for changes: each finding listed in a receipt that
+names a file in the tree counts at that file.
 
-- **No seam at all.** The sites share no import, so there is no primitive to
-  move the check into.
-- **A guessed seam.** All the findings landed on one file, so there was no
-  shared import to measure and the seam is whichever of that file's imports
-  ranked first. Unless the findings name something that module exports, the
-  ranking had no evidence behind it.
-
-Both would refuse with a primitive your fix has no reason to touch, leaving the
-override as the only way out — the failure this gate exists to prevent, arrived
-at by the gate. Read those rows yourself: they usually mean the findings were
-merged too coarsely, or the sites genuinely need splitting.
+When no import the flagged sites share can be **substantiated** — the sites
+share none, or all of them sit in one file whose findings name nothing the
+guessed module exports — the class gates on its **place** instead: the
+directory its files sit in, two path components deep (`tools/ingest/`), or the
+file itself at the repo root. That is how a Python, SQL or YAML class gates at
+all. A place names no primitive, so no diff lifts it; only a `Reframe:` trailer
+naming a primitive your commit introduces does. Only a class — one invariant —
+gates on a place: unrelated findings in one directory are review, not churn.
+A class whose findings name no file is reported and never gated.
 
 `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the refusal. It prints the override
 banner, and `codex-review.sh push` writes a line into the PR body naming the
@@ -548,7 +546,7 @@ The reviewer reads that diff: every line, including deletions. A regenerated `sr
 3. **Churning** (a class or seam recurring, or the substitute review still finds new defects): stop patching sites. Rebuild instead: fix the shared seam once, split the PR, or close it and redo the change in a fresh session with a reframed plan. A PR that needs more than six review rounds in total is the wrong PR, not an unlucky one. PR #566 went 12 rounds by patching.
 4. **The operator** hears only about a decision that is genuinely theirs (scope, product behaviour, an authority gate), in one or two lines with your recommendation.
 
-The churn gate cannot do this job alone: it derives seams from imports, so a finding class whose sites are Markdown or YAML never gates.
+The churn gate cannot do this job alone: it sees only a class that recurs, and a PR can churn across unrelated findings.
 
 ## When you compose the review prompt yourself
 

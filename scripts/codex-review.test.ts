@@ -714,7 +714,7 @@ if [[ "$1" == */comment-rule.mjs ]]; then
   printf '%s\\n' "\${MOCK_COMMENT_RULE_REPORT:-comment-rule: PASS}"
   exit "\${MOCK_COMMENT_RULE_STATUS:-0}"
 fi
-cat >/dev/null
+cat > "\${MOCK_GATE_PAYLOAD:-/dev/null}"
 printf 'node %s\\n' "$*" >> "$MOCK_CALLS"
 echo '{"status":"pass"}'
 exit "\${MOCK_GATE_STATUS:-0}"
@@ -1687,7 +1687,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(request.status).toBe(20);
     expect(request.stderr).toContain('automatic review handles this repo; never request');
     expect(request.posted).toBeNull();
-    expect(request.calls).not.toMatch(/^(node|pr comment)/m);
+    expect(request.calls).not.toMatch(/^pr comment/m);
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(merge.status).toBe(26);
@@ -2511,6 +2511,61 @@ describe('codex-review risk-scoped review requests', () => {
     const raised = runHelper(root, ['request'], { REVIEW_ROUND_CAP: '4' });
     expect(raised.status).toBe(0);
     expect(raised.posted).toContain(`head=${HEAD} round=4 -->`);
+  });
+
+  it('judges the churn gate in a legacy repo too, before refusing the request', () => {
+    const root = tempRoot();
+    scopeFixture(root, { baseConfig: null, labels: ['risk:high'] });
+
+    const result = runHelper(root, ['request'], { MOCK_GATE_STATUS: '3' });
+    expect(result.status).toBe(3);
+    expect(result.calls).toMatch(
+      new RegExp(`^node .*review-churn\\.mjs gate --json --committed-only --head ${HEAD}$`, 'm'),
+    );
+    expect(result.posted).toBeNull();
+  });
+
+  it('never counts receipts toward the round cap, which counts Codex requests alone', () => {
+    const root = tempRoot();
+    const heads = ['1', '2', '3', '4', '5'].map((c) => c.repeat(40));
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        marker(heads[0], 1),
+        marker(heads[1], 2),
+        receiptComment(heads[2], 'changes', '2026-09-05T01:00:00Z'),
+        receiptComment(heads[3], 'changes', '2026-09-05T02:00:00Z'),
+        independentReceipt(heads[4], 'CHANGES', 1, '2026-09-05T03:00:00Z'),
+      ],
+    });
+
+    const result = runHelper(root, ['request']);
+    expect(result.status).toBe(0);
+    expect(result.posted).toContain(`head=${HEAD} round=3 -->`);
+  });
+
+  it('hands the churn gate every receipt from a trusted author, beside the Codex threads', () => {
+    const root = tempRoot();
+    const other = '6'.repeat(40);
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        receiptComment(other, 'changes', '2026-09-05T01:00:00Z'),
+        receiptComment(other, 'changes', '2026-09-05T02:00:00Z', 'NONE'),
+        independentReceipt(other, 'CHANGES', 1, '2026-09-05T03:00:00Z'),
+        { ...receiptComment(other, 'changes', '2026-09-05T04:00:00Z'), body: 'an ordinary comment' },
+      ],
+    });
+    const payload = path.join(root, 'gate-payload.json');
+
+    const result = runHelper(root, ['gate'], { MOCK_GATE_PAYLOAD: payload });
+    expect(result.status).toBe(0);
+    const sent = JSON.parse(fs.readFileSync(payload, 'utf8')) as {
+      findings: unknown[];
+      receipts: { createdAt: string }[];
+    };
+    expect(sent.findings).toEqual([]);
+    expect(sent.receipts.map((r) => r.createdAt)).toEqual(['2026-09-05T01:00:00Z', '2026-09-05T03:00:00Z']);
   });
 
   it('propagates a churn-gate REFRAME from request without posting', () => {

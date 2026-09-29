@@ -444,8 +444,22 @@ findings_json() {
 # sites import the shared callee from), so repoRoot must be the checkout the
 # PR's branch is in.
 payload_json() {
-  jq -n --argjson findings "$(findings_json)" --arg root "$(git rev-parse --show-toplevel)" \
-    '{ findings: $findings, repoRoot: $root }'
+  jq -n --argjson findings "$(findings_json)" --argjson receipts "$(receipts_json)" \
+    --arg root "$(git rev-parse --show-toplevel)" \
+    '{ findings: $findings, receipts: $receipts, repoRoot: $root }'
+}
+
+# Substitute and independent review receipts, from the authors receipt_outcome
+# trusts. A receipt asking for changes is a round the classifier counts; the
+# classifier reads which ones did.
+receipts_json() {
+  local pages
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  printf '%s\n' "$pages" | jq -s --arg sub "$RECEIPT_MARKER_RE" --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" '
+    [ .[] | .data.repository.pullRequest.comments.nodes[]
+      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select((.body // "") | test($sub) or test($ind))
+      | { id: .fullDatabaseId, createdAt, body } ]'
 }
 
 # An override is not a private decision: it goes in the PR body where the
@@ -2791,6 +2805,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     # repo. Every refusal posts nothing and has its own exit code (header).
     scope_eval || exit 1
     if [ "$SCOPE_MODE" = legacy ]; then
+      run_gate --committed-only --head "$SCOPE_HEAD"
       echo "request refused: $REPO is not risk-scoped — automatic review handles this repo; never request a review here" >&2
       exit 20
     fi
@@ -2804,9 +2819,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
       exit 22
     fi
     # "After two failed corrections, stop correcting and reframe": the initial
-    # review plus two correction rounds. This cap is also what bounds a class
-    # the churn gate cannot see — the gate derives seams from imports, so
-    # findings on Markdown/YAML sites never gate.
+    # review plus two correction rounds.
     cap="${REVIEW_ROUND_CAP:-3}"
     if ! [[ "$cap" =~ ^[1-9][0-9]*$ ]]; then
       echo "REVIEW_ROUND_CAP must be a positive whole number" >&2
