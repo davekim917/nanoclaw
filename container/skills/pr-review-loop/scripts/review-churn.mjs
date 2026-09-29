@@ -663,7 +663,7 @@ function fileImports(file, seam, ctx) {
   return importsOf(source).some(({ spec }) => resolveSpec(file, spec) === seam);
 }
 
-function buildClass(signature, group, derived) {
+function buildClass(signature, group, derived, index) {
   const rounds = roundsOf(group);
   return {
     key: `${signature} @ ${derived.seam ?? derived.place ?? '-'}`,
@@ -673,6 +673,7 @@ function buildClass(signature, group, derived) {
     seamInRepo: derived.seamInRepo,
     seamSubstantiated: derived.substantiated,
     primitives: derived.primitives,
+    members: group.map((f) => index.get(f)),
     rounds: rounds.length,
     roundIds: rounds,
     findings: group.length,
@@ -694,6 +695,7 @@ function buildClass(signature, group, derived) {
 export function classify(payload) {
   const ctx = { repoRoot: payload.repoRoot, sources: payload.sources, head: payload.head };
   const findings = (payload.findings ?? []).filter((f) => f && f.body);
+  const index = new Map(findings.map((f, i) => [f, i]));
 
   // Pass 1 — group by invariant signature.
   const groups = new Map();
@@ -727,13 +729,11 @@ export function classify(payload) {
         }
         for (const [place, group] of byPlace) {
           const none = { seam: null, seamInRepo: false, substantiated: false, primitives: [], place };
-          built.push({ cls: buildClass(signature, group, none), group });
+          built.push({ cls: buildClass(signature, group, none, index), group });
         }
         break;
       }
-      // A guessed seam still feeds the rollup; the class gates on its place unless the rollup gates that seam.
-      const place = derived.substantiated ? null : pathSeam(members[0].path);
-      built.push({ cls: buildClass(signature, members, { ...derived, place }), group: members });
+      built.push({ cls: buildClass(signature, members, derived, index), group: members });
       remaining = remaining.filter((f) => !members.includes(f));
     }
   }
@@ -780,13 +780,29 @@ export function classify(payload) {
         primitives: [...new Set(entries.flatMap((e) => e.cls.primitives))].slice(0, 3),
         severityFalling: severityFalling(group),
         sites: group.map((f) => ({ file: f.path ?? '(none)', line: f.line ?? null, title: titleOf(f.body) })),
+        members: group.map((f) => index.get(f)),
       };
     })
     .sort((a, b) => b.rounds - a.rounds || a.seam.localeCompare(b.seam));
 
+  // Every finding of one invariant in one place, however the imports split its sites.
+  const places = [];
+  for (const [signature, group] of groups) {
+    const byPlace = new Map();
+    for (const f of group.filter((g) => g.path)) {
+      const place = pathSeam(f.path);
+      if (!byPlace.has(place)) byPlace.set(place, []);
+      byPlace.get(place).push(f);
+    }
+    for (const [place, members] of byPlace) {
+      places.push(buildClass(signature, members, { seam: null, place, primitives: [] }, index));
+    }
+  }
+
   return {
     classes: built.map((b) => b.cls),
     seams,
+    places,
     totalRounds: roundsOf(findings).length,
     totalFindings: findings.length,
   };
@@ -1011,28 +1027,28 @@ export function decideGate(payload, options = {}) {
         findings: s.findings,
         lastAt: s.lastAt,
         sites: s.sites,
+        members: s.members,
         severityFalling: false,
         reason: `${s.rounds} rounds on one seam with severity not falling`,
       });
     }
   }
-  const rolledUp = new Set(flagged.filter((f) => f.kind === 'seam').map((f) => f.seam));
+  const answered = new Set(flagged.flatMap((f) => f.members));
+  for (const p of report.places) {
+    if (p.rounds < CLASS_ROUND_LIMIT || p.members.some((m) => answered.has(m))) continue;
+    // Naming a guessed module as the primitive would refuse with something
+    // the fix has no reason to touch, so only an introduced primitive lifts.
+    flagged.push({
+      kind: 'place',
+      ...p,
+      seam: p.place,
+      seamKind: 'path',
+      seamInRepo: false,
+      reason: `${p.rounds} rounds on one finding class in one place`,
+    });
+  }
   for (const c of report.classes) {
-    if (c.rounds < CLASS_ROUND_LIMIT || (c.seam && c.seamSubstantiated) || rolledUp.has(c.seam)) continue;
-    if (c.place) {
-      // Naming a guessed module as the primitive would refuse with something
-      // the fix has no reason to touch, so only an introduced primitive lifts.
-      flagged.push({
-        kind: 'class',
-        ...c,
-        key: `${c.signature} @ ${c.place}`,
-        seam: c.place,
-        seamKind: 'path',
-        seamInRepo: false,
-        primitives: [],
-        reason: `${c.rounds} rounds on one finding class in one place`,
-      });
-    } else {
+    if (c.rounds >= CLASS_ROUND_LIMIT && !c.seam && !c.place) {
       // Listed, or "no finding class is gated" would hide a class at the limit.
       reported.push({ key: c.key, rounds: c.rounds, reason: 'no finding names a file' });
     }

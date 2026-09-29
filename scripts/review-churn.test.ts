@@ -1176,6 +1176,19 @@ describe('review-churn gate beyond the import graph', () => {
     expect(text).toContain('it lifts on the\ntrailer alone');
   });
 
+  it('gates a place whose sites an import spans only in part', () => {
+    const shared = "import { loadSnapshot } from './shared.js';\n";
+    const sources = {
+      'src/feature/a.ts': shared,
+      'src/feature/b.ts': shared,
+      'src/feature/c.ts': 'export const c = 1;\n',
+      'src/feature/shared.ts': 'export function loadSnapshot() {}\n',
+    };
+    const findings = staleRounds.map((f, i) => ({ ...f, path: `src/feature/${'abc'[i]}.ts` }));
+    const decision = expectPlaceGate({ findings, sources }, 'src/feature/');
+    expect(decision.unlifted[0].key).toBe('inv:staleness @ src/feature/');
+  });
+
   it('keeps an invariant in two directories apart', () => {
     const findings = [...staleRounds.slice(0, 2), { ...staleRounds[2], path: 'tools/export/sink.py' }];
     expect(gate({ findings, files: INGEST }).status).toBe(0);

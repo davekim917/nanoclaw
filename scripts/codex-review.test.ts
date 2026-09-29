@@ -2577,6 +2577,17 @@ describe('codex-review risk-scoped review requests', () => {
       expect(runHelper(root, ['request']).status).toBe(0);
     });
 
+    it("refuses when a checkpoint author's permission cannot be read, never counting them as a reader", () => {
+      const root = tempRoot();
+      const unreadable = checkpoint(HEAD, 'churning', 'MEMBER', 'flaky');
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), unreadable] });
+      fs.writeFileSync(path.join(root, 'permission--flaky.error'), '');
+      const result = runHelper(root, ['request']);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("could not read flaky's permission");
+      expect(result.posted).toBeNull();
+    });
+
     it('still lets the churn gate refuse a recurring class', () => {
       const result = request([checkpoint(HEAD, 'converging')], { MOCK_GATE_STATUS: '3' });
       expect(result.status).toBe(3);

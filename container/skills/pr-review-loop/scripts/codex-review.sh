@@ -455,16 +455,21 @@ payload_json() {
 # Receipts and checkpoints steer the gates, so only an author with write access
 # may post one that counts; association alone admits read and triage members.
 comments_by_writers() {
-  local pages comments login writers='[]'
+  local pages comments login permission writers='[]'
   pages=$(paginate_connection comments receipt_comments_page) || return 1
   comments=$(printf '%s\n' "$pages" | jq -cs '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
       | { login: (.author.login // ""), id: .fullDatabaseId, createdAt, body } ]') || return 1
   while IFS= read -r login; do
-    if [ -n "$login" ] && may_clear "$login"; then
-      writers=$(jq -cn --argjson w "$writers" --arg l "$login" '$w + [$l]')
-    fi
+    [ -n "$login" ] || continue
+    permission=$(repo_permission "$login") || {
+      echo "could not read $login's permission on $REPO; a receipt or checkpoint is never judged without it" >&2
+      return 1
+    }
+    case "$permission" in
+      admin|write) writers=$(jq -cn --argjson w "$writers" --arg l "$login" '$w + [$l]') ;;
+    esac
   done < <(printf '%s' "$comments" | jq -r '[ .[].login ] | unique | .[]')
   printf '%s' "$comments" | jq -c --argjson w "$writers" '[ .[] | select(.login as $l | $w | index($l)) ]'
 }
@@ -1809,9 +1814,13 @@ independent_receipt_state() {
 # write or above (`permission` folds maintain into write and triage into
 # read). Anything else, a failed read included, is no: the clear receipt does
 # not count and whatever it would have superseded stands.
+repo_permission() {
+  gh api "repos/$REPO/collaborators/$(jq -rn --arg l "$1" '$l | @uri')/permission" --jq .permission
+}
+
 may_clear() {
   local permission
-  permission=$(gh api "repos/$REPO/collaborators/$(jq -rn --arg l "$1" '$l | @uri')/permission" --jq .permission 2>/dev/null) || return 1
+  permission=$(repo_permission "$1" 2>/dev/null) || return 1
   [ "$permission" = admin ] || [ "$permission" = write ]
 }
 
@@ -2886,7 +2895,11 @@ $assessment
       exit 2
     fi
     requested=$(printf '%s' "$markers" | jq -er 'length') || exit 1
-    if [ "$requested" -ge "$cap" ] && [ "$(checkpoint_state "$SCOPE_HEAD")" != converging ]; then
+    checkpoint=none
+    if [ "$requested" -ge "$cap" ]; then
+      checkpoint=$(checkpoint_state "$SCOPE_HEAD") || { echo "request refused: the checkpoint for $SCOPE_HEAD could not be judged" >&2; exit 1; }
+    fi
+    if [ "$requested" -ge "$cap" ] && [ "$checkpoint" != converging ]; then
       {
         echo "CAP: $requested of $cap review rounds already requested on PR #$PR, and no converging checkpoint names $SCOPE_HEAD."
         echo "Checkpoint, not a stop: have a fresh-context assessor judge whether the rounds are converging or"
