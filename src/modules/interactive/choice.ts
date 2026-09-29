@@ -46,8 +46,9 @@ const MAX_DECISION_LINES = 10;
 const MAX_DECISION_EVIDENCE = 500;
 const MAX_RELEASE_CARD_TEXT = 1800; // Discord posts **title**, a blank line and the body, and cuts at 1900
 const HEX_RUN_RE = /[0-9a-f]{40}/i;
-const NOT_DISPLAY_SAFE_RE = /[\p{C}\p{M}\p{Default_Ignorable_Code_Point}]|(?! )\p{Z}/u;
-const VISIBLE_RE = /[\p{L}\p{N}]/u;
+const DISPLAY_SAFE_RE =
+  /^[\x20-\x7E\u00A3\u00B0\u00C0-\u00FF\u2013\u2014\u2018\u2019\u201C\u201D\u2022\u2026\u2192\u20AC]*$/;
+const VISIBLE_RE = /[A-Za-z0-9\u00C0-\u00FF]/;
 const EVIDENCE_RE = /^https:\/\/[^\s<>|]+$/;
 
 interface ReleaseDecision {
@@ -175,7 +176,7 @@ function parseReleaseDecision(value: unknown): ReleaseDecision | string {
   if (lines.length > MAX_DECISION_LINES) return `decision.ifItShips has over ${MAX_DECISION_LINES} lines`;
   const text = [question, ...lines, evidence];
   if (!text.every(isDisplaySafe)) {
-    return 'decision text must hold only visible characters and plain spaces';
+    return 'decision text must be plain text: ASCII, accented Latin letters, and ‘ ’ “ ” – — • … → £ € °';
   }
   if (text.some((t) => HEX_RUN_RE.test(t))) return 'decision text must not hold a commit SHA: the host pins the head';
   if (text.some((t) => t.includes(']('))) return 'decision text must not hold markdown links: put the link in evidence';
@@ -185,11 +186,11 @@ function parseReleaseDecision(value: unknown): ReleaseDecision | string {
 }
 
 function isDisplaySafe(normalized: string): boolean {
-  return !NOT_DISPLAY_SAFE_RE.test(normalized);
+  return DISPLAY_SAFE_RE.test(normalized);
 }
 
 function neutralize(text: string): string {
-  return text.replace(/</g, '‹').replace(/>/g, '›'); // Slack parses <…> as a link, mention or broadcast
+  return text.replace(/</g, '‹').replace(/>/g, '›').replace(/~/g, '∼'); // Slack <…> links/mentions; ~ strikes through
 }
 
 function canonicalReleaseChoice(

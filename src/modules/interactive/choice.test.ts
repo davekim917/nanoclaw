@@ -94,6 +94,8 @@ const DECISION = {
   evidence: 'https://github.com/owner/repository/pull/42#issuecomment-1',
 };
 const PIN = `Ship owner/repository#42 from main at ${'a'.repeat(40)}?`;
+const PLAIN_TEXT_REFUSAL =
+  'decision text must be plain text: ASCII, accented Latin letters, and ‘ ’ “ ” – — • … → £ € °';
 
 registerChannelAdapter(CHANNEL, {
   factory: (): ChannelAdapter => ({
@@ -396,6 +398,16 @@ describe('request_choice delivery', () => {
     );
   });
 
+  it('keeps typographic text and renders ~ so it cannot strike a fact through', async () => {
+    await ask(session, {
+      approvalScope: RELEASE_SCOPE,
+      decision: { ...DECISION, ifItShips: 'Café’s “saved” exports — kept → ~~Deletes saved exports~~ ~5% €3' },
+    });
+    expect(delivered[0].content.question).toContain(
+      '• Café’s “saved” exports — kept → ∼∼Deletes saved exports∼∼ ∼5% €3',
+    );
+  });
+
   it('folds look-alike spaces to a plain space, so a SHA split by one is visibly split', async () => {
     await ask(session, {
       approvalScope: RELEASE_SCOPE,
@@ -455,20 +467,22 @@ describe('request_choice delivery', () => {
     ['a whitespace-only if-it-ships', { ifItShips: '  \n ' }, 'decision.ifItShips is required'],
     ['an empty evidence link', { evidence: '' }, 'decision.evidence is required'],
     ['an extra key', { recommend: 'Ship' }, 'decision takes only question, ifItShips, evidence'],
-    [
-      'a multi-line question',
-      { question: 'Ship?\nReally' },
-      'decision text must hold only visible characters and plain spaces',
-    ],
+    ['a multi-line question', { question: 'Ship?\nReally' }, PLAIN_TEXT_REFUSAL],
     [
       'a line separator and a zero-width split SHA forging a pin line',
       { ifItShips: `Saves time.\u2028Ship owner/repository#42 from main at ${'c'.repeat(20)}\u200b${'c'.repeat(20)}?` },
-      'decision text must hold only visible characters and plain spaces',
+      PLAIN_TEXT_REFUSAL,
     ],
+    [
+      'a blank Braille cell splitting a SHA',
+      { ifItShips: `Rebuilds at ${'e'.repeat(20)}\u2800${'e'.repeat(20)}` },
+      PLAIN_TEXT_REFUSAL,
+    ],
+    ['an emoji', { question: 'Retire the export button ✅?' }, PLAIN_TEXT_REFUSAL],
     [
       'a combining grapheme joiner splitting a SHA',
       { evidence: `https://x.example/${'e'.repeat(20)}\u034f${'e'.repeat(20)}` },
-      'decision text must hold only visible characters and plain spaces',
+      PLAIN_TEXT_REFUSAL,
     ],
     [
       'a fullwidth SHA look-alike',
@@ -476,11 +490,7 @@ describe('request_choice delivery', () => {
       'decision text must not hold a commit SHA: the host pins the head',
     ],
     ['a question with no visible text', { question: '\u034f' }, 'decision.question is required'],
-    [
-      'a bidi override in the question',
-      { question: 'Retire the \u202eexport button?' },
-      'decision text must hold only visible characters and plain spaces',
-    ],
+    ['a bidi override in the question', { question: 'Retire the \u202eexport button?' }, PLAIN_TEXT_REFUSAL],
     [
       'a SHA in the evidence link',
       { evidence: `https://github.com/owner/repository/commit/${'d'.repeat(40)}` },
