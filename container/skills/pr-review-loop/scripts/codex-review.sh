@@ -450,38 +450,31 @@ payload_json() {
     '{ findings: $findings, receipts: $receipts, repoRoot: $root }'
 }
 
-# The comment pages $1 with each comment's `standing`: yes when it may steer a
-# gate, unknown when that cannot be told, else no. Permission, not association,
-# decides: a MEMBER or COLLABORATOR can hold read or triage only, so a trusted
-# association is only the precondition for a lookup. `permission` folds maintain
-# into write and triage into read (role_name has the granular role), so
-# admin|write is every role that may push. `audit` reads the
-# permission its merge recorded, since a lookup now would judge an old merge by
-# today's grants; a login the record does not name is unknown there. Otherwise
-# every lookup is appended to GATE_PERMISSION_RECORD, which `merge` writes into
-# the merge commit.
+# The comment pages $1 with each comment's `standing`: yes when its author may
+# steer a gate, else no. Permission, not association, decides: a MEMBER or
+# COLLABORATOR can hold read or triage only, so a trusted association is only
+# the precondition for a lookup. `permission` folds maintain into write and
+# triage into read (role_name has the granular role), so admin|write is every
+# role that may push. `audit` looks up the authors of comments edited since
+# the merge too, so an unreadable comment is judged by the same rule.
 author_standing() {
-  local logins login permission value standing='{}'
+  local logins login permission standing='{}'
   logins=$(printf '%s\n' "$1" | jq -rs --arg sub "$RECEIPT_MARKER_RE" --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" \
-    --arg chk "$CHECKPOINT_MARKER_RE" --arg cut "$CUT_DOWN_MARKER_RE" '
+    --arg chk "$CHECKPOINT_MARKER_RE" --arg cut "$CUT_DOWN_MARKER_RE" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | select((.body // "") | test($sub) or test($ind) or test($chk) or test($cut))
+      | select(((.body // "") | test($sub) or test($ind) or test($chk) or test($cut))
+               or ($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)))
       | .author.login | strings | select(. != "") ] | unique[]') || return 1
   while IFS= read -r login; do
     [ -n "$login" ] || continue
-    if [ -n "$GATE_AS_OF" ]; then
-      permission=$(printf '%s' "$GATE_PERMISSIONS" | jq -r --arg l "$login" '.[$l] // ""') || return 1
-      case "$permission" in admin|write) value=yes ;; '') value=unknown ;; *) value=no ;; esac
-    else
-      permission=$(repo_permission "$login") || {
-        echo "could not read $login's permission on $REPO; a receipt, checkpoint or cut-down comment is never judged without it" >&2
-        return 1
-      }
-      [ -z "${GATE_PERMISSION_RECORD:-}" ] || printf '%s=%s\n' "$login" "$permission" >> "$GATE_PERMISSION_RECORD"
-      case "$permission" in admin|write) value=yes ;; *) value=no ;; esac
-    fi
-    standing=$(jq -cn --argjson s "$standing" --arg l "$login" --arg v "$value" '$s + {($l): $v}') || return 1
+    permission=$(repo_permission "$login") || {
+      echo "could not read $login's permission on $REPO; a receipt, checkpoint or cut-down comment is never judged without it" >&2
+      return 1
+    }
+    case "$permission" in
+      admin|write) standing=$(jq -cn --argjson s "$standing" --arg l "$login" '$s + {($l): "yes"}') || return 1 ;;
+    esac
   done <<< "$logins"
   printf '%s\n' "$1" | jq -c --argjson s "$standing" '
     .data.repository.pullRequest.comments.nodes |= map(.standing = (
@@ -1069,9 +1062,6 @@ SCOPE_FILES=null
 SCOPE_PIN_BASE=""
 GATE_AS_OF=""
 GATE_LABELS=""
-# The permissions a merge's record names, as a JSON object; `audit` alone sets
-# it, and only from a merge commit whose whole body is the record `merge` writes.
-GATE_PERMISSIONS="{}"
 
 # The PR JSON $1, with the labels the PR had at its merge in place of the ones
 # gh reports now, once `audit` has set them.
@@ -1391,7 +1381,7 @@ receipt_outcome() {
   printf '%s\n' "$pages" | jq_here -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
-      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select(.standing == "yes")
       | select($asof == "" or .createdAt <= $asof)
       | .idstr = ((.fullDatabaseId // "") | tostring) ] as $comments
     | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)) ] as $unreadable
@@ -1399,11 +1389,9 @@ receipt_outcome() {
         | .createdAt as $at
         | .idstr as $idstr
         | .author as $author
-        | .standing as $standing
         | .body as $body
         | [ ($body // "" | capture($re)) ] | first // empty
         | select(.head == $head)
-        | select($standing == "yes" or ($standing == "unknown" and .outcome == "changes"))
         | { outcome, at: $at, idstr: $idstr, author: $author, reviewer: (($body // "" | capture($reviewerRe)).reviewer // "") } ] as $matches
     | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then
@@ -1425,8 +1413,8 @@ receipt_outcome() {
 # Whether any substitute receipt on this PR, for ANY head, asked for changes —
 # the review-notes rule's trigger (review_notes_state): `changes\t<who, which
 # head, when>` when one did, `none` when none did, `unknown\t<why>` when that
-# cannot be told. Read as receipt_outcome reads receipts: trusted authors only,
-# and under `audit` nothing posted after GATE_AS_OF. A trusted comment posted
+# cannot be told. Read as receipt_outcome reads receipts: authors with standing
+# only, and under `audit` nothing posted after GATE_AS_OF. Such a comment posted
 # in the merge's own second, or edited in or after it, is not read: GitHub's
 # timestamps are to the second, so either may have landed after the merge, and
 # its text at the merge is unknown. It could have been a `changes` receipt, so
@@ -1440,12 +1428,11 @@ changes_receipt_state() {
   pages=$(author_standing "$pages") || return 1
   printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
-      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select(.standing == "yes")
       | select($asof == "" or .createdAt <= $asof) ] as $comments
     | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)) ] as $unreadable
     | ([ $comments[] | select($asof == "" or ((.lastEditedAt // "") < $asof and .createdAt < $asof))
          | . as $c
-         | select($c.standing == "yes" or $c.standing == "unknown")
          | [ (.body // "") | capture($re; "g") | select(.outcome == "changes") ] | first // empty
          | { head, login: ($c.author.login // "someone"), at: $c.createdAt } ] | first) as $changes
     | ($unreadable | first) as $unread
@@ -1840,8 +1827,8 @@ independent_receipt_newest() {
     --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg head "$2" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
-      | select(.standing == "yes" or .standing == "unknown")
-      | { login: .author.login, writer: (.standing == "yes"), at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
+      | select(.standing == "yes")
+      | { login: .author.login, at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
       | [ (.body // "") | ltrimstr("\uFEFF") | splits($re) ] as $parts
       | select(($parts | length) > 1)
       | [ range(1; $parts | length) as $i
@@ -1856,7 +1843,7 @@ independent_receipt_newest() {
                      else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $receipts
       | ([ $receipts[] | select(.clear | not) ] | first) as $no
       | if $no != null then $c + { clear: false, said: $no.said }
-        elif $c.writer and ($parts | length) == 2 and ($receipts | length) == 1 and ($parts[0] | test("\\A[ \t\r\n]*\\z")) then $c + { clear: true, said: "" }
+        elif ($parts | length) == 2 and ($receipts | length) == 1 and ($parts[0] | test("\\A[ \t\r\n]*\\z")) then $c + { clear: true, said: "" }
         else empty end ] as $matches
     | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then
@@ -3023,23 +3010,19 @@ $assessment
     # this shell before its code is read. `( ... ) || checked=$?` would not do:
     # bash ignores errexit in anything run on the left of `||`, a subshell
     # that sets it again included (bash(1), `set -e`).
-    GATE_PERMISSION_RECORD=$(mktemp)
-    trap 'rm -f "$GATE_PERMISSION_RECORD"' EXIT
     set +e
     ( set -e; merge_check_main --head "$head" )
     checked=$?
     set -e
     if [ "$checked" -eq 25 ]; then
       echo "merge: the base moved while merge-check ran; checking once more" >&2
-      : > "$GATE_PERMISSION_RECORD"
       set +e
       ( set -e; merge_check_main --head "$head" )
       checked=$?
       set -e
     fi
     [ "$checked" -eq 0 ] || exit "$checked"
-    record=$(sort -u "$GATE_PERMISSION_RECORD" | paste -sd ' ' -)
-    gh pr merge "$PR" --repo "$REPO" "--$method" --match-head-commit "$head" --body "Gate-Permissions:${record:+ $record}" || {
+    gh pr merge "$PR" --repo "$REPO" "--$method" --match-head-commit "$head" || {
       echo "merge=failed head=$head: merge-check allowed it, but gh pr merge did not merge PR #$PR" >&2
       exit 27
     }
@@ -3093,7 +3076,7 @@ $assessment
       query($owner:String!,$name:String!,$pr:Int!){
         repository(owner:$owner,name:$name){ pullRequest(number:$pr){
           state mergedAt headRefOid title body
-          mergeCommit{ oid messageBody parents(first:3){ totalCount nodes{ oid } } signature{ isValid wasSignedByGitHub } }
+          mergeCommit{ oid parents(first:3){ totalCount nodes{ oid } } signature{ isValid wasSignedByGitHub } }
           userContentEdits(first:100){ pageInfo{hasNextPage} nodes{ editedAt deletedAt diff } }
           renames: timelineItems(itemTypes:[RENAMED_TITLE_EVENT],first:100){ pageInfo{hasNextPage} nodes{ ... on RenamedTitleEvent{ createdAt previousTitle } } }
           labelEvents: timelineItems(itemTypes:[LABELED_EVENT,UNLABELED_EVENT],first:100){ pageInfo{hasNextPage} nodes{
@@ -3142,11 +3125,6 @@ $assessment
     GATE_AS_OF=$(printf '%s' "$at_merge" | jq -r .mergedAt)
     SCOPE_PIN_BASE=$(printf '%s' "$at_merge" | jq -r .base)
     GATE_LABELS=$(printf '%s' "$at_merge" | jq -c .labels)
-    GATE_PERMISSIONS=$(printf '%s' "$audit_pr" | jq -c '
-      .data.repository.pullRequest.mergeCommit.messageBody // "" | rtrimstr("\n")
-      | if test("\\AGate-Permissions:( [^ =\n]+=[a-z]+)*\\z")
-        then [ ltrimstr("Gate-Permissions:") | splits(" ") | select(. != "") | capture("(?<k>[^=]+)=(?<v>.*)") | { (.k): .v } ] | add // {}
-        else {} end') || { echo "audit=error pr=$PR: could not read its merge commit's permission record" >&2; exit 1; }
     audit_head=$(printf '%s' "$at_merge" | jq -r .head)
     where="pr=$PR head=$audit_head base=$SCOPE_PIN_BASE merged=$GATE_AS_OF"
     scope_eval || { echo "audit=error $where: no scope verdict" >&2; exit 1; }

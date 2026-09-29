@@ -5368,8 +5368,6 @@ function auditFixture(
     labelEvents?: Page[];
     shape?: keyof typeof MERGE_SHAPES;
     parentConfig?: string | null;
-    permissions?: string | null;
-    mergeBody?: string;
   } = {},
 ): void {
   scopeFixture(root, opts);
@@ -5390,11 +5388,6 @@ function auditFixture(
           body: opts.body ?? '',
           mergeCommit: {
             oid: MERGE_OID,
-            messageBody:
-              opts.mergeBody ??
-              (opts.permissions === null
-                ? 'Merge the feature'
-                : `Gate-Permissions: ${opts.permissions ?? 'davekim917=admin release-desk=write'}`),
             parents: { totalCount: shape.parents.length, nodes: shape.parents.map((oid) => ({ oid })) },
             signature: shape.signature,
           },
@@ -5423,23 +5416,7 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
     );
     expect(result.stdout).toContain(`merged pr=1 head=${HEAD} method=merge commit=${MERGE_OID}`);
     expect(result.calls.match(/^merge-args .*$/gm)).toEqual([
-      `merge-args pr merge 1 --repo example/repository --merge --match-head-commit ${HEAD} --body Gate-Permissions:`,
-    ]);
-  });
-
-  it('records in the merge commit the permission each receipt author had', () => {
-    const root = tempRoot();
-    scopeFixture(root, {
-      labels: ['risk:high'],
-      comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')],
-    });
-    mergesTo(root);
-    fs.writeFileSync(path.join(root, 'permission--davekim917'), 'admin\n');
-
-    const result = runHelper(root, ['merge', '--head', HEAD]);
-    expect(result.status).toBe(0);
-    expect(result.calls.match(/^merge-args .*$/gm)).toEqual([
-      `merge-args pr merge 1 --repo example/repository --merge --match-head-commit ${HEAD} --body Gate-Permissions: davekim917=admin`,
+      `merge-args pr merge 1 --repo example/repository --merge --match-head-commit ${HEAD}`,
     ]);
   });
 
@@ -5760,48 +5737,47 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     expect(result.stdout).toContain(`verdict=review: ${reason}`);
   });
 
-  describe('permission as the merge recorded it', () => {
-    const APPROVAL = { comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')] };
-
-    it.each([
-      ['write when recorded, read now', 'davekim917=write', 'read', 0],
-      ['read when recorded, write now', 'davekim917=read', 'write', 28],
-    ])('judges an approving receipt whose author had %s by the record', (_case, record, now, code) => {
-      const root = tempRoot();
-      auditFixture(root, { labels: ['risk:high'], permissions: record, ...APPROVAL });
-      fs.writeFileSync(path.join(root, 'permission--davekim917'), `${now}\n`);
-
-      const result = runHelper(root, ['audit']);
-      expect(result.status).toBe(code);
-      expect(result.calls).not.toContain('/permission');
-    });
-
-    it('lets an author the record does not name block but never clear', () => {
-      const root = tempRoot();
-      auditFixture(root, { labels: ['risk:high'], permissions: null, ...APPROVAL });
-      expect(runHelper(root, ['audit']).status).toBe(28);
-
-      auditFixture(root, {
-        labels: ['risk:high'],
-        permissions: null,
-        comments: [receiptComment(OLD_HEAD, 'changes', '2026-09-05T00:10:00Z'), ...APPROVAL.comments],
-      });
-      const result = runHelper(root, ['audit']);
-      expect(result.status).toBe(28);
-      expect(result.stdout).toContain('review_notes_missing');
+  describe('permission, read at the audit', () => {
+    const APPROVAL = [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')];
+    const readOnlyEdit = (association: string): Page => ({
+      author: { login: 'reader' },
+      authorAssociation: association,
+      createdAt: '2026-09-05T00:10:00Z',
+      lastEditedAt: '2026-09-05T02:00:00Z',
+      fullDatabaseId: '10',
+      body: 'CI is green.',
     });
 
     it.each([
-      [
-        'inside a longer body, as a squash of the PR commits could carry it',
-        'Squashed\n\nGate-Permissions: davekim917=admin',
-      ],
-      ['in a form the merge never writes', 'Gate-Permissions: davekim917'],
-    ])('ignores a permission record %s', (_case, mergeBody) => {
+      ['write', 0],
+      ['read', 28],
+    ])('judges an approving receipt whose author has %s', (permission, code) => {
       const root = tempRoot();
-      auditFixture(root, { labels: ['risk:high'], mergeBody, ...APPROVAL });
+      auditFixture(root, { labels: ['risk:high'], comments: APPROVAL });
+      fs.writeFileSync(path.join(root, 'permission--davekim917'), `${permission}\n`);
 
-      expect(runHelper(root, ['audit']).status).toBe(28);
+      expect(runHelper(root, ['audit']).status).toBe(code);
+    });
+
+    it.each(['MEMBER', 'COLLABORATOR'])(
+      "passes over a read-only %s's comment edited after the merge",
+      (association) => {
+        const root = tempRoot();
+        auditFixture(root, { labels: ['risk:high'], comments: [readOnlyEdit(association), ...APPROVAL] });
+        fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+
+        const result = runHelper(root, ['audit']);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('audit=pass');
+      },
+    );
+
+    it('errors when an edited comment\'s author cannot be looked up', () => {
+      const root = tempRoot();
+      auditFixture(root, { labels: ['risk:high'], comments: [readOnlyEdit('MEMBER'), ...APPROVAL] });
+      fs.writeFileSync(path.join(root, 'permission--reader.error'), '');
+
+      expect(runHelper(root, ['audit']).status).not.toBe(0);
     });
   });
 
