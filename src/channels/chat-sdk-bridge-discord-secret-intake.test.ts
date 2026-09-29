@@ -1,7 +1,3 @@
-/**
- * The secret-intake card on Discord: the adapter has no modals, so the bridge answers the button with a modal and
- * the modal submit with the host hook's verdict. Driven through the real forwarded-Gateway path.
- */
 import http from 'http';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
