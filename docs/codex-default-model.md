@@ -54,8 +54,8 @@ For a fallback, set `providerFallback.model` in that group's `container.json`. `
 
 ```bash
 pnpm exec tsx scripts/q.ts data/v2.db "select agent_group_id, model, effort, count(*) from turn_usage where provider = 'codex' and ts > '<deploy time>' group by 1,2,3"
-docker exec <codex container> codex --version   # expect 0.159.0
-codex --version                                  # host, expect 0.159.0
+docker exec <codex container> codex --version   # expect 0.159.1 (the image pin)
+codex --version                                  # host, expect the same as the image pin
 ```
 
 **Rollback.**
