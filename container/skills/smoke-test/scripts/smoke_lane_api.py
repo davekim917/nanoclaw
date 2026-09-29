@@ -24,6 +24,15 @@ READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 SCOPE_LISTS = ("tenants", "authPaths", "readOnlyPosts", "denyPaths", "denyPrefixes")
 REQUIRED_LISTS = ("tenants", "denyPaths", "denyPrefixes")
 PINNED_KEYS = {"mode", "schemaVersion", "runId"}
+LEGACY_MODE = "allowlist"
+LEGACY_LISTS = ("tenants", "brands", "accounts", "authPaths", "readOnlyPosts")
+LEGACY_TARGET_KEYS = {
+    "accounts": {"accountid", "accountids", "account", "accounts"},
+    "tenants": {"tenantid", "tenantids", "tenant", "tenants"},
+    "brands": {"brandid", "brandids", "brand", "brands"},
+}
+ID_SEGMENT = re.compile(r".*\d.*")
+VERSION_SEGMENT = re.compile(r"v\d{1,2}")
 PATTERN_LISTS = ("authPaths", "readOnlyPosts", "denyPaths")
 TENANT_KEYS = {"tenantid", "tenantids", "tenant", "tenants"}
 TENANT_CLAIMS = ("tenantId", "tenant_id", "tenant")
@@ -49,9 +58,22 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def legacy_validated_scope(raw):
+    for key in LEGACY_LISTS:
+        value = raw.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(v, (str, int)) for v in value):
+            raise ValueError("{} must be a list of strings".format(key))
+    for key in ("authPaths", "readOnlyPosts"):
+        for pattern in raw.get(key, []):
+            re.compile(str(pattern))
+    return dict({key: [str(v) for v in raw.get(key, [])] for key in LEGACY_LISTS}, mode=LEGACY_MODE)
+
+
 def validated_scope(raw):
     if not isinstance(raw, dict):
         raise ValueError("scope is not an object")
+    if "mode" not in raw and set(raw) <= set(LEGACY_LISTS) | PINNED_KEYS:
+        return legacy_validated_scope(raw)
     if raw.get("mode") != SCOPE_MODE:
         raise ValueError("mode must be {!r} (an allowlist scope file is no longer accepted)".format(SCOPE_MODE))
     unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS)
@@ -83,7 +105,10 @@ def init_scope(run_dir, source):
     run_id = os.path.basename(os.path.normpath(run_dir))
     with open(source) as f:
         scope = validated_scope(json.load(f))
-    pinned = {**scope, "schemaVersion": 2, "runId": run_id}
+    if scope["mode"] == LEGACY_MODE:
+        pinned = {**{k: v for k, v in scope.items() if k != "mode"}, "schemaVersion": 1, "runId": run_id}
+    else:
+        pinned = {**scope, "schemaVersion": 2, "runId": run_id}
     with open(os.path.join(run_dir, SCOPE_FILE), "x") as f:
         json.dump(pinned, f, indent=1)
     return pinned
@@ -107,6 +132,20 @@ def load_scope(run_dir):
     if raw.get("runId") != run_id:
         raise WriteScopeRefused("scope-run-mismatch scope={} run={}".format(raw.get("runId"), run_id))
     return scope
+
+
+def ledger_ids(run_dir):
+    path = os.path.join(run_dir, LEDGER_FILE)
+    if not os.path.lexists(path):
+        return set()
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise WriteScopeRefused("unreadable-ledger path={}".format(path))
+    try:
+        with open(path) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        return {"{}/{}".format(r["path"].rstrip("/"), r["id"]) for r in rows}
+    except (OSError, ValueError, KeyError) as e:
+        raise WriteScopeRefused("unreadable-ledger error={}".format(e))
 
 
 def record_fixture(run_dir, create_path, fixture_id, name):
@@ -153,6 +192,37 @@ def denied(scope, route):
     return None
 
 
+def legacy_judge(run_dir, method, path, body, scope):
+    parsed = urllib.parse.urlsplit(path)
+    route = parsed.path
+    if method == "POST" and any(re.fullmatch(p, route) for p in scope["authPaths"]):
+        return "auth"
+    if method == "POST" and any(re.fullmatch(p, route) for p in scope["readOnlyPosts"]):
+        return "read-only-post"
+    fixtures = ledger_ids(run_dir)
+    owned, foreign = [], []
+    segments = route.split("/")
+    for i, segment in enumerate(segments):
+        segment = urllib.parse.unquote(segment)
+        if ID_SEGMENT.fullmatch(segment) and not (i == 1 and VERSION_SEGMENT.fullmatch(segment)):
+            (owned if "/".join(segments[:i + 1]) in fixtures else foreign).append(segment)
+    pairs = list(walk(body)) + urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    for key, value in pairs:
+        norm = key.lower().replace("_", "")
+        for kind, keys in LEGACY_TARGET_KEYS.items():
+            if norm in keys:
+                for v in scalars(value):
+                    (owned if v in scope[kind] else foreign).append("{}={}".format(key, v))
+    if foreign:
+        raise WriteScopeRefused("foreign-target targets={}".format(",".join(foreign)))
+    prefix = fixture_prefix(run_dir)
+    qa_named = method == "POST" and isinstance(body, dict) and any(
+        k.lower() in NAME_KEYS and isinstance(v, str) and v.startswith(prefix) for k, v in body.items())
+    if not owned and not qa_named:
+        raise WriteScopeRefused("no-qa-target (names no {}* object and no id this run created)".format(prefix))
+    return "write"
+
+
 def tenant_key(key):
     return any(part.replace("_", "").replace("-", "") in TENANT_KEYS
                for part in re.split(r"[\[\]]", key.lower()) if part)
@@ -166,6 +236,8 @@ def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
     if method in READ_METHODS:
         return "read"
     scope = load_scope(run_dir)
+    if scope["mode"] == LEGACY_MODE:
+        return legacy_judge(run_dir, method, path, body, scope)
     rule = denied(scope, route)
     if rule:
         raise WriteScopeRefused("denied-path rule={}".format(rule))

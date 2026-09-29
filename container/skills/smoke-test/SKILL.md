@@ -401,8 +401,13 @@ tenant key in the body or query (`tenantId`, `tenant_id`, `tenant-id`,
 `filter[tenantId]`, ...) names a tenant outside `tenants` (null or
 empty counts as outside); or the seat's token carries no tenant claim, or one
 outside `tenants`. Paths are compared lowercased, percent-decoded and with
-empty segments dropped; dot segments are refused. An allowlist-era scope file
-(no `mode`), a missing, unreadable or other-run scope refuses every write.
+empty segments dropped; dot segments are refused. A missing, unreadable or
+other-run scope refuses every write. For one release, an allowlist-era file
+(no `mode`, only `tenants`/`brands`/`accounts`/`authPaths`/`readOnlyPosts`)
+is still accepted, at `init` and as a run's existing pin, and judged by its old
+rules: a write needs a `QA-<runId>-` name on a POST, an `h.own` fixture in its
+path, or an allowlisted target, and no foreign id. A file mixing both formats
+is refused.
 `h.own(tag, seat, create_path, id, name)` still ledgers a QA fixture it reads
 back by id and exact name (`<run-dir>/write-scope-fixtures.ndjson`), for
 cleanup; no write needs it.
