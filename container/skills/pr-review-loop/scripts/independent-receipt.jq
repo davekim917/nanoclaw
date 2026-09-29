@@ -1,5 +1,7 @@
 # One comment body's answer as an independent-review receipt for head $head:
-# {clear, said}, or nothing when it carries no receipt for that head. The merge
+# {clear, said}, or nothing when it carries no receipt for that head, or only
+# clear ones it will not vouch for (not first in the body, or beside another
+# marker): those clear nothing and mask nothing. The merge
 # gate asks about the PR's head; the churn gate passes "" to judge each receipt
 # against the head it names.
 def independent_verdict($re; $jsonRe; $head):
