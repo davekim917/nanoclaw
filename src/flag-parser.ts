@@ -78,7 +78,7 @@ const FAMILY_DEFAULTS: Record<string, string> = {
  * alias mechanism, so the runner receives this map as NANOCLAW_CODEX_MODEL_ALIASES.
  */
 export const CODEX_FAMILY_DEFAULTS: Readonly<Record<string, string>> = Object.freeze({
-  sol: 'gpt-6-sol',
+  sol: 'gpt-6.1-sol',
   luna: 'gpt-6-luna',
   astra: 'gpt-6-astra',
   terra: 'gpt-5.6-terra',
@@ -152,6 +152,7 @@ const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
   'gpt5.6-luna': 'gpt-5.6-luna',
   'gpt6-astra': 'gpt-6-astra',
   'gpt6-sol': 'gpt-6-sol',
+  'gpt6.1-sol': 'gpt-6.1-sol',
   'gpt6-luna': 'gpt-6-luna',
   // Bare family names are stored as typed and resolved at use (CODEX_FAMILY_DEFAULTS).
 };
@@ -187,7 +188,7 @@ const CLAUDE_VOCAB: ProviderFlagVocab = {
 const CODEX_VOCAB: ProviderFlagVocab = {
   resolveModel: (raw) => CODEX_MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw.toLowerCase(),
   isValidModel: (resolved) => CODEX_VALID_MODEL_RE.test(resolved) || Object.hasOwn(CODEX_FAMILY_DEFAULTS, resolved),
-  modelHint: ' (codex models look like gpt-6-sol, gpt-5.5; family aliases that follow bumps: luna|terra|sol|astra)',
+  modelHint: ' (codex models look like gpt-6.1-sol, gpt-5.5; family aliases that follow bumps: luna|terra|sol|astra)',
   validEfforts: CODEX_VALID_EFFORT,
   effortHint: 'low|medium|high|xhigh|max|ultra',
   allowsUltracode: false,
