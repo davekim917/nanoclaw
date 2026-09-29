@@ -1,5 +1,5 @@
 diff --git a/dist/index.js b/dist/index.js
-index e4f6fe07808ab3c9858fda724c36f7aef5084502..c27c6aaa40d732eca409dc9fe2d90f9b269dc357 100644
+index e4f6fe07808ab3c9858fda724c36f7aef5084502..e69135f187c27e8ee8e9d477357f291ffbe3fb76 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -276,7 +276,13 @@ var DiscordFormatConverter = class extends BaseFormatConverter {
@@ -29,6 +29,17 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..c27c6aaa40d732eca409dc9fe2d90f9b
      }
      if (isStrongNode(node)) {
        const content = getNodeChildren(node).map((child) => this.nodeToDiscordMarkdown(child)).join("");
+@@ -1177,8 +1186,8 @@ var DiscordAdapter = class _DiscordAdapter {
+         "POST",
+         {
+           name: threadName,
+-          auto_archive_duration: 1440
+-          // 24 hours
++          auto_archive_duration: 10080
++          // 1 week
+         }
+       );
+       const result = await response.json();
 @@ -1786,14 +1795,23 @@ var DiscordAdapter = class _DiscordAdapter {
          this.logger.debug("Ignoring message - Gateway is shutting down");
          return;

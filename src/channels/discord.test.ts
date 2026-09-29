@@ -743,7 +743,7 @@ describe('discordCreateThread', () => {
     const mockRest: DiscordRestClient = { post: postSpy };
     await discordCreateThread(mockRest, 'channel', 'parent', 'My Task Name', 'first');
     // First call: thread creation with name and startMessage (via Routes.threads)
-    expect(postSpy.mock.calls[0][1]).toEqual({ body: { name: 'My Task Name' } });
+    expect(postSpy.mock.calls[0][1]).toEqual({ body: { name: 'My Task Name', auto_archive_duration: 10080 } });
     expect(postSpy.mock.calls[0][0]).toContain('/channels/channel/messages/parent/threads');
   });
 
@@ -922,7 +922,7 @@ describe('openRecoveredMentionThread', () => {
       openRecoveredMentionThread({ post }, platformId, { id: 'm1', text: '<@42> what does Chris need?' }),
     ).resolves.toBe('discord:g1:c1:m1');
     expect(post).toHaveBeenCalledWith('/channels/c1/messages/m1/threads', {
-      body: { name: 'what does Chris need?', auto_archive_duration: 1440 },
+      body: { name: 'what does Chris need?', auto_archive_duration: 10080 },
     });
   });
 

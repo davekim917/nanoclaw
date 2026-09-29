@@ -14,6 +14,7 @@ import {
   GatewayIntentBits,
   REST,
   Routes,
+  ThreadAutoArchiveDuration,
   type ChatInputCommandInteraction,
   type Interaction,
   type TextChannel,
@@ -292,10 +293,12 @@ async function handleUpdateContainer(interaction: ChatInputCommandInteraction): 
   const platformId = encodeId();
 
   // Mention-sticky engages in-thread without an @mention, so the user can reply "yes" in the audit thread.
-  const AUTO_ARCHIVE_24H = 1440;
   let threadId: string | null = null;
   try {
-    const thread = await reply.startThread({ name: 'Container update', autoArchiveDuration: AUTO_ARCHIVE_24H });
+    const thread = await reply.startThread({
+      name: 'Container update',
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+    });
     threadId = encodeId(thread.id);
   } catch (err) {
     log.warn('Failed to open audit thread, falling back to channel root', {
