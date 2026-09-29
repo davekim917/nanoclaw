@@ -75,10 +75,19 @@ function turn(
 describe('family-default effort follows the RESOLVED model, not the opus alias', () => {
   it('test_sonnet_pinned_group_gets_sonnets_family_default', () => {
     // The live bug on main: a channel wiring with default_model=sonnet and no
-    // default_effort. Sonnet 5's fleet default is xhigh; it was running high.
+    // default_effort. The effort must be Sonnet's family default, not Opus's.
     const o = turn({}, { groupModel: 'claude-sonnet-5' });
     expect(o?.model).toBe('claude-sonnet-5');
-    expect(o?.effort).toBe('xhigh');
+    expect(o?.effort).toBe('high');
+  });
+
+  it('test_sonnet_5_5_defaults_to_high_by_id_and_by_family_word', () => {
+    const byId = turn({}, { groupModel: 'claude-sonnet-5-5' });
+    expect(byId?.model).toBe('claude-sonnet-5-5');
+    expect(byId?.effort).toBe('high');
+    const byFamilyWord = turn({}, {}, { model: 'sonnet' });
+    expect(byFamilyWord?.model).toBe('sonnet');
+    expect(byFamilyWord?.effort).toBe('high');
   });
 
   it('test_haiku_pinned_group_sends_no_effort_at_all', () => {
@@ -156,7 +165,7 @@ describe('every other precedence layer is untouched', () => {
     // the alias var. It must keep running that model, not the install default.
     const o = turn({}, { alias: 'claude-sonnet-5' });
     expect(o?.model).toBe('claude-sonnet-5');
-    expect(o?.effort).toBe('xhigh');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_the_group_model_outranks_the_opus_alias_answer', () => {
@@ -165,7 +174,7 @@ describe('every other precedence layer is untouched', () => {
     // constant can never retarget a Sonnet group.
     const o = turn({}, { groupModel: 'claude-sonnet-5', alias: 'claude-opus-5[1m]' });
     expect(o?.model).toBe('claude-sonnet-5');
-    expect(o?.effort).toBe('xhigh');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_no_host_env_at_all_falls_back_to_the_bare_alias', () => {
@@ -202,11 +211,11 @@ describe('an unpinned scheduled task lands on the group default, not a literal',
   it('test_unpinned_task_uses_the_groups_configured_model', () => {
     // A group whose container.json sets sonnet. Pre-removal an unpinned task
     // ran the literal 'sonnet' regardless; now it runs what the group set,
-    // and picks up sonnet's own family default effort rather than 'xhigh'
-    // being forced alongside it.
+    // and picks up sonnet's own family default effort, with nothing forced
+    // alongside it.
     const o = turn({}, { groupModel: 'claude-sonnet-5' }, { model: undefined, effort: undefined });
     expect(o?.model).toBe('claude-sonnet-5');
-    expect(o?.effort).toBe('xhigh');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_unpinned_task_on_an_unconfigured_group_is_opus_at_high', () => {

@@ -8,6 +8,7 @@ import {
   isOpenCodeModelSlug,
   DEFAULT_OPUS_MODEL,
   DEFAULT_FABLE_MODEL,
+  DEFAULT_SONNET_MODEL,
   CODEX_FAMILY_DEFAULTS,
   resolveEffectiveModel,
 } from './flag-parser.js';
@@ -33,7 +34,7 @@ describe('formatFlagConfirmation model rendering', () => {
 
   it('resolves sonnet and haiku family aliases too', () => {
     const s = parseMessageFlags('-m sonnet hi');
-    expect(formatFlagConfirmation(s.intent ?? {}, s.warnings, s.errors)).toContain('claude-sonnet-5');
+    expect(formatFlagConfirmation(s.intent ?? {}, s.warnings, s.errors)).toContain(DEFAULT_SONNET_MODEL);
     const h = parseMessageFlags('-m haiku hi');
     expect(formatFlagConfirmation(h.intent ?? {}, h.warnings, h.errors)).toContain('claude-haiku-4-5');
   });
@@ -49,6 +50,9 @@ describe('resolveModelAlias', () => {
     expect(resolveModelAlias('opus5')).toBe('claude-opus-5[1m]');
     expect(resolveModelAlias('opus48')).toBe('claude-opus-4-8[1m]');
     expect(resolveModelAlias('sonnet5')).toBe('claude-sonnet-5');
+    expect(resolveModelAlias('sonnet55')).toBe('claude-sonnet-5-5');
+    expect(resolveModelAlias('sonnet5-5')).toBe('claude-sonnet-5-5');
+    expect(resolveModelAlias('sonnet-5-5')).toBe('claude-sonnet-5-5');
     expect(resolveModelAlias('haiku45')).toBe('claude-haiku-4-5');
   });
 
@@ -79,6 +83,7 @@ describe('ensureOpus1mSuffix', () => {
   it('leaves family aliases and non-opus models untouched', () => {
     expect(ensureOpus1mSuffix('opus')).toBe('opus');
     expect(ensureOpus1mSuffix('claude-sonnet-5')).toBe('claude-sonnet-5');
+    expect(ensureOpus1mSuffix('claude-sonnet-5-5')).toBe('claude-sonnet-5-5');
     expect(ensureOpus1mSuffix('claude-haiku-4-5')).toBe('claude-haiku-4-5');
   });
 });
@@ -310,6 +315,21 @@ describe('parseMessageFlags', () => {
       const r = parseMessageFlags('-m claude-sonnet-5 -e xhigh explain');
       expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-5', stickyEffort: 'xhigh' });
       expect(r.warnings).toEqual([]);
+    });
+
+    it('accepts a claude-sonnet-5-5 pin and its aliases, with every effort level through max', () => {
+      for (const model of ['claude-sonnet-5-5', 'sonnet55']) {
+        for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+          const r = parseMessageFlags(`-m ${model} -e ${effort} explain`);
+          expect(r.errors).toEqual([]);
+          expect(r.warnings).toEqual([]);
+          expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-5-5', stickyEffort: effort });
+        }
+      }
+    });
+
+    it('resolves the bare sonnet family word to the install Sonnet default', () => {
+      expect(resolveEffectiveModel('sonnet')).toBe(DEFAULT_SONNET_MODEL);
     });
 
     it('errors on unknown model', () => {

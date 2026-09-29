@@ -411,9 +411,9 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBeUndefined();
   });
 
-  it('test_effort_default_sonnet_xhigh: Sonnet 5 defaults to xhigh (fleet default)', () => {
+  it('test_effort_default_sonnet_high: Sonnet 5 defaults to high (fleet default)', () => {
     const opts = run({ model: 'claude-sonnet-5' });
-    expect(opts?.effort).toBe('xhigh');
+    expect(opts?.effort).toBe('high');
   });
 
   it('test_effort_operator_env_overrides_family_default: NANOCLAW_EFFORT_OVERRIDE beats the family default', () => {

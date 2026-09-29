@@ -45,6 +45,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { resolveGroupProvider } from '../../container-config.js';
+import { DEFAULT_SONNET_MODEL } from '../../flag-parser.js';
 import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { validateTaskPin } from '../../modules/scheduling/task-flags.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
@@ -3055,11 +3056,11 @@ describe('ncl tasks repin', () => {
 
   it('matches LITERALLY by default and reports the near-miss instead of silently looking exhaustive', async () => {
     const alias = await makePinnedTask('ag-1', 'alias', { model: 'sonnet' });
-    const frozen = await makePinnedTask('ag-1', 'frozen', { model: 'claude-sonnet-5' });
+    const frozen = await makePinnedTask('ag-1', 'frozen', { model: DEFAULT_SONNET_MODEL });
 
     const literal = await repin({
       group: 'ag-1',
-      from_model: 'claude-sonnet-5',
+      from_model: DEFAULT_SONNET_MODEL,
       to_model: 'claude-opus-5[1m]',
       dry_run: true,
     });
@@ -3070,14 +3071,14 @@ describe('ncl tasks repin', () => {
       near_misses: Array<{ series_id: string; model: string | null }>;
     };
     expect(data.matched).toBe(1);
-    // `sonnet` resolves to claude-sonnet-5 but is a DIFFERENT pin: it tracks
+    // `sonnet` resolves to DEFAULT_SONNET_MODEL but is a DIFFERENT pin: it tracks
     // the install default across future bumps. Rewriting it would freeze it.
     expect(data.near_misses).toEqual([expect.objectContaining({ series_id: alias.series_id, model: 'sonnet' })]);
     expect(frozen.series_id).toBeTruthy();
 
     const unified = await repin({
       group: 'ag-1',
-      from_model: 'claude-sonnet-5',
+      from_model: DEFAULT_SONNET_MODEL,
       to_model: 'claude-opus-5[1m]',
       match_resolved: true,
       dry_run: true,
