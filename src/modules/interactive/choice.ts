@@ -44,7 +44,7 @@ const MAX_DECISION_QUESTION = 300;
 const MAX_DECISION_IF_IT_SHIPS = 1200;
 const MAX_DECISION_LINES = 10;
 const MAX_DECISION_EVIDENCE = 500;
-const MAX_RELEASE_QUESTION = 1800; // Discord cuts a card at 2000 characters, title included
+const MAX_RELEASE_CARD_TEXT = 1800; // Discord posts **title**, a blank line and the body, and cuts at 1900
 const HEX_RUN_RE = /[0-9a-f]{40}/i;
 const CONTROL_RE = /\p{Cc}/u;
 const EVIDENCE_RE = /^https:\/\/[^\s<>|]+$/;
@@ -84,10 +84,9 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
     return { error: 'a release card needs decision {question, ifItShips, evidence}: an approver must see what ships' };
   }
   const canonical = scope ? canonicalReleaseChoice(scope, brief) : undefined;
-  if (canonical && canonical.question.length > MAX_RELEASE_QUESTION) {
-    return {
-      error: `decision is too long for one card: shorten it by ${canonical.question.length - MAX_RELEASE_QUESTION} characters`,
-    };
+  const cardText = canonical ? `**${canonical.title}**\n\n${canonical.question}`.length : 0;
+  if (cardText > MAX_RELEASE_CARD_TEXT) {
+    return { error: `decision is too long for one card: shorten it by ${cardText - MAX_RELEASE_CARD_TEXT} characters` };
   }
   const genericTitle = typeof title === 'string' && title.trim() ? title : undefined;
   const genericQuestion = typeof question === 'string' && question.trim() ? question : undefined;

@@ -443,6 +443,30 @@ describe('request_choice delivery', () => {
     expect(notes().map((n) => n.text)).toEqual([`request_choice failed: ${error}`]);
   });
 
+  it('counts the title against the card budget, so an accepted decision is never cut', async () => {
+    const scope = { ...RELEASE_SCOPE, repository: `${'o'.repeat(100)}/${'r'.repeat(100)}` };
+    const title = `Release approval: ${scope.repository}#42`;
+    const pin = `Ship ${scope.repository}#42 from main at ${'a'.repeat(40)}?`;
+    const body = (lines: string[]) =>
+      [
+        pin,
+        '',
+        'The requesting agent’s brief (its words, not checked by the host):',
+        `The question: ${DECISION.question}`,
+        'If it ships:',
+        ...lines.map((l) => `• ${l}`),
+        `Evidence: ${DECISION.evidence}`,
+      ].join('\n');
+    const lines = Array.from({ length: 10 }, () => 'x'.repeat(119));
+    lines[9] = 'x'.repeat(119 - (body(lines).length + title.length + 6 - 1801));
+    expect(body(lines).length).toBeLessThanOrEqual(1800);
+    await ask(session, { approvalScope: scope, decision: { ...DECISION, ifItShips: lines.join('\n') } });
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: decision is too long for one card: shorten it by 1 characters',
+    ]);
+  });
+
   it('refuses a decision that would not fit on one card', async () => {
     const long = { ...RELEASE_SCOPE, base: 'b'.repeat(255) };
     const ifItShips = Array.from({ length: 10 }, () => 'x'.repeat(115)).join('\n');
