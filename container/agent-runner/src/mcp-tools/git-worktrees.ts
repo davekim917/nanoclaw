@@ -1308,7 +1308,8 @@ export const gitPushTool: McpToolDefinition = {
       "Push this checkout's branch through the container-scoped origin identity. Sends the branch and commit " +
       'as they stood when the call started, so work a sibling adds meanwhile is not carried along — push again to ' +
       'send it. Refused while the pr-review-loop churn gate is holding: three review rounds on one finding class ' +
-      'means the fix belongs in the primitive every flagged site calls, not at one more site.',
+      'means the fix belongs in the primitive every flagged site calls, not at one more site; and once the PR has ' +
+      'run past its review round cap, counting every reviewer, the next push is refused too.',
     inputSchema: {
       type: 'object' as const,
       properties: {

@@ -6,14 +6,14 @@
 #   codex-review.sh churn                     # findings by file AND by class across rounds — the churn detector
 #   codex-review.sh classes [--json]          # the class table alone (invariant signature @ seam)
 #   codex-review.sh gate [--committed-only] [--head <sha>]
-#                                             # REFRAME gate: exit 3 when a class has run 3 rounds unfixed
+#                                             # REFRAME gate: exit 3 when a class has run 3 rounds unfixed, or the PR is past REVIEW_ROUND_CAP
 #   codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 #   codex-review.sh reply <comment_id> <text> # reply on that thread
 #   codex-review.sh resolve <thread_id>       # mark the thread resolved
 #   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings|unavailable|head-changed> head=<sha> open=<n> review=<n> last_review_at=<iso|none> reaction=<n> last_thumbs_up_at=<iso|none> rounds=<n>
 #   codex-review.sh wait <sha> <since_iso> [minutes]
 #                                             # foreground GraphQL poll, default $CODEX_REVIEW_WAIT_MINUTES or 15
-#                                             # open/status print a STOP banner at rounds>=4 — diagnose, do not push
+#                                             # open/status print a STOP banner past REVIEW_ROUND_CAP — the gate refuses the next push
 #   codex-review.sh ci-wait --head <sha> [--timeout <sec>]
 #                                             # wait for CI on exactly that head: 0 green, 29 red, 30 no run registered,
 #                                             # 31 the PR conflicts with its base, 11 timeout, 12 head moved
@@ -40,7 +40,7 @@
 #   20  request: not risk-scoped — automatic review handles this repo; never request
 #   21  request: scope verdict is skip — this head merges on green CI, no round
 #   22  request: a review of this head was already requested
-#   23  request: REVIEW_ROUND_CAP reached — checkpoint: converge via substitute review, or rebuild
+#   23  request: REVIEW_ROUND_CAP reached (review_rounds) — checkpoint: converge via substitute review, or rebuild
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
 #       neither a clean Codex review nor an approving substitute receipt, the
 #       approving receipt's reviewer is not a frontier model id, it is a
@@ -292,7 +292,7 @@ status_observation() {
   # requests must have its findings included before we can declare it clean.
   review_pages=$(paginate_connection reviews reviews_page) || return 1
   reaction_pages=$(paginate_connection reactions reactions_page) || return 1
-  comment_pages=$(paginate_connection comments comments_page) || return 1
+  comment_pages=$(paginate_connection comments receipt_comments_page) || return 1
   thread_pages=$(paginate_connection reviewThreads review_threads_page) || return 1
 
   observed_heads=$(printf '%s\n%s\n%s\n%s\n' "$thread_pages" "$review_pages" "$comment_pages" "$reaction_pages" | jq -ers '
@@ -315,11 +315,7 @@ status_observation() {
       | select(.isResolved | not)
       | select((.comments.nodes[0].author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
     ] | length') || return 1
-  rounds=$(printf '%s\n' "$thread_pages" | jq -s '
-    [ .[] | .data.repository.pullRequest.reviewThreads.nodes[]
-      | select((.comments.nodes[0].author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
-      | .comments.nodes[0].pullRequestReview.id // empty
-    ] | unique | length') || return 1
+  rounds=$(review_rounds_of "$review_pages" "$comment_pages") || return 1
   review_matches=$(printf '%s\n' "$review_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" --arg until "$GATE_AS_OF" --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" '
     [ .[] | .data.repository.pullRequest.reviews.nodes[]
       | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
@@ -392,22 +388,61 @@ status_observation() {
   fi
 }
 
-# Distinct Codex reviews that produced findings — the PR's round count.
-# Printed on open/status so the number is impossible to not see; at 4+ the
-# banner mandates the stop-and-diagnose path in SKILL.md instead of a push.
-rounds_count() {
-  gh api --paginate --slurp "repos/$REPO/pulls/$PR/comments" \
-    | jq '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector")) | .pull_request_review_id] | unique | length'
+# A round is a head any reviewer reviewed. Cut-down receipts are not rounds: that
+# pass only deletes and is mandatory above CUT_DOWN_THRESHOLD. Comments count only
+# from the authors receipt_outcome trusts, so an outsider cannot run a PR into the cap.
+review_rounds_of() {
+  printf '%s\n%s\n' "$1" "$2" | jq -rs --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" \
+    --arg requestRe "$REQUEST_MARKER_RE" --arg receiptRe "$RECEIPT_MARKER_RE" \
+    --arg independentRe "$INDEPENDENT_RECEIPT_MARKER_RE" --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" \
+    --arg asof "$GATE_AS_OF" '
+    def sha: select(type == "string" and test("\\A[0-9a-f]{40}\\z"));
+    [ .[] | .data.repository.pullRequest
+      | ( .reviews.nodes[]?
+          | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+          | select($asof == "" or (.submittedAt // "") <= $asof)
+          | select((.body // "") | test($usageLimitRe; "i") | not)
+          | ([ .commit.oid | sha ] | first) // "a Codex review at \(.submittedAt) with no commit" ),
+        ( .comments.nodes[]?
+          | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+          | select($asof == "" or (.createdAt // "") <= $asof)
+          | ((.fullDatabaseId // .createdAt) | tostring) as $id
+          | (.body // "" | ltrimstr("\uFEFF")) as $body
+          | ( ($body | capture($requestRe; "g") | .head),
+              ($body | capture($receiptRe; "g") | .head),
+              ( [ $body | splits($independentRe) ] as $parts
+                | range(1; $parts | length) as $i
+                | (([ $parts[$i] | capture($jsonRe) | .json ] | first) // $parts[$i]) as $text
+                | ([ [ $text | try fromjson catch null | objects ] | first | .head? | sha ] | first)
+                  // "independent receipt \($id)#\($i) with no readable head" ) ) )
+    ] | unique | length'
+}
+
+review_rounds() {
+  local review_pages comment_pages
+  review_pages=$(paginate_connection reviews reviews_page) || return 1
+  comment_pages=$(paginate_connection comments receipt_comments_page) || return 1
+  review_rounds_of "$review_pages" "$comment_pages"
+}
+
+review_round_cap() {
+  local cap="${REVIEW_ROUND_CAP:-3}"
+  if ! [[ "$cap" =~ ^[1-9][0-9]*$ ]]; then
+    echo "REVIEW_ROUND_CAP must be a positive whole number" >&2
+    return 1
+  fi
+  printf '%s' "$cap"
 }
 
 rounds_banner() {
-  local n="$1"
-  if [ "$n" -ge 4 ]; then
+  local n="$1" cap
+  cap=$(review_round_cap) || return 1
+  if [ "$n" -gt "$cap" ]; then
     {
       echo "=================================================================="
-      echo "STOP: $n distinct review rounds on this PR. Do not push another"
-      echo "patch. Run 'codex-review.sh churn', name the one invariant the"
-      echo "findings are circling, and escalate per SKILL.md (round 4+ path)."
+      echo "STOP: $n review rounds on this PR, over REVIEW_ROUND_CAP=$cap. The"
+      echo "gate refuses the next push. Merge this head if what is left does"
+      echo "not block, or rebuild the change as a new PR (SKILL.md, round 4+)."
       echo "=================================================================="
     } >&2
   fi
@@ -482,13 +517,36 @@ PUSH_HEAD=""
 PUSH_DEST=""
 PUSH_DRY_RUN=0
 run_gate() {
-  local node out status=0 sha classes pr saved_pr="$PR"
+  local node out status=0 sha classes pr saved_pr="$PR" cap rounds
   GATE_OVERRIDE_LINE=""
   GATE_OVERRIDE_LINES=()
   node=$(runtime) || return 2
+  cap=$(review_round_cap) || return 2
   for pr in $PR_LIST; do
     PR="$pr"
     status=0
+    rounds=$(review_rounds) || {
+      echo "refused: could not count the review rounds on PR #$pr, so the round cap cannot be checked; retry once GitHub answers." >&2
+      PR="$saved_pr"
+      return 3
+    }
+    if [ "$rounds" -gt "$cap" ]; then
+      if [ "${REVIEW_LOOP_ALLOW_SITE_PATCH:-}" = 1 ]; then
+        echo "OVERRIDE: REVIEW_LOOP_ALLOW_SITE_PATCH=1 pushes past the round cap on PR #$pr ($rounds of $cap rounds)." >&2
+        sha=$(git rev-parse --short "${PUSH_HEAD:-HEAD}")
+        GATE_OVERRIDE_LINES+=("$pr"$'\t'"⚠️ \`REVIEW_LOOP_ALLOW_SITE_PATCH=1\` used at \`$sha\`: pushed past the review round cap ($rounds rounds, REVIEW_ROUND_CAP=$cap).")
+      else
+        {
+          echo "REFRAME REQUIRED: PR #$pr has had $rounds review rounds, over REVIEW_ROUND_CAP=$cap. A round is a head any"
+          echo "reviewer reviewed: Codex, a request, a substitute receipt or an independent-review receipt."
+          echo "Another push starts another round. If what is left does not block, merge this head and record"
+          echo "the rest; if it does, rebuild the change as a new PR. An exception that honestly belongs here:"
+          echo "REVIEW_LOOP_ALLOW_SITE_PATCH=1 codex-review.sh push …, which records the override on the PR body."
+        } >&2
+        PR="$saved_pr"
+        return 3
+      fi
+    fi
     out=$(payload_json | "$node" "$CHURN_JS" gate --json "$@") || status=$?
     if [ "$status" -ne 0 ]; then
       PR="$saved_pr"
@@ -2511,7 +2569,8 @@ ci_wait_main() {
 case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|claim|merge-check|merge|audit|receipt|cut-down|cut-down-receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
-    rounds_banner "$(rounds_count)"
+    open_rounds=$(review_rounds) || { echo "open: could not count the review rounds on PR #$PR" >&2; exit 1; }
+    rounds_banner "$open_rounds"
     threads | jq -r '.comments.nodes[0] as $c
       | [ .id,
           ($c.databaseId | tostring),
@@ -2806,16 +2865,12 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     # "After two failed corrections, stop correcting and reframe": the initial
     # review plus two correction rounds. This cap is also what bounds a class
     # the churn gate cannot see — the gate derives seams from imports, so
-    # findings on Markdown/YAML sites never gate (PR #566: 12 rounds).
-    cap="${REVIEW_ROUND_CAP:-3}"
-    if ! [[ "$cap" =~ ^[1-9][0-9]*$ ]]; then
-      echo "REVIEW_ROUND_CAP must be a positive whole number" >&2
-      exit 2
-    fi
-    requested=$(printf '%s' "$markers" | jq -er 'length') || exit 1
+    # findings on Markdown/YAML sites never gate.
+    cap=$(review_round_cap) || exit 2
+    requested=$(review_rounds) || exit 1
     if [ "$requested" -ge "$cap" ]; then
       {
-        echo "CAP: $requested of $cap review rounds already requested on PR #$PR — do not request another."
+        echo "CAP: $requested of $cap review rounds already on PR #$PR — do not request another."
         echo "Checkpoint, not a stop: judge whether the rounds are converging or churning (SKILL.md,"
         echo "'Round 3 is a checkpoint'). Converging: fix, then a fresh-context substitute review and receipt."
         echo "Churning: rebuild the change. Do not escalate to the operator for the cap."
