@@ -452,8 +452,6 @@ payload_json() {
     '{ findings: $findings, receipts: $receipts, repoRoot: $root }'
 }
 
-# `converging` only when a trusted author recorded that decision for exactly
-# this head and none recorded `churning` for it.
 checkpoint_state() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
