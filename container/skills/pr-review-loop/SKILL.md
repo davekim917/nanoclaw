@@ -494,7 +494,7 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch nam
    codex-review.sh merge --head "$SHA"
    ```
 
-   It runs `merge-check` for exactly that head, and runs `gh pr merge --merge --match-head-commit "$SHA"` only when merge-check exits 0 (`merge=allowed`), then prints the merge commit. Every refusal comes back with merge-check's own code, and nothing merges: 24 refused, 26 a legacy repo (take Step 6), 1 no verdict. 27 means merge-check allowed the head but `gh pr merge` did not merge it. `--method squash` squashes instead. There is no rebase option, because GitHub does not sign a rebase merge and main-provenance.yml rejects one.
+   It runs `merge-check` for exactly that head, and runs `gh pr merge --merge --match-head-commit "$SHA"` only when merge-check exits 0 (`merge=allowed`), then prints the merge commit. The merge commit's body is a `Gate-Permissions:` line naming each receipt or checkpoint author's repository permission as merge-check read it; `audit` judges the merge by that record, not by today's permissions, so a merge made any other way leaves its receipts unable to clear. Every refusal comes back with merge-check's own code, and nothing merges: 24 refused, 26 a legacy repo (take Step 6), 1 no verdict. 27 means merge-check allowed the head but `gh pr merge` did not merge it. `--method squash` squashes instead. There is no rebase option, because GitHub does not sign a rebase merge and main-provenance.yml rejects one.
 
    Never pipe it (`| tail`, `| grep`) and never put a `gh pr merge` of your own after `merge-check`. A pipeline reports its last command's status, which is how #675 merged over a refusal.
 
