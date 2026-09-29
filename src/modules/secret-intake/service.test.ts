@@ -245,7 +245,6 @@ describe('startSecretIntake', () => {
 
   it('sends a card from a platform that cannot open forms to an owner DM instead', async () => {
     h.originType = 'telegram';
-    h.ownerSafe = true;
     await startSecretIntake({ ...newKey, caller: agentCaller });
     expect(h.deliveries[0].args.slice(0, 3)).toEqual(['slack', 'slack:D1', null]);
   });
