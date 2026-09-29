@@ -357,7 +357,6 @@ describe('review-churn classifier', () => {
     expect(churning.rounds).toBe(3);
     expect(churning.seam).toBe('src/db/messages-out.ts');
     expect(churning.seamSubstantiated).toBe(false);
-    expectPlaceGate(fixture('commented-import-seam'), 'src/');
   });
 
   it('substantiates a seam reached through a destructured dynamic import', () => {

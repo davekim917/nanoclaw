@@ -330,7 +330,6 @@ function receiptFindings(receipt, files) {
       commentId: receipt.id,
       createdAt: receipt.createdAt,
       path: file,
-      line: null,
       body: text,
       severity: severity ? Number(severity[1]) : null,
     };
@@ -339,12 +338,7 @@ function receiptFindings(receipt, files) {
 
 function trackedFiles(payload) {
   if (payload.files) return new Set(payload.files);
-  const files = new Set(Object.keys(payload.sources ?? {}));
-  if (payload.repoRoot) {
-    const listing = git(payload.repoRoot, ['ls-tree', '-r', '--name-only', payload.head ?? 'HEAD']);
-    for (const f of listing.split('\n')) if (f) files.add(f);
-  }
-  return files;
+  return new Set(git(payload.repoRoot, ['ls-tree', '-r', '--name-only', payload.head ?? 'HEAD']).split('\n'));
 }
 
 function withReceiptFindings(payload) {
@@ -565,7 +559,7 @@ export function seamFor(files, findingText, ctx) {
   // best-ranked import of a single file. Two or more flagged files sharing the
   // module IS the evidence; with one file the only evidence left is that the
   // findings name something the module exports. Neither, and the seam is a
-  // guess — reported, never gated. See decideGate.
+  // guess, never named as the primitive. See decideGate.
   const substantiated = top.fileCount >= 2 || top.mentioned.length > 0;
   return { seam: top.spec, seamInRepo: top.inRepo, substantiated, primitives };
 }
@@ -992,6 +986,7 @@ export function decideGate(payload, options = {}) {
   const worktree = payload.worktree ?? [];
 
   const flagged = [];
+  const reported = [];
   for (const c of report.classes) {
     if (c.rounds < CLASS_ROUND_LIMIT) continue;
     if (c.seam && c.seamSubstantiated) {
@@ -1009,6 +1004,9 @@ export function decideGate(payload, options = {}) {
         primitives: [],
         reason: `${c.rounds} rounds on one finding class in one place`,
       });
+    } else {
+      // Listed, or "no finding class is gated" would hide a class at the limit.
+      reported.push({ key: c.key, rounds: c.rounds, reason: 'no finding names a file' });
     }
   }
   for (const s of report.seams) {
@@ -1071,11 +1069,6 @@ export function decideGate(payload, options = {}) {
       liftedBy: touched ? 'diff touches the primitive' : named.length > 0 ? 'reframe trailer' : null,
     };
   });
-
-  // Listed, or "no finding class is gated" would hide a class at the limit.
-  const reported = report.classes
-    .filter((c) => c.rounds >= CLASS_ROUND_LIMIT && !(c.seam && c.seamSubstantiated) && !c.place)
-    .map((c) => ({ key: c.key, rounds: c.rounds, seam: c.seam, reason: 'no finding names a file' }));
 
   const unlifted = decided.filter((e) => !e.lifted);
   const allow =

@@ -28,6 +28,9 @@
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
 #                                             # post a substitute review's receipt for exactly that head — --reviewer
 #                                             # must start with a frontier model id (see REVIEWER_DENIED_TIERS)
+#   codex-review.sh checkpoint --head <sha> --decision converging|churning --assessor "<model + runtime>" --assessment "<one line>"
+#                                             # a fresh-context assessor's verdict at the round cap; past the cap,
+#                                             # request asks Codex again only on a converging one for that head
 #   codex-review.sh cut-down                  # does the current head need a cut-down receipt, and has one: 0 yes/no need, 24 missing
 #   codex-review.sh cut-down-receipt --head <sha> --reviewed <sha> --reviewer "<model> cut-down-reviewer (<runtime>)" --body-file <file>
 #
@@ -40,7 +43,7 @@
 #   20  request: not risk-scoped — automatic review handles this repo; never request
 #   21  request: scope verdict is skip — this head merges on green CI, no round
 #   22  request: a review of this head was already requested
-#   23  request: REVIEW_ROUND_CAP reached — checkpoint: converge via substitute review, or rebuild
+#   23  request: REVIEW_ROUND_CAP reached and no converging checkpoint names this head
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
 #       neither a clean Codex review nor an approving substitute receipt, the
 #       approving receipt's reviewer is not a frontier model id, it is a
@@ -449,16 +452,27 @@ payload_json() {
     '{ findings: $findings, receipts: $receipts, repoRoot: $root }'
 }
 
-# Substitute and independent review receipts, from the authors receipt_outcome
-# trusts. A receipt asking for changes is a round the classifier counts; the
-# classifier reads which ones did.
+# `converging` only when a trusted author recorded that decision for exactly
+# this head and none recorded `churning` for it.
+checkpoint_state() {
+  local pages
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  printf '%s\n' "$pages" | jq -rs --arg re "$CHECKPOINT_MARKER_RE" --arg head "$1" '
+    [ .[] | .data.repository.pullRequest.comments.nodes[]
+      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | [ (.body // "") | capture($re) ] | first // empty
+      | select(.head == $head) | .decision ] | unique
+    | if . == ["converging"] then "converging" else "none" end'
+}
+
+# PR comments from the authors receipt_outcome trusts; the classifier reads
+# which are receipts asking for changes, and counts those as rounds.
 receipts_json() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  printf '%s\n' "$pages" | jq -s --arg sub "$RECEIPT_MARKER_RE" --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" '
+  printf '%s\n' "$pages" | jq -s '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | select((.body // "") | test($sub) or test($ind))
       | { id: .fullDatabaseId, createdAt, body } ]'
 }
 
@@ -554,6 +568,7 @@ CLAIM_MARKER_RE='(^|\n)<!-- pr-review-loop:claim id=(?<id>[A-Za-z0-9._:-]{1,96})
 CLAIM_COMPLETE_MARKER_RE='(^|\n)<!-- pr-review-loop:claim-complete id=(?<id>[A-Za-z0-9._:-]{1,96}) owner=(?<owner>[A-Za-z0-9._:-]{1,64}) head=(?<head>[0-9a-f]{40}) -->'
 REVIEW_CLAIM_DEFAULT_TTL_MINUTES=45
 REVIEW_CLAIM_MAX_TTL_MINUTES=120
+CHECKPOINT_MARKER_RE='(^|\n)<!-- pr-review-loop:checkpoint head=(?<head>[0-9a-f]{40}) decision=(?<decision>converging|churning) -->'
 # A substitute review's receipt (docs/review-policy.md, "Review availability").
 # When Codex cannot review, the latest receipt for exactly this head decides
 # instead. Only an author with write access counts: a receipt unlocks a merge,
@@ -2522,7 +2537,7 @@ ci_wait_main() {
   done
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|claim|merge-check|merge|audit|receipt|cut-down|cut-down-receipt}" in
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|checkpoint|request|claim|merge-check|merge|audit|receipt|cut-down|cut-down-receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -2800,6 +2815,44 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         '{repo: $repo, pr: ($pr | tonumber), head: $head, mode: $mode, verdict: $verdict, labels: $labels, reason: $reason}'
     fi
     ;;
+  checkpoint)
+    shift
+    head="" decision="" assessor="" assessment=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head)
+          [ $# -ge 2 ] || { echo "checkpoint: --head needs a sha" >&2; exit 2; }
+          head="$2"; shift 2 ;;
+        --decision) decision="${2:?--decision needs converging or churning}"; shift 2 ;;
+        --assessor) assessor="${2:?--assessor needs the model and runtime}"; shift 2 ;;
+        --assessment) assessment="${2:?--assessment needs one line}"; shift 2 ;;
+        *) echo "checkpoint: unknown argument $1" >&2; exit 2 ;;
+      esac
+    done
+    if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "checkpoint: --head must be the full 40-character SHA the assessor judged" >&2
+      exit 2
+    fi
+    case "$decision" in
+      converging|churning) ;;
+      *) echo "checkpoint: --decision must be converging or churning" >&2; exit 2 ;;
+    esac
+    case "$assessment" in
+      ""|*$'\n'*|*$'\r'*) echo "checkpoint: --assessment must be one non-empty line" >&2; exit 2 ;;
+    esac
+    refusal=$(receipt_input_refusal "$assessor" "$assessment")
+    [ -z "$refusal" ] || { echo "checkpoint: ${refusal//--reviewer/--assessor}" >&2; exit 2; }
+    url=$(gh pr comment "$PR" --repo "$REPO" --body "### Review checkpoint
+
+- **Head:** \`$head\`
+- **Assessor:** $assessor
+- **Decision:** $decision
+
+$assessment
+
+<!-- pr-review-loop:checkpoint head=$head decision=$decision -->")
+    echo "checkpoint: decision=$decision head=$head $url"
+    ;;
   request)
     # The only sanctioned way to ask for a round, and only in a risk-scoped
     # repo. Every refusal posts nothing and has its own exit code (header).
@@ -2826,12 +2879,13 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
       exit 2
     fi
     requested=$(printf '%s' "$markers" | jq -er 'length') || exit 1
-    if [ "$requested" -ge "$cap" ]; then
+    if [ "$requested" -ge "$cap" ] && [ "$(checkpoint_state "$SCOPE_HEAD")" != converging ]; then
       {
-        echo "CAP: $requested of $cap review rounds already requested on PR #$PR — do not request another."
-        echo "Checkpoint, not a stop: judge whether the rounds are converging or churning (SKILL.md,"
-        echo "'Round 3 is a checkpoint'). Converging: fix, then a fresh-context substitute review and receipt."
-        echo "Churning: rebuild the change. Do not escalate to the operator for the cap."
+        echo "CAP: $requested of $cap review rounds already requested on PR #$PR, and no converging checkpoint names $SCOPE_HEAD."
+        echo "Checkpoint, not a stop: have a fresh-context assessor judge whether the rounds are converging or"
+        echo "churning (SKILL.md, 'Round 3 is a checkpoint') and record it with \`codex-review.sh checkpoint\`."
+        echo "Converging: request again. Churning: rebuild the change. Codex out of quota: substitute review and receipt."
+        echo "Do not escalate to the operator for the cap."
       } >&2
       exit 23
     fi
