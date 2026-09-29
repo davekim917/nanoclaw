@@ -730,7 +730,7 @@ export function classify(payload) {
         }
         break;
       }
-      // A guessed seam still feeds the rollup; the class itself gates on its place.
+      // A guessed seam still feeds the rollup; the class gates on its place unless the rollup gates that seam.
       const place = derived.substantiated ? null : pathSeam(members[0].path);
       built.push({ cls: buildClass(signature, members, { ...derived, place }), group: members });
       remaining = remaining.filter((f) => !members.includes(f));
