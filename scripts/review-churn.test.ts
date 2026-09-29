@@ -1291,6 +1291,28 @@ describe('review-churn gate beyond the import graph', () => {
     expect(gate({ findings, receipts: [clear], files: INGEST }).status).toBe(0);
   });
 
+  it('places no finding from a receipt whose list items name no file, whatever its prose mentions', () => {
+    const receipts = [21, 22, 23].map((id, i) =>
+      substituteReceipt(
+        id,
+        `2026-09-01T1${i}:00:00Z`,
+        'changes',
+        'Read tools/ingest/writer.py; the snapshot is stale.',
+      ),
+    );
+    const { status, decision } = gate({ findings: [], receipts, files: INGEST });
+    expect(status).toBe(0);
+    expect(decision.reported[0].reason).toBe('no finding names a file');
+  });
+
+  it('keeps receipts with no comment id as separate rounds', () => {
+    const receipts = staleRounds.map((f, i) => ({
+      ...substituteReceipt(0, f.createdAt, 'changes', `- **P1 — \`${f.path}\`:** Reads a stale cached snapshot.`),
+      id: null as unknown as number,
+    }));
+    expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
+  });
+
   it('counts nothing from a substitute receipt that approves', () => {
     const approve = substituteReceipt(
       31,

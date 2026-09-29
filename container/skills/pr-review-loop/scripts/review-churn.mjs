@@ -269,7 +269,7 @@ export function signatureOf(finding) {
 
 // ── receipts ────────────────────────────────────────────────────────────────
 // A receipt asking for changes is a round. Receipts list findings as prose, so
-// a finding is a list item naming a tracked file, else the whole receipt.
+// a finding is a list item naming a tracked file, else the whole receipt in no place.
 
 const SUBSTITUTE_RECEIPT =
   /(?:^|\n)<!-- pr-review-loop:substitute-receipt head=[0-9a-f]{40} outcome=(approve|changes) -->/;
@@ -321,11 +321,11 @@ function receiptFindings(receipt, files) {
   const located = receiptItems(prose)
     .map((text) => ({ text, file: locate(text, files) }))
     .filter((item) => item.file);
-  const items = located.length > 0 ? located : [{ text: prose.trim(), file: locate(prose, files) }];
+  const items = located.length > 0 ? located : [{ text: prose.trim(), file: null }];
   return items.map(({ text, file }) => {
     const severity = /\bP([0-9])\b/.exec(text.slice(0, 40));
     return {
-      reviewId: `receipt:${receipt.id}`,
+      reviewId: `receipt:${receipt.id ?? `at:${receipt.createdAt}`}`,
       commentId: receipt.id,
       createdAt: receipt.createdAt,
       path: file,

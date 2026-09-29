@@ -453,14 +453,20 @@ payload_json() {
 }
 
 checkpoint_state() {
-  local pages
+  local pages logins login
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  printf '%s\n' "$pages" | jq -rs --arg re "$CHECKPOINT_MARKER_RE" --arg head "$1" '
+  logins=$(printf '%s\n' "$pages" | jq -rs --arg re "$CHECKPOINT_MARKER_RE" --arg head "$1" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | .author.login as $login
       | [ (.body // "") | capture($re) ] | first // empty
-      | select(.head == $head) | .decision ] | unique
-    | if . == ["converging"] then "converging" else "none" end'
+      | select(.head == $head) | { decision, login: $login } ]
+    | if any(.[]; .decision == "churning") then "churning" else [ .[] | .login // "" ] | unique | .[] end') || return 1
+  while IFS= read -r login; do
+    [ "$login" = churning ] && break
+    if [ -n "$login" ] && may_clear "$login"; then echo converging; return 0; fi
+  done <<< "$logins"
+  echo none
 }
 
 # PR comments from the authors receipt_outcome trusts; the classifier reads

@@ -2562,6 +2562,13 @@ describe('codex-review risk-scoped review requests', () => {
       expect(request([checkpoint(HEAD, 'converging', 'NONE')]).status).toBe(23);
     });
 
+    it('refuses on a converging checkpoint whose author cannot write to the repository', () => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging', 'MEMBER')] });
+      fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
+      expect(runHelper(root, ['request']).status).toBe(23);
+    });
+
     it('still lets the churn gate refuse a recurring class', () => {
       const result = request([checkpoint(HEAD, 'converging')], { MOCK_GATE_STATUS: '3' });
       expect(result.status).toBe(3);
