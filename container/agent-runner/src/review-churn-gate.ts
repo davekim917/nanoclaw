@@ -2,7 +2,7 @@
  * Runs the pr-review-loop churn gate (`codex-review.sh gate`) before a container
  * `git_push`, since agents push through the MCP tool, not the skill's push path.
  * Never reimplement the classifier here: it runs the skill's one copy.
- * Fails OPEN: only an explicit exit 3 refuses a push.
+ * Fails OPEN: only an explicit exit 3 refuses a push. The gate itself exits 3 when it cannot count the rounds.
  */
 import { spawnSync } from 'child_process';
 import fs from 'fs';
@@ -95,8 +95,9 @@ function refusalMessage(
   return [
     gateText.trim(),
     '',
-    'This push was refused by the pr-review-loop churn gate. The next commit must',
-    'move the invariant into the primitive named above, not patch another call site.',
+    'This push was refused by the pr-review-loop gate. For a finding class, the next commit must move the',
+    'invariant into the primitive named above, not patch another call site. For the round cap, stop pushing:',
+    'merge this head, or rebuild the change as a new PR.',
     '',
     'If the reframe honestly belongs to a different PR, take the override through the',
     'skill so it is recorded on the PR body rather than made silently:',

@@ -471,11 +471,10 @@ function labelRun(status: string, conclusion: string | null, head = HEAD, name =
 }
 
 function marker(head: string, round: number, createdAt = '2026-09-05T00:05:00Z'): Page {
-  return comment(
-    createdAt,
-    `@codex review\n\n<!-- pr-review-loop:request head=${head} round=${round} -->`,
-    'davekim917',
-  );
+  return {
+    ...comment(createdAt, `@codex review\n\n<!-- pr-review-loop:request head=${head} round=${round} -->`, 'davekim917'),
+    authorAssociation: 'OWNER',
+  };
 }
 
 function reviewClaim(
@@ -729,6 +728,7 @@ if [ "$*" = "rev-parse --show-toplevel" ]; then pwd; exit 0; fi
 while [ "$1" = -c ]; do shift 2; done
 case "$1" in
   init|remote|config|diff) exit 0 ;;
+  rev-parse) echo aaaaaaaa; exit 0 ;;
   fetch)
     printf 'git %s\\n' "$*" >> "$MOCK_CALLS"
     [ "\${MOCK_GIT_FETCH_STATUS:-0}" = 0 ] || { echo 'fatal: could not read Username' >&2; exit "$MOCK_GIT_FETCH_STATUS"; }
@@ -800,7 +800,7 @@ describe('codex-review status and foreground wait', () => {
     const result = run(root, 'status');
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(`codex=clean head=${HEAD} open=0 review=1 last_review_at=2026-09-05T00:01:00Z`);
-    expect(result.stdout).toContain('reaction=1 last_thumbs_up_at=2026-09-05T00:02:00Z rounds=2');
+    expect(result.stdout).toContain('reaction=1 last_thumbs_up_at=2026-09-05T00:02:00Z rounds=1');
     expect(result.calls).toContain('reviewThreads threads-2');
     expect(result.calls).toContain('reviews reviews-2');
     expect(result.calls).toContain('reactions reactions-2');
@@ -1263,7 +1263,13 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     steps: [],
     ...(attempt === undefined ? {} : { run_attempt: attempt }),
   });
-  function quickRun(root: string, jobs = quickJobs(), attempt = 1, name = 'CI', startedAt = '2026-09-05T00:01:00Z'): Page {
+  function quickRun(
+    root: string,
+    jobs = quickJobs(),
+    attempt = 1,
+    name = 'CI',
+    startedAt = '2026-09-05T00:01:00Z',
+  ): Page {
     const run: Page = { ...workflowRun(name, 'completed', 'failure', startedAt), run_attempt: attempt };
     writeJson(root, `jobs--${run.id as number}--attempt-${attempt}.json`, { total_count: jobs.length, jobs });
     return run;
@@ -1272,7 +1278,10 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     writeJson(root, name, { total_count: list.length + 1, workflow_runs: [labelRun('completed', 'success'), ...list] });
   }
   function runState(root: string, id: number, status: string, attempt: number, nth?: number): void {
-    fs.writeFileSync(path.join(root, nth === undefined ? `run--${id}.tsv` : `run--${id}-${nth}.tsv`), `${status}\t${attempt}\n`);
+    fs.writeFileSync(
+      path.join(root, nth === undefined ? `run--${id}.tsv` : `run--${id}-${nth}.tsv`),
+      `${status}\t${attempt}\n`,
+    );
   }
   const reruns = (calls: string) => calls.split('\n').filter((l) => l.startsWith('rerun ')).length;
 
@@ -1321,7 +1330,9 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
   it('a gate whose own verdict failed is red even when every job looks right (mutation: quick_only by names alone)', () => {
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
-    runs(root, 'runs.json', [quickRun(root, [job('plan', 'success'), job('spelling / en-US spelling', 'success'), gate('failure')])]);
+    runs(root, 'runs.json', [
+      quickRun(root, [job('plan', 'success'), job('spelling / en-US spelling', 'success'), gate('failure')]),
+    ]);
 
     const result = ciWait(root, ['--head', HEAD], [0, 0]);
     expect(result.status).toBe(29);
@@ -1403,19 +1414,28 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
       runState(root, run.id as number, 'queued', 2);
     }
     runs(root, 'runs-1.json', quick);
-    runs(root, 'runs-2.json', names.map((n, i) => ({ ...workflowRun(n, 'completed', 'success', starts[i]), run_attempt: 2 })));
+    runs(
+      root,
+      'runs-2.json',
+      names.map((n, i) => ({ ...workflowRun(n, 'completed', 'success', starts[i]), run_attempt: 2 })),
+    );
 
-    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 0, 0, 30], { CODEX_REVIEW_REQUIRED_WORKFLOWS: 'CI,CI2,CI3' });
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 0, 0, 30], {
+      CODEX_REVIEW_REQUIRED_WORKFLOWS: 'CI,CI2,CI3',
+    });
     expect(result.status).toBe(0);
     expect(reruns(result.calls)).toBe(3);
   });
 
-  it('a newer run of the workflow from another event does not stand for the PR\'s full suite (mutation: newest run of any event wins)', () => {
+  it("a newer run of the workflow from another event does not stand for the PR's full suite (mutation: newest run of any event wins)", () => {
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
     const push = { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' };
     runs(root, 'runs-1.json', [quickRun(root), push]);
-    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:09:00Z'), run_attempt: 2 }, push]);
+    runs(root, 'runs-2.json', [
+      { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:09:00Z'), run_attempt: 2 },
+      push,
+    ]);
     runState(root, QUICK, 'completed', 1, 1);
     runState(root, QUICK, 'queued', 2);
 
@@ -1706,7 +1726,7 @@ describe('codex-review risk-scoped review requests', () => {
     const status = run(root, 'status');
     expect(status.status).toBe(0);
     expect(status.stdout).toBe(
-      `codex=clean head=${HEAD} open=0 review=1 last_review_at=2026-09-05T00:01:00Z reaction=0 last_thumbs_up_at=none rounds=0\n`,
+      `codex=clean head=${HEAD} open=0 review=1 last_review_at=2026-09-05T00:01:00Z reaction=0 last_thumbs_up_at=none rounds=1\n`,
     );
     expect(status.calls.trim().split('\n').sort()).toEqual([
       'comments null',
@@ -2206,7 +2226,7 @@ describe('codex-review risk-scoped review requests', () => {
 
     const result = runHelper(root, ['request']);
     expect(result.status).toBe(23);
-    expect(result.stderr).toContain('CAP: 3 of 3 review rounds already requested');
+    expect(result.stderr).toContain('CAP: 3 of 3 review rounds already on PR #1');
     expect(result.stderr).not.toContain('review_claim=advisory');
     expect(result.posted).toBeNull();
     expect(result.calls).not.toMatch(/^node /m);
@@ -2501,7 +2521,7 @@ describe('codex-review risk-scoped review requests', () => {
 
     const capped = runHelper(root, ['request']);
     expect(capped.status).toBe(23);
-    expect(capped.stderr).toContain('CAP: 3 of 3 review rounds already requested');
+    expect(capped.stderr).toContain('CAP: 3 of 3 review rounds already on PR #1');
     expect(capped.stderr).toContain('Checkpoint, not a stop');
     expect(capped.stderr).toContain('substitute review');
     expect(capped.stderr).not.toMatch(/escalate to the\s+operator, or restart/);
@@ -2965,12 +2985,17 @@ describe('codex-review risk-scoped review requests', () => {
           MOCK_COMMENT_RULE_REPORT: report([['src/gate.ts', 200, 200]]),
         });
         expect(result.status).toBe(0);
-        expect(result.calls).toMatch(new RegExp(`comment-rule check --repo \\S+ --base ${MERGE_BASE} --head \\S+ --json\\n`));
+        expect(result.calls).toMatch(
+          new RegExp(`comment-rule check --repo \\S+ --base ${MERGE_BASE} --head \\S+ --json\\n`),
+        );
       });
 
       it('counts only the code lines of a mixed change', () => {
         const root = tempRoot();
-        classifiedFixture(root, [changedFile('src/gate.ts', undefined, 200), changedFile('src/gate.test.ts', undefined, 90)]);
+        classifiedFixture(root, [
+          changedFile('src/gate.ts', undefined, 200),
+          changedFile('src/gate.test.ts', undefined, 90),
+        ]);
 
         const result = runHelper(root, ['cut-down'], {
           MOCK_COMMENT_RULE_REPORT: report([
@@ -2990,12 +3015,17 @@ describe('codex-review risk-scoped review requests', () => {
 
         const result = runHelper(root, ['cut-down'], { MOCK_COMMENT_RULE_REPORT: report([['src/gate.ts', 201, 201]]) });
         expect(result.status).toBe(24);
-        expect(result.stdout).toContain('this change adds 200 lines outside tests that are not only comment, over the threshold');
+        expect(result.stdout).toContain(
+          'this change adds 200 lines outside tests that are not only comment, over the threshold',
+        );
       });
 
       it.each<[string, Record<string, string>, string?]>([
         ['the checker cannot judge the change', { MOCK_COMMENT_RULE_STATUS: '2' }],
-        ['the checker predates the added-line counts', { MOCK_COMMENT_RULE_REPORT: '{"status":"pass","files":[{"path":"src/gate.ts"}]}' }],
+        [
+          'the checker predates the added-line counts',
+          { MOCK_COMMENT_RULE_REPORT: '{"status":"pass","files":[{"path":"src/gate.ts"}]}' },
+        ],
         ['the checker prints no JSON', { MOCK_COMMENT_RULE_REPORT: 'comment-rule: PASS' }],
         ['the base turns the comment rule off', {}, '{ "commentRule": false }\n'],
       ])('counts every added line when %s', (_case, env, reviewLoop) => {
@@ -3019,11 +3049,23 @@ describe('codex-review risk-scoped review requests', () => {
 
         const posted = runHelper(
           root,
-          ['cut-down-receipt', '--head', HEAD, '--reviewed', OLD_HEAD, '--reviewer', AGENT_REVIEWER, '--body-file', body],
+          [
+            'cut-down-receipt',
+            '--head',
+            HEAD,
+            '--reviewed',
+            OLD_HEAD,
+            '--reviewer',
+            AGENT_REVIEWER,
+            '--body-file',
+            body,
+          ],
           { MOCK_COMMENT_RULE_REPORT: report([['src/gate.ts', 151, 51]]) },
         );
         expect(posted.status).toBe(0);
-        expect(posted.posted).toContain('**Added lines outside tests, less comment-only lines:** 190 when reviewed, 100 now; cut 90');
+        expect(posted.posted).toContain(
+          '**Added lines outside tests, less comment-only lines:** 190 when reviewed, 100 now; cut 90',
+        );
       });
     });
 
@@ -3055,7 +3097,9 @@ describe('codex-review risk-scoped review requests', () => {
         const posted = receiptRun(root, AGENT_REVIEWER);
         expect(posted.status).toBe(0);
         expect(posted.stdout).toContain(`cut-down-receipt: head=${HEAD} cut=39`);
-        expect(posted.posted).toContain('**Added lines outside tests, less comment-only lines:** 190 when reviewed, 151 now; cut 39');
+        expect(posted.posted).toContain(
+          '**Added lines outside tests, less comment-only lines:** 190 when reviewed, 151 now; cut 39',
+        );
         expect(posted.posted).toContain(
           `<!-- pr-review-loop:cut-down-receipt head=${HEAD} reviewed=${OLD_HEAD} lines-reviewed=190 lines-now=151 -->`,
         );
@@ -5477,9 +5521,15 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       'codex=pending',
     ],
     [
-      'a review request edited after the merge',
+      'a review request from an untrusted author, edited after the merge',
       {
-        comments: [{ ...marker(HEAD, 1, '2026-09-05T00:05:00Z'), lastEditedAt: '2026-09-05T02:00:00Z' }],
+        comments: [
+          {
+            ...marker(HEAD, 1, '2026-09-05T00:05:00Z'),
+            authorAssociation: 'NONE',
+            lastEditedAt: '2026-09-05T02:00:00Z',
+          },
+        ],
         reviews: [review('2026-09-05T00:10:00Z', HEAD)],
       },
       28,
@@ -6381,7 +6431,12 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
   // `runId` is the Actions run this job belongs to; required_status_red reads
   // it back off the job to ask whether that whole RUN is excusable (#937 C).
   function actionsJob(started: boolean, conclusion = 'failure', runId?: number): Page {
-    const base = { id: 105741202176, status: 'completed', conclusion, ...(runId === undefined ? {} : { run_id: runId }) };
+    const base = {
+      id: 105741202176,
+      status: 'completed',
+      conclusion,
+      ...(runId === undefined ? {} : { run_id: runId }),
+    };
     return started
       ? {
           ...base,
@@ -6992,12 +7047,7 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
           { reviewDecision: 'SOMETHING_NEW' },
           'GitHub reports reviewDecision=SOMETHING_NEW',
         ],
-        [
-          'changes requested by a reviewer',
-          GREEN,
-          { changesRequested: ['reviewer'] },
-          'changes requested by reviewer',
-        ],
+        ['changes requested by a reviewer', GREEN, { changesRequested: ['reviewer'] }, 'changes requested by reviewer'],
         [
           'another required check still running',
           [...GREEN, rollupRun('Lint', 'IN_PROGRESS', null)],
@@ -7056,9 +7106,9 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
         // Approvals with the count at 0 (the fleet's actual shape) stay ready…
         expect(admin(tempRoot(), GREEN, { approvals: ['reviewer'] }).stdout).toContain('admin=ready');
         // …and approvals never satisfy a positive count.
-        expect(
-          admin(tempRoot(), GREEN, { approvals: ['a', 'b', 'c'] }, withApprovalCount(1)).stdout,
-        ).toContain('admin=not-ready');
+        expect(admin(tempRoot(), GREEN, { approvals: ['a', 'b', 'c'] }, withApprovalCount(1)).stdout).toContain(
+          'admin=not-ready',
+        );
       });
 
       it('still refuses the extra approval an unattributed commit owes, whatever reviewDecision says', () => {
@@ -7212,7 +7262,10 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     it.each<[string, Page]>([
       ['a runner id, but no runner name and no step', { runner_id: 5, runner_name: '', steps: [] }],
       ['a runner name, but no runner id and no step', { runner_id: 0, runner_name: 'GitHub Actions 5', steps: [] }],
-      ['a step, but no runner', { runner_id: 0, runner_name: '', steps: [{ name: 'Set up job', status: 'completed' }] }],
+      [
+        'a step, but no runner',
+        { runner_id: 0, runner_name: '', steps: [{ name: 'Set up job', status: 'completed' }] },
+      ],
     ])('refuses required_red for a check-run job with %s', (_case, shape) => {
       const root = tempRoot();
       const job = { ...actionsJob(false, 'failure', 4242), ...shape };
@@ -7246,5 +7299,101 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       expect(result.status).toBe(24);
       expect(result.stderr).toContain('required_red: CI Gate=failure');
     });
+  });
+});
+
+describe('codex-review review round cap, one count across every reviewer', () => {
+  const heads = ['1', '2', '3', '4', '5', '6'].map((c) => c.repeat(40));
+  const AT = '2026-09-05T00:05:00Z';
+  const kinds: [string, (head: string) => { reviews?: Page[]; comments?: Page[] }][] = [
+    ['a Codex review', (head) => ({ reviews: [review(AT, head)] })],
+    ['a request marker', (head) => ({ comments: [marker(head, 1)] })],
+    ['a substitute receipt', (head) => ({ comments: [receiptComment(head, 'changes', AT)] })],
+    ['an independent-review receipt', (head) => ({ comments: [independentReceipt(head, 'CHANGES', 1, AT)] })],
+  ];
+  const atCap = {
+    reviews: [review(AT, heads[0])],
+    comments: [receiptComment(heads[1], 'changes', AT), independentReceipt(heads[2], 'CHANGES', 1, AT)],
+  };
+
+  function gate(root: string, extra: { reviews?: Page[]; comments?: Page[] } = {}, env: Record<string, string> = {}) {
+    scopeFixture(root, {
+      baseConfig: null,
+      reviews: [...atCap.reviews, ...(extra.reviews ?? [])],
+      comments: [...atCap.comments, ...(extra.comments ?? [])],
+    });
+    return runHelper(root, ['gate', '--committed-only'], env);
+  }
+
+  it('lets a push through at the cap', () => {
+    const result = gate(tempRoot());
+    expect(result.status).toBe(0);
+    expect(result.calls).toMatch(/^node \S+review-churn\.mjs gate/m);
+  });
+
+  it.each(kinds)('refuses the push once %s takes the PR past the cap', (_kind, round) => {
+    const result = gate(tempRoot(), round(heads[3]));
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('PR #1 has had 4 review rounds, over REVIEW_ROUND_CAP=3');
+    expect(result.calls).not.toMatch(/^node /m);
+  });
+
+  it.each(kinds)('counts %s on an already-reviewed head as the same round', (_kind, round) => {
+    const result = gate(tempRoot(), round(heads[0]));
+    expect(result.status).toBe(0);
+  });
+
+  it('reads the same count in request, status and open', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'], ...atCap });
+    const request = runHelper(root, ['request']);
+    expect(request.status).toBe(23);
+    expect(request.stderr).toContain('CAP: 3 of 3 review rounds already on PR #1');
+    expect(request.posted).toBeNull();
+
+    scopeFixture(root, { baseConfig: null, reviews: [...atCap.reviews, review(AT, HEAD)], comments: atCap.comments });
+    const status = run(root, 'status');
+    expect(status.stdout).toContain('rounds=4');
+    expect(status.stderr).toContain('STOP: 4 review rounds on this PR, over REVIEW_ROUND_CAP=3');
+    const open = runHelper(root, ['open']);
+    expect(open.status).toBe(0);
+    expect(open.stderr).toContain('STOP: 4 review rounds on this PR, over REVIEW_ROUND_CAP=3');
+  });
+
+  it('does not count a Codex usage-limit notice or a receipt from an author outside the repository', () => {
+    const result = gate(tempRoot(), {
+      reviews: [review(AT, heads[3], USAGE_LIMIT_NOTICE)],
+      comments: [
+        receiptComment(heads[4], 'changes', AT, 'NONE'),
+        independentReceipt(heads[5], 'CHANGES', 1, AT, 'CONTRIBUTOR'),
+      ],
+    });
+    expect(result.status).toBe(0);
+  });
+
+  it('counts an independent receipt whose head cannot be read as a round of its own', () => {
+    const result = gate(tempRoot(), {
+      comments: [independentReceipt(heads[3], 'CHANGES', 1, AT, 'MEMBER', null, '{ not json')],
+    });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('4 review rounds');
+  });
+
+  it('refuses when the rounds cannot be counted', () => {
+    const root = tempRoot();
+    scopeFixture(root, { baseConfig: null });
+    fs.writeFileSync(path.join(root, 'comments-fail-1'), '');
+    const result = runHelper(root, ['gate', '--committed-only']);
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('could not count the review rounds on PR #1');
+    expect(result.calls).not.toMatch(/^node /m);
+  });
+
+  it('lets REVIEW_LOOP_ALLOW_SITE_PATCH=1 past the cap, loudly', () => {
+    const result = gate(tempRoot(), { reviews: [review(AT, heads[3])] }, { REVIEW_LOOP_ALLOW_SITE_PATCH: '1' });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain(
+      'OVERRIDE: REVIEW_LOOP_ALLOW_SITE_PATCH=1 pushes past the round cap on PR #1 (4 of 3 rounds)',
+    );
   });
 });
