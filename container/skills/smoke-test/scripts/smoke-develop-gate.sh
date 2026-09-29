@@ -240,6 +240,7 @@ FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 # are validated once here (smoke-gate-layout.sh) and a bad one is named by
 # `config` and in poll's gate_misconfigured alarm before any freeze is cut.
 . "$(dirname -- "${BASH_SOURCE[0]}")/smoke-gate-layout.sh"
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-run-path.sh"
 LAYOUT_MISSING=""
 [ "$FREEZE_HANDOFF" != true ] || LAYOUT_MISSING="$(layout_prefix_problems)"
 [ -z "$FRONTEND_PATHS" ] || LAYOUT_MISSING="$LAYOUT_MISSING$(layout_prefix_problems FRONTEND_PATHS)"
@@ -366,7 +367,6 @@ lease_dir_prepare() {
 task_binding_file() { printf '%s/task-binding-%s.json' "$LEASE_DIR" "$1"; }
 task_binding_lock_file() { printf '%s/task-lease-%s.lock' "$LEASE_DIR" "$1"; }
 task_lease_file() { printf '%s/task-lease-%s.json' "$LEASE_DIR" "$1"; }
-task_binding_run_id_ok() { printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._-]{1,200}$' && [ "${1:-}" != ".." ]; }
 
 read_task_binding() {
   local run="$1" f binding field stamp
@@ -453,7 +453,7 @@ resolve_shared_task_binding() {
 
 task_binding_lock_begin() {
   local run="$1"
-  if ! task_binding_run_id_ok "$run"; then
+  if ! run_id_ok "$run"; then
     jq -cn --arg run "$run" \
       '{ok:false,error:"run id is unsafe for the shared task binding path - refusing develop claim",runId:$run}'
     return 1

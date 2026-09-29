@@ -374,6 +374,20 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("run dir"))' >/dev/null 
   || { echo "auth in run dir: expected a refusal naming the run dir: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "auth in run dir: agent-browser must never be invoked" >&2; exit 1; }
 
+# Same, with the run dir reached through a symlink to a directory whose name
+# ends in a newline: its resolved path must keep that newline to compare.
+RUN6B="$WORK/run-store"$'\n'
+mkdir -p "$RUN6B/contact-sheet"; ln -s "$RUN6B" "$WORK/run-alias"
+cp "$RUN6/contact-sheet/shots.json" "$RUN6/contact-sheet/auth-state.json" "$RUN6B/contact-sheet/"
+: >"$STUB_LOG"
+set +e
+RESULT="$(bash "$SCRIPT" "$WORK/run-alias" "https://example.test" "$WORK/run-alias/contact-sheet/auth-state.json" 2>&1)"
+EC=$?
+set -e
+[ "$EC" -eq 2 ] && echo "$RESULT" | jq -e '.ok == false and (.error | test("run dir"))' >/dev/null \
+  || { echo "auth in a newline-named run dir: expected a refusal naming the run dir (exit $EC): $RESULT" >&2; exit 1; }
+[ ! -s "$STUB_LOG" ] || { echo "auth in a newline-named run dir: agent-browser must never be invoked" >&2; exit 1; }
+
 echo "6/17 auth state inside the run dir refuses ok"
 
 # --- 7. Auth state under the shared workgroup tree: refuse --------------------

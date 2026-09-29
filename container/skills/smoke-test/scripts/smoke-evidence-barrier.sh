@@ -6,6 +6,7 @@ set -euo pipefail
 
 RUN_DIR="${1:-}"
 PHASE="${2:-synthesis}"
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-run-path.sh"
 
 if [ -z "$RUN_DIR" ]; then
   jq -cn '{ready:false,error:"usage: smoke-evidence-barrier.sh <run-dir> <lanes|synthesis>"}'
@@ -173,7 +174,7 @@ pass_evidence_problem() {
     return
   fi
 
-  run_root="$(realpath -e "$RUN_DIR" 2>/dev/null || true)"
+  capture_exact run_root realpath -e -- "$RUN_DIR" 2>/dev/null || run_root=""
   if [ -z "$run_root" ]; then
     printf 'run root cannot be resolved while validating pass evidence'
     return
@@ -198,7 +199,7 @@ pass_evidence_problem() {
       printf 'pass marker evidence file is missing: %s' "$evidence_path"
       return
     fi
-    resolved="$(realpath -e "$candidate" 2>/dev/null || true)"
+    capture_exact resolved realpath -e -- "$candidate" 2>/dev/null || resolved=""
     case "$resolved" in
       "$run_root"/*) ;;
       *)
@@ -258,7 +259,7 @@ finding_clip_problem() {
     return
   fi
 
-  run_root="$(realpath -e "$RUN_DIR" 2>/dev/null || true)"
+  capture_exact run_root realpath -e -- "$RUN_DIR" 2>/dev/null || run_root=""
   if [ -z "$run_root" ]; then
     printf 'run root cannot be resolved while validating finding clip evidence'
     return
@@ -296,7 +297,7 @@ finding_clip_problem() {
       printf 'confirmed finding %s clip is missing: %s' "$finding_id" "$clip_entry"
       return
     fi
-    resolved="$(realpath -e "$candidate" 2>/dev/null || true)"
+    capture_exact resolved realpath -e -- "$candidate" 2>/dev/null || resolved=""
     case "$resolved" in
       "$run_root"/*) ;;
       *)
@@ -746,7 +747,7 @@ JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/
 # run-storage) is fenced, written and adopted as run-alias, and resolving it
 # here rejected that legitimate contract (#898 review 11). File checks keep
 # their canonical paths (_run_file_ok resolves under the real run root).
-JOURNEY_RUN_NAME="$(basename "$RUN_DIR")"
+path_base JOURNEY_RUN_NAME "$RUN_DIR"
 journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \
   --lease-dir "$JOURNEY_LEASE_DIR" --run-id "$JOURNEY_RUN_NAME" 2>/dev/null)" || journeys_result=""
 if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \

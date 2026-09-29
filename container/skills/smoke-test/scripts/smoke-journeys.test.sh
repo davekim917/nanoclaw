@@ -636,6 +636,12 @@ jq -n --arg sha "$SHA" '{sourceSha:$sha,lane:"A1",generation:1,status:"blocked",
   fail "5b-symlinked-run-dir-ordinary-no-catalogue: not byte-identical"
 expect 5b-symlinked-run-dir-pinned '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' \
   "$(SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$WORK/run-alias" lanes || true)"
+# The name is read exactly: `run-alias<newline>` holding a contract that names
+# `run-alias` is borrowing that run's id.
+NL_RUN="$WORK/run-alias"$'\n'; cp -R "$ALIAS_RUN" "$NL_RUN"
+expect 5b-newline-run-dir-borrows-nothing '.ready == false and any(.invalidReasons[]; test("runId .run-alias. is not this run directory.s name"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$NL_RUN" lanes || true)"
+rm -rf "$NL_RUN"
 # A leaf symlink where the pin should be is INVALID, never followed and never "absent".
 LINK_LEASES="$WORK/leaf-link-leases"; share_lease "$LINK_LEASES" 7
 LINK_PIN="$(gate_pin "$WORK/leaf-link-src" "$SHA" '["web/src/desk/a.tsx"]')"

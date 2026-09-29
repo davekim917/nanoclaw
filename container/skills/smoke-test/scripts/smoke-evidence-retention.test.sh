@@ -222,4 +222,23 @@ jq -e '.protected == 1 and .runsPruned == 0' <<<"$OUT" >/dev/null || {
 rm -f "$STATE_DIR/pr-8-state.json"
 rm -rf "$RUNS/-dash-run"
 
+# --- 13. Names are read whole: a newline or a space splits nothing ---------
+# Read one per line, `old<newline>decoy` became the missing `old` plus a
+# relative `decoy` in the caller's cwd, whose media was then pruned; and
+# `xargs` split `shot 1.png` into two names, deleting neither.
+NL_RUN="$RUNS/old"$'\n'"decoy"
+make_run $'old\ndecoy' 30
+CWD="$FIXTURE_ROOT/cwd"; mkdir -p "$CWD/decoy/screenshots"
+printf 'fake-png-bytes' > "$CWD/decoy/screenshots/keep.png"
+touch -d '-30 days' "$CWD/decoy"
+make_run spaced 30 0
+printf 'fake-png-bytes' > "$RUNS/spaced/screenshots/shot 1.png"
+OUT="$(cd "$CWD" && bash "$SCRIPT" "$RUNS" --delete)"
+jq -e '.scanned == 2 and .protected == 1 and .runsPruned == 1 and .mediaFiles == 1' <<<"$OUT" >/dev/null || {
+  echo "expected the newline-named run protected and the spaced media pruned, got: $OUT" >&2; exit 1; }
+[ -e "$CWD/decoy/screenshots/keep.png" ] || { echo "a split run name pruned a directory outside the run root" >&2; exit 1; }
+[ -e "$NL_RUN/screenshots/shot-1.png" ] || { echo "a run whose name holds a newline was pruned" >&2; exit 1; }
+[ ! -e "$RUNS/spaced/screenshots/shot 1.png" ] || { echo "a media file with a space in its name survived --delete" >&2; exit 1; }
+rm -rf "$NL_RUN" "$RUNS/spaced" "$CWD"
+
 echo "smoke evidence retention tests passed"

@@ -101,6 +101,7 @@ COMMAND="${1:-}"
 RUN_DIR="${2:-}"
 
 die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
+. "$(dirname -- "${BASH_SOURCE[0]}")/smoke-run-path.sh"
 
 [ "$_CF_WANT_VALUE" = false ] || die "--confirmed-findings requires a value"
 [ -z "$CONFIRMED_FINDINGS_CSV" ] || [ "$COMMAND" = marker ] ||
@@ -196,18 +197,20 @@ prepare_lease_dir() {
 begin_active_run_fence() {  # <artifact description>
   local description="$1" state_dir="${SMOKE_GATE_STATE_DIR:-}" run_id f count=0
   local state owner pr lease authority expires_epoch state_kind="" lease_slug env_slug
-  run_id="$(basename "$RUN_DIR")"
+  path_base run_id "$RUN_DIR"
+  run_id_ok "$run_id" || die "run directory name is not a run id (1-200 of [A-Za-z0-9._-]) — $description is refused"
+  FENCED_RUN_ID="$run_id"
   FENCED_PR=""; FENCED_REPO_SLUG=""; FENCED_REPO_CONFLICT=""
   [ -n "$state_dir" ] || die "SMOKE_GATE_STATE_DIR is unset — the run's gate claim cannot be verified, so $description is refused"
   FENCED_STATE_FILE=""
   for f in "$state_dir"/pr-*-state.json; do
     [ -e "$f" ] || continue
-    if [ "$(jq -r '.activeRunId // empty' "$f" 2>/dev/null)" = "$run_id" ]; then
+    if jq -e --arg id "$run_id" '.activeRunId == $id' "$f" >/dev/null 2>&1; then
       FENCED_STATE_FILE="$f"; state_kind="pr"; count=$(( count + 1 ))
     fi
   done
   if [ -e "$state_dir/develop-state.json" ] &&
-     [ "$(jq -r '.activeRunId // empty' "$state_dir/develop-state.json" 2>/dev/null)" = "$run_id" ]; then
+     jq -e --arg id "$run_id" '.activeRunId == $id' "$state_dir/develop-state.json" >/dev/null 2>&1; then
     FENCED_STATE_FILE="$state_dir/develop-state.json"; state_kind="develop"; count=$(( count + 1 ))
   fi
   # A certification, re-verification or evidence-recovery run has no PR and no
@@ -217,7 +220,7 @@ begin_active_run_fence() {  # <artifact description>
   # gap made coordinators hand-compose the contract and markers directly,
   # skipping every check in this function.
   if [ -e "$state_dir/task-$run_id-state.json" ] &&
-     [ "$(jq -r '.activeRunId // empty' "$state_dir/task-$run_id-state.json" 2>/dev/null)" = "$run_id" ]; then
+     jq -e --arg id "$run_id" '.activeRunId == $id' "$state_dir/task-$run_id-state.json" >/dev/null 2>&1; then
     FENCED_STATE_FILE="$state_dir/task-$run_id-state.json"; state_kind="task"; count=$(( count + 1 ))
   fi
   [ "$count" -eq 1 ] || die "run '$run_id' does not hold the gate in exactly one active slot — STOP this campaign; do not write $description"
@@ -545,7 +548,7 @@ contract)
   mkdir -p "$RUN_DIR/markers"
   tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
   jq -n \
-    --arg runId "$(basename "$RUN_DIR")" \
+    --arg runId "$FENCED_RUN_ID" \
     --arg sha "$SOURCE_SHA" \
     --arg now "$(iso_now)" \
     --arg owner "$FENCED_OWNER" \
@@ -742,7 +745,7 @@ adopt)
   # (smoke-pr-gate.sh:1011-1014) or creates one (smoke-pr-gate.sh:1049-1052)
   # and refuses the claim if that write fails.
   if [ "$FENCED_STATE_KIND" = task ]; then
-    TASK_BINDING_FILE="$LEASE_DIR/task-binding-$(basename "$RUN_DIR").json"
+    TASK_BINDING_FILE="$LEASE_DIR/task-binding-$FENCED_RUN_ID.json"
     # SOURCE OF TRUTH: read_task_binding in smoke-pr-gate.sh:631-663 — the jq
     # predicate at :638-650 and the calendar round-trip of boundAt and
     # terminal.completedAt at :654-661. Duplicated verbatim because the gate
@@ -750,7 +753,7 @@ adopt)
     # looser check here would adopt a contract onto a binding every gate
     # lifecycle verb then refuses as malformed (task_lease_fence_begin,
     # smoke-pr-gate.sh:1129-1134).
-    TASK_BINDING="$(jq -ce --arg run "$(basename "$RUN_DIR")" '
+    TASK_BINDING="$(jq -ce --arg run "$FENCED_RUN_ID" '
       def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
       def terminal_ok:
         . == null or
@@ -783,7 +786,7 @@ adopt)
     die "completion contract is bound to a different sourceSha — adoption only continues the SAME campaign; a different build requires 'contract --regenerate'"
   [ "$(jq -r '.ownershipKind // empty' "$CONTRACT")" = "$FENCED_STATE_KIND" ] ||
     die "completion contract ownershipKind does not match this run's active $FENCED_STATE_KIND slot — refusing adoption"
-  [ "$(jq -r '.runId // empty' "$CONTRACT")" = "$(basename "$RUN_DIR")" ] ||
+  jq -e --arg id "$FENCED_RUN_ID" '.runId == $id' "$CONTRACT" >/dev/null 2>&1 ||
     die "completion contract names a different run — refusing adoption"
   # Identity: never changed by an adoption, and BACKFILLED into a contract
   # written before it existed (schemaVersion 1, or one missing pr/repoSlug),
