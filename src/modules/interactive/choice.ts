@@ -80,8 +80,17 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
   if (decision !== undefined && !scope) return { error: 'decision belongs only on an approvalScope release card' };
   const brief = decision === undefined ? undefined : parseReleaseDecision(decision);
   if (typeof brief === 'string') return { error: brief };
-  if (scope && !brief && readEnvFile([DECISION_REQUIRED_KEY])[DECISION_REQUIRED_KEY] === '1') {
-    return { error: 'a release card needs decision {question, ifItShips, evidence}: an approver must see what ships' };
+  if (scope && !brief) {
+    if (readEnvFile([DECISION_REQUIRED_KEY])[DECISION_REQUIRED_KEY] === '1') {
+      return {
+        error: 'a release card needs decision {question, ifItShips, evidence}: an approver must see what ships',
+      };
+    }
+    log.warn('request_choice: release card posted without a decision', {
+      choiceId,
+      repository: scope.repository,
+      pullRequest: scope.pullRequest,
+    });
   }
   const canonical = scope ? canonicalReleaseChoice(scope, brief) : undefined;
   const cardText = canonical ? `**${canonical.title}**\n\n${canonical.question}`.length : 0;
@@ -183,13 +192,13 @@ function canonicalReleaseChoice(
     title: `Release approval: ${scope.repository}#${scope.pullRequest}`,
     question: brief
       ? [
-          pin,
-          '',
           'The requesting agent’s brief (its words, not checked by the host):',
           `The question: ${brief.question}`,
           'If it ships:',
           ...brief.ifItShips.map((line) => `• ${line}`),
           `Evidence: ${brief.evidence}`,
+          '',
+          pin,
         ].join('\n')
       : pin,
     options: [

@@ -122,7 +122,7 @@ export const requestChoice: McpToolDefinition = {
         approvalScope: {
           type: 'object',
           description:
-            'Optional host-canonical release approval scope. When supplied, omit title/question/options: the host renders exact Ship and Hold buttons from this scope. Pass `decision` with it.',
+            'Optional host-canonical release approval scope. When supplied, omit title/question/options: the host renders exact Ship and Hold buttons and the repo/PR/base/head line from this scope. `decision` is required with it.',
           properties: {
             purpose: { type: 'string', enum: ['release_ship'] },
             repository: { type: 'string', description: 'Exact owner/repository' },
@@ -136,7 +136,7 @@ export const requestChoice: McpToolDefinition = {
         decision: {
           type: 'object',
           description:
-            'With approvalScope only: what the approver decides, shown on the card under the host\'s Ship line, labelled as your words. The host refuses a release card without it once that rule is switched on, and refuses a commit SHA, a markdown link or || in question or ifItShips, or a card over 1800 characters; a refusal arrives later as a "request_choice failed" message.',
+            'Required with approvalScope, refused without it: what the approver is deciding, shown on the card above the host\'s Ship line and labelled as your words. The host refuses a commit SHA, a markdown link or || in question or ifItShips, or a card over 1800 characters; that refusal arrives later as a "request_choice failed" message.',
           properties: {
             question: {
               type: 'string',
@@ -162,6 +162,9 @@ export const requestChoice: McpToolDefinition = {
     const releaseScope = approvalScope === undefined ? undefined : parseReleaseShipScope(approvalScope);
     if (approvalScope !== undefined && !releaseScope) return err('approvalScope is malformed');
     if (decision !== undefined && !releaseScope) return err('decision belongs only on an approvalScope release card');
+    if (releaseScope && decision === undefined) {
+      return err('a release card needs decision {question, ifItShips, evidence}: an approver must see what ships');
+    }
     if (decision !== undefined && !isReleaseDecision(decision)) {
       return err('decision needs exactly question, ifItShips and evidence, each non-empty text');
     }

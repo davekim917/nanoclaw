@@ -363,23 +363,27 @@ describe('request_choice delivery', () => {
     });
   });
 
-  it('shows the decision under the host pin, labelled as the agent’s words, and keeps it on the answered card', async () => {
+  it('shows the decision above the host pin, labelled as the agent’s words, and a Ship still answers on scope alone', async () => {
     const row = (await ask(session, { approvalScope: RELEASE_SCOPE, decision: DECISION }))!;
     const shown = [
-      PIN,
-      '',
       'The requesting agent’s brief (its words, not checked by the host):',
       'The question: Retire the legacy export button?',
       'If it ships:',
       '• The export menu loses one entry.',
       '• Saved exports keep working.',
       'Evidence: https://github.com/owner/repository/pull/42#issuecomment-1',
+      '',
+      PIN,
     ].join('\n');
     expect(delivered[0].content.question).toBe(shown);
+    expect(delivered[0].content.title).toBe('Release approval: owner/repository#42');
     expect(JSON.parse(row.payload)).toEqual({ choiceId: 'choice-1', approvalScope: RELEASE_SCOPE });
 
-    await click(row.approval_id, 'ship', ADMIN);
+    expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
     expect(after(1).find((d) => d.content.operation === 'edit')?.content.text).toContain(shown);
+    const answer = notes()[0]!.text;
+    expect(answer).toContain(` value=ship `);
+    expect(answer.endsWith(` release_scope=${encodeURIComponent(JSON.stringify(RELEASE_SCOPE))}`)).toBe(true);
   });
 
   it('renders platform link and mention syntax in the decision as plain text', async () => {
@@ -392,8 +396,14 @@ describe('request_choice delivery', () => {
     );
   });
 
-  it('posts a decision-less release card until the rule is switched on, then refuses it', async () => {
+  it('posts a decision-less release card with a warning until the rule is switched on, then refuses it', async () => {
+    const warnSpy = vi.spyOn(log, 'warn');
     expect((await ask(session, { approvalScope: RELEASE_SCOPE }))!.question).toBe(PIN);
+    expect(warnSpy).toHaveBeenCalledWith('request_choice: release card posted without a decision', {
+      choiceId: 'choice-1',
+      repository: 'owner/repository',
+      pullRequest: 42,
+    });
 
     envFile.values = { NANOCLAW_RELEASE_CARD_DECISION_REQUIRED: '1' };
     expect(await ask(session, { approvalScope: RELEASE_SCOPE }, 'choice-2')).toBeUndefined();
@@ -432,7 +442,10 @@ describe('request_choice delivery', () => {
       { evidence: 'https://x.example and more' },
       'decision.evidence must be one https link',
     ],
-    ['a missing question', { question: ' ' }, 'decision.question is required'],
+    ['a whitespace-only question', { question: ' \t ' }, 'decision.question is required'],
+    ['an empty question', { question: '' }, 'decision.question is required'],
+    ['a whitespace-only if-it-ships', { ifItShips: '  \n ' }, 'decision.ifItShips is required'],
+    ['an empty evidence link', { evidence: '' }, 'decision.evidence is required'],
     ['an extra key', { recommend: 'Ship' }, 'decision takes only question, ifItShips, evidence'],
     ['a multi-line question', { question: 'Ship?\nReally' }, 'decision text must not hold control characters'],
     ['an over-long question', { question: `${'q'.repeat(300)}?` }, 'decision.question is over 300 characters'],
@@ -448,19 +461,29 @@ describe('request_choice delivery', () => {
     expect(notes().map((n) => n.text)).toEqual([`request_choice failed: ${error}`]);
   });
 
+  it.each([
+    ['an empty object', {}, 'decision.question is required'],
+    ['a blank string', '   ', 'decision must be {question, ifItShips, evidence}'],
+    ['null', null, 'decision must be {question, ifItShips, evidence}'],
+  ])('refuses %s as a decision, even before the rule is switched on', async (_name, decision, error) => {
+    expect(await ask(session, { approvalScope: RELEASE_SCOPE, decision })).toBeUndefined();
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([`request_choice failed: ${error}`]);
+  });
+
   it('counts the title against the card budget, so an accepted decision is never cut', async () => {
     const scope = { ...RELEASE_SCOPE, repository: `${'o'.repeat(100)}/${'r'.repeat(100)}` };
     const title = `Release approval: ${scope.repository}#42`;
     const pin = `Ship ${scope.repository}#42 from main at ${'a'.repeat(40)}?`;
     const body = (lines: string[]) =>
       [
-        pin,
-        '',
         'The requesting agent’s brief (its words, not checked by the host):',
         `The question: ${DECISION.question}`,
         'If it ships:',
         ...lines.map((l) => `• ${l}`),
         `Evidence: ${DECISION.evidence}`,
+        '',
+        pin,
       ].join('\n');
     const lines = Array.from({ length: 10 }, () => 'x'.repeat(119));
     lines[9] = 'x'.repeat(119 - (body(lines).length + title.length + 6 - 1801));

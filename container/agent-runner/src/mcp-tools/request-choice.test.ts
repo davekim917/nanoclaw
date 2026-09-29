@@ -108,24 +108,17 @@ describe('request_choice', () => {
     expect(outbound('system')[0].content.approvers).toEqual(['slack:admin-1', 'slack:admin-2']);
   });
 
-  it('transports a valid release scope without agent-controlled presentation', async () => {
+  it('transports a release scope and its decision, dropping agent title, question and options', async () => {
     inConversation();
-    const result = await requestChoice.handler({ approvalScope: RELEASE_SCOPE });
+    const result = await requestChoice.handler({ ...ASK, approvalScope: RELEASE_SCOPE, decision: DECISION });
 
     expect(result.isError).toBeUndefined();
     expect(outbound('system')[0].content).toEqual({
       action: 'request_choice',
       choiceId: outbound('system')[0].id,
       approvalScope: RELEASE_SCOPE,
+      decision: DECISION,
     });
-  });
-
-  it('carries a release decision through to the host', async () => {
-    inConversation();
-    const result = await requestChoice.handler({ approvalScope: RELEASE_SCOPE, decision: DECISION });
-
-    expect(result.isError).toBeUndefined();
-    expect(outbound('system')[0].content).toMatchObject({ approvalScope: RELEASE_SCOPE, decision: DECISION });
   });
 
   it('with `to`: resolves the channel destination into the action', async () => {
@@ -221,6 +214,12 @@ describe('request_choice', () => {
     ['a wrong purpose in release scope', { approvalScope: { ...RELEASE_SCOPE, purpose: 'other' } }, /approvalScope/],
     ['an extra release scope key', { approvalScope: { ...RELEASE_SCOPE, extra: true } }, /approvalScope/],
     ['a decision on a generic card', { ...ASK, decision: DECISION }, /only on an approvalScope/],
+    ['a release scope without a decision', { approvalScope: RELEASE_SCOPE }, /release card needs decision/],
+    [
+      'a whitespace-only decision field',
+      { approvalScope: RELEASE_SCOPE, decision: { ...DECISION, ifItShips: ' \n ' } },
+      /exactly question, ifItShips and evidence/,
+    ],
     [
       'a decision missing a field',
       { approvalScope: RELEASE_SCOPE, decision: { question: 'Q?', evidence: DECISION.evidence } },
