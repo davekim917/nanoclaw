@@ -342,7 +342,7 @@ class Guard(unittest.TestCase):
             json.dump(dict(legacy, accounts=[], brands=[], runId=RUN_ID), f)
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             api.judge(self.run_dir, "PUT", "/x", None, ["sandbox"])
-        self.assertIn("mode must be", str(ctx.exception), "an allowlist-era scope file fails closed")
+        self.assertIn("mode must be", str(ctx.exception), "a deny file missing its mode fails closed")
         os.unlink(path)
         with self.assertRaises(ValueError):
             self.pin(legacy)
@@ -370,6 +370,38 @@ class Guard(unittest.TestCase):
         with self.assertRaises(api.WriteScopeRefused) as ctx:
             api.judge(self.run_dir, "POST", "/notes", {"k": 1}, ["sandbox"])
         self.assertIn("no-scope", str(ctx.exception), "a symlinked scope is refused, not followed")
+
+    def test_allowlist_era_scope_keeps_its_old_behaviour(self):
+        legacy = {"tenants": [], "brands": [], "accounts": [], "authPaths": ["/users/login"],
+                  "readOnlyPosts": ["/widgets/search"]}
+        pinned = self.pin(legacy)
+        self.assertEqual((pinned["schemaVersion"], "mode" in pinned), (1, False))
+        h = self.client()
+        self.assertEqual(h.login("M"), 201)
+        self.assertEqual(h.call("l1", "M", "POST", "/widgets/search", {"q": 1})[0], 201)
+        name = PREFIX + "legacy"
+        code, js = h.call("l2", "M", "POST", "/reports", {"name": name})
+        self.assertEqual(code, 201)
+        self.assert_blocked(h, "l3", "PATCH", "/reports/" + js["report"]["id"], {"slot": 2}, "foreign-target")
+        h.own("l4", "M", "/reports", js["report"]["id"], name)
+        self.assert_sent(h, "l5", "PATCH", "/reports/" + js["report"]["id"], {"slot": 2})
+        self.assert_blocked(h, "l6", "POST", "/notes", {"body": "x"}, "no-qa-target")
+        self.assert_blocked(h, "l7", "POST", "/notes", {"name": PREFIX + "n", "accountId": 4401}, "foreign-target")
+
+    def test_a_run_already_holding_an_allowlist_pin_keeps_working(self):
+        with open(os.path.join(self.run_dir, api.SCOPE_FILE), "w") as f:
+            json.dump({"tenants": [], "brands": [], "accounts": [], "authPaths": ["/users/login"],
+                       "readOnlyPosts": [], "schemaVersion": 1, "runId": RUN_ID}, f)
+        h = self.client()
+        self.assertEqual(h.login("M"), 201)
+        self.assert_sent(h, "k1", "POST", "/notes", {"title": PREFIX + "n"})
+        self.assert_blocked(h, "k2", "DELETE", "/users/4401", None, "foreign-target")
+
+    def test_a_file_mixing_both_formats_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.pin({"tenants": [], "authPaths": [], "readOnlyPosts": [], "denyPrefixes": ["/media"]})
+        with self.assertRaises(ValueError):
+            self.pin({"tenants": [], "brands": [], "denyPaths": []})
 
     def test_cli(self):
         src = os.path.join(self.tmp.name, "scope.json")
@@ -401,6 +433,13 @@ class Guard(unittest.TestCase):
         with open(src, "w") as f:
             json.dump(dict(SCOPE, readOnlyPosts=["("]), f)
         self.assertEqual(run("init", os.path.join(self.tmp.name, "fresh"), "--from", src).returncode, 2)
+        old = os.path.join(self.tmp.name, "acme-pr-pr9-0123456789ab-20260103T000000Z")
+        os.makedirs(old)
+        with open(src, "w") as f:
+            json.dump({"tenants": [], "brands": [], "accounts": [], "authPaths": ["/users/login"], "readOnlyPosts": []}, f)
+        self.assertEqual(run("init", old, "--from", src).returncode, 0, "init accepts an allowlist-era file")
+        self.assertEqual(run("check", old, "POST", "/users/login").returncode, 0)
+        self.assertEqual(run("check", old, "POST", "/notes", "--body", '{"title": "x"}').returncode, 77)
 
 
 if __name__ == "__main__":
