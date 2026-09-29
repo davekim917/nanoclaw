@@ -113,8 +113,6 @@ Series you deliberately leave unpinned will move to their group's default. That 
 
 **Nothing is auto-pinned by the upgrade, deliberately.** Freezing every unpinned series onto a model nobody chose would be the same defect this change closes — and see the rollback caveat below, because pinning cannot currently be undone.
 
-> **On this install**, the pinning step is already done: ten recap/digest series are pinned to `claude-sonnet-5`/`xhigh` and the remaining unpinned series are intended to move to the group default. This section is the general procedure, for a fork doing the same migration.
-
 ## 4. Verify
 
 Verify at the **consumer**, not at the store. `ncl tasks get` shows what is configured; it cannot tell you what the model actually ran. The per-turn ledger can:
