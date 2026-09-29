@@ -46,7 +46,7 @@ const MAX_DECISION_LINES = 10;
 const MAX_DECISION_EVIDENCE = 500;
 const MAX_RELEASE_CARD_TEXT = 1800; // Discord posts **title**, a blank line and the body, and cuts at 1900
 const HEX_RUN_RE = /[0-9a-f]{40}/i;
-const CONTROL_RE = /\p{Cc}/u;
+const INVISIBLE_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const EVIDENCE_RE = /^https:\/\/[^\s<>|]+$/;
 
 interface ReleaseDecision {
@@ -170,8 +170,8 @@ function parseReleaseDecision(value: unknown): ReleaseDecision | string {
     .map((line) => line.trim())
     .filter(Boolean);
   if (lines.length > MAX_DECISION_LINES) return `decision.ifItShips has over ${MAX_DECISION_LINES} lines`;
-  const text = [question, ...lines];
-  if (text.some((t) => CONTROL_RE.test(t))) return 'decision text must not hold control characters';
+  const text = [question, ...lines, evidence];
+  if (text.some((t) => INVISIBLE_RE.test(t))) return 'decision text must not hold control or invisible characters';
   if (text.some((t) => HEX_RUN_RE.test(t))) return 'decision text must not hold a commit SHA: the host pins the head';
   if (text.some((t) => t.includes(']('))) return 'decision text must not hold markdown links: put the link in evidence';
   if (text.some((t) => t.includes('||'))) return 'decision text must not hold || (Discord hides text between bars)';

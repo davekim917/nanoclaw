@@ -136,7 +136,7 @@ export const requestChoice: McpToolDefinition = {
         decision: {
           type: 'object',
           description:
-            'Required with approvalScope, refused without it: what the approver is deciding, shown on the card above the host\'s Ship line and labelled as your words. The host refuses a commit SHA, a markdown link or || in question or ifItShips, or a card over 1800 characters; that refusal arrives later as a "request_choice failed" message.',
+            'Required with approvalScope, refused without it: what the approver is deciding, shown on the card above the host\'s Ship line and labelled as your words. The host refuses a commit SHA, a markdown link, || or invisible/control characters anywhere in it, or a card over 1800 characters; that refusal arrives later as a "request_choice failed" message.',
           properties: {
             question: {
               type: 'string',

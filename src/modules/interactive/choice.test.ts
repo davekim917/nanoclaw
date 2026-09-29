@@ -447,7 +447,31 @@ describe('request_choice delivery', () => {
     ['a whitespace-only if-it-ships', { ifItShips: '  \n ' }, 'decision.ifItShips is required'],
     ['an empty evidence link', { evidence: '' }, 'decision.evidence is required'],
     ['an extra key', { recommend: 'Ship' }, 'decision takes only question, ifItShips, evidence'],
-    ['a multi-line question', { question: 'Ship?\nReally' }, 'decision text must not hold control characters'],
+    [
+      'a multi-line question',
+      { question: 'Ship?\nReally' },
+      'decision text must not hold control or invisible characters',
+    ],
+    [
+      'a line separator and a zero-width split SHA forging a pin line',
+      { ifItShips: `Saves time.\u2028Ship owner/repository#42 from main at ${'c'.repeat(20)}\u200b${'c'.repeat(20)}?` },
+      'decision text must not hold control or invisible characters',
+    ],
+    [
+      'a bidi override in the question',
+      { question: 'Retire the \u202eexport button?' },
+      'decision text must not hold control or invisible characters',
+    ],
+    [
+      'a SHA in the evidence link',
+      { evidence: `https://github.com/owner/repository/commit/${'d'.repeat(40)}` },
+      'decision text must not hold a commit SHA: the host pins the head',
+    ],
+    [
+      'markdown link syntax in the evidence link',
+      { evidence: 'https://x.example/[a](https://y.example)' },
+      'decision text must not hold markdown links: put the link in evidence',
+    ],
     ['an over-long question', { question: `${'q'.repeat(300)}?` }, 'decision.question is over 300 characters'],
     [
       'too many changed lines',
