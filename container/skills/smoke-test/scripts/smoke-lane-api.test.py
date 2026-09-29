@@ -19,7 +19,7 @@ RUN_ID = "acme-pr-pr7-0123456789ab-20260101T000000Z"
 PREFIX = "QA-{}-".format(RUN_ID)
 SCOPE = {"mode": "deny", "tenants": ["sandbox", "playground"],
          "authPaths": ["/users/login", "/users/refresh"], "readOnlyPosts": ["/widgets/search"],
-         "denyPaths": ["/ledger/close", "/widgets/[^/]+/broadcast"], "denyPrefixes": ["/media", "/profile/photo/"]}
+         "denyPaths": ["/ledger/close", "/widgets/[^/]+/broadcast"], "denyPrefixes": ["/media", "/profile/photo"]}
 SEAT_TENANTS = {"m@example.test": {"tenantId": "sandbox"}, "g@example.test": {"tenantId": "globex"},
                 "n@example.test": {"sub": "9"}, "w@example.test": {"tenantId": "sandbox", "tenant_id": "globex"}}
 
@@ -209,12 +209,21 @@ class Guard(unittest.TestCase):
         for i, path in enumerate(("/forecasts/nightly-resync", "/catalog/Rebuild", "/orders/archive",
                                   "/stats/reindex/all", "/history/backfill", "/admin/cron/trigger",
                                   "/budget/publishDraft", "/reports/jobs/run", "/imports/jobs/77/run",
-                                  "/cache/refresh-all")):
+                                  "/cache/refresh-all", "/jobs/7/runs", "/jobs/7/execute", "/jobs/run-all",
+                                  "/job/trigger")):
             self.assertFalse(api.denied(api.load_scope(self.run_dir), api.route_of(path)), "not an exact rule")
             self.assert_blocked(h, "s%d" % i, "POST", path, {"k": 1}, "tenant-wide-shape")
         self.assert_blocked(h, "s-patch", "PATCH", "/users/refresh", {"k": 1}, "tenant-wide-shape")
         self.assert_sent(h, "s-auth", "POST", "/users/refresh", {"k": 1})
         self.assert_sent(h, "s-runner", "POST", "/runners/7/rerun-notes", {"k": 1})
+
+    def test_scope_routes_are_server_routes_under_the_base_path(self):
+        self.pin(dict(SCOPE, denyPaths=["/api/ledger/close"], denyPrefixes=["/api/media"]))
+        h = api.H(os.path.join(self.run_dir, "lanes", "l2"), run_dir=self.run_dir, base=self.base + "/api/",
+                  seats={"M": "m@example.test"}, password_helper=self.helper)
+        self.assert_blocked(h, "b1", "POST", "/ledger/close", None, "denyPaths")
+        self.assert_blocked(h, "b2", "DELETE", "/media/5", None, "denyPrefixes")
+        self.assertEqual(api.judge(self.run_dir, "POST", "/ledger/close", None, ["sandbox"]), "write")
 
     def test_explicit_deny_beats_exemptions(self):
         self.pin(dict(SCOPE, readOnlyPosts=["/media/search"], authPaths=["/ledger/close"]))
@@ -235,6 +244,9 @@ class Guard(unittest.TestCase):
         for i, empty in enumerate((None, [], [None], "")):
             self.assert_blocked(h, "t8e%d" % i, "POST", "/notes", {"tenantId": empty}, "foreign-tenant")
         self.assert_blocked(h, "t9", "POST", "/notes", {"tenants": ["sandbox", "globex"]}, "foreign-tenant")
+        self.assert_blocked(h, "t9b", "POST", "/notes", {"Tenant-Id": "globex"}, "foreign-tenant")
+        self.assert_blocked(h, "t9c", "POST", "/notes?tenantId%5B%5D=globex", {"k": 1}, "foreign-tenant")
+        self.assert_blocked(h, "t9d", "POST", "/notes?filter%5Btenant_id%5D=globex", {"k": 1}, "foreign-tenant")
         self.assert_sent(h, "t10", "POST", "/notes", {"tenants": ["sandbox", "playground"]})
         self.assertEqual(h.call("t11", "G", "GET", "/notes")[0], 200, "reads go from any seat")
         before = len(Backend.seen)
@@ -334,8 +346,23 @@ class Guard(unittest.TestCase):
         os.unlink(path)
         with self.assertRaises(ValueError):
             self.pin(legacy)
-        with self.assertRaises(ValueError):
-            self.pin(dict(SCOPE, denyPrefixes=["/"]))
+        bad = ([("denyPrefix", ["/media"])], [("denypaths", ["/ledger/close"])], [("accounts", [])],
+               [("denyPrefixes", ["/"])], [("denyPrefixes", ["/media/"])], [("denyPrefixes", ["/Media"])],
+               [("denyPrefixes", ["/me%64ia"])], [("denyPrefixes", ["/media//x"])], [("denyPrefixes", ["media"])],
+               [("denyPaths", ["/ledger/close/"])], [("denyPaths", ["/ledger//close"])],
+               [("denyPaths", ["/ledger/%63lose"])], [("tenants", [7])])
+        for pairs in bad:
+            with self.assertRaises(ValueError, msg=pairs):
+                self.pin(dict(SCOPE, **dict(pairs)))
+        for key in ("tenants", "denyPaths", "denyPrefixes"):
+            with self.assertRaises(ValueError, msg=key):
+                self.pin({k: v for k, v in SCOPE.items() if k != key})
+        with open(path, "w") as f:
+            json.dump(dict(SCOPE, denyPrefix=["/media"], runId=RUN_ID), f)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            api.judge(self.run_dir, "POST", "/media/5", None, ["sandbox"])
+        self.assertIn("unknown keys", str(ctx.exception), "a typo'd rule key fails closed, not open")
+        os.unlink(path)
         self.pin()
         real = os.path.join(self.tmp.name, "scope-copy.json")
         os.rename(path, real)

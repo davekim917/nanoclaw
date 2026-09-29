@@ -22,12 +22,14 @@ LEDGER_FILE = "write-scope-fixtures.ndjson"
 SCOPE_MODE = "deny"
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 SCOPE_LISTS = ("tenants", "authPaths", "readOnlyPosts", "denyPaths", "denyPrefixes")
+REQUIRED_LISTS = ("tenants", "denyPaths", "denyPrefixes")
+PINNED_KEYS = {"mode", "schemaVersion", "runId"}
 PATTERN_LISTS = ("authPaths", "readOnlyPosts", "denyPaths")
 TENANT_KEYS = {"tenantid", "tenantids", "tenant", "tenants"}
 TENANT_CLAIMS = ("tenantId", "tenant_id", "tenant")
 DENY_PATTERNS = (
     re.compile(r"sync|publish|archive|refresh|rebuild|reindex|backfill|cron"),
-    re.compile(r"(?:^|/)jobs?/(?:[^/]+/)*run(?:/|$)"),
+    re.compile(r"(?:^|/)jobs?/(?:[^/]+/)*(?:runs?|execute|trigger)(?:[/-]|$)"),
 )
 NAME_KEYS = {"name", "title", "label", "filename"}
 PASSWORD_HELPER = "/workspace/extra/qa-seat-password.sh"
@@ -52,16 +54,27 @@ def validated_scope(raw):
         raise ValueError("scope is not an object")
     if raw.get("mode") != SCOPE_MODE:
         raise ValueError("mode must be {!r} (an allowlist scope file is no longer accepted)".format(SCOPE_MODE))
+    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS)
+    if unknown:
+        raise ValueError("unknown keys {}".format(unknown))
     for key in SCOPE_LISTS:
+        if key in REQUIRED_LISTS and key not in raw:
+            raise ValueError("{} is required (an empty list is fine)".format(key))
         value = raw.get(key, [])
-        if not isinstance(value, list) or not all(isinstance(v, (str, int)) for v in value):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ValueError("{} must be a list of strings".format(key))
     for key in PATTERN_LISTS:
         for pattern in raw.get(key, []):
-            re.compile(str(pattern))
+            re.compile(pattern)
+            if not pattern.startswith("/") or pattern.endswith("/") or "//" in pattern or "%" in pattern:
+                raise ValueError("{} pattern {!r} is not a canonical path pattern".format(key, pattern))
     for prefix in raw.get("denyPrefixes", []):
-        if not str(prefix).startswith("/") or str(prefix).rstrip("/") == "":
-            raise ValueError("denyPrefixes entries are absolute paths below the root, got {!r}".format(prefix))
+        try:
+            canonical = route_of(prefix)
+        except WriteScopeRefused:
+            canonical = None
+        if prefix != canonical or canonical == "/":
+            raise ValueError("denyPrefixes entry {!r} is not a canonical path below the root".format(prefix))
     scope = {key: [str(v) for v in raw.get(key, [])] for key in SCOPE_LISTS}
     return dict(scope, mode=SCOPE_MODE)
 
@@ -135,15 +148,21 @@ def denied(scope, route):
         if re.fullmatch(pattern, route, re.I):
             return "denyPaths {}".format(pattern)
     for prefix in scope["denyPrefixes"]:
-        stem = prefix.rstrip("/").lower()
-        if route == stem or route.startswith(stem + "/"):
+        if route == prefix or route.startswith(prefix + "/"):
             return "denyPrefixes {}".format(prefix)
     return None
 
 
-def judge(run_dir, method, path, body=None, token_tenants=()):
+def tenant_key(key):
+    return any(part.replace("_", "").replace("-", "") in TENANT_KEYS
+               for part in re.split(r"[\[\]]", key.lower()) if part)
+
+
+def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
     method = method.upper()
     route = route_of(path)
+    if base_path:
+        route = route_of(base_path.rstrip("/") + route)
     if method in READ_METHODS:
         return "read"
     scope = load_scope(run_dir)
@@ -159,7 +178,7 @@ def judge(run_dir, method, path, body=None, token_tenants=()):
         raise WriteScopeRefused("denied-path rule=tenant-wide-shape {}".format(shape))
     query = urllib.parse.parse_qsl(urllib.parse.urlsplit(path).query, keep_blank_values=True)
     foreign = ["{}={}".format(key, v) for key, value in list(walk(body)) + query
-               if key.lower().replace("_", "") in TENANT_KEYS
+               if tenant_key(key)
                for v in scalars(value) if v not in scope["tenants"]]
     if foreign:
         raise WriteScopeRefused("foreign-tenant targets={}".format(",".join(foreign)))
@@ -238,7 +257,7 @@ class H:
 
     def guarded(self, tag, seat, method, path, body, tok=None):
         try:
-            judge(self.run_dir, method, path, body, seat_tenants(tok))
+            judge(self.run_dir, method, path, body, seat_tenants(tok), urllib.parse.urlsplit(self.base).path)
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)
 

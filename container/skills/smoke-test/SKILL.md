@@ -387,13 +387,18 @@ The scope file (deployment data, never skill text) is a denylist:
 `"mode": "deny"`, the dev `tenants` the seats may write in, `authPaths` (login
 and token refresh) and `readOnlyPosts` (POST-as-query routes), `denyPaths`
 (full-match path patterns) and `denyPrefixes` (a path and everything below
-it). Reads always go. A write goes unless one of these refuses it, in this
+it). `tenants`, `denyPaths` and `denyPrefixes` are required (empty is fine),
+unknown keys are refused, and rules must be canonical (lowercase prefixes, no
+trailing or doubled slash, no percent-encoding), so a typo fails closed. Rules
+name server routes: the client's `base` path is prepended before matching.
+Reads always go. A write goes unless one of these refuses it, in this
 order: its path matches `denyPaths` or `denyPrefixes`, whatever the method;
 it is a POST on `authPaths` or `readOnlyPosts` (allowed, no tenant needed);
 its path has a tenant-wide job shape (`sync`, `publish`, `archive`,
 `refresh`, `rebuild`, `reindex`, `backfill` or `cron` anywhere in it, or
-`jobs/.../run`), which catches a new job route before anyone lists it; a
-tenant key in the body or query names a tenant outside `tenants` (null or
+`jobs/.../run`, `runs`, `execute` or `trigger`), which catches a new job route before anyone lists it; a
+tenant key in the body or query (`tenantId`, `tenant_id`, `tenant-id`,
+`filter[tenantId]`, ...) names a tenant outside `tenants` (null or
 empty counts as outside); or the seat's token carries no tenant claim, or one
 outside `tenants`. Paths are compared lowercased, percent-decoded and with
 empty segments dropped; dot segments are refused. An allowlist-era scope file
@@ -405,8 +410,9 @@ A refusal sends nothing, saves `<tag>.json` with `harnessBlocked: true` (passwor
 secret and token fields and query values redacted, as in every saved call),
 logs
 `HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason=...` and raises
-`WriteScopeRefused`: record the step `untested` with the rule that denied it,
-never as a product refusal, a pass or a finding. The guard covers this client
+`WriteScopeRefused`: record the step `blocked` with the rule that denied it (it
+lands on the verdict's Untested line), never as a product refusal, a pass or a
+finding. The guard covers this client
 only: browser-driven writes and hand-rolled HTTP rest on the standing
 instructions, which must state the same denylist in words. It stops an honest
 lane's mistakes, not a lane set on bypassing it. Request paths must be
@@ -738,7 +744,7 @@ fenced `adopt` backfills it — never read as "no pin". At intake:
    Every worker brief carries this sentence verbatim: "QA seats act in the
    scoped dev tenants; ordinary writes there are pre-authorized; the scope's
    denied routes and the actions the standing instructions deny are not, and a
-   step that needs one is recorded untested." Say which tenants the seats sit
+   step that needs one is recorded blocked, on the Untested line." Say which tenants the seats sit
    in; never call a shared client tenant a QA tenant.
 
 **A journey that only renders an area does not cover a changed backend
