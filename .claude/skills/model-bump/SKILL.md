@@ -35,7 +35,7 @@ grep -E '^\s*CODEX_MODEL=' .env
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where coalesce(mga.default_model,'') <> '' or coalesce(mga.default_effort,'') <> ''"
 # Scheduled-task pins
 ncl tasks list --json   # rows with model_pin / effort_pin
-# Host-side Codex defaults outside the fleet: a `model =` line in either config pins every host codex call to that id
+# Host-side Codex defaults outside the fleet: a `model =` line in either config sets the default for every host codex call that passes no `-m`
 grep -Hn '^model = ' ~/.codex/config.toml ~/.codex-secondary/config.toml   # remove the line so Codex uses its own current default
 # Full model ids written into plugins (Codex has no aliases): review commands, dispatch rubric codex tiers, lints that assert the string
 grep -rnE 'gpt-[0-9]' ~/plugins --include=*.md --include=*.json --include=*.mjs --include=*.toml -l --exclude-dir=node_modules --exclude-dir=.git
