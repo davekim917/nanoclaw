@@ -932,8 +932,6 @@ jq -e '.status == "fail"' "$IDENT/markers/B1.json" >/dev/null   # the evidence s
 SMOKE_GATE_OWNER=owner-successor barrier "$IDENT" lanes | jq -e '.ready == true' >/dev/null
 gate_owns "$(basename "$FIXTURE_DIR")"
 
-# The fence reads the run directory's name exactly: `run-fixture<newline>`,
-# beside the claimed `run-fixture`, is not that run and is no run id at all.
 NL_RUN="$FIXTURE_DIR"$'\n'; mkdir -p "$NL_RUN"
 OUT="$(scaffold contract "$NL_RUN" "$SHA" B1:browser 2>&1 || true)"
 jq -e '.ok == false and (.error | test("not a run id"))' <<<"$OUT" >/dev/null || {

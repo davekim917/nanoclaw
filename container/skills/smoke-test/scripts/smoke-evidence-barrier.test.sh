@@ -199,8 +199,6 @@ jq '.evidence = ["evidence/fresh.txt"]' "$EVIDENCE_DIR/markers/B1.json" >"$EVIDE
 mv "$EVIDENCE_DIR/markers/.marker.json" "$EVIDENCE_DIR/markers/B1.json"
 bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes \
   | jq -e '.ready == true' >/dev/null || { echo "expected real evidence to clear a pass marker" >&2; exit 1; }
-# A run root whose resolved name ends in a newline is still that run root, not
-# the name with the newline dropped.
 NL_ROOT="$FIXTURE_DIR/ev-store"$'\n'
 cp -R "$EVIDENCE_DIR" "$NL_ROOT"; ln -s "$NL_ROOT" "$FIXTURE_DIR/ev-alias"
 RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FIXTURE_DIR/ev-alias" lanes || true)"

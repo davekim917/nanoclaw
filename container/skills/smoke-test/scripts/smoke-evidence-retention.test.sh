@@ -222,10 +222,6 @@ jq -e '.protected == 1 and .runsPruned == 0' <<<"$OUT" >/dev/null || {
 rm -f "$STATE_DIR/pr-8-state.json"
 rm -rf "$RUNS/-dash-run"
 
-# --- 13. Names are read whole: a newline or a space splits nothing ---------
-# Read one per line, `old<newline>decoy` became the missing `old` plus a
-# relative `decoy` in the caller's cwd, whose media was then pruned; and
-# `xargs` split `shot 1.png` into two names, deleting neither.
 NL_RUN="$RUNS/old"$'\n'"decoy"
 make_run $'old\ndecoy' 30
 CWD="$FIXTURE_ROOT/cwd"; mkdir -p "$CWD/decoy/screenshots"

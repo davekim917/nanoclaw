@@ -215,8 +215,7 @@ while IFS= read -r -d '' run_dir; do
   run_id="${run_dir##*/}"
   SCANNED=$((SCANNED + 1))
 
-  # The protection set is one id per line, so it cannot name a run whose name
-  # holds a newline; such a run is never pruned.
+  # The one-id-per-line protection set cannot name a run holding a newline.
   if [[ $run_id == *$'\n'* ]] || is_protected "$run_id"; then
     PROTECTED_COUNT=$((PROTECTED_COUNT + 1))
     continue

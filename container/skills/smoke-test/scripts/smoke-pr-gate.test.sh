@@ -5290,7 +5290,6 @@ fresh_state
 TASK_SHA="$(sha 7)"
 OTHER_TASK_SHA="$(sha 8)"
 
-# A run id is validated whole, not line by line: `run-t1<newline>..` is refused.
 OUT="$(bash "$GATE" task-claim $'run-t1\n..' "$TASK_SHA" || true)"
 jq -e '.ok == false and (.error | test("1-200 chars"))' <<<"$OUT" >/dev/null || {
   echo "expected a multi-line run id to be refused, got: $OUT" >&2; exit 1; }
