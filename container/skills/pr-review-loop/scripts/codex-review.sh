@@ -2806,7 +2806,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     # "After two failed corrections, stop correcting and reframe": the initial
     # review plus two correction rounds. This cap is also what bounds a class
     # the churn gate cannot see — the gate derives seams from imports, so
-    # findings on Markdown/YAML sites never gate (PR #566: 12 rounds).
+    # findings on Markdown/YAML sites never gate.
     cap="${REVIEW_ROUND_CAP:-3}"
     if ! [[ "$cap" =~ ^[1-9][0-9]*$ ]]; then
       echo "REVIEW_ROUND_CAP must be a positive whole number" >&2
