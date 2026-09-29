@@ -13,7 +13,7 @@ This section is the current migration. Opus and Fable defaults do not move (see 
 grep -HE '"(model|defaultModel)": *"sonnet"' groups/*/container.json
 # 2. Channel wirings:
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where lower(coalesce(mga.default_model,'')) = 'sonnet'"
-# 3. Task series (model_pin = sonnet):
+# 3. Task series (model_pin = sonnet). Lists pending and paused series only, so repeat it once in-flight fires have finished and before you deploy:
 ncl tasks list --json | grep -B1 -A1 '"model_pin": "sonnet"'
 # 4. Subagent frontmatter (group-local, then plugin agents):
 grep -rHE '^model: *sonnet' groups/*/.claude/agents; find ~/plugins -type d -name agents -not -path '*/node_modules/*' -exec grep -rHE '^model: *sonnet' {} +
@@ -30,12 +30,14 @@ A pure scheduled-task fire ignores session stickies (`effectiveTurnSettings`, `c
 ncl groups config update --id <group-id> --model claude-sonnet-5 --effort xhigh
 ncl wirings update <wiring-id> --default-model claude-sonnet-5 --default-effort xhigh
 ncl tasks update --id <series> --group <group-id> --model claude-sonnet-5 --effort xhigh
-ncl tasks repin --all --from-model sonnet --to-model claude-sonnet-5 --dry-run   # bulk; literal match, then apply without --dry-run
+ncl tasks repin --all --from-model sonnet --to-model claude-sonnet-5 --dry-run   # bulk, MODEL ONLY: literal match, then apply without --dry-run
 ```
+
+`repin` writes only the axes it is given, so the bulk command freezes the model but leaves a task that has no effort pin on the new `high` default. Run the per-series `ncl tasks update ... --effort xhigh` for every series that must keep `xhigh`.
 
 For `providerConfig.model`, `providerFallback.model` and legacy `defaultModel`, edit `groups/<g>/container.json` directly (no `ncl` verb writes them); the edit applies at the group's next restart.
 
-**Deploy.** Run `scripts/deploy.sh`; it rebuilds the agent image because `container/` changed. The rebuild is required: the SDK bump changes the runner's deps hash, and `src/agent-runner-image-check.ts` refuses every spawn until the image matches. A group with `imageTag` in its `container.json` spawns from its own image, which a base rebuild does not touch; rebuild those first (`grep -lE '"imageTag"' groups/*/container.json`). A host restart **adopts** running containers, which keep their spawn-time runner, CLI and `ANTHROPIC_DEFAULT_SONNET_MODEL`, so a `sonnet` pin in an adopted container still means Sonnet 5 until it exits. Recycle a group with `ncl groups restart --id <group-id>` at a quiet moment.
+**Deploy.** Run `scripts/deploy.sh`; it rebuilds the agent image because `container/` changed. The rebuild is required: the SDK bump changes the runner's deps hash, and `src/agent-runner-image-check.ts` refuses a spawn from the base image until it matches. A group with `imageTag` in its `container.json` spawns from its own image, which a base rebuild does not touch, and an `imageTag` image with no deps label is opted out of that check with a warning, so nothing forces its rebuild: rebuild those first and confirm each CLI yourself (`grep -lE '"imageTag"' groups/*/container.json`). A host restart **adopts** running containers, which keep their spawn-time runner, CLI and `ANTHROPIC_DEFAULT_SONNET_MODEL`, so a `sonnet` pin in an adopted container still means Sonnet 5 until it exits. Recycle a group with `ncl groups restart --id <group-id>` at a quiet moment.
 
 **Verify.**
 
@@ -45,7 +47,7 @@ docker exec <fresh claude container> claude --version
 pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*) from turn_usage where ts > '<deploy time>' group by 1,2"
 ```
 
-Expect `ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5` and CLI 2.1.284. Unpinned groups run Opus, so the bump shows in `turn_usage` only on a turn pinned to Sonnet: `claude-sonnet-5-5` / `high` for a `sonnet` pin with no explicit effort. Only the env var proves the build: a container that still reads `claude-sonnet-5` was spawned from the old build or image.
+Expect `ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5` and CLI 2.1.284. Unpinned groups run Opus, so the bump shows in `turn_usage` only on a turn pinned to Sonnet: `claude-sonnet-5-5` / `high` for a `sonnet` pin with no explicit effort. The env var comes from the host, so it proves the host build and says nothing about an `imageTag` image: confirm that image's CLI with `claude --version`. A container that still reads `claude-sonnet-5` was spawned before the deploy.
 
 **Rollback.**
 - **One path**: apply the Fix commands above, then `ncl groups restart --id <group-id>`.
