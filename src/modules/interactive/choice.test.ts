@@ -396,6 +396,14 @@ describe('request_choice delivery', () => {
     );
   });
 
+  it('folds look-alike spaces to a plain space, so a SHA split by one is visibly split', async () => {
+    await ask(session, {
+      approvalScope: RELEASE_SCOPE,
+      decision: { ...DECISION, ifItShips: `Rebuilds at ${'e'.repeat(20)}\u200a${'e'.repeat(20)}` },
+    });
+    expect(delivered[0].content.question).toContain(`• Rebuilds at ${'e'.repeat(20)} ${'e'.repeat(20)}`);
+  });
+
   it('posts a decision-less release card with a warning until the rule is switched on, then refuses it', async () => {
     const warnSpy = vi.spyOn(log, 'warn');
     expect((await ask(session, { approvalScope: RELEASE_SCOPE }))!.question).toBe(PIN);
@@ -450,17 +458,28 @@ describe('request_choice delivery', () => {
     [
       'a multi-line question',
       { question: 'Ship?\nReally' },
-      'decision text must not hold control or invisible characters',
+      'decision text must hold only visible characters and plain spaces',
     ],
     [
       'a line separator and a zero-width split SHA forging a pin line',
       { ifItShips: `Saves time.\u2028Ship owner/repository#42 from main at ${'c'.repeat(20)}\u200b${'c'.repeat(20)}?` },
-      'decision text must not hold control or invisible characters',
+      'decision text must hold only visible characters and plain spaces',
     ],
+    [
+      'a combining grapheme joiner splitting a SHA',
+      { evidence: `https://x.example/${'e'.repeat(20)}\u034f${'e'.repeat(20)}` },
+      'decision text must hold only visible characters and plain spaces',
+    ],
+    [
+      'a fullwidth SHA look-alike',
+      { question: `Ship ${'\uff41'.repeat(40)}?` },
+      'decision text must not hold a commit SHA: the host pins the head',
+    ],
+    ['a question with no visible text', { question: '\u034f' }, 'decision.question is required'],
     [
       'a bidi override in the question',
       { question: 'Retire the \u202eexport button?' },
-      'decision text must not hold control or invisible characters',
+      'decision text must hold only visible characters and plain spaces',
     ],
     [
       'a SHA in the evidence link',

@@ -46,7 +46,8 @@ const MAX_DECISION_LINES = 10;
 const MAX_DECISION_EVIDENCE = 500;
 const MAX_RELEASE_CARD_TEXT = 1800; // Discord posts **title**, a blank line and the body, and cuts at 1900
 const HEX_RUN_RE = /[0-9a-f]{40}/i;
-const INVISIBLE_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const NOT_DISPLAY_SAFE_RE = /[\p{C}\p{M}\p{Default_Ignorable_Code_Point}]|(?! )\p{Z}/u;
+const VISIBLE_RE = /[\p{L}\p{N}]/u;
 const EVIDENCE_RE = /^https:\/\/[^\s<>|]+$/;
 
 interface ReleaseDecision {
@@ -156,10 +157,12 @@ function parseReleaseDecision(value: unknown): ReleaseDecision | string {
   const record = value as Record<string, unknown>;
   if (Object.keys(record).some((k) => !DECISION_KEYS.includes(k)))
     return 'decision takes only question, ifItShips, evidence';
-  const { question, ifItShips, evidence } = record;
-  if (typeof question !== 'string' || !question.trim()) return 'decision.question is required';
-  if (typeof ifItShips !== 'string' || !ifItShips.trim()) return 'decision.ifItShips is required';
-  if (typeof evidence !== 'string' || !evidence) return 'decision.evidence is required';
+  const [question, ifItShips, evidence] = DECISION_KEYS.map((k) =>
+    typeof record[k] === 'string' ? record[k].normalize('NFKC') : undefined,
+  );
+  if (question === undefined || !VISIBLE_RE.test(question)) return 'decision.question is required';
+  if (ifItShips === undefined || !VISIBLE_RE.test(ifItShips)) return 'decision.ifItShips is required';
+  if (evidence === undefined || !evidence) return 'decision.evidence is required';
   if (question.length > MAX_DECISION_QUESTION) return `decision.question is over ${MAX_DECISION_QUESTION} characters`;
   if (ifItShips.length > MAX_DECISION_IF_IT_SHIPS) {
     return `decision.ifItShips is over ${MAX_DECISION_IF_IT_SHIPS} characters`;
@@ -171,12 +174,18 @@ function parseReleaseDecision(value: unknown): ReleaseDecision | string {
     .filter(Boolean);
   if (lines.length > MAX_DECISION_LINES) return `decision.ifItShips has over ${MAX_DECISION_LINES} lines`;
   const text = [question, ...lines, evidence];
-  if (text.some((t) => INVISIBLE_RE.test(t))) return 'decision text must not hold control or invisible characters';
+  if (!text.every(isDisplaySafe)) {
+    return 'decision text must hold only visible characters and plain spaces';
+  }
   if (text.some((t) => HEX_RUN_RE.test(t))) return 'decision text must not hold a commit SHA: the host pins the head';
   if (text.some((t) => t.includes(']('))) return 'decision text must not hold markdown links: put the link in evidence';
   if (text.some((t) => t.includes('||'))) return 'decision text must not hold || (Discord hides text between bars)';
   if (!EVIDENCE_RE.test(evidence) || !URL.canParse(evidence)) return 'decision.evidence must be one https link';
   return { question: neutralize(question.trim()), ifItShips: lines.map(neutralize), evidence };
+}
+
+function isDisplaySafe(normalized: string): boolean {
+  return !NOT_DISPLAY_SAFE_RE.test(normalized);
 }
 
 function neutralize(text: string): string {
