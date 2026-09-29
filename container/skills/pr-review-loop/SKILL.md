@@ -54,12 +54,11 @@ That file governs; read it before classifying, and state the classification
 in one line in the thread — an unnamed call cannot be overruled, and a human
 overruling you is the point.
 
-Past `REVIEW_ROUND_CAP` (default 3) review rounds, the gate refuses the next
-push. A round is a head any reviewer reviewed: a Codex review, a `request`, a
-substitute receipt, or an `independent-review-receipt:v1`. One counter covers
-all of them, so a second review path cannot run past the cap unseen. The cap
-never blocks a merge. A PR stopped at the cap with CI green merges if nothing
-left blocks. If something does block, rebuild the change as a new PR.
+There is no round number that forbids a push. There used to be, and it froze
+four PRs with CI green — one with every thread already resolved — because the
+rounds being counted were ones the fleet had asked for. Now that nobody
+manufactures them, a high count means the change keeps failing review, and that
+is a conversation to have, not a budget to run out of.
 
 ### Diagnosing round 4+
 
@@ -107,13 +106,11 @@ Everything above was advisory, and on #291 it was overridden round after
 round — each round's patch was individually correct, which is exactly why
 nobody stopped. So it is now a gate. `codex-review.sh push` is the
 loop's push path, and it runs `codex-review.sh gate` first, which exits 3 when
-any of these holds:
+either holds:
 
 - one finding **class** has drawn findings in 3+ rounds, or
 - one **seam** has, with severity not falling (`docs/review-policy.md`:
-  escalation is severity direction, not round count), or
-- the PR is past `REVIEW_ROUND_CAP` review rounds (above), or its rounds
-  cannot be counted.
+  escalation is severity direction, not round count).
 
 The refusal names the class, every site, the seam, and the candidate
 primitive(s) — the shared callee those sites all route through. **The next
@@ -228,7 +225,7 @@ merge-check and `ci-wait` accept a `CI (host)` success on the exact head in plac
 
 Three details it encodes, each of which has cost real debugging time — keep them if you ever hand-roll the API calls:
 
-- `open` and `status` print the PR's round count, the same one the gate enforces, and a STOP banner once it is past `REVIEW_ROUND_CAP`. From there the gate refuses the next push: merge the head or rebuild.
+- `open` and `status` print the PR's total round count (distinct findings-bearing Codex reviews) and a STOP banner at 4+. The banner is the round-4+ diagnosis path above made deterministic: per-file churn detection missed a 16-round PR whose findings hopped between files, so the tripwire fires on total rounds regardless of where the findings land. Acknowledge it by diagnosing, never by pushing.
 - The reviewer is `chatgpt-codex-connector` in GraphQL. Match case-insensitively on a prefix, never `==` against one spelling.
 - `status` and `wait` page through GraphQL `reviewThreads`, reviews, top-level comments, and reactions separately. They verify the current PR head still starts with the supplied SHA, count unresolved Codex threads from every round, ignore stale reviews and 👍 reactions, and treat an authenticated connector usage-limit notice for this head as unavailable unless a later valid review supersedes it.
 - Codex signals a clean review two ways: a review with no unresolved threads, **or** just a 👍 reaction on the PR. An `eyes` reaction means the review is still running — not a result.
@@ -544,10 +541,10 @@ The reviewer reads that diff: every line, including deletions. A regenerated `sr
 
 **Read the review notes first, and add to your fragment.** Before writing or reviewing code, the author and the reviewer read `docs/review-notes.md` and every `docs/review-notes/<PR>.md` fragment (in a container: `/workspace/project/docs/review-notes.md` and `/workspace/project/docs/review-notes/`). Post every review verdict as a receipt, `changes` included. Once any receipt on the PR, on any head, says `changes`, the PR adds `docs/review-notes/<its PR number>.md` — one or more lesson lines, in the registry's format and classes — or its body carries `Review-notes: none (<reason>)`; `merge-check` refuses with `review_notes_missing` (24) otherwise. Do not append the historical `docs/review-notes.md` lessons. Deferring a finding to an issue, or reverting a PR, adds a fragment too. When the PR carries `risk:*` dimension labels, they scope the reviewer's brief.
 
-**Round 3 is a checkpoint for you, not a stop that waits for the operator.** `REVIEW_ROUND_CAP` (default 3) counts review rounds of every kind: `request` exits 23 at the cap, and the gate refuses a push once a review has landed past it. On exit 23, decide yourself, and never escalate to the operator because the cap was reached:
+**Round 3 is a checkpoint for you, not a stop that waits for the operator.** `REVIEW_ROUND_CAP` (default 3) limits Codex requests, not the work. On exit 23, decide yourself, and never escalate to the operator because the cap was reached:
 
 1. **Assess.** Classify the rounds by file and by class (above, `review-churn.mjs`). For a second opinion, give a fresh-context subagent the diff and the finding history with one question: are these rounds hardening the right parts of this PR, or is each fix creating the next finding?
-2. **Converging** (severity falling, no class recurring): fix the open findings in one batch and push (once the PR is past the cap the gate refuses that push: merge the head or rebuild). Then get a fresh-context substitute review of the new head, post it with `receipt`, and merge on `approve`.
+2. **Converging** (severity falling, no class recurring): fix the open findings in one batch and push. Then get a fresh-context substitute review of the new head, post it with `receipt`, and merge on `approve`.
 3. **Churning** (a class or seam recurring, or the substitute review still finds new defects): stop patching sites. Rebuild instead: fix the shared seam once, split the PR, or close it and redo the change in a fresh session with a reframed plan. A PR that needs more than six review rounds in total is the wrong PR, not an unlucky one. PR #566 went 12 rounds by patching.
 4. **The operator** hears only about a decision that is genuinely theirs (scope, product behaviour, an authority gate), in one or two lines with your recommendation.
 

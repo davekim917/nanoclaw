@@ -212,10 +212,9 @@ disappears.
 
 ## Escalation is severity direction, not round count
 
-Past `REVIEW_ROUND_CAP` review rounds, counting every reviewer, the loop
-refuses the next push: merge the head or rebuild the change. Below it, a
-high round count with severity falling is convergence; severity flat or
-rising across rounds means stop and diagnose out loud before touching code.
+There is no round number that forbids a push. A high round count with
+severity falling is convergence; severity flat or rising across rounds means
+stop and diagnose out loud before touching code.
 
 A class that survives three rounds is a design defect at a seam, and the fix
 is the primitive, not the next call site: the loop refuses site patches until
