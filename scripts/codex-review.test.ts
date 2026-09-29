@@ -2562,20 +2562,29 @@ describe('codex-review risk-scoped review requests', () => {
       expect(request([checkpoint(HEAD, 'converging', 'NONE')]).status).toBe(23);
     });
 
-    it('refuses on a converging checkpoint whose author cannot write to the repository', () => {
-      const root = tempRoot();
-      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging', 'MEMBER')] });
-      fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
-      expect(runHelper(root, ['request']).status).toBe(23);
-    });
+    it.each(['MEMBER', 'COLLABORATOR'])(
+      'refuses on a converging checkpoint from a %s who cannot write to the repository',
+      (association) => {
+        const root = tempRoot();
+        scopeFixture(root, {
+          labels: ['risk:high'],
+          comments: [...capped, checkpoint(HEAD, 'converging', association)],
+        });
+        fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
+        expect(runHelper(root, ['request']).status).toBe(23);
+      },
+    );
 
-    it('ignores a churning checkpoint whose author cannot write to the repository', () => {
-      const root = tempRoot();
-      const readOnly = checkpoint(HEAD, 'churning', 'MEMBER', 'reader');
-      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), readOnly] });
-      fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
-      expect(runHelper(root, ['request']).status).toBe(0);
-    });
+    it.each(['MEMBER', 'COLLABORATOR'])(
+      'ignores a churning checkpoint from a %s who cannot write to the repository',
+      (association) => {
+        const root = tempRoot();
+        const readOnly = checkpoint(HEAD, 'churning', association, 'reader');
+        scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), readOnly] });
+        fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+        expect(runHelper(root, ['request']).status).toBe(0);
+      },
+    );
 
     it("refuses when a checkpoint author's permission cannot be read, never counting them as a reader", () => {
       const root = tempRoot();
@@ -2995,17 +3004,28 @@ describe('codex-review risk-scoped review requests', () => {
       ['names no agent, as the author posting its own', 'claude-opus-5 (author, self-review)', 'davekim917'],
       ['names the agent from a small tier', 'claude-sonnet-5 cut-down-reviewer', 'davekim917'],
       ['names the agent inside another word', 'claude-opus-5 not-cut-down-reviewer-really', 'davekim917'],
-      ['comes from an account without write access', AGENT_REVIEWER, 'reader'],
-      ['comes from an account whose permission cannot be read', AGENT_REVIEWER, 'ghost'],
-    ])('refuses a receipt on the head that %s', (_case, reviewer, login) => {
+      ['comes from a read-only MEMBER', AGENT_REVIEWER, 'reader', 'MEMBER'],
+      ['comes from a read-only COLLABORATOR', AGENT_REVIEWER, 'reader', 'COLLABORATOR'],
+    ])('refuses a receipt on the head that %s', (_case, reviewer, login, association = 'OWNER') => {
       const root = tempRoot();
-      cutDownFixture(root, { comments: [cutDownReceipt(HEAD, reviewer, login)] });
+      cutDownFixture(root, {
+        comments: [{ ...cutDownReceipt(HEAD, reviewer, login), authorAssociation: association }],
+      });
       fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
-      fs.writeFileSync(path.join(root, 'permission--ghost.error'), '');
 
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain('cut_down_missing:');
+    });
+
+    it('refuses a receipt on the head from an account whose permission cannot be read', () => {
+      const root = tempRoot();
+      cutDownFixture(root, { comments: [cutDownReceipt(HEAD, AGENT_REVIEWER, 'ghost')] });
+      fs.writeFileSync(path.join(root, 'permission--ghost.error'), '');
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("could not read ghost's permission");
     });
 
     it.each([
@@ -3852,6 +3872,37 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.stderr).toContain(`latest substitute ${reason}`);
   });
 
+  it.each(['MEMBER', 'COLLABORATOR'])(
+    'refuses a review-verdict head whose approving receipt comes from a read-only %s',
+    (association) => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: ['risk:high'],
+        comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', association)],
+      });
+      fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('latest substitute receipt: none');
+    },
+  );
+
+  it("ignores a read-only author's changes receipt beside a writer's approval", () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        marker(HEAD, 1),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z'),
+        { ...receiptComment(HEAD, 'changes', '2026-09-05T00:30:00Z', 'MEMBER'), author: { login: 'reader' } },
+      ],
+    });
+    fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+
+    expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(0);
+  });
+
   // Codex's round-3 repro (#679): page 1 carries an approval (id "100"); a
   // later same-second `changes` receipt lands on page 2 with a null
   // fullDatabaseId — GraphQL's real behavior for that nullable BigInt field.
@@ -4215,7 +4266,7 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stderr).toContain(why);
     });
 
-    describe('who may clear: anyone trusted can block, only write access can clear', () => {
+    describe('who may steer: only write access blocks or clears', () => {
       const FORGED = [
         independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
         {
@@ -4224,11 +4275,16 @@ describe('codex-review risk-scoped review requests', () => {
         },
       ];
 
-      it.each(['read', 'triage', 'none'])(
-        'ignores a later CLEAR from an author whose permission is %s: the CHANGES under it stands',
-        (permission) => {
+      it.each([
+        ['read', 'COLLABORATOR'],
+        ['triage', 'COLLABORATOR'],
+        ['none', 'COLLABORATOR'],
+        ['read', 'MEMBER'],
+      ])(
+        'ignores a later CLEAR from an author whose permission is %s, as a %s: the CHANGES under it stands',
+        (permission, association) => {
           const root = tempRoot();
-          legacy(root, { comments: FORGED });
+          legacy(root, { comments: [FORGED[0], { ...FORGED[1], authorAssociation: association }] });
           fs.writeFileSync(path.join(root, 'permission--reader'), `${permission}\n`);
 
           const result = runHelper(root, ['merge-check', '--head', HEAD]);
@@ -4239,7 +4295,7 @@ describe('codex-review risk-scoped review requests', () => {
       );
 
       it.each(['write', 'admin'])(
-        'counts a later CLEAR from an author with %s permission, after one lookup',
+        'counts a later CLEAR from an author with %s permission, after one lookup per author',
         (permission) => {
           const root = tempRoot();
           legacy(root, { comments: FORGED });
@@ -4249,36 +4305,54 @@ describe('codex-review risk-scoped review requests', () => {
           expect(result.status).toBe(26);
           expect(result.calls.match(/^rest .*\/permission$/gm)).toEqual([
             'rest repos/example/repository/collaborators/reader/permission',
+            'rest repos/example/repository/collaborators/release-desk/permission',
           ]);
         },
       );
 
-      it('does not count a CLEAR whose author cannot be looked up', () => {
+      it.each(['', 'null', 'owner'])(
+        'refuses when a receipt author\'s permission reads as "%s"',
+        (permission) => {
+          const root = tempRoot();
+          legacy(root, { comments: FORGED });
+          fs.writeFileSync(path.join(root, 'permission--reader'), `${permission}\n`);
+
+          const result = runHelper(root, ['merge-check', '--head', HEAD]);
+          expect(result.status).not.toBe(0);
+          expect(result.status).not.toBe(26);
+          expect(result.stderr).toContain("reader's permission on example/repository read as");
+        },
+      );
+
+      it('refuses when a receipt author cannot be looked up', () => {
         const root = tempRoot();
         legacy(root, { comments: FORGED });
         fs.writeFileSync(path.join(root, 'permission--reader.error'), '');
 
-        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
-      });
-
-      it("lets a read-only author's CHANGES block over a writer's older CLEAR, with no lookup", () => {
-        const root = tempRoot();
-        legacy(root, {
-          comments: [
-            independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z'),
-            {
-              ...independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:40:00Z', 'COLLABORATOR'),
-              author: { login: 'reader' },
-            },
-          ],
-        });
-        fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
-
         const result = runHelper(root, ['merge-check', '--head', HEAD]);
-        expect(result.status).toBe(24);
-        expect(result.stderr).toContain('reader posted the newest independent-review receipt');
-        expect(result.calls).not.toContain('/permission');
+        expect(result.status).not.toBe(0);
+        expect(result.status).not.toBe(26);
+        expect(result.stderr).toContain("could not read reader's permission");
       });
+
+      it.each(['MEMBER', 'COLLABORATOR'])(
+        "ignores a read-only %s's CHANGES over a writer's older CLEAR",
+        (association) => {
+          const root = tempRoot();
+          legacy(root, {
+            comments: [
+              independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z'),
+              {
+                ...independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:40:00Z', association),
+                author: { login: 'reader' },
+              },
+            ],
+          });
+          fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+
+          expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+        },
+      );
 
       it('defers when the only receipt is a CLEAR that does not count: nothing says no', () => {
         const root = tempRoot();
@@ -4450,7 +4524,7 @@ describe('codex-review risk-scoped review requests', () => {
         const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
         legacy(root, {
           comments: [
-            independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+            { ...independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'), author: { login: 'lead-desk' } },
             {
               ...newer,
               body: `${receiptText('CLEAR', 0)}\n${PROSE_FIRST}\n    an indented line\n\n~~~\nand a fence\n~~~\n`,
@@ -5677,6 +5751,60 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     expect(result.stdout).toContain(`verdict=review: ${reason}`);
   });
 
+  describe('permission, read at the audit', () => {
+    const APPROVAL = [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')];
+    const readOnlyEdit = (association: string): Page => ({
+      author: { login: 'reader' },
+      authorAssociation: association,
+      createdAt: '2026-09-05T00:10:00Z',
+      lastEditedAt: '2026-09-05T02:00:00Z',
+      fullDatabaseId: '10',
+      body: 'CI is green.',
+    });
+
+    it.each([
+      ['write', 0],
+      ['read', 28],
+    ])('judges an approving receipt whose author has %s', (permission, code) => {
+      const root = tempRoot();
+      auditFixture(root, { labels: ['risk:high'], comments: APPROVAL });
+      fs.writeFileSync(path.join(root, 'permission--davekim917'), `${permission}\n`);
+
+      expect(runHelper(root, ['audit']).status).toBe(code);
+    });
+
+    it.each(['MEMBER', 'COLLABORATOR'])(
+      "passes over a read-only %s's comment edited after the merge",
+      (association) => {
+        const root = tempRoot();
+        auditFixture(root, { labels: ['risk:high'], comments: [readOnlyEdit(association), ...APPROVAL] });
+        fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+
+        const result = runHelper(root, ['audit']);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('audit=pass');
+      },
+    );
+
+    it.each(['', 'null', 'owner'])('errors when an approving author\'s permission reads as "%s"', (permission) => {
+      const root = tempRoot();
+      auditFixture(root, { labels: ['risk:high'], comments: APPROVAL });
+      fs.writeFileSync(path.join(root, 'permission--davekim917'), `${permission}\n`);
+
+      const result = runHelper(root, ['audit']);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("davekim917's permission on example/repository read as");
+    });
+
+    it('errors when an edited comment\'s author cannot be looked up', () => {
+      const root = tempRoot();
+      auditFixture(root, { labels: ['risk:high'], comments: [readOnlyEdit('MEMBER'), ...APPROVAL] });
+      fs.writeFileSync(path.join(root, 'permission--reader.error'), '');
+
+      expect(runHelper(root, ['audit']).status).not.toBe(0);
+    });
+  });
+
   it.each([
     [
       'the only approving receipt was edited after the merge',
@@ -6057,9 +6185,18 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
       ['risk:high'],
       [receiptComment(OLD_HEAD, 'changes', '2026-09-05T00:10:00Z', 'NONE'), APPROVED],
     ],
+    ...['MEMBER', 'COLLABORATOR'].map((association): [string, string[], Page[]] => [
+      `a changes receipt from a read-only ${association}`,
+      ['risk:high'],
+      [
+        { ...receiptComment(OLD_HEAD, 'changes', '2026-09-05T00:10:00Z', association), author: { login: 'reader' } },
+        APPROVED,
+      ],
+    ]),
   ])('asks nothing of a PR with %s', (_case, labels, comments) => {
     const root = tempRoot();
     scopeFixture(root, { labels, comments });
+    fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
 
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(0);

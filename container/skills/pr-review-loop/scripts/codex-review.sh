@@ -450,25 +450,53 @@ payload_json() {
     '{ findings: $findings, receipts: $receipts, repoRoot: $root }'
 }
 
-comments_by_writers() {
-  local pages comments login permission writers='[]'
-  pages=$(paginate_connection comments receipt_comments_page) || return 1
-  comments=$(printf '%s\n' "$pages" | jq -cs --arg sub "$RECEIPT_MARKER_RE" --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" --arg chk "$CHECKPOINT_MARKER_RE" '
+# The comment pages $1 with each comment's `standing`: yes when its author may
+# steer a gate, else no. Permission, not association, decides: a MEMBER or
+# COLLABORATOR can hold read or triage only, so a trusted association is only
+# the precondition for a lookup. `permission` folds maintain into write and
+# triage into read (role_name has the granular role), so admin|write is every
+# role that may push. `audit` looks up the authors of comments edited since
+# the merge too, so an unreadable comment is judged by the same rule.
+author_standing() {
+  local logins login permission standing='{}'
+  logins=$(printf '%s\n' "$1" | jq -rs --arg sub "$RECEIPT_MARKER_RE" --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" \
+    --arg chk "$CHECKPOINT_MARKER_RE" --arg cut "$CUT_DOWN_MARKER_RE" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | select((.body // "") | test($sub) or test($ind) or test($chk))
-      | { login: (.author.login // ""), id: .fullDatabaseId, createdAt, body } ]') || return 1
+      | select(((.body // "") | test($sub) or test($ind) or test($chk) or test($cut))
+               or ($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)))
+      | .author.login | strings | select(. != "") ] | unique[]') || return 1
   while IFS= read -r login; do
     [ -n "$login" ] || continue
     permission=$(repo_permission "$login") || {
-      echo "could not read $login's permission on $REPO; a receipt or checkpoint is never judged without it" >&2
+      echo "could not read $login's permission on $REPO; a receipt, checkpoint or cut-down comment is never judged without it" >&2
       return 1
     }
     case "$permission" in
-      admin|write) writers=$(jq -cn --argjson w "$writers" --arg l "$login" '$w + [$l]') ;;
+      admin|maintain|write) standing=$(jq -cn --argjson s "$standing" --arg l "$login" '$s + {($l): "yes"}') || return 1 ;;
+      read|triage|none) ;;
+      *)
+        echo "$login's permission on $REPO read as \"$permission\", which is none of admin, maintain, write, triage, read or none; it is never judged from that" >&2
+        return 1
+        ;;
     esac
-  done < <(printf '%s' "$comments" | jq -r '[ .[].login ] | unique | .[]')
-  printf '%s' "$comments" | jq -c --argjson w "$writers" '[ .[] | select(.login as $l | $w | index($l)) ]'
+  done <<< "$logins"
+  printf '%s\n' "$1" | jq -c --argjson s "$standing" '
+    .data.repository.pullRequest.comments.nodes |= map(.standing = (
+      if .authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR"
+      then $s[.author.login // ""] // "no" else "no" end))'
+}
+
+comments_by_writers() {
+  local pages
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  pages=$(author_standing "$pages") || return 1
+  printf '%s\n' "$pages" | jq -cs --arg sub "$RECEIPT_MARKER_RE" \
+    --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" --arg chk "$CHECKPOINT_MARKER_RE" '
+    [ .[] | .data.repository.pullRequest.comments.nodes[]
+      | select(.standing == "yes")
+      | select((.body // "") | test($sub) or test($ind) or test($chk))
+      | { login: .author.login, id: .fullDatabaseId, createdAt, body } ]'
 }
 
 checkpoint_state() {
@@ -827,9 +855,10 @@ cut_down_state() {
     return 0
   fi
   pages=$(paginate_connection comments receipt_comments_page) || return 1
+  pages=$(author_standing "$pages") || return 1
   receipts=$(printf '%s\n' "$pages" | jq -rs --arg re "$CUT_DOWN_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" '
     .[] | .data.repository.pullRequest.comments.nodes[]
-    | select(.author.login | type == "string" and . != "")
+    | select(.standing == "yes")
     | .author.login as $login
     | (.body // "") as $body
     | [ $body | capture($re) ] | first // empty
@@ -838,7 +867,7 @@ cut_down_state() {
   while IFS=$'\t' read -r head login reviewer; do
     [ -n "$head" ] || continue
     if ! reviewer_model_allowed "$reviewer" || ! cut_down_reviewer_named "$reviewer"; then continue; fi
-    if [ "$head" = "$SCOPE_HEAD" ] && may_clear "$login"; then
+    if [ "$head" = "$SCOPE_HEAD" ]; then
       printf 'ok\ta cut-down receipt names this head (%s)\n' "$reviewer"
       return 0
     fi
@@ -1353,10 +1382,11 @@ receipt_comments_page() {
 receipt_outcome() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
+  pages=$(author_standing "$pages") || return 1
   printf '%s\n' "$pages" | jq_here -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
-      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select(.standing == "yes")
       | select($asof == "" or .createdAt <= $asof)
       | .idstr = ((.fullDatabaseId // "") | tostring) ] as $comments
     | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)) ] as $unreadable
@@ -1388,8 +1418,8 @@ receipt_outcome() {
 # Whether any substitute receipt on this PR, for ANY head, asked for changes —
 # the review-notes rule's trigger (review_notes_state): `changes\t<who, which
 # head, when>` when one did, `none` when none did, `unknown\t<why>` when that
-# cannot be told. Read as receipt_outcome reads receipts: trusted authors only,
-# and under `audit` nothing posted after GATE_AS_OF. A trusted comment posted
+# cannot be told. Read as receipt_outcome reads receipts: authors with standing
+# only, and under `audit` nothing posted after GATE_AS_OF. Such a comment posted
 # in the merge's own second, or edited in or after it, is not read: GitHub's
 # timestamps are to the second, so either may have landed after the merge, and
 # its text at the merge is unknown. It could have been a `changes` receipt, so
@@ -1400,9 +1430,10 @@ receipt_outcome() {
 changes_receipt_state() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
+  pages=$(author_standing "$pages") || return 1
   printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
-      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select(.standing == "yes")
       | select($asof == "" or .createdAt <= $asof) ] as $comments
     | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)) ] as $unreadable
     | ([ $comments[] | select($asof == "" or ((.lastEditedAt // "") < $asof and .createdAt < $asof))
@@ -1765,15 +1796,7 @@ quick_tier_runs() {
 # nothing. (The substitute receipt marker is matched against the raw body too,
 # so a quoted `approve` counts there; it is left as it is here.)
 #
-# Who wrote it follows the same asymmetry. authorAssociation is not a
-# permission: MEMBER is membership of the organisation, and a COLLABORATOR can
-# hold read or triage only. So anyone in that set can block, and only an author
-# whose permission on the repository is write or above can clear (may_clear),
-# looked up for the clear receipt that would decide and for no other. A clear
-# one that fails it is left out and the next newest decides, so a genuine
-# CHANGES under a forged CLEAR still stands. (receipt_outcome trusts the same
-# association set for a substitute `approve`, so the risk-scoped path shares
-# this weakness too; it is left as it is here.)
+# Who wrote it is author_standing's answer, the one every receipt reader shares.
 #
 # Which head a receipt is about is not left to a second parser either. A
 # receipt applies to this head when its JSON text names the head's full SHA
@@ -1792,45 +1815,25 @@ quick_tier_runs() {
 # reaches it (a legacy repo exits the audit arm first), so nothing is read as
 # of a merge. Non-zero when the comments cannot be read.
 independent_receipt_state() {
-  local pages state login denied='[]'
+  local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  while :; do
-    state=$(independent_receipt_newest "$pages" "$1" "$denied") || return 1
-    case "$state" in
-      clear$'\t'*)
-        login="${state#*$'\t'}"
-        if may_clear "$login"; then echo clear; return 0; fi
-        denied=$(jq -cn --argjson d "$denied" --arg l "$login" '$d + [$l]') || return 1
-        ;;
-      *) printf '%s\n' "$state"; return 0 ;;
-    esac
-  done
+  pages=$(author_standing "$pages") || return 1
+  independent_receipt_newest "$pages" "$1"
 }
 
 repo_permission() {
   gh api "repos/$REPO/collaborators/$(jq -rn --arg l "$1" '$l | @uri')/permission" --jq .permission
 }
 
-# Whether LOGIN may clear a head: its permission on this repository, now, is
-# write or above (`permission` folds maintain into write and triage into
-# read). Anything else, a failed read included, is no: the clear receipt does
-# not count and whatever it would have superseded stands.
-may_clear() {
-  local permission
-  permission=$(repo_permission "$1" 2>/dev/null) || return 1
-  [ "$permission" = admin ] || [ "$permission" = write ]
-}
-
 # independent_receipt_state's one read of the comment pages $1 for head $2,
-# with the clear receipts of every login in the JSON array $3 left out. Prints
-# `clear\t<login>` for a clear newest receipt, so its author can be checked.
+# with each comment's standing on it (author_standing).
 independent_receipt_newest() {
-  printf '%s\n' "$1" | jq_here -rs --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --argjson denied "$3" \
+  printf '%s\n' "$1" | jq_here -rs --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" \
     --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg head "$2" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
-      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | { login: (.author.login // "someone"), at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
+      | select(.standing == "yes")
+      | { login: .author.login, at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
       | [ (.body // "") | ltrimstr("\uFEFF") | splits($re) ] as $parts
       | select(($parts | length) > 1)
       | [ range(1; $parts | length) as $i
@@ -1845,8 +1848,7 @@ independent_receipt_newest() {
                      else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $receipts
       | ([ $receipts[] | select(.clear | not) ] | first) as $no
       | if $no != null then $c + { clear: false, said: $no.said }
-        elif ($parts | length) == 2 and ($receipts | length) == 1 and ($parts[0] | test("\\A[ \t\r\n]*\\z"))
-             and ($c.login as $l | $denied | index($l) | not) then $c + { clear: true, said: "" }
+        elif ($parts | length) == 2 and ($receipts | length) == 1 and ($parts[0] | test("\\A[ \t\r\n]*\\z")) then $c + { clear: true, said: "" }
         else empty end ] as $matches
     | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then
@@ -1854,7 +1856,7 @@ independent_receipt_newest() {
       else
         ( $matches | sort_by(.idstr | posting_key) | last ) as $latest
         | if $latest == null then "none"
-          elif $latest.clear then "clear\t\($latest.login)"
+          elif $latest.clear then "clear"
           else "blocked\t\($latest.login) posted the newest independent-review receipt for this head at \($latest.at): \($latest.said)" end
       end'
 }
