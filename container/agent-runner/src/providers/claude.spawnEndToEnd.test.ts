@@ -91,11 +91,11 @@ describe('END-TO-END after the deletion', () => {
     const r = spawn({}, { model: 'sonnet' });
     console.log('  sonnet wiring -> model=', r.model, ' effort=', r.effort);
     expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
-    expect(r.effort).toBe('xhigh');
+    expect(r.effort).toBe('high');
     expect(r.systemPrompt).toMatchObject({
       type: 'preset',
       preset: 'claude_code',
-      append: expect.stringContaining('provider "claude", model "claude-sonnet-5-5", and reasoning effort "xhigh"'),
+      append: expect.stringContaining('provider "claude", model "claude-sonnet-5-5", and reasoning effort "high"'),
     });
   });
 
@@ -125,7 +125,7 @@ describe('END-TO-END after the deletion', () => {
     expect(r.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5-5');
     // ...and the group still runs the model it pinned.
     expect(r.model).toBe('claude-sonnet-5');
-    expect(r.effort).toBe('xhigh');
+    expect(r.effort).toBe('high');
   });
 
   it('a carried codex model + ultra are still refused at the host', () => {

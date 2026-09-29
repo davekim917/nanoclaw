@@ -238,11 +238,11 @@ describe('claude turn effort -> turn_usage row', () => {
 
     const provider = new ClaudeProvider({ env: { ...process.env } });
     provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-    // `-e xhigh` up front so the switch to sonnet (whose family default is
-    // also xhigh) moves the MODEL without moving the effort. That keeps the
+    // `-e high` up front so the switch to sonnet (whose family default is
+    // also high) moves the MODEL without moving the effort. That keeps the
     // turn attributable, which is what lets this test assert on alias
     // canonicalization rather than on the transition counter.
-    const q = provider.query({ prompt: 'hi', cwd: tmp, effort: 'xhigh' });
+    const q = provider.query({ prompt: 'hi', cwd: tmp, effort: 'high' });
     await q.applySettings!({ model: 'sonnet' });
     for await (const e of q.events) {
       if (e.type !== 'result') continue;
@@ -252,7 +252,7 @@ describe('claude turn effort -> turn_usage row', () => {
 
     expect(getTurnUsageRows().map((r) => [r.model, r.effort])).toEqual([
       // Sonnet's family default, resolved from the alias the switch supplied.
-      ['claude-sonnet-5', 'xhigh'],
+      ['claude-sonnet-5', 'high'],
       ['claude-haiku-4-5-20251001', null],
     ]);
   });
@@ -522,7 +522,7 @@ describe('claude turn effort -> turn_usage row', () => {
 
     await runTurnAndRecord({ model: 'claude-sonnet-5' });
 
-    expect(getTurnUsageRows()[0]).toMatchObject({ model: 'claude-sonnet-5', effort: 'xhigh' });
+    expect(getTurnUsageRows()[0]).toMatchObject({ model: 'claude-sonnet-5', effort: 'high' });
   });
 
   it('records a clamped-away Haiku effort as NULL effective + the requested value', async () => {

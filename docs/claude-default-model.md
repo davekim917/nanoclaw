@@ -2,11 +2,11 @@
 
 ## Current: Sonnet default moves to 5.5 (2026-09-29)
 
-This section is the current migration. Opus and Fable defaults do not move (see **History: 2026-09-24** and **History: 2026-09-22** below). Only the Sonnet family default and the container's pinned CLI move.
+This section is the current migration. Opus and Fable defaults do not move (see **History: 2026-09-24** and **History: 2026-09-22** below). Only the Sonnet family default (model and effort) and the container's pinned CLI move.
 
-**What moves.** `DEFAULT_SONNET_MODEL` (`src/flag-parser.ts`) is `claude-sonnet-5-5`, was `claude-sonnet-5`. On deploy, every Claude path whose model resolves through the word `sonnet` runs Sonnet 5.5: a chat `-m sonnet`, a `sonnet` wiring, group, task or `providerFallback` pin, and a subagent's `model: sonnet` (the CLI resolves the word through `ANTHROPIC_DEFAULT_SONNET_MODEL`, which `claudeSpawnEnv`, `src/claude-spawn-defaults.ts`, sets from the same constant). Unpinned groups resolve to Opus and do not move. A frozen id (`claude-sonnet-5`) or its pinned alias (`sonnet5`) keeps Sonnet 5. Effort does not move: `defaultEffortForModel` keys on the `claude-sonnet-` prefix and the bare word, so 5.5 gets the same `xhigh` as 5 wherever no layer sets an effort. New pinned aliases: `sonnet55` / `sonnet5-5` / `sonnet-5-5`.
+**What moves.** `DEFAULT_SONNET_MODEL` (`src/flag-parser.ts`) is `claude-sonnet-5-5`, was `claude-sonnet-5`. On deploy, every Claude path whose model resolves through the word `sonnet` runs Sonnet 5.5: a chat `-m sonnet`, a `sonnet` wiring, group, task or `providerFallback` pin, and a subagent's `model: sonnet` (the CLI resolves the word through `ANTHROPIC_DEFAULT_SONNET_MODEL`, which `claudeSpawnEnv`, `src/claude-spawn-defaults.ts`, sets from the same constant). Unpinned groups resolve to Opus and do not move. A frozen id (`claude-sonnet-5`) or its pinned alias (`sonnet5`) keeps Sonnet 5. Effort moves too: `defaultEffortForModel` returns `high`, not `xhigh`, for the bare word and every `claude-sonnet-*` id, wherever no layer sets an effort, so a frozen `claude-sonnet-5` pin with no effort moves to `high` as well. Every explicit effort pin keeps its value. `high` is Anthropic's own default for Sonnet 5.5, which recalibrated its levels against Sonnet 5, so an `xhigh` set on a 5.5 path is not the same amount of thinking as on 5. New pinned aliases: `sonnet55` / `sonnet5-5` / `sonnet-5-5`.
 
-**Detect.** A path moves to 5.5 when its chain ends at the word `sonnet` or at the install default for the Sonnet family. Check every layer:
+**Detect.** A path moves to 5.5 when its chain ends at the word `sonnet` or at the install default for the Sonnet family, and to `high` when it resolves to any `claude-sonnet-*` id and no layer sets an effort (the effort layers are listed in History: 2026-09-24, Detect). Check every layer:
 
 ```bash
 # 1. Groups (model / defaultModel / providerConfig.model / providerFallback.model naming the bare word):
@@ -24,7 +24,7 @@ A pure scheduled-task fire ignores session stickies (`effectiveTurnSettings`, `c
 
 **Why.** Sonnet 5.5 is Anthropic's faster, lower-cost complement to Opus 5.5 for well-scoped tasks. The container's claude-code CLI must be at least 2.1.284 to know the id: the binaries for 2.1.281, 2.1.282 and 2.1.283 contain no `claude-sonnet-5-5`, and an id the CLI does not contain silently loses its family behaviour. This change pins exactly 2.1.284, with agent SDK 0.3.284 in the same patch (`setup/lib/image-version-pins.test.ts` enforces the pair and `versions.json`).
 
-**Fix: keep Sonnet 5 on a path, before deploying.** Pins are data and take effect without a deploy:
+**Fix: keep Sonnet 5 on a path, before deploying.** Pins are data and take effect without a deploy. Keeping Sonnet 5's old `xhigh` means pinning it explicitly, because it is no longer the family default:
 
 ```bash
 ncl groups config update --id <group-id> --model claude-sonnet-5 --effort xhigh
@@ -45,17 +45,17 @@ docker exec <fresh claude container> claude --version
 pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*) from turn_usage where ts > '<deploy time>' group by 1,2"
 ```
 
-Expect `ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5` and CLI 2.1.284. Unpinned groups run Opus, so the bump shows in `turn_usage` only on a turn pinned to Sonnet: `claude-sonnet-5-5` / `xhigh` for a `sonnet` pin with no explicit effort. Only the env var proves the build: a container that still reads `claude-sonnet-5` was spawned from the old build or image.
+Expect `ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5` and CLI 2.1.284. Unpinned groups run Opus, so the bump shows in `turn_usage` only on a turn pinned to Sonnet: `claude-sonnet-5-5` / `high` for a `sonnet` pin with no explicit effort. Only the env var proves the build: a container that still reads `claude-sonnet-5` was spawned from the old build or image.
 
 **Rollback.**
 - **One path**: apply the Fix commands above, then `ncl groups restart --id <group-id>`.
-- **The fleet default**: set `DEFAULT_SONNET_MODEL` back to `claude-sonnet-5` and redeploy with `scripts/deploy.sh`. The CLI/SDK pins can stay: 2.1.284 still serves Sonnet 5.
+- **The fleet default**: set `DEFAULT_SONNET_MODEL` back to `claude-sonnet-5`, set the `claude-sonnet-` branch of `defaultEffortForModel` back to `'xhigh'`, and redeploy with `scripts/deploy.sh`. The CLI/SDK pins can stay: 2.1.284 still serves Sonnet 5.
 
 ---
 
 ## History: 2026-09-24 — Opus default effort `high`
 
-_Historical. Still in force for Opus and Fable; the Sonnet default it mentions (`xhigh`) is unchanged by the section above._
+_Historical. Still in force for Opus and Fable; the Sonnet default effort it mentions (`xhigh`) is superseded by the section above (now `high`)._
 
 This section was the current migration. The model does not move: `DEFAULT_OPUS_MODEL` stays `claude-opus-5-5[1m]` (see **History: 2026-09-22** below). Only the family default effort moves.
 
