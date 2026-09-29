@@ -1347,10 +1347,10 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
   }
 }
 
-function laterThan(a: number | null, b: number | null): boolean {
-  if (b === null) return false;
-  if (a === null) return true;
-  return b > a;
+function mtimeAdvanced(prior: number | null, current: number | null): boolean {
+  if (prior === null) return current !== null;
+  if (current === null) return true;
+  return current > prior;
 }
 
 /** Durable record of the exact deregistrations a trash requires, so a crash after the trash is recoverable. */
@@ -1858,7 +1858,7 @@ async function finalizeIdleCollection(
       const prior = before.get(p.sessionId);
       // status/idleSince lag admission (inbound.db is written before last_active), so fence on inbound.db's mtime:
       // a file that appeared, moved forward or became unstatable is new activity.
-      const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+      const inboundMoved = mtimeAdvanced(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
       return (
         !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved
       );

@@ -1065,6 +1065,20 @@ describe('branch clone checkouts', () => {
     expect(state.trashed).toEqual([]);
   });
 
+  it('an inbound.db that becomes unstatable after the idle snapshot is late activity', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'lost-inbound', 'repo-a', 'nc-topic');
+    state.rows = [idleRow('lost-inbound')];
+    const inbound = path.join(state.dataDir, 'v2-sessions', 'ag-s-lost-inbound', 's-lost-inbound', 'inbound.db');
+    fs.mkdirSync(path.dirname(inbound), { recursive: true });
+    fs.writeFileSync(inbound, '');
+
+    const { report } = await runWithLateActivity(null, () => fs.rmSync(inbound));
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(state.trashed).toEqual([]);
+  });
+
   it('a rollback that leaves a locked superseded copy behind keeps the recovery marker', async () => {
     const canonA = canonicalFixture('repo-a');
     const canonB = canonicalFixture('repo-b');
