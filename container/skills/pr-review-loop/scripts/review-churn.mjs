@@ -1043,7 +1043,6 @@ export function decideGate(payload, options = {}) {
       ...p,
       seam: p.place,
       seamKind: 'path',
-      seamInRepo: false,
       reason: `${p.rounds} rounds on one finding class in one place`,
     });
   }

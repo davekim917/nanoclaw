@@ -457,9 +457,10 @@ payload_json() {
 comments_by_writers() {
   local pages comments login permission writers='[]'
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  comments=$(printf '%s\n' "$pages" | jq -cs '
+  comments=$(printf '%s\n' "$pages" | jq -cs --arg sub "$RECEIPT_MARKER_RE" --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" --arg chk "$CHECKPOINT_MARKER_RE" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select((.body // "") | test($sub) or test($ind) or test($chk))
       | { login: (.author.login // ""), id: .fullDatabaseId, createdAt, body } ]') || return 1
   while IFS= read -r login; do
     [ -n "$login" ] || continue
@@ -478,7 +479,7 @@ checkpoint_state() {
   local comments
   comments=$(comments_by_writers) || return 1
   printf '%s' "$comments" | jq -r --arg re "$CHECKPOINT_MARKER_RE" --arg head "$1" '
-    [ .[] | [ (.body // "") | capture($re) ] | first // empty | select(.head == $head) | .decision ] | unique
+    [ .[] | (.body // "") | capture($re; "g") | select(.head == $head) | .decision ] | unique
     | if . == ["converging"] then "converging" else "none" end'
 }
 
@@ -1810,14 +1811,14 @@ independent_receipt_state() {
   done
 }
 
-# Whether LOGIN may clear a head: its permission on this repository, now, is
-# write or above (`permission` folds maintain into write and triage into
-# read). Anything else, a failed read included, is no: the clear receipt does
-# not count and whatever it would have superseded stands.
 repo_permission() {
   gh api "repos/$REPO/collaborators/$(jq -rn --arg l "$1" '$l | @uri')/permission" --jq .permission
 }
 
+# Whether LOGIN may clear a head: its permission on this repository, now, is
+# write or above (`permission` folds maintain into write and triage into
+# read). Anything else, a failed read included, is no: the clear receipt does
+# not count and whatever it would have superseded stands.
 may_clear() {
   local permission
   permission=$(repo_permission "$1" 2>/dev/null) || return 1
@@ -2895,19 +2896,18 @@ $assessment
       exit 2
     fi
     requested=$(printf '%s' "$markers" | jq -er 'length') || exit 1
-    checkpoint=none
     if [ "$requested" -ge "$cap" ]; then
       checkpoint=$(checkpoint_state "$SCOPE_HEAD") || { echo "request refused: the checkpoint for $SCOPE_HEAD could not be judged" >&2; exit 1; }
-    fi
-    if [ "$requested" -ge "$cap" ] && [ "$checkpoint" != converging ]; then
-      {
-        echo "CAP: $requested of $cap review rounds already requested on PR #$PR, and no converging checkpoint names $SCOPE_HEAD."
-        echo "Checkpoint, not a stop: have a fresh-context assessor judge whether the rounds are converging or"
-        echo "churning (SKILL.md, 'Round 3 is a checkpoint') and record it with \`codex-review.sh checkpoint\`."
-        echo "Converging: request again. Churning: rebuild the change. Codex out of quota: substitute review and receipt."
-        echo "Do not escalate to the operator for the cap."
-      } >&2
-      exit 23
+      if [ "$checkpoint" != converging ]; then
+        {
+          echo "CAP: $requested of $cap review rounds already requested on PR #$PR, and no converging checkpoint names $SCOPE_HEAD."
+          echo "Checkpoint, not a stop: have a fresh-context assessor judge whether the rounds are converging or"
+          echo "churning (SKILL.md, 'Round 3 is a checkpoint') and record it with \`codex-review.sh checkpoint\`."
+          echo "Converging: request again. Churning: rebuild the change. Codex out of quota: substitute review and receipt."
+          echo "Do not escalate to the operator for the cap."
+        } >&2
+        exit 23
+      fi
     fi
     round=$((requested + 1))
     # See a local review before burning this PR-wide round budget, but never

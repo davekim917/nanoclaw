@@ -2588,6 +2588,22 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.posted).toBeNull();
     });
 
+    it('reads every checkpoint marker in a comment, so a churning one beside a converging one refuses', () => {
+      const both = checkpoint(HEAD, 'converging');
+      both.body = `${String(both.body)}\n<!-- pr-review-loop:checkpoint head=${HEAD} decision=churning -->`;
+      expect(request([both]).status).toBe(23);
+    });
+
+    it('looks up no permission for a comment that is not a receipt or checkpoint', () => {
+      const root = tempRoot();
+      const chatter: Page = { ...checkpoint(HEAD, 'converging', 'MEMBER', 'flaky'), body: 'looks good to me' };
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), chatter] });
+      fs.writeFileSync(path.join(root, 'permission--flaky.error'), '');
+      const result = runHelper(root, ['request']);
+      expect(result.status).toBe(0);
+      expect(result.calls).not.toContain('collaborators/flaky');
+    });
+
     it('still lets the churn gate refuse a recurring class', () => {
       const result = request([checkpoint(HEAD, 'converging')], { MOCK_GATE_STATUS: '3' });
       expect(result.status).toBe(3);
@@ -2643,7 +2659,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.posted).toContain(`head=${HEAD} round=3 -->`);
   });
 
-  it('hands the churn gate every comment from an author with write access, beside the Codex threads', () => {
+  it('hands the churn gate every receipt from an author with write access, beside the Codex threads', () => {
     const root = tempRoot();
     const other = '6'.repeat(40);
     scopeFixture(root, {
@@ -2665,7 +2681,7 @@ describe('codex-review risk-scoped review requests', () => {
       receipts: { createdAt: string }[];
     };
     expect(sent.findings).toEqual([]);
-    expect(sent.receipts.map((r) => r.createdAt)).toEqual(['2026-09-05T01:00:00Z', '2026-09-05T04:00:00Z']);
+    expect(sent.receipts.map((r) => r.createdAt)).toEqual(['2026-09-05T01:00:00Z']);
   });
 
   it('propagates a churn-gate REFRAME from request without posting', () => {
