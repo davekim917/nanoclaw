@@ -53,7 +53,9 @@
  *     "sources":  { "src/a.ts": "…" },  // optional; tests pass these so the
  *                                       // classifier never touches the disk
  *     "commits":  [ { sha, date, message, files: [] } ],  // optional; else git
- *     "worktree": [ "src/a.ts" ]        // optional; else git status
+ *     "worktree": [ "src/a.ts" ],       // optional; else git status
+ *     "receipts": [ { id, createdAt, body } ],  // review receipt comments
+ *     "files":    [ "src/a.ts" ]        // optional; else git ls-tree
  *   }
  *
  * No dependencies, plain ESM: this file is copied into the container skill
@@ -206,6 +208,10 @@ export function severityOf(body) {
   return m ? Number(m[1]) : null;
 }
 
+function findingSeverity(f) {
+  return f.severity ?? severityOf(f.body);
+}
+
 /**
  * The finding's title: first line, with the severity badge markup and the
  * bold wrapper stripped. Mirrors what `codex-review.sh open` prints, so a
@@ -259,6 +265,89 @@ export function signatureOf(finding) {
   const families = invariantFamilies(finding);
   if (families.length > 0) return `inv:${families[0]}`;
   return `title:${normalizeTitle(titleOf(finding.body))}`;
+}
+
+// ── receipts ────────────────────────────────────────────────────────────────
+// A receipt asking for changes is a round. Receipts list findings as prose, so
+// a finding is a list item naming a tracked file, else the whole receipt in no place.
+
+const SUBSTITUTE_RECEIPT =
+  /(?:^|\n)<!-- pr-review-loop:substitute-receipt head=[0-9a-f]{40} outcome=(approve|changes) -->/;
+const INDEPENDENT_RECEIPT =
+  /(?:^|\n)<!-- independent-review-receipt:v1 -->[ \t]*\r?\n\s*```json[ \t]*\r?\n([\s\S]*?)\n[ \t]*```/;
+const LIST_ITEM = /^\s{0,3}(?:[-*+]|\d+[.)])\s+/;
+
+function receiptClear(json) {
+  if (!['verdict', 'blocking_findings'].every((k) => json.split(`"${k}"`).length === 2)) return false;
+  try {
+    const doc = JSON.parse(json);
+    return doc.verdict === 'CLEAR' && doc.blocking_findings === 0;
+  } catch {
+    return false;
+  }
+}
+
+function receiptItems(prose) {
+  const items = [];
+  let current = null;
+  for (const line of prose.split('\n')) {
+    if (LIST_ITEM.test(line)) items.push((current = [line.replace(LIST_ITEM, '')]));
+    else if (current && line.trim()) current.push(line);
+    else current = null;
+  }
+  return items.map((lines) => lines.join('\n'));
+}
+
+// Receipts cite absolute paths into the reviewer's worktree, partial paths and
+// bare filenames: a cited path is the tracked file sharing its longest tail, and
+// a tail two tracked files share names neither.
+function locate(text, files) {
+  for (const token of text.match(/[\w./-]+\.[A-Za-z]\w*/g) ?? []) {
+    const parts = token.split('/').filter((p) => p && p !== '.');
+    for (let i = 0; i < parts.length; i++) {
+      const tail = parts.slice(i).join('/');
+      const hits = [...files].filter((f) => f === tail || f.endsWith(`/${tail}`));
+      if (hits.length === 1) return hits[0];
+    }
+  }
+  return null;
+}
+
+function receiptFindings(receipt, files, index) {
+  const body = receipt.body ?? '';
+  const substitute = SUBSTITUTE_RECEIPT.exec(body);
+  const independent = substitute ? null : INDEPENDENT_RECEIPT.exec(body);
+  if (substitute ? substitute[1] !== 'changes' : !independent || receiptClear(independent[1])) return [];
+  const prose = independent ? body.replace(independent[0], '\n') : body;
+  const located = receiptItems(prose)
+    .map((text) => ({ text, file: locate(text, files) }))
+    .filter((item) => item.file);
+  const items = located.length > 0 ? located : [{ text: prose.trim(), file: null }];
+  return items.map(({ text, file }) => {
+    const severity = /\bP([0-9])\b/.exec(text.slice(0, 40));
+    return {
+      reviewId: `receipt:${receipt.id ?? `#${index}`}`,
+      commentId: receipt.id,
+      createdAt: receipt.createdAt,
+      path: file,
+      body: text,
+      severity: severity ? Number(severity[1]) : null,
+    };
+  });
+}
+
+function trackedFiles(payload) {
+  if (payload.files) return new Set(payload.files);
+  return new Set(git(payload.repoRoot, ['ls-tree', '-r', '--name-only', payload.head ?? 'HEAD']).split('\n'));
+}
+
+function withReceiptFindings(payload) {
+  if (!payload.receipts?.length) return payload;
+  const files = trackedFiles(payload);
+  return {
+    ...payload,
+    findings: [...(payload.findings ?? []), ...payload.receipts.flatMap((r, i) => receiptFindings(r, files, i))],
+  };
 }
 
 // ── seam detection ──────────────────────────────────────────────────────────
@@ -470,9 +559,20 @@ export function seamFor(files, findingText, ctx) {
   // best-ranked import of a single file. Two or more flagged files sharing the
   // module IS the evidence; with one file the only evidence left is that the
   // findings name something the module exports. Neither, and the seam is a
-  // guess — reported, never gated. See decideGate.
+  // guess, never named as the primitive. See decideGate.
   const substantiated = top.fileCount >= 2 || top.mentioned.length > 0;
   return { seam: top.spec, seamInRepo: top.inRepo, substantiated, primitives };
+}
+
+// Where a class is when no import places it — imports are read for JS/TS only.
+// Classes gate on it, never a rollup: a PR draws unrelated findings wherever it
+// changes code, and gating those refused PRs that were converging.
+const PATH_SEAM_DEPTH = 2;
+
+function pathSeam(file) {
+  const dir = path.posix.dirname(file);
+  if (dir === '.') return file;
+  return `${dir.split('/').slice(0, PATH_SEAM_DEPTH).join('/')}/`;
 }
 
 // ── classification ──────────────────────────────────────────────────────────
@@ -511,7 +611,7 @@ function lastAt(findings) {
 export function severityFalling(findings) {
   const byRound = new Map();
   for (const f of findings) {
-    const s = severityOf(f.body);
+    const s = findingSeverity(f);
     if (s == null) continue;
     const k = roundKey(f);
     byRound.set(k, Math.min(byRound.get(k) ?? Infinity, s));
@@ -563,27 +663,29 @@ function fileImports(file, seam, ctx) {
   return importsOf(source).some(({ spec }) => resolveSpec(file, spec) === seam);
 }
 
-function buildClass(signature, group, derived) {
+function buildClass(signature, group, derived, index) {
   const rounds = roundsOf(group);
   return {
-    key: `${signature} @ ${derived.seam ?? '-'}`,
+    key: `${signature} @ ${derived.seam ?? derived.place ?? '-'}`,
     signature,
     seam: derived.seam,
+    place: derived.place,
     seamInRepo: derived.seamInRepo,
     seamSubstantiated: derived.substantiated,
     primitives: derived.primitives,
+    members: group.map((f) => index.get(f)),
     rounds: rounds.length,
     roundIds: rounds,
     findings: group.length,
     lastAt: lastAt(group),
-    severities: group.map((f) => severityOf(f.body)),
+    severities: group.map(findingSeverity),
     severityFalling: severityFalling(group),
     families: [...new Set(group.flatMap((f) => invariantFamilies(f)))],
     sites: group.map((f) => ({
       file: f.path ?? '(none)',
       line: f.line ?? null,
       title: titleOf(f.body),
-      severity: severityOf(f.body),
+      severity: findingSeverity(f),
       threadId: f.threadId ?? null,
       commentId: f.commentId ?? null,
     })),
@@ -593,6 +695,7 @@ function buildClass(signature, group, derived) {
 export function classify(payload) {
   const ctx = { repoRoot: payload.repoRoot, sources: payload.sources, head: payload.head };
   const findings = (payload.findings ?? []).filter((f) => f && f.body);
+  const index = new Map(findings.map((f, i) => [f, i]));
 
   // Pass 1 — group by invariant signature.
   const groups = new Map();
@@ -617,20 +720,20 @@ export function classify(payload) {
       const derived = seamFor(files, text, ctx);
       const members = derived.seam ? remaining.filter((f) => fileImports(f.path, derived.seam, ctx)) : [];
       if (members.length === 0) {
-        // Nothing shared: one seamless class holding the rest. It is reported
-        // and never gated — see decideGate.
-        built.push({
-          cls: buildClass(signature, remaining, {
-            seam: null,
-            seamInRepo: false,
-            substantiated: false,
-            primitives: [],
-          }),
-          group: remaining,
-        });
+        // A finding that names no file has no place either; see decideGate.
+        const byPlace = new Map();
+        for (const f of remaining) {
+          const place = f.path ? pathSeam(f.path) : null;
+          if (!byPlace.has(place)) byPlace.set(place, []);
+          byPlace.get(place).push(f);
+        }
+        for (const [place, group] of byPlace) {
+          const none = { seam: null, seamInRepo: false, substantiated: false, primitives: [], place };
+          built.push({ cls: buildClass(signature, group, none, index), group });
+        }
         break;
       }
-      built.push({ cls: buildClass(signature, members, derived), group: members });
+      built.push({ cls: buildClass(signature, members, derived, index), group: members });
       remaining = remaining.filter((f) => !members.includes(f));
     }
   }
@@ -677,13 +780,29 @@ export function classify(payload) {
         primitives: [...new Set(entries.flatMap((e) => e.cls.primitives))].slice(0, 3),
         severityFalling: severityFalling(group),
         sites: group.map((f) => ({ file: f.path ?? '(none)', line: f.line ?? null, title: titleOf(f.body) })),
+        members: group.map((f) => index.get(f)),
       };
     })
     .sort((a, b) => b.rounds - a.rounds || a.seam.localeCompare(b.seam));
 
+  // Every finding of one invariant in one place, however the imports split its sites.
+  const places = [];
+  for (const [signature, group] of groups) {
+    const byPlace = new Map();
+    for (const f of group.filter((g) => g.path)) {
+      const place = pathSeam(f.path);
+      if (!byPlace.has(place)) byPlace.set(place, []);
+      byPlace.get(place).push(f);
+    }
+    for (const [place, members] of byPlace) {
+      places.push(buildClass(signature, members, { seam: null, place, primitives: [] }, index));
+    }
+  }
+
   return {
     classes: built.map((b) => b.cls),
     seams,
+    places,
     totalRounds: roundsOf(findings).length,
     totalFindings: findings.length,
   };
@@ -752,6 +871,7 @@ function primitiveNamed(entry, trailer) {
   const named = trailerPrimitive(trailer.primitive);
   if (!named) return false;
   if (entry.primitives.some((p) => p === named)) return true;
+  if (entry.seamKind === 'path') return false;
   return Boolean(entry.seam) && path.posix.basename(entry.seam).replace(/\.[jt]sx?$/, '') === named;
 }
 
@@ -882,15 +1002,10 @@ export function decideGate(payload, options = {}) {
   const worktree = payload.worktree ?? [];
 
   const flagged = [];
+  const reported = [];
   for (const c of report.classes) {
-    // A class whose seam the classifier cannot substantiate is reported, never
-    // gated. With no seam there is no primitive to move the check into; with a
-    // GUESSED seam — one flagged file, and nothing in the findings naming what
-    // that module exports — the refusal names a primitive the fix has no reason
-    // to touch, so the only way past is the override. A gate that fires on an
-    // unfalsifiable seam drives people to the override, which is the failure it
-    // exists to prevent. The class table still shows the row either way.
-    if (c.rounds >= CLASS_ROUND_LIMIT && c.seam && c.seamSubstantiated) {
+    if (c.rounds < CLASS_ROUND_LIMIT) continue;
+    if (c.seam && c.seamSubstantiated) {
       flagged.push({ kind: 'class', ...c, reason: `${c.rounds} rounds on one finding class` });
     }
   }
@@ -912,9 +1027,29 @@ export function decideGate(payload, options = {}) {
         findings: s.findings,
         lastAt: s.lastAt,
         sites: s.sites,
+        members: s.members,
         severityFalling: false,
         reason: `${s.rounds} rounds on one seam with severity not falling`,
       });
+    }
+  }
+  const answered = new Set(flagged.flatMap((f) => f.members));
+  for (const p of report.places) {
+    if (p.rounds < CLASS_ROUND_LIMIT || p.members.some((m) => answered.has(m))) continue;
+    // Naming a guessed module as the primitive would refuse with something
+    // the fix has no reason to touch, so only an introduced primitive lifts.
+    flagged.push({
+      kind: 'place',
+      ...p,
+      seam: p.place,
+      seamKind: 'path',
+      reason: `${p.rounds} rounds on one finding class in one place`,
+    });
+  }
+  for (const c of report.classes) {
+    if (c.rounds >= CLASS_ROUND_LIMIT && !c.seam && !c.place) {
+      // Listed, or "no finding class is gated" would hide a class at the limit.
+      reported.push({ key: c.key, rounds: c.rounds, reason: 'no finding names a file' });
     }
   }
 
@@ -954,30 +1089,6 @@ export function decideGate(payload, options = {}) {
       liftedBy: touched ? 'diff touches the primitive' : named.length > 0 ? 'reframe trailer' : null,
     };
   });
-
-  // Classes at the limit that are NOT gated, because their seam is a guess.
-  // They are the "reported" half of the rule and must appear in the output: a
-  // gate that prints "no finding class has reached 3 rounds" while the table
-  // holds one is telling the operator something false.
-  const gatedSeams = new Set(flagged.map((f) => f.seam).filter(Boolean));
-  const reported = report.classes
-    .filter(
-      (c) =>
-        c.rounds >= CLASS_ROUND_LIMIT &&
-        !(c.seam && c.seamSubstantiated) &&
-        // Its seam may still be gated by the rollup, on evidence the rollup
-        // carries. Saying "not gated" beside a refusal naming the same seam
-        // would be two answers to one question.
-        !(c.seam && gatedSeams.has(c.seam)),
-    )
-    .map((c) => ({
-      key: c.key,
-      rounds: c.rounds,
-      seam: c.seam,
-      reason: c.seam
-        ? 'the seam is a guess: one flagged file, and the findings name nothing it exports'
-        : 'the sites share no seam',
-    }));
 
   const unlifted = decided.filter((e) => !e.lifted);
   const allow =
@@ -1037,7 +1148,9 @@ function renderGate(decision) {
     lines.push(`  ${e.reason}`);
     lines.push('  sites:');
     for (const s of e.sites) lines.push(`    ${s.file}:${s.line ?? '?'}${s.title ? `  ${s.title}` : ''}`);
-    lines.push(`  seam: ${e.seam ?? '(none found — name it yourself)'}`);
+    lines.push(
+      `  seam: ${e.seam ?? '(none found — name it yourself)'}${e.seamKind === 'path' ? '  (where the sites are; no import names a primitive)' : ''}`,
+    );
     lines.push(`  candidate primitive(s): ${e.primitives.length ? e.primitives.join(', ') : '(none found)'}`);
     lines.push('');
   }
@@ -1052,6 +1165,11 @@ function renderGate(decision) {
     lines.push('');
     lines.push('    Reframe: <invariant> enforced in <primitive>');
     lines.push('');
+    if (decision.unlifted.some((e) => e.seamKind === 'path')) {
+      lines.push('A seam that is only a place has no primitive to touch: it lifts on the');
+      lines.push('trailer alone, naming a primitive the commit introduces.');
+      lines.push('');
+    }
     lines.push('Escape hatch (loud, recorded in the PR body): REVIEW_LOOP_ALLOW_SITE_PATCH=1');
   }
   lines.push(...reportedLines);
@@ -1145,12 +1263,13 @@ export async function main(argv) {
   // either command rather than only on the gate path.
   const headFlag = argv.indexOf('--head');
   const head = headFlag >= 0 ? argv[headFlag + 1] : undefined;
+  payload = withReceiptFindings({ ...payload, head });
   if (cmd === 'classify') {
-    const report = classify({ ...payload, head });
+    const report = classify(payload);
     process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${renderClasses(report)}\n`);
     return 0;
   }
-  const context = gitContext({ ...payload, head }, head);
+  const context = gitContext(payload, head);
   if (argv.includes('--committed-only')) context.worktree = [];
   const decision = decideGate(context, {
     allowSitePatch: argv.includes('--allow-site-patch') ? true : undefined,

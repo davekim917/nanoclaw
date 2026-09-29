@@ -714,7 +714,7 @@ if [[ "$1" == */comment-rule.mjs ]]; then
   printf '%s\\n' "\${MOCK_COMMENT_RULE_REPORT:-comment-rule: PASS}"
   exit "\${MOCK_COMMENT_RULE_STATUS:-0}"
 fi
-cat >/dev/null
+cat > "\${MOCK_GATE_PAYLOAD:-/dev/null}"
 printf 'node %s\\n' "$*" >> "$MOCK_CALLS"
 echo '{"status":"pass"}'
 exit "\${MOCK_GATE_STATUS:-0}"
@@ -1687,7 +1687,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(request.status).toBe(20);
     expect(request.stderr).toContain('automatic review handles this repo; never request');
     expect(request.posted).toBeNull();
-    expect(request.calls).not.toMatch(/^(node|pr comment)/m);
+    expect(request.calls).not.toMatch(/^pr comment/m);
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(merge.status).toBe(26);
@@ -2503,6 +2503,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(capped.status).toBe(23);
     expect(capped.stderr).toContain('CAP: 3 of 3 review rounds already requested');
     expect(capped.stderr).toContain('Checkpoint, not a stop');
+    expect(capped.stderr).toContain('codex-review.sh checkpoint');
     expect(capped.stderr).toContain('substitute review');
     expect(capped.stderr).not.toMatch(/escalate to the\s+operator, or restart/);
     expect(capped.posted).toBeNull();
@@ -2511,6 +2512,176 @@ describe('codex-review risk-scoped review requests', () => {
     const raised = runHelper(root, ['request'], { REVIEW_ROUND_CAP: '4' });
     expect(raised.status).toBe(0);
     expect(raised.posted).toContain(`head=${HEAD} round=4 -->`);
+  });
+
+  it('judges the churn gate in a legacy repo too, before refusing the request', () => {
+    const root = tempRoot();
+    scopeFixture(root, { baseConfig: null, labels: ['risk:high'] });
+
+    const result = runHelper(root, ['request'], { MOCK_GATE_STATUS: '3' });
+    expect(result.status).toBe(3);
+    expect(result.calls).toMatch(
+      new RegExp(`^node .*review-churn\\.mjs gate --json --committed-only --head ${HEAD}$`, 'm'),
+    );
+    expect(result.posted).toBeNull();
+  });
+
+  describe('past the round cap, a converging checkpoint at the head', () => {
+    const capped = ['1', '2', '3'].map((c, i) => marker(c.repeat(40), i + 1));
+    function checkpoint(head: string, decision: string, authorAssociation = 'OWNER', login = 'davekim917'): Page {
+      return {
+        author: { login },
+        authorAssociation,
+        createdAt: '2026-09-05T04:00:00Z',
+        fullDatabaseId: '1757044800',
+        body: `### Review checkpoint\n\n- **Decision:** ${decision}\n\n<!-- pr-review-loop:checkpoint head=${head} decision=${decision} -->`,
+      };
+    }
+    function request(comments: Page[], env: Record<string, string> = {}) {
+      const root = tempRoot();
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, ...comments] });
+      return runHelper(root, ['request'], env);
+    }
+
+    it('requests a further Codex round with one', () => {
+      const result = request([checkpoint(HEAD, 'converging')]);
+      expect(result.status).toBe(0);
+      expect(result.posted).toContain(`head=${HEAD} round=4 -->`);
+    });
+
+    it('refuses on a checkpoint at an older head', () => {
+      expect(request([checkpoint('9'.repeat(40), 'converging')]).status).toBe(23);
+    });
+
+    it('refuses on churning, alone or beside a converging one', () => {
+      expect(request([checkpoint(HEAD, 'churning')]).status).toBe(23);
+      expect(request([checkpoint(HEAD, 'converging'), checkpoint(HEAD, 'churning')]).status).toBe(23);
+    });
+
+    it('refuses on a checkpoint from an author without write access', () => {
+      expect(request([checkpoint(HEAD, 'converging', 'NONE')]).status).toBe(23);
+    });
+
+    it('refuses on a converging checkpoint whose author cannot write to the repository', () => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging', 'MEMBER')] });
+      fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
+      expect(runHelper(root, ['request']).status).toBe(23);
+    });
+
+    it('ignores a churning checkpoint whose author cannot write to the repository', () => {
+      const root = tempRoot();
+      const readOnly = checkpoint(HEAD, 'churning', 'MEMBER', 'reader');
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), readOnly] });
+      fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+      expect(runHelper(root, ['request']).status).toBe(0);
+    });
+
+    it("refuses when a checkpoint author's permission cannot be read, never counting them as a reader", () => {
+      const root = tempRoot();
+      const unreadable = checkpoint(HEAD, 'churning', 'MEMBER', 'flaky');
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), unreadable] });
+      fs.writeFileSync(path.join(root, 'permission--flaky.error'), '');
+      const result = runHelper(root, ['request']);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("could not read flaky's permission");
+      expect(result.posted).toBeNull();
+    });
+
+    it('reads every checkpoint marker in a comment, so a churning one beside a converging one refuses', () => {
+      const both = checkpoint(HEAD, 'converging');
+      both.body = `${String(both.body)}\n<!-- pr-review-loop:checkpoint head=${HEAD} decision=churning -->`;
+      expect(request([both]).status).toBe(23);
+    });
+
+    it('looks up no permission for a comment that is not a receipt or checkpoint', () => {
+      const root = tempRoot();
+      const chatter: Page = { ...checkpoint(HEAD, 'converging', 'MEMBER', 'flaky'), body: 'looks good to me' };
+      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), chatter] });
+      fs.writeFileSync(path.join(root, 'permission--flaky.error'), '');
+      const result = runHelper(root, ['request']);
+      expect(result.status).toBe(0);
+      expect(result.calls).not.toContain('collaborators/flaky');
+    });
+
+    it('still lets the churn gate refuse a recurring class', () => {
+      const result = request([checkpoint(HEAD, 'converging')], { MOCK_GATE_STATUS: '3' });
+      expect(result.status).toBe(3);
+      expect(result.posted).toBeNull();
+    });
+
+    it('posts the checkpoint marker only from a frontier assessor with a one-line assessment', () => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: ['risk:high'] });
+      const args = [
+        'checkpoint',
+        '--head',
+        HEAD,
+        '--decision',
+        'converging',
+        '--assessment',
+        'severity falling, no class recurring',
+      ];
+
+      const posted = runHelper(root, [...args, '--assessor', 'claude-opus-5-5 (fresh context)']);
+      expect(posted.status).toBe(0);
+      expect(posted.posted).toContain(`<!-- pr-review-loop:checkpoint head=${HEAD} decision=converging -->`);
+      expect(posted.posted).toContain('claude-opus-5-5 (fresh context)');
+
+      const small = runHelper(root, [...args, '--assessor', 'claude-haiku-4-5']);
+      expect(small.status).toBe(2);
+      expect(small.stderr).toContain('--assessor refused');
+      expect(small.posted).toBeNull();
+
+      const unknownDecision = [...args.slice(0, 4), 'fine', ...args.slice(5)];
+      const decision = runHelper(root, [...unknownDecision, '--assessor', 'claude-opus-5-5']);
+      expect(decision.status).toBe(2);
+      expect(decision.posted).toBeNull();
+    });
+  });
+
+  it('never counts receipts toward the round cap, which counts Codex requests alone', () => {
+    const root = tempRoot();
+    const heads = ['1', '2', '3', '4', '5'].map((c) => c.repeat(40));
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        marker(heads[0], 1),
+        marker(heads[1], 2),
+        receiptComment(heads[2], 'changes', '2026-09-05T01:00:00Z'),
+        receiptComment(heads[3], 'changes', '2026-09-05T02:00:00Z'),
+        independentReceipt(heads[4], 'CHANGES', 1, '2026-09-05T03:00:00Z'),
+      ],
+    });
+
+    const result = runHelper(root, ['request']);
+    expect(result.status).toBe(0);
+    expect(result.posted).toContain(`head=${HEAD} round=3 -->`);
+  });
+
+  it('hands the churn gate every receipt from an author with write access, beside the Codex threads', () => {
+    const root = tempRoot();
+    const other = '6'.repeat(40);
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        receiptComment(other, 'changes', '2026-09-05T01:00:00Z'),
+        receiptComment(other, 'changes', '2026-09-05T02:00:00Z', 'NONE'),
+        independentReceipt(other, 'CHANGES', 1, '2026-09-05T03:00:00Z'),
+        { ...receiptComment(other, 'changes', '2026-09-05T04:00:00Z'), body: 'an ordinary comment' },
+      ],
+    });
+    const payload = path.join(root, 'gate-payload.json');
+    fs.writeFileSync(path.join(root, 'permission--release-desk'), 'read\n');
+
+    const result = runHelper(root, ['gate'], { MOCK_GATE_PAYLOAD: payload });
+    expect(result.status).toBe(0);
+    const sent = JSON.parse(fs.readFileSync(payload, 'utf8')) as {
+      findings: unknown[];
+      receipts: { createdAt: string }[];
+    };
+    expect(sent.findings).toEqual([]);
+    expect(sent.receipts.map((r) => r.createdAt)).toEqual(['2026-09-05T01:00:00Z']);
   });
 
   it('propagates a churn-gate REFRAME from request without posting', () => {

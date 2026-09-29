@@ -131,21 +131,19 @@ either:
 
 A commit that touches one more call site lifts nothing, which is the point.
 
-Two rounds counted are not gated. Neither is a class whose seam the classifier
-cannot **substantiate** — it is reported in the table and left alone. That
-covers two cases:
+Two rounds counted are not gated. A round is a Codex review or a substitute or
+independent receipt that asked for changes: each finding listed in a receipt that
+names a file in the tree counts at that file.
 
-- **No seam at all.** The sites share no import, so there is no primitive to
-  move the check into.
-- **A guessed seam.** All the findings landed on one file, so there was no
-  shared import to measure and the seam is whichever of that file's imports
-  ranked first. Unless the findings name something that module exports, the
-  ranking had no evidence behind it.
-
-Both would refuse with a primitive your fix has no reason to touch, leaving the
-override as the only way out — the failure this gate exists to prevent, arrived
-at by the gate. Read those rows yourself: they usually mean the findings were
-merged too coarsely, or the sites genuinely need splitting.
+When no import the flagged sites share can be **substantiated** — the sites
+share none, or all of them sit in one file whose findings name nothing the
+guessed module exports — the class gates on its **place** instead: the
+directory its files sit in, two path components deep (`tools/ingest/`), or the
+file itself at the repo root. That is how a Python, SQL or YAML class gates at
+all. A place names no primitive, so no diff lifts it; only a `Reframe:` trailer
+naming a primitive your commit introduces does. Only a class — one invariant —
+gates on a place: unrelated findings in one directory are review, not churn.
+A class whose findings name no file is reported and never gated.
 
 `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the refusal. It prints the override
 banner, and `codex-review.sh push` writes a line into the PR body naming the
@@ -187,6 +185,9 @@ codex-review.sh audit                     # a merged PR as of its merge, by the 
 codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file> [--claim <id> --claim-owner <session-label>]
                                          # post a substitute review's receipt for exactly that head — --reviewer
                                          # must start with a frontier model ID (small tiers refused: REVIEWER_DENIED_TIERS in codex-review.sh)
+codex-review.sh checkpoint --head <sha> --decision converging|churning --assessor "<model + runtime>" --assessment "<one line>"
+                                         # a fresh-context assessor's verdict at the cap; past it, request asks
+                                         # Codex again only on a converging checkpoint for exactly that head
 codex-review.sh cut-down                  # whether this head needs a cut-down receipt and has one: 0 yes or no need, 24 missing
 codex-review.sh cut-down-receipt --head <sha> --reviewed <sha> --reviewer "<model id> cut-down-reviewer (<runtime>)" --body-file <file>
                                          # the cut-down reviewer's receipt for that head (see Cut-down pass)
@@ -525,7 +526,7 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch nam
 
    After the merge, main-provenance.yml's `gate-audit` job re-judges the merged PR (`codex-review.sh audit`): at its merged head, from the commit it merged onto, with the title, body and labels it had then. It counts only evidence from before the merge: receipts and review requests not edited since, Codex reviews, and CI that had finished by then. Only a merge commit or a squash is judged, since only those name the commit a PR merged onto; a rebase merge or one made by hand is flagged outright. Review-thread resolution is read as it stands now, because GitHub keeps no time for it, but a Codex-review basis still needs the clean review itself to predate the merge. The rules are the audit code of the commit being judged, since the job checks out the merge commit. Running `audit` by hand with newer code applies newer rules to older merges. It files one `gate-bypass` issue for a merge the gate would have refused, and the daily `gate-audit-sweep` job audits any merge from the last 50 hours whose own audit left no result. It blocks nothing; it only makes a bypass visible.
 
-`request` refuses, posting nothing, with 20 (not risk-scoped), 21 (verdict `skip`), 22 (this head already requested), 23 (cap), or 3 (churn gate). When `wait` exits 11 or 13, run the substitute review [Review availability](../../../docs/review-policy.md#review-availability) requires — a fresh-context reviewer, never the implementing session — and post it with `codex-review.sh receipt`, whatever the verdict: `changes` too. Any frontier model may review; there is no list to edit when a new one ships. Default the reviewer to the model the dispatching session is running on — a Claude subagent inherits it or takes the `opus`/`fable` alias (newest release), `codex exec` and `opencode run` use their configured model unless given `-m` — at `high` effort, set by a runtime field or scoped CLI invocation, never prompt wording (`opencode run` has no effort flag, so there the id is the whole tier). `receipt`/`merge-check` read only `--reviewer`'s **first whitespace-delimited word**, drop a `[1m]` suffix and any provider path (`opencode/`), require a concrete versioned id (no alias), and refuse it when a whole id segment is a small tier — `REVIEWER_DENIED_TIERS` in `scripts/codex-review.sh`: `sonnet haiku luna terra mini nano lite small`. `flash` is not a tier; `gemini-3.8-flash` passes and `gemini-3.5-flash-lite` is refused for `lite`. A denylist fails open, so a small model with an unfamiliar name passes until its tier word is added. Everything after the first word is free text. Report the reviewer's **exact model id from its own runtime** — a Claude subagent from its system prompt, Codex from the `-m` it ran with or `codex exec`'s session metadata — as that first word, e.g. `claude-opus-5 (opus)`, `gpt-5.6-sol high (codex exec)` or `opencode/deepseek-v4.1-flash (opencode run)`. Don't wait for a reviewer to be free: start one yourself as a fresh process, `codex exec -c model_reasoning_effort=high`, `CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model opus --effort high` or `opencode run -m <provider/model> '<prompt>' < /dev/null` (the redirect is load-bearing — an open stdin makes the CLI wait for more prompt input and hang), give it the head SHA, the complete diff, the relevant files and the review policy, and post its report as the receipt body. The latest receipt for that exact head decides: `approve` satisfies the review, and `changes` refuses the merge under either verdict — even over a clean Codex review — until a later `approve`.
+`request` refuses, posting nothing, with 20 (not risk-scoped), 21 (verdict `skip`), 22 (this head already requested), 23 (cap, and no converging checkpoint for this head), or 3 (churn gate). When `wait` exits 11 or 13, run the substitute review [Review availability](../../../docs/review-policy.md#review-availability) requires — a fresh-context reviewer, never the implementing session — and post it with `codex-review.sh receipt`, whatever the verdict: `changes` too. Any frontier model may review; there is no list to edit when a new one ships. Default the reviewer to the model the dispatching session is running on — a Claude subagent inherits it or takes the `opus`/`fable` alias (newest release), `codex exec` and `opencode run` use their configured model unless given `-m` — at `high` effort, set by a runtime field or scoped CLI invocation, never prompt wording (`opencode run` has no effort flag, so there the id is the whole tier). `receipt`/`merge-check` read only `--reviewer`'s **first whitespace-delimited word**, drop a `[1m]` suffix and any provider path (`opencode/`), require a concrete versioned id (no alias), and refuse it when a whole id segment is a small tier — `REVIEWER_DENIED_TIERS` in `scripts/codex-review.sh`: `sonnet haiku luna terra mini nano lite small`. `flash` is not a tier; `gemini-3.8-flash` passes and `gemini-3.5-flash-lite` is refused for `lite`. A denylist fails open, so a small model with an unfamiliar name passes until its tier word is added. Everything after the first word is free text. Report the reviewer's **exact model id from its own runtime** — a Claude subagent from its system prompt, Codex from the `-m` it ran with or `codex exec`'s session metadata — as that first word, e.g. `claude-opus-5 (opus)`, `gpt-5.6-sol high (codex exec)` or `opencode/deepseek-v4.1-flash (opencode run)`. Don't wait for a reviewer to be free: start one yourself as a fresh process, `codex exec -c model_reasoning_effort=high`, `CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model opus --effort high` or `opencode run -m <provider/model> '<prompt>' < /dev/null` (the redirect is load-bearing — an open stdin makes the CLI wait for more prompt input and hang), give it the head SHA, the complete diff, the relevant files and the review policy, and post its report as the receipt body. The latest receipt for that exact head decides: `approve` satisfies the review, and `changes` refuses the merge under either verdict — even over a clean Codex review — until a later `approve`.
 
 **When the head moves after an approving receipt, re-review only what the move added, and don't re-run ci-full just for the move.** A receipt covers exactly one head, so the new head needs its own receipt. What the reviewer must read, though, is only what the move added on top of git's automatic merge of the approved head and the base. That surface is small and exact even when the merge commit hides a manual resolution, which `range-diff` never inspects. Produce it from a clean checkout of the new head (`git status --porcelain` empty):
 
@@ -541,14 +542,19 @@ The reviewer reads that diff: every line, including deletions. A regenerated `sr
 
 **Read the review notes first, and add to your fragment.** Before writing or reviewing code, the author and the reviewer read `docs/review-notes.md` and every `docs/review-notes/<PR>.md` fragment (in a container: `/workspace/project/docs/review-notes.md` and `/workspace/project/docs/review-notes/`). Post every review verdict as a receipt, `changes` included. Once any receipt on the PR, on any head, says `changes`, the PR adds `docs/review-notes/<its PR number>.md` — one or more lesson lines, in the registry's format and classes — or its body carries `Review-notes: none (<reason>)`; `merge-check` refuses with `review_notes_missing` (24) otherwise. Do not append the historical `docs/review-notes.md` lessons. Deferring a finding to an issue, or reverting a PR, adds a fragment too. When the PR carries `risk:*` dimension labels, they scope the reviewer's brief.
 
-**Round 3 is a checkpoint for you, not a stop that waits for the operator.** `REVIEW_ROUND_CAP` (default 3) limits Codex requests, not the work. On exit 23, decide yourself, and never escalate to the operator because the cap was reached:
+**Round 3 is a checkpoint for you, not a ceiling and not a stop that waits for the operator.** `REVIEW_ROUND_CAP` (default 3) counts Codex requests only — receipts never count toward it. On exit 23, decide yourself, and never escalate to the operator because the cap was reached:
 
-1. **Assess.** Classify the rounds by file and by class (above, `review-churn.mjs`). For a second opinion, give a fresh-context subagent the diff and the finding history with one question: are these rounds hardening the right parts of this PR, or is each fix creating the next finding?
-2. **Converging** (severity falling, no class recurring): fix the open findings in one batch and push. Then get a fresh-context substitute review of the new head, post it with `receipt`, and merge on `approve`.
-3. **Churning** (a class or seam recurring, or the substitute review still finds new defects): stop patching sites. Rebuild instead: fix the shared seam once, split the PR, or close it and redo the change in a fresh session with a reframed plan. A PR that needs more than six review rounds in total is the wrong PR, not an unlucky one. PR #566 went 12 rounds by patching.
+1. **Assess.** Classify the rounds by file and by class (above, `review-churn.mjs`). Give a fresh-context subagent (never the implementing session) the diff and the finding history with one question: are these rounds hardening the right parts of this PR, or is each fix creating the next finding? Record its verdict on the head it judged:
+
+   ```bash
+   codex-review.sh checkpoint --head <sha> --decision converging|churning \
+     --assessor "<its model id> (<runtime>)" --assessment "<one line>"
+   ```
+2. **Converging** (severity falling, no class recurring): fix the open findings in one batch and push. A `converging` checkpoint on the head you request for lets `request` ask Codex for another round; each new head past the cap needs its own. When Codex is out of quota, get a fresh-context substitute review instead, post it with `receipt`, and merge on `approve`.
+3. **Churning** (a class or seam recurring, or the substitute review still finds new defects): stop patching sites. A `churning` checkpoint never unlocks a request. Rebuild instead: fix the shared seam once, split the PR, or close it and redo the change in a fresh session with a reframed plan. Past about six review rounds in total, ask seriously whether it is the wrong PR rather than an unlucky one; PR #566 went 12 rounds by patching.
 4. **The operator** hears only about a decision that is genuinely theirs (scope, product behaviour, an authority gate), in one or two lines with your recommendation.
 
-The churn gate cannot do this job alone: it derives seams from imports, so a finding class whose sites are Markdown or YAML never gates.
+There is no ceiling past the checkpoint: the churn gate is what stops a PR whose findings keep recurring in one class.
 
 ## When you compose the review prompt yourself
 

@@ -228,9 +228,11 @@ on one seam with severity not falling, exits non-zero naming the class, the
 sites and the candidate primitive, and lifts only on a commit that touches that
 primitive or carries `Reframe: <invariant> enforced in <primitive>`. A class
 whose seam the classifier cannot substantiate — no shared import, or a single
-flagged file whose findings name nothing that module exports — is reported and
-not gated, because the refusal would name a primitive the fix has no reason to
-touch and the override would be the only way out. The reframe trailer may name
+flagged file whose findings name nothing that module exports — gates on its
+place (its files' directory, two components deep) and lifts only on that
+trailer, since naming a guessed primitive would leave the override as the only
+way out. Substitute and independent receipts that ask for changes count as
+rounds; the Codex round cap does not count them. The reframe trailer may name
 any primitive the commit itself introduces, not only the classifier's
 candidates. `REVIEW_LOOP_ALLOW_SITE_PATCH=1` overrides the gate loudly and
 records the override in the PR body. Agent containers get the same gate at
