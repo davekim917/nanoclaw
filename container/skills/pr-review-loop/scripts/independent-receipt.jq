@@ -3,7 +3,7 @@
 # clear ones it will not vouch for (not first in the body, or beside another
 # marker): those clear nothing and mask nothing. The merge
 # gate asks about the PR's head; the churn gate passes "" to judge each receipt
-# against the head it names.
+# against the head it names, and one that names none is no receipt.
 def independent_verdict($re; $jsonRe; $head):
   [ ltrimstr("﻿") | splits($re) ] as $parts
   | select(($parts | length) > 1)
@@ -11,8 +11,9 @@ def independent_verdict($re; $jsonRe; $head):
       | $parts[$i] as $rest
       | (([ $rest | capture($jsonRe) | .json ] | first) // $rest) as $text
       | ([ $text | try fromjson catch null | objects ] | first) as $doc
-      | (if $head == "" then ($doc.head? | strings) // "" else $head end) as $h
-      | select(($text | contains($h)) or ($doc != null and ($doc.head | type) != "string"))
+      | (if $head != "" then $head
+         else ($doc.head? | strings) // ([ $text | match("[0-9a-f]{40}") | .string ] | first) end) as $h
+      | select(($h != null and ($text | contains($h))) or ($doc != null and ($doc.head | type) != "string"))
       | { clear: ($doc != null and $doc.head == $h and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0
                   and ($text | contains("\\") | not)
                   and all("head", "verdict", "blocking_findings"; . as $k | [ $text | match("\"\($k)\""; "g") ] | length == 1)),

@@ -2730,6 +2730,11 @@ describe('codex-review risk-scoped review requests', () => {
         { clear: false, said: 'its JSON block does not parse' },
       ],
       [
+        'a receipt whose JSON does not parse and names no head',
+        independentReceipt(other, 'CHANGES', 1, at, 'MEMBER', '1', '{ not json }'),
+        null,
+      ],
+      [
         'a CLEAR with prose before its marker',
         {
           ...independentReceipt(other, 'CLEAR', 0, at),
