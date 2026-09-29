@@ -2562,20 +2562,29 @@ describe('codex-review risk-scoped review requests', () => {
       expect(request([checkpoint(HEAD, 'converging', 'NONE')]).status).toBe(23);
     });
 
-    it('refuses on a converging checkpoint whose author cannot write to the repository', () => {
-      const root = tempRoot();
-      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging', 'MEMBER')] });
-      fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
-      expect(runHelper(root, ['request']).status).toBe(23);
-    });
+    it.each(['MEMBER', 'COLLABORATOR'])(
+      'refuses on a converging checkpoint from a %s who cannot write to the repository',
+      (association) => {
+        const root = tempRoot();
+        scopeFixture(root, {
+          labels: ['risk:high'],
+          comments: [...capped, checkpoint(HEAD, 'converging', association)],
+        });
+        fs.writeFileSync(path.join(root, 'permission--davekim917'), 'read\n');
+        expect(runHelper(root, ['request']).status).toBe(23);
+      },
+    );
 
-    it('ignores a churning checkpoint whose author cannot write to the repository', () => {
-      const root = tempRoot();
-      const readOnly = checkpoint(HEAD, 'churning', 'MEMBER', 'reader');
-      scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), readOnly] });
-      fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
-      expect(runHelper(root, ['request']).status).toBe(0);
-    });
+    it.each(['MEMBER', 'COLLABORATOR'])(
+      'ignores a churning checkpoint from a %s who cannot write to the repository',
+      (association) => {
+        const root = tempRoot();
+        const readOnly = checkpoint(HEAD, 'churning', association, 'reader');
+        scopeFixture(root, { labels: ['risk:high'], comments: [...capped, checkpoint(HEAD, 'converging'), readOnly] });
+        fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+        expect(runHelper(root, ['request']).status).toBe(0);
+      },
+    );
 
     it("refuses when a checkpoint author's permission cannot be read, never counting them as a reader", () => {
       const root = tempRoot();
@@ -2995,10 +3004,13 @@ describe('codex-review risk-scoped review requests', () => {
       ['names no agent, as the author posting its own', 'claude-opus-5 (author, self-review)', 'davekim917'],
       ['names the agent from a small tier', 'claude-sonnet-5 cut-down-reviewer', 'davekim917'],
       ['names the agent inside another word', 'claude-opus-5 not-cut-down-reviewer-really', 'davekim917'],
-      ['comes from an account without write access', AGENT_REVIEWER, 'reader'],
-    ])('refuses a receipt on the head that %s', (_case, reviewer, login) => {
+      ['comes from a read-only MEMBER', AGENT_REVIEWER, 'reader', 'MEMBER'],
+      ['comes from a read-only COLLABORATOR', AGENT_REVIEWER, 'reader', 'COLLABORATOR'],
+    ])('refuses a receipt on the head that %s', (_case, reviewer, login, association = 'OWNER') => {
       const root = tempRoot();
-      cutDownFixture(root, { comments: [cutDownReceipt(HEAD, reviewer, login)] });
+      cutDownFixture(root, {
+        comments: [{ ...cutDownReceipt(HEAD, reviewer, login), authorAssociation: association }],
+      });
       fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
 
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
@@ -5357,6 +5369,7 @@ function auditFixture(
     shape?: keyof typeof MERGE_SHAPES;
     parentConfig?: string | null;
     permissions?: string | null;
+    mergeBody?: string;
   } = {},
 ): void {
   scopeFixture(root, opts);
@@ -5378,9 +5391,10 @@ function auditFixture(
           mergeCommit: {
             oid: MERGE_OID,
             messageBody:
-              opts.permissions === null
+              opts.mergeBody ??
+              (opts.permissions === null
                 ? 'Merge the feature'
-                : `Gate-Permissions: ${opts.permissions ?? 'davekim917=admin release-desk=write'}`,
+                : `Gate-Permissions: ${opts.permissions ?? 'davekim917=admin release-desk=write'}`),
             parents: { totalCount: shape.parents.length, nodes: shape.parents.map((oid) => ({ oid })) },
             signature: shape.signature,
           },
@@ -5777,13 +5791,17 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       expect(result.stdout).toContain('review_notes_missing');
     });
 
-    it('errors on a permission record it cannot read', () => {
+    it.each([
+      [
+        'inside a longer body, as a squash of the PR commits could carry it',
+        'Squashed\n\nGate-Permissions: davekim917=admin',
+      ],
+      ['in a form the merge never writes', 'Gate-Permissions: davekim917'],
+    ])('ignores a permission record %s', (_case, mergeBody) => {
       const root = tempRoot();
-      auditFixture(root, { labels: ['risk:high'], permissions: 'davekim917', ...APPROVAL });
+      auditFixture(root, { labels: ['risk:high'], mergeBody, ...APPROVAL });
 
-      const result = runHelper(root, ['audit']);
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("merge commit's permission record does not parse");
+      expect(runHelper(root, ['audit']).status).toBe(28);
     });
   });
 

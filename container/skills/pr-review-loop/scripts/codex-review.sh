@@ -1067,7 +1067,8 @@ SCOPE_FILES=null
 SCOPE_PIN_BASE=""
 GATE_AS_OF=""
 GATE_LABELS=""
-# The permissions a merge's record names, as a JSON object; `audit` alone sets it.
+# The permissions a merge's record names, as a JSON object; `audit` alone sets
+# it, and only from a merge commit whose whole body is the record `merge` writes.
 GATE_PERMISSIONS="{}"
 
 # The PR JSON $1, with the labels the PR had at its merge in place of the ones
@@ -3139,12 +3140,11 @@ $assessment
     GATE_AS_OF=$(printf '%s' "$at_merge" | jq -r .mergedAt)
     SCOPE_PIN_BASE=$(printf '%s' "$at_merge" | jq -r .base)
     GATE_LABELS=$(printf '%s' "$at_merge" | jq -c .labels)
-    GATE_PERMISSIONS=$(printf '%s' "$audit_pr" | jq -ce '
-      [ .data.repository.pullRequest.mergeCommit.messageBody // "" | splits("\n") | select(startswith("Gate-Permissions:")) ]
-      | if length > 1 then error("two permission records") else . end
-      | [ .[] | ltrimstr("Gate-Permissions:") | splits(" ") | select(. != "") | capture("\\A(?<k>[^=]+)=(?<v>[a-z]+)\\z") // error("an unreadable permission record")
-          | { (.k): .v } ] | add // {}') \
-      || { echo "audit=error pr=$PR: its merge commit's permission record does not parse" >&2; exit 1; }
+    GATE_PERMISSIONS=$(printf '%s' "$audit_pr" | jq -c '
+      .data.repository.pullRequest.mergeCommit.messageBody // "" | rtrimstr("\n")
+      | if test("\\AGate-Permissions:( [^ =\n]+=[a-z]+)*\\z")
+        then [ ltrimstr("Gate-Permissions:") | splits(" ") | select(. != "") | capture("(?<k>[^=]+)=(?<v>.*)") | { (.k): .v } ] | add // {}
+        else {} end') || { echo "audit=error pr=$PR: could not read its merge commit's permission record" >&2; exit 1; }
     audit_head=$(printf '%s' "$at_merge" | jq -r .head)
     where="pr=$PR head=$audit_head base=$SCOPE_PIN_BASE merged=$GATE_AS_OF"
     scope_eval || { echo "audit=error $where: no scope verdict" >&2; exit 1; }
