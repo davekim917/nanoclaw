@@ -2693,6 +2693,61 @@ describe('codex-review risk-scoped review requests', () => {
     expect(sent.receipts.map((r) => r.createdAt)).toEqual(['2026-09-05T01:00:00Z']);
   });
 
+  describe("hands the churn gate the merge gate's own verdict on each independent receipt", () => {
+    const other = '6'.repeat(40);
+    const at = '2026-09-05T03:00:00Z';
+    it.each([
+      ['a well-formed CLEAR', independentReceipt(other, 'CLEAR', 0, at), { clear: true, said: '' }],
+      [
+        'a CLEAR whose head key is given twice',
+        independentReceipt(
+          other,
+          'CLEAR',
+          0,
+          at,
+          'MEMBER',
+          '1',
+          `{"head":"${other}","head":"${other}","verdict":"CLEAR","blocking_findings":0}`,
+        ),
+        { clear: false, said: 'verdict CLEAR, blocking_findings 0' },
+      ],
+      [
+        'a CLEAR whose verdict key is given twice',
+        independentReceipt(
+          other,
+          'CLEAR',
+          0,
+          at,
+          'MEMBER',
+          '1',
+          `{"head":"${other}","verdict":"CHANGES","verdict":"CLEAR","blocking_findings":0}`,
+        ),
+        { clear: false, said: 'verdict CLEAR, blocking_findings 0' },
+      ],
+      [
+        'a receipt whose JSON does not parse',
+        independentReceipt(other, 'CLEAR', 0, at, 'MEMBER', '1', `{ not json ${other}`),
+        { clear: false, said: 'its JSON block does not parse' },
+      ],
+      [
+        'a CLEAR with prose before its marker',
+        {
+          ...independentReceipt(other, 'CLEAR', 0, at),
+          body: `Summary first.\n\n${independentReceipt(other, 'CLEAR', 0, at).body as string}`,
+        },
+        null,
+      ],
+    ])('%s', (_case, receipt, independent) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: ['risk:high'], comments: [receipt] });
+      const payload = path.join(root, 'gate-payload.json');
+
+      expect(runHelper(root, ['gate'], { MOCK_GATE_PAYLOAD: payload }).status).toBe(0);
+      const sent = JSON.parse(fs.readFileSync(payload, 'utf8')) as { receipts: { independent: unknown }[] };
+      expect(sent.receipts.map((r) => r.independent)).toEqual([independent]);
+    });
+  });
+
   it('propagates a churn-gate REFRAME from request without posting', () => {
     const root = tempRoot();
     scopeFixture(root, { labels: ['risk:high'] });

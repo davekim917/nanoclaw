@@ -1136,7 +1136,12 @@ describe('review-churn gate beyond the import graph', () => {
 
   function independentReceipt(id: number, createdAt: string, verdict: string, blocking: number, prose: string) {
     const json = JSON.stringify({ head: SHA, fresh_context: true, verdict, blocking_findings: blocking });
-    return { id, createdAt, body: `<!-- independent-review-receipt:v1 -->\n\`\`\`json\n${json}\n\`\`\`\n${prose}\n` };
+    return {
+      id,
+      createdAt,
+      body: `<!-- independent-review-receipt:v1 -->\n\`\`\`json\n${json}\n\`\`\`\n${prose}\n`,
+      independent: { clear: verdict === 'CLEAR' && blocking === 0, said: '' },
+    };
   }
 
   const staleRounds = [
@@ -1180,6 +1185,29 @@ describe('review-churn gate beyond the import graph', () => {
     const findings = staleRounds.map((f, i) => ({ ...f, path: `src/feature/${'abc'[i]}.ts` }));
     const decision = expectPlaceGate({ findings, sources }, 'src/feature/');
     expect(decision.unlifted[0].key).toBe('inv:staleness @ src/feature/');
+  });
+
+  it('keeps a place gated when a rollup on another invariant lifts over part of it', () => {
+    const shared = "import { loadSnapshot } from './shared.js';\n";
+    const sources = {
+      'src/feature/a.ts': shared,
+      'src/feature/b.ts': shared,
+      'src/feature/c.ts': 'export const c = 1;\n',
+      'src/feature/shared.ts': 'export function loadSnapshot() {}\n',
+    };
+    const findings = [
+      ...staleRounds.map((f, i) => ({ ...f, path: `src/feature/${'abc'[i]}.ts` })),
+      codexFinding('PRR_R1', 'src/feature/a.ts', 'Guard the concurrent write race', '2026-09-01T15:00:00Z'),
+      codexFinding('PRR_R2', 'src/feature/b.ts', 'Guard the concurrent write race', '2026-09-01T16:00:00Z'),
+    ];
+    const touchesShared = {
+      sha: 'eee5555',
+      date: '2026-09-02T00:00:00Z',
+      message: 'fix: lock the snapshot',
+      files: ['src/feature/shared.ts'],
+    };
+    const decision = expectPlaceGate({ findings, sources, commits: [touchesShared] }, 'src/feature/');
+    expect(decision.unlifted.map((e) => e.key)).toEqual(['inv:staleness @ src/feature/']);
   });
 
   it('keeps an invariant in two directories apart', () => {
@@ -1320,16 +1348,15 @@ describe('review-churn gate beyond the import graph', () => {
     expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
   });
 
-  it('counts an independent receipt whose verdict key is given twice as not clear', () => {
+  it("takes an independent receipt's verdict from the merge gate's reading, never its JSON", () => {
     const receipts = staleRounds.map((f, i) => ({
-      id: 60 + i,
-      createdAt: f.createdAt,
-      body:
-        '<!-- independent-review-receipt:v1 -->\n```json\n' +
-        '{"verdict":"CHANGES","blocking_findings":1,"verdict":"CLEAR","blocking_findings":0}\n```\n' +
-        `- \`${f.path}\` reads a stale cached snapshot.\n`,
+      ...independentReceipt(60 + i, f.createdAt, 'CLEAR', 0, `- \`${f.path}\` reads a stale cached snapshot.`),
+      independent: { clear: false, said: 'verdict CLEAR, blocking_findings 0' },
     }));
     expectPlaceGate({ findings: [], receipts, files: INGEST }, 'tools/ingest/');
+
+    const unread = receipts.map(({ independent: _unread, ...r }) => r);
+    expect(gate({ findings: [], receipts: unread, files: INGEST }).status).toBe(0);
   });
 
   it('counts nothing from a substitute receipt that approves', () => {

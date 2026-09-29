@@ -54,7 +54,7 @@
  *                                       // classifier never touches the disk
  *     "commits":  [ { sha, date, message, files: [] } ],  // optional; else git
  *     "worktree": [ "src/a.ts" ],       // optional; else git status
- *     "receipts": [ { id, createdAt, body } ],  // review receipt comments
+ *     "receipts": [ { id, createdAt, body, independent } ],  // review receipt comments
  *     "files":    [ "src/a.ts" ]        // optional; else git ls-tree
  *   }
  *
@@ -277,16 +277,6 @@ const INDEPENDENT_RECEIPT =
   /(?:^|\n)<!-- independent-review-receipt:v1 -->[ \t]*\r?\n\s*```json[ \t]*\r?\n([\s\S]*?)\n[ \t]*```/;
 const LIST_ITEM = /^\s{0,3}(?:[-*+]|\d+[.)])\s+/;
 
-function receiptClear(json) {
-  if (!['verdict', 'blocking_findings'].every((k) => json.split(`"${k}"`).length === 2)) return false;
-  try {
-    const doc = JSON.parse(json);
-    return doc.verdict === 'CLEAR' && doc.blocking_findings === 0;
-  } catch {
-    return false;
-  }
-}
-
 function receiptItems(prose) {
   const items = [];
   let current = null;
@@ -316,9 +306,9 @@ function locate(text, files) {
 function receiptFindings(receipt, files, index) {
   const body = receipt.body ?? '';
   const substitute = SUBSTITUTE_RECEIPT.exec(body);
-  const independent = substitute ? null : INDEPENDENT_RECEIPT.exec(body);
-  if (substitute ? substitute[1] !== 'changes' : !independent || receiptClear(independent[1])) return [];
-  const prose = independent ? body.replace(independent[0], '\n') : body;
+  const independent = substitute ? null : receipt.independent;
+  if (substitute ? substitute[1] !== 'changes' : !independent || independent.clear) return [];
+  const prose = independent ? body.replace(INDEPENDENT_RECEIPT, '\n') : body;
   const located = receiptItems(prose)
     .map((text) => ({ text, file: locate(text, files) }))
     .filter((item) => item.file);
@@ -1035,7 +1025,7 @@ export function decideGate(payload, options = {}) {
   }
   const answered = new Set(flagged.flatMap((f) => f.members));
   for (const p of report.places) {
-    if (p.rounds < CLASS_ROUND_LIMIT || p.members.some((m) => answered.has(m))) continue;
+    if (p.rounds < CLASS_ROUND_LIMIT || p.members.every((m) => answered.has(m))) continue;
     // Naming a guessed module as the primitive would refuse with something
     // the fix has no reason to touch, so only an introduced primitive lifts.
     flagged.push({

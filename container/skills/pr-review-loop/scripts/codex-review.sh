@@ -510,7 +510,9 @@ checkpoint_state() {
 receipts_json() {
   local comments
   comments=$(comments_by_writers) || return 1
-  printf '%s' "$comments" | jq '[ .[] | { id, createdAt, body } ]'
+  printf '%s' "$comments" | jq_here --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" '
+    include "independent-receipt";
+    [ .[] | { id, createdAt, body, independent: ([ (.body // "") | independent_verdict($re; $jsonRe; "") ] | first) } ]'
 }
 
 # An override is not a private decision: it goes in the PR body where the
@@ -1830,26 +1832,11 @@ repo_permission() {
 independent_receipt_newest() {
   printf '%s\n' "$1" | jq_here -rs --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" \
     --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg head "$2" '
-    include "receipt-order";
+    include "receipt-order"; include "independent-receipt";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.standing == "yes")
       | { login: .author.login, at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
-      | [ (.body // "") | ltrimstr("\uFEFF") | splits($re) ] as $parts
-      | select(($parts | length) > 1)
-      | [ range(1; $parts | length) as $i
-          | $parts[$i] as $rest
-          | (([ $rest | capture($jsonRe) | .json ] | first) // $rest) as $text
-          | ([ $text | try fromjson catch null | objects ] | first) as $doc
-          | select(($text | contains($head)) or ($doc != null and ($doc.head | type) != "string"))
-          | { clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0
-                      and ($text | contains("\\") | not)
-                      and all("head", "verdict", "blocking_findings"; . as $k | [ $text | match("\"\($k)\""; "g") ] | length == 1)),
-              said: (if $doc == null then "its JSON block does not parse"
-                     else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $receipts
-      | ([ $receipts[] | select(.clear | not) ] | first) as $no
-      | if $no != null then $c + { clear: false, said: $no.said }
-        elif ($parts | length) == 2 and ($receipts | length) == 1 and ($parts[0] | test("\\A[ \t\r\n]*\\z")) then $c + { clear: true, said: "" }
-        else empty end ] as $matches
+      | (.body // "") | independent_verdict($re; $jsonRe; $head) | $c + . ] as $matches
     | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then
         "unknown\treceipt_order_unknown: an independent-review receipt for this head from \($bad.login) has no usable database id (fullDatabaseId=\(if $bad.idstr == "" then "null" else $bad.idstr end)), so which receipt is newest cannot be determined"
