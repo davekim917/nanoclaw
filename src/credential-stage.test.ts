@@ -158,6 +158,44 @@ describe('stageDbtProfiles', () => {
     expect(fs.readFileSync(path.join(dest, 'profiles.yml'), 'utf-8')).not.toContain('FAKE_INLINE_KEY');
   });
 
+  it('refuses a top-level private_key, an alias of an inline key under another field, and a PEM under any field', () => {
+    fs.mkdirSync(path.join(home, '.dbt'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.dbt', 'profiles.yml'),
+      [
+        'private_key: FAKE_ROOT_KEY',
+        'hidden:',
+        '  outputs:',
+        '    dev:',
+        '      private_key: &pk FAKE_ALIASED_KEY',
+        'aliased:',
+        '  outputs:',
+        '    dev:',
+        '      query_tag: *pk',
+        'pem:',
+        '  outputs:',
+        '    dev:',
+        '      token: "-----BEGIN PRIVATE KEY-----\\nabc"',
+        'pw:',
+        '  outputs:',
+        '    dev:',
+        '      password: x',
+        '',
+      ].join('\n'),
+    );
+
+    expect(Object.keys(stage(['private_key', 'aliased', 'pem', 'pw']))).toEqual(['pw']);
+    const text = fs.readFileSync(path.join(dest, 'profiles.yml'), 'utf-8');
+    expect(text).not.toMatch(/FAKE_|PRIVATE KEY/);
+  });
+
+  it.each([null, ''])('treats private_key_path %j as absent', (keyPath) => {
+    writeProfiles({ oauth: snowflakeProfile({ authenticator: 'oauth', private_key_path: keyPath }) });
+
+    expect(Object.keys(stage(null))).toEqual(['oauth']);
+    expect(stagedKeys()).toEqual([]);
+  });
+
   it('refuses a private_key_path that is a symlink inside home to a file outside it', () => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dbt-stage-outside-'));
     try {

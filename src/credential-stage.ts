@@ -27,16 +27,29 @@ interface Refusal {
   at: string;
 }
 
-function findInlineKey(v: unknown, at: string): string | null {
+function collectInlineKeys(v: unknown, out: Set<unknown>): Set<unknown> {
+  if (Array.isArray(v)) {
+    for (const item of v) collectInlineKeys(item, out);
+  } else if (isRecord(v)) {
+    for (const [k, item] of Object.entries(v)) {
+      if (k === 'private_key' && item != null && item !== '') out.add(item);
+      collectInlineKeys(item, out);
+    }
+  }
+  return out;
+}
+
+function findInlineKey(v: unknown, at: string, inlineKeys: Set<unknown>): string | null {
+  if (inlineKeys.has(v) || (typeof v === 'string' && v.includes('PRIVATE KEY-----'))) return at;
   if (Array.isArray(v)) {
     for (const [i, item] of v.entries()) {
-      const hit = findInlineKey(item, `${at}[${i}]`);
+      const hit = findInlineKey(item, `${at}[${i}]`, inlineKeys);
       if (hit) return hit;
     }
   } else if (isRecord(v)) {
     for (const [k, item] of Object.entries(v)) {
       if (k === 'private_key') return `${at}.${k}`;
-      const hit = findInlineKey(item, `${at}.${k}`);
+      const hit = findInlineKey(item, `${at}.${k}`, inlineKeys);
       if (hit) return hit;
     }
   }
@@ -63,7 +76,7 @@ function stageProfileOutputs(outputs: Record<string, unknown>, home: string): St
   const staged: Record<string, unknown> = {};
   const keys: StagedProfile['keys'] = [];
   for (const [name, output] of Object.entries(outputs)) {
-    if (!isRecord(output) || output.private_key_path === undefined) {
+    if (!isRecord(output) || output.private_key_path == null || output.private_key_path === '') {
       staged[name] = output;
       continue;
     }
@@ -86,13 +99,14 @@ export function stageDbtProfiles(opts: {
   const parsed: unknown = YAML.parse(fs.readFileSync(opts.profilesPath, 'utf-8'), { merge: true }) ?? {};
   if (!isRecord(parsed)) throw new Error('profiles.yml is not a mapping');
 
+  const inlineKeys = collectInlineKeys(parsed, new Set());
   const refuse = (profile: string, r: Refusal): void =>
     log.warn('dbt profile not staged (fail closed)', { agent: opts.agent, profile, at: r.at, reason: r.refused });
 
   const staged: Record<string, unknown> = {};
   for (const [name, profile] of Object.entries(parsed)) {
     if (opts.allowedProfiles && !opts.allowedProfiles.includes(name)) continue;
-    const inline = findInlineKey(profile, name);
+    const inline = name === 'private_key' ? name : findInlineKey(profile, name, inlineKeys);
     if (inline) {
       refuse(name, { refused: 'inline private_key', at: inline });
       continue;
