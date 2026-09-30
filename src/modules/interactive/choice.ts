@@ -18,6 +18,7 @@ import {
 } from '../../db/messaging-groups.js';
 import { getPendingApprovalByRequestId, getPendingApprovalsByAction } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
+import { readEnvFile } from '../../env.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { resolveSession, sessionMessageExists } from '../../session-manager.js';
@@ -37,6 +38,24 @@ const CHOICE_RESPONSE_EVENT = 'choice_response';
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const USER_ID_RE = /^[^:\s]+:\S+$/;
 const OPTION_STYLES = new Set<unknown>(['primary', 'danger', 'default']);
+const DECISION_REQUIRED_KEY = 'NANOCLAW_RELEASE_CARD_DECISION_REQUIRED';
+const DECISION_KEYS = ['question', 'ifItShips', 'evidence'];
+const MAX_DECISION_QUESTION = 300;
+const MAX_DECISION_IF_IT_SHIPS = 1200;
+const MAX_DECISION_LINES = 10;
+const MAX_DECISION_EVIDENCE = 500;
+const MAX_RELEASE_CARD_TEXT = 1800;
+const HEX_RUN_RE = /[0-9a-f]{40}/i;
+const DISPLAY_SAFE_RE =
+  /^[\x20-\x7E\u00A3\u00B0\u00C0-\u00FF\u2013\u2014\u2018\u2019\u201C\u201D\u2022\u2026\u2192\u20AC]*$/;
+const VISIBLE_RE = /[A-Za-z0-9\u00C0-\u00FF]/;
+const EVIDENCE_RE = /^https:\/\/[^\s<>|]+$/;
+
+interface ReleaseDecision {
+  question: string;
+  ifItShips: string[];
+  evidence: string;
+}
 
 interface ChoiceRequest {
   choiceId: string;
@@ -55,11 +74,29 @@ interface ChoiceRequest {
 
 /** The host's own validation: the outbound row is container-written. */
 function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | { error: string } {
-  const { choiceId, title, question, options, key, approvers, to, channelType, platformId, approvalScope } = content;
+  const { choiceId, title, question, options, key, approvers, to, channelType, platformId, approvalScope, decision } =
+    content;
   if (typeof choiceId !== 'string' || !ID_RE.test(choiceId)) return { error: 'choiceId is missing or malformed' };
   const scope = approvalScope === undefined ? undefined : parseReleaseShipScope(approvalScope);
   if (approvalScope !== undefined && !scope) return { error: 'approvalScope is malformed' };
-  const canonical = scope ? canonicalReleaseChoice(scope) : undefined;
+  if (decision !== undefined && !scope) return { error: 'decision belongs only on an approvalScope release card' };
+  const brief = decision === undefined ? undefined : parseReleaseDecision(decision);
+  if (typeof brief === 'string') return { error: brief };
+  if (scope && !brief) {
+    if (decisionRequired()) {
+      return { error: 'a release card needs decision {question, ifItShips, evidence}' };
+    }
+    log.warn('request_choice: release card posted without a decision', {
+      choiceId,
+      repository: scope.repository,
+      pullRequest: scope.pullRequest,
+    });
+  }
+  const canonical = scope ? canonicalReleaseChoice(scope, brief) : undefined;
+  const cardText = canonical ? `**${canonical.title}**\n\n${canonical.question}`.length : 0;
+  if (cardText > MAX_RELEASE_CARD_TEXT) {
+    return { error: `decision is too long for one card: shorten it by ${cardText - MAX_RELEASE_CARD_TEXT} characters` };
+  }
   const genericTitle = typeof title === 'string' && title.trim() ? title : undefined;
   const genericQuestion = typeof question === 'string' && question.trim() ? question : undefined;
   if (!canonical && !genericTitle) return { error: 'title is required' };
@@ -113,10 +150,69 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
   };
 }
 
-function canonicalReleaseChoice(scope: ReleaseShipScope): Pick<ChoiceRequest, 'title' | 'question' | 'options'> {
+function decisionRequired(): boolean {
+  return readEnvFile([DECISION_REQUIRED_KEY])[DECISION_REQUIRED_KEY] === '1';
+}
+
+function parseReleaseDecision(value: unknown): ReleaseDecision | string {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    return 'decision must be {question, ifItShips, evidence}';
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((k) => !DECISION_KEYS.includes(k)))
+    return 'decision takes only question, ifItShips, evidence';
+  const [question, ifItShips, evidence] = DECISION_KEYS.map((k) =>
+    typeof record[k] === 'string' ? record[k].normalize('NFKC') : undefined,
+  );
+  if (question === undefined || !VISIBLE_RE.test(question)) return 'decision.question is required';
+  if (ifItShips === undefined || !VISIBLE_RE.test(ifItShips)) return 'decision.ifItShips is required';
+  if (evidence === undefined || !evidence) return 'decision.evidence is required';
+  if (question.length > MAX_DECISION_QUESTION) return `decision.question is over ${MAX_DECISION_QUESTION} characters`;
+  if (ifItShips.length > MAX_DECISION_IF_IT_SHIPS) {
+    return `decision.ifItShips is over ${MAX_DECISION_IF_IT_SHIPS} characters`;
+  }
+  if (evidence.length > MAX_DECISION_EVIDENCE) return `decision.evidence is over ${MAX_DECISION_EVIDENCE} characters`;
+  const lines = ifItShips
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length > MAX_DECISION_LINES) return `decision.ifItShips has over ${MAX_DECISION_LINES} lines`;
+  const text = [question, ...lines, evidence];
+  if (!text.every(isDisplaySafe)) {
+    return 'decision text must be plain text: ASCII, accented Latin letters, and ‘ ’ “ ” – — • … → £ € °';
+  }
+  if (text.some((t) => HEX_RUN_RE.test(t))) return 'decision text must not hold a commit SHA: the host pins the head';
+  if (text.some((t) => t.includes(']('))) return 'decision text must not hold markdown links: put the link in evidence';
+  if (text.some((t) => t.includes('||'))) return 'decision text must not hold || (Discord hides text between bars)';
+  if (!EVIDENCE_RE.test(evidence) || !URL.canParse(evidence)) return 'decision.evidence must be one https link';
+  return { question: neutralize(question.trim()), ifItShips: lines.map(neutralize), evidence };
+}
+
+function isDisplaySafe(normalized: string): boolean {
+  return DISPLAY_SAFE_RE.test(normalized);
+}
+
+function neutralize(text: string): string {
+  return text.replace(/</g, '‹').replace(/>/g, '›').replace(/~/g, '∼');
+}
+
+function canonicalReleaseChoice(
+  scope: ReleaseShipScope,
+  brief?: ReleaseDecision,
+): Pick<ChoiceRequest, 'title' | 'question' | 'options'> {
+  const pin = `Ship ${scope.repository}#${scope.pullRequest} from ${scope.base} at ${scope.headSha}?`;
   return {
     title: `Release approval: ${scope.repository}#${scope.pullRequest}`,
-    question: `Ship ${scope.repository}#${scope.pullRequest} from ${scope.base} at ${scope.headSha}?`,
+    question: brief
+      ? [
+          'The requesting agent’s brief (its words, not checked by the host):',
+          `The question: ${brief.question}`,
+          'If it ships:',
+          ...brief.ifItShips.map((line) => `• ${line}`),
+          `Evidence: ${brief.evidence}`,
+          '',
+          pin,
+        ].join('\n')
+      : pin,
     options: [
       { label: 'Ship', value: 'ship', style: 'primary' },
       { label: 'Hold', value: 'hold', style: 'danger' },
