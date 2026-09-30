@@ -35,13 +35,14 @@ sandbox without `allow-same-origin`, plus `default-src 'none'`:
   `try`/`catch`, or keep state in the URL hash.
 - Links open normally; `target="_blank"` works.
 
-What the sandbox protects is the dashboard: a page cannot read the viewer's cookie,
-call the dashboard API as the viewer, or read another page. It does **not** stop egress
-by navigation. CSP governs resource loads, not navigations, so a page can still send the
-tab (script `location`, a meta refresh, a link) to another site with its own content in
-the URL. That content is only what the page's author wrote into it, and the author could
-already send it elsewhere. The reports route adds no path to data the author did not
-have, but it cannot vouch that a page keeps its own content in.
+What the sandbox protects is the dashboard: a page cannot read the viewer's dashboard
+cookie, call the dashboard API as the viewer, or read another page. It is **not** an
+egress control. CSP governs resource loads, not navigations, so a page can still send the
+tab elsewhere (script `location`, a meta refresh, a link), and the destination URL can
+carry anything the page's script can see: its own content, anything the viewer types
+into it, its own URL, and the incoming `document.referrer` (the response's
+`Referrer-Policy` does not clear that). Publishing a page therefore trusts its author
+with what a viewer brings to it. Never type a secret into a report page.
 
 Files are read on each request (8 MiB cap) with `Cache-Control: private, no-store`, so an
 agent republishes by replacing the file; write to a dot-named temp file, then rename.
