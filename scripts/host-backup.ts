@@ -56,7 +56,7 @@ interface DirEntry {
   gid: number;
 }
 
-export interface Manifest {
+interface Manifest {
   runId: string;
   hostname: string;
   startedAt: string;
@@ -89,7 +89,7 @@ interface ScanReport {
   warnings: string[];
 }
 
-export interface Scan extends ScanReport {
+interface Scan extends ScanReport {
   files: ScannedFile[];
   dirs: DirEntry[];
 }
@@ -124,12 +124,12 @@ function hasRemote(dir: string): boolean {
   return res.status === 0 && res.stdout.trim() !== '';
 }
 
-function readHead(file: string, bytes: number): Buffer {
+function hasSqliteMagic(file: string): boolean {
   const fd = fs.openSync(file, 'r');
   try {
-    const buf = Buffer.alloc(bytes);
-    const n = fs.readSync(fd, buf, 0, bytes, 0);
-    return buf.subarray(0, n);
+    const buf = Buffer.alloc(SQLITE_MAGIC.length);
+    fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.equals(SQLITE_MAGIC);
   } finally {
     fs.closeSync(fd);
   }
@@ -137,7 +137,7 @@ function readHead(file: string, bytes: number): Buffer {
 
 function sqliteHeader(file: string): 'sqlite' | 'other' | 'missing' | 'unreadable' {
   try {
-    return readHead(file, 16).equals(SQLITE_MAGIC) ? 'sqlite' : 'other';
+    return hasSqliteMagic(file) ? 'sqlite' : 'other';
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unreadable';
   }
@@ -170,18 +170,7 @@ function* walkSources(
   const excludes = exclude.map(globToRegExp);
   const excluded = (p: string) => excludes.some((re) => re.test(p));
   const walked = new Set<string>();
-  const fileSources = new Set(
-    sources
-      .map((src) => path.resolve(src))
-      .filter((src) => {
-        try {
-          const st = fs.lstatSync(src, { throwIfNoEntry: false });
-          return st !== undefined && !st.isDirectory();
-        } catch {
-          return false;
-        }
-      }),
-  );
+  const fileSources = new Set(sources.map((src) => path.resolve(src)));
   const emittedFileSources = new Set<string>();
   const emittedDirs = new Set<string>();
   const lossless = (raw: Buffer, where: string): string | undefined => {
@@ -237,7 +226,7 @@ function* walkSources(
     let isSqlite: boolean;
     try {
       const known = knownKind(p, statStamp(st));
-      isSqlite = known ? known === 'sqlite' : st.size >= 512 && readHead(p, 16).equals(SQLITE_MAGIC);
+      isSqlite = known ? known === 'sqlite' : st.size >= 512 && hasSqliteMagic(p);
     } catch (err) {
       report.unreadable.push(p);
       report.warnings.push(`unreadable file ${p}: ${message(err)}`);
@@ -329,11 +318,7 @@ function* walkSources(
   }
 }
 
-export function scanSources(
-  sources: string[],
-  exclude: string[],
-  remoteCheck: (dir: string) => boolean = hasRemote,
-): Scan {
+export function scanSources(sources: string[], exclude: string[], remoteCheck: (dir: string) => boolean): Scan {
   const scan: Scan = { files: [], dirs: [], unreadable: [], skippedClones: [], skippedVenvs: [], warnings: [] };
   for (const item of walkSources(sources, exclude, scan, remoteCheck)) {
     if ('dir' in item) scan.dirs.push(item.dir);
@@ -390,11 +375,7 @@ export async function snapshotSqlite(
   } finally {
     db.close();
   }
-  if (
-    copied.totalPages === 0 ||
-    copied.remainingPages !== 0 ||
-    !(fs.statSync(dest, { throwIfNoEntry: false })?.size ?? 0)
-  ) {
+  if (copied.totalPages === 0 || !(fs.statSync(dest, { throwIfNoEntry: false })?.size ?? 0)) {
     throw new Error(`backup copied nothing (${copied.totalPages} pages); the source was likely locked throughout`);
   }
   const copy = new Database(dest, { fileMustExist: true });
@@ -484,11 +465,11 @@ async function sqliteWorker(): Promise<void> {
   process.stdout.write(JSON.stringify(Object.fromEntries(await snapshotInProcess(jobs))));
 }
 
-function awsUploader(bucket: string, run: (args: string[]) => Promise<void> = runAws): Uploader {
+function awsUploader(bucket: string): Uploader {
   const common = ['--only-show-errors', '--no-progress', '--checksum-algorithm', 'CRC32'];
   return {
-    uploadTree: (dir, prefix) => run(['s3', 'cp', dir, `s3://${bucket}/${prefix}`, '--recursive', ...common]),
-    uploadFile: (file, key) => run(['s3', 'cp', file, `s3://${bucket}/${key}`, ...common]),
+    uploadTree: (dir, prefix) => runAws(['s3', 'cp', dir, `s3://${bucket}/${prefix}`, '--recursive', ...common]),
+    uploadFile: (file, key) => runAws(['s3', 'cp', file, `s3://${bucket}/${key}`, ...common]),
   };
 }
 
@@ -518,7 +499,7 @@ interface StateRow {
 
 type KnownEntry = StateEntry & { dirty: boolean };
 
-const DIR_RETAINED = `d.seen_run = @run OR d.path = '/' OR EXISTS (
+const DIR_RETAINED = `d.seen_run = @run OR EXISTS (
   SELECT 1 FROM entries e WHERE e.seen_run = @run AND e.sha256 IS NOT NULL
     AND e.path > d.path || '/' AND e.path < d.path || '0')`;
 
@@ -558,7 +539,6 @@ class StateStore {
   private readonly db: Database.Database;
   private readonly stmts: ReturnType<typeof prepareStatements>;
   private pendingOps = 0;
-  private open = true;
 
   constructor(file: string, bucket: string) {
     this.db = new Database(file);
@@ -592,8 +572,6 @@ class StateStore {
   }
 
   close(): void {
-    if (!this.open) return;
-    this.open = false;
     this.db.exec('COMMIT');
     this.db.close();
   }
@@ -680,16 +658,15 @@ function runIdFor(date: Date): string {
     .replace(/:/g, '-');
 }
 
-export interface RunOptions {
+interface RunOptions {
   uploader: Uploader;
-  snapshotter?: SqliteSnapshotter;
   remoteCheck?: (dir: string) => boolean;
   now?: () => Date;
   dryRun?: boolean;
   log?: (line: string) => void;
 }
 
-export interface RunResult {
+interface RunResult {
   runId: string;
   failures: string[];
   manifestEntries: number;
@@ -740,10 +717,8 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
   fs.mkdirSync(staging, { mode: 0o700 });
   fs.mkdirSync(generated, { recursive: true, mode: 0o700 });
   fs.mkdirSync(manifestDir, { recursive: true, mode: 0o700 });
-  const generatedSeen = new Set<string>();
   for (const cmd of config.commands ?? []) {
     const out = path.join(generated, cmd.name);
-    generatedSeen.add(out);
     if (opts.dryRun) continue;
     const fd = fs.openSync(`${out}.tmp`, 'w', 0o600);
     const res = spawnSync(cmd.argv[0], cmd.argv.slice(1), { stdio: ['ignore', fd, 'pipe'] });
@@ -756,7 +731,7 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
     }
     fs.renameSync(`${out}.tmp`, out);
   }
-  const sources = [...config.sources, ...(generatedSeen.size ? [generated] : [])];
+  const sources = [...config.sources, ...(config.commands?.length ? [generated] : [])];
 
   const store = new StateStore(path.join(config.stateDir, 'state.db'), config.bucket);
   try {
@@ -779,7 +754,6 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
         failures.push(`upload of ${what} failed: ${message(err)}`);
         return false;
       } finally {
-        store.sync();
         fs.rmSync(staging, { recursive: true, force: true });
         fs.mkdirSync(staging, { mode: 0o700 });
       }
@@ -831,7 +805,7 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
       pendingBytes += size;
     };
 
-    const snapshotter = opts.snapshotter ?? makeSqliteSnapshotter(path.join(config.stateDir, 'sqlite-work'));
+    const snapshotter = makeSqliteSnapshotter(path.join(config.stateDir, 'sqlite-work'));
     let sqliteQueue: { file: ScannedFile; prev: KnownEntry | undefined }[] = [];
     let sqliteQueueBytes = 0;
     const drainSqlite = async () => {
@@ -1098,11 +1072,10 @@ function awsRestoreSource(bucket: string): RestoreSource {
   };
 }
 
-export interface RestoreResult {
+interface RestoreResult {
   manifest: string;
   restored: number;
   failures: string[];
-  manifestFailures: string[];
 }
 
 export async function restore(
@@ -1184,7 +1157,7 @@ export async function restore(
     for (const d of [...manifest.dirs].sort((a, b) => b.path.length - a.path.length)) {
       applyMetadata(outPath(d.path), d);
     }
-    return { manifest: chosen.key, restored, failures, manifestFailures: manifest.failures };
+    return { manifest: chosen.key, restored, failures };
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

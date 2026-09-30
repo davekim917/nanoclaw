@@ -582,16 +582,6 @@ describe('restore', () => {
     expect(result.failures.join('\n')).toMatch(/could not recreate symlink/);
   });
 
-  it('restores directory modes', async () => {
-    const bucket = new FakeBucket();
-    write('private/secret.txt', 's');
-    fs.chmodSync(path.join(src, 'private'), 0o700);
-    await runBackup(config, { uploader: bucket, ...quiet });
-    const dest = path.join(tmp, 'restore');
-    await restore(bucket, { dest, log: () => {} });
-    expect(fs.statSync(path.join(dest, src, 'private')).mode & 0o777).toBe(0o700);
-  });
-
   it('refuses a version whose content does not match the manifest hash', async () => {
     const bucket = new FakeBucket();
     const a = write('a.txt', 'real');

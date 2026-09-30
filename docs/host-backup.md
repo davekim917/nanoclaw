@@ -101,7 +101,7 @@ remove one.
    as a breach.
 
 A failed run exits 1, and `OnFailure=` sends the owner a DM with the run's last line, which
-names the first failure. A timer that stops firing is caught by the sentinel's `WATCHED_TIMERS`.
+names the first failure.
 
 ## Restore
 
