@@ -856,12 +856,21 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
       return result;
     }
     if (gone.length > 0) {
-      const empties = gone.filter((g) => g.kind !== 'symlink').map((g) => g.path);
-      for (const p of empties) {
-        fs.mkdirSync(path.dirname(stagedPath(p)), { recursive: true });
-        fs.writeFileSync(stagedPath(p), '');
-      }
-      const all = gone.map((g) => g.path);
+      const empties = gone
+        .filter((g) => g.kind !== 'symlink')
+        .map((g) => g.path)
+        .filter((p) => {
+          try {
+            fs.mkdirSync(path.dirname(stagedPath(p)), { recursive: true });
+            fs.writeFileSync(stagedPath(p), '');
+            return true;
+          } catch (err) {
+            failures.push(`could not stage the tombstone for ${p}: ${message(err)}`);
+            return false;
+          }
+        });
+      const staged = new Set(empties);
+      const all = gone.filter((g) => g.kind === 'symlink' || staged.has(g.path)).map((g) => g.path);
       if (empties.length === 0) store.remove(all);
       else await commit(empties, `${empties.length} tombstones`, () => store.remove(all));
     }
