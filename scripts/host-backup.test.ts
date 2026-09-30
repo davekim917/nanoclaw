@@ -233,6 +233,16 @@ describe('scanSources', () => {
     expect(scan.unreadable).toHaveLength(1);
   });
 
+  it('emits a file once when it is also listed as its own source, in either order', () => {
+    const f = write('dir/a.txt', 'a');
+    for (const sources of [
+      [src, f],
+      [f, src],
+    ]) {
+      expect(scanSources(sources, [], () => false).files.map((x) => x.path)).toEqual([f]);
+    }
+  });
+
   it('reports a missing source as unreadable', () => {
     const scan = scanSources([path.join(tmp, 'nope')], [], () => false);
     expect(scan.unreadable).toEqual([path.join(tmp, 'nope')]);

@@ -170,7 +170,19 @@ function* walkSources(
   const excludes = exclude.map(globToRegExp);
   const excluded = (p: string) => excludes.some((re) => re.test(p));
   const walked = new Set<string>();
-  const fileRoots = new Set<string>();
+  const fileSources = new Set(
+    sources
+      .map((src) => path.resolve(src))
+      .filter((src) => {
+        try {
+          const st = fs.lstatSync(src, { throwIfNoEntry: false });
+          return st !== undefined && !st.isDirectory();
+        } catch {
+          return false;
+        }
+      }),
+  );
+  const emittedFileSources = new Set<string>();
   const emittedDirs = new Set<string>();
   const lossless = (raw: Buffer, where: string): string | undefined => {
     const text = raw.toString('utf8');
@@ -192,6 +204,10 @@ function* walkSources(
   };
 
   const visitFile = (p: string, st: fs.Stats, siblings: Set<string>): ScannedFile | undefined => {
+    if (fileSources.has(p)) {
+      if (emittedFileSources.has(p)) return undefined;
+      emittedFileSources.add(p);
+    }
     if (Buffer.byteLength(p) > MAX_KEY_PATH_BYTES || /[\p{Cc}\\]/u.test(p)) {
       report.unreadable.push(p);
       report.warnings.push(
@@ -306,8 +322,7 @@ function* walkSources(
       report.unreadable.push(root);
       report.warnings.push(`source missing: ${root}`);
     } else if (st.isDirectory()) yield* visitDir(root, true);
-    else if (!fileRoots.has(root)) {
-      fileRoots.add(root);
+    else {
       const file = visitFile(root, st, siblings);
       if (file) yield { file };
     }
