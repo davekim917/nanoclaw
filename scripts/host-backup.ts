@@ -41,6 +41,8 @@ export function applyGates(config: BackupConfig): BackupConfig {
     merged.exclude.push(...(gate.exclude ?? []));
     merged.commands.push(...(gate.commands ?? []));
   }
+  const bad = merged.commands.find((cmd) => cmd.name !== path.basename(cmd.name) || /^\.*$/.test(cmd.name));
+  if (bad) throw new Error(`command name ${JSON.stringify(bad.name)} must be a plain file name`);
   return merged;
 }
 

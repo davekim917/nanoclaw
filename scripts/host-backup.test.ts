@@ -469,6 +469,12 @@ describe('runBackup', () => {
     expect(bucket.current(keyOf(gone))?.length).toBe(0);
   });
 
+  it('rejects a command name that is not a plain file name', () => {
+    for (const name of ['./dump.sql', 'sub/dump.sql', '..', '']) {
+      expect(() => applyGates({ ...config, commands: [{ name, argv: ['true'] }] })).toThrow(/plain file name/);
+    }
+  });
+
   it('dry-runs cleanly before a command has ever run and leaves stale outputs alone', async () => {
     const stale = path.join(config.stateDir, 'generated', 'old.sql');
     fs.mkdirSync(path.dirname(stale), { recursive: true });
