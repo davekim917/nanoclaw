@@ -1,0 +1,28 @@
+[Unit]
+Description=NanoClaw nightly off-host backup to S3
+# Uploads what changed since the last run to the backup bucket and writes that
+# night's manifest (scripts/host-backup.ts; runbook: docs/host-backup.md). The
+# bucket, region, sources and exclusions live in /etc/nanoclaw-backup/config.json;
+# the put-only writer key in /etc/nanoclaw-backup/credentials (root, 0600).
+#
+# Root, because the writer key and some sources are root-only. SQLite copies run
+# in a child under each database's owner, never as root.
+#
+# Reference copy — tracked, not installed. The deployer installs and enables it.
+OnFailure=nanoclaw-unit-alert@%n.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/nanoclaw-backup/credentials
+Environment=AWS_CONFIG_FILE=/etc/nanoclaw-backup/aws-config
+ExecStart=/usr/bin/flock --nonblock /run/nanoclaw-host-backup.lock /home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/host-backup.ts run
+IOSchedulingClass=idle
+Nice=10
+# Ends before storage-gc's 09:00 UTC start. A run cut short resumes where it
+# stopped: state is saved after every uploaded batch.
+TimeoutStartSec=3h
