@@ -1052,6 +1052,51 @@ describe('chat budget from task content', () => {
   });
 });
 
+describe('a system one-turn pin applies only when every trigger in the batch carries it', () => {
+  const light = { turnModel: 'sonnet', turnEffort: 'medium' };
+  const run = () => {
+    const messages = getPendingMessages();
+    return applyFlagBatch(messages, extractRouting(messages), 'claude');
+  };
+
+  it('applies when the batch is only pinned rows', () => {
+    insertMessage('s1', 'chat', { sender: 'system', senderId: 'system', text: 'light email', flagIntent: light });
+    insertMessage('s2', 'chat', { sender: 'system', senderId: 'system', text: 'another', flagIntent: light });
+    expect(run()).toMatchObject({ model: 'sonnet', effort: 'medium' });
+  });
+
+  it.each([
+    ['an unpinned engineering email', { sender: 'system', senderId: 'system', text: 'bug report' }],
+    ['a human reply', { sender: 'Jane', text: 'any update?' }],
+    ['a wait wake', { sender: 'system', senderId: 'system', text: '[system] do the engineering' }],
+    [
+      'a row with a different pin',
+      { sender: 'system', senderId: 'system', text: 'x', flagIntent: { turnModel: 'opus', turnEffort: 'high' } },
+    ],
+  ])('falls back to the default when batched with %s', (_label, other) => {
+    insertMessage('s1', 'chat', { sender: 'system', senderId: 'system', text: 'light email', flagIntent: light });
+    insertMessage('s2', 'chat', other);
+    expect(run()).toMatchObject({ model: undefined, effort: undefined });
+  });
+
+  it('ignores context rows that do not trigger a turn', () => {
+    insertMessage('s1', 'chat', { sender: 'system', senderId: 'system', text: 'light email', flagIntent: light });
+    insertMessage('c1', 'chat', { sender: 'Jane', text: 'earlier context' }, { trigger: 0 });
+    expect(run()).toMatchObject({ model: 'sonnet', effort: 'medium' });
+  });
+
+  it("still applies a human's typed one-turn flag to the whole batch", () => {
+    insertMessage('h1', 'chat', {
+      sender: 'Jane',
+      text: 'fix it',
+      flagIntent: { turnModel: 'opus' },
+      flagAck: '⚙️ opus',
+    });
+    insertMessage('h2', 'chat', { sender: 'Jane', text: 'and this too' });
+    expect(run()).toMatchObject({ model: 'opus' });
+  });
+});
+
 describe('fast-mode flag application', () => {
   it('persists sticky Codex on/off and honors one-turn precedence', () => {
     insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi', flagIntent: { stickyFast: true } });

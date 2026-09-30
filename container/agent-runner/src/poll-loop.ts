@@ -2924,6 +2924,22 @@ export function applyChatBudget(messages: MessageInRow[]): void {
   setChatLimit(limit);
 }
 
+function everyTriggerShares(
+  messages: MessageInRow[],
+  pin: FlagIntent,
+  options: { ignoreTaskFlagIntents?: boolean },
+): boolean {
+  return messages.filter(isAdmissibleTrigger).every((m) => {
+    if (options.ignoreTaskFlagIntents && m.kind === 'task') return false;
+    try {
+      const fi = (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent;
+      return fi?.turnModel === pin.turnModel && fi?.turnEffort === pin.turnEffort;
+    } catch {
+      return false;
+    }
+  });
+}
+
 export function applyFlagBatch(
   messages: MessageInRow[],
   _routing: RoutingContext,
@@ -2942,6 +2958,7 @@ export function applyFlagBatch(
   ignoredModelWasExplicit?: boolean;
 } {
   let intent: FlagIntent | undefined;
+  let intentTyped = false;
   for (const m of messages) {
     // Task rows carry per-fire flagIntent pins too.
     if (m.kind !== 'chat' && m.kind !== 'chat-sdk' && m.kind !== 'task') continue;
@@ -2949,9 +2966,10 @@ export function applyFlagBatch(
     // own config picks the model.
     if (options.ignoreTaskFlagIntents && m.kind === 'task') continue;
     try {
-      const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntent };
+      const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntent; flagAck?: unknown };
       if (parsed.flagIntent) {
         intent = parsed.flagIntent;
+        intentTyped = typeof parsed.flagAck === 'string';
         break;
       }
     } catch {
@@ -2984,7 +3002,8 @@ export function applyFlagBatch(
     }
   }
 
-  const requestedModel = intent?.turnModel ?? getStickyModel();
+  const turn = intent && (intentTyped || everyTriggerShares(messages, intent, options)) ? intent : undefined;
+  const requestedModel = turn?.turnModel ?? getStickyModel();
   // Pins are validated against the PRIMARY provider and stickies persist, so
   // under a fallback a pin can name the other provider's model. Ignore it for
   // this provider only; the sticky stays, and `ignoredModel` says so once.
@@ -2993,14 +3012,14 @@ export function applyFlagBatch(
   const ignoredModel = model === requestedModel ? undefined : requestedModel;
   // Explicit only when this batch carried a `-m`; the stored sticky is not a fresh request.
   const ignoredModelWasExplicit =
-    ignoredModel !== undefined && (intent?.turnModel !== undefined || intent?.stickyModel !== undefined);
+    ignoredModel !== undefined && (turn?.turnModel !== undefined || intent?.stickyModel !== undefined);
   // Effort here is USER INTENT ONLY: defaults belong to each provider, since
   // only it knows the final model.
-  const effort = intent?.turnEffort ?? getStickyEffort();
-  const ultracode = intent?.turnUltracode ?? getStickyUltracode() ?? false;
+  const effort = turn?.turnEffort ?? getStickyEffort();
+  const ultracode = turn?.turnUltracode ?? getStickyUltracode() ?? false;
   // Preserve a Codex sticky across provider migrations, but never let it
   // perturb a Claude/OpenCode query or trigger a false mid-turn restart there.
-  const fast = providerName === 'codex' ? (intent?.turnFast ?? getStickyFast() ?? false) : false;
+  const fast = providerName === 'codex' ? (turn?.turnFast ?? getStickyFast() ?? false) : false;
 
   return {
     model,
