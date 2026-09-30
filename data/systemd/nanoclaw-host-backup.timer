@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly NanoClaw off-host backup at 05:30 UTC (quiet hours)
+
+[Timer]
+OnCalendar=*-*-* 05:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

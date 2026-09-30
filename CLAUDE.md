@@ -119,7 +119,7 @@ Beyond correctness, a reviewer checks:
 - **Comments that narrate or restate the code, or carry history/backstory** — a new comment must say what code can't check; a constraint it states belongs in a test, type, assert or lint rule instead.
 
 Dead code, copy-paste clones, `file:line` citations and PR-number history in comments are flagged in CI by `scripts/hygiene/run.ts`; exemptions live only in `knip.json`, `container/agent-runner/knip.json` and `.jscpd.json`, which are `risk:high`, apart from two derived sets it skips: files still byte-identical to upstream (`src/upstream-ratchet.json`) and the vendored design-review engine.
-The same run fails a change that adds comment-only lines on net in the non-test TS/JS files it changes, measured from its merge base with `origin/main`.
+The same run reports, without failing, the comment-only lines a change adds on net in the non-test TS/JS files it changes, measured from its merge base with `origin/main`; the reviewer judges each one.
 
 ## Development
 
