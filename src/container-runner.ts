@@ -3192,6 +3192,8 @@ const SCOPED_CREDENTIAL_VARS = [
   'SUPABASE_PROJECT_REF',
   'SUPABASE_ACCESS_TOKEN',
   'SUPABASE_DB_PASSWORD',
+  'CLOUDFLARE_API_TOKEN',
+  'CLOUDFLARE_ACCOUNT_ID',
   // Env vars outrank the git_commit tool's `git -c user.name=` overrides, so these attribute commits to the human.
   'GIT_AUTHOR_NAME',
   'GIT_AUTHOR_EMAIL',

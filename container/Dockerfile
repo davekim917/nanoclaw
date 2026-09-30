@@ -407,6 +407,16 @@ RUN mkdir -p /opt/remotion/public/shots /opt/remotion/public/clips /opt/remotion
     chmod 0755 /opt/remotion/new-video.sh && \
     ln -sf /opt/remotion/new-video.sh /usr/local/bin/new-video
 
+# Cloudflare CLI. Upstream publishes only betas so far, so update-sources.json
+# opts this pin into npm's `latest` tag even when it is a prerelease. workerd's
+# blocked postinstall only costs `cf dev` / `--local`; API commands and deploys
+# don't need it. Auth: CLOUDFLARE_API_TOKEN placeholder, swapped by OneCLI.
+# Telemetry is on by default and ships `cf cli search` query text to Cloudflare.
+ARG CF_CLI_VERSION=1.0.0-beta.6
+ENV CF_SEND_TELEMETRY=false
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "cf@${CF_CLI_VERSION}"
+
 # Login shells reset PATH on Debian and can drop Docker ENV-provided /pnpm,
 # which makes globally installed CLIs invisible to Codex/OpenCode shell tools.
 # Expose pnpm shims through /usr/local/bin as a belt-and-suspenders fallback.

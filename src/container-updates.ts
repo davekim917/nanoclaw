@@ -234,7 +234,7 @@ interface DockerUpdateSource {
   name: string;
   arg: string;
   source:
-    | { kind: 'npm'; package: string }
+    | { kind: 'npm'; package: string; allowPrerelease?: boolean }
     | { kind: 'pypi'; package: string }
     | { kind: 'github'; repo: string }
     | { kind: 'github-tags'; repo: string };
@@ -296,12 +296,44 @@ function compareVersions(left: string, right: string): number {
     const delta = (a[index] ?? 0) - (b[index] ?? 0);
     if (delta !== 0) return delta;
   }
+  return comparePrereleases(prereleaseIdentifiers(left), prereleaseIdentifiers(right));
+}
+
+function prereleaseIdentifiers(value: string): string[] | null {
+  const match = value.trim().match(/^v?\d+\.\d+\.\d+-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)$/);
+  return match ? match[1].split('.') : null;
+}
+
+function comparePrereleases(left: string[] | null, right: string[] | null): number {
+  if (!left || !right) return left ? -1 : right ? 1 : 0;
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (a === undefined) return -1;
+    if (b === undefined) return 1;
+    const aNumeric = /^\d+$/.test(a);
+    const bNumeric = /^\d+$/.test(b);
+    if (aNumeric && bNumeric) {
+      const delta = Number(a) - Number(b);
+      if (delta !== 0) return delta;
+    } else if (aNumeric !== bNumeric) {
+      return aNumeric ? -1 : 1;
+    } else if (a !== b) {
+      return a < b ? -1 : 1;
+    }
+  }
   return 0;
 }
 
-export function latestStableNpmVersion(metadata: unknown): ReleaseResolution {
+export function latestStableNpmVersion(
+  metadata: unknown,
+  options: { allowPrerelease?: boolean } = {},
+): ReleaseResolution {
   const latest = (metadata as { 'dist-tags'?: { latest?: unknown } })?.['dist-tags']?.latest;
   if (typeof latest !== 'string') return { status: 'blocked', reason: 'npm metadata has no latest tag' };
+  if (options.allowPrerelease && prereleaseIdentifiers(latest)) {
+    return { status: 'resolved', version: latest.trim().replace(/^v/, '') };
+  }
   if (!isStableVersion(latest)) {
     return { status: 'blocked', reason: `npm latest tag is not a stable release: ${latest}` };
   }
@@ -414,7 +446,9 @@ function itemFromResolution(
 
 async function resolveSource(source: DockerUpdateSource['source'], fetchJson: JsonFetcher): Promise<ReleaseResolution> {
   if (source.kind === 'npm') {
-    return latestStableNpmVersion(await fetchJson(`https://registry.npmjs.org/${encodeURIComponent(source.package)}`));
+    return latestStableNpmVersion(await fetchJson(`https://registry.npmjs.org/${encodeURIComponent(source.package)}`), {
+      allowPrerelease: source.allowPrerelease,
+    });
   }
   if (source.kind === 'pypi') {
     return latestStablePyPiVersion(await fetchJson(`https://pypi.org/pypi/${encodeURIComponent(source.package)}/json`));
