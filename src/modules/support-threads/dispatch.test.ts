@@ -167,7 +167,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(seeded[0].content).toContain('operator-configured policy');
     expect(seeded[0].content).toContain('team EXAMPLE');
     expect(seeded[0].content).toContain('update_support_ticket');
-    expect(seeded[0].content).toMatch(/search Linear for an OPEN issue[\s\S]*Otherwise: Create the Linear issue/);
+    expect(seeded[0].content).toMatch(/search Linear for an OPEN issue[\s\S]*To create: Create the Linear issue/);
     expect(seeded[0].content).toContain('Subject: Depletions look wrong');
     expect(seeded[0].content).toContain('From: Jane <jane@acme.com>');
     expect(seeded[0].content).toContain('Date: Fri, 17 Jul 2026 16:40:55 -0400');
@@ -237,6 +237,20 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     });
   });
 
+  it('without an operator policy, runs the duplicate check before the default creation step', async () => {
+    delete process.env.NANOCLAW_SUPPORT_TICKET_POLICY_SUPPORT_AGENT;
+    await seed();
+    const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    await handleDispatchSupportIssue(dispatchContent('gthread-D', 'new problem'), poller);
+
+    const seeded = inboundOf((await getSupportThread('gthread-D'))!.session_id!);
+    expect(seeded[0].content).toMatch(
+      /search Linear for an OPEN issue[\s\S]*unsure between several, create a new issue/,
+    );
+    expect(seeded[0].content).toContain('To create: Create the Linear issue in the appropriate team');
+  });
+
   it('with a known ticket (legacy dispatcher), seeds the comment-not-duplicate protocol', async () => {
     await seed();
     const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
@@ -255,6 +269,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     const seeded = inboundOf(row!.session_id!);
     expect(seeded[0].content).toContain('already exists');
     expect(seeded[0].content).toContain('EXAMPLE-123');
+    expect(seeded[0].content).not.toContain('search Linear');
   });
 });
 
@@ -373,6 +388,8 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     expect(msgs[1].content).toContain('Subject: Depletions look wrong');
     expect(msgs[1].content).toContain('Date: Fri, 17 Jul 2026 16:40:55 -0400');
     expect(msgs[1].content).toContain('customer replied');
+    // No ticket recorded yet, so the follow-up carries the duplicate check too.
+    expect(msgs[1].content).toContain('search Linear for an OPEN issue');
   });
 
   it('seeded legacy row (ticket known, no session) reopens AND records the new session', async () => {

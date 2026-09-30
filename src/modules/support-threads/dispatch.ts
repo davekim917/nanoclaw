@@ -62,8 +62,9 @@ async function supportTicketPolicy(agentGroupId: string): Promise<string | null>
 
 const DUPLICATE_CHECK_STEP =
   `Before creating, search Linear for an OPEN issue from the same sender or their organisation about the same problem. ` +
-  `If one exists, do not create a new issue: comment on it with this email's context and call update_support_ticket with that issue's identifier and team. ` +
-  `Otherwise: `;
+  `If exactly one clearly matches, do not create a new issue: comment on it with this email's context and call update_support_ticket with that issue's identifier and team. ` +
+  `If none matches, or you are unsure between several, create a new issue and link the likely related ones in its description. ` +
+  `To create: `;
 
 function ticketCreationStep(policy: string | null): string {
   return DUPLICATE_CHECK_STEP + ticketCreationAction(policy);
