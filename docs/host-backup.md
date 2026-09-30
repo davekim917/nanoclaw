@@ -96,9 +96,9 @@ remove one.
    then `sudo systemctl daemon-reload && sudo systemctl enable --now nanoclaw-host-backup.timer`.
 3. Do the first full upload outside the unit's 3-hour limit. The limit only stops a run; the
    next run carries on from the last uploaded batch.
-4. Once the timer has fired once, add `nanoclaw-host-backup.timer:93600` to the health
-   sentinel's `WATCHED_TIMERS` (26 h). Before the first fire, an empty `LastTriggerUSec` reads
-   as a breach.
+4. Once the timer has fired once, add `nanoclaw-host-backup.timer` to the health sentinel's
+   `WATCHED_TIMERS` with a maximum age of 93600 seconds (26 h); entries are written as unit,
+   colon, seconds. Before the first fire, an empty `LastTriggerUSec` reads as a breach.
 
 A failed run exits 1, and `OnFailure=` sends the owner a DM with the run's last line, which
 names the first failure.
