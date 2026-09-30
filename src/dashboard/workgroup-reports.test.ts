@@ -10,7 +10,7 @@ vi.mock('../config.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('workgroup-reports-test') }));
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, getDb, initMigratedTestDb } from '../db/index.js';
 import { clearCookieVerifier, registerCookieVerifier } from './router.js';
 import { REPORT_CSP, reportGate, workgroupReportHandler } from './workgroup-reports.js';
 
@@ -22,23 +22,27 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function seed(): void {
-  const db = getRawDb();
+async function seed(): Promise<void> {
+  const db = getDb();
   for (const wg of ['wg-a', 'wg-b']) {
-    db.prepare('INSERT INTO workgroups (id, display_name, created_at) VALUES (?, NULL, ?)').run(wg, now());
-    db.prepare(
+    await db.run('INSERT INTO workgroups (id, display_name, created_at) VALUES (?, NULL, ?)', wg, now());
+    await db.run(
       "INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id, created_at) VALUES (?, ?, ?, 'claude', ?, ?)",
-    ).run(`ag-${wg}`, wg, wg, wg, now());
+      `ag-${wg}`,
+      wg,
+      wg,
+      wg,
+      now(),
+    );
   }
   for (const user of ['u-owner', 'u-a', 'u-b']) {
-    db.prepare("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'slack', NULL, ?)").run(user, now());
+    await db.run("INSERT INTO users (id, kind, display_name, created_at) VALUES (?, 'slack', NULL, ?)", user, now());
   }
-  const role = db.prepare(
-    'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
-  );
-  role.run('u-owner', 'owner', null, now());
-  role.run('u-a', 'admin', 'ag-wg-a', now());
-  role.run('u-b', 'admin', 'ag-wg-b', now());
+  const role =
+    'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)';
+  await db.run(role, 'u-owner', 'owner', null, now());
+  await db.run(role, 'u-a', 'admin', 'ag-wg-a', now());
+  await db.run(role, 'u-b', 'admin', 'ag-wg-b', now());
 }
 
 function write(file: string, contents: string | Buffer): void {
@@ -56,9 +60,8 @@ async function get(user: string | null, wg: string, tail: string): Promise<Respo
 
 beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
-  await initTestDb();
-  runMigrations(getRawDb());
-  seed();
+  await initMigratedTestDb();
+  await seed();
   write(path.join(reportsDir('wg-a'), 'rel-1', 'index.html'), '<h1>release</h1>');
   write(path.join(reportsDir('wg-a'), 'rel-1', 'summary.png'), PNG);
   write(path.join(reportsDir('wg-a'), 'rel-1', '.draft.html'), '<h1>unfinished</h1>');
