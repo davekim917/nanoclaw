@@ -40,6 +40,7 @@ import { observatoryAssignHandler } from './assign.js';
 import { observatoryIssueBriefHandler } from './issue-brief.js';
 import { observatoryNudgeHandler } from './nudge.js';
 import { observatorySteerHandler } from './observatory-steer.js';
+import { reportGate, workgroupReportHandler } from './workgroup-reports.js';
 
 // These register their routes and handlers at module load.
 import './auth/exchange.js';
@@ -96,6 +97,7 @@ export function startDashboard(): void {
   register('POST', '/dashboard/api/observatory/nudge', requireAuth(observatoryNudgeHandler));
   register('POST', '/dashboard/api/observatory/steer', requireAuth(observatorySteerHandler));
   register('GET', '/dashboard/api/observatory/issue-brief', requireAuth(observatoryIssueBriefHandler));
+  register('GET', '/dashboard/reports/:id/*tail', reportGate(workgroupReportHandler));
 
   // Routes match by exact segment count, but `/search` and `/:key` share one and `:key` captures anything: `/search`
   // MUST be registered before `/:key`. The static splat stays LAST.
