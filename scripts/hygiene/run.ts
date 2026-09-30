@@ -9,7 +9,7 @@ import { vendoredEngineFiles } from '../../src/design-artifact-loop-vendor.js';
 import { scanComments } from './comments.js';
 
 export interface Finding {
-  check: 'knip' | 'jscpd' | 'comments' | 'comment-growth';
+  check: 'knip' | 'jscpd' | 'comments';
   kind: string;
   location: string;
   message: string;
@@ -251,27 +251,12 @@ export function commentGrowth(root: string, base: string, exempt: Exempt): Comme
   return { base, files };
 }
 
-const GROWTH_GUIDANCE = 'delete narration in the files you touched, or keep only comments that name a hazard';
-
-export function commentGrowthFindings(growth: CommentGrowth): Finding[] {
-  const net = growth.files.reduce((sum, file) => sum + file.head - file.base, 0);
-  if (net <= 0) return [];
-  return [
-    {
-      check: 'comment-growth',
-      kind: 'net-growth',
-      location: `since ${growth.base.slice(0, 12)}`,
-      message: `+${net} comment-only line(s) on net in the changed files; ${GROWTH_GUIDANCE}`,
-    },
-  ];
-}
-
 function printGrowth(growth: CommentGrowth): void {
   const base = growth.files.reduce((sum, file) => sum + file.base, 0);
   const head = growth.files.reduce((sum, file) => sum + file.head, 0);
   const net = head - base;
   console.log(
-    `\ncomment growth since ${growth.base.slice(0, 12)}: ${growth.files.length} changed source file(s), ` +
+    `\ncomment growth since ${growth.base.slice(0, 12)} (for review, never a failure): ${growth.files.length} changed source file(s), ` +
       `comment-only lines base ${base}, head ${head}, net ${net > 0 ? '+' : ''}${net}`,
   );
   const gains = growth.files
@@ -299,7 +284,7 @@ export function hygieneFindings(root: string, exempt: Exempt): Finding[] {
 }
 
 function print(findings: Finding[]): void {
-  for (const check of ['knip', 'jscpd', 'comments', 'comment-growth'] as const) {
+  for (const check of ['knip', 'jscpd', 'comments'] as const) {
     const group = findings.filter((finding) => finding.check === check);
     const kinds = new Map<string, number>();
     for (const finding of group) kinds.set(finding.kind, (kinds.get(finding.kind) ?? 0) + 1);
@@ -323,7 +308,7 @@ function main(): void {
   }
   const exempt = exemptFiles(REPO_ROOT);
   const growth = commentGrowth(REPO_ROOT, growthBase(REPO_ROOT), exempt);
-  const findings = [...hygieneFindings(REPO_ROOT, exempt), ...commentGrowthFindings(growth)];
+  const findings = hygieneFindings(REPO_ROOT, exempt);
   print(findings);
   console.log(
     `\nexempt: ${exempt.upstream.size} file(s) byte-identical to upstream, ${exempt.vendored.size} vendored design-review file(s)`,

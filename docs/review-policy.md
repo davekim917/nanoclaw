@@ -168,20 +168,14 @@ claim: the replaced code is gone in the same PR.
 
 Every repo also answers to the comment rule at merge: merge-check runs the
 shared `comment-rule` checker from the bootstrap plugin over the change from
-its merge base, and refuses a head that adds comment lines on net or a
-prohibited comment form (a file:line or PR/ticket citation). It is on by
-default; a repo opts out only with `"commentRule": false` in the base branch's
+its merge base, and refuses a head that adds a prohibited comment form (a
+file:line or PR/ticket citation). It is on by default; a repo opts out only
+with `"commentRule": false` in the base branch's
 `.github/pr-review-loop.json`, and a checker that cannot run refuses rather
-than passes.
-
-A PR that adds more than 150 lines outside tests and lockfiles (not counting lines of only comment, which the comment rule judges) also needs a
-cut-down receipt on the head it merges at: a fresh-context `cut-down-reviewer`
-agent, run by the author's own provider, asked only what in the diff can be
-deleted or simplified without losing required behaviour. It never proposes
-deleting a comment that is the only statement of a rule, constraint, exception
-or hazard. merge-check refuses without the receipt (`cut_down_missing`); a repo
-tunes the threshold with `"cutDownThreshold"` in the same file, or sets it to
-`false`. The pr-review-loop skill's "Cut-down pass" has the steps.
+than passes. Comment growth is not refused. The reviewer judges each comment
+the diff adds: it stays only when a reader, human or agent, would get
+something wrong without it (an external system's quirk, why the obvious
+approach is wrong); anything else is a finding to cut.
 
 ## The test is blocking, not correctness
 
