@@ -124,6 +124,55 @@ describe('stageDbtProfiles', () => {
     expect(stagedKeys()).toEqual([]);
   });
 
+  it('refuses an inline private_key reached through a YAML merge key from a filtered-out profile', () => {
+    fs.mkdirSync(path.join(home, '.dbt'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.dbt', 'profiles.yml'),
+      [
+        'hidden:',
+        '  outputs:',
+        '    dev: &base',
+        '      type: snowflake',
+        '      private_key: FAKE_INLINE_KEY',
+        'visible:',
+        '  outputs:',
+        '    dev:',
+        '      <<: *base',
+        '      user: u',
+        '',
+      ].join('\n'),
+    );
+
+    expect(stage(['visible'])).toEqual({});
+    expect(fs.readFileSync(path.join(dest, 'profiles.yml'), 'utf-8')).not.toContain('FAKE_INLINE_KEY');
+  });
+
+  it('refuses an inline private_key nested anywhere in a profile or a non-profile entry', () => {
+    writeProfiles({
+      nested: { target: 'dev', outputs: { dev: { type: 'snowflake', extra: [{ private_key: 'FAKE_INLINE_KEY' }] } } },
+      config: { private_key: 'FAKE_INLINE_KEY' },
+      pw: snowflakeProfile({ password: 'x' }),
+    });
+
+    expect(Object.keys(stage(null))).toEqual(['pw']);
+    expect(fs.readFileSync(path.join(dest, 'profiles.yml'), 'utf-8')).not.toContain('FAKE_INLINE_KEY');
+  });
+
+  it('refuses a private_key_path that is a symlink inside home to a file outside it', () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dbt-stage-outside-'));
+    try {
+      fs.writeFileSync(path.join(outside, 'secret'), 'outside');
+      fs.mkdirSync(path.join(home, 'keys'));
+      fs.symlinkSync(path.join(outside, 'secret'), path.join(home, 'keys', 'link.p8'));
+      writeProfiles({ bad: snowflakeProfile({ private_key_path: '~/keys/link.p8' }) });
+
+      expect(stage(null)).toEqual({});
+      expect(stagedKeys()).toEqual([]);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('throws on a profiles.yml that is not a mapping', () => {
     fs.mkdirSync(path.join(home, '.dbt'), { recursive: true });
     fs.writeFileSync(path.join(home, '.dbt', 'profiles.yml'), '- a\n- b\n');
