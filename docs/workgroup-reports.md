@@ -48,4 +48,3 @@ Files are read on each request (8 MiB cap) with `Cache-Control: private, no-stor
 agent republishes by replacing the file; write to a dot-named temp file, then rename.
 
 Client data belongs here and never on a public host: this route is the private surface.
-It serves only the workgroup's own members; it is not an egress control on its authors.
