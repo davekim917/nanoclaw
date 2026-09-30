@@ -101,6 +101,17 @@ export function readContainedFile(
   workgroupId: string,
   maxBytes: number = MAX_FILE_BYTES,
 ): { text: string; mtimeIso: string } | null {
+  const read = readContainedBytes(label, rootDir, relative, workgroupId, maxBytes);
+  return read && { text: read.bytes.toString('utf8'), mtimeIso: read.mtimeIso };
+}
+
+export function readContainedBytes(
+  label: string,
+  rootDir: string,
+  relative: string,
+  workgroupId: string,
+  maxBytes: number = MAX_FILE_BYTES,
+): { bytes: Buffer; mtimeIso: string } | null {
   const target = path.join(rootDir, relative);
   let fd: number;
   try {
@@ -142,7 +153,7 @@ export function readContainedFile(
       if (n === 0) break; // Truncated under us; return what the fd held.
       read += n;
     }
-    return { text: buf.subarray(0, read).toString('utf8'), mtimeIso: new Date(st.mtimeMs).toISOString() };
+    return { bytes: buf.subarray(0, read), mtimeIso: new Date(st.mtimeMs).toISOString() };
   } catch (err) {
     log.warn(`${label}: file unreadable, emitting nothing`, { workgroupId, relative, err });
     return null;
