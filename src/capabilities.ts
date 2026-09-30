@@ -219,6 +219,8 @@ const SCOPED_ENV_NAMES = [
   'SUPABASE_PROJECT_REF',
   'SUPABASE_ACCESS_TOKEN',
   'SUPABASE_DB_PASSWORD',
+  'CLOUDFLARE_API_TOKEN',
+  'CLOUDFLARE_ACCOUNT_ID',
   'LOOKER_BASE_URL',
   'LOOKER_CLIENT_ID',
   'LOOKER_CLIENT_SECRET',
@@ -542,6 +544,26 @@ export function buildSessionServicesSnapshotFrom(
         activation: apiKey.set
           ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''} DO NOT ask the user for the API key — it's already in your env.`
           : `render tool declared but RENDER_API_KEY not set at host — ask Operator.`,
+      });
+    }
+  }
+
+  {
+    const token = resolveScopedEnvVar('CLOUDFLARE_API_TOKEN', folder);
+    if (token.set || declared(['cloudflare'])) {
+      const account = resolveScopedEnvVar('CLOUDFLARE_ACCOUNT_ID', folder);
+      services.push({
+        name: 'Cloudflare',
+        cli: 'cf',
+        declaredTools: declaredMatchingTools(['cloudflare']),
+        scopes: [],
+        credentialPaths: [],
+        summary: token.set
+          ? 'Cloudflare CLI (cf): Workers, Pages, DNS, R2, D1, KV, zones, the whole Cloudflare API'
+          : 'Cloudflare declared but CLOUDFLARE_API_TOKEN is unset on the host — ask the operator',
+        activation: token.set
+          ? `\`cf\` CLI authenticated through the OneCLI gateway (placeholder \`CLOUDFLARE_API_TOKEN\` from host env \`${token.name}\`${account.set ? `, account via \`${account.name}\`` : ''}). Find a command with \`cf cli search "<task>"\`, then \`<command> --help\`; \`--dry-run\` previews any request. Never run \`cf auth login\`, and DO NOT ask the user for a token.`
+          : `cloudflare tool declared but CLOUDFLARE_API_TOKEN not set at host — ask Operator.`,
       });
     }
   }

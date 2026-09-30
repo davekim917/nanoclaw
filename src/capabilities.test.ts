@@ -598,6 +598,8 @@ describe('buildSessionServicesSnapshot', () => {
         'GITHUB_TOKEN',
         'RENDER_API_KEY',
         'RENDER_WORKSPACE_ID',
+        'CLOUDFLARE_API_TOKEN',
+        'CLOUDFLARE_ACCOUNT_ID',
         'DBT_CLOUD_API_TOKEN',
         'DBT_CLOUD_API_URL',
         'DBT_CLOUD_ACCOUNT_ID',
