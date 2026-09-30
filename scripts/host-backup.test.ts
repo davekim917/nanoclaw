@@ -6,6 +6,8 @@ import zlib from 'node:zlib';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { withFileLock } from '../src/file-lock.js';
+
 import {
   globToRegExp,
   readManifest,
@@ -179,6 +181,23 @@ describe('scanSources', () => {
     expect(scan.files.map((f) => path.relative(src, f.path)).sort()).toEqual(['customer', 'customer-journal']);
   });
 
+  it('withholds a sidecar and fails when its database cannot be read', () => {
+    if (process.getuid?.() === 0) return;
+    const dbPath = path.join(src, 'app.db');
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE t (x)');
+    db.close();
+    write('app.db-journal', 'hot journal bytes');
+    fs.chmodSync(dbPath, 0o000);
+    try {
+      const scan = scanSources([src], [], () => false);
+      expect(scan.files.map((f) => path.relative(src, f.path))).toEqual([]);
+      expect(scan.unreadable.sort()).toEqual([dbPath, path.join(src, 'app.db-journal')].sort());
+    } finally {
+      fs.chmodSync(dbPath, 0o644);
+    }
+  });
+
   it('classifies a SQLite file by its header, not its name', () => {
     const db = new Database(path.join(src, 'data.bin'));
     db.exec('CREATE TABLE t (x); INSERT INTO t VALUES (1)');
@@ -295,11 +314,11 @@ describe('runBackup', () => {
     }
   });
 
-  it('refuses to start while another live run holds the lock', async () => {
+  it('refuses to start while another run holds the lock', async () => {
     fs.mkdirSync(config.stateDir, { recursive: true });
-    fs.writeFileSync(path.join(config.stateDir, 'run.lock'), String(process.pid));
-    await expect(runBackup(config, { uploader: new FakeBucket(), ...quiet })).rejects.toThrow(/holds/);
-    fs.writeFileSync(path.join(config.stateDir, 'run.lock'), '999999999');
+    await withFileLock(path.join(config.stateDir, 'run.lock'), async () => {
+      await expect(runBackup(config, { uploader: new FakeBucket(), ...quiet })).rejects.toThrow(/run lock/);
+    });
     const result = await runBackup(config, { uploader: new FakeBucket(), ...quiet });
     expect(result.failures).toEqual([]);
   });
@@ -362,7 +381,7 @@ describe('runBackup', () => {
     const result = await runBackup(config, { uploader: bucket, ...quiet });
     const manifest = await manifestOf(bucket, result.runId);
     expect(manifest.complete).toBe(true);
-    expect(manifest.dirs.map((d) => d.path)).toEqual([src]);
+    expect(manifest.dirs.map((d) => d.path)).toEqual(expect.arrayContaining(['/', path.dirname(src), src]));
     expect(manifest.entries).toEqual([
       expect.objectContaining({
         path: a,
@@ -449,11 +468,28 @@ describe('restore', () => {
     expect(result.restored).toBe(1);
   });
 
-  it('refuses a destination that is not empty', async () => {
+  it('refuses a destination that already exists', async () => {
     const dest = path.join(tmp, 'restore');
     fs.mkdirSync(dest);
-    fs.writeFileSync(path.join(dest, 'x'), '');
-    await expect(restore(new FakeBucket(), { dest, log: () => {} })).rejects.toThrow(/not empty/);
+    await expect(restore(new FakeBucket(), { dest, log: () => {} })).rejects.toThrow(/must not exist/);
+  });
+
+  it('restores the parent directory modes of a single restored file', async () => {
+    const bucket = new FakeBucket();
+    const secret = write('private/secret.txt', 's');
+    fs.chmodSync(path.join(src, 'private'), 0o700);
+    await runBackup(config, { uploader: bucket, ...quiet });
+    const dest = path.join(tmp, 'restore');
+    await restore(bucket, { dest, prefix: secret, log: () => {} });
+    expect(fs.statSync(path.join(dest, src, 'private')).mode & 0o777).toBe(0o700);
+    expect(fs.readFileSync(path.join(dest, secret), 'utf8')).toBe('s');
+  });
+
+  it('refuses to reuse upload state recorded against another bucket', async () => {
+    await runBackup(config, { uploader: new FakeBucket(), ...quiet });
+    await expect(runBackup({ ...config, bucket: 'other' }, { uploader: new FakeBucket(), ...quiet })).rejects.toThrow(
+      /fresh stateDir/,
+    );
   });
 
   it('never writes through a restored symlink', async () => {

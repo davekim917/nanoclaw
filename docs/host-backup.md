@@ -35,8 +35,11 @@ over absolute paths (`**` crosses `/`, `*` and `?` do not). Beyond those globs, 
 Nothing is dropped quietly. A path that cannot be read, or cannot be an S3 key (control
 characters, a backslash, over 1,000 bytes), fails the run and keeps its last uploaded
 version in the manifest. It is never treated as deleted. Rename or exclude such a path to
-clear the failure. Runs take a lock (`<stateDir>/run.lock`), so a manual run and the timer
-cannot overlap, dry runs included.
+clear the failure. A `-journal`/`-wal`/`-shm` file whose database cannot be read fails the run
+too, since uploading a sidecar without its database could later roll a restored copy back.
+Every run, dry runs included, takes an `flock` on `<stateDir>/run.lock` (`src/file-lock.ts`),
+so a manual run and the timer can never overlap. The state DB records the bucket it uploads to
+and refuses any other: point a new bucket at a fresh `stateDir`.
 
 A dry run prints the scan size without uploading:
 `sudo -E node_modules/.bin/tsx scripts/host-backup.ts run --dry-run`.
@@ -114,13 +117,15 @@ AWS_PROFILE=<profile> node_modules/.bin/tsx scripts/host-backup.ts restore \
   --prefix /home/ubuntu/nanoclaw-v2/data/v2.db --dest /tmp/restore
 ```
 
-`--dest` must be empty or absent. Paths keep their absolute layout under it, so the example
+`--dest` must not exist yet. Restore creates it mode 0700, so no other user can plant a link
+inside while the restore runs. Paths keep their absolute layout under it, so the example
 writes `/tmp/restore/home/ubuntu/nanoclaw-v2/data/v2.db`. Restore picks the newest run
 manifest written at or before `--as-of` and prints any failures that night's run recorded. For each file it takes the newest version no later than that manifest,
 checks it against the manifest's sha256, and falls back to an older retained version with the
 right hash. Files come first and symlinks last, so nothing is ever written through a restored
-link. File and directory modes and mtimes are restored, and ownership too when run as root
-(directories are finished last, deepest first). A path with no
+link. File and directory modes and mtimes are restored, and ownership too when run as root.
+That includes every ancestor directory of what `--prefix` selects, so a single restored
+database sits in a directory its owner can write. Directories are finished last, deepest first. A path with no
 matching version is reported and the command exits 1. Check a restored SQLite file with
 `PRAGMA integrity_check`, then stop the host before copying it into place.
 

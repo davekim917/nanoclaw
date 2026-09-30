@@ -10,12 +10,15 @@ import zlib from 'node:zlib';
 
 import Database from 'better-sqlite3';
 
+import { withFileLock } from '../src/file-lock.js';
+
 const DEFAULT_CONFIG_PATH = '/etc/nanoclaw-backup/config.json';
 const SQLITE_MAGIC = Buffer.from('SQLite format 3\0', 'latin1');
 const SQLITE_SIDECARS = ['-journal', '-wal', '-shm'];
 const MAX_KEY_PATH_BYTES = 1000;
 const DEFAULT_BATCH_BYTES = 8 * 1024 ** 3;
 const SQLITE_CHUNK_FILES = 200;
+const BATCH_FILES = 50_000;
 const MANIFEST_KEY = /^manifests\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\.jsonl\.gz$/;
 
 export interface BackupConfig {
@@ -132,11 +135,11 @@ function readHead(file: string, bytes: number): Buffer {
   }
 }
 
-function hasSqliteHeader(file: string): boolean {
+function sqliteHeader(file: string): 'sqlite' | 'other' | 'missing' | 'unreadable' {
   try {
-    return readHead(file, 16).equals(SQLITE_MAGIC);
-  } catch {
-    return false;
+    return readHead(file, 16).equals(SQLITE_MAGIC) ? 'sqlite' : 'other';
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unreadable';
   }
 }
 
@@ -167,6 +170,13 @@ function* walkSources(
   const excludes = exclude.map(globToRegExp);
   const excluded = (p: string) => excludes.some((re) => re.test(p));
   const visited = new Set<string>();
+  const emittedDirs = new Set<string>();
+  const dirItem = (dir: string): ScanItem | undefined => {
+    if (emittedDirs.has(dir)) return undefined;
+    emittedDirs.add(dir);
+    const st = fs.lstatSync(dir, { throwIfNoEntry: false });
+    return st ? { dir: { path: dir, mode: st.mode, uid: st.uid, gid: st.gid } } : undefined;
+  };
 
   const visitFile = (p: string, st: fs.Stats, siblings: Set<string>): ScannedFile | undefined => {
     if (Buffer.byteLength(p) > MAX_KEY_PATH_BYTES || /[\p{Cc}\\]/u.test(p)) {
@@ -183,7 +193,15 @@ function* walkSources(
     const base = path.basename(p);
     const sidecar = SQLITE_SIDECARS.find((s) => base.endsWith(s));
     const owner = sidecar ? path.join(path.dirname(p), base.slice(0, -sidecar.length)) : '';
-    if (sidecar && siblings.has(path.basename(owner)) && hasSqliteHeader(owner)) return undefined;
+    if (sidecar && siblings.has(path.basename(owner))) {
+      const probe = sqliteHeader(owner);
+      if (probe === 'sqlite') return undefined;
+      if (probe === 'unreadable') {
+        report.unreadable.push(p);
+        report.warnings.push(`cannot tell whether ${p} is a SQLite sidecar: ${owner} is unreadable`);
+        return undefined;
+      }
+    }
     let isSqlite: boolean;
     try {
       const known = knownKind(p, statStamp(st));
@@ -221,8 +239,8 @@ function* walkSources(
       report.skippedClones.push(dir);
       return;
     }
-    const self = fs.lstatSync(dir, { throwIfNoEntry: false });
-    if (self) yield { dir: { path: dir, mode: self.mode, uid: self.uid, gid: self.gid } };
+    const self = dirItem(dir);
+    if (self) yield self;
     for (const name of names.sort()) {
       if (skipGitDir && name === '.git') continue;
       const p = path.join(dir, name);
@@ -248,6 +266,15 @@ function* walkSources(
   for (const src of sources) {
     const root = path.resolve(src);
     if (excluded(root)) continue;
+    const ancestors: string[] = [];
+    for (let up = path.dirname(root); ; up = path.dirname(up)) {
+      ancestors.unshift(up);
+      if (up === path.dirname(up)) break;
+    }
+    for (const dir of ancestors) {
+      const item = dirItem(dir);
+      if (item) yield item;
+    }
     let st: fs.Stats | undefined;
     let siblings = new Set<string>();
     try {
@@ -489,10 +516,19 @@ class StateStore {
   private pendingOps = 0;
   private open = true;
 
-  constructor(file: string) {
+  constructor(file: string, bucket: string) {
     this.db = new Database(file);
     fs.chmodSync(file, 0o600);
     this.db.pragma('journal_mode = WAL');
+    this.db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    this.db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('bucket', ?)").run(bucket);
+    const bound = this.db.prepare<[], { value: string }>("SELECT value FROM meta WHERE key = 'bucket'").get()?.value;
+    if (bound !== bucket) {
+      this.db.close();
+      throw new Error(
+        `${file} records uploads to bucket ${bound}, not ${bucket}; use a fresh stateDir for a new bucket`,
+      );
+    }
     this.db.exec(`CREATE TABLE IF NOT EXISTS entries (
       path TEXT PRIMARY KEY, kind TEXT, size INTEGER, sha256 TEXT, mode INTEGER, uid INTEGER, gid INTEGER,
       mtime_ms REAL, target TEXT, stamp TEXT, dirty INTEGER NOT NULL DEFAULT 0, seen_run TEXT)`);
@@ -604,40 +640,13 @@ export interface RunResult {
   warnings: string[];
 }
 
-function acquireRunLock(stateDir: string): () => void {
-  const lock = path.join(stateDir, 'run.lock');
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
-      return () => fs.rmSync(lock, { force: true });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      const holder = Number(fs.readFileSync(lock, 'utf8'));
-      if (holder > 0 && isAlive(holder)) throw new Error(`another run (pid ${holder}) holds ${lock}`, { cause: err });
-      fs.rmSync(lock, { force: true });
-    }
-  }
-  throw new Error(`could not take ${lock}`);
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
 export async function runBackup(config: BackupConfig, opts: RunOptions): Promise<RunResult> {
   fs.mkdirSync(config.stateDir, { recursive: true, mode: 0o711 });
   fs.chmodSync(config.stateDir, 0o711);
-  const release = acquireRunLock(config.stateDir);
-  try {
-    return await runLocked(config, opts);
-  } finally {
-    release();
-  }
+  return withFileLock(path.join(config.stateDir, 'run.lock'), () => runLocked(config, opts), {
+    waitSec: 0,
+    label: 'the host backup run lock (another run is in progress)',
+  });
 }
 
 async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunResult> {
@@ -687,7 +696,7 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
   }
   const sources = [...config.sources, ...(generatedSeen.size ? [generated] : [])];
 
-  const store = new StateStore(path.join(config.stateDir, 'state.db'));
+  const store = new StateStore(path.join(config.stateDir, 'state.db'), config.bucket);
   try {
     return await backupWith(store);
   } finally {
@@ -777,13 +786,14 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
         const err = results.get(f.path);
         const staged = stagedPath(f.path);
         if (err !== null) {
-          if (fs.existsSync(f.path)) failures.push(`sqlite backup of ${f.path} failed: ${err ?? 'no result'}`);
+          if (sqliteHeader(f.path) !== 'missing')
+            failures.push(`sqlite backup of ${f.path} failed: ${err ?? 'no result'}`);
           fs.rmSync(staged, { force: true });
           continue;
         }
         stage(f, prev, await sha256File(staged), fs.statSync(staged).size);
       }
-      if (pendingBytes >= batchBytes) await flush();
+      if (pendingBytes >= batchBytes || pending.length >= BATCH_FILES) await flush();
     };
 
     const knownKind = (file: string, stamp: string) => {
@@ -822,7 +832,7 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
           if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
             failures.push(`could not read ${f.path}: ${message(err)}`);
         }
-        if (pendingBytes >= batchBytes) await flush();
+        if (pendingBytes >= batchBytes || pending.length >= BATCH_FILES) await flush();
       }
     }
     fs.closeSync(dirsFd);
@@ -1037,8 +1047,13 @@ export async function restore(
 ): Promise<RestoreResult> {
   const log = opts.log ?? ((line: string) => console.log(line));
   const asOf = opts.asOf ?? new Date();
-  if (fs.existsSync(opts.dest) && fs.readdirSync(opts.dest).length > 0) {
-    throw new Error(`${opts.dest} is not empty; restore only into an empty directory`);
+  fs.mkdirSync(path.dirname(path.resolve(opts.dest)), { recursive: true });
+  try {
+    fs.mkdirSync(opts.dest, { mode: 0o700 });
+  } catch (err) {
+    throw new Error(`${opts.dest} must not exist yet: restore creates it, private, so nothing else can write into it`, {
+      cause: err,
+    });
   }
   const manifests = (await source.listManifests())
     .filter((m) => MANIFEST_KEY.test(m.key) && new Date(m.lastModified) <= asOf)
@@ -1049,8 +1064,10 @@ export async function restore(
   try {
     const prefix = opts.prefix ? path.resolve(opts.prefix) : '/';
     const within = (p: string) => p === prefix || p.startsWith(prefix === '/' ? '/' : `${prefix}/`);
+    const withinOrAncestor = (p: string) => within(p) || prefix.startsWith(p === '/' ? '/' : `${p}/`);
     await source.getObject(chosen.key, null, path.join(tmp, 'manifest.jsonl.gz'));
-    const manifest = await readManifest(path.join(tmp, 'manifest.jsonl.gz'), within);
+    const manifest = await readManifest(path.join(tmp, 'manifest.jsonl.gz'), withinOrAncestor);
+    manifest.entries = manifest.entries.filter((e) => within(e.path));
     if (!manifest.complete) throw new Error(`${chosen.key} is truncated (no trailer line)`);
     for (const f of manifest.failures) log(`host-restore: warning: that night's run reported: ${f}`);
     log(`host-restore: manifest ${chosen.key}, restoring ${manifest.entries.length} paths under ${prefix}`);
@@ -1110,8 +1127,8 @@ export async function restore(
 }
 
 function applyMetadata(out: string, meta: { mode: number; uid: number; gid: number }): void {
-  if (process.getuid?.() === 0) fs.chownSync(out, meta.uid, meta.gid);
-  fs.chmodSync(out, meta.mode & 0o7777);
+  if (process.getuid?.() === 0) fs.lchownSync(out, meta.uid, meta.gid);
+  if (!fs.lstatSync(out).isSymbolicLink()) fs.chmodSync(out, meta.mode & 0o7777);
 }
 
 function loadConfig(file: string): BackupConfig {
