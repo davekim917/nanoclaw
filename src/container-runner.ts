@@ -117,6 +117,7 @@ import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
+import { copySecretFile, DBT_CONTAINER_DIR, stageDbtProfiles } from './credential-stage.js';
 import { log } from './log.js';
 import { applyOnecliContainerConfig, describeDiagnosis } from './onecli-apply.js';
 import {
@@ -144,7 +145,6 @@ import {
 } from './workgroup-read-access.js';
 import { resolveWorkgroupWiki, workgroupWikiInstructions } from './workgroup-wiki.js';
 import { loadPluginScopes, pluginAllowedForWorkgroup, warnUnmatchedPluginScopes } from './plugin-scopes.js';
-import YAML from 'yaml';
 
 import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
 // Provider host-side config barrel — each provider that needs host-side
@@ -4180,10 +4180,7 @@ export async function buildMounts(
           const srcPath = path.join(entry.parentPath, entry.name);
           const relPath = path.relative(keysDir, srcPath);
           if (filterConns && referenced.size > 0 && !referenced.has(relPath)) continue;
-          const destPath = path.join(destKeys, relPath);
-          fs.mkdirSync(path.dirname(destPath), { recursive: true });
-          fs.copyFileSync(srcPath, destPath);
-          fs.chmodSync(destPath, 0o600);
+          copySecretFile(srcPath, path.join(destKeys, relPath));
         }
       }
 
@@ -4270,22 +4267,19 @@ export async function buildMounts(
   }
 
   if (isToolEnabled(tools, 'dbt')) {
-    const dbtDir = path.join(home, '.dbt');
-    const origProfiles = path.join(dbtDir, 'profiles.yml');
+    const origProfiles = path.join(home, '.dbt', 'profiles.yml');
     if (fs.existsSync(origProfiles)) {
       const { scopes, isScoped } = extractToolScopes(tools, 'dbt');
       const dest = stageDir('dbt');
       try {
-        let profiles = YAML.parse(fs.readFileSync(origProfiles, 'utf-8')) as Record<string, unknown>;
-        if (isScoped) {
-          const filtered: Record<string, unknown> = {};
-          for (const name of scopes) {
-            if (profiles[name] !== undefined) filtered[name] = profiles[name];
-          }
-          profiles = filtered;
-        }
-        fs.writeFileSync(path.join(dest, 'profiles.yml'), YAML.stringify(profiles), { mode: 0o600 });
-        mounts.push({ hostPath: dest, containerPath: '/home/node/.dbt', readonly: true });
+        stageDbtProfiles({
+          profilesPath: origProfiles,
+          home,
+          dest,
+          allowedProfiles: isScoped ? scopes : null,
+          agent: agentGroup.folder,
+        });
+        mounts.push({ hostPath: dest, containerPath: DBT_CONTAINER_DIR, readonly: true });
       } catch (err) {
         log.warn('dbt profiles stage failed — skipping mount (fail closed)', {
           agent: agentGroup.folder,
