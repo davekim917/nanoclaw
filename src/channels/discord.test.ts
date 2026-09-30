@@ -825,7 +825,7 @@ describe('installMessageThreadAutoCreate', () => {
     await expect(adapter.postMessage(anchor, { markdown: 'part 2' })).resolves.toEqual({ id: 'reply-1' });
     expect(rest.get.mock.calls[0][0]).toBe('/channels/chan1/messages/msg1');
     expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', {
-      body: { name: 'Daily dbt failure' },
+      body: { name: 'Daily dbt failure', auto_archive_duration: 1440 },
     });
     expect(postMessage).toHaveBeenCalledTimes(2);
     expect(postMessage.mock.calls[1][0]).toBe(anchor);
@@ -877,7 +877,9 @@ describe('installMessageThreadAutoCreate', () => {
       };
       installMessageThreadAutoCreate(realAdapter, rest as unknown as DiscordThreadRestClient);
       await realAdapter.postMessage(anchor, { markdown: 'part 2' });
-      expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', { body: { name: 'Parent' } });
+      expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', {
+        body: { name: 'Parent', auto_archive_duration: 1440 },
+      });
       expect(String(fetchSpy.mock.calls[1][0])).toContain('/channels/msg1/messages');
     } finally {
       fetchSpy.mockRestore();
