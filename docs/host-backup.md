@@ -12,12 +12,14 @@ useless. S3's default SSE-S3 applies. Read access is the control (below).
 `/etc/nanoclaw-backup/config.json` lists `sources` (files or directories) and `exclude` globs
 over absolute paths (`**` crosses `/`, `*` and `?` do not). Beyond those globs, every run:
 
-- skips any directory below a source that is a git clone or worktree with a remote. A source
-  root that is itself a clone keeps its files but not its `.git`. The check passes
+- skips any directory below a source that is a git clone, worktree or bare repository with a
+  remote. A source root that is itself a clone keeps its files but not its `.git`, so a clone
+  that also holds untracked data (a workgroup pool, say) goes in as its own source. The check passes
   `safe.directory=*`: as root, git refuses a repository another user owns, and a refusal would
   read as "no remote" and pull the whole clone in. Commits and edits that
   exist only on the host are captured nightly by `scripts/git-safety.sh` into
   `~/nanoclaw-backups/`, so that directory is a source;
+- skips Python virtualenvs (any directory holding `pyvenv.cfg`), whatever they are named;
 - copies SQLite files, recognised by their header, with the online backup API under the file
   owner's uid, and never uploads `-journal`/`-wal`/`-shm` sidecars. The copy is stored in
   rollback-journal mode; a writer that wants WAL sets it again on open. Running as the owner
@@ -58,12 +60,12 @@ upload passes `--checksum-algorithm CRC32`.
 
 ## Access
 
-| Principal                                                                    | Can                                                                                                |
-| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Principal                                                                        | Can                                                                                                |
+| -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | Host writer (IAM user, key in `/etc/nanoclaw-backup/aws-credentials`, root 0600) | `s3:PutObject` on the bucket. No Get, List or Delete.                                              |
-| The operator's IAM user                                                      | Read and list.                                                                                     |
-| Break-glass role (assume with MFA)                                           | Read and list.                                                                                     |
-| Everyone else                                                                | Denied `s3:GetObject*` and `s3:ListBucket*` by the bucket policy, whatever their IAM policies say. |
+| The operator's IAM user                                                          | Read and list.                                                                                     |
+| Break-glass role (assume with MFA)                                               | Read and list.                                                                                     |
+| Everyone else                                                                    | Denied `s3:GetObject*` and `s3:ListBucket*` by the bucket policy, whatever their IAM policies say. |
 
 Block Public Access is fully on and non-TLS requests are denied. Anyone with passwordless sudo
 on the host can read the writer key, but it can only add objects: it cannot read a backup or

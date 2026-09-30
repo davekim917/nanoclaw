@@ -77,6 +77,7 @@ export interface Scan {
   files: ScannedFile[];
   unreadable: string[];
   skippedClones: string[];
+  skippedVenvs: string[];
   warnings: string[];
 }
 
@@ -143,10 +144,13 @@ export function scanSources(
   knownKind: (file: string, stamp: string) => EntryKind | undefined = () => undefined,
 ): Scan {
   const excludes = exclude.map(globToRegExp);
-  const scan: Scan = { files: [], unreadable: [], skippedClones: [], warnings: [] };
+  const scan: Scan = { files: [], unreadable: [], skippedClones: [], skippedVenvs: [], warnings: [] };
   const excluded = (p: string) => excludes.some((re) => re.test(p));
 
+  const visited = new Set<string>();
   const visitFile = (p: string, st: fs.Stats, siblings: Set<string>) => {
+    if (visited.has(p)) return;
+    visited.add(p);
     if (Buffer.byteLength(p) > MAX_KEY_PATH_BYTES || /[\p{Cc}\\]/u.test(p)) {
       scan.warnings.push(`skipped (path cannot be an S3 key as-is): ${JSON.stringify(p)}`);
       return;
@@ -185,8 +189,13 @@ export function scanSources(
       return;
     }
     const siblings = new Set(names);
-    const skipGitDir = names.includes('.git') && remoteCheck(dir);
-    if (skipGitDir && !isRoot) {
+    if (!isRoot && siblings.has('pyvenv.cfg')) {
+      scan.skippedVenvs.push(dir);
+      return;
+    }
+    const isBareRepo = siblings.has('HEAD') && siblings.has('objects') && siblings.has('refs');
+    const skipGitDir = (siblings.has('.git') || isBareRepo) && remoteCheck(dir);
+    if (skipGitDir && (!isRoot || isBareRepo)) {
       scan.skippedClones.push(dir);
       return;
     }
@@ -457,7 +466,7 @@ export async function runBackup(config: BackupConfig, opts: RunOptions): Promise
   for (const dir of scan.unreadable) failures.push(`could not read ${dir}`);
   const scannedBytes = scan.files.reduce((n, f) => n + (f.kind === 'symlink' ? 0 : f.stat.size), 0);
   log(
-    `host-backup: scanned ${scan.files.length} paths (${gib(scannedBytes)}), skipped ${scan.skippedClones.length} git clones with a remote`,
+    `host-backup: scanned ${scan.files.length} paths (${gib(scannedBytes)}), skipped ${scan.skippedClones.length} git clones with a remote and ${scan.skippedVenvs.length} Python venvs`,
   );
 
   const seen = new Set(scan.files.map((f) => f.path));

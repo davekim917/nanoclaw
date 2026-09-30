@@ -139,6 +139,19 @@ describe('scanSources', () => {
     expect(scan.files.find((f) => f.path.endsWith('link'))).toMatchObject({ kind: 'symlink', target: 'keep.txt' });
   });
 
+  it('skips Python virtualenvs and bare repositories with a remote', () => {
+    write('keep.txt', 'k');
+    write('tools/venv/pyvenv.cfg', 'home = /usr/bin');
+    write('tools/venv/lib/site.py', 'x');
+    write('mirrors/app.git/HEAD', 'ref');
+    write('mirrors/app.git/objects/pack/p.pack', 'x');
+    write('mirrors/app.git/refs/heads/main', 'sha');
+    const scan = scanSources([src], [], (dir) => dir.endsWith('app.git'));
+    expect(scan.files.map((f) => path.relative(src, f.path))).toEqual(['keep.txt']);
+    expect(scan.skippedVenvs).toEqual([path.join(src, 'tools', 'venv')]);
+    expect(scan.skippedClones).toEqual([path.join(src, 'mirrors', 'app.git')]);
+  });
+
   it('keeps a source root that is itself a clone, minus its .git', () => {
     write('.git/HEAD', 'ref');
     write('untracked-config.json', '{}');
@@ -166,6 +179,12 @@ describe('scanSources', () => {
     } finally {
       fs.chmodSync(locked, 0o700);
     }
+  });
+
+  it('lists a path once when sources overlap', () => {
+    write('dir/a.txt', 'a');
+    const scan = scanSources([src, path.join(src, 'dir')], [], () => false);
+    expect(scan.files.map((f) => f.path)).toEqual([path.join(src, 'dir', 'a.txt')]);
   });
 
   it('reports a missing source as unreadable', () => {
