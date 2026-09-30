@@ -28,7 +28,20 @@ export interface BackupConfig {
   sources: string[];
   exclude?: string[];
   commands?: { name: string; argv: string[] }[];
+  gated?: { flag: string; sources?: string[]; exclude?: string[]; commands?: { name: string; argv: string[] }[] }[];
   batchBytes?: number;
+}
+
+export function applyGates(config: BackupConfig): BackupConfig {
+  const merged = { ...config, exclude: [...(config.exclude ?? [])], commands: [...(config.commands ?? [])] };
+  for (const gate of config.gated ?? []) {
+    const flag = fs.lstatSync(gate.flag, { throwIfNoEntry: false });
+    if (!flag?.isFile() || (process.getuid?.() === 0 && flag.uid !== 0)) continue;
+    merged.sources = [...merged.sources, ...(gate.sources ?? [])];
+    merged.exclude.push(...(gate.exclude ?? []));
+    merged.commands.push(...(gate.commands ?? []));
+  }
+  return merged;
 }
 
 type EntryKind = 'file' | 'sqlite' | 'symlink';
@@ -1174,7 +1187,7 @@ function loadConfig(file: string): BackupConfig {
     if (typeof config[key] !== 'string' || !config[key]) throw new Error(`${file}: "${key}" is required`);
   }
   if (!Array.isArray(config.sources) || config.sources.length === 0) throw new Error(`${file}: "sources" is empty`);
-  return config;
+  return applyGates(config);
 }
 
 function gib(bytes: number): string {

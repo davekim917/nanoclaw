@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { withFileLock } from '../src/file-lock.js';
 
 import {
+  applyGates,
   globToRegExp,
   readManifest,
   restore,
@@ -112,6 +113,23 @@ async function manifestOf(bucket: FakeBucket, runId: string) {
   return readManifest(file);
 }
 const quiet = { log: () => {}, remoteCheck: () => false };
+
+describe('applyGates', () => {
+  it('adds a gated stage only while its flag file exists', () => {
+    const flag = path.join(tmp, 'stage.enabled');
+    const gated = {
+      ...config,
+      gated: [{ flag, sources: ['/extra'], exclude: ['/extra/skip'], commands: [{ name: 'd', argv: ['true'] }] }],
+    };
+    expect(applyGates(gated)).toMatchObject({ sources: [src], exclude: [], commands: [] });
+    fs.writeFileSync(flag, '');
+    expect(applyGates(gated)).toMatchObject({
+      sources: [src, '/extra'],
+      exclude: ['/extra/skip'],
+      commands: [{ name: 'd' }],
+    });
+  });
+});
 
 describe('globToRegExp', () => {
   it('lets ** cross directories and keeps * and ? inside one segment', () => {

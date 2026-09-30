@@ -30,7 +30,12 @@ over absolute paths (`**` crosses `/`, `*` and `?` do not). Beyond those globs, 
   the host. A copy that comes back empty (the source stayed locked) is a failure, not a backup;
 - records symlinks (target only) and restores them; sockets and FIFOs are ignored;
 - runs `commands` (e.g. a database dump) and backs up each one's stdout as
-  `<stateDir>/generated/<name>`.
+  `<stateDir>/generated/<name>`;
+- adds each `gated` stage (`flag`, plus its own `sources`, `exclude` and `commands`) only while
+  its flag file exists, owned by root. A stage that should run only on the operator's say-so
+  is switched on with `sudo touch <flag>` and off with `sudo rm <flag>`, and the nightly run does
+  the rest with no agent in the loop. When a stage is switched off, its paths are tombstoned
+  at the next run.
 
 Nothing is dropped quietly. A path that cannot be read, or cannot be an S3 key (control
 characters, a backslash, over 1,000 bytes, a name or symlink target that is not valid UTF-8), fails the run and keeps its last uploaded
@@ -138,6 +143,33 @@ subtree (`--prefix`): the version listing for a prefix is read in one call.
 A restore on a fresh machine also needs whatever the sources could not capture: repo clones
 from their remotes, Docker images (rebuild), and the systemd units and logrotate entries,
 which are under `files/etc/`.
+
+### OneCLI vault (operator step)
+
+The vault is encrypted secrets in the OneCLI Postgres database plus the key that decrypts them.
+Without `SECRET_ENCRYPTION_KEY` in its environment, the OneCLI image generates that key into
+`/app/data/secret-encryption-key`, so it lives in whichever host directory backs `/app/data`. A
+dump without that key is useless. This install gates both behind
+`/etc/nanoclaw-backup/onecli.enabled`: a `pg_dumpall` of the Postgres container
+(`onecli-postgres.sql`), and the OneCLI host directory minus the live Postgres data directory,
+which the dump replaces. The operator enables it with `sudo touch /etc/nanoclaw-backup/onecli.enabled`.
+The next run's manifest confirms it by path and size only:
+
+```bash
+aws s3 cp s3://<bucket>/manifests/<run id>.jsonl.gz - | zcat \
+  | jq -c 'select(.e and (.e.path | test("onecli"))) | {path: .e.path, size: .e.size}'
+```
+
+To restore, as root on the rebuilt host, with the OneCLI containers stopped:
+
+1. `restore --prefix <OneCLI host dir> --dest /root/restore-onecli`, and `--prefix
+<stateDir>/generated/onecli-postgres.sql` into another fresh directory. Copy the key file and
+   the rest of the host directory into place; ownership comes back with the restore.
+2. Start the Postgres container on an empty data directory with the restored password file, then
+   load the dump: `docker exec -i onecli-postgres psql -U <postgres user> -d postgres < onecli-postgres.sql`.
+3. Start the OneCLI container on the restored data directory. It reads the restored key rather
+   than generating one. Check that `onecli secrets list` shows the expected names and that one
+   credentialed call succeeds.
 
 ## Verify
 
