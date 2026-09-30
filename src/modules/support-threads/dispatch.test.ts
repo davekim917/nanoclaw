@@ -388,7 +388,6 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     expect(msgs[1].content).toContain('Subject: Depletions look wrong');
     expect(msgs[1].content).toContain('Date: Fri, 17 Jul 2026 16:40:55 -0400');
     expect(msgs[1].content).toContain('customer replied');
-    // No ticket recorded yet, so the follow-up carries the duplicate check too.
     expect(msgs[1].content).toContain('search Linear for an OPEN issue');
   });
 
