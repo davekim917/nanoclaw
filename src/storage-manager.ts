@@ -56,6 +56,8 @@ const DEFAULT_CLEANUP_TARGET_MARGIN_PCT = 3;
 const DEFAULT_EMERGENCY_RETRY_SECONDS = 60;
 const DEFAULT_IMAGE_RETENTION_HOURS = 168;
 const DEFAULT_LEGACY_IMAGE_GRACE_HOURS = 168;
+// `docker run` creates then starts within seconds; a container still never-started after this is a failed spawn.
+const STALE_CREATED_CONTAINER_MS = 60 * 60 * 1000;
 /** The only env inputs that decide storage-pressure refusal; exported so host scripts report the same policy. */
 export const STORAGE_ADMISSION_POLICY_ENV_KEYS = [
   'NANOCLAW_STORAGE_MANAGER_ENABLED',
@@ -1334,7 +1336,6 @@ export async function finishInterruptedSessionArchivals(sessionsRoot: string = s
               continue;
             }
             if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
-            // Sibling of the session directory (see the archival path).
             fs.rmSync(sessionContextPathFor(sessPath), { force: true });
             result.finished += 1;
             continue;
@@ -2341,6 +2342,8 @@ interface DockerContainerInventory {
   id: string;
   imageId: string;
   running: boolean;
+  status: string;
+  createdAt: string;
   labels: Record<string, string>;
 }
 
@@ -2433,21 +2436,30 @@ function inspectDockerContainers(ids?: string[]): DockerContainerInventory[] {
   const selectedIds = [...new Set(ids ?? nonEmptyLines(dockerOutput(['container', 'ls', '-a', '-q', '--no-trunc'])))];
   if (selectedIds.length === 0) return [];
   const installLabel = installLabelParts();
-  const format = dockerJsonFormat(['.Id', '.Image', '.State.Running', `(index .Config.Labels "${installLabel.key}")`]);
+  const format = dockerJsonFormat([
+    '.Id',
+    '.Image',
+    '.State.Running',
+    '.State.Status',
+    '.Created',
+    `(index .Config.Labels "${installLabel.key}")`,
+  ]);
   return inspectBatches(selectedIds).flatMap((batch) => {
     const rows = parseDockerProjection(
       dockerOutput(['container', 'inspect', '--format', format, ...batch]),
-      4,
+      6,
       'container',
     );
     if (rows.length !== batch.length) throw new Error('docker container inspect omitted a projected record');
-    const containers = rows.map(([id, imageId, running, label]) => {
+    const containers = rows.map(([id, imageId, running, status, createdAt, label]) => {
       if (
         typeof id !== 'string' ||
         id.length === 0 ||
         typeof imageId !== 'string' ||
         imageId.length === 0 ||
-        typeof running !== 'boolean'
+        typeof running !== 'boolean' ||
+        typeof status !== 'string' ||
+        typeof createdAt !== 'string'
       ) {
         throw new Error('docker container inspect returned an invalid projected record');
       }
@@ -2455,6 +2467,8 @@ function inspectDockerContainers(ids?: string[]): DockerContainerInventory[] {
         id,
         imageId,
         running,
+        status,
+        createdAt,
         labels: projectedLabels([label], [installLabel.key], 'container'),
       };
     });
@@ -2554,6 +2568,18 @@ function installLabelParts(): { key: string; value: string } {
   };
 }
 
+function removableContainer(container: DockerContainerInventory, underPressure: boolean, now: number): boolean {
+  const installLabel = installLabelParts();
+  if (container.running || container.labels[installLabel.key] !== installLabel.value) return false;
+  if (container.status !== 'created') return underPressure;
+  const createdMs = Date.parse(container.createdAt);
+  return Number.isFinite(createdMs) && now - createdMs >= STALE_CREATED_CONTAINER_MS;
+}
+
+function removableImage(image: DockerImageDispositionReport, underPressure: boolean): boolean {
+  return image.disposition === 'eligible' && (underPressure || image.repoTags.length === 0);
+}
+
 function usageAtOrBelowTarget(policy: StoragePolicy): boolean {
   const usage = getFilesystemUsage(policy.filesystemPath);
   return usage !== null && usage.usagePct <= policy.cleanupTargetPct;
@@ -2628,38 +2654,36 @@ function collectDockerActions(
 
   const actions: StorageAction[] = [];
   const thresholdReason = `filesystem usage is ${pressurePct}% (threshold ${policy.cleanupThresholdPct}%, target ${policy.cleanupTargetPct}%)`;
-  if (pressurePct >= policy.cleanupThresholdPct) {
-    const installLabel = installLabelParts();
-    for (const container of inventory.containers) {
-      if (container.running || container.labels[installLabel.key] !== installLabel.value) continue;
-      const dockerArgs = ['container', 'rm', container.id];
-      actions.push(
-        createDockerAction({
-          id: `docker:container:${container.id}`,
-          kind: 'docker-prune-containers',
-          dockerArgs,
-          estimatedBytes: 0,
-          reason: thresholdReason,
-          safety: 'Exact non-forced removal of a stopped container carrying this install label.',
-          apply: () => {
-            let current: DockerContainerInventory[];
-            try {
-              current = inspectDockerContainers([container.id]);
-            } catch (err) {
-              log.warn('storage-manager: docker container revalidation failed; removal skipped', {
-                containerId: container.id,
-                err,
-              });
-              return false;
-            }
-            const target = current[0];
-            if (!target || target.running || target.labels[installLabel.key] !== installLabel.value) return false;
-            execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
-            return true;
-          },
-        }),
-      );
-    }
+  const underPressure = pressurePct >= policy.cleanupThresholdPct;
+  for (const container of inventory.containers) {
+    if (!removableContainer(container, underPressure, now)) continue;
+    const dockerArgs = ['container', 'rm', container.id];
+    actions.push(
+      createDockerAction({
+        id: `docker:container:${container.id}`,
+        kind: 'docker-prune-containers',
+        dockerArgs,
+        estimatedBytes: 0,
+        reason: container.status === 'created' ? 'never-started container past the spawn window' : thresholdReason,
+        safety: 'Exact non-forced removal of a stopped container carrying this install label.',
+        apply: () => {
+          let current: DockerContainerInventory[];
+          try {
+            current = inspectDockerContainers([container.id]);
+          } catch (err) {
+            log.warn('storage-manager: docker container revalidation failed; removal skipped', {
+              containerId: container.id,
+              err,
+            });
+            return false;
+          }
+          const target = current[0];
+          if (!target || !removableContainer(target, underPressure, Date.now())) return false;
+          execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
+          return true;
+        },
+      }),
+    );
   }
 
   actions.push(
@@ -2699,49 +2723,48 @@ function collectDockerActions(
     }
   }
 
-  if (pressurePct >= policy.cleanupThresholdPct) {
-    const eligible = imageDispositions
-      .filter((image) => image.disposition === 'eligible')
-      .sort((a, b) => {
-        const aCreated = Date.parse(a.createdAt);
-        const bCreated = Date.parse(b.createdAt);
-        return (
-          (Number.isFinite(aCreated) ? aCreated : Number.MAX_SAFE_INTEGER) -
-          (Number.isFinite(bCreated) ? bCreated : Number.MAX_SAFE_INTEGER)
-        );
-      });
-    for (const image of eligible) {
-      const dockerArgs = ['image', 'rm', image.id];
-      actions.push(
-        createDockerAction({
-          id: `docker:image:${image.id}`,
-          kind: 'docker-prune-images',
-          dockerArgs,
-          estimatedBytes: image.sizeBytes,
-          reason: thresholdReason,
-          safety: 'Exact non-forced removal after immediate protection and reference revalidation.',
-          apply: () => {
-            if (usageAtOrBelowTarget(policy)) return false;
-            let currentInventory: DockerInventory;
-            try {
-              currentInventory = readDockerInventory();
-            } catch (err) {
-              log.warn('storage-manager: docker image revalidation failed; removal skipped', {
-                imageId: image.id,
-                err,
-              });
-              return false;
-            }
-            const current = classifyDockerInventory(currentInventory, policy, Date.now()).find(
-              (candidate) => candidate.id === image.id,
-            );
-            if (!current || current.disposition !== 'eligible') return false;
-            execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
-            return true;
-          },
-        }),
+  const removable = imageDispositions
+    .filter((image) => removableImage(image, underPressure))
+    .sort((a, b) => {
+      const aCreated = Date.parse(a.createdAt);
+      const bCreated = Date.parse(b.createdAt);
+      return (
+        (Number.isFinite(aCreated) ? aCreated : Number.MAX_SAFE_INTEGER) -
+        (Number.isFinite(bCreated) ? bCreated : Number.MAX_SAFE_INTEGER)
       );
-    }
+    });
+  for (const image of removable) {
+    const dockerArgs = ['image', 'rm', image.id];
+    const untagged = image.repoTags.length === 0;
+    actions.push(
+      createDockerAction({
+        id: `docker:image:${image.id}`,
+        kind: 'docker-prune-images',
+        dockerArgs,
+        estimatedBytes: image.sizeBytes,
+        reason: untagged ? 'untagged image: no tag can select it again' : thresholdReason,
+        safety: 'Exact non-forced removal after immediate protection and reference revalidation.',
+        apply: () => {
+          if (!untagged && usageAtOrBelowTarget(policy)) return false;
+          let currentInventory: DockerInventory;
+          try {
+            currentInventory = readDockerInventory();
+          } catch (err) {
+            log.warn('storage-manager: docker image revalidation failed; removal skipped', {
+              imageId: image.id,
+              err,
+            });
+            return false;
+          }
+          const current = classifyDockerInventory(currentInventory, policy, Date.now()).find(
+            (candidate) => candidate.id === image.id,
+          );
+          if (!current || !removableImage(current, underPressure)) return false;
+          execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
+          return true;
+        },
+      }),
+    );
   }
   return { actions, images: imageDispositions };
 }

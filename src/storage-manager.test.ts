@@ -82,11 +82,13 @@ function compactContainerInspect(rows: Array<Record<string, unknown>>): string {
   const installLabelKey = CONTAINER_INSTALL_LABEL.split('=', 1)[0]!;
   return rows
     .map((row) => {
-      const state = row.State as { Running?: unknown } | undefined;
+      const state = row.State as { Running?: unknown; Status?: unknown } | undefined;
       return [
         JSON.stringify(row.Id ?? null),
         JSON.stringify(row.Image ?? null),
         JSON.stringify(state?.Running === true),
+        JSON.stringify(state?.Status ?? (state?.Running === true ? 'running' : 'exited')),
+        JSON.stringify(row.Created ?? '2026-07-01T00:00:00.000000000Z'),
         JSON.stringify(dockerLabels(row)[installLabelKey] ?? null),
       ].join('\t');
     })
@@ -1814,6 +1816,97 @@ describe('storage-manager Docker cleanup', () => {
     expect(report.actions.map((a) => a.dockerArgs)).toEqual([
       ['builder', 'prune', '-a', '-f', '--filter', 'until=168h'],
     ]);
+  });
+
+  it('below the cleanup threshold removes only stale never-started install containers and untagged eligible images', () => {
+    usagePct = 60;
+    const ownLabels = { Labels: Object.fromEntries([CONTAINER_INSTALL_LABEL.split('=')]) };
+    containers.push(
+      {
+        Id: 'own-created-stale',
+        Image: 'sha256:canonical',
+        Created: new Date(now - 61 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: ownLabels,
+      },
+      {
+        Id: 'own-created-fresh',
+        Image: 'sha256:canonical',
+        Created: new Date(now - 59 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: ownLabels,
+      },
+      {
+        Id: 'peer-created-stale',
+        Image: 'sha256:peer',
+        Created: new Date(now - 61 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: { Labels: { 'nanoclaw-install': 'peer-install' } },
+      },
+      {
+        Id: 'foreign-running',
+        Image: 'sha256:superseded-in-use',
+        State: { Running: true },
+        Config: { Labels: {} },
+      },
+    );
+    const superseded = (id: string) => ({
+      Id: id,
+      RepoTags: [],
+      Created: '2026-07-01T00:00:00.000Z',
+      Size: 3_000,
+      Config: {
+        Labels: {
+          'nanoclaw.commit': id,
+          'nanoclaw.image.role': 'canonical',
+          'nanoclaw.retention.created_at': '2026-07-01T00:00:00.000Z',
+          'nanoclaw.retention.hours': '0',
+        },
+      },
+    });
+    images.push(superseded('sha256:superseded'), superseded('sha256:superseded-in-use'));
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.actions.map((a) => [a.dockerArgs, a.status])).toEqual([
+      [['container', 'rm', 'own-created-stale'], 'applied'],
+      [['builder', 'prune', '-a', '-f', '--filter', 'until=168h'], 'applied'],
+      [['image', 'rm', 'sha256:superseded'], 'applied'],
+    ]);
+    expect(report.images.dispositions.find((image) => image.id === 'sha256:superseded-in-use')).toMatchObject({
+      disposition: 'protected',
+      protectionReason: 'container-referenced',
+    });
+  });
+
+  it('keeps a never-started install container inside the spawn window even under pressure', () => {
+    containers = [
+      {
+        Id: 'own-created-fresh',
+        Image: 'sha256:canonical',
+        Created: new Date(now - 5 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: { Labels: Object.fromEntries([CONTAINER_INSTALL_LABEL.split('=')]) },
+      },
+      ...containers,
+    ];
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    const removals = report.actions.filter((a) => a.kind === 'docker-prune-containers').map((a) => a.dockerArgs);
+    expect(removals).toEqual([['container', 'rm', 'own-stopped']]);
   });
 
   it('revalidates an image immediately before removal and skips a newly referenced image', () => {
