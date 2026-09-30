@@ -203,7 +203,7 @@ function escalationStep(t: SupportTriageView): string {
     `This turn runs on a lighter model because the classifier read this email as ${t.category.replace(/_/g, ' ')}. ` +
     `If it needs engineering work (reading or changing code, querying or correcting data, debugging), do not start it here: ` +
     `finish the ticket step, then call \`wait\` with \`minutes: 0.05\` and a prompt that states the engineering task and the ticket, and end your turn. ` +
-    `That wake runs in this thread on the thread's normal model, not this lighter one.`
+    `That wake runs in this thread on the thread's normal model.`
   );
 }
 
