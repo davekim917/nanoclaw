@@ -155,6 +155,19 @@ describe('scanSources', () => {
     expect(scan.files[0].kind).toBe('sqlite');
   });
 
+  it('reports a source it may not stat as unreadable instead of throwing', () => {
+    const locked = path.join(tmp, 'locked');
+    fs.mkdirSync(locked);
+    fs.writeFileSync(path.join(locked, 'f'), 'x');
+    fs.chmodSync(locked, 0o000);
+    try {
+      const scan = scanSources([path.join(locked, 'f'), src], [], () => false);
+      expect(scan.unreadable).toEqual(process.getuid?.() === 0 ? [] : [path.join(locked, 'f')]);
+    } finally {
+      fs.chmodSync(locked, 0o700);
+    }
+  });
+
   it('reports a missing source as unreadable', () => {
     const scan = scanSources([path.join(tmp, 'nope')], [], () => false);
     expect(scan.unreadable).toEqual([path.join(tmp, 'nope')]);

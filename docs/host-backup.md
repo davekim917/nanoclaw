@@ -60,7 +60,7 @@ upload passes `--checksum-algorithm CRC32`.
 
 | Principal                                                                    | Can                                                                                                |
 | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Host writer (IAM user, key in `/etc/nanoclaw-backup/credentials`, root 0600) | `s3:PutObject` on the bucket. No Get, List or Delete.                                              |
+| Host writer (IAM user, key in `/etc/nanoclaw-backup/aws-credentials`, root 0600) | `s3:PutObject` on the bucket. No Get, List or Delete.                                              |
 | The operator's IAM user                                                      | Read and list.                                                                                     |
 | Break-glass role (assume with MFA)                                           | Read and list.                                                                                     |
 | Everyone else                                                                | Denied `s3:GetObject*` and `s3:ListBucket*` by the bucket policy, whatever their IAM policies say. |
@@ -74,7 +74,7 @@ remove one.
 1. `/etc/nanoclaw-backup/` (root 0700) holds:
    - `config.json`: `bucket`, `region`, `stateDir` (e.g. `/var/lib/nanoclaw-backup`),
      `sources`, `exclude`, optional `commands` and `batchBytes` (default 8 GiB staged per upload);
-   - `credentials` (0600): a `[default]` profile holding the writer key;
+   - `aws-credentials` (0600): a `[default]` profile holding the writer key;
    - `aws-config`: `[default]` with `region`, plus an `s3 =` block that bounds the upload, e.g.
      `max_concurrent_requests = 4` and `max_bandwidth = 25MB/s`.
 2. `sudo install -m 0644 data/systemd/nanoclaw-host-backup.{service,timer} /etc/systemd/system/`,

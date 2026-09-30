@@ -207,15 +207,22 @@ export function scanSources(
 
   for (const src of sources) {
     const root = path.resolve(src);
-    const st = fs.lstatSync(root, { throwIfNoEntry: false });
+    if (excluded(root)) continue;
+    let st: fs.Stats | undefined;
+    let siblings = new Set<string>();
+    try {
+      st = fs.lstatSync(root, { throwIfNoEntry: false });
+      if (st && !st.isDirectory()) siblings = new Set(fs.readdirSync(path.dirname(root)));
+    } catch (err) {
+      scan.unreadable.push(root);
+      scan.warnings.push(`unreadable source ${root}: ${message(err)}`);
+      continue;
+    }
     if (!st) {
       scan.unreadable.push(root);
       scan.warnings.push(`source missing: ${root}`);
-      continue;
-    }
-    if (excluded(root)) continue;
-    if (st.isDirectory()) visitDir(root, true);
-    else visitFile(root, st, new Set(fs.readdirSync(path.dirname(root))));
+    } else if (st.isDirectory()) visitDir(root, true);
+    else visitFile(root, st, siblings);
   }
   return scan;
 }
