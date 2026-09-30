@@ -744,11 +744,11 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
     }
     fs.renameSync(`${out}.tmp`, out);
   }
-  const outputs = (config.commands ?? []).map((cmd) => path.join(generated, cmd.name));
-  for (const name of fs.readdirSync(generated)) {
-    if (!outputs.includes(path.join(generated, name))) fs.rmSync(path.join(generated, name), { force: true });
+  const outputs = new Set((config.commands ?? []).map((cmd) => cmd.name));
+  for (const name of opts.dryRun ? [] : fs.readdirSync(generated)) {
+    if (!outputs.has(name)) fs.rmSync(path.join(generated, name), { force: true });
   }
-  const sources = [...config.sources, ...outputs];
+  const sources = [...config.sources, generated];
 
   const store = new StateStore(path.join(config.stateDir, 'state.db'), config.bucket);
   try {

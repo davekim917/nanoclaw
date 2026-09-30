@@ -469,6 +469,16 @@ describe('runBackup', () => {
     expect(bucket.current(keyOf(gone))?.length).toBe(0);
   });
 
+  it('dry-runs cleanly before a command has ever run and leaves stale outputs alone', async () => {
+    const stale = path.join(config.stateDir, 'generated', 'old.sql');
+    fs.mkdirSync(path.dirname(stale), { recursive: true });
+    fs.writeFileSync(stale, 'old');
+    config.commands = [{ name: 'new.sql', argv: ['sh', '-c', 'echo new'] }];
+    const result = await runBackup(config, { uploader: new FakeBucket(), ...quiet, dryRun: true });
+    expect(result.failures).toEqual([]);
+    expect(fs.existsSync(stale)).toBe(true);
+  });
+
   it('fails the run when a command fails', async () => {
     config.commands = [{ name: 'dump.sql', argv: ['sh', '-c', 'exit 3'] }];
     const result = await runBackup(config, { uploader: new FakeBucket(), ...quiet });
