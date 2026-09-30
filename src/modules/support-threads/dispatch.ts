@@ -68,8 +68,8 @@ function ticketCreationStep(policy: string | null): string {
 
 /**
  * Isolated task sessions have no messaging_group_id; the host-authored task row
- * carries the route. Its per-fire flags stay ONE-TURN on the dispatched message:
- * a human's reply in the support thread must not inherit the poller's cheap pin.
+ * carries the route. Its per-fire flags ride ONE turn, and only a light one:
+ * a human's reply or an engineering turn must not inherit the poller's cheap pin.
  */
 async function getSupportTaskContext(session: Session): Promise<SupportTaskContext | null> {
   if (!session.thread_id?.startsWith(TASK_SESSION_PREFIX)) return null;
@@ -177,6 +177,48 @@ function supportTriage(raw: unknown): SupportTriageView | null {
     areaConfidence = confidence;
   }
   return { product, areaType, area, areaConfidence, category, categoryConfidence, urgency, escapedDefect };
+}
+
+const LIGHT_TURN_CATEGORIES = new Set([
+  'question',
+  'access_request',
+  'follow_up',
+  'acknowledgement',
+  'automated_notice',
+]);
+const LIGHT_TURN_MIN_CONFIDENCE = 0.7;
+const LIGHT_TURN_MAX_DEFECT = 0.5;
+
+function isLightTurn(t: SupportTriageView | null): boolean {
+  return (
+    t !== null &&
+    LIGHT_TURN_CATEGORIES.has(t.category) &&
+    t.categoryConfidence >= LIGHT_TURN_MIN_CONFIDENCE &&
+    t.escapedDefect < LIGHT_TURN_MAX_DEFECT
+  );
+}
+
+function escalationStep(t: SupportTriageView): string {
+  return (
+    `This turn runs on a lighter model because the classifier read this email as ${t.category.replace(/_/g, ' ')}. ` +
+    `If it needs engineering work (reading or changing code, querying or correcting data, debugging), do not start it here: ` +
+    `finish the ticket step, then call \`wait\` with \`minutes: 0.05\` and a prompt that states the engineering task and the ticket, and end your turn. ` +
+    `That wake runs in this thread on the group's full model.`
+  );
+}
+
+function withTurnFlags(
+  text: string,
+  triage: SupportTriageView | null,
+  flagIntent: SupportTaskContext['flagIntent'],
+): Record<string, unknown> {
+  const light = flagIntent && isLightTurn(triage) ? triage : null;
+  return {
+    text: light ? `${text}\n\n${escalationStep(light)}` : text,
+    sender: 'system',
+    senderId: 'system',
+    ...(light ? { flagIntent } : {}),
+  };
 }
 
 function triageArea(t: SupportTriageView): string {
@@ -358,12 +400,13 @@ async function dispatchSupportIssue(
       channelType: mg.channel_type,
       platformId: mg.platform_id,
       threadId: existing.slack_thread_id,
-      content: JSON.stringify({
-        text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy, triage),
-        sender: 'system',
-        senderId: 'system',
-        ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
-      }),
+      content: JSON.stringify(
+        withTurnFlags(
+          followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy, triage),
+          triage,
+          supportFlagIntent,
+        ),
+      ),
     };
 
     // Thread, ticket and Gmail thread outlive the session: re-provision in place
@@ -422,12 +465,13 @@ async function dispatchSupportIssue(
     channelType: mg.channel_type,
     platformId: mg.platform_id,
     threadId: encodedThreadId,
-    content: JSON.stringify({
-      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText, ticketPolicy, triage),
-      sender: 'system',
-      senderId: 'system',
-      ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
-    }),
+    content: JSON.stringify(
+      withTurnFlags(
+        seedPrompt(linearIssue, subject, sender, date, content.bodyText, ticketPolicy, triage),
+        triage,
+        supportFlagIntent,
+      ),
+    ),
   });
 
   await upsertSupportThread(
