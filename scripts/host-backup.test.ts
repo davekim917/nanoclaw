@@ -454,6 +454,21 @@ describe('runBackup', () => {
     expect(bucket.current(keyOf(generated))?.toString()).toBe('dumped\n');
   });
 
+  it('drops the output of a command that is no longer configured, even while another still runs', async () => {
+    const bucket = new FakeBucket();
+    config.commands = [
+      { name: 'keep.sql', argv: ['sh', '-c', 'echo keep'] },
+      { name: 'gone.sql', argv: ['sh', '-c', 'echo gone'] },
+    ];
+    await runBackup(config, { uploader: bucket, ...quiet });
+    config.commands = [config.commands[0]];
+    const result = await runBackup(config, { uploader: bucket, ...quiet });
+    const gone = path.join(config.stateDir, 'generated', 'gone.sql');
+    expect(result.tombstoned).toBe(1);
+    expect(fs.existsSync(gone)).toBe(false);
+    expect(bucket.current(keyOf(gone))?.length).toBe(0);
+  });
+
   it('fails the run when a command fails', async () => {
     config.commands = [{ name: 'dump.sql', argv: ['sh', '-c', 'exit 3'] }];
     const result = await runBackup(config, { uploader: new FakeBucket(), ...quiet });
