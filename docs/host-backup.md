@@ -27,25 +27,34 @@ over absolute paths (`**` crosses `/`, `*` and `?` do not). Beyond those globs, 
   in steps of 1,024 pages, because a reader in a rollback-journal database blocks writers, and
   the host writes `archive.db` synchronously on its event loop. A commit between steps
   restarts the copy. A database kept busy for 10 minutes fails the run rather than stalling
-  the host;
+  the host. A copy that comes back empty (the source stayed locked) is a failure, not a backup;
 - records symlinks (target only) and restores them; sockets and FIFOs are ignored;
 - runs `commands` (e.g. a database dump) and backs up each one's stdout as
   `<stateDir>/generated/<name>`.
+
+Nothing is dropped quietly. A path that cannot be read, or cannot be an S3 key (control
+characters, a backslash, over 1,000 bytes), fails the run and keeps its last uploaded
+version in the manifest. It is never treated as deleted. Rename or exclude such a path to
+clear the failure. Runs take a lock (`<stateDir>/run.lock`), so a manual run and the timer
+cannot overlap, dry runs included.
 
 A dry run prints the scan size without uploading:
 `sudo -E node_modules/.bin/tsx scripts/host-backup.ts run --dry-run`.
 
 ## Bucket layout and retention
 
-| Key                          | Contents                                                              |
-| ---------------------------- | --------------------------------------------------------------------- |
-| `files/<absolute path>`      | File content. One S3 version per change.                              |
-| `manifests/<run id>.json.gz` | One per run: every path with its size, sha256, mode, owner and mtime. |
+| Key                           | Contents                                                                                                                                                                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `files/<absolute path>`       | File content. One S3 version per change.                                                                                                                                                                                                          |
+| `manifests/<run id>.jsonl.gz` | One per run, gzipped JSON Lines: a `header` line, one `e` line per path (size, sha256, mode, owner, mtime), one `d` line per directory (mode, owner), and a `trailer` line with that run's failures. A manifest without its trailer is truncated. |
 
 The host's key can only `PutObject`, so each run diffs against a local state file
-(`<stateDir>/state.json`: size, mtime, inode, sha256 last uploaded) and uploads only what
-changed. A path that disappears gets an empty object on top, so its last content becomes a
-noncurrent version.
+(`<stateDir>/state.db`, a SQLite table: size, mtime, inode, mode, owner, sha256 last uploaded) and uploads
+only what changed. A path that disappears gets an empty object on top, so its last content
+becomes a noncurrent version. Before each upload, the paths in it are marked dirty in the
+state file. Only a successful upload clears the mark, and a dirty path is always uploaded
+again. A partly failed batch therefore cannot leave a manifest that points at a version the
+bucket no longer treats as current.
 
 Lifecycle: noncurrent `files/` versions expire 30 days after they are superseded, manifests
 35 days after they are written, and incomplete multipart uploads after 7 days. **Current
@@ -105,17 +114,20 @@ AWS_PROFILE=<profile> node_modules/.bin/tsx scripts/host-backup.ts restore \
   --prefix /home/ubuntu/nanoclaw-v2/data/v2.db --dest /tmp/restore
 ```
 
-Paths keep their absolute layout under `--dest`, so the example writes
-`/tmp/restore/home/ubuntu/nanoclaw-v2/data/v2.db`. Restore picks the newest manifest written
-at or before `--as-of`. For each file it takes the newest version no later than that manifest,
+`--dest` must be empty or absent. Paths keep their absolute layout under it, so the example
+writes `/tmp/restore/home/ubuntu/nanoclaw-v2/data/v2.db`. Restore picks the newest run
+manifest written at or before `--as-of` and prints any failures that night's run recorded. For each file it takes the newest version no later than that manifest,
 checks it against the manifest's sha256, and falls back to an older retained version with the
-right hash. Mode and mtime are restored, and ownership too when run as root. A path with no
+right hash. Files come first and symlinks last, so nothing is ever written through a restored
+link. File and directory modes and mtimes are restored, and ownership too when run as root
+(directories are finished last, deepest first). A path with no
 matching version is reported and the command exits 1. Check a restored SQLite file with
 `PRAGMA integrity_check`, then stop the host before copying it into place.
 
 Without the repo, `aws s3api list-objects-v2 --prefix manifests/` lists the manifests, and
 `aws s3api list-object-versions --prefix files/<path>` plus `get-object --version-id` fetch a
-file. The manifest is gzipped JSON, so `sha256sum` confirms the version.
+file. `zcat` the manifest to find a path's sha256; `sha256sum` confirms the version. Restore by
+subtree (`--prefix`): the version listing for a prefix is read in one call.
 
 A restore on a fresh machine also needs whatever the sources could not capture: repo clones
 from their remotes, Docker images (rebuild), and the systemd units and logrotate entries,

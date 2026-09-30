@@ -20,9 +20,11 @@ Environment=HOME=/root
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/nanoclaw-backup/aws-credentials
 Environment=AWS_CONFIG_FILE=/etc/nanoclaw-backup/aws-config
-ExecStart=/usr/bin/flock --nonblock /run/nanoclaw-host-backup.lock /home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/host-backup.ts run
+ExecStart=/home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/host-backup.ts run
 IOSchedulingClass=idle
 Nice=10
+# A runaway backup must never take memory from the agents.
+MemoryMax=4G
 # Ends before storage-gc's 09:00 UTC start. A run cut short resumes where it
 # stopped: state is saved after every uploaded batch.
 TimeoutStartSec=3h

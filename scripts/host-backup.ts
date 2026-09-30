@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 
@@ -14,6 +15,8 @@ const SQLITE_MAGIC = Buffer.from('SQLite format 3\0', 'latin1');
 const SQLITE_SIDECARS = ['-journal', '-wal', '-shm'];
 const MAX_KEY_PATH_BYTES = 1000;
 const DEFAULT_BATCH_BYTES = 8 * 1024 ** 3;
+const SQLITE_CHUNK_FILES = 200;
+const MANIFEST_KEY = /^manifests\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\.jsonl\.gz$/;
 
 export interface BackupConfig {
   bucket: string;
@@ -43,18 +46,21 @@ interface StateEntry extends ManifestEntry {
   stamp: string;
 }
 
-interface BackupState {
-  entries: Record<string, StateEntry>;
+interface DirEntry {
+  path: string;
+  mode: number;
+  uid: number;
+  gid: number;
 }
 
 export interface Manifest {
-  version: 1;
   runId: string;
   hostname: string;
   startedAt: string;
   finishedAt: string;
   failures: string[];
   entries: ManifestEntry[];
+  dirs: DirEntry[];
 }
 
 interface FileStat {
@@ -73,13 +79,19 @@ interface ScannedFile {
   target?: string;
 }
 
-export interface Scan {
-  files: ScannedFile[];
+interface ScanReport {
   unreadable: string[];
   skippedClones: string[];
   skippedVenvs: string[];
   warnings: string[];
 }
+
+export interface Scan extends ScanReport {
+  files: ScannedFile[];
+  dirs: DirEntry[];
+}
+
+type ScanItem = { dir: DirEntry } | { file: ScannedFile };
 
 export interface Uploader {
   uploadTree(dir: string, prefix: string): Promise<void>;
@@ -120,8 +132,16 @@ function readHead(file: string, bytes: number): Buffer {
   }
 }
 
+function hasSqliteHeader(file: string): boolean {
+  try {
+    return readHead(file, 16).equals(SQLITE_MAGIC);
+  } catch {
+    return false;
+  }
+}
+
 function statStamp(st: fs.Stats): string {
-  return `${st.size}:${st.mtimeMs}:${st.ino}`;
+  return `${st.size}:${st.mtimeMs}:${st.ino}:${st.mode}:${st.uid}:${st.gid}`;
 }
 
 function sqliteStamp(file: string, st: fs.Stats): string {
@@ -137,82 +157,93 @@ const slim = (st: fs.Stats): FileStat => ({
   gid: st.gid,
 });
 
-export function scanSources(
+function* walkSources(
   sources: string[],
   exclude: string[],
+  report: ScanReport,
   remoteCheck: (dir: string) => boolean = hasRemote,
   knownKind: (file: string, stamp: string) => EntryKind | undefined = () => undefined,
-): Scan {
+): Generator<ScanItem> {
   const excludes = exclude.map(globToRegExp);
-  const scan: Scan = { files: [], unreadable: [], skippedClones: [], skippedVenvs: [], warnings: [] };
   const excluded = (p: string) => excludes.some((re) => re.test(p));
-
   const visited = new Set<string>();
-  const visitFile = (p: string, st: fs.Stats, siblings: Set<string>) => {
-    if (visited.has(p)) return;
-    visited.add(p);
+
+  const visitFile = (p: string, st: fs.Stats, siblings: Set<string>): ScannedFile | undefined => {
     if (Buffer.byteLength(p) > MAX_KEY_PATH_BYTES || /[\p{Cc}\\]/u.test(p)) {
-      scan.warnings.push(`skipped (path cannot be an S3 key as-is): ${JSON.stringify(p)}`);
-      return;
+      report.unreadable.push(p);
+      report.warnings.push(
+        `cannot back up (path cannot be an S3 key as-is; rename or exclude it): ${JSON.stringify(p)}`,
+      );
+      return undefined;
     }
     if (st.isSymbolicLink()) {
-      scan.files.push({ path: p, kind: 'symlink', stat: slim(st), stamp: statStamp(st), target: fs.readlinkSync(p) });
-      return;
+      return { path: p, kind: 'symlink', stat: slim(st), stamp: statStamp(st), target: fs.readlinkSync(p) };
     }
-    if (!st.isFile()) return;
+    if (!st.isFile()) return undefined;
     const base = path.basename(p);
     const sidecar = SQLITE_SIDECARS.find((s) => base.endsWith(s));
-    if (sidecar && siblings.has(base.slice(0, -sidecar.length))) return;
+    const owner = sidecar ? path.join(path.dirname(p), base.slice(0, -sidecar.length)) : '';
+    if (sidecar && siblings.has(path.basename(owner)) && hasSqliteHeader(owner)) return undefined;
     let isSqlite: boolean;
     try {
       const known = knownKind(p, statStamp(st));
       isSqlite = known ? known === 'sqlite' : st.size >= 512 && readHead(p, 16).equals(SQLITE_MAGIC);
     } catch (err) {
-      scan.warnings.push(`unreadable file ${p}: ${message(err)}`);
-      return;
+      report.unreadable.push(p);
+      report.warnings.push(`unreadable file ${p}: ${message(err)}`);
+      return undefined;
     }
-    scan.files.push({
+    return {
       path: p,
       kind: isSqlite ? 'sqlite' : 'file',
       stat: slim(st),
       stamp: isSqlite ? sqliteStamp(p, st) : statStamp(st),
-    });
+    };
   };
 
-  const visitDir = (dir: string, isRoot: boolean) => {
+  function* visitDir(dir: string, isRoot: boolean): Generator<ScanItem> {
     let names: string[];
     try {
       names = fs.readdirSync(dir);
     } catch (err) {
-      scan.unreadable.push(dir);
-      scan.warnings.push(`unreadable directory ${dir}: ${message(err)}`);
+      report.unreadable.push(dir);
+      report.warnings.push(`unreadable directory ${dir}: ${message(err)}`);
       return;
     }
     const siblings = new Set(names);
     if (!isRoot && siblings.has('pyvenv.cfg')) {
-      scan.skippedVenvs.push(dir);
+      report.skippedVenvs.push(dir);
       return;
     }
     const isBareRepo = siblings.has('HEAD') && siblings.has('objects') && siblings.has('refs');
     const skipGitDir = (siblings.has('.git') || isBareRepo) && remoteCheck(dir);
     if (skipGitDir && (!isRoot || isBareRepo)) {
-      scan.skippedClones.push(dir);
+      report.skippedClones.push(dir);
       return;
     }
+    const self = fs.lstatSync(dir, { throwIfNoEntry: false });
+    if (self) yield { dir: { path: dir, mode: self.mode, uid: self.uid, gid: self.gid } };
     for (const name of names.sort()) {
       if (skipGitDir && name === '.git') continue;
       const p = path.join(dir, name);
       if (excluded(p)) continue;
-      let st: fs.Stats;
+      let st: fs.Stats | undefined;
       try {
-        st = fs.lstatSync(p);
-      } catch {
+        st = fs.lstatSync(p, { throwIfNoEntry: false });
+      } catch (err) {
+        report.unreadable.push(p);
+        report.warnings.push(`unreadable path ${p}: ${message(err)}`);
         continue;
       }
-      if (st.isDirectory()) visitDir(p, false);
-      else visitFile(p, st, siblings);
+      if (!st) continue;
+      if (st.isDirectory()) yield* visitDir(p, false);
+      else if (!visited.has(p)) {
+        visited.add(p);
+        const file = visitFile(p, st, siblings);
+        if (file) yield { file };
+      }
     }
-  };
+  }
 
   for (const src of sources) {
     const root = path.resolve(src);
@@ -223,15 +254,31 @@ export function scanSources(
       st = fs.lstatSync(root, { throwIfNoEntry: false });
       if (st && !st.isDirectory()) siblings = new Set(fs.readdirSync(path.dirname(root)));
     } catch (err) {
-      scan.unreadable.push(root);
-      scan.warnings.push(`unreadable source ${root}: ${message(err)}`);
+      report.unreadable.push(root);
+      report.warnings.push(`unreadable source ${root}: ${message(err)}`);
       continue;
     }
     if (!st) {
-      scan.unreadable.push(root);
-      scan.warnings.push(`source missing: ${root}`);
-    } else if (st.isDirectory()) visitDir(root, true);
-    else visitFile(root, st, siblings);
+      report.unreadable.push(root);
+      report.warnings.push(`source missing: ${root}`);
+    } else if (st.isDirectory()) yield* visitDir(root, true);
+    else if (!visited.has(root)) {
+      visited.add(root);
+      const file = visitFile(root, st, siblings);
+      if (file) yield { file };
+    }
+  }
+}
+
+export function scanSources(
+  sources: string[],
+  exclude: string[],
+  remoteCheck: (dir: string) => boolean = hasRemote,
+): Scan {
+  const scan: Scan = { files: [], dirs: [], unreadable: [], skippedClones: [], skippedVenvs: [], warnings: [] };
+  for (const item of walkSources(sources, exclude, scan, remoteCheck)) {
+    if ('dir' in item) scan.dirs.push(item.dir);
+    else scan.files.push(item.file);
   }
   return scan;
 }
@@ -259,15 +306,19 @@ async function copyHashed(src: string, dest: string): Promise<{ sha256: string; 
 export async function snapshotSqlite(
   src: string,
   dest: string,
-  { pagesPerStep = 1024, budgetMs = 10 * 60_000 } = {},
+  { pagesPerStep = 1024, budgetMs = 10 * 60_000, busyTimeoutMs = 15_000 } = {},
 ): Promise<void> {
+  if (src !== src.trim() || dest !== dest.trim()) {
+    throw new Error('better-sqlite3 trims file names, so a path with leading or trailing whitespace cannot be copied');
+  }
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  const db = new Database(src, { readonly: true, fileMustExist: true, timeout: 15_000 });
+  const db = new Database(src, { readonly: true, fileMustExist: true, timeout: busyTimeoutMs });
   const started = Date.now();
   let restarts = 0;
   let lastRemaining = Infinity;
+  let copied: { totalPages: number; remainingPages: number };
   try {
-    await db.backup(dest, {
+    copied = await db.backup(dest, {
       progress: ({ remainingPages }) => {
         if (remainingPages > lastRemaining) restarts++;
         lastRemaining = remainingPages;
@@ -280,7 +331,14 @@ export async function snapshotSqlite(
   } finally {
     db.close();
   }
-  const copy = new Database(dest);
+  if (
+    copied.totalPages === 0 ||
+    copied.remainingPages !== 0 ||
+    !(fs.statSync(dest, { throwIfNoEntry: false })?.size ?? 0)
+  ) {
+    throw new Error(`backup copied nothing (${copied.totalPages} pages); the source was likely locked throughout`);
+  }
+  const copy = new Database(dest, { fileMustExist: true });
   try {
     copy.pragma('journal_mode = DELETE');
     const result = copy.pragma('quick_check', { simple: true });
@@ -322,7 +380,9 @@ function makeSqliteSnapshotter(workDir: string): SqliteSnapshotter {
       }
       const dir = path.join(workDir, String(uid));
       fs.rmSync(dir, { recursive: true, force: true });
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(workDir, { recursive: true, mode: 0o711 });
+      fs.chmodSync(workDir, 0o711);
+      fs.mkdirSync(dir, { mode: 0o700 });
       fs.chownSync(dir, uid, gid);
       const work = group.map((job, i) => ({ src: job.src, dest: path.join(dir, `${i}.db`) }));
       const child = spawn(process.execPath, [...process.execArgv, SCRIPT_PATH, 'sqlite-worker'], {
@@ -342,7 +402,10 @@ function makeSqliteSnapshotter(workDir: string): SqliteSnapshotter {
         parsed = {};
       }
       group.forEach((job, i) => {
-        const err = job.src in parsed ? parsed[job.src] : `sqlite worker for uid ${uid} exited ${code}`;
+        const err =
+          job.src in parsed
+            ? parsed[job.src]
+            : `sqlite worker for uid ${uid} exited ${code} (it must be able to read the script and ${dir})`;
         if (err === null) {
           fs.mkdirSync(path.dirname(job.dest), { recursive: true });
           fs.renameSync(work[i].dest, job.dest);
@@ -380,21 +443,136 @@ function runAws(args: string[]): Promise<void> {
   });
 }
 
-function loadState(file: string): BackupState {
-  if (!fs.existsSync(file)) return { entries: {} };
-  return JSON.parse(fs.readFileSync(file, 'utf8')) as BackupState;
+interface StateRow {
+  path: string;
+  kind: EntryKind | null;
+  size: number | null;
+  sha256: string | null;
+  mode: number | null;
+  uid: number | null;
+  gid: number | null;
+  mtime_ms: number | null;
+  target: string | null;
+  stamp: string | null;
+  dirty: number;
 }
 
-function saveState(file: string, state: BackupState): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
-  fs.renameSync(tmp, file);
+type KnownEntry = StateEntry & { dirty: boolean };
+
+function prepareStatements(db: Database.Database) {
+  return {
+    get: db.prepare<[string], StateRow>('SELECT * FROM entries WHERE path = ?'),
+    see: db.prepare('UPDATE entries SET seen_run = ? WHERE path = ?'),
+    seeUnder: db.prepare("UPDATE entries SET seen_run = ? WHERE path = ? OR substr(path, 1, length(?) + 1) = ? || '/'"),
+    put: db.prepare(`INSERT INTO entries
+      (path, kind, size, sha256, mode, uid, gid, mtime_ms, target, stamp, dirty, seen_run)
+      VALUES (@path, @kind, @size, @sha256, @mode, @uid, @gid, @mtimeMs, @target, @stamp, 0, @run)
+      ON CONFLICT(path) DO UPDATE SET kind = excluded.kind, size = excluded.size, sha256 = excluded.sha256,
+        mode = excluded.mode, uid = excluded.uid, gid = excluded.gid, mtime_ms = excluded.mtime_ms,
+        target = excluded.target, stamp = excluded.stamp, dirty = 0, seen_run = excluded.seen_run`),
+    dirty: db.prepare(`INSERT INTO entries (path, dirty, seen_run) VALUES (?, 1, ?)
+      ON CONFLICT(path) DO UPDATE SET dirty = 1`),
+    clean: db.prepare('UPDATE entries SET dirty = 0 WHERE path = ?'),
+    unseen: db.prepare<[string], { path: string; kind: EntryKind | null }>(
+      'SELECT path, kind FROM entries WHERE seen_run IS NOT ?',
+    ),
+    remove: db.prepare('DELETE FROM entries WHERE path = ?'),
+    manifest: db.prepare<[string], StateRow>(
+      'SELECT * FROM entries WHERE seen_run = ? AND sha256 IS NOT NULL ORDER BY path',
+    ),
+  };
 }
 
-function toManifestEntry(e: StateEntry): ManifestEntry {
-  const { stamp: _stamp, ...rest } = e;
-  return rest;
+class StateStore {
+  private readonly db: Database.Database;
+  private readonly stmts: ReturnType<typeof prepareStatements>;
+  private pendingOps = 0;
+  private open = true;
+
+  constructor(file: string) {
+    this.db = new Database(file);
+    fs.chmodSync(file, 0o600);
+    this.db.pragma('journal_mode = WAL');
+    this.db.exec(`CREATE TABLE IF NOT EXISTS entries (
+      path TEXT PRIMARY KEY, kind TEXT, size INTEGER, sha256 TEXT, mode INTEGER, uid INTEGER, gid INTEGER,
+      mtime_ms REAL, target TEXT, stamp TEXT, dirty INTEGER NOT NULL DEFAULT 0, seen_run TEXT)`);
+    this.stmts = prepareStatements(this.db);
+    this.db.exec('BEGIN');
+  }
+
+  private op(): void {
+    if (++this.pendingOps >= 5000) this.sync();
+  }
+
+  sync(): void {
+    this.db.exec('COMMIT; BEGIN');
+    this.pendingOps = 0;
+  }
+
+  close(): void {
+    if (!this.open) return;
+    this.open = false;
+    this.db.exec('COMMIT');
+    this.db.close();
+  }
+
+  get(p: string): KnownEntry | undefined {
+    const row = this.stmts.get.get(p);
+    if (!row) return undefined;
+    return { ...fromRow(row), stamp: row.stamp ?? '', dirty: row.dirty === 1 };
+  }
+
+  see(p: string, run: string): void {
+    this.stmts.see.run(run, p);
+    this.op();
+  }
+
+  seeUnder(p: string, run: string): void {
+    this.stmts.seeUnder.run(run, p, p, p);
+    this.op();
+  }
+
+  put(e: StateEntry, run: string): void {
+    this.stmts.put.run({ ...e, target: e.target ?? null, run });
+    this.op();
+  }
+
+  markDirty(paths: string[], run: string): void {
+    for (const p of paths) this.stmts.dirty.run(p, run);
+    this.sync();
+  }
+
+  markClean(paths: string[]): void {
+    for (const p of paths) this.stmts.clean.run(p);
+    this.sync();
+  }
+
+  unseen(run: string): { path: string; kind: EntryKind | null }[] {
+    return this.stmts.unseen.all(run);
+  }
+
+  remove(paths: string[]): void {
+    for (const p of paths) this.stmts.remove.run(p);
+    this.sync();
+  }
+
+  *manifestEntries(run: string): Generator<ManifestEntry> {
+    for (const row of this.stmts.manifest.iterate(run)) yield fromRow(row);
+  }
+}
+
+function fromRow(row: StateRow): ManifestEntry {
+  return {
+    path: row.path,
+    kind: row.kind ?? 'file',
+    size: row.size ?? 0,
+    sha256: row.sha256 ?? '',
+    mode: row.mode ?? 0o600,
+    uid: row.uid ?? 0,
+    gid: row.gid ?? 0,
+    mtimeMs: row.mtime_ms ?? 0,
+    ...(row.target !== null ? { target: row.target } : {}),
+  };
 }
 
 function runIdFor(date: Date): string {
@@ -402,10 +580,6 @@ function runIdFor(date: Date): string {
     .toISOString()
     .replace(/\.\d{3}Z$/, 'Z')
     .replace(/:/g, '-');
-}
-
-function underAny(p: string, dirs: string[]): boolean {
-  return dirs.some((d) => p === d || p.startsWith(`${d}${path.sep}`));
 }
 
 export interface RunOptions {
@@ -418,29 +592,83 @@ export interface RunOptions {
 }
 
 export interface RunResult {
-  manifest: Manifest;
+  runId: string;
+  failures: string[];
+  manifestEntries: number;
+  scannedFiles: number;
+  scannedBytes: number;
+  changedFiles: number;
   uploadedFiles: number;
   uploadedBytes: number;
   tombstoned: number;
-  scannedBytes: number;
-  skippedClones: string[];
   warnings: string[];
 }
 
+function acquireRunLock(stateDir: string): () => void {
+  const lock = path.join(stateDir, 'run.lock');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      return () => fs.rmSync(lock, { force: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      const holder = Number(fs.readFileSync(lock, 'utf8'));
+      if (holder > 0 && isAlive(holder)) throw new Error(`another run (pid ${holder}) holds ${lock}`, { cause: err });
+      fs.rmSync(lock, { force: true });
+    }
+  }
+  throw new Error(`could not take ${lock}`);
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 export async function runBackup(config: BackupConfig, opts: RunOptions): Promise<RunResult> {
+  fs.mkdirSync(config.stateDir, { recursive: true, mode: 0o711 });
+  fs.chmodSync(config.stateDir, 0o711);
+  const release = acquireRunLock(config.stateDir);
+  try {
+    return await runLocked(config, opts);
+  } finally {
+    release();
+  }
+}
+
+async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunResult> {
   const now = opts.now ?? (() => new Date());
   const log = opts.log ?? ((line: string) => console.log(line));
   const started = now();
   const runId = runIdFor(started);
-  const stateFile = path.join(config.stateDir, 'state.json');
+  const pass = crypto.randomUUID();
   const staging = path.join(config.stateDir, 'staging');
   const generated = path.join(config.stateDir, 'generated');
+  const manifestDir = path.join(config.stateDir, 'manifests');
   const batchBytes = config.batchBytes ?? DEFAULT_BATCH_BYTES;
   const failures: string[] = [];
-  const state = loadState(stateFile);
+  const report: ScanReport = { unreadable: [], skippedClones: [], skippedVenvs: [], warnings: [] };
+  const result: RunResult = {
+    runId,
+    failures,
+    manifestEntries: 0,
+    scannedFiles: 0,
+    scannedBytes: 0,
+    changedFiles: 0,
+    uploadedFiles: 0,
+    uploadedBytes: 0,
+    tombstoned: 0,
+    warnings: report.warnings,
+  };
 
   fs.rmSync(staging, { recursive: true, force: true });
+  fs.mkdirSync(staging, { mode: 0o700 });
   fs.mkdirSync(generated, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(manifestDir, { recursive: true, mode: 0o700 });
   const generatedSeen = new Set<string>();
   for (const cmd of config.commands ?? []) {
     const out = path.join(generated, cmd.name);
@@ -459,46 +687,55 @@ export async function runBackup(config: BackupConfig, opts: RunOptions): Promise
   }
   const sources = [...config.sources, ...(generatedSeen.size ? [generated] : [])];
 
-  const scan = scanSources(sources, config.exclude ?? [], opts.remoteCheck, (file, stamp) => {
-    const prev = state.entries[file];
-    return prev && (prev.stamp === stamp || prev.stamp.startsWith(`${stamp}|`)) ? prev.kind : undefined;
-  });
-  for (const dir of scan.unreadable) failures.push(`could not read ${dir}`);
-  const scannedBytes = scan.files.reduce((n, f) => n + (f.kind === 'symlink' ? 0 : f.stat.size), 0);
-  log(
-    `host-backup: scanned ${scan.files.length} paths (${gib(scannedBytes)}), skipped ${scan.skippedClones.length} git clones with a remote and ${scan.skippedVenvs.length} Python venvs`,
-  );
+  const store = new StateStore(path.join(config.stateDir, 'state.db'));
+  try {
+    return await backupWith(store);
+  } finally {
+    store.close();
+  }
 
-  const seen = new Set(scan.files.map((f) => f.path));
-  const changed = scan.files.filter((f) => state.entries[f.path]?.stamp !== f.stamp);
-  const tombstones = Object.keys(state.entries).filter((p) => !seen.has(p) && !underAny(p, scan.unreadable));
-  log(`host-backup: ${changed.length} changed since the last upload, ${tombstones.length} gone`);
+  async function backupWith(store: StateStore): Promise<RunResult> {
+    const dirsFile = path.join(manifestDir, `${runId}.dirs.jsonl`);
+    const dirsFd = fs.openSync(dirsFile, 'w', 0o600);
+    const stagedPath = (p: string) => path.join(staging, p.replace(/^\/+/, ''));
 
-  let uploadedFiles = 0;
-  let uploadedBytes = 0;
-  if (opts.dryRun) {
-    const bytes = changed.reduce((n, f) => n + (f.kind === 'symlink' ? 0 : f.stat.size), 0);
-    log(`host-backup: dry run, would stage up to ${gib(bytes)}`);
-  } else {
-    const snapshotter = opts.snapshotter ?? makeSqliteSnapshotter(path.join(config.stateDir, 'sqlite-work'));
-    let pending: { file: ScannedFile; entry: StateEntry }[] = [];
-    let pendingBytes = 0;
-
-    const flush = async () => {
-      if (pending.length === 0) return;
+    const commit = async (paths: string[], what: string, onSuccess: () => void): Promise<boolean> => {
+      store.markDirty(paths, pass);
       try {
         await opts.uploader.uploadTree(staging, 'files/');
-        for (const { entry } of pending) state.entries[entry.path] = entry;
-        uploadedFiles += pending.length;
-        uploadedBytes += pendingBytes;
-        saveState(stateFile, state);
-        log(`host-backup: uploaded ${uploadedFiles} files (${gib(uploadedBytes)}) so far`);
+        onSuccess();
+        store.markClean(paths);
+        return true;
       } catch (err) {
-        failures.push(`upload of a ${pending.length}-file batch failed: ${message(err)}`);
+        failures.push(`upload of ${what} failed: ${message(err)}`);
+        return false;
+      } finally {
+        store.sync();
+        fs.rmSync(staging, { recursive: true, force: true });
+        fs.mkdirSync(staging, { mode: 0o700 });
       }
-      fs.rmSync(staging, { recursive: true, force: true });
+    };
+
+    let pending: StateEntry[] = [];
+    let pendingBytes = 0;
+    const flush = async () => {
+      if (pending.length === 0) return;
+      const batch = pending;
+      const bytes = pendingBytes;
       pending = [];
       pendingBytes = 0;
+      const ok = await commit(
+        batch.map((e) => e.path),
+        `a ${batch.length}-file batch`,
+        () => {
+          for (const entry of batch) store.put(entry, pass);
+        },
+      );
+      if (ok) {
+        result.uploadedFiles += batch.length;
+        result.uploadedBytes += bytes;
+        log(`host-backup: uploaded ${result.uploadedFiles} files (${gib(result.uploadedBytes)}) so far`);
+      }
     };
 
     const record = (f: ScannedFile, sha256: string, size: number): StateEntry => ({
@@ -514,109 +751,206 @@ export async function runBackup(config: BackupConfig, opts: RunOptions): Promise
       ...(f.target !== undefined ? { target: f.target } : {}),
     });
 
-    const stage = async (f: ScannedFile, staged: string, sha256: string, size: number) => {
+    const stage = (f: ScannedFile, prev: KnownEntry | undefined, sha256: string, size: number) => {
       const entry = record(f, sha256, size);
-      const prev = state.entries[f.path];
-      if (prev && prev.sha256 === sha256) {
-        state.entries[f.path] = entry;
-        fs.rmSync(staged, { force: true });
+      if (prev && prev.sha256 === sha256 && !prev.dirty) {
+        store.put(entry, pass);
+        fs.rmSync(stagedPath(f.path), { force: true });
         return;
       }
-      pending.push({ file: f, entry });
+      pending.push(entry);
       pendingBytes += size;
+    };
+
+    const snapshotter = opts.snapshotter ?? makeSqliteSnapshotter(path.join(config.stateDir, 'sqlite-work'));
+    let sqliteQueue: { file: ScannedFile; prev: KnownEntry | undefined }[] = [];
+    let sqliteQueueBytes = 0;
+    const drainSqlite = async () => {
+      if (sqliteQueue.length === 0) return;
+      const chunk = sqliteQueue;
+      sqliteQueue = [];
+      sqliteQueueBytes = 0;
+      const results = await snapshotter(
+        chunk.map(({ file: f }) => ({ src: f.path, dest: stagedPath(f.path), uid: f.stat.uid, gid: f.stat.gid })),
+      );
+      for (const { file: f, prev } of chunk) {
+        const err = results.get(f.path);
+        const staged = stagedPath(f.path);
+        if (err !== null) {
+          if (fs.existsSync(f.path)) failures.push(`sqlite backup of ${f.path} failed: ${err ?? 'no result'}`);
+          fs.rmSync(staged, { force: true });
+          continue;
+        }
+        stage(f, prev, await sha256File(staged), fs.statSync(staged).size);
+      }
       if (pendingBytes >= batchBytes) await flush();
     };
 
-    const stagedPath = (p: string) => path.join(staging, p.replace(/^\/+/, ''));
-
-    for (const f of changed.filter((c) => c.kind === 'symlink')) {
-      state.entries[f.path] = record(f, '', 0);
-    }
-
-    for (const f of changed.filter((c) => c.kind === 'file')) {
-      try {
-        const { sha256, size } = await copyHashed(f.path, stagedPath(f.path));
-        await stage(f, stagedPath(f.path), sha256, size);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        failures.push(`could not read ${f.path}: ${message(err)}`);
+    const knownKind = (file: string, stamp: string) => {
+      const prev = store.get(file);
+      return prev && (prev.stamp === stamp || prev.stamp.startsWith(`${stamp}|`)) ? prev.kind : undefined;
+    };
+    let changedBytes = 0;
+    for (const item of walkSources(sources, config.exclude ?? [], report, opts.remoteCheck, knownKind)) {
+      if ('dir' in item) {
+        fs.writeSync(dirsFd, `${JSON.stringify(item.dir)}\n`);
+        continue;
       }
-    }
-
-    const sqlite = changed.filter((c) => c.kind === 'sqlite');
-    const SQLITE_CHUNK = 200;
-    for (let i = 0; i < sqlite.length; i += SQLITE_CHUNK) {
-      const chunk = sqlite.slice(i, i + SQLITE_CHUNK);
-      const results = await snapshotter(
-        chunk.map((f) => ({ src: f.path, dest: stagedPath(f.path), uid: f.stat.uid, gid: f.stat.gid })),
-      );
-      for (const f of chunk) {
-        const err = results.get(f.path);
-        if (err !== null) {
-          if (fs.existsSync(f.path)) failures.push(`sqlite backup of ${f.path} failed: ${err ?? 'no result'}`);
+      const f = item.file;
+      result.scannedFiles++;
+      if (f.kind !== 'symlink') result.scannedBytes += f.stat.size;
+      const prev = store.get(f.path);
+      if (prev) store.see(f.path, pass);
+      if (prev && prev.stamp === f.stamp && !prev.dirty) continue;
+      result.changedFiles++;
+      if (opts.dryRun) {
+        if (f.kind !== 'symlink') changedBytes += f.stat.size;
+        continue;
+      }
+      if (f.kind === 'symlink') {
+        store.put(record(f, '', 0), pass);
+      } else if (f.kind === 'sqlite') {
+        sqliteQueue.push({ file: f, prev });
+        sqliteQueueBytes += f.stat.size;
+        if (sqliteQueue.length >= SQLITE_CHUNK_FILES || sqliteQueueBytes >= batchBytes) await drainSqlite();
+      } else {
+        try {
+          const { sha256, size } = await copyHashed(f.path, stagedPath(f.path));
+          stage(f, prev, sha256, size);
+        } catch (err) {
           fs.rmSync(stagedPath(f.path), { force: true });
-          continue;
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+            failures.push(`could not read ${f.path}: ${message(err)}`);
         }
-        const staged = stagedPath(f.path);
-        await stage(f, staged, await sha256File(staged), fs.statSync(staged).size);
+        if (pendingBytes >= batchBytes) await flush();
       }
     }
+    fs.closeSync(dirsFd);
+    await drainSqlite();
     await flush();
 
-    if (tombstones.length > 0) {
-      const empties = tombstones.filter((p) => state.entries[p].kind !== 'symlink');
+    for (const p of report.unreadable) {
+      failures.push(`could not read ${p}`);
+      store.seeUnder(p, pass);
+    }
+    log(
+      `host-backup: scanned ${result.scannedFiles} paths (${gib(result.scannedBytes)}), ${result.changedFiles} changed; skipped ${report.skippedClones.length} git clones with a remote and ${report.skippedVenvs.length} Python venvs`,
+    );
+
+    const gone = store.unseen(pass);
+    result.tombstoned = gone.length;
+    if (opts.dryRun) {
+      log(`host-backup: dry run, would stage up to ${gib(changedBytes)} and tombstone ${gone.length} paths`);
+      store.close();
+      fs.rmSync(dirsFile, { force: true });
+      return result;
+    }
+    if (gone.length > 0) {
+      const empties = gone.filter((g) => g.kind !== 'symlink').map((g) => g.path);
       for (const p of empties) {
         fs.mkdirSync(path.dirname(stagedPath(p)), { recursive: true });
         fs.writeFileSync(stagedPath(p), '');
       }
-      try {
-        if (empties.length > 0) await opts.uploader.uploadTree(staging, 'files/');
-        for (const p of tombstones) delete state.entries[p];
-        saveState(stateFile, state);
-      } catch (err) {
-        failures.push(`tombstone upload failed: ${message(err)}`);
-      }
-      fs.rmSync(staging, { recursive: true, force: true });
+      const all = gone.map((g) => g.path);
+      if (empties.length === 0) store.remove(all);
+      else await commit(empties, `${empties.length} tombstones`, () => store.remove(all));
     }
-    saveState(stateFile, state);
-  }
 
-  const manifest: Manifest = {
-    version: 1,
-    runId,
-    hostname: os.hostname(),
-    startedAt: started.toISOString(),
-    finishedAt: now().toISOString(),
-    failures,
-    entries: Object.values(state.entries)
-      .filter((e) => seen.has(e.path))
-      .map(toManifestEntry)
-      .sort((a, b) => a.path.localeCompare(b.path)),
-  };
-  if (!opts.dryRun) {
-    const file = path.join(config.stateDir, 'manifests', `${runId}.json.gz`);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, zlib.gzipSync(JSON.stringify(manifest)), { mode: 0o600 });
+    const manifestFile = path.join(manifestDir, `${runId}.jsonl.gz`);
+    result.manifestEntries = await writeManifest(manifestFile, {
+      header: { runId, hostname: os.hostname(), startedAt: started.toISOString() },
+      entries: store.manifestEntries(pass),
+      dirsFile,
+      trailer: () => ({ finishedAt: now().toISOString(), failures }),
+    });
+    store.close();
+    fs.rmSync(dirsFile, { force: true });
     try {
-      await opts.uploader.uploadFile(file, `manifests/${runId}.json.gz`);
-      pruneLocalManifests(path.dirname(file), 7);
+      await opts.uploader.uploadFile(manifestFile, `manifests/${runId}.jsonl.gz`);
+      pruneLocalManifests(manifestDir, 7);
     } catch (err) {
       failures.push(`manifest upload failed: ${message(err)}`);
     }
+    return result;
   }
-  return {
-    manifest,
-    uploadedFiles,
-    uploadedBytes,
-    tombstoned: tombstones.length,
-    scannedBytes,
-    skippedClones: scan.skippedClones,
-    warnings: scan.warnings,
+}
+
+async function writeManifest(
+  file: string,
+  parts: {
+    header: { runId: string; hostname: string; startedAt: string };
+    entries: Iterable<ManifestEntry>;
+    dirsFile: string;
+    trailer: () => { finishedAt: string; failures: string[] };
+  },
+): Promise<number> {
+  const gzip = zlib.createGzip();
+  const out = fs.createWriteStream(file, { mode: 0o600 });
+  gzip.pipe(out);
+  const done = new Promise<void>((resolve, reject) => {
+    out.on('finish', resolve);
+    out.on('error', reject);
+    gzip.on('error', reject);
+  });
+  const line = async (value: unknown) => {
+    if (!gzip.write(`${JSON.stringify(value)}\n`)) await new Promise<void>((r) => gzip.once('drain', () => r()));
   };
+  await line({ header: parts.header });
+  let count = 0;
+  for (const e of parts.entries) {
+    await line({ e });
+    count++;
+  }
+  const dirs = readline.createInterface({ input: fs.createReadStream(parts.dirsFile), crlfDelay: Infinity });
+  for await (const d of dirs) if (d) await line({ d: JSON.parse(d) as DirEntry });
+  await line({ trailer: parts.trailer() });
+  gzip.end();
+  await done;
+  return count;
+}
+
+export async function readManifest(
+  file: string,
+  keep: (p: string) => boolean = () => true,
+): Promise<Manifest & { complete: boolean }> {
+  const manifest: Manifest & { complete: boolean } = {
+    runId: '',
+    hostname: '',
+    startedAt: '',
+    finishedAt: '',
+    failures: [],
+    entries: [],
+    dirs: [],
+    complete: false,
+  };
+  const lines = readline.createInterface({
+    input: fs.createReadStream(file).pipe(zlib.createGunzip()),
+    crlfDelay: Infinity,
+  });
+  for await (const raw of lines) {
+    if (!raw) continue;
+    const row = JSON.parse(raw) as {
+      header?: { runId: string; hostname: string; startedAt: string };
+      e?: ManifestEntry;
+      d?: DirEntry;
+      trailer?: { finishedAt: string; failures: string[] };
+    };
+    if (row.header) Object.assign(manifest, row.header);
+    else if (row.e && keep(row.e.path)) manifest.entries.push(row.e);
+    else if (row.d && keep(row.d.path)) manifest.dirs.push(row.d);
+    else if (row.trailer) {
+      Object.assign(manifest, row.trailer);
+      manifest.complete = true;
+    }
+  }
+  return manifest;
 }
 
 function pruneLocalManifests(dir: string, keep: number): void {
-  const names = fs.readdirSync(dir).sort();
+  const names = fs
+    .readdirSync(dir)
+    .filter((n) => n.endsWith('.jsonl.gz'))
+    .sort();
   for (const name of names.slice(0, Math.max(0, names.length - keep))) fs.rmSync(path.join(dir, name));
 }
 
@@ -633,27 +967,50 @@ export interface RestoreSource {
 }
 
 function awsRestoreSource(bucket: string): RestoreSource {
-  const json = (args: string[]): unknown => {
-    const res = spawnSync('aws', [...args, '--output', 'json'], { encoding: 'utf8', maxBuffer: 1024 ** 3 });
+  const aws = (args: string[]): string => {
+    const res = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 1024 ** 3 });
     if (res.status !== 0) throw new Error(`aws ${args.slice(0, 2).join(' ')} failed: ${res.stderr.trim()}`);
-    return res.stdout.trim() ? JSON.parse(res.stdout) : {};
+    return res.stdout;
   };
+  const rows = (out: string) =>
+    out
+      .split('\n')
+      .filter((l) => l && l !== 'None')
+      .map((l) => l.split('\t'));
   return {
-    listManifests: async () => {
-      const out = json(['s3api', 'list-objects-v2', '--bucket', bucket, '--prefix', 'manifests/']) as {
-        Contents?: { Key: string; LastModified: string }[];
-      };
-      return (out.Contents ?? []).map((c) => ({ key: c.Key, lastModified: c.LastModified }));
-    },
-    listVersions: async (prefix) => {
-      const out = json(['s3api', 'list-object-versions', '--bucket', bucket, '--prefix', prefix]) as {
-        Versions?: ObjectVersion[];
-      };
-      return out.Versions ?? [];
-    },
+    listManifests: async () =>
+      rows(
+        aws([
+          's3api',
+          'list-objects-v2',
+          '--bucket',
+          bucket,
+          '--prefix',
+          'manifests/',
+          '--query',
+          'Contents[].[Key,LastModified]',
+          '--output',
+          'text',
+        ]),
+      ).map(([key, lastModified]) => ({ key, lastModified })),
+    listVersions: async (prefix) =>
+      rows(
+        aws([
+          's3api',
+          'list-object-versions',
+          '--bucket',
+          bucket,
+          '--prefix',
+          prefix,
+          '--query',
+          'Versions[].[Key,VersionId,LastModified]',
+          '--output',
+          'text',
+        ]),
+      ).map(([Key, VersionId, LastModified]) => ({ Key, VersionId, LastModified })),
     getObject: async (key, versionId, dest) => {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
-      json([
+      aws([
         's3api',
         'get-object',
         '--bucket',
@@ -671,6 +1028,7 @@ export interface RestoreResult {
   manifest: string;
   restored: number;
   failures: string[];
+  manifestFailures: string[];
 }
 
 export async function restore(
@@ -679,24 +1037,25 @@ export async function restore(
 ): Promise<RestoreResult> {
   const log = opts.log ?? ((line: string) => console.log(line));
   const asOf = opts.asOf ?? new Date();
+  if (fs.existsSync(opts.dest) && fs.readdirSync(opts.dest).length > 0) {
+    throw new Error(`${opts.dest} is not empty; restore only into an empty directory`);
+  }
   const manifests = (await source.listManifests())
-    .filter((m) => new Date(m.lastModified) <= asOf)
+    .filter((m) => MANIFEST_KEY.test(m.key) && new Date(m.lastModified) <= asOf)
     .sort((a, b) => a.lastModified.localeCompare(b.lastModified));
   const chosen = manifests.at(-1);
   if (!chosen) throw new Error(`no manifest written at or before ${asOf.toISOString()}`);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'host-restore-'));
   try {
-    await source.getObject(chosen.key, null, path.join(tmp, 'manifest.json.gz'));
-    const manifest = JSON.parse(
-      zlib.gunzipSync(fs.readFileSync(path.join(tmp, 'manifest.json.gz'))).toString(),
-    ) as Manifest;
-    const cutoff = new Date(chosen.lastModified).getTime();
     const prefix = opts.prefix ? path.resolve(opts.prefix) : '/';
-    const wanted = manifest.entries.filter(
-      (e) => e.path === prefix || e.path.startsWith(prefix === '/' ? '/' : `${prefix}/`),
-    );
-    log(`host-restore: manifest ${chosen.key} (${manifest.entries.length} entries), restoring ${wanted.length}`);
+    const within = (p: string) => p === prefix || p.startsWith(prefix === '/' ? '/' : `${prefix}/`);
+    await source.getObject(chosen.key, null, path.join(tmp, 'manifest.jsonl.gz'));
+    const manifest = await readManifest(path.join(tmp, 'manifest.jsonl.gz'), within);
+    if (!manifest.complete) throw new Error(`${chosen.key} is truncated (no trailer line)`);
+    for (const f of manifest.failures) log(`host-restore: warning: that night's run reported: ${f}`);
+    log(`host-restore: manifest ${chosen.key}, restoring ${manifest.entries.length} paths under ${prefix}`);
 
+    const cutoff = new Date(chosen.lastModified).getTime();
     const versions = new Map<string, ObjectVersion[]>();
     for (const v of await source.listVersions(`files/${prefix.replace(/^\/+/, '')}`)) {
       if (new Date(v.LastModified).getTime() > cutoff) continue;
@@ -704,21 +1063,16 @@ export async function restore(
     }
     const failures: string[] = [];
     let restored = 0;
-    for (const e of wanted) {
-      const out = path.join(opts.dest, e.path);
-      if (e.kind === 'symlink') {
-        fs.mkdirSync(path.dirname(out), { recursive: true });
-        fs.rmSync(out, { force: true });
-        fs.symlinkSync(e.target ?? '', out);
-        restored++;
-        continue;
-      }
-      const candidates = (versions.get(`files/${e.path.replace(/^\/+/, '')}`) ?? []).sort((a, b) =>
-        b.LastModified.localeCompare(a.LastModified),
-      );
+    const outPath = (p: string) => path.join(opts.dest, p);
+    for (const d of manifest.dirs) fs.mkdirSync(outPath(d.path), { recursive: true });
+
+    for (const e of manifest.entries.filter((w) => w.kind !== 'symlink')) {
+      const out = outPath(e.path);
+      const key = `files/${e.path.replace(/^\/+/, '')}`;
+      const candidates = (versions.get(key) ?? []).sort((a, b) => b.LastModified.localeCompare(a.LastModified));
       let ok = false;
       for (const v of candidates) {
-        await source.getObject(`files/${e.path.replace(/^\/+/, '')}`, v.VersionId, out);
+        await source.getObject(key, v.VersionId, out);
         if ((await sha256File(out)) === e.sha256) {
           ok = true;
           break;
@@ -729,15 +1083,35 @@ export async function restore(
         failures.push(`no retained version of ${e.path} matches sha256 ${e.sha256}`);
         continue;
       }
-      fs.chmodSync(out, e.mode & 0o7777);
-      if (process.getuid?.() === 0) fs.chownSync(out, e.uid, e.gid);
+      applyMetadata(out, e);
       fs.utimesSync(out, new Date(e.mtimeMs), new Date(e.mtimeMs));
       restored++;
     }
-    return { manifest: chosen.key, restored, failures };
+
+    for (const e of manifest.entries.filter((w) => w.kind === 'symlink')) {
+      const out = outPath(e.path);
+      try {
+        fs.mkdirSync(path.dirname(out), { recursive: true });
+        fs.symlinkSync(e.target ?? '', out);
+        if (process.getuid?.() === 0) fs.lchownSync(out, e.uid, e.gid);
+        restored++;
+      } catch (err) {
+        failures.push(`could not recreate symlink ${e.path}: ${message(err)}`);
+      }
+    }
+
+    for (const d of [...manifest.dirs].sort((a, b) => b.path.length - a.path.length)) {
+      applyMetadata(outPath(d.path), d);
+    }
+    return { manifest: chosen.key, restored, failures, manifestFailures: manifest.failures };
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+function applyMetadata(out: string, meta: { mode: number; uid: number; gid: number }): void {
+  if (process.getuid?.() === 0) fs.chownSync(out, meta.uid, meta.gid);
+  fs.chmodSync(out, meta.mode & 0o7777);
 }
 
 function loadConfig(file: string): BackupConfig {
@@ -775,15 +1149,13 @@ async function main(argv: string[]): Promise<number> {
       uploader: awsUploader(config.bucket),
       dryRun: args.includes('--dry-run'),
     });
-    for (const w of result.warnings) console.log(`host-backup: warning: ${w}`);
+    for (const w of result.warnings.slice(0, 50)) console.log(`host-backup: warning: ${w}`);
     console.log(
-      `host-backup: ${result.manifest.runId}: ${result.manifest.entries.length} paths in the manifest, uploaded ${result.uploadedFiles} files (${gib(result.uploadedBytes)}), ${result.tombstoned} gone`,
+      `host-backup: ${result.runId}: ${result.manifestEntries} paths in the manifest, uploaded ${result.uploadedFiles} files (${gib(result.uploadedBytes)}), ${result.tombstoned} gone`,
     );
-    if (result.manifest.failures.length > 0) {
-      for (const f of result.manifest.failures.slice(0, 20)) console.error(`host-backup: FAILED: ${f}`);
-      console.error(
-        `host-backup: error: ${result.manifest.failures.length} failures; first: ${result.manifest.failures[0]}`,
-      );
+    if (result.failures.length > 0) {
+      for (const f of result.failures.slice(0, 20)) console.error(`host-backup: FAILED: ${f}`);
+      console.error(`host-backup: error: ${result.failures.length} failures; first: ${result.failures[0]}`);
       return 1;
     }
     return 0;

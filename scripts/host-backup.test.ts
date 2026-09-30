@@ -8,12 +8,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   globToRegExp,
+  readManifest,
   restore,
   runBackup,
   scanSources,
   snapshotSqlite,
   type BackupConfig,
-  type Manifest,
   type ObjectVersion,
   type RestoreSource,
   type Uploader,
@@ -46,6 +46,7 @@ class FakeBucket implements Uploader, RestoreSource {
   versions = new Map<string, { body: Buffer; at: string; id: string }[]>();
   tick = 0;
   failNextTree = false;
+  partialFailNextTree = false;
 
   private put(key: string, body: Buffer) {
     const at = new Date(Date.UTC(2026, 0, 1, 0, 0, this.tick++)).toISOString();
@@ -71,6 +72,10 @@ class FakeBucket implements Uploader, RestoreSource {
       }
     };
     walk(dir);
+    if (this.partialFailNextTree) {
+      this.partialFailNextTree = false;
+      throw new Error('simulated failure after some files landed');
+    }
   }
 
   async uploadFile(file: string, key: string) {
@@ -99,6 +104,12 @@ class FakeBucket implements Uploader, RestoreSource {
 }
 
 const keyOf = (p: string) => `files/${p.replace(/^\/+/, '')}`;
+
+async function manifestOf(bucket: FakeBucket, runId: string) {
+  const file = path.join(tmp, `${runId}.jsonl.gz`);
+  fs.writeFileSync(file, bucket.current(`manifests/${runId}.jsonl.gz`)!);
+  return readManifest(file);
+}
 const quiet = { log: () => {}, remoteCheck: () => false };
 
 describe('globToRegExp', () => {
@@ -121,7 +132,9 @@ describe('scanSources', () => {
     write('local-repo/.git/HEAD', 'ref');
     write('local-repo/work.txt', 'w');
     write('db.sqlite-journal', '');
-    write('db.sqlite', 'not really sqlite');
+    const sqlite = new Database(path.join(src, 'db.sqlite'));
+    sqlite.exec('CREATE TABLE t (x)');
+    sqlite.close();
     write('orphan-journal', 'no sibling, so kept');
     fs.symlinkSync('keep.txt', path.join(src, 'link'));
 
@@ -157,6 +170,13 @@ describe('scanSources', () => {
     write('untracked-config.json', '{}');
     const scan = scanSources([src], [], () => true);
     expect(scan.files.map((f) => path.relative(src, f.path))).toEqual(['untracked-config.json']);
+  });
+
+  it('keeps a -journal file whose sibling is not a SQLite database', () => {
+    write('customer', 'plain text');
+    write('customer-journal', 'notes');
+    const scan = scanSources([src], [], () => false);
+    expect(scan.files.map((f) => path.relative(src, f.path)).sort()).toEqual(['customer', 'customer-journal']);
   });
 
   it('classifies a SQLite file by its header, not its name', () => {
@@ -201,7 +221,7 @@ describe('runBackup', () => {
 
     const first = await runBackup(config, { uploader: bucket, ...quiet });
     expect(first.uploadedFiles).toBe(2);
-    expect(first.manifest.failures).toEqual([]);
+    expect(first.failures).toEqual([]);
     expect(bucket.current(keyOf(a))?.toString()).toBe('one');
 
     const second = await runBackup(config, { uploader: bucket, ...quiet });
@@ -215,7 +235,7 @@ describe('runBackup', () => {
     expect(third.tombstoned).toBe(1);
     expect(bucket.current(keyOf(a))?.toString()).toBe('one, edited');
     expect(bucket.current(keyOf(b))?.length).toBe(0);
-    expect(third.manifest.entries.map((e) => e.path)).toEqual([a]);
+    expect((await manifestOf(bucket, third.runId)).entries.map((e) => e.path)).toEqual([a]);
   });
 
   it('does not re-upload a file whose mtime moved but whose content did not', async () => {
@@ -234,11 +254,67 @@ describe('runBackup', () => {
     const a = write('a.txt', 'one');
     bucket.failNextTree = true;
     const failed = await runBackup(config, { uploader: bucket, ...quiet });
-    expect(failed.manifest.failures).toHaveLength(1);
-    expect(failed.manifest.entries).toEqual([]);
+    expect(failed.failures).toHaveLength(1);
+    expect((await manifestOf(bucket, failed.runId)).entries).toEqual([]);
     const retried = await runBackup(config, { uploader: bucket, ...quiet });
     expect(retried.uploadedFiles).toBe(1);
     expect(bucket.current(keyOf(a))?.toString()).toBe('one');
+  });
+
+  it('re-uploads after a batch failed partway, even if the content went back to what was last recorded', async () => {
+    const bucket = new FakeBucket();
+    const a = write('a.txt', 'A');
+    await runBackup(config, { uploader: bucket, ...quiet });
+    fs.writeFileSync(a, 'B');
+    bucket.partialFailNextTree = true;
+    const failed = await runBackup(config, { uploader: bucket, ...quiet });
+    expect(failed.failures).toHaveLength(1);
+    expect(bucket.current(keyOf(a))?.toString()).toBe('B');
+
+    fs.writeFileSync(a, 'A');
+    const healed = await runBackup(config, { uploader: bucket, ...quiet });
+    expect(healed.uploadedFiles).toBe(1);
+    expect(bucket.current(keyOf(a))?.toString()).toBe('A');
+  });
+
+  it('keeps an unreadable file in the manifest and does not tombstone it', async () => {
+    if (process.getuid?.() === 0) return;
+    const bucket = new FakeBucket();
+    const a = write('a.txt', 'A');
+    await runBackup(config, { uploader: bucket, ...quiet });
+    fs.chmodSync(a, 0o000);
+    fs.utimesSync(a, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
+    try {
+      const result = await runBackup(config, { uploader: bucket, ...quiet });
+      expect(result.failures.join('\n')).toMatch(/a\.txt/);
+      expect(result.tombstoned).toBe(0);
+      expect((await manifestOf(bucket, result.runId)).entries.map((e) => e.path)).toEqual([a]);
+      expect(bucket.current(keyOf(a))?.toString()).toBe('A');
+    } finally {
+      fs.chmodSync(a, 0o644);
+    }
+  });
+
+  it('refuses to start while another live run holds the lock', async () => {
+    fs.mkdirSync(config.stateDir, { recursive: true });
+    fs.writeFileSync(path.join(config.stateDir, 'run.lock'), String(process.pid));
+    await expect(runBackup(config, { uploader: new FakeBucket(), ...quiet })).rejects.toThrow(/holds/);
+    fs.writeFileSync(path.join(config.stateDir, 'run.lock'), '999999999');
+    const result = await runBackup(config, { uploader: new FakeBucket(), ...quiet });
+    expect(result.failures).toEqual([]);
+  });
+
+  it('keeps every SQLite copy of a chunk when a batch fills partway through it', async () => {
+    const bucket = new FakeBucket();
+    for (const name of ['one.db', 'two.db', 'three.db']) {
+      const db = new Database(path.join(src, name));
+      db.exec(`CREATE TABLE t (x); INSERT INTO t VALUES ('${name}')`);
+      db.close();
+    }
+    config.batchBytes = 1;
+    const result = await runBackup(config, { uploader: bucket, ...quiet });
+    expect(result.failures).toEqual([]);
+    expect(result.uploadedFiles).toBe(3);
   });
 
   it('captures a live SQLite database through the backup API, WAL content included', async () => {
@@ -249,7 +325,7 @@ describe('runBackup', () => {
     writer.exec('CREATE TABLE t (x); INSERT INTO t VALUES (1), (2), (3)');
     try {
       const result = await runBackup(config, { uploader: bucket, ...quiet });
-      expect(result.manifest.failures).toEqual([]);
+      expect(result.failures).toEqual([]);
       const copy = path.join(tmp, 'copy.db');
       fs.writeFileSync(copy, bucket.current(keyOf(dbPath))!);
       const check = new Database(copy, { readonly: true });
@@ -270,22 +346,23 @@ describe('runBackup', () => {
     config.commands = [{ name: 'dump.sql', argv: ['sh', '-c', 'echo dumped'] }];
     const result = await runBackup(config, { uploader: bucket, ...quiet });
     const generated = path.join(config.stateDir, 'generated', 'dump.sql');
-    expect(result.manifest.failures).toEqual([]);
+    expect(result.failures).toEqual([]);
     expect(bucket.current(keyOf(generated))?.toString()).toBe('dumped\n');
   });
 
   it('fails the run when a command fails', async () => {
     config.commands = [{ name: 'dump.sql', argv: ['sh', '-c', 'exit 3'] }];
     const result = await runBackup(config, { uploader: new FakeBucket(), ...quiet });
-    expect(result.manifest.failures[0]).toMatch(/command dump.sql failed: exit 3/);
+    expect(result.failures[0]).toMatch(/command dump.sql failed: exit 3/);
   });
 
   it('writes a manifest naming every path and its sha256', async () => {
     const bucket = new FakeBucket();
     const a = write('a.txt', 'one');
     const result = await runBackup(config, { uploader: bucket, ...quiet });
-    const body = bucket.current(`manifests/${result.manifest.runId}.json.gz`)!;
-    const manifest = JSON.parse(zlib.gunzipSync(body).toString()) as Manifest;
+    const manifest = await manifestOf(bucket, result.runId);
+    expect(manifest.complete).toBe(true);
+    expect(manifest.dirs.map((d) => d.path)).toEqual([src]);
     expect(manifest.entries).toEqual([
       expect.objectContaining({
         path: a,
@@ -298,6 +375,23 @@ describe('runBackup', () => {
 });
 
 describe('snapshotSqlite', () => {
+  it('fails rather than producing an empty copy when the source stays locked', async () => {
+    const dbPath = path.join(src, 'locked.db');
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE t (x); INSERT INTO t VALUES (1)');
+    db.exec('BEGIN EXCLUSIVE; INSERT INTO t VALUES (2)');
+    try {
+      await expect(snapshotSqlite(dbPath, path.join(tmp, 'out.db'), { busyTimeoutMs: 50 })).rejects.toThrow();
+    } finally {
+      db.exec('ROLLBACK');
+      db.close();
+    }
+  });
+
+  it('refuses a path that better-sqlite3 would trim', async () => {
+    await expect(snapshotSqlite(path.join(src, 'x.db '), path.join(tmp, 'out.db'))).rejects.toThrow(/trims/);
+  });
+
   it('gives up with an error once its time budget is spent', async () => {
     const dbPath = path.join(src, 'busy.db');
     const db = new Database(dbPath);
@@ -342,6 +436,56 @@ describe('restore', () => {
     expect(result.restored).toBe(2);
     expect(fs.readlinkSync(path.join(dest, src, 'keep', 'link'))).toBe('a.txt');
     expect(fs.existsSync(path.join(dest, src, 'other'))).toBe(false);
+  });
+
+  it('ignores objects under manifests/ that are not run manifests', async () => {
+    const bucket = new FakeBucket();
+    write('a.txt', 'a');
+    await runBackup(config, { uploader: bucket, ...quiet });
+    const probe = path.join(tmp, 'probe');
+    fs.writeFileSync(probe, 'probe');
+    await bucket.uploadFile(probe, 'manifests/_selftest/probe.txt');
+    const result = await restore(bucket, { dest: path.join(tmp, 'restore'), log: () => {} });
+    expect(result.restored).toBe(1);
+  });
+
+  it('refuses a destination that is not empty', async () => {
+    const dest = path.join(tmp, 'restore');
+    fs.mkdirSync(dest);
+    fs.writeFileSync(path.join(dest, 'x'), '');
+    await expect(restore(new FakeBucket(), { dest, log: () => {} })).rejects.toThrow(/not empty/);
+  });
+
+  it('never writes through a restored symlink', async () => {
+    const bucket = new FakeBucket();
+    const outside = path.join(tmp, 'outside');
+    fs.mkdirSync(outside);
+    write('real/f.txt', 'f');
+    fs.symlinkSync(outside, path.join(src, 'link'));
+    await runBackup(config, { uploader: bucket, ...quiet });
+    const manifestKey = (await bucket.listManifests())[0].key;
+    const lines = zlib.gunzipSync(bucket.current(manifestKey)!).toString().trim().split('\n');
+    const real = lines.map((l) => JSON.parse(l) as { e?: { path: string } }).find((r) => r.e?.path.endsWith('f.txt'))!;
+    const beneathLink = path.join(src, 'link', 'f.txt');
+    lines.splice(1, 0, JSON.stringify({ e: { ...real.e, path: beneathLink } }));
+    await bucket.uploadFile(path.join(src, 'real', 'f.txt'), keyOf(beneathLink));
+    const tampered = path.join(tmp, 'tampered.jsonl.gz');
+    fs.writeFileSync(tampered, zlib.gzipSync(`${lines.join('\n')}\n`));
+    await bucket.uploadFile(tampered, manifestKey);
+
+    const result = await restore(bucket, { dest: path.join(tmp, 'restore'), log: () => {} });
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(result.failures.join('\n')).toMatch(/could not recreate symlink/);
+  });
+
+  it('restores directory modes', async () => {
+    const bucket = new FakeBucket();
+    write('private/secret.txt', 's');
+    fs.chmodSync(path.join(src, 'private'), 0o700);
+    await runBackup(config, { uploader: bucket, ...quiet });
+    const dest = path.join(tmp, 'restore');
+    await restore(bucket, { dest, log: () => {} });
+    expect(fs.statSync(path.join(dest, src, 'private')).mode & 0o777).toBe(0o700);
   });
 
   it('refuses a version whose content does not match the manifest hash', async () => {
