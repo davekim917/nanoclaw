@@ -33,8 +33,9 @@ over absolute paths (`**` crosses `/`, `*` and `?` do not). Beyond those globs, 
   `<stateDir>/generated/<name>`.
 
 Nothing is dropped quietly. A path that cannot be read, or cannot be an S3 key (control
-characters, a backslash, over 1,000 bytes), fails the run and keeps its last uploaded
-version in the manifest. It is never treated as deleted. Rename or exclude such a path to
+characters, a backslash, over 1,000 bytes, a name or symlink target that is not valid UTF-8), fails the run and keeps its last uploaded
+version in the manifest, along with the directory metadata recorded beneath it (kept in the
+state DB). It is never treated as deleted. Rename or exclude such a path to
 clear the failure. A `-journal`/`-wal`/`-shm` file whose database cannot be read fails the run
 too, since uploading a sidecar without its database could later roll a restored copy back.
 Every run, dry runs included, takes an `flock` on `<stateDir>/run.lock` (`src/file-lock.ts`),

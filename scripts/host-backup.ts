@@ -169,8 +169,21 @@ function* walkSources(
 ): Generator<ScanItem> {
   const excludes = exclude.map(globToRegExp);
   const excluded = (p: string) => excludes.some((re) => re.test(p));
-  const visited = new Set<string>();
+  const walked = new Set<string>();
+  const fileRoots = new Set<string>();
   const emittedDirs = new Set<string>();
+  const lossless = (raw: Buffer, where: string): string | undefined => {
+    const text = raw.toString('utf8');
+    if (Buffer.from(text, 'utf8').equals(raw)) return text;
+    report.unreadable.push(where);
+    report.warnings.push(`cannot back up a name that is not valid UTF-8: ${JSON.stringify(where)}`);
+    return undefined;
+  };
+  const readNames = (dir: string): string[] =>
+    fs
+      .readdirSync(dir, { encoding: 'buffer' })
+      .map((raw) => lossless(raw, path.join(dir, raw.toString('latin1'))))
+      .filter((name): name is string => name !== undefined);
   const dirItem = (dir: string): ScanItem | undefined => {
     if (emittedDirs.has(dir)) return undefined;
     emittedDirs.add(dir);
@@ -187,7 +200,10 @@ function* walkSources(
       return undefined;
     }
     if (st.isSymbolicLink()) {
-      return { path: p, kind: 'symlink', stat: slim(st), stamp: statStamp(st), target: fs.readlinkSync(p) };
+      const target = lossless(fs.readlinkSync(p, { encoding: 'buffer' }), p);
+      return target === undefined
+        ? undefined
+        : { path: p, kind: 'symlink', stat: slim(st), stamp: statStamp(st), target };
     }
     if (!st.isFile()) return undefined;
     const base = path.basename(p);
@@ -220,9 +236,13 @@ function* walkSources(
   };
 
   function* visitDir(dir: string, isRoot: boolean): Generator<ScanItem> {
+    if (walked.has(dir)) return;
+    walked.add(dir);
+    const self = dirItem(dir);
+    if (self) yield self;
     let names: string[];
     try {
-      names = fs.readdirSync(dir);
+      names = readNames(dir);
     } catch (err) {
       report.unreadable.push(dir);
       report.warnings.push(`unreadable directory ${dir}: ${message(err)}`);
@@ -239,8 +259,6 @@ function* walkSources(
       report.skippedClones.push(dir);
       return;
     }
-    const self = dirItem(dir);
-    if (self) yield self;
     for (const name of names.sort()) {
       if (skipGitDir && name === '.git') continue;
       const p = path.join(dir, name);
@@ -255,8 +273,7 @@ function* walkSources(
       }
       if (!st) continue;
       if (st.isDirectory()) yield* visitDir(p, false);
-      else if (!visited.has(p)) {
-        visited.add(p);
+      else {
         const file = visitFile(p, st, siblings);
         if (file) yield { file };
       }
@@ -279,7 +296,7 @@ function* walkSources(
     let siblings = new Set<string>();
     try {
       st = fs.lstatSync(root, { throwIfNoEntry: false });
-      if (st && !st.isDirectory()) siblings = new Set(fs.readdirSync(path.dirname(root)));
+      if (st && !st.isDirectory()) siblings = new Set(readNames(path.dirname(root)));
     } catch (err) {
       report.unreadable.push(root);
       report.warnings.push(`unreadable source ${root}: ${message(err)}`);
@@ -289,8 +306,8 @@ function* walkSources(
       report.unreadable.push(root);
       report.warnings.push(`source missing: ${root}`);
     } else if (st.isDirectory()) yield* visitDir(root, true);
-    else if (!visited.has(root)) {
-      visited.add(root);
+    else if (!fileRoots.has(root)) {
+      fileRoots.add(root);
       const file = visitFile(root, st, siblings);
       if (file) yield { file };
     }
@@ -491,6 +508,14 @@ function prepareStatements(db: Database.Database) {
     get: db.prepare<[string], StateRow>('SELECT * FROM entries WHERE path = ?'),
     see: db.prepare('UPDATE entries SET seen_run = ? WHERE path = ?'),
     seeUnder: db.prepare("UPDATE entries SET seen_run = ? WHERE path = ? OR substr(path, 1, length(?) + 1) = ? || '/'"),
+    seeDirsUnder: db.prepare("UPDATE dirs SET seen_run = ? WHERE substr(path, 1, length(?) + 1) = ? || '/'"),
+    putDir: db.prepare(`INSERT INTO dirs (path, mode, uid, gid, seen_run) VALUES (@path, @mode, @uid, @gid, @run)
+      ON CONFLICT(path) DO UPDATE SET mode = excluded.mode, uid = excluded.uid, gid = excluded.gid,
+        seen_run = excluded.seen_run`),
+    manifestDirs: db.prepare<[string], DirEntry>(
+      'SELECT path, mode, uid, gid FROM dirs WHERE seen_run = ? ORDER BY path',
+    ),
+    pruneDirs: db.prepare('DELETE FROM dirs WHERE seen_run IS NOT ?'),
     put: db.prepare(`INSERT INTO entries
       (path, kind, size, sha256, mode, uid, gid, mtime_ms, target, stamp, dirty, seen_run)
       VALUES (@path, @kind, @size, @sha256, @mode, @uid, @gid, @mtimeMs, @target, @stamp, 0, @run)
@@ -532,6 +557,8 @@ class StateStore {
     this.db.exec(`CREATE TABLE IF NOT EXISTS entries (
       path TEXT PRIMARY KEY, kind TEXT, size INTEGER, sha256 TEXT, mode INTEGER, uid INTEGER, gid INTEGER,
       mtime_ms REAL, target TEXT, stamp TEXT, dirty INTEGER NOT NULL DEFAULT 0, seen_run TEXT)`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS dirs (
+      path TEXT PRIMARY KEY, mode INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, seen_run TEXT)`);
     this.stmts = prepareStatements(this.db);
     this.db.exec('BEGIN');
   }
@@ -565,7 +592,22 @@ class StateStore {
 
   seeUnder(p: string, run: string): void {
     this.stmts.seeUnder.run(run, p, p, p);
+    this.stmts.seeDirsUnder.run(run, p, p);
     this.op();
+  }
+
+  putDir(d: DirEntry, run: string): void {
+    this.stmts.putDir.run({ ...d, run });
+    this.op();
+  }
+
+  *manifestDirs(run: string): Generator<DirEntry> {
+    yield* this.stmts.manifestDirs.iterate(run);
+  }
+
+  pruneDirs(run: string): void {
+    this.stmts.pruneDirs.run(run);
+    this.sync();
   }
 
   put(e: StateEntry, run: string): void {
@@ -704,8 +746,6 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
   }
 
   async function backupWith(store: StateStore): Promise<RunResult> {
-    const dirsFile = path.join(manifestDir, `${runId}.dirs.jsonl`);
-    const dirsFd = fs.openSync(dirsFile, 'w', 0o600);
     const stagedPath = (p: string) => path.join(staging, p.replace(/^\/+/, ''));
 
     const commit = async (paths: string[], what: string, onSuccess: () => void): Promise<boolean> => {
@@ -803,7 +843,7 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
     let changedBytes = 0;
     for (const item of walkSources(sources, config.exclude ?? [], report, opts.remoteCheck, knownKind)) {
       if ('dir' in item) {
-        fs.writeSync(dirsFd, `${JSON.stringify(item.dir)}\n`);
+        store.putDir(item.dir, pass);
         continue;
       }
       const f = item.file;
@@ -835,7 +875,6 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
         if (pendingBytes >= batchBytes || pending.length >= BATCH_FILES) await flush();
       }
     }
-    fs.closeSync(dirsFd);
     await drainSqlite();
     await flush();
 
@@ -851,8 +890,6 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
     result.tombstoned = gone.length;
     if (opts.dryRun) {
       log(`host-backup: dry run, would stage up to ${gib(changedBytes)} and tombstone ${gone.length} paths`);
-      store.close();
-      fs.rmSync(dirsFile, { force: true });
       return result;
     }
     if (gone.length > 0) {
@@ -879,11 +916,10 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
     result.manifestEntries = await writeManifest(manifestFile, {
       header: { runId, hostname: os.hostname(), startedAt: started.toISOString() },
       entries: store.manifestEntries(pass),
-      dirsFile,
+      dirs: store.manifestDirs(pass),
       trailer: () => ({ finishedAt: now().toISOString(), failures }),
     });
-    store.close();
-    fs.rmSync(dirsFile, { force: true });
+    store.pruneDirs(pass);
     try {
       await opts.uploader.uploadFile(manifestFile, `manifests/${runId}.jsonl.gz`);
       pruneLocalManifests(manifestDir, 7);
@@ -899,7 +935,7 @@ async function writeManifest(
   parts: {
     header: { runId: string; hostname: string; startedAt: string };
     entries: Iterable<ManifestEntry>;
-    dirsFile: string;
+    dirs: Iterable<DirEntry>;
     trailer: () => { finishedAt: string; failures: string[] };
   },
 ): Promise<number> {
@@ -920,8 +956,7 @@ async function writeManifest(
     await line({ e });
     count++;
   }
-  const dirs = readline.createInterface({ input: fs.createReadStream(parts.dirsFile), crlfDelay: Infinity });
-  for await (const d of dirs) if (d) await line({ d: JSON.parse(d) as DirEntry });
+  for (const d of parts.dirs) await line({ d });
   await line({ trailer: parts.trailer() });
   gzip.end();
   await done;

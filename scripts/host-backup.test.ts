@@ -226,6 +226,13 @@ describe('scanSources', () => {
     expect(scan.files.map((f) => f.path)).toEqual([path.join(src, 'dir', 'a.txt')]);
   });
 
+  it('fails a file name that is not valid UTF-8 instead of silently skipping it', () => {
+    fs.writeFileSync(Buffer.concat([Buffer.from(`${src}/`), Buffer.from([0xff, 0x2e, 0x74])]), 'x');
+    const scan = scanSources([src], [], () => false);
+    expect(scan.files).toEqual([]);
+    expect(scan.unreadable).toHaveLength(1);
+  });
+
   it('reports a missing source as unreadable', () => {
     const scan = scanSources([path.join(tmp, 'nope')], [], () => false);
     expect(scan.unreadable).toEqual([path.join(tmp, 'nope')]);
@@ -311,6 +318,25 @@ describe('runBackup', () => {
       expect(bucket.current(keyOf(a))?.toString()).toBe('A');
     } finally {
       fs.chmodSync(a, 0o644);
+    }
+  });
+
+  it('keeps directory metadata under a directory that became unreadable', async () => {
+    if (process.getuid?.() === 0) return;
+    const bucket = new FakeBucket();
+    write('outer/inner/f.txt', 'f');
+    fs.chmodSync(path.join(src, 'outer', 'inner'), 0o700);
+    await runBackup(config, { uploader: bucket, ...quiet });
+    fs.chmodSync(path.join(src, 'outer'), 0o000);
+    try {
+      const result = await runBackup(config, { uploader: bucket, ...quiet });
+      expect(result.failures.length).toBeGreaterThan(0);
+      const manifest = await manifestOf(bucket, result.runId);
+      const inner = manifest.dirs.find((d) => d.path === path.join(src, 'outer', 'inner'));
+      expect(inner && inner.mode & 0o777).toBe(0o700);
+      expect(manifest.entries.map((e) => e.path)).toEqual([path.join(src, 'outer', 'inner', 'f.txt')]);
+    } finally {
+      fs.chmodSync(path.join(src, 'outer'), 0o755);
     }
   });
 
