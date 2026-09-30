@@ -60,7 +60,16 @@ async function supportTicketPolicy(agentGroupId: string): Promise<string | null>
   return str(process.env[scopedName]) ?? str(process.env.NANOCLAW_SUPPORT_TICKET_POLICY);
 }
 
+const DUPLICATE_CHECK_STEP =
+  `Before creating, search Linear for an OPEN issue from the same sender or their organisation about the same problem. ` +
+  `If one exists, do not create a new issue: comment on it with this email's context and call update_support_ticket with that issue's identifier and team. ` +
+  `Otherwise: `;
+
 function ticketCreationStep(policy: string | null): string {
+  return DUPLICATE_CHECK_STEP + ticketCreationAction(policy);
+}
+
+function ticketCreationAction(policy: string | null): string {
   return policy
     ? `Create the Linear issue using this operator-configured policy: ${policy} `
     : `Create the Linear issue in the appropriate team using the email subject as the title, include the complete email context in the description, choose priority from the reported impact, then immediately call update_support_ticket with the created issue identifier and team. `;

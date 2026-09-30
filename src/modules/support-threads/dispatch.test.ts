@@ -167,6 +167,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(seeded[0].content).toContain('operator-configured policy');
     expect(seeded[0].content).toContain('team EXAMPLE');
     expect(seeded[0].content).toContain('update_support_ticket');
+    expect(seeded[0].content).toMatch(/search Linear for an OPEN issue[\s\S]*Otherwise: Create the Linear issue/);
     expect(seeded[0].content).toContain('Subject: Depletions look wrong');
     expect(seeded[0].content).toContain('From: Jane <jane@acme.com>');
     expect(seeded[0].content).toContain('Date: Fri, 17 Jul 2026 16:40:55 -0400');
