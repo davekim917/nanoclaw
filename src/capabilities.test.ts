@@ -844,6 +844,19 @@ describe('buildSessionServicesSnapshot', () => {
         expect(use('Wix')).not.toContain('wixapis.com');
       });
 
+      it('cloudflare+wix shape with a cf token: the CLI entry is a separate, resolvable name', async () => {
+        const ag = await cloudflareWixShaped();
+        const tokenEnv = `CLOUDFLARE_API_TOKEN_${ag.folder.toUpperCase().replace(/-/g, '_')}`;
+        vi.stubEnv(tokenEnv, 'placeholder_for_onecli_proxy');
+        const services = (await buildSessionServicesSnapshot(ag.id)).services;
+
+        expect(services.filter((s) => s.name === 'Cloudflare')).toHaveLength(1);
+        const cli = services.find((s) => s.name === 'Cloudflare CLI');
+        expect(cli?.activation).toContain('cf cli search');
+        expect(cli?.activation).toContain(tokenEnv);
+        expect(cli?.activation).toContain('Never run `cf auth login`');
+      });
+
       it('the Wix REST imperative rides the REST half of the line', async () => {
         // A guessed site id writes to the WRONG SITE, so the rule belongs
         // wherever the REST surface is advertised.

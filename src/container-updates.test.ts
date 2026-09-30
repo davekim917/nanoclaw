@@ -61,6 +61,8 @@ describe('latest-stable release policy', () => {
     ['1.0.0-beta.9', '1.0.0', 'outdated'],
     ['1.0.0-beta.6', '1.0.0-beta.6', 'current'],
     ['1.0.0-beta.7', '1.0.0-beta.6', 'current'],
+    ['1.0.0-1', '1.0.0-alpha', 'outdated'],
+    ['1.0.0-beta', '1.0.0-beta.1', 'outdated'],
   ])('orders an opted-in prerelease pin %s against latest %s as %s', async (current, latest, status) => {
     const root = await mkdtemp(path.join(tmpdir(), 'container-updates-'));
     for (const dir of ['container/agent-runner', 'container/remotion']) {

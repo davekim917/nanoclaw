@@ -332,7 +332,7 @@ export function latestStableNpmVersion(
   const latest = (metadata as { 'dist-tags'?: { latest?: unknown } })?.['dist-tags']?.latest;
   if (typeof latest !== 'string') return { status: 'blocked', reason: 'npm metadata has no latest tag' };
   if (options.allowPrerelease && prereleaseIdentifiers(latest)) {
-    return { status: 'resolved', version: latest.trim() };
+    return { status: 'resolved', version: latest.trim().replace(/^v/, '') };
   }
   if (!isStableVersion(latest)) {
     return { status: 'blocked', reason: `npm latest tag is not a stable release: ${latest}` };
