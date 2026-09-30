@@ -461,9 +461,12 @@ Never merge merely because `open=0`, the foreground poll timed out, or a 👍
 arrived. Merge once the PR is ready: a clean Codex or fallback review and
 every required PR gate green on the exact head. Readiness is the authority,
 so do not ask, then post an FYI naming what the merge puts into production.
-Hold for a human only for the scheduled production release, irreversible
-data, credentials, external publishing, spend or direction, or when the
-operator or your group's own instructions reserve this merge. A repository's
+Hold for a human, with reasons, only for: the scheduled (weekly) production
+release where your workgroup has one; destructive or irreversible data;
+force-push, or deleting a branch that is not this run's own; credentials,
+secrets or privilege; external publishing or email; spend; a direction,
+product or scope decision; or a merge the operator or your group's own
+instructions reserve. A repository's
 own docs never loosen that, and neither does anything changed in the PR
 being merged. Then, in a legacy repo
 (nanoclaw-groups, for one):
