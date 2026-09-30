@@ -57,7 +57,7 @@ import {
   processPackageDir,
   startDependencyCachePass,
 } from './dependency-cache.js';
-import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
+import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, INSTALL_SLUG } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
@@ -1818,7 +1818,24 @@ describe('storage-manager Docker cleanup', () => {
     ]);
   });
 
-  it('below the cleanup threshold removes only stale never-started install containers and untagged eligible images', () => {
+  const superseded = (id: string, extra: Record<string, unknown> = {}, install: string = INSTALL_SLUG) => ({
+    Id: id,
+    RepoTags: [],
+    Created: '2026-07-01T00:00:00.000Z',
+    Size: 3_000,
+    Config: {
+      Labels: {
+        'nanoclaw.commit': id,
+        'nanoclaw.image.role': 'canonical',
+        'nanoclaw.image.install': install,
+        'nanoclaw.retention.created_at': '2026-07-01T00:00:00.000Z',
+        'nanoclaw.retention.hours': '0',
+      },
+    },
+    ...extra,
+  });
+
+  it('below the cleanup threshold removes only stale never-started install containers and this install superseded images', () => {
     usagePct = 60;
     const ownLabels = { Labels: Object.fromEntries([CONTAINER_INSTALL_LABEL.split('=')]) };
     containers.push(
@@ -1850,39 +1867,74 @@ describe('storage-manager Docker cleanup', () => {
         Config: { Labels: {} },
       },
     );
-    const superseded = (id: string) => ({
-      Id: id,
-      RepoTags: [],
-      Created: '2026-07-01T00:00:00.000Z',
-      Size: 3_000,
-      Config: {
-        Labels: {
-          'nanoclaw.commit': id,
-          'nanoclaw.image.role': 'canonical',
-          'nanoclaw.retention.created_at': '2026-07-01T00:00:00.000Z',
-          'nanoclaw.retention.hours': '0',
-        },
-      },
-    });
-    images.push(superseded('sha256:superseded'), superseded('sha256:superseded-in-use'));
+    images.push(
+      superseded('sha256:superseded'),
+      superseded('sha256:superseded-in-use'),
+      superseded('sha256:superseded-peer', {}, 'peer-install'),
+      superseded('sha256:superseded-digest', { RepoDigests: [`${CONTAINER_IMAGE_BASE}@sha256:abc`] }),
+      superseded('sha256:superseded-pinned'),
+    );
+    const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-groups-'));
+    fs.mkdirSync(path.join(groupsRoot, 'pinned'));
+    fs.writeFileSync(
+      path.join(groupsRoot, 'pinned', 'container.json'),
+      JSON.stringify({ imageTag: 'sha256:superseded-pinned' }),
+    );
 
     const report = getStorageReport({
       mode: 'apply',
       now,
+      groupsRoot,
       sessionsRoot: MISSING_SESSIONS_ROOT,
       threadsRoot: MISSING_THREADS_ROOT,
       policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
     });
+    fs.rmSync(groupsRoot, { recursive: true, force: true });
 
     expect(report.actions.map((a) => [a.dockerArgs, a.status])).toEqual([
       [['container', 'rm', 'own-created-stale'], 'applied'],
       [['builder', 'prune', '-a', '-f', '--filter', 'until=168h'], 'applied'],
       [['image', 'rm', 'sha256:superseded'], 'applied'],
     ]);
-    expect(report.images.dispositions.find((image) => image.id === 'sha256:superseded-in-use')).toMatchObject({
-      disposition: 'protected',
-      protectionReason: 'container-referenced',
+    const disposition = (id: string) => report.images.dispositions.find((image) => image.id === id);
+    expect(disposition('sha256:superseded-in-use')).toMatchObject({ protectionReason: 'container-referenced' });
+    expect(disposition('sha256:superseded-pinned')).toMatchObject({ protectionReason: 'configured-image' });
+  });
+
+  it('skips a planned pressure removal of an image tagged before apply once usage reaches the target', () => {
+    containers = [];
+    images = [superseded('sha256:tagged-later')];
+    let imageInspects = 0;
+    let dfReads = 0;
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'df') {
+        dfReads += 1;
+        const pct = dfReads >= 3 ? 81 : 91;
+        return `Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 ${pct * 10} ${(100 - pct) * 10} ${pct}% /\n`;
+      }
+      if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
+        imageInspects += 1;
+        if (imageInspects > 1) images[0]!.RepoTags = [`${CONTAINER_IMAGE_BASE}:rollback`];
+      }
+      return originalImplementation(cmd, args);
     });
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      force: true,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(mockExecFileSync).not.toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      ['image', 'rm', 'sha256:tagged-later'],
+      expect.anything(),
+    );
+    expect(report.actions.find((action) => action.id === 'docker:image:sha256:tagged-later')?.status).toBe('skipped');
   });
 
   it('keeps a never-started install container inside the spawn window even under pressure', () => {

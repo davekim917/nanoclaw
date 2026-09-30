@@ -10,7 +10,14 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
+import {
+  CONTAINER_IMAGE,
+  CONTAINER_IMAGE_BASE,
+  CONTAINER_INSTALL_LABEL,
+  DATA_DIR,
+  GROUPS_DIR,
+  INSTALL_SLUG,
+} from './config.js';
 import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import {
@@ -227,6 +234,8 @@ const RETENTION_CREATED_AT_LABEL = 'nanoclaw.retention.created_at';
 const RETENTION_HOURS_LABEL = 'nanoclaw.retention.hours';
 const RETENTION_OWNER_LABEL = 'nanoclaw.retention.owner';
 const IMAGE_ROLE_LABEL = 'nanoclaw.image.role';
+// Not `nanoclaw-install`: containers inherit image labels, and that key marks a container as this install's spawn.
+const IMAGE_INSTALL_LABEL = 'nanoclaw.image.install';
 
 export function classifyDockerImage(
   image: DockerImageInventory,
@@ -355,6 +364,7 @@ export interface StorageReportOptions {
   threadsRoot?: string;
   topicsRoot?: string;
   runningContainerMounts?: () => string[] | null;
+  groupsRoot?: string;
   includeDocker?: boolean;
   respectCadence?: boolean;
   force?: boolean;
@@ -548,7 +558,6 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     ...overrides,
   };
 
-  // An install that never sets the session knob keeps sessions on the shared worktree clock.
   if (overrides.sessionReclaimMs === undefined && sessionReclaimDays === 0) {
     policy.sessionReclaimMs = policy.worktreeReclaimMs;
   }
@@ -2523,13 +2532,28 @@ function readDockerInventory(): DockerInventory {
   return { containers: inspectDockerContainers(), images: inspectDockerImages() };
 }
 
-function configuredImageProtection(): { images: Set<string>; readable: boolean } {
+function containerJsonImageTags(groupsRoot: string): string[] {
+  if (!fs.existsSync(groupsRoot)) return [];
+  return fs
+    .readdirSync(groupsRoot)
+    .map((folder) => path.join(groupsRoot, folder, 'container.json'))
+    .filter((file) => fs.existsSync(file))
+    .map((file) => (JSON.parse(fs.readFileSync(file, 'utf8')) as { imageTag?: unknown }).imageTag)
+    .filter((tag): tag is string => typeof tag === 'string');
+}
+
+function configuredImageProtection(groupsRoot: string): { images: Set<string>; readable: boolean } {
   try {
     return {
       images: new Set(
-        // Raw and synchronous on purpose: runs in the storage worker (raw-DB allowlist); re-read before `rmi`.
-        (getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[])
-          .map((config) => config.image_tag?.trim())
+        [
+          // Raw and synchronous on purpose: runs in the storage worker (raw-DB allowlist); re-read before `rmi`.
+          ...(getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[]).map(
+            (config) => config.image_tag,
+          ),
+          ...containerJsonImageTags(groupsRoot),
+        ]
+          .map((tag) => tag?.trim())
           .filter((tag): tag is string => Boolean(tag)),
       ),
       readable: true,
@@ -2544,8 +2568,9 @@ function classifyDockerInventory(
   inventory: DockerInventory,
   policy: StoragePolicy,
   now: number,
+  groupsRoot: string,
 ): DockerImageDispositionReport[] {
-  const configured = configuredImageProtection();
+  const configured = configuredImageProtection(groupsRoot);
   const containerImageIds = new Set(inventory.containers.map((container) => container.imageId).filter(Boolean));
   return inventory.images.map((image) =>
     classifyDockerImage(image, {
@@ -2577,7 +2602,13 @@ function removableContainer(container: DockerContainerInventory, underPressure: 
 }
 
 function removableImage(image: DockerImageDispositionReport, underPressure: boolean): boolean {
-  return image.disposition === 'eligible' && (underPressure || image.repoTags.length === 0);
+  if (image.disposition !== 'eligible') return false;
+  if (underPressure) return true;
+  return (
+    image.repoTags.length === 0 &&
+    (image.repoDigests ?? []).length === 0 &&
+    image.labels[IMAGE_INSTALL_LABEL] === INSTALL_SLUG
+  );
 }
 
 function usageAtOrBelowTarget(policy: StoragePolicy): boolean {
@@ -2600,6 +2631,7 @@ function collectDockerActions(
   warnings: string[],
   usageBefore: FilesystemUsage | null,
   force: boolean,
+  groupsRoot: string,
 ): { actions: StorageAction[]; images: DockerImageDispositionReport[] } {
   let dockerRoot: string;
   try {
@@ -2642,7 +2674,7 @@ function collectDockerActions(
     log.warn('storage-manager: docker cleanup collection failed; cleanup skipped', { stage: 'inventory', err });
     return { actions: [], images: [] };
   }
-  const imageDispositions = classifyDockerInventory(inventory, policy, now);
+  const imageDispositions = classifyDockerInventory(inventory, policy, now, groupsRoot);
 
   let estimates: Partial<Record<'Images' | 'Containers' | 'Build Cache', number>> = {};
   try {
@@ -2735,17 +2767,17 @@ function collectDockerActions(
     });
   for (const image of removable) {
     const dockerArgs = ['image', 'rm', image.id];
-    const untagged = image.repoTags.length === 0;
     actions.push(
       createDockerAction({
         id: `docker:image:${image.id}`,
         kind: 'docker-prune-images',
         dockerArgs,
         estimatedBytes: image.sizeBytes,
-        reason: untagged ? 'untagged image: no tag can select it again' : thresholdReason,
+        reason: removableImage(image, false)
+          ? "this install's superseded image: no tag or digest selects it"
+          : thresholdReason,
         safety: 'Exact non-forced removal after immediate protection and reference revalidation.',
         apply: () => {
-          if (!untagged && usageAtOrBelowTarget(policy)) return false;
           let currentInventory: DockerInventory;
           try {
             currentInventory = readDockerInventory();
@@ -2756,10 +2788,11 @@ function collectDockerActions(
             });
             return false;
           }
-          const current = classifyDockerInventory(currentInventory, policy, Date.now()).find(
+          const current = classifyDockerInventory(currentInventory, policy, Date.now(), groupsRoot).find(
             (candidate) => candidate.id === image.id,
           );
           if (!current || !removableImage(current, underPressure)) return false;
+          if (!removableImage(current, false) && usageAtOrBelowTarget(policy)) return false;
           execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
           return true;
         },
@@ -2923,7 +2956,15 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
   }
 
   const dockerCollection = includeDocker
-    ? collectDockerActions(policy, now, mode, warnings, usageBefore, options.force === true)
+    ? collectDockerActions(
+        policy,
+        now,
+        mode,
+        warnings,
+        usageBefore,
+        options.force === true,
+        options.groupsRoot ?? GROUPS_DIR,
+      )
     : { actions: [], images: [] };
   const dependencyCacheOut: { report?: DependencyCacheReport } = {};
   const actions: StorageAction[] = [
