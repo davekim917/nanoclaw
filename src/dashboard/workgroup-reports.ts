@@ -33,7 +33,7 @@ function notFound(): Response {
   });
 }
 
-function reportRelativePath(tail: string): string | null {
+function reportTarget(tail: string): { relative: string; contentType: string } | null {
   let decoded: string;
   try {
     decoded = decodeURIComponent(tail);
@@ -43,12 +43,13 @@ function reportRelativePath(tail: string): string | null {
   const relative = decoded === '' || decoded.endsWith('/') ? `${decoded}index.html` : decoded;
   const segments = relative.split('/');
   if (relative.includes('\0') || segments.some((s) => s === '' || s.startsWith('.'))) return null;
-  return CONTENT_TYPES[path.extname(relative).toLowerCase()] ? relative : null;
+  const contentType = CONTENT_TYPES[path.extname(relative).toLowerCase()];
+  return contentType ? { relative, contentType } : null;
 }
 
 export const workgroupReportHandler: AuthHandler = async (_req, params, ctx) => {
-  const relative = reportRelativePath(params['tail'] ?? '');
-  if (relative === null) return notFound();
+  const target = reportTarget(params['tail'] ?? '');
+  if (target === null) return notFound();
   const wg = await resolveWorkgroup(params['id'] ?? '', ctx);
   if (!wg) return notFound();
 
@@ -59,13 +60,13 @@ export const workgroupReportHandler: AuthHandler = async (_req, params, ctx) => 
     return notFound();
   }
   const root = path.join(base, SHARED_WORK_DIR_NAME, 'reports');
-  const read = readContainedBytes('Workgroup report', root, relative, wg.id, MAX_REPORT_BYTES);
+  const read = readContainedBytes('Workgroup report', root, target.relative, wg.id, MAX_REPORT_BYTES);
   if (read === null) return notFound();
 
   return new Response(new Uint8Array(read.bytes), {
     status: 200,
     headers: {
-      'Content-Type': CONTENT_TYPES[path.extname(relative).toLowerCase()]!,
+      'Content-Type': target.contentType,
       'Content-Security-Policy': REPORT_CSP,
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',

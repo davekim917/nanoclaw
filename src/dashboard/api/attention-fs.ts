@@ -110,7 +110,7 @@ export function readContainedBytes(
   rootDir: string,
   relative: string,
   workgroupId: string,
-  maxBytes: number = MAX_FILE_BYTES,
+  maxBytes: number,
 ): { bytes: Buffer; mtimeIso: string } | null {
   const target = path.join(rootDir, relative);
   let fd: number;
