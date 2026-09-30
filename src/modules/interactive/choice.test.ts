@@ -430,7 +430,7 @@ describe('request_choice delivery', () => {
     expect(await ask(session, { approvalScope: RELEASE_SCOPE, decision: DECISION }, 'choice-3')).toBeDefined();
     expect(delivered).toHaveLength(2);
     expect(notes().map((n) => n.text)).toEqual([
-      'request_choice failed: a release card needs decision {question, ifItShips, evidence}: an approver must see what ships',
+      'request_choice failed: a release card needs decision {question, ifItShips, evidence}',
     ]);
   });
 

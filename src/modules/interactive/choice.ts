@@ -84,9 +84,7 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
   if (typeof brief === 'string') return { error: brief };
   if (scope && !brief) {
     if (decisionRequired()) {
-      return {
-        error: 'a release card needs decision {question, ifItShips, evidence}: an approver must see what ships',
-      };
+      return { error: 'a release card needs decision {question, ifItShips, evidence}' };
     }
     log.warn('request_choice: release card posted without a decision', {
       choiceId,
