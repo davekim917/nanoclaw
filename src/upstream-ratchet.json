@@ -254,7 +254,7 @@
 "bin/ncl":{"diff":0,"mode":"100755","sha256":"d83326a460f7dbd0f955e83f58896a8a5db5358b2ed80036ed6262e386af9c66"},
 "config-examples/mount-allowlist.json":{"diff":0,"mode":"100644","sha256":"49e12b387f81a97671633bd8ec67a013bb3660911363623a34e92a6361765c66"},
 "container/.dockerignore":{"diff":0,"mode":"100644","sha256":"ac417039131d1222d33cbd69df27933f2c307e519eb441c473793c2de37fbdd0"},
-"container/CLAUDE.md":{"diff":52,"mode":"100644","sha256":"b52762a0b63d403cfbc36acaf3c0a5168480f3cb9cb8c5609d80837ebfb6f6dd"},
+"container/CLAUDE.md":{"diff":52,"mode":"100644","sha256":"4e074b59ab5801d43abd8ce8f3688ee9b34c79cf94603a46261da574405e3ec5"},
 "container/Dockerfile":{"diff":488,"mode":"100644","sha256":"732a9eb4dfc4b2425a2d6886b4fac8190ee6bc91a95d8653a3ef003f3c4978f3"},
 "container/agent-runner/bun.lock":{"diff":46,"mode":"100644","sha256":"20e8b875d0ea3eab0ba856752c14534be76151fda0cdd925ae25983661db8a73"},
 "container/agent-runner/bunfig.toml":{"diff":0,"mode":"100644","sha256":"3c35bbe6522d71981d126ea0ad6a1cfea291c0223f11f7deaf5b58a44bd13b43"},
