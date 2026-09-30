@@ -57,10 +57,18 @@ export interface Manifest {
   entries: ManifestEntry[];
 }
 
+interface FileStat {
+  size: number;
+  mtimeMs: number;
+  mode: number;
+  uid: number;
+  gid: number;
+}
+
 interface ScannedFile {
   path: string;
   kind: EntryKind;
-  stat: fs.Stats;
+  stat: FileStat;
   stamp: string;
   target?: string;
 }
@@ -120,10 +128,19 @@ function sqliteStamp(file: string, st: fs.Stats): string {
   return `${statStamp(st)}|${wal ? statStamp(wal) : '-'}`;
 }
 
+const slim = (st: fs.Stats): FileStat => ({
+  size: st.size,
+  mtimeMs: st.mtimeMs,
+  mode: st.mode,
+  uid: st.uid,
+  gid: st.gid,
+});
+
 export function scanSources(
   sources: string[],
   exclude: string[],
   remoteCheck: (dir: string) => boolean = hasRemote,
+  knownKind: (file: string, stamp: string) => EntryKind | undefined = () => undefined,
 ): Scan {
   const excludes = exclude.map(globToRegExp);
   const scan: Scan = { files: [], unreadable: [], skippedClones: [], warnings: [] };
@@ -135,7 +152,7 @@ export function scanSources(
       return;
     }
     if (st.isSymbolicLink()) {
-      scan.files.push({ path: p, kind: 'symlink', stat: st, stamp: statStamp(st), target: fs.readlinkSync(p) });
+      scan.files.push({ path: p, kind: 'symlink', stat: slim(st), stamp: statStamp(st), target: fs.readlinkSync(p) });
       return;
     }
     if (!st.isFile()) return;
@@ -144,7 +161,8 @@ export function scanSources(
     if (sidecar && siblings.has(base.slice(0, -sidecar.length))) return;
     let isSqlite: boolean;
     try {
-      isSqlite = st.size >= 512 && readHead(p, 16).equals(SQLITE_MAGIC);
+      const known = knownKind(p, statStamp(st));
+      isSqlite = known ? known === 'sqlite' : st.size >= 512 && readHead(p, 16).equals(SQLITE_MAGIC);
     } catch (err) {
       scan.warnings.push(`unreadable file ${p}: ${message(err)}`);
       return;
@@ -152,7 +170,7 @@ export function scanSources(
     scan.files.push({
       path: p,
       kind: isSqlite ? 'sqlite' : 'file',
-      stat: st,
+      stat: slim(st),
       stamp: isSqlite ? sqliteStamp(p, st) : statStamp(st),
     });
   };
@@ -425,7 +443,10 @@ export async function runBackup(config: BackupConfig, opts: RunOptions): Promise
   }
   const sources = [...config.sources, ...(generatedSeen.size ? [generated] : [])];
 
-  const scan = scanSources(sources, config.exclude ?? [], opts.remoteCheck);
+  const scan = scanSources(sources, config.exclude ?? [], opts.remoteCheck, (file, stamp) => {
+    const prev = state.entries[file];
+    return prev && (prev.stamp === stamp || prev.stamp.startsWith(`${stamp}|`)) ? prev.kind : undefined;
+  });
   for (const dir of scan.unreadable) failures.push(`could not read ${dir}`);
   const scannedBytes = scan.files.reduce((n, f) => n + (f.kind === 'symlink' ? 0 : f.stat.size), 0);
   log(
