@@ -38,13 +38,13 @@ const CHOICE_RESPONSE_EVENT = 'choice_response';
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const USER_ID_RE = /^[^:\s]+:\S+$/;
 const OPTION_STYLES = new Set<unknown>(['primary', 'danger', 'default']);
-const DECISION_REQUIRED_KEY = 'NANOCLAW_RELEASE_CARD_DECISION_REQUIRED'; // read per ask: .env flips it, no restart
+const DECISION_REQUIRED_KEY = 'NANOCLAW_RELEASE_CARD_DECISION_REQUIRED';
 const DECISION_KEYS = ['question', 'ifItShips', 'evidence'];
 const MAX_DECISION_QUESTION = 300;
 const MAX_DECISION_IF_IT_SHIPS = 1200;
 const MAX_DECISION_LINES = 10;
 const MAX_DECISION_EVIDENCE = 500;
-const MAX_RELEASE_CARD_TEXT = 1800; // Discord posts **title**, a blank line and the body, and cuts at 1900
+const MAX_RELEASE_CARD_TEXT = 1800;
 const HEX_RUN_RE = /[0-9a-f]{40}/i;
 const DISPLAY_SAFE_RE =
   /^[\x20-\x7E\u00A3\u00B0\u00C0-\u00FF\u2013\u2014\u2018\u2019\u201C\u201D\u2022\u2026\u2192\u20AC]*$/;
@@ -83,7 +83,7 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
   const brief = decision === undefined ? undefined : parseReleaseDecision(decision);
   if (typeof brief === 'string') return { error: brief };
   if (scope && !brief) {
-    if (readEnvFile([DECISION_REQUIRED_KEY])[DECISION_REQUIRED_KEY] === '1') {
+    if (decisionRequired()) {
       return {
         error: 'a release card needs decision {question, ifItShips, evidence}: an approver must see what ships',
       };
@@ -152,6 +152,10 @@ function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | {
   };
 }
 
+function decisionRequired(): boolean {
+  return readEnvFile([DECISION_REQUIRED_KEY])[DECISION_REQUIRED_KEY] === '1';
+}
+
 function parseReleaseDecision(value: unknown): ReleaseDecision | string {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     return 'decision must be {question, ifItShips, evidence}';
@@ -190,7 +194,7 @@ function isDisplaySafe(normalized: string): boolean {
 }
 
 function neutralize(text: string): string {
-  return text.replace(/</g, '‹').replace(/>/g, '›').replace(/~/g, '∼'); // Slack <…> links/mentions; ~ strikes through
+  return text.replace(/</g, '‹').replace(/>/g, '›').replace(/~/g, '∼');
 }
 
 function canonicalReleaseChoice(
