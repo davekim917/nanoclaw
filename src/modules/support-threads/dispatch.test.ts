@@ -174,37 +174,66 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(wakeContainer).toHaveBeenCalledTimes(1);
   });
 
-  it('inherits isolated poller routing, and passes its turn flags as one-turn flags — never session stickies', async () => {
-    await seed();
-    const seriesId = 'task-support-poller';
-    const { session: poller } = await resolveTaskSession('ag-1', seriesId);
-    const pollerDb = openInboundDb('ag-1', poller.id);
-    insertTaskRow(pollerDb, {
-      id: 'task-fire-1',
-      seriesId,
-      processAfter: now(),
-      recurrence: '*/15 * * * *',
-      channelType: 'slack',
-      platformId: 'slack:C1',
-      threadId: null,
-      content: JSON.stringify({
-        prompt: 'poll support inbox',
-        flagIntent: { turnModel: 'gpt-5.6-terra', turnEffort: 'xhigh' },
-      }),
+  describe('the poller pin rides only a confidently light turn, one turn, never sticky', () => {
+    const PIN = { turnModel: 'sonnet', turnEffort: 'medium' };
+    const light = {
+      model: 'jev-1.13.0',
+      product: null,
+      areaType: 'general',
+      area: null,
+      areaConfidence: 0,
+      category: 'question',
+      categoryConfidence: 0.9,
+      urgency: 0.5,
+      escapedDefect: 0.1,
+    };
+
+    async function dispatchPinned(triage: unknown): Promise<Array<{ content: string }>> {
+      await seed();
+      const seriesId = 'task-support-poller';
+      const { session: poller } = await resolveTaskSession('ag-1', seriesId);
+      const pollerDb = openInboundDb('ag-1', poller.id);
+      insertTaskRow(pollerDb, {
+        id: 'task-fire-1',
+        seriesId,
+        processAfter: now(),
+        recurrence: '*/15 * * * *',
+        channelType: 'slack',
+        platformId: 'slack:C1',
+        threadId: null,
+        content: JSON.stringify({ prompt: 'poll support inbox', flagIntent: PIN }),
+      });
+      await handleDispatchSupportIssue({ ...dispatchContent('gthread-task', 'new issue'), triage }, poller);
+      await handleDispatchSupportIssue({ ...dispatchContent('gthread-task', 'customer replied'), triage }, poller);
+      pollerDb.close();
+      const row = await getSupportThread('gthread-task');
+      return inboundOf(row!.session_id!);
+    }
+
+    it('a light, confident, non-defect category gets the pin and the escalation step on seed and follow-up', async () => {
+      const messages = await dispatchPinned(light);
+      expect(messages).toHaveLength(2);
+      for (const message of messages) {
+        const parsed = JSON.parse(message.content) as { flagIntent?: Record<string, unknown>; text: string };
+        expect(parsed.flagIntent).toEqual(PIN);
+        expect(parsed.text).toContain('call `wait` with `minutes: 0.05`');
+        expect(parsed.text).toContain('read this email as question');
+      }
     });
 
-    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'new issue'), poller);
-    const row = await getSupportThread('gthread-task');
-    expect(row).toBeTruthy();
-    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'customer replied'), poller);
-    pollerDb.close();
-    const [seedMessage, followupMessage] = inboundOf(row!.session_id!);
-    // One-turn flags, never sticky: the poller's dispatched work runs on its
-    // pin, but a human reply in the thread must not inherit it.
-    for (const message of [seedMessage, followupMessage]) {
-      const { flagIntent } = JSON.parse(message.content) as { flagIntent: Record<string, unknown> };
-      expect(flagIntent).toEqual({ turnModel: 'gpt-5.6-terra', turnEffort: 'xhigh' });
-    }
+    it.each([
+      ['no triage', undefined],
+      ['an engineering category', { ...light, category: 'bug' }],
+      ['data work', { ...light, category: 'data_request' }],
+      ['low category confidence', { ...light, categoryConfidence: 0.69 }],
+      ['a likely user-facing defect', { ...light, escapedDefect: 0.5 }],
+    ])('%s runs on the group default: no pin, no escalation step', async (_label, triage) => {
+      for (const message of await dispatchPinned(triage)) {
+        const parsed = JSON.parse(message.content) as { flagIntent?: unknown; text: string };
+        expect(parsed.flagIntent).toBeUndefined();
+        expect(parsed.text).not.toContain('lighter model');
+      }
+    });
   });
 
   it('with a known ticket (legacy dispatcher), seeds the comment-not-duplicate protocol', async () => {
