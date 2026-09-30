@@ -43,7 +43,6 @@ function write(rel: string, body: string): string {
   return p;
 }
 
-/** A versioned bucket in memory: every upload is a new version stamped by one shared clock. */
 class FakeBucket implements Uploader, RestoreSource {
   versions = new Map<string, { body: Buffer; at: string; id: string }[]>();
   tick = 0;
