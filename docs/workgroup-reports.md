@@ -28,13 +28,23 @@ Pages are agent-authored and share the dashboard's origin, so every response car
 sandbox without `allow-same-origin`, plus `default-src 'none'`:
 
 - Inline `<script>` and `<style>` run. Filters, tabs, sorting and expanders work.
-- No network: no `fetch`, no external script, stylesheet or font, no remote image.
-  Images must be `data:` URIs. A page is one self-contained file.
+- No subresource network: no `fetch`, XHR or WebSocket, and no external script,
+  stylesheet, font or remote image. Images must be `data:` URIs. A page is one
+  self-contained file.
 - No storage: `localStorage` and cookies throw in an opaque origin. Wrap them in
   `try`/`catch`, or keep state in the URL hash.
 - Links open normally; `target="_blank"` works.
+
+What the sandbox protects is the dashboard: a page cannot read the viewer's cookie,
+call the dashboard API as the viewer, or read another page. It does **not** stop egress
+by navigation. CSP governs resource loads, not navigations, so a page can still send the
+tab (script `location`, a meta refresh, a link) to another site with its own content in
+the URL. That content is only what the page's author wrote into it, and the author could
+already send it elsewhere. The reports route adds no path to data the author did not
+have, but it cannot vouch that a page keeps its own content in.
 
 Files are read on each request (8 MiB cap) with `Cache-Control: private, no-store`, so an
 agent republishes by replacing the file; write to a dot-named temp file, then rename.
 
 Client data belongs here and never on a public host: this route is the private surface.
+It serves only the workgroup's own members; it is not an egress control on its authors.
