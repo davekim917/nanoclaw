@@ -13,12 +13,19 @@ useless. S3's default SSE-S3 applies. Read access is the control (below).
 over absolute paths (`**` crosses `/`, `*` and `?` do not). Beyond those globs, every run:
 
 - skips any directory below a source that is a git clone or worktree with a remote. A source
-  root that is itself a clone keeps its files but not its `.git`. Commits and edits that
+  root that is itself a clone keeps its files but not its `.git`. The check passes
+  `safe.directory=*`: as root, git refuses a repository another user owns, and a refusal would
+  read as "no remote" and pull the whole clone in. Commits and edits that
   exist only on the host are captured nightly by `scripts/git-safety.sh` into
   `~/nanoclaw-backups/`, so that directory is a source;
 - copies SQLite files, recognised by their header, with the online backup API under the file
   owner's uid, and never uploads `-journal`/`-wal`/`-shm` sidecars. The copy is stored in
-  rollback-journal mode; a writer that wants WAL sets it again on open;
+  rollback-journal mode; a writer that wants WAL sets it again on open. Running as the owner
+  means SQLite can never leave a root-owned sidecar next to a live database. The copy goes
+  in steps of 1,024 pages, because a reader in a rollback-journal database blocks writers, and
+  the host writes `archive.db` synchronously on its event loop. A commit between steps
+  restarts the copy. A database kept busy for 10 minutes fails the run rather than stalling
+  the host;
 - records symlinks (target only) and restores them; sockets and FIFOs are ignored;
 - runs `commands` (e.g. a database dump) and backs up each one's stdout as
   `<stateDir>/generated/<name>`.
@@ -45,8 +52,9 @@ would silently remove a file the host still has. So every manifest from the last
 be restored in full.
 
 Object Lock is on in COMPLIANCE mode with 30-day default retention. Until a version is 30 days
-old, nobody can delete or overwrite it, including the account root and anyone holding admin
-credentials.
+old, nobody can delete it, including the account root and anyone holding admin credentials.
+Object Lock refuses a PutObject that carries neither Content-MD5 nor a checksum, so every
+upload passes `--checksum-algorithm CRC32`.
 
 ## Access
 

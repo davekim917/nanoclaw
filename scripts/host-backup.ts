@@ -1,27 +1,4 @@
 #!/usr/bin/env tsx
-/**
- * Nightly off-host backup of this host's non-reproducible state to one S3 bucket.
- *
- * The host's key may only PutObject: it cannot list, read or delete. So nothing here can diff
- * against the bucket; a local state file records what was last uploaded (size, mtime, sha256),
- * and each run uploads only what changed. Keys are `files/<absolute path>`, versioned by S3.
- * Every run ends with `manifests/<run id>.json.gz`, which names every path and the sha256 of
- * the content that was current for it, so `restore --as-of` can rebuild any retained night.
- *
- * A path that disappears is overwritten with an empty object, which turns its last real content
- * into a noncurrent version the bucket's lifecycle expires. The bucket never expires a current
- * version: an unchanged file is never re-uploaded, so expiring by age would delete it.
- *
- * SQLite files are copied with the online backup API, never byte-copied: they are written live.
- * When this runs as root, that copy runs in a child process under the database owner's uid, so
- * SQLite can never leave a root-owned -journal/-wal/-shm beside a database others write.
- *
- * Usage:
- *   host-backup.ts run [--config <file>] [--dry-run]
- *   host-backup.ts restore --dest <dir> [--as-of <iso>] [--prefix <abs path>] [--config <file>]
- * Docs: docs/host-backup.md. Exit: 0 when everything was uploaded, 1 otherwise; the last output
- * line names what failed, which is the line the unit's OnFailure alert carries.
- */
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -32,10 +9,9 @@ import zlib from 'node:zlib';
 
 import Database from 'better-sqlite3';
 
-export const DEFAULT_CONFIG_PATH = '/etc/nanoclaw-backup/config.json';
+const DEFAULT_CONFIG_PATH = '/etc/nanoclaw-backup/config.json';
 const SQLITE_MAGIC = Buffer.from('SQLite format 3\0', 'latin1');
 const SQLITE_SIDECARS = ['-journal', '-wal', '-shm'];
-/** S3's key limit is 1024 bytes; `files/` takes 6. */
 const MAX_KEY_PATH_BYTES = 1000;
 const DEFAULT_BATCH_BYTES = 8 * 1024 ** 3;
 
@@ -44,16 +20,14 @@ export interface BackupConfig {
   region: string;
   stateDir: string;
   sources: string[];
-  /** Globs over absolute paths: `**` crosses `/`, `*` and `?` do not. A matching directory is pruned. */
   exclude?: string[];
-  /** Commands whose stdout is backed up as `<stateDir>/generated/<name>`, e.g. a database dump. */
   commands?: { name: string; argv: string[] }[];
   batchBytes?: number;
 }
 
-export type EntryKind = 'file' | 'sqlite' | 'symlink';
+type EntryKind = 'file' | 'sqlite' | 'symlink';
 
-export interface ManifestEntry {
+interface ManifestEntry {
   path: string;
   kind: EntryKind;
   size: number;
@@ -62,16 +36,14 @@ export interface ManifestEntry {
   uid: number;
   gid: number;
   mtimeMs: number;
-  /** Symlinks only. A symlink is recorded, never followed or uploaded. */
   target?: string;
 }
 
 interface StateEntry extends ManifestEntry {
-  /** What the source looked like when it was last read; a match means it is unchanged. */
   stamp: string;
 }
 
-export interface BackupState {
+interface BackupState {
   entries: Record<string, StateEntry>;
 }
 
@@ -85,7 +57,7 @@ export interface Manifest {
   entries: ManifestEntry[];
 }
 
-export interface ScannedFile {
+interface ScannedFile {
   path: string;
   kind: EntryKind;
   stat: fs.Stats;
@@ -95,19 +67,17 @@ export interface ScannedFile {
 
 export interface Scan {
   files: ScannedFile[];
-  /** Directories that could not be read: nothing under them may be tombstoned. */
   unreadable: string[];
   skippedClones: string[];
   warnings: string[];
 }
 
 export interface Uploader {
-  /** Upload every file under `dir` to `<prefix><path relative to dir>`. */
   uploadTree(dir: string, prefix: string): Promise<void>;
   uploadFile(file: string, key: string): Promise<void>;
 }
 
-export type SqliteSnapshotter = (
+type SqliteSnapshotter = (
   jobs: { src: string; dest: string; uid: number; gid: number }[],
 ) => Promise<Map<string, string | null>>;
 
@@ -126,7 +96,6 @@ export function globToRegExp(glob: string): RegExp {
 }
 
 function hasRemote(dir: string): boolean {
-  // safe.directory: as root, git refuses a repository owned by another user and would report none.
   const res = spawnSync('git', ['-c', 'safe.directory=*', '-C', dir, 'remote'], { encoding: 'utf8' });
   return res.status === 0 && res.stdout.trim() !== '';
 }
@@ -239,7 +208,6 @@ async function sha256File(file: string): Promise<string> {
   return hash.digest('hex');
 }
 
-/** Copy while hashing, so the recorded sha256 is exactly what was staged, even if the source is appended to meanwhile. */
 async function copyHashed(src: string, dest: string): Promise<{ sha256: string; size: number }> {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const hash = crypto.createHash('sha256');
@@ -254,11 +222,6 @@ async function copyHashed(src: string, dest: string): Promise<{ sha256: string; 
   return { sha256: hash.digest('hex'), size };
 }
 
-/**
- * Small steps: in a rollback-journal database a reader blocks writers for as long as a step runs,
- * and the host writes archive.db synchronously on its event loop. A write between steps makes
- * SQLite restart the copy, so a database busy for the whole budget fails rather than stalls.
- */
 export async function snapshotSqlite(
   src: string,
   dest: string,
@@ -283,8 +246,6 @@ export async function snapshotSqlite(
   } finally {
     db.close();
   }
-  // A copy of a WAL database is itself in WAL mode and grows sidecars on open; a single file is
-  // what gets uploaded, so the copy is rolled into rollback-journal mode. Writers set WAL again on open.
   const copy = new Database(dest);
   try {
     copy.pragma('journal_mode = DELETE');
@@ -310,11 +271,7 @@ async function snapshotInProcess(jobs: { src: string; dest: string }[]): Promise
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 
-/**
- * As root, run each owner's snapshots in a child under that owner's uid, writing into a work
- * directory that owner holds; the result is then moved into place. Otherwise in-process.
- */
-export function makeSqliteSnapshotter(workDir: string): SqliteSnapshotter {
+function makeSqliteSnapshotter(workDir: string): SqliteSnapshotter {
   return async (jobs) => {
     if (process.getuid?.() !== 0) return snapshotInProcess(jobs);
     const results = new Map<string, string | null>();
@@ -371,8 +328,7 @@ async function sqliteWorker(): Promise<void> {
   process.stdout.write(JSON.stringify(Object.fromEntries(await snapshotInProcess(jobs))));
 }
 
-export function awsUploader(bucket: string, run: (args: string[]) => Promise<void> = runAws): Uploader {
-  // An explicit checksum: Object Lock refuses a PutObject that carries neither Content-MD5 nor one.
+function awsUploader(bucket: string, run: (args: string[]) => Promise<void> = runAws): Uploader {
   const common = ['--only-show-errors', '--no-progress', '--checksum-algorithm', 'CRC32'];
   return {
     uploadTree: (dir, prefix) => run(['s3', 'cp', dir, `s3://${bucket}/${prefix}`, '--recursive', ...common]),
@@ -390,7 +346,7 @@ function runAws(args: string[]): Promise<void> {
   });
 }
 
-export function loadState(file: string): BackupState {
+function loadState(file: string): BackupState {
   if (!fs.existsSync(file)) return { entries: {} };
   return JSON.parse(fs.readFileSync(file, 'utf8')) as BackupState;
 }
@@ -407,7 +363,7 @@ function toManifestEntry(e: StateEntry): ManifestEntry {
   return rest;
 }
 
-export function runIdFor(date: Date): string {
+function runIdFor(date: Date): string {
   return date
     .toISOString()
     .replace(/\.\d{3}Z$/, 'Z')
@@ -639,7 +595,7 @@ export interface RestoreSource {
   listVersions(prefix: string): Promise<ObjectVersion[]>;
 }
 
-export function awsRestoreSource(bucket: string): RestoreSource {
+function awsRestoreSource(bucket: string): RestoreSource {
   const json = (args: string[]): unknown => {
     const res = spawnSync('aws', [...args, '--output', 'json'], { encoding: 'utf8', maxBuffer: 1024 ** 3 });
     if (res.status !== 0) throw new Error(`aws ${args.slice(0, 2).join(' ')} failed: ${res.stderr.trim()}`);
@@ -680,11 +636,6 @@ export interface RestoreResult {
   failures: string[];
 }
 
-/**
- * Restore every manifest entry under `prefix` into `dest` (paths keep their absolute layout below
- * it). Each file is the newest version written no later than the manifest itself, checked against
- * the manifest's sha256; an older version with the right hash is used if the newest does not match.
- */
 export async function restore(
   source: RestoreSource,
   opts: { dest: string; asOf?: Date; prefix?: string; log?: (line: string) => void },
@@ -752,7 +703,7 @@ export async function restore(
   }
 }
 
-export function loadConfig(file: string): BackupConfig {
+function loadConfig(file: string): BackupConfig {
   const config = JSON.parse(fs.readFileSync(file, 'utf8')) as BackupConfig;
   for (const key of ['bucket', 'region', 'stateDir'] as const) {
     if (typeof config[key] !== 'string' || !config[key]) throw new Error(`${file}: "${key}" is required`);
@@ -774,7 +725,7 @@ function flag(args: string[], name: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
-export async function main(argv: string[]): Promise<number> {
+async function main(argv: string[]): Promise<number> {
   const [cmd, ...args] = argv;
   if (cmd === 'sqlite-worker') {
     await sqliteWorker();
