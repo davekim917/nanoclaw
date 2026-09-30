@@ -237,7 +237,6 @@ function* walkSources(
 
   function* visitDir(dir: string, isRoot: boolean): Generator<ScanItem> {
     if (walked.has(dir)) return;
-    walked.add(dir);
     const self = dirItem(dir);
     if (self) yield self;
     let names: string[];
@@ -259,6 +258,7 @@ function* walkSources(
       report.skippedClones.push(dir);
       return;
     }
+    walked.add(dir);
     for (const name of names.sort()) {
       if (skipGitDir && name === '.git') continue;
       const p = path.join(dir, name);
@@ -503,19 +503,23 @@ interface StateRow {
 
 type KnownEntry = StateEntry & { dirty: boolean };
 
+const DIR_RETAINED = `d.seen_run = @run OR d.path = '/' OR EXISTS (
+  SELECT 1 FROM entries e WHERE e.seen_run = @run AND e.sha256 IS NOT NULL
+    AND e.path > d.path || '/' AND e.path < d.path || '0')`;
+
 function prepareStatements(db: Database.Database) {
   return {
     get: db.prepare<[string], StateRow>('SELECT * FROM entries WHERE path = ?'),
     see: db.prepare('UPDATE entries SET seen_run = ? WHERE path = ?'),
-    seeUnder: db.prepare("UPDATE entries SET seen_run = ? WHERE path = ? OR substr(path, 1, length(?) + 1) = ? || '/'"),
-    seeDirsUnder: db.prepare("UPDATE dirs SET seen_run = ? WHERE substr(path, 1, length(?) + 1) = ? || '/'"),
+    seeUnder: db.prepare('UPDATE entries SET seen_run = ? WHERE path = ? OR substr(path, 1, length(?)) = ?'),
+    seeDirsUnder: db.prepare('UPDATE dirs SET seen_run = ? WHERE path = ? OR substr(path, 1, length(?)) = ?'),
     putDir: db.prepare(`INSERT INTO dirs (path, mode, uid, gid, seen_run) VALUES (@path, @mode, @uid, @gid, @run)
       ON CONFLICT(path) DO UPDATE SET mode = excluded.mode, uid = excluded.uid, gid = excluded.gid,
         seen_run = excluded.seen_run`),
-    manifestDirs: db.prepare<[string], DirEntry>(
-      'SELECT path, mode, uid, gid FROM dirs WHERE seen_run = ? ORDER BY path',
+    retainedDirs: db.prepare<[{ run: string }], DirEntry>(
+      `SELECT path, mode, uid, gid FROM dirs d WHERE ${DIR_RETAINED} ORDER BY path`,
     ),
-    pruneDirs: db.prepare('DELETE FROM dirs WHERE seen_run IS NOT ?'),
+    pruneDirs: db.prepare<[{ run: string }]>(`DELETE FROM dirs AS d WHERE NOT (${DIR_RETAINED})`),
     put: db.prepare(`INSERT INTO entries
       (path, kind, size, sha256, mode, uid, gid, mtime_ms, target, stamp, dirty, seen_run)
       VALUES (@path, @kind, @size, @sha256, @mode, @uid, @gid, @mtimeMs, @target, @stamp, 0, @run)
@@ -591,8 +595,9 @@ class StateStore {
   }
 
   seeUnder(p: string, run: string): void {
-    this.stmts.seeUnder.run(run, p, p, p);
-    this.stmts.seeDirsUnder.run(run, p, p);
+    const under = p.endsWith('/') ? p : `${p}/`;
+    this.stmts.seeUnder.run(run, p, under, under);
+    this.stmts.seeDirsUnder.run(run, p, under, under);
     this.op();
   }
 
@@ -601,12 +606,12 @@ class StateStore {
     this.op();
   }
 
-  *manifestDirs(run: string): Generator<DirEntry> {
-    yield* this.stmts.manifestDirs.iterate(run);
+  *retainedDirs(run: string): Generator<DirEntry> {
+    yield* this.stmts.retainedDirs.iterate({ run });
   }
 
   pruneDirs(run: string): void {
-    this.stmts.pruneDirs.run(run);
+    this.stmts.pruneDirs.run({ run });
     this.sync();
   }
 
@@ -916,7 +921,7 @@ async function runLocked(config: BackupConfig, opts: RunOptions): Promise<RunRes
     result.manifestEntries = await writeManifest(manifestFile, {
       header: { runId, hostname: os.hostname(), startedAt: started.toISOString() },
       entries: store.manifestEntries(pass),
-      dirs: store.manifestDirs(pass),
+      dirs: store.retainedDirs(pass),
       trailer: () => ({ finishedAt: now().toISOString(), failures }),
     });
     store.pruneDirs(pass);

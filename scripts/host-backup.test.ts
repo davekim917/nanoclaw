@@ -340,6 +340,38 @@ describe('runBackup', () => {
     }
   });
 
+  it('backs up a clone listed as its own source even when an earlier source skipped it', async () => {
+    const bucket = new FakeBucket();
+    const pool = path.join(src, 'pool');
+    write('pool/.git/HEAD', 'ref');
+    const data = write('pool/untracked.json', '{}');
+    config.sources = [src, pool];
+    const result = await runBackup(config, { uploader: bucket, ...quiet, remoteCheck: (d) => d === pool });
+    expect(result.failures).toEqual([]);
+    expect(bucket.current(keyOf(data))?.toString()).toBe('{}');
+  });
+
+  it('keeps a directory and its subtree when the directory itself cannot be stat-ed', async () => {
+    if (process.getuid?.() === 0) return;
+    const bucket = new FakeBucket();
+    const inner = path.join(src, 'outer', 'inner');
+    write('outer/inner/f.txt', 'f');
+    fs.chmodSync(inner, 0o700);
+    await runBackup(config, { uploader: bucket, ...quiet });
+    fs.chmodSync(path.join(src, 'outer'), 0o600);
+    try {
+      const result = await runBackup(config, { uploader: bucket, ...quiet });
+      expect(result.failures.join('\n')).toMatch(/inner/);
+      expect(result.tombstoned).toBe(0);
+      const manifest = await manifestOf(bucket, result.runId);
+      const kept = manifest.dirs.find((d) => d.path === inner);
+      expect(kept && kept.mode & 0o777).toBe(0o700);
+      expect(manifest.entries.map((e) => e.path)).toEqual([path.join(inner, 'f.txt')]);
+    } finally {
+      fs.chmodSync(path.join(src, 'outer'), 0o755);
+    }
+  });
+
   it('refuses to start while another run holds the lock', async () => {
     fs.mkdirSync(config.stateDir, { recursive: true });
     await withFileLock(path.join(config.stateDir, 'run.lock'), async () => {
