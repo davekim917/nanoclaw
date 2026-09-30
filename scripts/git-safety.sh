@@ -4,7 +4,8 @@
 # Two phases; a failure in one does not skip the other:
 #   1. snapshot — every commit that exists only on this host (on no remote),
 #      every uncommitted edit and new file, and every stash, across all
-#      worktrees of this repo, groups/, and $GIT_SAFETY_EXTRA_REPOS, into
+#      worktrees of this repo, groups/, $GIT_SAFETY_EXTRA_REPOS, and every
+#      checkout in $GIT_SAFETY_TOPIC_CHECKOUTS, into
 #      $GIT_SAFETY_DIR/<UTC stamp>/. Read-only against the repos except for
 #      refs/git-safety/* refs that pin detached-HEAD and stash commits so
 #      `git gc` cannot collect them; those refs are pruned once whatever they
@@ -76,6 +77,10 @@
 #   GIT_SAFETY_DIR                snapshot root (default ~/nanoclaw-backups)
 #   GIT_SAFETY_KEEP_DAYS          delete snapshots older than this (default 14)
 #   GIT_SAFETY_EXTRA_REPOS        space-separated extra repo paths or globs
+#   GIT_SAFETY_TOPIC_CHECKOUTS    space-separated globs of individual checkouts
+#                                 (clones or linked worktrees); one git cannot
+#                                 open is listed in the manifest, not skipped
+#                                 silently
 #   GIT_SAFETY_GROUPS_COMMIT      apply (default) | dry (report only: no fetch,
 #                                 no commit, no push, no owner DM)
 #   GIT_SAFETY_SNAPSHOT_BRANCH    branch groups/ snapshots push to
@@ -325,25 +330,84 @@ verify_bundle() { # <bundle-path> <source-repo> — real integrity check
 
 say "Snapshot $TS"
 say "Restore commits:   git fetch <bundle> 'refs/*:refs/*' (verify first: see verify_bundle in this script)"
-say "Restore edits:     git apply --binary <patch>   (in a worktree at the recorded HEAD)"
+say "Restore edits:     gzip -dc <patch.gz> | git apply --binary   (in a worktree at the recorded HEAD)"
 say "Restore new files: tar xzf <tgz> -C <worktree>"
 say "Restore groups/ config: git -C groups fetch origin $SNAPSHOT_BRANCH && git -C groups show origin/$SNAPSHOT_BRANCH:<path>"
 
 # ── phase 1: snapshot ───────────────────────────────────────────────────────
+# Topic checkouts and the repo store are bind-mounted read-write into agent
+# containers, so their config is untrusted: without these overrides a
+# container-set core.fsmonitor, reference-transaction hook, gpg program or
+# filter driver would run on the host as this user.
+SAFE_GIT=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false
+  -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false -c gpg.x509.program=/bin/false)
+sgit() { git "${SAFE_GIT[@]}" "$@"; }
+# wgit <worktree> <args> — for commands that read a worktree's files, which
+# run filter drivers. Filters the repo's own config defines are replaced by
+# cat; global and system ones are the operator's and stay. The ceiling stops
+# a checkout whose .git vanished from resolving to an enclosing repository.
+wgit() {
+  local w=$1 name filters=(); shift
+  while IFS= read -r name; do
+    filters+=(-c "filter.$name.process=" -c "filter.$name.clean=/bin/cat" -c "filter.$name.smudge=/bin/cat" -c "filter.$name.required=false")
+  done < <(GIT_CEILING_DIRECTORIES="$(dirname "$w")" sgit -C "$w" config --show-scope --includes --name-only \
+      --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null |
+    awk -F'\t' '$1 != "global" && $1 != "system" { sub(/^filter\./, "", $2); sub(/\.[a-z]+$/, "", $2); print $2 }' | sort -u)
+  GIT_CEILING_DIRECTORIES="$(dirname "$w")" sgit ${filters[@]+"${filters[@]}"} -C "$w" "$@"
+}
+common_dir() { # <repo or worktree> -> canonical path of the git dir holding its refs and objects
+  local c
+  c=$(sgit -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+    realpath -e "$c" 2>/dev/null
+}
+
+# Keyed by the repository holding their commits: a linked worktree's branches
+# and stashes live in a repo other checkouts or the repos below may share.
+declare -A TOPIC_WTS=() SNAPSHOTTED=() CAPTURED=()
+TOPIC_UNREADABLE=()
+for spec in ${GIT_SAFETY_TOPIC_CHECKOUTS:-}; do
+  for t in $spec; do
+    t=${t%/}
+    [ -e "$t" ] || [ -L "$t" ] || continue
+    real=$(realpath -e "$t" 2>/dev/null)
+    top="" common=""
+    if [ ! -L "$t" ] && [ -d "$t" ]; then
+      top=$(sgit -C "$t" rev-parse --show-toplevel 2>/dev/null)
+      common=$(common_dir "$t")
+    fi
+    if [ -z "$common" ] || [ "$top" != "$real" ]; then
+      TOPIC_UNREADABLE+=("$t")
+      continue
+    fi
+    TOPIC_WTS[$common]+="$real"$'\n'
+  done
+done
+
+repo_worktrees() { # <repo> -> git's own worktree list plus the topic checkouts sharing its commits
+  local common
+  common=$(common_dir "$1")
+  { sgit -C "$1" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}'
+    [ -n "$common" ] && printf '%s' "${TOPIC_WTS[$common]:-}"
+  } | awk 'NF && !seen[$0]++'
+}
+
 snapshot_repo() { # <repo path> <label>
-  local repo=$1 label=$2 dir="$OUT/$2" h w s list r n=0
+  local repo=$1 label=$2 dir="$OUT/$2" h w s st list r n=0 common worktrees
   mkdir -p "$dir"
+  common=$(common_dir "$repo")
+  [ -n "$common" ] && SNAPSHOTTED[$common]=1
+  worktrees=$(repo_worktrees "$repo")
 
   local mark_dir="$SNAP_ROOT/.git-safety-refs/$label"
-  mkdir -p "$mark_dir"
 
   # Pin detached HEADs that hold commits on no remote: once their worktree
   # directory is gone, nothing but the reflog keeps them.
   local live_detached=()
   while read -r w; do
     [ -e "$w" ] || continue
-    h=$(git -C "$w" rev-parse HEAD 2>/dev/null) || continue
-    if [ "$(git -C "$repo" rev-list --count "$h" --not --remotes 2>/dev/null || echo 0)" -gt 0 ]; then
+    wgit "$w" symbolic-ref -q HEAD >/dev/null 2>&1 && continue
+    h=$(wgit "$w" rev-parse HEAD 2>/dev/null) || continue
+    if [ "$(sgit -C "$repo" rev-list --count "$h" --not --remotes 2>/dev/null || echo 0)" -gt 0 ]; then
       local wslug; wslug=$(slug "$w")
       # review-683-r2 P3-8: check_err always rm's this on the normal path,
       # but a SIGTERM/SIGINT landing between mktemp and check_err leaked it
@@ -351,12 +415,12 @@ snapshot_repo() { # <repo path> <label>
       # it) — register it the instant it's created, same as every other
       # scratch path in this file.
       local e; e=$(mktemp); CLEANUP_PATHS+=("$e")
-      git -C "$repo" update-ref "refs/git-safety/detached/$wslug" "$h" 2>"$e"
+      sgit -C "$repo" update-ref "refs/git-safety/detached/$wslug" "$h" 2>"$e"
       check_err "$e" "$label: update-ref for detached worktree at $w"
       live_detached+=("$wslug")
       rm -f "$mark_dir/detached-$wslug"
     fi
-  done < <(git -C "$repo" worktree list --porcelain | awk '/^worktree /{w=substr($0,10)} /^detached/{print w}')
+  done <<<"$worktrees"
 
   # Pin every stash entry by content SHA (not list position): a bundle of
   # refs/stash carries only the newest, and a positional ref name goes stale
@@ -366,11 +430,11 @@ snapshot_repo() { # <repo path> <label>
     # review-683-r2 P3-8: same leak-on-signal reasoning as the detached-HEAD
     # loop above.
     local e; e=$(mktemp); CLEANUP_PATHS+=("$e")
-    git -C "$repo" update-ref "refs/git-safety/stash/$s" "$s" 2>"$e"
+    sgit -C "$repo" update-ref "refs/git-safety/stash/$s" "$s" 2>"$e"
     check_err "$e" "$label: update-ref for stash entry $s"
     live_stash+=("$s")
     rm -f "$mark_dir/stash-$s"
-  done < <(git -C "$repo" stash list --format=%H 2>/dev/null)
+  done < <(sgit -C "$repo" stash list --format=%H 2>/dev/null)
 
   # Expire pins whose worktree/stash entry is gone AND has been gone for at
   # least $KEEP_DAYS — tracked via a marker file's mtime, not the ref's own
@@ -381,26 +445,26 @@ snapshot_repo() { # <repo path> <label>
     suffix=${refname#refs/git-safety/detached/}
     printf '%s\n' "${live_detached[@]}" | grep -qxF "$suffix" && continue
     mfile="$mark_dir/detached-$suffix"
-    [ -e "$mfile" ] || touch "$mfile"
-    [ -n "$(find "$mfile" -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && { git -C "$repo" update-ref -d "$refname" 2>/dev/null; rm -f "$mfile"; }
-  done < <(git -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/detached 2>/dev/null)
+    [ -e "$mfile" ] || { mkdir -p "$mark_dir"; touch "$mfile"; }
+    [ -n "$(find "$mfile" -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && { sgit -C "$repo" update-ref -d "$refname" 2>/dev/null; rm -f "$mfile"; }
+  done < <(sgit -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/detached 2>/dev/null)
   while read -r refname; do
     suffix=${refname#refs/git-safety/stash/}
     printf '%s\n' "${live_stash[@]}" | grep -qxF "$suffix" && continue
     mfile="$mark_dir/stash-$suffix"
-    [ -e "$mfile" ] || touch "$mfile"
-    [ -n "$(find "$mfile" -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && { git -C "$repo" update-ref -d "$refname" 2>/dev/null; rm -f "$mfile"; }
-  done < <(git -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/stash 2>/dev/null)
+    [ -e "$mfile" ] || { mkdir -p "$mark_dir"; touch "$mfile"; }
+    [ -n "$(find "$mfile" -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && { sgit -C "$repo" update-ref -d "$refname" 2>/dev/null; rm -f "$mfile"; }
+  done < <(sgit -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/stash 2>/dev/null)
 
   while read -r r; do
-    [ "$(git -C "$repo" rev-list --count "$r" --not --remotes 2>/dev/null || echo 0)" -gt 0 ] && n=$((n + 1))
-  done < <(git -C "$repo" for-each-ref --format='%(refname)' refs/heads refs/git-safety)
+    [ "$(sgit -C "$repo" rev-list --count "$r" --not --remotes 2>/dev/null || echo 0)" -gt 0 ] && n=$((n + 1))
+  done < <(sgit -C "$repo" for-each-ref --format='%(refname)' refs/heads refs/git-safety)
   if [ "$n" -gt 0 ]; then
     # review-683-r2 P3-8: same leak-on-signal reasoning — this one is rm'd
     # by hand a few lines down rather than via check_err, but a signal
     # landing before that still leaked it without CLEANUP_PATHS.
     local be; be=$(mktemp); CLEANUP_PATHS+=("$be")
-    if git -C "$repo" bundle create "$dir/unpushed-commits.bundle" --branches --glob='refs/git-safety/*' --not --remotes >/dev/null 2>"$be" &&
+    if sgit -C "$repo" bundle create "$dir/unpushed-commits.bundle" --branches --glob='refs/git-safety/*' --not --remotes >/dev/null 2>"$be" &&
        verify_bundle "$dir/unpushed-commits.bundle" "$repo"; then
       say "$label: bundled $n refs holding commits on no remote"
     else
@@ -409,11 +473,16 @@ snapshot_repo() { # <repo path> <label>
     cat "$be" >> "$ERR" 2>/dev/null; rm -f "$be"
   fi
 
-  # Per worktree: tracked edits as a binary patch, new files (under the size
-  # cap, and never secret-shaped by filename) as a tarball.
+  # Per worktree: tracked edits as a gzipped binary patch, new files (under
+  # the size cap, and never secret-shaped by filename) as a tarball. A
+  # worktree two repos both list is captured once.
   while read -r w; do
     [ -e "$w" ] || continue
-    [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ] || continue
+    r=$(realpath -e "$w" 2>/dev/null) || continue
+    [ -z "${CAPTURED[$r]:-}" ] || continue
+    CAPTURED[$r]=1
+    st=$(wgit "$w" status --porcelain --untracked-files=normal --ignore-submodules=dirty 2>/dev/null)
+    [ -n "$st" ] || continue
     s=$(slug "$w")
     list="$dir/$s.untracked"
     # review-683-r2 P3-8: same leak-on-signal reasoning as above.
@@ -423,10 +492,11 @@ snapshot_repo() { # <repo path> <label>
     # stat-dirty (mtime changed, content identical) — verified empirically
     # while building this fix, on both settings of the variable. `diff-index`
     # never does that rewrite, with or without the variable.
-    git -C "$w" diff-index --no-color -p --binary HEAD > "$dir/$s.patch" 2>"$pe"
+    wgit "$w" diff-index --no-color -p --binary --no-ext-diff --no-textconv --ignore-submodules=dirty HEAD 2>"$pe" |
+      gzip -n > "$dir/$s.patch.gz"
     check_err "$pe" "$label: diff for $w"
-    [ -s "$dir/$s.patch" ] || rm -f "$dir/$s.patch"
-    git -C "$w" ls-files --others --exclude-standard -z 2>/dev/null |
+    [ -n "$(gzip -dc "$dir/$s.patch.gz" 2>/dev/null | head -c1)" ] || rm -f "$dir/$s.patch.gz"
+    wgit "$w" ls-files --others --exclude-standard -z 2>/dev/null |
       while IFS= read -r -d '' f; do
         [ -f "$w/$f" ] || continue
         local bn sz
@@ -449,8 +519,8 @@ snapshot_repo() { # <repo path> <label>
       check_err "$te" "$label: tar of untracked files for $w"
     fi
     rm -f "$list"
-    say "$label: $w  HEAD=$(git -C "$w" rev-parse --short HEAD) branch=$(git -C "$w" rev-parse --abbrev-ref HEAD) uncommitted=$(git -C "$w" status --porcelain | wc -l)"
-  done < <(git -C "$repo" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}')
+    say "$label: $w  HEAD=$(wgit "$w" rev-parse --short HEAD) branch=$(wgit "$w" rev-parse --abbrev-ref HEAD) uncommitted=$(wc -l <<<"$st")"
+  done <<<"$worktrees"
 }
 
 snapshot_repo "$NANOCLAW_DIR" nanoclaw
@@ -458,11 +528,19 @@ snapshot_repo "$NANOCLAW_DIR" nanoclaw
 for spec in ${GIT_SAFETY_EXTRA_REPOS:-}; do
   for r in $spec; do
     r=${r%/}
-    git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
-    [ -n "$(git -C "$r" status --porcelain 2>/dev/null)$(git -C "$r" log --oneline --branches --not --remotes 2>/dev/null | head -c1)$(git -C "$r" stash list 2>/dev/null | head -c1)" ] || continue
+    sgit -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+    [ -n "$(wgit "$r" status --porcelain 2>/dev/null)$(sgit -C "$r" log --oneline --branches --not --remotes 2>/dev/null | head -c1)$(sgit -C "$r" stash list 2>/dev/null | head -c1)" ] || continue
     snapshot_repo "$r" "extra-$(slug "$r")"
   done
 done
+while read -r common; do
+  [ -n "$common" ] && [ -z "${SNAPSHOTTED[$common]:-}" ] || continue
+  snapshot_repo "$(head -1 <<<"${TOPIC_WTS[$common]}")" "topic-$(slug "$common")"
+done < <(printf '%s\n' "${!TOPIC_WTS[@]}" | sort)
+if [ ${#TOPIC_UNREADABLE[@]} -gt 0 ]; then
+  say "topic checkouts git cannot open (not snapshotted): ${#TOPIC_UNREADABLE[@]}"
+  printf '  %s\n' "${TOPIC_UNREADABLE[@]}" >> "$MAN"
+fi
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # ── phase 2: snapshot groups/'s pending tracked-file edits ──────────────────
@@ -1003,4 +1081,6 @@ Full snapshot: $OUT ($SIZE)."
   node_modules/.bin/tsx scripts/notify-owner.ts --title "Git safety net: review pending" --body "$NOTICE_BODY" ||
     echo "git-safety: notice DM failed (non-fatal)" >&2
 fi
-echo "git-safety: ok — snapshot $OUT ($SIZE); groups: $GROUPS_RESULT"
+UNREADABLE_NOTE=""
+[ ${#TOPIC_UNREADABLE[@]} -gt 0 ] && UNREADABLE_NOTE="; ${#TOPIC_UNREADABLE[@]} topic checkout(s) git cannot open, listed in $MAN"
+echo "git-safety: ok — snapshot $OUT ($SIZE); groups: $GROUPS_RESULT$UNREADABLE_NOTE"

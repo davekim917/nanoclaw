@@ -517,7 +517,7 @@ echo edit >> "$LONGA/README.md"
 echo edit >> "$LONGB/README.md"
 run_safety
 NANOCLAW_SNAP="$(latest_snapshot)nanoclaw"
-COUNT=$(ls "$NANOCLAW_SNAP"/*.patch 2>/dev/null | wc -l)
+COUNT=$(ls "$NANOCLAW_SNAP"/*.patch.gz 2>/dev/null | wc -l)
 [ "$COUNT" -ge 2 ] && ok "two long, tail-colliding worktree paths produced distinct slugs ($COUNT patch files)" \
   || bad "worktree slug collision — expected 2 distinct patch files" "found=$COUNT dir=$(ls "$NANOCLAW_SNAP" 2>/dev/null)"
 git -C "$NCDIR" worktree remove --force "$LONGA" >/dev/null 2>&1
@@ -1904,6 +1904,141 @@ case "$(cat "$DM_LOG" 2>/dev/null)" in
   *'del\nname.md'*) ok "round 3 P3: the deletion notice %q-quotes an embedded-LF filename intact, on one line" ;;
   *) bad "round 3 P3: no %q-quoted form of the poisoned deleted filename in the DM" "$(cat "$DM_LOG" 2>/dev/null)" ;;
 esac
+
+# ═══ GIT_SAFETY_TOPIC_CHECKOUTS: per-checkout capture, one bundle per repo ═══
+# Mirrors the host layout: topic checkouts nested inside the nanoclaw
+# checkout (data/ is ignored there), some standalone clones, some linked
+# worktrees of a shared store repo whose own registration of them names a
+# container path.
+new_fixture
+echo data/ >> "$NCDIR/.git/info/exclude"
+TOPICS="$NCDIR/data/v2-topics"
+TOPIC_GLOB="$TOPICS/*/*/worktrees/*"
+tgit() { git -c user.email=test@example.com -c user.name=test "$@"; }
+CLONE_REMOTE="$FIX/remote-clone.git"
+git init --bare -q -b main "$CLONE_REMOTE"
+SEED="$FIX/seed"
+tgit init -q -b main "$SEED" && echo base > "$SEED/app.txt" && tgit -C "$SEED" add app.txt && tgit -C "$SEED" commit -qm base &&
+  tgit -C "$SEED" push -q "$CLONE_REMOTE" HEAD:refs/heads/main
+CLONE="$TOPICS/wg/topic-a/worktrees/app"
+mkdir -p "$(dirname "$CLONE")"
+git clone -q "$CLONE_REMOTE" "$CLONE"
+tgit -C "$CLONE" checkout -q -b feature
+echo unpushed >> "$CLONE/app.txt" && tgit -C "$CLONE" commit -qam "unpushed on topic clone"
+echo stashed >> "$CLONE/app.txt" && tgit -C "$CLONE" stash push -q -m "topic stash"
+echo edited >> "$CLONE/app.txt"
+echo new > "$CLONE/new-file.txt"
+UNPUSHED_SHA=$(git -C "$CLONE" rev-parse feature)
+
+STORE="$NCDIR/data/repositories/wg/store"
+mkdir -p "$(dirname "$STORE")"
+git clone -q "$CLONE_REMOTE" "$STORE"
+LINK1="$TOPICS/wg/topic-b/worktrees/store"
+LINK2="$TOPICS/wg/topic-c/worktrees/store"
+mkdir -p "$(dirname "$LINK1")" "$(dirname "$LINK2")"
+git -C "$STORE" worktree add -q -b topic-b "$LINK1" >/dev/null 2>&1
+git -C "$STORE" worktree add -q -b topic-c "$LINK2" >/dev/null 2>&1
+echo b-work >> "$LINK1/app.txt" && tgit -C "$LINK1" commit -qam "unpushed on topic-b"
+echo b-edit >> "$LINK1/app.txt"
+echo c-edit >> "$LINK2/app.txt"
+# A worktree added inside a container records the container's path for it.
+printf '/workspace/worktrees/store/.git\n' > "$(git -C "$LINK1" rev-parse --absolute-git-dir)/gitdir"
+
+ORPHAN="$TOPICS/wg/topic-d/worktrees/gone"
+mkdir -p "$ORPHAN" && printf 'gitdir: %s\n' "$FIX/no-such-admin-dir" > "$ORPHAN/.git"
+PLAIN="$TOPICS/wg/topic-e/worktrees/plain"
+mkdir -p "$PLAIN" && echo loose > "$PLAIN/file.txt"
+
+run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPIC_GLOB" GIT_SAFETY_GROUPS_COMMIT=dry
+SNAP=$(latest_snapshot)
+[ "$RC" -eq 0 ] && ok "topic checkouts: run succeeds" || bad "topic checkouts: run failed" "$OUT"
+
+CLONE_BUNDLE=$(grep -l "$UNPUSHED_SHA" "$SNAP"/topic-*/unpushed-commits.bundle 2>/dev/null | head -1)
+if [ -n "$CLONE_BUNDLE" ]; then
+  CLONE_DIR=$(dirname "$CLONE_BUNDLE")
+  RESTORE="$FIX/restore-clone"
+  git clone -q "$CLONE_REMOTE" "$RESTORE" && git -C "$RESTORE" fetch -q "$CLONE_BUNDLE" 'refs/*:refs/restored/*' 2>/dev/null
+  git -C "$RESTORE" cat-file -e "$UNPUSHED_SHA" 2>/dev/null \
+    && ok "topic clone: its unpushed branch restores from the bundle" \
+    || bad "topic clone: unpushed commit missing from the restored bundle" "$(ls "$CLONE_DIR")"
+  git -C "$RESTORE" cat-file -e "$(git -C "$CLONE" rev-parse refs/stash)" 2>/dev/null \
+    && ok "topic clone: its stash restores from the bundle" \
+    || bad "topic clone: stash commit missing from the restored bundle" ""
+  git -C "$RESTORE" checkout -q "$UNPUSHED_SHA" 2>/dev/null
+  if gzip -dc "$CLONE_DIR"/*.patch.gz | git -C "$RESTORE" apply --binary 2>/dev/null &&
+     tar xzf "$CLONE_DIR"/*-untracked.tgz -C "$RESTORE" 2>/dev/null &&
+     cmp -s "$RESTORE/app.txt" "$CLONE/app.txt" && cmp -s "$RESTORE/new-file.txt" "$CLONE/new-file.txt"; then
+    ok "topic clone: its edits and new file restore byte-identical from patch.gz + tgz"
+  else
+    bad "topic clone: working tree did not restore from the snapshot" "$(ls "$CLONE_DIR")"
+  fi
+else
+  bad "topic clone: no topic-* bundle holds its unpushed commit" "$(ls -R "$SNAP" 2>/dev/null | head -30)"
+fi
+
+STORE_BUNDLES=$(grep -l "$(git -C "$STORE" rev-parse topic-b)" "$SNAP"/*/unpushed-commits.bundle 2>/dev/null | wc -l)
+[ "$STORE_BUNDLES" -eq 1 ] && ok "a store repo shared by two topic worktrees is bundled exactly once" \
+  || bad "store repo bundled $STORE_BUNDLES times (want 1)" "$(ls "$SNAP")"
+MAN_TXT=$(cat "$SNAP/MANIFEST.txt" 2>/dev/null)
+for wt in "$LINK1" "$LINK2"; do
+  n=$(grep -cF "$wt  HEAD=" <<<"$MAN_TXT")
+  [ "$n" -eq 1 ] && ok "linked topic worktree captured exactly once: ${wt##*/v2-topics/}" \
+    || bad "linked topic worktree captured $n times (want 1): $wt" "$MAN_TXT"
+done
+case "$MAN_TXT" in
+  *"git cannot open (not snapshotted): 2"*"$ORPHAN"*) ok "a topic checkout whose admin dir is gone is listed as unreadable" ;;
+  *) bad "unreadable topic checkouts not listed in the manifest" "$MAN_TXT" ;;
+esac
+case "$MAN_TXT" in
+  *"$PLAIN"*) ok "a topic dir with no .git is listed as unreadable, not resolved to the enclosing checkout" ;;
+  *) bad "a topic dir with no .git was not listed as unreadable" "$MAN_TXT" ;;
+esac
+case "$OUT" in
+  *"2 topic checkout(s) git cannot open"*) ok "the final journal line counts unreadable topic checkouts" ;;
+  *) bad "the final journal line does not count unreadable topic checkouts" "$OUT" ;;
+esac
+
+# Container-writable git config must not run anything on the host. Each
+# trigger is shown to fire under plain git first, so a pass can't come from
+# a fixture that never exercises it.
+new_fixture
+echo data/ >> "$NCDIR/.git/info/exclude"
+TOPICS="$NCDIR/data/v2-topics"
+HOSTILE="$TOPICS/wg/topic-x/worktrees/app"
+mkdir -p "$(dirname "$HOSTILE")"
+tgit init -q "$HOSTILE"
+echo 'x.dat filter=evil' > "$HOSTILE/.gitattributes"
+echo data > "$HOSTILE/x.dat"
+tgit -C "$HOSTILE" add . && tgit -C "$HOSTILE" commit -qm base
+PWN="$FIX/pwned"
+cat > "$FIX/evil.sh" <<EOF
+#!/bin/bash
+echo "\$0 \$*" >> "$PWN"
+cat
+EOF
+chmod +x "$FIX/evil.sh"
+git -C "$HOSTILE" config filter.evil.clean "$FIX/evil.sh clean"
+git -C "$HOSTILE" config core.fsmonitor "$FIX/evil.sh"
+cp "$FIX/evil.sh" "$HOSTILE/.git/hooks/reference-transaction"
+echo more >> "$HOSTILE/x.dat"
+tgit -C "$HOSTILE" stash push -q -m s
+echo untracked > "$HOSTILE/new.txt"
+# Same content, new mtime: git has to run the clean filter to compare it.
+stat_dirty() { touch -d "@$(( $(date +%s) - 1000 - RANDOM ))" "$HOSTILE/x.dat"; }
+PROBES=""
+: > "$PWN"; stat_dirty; git -C "$HOSTILE" -c core.fsmonitor=false status --porcelain >/dev/null 2>&1; [ -s "$PWN" ] && PROBES+="filter "
+: > "$PWN"; stat_dirty; git -C "$HOSTILE" -c filter.evil.clean=cat status --porcelain >/dev/null 2>&1; [ -s "$PWN" ] && PROBES+="fsmonitor "
+: > "$PWN"; git -C "$HOSTILE" update-ref refs/probe HEAD 2>/dev/null; git -C "$HOSTILE" update-ref -d refs/probe 2>/dev/null; [ -s "$PWN" ] && PROBES+="hook"
+if [ "$PROBES" = "filter fsmonitor hook" ]; then
+  : > "$PWN"; stat_dirty
+  run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPICS/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry
+  [ ! -s "$PWN" ] && ok "a topic repo's fsmonitor, filter driver and reference-transaction hook never run on the host" \
+    || bad "container-set git config ran a program on the host" "$(cat "$PWN")"
+  ls "$(latest_snapshot)"topic-*/*-untracked.tgz >/dev/null 2>&1 && ok "the hostile topic repo is still snapshotted" \
+    || bad "the hostile topic repo was not snapshotted" "$OUT"
+else
+  bad "test setup: plain git fired only [$PROBES] of the planted filter/fsmonitor/hook, so the check proves nothing" ""
+fi
 
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
 exit "$FAILED"
