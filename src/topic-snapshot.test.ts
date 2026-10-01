@@ -359,6 +359,52 @@ describe('snapshotTopics', () => {
     expect(result.failures).toEqual([expect.stringMatching(/killed after 2s/)]);
   });
 
+  it('reports a topic it cannot list or stat, a symlinked topic dir and a pattern matching nothing; never skips them', async () => {
+    const good = topic('topic-ok');
+    git(root, 'clone', '-q', remote, good);
+    fs.appendFileSync(path.join(good, 'app.txt'), 'edit\n');
+    const unlistable = path.dirname(topic('topic-locked'));
+    const unsearchable = path.dirname(topic('topic-blind'));
+    fs.mkdirSync(path.join(unsearchable, 'app'));
+    const outside = path.join(root, 'outside-topic');
+    fs.mkdirSync(path.join(outside, 'worktrees'), { recursive: true });
+    const linked = path.join(topics, 'wg', 'topic-link');
+    fs.symlinkSync(outside, linked);
+    fs.chmodSync(unlistable, 0o000);
+    fs.chmodSync(unsearchable, 0o644);
+    let result: Awaited<ReturnType<typeof snapshotTopics>>;
+    try {
+      result = await snapshotTopics({ ...options, patterns: [...options.patterns, path.join(root, 'nowhere', '*')] });
+    } finally {
+      fs.chmodSync(unlistable, 0o755);
+      fs.chmodSync(unsearchable, 0o755);
+    }
+
+    expect(result.captured).toBe(1);
+    expect(result.failures).toHaveLength(3);
+    expect(result.failures).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(`${unlistable}: EACCES`),
+        expect.stringContaining(`${path.join(unsearchable, 'app')}: EACCES`),
+        `pattern ${path.join(root, 'nowhere', '*')}: matched nothing`,
+      ]),
+    );
+    expect(result.unreadable).toEqual([{ kind: 'unreadable', checkout: linked, reason: 'a symlink' }]);
+  });
+
+  it('fails a checkout whose untracked file tar cannot read, rather than archiving without it', async () => {
+    const checkout = topic('topic-perm');
+    git(root, 'clone', '-q', remote, checkout);
+    fs.writeFileSync(path.join(checkout, 'kept.txt'), 'kept\n');
+    fs.writeFileSync(path.join(checkout, 'sealed.txt'), 'sealed\n');
+    fs.chmodSync(path.join(checkout, 'sealed.txt'), 0o000);
+
+    const result = await snapshotTopics(options);
+
+    expect(result.captured).toBe(0);
+    expect(result.failures).toEqual([expect.stringMatching(/sealed\.txt: Warning: Cannot open: Permission denied/)]);
+  });
+
   it('refuses an output location under data/', async () => {
     await expect(snapshotTopics({ ...options, outDir: path.join(data, 'out') })).rejects.toThrow(
       /refusing to write under/,

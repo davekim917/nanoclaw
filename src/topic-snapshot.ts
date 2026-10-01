@@ -159,7 +159,8 @@ function admit(dataRoot: string, checkout: string, timeoutMs: number): Admission
   try {
     stat = fs.lstatSync(checkout);
   } catch (err) {
-    return unreadable(String(err));
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    return unreadable('vanished after listing');
   }
   if (stat.isSymbolicLink()) return unreadable('a symlink');
   if (!stat.isDirectory()) return unreadable('not a directory');
@@ -174,8 +175,8 @@ function admit(dataRoot: string, checkout: string, timeoutMs: number): Admission
     if (!isWithin(dataRoot, commonDir)) return unreadable(`its repository ${commonDir} is outside ${dataRoot}`);
     return { kind: 'admitted', checkout: real, commonDir };
   } catch (err) {
-    if (err instanceof GitFailure && !err.cannotOpen) throw err;
-    return unreadable(`git cannot open it: ${err instanceof Error ? err.message : String(err)}`);
+    if (!(err instanceof GitFailure) || !err.cannotOpen) throw err;
+    return unreadable(`git cannot open it: ${err.message}`);
   }
 }
 
@@ -396,22 +397,25 @@ async function captureCheckout(
       const list = hostChild(work, 'untracked.list');
       fs.writeFileSync(list, Buffer.concat(kept.flatMap((file) => [file, Buffer.from([0])])));
       const tarball = hostChild(dir, `${slug}-untracked.tgz`);
-      // A checkout in use can lose a file between listing and archiving; tar reports it and carries on.
+      // A checkout in use can lose a file between listing and archiving; any other unread file is a failure.
       const tar = spawnSync(
         'tar',
         ['--null', '--no-recursion', '--ignore-failed-read', '-C', checkout, '-T', list, '-czf', tarball],
         {
+          env: { PATH: process.env.PATH, LC_ALL: 'C' },
           stdio: ['ignore', 'ignore', 'pipe'],
           timeout: options.timeoutMs,
           killSignal: 'SIGKILL',
         },
       );
-      if (tar.error || tar.signal || tar.status !== 0) {
+      const warnings = tar.stderr ? lines(tar.stderr) : [];
+      const unread = warnings.filter((line) => !/: Warning: Cannot stat: No such file or directory$/.test(line));
+      if (tar.error || tar.signal || tar.status !== 0 || unread.length > 0) {
         throw new Error(
-          `tar of untracked files in ${checkout}: ${tar.stderr?.toString().trim() || tar.signal || String(tar.error)}`,
+          `tar of untracked files in ${checkout}: ${unread.join('; ') || tar.signal || tar.error?.message || `exit ${tar.status}`}`,
         );
       }
-      for (const warning of lines(tar.stderr)) say(`${label}: ${checkout}: tar: ${warning}`);
+      for (const warning of warnings) say(`${label}: ${checkout}: tar: ${warning}`);
     }
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
@@ -428,6 +432,56 @@ async function captureCheckout(
   return true;
 }
 
+/**
+ * The paths `pattern` matches, by its own directory walk: `fs.globSync` skips a directory it cannot read, so an
+ * unreadable topic would vanish from the run. Only ENOENT is absence, and past the first wildcard, where a
+ * container chose the names, a symlink is listed rather than followed.
+ */
+function expand(pattern: string): { checkouts: string[]; unreadable: Admission[]; failures: string[] } {
+  const isGlob = (segment: string): boolean => /[*?[]/.test(segment);
+  const [rootSegment, ...segments] = path.resolve(pattern).split(path.sep);
+  const unreadable: Admission[] = [];
+  const failures: string[] = [];
+  const failed = (where: string, err: unknown): void => {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') failures.push(`${where}: ${(err as Error).message}`);
+  };
+  let level = [rootSegment || path.sep];
+  let untrusted = false;
+  for (const [index, segment] of segments.entries()) {
+    const wildcard = isGlob(segment);
+    untrusted ||= wildcard;
+    const last = index === segments.length - 1;
+    const next: string[] = [];
+    for (const dir of level) {
+      let names = [segment];
+      if (wildcard) {
+        try {
+          names = fs.readdirSync(dir).filter((name) => path.matchesGlob(name, segment));
+        } catch (err) {
+          failed(dir, err);
+          continue;
+        }
+      }
+      for (const name of names) {
+        const candidate = path.join(dir, name);
+        let stat: fs.Stats;
+        try {
+          stat = untrusted ? fs.lstatSync(candidate) : fs.statSync(candidate);
+        } catch (err) {
+          failed(candidate, err);
+          continue;
+        }
+        if (last) next.push(candidate);
+        else if (stat.isSymbolicLink())
+          unreadable.push({ kind: 'unreadable', checkout: candidate, reason: 'a symlink' });
+        else if (stat.isDirectory()) next.push(candidate);
+      }
+    }
+    level = next;
+  }
+  return { checkouts: level, unreadable, failures };
+}
+
 export async function snapshotTopics(options: TopicSnapshotOptions): Promise<TopicSnapshotResult> {
   const dataRoot = fs.realpathSync(options.dataRoot);
   const resolved = { ...options, dataRoot };
@@ -435,8 +489,18 @@ export async function snapshotTopics(options: TopicSnapshotOptions): Promise<Top
   const manifest = hostOwned(dataRoot, options.manifestPath);
   const say = (line: string): void => fs.appendFileSync(manifest, `${line}\n`);
 
-  const checkouts = [...new Set(options.patterns.flatMap((pattern) => fs.globSync(pattern)))].sort();
   const result: TopicSnapshotResult = { captured: 0, bundled: 0, unreadable: [], failures: [] };
+  const found = new Set<string>();
+  for (const pattern of options.patterns) {
+    const expanded = expand(pattern);
+    for (const checkout of expanded.checkouts) found.add(checkout);
+    result.unreadable.push(...expanded.unreadable);
+    result.failures.push(...expanded.failures);
+    if (expanded.checkouts.length + expanded.unreadable.length + expanded.failures.length === 0) {
+      result.failures.push(`pattern ${pattern}: matched nothing`);
+    }
+  }
+  const checkouts = [...found].sort();
   const admissions: Admission[] = [];
   for (const checkout of checkouts) {
     try {
