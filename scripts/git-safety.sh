@@ -87,6 +87,8 @@
 #                                 (default host-snapshot)
 #   GIT_SAFETY_MAX_UNTRACKED_BYTES  size cap for untracked files captured in a
 #                                 snapshot tarball (default 104857600 = 100MB)
+#   GIT_SAFETY_GIT_TIMEOUT        seconds any one snapshot-phase git command may
+#                                 run (default 300)
 #   GIT_SAFETY_STATE_DIR          per-file secret-scan hold state directory
 #                                 (default $GIT_SAFETY_DIR/.git-safety-state)
 #
@@ -118,6 +120,7 @@ GROUPS_MODE="${GIT_SAFETY_GROUPS_COMMIT:-apply}"
 GROUPS_DIR="$NANOCLAW_DIR/groups"
 SNAPSHOT_BRANCH="${GIT_SAFETY_SNAPSHOT_BRANCH:-host-snapshot}"
 MAX_UNTRACKED_BYTES="${GIT_SAFETY_MAX_UNTRACKED_BYTES:-104857600}"
+GIT_TIMEOUT="${GIT_SAFETY_GIT_TIMEOUT:-300}"
 STATE_DIR="${GIT_SAFETY_STATE_DIR:-$SNAP_ROOT/.git-safety-state}"
 HELD_STATE_FILE="$STATE_DIR/secret-scan-held.tsv"
 # #628 item 9: a hold that has sat unresolved (not allowlisted, not fixed)
@@ -337,11 +340,13 @@ say "Restore groups/ config: git -C groups fetch origin $SNAPSHOT_BRANCH && git 
 # ── phase 1: snapshot ───────────────────────────────────────────────────────
 # Topic checkouts and the repo store are bind-mounted read-write into agent
 # containers, so their config is untrusted: without these overrides a
-# container-set core.fsmonitor, reference-transaction hook, gpg program or
-# filter driver would run on the host as this user.
-SAFE_GIT=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false
+# container-set core.fsmonitor, reference-transaction hook, gpg program,
+# filter driver, or promisor remote (whose lazy fetch runs core.sshCommand)
+# would run on the host as this user. The timeout keeps a planted FIFO from
+# hanging the whole run.
+SAFE_GIT=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false -c protocol.allow=never
   -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false -c gpg.x509.program=/bin/false)
-sgit() { git "${SAFE_GIT[@]}" "$@"; }
+sgit() { GIT_NO_LAZY_FETCH=1 timeout -k 10 "$GIT_TIMEOUT" git "${SAFE_GIT[@]}" "$@"; }
 # wgit <worktree> <args> — for commands that read a worktree's files, which
 # run filter drivers. Filters the repo's own config defines are replaced by
 # cat; global and system ones are the operator's and stay. The ceiling stops
@@ -362,41 +367,45 @@ common_dir() { # <repo or worktree> -> canonical path of the git dir holding its
 }
 
 # Keyed by the repository holding their commits: a linked worktree's branches
-# and stashes live in a repo other checkouts or the repos below may share.
+# and stashes live in a repo other checkouts or the repos below may share. A
+# topic's .git is container-written, so its repository must sit under data/.
 declare -A TOPIC_WTS=() SNAPSHOTTED=() CAPTURED=()
-TOPIC_UNREADABLE=()
-for spec in ${GIT_SAFETY_TOPIC_CHECKOUTS:-}; do
+UNREADABLE=()
+DATA_ROOT="$(realpath -m "$NANOCLAW_DIR/data")/"
+read -ra TOPIC_SPECS <<<"${GIT_SAFETY_TOPIC_CHECKOUTS:-}"
+for spec in ${TOPIC_SPECS[@]+"${TOPIC_SPECS[@]}"}; do
   for t in $spec; do
     t=${t%/}
     [ -e "$t" ] || [ -L "$t" ] || continue
     real=$(realpath -e "$t" 2>/dev/null)
     top="" common=""
-    if [ ! -L "$t" ] && [ -d "$t" ]; then
+    if [ ! -L "$t" ] && [ -d "$t" ] && [[ "$real" != *$'\n'* ]]; then
       top=$(sgit -C "$t" rev-parse --show-toplevel 2>/dev/null)
       common=$(common_dir "$t")
     fi
-    if [ -z "$common" ] || [ "$top" != "$real" ]; then
-      TOPIC_UNREADABLE+=("$t")
+    if [ -z "$common" ] || [ "$top" != "$real" ] || [[ "$common/" != "$DATA_ROOT"* ]]; then
+      UNREADABLE+=("$t")
       continue
     fi
     TOPIC_WTS[$common]+="$real"$'\n'
   done
 done
 
-repo_worktrees() { # <repo> -> git's own worktree list plus the topic checkouts sharing its commits
-  local common
-  common=$(common_dir "$1")
+repo_worktrees() { # <repo> <its common dir> -> git's own worktree list plus the topic checkouts sharing its commits
   { sgit -C "$1" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}'
-    [ -n "$common" ] && printf '%s' "${TOPIC_WTS[$common]:-}"
+    printf '%s' "${TOPIC_WTS[$2]:-}"
   } | awk 'NF && !seen[$0]++'
 }
 
 snapshot_repo() { # <repo path> <label>
   local repo=$1 label=$2 dir="$OUT/$2" h w s st list r n=0 common worktrees
-  mkdir -p "$dir"
   common=$(common_dir "$repo")
-  [ -n "$common" ] && SNAPSHOTTED[$common]=1
-  worktrees=$(repo_worktrees "$repo")
+  if [ -n "$common" ]; then
+    [ -z "${SNAPSHOTTED[$common]:-}" ] || return 0
+    SNAPSHOTTED[$common]=1
+  fi
+  mkdir -p "$dir"
+  worktrees=$(repo_worktrees "$repo" "$common")
 
   local mark_dir="$SNAP_ROOT/.git-safety-refs/$label"
 
@@ -475,13 +484,18 @@ snapshot_repo() { # <repo path> <label>
 
   # Per worktree: tracked edits as a gzipped binary patch, new files (under
   # the size cap, and never secret-shaped by filename) as a tarball. A
-  # worktree two repos both list is captured once.
+  # registration is container-writable, so a listed path is captured only
+  # when it really is a worktree of this repo.
   while read -r w; do
     [ -e "$w" ] || continue
     r=$(realpath -e "$w" 2>/dev/null) || continue
     [ -z "${CAPTURED[$r]:-}" ] || continue
+    [ -z "$common" ] || [ "$(common_dir "$w")" = "$common" ] || continue
     CAPTURED[$r]=1
-    st=$(wgit "$w" status --porcelain --untracked-files=normal --ignore-submodules=dirty 2>/dev/null)
+    if ! st=$(wgit "$w" status --porcelain --untracked-files=normal --ignore-submodules=dirty 2>/dev/null); then
+      UNREADABLE+=("$w")
+      continue
+    fi
     [ -n "$st" ] || continue
     s=$(slug "$w")
     list="$dir/$s.untracked"
@@ -493,7 +507,7 @@ snapshot_repo() { # <repo path> <label>
     # while building this fix, on both settings of the variable. `diff-index`
     # never does that rewrite, with or without the variable.
     wgit "$w" diff-index --no-color -p --binary --no-ext-diff --no-textconv --ignore-submodules=dirty HEAD 2>"$pe" |
-      gzip -n > "$dir/$s.patch.gz"
+      gzip -n 2>>"$pe" > "$dir/$s.patch.gz"
     check_err "$pe" "$label: diff for $w"
     [ -n "$(gzip -dc "$dir/$s.patch.gz" 2>/dev/null | head -c1)" ] || rm -f "$dir/$s.patch.gz"
     wgit "$w" ls-files --others --exclude-standard -z 2>/dev/null |
@@ -534,12 +548,12 @@ for spec in ${GIT_SAFETY_EXTRA_REPOS:-}; do
   done
 done
 while read -r common; do
-  [ -n "$common" ] && [ -z "${SNAPSHOTTED[$common]:-}" ] || continue
+  [ -n "$common" ] || continue
   snapshot_repo "$(head -1 <<<"${TOPIC_WTS[$common]}")" "topic-$(slug "$common")"
 done < <(printf '%s\n' "${!TOPIC_WTS[@]}" | sort)
-if [ ${#TOPIC_UNREADABLE[@]} -gt 0 ]; then
-  say "topic checkouts git cannot open (not snapshotted): ${#TOPIC_UNREADABLE[@]}"
-  printf '  %s\n' "${TOPIC_UNREADABLE[@]}" >> "$MAN"
+if [ ${#UNREADABLE[@]} -gt 0 ]; then
+  say "checkouts git cannot open (not snapshotted): ${#UNREADABLE[@]}"
+  printf '  %q\n' "${UNREADABLE[@]}" >> "$MAN"
 fi
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
@@ -1082,5 +1096,5 @@ Full snapshot: $OUT ($SIZE)."
     echo "git-safety: notice DM failed (non-fatal)" >&2
 fi
 UNREADABLE_NOTE=""
-[ ${#TOPIC_UNREADABLE[@]} -gt 0 ] && UNREADABLE_NOTE="; ${#TOPIC_UNREADABLE[@]} topic checkout(s) git cannot open, listed in $MAN"
+[ ${#UNREADABLE[@]} -gt 0 ] && UNREADABLE_NOTE="; ${#UNREADABLE[@]} checkout(s) git cannot open, listed in $MAN"
 echo "git-safety: ok — snapshot $OUT ($SIZE); groups: $GROUPS_RESULT$UNREADABLE_NOTE"

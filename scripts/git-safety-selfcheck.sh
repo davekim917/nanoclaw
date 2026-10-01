@@ -1906,10 +1906,6 @@ case "$(cat "$DM_LOG" 2>/dev/null)" in
 esac
 
 # ═══ GIT_SAFETY_TOPIC_CHECKOUTS: per-checkout capture, one bundle per repo ═══
-# Mirrors the host layout: topic checkouts nested inside the nanoclaw
-# checkout (data/ is ignored there), some standalone clones, some linked
-# worktrees of a shared store repo whose own registration of them names a
-# container path.
 new_fixture
 echo data/ >> "$NCDIR/.git/info/exclude"
 TOPICS="$NCDIR/data/v2-topics"
@@ -1948,8 +1944,18 @@ ORPHAN="$TOPICS/wg/topic-d/worktrees/gone"
 mkdir -p "$ORPHAN" && printf 'gitdir: %s\n' "$FIX/no-such-admin-dir" > "$ORPHAN/.git"
 PLAIN="$TOPICS/wg/topic-e/worktrees/plain"
 mkdir -p "$PLAIN" && echo loose > "$PLAIN/file.txt"
+SPACED="$TOPICS/wg/topic f/worktrees/app two"
+mkdir -p "$(dirname "$SPACED")" && git clone -q "$CLONE_REMOTE" "$SPACED" && echo spaced >> "$SPACED/app.txt"
+OUTSIDE_REPO="$FIX/outside"
+git clone -q "$CLONE_REMOTE" "$OUTSIDE_REPO"
+OUTSIDE="$TOPICS/wg/topic-g/worktrees/outside"
+mkdir -p "$(dirname "$OUTSIDE")" && git -C "$OUTSIDE_REPO" worktree add -q -b topic-g "$OUTSIDE" >/dev/null 2>&1
+echo outside-edit >> "$OUTSIDE/app.txt"
+BADSTATUS="$TOPICS/wg/topic-h/worktrees/app"
+mkdir -p "$(dirname "$BADSTATUS")" && git clone -q "$CLONE_REMOTE" "$BADSTATUS"
+echo edit >> "$BADSTATUS/app.txt" && git -C "$BADSTATUS" config status.showUntrackedFiles invalid
 
-run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPIC_GLOB" GIT_SAFETY_GROUPS_COMMIT=dry
+run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPIC_GLOB" GIT_SAFETY_EXTRA_REPOS="$STORE $LINK2" GIT_SAFETY_GROUPS_COMMIT=dry
 SNAP=$(latest_snapshot)
 [ "$RC" -eq 0 ] && ok "topic checkouts: run succeeds" || bad "topic checkouts: run failed" "$OUT"
 
@@ -1977,7 +1983,7 @@ else
 fi
 
 STORE_BUNDLES=$(grep -l "$(git -C "$STORE" rev-parse topic-b)" "$SNAP"/*/unpushed-commits.bundle 2>/dev/null | wc -l)
-[ "$STORE_BUNDLES" -eq 1 ] && ok "a store repo shared by two topic worktrees is bundled exactly once" \
+[ "$STORE_BUNDLES" -eq 1 ] && ok "a store repo shared by two topic worktrees, and named twice in extras, is bundled exactly once" \
   || bad "store repo bundled $STORE_BUNDLES times (want 1)" "$(ls "$SNAP")"
 MAN_TXT=$(cat "$SNAP/MANIFEST.txt" 2>/dev/null)
 for wt in "$LINK1" "$LINK2"; do
@@ -1985,8 +1991,17 @@ for wt in "$LINK1" "$LINK2"; do
   [ "$n" -eq 1 ] && ok "linked topic worktree captured exactly once: ${wt##*/v2-topics/}" \
     || bad "linked topic worktree captured $n times (want 1): $wt" "$MAN_TXT"
 done
+grep -qF "$SPACED  HEAD=" <<<"$MAN_TXT" && ok "a topic checkout whose path has spaces is captured" \
+  || bad "a topic checkout whose path has spaces was not captured" "$MAN_TXT"
+for unread in "$OUTSIDE" "$BADSTATUS"; do
+  case "$MAN_TXT" in
+    *"$unread  HEAD="*) bad "captured a checkout that should be unreadable: $unread" "$MAN_TXT" ;;
+    *"  $unread"*) ok "listed as unreadable, not captured: ${unread##*/v2-topics/}" ;;
+    *) bad "not listed as unreadable: $unread" "$MAN_TXT" ;;
+  esac
+done
 case "$MAN_TXT" in
-  *"git cannot open (not snapshotted): 2"*"$ORPHAN"*) ok "a topic checkout whose admin dir is gone is listed as unreadable" ;;
+  *"git cannot open (not snapshotted): 4"*"$ORPHAN"*) ok "a topic checkout whose admin dir is gone is listed as unreadable" ;;
   *) bad "unreadable topic checkouts not listed in the manifest" "$MAN_TXT" ;;
 esac
 case "$MAN_TXT" in
@@ -1994,7 +2009,7 @@ case "$MAN_TXT" in
   *) bad "a topic dir with no .git was not listed as unreadable" "$MAN_TXT" ;;
 esac
 case "$OUT" in
-  *"2 topic checkout(s) git cannot open"*) ok "the final journal line counts unreadable topic checkouts" ;;
+  *"4 checkout(s) git cannot open"*) ok "the final journal line counts unreadable topic checkouts" ;;
   *) bad "the final journal line does not count unreadable topic checkouts" "$OUT" ;;
 esac
 
@@ -2016,10 +2031,11 @@ cat > "$FIX/evil.sh" <<EOF
 echo "\$0 \$*" >> "$PWN"
 cat
 EOF
-chmod +x "$FIX/evil.sh"
+printf '#!/bin/bash\necho "$0 $*" >> "%s"\n' "$PWN" > "$FIX/evil-log.sh"
+chmod +x "$FIX/evil.sh" "$FIX/evil-log.sh"
 git -C "$HOSTILE" config filter.evil.clean "$FIX/evil.sh clean"
-git -C "$HOSTILE" config core.fsmonitor "$FIX/evil.sh"
-cp "$FIX/evil.sh" "$HOSTILE/.git/hooks/reference-transaction"
+git -C "$HOSTILE" config core.fsmonitor "$FIX/evil-log.sh"
+cp "$FIX/evil-log.sh" "$HOSTILE/.git/hooks/reference-transaction"
 echo more >> "$HOSTILE/x.dat"
 tgit -C "$HOSTILE" stash push -q -m s
 echo untracked > "$HOSTILE/new.txt"
@@ -2028,16 +2044,32 @@ stat_dirty() { touch -d "@$(( $(date +%s) - 1000 - RANDOM ))" "$HOSTILE/x.dat"; 
 PROBES=""
 : > "$PWN"; stat_dirty; git -C "$HOSTILE" -c core.fsmonitor=false status --porcelain >/dev/null 2>&1; [ -s "$PWN" ] && PROBES+="filter "
 : > "$PWN"; stat_dirty; git -C "$HOSTILE" -c filter.evil.clean=cat status --porcelain >/dev/null 2>&1; [ -s "$PWN" ] && PROBES+="fsmonitor "
-: > "$PWN"; git -C "$HOSTILE" update-ref refs/probe HEAD 2>/dev/null; git -C "$HOSTILE" update-ref -d refs/probe 2>/dev/null; [ -s "$PWN" ] && PROBES+="hook"
-if [ "$PROBES" = "filter fsmonitor hook" ]; then
+: > "$PWN"; git -C "$HOSTILE" update-ref refs/probe HEAD 2>/dev/null; git -C "$HOSTILE" update-ref -d refs/probe 2>/dev/null; [ -s "$PWN" ] && PROBES+="hook "
+# A promisor remote's lazy fetch of a missing blob runs core.sshCommand.
+LAZY="$TOPICS/wg/topic-y/worktrees/app"
+mkdir -p "$(dirname "$LAZY")"
+tgit init -q "$LAZY" && echo one > "$LAZY/f.txt" && tgit -C "$LAZY" add f.txt && tgit -C "$LAZY" commit -qm base
+BLOB=$(git -C "$LAZY" rev-parse HEAD:f.txt)
+mv "$LAZY/.git/objects/${BLOB:0:2}/${BLOB:2}" "$FIX/missing-blob"
+git -C "$LAZY" config remote.evil.url ssh://evil.invalid/x
+git -C "$LAZY" config remote.evil.promisor true
+git -C "$LAZY" config extensions.partialclone evil
+git -C "$LAZY" config core.sshCommand "$FIX/evil-log.sh"
+echo two >> "$LAZY/f.txt"
+: > "$PWN"; git -C "$LAZY" diff-index -p HEAD >/dev/null 2>&1; [ -s "$PWN" ] && PROBES+="lazy-fetch"
+if [ "$PROBES" = "filter fsmonitor hook lazy-fetch" ]; then
   : > "$PWN"; stat_dirty
   run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPICS/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry
-  [ ! -s "$PWN" ] && ok "a topic repo's fsmonitor, filter driver and reference-transaction hook never run on the host" \
+  [ ! -s "$PWN" ] && ok "a topic repo's fsmonitor, filter driver, reference-transaction hook and promisor transport never run on the host" \
     || bad "container-set git config ran a program on the host" "$(cat "$PWN")"
+  case "$OUT" in
+    *"diff for $LAZY"*) ok "a blob that would need a lazy fetch fails that checkout's diff loudly" ;;
+    *) bad "a missing promisor blob did not surface as a failure" "$OUT" ;;
+  esac
   ls "$(latest_snapshot)"topic-*/*-untracked.tgz >/dev/null 2>&1 && ok "the hostile topic repo is still snapshotted" \
     || bad "the hostile topic repo was not snapshotted" "$OUT"
 else
-  bad "test setup: plain git fired only [$PROBES] of the planted filter/fsmonitor/hook, so the check proves nothing" ""
+  bad "test setup: plain git fired only [$PROBES] of the planted filter/fsmonitor/hook/lazy-fetch, so the check proves nothing" ""
 fi
 
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
