@@ -46,7 +46,7 @@ export function safeGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   };
 }
 
-/** Command-line config outranks repository-local config. Filters use `--config-env`, which takes the key verbatim. */
+/** Command-line config outranks repository-local config. Filters use `--config-env`, which splits at the last `=`, so any name stays in the key. */
 export function safeGitArgs(
   args: readonly string[],
   localConfigPath?: string,
@@ -93,7 +93,6 @@ function localFilterNames(configPath: string): string[] {
 
 const FILTER_VARIABLES = ['clean', 'smudge', 'process', 'required'];
 
-/** Names are sliced from NUL-terminated keys, never matched by a JS pattern, so every name git stores is kept. */
 function filterNamesFrom(configArgs: string[]): string[] {
   let output: Buffer;
   try {
