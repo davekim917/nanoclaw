@@ -121,7 +121,7 @@ const THREAD_KEY_MAX_LENGTH = 128;
 const THREAD_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 const THREAD_KEY_DESCRIPTION =
-  'Optional stable id for ONE incident or topic (e.g. "db-backup-job-42-since-run-9001"). First post with a key is a new top-level post; later posts with the SAME key — any fire, any day — go in that post\'s thread; a NEW key is a new top-level post, so mint a new key when an incident ends and another begins. Omit for ordinary messages. Letters, digits, . _ : - only; max 128 chars. No effect when posting into the current conversation\'s thread.';
+  'Optional stable id for ONE incident or topic (e.g. "db-backup-job-42-since-run-9001"). First post with a key is a new top-level post; later posts with the SAME key — any fire, any day — go in that post\'s thread; a NEW key is a new top-level post, so mint a new key when an incident ends and another begins. Omit for ordinary messages. Letters, digits, . _ : - only; max 128 chars. No effect when posting into the current conversation\'s thread, unless continue_thread names the thread to post in.';
 
 const IN_PLACE_THREAD_KEY_DESCRIPTION =
   'Optional. The thread_key the target message was sent with, when it went into an incident thread — routes this to the message inside that thread. Omit otherwise.';
@@ -152,9 +152,13 @@ export function parseThreadKey(raw: unknown): { threadKey: string | null } | { e
  * the same channel the session is bound to, the session's thread_id is
  * preserved so replies land in the correct thread. Otherwise thread_id
  * is null (a cross-destination send starts a new conversation).
+ *
+ * `leaveThread` drops the inherited thread: the host only resolves a keyed
+ * post (and the thread it continues) for a row that names no thread.
  */
 function resolveRouting(
   to: string | undefined,
+  leaveThread = false,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
   if (!to) {
     if (getTaskSeriesId()) {
@@ -166,7 +170,7 @@ function resolveRouting(
       return {
         channel_type: session.channel_type,
         platform_id: session.platform_id,
-        thread_id: session.thread_id,
+        thread_id: leaveThread ? null : session.thread_id,
         resolvedName: '(current conversation)',
       };
     }
@@ -187,7 +191,7 @@ function resolveRouting(
   if (dest.type === 'channel') {
     // Compare by platform_id, not bot instance: siblings reach one channel through different channel_types.
     const session = getSessionRouting();
-    const threadId = session.platform_id === dest.platformId ? session.thread_id : null;
+    const threadId = !leaveThread && session.platform_id === dest.platformId ? session.thread_id : null;
     return {
       channel_type: dest.channelType!,
       platform_id: dest.platformId!,
@@ -259,7 +263,7 @@ export const sendMessage: McpToolDefinition = {
     const cont = parseContinueThread(args.continue_thread, key.threadKey);
     if ('error' in cont) return err(cont.error);
 
-    const routing = resolveRouting(args.to as string | undefined);
+    const routing = resolveRouting(args.to as string | undefined, cont.continueThread !== null);
     if ('error' in routing) return err(routing.error);
 
     const policy = outcomeReportingEnabled() && routing.channel_type !== 'agent';
@@ -379,7 +383,7 @@ export const sendFile: McpToolDefinition = {
     const denial = chatSendDenial();
     if (denial) return err(denial);
 
-    const routing = resolveRouting(args.to as string | undefined);
+    const routing = resolveRouting(args.to as string | undefined, cont.continueThread !== null);
     if ('error' in routing) return err(routing.error);
 
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);

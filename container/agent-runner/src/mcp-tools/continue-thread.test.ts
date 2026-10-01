@@ -91,6 +91,43 @@ describe('send_message / send_file — continue_thread', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
+  describe('from a session bound to a thread', () => {
+    const here = 'discord:1:2:3';
+    const other = 'discord:1:2:9';
+
+    beforeEach(() => {
+      const db = getInboundDb();
+      db.exec(
+        'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
+      );
+      db.prepare(
+        "INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, 'discord', 'discord:1:2', ?)",
+      ).run(here);
+      db.prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('team', 'Team', 'channel', 'discord', 'discord:1:2', NULL)`,
+      ).run();
+    });
+
+    it('leaves the session thread so the host can route to the named one, with or without `to`', async () => {
+      await sendMessage.handler({ text: 'a', thread_key: 'topic-a', continue_thread: other });
+      await sendMessage.handler({ to: 'team', text: 'b', thread_key: 'topic-a', continue_thread: other });
+
+      const out = getUndeliveredMessages();
+      expect(out.map((m) => [m.platform_id, m.thread_id])).toEqual([
+        ['discord:1:2', null],
+        ['discord:1:2', null],
+      ]);
+      expect(JSON.parse(out[0].content).continueThread).toBe(other);
+    });
+
+    it('a key alone stays in the session thread', async () => {
+      await sendMessage.handler({ to: 'team', text: 'a', thread_key: 'topic-a' });
+
+      expect(getUndeliveredMessages()[0].thread_id).toBe(here);
+    });
+  });
+
   it('both tools advertise continue_thread as optional', () => {
     for (const t of [sendMessage, sendFile]) {
       expect(t.tool.inputSchema.properties).toHaveProperty('continue_thread');

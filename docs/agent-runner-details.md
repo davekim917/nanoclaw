@@ -584,7 +584,9 @@ written by the host) resolves the name to routing fields.
 Implementation: `resolveRouting(to)` looks up the destination. With no `to`, it defaults to
 the session's own reply routing (`session_routing`); if the destination resolves to the same
 channel the session is bound to, the session's `thread_id` is preserved so the reply lands
-in-thread, otherwise `thread_id` is null. The tool then writes a `messages_out` row with
+in-thread, otherwise `thread_id` is null. A send that carries `continue_thread` never inherits
+the session's thread, so a session bound to one thread can post into another thread of its own
+channel. The tool then writes a `messages_out` row with
 `kind: 'chat'` and content `{ text }` (`{ text, threadKey }` when a `thread_key` was given),
 and returns the new `seq` as the message id.
 

@@ -201,6 +201,17 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     expect(await keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-live' }]);
   });
 
+  it('a chat session bound to one thread posts into another thread of its own channel', async () => {
+    await threadSession('mg-1', 'telegram:123:thr-other');
+    const { session } = await resolveSession('ag-1', 'mg-1', 'telegram:123:thr-here', 'per-thread');
+    insertChat(session.id, 'out-1', { text: 'context', threadKey: 'topic-a', continueThread: 'thr-other' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:thr-other' }]);
+  });
+
   it('adopts a thread known only from the archive (the agent never engaged there)', async () => {
     archiveMessage({
       id: 'arch-1',
