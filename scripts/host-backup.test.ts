@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
@@ -14,7 +16,9 @@ import {
   readManifest,
   restore,
   runBackup,
+  s3RestoreSource,
   scanSources,
+  signS3Get,
   snapshotSqlite,
   type BackupConfig,
   type ObjectVersion,
@@ -637,5 +641,127 @@ describe('restore', () => {
     bucket.versions.get(keyOf(a))![0].body = Buffer.from('tampered');
     const result = await restore(bucket, { dest: path.join(tmp, 'restore'), log: () => {} });
     expect(result.failures[0]).toMatch(/no retained version/);
+  });
+  it('does not bring back a path the chosen night no longer had', async () => {
+    const bucket = new FakeBucket();
+    const gone = write('gone.txt', 'was here');
+    write('kept.txt', 'k');
+    await runBackup(config, { uploader: bucket, ...quiet, now: () => new Date('2026-01-01T00:00:00Z') });
+    const first = (await bucket.listManifests())[0];
+    fs.rmSync(gone);
+    await runBackup(config, { uploader: bucket, ...quiet, now: () => new Date('2026-01-02T00:00:00Z') });
+
+    const latest = path.join(tmp, 'restore-latest');
+    expect((await restore(bucket, { dest: latest, log: () => {} })).failures).toEqual([]);
+    expect(fs.existsSync(path.join(latest, gone))).toBe(false);
+    const older = path.join(tmp, 'restore-older');
+    await restore(bucket, { dest: older, asOf: new Date(first.lastModified), log: () => {} });
+    expect(fs.readFileSync(path.join(older, gone), 'utf8')).toBe('was here');
+  });
+
+  it('fetches files concurrently and records a failed fetch instead of aborting', async () => {
+    const bucket = new FakeBucket();
+    for (let i = 0; i < 12; i++) write(`f${i}.txt`, `body ${i}`);
+    await runBackup(config, { uploader: bucket, ...quiet });
+    let inFlight = 0;
+    let peak = 0;
+    const fetch = bucket.getObject.bind(bucket);
+    bucket.getObject = async (key, versionId, dest) => {
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      if (key.endsWith('f3.txt')) throw new Error('connection reset');
+      return fetch(key, versionId, dest);
+    };
+    const dest = path.join(tmp, 'restore');
+    const result = await restore(bucket, { dest, concurrency: 4, log: () => {} });
+    expect(peak).toBe(4);
+    expect(result.restored).toBe(11);
+    expect(result.failures).toEqual([expect.stringMatching(/could not fetch .*f3\.txt: connection reset/)]);
+    expect(fs.existsSync(path.join(dest, src, 'f3.txt'))).toBe(false);
+  });
+});
+
+describe('signS3Get', () => {
+  const creds = { AccessKeyId: 'AKIAIOSFODNN7EXAMPLE', SecretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' };
+  const at = new Date('2013-05-24T00:00:00Z');
+  const signature = (query: Record<string, string>) =>
+    /Signature=(\w+)/.exec(
+      signS3Get('examplebucket.s3.amazonaws.com', 'us-east-1', '', query, creds, at).headers.authorization,
+    )![1];
+
+  it('matches the AWS Signature Version 4 examples for S3', () => {
+    expect(signature({ lifecycle: '' })).toBe('fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543');
+    expect(signature({ 'max-keys': '2', prefix: 'J' })).toBe(
+      '34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7',
+    );
+  });
+});
+
+describe('s3RestoreSource', () => {
+  let server: http.Server;
+  let seen: string[];
+  let failNext: number;
+  const creds = () => ({ AccessKeyId: 'AK', SecretAccessKey: 'SK' });
+
+  beforeEach(async () => {
+    seen = [];
+    failNext = 0;
+    server = http.createServer((req, res) => {
+      const url = new URL(req.url!, 'http://x');
+      seen.push(`${url.pathname}${url.search}`);
+      if (!req.headers.authorization?.startsWith('AWS4-HMAC-SHA256 Credential=AK/')) {
+        res.writeHead(403).end('<Error><Code>AccessDenied</Code></Error>');
+      } else if (failNext > 0) {
+        failNext--;
+        res.writeHead(503).end('<Error><Code>SlowDown</Code></Error>');
+      } else if (url.searchParams.has('versions') && !url.searchParams.get('key-marker')) {
+        res.end(
+          '<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>files/a+b%2Bc</NextKeyMarker>' +
+            '<NextVersionIdMarker>v1</NextVersionIdMarker><Version><Key>files/a+b%2Bc</Key><VersionId>v1</VersionId>' +
+            '<LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;e&quot;</ETag></Version></ListVersionsResult>',
+        );
+      } else if (url.searchParams.has('versions')) {
+        res.end(
+          '<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>files/x%26y</Key>' +
+            '<VersionId>v2</VersionId><LastModified>2026-01-02T00:00:00.000Z</LastModified></Version></ListVersionsResult>',
+        );
+      } else if (url.pathname === '/files/a%20b%2Bc' && url.searchParams.get('versionId') === 'v1') {
+        res.end('content');
+      } else {
+        res.writeHead(404).end('<Error><Code>NoSuchKey</Code></Error>');
+      }
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  });
+
+  afterEach(() => new Promise<void>((r) => server.close(() => r())));
+
+  const source = () =>
+    s3RestoreSource({
+      bucket: 'b',
+      region: 'r',
+      endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      credentials: creds,
+      attempts: 3,
+    });
+
+  it('pages through a version listing and decodes URL-encoded keys', async () => {
+    expect(await source().listVersions('files/')).toEqual([
+      { Key: 'files/a b+c', VersionId: 'v1', LastModified: '2026-01-01T00:00:00.000Z' },
+      { Key: 'files/x&y', VersionId: 'v2', LastModified: '2026-01-02T00:00:00.000Z' },
+    ]);
+    expect(seen[1]).toContain('key-marker=files%2Fa%20b%2Bc');
+    expect(seen[1]).toContain('version-id-marker=v1');
+  });
+
+  it('fetches a version, retrying a throttled request but not a missing key', async () => {
+    const dest = path.join(tmp, 'out', 'f');
+    failNext = 2;
+    await source().getObject('files/a b+c', 'v1', dest);
+    expect(fs.readFileSync(dest, 'utf8')).toBe('content');
+    expect(seen).toHaveLength(3);
+    await expect(source().getObject('files/missing', 'v9', dest)).rejects.toThrow(/404 NoSuchKey/);
+    expect(seen).toHaveLength(4);
   });
 });

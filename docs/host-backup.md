@@ -135,10 +135,17 @@ database sits in a directory its owner can write. Directories are finished last,
 matching version is reported and the command exits 1. Check a restored SQLite file with
 `PRAGMA integrity_check`, then stop the host before copying it into place.
 
+Restore takes credentials from `aws configure export-credentials` (the same resolution as the
+CLI: `AWS_PROFILE`, or the break-glass session's environment) and talks to S3 directly: it pages
+through the version listing once, then fetches files by version id, 128 at a time
+(`--concurrency <n>`), retrying throttling and server errors. Leaving out `--prefix` restores the
+whole host. For about 1.8M files and 80 GiB that is roughly 1 to 1.5 hours and 4 GB of memory,
+extrapolated from a measured subtree restore of 0.5M files at about 1,000 files a second plus a
+10-minute listing of the whole bucket. Progress is logged every minute.
+
 Without the repo, `aws s3api list-objects-v2 --prefix manifests/` lists the manifests, and
 `aws s3api list-object-versions --prefix files/<path>` plus `get-object --version-id` fetch a
-file. `zcat` the manifest to find a path's sha256; `sha256sum` confirms the version. Restore by
-subtree (`--prefix`): the version listing for a prefix is read in one call.
+file. `zcat` the manifest to find a path's sha256; `sha256sum` confirms the version.
 
 A restore on a fresh machine also needs whatever the sources could not capture: repo clones
 from their remotes, Docker images (rebuild), and the systemd units and logrotate entries,

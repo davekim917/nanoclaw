@@ -2,9 +2,12 @@
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 
@@ -19,6 +22,7 @@ const MAX_KEY_PATH_BYTES = 1000;
 const DEFAULT_BATCH_BYTES = 8 * 1024 ** 3;
 const SQLITE_CHUNK_FILES = 200;
 const BATCH_FILES = 50_000;
+const RESTORE_CONCURRENCY = 128;
 const MANIFEST_KEY = /^manifests\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\.jsonl\.gz$/;
 
 export interface BackupConfig {
@@ -1033,62 +1037,174 @@ export interface RestoreSource {
   listVersions(prefix: string): Promise<ObjectVersion[]>;
 }
 
-function awsRestoreSource(bucket: string): RestoreSource {
-  const aws = (args: string[]): string => {
-    const res = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 1024 ** 3 });
-    if (res.status !== 0) throw new Error(`aws ${args.slice(0, 2).join(' ')} failed: ${res.stderr.trim()}`);
-    return res.stdout;
+export interface S3Credentials {
+  AccessKeyId: string;
+  SecretAccessKey: string;
+  SessionToken?: string;
+  Expiration?: string;
+}
+
+const EMPTY_SHA256 = crypto.createHash('sha256').digest('hex');
+
+function uriEncode(s: string): string {
+  return encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+export function signS3Get(
+  host: string,
+  region: string,
+  key: string,
+  query: Record<string, string>,
+  creds: S3Credentials,
+  now: Date,
+): { path: string; headers: Record<string, string> } {
+  const hmac = (k: crypto.BinaryLike, data: string) => crypto.createHmac('sha256', k).update(data).digest();
+  const stamp = now.toISOString().replace(/[-:]|\.\d{3}/g, '');
+  const scope = `${stamp.slice(0, 8)}/${region}/s3/aws4_request`;
+  const resource = `/${key.split('/').map(uriEncode).join('/')}`;
+  const qs = Object.keys(query)
+    .sort()
+    .map((k) => `${uriEncode(k)}=${uriEncode(query[k])}`)
+    .join('&');
+  const headers: Record<string, string> = { host, 'x-amz-content-sha256': EMPTY_SHA256, 'x-amz-date': stamp };
+  if (creds.SessionToken) headers['x-amz-security-token'] = creds.SessionToken;
+  const names = Object.keys(headers).sort();
+  const canonical = [
+    'GET',
+    resource,
+    qs,
+    names.map((n) => `${n}:${headers[n]}\n`).join(''),
+    names.join(';'),
+    EMPTY_SHA256,
+  ].join('\n');
+  const toSign = ['AWS4-HMAC-SHA256', stamp, scope, crypto.createHash('sha256').update(canonical).digest('hex')];
+  let signingKey = hmac(`AWS4${creds.SecretAccessKey}`, stamp.slice(0, 8));
+  for (const part of [region, 's3', 'aws4_request']) signingKey = hmac(signingKey, part);
+  const signature = hmac(signingKey, toSign.join('\n')).toString('hex');
+  headers.authorization = `AWS4-HMAC-SHA256 Credential=${creds.AccessKeyId}/${scope}, SignedHeaders=${names.join(';')}, Signature=${signature}`;
+  return { path: qs ? `${resource}?${qs}` : resource, headers };
+}
+
+function cliCredentials(): S3Credentials {
+  const res = spawnSync('aws', ['configure', 'export-credentials', '--format', 'process'], { encoding: 'utf8' });
+  if (res.status !== 0) throw new Error(`aws configure export-credentials failed: ${res.stderr.trim()}`);
+  return JSON.parse(res.stdout) as S3Credentials;
+}
+
+export function s3RestoreSource(opts: {
+  bucket: string;
+  region: string;
+  endpoint?: string;
+  credentials?: () => S3Credentials;
+  attempts?: number;
+}): RestoreSource {
+  const base = new URL(opts.endpoint ?? `https://${opts.bucket}.s3.${opts.region}.amazonaws.com`);
+  const transport = base.protocol === 'http:' ? http : https;
+  const agent = new transport.Agent({ keepAlive: true, maxSockets: 256 });
+  const load = opts.credentials ?? cliCredentials;
+  let creds: S3Credentials | undefined;
+  const current = () => {
+    if (!creds || (creds.Expiration && Date.parse(creds.Expiration) - Date.now() < 5 * 60_000)) creds = load();
+    return creds;
   };
-  const rows = (out: string) =>
-    out
-      .split('\n')
-      .filter((l) => l && l !== 'None')
-      .map((l) => l.split('\t'));
+  const once = (key: string, query: Record<string, string>) =>
+    new Promise<http.IncomingMessage>((resolve, reject) => {
+      const signed = signS3Get(base.host, opts.region, key, query, current(), new Date());
+      transport
+        .get(
+          {
+            protocol: base.protocol,
+            hostname: base.hostname,
+            port: base.port,
+            path: signed.path,
+            headers: signed.headers,
+            agent,
+          },
+          resolve,
+        )
+        .on('error', reject);
+    });
+  const request = async <T>(
+    key: string,
+    query: Record<string, string>,
+    use: (res: http.IncomingMessage) => Promise<T>,
+  ) => {
+    const attempts = opts.attempts ?? 5;
+    for (let attempt = 1; ; attempt++) {
+      let retryable = true;
+      try {
+        const res = await once(key, query);
+        if (res.statusCode === 200) return await use(res);
+        const body = await text(res);
+        retryable = res.statusCode === 429 || (res.statusCode ?? 0) >= 500;
+        const code = /<Code>(.*?)<\/Code>/.exec(body)?.[1] ?? '';
+        throw new Error(`GET ${key || '/'} returned ${res.statusCode} ${code}`.trim());
+      } catch (err) {
+        if (!retryable || attempt >= attempts) throw err;
+        await new Promise((r) => setTimeout(r, 2 ** attempt * 100 * (1 + Math.random())));
+      }
+    }
+  };
+  const field = (body: string, name: string) => {
+    const value = new RegExp(`<${name}>([^<]*)</${name}>`).exec(body)?.[1] ?? '';
+    return xmlText(Buffer.from(value).toString());
+  };
+  const list = async <T>(
+    query: Record<string, string>,
+    row: string,
+    next: (body: string) => Record<string, string>,
+    take: (fields: (name: string) => string) => T,
+  ) => {
+    const rows: T[] = [];
+    for (let q: Record<string, string> | null = query; q; ) {
+      const body: string = await request('', q, text);
+      for (const m of body.matchAll(new RegExp(`<${row}>(.*?)</${row}>`, 'gs')))
+        rows.push(take((name) => field(m[1], name)));
+      q = /<IsTruncated>true<\/IsTruncated>/.test(body) ? next(body) : null;
+    }
+    return rows;
+  };
+  const listKey = (k: string) => decodeURIComponent(k.replace(/\+/g, '%20'));
   return {
-    listManifests: async () =>
-      rows(
-        aws([
-          's3api',
-          'list-objects-v2',
-          '--bucket',
-          bucket,
-          '--prefix',
-          'manifests/',
-          '--query',
-          'Contents[].[Key,LastModified]',
-          '--output',
-          'text',
-        ]),
-      ).map(([key, lastModified]) => ({ key, lastModified })),
-    listVersions: async (prefix) =>
-      rows(
-        aws([
-          's3api',
-          'list-object-versions',
-          '--bucket',
-          bucket,
-          '--prefix',
-          prefix,
-          '--query',
-          'Versions[].[Key,VersionId,LastModified]',
-          '--output',
-          'text',
-        ]),
-      ).map(([Key, VersionId, LastModified]) => ({ Key, VersionId, LastModified })),
-    getObject: async (key, versionId, dest) => {
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      aws([
-        's3api',
-        'get-object',
-        '--bucket',
-        bucket,
-        '--key',
-        key,
-        ...(versionId ? ['--version-id', versionId] : []),
-        dest,
-      ]);
+    listManifests: async () => {
+      const query = { 'list-type': '2', prefix: 'manifests/', 'encoding-type': 'url' };
+      return list(
+        query,
+        'Contents',
+        (body) => ({ ...query, 'continuation-token': field(body, 'NextContinuationToken') }),
+        (f) => ({ key: listKey(f('Key')), lastModified: f('LastModified') }),
+      );
     },
+    listVersions: async (prefix) => {
+      const query = { versions: '', prefix, 'encoding-type': 'url' };
+      return list(
+        query,
+        'Version',
+        (body) => ({
+          ...query,
+          'key-marker': listKey(field(body, 'NextKeyMarker')),
+          'version-id-marker': field(body, 'NextVersionIdMarker'),
+        }),
+        (f) => ({ Key: listKey(f('Key')), VersionId: f('VersionId'), LastModified: f('LastModified') }),
+      );
+    },
+    getObject: (key, versionId, dest) =>
+      request(key, versionId ? { versionId } : {}, async (res) => {
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        await pipeline(res, fs.createWriteStream(dest));
+      }),
   };
+}
+
+async function text(res: http.IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of res) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function xmlText(s: string): string {
+  const entities: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+  return s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e: string) => entities[e]);
 }
 
 interface RestoreResult {
@@ -1099,7 +1215,7 @@ interface RestoreResult {
 
 export async function restore(
   source: RestoreSource,
-  opts: { dest: string; asOf?: Date; prefix?: string; log?: (line: string) => void },
+  opts: { dest: string; asOf?: Date; prefix?: string; concurrency?: number; log?: (line: string) => void },
 ): Promise<RestoreResult> {
   const log = opts.log ?? ((line: string) => console.log(line));
   const asOf = opts.asOf ?? new Date();
@@ -1139,27 +1255,39 @@ export async function restore(
     const outPath = (p: string) => path.join(opts.dest, p);
     for (const d of manifest.dirs) fs.mkdirSync(outPath(d.path), { recursive: true });
 
-    for (const e of manifest.entries.filter((w) => w.kind !== 'symlink')) {
+    const files = manifest.entries.filter((w) => w.kind !== 'symlink');
+    const restoreFile = async (e: ManifestEntry) => {
       const out = outPath(e.path);
       const key = `files/${e.path.replace(/^\/+/, '')}`;
       const candidates = (versions.get(key) ?? []).sort((a, b) => b.LastModified.localeCompare(a.LastModified));
-      let ok = false;
-      for (const v of candidates) {
-        await source.getObject(key, v.VersionId, out);
-        if ((await sha256File(out)) === e.sha256) {
-          ok = true;
-          break;
+      try {
+        for (const v of candidates) {
+          await source.getObject(key, v.VersionId, out);
+          if ((await sha256File(out)) !== e.sha256) continue;
+          applyMetadata(out, e);
+          fs.utimesSync(out, new Date(e.mtimeMs), new Date(e.mtimeMs));
+          restored++;
+          return;
         }
-      }
-      if (!ok) {
-        fs.rmSync(out, { force: true });
         failures.push(`no retained version of ${e.path} matches sha256 ${e.sha256}`);
-        continue;
+      } catch (err) {
+        failures.push(`could not fetch ${e.path}: ${message(err)}`);
       }
-      applyMetadata(out, e);
-      fs.utimesSync(out, new Date(e.mtimeMs), new Date(e.mtimeMs));
-      restored++;
-    }
+      fs.rmSync(out, { force: true });
+    };
+    let next = 0;
+    let lastReport = Date.now();
+    await Promise.all(
+      Array.from({ length: Math.min(opts.concurrency ?? RESTORE_CONCURRENCY, files.length) }, async () => {
+        while (next < files.length) {
+          await restoreFile(files[next++]);
+          if (Date.now() - lastReport >= 60_000) {
+            lastReport = Date.now();
+            log(`host-restore: ${next}/${files.length} files, ${failures.length} failures`);
+          }
+        }
+      }),
+    );
 
     for (const e of manifest.entries.filter((w) => w.kind === 'symlink')) {
       const out = outPath(e.path);
@@ -1237,9 +1365,14 @@ async function main(argv: string[]): Promise<number> {
     const dest = flag(args, '--dest');
     if (!dest) throw new Error('restore needs --dest <dir>');
     const asOf = flag(args, '--as-of');
-    const result = await restore(awsRestoreSource(config.bucket), {
+    const concurrency = flag(args, '--concurrency');
+    if (concurrency !== undefined && !/^[1-9]\d*$/.test(concurrency)) {
+      throw new Error('--concurrency takes a positive whole number');
+    }
+    const result = await restore(s3RestoreSource({ bucket: config.bucket, region: config.region }), {
       dest,
       prefix: flag(args, '--prefix'),
+      concurrency: concurrency ? Number(concurrency) : undefined,
       asOf: asOf ? new Date(asOf) : undefined,
     });
     console.log(`host-restore: restored ${result.restored} paths from ${result.manifest} into ${dest}`);
@@ -1247,7 +1380,7 @@ async function main(argv: string[]): Promise<number> {
     return result.failures.length ? 1 : 0;
   }
   console.error(
-    'usage: host-backup.ts run [--dry-run] | restore --dest <dir> [--as-of <iso>] [--prefix <path>] [--config <file>]',
+    'usage: host-backup.ts run [--dry-run] | restore --dest <dir> [--as-of <iso>] [--prefix <path>] [--concurrency <n>] [--config <file>]',
   );
   return 2;
 }
