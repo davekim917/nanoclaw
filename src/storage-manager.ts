@@ -237,6 +237,11 @@ const IMAGE_ROLE_LABEL = 'nanoclaw.image.role';
 // Not `nanoclaw-install`: containers inherit image labels, and that key marks a container as this install's spawn.
 const IMAGE_INSTALL_LABEL = 'nanoclaw.image.install';
 
+function referencesImageId(reference: string, imageId: string): boolean {
+  const hex = reference.startsWith('sha256:') ? reference.slice('sha256:'.length) : reference;
+  return /^[0-9a-f]+$/.test(hex) && imageId.startsWith(`sha256:${hex}`);
+}
+
 export function classifyDockerImage(
   image: DockerImageInventory,
   context: DockerImageProtectionContext,
@@ -245,7 +250,8 @@ export function classifyDockerImage(
   const isCanonical = imageReferences.includes(context.canonicalImage) || image.id === context.canonicalImage;
   const isConfigured =
     imageReferences.some((reference) => context.configuredImages.has(reference)) ||
-    context.configuredImages.has(image.id);
+    context.configuredImages.has(image.id) ||
+    [...context.configuredImages].some((reference) => referencesImageId(reference, image.id));
   const isContainerReferenced = context.containerImageIds.has(image.id);
   const isNanoClawTag = image.repoTags.some(
     (tag) => tag === CONTAINER_IMAGE_BASE || tag.startsWith(`${CONTAINER_IMAGE_BASE}:`),
@@ -2532,13 +2538,23 @@ function readDockerInventory(): DockerInventory {
   return { containers: inspectDockerContainers(), images: inspectDockerImages() };
 }
 
+function readUnlessAbsent<T>(read: () => T, absent: T): T {
+  try {
+    return read();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return absent;
+    throw err;
+  }
+}
+
 function containerJsonImageTags(groupsRoot: string): string[] {
-  if (!fs.existsSync(groupsRoot)) return [];
-  return fs
-    .readdirSync(groupsRoot)
-    .map((folder) => path.join(groupsRoot, folder, 'container.json'))
-    .filter((file) => fs.existsSync(file))
-    .map((file) => (JSON.parse(fs.readFileSync(file, 'utf8')) as { imageTag?: unknown }).imageTag)
+  return readUnlessAbsent(() => fs.readdirSync(groupsRoot), [])
+    .map((folder) =>
+      readUnlessAbsent(() => fs.readFileSync(path.join(groupsRoot, folder, 'container.json'), 'utf8'), null),
+    )
+    .filter((text): text is string => text !== null)
+    .map((text) => (JSON.parse(text) as { imageTag?: unknown }).imageTag)
     .filter((tag): tag is string => typeof tag === 'string');
 }
 
@@ -2766,7 +2782,7 @@ function collectDockerActions(
       );
     });
   for (const image of removable) {
-    const dockerArgs = ['image', 'rm', image.id];
+    const dockerArgs = ['image', 'rm', '--no-prune', image.id];
     actions.push(
       createDockerAction({
         id: `docker:image:${image.id}`,
