@@ -1159,18 +1159,31 @@ export function s3RestoreSource(opts: {
   ) => {
     const rows: T[] = [];
     for (let q: Record<string, string> | null = query; q; ) {
-      const body: string = await request('', q, async (res) => {
-        const page = await text(res);
-        if (!page.trimEnd().endsWith(`</${root}>`) || !/<IsTruncated>(true|false)<\/IsTruncated>/.test(page)) {
-          throw new Error(`incomplete ${root} page`);
+      const page: { parsed: T[]; markers: Record<string, string> | null } = await request('', q, async (res) => {
+        const body = await text(res);
+        const truncated = /<IsTruncated>(true|false)<\/IsTruncated>/.exec(body)?.[1];
+        const matches = [...body.matchAll(new RegExp(`<${row}>(.*?)</${row}>`, 'gs'))];
+        if (
+          !body.trimEnd().endsWith(`</${root}>`) ||
+          !truncated ||
+          body.split(`<${row}>`).length - 1 !== matches.length
+        ) {
+          throw new Error(`malformed ${root} page`);
         }
-        return page;
+        const parsed = matches.map((m) =>
+          take((name) => {
+            const value = field(m[1], name);
+            if (!value) throw new Error(`malformed ${root} page: a ${row} has no ${name}`);
+            return value;
+          }),
+        );
+        const markers = truncated === 'true' ? next(body) : null;
+        if (markers && Object.values(markers).some((v) => !v))
+          throw new Error(`malformed ${root} page: no next marker`);
+        return { parsed, markers };
       });
-      for (const m of body.matchAll(new RegExp(`<${row}>(.*?)</${row}>`, 'gs')))
-        rows.push(take((name) => field(m[1], name)));
-      const markers = /<IsTruncated>true<\/IsTruncated>/.test(body) ? next(body) : null;
-      if (markers && Object.values(markers).some((v) => !v)) throw new Error(`${root} page has no next marker`);
-      q = markers && { ...query, ...markers };
+      rows.push(...page.parsed);
+      q = page.markers && { ...query, ...page.markers };
     }
     return rows;
   };
@@ -1287,18 +1300,19 @@ export async function restore(
       fs.rmSync(out, { force: true });
     };
     let next = 0;
-    let lastReport = Date.now();
-    await Promise.all(
-      Array.from({ length: Math.min(opts.concurrency ?? RESTORE_CONCURRENCY, files.length) }, async () => {
-        while (next < files.length) {
-          await restoreFile(files[next++]);
-          if (Date.now() - lastReport >= 60_000) {
-            lastReport = Date.now();
-            log(`host-restore: ${next}/${files.length} files, ${failures.length} failures`);
-          }
-        }
-      }),
+    const progress = setInterval(
+      () => log(`host-restore: ${next}/${files.length} files started, ${failures.length} failures`),
+      60_000,
     );
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(opts.concurrency ?? RESTORE_CONCURRENCY, files.length) }, async () => {
+          while (next < files.length) await restoreFile(files[next++]);
+        }),
+      );
+    } finally {
+      clearInterval(progress);
+    }
 
     for (const e of manifest.entries.filter((w) => w.kind === 'symlink')) {
       const out = outPath(e.path);

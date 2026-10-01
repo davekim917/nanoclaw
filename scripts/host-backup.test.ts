@@ -702,7 +702,7 @@ describe('s3RestoreSource', () => {
   let server: http.Server;
   let seen: string[];
   let failNext: number;
-  let brokenNext: boolean;
+  let brokenNext: false | 'truncated' | 'unclosedRow' | 'missingField';
   let stallNext: boolean;
   const creds = () => ({ AccessKeyId: 'AK', SecretAccessKey: 'SK' });
 
@@ -724,7 +724,12 @@ describe('s3RestoreSource', () => {
           '<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>manifests/old</Key>' +
           '<LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents><Contents><Key>manifests/new</Key>' +
           '<LastModified>2026-01-02T00:00:00.000Z</LastModified></Contents></ListBucketResult>';
-        res.end(brokenNext ? page.slice(0, page.indexOf('<Contents><Key>manifests/new') + 20) : page);
+        const broken = {
+          truncated: page.slice(0, page.indexOf('<Contents><Key>manifests/new') + 20),
+          unclosedRow: page.replace('</Contents></ListBucketResult>', '</ListBucketResult>'),
+          missingField: page.replace('<LastModified>2026-01-02T00:00:00.000Z</LastModified>', ''),
+        };
+        res.end(brokenNext ? broken[brokenNext] : page);
         brokenNext = false;
       } else if (stallNext) {
         stallNext = false;
@@ -779,10 +784,13 @@ describe('s3RestoreSource', () => {
     expect(seen).toHaveLength(4);
   });
 
-  it('retries a listing page that arrived incomplete rather than trusting the rows it has', async () => {
-    brokenNext = true;
-    expect((await source().listManifests()).map((m) => m.key)).toEqual(['manifests/old', 'manifests/new']);
-    expect(seen).toHaveLength(2);
+  it('retries a malformed listing page rather than trusting the rows it has', async () => {
+    for (const kind of ['truncated', 'unclosedRow', 'missingField'] as const) {
+      seen = [];
+      brokenNext = kind;
+      expect((await source().listManifests()).map((m) => m.key)).toEqual(['manifests/old', 'manifests/new']);
+      expect(seen).toHaveLength(2);
+    }
   });
 
   it('abandons and retries a response that stalls mid-body', async () => {
