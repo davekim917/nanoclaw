@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { closeDb, createAgentGroup, createSession, runMigrations } from '../db/index.js';
+import { initDb } from '../db/connection.js';
+
 import { createDiscordAdapter, DiscordFormatConverter } from '@chat-adapter/discord';
 
 import {
   installForwardUnwrap,
+  installThreadParentResolve,
   isUserMessage,
   parseDiscordWorkspaces,
   resolveDiscordMentions,
@@ -1047,5 +1056,125 @@ describe('installForwardUnwrap', () => {
       attachments: [],
     });
     expect(seen).toEqual(['plain']);
+  });
+});
+
+describe('installThreadParentResolve', () => {
+  type Forwarded = Record<string, unknown>;
+  const threadMessage = (): Forwarded => ({ id: '9', guild_id: '111', channel_id: '333', channel_type: 11 });
+
+  function install(opts: { known?: string | null; rest?: () => Promise<unknown> }) {
+    const seen: Forwarded[] = [];
+    const adapter = {
+      handleForwardedMessage: async (data: Forwarded) => {
+        seen.push(data);
+      },
+    };
+    const get = vi.fn(opts.rest ?? (async () => ({ parent_id: '222' })));
+    const known = vi.fn(async () => opts.known ?? null);
+    installThreadParentResolve(adapter as never, { get }, known);
+    const send = (data: Forwarded) =>
+      (adapter as unknown as { handleForwardedMessage: (d: Forwarded) => Promise<void> }).handleForwardedMessage(data);
+    return { seen, get, known, send };
+  }
+
+  it('hands the adapter the parent of a thread the host already knows, without a fetch', async () => {
+    const { seen, get, send } = install({ known: '222' });
+
+    await send(threadMessage());
+
+    expect(seen[0].thread).toEqual({ id: '333', parent_id: '222' });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('fetches the parent of an unknown thread once, then remembers it', async () => {
+    const { seen, get, known, send } = install({});
+
+    await send(threadMessage());
+    await send(threadMessage());
+
+    expect(seen.map((d) => d.thread)).toEqual([
+      { id: '333', parent_id: '222' },
+      { id: '333', parent_id: '222' },
+    ]);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledWith('/channels/333');
+    expect(known).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a thread message whose parent cannot be resolved, so it never reaches the adapter as a channel', async () => {
+    const { seen, send } = install({
+      rest: async () => {
+        throw new TypeError('fetch failed');
+      },
+    });
+
+    await send(threadMessage());
+
+    expect(seen).toEqual([]);
+  });
+
+  it('routes a thread the host holds a session in to its parent while Discord is unreachable', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-thread-parent-'));
+    const dbPath = path.join(dir, 'central.db');
+    const migrated = new Database(dbPath);
+    runMigrations(migrated);
+    migrated.close();
+    await initDb(dbPath, { role: 'test' });
+    try {
+      const createdAt = new Date().toISOString();
+      await createAgentGroup({
+        id: 'ag-1',
+        name: 'Agent',
+        folder: 'agent',
+        agent_provider: null,
+        created_at: createdAt,
+      });
+      await createSession({
+        id: 'sess-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: null,
+        thread_id: 'discord:111:222:333',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: null,
+        created_at: createdAt,
+      });
+      const seen: Forwarded[] = [];
+      const adapter = {
+        handleForwardedMessage: async (data: Forwarded) => {
+          seen.push(data);
+        },
+      };
+      installThreadParentResolve(adapter as never, {
+        get: async () => {
+          throw new TypeError('fetch failed');
+        },
+      });
+
+      await (adapter as unknown as { handleForwardedMessage: (d: Forwarded) => Promise<void> }).handleForwardedMessage(
+        threadMessage(),
+      );
+
+      expect(seen.map((d) => d.thread)).toEqual([{ id: '333', parent_id: '222' }]);
+    } finally {
+      await closeDb();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves a channel message and a message that already carries its thread alone', async () => {
+    const { seen, get, known, send } = install({ known: '222' });
+    const inChannel = { id: '1', guild_id: '111', channel_id: '222', channel_type: 0 };
+    const withThread = { ...threadMessage(), thread: { id: '333', parent_id: '777' } };
+
+    await send(inChannel);
+    await send(withThread);
+
+    expect(seen).toEqual([inChannel, withThread]);
+    expect(seen[0]).not.toHaveProperty('thread');
+    expect(known).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
   });
 });
