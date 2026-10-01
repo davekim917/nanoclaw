@@ -75,6 +75,12 @@ import {
   type InstallContainerScope,
 } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
+import {
+  codexStartHome,
+  resolveCodexAuthDir,
+  resolveCodexAuthFallbacks,
+  type CodexAuthFallback,
+} from './codex-accounts.js';
 import { requestContainerRebuild } from './container-rebuild-watcher.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import {
@@ -2895,46 +2901,7 @@ export function assertWikiEgressAllowed(egressLockdown: boolean): void {
   if (egressLockdown) throw new Error('Wiki maintenance requires direct model egress');
 }
 
-/** `~/.codex-<folder>/` with a real `auth.json` (a separate account via `CODEX_HOME=… codex login`) wins over `~/.codex/`. */
-export function resolveCodexAuthDir(folder: string, homedir: string = os.homedir()): string {
-  const scoped = path.join(homedir, `.codex-${folder}`);
-  if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
-  return path.join(homedir, '.codex');
-}
-
-/** Index 0 maps to `.codex-fallback-1`, index 1 to `.codex-fallback-2`, etc. */
-export interface CodexAuthFallback {
-  hostPath: string;
-  containerPath: string;
-}
-
 const CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH = '/home/node/.codex-host-primary';
-
-/**
- * Entries without an `auth.json`, equal to the primary, or already seen are silently skipped. Both the mount block
- * and the env-forward block call this so they stay in sync.
- */
-export function resolveCodexAuthFallbacks(
-  declarations: string[] | undefined,
-  primaryHostPath: string,
-  homedir: string = os.homedir(),
-): CodexAuthFallback[] {
-  if (!Array.isArray(declarations) || declarations.length === 0) return [];
-  const out: CodexAuthFallback[] = [];
-  const seen = new Set<string>([primaryHostPath]);
-  for (const decl of declarations) {
-    if (typeof decl !== 'string' || !decl.trim()) continue;
-    const expanded = decl.startsWith('~/') ? path.join(homedir, decl.slice(2)) : decl;
-    if (seen.has(expanded)) continue;
-    if (!fs.existsSync(path.join(expanded, 'auth.json'))) {
-      log.warn('codexAuthFallbacks: entry skipped (no auth.json)', { hostPath: expanded });
-      continue;
-    }
-    seen.add(expanded);
-    out.push({ hostPath: expanded, containerPath: `/home/node/.codex-fallback-${out.length + 1}` });
-  }
-  return out;
-}
 
 /**
  * A credential-staging failure caused by HOST STATE: a syscall error (bare `E…` code; Node's own `ERR_…`
@@ -4929,6 +4896,9 @@ async function buildContainerArgs(
   if (codexFallbackPaths.length > 0) {
     args.push('-e', `CODEX_FALLBACK_HOMES=${codexFallbackPaths.join(':')}`);
   }
+
+  const codexStart = codexStartHome(provider, agentGroup.folder, containerConfig.codexAuthFallbacks);
+  if (codexStart) args.push('-e', `CODEX_START_HOME=${codexStart}`);
 
   if (mounts.some((m) => m.containerPath === CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH)) {
     args.push('-e', `CODEX_PRIMARY_HOST_HOME=${CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH}`);

@@ -26,6 +26,8 @@ import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } fro
 import type { Session } from '../../types.js';
 import { SYSTEM_ERROR_PARK_MAX_MS, handleProviderUnavailable, measuredResetAt } from './handler.js';
 import { handleProviderRetryPrimary } from './retry-primary.js';
+import { handleCodexAccountExhausted } from './codex-account.js';
+import { isCodexAccountExhausted } from '../../codex-accounts.js';
 
 const GID = 'ag-pf';
 const FOLDER = 'pf-group';
@@ -266,5 +268,47 @@ describe('provider_retry_primary handler', () => {
     // window is the operator's own visible signal — not ours to clear.
     expect(await isProviderUnavailable(GID, 'claude')).toBe(true);
     expect(killed).toHaveLength(0);
+  });
+});
+
+describe('codex_account_exhausted handler', () => {
+  const HOME = `${TEST_DIR}/home`;
+  const originalHome = process.env.HOME;
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    for (const dir of ['.codex', '.codex-secondary']) {
+      fs.mkdirSync(`${HOME}/${dir}`, { recursive: true });
+      fs.writeFileSync(`${HOME}/${dir}/auth.json`, '{}');
+    }
+    process.env.HOME = HOME;
+    await initTestDb();
+    runMigrations(getRawDb());
+    await createAgentGroup({
+      id: GID,
+      name: FOLDER,
+      folder: FOLDER,
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    writeConfig({ provider: 'codex', codexAuthFallbacks: ['~/.codex-secondary'] });
+  });
+  afterEach(async () => {
+    process.env.HOME = originalHome;
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('marks the host account behind the reported container home', async () => {
+    await handleCodexAccountExhausted({ home: '/home/node/.codex-fallback-1' }, session);
+    expect(isCodexAccountExhausted(`${HOME}/.codex-secondary`)).toBe(true);
+    expect(isCodexAccountExhausted(`${HOME}/.codex`)).toBe(false);
+  });
+
+  it('ignores a path that is not one of the group Codex homes', async () => {
+    await handleCodexAccountExhausted({ home: `${HOME}/.codex` }, session);
+    await handleCodexAccountExhausted({ home: '/home/node/.codex-fallback-2' }, session);
+    await handleCodexAccountExhausted({}, session);
+    expect(isCodexAccountExhausted(`${HOME}/.codex`)).toBe(false);
   });
 });

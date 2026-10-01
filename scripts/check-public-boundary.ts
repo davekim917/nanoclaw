@@ -215,6 +215,7 @@ const GENERIC_IDENTIFIERS = new Set([
   'unknown',
   'discord-codex',
   'discord-opencode',
+  'cli',
   'cli:local',
   'cli:test-driver',
   // Slack's built-in bot and its platform ID: identical in every workspace, not install-specific.

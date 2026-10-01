@@ -2973,6 +2973,13 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
     expect(body.text).toContain('Rate limit');
   });
 
+  it('a Codex account at its quota is reported to the host as a system action, not as chat', async () => {
+    await handleEvent({ type: 'codex_account_exhausted', home: '/home/node/.codex' }, routingFixture());
+    const out = getUndeliveredMessages();
+    expect(out.map((m) => m.kind)).toEqual(['system']);
+    expect(JSON.parse(out[0].content)).toEqual({ action: 'codex_account_exhausted', home: '/home/node/.codex' });
+  });
+
   it('a quota error carrying a measured resetAt still surfaces when no fallback is declared', async () => {
     // The Codex pre-turn park (providers/codex.ts parkedTurnEvents) arrives
     // here with `resetAt`; with nothing to route to, the outage stays loud.

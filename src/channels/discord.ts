@@ -6,8 +6,17 @@
  * stay bound to the primary token.
  */
 import { createDiscordAdapter } from '@chat-adapter/discord';
-import { Constants, MessageType, REST, RESTJSONErrorCodes, Routes, ThreadAutoArchiveDuration } from 'discord.js';
+import {
+  ChannelType,
+  Constants,
+  MessageType,
+  REST,
+  RESTJSONErrorCodes,
+  Routes,
+  ThreadAutoArchiveDuration,
+} from 'discord.js';
 
+import { getDb } from '../db/connection.js';
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { getOwners } from '../modules/permissions/db/user-roles.js';
@@ -203,6 +212,57 @@ export function installForwardUnwrap(adapter: ReturnType<typeof createDiscordAda
   const original = target.handleForwardedMessage.bind(adapter);
   target.handleForwardedMessage = async (data, options) => {
     unwrapForwardedSnapshot(data);
+    return original(data, options);
+  };
+}
+
+/** The parent channel of a thread the host already holds a session in, read from that session's thread id. */
+async function sessionThreadParent(guildId: string, threadId: string): Promise<string | null> {
+  if (!/^\d+$/.test(guildId) || !/^\d+$/.test(threadId)) return null;
+  const row = await getDb().get<{ thread_id: string }>(
+    'SELECT thread_id FROM sessions WHERE thread_id LIKE ? LIMIT 1',
+    `discord:${guildId}:%:${threadId}`,
+  );
+  return row?.thread_id.split(':')[2] ?? null;
+}
+
+/**
+ * The chat-adapter resolves a thread message's parent with one unretried fetch and, when that fails, delivers the
+ * message as if the thread were a top-level channel, which the router then registers as a new channel. Resolve the
+ * parent here first and hand it to the adapter as `data.thread`; a thread whose parent cannot be resolved is dropped.
+ */
+export function installThreadParentResolve(
+  adapter: ReturnType<typeof createDiscordAdapter>,
+  rest: Pick<DiscordThreadRestClient, 'get'>,
+  knownParent: (guildId: string, threadId: string) => Promise<string | null> = sessionThreadParent,
+): void {
+  const target = adapter as unknown as {
+    handleForwardedMessage: (data: Record<string, unknown>, options?: unknown) => Promise<void>;
+  };
+  const original = target.handleForwardedMessage.bind(adapter);
+  const parents = new Map<string, string>();
+  target.handleForwardedMessage = async (data, options) => {
+    const inThread = data.channel_type === ChannelType.PublicThread || data.channel_type === ChannelType.PrivateThread;
+    if (data.thread || !inThread || typeof data.channel_id !== 'string') return original(data, options);
+    const threadId = data.channel_id;
+    let parent = parents.get(threadId) ?? (await knownParent(String(data.guild_id ?? ''), threadId));
+    if (!parent) {
+      try {
+        const channel = (await rest.get(Routes.channel(threadId))) as { parent_id?: string | null };
+        parent = channel.parent_id ?? null;
+      } catch (err) {
+        log.warn('Discord thread message dropped: its parent channel could not be resolved', {
+          threadId,
+          messageId: data.id,
+          err,
+        });
+        return;
+      }
+    }
+    if (parent) {
+      parents.set(threadId, parent);
+      data.thread = { id: threadId, parent_id: parent };
+    }
     return original(data, options);
   };
 }
@@ -811,6 +871,7 @@ for (const ws of workspaces) {
       (discordAdapter as unknown as { name: string }).name = ws.channelType;
       const rest = new REST({ version: '10' }).setToken(ws.botToken);
       installMessageThreadAutoCreate(discordAdapter, rest);
+      installThreadParentResolve(discordAdapter, rest);
       const bridge = createChatSdkBridge({
         adapter: discordAdapter,
         concurrency: 'concurrent',
