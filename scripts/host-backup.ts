@@ -1037,7 +1037,7 @@ export interface RestoreSource {
   listVersions(prefix: string): Promise<ObjectVersion[]>;
 }
 
-export interface S3Credentials {
+interface S3Credentials {
   AccessKeyId: string;
   SecretAccessKey: string;
   SessionToken?: string;
@@ -1096,7 +1096,7 @@ export function s3RestoreSource(opts: {
   region: string;
   endpoint?: string;
   credentials?: () => S3Credentials;
-  attempts?: number;
+  timeoutMs?: number;
 }): RestoreSource {
   const base = new URL(opts.endpoint ?? `https://${opts.bucket}.s3.${opts.region}.amazonaws.com`);
   const transport = base.protocol === 'http:' ? http : https;
@@ -1110,7 +1110,8 @@ export function s3RestoreSource(opts: {
   const once = (key: string, query: Record<string, string>) =>
     new Promise<http.IncomingMessage>((resolve, reject) => {
       const signed = signS3Get(base.host, opts.region, key, query, current(), new Date());
-      transport
+      const timeoutMs = opts.timeoutMs ?? 60_000;
+      const req = transport
         .get(
           {
             protocol: base.protocol,
@@ -1123,13 +1124,13 @@ export function s3RestoreSource(opts: {
           resolve,
         )
         .on('error', reject);
+      req.setTimeout(timeoutMs, () => req.destroy(new Error(`GET ${key || '/'} stalled for ${timeoutMs / 1000}s`)));
     });
   const request = async <T>(
     key: string,
     query: Record<string, string>,
     use: (res: http.IncomingMessage) => Promise<T>,
   ) => {
-    const attempts = opts.attempts ?? 5;
     for (let attempt = 1; ; attempt++) {
       let retryable = true;
       try {
@@ -1140,7 +1141,7 @@ export function s3RestoreSource(opts: {
         const code = /<Code>(.*?)<\/Code>/.exec(body)?.[1] ?? '';
         throw new Error(`GET ${key || '/'} returned ${res.statusCode} ${code}`.trim());
       } catch (err) {
-        if (!retryable || attempt >= attempts) throw err;
+        if (!retryable || attempt >= 5) throw err;
         await new Promise((r) => setTimeout(r, 2 ** attempt * 100 * (1 + Math.random())));
       }
     }
@@ -1151,16 +1152,25 @@ export function s3RestoreSource(opts: {
   };
   const list = async <T>(
     query: Record<string, string>,
+    root: string,
     row: string,
     next: (body: string) => Record<string, string>,
     take: (fields: (name: string) => string) => T,
   ) => {
     const rows: T[] = [];
     for (let q: Record<string, string> | null = query; q; ) {
-      const body: string = await request('', q, text);
+      const body: string = await request('', q, async (res) => {
+        const page = await text(res);
+        if (!page.trimEnd().endsWith(`</${root}>`) || !/<IsTruncated>(true|false)<\/IsTruncated>/.test(page)) {
+          throw new Error(`incomplete ${root} page`);
+        }
+        return page;
+      });
       for (const m of body.matchAll(new RegExp(`<${row}>(.*?)</${row}>`, 'gs')))
         rows.push(take((name) => field(m[1], name)));
-      q = /<IsTruncated>true<\/IsTruncated>/.test(body) ? next(body) : null;
+      const markers = /<IsTruncated>true<\/IsTruncated>/.test(body) ? next(body) : null;
+      if (markers && Object.values(markers).some((v) => !v)) throw new Error(`${root} page has no next marker`);
+      q = markers && { ...query, ...markers };
     }
     return rows;
   };
@@ -1170,8 +1180,9 @@ export function s3RestoreSource(opts: {
       const query = { 'list-type': '2', prefix: 'manifests/', 'encoding-type': 'url' };
       return list(
         query,
+        'ListBucketResult',
         'Contents',
-        (body) => ({ ...query, 'continuation-token': field(body, 'NextContinuationToken') }),
+        (body) => ({ 'continuation-token': field(body, 'NextContinuationToken') }),
         (f) => ({ key: listKey(f('Key')), lastModified: f('LastModified') }),
       );
     },
@@ -1179,9 +1190,9 @@ export function s3RestoreSource(opts: {
       const query = { versions: '', prefix, 'encoding-type': 'url' };
       return list(
         query,
+        'ListVersionsResult',
         'Version',
         (body) => ({
-          ...query,
           'key-marker': listKey(field(body, 'NextKeyMarker')),
           'version-id-marker': field(body, 'NextVersionIdMarker'),
         }),

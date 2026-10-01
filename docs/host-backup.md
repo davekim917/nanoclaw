@@ -139,9 +139,9 @@ Restore takes credentials from `aws configure export-credentials` (the same reso
 CLI: `AWS_PROFILE`, or the break-glass session's environment) and talks to S3 directly: it pages
 through the version listing once, then fetches files by version id, 128 at a time
 (`--concurrency <n>`), retrying throttling and server errors. Leaving out `--prefix` restores the
-whole host. For about 1.8M files and 80 GiB that is roughly 1 to 1.5 hours and 4 GB of memory,
-extrapolated from a measured subtree restore of 0.5M files at about 1,000 files a second plus a
-10-minute listing of the whole bucket. Progress is logged every minute.
+whole host: for about 1.8M files and 80 GiB, roughly 1 to 1.5 hours and 4 GB of memory
+(extrapolated, not measured). Progress is logged every minute, and a request that stalls for a
+minute is retried.
 
 Without the repo, `aws s3api list-objects-v2 --prefix manifests/` lists the manifests, and
 `aws s3api list-object-versions --prefix files/<path>` plus `get-object --version-id` fetch a

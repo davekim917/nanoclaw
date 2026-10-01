@@ -702,11 +702,15 @@ describe('s3RestoreSource', () => {
   let server: http.Server;
   let seen: string[];
   let failNext: number;
+  let brokenNext: boolean;
+  let stallNext: boolean;
   const creds = () => ({ AccessKeyId: 'AK', SecretAccessKey: 'SK' });
 
   beforeEach(async () => {
     seen = [];
     failNext = 0;
+    brokenNext = false;
+    stallNext = false;
     server = http.createServer((req, res) => {
       const url = new URL(req.url!, 'http://x');
       seen.push(`${url.pathname}${url.search}`);
@@ -715,6 +719,16 @@ describe('s3RestoreSource', () => {
       } else if (failNext > 0) {
         failNext--;
         res.writeHead(503).end('<Error><Code>SlowDown</Code></Error>');
+      } else if (url.searchParams.get('list-type') === '2') {
+        const page =
+          '<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>manifests/old</Key>' +
+          '<LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents><Contents><Key>manifests/new</Key>' +
+          '<LastModified>2026-01-02T00:00:00.000Z</LastModified></Contents></ListBucketResult>';
+        res.end(brokenNext ? page.slice(0, page.indexOf('<Contents><Key>manifests/new') + 20) : page);
+        brokenNext = false;
+      } else if (stallNext) {
+        stallNext = false;
+        res.writeHead(200).write('partial');
       } else if (url.searchParams.has('versions') && !url.searchParams.get('key-marker')) {
         res.end(
           '<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>files/a+b%2Bc</NextKeyMarker>' +
@@ -743,7 +757,7 @@ describe('s3RestoreSource', () => {
       region: 'r',
       endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
       credentials: creds,
-      attempts: 3,
+      timeoutMs: 100,
     });
 
   it('pages through a version listing and decodes URL-encoded keys', async () => {
@@ -763,5 +777,19 @@ describe('s3RestoreSource', () => {
     expect(seen).toHaveLength(3);
     await expect(source().getObject('files/missing', 'v9', dest)).rejects.toThrow(/404 NoSuchKey/);
     expect(seen).toHaveLength(4);
+  });
+
+  it('retries a listing page that arrived incomplete rather than trusting the rows it has', async () => {
+    brokenNext = true;
+    expect((await source().listManifests()).map((m) => m.key)).toEqual(['manifests/old', 'manifests/new']);
+    expect(seen).toHaveLength(2);
+  });
+
+  it('abandons and retries a response that stalls mid-body', async () => {
+    const dest = path.join(tmp, 'out', 'f');
+    stallNext = true;
+    await source().getObject('files/a b+c', 'v1', dest);
+    expect(fs.readFileSync(dest, 'utf8')).toBe('content');
+    expect(seen).toHaveLength(2);
   });
 });
