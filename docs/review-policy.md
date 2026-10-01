@@ -88,7 +88,9 @@ and nothing can be derived from one. Two settings govern review, and they
 are independent of each other:
 
 - **Who may review.** Any frontier model; nothing to edit when a new one
-  ships. Only the small-tier denylist, `REVIEWER_DENIED_TIERS` in
+  ships. Eligibility is not dispatch: routine reviews still run on the Opus /
+  `gpt-6.1-sol` defaults above, and `gpt-6-astra` or Fable only on an explicit
+  human request. Only the small-tier denylist, `REVIEWER_DENIED_TIERS` in
   `container/skills/pr-review-loop/scripts/codex-review.sh`, changes — add a
   word when a vendor names a new small tier.
 - **What a Codex subagent runs at.** Codex's native default: the generated
@@ -110,8 +112,10 @@ eligibility immediately, including on heads already receipted, because
 merge-check re-reads the receipt against the current rule. Add a tier word only
 for a genuinely small tier.
 
-**Which reviewer is dispatched** is not a policy question — a reviewer is chosen
-for independence from the artifact's author, not for a worker tier.
+**Which reviewer is dispatched** follows the defaults above — Opus or
+`gpt-6.1-sol` routinely, `gpt-6-astra` or Fable only on an explicit human
+request; within those, a reviewer is chosen for independence from the
+artifact's author, not for a worker tier.
 
 Containers read the generated config at spawn, so an effort change reaches a
 running agent only when its container restarts on the new image.
