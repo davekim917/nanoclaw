@@ -23,6 +23,12 @@ const BASE_CONFIG = [
   'gpg.x509.program=/bin/false',
 ];
 
+const FILTER_OVERRIDE_ENV = {
+  NANOCLAW_GIT_EMPTY: '',
+  NANOCLAW_GIT_CAT: '/bin/cat',
+  NANOCLAW_GIT_FALSE: 'false',
+};
+
 export function safeGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     PATH: SAFE_PATH,
@@ -36,10 +42,11 @@ export function safeGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     GIT_ALLOW_PROTOCOL: 'file',
     GIT_OPTIONAL_LOCKS: '0',
     ...extra,
+    ...FILTER_OVERRIDE_ENV,
   };
 }
 
-/** Command-line config has higher priority than repository-local config. */
+/** Command-line config outranks repository-local config. Filters use `--config-env`, which splits at the last `=`, so any name stays in the key. */
 export function safeGitArgs(
   args: readonly string[],
   localConfigPath?: string,
@@ -50,14 +57,10 @@ export function safeGitArgs(
   if (localConfigPath) for (const name of localFilterNames(localConfigPath)) filterNames.add(name);
   for (const name of [...filterNames].sort()) {
     overrides.push(
-      '-c',
-      `filter.${name}.process=`,
-      '-c',
-      `filter.${name}.clean=/bin/cat`,
-      '-c',
-      `filter.${name}.smudge=/bin/cat`,
-      '-c',
-      `filter.${name}.required=false`,
+      `--config-env=filter.${name}.process=NANOCLAW_GIT_EMPTY`,
+      `--config-env=filter.${name}.clean=NANOCLAW_GIT_CAT`,
+      `--config-env=filter.${name}.smudge=NANOCLAW_GIT_CAT`,
+      `--config-env=filter.${name}.required=NANOCLAW_GIT_FALSE`,
     );
   }
   return [...overrides, ...args];
@@ -72,9 +75,6 @@ export function safeGitFilterNames(gitDir: string, workTree?: string): string[] 
     ...(workTree ? ['--work-tree', workTree] : []),
     'config',
     '--includes',
-    '--name-only',
-    '--get-regexp',
-    '^filter\\..*\\.(clean|smudge|process|required)$',
   ];
   return filterNamesFrom(args);
 }
@@ -88,35 +88,39 @@ function localFilterNames(configPath: string): string[] {
     throw error;
   }
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`unsafe Git config path: ${configPath}`);
-  return filterNamesFrom([
-    'config',
-    '--file',
-    configPath,
-    '--includes',
-    '--name-only',
-    '--get-regexp',
-    '^filter\\..*\\.(clean|smudge|process|required)$',
-  ]);
+  return filterNamesFrom(['config', '--file', configPath, '--includes']);
 }
 
-function filterNamesFrom(args: string[]): string[] {
-  let output: string;
+const FILTER_VARIABLES = ['clean', 'smudge', 'process', 'required'];
+
+function filterNamesFrom(configArgs: string[]): string[] {
+  let output: Buffer;
   try {
-    output = execFileSync('git', args, {
-      encoding: 'utf8',
-      env: safeGitEnv(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 10_000,
-    });
+    // In a UTF-8 locale git's regex `.` skips an invalid byte, so such a name would go undiscovered.
+    output = execFileSync(
+      'git',
+      [...configArgs, '--null', '--name-only', '--get-regexp', `^filter\\..*\\.(${FILTER_VARIABLES.join('|')})$`],
+      {
+        env: safeGitEnv({ LANG: 'C', LC_ALL: 'C' }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000,
+      },
+    );
   } catch (error) {
     const status = (error as NodeJS.ErrnoException & { status?: number }).status;
     if (status === 1) return [];
     throw error;
   }
+  const utf8 = new TextDecoder('utf-8', { fatal: true });
+  const keys = utf8.decode(output).split('\0');
+  if (keys.pop() !== '') throw new Error('unterminated git config key');
   const names = new Set<string>();
-  for (const key of output.split('\n')) {
-    const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/.exec(key.trim());
-    if (match) names.add(match[1]);
+  for (const key of keys) {
+    const variable = FILTER_VARIABLES.find((name) => key.startsWith('filter.') && key.endsWith(`.${name}`));
+    if (variable === undefined || key.length < 'filter.'.length + variable.length + 1) {
+      throw new Error(`unexpected git config key: ${JSON.stringify(key)}`);
+    }
+    names.add(key.slice('filter.'.length, key.length - variable.length - 1));
   }
   return [...names].sort();
 }
