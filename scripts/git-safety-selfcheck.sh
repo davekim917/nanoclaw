@@ -1905,5 +1905,34 @@ case "$(cat "$DM_LOG" 2>/dev/null)" in
   *) bad "round 3 P3: no %q-quoted form of the poisoned deleted filename in the DM" "$(cat "$DM_LOG" 2>/dev/null)" ;;
 esac
 
+# ═══ GIT_SAFETY_TOPIC_CHECKOUTS: handed to scripts/topic-snapshot.ts ══════
+# Its behaviour is covered by src/topic-snapshot.test.ts; this checks the
+# wiring: output lands in the snapshot, and its failures fail the run.
+new_fixture
+echo data/ >> "$NCDIR/.git/info/exclude"
+TOPIC_REMOTE="$FIX/topic-remote.git"
+git init --bare -q -b main "$TOPIC_REMOTE"
+git clone -q "$TOPIC_REMOTE" "$FIX/topic-seed" 2>/dev/null
+echo base > "$FIX/topic-seed/app.txt"
+git -C "$FIX/topic-seed" add app.txt && git -C "$FIX/topic-seed" -c user.email=t@e -c user.name=t commit -qm base &&
+  git -C "$FIX/topic-seed" push -q origin HEAD:main
+TOPIC="$NCDIR/data/v2-topics/wg/topic-a/worktrees/app"
+mkdir -p "$(dirname "$TOPIC")" && git clone -q "$TOPIC_REMOTE" "$TOPIC"
+echo edit >> "$TOPIC/app.txt"
+run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$NCDIR/data/v2-topics/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry
+if [ "$RC" -eq 0 ] && ls "$(latest_snapshot)"topics/topic-*/*.patch.gz >/dev/null 2>&1 &&
+   [[ "$OUT" == *"topics: 1 checkout(s) captured"* ]] && grep -qF "$TOPIC  HEAD=" "$(latest_snapshot)MANIFEST.txt"; then
+  ok "topic checkouts are snapshotted by topic-snapshot.ts into the run's snapshot and manifest"
+else
+  bad "topic checkouts were not snapshotted through topic-snapshot.ts" "$OUT"
+fi
+git -C "$TOPIC" -c user.email=t@e -c user.name=t stash push -q && git -C "$TOPIC" config log.date INVALID
+run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$NCDIR/data/v2-topics/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry
+if [ "$RC" -ne 0 ] && [[ "$(tail -1 <<<"$OUT")" == "- topics: "*"stash list"* ]]; then
+  ok "a topic-snapshot.ts failure fails the run and is its reported reason"
+else
+  bad "a topic-snapshot.ts failure did not fail the run" "$OUT"
+fi
+
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
 exit "$FAILED"
