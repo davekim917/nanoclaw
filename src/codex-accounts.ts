@@ -26,8 +26,8 @@ export interface CodexAuthFallback {
 }
 
 /**
- * Entries without an `auth.json`, equal to the primary, or already seen are silently skipped. Both the mount block
- * and the env-forward block call this so they stay in sync.
+ * Entries without an `auth.json`, equal to the primary, or already seen are skipped. The mount block and
+ * `codexAccountRing` both call this, so a fallback's container path names the same host account in each.
  */
 export function resolveCodexAuthFallbacks(
   declarations: string[] | undefined,
@@ -58,8 +58,8 @@ export interface CodexAccount {
 }
 
 /**
- * An account's quota can be reset early, and only a running app-server can read it, so the mark expires and one
- * container tries the account again.
+ * An account's quota can be reset early, and only a running app-server can read it, so the mark expires and
+ * containers start on the account again until one of them reports it spent.
  */
 export const CODEX_ACCOUNT_RETRY_MS = 60 * 60_000;
 

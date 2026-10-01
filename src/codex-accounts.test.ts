@@ -66,6 +66,16 @@ describe('codex account health', () => {
   });
 });
 
+describe('CODEX_START_HOME at spawn', () => {
+  // buildContainerArgs makes live OneCLI calls and cannot run here, so the wiring is read from source.
+  it('is the start pick for the spawning group, passed as container env', () => {
+    const src = fs.readFileSync(new URL('./container-runner.ts', import.meta.url), 'utf8');
+    expect(src).toMatch(
+      /const codexStart = codexStartHome\(provider, agentGroup\.folder, containerConfig\.codexAuthFallbacks\);\s+if \(codexStart\) args\.push\('-e', `CODEX_START_HOME=\$\{codexStart\}`\);/,
+    );
+  });
+});
+
 describe('codexStartHome', () => {
   function makeHome(): string {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-start-'));

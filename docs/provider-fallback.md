@@ -53,7 +53,8 @@ instead (`CODEX_START_HOME`).
 
 The mark is keyed by the host Codex home, so groups that share an account share
 the mark. It carries no reset date: a quota can be reset early, so after an hour
-one container tries the account again and either stays on it or renews the mark.
+containers start on the account again, until one of them finds it still spent
+and renews the mark.
 It lives in host memory (`src/codex-accounts.ts`); a host restart forgets
 it, which costs one extra app-server start. With every account marked, the
 container starts on the primary and the ladder above runs as usual.

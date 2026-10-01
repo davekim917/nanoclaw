@@ -31,6 +31,7 @@ const ORIGINAL_ENV = {
   FAKE_CODEX_SILENT_INIT_INSTANCES: process.env.FAKE_CODEX_SILENT_INIT_INSTANCES,
   CODEX_START_HOME: process.env.CODEX_START_HOME,
   CODEX_INIT_TIMEOUT_MS: process.env.CODEX_INIT_TIMEOUT_MS,
+  NANOCLAW_HEARTBEAT_PATH: process.env.NANOCLAW_HEARTBEAT_PATH,
 };
 
 function restoreEnv(): void {
@@ -231,6 +232,7 @@ async function run(opts: {
     delete process.env.FAKE_CODEX_SILENT_INIT_INSTANCES;
     delete process.env.CODEX_INIT_TIMEOUT_MS;
   }
+  process.env.NANOCLAW_HEARTBEAT_PATH = path.join(tmpDir, 'heartbeat');
   process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
   process.env.CODEX_HEALTH_PROBE_INTERVAL_MS = '1000';
   process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS = '1000';
@@ -346,6 +348,7 @@ describe('Codex rate-limit read → park through gen()', () => {
     const { events, requests, spawned } = await run({ weeklyByInstance: '95,30', fallbackHomes: [fallbackHome] });
     expect(spawned).toBe(2);
     expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, 'heartbeat'))).toBe(false);
     expect(
       events.some((e) => e.type === 'progress' && String(e.message).includes('Codex OAuth rotating (quota)')),
     ).toBe(true);
@@ -397,6 +400,25 @@ describe('Codex rate-limit read → park through gen()', () => {
     expect(events.filter((e) => e.type === 'result')).toHaveLength(1);
   }, 5_000);
 
+  it('the start hint applies to the first query only: a later query keeps the home the rotation left', async () => {
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const { events, spawned } = await run({
+      weeklyByInstance: '97,20,20',
+      fallbackHomes: [fallbackHome],
+      startHome: fallbackHome,
+      queries: 2,
+    });
+    expect(spawned).toBe(3);
+    expect(events.filter((e) => e.type === 'result')).toHaveLength(2);
+    const pulls = getRateLimitSampleRows().filter((r) => r.source === 'usage_pull' && r.limit_type === 'seven_day');
+    expect(pulls.map((r) => r.credential_set)).toEqual([
+      'codex:codex-fallback-1',
+      'codex:codex-home',
+      'codex:codex-home',
+    ]);
+  }, 5_000);
+
   it('a start hint naming a home that is not a mounted fallback is ignored', async () => {
     const { spawned } = await run({ weeklyByInstance: '20', startHome: path.join(tmpDir, 'not-mounted') });
     expect(spawned).toBe(1);
@@ -405,7 +427,6 @@ describe('Codex rate-limit read → park through gen()', () => {
   }, 5_000);
 
   it('an unanswered initialize on the rotated-to account gets one fresh app-server and the turn completes', async () => {
-    // The 2026-10-01 shape: primary parks, the fallback's first app-server never answers initialize.
     const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
     fs.mkdirSync(fallbackHome, { recursive: true });
     const { events, requests, spawned } = await run({
@@ -416,6 +437,8 @@ describe('Codex rate-limit read → park through gen()', () => {
     expect(spawned).toBe(3);
     expect(events.some((e) => e.type === 'error')).toBe(false);
     expect(requests.filter((r) => r.method === 'turn/start').map((r) => r.instance)).toEqual([3]);
+    // The provider touches the heartbeat only when it retries a start; the poll-loop is not in this test.
+    expect(fs.existsSync(path.join(tmpDir, 'heartbeat'))).toBe(true);
     expect(events.filter((e) => e.type === 'result')).toHaveLength(1);
   }, 5_000);
 

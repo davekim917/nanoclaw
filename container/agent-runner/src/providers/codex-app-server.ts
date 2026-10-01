@@ -300,11 +300,14 @@ async function initializeCodexAppServer(server: AppServer, timeoutMs: number): P
 /**
  * Spawns and initializes an app-server. An unanswered `initialize` gets one fresh process before the failure
  * surfaces: the host answers that failure by moving the whole agent group to its fallback provider. `onSpawn`
- * runs for every process, before its first request.
+ * runs for every process, before its first request. `onRetry` is the caller's liveness signal: the host kills a
+ * container whose claimed message shows no sign of life for a minute, and a retried start can take that long
+ * before the first provider event.
  */
 export async function startCodexAppServer(
   configOverrides: string[],
   onSpawn: (server: AppServer) => void,
+  onRetry: () => void,
   initTimeoutMs: number = CODEX_INIT_TIMEOUT_MS,
 ): Promise<AppServer> {
   for (let attempt = 1; ; attempt++) {
@@ -317,6 +320,7 @@ export async function startCodexAppServer(
       killCodexAppServer(server);
       if (attempt >= INIT_ATTEMPTS || !(err instanceof CodexRequestTimeoutError)) throw err;
       log(`initialize unanswered after ${initTimeoutMs}ms — starting a fresh app-server (attempt ${attempt + 1})`);
+      onRetry();
     }
   }
 }

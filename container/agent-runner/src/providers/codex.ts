@@ -13,6 +13,7 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/cont
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { setProviderHealthState, type ProviderHealthState } from '../modules/mailbox/index.js';
 import { formatCredentialRotationNotice } from '../credential-rotation-notice.js';
+import { touchHeartbeat } from '../heartbeat.js';
 import { CODEX_MODEL_RE, isCodexFamilyName, resolveCodexFamily } from './model-vocabulary.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
@@ -869,6 +870,7 @@ export class CodexProvider implements AgentProvider {
               turnTracker.server = spawned;
               attachCodexAutoApproval(spawned);
             },
+            touchHeartbeat,
             positiveEnvMs('CODEX_INIT_TIMEOUT_MS', CODEX_INIT_TIMEOUT_MS),
           );
         } catch (err) {
