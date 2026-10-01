@@ -6,7 +6,8 @@
 #      every uncommitted edit and new file, and every stash, across all
 #      worktrees of this repo, groups/, $GIT_SAFETY_EXTRA_REPOS, and every
 #      checkout in $GIT_SAFETY_TOPIC_CHECKOUTS, into
-#      $GIT_SAFETY_DIR/<UTC stamp>/. Read-only against the repos except for
+#      $GIT_SAFETY_DIR/<UTC stamp>/. Read-only against the repos under data/
+#      (container-writable); elsewhere it writes only
 #      refs/git-safety/* refs that pin detached-HEAD and stash commits so
 #      `git gc` cannot collect them; those refs are pruned once whatever they
 #      protected is gone AND the pin itself has outlived $GIT_SAFETY_KEEP_DAYS
@@ -343,15 +344,24 @@ say "Restore groups/ config: git -C groups fetch origin $SNAPSHOT_BRANCH && git 
 # container-set core.fsmonitor, reference-transaction hook, gpg program,
 # filter driver, or promisor remote (whose lazy fetch runs core.sshCommand)
 # would run on the host as this user. The timeout keeps a planted FIFO from
-# hanging the whole run; a timed-out read can look like an empty one, so
-# every timeout is logged and fails the run.
+# hanging the whole run.
 SAFE_GIT=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false -c protocol.allow=never
   -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false -c gpg.x509.program=/bin/false)
-GIT_TIMEOUT_LOG=$(mktemp); CLEANUP_PATHS+=("$GIT_TIMEOUT_LOG")
+GIT_FAIL_LOG=$(mktemp); CLEANUP_PATHS+=("$GIT_FAIL_LOG")
+git_failed() { printf '%q ' "$@" | cut -c1-200 >> "$GIT_FAIL_LOG"; }
 sgit() {
   local rc=0
   GIT_NO_LAZY_FETCH=1 timeout -k 10 "$GIT_TIMEOUT" git "${SAFE_GIT[@]}" "$@" || rc=$?
-  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then printf '%q ' "$@" | cut -c1-200 >> "$GIT_TIMEOUT_LOG"; fi
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then git_failed "$@"; fi
+  return "$rc"
+}
+# strict <sgit|wgit call> — a read whose failure would otherwise pass for an
+# empty result (no stashes, no branches, no edits). Every failure is logged,
+# and any logged failure fails the run.
+strict() {
+  local rc=0
+  "$@" || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || git_failed "$@"
   return "$rc"
 }
 # wgit <worktree> <args> — for commands that read a worktree's files, which
@@ -367,10 +377,21 @@ wgit() {
     awk -F'\t' '$1 != "global" && $1 != "system" { sub(/^filter\./, "", $2); sub(/\.[a-z]+$/, "", $2); print $2 }' | sort -u)
   GIT_CEILING_DIRECTORIES="$(dirname "$w")" sgit ${filters[@]+"${filters[@]}"} -C "$w" "$@"
 }
+# one_path <command> — the one path the command prints, byte-exact. `$(...)`
+# strips trailing newlines, which would turn a path ending in LF into another,
+# existing path, so a path holding an LF is refused instead.
+one_path() {
+  local out
+  out=$("$@" && printf x) || return 1
+  [[ "$out" == *$'\nx' ]] || return 1
+  out=${out%$'\nx'}
+  [ -n "$out" ] && [[ "$out" != *$'\n'* ]] || return 1
+  printf '%s' "$out"
+}
 common_dir() { # <repo or worktree> -> canonical path of the git dir holding its refs and objects
   local c
-  c=$(sgit -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
-    realpath -e "$c" 2>/dev/null
+  c=$(one_path sgit -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+    one_path realpath -e -- "$c" 2>/dev/null
 }
 
 # Keyed by the repository holding their commits: a linked worktree's branches
@@ -384,13 +405,13 @@ for spec in ${TOPIC_SPECS[@]+"${TOPIC_SPECS[@]}"}; do
   for t in $spec; do
     t=${t%/}
     [ -e "$t" ] || [ -L "$t" ] || continue
-    real=$(realpath -e "$t" 2>/dev/null)
-    top="" common=""
+    real="" top="" common=""
     if [ ! -L "$t" ] && [ -d "$t" ] && [[ "$t" != *$'\n'* ]]; then
-      top=$(sgit -C "$t" rev-parse --show-toplevel 2>/dev/null)
+      real=$(one_path realpath -e -- "$t" 2>/dev/null)
+      top=$(one_path sgit -C "$t" rev-parse --show-toplevel 2>/dev/null)
       common=$(common_dir "$t")
     fi
-    if [ -z "$common" ] || [ "$top" != "$real" ] || [[ "$common/" != "$DATA_ROOT"* ]]; then
+    if [ -z "$common" ] || [ -z "$real" ] || [ "$top" != "$real" ] || [[ "$common/" != "$DATA_ROOT"* ]]; then
       UNREADABLE+=("$t")
       continue
     fi
@@ -398,28 +419,101 @@ for spec in ${TOPIC_SPECS[@]+"${TOPIC_SPECS[@]}"}; do
   done
 done
 
-repo_worktrees() { # <repo> <its common dir>
-  { sgit -C "$1" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}'
-    printf '%s' "${TOPIC_WTS[$2]:-}"
-  } | awk 'NF && !seen[$0]++'
+repo_worktrees() { # <repo> <its common dir> -> REPO_WTS, and REPO_WTS_OK unless git's own list failed
+  local line w listing
+  local -A seen=()
+  REPO_WTS=() REPO_WTS_OK=1
+  listing=$(mktemp); CLEANUP_PATHS+=("$listing")
+  strict sgit -C "$1" worktree list --porcelain -z > "$listing" || REPO_WTS_OK=""
+  while IFS= read -r -d '' line; do
+    case $line in
+      "worktree "*) w=${line#worktree } ;;
+      bare) [ ${#REPO_WTS[@]} -gt 0 ] && unset 'REPO_WTS[-1]'; continue ;;
+      *) continue ;;
+    esac
+    if [[ "$w" == *$'\n'* ]]; then UNREADABLE+=("$w"); continue; fi
+    [ -z "${seen[$w]:-}" ] || continue
+    seen[$w]=1; REPO_WTS+=("$w")
+  done < "$listing"
+  rm -f "$listing"
+  while IFS= read -r w; do
+    [ -n "$w" ] && [ -z "${seen[$w]:-}" ] || continue
+    seen[$w]=1; REPO_WTS+=("$w")
+  done <<<"${TOPIC_WTS[$2]:-}"
+}
+
+# A repository under data/ is container-writable, so it is never written to:
+# update-ref there follows whatever symref or symlinked ref directory a
+# container planted. Its unpushed tips get refs in a host-owned scratch repo
+# that borrows its objects, and the bundle is built there, under the same ref
+# names the pinned repos use, so restore is the same.
+bundle_untrusted() { # <repo> <common dir> <label> <dir> <worktree>...
+  local repo=$1 common=$2 label=$3 dir=$4 w h rc sha name refs stashes negatives objdir scratch commits
+  local tips=() updates=()
+  shift 4
+  refs=$(strict sgit -C "$repo" for-each-ref --format='%(objectname) %(refname)' refs/heads) || return 0
+  while read -r sha name; do
+    [ -n "$sha" ] && tips+=("$name") && updates+=("create $name $sha")
+  done <<<"$refs"
+  stashes=$(strict sgit -C "$repo" stash list --format=%H) || return 0
+  while read -r sha; do
+    [ -n "$sha" ] && tips+=("refs/git-safety/stash/$sha") && updates+=("create refs/git-safety/stash/$sha $sha")
+  done <<<"$stashes"
+  for w in "$@"; do
+    [ -e "$w" ] && [ "$(common_dir "$w")" = "$common" ] || continue
+    rc=0; wgit "$w" symbolic-ref -q HEAD >/dev/null 2>&1 || rc=$?
+    # 0 is a branch, already listed; 128 is a checkout git cannot read,
+    # which the capture below lists as unreadable.
+    [ "$rc" -eq 1 ] || continue
+    h=$(strict wgit "$w" rev-parse --verify HEAD) || continue
+    name="refs/git-safety/detached/$(slug "$w")"
+    tips+=("$name") && updates+=("create $name $h")
+  done
+  [ ${#tips[@]} -gt 0 ] || return 0
+  negatives=$(strict sgit -C "$repo" for-each-ref --format='^%(objectname)' refs/remotes) || return 0
+  objdir=$(one_path sgit -C "$repo" rev-parse --path-format=absolute --git-path objects) || { git_failed "$repo" objects path; return 0; }
+  scratch=$(mktemp -d); CLEANUP_PATHS+=("$scratch")
+  if ! { sgit init --bare -q "$scratch" && printf '%s\n' "$objdir" > "$scratch/objects/info/alternates" &&
+         { [ ! -f "$common/shallow" ] || [ -L "$common/shallow" ] || timeout "$GIT_TIMEOUT" cp "$common/shallow" "$scratch/shallow"; } &&
+         printf '%s\n' "${updates[@]}" | sgit --git-dir="$scratch" update-ref --stdin; } 2>>"$ERR"; then
+    FAILURES+=("$label: could not stage its ${#tips[@]} tips in a scratch repo for bundling")
+    rm -rf "$scratch"; return 0
+  fi
+  commits=$(printf '%s\n' "${tips[@]}" "$negatives" | sgit --git-dir="$scratch" rev-list --count --stdin 2>>"$ERR") ||
+    { FAILURES+=("$label: could not count its unpushed commits"); rm -rf "$scratch"; return 0; }
+  if [ "$commits" -gt 0 ]; then
+    if printf '%s\n' "${tips[@]}" "$negatives" | sgit --git-dir="$scratch" bundle create "$dir/unpushed-commits.bundle" --stdin >/dev/null 2>>"$ERR" &&
+       verify_bundle "$dir/unpushed-commits.bundle" "$scratch"; then
+      say "$label: bundled $commits commits on no remote (built read-only)"
+    else
+      FAILURES+=("$label: could not write a verified bundle of its $commits unpushed commits")
+    fi
+  fi
+  rm -rf "$scratch"
 }
 
 snapshot_repo() { # <repo path> <label>
-  local repo=$1 label=$2 dir="$OUT/$2" h w s st list r n=0 common worktrees
+  local repo=$1 label=$2 dir="$OUT/$2" h w s r n=0 common wts
   common=$(common_dir "$repo")
   if [ -n "$common" ]; then
     [ -z "${SNAPSHOTTED[$common]:-}" ] || return 0
     SNAPSHOTTED[$common]=1
   fi
   mkdir -p "$dir"
-  worktrees=$(repo_worktrees "$repo" "$common")
+  repo_worktrees "$repo" "$common"
+  wts=(${REPO_WTS[@]+"${REPO_WTS[@]}"})
+  if [ -n "$common" ] && [[ "$common/" == "$DATA_ROOT"* ]]; then
+    bundle_untrusted "$repo" "$common" "$label" "$dir" ${wts[@]+"${wts[@]}"}
+    capture_worktrees "$label" "$dir" "$common" ${wts[@]+"${wts[@]}"}
+    return 0
+  fi
 
   local mark_dir="$SNAP_ROOT/.git-safety-refs/$label"
 
   # Pin detached HEADs that hold commits on no remote: once their worktree
   # directory is gone, nothing but the reflog keeps them.
   local live_detached=()
-  while IFS= read -r w; do
+  for w in ${wts[@]+"${wts[@]}"}; do
     [ -e "$w" ] || continue
     wgit "$w" symbolic-ref -q HEAD >/dev/null 2>&1 && continue
     h=$(wgit "$w" rev-parse HEAD 2>/dev/null) || continue
@@ -436,13 +530,15 @@ snapshot_repo() { # <repo path> <label>
       live_detached+=("$wslug")
       rm -f "$mark_dir/detached-$wslug"
     fi
-  done <<<"$worktrees"
+  done
 
   # Pin every stash entry by content SHA (not list position): a bundle of
   # refs/stash carries only the newest, and a positional ref name goes stale
   # the moment an entry is popped or a new one is pushed ahead of it.
-  local live_stash=()
+  local live_stash=() stashes stashes_ok=1
+  stashes=$(strict sgit -C "$repo" stash list --format=%H) || stashes_ok=""
   while read -r s; do
+    [ -n "$s" ] || continue
     # review-683-r2 P3-8: same leak-on-signal reasoning as the detached-HEAD
     # loop above.
     local e; e=$(mktemp); CLEANUP_PATHS+=("$e")
@@ -450,31 +546,31 @@ snapshot_repo() { # <repo path> <label>
     check_err "$e" "$label: update-ref for stash entry $s"
     live_stash+=("$s")
     rm -f "$mark_dir/stash-$s"
-  done < <(sgit -C "$repo" stash list --format=%H 2>/dev/null)
+  done <<<"$stashes"
 
   # Expire pins whose worktree/stash entry is gone AND has been gone for at
   # least $KEEP_DAYS — tracked via a marker file's mtime, not the ref's own
   # date, because a stash entry that has sat untouched for months is still
-  # live and must never expire.
+  # live and must never expire. A listing that failed proves nothing gone.
   local refname suffix mfile
-  while read -r refname; do
+  [ -n "$REPO_WTS_OK" ] && while read -r refname; do
     suffix=${refname#refs/git-safety/detached/}
     printf '%s\n' "${live_detached[@]}" | grep -qxF "$suffix" && continue
     mfile="$mark_dir/detached-$suffix"
     [ -e "$mfile" ] || { mkdir -p "$mark_dir"; touch "$mfile"; }
     [ -n "$(find "$mfile" -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && { sgit -C "$repo" update-ref -d "$refname" 2>/dev/null; rm -f "$mfile"; }
-  done < <(sgit -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/detached 2>/dev/null)
-  while read -r refname; do
+  done < <(strict sgit -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/detached)
+  [ -n "$stashes_ok" ] && while read -r refname; do
     suffix=${refname#refs/git-safety/stash/}
     printf '%s\n' "${live_stash[@]}" | grep -qxF "$suffix" && continue
     mfile="$mark_dir/stash-$suffix"
     [ -e "$mfile" ] || { mkdir -p "$mark_dir"; touch "$mfile"; }
     [ -n "$(find "$mfile" -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && { sgit -C "$repo" update-ref -d "$refname" 2>/dev/null; rm -f "$mfile"; }
-  done < <(sgit -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/stash 2>/dev/null)
+  done < <(strict sgit -C "$repo" for-each-ref --format='%(refname)' refs/git-safety/stash)
 
   while read -r r; do
     [ "$(sgit -C "$repo" rev-list --count "$r" --not --remotes 2>/dev/null || echo 0)" -gt 0 ] && n=$((n + 1))
-  done < <(sgit -C "$repo" for-each-ref --format='%(refname)' refs/heads refs/git-safety)
+  done < <(strict sgit -C "$repo" for-each-ref --format='%(refname)' refs/heads refs/git-safety)
   if [ "$n" -gt 0 ]; then
     # review-683-r2 P3-8: same leak-on-signal reasoning — this one is rm'd
     # by hand a few lines down rather than via check_err, but a signal
@@ -488,14 +584,19 @@ snapshot_repo() { # <repo path> <label>
     fi
     cat "$be" >> "$ERR" 2>/dev/null; rm -f "$be"
   fi
+  capture_worktrees "$label" "$dir" "$common" ${wts[@]+"${wts[@]}"}
+}
 
-  # Per worktree: tracked edits as a gzipped binary patch, new files (under
-  # the size cap, and never secret-shaped by filename) as a tarball. A
-  # registration is container-writable, so a listed path is captured only
-  # when it really is a worktree of this repo.
-  while IFS= read -r w; do
+# Per worktree: tracked edits as a gzipped binary patch, new files (under the
+# size cap, and never secret-shaped by filename) as a tarball. A registration
+# is container-writable, so a listed path is captured only when it really is
+# a worktree of this repo.
+capture_worktrees() { # <label> <dir> <common dir> <worktree>...
+  local label=$1 dir=$2 common=$3 w r s st list
+  shift 3
+  for w in "$@"; do
     [ -e "$w" ] || continue
-    r=$(realpath -e "$w" 2>/dev/null) || continue
+    r=$(one_path realpath -e -- "$w" 2>/dev/null) || { UNREADABLE+=("$w"); continue; }
     [ -z "${CAPTURED[$r]:-}" ] || continue
     [ -z "$common" ] || [ "$(common_dir "$w")" = "$common" ] || continue
     CAPTURED[$r]=1
@@ -513,10 +614,10 @@ snapshot_repo() { # <repo path> <label>
     # stat-dirty (mtime changed, content identical) — verified empirically
     # while building this fix, on both settings of the variable. `diff-index`
     # never does that rewrite, with or without the variable.
-    wgit "$w" diff-index --no-color -p --binary --no-ext-diff --no-textconv --ignore-submodules=dirty HEAD 2>"$pe" |
+    strict wgit "$w" diff-index --no-color -p --binary --no-ext-diff --no-textconv --ignore-submodules=dirty HEAD 2>"$pe" |
       gzip -n 2>>"$pe" > "$dir/$s.patch.gz"
     [ -n "$(gzip -dc "$dir/$s.patch.gz" 2>/dev/null | head -c1)" ] || rm -f "$dir/$s.patch.gz"
-    wgit "$w" ls-files --others --exclude-standard -z 2>>"$pe" |
+    strict wgit "$w" ls-files --others --exclude-standard -z 2>>"$pe" |
       while IFS= read -r -d '' f; do
         [ -f "$w/$f" ] || continue
         local bn sz
@@ -541,7 +642,7 @@ snapshot_repo() { # <repo path> <label>
     fi
     rm -f "$list"
     say "$label: $w  HEAD=$(wgit "$w" rev-parse --short HEAD) branch=$(wgit "$w" rev-parse --abbrev-ref HEAD) uncommitted=$(wc -l <<<"$st")"
-  done <<<"$worktrees"
+  done
 }
 
 snapshot_repo "$NANOCLAW_DIR" nanoclaw
@@ -562,7 +663,7 @@ if [ ${#UNREADABLE[@]} -gt 0 ]; then
   say "checkouts git cannot open (not snapshotted): ${#UNREADABLE[@]}"
   printf '  %q\n' "${UNREADABLE[@]}" >> "$MAN"
 fi
-[ -s "$GIT_TIMEOUT_LOG" ] && FAILURES+=("$(wc -l < "$GIT_TIMEOUT_LOG") git command(s) hit the ${GIT_TIMEOUT}s limit, so the snapshot is incomplete: $(head -3 "$GIT_TIMEOUT_LOG" | tr '\n' ';')")
+[ -s "$GIT_FAIL_LOG" ] && FAILURES+=("$(wc -l < "$GIT_FAIL_LOG") git read(s) failed or hit the ${GIT_TIMEOUT}s limit, so the snapshot is incomplete: $(head -3 "$GIT_FAIL_LOG" | tr '\n' ';')")
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # ── phase 2: snapshot groups/'s pending tracked-file edits ──────────────────

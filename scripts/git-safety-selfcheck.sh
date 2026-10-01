@@ -1915,16 +1915,20 @@ CLONE_REMOTE="$FIX/remote-clone.git"
 git init --bare -q -b main "$CLONE_REMOTE"
 SEED="$FIX/seed"
 tgit init -q -b main "$SEED" && echo base > "$SEED/app.txt" && tgit -C "$SEED" add app.txt && tgit -C "$SEED" commit -qm base &&
-  tgit -C "$SEED" push -q "$CLONE_REMOTE" HEAD:refs/heads/main
+  echo second >> "$SEED/app.txt" && tgit -C "$SEED" commit -qam second && tgit -C "$SEED" push -q "$CLONE_REMOTE" HEAD:refs/heads/main
 CLONE="$TOPICS/wg/topic-a/worktrees/app"
 mkdir -p "$(dirname "$CLONE")"
-git clone -q "$CLONE_REMOTE" "$CLONE"
+git clone -q --depth 1 "file://$CLONE_REMOTE" "$CLONE"
 tgit -C "$CLONE" checkout -q -b feature
 echo unpushed >> "$CLONE/app.txt" && tgit -C "$CLONE" commit -qam "unpushed on topic clone"
 echo stashed >> "$CLONE/app.txt" && tgit -C "$CLONE" stash push -q -m "topic stash"
 echo edited >> "$CLONE/app.txt"
 echo new > "$CLONE/new-file.txt"
 UNPUSHED_SHA=$(git -C "$CLONE" rev-parse feature)
+STASH_SHA=$(git -C "$CLONE" rev-parse refs/stash)
+# A planted symref where a pin would go: writing a pin through it would move feature.
+mkdir -p "$CLONE/.git/refs/git-safety/stash"
+printf 'ref: refs/heads/feature\n' > "$CLONE/.git/refs/git-safety/stash/$STASH_SHA"
 
 STORE="$NCDIR/data/repositories/wg/store"
 mkdir -p "$(dirname "$STORE")"
@@ -1970,7 +1974,7 @@ if [ -n "$CLONE_BUNDLE" ]; then
     && ok "topic clone: its unpushed branch restores from the bundle" \
     || bad "topic clone: unpushed commit missing from the restored bundle" "$(ls "$CLONE_DIR")"
   git -C "$RESTORE" cat-file -e "$(git -C "$CLONE" rev-parse refs/stash)" 2>/dev/null \
-    && ok "topic clone: its stash restores from the bundle" \
+    && ok "topic clone (shallow): its stash restores from the bundle" \
     || bad "topic clone: stash commit missing from the restored bundle" ""
   git -C "$RESTORE" checkout -q "$UNPUSHED_SHA" 2>/dev/null
   if gzip -dc "$CLONE_DIR"/*.patch.gz | git -C "$RESTORE" apply --binary 2>/dev/null &&
@@ -1984,6 +1988,9 @@ else
   bad "topic clone: no topic-* bundle holds its unpushed commit" "$(ls -R "$SNAP" 2>/dev/null | head -30)"
 fi
 
+[ "$(git -C "$CLONE" rev-parse feature)" = "$UNPUSHED_SHA" ] && [ -z "$(git -C "$STORE" for-each-ref refs/git-safety)" ] \
+  && ok "topic repos are never written to: no pins, and a planted symref moves nothing" \
+  || bad "the run wrote into a topic repo" "$(git -C "$CLONE" for-each-ref; git -C "$STORE" for-each-ref refs/git-safety)"
 STORE_BUNDLES=$(grep -l "$(git -C "$STORE" rev-parse topic-b)" "$SNAP"/*/unpushed-commits.bundle 2>/dev/null | wc -l)
 [ "$STORE_BUNDLES" -eq 1 ] && ok "a store repo shared by two topic worktrees, and named twice in extras, is bundled exactly once" \
   || bad "store repo bundled $STORE_BUNDLES times (want 1)" "$(ls "$SNAP")"
@@ -2061,11 +2068,24 @@ git -C "$LAZY" config extensions.partialclone evil
 git -C "$LAZY" config core.sshCommand "$FIX/evil-log.sh"
 echo two >> "$LAZY/f.txt"
 : > "$PWN"; git -C "$LAZY" diff-index -p HEAD >/dev/null 2>&1; [ -s "$PWN" ] && PROBES+="lazy-fetch"
+# An admin dir whose name ends in LF would read back as its LF-less sibling.
+ADM="$NCDIR/data/admins"
+mkdir -p "$ADM"
+tgit init -q "$FIX/lf-src" && echo lf > "$FIX/lf-src/f.txt" && tgit -C "$FIX/lf-src" add f.txt && tgit -C "$FIX/lf-src" commit -qm base
+mv "$FIX/lf-src/.git" "$ADM/g"$'\n'
+tgit init -q "$FIX/lf-sibling" && mv "$FIX/lf-sibling/.git" "$ADM/g"
+LFT="$TOPICS/wg/topic-lf/worktrees/app"
+mkdir -p "$LFT" && cp "$FIX/lf-src/f.txt" "$LFT/" && ln -s "$ADM/g"$'\n' "$LFT/.git" && echo edit >> "$LFT/f.txt"
 if [ "$PROBES" = "filter fsmonitor hook lazy-fetch" ]; then
   : > "$PWN"; stat_dirty
   run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPICS/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry
   [ ! -s "$PWN" ] && ok "a topic repo's fsmonitor, filter driver, reference-transaction hook and promisor transport never run on the host" \
     || bad "container-set git config ran a program on the host" "$(cat "$PWN")"
+  case "$(cat "$(latest_snapshot)MANIFEST.txt")" in
+    *"$LFT  HEAD="*) bad "a checkout whose repository path ends in LF was captured" "" ;;
+    *"  $LFT"*) ok "a checkout whose repository path ends in LF is listed as unreadable" ;;
+    *) bad "a checkout whose repository path ends in LF was neither captured nor listed" "$(cat "$(latest_snapshot)MANIFEST.txt")" ;;
+  esac
   case "$OUT" in
     *"read of $LAZY"*) ok "a blob that would need a lazy fetch fails that checkout's diff loudly" ;;
     *) bad "a missing promisor blob did not surface as a failure" "$OUT" ;;
@@ -2086,14 +2106,20 @@ mkdir -p "$(dirname "$STUCK")"
 tgit init -q "$STUCK" && echo one > "$STUCK/f.txt" && tgit -C "$STUCK" add f.txt && tgit -C "$STUCK" commit -qm base
 echo two >> "$STUCK/f.txt" && git -C "$STUCK" add f.txt
 mkfifo "$FIX/attrs-fifo" && git -C "$STUCK" config core.attributesFile "$FIX/attrs-fifo"
+BADLOG="$TOPICS/wg/topic-w/worktrees/app"
+mkdir -p "$(dirname "$BADLOG")"
+tgit init -q "$BADLOG" && echo one > "$BADLOG/f.txt" && tgit -C "$BADLOG" add f.txt && tgit -C "$BADLOG" commit -qm base
+echo two >> "$BADLOG/f.txt" && tgit -C "$BADLOG" stash push -q -m s && git -C "$BADLOG" config log.date INVALID
 START=$(date +%s)
 run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPICS/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry GIT_SAFETY_GIT_TIMEOUT=2
 ELAPSED=$(( $(date +%s) - START ))
-if [ "$RC" -ne 0 ] && [[ "$OUT" == *"hit the 2s limit, so the snapshot is incomplete"* ]] && [ "$ELAPSED" -lt 120 ]; then
+if [ "$RC" -ne 0 ] && [[ "$OUT" == *"failed or hit the 2s limit, so the snapshot is incomplete"* ]] && [ "$ELAPSED" -lt 120 ]; then
   ok "a git read stuck on a FIFO times out and fails the run (${ELAPSED}s)"
 else
   bad "a stuck git read did not fail the run within the timeout (rc=$RC, ${ELAPSED}s)" "$OUT"
 fi
+[[ "$OUT" == *"$BADLOG stash list"* ]] && ok "a stash listing that fails is a run failure, not an empty stash" \
+  || bad "a failed stash listing passed for an empty one" "$OUT"
 
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
 exit "$FAILED"
