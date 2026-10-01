@@ -39,8 +39,8 @@ function repoWithFilter(name: string): { repo: string; sentinel: string } {
 }
 
 describe('safeGitArgs filter neutralization', () => {
-  for (const name of ['plain', 'a=b', 'a=b=c', '=', 'dot.ted']) {
-    it(`neutralizes a repository filter named ${JSON.stringify(name)}`, () => {
+  for (const [index, name] of ['plain', 'a=b', 'a=b=c', '=', 'dot.ted'].entries()) {
+    it(`neutralizes repository filter fixture ${index + 1}`, () => {
       const { repo, sentinel } = repoWithFilter(name);
       const gitDir = path.join(repo, '.git');
       expect(safeGitFilterNames(gitDir, repo)).toEqual([name]);
@@ -57,6 +57,27 @@ describe('safeGitArgs filter neutralization', () => {
       expect(fs.existsSync(sentinel)).toBe(true);
     });
   }
+
+  it('refuses a filter name it cannot carry verbatim', () => {
+    const { repo, sentinel } = repoWithFilter('plain');
+    const gitDir = path.join(repo, '.git');
+    const config = repositoryConfigPath(gitDir);
+    const invalid = Buffer.from([0xff]);
+    fs.appendFileSync(
+      config,
+      Buffer.concat([Buffer.from('[filter "'), invalid, Buffer.from(`"]\n\tclean = touch ${sentinel}; cat\n`)]),
+    );
+    fs.writeFileSync(
+      path.join(gitDir, 'info', 'attributes'),
+      Buffer.concat([Buffer.from('* filter='), invalid, Buffer.from('\n')]),
+    );
+
+    git(repo, ['status', '--porcelain']);
+    expect(fs.existsSync(sentinel)).toBe(true);
+
+    expect(() => safeGitFilterNames(gitDir, repo)).toThrow(TypeError);
+    expect(() => safeGitArgs(['status'], config)).toThrow(TypeError);
+  });
 
   it('refuses to run when the override values are missing from the environment', () => {
     const { repo } = repoWithFilter('a=b');

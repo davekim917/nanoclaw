@@ -1248,11 +1248,24 @@ describe('branch clone checkouts', () => {
     fs.writeFileSync(path.join(filtered.checkout, '.git', 'info', 'attributes'), '* filter=evil\n');
     fs.utimesSync(path.join(filtered.checkout, 'README.md'), OLD, OLD);
 
-    // `-c` splits at the first `=`, so only a key-verbatim override reaches a filter named with one.
+    // Filter names are the clone's choice; every legal one must be neutralized.
     const equalsNamed = cloneCheckout(canon, 'exec-filter-equals', 'repo-a@feat', 'feat');
     git(equalsNamed.checkout, ['config', 'filter.a=b.clean', script('filter-equals')]);
     fs.writeFileSync(path.join(equalsNamed.checkout, '.git', 'info', 'attributes'), '* filter=a=b\n');
     fs.utimesSync(path.join(equalsNamed.checkout, 'README.md'), OLD, OLD);
+
+    // A name discovery cannot carry verbatim is refused, never missed.
+    const nonUtf8 = cloneCheckout(canon, 'exec-filter-non-utf8', 'repo-a@feat', 'feat');
+    const invalid = Buffer.from([0xff]);
+    fs.appendFileSync(
+      path.join(nonUtf8.checkout, '.git', 'config'),
+      Buffer.concat([Buffer.from('[filter "'), invalid, Buffer.from(`"]\n\tclean = ${script('filter-non-utf8')}\n`)]),
+    );
+    fs.writeFileSync(
+      path.join(nonUtf8.checkout, '.git', 'info', 'attributes'),
+      Buffer.concat([Buffer.from('* filter='), invalid, Buffer.from('\n')]),
+    );
+    fs.utimesSync(path.join(nonUtf8.checkout, 'README.md'), OLD, OLD);
 
     // log.showSignature makes `git log` run gpg.program on a signed commit.
     const signed = cloneCheckout(canon, 'exec-gpg', 'repo-a@feat', 'feat');
@@ -1281,7 +1294,7 @@ describe('branch clone checkouts', () => {
     git(embedding.checkout, ['commit', '-q', '-m', 'embed']);
     fs.utimesSync(path.join(nested, 'inner.txt'), OLD, OLD);
 
-    const verdicts = [filtered, equalsNamed, signed, embedding].map((fixture) =>
+    const verdicts = [filtered, equalsNamed, nonUtf8, signed, embedding].map((fixture) =>
       disposability.proveCheckoutDisposable({ path: fixture.checkout, shape: 'clone' }),
     );
 
@@ -1289,6 +1302,7 @@ describe('branch clone checkouts', () => {
     expect(verdicts.map((verdict) => verdict.reason)).toEqual([
       'clean-and-pushed',
       'clean-and-pushed',
+      'status-unprovable',
       'unpushed',
       'submodule',
     ]);

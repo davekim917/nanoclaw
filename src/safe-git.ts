@@ -46,7 +46,7 @@ export function safeGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   };
 }
 
-/** Command-line config outranks repository-local config. Filters use `--config-env`: `-c` splits at the first `=`, and a filter name may contain one. */
+/** Command-line config outranks repository-local config. Filters use `--config-env`, which takes the key verbatim. */
 export function safeGitArgs(
   args: readonly string[],
   localConfigPath?: string,
@@ -103,11 +103,11 @@ function localFilterNames(configPath: string): string[] {
 }
 
 function filterNamesFrom(args: string[]): string[] {
-  let output: string;
+  let output: Buffer;
   try {
+    // Every name must be found, in whatever bytes the repository wrote it.
     output = execFileSync('git', args, {
-      encoding: 'utf8',
-      env: safeGitEnv(),
+      env: safeGitEnv({ LANG: 'C', LC_ALL: 'C' }),
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
     });
@@ -116,8 +116,9 @@ function filterNamesFrom(args: string[]): string[] {
     if (status === 1) return [];
     throw error;
   }
+  const utf8 = new TextDecoder('utf-8', { fatal: true });
   const names = new Set<string>();
-  for (const key of output.split('\n')) {
+  for (const key of utf8.decode(output).split('\n')) {
     const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/.exec(key.trim());
     if (match) names.add(match[1]);
   }
