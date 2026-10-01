@@ -267,6 +267,7 @@ describe('install-aware inputs', () => {
       'slack-private',
       'Private Room',
     );
+    db.prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, ?)').run('mg-native1', 'native-private-cli', 'cli', 'Native private cli');
     db.close();
     const values = loadRegistryIdentifiers(dbPath);
     expect(values.has('Private House')).toBe(true);
@@ -276,6 +277,8 @@ describe('install-aware inputs', () => {
     // system:* senders are script-authored constants living in tracked code —
     // never install-private identifiers (see loadRegistryIdentifiers comment).
     expect(values.has('system:health-sentinel')).toBe(false);
+    expect(values.has('cli')).toBe(false);
+    expect(values.has('native-private-cli')).toBe(true);
     expect(() => loadRegistryIdentifiers(path.join(root, 'missing.db'))).toThrow('missing');
   });
 });
