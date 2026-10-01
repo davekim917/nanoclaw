@@ -719,7 +719,9 @@ export function installMessageThreadAutoCreate(
         } catch {
           // Unreadable parent: the thread-create call below decides whether the id is usable.
         }
-        await rest.post(Routes.threads(channelId, messageId), { body: { name } });
+        await rest.post(Routes.threads(channelId, messageId), {
+          body: { name, auto_archive_duration: ThreadAutoArchiveDuration.OneDay },
+        });
         log.info('Discord thread opened under anchor message', { channelId, messageId });
         // Best-effort; the retried post does not wait on it.
         void addThreadMembers(rest, messageId);

@@ -598,6 +598,8 @@ describe('buildSessionServicesSnapshot', () => {
         'GITHUB_TOKEN',
         'RENDER_API_KEY',
         'RENDER_WORKSPACE_ID',
+        'CLOUDFLARE_API_TOKEN',
+        'CLOUDFLARE_ACCOUNT_ID',
         'DBT_CLOUD_API_TOKEN',
         'DBT_CLOUD_API_URL',
         'DBT_CLOUD_ACCOUNT_ID',
@@ -840,6 +842,19 @@ describe('buildSessionServicesSnapshot', () => {
         // line is the CLI half only — and that half carries its imperative.
         expect(use('Wix')).toContain('never run `wix login`');
         expect(use('Wix')).not.toContain('wixapis.com');
+      });
+
+      it('cloudflare+wix shape with a cf token: the CLI entry is a separate, resolvable name', async () => {
+        const ag = await cloudflareWixShaped();
+        const tokenEnv = `CLOUDFLARE_API_TOKEN_${ag.folder.toUpperCase().replace(/-/g, '_')}`;
+        vi.stubEnv(tokenEnv, 'placeholder_for_onecli_proxy');
+        const services = (await buildSessionServicesSnapshot(ag.id)).services;
+
+        expect(services.filter((s) => s.name === 'Cloudflare')).toHaveLength(1);
+        const cli = services.find((s) => s.name === 'Cloudflare CLI');
+        expect(cli?.activation).toContain('cf cli search');
+        expect(cli?.activation).toContain(tokenEnv);
+        expect(cli?.activation).toContain('Never run `cf auth login`');
       });
 
       it('the Wix REST imperative rides the REST half of the line', async () => {

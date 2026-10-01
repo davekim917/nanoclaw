@@ -219,6 +219,8 @@ const SCOPED_ENV_NAMES = [
   'SUPABASE_PROJECT_REF',
   'SUPABASE_ACCESS_TOKEN',
   'SUPABASE_DB_PASSWORD',
+  'CLOUDFLARE_API_TOKEN',
+  'CLOUDFLARE_ACCOUNT_ID',
   'LOOKER_BASE_URL',
   'LOOKER_CLIENT_ID',
   'LOOKER_CLIENT_SECRET',
@@ -546,6 +548,26 @@ export function buildSessionServicesSnapshotFrom(
     }
   }
 
+  {
+    const token = resolveScopedEnvVar('CLOUDFLARE_API_TOKEN', folder);
+    if (token.set || declared(['cloudflare'])) {
+      const account = resolveScopedEnvVar('CLOUDFLARE_ACCOUNT_ID', folder);
+      services.push({
+        name: 'Cloudflare CLI',
+        cli: 'cf',
+        declaredTools: declaredMatchingTools(['cloudflare']),
+        scopes: [],
+        credentialPaths: [],
+        summary: token.set
+          ? 'Cloudflare CLI (cf): Workers, Pages, DNS, R2, D1, KV, zones, the whole Cloudflare API'
+          : 'Cloudflare declared but CLOUDFLARE_API_TOKEN is unset on the host — ask the operator',
+        activation: token.set
+          ? `\`cf\` CLI authenticated through the OneCLI gateway (placeholder \`CLOUDFLARE_API_TOKEN\` from host env \`${token.name}\`${account.set ? `, account via \`${account.name}\`` : ''}). Find a command with \`cf cli search "<task>"\`, then \`<command> --help\`; \`--dry-run\` previews any request. Never run \`cf auth login\`, and DO NOT ask the user for a token.`
+          : `cloudflare tool declared but CLOUDFLARE_API_TOKEN not set at host — ask Operator.`,
+      });
+    }
+  }
+
   // Derived MCP entries are spliced in here, not appended: both capability budgets evict from the end, and the
   // fleet universals must not land in the eviction zone.
   const derivedMcpIndex = services.length;
@@ -730,7 +752,7 @@ export function buildSessionServicesSnapshotFrom(
       summary:
         'Cloudflare account APIs (DNS, Workers, Pages, R2) via docs → search → execute. Never verify with /user/tokens/verify, and send no Authorization header of your own',
       useFor:
-        'Official Cloudflare API MCP at https://mcp.cloudflare.com/mcp — auth pre-injected as `Authorization: Bearer`; do NOT ask for or send the token. Use `mcp__cloudflare-api__docs` for Cloudflare product documentation, `mcp__cloudflare-api__search` to locate the correct OpenAPI endpoint, then `mcp__cloudflare-api__execute` to call it. The server pre-selects the account from the token and exposes its `accountId` to execute code. Covers Cloudflare account APIs such as DNS, Workers, Pages, and R2 API endpoints, subject to the token’s granted permissions. Diagnosing Cloudflare auth failures — `mcp.cloudflare.com` and `api.cloudflare.com` are separately credentialed, so name the one that is actually broken instead of reporting "no Cloudflare access". `1000: Invalid API Token` does NOT by itself mean the token is bad — this install uses an ACCOUNT-scoped API token, and account tokens legitimately return `1000` on USER-scoped endpoints like `/user/tokens/verify`. Probe with an account-scoped call (`GET /accounts`) before concluding anything; a real `1000` there means the stored token is stale or rotated, and retrying cannot fix it. Never verify with `/user/tokens/verify` — it has produced a false "credential is dead" diagnosis twice. `1001 Missing "Authorization" header` from `api.cloudflare.com` means the opposite: nothing was injected on that host, because direct API access is wired separately (its own host-scoped OneCLI secret, or the OneCLI Cloudflare app connection) and may not be set up here. Distinguish them before concluding — `onecli apps get --provider cloudflare` shows whether the app connection exists (`connection: null` = not connected). Never add your own `Authorization` header to test any of this: on a host the gateway does not cover, your header is passed through and Cloudflare rejects its FORMAT (`6003`/`6111`), which reads like a token problem and has already caused a wrong diagnosis once. Send no header and read the error. Note `wrangler` is NOT installed in this container — deploys go through the REST API (Workers script upload, Pages Direct Upload), which is also the route that gets gateway injection. The separate S3-compatible access-key/secret pair is not exposed through this MCP; do not attempt AWS SDK/CLI access or claim direct S3 access unless a signing-capable S3 client is separately wired.',
+        'Official Cloudflare API MCP at https://mcp.cloudflare.com/mcp — auth pre-injected as `Authorization: Bearer`; do NOT ask for or send the token. Use `mcp__cloudflare-api__docs` for Cloudflare product documentation, `mcp__cloudflare-api__search` to locate the correct OpenAPI endpoint, then `mcp__cloudflare-api__execute` to call it. The server pre-selects the account from the token and exposes its `accountId` to execute code. Covers Cloudflare account APIs such as DNS, Workers, Pages, and R2 API endpoints, subject to the token’s granted permissions. Diagnosing Cloudflare auth failures — `mcp.cloudflare.com` and `api.cloudflare.com` are separately credentialed, so name the one that is actually broken instead of reporting "no Cloudflare access". `1000: Invalid API Token` does NOT by itself mean the token is bad — this install uses an ACCOUNT-scoped API token, and account tokens legitimately return `1000` on USER-scoped endpoints like `/user/tokens/verify`. Probe with an account-scoped call (`GET /accounts`) before concluding anything; a real `1000` there means the stored token is stale or rotated, and retrying cannot fix it. Never verify with `/user/tokens/verify` — it has produced a false "credential is dead" diagnosis twice. `1001 Missing "Authorization" header` from `api.cloudflare.com` means the opposite: nothing was injected on that host, because direct API access is wired separately (its own host-scoped OneCLI secret, or the OneCLI Cloudflare app connection) and may not be set up here. Distinguish them before concluding — `onecli apps get --provider cloudflare` shows whether the app connection exists (`connection: null` = not connected). Never add your own `Authorization` header to test any of this: on a host the gateway does not cover, your header is passed through and Cloudflare rejects its FORMAT (`6003`/`6111`), which reads like a token problem and has already caused a wrong diagnosis once. Send no header and read the error. Note `wrangler` is NOT installed in this container. Where a `Cloudflare CLI` entry is listed, `cf` covers deploys and every REST endpoint; otherwise deploys go through the REST API (Workers script upload, Pages Direct Upload), which is also the route that gets gateway injection. The separate S3-compatible access-key/secret pair is not exposed through this MCP; do not attempt AWS SDK/CLI access or claim direct S3 access unless a signing-capable S3 client is separately wired.',
     });
   }
 

@@ -41,6 +41,54 @@ describe('latest-stable release policy', () => {
     });
   });
 
+  it('takes a prerelease npm latest tag only for a source that opts in', () => {
+    const metadata = { 'dist-tags': { latest: '1.0.0-beta.7' } };
+    expect(latestStableNpmVersion(metadata)).toMatchObject({ status: 'blocked' });
+    expect(latestStableNpmVersion(metadata, { allowPrerelease: true })).toEqual({
+      status: 'resolved',
+      version: '1.0.0-beta.7',
+    });
+    expect(latestStableNpmVersion({ 'dist-tags': { latest: 'v2.4.1' } }, { allowPrerelease: true })).toEqual({
+      status: 'resolved',
+      version: '2.4.1',
+    });
+  });
+
+  it.each([
+    ['1.0.0-beta.6', '1.0.0-beta.7', 'outdated'],
+    ['1.0.0-beta.9', '1.0.0-beta.10', 'outdated'],
+    ['1.0.0-alpha.1', '1.0.0-beta', 'outdated'],
+    ['1.0.0-beta.9', '1.0.0', 'outdated'],
+    ['1.0.0-beta.6', '1.0.0-beta.6', 'current'],
+    ['1.0.0-beta.7', '1.0.0-beta.6', 'current'],
+    ['1.0.0-1', '1.0.0-alpha', 'outdated'],
+    ['1.0.0-beta', '1.0.0-beta.1', 'outdated'],
+  ])('orders an opted-in prerelease pin %s against latest %s as %s', async (current, latest, status) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'container-updates-'));
+    for (const dir of ['container/agent-runner', 'container/remotion']) {
+      await mkdir(path.join(root, dir), { recursive: true });
+      await writeFile(path.join(root, dir, 'package.json'), '{}\n');
+    }
+    await writeFile(path.join(root, 'package.json'), '{}\n');
+    await writeFile(path.join(root, 'container', 'Dockerfile'), `ARG TOOL_VERSION=${current}\n`);
+    await writeFile(
+      path.join(root, 'container', 'update-sources.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        dockerfile: [
+          {
+            id: 'tool',
+            name: 'tool',
+            arg: 'TOOL_VERSION',
+            source: { kind: 'npm', package: 'tool', allowPrerelease: true },
+          },
+        ],
+      }),
+    );
+    const items = await auditRepository(root, async () => ({ 'dist-tags': { latest } }));
+    expect(items.find((item) => item.id === 'docker:tool')).toMatchObject({ current, latest, status });
+  });
+
   it('selects the highest non-yanked stable PyPI release with compatible files', () => {
     expect(
       latestStablePyPiVersion({

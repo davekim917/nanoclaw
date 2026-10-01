@@ -29,8 +29,6 @@
 #                                             # post a substitute review's receipt for exactly that head — --reviewer
 #                                             # must start with a frontier model id (see REVIEWER_DENIED_TIERS)
 #   codex-review.sh checkpoint --head <sha> --decision converging|churning --assessor "<model + runtime>" --assessment "<one line>"
-#   codex-review.sh cut-down                  # does the current head need a cut-down receipt, and has one: 0 yes/no need, 24 missing
-#   codex-review.sh cut-down-receipt --head <sha> --reviewed <sha> --reviewer "<model> cut-down-reviewer (<runtime>)" --body-file <file>
 #
 # Exit codes, one contract across commands (0 and 3 are the originals):
 #   0   pass; verdict printed; merge allowed. For merge-check, only `merge=allowed`
@@ -50,9 +48,8 @@
 #       or a substitute receipt on the PR
 #       asked for changes and it neither adds docs/review-notes/<this PR>.md nor
 #       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`), or
-#       it grows comment lines or adds a prohibited comment form (`comment_rule`;
-#       on unless the base's .github/pr-review-loop.json sets "commentRule": false),
-#       or it is over CUT_DOWN_THRESHOLD with no cut-down receipt (`cut_down_missing`)
+#       it adds a prohibited comment form (`comment_rule`; on unless the base's
+#       .github/pr-review-loop.json sets "commentRule": false)
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
@@ -61,7 +58,7 @@
 #       (admin_readiness); only `admin=ready` licenses `gh pr merge --admin`. A legacy
 #       head still gets 24 first when a check GitHub marks required for the PR is red on it
 #       (`required_red`) or the newest independent-review-receipt:v1 for it is not
-#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule` or `cut_down_missing`
+#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck — or on `comment_rule`
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
 #   28  audit: merge-check would have refused this PR at its merge, or it merged by a
 #       method the gate does not authorize (rebase or manual) — a gate bypass
@@ -460,16 +457,16 @@ payload_json() {
 author_standing() {
   local logins login permission standing='{}'
   logins=$(printf '%s\n' "$1" | jq -rs --arg sub "$RECEIPT_MARKER_RE" --arg ind "$INDEPENDENT_RECEIPT_MARKER_RE" \
-    --arg chk "$CHECKPOINT_MARKER_RE" --arg cut "$CUT_DOWN_MARKER_RE" --arg asof "$GATE_AS_OF" '
+    --arg chk "$CHECKPOINT_MARKER_RE" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | select(((.body // "") | test($sub) or test($ind) or test($chk) or test($cut))
+      | select(((.body // "") | test($sub) or test($ind) or test($chk))
                or ($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)))
       | .author.login | strings | select(. != "") ] | unique[]') || return 1
   while IFS= read -r login; do
     [ -n "$login" ] || continue
     permission=$(repo_permission "$login") || {
-      echo "could not read $login's permission on $REPO; a receipt, checkpoint or cut-down comment is never judged without it" >&2
+      echo "could not read $login's permission on $REPO; a receipt or checkpoint is never judged without it" >&2
       return 1
     }
     case "$permission" in
@@ -634,11 +631,6 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # in (replaces_state). A zero-width space or word joiner alone is no value.
 REPLACES_LINE_RE='(^|\n)Replaces:(?<value>[^\n]*)'
 REVIEW_LOOP_CONFIG='.github/pr-review-loop.json'
-# The base's REVIEW_LOOP_CONFIG may replace CUT_DOWN_THRESHOLD with its own
-# "cutDownThreshold", a whole number, or false to switch the rule off.
-CUT_DOWN_THRESHOLD=150
-CUT_DOWN_AGENT='cut-down-reviewer'
-CUT_DOWN_MARKER_RE='(^|\n)<!-- pr-review-loop:cut-down-receipt head=(?<head>[0-9a-f]{40}) reviewed=(?<reviewed>[0-9a-f]{40}) lines-reviewed=(?<before>[0-9]+|unknown) lines-now=(?<after>[0-9]+|unknown) -->'
 # The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
 # a PR any substitute receipt asked for changes on adds a current-PR fragment
 # under REVIEW_NOTES_DIR, or its body carries this line, read the way the Fixes-PR
@@ -741,8 +733,7 @@ comment_rule_checker() {
   return 1
 }
 
-# The checker's report on $2 against its merge base with $1, extra arguments passed through,
-# and its exit status. Two shallow commits share no merge base, so it reads $2's tree on that base.
+# The checker's report on $2 against its merge base with $1, and its exit status. Two shallow commits share no merge base, so it reads $2's tree on that base.
 comment_rule_run() {
   local checker merge_base head
   checker=$(comment_rule_checker) || {
@@ -771,11 +762,11 @@ comment_rule_run() {
     echo "could not fetch $2 and its merge base $merge_base from $REPO"
     return 2
   }
-  node "$checker" check --repo "$dir" --base "$merge_base" --head "$head" "${@:3}"
+  node "$checker" check --repo "$dir" --base "$merge_base" --head "$head"
 }
 
-# Refuses (24) a head whose change grows comment lines or adds a prohibited
-# comment form, unless the base's REVIEW_LOOP_CONFIG sets "commentRule": false.
+# Refuses (24) a head whose change adds a prohibited comment form, unless the
+# base's REVIEW_LOOP_CONFIG sets "commentRule": false.
 # A checker that is missing or cannot judge the change is no verdict (1).
 comment_rule_gate() {
   local enabled report status=0
@@ -797,7 +788,7 @@ comment_rule_gate() {
     0) ;;
     1)
       printf '%s\n' "$report" >&2
-      echo "merge=refused head=$SCOPE_HEAD: comment_rule: this change adds comment lines on net or a prohibited comment form (report above); cut them and push a new head" >&2
+      echo "merge=refused head=$SCOPE_HEAD: comment_rule: this change adds a prohibited comment form, a file:line citation or PR/issue/ticket history (report above); remove it and push a new head" >&2
       exit 24
       ;;
     *)
@@ -808,90 +799,8 @@ comment_rule_gate() {
   esac
 }
 
-cut_down_lines() {
-  gh api "repos/$REPO/compare/$1...$2?per_page=1" \
-    | jq_here -r --argjson comments "${3:-null}" 'include "cut-down"; cut_down_lines($comments)'
-}
-
-# Null when the base turns the comment rule off: nothing else would judge comment lines then.
-cut_down_comment_lines() {
-  local report status=0 classified
-  [ "$(review_loop_flag commentRule true)" = true ] || { echo null; return 0; }
-  report=$(comment_rule_run "$1" "$2" --json 2>/dev/null) || status=$?
-  [ "$status" -le 1 ] || { echo null; return 0; }
-  classified=$(printf '%s' "$report" | jq -c '
-    if (.files | type) == "array" and all(.files[]; (.added_lines | type) == "number"
-      and (.added_comment_lines | type) == "number" and 0 <= .added_comment_lines and .added_comment_lines <= .added_lines)
-    then .files | map({ key: .path, value: { added: .added_lines, comments: .added_comment_lines } }) | from_entries
-    else null end' 2>/dev/null) || classified=null
-  echo "${classified:-null}"
-}
-
-cut_down_reviewer_named() {
-  [[ "$1" =~ (^|[^[:alnum:]_-])${CUT_DOWN_AGENT}($|[^[:alnum:]_-]) ]]
-}
-
-# `ok\t<why>` or `missing\t<why>` for SCOPE_HEAD; non-zero when it cannot tell.
-cut_down_state() {
-  local threshold lines comments counted='lines outside tests' note='' pages receipts head login reviewer others
-  threshold=$(review_loop_value cutDownThreshold "$CUT_DOWN_THRESHOLD" \
-    'if . == false then "off" elif type == "number" and . >= 0 and floor == . then [., 1000000000] | min else error("not a whole number or false") end') || return 1
-  if [ "$threshold" = off ]; then
-    printf 'ok\t%s on %s sets "cutDownThreshold": false\n' "$REVIEW_LOOP_CONFIG" "$SCOPE_BASE_REF"
-    return 0
-  fi
-  lines=$(cut_down_lines "$SCOPE_BASE" "$SCOPE_HEAD") || return 1
-  if [ "$lines" != unknown ] && [ "$lines" -gt "$threshold" ]; then
-    comments=$(cut_down_comment_lines "$SCOPE_BASE" "$SCOPE_HEAD")
-    if [ "$comments" = null ]; then
-      note=' Comment-only lines count too: the comment-rule checker classified none (it is off, missing, older than 1.1.0 or failed).'
-    else
-      lines=$(cut_down_lines "$SCOPE_BASE" "$SCOPE_HEAD" "$comments") || return 1
-      counted='lines outside tests that are not only comment'
-    fi
-  fi
-  if [ "$lines" != unknown ] && [ "$lines" -le "$threshold" ]; then
-    printf 'ok\t%s added %s, within the threshold of %s\n' "$lines" "$counted" "$threshold"
-    return 0
-  fi
-  pages=$(paginate_connection comments receipt_comments_page) || return 1
-  pages=$(author_standing "$pages") || return 1
-  receipts=$(printf '%s\n' "$pages" | jq -rs --arg re "$CUT_DOWN_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" '
-    .[] | .data.repository.pullRequest.comments.nodes[]
-    | select(.standing == "yes")
-    | .author.login as $login
-    | (.body // "") as $body
-    | [ $body | capture($re) ] | first // empty
-    | [ .head, $login, ([ $body | capture($reviewerRe) ] | first | .reviewer // "") ] | @tsv') || return 1
-  others=""
-  while IFS=$'\t' read -r head login reviewer; do
-    [ -n "$head" ] || continue
-    if ! reviewer_model_allowed "$reviewer" || ! cut_down_reviewer_named "$reviewer"; then continue; fi
-    if [ "$head" = "$SCOPE_HEAD" ]; then
-      printf 'ok\ta cut-down receipt names this head (%s)\n' "$reviewer"
-      return 0
-    fi
-    others="$head"
-  done <<< "$receipts"
-  printf 'missing\tthis change adds %s %s, over the threshold of %s, and no cut-down receipt from %s names this head%s. Run the %s agent on the change (SKILL.md, "Cut-down pass"); it posts the receipt with `codex-review.sh cut-down-receipt`.%s\n' \
-    "$lines" "$counted" "$threshold" "$CUT_DOWN_AGENT" "${others:+ (the latest names ${others:0:12}: review only what changed since)}" "$CUT_DOWN_AGENT" "$note"
-}
-
-cut_down_gate() {
-  local state
-  [ -n "$SCOPE_BASE" ] || return 0
-  state=$(cut_down_state) || {
-    echo "merge=error head=$SCOPE_HEAD: the cut-down check gave no verdict; could not read $REVIEW_LOOP_CONFIG at $SCOPE_BASE as an object whose cutDownThreshold is a whole number or false, this head's changed lines, or the PR's comments" >&2
-    exit 1
-  }
-  [[ "$state" == missing$'\t'* ]] || return 0
-  echo "merge=refused head=$SCOPE_HEAD: cut_down_missing: ${state#*$'\t'}" >&2
-  exit 24
-}
-
 final_gates() {
   comment_rule_gate
-  cut_down_gate
   refuse_if_base_moved
 }
 
@@ -2552,7 +2461,7 @@ ci_wait_main() {
   done
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|checkpoint|request|claim|merge-check|merge|audit|receipt|cut-down|cut-down-receipt}" in
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|checkpoint|request|claim|merge-check|merge|audit|receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -3235,62 +3144,6 @@ $assessment
         exit 28
         ;;
     esac
-    ;;
-  cut-down)
-    scope_eval || exit 1
-    [ -n "$SCOPE_BASE" ] || { echo "cut-down: could not resolve base branch $SCOPE_BASE_REF to a commit" >&2; exit 1; }
-    state=$(cut_down_state) || { echo "cut-down: no verdict for $SCOPE_HEAD" >&2; exit 1; }
-    echo "cut_down=${state%%$'\t'*} head=$SCOPE_HEAD: ${state#*$'\t'}"
-    [ "${state%%$'\t'*}" = ok ] || exit 24
-    ;;
-  cut-down-receipt)
-    shift
-    head="" reviewed="" reviewer="" body_file=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --head|--reviewed|--reviewer|--body-file)
-          [ $# -ge 2 ] || { echo "cut-down-receipt: $1 needs a value" >&2; exit 2; }
-          case "$1" in
-            --head) head="$2" ;;
-            --reviewed) reviewed="$2" ;;
-            --reviewer) reviewer="$2" ;;
-            *) body_file="$2" ;;
-          esac
-          shift 2 ;;
-        *) echo "cut-down-receipt: unknown argument $1" >&2; exit 2 ;;
-      esac
-    done
-    if ! [[ "$head" =~ ^[0-9a-f]{40}$ && "$reviewed" =~ ^[0-9a-f]{40}$ ]]; then
-      echo "cut-down-receipt: --head (the PR head now) and --reviewed (the head the pass read) must be full 40-character SHAs" >&2
-      exit 2
-    fi
-    if [ -z "$reviewer" ] || [ -z "$body_file" ] || [ ! -s "$body_file" ]; then
-      echo "cut-down-receipt: needs --reviewer and a non-empty --body-file (every cut, and whether it was applied or answered)" >&2
-      exit 2
-    fi
-    body=$(cat "$body_file")
-    refusal=$(receipt_input_refusal "$reviewer" "$body")
-    if [ -z "$refusal" ] && ! cut_down_reviewer_named "$reviewer"; then
-      refusal="--reviewer must name the $CUT_DOWN_AGENT agent that ran the pass, after its model id; the PR's author does not post this receipt"
-    fi
-    [ -z "$refusal" ] || { echo "cut-down-receipt: $refusal" >&2; exit 2; }
-    base=$(gh pr view "$PR" --repo "$REPO" --json baseRefName | jq -er .baseRefName) || exit 1
-    SCOPE_BASE=$(base_tip "$base") || { echo "cut-down-receipt: could not resolve $base to a commit" >&2; exit 1; }
-    before=$(cut_down_lines "$SCOPE_BASE" "$reviewed" "$(cut_down_comment_lines "$SCOPE_BASE" "$reviewed")") || { echo "cut-down-receipt: could not count the lines $reviewed adds" >&2; exit 1; }
-    after=$(cut_down_lines "$SCOPE_BASE" "$head" "$(cut_down_comment_lines "$SCOPE_BASE" "$head")") || { echo "cut-down-receipt: could not count the lines $head adds" >&2; exit 1; }
-    cut=unknown
-    if [ "$before" != unknown ] && [ "$after" != unknown ]; then cut=$((before - after)); fi
-    url=$(gh pr comment "$PR" --repo "$REPO" --body "### Cut-down review receipt
-
-- **Head:** \`$head\`
-- **Reviewed head:** \`$reviewed\`
-- **Reviewer and runtime:** $reviewer
-- **Added lines outside tests, less comment-only lines:** $before when reviewed, $after now; cut $cut
-
-$body
-
-<!-- pr-review-loop:cut-down-receipt head=$head reviewed=$reviewed lines-reviewed=$before lines-now=$after -->")
-    echo "cut-down-receipt: head=$head cut=$cut $url"
     ;;
   receipt)
     # A substitute review's durable receipt (docs/review-policy.md, "Review

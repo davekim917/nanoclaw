@@ -11,7 +11,6 @@ import { createHash } from 'node:crypto';
 import {
   commentFindings,
   commentGrowth,
-  commentGrowthFindings,
   exemptFiles,
   growthBase,
   hygieneFindings,
@@ -331,43 +330,35 @@ describe('comment growth', () => {
     return {
       net: growth.files.reduce((sum, file) => sum + file.head - file.base, 0),
       files: growth.files.map((file) => file.file),
-      findings: summary(commentGrowthFindings(growth)),
     };
   };
 
   const code = 'export const a = 1;\n';
 
-  it('fails a change that adds comment-only lines to a changed file', () => {
+  it('measures the comment-only lines a change adds to a changed file', () => {
     const root = repo({ 'src/a.ts': code }, { 'src/a.ts': `// one\n/**\n * two\n */\n${code}` });
-    const result = verdict(root);
-    expect(result.net).toBe(4);
-    expect(result.findings).toEqual([
-      expect.stringMatching(
-        /^net-growth since [0-9a-f]{12} \+4 comment-only line\(s\) on net in the changed files; delete narration in the files you touched, or keep only comments that name a hazard$/,
-      ),
-    ]);
+    expect(verdict(root)).toEqual({ net: 4, files: ['src/a.ts'] });
   });
 
-  it('passes a change that adds and removes the same number of comment lines across files', () => {
+  it('nets comment lines added and removed across files', () => {
     const root = repo(
       { 'src/a.ts': code, 'setup/b.ts': `// old\n${code}` },
       { 'src/a.ts': `// new\n${code}`, 'setup/b.ts': code },
     );
-    expect(verdict(root)).toEqual({ net: 0, files: ['setup/b.ts', 'src/a.ts'], findings: [] });
+    expect(verdict(root)).toEqual({ net: 0, files: ['setup/b.ts', 'src/a.ts'] });
   });
 
-  it('passes a change that deletes comments, counting a deleted file negative', () => {
+  it('counts deleted comments, and a deleted file, negative', () => {
     const root = repo(
       { 'src/a.ts': `// a\n// b\n${code}`, 'scripts/gone.ts': `// c\n${code}` },
       { 'src/a.ts': code, 'scripts/gone.ts': null },
     );
-    expect(verdict(root)).toEqual({ net: -3, files: ['scripts/gone.ts', 'src/a.ts'], findings: [] });
+    expect(verdict(root)).toEqual({ net: -3, files: ['scripts/gone.ts', 'src/a.ts'] });
   });
 
   it('counts a new file in full', () => {
     const root = repo({ 'src/a.ts': code }, { 'container/agent-runner/src/new.ts': `// fresh\n${code}` });
     expect(verdict(root).net).toBe(1);
-    expect(verdict(root).findings).toHaveLength(1);
   });
 
   it('counts changed source outside the scanned roots', () => {
@@ -393,7 +384,7 @@ describe('comment growth', () => {
       },
     );
     const exempt = { upstream: new Set(['src/upstream.ts']), vendored: new Set(['src/vendored.ts']) };
-    expect(verdict(root, exempt)).toEqual({ net: 0, files: [], findings: [] });
+    expect(verdict(root, exempt)).toEqual({ net: 0, files: [] });
   });
 
   it('does not count comment markers inside a template literal', () => {
@@ -401,7 +392,7 @@ describe('comment growth', () => {
       { 'src/a.ts': code },
       { 'src/a.ts': `${code}export const t = \`\n// not a comment\n/* nor this */\n\`;\n` },
     );
-    expect(verdict(root)).toEqual({ net: 0, files: ['src/a.ts'], findings: [] });
+    expect(verdict(root)).toEqual({ net: 0, files: ['src/a.ts'] });
   });
 
   it('counts uncommitted and untracked source as changed', () => {
@@ -410,11 +401,11 @@ describe('comment growth', () => {
     expect(verdict(root)).toMatchObject({ net: 2, files: ['src/a.ts', 'src/untracked.ts'] });
   });
 
-  it('passes on origin/main itself, where the base is HEAD', () => {
+  it('measures nothing on origin/main itself, where the base is HEAD', () => {
     const root = repo({ 'src/a.ts': `// a\n${code}` }, {});
     git(root, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
     expect(growthBase(root)).toBe(git(root, 'rev-parse', 'HEAD'));
-    expect(verdict(root)).toEqual({ net: 0, files: [], findings: [] });
+    expect(verdict(root)).toEqual({ net: 0, files: [] });
   });
 
   it('fails closed when origin/main cannot be resolved', () => {

@@ -7,7 +7,7 @@ bun scripts/container-updates.ts audit --format json
 bun scripts/container-updates.ts apply --repo <writable-clone> --items <id,id,...>
 ```
 
-The policy is latest stable, including major releases. Prerelease, beta, RC, dev, nightly, draft, yanked, and incompatible releases are not candidates. Registry failures remain unknown. Exact Docker pins and committed pnpm and Bun locks remain mandatory.
+The policy is latest stable, including major releases. Prerelease, beta, RC, dev, nightly, draft, yanked, and incompatible releases are not candidates. One opt-in exception: a Docker pin whose npm source sets `allowPrerelease: true` in `container/update-sources.json` follows npm's `latest` tag even when it is a prerelease, for a tool that has never published a stable release (`cf` today). Drop the flag once that tool's `latest` is stable. Registry failures remain unknown. Exact Docker pins and committed pnpm and Bun locks remain mandatory.
 
 The weekly task runs the audit as a pre-task script. A deterministic all-current result does not wake the agent and declares an `empty` observation ([Observations](scheduled-tasks.md#observations)); otherwise the agent posts an advisory only. It never edits, opens a PR, merges, deploys, or restarts. `/update-container` presents exact item IDs, waits for human selection, applies only those IDs in writable clones, runs the relevant gates, and opens unmerged PRs.
 

@@ -16,6 +16,7 @@
     { "id": "codex", "name": "Codex CLI", "arg": "CODEX_VERSION", "source": { "kind": "npm", "package": "@openai/codex" } },
     { "id": "opencode", "name": "OpenCode", "arg": "OPENCODE_VERSION", "source": { "kind": "npm", "package": "opencode-ai" } },
     { "id": "wix-cli", "name": "Wix CLI", "arg": "WIX_CLI_VERSION", "source": { "kind": "npm", "package": "@wix/cli" } },
+    { "id": "cf", "name": "Cloudflare CLI", "arg": "CF_CLI_VERSION", "source": { "kind": "npm", "package": "cf", "allowPrerelease": true } },
     { "id": "dbt-mcp", "name": "dbt MCP", "arg": "DBT_MCP_VERSION", "source": { "kind": "pypi", "package": "dbt-mcp" } },
     { "id": "pip", "name": "pip", "arg": "PIP_VERSION", "source": { "kind": "pypi", "package": "pip" } },
     { "id": "setuptools", "name": "setuptools", "arg": "SETUPTOOLS_VERSION", "source": { "kind": "pypi", "package": "setuptools" } },
@@ -29,6 +30,7 @@
     { "id": "render", "name": "Render CLI", "arg": "RENDER_VERSION", "source": { "kind": "github", "repo": "render-oss/cli" } },
     { "id": "railway", "name": "Railway CLI", "arg": "RAILWAY_VERSION", "source": { "kind": "github", "repo": "railwayapp/cli" } },
     { "id": "supabase", "name": "Supabase CLI", "arg": "SUPABASE_VERSION", "source": { "kind": "github", "repo": "supabase/cli" } },
+    { "id": "yq", "name": "yq", "arg": "YQ_VERSION", "source": { "kind": "github", "repo": "mikefarah/yq" } },
     { "id": "hex-cli", "name": "Hex CLI", "arg": "HEX_CLI_VERSION", "source": { "kind": "github", "repo": "hex-inc/hex-cli" }, "checksums": [
       { "arg": "HEX_CLI_SHA256_arm64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-aarch64-unknown-linux-gnu.tar.xz.sha256" },
       { "arg": "HEX_CLI_SHA256_amd64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-x86_64-unknown-linux-gnu.tar.xz.sha256" }
