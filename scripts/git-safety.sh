@@ -91,7 +91,14 @@
 #                                 (default $GIT_SAFETY_DIR/.git-safety-state)
 #
 # Manual run:  bash scripts/git-safety.sh
-# Restore:     see MANIFEST.txt in the snapshot directory. groups/ config
+# Restore:     see MANIFEST.txt in the snapshot directory. A topic snapshot
+#              (<stamp>/topics/) holds bytes a container chose: a patch can
+#              name paths outside its checkout and a bundle can carry history
+#              from any repository the topic's alternates reached. Never
+#              restore one into a container-visible location until a restore
+#              path exists that re-reads it through an admission-pinned view
+#              (fixed GIT_DIR/GIT_WORK_TREE, a validated index, alternates
+#              confined to the repo's own store). groups/ config
 #              lives on refs/heads/$GIT_SAFETY_SNAPSHOT_BRANCH, e.g.:
 #              git -C groups fetch origin host-snapshot && \
 #                git -C groups show origin/host-snapshot:<path>
@@ -333,6 +340,7 @@ say "Snapshot $TS"
 say "Restore commits:   git fetch <bundle> 'refs/*:refs/*' (verify first: see verify_bundle in this script)"
 say "Restore edits:     git apply --binary <patch>   (in a worktree at the recorded HEAD)"
 say "Restore new files: tar xzf <tgz> -C <worktree>"
+say "Topic snapshots (topics/): not restorable into a container-visible location yet; see Restore in scripts/git-safety.sh"
 say "Restore groups/ config: git -C groups fetch origin $SNAPSHOT_BRANCH && git -C groups show origin/$SNAPSHOT_BRANCH:<path>"
 
 # ── phase 1: snapshot ───────────────────────────────────────────────────────
@@ -469,24 +477,6 @@ for spec in ${GIT_SAFETY_EXTRA_REPOS:-}; do
     snapshot_repo "$r" "extra-$(slug "$r")"
   done
 done
-# Topic checkouts are container-writable, so this script never runs git in
-# them: the TS module does, read-only and on the hardened host-git path.
-TOPICS_RESULT=""
-if [ -n "${GIT_SAFETY_TOPIC_CHECKOUTS:-}" ]; then
-  read -ra TOPIC_SPECS <<<"$GIT_SAFETY_TOPIC_CHECKOUTS"
-  TOPICS_ERR=$(mktemp); CLEANUP_PATHS+=("$TOPICS_ERR")
-  TOPICS_RESULT=$("$SCRIPT_DIR/../node_modules/.bin/tsx" "$SCRIPT_DIR/topic-snapshot.ts" \
-    --data-root "$NANOCLAW_DIR/data" --out "$OUT/topics" --manifest "$MAN" \
-    --timeout-seconds "$GIT_TIMEOUT" --max-untracked-bytes "$MAX_UNTRACKED_BYTES" -- "${TOPIC_SPECS[@]}" 2>"$TOPICS_ERR")
-  TOPICS_RC=$?
-  cat "$TOPICS_ERR" >> "$ERR"
-  if [ "$TOPICS_RC" -ne 0 ]; then
-    while IFS= read -r line; do
-      case "$line" in failure:*) FAILURES+=("topics: ${line#failure: }") ;; esac
-    done < "$TOPICS_ERR"
-    [ "$TOPICS_RC" -eq 1 ] || FAILURES+=("topics: topic-snapshot.ts exited $TOPICS_RC: $(tail -1 "$TOPICS_ERR" | cut -c1-300)")
-  fi
-fi
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # ── phase 2: snapshot groups/'s pending tracked-file edits ──────────────────
@@ -1000,6 +990,28 @@ commit_groups() {
 }
 [ -d "$GROUPS_DIR/.git" ] && commit_groups
 say "groups: $GROUPS_RESULT"
+
+# Topic checkouts are container-writable, so this script never runs git in
+# them: the TS module does, read-only and on the hardened host-git path. It
+# runs after groups/ so that a slow or stalled topic cannot cost that commit.
+TOPICS_RESULT=""
+if [ -n "${GIT_SAFETY_TOPIC_CHECKOUTS:-}" ]; then
+  read -ra TOPIC_SPECS <<<"$GIT_SAFETY_TOPIC_CHECKOUTS"
+  TOPICS_ERR=$(mktemp); CLEANUP_PATHS+=("$TOPICS_ERR")
+  TOPICS_RESULT=$("$SCRIPT_DIR/../node_modules/.bin/tsx" "$SCRIPT_DIR/topic-snapshot.ts" \
+    --data-root "$NANOCLAW_DIR/data" --out "$OUT/topics" --manifest "$MAN" \
+    --timeout-seconds "$GIT_TIMEOUT" --max-untracked-bytes "$MAX_UNTRACKED_BYTES" -- "${TOPIC_SPECS[@]}" 2>"$TOPICS_ERR")
+  TOPICS_RC=$?
+  cat "$TOPICS_ERR" >> "$ERR"
+  if [ "$TOPICS_RC" -ne 0 ]; then
+    TOPICS_REPORTED=0
+    while IFS= read -r line; do
+      case "$line" in failure:*) FAILURES+=("topics: ${line#failure: }"); TOPICS_REPORTED=1 ;; esac
+    done < "$TOPICS_ERR"
+    [ "$TOPICS_REPORTED" -eq 1 ] ||
+      FAILURES+=("topics: topic-snapshot.ts exited $TOPICS_RC with no failure line: $(tail -1 "$TOPICS_ERR" | cut -c1-300)")
+  fi
+fi
 
 # ── retention ───────────────────────────────────────────────────────────────
 find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*Z' -mtime +"$KEEP_DAYS" -exec rm -rf {} + 2>/dev/null

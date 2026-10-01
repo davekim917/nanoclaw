@@ -346,6 +346,19 @@ describe('snapshotTopics', () => {
     expect(listed.trim().split('\n')).toEqual(['notes.md']);
   });
 
+  it('counts a git call killed during admission as a failure, not as a checkout git cannot open', async () => {
+    const stalled = topic('topic-q');
+    git(root, 'clone', '-q', remote, stalled);
+    const fifo = path.join(root, 'config-fifo');
+    execFileSync('mkfifo', [fifo]);
+    git(stalled, 'config', 'include.path', fifo);
+
+    const result = await snapshotTopics({ ...options, timeoutMs: 2000 });
+
+    expect(result.unreadable).toEqual([]);
+    expect(result.failures).toEqual([expect.stringMatching(/killed after 2s/)]);
+  });
+
   it('refuses an output location under data/', async () => {
     await expect(snapshotTopics({ ...options, outDir: path.join(data, 'out') })).rejects.toThrow(
       /refusing to write under/,

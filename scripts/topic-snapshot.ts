@@ -37,9 +37,17 @@ if (!options) {
   console.error(USAGE);
   process.exit(2);
 }
-const result = await snapshotTopics(options);
-for (const failure of result.failures) console.error(`failure: ${failure.replace(/\n/g, ' ')}`);
-console.log(
-  `topics: ${result.captured} checkout(s) captured, ${result.bundled} repo(s) bundled, ${result.unreadable.length} git cannot open`,
-);
-process.exit(result.failures.length > 0 ? 1 : 0);
+// git-safety.sh reports only `failure:` lines, so nothing may leave this script as a bare stack trace.
+try {
+  const result = await snapshotTopics(options);
+  for (const failure of result.failures) console.error(`failure: ${JSON.stringify(failure)}`);
+  console.log(
+    `topics: ${result.captured} checkout(s) captured, ${result.bundled} repo(s) bundled, ${result.unreadable.length} git cannot open`,
+  );
+  process.exit(result.failures.length > 0 ? 1 : 0);
+} catch (err) {
+  console.error(
+    `failure: ${JSON.stringify(`topic snapshot did not finish: ${err instanceof Error ? err.message : String(err)}`)}`,
+  );
+  process.exit(1);
+}

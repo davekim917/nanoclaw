@@ -1933,6 +1933,19 @@ if [ "$RC" -ne 0 ] && [[ "$(tail -1 <<<"$OUT")" == "- topics: "*"stash list"* ]]
 else
   bad "a topic-snapshot.ts failure did not fail the run" "$OUT"
 fi
+rm -rf "$NCDIR/data"
+run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$NCDIR/data/v2-topics/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry
+if [ "$RC" -ne 0 ] && [[ "$(tail -1 <<<"$OUT")" == "- topics: "*"did not finish"* ]] && [[ "$OUT" != *"git-safety: ok"* ]]; then
+  ok "a topic snapshot that throws before finishing fails the run with its reason"
+else
+  bad "a topic snapshot that threw did not fail the run" "$OUT"
+fi
+run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$NCDIR/data/v2-topics/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry GIT_SAFETY_GIT_TIMEOUT=0
+if [ "$RC" -ne 0 ] && [[ "$(tail -1 <<<"$OUT")" == "- topics: topic-snapshot.ts exited 2 with no failure line"* ]]; then
+  ok "a topic-snapshot.ts exit with no failure line still fails the run"
+else
+  bad "a topic-snapshot.ts exit with no failure line passed as ok" "$OUT"
+fi
 
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
 exit "$FAILED"

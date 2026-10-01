@@ -15,7 +15,7 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 import zlib from 'zlib';
 
-import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
+import { safeGitArgs, safeGitEnv } from './safe-git.js';
 
 /** A repository a container can write. The type carries no capability: nothing in this module writes to one. */
 interface ContainerWritableRepo {
@@ -47,9 +47,19 @@ export interface TopicSnapshotResult {
   failures: string[];
 }
 
-class GitFailure extends Error {}
+/** `cannotOpen`: git ran and refused (an exit or unusable output), as opposed to being killed or failing to start. */
+class GitFailure extends Error {
+  constructor(
+    message: string,
+    readonly cannotOpen: boolean,
+  ) {
+    super(message);
+  }
+}
 
-const NO_TRANSPORT = ['-c', 'protocol.allow=never', '-c', 'protocol.file.allow=never'];
+// No transport, so a promisor remote's lazy fetch cannot run core.sshCommand; no mailmap, which `git log` (forked by
+// `stash list`) would read from the working tree, where a FIFO would outlive the SIGKILL of its parent.
+const HOST_GIT_OVERRIDES = ['-c', 'protocol.allow=never', '-c', 'protocol.file.allow=never', '-c', 'log.mailmap=false'];
 const SECRET_SHAPED =
   /^(\.env|\.env\..*|.*\.env|.*\.pem|.*\.p8|.*\.key|credentials.*|\.netrc|id_rsa.*|id_ed25519.*|id_ecdsa.*|profiles\.yml|secrets\.ya?ml)$/;
 
@@ -71,6 +81,14 @@ function hostOwned(dataRoot: string, p: string): HostOwnedPath {
   return path.resolve(p) as HostOwnedPath;
 }
 
+function hostChild(parent: HostOwnedPath, ...names: string[]): HostOwnedPath {
+  for (const name of names) {
+    if (name === '' || name === '.' || name === '..' || name.includes('/'))
+      throw new Error(`not a child name: ${name}`);
+  }
+  return path.join(parent, ...names) as HostOwnedPath;
+}
+
 interface GitCall {
   args: readonly string[];
   /** A checkout to run in; discovery from it stops at its parent. */
@@ -80,6 +98,7 @@ interface GitCall {
   filters?: readonly string[];
   okStatus?: readonly number[];
   input?: string;
+  stdinFd?: number;
   stdoutFd?: number;
   env?: NodeJS.ProcessEnv;
 }
@@ -92,11 +111,11 @@ function runGit(call: GitCall, timeoutMs: number): SpawnSyncReturns<Buffer> {
     ...(call.gitDir ? { GIT_DIR: call.gitDir } : {}),
     ...call.env,
   });
-  const result = spawnSync('git', safeGitArgs([...NO_TRANSPORT, ...call.args], undefined, call.filters ?? []), {
+  const result = spawnSync('git', safeGitArgs([...HOST_GIT_OVERRIDES, ...call.args], undefined, call.filters ?? []), {
     cwd: call.cwd ?? path.dirname(call.gitDir ?? os.tmpdir()),
     env,
     input: call.input,
-    stdio: [call.input === undefined ? 'ignore' : 'pipe', call.stdoutFd ?? 'pipe', 'pipe'],
+    stdio: [call.stdinFd ?? (call.input === undefined ? 'ignore' : 'pipe'), call.stdoutFd ?? 'pipe', 'pipe'],
     timeout: timeoutMs,
     killSignal: 'SIGKILL',
     maxBuffer: 512 * 1024 * 1024,
@@ -104,11 +123,14 @@ function runGit(call: GitCall, timeoutMs: number): SpawnSyncReturns<Buffer> {
   const where = call.cwd ?? call.gitDir;
   const command = `git ${call.args.join(' ')} in ${where}`;
   if (result.error || result.signal) {
-    throw new GitFailure(`${command}: ${result.signal ? `killed after ${timeoutMs / 1000}s` : String(result.error)}`);
+    throw new GitFailure(
+      `${command}: ${result.signal ? `killed after ${timeoutMs / 1000}s` : String(result.error)}`,
+      false,
+    );
   }
   if (!(call.okStatus ?? [0]).includes(result.status ?? -1)) {
     const stderr = result.stderr.toString().trim().split('\n').pop() ?? '';
-    throw new GitFailure(`${command}: exit ${result.status}${stderr ? ` (${stderr})` : ''}`);
+    throw new GitFailure(`${command}: exit ${result.status}${stderr ? ` (${stderr})` : ''}`, true);
   }
   return result;
 }
@@ -116,10 +138,10 @@ function runGit(call: GitCall, timeoutMs: number): SpawnSyncReturns<Buffer> {
 /** The one path git printed, byte-exact: git ends it with a newline, and a path holding a newline is refused. */
 function onePath(stdout: Buffer): string {
   const text = stdout.toString();
-  if (!text.endsWith('\n')) throw new GitFailure(`expected one path, got ${JSON.stringify(text)}`);
+  if (!text.endsWith('\n')) throw new GitFailure(`expected one path, got ${JSON.stringify(text)}`, true);
   const value = text.slice(0, -1);
   if (value === '' || value.includes('\n'))
-    throw new GitFailure(`refusing a path that holds a newline: ${JSON.stringify(text)}`);
+    throw new GitFailure(`refusing a path that holds a newline: ${JSON.stringify(text)}`, true);
   return value;
 }
 
@@ -152,8 +174,22 @@ function admit(dataRoot: string, checkout: string, timeoutMs: number): Admission
     if (!isWithin(dataRoot, commonDir)) return unreadable(`its repository ${commonDir} is outside ${dataRoot}`);
     return { kind: 'admitted', checkout: real, commonDir };
   } catch (err) {
+    if (err instanceof GitFailure && !err.cannotOpen) throw err;
     return unreadable(`git cannot open it: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/** Filter drivers the repo's config defines; global and system config are already off (safeGitEnv). */
+function repoFilterNames(checkout: string, timeoutMs: number): string[] {
+  const keys = runGit(
+    {
+      cwd: checkout,
+      args: ['config', '--includes', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'],
+      okStatus: [0, 1],
+    },
+    timeoutMs,
+  ).stdout;
+  return [...new Set(lines(keys).map((key) => key.replace(/^filter\./, '').replace(/\.[a-z]+$/, '')))].sort();
 }
 
 function groupRepos(admitted: readonly Admission[]): ContainerWritableRepo[] {
@@ -200,33 +236,26 @@ function verifyBundle(bundle: HostOwnedPath, objectsDir: string, scratchRoot: Ho
   const bytes = fs.readFileSync(bundle);
   const headerEnd = bytes.indexOf('\n\n');
   if (headerEnd < 0) throw new Error(`${bundle} has no bundle header`);
-  const pack = path.join(scratchRoot, 'verify.pack') as HostOwnedPath;
+  const pack = hostChild(scratchRoot, 'verify.pack');
   fs.writeFileSync(pack, bytes.subarray(headerEnd + 2));
-  const verifyDir = path.join(scratchRoot, 'verify.git') as HostOwnedPath;
+  const verifyDir = hostChild(scratchRoot, 'verify.git');
   runGit({ gitDir: verifyDir, args: ['init', '--bare', '-q', verifyDir] }, timeoutMs);
   const fd = fs.openSync(pack, 'r');
   try {
-    const result = spawnSync(
-      'git',
-      safeGitArgs([...NO_TRANSPORT, 'index-pack', '--stdin', '--fix-thin', '-o', path.join(verifyDir, 'verify.idx')]),
+    runGit(
       {
-        env: safeGitEnv({ GIT_DIR: verifyDir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objectsDir, GIT_NO_LAZY_FETCH: '1' }),
-        stdio: [fd, 'ignore', 'pipe'],
-        timeout: timeoutMs,
-        killSignal: 'SIGKILL',
+        gitDir: verifyDir,
+        stdinFd: fd,
+        env: { GIT_ALTERNATE_OBJECT_DIRECTORIES: objectsDir },
+        args: ['index-pack', '--stdin', '--fix-thin', '-o', hostChild(verifyDir, 'verify.idx')],
       },
+      timeoutMs,
     );
-    if (result.error || result.signal || result.status !== 0) {
-      throw new GitFailure(
-        `bundle ${bundle} failed verification: ${result.stderr?.toString().trim() || result.signal}`,
-      );
-    }
   } finally {
     fs.closeSync(fd);
   }
 }
 
-/** Bundles the repo's unpushed tips from a host-owned scratch repository that borrows its objects. */
 function bundleRepo(repo: ContainerWritableRepo, dir: HostOwnedPath, options: TopicSnapshotOptions): number {
   const run = (call: GitCall) => runGit(call, options.timeoutMs);
   const at = repo.checkouts[0];
@@ -255,10 +284,10 @@ function bundleRepo(repo: ContainerWritableRepo, dir: HostOwnedPath, options: To
 
   const scratchRoot = hostOwned(options.dataRoot, fs.mkdtempSync(path.join(os.tmpdir(), 'git-safety-topic-')));
   try {
-    const scratch = path.join(scratchRoot, 'repo.git') as HostOwnedPath;
+    const scratch = hostChild(scratchRoot, 'repo.git');
     run({ gitDir: scratch, args: ['init', '--bare', '-q', scratch] });
-    fs.writeFileSync(path.join(scratch, 'objects', 'info', 'alternates'), `${objectsDir}\n`);
-    if (shallow) fs.writeFileSync(path.join(scratch, 'shallow'), shallow);
+    fs.writeFileSync(hostChild(scratch, 'objects', 'info', 'alternates'), `${objectsDir}\n`);
+    if (shallow) fs.writeFileSync(hostChild(scratch, 'shallow'), shallow);
     run({ gitDir: scratch, args: ['update-ref', '--stdin'], input: `${updates.join('\n')}\n` });
     const tips = updates.map((update) => update.split(' ')[1]);
     const revs = `${[...tips, ...negatives].join('\n')}\n`;
@@ -266,10 +295,10 @@ function bundleRepo(repo: ContainerWritableRepo, dir: HostOwnedPath, options: To
       lines(run({ gitDir: scratch, args: ['rev-list', '--count', '--stdin'], input: revs }).stdout)[0],
     );
     if (!(commits > 0)) return 0;
-    const bundle = hostOwned(options.dataRoot, path.join(dir, 'unpushed-commits.bundle'));
+    const bundle = hostChild(dir, 'unpushed-commits.bundle');
     fs.mkdirSync(dir, { recursive: true });
     run({ gitDir: scratch, args: ['bundle', 'create', '-q', bundle, '--stdin'], input: revs });
-    verifyBundle(bundle, path.join(scratch, 'objects'), scratchRoot, options.timeoutMs);
+    verifyBundle(bundle, hostChild(scratch, 'objects'), scratchRoot, options.timeoutMs);
     return commits;
   } finally {
     fs.rmSync(scratchRoot, { recursive: true, force: true });
@@ -295,8 +324,7 @@ async function captureCheckout(
   say: (line: string) => void,
 ): Promise<boolean> {
   const run = (call: GitCall) => runGit(call, options.timeoutMs);
-  const gitDir = onePath(run({ cwd: checkout, args: ['rev-parse', '--absolute-git-dir'] }).stdout);
-  const filters = safeGitFilterNames(gitDir, checkout);
+  const filters = repoFilterNames(checkout, options.timeoutMs);
   const status = run({
     cwd: checkout,
     filters,
@@ -314,7 +342,7 @@ async function captureCheckout(
 
   const work = hostOwned(options.dataRoot, fs.mkdtempSync(path.join(os.tmpdir(), 'git-safety-capture-')));
   try {
-    const raw = path.join(work, 'patch') as HostOwnedPath;
+    const raw = hostChild(work, 'patch');
     const fd = fs.openSync(raw, 'w');
     try {
       run({
@@ -336,7 +364,7 @@ async function captureCheckout(
       fs.closeSync(fd);
     }
     if (fs.statSync(raw).size > 0) {
-      const patch = hostOwned(options.dataRoot, path.join(dir, `${slug}.patch.gz`));
+      const patch = hostChild(dir, `${slug}.patch.gz`);
       await pipeline(fs.createReadStream(raw), zlib.createGzip(), fs.createWriteStream(patch));
     }
 
@@ -365,9 +393,9 @@ async function captureCheckout(
       kept.push(file);
     }
     if (kept.length > 0) {
-      const list = path.join(work, 'untracked.list') as HostOwnedPath;
+      const list = hostChild(work, 'untracked.list');
       fs.writeFileSync(list, Buffer.concat(kept.flatMap((file) => [file, Buffer.from([0])])));
-      const tarball = hostOwned(options.dataRoot, path.join(dir, `${slug}-untracked.tgz`));
+      const tarball = hostChild(dir, `${slug}-untracked.tgz`);
       // A checkout in use can lose a file between listing and archiving; tar reports it and carries on.
       const tar = spawnSync(
         'tar',
@@ -408,17 +436,21 @@ export async function snapshotTopics(options: TopicSnapshotOptions): Promise<Top
   const say = (line: string): void => fs.appendFileSync(manifest, `${line}\n`);
 
   const checkouts = [...new Set(options.patterns.flatMap((pattern) => fs.globSync(pattern)))].sort();
-  const admissions = checkouts.map((checkout) => admit(dataRoot, checkout, options.timeoutMs));
-  const result: TopicSnapshotResult = {
-    captured: 0,
-    bundled: 0,
-    unreadable: admissions.filter((entry) => entry.kind === 'unreadable'),
-    failures: [],
-  };
+  const result: TopicSnapshotResult = { captured: 0, bundled: 0, unreadable: [], failures: [] };
+  const admissions: Admission[] = [];
+  for (const checkout of checkouts) {
+    try {
+      const admission = admit(dataRoot, checkout, options.timeoutMs);
+      admissions.push(admission);
+      if (admission.kind === 'unreadable') result.unreadable.push(admission);
+    } catch (err) {
+      result.failures.push(`${checkout}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   for (const repo of groupRepos(admissions)) {
     const label = labelFor(repo.commonDir);
-    const dir = hostOwned(dataRoot, path.join(outDir, label));
+    const dir = hostChild(outDir, label);
     try {
       const commits = bundleRepo(repo, dir, resolved);
       if (commits > 0) {
