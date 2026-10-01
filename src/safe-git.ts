@@ -23,6 +23,12 @@ const BASE_CONFIG = [
   'gpg.x509.program=/bin/false',
 ];
 
+const FILTER_OVERRIDE_ENV = {
+  NANOCLAW_GIT_EMPTY: '',
+  NANOCLAW_GIT_CAT: '/bin/cat',
+  NANOCLAW_GIT_FALSE: 'false',
+};
+
 export function safeGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     PATH: SAFE_PATH,
@@ -36,10 +42,11 @@ export function safeGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     GIT_ALLOW_PROTOCOL: 'file',
     GIT_OPTIONAL_LOCKS: '0',
     ...extra,
+    ...FILTER_OVERRIDE_ENV,
   };
 }
 
-/** Command-line config has higher priority than repository-local config. */
+/** Command-line config outranks repository-local config. Filters use `--config-env`: `-c` splits at the first `=`, and a filter name may contain one. */
 export function safeGitArgs(
   args: readonly string[],
   localConfigPath?: string,
@@ -50,14 +57,10 @@ export function safeGitArgs(
   if (localConfigPath) for (const name of localFilterNames(localConfigPath)) filterNames.add(name);
   for (const name of [...filterNames].sort()) {
     overrides.push(
-      '-c',
-      `filter.${name}.process=`,
-      '-c',
-      `filter.${name}.clean=/bin/cat`,
-      '-c',
-      `filter.${name}.smudge=/bin/cat`,
-      '-c',
-      `filter.${name}.required=false`,
+      `--config-env=filter.${name}.process=NANOCLAW_GIT_EMPTY`,
+      `--config-env=filter.${name}.clean=NANOCLAW_GIT_CAT`,
+      `--config-env=filter.${name}.smudge=NANOCLAW_GIT_CAT`,
+      `--config-env=filter.${name}.required=NANOCLAW_GIT_FALSE`,
     );
   }
   return [...overrides, ...args];
