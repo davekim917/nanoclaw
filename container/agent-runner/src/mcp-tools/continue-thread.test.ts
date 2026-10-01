@@ -121,6 +121,35 @@ describe('send_message / send_file — continue_thread', () => {
       expect(JSON.parse(out[0].content).continueThread).toBe(other);
     });
 
+    describe('with outcome reporting on', () => {
+      beforeEach(() => {
+        process.env.NANOCLAW_OUTCOME_REPORTING = '1';
+      });
+      afterEach(() => {
+        delete process.env.NANOCLAW_OUTCOME_REPORTING;
+      });
+
+      it('a reply leaves the session thread', async () => {
+        await sendMessage.handler({ purpose: 'reply', text: 'a', thread_key: 'topic-a', continue_thread: other });
+
+        expect(getUndeliveredMessages()[0].thread_id).toBeNull();
+      });
+
+      it('refuses an outcome, which the host never routes by key, and writes nothing', async () => {
+        const result = await sendMessage.handler({
+          purpose: 'outcome',
+          text: 'Fixed.',
+          outcome: { workItem: 'https://github.com/org/repo/pull/17', verified: 'Tests passed' },
+          thread_key: 'topic-a',
+          continue_thread: other,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain('continue_thread');
+        expect(getUndeliveredMessages()).toHaveLength(0);
+      });
+    });
+
     it('a key alone stays in the session thread', async () => {
       await sendMessage.handler({ to: 'team', text: 'a', thread_key: 'topic-a' });
 

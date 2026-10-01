@@ -273,6 +273,10 @@ export const sendMessage: McpToolDefinition = {
         'Choose an explicit purpose: progress stays internal; outcome, reply, urgent, decision or actionable handoff may reach the channel.',
       );
     let reportedOutcome = args.outcome;
+    if (policy && purpose === 'outcome' && cont.continueThread)
+      return err(
+        'An outcome reports in its own request thread and cannot take continue_thread. Send it without, or post to the other thread with purpose reply or handoff.',
+      );
     if (policy && purpose === 'outcome') {
       try {
         const rawOutcome = args.outcome as Record<string, unknown> | undefined;

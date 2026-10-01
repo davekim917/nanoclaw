@@ -303,7 +303,7 @@
 "container/agent-runner/src/mcp-tools/cli.instructions.md":{"diff":121,"mode":"100644","sha256":"661c9b9571f8a71a95fa95661a76bf26925e7be87829d5adb05ae6721aff0fd7"},
 "container/agent-runner/src/mcp-tools/core.instructions.md":{"diff":15,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/mcp-tools/core.test.ts":{"diff":746,"mode":"100644","sha256":"1a0914b5f81ec16277fe1ee1a60a966377a5e563b240f8ba6433a91fc8119158"},
-"container/agent-runner/src/mcp-tools/core.ts":{"diff":474,"mode":"100644","sha256":"3326750bc9226157b16cb4986406e9ca106da7b9814ecd97c28ad3865b63c320"},
+"container/agent-runner/src/mcp-tools/core.ts":{"diff":478,"mode":"100644","sha256":"bd02a344ad88138e04ed1c0dd73dc1f7385cc470253b87955e0e159beb9f2687"},
 "container/agent-runner/src/mcp-tools/index.ts":{"diff":45,"mode":"100644","sha256":"cb2f990df7bee3becbd852b33f9a7583813231366d9f94839ad79fa09589549c"},
 "container/agent-runner/src/mcp-tools/interactive.instructions.md":{"diff":22,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/mcp-tools/interactive.test.ts":{"diff":165,"mode":"100644","sha256":null,"deleted":true},
