@@ -28,6 +28,9 @@ const ORIGINAL_ENV = {
   FAKE_CODEX_WEEKLY_BY_INSTANCE: process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE,
   FAKE_CODEX_RESET_BY_INSTANCE: process.env.FAKE_CODEX_RESET_BY_INSTANCE,
   FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE: process.env.FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE,
+  FAKE_CODEX_SILENT_INIT_INSTANCES: process.env.FAKE_CODEX_SILENT_INIT_INSTANCES,
+  CODEX_START_HOME: process.env.CODEX_START_HOME,
+  CODEX_INIT_TIMEOUT_MS: process.env.CODEX_INIT_TIMEOUT_MS,
 };
 
 function restoreEnv(): void {
@@ -58,7 +61,8 @@ afterEach(() => {
  * usedPercent per spawned instance (instance 1 first), so a test can make the
  * primary account look spent and the fallback fresh. `FAKE_CODEX_RESET_BY_INSTANCE`
  * is the matching list of weekly `resetsAt` epoch seconds (default RESET_S), so
- * two spent accounts can state different resets.
+ * two spent accounts can state different resets. `FAKE_CODEX_SILENT_INIT_INSTANCES`
+ * is a comma list of instances that never answer `initialize`.
  */
 function writeFakeCodex(binDir: string): void {
   fs.mkdirSync(binDir, { recursive: true });
@@ -90,6 +94,8 @@ lines.on('line', (line) => {
   const request = JSON.parse(line);
   log({ method: request.method, params: request.params });
   if (request.method === 'initialize') {
+    const silent = (process.env.FAKE_CODEX_SILENT_INIT_INSTANCES ?? '').split(',').map(Number);
+    if (silent.includes(instance)) return;
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
     return;
   }
@@ -190,6 +196,10 @@ async function run(opts: {
   pushedTurns?: number;
   /** Weekly usedPercent each instance pushes mid-turn (comma list, blank = default weekly+1). */
   pushWeeklyByInstance?: string;
+  /** The host's `CODEX_START_HOME` hint. */
+  startHome?: string;
+  /** Instances that never answer `initialize` (comma list); the init timeout drops to 200ms when set. */
+  silentInitInstances?: string;
 }): Promise<Run> {
   const binDir = path.join(tmpDir, 'bin');
   const codexHome = path.join(tmpDir, 'codex-home');
@@ -212,6 +222,15 @@ async function run(opts: {
   else delete process.env.FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE;
   if (opts.untrustedHomeMatch) process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH = opts.untrustedHomeMatch;
   else delete process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH;
+  if (opts.startHome) process.env.CODEX_START_HOME = opts.startHome;
+  else delete process.env.CODEX_START_HOME;
+  if (opts.silentInitInstances) {
+    process.env.FAKE_CODEX_SILENT_INIT_INSTANCES = opts.silentInitInstances;
+    process.env.CODEX_INIT_TIMEOUT_MS = '200';
+  } else {
+    delete process.env.FAKE_CODEX_SILENT_INIT_INSTANCES;
+    delete process.env.CODEX_INIT_TIMEOUT_MS;
+  }
   process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
   process.env.CODEX_HEALTH_PROBE_INTERVAL_MS = '1000';
   process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS = '1000';
@@ -330,6 +349,9 @@ describe('Codex rate-limit read → park through gen()', () => {
     expect(
       events.some((e) => e.type === 'progress' && String(e.message).includes('Codex OAuth rotating (quota)')),
     ).toBe(true);
+    expect(events.filter((e) => e.type === 'codex_account_exhausted')).toEqual([
+      { type: 'codex_account_exhausted', home: path.join(tmpDir, 'codex-home') },
+    ]);
     // Instance 1 was parked before any turn; instance 2 ran the one turn.
     const starts = requests.filter((r) => r.method === 'turn/start');
     expect(starts.map((r) => r.instance)).toEqual([2]);
@@ -341,6 +363,71 @@ describe('Codex rate-limit read → park through gen()', () => {
       ['acct-1', 'codex:codex-home', 0.95],
       ['acct-2', 'codex:codex-fallback-1', 0.3],
     ]);
+  }, 5_000);
+
+  it('a host start hint puts the first app-server on the fallback: one spawn, no rotation, the primary never read', async () => {
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const { events, requests, spawned } = await run({
+      weeklyByInstance: '30',
+      fallbackHomes: [fallbackHome],
+      startHome: fallbackHome,
+    });
+    expect(spawned).toBe(1);
+    expect(events.some((e) => e.type === 'error' || e.type === 'codex_account_exhausted')).toBe(false);
+    expect(events.some((e) => e.type === 'progress' && String(e.message).includes('Codex OAuth rotating'))).toBe(false);
+    expect(requests.filter((r) => r.method === 'turn/start').map((r) => r.instance)).toEqual([1]);
+    const pulls = getRateLimitSampleRows().filter((r) => r.source === 'usage_pull' && r.limit_type === 'seven_day');
+    expect(pulls.map((r) => r.credential_set)).toEqual(['codex:codex-fallback-1']);
+  }, 5_000);
+
+  it('a hinted fallback that is itself spent rotates back to the primary and reports the fallback', async () => {
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const { events, requests, spawned } = await run({
+      weeklyByInstance: '97,20',
+      fallbackHomes: [fallbackHome],
+      startHome: fallbackHome,
+    });
+    expect(spawned).toBe(2);
+    expect(events.filter((e) => e.type === 'codex_account_exhausted')).toEqual([
+      { type: 'codex_account_exhausted', home: fallbackHome },
+    ]);
+    expect(requests.filter((r) => r.method === 'turn/start').map((r) => r.instance)).toEqual([2]);
+    expect(events.filter((e) => e.type === 'result')).toHaveLength(1);
+  }, 5_000);
+
+  it('a start hint naming a home that is not a mounted fallback is ignored', async () => {
+    const { spawned } = await run({ weeklyByInstance: '20', startHome: path.join(tmpDir, 'not-mounted') });
+    expect(spawned).toBe(1);
+    const pulls = getRateLimitSampleRows().filter((r) => r.source === 'usage_pull' && r.limit_type === 'seven_day');
+    expect(pulls.map((r) => r.credential_set)).toEqual(['codex:codex-home']);
+  }, 5_000);
+
+  it('an unanswered initialize on the rotated-to account gets one fresh app-server and the turn completes', async () => {
+    // The 2026-10-01 shape: primary parks, the fallback's first app-server never answers initialize.
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const { events, requests, spawned } = await run({
+      weeklyByInstance: '96,30,30',
+      fallbackHomes: [fallbackHome],
+      silentInitInstances: '2',
+    });
+    expect(spawned).toBe(3);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(requests.filter((r) => r.method === 'turn/start').map((r) => r.instance)).toEqual([3]);
+    expect(events.filter((e) => e.type === 'result')).toHaveLength(1);
+  }, 5_000);
+
+  it('two unanswered initializes in a row surface the timeout', async () => {
+    const { requests, spawned, thrown } = await run({
+      weeklyByInstance: '20',
+      silentInitInstances: '1,2',
+      tolerateThrow: true,
+    });
+    expect(spawned).toBe(2);
+    expect(thrown).toBe('Timeout waiting for initialize response (200ms)');
+    expect(requests.some((r) => r.method === 'turn/start')).toBe(false);
   }, 5_000);
 
   it('a container already on its fallback whose fallback then parks wraps back to the primary — the 2026-09-16 outage', async () => {

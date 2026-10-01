@@ -24,12 +24,12 @@ import {
   STALE_THREAD_RE,
   attachCodexAutoApproval,
   createCodexConfigOverrides,
-  initializeCodexAppServer,
   interruptCodexTurn,
+  CODEX_INIT_TIMEOUT_MS,
   killCodexAppServer,
   probeCodexThreadHealth,
   readCodexTurnSnapshot,
-  spawnCodexAppServer,
+  startCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
   steerCodexTurn,
@@ -677,6 +677,8 @@ export class CodexProvider implements AgentProvider {
    */
   readonly fallbackHomes: readonly string[];
   private readonly primaryCodexHome: string;
+  /** The host's start hint, consumed by the first query; later queries keep whatever home the last one left. */
+  private pendingStartHome: string | null;
   private readonly primaryHostCodexHome: string | undefined;
 
   constructor(options: ProviderOptions = {}) {
@@ -760,6 +762,8 @@ export class CodexProvider implements AgentProvider {
     );
     this.primaryCodexHome = resolveCodexConfigDir();
     this.primaryHostCodexHome = process.env.CODEX_PRIMARY_HOST_HOME;
+    const startHome = process.env.CODEX_START_HOME;
+    this.pendingStartHome = startHome && this.fallbackHomes.includes(startHome) ? startHome : null;
     if (this.fallbackHomes.length > 0) {
       console.error(
         `[codex-provider] Loaded ${this.fallbackHomes.length} Codex OAuth fallback(s): ${this.fallbackHomes.join(', ')}`,
@@ -773,7 +777,8 @@ export class CodexProvider implements AgentProvider {
 
   /**
    * Circular, skipping every home in `tried` (per turn), so a recovered primary is retried; null once all were tried.
-   * Nothing persists: `process.env.CODEX_HOME` carries the active home and a respawn starts on the primary.
+   * Nothing persists here: `process.env.CODEX_HOME` carries the active home, and a respawn starts on the primary
+   * unless the host names another home in `CODEX_START_HOME`.
    */
   rotateCodexHome(current: string, tried: ReadonlySet<string>): string | null {
     const ring = this.codexHomeRing;
@@ -846,11 +851,32 @@ export class CodexProvider implements AgentProvider {
     };
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
+      if (self.pendingStartHome) {
+        console.error(
+          `[codex-provider] Starting on ${self.pendingStartHome}: the host marked earlier accounts at quota`,
+        );
+        process.env.CODEX_HOME = self.pendingStartHome;
+        mirrorCodexAgentsToHome(self.primaryCodexHome, self.pendingStartHome);
+        self.pendingStartHome = null;
+      }
       writeCodexMcpConfigToml(self.mcpServers);
       writeCodexHooksAndTrust();
-      let server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
-      turnTracker.server = server;
-      attachCodexAutoApproval(server);
+      const startAppServer = async (): Promise<AppServer> => {
+        try {
+          return await startCodexAppServer(
+            createCodexConfigOverrides(effectiveConfig, effectiveFast),
+            (spawned) => {
+              turnTracker.server = spawned;
+              attachCodexAutoApproval(spawned);
+            },
+            positiveEnvMs('CODEX_INIT_TIMEOUT_MS', CODEX_INIT_TIMEOUT_MS),
+          );
+        } catch (err) {
+          turnTracker.server = null;
+          throw err;
+        }
+      };
+      let server = await startAppServer();
       const rateLimits = new CodexRateLimitTracker();
 
       let threadId: string | undefined = input.continuation;
@@ -861,7 +887,6 @@ export class CodexProvider implements AgentProvider {
       let primaryAuthRefreshAttempted = false;
 
       try {
-        await initializeCodexAppServer(server);
         // Fail closed on a guard chain that loaded but would never fire, on every spawn.
         await verifyCodexHookTrust(server, currentCodexHome);
         await rateLimits.bind(server, currentCodexHome);
@@ -881,10 +906,10 @@ export class CodexProvider implements AgentProvider {
           ),
         };
 
-        // A fresh container starts on the primary, but a prior rotation may have left newer history on a fallback;
+        // A fresh container may start on a different home than the one holding the thread's newest history;
         // resuming the stale rollout and rotating again would overwrite it.
         if (threadId && self.fallbackHomes.length > 0) {
-          const candidate = findNewestRolloutAcrossHomes(threadId, [currentCodexHome, ...self.fallbackHomes]);
+          const candidate = findNewestRolloutAcrossHomes(threadId, self.codexHomeRing);
           if (candidate && candidate.home !== currentCodexHome) {
             const copied = copyRolloutToFallback(candidate.path, candidate.home, currentCodexHome);
             if (copied) {
@@ -939,10 +964,7 @@ export class CodexProvider implements AgentProvider {
             writeCodexHooksAndTrust();
             if (nextHome) mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
 
-            server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
-            turnTracker.server = server;
-            attachCodexAutoApproval(server);
-            await initializeCodexAppServer(server);
+            server = await startAppServer();
             // The guard chain must be proven live in the (possibly new) home.
             await verifyCodexHookTrust(server, currentCodexHome);
             await rateLimits.bind(server, currentCodexHome);
@@ -1073,6 +1095,7 @@ export class CodexProvider implements AgentProvider {
                     }
                   }
 
+                  if (ev.classification === 'quota') yield { type: 'codex_account_exhausted', home: currentCodexHome };
                   yield {
                     type: 'progress',
                     message: formatBlockquoteLabel(

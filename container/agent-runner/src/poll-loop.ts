@@ -2352,6 +2352,13 @@ export async function handleEvent(event: ProviderEvent, routing: RoutingContext)
         }
       }
       break;
+    case 'codex_account_exhausted':
+      await writeMessageOut({
+        id: generateId(),
+        kind: 'system',
+        content: JSON.stringify({ action: 'codex_account_exhausted', home: event.home }),
+      });
+      break;
     case 'progress':
       log(`Progress: ${event.message}`);
       // Internal MCP tool descriptions (`Using <tool>`) are not user progress.
