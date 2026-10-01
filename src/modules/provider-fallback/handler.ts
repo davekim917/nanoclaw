@@ -102,7 +102,7 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
   // container in the group. The requeued message is answered on the fallback.
   killContainer(
     session.id,
-    'provider quota exhausted — respawning on fallback',
+    'provider unavailable — respawning on fallback',
     async () => {
       const fresh = await getSession(session.id);
       if (fresh) void requestWake(fresh, 'container-restart');

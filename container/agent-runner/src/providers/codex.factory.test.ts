@@ -1323,12 +1323,11 @@ describe('per-query model/effort overrides (-m/-e flags)', () => {
     });
 
     it('every app-server spawn uses the effort-folded config and per-query fast mode', () => {
-      const spawns = codeOnly.match(/spawnCodexAppServer\(createCodexConfigOverrides\(([^)]*)\)\)/g) ?? [];
-      expect(spawns.length).toBeGreaterThanOrEqual(2);
-      for (const s of spawns) {
-        expect(s).toContain('effectiveConfig');
-        expect(s).toContain('effectiveFast');
-      }
+      const starts = codeOnly.match(/startCodexAppServer\(\s*createCodexConfigOverrides\(([^)]*)\)/g) ?? [];
+      expect(starts).toHaveLength(1);
+      expect(starts[0]).toContain('effectiveConfig');
+      expect(starts[0]).toContain('effectiveFast');
+      expect(codeOnly.match(/startCodexAppServer\(/g)).toHaveLength(1);
     });
   });
 });

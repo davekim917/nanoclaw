@@ -14,7 +14,10 @@ function log(msg: string): void {
   console.error(`[codex-app-server] ${msg}`);
 }
 
-const INIT_TIMEOUT_MS = 30_000;
+export const CODEX_INIT_TIMEOUT_MS = 30_000;
+const INIT_ATTEMPTS = 2;
+
+class CodexRequestTimeoutError extends Error {}
 
 const CODEX_INITIALIZE_CAPABILITIES = {
   // Required for thread/list.ancestorThreadId, which lets the liveness probe
@@ -119,7 +122,7 @@ export interface AppServer {
   serverRequestHandlers: ((r: JsonRpcServerRequest) => void)[];
 }
 
-export function spawnCodexAppServer(configOverrides: string[] = []): AppServer {
+function spawnCodexAppServer(configOverrides: string[] = []): AppServer {
   const args = ['app-server', '--listen', 'stdio://'];
   for (const override of configOverrides) args.push('-c', override);
 
@@ -195,7 +198,7 @@ export function sendCodexRequest(
   return new Promise<JsonRpcResponse>((resolve, reject) => {
     const timer = setTimeout(() => {
       server.pending.delete(req.id);
-      reject(new Error(`Timeout waiting for ${method} response (${timeoutMs}ms)`));
+      reject(new CodexRequestTimeoutError(`Timeout waiting for ${method} response (${timeoutMs}ms)`));
     }, timeoutMs);
 
     server.pending.set(req.id, {
@@ -279,7 +282,7 @@ export function attachCodexAutoApproval(server: AppServer): void {
   });
 }
 
-export async function initializeCodexAppServer(server: AppServer): Promise<void> {
+async function initializeCodexAppServer(server: AppServer, timeoutMs: number): Promise<void> {
   log('Sending initialize…');
   const resp = await sendCodexRequest(
     server,
@@ -288,10 +291,38 @@ export async function initializeCodexAppServer(server: AppServer): Promise<void>
       clientInfo: { name: 'nanoclaw', version: '1.0.0' },
       capabilities: CODEX_INITIALIZE_CAPABILITIES,
     },
-    INIT_TIMEOUT_MS,
+    timeoutMs,
   );
   if (resp.error) throw new Error(`Initialize failed: ${resp.error.message}`);
   log('Initialize successful');
+}
+
+/**
+ * Spawns and initializes an app-server. An unanswered `initialize` gets one fresh process before the failure
+ * surfaces: the host answers that failure by moving the whole agent group to its fallback provider. `onSpawn`
+ * runs for every process, before its first request. `onRetry` is the caller's liveness signal: the host kills a
+ * container whose claimed message shows no sign of life for a minute, and a retried start can take that long
+ * before the first provider event.
+ */
+export async function startCodexAppServer(
+  configOverrides: string[],
+  onSpawn: (server: AppServer) => void,
+  onRetry: () => void,
+  initTimeoutMs: number = CODEX_INIT_TIMEOUT_MS,
+): Promise<AppServer> {
+  for (let attempt = 1; ; attempt++) {
+    const server = spawnCodexAppServer(configOverrides);
+    onSpawn(server);
+    try {
+      await initializeCodexAppServer(server, initTimeoutMs);
+      return server;
+    } catch (err) {
+      killCodexAppServer(server);
+      if (attempt >= INIT_ATTEMPTS || !(err instanceof CodexRequestTimeoutError)) throw err;
+      log(`initialize unanswered after ${initTimeoutMs}ms — starting a fresh app-server (attempt ${attempt + 1})`);
+      onRetry();
+    }
+  }
 }
 
 export interface ThreadParams {

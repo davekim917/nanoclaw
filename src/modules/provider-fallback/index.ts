@@ -4,6 +4,7 @@
  */
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { handleCodexAccountExhausted } from './codex-account.js';
 import { handleProviderUnavailable } from './handler.js';
 import { handleProviderRetryPrimary } from './retry-primary.js';
 
@@ -17,3 +18,8 @@ const PROVIDER_RETRY_PRIMARY_ACTION = unguarded(
   'asks for the calling session own group primary provider to be tried again; the handler only clears that group availability window and respawns that session',
 );
 registerDeliveryAction('provider_retry_primary', handleProviderRetryPrimary, PROVIDER_RETRY_PRIMARY_ACTION);
+
+const CODEX_ACCOUNT_EXHAUSTED_ACTION = unguarded(
+  'reports that one of the calling session own mounted Codex accounts hit its quota; the handler only marks that account for an hour so new containers start on the next one, and the runner still rotates on its own if the mark is wrong',
+);
+registerDeliveryAction('codex_account_exhausted', handleCodexAccountExhausted, CODEX_ACCOUNT_EXHAUSTED_ACTION);

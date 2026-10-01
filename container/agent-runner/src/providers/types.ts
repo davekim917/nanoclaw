@@ -355,6 +355,11 @@ export type ProviderEvent =
    */
   | { type: 'error'; message: string; retryable: boolean; classification?: string; resetAt?: string | null }
   | { type: 'progress'; message: string }
+  /**
+   * The Codex account at `home` (a CODEX_HOME inside the container) is at its quota and the provider is moving to
+   * the next one. Reported to the host so new containers start past it.
+   */
+  | { type: 'codex_account_exhausted'; home: string }
   /** File to deliver as an attachment; the poll-loop owns routing and outbox staging. */
   | { type: 'file'; path: string; filename?: string; text?: string }
   /**
