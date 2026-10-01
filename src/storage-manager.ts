@@ -2568,6 +2568,7 @@ function configuredImageProtection(groupsRoot: string): { imageIds: Set<string>;
           (config) => config.image_tag,
         ),
         ...containerJsonImageTags(groupsRoot),
+        CONTAINER_IMAGE,
       ]
         .map((tag) => tag?.trim())
         .filter((tag): tag is string => Boolean(tag)),

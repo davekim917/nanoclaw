@@ -1995,6 +1995,33 @@ describe('storage-manager Docker cleanup', () => {
     expect(report.actions.filter((action) => action.kind === 'docker-prune-images')).toEqual([]);
   });
 
+  it('protects whatever image the spawn default resolves to, even untagged', () => {
+    containers = [];
+    images = [superseded('sha256:canonical-by-id'), superseded('sha256:superseded')];
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === CONTAINER_RUNTIME_BIN && args.join(' ') === `image inspect --format {{.Id}} ${CONTAINER_IMAGE}`) {
+        return 'sha256:canonical-by-id\n';
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.images.dispositions.find((image) => image.id === 'sha256:canonical-by-id')).toMatchObject({
+      protectionReason: 'configured-image',
+    });
+    expect(report.actions.filter((action) => action.kind === 'docker-prune-images').map((a) => a.dockerArgs)).toEqual([
+      ['image', 'rm', '--no-prune', 'sha256:superseded'],
+    ]);
+  });
+
   it('removes no image when Docker fails to resolve a configured reference for any reason but absence', () => {
     images.push(superseded('sha256:superseded'));
     centralDbMock.current!.db.exec("INSERT INTO container_configs VALUES ('g1', 'nano-rollback')");
