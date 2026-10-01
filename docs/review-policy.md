@@ -37,11 +37,14 @@ does not relax required CI, holds, or merge authorization.
 The substitute, like every review (a delta check after a rebase or ratchet
 regeneration, adversarial verification, a gap analysis), runs on a frontier
 model at `high` effort. There is no list of approved models, because vendors
-ship new frontier models faster than a list can be edited. Instead, the reviewer
-defaults to **the model the dispatching session is running on**: a Claude
-subagent inherits it, or takes the `opus`/`fable` alias, which resolves to the
-newest release; `codex exec` and `opencode run` use their configured model
-unless given `-m`. Effort is a runtime setting — a native spawn's own field, or
+ship new frontier models faster than a list can be edited. Routine reviews
+default to **Opus on Claude** (`--model opus`, or a subagent's `opus` alias) and
+**`gpt-6.1-sol` on Codex** (`codex exec -m gpt-6.1-sol`, passed explicitly
+because an alternate `CODEX_HOME` may configure no model); `opencode run` uses
+its configured model unless given `-m`. `gpt-6-astra` and Fable review only
+when a human explicitly asks for that model in the request — never by default,
+by inheritance, or because the dispatching session runs on one — and a receipt
+naming either cites that request (who, when, and a link or message id). Effort is a runtime setting — a native spawn's own field, or
 a scoped CLI invocation — never prompt wording. `opencode run` has no effort
 flag at all (effort is per-model `options` in the opencode config,
 `container/agent-runner/src/providers/opencode.ts:535-536`), so on that pool
@@ -64,10 +67,10 @@ The reviewer reports its **exact model id from its own runtime** — a Claude
 subagent from its system prompt, Codex from the `-m` it ran with or
 `codex exec`'s session metadata, OpenCode from `-m` — as that first word, and
 the receipt's `--reviewer` copies it verbatim, e.g. `claude-opus-5 (opus)`,
-`gpt-5.6-sol high (codex exec)` or `opencode/deepseek-v4.1-flash (opencode run)`.
+`gpt-6.1-sol high (codex exec)` or `opencode/deepseek-v4.1-flash (opencode run)`.
 Everything after the first word is free text. Nobody has to be free for this:
 the author may start that reviewer as a fresh process
-(`codex exec -c model_reasoning_effort=high`,
+(`codex exec -m gpt-6.1-sol -c model_reasoning_effort=high`,
 `CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model opus --effort high`, or
 `opencode run -m <provider/model> '<prompt>' < /dev/null`) and hand it the
 inputs above.
@@ -85,7 +88,9 @@ and nothing can be derived from one. Two settings govern review, and they
 are independent of each other:
 
 - **Who may review.** Any frontier model; nothing to edit when a new one
-  ships. Only the small-tier denylist, `REVIEWER_DENIED_TIERS` in
+  ships. Eligibility is not dispatch: routine reviews still run on the Opus /
+  `gpt-6.1-sol` defaults above, and `gpt-6-astra` or Fable only on an explicit
+  human request. Only the small-tier denylist, `REVIEWER_DENIED_TIERS` in
   `container/skills/pr-review-loop/scripts/codex-review.sh`, changes — add a
   word when a vendor names a new small tier.
 - **What a Codex subagent runs at.** Codex's native default: the generated
@@ -107,8 +112,10 @@ eligibility immediately, including on heads already receipted, because
 merge-check re-reads the receipt against the current rule. Add a tier word only
 for a genuinely small tier.
 
-**Which reviewer is dispatched** is not a policy question — a reviewer is chosen
-for independence from the artifact's author, not for a worker tier.
+**Which reviewer is dispatched** follows the defaults above — Opus or
+`gpt-6.1-sol` routinely, `gpt-6-astra` or Fable only on an explicit human
+request; within those, a reviewer is chosen for independence from the
+artifact's author, not for a worker tier.
 
 Containers read the generated config at spawn, so an effort change reaches a
 running agent only when its container restarts on the new image.

@@ -42,6 +42,27 @@ rung 3 is correct.
 `gpt-*` model drops to its configured Codex model by the same path before
 falling back to Claude.
 
+### Codex: skipping an account that is already spent
+
+A Codex container can only learn that an account is at its quota by starting an
+app-server on it, so every fresh container used to start on the primary, read
+the wall, and start a second app-server on the next account. Rung 1 now reports
+the spent account to the host (`codex_account_exhausted`), and for the next hour
+the host starts every Codex container that mounts that account on the next one
+instead (`CODEX_START_HOME`).
+
+The mark is keyed by the host Codex home, so groups that share an account share
+the mark. It carries no reset date: a quota can be reset early, so after an hour
+containers start on the account again, until one of them finds it still spent
+and renews the mark.
+It lives in host memory (`src/codex-accounts.ts`); a host restart forgets
+it, which costs one extra app-server start. With every account marked, the
+container starts on the primary and the ladder above runs as usual.
+
+An app-server that does not answer `initialize` within 30 seconds is replaced
+once before the turn fails, because that failure reaches rung 3 and moves the
+whole group to its fallback provider for 15 minutes.
+
 ### What the user sees
 
 When rung 2 succeeds, one line says so — the turn was answered by a different
@@ -78,13 +99,17 @@ re-recorded from 15m and the session goes straight back to the fallback.
 
 ## Where it lives
 
-| Piece                            | File                                             |
-| -------------------------------- | ------------------------------------------------ |
-| Rungs 1–3, the chat lines        | `container/agent-runner/src/poll-loop.ts`        |
-| Availability windows, backoff    | `src/db/provider-health.ts`                      |
-| Spawn-time routing decision      | `src/provider-fallback.ts`                       |
-| `provider_unavailable` handler   | `src/modules/provider-fallback/handler.ts`       |
-| `provider_retry_primary` handler | `src/modules/provider-fallback/retry-primary.ts` |
+| Piece                             | File                                             |
+| --------------------------------- | ------------------------------------------------ |
+| Rungs 1–3, the chat lines         | `container/agent-runner/src/poll-loop.ts`        |
+| Availability windows, backoff     | `src/db/provider-health.ts`                      |
+| Spawn-time routing decision       | `src/provider-fallback.ts`                       |
+| `provider_unavailable` handler    | `src/modules/provider-fallback/handler.ts`       |
+| `provider_retry_primary` handler  | `src/modules/provider-fallback/retry-primary.ts` |
+| `codex_account_exhausted` handler | `src/modules/provider-fallback/codex-account.ts` |
+| Spent Codex accounts, start pick  | `src/codex-accounts.ts`                          |
 
-Both delivery actions are session-scoped and act only on the reporting session's
-own agent group: one records a window, the other clears one.
+The two provider actions are session-scoped and act only on the reporting
+session's own agent group: one records a window, the other clears one.
+`codex_account_exhausted` accepts only a Codex home mounted into the reporting
+group, and its mark reaches every group that mounts the same host account.
