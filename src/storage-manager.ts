@@ -223,7 +223,7 @@ export interface DockerImageDispositionReport extends DockerImageInventory {
 export interface DockerImageProtectionContext {
   now: number;
   canonicalImage: string;
-  configuredImages: Set<string>;
+  configuredImageIds: Set<string>;
   containerImageIds: Set<string>;
   candidateRetentionHours: number;
   legacyGraceHours: number;
@@ -237,21 +237,13 @@ const IMAGE_ROLE_LABEL = 'nanoclaw.image.role';
 // Not `nanoclaw-install`: containers inherit image labels, and that key marks a container as this install's spawn.
 const IMAGE_INSTALL_LABEL = 'nanoclaw.image.install';
 
-function referencesImageId(reference: string, imageId: string): boolean {
-  const hex = reference.startsWith('sha256:') ? reference.slice('sha256:'.length) : reference;
-  return /^[0-9a-f]+$/.test(hex) && imageId.startsWith(`sha256:${hex}`);
-}
-
 export function classifyDockerImage(
   image: DockerImageInventory,
   context: DockerImageProtectionContext,
 ): DockerImageDispositionReport {
   const imageReferences = [...image.repoTags, ...(image.repoDigests ?? [])];
   const isCanonical = imageReferences.includes(context.canonicalImage) || image.id === context.canonicalImage;
-  const isConfigured =
-    imageReferences.some((reference) => context.configuredImages.has(reference)) ||
-    context.configuredImages.has(image.id) ||
-    [...context.configuredImages].some((reference) => referencesImageId(reference, image.id));
+  const isConfigured = context.configuredImageIds.has(image.id);
   const isContainerReferenced = context.containerImageIds.has(image.id);
   const isNanoClawTag = image.repoTags.some(
     (tag) => tag === CONTAINER_IMAGE_BASE || tag.startsWith(`${CONTAINER_IMAGE_BASE}:`),
@@ -2558,25 +2550,35 @@ function containerJsonImageTags(groupsRoot: string): string[] {
     .filter((tag): tag is string => typeof tag === 'string');
 }
 
-function configuredImageProtection(groupsRoot: string): { images: Set<string>; readable: boolean } {
+function resolveImageId(reference: string): string | null {
   try {
+    return dockerOutput(['image', 'inspect', '--format', '{{.Id}}', reference]).trim();
+  } catch (err) {
+    if (/No such image/i.test(String((err as { stderr?: unknown }).stderr ?? ''))) return null;
+    throw err;
+  }
+}
+
+function configuredImageProtection(groupsRoot: string): { imageIds: Set<string>; readable: boolean } {
+  try {
+    const references = new Set(
+      [
+        // Raw and synchronous on purpose: runs in the storage worker (raw-DB allowlist); re-read before `rmi`.
+        ...(getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[]).map(
+          (config) => config.image_tag,
+        ),
+        ...containerJsonImageTags(groupsRoot),
+      ]
+        .map((tag) => tag?.trim())
+        .filter((tag): tag is string => Boolean(tag)),
+    );
     return {
-      images: new Set(
-        [
-          // Raw and synchronous on purpose: runs in the storage worker (raw-DB allowlist); re-read before `rmi`.
-          ...(getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[]).map(
-            (config) => config.image_tag,
-          ),
-          ...containerJsonImageTags(groupsRoot),
-        ]
-          .map((tag) => tag?.trim())
-          .filter((tag): tag is string => Boolean(tag)),
-      ),
+      imageIds: new Set([...references].map(resolveImageId).filter((id): id is string => Boolean(id))),
       readable: true,
     };
   } catch (err) {
-    log.warn('storage-manager: failed to read configured image tags; image deletion disabled', { err });
-    return { images: new Set(), readable: false };
+    log.warn('storage-manager: failed to resolve configured images; image deletion disabled', { err });
+    return { imageIds: new Set(), readable: false };
   }
 }
 
@@ -2592,7 +2594,7 @@ function classifyDockerInventory(
     classifyDockerImage(image, {
       now,
       canonicalImage: CONTAINER_IMAGE,
-      configuredImages: configured.images,
+      configuredImageIds: configured.imageIds,
       containerImageIds,
       candidateRetentionHours: policy.candidateRetentionHours,
       legacyGraceHours: policy.legacyImageGraceHours,

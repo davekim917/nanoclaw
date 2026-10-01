@@ -140,5 +140,6 @@ describe('container image retention metadata', () => {
     expect(source).toContain('nanoclaw.retention.owner=${JSON.stringify(agentGroupId)}');
     expect(source).toContain('nanoclaw.image.role=agent-group');
     expect(source).toContain('nanoclaw.agent_group_id=${JSON.stringify(agentGroupId)}');
+    expect(source).toContain('nanoclaw.image.install=${JSON.stringify(INSTALL_SLUG)}');
   });
 });

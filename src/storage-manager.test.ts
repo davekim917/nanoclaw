@@ -110,6 +110,17 @@ function compactImageInspect(rows: Array<Record<string, unknown>>): string {
     .join('\n');
 }
 
+/** Stands in for the daemon's reference resolution: exact id, id prefix, tag (implicit `:latest`), or digest. */
+function resolveFixtureImage(images: Array<Record<string, unknown>>, reference: string): string | undefined {
+  const tag = reference.includes(':') || reference.includes('@') ? reference : `${reference}:latest`;
+  return images
+    .map((image) => ({
+      id: String(image.Id),
+      refs: [...((image.RepoTags as string[]) ?? []), ...((image.RepoDigests as string[]) ?? [])],
+    }))
+    .find(({ id, refs }) => id === reference || id.startsWith(`sha256:${reference}`) || refs.includes(tag))?.id;
+}
+
 function inspectIds(args: string[]): string[] {
   const formatIndex = args.indexOf('--format');
   return args.slice(formatIndex === -1 ? 2 : formatIndex + 2);
@@ -1574,6 +1585,11 @@ describe('storage-manager Docker cleanup', () => {
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'ls') {
         return images.map((image) => image.Id).join('\n');
       }
+      if (cmd === CONTAINER_RUNTIME_BIN && args.slice(0, 4).join(' ') === 'image inspect --format {{.Id}}') {
+        const id = resolveFixtureImage(images, args[4]!);
+        if (id) return `${id}\n`;
+        throw Object.assign(new Error('exit 1'), { stderr: `Error response from daemon: No such image: ${args[4]}` });
+      }
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
         const rows = images.filter((image) => inspectIds(args).includes(String(image.Id)));
         return args.includes('--format') ? compactImageInspect(rows) : JSON.stringify(rows);
@@ -1952,6 +1968,56 @@ describe('storage-manager Docker cleanup', () => {
       fs.chmodSync(path.join(groupsRoot, 'locked'), 0o700);
       fs.rmSync(groupsRoot, { recursive: true, force: true });
     }
+  });
+
+  it('protects a configured image under whatever reference spelling Docker resolves, and ignores a pin to no image', () => {
+    containers = [];
+    images = [
+      superseded('sha256:rollback', { RepoTags: ['nano-rollback:latest'] }),
+      superseded('sha256:qualified', { RepoTags: ['docker.io/library/nano-qualified:latest'] }),
+    ];
+    centralDbMock.current!.db.exec(
+      "INSERT INTO container_configs VALUES ('g1', 'nano-rollback'), ('g2', 'docker.io/library/nano-qualified:latest'), ('g3', 'gone:1')",
+    );
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.images.dispositions.map((image) => [image.id, image.protectionReason])).toEqual([
+      ['sha256:rollback', 'configured-image'],
+      ['sha256:qualified', 'configured-image'],
+    ]);
+    expect(report.actions.filter((action) => action.kind === 'docker-prune-images')).toEqual([]);
+  });
+
+  it('removes no image when Docker fails to resolve a configured reference for any reason but absence', () => {
+    images.push(superseded('sha256:superseded'));
+    centralDbMock.current!.db.exec("INSERT INTO container_configs VALUES ('g1', 'nano-rollback')");
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === CONTAINER_RUNTIME_BIN && args.slice(0, 4).join(' ') === 'image inspect --format {{.Id}}') {
+        throw Object.assign(new Error('exit 1'), { stderr: 'Cannot connect to the Docker daemon' });
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.actions.filter((action) => action.kind === 'docker-prune-images')).toEqual([]);
+    expect(report.images.dispositions.find((image) => image.id === 'sha256:superseded')).toMatchObject({
+      protectionReason: 'configuration-unreadable',
+    });
   });
 
   it('skips a planned pressure removal of an image tagged before apply once usage reaches the target', () => {
@@ -2359,7 +2425,7 @@ describe('storage-manager image protection', () => {
     return classifyDockerImage(image, {
       now,
       canonicalImage: CONTAINER_IMAGE,
-      configuredImages: new Set<string>(),
+      configuredImageIds: new Set<string>(),
       containerImageIds: new Set<string>(),
       candidateRetentionHours: 168,
       legacyGraceHours: 168,
@@ -2375,7 +2441,7 @@ describe('storage-manager image protection', () => {
       { canonicalImage: CONTAINER_IMAGE },
       'canonical-image',
     ],
-    ['configured image', baseImage, { configuredImages: new Set([baseImage.repoTags[0]]) }, 'configured-image'],
+    ['configured image', baseImage, { configuredImageIds: new Set([baseImage.id]) }, 'configured-image'],
     ['container referenced image', baseImage, { containerImageIds: new Set([baseImage.id]) }, 'container-referenced'],
   ])('protects the %s', (_name, image, context, reason) => {
     expect(classify(image as typeof baseImage, context as never)).toMatchObject({
