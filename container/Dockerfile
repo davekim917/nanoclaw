@@ -161,10 +161,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
     && apt-get install -y --no-install-recommends google-cloud-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Render / Railway / Supabase CLIs (released as prebuilt binaries)
+# Render / Railway / Supabase CLIs and yq (released as prebuilt binaries)
 ARG RENDER_VERSION=2.22.0
 ARG RAILWAY_VERSION=5.28.1
 ARG SUPABASE_VERSION=2.109.1
+ARG YQ_VERSION=4.54.1
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
        -o /tmp/render.zip \
@@ -177,6 +178,9 @@ RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/supabase/cli/releases/download/v${SUPABASE_VERSION}/supabase_${SUPABASE_VERSION}_linux_${DPKG_ARCH}.deb" \
        -o /tmp/supabase.deb \
     && dpkg -i /tmp/supabase.deb \
+    && curl -fsSL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${DPKG_ARCH}" \
+       -o /usr/local/bin/yq \
+    && chmod +x /usr/local/bin/yq \
     && rm -rf /tmp/render.zip /tmp/render /tmp/supabase.deb
 
 # Google MCP Toolbox for Databases — provides --prebuilt looker stdio MCP.
