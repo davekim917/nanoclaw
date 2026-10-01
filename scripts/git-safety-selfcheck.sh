@@ -1951,6 +1951,8 @@ git clone -q "$CLONE_REMOTE" "$OUTSIDE_REPO"
 OUTSIDE="$TOPICS/wg/topic-g/worktrees/outside"
 mkdir -p "$(dirname "$OUTSIDE")" && git -C "$OUTSIDE_REPO" worktree add -q -b topic-g "$OUTSIDE" >/dev/null 2>&1
 echo outside-edit >> "$OUTSIDE/app.txt"
+TRAILING="$TOPICS/wg/topic-i/worktrees/app "
+mkdir -p "$(dirname "$TRAILING")" && git clone -q "$CLONE_REMOTE" "$TRAILING" && echo trailing >> "$TRAILING/app.txt"
 BADSTATUS="$TOPICS/wg/topic-h/worktrees/app"
 mkdir -p "$(dirname "$BADSTATUS")" && git clone -q "$CLONE_REMOTE" "$BADSTATUS"
 echo edit >> "$BADSTATUS/app.txt" && git -C "$BADSTATUS" config status.showUntrackedFiles invalid
@@ -1991,8 +1993,10 @@ for wt in "$LINK1" "$LINK2"; do
   [ "$n" -eq 1 ] && ok "linked topic worktree captured exactly once: ${wt##*/v2-topics/}" \
     || bad "linked topic worktree captured $n times (want 1): $wt" "$MAN_TXT"
 done
-grep -qF "$SPACED  HEAD=" <<<"$MAN_TXT" && ok "a topic checkout whose path has spaces is captured" \
-  || bad "a topic checkout whose path has spaces was not captured" "$MAN_TXT"
+for wt in "$SPACED" "$TRAILING"; do
+  grep -qF "$wt  HEAD=" <<<"$MAN_TXT" && ok "a topic checkout whose path has spaces is captured: [${wt##*/}]" \
+    || bad "a topic checkout whose path has spaces was not captured: [$wt]" "$MAN_TXT"
+done
 for unread in "$OUTSIDE" "$BADSTATUS"; do
   case "$MAN_TXT" in
     *"$unread  HEAD="*) bad "captured a checkout that should be unreadable: $unread" "$MAN_TXT" ;;
@@ -2063,13 +2067,32 @@ if [ "$PROBES" = "filter fsmonitor hook lazy-fetch" ]; then
   [ ! -s "$PWN" ] && ok "a topic repo's fsmonitor, filter driver, reference-transaction hook and promisor transport never run on the host" \
     || bad "container-set git config ran a program on the host" "$(cat "$PWN")"
   case "$OUT" in
-    *"diff for $LAZY"*) ok "a blob that would need a lazy fetch fails that checkout's diff loudly" ;;
+    *"read of $LAZY"*) ok "a blob that would need a lazy fetch fails that checkout's diff loudly" ;;
     *) bad "a missing promisor blob did not surface as a failure" "$OUT" ;;
   esac
   ls "$(latest_snapshot)"topic-*/*-untracked.tgz >/dev/null 2>&1 && ok "the hostile topic repo is still snapshotted" \
     || bad "the hostile topic repo was not snapshotted" "$OUT"
 else
   bad "test setup: plain git fired only [$PROBES] of the planted filter/fsmonitor/hook/lazy-fetch, so the check proves nothing" ""
+fi
+
+# A git read that hangs (a planted FIFO) is cut off at the timeout and fails
+# the run rather than reading as an empty result.
+new_fixture
+echo data/ >> "$NCDIR/.git/info/exclude"
+TOPICS="$NCDIR/data/v2-topics"
+STUCK="$TOPICS/wg/topic-z/worktrees/app"
+mkdir -p "$(dirname "$STUCK")"
+tgit init -q "$STUCK" && echo one > "$STUCK/f.txt" && tgit -C "$STUCK" add f.txt && tgit -C "$STUCK" commit -qm base
+echo two >> "$STUCK/f.txt" && git -C "$STUCK" add f.txt
+mkfifo "$FIX/attrs-fifo" && git -C "$STUCK" config core.attributesFile "$FIX/attrs-fifo"
+START=$(date +%s)
+run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$TOPICS/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry GIT_SAFETY_GIT_TIMEOUT=2
+ELAPSED=$(( $(date +%s) - START ))
+if [ "$RC" -ne 0 ] && [[ "$OUT" == *"hit the 2s limit, so the snapshot is incomplete"* ]] && [ "$ELAPSED" -lt 120 ]; then
+  ok "a git read stuck on a FIFO times out and fails the run (${ELAPSED}s)"
+else
+  bad "a stuck git read did not fail the run within the timeout (rc=$RC, ${ELAPSED}s)" "$OUT"
 fi
 
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"

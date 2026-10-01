@@ -343,10 +343,17 @@ say "Restore groups/ config: git -C groups fetch origin $SNAPSHOT_BRANCH && git 
 # container-set core.fsmonitor, reference-transaction hook, gpg program,
 # filter driver, or promisor remote (whose lazy fetch runs core.sshCommand)
 # would run on the host as this user. The timeout keeps a planted FIFO from
-# hanging the whole run.
+# hanging the whole run; a timed-out read can look like an empty one, so
+# every timeout is logged and fails the run.
 SAFE_GIT=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false -c protocol.allow=never
   -c gpg.program=/bin/false -c gpg.ssh.program=/bin/false -c gpg.x509.program=/bin/false)
-sgit() { GIT_NO_LAZY_FETCH=1 timeout -k 10 "$GIT_TIMEOUT" git "${SAFE_GIT[@]}" "$@"; }
+GIT_TIMEOUT_LOG=$(mktemp); CLEANUP_PATHS+=("$GIT_TIMEOUT_LOG")
+sgit() {
+  local rc=0
+  GIT_NO_LAZY_FETCH=1 timeout -k 10 "$GIT_TIMEOUT" git "${SAFE_GIT[@]}" "$@" || rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then printf '%q ' "$@" | cut -c1-200 >> "$GIT_TIMEOUT_LOG"; fi
+  return "$rc"
+}
 # wgit <worktree> <args> — for commands that read a worktree's files, which
 # run filter drivers. Filters the repo's own config defines are replaced by
 # cat; global and system ones are the operator's and stay. The ceiling stops
@@ -379,7 +386,7 @@ for spec in ${TOPIC_SPECS[@]+"${TOPIC_SPECS[@]}"}; do
     [ -e "$t" ] || [ -L "$t" ] || continue
     real=$(realpath -e "$t" 2>/dev/null)
     top="" common=""
-    if [ ! -L "$t" ] && [ -d "$t" ] && [[ "$real" != *$'\n'* ]]; then
+    if [ ! -L "$t" ] && [ -d "$t" ] && [[ "$t" != *$'\n'* ]]; then
       top=$(sgit -C "$t" rev-parse --show-toplevel 2>/dev/null)
       common=$(common_dir "$t")
     fi
@@ -391,7 +398,7 @@ for spec in ${TOPIC_SPECS[@]+"${TOPIC_SPECS[@]}"}; do
   done
 done
 
-repo_worktrees() { # <repo> <its common dir> -> git's own worktree list plus the topic checkouts sharing its commits
+repo_worktrees() { # <repo> <its common dir>
   { sgit -C "$1" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}'
     printf '%s' "${TOPIC_WTS[$2]:-}"
   } | awk 'NF && !seen[$0]++'
@@ -412,7 +419,7 @@ snapshot_repo() { # <repo path> <label>
   # Pin detached HEADs that hold commits on no remote: once their worktree
   # directory is gone, nothing but the reflog keeps them.
   local live_detached=()
-  while read -r w; do
+  while IFS= read -r w; do
     [ -e "$w" ] || continue
     wgit "$w" symbolic-ref -q HEAD >/dev/null 2>&1 && continue
     h=$(wgit "$w" rev-parse HEAD 2>/dev/null) || continue
@@ -486,7 +493,7 @@ snapshot_repo() { # <repo path> <label>
   # the size cap, and never secret-shaped by filename) as a tarball. A
   # registration is container-writable, so a listed path is captured only
   # when it really is a worktree of this repo.
-  while read -r w; do
+  while IFS= read -r w; do
     [ -e "$w" ] || continue
     r=$(realpath -e "$w" 2>/dev/null) || continue
     [ -z "${CAPTURED[$r]:-}" ] || continue
@@ -508,9 +515,8 @@ snapshot_repo() { # <repo path> <label>
     # never does that rewrite, with or without the variable.
     wgit "$w" diff-index --no-color -p --binary --no-ext-diff --no-textconv --ignore-submodules=dirty HEAD 2>"$pe" |
       gzip -n 2>>"$pe" > "$dir/$s.patch.gz"
-    check_err "$pe" "$label: diff for $w"
     [ -n "$(gzip -dc "$dir/$s.patch.gz" 2>/dev/null | head -c1)" ] || rm -f "$dir/$s.patch.gz"
-    wgit "$w" ls-files --others --exclude-standard -z 2>/dev/null |
+    wgit "$w" ls-files --others --exclude-standard -z 2>>"$pe" |
       while IFS= read -r -d '' f; do
         [ -f "$w/$f" ] || continue
         local bn sz
@@ -526,6 +532,7 @@ snapshot_repo() { # <repo path> <label>
         fi
         printf '%s\0' "$f"
       done > "$list"
+    check_err "$pe" "$label: read of $w"
     if [ -s "$list" ]; then
       # review-683-r2 P3-8: same leak-on-signal reasoning as above.
       local te; te=$(mktemp); CLEANUP_PATHS+=("$te")
@@ -547,7 +554,7 @@ for spec in ${GIT_SAFETY_EXTRA_REPOS:-}; do
     snapshot_repo "$r" "extra-$(slug "$r")"
   done
 done
-while read -r common; do
+while IFS= read -r common; do
   [ -n "$common" ] || continue
   snapshot_repo "$(head -1 <<<"${TOPIC_WTS[$common]}")" "topic-$(slug "$common")"
 done < <(printf '%s\n' "${!TOPIC_WTS[@]}" | sort)
@@ -555,6 +562,7 @@ if [ ${#UNREADABLE[@]} -gt 0 ]; then
   say "checkouts git cannot open (not snapshotted): ${#UNREADABLE[@]}"
   printf '  %q\n' "${UNREADABLE[@]}" >> "$MAN"
 fi
+[ -s "$GIT_TIMEOUT_LOG" ] && FAILURES+=("$(wc -l < "$GIT_TIMEOUT_LOG") git command(s) hit the ${GIT_TIMEOUT}s limit, so the snapshot is incomplete: $(head -3 "$GIT_TIMEOUT_LOG" | tr '\n' ';')")
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # ── phase 2: snapshot groups/'s pending tracked-file edits ──────────────────
