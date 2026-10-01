@@ -39,7 +39,7 @@ function repoWithFilter(name: string): { repo: string; sentinel: string } {
 }
 
 describe('safeGitArgs filter neutralization', () => {
-  for (const [index, name] of ['plain', 'a=b', 'a=b=c', '=', 'dot.ted'].entries()) {
+  for (const [index, name] of ['plain', 'a=b', 'a=b=c', '=', 'dot.ted', '', 'a\u2028b', 'a\u2029b'].entries()) {
     it(`neutralizes repository filter fixture ${index + 1}`, () => {
       const { repo, sentinel } = repoWithFilter(name);
       const gitDir = path.join(repo, '.git');

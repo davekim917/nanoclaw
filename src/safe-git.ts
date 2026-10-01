@@ -75,9 +75,6 @@ export function safeGitFilterNames(gitDir: string, workTree?: string): string[] 
     ...(workTree ? ['--work-tree', workTree] : []),
     'config',
     '--includes',
-    '--name-only',
-    '--get-regexp',
-    '^filter\\..*\\.(clean|smudge|process|required)$',
   ];
   return filterNamesFrom(args);
 }
@@ -91,36 +88,40 @@ function localFilterNames(configPath: string): string[] {
     throw error;
   }
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`unsafe Git config path: ${configPath}`);
-  return filterNamesFrom([
-    'config',
-    '--file',
-    configPath,
-    '--includes',
-    '--name-only',
-    '--get-regexp',
-    '^filter\\..*\\.(clean|smudge|process|required)$',
-  ]);
+  return filterNamesFrom(['config', '--file', configPath, '--includes']);
 }
 
-function filterNamesFrom(args: string[]): string[] {
+const FILTER_VARIABLES = ['clean', 'smudge', 'process', 'required'];
+
+/** Names are sliced from NUL-terminated keys, never matched by a JS pattern, so every name git stores is kept. */
+function filterNamesFrom(configArgs: string[]): string[] {
   let output: Buffer;
   try {
-    // Every name must be found, in whatever bytes the repository wrote it.
-    output = execFileSync('git', args, {
-      env: safeGitEnv({ LANG: 'C', LC_ALL: 'C' }),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 10_000,
-    });
+    // In a UTF-8 locale git's regex `.` skips an invalid byte, so such a name would go undiscovered.
+    output = execFileSync(
+      'git',
+      [...configArgs, '--null', '--name-only', '--get-regexp', `^filter\\..*\\.(${FILTER_VARIABLES.join('|')})$`],
+      {
+        env: safeGitEnv({ LANG: 'C', LC_ALL: 'C' }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000,
+      },
+    );
   } catch (error) {
     const status = (error as NodeJS.ErrnoException & { status?: number }).status;
     if (status === 1) return [];
     throw error;
   }
   const utf8 = new TextDecoder('utf-8', { fatal: true });
+  const keys = utf8.decode(output).split('\0');
+  if (keys.pop() !== '') throw new Error('unterminated git config key');
   const names = new Set<string>();
-  for (const key of utf8.decode(output).split('\n')) {
-    const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/.exec(key.trim());
-    if (match) names.add(match[1]);
+  for (const key of keys) {
+    const variable = FILTER_VARIABLES.find((name) => key.startsWith('filter.') && key.endsWith(`.${name}`));
+    if (variable === undefined || key.length < 'filter.'.length + variable.length + 1) {
+      throw new Error(`unexpected git config key: ${JSON.stringify(key)}`);
+    }
+    names.add(key.slice('filter.'.length, key.length - variable.length - 1));
   }
   return [...names].sort();
 }
