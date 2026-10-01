@@ -10,7 +10,7 @@ const CONTINUE_THREAD_MAX_LENGTH = 512;
 const CONTINUE_THREAD_PATTERN = /^(?:https:\/\/\S+|[A-Za-z0-9][A-Za-z0-9._:-]*)$/;
 
 export const CONTINUE_THREAD_DESCRIPTION =
-  'Optional, and only together with thread_key. An EXISTING thread in the same destination that this key should continue instead of opening a new one: its id as search_threads prints it (thread=...), the bare thread id, or its Discord/Slack link. Used only by the first post under a key that has no thread yet: the host confirms the thread is in this destination, posts there, and every later post with the key goes there too. A key that already has a thread ignores it. If the host cannot confirm the thread, the post opens a new thread as usual.';
+  'Optional, and only together with thread_key. An EXISTING thread in the same destination that this key should continue instead of opening a new one: its id as search_threads prints it (thread=...), the bare thread id, or its Discord/Slack link. This is how you post into ANOTHER thread, including a different thread of the channel you are in (omit `to` for that): the post leaves the current thread. Used only by the first post under a key that has no thread yet: the host confirms the thread is in this destination, posts there, and every later post with the key goes there too. A key that already has a thread ignores it. If the host cannot confirm the thread, the post opens a new thread as usual.';
 
 export function parseContinueThread(
   raw: unknown,
