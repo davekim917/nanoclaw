@@ -78,6 +78,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `guessed safety value` — a tool fills a setting that decides what a protection covers from a heuristic guess; the value passes the syntax check, so a wrong guess silently narrows the protection instead of failing
 - `display denylist` — untrusted text shown to a person is filtered by listing bad characters, so every unlisted invisible, blank or markup-bearing code point still passes; only a closed allowlist ends the class
 - `unbounded wait` — a network call or wait has no deadline, so a peer that stops responding without closing the connection holds its caller (and any pool slot or progress report behind it) forever instead of failing into a retry
+- `name-keyed exemption` — a safety check lets a file or directory pass on its name alone, so whatever sits under that name (a nested repository, exports, a whole project) passes with it; the name says what the thing usually is, not what it holds
 
 ## Lessons
 
