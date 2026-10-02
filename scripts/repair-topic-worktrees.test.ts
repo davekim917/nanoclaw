@@ -374,6 +374,23 @@ describe('repairTopicWorktrees', () => {
     expect(fs.readFileSync(path.join(taken, 'gitdir'), 'utf8')).toBe('/elsewhere/.git\n');
   });
 
+  it('reuses its own admin dir left without a back-pointer by an interrupted run', async () => {
+    buildFixture();
+    const residue = path.join(canonical, '.git', 'worktrees', adminDirName(topicDirName(2), REPO));
+    fs.mkdirSync(residue);
+
+    const report = await repairTopicWorktrees({
+      dataDir,
+      apply: true,
+      scratchDir: root,
+      topics: [`${WORKGROUP}/${topicDirName(2)}`],
+      probes: probes(),
+    });
+
+    expect(entryFor(report.entries, 2)).toMatchObject({ action: 'repaired' });
+    expect(entryFor(report.entries, 2).proof!.adminDir).toBe(fs.realpathSync(residue));
+  });
+
   it('names admin dirs uniquely even when two checkout names sanitise alike', () => {
     expect(adminDirName('thread-x', 'app@a/b')).not.toBe(adminDirName('thread-x', 'app@a-b'));
   });

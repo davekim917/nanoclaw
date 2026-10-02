@@ -450,13 +450,26 @@ function verifyRescue(canonicalGit: string, ref: string, commit: string, tree: s
   if (stored !== commit || storedTree !== tree) throw new Error(`rescue ref ${ref} did not verify`);
 }
 
+/**
+ * The back-pointer of an admin dir under this tool's name, or null when it is free to (re)use: absent, or residue of
+ * a run that died between mkdir and the first write (git never creates a name of this shape).
+ */
+function adminDirOwner(adminDir: string): string | null {
+  try {
+    return fs.readFileSync(path.join(adminDir, 'gitdir'), 'utf8').trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
 function writeAdminDir(adminDir: string, backPointer: string, head: string, lock: boolean): void {
   if (!fs.existsSync(adminDir)) {
     fs.mkdirSync(path.dirname(adminDir), { recursive: true });
     fs.mkdirSync(adminDir);
   }
-  fs.writeFileSync(path.join(adminDir, 'commondir'), '../..\n');
   fs.writeFileSync(path.join(adminDir, 'gitdir'), `${backPointer}\n`);
+  fs.writeFileSync(path.join(adminDir, 'commondir'), '../..\n');
   fs.writeFileSync(path.join(adminDir, 'HEAD'), `${head}\n`);
   if (lock) fs.writeFileSync(path.join(adminDir, 'locked'), LOCK_REASON);
   git(['--git-dir', adminDir, 'read-tree', head], { env: { GIT_INDEX_FILE: path.join(adminDir, 'index') } });
@@ -507,7 +520,7 @@ function recordSnapshot(entry: RepairEntry, snapshot: Snapshot): void {
 function writePointer(checkoutPath: string, adminDir: string): void {
   const fd = fs.openSync(
     path.join(checkoutPath, '.git'),
-    fs.constants.O_WRONLY | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
+    fs.constants.O_WRONLY | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
   );
   try {
     if (!fs.fstatSync(fd).isFile()) throw new Error(`.git is not a regular file: ${checkoutPath}`);
@@ -530,7 +543,8 @@ async function applyRepair(
   const { entry, canonicalGit } = context;
   const adminDir = path.join(canonicalGit, 'worktrees', adminDirName(context.topicDirName, entry.checkout));
   const backPointer = path.join(fs.realpathSync(entry.path), '.git');
-  if (fs.existsSync(adminDir) && fs.readFileSync(path.join(adminDir, 'gitdir'), 'utf8').trim() !== backPointer) {
+  const owner = adminDirOwner(adminDir);
+  if (owner !== null && owner !== backPointer) {
     throw new Error(`admin dir name already taken by another checkout: ${adminDir}`);
   }
 
