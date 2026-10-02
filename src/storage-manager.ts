@@ -117,7 +117,12 @@ const TOPIC_WORKTREES_DIRNAME = 'worktrees';
 // `build`, `.next`, `coverage` (often tracked, may hold uncommitted output), `.cache` (means anything), and
 // `.venv`/`venv` (an ad-hoc `pip install` venv is unique state; do not re-add it as "just a cache").
 // `__pycache__` qualifies: PEP 3147 bytecode is not importable without its `.py`, so it is never the only copy.
-const REGENERABLE_SWEEP_DIR_NAMES = new Set<string>(['node_modules', '.pnpm-store', '.turbo', '__pycache__']);
+export const REGENERABLE_SWEEP_DIR_NAMES: ReadonlySet<string> = new Set<string>([
+  'node_modules',
+  '.pnpm-store',
+  '.turbo',
+  '__pycache__',
+]);
 
 const PRUNABLE_DIR_NAMES = new Set(['node_modules', '.pnpm-store', '.turbo', '.cache']);
 const SKIP_DESCEND_DIR_NAMES = new Set(['.git']);
