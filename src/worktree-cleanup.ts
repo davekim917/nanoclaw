@@ -766,7 +766,7 @@ const RECLAIM_IGNORABLE_DIR_NAMES: ReadonlySet<string> = new Set(['allure-result
 const RECLAIM_IGNORABLE_FILE_SUFFIX = '.tsbuildinfo';
 const NESTED_REPOSITORY_SCAN_LIMIT = 50_000;
 
-/** No `.git` anywhere under `root`; a tree too large or unreadable to finish refuses. */
+/** No repository, `.git` or bare, anywhere under `root`; a tree too large or unreadable to finish refuses. */
 function holdsNoRepository(root: string): boolean {
   const stack = [root];
   let seen = 0;
@@ -778,6 +778,8 @@ function holdsNoRepository(root: string): boolean {
     } catch {
       return false;
     }
+    const names = new Set(entries.map((entry) => entry.name));
+    if (names.has('HEAD') && names.has('objects')) return false;
     for (const entry of entries) {
       if (entry.name === '.git' || ++seen > NESTED_REPOSITORY_SCAN_LIMIT) return false;
       if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(path.join(current, entry.name));
@@ -789,6 +791,8 @@ function holdsNoRepository(root: string): boolean {
 /**
  * `entry` is a porcelain path. Git collapses a directory to one `dir/` entry when it is ignored, and also when it is
  * not but everything in it is, so a listed name counts only once `isIgnoredDirectory` says the directory itself is.
+ * That question goes without the trailing slash: `check-ignore dir/` also matches `dir/*`, which ignores only the
+ * contents.
  */
 function reclaimIgnorable(dir: string, entry: string, isIgnoredDirectory: (entry: string) => boolean): boolean {
   const segments = entry.split('/').filter(Boolean);
@@ -796,7 +800,7 @@ function reclaimIgnorable(dir: string, entry: string, isIgnoredDirectory: (entry
   if (!entry.endsWith('/')) return segments.at(-1)?.endsWith(RECLAIM_IGNORABLE_FILE_SUFFIX) ?? false;
   return (
     RECLAIM_IGNORABLE_DIR_NAMES.has(segments.at(-1) ?? '') &&
-    isIgnoredDirectory(entry) &&
+    isIgnoredDirectory(entry.slice(0, -1)) &&
     holdsNoRepository(path.join(dir, entry))
   );
 }

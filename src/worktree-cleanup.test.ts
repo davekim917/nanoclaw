@@ -985,202 +985,207 @@ describe('branch clone checkouts', () => {
     expect(fs.existsSync(checkoutInheritedTagsPath(refused[0]!.checkout))).toBe(true);
   });
 
-  it('reclaims a clean pushed clone inside an open topic, one checkout at a time, and refuses what is live (#1400)', async () => {
-    const canon = canonicalFixture('repo-a');
-    /** An active session that spoke a minute ago: the topic is open to the orphan-topic loop. */
-    const openRow = (threadId: string) => ({
-      ...row(`s-${threadId}`, threadId, 'active'),
-      folder: 'folder-a',
-      idle_since: new Date(Date.now() - 60_000).toISOString(),
-    });
-    const decide = async (checkout: string): Promise<unknown> => {
-      const target = (await _discoverWorktreesForTesting(state.dataDir)).find((t) => t.worktreePath === checkout);
-      return _cleanupOneForTesting(target!, state.dataDir);
-    };
+  it(
+    'reclaims a clean pushed clone inside an open topic, one checkout at a time, and refuses what is live (#1400)',
+    { timeout: 30_000 },
+    async () => {
+      const canon = canonicalFixture('repo-a');
+      /** An active session that spoke a minute ago: the topic is open to the orphan-topic loop. */
+      const openRow = (threadId: string) => ({
+        ...row(`s-${threadId}`, threadId, 'active'),
+        folder: 'folder-a',
+        idle_since: new Date(Date.now() - 60_000).toISOString(),
+      });
+      const decide = async (checkout: string): Promise<unknown> => {
+        const target = (await _discoverWorktreesForTesting(state.dataDir)).find((t) => t.worktreePath === checkout);
+        return _cleanupOneForTesting(target!, state.dataDir);
+      };
 
-    const refusals: Array<{
-      thread: string;
-      reason: string;
-      arrange: (fixture: { root: string; checkout: string }) => void;
-    }> = [
-      { thread: 'p1400-busy', reason: 'topic-busy', arrange: () => state.running.add('s-p1400-busy') },
-      {
-        thread: 'p1400-mounted',
-        reason: 'container-mounted',
-        arrange: ({ root }) => {
-          state.mounts = [root];
+      const refusals: Array<{
+        thread: string;
+        reason: string;
+        arrange: (fixture: { root: string; checkout: string }) => void;
+      }> = [
+        { thread: 'p1400-busy', reason: 'topic-busy', arrange: () => state.running.add('s-p1400-busy') },
+        {
+          thread: 'p1400-mounted',
+          reason: 'container-mounted',
+          arrange: ({ root }) => {
+            state.mounts = [root];
+          },
         },
-      },
-      {
-        thread: 'p1400-runtime',
-        reason: 'runtime-unreadable',
-        arrange: () => {
-          state.mounts = null;
+        {
+          thread: 'p1400-runtime',
+          reason: 'runtime-unreadable',
+          arrange: () => {
+            state.mounts = null;
+          },
         },
-      },
-      {
-        // A commit, checkout or index refresh leaves the checkout dir's own mtime old.
-        thread: 'p1400-recent',
-        reason: 'recent',
-        arrange: ({ checkout }) => fs.utimesSync(path.join(checkout, '.git', 'index'), new Date(), new Date()),
-      },
-      {
-        // An ignored file the rescue archives would keep, such as an export or a `.env`.
-        thread: 'p1400-ignored',
-        reason: 'ignored-files',
-        arrange: ({ checkout }) => {
-          fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'exports/\n');
-          fs.mkdirSync(path.join(checkout, 'exports'));
-          fs.writeFileSync(path.join(checkout, 'exports', 'q3.csv'), 'a,b\n');
-          age(checkout);
+        {
+          // A commit, checkout or index refresh leaves the checkout dir's own mtime old.
+          thread: 'p1400-recent',
+          reason: 'recent',
+          arrange: ({ checkout }) => fs.utimesSync(path.join(checkout, '.git', 'index'), new Date(), new Date()),
         },
-      },
-      {
-        // An ignored project folder is collapsed to one entry, so the build output inside it does not let it go.
-        thread: 'p1400-ignored-project',
-        reason: 'ignored-files',
-        arrange: ({ checkout }) => {
-          fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'Nested-App/\n');
-          for (const dir of ['src', 'dist']) fs.mkdirSync(path.join(checkout, 'Nested-App', dir), { recursive: true });
-          fs.writeFileSync(path.join(checkout, 'Nested-App', 'src', 'index.ts'), 'export {};\n');
-          fs.writeFileSync(path.join(checkout, 'Nested-App', 'dist', 'index.js'), 'export {};\n');
-          age(checkout);
+        {
+          // An ignored file the rescue archives would keep, such as an export or a `.env`.
+          thread: 'p1400-ignored',
+          reason: 'ignored-files',
+          arrange: ({ checkout }) => {
+            fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'exports/\n');
+            fs.mkdirSync(path.join(checkout, 'exports'));
+            fs.writeFileSync(path.join(checkout, 'exports', 'q3.csv'), 'a,b\n');
+            age(checkout);
+          },
         },
-      },
-      {
-        // `status` reads an entry behind skip-worktree as clean, whatever its file now holds.
-        thread: 'p1400-skip-worktree',
-        reason: 'index-flagged',
-        arrange: ({ checkout }) => {
-          git(checkout, ['update-index', '--skip-worktree', 'README.md']);
-          fs.writeFileSync(path.join(checkout, 'README.md'), 'edited behind the flag\n');
-          age(checkout);
+        {
+          // An ignored project folder is collapsed to one entry, so the build output inside it does not let it go.
+          thread: 'p1400-ignored-project',
+          reason: 'ignored-files',
+          arrange: ({ checkout }) => {
+            fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'Nested-App/\n');
+            for (const dir of ['src', 'dist'])
+              fs.mkdirSync(path.join(checkout, 'Nested-App', dir), { recursive: true });
+            fs.writeFileSync(path.join(checkout, 'Nested-App', 'src', 'index.ts'), 'export {};\n');
+            fs.writeFileSync(path.join(checkout, 'Nested-App', 'dist', 'index.js'), 'export {};\n');
+            age(checkout);
+          },
         },
-      },
-      {
-        // A Git activity file that cannot be read is never evidence of idleness.
-        thread: 'p1400-unreadable-activity',
-        reason: 'recent',
-        arrange: ({ checkout }) => fs.chmodSync(path.join(checkout, '.git', 'logs'), 0o000),
-      },
-      {
-        thread: 'p1400-transfer',
-        reason: 'transfer-referenced',
-        arrange: ({ checkout }) => {
-          const source = unit('p1400-transfer', 's-p1400-transfer');
-          writeTransferTombstone(
-            source,
-            'repo-a',
-            {
-              version: 1,
-              phase: 'prepared',
-              workgroupId: 'wg-a',
-              repo: 'repo-a',
-              sourceWorkUnitKey: source.key,
-              destinationWorkUnitKey: unit('p1400-elsewhere', 's-p1400-elsewhere').key,
-              sourcePath: checkout,
-              destinationPath: path.join(state.dataDir, 'elsewhere'),
-              createdAt: new Date().toISOString(),
-            },
-            state.dataDir,
-          );
+        {
+          // `status` reads an entry behind skip-worktree as clean, whatever its file now holds.
+          thread: 'p1400-skip-worktree',
+          reason: 'index-flagged',
+          arrange: ({ checkout }) => {
+            git(checkout, ['update-index', '--skip-worktree', 'README.md']);
+            fs.writeFileSync(path.join(checkout, 'README.md'), 'edited behind the flag\n');
+            age(checkout);
+          },
         },
-      },
-    ];
-    for (const spec of refusals) {
-      const fixture = cloneCheckout(canon, spec.thread, 'repo-a@feat', 'feat');
-      state.rows = [openRow(spec.thread)];
+        {
+          // A Git activity file that cannot be read is never evidence of idleness.
+          thread: 'p1400-unreadable-activity',
+          reason: 'recent',
+          arrange: ({ checkout }) => fs.chmodSync(path.join(checkout, '.git', 'logs'), 0o000),
+        },
+        {
+          thread: 'p1400-transfer',
+          reason: 'transfer-referenced',
+          arrange: ({ checkout }) => {
+            const source = unit('p1400-transfer', 's-p1400-transfer');
+            writeTransferTombstone(
+              source,
+              'repo-a',
+              {
+                version: 1,
+                phase: 'prepared',
+                workgroupId: 'wg-a',
+                repo: 'repo-a',
+                sourceWorkUnitKey: source.key,
+                destinationWorkUnitKey: unit('p1400-elsewhere', 's-p1400-elsewhere').key,
+                sourcePath: checkout,
+                destinationPath: path.join(state.dataDir, 'elsewhere'),
+                createdAt: new Date().toISOString(),
+              },
+              state.dataDir,
+            );
+          },
+        },
+      ];
+      for (const spec of refusals) {
+        const fixture = cloneCheckout(canon, spec.thread, 'repo-a@feat', 'feat');
+        state.rows = [openRow(spec.thread)];
+        state.running.clear();
+        state.mounts = [];
+        const before = snapshot(fixture.checkout);
+        age(fixture.checkout);
+        spec.arrange(fixture);
+        try {
+          expect(await decide(fixture.checkout), spec.thread).toEqual({ collected: false, reason: spec.reason });
+        } finally {
+          fs.chmodSync(path.join(fixture.checkout, '.git', 'logs'), 0o755);
+        }
+        expect(snapshot(fixture.checkout), spec.thread).toEqual(before);
+      }
+
+      // An unreadable process table refuses rather than reading as "nobody is in there".
+      const blind = cloneCheckout(canon, 'p1400-blind', 'repo-a@feat', 'feat');
+      state.rows = [openRow('p1400-blind')];
+      const realReaddir = fs.readdirSync;
+      const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(((target: fs.PathLike, options?: unknown) => {
+        if (String(target) === '/proc') throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        return (realReaddir as (p: fs.PathLike, o?: unknown) => unknown)(target, options);
+      }) as typeof fs.readdirSync);
+      try {
+        expect(await decide(blind.checkout)).toEqual({ collected: false, reason: 'process-table-unreadable' });
+      } finally {
+        readdir.mockRestore();
+      }
       state.running.clear();
       state.mounts = [];
-      const before = snapshot(fixture.checkout);
-      age(fixture.checkout);
-      spec.arrange(fixture);
+
+      // A live process standing in the checkout, as an agent shell or editor would.
+      const rooted = cloneCheckout(canon, 'p1400-rooted', 'repo-a@feat', 'feat');
+      state.rows = [openRow('p1400-rooted')];
+      const sleeper = spawn('sleep', ['30'], { cwd: rooted.checkout, stdio: 'ignore' });
       try {
-        expect(await decide(fixture.checkout), spec.thread).toEqual({ collected: false, reason: spec.reason });
+        expect(await decide(rooted.checkout)).toEqual({ collected: false, reason: 'process-rooted' });
       } finally {
-        fs.chmodSync(path.join(fixture.checkout, '.git', 'logs'), 0o755);
+        sleeper.kill();
       }
-      expect(snapshot(fixture.checkout), spec.thread).toEqual(before);
-    }
+      expect(fs.existsSync(rooted.checkout)).toBe(true);
 
-    // An unreadable process table refuses rather than reading as "nobody is in there".
-    const blind = cloneCheckout(canon, 'p1400-blind', 'repo-a@feat', 'feat');
-    state.rows = [openRow('p1400-blind')];
-    const realReaddir = fs.readdirSync;
-    const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(((target: fs.PathLike, options?: unknown) => {
-      if (String(target) === '/proc') throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
-      return (realReaddir as (p: fs.PathLike, o?: unknown) => unknown)(target, options);
-    }) as typeof fs.readdirSync);
-    try {
-      expect(await decide(blind.checkout)).toEqual({ collected: false, reason: 'process-table-unreadable' });
-    } finally {
-      readdir.mockRestore();
-    }
-    state.running.clear();
-    state.mounts = [];
-
-    // A live process standing in the checkout, as an agent shell or editor would.
-    const rooted = cloneCheckout(canon, 'p1400-rooted', 'repo-a@feat', 'feat');
-    state.rows = [openRow('p1400-rooted')];
-    const sleeper = spawn('sleep', ['30'], { cwd: rooted.checkout, stdio: 'ignore' });
-    try {
-      expect(await decide(rooted.checkout)).toEqual({ collected: false, reason: 'process-rooted' });
-    } finally {
-      sleeper.kill();
-    }
-    expect(fs.existsSync(rooted.checkout)).toBe(true);
-
-    // The proof still decides once nothing live refuses: dirty work is kept in an open topic too. A repeat pass
-    // over an unchanged checkout reuses that failure; any Git activity re-proves it.
-    const dirty = cloneCheckout(canon, 'p1400-dirty', 'repo-a@feat', 'feat');
-    fs.writeFileSync(path.join(dirty.checkout, 'scratch.txt'), 'uncommitted\n');
-    age(dirty.checkout);
-    state.rows = [openRow('p1400-dirty')];
-    expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
-    const prove = vi.spyOn(disposability, 'proveCheckoutDisposable');
-    try {
+      // The proof still decides once nothing live refuses: dirty work is kept in an open topic too. A repeat pass
+      // over an unchanged checkout reuses that failure; any Git activity re-proves it.
+      const dirty = cloneCheckout(canon, 'p1400-dirty', 'repo-a@feat', 'feat');
+      fs.writeFileSync(path.join(dirty.checkout, 'scratch.txt'), 'uncommitted\n');
+      age(dirty.checkout);
+      state.rows = [openRow('p1400-dirty')];
       expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
-      expect(prove).not.toHaveBeenCalled();
-      const touched = new Date(Date.now() - 20 * 86_400_000);
-      fs.utimesSync(path.join(dirty.checkout, '.git', 'HEAD'), touched, touched);
-      expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
-      expect(prove).toHaveBeenCalled();
-    } finally {
-      prove.mockRestore();
-    }
+      const prove = vi.spyOn(disposability, 'proveCheckoutDisposable');
+      try {
+        expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
+        expect(prove).not.toHaveBeenCalled();
+        const touched = new Date(Date.now() - 20 * 86_400_000);
+        fs.utimesSync(path.join(dirty.checkout, '.git', 'HEAD'), touched, touched);
+        expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
+        expect(prove).toHaveBeenCalled();
+      } finally {
+        prove.mockRestore();
+      }
 
-    // The change itself: the topic stays open, its idle clean pushed clone goes to the trash, and the topic dir stays.
-    // A regenerable ignored tree and another checkout's transfer tombstone do not hold it.
-    const clean = cloneCheckout(canon, 'p1400-clean', 'repo-a@feat', 'feat');
-    fs.writeFileSync(path.join(clean.checkout, '.git', 'info', 'exclude'), 'node_modules/\n');
-    fs.mkdirSync(path.join(clean.checkout, 'node_modules', 'left-pad'), { recursive: true });
-    fs.writeFileSync(path.join(clean.checkout, 'node_modules', 'left-pad', 'index.js'), '\n');
-    const other = unit('p1400-other', 's-p1400-other');
-    writeTransferTombstone(
-      other,
-      'repo-a',
-      {
-        version: 1,
-        phase: 'prepared',
-        workgroupId: 'wg-a',
-        repo: 'repo-a',
-        sourceWorkUnitKey: other.key,
-        destinationWorkUnitKey: unit('p1400-elsewhere-2', 's-p1400-elsewhere-2').key,
-        sourcePath: path.join(state.dataDir, 'not-this-checkout'),
-        destinationPath: path.join(state.dataDir, 'elsewhere-2'),
-        createdAt: new Date().toISOString(),
-      },
-      state.dataDir,
-    );
-    age(clean.checkout);
-    state.rows = [openRow('p1400-clean')];
-    state.trashed = [];
-    expect(await decide(clean.checkout)).toEqual({ collected: true, reason: 'clean-and-pushed' });
-    expect(fs.existsSync(clean.checkout)).toBe(false);
-    expect(fs.existsSync(clean.topicDir)).toBe(true);
-    expect(state.trashed).toHaveLength(1);
-    expect(path.dirname(state.trashed[0]!)).toBe(path.join(state.dataDir, '.gc-quarantine'));
-  });
+      // The change itself: the topic stays open, its idle clean pushed clone goes to the trash, and the topic dir stays.
+      // A regenerable ignored tree and another checkout's transfer tombstone do not hold it.
+      const clean = cloneCheckout(canon, 'p1400-clean', 'repo-a@feat', 'feat');
+      fs.writeFileSync(path.join(clean.checkout, '.git', 'info', 'exclude'), 'node_modules/\n');
+      fs.mkdirSync(path.join(clean.checkout, 'node_modules', 'left-pad'), { recursive: true });
+      fs.writeFileSync(path.join(clean.checkout, 'node_modules', 'left-pad', 'index.js'), '\n');
+      const other = unit('p1400-other', 's-p1400-other');
+      writeTransferTombstone(
+        other,
+        'repo-a',
+        {
+          version: 1,
+          phase: 'prepared',
+          workgroupId: 'wg-a',
+          repo: 'repo-a',
+          sourceWorkUnitKey: other.key,
+          destinationWorkUnitKey: unit('p1400-elsewhere-2', 's-p1400-elsewhere-2').key,
+          sourcePath: path.join(state.dataDir, 'not-this-checkout'),
+          destinationPath: path.join(state.dataDir, 'elsewhere-2'),
+          createdAt: new Date().toISOString(),
+        },
+        state.dataDir,
+      );
+      age(clean.checkout);
+      state.rows = [openRow('p1400-clean')];
+      state.trashed = [];
+      expect(await decide(clean.checkout)).toEqual({ collected: true, reason: 'clean-and-pushed' });
+      expect(fs.existsSync(clean.checkout)).toBe(false);
+      expect(fs.existsSync(clean.topicDir)).toBe(true);
+      expect(state.trashed).toHaveLength(1);
+      expect(path.dirname(state.trashed[0]!)).toBe(path.join(state.dataDir, '.gc-quarantine'));
+    },
+  );
 
   it('the quarantined copy of an open-topic clone is re-proved for ignored files before the trash', async () => {
     const canon = canonicalFixture('repo-a');
@@ -1217,7 +1222,13 @@ describe('branch clone checkouts', () => {
 
   it('lets build output go with an open-topic clone, and keeps refusing other ignored entries', () => {
     const canon = canonicalFixture('repo-a');
-    const cases: Array<{ exclude: string; files: string[]; reason: string; repository?: string }> = [
+    const cases: Array<{
+      exclude: string;
+      files: string[];
+      reason: string;
+      repository?: string;
+      bareRepository?: string;
+    }> = [
       { exclude: 'allure-results/', files: ['allure-results/run-result.json'], reason: 'clean-and-pushed' },
       { exclude: '.pytest_cache/', files: ['.pytest_cache/v/cache/lastfailed'], reason: 'clean-and-pushed' },
       { exclude: '.ruff_cache/', files: ['.ruff_cache/0.6.0/index'], reason: 'clean-and-pushed' },
@@ -1244,6 +1255,16 @@ describe('branch clone checkouts', () => {
       { exclude: 'allure-results', files: ['allure-results'], reason: 'ignored-files' },
       // Git collapses a directory that is not ignored when everything in it is.
       { exclude: '*.csv', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+      // `check-ignore allure-results/` matches these; the directory itself is not ignored.
+      { exclude: '*/*', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+      { exclude: 'allure-results/*', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+      { exclude: '*\n!allure-results', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+      {
+        exclude: '.ruff_cache/',
+        files: ['.ruff_cache/index'],
+        bareRepository: '.ruff_cache/b.git',
+        reason: 'ignored-files',
+      },
       // A repository anywhere inside a listed directory may hold commits that exist nowhere else.
       {
         exclude: '.pytest_cache/',
@@ -1252,13 +1273,14 @@ describe('branch clone checkouts', () => {
         reason: 'ignored-files',
       },
     ];
-    const verdicts = cases.map(({ exclude, files, repository }, index) => {
+    const verdicts = cases.map(({ exclude, files, repository, bareRepository }, index) => {
       const { checkout } = cloneCheckout(canon, `p1404-ignorable-${index}`, 'repo-a@feat', 'feat');
       fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), `${exclude}\n`);
       for (const file of files) {
         fs.mkdirSync(path.dirname(path.join(checkout, file)), { recursive: true });
         fs.writeFileSync(path.join(checkout, file), 'output\n');
       }
+      if (bareRepository) git(checkout, ['init', '-q', '--bare', bareRepository]);
       if (repository) {
         git(path.join(checkout, repository), ['init', '-q']);
         git(path.join(checkout, repository), ['add', '.']);
