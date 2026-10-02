@@ -57,7 +57,8 @@ class GitFailure extends Error {
   }
 }
 
-// No transport, so a promisor remote's lazy fetch cannot run core.sshCommand.
+// No transport, so a promisor remote's lazy fetch cannot run core.sshCommand; no CRLF or untracked-cache warnings,
+// which would fail a benign read under runGit's stderr rule.
 const HOST_GIT_OVERRIDES = [
   '-c',
   'protocol.allow=never',
@@ -274,12 +275,15 @@ function verifyBundle(bundle: HostOwnedPath, objectsDir: string, scratchRoot: Ho
 
 /** Throws on any ref or reflog the host cannot read: git skips an unreadable ref directory or reflog without a word. */
 function assertRefsReadable(commonDir: string): void {
-  const walk = (entry: string): void => {
+  // Buffer paths: a name that is not UTF-8 would decode lossily and then read as absent.
+  const walk = (entry: Buffer): void => {
     let stat: fs.Stats;
     try {
       stat = fs.lstatSync(entry);
       if (stat.isDirectory()) {
-        for (const name of fs.readdirSync(entry)) walk(path.join(entry, name));
+        for (const name of fs.readdirSync(entry, { encoding: 'buffer' })) {
+          walk(Buffer.concat([entry, Buffer.from('/'), name]));
+        }
       } else if (stat.isFile()) {
         fs.accessSync(entry, fs.constants.R_OK);
       }
@@ -287,7 +291,7 @@ function assertRefsReadable(commonDir: string): void {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
   };
-  for (const name of ['refs', 'logs', 'packed-refs']) walk(path.join(commonDir, name));
+  for (const name of ['refs', 'logs', 'packed-refs']) walk(Buffer.from(path.join(commonDir, name)));
 }
 
 /**
@@ -495,6 +499,14 @@ async function captureCheckout(
  * unreadable topic would vanish from the run. Only ENOENT is absence, and past the first wildcard, where a
  * container chose the names, a symlink is listed rather than followed.
  */
+function decodeName(raw: Buffer): string | null {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  } catch {
+    return null;
+  }
+}
+
 function expand(pattern: string): { checkouts: string[]; unreadable: Admission[]; failures: string[] } {
   const isGlob = (segment: string): boolean => /[*?[]/.test(segment);
   const [rootSegment, ...segments] = path.resolve(pattern).split(path.sep);
@@ -514,7 +526,16 @@ function expand(pattern: string): { checkouts: string[]; unreadable: Admission[]
       let names = [segment];
       if (wildcard) {
         try {
-          names = fs.readdirSync(dir).filter((name) => path.matchesGlob(name, segment));
+          names = [];
+          for (const raw of fs.readdirSync(dir, { encoding: 'buffer' })) {
+            const name = decodeName(raw);
+            if (name === null) {
+              const shown = path.join(dir, raw.toString());
+              unreadable.push({ kind: 'unreadable', checkout: shown, reason: 'its name is not UTF-8' });
+            } else if (path.matchesGlob(name, segment)) {
+              names.push(name);
+            }
+          }
         } catch (err) {
           failed(dir, err);
           continue;
@@ -581,6 +602,7 @@ export async function snapshotTopics(options: TopicSnapshotOptions): Promise<Top
     }
   }
 
+  const removed: string[] = [];
   for (const repo of groupRepos(admissions)) {
     const label = labelFor(repo.commonDir);
     const dir = hostChild(outDir, label);
@@ -593,17 +615,23 @@ export async function snapshotTopics(options: TopicSnapshotOptions): Promise<Top
         );
       }
     } catch (err) {
-      if (gone(repo.commonDir)) say(`${label}: ${repo.commonDir} was removed during the run`);
+      if (gone(repo.commonDir)) removed.push(repo.commonDir);
       else result.failures.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
     }
     for (const checkout of repo.checkouts) {
       try {
         if (await captureCheckout(checkout, label, dir, resolved, say)) result.captured += 1;
       } catch (err) {
-        if (gone(checkout)) say(`${label}: ${checkout} was removed during the run`);
+        if (gone(checkout)) removed.push(checkout);
         else result.failures.push(`${label}: ${checkout}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  }
+
+  // A checkout moved away and back mid-run (quarantine, migration rollback) still needed capturing.
+  for (const entry of removed) {
+    if (gone(entry)) say(`${entry} was removed during the run`);
+    else result.failures.push(`${entry}: missing while captured, present after the run`);
   }
 
   if (result.unreadable.length > 0) {

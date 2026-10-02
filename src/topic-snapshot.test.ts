@@ -575,6 +575,29 @@ describe('snapshotTopics', () => {
     expect(manifest()).toContain(`${leaving} was removed during the run`);
   });
 
+  it('lists a topic entry or ref whose name is not UTF-8 instead of reading it as absent', async () => {
+    const odd = path.join(topics, 'wg', 'topic-odd', 'worktrees');
+    fs.mkdirSync(odd, { recursive: true });
+    const oddCheckout = Buffer.concat([Buffer.from(`${odd}/`), Buffer.from([0x61, 0xff])]);
+    git(root, 'clone', '-q', remote, path.join(odd, 'staged'));
+    fs.renameSync(path.join(odd, 'staged'), oddCheckout);
+    const branchy = topic('topic-oddref');
+    git(root, 'clone', '-q', remote, branchy);
+    const refDir = Buffer.concat([Buffer.from(path.join(branchy, '.git', 'refs', 'heads') + '/'), Buffer.from([0xfe])]);
+    fs.mkdirSync(refDir);
+    fs.writeFileSync(Buffer.concat([refDir, Buffer.from('/x')]), `${git(branchy, 'rev-parse', 'HEAD')}\n`);
+    fs.chmodSync(refDir, 0o000);
+    let result: Awaited<ReturnType<typeof snapshotTopics>>;
+    try {
+      result = await snapshotTopics(options);
+    } finally {
+      fs.chmodSync(refDir, 0o755);
+    }
+
+    expect(result.unreadable).toContainEqual(expect.objectContaining({ reason: 'its name is not UTF-8' }));
+    expect(result.failures).toEqual([expect.stringContaining('EACCES')]);
+  });
+
   it('refuses an empty pattern list', async () => {
     await expect(snapshotTopics({ ...options, patterns: [] })).rejects.toThrow(/no topic checkout patterns/);
   });
