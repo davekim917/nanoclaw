@@ -41,7 +41,7 @@ import {
 
 import { gitCommonDirIs } from './canonical-git-commondir.js';
 import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
-import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
+import { ARCHIVE_EXCLUDED_DIR_NAMES, dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
@@ -482,22 +482,79 @@ async function cleanupOne(
 }
 
 /** The dir's own mtime misses a commit, a checkout or an index refresh, so the Git activity files count too. */
-function checkoutIdleDays(checkoutPath: string): number {
-  let newest = 0;
-  for (const file of ['', '.git/HEAD', '.git/index', '.git/logs/HEAD']) {
+const CHECKOUT_ACTIVITY_FILES = ['', '.git/HEAD', '.git/index', '.git/logs/HEAD'];
+/** A failed clone proof is reused while its activity files are unchanged, at most this long (a push moves none). */
+const FAILED_PROOF_REUSE_MS = 24 * 60 * 60 * 1000;
+const failedCloneProofs = new Map<string, { signature: string; at: number; reason: string }>();
+
+function checkoutActivityMtimes(checkoutPath: string): number[] | null {
+  const mtimes: number[] = [];
+  for (const file of CHECKOUT_ACTIVITY_FILES) {
     try {
-      newest = Math.max(newest, fs.lstatSync(path.join(checkoutPath, file)).mtimeMs);
+      mtimes.push(fs.lstatSync(path.join(checkoutPath, file)).mtimeMs);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return 0;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      mtimes.push(0);
     }
   }
+  return mtimes;
+}
+
+function checkoutIdleDays(checkoutPath: string): number {
+  const newest = Math.max(0, ...(checkoutActivityMtimes(checkoutPath) ?? [Date.now()]));
   return newest === 0 ? 0 : (Date.now() - newest) / 86_400_000;
 }
 
+/**
+ * The clone proof plus ignored files: `status` without `--ignored` calls a `.env` or an export clean, and an open
+ * topic may still want them. Ignored trees the rescue archives already drop (node_modules, build output) are not.
+ */
+function cloneCheckoutProof(target: TopicWorktreeTarget): { ok: boolean; reason: string } {
+  const signature = JSON.stringify(checkoutActivityMtimes(target.worktreePath));
+  const prior = failedCloneProofs.get(target.worktreePath);
+  if (prior && prior.signature === signature && Date.now() - prior.at < FAILED_PROOF_REUSE_MS) {
+    return { ok: false, reason: prior.reason };
+  }
+  const env = checkoutGitEnv(target.worktreePath);
+  const filters = repositoryFilterNames(target.worktreePath, env);
+  const status =
+    filters === null
+      ? null
+      : git(
+          target.worktreePath,
+          ['status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=normal'],
+          env,
+          filters,
+        );
+  const kept = status
+    ?.split('\0')
+    .filter((entry) => entry.startsWith('!! '))
+    .some(
+      (entry) =>
+        !entry
+          .slice(3)
+          .split('/')
+          .some((segment) => ARCHIVE_EXCLUDED_DIR_NAMES.includes(segment)),
+    );
+  const proof =
+    status === null || status === undefined
+      ? { ok: false, reason: 'status-unprovable' }
+      : kept
+        ? { ok: false, reason: 'ignored-files' }
+        : disposability.proveCheckoutDisposable({
+            path: target.worktreePath,
+            shape: target.shape,
+            inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
+          });
+  if (proof.ok) failedCloneProofs.delete(target.worktreePath);
+  else failedCloneProofs.set(target.worktreePath, { signature, at: Date.now(), reason: proof.reason });
+  return proof;
+}
+
 function cloneCheckoutRefusal(target: TopicWorktreeTarget, dataDir: string, liveness: () => Liveness): string | null {
-  if (topicIsBusy(target.participants, dataDir)) return 'topic-busy';
-  if (transferReferencesPath(target, dataDir)) return 'transfer-referenced';
   if (checkoutIdleDays(target.worktreePath) < MINIMUM_IDLE_DAYS) return 'recent';
+  if (transferReferencesPath(target, dataDir)) return 'transfer-referenced';
+  if (topicIsBusy(target.participants, dataDir)) return 'topic-busy';
   const { mounts, cwds } = liveness();
   if (mounts === null) return 'runtime-unreadable';
   if (relationToMounts(target.worktreePath, mounts) !== 'clear') return 'container-mounted';
@@ -521,14 +578,7 @@ export async function previewCloneCheckoutCleanup(dataDir: string = DATA_DIR): P
   for (const target of discover(dataDir, rows).targets.filter((entry) => entry.shape === 'clone')) {
     preview.examined += 1;
     const refused = cloneCheckoutRefusal(target, dataDir, liveness);
-    const proof =
-      refused === null
-        ? disposability.proveCheckoutDisposable({
-            path: target.worktreePath,
-            shape: target.shape,
-            inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
-          })
-        : null;
+    const proof = refused === null ? cloneCheckoutProof(target) : null;
     if (proof?.ok) {
       preview.collectable.push({ path: target.worktreePath, bytes: dirSizeBytes(target.worktreePath) });
     } else {
@@ -540,9 +590,9 @@ export async function previewCloneCheckoutCleanup(dataDir: string = DATA_DIR): P
 }
 
 /**
- * The clone branch of worktree cleanup, per checkout even in an open topic: a clean clone with every ref on origin
- * loses nothing, and repository_checkout rebuilds it. It needs the topic not busy, nothing mounting or standing in
- * the checkout, MINIMUM_IDLE_DAYS idle, and proveCheckoutDisposable at scope `all`; then quarantine, re-prove the
+ * The clone branch of worktree cleanup, per checkout even in an open topic: a clone with every ref on origin and no
+ * kept ignored file is rebuilt by repository_checkout. It needs the topic not busy, nothing mounting or standing in
+ * the checkout, MINIMUM_IDLE_DAYS idle, and cloneCheckoutProof; then quarantine, re-prove the
  * moved copy, and trash. Every check re-runs under the lifecycle claim and repository lock repository_checkout
  * holds, so a checkout request cannot reuse the directory mid-collection.
  */
@@ -568,13 +618,9 @@ async function cleanupCloneCheckout(
       (): CloneCleanupDecision => {
         const late = refusal();
         if (late) return { collected: false, reason: late };
-        const proof = disposability.proveCheckoutDisposable({
-          path: target.worktreePath,
-          shape: target.shape,
-          inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
-        });
+        const proof = cloneCheckoutProof(target);
         if (!proof.ok) {
-          if (idleDays(target.worktreePath) >= STALE_WARNING_DAYS) {
+          if (checkoutIdleDays(target.worktreePath) >= STALE_WARNING_DAYS) {
             log.warn('Worktree cleanup: preserving stale clone checkout', { ...context, reason: proof.reason });
           }
           return { collected: false, reason: proof.reason };
@@ -710,7 +756,8 @@ export interface GcReport {
   collected: number;
   reclaimableBytes: Record<GcCategory, number>;
   skips: Record<string, number>;
-  skipBytes: Record<string, number>;
+  /** Bytes the skipped orphan topics hold, by reason; clone skips are not sized. */
+  topicSkipBytes: Record<string, number>;
   unmeasuredSkips: number;
   candidates: GcCandidate[];
 }
@@ -723,7 +770,7 @@ function emptyReport(mode: 'dry-run' | 'apply', ran: boolean): GcReport {
     collected: 0,
     reclaimableBytes: { 'orphan-topic': 0, clone: 0 },
     skips: {},
-    skipBytes: {},
+    topicSkipBytes: {},
     unmeasuredSkips: 0,
     candidates: [],
   };
@@ -974,7 +1021,9 @@ function record(report: GcReport, candidate: GcCandidate): void {
     report.reclaimableBytes[candidate.category] += candidate.bytes;
   } else {
     report.skips[candidate.reason] = (report.skips[candidate.reason] ?? 0) + 1;
-    report.skipBytes[candidate.reason] = (report.skipBytes[candidate.reason] ?? 0) + candidate.bytes;
+    if (candidate.category === 'orphan-topic') {
+      report.topicSkipBytes[candidate.reason] = (report.topicSkipBytes[candidate.reason] ?? 0) + candidate.bytes;
+    }
   }
 }
 
@@ -2167,7 +2216,9 @@ export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: st
       report.collected -= 1;
       report.reclaimableBytes[candidate.category] -= candidate.bytes;
       report.skips[reason] = (report.skips[reason] ?? 0) + 1;
-      report.skipBytes[reason] = (report.skipBytes[reason] ?? 0) + candidate.bytes;
+      if (candidate.category === 'orphan-topic') {
+        report.topicSkipBytes[reason] = (report.topicSkipBytes[reason] ?? 0) + candidate.bytes;
+      }
     };
     const mounts = runningContainerMounts();
     const cwds = liveProcessCwds();
@@ -2224,7 +2275,7 @@ export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: st
     collected: report.collected,
     reclaimableBytes: report.reclaimableBytes,
     skips: report.skips,
-    skipBytes: report.skipBytes,
+    topicSkipBytes: report.topicSkipBytes,
     unmeasuredSkips: report.unmeasuredSkips,
   });
   return report;

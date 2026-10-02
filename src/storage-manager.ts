@@ -90,7 +90,7 @@ const THREAD_RESCUES_DIRNAME = 'thread-rescues';
 export const SESSION_RECLAIM_JOURNAL_FILENAME = 'reclaim-journal.jsonl';
 // Excluded from rescue archives only (not worth the bytes). NOT a deletion allowlist:
 // `REGENERABLE_SWEEP_DIR_NAMES` authorizes removal and is deliberately narrower. Do not merge them.
-const ARCHIVE_EXCLUDED_DIR_NAMES = [
+export const ARCHIVE_EXCLUDED_DIR_NAMES = [
   'node_modules',
   '.pnpm-store',
   '.turbo',

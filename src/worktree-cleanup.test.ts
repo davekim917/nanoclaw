@@ -1022,6 +1022,23 @@ describe('branch clone checkouts', () => {
         arrange: ({ checkout }) => fs.utimesSync(path.join(checkout, '.git', 'index'), new Date(), new Date()),
       },
       {
+        // An ignored file the rescue archives would keep, such as an export or a `.env`.
+        thread: 'p1400-ignored',
+        reason: 'ignored-files',
+        arrange: ({ checkout }) => {
+          fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'exports/\n');
+          fs.mkdirSync(path.join(checkout, 'exports'));
+          fs.writeFileSync(path.join(checkout, 'exports', 'q3.csv'), 'a,b\n');
+          age(checkout);
+        },
+      },
+      {
+        // A Git activity file that cannot be read is never evidence of idleness.
+        thread: 'p1400-unreadable-activity',
+        reason: 'recent',
+        arrange: ({ checkout }) => fs.chmodSync(path.join(checkout, '.git', 'logs'), 0o000),
+      },
+      {
         thread: 'p1400-transfer',
         reason: 'transfer-referenced',
         arrange: ({ checkout }) => {
@@ -1050,10 +1067,29 @@ describe('branch clone checkouts', () => {
       state.rows = [openRow(spec.thread)];
       state.running.clear();
       state.mounts = [];
-      spec.arrange(fixture);
       const before = snapshot(fixture.checkout);
-      expect(await decide(fixture.checkout), spec.thread).toEqual({ collected: false, reason: spec.reason });
+      age(fixture.checkout);
+      spec.arrange(fixture);
+      try {
+        expect(await decide(fixture.checkout), spec.thread).toEqual({ collected: false, reason: spec.reason });
+      } finally {
+        fs.chmodSync(path.join(fixture.checkout, '.git', 'logs'), 0o755);
+      }
       expect(snapshot(fixture.checkout), spec.thread).toEqual(before);
+    }
+
+    // An unreadable process table refuses rather than reading as "nobody is in there".
+    const blind = cloneCheckout(canon, 'p1400-blind', 'repo-a@feat', 'feat');
+    state.rows = [openRow('p1400-blind')];
+    const realReaddir = fs.readdirSync;
+    const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(((target: fs.PathLike, options?: unknown) => {
+      if (String(target) === '/proc') throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return (realReaddir as (p: fs.PathLike, o?: unknown) => unknown)(target, options);
+    }) as typeof fs.readdirSync);
+    try {
+      expect(await decide(blind.checkout)).toEqual({ collected: false, reason: 'process-table-unreadable' });
+    } finally {
+      readdir.mockRestore();
     }
     state.running.clear();
     state.mounts = [];
@@ -1069,15 +1105,49 @@ describe('branch clone checkouts', () => {
     }
     expect(fs.existsSync(rooted.checkout)).toBe(true);
 
-    // The proof still decides once nothing live refuses: dirty work is kept in an open topic too.
+    // The proof still decides once nothing live refuses: dirty work is kept in an open topic too. A repeat pass
+    // over an unchanged checkout reuses that failure; any Git activity re-proves it.
     const dirty = cloneCheckout(canon, 'p1400-dirty', 'repo-a@feat', 'feat');
     fs.writeFileSync(path.join(dirty.checkout, 'scratch.txt'), 'uncommitted\n');
     age(dirty.checkout);
     state.rows = [openRow('p1400-dirty')];
     expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
+    const prove = vi.spyOn(disposability, 'proveCheckoutDisposable');
+    try {
+      expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
+      expect(prove).not.toHaveBeenCalled();
+      const touched = new Date(Date.now() - 20 * 86_400_000);
+      fs.utimesSync(path.join(dirty.checkout, '.git', 'HEAD'), touched, touched);
+      expect(await decide(dirty.checkout)).toEqual({ collected: false, reason: 'dirty' });
+      expect(prove).toHaveBeenCalled();
+    } finally {
+      prove.mockRestore();
+    }
 
     // The change itself: the topic stays open, its idle clean pushed clone goes to the trash, and the topic dir stays.
+    // A regenerable ignored tree and another checkout's transfer tombstone do not hold it.
     const clean = cloneCheckout(canon, 'p1400-clean', 'repo-a@feat', 'feat');
+    fs.writeFileSync(path.join(clean.checkout, '.git', 'info', 'exclude'), 'node_modules/\n');
+    fs.mkdirSync(path.join(clean.checkout, 'node_modules', 'left-pad'), { recursive: true });
+    fs.writeFileSync(path.join(clean.checkout, 'node_modules', 'left-pad', 'index.js'), '\n');
+    const other = unit('p1400-other', 's-p1400-other');
+    writeTransferTombstone(
+      other,
+      'repo-a',
+      {
+        version: 1,
+        phase: 'prepared',
+        workgroupId: 'wg-a',
+        repo: 'repo-a',
+        sourceWorkUnitKey: other.key,
+        destinationWorkUnitKey: unit('p1400-elsewhere-2', 's-p1400-elsewhere-2').key,
+        sourcePath: path.join(state.dataDir, 'not-this-checkout'),
+        destinationPath: path.join(state.dataDir, 'elsewhere-2'),
+        createdAt: new Date().toISOString(),
+      },
+      state.dataDir,
+    );
+    age(clean.checkout);
     state.rows = [openRow('p1400-clean')];
     state.trashed = [];
     expect(await decide(clean.checkout)).toEqual({ collected: true, reason: 'clean-and-pushed' });
@@ -1129,9 +1199,9 @@ describe('branch clone checkouts', () => {
     const report = await runStorageGcOnce(state.dataDir, groupsDir);
     expect(find(report, open.topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
     expect(find(report, dirty.topicDir)).toMatchObject({ collect: false, reason: 'dirty' });
-    expect(report.skipBytes['topic-open']).toBe(find(report, open.topicDir)!.bytes);
-    expect(report.skipBytes['topic-open']).toBeGreaterThan(0);
-    expect(report.skipBytes.dirty).toBeGreaterThan(4096);
+    expect(report.topicSkipBytes['topic-open']).toBe(find(report, open.topicDir)!.bytes);
+    expect(report.topicSkipBytes['topic-open']).toBeGreaterThan(0);
+    expect(report.topicSkipBytes.dirty).toBeGreaterThan(4096);
     expect(report.unmeasuredSkips).toBe(0);
   });
 

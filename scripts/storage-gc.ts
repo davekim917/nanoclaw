@@ -22,11 +22,14 @@ console.log(`storage GC ran (${report.mode}): examined ${report.examined}, colle
 for (const category of Object.keys(report.reclaimableBytes) as GcCategory[]) {
   console.log(`  reclaimable ${category}: ${gb(report.reclaimableBytes[category])}`);
 }
-console.log(
-  `  skips (count, held)${report.unmeasuredSkips ? ` — ${report.unmeasuredSkips} past the size budget, unmeasured` : ''}:`,
-);
+console.log('  skips:');
 for (const [reason, count] of Object.entries(report.skips).sort((a, b) => b[1] - a[1])) {
-  console.log(`    ${String(count).padStart(5)}  ${gb(report.skipBytes[reason] ?? 0).padStart(9)}  ${reason}`);
+  console.log(`    ${String(count).padStart(5)}  ${reason}`);
+}
+const unsized = report.unmeasuredSkips ? `, ${report.unmeasuredSkips} past the size budget and unsized` : '';
+console.log(`  held by skipped topics${unsized}:`);
+for (const [reason, bytes] of Object.entries(report.topicSkipBytes).sort((a, b) => b[1] - a[1])) {
+  console.log(`    ${gb(bytes).padStart(9)}  ${reason}`);
 }
 for (const candidate of report.candidates.filter((entry) => entry.collect)) {
   console.log(
@@ -45,6 +48,7 @@ if (report.mode === 'dry-run') {
   console.log(
     `worktree cleanup would collect ${preview.collectable.length} of ${preview.examined} clone checkouts: ${gb(total)}`,
   );
+  console.log('  (topic-busy here reads persisted state only; running containers show as container-mounted)');
   for (const [reason, count] of Object.entries(preview.refusals).sort((a, b) => b[1] - a[1])) {
     console.log(`    ${String(count).padStart(5)}  ${reason}`);
   }

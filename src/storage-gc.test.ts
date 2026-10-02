@@ -302,7 +302,7 @@ describe('storage GC — evidence', () => {
     expect(didNotRun.examined).toBe(0);
   });
 
-  it('reports a reason for every skip and bytes for every collection', async () => {
+  it('reports a reason for every skip and bytes for every candidate topic, counting only collections as reclaimable', async () => {
     const clean = topicFixture('thread-clean');
     const dirty = topicFixture('thread-dirty');
     fs.writeFileSync(path.join(dirty.worktree, 'scratch.txt'), 'x');
@@ -310,12 +310,13 @@ describe('storage GC — evidence', () => {
     const report = await runStorageGcOnce(state.dataDir, state.groupsDir);
     expect(report.mode).toBe('dry-run');
     expect(report.examined).toBe(2);
-    for (const candidate of report.candidates) {
-      expect(candidate.reason).not.toBe('');
-      if (!candidate.collect) expect(candidate.bytes).toBe(0);
-    }
+    for (const candidate of report.candidates) expect(candidate.reason).not.toBe('');
+    const skipped = find(report, dirty.topicDir)!;
+    expect(skipped).toMatchObject({ collect: false, reason: 'dirty' });
+    expect(skipped.bytes).toBeGreaterThan(0);
+    expect(report.topicSkipBytes).toEqual({ dirty: skipped.bytes });
     expect(find(report, clean.topicDir)!.bytes).toBeGreaterThan(0);
-    expect(report.reclaimableBytes['orphan-topic']).toBeGreaterThan(0);
+    expect(report.reclaimableBytes['orphan-topic']).toBe(find(report, clean.topicDir)!.bytes);
   });
 
   it('does not remove anything without NANOCLAW_STORAGE_GC=apply', async () => {
