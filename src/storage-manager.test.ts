@@ -3271,10 +3271,19 @@ describe('storage-manager regenerable tree sweep', () => {
     );
   });
 
-  // Every name here is on ARCHIVE_EXCLUDED_DIR_NAMES and deliberately NOT on
-  // REGENERABLE_SWEEP_DIR_NAMES. Not archiving a tree is a very different claim
-  // from being allowed to delete the only copy of it.
-  const NEVER_SWEPT = ['dist', 'build', '.next', 'coverage', '.cache'];
+  // Deliberately NOT on REGENERABLE_SWEEP_DIR_NAMES, which deletes with no git
+  // proof. Not archiving a tree, or trashing it with a proven clean and pushed
+  // checkout, is a very different claim from being allowed to delete it here.
+  const NEVER_SWEPT = [
+    'dist',
+    'build',
+    '.next',
+    'coverage',
+    '.cache',
+    'allure-results',
+    '.pytest_cache',
+    '.ruff_cache',
+  ];
 
   it('never sweeps build output directories, only dependency-install output', () => {
     const { topicDir, repoDir } = makeTopic('thread-22222222222222222222222222222222');

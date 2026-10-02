@@ -1036,13 +1036,14 @@ describe('branch clone checkouts', () => {
         },
       },
       {
-        // Build output is not regenerable from a tracked file the way node_modules is; it may be the only copy.
-        thread: 'p1400-ignored-dist',
+        // An ignored project folder is collapsed to one entry, so the build output inside it does not let it go.
+        thread: 'p1400-ignored-project',
         reason: 'ignored-files',
         arrange: ({ checkout }) => {
-          fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'dist/\n');
-          fs.mkdirSync(path.join(checkout, 'dist'));
-          fs.writeFileSync(path.join(checkout, 'dist', 'report.pdf'), 'pdf\n');
+          fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'Nested-App/\n');
+          for (const dir of ['src', 'dist']) fs.mkdirSync(path.join(checkout, 'Nested-App', dir), { recursive: true });
+          fs.writeFileSync(path.join(checkout, 'Nested-App', 'src', 'index.ts'), 'export {};\n');
+          fs.writeFileSync(path.join(checkout, 'Nested-App', 'dist', 'index.js'), 'export {};\n');
           age(checkout);
         },
       },
@@ -1212,6 +1213,49 @@ describe('branch clone checkouts', () => {
     }
     expect(fs.readFileSync(path.join(fixture.checkout, 'exports', 'late.csv'), 'utf8')).toBe('a,b\n');
     expect(state.trashed).toEqual([]);
+  });
+
+  it('lets build output go with an open-topic clone, and keeps refusing other ignored entries', () => {
+    const canon = canonicalFixture('repo-a');
+    const cases: Array<{ exclude: string; files: string[]; reason: string }> = [
+      { exclude: 'allure-results/', files: ['allure-results/run-result.json'], reason: 'clean-and-pushed' },
+      { exclude: 'dist/', files: ['dist/index.js'], reason: 'clean-and-pushed' },
+      { exclude: '.pytest_cache/', files: ['.pytest_cache/v/cache/lastfailed'], reason: 'clean-and-pushed' },
+      { exclude: '.ruff_cache/', files: ['.ruff_cache/0.6.0/index'], reason: 'clean-and-pushed' },
+      {
+        exclude: '*.tsbuildinfo',
+        files: ['tsconfig.tsbuildinfo', 'tsconfig.build.tsbuildinfo'],
+        reason: 'clean-and-pushed',
+      },
+      { exclude: '.venv/', files: ['.venv/lib/site.py'], reason: 'ignored-files' },
+      { exclude: 'deployment_packages/', files: ['deployment_packages/bundle.zip'], reason: 'ignored-files' },
+      { exclude: '.gitnexus/', files: ['.gitnexus/index.db'], reason: 'ignored-files' },
+      { exclude: '.expo/', files: ['.expo/settings.json'], reason: 'ignored-files' },
+      { exclude: 'logs/', files: ['logs/run.log'], reason: 'ignored-files' },
+      { exclude: '*.csv', files: ['report.tsbuildinfo.csv'], reason: 'ignored-files' },
+      { exclude: 'cache.tsbuildinfo/', files: ['cache.tsbuildinfo/data.json'], reason: 'ignored-files' },
+      {
+        exclude: 'Nested-App/',
+        files: ['Nested-App/src/index.ts', 'Nested-App/dist/index.js'],
+        reason: 'ignored-files',
+      },
+    ];
+    const verdicts = cases.map(({ exclude, files }, index) => {
+      const { checkout } = cloneCheckout(canon, `p1404-ignorable-${index}`, 'repo-a@feat', 'feat');
+      fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), `${exclude}\n`);
+      for (const file of files) {
+        fs.mkdirSync(path.dirname(path.join(checkout, file)), { recursive: true });
+        fs.writeFileSync(path.join(checkout, file), 'output\n');
+      }
+      age(checkout);
+      return disposability.proveCheckoutDisposable({
+        path: checkout,
+        shape: 'clone',
+        inheritedTagsRecord: checkoutInheritedTagsPath(checkout),
+        liveTopic: true,
+      }).reason;
+    });
+    expect(verdicts).toEqual(cases.map((entry) => entry.reason));
   });
 
   it('never runs a filter an embedded repository configures while proving a clone in an open topic', async () => {

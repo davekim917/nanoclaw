@@ -758,6 +758,27 @@ function gcMode(): 'dry-run' | 'apply' {
 }
 
 /**
+ * Ignored output a clean, fully pushed checkout may take to the trash. Wider than REGENERABLE_SWEEP_DIR_NAMES on
+ * purpose: that set lets the regenerable sweep delete from live checkouts with no git proof, so it stays narrow.
+ */
+const RECLAIM_IGNORABLE_DIR_NAMES: ReadonlySet<string> = new Set([
+  ...REGENERABLE_SWEEP_DIR_NAMES,
+  'allure-results',
+  'dist',
+  '.pytest_cache',
+  '.ruff_cache',
+]);
+const RECLAIM_IGNORABLE_FILE_SUFFIX = '.tsbuildinfo';
+
+/** `entry` is a porcelain path; a wholly ignored directory arrives collapsed, with a trailing `/`. */
+function reclaimIgnorable(entry: string): boolean {
+  const isDirectory = entry.endsWith('/');
+  const segments = entry.split('/').filter(Boolean);
+  if (!isDirectory && segments.at(-1)?.endsWith(RECLAIM_IGNORABLE_FILE_SUFFIX)) return true;
+  return (isDirectory ? segments : segments.slice(0, -1)).some((segment) => RECLAIM_IGNORABLE_DIR_NAMES.has(segment));
+}
+
+/**
  * A `git worktree lock` marker makes a checkout non-disposable: the agent said "don't touch", and `worktree prune`
  * (git 2.43) keeps a locked registration even once its path is gone. No-op for a plain clone.
  */
@@ -820,13 +841,7 @@ function provenDisposable(
     const kept = ignored
       .split('\0')
       .filter((entry) => entry.startsWith('!! '))
-      .some(
-        (entry) =>
-          !entry
-            .slice(3)
-            .split('/')
-            .some((segment) => REGENERABLE_SWEEP_DIR_NAMES.has(segment)),
-      );
+      .some((entry) => !reclaimIgnorable(entry.slice(3)));
     if (kept) return { ok: false, reason: 'ignored-files' };
   }
 
