@@ -41,7 +41,7 @@ import {
 
 import { gitCommonDirIs } from './canonical-git-commondir.js';
 import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
-import { ARCHIVE_EXCLUDED_DIR_NAMES, dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
+import { dirSizeBytes, REGENERABLE_SWEEP_DIR_NAMES, sessionWasReclaimed } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
@@ -506,8 +506,8 @@ function checkoutIdleDays(checkoutPath: string): number {
 }
 
 /**
- * The clone proof plus ignored files: `status` without `--ignored` calls a `.env` or an export clean, and an open
- * topic may still want them. Ignored trees the rescue archives already drop (node_modules, build output) are not.
+ * The topic-clone proof: plain `status` calls an ignored export or `.env` clean, and an open topic may still want
+ * it, so every ignored path outside the regenerable trees refuses.
  */
 function cloneCheckoutProof(target: TopicWorktreeTarget): { ok: boolean; reason: string } {
   const signature = JSON.stringify(checkoutActivityMtimes(target.worktreePath));
@@ -515,37 +515,12 @@ function cloneCheckoutProof(target: TopicWorktreeTarget): { ok: boolean; reason:
   if (prior && prior.signature === signature && Date.now() - prior.at < FAILED_PROOF_REUSE_MS) {
     return { ok: false, reason: prior.reason };
   }
-  const env = checkoutGitEnv(target.worktreePath);
-  const filters = repositoryFilterNames(target.worktreePath, env);
-  const status =
-    filters === null
-      ? null
-      : git(
-          target.worktreePath,
-          ['status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=normal'],
-          env,
-          filters,
-        );
-  const kept = status
-    ?.split('\0')
-    .filter((entry) => entry.startsWith('!! '))
-    .some(
-      (entry) =>
-        !entry
-          .slice(3)
-          .split('/')
-          .some((segment) => ARCHIVE_EXCLUDED_DIR_NAMES.includes(segment)),
-    );
-  const proof =
-    status === null || status === undefined
-      ? { ok: false, reason: 'status-unprovable' }
-      : kept
-        ? { ok: false, reason: 'ignored-files' }
-        : disposability.proveCheckoutDisposable({
-            path: target.worktreePath,
-            shape: target.shape,
-            inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
-          });
+  const proof = disposability.proveCheckoutDisposable({
+    path: target.worktreePath,
+    shape: target.shape,
+    inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
+    refuseIgnored: true,
+  });
   if (proof.ok) failedCloneProofs.delete(target.worktreePath);
   else failedCloneProofs.set(target.worktreePath, { signature, at: Date.now(), reason: proof.reason });
   return proof;
@@ -797,6 +772,7 @@ function provenDisposable(
   dir: string,
   scope: 'head' | 'all',
   inheritedTags: ReadonlyMap<string, string> | null = null,
+  refuseIgnored = false,
 ): { ok: boolean; reason: string } {
   if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
   const env = checkoutGitEnv(dir);
@@ -818,6 +794,33 @@ function provenDisposable(
   );
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
+  if (refuseIgnored) {
+    const ignored = git(
+      dir,
+      [
+        'status',
+        '--porcelain=v1',
+        '-z',
+        '--ignored=traditional',
+        '--untracked-files=normal',
+        '--ignore-submodules=all',
+      ],
+      env,
+      filters,
+    );
+    if (ignored === null) return { ok: false, reason: 'status-unprovable' };
+    const kept = ignored
+      .split('\0')
+      .filter((entry) => entry.startsWith('!! '))
+      .some(
+        (entry) =>
+          !entry
+            .slice(3)
+            .split('/')
+            .some((segment) => REGENERABLE_SWEEP_DIR_NAMES.has(segment)),
+      );
+    if (kept) return { ok: false, reason: 'ignored-files' };
+  }
 
   const stashVerdict = (): { ok: boolean; reason: string } | null => {
     const stash = git(dir, ['stash', 'list'], env);
@@ -885,7 +888,7 @@ function provenDisposable(
  * undecided shape is refused. Only a topic clone has an inherited-tags record; without one every tag counts.
  */
 export function proveCheckoutDisposable(
-  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { inheritedTagsRecord?: string | null },
+  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { inheritedTagsRecord?: string | null; refuseIgnored?: boolean },
 ): {
   ok: boolean;
   reason: string;
@@ -895,7 +898,7 @@ export function proveCheckoutDisposable(
     const inherited = checkout.inheritedTagsRecord
       ? readCheckoutInheritedTags(checkout.inheritedTagsRecord, checkout.path)
       : null;
-    return disposability.provenDisposable(checkout.path, 'all', inherited);
+    return disposability.provenDisposable(checkout.path, 'all', inherited, checkout.refuseIgnored);
   }
   if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
   return { ok: false, reason: 'unknown-shape' };
@@ -1920,7 +1923,12 @@ function finalizeCloneCollection(
     return restore('aborted-late-activity');
   }
   // Re-prove the moved copy, not the original path, against the same tag record: this catches writes in the gap.
-  const decision = disposability.proveCheckoutDisposable({ path: quarantinePath, shape: 'clone', inheritedTagsRecord });
+  const decision = disposability.proveCheckoutDisposable({
+    path: quarantinePath,
+    shape: 'clone',
+    inheritedTagsRecord,
+    refuseIgnored: kind === 'topic-checkout',
+  });
   if (!decision.ok) return restore(`aborted-${decision.reason}`);
 
   try {

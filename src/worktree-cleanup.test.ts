@@ -1033,6 +1033,17 @@ describe('branch clone checkouts', () => {
         },
       },
       {
+        // Build output is not regenerable from a tracked file the way node_modules is; it may be the only copy.
+        thread: 'p1400-ignored-dist',
+        reason: 'ignored-files',
+        arrange: ({ checkout }) => {
+          fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), 'dist/\n');
+          fs.mkdirSync(path.join(checkout, 'dist'));
+          fs.writeFileSync(path.join(checkout, 'dist', 'report.pdf'), 'pdf\n');
+          age(checkout);
+        },
+      },
+      {
         // A Git activity file that cannot be read is never evidence of idleness.
         thread: 'p1400-unreadable-activity',
         reason: 'recent',
@@ -1155,6 +1166,37 @@ describe('branch clone checkouts', () => {
     expect(fs.existsSync(clean.topicDir)).toBe(true);
     expect(state.trashed).toHaveLength(1);
     expect(path.dirname(state.trashed[0]!)).toBe(path.join(state.dataDir, '.gc-quarantine'));
+  });
+
+  it('never runs a filter an embedded repository configures while proving a clone in an open topic', async () => {
+    const canon = canonicalFixture('repo-a');
+    const fixture = cloneCheckout(canon, 'p1400-submodule-filter', 'repo-a@feat', 'feat');
+    const marker = path.join(state.dataDir, 'filter-ran');
+    const nested = path.join(fixture.checkout, 'sub');
+    fs.mkdirSync(nested);
+    git(nested, ['init', '-q']);
+    fs.writeFileSync(path.join(nested, '.gitattributes'), '* filter=planted\n');
+    fs.writeFileSync(path.join(nested, 'a.txt'), 'a\n');
+    git(nested, ['add', '-A']);
+    git(nested, ['commit', '-q', '-m', 'nested']);
+    git(nested, ['config', 'filter.planted.clean', `touch ${marker}; cat`]);
+    git(fixture.checkout, ['add', 'sub']);
+    git(fixture.checkout, ['commit', '-q', '-m', 'embed']);
+    // Stat-dirty, so any status that recursed into the nested repository would have to re-hash it.
+    const stale = new Date(Date.now() - 400 * 86_400_000);
+    fs.utimesSync(path.join(nested, 'a.txt'), stale, stale);
+    age(fixture.checkout);
+    state.rows = [
+      {
+        ...row('s-p1400-submodule-filter', 'p1400-submodule-filter', 'active'),
+        folder: 'folder-a',
+        idle_since: new Date().toISOString(),
+      },
+    ];
+
+    const target = (await _discoverWorktreesForTesting(state.dataDir)).find((t) => t.worktreePath === fixture.checkout);
+    expect(await _cleanupOneForTesting(target!, state.dataDir)).toEqual({ collected: false, reason: 'submodule' });
+    expect(fs.existsSync(marker)).toBe(false);
   });
 
   it('previews the clone decisions without moving or trashing anything', async () => {
