@@ -22,8 +22,8 @@ The NanoClaw host runs your Markdown through the Slack chat-adapter, which conve
 | `` `inline code` `` | inline code | preserved literally |
 | ```` ```code``` ```` | code block | preserved literally, language tag dropped |
 | `[text](url)` | named link | adapter converts to `<url|text>` |
-| `- item` / `* item` | bullet | adapter renders as `•` |
-| `1. item` | numbered list | renders, but bullets are more reliable |
+| `- item` / `* item` | bullet list | Slack stores it as a real list (`rich_text_list`); never type `•` yourself |
+| `1. item` | numbered list | a real ordered list, numbered by Slack |
 | `> quote` | block quote | adapter renders natively |
 | `## Heading` | bold | host pre-rewrites to `**Heading**` |
 | Markdown table | Block Kit table | see Tables section below |
