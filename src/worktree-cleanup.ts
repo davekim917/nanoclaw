@@ -873,7 +873,8 @@ function provenDisposable(
           !reclaimIgnorable(
             dir,
             entry.slice(3),
-            (candidate) => git(dir, ['check-ignore', '-q', '--', candidate], env, filters) !== null,
+            // A leading `./` keeps a name that starts with `:` from reading as pathspec magic.
+            (candidate) => git(dir, ['check-ignore', '-q', '--', `./${candidate}`], env, filters) !== null,
           ),
       );
     if (kept) return { ok: false, reason: 'ignored-files' };

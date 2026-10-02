@@ -1220,82 +1220,101 @@ describe('branch clone checkouts', () => {
     expect(state.trashed).toEqual([]);
   });
 
-  it('lets build output go with an open-topic clone, and keeps refusing other ignored entries', () => {
-    const canon = canonicalFixture('repo-a');
-    const cases: Array<{
-      exclude: string;
-      files: string[];
-      reason: string;
-      repository?: string;
-      bareRepository?: string;
-    }> = [
-      { exclude: 'allure-results/', files: ['allure-results/run-result.json'], reason: 'clean-and-pushed' },
-      { exclude: '.pytest_cache/', files: ['.pytest_cache/v/cache/lastfailed'], reason: 'clean-and-pushed' },
-      { exclude: '.ruff_cache/', files: ['.ruff_cache/0.6.0/index'], reason: 'clean-and-pushed' },
-      {
-        exclude: '*.tsbuildinfo',
-        files: ['tsconfig.tsbuildinfo', 'tsconfig.build.tsbuildinfo'],
-        reason: 'clean-and-pushed',
-      },
-      { exclude: 'node_modules/', files: ['node_modules/left-pad/index.js'], reason: 'clean-and-pushed' },
-      { exclude: 'dist/', files: ['dist/index.js'], reason: 'ignored-files' },
-      { exclude: '.venv/', files: ['.venv/lib/site.py'], reason: 'ignored-files' },
-      { exclude: 'deployment_packages/', files: ['deployment_packages/bundle.zip'], reason: 'ignored-files' },
-      { exclude: '.gitnexus/', files: ['.gitnexus/index.db'], reason: 'ignored-files' },
-      { exclude: '.expo/', files: ['.expo/settings.json'], reason: 'ignored-files' },
-      { exclude: 'logs/', files: ['logs/run.log'], reason: 'ignored-files' },
-      { exclude: '*.csv', files: ['report.tsbuildinfo.csv'], reason: 'ignored-files' },
-      { exclude: 'cache.tsbuildinfo/', files: ['cache.tsbuildinfo/data.json'], reason: 'ignored-files' },
-      {
-        exclude: 'Nested-App/',
-        files: ['Nested-App/src/index.ts', 'Nested-App/dist/index.js'],
-        reason: 'ignored-files',
-      },
-      // A listed name that is a file, not the output directory.
-      { exclude: 'allure-results', files: ['allure-results'], reason: 'ignored-files' },
-      // Git collapses a directory that is not ignored when everything in it is.
-      { exclude: '*.csv', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
-      // `check-ignore allure-results/` matches these; the directory itself is not ignored.
-      { exclude: '*/*', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
-      { exclude: 'allure-results/*', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
-      { exclude: '*\n!allure-results', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
-      {
-        exclude: '.ruff_cache/',
-        files: ['.ruff_cache/index'],
-        bareRepository: '.ruff_cache/b.git',
-        reason: 'ignored-files',
-      },
-      // A repository anywhere inside a listed directory may hold commits that exist nowhere else.
-      {
-        exclude: '.pytest_cache/',
-        files: ['.pytest_cache/v/clone/notes.md'],
-        repository: '.pytest_cache/v/clone',
-        reason: 'ignored-files',
-      },
-    ];
-    const verdicts = cases.map(({ exclude, files, repository, bareRepository }, index) => {
-      const { checkout } = cloneCheckout(canon, `p1404-ignorable-${index}`, 'repo-a@feat', 'feat');
-      fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), `${exclude}\n`);
-      for (const file of files) {
-        fs.mkdirSync(path.dirname(path.join(checkout, file)), { recursive: true });
-        fs.writeFileSync(path.join(checkout, file), 'output\n');
-      }
-      if (bareRepository) git(checkout, ['init', '-q', '--bare', bareRepository]);
-      if (repository) {
-        git(path.join(checkout, repository), ['init', '-q']);
-        git(path.join(checkout, repository), ['add', '.']);
-        git(path.join(checkout, repository), ['commit', '-qm', 'only copy']);
-      }
-      age(checkout);
-      return disposability.proveCheckoutDisposable({
-        path: checkout,
-        shape: 'clone',
-        inheritedTagsRecord: checkoutInheritedTagsPath(checkout),
-        liveTopic: true,
-      }).reason;
-    });
-    expect(verdicts).toEqual(cases.map((entry) => entry.reason));
-  });
+  it(
+    'lets build output go with an open-topic clone, and keeps refusing other ignored entries',
+    { timeout: 30_000 },
+    () => {
+      const canon = canonicalFixture('repo-a');
+      const cases: Array<{
+        exclude: string;
+        files: string[];
+        reason: string;
+        repository?: string;
+        bareRepository?: string;
+        committed?: string;
+      }> = [
+        { exclude: 'allure-results/', files: ['allure-results/run-result.json'], reason: 'clean-and-pushed' },
+        { exclude: '.pytest_cache/', files: ['.pytest_cache/v/cache/lastfailed'], reason: 'clean-and-pushed' },
+        { exclude: '.ruff_cache/', files: ['.ruff_cache/0.6.0/index'], reason: 'clean-and-pushed' },
+        {
+          exclude: '*.tsbuildinfo',
+          files: ['tsconfig.tsbuildinfo', 'tsconfig.build.tsbuildinfo'],
+          reason: 'clean-and-pushed',
+        },
+        { exclude: 'node_modules/', files: ['node_modules/left-pad/index.js'], reason: 'clean-and-pushed' },
+        { exclude: 'dist/', files: ['dist/index.js'], reason: 'ignored-files' },
+        { exclude: '.venv/', files: ['.venv/lib/site.py'], reason: 'ignored-files' },
+        { exclude: 'deployment_packages/', files: ['deployment_packages/bundle.zip'], reason: 'ignored-files' },
+        { exclude: '.gitnexus/', files: ['.gitnexus/index.db'], reason: 'ignored-files' },
+        { exclude: '.expo/', files: ['.expo/settings.json'], reason: 'ignored-files' },
+        { exclude: 'logs/', files: ['logs/run.log'], reason: 'ignored-files' },
+        { exclude: '*.csv', files: ['report.tsbuildinfo.csv'], reason: 'ignored-files' },
+        { exclude: 'cache.tsbuildinfo/', files: ['cache.tsbuildinfo/data.json'], reason: 'ignored-files' },
+        {
+          exclude: 'Nested-App/',
+          files: ['Nested-App/src/index.ts', 'Nested-App/dist/index.js'],
+          reason: 'ignored-files',
+        },
+        // A listed name that is a file, not the output directory.
+        { exclude: 'allure-results', files: ['allure-results'], reason: 'ignored-files' },
+        // Git collapses a directory that is not ignored when everything in it is.
+        { exclude: '*.csv', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+        // `check-ignore allure-results/` matches these; the directory itself is not ignored.
+        { exclude: '*/*', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+        { exclude: 'allure-results/*', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+        { exclude: '*\n!allure-results', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+        {
+          exclude: '.ruff_cache/',
+          files: ['.ruff_cache/index'],
+          bareRepository: '.ruff_cache/b.git',
+          reason: 'ignored-files',
+        },
+        // A `:` directory name is pathspec magic to check-ignore: `:/allure-results` means the top-level one.
+        {
+          exclude: '*.csv\n/allure-results',
+          committed: ':/keep.txt',
+          files: [':/allure-results/customers.csv'],
+          reason: 'ignored-files',
+        },
+        // A repository anywhere inside a listed directory may hold commits that exist nowhere else.
+        {
+          exclude: '.pytest_cache/',
+          files: ['.pytest_cache/v/clone/notes.md'],
+          repository: '.pytest_cache/v/clone',
+          reason: 'ignored-files',
+        },
+      ];
+      const verdicts = cases.map(({ exclude, files, repository, bareRepository, committed }, index) => {
+        const { checkout } = cloneCheckout(canon, `p1404-ignorable-${index}`, 'repo-a@feat', 'feat');
+        fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), `${exclude}\n`);
+        if (committed) {
+          fs.mkdirSync(path.dirname(path.join(checkout, committed)), { recursive: true });
+          fs.writeFileSync(path.join(checkout, committed), 'tracked\n');
+          git(checkout, ['add', '--', `./${committed}`]);
+          git(checkout, ['commit', '-qm', 'tracked']);
+          git(checkout, ['push', '-q', 'origin', 'feat']);
+        }
+        for (const file of files) {
+          fs.mkdirSync(path.dirname(path.join(checkout, file)), { recursive: true });
+          fs.writeFileSync(path.join(checkout, file), 'output\n');
+        }
+        if (bareRepository) git(checkout, ['init', '-q', '--bare', bareRepository]);
+        if (repository) {
+          git(path.join(checkout, repository), ['init', '-q']);
+          git(path.join(checkout, repository), ['add', '.']);
+          git(path.join(checkout, repository), ['commit', '-qm', 'only copy']);
+        }
+        age(checkout);
+        return disposability.proveCheckoutDisposable({
+          path: checkout,
+          shape: 'clone',
+          inheritedTagsRecord: checkoutInheritedTagsPath(checkout),
+          liveTopic: true,
+        }).reason;
+      });
+      expect(verdicts).toEqual(cases.map((entry) => entry.reason));
+    },
+  );
 
   it('never runs a filter an embedded repository configures while proving a clone in an open topic', async () => {
     const canon = canonicalFixture('repo-a');
