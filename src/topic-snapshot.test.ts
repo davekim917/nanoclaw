@@ -575,12 +575,16 @@ describe('snapshotTopics', () => {
     expect(manifest()).toContain(`${leaving} was removed during the run`);
   });
 
-  it('lists a topic entry or ref whose name is not UTF-8 instead of reading it as absent', async () => {
+  it('lists a topic entry or ref whose name is not byte-exact UTF-8 instead of reading it as absent', async () => {
     const odd = path.join(topics, 'wg', 'topic-odd', 'worktrees');
     fs.mkdirSync(odd, { recursive: true });
     const oddCheckout = Buffer.concat([Buffer.from(`${odd}/`), Buffer.from([0x61, 0xff])]);
     git(root, 'clone', '-q', remote, path.join(odd, 'staged'));
     fs.renameSync(path.join(odd, 'staged'), oddCheckout);
+    const bomCheckout = Buffer.concat([Buffer.from(`${odd}/`), Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('app')]);
+    git(root, 'clone', '-q', remote, path.join(odd, 'staged'));
+    fs.appendFileSync(path.join(odd, 'staged', 'app.txt'), 'edit\n');
+    fs.renameSync(path.join(odd, 'staged'), bomCheckout);
     const branchy = topic('topic-oddref');
     git(root, 'clone', '-q', remote, branchy);
     const refDir = Buffer.concat([Buffer.from(path.join(branchy, '.git', 'refs', 'heads') + '/'), Buffer.from([0xfe])]);
@@ -594,7 +598,11 @@ describe('snapshotTopics', () => {
       fs.chmodSync(refDir, 0o755);
     }
 
-    expect(result.unreadable).toContainEqual(expect.objectContaining({ reason: 'its name is not UTF-8' }));
+    expect(
+      result.unreadable.filter(
+        (entry) => entry.kind === 'unreadable' && entry.reason === 'its name is not byte-exact UTF-8',
+      ),
+    ).toHaveLength(2);
     expect(result.failures).toEqual([expect.stringContaining('EACCES')]);
   });
 

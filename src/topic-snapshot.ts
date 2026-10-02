@@ -494,19 +494,22 @@ async function captureCheckout(
   return true;
 }
 
+/** `raw` as a string only when it round-trips byte-exact; the decoder alone drops a leading BOM. */
+function decodeName(raw: Buffer): string | null {
+  let name: string;
+  try {
+    name = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  } catch {
+    return null;
+  }
+  return Buffer.from(name).equals(raw) ? name : null;
+}
+
 /**
  * The paths `pattern` matches, by its own directory walk: `fs.globSync` skips a directory it cannot read, so an
  * unreadable topic would vanish from the run. Only ENOENT is absence, and past the first wildcard, where a
  * container chose the names, a symlink is listed rather than followed.
  */
-function decodeName(raw: Buffer): string | null {
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(raw);
-  } catch {
-    return null;
-  }
-}
-
 function expand(pattern: string): { checkouts: string[]; unreadable: Admission[]; failures: string[] } {
   const isGlob = (segment: string): boolean => /[*?[]/.test(segment);
   const [rootSegment, ...segments] = path.resolve(pattern).split(path.sep);
@@ -531,7 +534,7 @@ function expand(pattern: string): { checkouts: string[]; unreadable: Admission[]
             const name = decodeName(raw);
             if (name === null) {
               const shown = path.join(dir, raw.toString());
-              unreadable.push({ kind: 'unreadable', checkout: shown, reason: 'its name is not UTF-8' });
+              unreadable.push({ kind: 'unreadable', checkout: shown, reason: 'its name is not byte-exact UTF-8' });
             } else if (path.matchesGlob(name, segment)) {
               names.push(name);
             }
