@@ -506,8 +506,8 @@ function checkoutIdleDays(checkoutPath: string): number {
 }
 
 /**
- * The topic-clone proof: plain `status` calls an ignored export or `.env` clean, and an open topic may still want
- * it, so every ignored path outside the regenerable trees refuses.
+ * The topic-clone proof, with `liveTopic`: plain `status` calls an ignored export, a `.env` or an edit behind an
+ * index flag clean, and an open topic may still want them, so each of those refuses.
  */
 function cloneCheckoutProof(target: TopicWorktreeTarget): { ok: boolean; reason: string } {
   const signature = JSON.stringify(checkoutActivityMtimes(target.worktreePath));
@@ -519,7 +519,7 @@ function cloneCheckoutProof(target: TopicWorktreeTarget): { ok: boolean; reason:
     path: target.worktreePath,
     shape: target.shape,
     inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
-    refuseIgnored: true,
+    liveTopic: true,
   });
   if (proof.ok) failedCloneProofs.delete(target.worktreePath);
   else failedCloneProofs.set(target.worktreePath, { signature, at: Date.now(), reason: proof.reason });
@@ -671,6 +671,8 @@ export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promis
   let skipped = 0;
   const liveness = passLiveness();
   for (const target of targets) {
+    // Each target's git work is synchronous; a macrotask between targets lets message routing run.
+    await new Promise((resolve) => setImmediate(resolve));
     try {
       await cleanupOne(target, dataDir, liveness);
     } catch (err) {
@@ -772,7 +774,7 @@ function provenDisposable(
   dir: string,
   scope: 'head' | 'all',
   inheritedTags: ReadonlyMap<string, string> | null = null,
-  refuseIgnored = false,
+  liveTopic = false,
 ): { ok: boolean; reason: string } {
   if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
   const env = checkoutGitEnv(dir);
@@ -794,7 +796,13 @@ function provenDisposable(
   );
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
-  if (refuseIgnored) {
+  if (liveTopic) {
+    // `status` reads a skip-worktree or assume-unchanged entry as clean whatever its file holds.
+    const tags = git(dir, ['ls-files', '-v', '-z'], env, filters);
+    if (tags === null) return { ok: false, reason: 'status-unprovable' };
+    if (tags.split('\0').some((entry) => entry !== '' && !entry.startsWith('H '))) {
+      return { ok: false, reason: 'index-flagged' };
+    }
     const ignored = git(
       dir,
       [
@@ -888,7 +896,7 @@ function provenDisposable(
  * undecided shape is refused. Only a topic clone has an inherited-tags record; without one every tag counts.
  */
 export function proveCheckoutDisposable(
-  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { inheritedTagsRecord?: string | null; refuseIgnored?: boolean },
+  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { inheritedTagsRecord?: string | null; liveTopic?: boolean },
 ): {
   ok: boolean;
   reason: string;
@@ -898,7 +906,7 @@ export function proveCheckoutDisposable(
     const inherited = checkout.inheritedTagsRecord
       ? readCheckoutInheritedTags(checkout.inheritedTagsRecord, checkout.path)
       : null;
-    return disposability.provenDisposable(checkout.path, 'all', inherited, checkout.refuseIgnored);
+    return disposability.provenDisposable(checkout.path, 'all', inherited, checkout.liveTopic);
   }
   if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
   return { ok: false, reason: 'unknown-shape' };
@@ -1927,7 +1935,7 @@ function finalizeCloneCollection(
     path: quarantinePath,
     shape: 'clone',
     inheritedTagsRecord,
-    refuseIgnored: kind === 'topic-checkout',
+    liveTopic: kind === 'topic-checkout',
   });
   if (!decision.ok) return restore(`aborted-${decision.reason}`);
 

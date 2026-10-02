@@ -1044,6 +1044,16 @@ describe('branch clone checkouts', () => {
         },
       },
       {
+        // `status` reads an entry behind skip-worktree as clean, whatever its file now holds.
+        thread: 'p1400-skip-worktree',
+        reason: 'index-flagged',
+        arrange: ({ checkout }) => {
+          git(checkout, ['update-index', '--skip-worktree', 'README.md']);
+          fs.writeFileSync(path.join(checkout, 'README.md'), 'edited behind the flag\n');
+          age(checkout);
+        },
+      },
+      {
         // A Git activity file that cannot be read is never evidence of idleness.
         thread: 'p1400-unreadable-activity',
         reason: 'recent',
@@ -1166,6 +1176,39 @@ describe('branch clone checkouts', () => {
     expect(fs.existsSync(clean.topicDir)).toBe(true);
     expect(state.trashed).toHaveLength(1);
     expect(path.dirname(state.trashed[0]!)).toBe(path.join(state.dataDir, '.gc-quarantine'));
+  });
+
+  it('the quarantined copy of an open-topic clone is re-proved for ignored files before the trash', async () => {
+    const canon = canonicalFixture('repo-a');
+    const fixture = cloneCheckout(canon, 'p1400-late-ignored', 'repo-a@feat', 'feat');
+    fs.writeFileSync(path.join(fixture.checkout, '.git', 'info', 'exclude'), 'exports/\n');
+    age(fixture.checkout);
+    state.rows = [
+      {
+        ...row('s-p1400-late-ignored', 'p1400-late-ignored', 'active'),
+        folder: 'folder-a',
+        idle_since: new Date().toISOString(),
+      },
+    ];
+    const realRename = fs.renameSync.bind(fs);
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from, to);
+      fs.mkdirSync(path.join(String(to), 'exports'));
+      fs.writeFileSync(path.join(String(to), 'exports', 'late.csv'), 'a,b\n');
+    });
+    try {
+      const target = (await _discoverWorktreesForTesting(state.dataDir)).find(
+        (t) => t.worktreePath === fixture.checkout,
+      );
+      expect(await _cleanupOneForTesting(target!, state.dataDir)).toEqual({
+        collected: false,
+        reason: 'aborted-ignored-files',
+      });
+    } finally {
+      rename.mockRestore();
+    }
+    expect(fs.readFileSync(path.join(fixture.checkout, 'exports', 'late.csv'), 'utf8')).toBe('a,b\n');
+    expect(state.trashed).toEqual([]);
   });
 
   it('never runs a filter an embedded repository configures while proving a clone in an open topic', async () => {
