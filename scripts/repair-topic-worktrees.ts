@@ -452,27 +452,47 @@ function verifyRescue(canonicalGit: string, ref: string, commit: string, tree: s
 
 /**
  * The back-pointer of an admin dir under this tool's name, or null when it is free to (re)use: absent, or residue of
- * a run that died between mkdir and the first write (git never creates a name of this shape).
+ * a run that died before its back-pointer reached disk. Only this tool names dirs this way, under the repository lock.
  */
 function adminDirOwner(adminDir: string): string | null {
   try {
-    return fs.readFileSync(path.join(adminDir, 'gitdir'), 'utf8').trim();
+    return fs.readFileSync(path.join(adminDir, 'gitdir'), 'utf8').trim() || null;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
 }
 
+function writeDurable(file: string, content: string): void {
+  const fd = fs.openSync(file, 'w');
+  try {
+    fs.writeSync(fd, content);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Durable before the checkout's pointer names it: the pointer is fsynced, so it must never outlive this dir. */
 function writeAdminDir(adminDir: string, backPointer: string, head: string, lock: boolean): void {
   if (!fs.existsSync(adminDir)) {
     fs.mkdirSync(path.dirname(adminDir), { recursive: true });
     fs.mkdirSync(adminDir);
   }
-  fs.writeFileSync(path.join(adminDir, 'gitdir'), `${backPointer}\n`);
-  fs.writeFileSync(path.join(adminDir, 'commondir'), '../..\n');
-  fs.writeFileSync(path.join(adminDir, 'HEAD'), `${head}\n`);
-  if (lock) fs.writeFileSync(path.join(adminDir, 'locked'), LOCK_REASON);
-  git(['--git-dir', adminDir, 'read-tree', head], { env: { GIT_INDEX_FILE: path.join(adminDir, 'index') } });
+  writeDurable(path.join(adminDir, 'gitdir'), `${backPointer}\n`);
+  writeDurable(path.join(adminDir, 'commondir'), '../..\n');
+  writeDurable(path.join(adminDir, 'HEAD'), `${head}\n`);
+  if (lock) writeDurable(path.join(adminDir, 'locked'), LOCK_REASON);
+  const index = path.join(adminDir, 'index');
+  git(['--git-dir', adminDir, 'read-tree', head], { env: { GIT_INDEX_FILE: index } });
+  for (const target of [index, adminDir, path.dirname(adminDir)]) {
+    const fd = fs.openSync(target, 'r');
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
 }
 
 interface Snapshot {

@@ -374,10 +374,19 @@ describe('repairTopicWorktrees', () => {
     expect(fs.readFileSync(path.join(taken, 'gitdir'), 'utf8')).toBe('/elsewhere/.git\n');
   });
 
-  it('reuses its own admin dir left without a back-pointer by an interrupted run', async () => {
+  it.each([
+    ['no gitdir file', (dir: string) => fs.mkdirSync(dir)],
+    [
+      'an empty gitdir file',
+      (dir: string) => {
+        fs.mkdirSync(dir);
+        fs.writeFileSync(path.join(dir, 'gitdir'), '');
+      },
+    ],
+  ])('reuses its own admin dir an interrupted run left with %s', async (_shape, leave) => {
     buildFixture();
     const residue = path.join(canonical, '.git', 'worktrees', adminDirName(topicDirName(2), REPO));
-    fs.mkdirSync(residue);
+    leave(residue);
 
     const report = await repairTopicWorktrees({
       dataDir,
