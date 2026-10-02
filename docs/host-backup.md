@@ -139,8 +139,8 @@ Restore takes credentials from `aws configure export-credentials` (the same reso
 CLI: `AWS_PROFILE`, or the break-glass session's environment) and talks to S3 directly: it pages
 through the version listing once, then fetches files by version id, 128 at a time
 (`--concurrency <n>`), retrying throttling and server errors. Leaving out `--prefix` restores the
-whole host: for about 1.8M files and 80 GiB, roughly 1 to 1.5 hours and 4 GB of memory
-(extrapolated, not measured). Progress is logged every minute, and a request that stalls for a
+whole host: 1.9M files and 94 GiB took 29 minutes and peaked at 3.2 GB of memory (measured in
+the restore drill on an m7i.2xlarge in the bucket's region). Progress is logged every minute, and a request that stalls for a
 minute is retried.
 
 Without the repo, `aws s3api list-objects-v2 --prefix manifests/` lists the manifests, and
@@ -150,6 +150,24 @@ file. `zcat` the manifest to find a path's sha256; `sha256sum` confirms the vers
 A restore on a fresh machine also needs whatever the sources could not capture: repo clones
 from their remotes, Docker images (rebuild), and the systemd units and logrotate entries,
 which are under `files/etc/`.
+
+### Full rebuild on a fresh machine
+
+Measured end to end in a drill on an isolated instance whose only outbound route was the bucket:
+about 9 minutes to install packages and build the agent image, 29 to restore, 7 to verify every
+file against the manifest, and 35 to copy the tree into place. The restored host started, passed
+its OneCLI preflight, and failed only to reach Slack and Discord. Steps the sources do not carry:
+
+- Create `ubuntu` as uid and gid 1001 before restoring. Ownership is restored by number, and a
+  stock image makes `ubuntu` 1000.
+- Restore the OneCLI host directory, key file included, before the OneCLI container first
+  starts (see below). Starting it without the key generates a new one, and every stored secret
+  becomes unreadable.
+- Add `groups/` to `.git/info/exclude` in the fresh clone. `groups/` is its own repository, and
+  the build refuses a tree where it shows as untracked.
+- Clone the repositories under `data/repositories` again from their remotes. The backup skips
+  clones that have a remote, and the host logs `invalid canonical workgroup directory` until
+  they exist.
 
 ### OneCLI vault (operator step)
 
