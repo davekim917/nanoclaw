@@ -9,12 +9,14 @@
  * written; only the checkout's `.git` pointer file changes. Nothing is ever deleted.
  */
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
 import { gitCommonDirIs } from '../src/canonical-git-commondir.js';
+import { hasLiveProcess } from '../src/agent-worktree-gc.js';
 import { DATA_DIR } from '../src/config.js';
 import { runningContainerMounts } from '../src/container-mounts.js';
 import { getDb, initDb } from '../src/db/connection.js';
@@ -30,7 +32,9 @@ import {
   withRepositoryLifecycleClaims,
   type RepositoryWorkUnit,
 } from '../src/repository-workspaces.js';
+import { isPathInside } from '../src/inbox-safety.js';
 import { safeGitArgs, safeGitEnv, safeGitFilterNames } from '../src/safe-git.js';
+import { sessionWasReclaimed } from '../src/storage-manager.js';
 
 export const RESCUE_REF_PREFIX = 'refs/nanoclaw/rescue/1388';
 const LOCK_REASON = 'nanoclaw: repaired checkout whose HEAD is its rescue snapshot';
@@ -70,6 +74,8 @@ export interface RepairEntry {
   rescueRef?: string;
   /** Per canonical, the share of the checkout's blobs it holds; recorded when that evidence named no single canonical. */
   contentShares?: Record<string, number>;
+  /** The commit the snapshot index was seeded from, so ignored files it tracks count. */
+  hashSeed?: string;
   /** Nested repositories recorded as gitlinks: their own uncommitted content is not in the snapshot. */
   embeddedRepos?: number;
   proof?: {
@@ -102,10 +108,11 @@ interface TopicParticipant {
 
 /** Every probe the idle gate asks; `null` from any of them means "cannot tell", which refuses. */
 export interface LivenessProbes {
-  participants(topicDir: string): TopicParticipant[] | null;
+  /** Read fresh on every call: the gate runs again under the repository lock and right before the pointer write. */
+  participants(topicDir: string): Promise<TopicParticipant[] | null>;
   participantBusy(participant: TopicParticipant): boolean;
   mounts(): string[] | null;
-  cwds(): string[] | null;
+  processRooted(dir: string): boolean;
 }
 
 export interface RepairOptions {
@@ -150,10 +157,6 @@ function realpathOrNull(target: string): string | null {
   } catch {
     return null;
   }
-}
-
-function isWithin(child: string, parent: string): boolean {
-  return child === parent || child.startsWith(`${parent}${path.sep}`);
 }
 
 interface PointerInspection {
@@ -227,8 +230,11 @@ interface HashTarget {
   scratchObjects?: { dir: string; alternates: string[] };
 }
 
-/** The root tree of every non-ignored file in the working tree, built in a throwaway index. */
-function hashWorkTree(target: HashTarget, scratchDir: string): { tree: string; gitlinks: number } {
+/**
+ * The root tree of the working tree, built in a throwaway index: every non-ignored file, plus, when seeded from a
+ * commit, the ignored files that commit tracks and the working tree still holds.
+ */
+function hashWorkTree(target: HashTarget, scratchDir: string, seed?: string): { tree: string; gitlinks: number } {
   const indexDir = fs.mkdtempSync(path.join(scratchDir, 'index-'));
   const env: NodeJS.ProcessEnv = { GIT_INDEX_FILE: path.join(indexDir, 'index') };
   if (target.scratchObjects) {
@@ -238,6 +244,7 @@ function hashWorkTree(target: HashTarget, scratchDir: string): { tree: string; g
   const filters = safeGitFilterNames(target.gitDir);
   const base = ['--git-dir', target.gitDir, '--work-tree', target.workTree, '-c', 'advice.addEmbeddedRepo=false'];
   try {
+    if (seed) git([...base, 'read-tree', seed], { cwd: target.workTree, env });
     git([...base, 'add', '-A', '--', '.'], { cwd: target.workTree, env, filters });
     const tree = git([...base, 'write-tree'], { cwd: target.workTree, env, filters });
     const stages = git([...base, 'ls-files', '-s'], { cwd: target.workTree, env });
@@ -252,6 +259,7 @@ interface CommitIndex {
   byTree: Map<string, string[]>;
   origin: Set<string>;
   local: Set<string>;
+  originHead: string | null;
 }
 
 function buildCommitIndex(gitDir: string): CommitIndex {
@@ -282,6 +290,10 @@ function buildCommitIndex(gitDir: string): CommitIndex {
     byTree,
     origin: revs(['--remotes=origin']),
     local: revs([`--exclude=${RESCUE_REF_PREFIX}/*`, '--all']),
+    originHead: gitOrNull(
+      ['--git-dir', gitDir, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/HEAD^{commit}'],
+      {},
+    ),
   };
 }
 
@@ -376,7 +388,9 @@ function registrationsByBackPointer(dataDir: string, workgroupId: string): Map<s
 }
 
 export function adminDirName(topicDirName: string, checkout: string): string {
-  return `${checkout}-${topicDirName}`.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '');
+  const safe = checkout.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '');
+  const suffix = safe === checkout ? '' : `-${createHash('sha256').update(checkout).digest('hex').slice(0, 8)}`;
+  return `${safe}${suffix}-${topicDirName}`;
 }
 
 export function rescueRefName(topicDirName: string, checkout: string): string {
@@ -384,8 +398,8 @@ export function rescueRefName(topicDirName: string, checkout: string): string {
   return `${RESCUE_REF_PREFIX}/${component(topicDirName)}/${component(checkout)}`;
 }
 
-function topicLiveReason(topicDir: string, probes: LivenessProbes): string | null {
-  const participants = probes.participants(topicDir);
+async function topicLiveReason(topicDir: string, probes: LivenessProbes): Promise<string | null> {
+  const participants = await probes.participants(topicDir);
   if (participants === null) return 'inventory-unavailable';
   if (participants.some((participant) => participant.status !== 'closed')) return 'session-live';
   if (participants.some((participant) => probes.participantBusy(participant))) return 'topic-busy';
@@ -394,12 +408,10 @@ function topicLiveReason(topicDir: string, probes: LivenessProbes): string | nul
   const resolvedTopic = realpathOrNull(topicDir) ?? topicDir;
   const mounted = mounts.some((mount) => {
     const source = realpathOrNull(mount) ?? mount;
-    return isWithin(source, resolvedTopic) || isWithin(resolvedTopic, source);
+    return isPathInside(resolvedTopic, source) || isPathInside(source, resolvedTopic);
   });
   if (mounted) return 'container-mounted';
-  const cwds = probes.cwds();
-  if (cwds === null) return 'process-table-unreadable';
-  if (cwds.some((cwd) => isWithin(cwd, resolvedTopic))) return 'process-rooted';
+  if (probes.processRooted(resolvedTopic)) return 'process-rooted';
   return null;
 }
 
@@ -438,14 +450,8 @@ function verifyRescue(canonicalGit: string, ref: string, commit: string, tree: s
   if (stored !== commit || storedTree !== tree) throw new Error(`rescue ref ${ref} did not verify`);
 }
 
-function writeAdminDir(context: WriteContext, head: string, lock: boolean): string {
-  const { entry, canonicalGit, topicDirName } = context;
-  const adminDir = path.join(canonicalGit, 'worktrees', adminDirName(topicDirName, entry.checkout));
-  const backPointer = path.join(fs.realpathSync(entry.path), '.git');
-  if (fs.existsSync(adminDir)) {
-    const owner = fs.readFileSync(path.join(adminDir, 'gitdir'), 'utf8').trim();
-    if (owner !== backPointer) throw new Error(`admin dir name already taken by another checkout: ${adminDir}`);
-  } else {
+function writeAdminDir(adminDir: string, backPointer: string, head: string, lock: boolean): void {
+  if (!fs.existsSync(adminDir)) {
     fs.mkdirSync(path.dirname(adminDir), { recursive: true });
     fs.mkdirSync(adminDir);
   }
@@ -454,55 +460,123 @@ function writeAdminDir(context: WriteContext, head: string, lock: boolean): stri
   fs.writeFileSync(path.join(adminDir, 'HEAD'), `${head}\n`);
   if (lock) fs.writeFileSync(path.join(adminDir, 'locked'), LOCK_REASON);
   git(['--git-dir', adminDir, 'read-tree', head], { env: { GIT_INDEX_FILE: path.join(adminDir, 'index') } });
-  return adminDir;
 }
 
-/** Applies one checkout's repair; the caller holds the lifecycle claim and the repository lock. */
-function applyRepair(context: WriteContext, steps: string[]): void {
-  const { entry, canonicalGit, scratchDir } = context;
-  const before = hashWorkTree({ gitDir: canonicalGit, workTree: entry.path }, scratchDir);
-  const { match, commit: matched } = classify(context.commits, before.tree);
-  Object.assign(entry, { tree: before.tree, match, matchedCommit: matched });
-  if (before.gitlinks > 0) entry.embeddedRepos = before.gitlinks;
+interface Snapshot {
+  tree: string;
+  gitlinks: number;
+  seed: string | null;
+  match: MatchClass;
+  commit: string | null;
+}
+
+/**
+ * Hashes the working tree and finds the commit with that exact tree. An unmatched tree is hashed again seeded from
+ * origin's HEAD, so files a commit force-tracks under an ignore rule count; that superset is the snapshot either way.
+ */
+function snapshotWorkTree(context: WriteContext, scratchObjects?: HashTarget['scratchObjects']): Snapshot {
+  const target = { gitDir: context.canonicalGit, workTree: context.entry.path, scratchObjects };
+  const plain = hashWorkTree(target, context.scratchDir);
+  const plainMatch = classify(context.commits, plain.tree);
+  const seed = context.commits.originHead;
+  if (plainMatch.match !== 'no-match' || seed === null) return { ...plain, seed: null, ...plainMatch };
+  const seeded = hashWorkTree(target, context.scratchDir, seed);
+  return { ...seeded, seed, ...classify(context.commits, seeded.tree) };
+}
+
+function withScratchObjects<T>(context: WriteContext, fn: (objects: HashTarget['scratchObjects']) => T): T {
+  const dir = fs.mkdtempSync(path.join(context.scratchDir, 'objects-'));
+  try {
+    return fn({ dir, alternates: [path.join(context.canonicalGit, 'objects')] });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function recordSnapshot(entry: RepairEntry, snapshot: Snapshot): void {
+  Object.assign(entry, {
+    tree: snapshot.tree,
+    match: snapshot.match,
+    matchedCommit: snapshot.commit,
+    locked: snapshot.commit === null,
+  });
+  if (snapshot.seed) entry.hashSeed = snapshot.seed;
+  if (snapshot.gitlinks > 0) entry.embeddedRepos = snapshot.gitlinks;
+}
+
+function writePointer(checkoutPath: string, adminDir: string): void {
+  const fd = fs.openSync(
+    path.join(checkoutPath, '.git'),
+    fs.constants.O_WRONLY | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
+  );
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`.git is not a regular file: ${checkoutPath}`);
+    fs.writeSync(fd, `gitdir: ${adminDir}\n`);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * One checkout's repair, under the caller's lifecycle claim and repository lock. `stillIdle` runs once more after
+ * the rescue is durable and before any registration write; a topic that went live there is left untouched.
+ */
+async function applyRepair(
+  context: WriteContext,
+  steps: string[],
+  stillIdle: () => Promise<string | null>,
+): Promise<string | null> {
+  const { entry, canonicalGit } = context;
+  const adminDir = path.join(canonicalGit, 'worktrees', adminDirName(context.topicDirName, entry.checkout));
+  const backPointer = path.join(fs.realpathSync(entry.path), '.git');
+  if (fs.existsSync(adminDir) && fs.readFileSync(path.join(adminDir, 'gitdir'), 'utf8').trim() !== backPointer) {
+    throw new Error(`admin dir name already taken by another checkout: ${adminDir}`);
+  }
+
+  const before = snapshotWorkTree(context);
+  recordSnapshot(entry, before);
   steps.push('tree-hashed');
 
-  const rescueCommit = writeRescue(context, before.tree, matched);
+  const rescueCommit = writeRescue(context, before.tree, before.commit);
   verifyRescue(canonicalGit, entry.rescueRef!, rescueCommit, before.tree);
   steps.push('rescue-verified');
 
-  const head = matched ?? rescueCommit;
-  const lock = matched === null;
-  Object.assign(entry, { head, locked: lock });
-  const adminDir = writeAdminDir(context, head, lock);
-  steps.push('admin-written');
+  const late = await stillIdle();
+  if (late) return late;
+  steps.push('liveness-rechecked-before-write');
 
-  const pointerPath = path.join(entry.path, '.git');
-  fs.writeFileSync(pointerPath, `gitdir: ${adminDir}\n`);
+  const head = before.commit ?? rescueCommit;
+  entry.head = head;
+  writeAdminDir(adminDir, backPointer, head, entry.locked!);
+  steps.push('admin-written');
+  writePointer(entry.path, adminDir);
   steps.push('pointer-written');
 
   const checkoutEnv = { GIT_CEILING_DIRECTORIES: path.dirname(fs.realpathSync(entry.path)) };
-  gitOrNull(['update-index', '-q', '--refresh'], { cwd: entry.path, env: checkoutEnv });
+  const filters = safeGitFilterNames(adminDir, entry.path);
+  gitOrNull(['update-index', '-q', '--refresh'], { cwd: entry.path, env: checkoutEnv, filters });
   const resolvedGitDir = git(['rev-parse', '--absolute-git-dir'], { cwd: entry.path, env: checkoutEnv });
   const resolvedHead = git(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: entry.path, env: checkoutEnv });
-  if (fs.realpathSync(resolvedGitDir) !== fs.realpathSync(adminDir))
+  if (fs.realpathSync(resolvedGitDir) !== fs.realpathSync(adminDir)) {
     throw new Error('pointer did not resolve to the new admin dir');
+  }
   if (!gitCommonDirIs(adminDir, canonicalGit)) throw new Error('new admin dir does not resolve to its canonical');
   if (resolvedHead !== head) throw new Error(`HEAD is ${resolvedHead}, expected ${head}`);
-  const scratchObjects = {
-    dir: fs.mkdtempSync(path.join(scratchDir, 'verify-')),
-    alternates: [path.join(canonicalGit, 'objects')],
-  };
-  let after: string;
-  try {
-    after = hashWorkTree({ gitDir: canonicalGit, workTree: entry.path, scratchObjects }, scratchDir).tree;
-  } finally {
-    fs.rmSync(scratchObjects.dir, { recursive: true, force: true });
-  }
+  const after = withScratchObjects(
+    context,
+    (objects) =>
+      hashWorkTree(
+        { gitDir: canonicalGit, workTree: entry.path, scratchObjects: objects },
+        context.scratchDir,
+        before.seed ?? undefined,
+      ).tree,
+  );
   if (after !== before.tree) throw new Error(`working tree hash changed: ${before.tree} -> ${after}`);
   const status = gitOrNull(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all'], {
     cwd: entry.path,
     env: checkoutEnv,
-    filters: safeGitFilterNames(adminDir, entry.path),
+    filters,
   });
   steps.push('verified');
   entry.proof = {
@@ -514,28 +588,13 @@ function applyRepair(context: WriteContext, steps: string[]): void {
     statusClean: status === '',
     steps,
   };
+  return null;
 }
 
 function planRepair(context: WriteContext): void {
-  const { entry, canonicalGit, scratchDir } = context;
-  const scratchObjects = {
-    dir: fs.mkdtempSync(path.join(scratchDir, 'plan-')),
-    alternates: [path.join(canonicalGit, 'objects')],
-  };
-  try {
-    const { tree, gitlinks } = hashWorkTree({ gitDir: canonicalGit, workTree: entry.path, scratchObjects }, scratchDir);
-    const { match, commit } = classify(context.commits, tree);
-    if (gitlinks > 0) entry.embeddedRepos = gitlinks;
-    Object.assign(entry, {
-      tree,
-      match,
-      matchedCommit: commit,
-      head: commit ?? 'rescue-commit',
-      locked: commit === null,
-    });
-  } finally {
-    fs.rmSync(scratchObjects.dir, { recursive: true, force: true });
-  }
+  const snapshot = withScratchObjects(context, (objects) => snapshotWorkTree(context, objects));
+  recordSnapshot(context.entry, snapshot);
+  context.entry.head = snapshot.commit ?? 'rescue-commit';
 }
 
 function topicUnit(workgroupId: string, topicDirName: string): RepositoryWorkUnit {
@@ -570,7 +629,7 @@ async function repairOne(run: RunState, entry: RepairEntry, workgroupId: string,
   const { options, scratchDir } = run;
   const topicDir = path.join(run.root, workgroupId, topicDirName);
   const skip = (reason: string) => Object.assign(entry, { action: 'skipped', reason });
-  const live = topicLiveReason(topicDir, options.probes);
+  const live = await topicLiveReason(topicDir, options.probes);
   if (live) return void skip(live);
   if (entry.state === 'foreign-common') return void skip('admin-outside-workgroup-canonicals');
   if (!run.registrations.has(workgroupId)) {
@@ -607,20 +666,23 @@ async function repairOne(run: RunState, entry: RepairEntry, workgroupId: string,
     withHostRepositoryLock(
       workgroupId,
       canonical.repo,
-      () => {
-        const late = topicLiveReason(topicDir, options.probes);
+      async () => {
+        const late = await topicLiveReason(topicDir, options.probes);
         if (late) return void skip(`recheck-${late}`);
         if (inspectPointer(entry.path, workgroupId, options.dataDir).state === 'healthy') {
           return void Object.assign(entry, { action: 'none', reason: 'healthy-on-recheck' });
         }
         steps.push('liveness-rechecked');
-        applyRepair(context, steps);
+        const lateBeforeWrite = await applyRepair(context, steps, () => topicLiveReason(topicDir, options.probes));
+        if (lateBeforeWrite) return void skip(`recheck-before-write-${lateBeforeWrite}`);
         entry.action = 'repaired';
       },
       options.dataDir,
     ),
   );
-  if (entry.action === 'repaired' && topicLiveReason(topicDir, options.probes)) entry.reason = 'went-live-after-repair';
+  if (entry.action === 'repaired' && (await topicLiveReason(topicDir, options.probes))) {
+    entry.reason = 'went-live-after-repair';
+  }
 }
 
 export async function repairTopicWorktrees(options: RepairOptions): Promise<RepairReport> {
@@ -696,7 +758,7 @@ export async function repairTopicWorktrees(options: RepairOptions): Promise<Repa
   };
 }
 
-async function sessionParticipants(dataDir: string): Promise<Map<string, TopicParticipant[]>> {
+export async function sessionParticipants(dataDir: string): Promise<Map<string, TopicParticipant[]>> {
   const rows = await getDb().all<{
     id: string;
     agent_group_id: string;
@@ -732,7 +794,12 @@ async function sessionParticipants(dataDir: string): Promise<Map<string, TopicPa
 /** A closed session can still hold a processing claim, a current tool or a promised continuation. */
 function outboundShowsWork(participant: TopicParticipant): boolean {
   const location = { agentGroupId: participant.agentGroupId, sessionId: participant.sessionId };
-  if (!fs.existsSync(sessionMailboxPath(location, 'outbound'))) return false;
+  if (
+    sessionWasReclaimed(participant.sessionId, path.join(DATA_DIR, 'v2-sessions')) &&
+    !fs.existsSync(sessionMailboxPath(location, 'inbound'))
+  ) {
+    return false;
+  }
   try {
     const busy = readSessionOutbound(
       location,
@@ -748,39 +815,23 @@ function outboundShowsWork(participant: TopicParticipant): boolean {
   }
 }
 
-function hostProcessCwds(): string[] | null {
-  let pids: string[];
-  try {
-    pids = fs.readdirSync('/proc').filter((name) => /^\d+$/.test(name));
-  } catch {
-    return null;
-  }
-  return pids.flatMap((pid) => {
-    try {
-      return [fs.readlinkSync(`/proc/${pid}/cwd`)];
-    } catch {
-      return [];
-    }
-  });
-}
-
 async function main(argv: string[]): Promise<number> {
   const apply = argv.includes('--apply');
   const valueOf = (flag: string) => argv.flatMap((arg, i) => (arg === flag && argv[i + 1] ? [argv[i + 1]] : []));
   const dataDir = DATA_DIR;
   const topics = valueOf('--topic');
   await initDb(path.join(dataDir, 'v2.db'), { role: 'tool', readonly: true });
-  const participants = await sessionParticipants(dataDir);
+  if (process.getuid?.() === 0) throw new Error('run as the install user, not root: admin dirs must stay writable');
   const report = await repairTopicWorktrees({
     dataDir,
     apply,
     topics: topics.length > 0 ? topics : undefined,
     scratchDir: valueOf('--scratch')[0],
     probes: {
-      participants: (topicDir) => participants.get(topicDir) ?? [],
+      participants: async (topicDir) => (await sessionParticipants(dataDir)).get(topicDir) ?? [],
       participantBusy: outboundShowsWork,
       mounts: runningContainerMounts,
-      cwds: hostProcessCwds,
+      processRooted: (dir) => hasLiveProcess(dir).live,
     },
     onEntry: (entry) =>
       console.error(`${entry.action} ${entry.reason ?? entry.match ?? ''} ${entry.topic}/${entry.checkout}`),

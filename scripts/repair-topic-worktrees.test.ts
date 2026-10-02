@@ -6,6 +6,10 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { createAgentGroup } from '../src/db/agent-groups.js';
+import { closeDb, initMigratedTestDb } from '../src/db/index.js';
+import { createSession } from '../src/db/sessions.js';
+import { resolveRepositoryWorkUnit, topicStateDir } from '../src/repository-workspaces.js';
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
 
 import {
@@ -13,6 +17,7 @@ import {
   adminDirName,
   repairTopicWorktrees,
   rescueRefName,
+  sessionParticipants,
   type LivenessProbes,
   type RepairEntry,
 } from './repair-topic-worktrees.js';
@@ -101,10 +106,10 @@ function fingerprint(dir: string): Record<string, string> {
 
 function probes(overrides: Partial<LivenessProbes> = {}): LivenessProbes {
   return {
-    participants: () => [],
+    participants: () => Promise.resolve([]),
     participantBusy: () => false,
     mounts: () => [],
-    cwds: () => [],
+    processRooted: () => false,
     ...overrides,
   };
 }
@@ -131,11 +136,14 @@ function buildFixture(): { originHead: string; localCommit: string } {
   git(root, 'init', '--quiet', '--bare', '--initial-branch=main', origin);
   const seed = path.join(root, 'seed');
   git(root, 'init', '--quiet', '--initial-branch=main', seed);
-  fs.writeFileSync(path.join(seed, '.gitignore'), 'node_modules/\n*.log\n');
+  fs.writeFileSync(path.join(seed, '.gitignore'), 'node_modules/\n*.log\ndist/\n');
+  fs.mkdirSync(path.join(seed, 'dist'));
+  fs.writeFileSync(path.join(seed, 'dist', 'bundle.js'), 'force-tracked build output\n');
   fs.writeFileSync(path.join(seed, 'README.md'), 'hello\n');
   fs.mkdirSync(path.join(seed, 'src'));
   fs.writeFileSync(path.join(seed, 'src', 'index.ts'), 'export const x = 1;\n');
   git(seed, 'add', '-A');
+  git(seed, 'add', '-f', 'dist/bundle.js');
   git(seed, 'commit', '--quiet', '-m', 'seed');
   git(seed, 'remote', 'add', 'origin', origin);
   git(seed, 'push', '--quiet', 'origin', 'main');
@@ -256,6 +264,10 @@ describe('repairTopicWorktrees', () => {
       `${two.proof!.rescueCommit} ${originHead}`,
     );
     expect(git(canonical, 'cat-file', '-p', `${one.proof!.rescueCommit}:notes.txt`)).toBe('untracked work');
+    expect(git(canonical, 'cat-file', '-p', `${one.proof!.rescueCommit}:dist/bundle.js`)).toBe(
+      'force-tracked build output',
+    );
+    expect(two.hashSeed).toBe(originHead);
     expect(git(canonical, 'worktree', 'list', '--porcelain')).not.toContain('prunable');
   });
 
@@ -286,7 +298,8 @@ describe('repairTopicWorktrees', () => {
       topics: [1, 2].map((n) => `${WORKGROUP}/${topicDirName(n)}`),
       probes: probes({
         mounts: () => [path.join(topicDir(1), 'worktrees')],
-        participants: (dir) => (dir === topicDir(2) ? [{ sessionId: 's', agentGroupId: 'g', status: 'active' }] : []),
+        participants: (dir) =>
+          Promise.resolve(dir === topicDir(2) ? [{ sessionId: 's', agentGroupId: 'g', status: 'active' }] : []),
       }),
     });
 
@@ -304,9 +317,10 @@ describe('repairTopicWorktrees', () => {
       scratchDir: root,
       topics: [1, 2].map((n) => `${WORKGROUP}/${topicDirName(n)}`),
       probes: probes({
-        participants: (dir) => (dir === topicDir(1) ? [{ sessionId: 's', agentGroupId: 'g', status: 'closed' }] : []),
+        participants: (dir) =>
+          Promise.resolve(dir === topicDir(1) ? [{ sessionId: 's', agentGroupId: 'g', status: 'closed' }] : []),
         participantBusy: () => true,
-        cwds: () => [path.join(checkoutPath(2), 'src')],
+        processRooted: (dir) => dir === fs.realpathSync(topicDir(2)),
       }),
     });
     expect(entryFor(report.entries, 1)).toMatchObject({ action: 'skipped', reason: 'topic-busy' });
@@ -314,12 +328,38 @@ describe('repairTopicWorktrees', () => {
     expect(rescueRefs()).toEqual([]);
   });
 
-  it('writes and verifies the rescue ref before any registration change, and keeps it when the change fails', async () => {
+  it('keeps the verified rescue ref when the registration write fails after it', async () => {
+    buildFixture();
+    const pointer = fs.readFileSync(path.join(checkoutPath(1), '.git'), 'utf8');
+    const admins = path.join(canonical, '.git', 'worktrees');
+    fs.chmodSync(admins, 0o555);
+    let report;
+    try {
+      report = await repairTopicWorktrees({
+        dataDir,
+        apply: true,
+        scratchDir: root,
+        topics: [`${WORKGROUP}/${topicDirName(1)}`],
+        probes: probes(),
+      });
+    } finally {
+      fs.chmodSync(admins, 0o755);
+    }
+
+    const entry = entryFor(report.entries, 1);
+    expect(entry).toMatchObject({ action: 'failed' });
+    expect(entry.reason).toContain('EACCES');
+    expect(git(canonical, 'cat-file', '-p', `${rescueRefName(topicDirName(1), REPO)}:notes.txt`)).toBe(
+      'untracked work',
+    );
+    expect(fs.readFileSync(path.join(checkoutPath(1), '.git'), 'utf8')).toBe(pointer);
+  });
+
+  it('refuses before any write when its admin dir name is held by another checkout', async () => {
     buildFixture();
     const taken = path.join(canonical, '.git', 'worktrees', adminDirName(topicDirName(1), REPO));
     fs.mkdirSync(taken);
     fs.writeFileSync(path.join(taken, 'gitdir'), '/elsewhere/.git\n');
-    const pointer = fs.readFileSync(path.join(checkoutPath(1), '.git'), 'utf8');
 
     const report = await repairTopicWorktrees({
       dataDir,
@@ -329,14 +369,13 @@ describe('repairTopicWorktrees', () => {
       probes: probes(),
     });
 
-    const entry = entryFor(report.entries, 1);
-    expect(entry.action).toBe('failed');
-    expect(entry.reason).toContain('admin dir name already taken');
-    expect(git(canonical, 'cat-file', '-p', `${rescueRefName(topicDirName(1), REPO)}:notes.txt`)).toBe(
-      'untracked work',
-    );
-    expect(fs.readFileSync(path.join(checkoutPath(1), '.git'), 'utf8')).toBe(pointer);
+    expect(entryFor(report.entries, 1).reason).toContain('admin dir name already taken');
+    expect(rescueRefs()).toEqual([]);
     expect(fs.readFileSync(path.join(taken, 'gitdir'), 'utf8')).toBe('/elsewhere/.git\n');
+  });
+
+  it('names admin dirs uniquely even when two checkout names sanitise alike', () => {
+    expect(adminDirName('thread-x', 'app@a/b')).not.toBe(adminDirName('thread-x', 'app@a-b'));
   });
 
   it('resolves a checkout whose name is not a canonical by the admin dir its pointer names', async () => {
@@ -394,5 +433,100 @@ describe('repairTopicWorktrees', () => {
     git(other, 'fetch', '--quiet', path.join(root, 'origin.git'), 'main');
     const ambiguous = await repairTopicWorktrees({ ...scope, probes: probes() });
     expect(entryFor(ambiguous.entries, 6)).toMatchObject({ action: 'skipped', reason: 'no-canonical' });
+  });
+
+  it('re-reads liveness under the lock and again before the first registration write', async () => {
+    buildFixture();
+    const pointer = fs.readFileSync(path.join(checkoutPath(1), '.git'), 'utf8');
+    const adminsBefore = fs.readdirSync(path.join(canonical, '.git', 'worktrees')).sort();
+    const goesLiveOnCall = (n: number): LivenessProbes => {
+      let calls = 0;
+      return probes({
+        participants: () => {
+          calls += 1;
+          return Promise.resolve(calls >= n ? [{ sessionId: 's', agentGroupId: 'g', status: 'active' }] : []);
+        },
+      });
+    };
+    const scope = { dataDir, apply: true, scratchDir: root, topics: [`${WORKGROUP}/${topicDirName(1)}`] };
+
+    const underLock = await repairTopicWorktrees({ ...scope, probes: goesLiveOnCall(2) });
+    expect(entryFor(underLock.entries, 1)).toMatchObject({ action: 'skipped', reason: 'recheck-session-live' });
+    expect(rescueRefs()).toEqual([]);
+
+    const beforeWrite = await repairTopicWorktrees({ ...scope, probes: goesLiveOnCall(3) });
+    expect(entryFor(beforeWrite.entries, 1)).toMatchObject({
+      action: 'skipped',
+      reason: 'recheck-before-write-session-live',
+    });
+    expect(rescueRefs()).toHaveLength(1);
+    expect(fs.readFileSync(path.join(checkoutPath(1), '.git'), 'utf8')).toBe(pointer);
+    expect(fs.readdirSync(path.join(canonical, '.git', 'worktrees')).sort()).toEqual(adminsBefore);
+  });
+
+  it('never runs a clean filter the repository configures', async () => {
+    buildFixture();
+    const marker = path.join(root, 'filter-ran');
+    git(canonical, 'config', 'filter.evil.clean', `touch ${marker}; cat`);
+    fs.writeFileSync(path.join(checkoutPath(2), '.gitattributes'), '* filter=evil\n');
+
+    const report = await repairTopicWorktrees({
+      dataDir,
+      apply: true,
+      scratchDir: root,
+      topics: [`${WORKGROUP}/${topicDirName(2)}`],
+      probes: probes(),
+    });
+    expect(entryFor(report.entries, 2).action).toBe('repaired');
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('keys DB sessions to the topic dir they own, so a live session refuses its topic', async () => {
+    buildFixture();
+    await initMigratedTestDb();
+    try {
+      const created_at = new Date().toISOString();
+      await createAgentGroup({
+        id: 'ag',
+        name: 'A',
+        folder: WORKGROUP,
+        agent_provider: null,
+        created_at,
+      });
+      await createSession({
+        id: 'sess-1',
+        agent_group_id: 'ag',
+        messaging_group_id: null,
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: null,
+        created_at,
+      });
+      const unit = resolveRepositoryWorkUnit({
+        workgroupId: WORKGROUP,
+        sessionId: 'sess-1',
+        platformId: null,
+        messagingGroupId: null,
+        threadId: null,
+      });
+      const owned = path.join(topicStateDir(unit, dataDir), 'worktrees', REPO);
+      fs.mkdirSync(path.dirname(owned), { recursive: true });
+      git(canonical, 'worktree', 'add', '--quiet', '--detach', owned, 'origin/main');
+      fs.rmSync(adminOf(owned), { recursive: true });
+
+      const report = await repairTopicWorktrees({
+        dataDir,
+        apply: true,
+        scratchDir: root,
+        topics: [`${WORKGROUP}/${path.basename(topicStateDir(unit, dataDir))}`],
+        probes: probes({ participants: async (dir) => (await sessionParticipants(dataDir)).get(dir) ?? [] }),
+      });
+      expect(report.entries).toEqual([expect.objectContaining({ action: 'skipped', reason: 'session-live' })]);
+      expect(rescueRefs()).toEqual([]);
+    } finally {
+      await closeDb();
+    }
   });
 });
