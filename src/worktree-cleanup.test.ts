@@ -619,6 +619,63 @@ describe('per-topic linked worktree cleanup', () => {
 
 // ── Branch clones (docs/specs/repository-branch-clones/plan.md §5.8) ────────
 
+describe('linked checkout stash attribution', () => {
+  /** A stash pushed from a sibling linked worktree of the same canonical, committed at `when`. */
+  function siblingStash(canonical: string, name: string, when: Date): void {
+    const sibling = path.join(state.dataDir, 'siblings', name);
+    fs.mkdirSync(path.dirname(sibling), { recursive: true });
+    git(canonical, ['worktree', 'add', '-q', '--detach', sibling, 'origin/HEAD']);
+    fs.writeFileSync(path.join(sibling, 'README.md'), `${name} edit\n`);
+    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'stash', 'push', '-q'], {
+      cwd: sibling,
+      env: { ...process.env, GIT_COMMITTER_DATE: when.toISOString() },
+      stdio: 'ignore',
+    });
+  }
+
+  function prove(worktree: string) {
+    return disposability.proveCheckoutDisposable({ path: worktree, shape: 'linked' });
+  }
+
+  it("passes a linked checkout over another worktree's stash that predates it", () => {
+    const { canonical, worktree } = repositoryFixture('stash-foreign');
+    siblingStash(canonical, 'earlier', new Date(Date.now() - 3_600_000));
+    expect(git(worktree, ['stash', 'list']).split('\n')).toHaveLength(1);
+    expect(prove(worktree)).toEqual({ ok: true, reason: 'clean-and-pushed' });
+  });
+
+  it('refuses when the filesystem cannot report a real birth time', () => {
+    const { canonical, worktree } = repositoryFixture('stash-no-birth');
+    siblingStash(canonical, 'earlier', new Date(Date.now() - 3_600_000));
+    const realStat = fs.statSync;
+    const stat = vi.spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const result = realStat(target, options) as fs.Stats;
+      if (target !== worktree) return result;
+      return Object.assign(Object.create(Object.getPrototypeOf(result)), result, { birthtimeMs: result.ctimeMs });
+    }) as typeof fs.statSync);
+    try {
+      expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
+    } finally {
+      stat.mockRestore();
+    }
+  });
+
+  it('refuses a linked checkout over a stash it pushed itself', () => {
+    const { worktree } = repositoryFixture('stash-own');
+    fs.writeFileSync(path.join(worktree, 'README.md'), 'parked work\n');
+    git(worktree, ['stash', 'push', '-q']);
+    expect(git(worktree, ['status', '--porcelain'])).toBe('');
+    expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
+  });
+
+  it('refuses a linked checkout over an entry it cannot rule out as its own', () => {
+    const { canonical, worktree } = repositoryFixture('stash-unattributable');
+    siblingStash(canonical, 'earlier', new Date(Date.now() - 3_600_000));
+    siblingStash(canonical, 'later', new Date(Date.now() + 3_600_000));
+    expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
+  });
+});
+
 describe('branch clone checkouts', () => {
   const OLD = new Date(Date.now() - 30 * 86_400_000);
 

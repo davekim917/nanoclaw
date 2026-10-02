@@ -767,6 +767,31 @@ function isWorktreeLocked(dir: string): boolean {
 }
 
 /**
+ * `refs/stash` is one ref shared by every worktree of a repository, and nothing records which worktree pushed an
+ * entry. A linked checkout answers for every entry that could be its own: all of them, except entries that provably
+ * predate the checkout directory's birth. Removing a worktree never drops an entry; this keeps a topic whose agent
+ * parked work in it.
+ */
+function linkedStashVerdict(dir: string, env: NodeJS.ProcessEnv): { ok: boolean; reason: string } | null {
+  const entries = git(dir, ['stash', 'list', '--date=unix', '--format=%ct %gd'], env);
+  if (entries === null) return { ok: false, reason: 'stash-unprovable' };
+  if (entries === '') return null;
+  let born: number;
+  try {
+    const stat = fs.statSync(dir);
+    // A birth time the filesystem cannot report surfaces as 0 or as the ctime; only 0 < birth < ctime is trusted.
+    born = stat.birthtimeMs > 0 && stat.birthtimeMs < stat.ctimeMs ? stat.birthtimeMs : Number.NaN;
+  } catch {
+    return { ok: false, reason: 'stash-unprovable' };
+  }
+  const predatesCheckout = (entry: string): boolean => {
+    const times = /^(\d+) stash@\{(\d+)\}$/.exec(entry);
+    return times !== null && (Math.max(Number(times[1]), Number(times[2])) + 1) * 1000 <= born;
+  };
+  return entries.split('\n').every(predatesCheckout) ? null : { ok: false, reason: 'stashed' };
+}
+
+/**
  * Positive proof that a checkout holds nothing worth keeping; reach it through proveCheckoutDisposable. A git
  * invocation that fails (pruned admin dir, container-only gitdir) returns unprovable, never clean.
  */
@@ -871,7 +896,7 @@ function provenDisposable(
   if (unpushed !== '') return { ok: false, reason: 'unpushed' };
 
   if (scope === 'head') {
-    const stashed = stashVerdict();
+    const stashed = linkedStashVerdict(dir, env);
     if (stashed) return stashed;
   }
 
