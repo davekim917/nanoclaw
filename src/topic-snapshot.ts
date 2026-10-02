@@ -57,17 +57,16 @@ class GitFailure extends Error {
   }
 }
 
-// No transport, so a promisor remote's lazy fetch cannot run core.sshCommand; no mailmap, which `git log` (forked by
-// `stash list`) would read from the working tree, where a FIFO would outlive the SIGKILL of its parent.
+// No transport, so a promisor remote's lazy fetch cannot run core.sshCommand.
 const HOST_GIT_OVERRIDES = [
   '-c',
   'protocol.allow=never',
   '-c',
   'protocol.file.allow=never',
   '-c',
-  'log.mailmap=false',
-  '-c',
   'core.safecrlf=false',
+  '-c',
+  'core.untrackedCache=false',
 ];
 const SECRET_SHAPED =
   /^(\.env|\.env\..*|.*\.env|.*\.pem|.*\.p8|.*\.key|credentials.*|\.netrc|id_rsa.*|id_ed25519.*|id_ecdsa.*|profiles\.yml|secrets\.ya?ml)$/;
@@ -102,7 +101,6 @@ interface GitCall {
   args: readonly string[];
   /** A checkout to run in; discovery from it stops at its parent. */
   cwd?: string;
-  /** A host-owned scratch repository to run against instead. */
   gitDir?: HostOwnedPath;
   filters?: readonly string[];
   okStatus?: readonly number[];
@@ -292,6 +290,21 @@ function assertRefsReadable(commonDir: string): void {
   for (const name of ['refs', 'logs', 'packed-refs']) walk(path.join(commonDir, name));
 }
 
+/**
+ * Every stash: the ref's tip plus every commit its reflog names, parsed here. `git stash list` walks that reflog and
+ * silently drops an entry whose commit it cannot load, and prints nothing for a ref whose reflog was expired.
+ */
+function stashTips(commonDir: string, refTip: Buffer): string[] {
+  const tips = new Set(lines(refTip));
+  const reflog = readPlainFile(path.join(commonDir, 'logs', 'refs', 'stash'));
+  for (const line of reflog ? lines(reflog) : []) {
+    const entry = /^([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) /.exec(line);
+    if (!entry) throw new Error(`unparseable stash reflog line in ${commonDir}: ${JSON.stringify(line)}`);
+    if (!/^0+$/.test(entry[2])) tips.add(entry[2]);
+  }
+  return [...tips];
+}
+
 function bundleRepo(repo: ContainerWritableRepo, dir: HostOwnedPath, options: TopicSnapshotOptions): number {
   const run = (call: GitCall) => runGit(call, options.timeoutMs);
   const at = repo.checkouts[0];
@@ -303,7 +316,10 @@ function bundleRepo(repo: ContainerWritableRepo, dir: HostOwnedPath, options: To
     const [sha, name] = line.split(' ');
     updates.push(`create ${name} ${sha}`);
   }
-  for (const sha of lines(run({ cwd: at, args: ['stash', 'list', '--format=%H'] }).stdout)) {
+  for (const sha of stashTips(
+    repo.commonDir,
+    run({ cwd: at, args: ['for-each-ref', '--format=%(objectname)', 'refs/stash'] }).stdout,
+  )) {
     updates.push(`create refs/git-safety/stash/${sha} ${sha}`);
   }
   for (const checkout of repo.checkouts) {
@@ -524,6 +540,16 @@ function expand(pattern: string): { checkouts: string[]; unreadable: Admission[]
   return { checkouts: level, unreadable, failures };
 }
 
+/** True only when `p` provably no longer exists; any other error leaves the failure standing. */
+function gone(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
 export async function snapshotTopics(options: TopicSnapshotOptions): Promise<TopicSnapshotResult> {
   const dataRoot = fs.realpathSync(options.dataRoot);
   const resolved = { ...options, dataRoot };
@@ -567,13 +593,15 @@ export async function snapshotTopics(options: TopicSnapshotOptions): Promise<Top
         );
       }
     } catch (err) {
-      result.failures.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+      if (gone(repo.commonDir)) say(`${label}: ${repo.commonDir} was removed during the run`);
+      else result.failures.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
     }
     for (const checkout of repo.checkouts) {
       try {
         if (await captureCheckout(checkout, label, dir, resolved, say)) result.captured += 1;
       } catch (err) {
-        result.failures.push(`${label}: ${checkout}: ${err instanceof Error ? err.message : String(err)}`);
+        if (gone(checkout)) say(`${label}: ${checkout} was removed during the run`);
+        else result.failures.push(`${label}: ${checkout}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }

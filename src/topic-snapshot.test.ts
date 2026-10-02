@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import zlib from 'zlib';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from './test-hermeticity.js';
 import { snapshotTopics, type TopicSnapshotOptions } from './topic-snapshot.js';
@@ -345,7 +345,7 @@ describe('snapshotTopics', () => {
     git(root, 'clone', '-q', remote, badLog);
     fs.appendFileSync(path.join(badLog, 'app.txt'), 'stashed\n');
     git(badLog, 'stash', 'push', '-q');
-    git(badLog, 'config', 'log.date', 'INVALID');
+    fs.appendFileSync(path.join(badLog, '.git', 'logs', 'refs', 'stash'), 'not a reflog line\n');
     const stuck = topic('topic-z');
     git(root, 'clone', '-q', remote, stuck);
     fs.appendFileSync(path.join(stuck, 'app.txt'), 'edit\n');
@@ -361,7 +361,7 @@ describe('snapshotTopics', () => {
     expect(result.captured).toBe(0);
     const failures = result.failures.join('\n');
     expect(failures).toContain(`${badStatus}: git status`);
-    expect(failures).toContain('git stash list');
+    expect(failures).toContain('unparseable stash reflog line');
     expect(failures).toMatch(/killed after 2s/);
   });
 
@@ -497,6 +497,39 @@ describe('snapshotTopics', () => {
     for (const entry of sealed) expect(result.failures.join('\n')).toContain(entry);
   });
 
+  it('bundles every stash commit, including a stash whose reflog was expired', async () => {
+    const stashTwice = (checkout: string): string[] => {
+      git(root, 'clone', '-q', remote, checkout);
+      fs.appendFileSync(path.join(checkout, 'app.txt'), 'first\n');
+      git(checkout, 'stash', 'push', '-q');
+      fs.appendFileSync(path.join(checkout, 'app.txt'), 'second\n');
+      git(checkout, 'stash', 'push', '-q');
+      return git(checkout, 'stash', 'list', '--format=%H').split('\n');
+    };
+    const kept = topic('topic-sk');
+    const keptStashes = stashTwice(kept);
+    const expired = topic('topic-se');
+    const [expiredTip] = stashTwice(expired);
+    git(expired, 'reflog', 'expire', '--expire=now', '--all');
+    expect(git(expired, 'stash', 'list')).toBe('');
+
+    const result = await snapshotTopics(options);
+
+    expect(result.failures).toEqual([]);
+    expect(result.bundled).toBe(2);
+    const heads = fs
+      .readdirSync(options.outDir)
+      .flatMap((label) =>
+        fs
+          .readdirSync(path.join(options.outDir, label))
+          .filter((name) => name.endsWith('.bundle'))
+          .map((name) => path.join(options.outDir, label, name)),
+      )
+      .map((bundle) => execFileSync('git', ['bundle', 'list-heads', bundle], { encoding: 'utf8' }))
+      .join('');
+    for (const sha of [...keptStashes, expiredTip]) expect(heads).toContain(sha);
+  });
+
   it('lists a split-index checkout without reading it, and captures a CRLF edit without failing', async () => {
     const split = topic('topic-si');
     git(root, 'clone', '-q', remote, split);
@@ -517,6 +550,29 @@ describe('snapshotTopics', () => {
     expect(result.unreadable).toEqual([{ kind: 'unreadable', checkout: split, reason: 'a split index' }]);
     expect(result.captured).toBe(1);
     expect(fingerprint(data)).toEqual(before);
+  });
+
+  it('notes a checkout removed during the run instead of failing it', async () => {
+    const leaving = topic('topic-gone');
+    git(root, 'clone', '-q', remote, leaving);
+    fs.appendFileSync(path.join(leaving, 'app.txt'), 'edit\n');
+    const readdir = fs.readdirSync;
+    // Admission's last read of this checkout; removing it here leaves it admitted but gone before capture.
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation(((dir: fs.PathLike, ...rest: unknown[]) => {
+      const names = (readdir as (...args: unknown[]) => unknown)(dir, ...rest);
+      if (String(dir) === path.join(leaving, '.git')) fs.rmSync(leaving, { recursive: true, force: true });
+      return names;
+    }) as typeof fs.readdirSync);
+    let result: Awaited<ReturnType<typeof snapshotTopics>>;
+    try {
+      result = await snapshotTopics(options);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(result.failures).toEqual([]);
+    expect(result.captured).toBe(0);
+    expect(manifest()).toContain(`${leaving} was removed during the run`);
   });
 
   it('refuses an empty pattern list', async () => {

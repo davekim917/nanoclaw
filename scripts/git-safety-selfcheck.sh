@@ -1926,9 +1926,10 @@ if [ "$RC" -eq 0 ] && ls "$(latest_snapshot)"topics/topic-*/*.patch.gz >/dev/nul
 else
   bad "topic checkouts were not snapshotted through topic-snapshot.ts" "$OUT"
 fi
-git -C "$TOPIC" -c user.email=t@e -c user.name=t stash push -q && git -C "$TOPIC" config log.date INVALID
+git -C "$TOPIC" -c user.email=t@e -c user.name=t stash push -q &&
+  echo 'not a reflog line' >>"$(git -C "$TOPIC" rev-parse --path-format=absolute --git-common-dir)/logs/refs/stash"
 run_safety GIT_SAFETY_TOPIC_CHECKOUTS="$NCDIR/data/v2-topics/*/*/worktrees/*" GIT_SAFETY_GROUPS_COMMIT=dry
-if [ "$RC" -ne 0 ] && [[ "$(tail -1 <<<"$OUT")" == "- topics: "*"stash list"* ]]; then
+if [ "$RC" -ne 0 ] && [[ "$(tail -1 <<<"$OUT")" == "- topics: "*"unparseable stash reflog"* ]]; then
   ok "a topic-snapshot.ts failure fails the run and is its reported reason"
 else
   bad "a topic-snapshot.ts failure did not fail the run" "$OUT"
