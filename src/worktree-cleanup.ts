@@ -1032,9 +1032,19 @@ function record(report: GcReport, candidate: GcCandidate): void {
     report.reclaimableBytes[candidate.category] += candidate.bytes;
   } else {
     report.skips[candidate.reason] = (report.skips[candidate.reason] ?? 0) + 1;
-    if (candidate.category === 'orphan-topic') {
-      report.topicSkipBytes[candidate.reason] = (report.topicSkipBytes[candidate.reason] ?? 0) + candidate.bytes;
+  }
+}
+
+/** Report-only, so it runs after the apply loop: a full walk here would sit between a topic's proof and its trash. */
+function sizeSkippedTopics(report: GcReport, skipped: GcCandidate[]): void {
+  const deadline = Date.now() + SKIP_SIZE_BUDGET_MS;
+  for (const candidate of skipped) {
+    if (Date.now() >= deadline) {
+      report.unmeasuredSkips += 1;
+      continue;
     }
+    candidate.bytes = dirSizeBytes(candidate.path);
+    report.topicSkipBytes[candidate.reason] = (report.topicSkipBytes[candidate.reason] ?? 0) + candidate.bytes;
   }
 }
 
@@ -1055,27 +1065,23 @@ function topicDisposabilityProbes(worktreeRoot: string): Array<Pick<TopicCheckou
   return [...checkouts, ...others];
 }
 
-function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
+function collectOrphanTopics(
+  report: GcReport,
+  dataDir: string,
+  owners: Map<string, TopicParticipant[]>,
+): GcCandidate[] {
   const topicsRoot = path.join(dataDir, 'v2-topics');
   const idleReclaimDays = topicIdleReclaimDays();
-  const sizeDeadline = Date.now() + SKIP_SIZE_BUDGET_MS;
-  const skippedBytes = (topicDir: string): number => {
-    if (Date.now() < sizeDeadline) return dirSizeBytes(topicDir);
-    report.unmeasuredSkips += 1;
-    return 0;
-  };
+  const skipped: GcCandidate[] = [];
   for (const workgroupId of safeDirectories(topicsRoot) ?? []) {
     const workgroupDir = path.join(topicsRoot, workgroupId);
     for (const topic of safeDirectories(workgroupDir) ?? []) {
       const topicDir = path.join(workgroupDir, topic);
-      const skip = (reason: string): void =>
-        record(report, {
-          category: 'orphan-topic',
-          path: topicDir,
-          collect: false,
-          reason,
-          bytes: skippedBytes(topicDir),
-        });
+      const skip = (reason: string): void => {
+        const candidate: GcCandidate = { category: 'orphan-topic', path: topicDir, collect: false, reason, bytes: 0 };
+        record(report, candidate);
+        skipped.push(candidate);
+      };
 
       const participants = owners.get(topicDir);
       // Status alone is not enough: a closed session can hold a claim or continuation; `topicIsBusy` fails closed.
@@ -1135,6 +1141,7 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
       });
     }
   }
+  return skipped;
 }
 
 function collectClones(
@@ -2222,7 +2229,7 @@ export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: st
   const owners = new Map(
     [...participantsByTopic(dataDir, rows)].map(([key, value]) => [key, value.participants] as const),
   );
-  collectOrphanTopics(report, dataDir, owners);
+  const skippedTopics = collectOrphanTopics(report, dataDir, owners);
   collectClones(report, dataDir, groupsDir, boundGitDirs(dataDir));
 
   if (mode === 'apply') {
@@ -2284,6 +2291,7 @@ export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: st
       }
     }
   }
+  sizeSkippedTopics(report, skippedTopics);
 
   log.info('Storage GC: ran', {
     mode,

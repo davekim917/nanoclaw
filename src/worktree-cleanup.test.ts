@@ -20,6 +20,7 @@ const state = vi.hoisted(() => ({
   trashed: [] as string[],
   trashDir: '',
   afterGit: null as null | ((args: readonly string[], cwd: string) => void),
+  afterTrash: null as null | (() => void),
 }));
 
 // The GC's removal is `/usr/bin/trash` (TRASH_BIN in worktree-cleanup.ts).
@@ -41,6 +42,7 @@ vi.mock('child_process', async (importOriginal) => {
           target,
           realPath.join(state.trashDir, `${state.trashed.length}-${realPath.basename(target)}`),
         );
+        state.afterTrash?.();
         return Buffer.alloc(0);
       }
       const result = actual.execFileSync(...args);
@@ -225,6 +227,7 @@ beforeEach(() => {
   state.unreadable.clear();
   state.mounts = [];
   state.trashed = [];
+  state.afterTrash = null;
   state.trashDir = fs.mkdtempSync(path.join(os.tmpdir(), 'topic-cleanup-trash-'));
   vi.mocked(listTopicCheckouts).mockClear();
   delete process.env.NANOCLAW_STORAGE_GC;
@@ -1288,6 +1291,32 @@ describe('branch clone checkouts', () => {
     expect(report.topicSkipBytes['topic-open']).toBeGreaterThan(0);
     expect(report.topicSkipBytes.dirty).toBeGreaterThan(4096);
     expect(report.unmeasuredSkips).toBe(0);
+  });
+
+  it('sizes skipped topics only after the apply loop has trashed its collections', async () => {
+    const canon = canonicalFixture('repo-a');
+    const open = cloneCheckout(canon, 'p1400-size-open', 'repo-a@feat', 'feat');
+    const closed = cloneCheckout(canon, 'p1400-size-closed', 'repo-a@feat', 'feat');
+    age(closed.checkout);
+    state.rows = [
+      {
+        ...row('s-p1400-size-open', 'p1400-size-open', 'active'),
+        folder: 'folder-a',
+        idle_since: new Date().toISOString(),
+      },
+      closedRow('p1400-size-closed'),
+    ];
+    const grown = 64 * 1024;
+    state.afterTrash = () => fs.writeFileSync(path.join(open.topicDir, 'grown.bin'), Buffer.alloc(grown));
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+
+    const report = await runStorageGcOnce(state.dataDir, groupsDir);
+
+    expect(state.trashed).toContain(closed.topicDir);
+    expect(find(report, open.topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+    expect(report.topicSkipBytes['topic-open']).toBeGreaterThan(grown);
   });
 
   /** Every path under `dir` with its type and bytes: what "restored byte for byte" compares. */

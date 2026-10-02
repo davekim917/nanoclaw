@@ -27,7 +27,7 @@ for (const [reason, count] of Object.entries(report.skips).sort((a, b) => b[1] -
   console.log(`    ${String(count).padStart(5)}  ${reason}`);
 }
 const unsized = report.unmeasuredSkips ? `, ${report.unmeasuredSkips} past the size budget and unsized` : '';
-console.log(`  held by skipped topics${unsized}:`);
+console.log(`  held by skipped topics (single-link files, what removal would free)${unsized}:`);
 for (const [reason, bytes] of Object.entries(report.topicSkipBytes).sort((a, b) => b[1] - a[1])) {
   console.log(`    ${gb(bytes).padStart(9)}  ${reason}`);
 }
