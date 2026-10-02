@@ -15,7 +15,7 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 import zlib from 'zlib';
 
-import { safeGitArgs, safeGitEnv } from './safe-git.js';
+import { FILTER_DISCOVERY_ARGS, FILTER_DISCOVERY_ENV, parseFilterKeys, safeGitArgs, safeGitEnv } from './safe-git.js';
 
 /** A repository a container can write. The type carries no capability: nothing in this module writes to one. */
 interface ContainerWritableRepo {
@@ -185,12 +185,13 @@ function repoFilterNames(checkout: string, timeoutMs: number): string[] {
   const keys = runGit(
     {
       cwd: checkout,
-      args: ['config', '--includes', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'],
+      args: ['config', '--includes', ...FILTER_DISCOVERY_ARGS],
+      env: FILTER_DISCOVERY_ENV,
       okStatus: [0, 1],
     },
     timeoutMs,
   ).stdout;
-  return [...new Set(lines(keys).map((key) => key.replace(/^filter\./, '').replace(/\.[a-z]+$/, '')))].sort();
+  return parseFilterKeys(keys);
 }
 
 function groupRepos(admitted: readonly Admission[]): ContainerWritableRepo[] {

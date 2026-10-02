@@ -297,6 +297,45 @@ describe('snapshotTopics', () => {
     for (const failure of result.failures) expect(failure).toContain('topic-y');
   });
 
+  it('neutralizes a filter whatever its name, and fails a checkout whose filter name it cannot carry', async () => {
+    const log = path.join(root, 'filter-ran');
+    const driver = path.join(root, 'filter-driver.sh');
+    fs.writeFileSync(driver, `#!/bin/sh\necho ran >> '${log}'\ncat\n`, { mode: 0o755 });
+    const names: Buffer[] = [Buffer.from(''), Buffer.from('a=b'), Buffer.from('a\u2028b'), Buffer.from([0x61, 0xff])];
+    const checkouts = names.map((name, index) => {
+      const checkout = topic(`topic-f${index}`);
+      git(root, 'clone', '-q', remote, checkout);
+      fs.appendFileSync(
+        path.join(checkout, '.git', 'config'),
+        Buffer.concat([Buffer.from('[filter "'), name, Buffer.from(`"]\n\tclean = ${driver}\n`)]),
+      );
+      fs.writeFileSync(
+        path.join(checkout, '.git', 'info', 'attributes'),
+        Buffer.concat([Buffer.from('* filter='), name, Buffer.from('\n')]),
+      );
+      fs.writeFileSync(path.join(checkout, 'new.txt'), 'untracked\n');
+      return checkout;
+    });
+    const stampDirty = (): void => {
+      const when = new Date(Date.now() - 1_000_000);
+      for (const checkout of checkouts) fs.utimesSync(path.join(checkout, 'app.txt'), when, when);
+    };
+    for (const checkout of checkouts) {
+      fs.rmSync(log, { force: true });
+      stampDirty();
+      execFileSync('git', ['status', '--porcelain'], { cwd: checkout, stdio: 'ignore' });
+      expect(fs.existsSync(log)).toBe(true);
+    }
+
+    fs.rmSync(log, { force: true });
+    stampDirty();
+    const result = await snapshotTopics(options);
+
+    expect(fs.existsSync(log)).toBe(false);
+    expect(result.captured).toBe(3);
+    expect(result.failures).toEqual([expect.stringContaining(checkouts[3])]);
+  });
+
   it('reports a failed or stuck read as a failure, never as an empty result', async () => {
     const badStatus = topic('topic-h');
     git(root, 'clone', '-q', remote, badStatus);
