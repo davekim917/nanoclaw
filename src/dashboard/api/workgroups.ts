@@ -29,7 +29,7 @@ interface WorkgroupRow {
  * Resolves the id AND checks scope in one step; never trust the route param as a filesystem path or authorization.
  * Null for not-found and out-of-scope alike.
  */
-export async function resolveWorkgroup(id: string, ctx: AuthedRequestContext): Promise<WorkgroupRow | null> {
+async function resolveWorkgroup(id: string, ctx: AuthedRequestContext): Promise<WorkgroupRow | null> {
   const row = await getDb().get<WorkgroupRow>('SELECT id, display_name FROM workgroups WHERE id = ?', id);
   if (!row) return null;
   if (ctx.scopes.no_filter) return row;
