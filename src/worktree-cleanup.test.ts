@@ -647,15 +647,19 @@ describe('linked checkout stash attribution', () => {
     return dir;
   }
 
-  /** The canonical and the topic dir first, so `before` runs strictly before the checkout exists. */
-  async function linkedAfter(threadId: string, before: (canonical: string) => void) {
+  /**
+   * The canonical and the topic dir first, so `before` runs strictly before the checkout exists; the worktrees root
+   * too when `rootFirst`, as for a checkout recreated in a topic that already had one.
+   */
+  async function linkedAfter(threadId: string, before: (canonical: string) => void, rootFirst = false) {
     const { canonical } = canonicalFixture('repo-a');
     const workUnit = unit(threadId);
     const worktree = path.join(topicWorktreesDir(workUnit, state.dataDir), 'repo-a');
-    fs.mkdirSync(topicStateDir(workUnit, state.dataDir), { recursive: true });
+    const root = path.dirname(worktree);
+    fs.mkdirSync(rootFirst ? root : path.dirname(root), { recursive: true });
     before(canonical);
     await nextSecond();
-    fs.mkdirSync(path.dirname(worktree));
+    if (!rootFirst) fs.mkdirSync(root);
     git(canonical, ['worktree', 'add', '-q', '-b', defaultTopicBranch(workUnit, 'repo-a'), worktree, 'origin/HEAD']);
     return { canonical, worktree, topicDir: topicStateDir(workUnit, state.dataDir) };
   }
@@ -711,13 +715,15 @@ describe('linked checkout stash attribution', () => {
   );
 
   it(
-    'anchors on the topic dir, which outlives each checkout incarnation, in the orphan-topic pass',
+    'anchors on the worktrees root, which a recreated checkout does not reset, in the orphan-topic pass',
     async () => {
-      const { worktree, topicDir } = await linkedAfter('stash-reincarnated', (canonical) =>
-        stashGit(sibling(canonical, 'first-incarnation'), ['stash', 'push', '-q']),
+      const { worktree, topicDir } = await linkedAfter(
+        'stash-reincarnated',
+        (canonical) => stashGit(sibling(canonical, 'first-incarnation'), ['stash', 'push', '-q']),
+        true,
       );
       expect(prove(worktree)).toEqual({ ok: true, reason: 'clean-and-pushed' });
-      expect(prove(worktree, topicDir)).toEqual({ ok: false, reason: 'stashed' });
+      expect(prove(worktree, path.dirname(worktree))).toEqual({ ok: false, reason: 'stashed' });
 
       state.rows = [];
       const old = new Date(Date.now() - 30 * 86_400_000);
@@ -751,22 +757,26 @@ describe('linked checkout stash attribution', () => {
   );
 
   it.each([
-    ['0', () => 0],
-    ['the ctime', (stat: fs.Stats) => stat.ctimeMs],
+    ['0', 'checkout', () => 0],
+    ['the ctime', 'checkout', (stat: fs.Stats) => stat.ctimeMs],
+    ['0', 'anchor', () => 0],
+    ['the ctime', 'anchor', (stat: fs.Stats) => stat.ctimeMs],
   ])(
-    'refuses as unprovable when the birth time reads as %s',
-    async (_label, birth) => {
+    'refuses as unprovable when the birth time reads as %s for the %s',
+    async (_label, which, birth) => {
       const { worktree } = await linkedAfter('stash-no-birth', (canonical) =>
         stashGit(sibling(canonical, 'earlier'), ['stash', 'push', '-q']),
       );
+      const anchor = path.dirname(worktree);
+      const stubbed = which === 'checkout' ? worktree : anchor;
       const realStat = fs.statSync;
       const stat = vi.spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
         const result = realStat(target, options) as fs.Stats;
-        if (target !== worktree) return result;
+        if (target !== stubbed) return result;
         return Object.assign(Object.create(Object.getPrototypeOf(result)), result, { birthtimeMs: birth(result) });
       }) as typeof fs.statSync);
       try {
-        expect(prove(worktree)).toEqual({ ok: false, reason: 'stash-unprovable' });
+        expect(prove(worktree, anchor)).toEqual({ ok: false, reason: 'stash-unprovable' });
       } finally {
         stat.mockRestore();
       }

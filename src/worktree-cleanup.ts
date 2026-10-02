@@ -768,7 +768,8 @@ function isWorktreeLocked(dir: string): boolean {
 
 /**
  * The earliest instant this checkout can have existed: its directory's birth, its `.git` pointer's mtime (a copy
- * that keeps times keeps that one), and `anchor`'s birth (the topic dir, which outlives each checkout incarnation).
+ * that keeps times keeps that one), and `anchor`'s birth (the topic's worktrees root, usually older than every
+ * incarnation of a checkout recreated in it; the minimum makes an exception harmless).
  * `null` when a birth time is unreportable: it surfaces as 0 or as the ctime, so only 0 < birth < ctime is trusted.
  */
 function checkoutExistedBy(dir: string, anchor: string | undefined): number | null {
@@ -1168,7 +1169,7 @@ function collectOrphanTopics(
         const decision = disposability.proveCheckoutDisposable({
           ...probe,
           inheritedTagsRecord: probe.shape === 'clone' ? checkoutInheritedTagsPath(probe.path) : null,
-          stashAnchor: topicDir,
+          stashAnchor: worktreeRoot,
         });
         if (!decision.ok) {
           refused = decision.reason;
