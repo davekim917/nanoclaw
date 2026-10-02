@@ -59,7 +59,16 @@ class GitFailure extends Error {
 
 // No transport, so a promisor remote's lazy fetch cannot run core.sshCommand; no mailmap, which `git log` (forked by
 // `stash list`) would read from the working tree, where a FIFO would outlive the SIGKILL of its parent.
-const HOST_GIT_OVERRIDES = ['-c', 'protocol.allow=never', '-c', 'protocol.file.allow=never', '-c', 'log.mailmap=false'];
+const HOST_GIT_OVERRIDES = [
+  '-c',
+  'protocol.allow=never',
+  '-c',
+  'protocol.file.allow=never',
+  '-c',
+  'log.mailmap=false',
+  '-c',
+  'core.safecrlf=false',
+];
 const SECRET_SHAPED =
   /^(\.env|\.env\..*|.*\.env|.*\.pem|.*\.p8|.*\.key|credentials.*|\.netrc|id_rsa.*|id_ed25519.*|id_ecdsa.*|profiles\.yml|secrets\.ya?ml)$/;
 
@@ -101,8 +110,6 @@ interface GitCall {
   stdinFd?: number;
   stdoutFd?: number;
   env?: NodeJS.ProcessEnv;
-  /** Git reports a path it could not read on stderr and still exits 0, so any stderr fails the call. */
-  quiet?: boolean;
 }
 
 function runGit(call: GitCall, timeoutMs: number): SpawnSyncReturns<Buffer> {
@@ -134,7 +141,8 @@ function runGit(call: GitCall, timeoutMs: number): SpawnSyncReturns<Buffer> {
     const stderr = result.stderr.toString().trim().split('\n').pop() ?? '';
     throw new GitFailure(`${command}: exit ${result.status}${stderr ? ` (${stderr})` : ''}`, true);
   }
-  if (call.quiet && result.stderr.length > 0) {
+  // Git reports what it could not read (a path, a ref) on stderr and still exits 0.
+  if (result.status === 0 && result.stderr.length > 0) {
     throw new GitFailure(`${command}: ${result.stderr.toString().trim().split('\n')[0]}`, false);
   }
   return result;
@@ -175,9 +183,12 @@ function admit(dataRoot: string, checkout: string, timeoutMs: number): Admission
     const common = onePath(
       runGit({ cwd: checkout, args: ['rev-parse', '--path-format=absolute', '--git-common-dir'] }, timeoutMs).stdout,
     );
+    const gitDir = onePath(runGit({ cwd: checkout, args: ['rev-parse', '--absolute-git-dir'] }, timeoutMs).stdout);
     const commonDir = fs.realpathSync(common);
     if (top !== real) return unreadable(`git resolves it to ${top}`);
     if (!isWithin(dataRoot, commonDir)) return unreadable(`its repository ${commonDir} is outside ${dataRoot}`);
+    // Reading a split index touches the shared index file's timestamps, which would write under data/.
+    if (fs.readdirSync(gitDir).some((name) => name.startsWith('sharedindex.'))) return unreadable('a split index');
     return { kind: 'admitted', checkout: real, commonDir };
   } catch (err) {
     if (!(err instanceof GitFailure) || !err.cannotOpen) throw err;
@@ -263,9 +274,28 @@ function verifyBundle(bundle: HostOwnedPath, objectsDir: string, scratchRoot: Ho
   }
 }
 
+/** Throws on any ref or reflog the host cannot read: git skips an unreadable ref directory or reflog without a word. */
+function assertRefsReadable(commonDir: string): void {
+  const walk = (entry: string): void => {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(entry);
+      if (stat.isDirectory()) {
+        for (const name of fs.readdirSync(entry)) walk(path.join(entry, name));
+      } else if (stat.isFile()) {
+        fs.accessSync(entry, fs.constants.R_OK);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  };
+  for (const name of ['refs', 'logs', 'packed-refs']) walk(path.join(commonDir, name));
+}
+
 function bundleRepo(repo: ContainerWritableRepo, dir: HostOwnedPath, options: TopicSnapshotOptions): number {
   const run = (call: GitCall) => runGit(call, options.timeoutMs);
   const at = repo.checkouts[0];
+  assertRefsReadable(repo.commonDir);
   const updates: string[] = [];
   for (const line of lines(
     run({ cwd: at, args: ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads'] }).stdout,
@@ -336,7 +366,6 @@ async function captureCheckout(
     cwd: checkout,
     filters,
     args: ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=dirty'],
-    quiet: true,
   }).stdout;
   if (status.length === 0) return false;
 
@@ -357,7 +386,6 @@ async function captureCheckout(
         cwd: checkout,
         filters,
         stdoutFd: fd,
-        quiet: true,
         args: [
           'diff-index',
           '--no-color',
@@ -381,7 +409,6 @@ async function captureCheckout(
     const untracked = run({
       cwd: checkout,
       args: ['ls-files', '--others', '--exclude-standard', '-z'],
-      quiet: true,
     }).stdout;
     for (const file of nulRecords(untracked)) {
       const shown = JSON.stringify(file.toString());
@@ -504,6 +531,7 @@ export async function snapshotTopics(options: TopicSnapshotOptions): Promise<Top
   const manifest = hostOwned(dataRoot, options.manifestPath);
   const say = (line: string): void => fs.appendFileSync(manifest, `${line}\n`);
 
+  if (options.patterns.length === 0) throw new Error('no topic checkout patterns');
   const result: TopicSnapshotResult = { captured: 0, bundled: 0, unreadable: [], failures: [] };
   const found = new Set<string>();
   for (const pattern of options.patterns) {

@@ -467,6 +467,62 @@ describe('snapshotTopics', () => {
     }
   });
 
+  it('fails a repo whose refs or reflogs it cannot read, rather than bundling without them', async () => {
+    const nested = topic('topic-r1');
+    git(root, 'clone', '-q', remote, nested);
+    git(nested, 'checkout', '-q', '-b', 'feature/x');
+    fs.appendFileSync(path.join(nested, 'app.txt'), 'unpushed\n');
+    git(nested, 'commit', '-qam', 'unpushed');
+    git(nested, 'checkout', '-q', 'main');
+    const stashed = topic('topic-r2');
+    git(root, 'clone', '-q', remote, stashed);
+    fs.appendFileSync(path.join(stashed, 'app.txt'), 'stashed\n');
+    git(stashed, 'stash', 'push', '-q');
+    const sealed = [
+      path.join(nested, '.git', 'refs', 'heads', 'feature'),
+      path.join(stashed, '.git', 'logs', 'refs', 'stash'),
+    ];
+    for (const entry of sealed) fs.chmodSync(entry, 0o000);
+    let result: Awaited<ReturnType<typeof snapshotTopics>>;
+    try {
+      result = await snapshotTopics(options);
+    } finally {
+      fs.chmodSync(sealed[0], 0o755);
+      fs.chmodSync(sealed[1], 0o644);
+    }
+
+    expect(result.bundled).toBe(0);
+    expect(result.failures).toHaveLength(2);
+    expect(result.failures).toContainEqual(expect.stringContaining('EACCES'));
+    for (const entry of sealed) expect(result.failures.join('\n')).toContain(entry);
+  });
+
+  it('lists a split-index checkout without reading it, and captures a CRLF edit without failing', async () => {
+    const split = topic('topic-si');
+    git(root, 'clone', '-q', remote, split);
+    git(split, 'config', 'core.splitIndex', 'true');
+    git(split, 'update-index', '--split-index');
+    fs.appendFileSync(path.join(split, 'app.txt'), 'edit\n');
+    const crlf = topic('topic-crlf');
+    git(root, 'clone', '-q', remote, crlf);
+    fs.writeFileSync(path.join(crlf, '.gitattributes'), '* text=auto\n');
+    git(crlf, 'add', '.gitattributes');
+    git(crlf, 'commit', '-qm', 'attrs');
+    fs.writeFileSync(path.join(crlf, 'app.txt'), 'base\r\nsecond\r\nedit\r\n');
+    const before = fingerprint(data);
+
+    const result = await snapshotTopics(options);
+
+    expect(result.failures).toEqual([]);
+    expect(result.unreadable).toEqual([{ kind: 'unreadable', checkout: split, reason: 'a split index' }]);
+    expect(result.captured).toBe(1);
+    expect(fingerprint(data)).toEqual(before);
+  });
+
+  it('refuses an empty pattern list', async () => {
+    await expect(snapshotTopics({ ...options, patterns: [] })).rejects.toThrow(/no topic checkout patterns/);
+  });
+
   it('fails a checkout whose untracked file tar cannot read, rather than archiving without it', async () => {
     const checkout = topic('topic-perm');
     git(root, 'clone', '-q', remote, checkout);
