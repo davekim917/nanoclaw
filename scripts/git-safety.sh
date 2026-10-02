@@ -5,7 +5,9 @@
 #   1. snapshot — every commit that exists only on this host (on no remote),
 #      every uncommitted edit and new file, and every stash, across all
 #      worktrees of this repo, groups/, and $GIT_SAFETY_EXTRA_REPOS, into
-#      $GIT_SAFETY_DIR/<UTC stamp>/. Read-only against the repos except for
+#      $GIT_SAFETY_DIR/<UTC stamp>/; topic checkouts ($GIT_SAFETY_TOPIC_CHECKOUTS)
+#      go through scripts/topic-snapshot.ts into <stamp>/topics/ and are never
+#      written. Read-only against the other repos except for
 #      refs/git-safety/* refs that pin detached-HEAD and stash commits so
 #      `git gc` cannot collect them; those refs are pruned once whatever they
 #      protected is gone AND the pin itself has outlived $GIT_SAFETY_KEEP_DAYS
@@ -76,6 +78,10 @@
 #   GIT_SAFETY_DIR                snapshot root (default ~/nanoclaw-backups)
 #   GIT_SAFETY_KEEP_DAYS          delete snapshots older than this (default 14)
 #   GIT_SAFETY_EXTRA_REPOS        space-separated extra repo paths or globs
+#   GIT_SAFETY_TOPIC_CHECKOUTS    space-separated globs of container-writable
+#                                 checkouts under data/ (topic worktrees)
+#   GIT_SAFETY_GIT_TIMEOUT        seconds any one topic git command may run
+#                                 (default 300)
 #   GIT_SAFETY_GROUPS_COMMIT      apply (default) | dry (report only: no fetch,
 #                                 no commit, no push, no owner DM)
 #   GIT_SAFETY_SNAPSHOT_BRANCH    branch groups/ snapshots push to
@@ -86,7 +92,14 @@
 #                                 (default $GIT_SAFETY_DIR/.git-safety-state)
 #
 # Manual run:  bash scripts/git-safety.sh
-# Restore:     see MANIFEST.txt in the snapshot directory. groups/ config
+# Restore:     see MANIFEST.txt in the snapshot directory. A topic snapshot
+#              (<stamp>/topics/) holds bytes a container chose: a patch can
+#              name paths outside its checkout and a bundle can carry history
+#              from any repository the topic's alternates reached. Never
+#              restore one into a container-visible location until a restore
+#              path exists that re-reads it through an admission-pinned view
+#              (fixed GIT_DIR/GIT_WORK_TREE, a validated index, alternates
+#              confined to the repo's own store). groups/ config
 #              lives on refs/heads/$GIT_SAFETY_SNAPSHOT_BRANCH, e.g.:
 #              git -C groups fetch origin host-snapshot && \
 #                git -C groups show origin/host-snapshot:<path>
@@ -113,6 +126,7 @@ GROUPS_MODE="${GIT_SAFETY_GROUPS_COMMIT:-apply}"
 GROUPS_DIR="$NANOCLAW_DIR/groups"
 SNAPSHOT_BRANCH="${GIT_SAFETY_SNAPSHOT_BRANCH:-host-snapshot}"
 MAX_UNTRACKED_BYTES="${GIT_SAFETY_MAX_UNTRACKED_BYTES:-104857600}"
+GIT_TIMEOUT="${GIT_SAFETY_GIT_TIMEOUT:-300}"
 STATE_DIR="${GIT_SAFETY_STATE_DIR:-$SNAP_ROOT/.git-safety-state}"
 HELD_STATE_FILE="$STATE_DIR/secret-scan-held.tsv"
 # #628 item 9: a hold that has sat unresolved (not allowlisted, not fixed)
@@ -327,6 +341,7 @@ say "Snapshot $TS"
 say "Restore commits:   git fetch <bundle> 'refs/*:refs/*' (verify first: see verify_bundle in this script)"
 say "Restore edits:     git apply --binary <patch>   (in a worktree at the recorded HEAD)"
 say "Restore new files: tar xzf <tgz> -C <worktree>"
+say "Topic snapshots (topics/): not restorable into a container-visible location yet; see Restore in scripts/git-safety.sh"
 say "Restore groups/ config: git -C groups fetch origin $SNAPSHOT_BRANCH && git -C groups show origin/$SNAPSHOT_BRANCH:<path>"
 
 # ── phase 1: snapshot ───────────────────────────────────────────────────────
@@ -977,6 +992,28 @@ commit_groups() {
 [ -d "$GROUPS_DIR/.git" ] && commit_groups
 say "groups: $GROUPS_RESULT"
 
+# Topic checkouts are container-writable, so this script never runs git in
+# them: the TS module does, read-only and on the hardened host-git path. It
+# runs after groups/ so that a slow or stalled topic cannot cost that commit.
+TOPICS_RESULT=""
+if [ -n "${GIT_SAFETY_TOPIC_CHECKOUTS:-}" ]; then
+  read -ra TOPIC_SPECS <<<"$GIT_SAFETY_TOPIC_CHECKOUTS"
+  TOPICS_ERR=$(mktemp); CLEANUP_PATHS+=("$TOPICS_ERR")
+  TOPICS_RESULT=$("$SCRIPT_DIR/../node_modules/.bin/tsx" "$SCRIPT_DIR/topic-snapshot.ts" \
+    --data-root "$NANOCLAW_DIR/data" --out "$OUT/topics" --manifest "$MAN" \
+    --timeout-seconds "$GIT_TIMEOUT" --max-untracked-bytes "$MAX_UNTRACKED_BYTES" -- "${TOPIC_SPECS[@]}" 2>"$TOPICS_ERR")
+  TOPICS_RC=$?
+  cat "$TOPICS_ERR" >> "$ERR"
+  if [ "$TOPICS_RC" -ne 0 ]; then
+    TOPICS_REPORTED=0
+    while IFS= read -r line; do
+      case "$line" in failure:*) FAILURES+=("topics: ${line#failure: }"); TOPICS_REPORTED=1 ;; esac
+    done < "$TOPICS_ERR"
+    [ "$TOPICS_REPORTED" -eq 1 ] ||
+      FAILURES+=("topics: topic-snapshot.ts exited $TOPICS_RC with no failure line: $(tail -1 "$TOPICS_ERR" | cut -c1-300)")
+  fi
+fi
+
 # ── retention ───────────────────────────────────────────────────────────────
 find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*Z' -mtime +"$KEEP_DAYS" -exec rm -rf {} + 2>/dev/null
 
@@ -1003,4 +1040,4 @@ Full snapshot: $OUT ($SIZE)."
   node_modules/.bin/tsx scripts/notify-owner.ts --title "Git safety net: review pending" --body "$NOTICE_BODY" ||
     echo "git-safety: notice DM failed (non-fatal)" >&2
 fi
-echo "git-safety: ok — snapshot $OUT ($SIZE); groups: $GROUPS_RESULT"
+echo "git-safety: ok — snapshot $OUT ($SIZE); groups: $GROUPS_RESULT${TOPICS_RESULT:+; $TOPICS_RESULT}"

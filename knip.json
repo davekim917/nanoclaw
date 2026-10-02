@@ -37,6 +37,7 @@
         "setup/migrate-v2/channel-auth.ts",
         "setup/migrate-v2/switchover-prompt.ts",
         "scripts/storage-gc.ts",
+        "scripts/topic-snapshot.ts",
         "scripts/upstream-dry-run-report.ts",
         "scripts/fleet-drift.ts",
         "scripts/check-remote-boundary.ts",

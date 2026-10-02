@@ -93,24 +93,17 @@ function localFilterNames(configPath: string): string[] {
 
 const FILTER_VARIABLES = ['clean', 'smudge', 'process', 'required'];
 
-function filterNamesFrom(configArgs: string[]): string[] {
-  let output: Buffer;
-  try {
-    // In a UTF-8 locale git's regex `.` skips an invalid byte, so such a name would go undiscovered.
-    output = execFileSync(
-      'git',
-      [...configArgs, '--null', '--name-only', '--get-regexp', `^filter\\..*\\.(${FILTER_VARIABLES.join('|')})$`],
-      {
-        env: safeGitEnv({ LANG: 'C', LC_ALL: 'C' }),
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 10_000,
-      },
-    );
-  } catch (error) {
-    const status = (error as NodeJS.ErrnoException & { status?: number }).status;
-    if (status === 1) return [];
-    throw error;
-  }
+/** Appended to a `git config` invocation; run it with `FILTER_DISCOVERY_ENV` and read the output with `parseFilterKeys`. */
+export const FILTER_DISCOVERY_ARGS = [
+  '--null',
+  '--name-only',
+  '--get-regexp',
+  `^filter\\..*\\.(${FILTER_VARIABLES.join('|')})$`,
+];
+// In a UTF-8 locale git's regex `.` skips an invalid byte, so such a name would go undiscovered.
+export const FILTER_DISCOVERY_ENV = { LANG: 'C', LC_ALL: 'C' };
+
+export function parseFilterKeys(output: Buffer): string[] {
   const utf8 = new TextDecoder('utf-8', { fatal: true });
   const keys = utf8.decode(output).split('\0');
   if (keys.pop() !== '') throw new Error('unterminated git config key');
@@ -123,6 +116,22 @@ function filterNamesFrom(configArgs: string[]): string[] {
     names.add(key.slice('filter.'.length, key.length - variable.length - 1));
   }
   return [...names].sort();
+}
+
+function filterNamesFrom(configArgs: string[]): string[] {
+  let output: Buffer;
+  try {
+    output = execFileSync('git', [...configArgs, ...FILTER_DISCOVERY_ARGS], {
+      env: safeGitEnv(FILTER_DISCOVERY_ENV),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
+  } catch (error) {
+    const status = (error as NodeJS.ErrnoException & { status?: number }).status;
+    if (status === 1) return [];
+    throw error;
+  }
+  return parseFilterKeys(output);
 }
 
 export function safeGitConfigGet(configPath: string, key: string): string | null {
