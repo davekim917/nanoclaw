@@ -101,6 +101,8 @@ interface GitCall {
   stdinFd?: number;
   stdoutFd?: number;
   env?: NodeJS.ProcessEnv;
+  /** Git reports a path it could not read on stderr and still exits 0, so any stderr fails the call. */
+  quiet?: boolean;
 }
 
 function runGit(call: GitCall, timeoutMs: number): SpawnSyncReturns<Buffer> {
@@ -131,6 +133,9 @@ function runGit(call: GitCall, timeoutMs: number): SpawnSyncReturns<Buffer> {
   if (!(call.okStatus ?? [0]).includes(result.status ?? -1)) {
     const stderr = result.stderr.toString().trim().split('\n').pop() ?? '';
     throw new GitFailure(`${command}: exit ${result.status}${stderr ? ` (${stderr})` : ''}`, true);
+  }
+  if (call.quiet && result.stderr.length > 0) {
+    throw new GitFailure(`${command}: ${result.stderr.toString().trim().split('\n')[0]}`, false);
   }
   return result;
 }
@@ -293,10 +298,10 @@ function bundleRepo(repo: ContainerWritableRepo, dir: HostOwnedPath, options: To
     run({ gitDir: scratch, args: ['update-ref', '--stdin'], input: `${updates.join('\n')}\n` });
     const tips = updates.map((update) => update.split(' ')[1]);
     const revs = `${[...tips, ...negatives].join('\n')}\n`;
-    const commits = Number(
-      lines(run({ gitDir: scratch, args: ['rev-list', '--count', '--stdin'], input: revs }).stdout)[0],
-    );
-    if (!(commits > 0)) return 0;
+    const count = run({ gitDir: scratch, args: ['rev-list', '--count', '--stdin'], input: revs }).stdout.toString();
+    if (!/^\d+\n$/.test(count)) throw new Error(`rev-list --count printed ${JSON.stringify(count)}`);
+    const commits = Number(count);
+    if (commits === 0) return 0;
     const bundle = hostChild(dir, 'unpushed-commits.bundle');
     fs.mkdirSync(dir, { recursive: true });
     run({ gitDir: scratch, args: ['bundle', 'create', '-q', bundle, '--stdin'], input: revs });
@@ -331,6 +336,7 @@ async function captureCheckout(
     cwd: checkout,
     filters,
     args: ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=dirty'],
+    quiet: true,
   }).stdout;
   if (status.length === 0) return false;
 
@@ -351,6 +357,7 @@ async function captureCheckout(
         cwd: checkout,
         filters,
         stdoutFd: fd,
+        quiet: true,
         args: [
           'diff-index',
           '--no-color',
@@ -371,7 +378,11 @@ async function captureCheckout(
     }
 
     const kept: Buffer[] = [];
-    const untracked = run({ cwd: checkout, args: ['ls-files', '--others', '--exclude-standard', '-z'] }).stdout;
+    const untracked = run({
+      cwd: checkout,
+      args: ['ls-files', '--others', '--exclude-standard', '-z'],
+      quiet: true,
+    }).stdout;
     for (const file of nulRecords(untracked)) {
       const shown = JSON.stringify(file.toString());
       const name = file.subarray(file.lastIndexOf(0x2f) + 1).toString();
@@ -387,7 +398,10 @@ async function captureCheckout(
         say(`${label}: ${checkout}: ${shown} vanished while listing`);
         continue;
       }
-      if (!stat.isFile() && !stat.isSymbolicLink()) continue;
+      if (!stat.isFile() && !stat.isSymbolicLink()) {
+        say(`${label}: ${checkout}: skipped ${shown} (not a file or symlink)`);
+        continue;
+      }
       if (stat.isFile() && stat.size >= options.maxUntrackedBytes) {
         say(`${label}: ${checkout}: skipped ${shown} (${stat.size} bytes, >= ${options.maxUntrackedBytes} cap)`);
         continue;

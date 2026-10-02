@@ -37,7 +37,7 @@ if (!options) {
   console.error(USAGE);
   process.exit(2);
 }
-// git-safety.sh reports only `failure:` lines, so nothing may leave this script as a bare stack trace.
+// Every failure leaves as a `failure:` line, so git-safety.sh can name it rather than only count a bare exit.
 try {
   const result = await snapshotTopics(options);
   for (const failure of result.failures) console.error(`failure: ${JSON.stringify(failure)}`);

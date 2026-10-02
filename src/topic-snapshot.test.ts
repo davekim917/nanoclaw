@@ -431,6 +431,42 @@ describe('snapshotTopics', () => {
     expect(result.unreadable).toEqual([{ kind: 'unreadable', checkout: linked, reason: 'a symlink' }]);
   });
 
+  it('fails a checkout git cannot fully read, rather than capturing what it could see', async () => {
+    const trackedOnly = topic('topic-t1');
+    git(root, 'clone', '-q', remote, trackedOnly);
+    fs.mkdirSync(path.join(trackedOnly, 'sub'));
+    fs.writeFileSync(path.join(trackedOnly, 'sub', 'kept.txt'), 'kept\n');
+    git(trackedOnly, 'add', 'sub');
+    git(trackedOnly, 'commit', '-qm', 'sub');
+    fs.appendFileSync(path.join(trackedOnly, 'sub', 'kept.txt'), 'edit\n');
+    const mixed = topic('topic-t2');
+    git(root, 'clone', '-q', remote, mixed);
+    fs.mkdirSync(path.join(mixed, 'sub'));
+    fs.writeFileSync(path.join(mixed, 'sub', 'kept.txt'), 'kept\n');
+    git(mixed, 'add', 'sub');
+    git(mixed, 'commit', '-qm', 'sub');
+    fs.appendFileSync(path.join(mixed, 'app.txt'), 'edit\n');
+    const untracked = topic('topic-t3');
+    git(root, 'clone', '-q', remote, untracked);
+    fs.mkdirSync(path.join(untracked, 'fresh'));
+    fs.writeFileSync(path.join(untracked, 'fresh', 'new.txt'), 'new\n');
+    fs.appendFileSync(path.join(untracked, 'app.txt'), 'edit\n');
+    const sealed = [path.join(trackedOnly, 'sub'), path.join(mixed, 'sub'), path.join(untracked, 'fresh')];
+    for (const dir of sealed) fs.chmodSync(dir, 0o000);
+    let result: Awaited<ReturnType<typeof snapshotTopics>>;
+    try {
+      result = await snapshotTopics(options);
+    } finally {
+      for (const dir of sealed) fs.chmodSync(dir, 0o755);
+    }
+
+    expect(result.captured).toBe(0);
+    expect(result.failures).toHaveLength(3);
+    for (const checkout of [trackedOnly, mixed, untracked]) {
+      expect(result.failures).toContainEqual(expect.stringContaining(checkout));
+    }
+  });
+
   it('fails a checkout whose untracked file tar cannot read, rather than archiving without it', async () => {
     const checkout = topic('topic-perm');
     git(root, 'clone', '-q', remote, checkout);

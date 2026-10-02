@@ -6,7 +6,8 @@
 #      every uncommitted edit and new file, and every stash, across all
 #      worktrees of this repo, groups/, and $GIT_SAFETY_EXTRA_REPOS, into
 #      $GIT_SAFETY_DIR/<UTC stamp>/; topic checkouts ($GIT_SAFETY_TOPIC_CHECKOUTS)
-#      go through scripts/topic-snapshot.ts into <stamp>/topics/. Read-only against the repos except for
+#      go through scripts/topic-snapshot.ts into <stamp>/topics/ and are never
+#      written. Read-only against the other repos except for
 #      refs/git-safety/* refs that pin detached-HEAD and stash commits so
 #      `git gc` cannot collect them; those refs are pruned once whatever they
 #      protected is gone AND the pin itself has outlived $GIT_SAFETY_KEEP_DAYS
