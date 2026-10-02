@@ -20,6 +20,8 @@ const state = vi.hoisted(() => ({
   trashed: [] as string[],
   trashDir: '',
   afterGit: null as null | ((args: readonly string[], cwd: string) => void),
+  /** Replaces a git call's output when it returns a string; the call still runs first. */
+  rewriteGit: null as null | ((args: readonly string[]) => string | undefined),
   afterTrash: null as null | (() => void),
 }));
 
@@ -46,6 +48,9 @@ vi.mock('child_process', async (importOriginal) => {
         return Buffer.alloc(0);
       }
       const result = actual.execFileSync(...args);
+      const rewritten =
+        file === 'git' && Array.isArray(fileArgs) ? state.rewriteGit?.(fileArgs as string[]) : undefined;
+      if (rewritten !== undefined) return rewritten;
       if (file === 'git' && state.afterGit && Array.isArray(fileArgs)) {
         state.afterGit(fileArgs as string[], String((args[2] as { cwd?: string } | undefined)?.cwd));
       }
@@ -228,6 +233,7 @@ beforeEach(() => {
   state.mounts = [];
   state.trashed = [];
   state.afterTrash = null;
+  state.rewriteGit = null;
   state.trashDir = fs.mkdtempSync(path.join(os.tmpdir(), 'topic-cleanup-trash-'));
   vi.mocked(listTopicCheckouts).mockClear();
   delete process.env.NANOCLAW_STORAGE_GC;
@@ -620,45 +626,55 @@ describe('per-topic linked worktree cleanup', () => {
 // ── Branch clones (docs/specs/repository-branch-clones/plan.md §5.8) ────────
 
 describe('linked checkout stash attribution', () => {
-  /** A stash pushed from a sibling linked worktree of the same canonical, committed at `when`. */
-  function siblingStash(canonical: string, name: string, when: Date): void {
-    const sibling = path.join(state.dataDir, 'siblings', name);
-    fs.mkdirSync(path.dirname(sibling), { recursive: true });
-    git(canonical, ['worktree', 'add', '-q', '--detach', sibling, 'origin/HEAD']);
-    fs.writeFileSync(path.join(sibling, 'README.md'), `${name} edit\n`);
-    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'stash', 'push', '-q'], {
-      cwd: sibling,
-      env: { ...process.env, GIT_COMMITTER_DATE: when.toISOString() },
-      stdio: 'ignore',
-    });
+  const PATIENT = 30_000;
+  const nextSecond = () => new Promise((resolve) => setTimeout(resolve, 1_100));
+
+  function stashGit(cwd: string, args: string[], committedAt?: Date): string {
+    return execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args], {
+      cwd,
+      encoding: 'utf8',
+      env: committedAt ? { ...process.env, GIT_COMMITTER_DATE: committedAt.toISOString() } : process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
   }
 
-  function prove(worktree: string) {
-    return disposability.proveCheckoutDisposable({ path: worktree, shape: 'linked' });
+  /** A sibling linked worktree of the canonical holding an uncommitted edit, ready to stash. */
+  function sibling(canonical: string, name: string): string {
+    const dir = path.join(state.dataDir, 'siblings', name);
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    git(canonical, ['worktree', 'add', '-q', '--detach', dir, 'origin/HEAD']);
+    fs.writeFileSync(path.join(dir, 'README.md'), `${name} edit\n`);
+    return dir;
   }
 
-  it("passes a linked checkout over another worktree's stash that predates it", () => {
-    const { canonical, worktree } = repositoryFixture('stash-foreign');
-    siblingStash(canonical, 'earlier', new Date(Date.now() - 3_600_000));
-    expect(git(worktree, ['stash', 'list']).split('\n')).toHaveLength(1);
-    expect(prove(worktree)).toEqual({ ok: true, reason: 'clean-and-pushed' });
-  });
+  /** The canonical and the topic dir first, so `before` runs strictly before the checkout exists. */
+  async function linkedAfter(threadId: string, before: (canonical: string) => void) {
+    const { canonical } = canonicalFixture('repo-a');
+    const workUnit = unit(threadId);
+    const worktree = path.join(topicWorktreesDir(workUnit, state.dataDir), 'repo-a');
+    fs.mkdirSync(topicStateDir(workUnit, state.dataDir), { recursive: true });
+    before(canonical);
+    await nextSecond();
+    fs.mkdirSync(path.dirname(worktree));
+    git(canonical, ['worktree', 'add', '-q', '-b', defaultTopicBranch(workUnit, 'repo-a'), worktree, 'origin/HEAD']);
+    return { canonical, worktree, topicDir: topicStateDir(workUnit, state.dataDir) };
+  }
 
-  it('refuses when the filesystem cannot report a real birth time', () => {
-    const { canonical, worktree } = repositoryFixture('stash-no-birth');
-    siblingStash(canonical, 'earlier', new Date(Date.now() - 3_600_000));
-    const realStat = fs.statSync;
-    const stat = vi.spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
-      const result = realStat(target, options) as fs.Stats;
-      if (target !== worktree) return result;
-      return Object.assign(Object.create(Object.getPrototypeOf(result)), result, { birthtimeMs: result.ctimeMs });
-    }) as typeof fs.statSync);
-    try {
-      expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
-    } finally {
-      stat.mockRestore();
-    }
-  });
+  function prove(worktree: string, stashAnchor?: string) {
+    return disposability.proveCheckoutDisposable({ path: worktree, shape: 'linked', stashAnchor });
+  }
+
+  it(
+    "passes a linked checkout over another worktree's stash pushed before it existed",
+    async () => {
+      const { worktree } = await linkedAfter('stash-foreign', (canonical) =>
+        stashGit(sibling(canonical, 'earlier'), ['stash', 'push', '-q']),
+      );
+      expect(git(worktree, ['stash', 'list']).split('\n')).toHaveLength(1);
+      expect(prove(worktree)).toEqual({ ok: true, reason: 'clean-and-pushed' });
+    },
+    PATIENT,
+  );
 
   it('refuses a linked checkout over a stash it pushed itself', () => {
     const { worktree } = repositoryFixture('stash-own');
@@ -668,11 +684,114 @@ describe('linked checkout stash attribution', () => {
     expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
   });
 
-  it('refuses a linked checkout over an entry it cannot rule out as its own', () => {
+  it("refuses over another worktree's entry pushed after it existed: it cannot rule it out", () => {
     const { canonical, worktree } = repositoryFixture('stash-unattributable');
-    siblingStash(canonical, 'earlier', new Date(Date.now() - 3_600_000));
-    siblingStash(canonical, 'later', new Date(Date.now() + 3_600_000));
+    stashGit(sibling(canonical, 'later'), ['stash', 'push', '-q']);
     expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
+  });
+
+  it(
+    'refuses an old stash commit stored after it existed, and a new one stored with a backdated reflog',
+    async () => {
+      let oldCommit = '';
+      let spare = '';
+      const { worktree } = await linkedAfter('stash-stored', (canonical) => {
+        oldCommit = stashGit(sibling(canonical, 'created-early'), ['stash', 'create']);
+        spare = sibling(canonical, 'created-late');
+      });
+      stashGit(worktree, ['stash', 'store', '-q', oldCommit]);
+      expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
+
+      stashGit(worktree, ['stash', 'drop', '-q']);
+      const newCommit = stashGit(spare, ['stash', 'create']);
+      stashGit(worktree, ['stash', 'store', '-q', newCommit], new Date(Date.now() - 3_600_000));
+      expect(prove(worktree)).toEqual({ ok: false, reason: 'stashed' });
+    },
+    PATIENT,
+  );
+
+  it(
+    'anchors on the topic dir, which outlives each checkout incarnation, in the orphan-topic pass',
+    async () => {
+      const { worktree, topicDir } = await linkedAfter('stash-reincarnated', (canonical) =>
+        stashGit(sibling(canonical, 'first-incarnation'), ['stash', 'push', '-q']),
+      );
+      expect(prove(worktree)).toEqual({ ok: true, reason: 'clean-and-pushed' });
+      expect(prove(worktree, topicDir)).toEqual({ ok: false, reason: 'stashed' });
+
+      state.rows = [];
+      const old = new Date(Date.now() - 30 * 86_400_000);
+      fs.utimesSync(path.dirname(worktree), old, old);
+      fs.utimesSync(worktree, old, old);
+      const report = await runStorageGcOnce(state.dataDir, path.join(state.dataDir, 'groups'));
+      expect(report.candidates.find((candidate) => candidate.path === topicDir)).toMatchObject({
+        collect: false,
+        reason: 'stashed',
+      });
+    },
+    PATIENT,
+  );
+
+  it(
+    'a copy that keeps times keeps its stash: the .git pointer mtime bounds a reset birth time',
+    async () => {
+      const { worktree } = repositoryFixture('stash-copied');
+      fs.writeFileSync(path.join(worktree, 'README.md'), 'parked work\n');
+      git(worktree, ['stash', 'push', '-q']);
+      await nextSecond();
+      const copy = path.join(state.dataDir, 'relocated', 'repo-a');
+      fs.cpSync(worktree, copy, { recursive: true, preserveTimestamps: true });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      fs.writeFileSync(path.join(copy, '.touched'), '');
+      fs.rmSync(path.join(copy, '.touched'));
+      expect(fs.statSync(copy).birthtimeMs).toBeGreaterThan(fs.statSync(worktree).birthtimeMs);
+      expect(prove(copy)).toEqual({ ok: false, reason: 'stashed' });
+    },
+    PATIENT,
+  );
+
+  it.each([
+    ['0', () => 0],
+    ['the ctime', (stat: fs.Stats) => stat.ctimeMs],
+  ])(
+    'refuses as unprovable when the birth time reads as %s',
+    async (_label, birth) => {
+      const { worktree } = await linkedAfter('stash-no-birth', (canonical) =>
+        stashGit(sibling(canonical, 'earlier'), ['stash', 'push', '-q']),
+      );
+      const realStat = fs.statSync;
+      const stat = vi.spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+        const result = realStat(target, options) as fs.Stats;
+        if (target !== worktree) return result;
+        return Object.assign(Object.create(Object.getPrototypeOf(result)), result, { birthtimeMs: birth(result) });
+      }) as typeof fs.statSync);
+      try {
+        expect(prove(worktree)).toEqual({ ok: false, reason: 'stash-unprovable' });
+      } finally {
+        stat.mockRestore();
+      }
+    },
+    PATIENT,
+  );
+
+  it('refuses as unprovable when the stash cannot be listed, read, or parsed', () => {
+    const { canonical, worktree } = repositoryFixture('stash-unreadable');
+    stashGit(sibling(canonical, 'any'), ['stash', 'push', '-q']);
+    const reflog = path.join(canonical, '.git', 'logs', 'refs', 'stash');
+    const stashRef = path.join(canonical, '.git', 'refs', 'stash');
+
+    state.rewriteGit = (args) => (args.includes('list') && args.includes('stash') ? '1 stash@{garbled}' : undefined);
+    expect(prove(worktree)).toEqual({ ok: false, reason: 'stash-unprovable' });
+    state.rewriteGit = null;
+
+    fs.renameSync(reflog, `${reflog}.aside`);
+    expect(prove(worktree)).toEqual({ ok: false, reason: 'stash-unprovable' });
+    fs.renameSync(`${reflog}.aside`, reflog);
+
+    const tip = fs.readFileSync(stashRef, 'utf8');
+    fs.writeFileSync(stashRef, `${'d'.repeat(40)}\n`);
+    expect(prove(worktree)).toEqual({ ok: false, reason: 'stash-unprovable' });
+    fs.writeFileSync(stashRef, tip);
   });
 });
 

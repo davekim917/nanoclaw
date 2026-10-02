@@ -767,28 +767,49 @@ function isWorktreeLocked(dir: string): boolean {
 }
 
 /**
- * `refs/stash` is one ref shared by every worktree of a repository, and nothing records which worktree pushed an
- * entry. A linked checkout answers for every entry that could be its own: all of them, except entries that provably
- * predate the checkout directory's birth. Removing a worktree never drops an entry; this keeps a topic whose agent
- * parked work in it.
+ * The earliest instant this checkout can have existed: its directory's birth, its `.git` pointer's mtime (a copy
+ * that keeps times keeps that one), and `anchor`'s birth (the topic dir, which outlives each checkout incarnation).
+ * `null` when a birth time is unreportable: it surfaces as 0 or as the ctime, so only 0 < birth < ctime is trusted.
  */
-function linkedStashVerdict(dir: string, env: NodeJS.ProcessEnv): { ok: boolean; reason: string } | null {
-  const entries = git(dir, ['stash', 'list', '--date=unix', '--format=%ct %gd'], env);
-  if (entries === null) return { ok: false, reason: 'stash-unprovable' };
-  if (entries === '') return null;
-  let born: number;
-  try {
-    const stat = fs.statSync(dir);
-    // A birth time the filesystem cannot report surfaces as 0 or as the ctime; only 0 < birth < ctime is trusted.
-    born = stat.birthtimeMs > 0 && stat.birthtimeMs < stat.ctimeMs ? stat.birthtimeMs : Number.NaN;
-  } catch {
-    return { ok: false, reason: 'stash-unprovable' };
-  }
-  const predatesCheckout = (entry: string): boolean => {
-    const times = /^(\d+) stash@\{(\d+)\}$/.exec(entry);
-    return times !== null && (Math.max(Number(times[1]), Number(times[2])) + 1) * 1000 <= born;
+function checkoutExistedBy(dir: string, anchor: string | undefined): number | null {
+  const birth = (target: string): number | null => {
+    const stat = fs.statSync(target);
+    return stat.birthtimeMs > 0 && stat.birthtimeMs < stat.ctimeMs ? stat.birthtimeMs : null;
   };
-  return entries.split('\n').every(predatesCheckout) ? null : { ok: false, reason: 'stashed' };
+  try {
+    const times = [birth(dir), fs.lstatSync(path.join(dir, '.git')).mtimeMs];
+    if (anchor !== undefined) times.push(birth(anchor));
+    return times.includes(null) ? null : Math.min(...(times as number[]));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `refs/stash` is one ref shared by every worktree of a repository, and nothing records which worktree pushed an
+ * entry. A linked checkout answers for every entry it cannot rule out as its own: all of them, except entries whose
+ * commit and reflog times both precede the checkout's existence. Those times are written by whoever pushed the
+ * entry. Removing a worktree never drops an entry; this keeps a topic whose agent parked work in it.
+ */
+function linkedStashVerdict(
+  dir: string,
+  env: NodeJS.ProcessEnv,
+  anchor: string | undefined,
+): { ok: boolean; reason: string } | null {
+  const unprovable = { ok: false, reason: 'stash-unprovable' };
+  const entries = git(dir, ['stash', 'list', '--date=unix', '--format=%ct %gd'], env);
+  if (entries === null) return unprovable;
+  // A `refs/stash` whose reflog is missing or unreadable lists nothing, with a zero exit.
+  if (entries === '')
+    return git(dir, ['rev-parse', '--quiet', '--verify', 'refs/stash'], env) === null ? null : unprovable;
+  const existedBy = checkoutExistedBy(dir, anchor);
+  if (existedBy === null) return unprovable;
+  const pushedAt = entries.split('\n').map((entry) => {
+    const times = /^(\d+) stash@\{(\d+)\}$/.exec(entry);
+    return times === null ? null : Math.max(Number(times[1]), Number(times[2]));
+  });
+  if (pushedAt.includes(null)) return unprovable;
+  return pushedAt.every((seconds) => (seconds! + 1) * 1000 <= existedBy) ? null : { ok: false, reason: 'stashed' };
 }
 
 /**
@@ -800,6 +821,7 @@ function provenDisposable(
   scope: 'head' | 'all',
   inheritedTags: ReadonlyMap<string, string> | null = null,
   liveTopic = false,
+  stashAnchor?: string,
 ): { ok: boolean; reason: string } {
   if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
   const env = checkoutGitEnv(dir);
@@ -896,7 +918,7 @@ function provenDisposable(
   if (unpushed !== '') return { ok: false, reason: 'unpushed' };
 
   if (scope === 'head') {
-    const stashed = linkedStashVerdict(dir, env);
+    const stashed = linkedStashVerdict(dir, env, stashAnchor);
     if (stashed) return stashed;
   }
 
@@ -921,7 +943,12 @@ function provenDisposable(
  * undecided shape is refused. Only a topic clone has an inherited-tags record; without one every tag counts.
  */
 export function proveCheckoutDisposable(
-  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { inheritedTagsRecord?: string | null; liveTopic?: boolean },
+  checkout: Pick<TopicCheckout, 'path' | 'shape'> & {
+    inheritedTagsRecord?: string | null;
+    liveTopic?: boolean;
+    /** A directory that existed whenever this linked checkout did; see linkedStashVerdict. */
+    stashAnchor?: string;
+  },
 ): {
   ok: boolean;
   reason: string;
@@ -933,7 +960,9 @@ export function proveCheckoutDisposable(
       : null;
     return disposability.provenDisposable(checkout.path, 'all', inherited, checkout.liveTopic);
   }
-  if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
+  if (checkout.shape === 'linked') {
+    return disposability.provenDisposable(checkout.path, 'head', null, false, checkout.stashAnchor);
+  }
   return { ok: false, reason: 'unknown-shape' };
 }
 
@@ -1139,6 +1168,7 @@ function collectOrphanTopics(
         const decision = disposability.proveCheckoutDisposable({
           ...probe,
           inheritedTagsRecord: probe.shape === 'clone' ? checkoutInheritedTagsPath(probe.path) : null,
+          stashAnchor: topicDir,
         });
         if (!decision.ok) {
           refused = decision.reason;
