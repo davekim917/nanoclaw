@@ -2,9 +2,9 @@
  * Conservative cleanup for host-owned per-topic checkouts. Never talks to a remote. A linked checkout is eligible
  * only when every DB participant is inactive, Git proves the tree clean with no commits absent from local remote
  * refs, the branch is merged into origin/HEAD or gone from the fetched origin namespace, and the topic has been
- * idle seven days; only the exact generated topic branch is removed. A branch clone (`.git` a directory) has no
- * registration: it is quarantined and trashed, on side-(a) evidence, seven idle days, and a proof covering every
- * local ref, HEAD and the stash, less the tags the host recorded when it built the clone.
+ * idle seven days; only the exact generated topic branch is removed. A branch clone (`.git` a directory), even in an
+ * open topic, is quarantined and trashed once the topic is not busy, nothing mounts it, it is seven days idle, and a
+ * proof covers every local ref, HEAD and the stash, less the tags the host recorded when it built the clone.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -460,35 +460,104 @@ export interface CloneCleanupDecision {
   reason: string;
 }
 
+interface Liveness {
+  mounts: string[] | null;
+  cwds: string[] | null;
+}
+
+/** One mount and process-table read per pass; finalizeCloneCollection re-reads both after its rename. */
+function passLiveness(): () => Liveness {
+  let snapshot: Liveness | undefined;
+  return () => (snapshot ??= { mounts: runningContainerMounts(), cwds: liveProcessCwds() });
+}
+
 async function cleanupOne(
   target: TopicWorktreeTarget,
   dataDir: string = DATA_DIR,
+  liveness: () => Liveness = passLiveness(),
 ): Promise<CloneCleanupDecision | undefined> {
-  if (target.shape === 'clone') return cleanupCloneCheckout(target, dataDir);
+  if (target.shape === 'clone') return cleanupCloneCheckout(target, dataDir, liveness);
   await cleanupLinkedCheckout(target, dataDir);
   return undefined;
 }
 
+/** The dir's own mtime misses a commit, a checkout or an index refresh, so the Git activity files count too. */
+function checkoutIdleDays(checkoutPath: string): number {
+  let newest = 0;
+  for (const file of ['', '.git/HEAD', '.git/index', '.git/logs/HEAD']) {
+    try {
+      newest = Math.max(newest, fs.lstatSync(path.join(checkoutPath, file)).mtimeMs);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return 0;
+    }
+  }
+  return newest === 0 ? 0 : (Date.now() - newest) / 86_400_000;
+}
+
+function cloneCheckoutRefusal(target: TopicWorktreeTarget, dataDir: string, liveness: () => Liveness): string | null {
+  if (topicIsBusy(target.participants, dataDir)) return 'topic-busy';
+  if (transferReferencesPath(target, dataDir)) return 'transfer-referenced';
+  if (checkoutIdleDays(target.worktreePath) < MINIMUM_IDLE_DAYS) return 'recent';
+  const { mounts, cwds } = liveness();
+  if (mounts === null) return 'runtime-unreadable';
+  if (relationToMounts(target.worktreePath, mounts) !== 'clear') return 'container-mounted';
+  if (cwds === null) return 'process-table-unreadable';
+  if (processRootedIn(target.worktreePath, cwds)) return 'process-rooted';
+  return null;
+}
+
+export interface CloneCheckoutPreview {
+  examined: number;
+  collectable: Array<{ path: string; bytes: number }>;
+  refusals: Record<string, number>;
+}
+
+/** The clone branch's decisions without the quarantine or the trash; `null` when the session inventory failed. */
+export async function previewCloneCheckoutCleanup(dataDir: string = DATA_DIR): Promise<CloneCheckoutPreview | null> {
+  const rows = await readSessionInventory();
+  if (rows === null) return null;
+  const liveness = passLiveness();
+  const preview: CloneCheckoutPreview = { examined: 0, collectable: [], refusals: {} };
+  for (const target of discover(dataDir, rows).targets.filter((entry) => entry.shape === 'clone')) {
+    preview.examined += 1;
+    const refused = cloneCheckoutRefusal(target, dataDir, liveness);
+    const proof =
+      refused === null
+        ? disposability.proveCheckoutDisposable({
+            path: target.worktreePath,
+            shape: target.shape,
+            inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
+          })
+        : null;
+    if (proof?.ok) {
+      preview.collectable.push({ path: target.worktreePath, bytes: dirSizeBytes(target.worktreePath) });
+    } else {
+      const reason = refused ?? proof!.reason;
+      preview.refusals[reason] = (preview.refusals[reason] ?? 0) + 1;
+    }
+  }
+  return preview;
+}
+
 /**
- * The clone branch of worktree cleanup. A clone goes to the trash, so it asks for more than a linked checkout:
- * side-(a) evidence, MINIMUM_IDLE_DAYS idle, and proveCheckoutDisposable at scope `all`. Then quarantine,
- * re-prove the moved copy, and trash. Every check re-runs under the lifecycle claim and repository lock, the pair
- * repository_checkout holds, so a checkout request cannot reuse the directory mid-collection.
+ * The clone branch of worktree cleanup, per checkout even in an open topic: a clean clone with every ref on origin
+ * loses nothing, and repository_checkout rebuilds it. It needs the topic not busy, nothing mounting or standing in
+ * the checkout, MINIMUM_IDLE_DAYS idle, and proveCheckoutDisposable at scope `all`; then quarantine, re-prove the
+ * moved copy, and trash. Every check re-runs under the lifecycle claim and repository lock repository_checkout
+ * holds, so a checkout request cannot reuse the directory mid-collection.
  */
-async function cleanupCloneCheckout(target: TopicWorktreeTarget, dataDir: string): Promise<CloneCleanupDecision> {
+async function cleanupCloneCheckout(
+  target: TopicWorktreeTarget,
+  dataDir: string,
+  liveness: () => Liveness,
+): Promise<CloneCleanupDecision> {
   const context = {
     workgroupId: target.workUnit.workgroupId,
     workUnit: target.workUnit.key,
     repo: target.repo,
     path: target.worktreePath,
   };
-  const refusal = (): string | null => {
-    if (!sideAClear(target.participants, topicIdleReclaimDays()).pass) return 'topic-open';
-    if (topicIsBusy(target.participants, dataDir)) return 'topic-busy';
-    if (transferReferencesPath(target, dataDir)) return 'transfer-referenced';
-    if (idleDays(target.worktreePath) < MINIMUM_IDLE_DAYS) return 'recent';
-    return null;
-  };
+  const refusal = (): string | null => cloneCheckoutRefusal(target, dataDir, liveness);
   const early = refusal();
   if (early) return { collected: false, reason: early };
 
@@ -579,9 +648,10 @@ export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promis
   const { targets, filteredNames, unreadableRoots } = discover(dataDir, await readSessionInventory());
   // A failing target is skipped and counted, never allowed to abort the rest of the fleet's pass.
   let skipped = 0;
+  const liveness = passLiveness();
   for (const target of targets) {
     try {
-      await cleanupOne(target, dataDir);
+      await cleanupOne(target, dataDir, liveness);
     } catch (err) {
       skipped += 1;
       log.warn('Worktree cleanup: target failed; continuing pass', {
@@ -613,6 +683,8 @@ const TRASH_BIN = '/usr/bin/trash';
 /** Written into a quarantined topic so an interrupted pass can find its way home. */
 const QUARANTINE_META_FILE = '.gc-quarantine-meta.json';
 const CLONE_SCAN_DEPTH = 4;
+/** Sizing every skipped topic is a full walk; past this, skips are counted unmeasured so the daily unit stays bounded. */
+const SKIP_SIZE_BUDGET_MS = 30 * 60 * 1000;
 const RESERVED_WORKGROUP_DIRS = new Set(['.repos', '.worktrees', '.rescues']);
 
 export type GcCategory = 'orphan-topic' | 'clone';
@@ -638,6 +710,8 @@ export interface GcReport {
   collected: number;
   reclaimableBytes: Record<GcCategory, number>;
   skips: Record<string, number>;
+  skipBytes: Record<string, number>;
+  unmeasuredSkips: number;
   candidates: GcCandidate[];
 }
 
@@ -649,6 +723,8 @@ function emptyReport(mode: 'dry-run' | 'apply', ran: boolean): GcReport {
     collected: 0,
     reclaimableBytes: { 'orphan-topic': 0, clone: 0 },
     skips: {},
+    skipBytes: {},
+    unmeasuredSkips: 0,
     candidates: [],
   };
 }
@@ -898,6 +974,7 @@ function record(report: GcReport, candidate: GcCandidate): void {
     report.reclaimableBytes[candidate.category] += candidate.bytes;
   } else {
     report.skips[candidate.reason] = (report.skips[candidate.reason] ?? 0) + 1;
+    report.skipBytes[candidate.reason] = (report.skipBytes[candidate.reason] ?? 0) + candidate.bytes;
   }
 }
 
@@ -921,12 +998,24 @@ function topicDisposabilityProbes(worktreeRoot: string): Array<Pick<TopicCheckou
 function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
   const topicsRoot = path.join(dataDir, 'v2-topics');
   const idleReclaimDays = topicIdleReclaimDays();
+  const sizeDeadline = Date.now() + SKIP_SIZE_BUDGET_MS;
+  const skippedBytes = (topicDir: string): number => {
+    if (Date.now() < sizeDeadline) return dirSizeBytes(topicDir);
+    report.unmeasuredSkips += 1;
+    return 0;
+  };
   for (const workgroupId of safeDirectories(topicsRoot) ?? []) {
     const workgroupDir = path.join(topicsRoot, workgroupId);
     for (const topic of safeDirectories(workgroupDir) ?? []) {
       const topicDir = path.join(workgroupDir, topic);
       const skip = (reason: string): void =>
-        record(report, { category: 'orphan-topic', path: topicDir, collect: false, reason, bytes: 0 });
+        record(report, {
+          category: 'orphan-topic',
+          path: topicDir,
+          collect: false,
+          reason,
+          bytes: skippedBytes(topicDir),
+        });
 
       const participants = owners.get(topicDir);
       // Status alone is not enough: a closed session can hold a claim or continuation; `topicIsBusy` fails closed.
@@ -2078,6 +2167,7 @@ export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: st
       report.collected -= 1;
       report.reclaimableBytes[candidate.category] -= candidate.bytes;
       report.skips[reason] = (report.skips[reason] ?? 0) + 1;
+      report.skipBytes[reason] = (report.skipBytes[reason] ?? 0) + candidate.bytes;
     };
     const mounts = runningContainerMounts();
     const cwds = liveProcessCwds();
@@ -2134,6 +2224,8 @@ export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: st
     collected: report.collected,
     reclaimableBytes: report.reclaimableBytes,
     skips: report.skips,
+    skipBytes: report.skipBytes,
+    unmeasuredSkips: report.unmeasuredSkips,
   });
   return report;
 }
