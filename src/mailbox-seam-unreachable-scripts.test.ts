@@ -713,7 +713,14 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
   // honest boundary this test draws, not a gap it hides.
   it('storage-manager.ts imports exactly this complete relative-import manifest', () => {
     expect(collectRelativeImportManifest('src/storage-manager.ts')).toEqual({
-      'src/config.ts': ['CONTAINER_IMAGE', 'CONTAINER_IMAGE_BASE', 'CONTAINER_INSTALL_LABEL', 'DATA_DIR'],
+      'src/config.ts': [
+        'CONTAINER_IMAGE',
+        'CONTAINER_IMAGE_BASE',
+        'CONTAINER_INSTALL_LABEL',
+        'DATA_DIR',
+        'GROUPS_DIR',
+        'INSTALL_SLUG',
+      ],
       'src/container-mounts.ts': ['runningContainerMounts as inspectRunningContainerMounts'],
       'src/container-runtime.ts': ['CONTAINER_RUNTIME_BIN'],
       // Seam 3 PR 6: the host-side boot finisher takes the central lease; the
@@ -837,7 +844,7 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
         'withRepositoryLifecycleClaims',
       ],
       'src/safe-git.ts': ['safeGitArgs', 'safeGitEnv', 'safeGitFilterNames'],
-      'src/storage-manager.ts': ['dirSizeBytes', 'sessionWasReclaimed'],
+      'src/storage-manager.ts': ['dirSizeBytes', 'REGENERABLE_SWEEP_DIR_NAMES', 'sessionWasReclaimed'],
     });
   });
 });
