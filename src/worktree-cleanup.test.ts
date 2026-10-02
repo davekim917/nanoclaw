@@ -1217,9 +1217,8 @@ describe('branch clone checkouts', () => {
 
   it('lets build output go with an open-topic clone, and keeps refusing other ignored entries', () => {
     const canon = canonicalFixture('repo-a');
-    const cases: Array<{ exclude: string; files: string[]; reason: string }> = [
+    const cases: Array<{ exclude: string; files: string[]; reason: string; repository?: string }> = [
       { exclude: 'allure-results/', files: ['allure-results/run-result.json'], reason: 'clean-and-pushed' },
-      { exclude: 'dist/', files: ['dist/index.js'], reason: 'clean-and-pushed' },
       { exclude: '.pytest_cache/', files: ['.pytest_cache/v/cache/lastfailed'], reason: 'clean-and-pushed' },
       { exclude: '.ruff_cache/', files: ['.ruff_cache/0.6.0/index'], reason: 'clean-and-pushed' },
       {
@@ -1227,6 +1226,8 @@ describe('branch clone checkouts', () => {
         files: ['tsconfig.tsbuildinfo', 'tsconfig.build.tsbuildinfo'],
         reason: 'clean-and-pushed',
       },
+      { exclude: 'node_modules/', files: ['node_modules/left-pad/index.js'], reason: 'clean-and-pushed' },
+      { exclude: 'dist/', files: ['dist/index.js'], reason: 'ignored-files' },
       { exclude: '.venv/', files: ['.venv/lib/site.py'], reason: 'ignored-files' },
       { exclude: 'deployment_packages/', files: ['deployment_packages/bundle.zip'], reason: 'ignored-files' },
       { exclude: '.gitnexus/', files: ['.gitnexus/index.db'], reason: 'ignored-files' },
@@ -1239,13 +1240,29 @@ describe('branch clone checkouts', () => {
         files: ['Nested-App/src/index.ts', 'Nested-App/dist/index.js'],
         reason: 'ignored-files',
       },
+      // A listed name that is a file, not the output directory.
+      { exclude: 'allure-results', files: ['allure-results'], reason: 'ignored-files' },
+      // Git collapses a directory that is not ignored when everything in it is.
+      { exclude: '*.csv', files: ['allure-results/customers.csv'], reason: 'ignored-files' },
+      // A repository anywhere inside a listed directory may hold commits that exist nowhere else.
+      {
+        exclude: '.pytest_cache/',
+        files: ['.pytest_cache/v/clone/notes.md'],
+        repository: '.pytest_cache/v/clone',
+        reason: 'ignored-files',
+      },
     ];
-    const verdicts = cases.map(({ exclude, files }, index) => {
+    const verdicts = cases.map(({ exclude, files, repository }, index) => {
       const { checkout } = cloneCheckout(canon, `p1404-ignorable-${index}`, 'repo-a@feat', 'feat');
       fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), `${exclude}\n`);
       for (const file of files) {
         fs.mkdirSync(path.dirname(path.join(checkout, file)), { recursive: true });
         fs.writeFileSync(path.join(checkout, file), 'output\n');
+      }
+      if (repository) {
+        git(path.join(checkout, repository), ['init', '-q']);
+        git(path.join(checkout, repository), ['add', '.']);
+        git(path.join(checkout, repository), ['commit', '-qm', 'only copy']);
       }
       age(checkout);
       return disposability.proveCheckoutDisposable({

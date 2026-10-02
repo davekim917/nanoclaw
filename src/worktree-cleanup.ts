@@ -758,24 +758,47 @@ function gcMode(): 'dry-run' | 'apply' {
 }
 
 /**
- * Ignored output a clean, fully pushed checkout may take to the trash. Wider than REGENERABLE_SWEEP_DIR_NAMES on
- * purpose: that set lets the regenerable sweep delete from live checkouts with no git proof, so it stays narrow.
+ * Ignored output a clean, fully pushed checkout may take to the trash beyond REGENERABLE_SWEEP_DIR_NAMES, which the
+ * regenerable sweep deletes from live checkouts with no git proof and so must stay narrow. `dist` is not here: a
+ * gh-pages clone or a hand-placed export commonly lives in it.
  */
-const RECLAIM_IGNORABLE_DIR_NAMES: ReadonlySet<string> = new Set([
-  ...REGENERABLE_SWEEP_DIR_NAMES,
-  'allure-results',
-  'dist',
-  '.pytest_cache',
-  '.ruff_cache',
-]);
+const RECLAIM_IGNORABLE_DIR_NAMES: ReadonlySet<string> = new Set(['allure-results', '.pytest_cache', '.ruff_cache']);
 const RECLAIM_IGNORABLE_FILE_SUFFIX = '.tsbuildinfo';
+const NESTED_REPOSITORY_SCAN_LIMIT = 50_000;
 
-/** `entry` is a porcelain path; a wholly ignored directory arrives collapsed, with a trailing `/`. */
-function reclaimIgnorable(entry: string): boolean {
-  const isDirectory = entry.endsWith('/');
+/** No `.git` anywhere under `root`; a tree too large or unreadable to finish refuses. */
+function holdsNoRepository(root: string): boolean {
+  const stack = [root];
+  let seen = 0;
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      if (entry.name === '.git' || ++seen > NESTED_REPOSITORY_SCAN_LIMIT) return false;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(path.join(current, entry.name));
+    }
+  }
+  return true;
+}
+
+/**
+ * `entry` is a porcelain path. Git collapses a directory to one `dir/` entry when it is ignored, and also when it is
+ * not but everything in it is, so a listed name counts only once `isIgnoredDirectory` says the directory itself is.
+ */
+function reclaimIgnorable(dir: string, entry: string, isIgnoredDirectory: (entry: string) => boolean): boolean {
   const segments = entry.split('/').filter(Boolean);
-  if (!isDirectory && segments.at(-1)?.endsWith(RECLAIM_IGNORABLE_FILE_SUFFIX)) return true;
-  return (isDirectory ? segments : segments.slice(0, -1)).some((segment) => RECLAIM_IGNORABLE_DIR_NAMES.has(segment));
+  if (segments.some((segment) => REGENERABLE_SWEEP_DIR_NAMES.has(segment))) return true;
+  if (!entry.endsWith('/')) return segments.at(-1)?.endsWith(RECLAIM_IGNORABLE_FILE_SUFFIX) ?? false;
+  return (
+    RECLAIM_IGNORABLE_DIR_NAMES.has(segments.at(-1) ?? '') &&
+    isIgnoredDirectory(entry) &&
+    holdsNoRepository(path.join(dir, entry))
+  );
 }
 
 /**
@@ -841,7 +864,14 @@ function provenDisposable(
     const kept = ignored
       .split('\0')
       .filter((entry) => entry.startsWith('!! '))
-      .some((entry) => !reclaimIgnorable(entry.slice(3)));
+      .some(
+        (entry) =>
+          !reclaimIgnorable(
+            dir,
+            entry.slice(3),
+            (candidate) => git(dir, ['check-ignore', '-q', '--', candidate], env, filters) !== null,
+          ),
+      );
     if (kept) return { ok: false, reason: 'ignored-files' };
   }
 
