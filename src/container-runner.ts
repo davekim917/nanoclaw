@@ -31,6 +31,7 @@ import {
   EGRESS_LOCKDOWN,
   GROUPS_DIR,
   HOST_LEASE_TTL_MS,
+  INSTALL_SLUG,
   MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
@@ -5480,6 +5481,7 @@ async function buildAgentGroupImageNow(agentGroupId: string): Promise<void> {
   dockerfile += `LABEL nanoclaw.retention.owner=${JSON.stringify(agentGroupId)}\n`;
   dockerfile += 'LABEL nanoclaw.image.role=agent-group\n';
   dockerfile += `LABEL nanoclaw.agent_group_id=${JSON.stringify(agentGroupId)}\n`;
+  dockerfile += `LABEL nanoclaw.image.install=${JSON.stringify(INSTALL_SLUG)}\n`;
   dockerfile += 'USER node\n';
 
   const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;

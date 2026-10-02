@@ -57,7 +57,7 @@ import {
   processPackageDir,
   startDependencyCachePass,
 } from './dependency-cache.js';
-import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
+import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, INSTALL_SLUG } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
@@ -82,11 +82,13 @@ function compactContainerInspect(rows: Array<Record<string, unknown>>): string {
   const installLabelKey = CONTAINER_INSTALL_LABEL.split('=', 1)[0]!;
   return rows
     .map((row) => {
-      const state = row.State as { Running?: unknown } | undefined;
+      const state = row.State as { Running?: unknown; Status?: unknown } | undefined;
       return [
         JSON.stringify(row.Id ?? null),
         JSON.stringify(row.Image ?? null),
         JSON.stringify(state?.Running === true),
+        JSON.stringify(state?.Status ?? (state?.Running === true ? 'running' : 'exited')),
+        JSON.stringify(row.Created ?? '2026-07-01T00:00:00.000000000Z'),
         JSON.stringify(dockerLabels(row)[installLabelKey] ?? null),
       ].join('\t');
     })
@@ -106,6 +108,17 @@ function compactImageInspect(rows: Array<Record<string, unknown>>): string {
       ].join('\t');
     })
     .join('\n');
+}
+
+/** Stands in for the daemon's reference resolution: exact id, id prefix, tag (implicit `:latest`), or digest. */
+function resolveFixtureImage(images: Array<Record<string, unknown>>, reference: string): string | undefined {
+  const tag = reference.includes(':') || reference.includes('@') ? reference : `${reference}:latest`;
+  return images
+    .map((image) => ({
+      id: String(image.Id),
+      refs: [...((image.RepoTags as string[]) ?? []), ...((image.RepoDigests as string[]) ?? [])],
+    }))
+    .find(({ id, refs }) => id === reference || id.startsWith(`sha256:${reference}`) || refs.includes(tag))?.id;
 }
 
 function inspectIds(args: string[]): string[] {
@@ -1572,6 +1585,11 @@ describe('storage-manager Docker cleanup', () => {
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'ls') {
         return images.map((image) => image.Id).join('\n');
       }
+      if (cmd === CONTAINER_RUNTIME_BIN && args.slice(0, 4).join(' ') === 'image inspect --format {{.Id}}') {
+        const id = resolveFixtureImage(images, args[4]!);
+        if (id) return `${id}\n`;
+        throw Object.assign(new Error('exit 1'), { stderr: `Error response from daemon: No such image: ${args[4]}` });
+      }
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
         const rows = images.filter((image) => inspectIds(args).includes(String(image.Id)));
         return args.includes('--format') ? compactImageInspect(rows) : JSON.stringify(rows);
@@ -1596,7 +1614,7 @@ describe('storage-manager Docker cleanup', () => {
       ['container', 'rm', 'own-stopped'],
       ['builder', 'prune', '-a', '-f', '--filter', 'until=168h'],
       ['builder', 'prune', '-a', '-f', '--min-free-space', expect.stringMatching(/B$/)],
-      ['image', 'rm', 'sha256:expired'],
+      ['image', 'rm', '--no-prune', 'sha256:expired'],
     ]);
     expect(
       report.actions.filter(
@@ -1651,7 +1669,12 @@ describe('storage-manager Docker cleanup', () => {
     });
 
     expect(report.actions.map((action) => action.dockerArgs)).toContainEqual(['container', 'rm', 'own-stopped']);
-    expect(report.actions.map((action) => action.dockerArgs)).toContainEqual(['image', 'rm', 'sha256:expired']);
+    expect(report.actions.map((action) => action.dockerArgs)).toContainEqual([
+      'image',
+      'rm',
+      '--no-prune',
+      'sha256:expired',
+    ]);
     expect(report.images.dispositions.find((image) => image.id === 'sha256:canonical')).toMatchObject({
       disposition: 'protected',
       protectionReason: 'canonical-image',
@@ -1757,7 +1780,12 @@ describe('storage-manager Docker cleanup', () => {
         disposition: field === 'Labels' ? 'eligible' : 'protected',
         protectionReason: field === 'Labels' ? 'expired-unreferenced' : 'invalid-retention-metadata',
       });
-      expect(report.actions.map((action) => action.dockerArgs)).toContainEqual(['image', 'rm', 'sha256:expired']);
+      expect(report.actions.map((action) => action.dockerArgs)).toContainEqual([
+        'image',
+        'rm',
+        '--no-prune',
+        'sha256:expired',
+      ]);
       expect(report.warnings.some((warning) => warning.startsWith('docker inventory failed:'))).toBe(false);
     },
   );
@@ -1816,6 +1844,269 @@ describe('storage-manager Docker cleanup', () => {
     ]);
   });
 
+  const superseded = (id: string, extra: Record<string, unknown> = {}, install: string = INSTALL_SLUG) => ({
+    Id: id,
+    RepoTags: [],
+    Created: '2026-07-01T00:00:00.000Z',
+    Size: 3_000,
+    Config: {
+      Labels: {
+        'nanoclaw.commit': id,
+        'nanoclaw.image.role': 'canonical',
+        'nanoclaw.image.install': install,
+        'nanoclaw.retention.created_at': '2026-07-01T00:00:00.000Z',
+        'nanoclaw.retention.hours': '0',
+      },
+    },
+    ...extra,
+  });
+
+  it('below the cleanup threshold removes only stale never-started install containers and this install superseded images', () => {
+    usagePct = 60;
+    const ownLabels = { Labels: Object.fromEntries([CONTAINER_INSTALL_LABEL.split('=')]) };
+    containers.push(
+      {
+        Id: 'own-created-stale',
+        Image: 'sha256:canonical',
+        Created: new Date(now - 61 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: ownLabels,
+      },
+      {
+        Id: 'own-created-fresh',
+        Image: 'sha256:canonical',
+        Created: new Date(now - 59 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: ownLabels,
+      },
+      {
+        Id: 'peer-created-stale',
+        Image: 'sha256:peer',
+        Created: new Date(now - 61 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: { Labels: { 'nanoclaw-install': 'peer-install' } },
+      },
+      {
+        Id: 'foreign-running',
+        Image: 'sha256:superseded-in-use',
+        State: { Running: true },
+        Config: { Labels: {} },
+      },
+    );
+    images.push(
+      superseded('sha256:superseded'),
+      superseded('sha256:superseded-in-use'),
+      superseded('sha256:superseded-peer', {}, 'peer-install'),
+      superseded('sha256:superseded-digest', { RepoDigests: [`${CONTAINER_IMAGE_BASE}@sha256:abc`] }),
+      superseded('sha256:superseded-pinned'),
+      superseded('sha256:a1b2c3d4e5f60000000000000000000000000000000000000000000000000000'),
+      superseded('sha256:0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f'),
+    );
+    const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-groups-'));
+    const pins = {
+      pinned: 'sha256:superseded-pinned',
+      'short-id': 'a1b2c3d4e5f6',
+      'bare-id': '0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f',
+    };
+    for (const [folder, imageTag] of Object.entries(pins)) {
+      fs.mkdirSync(path.join(groupsRoot, folder));
+      fs.writeFileSync(path.join(groupsRoot, folder, 'container.json'), JSON.stringify({ imageTag }));
+    }
+    fs.mkdirSync(path.join(groupsRoot, 'no-config'));
+    fs.writeFileSync(path.join(groupsRoot, 'README.md'), 'not a group');
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      groupsRoot,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+    fs.rmSync(groupsRoot, { recursive: true, force: true });
+
+    expect(report.actions.map((a) => [a.dockerArgs, a.status])).toEqual([
+      [['container', 'rm', 'own-created-stale'], 'applied'],
+      [['builder', 'prune', '-a', '-f', '--filter', 'until=168h'], 'applied'],
+      [['image', 'rm', '--no-prune', 'sha256:superseded'], 'applied'],
+    ]);
+    const disposition = (id: string) => report.images.dispositions.find((image) => image.id === id);
+    expect(disposition('sha256:superseded-in-use')).toMatchObject({ protectionReason: 'container-referenced' });
+    expect(disposition('sha256:superseded-pinned')).toMatchObject({ protectionReason: 'configured-image' });
+    expect(disposition('sha256:a1b2c3d4e5f60000000000000000000000000000000000000000000000000000')).toMatchObject({
+      protectionReason: 'configured-image',
+    });
+    expect(disposition('sha256:0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f')).toMatchObject({
+      protectionReason: 'configured-image',
+    });
+  });
+
+  it.skipIf(process.getuid?.() === 0)('removes no image when a group config cannot be read', () => {
+    usagePct = 60;
+    images.push(superseded('sha256:superseded'));
+    const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-groups-'));
+    fs.mkdirSync(path.join(groupsRoot, 'locked'));
+    fs.writeFileSync(
+      path.join(groupsRoot, 'locked', 'container.json'),
+      JSON.stringify({ imageTag: 'sha256:superseded' }),
+    );
+    fs.chmodSync(path.join(groupsRoot, 'locked'), 0o000);
+    try {
+      const report = getStorageReport({
+        mode: 'dry-run',
+        now,
+        groupsRoot,
+        sessionsRoot: MISSING_SESSIONS_ROOT,
+        threadsRoot: MISSING_THREADS_ROOT,
+        policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+      });
+      expect(report.actions.filter((action) => action.kind === 'docker-prune-images')).toEqual([]);
+      expect(report.images.dispositions.find((image) => image.id === 'sha256:superseded')).toMatchObject({
+        protectionReason: 'configuration-unreadable',
+      });
+    } finally {
+      fs.chmodSync(path.join(groupsRoot, 'locked'), 0o700);
+      fs.rmSync(groupsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('protects a configured image under whatever reference spelling Docker resolves, and ignores a pin to no image', () => {
+    containers = [];
+    images = [
+      superseded('sha256:rollback', { RepoTags: ['nano-rollback:latest'] }),
+      superseded('sha256:qualified', { RepoTags: ['docker.io/library/nano-qualified:latest'] }),
+    ];
+    centralDbMock.current!.db.exec(
+      "INSERT INTO container_configs VALUES ('g1', 'nano-rollback'), ('g2', 'docker.io/library/nano-qualified:latest'), ('g3', 'gone:1')",
+    );
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.images.dispositions.map((image) => [image.id, image.protectionReason])).toEqual([
+      ['sha256:rollback', 'configured-image'],
+      ['sha256:qualified', 'configured-image'],
+    ]);
+    expect(report.actions.filter((action) => action.kind === 'docker-prune-images')).toEqual([]);
+  });
+
+  it('protects whatever image the spawn default resolves to, even untagged', () => {
+    containers = [];
+    images = [superseded('sha256:canonical-by-id'), superseded('sha256:superseded')];
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === CONTAINER_RUNTIME_BIN && args.join(' ') === `image inspect --format {{.Id}} ${CONTAINER_IMAGE}`) {
+        return 'sha256:canonical-by-id\n';
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.images.dispositions.find((image) => image.id === 'sha256:canonical-by-id')).toMatchObject({
+      protectionReason: 'configured-image',
+    });
+    expect(report.actions.filter((action) => action.kind === 'docker-prune-images').map((a) => a.dockerArgs)).toEqual([
+      ['image', 'rm', '--no-prune', 'sha256:superseded'],
+    ]);
+  });
+
+  it('removes no image when Docker fails to resolve a configured reference for any reason but absence', () => {
+    images.push(superseded('sha256:superseded'));
+    centralDbMock.current!.db.exec("INSERT INTO container_configs VALUES ('g1', 'nano-rollback')");
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === CONTAINER_RUNTIME_BIN && args.slice(0, 4).join(' ') === 'image inspect --format {{.Id}}') {
+        throw Object.assign(new Error('exit 1'), { stderr: 'Cannot connect to the Docker daemon' });
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.actions.filter((action) => action.kind === 'docker-prune-images')).toEqual([]);
+    expect(report.images.dispositions.find((image) => image.id === 'sha256:superseded')).toMatchObject({
+      protectionReason: 'configuration-unreadable',
+    });
+  });
+
+  it('skips a planned pressure removal of an image tagged before apply once usage reaches the target', () => {
+    containers = [];
+    images = [superseded('sha256:tagged-later')];
+    let imageInspects = 0;
+    let dfReads = 0;
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'df') {
+        dfReads += 1;
+        const pct = dfReads >= 3 ? 81 : 91;
+        return `Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 ${pct * 10} ${(100 - pct) * 10} ${pct}% /\n`;
+      }
+      if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
+        imageInspects += 1;
+        if (imageInspects > 1) images[0]!.RepoTags = [`${CONTAINER_IMAGE_BASE}:rollback`];
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      force: true,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(mockExecFileSync).not.toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      ['image', 'rm', '--no-prune', 'sha256:tagged-later'],
+      expect.anything(),
+    );
+    expect(report.actions.find((action) => action.id === 'docker:image:sha256:tagged-later')?.status).toBe('skipped');
+  });
+
+  it('keeps a never-started install container inside the spawn window even under pressure', () => {
+    containers = [
+      {
+        Id: 'own-created-fresh',
+        Image: 'sha256:canonical',
+        Created: new Date(now - 5 * 60 * 1000).toISOString(),
+        State: { Running: false, Status: 'created' },
+        Config: { Labels: Object.fromEntries([CONTAINER_INSTALL_LABEL.split('=')]) },
+      },
+      ...containers,
+    ];
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    const removals = report.actions.filter((a) => a.kind === 'docker-prune-containers').map((a) => a.dockerArgs);
+    expect(removals).toEqual([['container', 'rm', 'own-stopped']]);
+  });
+
   it('revalidates an image immediately before removal and skips a newly referenced image', () => {
     let containerInventoryReads = 0;
     const newRunningContainer = {
@@ -1851,7 +2142,7 @@ describe('storage-manager Docker cleanup', () => {
 
     expect(mockExecFileSync).not.toHaveBeenCalledWith(
       CONTAINER_RUNTIME_BIN,
-      ['image', 'rm', 'sha256:expired'],
+      ['image', 'rm', '--no-prune', 'sha256:expired'],
       expect.anything(),
     );
     expect(report.actions.find((action) => action.id.includes('sha256:expired'))?.status).toBe('skipped');
@@ -1994,7 +2285,12 @@ describe('storage-manager Docker cleanup', () => {
       disposition: 'protected',
       protectionReason: 'configuration-unreadable',
     });
-    expect(report.actions.map((action) => action.dockerArgs)).not.toContainEqual(['image', 'rm', 'sha256:expired']);
+    expect(report.actions.map((action) => action.dockerArgs)).not.toContainEqual([
+      'image',
+      'rm',
+      '--no-prune',
+      'sha256:expired',
+    ]);
   });
 
   it('skips an exact stopped-container removal if the container starts before execution', () => {
@@ -2071,12 +2367,12 @@ describe('storage-manager Docker cleanup', () => {
 
     expect(mockExecFileSync).toHaveBeenCalledWith(
       CONTAINER_RUNTIME_BIN,
-      ['image', 'rm', 'sha256:expired'],
+      ['image', 'rm', '--no-prune', 'sha256:expired'],
       expect.objectContaining({ stdio: 'pipe' }),
     );
     expect(mockExecFileSync).not.toHaveBeenCalledWith(
       CONTAINER_RUNTIME_BIN,
-      ['image', 'rm', 'sha256:newer-expired'],
+      ['image', 'rm', '--no-prune', 'sha256:newer-expired'],
       expect.anything(),
     );
     expect(report.actions.find((action) => action.id.includes('newer-expired'))?.status).toBe('skipped');
@@ -2156,7 +2452,7 @@ describe('storage-manager image protection', () => {
     return classifyDockerImage(image, {
       now,
       canonicalImage: CONTAINER_IMAGE,
-      configuredImages: new Set<string>(),
+      configuredImageIds: new Set<string>(),
       containerImageIds: new Set<string>(),
       candidateRetentionHours: 168,
       legacyGraceHours: 168,
@@ -2172,7 +2468,7 @@ describe('storage-manager image protection', () => {
       { canonicalImage: CONTAINER_IMAGE },
       'canonical-image',
     ],
-    ['configured image', baseImage, { configuredImages: new Set([baseImage.repoTags[0]]) }, 'configured-image'],
+    ['configured image', baseImage, { configuredImageIds: new Set([baseImage.id]) }, 'configured-image'],
     ['container referenced image', baseImage, { containerImageIds: new Set([baseImage.id]) }, 'container-referenced'],
   ])('protects the %s', (_name, image, context, reason) => {
     expect(classify(image as typeof baseImage, context as never)).toMatchObject({

@@ -5,6 +5,8 @@ import path from 'path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { getInstallSlug } from './install-slug.js';
+
 const projectRoot = path.resolve(import.meta.dirname, '..');
 const buildScript = path.join(projectRoot, 'container', 'build.sh');
 const dockerfilePath = path.join(projectRoot, 'container', 'Dockerfile');
@@ -55,6 +57,11 @@ describe('container image retention metadata', () => {
 
     expect(buildArg(args, 'NANOCLAW_RETENTION_HOURS')).toBe('0');
     expect(buildArg(args, 'NANOCLAW_IMAGE_ROLE')).toBe('canonical');
+  });
+
+  it("stamps this install's slug where storage cleanup scopes superseded images", () => {
+    expect(buildArg(runBuild('latest'), 'NANOCLAW_IMAGE_INSTALL')).toBe(getInstallSlug(projectRoot));
+    expect(fs.readFileSync(dockerfilePath, 'utf8')).toContain('nanoclaw.image.install=$NANOCLAW_IMAGE_INSTALL');
   });
 
   it('uses ARG-driven Dockerfile labels so cached rebuilds renew metadata', () => {
@@ -133,5 +140,6 @@ describe('container image retention metadata', () => {
     expect(source).toContain('nanoclaw.retention.owner=${JSON.stringify(agentGroupId)}');
     expect(source).toContain('nanoclaw.image.role=agent-group');
     expect(source).toContain('nanoclaw.agent_group_id=${JSON.stringify(agentGroupId)}');
+    expect(source).toContain('nanoclaw.image.install=${JSON.stringify(INSTALL_SLUG)}');
   });
 });

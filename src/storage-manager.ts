@@ -10,7 +10,14 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
+import {
+  CONTAINER_IMAGE,
+  CONTAINER_IMAGE_BASE,
+  CONTAINER_INSTALL_LABEL,
+  DATA_DIR,
+  GROUPS_DIR,
+  INSTALL_SLUG,
+} from './config.js';
 import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import {
@@ -56,6 +63,8 @@ const DEFAULT_CLEANUP_TARGET_MARGIN_PCT = 3;
 const DEFAULT_EMERGENCY_RETRY_SECONDS = 60;
 const DEFAULT_IMAGE_RETENTION_HOURS = 168;
 const DEFAULT_LEGACY_IMAGE_GRACE_HOURS = 168;
+// `docker run` creates then starts within seconds; a container still never-started after this is a failed spawn.
+const STALE_CREATED_CONTAINER_MS = 60 * 60 * 1000;
 /** The only env inputs that decide storage-pressure refusal; exported so host scripts report the same policy. */
 export const STORAGE_ADMISSION_POLICY_ENV_KEYS = [
   'NANOCLAW_STORAGE_MANAGER_ENABLED',
@@ -214,7 +223,7 @@ export interface DockerImageDispositionReport extends DockerImageInventory {
 export interface DockerImageProtectionContext {
   now: number;
   canonicalImage: string;
-  configuredImages: Set<string>;
+  configuredImageIds: Set<string>;
   containerImageIds: Set<string>;
   candidateRetentionHours: number;
   legacyGraceHours: number;
@@ -225,6 +234,8 @@ const RETENTION_CREATED_AT_LABEL = 'nanoclaw.retention.created_at';
 const RETENTION_HOURS_LABEL = 'nanoclaw.retention.hours';
 const RETENTION_OWNER_LABEL = 'nanoclaw.retention.owner';
 const IMAGE_ROLE_LABEL = 'nanoclaw.image.role';
+// Not `nanoclaw-install`: containers inherit image labels, and that key marks a container as this install's spawn.
+const IMAGE_INSTALL_LABEL = 'nanoclaw.image.install';
 
 export function classifyDockerImage(
   image: DockerImageInventory,
@@ -232,9 +243,7 @@ export function classifyDockerImage(
 ): DockerImageDispositionReport {
   const imageReferences = [...image.repoTags, ...(image.repoDigests ?? [])];
   const isCanonical = imageReferences.includes(context.canonicalImage) || image.id === context.canonicalImage;
-  const isConfigured =
-    imageReferences.some((reference) => context.configuredImages.has(reference)) ||
-    context.configuredImages.has(image.id);
+  const isConfigured = context.configuredImageIds.has(image.id);
   const isContainerReferenced = context.containerImageIds.has(image.id);
   const isNanoClawTag = image.repoTags.some(
     (tag) => tag === CONTAINER_IMAGE_BASE || tag.startsWith(`${CONTAINER_IMAGE_BASE}:`),
@@ -353,6 +362,7 @@ export interface StorageReportOptions {
   threadsRoot?: string;
   topicsRoot?: string;
   runningContainerMounts?: () => string[] | null;
+  groupsRoot?: string;
   includeDocker?: boolean;
   respectCadence?: boolean;
   force?: boolean;
@@ -546,7 +556,6 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     ...overrides,
   };
 
-  // An install that never sets the session knob keeps sessions on the shared worktree clock.
   if (overrides.sessionReclaimMs === undefined && sessionReclaimDays === 0) {
     policy.sessionReclaimMs = policy.worktreeReclaimMs;
   }
@@ -1334,7 +1343,6 @@ export async function finishInterruptedSessionArchivals(sessionsRoot: string = s
               continue;
             }
             if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
-            // Sibling of the session directory (see the archival path).
             fs.rmSync(sessionContextPathFor(sessPath), { force: true });
             result.finished += 1;
             continue;
@@ -2341,6 +2349,8 @@ interface DockerContainerInventory {
   id: string;
   imageId: string;
   running: boolean;
+  status: string;
+  createdAt: string;
   labels: Record<string, string>;
 }
 
@@ -2433,21 +2443,30 @@ function inspectDockerContainers(ids?: string[]): DockerContainerInventory[] {
   const selectedIds = [...new Set(ids ?? nonEmptyLines(dockerOutput(['container', 'ls', '-a', '-q', '--no-trunc'])))];
   if (selectedIds.length === 0) return [];
   const installLabel = installLabelParts();
-  const format = dockerJsonFormat(['.Id', '.Image', '.State.Running', `(index .Config.Labels "${installLabel.key}")`]);
+  const format = dockerJsonFormat([
+    '.Id',
+    '.Image',
+    '.State.Running',
+    '.State.Status',
+    '.Created',
+    `(index .Config.Labels "${installLabel.key}")`,
+  ]);
   return inspectBatches(selectedIds).flatMap((batch) => {
     const rows = parseDockerProjection(
       dockerOutput(['container', 'inspect', '--format', format, ...batch]),
-      4,
+      6,
       'container',
     );
     if (rows.length !== batch.length) throw new Error('docker container inspect omitted a projected record');
-    const containers = rows.map(([id, imageId, running, label]) => {
+    const containers = rows.map(([id, imageId, running, status, createdAt, label]) => {
       if (
         typeof id !== 'string' ||
         id.length === 0 ||
         typeof imageId !== 'string' ||
         imageId.length === 0 ||
-        typeof running !== 'boolean'
+        typeof running !== 'boolean' ||
+        typeof status !== 'string' ||
+        typeof createdAt !== 'string'
       ) {
         throw new Error('docker container inspect returned an invalid projected record');
       }
@@ -2455,6 +2474,8 @@ function inspectDockerContainers(ids?: string[]): DockerContainerInventory[] {
         id,
         imageId,
         running,
+        status,
+        createdAt,
         labels: projectedLabels([label], [installLabel.key], 'container'),
       };
     });
@@ -2509,20 +2530,56 @@ function readDockerInventory(): DockerInventory {
   return { containers: inspectDockerContainers(), images: inspectDockerImages() };
 }
 
-function configuredImageProtection(): { images: Set<string>; readable: boolean } {
+function readUnlessAbsent<T>(read: () => T, absent: T): T {
   try {
-    return {
-      images: new Set(
+    return read();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return absent;
+    throw err;
+  }
+}
+
+function containerJsonImageTags(groupsRoot: string): string[] {
+  return readUnlessAbsent(() => fs.readdirSync(groupsRoot), [])
+    .map((folder) =>
+      readUnlessAbsent(() => fs.readFileSync(path.join(groupsRoot, folder, 'container.json'), 'utf8'), null),
+    )
+    .filter((text): text is string => text !== null)
+    .map((text) => (JSON.parse(text) as { imageTag?: unknown }).imageTag)
+    .filter((tag): tag is string => typeof tag === 'string');
+}
+
+function resolveImageId(reference: string): string | null {
+  try {
+    return dockerOutput(['image', 'inspect', '--format', '{{.Id}}', reference]).trim();
+  } catch (err) {
+    if (/No such image/i.test(String((err as { stderr?: unknown }).stderr ?? ''))) return null;
+    throw err;
+  }
+}
+
+function configuredImageProtection(groupsRoot: string): { imageIds: Set<string>; readable: boolean } {
+  try {
+    const references = new Set(
+      [
         // Raw and synchronous on purpose: runs in the storage worker (raw-DB allowlist); re-read before `rmi`.
-        (getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[])
-          .map((config) => config.image_tag?.trim())
-          .filter((tag): tag is string => Boolean(tag)),
-      ),
+        ...(getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[]).map(
+          (config) => config.image_tag,
+        ),
+        ...containerJsonImageTags(groupsRoot),
+        CONTAINER_IMAGE,
+      ]
+        .map((tag) => tag?.trim())
+        .filter((tag): tag is string => Boolean(tag)),
+    );
+    return {
+      imageIds: new Set([...references].map(resolveImageId).filter((id): id is string => Boolean(id))),
       readable: true,
     };
   } catch (err) {
-    log.warn('storage-manager: failed to read configured image tags; image deletion disabled', { err });
-    return { images: new Set(), readable: false };
+    log.warn('storage-manager: failed to resolve configured images; image deletion disabled', { err });
+    return { imageIds: new Set(), readable: false };
   }
 }
 
@@ -2530,14 +2587,15 @@ function classifyDockerInventory(
   inventory: DockerInventory,
   policy: StoragePolicy,
   now: number,
+  groupsRoot: string,
 ): DockerImageDispositionReport[] {
-  const configured = configuredImageProtection();
+  const configured = configuredImageProtection(groupsRoot);
   const containerImageIds = new Set(inventory.containers.map((container) => container.imageId).filter(Boolean));
   return inventory.images.map((image) =>
     classifyDockerImage(image, {
       now,
       canonicalImage: CONTAINER_IMAGE,
-      configuredImages: configured.images,
+      configuredImageIds: configured.imageIds,
       containerImageIds,
       candidateRetentionHours: policy.candidateRetentionHours,
       legacyGraceHours: policy.legacyImageGraceHours,
@@ -2552,6 +2610,24 @@ function installLabelParts(): { key: string; value: string } {
     key: equals === -1 ? CONTAINER_INSTALL_LABEL : CONTAINER_INSTALL_LABEL.slice(0, equals),
     value: equals === -1 ? '' : CONTAINER_INSTALL_LABEL.slice(equals + 1),
   };
+}
+
+function removableContainer(container: DockerContainerInventory, underPressure: boolean, now: number): boolean {
+  const installLabel = installLabelParts();
+  if (container.running || container.labels[installLabel.key] !== installLabel.value) return false;
+  if (container.status !== 'created') return underPressure;
+  const createdMs = Date.parse(container.createdAt);
+  return Number.isFinite(createdMs) && now - createdMs >= STALE_CREATED_CONTAINER_MS;
+}
+
+function removableImage(image: DockerImageDispositionReport, underPressure: boolean): boolean {
+  if (image.disposition !== 'eligible') return false;
+  if (underPressure) return true;
+  return (
+    image.repoTags.length === 0 &&
+    (image.repoDigests ?? []).length === 0 &&
+    image.labels[IMAGE_INSTALL_LABEL] === INSTALL_SLUG
+  );
 }
 
 function usageAtOrBelowTarget(policy: StoragePolicy): boolean {
@@ -2574,6 +2650,7 @@ function collectDockerActions(
   warnings: string[],
   usageBefore: FilesystemUsage | null,
   force: boolean,
+  groupsRoot: string,
 ): { actions: StorageAction[]; images: DockerImageDispositionReport[] } {
   let dockerRoot: string;
   try {
@@ -2616,7 +2693,7 @@ function collectDockerActions(
     log.warn('storage-manager: docker cleanup collection failed; cleanup skipped', { stage: 'inventory', err });
     return { actions: [], images: [] };
   }
-  const imageDispositions = classifyDockerInventory(inventory, policy, now);
+  const imageDispositions = classifyDockerInventory(inventory, policy, now, groupsRoot);
 
   let estimates: Partial<Record<'Images' | 'Containers' | 'Build Cache', number>> = {};
   try {
@@ -2628,38 +2705,36 @@ function collectDockerActions(
 
   const actions: StorageAction[] = [];
   const thresholdReason = `filesystem usage is ${pressurePct}% (threshold ${policy.cleanupThresholdPct}%, target ${policy.cleanupTargetPct}%)`;
-  if (pressurePct >= policy.cleanupThresholdPct) {
-    const installLabel = installLabelParts();
-    for (const container of inventory.containers) {
-      if (container.running || container.labels[installLabel.key] !== installLabel.value) continue;
-      const dockerArgs = ['container', 'rm', container.id];
-      actions.push(
-        createDockerAction({
-          id: `docker:container:${container.id}`,
-          kind: 'docker-prune-containers',
-          dockerArgs,
-          estimatedBytes: 0,
-          reason: thresholdReason,
-          safety: 'Exact non-forced removal of a stopped container carrying this install label.',
-          apply: () => {
-            let current: DockerContainerInventory[];
-            try {
-              current = inspectDockerContainers([container.id]);
-            } catch (err) {
-              log.warn('storage-manager: docker container revalidation failed; removal skipped', {
-                containerId: container.id,
-                err,
-              });
-              return false;
-            }
-            const target = current[0];
-            if (!target || target.running || target.labels[installLabel.key] !== installLabel.value) return false;
-            execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
-            return true;
-          },
-        }),
-      );
-    }
+  const underPressure = pressurePct >= policy.cleanupThresholdPct;
+  for (const container of inventory.containers) {
+    if (!removableContainer(container, underPressure, now)) continue;
+    const dockerArgs = ['container', 'rm', container.id];
+    actions.push(
+      createDockerAction({
+        id: `docker:container:${container.id}`,
+        kind: 'docker-prune-containers',
+        dockerArgs,
+        estimatedBytes: 0,
+        reason: container.status === 'created' ? 'never-started container past the spawn window' : thresholdReason,
+        safety: 'Exact non-forced removal of a stopped container carrying this install label.',
+        apply: () => {
+          let current: DockerContainerInventory[];
+          try {
+            current = inspectDockerContainers([container.id]);
+          } catch (err) {
+            log.warn('storage-manager: docker container revalidation failed; removal skipped', {
+              containerId: container.id,
+              err,
+            });
+            return false;
+          }
+          const target = current[0];
+          if (!target || !removableContainer(target, underPressure, Date.now())) return false;
+          execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
+          return true;
+        },
+      }),
+    );
   }
 
   actions.push(
@@ -2699,49 +2774,49 @@ function collectDockerActions(
     }
   }
 
-  if (pressurePct >= policy.cleanupThresholdPct) {
-    const eligible = imageDispositions
-      .filter((image) => image.disposition === 'eligible')
-      .sort((a, b) => {
-        const aCreated = Date.parse(a.createdAt);
-        const bCreated = Date.parse(b.createdAt);
-        return (
-          (Number.isFinite(aCreated) ? aCreated : Number.MAX_SAFE_INTEGER) -
-          (Number.isFinite(bCreated) ? bCreated : Number.MAX_SAFE_INTEGER)
-        );
-      });
-    for (const image of eligible) {
-      const dockerArgs = ['image', 'rm', image.id];
-      actions.push(
-        createDockerAction({
-          id: `docker:image:${image.id}`,
-          kind: 'docker-prune-images',
-          dockerArgs,
-          estimatedBytes: image.sizeBytes,
-          reason: thresholdReason,
-          safety: 'Exact non-forced removal after immediate protection and reference revalidation.',
-          apply: () => {
-            if (usageAtOrBelowTarget(policy)) return false;
-            let currentInventory: DockerInventory;
-            try {
-              currentInventory = readDockerInventory();
-            } catch (err) {
-              log.warn('storage-manager: docker image revalidation failed; removal skipped', {
-                imageId: image.id,
-                err,
-              });
-              return false;
-            }
-            const current = classifyDockerInventory(currentInventory, policy, Date.now()).find(
-              (candidate) => candidate.id === image.id,
-            );
-            if (!current || current.disposition !== 'eligible') return false;
-            execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
-            return true;
-          },
-        }),
+  const removable = imageDispositions
+    .filter((image) => removableImage(image, underPressure))
+    .sort((a, b) => {
+      const aCreated = Date.parse(a.createdAt);
+      const bCreated = Date.parse(b.createdAt);
+      return (
+        (Number.isFinite(aCreated) ? aCreated : Number.MAX_SAFE_INTEGER) -
+        (Number.isFinite(bCreated) ? bCreated : Number.MAX_SAFE_INTEGER)
       );
-    }
+    });
+  for (const image of removable) {
+    const dockerArgs = ['image', 'rm', '--no-prune', image.id];
+    actions.push(
+      createDockerAction({
+        id: `docker:image:${image.id}`,
+        kind: 'docker-prune-images',
+        dockerArgs,
+        estimatedBytes: image.sizeBytes,
+        reason: removableImage(image, false)
+          ? "this install's superseded image: no tag or digest selects it"
+          : thresholdReason,
+        safety: 'Exact non-forced removal after immediate protection and reference revalidation.',
+        apply: () => {
+          let currentInventory: DockerInventory;
+          try {
+            currentInventory = readDockerInventory();
+          } catch (err) {
+            log.warn('storage-manager: docker image revalidation failed; removal skipped', {
+              imageId: image.id,
+              err,
+            });
+            return false;
+          }
+          const current = classifyDockerInventory(currentInventory, policy, Date.now(), groupsRoot).find(
+            (candidate) => candidate.id === image.id,
+          );
+          if (!current || !removableImage(current, underPressure)) return false;
+          if (!removableImage(current, false) && usageAtOrBelowTarget(policy)) return false;
+          execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
+          return true;
+        },
+      }),
+    );
   }
   return { actions, images: imageDispositions };
 }
@@ -2900,7 +2975,15 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
   }
 
   const dockerCollection = includeDocker
-    ? collectDockerActions(policy, now, mode, warnings, usageBefore, options.force === true)
+    ? collectDockerActions(
+        policy,
+        now,
+        mode,
+        warnings,
+        usageBefore,
+        options.force === true,
+        options.groupsRoot ?? GROUPS_DIR,
+      )
     : { actions: [], images: [] };
   const dependencyCacheOut: { report?: DependencyCacheReport } = {};
   const actions: StorageAction[] = [
