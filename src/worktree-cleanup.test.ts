@@ -1232,6 +1232,7 @@ describe('branch clone checkouts', () => {
         repository?: string;
         bareRepository?: string;
         committed?: string;
+        unreadable?: string;
       }> = [
         { exclude: 'allure-results/', files: ['allure-results/run-result.json'], reason: 'clean-and-pushed' },
         { exclude: '.pytest_cache/', files: ['.pytest_cache/v/cache/lastfailed'], reason: 'clean-and-pushed' },
@@ -1276,6 +1277,13 @@ describe('branch clone checkouts', () => {
           files: [':/allure-results/customers.csv'],
           reason: 'ignored-files',
         },
+        // Git still lists the directory; only the walk sees that part of it cannot be read.
+        {
+          exclude: 'allure-results/',
+          files: ['allure-results/run-result.json', 'allure-results/sub/r.json'],
+          unreadable: 'allure-results/sub',
+          reason: 'ignored-files',
+        },
         // A repository anywhere inside a listed directory may hold commits that exist nowhere else.
         {
           exclude: '.pytest_cache/',
@@ -1284,7 +1292,7 @@ describe('branch clone checkouts', () => {
           reason: 'ignored-files',
         },
       ];
-      const verdicts = cases.map(({ exclude, files, repository, bareRepository, committed }, index) => {
+      const verdicts = cases.map(({ exclude, files, repository, bareRepository, committed, unreadable }, index) => {
         const { checkout } = cloneCheckout(canon, `p1404-ignorable-${index}`, 'repo-a@feat', 'feat');
         fs.writeFileSync(path.join(checkout, '.git', 'info', 'exclude'), `${exclude}\n`);
         if (committed) {
@@ -1305,12 +1313,17 @@ describe('branch clone checkouts', () => {
           git(path.join(checkout, repository), ['commit', '-qm', 'only copy']);
         }
         age(checkout);
-        return disposability.proveCheckoutDisposable({
-          path: checkout,
-          shape: 'clone',
-          inheritedTagsRecord: checkoutInheritedTagsPath(checkout),
-          liveTopic: true,
-        }).reason;
+        if (unreadable) fs.chmodSync(path.join(checkout, unreadable), 0o000);
+        try {
+          return disposability.proveCheckoutDisposable({
+            path: checkout,
+            shape: 'clone',
+            inheritedTagsRecord: checkoutInheritedTagsPath(checkout),
+            liveTopic: true,
+          }).reason;
+        } finally {
+          if (unreadable) fs.chmodSync(path.join(checkout, unreadable), 0o755);
+        }
       });
       expect(verdicts).toEqual(cases.map((entry) => entry.reason));
     },
