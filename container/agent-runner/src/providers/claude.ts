@@ -421,7 +421,10 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  * A call denied by another PreToolUse hook never reaches PostToolUse and leaks; that only widens the host's
  * patience, and the map resets at query creation and on every `result`.
  */
-const toolsInFlight = new Map<string, { tool: string; declaredTimeoutMs: number | null }>();
+const toolsInFlight = new Map<
+  string,
+  { tool: string; declaredTimeoutMs: number | null; startedAt: number; mainThread: boolean }
+>();
 
 /**
  * `tool_use_id` of the call the row currently describes: null = row cleared,
@@ -450,6 +453,22 @@ function publishToolInFlight(): void {
     publishedToolUseId = undefined;
     log(`Tool in-flight: failed to write container_state: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+const BACKGROUNDABLE_TOOLS: readonly string[] = ['Bash', ...SUBAGENT_TOOL_NAMES];
+
+/**
+ * Main-thread Bash and subagent calls in flight: the calls `Query.backgroundTasks` can detach. A subagent's own calls
+ * are left out, because detaching one does not unblock the main thread, which is waiting on the subagent.
+ */
+export function backgroundableToolsInFlight(): { id: string; tool: string; startedAt: number }[] {
+  const calls: { id: string; tool: string; startedAt: number }[] = [];
+  for (const [id, entry] of toolsInFlight) {
+    if (id && entry.mainThread && BACKGROUNDABLE_TOOLS.includes(entry.tool)) {
+      calls.push({ id, tool: entry.tool, startedAt: entry.startedAt });
+    }
+  }
+  return calls;
 }
 
 export function resetToolInFlightTracking(): void {
@@ -484,7 +503,12 @@ export function clampDeclaredBashTimeoutMs(declared: unknown): number | null {
  * declared Bash timeout. Upstream merges have dropped the registration before; the registration test guards it.
  */
 export const preToolUseHook: HookCallback = async (input) => {
-  const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; tool_use_id?: string };
+  const i = input as {
+    tool_name?: string;
+    tool_input?: Record<string, unknown>;
+    tool_use_id?: string;
+    agent_id?: string;
+  };
   const toolName = i.tool_name ?? '';
   if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
     return {
@@ -494,7 +518,12 @@ export const preToolUseHook: HookCallback = async (input) => {
   }
   // `tool_input.timeout` is in ms.
   const declaredTimeoutMs = toolName === 'Bash' ? clampDeclaredBashTimeoutMs(i.tool_input?.timeout) : null;
-  toolsInFlight.set(i.tool_use_id ?? '', { tool: toolName, declaredTimeoutMs });
+  toolsInFlight.set(i.tool_use_id ?? '', {
+    tool: toolName,
+    declaredTimeoutMs,
+    startedAt: Date.now(),
+    mainThread: i.agent_id === undefined,
+  });
   publishToolInFlight();
   return { continue: true };
 };
@@ -2063,6 +2092,7 @@ export class ClaudeProvider implements AgentProvider {
     });
 
     let aborted = false;
+    const backgroundScheduled = new Set<string>();
     // SDKResultMessage.modelUsage resets for each query(), even when resuming
     // the same session (SDK sdk.d.ts, SDKResultSuccess.modelUsage contract).
     const usageCounterScope = randomUUID();
@@ -2426,6 +2456,34 @@ export class ClaudeProvider implements AgentProvider {
       // live keeps the task reaper off the container (see backgroundHold). Gated on sessionStateSeen: the release
       // arrives only behind CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, so a CLI without it must not pin a container.
       hasBackgroundWork: () => sessionStateSeen && backgroundHold,
+      backgroundForegroundTools: (minAgeMs) => {
+        const calls = backgroundableToolsInFlight();
+        for (const { id, tool, startedAt } of calls) {
+          if (backgroundScheduled.has(id)) continue;
+          backgroundScheduled.add(id);
+          const timer = setTimeout(
+            () => {
+              if (aborted || !toolsInFlight.has(id)) return;
+              const failed = (err: unknown) =>
+                log(`backgroundTasks(${tool} ${id}) failed: ${err instanceof Error ? err.message : String(err)}`);
+              try {
+                sdkResult.backgroundTasks(id).then((moved) => {
+                  log(
+                    moved
+                      ? `Moved ${tool} ${id} to the background so a waiting message is read now`
+                      : `backgroundTasks(${tool} ${id}) matched no foreground task`,
+                  );
+                }, failed);
+              } catch (err) {
+                failed(err);
+              }
+            },
+            Math.max(0, startedAt + minAgeMs - Date.now()),
+          );
+          timer.unref?.();
+        }
+        return calls.length;
+      },
       end: () => stream.end(),
       events: translateEvents(),
       // The SDK installs systemPrompt at query creation and has no control request to replace it.

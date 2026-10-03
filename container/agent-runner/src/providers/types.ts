@@ -247,6 +247,13 @@ export interface AgentQuery {
    */
   hasBackgroundWork?(): boolean;
 
+  /**
+   * Move each foreground Bash or subagent call to the background once it has run `minAgeMs`, so a message pushed
+   * mid-turn is read at the next tool boundary rather than when a long call returns. Returns how many calls are
+   * covered. Providers whose tool calls cannot be detached omit it.
+   */
+  backgroundForegroundTools?(minAgeMs: number): number;
+
   /** Signal that no more input will be sent. */
   end(): void;
 
