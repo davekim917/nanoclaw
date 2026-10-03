@@ -1834,9 +1834,9 @@ export async function processQuery(
         // detached call returns.
         const detachedNote =
           pushedHumanTrigger && !turnIdle && (query.backgroundForegroundTools?.(MID_TURN_DETACH_MIN_AGE_MS) ?? 0) > 0
-            ? `\n\n<system>A Bash command or subagent still running ${MID_TURN_DETACH_MIN_AGE_MS / 1000}s after it ` +
-              'started is moved to the background so this message is read now. Its result arrives later as a task ' +
-              'notification; do not report or act on that result until it arrives.</system>'
+            ? '\n\n<system>If a tool result says the call is now running in the background, it was detached so ' +
+              'this message is read now: do not report or act on that call until its task notification ' +
+              'arrives.</system>'
             : '';
         const pushedId = pushToQuery(runtimeUpdateNote + prompt + midTurnNote + detachedNote, extractAttachments(keep));
         runtimeUpdateNote = '';

@@ -6602,12 +6602,12 @@ describe('a human message pushed into a running turn detaches long foreground to
     const followUp = pushed.find((m) => m.includes('quick side question'));
     expect(followUp).toBeDefined();
     expect(minAges).toEqual([15_000]);
-    expect(followUp).toContain('moved to the background so this message is read now');
+    expect(followUp).toContain('detached so this message is read now');
   }, 15_000);
 
   it('adds no note when the provider has nothing to detach', async () => {
     const { pushed, minAges } = await runWithFollowUp(0);
     expect(minAges).toEqual([15_000]);
-    expect(pushed.find((m) => m.includes('quick side question'))).not.toContain('moved to the background');
+    expect(pushed.find((m) => m.includes('quick side question'))).not.toContain('detached so this message');
   }, 15_000);
 });
