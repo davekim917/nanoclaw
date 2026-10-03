@@ -6568,3 +6568,46 @@ describe('an ignored model pin is announced on both query paths', () => {
     expect(noticed()).toBe(true);
   }, 30_000);
 });
+
+describe('a human message pushed into a running turn detaches long foreground tools', () => {
+  async function runWithFollowUp(detachable: number): Promise<{ pushed: string[]; minAges: number[] }> {
+    insertMessage('m1', 'chat-sdk', { sender: 'A', text: 'start the build' });
+    // Pending before the query opens but outside the initial batch, so only the in-stream follow-up poll admits it.
+    insertMessage('f1', 'chat-sdk', { sender: 'A', text: 'quick side question' });
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Mid-turn: outlast ACTIVE_POLL_INTERVAL_MS so the follow-up is pushed before any result.
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'done', isError: false };
+    }
+    const pushed: string[] = [];
+    const minAges: number[] = [];
+    const query: AgentQuery = {
+      push: (m: string) => pushed.push(m),
+      end: () => {},
+      abort: () => {},
+      applySettings: async () => {},
+      backgroundForegroundTools: (minAgeMs: number) => {
+        minAges.push(minAgeMs);
+        return detachable;
+      },
+      events: events(),
+    };
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'p', undefined, { ultracode: false });
+    return { pushed, minAges };
+  }
+
+  it('asks the provider to detach and tells the agent why its call moved', async () => {
+    const { pushed, minAges } = await runWithFollowUp(1);
+    const followUp = pushed.find((m) => m.includes('quick side question'));
+    expect(followUp).toBeDefined();
+    expect(minAges).toEqual([15_000]);
+    expect(followUp).toContain('detached so this message is read now');
+  }, 15_000);
+
+  it('adds no note when the provider has nothing to detach', async () => {
+    const { pushed, minAges } = await runWithFollowUp(0);
+    expect(minAges).toEqual([15_000]);
+    expect(pushed.find((m) => m.includes('quick side question'))).not.toContain('detached so this message');
+  }, 15_000);
+});

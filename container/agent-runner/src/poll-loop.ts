@@ -124,6 +124,8 @@ const CORRUPTION_STREAK_EXIT = 10;
 const TRANSIENT_OVERLOAD_MAX_TRIES = 30;
 /** Releases per container of a mid-turn follow-up whose stream ended unconsumed. */
 const FOLLOW_UP_MAX_RELEASES = 1;
+/** How long a foreground tool call may hold a waiting human message before it is moved to the background. */
+const MID_TURN_DETACH_MIN_AGE_MS = 15_000;
 const followUpReleaseCounts = new Map<string, number>();
 const TRANSIENT_OVERLOAD_BASE_MS = 1500;
 const TRANSIENT_OVERLOAD_CAP_MS = 30_000;
@@ -1828,7 +1830,15 @@ export async function processQuery(
                 'To answer now, write a complete <message to="name">...</message> block or call the ' +
                 '`send_message` tool.</system>'
             : '';
-        const pushedId = pushToQuery(runtimeUpdateNote + prompt + midTurnNote, extractAttachments(keep));
+        // Scheduled before the push so detaching can't overtake the message, which must be queued when the
+        // detached call returns.
+        const detachedNote =
+          pushedHumanTrigger && !turnIdle && (query.backgroundForegroundTools?.(MID_TURN_DETACH_MIN_AGE_MS) ?? 0) > 0
+            ? '\n\n<system>If a tool result says the call is now running in the background, it was detached so ' +
+              'this message is read now: do not report or act on that call until its task notification ' +
+              'arrives.</system>'
+            : '';
+        const pushedId = pushToQuery(runtimeUpdateNote + prompt + midTurnNote + detachedNote, extractAttachments(keep));
         runtimeUpdateNote = '';
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
