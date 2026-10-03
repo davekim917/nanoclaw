@@ -140,6 +140,31 @@ describe('query.backgroundForegroundTools', () => {
     expect(backgrounded).toEqual(['bash-1']);
   });
 
+  it('a later waiting message retries a call the SDK found no task for', async () => {
+    const q = startQuery();
+    backgroundImpl = async () => false;
+    await pre('bash-gated', 'Bash');
+    q.backgroundForegroundTools!(0);
+    await Bun.sleep(20);
+    backgroundImpl = async () => true;
+    q.backgroundForegroundTools!(0);
+    await Bun.sleep(20);
+    expect(backgrounded).toEqual(['bash-gated', 'bash-gated']);
+  });
+
+  it('a later waiting message retries a call whose backgroundTasks rejected', async () => {
+    const q = startQuery();
+    backgroundImpl = async () => {
+      throw new Error('transient');
+    };
+    await pre('bash-1', 'Bash');
+    q.backgroundForegroundTools!(0);
+    await Bun.sleep(20);
+    q.backgroundForegroundTools!(0);
+    await Bun.sleep(20);
+    expect(backgrounded).toEqual(['bash-1', 'bash-1']);
+  });
+
   it('leaves alone a call that finishes before the minimum age', async () => {
     const q = startQuery();
     await pre('bash-quick', 'Bash');
@@ -165,6 +190,7 @@ describe('query.backgroundForegroundTools', () => {
     await pre('bash-1', 'Bash');
     q.backgroundForegroundTools!(0);
     await Bun.sleep(20);
+    await post('bash-1');
     await pre('bash-2', 'Bash');
     backgroundImpl = () => {
       throw new Error('sync throw');

@@ -2464,15 +2464,19 @@ export class ClaudeProvider implements AgentProvider {
           const timer = setTimeout(
             () => {
               if (aborted || !toolsInFlight.has(id)) return;
-              const failed = (err: unknown) =>
+              // Unlatched on no-match or failure: a call still inside a PreToolUse hook has no task to move yet.
+              const failed = (err: unknown) => {
+                backgroundScheduled.delete(id);
                 log(`backgroundTasks(${tool} ${id}) failed: ${err instanceof Error ? err.message : String(err)}`);
+              };
               try {
                 sdkResult.backgroundTasks(id).then((moved) => {
-                  log(
-                    moved
-                      ? `Moved ${tool} ${id} to the background so a waiting message is read now`
-                      : `backgroundTasks(${tool} ${id}) matched no foreground task`,
-                  );
+                  if (moved) {
+                    log(`Moved ${tool} ${id} to the background so a waiting message is read now`);
+                  } else {
+                    backgroundScheduled.delete(id);
+                    log(`backgroundTasks(${tool} ${id}) matched no foreground task`);
+                  }
                 }, failed);
               } catch (err) {
                 failed(err);
