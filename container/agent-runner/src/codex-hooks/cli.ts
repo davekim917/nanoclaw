@@ -6,6 +6,7 @@
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import '../modules/index.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
+import { hookFailureDenyReason, recordHookFailure, summarizeHookError, type HookFailureStage } from './hook-failure.js';
 import { runHookForCodex, type HookEvent, type CodexHookInput } from './runner.js';
 
 async function main(): Promise<void> {
@@ -30,23 +31,25 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  let stage: HookFailureStage = 'mailbox start';
   try {
     // Separate process from the runner: without its own mailbox the email gate throws, denying every gated command.
     await getAgentMailbox().start(await readMailboxContext());
+    stage = 'hook chain';
     const result = await runHookForCodex(eventArg as HookEvent, input);
     process.stdout.write(JSON.stringify(result));
   } catch (err) {
-    process.stderr.write(`[codex-hook] runtime error in ${eventArg}: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(`[codex-hook] runtime error in ${eventArg} at ${stage}: ${summarizeHookError(err)}\n`);
     // Fail closed: Codex runs the tool on continue:true + exit 0, so a throwing PreToolUse guard must deny.
     // PostToolUse is advisory (the tool already ran), so it stays soft rather than wedging the session.
     if (eventArg === 'PreToolUse') {
+      await recordHookFailure(stage, err);
       process.stdout.write(
         JSON.stringify({
           hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
-            permissionDecisionReason:
-              'BLOCKED: guard hook errored — denying for safety. Report this rather than retrying.',
+            permissionDecisionReason: hookFailureDenyReason(stage, err),
           },
         }),
       );
