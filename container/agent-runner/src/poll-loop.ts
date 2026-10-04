@@ -29,11 +29,11 @@ import { clearStaleProcessingAcks } from './db/container-state.js';
 import { activeRuntimeEffortUpdate } from './runtime-context.js';
 import {
   clearContinuation,
-  clearCurrentInReplyTo,
+  clearCurrentReplyRoute,
   getContinuation,
   migrateLegacyContinuation,
   setContinuation,
-  setCurrentInReplyTo,
+  setCurrentReplyRoute,
 } from './db/session-state.js';
 import {
   advanceMemoryContextEpoch,
@@ -461,7 +461,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           const settings = applyFlagBatch([], routing, config.providerName);
           log(`Resuming durable continuation: ${runningWork.task.slice(0, 120)}`);
           config.provider.resetRotationCycle?.();
-          setCurrentInReplyTo(routing.inReplyTo);
+          setCurrentReplyRoute(routing);
           setCurrentBatchAnchors(sourceBatch);
           rememberRequestCandidates(sourceBatch);
           let query: AgentQuery | undefined;
@@ -505,7 +505,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             log(`Durable continuation paused after query error: ${err instanceof Error ? err.message : String(err)}`);
           } finally {
             config.signal?.removeEventListener('abort', abortDirectQuery);
-            clearCurrentInReplyTo();
+            clearCurrentReplyRoute();
             clearBatchAnchors();
           }
           // The checkpoint below is real work the host would otherwise read as idle.
@@ -740,9 +740,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Fallback handoff: rows stay claimed-but-unfinished so the respawned container answers them.
     let deferredToFallback = false;
     let deferredForRepositoryBarrier = false;
-    // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
-    // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(routing.inReplyTo);
+    // Publish the batch's reply route so MCP tools stamp in_reply_to on outbound rows (a2a return-path routing)
+    // and thread their sends into the conversation being answered.
+    setCurrentReplyRoute(routing);
     setCurrentBatchAnchors(keep);
     let abortActiveQuery: (() => void) | undefined;
     if (config.signal) {
@@ -1166,7 +1166,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
       if (abortActiveQuery) config.signal?.removeEventListener('abort', abortActiveQuery);
       // Clear per-batch routing so MCP tools cannot stamp it on the next turn.
-      clearCurrentInReplyTo();
+      clearCurrentReplyRoute();
       clearBatchAnchors();
     }
 
@@ -1794,10 +1794,10 @@ export async function processQuery(
           log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.map((s) => s.id).join(', ')}`);
         }
         const prompt = formatMessages(keep);
-        // Refresh in_reply_to to the follow-up batch, or a mid-turn a2a reply
-        // routes to the outer turn's source session.
+        // Refresh the reply route to the follow-up batch, or a mid-turn reply routes to the outer turn's source
+        // session and thread.
         const followUpRouting = extractRouting(keep);
-        setCurrentInReplyTo(followUpRouting.inReplyTo);
+        setCurrentReplyRoute(followUpRouting);
         setCurrentBatchAnchors(keep);
         rememberRequestCandidates(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);

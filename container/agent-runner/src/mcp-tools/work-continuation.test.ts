@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, mock } from 'bun:test';
 
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { initTestSessionDb } from '../modules/mailbox/testing.js';
-import { setCurrentInReplyTo } from '../db/session-state.js';
+import { setCurrentReplyRoute } from '../db/session-state.js';
 
 mock.module('./server.js', () => ({ registerTools: (_tools: unknown) => {} }));
 
@@ -18,7 +18,7 @@ describe('work continuation tools', () => {
          VALUES ('turn-anchor', 'chat', ?, 'processing', '{}')`,
       )
       .run(new Date().toISOString());
-    setCurrentInReplyTo('turn-anchor');
+    setCurrentReplyRoute({ inReplyTo: 'turn-anchor', platformId: null, threadId: null });
     const result = await continueWork.handler({ task: 'write focused tests' });
     expect(result.isError).toBeUndefined();
     const row = getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'work_continuation'").get() as {

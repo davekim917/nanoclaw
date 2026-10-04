@@ -30,7 +30,7 @@ function chatSendDenial(): string | null {
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { withStatusSubtext } from '../turn-status.js';
 import { resolveRequestCandidate } from '../modules/mailbox/session-state.js';
-import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
+import { getSessionRouting, getTaskSeriesId, inheritedThreadFor } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
@@ -148,10 +148,9 @@ export function parseThreadKey(raw: unknown): { threadKey: string | null } | { e
  * If `to` is omitted, use the session's default reply routing (channel +
  * thread the conversation is in) — the agent replies in place.
  *
- * If `to` is specified, look up the named destination. If it resolves to
- * the same channel the session is bound to, the session's thread_id is
- * preserved so replies land in the correct thread. Otherwise thread_id
- * is null (a cross-destination send starts a new conversation).
+ * If `to` is specified, look up the named destination. A send to the chat the
+ * conversation is in continues its thread (`inheritedThreadFor`); a send to any
+ * other chat starts a new conversation.
  *
  * `leaveThread` drops the inherited thread: the host only resolves a keyed
  * post (and the thread it continues) for a row that names no thread.
@@ -170,7 +169,7 @@ function resolveRouting(
       return {
         channel_type: session.channel_type,
         platform_id: session.platform_id,
-        thread_id: leaveThread ? null : session.thread_id,
+        thread_id: leaveThread ? null : inheritedThreadFor(session.platform_id),
         resolvedName: '(current conversation)',
       };
     }
@@ -189,13 +188,10 @@ function resolveRouting(
   const dest = findByName(to);
   if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
   if (dest.type === 'channel') {
-    // Compare by platform_id, not bot instance: siblings reach one channel through different channel_types.
-    const session = getSessionRouting();
-    const threadId = !leaveThread && session.platform_id === dest.platformId ? session.thread_id : null;
     return {
       channel_type: dest.channelType!,
       platform_id: dest.platformId!,
-      thread_id: threadId,
+      thread_id: leaveThread ? null : inheritedThreadFor(dest.platformId!),
       resolvedName: to,
     };
   }

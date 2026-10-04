@@ -20,17 +20,25 @@ import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { addReaction, editMessage, sendFile, sendMessage, isAllowedFilePath, parseThreadKey } from './core.js';
+import { sendCard } from './interactive.js';
 
 /**
  * Publish the a2a reply stamp the way the poll loop does: a direct write to
  * session_state in outbound.db. `ageMs` back-dates updated_at to exercise the
  * staleness guard MCP tools apply when reading it.
  */
-function publishInReplyTo(id: string, ageMs = 0): void {
+function publishReplyRoute(
+  route: { inReplyTo: string | null; platformId: string | null; threadId: string | null },
+  ageMs = 0,
+): void {
   const updatedAt = new Date(Date.now() - ageMs).toISOString();
   getOutboundDb()
     .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
-    .run('current_in_reply_to', id, updatedAt);
+    .run('current_reply_route', JSON.stringify(route), updatedAt);
+}
+
+function publishInReplyTo(id: string, ageMs = 0): void {
+  publishReplyRoute({ inReplyTo: id, platformId: null, threadId: null }, ageMs);
 }
 
 function publishRequestCandidates(candidates: Array<{ sequence: number; messageId: string }>): void {
@@ -82,6 +90,116 @@ describe('send_message MCP tool — in_reply_to plumbing', () => {
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].in_reply_to).toBeNull();
+  });
+});
+
+describe('sends from a shared session thread into the conversation being answered', () => {
+  const CHAT = 'slack:CTEST00004';
+  const THREAD = 'slack:CTEST00004:1780316121.601669';
+
+  function bindSession(threadId: string | null): void {
+    const db = getInboundDb();
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
+    );
+    db.prepare('INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, ?, ?, ?)').run(
+      'slack',
+      CHAT,
+      threadId,
+    );
+  }
+
+  beforeEach(() => {
+    const db = getInboundDb();
+    db.prepare(
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES ('team', 'Team', 'channel', 'slack', '${CHAT}', NULL), ('other', 'Other', 'channel', 'slack', 'slack:CTEST00007', NULL)`,
+    ).run();
+  });
+
+  function lastThread(): string | null {
+    const out = getUndeliveredMessages();
+    return out[out.length - 1].thread_id;
+  }
+
+  it('replies in the thread the answered message came from, not the null bound thread', async () => {
+    bindSession(null);
+    publishReplyRoute({ inReplyTo: 'inbound-1', platformId: CHAT, threadId: THREAD });
+
+    await sendMessage.handler({ text: 'here you go' });
+    expect(lastThread()).toBe(THREAD);
+
+    await sendMessage.handler({ to: 'team', text: 'named, same chat' });
+    expect(lastThread()).toBe(THREAD);
+  });
+
+  it('starts a new conversation in another chat', async () => {
+    bindSession(null);
+    publishReplyRoute({ inReplyTo: 'inbound-1', platformId: CHAT, threadId: THREAD });
+
+    await sendMessage.handler({ to: 'other', text: 'elsewhere' });
+    expect(lastThread()).toBeNull();
+  });
+
+  it("never inherits a thread from a different chat's message", async () => {
+    bindSession(null);
+    publishReplyRoute({ inReplyTo: 'inbound-1', platformId: 'slack:CTEST00007', threadId: 'slack:CTEST00007:1.1' });
+
+    await sendMessage.handler({ text: 'own chat' });
+    expect(lastThread()).toBeNull();
+  });
+
+  it('keeps the bound thread when the answered message has none or the stamp is stale', async () => {
+    bindSession(THREAD);
+    publishReplyRoute({ inReplyTo: 'task-1', platformId: CHAT, threadId: null });
+    await sendMessage.handler({ text: 'root-stamped' });
+    expect(lastThread()).toBe(THREAD);
+
+    bindSession(null);
+    publishReplyRoute({ inReplyTo: 'inbound-1', platformId: CHAT, threadId: THREAD }, 60 * 60 * 1000);
+    await sendMessage.handler({ text: 'stale' });
+    expect(lastThread()).toBeNull();
+  });
+
+  it('threads send_file and send_card the same way', async () => {
+    bindSession(null);
+    publishReplyRoute({ inReplyTo: 'inbound-1', platformId: CHAT, threadId: THREAD });
+
+    await sendCard.handler({ card: { title: 'Summary' } });
+    expect(lastThread()).toBe(THREAD);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-send-file-thread-'));
+    const filePath = path.join(tmpDir, 'answer.csv');
+    fs.writeFileSync(filePath, `answer ${Date.now()} ${Math.random()}`);
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    const realWriteFileSync = fs.writeFileSync.bind(fs);
+    const mkdirSpy = spyOn(fs, 'mkdirSync').mockImplementation((target, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realMkdirSync(target, opts as never);
+    });
+    const writeFileSpy = spyOn(fs, 'writeFileSync').mockImplementation((target, data, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realWriteFileSync(target, data as never, opts as never);
+    });
+    try {
+      const before = getUndeliveredMessages().length;
+      const pending = sendFile.handler({ path: filePath });
+      let out = getUndeliveredMessages();
+      for (let i = 0; i < 100 && out.length === before; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        out = getUndeliveredMessages();
+      }
+      const row = out[out.length - 1];
+      expect(row.thread_id).toBe(THREAD);
+      getInboundDb()
+        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
+        .run(row.id, new Date().toISOString());
+      await pending;
+    } finally {
+      mkdirSpy.mockRestore();
+      writeFileSpy.mockRestore();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
