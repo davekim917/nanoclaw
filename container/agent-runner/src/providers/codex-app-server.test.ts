@@ -15,7 +15,8 @@ import {
   readCodexAccountRateLimits,
   readCodexTurnSnapshot,
   renderCodexMcpServer,
-  STALE_THREAD_RE,
+  startOrResumeCodexThread,
+  type ThreadParams,
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
@@ -370,16 +371,28 @@ describe('MCP server startup', () => {
     );
   });
 
-  // A failed required server must throw, not be read as a stale thread that resumes as a fresh one.
-  it.each([
+  const REQUIRED_FAILURES = [
     'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: nanoclaw: handshake failed',
     'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: nanoclaw: timed out after 10s',
-  ])('does not treat a required-server failure as a stale thread: %s', (message) => {
-    expect(STALE_THREAD_RE.test(message)).toBe(false);
+  ];
+  const PARAMS: ThreadParams = { model: 'gpt-test', cwd: '/workspace' };
+
+  it.each(REQUIRED_FAILURES)('rejects the resume and keeps the thread when the required server fails: %s', async (message) => {
+    const { server, requests } = fakeAppServer((request) =>
+      request.method === 'thread/resume' ? { error: { code: -32603, message } } : { result: { thread: { id: 'fresh' } } },
+    );
+    await expect(startOrResumeCodexThread(server, 'thread-kept', PARAMS)).rejects.toThrow('required MCP servers');
+    expect(requests.map((r) => r.method)).toEqual(['thread/resume']);
   });
 
-  it('still treats a missing thread as stale', () => {
-    expect(STALE_THREAD_RE.test('no rollout found for thread id 01a0caf8-0000-7000-a000-000000000000')).toBe(true);
+  it('still starts a fresh thread when the stored thread is gone', async () => {
+    const { server, requests } = fakeAppServer((request) =>
+      request.method === 'thread/resume'
+        ? { error: { code: -32603, message: 'no rollout found for thread id 01a0caf8-0000-7000-a000-000000000000' } }
+        : { result: { thread: { id: 'fresh' } } },
+    );
+    await expect(startOrResumeCodexThread(server, 'thread-gone', PARAMS)).resolves.toBe('fresh');
+    expect(requests.map((r) => r.method)).toEqual(['thread/resume', 'thread/start']);
   });
 });
 
