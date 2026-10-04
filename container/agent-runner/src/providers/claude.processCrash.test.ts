@@ -6,7 +6,6 @@ const provider = new ClaudeProvider({});
 
 describe('ClaudeProvider.isLocalProcessCrash', () => {
   it('matches a signal death reported through the sh wrapper as 128+N', () => {
-    // The 2026-10-03 13:45Z report that moved a group onto its codex fallback.
     const err = new Error(
       'Claude Code process exited with code 134. stderr: Claude configuration file not found at: /home/node/.claude.json',
     );

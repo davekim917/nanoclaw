@@ -1,10 +1,3 @@
-/**
- * A crashed local CLI process, driven through the real poll loop with a fallback provider declared.
- *
- * Measured 2026-10-03 13:45Z: a group's Claude CLI died with SIGABRT (reported as exit 134), the loop
- * reported `provider_unavailable`, and the host moved the session to its codex fallback for the next 26 hours
- * while Claude itself was healthy.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { _resetConfig, _setConfigForTest } from './config.js';
@@ -28,9 +21,9 @@ beforeEach(() => {
   getInboundDb()
     .prepare(
       `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
-       VALUES ('m1', 'chat', datetime('now'), 'pending', 'chan-1', 'discord', 'thread-1', ?)`,
+       VALUES ('m1', 'chat', ?, 'pending', 'chan-1', 'discord', 'thread-1', ?)`,
     )
-    .run(JSON.stringify({ sender: 'Operator', text: 'go' }));
+    .run(new Date().toISOString(), JSON.stringify({ sender: 'Operator', text: 'go' }));
 });
 
 afterEach(() => {
