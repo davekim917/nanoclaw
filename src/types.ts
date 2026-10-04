@@ -225,7 +225,7 @@ export interface PendingQuestion {
 
 /** Every status a pending_approvals row can hold. */
 export const PENDING_APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'expired', 'awaiting_reason'] as const;
-export type PendingApprovalStatus = (typeof PENDING_APPROVAL_STATUSES)[number];
+type PendingApprovalStatus = (typeof PENDING_APPROVAL_STATUSES)[number];
 
 export interface PendingApproval {
   approval_id: string;

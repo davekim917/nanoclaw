@@ -1206,7 +1206,7 @@
 "src/test-utils/free-port.ts":{"diff":27,"mode":"100644","sha256":null,"deleted":true},
 "src/timezone.test.ts":{"diff":74,"mode":"100644","sha256":"05191c37fab238d037447f07c70d9ec4e32413601dbbddb7b838d5e3341728b8"},
 "src/timezone.ts":{"diff":83,"mode":"100644","sha256":"d1ec5d073a59dc7101c83da87b5dbbe0b0dc49ec688a1072fd761d77f643bbac"},
-"src/types.ts":{"diff":142,"mode":"100644","sha256":"c79f5e935a830d6a42f132681d5bf382cc15afc51102506778ba541a0214fc88"},
+"src/types.ts":{"diff":144,"mode":"100644","sha256":"0a1b3abcfa5f5282265ce90784befb3825aa1564516f8327662aa69bfe779fd3"},
 "src/upgrade-state.test.ts":{"diff":68,"mode":"100644","sha256":"7fac511be49ea2dd5ffe50fb24b9616485069aa77b92e69f2974b7201e8c86a8"},
 "src/upgrade-state.ts":{"diff":104,"mode":"100644","sha256":"3fb08518919ecd645e88ab55e7a27550747fc39ba2632cd27532c0862d4430fb"},
 "src/webhook-server-raw.test.ts":{"diff":102,"mode":"100644","sha256":null,"deleted":true},
