@@ -1,8 +1,3 @@
-/**
- * `ncl approvals` must expose every status the host writes to
- * pending_approvals, including the "Reject with reason…" hold, so a
- * `--status` filter and the help text agree with the rows that exist.
- */
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../container-runner.js', async (importOriginal) => ({

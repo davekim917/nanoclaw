@@ -144,8 +144,7 @@ describe('log never throws on unserializable data', () => {
     expect(written.join('')).toContain('10n');
   });
 
-  it('honors a top-level toJSON when stringify throws on its result', () => {
-    // The BigInt in toJSON's result makes stringify throw, so the inspect fallback runs.
+  it('honors a top-level toJSON whose result holds a BigInt', () => {
     const value = {
       token: 'SECRET',
       toJSON() {
