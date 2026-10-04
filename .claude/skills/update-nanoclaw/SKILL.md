@@ -1,7 +1,9 @@
 ---
 name: update-nanoclaw
-description: Safely bring upstream NanoClaw updates into a customized install while treating local customization behavior as the release-blocking invariant. Use for preview, full merge, selective cherry-pick, rebase, semantic customization compatibility auditing, validation, and rollback.
+description: Safely bring upstream NanoClaw updates into a customized install while treating local customization behavior as the release-blocking invariant. Use for preview, full merge, selective cherry-pick, rebase, semantic customization compatibility auditing, validation, and rollback. On this fork, use /sync-upstream instead.
 ---
+
+> **On this fork, stop here and run `/sync-upstream`.** This fork ports upstream work instead of merging upstream's branch, and every apply path below (the dry-run merge, the merge, rebase and cherry-pick paths, the `git reset --hard` rollback) changes the production checkout directly.
 
 # About
 
