@@ -47,6 +47,12 @@ export interface AgentProvider {
   isTransientOverload?(err: unknown): boolean;
 
   /**
+   * The provider's local CLI process died on a signal: a fault of this container, not of the provider. The
+   * poll-loop replays the batch once on a fresh process and never reports it as `provider_unavailable`.
+   */
+  isLocalProcessCrash?(err: unknown): boolean;
+
+  /**
    * True when this ACCOUNT is spent (usage/credit limit) until the provider's window resets; no retry on this
    * credential can recover it.
    */

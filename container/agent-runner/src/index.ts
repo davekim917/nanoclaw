@@ -45,6 +45,7 @@ import { readToneProfile } from './tone-profiles.js';
 import { readChannelInstructions, isSafeInstructionsProfileName } from './channel-instructions.js';
 import { setupCodexPrimaryRuntime, setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
 import { activateGcpServiceAccount } from './gcp-auth-setup.js';
+import { ensureClaudeUserConfig } from './claude-user-config.js';
 import { startResourceTelemetry } from './resource-telemetry.js';
 import { CLAUDE_REVIEW_SOCKET_ENV } from './cli/claude-review-contract.js';
 import { startClaudeReviewService } from './cli/claude-review-service.js';
@@ -97,6 +98,7 @@ async function main(): Promise<void> {
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
   activateGcpServiceAccount(log);
+  ensureClaudeUserConfig(log);
 
   ensureMemoryScaffold();
 

@@ -1685,6 +1685,12 @@ const STALE_SESSION_RE =
  */
 const PROMPT_TOO_LONG_RE = /prompt is too long|prompt_too_long|maximum context length|context[_ ]length.*exceed/i;
 
+/**
+ * The Agent SDK's process-exit errors. `claude` is a `/bin/sh` wrapper, so a signal reaches the SDK as exit
+ * 128+N (134 = SIGABRT); a low exit code is the CLI's own deliberate failure and is left to the other rungs.
+ */
+const PROCESS_EXIT_RE = /^Claude Code process (?:exited with code (\d+)\b|terminated by signal SIG[A-Z0-9]+)/;
+
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
 
@@ -1842,6 +1848,12 @@ export class ClaudeProvider implements AgentProvider {
   isTransientOverload(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return msg.startsWith('transient_overload:');
+  }
+
+  isLocalProcessCrash(err: unknown): boolean {
+    const match = PROCESS_EXIT_RE.exec(err instanceof Error ? err.message : String(err));
+    if (!match) return false;
+    return match[1] === undefined || Number(match[1]) > 128;
   }
 
   transcriptHasPrompt(continuation: string | undefined, prompt: string, sinceMs: number): boolean {
