@@ -6,6 +6,7 @@
  * destination resolves to the chat this session is bound to.
  */
 import { getAgentMailbox } from '../mailbox/index.js';
+import { getCurrentReplyRoute } from './session-state.js';
 
 export interface SessionRouting {
   channel_type: string | null;
@@ -20,6 +21,19 @@ export function getSessionRouting(): SessionRouting {
     platform_id: routing.platformId,
     thread_id: routing.threadId,
   };
+}
+
+/**
+ * The thread a post to `platformId` continues: the answered message's thread when that message came from this chat,
+ * else the session's bound thread when this is the session's own chat. A shared session's bound thread is null even
+ * when the request arrived in a thread, so the bound thread alone sends a threaded answer to the channel root.
+ * Compares by platform id, not channel type: siblings reach one chat through different channel types.
+ */
+export function inheritedThreadFor(platformId: string): string | null {
+  const reply = getCurrentReplyRoute();
+  if (reply?.threadId && reply.platformId === platformId) return reply.threadId;
+  const session = getSessionRouting();
+  return session.platform_id === platformId ? session.thread_id : null;
 }
 
 const TASK_THREAD_PREFIX = 'system:tasks:';

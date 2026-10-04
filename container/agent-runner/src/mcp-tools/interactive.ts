@@ -6,13 +6,14 @@
  */
 import { findQuestionResponse, markCompleted } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { getSessionRouting } from '../db/session-routing.js';
+import { getSessionRouting, inheritedThreadFor } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 function routing() {
-  return getSessionRouting();
+  const session = getSessionRouting();
+  return { ...session, thread_id: session.platform_id ? inheritedThreadFor(session.platform_id) : session.thread_id };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -114,7 +115,7 @@ const askUserQuestion: McpToolDefinition = {
   },
 };
 
-const sendCard: McpToolDefinition = {
+export const sendCard: McpToolDefinition = {
   tool: {
     name: 'send_card',
     description:

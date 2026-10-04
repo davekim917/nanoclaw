@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
-import { setCurrentInReplyTo } from '../db/session-state.js';
+import { setCurrentReplyRoute } from '../db/session-state.js';
 import { wait } from './wait.js';
 
 beforeEach(() => {
@@ -31,7 +31,7 @@ describe('wait', () => {
          VALUES ('turn-anchor', 'chat', datetime('now'), 'processing', 1, '{}')`,
       )
       .run();
-    setCurrentInReplyTo('turn-anchor');
+    setCurrentReplyRoute({ inReplyTo: 'turn-anchor', platformId: null, threadId: null });
     const before = Date.now();
     const result = await wait.handler({ minutes: 15, prompt: 'Check CI for PR #207 and report status' });
     const after = Date.now();

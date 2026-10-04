@@ -73,16 +73,20 @@ export function clearContinuation(providerName: string): void {
 }
 
 /**
- * The a2a reply stamp: the id of the first inbound message in the batch the
- * agent is currently processing. The poll loop publishes it at batch start;
- * MCP tools (`send_message`, `send_file`) read it and stamp it onto outbound
- * rows so the host's a2a return-path routing can correlate replies back to
- * the originating session.
+ * The reply stamp: the message being answered (its id, for the host's a2a return-path routing) and the chat and
+ * thread it came from, so a send to that chat lands in the same thread. The poll loop publishes it at batch start
+ * and again for each follow-up it pushes into a running query; MCP tools read it.
  *
  * This lives in mailbox state because the MCP server runs as a separate stdio
  * subprocess; module state set by the poll loop is invisible to it.
  */
-const IN_REPLY_TO_KEY = 'current_in_reply_to';
+export interface ReplyRoute {
+  inReplyTo: string | null;
+  platformId: string | null;
+  threadId: string | null;
+}
+
+const REPLY_ROUTE_KEY = 'current_reply_route';
 
 /**
  * Ignore a stamp older than this. The poll loop clears the stamp in a
@@ -90,24 +94,34 @@ const IN_REPLY_TO_KEY = 'current_in_reply_to';
  * the guard stops a later out-of-batch read from picking up a dead stamp.
  * Generous so a long-running batch's late sends still stamp correctly.
  */
-const IN_REPLY_TO_MAX_AGE_MS = 30 * 60 * 1000;
+const REPLY_ROUTE_MAX_AGE_MS = 30 * 60 * 1000;
 
-export function setCurrentInReplyTo(id: string | null): void {
-  if (id === null) {
-    clearCurrentInReplyTo();
+export function setCurrentReplyRoute(route: ReplyRoute | null): void {
+  if (route === null) {
+    clearCurrentReplyRoute();
     return;
   }
-  setValue(IN_REPLY_TO_KEY, id);
+  const { inReplyTo, platformId, threadId } = route;
+  setValue(REPLY_ROUTE_KEY, JSON.stringify({ inReplyTo, platformId, threadId }));
 }
 
-export function clearCurrentInReplyTo(): void {
-  deleteValue(IN_REPLY_TO_KEY);
+export function clearCurrentReplyRoute(): void {
+  deleteValue(REPLY_ROUTE_KEY);
+}
+
+export function getCurrentReplyRoute(): ReplyRoute | null {
+  const row = getAgentMailbox().operations.getState(REPLY_ROUTE_KEY);
+  if (!row) return null;
+  const age = Date.now() - new Date(row.updatedAt).getTime();
+  if (!Number.isFinite(age) || age > REPLY_ROUTE_MAX_AGE_MS) return null;
+  try {
+    const route = JSON.parse(row.value) as Partial<ReplyRoute>;
+    return { inReplyTo: route.inReplyTo ?? null, platformId: route.platformId ?? null, threadId: route.threadId ?? null };
+  } catch {
+    return null;
+  }
 }
 
 export function getCurrentInReplyTo(): string | null {
-  const row = getAgentMailbox().operations.getState(IN_REPLY_TO_KEY);
-  if (!row) return null;
-  const age = Date.now() - new Date(row.updatedAt).getTime();
-  if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return null;
-  return row.value;
+  return getCurrentReplyRoute()?.inReplyTo ?? null;
 }
