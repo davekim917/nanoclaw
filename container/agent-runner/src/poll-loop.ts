@@ -156,7 +156,7 @@ function formatCredentialRetryPrompt(
       : '';
   return (
     '<runner-retry-provenance>\n' +
-    'A retryable upstream failure interrupted an earlier attempt for this same inbound batch.' +
+    'A retryable failure interrupted an earlier attempt for this same inbound batch.' +
     `${occurrence} The runner has not recorded a completed result for this batch. ` +
     'Treat the repeated payload below as retry context, not a new delivery. ' +
     'Before repeating side effects, inspect durable effects already produced, then continue the unfinished work.\n' +
@@ -966,6 +966,26 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
+      const localCrash = config.provider.isLocalProcessCrash?.(err) ?? false;
+      if (!recovered && localCrash && repositoryRecoveryAllowed()) {
+        log(`Provider process crashed — replaying the batch once on a fresh process`);
+        try {
+          const retryPrompt = formatCredentialRetryPrompt(
+            prompt,
+            keep,
+            undefined,
+            config.provider.transcriptHasPrompt?.(continuation, prompt, batchStartedAt) ?? false,
+          );
+          await retryInTurn(retryPrompt, continuation, effectiveModel);
+          recovered = true;
+        } catch (retryErr) {
+          log(
+            `Replay after the process crash also failed: ` +
+              `${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
+          );
+        }
+      }
+
       // Cycle the credential ring until one succeeds; rotateApiKey returns
       // rotated:false once the cycle is spent, so the loop terminates. Ordered
       // before isContextTooLong, which can look retryable. The continuation
@@ -1107,6 +1127,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const quotaHandled =
         !recovered &&
         !deferredForRepositoryBarrier &&
+        !localCrash &&
         (await reportProviderUnavailable(
           config.providerName,
           err instanceof Error ? err.message : String(err),
