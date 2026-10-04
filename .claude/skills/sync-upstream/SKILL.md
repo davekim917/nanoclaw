@@ -123,6 +123,7 @@ Port rules:
 - **The fork is public.** Commits, tests, comments, issues and PR bodies use synthetic ids and no operator, client or agent names. The boundary check refuses them, and it fails closed when the install's identifier registry is missing.
 - **One producer per Docker flag.** `dockerResourceLimitArgs` owns `--pids-limit` and `--memory`; `resolveContainerSecurity` owns cap-drop and no-new-privileges.
 - **Supply chain.** Keep the fork's Bun pin. Add nothing to `allowBuilds` and no release-age policy without the operator's approval.
+- **Mocked modules.** A port that adds an export leaves it undefined in every suite that mocks that module with a bare `vi.mock` factory. Spread `importOriginal()` into the factory rather than stubbing the new export; `./log.js` stays a full stub.
 - **New environment reads.** A port that adds a `process.env` read confirms the key is set in `.env` or OneCLI before deploy.
 - **Migrations.** Scan a ported migration for `ALTER … NOT NULL` without a default, `DROP`, and bulk `UPDATE` against what the live DB holds, and take the backup in §4 before deploying it.
 
@@ -143,7 +144,8 @@ Gate at about 2.5 minutes after the restart. Read the logs from this boot's last
 - `OneCLI preflight ok` is present for this boot.
 - `logs/nanoclaw.error.log` has no `ERROR` line since the restart. Investigate any WARN class not seen in the previous day before calling it green.
 - `systemctl show -p NRestarts --value nanoclaw-v2` prints 0.
-- `docker ps --filter name=nanoclaw-v2- --format '{{.Names}} {{.Status}}'` shows a container started after the restart. `OneCLI gateway applied` is logged before the spawn, so on its own it doesn't prove one.
+- `Reconciled sessions at startup` reports the running containers as `adopted`; a nonzero `stopped` is explained by the `Boot quiescence scope` line before it.
+- The next spawn succeeds: a container started after the restart appears in `docker ps --filter name=nanoclaw-v2- --format '{{.Names}} {{.Status}}'`. `OneCLI gateway applied` is logged before the spawn, so on its own it doesn't prove one.
 - `Host sweep duty failed`, `Host sweep mailbox unopenable` and `tick threw` don't appear since the restart.
 
 To roll back, revert the merge commit through a PR and redeploy. Restore the DB backup if a migration ran.
