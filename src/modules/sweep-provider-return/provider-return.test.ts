@@ -158,7 +158,7 @@ describe('sweepProviderReturn', () => {
 
     expect(wakeRows).toHaveLength(1);
     expect(wakeRows[0]).toMatchObject({ onWake: 1 });
-    expect(String(wakeRows[0].content)).toContain('back on claude');
+    expect(String(wakeRows[0].content)).toContain('move it back to claude');
     expect(killContainer).toHaveBeenCalledTimes(1);
     const [sessionId, , onExit, intent] = killContainer.mock.calls[0];
     expect(sessionId).toBe('sess-1');
@@ -245,6 +245,14 @@ describe('sweepProviderReturn', () => {
     await expect(sweepProviderReturn(context(), { readMarker: () => true })).resolves.toBe(true);
     expect(wakeRows).toHaveLength(0);
     expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('skips the thread note when the primary failed again before the exit, and still respawns', async () => {
+    await sweepProviderReturn(context(), { readMarker: () => true });
+    state.primaryUnavailable = true;
+    await killContainer.mock.calls[0][2]();
+    expect(outboundWrites).toHaveLength(0);
+    expect(requestWake).toHaveBeenCalledTimes(1);
   });
 
   it('skips the thread note when a container already owns outbound.db, and still respawns', async () => {

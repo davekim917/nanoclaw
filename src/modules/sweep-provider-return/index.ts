@@ -156,9 +156,9 @@ export async function sweepProviderReturn(
       mailbox,
       session,
       `${PROVIDER_RETURN_ID_PREFIX}${Date.now()}`,
-      `[system] This session ran on ${fallbackProvider} while ${primaryProvider} was unavailable. ${primaryProvider} ` +
-        `is available again, so your container was restarted between turns and you are back on ${primaryProvider}. ` +
-        `Nothing was in flight, but your conversation memory does not include what happened on ${fallbackProvider}: ` +
+      `[system] This session ran on ${fallbackProvider} while ${primaryProvider} was unavailable. Your container ` +
+        `was restarted between turns to move it back to ${primaryProvider}. Nothing was in flight, but if you are now ` +
+        `on ${primaryProvider} your conversation memory does not include what happened on ${fallbackProvider}: ` +
         `catch up from this thread and your durable notes before acting. If work was underway, continue it; ` +
         `otherwise stay silent.`,
       { kind: 'provider_fallback_return', provider: primaryProvider, from: fallbackProvider },
@@ -181,9 +181,12 @@ export async function sweepProviderReturn(
     session.id,
     'provider fallback ended — returning to the primary',
     async () => {
-      await noteReturnInThread(session, primaryProvider, fallbackProvider).catch((err) =>
-        log.warn('provider-return: thread note failed', { sessionId: session.id, err }),
-      );
+      // Another session can re-record the outage before this exit, and the respawn would then land on the fallback.
+      if (!(await isProviderUnavailable(session.agent_group_id, primaryProvider))) {
+        await noteReturnInThread(session, primaryProvider, fallbackProvider).catch((err) =>
+          log.warn('provider-return: thread note failed', { sessionId: session.id, err }),
+        );
+      }
       await requestWake(session, 'container-restart', {
         priority: 'interactive',
         guard: sessionStillActive(session.id),

@@ -97,9 +97,10 @@ thread gets one line:
 
 > ⚙️ claude is available again — this thread is moving back from codex.
 
-The fresh container wakes on an `on_wake` row telling the agent it is back on
-the primary and that its conversation memory does not cover the fallback
-period. The sweep tells a fallback container from a primary one by the
+The line is skipped when the primary's outage is re-recorded before the old
+container exits. The fresh container wakes on an `on_wake` row telling the
+agent why it was restarted and that, back on the primary, its conversation
+memory does not cover the fallback period. The sweep tells a fallback container from a primary one by the
 `NANOCLAW_PROVIDER_FALLBACK_APPLIED` marker in the container's own env, so an
 adopted container started by an earlier host is judged the same way. If the
 primary is still failing, that turn re-records the outage and the session goes
