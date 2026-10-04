@@ -33,6 +33,8 @@ git -C $R rev-list --first-parent --count $PIN..$UP
 git -C $R log --first-parent --format='%h %cs %s' $PIN..$UP
 ```
 
+`$UP` is this cycle's target. Write it down: triage and the re-pin both use that head, even if upstream moves in between.
+
 `.git/shallow` grafts the pin, so it has no parents locally. Count from it with `--first-parent`; a plain `rev-list $PIN..$UP` also counts older history reached through merge commits.
 
 Check on every cycle:
@@ -69,7 +71,7 @@ Put every commit in exactly one place:
 
 **Channels and providers.** Installed adapters ship on upstream's `channels` and `providers` branches, which neither this triage nor the ratchet covers. Run `/update-skills` for them.
 
-**Re-pin** once every commit is placed, in its own PR from a worktree (§3), with the report's full delta in the PR body:
+**Re-pin** once every commit is placed, to the `$UP` you triaged, in its own PR from a worktree (§3), with the report's full delta in the PR body:
 
 ```bash
 (cd "$W" && node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --root "$W" --upstream $UP)
@@ -101,7 +103,7 @@ node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --root "$W" --write [--
 (cd $R && pnpm run check:public-boundary -- --root "$W" --index)   # from the live checkout so pnpm resolves; scans $W's index
 ```
 
-Never run the full host suite on this host. Push, open the PR from `$W` (`gh pr create` takes its head branch from the working directory) with a `Replaces:` line, and drive it with the `pr-review-loop` skill, which owns review rounds, receipts and the merge (`codex-review.sh merge --head <sha>`). After the merge: `git -C $R worktree remove "$W"`.
+Never run the full host suite on this host. Push, open the PR from `$W` (`gh pr create` takes its head branch from the working directory) with a `Replaces:` line, and drive it with the `pr-review-loop` skill, which owns review rounds, receipts and the merge (`codex-review.sh merge --head <sha>`). After the merge: `git -C $R worktree remove --force "$W"`. The untracked `node_modules` symlink makes a plain remove refuse; git deletes the link, not its target.
 
 Drift tests, green before and after every port:
 
@@ -139,16 +141,17 @@ cd $R && node -e "const D=require('better-sqlite3'); new D('data/v2.db',{readonl
 
 Deploy with `scripts/deploy.sh` or the Discord `/deploy` command. It pulls, builds the host, rebuilds the agent image when `container/` changed, and restarts. Its crash guard rolls back a boot crash, but it doesn't arm when the deploy ships a migration. A host restart leaves running containers for the new host to adopt; boot stops only the ones it cannot adopt.
 
-Before launching the deploy, checkpoint both logs. Rotation is a daily `copytruncate`, so a whole-file grep proves nothing:
+Before launching the deploy, checkpoint both logs to a file; shell variables don't survive between tool calls:
 
 ```bash
-cd $R && L0=$(wc -l < logs/nanoclaw.log) && E0=$(wc -l < logs/nanoclaw.error.log)
+cd $R && echo "$(date +%s) $(wc -l < logs/nanoclaw.log) $(wc -l < logs/nanoclaw.error.log)" > <scratchpad>/log-checkpoint
 ```
 
-Gate at about 2.5 minutes after the restart. INFO lines go to `logs/nanoclaw.log` and WARN and above to `logs/nanoclaw.error.log`, so read both from their checkpoints. A file shorter than its checkpoint has rotated; its earlier lines are in `.1`:
+Gate at about 2.5 minutes after the restart. INFO lines go to `logs/nanoclaw.log` and WARN and above to `logs/nanoclaw.error.log`, so read both from the checkpoint. Daily rotation is a `copytruncate` that writes a new `.1` file, so a `.1` created after the checkpoint means the file rotated in between and its earlier lines are in `.1`:
 
 ```bash
-since() { { if [ "$(wc -l < "$1")" -ge "$2" ]; then tail -n +$(($2 + 1)) "$1"; else tail -n +$(($2 + 1)) "$1.1"; cat "$1"; fi; } | sed 's/\x1b\[[0-9;]*m//g'; }
+cd $R && read C L0 E0 < <scratchpad>/log-checkpoint
+since() { { if [ "$(stat -c %Z "$1.1" 2>/dev/null || echo 0)" -lt "$C" ]; then tail -n +$(($2 + 1)) "$1"; else tail -n +$(($2 + 1)) "$1.1"; cat "$1"; fi; } | sed 's/\x1b\[[0-9;]*m//g'; }
 { since logs/nanoclaw.log $L0; since logs/nanoclaw.error.log $E0; } > <scratchpad>/since-restart.log
 ```
 
@@ -173,13 +176,13 @@ Only `better-sqlite3` is ABI-bound in the host tree. Rebuilding it while the hos
 1. Checkpoint the logs as in §4, then stop the timers that run this checkout's code and the service. Expect about a minute of planned downtime.
 
    ```bash
-   T=$(systemctl list-units --type=timer --state=active --plain --no-legend 'nanoclaw-*' | awk '{print $1}')
-   sudo systemctl stop $T nanoclaw-v2
+   systemctl list-units --type=timer --state=active --plain --no-legend 'nanoclaw-*' | awk '{print $1}' > <scratchpad>/stopped-timers
+   sudo systemctl stop $(cat <scratchpad>/stopped-timers) nanoclaw-v2
    ```
 
 2. Back up the apt source, switch it, then `sudo apt-get install -y nodejs=<version>`, `pnpm rebuild better-sqlite3` and `node -e "require('better-sqlite3')"`.
-3. `sudo systemctl start nanoclaw-v2 $T`, and restart `nanoclaw-codex-sync`, which still holds the old node binary.
-4. Run the §4 gate, and two more checks. The daemon runs the intended Node: `MP=$(systemctl show -p MainPID --value nanoclaw-v2); sudo /proc/$MP/exe -v`. And `NODE_USE_ENV_PROXY` is absent from its environment: `sudo cat /proc/$MP/environ | tr '\0' '\n' | grep NODE_USE_ENV_PROXY` prints nothing. Node 22.23 and later honor that variable, and with the OneCLI gateway as `HTTPS_PROXY` the host's own calls to the OneCLI control API would then go through the proxy and every spawn would be refused. The drop-in `/etc/systemd/system/nanoclaw-v2.service.d/node22-env-proxy.conf` unsets it.
+3. `sudo systemctl start nanoclaw-v2 $(cat <scratchpad>/stopped-timers)`, and restart `nanoclaw-codex-sync`, which still holds the old node binary.
+4. Run the §4 gate, and two more checks. The daemon runs the intended Node: `MP=$(systemctl show -p MainPID --value nanoclaw-v2); sudo /proc/$MP/exe -v`. And `NODE_USE_ENV_PROXY` is absent from its environment: `MP=$(systemctl show -p MainPID --value nanoclaw-v2); sudo grep -ac NODE_USE_ENV_PROXY /proc/$MP/environ` prints `0`. Node 22.23 and later honor that variable, and with the OneCLI gateway as `HTTPS_PROXY` the host's own calls to the OneCLI control API would then go through the proxy and every spawn would be refused. The drop-in `/etc/systemd/system/nanoclaw-v2.service.d/node22-env-proxy.conf` unsets it.
 5. Change one variable per restart: don't deploy a new `dist/` in the same change.
 
 To roll back, restore the apt source, run `sudo apt-get install --allow-downgrades nodejs=<old>` and `pnpm rebuild better-sqlite3`, then restart. Never restore `node_modules.pre-deploy/`: its snapshots are tied to the old runtime's ABI, which is why the deploy crash guard won't roll back across a Node change.
