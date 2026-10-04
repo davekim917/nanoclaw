@@ -85,10 +85,11 @@ turn on the primary clears the streak.
 
 A container already running on the fallback does not wait for its next spawn.
 A busy thread can keep one container alive for a day, long past the window, so
-the host sweep restarts it once the spawn resolver would pick the primary again
-(the `provider-fallback-return` duty, `src/modules/sweep-provider-return/`).
-It acts only between turns — nothing due, no claim, no provider call and no
-continuation turn in flight — and after provider self-heal in the same
+the host sweep restarts it once the primary has no availability window (the
+`provider-fallback-return` duty, `src/modules/sweep-provider-return/`). It acts
+only between turns — nothing due, no claim, no provider call and no
+continuation turn in flight, re-read in the same mailbox window as the restart's
+wake row — and after provider self-heal in the same
 exclusive chain, so a container self-heal restarts is not restarted twice. The
 thread gets one line:
 

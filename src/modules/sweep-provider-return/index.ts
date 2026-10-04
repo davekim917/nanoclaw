@@ -25,7 +25,9 @@ import {
   type WakePlan,
 } from '../../host-sweep.js';
 import { log } from '../../log.js';
-import { PROVIDER_FALLBACK_APPLIED_ENV, resolveSpawnProvider } from '../../provider-fallback.js';
+import { resolveProviderName } from '../../db/container-configs.js';
+import { isProviderUnavailable } from '../../db/provider-health.js';
+import { PROVIDER_FALLBACK_APPLIED_ENV } from '../../provider-fallback.js';
 import { requestWake } from '../../request-wake.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -117,25 +119,28 @@ export async function sweepProviderReturn(
     log.debug('provider-return: container config unreadable — skipping', { sessionId: session.id, err });
     return false;
   }
-  // The spawn path's own resolver: a respawn now lands wherever this says, so "not on fallback" is the return signal.
-  const decision = await resolveSpawnProvider({
-    agentGroupId: session.agent_group_id,
-    sessionProvider: session.agent_provider,
-    containerConfig,
-  });
-  if (decision.fallbackApplied) return false;
+  // Asked directly, not inferred from the spawn resolver: it also picks the primary when the fallback is in cooldown.
+  const primaryProvider = resolveProviderName(session.agent_provider, containerConfig.provider);
+  if (await isProviderUnavailable(session.agent_group_id, primaryProvider)) return false;
   if (containerOnFallback(session.id, target.containerName, deps.readMarker ?? readFallbackMarker) !== true) {
     return false;
   }
 
-  const primaryProvider = decision.primaryProvider;
   const fallbackProvider = containerConfig.providerFallback?.provider ?? 'its fallback provider';
   // A replacement registered since the observation is a different container; claim the phase so no later duty acts
   // on the stale observation either.
   if (!sameContainerIdentity(containerIdentityFor(session.id), target)) return true;
 
-  const wrote = await ctx.run((mailbox) =>
-    writeSystemWake(
+  // The plan and observation are snapshots from before the awaits above; the container may have taken a turn since.
+  const wrote = await ctx.run((mailbox) => {
+    const current = {
+      dueCount: mailbox.countDueMessages(),
+      workContinuation: mailbox.readWorkContinuation(),
+      containerState: mailbox.getContainerState(),
+      processingClaimCount: mailbox.getProcessingClaimRows().length,
+    };
+    if (!isBetweenTurns(current, current)) return false;
+    return writeSystemWake(
       mailbox,
       session,
       `${PROVIDER_RETURN_ID_PREFIX}${Date.now()}`,
@@ -145,9 +150,9 @@ export async function sweepProviderReturn(
         `catch up from this thread and your durable notes before acting. If work was underway, continue it; ` +
         `otherwise stay silent.`,
       { kind: 'provider_fallback_return', provider: primaryProvider, from: fallbackProvider },
-    ),
-  );
-  if (wrote === undefined) return false;
+    );
+  });
+  if (!wrote) return false;
 
   if (!sameContainerIdentity(containerIdentityFor(session.id), target)) return true;
   log.warn('provider-return: primary available again — restarting the fallback container', {

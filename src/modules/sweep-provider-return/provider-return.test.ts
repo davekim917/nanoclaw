@@ -22,6 +22,8 @@ vi.mock('child_process', () => {
 
 const state = vi.hoisted(() => ({
   primaryUnavailable: false,
+  fallbackUnavailable: false,
+  liveClaims: 0,
   registered: { containerName: 'nanoclaw-v2-g-1', claimIncarnation: 1 } as {
     containerName: string;
     claimIncarnation: number;
@@ -35,7 +37,7 @@ const outboundWrites = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 
 vi.mock('../../db/provider-health.js', () => ({
   isProviderUnavailable: vi.fn(async (_group: string, provider: string) =>
-    provider === 'claude' ? state.primaryUnavailable : false,
+    provider === 'claude' ? state.primaryUnavailable : state.fallbackUnavailable,
   ),
 }));
 vi.mock('../../container-config.js', () => ({
@@ -92,6 +94,10 @@ function observation(overrides: Partial<ContainerObservation> = {}): ContainerOb
 const wakeRows: Array<Record<string, unknown>> = [];
 function context(overrides: { plan?: Partial<WakePlan>; observed?: ContainerObservation | null } = {}) {
   const mailbox = {
+    countDueMessages: () => 0,
+    readWorkContinuation: () => null,
+    getContainerState: () => ({ provider_executing: 0 }),
+    getProcessingClaimRows: () => Array.from({ length: state.liveClaims }),
     insertDeferredMessageWithContextIfNew: (row: Record<string, unknown>) => {
       wakeRows.push(row);
       return true;
@@ -109,6 +115,8 @@ function context(overrides: { plan?: Partial<WakePlan>; observed?: ContainerObse
 
 beforeEach(() => {
   state.primaryUnavailable = false;
+  state.fallbackUnavailable = false;
+  state.liveClaims = 0;
   state.registered = { containerName: 'nanoclaw-v2-g-1', claimIncarnation: 1 };
   state.ownsOutbound = false;
   state.providerFallback = { provider: 'codex' };
@@ -167,6 +175,20 @@ describe('sweepProviderReturn', () => {
     const readMarker = vi.fn(() => true);
     await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(false);
     expect(readMarker).not.toHaveBeenCalled();
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('stays put when both providers are in cooldown', async () => {
+    state.primaryUnavailable = true;
+    state.fallbackUnavailable = true;
+    await expect(sweepProviderReturn(context(), { readMarker: () => true })).resolves.toBe(false);
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('does not kill a container that took a turn after the observation', async () => {
+    state.liveClaims = 1;
+    await expect(sweepProviderReturn(context(), { readMarker: () => true })).resolves.toBe(false);
+    expect(wakeRows).toHaveLength(0);
     expect(killContainer).not.toHaveBeenCalled();
   });
 
