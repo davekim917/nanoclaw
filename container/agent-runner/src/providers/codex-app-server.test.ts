@@ -14,6 +14,8 @@ import {
   probeCodexThreadHealth,
   readCodexAccountRateLimits,
   readCodexTurnSnapshot,
+  renderCodexMcpServer,
+  STALE_THREAD_RE,
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
@@ -347,6 +349,37 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain('model_reasoning_effort="xhigh"');
     expect(createCodexConfigOverrides({ reasoning_effort: 'max' })).toContain('model_reasoning_effort="max"');
     expect(createCodexConfigOverrides({ reasoning_effort: 'ultra' })).toContain('model_reasoning_effort="ultra"');
+  });
+});
+
+describe('MCP server startup', () => {
+  it('waits for every MCP server instead of the one-second grace', () => {
+    expect(createCodexConfigOverrides()).toContain('mcp_optional_startup_grace_ms=0');
+  });
+
+  it('marks only the built-in nanoclaw server required', () => {
+    expect(renderCodexMcpServer('nanoclaw', { type: 'stdio', command: 'bun', args: ['mcp.ts'] })).toEqual([
+      '[mcp_servers.nanoclaw]',
+      'required = true',
+      'type = "stdio"',
+      'command = "bun"',
+      'args = ["mcp.ts"]',
+    ]);
+    expect(renderCodexMcpServer('exa', { type: 'http', url: 'https://mcp.example.test' })).not.toContain(
+      'required = true',
+    );
+  });
+
+  // A failed required server must throw, not be read as a stale thread that resumes as a fresh one.
+  it.each([
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: nanoclaw: handshake failed',
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: nanoclaw: timed out after 10s',
+  ])('does not treat a required-server failure as a stale thread: %s', (message) => {
+    expect(STALE_THREAD_RE.test(message)).toBe(false);
+  });
+
+  it('still treats a missing thread as stale', () => {
+    expect(STALE_THREAD_RE.test('no rollout found for thread id 01a0caf8-0000-7000-a000-000000000000')).toBe(true);
   });
 });
 

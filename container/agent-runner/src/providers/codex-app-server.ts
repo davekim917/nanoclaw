@@ -636,9 +636,14 @@ export function renderCodexMcpConfigToml(existing: string, servers: Record<strin
   return lines.join('\n');
 }
 
+const NANOCLAW_MCP_SERVER = 'nanoclaw';
+
 export function renderCodexMcpServer(name: string, config: CodexMcpServer): string[] {
   const tomlName = tomlKey(name);
   const lines = [`[mcp_servers.${tomlName}]`];
+  // Fail thread start or resume loudly when the built-in server (send_message, scheduling, every NanoClaw tool)
+  // cannot start, rather than run a turn that cannot act. Other servers stay optional.
+  if (name === NANOCLAW_MCP_SERVER) lines.push('required = true');
   if (config.type === 'http') {
     lines.push(`url = ${tomlBasicString(config.url)}`);
     if (config.headers && Object.keys(config.headers).length > 0) {
@@ -739,6 +744,10 @@ export function createCodexConfigOverrides(
 ): string[] {
   // CLI overrides survive per-spawn config rewrites and fallback-home rotation.
   const overrides = [
+    // Since Codex 0.147.0 MCP servers get about a second before a turn, which then runs without the tools of any
+    // server still starting. Each query spawns a fresh app-server, so every server starts cold; 0 waits for each
+    // one up to its own startup timeout.
+    'mcp_optional_startup_grace_ms=0',
     'features.use_linux_sandbox_bwrap=false',
     'features.goals=true',
     // 256KB: the 32KB default silently truncated the group AGENTS.md. Keep src/codex-project-doc-cap.ts's warn
