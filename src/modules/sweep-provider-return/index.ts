@@ -33,6 +33,8 @@ import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
 const PROVIDER_RETURN_ID_PREFIX = 'provider-return-';
+/** Synchronous on the host's only event loop: a stalled runtime must cost this attempt, not every session. */
+const INSPECT_TIMEOUT_MS = 5_000;
 
 export function isBetweenTurns(
   plan: Pick<WakePlan, 'dueCount' | 'workContinuation'>,
@@ -53,13 +55,20 @@ function readFallbackMarker(containerName: string): boolean {
   const output = execFileSync(
     CONTAINER_RUNTIME_BIN,
     ['inspect', '--format', `{{range .Config.Env}}{{if eq . "${marker}"}}1{{end}}{{end}}`, containerName],
-    { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8', timeout: INSPECT_TIMEOUT_MS },
   );
   return output.trim() === '1';
 }
 
 /** Per session, the last container judged: a container's env cannot change, so each is inspected once. */
 const fallbackMarkerBySession = new Map<string, { containerName: string; onFallback: boolean }>();
+
+function evictEndedContainers(): void {
+  for (const [sessionId, entry] of fallbackMarkerBySession) {
+    if (containerIdentityFor(sessionId)?.containerName !== entry.containerName)
+      fallbackMarkerBySession.delete(sessionId);
+  }
+}
 
 function containerOnFallback(
   sessionId: string,
@@ -70,6 +79,7 @@ function containerOnFallback(
   if (cached?.containerName === containerName) return cached.onFallback;
   try {
     const onFallback = readMarker(containerName);
+    evictEndedContainers();
     fallbackMarkerBySession.set(sessionId, { containerName, onFallback });
     return onFallback;
   } catch (err) {
@@ -80,6 +90,10 @@ function containerOnFallback(
 
 export function _resetProviderReturnForTesting(): void {
   fallbackMarkerBySession.clear();
+}
+
+export function _fallbackMarkerCacheSizeForTesting(): number {
+  return fallbackMarkerBySession.size;
 }
 
 async function noteReturnInThread(session: Session, primaryProvider: string, fallbackProvider: string): Promise<void> {

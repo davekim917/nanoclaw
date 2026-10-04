@@ -62,7 +62,8 @@ vi.mock('../../session-manager.js', () => ({
     }),
 }));
 
-const { _resetProviderReturnForTesting, isBetweenTurns, sweepProviderReturn } = await import('./index.js');
+const { _fallbackMarkerCacheSizeForTesting, _resetProviderReturnForTesting, isBetweenTurns, sweepProviderReturn } =
+  await import('./index.js');
 
 const session = {
   id: 'sess-1',
@@ -206,6 +207,16 @@ describe('sweepProviderReturn', () => {
     await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(false);
     expect(readMarker).toHaveBeenCalledTimes(1);
     expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('drops a cached judgement once its container is gone', async () => {
+    const readMarker = vi.fn((_containerName: string) => false);
+    await sweepProviderReturn(context(), { readMarker });
+    state.registered = { containerName: 'nanoclaw-v2-g-2', claimIncarnation: 2 };
+    const replacement = observation({ containerIdentity: { containerName: 'nanoclaw-v2-g-2', claimIncarnation: 2 } });
+    await sweepProviderReturn(context({ observed: replacement }), { readMarker });
+    expect(readMarker.mock.calls.map(([name]) => name)).toEqual(['nanoclaw-v2-g-1', 'nanoclaw-v2-g-2']);
+    expect(_fallbackMarkerCacheSizeForTesting()).toBe(1);
   });
 
   it('retries an unanswered inspect on the next tick instead of caching it', async () => {

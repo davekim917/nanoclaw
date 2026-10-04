@@ -89,7 +89,9 @@ the host sweep restarts it once the primary has no availability window (the
 `provider-fallback-return` duty, `src/modules/sweep-provider-return/`). It acts
 only between turns — nothing due, no claim, no provider call and no
 continuation turn in flight, re-read in the same mailbox window as the restart's
-wake row — and after provider self-heal in the same
+wake row. As with every sweep kill, a turn that starts in the moment between
+that read and the kill is cut off; its claimed message is reset and retried on
+the fresh container. It runs after provider self-heal in the same
 exclusive chain, so a container self-heal restarts is not restarted twice. The
 thread gets one line:
 
