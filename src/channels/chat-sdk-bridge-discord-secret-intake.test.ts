@@ -216,7 +216,7 @@ describe('Discord secret intake', () => {
     const url = await startLocalWebhookServer(adapter as never, setup(hooks()), 'bot');
     const post = (body: string) =>
       new Promise<void>((resolve, reject) => {
-        const req = http.request(url, { method: 'POST' }, (res) => {
+        const req = http.request(url, { method: 'POST', headers: { 'x-discord-gateway-token': 'bot' } }, (res) => {
           res.resume();
           res.on('end', () => resolve());
         });
