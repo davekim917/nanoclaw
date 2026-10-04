@@ -223,7 +223,6 @@ export interface PendingQuestion {
 
 // ── Pending approvals (central DB) ──
 
-/** Every status a pending_approvals row can hold. */
 export const PENDING_APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'expired', 'awaiting_reason'] as const;
 type PendingApprovalStatus = (typeof PENDING_APPROVAL_STATUSES)[number];
 

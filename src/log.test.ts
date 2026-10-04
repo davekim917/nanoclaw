@@ -209,10 +209,35 @@ describe('log never throws on unserializable data', () => {
     expect(out).not.toContain('SECRET');
   });
 
-  it('keeps fields four levels deep in the inspect fallback', () => {
+  it('keeps fields four levels deep when a sibling is a BigInt', () => {
     const err = { n: 1n, a: { b: { c: { d: { code: 'E_DEEP' } } } } };
     log.warn('deep', { err });
     expect(written.join('')).toContain('E_DEEP');
+  });
+
+  it('applies a nested redacting toJSON when a sibling is a BigInt', () => {
+    const err = {
+      n: 1n,
+      creds: {
+        token: 'SECRET',
+        toJSON() {
+          return { token: '[redacted]' };
+        },
+      },
+    };
+    log.warn('nested', { err });
+    const out = written.join('');
+    expect(out).toContain('[redacted]');
+    expect(out).toContain('1n');
+    expect(out).not.toContain('SECRET');
+  });
+
+  it('marks only a true cycle, not a value referenced twice', () => {
+    const shared = { code: 'E_SHARED' };
+    log.warn('dag', { err: { a: shared, b: shared, n: 1n } });
+    const out = written.join('');
+    expect(out.match(/E_SHARED/g)).toHaveLength(2);
+    expect(out).not.toContain('[Circular');
   });
 
   it('survives a Proxy with throwing traps, as a value or as the data bag', () => {
