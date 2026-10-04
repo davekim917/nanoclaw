@@ -23,7 +23,3 @@ export function setPickedProvider(provider: string | undefined): void {
     delete process.env[ENV_KEY];
   }
 }
-
-export function getPickedProvider(): string | undefined {
-  return process.env[ENV_KEY]?.trim().toLowerCase() || undefined;
-}
