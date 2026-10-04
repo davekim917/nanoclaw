@@ -18,7 +18,7 @@ import { log } from './log.js';
 export { EGRESS_NETWORK };
 
 /** Raised when lockdown is requested but can't be established. */
-export class EgressLockdownError extends Error {
+class EgressLockdownError extends Error {
   constructor(reason: string) {
     super(
       `Egress lockdown is on (NANOCLAW_EGRESS_LOCKDOWN=true) but ${reason}. ` +
