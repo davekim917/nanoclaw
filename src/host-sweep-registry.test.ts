@@ -378,6 +378,7 @@ import './modules/sweep-task-escalation/index.js';
 // is reachable from this registration alone.
 import './modules/mcp-oauth/index.js';
 import './modules/sweep-promise-watch/index.js';
+import './modules/sweep-provider-return/index.js';
 import './modules/wiki-admission/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
@@ -1341,6 +1342,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'continuation-wake-eligibility', 'session:plan', 80],
     ['duty', 'container-wake', 'session:wake', 10],
     ['duty', 'provider-self-heal', 'session:health', 10],
+    ['duty', 'provider-fallback-return', 'session:health', 15],
     ['duty', 'idle-task-reap', 'session:health', 20],
     ['duty', 'idle-chat-reap', 'session:health', 30],
     ['duty', 'running-container-sla', 'session:health', 40],
@@ -1398,16 +1400,17 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    // 45 registrations: the 38 from the seam-2 port (37 unique names, one
-    // registered twice — see below) plus six fork additions,
+    // 46 registrations: the 38 from the seam-2 port (37 unique names, one
+    // registered twice — see below) plus seven fork additions,
     // github-token-file-refresh, cli-request-execution-prune,
     // coordination-orphans (seam 4 series A', issue #430),
-    // task-failure-escalation, mcp-oauth-refresh and promise-watch.
-    expect(actual).toHaveLength(45);
+    // task-failure-escalation, mcp-oauth-refresh, promise-watch and
+    // provider-fallback-return.
+    expect(actual).toHaveLength(46);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(44);
+    expect(names.size).toBe(45);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(44);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(45);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1820,7 +1823,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ];
 
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
-    // 45 registrations over 44 names. The seam-2 port is 37 duties in 38
+    // 46 registrations over 45 names. The seam-2 port is 37 duties in 38
     // registrations — S17 is the only one registered twice, once as a
     // session:health duty and once as the post-kill follow-up — plus the four
     // fork duties the upstream seam does not have: T23
@@ -1828,15 +1831,16 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `github-token-file-refresh` (#247) and FORK2 `coordination-orphans`
     // (#430), all three from `sweep-central`, T24
     // `task-failure-escalation` from `sweep-task-escalation`, and FORK4
-    // `mcp-oauth-refresh` from `mcp-oauth`. The numbers here said 39/38/38 from
-    // before those landed; the tuple comparison above was already right, which
-    // is why it never failed.
-    expect(actual).toHaveLength(45);
+    // `mcp-oauth-refresh` from `mcp-oauth`, and FORK6
+    // `provider-fallback-return` from `sweep-provider-return`. The numbers here
+    // said 39/38/38 from before those landed; the tuple comparison above was
+    // already right, which is why it never failed.
+    expect(actual).toHaveLength(46);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(44);
+    expect(names.size).toBe(45);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(44);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(45);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });

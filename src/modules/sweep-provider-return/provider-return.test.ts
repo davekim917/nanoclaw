@@ -1,0 +1,212 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { ContainerObservation, SweepSessionContext, WakePlan } from '../../host-sweep.js';
+import type { Session } from '../../types.js';
+
+const spawns = vi.hoisted(() => [] as string[]);
+vi.mock('child_process', () => {
+  const tripwire = (name: string) => (): never => {
+    spawns.push(name);
+    throw new Error(`provider-return.test: real process spawn attempted (${name})`);
+  };
+  return {
+    exec: tripwire('exec'),
+    execFile: tripwire('execFile'),
+    execFileSync: tripwire('execFileSync'),
+    execSync: tripwire('execSync'),
+    spawn: tripwire('spawn'),
+    spawnSync: tripwire('spawnSync'),
+    fork: tripwire('fork'),
+  };
+});
+
+const state = vi.hoisted(() => ({
+  primaryUnavailable: false,
+  registered: { containerName: 'nanoclaw-v2-g-1', claimIncarnation: 1 } as {
+    containerName: string;
+    claimIncarnation: number;
+  } | null,
+  ownsOutbound: false,
+  providerFallback: { provider: 'codex' } as { provider: string } | undefined,
+}));
+const killContainer = vi.hoisted(() => vi.fn());
+const requestWake = vi.hoisted(() => vi.fn(async () => true));
+const outboundWrites = vi.hoisted(() => [] as Array<Record<string, unknown>>);
+
+vi.mock('../../db/provider-health.js', () => ({
+  isProviderUnavailable: vi.fn(async (_group: string, provider: string) =>
+    provider === 'claude' ? state.primaryUnavailable : false,
+  ),
+}));
+vi.mock('../../container-config.js', () => ({
+  readContainerConfig: () => ({ provider: 'claude', providerFallback: state.providerFallback }),
+}));
+vi.mock('../../container-runner.js', () => ({
+  containerIdentityFor: () => state.registered,
+  containerOwnsOutbound: () => state.ownsOutbound,
+  killContainer,
+  sameContainerIdentity: (
+    a: { containerName: string; claimIncarnation: number } | null,
+    b: { containerName: string; claimIncarnation: number } | null,
+  ) => !!a && !!b && a.containerName === b.containerName && a.claimIncarnation === b.claimIncarnation,
+  sessionStillActive: () => () => true,
+}));
+vi.mock('../../request-wake.js', () => ({ requestWake }));
+vi.mock('../../session-manager.js', () => ({
+  withExistingMailboxSession: async (_g: string, _s: string, action: (m: unknown) => unknown) =>
+    action({
+      readSessionRouting: () => ({ platform_id: 'slack:C1', channel_type: 'slack', thread_id: 'T1' }),
+      writeOutboundDirect: (row: Record<string, unknown>) => outboundWrites.push(row),
+    }),
+}));
+
+const { _resetProviderReturnForTesting, isBetweenTurns, sweepProviderReturn } = await import('./index.js');
+
+const session = {
+  id: 'sess-1',
+  agent_group_id: 'ag-1',
+  agent_provider: null,
+  thread_id: 'T1',
+} as unknown as Session;
+
+const idlePlan: WakePlan = {
+  dueCount: 0,
+  wakePriority: 'interactive',
+  admittedTasks: 0,
+  workContinuation: null,
+  continuationWakeEligible: false,
+  hasOutbound: true,
+};
+
+function observation(overrides: Partial<ContainerObservation> = {}): ContainerObservation {
+  return {
+    containerState: { provider_executing: 0 } as ContainerObservation['containerState'],
+    processingClaimCount: 0,
+    lastOutboundAtMs: 0,
+    lastInboundAtMs: 0,
+    containerIdentity: { containerName: 'nanoclaw-v2-g-1', claimIncarnation: 1 },
+    ...overrides,
+  };
+}
+
+const wakeRows: Array<Record<string, unknown>> = [];
+function context(overrides: { plan?: Partial<WakePlan>; observed?: ContainerObservation | null } = {}) {
+  const mailbox = {
+    insertDeferredMessageWithContextIfNew: (row: Record<string, unknown>) => {
+      wakeRows.push(row);
+      return true;
+    },
+  };
+  return {
+    session,
+    agentGroupId: 'ag-1',
+    agentGroupFolder: 'g',
+    plan: { ...idlePlan, ...overrides.plan },
+    observed: overrides.observed === undefined ? observation() : overrides.observed,
+    run: async (action: (m: unknown) => unknown) => action(mailbox),
+  } as unknown as SweepSessionContext;
+}
+
+beforeEach(() => {
+  state.primaryUnavailable = false;
+  state.registered = { containerName: 'nanoclaw-v2-g-1', claimIncarnation: 1 };
+  state.ownsOutbound = false;
+  state.providerFallback = { provider: 'codex' };
+  killContainer.mockReset();
+  requestWake.mockClear();
+  outboundWrites.length = 0;
+  wakeRows.length = 0;
+  _resetProviderReturnForTesting();
+});
+
+afterEach(() => {
+  expect(spawns).toEqual([]);
+});
+
+describe('isBetweenTurns', () => {
+  it('holds only with nothing due, claimed, executing or running as a continuation', () => {
+    const observed = observation();
+    expect(isBetweenTurns(idlePlan, observed)).toBe(true);
+    expect(isBetweenTurns({ ...idlePlan, dueCount: 1 }, observed)).toBe(false);
+    expect(isBetweenTurns(idlePlan, observation({ processingClaimCount: 1 }))).toBe(false);
+    expect(
+      isBetweenTurns(
+        idlePlan,
+        observation({ containerState: { provider_executing: 1 } as ContainerObservation['containerState'] }),
+      ),
+    ).toBe(false);
+    const running = { phase: 'running' } as WakePlan['workContinuation'];
+    expect(isBetweenTurns({ ...idlePlan, workContinuation: running }, observed)).toBe(false);
+    const queued = { phase: 'queued' } as WakePlan['workContinuation'];
+    expect(isBetweenTurns({ ...idlePlan, workContinuation: queued }, observed)).toBe(true);
+  });
+});
+
+describe('sweepProviderReturn', () => {
+  it('restarts a fallback container between turns once the primary is available, then notes it and respawns', async () => {
+    const readMarker = vi.fn(() => true);
+    await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(true);
+
+    expect(wakeRows).toHaveLength(1);
+    expect(wakeRows[0]).toMatchObject({ onWake: 1 });
+    expect(String(wakeRows[0].content)).toContain('back on claude');
+    expect(killContainer).toHaveBeenCalledTimes(1);
+    const [sessionId, , onExit, intent] = killContainer.mock.calls[0];
+    expect(sessionId).toBe('sess-1');
+    expect(intent).toBe('respawn_after_stop');
+
+    await onExit();
+    expect(outboundWrites).toHaveLength(1);
+    expect(outboundWrites[0]).toMatchObject({ kind: 'chat', platformId: 'slack:C1', threadId: 'T1' });
+    expect(String(outboundWrites[0].content)).toContain('claude is available again');
+    expect(requestWake).toHaveBeenCalledWith(session, 'container-restart', expect.anything());
+  });
+
+  it('leaves the fallback alone while the primary is still in its window', async () => {
+    state.primaryUnavailable = true;
+    const readMarker = vi.fn(() => true);
+    await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(false);
+    expect(readMarker).not.toHaveBeenCalled();
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('never interrupts a turn', async () => {
+    const readMarker = vi.fn(() => true);
+    await expect(
+      sweepProviderReturn(context({ observed: observation({ processingClaimCount: 1 }) }), { readMarker }),
+    ).resolves.toBe(false);
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('ignores a container started on the primary, inspecting it once', async () => {
+    const readMarker = vi.fn(() => false);
+    await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(false);
+    await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(false);
+    expect(readMarker).toHaveBeenCalledTimes(1);
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('retries an unanswered inspect on the next tick instead of caching it', async () => {
+    const readMarker = vi.fn(() => {
+      throw new Error('daemon unreachable');
+    });
+    await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(false);
+    await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(false);
+    expect(readMarker).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not kill a replacement registered since the observation', async () => {
+    state.registered = { containerName: 'nanoclaw-v2-g-2', claimIncarnation: 2 };
+    await expect(sweepProviderReturn(context(), { readMarker: () => true })).resolves.toBe(true);
+    expect(wakeRows).toHaveLength(0);
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
+  it('skips the thread note when a container already owns outbound.db, and still respawns', async () => {
+    await sweepProviderReturn(context(), { readMarker: () => true });
+    state.ownsOutbound = true;
+    await killContainer.mock.calls[0][2]();
+    expect(outboundWrites).toHaveLength(0);
+    expect(requestWake).toHaveBeenCalledTimes(1);
+  });
+});
