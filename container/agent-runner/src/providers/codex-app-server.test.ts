@@ -14,6 +14,10 @@ import {
   probeCodexThreadHealth,
   readCodexAccountRateLimits,
   readCodexTurnSnapshot,
+  renderCodexMcpConfigToml,
+  renderCodexMcpServer,
+  startOrResumeCodexThread,
+  type ThreadParams,
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
@@ -347,6 +351,49 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain('model_reasoning_effort="xhigh"');
     expect(createCodexConfigOverrides({ reasoning_effort: 'max' })).toContain('model_reasoning_effort="max"');
     expect(createCodexConfigOverrides({ reasoning_effort: 'ultra' })).toContain('model_reasoning_effort="ultra"');
+  });
+});
+
+describe('MCP server startup', () => {
+  it('waits for every MCP server instead of the one-second grace', () => {
+    expect(createCodexConfigOverrides()).toContain('mcp_optional_startup_grace_ms=0');
+  });
+
+  it('marks only the built-in nanoclaw server required in the provider config', () => {
+    const toml = renderCodexMcpConfigToml('', {
+      nanoclaw: { type: 'stdio', command: 'bun', args: ['mcp.ts'] },
+      exa: { type: 'http', url: 'https://mcp.example.test' },
+    });
+    expect(toml).toContain('[mcp_servers.nanoclaw]\nrequired = true\ntype = "stdio"');
+    expect(toml.match(/required = true/g)).toHaveLength(1);
+  });
+
+  it('leaves the shared per-server renderer optional, as the peer-mode companion uses it', () => {
+    expect(renderCodexMcpServer('nanoclaw', { type: 'stdio', command: 'bun' })).not.toContain('required = true');
+  });
+
+  const REQUIRED_FAILURES = [
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: nanoclaw: handshake failed',
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: nanoclaw: timed out after 10s',
+  ];
+  const PARAMS: ThreadParams = { model: 'gpt-test', cwd: '/workspace' };
+
+  it.each(REQUIRED_FAILURES)('rejects the resume and keeps the thread when the required server fails: %s', async (message) => {
+    const { server, requests } = fakeAppServer((request) =>
+      request.method === 'thread/resume' ? { error: { code: -32603, message } } : { result: { thread: { id: 'fresh' } } },
+    );
+    await expect(startOrResumeCodexThread(server, 'thread-kept', PARAMS)).rejects.toThrow('required MCP servers');
+    expect(requests.map((r) => r.method)).toEqual(['thread/resume']);
+  });
+
+  it('still starts a fresh thread when the stored thread is gone', async () => {
+    const { server, requests } = fakeAppServer((request) =>
+      request.method === 'thread/resume'
+        ? { error: { code: -32603, message: 'no rollout found for thread id 01a0caf8-0000-7000-a000-000000000000' } }
+        : { result: { thread: { id: 'fresh' } } },
+    );
+    await expect(startOrResumeCodexThread(server, 'thread-gone', PARAMS)).resolves.toBe('fresh');
+    expect(requests.map((r) => r.method)).toEqual(['thread/resume', 'thread/start']);
   });
 });
 
