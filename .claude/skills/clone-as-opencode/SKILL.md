@@ -49,7 +49,7 @@ workflow as Claude and Codex.
 - `provider: "opencode"` is registered. If `src/providers/opencode.ts` is missing, run `/add-opencode` first.
 - `.env` exists and is writable.
 - **You have admin rights in the platform workspace/guild** to create a second bot app for the sibling.
-- **An OpenCode account with a Go or Zen subscription.** Free-tier models work but cap out fast — Go ($5 first month, $10/mo after) is the recommended floor.
+- **An OpenCode account with a Go or Zen subscription.** Free-tier models work but cap out fast — Go (\$5 first month, \$10/mo after) is the recommended floor.
 
 ## Channel selection
 
@@ -585,8 +585,7 @@ Slack allowlist IDs to differ. This step prints unexpected drift before ship.
 SIBLING_FOLDER=${SIBLING_FOLDER}
 SOURCE_FOLDER=${SOURCE_FOLDER}
 
-bash <(cat <<'AUDIT'
-SF="$1"; SR="$2"
+SF="$SOURCE_FOLDER" SR="$SIBLING_FOLDER" bash <(cat <<'AUDIT'
 echo "=== container.json capability diff (identity/provider/runtime fields may differ) ==="
 PARITY_FILTER='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.gitIdentity,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
 diff <(jq -S "$PARITY_FILTER" groups/${SF}/container.json) \
@@ -628,7 +627,7 @@ WHERE mga.agent_group_id='${SR}'
 echo
 echo "Note: runtime parity (actual OneCLI secret assignment + tool surface) requires a warm-up spawn — send any message to the sibling, then verify with: docker exec <container> env | grep -E 'ANTHROPIC_API_KEY|GITHUB_TOKEN|SLACK_BOT_TOKEN'"
 AUDIT
-) "$SOURCE_FOLDER" "$SIBLING_FOLDER"
+)
 ```
 
 A clean audit shows ✅ on the three diff checks; any drift means the inheritance step (5) didn't run or was hand-edited. Fix the offending field and re-run the audit.

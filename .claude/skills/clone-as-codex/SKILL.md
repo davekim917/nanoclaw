@@ -544,8 +544,7 @@ Slack allowlist IDs to differ. This step prints unexpected drift before ship.
 SIBLING_FOLDER=${SIBLING_FOLDER}
 SOURCE_FOLDER=${SOURCE_FOLDER}
 
-bash <(cat <<'AUDIT'
-SF="$1"; SR="$2"
+SF="$SOURCE_FOLDER" SR="$SIBLING_FOLDER" bash <(cat <<'AUDIT'
 echo "=== container.json capability diff (identity/provider/runtime fields may differ) ==="
 PARITY_FILTER='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.gitIdentity,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
 diff <(jq -S "$PARITY_FILTER" groups/${SF}/container.json) \
@@ -587,7 +586,7 @@ WHERE mga.agent_group_id='${SR}'
 echo
 echo "Note: runtime parity (actual OneCLI secret assignment) requires a warm-up spawn — send any message to the sibling, then verify with: docker exec <container> env | grep -E 'ANTHROPIC_API_KEY|GITHUB_TOKEN'"
 AUDIT
-) "$SOURCE_FOLDER" "$SIBLING_FOLDER"
+)
 ```
 
 A clean audit shows ✅ on the three diff checks. Any drift means the inheritance step didn't run or was hand-edited — fix and re-run.
