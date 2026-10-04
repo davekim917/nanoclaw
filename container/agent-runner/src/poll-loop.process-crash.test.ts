@@ -31,7 +31,6 @@ afterEach(() => {
   closeSessionDb();
 });
 
-/** Crashes on the first `crashes` queries, then answers. */
 class CrashingProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
   readonly prompts: string[] = [];
