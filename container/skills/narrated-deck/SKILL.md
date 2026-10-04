@@ -40,7 +40,7 @@ the sentence is about.
 6. **Deliver** with `send_file`: the `.mp4` first (it plays inline on every
    device), then the `.html` player, then the `-1.5x.mp4` if you made one.
    Caption: the one-line headline plus the running time, e.g.
-   `Weekly review w/e 9/26 — \$4.2M gross, −\$0.1M vs forecast. 2:18 narrated.`
+   `Weekly review w/e 9/26 — gross 4.2M (USD), 0.1M under forecast. 2:18 narrated.`
    Never send only the files: the caption must carry the headline so the user
    can triage without pressing play.
 
@@ -114,7 +114,7 @@ there, not as failures.
   | an acronym said as letters (`QBR`) | Q-B-R |
 
 - **Round in speech, keep precision on screen.** Say "about three hundred
-  thousand"; show `−\$308K`.
+  thousand"; show `−&#36;308K` on the slide.
 - **End with what needs the listener** — a decision, an ask, or "nothing needs
   you this week".
 
@@ -142,23 +142,23 @@ slide number is added for you.
 <p class="lede">One muted supporting line.</p>
 
 <!-- One huge number -->
-<div class="big"><div class="v">\$4.2M</div><div class="l">gross revenue</div></div>
+<div class="big"><div class="v">&#36;4.2M</div><div class="l">gross revenue</div></div>
 
 <!-- KPI tiles (2–4) -->
 <div class="kpis">
-  <div class="kpi"><div class="l">Gross</div><div class="v">\$4.2M</div><div class="d down">−\$0.1M vs forecast</div></div>
+  <div class="kpi"><div class="l">Gross</div><div class="v">&#36;4.2M</div><div class="d down">−&#36;0.1M vs forecast</div></div>
 </div>
 
 <!-- Horizontal bars: --w is the bar length as a % of the largest magnitude -->
 <div class="bars">
-  <div class="bar down"><span class="l">Wholesale</span><span class="track"><i style="--w:100%"></i></span><span class="v down">−\$49K</span></div>
-  <div class="bar up"><span class="l">Retail</span><span class="track"><i style="--w:82%"></i></span><span class="v up">+\$40K</span></div>
+  <div class="bar down"><span class="l">Wholesale</span><span class="track"><i style="--w:100%"></i></span><span class="v down">−&#36;49K</span></div>
+  <div class="bar up"><span class="l">Retail</span><span class="track"><i style="--w:82%"></i></span><span class="v up">+&#36;40K</span></div>
 </div>
 
 <!-- Scannable table -->
 <table class="scan">
   <thead><tr><th>Vertical</th><th class="n">Revenue</th><th class="n">vs forecast</th></tr></thead>
-  <tbody><tr class="hl"><td>Wholesale</td><td class="n">\$1.2M</td><td class="n down">−1.7%</td></tr></tbody>
+  <tbody><tr class="hl"><td>Wholesale</td><td class="n">&#36;1.2M</td><td class="n down">−1.7%</td></tr></tbody>
 </table>
 
 <!-- Callout and short points (≤ 3) -->
@@ -167,7 +167,7 @@ slide number is added for you.
 
 <!-- Layout -->
 <div class="cols"> … </div>        <!-- two equal columns; .cols.wide-left = 3:2 -->
-<div class="row"> … </div>         <!-- inline row; <span class="tag up">+\$0.2M vs plan</span> -->
+<div class="row"> … </div>         <!-- inline row; <span class="tag up">+&#36;0.2M vs plan</span> -->
 ```
 
 Text utilities: `.up .down .flat .warn .accent .muted`.
