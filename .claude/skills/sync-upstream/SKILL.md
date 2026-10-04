@@ -151,8 +151,10 @@ Gate at about 2.5 minutes after the restart. INFO lines go to `logs/nanoclaw.log
 
 ```bash
 cd $R && read C L0 E0 < <scratchpad>/log-checkpoint
-since() { { if [ "$(stat -c %Z "$1.1" 2>/dev/null || echo 0)" -lt "$C" ]; then tail -n +$(($2 + 1)) "$1"; else tail -n +$(($2 + 1)) "$1.1"; cat "$1"; fi; } | sed 's/\x1b\[[0-9;]*m//g'; }
-{ since logs/nanoclaw.log $L0; since logs/nanoclaw.error.log $E0; } > <scratchpad>/since-restart.log
+for pair in "logs/nanoclaw.log:$L0" "logs/nanoclaw.error.log:$E0"; do
+  f=${pair%:*}; n=${pair##*:}
+  if [ "$(stat -c %Z "$f.1" 2>/dev/null || echo 0)" -lt "$C" ]; then tail -n +$((n + 1)) "$f"; else tail -n +$((n + 1)) "$f.1"; cat "$f"; fi
+done | sed 's/\x1b\[[0-9;]*m//g' > <scratchpad>/since-restart.log
 ```
 
 In `since-restart.log`:
@@ -176,7 +178,7 @@ Only `better-sqlite3` is ABI-bound in the host tree. Rebuilding it while the hos
 1. Checkpoint the logs as in §4, then stop the timers that run this checkout's code and the service. Expect about a minute of planned downtime.
 
    ```bash
-   systemctl list-units --type=timer --state=active --plain --no-legend 'nanoclaw-*' | awk '{print $1}' > <scratchpad>/stopped-timers
+   systemctl list-units --type=timer --state=active --plain --no-legend 'nanoclaw-*' | cut -d' ' -f1 > <scratchpad>/stopped-timers
    sudo systemctl stop $(cat <scratchpad>/stopped-timers) nanoclaw-v2
    ```
 
