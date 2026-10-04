@@ -83,6 +83,36 @@ returns to the primary — no cron, no probe, no operator action. Cooldowns
 escalate on the failure streak (15m → 30m → 1h → … → 6h cap), and a completed
 turn on the primary clears the streak.
 
+A container already running on the fallback does not wait for its next spawn.
+A busy thread can keep one container alive for a day, long past the window, so
+the host sweep restarts it once the primary has no availability window (the
+`provider-fallback-return` duty, `src/modules/sweep-provider-return/`). It acts
+only between turns — nothing due, no claim, no provider call and no
+continuation turn in flight, re-read in the same mailbox window as the restart's
+wake row. As with every sweep kill, a turn that starts in the moment between
+that read and the kill is cut off; its claimed message is reset and retried on
+the fresh container. It runs after provider self-heal in the same
+exclusive chain, so a container self-heal restarts is not restarted twice. The
+thread gets one line:
+
+> ⚙️ claude is available again — this thread is moving back from codex.
+
+The line is skipped when the primary's outage is re-recorded before the old
+container exits. The fresh container wakes on an `on_wake` row telling the
+agent why it was restarted and that, back on the primary, its conversation
+memory does not cover the fallback period. The sweep tells a fallback container
+from a primary one by the `NANOCLAW_PROVIDER_FALLBACK_APPLIED` marker in the
+container's own env, so an adopted container started by an earlier host is
+judged the same way.
+
+If the primary is still failing, that turn re-records the outage and the
+session goes back to the fallback. The cooldown does **not** escalate across
+these returns: a spawn that picks the primary clears the failure streak before
+the primary has answered (`markProviderAvailable` in `spawnContainer`). So an
+outage with no measured reset costs a busy fallback session one restart, one
+failing turn and one thread line about every 15 minutes; a quota window with a
+measured reset holds the session on the fallback until that reset.
+
 **The operator override.** Typing `-m <a primary-provider model>` while the
 session is serving from the fallback now asks for the primary back. The
 container cannot route itself — the provider is chosen at spawn, from
@@ -104,6 +134,7 @@ re-recorded from 15m and the session goes straight back to the fallback.
 | Rungs 1–3, the chat lines         | `container/agent-runner/src/poll-loop.ts`        |
 | Availability windows, backoff     | `src/db/provider-health.ts`                      |
 | Spawn-time routing decision       | `src/provider-fallback.ts`                       |
+| Return of a live fallback session | `src/modules/sweep-provider-return/index.ts`     |
 | `provider_unavailable` handler    | `src/modules/provider-fallback/handler.ts`       |
 | `provider_retry_primary` handler  | `src/modules/provider-fallback/retry-primary.ts` |
 | `codex_account_exhausted` handler | `src/modules/provider-fallback/codex-account.ts` |

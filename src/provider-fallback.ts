@@ -33,12 +33,14 @@ export function applyProviderFallbackRuntime(
 }
 
 /** A marker separate from the provider: the target can equal the file provider when the session's differs. */
+export const PROVIDER_FALLBACK_APPLIED_ENV = 'NANOCLAW_PROVIDER_FALLBACK_APPLIED';
+
 export function providerFallbackRuntimeEnv(
   decision: Pick<SpawnProviderDecision, 'provider' | 'model'>,
 ): Record<string, string> {
   return {
     NANOCLAW_PROVIDER_OVERRIDE: decision.provider,
-    NANOCLAW_PROVIDER_FALLBACK_APPLIED: '1',
+    [PROVIDER_FALLBACK_APPLIED_ENV]: '1',
     ...(decision.model ? { NANOCLAW_MODEL_OVERRIDE: decision.model } : {}),
   };
 }

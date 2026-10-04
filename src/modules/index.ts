@@ -48,6 +48,7 @@ import './sweep-repo-fence/index.js';
 import './sweep-scheduled-move/index.js';
 import './wiki-admission/index.js';
 import './sweep-container-health/index.js';
+import './sweep-provider-return/index.js';
 import './sweep-egress/index.js';
 import './sweep-claims/index.js';
 // No second import for sweep-storage: its duty registration rides the import above.
