@@ -627,23 +627,25 @@ function stripExistingMcpServers(toml: string): string {
   return collapsed.join('\n').trimEnd();
 }
 
+const NANOCLAW_MCP_SERVER = 'nanoclaw';
+
 export function renderCodexMcpConfigToml(existing: string, servers: Record<string, CodexMcpServer>): string {
   const base = stripExistingMcpServers(existing);
   const lines: string[] = base ? [base, '', MCP_MARKER, ''] : [];
   for (const [name, config] of Object.entries(servers)) {
-    lines.push(...renderCodexMcpServer(name, config), '');
+    const rendered = renderCodexMcpServer(name, config);
+    // Fail thread start or resume loudly when the built-in server (send_message, scheduling, every NanoClaw tool)
+    // cannot start, rather than run a turn that cannot act. Other servers stay optional, and so does the peer-mode
+    // companion's copy of this server.
+    if (name === NANOCLAW_MCP_SERVER) rendered.splice(1, 0, 'required = true');
+    lines.push(...rendered, '');
   }
   return lines.join('\n');
 }
 
-const NANOCLAW_MCP_SERVER = 'nanoclaw';
-
 export function renderCodexMcpServer(name: string, config: CodexMcpServer): string[] {
   const tomlName = tomlKey(name);
   const lines = [`[mcp_servers.${tomlName}]`];
-  // Fail thread start or resume loudly when the built-in server (send_message, scheduling, every NanoClaw tool)
-  // cannot start, rather than run a turn that cannot act. Other servers stay optional.
-  if (name === NANOCLAW_MCP_SERVER) lines.push('required = true');
   if (config.type === 'http') {
     lines.push(`url = ${tomlBasicString(config.url)}`);
     if (config.headers && Object.keys(config.headers).length > 0) {

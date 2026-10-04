@@ -14,6 +14,7 @@ import {
   probeCodexThreadHealth,
   readCodexAccountRateLimits,
   readCodexTurnSnapshot,
+  renderCodexMcpConfigToml,
   renderCodexMcpServer,
   startOrResumeCodexThread,
   type ThreadParams,
@@ -358,17 +359,17 @@ describe('MCP server startup', () => {
     expect(createCodexConfigOverrides()).toContain('mcp_optional_startup_grace_ms=0');
   });
 
-  it('marks only the built-in nanoclaw server required', () => {
-    expect(renderCodexMcpServer('nanoclaw', { type: 'stdio', command: 'bun', args: ['mcp.ts'] })).toEqual([
-      '[mcp_servers.nanoclaw]',
-      'required = true',
-      'type = "stdio"',
-      'command = "bun"',
-      'args = ["mcp.ts"]',
-    ]);
-    expect(renderCodexMcpServer('exa', { type: 'http', url: 'https://mcp.example.test' })).not.toContain(
-      'required = true',
-    );
+  it('marks only the built-in nanoclaw server required in the provider config', () => {
+    const toml = renderCodexMcpConfigToml('', {
+      nanoclaw: { type: 'stdio', command: 'bun', args: ['mcp.ts'] },
+      exa: { type: 'http', url: 'https://mcp.example.test' },
+    });
+    expect(toml).toContain('[mcp_servers.nanoclaw]\nrequired = true\ntype = "stdio"');
+    expect(toml.match(/required = true/g)).toHaveLength(1);
+  });
+
+  it('leaves the shared per-server renderer optional, as the peer-mode companion uses it', () => {
+    expect(renderCodexMcpServer('nanoclaw', { type: 'stdio', command: 'bun' })).not.toContain('required = true');
   });
 
   const REQUIRED_FAILURES = [
