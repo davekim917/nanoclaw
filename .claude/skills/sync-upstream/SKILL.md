@@ -139,14 +139,30 @@ cd $R && node -e "const D=require('better-sqlite3'); new D('data/v2.db',{readonl
 
 Deploy with `scripts/deploy.sh` or the Discord `/deploy` command. It pulls, builds the host, rebuilds the agent image when `container/` changed, and restarts. Its crash guard rolls back a boot crash, but it doesn't arm when the deploy ships a migration. A host restart leaves running containers for the new host to adopt; boot stops only the ones it cannot adopt.
 
-Gate at about 2.5 minutes after the restart. Read the logs from this boot's last `OneCLI preflight ok` line on, with ANSI codes stripped. Rotation is daily `copytruncate`, so a whole-file grep proves nothing.
+Before launching the deploy, checkpoint both logs. Rotation is a daily `copytruncate`, so a whole-file grep proves nothing:
 
-- `OneCLI preflight ok` is present for this boot.
-- `logs/nanoclaw.error.log` has no `ERROR` line since the restart. Investigate any WARN class not seen in the previous day before calling it green.
+```bash
+cd $R && L0=$(wc -l < logs/nanoclaw.log) && E0=$(wc -l < logs/nanoclaw.error.log)
+```
+
+Gate at about 2.5 minutes after the restart. INFO lines go to `logs/nanoclaw.log` and WARN and above to `logs/nanoclaw.error.log`, so read both from their checkpoints. A file shorter than its checkpoint has rotated; its earlier lines are in `.1`:
+
+```bash
+since() { { if [ "$(wc -l < "$1")" -ge "$2" ]; then tail -n +$(($2 + 1)) "$1"; else tail -n +$(($2 + 1)) "$1.1"; cat "$1"; fi; } | sed 's/\x1b\[[0-9;]*m//g'; }
+{ since logs/nanoclaw.log $L0; since logs/nanoclaw.error.log $E0; } > <scratchpad>/since-restart.log
+```
+
+In `since-restart.log`:
+
+- `OneCLI preflight ok` is present.
+- No line is at level ERROR (`grep -c '^\[[^]]*\] ERROR'` prints 0). Investigate any WARN class not seen in the previous day before calling it green.
+- `Host sweep duty failed`, `Host sweep mailbox unopenable` and `tick threw` are absent.
+- `Reconciled sessions at startup` shows `stopped=0`, or each stopped container has its own `Stopped an unadoptable container at startup` or `Adoption refused` line giving the reason. An interrupted session with work in flight gets `Wrote host-restart accountability note`.
+
+Outside the logs:
+
 - `systemctl show -p NRestarts --value nanoclaw-v2` prints 0.
-- `Reconciled sessions at startup` reports the running containers as `adopted`; a nonzero `stopped` is explained by the `Boot quiescence scope` line before it.
 - The next spawn succeeds: a container started after the restart appears in `docker ps --filter name=nanoclaw-v2- --format '{{.Names}} {{.Status}}'`. `OneCLI gateway applied` is logged before the spawn, so on its own it doesn't prove one.
-- `Host sweep duty failed`, `Host sweep mailbox unopenable` and `tick threw` don't appear since the restart.
 
 To roll back, revert the merge commit through a PR and redeploy. Restore the DB backup if a migration ran.
 
@@ -154,7 +170,7 @@ To roll back, revert the merge commit through a PR and redeploy. Restore the DB 
 
 Only `better-sqlite3` is ABI-bound in the host tree. Rebuilding it while the host runs overwrites its mapped `.node` file in place and segfaults the service, so stop first:
 
-1. Stop the timers that run this checkout's code, then the service. Expect about a minute of planned downtime.
+1. Checkpoint the logs as in §4, then stop the timers that run this checkout's code and the service. Expect about a minute of planned downtime.
 
    ```bash
    T=$(systemctl list-units --type=timer --state=active --plain --no-legend 'nanoclaw-*' | awk '{print $1}')
