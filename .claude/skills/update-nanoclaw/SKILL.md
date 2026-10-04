@@ -552,7 +552,7 @@ Tell the user:
   additional restart command.
 - Otherwise, restart the service to apply changes (after rebuild/backup if flagged above). Detect platform with `uname -s`:
   - **macOS (Darwin)**: `launchctl kickstart -k gui/$(id -u)/com.nanoclaw` (or derive the slug: `source setup/lib/install-slug.sh && launchctl kickstart -k gui/$(id -u)/$(launchd_label)`)
-  - **Linux (systemd user)**: detect the service name with `systemctl --user list-units --type=service | grep nanoclaw | awk '{print $1}'`, then `systemctl --user restart <detected-name>` (or `source setup/lib/install-slug.sh && systemctl --user restart $(systemd_unit)`)
+  - **Linux (systemd user)**: detect the service name with `systemctl --user list-units --type=service --plain --no-legend 'nanoclaw*' | cut -d' ' -f1`, then `systemctl --user restart <detected-name>` (or `source setup/lib/install-slug.sh && systemctl --user restart $(systemd_unit)`)
   - **Linux (systemd system)**: `sudo systemctl restart nanoclaw-v2`
   - **Manual** (no service found): restart `pnpm run dev`
 

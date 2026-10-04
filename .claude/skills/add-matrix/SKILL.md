@@ -59,7 +59,7 @@ node -e '
   if (!dir) { console.log("Matrix adapter not installed"); process.exit(0); }
   const f = path.join(root, dir, "node_modules/@beeper/chat-adapter-matrix/dist/index.js");
   fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace(
-    /from "(matrix-js-sdk\/lib\/[^"]+?)(?<!\.js)"/g, "from \"$1.js\""
+    /from "(matrix-js-sdk\/lib\/[^"]+?)(?<!\.js)"/g, (_, spec) => `from "${spec}.js"`
   ));
   console.log("Patched", f);
 '

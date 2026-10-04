@@ -338,7 +338,7 @@ mkdir -p "${IMPORT_ROOT}/workspace"
 
 memory_manifest() {
   (
-    cd "$1"
+    cd "${MANIFEST_DIR}"
     [ ! -f MEMORY.md ] || sha256sum MEMORY.md
     [ ! -L MEMORY.md ] || printf 'SYMLINK MEMORY.md -> %s\n' "$(readlink MEMORY.md)"
     if [ -d memory ]; then
@@ -347,7 +347,7 @@ memory_manifest() {
     fi
   )
 }
-memory_manifest "${OPENCLAW_WORKSPACE}" > "${SOURCE_MANIFEST}"
+MANIFEST_DIR="${OPENCLAW_WORKSPACE}" memory_manifest > "${SOURCE_MANIFEST}"
 test -s "${SOURCE_MANIFEST}" || { echo "ERROR: no OpenClaw memory files found"; exit 1; }
 
 # Preserve the original relative layout and metadata. Never copy through the
@@ -362,7 +362,7 @@ test -s "${SOURCE_MANIFEST}" || { echo "ERROR: no OpenClaw memory files found"; 
   cmp "${OPENCLAW_WORKSPACE}/MEMORY.md" "${IMPORT_ROOT}/workspace/MEMORY.md"
 [ ! -d "${OPENCLAW_WORKSPACE}/memory" ] || \
   diff -qr "${OPENCLAW_WORKSPACE}/memory" "${IMPORT_ROOT}/workspace/memory"
-memory_manifest "${IMPORT_ROOT}/workspace" > "${IMPORT_MANIFEST}"
+MANIFEST_DIR="${IMPORT_ROOT}/workspace" memory_manifest > "${IMPORT_MANIFEST}"
 diff -u "${SOURCE_MANIFEST}" "${IMPORT_MANIFEST}"
 ```
 

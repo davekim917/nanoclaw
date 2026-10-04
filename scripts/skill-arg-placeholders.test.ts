@@ -12,17 +12,6 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SKILL_ROOTS = ['.claude/skills', 'container/skills'];
 const PLACEHOLDER = /(?<![^\\]\\)(?<!^\\)\$\d/m;
 
-// Shrink-only: unescaped placeholders per skill when the check landed. A fix lowers its count here.
-const KNOWN: Record<string, number> = {
-  '.claude/skills/add-matrix/SKILL.md': 1,
-  '.claude/skills/add-vercel/SKILL.md': 1,
-  '.claude/skills/clone-as-codex/SKILL.md': 2,
-  '.claude/skills/clone-as-opencode/SKILL.md': 4,
-  '.claude/skills/migrate-from-openclaw/SKILL.md': 1,
-  '.claude/skills/update-nanoclaw/SKILL.md': 1,
-  'container/skills/narrated-deck/SKILL.md': 12,
-};
-
 /** Every SKILL.md under the roots, at any depth: a skill can ship nested payloads it installs elsewhere. */
 function skillFiles(dir: string): string[] {
   return readdirSync(join(ROOT, dir), { withFileTypes: true }).flatMap((entry) => {
@@ -58,7 +47,7 @@ describe('placeholder matcher', () => {
 });
 
 describe('SKILL.md positional placeholders', () => {
-  it('matches the shrink-only counts exactly', () => {
-    expect(placeholderCounts()).toEqual(KNOWN);
+  it('no skill has an unescaped one', () => {
+    expect(placeholderCounts()).toEqual({});
   });
 });
