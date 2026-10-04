@@ -141,20 +141,18 @@ export async function sweepProviderReturn(
   }
 
   const fallbackProvider = containerConfig.providerFallback?.provider ?? 'its fallback provider';
-  // A replacement registered since the observation is a different container; claim the phase so no later duty acts
-  // on the stale observation either.
-  if (!sameContainerIdentity(containerIdentityFor(session.id), target)) return true;
-
-  // The plan and observation are snapshots from before the awaits above; the container may have taken a turn since.
-  const wrote = await ctx.run((mailbox) => {
+  // The plan and observation are snapshots from before the awaits above: the container may have been replaced or
+  // taken a turn since, and both are rechecked with no yield before the wake row.
+  const outcome = await ctx.run((mailbox) => {
+    if (!sameContainerIdentity(containerIdentityFor(session.id), target)) return 'replaced';
     const current = {
       dueCount: mailbox.countDueMessages(),
       workContinuation: mailbox.readWorkContinuation(),
       containerState: mailbox.getContainerState(),
       processingClaimCount: mailbox.getProcessingClaimRows().length,
     };
-    if (!isBetweenTurns(current, current)) return false;
-    return writeSystemWake(
+    if (!isBetweenTurns(current, current)) return 'busy';
+    writeSystemWake(
       mailbox,
       session,
       `${PROVIDER_RETURN_ID_PREFIX}${Date.now()}`,
@@ -165,8 +163,11 @@ export async function sweepProviderReturn(
         `otherwise stay silent.`,
       { kind: 'provider_fallback_return', provider: primaryProvider, from: fallbackProvider },
     );
+    return 'written';
   });
-  if (!wrote) return false;
+  // A replacement claims the phase so no later duty acts on the stale observation either.
+  if (outcome === 'replaced') return true;
+  if (outcome !== 'written') return false;
 
   if (!sameContainerIdentity(containerIdentityFor(session.id), target)) return true;
   log.warn('provider-return: primary available again — restarting the fallback container', {

@@ -228,6 +228,18 @@ describe('sweepProviderReturn', () => {
     expect(readMarker).toHaveBeenCalledTimes(2);
   });
 
+  it('writes no wake row for a container replaced while the mailbox window opened', async () => {
+    const replacingContext = context();
+    const open = replacingContext.run;
+    (replacingContext as { run: typeof open }).run = (action) => {
+      state.registered = { containerName: 'nanoclaw-v2-g-2', claimIncarnation: 2 };
+      return open(action);
+    };
+    await expect(sweepProviderReturn(replacingContext, { readMarker: () => true })).resolves.toBe(true);
+    expect(wakeRows).toHaveLength(0);
+    expect(killContainer).not.toHaveBeenCalled();
+  });
+
   it('does not kill a replacement registered since the observation', async () => {
     state.registered = { containerName: 'nanoclaw-v2-g-2', claimIncarnation: 2 };
     await expect(sweepProviderReturn(context(), { readMarker: () => true })).resolves.toBe(true);
