@@ -1,4 +1,3 @@
-/** Proves the production barrel, not a direct import of this module, registers the duty. */
 import { expect, it, vi } from 'vitest';
 
 const spawns = vi.hoisted(() => [] as string[]);

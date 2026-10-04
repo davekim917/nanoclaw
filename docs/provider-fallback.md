@@ -100,11 +100,18 @@ thread gets one line:
 The line is skipped when the primary's outage is re-recorded before the old
 container exits. The fresh container wakes on an `on_wake` row telling the
 agent why it was restarted and that, back on the primary, its conversation
-memory does not cover the fallback period. The sweep tells a fallback container from a primary one by the
-`NANOCLAW_PROVIDER_FALLBACK_APPLIED` marker in the container's own env, so an
-adopted container started by an earlier host is judged the same way. If the
-primary is still failing, that turn re-records the outage and the session goes
-back to the fallback under the escalated cooldown.
+memory does not cover the fallback period. The sweep tells a fallback container
+from a primary one by the `NANOCLAW_PROVIDER_FALLBACK_APPLIED` marker in the
+container's own env, so an adopted container started by an earlier host is
+judged the same way.
+
+If the primary is still failing, that turn re-records the outage and the
+session goes back to the fallback. The cooldown does **not** escalate across
+these returns: a spawn that picks the primary clears the failure streak before
+the primary has answered (`markProviderAvailable` in `spawnContainer`). So an
+outage with no measured reset costs a busy fallback session one restart, one
+failing turn and one thread line about every 15 minutes; a quota window with a
+measured reset holds the session on the fallback until that reset.
 
 **The operator override.** Typing `-m <a primary-provider model>` while the
 session is serving from the fallback now asks for the primary back. The
