@@ -1,229 +1,196 @@
 ---
 name: sync-upstream
-description: "Bring upstream nanocoai/nanoclaw work into this production-critical, heavily customized fork WITHOUT a big-bang merge — read-only merge-tree triage, theme-by-theme ports via scratch worktree + PR + Codex loop, and a deploy sequence with a spawn-success gate. Use instead of running /update-nanoclaw directly. Triggers: 'sync upstream', 'update nanoclaw', 'catch up with upstream', 'what did upstream ship', 'we are N commits behind', 'cherry-pick upstream', 'Node upgrade on the host'."
+description: "Bring upstream nanocoai/nanoclaw work into this production-critical, heavily customized fork without merging upstream's branch: triage what upstream landed since the ratchet pin, ship safe fixes through a weekly fast lane, port larger themes one PR at a time, then re-pin. Use instead of /update-nanoclaw. Triggers: 'sync upstream', 'update nanoclaw', 'catch up with upstream', 'what did upstream ship', 'cherry-pick upstream', 'upstream fast lane', 'Node upgrade on the host'."
 ---
 
-# Sync Upstream (fork-safe front-end to `/update-nanoclaw`)
+# Sync Upstream
 
-This fork diverged from upstream trunk in 2026 around the spawn, sweep, router, delivery, session-manager and poll-loop paths, on a host the two production workgroups use daily. A full `git merge upstream/main` is never attempted directly — it would touch every one of the fork's own architectural seams at once. This skill replaces "merge and resolve" with "inventory, decide per theme, port one theme per PR, deploy with a gate". `/update-nanoclaw` is still the tool for the cherry-pick mechanics and the A–F audit; this skill decides _what_ to feed it and how to land it without downtime.
+This fork ports upstream work into fork-owned code and never merges upstream's branch. `/update-nanoclaw` is the wrong tool here: upstream's version merges `upstream/main`, stops this install's agent containers at cutover, runs the full host suite on this host and resets the live branch to a locally staged commit, and the fork's own copy dry-run merges inside the live checkout. `/migrate-nanoclaw` assumes customizations small enough to replay onto a clean upstream.
 
-**Status (2026-09-06, program closed):** the September sync landed 155 PRs with the upstream-ownership ratchet at Δ 0 throughout. **Ignore "N commits behind"** — the fork ports upstream work into fork-owned code rather than merging the upstream branch, so the merge base never advances and that counter only ever grows. The numbers that mean something: the ratchet manifest (`src/upstream-ratchet.json`, `pnpm run ratchet:report`) pins the upstream commit the fork's 959 upstream-owned files are compared against (690 diverged, 132,445 diff units — a **level** to hold, not a debt to pay down), and `pinBehind` in the daily upstream-check task's report is how far upstream has moved past that pin. Re-pin with `pnpm run ratchet:report -- --upstream <rev>` only as part of a deliberate port, never to make a number smaller.
+A sync is a cycle with one cursor, the ratchet pin (`upstream` in `src/upstream-ratchet.json`). Triage everything upstream landed on `main` since the pin, ship what is safe, queue the rest as issues, then re-pin to the upstream head you triaged. Run one cycle a week; ship a security fix as soon as triage finds it.
 
-**Standing decisions (do not re-litigate without a trigger):** the agent-mailbox seam and the host-lifecycle/host-sweep-duty-registry seam are **ADOPTED**, built in the fork's own shape rather than upstream's literal `src/mailbox/`/`src/drivers/` code (`docs/specs/upstream-mailbox-seam/plan.md`, `docs/specs/upstream-host-sweep-seam/plan.md`). All host session-DB access funnels through `src/modules/mailbox/` — the host allowlist is down to the two documented KEEP-PATCH exemptions — and `src/host-sweep.ts` is driver + registry only, with duties registered in `src/modules/sweep-*/` behind a 41-entry pinned registration table (`src/host-sweep-registry.test.ts`). When an upstream change lands in one of these areas, **port it INTO the seam**: take upstream's driver/façade shape, keep the fork's own registrations and module bodies, and re-run the drift tests (§1 below) — never hand-merge a seam file directly.
+## Settled decisions
 
-**Shipped, not pending:** seam 3 (async central DB via `centralTransaction` / `insertOrAdopt` / the raw-db ratchet), seam 4 (restart survival: host instance lease, session claims with incarnation, boot door D2 adopting survivors — proven on three live restarts), and the mailbox seam are all on main. Issue #234's "declined" record is historical. **Slack Agents manager-app provisioning is impossible for this install** (partner enrollment + Enterprise-only `admin.apps:*` scopes); hot-attach of an operator-created app via `ncl slack workspaces add` (#496) is the supported path, and in-chat rooms were closed as already covered by the Slack UI plus auto-wire. Do not re-plan any of these. **Nothing deploys without the operator's explicit go** — triage, plans and PRs may proceed ahead of that, restarts don't.
+Reopen one only when upstream ships something that changes its premise.
 
-## When to use
+- **No merges of upstream's branch.** Distance is the ratchet (`pnpm run ratchet:report`, [docs/upstream-ratchet.md](../../../docs/upstream-ratchet.md)). The merge base never advances, so "commits behind" only grows and measures nothing.
+- **Seams are ported into, never hand-merged.** The mailbox seam (`src/modules/mailbox/`, `src/mailbox/`), the host-sweep driver and duty registry (`src/host-sweep.ts`, `src/modules/sweep-*/`), the async central-DB driver and the host lifecycle (`src/host-lifecycle-seam/`) are built in the fork's shape. An upstream change there takes upstream's driver or façade shape and keeps the fork's registrations and module bodies, with the drift tests in §3 green before and after.
+- **The Slack adapter is the fork's.** Port single upstream fixes into `src/channels/slack.ts`; never copy upstream's file over it. Slack manager-app provisioning is impossible for this install; `ncl slack workspaces add` (hot-attach) is the supported path.
+- **`package.json` `version` stays the fork's.** A port that moves it trips the upgrade tripwire and halts the host at its next build and restart.
 
-- The daily "Upstream Check" report says N commits behind, or the user asks what upstream shipped.
-- A specific upstream fix/feature is wanted (security, CVE, adapter fix, small feature).
-- Any host runtime change that upstream forces (Node major, better-sqlite3, pnpm major).
+## 1. Preflight
 
-Not for: skill-content refreshes (`/update-skills`), first-time setup, or fresh installs where a clean merge applies.
-
-## Workflow
-
-### 1. Preflight (read-only, ~2 min)
+Read-only, from the live checkout:
 
 ```bash
-cd /home/ubuntu/nanoclaw-v2
-git status --porcelain            # must be empty; never stash -u here
-git fetch upstream --prune
-BASE=$(git merge-base HEAD upstream/main)
-git rev-list --count $BASE..upstream/main; git rev-list --count $BASE..HEAD
-git merge-tree --write-tree --name-only HEAD upstream/main > /tmp/mt.txt; grep -c '^CONFLICT' /tmp/mt.txt
+R=/home/ubuntu/nanoclaw-v2
+git -C $R status --porcelain --untracked-files=no   # must print nothing
+git -C $R fetch upstream --prune
+git -C $R fetch origin --prune
+PIN=$(node -p "require('$R/src/upstream-ratchet.json').upstream")
+UP=$(git -C $R rev-parse upstream/main)
+git -C $R rev-list --first-parent --count $PIN..$UP
+git -C $R log --first-parent --format='%h %cs %s' $PIN..$UP
 ```
 
-`git merge-tree` is an in-memory merge: it never touches the live working tree. Do **not** run the `git merge --no-commit` dry-run from `/update-nanoclaw` Step 3 on this checkout — it rewrites files other agents and bind-mounted containers are reading.
+`$UP` is this cycle's target. Write it down: triage and the re-pin both use that head, even if upstream moves in between.
 
-Also check, every time:
+`.git/shallow` grafts the pin, so it has no parents locally. Count from it with `--first-parent`; a plain `rev-list $PIN..$UP` also counts older history reached through merge commits.
 
-| Check               | Command                                                                                                                           | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Upgrade tripwire    | `node_modules/.bin/tsx scripts/upgrade-state.ts get` vs `node -p "require('./package.json').version"`                             | Any port that bumps `version` halts the host on next build+restart. Keep the fork's version; never take upstream's.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Migration collision | `git diff --name-only --diff-filter=A $BASE..upstream/main -- src/db/migrations/` and `grep -rn "name: '" src/db/migrations/*.ts` | Ledger is keyed by `name`, NOT file number. Fork's own migrations run 065–069 (065 `container-config-timezone`, 066 `approvals-instance`, 067 `cli-request-executions`, 068 `sessions-sweep-quiet-until`, 069 `messaging-group-name-source`); the next fork ordinal is **070**. An upstream migration file that collides with an already-used fork number gets renumbered to the fork's next free ordinal — keep upstream's `name` verbatim. A same-`name` migration is already applied; don't re-add it. A ported migration that ALTERs `container_configs` is registered right after the aliased `containerConfigs` migration in `src/db/migrations/index.ts` — the array runs in ARRAY order, not filename order, and that table is created late. |
-| Host runtime gate   | `git show upstream/main:package.json \| grep -A2 engines` vs `node -v`                                                            | Upstream moved to Node ≥22 in 2.3.0; fork is on Node 22 as of 2026-09-02.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| Nested pnpm         | use `node_modules/.bin/tsx` / `node_modules/.bin/vitest` directly                                                                 | `pnpm exec` nested here costs ~80 s CPU and times out tool calls.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+Check on every cycle:
 
-**Drift tests — green before AND after every port, not just at the end.** These are the seams' own correctness gates; a port that fails one of them is not done, whatever the diff looks like:
+- **Upgrade tripwire:** `node_modules/.bin/tsx scripts/upgrade-state.ts get` matches `node -p "require('./package.json').version"`.
+- **Migrations:** `git -C $R diff --name-only --diff-filter=A $PIN $UP -- src/db/migrations/`. The ledger is keyed by `name`, not file number. Skip a migration whose `name` the fork already has; it has already run. A new one keeps upstream's `name` and takes the next free fork ordinal, one above the highest `NNN-` file in `src/db/migrations/`. A migration that ALTERs `container_configs` registers right after the aliased `containerConfigs` migration in `src/db/migrations/index.ts`: the array runs in array order, and that table is created late.
+- **Host runtime:** `git -C $R show $UP:package.json | grep -A2 engines` against `node -v`. A Node major goes through §5.
+- **Tooling:** call `node_modules/.bin/tsx` and `node_modules/.bin/vitest` directly. A nested `pnpm exec` costs about 80 s of CPU here.
 
-| Seam                         | Test(s)                                                                                       | What it pins                                                                                                                                            |
-| ---------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Mailbox manifest             | `src/mailbox-seam-upstream.test.ts`                                                           | every ported-verbatim upstream file's content hash matches `src/mailbox/UPSTREAM-MANIFEST.json`                                                         |
-| Mailbox ratchet              | `src/mailbox-seam-ratchet.test.ts`                                                            | the host allowlist (`src/mailbox/RATCHET.json`) never grows past its two documented KEEP-PATCH files                                                    |
-| Mailbox composition          | `src/mailbox-seam-composition.test.ts`                                                        | every code path that provisions a session actually loads the mailbox composition, not a bypass                                                          |
-| Scripts-reach tripwire       | `src/mailbox-seam-unreachable-scripts.test.ts` (+ `scripts/mailbox-seam-unreachable.test.ts`) | standalone scripts that are import-graph-reachable to the seam either route through it or are proven, by actual call graph, never to touch a session DB |
-| Host-sweep registry pin      | `src/host-sweep-registry.test.ts`                                                             | the 41-entry duty registration table; a moved or renamed duty without a matching table update fails here first                                          |
-| Host-lifecycle seam manifest | `src/host-lifecycle-seam.test.ts`, `src/host-lifecycle.test.ts`                               | ported-verbatim files against `src/host-lifecycle-seam/UPSTREAM-MANIFEST.json`                                                                          |
-| Agent-runner hermeticity     | `container/agent-runner/src/test-hermeticity.test.ts`                                         | no runner test reaches real network/filesystem outside its sandbox                                                                                      |
+## 2. Triage
 
-**Upstream-ownership ratchet — when present.** A generalized version of `storage-manager.ts`'s `computeOffenders` pattern (an allowlist of upstream-owned files the fork may still differ in, with a pinned per-file diff budget: growth fails the test, shrinkage is always allowed) is being built as part of the host-sweep seam's remaining work. It is not shipped yet as of 2026-09-04 — if its test file exists when you run this skill, add it to the drift-test table above and treat it the same as the others; if it doesn't, skip it.
-
-### 2. Triage with parallel workers (read-only)
-
-Spawn three `worker-high` agents at once, all git-against-refs only, writing to the scratchpad:
-
-1. **upstream-inventory** — `git log --first-parent $BASE..upstream/main` grouped by theme with PR counts and hashes; every `[BREAKING]` CHANGELOG line verbatim; new migrations; new env vars; version bumps in `container/Dockerfile`.
-2. **conflict-triage** — for each `CONFLICT` path from merge-tree: local intent (`git log $BASE..HEAD -- file`), upstream intent, severity TRIVIAL / SEMANTIC / ARCHITECTURAL / DROP-UPSTREAM. **A conflict inside a seam file (`src/modules/mailbox/**`, `src/mailbox/**`, `src/host-sweep.ts`, `src/modules/sweep-\*/**`, `src/host-lifecycle-seam/**`) is never SEMANTIC-or-below by hand-merge** — its severity call is "port into the seam per the standing decision above", resolved by taking upstream's driver/façade shape and re-registering the fork's own duties/ops, not by merging the two files' bodies together.
-3. **adapter-delta** — for each installed channel/provider (`src/channels/index.ts`, `src/providers/index.ts`): compare ours vs `upstream/channels` at the feature level, not file level. Our Slack adapter (`src/channels/slack.ts`) is a fork; never re-apply upstream's.
-
-Then write the recommendation per theme: **take** (cherry-pick clean), **port** (re-home onto our shape), **own version** (we already built it differently), **declined** (with trigger), **n/a**. File or update `upstream-port` issues on the fork for anything not done now.
-
-**Theme order:** the operator's own priorities first, then conflict severity. As of the 2026-09-04 kickoff the two named priorities are (a) agents surviving host restarts without their work pausing, and (b) Slack agent improvements — verify each actually exists in the upstream commit range before promising it; upstream subject lines are not proof of scope. Everything else orders by conflict severity from step 2, with seam-boundary conflicts (ported, not hand-merged) sequenced ahead of ordinary ARCHITECTURAL conflicts since they have a known resolution shape.
-
-### 3. Port one theme per PR (scratch worktree, never the live checkout)
+Test each first-parent commit for a clean cherry-pick onto fork main. `merge-tree` writes objects, so give it a private object directory; a merge commit's change is its diff against its first parent:
 
 ```bash
-W=<scratchpad>/wt-<theme>
-git -C /home/ubuntu/nanoclaw-v2 worktree add --detach "$W" origin/main
-git -C "$W" switch -c port/<theme>
-ln -s /home/ubuntu/nanoclaw-v2/node_modules "$W/node_modules"   # read-only use; NEVER pnpm install/rebuild in a worktree
-git -C "$W" cherry-pick -x <sha>...                                # resolve against fork intent
-(cd "$W" && node_modules/.bin/tsc --noEmit -p tsconfig.json)
-(cd "$W" && ionice -c3 nice -n 10 node_modules/.bin/vitest run --pool=forks --maxWorkers=2 <targeted files>)   # load < 8; never the whole suite
-# If the theme touches container/agent-runner/**: the root tsconfig only includes src/**/*, and the root
-# vitest config excludes runner tests (they run under Bun, not Node) — the two commands above never see
-# runner code at all. Verify it separately, including the mandatory hermeticity gate:
-(cd "$W/container/agent-runner" && bun install && bun run typecheck && bun run test)
-(cd /home/ubuntu/nanoclaw-v2 && pnpm run check:public-boundary -- --root "$W" --index)   # scans $W's commits; run from the live checkout only so pnpm/tsx resolve
-(cd "$W" && gh pr create ...)   # gh's head branch is inferred from cwd — must run from $W; then run the pr-review-loop skill
-git -C /home/ubuntu/nanoclaw-v2 worktree remove "$W"               # from the live checkout, after the PR
+O=$(mktemp -d)
+for c in $(git -C $R rev-list --first-parent --reverse $PIN..$UP); do
+  GIT_OBJECT_DIRECTORY=$O GIT_ALTERNATE_OBJECT_DIRECTORIES=$R/.git/objects \
+    git -C $R merge-tree --write-tree --name-only --merge-base=$c^1 origin/main $c >/dev/null
+  case $? in 0) s=clean ;; 1) s=conflict ;; *) s=error ;; esac
+  echo "$s $(git -C $R log -1 --format='%h %cs %s' $c)"
+done
 ```
 
-Port rules that have already bitten:
+The daily Upstream Check classifies the same commits against the ratchet; read it as a second opinion.
 
-- **Every git command in a port worker's brief is `git -C /abs/path ...`**, never a bare `cd && git`; a fallen-through `cd` chain has landed a `git checkout <sha> -- .` in the live checkout before.
-- **Never `git stash`, `-u` or otherwise**, in the live checkout or a worktree a peer might touch — live sessions write untracked files a stash would sweep up.
-- **Synthetic ids only** in anything committed — source, tests, comments. A real `sess-…`/`ag-…`/`mg-…` id or an operator/client name in a comment blocks the next push from the live checkout (the boundary hook is blind in a worktree, and a GitHub merge runs no hook at all).
-- **Before any push from a worktree**, run the boundary check with `--root` pointing at the _worktree_ (that's the content it scans — `--index` reads each tracked file via `git show :<file>` under `--root`), executed from the live checkout so `pnpm`/`tsx` resolve — the same split the repo's own pre-push hook uses: `(cd /home/ubuntu/nanoclaw-v2 && pnpm run check:public-boundary -- --root "$W" --index)`. Pointing `--root` at the live checkout instead scans the live checkout's own (usually empty) index and proves nothing about the worktree's commits. **Read the message, not just the exit code**: if it says `structural patterns only — no identifier registry found` instead of `identifiers from main checkout`/`identifiers from local install`, the check was blind to real names and ids — it still exits 0, so a green run is not proof — do not push until the registry resolves (fork issue #374 tracks making this fail closed).
-- **Targeted vitest only**, never a full suite concurrently with another session: `ionice -c3 nice -n 10 node_modules/.bin/vitest run --pool=forks --maxWorkers=2 <files>` at load < 8.
-- **A bare `vi.mock` factory of a project module must spread `importOriginal`** (`vi.mock('../foo.js', async (importOriginal) => ({ ...(await importOriginal()), ... }))`) so a batch that adds an export doesn't silently undefine it for every mocking suite — except `./log.js`, which is intentionally a full stub (mocking the logger's real implementation is never wanted).
-- **Codex thread counts come from the GraphQL `reviewThreads` API only** — the REST login filter silently returns 0 and reads as a clean review that never happened.
-- **Codex silent for 15 minutes → fall back to a cross-model reviewer** (opencode or gemini) rather than waiting indefinitely or merging unreviewed.
-- **The churn gate applies**: `codex-review.sh gate`/`push` refuse the next commit once one finding class has drawn findings across 3+ review rounds with severity not falling — the fix at that point is a reframe at the shared primitive, named in a `Reframe: <invariant> enforced in <primitive>` commit trailer, not another patch at the next site. For heuristic/classifier-style code specifically, decide the posture up front (e.g. "ambiguity makes the check fail closed"), cap the review budget at 3 rounds regardless of severity, and file any remaining low-severity residue as an issue rather than chasing it to zero.
-- One producer per Docker flag: `dockerResourceLimitArgs` owns `--pids-limit`/`--memory`; `securityArgs`/`resolveContainerSecurity` owns cap-drop/no-new-privileges.
-- Every `ARG *_VERSION` in `container/Dockerfile` must have an entry in `container/update-sources.json` or `src/container-updates.test.ts` fails CI.
-- Keep the fork's Bun pin and `allowBuilds` untouched; take only the version bumps upstream intends.
-- `package.json` `version` stays the fork's (tripwire). `packageManager` may move.
-- Anything under `container/` in the PR ⇒ `./container/build.sh` before the restart.
+Put every commit in exactly one place:
 
-### 4. Deploy (live checkout has exactly one writer — the deployer)
+- **Fast lane.** It fixes a bug or security issue in code this install runs, or bumps a pin that carries such a fix, and adds no migration, runtime or major-dependency bump, seam-file change, or `package.json` `version` move. A clean pick goes in as is. Most picks conflict, because the fork has diverged in most files upstream changes; port those by hand onto the fork's version of the file, with the customization contract below passing. Host changes and container changes go in separate PRs, because they activate and roll back differently.
+- **Theme lane.** Everything else worth having: features, seam changes, migrations, runtime bumps, and fixes too large to port by hand in one sitting. Group by theme and open or update one `upstream-port` issue per theme. Order themes by what the operator asked for first, then by conflict severity.
+- **Declined.** Not wanted. Record why, and the trigger that would reopen it, on the theme's `upstream-port` issue.
+- **Not applicable.** Code this install doesn't run, such as setup for unused channels, skills it doesn't install, or upstream-only infrastructure.
 
-The live checkout `/home/ubuntu/nanoclaw-v2` is shared by every session in the convergence program; only the session executing THIS deploy writes to it. Everyone else sends `git format-patch` files into the deployer's scratchpad inbox instead of touching the checkout directly (see "Multi-session protocol" below).
+**Customization contract.** List the fork customizations in files this cycle's upstream commits touch: `git -C $R log --no-merges --format='%h %s' upstream/main..origin/main -- <file>`. For each, write down its intent, its integration point, and the test that proves its behavior. If upstream now ships an equivalent, adopt upstream's version only when that test passes against it. Keep the fork's version when the intent is unclear, and write the missing test before any port touches that file.
+
+**Channels and providers.** Installed adapters ship on upstream's `channels` and `providers` branches, which neither this triage nor the ratchet covers. Run `/update-skills` for them.
+
+**Re-pin** once every commit is placed, to the `$UP` you triaged, in its own PR from a worktree (§3), with the report's full delta in the PR body:
 
 ```bash
-cd /home/ubuntu/nanoclaw-v2
-# 1. Announce BUILD START first — no merges or pushes to main by anyone (including origin) until the gate result lands.
-gh pr merge <n> --merge            # merge commit, never squash (loses upstream topology)
-gh pr view <n> --json state,mergeCommit --jq '.state, .mergeCommit.oid'   # must print MERGED and a real sha before pulling —
-                                    # `gh pr merge` only guarantees the merge if it landed immediately; with required
-                                    # checks pending it enables auto-merge/queues instead, and a pull right after can
-                                    # silently stay on the OLD origin/main (the sha-equality check downstream still
-                                    # "passes" for that old commit)
-git pull --ff-only origin main     # HEAD must now equal origin/main; a non-fast-forward here means announce again and retry
+(cd "$W" && node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --root "$W" --upstream $UP)
 ```
 
-If the PR includes a migration, back up the live DB with a **hot** `better-sqlite3` backup — never `cp` a live SQLite file:
+From then on, a change that moves an upstream-owned file toward upstream reads as shrink, not growth, and the next cycle starts at `$UP`.
+
+## 3. Port
+
+Open one PR per fast-lane batch (host or container) and one per theme. Work in a scratch worktree, never in the live checkout:
 
 ```bash
-node -e "const Database = require('better-sqlite3'); const db = new Database('data/v2.db', { readonly: true }); db.backup('data/v2.db.pre-<slot>-' + Date.now()).then(() => process.exit(0));"
+W=<scratchpad>/wt-<topic>
+git -C $R worktree add -b port/<topic> "$W" origin/main
+ln -s $R/node_modules "$W/node_modules"      # read-only use; never install or rebuild into it
+git -C "$W" cherry-pick -x <sha>             # -m 1 for a merge commit; resolve against the customization contract
 ```
 
-Build under the `check-build-clean` guard (`scripts/check-build-clean.ts`), which refuses to build unless `HEAD == origin/main` and refuses (postbuild) if `HEAD` moved while the build ran; docs-only dirt is exempted, everything else blocks:
+A pick that comes out empty is already in the fork: `git -C "$W" cherry-pick --skip`.
+
+Before pushing, from `$W`:
 
 ```bash
-./container/build.sh               # first, if anything under container/ changed; verify pins inside the built image afterwards
-pnpm run build
-node -p "require('./dist/BUILD_INFO.json').sha" && git rev-parse HEAD && git rev-parse origin/main   # all three must match
-grep -c <a-symbol-the-PR-introduced> dist/<file>.js   # content proof — a sha match alone is not proof the PR is in dist
+node_modules/.bin/tsc --noEmit -p tsconfig.json
+flock <scratchpad>/vitest.lock ionice -c3 nice -n 10 node_modules/.bin/eslint src/ scripts/ setup/
+flock <scratchpad>/vitest.lock ionice -c3 nice -n 10 node_modules/.bin/vitest run <targeted files> --maxWorkers=2
+node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --root "$W" --write [--accept <path>]   # when an upstream-owned file changed
+(cd container/agent-runner && bun install && bun run typecheck && bun run test)                 # when container/agent-runner/ changed
+(cd $R && pnpm run check:public-boundary -- --root "$W" --index)   # from the live checkout so pnpm resolves; scans $W's index
 ```
 
-**Restart only when the fleet is actually quiet** — the full rule (`docs/specs/upstream-mailbox-seam/plan.md` §6): no deliveries for 10 minutes and no container younger than 5 minutes. "No deliveries" means both delivery log lines, not just one — `src/delivery.ts` logs `Status delivered` for status-message updates and a separate `Message delivered` for ordinary chat replies; a check that greps only the first can call the fleet quiet while a container is mid-turn on a normal reply. A short waiter loop against both lines, plus `docker ps` for container age, is fine. Then checkpoint the logs (they're append-only across restarts; logrotate is daily via `copytruncate`, not per-restart, so a whole-file grep after the first successful boot ever is permanently non-zero and proves nothing about _this_ restart) before restarting:
+Never run the full host suite on this host. Push, open the PR from `$W` (`gh pr create` takes its head branch from the working directory) with a `Replaces:` line, and drive it with the `pr-review-loop` skill, which owns review rounds, receipts and the merge (`codex-review.sh merge --head <sha>`). After the merge: `git -C $R worktree remove --force "$W"`. The untracked `node_modules` symlink makes a plain remove refuse; git deletes the link, not its target.
+
+Drift tests, green before and after every port:
+
+| Seam | Test |
+| --- | --- |
+| Mailbox manifest: ported-verbatim upstream files match `src/mailbox/UPSTREAM-MANIFEST.json` | `src/mailbox-seam-upstream.test.ts` |
+| Mailbox ratchet: the host allowlist in `src/mailbox/RATCHET.json` never grows | `src/mailbox-seam-ratchet.test.ts` |
+| Mailbox composition: every session-provisioning path loads the mailbox composition | `src/mailbox-seam-composition.test.ts` |
+| Scripts that reach the seam route through it | `src/mailbox-seam-unreachable-scripts.test.ts`, `scripts/mailbox-seam-unreachable.test.ts` |
+| Host-sweep duty registration table | `src/host-sweep-registry.test.ts` |
+| Host lifecycle: ported-verbatim files match `src/host-lifecycle-seam/UPSTREAM-MANIFEST.json` | `src/host-lifecycle-seam.test.ts`, `src/host-lifecycle.test.ts` |
+| Upstream-ownership ratchet is current | `src/upstream-ratchet.test.ts` |
+| Agent-runner hermeticity | `container/agent-runner/src/test-hermeticity.test.ts` |
+
+Port rules:
+
+- **Name the tree in every git command** with `git -C <absolute path>`. A failed `cd` falls through to the live checkout.
+- **Never `git stash`,** in the live checkout or in a worktree another session might touch. Live sessions write untracked files a stash sweeps up.
+- **The fork is public.** Commits, tests, comments, issues and PR bodies use synthetic ids and no operator, client or agent names. The boundary check refuses them, and it fails closed when the install's identifier registry is missing.
+- **One producer per Docker flag.** `dockerResourceLimitArgs` owns `--pids-limit` and `--memory`; `resolveContainerSecurity` owns cap-drop and no-new-privileges.
+- **Supply chain.** Keep the fork's Bun pin. Add nothing to `allowBuilds` and no release-age policy without the operator's approval.
+- **Mocked modules.** A port that adds an export leaves it undefined in every suite that mocks that module with a bare `vi.mock` factory. Spread `importOriginal()` into the factory rather than stubbing the new export; `./log.js` stays a full stub.
+- **New environment reads.** A port that adds a `process.env` read confirms the key is set in `.env` or OneCLI before deploy.
+- **Migrations.** Scan a ported migration for `ALTER … NOT NULL` without a default, `DROP`, and bulk `UPDATE` against what the live DB holds, and take the backup in §4 before deploying it.
+
+## 4. Deploy
+
+A merge reaches production only at a deploy, and every deploy needs the operator's approval or a pre-approval in their own words. Report the cycle as an FYI: what ships at the next approved restart, which themes were queued, what was declined and why. Bring the operator a HOLD only for a direction call.
+
+If the deploy carries a migration, take a hot backup first. Never `cp` a live SQLite file, and note that `scripts/deploy.sh` takes no DB backup:
 
 ```bash
-LOG0=$(wc -l < logs/nanoclaw.log 2>/dev/null || echo 0)
-ERR0=$(wc -l < logs/nanoclaw.error.log 2>/dev/null || echo 0)
-sudo systemctl restart nanoclaw-v2
+cd $R && node -e "const D=require('better-sqlite3'); new D('data/v2.db',{readonly:true}).backup('data/v2.db.pre-sync-'+Date.now()).then(()=>process.exit(0))"
 ```
 
-**Checkpoint caveat:** the host logs rotate daily with `copytruncate`; if rotation fires between the checkpoint and the read, the file shrinks and the scoped tail is empty. If `wc -l < logs/nanoclaw.log` is smaller than `$LOG0`, scope from the last `OneCLI preflight ok` line instead (`tail -n +$(grep -n 'OneCLI preflight ok' logs/nanoclaw.log | tail -1 | cut -d: -f1)`), and likewise for the error log from its first line after the restart timestamp.
+Deploy with `scripts/deploy.sh` or the Discord `/deploy` command. It pulls, builds the host, rebuilds the agent image when `container/` changed, and restarts. Its crash guard rolls back a boot crash, but it doesn't arm when the deploy ships a migration. A host restart leaves running containers for the new host to adopt; boot stops only the ones it cannot adopt.
 
-**Post-restart gate, read at +2.5 minutes with ANSI codes stripped, scoped to `tail -n +$((LOG0+1)) logs/nanoclaw.log` / `tail -n +$((ERR0+1)) logs/nanoclaw.error.log`: before every count, retain only timestamp-prefixed rows matching `^\[[0-9]{4}-[0-9]{2}-[0-9]{2}[ T]` — all required rows, or it is not deployed:**
+Before launching the deploy, checkpoint both logs to a file; shell variables don't survive between tool calls:
 
-| Check                       | What passes                                                                                                                                                                                                                                                                                      |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Preflight                   | `OneCLI preflight ok` present in the scoped tail                                                                                                                                                                                                                                                 |
-| OneCLI gateway              | `OneCLI gateway applied` count > 0 in the scoped tail within 2 min — the spawn-success signal                                                                                                                                                                                                    |
-| Channel adapters            | 12 `Channel adapter started` lines in the scoped tail                                                                                                                                                                                                                                            |
-| Errors                      | 0 `ERROR` lines in the scoped tail                                                                                                                                                                                                                                                               |
-| Warnings                    | every WARN class present in the scoped error-log tail is compared against the previous few hours; a class never seen before is investigated before calling the deploy green, a familiar recurring one is not                                                                                     |
-| Restarts                    | `NRestarts` 0 (no crash loop)                                                                                                                                                                                                                                                                    |
-| Container started           | `docker ps --filter name=nanoclaw-v2- --format '{{.Names}} {{.Status}}'` shows at least one container created after the restart — `OneCLI gateway applied` is logged during argument assembly, BEFORE the actual `spawn`, so a mount or egress failure after that line still leaves no container |
-| Runtime (host upgrades, §5) | `MP=$(systemctl show -p MainPID --value nanoclaw-v2); /proc/$MP/exe -v` prints the intended Node version — systemd can restart through an old executable path and every other row still passes                                                                                                   |
-| Env proxy                   | `NODE_USE_ENV_PROXY` absent from the daemon environ                                                                                                                                                                                                                                              |
-| Seam counters               | in the scoped tail: `Host sweep duty failed` = 0; `Host sweep mailbox unopenable` = 0; `tick threw` = 0                                                                                                                                                                                          |
-| Quiet cache                 | `Host sweep quiet cache warmed warmed=N` present in the scoped tail, N roughly the fleet size after the first post-boot tick                                                                                                                                                                     |
-| First tick timing           | _conditional, not required_: `src/host-sweep.ts` only emits `Host sweep tick timing` when that sweep took ≥1 s, so its absence on a fast, healthy first sweep is not a failure — if the line does appear in the scoped tail, `spawnWaitMs` must be near 0                                        |
-| Independent read            | a second session re-reads the same checks at +6 minutes when one is available — a single reader's clean read is not the same guarantee                                                                                                                                                           |
+```bash
+cd $R && echo "$(date +%s) $(wc -l < logs/nanoclaw.log) $(wc -l < logs/nanoclaw.error.log)" > <scratchpad>/log-checkpoint
+```
 
-Record every restart — time, PRs riding it, gate result — in `groups/_ops/upstream-rebaseline-2026-09/deploy-schedule.md` (private groups repo, not this one).
+Gate at about 2.5 minutes after the restart. INFO lines go to `logs/nanoclaw.log` and WARN and above to `logs/nanoclaw.error.log`, so read both from the checkpoint. Daily rotation is a `copytruncate` that writes a new `.1` file, so a `.1` created after the checkpoint means the file rotated in between and its earlier lines are in `.1`:
 
-**Restart approval**: explicit per restart unless the operator has granted a standing window for this session; ask before running the `systemctl restart`, not after. Each restart kills every in-flight container turn — the restart-note predicate writes an accountability note for a streaming session, but it does not resume the turn — so prefer a genuinely quiet moment over a merely-approved one.
+```bash
+cd $R && read C L0 E0 < <scratchpad>/log-checkpoint
+since() { { if [ "$(stat -c %Z "$1.1" 2>/dev/null || echo 0)" -lt "$C" ]; then tail -n +$(($2 + 1)) "$1"; else tail -n +$(($2 + 1)) "$1.1"; cat "$1"; fi; } | sed 's/\x1b\[[0-9;]*m//g'; }
+{ since logs/nanoclaw.log $L0; since logs/nanoclaw.error.log $E0; } > <scratchpad>/since-restart.log
+```
 
-### 5. Host runtime upgrades (Node major, native addons)
+In `since-restart.log`:
 
-Only `better-sqlite3` is ABI-bound in the host tree (raw V8; lightningcss/rolldown are N-API). Sequence:
+- `OneCLI preflight ok` is present.
+- No line is at level ERROR (`grep -c '^\[[^]]*\] ERROR'` prints 0). Investigate any WARN class not seen in the previous day before calling it green.
+- `Host sweep duty failed`, `Host sweep mailbox unopenable` and `tick threw` are absent.
+- `Reconciled sessions at startup` shows `stopped=0`, or each stopped container has its own `Stopped an unadoptable container at startup` or `Adoption refused` line giving the reason. An interrupted session with work in flight gets `Wrote host-restart accountability note`.
 
-1. Stop the timers that shell into tsx/ncl: `sudo systemctl stop nanoclaw-health-sentinel.timer nanoclaw-storage-gc.timer nanoclaw-fleet-drift.timer`.
-2. **`sudo systemctl stop nanoclaw-v2`** — accept ~60 s planned downtime.
-3. Back up the apt source, swap it, `sudo apt-get install -y nodejs=<ver> && pnpm rebuild better-sqlite3`, then `node -e "require('better-sqlite3')"`.
-4. `sudo systemctl start nanoclaw-v2`; `sudo systemctl restart nanoclaw-codex-sync` (holds the deleted old node inode); re-`start` the timers.
-5. Run the §4 gate. Do not build `dist/` in the same change unless HEAD == BUILD_INFO sha already; one variable per restart.
+Outside the logs:
 
-Rollback: restore the apt source backup, `apt-get install --allow-downgrades nodejs=<old>`, `pnpm rebuild better-sqlite3` (old ABI copy is still in the pnpm store), restart. Never restore `node_modules.pre-deploy/` (`deploy-crash-guard` refuses `runtime-changed` for this reason).
+- `systemctl show -p NRestarts --value nanoclaw-v2` prints 0.
+- The next spawn succeeds: a container started after the restart appears in `docker ps --filter name=nanoclaw-v2- --format '{{.Names}} {{.Status}}'`. `OneCLI gateway applied` is logged before the spawn, so on its own it doesn't prove one.
 
-## Multi-session protocol
+To roll back, revert the merge commit through a PR and redeploy. Restore the DB backup if a migration ran.
 
-The upstream sync runs with several sessions up at once, sharing the fork and the live checkout. Roles (adjust names to whoever is actually running each): an **orchestrator/deployer**, who is the live checkout's single writer and owns the triage pass, the deploy schedule, and the process/docs conflict themes (this skill included); a **mailbox/runner owner**, who takes the `agent-runner/src` and mailbox-adjacent conflict themes; a **seam-2 owner**, who takes the host-sweep/scheduling/permissions/agent-to-agent/cli-resources themes and any seam-2 follow-up work (such as the ownership ratchet in §1).
+## 5. Host runtime upgrades (Node major, native addons)
 
-- **Fences during a gate window.** While a deploy gate is running, no other session runs vitest against the live checkout's tree — host suites already collide across concurrent worktrees on shared fixture paths, and a gate read competing with a builder's I/O is not a clean read.
-- **Patch inbox, not direct writes.** A session that isn't the deployer never commits to the live checkout. It produces `git format-patch` files into the deployer's scratchpad inbox and messages the filenames; the deployer applies them with `git am` in a **scratch worktree**, never directly onto the live checkout. The live checkout is checked out on `main`; a `git am` run there commits straight onto local `main` ahead of `origin/main`, which `check-build-clean`'s freshness gate then refuses to build from, and it skips the PR/review step every other change goes through. Apply the patch in a worktree, push the branch, and land it through the normal §3 PR flow before it ever reaches the live checkout via `git pull --ff-only`.
-- **Check "is this mine?" before touching any dirt in the live checkout.** `git status --porcelain` plus `/proc/*/cwd` for every process rooted there — a change you didn't make is not automatically a peer's mistake to clean up; it may be an operator-side tool.
-- **Operator-side tools may edit the live checkout directly** — an interactive editor, an interactive Codex TUI launched in that directory. That's expected, not a collision to fix. If you find dirt you didn't create and can't attribute to a known peer session, rescue it to a patch file before doing anything destructive; never `reset`/`checkout -- .`/`clean` without first knowing whose work it is.
-- **If the operator's tool needs to move its work off the live checkout** (because it's mid-edit, still on `main`, when a deploy window needs the tree clean), give the exact commands — "commit to a branch" alone reads as switching the shared checkout, which breaks every other session's assumption that it's on `main`. Branch **before** committing (a commit made first lands on shared `main`, not on a branch that doesn't exist yet), and stage only the paths that are actually the operator's WIP (`git add -A` sweeps up any other session's or operator-side tool's untracked dirt too):
-  ```bash
-  git -C /home/ubuntu/nanoclaw-v2 status --porcelain                         # attribute what's dirty before touching any of it
-  git -C /home/ubuntu/nanoclaw-v2 switch -c wip/<topic>                      # branch first, off the current (still-main) tree
-  git -C /home/ubuntu/nanoclaw-v2 add <the attributed paths>                 # explicit paths only, never -A
-  git -C /home/ubuntu/nanoclaw-v2 commit -m "<wip>"
-  git -C /home/ubuntu/nanoclaw-v2 switch main
-  git -C /home/ubuntu/nanoclaw-v2 worktree add /home/ubuntu/nanoclaw-wt-<topic> wip/<topic>
-  # continue editing in /home/ubuntu/nanoclaw-wt-<topic> from here
-  ```
-  If the tool already created its own branch (the `git switch -c` case in gotcha 9 below), skip the branch-creation step and commit directly onto that branch, then continue from `switch main`.
+Only `better-sqlite3` is ABI-bound in the host tree. Rebuilding it while the host runs overwrites its mapped `.node` file in place and segfaults the service, so stop first:
 
-## Gotchas (each one cost real downtime or a blocked push)
+1. Checkpoint the logs as in §4, then stop the timers that run this checkout's code and the service. Expect about a minute of planned downtime.
 
-1. **Rebuilding a native addon while the host runs segfaults it.** `prebuild-install` overwrites `better_sqlite3.node` in place (hardlinked into the pnpm store); the live process's mmap changes underneath and it dies with SIGSEGV + a 5 GB core dump. Stop the service first. (2026-09-02, ~30 s outage + false unit alert.)
-2. **Node ≥22.23 honors `NODE_USE_ENV_PROXY=1`; Node 20 ignored it.** The daemon carries `HTTPS_PROXY` = the OneCLI gateway. On Node 22 the host's own `fetch()` to the OneCLI control API (`127.0.0.1:10254`) went through the proxy and failed → every spawn refused for 11 minutes with the host "healthy". Fixed by `/etc/systemd/system/nanoclaw-v2.service.d/node22-env-proxy.conf` (`ExecStart=… onecli run -- /usr/bin/env -u NODE_USE_ENV_PROXY /usr/bin/node …`). The tell is `[UNDICI-EHPA] EnvHttpProxyAgent is experimental` on process start. Keep the drop-in; verify with the environ grep in the gate.
-3. **`/update-nanoclaw`'s live dry-run merge and `migrate-nanoclaw` are wrong tools here** — the first edits the live tree, the second assumes customizations small enough to extract and replay.
-4. **`/migrate-slack-agents` — not until the provisioning port lands.** As shipped today it detects an unsuffixed `SLACK_BOT_TOKEN` (the fork has none, only the suffixed per-agent form) and its later phases assume upstream's provisioning substrate outright; running it now would misfire. The provisioning model itself is in scope (standing decisions, above) — this gotcha retires once the seam that solves suffix-token compatibility and the migration path lands, not before.
-5. **Worker reports about "silently skipped migrations" are wrong** — the ledger is name-keyed. Renumber files, keep names.
-6. **A pre-existing ~28% intermittent `OneCLI gateway not applied` rate exists (issue #239)** — one refusal after a restart is not a regression; zero successes is.
-7. **The image's `pnpm --version` may not equal `PNPM_VERSION`** (issue #240) — verify pins _inside_ the built image, not from the Dockerfile.
-8. **A worker's `cd <dir> && git ...` chain fell through to the live checkout when the `cd` silently failed**, and the subsequent `git checkout <sha> -- .` ran there instead of in the intended worktree. Use `git -C /abs/path` for every command in a worker brief so a bad path is a hard error, not a silent fallthrough to `main`.
-9. **`git switch -c` inside the live checkout, run by an operator-side tool** (not a worker), left the shared checkout on a feature branch mid-session, which every other session read as "we aren't on `main`". Recovery is the five commands in "Multi-session protocol" above, not a bare `git switch main` (that alone discards nothing but leaves the operator's WIP commit orphaned if the branch isn't kept).
-10. **A real install id in a source comment blocked the next push from the live checkout.** The boundary hook that catches this is blind inside a worktree and a GitHub merge runs no hook at all, so a worker can land a `sess-…`/`ag-…`/`mg-…` id or an operator/client name straight onto `main` without ever tripping the check — it only surfaces when the deployer's own push from the live checkout gets refused. Run the boundary check against the live root before every push from a worktree (§3).
-11. **GitHub Actions is quota-dead on this private repo.** There is no CI gate to lean on — the gate is local targeted vitest, the Codex review loop, and the 15-minute fallback reviewer when Codex goes quiet. Don't wait on a check that will never run.
-12. **A session going unresponsive for hours while holding the deploy window stalls the whole program** — nobody else can merge or restart until it either finishes or is recognized as stuck. Fences (the patch-inbox rule, the single-writer rule) need a timeout in practice, not just in principle: if the deployer session hasn't posted a gate result or a status update in a reasonable window, escalate to the operator rather than waiting indefinitely or working around the fence yourself.
+   ```bash
+   systemctl list-units --type=timer --state=active --plain --no-legend 'nanoclaw-*' | awk '{print $1}' > <scratchpad>/stopped-timers
+   sudo systemctl stop $(cat <scratchpad>/stopped-timers) nanoclaw-v2
+   ```
+
+2. Back up the apt source, switch it, then `sudo apt-get install -y nodejs=<version>`, `pnpm rebuild better-sqlite3` and `node -e "require('better-sqlite3')"`.
+3. `sudo systemctl start nanoclaw-v2 $(cat <scratchpad>/stopped-timers)`, and restart `nanoclaw-codex-sync`, which still holds the old node binary.
+4. Run the §4 gate, and two more checks. The daemon runs the intended Node: `MP=$(systemctl show -p MainPID --value nanoclaw-v2); sudo /proc/$MP/exe -v`. And `NODE_USE_ENV_PROXY` is absent from its environment: `MP=$(systemctl show -p MainPID --value nanoclaw-v2); sudo grep -ac NODE_USE_ENV_PROXY /proc/$MP/environ` prints `0`. Node 22.23 and later honor that variable, and with the OneCLI gateway as `HTTPS_PROXY` the host's own calls to the OneCLI control API would then go through the proxy and every spawn would be refused. The drop-in `/etc/systemd/system/nanoclaw-v2.service.d/node22-env-proxy.conf` unsets it.
+5. Change one variable per restart: don't deploy a new `dist/` in the same change.
+
+To roll back, restore the apt source, run `sudo apt-get install --allow-downgrades nodejs=<old>` and `pnpm rebuild better-sqlite3`, then restart. Never restore `node_modules.pre-deploy/`: its snapshots are tied to the old runtime's ABI, which is why the deploy crash guard won't roll back across a Node change.
 
 ## References
 
-- Seam design + PR series + deploy protocol: `docs/specs/upstream-mailbox-seam/plan.md`, `docs/specs/upstream-host-sweep-seam/plan.md`.
-- Original decline record, now partially reversed (see "Standing decisions" above for current state): fork issue #234; the reversal itself and the operator's own words on it: memory `project_upstream_sync_phase_2026_09_04`.
-- Node 22 runbook + incidents: memory `project_node22_upgrade_2026_09_02`.
-- Live-checkout single-writer rule: memory `feedback_live_checkout_single_writer`.
-- Boundary hook / real-id scrubbing: memory `feedback_boundary_hook_flags_names_in_docs`.
-- Review-round stopping rule + churn gate: memory `feedback_review_rounds_need_a_stopping_rule`; the pr-review-loop skill.
-- Backlog: fork issues labeled `upstream-port`.
-- Prior full merges (union/keep-ours decisions): memories `project_upstream_merge_2026_07_12`, `project_upstream_merge_2026_06_16`.
+- [docs/upstream-ratchet.md](../../../docs/upstream-ratchet.md): the divergence measure, its verdicts, and re-pinning.
+- `docs/specs/upstream-*/`: the seam plans and run logs. `docs/specs/upstream-mailbox-seam/plan.md` §6 holds the single-deployer protocol, which runs only when the operator asks for it.
+- `container/skills/pr-review-loop/SKILL.md`: review rounds, receipts and merging.
+- `scripts/deploy.sh`: deploy, crash guard and rollback.
+- `/update-skills`: installed channels and providers.
