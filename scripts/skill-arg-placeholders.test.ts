@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,26 +12,34 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SKILL_ROOTS = ['.claude/skills', 'container/skills'];
 const PLACEHOLDER = /(?<![^\\]\\)(?<!^\\)\$\d/m;
 
-// Shrink-only: these predate the check.
-const KNOWN = new Set([
-  '.claude/skills/add-matrix/SKILL.md',
-  '.claude/skills/add-vercel/SKILL.md',
-  '.claude/skills/clone-as-codex/SKILL.md',
-  '.claude/skills/clone-as-opencode/SKILL.md',
-  '.claude/skills/migrate-from-openclaw/SKILL.md',
-  '.claude/skills/update-nanoclaw/SKILL.md',
-  'container/skills/narrated-deck/SKILL.md',
-]);
+// Shrink-only: unescaped placeholders per skill when the check landed. A fix lowers its count here.
+const KNOWN: Record<string, number> = {
+  '.claude/skills/add-matrix/SKILL.md': 1,
+  '.claude/skills/add-vercel/SKILL.md': 1,
+  '.claude/skills/clone-as-codex/SKILL.md': 2,
+  '.claude/skills/clone-as-opencode/SKILL.md': 4,
+  '.claude/skills/migrate-from-openclaw/SKILL.md': 1,
+  '.claude/skills/update-nanoclaw/SKILL.md': 1,
+  'container/skills/narrated-deck/SKILL.md': 12,
+};
 
-function skillsWithPlaceholders(): string[] {
-  const found: string[] = [];
-  for (const root of SKILL_ROOTS) {
-    for (const name of readdirSync(join(ROOT, root))) {
-      const rel = `${root}/${name}/SKILL.md`;
-      if (existsSync(join(ROOT, rel)) && PLACEHOLDER.test(readFileSync(join(ROOT, rel), 'utf8'))) found.push(rel);
-    }
+/** Every SKILL.md under the roots, at any depth: a skill can ship nested payloads it installs elsewhere. */
+function skillFiles(dir: string): string[] {
+  return readdirSync(join(ROOT, dir), { withFileTypes: true }).flatMap((entry) => {
+    const rel = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) return entry.name === 'node_modules' ? [] : skillFiles(rel);
+    return entry.name === 'SKILL.md' ? [rel] : [];
+  });
+}
+
+function placeholderCounts(): Record<string, number> {
+  const all = new RegExp(PLACEHOLDER.source, 'gm');
+  const counts: Record<string, number> = {};
+  for (const rel of SKILL_ROOTS.flatMap(skillFiles).sort()) {
+    const n = readFileSync(join(ROOT, rel), 'utf8').match(all)?.length ?? 0;
+    if (n > 0) counts[rel] = n;
   }
-  return found.sort();
+  return counts;
 }
 
 describe('placeholder matcher', () => {
@@ -50,13 +58,7 @@ describe('placeholder matcher', () => {
 });
 
 describe('SKILL.md positional placeholders', () => {
-  const found = skillsWithPlaceholders();
-
-  it('no other skill reads a positional $N the skill loader overwrites', () => {
-    expect(found.filter((f) => !KNOWN.has(f))).toEqual([]);
-  });
-
-  it('a fixed skill leaves the known list', () => {
-    expect([...KNOWN].filter((f) => !found.includes(f))).toEqual([]);
+  it('matches the shrink-only counts exactly', () => {
+    expect(placeholderCounts()).toEqual(KNOWN);
   });
 });
