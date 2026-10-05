@@ -329,7 +329,7 @@
 ".github/labeler.yml":{"diff":656,"mode":"100644","sha256":"bf45bb4fd6947890d7865c11c2efc30ff4525fa634469f530f771584fe998227"},
 ".github/renovate.json":{"diff":37,"mode":"100644","sha256":null,"deleted":true},
 ".github/workflows/approve-agent-image.yml":{"diff":223,"mode":"100644","sha256":null,"deleted":true},
-".github/workflows/ci.yml":{"diff":177,"mode":"100644","sha256":"facc676f297e4b2e1ba3454163e6ecea50fb0ec1cdb9bd13dd47c0bd045a81a5"},
+".github/workflows/ci.yml":{"diff":174,"mode":"100644","sha256":"06ec8304edf5815efbca01b0b88c3a0690380a9590bde7c94136088488ef1967"},
 ".github/workflows/label-pr.yml":{"diff":328,"mode":"100644","sha256":"58c9e1d6ddbce411360237f36034a60adfce4b1606f07ceb5092628c8f8f829f"},
 ".github/workflows/refresh-agent-image.yml":{"diff":197,"mode":"100644","sha256":null,"deleted":true},
 ".github/workflows/registry-skills.yml":{"diff":202,"mode":"100644","sha256":null,"deleted":true},

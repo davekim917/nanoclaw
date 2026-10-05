@@ -91,11 +91,8 @@ jobs:
       - name: Review notes and doc citations
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run scripts/review-notes.test.ts scripts/doc-citations.test.ts --maxWorkers=1
-      # Every test file whose path contains `ratchet` or `tripwire`, selected by
-      # name so a new repo guard runs on PRs without editing this lane; a guard
-      # left to the nightly lets a PR merge red. The upstream ratchet's GROWTH
-      # arithmetic (ratchet:report) needs the pinned upstream commit and stays
-      # in ci-full.yml's `bookkeeping` job.
+      # The upstream ratchet's GROWTH arithmetic (ratchet:report) needs the
+      # pinned upstream commit and stays in ci-full.yml's `bookkeeping` job.
       - name: Ratchets and tripwires
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run ratchet tripwire --maxWorkers=1
