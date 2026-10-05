@@ -47,6 +47,26 @@ Check only controls implicated by the question or sample. Examples include claim
 
 For a sampled lifecycle, compare the actual path with its current contract. Escalate to a broader sweep only when the sample exposes a concrete systemic failure or the operator requests it. Do not treat silence as settlement, approval or an independent evaluation. Operator invocation authorizes the audit itself; it does not make the operator an independent evaluator or authorize fixes, publication, deployment, messages, new timers or scheduled retries.
 
+## Count the operator's corrections
+
+When the question concerns agent behaviour, read what the operator actually told the workgroup's
+agents in the window. Human channel messages are `messages_in` rows with `kind='chat-sdk'` and
+`author.isBot === false` in the envelope. `kind='chat'` is agent and system traffic. Exclude
+host-assembled thread replays (`[New in thread since last response] …`), and check names against
+the workgroup's known agent identities, because an agent posting through a human-looking account
+passes the bot flag.
+
+Pick out the messages that correct an agent: a redirect, a "don't", a repeat of an earlier
+instruction, a "why did you". Group them by the behaviour corrected, across every agent group in
+the workgroup. A class counts once it has happened twice. When the group's instructions already
+state the rule, the instruction has failed: recommend a control, not more prose.
+
+For each class, recommend the fix at the highest level that works: a guard or `ncl` check that
+refuses the action, a container-config or tool change that removes the wrong path, a lint or test
+in the repository the agent works in, and only then an instruction, for judgment calls. Give
+the reason a higher level does not work. Quote corrections minimally and never copy client
+content beyond what the finding needs.
+
 ## Deliver the retro
 
 Lead with the bounded conclusion. For each material finding, state:
