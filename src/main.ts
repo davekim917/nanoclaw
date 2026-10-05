@@ -242,7 +242,7 @@ import type Database from 'better-sqlite3';
 
 /**
  * Canonical-memory reconciliation for the workgroups the boot door proved quiescent. Must never be called from
- * outside a quiescence door (src/workgroup-reconcile-doors.test.ts pins that).
+ * outside a quiescence door (src/workgroup-reconcile-doors-ratchet.test.ts pins that).
  */
 export function runWorkgroupMemoryStartupGate(
   db: Database.Database,

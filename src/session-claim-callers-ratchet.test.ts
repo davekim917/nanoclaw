@@ -48,7 +48,7 @@ const NOT_CALLERS: readonly string[] = [
   'src/container-supervision-channel.test.ts',
   'src/db/coordination.test.ts',
   'src/db/coordination.ts',
-  'src/session-claim-callers.test.ts',
+  'src/session-claim-callers-ratchet.test.ts',
   'src/session-claim-spawn.test.ts',
 ];
 
@@ -114,7 +114,7 @@ describe('tryClaimSession has exactly one caller', () => {
     const files = listTsFiles();
     expect(files.length).toBeGreaterThan(500);
     expect(files).toContain('src/db/coordination.ts');
-    expect(files).toContain('src/session-claim-callers.test.ts');
+    expect(files).toContain('src/session-claim-callers-ratchet.test.ts');
   });
 
   it('the caller files are exactly the pinned set', () => {

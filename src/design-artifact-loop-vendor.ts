@@ -6,7 +6,7 @@
  * container tree carries byte-identical vendored copies so NanoClaw installs
  * need no external repo at runtime. Develop in the plugin repo, then run
  * `pnpm exec tsx scripts/vendor-design-artifact-loop.ts` and commit the result.
- * src/design-artifact-loop-vendor.test.ts fails the host suite on drift
+ * src/design-artifact-loop-vendor-tripwire.test.ts fails the host suite on drift
  * (skipped on machines without the plugin repo).
  *
  * Tree-only files NOT synced (each side has a thin harness of its own):

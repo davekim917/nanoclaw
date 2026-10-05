@@ -36,7 +36,7 @@ scrutiny falling at each step.
 runs failed. At the time of writing, `main` had been red across three consecutive pushes on
 two failures that were both stale committed manifests:
 
-- `src/mailbox-seam-upstream.test.ts:42` — `container/agent-runner/src/mailbox/sqlite/connection.ts`
+- `src/mailbox-seam-upstream-tripwire.test.ts:42` — `container/agent-runner/src/mailbox/sqlite/connection.ts`
   stopped being a byte-identical copy of upstream `5c3082a1` when #588 (e4cefa3c8) added
   `refuseProductionSessionDbUnderTest()`. A real, permanent, intentional fork divergence
   that nobody recorded.
@@ -316,6 +316,6 @@ shadow review, not file overlap, is the signal this rollback condition acts on.
         pushed tree (#659); git-safety uses one shared pattern file (#658). #666 (in rework)
         adds a host-managed pre-push scan for the wiki repositories agents push to.
       - **Memory and decisions — shipped.** Review-dimension labels are derived in
-        `scripts/labeler-config.test.ts` (#643); `docs/review-notes.md` records deferred
+        `scripts/labeler-config-tripwire.test.ts` (#643); `docs/review-notes.md` records deferred
         findings and reverts.
 - [ ] Tier 2 · Tier 3 · Tier 4 — not started

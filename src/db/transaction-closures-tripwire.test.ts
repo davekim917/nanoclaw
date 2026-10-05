@@ -49,7 +49,7 @@ const SRC_ROOT = path.join(REPO_ROOT, 'src');
  * `src/db/drivers/**` IS the driver (its `SqliteDriver` receiver is the
  * implementation), and `src/db/testing/driver-conformance.ts` is upstream's
  * conformance contract, whose whole job is to drive `DbDriver.transaction`.
- * Both are byte-identical ports pinned by src/host-lifecycle-seam.test.ts, so
+ * Both are byte-identical ports pinned by src/host-lifecycle-seam-tripwire.test.ts, so
  * editing them is already a failure — they need no rule here.
  */
 const EXCLUDED_DIRS = ['src/db/drivers/', 'src/db/testing/', 'src/db/transaction-fixtures/'] as const;

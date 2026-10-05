@@ -1,6 +1,6 @@
 /**
  * Upstream mailbox-seam manifest: UPSTREAM_FILES are ported byte-for-byte from upstream and must never be
- * hand-edited (src/mailbox-seam-upstream.test.ts fails on drift). To sync with a newer upstream, run
+ * hand-edited (src/mailbox-seam-upstream-tripwire.test.ts fails on drift). To sync with a newer upstream, run
  * `pnpm exec tsx scripts/mailbox-seam-manifest.ts --update <upstream-sha>` from a worktree holding upstream's
  * objects and commit the regenerated manifest with the ported changes.
  */
@@ -45,8 +45,8 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/db/container-state.ts',
   'container/agent-runner/src/db/index.ts',
   'container/agent-runner/src/db/messages-out.ts',
-  'container/agent-runner/src/db/session-routing.ts',
-  'container/agent-runner/src/db/session-state.ts',
+  // 'container/agent-runner/src/db/session-routing.ts' — FORK DIVERGED, see FORK_DIVERGED_UPSTREAM_FILES.
+  // 'container/agent-runner/src/db/session-state.ts' — FORK DIVERGED, see FORK_DIVERGED_UPSTREAM_FILES.
   // The runner registry test asserts its exact `preload` line.
   'container/agent-runner/bunfig.toml',
 ] as const;
@@ -81,10 +81,13 @@ export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
  * Ported from upstream, since hand-edited for fork-only features, so never expected to match upstream's hash again;
  * tracked by name so a re-port is a reviewed act, not a silent --update overwrite. Fork additions: messages-in.ts
  * `scheduled_for` (a retry backoff must not rewrite an occurrence's slot); connection.ts
- * refuseProductionSessionDbUnderTest; sqlite/index.ts, sqlite.test.ts and types.ts the task-list reads.
+ * refuseProductionSessionDbUnderTest; sqlite/index.ts, sqlite.test.ts and types.ts the task-list reads;
+ * session-routing.ts and session-state.ts the reply route that threads tool sends from the answered message.
  */
 export const FORK_DIVERGED_UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/db/messages-in.ts',
+  'container/agent-runner/src/db/session-routing.ts',
+  'container/agent-runner/src/db/session-state.ts',
   'container/agent-runner/src/mailbox/sqlite/connection.ts',
   'container/agent-runner/src/mailbox/sqlite/index.ts',
   'container/agent-runner/src/mailbox/sqlite/sqlite.test.ts',

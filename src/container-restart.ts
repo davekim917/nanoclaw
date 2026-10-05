@@ -507,7 +507,7 @@ function partitionInstallContainers(
 /**
  * The BOOT quiescence door: stops the containers a startup reconcile is about to invalidate and proves them gone
  * before the caller mutates anything. The stop set comes from runtime labels, since the in-process registry is
- * empty at boot (src/workgroup-reconcile-doors.test.ts pins both doors). Only must-stop containers are stopped.
+ * empty at boot (src/workgroup-reconcile-doors-ratchet.test.ts pins both doors). Only must-stop containers are stopped.
  * Two partitions, because live agents can flip a workgroup while stops are in flight: pre-stop against the
  * snapshot (stop set, note skip set), then post-stop over a fresh inventory against the re-evaluated set, with a
  * second stop pass. A final inventory must show nothing in must-stop or boot fails; its survivors are the adoption

@@ -109,12 +109,12 @@ Drift tests, green before and after every port:
 
 | Seam | Test |
 | --- | --- |
-| Mailbox manifest: ported-verbatim upstream files match `src/mailbox/UPSTREAM-MANIFEST.json` | `src/mailbox-seam-upstream.test.ts` |
+| Mailbox manifest: ported-verbatim upstream files match `src/mailbox/UPSTREAM-MANIFEST.json` | `src/mailbox-seam-upstream-tripwire.test.ts` |
 | Mailbox ratchet: the host allowlist in `src/mailbox/RATCHET.json` never grows | `src/mailbox-seam-ratchet.test.ts` |
 | Mailbox composition: every session-provisioning path loads the mailbox composition | `src/mailbox-seam-composition.test.ts` |
 | Scripts that reach the seam route through it | `src/mailbox-seam-unreachable-scripts.test.ts`, `scripts/mailbox-seam-unreachable.test.ts` |
 | Host-sweep duty registration table | `src/host-sweep-registry.test.ts` |
-| Host lifecycle: ported-verbatim files match `src/host-lifecycle-seam/UPSTREAM-MANIFEST.json` | `src/host-lifecycle-seam.test.ts`, `src/host-lifecycle.test.ts` |
+| Host lifecycle: ported-verbatim files match `src/host-lifecycle-seam/UPSTREAM-MANIFEST.json` | `src/host-lifecycle-seam-tripwire.test.ts`, `src/host-lifecycle.test.ts` |
 | Upstream-ownership ratchet is current | `src/upstream-ratchet.test.ts` |
 | Agent-runner hermeticity | `container/agent-runner/src/test-hermeticity.test.ts` |
 

@@ -8,7 +8,7 @@
  *   3. outbound `session_state` work_continuation/pending_next → clearWorkContinuation
  *
  * Entry points: sweep duty S19 right after the only active→closed transition (pinned by
- * `session-close-sites.test.ts`), and `drainClosedSessionPendingBacklog()` at boot.
+ * `session-close-sites-ratchet.test.ts`), and `drainClosedSessionPendingBacklog()` at boot.
  */
 import fs from 'node:fs';
 import path from 'node:path';
