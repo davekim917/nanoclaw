@@ -244,9 +244,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/worktree-cleanup.test.ts',
 ];
 
-/**
- * Test files whose subject is the migration runner on the central handle, so they run it by hand.
- */
+/** Test files that run the migrations on the central handle by hand, each for the reason given. */
 const RAW_MIGRATION_SUBJECTS: readonly string[] = [
   // Re-runs the full migration list to prove it is idempotent.
   'src/db/db-v2.test.ts',
