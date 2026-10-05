@@ -39,7 +39,7 @@ import {
 import { type RawStatements, withCentralSync, withRawDb } from './db/central-lease.js';
 // Every `getRawDb()` here runs in the storage worker thread, on its own connection with no host lease to join;
 // the one host-side entry point, `finishInterruptedSessionArchivals`, takes the lease. Pinned by
-// `src/db/raw-outside-lease.test.ts`.
+// `src/db/raw-outside-lease-tripwire.test.ts`.
 import { getRawDb } from './db/connection.js';
 import { CONTAINER_CONFIGS_ALL_SQL } from './db/container-configs.js';
 import type { ContainerConfigRow } from './types.js';

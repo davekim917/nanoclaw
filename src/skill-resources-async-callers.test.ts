@@ -24,7 +24,7 @@
  * out what each relative import would resolve to at the install location, read
  * that file's async exports, and fail on any bare call. It uses the TypeScript
  * compiler API rather than the type checker, so it needs no program, no
- * tsconfig and no mocks - the same shape as `src/db/transaction-closures.test.ts`.
+ * tsconfig and no mocks - the same shape as `src/db/transaction-closures-tripwire.test.ts`.
  */
 import fs from 'node:fs';
 import path from 'node:path';

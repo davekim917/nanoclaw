@@ -1,5 +1,5 @@
 /**
- * POSITIVE FIXTURE for src/db/transaction-closures.test.ts — a `.transaction(`
+ * POSITIVE FIXTURE for src/db/transaction-closures-tripwire.test.ts — a `.transaction(`
  * call whose receiver is better-sqlite3's synchronous `Database`.
  *
  * Nothing imports this at runtime and nothing calls it: the handle is `declare

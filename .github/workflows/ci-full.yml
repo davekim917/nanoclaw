@@ -179,7 +179,7 @@ jobs:
         # pass, 0 fail, no timeouts) with no equivalent to the host's
         # CPU-heavy-test regression found, so this needed no timeout scaling
         # of its own. Revisit if a bun-side test starts timing out under
-        # coverage the way transaction-closures.test.ts did on the host.
+        # coverage the way transaction-closures-tripwire.test.ts did on the host.
         run: bun run test -- --coverage --coverage-reporter=lcov --coverage-reporter=text
 
       # Both build real fixture repos and run the SHIPPED scripts against

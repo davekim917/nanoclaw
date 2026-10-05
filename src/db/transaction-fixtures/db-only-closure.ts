@@ -1,5 +1,5 @@
 /**
- * POSITIVE FIXTURE for src/db/transaction-closures.test.ts — a
+ * POSITIVE FIXTURE for src/db/transaction-closures-tripwire.test.ts — a
  * `centralTransaction` closure that awaits ONLY `DbDriver` calls, which is the
  * only shape plan §4.4 allows. The resolver must find its awaits and classify
  * every one as a driver call, so a green run means "the DB-only rule holds",

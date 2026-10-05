@@ -281,17 +281,9 @@ describe('channel + router integration', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const {
-      initTestDb,
-      runMigrations,
-      createAgentGroup,
-      createMessagingGroup,
-      createMessagingGroupAgent,
-      getRawDb: getRawDbFresh,
-    } = await import('../db/index.js');
-    await initTestDb();
-    const db = getRawDbFresh();
-    runMigrations(db);
+    const { initMigratedTestDb, createAgentGroup, createMessagingGroup, createMessagingGroupAgent } =
+      await import('../db/index.js');
+    await initMigratedTestDb();
 
     await createAgentGroup({
       id: 'ag-1',

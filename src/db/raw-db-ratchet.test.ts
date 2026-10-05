@@ -7,7 +7,7 @@
  * deletes both functions and this file with them.
  *
  * Until then the two escape hatches are safe only because the fork opens ZERO
- * driver transactions (src/db/transaction-closures.test.ts is the other half of
+ * driver transactions (src/db/transaction-closures-tripwire.test.ts is the other half of
  * that invariant): a raw statement bypasses the driver's `activeTransaction`
  * gate, so one running inside an open `BEGIN IMMEDIATE` would silently join a
  * transaction it knows nothing about. Every NEW raw call site widens that
@@ -37,12 +37,12 @@ const SCAN_ROOTS = ['src', 'scripts', 'setup'] as const;
  * Not callers, and excluded from the scan:
  *  - `connection.ts` defines both functions.
  *  - this file names them in its own matcher, so it would otherwise match itself.
- *  - `raw-outside-lease.test.ts` (PR 6) pins the CALL sites the same way.
+ *  - `raw-outside-lease-tripwire.test.ts` (PR 6) pins the CALL sites the same way.
  */
 const DEFINER = 'src/db/connection.ts';
 const SELF = 'src/db/raw-db-ratchet.test.ts';
 /** Names the identifier in its own matcher and fixture, like this file. */
-const LEASE_TRIPWIRE = 'src/db/raw-outside-lease.test.ts';
+const LEASE_TRIPWIRE = 'src/db/raw-outside-lease-tripwire.test.ts';
 const NOT_CALLERS: readonly string[] = [DEFINER, SELF, LEASE_TRIPWIRE];
 
 /**
@@ -114,7 +114,7 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF, LEASE_TRIPWIRE];
  * PR 6's Codex round 1 (#460) then put every remaining runtime raw statement
  * under the lease — `withCentralSync(() => withRawDb(…))` at the leaf, or a
  * lease-only `withRawDb` leaf whose callers take the lease — which dropped
- * the importer set to the bare-handle files `src/db/raw-outside-lease.test.ts`
+ * the importer set to the bare-handle files `src/db/raw-outside-lease-tripwire.test.ts`
  * enumerates plus the tests that seed through the raw handle (176 → 154; 152 after the 5c merge).
  *
  * PR 6 also carried the three "5c deferral" families 5b left raw (180 → 176):
@@ -141,7 +141,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/agent-runner-source.test.ts',
   'src/attention-sources.test.ts',
   'src/capabilities.test.ts',
-  'src/channels/channel-registry.test.ts',
   'src/channels/chat-sdk-bridge-recovery.test.ts',
   'src/cli/crud-validate.test.ts',
   'src/cli/crud.test.ts',
@@ -257,28 +256,48 @@ const RAW_MIGRATION_SUBJECTS: readonly string[] = [
   'src/modules/approvals/onecli-approvals.test.ts',
 ];
 
-function calleeName(expr: ts.Expression): string | undefined {
-  if (ts.isIdentifier(expr)) return expr.text;
-  if (ts.isPropertyAccessExpression(expr)) return expr.name.text;
-  return undefined;
+interface Binding {
+  readonly declaration: ts.VariableDeclaration;
+  /** The property a destructured local was bound from (`{ getRawDb: fresh }` gives `getRawDb`). */
+  readonly property?: string;
 }
 
-/** A `getRawDb()` call, or an identifier whose nearest enclosing declaration is initialised from one. */
-function isRawHandle(expr: ts.Expression, at: ts.Node): boolean {
-  if (ts.isCallExpression(expr)) return calleeName(expr.expression) === 'getRawDb';
-  if (!ts.isIdentifier(expr)) return false;
+/** The nearest enclosing `const`/`let`/`var` binding of `name`, plain or destructured. */
+function findBinding(name: string, at: ts.Node): Binding | undefined {
   for (let scope: ts.Node | undefined = at.parent; scope; scope = scope.parent) {
     if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
     for (const statement of scope.statements) {
       if (!ts.isVariableStatement(statement)) continue;
-      for (const decl of statement.declarationList.declarations) {
-        if (ts.isIdentifier(decl.name) && decl.name.text === expr.text) {
-          return decl.initializer !== undefined && isRawHandle(decl.initializer, decl);
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) {
+          if (declaration.name.text === name) return { declaration };
+          continue;
+        }
+        if (!ts.isObjectBindingPattern(declaration.name)) continue;
+        for (const element of declaration.name.elements) {
+          if (!ts.isIdentifier(element.name) || element.name.text !== name) continue;
+          const key = element.propertyName ?? element.name;
+          return { declaration, property: ts.isIdentifier(key) ? key.text : undefined };
         }
       }
     }
   }
-  return false;
+  return undefined;
+}
+
+/** `fn`, `ns.fn`, or a local destructured as `{ fn: local }`. */
+function namesFunction(expr: ts.Expression, fn: string): boolean {
+  if (ts.isPropertyAccessExpression(expr)) return expr.name.text === fn;
+  if (!ts.isIdentifier(expr)) return false;
+  return expr.text === fn || findBinding(expr.text, expr)?.property === fn;
+}
+
+/** A `getRawDb()` call, or an identifier whose nearest enclosing declaration is initialised from one. */
+function isRawHandle(expr: ts.Expression, at: ts.Node): boolean {
+  if (ts.isCallExpression(expr)) return namesFunction(expr.expression, 'getRawDb');
+  if (!ts.isIdentifier(expr)) return false;
+  const initializer = findBinding(expr.text, at)?.declaration.initializer;
+  return initializer !== undefined && isRawHandle(initializer, initializer);
 }
 
 function rawMigrationLines(fileName: string, text: string): number[] {
@@ -288,7 +307,7 @@ function rawMigrationLines(fileName: string, text: string): number[] {
   const visit = (node: ts.Node): void => {
     if (
       ts.isCallExpression(node) &&
-      calleeName(node.expression) === 'runMigrations' &&
+      namesFunction(node.expression, 'runMigrations') &&
       node.arguments.length > 0 &&
       isRawHandle(node.arguments[0], node)
     ) {
@@ -350,14 +369,15 @@ describe('the raw central-DB handle only shrinks', () => {
     ).toEqual([]);
   });
 
-  it('finds a hand-run migration through a call, a namespace and an alias', () => {
+  it('finds a hand-run migration through a call, a namespace, an alias and a renamed destructure', () => {
     const fixture = [
       'runMigrations(getRawDb());',
       'dbIndex.runMigrations(dbIndex.getRawDb());',
       'async function setup() { const db = getRawDb(); runMigrations(db); }',
+      'async function fresh() { const { getRawDb: raw, runMigrations: migrate } = await import("x"); migrate(raw()); }',
       'const scratch = new Database(":memory:"); runMigrations(scratch);',
     ].join('\n');
-    expect(rawMigrationLines('fixture.test.ts', fixture)).toEqual([1, 2, 3]);
+    expect(rawMigrationLines('fixture.test.ts', fixture)).toEqual([1, 2, 3, 4]);
   });
 
   it('tests migrate through initMigratedTestDb, never by hand on the raw handle', () => {

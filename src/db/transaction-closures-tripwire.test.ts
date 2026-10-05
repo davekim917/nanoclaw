@@ -412,7 +412,7 @@ describe('centralTransaction closures await only DB work', () => {
   // type checking) inside the test body, not at collection time like the `every
   // .transaction( receiver` describe block above. Comfortably fast normally, but
   // `--coverage`'s V8 instrumentation overhead applies to every statement executed
-  // process-wide — including this one, even though transaction-closures.test.ts
+  // process-wide — including this one, even though transaction-closures-tripwire.test.ts
   // itself matches no risk:high glob — and pushed it past the 5000ms default in CI
   // (PR #662). No explicit per-test timeout here: vitest.config.ts's
   // COVERAGE_TIMEOUT_MULTIPLIER scales the GLOBAL default under --coverage instead
