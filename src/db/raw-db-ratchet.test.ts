@@ -180,7 +180,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/dashboard/thread-message.test.ts',
   'src/dashboard/thread-snooze.test.ts',
   'src/db/agent-groups.test.ts',
-  'src/db/boot-order.test.ts',
+  'src/db/boot-order-tripwire.test.ts',
   'src/db/central-lease.ts',
   'src/db/db-v2.test.ts',
   'src/db/index.ts',

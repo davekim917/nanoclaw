@@ -169,7 +169,7 @@ jobs:
         # `bun run test`, not bare `bun test`: the package script adds the
         # hermeticity tripwire preload (issue #305). bunfig.toml would be the
         # natural home for it, but that file is a byte-for-byte upstream port
-        # pinned by src/mailbox-seam-upstream.test.ts.
+        # pinned by src/mailbox-seam-upstream-tripwire.test.ts.
         #
         # `--coverage`/`--coverage-reporter` are extra args after `bun run
         # test`'s own `--`, not a bunfig.toml edit (see the pin note above).

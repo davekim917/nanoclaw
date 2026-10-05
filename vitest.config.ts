@@ -41,7 +41,7 @@ import skillsConfig from './vitest.skills.config.js';
  * else; unset (plain `pnpm test`) runs both lanes together, as before.
  */
 const DRIFT_TESTS = [
-  'src/mailbox-seam-upstream.test.ts',
+  'src/mailbox-seam-upstream-tripwire.test.ts',
   'src/upstream-ratchet.test.ts',
   'src/design-artifact-loop-vendor.test.ts',
 ] as const;

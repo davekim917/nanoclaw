@@ -149,7 +149,7 @@ describe('risk-scope.jq reads labeler.yml', () => {
 
 describe('risk-scope.jq matches as actions/labeler v7 does', () => {
   it('agrees on every labeler.yml glob against every tracked path, plus dotted and deep ones', () => {
-    // labeler-config.test.ts holds every risk:<dimension> glob to a subset of
+    // labeler-config-tripwire.test.ts holds every risk:<dimension> glob to a subset of
     // risk:high, so these are all of labeler.yml's globs.
     const globs = globsForRiskHigh(parse(LABELER_YML) as Record<string, unknown>);
     const tracked = spawnSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });

@@ -1,6 +1,6 @@
 /**
  * Upstream seam-port manifest (host-lifecycle seam and the DbDriver layer): UPSTREAM_FILES are ported byte-for-byte
- * and must never be hand-edited (src/host-lifecycle-seam.test.ts fails on drift). Hashes live in a manifest because
+ * and must never be hand-edited (src/host-lifecycle-seam-tripwire.test.ts fails on drift). Hashes live in a manifest because
  * CI's clone carries no upstream objects. To re-pin, run
  * `pnpm exec tsx scripts/host-lifecycle-seam-manifest.ts --update <upstream-sha>` from a worktree with upstream's
  * objects and commit the manifest with the ported changes.

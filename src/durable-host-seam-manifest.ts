@@ -1,6 +1,6 @@
 /**
  * Upstream durable-host seam manifest. UPSTREAM_FILES are ported byte-for-byte from upstream and must never be
- * hand-edited: src/durable-host-seam.test.ts fails on drift from src/durable-host-seam/UPSTREAM-MANIFEST.json.
+ * hand-edited: src/durable-host-seam-tripwire.test.ts fails on drift from src/durable-host-seam/UPSTREAM-MANIFEST.json.
  * To re-sync, run `pnpm exec tsx scripts/durable-host-seam-manifest.ts --update <upstream-sha>` from a worktree
  * holding upstream's objects and commit the regenerated manifest with the ported files. A manifest rather than
  * `git show`, because CI's clone carries no upstream objects.

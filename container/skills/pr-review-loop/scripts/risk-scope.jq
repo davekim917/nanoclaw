@@ -5,7 +5,7 @@
 # tracked path. Plain jq, so the host and an agent container run the same code.
 
 # The globs under the one `risk:high` key, read from the raw YAML. Only the
-# shape scripts/labeler-config.test.ts pins is read — one rule holding one
+# shape scripts/labeler-config-tripwire.test.ts pins is read — one rule holding one
 # `any-glob-to-any-file` block list of quoted globs:
 #
 #   risk:high:

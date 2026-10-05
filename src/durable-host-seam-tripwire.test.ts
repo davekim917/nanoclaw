@@ -8,7 +8,7 @@
  *
  * A manifest (rather than `git show <sha>:<path>`) is used because the fork's CI
  * clone does not carry upstream commits — same pattern and same reasoning as
- * src/host-lifecycle-seam.test.ts and src/mailbox-seam-upstream.test.ts.
+ * src/host-lifecycle-seam-tripwire.test.ts and src/mailbox-seam-upstream-tripwire.test.ts.
  */
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';

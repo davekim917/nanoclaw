@@ -95,7 +95,7 @@ disk walk plus a GitHub and an Anthropic API call since before anyone looked.
   `--preload` by the package's own `test` script. Run the runner suite as
   `bun run test`, not bare `bun test`, or the guard is not installed.
   `bunfig.toml` would be the natural home for the entry, but that file is a
-  byte-for-byte upstream port pinned by `src/mailbox-seam-upstream.test.ts`.
+  byte-for-byte upstream port pinned by `src/mailbox-seam-upstream-tripwire.test.ts`.
 
 Three seams are guarded. `child_process` and `node:child_process` have every
 spawning export wrapped. `globalThis.fetch`, and `undici`'s `fetch`/`request` on

@@ -122,7 +122,7 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   const name = opts?.name ?? tpl.agentName ?? path.basename(dir);
   let folder = normalizeName(name);
   assertValidGroupFolder(folder);
-  // Uniqueness is a filesystem check plus a random suffix, never a DB read (see insert-or-adopt.test.ts).
+  // Uniqueness is a filesystem check plus a random suffix, never a DB read (see insert-or-adopt-tripwire.test.ts).
   if (fs.existsSync(resolveGroupFolderPath(folder))) folder = `${folder}-${randomUUID().slice(0, 8)}`;
 
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };

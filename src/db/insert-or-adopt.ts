@@ -1,7 +1,7 @@
 /**
  * `insertOrAdopt`: the one shape every lookup-then-insert against the central DB uses. With the async driver every
  * read yields, so two callers can both see "no row" and both INSERT; the unique index settles it, and the loser
- * should adopt the winner's row rather than fail. A tripwire test (`insert-or-adopt.test.ts`) fails on a new bare
+ * should adopt the winner's row rather than fail. A tripwire test (`insert-or-adopt-tripwire.test.ts`) fails on a new bare
  * `createSession(` / `createMessagingGroup(` / `createAgentGroup(` outside it.
  * Not a retry loop (one insert, one adopt), not a transaction or lock (the unique index is the arbiter), and not a
  * swallow-all: anything but a unique violation rethrows, and a violation whose winner cannot be re-read rethrows the

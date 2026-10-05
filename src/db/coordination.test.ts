@@ -3,7 +3,7 @@
  * (docs/specs/upstream-restart-survival-seam/plan.md §7.A).
  *
  * The accessors themselves are byte-identical to upstream and never edited
- * (src/durable-host-seam.test.ts pins that). These cases exist because the
+ * (src/durable-host-seam-tripwire.test.ts pins that). These cases exist because the
  * fork depends on specific SEMANTICS of theirs in later series — the CAS
  * fence, the holder-scoped release, the strict `>` lease comparison — so a
  * future upstream re-pin that changes any of them fails here rather than in
