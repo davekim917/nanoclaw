@@ -23,8 +23,8 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
 import { closeDb, initMigratedTestDb } from '../db/index.js';
 import type { ChannelSetup, InboundMessage } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
-import { registerSlackBot, type SlackBotIdentity } from './slack-mentions.js';
-import { slackHopInboundFilter } from './slack.js';
+import { registerSlackBot, registerSlackWorkspaceHumans, type SlackBotIdentity } from './slack-mentions.js';
+import { isSlackWorkspaceHuman, slackHopInboundFilter } from './slack.js';
 import { createSlackHopGovernor, DEFAULT_MAX_BOT_HOPS, parseMaxBotHops } from './slack-hop-limit.js';
 
 const THREAD = 'slack:C1:ts-1';
@@ -177,6 +177,7 @@ async function runThroughBridge(
   const bridge = createChatSdkBridge({
     adapter,
     supportsThreads: true,
+    isHumanAuthor: (userId) => isSlackWorkspaceHuman(SELF, userId),
     inboundFilter: (message, ctx) => (ctx.recovered ? true : slackHopInboundFilter(governor, SELF, message)),
   });
 
@@ -258,6 +259,22 @@ describe('the governor as the Slack bridge inboundFilter', () => {
     const human = { userId: 'U-human', isBot: false };
     const delivered = await runThroughBridge([sibling, sibling, sibling, human, sibling], 2);
     expect(delivered).toEqual(['m-0', 'm-1', 'm-3', 'm-4']);
+  });
+
+  it('a workspace human posting through an app (bot_id set) still resets the counter', async () => {
+    registerSlackWorkspaceHumans(SELF.teamId, [{ userId: 'U-operator', username: 'operator', teamId: SELF.teamId }]);
+    const sibling = { userId: SIBLING.userId, isBot: true };
+    const humanViaApi = { userId: 'U-operator', isBot: true };
+    const delivered = await runThroughBridge([sibling, sibling, sibling, humanViaApi, sibling], 2);
+    expect(delivered).toEqual(['m-0', 'm-1', 'm-3', 'm-4']);
+  });
+
+  it('a bot-flagged author who is not a registered human still counts nothing and resets nothing', async () => {
+    registerSlackWorkspaceHumans(SELF.teamId, [{ userId: 'U-operator', username: 'operator', teamId: SELF.teamId }]);
+    const sibling = { userId: SIBLING.userId, isBot: true };
+    const thirdParty = { userId: 'B-github', isBot: true };
+    const delivered = await runThroughBridge([sibling, sibling, sibling, thirdParty, sibling], 2);
+    expect(delivered).toEqual(['m-0', 'm-1', 'm-3']);
   });
 
   it('never blocks a human, however long the bot exchange ran', async () => {

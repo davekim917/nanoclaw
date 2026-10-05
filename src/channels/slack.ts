@@ -21,6 +21,7 @@ import {
   fetchSlackBotIdentity,
   getSlackBotSenderName,
   getKnownSlackBots,
+  getKnownSlackHumans,
   registerSlackBot,
   registerSlackWorkspaceHumans,
   slackMentionOutsideCode,
@@ -102,6 +103,15 @@ export function slackHopInboundFilter(
     isSiblingBot,
     isHuman: !isSiblingBot && message.author?.isBot !== true,
   });
+}
+
+/**
+ * Slack stamps `bot_id` on every app-posted message, including a human's own post through a user token, and the SDK
+ * turns that into `isBot`. A registered workspace human is a human however the post was made.
+ */
+export function isSlackWorkspaceHuman(identity: SlackBotIdentity | null, userId: string): boolean {
+  if (!identity) return false;
+  return (getKnownSlackHumans().get(identity.teamId) ?? []).some((human) => human.userId === userId);
 }
 
 /**
@@ -626,6 +636,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
           // slack-raw-text.ts.
           return extractSlackRawText(raw)?.includes(mention) === true;
         },
+        isHumanAuthor: (userId) => isSlackWorkspaceHuman(identity, userId),
         // Sibling-bot messages are admissible in recovery, or a sibling's @-mention that arrived during a stall is
         // silently lost.
         allowRecoveredBotMessage: (message) => {
