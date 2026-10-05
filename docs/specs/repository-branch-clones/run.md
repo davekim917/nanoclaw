@@ -272,7 +272,7 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
      - The fix: `findTopicRegenerableTargets` also takes a real directory with a regenerable name at the worktrees root.
      - The proof: `still sweeps a regenerable store at the worktrees root, beside the checkouts`.
   4. **No edits to upstream-ported mailbox files.**
-     - The problem: C added `findRepositoryActionResponse` to `db/messages-in.ts` and to the three `mailbox/` files pinned by `UPSTREAM-MANIFEST.json`, which `mailbox-seam-upstream-tripwire.test.ts` failed on.
+     - The problem: C added `findRepositoryActionResponse` to `db/messages-in.ts` and to the three `mailbox/` files pinned by `UPSTREAM-MANIFEST.json`, which `mailbox-seam-upstream.test.ts` failed on.
      - The fix: reverted. The tool reads the response with the existing exact-id `getMessageIn`, which opens a fresh handle per call (`mailbox/sqlite/operations.ts:94-101`), and requires `status === 'pending'`.
   5. **`open_pr` keeps its documented contract.**
      - The problem: selecting the checkout by `branch` made `open_pr` fail when no checkout still holds the pushed branch, which is the very case `branch` exists for.

@@ -105,7 +105,7 @@ node_modules/.bin/vitest run             # full host suite
 → Tests  1 failed | 3821 passed | 1 skipped | 1 todo (3824)
 ```
 
-The single failure is `src/design-artifact-loop-vendor-tripwire.test.ts` — vendored `render.ts` drifted from
+The single failure is `src/design-artifact-loop-vendor.test.ts` — vendored `render.ts` drifted from
 `~/plugins/design-artifact-loop/server/render.ts`. **Pre-existing and unrelated**: that file is
 clean against HEAD in this working tree, its last commit is `89ca8162` (another session's diagram
 refactor), and it shares no code with this build's diff.
@@ -219,7 +219,7 @@ node_modules/.bin/vitest run src/delivery.test.ts src/storage-manager.test.ts
 node_modules/.bin/vitest run                                      → 1 failed | 3824 passed | 1 skipped | 1 todo
 ```
 
-The single remaining failure is `src/design-artifact-loop-vendor-tripwire.test.ts`, pre-existing vendor
+The single remaining failure is `src/design-artifact-loop-vendor.test.ts`, pre-existing vendor
 drift against `~/plugins/design-artifact-loop`; its files are clean against HEAD and share no code
 with this diff. Before the correction the run showed **two** failing files (storage-manager's mock);
 after, it is back to one.

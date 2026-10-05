@@ -43,7 +43,7 @@ import skillsConfig from './vitest.skills.config.js';
 const DRIFT_TESTS = [
   'src/mailbox-seam-upstream-tripwire.test.ts',
   'src/upstream-ratchet.test.ts',
-  'src/design-artifact-loop-vendor-tripwire.test.ts',
+  'src/design-artifact-loop-vendor.test.ts',
 ] as const;
 
 const lane = process.env.VITEST_LANE;

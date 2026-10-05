@@ -109,7 +109,7 @@ The order that keeps the proof intact at every deployed state:
 - **D1** replaces the fleet-wide stop with a primitive that computes the scoped set, proves it, logs the counterfactual, and then stops exactly what `cleanupOrphansStrict` stopped. Behavior identical; the scope decision runs in production before it is allowed to skip a stop.
 - **D2** flips the primitive to honour its own scope. This is the first state in which a container outlives a host restart, and divergences 3, 8, 9 and 10 say that state is only safe once **E** re-registers survivors in `activeContainers` (restoring the `wakeContainer` fast path at `src/container-runner.ts:608`), **E** also closes the two unit-file doors that kill containers regardless of what Node does, **F** reconciles the `on_wake` rows a survivor can never select and makes an interrupted restart recoverable, and **G** stops the host telling an adopted session its container was stopped mid-work. Four merges, one restart (§7).
 
-Invariant in a primitive, part 1: `tryClaimSession` (CAS on `incarnation`, `changes > 0`) is the only path that may start or adopt a container. `src/session-claim-callers-ratchet.test.ts` pins its caller set as a file list (shrink-or-equal), the same ratchet shape seam 3 uses for `getRawDb` and seam 2 uses for `computeOffenders`.
+Invariant in a primitive, part 1: `tryClaimSession` (CAS on `incarnation`, `changes > 0`) is the only path that may start or adopt a container. `src/session-claim-callers.test.ts` pins its caller set as a file list (shrink-or-equal), the same ratchet shape seam 3 uses for `getRawDb` and seam 2 uses for `computeOffenders`.
 
 ### 4.2 Mount changes go only through a quiescence door
 
@@ -118,7 +118,7 @@ Invariant in a primitive, part 2: `reconcileWorkgroupMemory` and `reconcileWorkg
 - **the boot door**, `quiesceWorkgroupsForBootMountChange(changedWorkgroupIds)`, whose stop set comes from the container runtime by label, or
 - **the runtime door**, `quiesceAgentGroupsForRepositoryMounts` / `quiesceSessionsForRepositoryMounts` (`src/container-restart.ts:363,372`), whose stop set comes from the in-process registry,
 
-or from the no-container path when the boot predicate reports no workgroup would change. `src/workgroup-reconcile-doors-ratchet.test.ts` pins the caller file set for both reconcilers and asserts the boot call order (`quiesce…` resolves before either reconciler is entered, and `pruneAgentRunnerSnapshots` runs after both). Two doors rather than one because the two stop sets have different authorities and the fork cannot merge them until adoption makes the registry complete at boot (divergence 2).
+or from the no-container path when the boot predicate reports no workgroup would change. `src/workgroup-reconcile-doors.test.ts` pins the caller file set for both reconcilers and asserts the boot call order (`quiesce…` resolves before either reconciler is entered, and `pruneAgentRunnerSnapshots` runs after both). Two doors rather than one because the two stop sets have different authorities and the fork cannot merge them until adoption makes the registry complete at boot (divergence 2).
 
 The boot door does **not** fence session ingress and does not wait for a barrier ack, unlike the runtime door. Deliberate: today's boot path (`cleanupOrphansStrict`) stops the same population with no fence and no drain, so adding one at boot would be new behavior on the startup critical path with a 120 s per-session timeout (`src/container-restart.ts:375`), and the sessions being stopped are exactly the ones whose mounts are changing. The boot door is a scoped `cleanupOrphansStrict`, not a scoped `quiesceSessionsForRepositoryMounts`.
 
@@ -326,7 +326,7 @@ Per-PR mechanics, unchanged from seam 3 §7: scratch worktree, `git -C`, boundar
 | `src/host-instance.ts`                                     | **new**, upstream byte-identical (85 L)  |
 | `src/main.ts`                                              | start the lease; stop it in `shutdown()` |
 | `src/durable-host-seam-manifest.ts`                        | **new**, the two files' upstream hashes  |
-| `src/durable-host-seam-tripwire.test.ts`                            | **new**, drift tripwire                  |
+| `src/durable-host-seam.test.ts`                            | **new**, drift tripwire                  |
 | `src/db/coordination.test.ts`, `src/host-instance.test.ts` | **new**                                  |
 | `src/upstream-ratchet.json`                                | regenerated                              |
 
@@ -370,9 +370,9 @@ await stopHostInstanceLease();
 - _"a rejected stop stamp does not throw"_.
 - _"the renew timer is unref'd"_ — assert `unref` was called on the returned handle.
 
-`src/durable-host-seam-tripwire.test.ts`:
+`src/durable-host-seam.test.ts`:
 
-- _"coordination.ts and host-instance.ts are byte-identical to upstream"_ — same manifest-hash shape as `src/host-lifecycle-seam-tripwire.test.ts` / `src/mailbox-seam-manifest.ts`; a local patch to either file fails the build.
+- _"coordination.ts and host-instance.ts are byte-identical to upstream"_ — same manifest-hash shape as `src/host-lifecycle-seam.test.ts` / `src/mailbox-seam-manifest.ts`; a local patch to either file fails the build.
 
 **Rollback.** Revert the merge, build, restart. The rows written stay and are ignored; the next build with A re-registers under a fresh instance id.
 
@@ -473,7 +473,7 @@ In `src/agent-runner-source.test.ts` (existing): the pruner cases must pass unmo
 
 ### 7.A′ — claim-first spawn
 
-**Files.** `src/container-runner.ts`; `src/session-claim-spawn.test.ts` (new); `src/session-claim-callers-ratchet.test.ts` (new ratchet); `src/upstream-ratchet.json`.
+**Files.** `src/container-runner.ts`; `src/session-claim-spawn.test.ts` (new); `src/session-claim-callers.test.ts` (new ratchet); `src/upstream-ratchet.json`.
 
 **Insertion points, all in `src/container-runner.ts`.**
 
@@ -516,7 +516,7 @@ This is the ordering argument: the claim is the **last `await`** in the spawn pa
 - _"a stale finish does not release a fresh claim"_ — register runtime A at incarnation 1, replace it with runtime B at incarnation 2, emit A's `close`; assert `markContainerStopped` not called for the session, B's claim intact, and `Ignoring stale session finish` logged.
 - _"the claimant id is the host instance id when the lease is running"_.
 
-`src/session-claim-callers-ratchet.test.ts` (§4.1 ratchet):
+`src/session-claim-callers.test.ts` (§4.1 ratchet):
 
 - _"tryClaimSession has exactly one caller"_ — the caller file/function set is pinned to `claimSessionRun` in `src/container-runner.ts`; the list may shrink, never grow. E adds `adoptRunningSessions` to it in its own PR, deliberately and visibly.
 
@@ -534,7 +534,7 @@ D1 ships in this batch. D2 is the flip and is gated on E and F (§4.1, divergenc
 | `src/container-runtime.ts`             | add `listInstallContainersWithScope()`; keep `cleanupOrphansStrict` (D1 still calls its stop-and-prove body)                                         |
 | `src/container-restart.ts`             | add `quiesceWorkgroupsForBootMountChange` after `:478`, beside the runtime door                                                                      |
 | `src/main.ts`                          | restructure `:283-317`; `runWorkgroupMemoryStartupGate` (`:153-164`) loses `cleanupOrphansStrict` from its body                                      |
-| new tests                              | `shared-dirs.wouldchange.test.ts`, `container-restart.boot-quiescence.test.ts`, `boot-quiescence-order.test.ts`, `workgroup-reconcile-doors-ratchet.test.ts` |
+| new tests                              | `shared-dirs.wouldchange.test.ts`, `container-restart.boot-quiescence.test.ts`, `boot-quiescence-order.test.ts`, `workgroup-reconcile-doors.test.ts` |
 
 **Insertion points.**
 
@@ -624,7 +624,7 @@ pruneAgentRunnerSnapshots();
 - _"shared-FS consolidation no longer runs before the quiescence proof"_ — the divergence-4 regression guard.
 - _"a boot where nothing would change stops nothing"_ — **D1**: assert the primitive was called with an empty changed set and reported `stopped == containers`; the D2 PR changes this to `stopped == 0`.
 
-`src/workgroup-reconcile-doors-ratchet.test.ts` (§4.2 invariant):
+`src/workgroup-reconcile-doors.test.ts` (§4.2 invariant):
 
 - _"reconcileWorkgroupMemory and reconcileWorkgroupSharedDirs have exactly the pinned callers"_ — the file/function set is the boot continuation in `src/main.ts` plus the existing runtime callers; shrink-or-equal.
 - _"the boot caller is reached only after a quiescence door"_ — AST over `main()`: no call to either reconciler precedes the `quiesceWorkgroupsForBootMountChange` await.
@@ -645,7 +645,7 @@ The second milestone. Ships with F, G and D2 on one restart (§7, restart batchi
 | `scripts/nanoclaw-v2.service`       | drop `ExecStop=`; add `KillMode=mixed`; `TimeoutStopSec=30`                                                                                                                            |
 | `data/systemd/nanoclaw-v2.service`  | same three lines (deployed copy, install data — called out in the PR body)                                                                                                             |
 | new tests                           | `src/container-adoption.test.ts`, `src/adoption-order.test.ts`, `src/container-supervision-channel.test.ts`                                                                            |
-| `src/session-claim-callers-ratchet.test.ts` | the pinned caller set grows by exactly one, deliberately and visibly (§7.A′)                                                                                                           |
+| `src/session-claim-callers.test.ts` | the pinned caller set grows by exactly one, deliberately and visibly (§7.A′)                                                                                                           |
 | `src/upstream-ratchet.json`         | regenerated                                                                                                                                                                            |
 
 **Insertion points.**

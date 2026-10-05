@@ -298,7 +298,7 @@ Because `duty` and `window` are structured fields, a family PR's post-deploy che
 
 ### 4.6 Drift tests
 
-1. **Upstream manifest** — `src/host-lifecycle-seam/UPSTREAM-MANIFEST.json`: `{ upstream: "5c3082a1", files: { "<path>": "<sha256>" } }` over an explicit `UPSTREAM_FILES` constant (`src/host-lifecycle.ts` only; `src/host-lifecycle.test.ts` is in `UNPORTABLE_UPSTREAM_FILES`, §4.1, and the test asserts the two sets are disjoint). The test asserts the manifest's key set **equals** `UPSTREAM_FILES`, then recomputes and compares every hash. `--update <sha>` regenerates via `git show <sha>:<path>` and is the only sanctioned way to touch those files. A manifest rather than `git show` because CI's clone carries no upstream objects. Same pattern as `src/mailbox-seam-upstream-tripwire.test.ts` and `src/design-artifact-loop-vendor-tripwire.test.ts`.
+1. **Upstream manifest** — `src/host-lifecycle-seam/UPSTREAM-MANIFEST.json`: `{ upstream: "5c3082a1", files: { "<path>": "<sha256>" } }` over an explicit `UPSTREAM_FILES` constant (`src/host-lifecycle.ts` only; `src/host-lifecycle.test.ts` is in `UNPORTABLE_UPSTREAM_FILES`, §4.1, and the test asserts the two sets are disjoint). The test asserts the manifest's key set **equals** `UPSTREAM_FILES`, then recomputes and compares every hash. `--update <sha>` regenerates via `git show <sha>:<path>` and is the only sanctioned way to touch those files. A manifest rather than `git show` because CI's clone carries no upstream objects. Same pattern as `src/mailbox-seam-upstream.test.ts` and `src/design-artifact-loop-vendor.test.ts`.
 2. **Timer drift** (PR 1) — `src/host-lifecycle-timers.test.ts` greps `src/main.ts` for the seven start/stop symbols and asserts zero matches.
 3. **Duty drift** (PR 2, tightened at PR 14) — the same file asserts the registered set matches the checked-in inventory id set (**pinned at 41 registrations across 40 distinct names as of `origin/main`**: the 38-duty seam-2 port registers 39 times because S17 registers once on two surfaces, plus two fork additions tracked in the same inventory — #285's `cli-request-execution-prune` (T23) and #247's `github-token-file-refresh` (FORK1) — bringing it to 41/40; no further fork duty has landed beyond these two), and after the last family PR that `src/host-sweep.ts` exports nothing outside the driver/registry/phase-list allowlist and is under 300 lines.
 
@@ -451,7 +451,7 @@ Plus the moved family's own log lines at their previous rate — each family PR 
 Host, `vitest`. 93 cases. (PR 0 through PR 14 sum to 70; S2-PR15 adds 20; S2-PR16 adds 3.)
 
 **S2-PR0 — lifecycle port (4)**
-- **L-1** `src/host-lifecycle-seam-tripwire.test.ts` › "every ported upstream file matches UPSTREAM-MANIFEST.json" — manifest key set equals `UPSTREAM_FILES`; recompute sha256 for each; assert equality.
+- **L-1** `src/host-lifecycle-seam.test.ts` › "every ported upstream file matches UPSTREAM-MANIFEST.json" — manifest key set equals `UPSTREAM_FILES`; recompute sha256 for each; assert equality.
 - **L-2** `src/host-lifecycle.test.ts` (fork-owned copy of upstream's five `host module lifecycle registry` cases, verbatim — §4.1) › "start callbacks run FIFO and a throw propagates; shutdown callbacks run LIFO and a throw is swallowed" — upstream's assertions, unmodified; the two boot-order cases are kept with only the `src/index.ts` → `src/main.ts` path swapped; the approvals case is deferred.
 - **L-3** `src/main.test.ts` › "startHostModules fires after the delivery adapter and before the delivery polls; stopHostModules is the first shutdown action" — source-position assertions inside `main()` and `shutdown()` in `src/main.ts` (the precedent `src/main.memory-startup-order.test.ts` uses; `main()` cannot be driven under test without mocking its ~40 imports) — `startHostModules(` sits between `setDeliveryAdapter(` and `startActiveDeliveryPoll(`, and `hostAbortController.abort()` + `stopHostModules()` precede `stopDeliveryPolls()` — plus a runtime assertion that `startHostModules` hands every callback the same `{db, signal}` context. Deferred, with a re-raise trigger: when any seam PR makes `main()`'s boot sequence executable under test, L-3 upgrades to ordered spies over the real path (Codex PR 0 review, run.md).
 - **L-4** same file › "the lifecycle port registers no callbacks" — after importing the modules barrel, both getters return empty at PR 0. **Superseded at PR 1** (the timers register), replaced by T-5 below; the case is removed in PR 1's diff, not weakened in place.
@@ -624,10 +624,10 @@ Everything else here is an engineering decision already made and stated (§11).
 ```bash
 ./node_modules/.bin/prettier --check .
 ./node_modules/.bin/tsc --noEmit
-./node_modules/.bin/vitest run src/host-lifecycle.test.ts src/host-lifecycle-seam-tripwire.test.ts src/main.test.ts   # PR 0 (L-1..L-4)
+./node_modules/.bin/vitest run src/host-lifecycle.test.ts src/host-lifecycle-seam.test.ts src/main.test.ts   # PR 0 (L-1..L-4)
 ./node_modules/.bin/vitest run src/host-sweep-registry.test.ts src/host-sweep-reschedule.test.ts
 ./node_modules/.bin/vitest run src/host-sweep.test.ts src/modules/sweep-<family>/*.test.ts    # per family PR
-./node_modules/.bin/vitest run src/mailbox-seam-upstream-tripwire.test.ts src/mailbox-seam-ratchet.test.ts
+./node_modules/.bin/vitest run src/mailbox-seam-upstream.test.ts src/mailbox-seam-ratchet.test.ts
 pnpm run check:public-boundary -- --portable
 ```
 
@@ -653,6 +653,6 @@ Targeted files only. Never the full host suite while another builder is running,
 - Record: `groups/_ops/upstream-rebaseline-2026-09/{seam2-inventory.md, ledger.md §2.3 line 357 / §4 / §9 risk 9 / lines 401, 481-484, 583, 802, 939, 1085, seam-catalog.md §17 + :104-106, critic.md B2, contrib/}`
 - Grounding: seam2-upstream.md (upstream lifecycle and reconcile seam at `5c3082a1`), seam2-fork.md rev 2 (duty inventory on the PR 5 branch, 21 ordering constraints, legacy-handle bridge, perf history), seam2-constraints.md (mailbox branch stack, ratchet invariants, deploy conventions, review policy)
 - Upstream `5c3082a1`: `src/host-lifecycle.ts`, `src/host-lifecycle.test.ts`, `src/index.ts:155,180`, `src/host-instance.ts:51-55,71-74`, `src/reconcile.ts:30-42`, `src/reconcile-queue.ts:37-42`, `src/reconcile-session.ts:34,179-182,192-200,218-250`, `src/db/coordination.ts:5-7`, `src/db/migrations/024-host-coordination.ts`, `src/modules/approvals/index.ts:44-46`
-- Fork (PR 5 branch `756f5d02`): `src/host-sweep.ts`, `src/host-sweep.test.ts`, `src/host-sweep-reschedule.test.ts`, `src/modules/mailbox/ops/{continuation,recovery}.ts`, `src/modules/mailbox/sqlite-utc.ts`, `src/mailbox/RATCHET.json`; fork `main`: `src/main.ts:490,508,517-565,598-613,630`, `src/modules/index.ts:17`, `docs/architecture.md` (bounded-periodic-work invariant), `src/mailbox-seam-upstream-tripwire.test.ts` (manifest pattern)
+- Fork (PR 5 branch `756f5d02`): `src/host-sweep.ts`, `src/host-sweep.test.ts`, `src/host-sweep-reschedule.test.ts`, `src/modules/mailbox/ops/{continuation,recovery}.ts`, `src/modules/mailbox/sqlite-utc.ts`, `src/mailbox/RATCHET.json`; fork `main`: `src/main.ts:490,508,517-565,598-613,630`, `src/modules/index.ts:17`, `docs/architecture.md` (bounded-periodic-work invariant), `src/mailbox-seam-upstream.test.ts` (manifest pattern)
 - Predecessor: `docs/specs/upstream-mailbox-seam/{plan.md,run.md}`
 - Process: `.claude/skills/sync-upstream/SKILL.md §4`, `docs/review-policy.md`, memories `project_upstream_convergence_program`, `feedback_deploy_is_pull_build_restart`, `feedback_host_tests_unsafe_concurrent`, `feedback_never_branch_shared_checkout_main_only`

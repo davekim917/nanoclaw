@@ -343,7 +343,7 @@
 ".prettierrc":{"diff":0,"mode":"100644","sha256":"c9396af8dd02064188ba41407fb182d2e8fdc3103a1f5f3ea4d1ec703e29bafd"},
 "AGENTS.md":{"diff":0,"mode":"120000","sha256":"6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7"},
 "CHANGELOG.md":{"diff":238,"mode":"100644","sha256":"ba784f5775734a86ec6884b3c9de6ca0bc6950f018be56818ff44eb248b58ac9"},
-"CLAUDE.md":{"diff":345,"mode":"100644","sha256":"925c7a7dd7fc0731915c08d60409eaf6b51f7847f1091f5147d6c58c9b689a42"},
+"CLAUDE.md":{"diff":345,"mode":"100644","sha256":"e5a23cfc48e1e70a82772d55b30a9744762d4ea751f113194267e6c135932e75"},
 "CODE_OF_CONDUCT.md":{"diff":0,"mode":"100644","sha256":"ffb0652539c6d61f2cf0219f908f7221140764bb70cb1b78a9d15d3e5e1f5d36"},
 "CONTRIBUTING.md":{"diff":137,"mode":"100644","sha256":"a45a41e1383496503b29c9d6abf8413681d4deac8c01906564f6b5e0ceb93f6c"},
 "CONTRIBUTORS.md":{"diff":1,"mode":"100644","sha256":"5421a878e0b795dbf405cf5efbdc5c3ce7a664c3c5a5c3ce5226655d69043abf"},
@@ -1217,6 +1217,6 @@
 "tsconfig.json":{"diff":0,"mode":"100644","sha256":"25bb17e17ea109ef835738bc5481a8e79b3169dd003dd3c73c3f860724e653e8"},
 "uninstall.sh":{"diff":0,"mode":"100755","sha256":"5bc58587d37cc989c8a79f18d8fa731d1139c0387f531eb182b9303ccbe6d6ac"},
 "versions.json":{"diff":6,"mode":"100644","sha256":"8e47fe672d5fbbd5a80ef04d8e8f9709e1293e6ed71c64097a1b6b21b5ff4b65"},
-"vitest.config.ts":{"diff":190,"mode":"100644","sha256":"944027475147f28503724ef1f0a3d1787cef4b2d94ec38aea43a0fa297271713"},
+"vitest.config.ts":{"diff":190,"mode":"100644","sha256":"288e8918e3d71b21dc431f07e5a43a8c3aaf81d5a0c74a3dfa84a449e0ad81c0"},
 "vitest.skills.config.ts":{"diff":0,"mode":"100644","sha256":"0e88cbf778cdaf68e5580498220832a7ce574ae14850100b365dd1fbdd81f96f"}
 }}

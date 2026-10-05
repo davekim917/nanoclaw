@@ -154,7 +154,7 @@ helper with whichever lands first.
 ```
 
 `runtimeShowsRunning` is synchronous (`execFileSync`), so the claim stays the last `await` and the A′ AST case ("nothing is awaited between the guard
-and spawn") is untouched. The `:1457-1476` spawn-tail call site does not change. `session-claim-callers-ratchet.test.ts:52-54` (`TRY_CLAIM_SESSION_CALLERS`)
+and spawn") is untouched. The `:1457-1476` spawn-tail call site does not change. `session-claim-callers.test.ts:52-54` (`TRY_CLAIM_SESSION_CALLERS`)
 stays at one entry for P2; it grows to two (`adoptRunningSessions` is a `claimSessionRun` caller, not a `tryClaimSession` caller — check the matcher: it
 scans for the `tryClaimSession` identifier, so the list may not need to grow at all; if it does not, add the E case the plan asks for as a
 `claimSessionRun` caller list instead, so "adopt" is still a visible diff).
@@ -191,7 +191,7 @@ absent: `finalizeSession`; throws: re-arm with backoff; `fencedInbound` via `wit
 Leave a named hook where F2's `honorPendingStopIntents()` and F1's per-session `reconcileSurvivorWakeRows` go (upstream `:678`). Tests: all 11
 `container-adoption.test.ts` cases; remaining `container-supervision-channel.test.ts` cases: _"an adopted entry's SIGKILL fallback targets the container, not the waiter"_,
 _"a waiter close finalizes the session"_, _"a waiter close while the container is still running re-arms instead of finalizing"_, _"a truth read that fails treats the container as running"_,
-_"an adopted entry releases no storage-activity lease"_; `session-claim-callers-ratchet.test.ts` grows by exactly one if the matcher sees it. Gate: those three files + ratchet.
+_"an adopted entry releases no storage-activity lease"_; `session-claim-callers.test.ts` grows by exactly one if the matcher sees it. Gate: those three files + ratchet.
 
 **CP5 — main.ts wiring (after D1 merges; rebase first)**: `const reconciled = await adoptRunningSessions();` between the boot door and `:380`'s fence recovery;
 `beginContainerShutdown()` (sets `containerShutdownInProgress`, `memoryAdmission?.shutdown()`, `await Promise.allSettled([...wakePromises.values()])` raced
@@ -218,6 +218,6 @@ add `KillMode=mixed`; PR body: install-data file called out, two-part rollback o
 7. **Two fast paths, not one**: `wakeContainer:628` and `startReservedWake:746` both short-circuit on the registry; P4 must sit in front of both.
 8. **`stopAllContainers` has no production caller after E** (the boot door stops by name via `stopContainer`, not via the registry). Plan §4.3.5 says its
    "only caller becomes the boot door's stop set" — that is not how D1 is specified. Keep it exported for rollback; kill-list it.
-9. **Callers ratchet matcher scans for `tryClaimSession`** (`session-claim-callers-ratchet.test.ts:20-25`), which `adoptRunningSessions` never names; the plan's
+9. **Callers ratchet matcher scans for `tryClaimSession`** (`session-claim-callers.test.ts:20-25`), which `adoptRunningSessions` never names; the plan's
    "grows by exactly one" may be a no-op. Make the E addition visible some other way if so.
 10. **Line drift**: the plan's container-runner numbers are ~+17 stale on main and ~+172 on A′; every anchor above was re-read.
