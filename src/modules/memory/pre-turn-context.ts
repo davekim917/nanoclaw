@@ -19,6 +19,7 @@ import {
   searchArchiveEvidence,
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
+import { latestMessageText } from '../../thread-context.js';
 import { USER_BY_ID_SQL } from '../permissions/db/users.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
@@ -825,11 +826,7 @@ function boundedText(value: string, maxChars: number, marker: string): string {
 function extractQueryText(normalizedContent: string): string {
   try {
     const parsed = JSON.parse(normalizedContent) as { text?: unknown };
-    if (typeof parsed.text === 'string') {
-      const marker = '[Latest message]\n';
-      const latest = parsed.text.lastIndexOf(marker);
-      return latest === -1 ? parsed.text : parsed.text.slice(latest + marker.length);
-    }
+    if (typeof parsed.text === 'string') return latestMessageText(parsed.text);
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
     // Plain-text rows are valid host inputs.

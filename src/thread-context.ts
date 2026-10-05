@@ -65,8 +65,16 @@ export async function buildThreadContextBlock(opts: ThreadContextOptions): Promi
   }
 }
 
+const LATEST_MESSAGE_MARKER = '[Latest message]\n';
+
 function join(block: string, text: string): string {
-  return `${block}\n[Latest message]\n${text}`;
+  return `${block}\n${LATEST_MESSAGE_MARKER}${text}`;
+}
+
+/** The message itself, without a thread-context prefix `withThreadContext` added. */
+export function latestMessageText(text: string): string {
+  const idx = text.lastIndexOf(LATEST_MESSAGE_MARKER);
+  return idx === -1 ? text : text.slice(idx + LATEST_MESSAGE_MARKER.length);
 }
 
 export function withThreadContext(contentJson: string, block: string | null): string {
