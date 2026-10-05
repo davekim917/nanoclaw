@@ -90,13 +90,18 @@ export function refuseProductionSessionDbUnderTest(path: string): void {
   }
 }
 
+/** busy_timeout first: journal_mode takes a lock even when unchanged, so it fails at once under a sibling's lock. */
+export function applyOutboundPragmas(db: Database): void {
+  db.exec('PRAGMA busy_timeout = 5000');
+  db.exec('PRAGMA journal_mode = DELETE');
+  db.exec('PRAGMA foreign_keys = ON');
+}
+
 export function getOutboundDb(): Database {
   if (!_outbound) {
     refuseProductionSessionDbUnderTest(DEFAULT_OUTBOUND_PATH);
     _outbound = new Database(DEFAULT_OUTBOUND_PATH);
-    _outbound.exec('PRAGMA journal_mode = DELETE');
-    _outbound.exec('PRAGMA busy_timeout = 5000');
-    _outbound.exec('PRAGMA foreign_keys = ON');
+    applyOutboundPragmas(_outbound);
     // Lightweight forward-compat: session_state was added after the initial
     // v2 schema, so older session DBs don't have it. Create it on demand
     // instead of requiring a formal migration pass. Also handle the case

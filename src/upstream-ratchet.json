@@ -406,7 +406,7 @@
 "container/agent-runner/src/mailbox/index.ts":{"diff":0,"mode":"100644","sha256":"d8568702a9b5a287f75a4dd9821deccba44c14b534f92a669ba313ba9c59dde3"},
 "container/agent-runner/src/mailbox/model.generated.ts":{"diff":0,"mode":"100644","sha256":"f23a848fd794001aec5d10fe05f699b20cf93f2e756f23a498c1654441be159e"},
 "container/agent-runner/src/mailbox/registry.test.ts":{"diff":0,"mode":"100644","sha256":"ddb6ae7549d2c9a113c11c888af7c14c58fd8be547e36a14862b5f2b97578335"},
-"container/agent-runner/src/mailbox/sqlite/connection.ts":{"diff":18,"mode":"100644","sha256":"f11d7b8534ee11bf9644fb542f015a3da1e6287a0484a326c6130ce246f9db8d"},
+"container/agent-runner/src/mailbox/sqlite/connection.ts":{"diff":29,"mode":"100644","sha256":"fa7377f83823c1c84bf6394f157a46a0da995dfc2c4e2f531afd998811313c88"},
 "container/agent-runner/src/mailbox/sqlite/index.ts":{"diff":45,"mode":"100644","sha256":"ce2037f57ccead2a4d60cb4b5dc7cca372e23da290b1dff183dc68cc57c5cd59"},
 "container/agent-runner/src/mailbox/sqlite/operations.ts":{"diff":0,"mode":"100644","sha256":"1897b356ce62692b993a019ef807b240c7b5dc4182452d496093815f8f5bdc17"},
 "container/agent-runner/src/mailbox/sqlite/sqlite.test.ts":{"diff":66,"mode":"100644","sha256":"53e1f1e6df8b077ac458b4174ea82d82dd674990bea7ae355d786e66ee337779"},

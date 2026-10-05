@@ -13,7 +13,7 @@ import {
 } from '../../mailbox/sqlite/operations.js';
 import type { InboundMessage, MailboxOperations, MailboxSessionKey, ProcessingStatus } from '../../mailbox/types.js';
 import type { MessageInRow } from '../../db/messages-in.js';
-import { ensureNanoclawOutboundSchema, prepareOutboundFile } from './schema.js';
+import { ensureNanoclawOutboundSchema } from './schema.js';
 import {
   classifyTrigger,
   getActiveRepositoryMountBarrier,
@@ -43,7 +43,6 @@ import {
 } from './rate-limit-samples.js';
 import { acknowledgeRepositoryMountBarrier } from './session-state.js';
 import { repositoryFenceAdmissionGate } from './admission.js';
-import { isMailboxTestMode } from './test-mode.js';
 
 export * from './admission.js';
 export * from './schema.js';
@@ -183,7 +182,6 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
   /** Adds the fork schema on top of upstream's baseline once per process. `key` stays optional: an older host passes null. */
   override async start(key: MailboxSessionKey | null): Promise<void> {
     await super.start(key);
-    if (!isMailboxTestMode()) prepareOutboundFile();
     ensureNanoclawOutboundSchema(getOutboundDb());
   }
 
