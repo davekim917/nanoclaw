@@ -47,6 +47,16 @@ Check only controls implicated by the question or sample. Examples include claim
 
 For a sampled lifecycle, compare the actual path with its current contract. Escalate to a broader sweep only when the sample exposes a concrete systemic failure or the operator requests it. Do not treat silence as settlement, approval or an independent evaluation. Operator invocation authorizes the audit itself; it does not make the operator an independent evaluator or authorize fixes, publication, deployment, messages, new timers or scheduled retries.
 
+## Count the operator's corrections
+
+When the question is whether agents keep repeating a behavior the operator has corrected, read what the operator told the agent groups in question during the window, metadata first, before any content.
+
+Get them with `pnpm exec tsx scripts/operator-messages.ts --groups <id,id> --since <date> [--until <date>]`, which prints metadata only; add `--text` once you need the messages themselves. It selects the operator's chat and dashboard-steer rows, strips thread-context replays and dedupes fan-out, and its count is an upper bound: a post made with the operator's user token looks exactly like a typed one, so check a candidate against the poster's own record (the host session transcript, or the agent's tool call that posted it) before counting it as typed.
+
+Pick out the messages that correct an agent: a redirect, a "don't", a repeat of an earlier instruction, a "why did you". Group them by the behavior corrected. A class counts once it has happened twice. When the group's instructions already state the rule, the instruction has failed: recommend a control, not more prose.
+
+For each class, recommend the fix at the highest level that works: a host guard or `ncl` check, or a container tool hook, that refuses the action; a container-config or tool change that removes the wrong path; a lint or test in the repository the agent works in; and only then an instruction, for judgment calls. Give the reason a higher level does not work. Quote corrections minimally and never copy client content beyond what the finding needs.
+
 ## Deliver the retro
 
 Lead with the bounded conclusion. For each material finding, state:
