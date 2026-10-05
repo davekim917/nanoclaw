@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, getRawDb, initTestDb } from '../connection.js';
+import { closeDb, getRawDb } from '../connection.js';
 import { withCentralSync } from '../central-lease.js';
 import { runMigrations } from './index.js';
 import { migration068 } from './068-sessions-sweep-quiet-until.js';
@@ -15,6 +15,7 @@ import {
   type QuietSessionMark,
 } from '../sessions.js';
 import type { Session } from '../../types.js';
+import { initMigratedTestDb } from '../index.js';
 
 /**
  * A pre-068 `sessions` table, hand-rolled so rows can exist BEFORE the
@@ -115,9 +116,8 @@ describe('the persisted quiet mark (S2-PR15)', () => {
   const PAST = '2000-01-01T00:00:00.000Z';
 
   beforeEach(async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-1', 'ag', 'ag', '2026-08-01T00:00:00.000Z')`,
     ).run();

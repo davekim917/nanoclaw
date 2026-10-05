@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../db/index.js';
 import { applySessionSteer, _resetRateLimitForTesting } from './steer.js';
 import type { AuthedRequestContext } from './router.js';
 
@@ -102,10 +102,7 @@ function now(): string {
 }
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 async function seedAgentGroup(id: string): Promise<void> {

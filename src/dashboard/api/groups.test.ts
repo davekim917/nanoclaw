@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { groupsListHandler } from './groups.js';
 import type { AuthedRequestContext } from '../router.js';
 
@@ -27,10 +27,7 @@ function makeReq(): Request {
 }
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 describe('groupsListHandler', () => {

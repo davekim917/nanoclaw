@@ -8,7 +8,7 @@
  */
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { dispatch } from '../dispatch.js';
 import type { CallerContext } from '../frame.js';
 // Side-effect import: registers the `usage-list` / `usage-summary` commands.
@@ -31,9 +31,7 @@ function insertCentralTurn(turnId: string, model: string, cacheRead: number): vo
 
 describe('ncl usage summary', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: 'usage-cli',

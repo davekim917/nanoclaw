@@ -118,7 +118,7 @@ export async function listSeriesWithFailures(): Promise<
  * ONE statement, deliberately: reading the last-success boundary and then aggregating as two awaits let a success
  * inserted between them count as another failure, alerting on a task at the moment it recovered. A driver transaction
  * is not an option (the fork's zero-open-transactions invariant, pinned by `src/db/raw-db-ratchet.test.ts` and
- * `transaction-closures.test.ts`), and episode rows are also filtered `outcome = 'failed'`.
+ * `transaction-closures-tripwire.test.ts`), and episode rows are also filtered `outcome = 'failed'`.
  * `COUNT(escalated_at)` answers "already escalated" over the WHOLE episode, so no read window can hide the marker.
  * Derived from history, never a stored counter that someone must remember to reset.
  */

@@ -19,7 +19,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import { insertThreadTitleClaim, recordThreadTitleAttemptFailure } from '../../db/thread-titles.js';
 import { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY, type SweepTickContext } from '../../host-sweep.js';
 import { log } from '../../log.js';
@@ -81,8 +81,7 @@ let originalToken: string | undefined;
 beforeEach(async () => {
   // Truncate, never reassign: the tripwire factory closed over THIS array.
   h.spawns.length = 0;
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   originalToken = process.env.DISCORD_BOT_TOKEN;
   delete process.env.DISCORD_BOT_TOKEN;
   vi.stubGlobal(

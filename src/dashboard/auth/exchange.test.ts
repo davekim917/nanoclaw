@@ -18,7 +18,7 @@ vi.mock('../router.js', async (importOriginal) => ({
 }));
 
 import crypto from 'crypto';
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { issueDashboardToken, consumeDashboardToken } from '../db/dashboard-tokens.js';
 import { exchangeHandler } from './exchange.js';
 import { resolveServerKey } from './cookie.js';
@@ -62,9 +62,7 @@ function insertUser(id: string): void {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

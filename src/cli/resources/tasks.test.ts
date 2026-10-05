@@ -41,7 +41,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-tasks') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { resolveGroupProvider } from '../../container-config.js';
@@ -131,9 +131,7 @@ describe('tasks CLI resource', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createGroup('ag-1');
     await createGroup('ag-2');
     await createChatSession('ag-1', 'chat-1');
@@ -2572,8 +2570,7 @@ describe('groups config update --provider refuses on stranded task pins', () => 
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {
@@ -2868,8 +2865,7 @@ describe('ncl tasks repin', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await makePinGroup('ag-1', 'claude');
   });
 

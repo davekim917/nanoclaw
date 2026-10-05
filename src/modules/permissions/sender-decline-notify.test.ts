@@ -26,7 +26,7 @@
 import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { upsertUser } from './db/users.js';
@@ -100,9 +100,7 @@ async function db() {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const handle = getRawDb();
-  runMigrations(handle);
+  await initMigratedTestDb();
 
   // Side-effect import: registers the access gate AFTER the mocks are in
   // place so it picks up the mocked delivery + user-dm helpers.

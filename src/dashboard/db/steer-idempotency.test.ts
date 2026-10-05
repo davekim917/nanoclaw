@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { IdempotencyConflict, applyIdempotency, markEchoAttempted, reserveIdempotency } from './steer-idempotency.js';
 import type { SteerResponse, SteerTarget } from './steer-idempotency.js';
 
@@ -17,9 +17,7 @@ function seedUser(id: string): void {
 beforeEach(async () => {
   // Reset column-check flag between tests so ensureColumn runs fresh each time
   // (the module-level flag persists across tests in the same process)
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   seedUser('u1');
 });
 

@@ -96,7 +96,7 @@ const coverageRequested = process.argv.some((arg) => arg === '--coverage' || arg
  * coverage-v8's whole-worker instrumentation (see readHostRiskGlobs's comment above)
  * slows every test's CPU-bound work under `--coverage`, generically — not just the one
  * test this was first caught on. Measured on this host: the two heaviest cases in
- * src/db/transaction-closures.test.ts (a full ts.Program built inside the test body)
+ * src/db/transaction-closures-tripwire.test.ts (a full ts.Program built inside the test body)
  * went from a few hundred ms uninstrumented to 8.4s/10.0s under coverage; CI's own run
  * (PR #662) measured one of the two at 18.1s, up from a normal 5.1s. 4x — not 3x —
  * is what actually covers that CI number: 3 × vitest's 5000ms default testTimeout is

@@ -39,7 +39,7 @@ vi.mock('../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { closeDb, deleteSession, getRawDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, deleteSession, getRawDb, initMigratedTestDb } from '../db/index.js';
 import { getDeliveryAttempt, recordDeliveryAttempt } from '../db/coordination.js';
 import { getDeliveryAction, type DeliveryActionHandler } from '../delivery.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
@@ -142,8 +142,7 @@ function age(requestId: string, claimedAt: string): void {
 beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   initSessionFolder(AG, SESSION_ID);
   dispatch.mockReset();
   dispatch.mockResolvedValue({ id: 'req-1', ok: true, data: { id: 'task-created-once' } });

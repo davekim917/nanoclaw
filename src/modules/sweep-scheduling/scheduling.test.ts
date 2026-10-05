@@ -266,7 +266,7 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
 });
 
 import { CLOSE_CONFIRM_WINDOW_MS } from '../../dashboard/thread-close.js';
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { openInboundDb } from '../mailbox/openers.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting } from '../../host-sweep.js';
@@ -436,10 +436,7 @@ const clone = (db: Database.Database) =>
   };
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
   await createAgentGroup({
     id: 'ag-test',
     name: 'ag-test',

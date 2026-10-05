@@ -1732,7 +1732,7 @@ describe('sweep duty registry (S2-PR2)', () => {
   // transaction back while the kill kept running.
   //
   // Structural, in the style of the F-14.x checks above, and receiver-agnostic
-  // on purpose: `src/db/transaction-closures.test.ts` already resolves WHICH
+  // on purpose: `src/db/transaction-closures-tripwire.test.ts` already resolves WHICH
   // handle every `.transaction(` call holds. What that file cannot say is
   // whether a call sits inside one, which is the property this case pins. The
   // scan is AST, not text, so a closure spanning many lines is still seen.

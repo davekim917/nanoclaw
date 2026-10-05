@@ -27,7 +27,7 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
@@ -44,9 +44,7 @@ beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
 
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 
   await createAgentGroup({ id: AG, name: 'SaveAtt', folder: 'saveatt', agent_provider: null, created_at: now() });
   const sess: Session = {

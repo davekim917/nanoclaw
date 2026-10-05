@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { withCentralSync } from '../db/central-lease.js';
-import { createAgentGroup, getRawDb, initTestDb, runMigrations } from '../db/index.js';
+import { createAgentGroup, getRawDb, initMigratedTestDb } from '../db/index.js';
 import { ensureSchema } from '../modules/mailbox/schema.js';
 import { guard } from '../guard/index.js';
 import type { AuthedRequestContext } from './router.js';
@@ -160,10 +160,8 @@ function ctxFor(userId: string, opts: { no_filter?: boolean; allowed?: string[] 
 }
 
 async function seed(): Promise<void> {
-  await initTestDb();
+  await initMigratedTestDb();
   const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
   await createAgentGroup({ id: 'ag1', name: 'ag1', folder: 'ag1', agent_provider: null, created_at: iso(0) });
   await createAgentGroup({ id: 'ag2', name: 'ag2', folder: 'ag2', agent_provider: null, created_at: iso(0) });
   db.prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES ('admin', 'dashboard', 'admin', ?)`).run(

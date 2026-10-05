@@ -59,7 +59,7 @@ vi.mock('../../modules/agent-to-agent/write-destinations.js', async (importOrigi
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-programmatic-wiring') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { dispatch } from '../dispatch.js';
 // Side-effect imports: register the verbs under test.
 import './messaging-groups.js';
@@ -86,8 +86,7 @@ describe('programmatic wiring verbs', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await createAgentGroup({ id: 'ag-1', name: 'Nano', folder: 'nano', agent_provider: null, created_at: now() });
   });
   afterEach(async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from './db/index.js';
 import { markProviderUnavailable } from './db/provider-health.js';
 import { applyProviderFallbackRuntime, providerFallbackRuntimeEnv, resolveSpawnProvider } from './provider-fallback.js';
 import type { ContainerConfig } from './container-config.js';
@@ -20,9 +20,7 @@ function decide(overrides: Record<string, unknown> = {}) {
 
 describe('spawn-time provider fallback', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: 'f',

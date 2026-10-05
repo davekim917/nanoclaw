@@ -17,7 +17,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { type ContainerState } from '../mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -827,9 +827,8 @@ describe('observeProviderStatus — two-tick debounce', () => {
   // driver-owned export of host-sweep.ts precisely so its own `!alive`
   // cleanup can stay synchronous (see that export's doc comment).
   it('the two-tick provider debounce is cleared when the container is not alive', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-debounce', 'debounce', 'debounce-folder', ?)`,
@@ -927,9 +926,8 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
   }
 
   beforeEach(async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     // The heal's "target still live" check re-reads the session on the RAW
     // handle (seam-3 §4.5 I-1, `sessionStillActive`), so the row has to exist
     // in the test DB and not only behind the `getSession` mock.
@@ -1350,9 +1348,8 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
   // regression where the SLA branch ran a second time and simply had nothing
   // new to report.
   it('the idle-task reap winning the chain suppresses the SLA branch, discriminated by a changed OOM count', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-task-reap', 'task-reap', 'task-reap-folder', ?)`,
@@ -1415,9 +1412,8 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
   });
 
   it('the idle-chat reap winning the chain suppresses the SLA branch, discriminated by a changed OOM count', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-chat-reap', 'chat-reap', 'chat-reap-folder', ?)`,
@@ -1503,9 +1499,8 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
 // ── F-10.2 ───────────────────────────────────────────────────────────────────
 describe('provider self-heal claims the health phase and the later branches do not run', () => {
   it('a heal that kills stops the exclusive chain: no idle reap, no SLA branch, no OOM row', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-health', 'health', 'health-folder', ?)`,
@@ -1620,9 +1615,8 @@ describe('registered S11/S14/S16 entries reach their bodies', () => {
   beforeEach(async () => {
     // The heal's liveness re-read is a raw-handle read (seam-3 §4.5 I-1): the
     // session row must exist in a real test DB, not only behind the mock.
-    await initTestDb();
+    await initMigratedTestDb();
     const central = getRawDb();
-    runMigrations(central);
     central
       .prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-test', 'test', 'group-folder', ?)`)
       .run(new Date().toISOString());
@@ -1881,9 +1875,8 @@ describe('post-kill writes yield to a replacement container', () => {
   let postKillExit: (() => void) | undefined;
 
   beforeEach(async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla-folder', ?)`).run(
       new Date().toISOString(),
     );

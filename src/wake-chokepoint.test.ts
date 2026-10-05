@@ -10,7 +10,7 @@
  * import anywhere outside `src/request-wake.ts`, this is what catches it.
  *
  * Two things are asserted, resolved with the TypeScript AST rather than by
- * text search — matching src/db/transaction-closures.test.ts's convention —
+ * text search — matching src/db/transaction-closures-tripwire.test.ts's convention —
  * because a text-based check would miss the one dynamic-import call site
  * (`src/modules/repository-workspaces/index.ts:719`,
  * `const { wakeContainer } = await import('../../container-runner.js')`),

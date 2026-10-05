@@ -25,11 +25,11 @@ vi.mock('../../db/messaging-groups.js', async (importOriginal) => {
   return { ...real, createMessagingGroup: vi.fn(real.createMessagingGroup) };
 });
 
-import { closeDb, getRawDb, initTestDb } from '../../db/connection.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { closeDb, getRawDb } from '../../db/connection.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { upsertUser } from './db/users.js';
 import { ensureUserDm } from './user-dm.js';
+import { initMigratedTestDb } from '../../db/index.js';
 
 const USER_ID = 'telegram:555';
 
@@ -53,8 +53,7 @@ function insertWinnerRow(): void {
 
 describe('ensureUserDm adopts a concurrently created DM messaging group', () => {
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await upsertUser({ id: USER_ID, kind: 'telegram', display_name: 'Ada', created_at: now() });
   });
 

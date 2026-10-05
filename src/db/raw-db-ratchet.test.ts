@@ -7,7 +7,7 @@
  * deletes both functions and this file with them.
  *
  * Until then the two escape hatches are safe only because the fork opens ZERO
- * driver transactions (src/db/transaction-closures.test.ts is the other half of
+ * driver transactions (src/db/transaction-closures-tripwire.test.ts is the other half of
  * that invariant): a raw statement bypasses the driver's `activeTransaction`
  * gate, so one running inside an open `BEGIN IMMEDIATE` would silently join a
  * transaction it knows nothing about. Every NEW raw call site widens that
@@ -27,6 +27,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -36,12 +37,12 @@ const SCAN_ROOTS = ['src', 'scripts', 'setup'] as const;
  * Not callers, and excluded from the scan:
  *  - `connection.ts` defines both functions.
  *  - this file names them in its own matcher, so it would otherwise match itself.
- *  - `raw-outside-lease.test.ts` (PR 6) pins the CALL sites the same way.
+ *  - `raw-outside-lease-tripwire.test.ts` pins the CALL sites the same way.
  */
 const DEFINER = 'src/db/connection.ts';
 const SELF = 'src/db/raw-db-ratchet.test.ts';
 /** Names the identifier in its own matcher and fixture, like this file. */
-const LEASE_TRIPWIRE = 'src/db/raw-outside-lease.test.ts';
+const LEASE_TRIPWIRE = 'src/db/raw-outside-lease-tripwire.test.ts';
 const NOT_CALLERS: readonly string[] = [DEFINER, SELF, LEASE_TRIPWIRE];
 
 /**
@@ -113,7 +114,7 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF, LEASE_TRIPWIRE];
  * PR 6's Codex round 1 (#460) then put every remaining runtime raw statement
  * under the lease — `withCentralSync(() => withRawDb(…))` at the leaf, or a
  * lease-only `withRawDb` leaf whose callers take the lease — which dropped
- * the importer set to the bare-handle files `src/db/raw-outside-lease.test.ts`
+ * the importer set to the bare-handle files `src/db/raw-outside-lease-tripwire.test.ts`
  * enumerates plus the tests that seed through the raw handle (176 → 154; 152 after the 5c merge).
  *
  * PR 6 also carried the three "5c deferral" families 5b left raw (180 → 176):
@@ -140,17 +141,10 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/agent-runner-source.test.ts',
   'src/attention-sources.test.ts',
   'src/capabilities.test.ts',
-  'src/channels/channel-registry.test.ts',
-  'src/channels/chat-sdk-bridge-byline.test.ts',
   'src/channels/chat-sdk-bridge-recovery.test.ts',
-  'src/channels/slack-hop-limit.test.ts',
-  'src/channels/slack-raw-text.test.ts',
-  'src/claude-md-compose.test.ts',
   'src/cli/crud-validate.test.ts',
   'src/cli/crud.test.ts',
-  'src/cli/delivery-action.test.ts',
   'src/cli/request-ledger.test.ts',
-  'src/cli/resources/destinations.test.ts',
   'src/cli/resources/groups-create-adopt.test.ts',
   'src/cli/resources/groups.test.ts',
   'src/cli/resources/messaging-groups.test.ts',
@@ -159,7 +153,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/cli/resources/usage.test.ts',
   'src/cli/resources/wirings.test.ts',
   'src/command-gate.test.ts',
-  'src/container-config.test.ts',
   'src/container-runner.test.ts',
   'src/dashboard/api/auth-me.test.ts',
   'src/dashboard/api/groups.test.ts',
@@ -189,18 +182,14 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/agent-groups.test.ts',
   'src/db/boot-order.test.ts',
   'src/db/central-lease.ts',
-  'src/db/channel-ingress-receipts.test.ts',
-  'src/db/container-configs.test.ts',
   'src/db/db-v2.test.ts',
   'src/db/index.ts',
   'src/db/messaging-groups-instance.test.ts',
   'src/db/migrations/068-sessions-sweep-quiet-until.test.ts',
-  'src/db/provider-health.test.ts',
   'src/db/scheduled-tasks.test.ts',
   'src/db/sessions.test.ts',
   'src/db/usage.test.ts',
   'src/delivery.test.ts',
-  'src/group-init.settings.test.ts',
   'src/host-core.test.ts',
   'src/host-lifecycle-timers.test.ts',
   'src/host-sweep.test.ts',
@@ -211,12 +200,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/agent-to-agent/create-agent.test.ts',
   'src/modules/agent-to-agent/message-gate.test.ts',
   'src/modules/agent-to-agent/write-destinations.test.ts',
-  'src/modules/approvals/approval-resolved.test.ts',
   'src/modules/approvals/onecli-approvals.test.ts',
-  'src/modules/approvals/picks.test.ts',
-  'src/modules/approvals/primitive.test.ts',
-  'src/modules/approvals/reason-capture.test.ts',
-  'src/modules/approvals/response-handler.test.ts',
   'src/modules/bash-gate/index.test.ts',
   'src/modules/channel-auto-wire/index.test.ts',
   'src/modules/claims/self-heal.test.ts',
@@ -233,21 +217,13 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/permissions/channel-approval-folder-race.test.ts',
   'src/modules/permissions/channel-approval.test.ts',
   'src/modules/permissions/db/user-roles.test.ts',
-  'src/modules/permissions/grant.test.ts',
-  'src/modules/permissions/permissions.test.ts',
   'src/modules/permissions/sender-approval.test.ts',
   'src/modules/permissions/sender-decline-notify.test.ts',
-  'src/modules/permissions/task-slack-subject.test.ts',
   'src/modules/permissions/user-dm-adopt.test.ts',
-  'src/modules/provider-fallback/handler.test.ts',
   'src/modules/repository-workspaces/index.test.ts',
-  'src/modules/scheduling/create.test.ts',
-  'src/modules/self-mod/apply.test.ts',
-  'src/modules/self-mod/request.test.ts',
   'src/modules/support-threads/dispatch.test.ts',
   'src/modules/sweep-central/central.test.ts',
   'src/modules/sweep-central/session-title-sweep.test.ts',
-  'src/modules/sweep-central/thread-title-retry.test.ts',
   'src/modules/sweep-claims/claims-throttle.test.ts',
   'src/modules/sweep-container-health/health.test.ts',
   'src/modules/sweep-continuation/continuation.test.ts',
@@ -256,22 +232,90 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/sweep-scheduled-move/scheduled-move.test.ts',
   'src/modules/sweep-scheduling/scheduling.test.ts',
   'src/modules/sweep-usage/usage.test.ts',
-  'src/provider-fallback.test.ts',
   'src/provider-surfaces.test.ts',
-  'src/providers/opencode.container-config.test.ts',
   'src/router.session-skip.test.ts',
-  'src/session-manager.attachments.test.ts',
   'src/session-manager.test.ts',
   'src/state-sqlite.test.ts',
   'src/storage-gc.test.ts',
   'src/storage-manager.test.ts',
   'src/storage-manager.ts',
-  'src/templates/create-agent.test.ts',
   'src/test-fixtures/raw-db-fake.ts',
-  'src/topic-title.test.ts',
   'src/workgroup-memory.integration.test.ts',
   'src/worktree-cleanup.test.ts',
 ];
+
+/** Test files that run the migrations on the central handle by hand, each for the reason given. */
+const RAW_MIGRATION_SUBJECTS: readonly string[] = [
+  // Re-runs the full migration list to prove it is idempotent.
+  'src/db/db-v2.test.ts',
+  // Builds a legacy schema on the central handle, then migrates it in place.
+  'src/db/messaging-groups-instance.test.ts',
+  // Opens a file-backed central DB with initDb(path); initMigratedTestDb() is in-memory only.
+  'src/modules/approvals/onecli-approvals.test.ts',
+];
+
+interface Binding {
+  readonly declaration: ts.VariableDeclaration;
+  /** The property a destructured local was bound from (`{ getRawDb: fresh }` gives `getRawDb`). */
+  readonly property?: string;
+}
+
+/** The nearest enclosing `const`/`let`/`var` binding of `name`, plain or destructured. */
+function findBinding(name: string, at: ts.Node): Binding | undefined {
+  for (let scope: ts.Node | undefined = at.parent; scope; scope = scope.parent) {
+    if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
+    for (const statement of scope.statements) {
+      if (!ts.isVariableStatement(statement)) continue;
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) {
+          if (declaration.name.text === name) return { declaration };
+          continue;
+        }
+        if (!ts.isObjectBindingPattern(declaration.name)) continue;
+        for (const element of declaration.name.elements) {
+          if (!ts.isIdentifier(element.name) || element.name.text !== name) continue;
+          const key = element.propertyName ?? element.name;
+          return { declaration, property: ts.isIdentifier(key) ? key.text : undefined };
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+/** `fn`, `ns.fn`, or a local destructured as `{ fn: local }`. */
+function namesFunction(expr: ts.Expression, fn: string): boolean {
+  if (ts.isPropertyAccessExpression(expr)) return expr.name.text === fn;
+  if (!ts.isIdentifier(expr)) return false;
+  return expr.text === fn || findBinding(expr.text, expr)?.property === fn;
+}
+
+/** A `getRawDb()` call, or an identifier whose nearest enclosing declaration is initialised from one. */
+function isRawHandle(expr: ts.Expression, at: ts.Node): boolean {
+  if (ts.isCallExpression(expr)) return namesFunction(expr.expression, 'getRawDb');
+  if (!ts.isIdentifier(expr)) return false;
+  const initializer = findBinding(expr.text, at)?.declaration.initializer;
+  return initializer !== undefined && isRawHandle(initializer, initializer);
+}
+
+function rawMigrationLines(fileName: string, text: string): number[] {
+  if (!text.includes('runMigrations')) return [];
+  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true);
+  const lines: number[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node) &&
+      namesFunction(node.expression, 'runMigrations') &&
+      node.arguments.length > 0 &&
+      isRawHandle(node.arguments[0], node)
+    ) {
+      lines.push(source.getLineAndCharacterOfPosition(node.getStart()).line + 1);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return lines;
+}
 
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:"'`])\/\/[^\n]*/g, (_m, lead: string) => lead);
@@ -317,9 +361,41 @@ describe('the raw central-DB handle only shrinks', () => {
     expect(
       added,
       'a NEW file reaches the transitional synchronous central-DB handle. The seam only shrinks: ' +
-        'convert the site to the async DbDriver (getDb()) instead of widening the raw allowlist. ' +
+        'a test that needs a migrated central DB calls initMigratedTestDb() (src/db/index.ts); ' +
+        'any other site uses the async DbDriver (getDb()). Never widen the raw allowlist. ' +
         'See docs/specs/upstream-async-central-db-seam/plan.md §4.1.',
     ).toEqual([]);
+  });
+
+  it('finds a hand-run migration through a call, a namespace, an alias and a renamed destructure', () => {
+    const fixture = [
+      'runMigrations(getRawDb());',
+      'dbIndex.runMigrations(dbIndex.getRawDb());',
+      'async function setup() { const db = getRawDb(); runMigrations(db); }',
+      'async function fresh() { const { getRawDb: raw, runMigrations: migrate } = await import("x"); migrate(raw()); }',
+      'const scratch = new Database(":memory:"); runMigrations(scratch);',
+    ].join('\n');
+    expect(rawMigrationLines('fixture.test.ts', fixture)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('tests migrate through initMigratedTestDb, never by hand on the raw handle', () => {
+    const offenders = listTsFiles()
+      .filter((rel) => rel.endsWith('.test.ts') && !NOT_CALLERS.includes(rel) && !RAW_MIGRATION_SUBJECTS.includes(rel))
+      .flatMap((rel) =>
+        rawMigrationLines(rel, fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')).map((line) => `${rel}:${line}`),
+      );
+    expect(
+      offenders,
+      'replace `await initTestDb(); runMigrations(getRawDb());` (or a `db = getRawDb()` alias of it) ' +
+        'with `await initMigratedTestDb();`',
+    ).toEqual([]);
+  });
+
+  it('exempts only files that still run the migrations by hand', () => {
+    const stale = RAW_MIGRATION_SUBJECTS.filter(
+      (rel) => rawMigrationLines(rel, fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')).length === 0,
+    );
+    expect(stale, 'delete these from RAW_MIGRATION_SUBJECTS').toEqual([]);
   });
 
   it('records removals so the pin cannot rot into a stale list', () => {

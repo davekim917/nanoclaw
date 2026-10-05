@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
-import { runMigrations } from '../db/migrations/index.js';
+import { closeDb, getRawDb } from '../db/connection.js';
 import { createAgentGroup } from '../db/agent-groups.js';
 import { observatoryIssueBriefHandler, _resetIssueBriefCacheForTesting } from './issue-brief.js';
 import type { AuthedRequestContext } from './router.js';
 
 import { readReleaseState as _rrsRaw } from './api/observatory.js';
+import { initMigratedTestDb } from '../db/index.js';
 
 const mockReadReleaseState = vi.mocked(_rrsRaw);
 
@@ -42,9 +42,7 @@ function ghResponses(issue: unknown, comments: unknown): void {
 
 describe('observatoryIssueBriefHandler', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-1', 'Example', ?)`)
       .run(new Date().toISOString());
@@ -155,8 +153,7 @@ describe('observatoryIssueBriefHandler — workgroup scope', () => {
   const ISSUE = { state: 'open', body: 'private body of workgroup one', labels: [], comments: 0 };
 
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     const at = new Date().toISOString();
     const ins = getRawDb().prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES (?, ?, ?)`);
     ins.run('wg-1', 'One', at);

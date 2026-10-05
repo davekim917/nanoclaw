@@ -1,5 +1,5 @@
 /**
- * NEGATIVE FIXTURE for src/db/transaction-closures.test.ts — a
+ * NEGATIVE FIXTURE for src/db/transaction-closures-tripwire.test.ts — a
  * `centralTransaction` closure that awaits a non-DB effect (`fetch`) and calls
  * `getDb().transaction` directly. Both are forbidden inside a central
  * transaction closure (plan §4.4): the driver yields at every await, so a

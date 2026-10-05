@@ -9,10 +9,10 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, getRawDb } from './connection.js';
-import { runMigrations } from './migrations/index.js';
+import { closeDb } from './connection.js';
 import { createAgentGroup } from './agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './container-configs.js';
+import { initMigratedTestDb } from './index.js';
 
 async function makeGroup(id: string): Promise<void> {
   await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -20,9 +20,7 @@ async function makeGroup(id: string): Promise<void> {
 
 describe('ensureContainerConfig provider stamping', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
   });
   afterEach(async () => {
     await closeDb();

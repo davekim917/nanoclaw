@@ -37,7 +37,7 @@ import {
   updateContainerConfigJson,
   updateContainerConfigScalars,
 } from './db/container-configs.js';
-import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from './db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from './db/index.js';
 import { STANDING_INSTRUCTIONS_FILE } from './group-persona.js';
 import type { AgentGroup } from './types.js';
 
@@ -92,8 +92,7 @@ beforeEach(async () => {
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   seedInstructionSources();
   switches.taskList = true;
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

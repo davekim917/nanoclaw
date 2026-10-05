@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../db/index.js';
 import { log } from '../log.js';
 
 // The sweep reads inbound/outbound DBs from `${DATA_DIR}/v2-sessions/...`.
@@ -82,10 +82,7 @@ const CREDENTIAL_ENV_KEYS = [
 let originalCredentialEnv: Partial<Record<(typeof CREDENTIAL_ENV_KEYS)[number], string>>;
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 async function seedAgentGroup(id: string): Promise<void> {

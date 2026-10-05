@@ -43,14 +43,7 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
   };
 });
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  getRawDb,
-  initTestDb,
-  runMigrations,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import { createDestination } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
@@ -78,9 +71,7 @@ function projectedNames(): string[] {
 
 beforeEach(async () => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 
   await createAgentGroup({
     id: AGENT_GROUP_ID,

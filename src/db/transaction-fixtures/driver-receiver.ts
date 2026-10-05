@@ -1,5 +1,5 @@
 /**
- * NEGATIVE FIXTURE for src/db/transaction-closures.test.ts — a `.transaction(`
+ * NEGATIVE FIXTURE for src/db/transaction-closures-tripwire.test.ts — a `.transaction(`
  * call whose receiver is upstream's async `DbDriver`.
  *
  * This is the shape the test forbids everywhere in `src/` until seam-3 PR 6

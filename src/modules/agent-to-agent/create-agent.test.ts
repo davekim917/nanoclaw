@@ -89,7 +89,7 @@ vi.mock('../approvals/index.js', async (importOriginal) => ({
 }));
 
 // ── Imports after mocks ───────────────────────────────────────────────────────
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../../group-persona.js';
 import { applyCreateAgent, handleCreateAgent, registerCreateAgentFollowUp } from './create-agent.js';
@@ -157,9 +157,7 @@ beforeEach(async () => {
   fs.mkdirSync(TEST_GROUPS_DIR, { recursive: true });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 
   // Insert the parent agent group
   await createAgentGroup({

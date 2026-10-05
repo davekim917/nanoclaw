@@ -20,7 +20,7 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
   }),
 }));
 
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../db/index.js';
+import { closeDb, initMigratedTestDb } from '../db/index.js';
 import type { ChannelSetup, InboundMessage } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerSlackBot, type SlackBotIdentity } from './slack-mentions.js';
@@ -240,8 +240,7 @@ describe('the governor as the Slack bridge inboundFilter', () => {
     captured.chat = null;
     registerSlackBot('slack-hop-self', SELF);
     registerSlackBot('slack-hop-sib', SIBLING);
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {

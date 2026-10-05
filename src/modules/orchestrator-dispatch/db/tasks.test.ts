@@ -10,7 +10,7 @@ import {
   incrementCompletionAttempts,
   type Task,
 } from './tasks.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../../db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from '../../../db/index.js';
 import { getRawDb } from '../../../db/connection.js';
 
 function now(): string {
@@ -22,10 +22,7 @@ afterEach(async () => {
 });
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 async function seedAgentAndSession(agId: string, sessId: string): Promise<void> {

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../../db/index.js';
 import { isAnyAdmin } from './user-roles.js';
 
 function now(): string {
@@ -30,9 +30,7 @@ function insertRole(userId: string, role: 'owner' | 'admin', agentGroupId: strin
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

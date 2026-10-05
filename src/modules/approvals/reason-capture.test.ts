@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InboundEvent } from '../../channels/adapter.js';
-import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import {
@@ -111,9 +111,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   delivered = [];
 
   await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });

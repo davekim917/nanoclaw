@@ -36,7 +36,7 @@ vi.mock('../../delivery.js', async (importOriginal) => ({
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { registerSlackBot } from '../../channels/slack-mentions.js';
-import { initTestDb, closeDb, runMigrations, getDb, getRawDb } from '../../db/index.js';
+import { closeDb, getDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import type { ChannelDeliveryAdapter } from '../../delivery.js';
 import type { MessagingGroup } from '../../types.js';
@@ -57,8 +57,7 @@ describe('messaging-groups CLI create defaults instance to channel_type', () => 
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {
@@ -102,8 +101,7 @@ describe('messaging-groups CLI create resolves unknown_sender_policy from the ch
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {
@@ -146,8 +144,7 @@ describe('messaging-groups CLI notify', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     vi.mocked(getDeliveryAdapter).mockReset();
   });
 

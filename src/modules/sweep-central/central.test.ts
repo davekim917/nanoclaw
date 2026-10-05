@@ -50,7 +50,7 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import {
   claimChannelIngress,
   completeChannelIngress,
@@ -119,10 +119,7 @@ vi.mock('node:child_process', () => childProcessTripwire(spawnState.spawns));
 
 describe('pruneSteerIdempotency — D7', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    db.pragma('foreign_keys = ON');
-    runMigrations(db);
+    await initMigratedTestDb();
     // Seed a user required by FK
     getRawDb()
       .prepare(
@@ -210,8 +207,7 @@ describe('F-4.1 — each prune duty deletes exactly the rows its retention windo
   };
 
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(() => closeDb());
@@ -346,10 +342,7 @@ describe('the registered central-housekeeping duties call their expected depende
   beforeEach(async () => {
     // Truncate, never reassign: the tripwire factory closed over THIS array.
     spawnState.spawns.length = 0;
-    await initTestDb();
-    const db = getRawDb();
-    db.pragma('foreign_keys = ON');
-    runMigrations(db);
+    await initMigratedTestDb();
     getRawDb()
       .prepare(
         "INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES ('u1', 'test', NULL, datetime('now'))",

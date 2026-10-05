@@ -26,7 +26,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { _listSweepRegistrationsForTesting, SWEEP_DUTY_INVENTORY, type SweepTickContext } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import {
@@ -154,10 +154,7 @@ beforeEach(async () => {
   h.tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-title-central-'));
   // Truncate, never reassign: the tripwire factory closed over THIS array.
   h.spawns.length = 0;
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
   await createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: now() });
 });
 

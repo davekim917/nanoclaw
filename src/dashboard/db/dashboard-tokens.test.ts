@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { consumeDashboardToken, issueDashboardToken } from './dashboard-tokens.js';
 
 function now(): string {
@@ -14,9 +14,7 @@ function seedUser(id: string): void {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   seedUser('u1');
   seedUser('u2');
 });

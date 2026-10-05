@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { withCentralSync } from '../db/central-lease.js';
-import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
-import { runMigrations } from '../db/migrations/index.js';
+import { closeDb, getRawDb } from '../db/connection.js';
 import { ALLOW, guard } from '../guard/index.js';
 import { observatoryAssign, type ObservatoryAssignPayload } from './observatory-assign-guard.js';
+import { initMigratedTestDb } from '../db/index.js';
 
 /**
  * The seam, not the handler. `assign.test.ts` pins what the endpoint DOES;
@@ -35,9 +35,8 @@ function decide(userId: string, payload: Partial<ObservatoryAssignPayload>, acto
 const wired = { agentGroupId: 'ag-wired', channelKey: 'slack:CEXAMPLE001', wiredToItemChannel: true };
 
 beforeEach(async () => {
-  await initTestDb();
+  await initMigratedTestDb();
   const db = getRawDb();
-  runMigrations(db);
   db.exec(`
     INSERT INTO workgroups (id, created_at) VALUES ('wg-example', '2026-08-01T00:00:00.000Z');
     INSERT INTO agent_groups (id, name, folder, agent_provider, workgroup_id, created_at)

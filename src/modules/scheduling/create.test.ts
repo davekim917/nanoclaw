@@ -22,12 +22,12 @@ vi.mock('../../config.js', async (importOriginal) => ({
   TIMEZONE: 'UTC',
 }));
 
-import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { closeDb } from '../../db/connection.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { createScheduledTask, makeTaskId, prepareScheduledTask, taskNameSlug } from './create.js';
+import { initMigratedTestDb } from '../../db/index.js';
 
 const AG = 'ag-create-test';
 
@@ -89,9 +89,7 @@ const TASK = prepareScheduledTask({
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   await createAgentGroup({ id: AG, name: AG, folder: AG, agent_provider: null, created_at: new Date().toISOString() });
 });
 

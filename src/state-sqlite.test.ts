@@ -13,14 +13,12 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, getRawDb } from './db/connection.js';
-import { runMigrations } from './db/migrations/index.js';
+import { closeDb, getRawDb } from './db/connection.js';
 import { SqliteStateAdapter } from './state-sqlite.js';
+import { initMigratedTestDb } from './db/index.js';
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

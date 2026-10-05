@@ -41,14 +41,7 @@ vi.mock('../../channels/channel-registry.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-support-dispatch') }));
 
-import {
-  initTestDb,
-  closeDb,
-  runMigrations,
-  createAgentGroup,
-  createMessagingGroup,
-  getRawDb,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
 import { getSupportThread } from '../../db/support-threads.js';
 import { resolveSession, resolveTaskSession } from '../../session-manager.js';
@@ -122,9 +115,7 @@ function dispatchContent(
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   postParent.mockReset().mockResolvedValue({ messageId: 'parent-ts-1' });
   createThread.mockReset().mockResolvedValue({ threadId: 'thread-ts-1' });
   adapterDeliver.mockReset().mockResolvedValue(undefined);

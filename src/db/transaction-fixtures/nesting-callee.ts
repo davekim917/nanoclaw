@@ -1,5 +1,5 @@
 /**
- * NEGATIVE FIXTURE for src/db/transaction-closures.test.ts — the reentrancy
+ * NEGATIVE FIXTURE for src/db/transaction-closures-tripwire.test.ts — the reentrancy
  * shape that shipped as a P1 on #505 and would have taken workspace-trust
  * auto-wire out entirely.
  *

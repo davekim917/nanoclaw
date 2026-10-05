@@ -20,7 +20,7 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from './db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from './db/index.js';
 import { CLAUDE_MAX_CONCURRENT_SUBAGENTS, CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH } from './claude-spawn-defaults.js';
 import { initGroupFilesystem } from './group-init.js';
 import type { AgentGroup } from './types.js';
@@ -34,8 +34,7 @@ async function makeGroup(id: string): Promise<AgentGroup> {
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

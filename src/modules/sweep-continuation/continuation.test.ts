@@ -15,7 +15,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
 import { type ContainerState } from '../mailbox/ops/sweep.js';
@@ -1336,9 +1336,8 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
 
   // ── F-13.4 ─────────────────────────────────────────────────────────────────
   it('the kill sequence is kill, notify, reset, follow-up, with claims snapshotted before the kill', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-ceiling', 'ceiling', 'ceiling-folder', ?)`,

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { ATTENTION_ITEM_PREFIX, ATTENTION_MEMO_TTL_MS, clearAttentionMemo } from '../../attention-sources.js';
 import { ASSIGN_DEDUPE_MS } from '../db/item-assignments.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -104,10 +104,7 @@ async function setupDb(): Promise<void> {
   // Module-level memo, and vitest keeps module state across files in a worker:
   // an un-cleared one would serve a previous DB's attention items into this one.
   clearAttentionMemo();
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 async function seedAgentGroup(id: string, workgroupId?: string): Promise<void> {

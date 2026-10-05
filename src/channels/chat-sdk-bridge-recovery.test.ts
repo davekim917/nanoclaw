@@ -7,7 +7,7 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
   registerWebhookAdapter: vi.fn(),
 }));
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../db/index.js';
 import { createPendingApproval } from '../db/sessions.js';
 import type { ChannelSetup } from './adapter.js';
 import { createChatSdkBridge, handleForwardedEvent, RecoveryIngressGate } from './chat-sdk-bridge.js';
@@ -59,9 +59,7 @@ function message(options: {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(() => closeDb());

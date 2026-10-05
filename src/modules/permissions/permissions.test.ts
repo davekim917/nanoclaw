@@ -13,14 +13,7 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  initTestDb,
-  runMigrations,
-  getRawDb,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from '../../db/index.js';
 import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
 import { addMember, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
@@ -34,9 +27,7 @@ function now(): string {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

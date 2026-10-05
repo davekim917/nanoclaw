@@ -28,7 +28,7 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
   }),
 }));
 
-import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations, getRawDb } from '../db/index.js';
+import { closeDb, createAgentGroup, createSession, initMigratedTestDb } from '../db/index.js';
 import { createPendingApproval, createPendingQuestion } from '../db/sessions.js';
 import type { ChannelSetup } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
@@ -152,9 +152,7 @@ async function seedInteractiveQuestion(
 
 beforeEach(async () => {
   captured.chat = null;
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

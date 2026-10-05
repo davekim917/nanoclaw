@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../db/index.js';
 import type { AuthedRequestContext } from './router.js';
 import * as userRoles from '../modules/permissions/db/user-roles.js';
 import { isSnoozed, readThreadSnoozes, threadSnoozeHandler, threadUnsnoozeHandler } from './thread-snooze.js';
@@ -56,10 +56,7 @@ const post = (): Request => new Request('http://localhost/x', { method: 'POST' }
 
 beforeEach(async () => {
   await closeDb();
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
   await createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: iso(0) });
   await createAgentGroup({ id: 'ag-2', name: 'ag-2', folder: 'ag-2', agent_provider: null, created_at: iso(0) });
   vi.mocked(userRoles.hasAdminPrivilege).mockReturnValue(true);

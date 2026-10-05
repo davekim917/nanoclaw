@@ -64,7 +64,7 @@ vi.mock('../container/agent-runner/src/destinations.js', () => ({
   findByRouting: () => undefined,
 }));
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from './db/index.js';
 import { upsertArchiveMessage } from './message-archive.js';
 import { writeSessionMessageIfNew } from './session-manager.js';
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
@@ -290,8 +290,7 @@ beforeEach(async () => {
   FAILURES.archive = false;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   seedCentralScope();
   writeMemory(
     'house-a',

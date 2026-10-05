@@ -1,13 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  createSession,
-  initTestDb,
-  runMigrations,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, createSession, initMigratedTestDb } from '../../db/index.js';
 import { getRawDb } from '../../db/connection.js';
 import { getTaskByParentAndIdempotency, getTaskById, insertTaskAtomic } from './db/tasks.js';
 import type { Task } from './db/tasks.js';
@@ -107,10 +100,7 @@ function now(): string {
 }
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 function makeCallerSession(overrides: Partial<Session> = {}): Session {

@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import http from 'http';
 
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../db/index.js';
 import { enforceHermeticity } from '../test-hermeticity.js';
 import type { AuthedRequestContext } from './router.js';
 
@@ -143,10 +143,7 @@ function makeUserAdmin(userId: string): void {
 
 beforeEach(async () => {
   await closeDb();
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
   claimsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ncc-claims-'));
   applySessionSteer.mockReset();
   applySessionSteer.mockResolvedValue(ACCEPTED);

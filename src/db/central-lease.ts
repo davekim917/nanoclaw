@@ -10,7 +10,7 @@
  * block. `withRawDb(fn)`: the connection, confined to such a block. `evaluateGuardSync(g)`: rejects a thenable guard
  * result. Non-transactional driver `get`/`all`/`run` do not take the lease; they never open a transaction.
  * No deadlock: a sync-block holder cannot await, and a transaction closure may await only driver calls (enforced by
- * `src/db/transaction-closures.test.ts`); re-entry throws immediately.
+ * `src/db/transaction-closures-tripwire.test.ts`); re-entry throws immediately.
  */
 import type Database from 'better-sqlite3';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -157,7 +157,7 @@ function assertLeaseNotHeld(entry: string): void {
 }
 
 /**
- * The ONLY sanctioned caller of `DbDriver.transaction` (enforced by `src/db/transaction-closures.test.ts`). The
+ * The ONLY sanctioned caller of `DbDriver.transaction` (enforced by `src/db/transaction-closures-tripwire.test.ts`). The
  * closure must issue DB calls sequentially and contain no non-DB effect (mailbox write, container op, adapter call,
  * `fetch`); those belong after it resolves.
  */

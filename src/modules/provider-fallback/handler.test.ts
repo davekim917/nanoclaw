@@ -21,7 +21,7 @@ vi.mock('../../config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-provider-fallback') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
 import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } from '../../db/provider-health.js';
 import type { Session } from '../../types.js';
 import { SYSTEM_ERROR_PARK_MAX_MS, handleProviderUnavailable, measuredResetAt } from './handler.js';
@@ -47,9 +47,7 @@ describe('provider_unavailable handler', () => {
     killed.length = 0;
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: FOLDER,
@@ -200,9 +198,7 @@ describe('provider_retry_primary handler', () => {
     killed.length = 0;
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: FOLDER,
@@ -282,8 +278,7 @@ describe('codex_account_exhausted handler', () => {
       fs.writeFileSync(`${HOME}/${dir}/auth.json`, '{}');
     }
     process.env.HOME = HOME;
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: FOLDER,
