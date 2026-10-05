@@ -51,7 +51,7 @@ For a sampled lifecycle, compare the actual path with its current contract. Esca
 
 When the question is whether agents keep repeating a behavior the operator has corrected, read what the operator told the agent groups in question during the window, metadata first, before any content.
 
-Get them with `pnpm exec tsx scripts/operator-messages.ts --groups <id,id> --since <ISO> [--until <ISO>]`. It selects the operator's chat and dashboard-steer rows, strips thread-context replays and dedupes fan-out, and its count is an upper bound: a post made with the operator's user token looks exactly like a typed one, so check a candidate against the poster's own record (the host session transcript, or the agent's tool call that posted it) before counting it as typed.
+Get them with `pnpm exec tsx scripts/operator-messages.ts --groups <id,id> --since <date> [--until <date>]`, which prints metadata only; add `--text` once you need the messages themselves. It selects the operator's chat and dashboard-steer rows, strips thread-context replays and dedupes fan-out, and its count is an upper bound: a post made with the operator's user token looks exactly like a typed one, so check a candidate against the poster's own record (the host session transcript, or the agent's tool call that posted it) before counting it as typed.
 
 Pick out the messages that correct an agent: a redirect, a "don't", a repeat of an earlier instruction, a "why did you". Group them by the behavior corrected. A class counts once it has happened twice. When the group's instructions already state the rule, the instruction has failed: recommend a control, not more prose.
 

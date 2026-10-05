@@ -3,7 +3,8 @@
  *
  * `author.isBot === false` is not proof a person typed a row: posts made with the operator's Slack user token, by a
  * host session or by an agent granted the token, arrive the same way and nothing in `messages_in` separates them.
- * Every count this prints is therefore an upper bound, and says so.
+ * Every count this prints is therefore an upper bound, and says so. Rows from the CLI channel are not counted: they
+ * arrive through the admin transport, usually from a host session, not typed by the operator.
  */
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
@@ -84,6 +85,7 @@ function* inboundRows(
       if (!fs.existsSync(dbPath)) continue;
       const db = new Database(dbPath, { readonly: true, fileMustExist: true });
       try {
+        if (!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_in'`).get()) continue;
         const rows = db
           .prepare(
             `SELECT id, kind, timestamp, content FROM messages_in
@@ -108,11 +110,14 @@ function main(args: string[]): void {
   const since = flag(args, '--since');
   const until = flag(args, '--until') ?? new Date().toISOString();
   if (groups.length === 0 || !since || Number.isNaN(Date.parse(since)) || Number.isNaN(Date.parse(until))) {
-    console.error('usage: tsx scripts/operator-messages.ts --groups <id,id> --since <ISO> [--until <ISO>]');
+    console.error('usage: tsx scripts/operator-messages.ts --groups <id,id> --since <date> [--until <date>] [--text]');
     process.exit(2);
   }
-  const messages = selectOperatorMessages(inboundRows(groups, since, until));
-  console.log(JSON.stringify({ count: messages.length, provenance: PROVENANCE_CAVEAT, messages }, null, 2));
+  const messages = selectOperatorMessages(
+    inboundRows(groups, new Date(since).toISOString(), new Date(until).toISOString()),
+  );
+  const shown = args.includes('--text') ? messages : messages.map(({ text: _text, ...metadata }) => metadata);
+  console.log(JSON.stringify({ count: messages.length, provenance: PROVENANCE_CAVEAT, messages: shown }, null, 2));
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) main(process.argv.slice(2));
