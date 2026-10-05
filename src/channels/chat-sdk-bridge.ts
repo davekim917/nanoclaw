@@ -317,6 +317,12 @@ export interface ChatSdkBridgeConfig {
    * otherwise it is answered at channel root. Null keeps the root address.
    */
   threadRecoveredRootMention?: (platformId: string, message: ChatMessage) => Promise<string | null>;
+  /**
+   * True when a bot-flagged author is really a human. SDK adapters derive `isBot` from transport details (Slack sets
+   * it for any app-posted message, including a human's own user-token post); this hook corrects the flag before any
+   * filter, recovery gate or the router sees the message.
+   */
+  isHumanAuthor?: (userId: string) => boolean;
   /** Default recovery policy drops bot-authored rows. */
   allowRecoveredBotMessage?: (message: ChatMessage) => boolean;
   fetchRecoveryPage?: (
@@ -668,6 +674,9 @@ export function appendRawText(
 
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
+  const correctHumanAuthor = (message: ChatMessage): void => {
+    if (message.author.isBot === true && config.isHumanAuthor?.(message.author.userId)) message.author.isBot = false;
+  };
   const bridgeChannelType = config.channelType ?? adapter.name;
   const isDiscordBridge = bridgeChannelType === 'discord' || bridgeChannelType.startsWith('discord-');
   // The instance name becomes a webhook route segment (the route regex is
@@ -996,8 +1005,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
       };
 
-      const passesFilter = (message: ChatMessage): boolean =>
-        config.inboundFilter ? config.inboundFilter(message, { recovered: false }) : true;
+      const passesFilter = (message: ChatMessage): boolean => {
+        correctHumanAuthor(message);
+        return config.inboundFilter ? config.inboundFilter(message, { recovered: false }) : true;
+      };
 
       // Subscribed threads — every message in a thread we've previously
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
@@ -1746,6 +1757,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                 oldestMs = Math.min(oldestMs, messageMs);
                 if (messageMs <= sinceMs) continue;
                 if (message.author.isMe) continue;
+                correctHumanAuthor(message);
                 if (message.author.isBot === true && !config.allowRecoveredBotMessage?.(message)) continue;
                 if (config.inboundFilter && !config.inboundFilter(message, { recovered: true })) continue;
                 const dedupeKey = `${target.platformId}\u0000${message.id}`;

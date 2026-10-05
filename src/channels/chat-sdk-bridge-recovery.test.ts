@@ -278,6 +278,46 @@ describe('Chat SDK bridge missed-message recovery', () => {
     expect(threadRecoveredRootMention.mock.calls.map(([, msg]) => msg.id)).toEqual(['ask', 'refused']);
   });
 
+  it('recovers a human post the SDK flagged as a bot, and hands the router a human author', async () => {
+    const fetched = [
+      message({
+        id: 'operator',
+        timestamp: '2026-07-21T18:18:00Z',
+        text: 'continue',
+        isBot: true,
+        authorUserId: 'U-OPERATOR',
+      }),
+      message({ id: 'app', timestamp: '2026-07-21T18:18:30Z', text: 'deploy done', isBot: true, authorUserId: 'B-CI' }),
+    ];
+    const bridge = createChatSdkBridge({
+      adapter: {
+        name: 'stub',
+        initialize: async () => {},
+        channelIdFromThreadId: () => 'stub:C',
+        fetchMessages: vi.fn(async () => ({ messages: fetched })),
+      } as unknown as Adapter,
+      supportsThreads: true,
+      isHumanAuthor: (userId) => userId === 'U-OPERATOR',
+    });
+    const inbound: Array<{ id: string; isBot: unknown }> = [];
+    await bridge.setup({
+      onInbound: async (_platformId, _threadId, msg) => {
+        inbound.push({ id: msg.id, isBot: (msg.content as { author?: { isBot?: unknown } }).author?.isBot });
+      },
+      onInboundEvent: async () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    } as ChannelSetup);
+
+    await bridge.recoverMissedMessages!({
+      since: '2026-07-21T18:16:00Z',
+      reason: 'event-loop-stall',
+      targets: [{ platformId: 'stub:C', threadId: 'stub:C:T', isDM: false }],
+    });
+
+    expect(inbound).toEqual([{ id: 'operator', isBot: false }]);
+  });
+
   it('normalizes stale sibling sender names before recovered messages reach the router', async () => {
     const fetched = [
       message({
