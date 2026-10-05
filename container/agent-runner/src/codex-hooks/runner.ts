@@ -11,6 +11,7 @@ import {
   createEmailGateHook,
 } from '../providers/claude.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
+import { hookFailureDenyReason } from './hook-failure.js';
 
 /** Normalized to `Bash` because the shared hooks match on `tool_name === 'Bash'`. */
 const CODEX_SHELL_ALIASES = new Set(['exec_command', 'local_shell_call', 'shell']);
@@ -332,9 +333,7 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
       );
     } catch (err) {
       // A throwing guard (e.g. the email gate's session-DB round-trip) must deny here, not escape to the CLI.
-      return denyDecision(
-        `Guard hook errored (${err instanceof Error ? err.message : String(err)}) — denying for safety. Report this rather than retrying.`,
-      );
+      return denyDecision(hookFailureDenyReason('hook chain', err));
     }
     if (!out) continue;
     const ret = out as {
