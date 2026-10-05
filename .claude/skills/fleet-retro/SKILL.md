@@ -49,23 +49,13 @@ For a sampled lifecycle, compare the actual path with its current contract. Esca
 
 ## Count the operator's corrections
 
-When the question concerns agent behaviour, read what the operator actually told the workgroup's
-agents in the window. Human channel messages are `messages_in` rows with `kind='chat-sdk'` and
-`author.isBot === false` in the envelope. `kind='chat'` is agent and system traffic. Exclude
-host-assembled thread replays (`[New in thread since last response] …`), and check names against
-the workgroup's known agent identities, because an agent posting through a human-looking account
-passes the bot flag.
+When the question is whether agents keep repeating a behavior the operator has corrected, read what the operator told the agent groups in question during the window, metadata first, before any content.
 
-Pick out the messages that correct an agent: a redirect, a "don't", a repeat of an earlier
-instruction, a "why did you". Group them by the behaviour corrected, across every agent group in
-the workgroup. A class counts once it has happened twice. When the group's instructions already
-state the rule, the instruction has failed: recommend a control, not more prose.
+Operator messages are `messages_in` rows with `kind='chat-sdk'` and `author.isBot === false` in the envelope, plus dashboard steers (`kind='chat'` with `_via: 'dashboard'`); other `kind='chat'` rows are agent and system traffic. A thread replay is a prefix on the triggering row (`[Thread context]` or `[New in thread since last response]`): keep only the text after `[Latest message]`. One message is written to every wired agent's session, so dedupe by platform message id before counting. Posts made as the operator through a user token also arrive with `isBot` false and the operator's name; leave out rows the host's own logs show it posted.
 
-For each class, recommend the fix at the highest level that works: a guard or `ncl` check that
-refuses the action, a container-config or tool change that removes the wrong path, a lint or test
-in the repository the agent works in, and only then an instruction, for judgment calls. Give
-the reason a higher level does not work. Quote corrections minimally and never copy client
-content beyond what the finding needs.
+Pick out the messages that correct an agent: a redirect, a "don't", a repeat of an earlier instruction, a "why did you". Group them by the behavior corrected. A class counts once it has happened twice. When the group's instructions already state the rule, the instruction has failed: recommend a control, not more prose.
+
+For each class, recommend the fix at the highest level that works: a host guard or `ncl` check, or a container tool hook, that refuses the action; a container-config or tool change that removes the wrong path; a lint or test in the repository the agent works in; and only then an instruction, for judgment calls. Give the reason a higher level does not work. Quote corrections minimally and never copy client content beyond what the finding needs.
 
 ## Deliver the retro
 
