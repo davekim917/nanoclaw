@@ -36,11 +36,11 @@ vi.mock('../../db/agent-groups.js', async (importOriginal) => {
 });
 
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { closeDb, getRawDb, initTestDb } from '../../db/connection.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { closeDb, getRawDb } from '../../db/connection.js';
 import { dispatch } from '../dispatch.js';
 // Side-effect import: registers the `groups-*` commands.
 import './groups.js';
+import { initMigratedTestDb } from '../../db/index.js';
 
 const FOLDER = 'racy-agent';
 
@@ -63,8 +63,7 @@ describe('groups create adopts the winner of a concurrent folder race', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {

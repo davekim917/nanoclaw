@@ -26,7 +26,7 @@ vi.mock('../log.js', () => ({
 }));
 
 import { CONTAINER_PLUGINS_DIR } from '../container-config.js';
-import { closeDb, getAllAgentGroups, initTestDb, runMigrations, getRawDb } from '../db/index.js';
+import { closeDb, getAllAgentGroups, initMigratedTestDb } from '../db/index.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { findTaskSessions } from '../db/sessions.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
@@ -73,8 +73,7 @@ function writeTask(name: string, schedule: string, prompt: string, script?: stri
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   writeTemplate();
 });
 

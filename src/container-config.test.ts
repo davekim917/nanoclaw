@@ -24,9 +24,8 @@ import {
 } from './container-config.js';
 import { TIMEZONE } from './config.js';
 import { createAgentGroup } from './db/agent-groups.js';
-import { closeDb, initTestDb, getRawDb } from './db/connection.js';
+import { closeDb } from './db/connection.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
-import { runMigrations } from './db/migrations/index.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
 import knownSecretShapes from '../tests/fixtures/mcp-known-secret-shapes.json' with { type: 'json' };
@@ -46,6 +45,7 @@ afterEach(() => {
 // Since we can't easily override GROUPS_DIR, we use vi.mock below to redirect it.
 
 import { vi } from 'vitest';
+import { initMigratedTestDb } from './db/index.js';
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
@@ -355,8 +355,7 @@ const TZ_GROUP: AgentGroup = {
 
 describe('resolveGroupTimezone', () => {
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await createAgentGroup(TZ_GROUP);
     await ensureContainerConfig(TZ_GROUP.id);
   });

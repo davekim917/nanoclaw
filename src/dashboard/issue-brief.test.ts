@@ -7,6 +7,7 @@ import { observatoryIssueBriefHandler, _resetIssueBriefCacheForTesting } from '.
 import type { AuthedRequestContext } from './router.js';
 
 import { readReleaseState as _rrsRaw } from './api/observatory.js';
+import { initMigratedTestDb } from '../db/index.js';
 
 const mockReadReleaseState = vi.mocked(_rrsRaw);
 
@@ -155,8 +156,7 @@ describe('observatoryIssueBriefHandler — workgroup scope', () => {
   const ISSUE = { state: 'open', body: 'private body of workgroup one', labels: [], comments: 0 };
 
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     const at = new Date().toISOString();
     const ins = getRawDb().prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES (?, ?, ?)`);
     ins.run('wg-1', 'One', at);

@@ -50,13 +50,12 @@ vi.mock('./topic-title.js', async (importOriginal) => ({
 }));
 
 import {
-  initTestDb,
   closeDb,
   getRawDb,
-  runMigrations,
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  initMigratedTestDb,
 } from './db/index.js';
 import { findSessionForAgent, createSession } from './db/sessions.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
@@ -222,8 +221,7 @@ beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   vi.clearAllMocks();
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   threadHistory = [];
   historyCalls = [];
   historyThrows = false;

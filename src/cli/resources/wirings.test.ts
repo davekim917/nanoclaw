@@ -38,7 +38,7 @@ vi.mock('../../db/messaging-groups.js', async (importOriginal) => {
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { validateEngageAgainstChannel } from '../../channels/channel-defaults.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from '../../db/index.js';
 import { getRawDb } from '../../db/connection.js';
 import {
   createMessagingGroupAgent,
@@ -94,8 +94,7 @@ async function del(args: Record<string, unknown>) {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   await createAgentGroup({
     id: 'ag-1',
     name: 'Helper Bot',

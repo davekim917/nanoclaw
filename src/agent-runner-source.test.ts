@@ -28,7 +28,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import { buildMounts } from './container-runner.js';
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from './db/index.js';
 import { ensureContainerConfig } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -117,8 +117,7 @@ beforeEach(async () => {
   savedHome = process.env.HOME;
   process.env.HOME = path.join(TEST_ROOT, 'home');
   fs.mkdirSync(process.env.HOME, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

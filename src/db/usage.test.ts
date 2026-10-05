@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb, initMigratedTestDb } from './index.js';
 import {
   getUsageWatermark,
   rollupSessionUsage,
@@ -600,8 +600,7 @@ describe('summarizeTurnUsage', () => {
  */
 describe('untrusted Claude usage window (#1061)', () => {
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: 'usage',

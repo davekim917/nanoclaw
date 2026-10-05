@@ -21,7 +21,7 @@ vi.mock('../../config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-provider-fallback') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } from '../../db/provider-health.js';
 import type { Session } from '../../types.js';
 import { SYSTEM_ERROR_PARK_MAX_MS, handleProviderUnavailable, measuredResetAt } from './handler.js';
@@ -282,8 +282,7 @@ describe('codex_account_exhausted handler', () => {
       fs.writeFileSync(`${HOME}/${dir}/auth.json`, '{}');
     }
     process.env.HOME = HOME;
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: FOLDER,

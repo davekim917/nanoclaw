@@ -10,8 +10,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, getRawDb } from './connection.js';
-import { runMigrations } from './migrations/index.js';
+import { closeDb, getRawDb } from './connection.js';
 import {
   TASKS_SYSTEM_THREAD_ID,
   createSession,
@@ -21,11 +20,11 @@ import {
   taskSeriesId,
   taskThreadId,
 } from './sessions.js';
+import { initMigratedTestDb } from './index.js';
 
 describe('getAskQuestionRender — module-absent path', () => {
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     // Simulate an install where the pending_channel_approvals /
     // pending_sender_approvals modules were never migrated in, which is
     // exactly the state the two `hasTable` guards exist to handle.
@@ -113,8 +112,7 @@ describe('per-series task session threads', () => {
  */
 describe('findTaskSessions — legacy shared session reachability', () => {
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     getRawDb()
       .prepare("INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-1', 'ag', 'ag', ?)")
       .run(new Date().toISOString());

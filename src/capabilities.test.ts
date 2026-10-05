@@ -19,7 +19,7 @@ vi.mock('./config.js', async (importOriginal) => ({
 
 import { boundedNameList, buildSessionServicesSnapshot, getHostCapabilities } from './capabilities.js';
 import { __resetCachesForTest, __setSecretsCacheForTest } from './onecli-secrets.js';
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
 import { PRE_TURN_BOUNDS, boundedCapabilities, type ContextNotice } from './modules/memory/pre-turn-context.js';
@@ -53,8 +53,7 @@ async function createGroupInWorkgroup(agentGroup: AgentGroup, workgroupId: strin
 beforeEach(async () => {
   fs.rmSync(dirs.TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(dirs.GROUPS_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {
@@ -322,8 +321,7 @@ describe('buildSessionServicesSnapshot', () => {
       await closeDb();
       fs.rmSync(dirs.TEST_ROOT, { recursive: true, force: true });
       fs.mkdirSync(dirs.GROUPS_DIR, { recursive: true });
-      await initTestDb();
-      runMigrations(getRawDb());
+      await initMigratedTestDb();
 
       const disabledWithSecret = await slackGroup({ secret: true, enabled: false });
       expect((await slackEntry(disabledWithSecret.id, OWNER_SAFE_MG))?.useFor).toContain('LIVE in THIS session');

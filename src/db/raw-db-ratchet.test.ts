@@ -143,12 +143,8 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/channels/channel-registry.test.ts',
   'src/channels/chat-sdk-bridge-byline.test.ts',
   'src/channels/chat-sdk-bridge-recovery.test.ts',
-  'src/channels/slack-hop-limit.test.ts',
-  'src/channels/slack-raw-text.test.ts',
-  'src/claude-md-compose.test.ts',
   'src/cli/crud-validate.test.ts',
   'src/cli/crud.test.ts',
-  'src/cli/delivery-action.test.ts',
   'src/cli/request-ledger.test.ts',
   'src/cli/resources/destinations.test.ts',
   'src/cli/resources/groups-create-adopt.test.ts',
@@ -159,7 +155,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/cli/resources/usage.test.ts',
   'src/cli/resources/wirings.test.ts',
   'src/command-gate.test.ts',
-  'src/container-config.test.ts',
   'src/container-runner.test.ts',
   'src/dashboard/api/auth-me.test.ts',
   'src/dashboard/api/groups.test.ts',
@@ -189,7 +184,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/agent-groups.test.ts',
   'src/db/boot-order.test.ts',
   'src/db/central-lease.ts',
-  'src/db/channel-ingress-receipts.test.ts',
   'src/db/container-configs.test.ts',
   'src/db/db-v2.test.ts',
   'src/db/index.ts',
@@ -200,7 +194,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/sessions.test.ts',
   'src/db/usage.test.ts',
   'src/delivery.test.ts',
-  'src/group-init.settings.test.ts',
   'src/host-core.test.ts',
   'src/host-lifecycle-timers.test.ts',
   'src/host-sweep.test.ts',
@@ -237,17 +230,14 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/permissions/permissions.test.ts',
   'src/modules/permissions/sender-approval.test.ts',
   'src/modules/permissions/sender-decline-notify.test.ts',
-  'src/modules/permissions/task-slack-subject.test.ts',
   'src/modules/permissions/user-dm-adopt.test.ts',
   'src/modules/provider-fallback/handler.test.ts',
   'src/modules/repository-workspaces/index.test.ts',
   'src/modules/scheduling/create.test.ts',
-  'src/modules/self-mod/apply.test.ts',
   'src/modules/self-mod/request.test.ts',
   'src/modules/support-threads/dispatch.test.ts',
   'src/modules/sweep-central/central.test.ts',
   'src/modules/sweep-central/session-title-sweep.test.ts',
-  'src/modules/sweep-central/thread-title-retry.test.ts',
   'src/modules/sweep-claims/claims-throttle.test.ts',
   'src/modules/sweep-container-health/health.test.ts',
   'src/modules/sweep-continuation/continuation.test.ts',
@@ -258,7 +248,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/sweep-usage/usage.test.ts',
   'src/provider-fallback.test.ts',
   'src/provider-surfaces.test.ts',
-  'src/providers/opencode.container-config.test.ts',
   'src/router.session-skip.test.ts',
   'src/session-manager.attachments.test.ts',
   'src/session-manager.test.ts',
@@ -266,7 +255,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/storage-gc.test.ts',
   'src/storage-manager.test.ts',
   'src/storage-manager.ts',
-  'src/templates/create-agent.test.ts',
   'src/test-fixtures/raw-db-fake.ts',
   'src/topic-title.test.ts',
   'src/workgroup-memory.integration.test.ts',
@@ -317,8 +305,23 @@ describe('the raw central-DB handle only shrinks', () => {
     expect(
       added,
       'a NEW file reaches the transitional synchronous central-DB handle. The seam only shrinks: ' +
-        'convert the site to the async DbDriver (getDb()) instead of widening the raw allowlist. ' +
+        'a test that needs a migrated central DB calls initMigratedTestDb() (src/db/index.ts); ' +
+        'any other site uses the async DbDriver (getDb()). Never widen the raw allowlist. ' +
         'See docs/specs/upstream-async-central-db-seam/plan.md §4.1.',
+    ).toEqual([]);
+  });
+
+  it('tests migrate through initMigratedTestDb, never by hand on the raw handle', () => {
+    const offenders = listTsFiles()
+      .filter((rel) => rel.endsWith('.test.ts') && !NOT_CALLERS.includes(rel))
+      .filter((rel) =>
+        /\brunMigrations\(\s*getRawDb\(\s*\)\s*\)/.test(
+          stripComments(fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')),
+        ),
+      );
+    expect(
+      offenders,
+      'replace `await initTestDb(); runMigrations(getRawDb());` with `await initMigratedTestDb();`',
     ).toEqual([]);
   });
 

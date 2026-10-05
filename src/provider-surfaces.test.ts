@@ -46,7 +46,7 @@ import { sessionContextPath, sessionDir, writeSessionContext } from './session-m
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
 import { OPENCODE_STAGED_CONFIG_FILE, OPENCODE_XDG_ENV } from './providers/opencode.js';
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
 import { STANDING_INSTRUCTIONS_FILE, readGroupPersona } from './group-persona.js';
@@ -148,8 +148,7 @@ beforeEach(async () => {
   savedHome = process.env.HOME;
   process.env.HOME = path.join(TEST_ROOT, 'home');
   fs.mkdirSync(process.env.HOME, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

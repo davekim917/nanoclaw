@@ -91,15 +91,15 @@ jobs:
       - name: Review notes and doc citations
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run scripts/review-notes.test.ts scripts/doc-citations.test.ts --maxWorkers=1
-      # src/upstream-ratchet.json must be regenerated whenever an upstream-owned
-      # file changes (CLAUDE.md:105); a stale hash (#1103) otherwise first
-      # shows at ci-full's drift tests. The suite is fs + crypto only, no git
-      # (src/upstream-ratchet.test.ts:4-16), ~seconds. The GROWTH arithmetic
-      # (ratchet:report) needs the pinned upstream commit and stays in
-      # ci-full.yml's `bookkeeping` job (.github/workflows/ci-full.yml:320-334).
-      - name: Upstream ratchet is current
+      # Every test file whose path contains `ratchet` or `tripwire`, selected by
+      # name so a new repo guard runs on PRs without editing this lane. They
+      # are fs-only source scans, ~5s together; a guard left to the nightly
+      # lets a PR merge red. A file matching either name must stay that cheap.
+      # The upstream ratchet's GROWTH arithmetic (ratchet:report) needs the
+      # pinned upstream commit and stays in ci-full.yml's `bookkeeping` job.
+      - name: Ratchets and tripwires
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: pnpm exec vitest run src/upstream-ratchet.test.ts --maxWorkers=1
+        run: pnpm exec vitest run ratchet tripwire --maxWorkers=1
       # Dead code (knip, host and runner), duplication (jscpd) and prohibited
       # comment forms over the whole tree. Any finding fails the step, as does
       # a check that cannot run. Keep this line identical in host-ci.sh and

@@ -35,7 +35,7 @@ vi.mock('../../config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-groups') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
 import { recordDeliveryAttempt } from '../../db/coordination.js';
 import { addDeniedModel } from '../../db/denied-models.js';
@@ -861,8 +861,7 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
   afterEach(async () => {
     await closeDb();
@@ -919,8 +918,7 @@ describe('plugin-owned MCP server guard on config add/remove-mcp-server (cases 1
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
   afterEach(async () => {
     await closeDb();
@@ -1035,8 +1033,7 @@ describe('groups config — the container.json + container_configs dual write ho
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
   afterEach(async () => {
     await closeDb();

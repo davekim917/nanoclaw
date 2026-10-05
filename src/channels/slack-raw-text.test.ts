@@ -23,7 +23,7 @@ vi.mock('../webhook-server.js', async (importOriginal) => ({
   }),
 }));
 
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../db/index.js';
+import { closeDb, initMigratedTestDb } from '../db/index.js';
 import type { ChannelSetup, InboundMessage } from './adapter.js';
 import { appendRawText, createChatSdkBridge } from './chat-sdk-bridge.js';
 import { extractSlackRawText } from './slack-raw-text.js';
@@ -508,8 +508,7 @@ describe('Slack pasted tables in replayed thread context', () => {
 describe('Slack pasted tables through the chat-sdk bridge', () => {
   beforeEach(async () => {
     captured.chat = null;
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {

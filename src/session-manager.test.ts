@@ -64,7 +64,7 @@ import {
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb, initMigratedTestDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
@@ -2605,8 +2605,7 @@ describe('resolveSession under two concurrent first messages (seam 3: the lookup
   const MG_RACE = 'mg-race';
 
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await createAgentGroup({
       id: AG_RACE,
       name: 'Race',
@@ -2645,8 +2644,7 @@ describe('resolveSession under two concurrent first messages (seam 3: the lookup
 describe('resolveTaskSession under two concurrent schedulers (seam 3: the lookup yields)', () => {
   const AG_RACE = 'ag-task-race';
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
     await createAgentGroup({
       id: AG_RACE,
       name: 'TaskRace',

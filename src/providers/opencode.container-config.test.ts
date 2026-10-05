@@ -11,11 +11,11 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
-import { runMigrations } from '../db/migrations/index.js';
+import { closeDb } from '../db/connection.js';
 import { getProviderContainerConfig, type ProviderContainerContext } from './provider-container-registry.js';
 // Importing the module registers the host config callback.
 import './opencode.js';
+import { initMigratedTestDb } from '../db/index.js';
 
 function makeCtx(root: string, overrides: Partial<ProviderContainerContext> = {}): ProviderContainerContext {
   return {
@@ -46,8 +46,7 @@ function writeGlobalSources(home: string): void {
 
 describe('opencode provider container-config reconciliation', () => {
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {

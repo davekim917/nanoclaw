@@ -1,10 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb, getDb } from './connection.js';
-// Seeded through the shared fixture, not `runMigrations(getRawDb())`: the raw
-// synchronous handle is seam-3 scaffolding under a SHRINK-ONLY pin
-// (`src/db/raw-db-ratchet.test.ts`), so a new test file naming it is an
-// addition the ratchet refuses — which is exactly how #545 turned main red.
 import { initMigratedTestDb } from './index.js';
 import {
   listSeriesWithFailures,

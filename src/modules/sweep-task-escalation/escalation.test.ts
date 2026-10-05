@@ -33,9 +33,6 @@ vi.mock('../../host-sweep.js', () => ({
   registerSweepDutySource: vi.fn(),
 }));
 
-// Seeded through the shared fixture rather than `runMigrations(getRawDb())`:
-// the raw synchronous handle is under a shrink-only pin
-// (`src/db/raw-db-ratchet.test.ts`), so naming it here would be an addition.
 import Database from 'better-sqlite3';
 
 import { closeDb } from '../../db/connection.js';

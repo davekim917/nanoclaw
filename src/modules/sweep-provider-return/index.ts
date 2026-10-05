@@ -7,7 +7,6 @@ import { execFileSync } from 'child_process';
 import { readContainerConfig } from '../../container-config.js';
 import {
   containerIdentityFor,
-  containerOwnsOutbound,
   killContainer,
   sameContainerIdentity,
   sessionStillActive,
@@ -19,8 +18,10 @@ import {
   asSessionContext,
   registerSweepDuty,
   registerSweepDutySource,
+  withStoppedContainerSession,
   writeSystemWake,
   type ContainerObservation,
+  type SessionRunner,
   type SweepSessionContext,
   type WakePlan,
 } from '../../host-sweep.js';
@@ -97,8 +98,8 @@ export function _fallbackMarkerCacheSizeForTesting(): number {
 }
 
 async function noteReturnInThread(session: Session, primaryProvider: string, fallbackProvider: string): Promise<void> {
-  const written = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-    if (containerOwnsOutbound(session.id)) return false;
+  const run: SessionRunner = (action) => withExistingMailboxSession(session.agent_group_id, session.id, action);
+  const written = await withStoppedContainerSession(run, session, (mailbox) => {
     const routing = mailbox.readSessionRouting();
     if (!routing) return false;
     mailbox.writeOutboundDirect({

@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, initTestDb, getRawDb } from './connection.js';
-import { runMigrations } from './migrations/index.js';
+import { closeDb } from './connection.js';
 import {
   claimChannelIngress,
   claimDeferredChannelIngress,
@@ -13,6 +12,7 @@ import {
   resetProcessingChannelIngress,
   type ChannelIngressReceiptKey,
 } from './channel-ingress-receipts.js';
+import { initMigratedTestDb } from './index.js';
 
 const key: ChannelIngressReceiptKey = {
   channelType: 'discord',
@@ -22,8 +22,7 @@ const key: ChannelIngressReceiptKey = {
 };
 
 beforeEach(async () => {
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(() => closeDb());

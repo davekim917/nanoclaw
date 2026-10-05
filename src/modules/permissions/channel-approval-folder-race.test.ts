@@ -28,9 +28,9 @@ vi.mock('../../db/agent-groups.js', async (importOriginal) => {
 });
 
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { closeDb, getRawDb, initTestDb } from '../../db/connection.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { closeDb, getRawDb } from '../../db/connection.js';
 import { createNewAgentGroup } from './channel-approval.js';
+import { initMigratedTestDb } from '../../db/index.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -51,8 +51,7 @@ describe('createNewAgentGroup survives a concurrent folder allocation', () => {
   beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {

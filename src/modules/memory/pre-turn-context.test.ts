@@ -68,7 +68,7 @@ import {
   resolveSessionServicesCentral,
   type SessionServicesCentral,
 } from '../../capabilities.js';
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 
@@ -194,8 +194,7 @@ beforeEach(async () => {
   // test that happens to recreate the same relative path at a coincidentally
   // matching size — reset it here so every test starts cold.
   _resetPreferenceIdCacheForTest();
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   seedScope();
   SERVICES_CENTRAL_AG_A = await resolveSessionServicesCentral('ag-a');
   SERVICES_CENTRAL_AG_B = await resolveSessionServicesCentral('ag-b');

@@ -8,7 +8,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
   killContainer: vi.fn(),
 }));
 
-import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import { createPendingApproval, markApprovalAwaitingReason } from '../../db/sessions.js';
 import { PENDING_APPROVAL_STATUSES } from '../../types.js';
 import { registerResourceHelpCommands } from '../commands/help.js';
@@ -21,8 +21,7 @@ registerResourceHelpCommands();
 
 describe('approvals CLI status enum', () => {
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(async () => {

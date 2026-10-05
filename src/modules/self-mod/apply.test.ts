@@ -40,7 +40,7 @@ import { readContainerConfig, writeContainerConfig } from '../../container-confi
 import { buildAgentGroupImage } from '../../container-runner.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import {
   ensureContainerConfig,
   getContainerConfig,
@@ -62,8 +62,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(`${TEST_DIR}/groups/agent`, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 
   await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
   await ensureContainerConfig('ag-1');

@@ -50,7 +50,7 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initTestDb, runMigrations, initMigratedTestDb } from '../../db/index.js';
 import {
   claimChannelIngress,
   completeChannelIngress,
@@ -210,8 +210,7 @@ describe('F-4.1 — each prune duty deletes exactly the rows its retention windo
   };
 
   beforeEach(async () => {
-    await initTestDb();
-    runMigrations(getRawDb());
+    await initMigratedTestDb();
   });
 
   afterEach(() => closeDb());

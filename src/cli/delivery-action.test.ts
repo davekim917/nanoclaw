@@ -38,7 +38,7 @@ vi.mock('../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../db/index.js';
+import { closeDb, initMigratedTestDb } from '../db/index.js';
 import { getDeliveryAction } from '../delivery.js';
 import { log } from '../log.js';
 import { initSessionFolder } from '../session-manager.js';
@@ -86,8 +86,7 @@ beforeEach(async () => {
   // against the central-DB execution ledger (request-ledger.ts) before
   // dispatching — the central DB must exist for the handler to reach dispatch
   // at all, let alone the response write these tests actually pin.
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   vi.mocked(log.warn).mockClear();
   vi.mocked(log.info).mockClear();
   dispatch.mockReset();

@@ -27,7 +27,7 @@ vi.mock('../mailbox/index.js', async (importOriginal) => {
   };
 });
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, taskThreadId, TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
 import { initSessionFolder } from '../../session-manager.js';
@@ -74,8 +74,7 @@ function addTaskRow(sessionId: string, channelType: string, platformId: string, 
 beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   await createAgentGroup({ id: GROUP, name: GROUP, folder: GROUP, agent_provider: null, created_at: NOW });
   await createMessagingGroup({
     id: 'mg-dm',

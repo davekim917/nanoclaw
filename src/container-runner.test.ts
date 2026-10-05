@@ -183,7 +183,7 @@ import { getProviderContainerConfig } from './providers/provider-container-regis
 import { log } from './log.js';
 import { closeDb, getRawDb, initTestDb } from './db/connection.js';
 import { withCentralSync } from './db/central-lease.js';
-import { runMigrations } from './db/index.js';
+import { initMigratedTestDb } from './db/index.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
@@ -2480,9 +2480,8 @@ describe('renderCapabilitiesSnapshot (seam 3: getHostCapabilities is async)', ()
   it('renders the AWAITED capabilities, never a Promise serialized as {}', async () => {
     // A Promise reaching JSON.stringify is `{}` and no lint rule sees it, so
     // the proof is behavioural: the snapshot carries the capabilities shape.
-    await initTestDb();
+    await initMigratedTestDb();
     try {
-      runMigrations(getRawDb());
       const parsed = JSON.parse(await renderCapabilitiesSnapshot('ag-none', null)) as Record<string, unknown>;
       expect(typeof parsed.version).toBe('string');
       expect(parsed).toHaveProperty('channels');
