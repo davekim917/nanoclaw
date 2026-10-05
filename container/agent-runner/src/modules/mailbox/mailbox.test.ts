@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { getInboundDb, getOutboundDb } from '../../mailbox/sqlite/connection.js';
+import { applyOutboundPragmas, getInboundDb, getOutboundDb } from '../../mailbox/sqlite/connection.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
 import { getMessageIn, getPendingMessages } from '../../db/messages-in.js';
 import { INBOUND_KINDS } from './inbound-kinds.js';
@@ -23,7 +23,6 @@ import {
   getStickyModel,
   getWorkContinuation,
   markWorkContinuationRunning,
-  prepareOutboundFile,
   proposeDone,
   queueWorkContinuation,
   setProviderHealthState,
@@ -97,27 +96,18 @@ describe('runner mailbox seam', () => {
   });
 
   test('outbound singleton runs busy_timeout, journal_mode=DELETE, foreign_keys=ON in that order; inbound opens set mmap_size=0', async () => {
-    // Order, on the one opener the fork owns. Upstream's getOutboundDb runs
-    // journal_mode BEFORE busy_timeout and switching journal mode takes an
-    // exclusive lock, so prepareOutboundFile pins the (persistent) journal mode
-    // behind a busy handler first and upstream's PRAGMA becomes a no-op read.
     const calls: string[] = [];
-    prepareOutboundFile(
-      () =>
-        ({
-          exec: (sql: string) => calls.push(sql.trim()),
-          close: () => {},
-        }) as unknown as Database,
-    );
-    expect(calls).toEqual(['PRAGMA busy_timeout = 5000', 'PRAGMA journal_mode = DELETE']);
+    applyOutboundPragmas({ exec: (sql: string) => calls.push(sql.trim()) } as unknown as Database);
+    expect(calls).toEqual(['PRAGMA busy_timeout = 5000', 'PRAGMA journal_mode = DELETE', 'PRAGMA foreign_keys = ON']);
 
     // Readback on a real file: journal_mode is DELETE, which is the cross-mount
     // invariant (I-5) — WAL's mmap'd -shm does not propagate over VirtioFS.
     const dbPath = tempDbPath();
-    prepareOutboundFile(() => new Database(dbPath));
+    const configured = new Database(dbPath);
+    applyOutboundPragmas(configured);
+    configured.close();
     const onDisk = new Database(dbPath);
     expect(onDisk.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
-    expect(onDisk.prepare('PRAGMA busy_timeout').get()).toEqual({ timeout: 0 });
     onDisk.close();
 
     await getAgentMailbox().start(null);

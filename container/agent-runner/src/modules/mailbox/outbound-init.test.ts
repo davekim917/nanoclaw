@@ -8,7 +8,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { ensureNanoclawOutboundSchema, prepareOutboundFile } from './schema.js';
+import { applyOutboundPragmas } from '../../mailbox/sqlite/connection.js';
+import { allowSubprocess, resetHermeticityAllowances } from '../../test-hermeticity.js';
+import { ensureNanoclawOutboundSchema } from './schema.js';
 
 const tempDirs: string[] = [];
 
@@ -19,16 +21,18 @@ function tempDbPath(): string {
 }
 
 afterEach(() => {
+  resetHermeticityAllowances();
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe('outbound DB initialization', () => {
-  it('installs busy_timeout before journal mode so a concurrent writer is waited out', async () => {
+  it('waits out a sibling process holding the outbound lock instead of failing at journal_mode', async () => {
     const dbPath = tempDbPath();
     const seed = new Database(dbPath);
     seed.exec('CREATE TABLE lock_probe (id INTEGER)');
     seed.close();
 
+    allowSubprocess(['bun']);
     const holder = Bun.spawn(
       [
         process.execPath,
@@ -49,47 +53,30 @@ describe('outbound DB initialization', () => {
     reader.releaseLock();
     expect(new TextDecoder().decode(firstChunk.value)).toContain('locked');
 
+    const fresh = new Database(dbPath);
     const started = Date.now();
-    prepareOutboundFile(() => new Database(dbPath));
+    applyOutboundPragmas(fresh);
     const elapsedMs = Date.now() - started;
 
     expect(elapsedMs).toBeGreaterThanOrEqual(100);
-    const db = new Database(dbPath);
-    expect(db.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
-    db.close();
+    expect(fresh.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
+    expect(fresh.prepare('PRAGMA busy_timeout').get()).toEqual({ timeout: 5000 });
+    expect(fresh.prepare('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
+    fresh.close();
     expect(await holder.exited).toBe(0);
   });
 
-  it('closes a partially initialized connection so the next open starts clean', () => {
-    const calls: string[] = [];
-    let closed = false;
-    const candidate = {
-      exec(sql: string) {
-        calls.push(sql.trim());
-        if (sql.includes('journal_mode')) throw new Error('database is locked');
-      },
-      close() {
-        closed = true;
-      },
-    } as unknown as Database;
-
-    expect(() => prepareOutboundFile(() => candidate)).toThrow('database is locked');
-    expect(calls[0]).toBe('PRAGMA busy_timeout = 5000');
-    expect(closed).toBe(true);
-  });
-
-  it('keeps the connection configuration order explicit', () => {
+  it('installs the busy handler before any pragma that takes a lock', () => {
     const calls: string[] = [];
     const candidate = {
       exec(sql: string) {
         calls.push(sql.trim());
       },
-      close() {},
     } as unknown as Database;
 
-    prepareOutboundFile(() => candidate);
+    applyOutboundPragmas(candidate);
 
-    expect(calls).toEqual(['PRAGMA busy_timeout = 5000', 'PRAGMA journal_mode = DELETE']);
+    expect(calls).toEqual(['PRAGMA busy_timeout = 5000', 'PRAGMA journal_mode = DELETE', 'PRAGMA foreign_keys = ON']);
   });
 
   it('test_container_state_forward_compat_adds_resource_telemetry_columns', () => {

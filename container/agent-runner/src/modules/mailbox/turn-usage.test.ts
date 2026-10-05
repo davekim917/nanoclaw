@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
-import { ensureNanoclawOutboundSchema, prepareOutboundFile } from './index.js';
+import { applyOutboundPragmas } from '../../mailbox/sqlite/connection.js';
+import { ensureNanoclawOutboundSchema } from './index.js';
 import { initTestSessionDb } from './testing.js';
 import { getTurnUsageRows, recordTurnUsage, _resetCumulativeTrackingForTesting } from './turn-usage.js';
 
@@ -435,8 +436,8 @@ describe('turn_usage — phantom "listed but unused" model rows', () => {
 describe('turn_usage — table creation (real files, not the in-memory test mode)', () => {
   it('exists after connection init on a brand-new outbound.db', () => {
     const dbPath = tempDbPath();
-    prepareOutboundFile(() => new Database(dbPath));
     const db = new Database(dbPath);
+    applyOutboundPragmas(db);
     ensureNanoclawOutboundSchema(db);
     expect(tableExists(db, 'turn_usage')).toBe(true);
     db.close();

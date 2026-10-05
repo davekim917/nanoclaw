@@ -5,7 +5,7 @@
  * inbound.db MUST be journal_mode=DELETE: VirtioFS does not propagate WAL's mmapped `-shm` from host to guest,
  * so a WAL inbound.db leaves this reader frozen on an old snapshot.
  */
-import { Database } from 'bun:sqlite';
+import type { Database } from 'bun:sqlite';
 
 export const OUTBOUND_DB_PATH = '/workspace/outbound.db';
 
@@ -63,21 +63,6 @@ const RATE_LIMIT_SAMPLES_DDL = `
     status            TEXT
   );
 `;
-
-/**
- * Pin journal_mode=DELETE behind a busy handler before upstream's opener runs: its journal_mode PRAGMA precedes
- * busy_timeout and needs an exclusive lock, so a sibling MCP writer would fail it immediately. journal_mode is
- * persistent, so upstream's PRAGMA then becomes a lock-free no-op.
- */
-export function prepareOutboundFile(create: () => Database = () => new Database(OUTBOUND_DB_PATH)): void {
-  const db = create();
-  try {
-    db.exec('PRAGMA busy_timeout = 5000');
-    db.exec('PRAGMA journal_mode = DELETE');
-  } finally {
-    db.close();
-  }
-}
 
 /**
  * Every fork-only outbound table/column, applied idempotently on top of
