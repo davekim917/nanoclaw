@@ -37,7 +37,7 @@ const SCAN_ROOTS = ['src', 'scripts', 'setup'] as const;
  * Not callers, and excluded from the scan:
  *  - `connection.ts` defines both functions.
  *  - this file names them in its own matcher, so it would otherwise match itself.
- *  - `raw-outside-lease-tripwire.test.ts` (PR 6) pins the CALL sites the same way.
+ *  - `raw-outside-lease-tripwire.test.ts` pins the CALL sites the same way.
  */
 const DEFINER = 'src/db/connection.ts';
 const SELF = 'src/db/raw-db-ratchet.test.ts';
