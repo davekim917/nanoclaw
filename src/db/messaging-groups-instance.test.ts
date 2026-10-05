@@ -25,6 +25,7 @@ import {
   getMessagingGroupWithAgentCount,
 } from './messaging-groups.js';
 import type { MessagingGroup } from '../types.js';
+import { initMigratedTestDb } from './index.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -48,9 +49,7 @@ afterEach(async () => {
 
 describe('migration 016 — fresh DB', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
   });
 
   it('adds a NOT NULL instance column', () => {
@@ -171,9 +170,8 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
   });
 
   it('still rejects a migration that ITSELF introduces FK violations', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
 
     const rogue: Migration = {
       version: 999,
@@ -196,9 +194,8 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
   });
 
   it('is idempotent — re-running the full barrel is a no-op', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     await createMessagingGroup(mg({ id: 'mg-keep', instance: 'slack-tester' }));
     expect(() => runMigrations(db)).not.toThrow();
     const row = db.prepare("SELECT instance FROM messaging_groups WHERE id = 'mg-keep'").get() as {
@@ -210,9 +207,7 @@ describe('migration 016 — wired legacy DB upgrade (the FK recreate arm)', () =
 
 describe('lookup asymmetry — inbound exact-only vs outbound default-first', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     // The named instance ('alpha-tester') sorts lexically BEFORE the
     // channel type ('slack') and is inserted first — so both rowid order
     // and the triple-autoindex order put it ahead of the default row.

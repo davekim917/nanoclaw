@@ -16,7 +16,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { log } from '../../log.js';
 
 // Hermeticity tripwire (brief-common.md HARD RULE): every case below runs a
@@ -187,10 +187,7 @@ function fakeParentSession() {
 
 describe('auto-archive covers completed tasks older than 24h and never failed tasks', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    db.pragma('foreign_keys = ON');
-    runMigrations(db);
+    await initMigratedTestDb();
     // Seed agent_group + session so task FKs hold
     getRawDb()
       .prepare(

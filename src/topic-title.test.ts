@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations, getRawDb } from './db/index.js';
+import { closeDb, initMigratedTestDb } from './db/index.js';
 import { getThreadTitleRow, insertThreadTitleClaim, recordThreadTitleAttemptFailure } from './db/thread-titles.js';
 
 vi.mock('./llm.js', async (importOriginal) => ({
@@ -15,9 +15,7 @@ const OPENER_ID = '33333333333333333';
 const THREAD_ID = `discord:11111111111111111:22222222222222222:${OPENER_ID}`;
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 /**

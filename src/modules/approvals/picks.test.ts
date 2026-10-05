@@ -11,7 +11,7 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
-import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
 import { createUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import { pickApprovalDelivery, pickApprover } from './primitive.js';
@@ -21,9 +21,7 @@ function now(): string {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

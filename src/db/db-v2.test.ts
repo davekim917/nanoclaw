@@ -41,7 +41,6 @@ vi.mock('../modules/agent-to-agent/db/agent-destinations.js', async (importOrigi
 
 import { getRawDb } from './connection.js';
 import {
-  initTestDb,
   closeDb,
   runMigrations,
   createAgentGroup,
@@ -74,6 +73,7 @@ import {
   deletePendingQuestion,
   ensureContainerConfig,
   getContainerConfig,
+  initMigratedTestDb,
 } from './index.js';
 
 function now() {
@@ -81,9 +81,7 @@ function now() {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {
@@ -94,17 +92,15 @@ afterEach(async () => {
 
 describe('migrations', () => {
   it('should be idempotent', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     // Running again should not throw
     runMigrations(db);
   });
 
   it('adds messaging_group_agents.threads as a nullable, default-free override column (019)', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     const col = db
       .prepare(
         `SELECT type, "notnull", dflt_value FROM pragma_table_info('messaging_group_agents') WHERE name = 'threads'`,

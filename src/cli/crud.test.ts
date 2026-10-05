@@ -40,7 +40,7 @@ vi.mock('../modules/agent-to-agent/write-destinations.js', async (importOriginal
   writeDestinations: (...args: unknown[]) => writeDestinationsSpy(...args),
 }));
 
-import { initTestDb, closeDb, getRawDb, runMigrations, createAgentGroup, createMessagingGroup } from '../db/index.js';
+import { closeDb, getRawDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from '../db/index.js';
 import { createSession } from '../db/sessions.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { getDestinations } from '../modules/agent-to-agent/db/agent-destinations.js';
@@ -81,9 +81,7 @@ registerResource({
 });
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   ensureContainerConfigSpy.mockClear();
   writeDestinationsSpy.mockClear();
 });

@@ -16,8 +16,8 @@ import {
   type AttentionItem,
 } from './attention-sources.js';
 import { deriveThreadState, threadChannelKey, UNKNOWN_CHANNEL_KEY } from './dashboard/api/threads.js';
-import { closeDb, getRawDb, initTestDb } from './db/connection.js';
-import { runMigrations } from './db/migrations/index.js';
+import { closeDb, getRawDb } from './db/connection.js';
+import { initMigratedTestDb } from './db/index.js';
 
 /**
  * Fixture identifiers ONLY. `scripts/check-public-boundary.ts` scans this tree
@@ -99,9 +99,8 @@ function declare(value: string | null): void {
 
 beforeEach(async () => {
   clearAttentionMemo();
-  await initTestDb();
+  await initMigratedTestDb();
   const db = getRawDb();
-  runMigrations(db);
   db.prepare(
     `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, created_at)
      VALUES (?, ?, '[]', '2026-08-01T00:00:00.000Z')`,

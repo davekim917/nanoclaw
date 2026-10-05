@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, initTestDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { sessionsHandler, sessionsDetailHandler, resolveTranscriptAuthor } from './sessions.js';
 import type { AuthedRequestContext } from '../router.js';
 
@@ -57,10 +57,7 @@ function makeReq(url = 'http://localhost/dashboard/api/sessions'): Request {
 }
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 async function seedAgentGroup(id: string): Promise<void> {

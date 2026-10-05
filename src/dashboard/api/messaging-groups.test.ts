@@ -1,14 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  initTestDb,
-  runMigrations,
-  getRawDb,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { messagingGroupsListHandler } from './messaging-groups.js';
 import { clearCookieVerifier, requireAuth } from '../router.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -50,10 +43,7 @@ function grantRole(userId: string, role: string, agentGroupId: string | null): v
 }
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 describe('messagingGroupsListHandler', () => {

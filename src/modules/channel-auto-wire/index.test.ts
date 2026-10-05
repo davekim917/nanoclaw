@@ -7,14 +7,7 @@
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  initTestDb,
-  runMigrations,
-  getRawDb,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup, MessagingGroup } from '../../types.js';
@@ -64,9 +57,7 @@ const ENV_DISCORD_KEY = 'NANOCLAW_DEFAULT_AGENT_GROUP_DISCORD';
 let saved: Record<string, string | undefined> = {};
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   saved = {
     [ENV_FOLDER_KEY]: process.env[ENV_FOLDER_KEY],
     [ENV_MODE_KEY]: process.env[ENV_MODE_KEY],

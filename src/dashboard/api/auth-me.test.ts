@@ -16,7 +16,7 @@ vi.mock('../router.js', async (importOriginal) => {
 });
 
 import http from 'http';
-import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { authMeHandler } from './auth-me.js';
 import { requireAuth, registerCookieVerifier, clearCookieVerifier } from '../router.js';
 import * as accessMod from '../../modules/permissions/access.js';
@@ -66,9 +66,7 @@ function makeReq(cookieHeader?: string): Request {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   vi.mocked(accessMod.canAccessAgentGroup).mockResolvedValue({ allowed: true, reason: 'owner' });
 });
 

@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb, initMigratedTestDb } from './index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from './index.js';
 import {
   getUsageWatermark,
   rollupSessionUsage,
@@ -97,9 +97,7 @@ function insertTurn(
 
 describe('rollupSessionUsage', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: 'usage',
@@ -230,9 +228,7 @@ function makeOutboundDbWithEffort(): Database.Database {
 
 describe('rollupSessionUsage — central turn_usage mirror', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: 'usage',
@@ -373,9 +369,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
 
 describe('listUsageDaily filters', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: 'usage',
@@ -412,9 +406,7 @@ describe('listUsageDaily filters', () => {
 
 describe('pruneOldTurnUsage', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
   });
   afterEach(() => closeDb());
 
@@ -445,9 +437,7 @@ describe('pruneOldTurnUsage', () => {
 
 describe('summarizeTurnUsage', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
   });
   afterEach(() => closeDb());
 

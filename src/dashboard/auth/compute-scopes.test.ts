@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { computeScopes } from './compute-scopes.js';
-import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { createUser } from '../../modules/permissions/db/users.js';
 import { grantRole } from '../../modules/permissions/db/user-roles.js';
 import { addMember } from '../../modules/permissions/db/agent-group-members.js';
@@ -23,9 +23,7 @@ async function seedUser(id: string): Promise<void> {
 }
 
 beforeEach(async () => {
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   await seedAgentGroup('ag-1');
   await seedAgentGroup('ag-2');
 });

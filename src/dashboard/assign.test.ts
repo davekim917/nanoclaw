@@ -4,14 +4,14 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
-import { runMigrations } from '../db/migrations/index.js';
+import { closeDb, getRawDb } from '../db/connection.js';
 import { clearAttentionMemo } from '../attention-sources.js';
 import { assignAttentionItem, ASSIGN_DEDUPE_MS } from './assign.js';
 import { readItemAssignment } from './db/item-assignments.js';
 import type { AuthedRequestContext } from './router.js';
 
 import { dispatch as _dispatchRaw } from '../cli/dispatch.js';
+import { initMigratedTestDb } from '../db/index.js';
 
 const mockDispatch = vi.mocked(_dispatchRaw);
 
@@ -88,9 +88,8 @@ function ctxFor(userId: string, scopes: Partial<AuthedRequestContext['scopes']> 
 beforeEach(async () => {
   vi.clearAllMocks();
   clearAttentionMemo();
-  await initTestDb();
+  await initMigratedTestDb();
   const db = getRawDb();
-  runMigrations(db);
   db.exec(`
     INSERT INTO workgroups (id, created_at) VALUES ('${WG}', '2026-08-01T00:00:00.000Z');
     UPDATE workgroups SET attention_sources =

@@ -19,8 +19,7 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
-  initTestDb,
-  runMigrations,
+  initMigratedTestDb,
 } from '../../db/index.js';
 import { getRawDb } from '../../db/connection.js';
 import { getTaskById, insertTaskAtomic } from './db/tasks.js';
@@ -163,10 +162,7 @@ function ts(): string {
 }
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 async function seedGroups({ withMg = false }: { withMg?: boolean } = {}): Promise<{

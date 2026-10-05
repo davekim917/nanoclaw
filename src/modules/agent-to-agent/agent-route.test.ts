@@ -6,7 +6,7 @@ import { describe, expect, it, beforeEach, afterEach, vi, type MockInstance } fr
 import { forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
 import { log } from '../../log.js';
 import { createDestination } from './db/agent-destinations.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
 import { createSession, updateSession } from '../../db/sessions.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
@@ -170,9 +170,7 @@ describe('routeAgentMessage return-path', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
 
     await createAgentGroup({ id: A, name: 'A', folder: 'a', agent_provider: null, created_at: now() });
     await createAgentGroup({ id: B, name: 'B', folder: 'b', agent_provider: null, created_at: now() });

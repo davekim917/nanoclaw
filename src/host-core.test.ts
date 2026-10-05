@@ -9,13 +9,12 @@ import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import {
-  initTestDb,
   closeDb,
   getRawDb,
-  runMigrations,
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  initMigratedTestDb,
 } from './db/index.js';
 import {
   resolveSession,
@@ -149,9 +148,7 @@ beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
 
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

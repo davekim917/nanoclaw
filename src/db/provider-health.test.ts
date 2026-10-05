@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb, getRawDb } from './index.js';
+import { closeDb, createAgentGroup, getDb, initMigratedTestDb } from './index.js';
 import {
   getProviderHealth,
   isProviderUnavailable,
@@ -14,9 +14,7 @@ const NOW = Date.parse('2026-08-05T12:00:00.000Z');
 
 describe('provider health cooldown', () => {
   beforeEach(async () => {
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: GID,
       name: 'health',

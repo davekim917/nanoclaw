@@ -183,8 +183,7 @@ import {
 import { MANAGED_GIT_HOOKS_SCAN_DIR } from '../../managed-git-hooks.js';
 import { repositoryConfigPath, safeGitConfigGet } from '../../safe-git.js';
 import { sessionDir } from '../../session-manager.js';
-import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { closeDb, getRawDb } from '../../db/connection.js';
 import type { Session } from '../../types.js';
 import {
   _setPublishClaimWaitForTesting,
@@ -207,6 +206,7 @@ import {
   _resetRepositoryActionsForTesting,
   runRepositoryActionDetached,
 } from './job-runner.js';
+import { initMigratedTestDb } from '../../db/index.js';
 
 /** In-memory inbound for action responses, and the delivery acks the job runner writes. */
 const mailboxInbound = new Map<string, { id: string; content: string }>();
@@ -276,9 +276,8 @@ async function seedPublishFixture(input: {
   messagingGroups: Array<{ id: string; platformId: string }>;
   sessions: Session[];
 }): Promise<void> {
-  await initTestDb();
+  await initMigratedTestDb();
   const db = getRawDb();
-  runMigrations(db);
   const now = new Date().toISOString();
   for (const workgroupId of new Set(input.agentGroups.map((group) => group.workgroupId))) {
     db.prepare('INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, ?, ?)').run(workgroupId, '[]', now);
@@ -1800,9 +1799,8 @@ describe('exact topic transfer', () => {
   });
 
   it('replays a moved transfer with the same barrier epoch and releases queued destination ingress exactly once', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     const now = new Date().toISOString();
     db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
     db.prepare(
@@ -1947,9 +1945,8 @@ describe('exact topic transfer', () => {
   });
 
   it('answers a duplicate request for a completed transfer without draining or stopping any container', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     const now = new Date().toISOString();
     db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
     db.prepare(
@@ -2070,9 +2067,8 @@ describe('exact topic transfer', () => {
   });
 
   it('delivers pre-quiescence failures and ignores stale mailbox residue once the source task closes', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     const now = new Date().toISOString();
     db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
     db.prepare(
@@ -2215,9 +2211,8 @@ describe('exact topic transfer', () => {
   });
 
   it('writes and wakes a durable failure when source resolution rejects before any Git mutation', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     const now = new Date().toISOString();
     db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
     db.prepare(

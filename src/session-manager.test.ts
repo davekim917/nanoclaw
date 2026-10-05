@@ -64,7 +64,7 @@ import {
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb, initMigratedTestDb } from './db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
@@ -266,9 +266,7 @@ describe('writeOutboundDirect', () => {
 describe('writeSessionMessage re-provisions a deleted session folder', () => {
   beforeEach(async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: AG,
       name: 'Reset',
@@ -1452,9 +1450,7 @@ describe('session migration pass preserves the idle clock', () => {
   beforeEach(async () => {
     fs.rmSync(path.join(DATA_DIR, 'v2-sessions', MIGRATION_AG), { recursive: true, force: true });
     fs.rmSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'), { force: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: MIGRATION_AG,
       name: 'Mtime',
@@ -2101,9 +2097,7 @@ describe('writeSessionMessage evaluates its caller guard at the insert', () => {
 
   beforeEach(async () => {
     fs.rmSync(sessionDir(AG, GUARD_SESS), { recursive: true, force: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: AG,
       name: 'Guard',
@@ -2310,9 +2304,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
   beforeEach(async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
     fs.rmSync(journalPath(), { force: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: AG,
       name: 'Race',
@@ -2525,9 +2517,7 @@ describe('mailbox seam: ingress writes', () => {
 
   beforeEach(async () => {
     fs.rmSync(sessionDir(AG_ING, SESS_ING), { recursive: true, force: true });
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
     await createAgentGroup({
       id: AG_ING,
       name: 'Ingress',

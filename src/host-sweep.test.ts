@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
-import { closeDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, initMigratedTestDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -222,9 +222,8 @@ describe('sweepUsageRollup over a hot journal', () => {
   // creates a GENUINE hot journal by killing a child process mid-transaction
   // (same technique as `db/session-db.test.ts`'s hot-journal-recovery cases).
   it('reads turn_usage and advances the watermark over a REAL hot journal with no inbound.db', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-usage-hot', 'usage hot', 'usage-hot', ?)`,
@@ -331,9 +330,8 @@ describe('sweepUsageRollup over a hot journal', () => {
 // ─── H-10 (mailbox seam §8): reads never provision ───────────────────────────
 describe('sweepSession on a session with no mailbox', () => {
   it('sweep treats a missing mailbox as no-op via withExistingMailboxSession', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-nomailbox', 'no mailbox', 'no-mailbox', ?)`,
@@ -385,9 +383,8 @@ describe('sweepSession on a session with no mailbox', () => {
   }
 
   it('a replacement container that wakes during the post-kill open keeps its claim (ceiling)', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
@@ -420,9 +417,8 @@ describe('sweepSession on a session with no mailbox', () => {
   });
 
   it('a replacement container that wakes during the post-kill open gets no stale ceiling wake', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
@@ -484,9 +480,8 @@ describe('sweepSession on a session with no mailbox', () => {
   });
 
   it('a replacement container that wakes during the post-kill open keeps its claim (claim-stuck)', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
@@ -569,9 +564,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // returns and flips false only when `onExit` runs, which is production's
   // ordering and the one the old mocks did not have.
   it('the post-kill chain runs after the container actually exits, not when the kill is requested', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
@@ -606,9 +600,8 @@ describe('sweepSession on a session with no mailbox', () => {
   });
 
   it('a replacement container that takes the session before the exit still refuses the chain', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
@@ -645,9 +638,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // guards its own write. The first half of this case is the control that
   // proves the second half is not vacuous.
   it('a wake that takes ownership between post-kill follow-ups stops the later follow-ups from writing', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-sla', 'sla', 'sla', ?)`).run(
       new Date().toISOString(),
     );
@@ -730,9 +722,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // new runner never got is consumed — saved work duplicated, parked early, or
   // lost. This is continue_work's recovery path.
   it('a container that starts during the open leaves the continuation and its attempt count untouched', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-toctou', 'toctou', 'toctou', ?)`,
@@ -783,9 +774,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // outbound.db is retried and logged every 60s instead of backing off, which
   // is the repeated-error load the backoff exists to contain.
   it('an unreadable outbound.db takes the mailbox backoff, not the per-tick duty retry', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-badout', 'bad outbound', 'bad-outbound', ?)`,
@@ -821,9 +811,8 @@ describe('sweepSession on a session with no mailbox', () => {
    * ceiling, no claim tolerance, for as long as it runs.
    */
   it('hands the wake the current session row, not the tick snapshot', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-stale', 'stale snapshot', 'stale-snapshot', ?)`,
@@ -869,9 +858,8 @@ describe('sweepSession on a session with no mailbox', () => {
   // for the full 30 minutes, and `last_active` does not move on failure, so
   // nothing would clear it early.
   it('a duty that throws propagates for the next-tick retry instead of being quiet-cached', async () => {
-    await initTestDb();
+    await initMigratedTestDb();
     const db = getRawDb();
-    runMigrations(db);
     db.prepare(
       `INSERT INTO agent_groups (id, name, folder, created_at)
        VALUES ('ag-dutythrow', 'duty throw', 'duty-throw', ?)`,

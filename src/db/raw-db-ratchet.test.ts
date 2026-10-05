@@ -27,6 +27,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -141,12 +142,10 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/attention-sources.test.ts',
   'src/capabilities.test.ts',
   'src/channels/channel-registry.test.ts',
-  'src/channels/chat-sdk-bridge-byline.test.ts',
   'src/channels/chat-sdk-bridge-recovery.test.ts',
   'src/cli/crud-validate.test.ts',
   'src/cli/crud.test.ts',
   'src/cli/request-ledger.test.ts',
-  'src/cli/resources/destinations.test.ts',
   'src/cli/resources/groups-create-adopt.test.ts',
   'src/cli/resources/groups.test.ts',
   'src/cli/resources/messaging-groups.test.ts',
@@ -184,12 +183,10 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/agent-groups.test.ts',
   'src/db/boot-order.test.ts',
   'src/db/central-lease.ts',
-  'src/db/container-configs.test.ts',
   'src/db/db-v2.test.ts',
   'src/db/index.ts',
   'src/db/messaging-groups-instance.test.ts',
   'src/db/migrations/068-sessions-sweep-quiet-until.test.ts',
-  'src/db/provider-health.test.ts',
   'src/db/scheduled-tasks.test.ts',
   'src/db/sessions.test.ts',
   'src/db/usage.test.ts',
@@ -204,12 +201,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/agent-to-agent/create-agent.test.ts',
   'src/modules/agent-to-agent/message-gate.test.ts',
   'src/modules/agent-to-agent/write-destinations.test.ts',
-  'src/modules/approvals/approval-resolved.test.ts',
   'src/modules/approvals/onecli-approvals.test.ts',
-  'src/modules/approvals/picks.test.ts',
-  'src/modules/approvals/primitive.test.ts',
-  'src/modules/approvals/reason-capture.test.ts',
-  'src/modules/approvals/response-handler.test.ts',
   'src/modules/bash-gate/index.test.ts',
   'src/modules/channel-auto-wire/index.test.ts',
   'src/modules/claims/self-heal.test.ts',
@@ -226,15 +218,10 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/permissions/channel-approval-folder-race.test.ts',
   'src/modules/permissions/channel-approval.test.ts',
   'src/modules/permissions/db/user-roles.test.ts',
-  'src/modules/permissions/grant.test.ts',
-  'src/modules/permissions/permissions.test.ts',
   'src/modules/permissions/sender-approval.test.ts',
   'src/modules/permissions/sender-decline-notify.test.ts',
   'src/modules/permissions/user-dm-adopt.test.ts',
-  'src/modules/provider-fallback/handler.test.ts',
   'src/modules/repository-workspaces/index.test.ts',
-  'src/modules/scheduling/create.test.ts',
-  'src/modules/self-mod/request.test.ts',
   'src/modules/support-threads/dispatch.test.ts',
   'src/modules/sweep-central/central.test.ts',
   'src/modules/sweep-central/session-title-sweep.test.ts',
@@ -246,20 +233,72 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/sweep-scheduled-move/scheduled-move.test.ts',
   'src/modules/sweep-scheduling/scheduling.test.ts',
   'src/modules/sweep-usage/usage.test.ts',
-  'src/provider-fallback.test.ts',
   'src/provider-surfaces.test.ts',
   'src/router.session-skip.test.ts',
-  'src/session-manager.attachments.test.ts',
   'src/session-manager.test.ts',
   'src/state-sqlite.test.ts',
   'src/storage-gc.test.ts',
   'src/storage-manager.test.ts',
   'src/storage-manager.ts',
   'src/test-fixtures/raw-db-fake.ts',
-  'src/topic-title.test.ts',
   'src/workgroup-memory.integration.test.ts',
   'src/worktree-cleanup.test.ts',
 ];
+
+/**
+ * Test files whose subject is the migration runner on the central handle, so they run it by hand.
+ */
+const RAW_MIGRATION_SUBJECTS: readonly string[] = [
+  // Re-runs the full migration list to prove it is idempotent.
+  'src/db/db-v2.test.ts',
+  // Builds a legacy schema on the central handle, then migrates it in place.
+  'src/db/messaging-groups-instance.test.ts',
+  // Opens a file-backed central DB with initDb(path); initMigratedTestDb() is in-memory only.
+  'src/modules/approvals/onecli-approvals.test.ts',
+];
+
+function calleeName(expr: ts.Expression): string | undefined {
+  if (ts.isIdentifier(expr)) return expr.text;
+  if (ts.isPropertyAccessExpression(expr)) return expr.name.text;
+  return undefined;
+}
+
+/** A `getRawDb()` call, or an identifier whose nearest enclosing declaration is initialised from one. */
+function isRawHandle(expr: ts.Expression, at: ts.Node): boolean {
+  if (ts.isCallExpression(expr)) return calleeName(expr.expression) === 'getRawDb';
+  if (!ts.isIdentifier(expr)) return false;
+  for (let scope: ts.Node | undefined = at.parent; scope; scope = scope.parent) {
+    if (!ts.isBlock(scope) && !ts.isSourceFile(scope)) continue;
+    for (const statement of scope.statements) {
+      if (!ts.isVariableStatement(statement)) continue;
+      for (const decl of statement.declarationList.declarations) {
+        if (ts.isIdentifier(decl.name) && decl.name.text === expr.text) {
+          return decl.initializer !== undefined && isRawHandle(decl.initializer, decl);
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function rawMigrationLines(fileName: string, text: string): number[] {
+  if (!text.includes('runMigrations')) return [];
+  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true);
+  const lines: number[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node) &&
+      calleeName(node.expression) === 'runMigrations' &&
+      node.arguments.length > 0 &&
+      isRawHandle(node.arguments[0], node)
+    ) {
+      lines.push(source.getLineAndCharacterOfPosition(node.getStart()).line + 1);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return lines;
+}
 
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:"'`])\/\/[^\n]*/g, (_m, lead: string) => lead);
@@ -311,18 +350,34 @@ describe('the raw central-DB handle only shrinks', () => {
     ).toEqual([]);
   });
 
+  it('finds a hand-run migration through a call, a namespace and an alias', () => {
+    const fixture = [
+      'runMigrations(getRawDb());',
+      'dbIndex.runMigrations(dbIndex.getRawDb());',
+      'async function setup() { const db = getRawDb(); runMigrations(db); }',
+      'const scratch = new Database(":memory:"); runMigrations(scratch);',
+    ].join('\n');
+    expect(rawMigrationLines('fixture.test.ts', fixture)).toEqual([1, 2, 3]);
+  });
+
   it('tests migrate through initMigratedTestDb, never by hand on the raw handle', () => {
     const offenders = listTsFiles()
-      .filter((rel) => rel.endsWith('.test.ts') && !NOT_CALLERS.includes(rel))
-      .filter((rel) =>
-        /\brunMigrations\(\s*getRawDb\(\s*\)\s*\)/.test(
-          stripComments(fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')),
-        ),
+      .filter((rel) => rel.endsWith('.test.ts') && !NOT_CALLERS.includes(rel) && !RAW_MIGRATION_SUBJECTS.includes(rel))
+      .flatMap((rel) =>
+        rawMigrationLines(rel, fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')).map((line) => `${rel}:${line}`),
       );
     expect(
       offenders,
-      'replace `await initTestDb(); runMigrations(getRawDb());` with `await initMigratedTestDb();`',
+      'replace `await initTestDb(); runMigrations(getRawDb());` (or a `db = getRawDb()` alias of it) ' +
+        'with `await initMigratedTestDb();`',
     ).toEqual([]);
+  });
+
+  it('exempts only files that still run the migrations by hand', () => {
+    const stale = RAW_MIGRATION_SUBJECTS.filter(
+      (rel) => rawMigrationLines(rel, fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')).length === 0,
+    );
+    expect(stale, 'delete these from RAW_MIGRATION_SUBJECTS').toEqual([]);
   });
 
   it('records removals so the pin cannot rot into a stale list', () => {

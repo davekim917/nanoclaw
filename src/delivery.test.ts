@@ -30,7 +30,7 @@ vi.mock('./config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-delivery') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from './db/index.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { completeAnsweredPendingRows } from './modules/mailbox/ops/sweep.js';
 import { resolveSession, resolveTaskSession, withMailboxSession, writeSessionMessage } from './session-manager.js';
@@ -128,9 +128,7 @@ function insertFirstProgress(
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {

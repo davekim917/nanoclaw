@@ -6,7 +6,7 @@ import {
   getCapabilityConfig,
   type CapabilityConfig,
 } from './agent-group-capabilities.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../../db/index.js';
+import { closeDb, createAgentGroup, initMigratedTestDb } from '../../../db/index.js';
 import { getRawDb } from '../../../db/connection.js';
 
 function createUser(id: string): void {
@@ -24,10 +24,7 @@ afterEach(async () => {
 });
 
 async function setupDb(): Promise<void> {
-  await initTestDb();
-  const db = getRawDb();
-  db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  await initMigratedTestDb();
 }
 
 const defaultConfig: CapabilityConfig = {

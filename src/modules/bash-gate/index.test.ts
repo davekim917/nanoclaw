@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import { getRawDb } from '../../db/connection.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
@@ -116,9 +116,7 @@ async function runDestructiveGate(label: string, requestId: string, command?: st
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   await seedSession();
   mocks.deliver.mockReset();
   mocks.wakeContainer.mockReset();

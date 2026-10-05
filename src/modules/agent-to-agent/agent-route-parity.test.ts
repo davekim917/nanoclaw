@@ -116,14 +116,12 @@ describe('a2a parity with a normally-engaged session', () => {
     getChannelAdapter.mockReset();
     getChannelAdapter.mockReturnValue(undefined);
 
-    const { initTestDb, runMigrations, createAgentGroup } = await import('../../db/index.js');
+    const { initMigratedTestDb, createAgentGroup } = await import('../../db/index.js');
     const { createMessagingGroup } = await import('../../db/messaging-groups.js');
     const { getRawDb } = await import('../../db/connection.js');
     const { resolveSession } = await import('../../session-manager.js');
 
-    await initTestDb();
-    const db = getRawDb();
-    runMigrations(db);
+    await initMigratedTestDb();
 
     await createAgentGroup({
       id: A,

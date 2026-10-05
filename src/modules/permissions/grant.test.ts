@@ -71,14 +71,7 @@ vi.mock('../approvals/index.js', async (importOriginal) => ({
   },
 }));
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  initTestDb,
-  runMigrations,
-  getRawDb,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initMigratedTestDb } from '../../db/index.js';
 import { withCentralSync } from '../../db/central-lease.js';
 import { initSessionFolder } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
@@ -162,9 +155,7 @@ function insertRawInbound(id: string, content: string): void {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  const db = getRawDb();
-  runMigrations(db);
+  await initMigratedTestDb();
   notifyCalls.length = 0;
   beforeApply.label = null;
   beforeApply.run = null;
