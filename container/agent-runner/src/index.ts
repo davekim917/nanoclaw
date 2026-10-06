@@ -45,6 +45,8 @@ import { runPollLoop } from './poll-loop.js';
 import { readToneProfile } from './tone-profiles.js';
 import { readChannelInstructions, isSafeInstructionsProfileName } from './channel-instructions.js';
 import { setupCodexPrimaryRuntime, setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
+import { isAgentRuntime, type AgentRuntime } from './plugin-skill-discovery.js';
+import { providerContract } from './providers/contract.js';
 import { activateGcpServiceAccount } from './gcp-auth-setup.js';
 import { ensureClaudeUserConfig } from './claude-user-config.js';
 import { startResourceTelemetry } from './resource-telemetry.js';
@@ -222,19 +224,16 @@ async function main(): Promise<void> {
   const instructions = baseInstructions;
 
   // Unconditional so codex-primary and codex-as-peer see the same plugin skills; the runtime picks the denylist.
-  const skillRuntime: 'codex' | 'opencode' | 'claude' =
-    providerName === 'codex' ? 'codex' : providerName === 'opencode' ? 'opencode' : 'claude';
+  const skillRuntime: AgentRuntime = isAgentRuntime(providerName) ? providerName : 'claude';
   syncAgentSkillsMirror(skillRuntime);
 
-  // Codex-primary uses a persistent session-local ~/.codex; peer-mode Codex (codex-companion) uses the
-  // synthesized ~/.codex-runtime.
-  if (providerName === 'codex') {
+  if (providerContract(providerName).codexHome === 'primary') {
     setupCodexPrimaryRuntime();
   } else {
     // null means no codex auth is mounted, so CODEX_HOME stays unset. Any other failure returns the nonexistent
     // FAILED_CODEX_HOME sentinel, which must still be assigned: an unset CODEX_HOME would run codex unguarded
     // against the staged ~/.codex.
-    const codexHome = setupCodexRuntime(mcpServers, providerName === 'opencode' ? 'opencode' : 'claude');
+    const codexHome = setupCodexRuntime(mcpServers, skillRuntime);
     if (codexHome) {
       process.env.CODEX_HOME = codexHome;
     }

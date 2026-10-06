@@ -17,7 +17,8 @@ import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { setStickyModel, setStickyEffort } from '../modules/mailbox/index.js';
 import { getConfig } from '../config.js';
-import { OPENCODE_MODEL_SLUG_RE, resolveFamilyModel } from '../providers/model-vocabulary.js';
+import { providerContract } from '../providers/contract.js';
+import { resolveFamilyModel } from '../providers/model-vocabulary.js';
 import { registerTools } from './server.js';
 import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
@@ -128,7 +129,7 @@ export const addMcpServer: McpToolDefinition = {
 };
 
 export function unavailableModelInventory(provider: string) {
-  if (provider === 'opencode') return null;
+  if (providerContract(provider).modelListing) return null;
   return ok(
     `This is a ${provider} session. \`list_models\` inventories OpenCode slugs only and is not a ${provider} model catalog. ` +
       'For an authorized request to change this channel default, call `set_channel_model` directly; the host validates the provider-specific model.',
@@ -252,9 +253,10 @@ export const changeModel: McpToolDefinition = {
     }
 
     const provider = getConfig().provider;
-    // Mirrors the host flag-parser's OPENCODE_VALID_MODEL_RE exactly (the container can't import it): a looser check
-    // lets malformed slugs persist, after which splitModelSlug silently drops the model.
-    if (provider === 'opencode' && !OPENCODE_MODEL_SLUG_RE.test(slug)) {
+    const listing = providerContract(provider).modelListing;
+    // The pattern mirrors the host flag-parser's OPENCODE_VALID_MODEL_RE exactly (the container can't import it): a
+    // looser check lets malformed slugs persist, after which splitModelSlug silently drops the model.
+    if (listing && !listing.slugPattern.test(slug)) {
       return err(
         `"${slug}" is not a valid opencode model slug — use the provider-prefixed form ` +
           `(e.g. opencode-go/kimi-k2.7-code, nvidia/moonshotai/kimi-k2.6). Run list_models for exact ids.`,
@@ -296,5 +298,5 @@ export const changeModel: McpToolDefinition = {
 registerTools([installPackages, addMcpServer, changeModel]);
 
 export function registerProviderSpecificSelfModTools(provider: string = getConfig().provider): void {
-  if (provider === 'opencode') registerTools([listModels]);
+  if (providerContract(provider).modelListing) registerTools([listModels]);
 }
