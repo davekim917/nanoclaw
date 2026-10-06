@@ -50,8 +50,9 @@ import type { InstallContainerScope } from './container-runtime.js';
 import { runBootMountQuiescence, runWorkgroupMemoryStartupGate } from './main.js';
 import {
   reconcileWorkgroupMemory,
-  sharedDirsReconcileWouldChange,
-  workgroupMemoryReconcileWouldChange,
+  reconcileWorkgroupSharedDirs,
+  sharedDirsPendingChange,
+  workgroupMemoryPendingChange,
   WORKGROUP_MEMORY_CONTAINER_PATH,
   workgroupMemoryDir,
 } from './modules/workgroup/shared-dirs.js';
@@ -151,8 +152,8 @@ describe('boot mount-change ordering', () => {
 
     const pending = runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
-      memoryWouldChange: () => true,
-      sharedWouldChange: () => true,
+      memoryPendingChange: () => ({ reason: 'canon-missing' }),
+      sharedPendingChange: () => ({ kind: 'move', name: 'dbt', invalidatesMounts: true }),
       sharedFsEnabled: true,
       quiesce: async (changed, options) => {
         calls.push(`quiesce(${changed.join(',')}, of ${options.knownWorkgroupIds.length})`);
@@ -173,6 +174,7 @@ describe('boot mount-change ordering', () => {
           survivable: 0,
           unlabeled: 0,
           survivableSessionIds: [],
+          survivingWorkgroupIds: [],
           mustStopSessionIds: ['s1'],
         };
       },
@@ -219,8 +221,8 @@ describe('boot mount-change ordering', () => {
 
     await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
-      memoryWouldChange: () => false,
-      sharedWouldChange: () => true,
+      memoryPendingChange: () => null,
+      sharedPendingChange: () => ({ kind: 'move', name: 'dbt', invalidatesMounts: true }),
       sharedFsEnabled: true,
       quiesce: async () => {
         calls.push('quiesce');
@@ -232,6 +234,7 @@ describe('boot mount-change ordering', () => {
           survivable: 0,
           unlabeled: 0,
           survivableSessionIds: [],
+          survivingWorkgroupIds: [],
           mustStopSessionIds: [],
         };
       },
@@ -249,7 +252,7 @@ describe('boot mount-change ordering', () => {
 
     const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
     const proof = source.indexOf('quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {');
-    const shared = source.indexOf('reconcileWorkgroupSharedDirs)(db, { workgroupIds: changedWorkgroupIds })');
+    const shared = source.indexOf('reconcileWorkgroupSharedDirs)(db, { workgroupIds: reconcileWorkgroupIds });');
     expect(proof).toBeGreaterThanOrEqual(0);
     expect(shared).toBeGreaterThan(proof);
     db.close();
@@ -272,8 +275,8 @@ describe('boot mount-change ordering', () => {
 
     const { changedWorkgroupIds, scope } = await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
-      memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
-      sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
+      memoryPendingChange: (database, id) => workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database, id) => sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
       sharedFsEnabled: true,
       quiesce: (changed, options) => {
         quiesceArg = changed;
@@ -301,10 +304,122 @@ describe('boot mount-change ordering', () => {
       // Both are identified and outside the changed set — the survivors, named
       // session by session for seam-4 E (adoption) and G (the warn's skip set).
       survivableSessionIds: ['s1', 's2'],
+      survivingWorkgroupIds: ['wgx'],
       mustStopSessionIds: [],
     });
     expect(scope.stopped).toBe(0);
     expect(runtime.stops).toEqual([]);
+    db.close();
+  });
+
+  it('a pending link creation keeps every container and waits for an idle boot', async () => {
+    // The shape a live fleet produces: an agent created a top-level dir in the
+    // shared mount, so the canonical dir exists with no seed or sibling entry.
+    // The reconcile owes it compat symlinks, but no write runs beside a live
+    // container: the door stops nothing, the reconcile is scoped away from the
+    // workgroup, and the creation stays pending for a boot that finds it idle.
+    const { groupsDir, dataDir } = buildSettledTree();
+    fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    const db = makeDb();
+    const runtime = fakeRuntime([
+      { name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' },
+      { name: 'nanoclaw-v2-b-1', workgroupId: 'wgx', sessionId: 's2', groupId: 'g2' },
+    ]);
+    const reconcileCalls: Array<{ workgroupIds?: string[] }> = [];
+
+    const { changedWorkgroupIds, scope } = await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx'],
+      memoryPendingChange: (database, id) => workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database, id) => sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
+      sharedFsEnabled: true,
+      quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
+      activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
+      warnStartup: async () => undefined,
+      reconcileShared: (database, dirs) => {
+        reconcileCalls.push(dirs);
+        return reconcileWorkgroupSharedDirs(database, { ...dirs, groupsDir, dataDir });
+      },
+      memoryGate: () => [],
+      prune: () => undefined,
+    });
+
+    expect(changedWorkgroupIds).toEqual([]);
+    expect(runtime.stops).toEqual([]);
+    expect(scope.survivableSessionIds).toEqual(['s1', 's2']);
+    expect(reconcileCalls).toEqual([{ workgroupIds: [] }]);
+    expect(fs.existsSync(path.join(groupsDir, 'wgx', 'scratch'))).toBe(false);
+    expect(sharedDirsPendingChange(db, 'wgx', { groupsDir, dataDir })).toEqual({
+      kind: 'compat-link',
+      name: 'scratch',
+      invalidatesMounts: false,
+    });
+    db.close();
+  });
+
+  it('a pending link creation on an idle workgroup is written at that boot', async () => {
+    const { groupsDir, dataDir } = buildSettledTree();
+    fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    const db = makeDb();
+    const runtime = fakeRuntime([]);
+    const reconcileCalls: Array<{ workgroupIds?: string[] }> = [];
+
+    const { changedWorkgroupIds } = await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx'],
+      memoryPendingChange: (database, id) => workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database, id) => sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
+      sharedFsEnabled: true,
+      quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
+      activeSessionIds: async () => [],
+      ensureRuntime: () => undefined,
+      warnStartup: async () => undefined,
+      reconcileShared: (database, dirs) => {
+        reconcileCalls.push(dirs);
+        return reconcileWorkgroupSharedDirs(database, { ...dirs, groupsDir, dataDir });
+      },
+      memoryGate: () => [],
+      prune: () => undefined,
+    });
+
+    expect(changedWorkgroupIds).toEqual([]);
+    expect(runtime.stops).toEqual([]);
+    expect(reconcileCalls).toEqual([{ workgroupIds: ['wgx'] }]);
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx', 'scratch'))).toBe('/workspace/workgroup/scratch');
+    expect(fs.existsSync(path.join(dataDir, 'workgroups', 'wgx', '.migrated'))).toBe(true);
+    expect(sharedDirsPendingChange(db, 'wgx', { groupsDir, dataDir })).toBeNull();
+    db.close();
+  });
+
+  it('a pending move still stops the workgroup and reconciles it as quiesced', async () => {
+    const { groupsDir, dataDir } = buildSettledTree();
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'dbt', '.git'), { recursive: true });
+    const db = makeDb();
+    const runtime = fakeRuntime([{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }]);
+    const reconcileCalls: Array<{ workgroupIds?: string[] }> = [];
+
+    const { changedWorkgroupIds, scope } = await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx'],
+      memoryPendingChange: (database, id) => workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database, id) => sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
+      sharedFsEnabled: true,
+      quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
+      activeSessionIds: async () => ['s1'],
+      ensureRuntime: () => undefined,
+      warnStartup: async () => undefined,
+      reconcileShared: (database, dirs) => {
+        reconcileCalls.push(dirs);
+        return reconcileWorkgroupSharedDirs(database, { ...dirs, groupsDir, dataDir });
+      },
+      memoryGate: () => [],
+      prune: () => undefined,
+    });
+
+    expect(changedWorkgroupIds).toEqual(['wgx']);
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(scope.survivableSessionIds).toEqual([]);
+    expect(reconcileCalls).toEqual([{ workgroupIds: ['wgx'] }]);
+    expect(fs.existsSync(path.join(dataDir, 'workgroups', 'wgx', 'dbt', '.git'))).toBe(true);
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx', 'dbt'))).toBe('/workspace/workgroup/dbt');
     db.close();
   });
 
@@ -331,8 +446,8 @@ describe('boot mount-change ordering', () => {
 
     const { changedWorkgroupIds, scope } = await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
-      memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
-      sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
+      memoryPendingChange: (database, id) => workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database, id) => sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
       sharedFsEnabled: true,
       quiesce: (changed, options) => {
         scopes.push([...changed]);
@@ -399,8 +514,8 @@ describe('boot mount-change ordering', () => {
 
     const { changedWorkgroupIds, memoryReports } = await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx', 'wgy'],
-      memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
-      sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
+      memoryPendingChange: (database, id) => workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database, id) => sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
       sharedFsEnabled: true,
       quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
       activeSessionIds: async () => ['s1', 's2'],
@@ -438,8 +553,8 @@ describe('boot mount-change ordering', () => {
 
     await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
-      memoryWouldChange: () => false,
-      sharedWouldChange: () => false,
+      memoryPendingChange: () => null,
+      sharedPendingChange: () => null,
       sharedFsEnabled: true,
       activeSessionIds: async () => [],
       ensureRuntime: () => {
@@ -460,6 +575,7 @@ describe('boot mount-change ordering', () => {
           unlabeled: 0,
           survivors: [],
           survivableSessionIds: [],
+          survivingWorkgroupIds: [],
           mustStopSessionIds: [],
         };
       },
@@ -479,8 +595,8 @@ describe('boot mount-change ordering', () => {
     await expect(
       runBootMountQuiescence(db, {
         workgroupIds: () => ['wgx'],
-        memoryWouldChange: () => false,
-        sharedWouldChange: () => false,
+        memoryPendingChange: () => null,
+        sharedPendingChange: () => null,
         sharedFsEnabled: true,
         activeSessionIds: async () => [],
         ensureRuntime: () => {
@@ -527,8 +643,8 @@ describe('boot mount-change ordering', () => {
 
     await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
-      memoryWouldChange: () => true,
-      sharedWouldChange: () => false,
+      memoryPendingChange: () => ({ reason: 'canon-missing' }),
+      sharedPendingChange: () => null,
       sharedFsEnabled: true,
       quiesce: (changed, options) => {
         calls.push('quiesce');
@@ -570,8 +686,8 @@ describe('boot mount-change ordering', () => {
 
     const { scope } = await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx', 'wgy'],
-      memoryWouldChange: (_database, id) => id === 'wgx',
-      sharedWouldChange: () => false,
+      memoryPendingChange: (_database, id) => (id === 'wgx' ? { reason: 'canon-missing' } : null),
+      sharedPendingChange: () => null,
       sharedFsEnabled: true,
       quiesce: (changed, options) =>
         quiesceWorkgroupsForBootMountChange(changed, {
@@ -620,8 +736,8 @@ describe('boot mount-change ordering', () => {
         activeSessionIds: async () => ['s1', 's2'],
         ensureRuntime: () => undefined,
         workgroupIds: () => ['wgx'],
-        memoryWouldChange: () => true,
-        sharedWouldChange: () => false,
+        memoryPendingChange: () => ({ reason: 'canon-missing' }),
+        sharedPendingChange: () => null,
         sharedFsEnabled: true,
         quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
         warnStartup: async () => {
@@ -654,8 +770,8 @@ describe('boot mount-change ordering', () => {
         activeSessionIds: async () => ['s1', 's2'],
         ensureRuntime: () => undefined,
         workgroupIds: () => ['wgx'],
-        memoryWouldChange: () => true,
-        sharedWouldChange: () => false,
+        memoryPendingChange: () => ({ reason: 'canon-missing' }),
+        sharedPendingChange: () => null,
         sharedFsEnabled: true,
         quiesce: () =>
           quiesceWorkgroupsForBootMountChange([], {

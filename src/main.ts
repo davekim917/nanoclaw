@@ -219,10 +219,13 @@ import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modu
 
 import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
 import {
+  describeMutation,
   reconcileWorkgroupMemory,
   reconcileWorkgroupSharedDirs,
-  sharedDirsReconcileWouldChange,
-  workgroupMemoryReconcileWouldChange,
+  sharedDirsPendingChange,
+  workgroupMemoryPendingChange,
+  type SharedDirsPendingChange,
+  type WorkgroupMemoryPendingChange,
   type WorkgroupMemoryReport,
 } from './modules/workgroup/shared-dirs.js';
 import { WORKGROUP_SHARED_FS } from './config.js';
@@ -262,8 +265,8 @@ export function runWorkgroupMemoryStartupGate(
 
 export interface BootMountQuiescenceDeps {
   workgroupIds?: (db: Database.Database) => string[];
-  memoryWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
-  sharedWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
+  memoryPendingChange?: (db: Database.Database, workgroupId: string) => WorkgroupMemoryPendingChange | null;
+  sharedPendingChange?: (db: Database.Database, workgroupId: string) => SharedDirsPendingChange | null;
   sharedFsEnabled?: boolean;
   activeSessionIds?: () => Promise<string[]>;
   ensureRuntime?: () => void;
@@ -281,7 +284,7 @@ export interface BootMountQuiescenceDeps {
     },
   ) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
-  reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => void;
+  reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => unknown;
   memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
   prune?: () => void;
   fatal?: (message: string, err: unknown) => never;
@@ -318,15 +321,31 @@ export async function runBootMountQuiescence(
     deps.workgroupIds ??
     ((database: Database.Database): string[] =>
       (database.prepare(`SELECT id FROM workgroups ORDER BY id`).all() as Array<{ id: string }>).map((row) => row.id));
-  const memoryWouldChange = deps.memoryWouldChange ?? workgroupMemoryReconcileWouldChange;
-  const sharedWouldChange = deps.sharedWouldChange ?? sharedDirsReconcileWouldChange;
+  const memoryPending = deps.memoryPendingChange ?? workgroupMemoryPendingChange;
+  const sharedPending = deps.sharedPendingChange ?? sharedDirsPendingChange;
   const fatal = deps.fatal ?? bootFatal;
 
   const allWorkgroupIds = listWorkgroupIds(db);
+  // The latest evaluation, kept so the door's post-stop answer — the one it partitioned against — is what gets
+  // logged and what scopes the reconciles, not a fourth read of a tree live containers may have written since.
+  const pending = new Map<
+    string,
+    { memory: WorkgroupMemoryPendingChange | null; shared: SharedDirsPendingChange | null }
+  >();
+  // A workgroup is "changed" (its containers must stop) only for a write that changes what an existing path in a
+  // live mount resolves to. A pending link creation is taken at a boot that finds the workgroup idle, never live.
   // Once a D2 survivable-container path exists, a pending wiki core.hooksPath change must also count as a mount
   // change here, before the door runs: a survivor keeps its pre-migration `.git/config` mount and has no hook.
-  const evaluateChanged = (): string[] =>
-    allWorkgroupIds.filter((id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)));
+  const evaluateChanged = (): string[] => {
+    pending.clear();
+    for (const id of allWorkgroupIds) {
+      pending.set(id, { memory: memoryPending(db, id), shared: sharedFsEnabled ? sharedPending(db, id) : null });
+    }
+    return allWorkgroupIds.filter((id) => {
+      const entry = pending.get(id)!;
+      return entry.memory !== null || entry.shared?.invalidatesMounts === true;
+    });
+  };
 
   // Bounded probe before the door's unbounded `docker ps`, so a stalled daemon fails the boot instead of hanging.
   (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
@@ -377,11 +396,39 @@ export async function runBootMountQuiescence(
     // Non-empty means a live agent wrote to a group directory while the door was stopping it.
     ...(flipped.length > 0 ? { flipped } : {}),
   });
+  // Every write runs with the workgroup's containers stopped. The changed set was stopped by the door; a workgroup
+  // with only link creations pending is written at a boot where nothing of it survived, and otherwise waits.
+  const surviving = new Set(scope.survivingWorkgroupIds);
+  const idleLinkWorkgroupIds: string[] = [];
+  for (const [workgroupId, entry] of pending) {
+    if (changedWorkgroupIds.includes(workgroupId)) {
+      log.info('Boot quiescence changed workgroup', {
+        workgroupId,
+        predicate: entry.memory ? 'memory' : 'shared-dirs',
+        ...(entry.memory
+          ? { reason: entry.memory.reason, ...(entry.memory.folder ? { folder: entry.memory.folder } : {}) }
+          : { write: entry.shared ? describeMutation(entry.shared) : 'none' }),
+      });
+    } else if (entry.shared && !entry.shared.invalidatesMounts) {
+      const idle = !surviving.has(workgroupId);
+      if (idle) idleLinkWorkgroupIds.push(workgroupId);
+      log.info(
+        idle
+          ? 'Boot quiescence link creation on an idle workgroup'
+          : 'Boot quiescence link creation deferred, containers kept',
+        {
+          workgroupId,
+          write: describeMutation(entry.shared),
+        },
+      );
+    }
+  }
+  const reconcileWorkgroupIds = [...changedWorkgroupIds, ...idleLinkWorkgroupIds];
 
   // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed.
   if (sharedFsEnabled) {
     try {
-      (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, { workgroupIds: changedWorkgroupIds });
+      (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, { workgroupIds: reconcileWorkgroupIds });
     } catch (sharedErr) {
       fatal('Workgroup shared-FS consolidation failed at startup', sharedErr);
     }
