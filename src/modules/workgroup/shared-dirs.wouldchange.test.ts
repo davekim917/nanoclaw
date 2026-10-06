@@ -348,10 +348,11 @@ interface SharedCase {
   build: (dirs: { groupsDir: string; dataDir: string }) => void;
 }
 
-/** A workgroup whose consolidation is already settled: nothing left to do. */
+/** A workgroup whose consolidation is already settled: nothing left to do, marker in place. */
 function buildSettled({ groupsDir, dataDir }: { groupsDir: string; dataDir: string }): void {
   const wgDir = path.join(dataDir, 'workgroups', 'wgx');
   fs.mkdirSync(path.join(wgDir, 'dbt', '.git'), { recursive: true });
+  fs.writeFileSync(path.join(wgDir, '.migrated'), '{"migratedAt":"2020-01-01T00:00:00.000Z"}\n');
   fs.mkdirSync(path.join(groupsDir, 'wgx'), { recursive: true });
   fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/dbt`, path.join(groupsDir, 'wgx', 'dbt'));
   fs.mkdirSync(path.join(groupsDir, 'wgx-codex'), { recursive: true });
@@ -432,6 +433,16 @@ const SHARED_MATRIX: SharedCase[] = [
       fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/gone`, path.join(groupsDir, 'wgx', 'gone'));
     },
   },
+  // No marker yet: the mount gate reads it once the flag is off, so the first
+  // links wait for a quiesced run that also writes it.
+  {
+    name: 'markerless-agent-created-dir',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.unlinkSync(path.join(dataDir, 'workgroups', 'wgx', '.migrated'));
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    },
+  },
   // A link already at the name pointing elsewhere: repointing it changes what
   // a container's existing path resolves to, so it is a mount change.
   {
@@ -480,6 +491,7 @@ describe('sharedDirsPendingChange', () => {
 
       const pending = sharedDirsPendingChange(db, 'wgx', dirs);
       expect(sharedDirsReconcileWouldChange(db, 'wgx', dirs)).toBe(pending !== null);
+      const markerBefore = fs.existsSync(path.join(dirs.dataDir, 'workgroups', 'wgx', '.migrated'));
 
       // The reconcile runs on an independent copy; the tree hash is the second
       // witness that its report names every write and nothing else.
@@ -496,7 +508,10 @@ describe('sharedDirsPendingChange', () => {
       expect(report.deferred).toEqual([]);
       expect(pending !== null, testCase.name).toBe(report.mutations.length > 0);
       expect(pending !== null, testCase.name).toBe(treeChanged);
-      expect(pending?.invalidatesMounts ?? false, testCase.name).toBe(invalidatesMounts(report.mutations));
+      // Without a marker the first links wait for quiescence: a creation counts as invalidating then.
+      expect(pending?.invalidatesMounts ?? false, testCase.name).toBe(
+        invalidatesMounts(report.mutations) || (report.mutations.length > 0 && !markerBefore),
+      );
 
       observed[testCase.name] = {
         pending: pending ? describeMutation(pending) : null,
@@ -548,6 +563,12 @@ describe('sharedDirsPendingChange', () => {
         treeChanged: false,
       },
       'dangling-compat-symlink': { pending: null, invalidates: false, mutations: [], treeChanged: false },
+      'markerless-agent-created-dir': {
+        pending: 'compat-link:scratch',
+        invalidates: true,
+        mutations: ['compat-link:scratch', 'sibling-link:wgx-codex/scratch'],
+        treeChanged: true,
+      },
       'seed-link-wrong-target': {
         pending: 'compat-link-replace:dbt',
         invalidates: true,
@@ -659,6 +680,24 @@ describe('sharedDirsPendingChange', () => {
     fs.unlinkSync(path.join(groupsDir, 'wgx-codex', 'scratch'));
     expect(hashTree(base)).toBe(before);
     expect(fs.statSync(markerPath).mtimeMs).toBe(pinned.getTime());
+    db.close();
+  });
+
+  it('a live run on a workgroup with no marker writes nothing', () => {
+    const base = makeTree('markerless-live', ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.unlinkSync(path.join(dataDir, 'workgroups', 'wgx', '.migrated'));
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    });
+    const groupsDir = path.join(base, 'groups');
+    const dataDir = path.join(base, 'data');
+    const db = makeSharedDb();
+    const before = hashTree(base);
+
+    const [live] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir, quiescedWorkgroupIds: [] });
+
+    expect(live).toEqual({ workgroupId: 'wgx', mutations: [], deferred: [] });
+    expect(hashTree(base)).toBe(before);
     db.close();
   });
 

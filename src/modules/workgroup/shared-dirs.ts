@@ -494,8 +494,9 @@ export interface SharedDirsReconcileReport {
 
 /**
  * Consolidate every workgroup's shared dirs into `data/workgroups/<id>/`.
- * Fail-closed: a per-workgroup failure throws so the caller exits rather than
- * spawn containers against a half-migrated tree. Runs only inside the boot
+ * A per-workgroup failure throws: the boot caller exits for a quiesced run,
+ * since the tree may be half-migrated, and logs for a live one, whose only
+ * writes are link creations that stay pending. Runs only inside the boot
  * quiescence door. Mount-invalidating mutations are performed only for the
  * workgroups in `quiescedWorkgroupIds` (default: every selected workgroup) —
  * the ones whose containers the caller has proven stopped; elsewhere they are
@@ -621,9 +622,14 @@ export function sharedDirsPendingChange(
   const { seedDir, wgDir, siblingFolders, shared } = plan;
   if (shared.size === 0) return null;
 
+  // A link only outlives a flag flip through the marker, which the mount gate reads, so a workgroup without one
+  // takes its first links in a quiesced run (which writes the marker) — never live.
+  const markerPresent = fs.existsSync(path.join(wgDir, MIGRATION_MARKER));
   const first: { link: SharedDirMutation | null } = { link: null };
   const linkWrite = (mutation: SharedDirMutation): SharedDirsPendingChange | null => {
-    if (MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS.has(mutation.kind)) return { ...mutation, invalidatesMounts: true };
+    if (MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS.has(mutation.kind) || !markerPresent) {
+      return { ...mutation, invalidatesMounts: true };
+    }
     first.link ??= mutation;
     return null;
   };
@@ -698,6 +704,10 @@ function migrateWorkgroup(
 
   if (shared.size === 0) {
     log.info('reconcileWorkgroupSharedDirs: nothing to consolidate', { workgroupId });
+    return report;
+  }
+  if (!quiesced && !fs.existsSync(markerPath)) {
+    log.warn('reconcileWorkgroupSharedDirs: first consolidation waits for a quiesced run', { workgroupId });
     return report;
   }
 
@@ -804,7 +814,7 @@ function migrateWorkgroup(
   });
   // Under live containers the only writes above were refusing `symlink(2)` creations. The marker and the
   // migration log are plain file writes an agent can redirect (a `.migrated` swapped for a symlink is followed
-  // and its target truncated), so they wait for a quiesced run; a created link needs no marker to persist.
+  // and its target truncated), so they wait for a quiesced run; a live run already has the marker it needs.
   if (!quiesced) return report;
 
   const marker: MigrationReport = {

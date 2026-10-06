@@ -98,6 +98,13 @@ function buildSettledTree(workgroupIds: string[] = ['wgx']): { groupsDir: string
   return { groupsDir, dataDir };
 }
 
+/** The record a prior quiesced consolidation leaves; the spawn path mounts the shared tree on it. */
+function writeSharedMarker(dataDir: string): void {
+  const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+  fs.mkdirSync(wgDir, { recursive: true });
+  fs.writeFileSync(path.join(wgDir, '.migrated'), '{"migratedAt":"2020-01-01T00:00:00.000Z"}\n');
+}
+
 /** Content hash of a fixture tree: file bytes, symlink targets, directory shape. */
 function hashTree(rootDir: string): string {
   const lines: string[] = [];
@@ -319,6 +326,7 @@ describe('boot mount-change ordering', () => {
     // mount never resolves differently for — so the door must not stop
     // anything, and the reconcile must still run, outside the quiesced set.
     const { groupsDir, dataDir } = buildSettledTree();
+    writeSharedMarker(dataDir);
     fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
     const db = makeDb();
     const runtime = fakeRuntime([
@@ -358,6 +366,7 @@ describe('boot mount-change ordering', () => {
 
   it('a live link-housekeeping failure is logged, not fatal; a quiesced failure still is', async () => {
     const { groupsDir, dataDir } = buildSettledTree();
+    writeSharedMarker(dataDir);
     fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
     const db = makeDb();
     const fatals: string[] = [];
@@ -394,7 +403,9 @@ describe('boot mount-change ordering', () => {
       expect(fatals).toEqual([]);
       expect(
         errors.mock.calls.map(([message, fields]) => [message, (fields as { workgroupIds: string[] }).workgroupIds]),
-      ).toEqual([['Workgroup shared-FS link housekeeping failed under live containers; retried next boot', ['wgx']]]);
+      ).toEqual([
+        ['Workgroup shared-FS link housekeeping failed under live containers; reconsidered next boot', ['wgx']],
+      ]);
     } finally {
       errors.mockRestore();
     }
@@ -409,6 +420,40 @@ describe('boot mount-change ordering', () => {
       }),
     ).rejects.toThrow('Workgroup shared-FS consolidation failed at startup');
     expect(fatals).toEqual(['Workgroup shared-FS consolidation failed at startup']);
+    db.close();
+  });
+
+  it('a workgroup with no marker takes its first links in a quiesced run', async () => {
+    // The marker is what keeps /workspace/workgroup mounted once the flag is
+    // off; a link created before it exists would dangle after a flag flip.
+    const { groupsDir, dataDir } = buildSettledTree();
+    fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    const db = makeDb();
+    const runtime = fakeRuntime([{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }]);
+    const reconcileCalls: Array<{ workgroupIds?: string[]; quiescedWorkgroupIds?: string[] }> = [];
+
+    const { changedWorkgroupIds } = await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx'],
+      memoryPendingChange: (database, id) => workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database, id) => sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
+      sharedFsEnabled: true,
+      quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
+      activeSessionIds: async () => ['s1'],
+      ensureRuntime: () => undefined,
+      warnStartup: async () => undefined,
+      reconcileShared: (database, dirs) => {
+        reconcileCalls.push(dirs);
+        return reconcileWorkgroupSharedDirs(database, { ...dirs, groupsDir, dataDir });
+      },
+      memoryGate: () => [],
+      prune: () => undefined,
+    });
+
+    expect(changedWorkgroupIds).toEqual(['wgx']);
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(reconcileCalls).toEqual([{ workgroupIds: ['wgx'], quiescedWorkgroupIds: ['wgx'] }]);
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx', 'scratch'))).toBe('/workspace/workgroup/scratch');
+    expect(fs.existsSync(path.join(dataDir, 'workgroups', 'wgx', '.migrated'))).toBe(true);
     db.close();
   });
 

@@ -421,7 +421,7 @@ export async function runBootMountQuiescence(
   // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed for the changed set, the
   // only one proven stopped and so the only one that may take mount-invalidating writes. The link-creation set is
   // reconciled under live containers, whose agents can make a creation fail (EACCES); the link is then still
-  // pending, so the next boot retries it — not a reason to take the fleet down.
+  // pending for the next boot's door, if it still applies — not a reason to take the fleet down.
   if (sharedFsEnabled) {
     try {
       (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, {
@@ -438,7 +438,7 @@ export async function runBootMountQuiescence(
           quiescedWorkgroupIds: [],
         });
       } catch (sharedErr) {
-        log.error('Workgroup shared-FS link housekeeping failed under live containers; retried next boot', {
+        log.error('Workgroup shared-FS link housekeeping failed under live containers; reconsidered next boot', {
           workgroupIds: linkOnlyWorkgroupIds,
           err: sharedErr,
         });
