@@ -43,8 +43,10 @@ export interface InFlightOptions {
   commandTimeoutMs?: number;
   budgetMs?: number;
   log?: (msg: string) => void;
-  /** Test seam for the per-path stat. */
+  /** Test seams. */
   lstat?: (file: string) => Promise<fs.Stats>;
+  opendir?: (dir: string) => Promise<fs.Dir>;
+  now?: () => number;
 }
 
 interface StatusEntry {
@@ -63,24 +65,60 @@ interface CheckoutStatus {
   entries: StatusEntry[];
 }
 
-/** Never caught per checkout: running out of time must void the whole result, not shrink it. */
+/** Never swallowed anywhere: running out of time voids the whole result (no record, no baseline), never shrinks it. */
 class BudgetExhausted extends Error {
   constructor() {
     super('worktree in-flight budget exhausted');
   }
 }
 
-/** Returns the timeout for the next step, or throws once the budget is spent. */
-type Deadline = () => number;
+/** One time budget for a whole snapshot or turn-end pass. */
+class Budget {
+  private readonly end: number;
 
-function deadlineFrom(opts: InFlightOptions): Deadline {
-  const commandTimeoutMs = opts.commandTimeoutMs ?? COMMAND_TIMEOUT_MS;
-  const end = Date.now() + (opts.budgetMs ?? BUDGET_MS);
-  return () => {
-    const remaining = end - Date.now();
-    if (remaining <= 0) throw new BudgetExhausted();
-    return Math.min(commandTimeoutMs, remaining);
-  };
+  constructor(
+    budgetMs: number,
+    private readonly now: () => number,
+  ) {
+    this.end = now() + budgetMs;
+  }
+
+  /** Throws once the budget is spent. */
+  check(): void {
+    if (this.now() >= this.end) throw new BudgetExhausted();
+  }
+
+  /**
+   * Settles with `work` unless the budget runs out first, in which case it rejects at the deadline — a stalled
+   * filesystem call cannot hold the caller past it — and calls `onExpire` to stop the work where that is possible.
+   * A failure that lands after the deadline is reported as the budget, so it cannot be mistaken for one checkout's.
+   */
+  race<T>(work: () => Promise<T>, onExpire?: () => void): Promise<T> {
+    this.check();
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => {
+          onExpire?.();
+          reject(new BudgetExhausted());
+        },
+        Math.max(this.end - this.now(), 0),
+      );
+      work().then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          reject(this.now() >= this.end ? new BudgetExhausted() : err);
+        },
+      );
+    });
+  }
+}
+
+function budgetFrom(opts: InFlightOptions): Budget {
+  return new Budget(opts.budgetMs ?? BUDGET_MS, opts.now ?? Date.now);
 }
 
 function recordedText(value: string): string {
@@ -88,64 +126,102 @@ function recordedText(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/g, '?').slice(0, MAX_RECORDED_CHARS);
 }
 
-function git(cwd: string, args: string[], timeoutMs: number, okStatus: readonly number[] = [0]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = execFile(
-      'git',
-      ['--no-optional-locks', '-c', 'protocol.allow=never', ...args],
-      {
-        cwd,
-        env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' },
-        encoding: 'utf8',
-        timeout: timeoutMs,
-        killSignal: 'SIGKILL',
-        maxBuffer: 16 * 1024 * 1024,
-      },
-      (error, stdout, stderr) => {
-        if (!error) return resolve(stdout);
-        const code = (error as { code?: unknown }).code;
-        if (typeof code === 'number' && okStatus.includes(code)) return resolve(stdout);
-        const detail = (error as { killed?: boolean }).killed
-          ? `killed after ${timeoutMs}ms`
-          : stderr.trim().split('\n').pop() || error.message;
-        reject(new Error(`git ${args[0]} in ${cwd}: ${detail}`));
-      },
-    );
-    child.stdin?.end();
-  });
+function git(
+  cwd: string,
+  args: string[],
+  budget: Budget,
+  opts: InFlightOptions,
+  okStatus: readonly number[] = [0],
+): Promise<string> {
+  const timeoutMs = opts.commandTimeoutMs ?? COMMAND_TIMEOUT_MS;
+  const abort = new AbortController();
+  const run = (): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const child = execFile(
+        'git',
+        ['--no-optional-locks', '-c', 'protocol.allow=never', ...args],
+        {
+          cwd,
+          env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' },
+          encoding: 'utf8',
+          timeout: timeoutMs,
+          killSignal: 'SIGKILL',
+          signal: abort.signal,
+          maxBuffer: 16 * 1024 * 1024,
+        },
+        (error, stdout, stderr) => {
+          if (!error) return resolve(stdout);
+          const code = (error as { code?: unknown }).code;
+          if (typeof code === 'number' && okStatus.includes(code)) return resolve(stdout);
+          const detail = (error as { killed?: boolean }).killed
+            ? `killed after ${timeoutMs}ms`
+            : stderr.trim().split('\n').pop() || error.message;
+          reject(new Error(`git ${args[0]} in ${cwd}: ${detail}`));
+        },
+      );
+      child.stdin?.end();
+    });
+  return budget.race(run, () => abort.abort());
 }
 
-async function listCheckouts(root: string, deadline: Deadline): Promise<{ names: string[]; truncated: boolean }> {
-  let entries: fs.Dirent[];
+/** Streamed, so a huge root costs at most the budget; stops at the first checkout past the cap. */
+async function listCheckouts(
+  root: string,
+  budget: Budget,
+  opts: InFlightOptions,
+): Promise<{ names: string[]; truncated: boolean }> {
+  const openDir = opts.opendir ?? ((dir: string) => fs.promises.opendir(dir));
+  let dir: fs.Dir;
   try {
-    entries = await fs.promises.readdir(root, { withFileTypes: true });
+    dir = await budget.race(() => openDir(root));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { names: [], truncated: false };
     throw err;
   }
-  const candidates = entries
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-    .map((entry) => entry.name)
-    .sort();
   const names: string[] = [];
-  for (const name of candidates) {
-    deadline();
-    try {
-      await fs.promises.lstat(path.join(root, name, '.git'));
-    } catch {
-      continue;
+  let truncated = false;
+  try {
+    for (;;) {
+      let entry: fs.Dirent | null;
+      try {
+        entry = await budget.race(() => dir.read());
+      } catch (err) {
+        // Bun opens lazily: a missing root surfaces on the first read, not at opendir.
+        if (names.length === 0 && (err as NodeJS.ErrnoException).code === 'ENOENT') break;
+        throw err;
+      }
+      if (entry === null) break;
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const isCheckout = await budget.race(() =>
+        fs.promises.lstat(path.join(root, entry.name, '.git')).then(
+          () => true,
+          () => false,
+        ),
+      );
+      if (!isCheckout) continue;
+      if (names.length === MAX_CHECKOUTS) {
+        truncated = true;
+        break;
+      }
+      names.push(entry.name);
     }
-    if (names.length === MAX_CHECKOUTS) return { names, truncated: true };
-    names.push(name);
+  } finally {
+    // Not awaited: a close behind a stalled read must not hold the caller past the budget.
+    // Bun's `Dir.close()` can return undefined rather than a promise, hence the wrapper.
+    void Promise.resolve()
+      .then(() => dir.close())
+      .catch(() => undefined);
   }
-  return { names, truncated: false };
+  return { names: names.sort(), truncated };
 }
 
-async function worktreeStat(checkout: string, rel: string, opts: InFlightOptions): Promise<string> {
+async function worktreeStat(checkout: string, rel: string, budget: Budget, opts: InFlightOptions): Promise<string> {
+  const lstat = opts.lstat ?? ((file: string) => fs.promises.lstat(file));
   try {
-    const stat = await (opts.lstat ?? fs.promises.lstat)(path.join(checkout, rel));
+    const stat = await budget.race(() => lstat(path.join(checkout, rel)));
     return `${stat.mtimeMs}:${stat.size}:${stat.ino}:${stat.mode}`;
   } catch (err) {
+    if (err instanceof BudgetExhausted) throw err;
     if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ENOTDIR') {
       return 'absent';
     }
@@ -156,11 +232,12 @@ async function worktreeStat(checkout: string, rel: string, opts: InFlightOptions
 /** `--porcelain=v2 -z` fields before the path, by entry type; the path is the remainder and may hold spaces. */
 const PATH_FIELD_OFFSET: Readonly<Record<string, number>> = { '1': 8, '2': 9, u: 10, '?': 1 };
 
-async function readStatus(checkout: string, deadline: Deadline, opts: InFlightOptions): Promise<CheckoutStatus> {
+async function readStatus(checkout: string, budget: Budget, opts: InFlightOptions): Promise<CheckoutStatus> {
   const raw = await git(
     checkout,
     ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all', '--ignore-submodules=all'],
-    deadline(),
+    budget,
+    opts,
   );
   const status: CheckoutStatus = { hasHead: true, branch: null, upstream: null, upstreamTracked: false, entries: [] };
   const tokens = raw.split('\0');
@@ -190,32 +267,35 @@ async function readStatus(checkout: string, deadline: Deadline, opts: InFlightOp
     const staged = token[0] === '1' || token[0] === '2' ? `${fields[4]}:${fields[7]}` : '';
     status.entries.push({ path: rel, identity: `${code}:${staged}:` });
   }
-  for (const entry of status.entries) {
-    deadline();
-    entry.identity += await worktreeStat(checkout, entry.path, opts);
-  }
+  for (const entry of status.entries) entry.identity += await worktreeStat(checkout, entry.path, budget, opts);
   return status;
 }
 
-async function unpushedCommits(checkout: string, revs: string[], deadline: Deadline): Promise<string[]> {
+/**
+ * Commits on no remote, across every local branch, so a branch switch neither surfaces old commits nor hides new
+ * ones. The same set at startup and turn end, independent of the checked-out branch: excluding its upstream would
+ * drop a local upstream's unpushed commits from the baseline and resurface them after a switch.
+ */
+async function unpushedCommits(
+  checkout: string,
+  status: CheckoutStatus,
+  budget: Budget,
+  opts: InFlightOptions,
+): Promise<string[]> {
+  const tips = status.hasHead ? ['--branches', 'HEAD'] : ['--branches'];
   // One past the cap, so a full list reads as "more than the cap", never as exact.
-  const out = await git(checkout, ['rev-list', `--max-count=${MAX_COMMITS + 1}`, ...revs], deadline());
+  const out = await git(
+    checkout,
+    ['rev-list', `--max-count=${MAX_COMMITS + 1}`, ...tips, '--not', '--remotes'],
+    budget,
+    opts,
+  );
   return out.split('\n').filter(Boolean);
 }
 
-/** Every local branch, so a branch switch neither surfaces old commits nor hides new ones. */
-function unpushedRevs(status: CheckoutStatus): string[] {
-  const tips = status.hasHead ? ['--branches', 'HEAD'] : ['--branches'];
-  return [...tips, '--not', '--remotes', ...(status.upstreamTracked ? ['@{upstream}'] : [])];
-}
-
-async function snapshotCheckout(
-  checkout: string,
-  deadline: Deadline,
-  opts: InFlightOptions,
-): Promise<CheckoutBaseline> {
-  const status = await readStatus(checkout, deadline, opts);
-  const commits = await unpushedCommits(checkout, unpushedRevs(status), deadline);
+async function snapshotCheckout(checkout: string, budget: Budget, opts: InFlightOptions): Promise<CheckoutBaseline> {
+  const status = await readStatus(checkout, budget, opts);
+  const commits = await unpushedCommits(checkout, status, budget, opts);
   return {
     dirty: new Map(status.entries.map((entry) => [entry.path, entry.identity])),
     unpushed: commits.length > MAX_COMMITS ? null : new Set(commits),
@@ -231,20 +311,21 @@ export async function snapshotWorktrees(
   opts: InFlightOptions = {},
 ): Promise<WorktreeBaseline | null> {
   const log = opts.log ?? (() => {});
-  const deadline = deadlineFrom(opts);
+  const budget = budgetFrom(opts);
   try {
-    const { names, truncated } = await listCheckouts(root, deadline);
+    const { names, truncated } = await listCheckouts(root, budget, opts);
     if (truncated) log(`worktree baseline: more than ${MAX_CHECKOUTS} checkouts; later ones are never attributed`);
     const baseline: WorktreeBaseline = { root, checkouts: new Map(), truncated };
     for (const name of names) {
       try {
-        baseline.checkouts.set(name, await snapshotCheckout(path.join(root, name), deadline, opts));
+        baseline.checkouts.set(name, await snapshotCheckout(path.join(root, name), budget, opts));
       } catch (err) {
         if (err instanceof BudgetExhausted) throw err;
         baseline.checkouts.set(name, null);
         log(`worktree baseline: ${name} unreadable: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    budget.check();
     return baseline;
   } catch (err) {
     log(`worktree baseline skipped: ${err instanceof Error ? err.message : String(err)}`);
@@ -256,10 +337,10 @@ async function checkoutInFlight(
   checkout: string,
   name: string,
   before: CheckoutBaseline | undefined,
-  deadline: Deadline,
+  budget: Budget,
   opts: InFlightOptions,
 ): Promise<WorktreeInFlightCheckout | null> {
-  const status = await readStatus(checkout, deadline, opts);
+  const status = await readStatus(checkout, budget, opts);
   // A checkout absent at startup was created by this container, so all of it is new.
   const files = status.entries
     .filter((entry) => before?.dirty.get(entry.path) !== entry.identity)
@@ -267,7 +348,7 @@ async function checkoutInFlight(
 
   let unpushed = 0;
   if (!before || before.unpushed !== null) {
-    const commits = await unpushedCommits(checkout, unpushedRevs(status), deadline);
+    const commits = await unpushedCommits(checkout, status, budget, opts);
     unpushed = commits.filter((sha) => !before?.unpushed?.has(sha)).length;
   }
   if (files.length === 0 && unpushed === 0) return null;
@@ -275,7 +356,7 @@ async function checkoutInFlight(
   let upstreamHead: string | null = null;
   if (status.upstreamTracked) {
     upstreamHead =
-      (await git(checkout, ['rev-parse', '--verify', '--quiet', '@{upstream}'], deadline(), [0, 1])).trim() || null;
+      (await git(checkout, ['rev-parse', '--verify', '--quiet', '@{upstream}'], budget, opts, [0, 1])).trim() || null;
   }
   return {
     name: recordedText(name),
@@ -293,14 +374,14 @@ export async function computeWorktreeInFlight(
   opts: InFlightOptions = {},
 ): Promise<WorktreeInFlight> {
   const log = opts.log ?? (() => {});
-  const deadline = deadlineFrom(opts);
+  const budget = budgetFrom(opts);
   const record: WorktreeInFlight = { at: new Date().toISOString(), checkouts: [] };
   let filesLeft = MAX_FILES_RECORDED;
-  for (const name of (await listCheckouts(baseline.root, deadline)).names) {
+  for (const name of (await listCheckouts(baseline.root, budget, opts)).names) {
     const before = baseline.checkouts.get(name);
     if (before === null || (before === undefined && baseline.truncated)) continue;
     try {
-      const found = await checkoutInFlight(path.join(baseline.root, name), name, before, deadline, opts);
+      const found = await checkoutInFlight(path.join(baseline.root, name), name, before, budget, opts);
       if (!found) continue;
       found.files = found.files.slice(0, filesLeft);
       filesLeft -= found.files.length;
@@ -310,6 +391,8 @@ export async function computeWorktreeInFlight(
       log(`worktree in-flight: ${name} unreadable: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  // Evidence gathered past the deadline is not published, even when every step succeeded.
+  budget.check();
   return record;
 }
 

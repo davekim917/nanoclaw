@@ -194,13 +194,29 @@ describe('worktree in-flight record', () => {
     const logs: string[] = [];
     const baseline = await snapshotWorktrees(worktrees, { log: (m) => logs.push(m) });
     expect(baseline!.truncated).toBe(true);
-    expect(baseline!.checkouts.has('a32')).toBe(false);
+    expect(baseline!.checkouts.size).toBe(32);
     expect(logs.filter((m) => m.includes('more than 32 checkouts'))).toHaveLength(1);
-    // Removing an earlier checkout brings the uninventoried one into the listing.
-    fs.rmSync(path.join(worktrees, 'a00'), { recursive: true, force: true });
+    // Removing an inventoried checkout brings the uninventoried one into the listing.
+    fs.rmSync(path.join(worktrees, [...baseline!.checkouts.keys()][0]), { recursive: true, force: true });
 
     const record = await computeWorktreeInFlight(baseline!);
 
+    expect(record.checkouts).toEqual([]);
+  });
+
+  it('does not count old unpushed commits on a local upstream after switching to a remote-tracking branch', async () => {
+    const { record } = await inFlightAfter(
+      (c) => git(c, ['checkout', '-q', 'feat/x']),
+      (c) => {
+        git(c, ['checkout', '-q', '-b', 'base']);
+        fs.writeFileSync(path.join(c, 'a.ts'), 'old one\n');
+        git(c, ['commit', '-q', '-am', 'old one']);
+        fs.writeFileSync(path.join(c, 'b.ts'), 'old two\n');
+        git(c, ['commit', '-q', '-am', 'old two']);
+        git(c, ['checkout', '-q', '-b', 'feat/on-base']);
+        git(c, ['branch', '-q', '--set-upstream-to=base']);
+      },
+    );
     expect(record.checkouts).toEqual([]);
   });
 
@@ -262,6 +278,65 @@ describe('worktree in-flight record', () => {
     // Stopped after the first slow stat, not after all five.
     expect(Date.now() - startedAt).toBeLessThan(600);
     expect(getWorktreeInFlight()).toBeUndefined();
+  });
+
+  it('clears the record when the last git command runs past the budget, despite earlier evidence', async () => {
+    const first = makeCheckout('a-first');
+    const slow = makeCheckout('b-slow');
+    const baseline = await snapshotWorktrees(worktrees);
+    fs.writeFileSync(path.join(first, 'a.ts'), 'edited\n');
+    const hook = path.join(root, 'slow-fsmonitor.sh');
+    fs.writeFileSync(hook, '#!/bin/sh\nsleep 5\n', { mode: 0o755 });
+    git(slow, ['config', 'core.fsmonitor', hook]);
+    setWorktreeInFlight({ at: new Date().toISOString(), checkouts: [] });
+
+    const startedAt = Date.now();
+    await recordWorktreeInFlight(baseline, { budgetMs: 1_500 });
+
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
+    expect(getWorktreeInFlight()).toBeUndefined();
+  });
+
+  it('clears the record when the last step finishes just past the budget', async () => {
+    const checkout = makeCheckout();
+    git(checkout, ['checkout', '-q', '-b', 'local-only']);
+    fs.writeFileSync(path.join(checkout, 'a.ts'), 'edited\n');
+    // No commit baseline and no upstream, so the final file stat is the last step of the pass.
+    const baseline = {
+      root: worktrees,
+      truncated: false,
+      checkouts: new Map([['app@feat-x', { dirty: new Map<string, string>(), unpushed: null }]]),
+    };
+    const budgetMs = 10_000;
+    let skew = 0;
+    setWorktreeInFlight({ at: new Date().toISOString(), checkouts: [] });
+
+    await recordWorktreeInFlight(baseline, {
+      budgetMs,
+      now: () => Date.now() + skew,
+      lstat: async (file) => {
+        skew = budgetMs + 1;
+        return fs.promises.lstat(file);
+      },
+    });
+
+    expect(getWorktreeInFlight()).toBeUndefined();
+  });
+
+  it('takes no baseline, within the budget, when listing the root stalls', async () => {
+    makeCheckout();
+    const startedAt = Date.now();
+    const baseline = await snapshotWorktrees(worktrees, {
+      budgetMs: 50,
+      opendir: (dir) => new Promise((resolve) => setTimeout(() => resolve(fs.promises.opendir(dir)), 1_000)),
+    });
+    expect(baseline).toBeNull();
+    expect(Date.now() - startedAt).toBeLessThan(400);
+  });
+
+  it('takes an empty baseline when there is no worktrees root', async () => {
+    const baseline = await snapshotWorktrees(path.join(root, 'missing'));
+    expect(baseline).toEqual({ root: path.join(root, 'missing'), checkouts: new Map(), truncated: false });
   });
 
   it('takes no baseline when the startup budget runs out', async () => {
