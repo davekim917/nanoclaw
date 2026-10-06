@@ -182,7 +182,8 @@ describe('Codex planCodexPluginRegistration', () => {
 describe('skill mirror discoverPortableSkills', () => {
   const skillNames = (entries: string[] | undefined): string[] =>
     discoverPortableSkills(root, {
-      runtime: 'opencode', delivery: OPENCODE_DELIVERY,
+      runtime: 'opencode',
+      delivery: OPENCODE_DELIVERY,
       excludePlugins: splitExcludedPlugins(entries),
     })
       .map((s) => s.name)
@@ -266,7 +267,11 @@ describe('the three walkers and the predicate agree', () => {
         .sort();
       expect(codex).toEqual(expected);
 
-      const skills = discoverPortableSkills(root, { runtime: 'opencode', delivery: OPENCODE_DELIVERY, excludePlugins: excluded })
+      const skills = discoverPortableSkills(root, {
+        runtime: 'opencode',
+        delivery: OPENCODE_DELIVERY,
+        excludePlugins: excluded,
+      })
         .filter((s) => s.name !== 'standalone')
         .map((s) => s.name)
         .sort();
@@ -287,8 +292,8 @@ describe('an exclusion that matches nothing', () => {
     const none = splitExcludedPlugins(undefined);
     expect(discoverPlugins(root, ghost).plugins).toEqual(discoverPlugins(root, none).plugins);
     expect(planCodexPluginRegistration(root, ghost)).toEqual(planCodexPluginRegistration(root, none));
-    expect(discoverPortableSkills(root, { runtime: 'opencode', delivery: OPENCODE_DELIVERY, excludePlugins: ghost })).toEqual(
-      discoverPortableSkills(root, { runtime: 'opencode', delivery: OPENCODE_DELIVERY, excludePlugins: none }),
-    );
+    expect(
+      discoverPortableSkills(root, { runtime: 'opencode', delivery: OPENCODE_DELIVERY, excludePlugins: ghost }),
+    ).toEqual(discoverPortableSkills(root, { runtime: 'opencode', delivery: OPENCODE_DELIVERY, excludePlugins: none }));
   });
 });
