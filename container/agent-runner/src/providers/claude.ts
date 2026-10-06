@@ -118,7 +118,7 @@ function resetsAtIso(resetsAt: number | undefined): string | null {
  */
 export function classifyRateLimitEvent(
   info: SdkRateLimitInfo | undefined,
-): { message: string; classification: 'rate_limit' | 'quota' } | null {
+): { message: string; classification: 'rate_limit' | 'quota'; resetAt: string | null } | null {
   if (info?.status !== 'rejected') return null;
   const outOfCredits = info.errorCode === 'credits_required' || info.overageDisabledReason === 'out_of_credits';
   const iso = resetsAtIso(info.resetsAt);
@@ -127,6 +127,7 @@ export function classifyRateLimitEvent(
   return {
     message: `${outOfCredits ? 'Out of credits' : 'Rate limit'}${window}${detail}`,
     classification: outOfCredits ? 'quota' : 'rate_limit',
+    resetAt: iso,
   };
 }
 
@@ -2285,6 +2286,7 @@ export class ClaudeProvider implements AgentProvider {
                 message: blocked.message,
                 retryable: false,
                 classification: blocked.classification,
+                resetAt: blocked.resetAt,
               };
             }
           } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {

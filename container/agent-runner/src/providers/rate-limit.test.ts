@@ -36,6 +36,13 @@ describe('classifyRateLimitEvent', () => {
     expect(secs!.message).toBe(ms!.message);
   });
 
+  it('carries the measured reset as resetAt, so the host parks until exactly then', () => {
+    expect(
+      classifyRateLimitEvent({ status: 'rejected', rateLimitType: 'five_hour', resetsAt: 1_791_244_800 })!.resetAt,
+    ).toBe('2026-10-06T00:00:00.000Z');
+    expect(classifyRateLimitEvent({ status: 'rejected', rateLimitType: 'five_hour' })!.resetAt).toBeNull();
+  });
+
   it('reports genuine credit exhaustion as a billing problem', () => {
     const byErrorCode = classifyRateLimitEvent({ status: 'rejected', errorCode: 'credits_required' });
     expect(byErrorCode!.classification).toBe('quota');
