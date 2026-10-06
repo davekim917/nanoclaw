@@ -47,6 +47,7 @@ vi.mock('node:child_process', () => childProcessTripwire(spawns));
 
 import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
 import type { InstallContainerScope } from './container-runtime.js';
+import { log } from './log.js';
 import { runBootMountQuiescence, runWorkgroupMemoryStartupGate } from './main.js';
 import {
   reconcileWorkgroupMemory,
@@ -380,15 +381,23 @@ describe('boot mount-change ordering', () => {
       },
     };
 
-    await runBootMountQuiescence(db, {
-      ...deps,
-      reconcileShared: (_database, dirs) => {
-        if ((dirs.quiescedWorkgroupIds ?? []).length === 0 && dirs.workgroupIds?.length) {
-          throw new Error('EACCES: permission denied, symlink');
-        }
-      },
-    });
-    expect(fatals).toEqual([]);
+    const errors = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+    try {
+      await runBootMountQuiescence(db, {
+        ...deps,
+        reconcileShared: (_database, dirs) => {
+          if ((dirs.quiescedWorkgroupIds ?? []).length === 0 && dirs.workgroupIds?.length) {
+            throw new Error('EACCES: permission denied, symlink');
+          }
+        },
+      });
+      expect(fatals).toEqual([]);
+      expect(
+        errors.mock.calls.map(([message, fields]) => [message, (fields as { workgroupIds: string[] }).workgroupIds]),
+      ).toEqual([['Workgroup shared-FS link housekeeping failed under live containers; retried next boot', ['wgx']]]);
+    } finally {
+      errors.mockRestore();
+    }
 
     fs.mkdirSync(path.join(groupsDir, 'wgx', 'dbt', '.git'), { recursive: true });
     await expect(

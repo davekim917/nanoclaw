@@ -378,7 +378,6 @@ export function workgroupMemoryPendingChange(
   return null;
 }
 
-/** Would `reconcileWorkgroupMemory` change anything for this workgroup? */
 export function workgroupMemoryReconcileWouldChange(
   db: RawStatements,
   workgroupId: string,
@@ -795,6 +794,18 @@ function migrateWorkgroup(
     });
   }
   if (mutations.length === 0) return report; // settled — re-run is a true no-op
+  log.info('reconcileWorkgroupSharedDirs: migrated', {
+    workgroupId,
+    strategy,
+    quiesced,
+    mutations: mutations.map(describeMutation),
+    shared: moved.length,
+    leftInBedroom: candidates.length,
+  });
+  // Under live containers the only writes above were refusing `symlink(2)` creations. The marker and the
+  // migration log are plain file writes an agent can redirect (a `.migrated` swapped for a symlink is followed
+  // and its target truncated), so they wait for a quiesced run; a created link needs no marker to persist.
+  if (!quiesced) return report;
 
   const marker: MigrationReport = {
     migratedAt: priorReport?.migratedAt ?? new Date().toISOString(),
@@ -811,13 +822,6 @@ function migrateWorkgroup(
   } catch {
     /* report log is best-effort */
   }
-  log.info('reconcileWorkgroupSharedDirs: migrated', {
-    workgroupId,
-    strategy,
-    mutations: mutations.map(describeMutation),
-    shared: moved.length,
-    leftInBedroom: candidates.length,
-  });
   return report;
 }
 

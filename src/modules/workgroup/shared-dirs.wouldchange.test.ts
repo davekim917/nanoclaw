@@ -636,6 +636,58 @@ describe('sharedDirsPendingChange', () => {
     db.close();
   });
 
+  it('a live reconcile writes nothing but the links it creates', () => {
+    // The marker and the migration log are plain file writes; an agent holding
+    // the shared mount could redirect them, so they wait for a quiesced run.
+    const base = makeTree('live-writes-links-only', ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    });
+    const groupsDir = path.join(base, 'groups');
+    const dataDir = path.join(base, 'data');
+    const markerPath = path.join(dataDir, 'workgroups', 'wgx', '.migrated');
+    fs.writeFileSync(markerPath, '{"migratedAt":"2020-01-01T00:00:00.000Z"}\n');
+    const pinned = new Date('2020-01-01T00:00:00Z');
+    fs.utimesSync(markerPath, pinned, pinned);
+    const db = makeSharedDb();
+    const before = hashTree(base);
+
+    const [live] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir, quiescedWorkgroupIds: [] });
+
+    expect(live.mutations.map(describeMutation)).toEqual(['compat-link:scratch', 'sibling-link:wgx-codex/scratch']);
+    fs.unlinkSync(path.join(groupsDir, 'wgx', 'scratch'));
+    fs.unlinkSync(path.join(groupsDir, 'wgx-codex', 'scratch'));
+    expect(hashTree(base)).toBe(before);
+    expect(fs.statSync(markerPath).mtimeMs).toBe(pinned.getTime());
+    db.close();
+  });
+
+  it('a live creation that fails leaves the link pending for the next boot', () => {
+    const base = makeTree('live-eacces', ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    });
+    const groupsDir = path.join(base, 'groups');
+    const dataDir = path.join(base, 'data');
+    const db = makeSharedDb();
+    const spy = vi.spyOn(fs, 'symlinkSync').mockImplementation(() => {
+      throw Object.assign(new Error('EACCES: permission denied, symlink'), { code: 'EACCES' });
+    });
+    try {
+      expect(() => reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir, quiescedWorkgroupIds: [] })).toThrow(
+        'EACCES',
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    expect(sharedDirsPendingChange(db, 'wgx', { groupsDir, dataDir })).toEqual({
+      kind: 'compat-link',
+      name: 'scratch',
+      invalidatesMounts: false,
+    });
+    db.close();
+  });
+
   it('a name an agent takes between the lstat and the write is left to its owner', () => {
     // Under live containers the only link write is a creation, and `symlink(2)`
     // is what refuses: the agent's bytes survive and the boot does not fail.

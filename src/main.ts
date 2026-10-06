@@ -420,8 +420,8 @@ export async function runBootMountQuiescence(
 
   // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed for the changed set, the
   // only one proven stopped and so the only one that may take mount-invalidating writes. The link-creation set is
-  // reconciled under live containers, whose agents can make any write fail (EACCES, a `.migrated` turned into a
-  // directory); that is housekeeping the next boot retries, not a reason to take the fleet down.
+  // reconciled under live containers, whose agents can make a creation fail (EACCES); the link is then still
+  // pending, so the next boot retries it — not a reason to take the fleet down.
   if (sharedFsEnabled) {
     try {
       (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, {
