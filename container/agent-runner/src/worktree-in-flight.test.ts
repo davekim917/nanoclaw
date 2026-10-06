@@ -136,6 +136,74 @@ describe('worktree in-flight record', () => {
     expect(record.checkouts).toEqual([]);
   });
 
+  it('counts a commit made on another branch before switching back', async () => {
+    const { record } = await inFlightAfter((c) => {
+      git(c, ['checkout', '-q', '-b', 'feat/side']);
+      fs.writeFileSync(path.join(c, 'a.ts'), 'side work\n');
+      git(c, ['commit', '-q', '-am', 'side work']);
+      git(c, ['checkout', '-q', 'feat/x']);
+    });
+    expect(record.checkouts).toHaveLength(1);
+    expect(record.checkouts[0]).toMatchObject({ branch: 'feat/x', unpushed: 1, file_count: 0 });
+  });
+
+  it('counts a staged mode change on a file that was already staged and dirty', async () => {
+    const { record } = await inFlightAfter(
+      // --cacheinfo changes only the staged mode; `update-index --chmod` would also restage the worktree content.
+      (c) => git(c, ['update-index', '--cacheinfo', `100755,${git(c, ['rev-parse', ':a.ts'])},a.ts`]),
+      (c) => {
+        fs.writeFileSync(path.join(c, 'a.ts'), 'staged\n');
+        git(c, ['add', 'a.ts']);
+        fs.writeFileSync(path.join(c, 'a.ts'), 'staged then edited\n');
+      },
+    );
+    expect(record.checkouts.map((c) => c.files)).toEqual([['a.ts']]);
+  });
+
+  it('records an unusual path in a form the host accepts', async () => {
+    const long = `${'d'.repeat(160)}/${'e'.repeat(160)}/f.ts`;
+    const { record } = await inFlightAfter((c) => {
+      fs.mkdirSync(path.dirname(path.join(c, long)), { recursive: true });
+      fs.writeFileSync(path.join(c, long), 'x\n');
+      fs.writeFileSync(path.join(c, 'line\nbreak.ts'), 'x\n');
+    });
+    const files = record.checkouts[0].files;
+    expect(files).toHaveLength(2);
+    for (const file of files) {
+      expect(file.length).toBeLessThanOrEqual(200);
+      expect(file).not.toMatch(/[\r\n]/);
+    }
+  });
+
+  it('counts work on an unborn branch', async () => {
+    const checkout = path.join(worktrees, 'app@unborn');
+    fs.mkdirSync(checkout);
+    git(checkout, ['init', '-q']);
+    const baseline = await snapshotWorktrees(worktrees);
+    fs.writeFileSync(path.join(checkout, 'first.ts'), 'x\n');
+    const record = await computeWorktreeInFlight(baseline!);
+    expect(record.checkouts.map((c) => [c.name, c.files, c.unpushed])).toEqual([['app@unborn', ['first.ts'], 0]]);
+  });
+
+  it('never attributes a checkout that was beyond the startup cap', async () => {
+    const template = makeCheckout('a00');
+    fs.writeFileSync(path.join(template, 'a.ts'), 'old dirt\n');
+    for (let i = 1; i <= 32; i++) {
+      fs.cpSync(template, path.join(worktrees, `a${String(i).padStart(2, '0')}`), { recursive: true });
+    }
+    const logs: string[] = [];
+    const baseline = await snapshotWorktrees(worktrees, { log: (m) => logs.push(m) });
+    expect(baseline!.truncated).toBe(true);
+    expect(baseline!.checkouts.has('a32')).toBe(false);
+    expect(logs.filter((m) => m.includes('more than 32 checkouts'))).toHaveLength(1);
+    // Removing an earlier checkout brings the uninventoried one into the listing.
+    fs.rmSync(path.join(worktrees, 'a00'), { recursive: true, force: true });
+
+    const record = await computeWorktreeInFlight(baseline!);
+
+    expect(record.checkouts).toEqual([]);
+  });
+
   it('counts everything in a checkout created after startup', async () => {
     const baseline = await snapshotWorktrees(worktrees);
     const checkout = makeCheckout('app@later');
@@ -171,12 +239,34 @@ describe('worktree in-flight record', () => {
     expect(record.checkouts[0].file_count).toBe(25);
   });
 
-  it('stops at the time budget and reports nothing it did not read', async () => {
+  it('voids the whole result when the time budget runs out', async () => {
     const checkout = makeCheckout();
     const baseline = await snapshotWorktrees(worktrees);
     fs.writeFileSync(path.join(checkout, 'a.ts'), 'edited\n');
-    const record = await computeWorktreeInFlight(baseline!, { budgetMs: 0 });
-    expect(record.checkouts).toEqual([]);
+    await expect(computeWorktreeInFlight(baseline!, { budgetMs: 0 })).rejects.toThrow('budget exhausted');
+  });
+
+  it('clears the record, with no partial evidence, when a slow stat exhausts the budget', async () => {
+    const checkout = makeCheckout();
+    const baseline = await snapshotWorktrees(worktrees);
+    for (let i = 0; i < 5; i++) fs.writeFileSync(path.join(checkout, `f${i}.ts`), 'new\n');
+    setWorktreeInFlight({ at: new Date().toISOString(), checkouts: [] });
+    const slowStat = async (file: string): Promise<fs.Stats> => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return fs.promises.lstat(file);
+    };
+
+    const startedAt = Date.now();
+    await recordWorktreeInFlight(baseline, { budgetMs: 150, lstat: slowStat });
+
+    // Stopped after the first slow stat, not after all five.
+    expect(Date.now() - startedAt).toBeLessThan(600);
+    expect(getWorktreeInFlight()).toBeUndefined();
+  });
+
+  it('takes no baseline when the startup budget runs out', async () => {
+    makeCheckout();
+    expect(await snapshotWorktrees(worktrees, { budgetMs: 0 })).toBeNull();
   });
 
   it('writes the record to session_state at turn end, empty when nothing is in flight', async () => {
@@ -197,7 +287,10 @@ describe('worktree in-flight record', () => {
     const notADir = path.join(root, 'file');
     fs.writeFileSync(notADir, 'x');
 
-    await recordWorktreeInFlight({ root: notADir, checkouts: new Map() }, { log: (m) => logs.push(m) });
+    await recordWorktreeInFlight(
+      { root: notADir, checkouts: new Map(), truncated: false },
+      { log: (m) => logs.push(m) },
+    );
 
     expect(getWorktreeInFlight()).toBeUndefined();
     expect(logs.some((m) => m.startsWith('worktree in-flight record skipped'))).toBe(true);

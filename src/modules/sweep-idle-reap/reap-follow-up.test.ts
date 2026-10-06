@@ -11,7 +11,8 @@ import type { Session } from '../../types.js';
 
 const h = vi.hoisted(() => ({
   selfHeal: true,
-  spawnedAtMs: 0,
+  containerName: null as string | null,
+  adoptedAtMs: 0,
   ownsOutbound: false,
   kills: [] as string[],
 }));
@@ -30,7 +31,9 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../container-runner.js')>();
   return {
     ...real,
-    getContainerSpawnedAt: () => h.spawnedAtMs,
+    // What adoption leaves in the registry: the adoption instant, not the start (container-runner.ts adopt path).
+    getContainerSpawnedAt: () => h.adoptedAtMs,
+    containerIdentityFor: () => (h.containerName ? { containerName: h.containerName, claimIncarnation: 1 } : null),
     containerOwnsOutbound: () => h.ownsOutbound,
     isContainerRunning: () => false,
     getActiveContainerSessionIds: () => [],
@@ -42,7 +45,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
 });
 
 import { CHAT_IDLE_REAP_MS } from './index.js';
-import { _settleChatReapFollowUpsForTesting } from './reap-follow-up.js';
+import { _settleChatReapFollowUpsForTesting, containerStartedAtMs } from './reap-follow-up.js';
 import {
   _lastSweepTickStatsForTesting,
   _listSweepRegistrationsForTesting,
@@ -91,8 +94,9 @@ function ctx(s: Session): SweepSessionContext {
 
 const S13 = _listSweepRegistrationsForTesting().duties.find((d) => d.name === SWEEP_DUTY_INVENTORY.S13)!;
 
-async function reap(spawnedAtMs: number): Promise<void> {
-  h.spawnedAtMs = spawnedAtMs;
+/** `startedAtMs` 0 means the registry knows no container for the session. */
+async function reap(startedAtMs: number): Promise<void> {
+  h.containerName = startedAtMs > 0 ? `nanoclaw-v2-ag-folder-${startedAtMs}` : null;
   await S13.run(ctx(await session()));
   await _settleChatReapFollowUpsForTesting();
 }
@@ -159,6 +163,7 @@ beforeEach(async () => {
   resetAgentMailboxForTesting();
   registerAgentMailbox(() => store);
   h.selfHeal = true;
+  h.adoptedAtMs = 0;
   h.ownsOutbound = false;
   h.kills = [];
 });
@@ -250,6 +255,63 @@ describe('the registered chat idle reap (S13) queues an accountable respawn from
       expect(wakeRows()).toHaveLength(0);
     },
   );
+
+  it('a record over the size cap is never parsed and writes nothing', async () => {
+    const spawnedAt = Date.now() - HOUR;
+    outDb
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(
+        'worktree_in_flight',
+        JSON.stringify({ at: new Date().toISOString(), checkouts: [checkout()], pad: 'x'.repeat(70 * 1024) }),
+        new Date().toISOString(),
+      );
+    const parse = vi.spyOn(JSON, 'parse');
+    await reap(spawnedAt);
+    expect(parse.mock.calls.some(([text]) => typeof text === 'string' && text.includes('"pad"'))).toBe(false);
+    expect(wakeRows()).toHaveLength(0);
+  });
+
+  it.each([
+    ['a 100k-element array', Array.from({ length: 100_000 }, () => 0)],
+    ['a 40-element array under the size cap', Array.from({ length: 40 }, () => 0)],
+  ])('a record holding %s writes nothing', async (_label, big) => {
+    const spawnedAt = Date.now() - HOUR;
+    recordInFlight(spawnedAt + 1_000, [checkout({ files: big })]);
+    await reap(spawnedAt);
+    expect(wakeRows()).toHaveLength(0);
+  });
+
+  it('a bad path or a bad checkout entry costs only itself', async () => {
+    const spawnedAt = Date.now() - HOUR;
+    recordInFlight(spawnedAt + 1_000, [
+      checkout({ files: ['src/a.ts', 'x'.repeat(301), 'line\nbreak.ts'], file_count: 3 }),
+      checkout({ name: 'app\n- forged line' }),
+    ]);
+    await reap(spawnedAt);
+    const rows = wakeRows();
+    expect(rows).toHaveLength(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content._system.checkouts).toEqual(['app@feat-x']);
+    expect(content.text).toContain('3 uncommitted file(s): src/a.ts (+2 more)');
+    expect(content.text).not.toContain('forged line');
+  });
+
+  it('a container that survived a host restart is attributed by its start, not its adoption', async () => {
+    const startedAt = Date.now() - 2 * HOUR;
+    recordInFlight(startedAt + 60_000);
+    h.adoptedAtMs = Date.now() - HOUR;
+
+    await reap(startedAt);
+
+    expect(wakeRows().map((r) => r.id)).toEqual([`reap-respawn-${startedAt}`]);
+  });
+
+  it('reads the start instant from the container name', () => {
+    expect(containerStartedAtMs('nanoclaw-v2-team-2-1791245192375')).toBe(1791245192375);
+    expect(containerStartedAtMs('nanoclaw-v2-ag')).toBeNull();
+    expect(containerStartedAtMs('other-1791245192375')).toBeNull();
+    expect(containerStartedAtMs(null)).toBeNull();
+  });
 
   it('an untracked container (no spawn instant) writes nothing', async () => {
     recordInFlight(Date.now());

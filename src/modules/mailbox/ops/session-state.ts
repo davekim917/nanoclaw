@@ -93,6 +93,8 @@ export interface WorktreeInFlight {
 const MAX_RECORDED_CHECKOUTS = 32;
 const MAX_RECORDED_FILES = 20;
 const MAX_RECORDED_CHARS = 300;
+/** A maximal valid record is about 25 KiB; anything larger is malformed and is never read into memory. */
+const MAX_RECORD_BYTES = 64 * 1024;
 
 /** A single line of at most MAX_RECORDED_CHARS: these strings are spliced into a note, one checkout per line. */
 function recordedText(value: unknown): string | null {
@@ -113,8 +115,11 @@ function parseInFlightCheckout(value: unknown): WorktreeInFlightCheckout | null 
   const fileCount = recordedCount(raw.file_count);
   const unpushed = recordedCount(raw.unpushed);
   if (name === null || fileCount === null || unpushed === null || !Array.isArray(raw.files)) return null;
-  const files = raw.files.slice(0, MAX_RECORDED_FILES).map(recordedText);
-  if (files.some((file) => file === null)) return null;
+  // One bad path costs only itself; the count still says how many there were.
+  const files = raw.files
+    .slice(0, MAX_RECORDED_FILES)
+    .map(recordedText)
+    .filter((file): file is string => file !== null);
   const optional = (field: unknown): string | null | undefined =>
     field === null ? null : (recordedText(field) ?? undefined);
   const branch = optional(raw.branch);
@@ -126,29 +131,39 @@ function parseInFlightCheckout(value: unknown): WorktreeInFlightCheckout | null 
     branch,
     upstream,
     upstream_head: upstreamHead,
-    files: files as string[],
+    files,
     file_count: Math.max(fileCount, files.length),
     unpushed,
   };
 }
 
-/** Anything malformed is absent: the record can only ever trigger a wake, so an unreadable one triggers none. */
+/**
+ * Anything malformed is absent: the record can only ever trigger a wake, so an unreadable one triggers none. A bad
+ * checkout entry drops only that entry. The value is agent-written, so its size is bounded in SQL, before it is read.
+ */
 export function readWorktreeInFlight(outbound: Database.Database): WorktreeInFlight | null {
-  const row = outbound.prepare("SELECT value FROM session_state WHERE key = 'worktree_in_flight'").get() as
-    | { value: string }
-    | undefined;
-  if (!row) return null;
+  const row = outbound
+    .prepare(
+      `SELECT CASE WHEN length(CAST(value AS BLOB)) <= ? THEN value END AS value
+         FROM session_state WHERE key = 'worktree_in_flight'`,
+    )
+    .get(MAX_RECORD_BYTES) as { value: string | null } | undefined;
+  if (!row || row.value === null) return null;
   let parsed: { at?: unknown; checkouts?: unknown } | null;
   try {
-    parsed = JSON.parse(row.value) as { at?: unknown; checkouts?: unknown } | null;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- the only throw here is a JSON syntax error: malformed is absent
+    parsed = JSON.parse(row.value, (_key, value: unknown) => {
+      if (Array.isArray(value) && value.length > MAX_RECORDED_CHECKOUTS) throw new Error('oversized array');
+      return value;
+    }) as { at?: unknown; checkouts?: unknown } | null;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a syntax error or an oversized array: malformed is absent
   } catch {
     return null;
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
   if (typeof parsed.at !== 'string' || Number.isNaN(Date.parse(parsed.at))) return null;
-  if (!Array.isArray(parsed.checkouts) || parsed.checkouts.length > MAX_RECORDED_CHECKOUTS) return null;
-  const checkouts = parsed.checkouts.map(parseInFlightCheckout);
-  if (checkouts.some((checkout) => checkout === null)) return null;
-  return { at: parsed.at, checkouts: checkouts as WorktreeInFlightCheckout[] };
+  if (!Array.isArray(parsed.checkouts)) return null;
+  const checkouts = parsed.checkouts
+    .map(parseInFlightCheckout)
+    .filter((checkout): checkout is WorktreeInFlightCheckout => checkout !== null);
+  return { at: parsed.at, checkouts };
 }
