@@ -13,11 +13,13 @@ LOG="logs/deploy.log"
 POST_PULL="${NANOCLAW_DEPLOY_POST_PULL:-0}"
 
 # One deploy at a time. The lock rides on fd 9 so the post-pull re-exec of this
-# script (same process) inherits it; a re-exec that arrives without fd 9 (the
-# deploy that pulled this script) takes it here instead.
+# script (same process) inherits it. Only an fd 9 that is this lock file counts
+# as inherited: a re-exec from the old lock-less script, or a launcher that
+# happens to hold some other fd 9, takes the lock here.
+mkdir -p logs
 DEPLOY_LOCK="logs/deploy.lock"
-if ! { true >&9; } 2>/dev/null; then
-  mkdir -p logs
+: >> "$DEPLOY_LOCK"
+if [ "$(readlink /proc/self/fd/9 2>/dev/null)" != "$(realpath "$DEPLOY_LOCK")" ]; then
   exec 9>>"$DEPLOY_LOCK"
   if ! flock -n 9; then
     echo "deploy.sh: another deploy appears to be running (lock file names pid $(cat "$DEPLOY_LOCK" 2>/dev/null || echo unknown)); not starting a second one" >&2

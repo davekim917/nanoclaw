@@ -14,10 +14,16 @@ describe('deploy rollback shell contract', () => {
     expect(script).toContain('if ! flock -n 9; then');
     expect(script).toContain('exit 3');
     const lockAt = script.indexOf('flock -n 9');
-    expect(script.indexOf('if ! { true >&9; } 2>/dev/null; then')).toBeLessThan(lockAt);
-    expect(lockAt).toBeLessThan(script.indexOf('git pull'));
-    expect(lockAt).toBeLessThan(script.indexOf('NANOCLAW_DEPLOY_POST_PULL=1'));
-    expect(script).not.toMatch(/9[<>]&-/);
+    const probeAt = script.indexOf('readlink /proc/self/fd/9');
+    const pullAt = script.indexOf('git pull');
+    const reexecAt = script.indexOf('NANOCLAW_DEPLOY_POST_PULL=1');
+    for (const at of [lockAt, probeAt, pullAt, reexecAt]) expect(at).toBeGreaterThan(-1);
+    expect(probeAt).toBeLessThan(lockAt);
+    expect(lockAt).toBeLessThan(pullAt);
+    expect(lockAt).toBeLessThan(reexecAt);
+    // fd 9 is opened once, on the lock file, and never closed or redirected elsewhere.
+    expect(script.match(/\b9[<>]/g)).toEqual(['9>']);
+    expect(script).toContain('exec 9>>"$DEPLOY_LOCK"');
   });
 
   it('snapshots before a fast-forward pull and re-execs the pulled script', () => {
