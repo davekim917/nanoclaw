@@ -129,7 +129,36 @@ BUILD_ARGS+=(--build-arg "NANOCLAW_IMAGE_INSTALL=$(_nanoclaw_install_slug)")
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_REF} (commit ${NANOCLAW_COMMIT}, agent-runner-deps ${AGENT_RUNNER_DEPS_HASH})"
 
-${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_REF}" .
+# Docker Hub returns the occasional 5xx on a manifest request and BuildKit gives up on the first. Three attempts,
+# ten seconds apart, only when the failure reads as a registry status error (a 429 or 5xx after "unexpected
+# status"); anything else fails once with docker's own exit code. Output streams through tee onto stderr, where
+# BuildKit already writes it. No pipefail here, so docker's status comes from PIPESTATUS.
+BUILD_ATTEMPTS=3
+BUILD_RETRY_WAIT=10
+BUILD_LOG=""
+trap 'rm -f "$BUILD_LOG"' EXIT
+build_image() {
+    local attempt=1 status
+    BUILD_LOG="$(mktemp)"
+    while :; do
+        "${CONTAINER_RUNTIME}" build "$@" 2>&1 | tee "$BUILD_LOG" >&2
+        status=${PIPESTATUS[0]}
+        if [ "$status" -eq 0 ]; then
+            return 0
+        fi
+        if [ "$attempt" -ge "$BUILD_ATTEMPTS" ] \
+            || ! grep -qE 'unexpected status.*: (429|5[0-9][0-9])( |$)' "$BUILD_LOG"; then
+            return "$status"
+        fi
+        echo "" >&2
+        echo "The registry answered with a transient error (attempt ${attempt}/${BUILD_ATTEMPTS})." >&2
+        echo "Retrying in ${BUILD_RETRY_WAIT}s..." >&2
+        sleep "$BUILD_RETRY_WAIT"
+        attempt=$((attempt + 1))
+    done
+}
+
+build_image "${BUILD_ARGS[@]}" -t "${IMAGE_REF}" .
 
 echo ""
 echo "Build complete!"

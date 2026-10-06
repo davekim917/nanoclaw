@@ -166,7 +166,7 @@ jobs:
       # layers (this restore, --setting-sources user, --strict-mcp-config) that
       # keep whatever lands in this checkout inert to the model.
       - name: Checkout the merge commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 1
