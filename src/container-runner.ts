@@ -163,7 +163,7 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
-import { buildContainerCodexConfig } from './providers/codex.js';
+import { buildContainerCodexConfig, CODEX_CHANNEL_DEFAULT_ENV } from './providers/codex.js';
 import { OPENCODE_XDG_CONTAINER_PATH, OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -4785,8 +4785,8 @@ async function buildContainerArgs(
     // mutating the mounted file.
     const codexModel = activeChannelModel ?? containerConfig.model ?? containerConfig.defaultModel;
     const codexEffort = activeChannelEffort ?? containerConfig.effort ?? containerConfig.defaultEffort;
-    if (codexModel) args.push('-e', `NANOCLAW_CODEX_MODEL_OVERRIDE=${codexModel}`);
-    if (codexEffort) args.push('-e', `NANOCLAW_CODEX_EFFORT_OVERRIDE=${codexEffort}`);
+    if (codexModel) args.push('-e', `${CODEX_CHANNEL_DEFAULT_ENV.model}=${codexModel}`);
+    if (codexEffort) args.push('-e', `${CODEX_CHANNEL_DEFAULT_ENV.effort}=${codexEffort}`);
   } else {
     // claudeSpawnEnv resolves family and short aliases and adds the Opus 1M suffix (a bare `claude-opus-*` would
     // collapse the auto-compact window to 200k). The chat ack uses the same function. NANOCLAW_EFFORT_OVERRIDE is

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import type { ContainerConfig } from '../container-config.js';
 import { replaceUntrustedFile } from '../fs-safety.js';
+import { CODEX_CHANNEL_DEFAULT_ENV } from '../providers/codex.js';
 import type { VolumeMount, ProviderContainerContribution } from '../providers/provider-container-registry.js';
 
 export function privateWikiRuntime(root: string, config: ContainerConfig): VolumeMount[] {
@@ -78,8 +79,8 @@ export function wikiRuntimeEnvironment(
     CLAUDE_CODE_OAUTH_SCOPES: 'user:inference',
   };
   if (provider === 'codex') {
-    if (model) env.NANOCLAW_CODEX_MODEL_OVERRIDE = model;
-    if (effort) env.NANOCLAW_CODEX_EFFORT_OVERRIDE = effort;
+    if (model) env[CODEX_CHANNEL_DEFAULT_ENV.model] = model;
+    if (effort) env[CODEX_CHANNEL_DEFAULT_ENV.effort] = effort;
   }
   return env;
 }
