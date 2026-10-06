@@ -1,21 +1,53 @@
 diff --git a/dist/index.js b/dist/index.js
-index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..bc2ef29f37598c11af4b265dd846a96c169c16c7 100644
+index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..2916710f7cce7b414eecac39454b1b86c4b40fec 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -738,8 +738,14 @@ function findCodeEnd(text, index, end) {
+@@ -738,20 +738,41 @@ function findCodeEnd(text, index, end) {
    if (text[index] !== "`") {
      return index;
    }
 -  const fence = text.startsWith("```", index);
 -  const marker = fence ? "```" : "`";
-+  // A code span opens with a run of N backticks and closes with a run of the same
-+  // length (CommonMark 6.1), so ``npm i @scope/pkg`` is one span, not two empty ones.
+-  const start = index + marker.length;
+-  const close = text.indexOf(marker, start);
+-  if (close === -1 || close >= end) {
++  // A code span opens with a run of N backticks and closes with the next run of exactly N
++  // (CommonMark 6.1): ``npm i @scope/pkg`` is one span, and a longer run inside it does not
++  // close it. Only a single-backtick span is kept to one line, as upstream had it.
 +  let runLength = 1;
 +  while (text[index + runLength] === "`") {
 +    runLength += 1;
 +  }
-+  const fence = runLength >= 3;
-+  const marker = "`".repeat(runLength);
-   const start = index + marker.length;
-   const close = text.indexOf(marker, start);
-   if (close === -1 || close >= end) {
++  const start = index + runLength;
++  let close = -1;
++  let cursor = start;
++  while (cursor < end) {
++    const run = text.indexOf("`", cursor);
++    if (run === -1 || run >= end) {
++      break;
++    }
++    let length = 1;
++    while (text[run + length] === "`") {
++      length += 1;
++    }
++    if (length === runLength) {
++      close = run;
++      break;
++    }
++    cursor = run + length;
++  }
++  if (close === -1) {
+     return index;
+   }
+-  if (!fence) {
++  if (runLength === 1) {
+     const newline = text.indexOf("\n", start);
+     if (newline !== -1 && newline < close) {
+       return index;
+     }
+   }
+-  return close + marker.length;
++  return close + runLength;
+ }
+ function replaceRange(text, start, end, replacer, angles) {
+   let result = "";

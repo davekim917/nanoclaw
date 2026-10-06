@@ -874,7 +874,7 @@ describe('installMessageThreadAutoCreate', () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(new Response('{"message": "Unknown Channel", "code": 10003}', { status: 404 }))
-      // Since 4.39 the adapter resolves the thread's parent channel (GET /channels/<thread>) before every post.
+      // Since 4.39 the adapter resolves an unseen thread's parent channel (GET /channels/<thread>) before posting to it.
       .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'msg1', parent_id: 'chan1' }), { status: 200 }))
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ id: 'reply-1', channel_id: 'msg1', content: 'x', author: { id: 'b' } }), {

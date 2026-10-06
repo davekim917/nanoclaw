@@ -1,7 +1,7 @@
 /**
  * Pins the behaviour patches/@chat-adapter__shared@4.41.1.patch exists for: the adapters'
- * bare-@mention rewrite must leave every code span alone, including ``double-backtick``
- * spans, which upstream's scanner reads as two empty single-backtick spans.
+ * bare-@mention rewrite must leave every code span alone: a span opens with a run of N backticks
+ * and closes on the next run of exactly N, which upstream's scanner gets wrong for N >= 2.
  */
 import { DiscordFormatConverter } from '@chat-adapter/discord';
 import { SlackFormatConverter } from '@chat-adapter/slack';
@@ -18,6 +18,10 @@ const CASES: ReadonlyArray<[input: string, expected: string]> = [
   ['run ``npm i @scope/pkg`` then ping @bob', 'run ``npm i @scope/pkg`` then ping <@bob>'],
   ['`@inline` and ```\n@fenced\n``` but @carol', '`@inline` and ```\n@fenced\n``` but <@carol>'],
   ['already <@U123> stays', 'already <@U123> stays'],
+  ['``@first\n@second`` then @bob', '``@first\n@second`` then <@bob>'],
+  ['``a``` x` @inside`` then @bob', '``a``` x` @inside`` then <@bob>'],
+  ['````\n@four ``` still code\n```` then @bob', '````\n@four ``` still code\n```` then <@bob>'],
+  ['unclosed ``x so @bob is rewritten', 'unclosed ``x so <@bob> is rewritten'],
 ];
 
 describe('@chat-adapter mention rewrite leaves code spans alone', () => {
