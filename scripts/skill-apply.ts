@@ -616,7 +616,6 @@ function bindCapture(
   }
 }
 
-/** A captured value that contains a resolved secret is itself a secret. */
 function derivedFromSecret(vars: Map<string, { value: string; secret: boolean }>, value: string): boolean {
   return [...vars.values()].some((v) => v.secret && v.value !== '' && value.includes(v.value));
 }
@@ -936,7 +935,7 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
         // programmatic caller can relay/output them. {{vars}} render so a
         // resolved value can be shown (throws → deferred if a referenced var is
         // unset — the whole block defers before any event fires).
-        const text = substitute(d.body.join('\n'), vars);
+        const text = redact(substitute(d.body.join('\n'), vars));
         res.operatorMessages.push(text);
         // The core seam: emit the rendered block and AWAIT the consumer before
         // evaluating the next directive — that ordering is what lets a consumer

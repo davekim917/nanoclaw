@@ -1409,6 +1409,20 @@ describe('onEvent (core event seam)', () => {
     expect(res.operatorMessages).toEqual(['Hello world — go click the button.']); // still collected in the result
   });
 
+  it('never renders a resolved secret into an operator message or event', async () => {
+    const md =
+      '# op\n\n```nc:prompt token secret\nToken?\n```\nTell the user:\n```nc:operator\nYour token is {{token}}; keep it safe.\n```\n';
+    writeFileSync(join(eskill, 'SKILL.md'), md);
+    const events: ApplyEvent[] = [];
+    const res = await applySkill(eskill, eroot, {
+      inputs: { token: 'operator-secret-never-shown' },
+      exec: () => {},
+      onEvent: (e) => void events.push(e),
+    });
+    expect(res.operatorMessages).toEqual(['Your token is [REDACTED]; keep it safe.']);
+    expect(JSON.stringify(events)).not.toContain('operator-secret-never-shown');
+  });
+
   it('awaits each onEvent before evaluating the next directive (async handler ordering)', async () => {
     writeFileSync(
       join(eskill, 'SKILL.md'),
