@@ -1,7 +1,9 @@
-import { describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
+import { discoverPortableSkills, type AgentRuntime } from '../plugin-skill-discovery.js';
 import { declaredContractNames, providerContract } from './contract.js';
 import './index.js';
 import './mock.js';
@@ -44,5 +46,50 @@ describe('provider contracts', () => {
     };
     walk(root);
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('skill delivery follows the contract', () => {
+  let root: string;
+
+  function writeSkill(dir: string, name: string, invocable: boolean): void {
+    fs.mkdirSync(dir, { recursive: true });
+    const flag = invocable ? '' : 'user-invocable: false\n';
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n${flag}---\n\nbody\n`);
+  }
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'contract-skills-'));
+    // `native`: a Claude manifest plus the Codex manifest that marks the plugin as loaded natively by Codex.
+    fs.mkdirSync(path.join(root, 'native', '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'native', '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'native' }));
+    fs.mkdirSync(path.join(root, 'native', '.codex-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'native', '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'native' }));
+    writeSkill(path.join(root, 'native', 'skills', 'visible'), 'visible', true);
+    writeSkill(path.join(root, 'native', 'skills', 'helper'), 'helper', false);
+    // `plain`: no Codex manifest, so every runtime mirrors it.
+    fs.mkdirSync(path.join(root, 'plain', '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'plain', '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'plain' }));
+    writeSkill(path.join(root, 'plain', 'skills', 'shared'), 'shared', true);
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const names = (runtime: AgentRuntime): string[] =>
+    discoverPortableSkills(root, { runtime })
+      .map((s) => s.name)
+      .sort();
+
+  it('a runtime that loads plugins natively skips them in the mirror', () => {
+    expect(providerContract('codex').skills.nativePluginLoading).toBe(true);
+    expect(names('codex')).toEqual(['shared']);
+    expect(names('claude')).toEqual(['shared', 'visible']);
+  });
+
+  it('only a runtime whose mirror is its sole delivery gets non-invocable helpers', () => {
+    expect(providerContract('opencode').skills.mirrorIsSoleDelivery).toBe(true);
+    expect(names('opencode')).toEqual(['helper', 'shared', 'visible']);
+    expect(names('claude')).not.toContain('helper');
   });
 });
