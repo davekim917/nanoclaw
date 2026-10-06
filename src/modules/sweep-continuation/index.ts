@@ -440,7 +440,7 @@ function registerContinuationSweepDuties(): void {
     order: 70,
     run: (ctx) => {
       const { session, mailbox, plan } = asSessionContext(ctx);
-      if (plan.workContinuation && plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) {
+      if (plan.workContinuation && !canAttemptContinuationRecovery(plan.workContinuation)) {
         const continuation = plan.workContinuation;
         writeOutboundWhenStopped(session, mailbox!, () => {
           const parked = mailbox!.parkDueRecoveryWakes(new Date().toISOString());

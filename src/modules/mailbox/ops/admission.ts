@@ -6,6 +6,7 @@
 import type Database from 'better-sqlite3';
 
 import { nextEvenSeq, type MessageInsert } from './ingress.js';
+import { DUE_NOW } from './sweep.js';
 
 export interface DueAdmissionRow {
   id: string;
@@ -66,10 +67,8 @@ export function demoteUnpairedLegacyTasks(db: Database.Database): void {
   ).run();
 }
 
-/** Shared by the select and the in-transaction re-check. */
-const DUE_PREDICATE = `status = 'pending'
-          AND trigger = 0
-          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+/** A `trigger = 0` row admission turns into a turn once it is due; any other one stays context for good. */
+export const ADMISSIBLE = `trigger = 0
           AND (
             kind = 'task'
             OR EXISTS (
@@ -81,12 +80,16 @@ const DUE_PREDICATE = `status = 'pending'
             )
           )`;
 
+/** Shared by the select and the in-transaction re-check. */
+const DUE_PREDICATE = `status = 'pending'
+          AND ${DUE_NOW}
+          AND ${ADMISSIBLE}`;
+
 /**
  * Matches a deferred wait (trigger=0) or an admitted due turn (trigger=1). A
- * recall marker alone does not: its trigger has already ended. A caller asking
- * whether anything ELSE is queued passes its own row-id prefix to leave out.
+ * recall marker alone does not: its trigger has already ended.
  */
-export function hasPendingRecallPairedTrigger(db: Database.Database, exceptIdPrefix = ''): boolean {
+export function hasPendingRecallPairedTrigger(db: Database.Database): boolean {
   return (
     db
       .prepare(
@@ -94,7 +97,6 @@ export function hasPendingRecallPairedTrigger(db: Database.Database, exceptIdPre
            FROM messages_in AS pending_turn
           WHERE pending_turn.status = 'pending'
             AND pending_turn.kind != 'system'
-            AND (@except = '' OR substr(pending_turn.id, 1, length(@except)) != @except)
             AND EXISTS (
               SELECT 1
                 FROM messages_in AS recall
@@ -104,7 +106,7 @@ export function hasPendingRecallPairedTrigger(db: Database.Database, exceptIdPre
             )
           LIMIT 1`,
       )
-      .get({ except: exceptIdPrefix }) !== undefined
+      .get() !== undefined
   );
 }
 

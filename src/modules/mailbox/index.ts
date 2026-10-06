@@ -204,11 +204,14 @@ import {
   outboundHasRecentContentLike,
   parkDueRecoveryWakes,
   readMessageRouting,
+  staleClaimFate,
   writeOutboundDirectRow,
   type DirectOutboundRow,
   type InboundMessageRouting,
   type OutboundChatRow,
+  type StaleClaimFate,
 } from './ops/recovery.js';
+import { listRunnableWakes, type RunnableWake } from './ops/runnable-wakes.js';
 
 export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
 export { isContinuationParked, type HostWorkContinuation } from './ops/continuation.js';
@@ -464,7 +467,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** The recall POLICY stays with session-manager; these commit its decision. */
   demoteUnpairedLegacyTasks(): void;
   /** A pending primary row still has the recall partner required for admission. */
-  hasPendingRecallPairedTrigger(exceptIdPrefix?: string): boolean;
+  hasPendingRecallPairedTrigger(): boolean;
   listDueAdmissionRows(): DueAdmissionRow[];
   admitDueRow(recall: MessageInsert, taskId: string): boolean;
   listUnpairedPendingUpgradeRows(): PendingUpgradeRow[];
@@ -516,6 +519,10 @@ export interface NanoclawMailboxSession extends MailboxSession {
   outboundHasContentLike(marker: string): boolean;
   outboundHasRecentContentLike(marker: string, withinSeconds: number): boolean;
   hasNonStatusReplyTo(messageId: string): boolean;
+  /** What the stale-claim cleanup will do with this claim (see the op). */
+  staleClaimFate(messageId: string): StaleClaimFate;
+  /** The rows this session will be woken for once the ack sync, claim cleanup and due admission have run (see the op). */
+  listRunnableWakes(): RunnableWake[];
   /** The fork's `MAX(seq) + 2` direct write; opens the writable outbound handle. */
   writeOutboundDirect(message: DirectOutboundRow): void;
 }
@@ -930,7 +937,7 @@ function forkOps(
     getCreatedTaskRow: (id) => getCreatedTaskRow(inbound, id),
 
     demoteUnpairedLegacyTasks: () => demoteUnpairedLegacyTasks(inbound),
-    hasPendingRecallPairedTrigger: (exceptIdPrefix) => hasPendingRecallPairedTrigger(inbound, exceptIdPrefix),
+    hasPendingRecallPairedTrigger: () => hasPendingRecallPairedTrigger(inbound),
     listDueAdmissionRows: () => listDueAdmissionRows(inbound),
     admitDueRow: (recall, taskId) => admitDueRow(inbound, recall, taskId),
     listUnpairedPendingUpgradeRows: () => listUnpairedPendingUpgradeRows(inbound),
@@ -975,5 +982,10 @@ function forkOps(
     outboundHasRecentContentLike: (marker, withinSeconds) =>
       readOutbound(false, (outbound) => outboundHasRecentContentLike(outbound, marker, withinSeconds)),
     hasNonStatusReplyTo: (messageId) => readOutbound(false, (outbound) => hasNonStatusReplyTo(outbound, messageId)),
+    staleClaimFate: (messageId) =>
+      readOutbound<StaleClaimFate>({ fate: 'orphan' }, (outbound) =>
+        staleClaimFate(inbound, outbound, messageId, Date.now()),
+      ),
+    listRunnableWakes: () => listRunnableWakes(inbound, outboundPresent ? readableOutbound() : null),
   };
 }

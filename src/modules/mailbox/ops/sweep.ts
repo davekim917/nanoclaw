@@ -27,19 +27,14 @@ export function getNextFutureProcessAfter(db: Database.Database): string | null 
   return row.next;
 }
 
+/** What every host due-ness reader keys on; the SQL half of "a wake would hand this row to a runner now". */
+export const DUE_NOW = `(process_after IS NULL OR datetime(process_after) <= datetime('now'))`;
+const DUE_TRIGGER = `status = 'pending' AND repo_fence_epoch IS NULL AND trigger = 1 AND ${DUE_NOW}`;
+
 export function countDueMessages(db: Database.Database): number {
   migrateMessagesInTable(db);
-  return (
-    db
-      .prepare(
-        `SELECT COUNT(*) as count FROM messages_in
-       WHERE status = 'pending'
-         AND repo_fence_epoch IS NULL
-         AND trigger = 1
-         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
-      )
-      .get() as { count: number }
-  ).count;
+  return (db.prepare(`SELECT COUNT(*) as count FROM messages_in WHERE ${DUE_TRIGGER}`).get() as { count: number })
+    .count;
 }
 
 /**
@@ -84,21 +79,33 @@ export function getDueWakePriority(db: Database.Database): 'interactive' | 'sche
  */
 export function expireStalePending(db: Database.Database, maxAgeMs: number): number {
   migrateMessagesInTable(db);
-  const cutoffIso = new Date(Date.now() - maxAgeMs).toISOString();
   const result = db
     .prepare(
       `UPDATE messages_in
        SET status = 'expired'
        WHERE status = 'pending'
          AND repo_fence_epoch IS NULL
-         AND recurrence IS NULL
-         AND (
-           (process_after IS NULL AND datetime(timestamp) < datetime(?))
-           OR (process_after IS NOT NULL AND datetime(process_after) < datetime(?))
-         )`,
+         AND ${STALE_PENDING}`,
     )
-    .run(cutoffIso, cutoffIso);
+    .run({ cutoff: stalePendingCutoff(maxAgeMs) });
   return result.changes;
+}
+
+// Pending inbound rows older than this are expired so crashed-spawn leftovers
+// stop waking sessions and squatting the concurrency cap every tick.
+const parsedMaxAgeHours = Number(process.env.PENDING_MESSAGE_MAX_AGE_HOURS);
+export const PENDING_MESSAGE_MAX_AGE_MS =
+  (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
+
+/** Binds `@cutoff`; see `expireStalePending` for why recurring rows are exempt. */
+export const STALE_PENDING = `recurrence IS NULL
+         AND (
+           (process_after IS NULL AND datetime(timestamp) < datetime(@cutoff))
+           OR (process_after IS NOT NULL AND datetime(process_after) < datetime(@cutoff))
+         )`;
+
+export function stalePendingCutoff(maxAgeMs: number = PENDING_MESSAGE_MAX_AGE_MS): string {
+  return new Date(Date.now() - maxAgeMs).toISOString();
 }
 
 /**
@@ -116,6 +123,15 @@ export function expireClosedSessionPending(db: Database.Database): number {
     .changes;
 }
 
+/** Acks that take their inbound row out of `pending` at the next sync. */
+export function readTerminalAcks(outDb: Database.Database): Array<{ message_id: string; status: string }> {
+  return outDb
+    .prepare(
+      "SELECT message_id, status FROM processing_ack WHERE status IN ('completed', 'failed', 'script-skip:error')",
+    )
+    .all() as Array<{ message_id: string; status: string }>;
+}
+
 /**
  * Fused (upstream splits it): maps the runner's two notions of "handled", a
  * terminal `processing_ack` and an answer in `messages_out`, onto
@@ -123,11 +139,7 @@ export function expireClosedSessionPending(db: Database.Database): number {
  * completed because they were already answered.
  */
 export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): string[] {
-  const completed = outDb
-    .prepare(
-      "SELECT message_id, status FROM processing_ack WHERE status IN ('completed', 'failed', 'script-skip:error')",
-    )
-    .all() as Array<{ message_id: string; status: string }>;
+  const completed = readTerminalAcks(outDb);
 
   if (completed.length > 0) {
     // `script-skip:error` lands as FAILED, so recurrence derives the failure
@@ -203,15 +215,15 @@ export const ANSWERED_LOOKUP_CHUNK = 500;
  * not resumed", never "ran successfully". Rows with any ack are left alone.
  */
 export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Database.Database): string[] {
+  const completeStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'");
+  return listAnsweredPendingRows(inDb, outDb).filter((id) => completeStmt.run(id).changes > 0);
+}
+
+/** The rows `completeAnsweredPendingRows` completes, without completing them. */
+export function listAnsweredPendingRows(inDb: Database.Database, outDb: Database.Database): string[] {
   migrateMessagesInTable(inDb);
   const due = inDb
-    .prepare(
-      `SELECT id, process_after AS processAfter FROM messages_in
-       WHERE status = 'pending'
-         AND repo_fence_epoch IS NULL
-         AND trigger = 1
-         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
-    )
+    .prepare(`SELECT id, process_after AS processAfter FROM messages_in WHERE ${DUE_TRIGGER}`)
     .all() as Array<{ id: string; processAfter: string | null }>;
   if (due.length === 0) return [];
 
@@ -233,16 +245,12 @@ export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Data
   }
   if (answeredAt.size === 0) return [];
 
-  const completeStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'");
-  const backfilled: string[] = [];
-  for (const { id, processAfter } of due) {
-    const ts = answeredAt.get(id);
-    if (ts === undefined) continue;
-    if (!answeredSinceDue(ts, processAfter)) continue;
-    if (hasProcessingAck(outDb, id)) continue;
-    if (completeStmt.run(id).changes > 0) backfilled.push(id);
-  }
-  return backfilled;
+  return due
+    .filter(({ id, processAfter }) => {
+      const ts = answeredAt.get(id);
+      return ts !== undefined && answeredSinceDue(ts, processAfter) && !hasProcessingAck(outDb, id);
+    })
+    .map(({ id }) => id);
 }
 
 interface OverdueRecurringRow {

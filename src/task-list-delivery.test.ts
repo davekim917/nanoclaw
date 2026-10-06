@@ -938,6 +938,19 @@ describe('the kill label says what is true of the session', () => {
     expect(subtext).not.toContain(formatLocalTime(nextCheck, 'America/Anchorage'));
   });
 
+  it('names the earliest of several later checks', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, current());
+    const sooner = new Date(Date.now() + 2 * HOUR).toISOString();
+    insertInbound(sessionId, { id: 'wait-later', processAfter: new Date(Date.now() + 5 * HOUR).toISOString() });
+    insertInbound(sessionId, { id: 'wait-sooner', processAfter: sooner });
+    insertInbound(sessionId, { id: 'wait-latest', processAfter: new Date(Date.now() + 9 * HOUR).toISOString() });
+    expect(await label(sessionId)).toBe(
+      `paused · next check ${formatLocalTime(sooner, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
+    );
+  });
+
   it('paused and resuming, when what is armed is already due', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
@@ -994,17 +1007,44 @@ describe('the kill label says what is true of the session', () => {
     expect(followUp).toEqual({ action: 'none', reason: 'capped' });
   });
 
+  function claim(sessionId: string, messageId: string): void {
+    const db = outbound(sessionId);
+    db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', ?)").run(
+      messageId,
+      now(),
+    );
+    db.close();
+  }
+
   it('paused and resuming for a batch the killed container had claimed and not finished', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
     writeListState(sessionId, current());
+    insertInbound(sessionId, { id: 'chat-1' });
+    claim(sessionId, 'chat-1');
+    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
+  });
+
+  it('stopped, when the only claim has no inbound row behind it: the cleanup drops it and nothing runs', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, current());
+    claim(sessionId, 'gone-1');
+    expect(await label(sessionId)).toBe(`stopped · ${DETAIL}`);
+  });
+
+  it('stopped, when the only due row was already acknowledged by the container that died', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, current());
+    insertInbound(sessionId, { id: 'chat-1' });
     const db = outbound(sessionId);
-    db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', ?)").run(
+    db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'completed', ?)").run(
       'chat-1',
       now(),
     );
     db.close();
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
+    expect(await label(sessionId)).toBe(`stopped · ${DETAIL}`);
   });
 
   it('a later wait beside something that brings the session back sooner reads as resuming, not as that later check', async () => {

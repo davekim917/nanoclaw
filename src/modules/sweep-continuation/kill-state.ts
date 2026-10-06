@@ -16,6 +16,8 @@ import {
   type HostWorkContinuation,
 } from '../mailbox/ops/continuation.js';
 import { isRecoveryWakeId } from '../mailbox/ops/recovery.js';
+import type { RunnableWake } from '../mailbox/ops/runnable-wakes.js';
+import { parseSqliteUtc, sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
 
 export const REAP_RESPAWN_ID_PREFIX = 'reap-respawn-';
 
@@ -51,28 +53,14 @@ export interface ArmedState {
   hasContinuation: boolean;
 }
 
-interface SessionWakes {
-  dueCount: number;
-  nextFutureProcessAfter: string | null;
-  continuation: HostWorkContinuation | null;
-}
-
-function readSessionWakes(
+export function readArmedState(
   mailbox: Pick<NanoclawMailboxSession, 'countDueMessages' | 'getNextFutureProcessAfter' | 'readWorkContinuation'>,
-): SessionWakes {
+): ArmedState {
   return {
     dueCount: mailbox.countDueMessages(),
     nextFutureProcessAfter: mailbox.getNextFutureProcessAfter(),
-    continuation: mailbox.readWorkContinuation(),
+    hasContinuation: mailbox.readWorkContinuation() !== null,
   };
-}
-
-function armedState({ continuation, ...wakes }: SessionWakes): ArmedState {
-  return { ...wakes, hasContinuation: continuation !== null };
-}
-
-export function readArmedState(mailbox: Parameters<typeof readSessionWakes>[0]): ArmedState {
-  return armedState(readSessionWakes(mailbox));
 }
 
 export type ArmedBy = 'wake-due' | 'wake-pending' | 'continuation-saved';
@@ -85,64 +73,55 @@ export function armedBy(state: ArmedState): ArmedBy | null {
 }
 
 /** What makes a further wake redundant. Says nothing about whether the session comes back: see `Resumes`. */
-type SuppressedBy = ArmedBy | 'wake-deferred' | 'claimed';
+type SuppressedBy = ArmedBy | 'wake-deferred';
 
 /** What will bring a stopped session back, and when if that is a known future time. */
 interface Resumes {
-  by: 'wake-due' | 'claimed' | 'wake-queued' | 'continuation' | 'follow-up' | 'wake-pending';
+  by: 'wake-due' | 'wake-queued' | 'continuation' | 'follow-up' | 'wake-pending';
   at: string | null;
 }
 
-interface KillReads extends SessionWakes {
-  claimed: boolean;
-  /** A deferred wake other than the kill follow-up's own, admitted or not. */
-  otherWakeDeferred: boolean;
-  /** Ids of the rows the next sweep admits, the kill follow-up's own included. */
-  queuedIds: string[];
-  /** Whether a recovery wake is among the due rows. */
-  dueRecoveryWake: boolean;
+/**
+ * Raw pending rows are not read here: a row its container already acknowledged, a claim the cleanup will discard and
+ * a context row nothing admits all look pending and never run. `listRunnableWakes` is what the sweep leaves to run.
+ */
+interface KillReads {
+  continuation: HostWorkContinuation | null;
+  wakes: RunnableWake[];
 }
 
 function readKill(mailbox: NanoclawMailboxSession): KillReads {
-  return {
-    ...readSessionWakes(mailbox),
-    claimed: mailbox.getProcessingClaimRows().length > 0,
-    otherWakeDeferred: mailbox.hasPendingRecallPairedTrigger(REAP_RESPAWN_ID_PREFIX),
-    queuedIds: mailbox.listDueAdmissionRows().map((row) => row.id),
-    dueRecoveryWake: mailbox.hasDueRecoveryWake(new Date().toISOString()),
-  };
+  return { continuation: mailbox.readWorkContinuation(), wakes: mailbox.listRunnableWakes() };
 }
 
 /**
  * The kill follow-up's own unadmitted rows are left out: one row per kill is its id's job and the count is its
  * cap's, so an earlier one still pending must not read as "already coming back".
  */
-function suppressedBy(reads: KillReads): SuppressedBy | null {
-  return (
-    armedBy(armedState(reads)) ??
-    (reads.otherWakeDeferred ? 'wake-deferred' : null) ??
-    (reads.claimed ? 'claimed' : null)
-  );
+function suppressedBy({ continuation, wakes }: KillReads): SuppressedBy | null {
+  const others = wakes.filter((wake) => wake.admitted || !wake.id.startsWith(REAP_RESPAWN_ID_PREFIX));
+  if (others.some((wake) => wake.admitted && wake.at === null)) return 'wake-due';
+  if (others.some((wake) => wake.at !== null)) return 'wake-pending';
+  if (continuation !== null) return 'continuation-saved';
+  return others.length > 0 ? 'wake-deferred' : null;
 }
 
 /**
  * "Will this session come back", which is not "should another wake be withheld": a spent continuation withholds a
  * wake and resumes nothing, and the follow-up's own queued row resumes the session without withholding anything.
  * While a continuation's recovery budget is spent the sweep completes recovery wakes unread, so those bring nothing
- * back either; a due one then hides any other due row, which errs towards the runner's own label.
+ * back either.
  */
-function resumesBy(reads: KillReads, takesAWake: boolean, followUp: ReapFollowUp): Resumes | null {
+function resumesBy({ continuation, wakes }: KillReads, takesAWake: boolean, followUp: ReapFollowUp): Resumes | null {
   if (!takesAWake) return null;
-  const recoverable = reads.continuation !== null && canAttemptContinuationRecovery(reads.continuation);
-  const spent = reads.continuation !== null && !recoverable;
-  const soon = (by: Resumes['by']): Resumes => ({ by, at: null });
-  if (reads.dueCount > 0 && !(spent && reads.dueRecoveryWake)) return soon('wake-due');
-  if (reads.claimed) return soon('claimed');
-  if (reads.queuedIds.some((id) => !(spent && isRecoveryWakeId(id)))) return soon('wake-queued');
-  if (recoverable) return soon('continuation');
-  if (followUp.action === 'wake-accountable') return soon('follow-up');
-  if (reads.nextFutureProcessAfter) return { by: 'wake-pending', at: reads.nextFutureProcessAfter };
-  return null;
+  const recoverable = continuation !== null && canAttemptContinuationRecovery(continuation);
+  const delivered = continuation !== null && !recoverable ? wakes.filter((wake) => !isRecoveryWakeId(wake.id)) : wakes;
+  const now = delivered.find((wake) => wake.at === null);
+  if (now) return { by: now.admitted ? 'wake-due' : 'wake-queued', at: null };
+  if (recoverable) return { by: 'continuation', at: null };
+  if (followUp.action === 'wake-accountable') return { by: 'follow-up', at: null };
+  const later = delivered.flatMap((wake) => wake.at ?? []).sort((a, b) => parseSqliteUtc(a) - parseSqliteUtc(b));
+  return later.length > 0 ? { by: 'wake-pending', at: sqliteUtcToIso(later[0]) } : null;
 }
 
 type OpenCard = 'approval' | 'question';
