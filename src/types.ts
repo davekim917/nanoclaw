@@ -29,6 +29,7 @@ export interface ContainerConfigRow {
   cli_scope: string; // 'disabled' | 'group' | 'global'
   security_json: string | null; // JSON: SecurityConfig | null
   timezone: string | null; // IANA id; NULL = follow the install-global timezone
+  speed: string | null; // provider speed tier ('standard' | 'fast' for claude); NULL = provider default
   updated_at: string;
 }
 

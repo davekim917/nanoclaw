@@ -40,7 +40,7 @@ git -C $R log --first-parent --format='%h %cs %s' $PIN..$UP
 Check on every cycle:
 
 - **Upgrade tripwire:** `node_modules/.bin/tsx scripts/upgrade-state.ts get` matches `node -p "require('./package.json').version"`.
-- **Migrations:** `git -C $R diff --name-only --diff-filter=A $PIN $UP -- src/db/migrations/`. The ledger is keyed by `name`, not file number. Skip a migration whose `name` the fork already has; it has already run. A new one keeps upstream's `name` and takes the next free fork ordinal, one above the highest `NNN-` file in `src/db/migrations/`. A migration that ALTERs `container_configs` registers right after the aliased `containerConfigs` migration in `src/db/migrations/index.ts`: the array runs in array order, and that table is created late.
+- **Migrations:** `git -C $R diff --name-only --diff-filter=A $PIN $UP -- src/db/migrations/`. The ledger is keyed by `name`, not file number. Skip a migration whose `name` the fork already has; it has already run. A new one keeps upstream's `name` and takes the next free fork ordinal, one above the highest `NNN-` file in `src/db/migrations/`. A migration that ALTERs `container_configs` registers after the last existing `container_configs` ALTER in `src/db/migrations/index.ts` (the block that follows the aliased `containerConfigs`): the array runs in array order, that table is created late, and `src/db/migrations/registry.test.ts` requires a live upgrade and a fresh install to end with the same column order, which an earlier slot breaks.
 - **Host runtime:** `git -C $R show $UP:package.json | grep -A2 engines` against `node -v`. A Node major goes through §5.
 - **Tooling:** call `node_modules/.bin/tsx` and `node_modules/.bin/vitest` directly. A nested `pnpm exec` costs about 80 s of CPU here.
 

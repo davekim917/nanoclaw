@@ -1696,6 +1696,7 @@ export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
 
   private assistantName?: string;
+  private readonly fastMode: boolean;
   private mcpServers: Record<string, McpServerConfig>;
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
@@ -1722,6 +1723,7 @@ export class ClaudeProvider implements AgentProvider {
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
+    this.fastMode = options.speed === 'fast';
     // The SDK's stdio MCP config has no cwd field (checked against 0.3.197), so cwd-bearing servers go through
     // cwd-shim.ts rather than silently starting in the container's default cwd.
     this.mcpServers = Object.fromEntries(
@@ -2047,6 +2049,7 @@ export class ClaudeProvider implements AgentProvider {
         model: model,
         abortController: queryAbortController,
         ...(effort ? { effort: effort as EffortLevel } : {}),
+        ...(this.fastMode ? { settings: { fastMode: true } } : {}),
         // `display: 'summarized'` makes thinking text visible; the default is empty text plus signature.
         thinking: { type: 'adaptive', display: 'summarized' },
         pathToClaudeCodeExecutable: '/pnpm/claude',

@@ -1302,3 +1302,107 @@ describe('groups config — the container.json + container_configs dual write ho
     expect(JSON.stringify(res.error)).toMatch(/mutually exclusive/);
   });
 });
+
+describe('groups config update --speed', () => {
+  beforeEach(async () => {
+    await initMigratedTestDb();
+  });
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  async function seedGroup(id: string, folder: string, provider: string | null): Promise<void> {
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    if (provider) await updateContainerConfigScalars(id, { provider });
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        skills: 'all',
+        ...(provider ? { provider } : {}),
+      }) + '\n',
+    );
+  }
+
+  it('dual-writes a Claude tier to the DB row and container.json, and "" clears both', async () => {
+    const id = 'ag-speed';
+    const folder = 'speed-group';
+    await seedGroup(id, folder, 'claude');
+
+    const set = await dispatch(
+      { id: 'req-speed-set', command: 'groups-config-update', args: { id, speed: 'fast' } },
+      { caller: 'host' },
+    );
+    expect(set.ok).toBe(true);
+    expect((await getContainerConfig(id))?.speed).toBe('fast');
+    expect(readContainerConfig(folder).speed).toBe('fast');
+
+    const clear = await dispatch(
+      { id: 'req-speed-clear', command: 'groups-config-update', args: { id, speed: '' } },
+      { caller: 'host' },
+    );
+    expect(clear.ok).toBe(true);
+    expect((await getContainerConfig(id))?.speed).toBeNull();
+    expect(readContainerConfig(folder).speed).toBeUndefined();
+  });
+
+  it('rejects a tier the provider does not declare, and any tier for a provider without tiers', async () => {
+    await seedGroup('ag-speed-bad', 'speed-bad', 'claude');
+    const unknown = await dispatch(
+      { id: 'req-speed-unknown', command: 'groups-config-update', args: { id: 'ag-speed-bad', speed: 'turbo' } },
+      { caller: 'host' },
+    );
+    expect(unknown.ok).toBe(false);
+    if (unknown.ok) throw new Error('unreachable');
+    expect(JSON.stringify(unknown.error)).toMatch(/not a speed tier/);
+    expect((await getContainerConfig('ag-speed-bad'))?.speed).toBeNull();
+
+    await seedGroup('ag-speed-codex', 'speed-codex', 'codex');
+    const codex = await dispatch(
+      { id: 'req-speed-codex', command: 'groups-config-update', args: { id: 'ag-speed-codex', speed: 'fast' } },
+      { caller: 'host' },
+    );
+    expect(codex.ok).toBe(false);
+    if (codex.ok) throw new Error('unreachable');
+    expect(JSON.stringify(codex.error)).toMatch(/no speed tiers/);
+    // A `--provider` in the same command decides which vocabulary applies.
+    const switching = await dispatch(
+      {
+        id: 'req-speed-switch',
+        command: 'groups-config-update',
+        args: { id: 'ag-speed-codex', provider: 'claude', speed: 'fast' },
+      },
+      { caller: 'host' },
+    );
+    expect(switching.ok).toBe(true);
+    expect((await getContainerConfig('ag-speed-codex'))?.speed).toBe('fast');
+  });
+
+  it('validates against the container.json provider, not the DB projection', async () => {
+    await seedGroup('ag-speed-lag', 'speed-lag', 'codex');
+    await updateContainerConfigScalars('ag-speed-lag', { provider: 'claude' });
+    const lagging = await dispatch(
+      { id: 'req-speed-lag', command: 'groups-config-update', args: { id: 'ag-speed-lag', speed: 'fast' } },
+      { caller: 'host' },
+    );
+    expect(lagging.ok).toBe(false);
+    if (lagging.ok) throw new Error('unreachable');
+    expect(JSON.stringify(lagging.error)).toMatch(/no speed tiers/);
+
+    // Clearing the provider in the same command selects the default, which has tiers.
+    const cleared = await dispatch(
+      {
+        id: 'req-speed-clear-provider',
+        command: 'groups-config-update',
+        args: { id: 'ag-speed-lag', provider: '', speed: 'fast' },
+      },
+      { caller: 'host' },
+    );
+    expect(cleared.ok).toBe(true);
+    expect((await getContainerConfig('ag-speed-lag'))?.speed).toBe('fast');
+  });
+});

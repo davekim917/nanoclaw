@@ -338,6 +338,7 @@ CREATE TABLE container_configs (
   cli_scope              TEXT NOT NULL DEFAULT 'group',   -- disabled | group | global
   security_json          TEXT,                            -- JSON: SecurityConfig | NULL = safe defaults
   timezone               TEXT,                            -- IANA id; NULL = install-global TZ (migration `container-config-timezone`)
+  speed                  TEXT,                            -- provider speed tier, 'standard'|'fast' for claude; NULL = provider default (migration `container-config-speed`)
   updated_at             TEXT NOT NULL
 );
 ```

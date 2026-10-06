@@ -619,3 +619,21 @@ describe('container GitNexus retirement', () => {
     expect(fs.existsSync(new URL('../gitnexus-runtime.ts', import.meta.url))).toBe(false);
   });
 });
+
+describe('ClaudeProvider speed tier', () => {
+  it('speed "fast" turns on the SDK fast serving tier for every query', () => {
+    capturedSdkOptions = null;
+    mockSdkQuery.mockClear();
+    makeClaudeProvider({ speed: 'fast' }).query({ prompt: 'hi', cwd: '/tmp', continuation: undefined });
+    expect(capturedSdkOptions?.settings).toEqual({ fastMode: true });
+  });
+
+  it('any other tier, or none, leaves the SDK default', () => {
+    for (const speed of ['standard', undefined]) {
+      capturedSdkOptions = null;
+      mockSdkQuery.mockClear();
+      makeClaudeProvider({ speed }).query({ prompt: 'hi', cwd: '/tmp', continuation: undefined });
+      expect(capturedSdkOptions?.settings).toBeUndefined();
+    }
+  });
+});

@@ -74,6 +74,7 @@ export async function backfillContainerConfigs(): Promise<void> {
       security_json: null,
       // A valid legacy container.json override is kept; otherwise NULL follows the install-global timezone.
       timezone: honouredTimezoneOverride(legacy.timezone) ?? null,
+      speed: null,
       updated_at: new Date().toISOString(),
     };
 

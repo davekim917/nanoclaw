@@ -57,7 +57,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('recurrence-tes
 // resolveGroupTimezone reads the group's config row from the central DB
 // (not initialized here). Default: no override → falls back to the mocked
 // install TIMEZONE; individual tests set an override to test precedence.
-const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null }));
+const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null, speed: null as string | null }));
 vi.mock('../../db/container-configs.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/container-configs.js')>()),
   getContainerConfig: () => ({ timezone: containerConfigState.timezone }),
