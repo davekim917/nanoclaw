@@ -174,48 +174,6 @@ export async function discoverDiscordRecoveryTargets(
   return { targets, complete, failed };
 }
 
-/**
- * Discord FORWARDS (`message_reference.type === 1`) carry text and attachments in `message_snapshots` with an empty
- * top-level `content`, which the chat-adapter would deliver as an empty message; unwrap the snapshot into the payload
- * before the adapter builds its Message. Snapshots carry no author, so the content is labeled `[Forwarded message]`.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function unwrapForwardedSnapshot(data: Record<string, any>): void {
-  if (data.message_reference?.type !== 1) return;
-  const snaps = (data.message_snapshots ?? [])
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    .map((snapshot: any) => snapshot?.message)
-    .filter(Boolean);
-  if (snaps.length === 0) return;
-  const text = snaps
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    .map((message: any) => message.content)
-    .filter(Boolean)
-    .join('\n');
-  const label = '[Forwarded message]';
-  data.content = text ? `${label}\n${text}` : data.content || label;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const forwardedAttachments = snaps.flatMap((message: any) => message.attachments ?? []);
-  if (forwardedAttachments.length > 0) {
-    data.attachments = [...(data.attachments ?? []), ...forwardedAttachments];
-  }
-}
-
-/**
- * `handleForwardedMessage` is the live inbound seam: the Gateway listener runs in webhook-forwarding mode, so every
- * MESSAGE_CREATE arrives through it as raw JSON.
- */
-export function installForwardUnwrap(adapter: ReturnType<typeof createDiscordAdapter>): void {
-  const target = adapter as unknown as {
-    handleForwardedMessage: (data: Record<string, unknown>, options?: unknown) => Promise<void>;
-  };
-  const original = target.handleForwardedMessage.bind(adapter);
-  target.handleForwardedMessage = async (data, options) => {
-    unwrapForwardedSnapshot(data);
-    return original(data, options);
-  };
-}
-
 /** The parent channel of a thread the host already holds a session in, read from that session's thread id. */
 async function sessionThreadParent(guildId: string, threadId: string): Promise<string | null> {
   if (!/^\d+$/.test(guildId) || !/^\d+$/.test(threadId)) return null;
@@ -864,7 +822,6 @@ for (const ws of workspaces) {
         publicKey: ws.publicKey,
         applicationId: ws.applicationId,
       });
-      installForwardUnwrap(discordAdapter);
       // Multi-bot dedup isolation: the dedup key is `dedupe:${adapter.name}:${message.id}` and every Discord adapter
       // defaults to name "discord", so two bots seeing the same message would collide in the shared state and the
       // second would silently drop it. Name it after the channelType (as slack.ts does).
