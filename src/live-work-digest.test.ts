@@ -11,7 +11,7 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: TEST_DATA_DIR };
 });
 
-import { closeDb, createAgentGroup, createMessagingGroup, getRawDb, initMigratedTestDb } from './db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initMigratedTestDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { buildLiveWorkDigest, LIVE_WORK_BOUNDS } from './live-work-digest.js';
 import { outboundDbPath } from './mailbox/sqlite/paths.js';
@@ -77,10 +77,8 @@ describe('buildLiveWorkDigest', () => {
     fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
     await initMigratedTestDb();
     await createAgentGroup({ id: AG, name: 'Live', folder: 'live', agent_provider: null, created_at: at(-HOUR) });
-    getRawDb()
-      .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-live', 'Live', ?)`)
-      .run(at(-HOUR));
-    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-live' WHERE id = ?`).run(AG);
+    await getDb().run(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-live', 'Live', ?)`, at(-HOUR));
+    await getDb().run(`UPDATE agent_groups SET workgroup_id = 'wg-live' WHERE id = ?`, AG);
     await createMessagingGroup({
       id: 'mg-build',
       channel_type: 'slack',
@@ -188,11 +186,9 @@ describe('buildLiveWorkDigest', () => {
   it('includes open lists from sibling agent groups in the same workgroup, labelled by owner, and none beyond it', async () => {
     await createAgentGroup({ id: 'ag-sib', name: 'Sib', folder: 'sib', agent_provider: null, created_at: at(-HOUR) });
     await createAgentGroup({ id: 'ag-far', name: 'Far', folder: 'far', agent_provider: null, created_at: at(-HOUR) });
-    getRawDb()
-      .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-far', 'Far', ?)`)
-      .run(at(-HOUR));
-    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-live' WHERE id = 'ag-sib'`).run();
-    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-far' WHERE id = 'ag-far'`).run();
+    await getDb().run(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-far', 'Far', ?)`, at(-HOUR));
+    await getDb().run(`UPDATE agent_groups SET workgroup_id = 'wg-live' WHERE id = 'ag-sib'`);
+    await getDb().run(`UPDATE agent_groups SET workgroup_id = 'wg-far' WHERE id = 'ag-far'`);
     await session(
       'sess-sib',
       'slack:CBUILD:2.000',
