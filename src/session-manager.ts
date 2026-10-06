@@ -48,12 +48,7 @@ import {
   type ProviderRecallState,
 } from './modules/mailbox/index.js';
 import { log } from './log.js';
-import {
-  buildLiveWorkDigest,
-  deliveredLiveWorkFingerprint,
-  liveWorkRecallField,
-  type LiveWorkDigest,
-} from './live-work-digest.js';
+import { buildLiveWorkDigest, type LiveWorkDigest } from './live-work-digest.js';
 import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
 import { taskFiresFresh } from './modules/scheduling/fresh-context.js';
@@ -611,7 +606,7 @@ function buildRecallRow(
         seenEvidenceFingerprints: lifecycle.seenEvidenceFingerprints,
         servicesCentral: central.services,
       }),
-      ...liveWorkRecallField(central.liveWork, lifecycle.seenEvidenceFingerprints),
+      ...(central.liveWork ? { liveWork: central.liveWork } : {}),
     }),
     processAfter: message.processAfter ?? null,
     recurrence: null,
@@ -622,7 +617,6 @@ function buildRecallRow(
 }
 
 interface ParsedRecallContext {
-  liveWork?: unknown;
   provider?: unknown;
   contextEpoch?: unknown;
   trustedCapabilities?: unknown;
@@ -657,9 +651,9 @@ function recallFingerprints(context: ParsedRecallContext): string[] {
     ...(context.memoryEvidence?.excerpts ?? []),
     ...(context.conversationEvidence?.excerpts ?? []),
   ];
-  return [...rows.map((row) => row.fingerprint), deliveredLiveWorkFingerprint(context)].filter(
-    (fingerprint): fingerprint is string => typeof fingerprint === 'string' && fingerprint.length > 0,
-  );
+  return rows
+    .map((row) => row.fingerprint)
+    .filter((fingerprint): fingerprint is string => typeof fingerprint === 'string' && fingerprint.length > 0);
 }
 
 /**
@@ -997,6 +991,7 @@ export async function admitPendingUpgradeContexts(
   agentGroupId: string,
   sessionId: string,
 ): Promise<number> {
+  if (mailbox.listUnpairedPendingUpgradeRows().length === 0) return 0;
   // The one central read, first: the loop below is one synchronous pass over a single snapshot.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
   // Under the lease: the pre-turn context carries a lease-only central read.
@@ -1257,13 +1252,25 @@ export async function admitDueTaskContexts(
   sessionId: string,
   withheld: ReadonlySet<string> = new Set(),
 ): Promise<number> {
-  // The one central read, BEFORE the first inbound read, so the admission is one synchronous snapshot pass.
+  if (dueAdmissionRows(mailbox, withheld).length === 0) return 0;
+  // The one central read, BEFORE the admitting inbound read, so the admission is one synchronous snapshot pass.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
   // Under the lease: the recall rows read one lease-only central fact each.
   return withCentralSync(
     () => admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central, withheld),
     'admitDueTaskContexts',
   );
+}
+
+function dueAdmissionRows(mailbox: NanoclawMailboxSession, withheld: ReadonlySet<string>) {
+  // An active repository ingress fence admits nothing (no new turn while mounts change); release replays the
+  // deferred rows with their original triggers, so this defers rather than drops.
+  if (mailbox.readRepoIngressFence()?.state === 'active') return [];
+
+  // Legacy rows were stored trigger=1: demote only unpaired live tasks before selecting due work.
+  mailbox.demoteUnpairedLegacyTasks();
+
+  return mailbox.listDueAdmissionRows().filter((task) => !withheld.has(task.id));
 }
 
 /** The synchronous half, for a caller whose mailbox action must not yield (resolve `resolveRecallCentral` first). */
@@ -1274,16 +1281,8 @@ export function admitDueTaskContextsFor(
   central: RecallCentral,
   withheld: ReadonlySet<string> = new Set(),
 ): number {
-  // An active repository ingress fence admits nothing (no new turn while mounts change); release replays the
-  // deferred rows with their original triggers, so this defers rather than drops.
-  if (mailbox.readRepoIngressFence()?.state === 'active') return 0;
-
-  // Legacy rows were stored trigger=1: demote only unpaired live tasks before selecting due work.
-  mailbox.demoteUnpairedLegacyTasks();
-
   let admitted = 0;
-  for (const task of mailbox.listDueAdmissionRows()) {
-    if (withheld.has(task.id)) continue;
+  for (const task of dueAdmissionRows(mailbox, withheld)) {
     let recall: MessageInsert;
     try {
       recall = buildRecallRow(

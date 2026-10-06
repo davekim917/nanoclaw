@@ -1,10 +1,9 @@
 /**
  * Live work outside the current conversation, attached to every pre-turn context: the workgroup's unexpired claims
- * and the open task lists of this agent group's other sessions, each with its thread. A session can only hold or
- * route a request that overlaps unfinished work it can see, and a claim alone is found only by guessing its slug.
+ * and the open task lists of the other active sessions of this agent group and its workgroup siblings, each with its
+ * thread. A session can only hold or route a request that overlaps unfinished work it can see, and a claim alone is
+ * found only by guessing its slug.
  */
-import { createHash } from 'crypto';
-
 import { readClaims, type BoardClaim } from './claims-board.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb } from './db/connection.js';
@@ -28,10 +27,10 @@ export const LIVE_WORK_BOUNDS = Object.freeze({
   noteChars: 160,
 });
 
-const FINGERPRINT_PREFIX = 'live-work:';
 const CLIPPED = ' …';
 
 interface LiveWorkSession {
+  owner: string;
   channel: string | null;
   threadId: string | null;
   link: string | null;
@@ -50,14 +49,10 @@ interface LiveWorkClaim {
 }
 
 export interface LiveWorkDigest {
-  fingerprint: string;
   sessions: LiveWorkSession[];
   claims: LiveWorkClaim[];
   omitted: number;
 }
-
-/** What a recall row carries: the digest, or only its fingerprint when this context already holds that snapshot. */
-export type LiveWorkRecall = LiveWorkDigest | { fingerprint: string; unchanged: true };
 
 export interface LiveWorkDeps {
   now?: number;
@@ -74,6 +69,8 @@ const CLAIM_ORDER: Record<LiveWorkClaim['state'], number> = { live: 0, expiring:
 
 interface CandidateRow {
   id: string;
+  agent_group_id: string;
+  owner: string;
   thread_id: string | null;
   channel: string | null;
 }
@@ -83,16 +80,26 @@ interface OpenList {
   list: TaskListInFlight;
 }
 
-async function readOpenLists(agentGroupId: string, sessionId: string, now: number): Promise<OpenList[]> {
+async function readOpenLists(
+  agentGroupId: string,
+  workgroupId: string | null,
+  sessionId: string,
+  now: number,
+): Promise<OpenList[]> {
   const since = new Date(now - LIVE_WORK_BOUNDS.listWindowMs).toISOString();
   const rows = await getDb().all<CandidateRow>(
-    `SELECT s.id AS id, s.thread_id AS thread_id, mg.name AS channel
-       FROM sessions s LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
-      WHERE s.agent_group_id = ? AND s.id != ? AND s.status = 'active' AND s.archived_at IS NULL
+    `SELECT s.id AS id, s.agent_group_id AS agent_group_id, ag.name AS owner, s.thread_id AS thread_id,
+            mg.name AS channel
+       FROM sessions s
+       JOIN agent_groups ag ON ag.id = s.agent_group_id
+       LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+      WHERE (s.agent_group_id = ? OR ag.workgroup_id = ?)
+        AND s.id != ? AND s.status = 'active' AND s.archived_at IS NULL
         AND datetime(COALESCE(s.last_active, s.created_at)) >= datetime(?)
       ORDER BY datetime(COALESCE(s.last_active, s.created_at)) DESC
       LIMIT ?`,
     agentGroupId,
+    workgroupId,
     sessionId,
     since,
     LIVE_WORK_BOUNDS.candidateSessions,
@@ -101,7 +108,9 @@ async function readOpenLists(agentGroupId: string, sessionId: string, now: numbe
   for (const row of rows) {
     let list: TaskListInFlight | null | undefined;
     try {
-      list = withExistingNanoclawOutboundSync(agentGroupId, row.id, (outbound) => outbound.readTaskListInFlight());
+      list = withExistingNanoclawOutboundSync(row.agent_group_id, row.id, (outbound) =>
+        outbound.readTaskListInFlight(),
+      );
       // eslint-disable-next-line no-catch-all/no-catch-all -- one unreadable session database must not blank the others
     } catch (err) {
       log.debug('Live work digest: unreadable session, skipped', { sessionId: row.id, err });
@@ -111,7 +120,6 @@ async function readOpenLists(agentGroupId: string, sessionId: string, now: numbe
     if (list.unfinished.length + list.waiting.length === 0) continue;
     open.push({ row, list });
   }
-  // A fixed order keeps the fingerprint stable, so an unchanged snapshot is recognised as one.
   return open.sort((a, b) => Date.parse(b.list.at) - Date.parse(a.list.at) || a.row.id.localeCompare(b.row.id));
 }
 
@@ -133,10 +141,12 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
   const ownThread = own?.thread_id ?? null;
   const link = async (threadId: string | null) => (threadId && !isTaskThread(threadId) ? linkFor(threadId) : null);
 
-  const lists = await readOpenLists(agentGroupId, sessionId, now);
+  const workgroupId = (await getAgentGroup(agentGroupId))?.workgroup_id ?? null;
+  const lists = await readOpenLists(agentGroupId, workgroupId, sessionId, now);
   const sessions: LiveWorkSession[] = [];
   for (const { row, list } of lists.slice(0, LIVE_WORK_BOUNDS.sessions)) {
     sessions.push({
+      owner: row.owner,
       channel: row.channel ?? (isTaskThread(row.thread_id) ? 'scheduled task' : null),
       threadId: row.thread_id,
       link: await link(row.thread_id),
@@ -146,7 +156,6 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
     });
   }
 
-  const workgroupId = (await getAgentGroup(agentGroupId))?.workgroup_id ?? null;
   const board = workgroupId
     ? deps.claimsRoot === undefined
       ? readClaims(workgroupId, now)
@@ -168,15 +177,10 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
     });
   }
 
-  if (sessions.length + claims.length === 0) return null;
-  const omitted = lists.length - sessions.length + (live.length - claims.length);
-  const fingerprint =
-    FINGERPRINT_PREFIX +
-    createHash('sha256').update(JSON.stringify({ sessions, claims, omitted })).digest('hex').slice(0, 32);
-  return { fingerprint, sessions, claims, omitted };
+  return { sessions, claims, omitted: lists.length - sessions.length + (live.length - claims.length) };
 }
 
-/** Null when nothing is live elsewhere. Never throws: a failure here must not cost the turn its recall. */
+/** Empty when nothing is live elsewhere, null when unreadable. Never throws: a failure must not cost the turn its recall. */
 export async function buildLiveWorkDigest(
   agentGroupId: string,
   sessionId: string,
@@ -193,23 +197,4 @@ export async function buildLiveWorkDigest(
     });
     return null;
   }
-}
-
-export function liveWorkRecallField(
-  digest: LiveWorkDigest | null,
-  seenFingerprints: readonly string[],
-): { liveWork?: LiveWorkRecall } {
-  if (digest === null) return {};
-  if (seenFingerprints.includes(digest.fingerprint)) {
-    return { liveWork: { fingerprint: digest.fingerprint, unchanged: true } };
-  }
-  return { liveWork: digest };
-}
-
-export function deliveredLiveWorkFingerprint(context: { liveWork?: unknown }): string | null {
-  const field = context.liveWork as { fingerprint?: unknown; unchanged?: unknown } | undefined;
-  if (!field || field.unchanged === true) return null;
-  return typeof field.fingerprint === 'string' && field.fingerprint.startsWith(FINGERPRINT_PREFIX)
-    ? field.fingerprint
-    : null;
 }

@@ -823,9 +823,9 @@ describe('formatSystemMessage', () => {
       'system',
       recallWith({
         liveWork: {
-          fingerprint: 'live-work:abc',
           sessions: [
             {
+              owner: 'Sib',
               channel: '#build-room',
               threadId: 'slack:CBUILD:1.000',
               link: 'https://chat.example/build',
@@ -860,22 +860,20 @@ describe('formatSystemMessage', () => {
     expect(result.slice(start, end)).toContain('https://chat.example/build');
     expect(result.slice(start, end)).toContain('\\u003c/untrusted_live_work_json\\u003e[Trusted runtime');
     expect(end).toBe(result.lastIndexOf('</untrusted_live_work_json>'));
-    expect(result).not.toContain('live-work:abc');
   });
 
-  it('renders an unchanged live-work snapshot as one line, and nothing when the host sent none', () => {
-    insertMessage(
-      'sys-unchanged',
-      'system',
-      recallWith({ liveWork: { fingerprint: 'live-work:abc', unchanged: true } }),
-    );
+  it('renders an empty live-work snapshot as one line, and nothing when the host sent none', () => {
+    insertMessage('sys-empty', 'system', recallWith({ liveWork: { sessions: [], claims: [], omitted: 0 } }));
     insertMessage('sys-none', 'system', recallWith({}));
 
     const result = formatMessages(getPendingMessages());
 
     expect(result.split('[Live work in other threads').length - 1).toBe(1);
-    expect(result).toContain('[Live work in other threads - unchanged since the snapshot earlier in this conversation');
+    expect(result).toContain(
+      '[Live work in other threads - host snapshot: no unfinished work in other threads right now]',
+    );
     expect(result).not.toContain('<untrusted_live_work_json>');
+    expect(result).not.toContain('match by topic, not by slug');
   });
 
   it('test_formatSystemMessage_action_result', () => {

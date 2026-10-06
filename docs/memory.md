@@ -177,11 +177,12 @@ Every pair then contains only the newly relevant evidence delta:
 4. explicit degraded, conflict, truncation, already-delivered, or no-match
    notices; and
 5. a live-work snapshot (`src/live-work-digest.ts`): the workgroup's unexpired
-   claims outside this thread and the open task lists of the agent group's
-   other sessions touched in the last 24 hours, each with its thread link,
+   claims outside this thread and the open task lists of the other active
+   sessions of this agent group and its workgroup siblings touched in the last
+   24 hours, each labelled with its owning agent group and its thread link,
    under a rule to hold or route a request that overlaps or depends on them.
-   A snapshot this provider context already received is sent as its
-   fingerprint alone.
+   The current snapshot is sent on every turn; when nothing is live elsewhere
+   it is sent empty, so a session that was holding sees the hold lift.
 
 The rest of the manual canon is not pushed. `index.md` is the map, and the
 agent reads or greps the tree from it — the host runs no per-turn walk of the

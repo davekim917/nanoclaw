@@ -27,10 +27,15 @@ const linkFor = (threadId: string) => Promise.resolve(`https://chat.example/${th
 
 const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
 
-async function session(id: string, threadId: string | null, list?: Record<string, unknown>): Promise<void> {
+async function session(
+  id: string,
+  threadId: string | null,
+  list?: Record<string, unknown>,
+  agentGroupId = AG,
+): Promise<void> {
   await createSession({
     id,
-    agent_group_id: AG,
+    agent_group_id: agentGroupId,
     messaging_group_id: threadId?.startsWith('slack:') ? 'mg-build' : null,
     thread_id: threadId,
     agent_provider: null,
@@ -39,9 +44,9 @@ async function session(id: string, threadId: string | null, list?: Record<string
     last_active: at(-HOUR),
     created_at: at(-2 * HOUR),
   });
-  initSessionFolder(AG, id);
+  initSessionFolder(agentGroupId, id);
   if (!list) return;
-  const db = new Database(outboundDbPath(AG, id));
+  const db = new Database(outboundDbPath(agentGroupId, id));
   try {
     db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
       'task_list',
@@ -139,6 +144,7 @@ describe('buildLiveWorkDigest', () => {
 
     expect(digest?.sessions).toEqual([
       {
+        owner: 'Live',
         channel: 'scheduled task',
         threadId: 'system:tasks:nightly',
         link: null,
@@ -147,6 +153,7 @@ describe('buildLiveWorkDigest', () => {
         updatedAt: at(-60 * 1000),
       },
       {
+        owner: 'Live',
         channel: '#build-room',
         threadId: 'slack:CBUILD:2.000',
         link: 'https://chat.example/slack:CBUILD:2.000',
@@ -164,10 +171,42 @@ describe('buildLiveWorkDigest', () => {
     expect(digest?.omitted).toBe(0);
   });
 
-  it('returns nothing when the only work is this conversation’s own', async () => {
+  it('returns an empty snapshot when the only work is this conversation’s own', async () => {
     claim('here', liveClaim('ava', MY_THREAD));
 
-    await expect(buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor })).resolves.toBeNull();
+    await expect(buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor })).resolves.toEqual({
+      sessions: [],
+      claims: [],
+      omitted: 0,
+    });
+  });
+
+  it('includes open lists from sibling agent groups in the same workgroup, labelled by owner, and none beyond it', async () => {
+    await createAgentGroup({ id: 'ag-sib', name: 'Sib', folder: 'sib', agent_provider: null, created_at: at(-HOUR) });
+    await createAgentGroup({ id: 'ag-far', name: 'Far', folder: 'far', agent_provider: null, created_at: at(-HOUR) });
+    getRawDb()
+      .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-far', 'Far', ?)`)
+      .run(at(-HOUR));
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-live' WHERE id = 'ag-sib'`).run();
+    getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-far' WHERE id = 'ag-far'`).run();
+    await session(
+      'sess-sib',
+      'slack:CBUILD:2.000',
+      { title: 'Hosted QA environment', items: [{ text: 'Provision QA', status: 'in_progress' }], touchedAt: at(0) },
+      'ag-sib',
+    );
+    await session(
+      'sess-far',
+      'slack:CBUILD:3.000',
+      { title: 'Other workgroup build', items: [{ text: 'Build', status: 'in_progress' }], touchedAt: at(0) },
+      'ag-far',
+    );
+
+    const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
+
+    expect(digest?.sessions.map((s) => [s.owner, s.title, s.link])).toEqual([
+      ['Sib', 'Hosted QA environment', 'https://chat.example/slack:CBUILD:2.000'],
+    ]);
   });
 
   it('caps the claims it carries and counts the rest as omitted', async () => {

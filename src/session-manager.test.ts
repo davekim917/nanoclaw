@@ -558,7 +558,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     }
   });
 
-  it('carries unfinished work from the agent group’s other threads into the recall row, once per context', async () => {
+  it('carries the current live-work snapshot into every recall row, including when the work has cleared', async () => {
     const buildThread = 'slack:CBUILD:1700000000.000100';
     const reviewThread = 'slack:CREVIEW:1700000000.000200';
     const now = new Date().toISOString();
@@ -650,10 +650,20 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
         .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
         .run('continuation:claude', 'claude-context-1', now);
       await writeSessionMessage(AG, SESS, ask('smoke-again'));
-      expect(recall('recall-smoke-again').liveWork).toEqual({
-        fingerprint: first.liveWork.fingerprint,
-        unchanged: true,
-      });
+      expect(recall('recall-smoke-again').liveWork).toEqual(first.liveWork);
+
+      inbound
+        .prepare(`UPDATE messages_in SET status = 'completed' WHERE id IN ('recall-smoke-again', 'smoke-again')`)
+        .run();
+      const finished = new Database(outboundDbPath(AG, 'sess-build'));
+      try {
+        finished.prepare("DELETE FROM session_state WHERE key = 'task_list'").run();
+      } finally {
+        finished.close();
+      }
+      fs.rmSync(path.join(claimsDir, 'qa-env.json'));
+      await writeSessionMessage(AG, SESS, ask('smoke-go'));
+      expect(recall('recall-smoke-go').liveWork).toEqual({ sessions: [], claims: [], omitted: 0 });
     } finally {
       outbound.close();
       inbound.close();

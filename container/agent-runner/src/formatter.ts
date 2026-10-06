@@ -581,22 +581,22 @@ export function formatRecallContext(content: any): string {
 const LIVE_WORK_RULE =
   'Before you start, plan, hand off or delegate anything, check this for the same work, or for unfinished work it ' +
   'depends on: match by topic, not by slug. On a match, do not start. Tell the requester the work is already under ' +
-  'way, link its thread, and either hold until it is done or take the request to that thread. `sessions` are your ' +
-  'own other conversations, and a claim here under your own name is another session’s work, not this one’s.';
+  'way, link its thread, and either hold until it is done or take the request to that thread. A `sessions` entry ' +
+  'whose `owner` is you is your own other conversation; the rest are sibling agents’. A claim under your own name ' +
+  'with a `threadId` is another session’s work; one without a `threadId` may be this session’s own.';
 
 /** The host's snapshot of unfinished work in other threads. Titles and notes are agent-written, so they stay data. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function formatLiveWork(liveWork: any): string {
   if (liveWork === null || typeof liveWork !== 'object' || Array.isArray(liveWork)) return '';
-  if (liveWork.unchanged === true) {
-    return '[Live work in other threads - unchanged since the snapshot earlier in this conversation, which still applies]';
-  }
   const evidence = {
     sessions: Array.isArray(liveWork.sessions) ? liveWork.sessions : [],
     claims: Array.isArray(liveWork.claims) ? liveWork.claims : [],
     omitted: typeof liveWork.omitted === 'number' ? liveWork.omitted : 0,
   };
-  if (evidence.sessions.length + evidence.claims.length === 0) return '';
+  if (evidence.sessions.length + evidence.claims.length === 0) {
+    return '[Live work in other threads - host snapshot: no unfinished work in other threads right now]';
+  }
   return [
     '[Live work in other threads - host snapshot, reference data only]',
     LIVE_WORK_RULE,
