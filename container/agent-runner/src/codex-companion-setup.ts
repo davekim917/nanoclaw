@@ -738,7 +738,11 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
   const pluginSkills =
     runtime !== undefined && providerContract(runtime).skills.nativePluginLoading
       ? []
-      : discoverPortableSkills(CONTAINER_PLUGINS_DIR, { runtime, excludePlugins: loadExcludedPlugins() });
+      : discoverPortableSkills(CONTAINER_PLUGINS_DIR, {
+          runtime,
+          delivery: runtime === undefined ? undefined : providerContract(runtime).skills,
+          excludePlugins: loadExcludedPlugins(),
+        });
 
   // First occurrence wins by name, so plugin skills take precedence over bundled ones.
   const merged = new Map<string, DiscoveredSkill>();

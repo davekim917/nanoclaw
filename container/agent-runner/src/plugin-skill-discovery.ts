@@ -15,7 +15,6 @@ import fs from 'fs';
 import path from 'path';
 
 import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from './plugin-exclusions.js';
-import { providerContract } from './providers/contract.js';
 
 export interface DiscoveredSkill {
   /** Skill name (used as `~/.codex/skills/<name>/` link basename) */
@@ -204,15 +203,13 @@ function discoverInPlugin(
   pluginDir: string,
   pluginName: string,
   denySubPluginSkillDirs: Set<string>,
-  allowNonInvocable: boolean,
-  runtime: AgentRuntime,
+  delivery: SkillDelivery,
   excluded: ExcludedPlugins,
 ): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
 
   // Applied per plugin root: the top-level plugin (rules 1-6) and each sub-plugin (rules 7-8).
-  const skipCodexNative = (root: string) =>
-    providerContract(runtime).skills.nativePluginLoading && loadedNativelyByCodex(root);
+  const skipCodexNative = (root: string) => delivery.nativePluginLoading && loadedNativelyByCodex(root);
   const doTopLevel = !skipCodexNative(pluginDir);
 
   // Exclusions are asked ONCE, at `recordCandidate`, the seam every layout rule ends at: a per-rule check is one
@@ -225,9 +222,7 @@ function discoverInPlugin(
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
     if (excludedCandidate(skillDir)) return;
-    // OpenCode has no plugin loader, so this mirror is its only skill delivery: it gets `user-invocable: false`
-    // helpers too (visible skills reference them), at the cosmetic cost of surfacing them as commands.
-    if (!isUserInvocable(skillDir) && !allowNonInvocable) return;
+    if (!isUserInvocable(skillDir) && !delivery.mirrorIsSoleDelivery) return;
     const fmName = readPluginName(skillDir);
     const name = fmName ?? path.basename(skillDir);
     if (skills.has(name)) return; // first match wins (preference order)
@@ -313,6 +308,16 @@ function discoverInPlugin(
   return [...skills.values()];
 }
 
+/** What the target runtime's skill loading already does, declared by the caller: this module never asks by provider name. */
+interface SkillDelivery {
+  /** The runtime loads plugin skills natively, so the mirror must not list a plugin it loads a second time. */
+  nativePluginLoading: boolean;
+  /** The mirror is the runtime's only skill delivery, so it also carries `user-invocable:false` helper skills. */
+  mirrorIsSoleDelivery: boolean;
+}
+
+const NO_PROVIDER_FACTS: SkillDelivery = { nativePluginLoading: false, mirrorIsSoleDelivery: false };
+
 export interface DiscoverOptions {
   /** Plugins to skip entirely (matched against folder name) */
   denyPlugins?: Set<string>;
@@ -322,6 +327,8 @@ export interface DiscoverOptions {
   denyDirSegments?: Set<string>;
   /** Selects the sub-plugin denylist. Defaults to 'codex' for back-compat. */
   runtime?: AgentRuntime;
+  /** Defaults to no provider facts: nothing skipped, no helper skills. */
+  delivery?: SkillDelivery;
   /** A group's split `excludePlugins`, honoured for both shapes. Host callers build unscoped mirrors and pass none. */
   excludePlugins?: ExcludedPlugins;
 }
@@ -334,7 +341,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
   const denySkills = options.denySkills ?? new Set<string>();
   const runtime = options.runtime ?? DEFAULT_RUNTIME;
   const denySubPluginSkillDirs = DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME[runtime];
-  const allowNonInvocable = providerContract(runtime).skills.mirrorIsSoleDelivery;
+  const delivery = options.delivery ?? NO_PROVIDER_FACTS;
 
   const excluded = options.excludePlugins ?? splitExcludedPlugins(undefined);
 
@@ -346,14 +353,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     const pluginDir = path.join(pluginsRoot, pluginName);
     if (!isDirectory(pluginDir)) continue;
     if (readPluginDenySiblings(pluginDir).has(runtime)) continue;
-    for (const skill of discoverInPlugin(
-      pluginDir,
-      pluginName,
-      denySubPluginSkillDirs,
-      allowNonInvocable,
-      runtime,
-      excluded,
-    )) {
+    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs, delivery, excluded)) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
       // First plugin wins by name (alphabetical).

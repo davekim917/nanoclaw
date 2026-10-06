@@ -19,7 +19,6 @@ const PINNED: Record<string, number> = {
   'src/modules/channel-config/index.ts': 1,
   'src/modules/self-mod/apply.ts': 1,
   'src/onecli-secrets.ts': 1,
-  'src/plugin-skill-discovery.ts': 5,
   'src/repository-discovery.ts': 1,
   'src/wiki-admission/runtime.ts': 2,
 };
