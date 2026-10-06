@@ -383,7 +383,7 @@
 "container/agent-runner/src/compact-instructions.test.ts":{"diff":52,"mode":"100644","sha256":"fb7ab7c516742ddf00ebb37fa263129c5b10943d1bb47c7e64b07b7b273c13b7"},
 "container/agent-runner/src/compact-instructions.ts":{"diff":61,"mode":"100644","sha256":"fc7e7be9738df20fb832b31241c2b19ee1bf9d3522248ee8e6b8a8894d622cc8"},
 "container/agent-runner/src/config.test.ts":{"diff":247,"mode":"100644","sha256":"367a84581004719c9786faaf111c03387586580cf8f7a8adefc8f08181f6a013"},
-"container/agent-runner/src/config.ts":{"diff":147,"mode":"100644","sha256":"6282c4e6a1d88107e12830eb220fc64661ce5a94f5d5620f72e1904d39b5315f"},
+"container/agent-runner/src/config.ts":{"diff":146,"mode":"100644","sha256":"66d01ed8a5f8eec684bd3ad458515a8dd86306217c58c55f21cb338e98c22416"},
 "container/agent-runner/src/cross-session-echo.test.ts":{"diff":236,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/db/container-state.ts":{"diff":0,"mode":"100644","sha256":"551bed7b9ac4039c28e6d218ffe81dbb512ac709b27b6e733dd6ea23c72d832b"},
 "container/agent-runner/src/db/index.ts":{"diff":0,"mode":"100644","sha256":"39bab9732a23047c55729d06f63e7725f9063b52918544a8effcddb584585546"},

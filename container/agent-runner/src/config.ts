@@ -78,7 +78,6 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   const configuredProviderModel = typeof providerConfig.model === 'string' ? providerConfig.model : undefined;
   const configuredProviderEffort =
     typeof providerConfig.reasoning_effort === 'string' ? providerConfig.reasoning_effort : undefined;
-  // Channel defaults apply to the primary provider, never to a fallback.
   const channelDefaults = onFallback ? null : providerContract(provider).channelDefaults;
   const activeCodexModel = channelDefaults ? env?.[channelDefaults.modelEnv] : undefined;
   const activeCodexEffort = channelDefaults ? env?.[channelDefaults.effortEnv] : undefined;

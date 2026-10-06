@@ -1,10 +1,5 @@
 import { OPENCODE_MODEL_SLUG_RE } from './model-vocabulary.js';
 
-/**
- * What the core needs to know about a provider without naming it. Code outside `providers/` reads these fields
- * instead of comparing provider names, so each provider-specific behaviour has one declaration here and the
- * conformance test (`contract.test.ts`) keeps the name comparisons out of the core.
- */
 export interface ProviderRuntimeContract {
   /** Host channel defaults the provider reads as sticky `providerConfig` values at startup, by env var name. */
   channelDefaults: { modelEnv: string; effortEnv: string } | null;
@@ -22,43 +17,47 @@ export interface ProviderRuntimeContract {
   modelListing: { slugPattern: RegExp } | null;
 }
 
-const PROVIDER_CONTRACTS: Readonly<Record<string, ProviderRuntimeContract>> = {
-  claude: {
-    channelDefaults: null,
-    turnFast: false,
-    codexHome: 'peer',
-    skills: { nativePluginLoading: false, mirrorIsSoleDelivery: false },
-    modelListing: null,
-  },
-  codex: {
-    channelDefaults: { modelEnv: 'NANOCLAW_CODEX_MODEL_OVERRIDE', effortEnv: 'NANOCLAW_CODEX_EFFORT_OVERRIDE' },
-    turnFast: true,
-    codexHome: 'primary',
-    skills: { nativePluginLoading: true, mirrorIsSoleDelivery: false },
-    modelListing: null,
-  },
-  opencode: {
-    channelDefaults: null,
-    turnFast: false,
-    codexHome: 'peer',
-    skills: { nativePluginLoading: false, mirrorIsSoleDelivery: true },
-    modelListing: { slugPattern: OPENCODE_MODEL_SLUG_RE },
-  },
-  mock: {
-    channelDefaults: null,
-    turnFast: false,
-    codexHome: 'peer',
-    skills: { nativePluginLoading: false, mirrorIsSoleDelivery: false },
-    modelListing: null,
-  },
-};
+const PROVIDER_CONTRACTS: ReadonlyMap<string, ProviderRuntimeContract> = new Map(
+  Object.entries({
+    claude: {
+      channelDefaults: null,
+      turnFast: false,
+      codexHome: 'peer',
+      skills: { nativePluginLoading: false, mirrorIsSoleDelivery: false },
+      modelListing: null,
+    },
+    codex: {
+      channelDefaults: { modelEnv: 'NANOCLAW_CODEX_MODEL_OVERRIDE', effortEnv: 'NANOCLAW_CODEX_EFFORT_OVERRIDE' },
+      turnFast: true,
+      codexHome: 'primary',
+      skills: { nativePluginLoading: true, mirrorIsSoleDelivery: false },
+      modelListing: null,
+    },
+    opencode: {
+      channelDefaults: null,
+      turnFast: false,
+      codexHome: 'peer',
+      skills: { nativePluginLoading: false, mirrorIsSoleDelivery: true },
+      modelListing: { slugPattern: OPENCODE_MODEL_SLUG_RE },
+    },
+    mock: {
+      channelDefaults: null,
+      turnFast: false,
+      codexHome: 'peer',
+      skills: { nativePluginLoading: false, mirrorIsSoleDelivery: false },
+      modelListing: null,
+    },
+  } satisfies Record<string, ProviderRuntimeContract>),
+);
 
+/** Names are matched the way the provider factory matches them: case-insensitively. */
 export function providerContract(name: string): ProviderRuntimeContract {
-  const contract = PROVIDER_CONTRACTS[name];
-  if (!contract) throw new Error(`No provider contract for: ${name}. Declared: ${Object.keys(PROVIDER_CONTRACTS).join(', ')}`);
+  const contract = PROVIDER_CONTRACTS.get(name.toLowerCase());
+  if (!contract)
+    throw new Error(`No provider contract for: ${name}. Declared: ${[...PROVIDER_CONTRACTS.keys()].join(', ')}`);
   return contract;
 }
 
 export function declaredContractNames(): string[] {
-  return Object.keys(PROVIDER_CONTRACTS);
+  return [...PROVIDER_CONTRACTS.keys()];
 }

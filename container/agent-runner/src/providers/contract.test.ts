@@ -12,8 +12,14 @@ describe('provider contracts', () => {
     expect([...declaredContractNames()].sort()).toEqual([...listProviderNames()].sort());
   });
 
-  it('an undeclared provider fails loudly', () => {
-    expect(() => providerContract('bogus')).toThrow(/No provider contract/);
+  it('matches names case-insensitively, like the provider factory', () => {
+    expect(providerContract('Codex')).toBe(providerContract('codex'));
+  });
+
+  it('an undeclared provider fails loudly, including names an object prototype would answer', () => {
+    for (const name of ['bogus', 'toString', 'constructor', '__proto__']) {
+      expect(() => providerContract(name)).toThrow(/No provider contract/);
+    }
   });
 
   it('core code outside providers/ compares no provider names', () => {
@@ -30,7 +36,7 @@ describe('provider contracts', () => {
         if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
         const lines = fs.readFileSync(full, 'utf-8').split('\n');
         lines.forEach((line, i) => {
-          if (/[=!]==?\s*['"](claude|codex|opencode)['"]/.test(line)) {
+          if (/[=!]==?\s*['"](claude|codex|opencode)['"]|['"](claude|codex|opencode)['"]\s*[=!]==?|case\s+['"](claude|codex|opencode)['"]/.test(line)) {
             offenders.push(`${path.relative(root, full)}:${i + 1}`);
           }
         });
