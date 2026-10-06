@@ -1742,21 +1742,25 @@ export interface StartupReconciliation {
 }
 
 /**
- * Stop the containers this host supervises whose session row or agent group no longer exists. The per-session
- * sweep fans out over `getActiveSessions()`, so a deleted row is never visited and its container would run until
- * the idle ceiling or the next host restart. A session with a wake in flight is left for the next tick: its row was
- * read by the spawn path and it is registered only after that read.
+ * Stop the containers this host supervises (adopted or spawned, and survivors held pending a claim) whose session
+ * row or agent group no longer exists. The per-session sweep fans out over `getActiveSessions()`, so a deleted row
+ * is never visited and its container would run until the idle ceiling or the next host restart. A session with a
+ * wake in flight is left for the next tick: its row was read by the spawn path and it is registered only after
+ * that read.
  */
 export async function stopOrphanedSessions(): Promise<number> {
   let stopped = 0;
-  for (const [sessionId, runtime] of [...activeContainers]) {
+  const supervised = [
+    ...[...activeContainers].map(([sessionId, runtime]) => [sessionId, runtime.containerName] as const),
+    ...[...pendingAdoptions].map(
+      (sessionId) => [sessionId, pendingHolds.get(sessionId)?.containerName ?? null] as const,
+    ),
+  ];
+  for (const [sessionId, containerName] of supervised) {
     if (wakePromises.has(sessionId) || pendingKills.has(sessionId)) continue;
     const session = await getSession(sessionId);
     if (session && (await getAgentGroup(session.agent_group_id))) continue;
-    log.warn('Stopping container whose session or agent group was deleted', {
-      sessionId,
-      containerName: runtime.containerName,
-    });
+    log.warn('Stopping container whose session or agent group was deleted', { sessionId, containerName });
     killContainer(sessionId, 'orphaned');
     stopped += 1;
   }

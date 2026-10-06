@@ -1063,6 +1063,18 @@ describe('adoptRunningSessions', () => {
       expect(warnings('Stopping container whose session or agent group was deleted')).toHaveLength(1);
     });
 
+    it('stops a pending survivor whose session row was deleted', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-held-gone');
+      await seedHostInstance('peer-live', 'live');
+      await seedForeignClaim('sess-held-gone', 'peer-live', 5);
+      fakes.listing = [survivor('sess-held-gone')];
+      expect(await adoptRunningSessions({ list: fakes.list })).toMatchObject({ pendingClaim: 1 });
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-held-gone');
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-held-gone']);
+    });
+
     it('stops a supervised session whose agent group was deleted', async () => {
       await seedSession(TEST_DATA_DIR, 'sess-groupless');
       fakes.listing = [survivor('sess-groupless')];
