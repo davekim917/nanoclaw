@@ -138,6 +138,92 @@ describe('a rate limit on every credential is the account quota wall', () => {
   });
 });
 
+const PIN = 'claude-pinned-tier';
+const PINNED_RESET = '2026-10-13T00:00:00.000Z';
+const DEFAULT_RESET = '2026-10-07T00:00:00.000Z';
+
+/** Every credential rejects the pinned model; the group's default model then fails as scripted. */
+class PinnedRingProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = false;
+  private rotations = 0;
+  readonly modelsAsked: Array<string | undefined> = [];
+
+  constructor(private readonly defaultOutcome: 'rate_limit' | 'other') {}
+
+  registerMemorySessionHook(): void {}
+  isSessionInvalid(): boolean {
+    return false;
+  }
+  isRetryable(err: unknown): boolean {
+    return err instanceof ProviderEventError && err.classification === 'rate_limit';
+  }
+  rotateApiKey(): { rotated: boolean } {
+    if (this.rotations >= 1) return { rotated: false };
+    this.rotations++;
+    return { rotated: true };
+  }
+
+  query(input: QueryInput): AgentQuery {
+    this.modelsAsked.push(input.model);
+    const pinned = input.model !== undefined;
+    const outcome = this.defaultOutcome;
+    const events = {
+      async *[Symbol.asyncIterator](): AsyncGenerator<ProviderEvent> {
+        if (pinned || outcome === 'rate_limit') {
+          const resetAt = pinned ? PINNED_RESET : DEFAULT_RESET;
+          yield {
+            type: 'error',
+            message: `Rate limit [seven_day] (resets ${resetAt})`,
+            retryable: false,
+            classification: 'rate_limit',
+            resetAt,
+          };
+          return;
+        }
+        yield { type: 'error', message: 'Internal server error', retryable: false };
+      },
+    };
+    return {
+      resolvedModel: input.model ?? 'mock:group-default',
+      resolvedEffort: undefined,
+      push() {},
+      end() {},
+      events,
+      abort() {},
+    } as unknown as AgentQuery;
+  }
+}
+
+function pinTheMessage(): void {
+  getInboundDb()
+    .prepare(`UPDATE messages_in SET content = ? WHERE id = 'm1'`)
+    .run(JSON.stringify({ sender: 'Operator', text: 'go', flagIntent: { stickyModel: PIN } }));
+}
+
+describe('a pinned model that exhausts the ring is judged by the default-model retry too', () => {
+  it('reports an outage, not quota, when the default model fails another way', async () => {
+    pinTheMessage();
+    const provider = new PinnedRingProvider('other');
+    await runUntil(provider, () => unavailableReports().length > 0);
+
+    expect(provider.modelsAsked).toEqual([PIN, PIN, undefined]);
+    const [report] = unavailableReports();
+    expect(report.classification).toBe('unavailable');
+    expect(report.message).toBe('Internal server error');
+  });
+
+  it('parks only until the earliest reset across the pinned ring and the default model', async () => {
+    pinTheMessage();
+    const provider = new PinnedRingProvider('rate_limit');
+    await runUntil(provider, () => unavailableReports().length > 0);
+
+    expect(provider.modelsAsked).toEqual([PIN, PIN, undefined]);
+    const [report] = unavailableReports();
+    expect(report.classification).toBe('quota');
+    expect(report.resetAt).toBe(DEFAULT_RESET);
+  });
+});
+
 describe('ringRateLimitQuota', () => {
   const rejection = (resetAt: string | null): ProviderEventError =>
     new ProviderEventError({
