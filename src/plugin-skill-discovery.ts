@@ -114,7 +114,12 @@ const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> =
   ]),
 };
 
-export type AgentRuntime = 'claude' | 'codex' | 'opencode';
+const AGENT_RUNTIMES = ['claude', 'codex', 'opencode'] as const;
+export type AgentRuntime = (typeof AGENT_RUNTIMES)[number];
+
+function isAgentRuntime(value: unknown): value is AgentRuntime {
+  return (AGENT_RUNTIMES as readonly unknown[]).includes(value);
+}
 
 /** Most-conservative fallback, for back-compat only; callers should pass `runtime`. */
 const DEFAULT_RUNTIME: AgentRuntime = 'claude';
@@ -152,7 +157,7 @@ export function readPluginDenySiblings(pluginDir: string): Set<AgentRuntime> {
     const raw = fs.readFileSync(path.join(pluginDir, '.nanoclaw-plugin.json'), 'utf-8');
     const parsed = JSON.parse(raw) as { denySiblings?: unknown };
     const list = Array.isArray(parsed.denySiblings) ? parsed.denySiblings : [];
-    return new Set(list.filter((x): x is AgentRuntime => x === 'claude' || x === 'codex' || x === 'opencode'));
+    return new Set(list.filter(isAgentRuntime));
   } catch {
     // No marker / unreadable / malformed → deliver to all siblings (the default).
     return new Set();
@@ -208,14 +213,13 @@ function discoverInPlugin(
   pluginDir: string,
   pluginName: string,
   denySubPluginSkillDirs: Set<string>,
-  allowNonInvocable: boolean,
-  runtime: AgentRuntime,
+  delivery: SkillDelivery,
   excluded: ExcludedPlugins,
 ): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
 
   // Applied per plugin root: the top-level plugin (rules 1-6) and each sub-plugin (rules 7-8).
-  const skipCodexNative = (root: string) => runtime === 'codex' && loadedNativelyByCodex(root);
+  const skipCodexNative = (root: string) => delivery.nativePluginLoading && loadedNativelyByCodex(root);
   const doTopLevel = !skipCodexNative(pluginDir);
 
   // Exclusions are asked ONCE, at `recordCandidate`, the seam every layout rule ends at: a per-rule check is one
@@ -228,9 +232,8 @@ function discoverInPlugin(
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
     if (excludedCandidate(skillDir)) return;
-    // OpenCode has no plugin loader, so this mirror is its only skill delivery: it gets `user-invocable: false`
-    // helpers too (visible skills reference them), at the cosmetic cost of surfacing them as commands.
-    if (!isUserInvocable(skillDir) && !allowNonInvocable) return;
+    // A sole-delivery mirror surfaces helper skills as commands too; visible skills reference them, so the cosmetic cost is accepted.
+    if (!isUserInvocable(skillDir) && !delivery.mirrorIsSoleDelivery) return;
     const fmName = readPluginName(skillDir);
     const name = fmName ?? path.basename(skillDir);
     if (skills.has(name)) return; // first match wins (preference order)
@@ -316,6 +319,14 @@ function discoverInPlugin(
   return [...skills.values()];
 }
 
+/** What the target runtime's own skill loading already does, declared by the caller. */
+interface SkillDelivery {
+  /** The runtime loads plugin skills natively, so the mirror must not list a plugin it loads a second time. */
+  nativePluginLoading: boolean;
+  /** The mirror is the runtime's only skill delivery, so it also carries `user-invocable:false` helper skills. */
+  mirrorIsSoleDelivery: boolean;
+}
+
 export interface DiscoverOptions {
   /** Plugins to skip entirely (matched against folder name) */
   denyPlugins?: Set<string>;
@@ -323,8 +334,9 @@ export interface DiscoverOptions {
   denySkills?: Set<string>;
   /** Paths or path components that should never be traversed (runtime-specific dirs) */
   denyDirSegments?: Set<string>;
-  /** Selects the sub-plugin denylist. Defaults to 'codex' for back-compat. */
+  /** Selects the sub-plugin denylist. */
   runtime?: AgentRuntime;
+  delivery: SkillDelivery;
   /**
    * A group's split `excludePlugins`, honoured for both shapes. NO HOST CALLER PASSES IT, deliberately: host
    * mirrors are shared across groups. It stays so this file remains the twin of the container copy, where it is
@@ -334,15 +346,14 @@ export interface DiscoverOptions {
 }
 
 /** Every portable skill to expose to the target runtime. No filesystem writes. */
-export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOptions = {}): DiscoveredSkill[] {
+export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOptions): DiscoveredSkill[] {
   if (!isDirectory(pluginsRoot)) return [];
 
   const denyPlugins = options.denyPlugins ?? DEFAULT_DENY_PLUGINS;
   const denySkills = options.denySkills ?? new Set<string>();
   const runtime = options.runtime ?? DEFAULT_RUNTIME;
   const denySubPluginSkillDirs = DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME[runtime];
-  // OpenCode's mirror is its sole skill delivery, so it also gets `user-invocable:false` helper skills.
-  const allowNonInvocable = runtime === 'opencode';
+  const delivery = options.delivery;
 
   const excluded = options.excludePlugins ?? splitExcludedPlugins(undefined);
 
@@ -354,14 +365,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     const pluginDir = path.join(pluginsRoot, pluginName);
     if (!isDirectory(pluginDir)) continue;
     if (readPluginDenySiblings(pluginDir).has(runtime)) continue;
-    for (const skill of discoverInPlugin(
-      pluginDir,
-      pluginName,
-      denySubPluginSkillDirs,
-      allowNonInvocable,
-      runtime,
-      excluded,
-    )) {
+    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs, delivery, excluded)) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
       // First plugin wins by name (alphabetical).

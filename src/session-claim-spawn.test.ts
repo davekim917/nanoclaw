@@ -164,7 +164,7 @@ const hooks = vi.hoisted(() => ({
 // runner must not leave a live-looking list); observed, not run.
 const { settleTaskListOnKill } = vi.hoisted(() => ({ settleTaskListOnKill: vi.fn(async () => undefined) }));
 /** A spawn mints `<prefix><folder>-<epoch ms>`; the kill label dates the container by that suffix. */
-const SPAWNED_CONTAINER_NAME = expect.stringMatching(/^nanoclaw-v2-.+-\d{13}$/);
+const SPAWNED_CONTAINER_STARTED_AT = expect.any(Number);
 vi.mock('./task-list-host.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./task-list-host.js')>()),
   settleTaskListOnKill,
@@ -838,7 +838,11 @@ describe('claim-first spawn', () => {
     expect(hooks.events).toContain('release:sess-early-error:1');
     // Not a host stop: the task list is settled as interrupted.
     await vi.waitFor(() =>
-      expect(settleTaskListOnKill).toHaveBeenCalledWith('sess-early-error', 'container-exit', SPAWNED_CONTAINER_NAME),
+      expect(settleTaskListOnKill).toHaveBeenCalledWith(
+        'sess-early-error',
+        'container-exit',
+        SPAWNED_CONTAINER_STARTED_AT,
+      ),
     );
   });
 
@@ -859,12 +863,12 @@ describe('claim-first spawn', () => {
       expect.objectContaining({ sessionId: 'sess-host-stop', code: 143 }),
     );
     expect(settleTaskListOnKill).not.toHaveBeenCalledWith('sess-host-stop', 'container-exit', expect.anything());
-    // Settled once, by the stop itself, with the name that dates the killed container.
+    // Settled once, by the stop itself, with the instant that dates the killed container.
     await vi.waitFor(() =>
       expect(settleTaskListOnKill).toHaveBeenCalledWith(
         'sess-host-stop',
         'scheduled-task-idle',
-        SPAWNED_CONTAINER_NAME,
+        SPAWNED_CONTAINER_STARTED_AT,
       ),
     );
   });
@@ -1067,10 +1071,9 @@ describe('claim-first spawn', () => {
     waiter.exitCode = 0;
     waiter.emit('close', 0);
     await waitForFinalize('sess-adopter');
-    // The host did not stop it: its task list is settled (docker wait exits 0 either way).
-    await vi.waitFor(() =>
-      expect(settleTaskListOnKill).toHaveBeenCalledWith('sess-adopter', 'container-exit', 'nanoclaw-v2-dead-host'),
-    );
+    // The host did not stop it: its task list is settled (docker wait exits 0 either way). A name with no
+    // epoch suffix dates nothing.
+    await vi.waitFor(() => expect(settleTaskListOnKill).toHaveBeenCalledWith('sess-adopter', 'container-exit', null));
   });
 
   // LAST runtime case in the file, deliberately: `stopAllContainers()` latches

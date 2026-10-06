@@ -106,16 +106,11 @@ function wakeText(cause: string, evidence: KillEvidence): string {
 export async function followUpKill(
   mailbox: NanoclawMailboxSession,
   session: Session,
-  containerName: string | null,
+  startedAtMs: number | null,
   kill: StrandingKill,
 ): Promise<ReapFollowUp> {
   return withCentralSync((): ReapFollowUp => {
-    const { followUp, startedAtMs, evidence, withheldBy, priorAttempts } = decideKill(
-      mailbox,
-      session,
-      containerName,
-      kill,
-    );
+    const { followUp, evidence, withheldBy, priorAttempts } = decideKill(mailbox, session, startedAtMs, kill);
     const checkouts = evidence.checkouts.map((checkout) => checkout.name);
     const fields: Record<string, unknown> = {
       sessionId: session.id,

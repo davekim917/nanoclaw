@@ -722,10 +722,6 @@ describe('the kill label says only what the host knows for certain', () => {
     return `todos as of ${formatLocalTime(LISTED_AT, timezone ?? (await resolveGroupTimezone('ag-1')))}`;
   }
 
-  function containerStartedAt(ms: number): string {
-    return `nanoclaw-v2-agent-${ms}`;
-  }
-
   function insertInbound(sessionId: string, row: { id: string; processAfter?: string; trigger?: number }): void {
     const db = new Database(inboundDbPath('ag-1', sessionId));
     db.prepare(
@@ -742,9 +738,10 @@ describe('the kill label says only what the host knows for certain', () => {
 
   const inHours = (hours: number): string => new Date(Date.now() + hours * HOUR).toISOString();
 
-  async function label(sessionId: string, containerName: string | null = null): Promise<unknown> {
+  /** `startedAtMs` is when the killed container started; null when the registry never named it. */
+  async function label(sessionId: string, startedAtMs: number | null = null): Promise<unknown> {
     const calls = captureAdapter();
-    await settleTaskListOnKill(sessionId, 'chat-idle-reap', containerName);
+    await settleTaskListOnKill(sessionId, 'chat-idle-reap', startedAtMs);
     expect(calls).toHaveLength(1);
     return calls[0].content.subtext;
   }
@@ -781,7 +778,7 @@ describe('the kill label says only what the host knows for certain', () => {
 
   it('keeps the runner’s label when nothing is queued', async () => {
     const sessionId = await listed();
-    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(RUNNER_LABEL);
+    expect(await label(sessionId, Date.now() - HOUR)).toBe(RUNNER_LABEL);
   });
 
   it.each([
@@ -819,7 +816,7 @@ describe('the kill label says only what the host knows for certain', () => {
   ])('never claims the session is resuming: %s leaves the runner’s label', async (_l, arrange) => {
     const sessionId = await listed();
     arrange(sessionId);
-    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(RUNNER_LABEL);
+    expect(await label(sessionId, Date.now() - HOUR)).toBe(RUNNER_LABEL);
   });
 
   it('paused with the next check, in the group’s timezone, when the agent armed a wait', async () => {
@@ -875,7 +872,7 @@ describe('the kill label says only what the host knows for certain', () => {
     const sessionId = await listed();
     const startedAt = Date.now() - HOUR;
     await approvalCard(sessionId, startedAt + 60_000);
-    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${await asOf()}`);
+    expect(await label(sessionId, startedAt)).toBe(`waiting on an approval · ${await asOf()}`);
   });
 
   it('waiting on an answer, when the killed container’s question is unanswered', async () => {
@@ -893,14 +890,14 @@ describe('the kill label says only what the host knows for certain', () => {
       options: [],
       created_at: new Date(startedAt + 60_000).toISOString(),
     });
-    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an answer · ${await asOf()}`);
+    expect(await label(sessionId, startedAt)).toBe(`waiting on an answer · ${await asOf()}`);
   });
 
   it('a card from before the killed container, or a kill with no container to date it by, is not this list’s', async () => {
     const sessionId = await listed();
     const startedAt = Date.now() - HOUR;
     await approvalCard(sessionId, startedAt - 24 * HOUR);
-    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(RUNNER_LABEL);
+    expect(await label(sessionId, startedAt)).toBe(RUNNER_LABEL);
     await approvalCard(sessionId, startedAt + 60_000);
     expect(await label(sessionId, null)).toBe(RUNNER_LABEL);
   });
@@ -914,9 +911,7 @@ describe('the kill label says only what the host knows for certain', () => {
       const sessionId = await listed();
       const startedAt = Math.floor((Date.now() - HOUR) / 1000) * 1000 + 900;
       await approvalCard(sessionId, startedAt + offsetMs);
-      expect(await label(sessionId, containerStartedAt(startedAt))).toBe(
-        state === 'stopped' ? RUNNER_LABEL : `${state} · ${await asOf()}`,
-      );
+      expect(await label(sessionId, startedAt)).toBe(state === 'stopped' ? RUNNER_LABEL : `${state} · ${await asOf()}`);
     },
   );
 
@@ -925,7 +920,7 @@ describe('the kill label says only what the host knows for certain', () => {
     const startedAt = Date.now() - HOUR;
     await approvalCard(sessionId, startedAt + 60_000);
     armWait(sessionId, 'a', inHours(1));
-    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${await asOf()}`);
+    expect(await label(sessionId, startedAt)).toBe(`waiting on an approval · ${await asOf()}`);
   });
 
   describe('a session that takes no wake keeps the runner’s label', () => {
@@ -945,7 +940,7 @@ describe('the kill label says only what the host knows for certain', () => {
         const startedAt = Date.now() - HOUR;
         await arrange(sessionId, startedAt);
         await end(sessionId);
-        expect(await label(sessionId, containerStartedAt(startedAt))).toBe(RUNNER_LABEL);
+        expect(await label(sessionId, startedAt)).toBe(RUNNER_LABEL);
       },
     );
   });
@@ -956,7 +951,7 @@ describe('the kill label says only what the host knows for certain', () => {
       items: [{ text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana' }],
       interruptedSubtext: `waiting on Dana · ${DETAIL}`,
     });
-    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`waiting on Dana · ${DETAIL}`);
+    expect(await label(sessionId, Date.now() - HOUR)).toBe(`waiting on Dana · ${DETAIL}`);
   });
 
   it('a record from an older runner gets the host’s label too: nothing in it comes from the record but an instant', async () => {

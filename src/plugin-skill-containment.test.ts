@@ -5,6 +5,8 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { discoverPortableSkills, resolvePluginRoots, syncSkillSymlinks } from './plugin-skill-discovery.js';
+
+const OPENCODE_DELIVERY = { nativePluginLoading: false, mirrorIsSoleDelivery: true };
 import { copyOpenCodeSkills, mirrorSourceRootsByName } from './providers/opencode.js';
 
 /**
@@ -35,7 +37,7 @@ describe('plugin skill mirror containment', () => {
   const runPipeline = (): { mirror: string; xdg: string; refused: string[] } => {
     const mirror = path.join(tmp, 'mirror');
     const xdg = path.join(tmp, 'xdg');
-    const discovered = discoverPortableSkills(plugins, { runtime: 'opencode' });
+    const discovered = discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY });
     const result = syncSkillSymlinks(mirror, discovered);
     copyOpenCodeSkills(mirror, xdg, {
       allowedRoots: resolvePluginRoots(plugins),
@@ -154,7 +156,7 @@ describe('plugin skill mirror containment', () => {
     fs.symlinkSync(path.join(shared, 'ref.md'), inRepoLink);
 
     const mirror = path.join(tmp, 'mirror');
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
 
     fs.unlinkSync(inRepoLink);
     fs.symlinkSync(secret, inRepoLink);
@@ -214,7 +216,7 @@ describe('plugin skill mirror containment', () => {
     fs.symlinkSync(checkoutA, path.join(plugins, 'good'));
 
     const mirror = path.join(tmp, 'mirror');
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
 
     const checkoutB = path.join(tmp, 'checkout-b');
     writeSkill(path.join(checkoutB, 'skills', 'helper'), 'helper');
@@ -256,12 +258,15 @@ describe('plugin skill mirror containment', () => {
     fs.symlinkSync(path.join(shared, 'ref.md'), link);
 
     const mirror = path.join(tmp, 'mirror');
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
     expect(fs.existsSync(path.join(mirror, 'helper', 'notes.md'))).toBe(true);
 
     fs.unlinkSync(link);
     fs.symlinkSync(secret, link);
-    const result = syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    const result = syncSkillSymlinks(
+      mirror,
+      discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }),
+    );
 
     expect(result.refused).toContain('helper/notes.md');
     expect(fs.existsSync(path.join(mirror, 'helper', 'notes.md'))).toBe(false);
@@ -280,7 +285,7 @@ describe('plugin skill mirror containment', () => {
     fs.symlinkSync(path.join(other, 'private.md'), path.join(reference, 'stolen.md'));
 
     const mirror = path.join(tmp, 'mirror');
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
     // Downgrade the mirror to the pre-record shape.
     fs.rmSync(path.join(mirror, 'helper', '.nanoclaw-source-root'));
 
@@ -339,7 +344,7 @@ describe('plugin skill mirror containment', () => {
     }) as typeof fs.writeFileSync);
     const mirror = path.join(tmp, 'mirror');
     try {
-      syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+      syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
     } finally {
       writeSpy.mockRestore();
     }
@@ -347,7 +352,7 @@ describe('plugin skill mirror containment', () => {
 
     // With the write working again the record is ours, a regular file, naming
     // this plugin — never the plugin's own bytes.
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
     const record = fs.readFileSync(path.join(mirror, 'helper', '.nanoclaw-source-root'), 'utf8');
     expect(record).toBe(`${JSON.stringify(fs.realpathSync(path.join(plugins, 'good')))}\n`);
     expect(fs.lstatSync(path.join(mirror, 'helper', '.nanoclaw-source-root')).isSymbolicLink()).toBe(false);
@@ -369,7 +374,7 @@ describe('plugin skill mirror containment', () => {
     // Honouring an arbitrary resolvable path would let a stale or planted record
     // nominate its own boundary.
     const mirror = path.join(tmp, 'mirror');
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
     fs.writeFileSync(path.join(mirror, 'helper', '.nanoclaw-source-root'), `${JSON.stringify(secretDir)}\n`);
     fs.symlinkSync(secret, path.join(mirror, 'helper', 'notes.md'));
 
@@ -413,7 +418,7 @@ describe('plugin skill mirror containment', () => {
     // an unhandled throw here escapes the cpSync filter and fails the spawn for
     // every group sharing the mirror.
     const mirror = path.join(tmp, 'mirror');
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
     fs.writeFileSync(path.join(mirror, 'loose.md'), 'loose');
     fs.writeFileSync(path.join(tmp, 'elsewhere.md'), 'elsewhere');
     fs.symlinkSync(path.join(tmp, 'elsewhere.md'), path.join(mirror, 'linked.md'));
@@ -437,7 +442,7 @@ describe('plugin skill mirror containment', () => {
     const skillDir = path.join(plugins, 'evil', 'skills', 'leak');
     writeSkill(skillDir, 'leak');
     const mirror = path.join(tmp, 'mirror');
-    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }));
     expect(fs.existsSync(path.join(mirror, 'leak', 'SKILL.md'))).toBe(true);
 
     // The whole skill directory becomes a link out of the repo.
@@ -446,7 +451,10 @@ describe('plugin skill mirror containment', () => {
     writeSkill(outside, 'leak');
     fs.symlinkSync(outside, skillDir);
 
-    const result = syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    const result = syncSkillSymlinks(
+      mirror,
+      discoverPortableSkills(plugins, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }),
+    );
     expect(result.refused).toContain('leak');
     expect(fs.existsSync(path.join(mirror, 'leak'))).toBe(false);
   });

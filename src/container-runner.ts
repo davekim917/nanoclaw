@@ -1099,6 +1099,17 @@ async function acquireContainerStorageActivity(
   };
 }
 
+/**
+ * The instant the spawn minted this container's name, which is before the container started. Unlike the registry's
+ * `spawnedAt`, it survives a host restart: adoption reads the name back from the runtime and restamps `spawnedAt`.
+ */
+export function containerStartedAtMs(containerName: string | null): number | null {
+  if (!containerName?.startsWith(CONTAINER_NAME_PREFIX)) return null;
+  const match = /-(\d+)$/.exec(containerName);
+  const ms = match ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
+}
+
 export async function resolveSessionRepositoryWorkUnit(
   session: Session,
   workgroupId: string,
@@ -1646,11 +1657,11 @@ export function captureContainerStderr(
  * scheduled task, whose normal exit is the idle reaper). Dynamic import: delivery.ts imports this module.
  * Fire-and-forget, never throws. Runs for a cancelled spawn too.
  */
-function clearStatusOnKill(sessionId: string, reason: string, container: string | null = null): void {
+function clearStatusOnKill(sessionId: string, reason: string, startedAtMs: number | null = null): void {
   void import('./delivery.js')
     .then(async (m) => {
       const { settleTaskListOnKill } = await import('./task-list-host.js');
-      await Promise.all([m.clearSessionStatusOnKill(sessionId), settleTaskListOnKill(sessionId, reason, container)]);
+      await Promise.all([m.clearSessionStatusOnKill(sessionId), settleTaskListOnKill(sessionId, reason, startedAtMs)]);
     })
     .catch((err) => {
       log.warn('Failed to clear status on container kill — leaving as-is', {
@@ -1670,7 +1681,8 @@ const hostStoppedContainers = new Set<string>();
  */
 function settleUnexpectedExit(sessionId: string, containerName: string): boolean {
   if (hostStoppedContainers.delete(containerName)) return false;
-  void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(sessionId, 'container-exit', containerName));
+  const startedAtMs = containerStartedAtMs(containerName);
+  void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(sessionId, 'container-exit', startedAtMs));
   return true;
 }
 
@@ -1687,7 +1699,7 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
   }
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName, adopted: entry.adopted });
   hostStoppedContainers.add(entry.containerName);
-  clearStatusOnKill(sessionId, reason, entry.containerName);
+  clearStatusOnKill(sessionId, reason, containerStartedAtMs(entry.containerName));
   try {
     stopContainer(entry.containerName);
   } catch {
@@ -1957,7 +1969,7 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
   }
   log.info('Killing container', { sessionId, reason, containerName, pending: true });
   hostStoppedContainers.add(containerName);
-  clearStatusOnKill(sessionId, reason, containerName);
+  clearStatusOnKill(sessionId, reason, containerStartedAtMs(containerName));
   try {
     stopContainer(containerName);
   } catch (err) {

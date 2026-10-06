@@ -77,7 +77,7 @@ async function killSubtext(
 export async function settleTaskListOnKill(
   sessionId: string,
   reason: string,
-  containerName: string | null = null,
+  containerStartedAtMs: number | null = null,
 ): Promise<void> {
   setTypingStatusText(sessionId, null);
   if (!TASK_LIST_ENABLED) return;
@@ -98,7 +98,7 @@ export async function settleTaskListOnKill(
           if (!found.edit) return { ...found, facts: null };
           // A label that cannot be worked out must not cost the list its interrupted form.
           const facts = await withCentralSync(
-            () => readKillFacts(mailbox, session, containerName),
+            () => readKillFacts(mailbox, session, containerStartedAtMs),
             'task list kill label',
           ).catch((err: unknown) => {
             log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId, reason, err });

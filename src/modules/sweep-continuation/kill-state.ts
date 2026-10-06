@@ -5,7 +5,7 @@
  * wake is withheld only on a fact read directly. Free of top-level side effects, and of any import that reaches
  * container-runner.ts or host-sweep.ts: task-list-host.ts loads this, and both of those load task-list-host.ts.
  */
-import { CONTAINER_NAME_PREFIX, SELF_HEAL_ENABLED } from '../../config.js';
+import { SELF_HEAL_ENABLED } from '../../config.js';
 import { withRawDb } from '../../db/central-lease.js';
 import { isTaskThread, SESSION_BY_ID_SQL } from '../../db/sessions.js';
 import type { Session } from '../../types.js';
@@ -28,17 +28,6 @@ export const STRANDING_KILLS: ReadonlyMap<string, (minutes: number | undefined) 
   [ABSOLUTE_CEILING_KILL, (minutes) => `was killed by the ${minutes}-minute idle ceiling`],
   [PROVIDER_UNAVAILABLE_KILL, () => `was stopped mid-turn because its model provider became unavailable`],
 ]);
-
-/**
- * The instant the spawn minted this container's name, which is before the container started. Unlike the registry's
- * `spawnedAt`, it survives a host restart: adoption reads the name back from the runtime and restamps `spawnedAt`.
- */
-export function containerStartedAtMs(containerName: string | null): number | null {
-  if (!containerName?.startsWith(CONTAINER_NAME_PREFIX)) return null;
-  const match = /-(\d+)$/.exec(containerName);
-  const ms = match ? Number(match[1]) : NaN;
-  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
-}
 
 export interface ArmedState {
   dueCount: number;
@@ -197,8 +186,6 @@ function decideKillFollowUp(args: {
 }
 
 export interface KillFacts {
-  /** Null when the registry never named the container: nothing can be dated, so nothing is attributable. */
-  startedAtMs: number | null;
   /** The earliest `wait` the agent armed that has not come due. */
   nextCheckAt: string | null;
   openCard: OpenCard | null;
@@ -206,15 +193,17 @@ export interface KillFacts {
   takesAWake: boolean;
 }
 
-/** Call inside `withCentralSync`. `containerName` is read before the kill (the registry entry is gone after exit). */
+/**
+ * Call inside `withCentralSync`. `startedAtMs` is the killed container's `containerStartedAtMs`, resolved by the
+ * caller from a name read before the kill (the registry entry is gone after exit): container-runner.ts owns that
+ * parse and this file may not import it.
+ */
 export function readKillFacts(
   mailbox: Pick<NanoclawMailboxSession, 'getNextScheduledWakeAt'>,
   session: Session,
-  containerName: string | null,
+  startedAtMs: number | null,
 ): KillFacts {
-  const startedAtMs = containerStartedAtMs(containerName);
   return {
-    startedAtMs,
     nextCheckAt: mailbox.getNextScheduledWakeAt(),
     openCard:
       startedAtMs === null
@@ -226,7 +215,6 @@ export function readKillFacts(
 
 export interface KillDecision {
   followUp: ReapFollowUp;
-  startedAtMs: number | null;
   evidence: KillEvidence;
   withheldBy: WithheldBy | null;
   priorAttempts: number;
@@ -236,11 +224,10 @@ export interface KillDecision {
 export function decideKill(
   mailbox: NanoclawMailboxSession,
   session: Session,
-  containerName: string | null,
+  startedAtMs: number | null,
   kill: { reason: string; ceilingWakeQueued?: boolean },
 ): KillDecision {
-  const facts = readKillFacts(mailbox, session, containerName);
-  const { startedAtMs } = facts;
+  const facts = readKillFacts(mailbox, session, startedAtMs);
   const dated = startedAtMs !== null;
   const evidence = dated ? readKillEvidence(mailbox, startedAtMs) : NO_EVIDENCE;
   const withheldBy: WithheldBy | null = kill.ceilingWakeQueued
@@ -263,5 +250,5 @@ export function decideKill(
     priorAttempts,
     selfHeal: SELF_HEAL_ENABLED,
   });
-  return { followUp, startedAtMs, evidence, withheldBy, priorAttempts };
+  return { followUp, evidence, withheldBy, priorAttempts };
 }

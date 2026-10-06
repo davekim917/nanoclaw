@@ -1136,7 +1136,7 @@ describe('kills that never queue a wake', () => {
     recordWorktree(startedAt + 60_000);
     const info = vi.spyOn(log, 'info');
 
-    const followUp = await followUpKill(mailbox, await session(), containerNamed(startedAt), { reason });
+    const followUp = await followUpKill(mailbox, await session(), startedAt, { reason });
 
     expect(followUp).toEqual({ action: 'none', reason: 'reason-not-covered' });
     expect(wakeRows()).toHaveLength(0);

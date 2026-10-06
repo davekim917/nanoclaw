@@ -10,6 +10,7 @@ import type Database from 'better-sqlite3';
 
 import { SELF_HEAL_ENABLED } from '../../config.js';
 import {
+  containerStartedAtMs,
   getContainerSpawnedAt,
   isContainerRunning,
   isContainerSpawning,
@@ -604,7 +605,8 @@ function registerContinuationSweepDuties(): void {
         }
       });
       try {
-        await followUpKill(mailbox, ctx.session, ctx.observed?.containerIdentity?.containerName ?? null, {
+        const startedAtMs = containerStartedAtMs(ctx.observed?.containerIdentity?.containerName ?? null);
+        await followUpKill(mailbox, ctx.session, startedAtMs, {
           reason: ABSOLUTE_CEILING_KILL,
           minutes: Math.round(Math.max(outcome.ceilingMs, ABSOLUTE_CEILING_MS) / 60_000),
           ceilingWakeQueued: ceiling?.action === 'wake-accountable',

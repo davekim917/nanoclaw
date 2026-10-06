@@ -77,7 +77,7 @@ describe('skill delivery follows the contract', () => {
   });
 
   const names = (runtime: AgentRuntime): string[] =>
-    discoverPortableSkills(root, { runtime })
+    discoverPortableSkills(root, { runtime, delivery: providerContract(runtime).skills })
       .map((s) => s.name)
       .sort();
 
