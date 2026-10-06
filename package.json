@@ -44,25 +44,14 @@
     "mailbox-model:check": "cmp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts"
   },
   "dependencies": {
-<<<<<<< HEAD
     "@chat-adapter/discord": "4.41.1",
     "@chat-adapter/slack": "4.41.1",
-    "@clack/core": "^1.4.3",
-    "@clack/prompts": "^1.7.0",
-    "@onecli-sh/sdk": "2.2.1",
-    "@slack/web-api": "8.0.0",
-    "better-sqlite3": "11.10.0",
-    "chat": "4.41.1",
-=======
-    "@chat-adapter/discord": "4.29.0",
-    "@chat-adapter/slack": "4.29.0",
     "@clack/core": "^1.5.1",
     "@clack/prompts": "^1.8.1",
     "@onecli-sh/sdk": "2.2.1",
     "@slack/web-api": "8.2.0",
     "better-sqlite3": "13.0.3",
-    "chat": "4.29.0",
->>>>>>> origin/main
+    "chat": "4.41.1",
     "chokidar": "5.0.0",
     "cron-parser": "5.10.1",
     "discord.js": "^14.27.0",
