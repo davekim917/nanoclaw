@@ -84,7 +84,8 @@
       "ws@<8.20.1": "^8.20.1"
     },
     "patchedDependencies": {
-      "@chat-adapter/discord@4.41.1": "patches/@chat-adapter__discord@4.41.1.patch"
+      "@chat-adapter/discord@4.41.1": "patches/@chat-adapter__discord@4.41.1.patch",
+      "@chat-adapter/shared@4.41.1": "patches/@chat-adapter__shared@4.41.1.patch"
     }
   }
 }

@@ -1,0 +1,21 @@
+diff --git a/dist/index.js b/dist/index.js
+index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..bc2ef29f37598c11af4b265dd846a96c169c16c7 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -738,8 +738,14 @@ function findCodeEnd(text, index, end) {
+   if (text[index] !== "`") {
+     return index;
+   }
+-  const fence = text.startsWith("```", index);
+-  const marker = fence ? "```" : "`";
++  // A code span opens with a run of N backticks and closes with a run of the same
++  // length (CommonMark 6.1), so ``npm i @scope/pkg`` is one span, not two empty ones.
++  let runLength = 1;
++  while (text[index + runLength] === "`") {
++    runLength += 1;
++  }
++  const fence = runLength >= 3;
++  const marker = "`".repeat(runLength);
+   const start = index + marker.length;
+   const close = text.indexOf(marker, start);
+   if (close === -1 || close >= end) {
