@@ -740,7 +740,7 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
       ? []
       : discoverPortableSkills(CONTAINER_PLUGINS_DIR, {
           runtime,
-          delivery: runtime === undefined ? undefined : providerContract(runtime).skills,
+          delivery: runtime === undefined ? { nativePluginLoading: false, mirrorIsSoleDelivery: false } : providerContract(runtime).skills,
           excludePlugins: loadExcludedPlugins(),
         });
 

@@ -222,6 +222,7 @@ function discoverInPlugin(
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
     if (excludedCandidate(skillDir)) return;
+    // A sole-delivery mirror surfaces helper skills as commands too; visible skills reference them, so the cosmetic cost is accepted.
     if (!isUserInvocable(skillDir) && !delivery.mirrorIsSoleDelivery) return;
     const fmName = readPluginName(skillDir);
     const name = fmName ?? path.basename(skillDir);
@@ -308,15 +309,13 @@ function discoverInPlugin(
   return [...skills.values()];
 }
 
-/** What the target runtime's skill loading already does, declared by the caller: this module never asks by provider name. */
+/** What the target runtime's own skill loading already does, declared by the caller. */
 interface SkillDelivery {
   /** The runtime loads plugin skills natively, so the mirror must not list a plugin it loads a second time. */
   nativePluginLoading: boolean;
   /** The mirror is the runtime's only skill delivery, so it also carries `user-invocable:false` helper skills. */
   mirrorIsSoleDelivery: boolean;
 }
-
-const NO_PROVIDER_FACTS: SkillDelivery = { nativePluginLoading: false, mirrorIsSoleDelivery: false };
 
 export interface DiscoverOptions {
   /** Plugins to skip entirely (matched against folder name) */
@@ -325,23 +324,22 @@ export interface DiscoverOptions {
   denySkills?: Set<string>;
   /** Paths or path components that should never be traversed (runtime-specific dirs) */
   denyDirSegments?: Set<string>;
-  /** Selects the sub-plugin denylist. Defaults to 'codex' for back-compat. */
+  /** Selects the sub-plugin denylist. */
   runtime?: AgentRuntime;
-  /** Defaults to no provider facts: nothing skipped, no helper skills. */
-  delivery?: SkillDelivery;
+  delivery: SkillDelivery;
   /** A group's split `excludePlugins`, honoured for both shapes. Host callers build unscoped mirrors and pass none. */
   excludePlugins?: ExcludedPlugins;
 }
 
 /** Every portable skill to expose to the target runtime. No filesystem writes. */
-export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOptions = {}): DiscoveredSkill[] {
+export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOptions): DiscoveredSkill[] {
   if (!isDirectory(pluginsRoot)) return [];
 
   const denyPlugins = options.denyPlugins ?? DEFAULT_DENY_PLUGINS;
   const denySkills = options.denySkills ?? new Set<string>();
   const runtime = options.runtime ?? DEFAULT_RUNTIME;
   const denySubPluginSkillDirs = DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME[runtime];
-  const delivery = options.delivery ?? NO_PROVIDER_FACTS;
+  const delivery = options.delivery;
 
   const excluded = options.excludePlugins ?? splitExcludedPlugins(undefined);
 
