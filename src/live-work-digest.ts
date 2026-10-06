@@ -31,6 +31,7 @@ const CLIPPED = ' …';
 
 interface LiveWorkSession {
   owner: string;
+  self: boolean;
   channel: string | null;
   threadId: string | null;
   link: string | null;
@@ -52,6 +53,8 @@ export interface LiveWorkDigest {
   sessions: LiveWorkSession[];
   claims: LiveWorkClaim[];
   omitted: number;
+  /** The candidate scan hit its cap, so an empty snapshot does not show that nothing is under way. */
+  partial: boolean;
 }
 
 export interface LiveWorkDeps {
@@ -80,12 +83,18 @@ interface OpenList {
   list: TaskListInFlight;
 }
 
+interface OwnConversation {
+  sessionId: string;
+  threadId: string | null;
+  platformId: string | null;
+}
+
 async function readOpenLists(
   agentGroupId: string,
   workgroupId: string | null,
-  sessionId: string,
+  own: OwnConversation,
   now: number,
-): Promise<OpenList[]> {
+): Promise<{ open: OpenList[]; partial: boolean }> {
   const since = new Date(now - LIVE_WORK_BOUNDS.listWindowMs).toISOString();
   const rows = await getDb().all<CandidateRow>(
     `SELECT s.id AS id, s.agent_group_id AS agent_group_id, ag.name AS owner, s.thread_id AS thread_id,
@@ -95,12 +104,19 @@ async function readOpenLists(
        LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
       WHERE (s.agent_group_id = ? OR ag.workgroup_id = ?)
         AND s.id != ? AND s.status = 'active' AND s.archived_at IS NULL
+        AND (? IS NULL OR s.thread_id IS NOT ?)
+        AND (? IS NOT NULL OR ? IS NULL OR NOT (s.thread_id IS NULL AND mg.platform_id IS ?))
         AND datetime(COALESCE(s.last_active, s.created_at)) >= datetime(?)
       ORDER BY datetime(COALESCE(s.last_active, s.created_at)) DESC
       LIMIT ?`,
     agentGroupId,
     workgroupId,
-    sessionId,
+    own.sessionId,
+    own.threadId,
+    own.threadId,
+    own.threadId,
+    own.platformId,
+    own.platformId,
     since,
     LIVE_WORK_BOUNDS.candidateSessions,
   );
@@ -120,7 +136,8 @@ async function readOpenLists(
     if (list.unfinished.length + list.waiting.length === 0) continue;
     open.push({ row, list });
   }
-  return open.sort((a, b) => Date.parse(b.list.at) - Date.parse(a.list.at) || a.row.id.localeCompare(b.row.id));
+  open.sort((a, b) => Date.parse(b.list.at) - Date.parse(a.list.at) || a.row.id.localeCompare(b.row.id));
+  return { open, partial: rows.length >= LIVE_WORK_BOUNDS.candidateSessions };
 }
 
 function markedItems(list: TaskListInFlight): string[] {
@@ -137,16 +154,27 @@ function markedItems(list: TaskListInFlight): string[] {
 async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDeps): Promise<LiveWorkDigest | null> {
   const now = deps.now ?? Date.now();
   const linkFor = deps.linkFor ?? defaultLinkFor;
-  const own = await getDb().get<{ thread_id: string | null }>('SELECT thread_id FROM sessions WHERE id = ?', sessionId);
+  const own = await getDb().get<{ thread_id: string | null; platform_id: string | null }>(
+    `SELECT s.thread_id AS thread_id, mg.platform_id AS platform_id
+       FROM sessions s LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+      WHERE s.id = ?`,
+    sessionId,
+  );
   const ownThread = own?.thread_id ?? null;
   const link = async (threadId: string | null) => (threadId && !isTaskThread(threadId) ? linkFor(threadId) : null);
 
   const workgroupId = (await getAgentGroup(agentGroupId))?.workgroup_id ?? null;
-  const lists = await readOpenLists(agentGroupId, workgroupId, sessionId, now);
+  const { open: lists, partial } = await readOpenLists(
+    agentGroupId,
+    workgroupId,
+    { sessionId, threadId: ownThread, platformId: own?.platform_id ?? null },
+    now,
+  );
   const sessions: LiveWorkSession[] = [];
   for (const { row, list } of lists.slice(0, LIVE_WORK_BOUNDS.sessions)) {
     sessions.push({
       owner: row.owner,
+      self: row.agent_group_id === agentGroupId,
       channel: row.channel ?? (isTaskThread(row.thread_id) ? 'scheduled task' : null),
       threadId: row.thread_id,
       link: await link(row.thread_id),
@@ -177,7 +205,7 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
     });
   }
 
-  return { sessions, claims, omitted: lists.length - sessions.length + (live.length - claims.length) };
+  return { sessions, claims, omitted: lists.length - sessions.length + (live.length - claims.length), partial };
 }
 
 /** Empty when nothing is live elsewhere, null when unreadable. Never throws: a failure must not cost the turn its recall. */

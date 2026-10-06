@@ -145,6 +145,7 @@ describe('buildLiveWorkDigest', () => {
     expect(digest?.sessions).toEqual([
       {
         owner: 'Live',
+        self: true,
         channel: 'scheduled task',
         threadId: 'system:tasks:nightly',
         link: null,
@@ -154,6 +155,7 @@ describe('buildLiveWorkDigest', () => {
       },
       {
         owner: 'Live',
+        self: true,
         channel: '#build-room',
         threadId: 'slack:CBUILD:2.000',
         link: 'https://chat.example/slack:CBUILD:2.000',
@@ -169,6 +171,7 @@ describe('buildLiveWorkDigest', () => {
       ['handoff', 'parked', 'https://chat.example/slack:CBUILD:8.000'],
     ]);
     expect(digest?.omitted).toBe(0);
+    expect(digest?.partial).toBe(false);
   });
 
   it('returns an empty snapshot when the only work is this conversation’s own', async () => {
@@ -178,6 +181,7 @@ describe('buildLiveWorkDigest', () => {
       sessions: [],
       claims: [],
       omitted: 0,
+      partial: false,
     });
   });
 
@@ -196,6 +200,12 @@ describe('buildLiveWorkDigest', () => {
       'ag-sib',
     );
     await session(
+      'sess-sib-here',
+      MY_THREAD,
+      { title: 'Shared thread work', items: [{ text: 'Pair on it', status: 'in_progress' }], touchedAt: at(0) },
+      'ag-sib',
+    );
+    await session(
       'sess-far',
       'slack:CBUILD:3.000',
       { title: 'Other workgroup build', items: [{ text: 'Build', status: 'in_progress' }], touchedAt: at(0) },
@@ -204,9 +214,34 @@ describe('buildLiveWorkDigest', () => {
 
     const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
 
-    expect(digest?.sessions.map((s) => [s.owner, s.title, s.link])).toEqual([
-      ['Sib', 'Hosted QA environment', 'https://chat.example/slack:CBUILD:2.000'],
+    expect(digest?.sessions.map((s) => [s.owner, s.self, s.title, s.link])).toEqual([
+      ['Sib', false, 'Hosted QA environment', 'https://chat.example/slack:CBUILD:2.000'],
     ]);
+  });
+
+  it('marks the snapshot partial when the candidate scan hits its cap', async () => {
+    for (let i = 0; i < LIVE_WORK_BOUNDS.candidateSessions; i++) {
+      await createSession({
+        id: `sess-quiet-${i}`,
+        agent_group_id: AG,
+        messaging_group_id: null,
+        thread_id: `system:tasks:quiet-${i}`,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: at(-30 * 60 * 1000),
+        created_at: at(-2 * HOUR),
+      });
+    }
+    await session('sess-long-build', 'slack:CBUILD:2.000', {
+      title: 'Long build',
+      items: [{ text: 'Provision QA', status: 'in_progress' }],
+      touchedAt: at(0),
+    });
+
+    const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
+
+    expect(digest).toEqual({ sessions: [], claims: [], omitted: 0, partial: true });
   });
 
   it('caps the claims it carries and counts the rest as omitted', async () => {

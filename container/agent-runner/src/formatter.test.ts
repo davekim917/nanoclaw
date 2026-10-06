@@ -826,6 +826,7 @@ describe('formatSystemMessage', () => {
           sessions: [
             {
               owner: 'Sib',
+              self: false,
               channel: '#build-room',
               threadId: 'slack:CBUILD:1.000',
               link: 'https://chat.example/build',
@@ -874,6 +875,33 @@ describe('formatSystemMessage', () => {
     );
     expect(result).not.toContain('<untrusted_live_work_json>');
     expect(result).not.toContain('match by topic, not by slug');
+  });
+
+  it('never calls a partial scan clear, and flags it alongside what was found', () => {
+    insertMessage(
+      'sys-partial-empty',
+      'system',
+      recallWith({ liveWork: { sessions: [], claims: [], omitted: 0, partial: true } }),
+    );
+    insertMessage(
+      'sys-partial-found',
+      'system',
+      recallWith({
+        liveWork: {
+          sessions: [],
+          claims: [{ slug: 'qa-env', owner: 'bo', state: 'live', note: 'QA env', threadId: null, link: null }],
+          omitted: 0,
+          partial: true,
+        },
+      }),
+    );
+
+    const result = formatMessages(getPendingMessages());
+
+    expect(result).not.toContain('no unfinished work in other threads right now');
+    expect(result).toContain('[Live work in other threads - host snapshot incomplete: none found');
+    expect(result).toContain('The scan was incomplete');
+    expect(result).toContain('qa-env');
   });
 
   it('test_formatSystemMessage_action_result', () => {

@@ -663,7 +663,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       }
       fs.rmSync(path.join(claimsDir, 'qa-env.json'));
       await writeSessionMessage(AG, SESS, ask('smoke-go'));
-      expect(recall('recall-smoke-go').liveWork).toEqual({ sessions: [], claims: [], omitted: 0 });
+      expect(recall('recall-smoke-go').liveWork).toEqual({ sessions: [], claims: [], omitted: 0, partial: false });
     } finally {
       outbound.close();
       inbound.close();

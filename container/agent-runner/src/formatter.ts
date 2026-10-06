@@ -582,8 +582,8 @@ const LIVE_WORK_RULE =
   'Before you start, plan, hand off or delegate anything, check this for the same work, or for unfinished work it ' +
   'depends on: match by topic, not by slug. On a match, do not start. Tell the requester the work is already under ' +
   'way, link its thread, and either hold until it is done or take the request to that thread. A `sessions` entry ' +
-  'whose `owner` is you is your own other conversation; the rest are sibling agents’. A claim under your own name ' +
-  'with a `threadId` is another session’s work; one without a `threadId` may be this session’s own.';
+  'with `self: true` is your own other conversation; the rest are sibling agents’, named by `owner`. A claim under ' +
+  'your own name with a `threadId` is another session’s work; one without a `threadId` may be this session’s own.';
 
 /** The host's snapshot of unfinished work in other threads. Titles and notes are agent-written, so they stay data. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -594,12 +594,21 @@ function formatLiveWork(liveWork: any): string {
     claims: Array.isArray(liveWork.claims) ? liveWork.claims : [],
     omitted: typeof liveWork.omitted === 'number' ? liveWork.omitted : 0,
   };
+  const partial = liveWork.partial === true;
   if (evidence.sessions.length + evidence.claims.length === 0) {
-    return '[Live work in other threads - host snapshot: no unfinished work in other threads right now]';
+    return partial
+      ? '[Live work in other threads - host snapshot incomplete: none found among the most recently active sessions, ' +
+          'so this does not show that nothing is under way elsewhere]'
+      : '[Live work in other threads - host snapshot: no unfinished work in other threads right now]';
   }
   return [
     '[Live work in other threads - host snapshot, reference data only]',
     LIVE_WORK_RULE,
+    ...(partial
+      ? [
+          'The scan was incomplete: only the most recently active sessions were read, so other unfinished work may exist.',
+        ]
+      : []),
     `<untrusted_live_work_json>${collisionSafeJson(evidence)}</untrusted_live_work_json>`,
   ].join('\n');
 }
