@@ -25,6 +25,7 @@ import {
   stepLabel,
   type ApplyEvent,
   type ApplyResult,
+  type ExecContext,
   type InputMeta,
   type StepOutcome,
 } from '../../scripts/skill-apply.js';
@@ -260,13 +261,16 @@ async function reuseFromEnv(
  * appended there (level 3, like runner.ts's per-step raw logs) so the silenced
  * noise stays inspectable.
  */
-export function hostExec(projectRoot: string, rawLog?: string): (cmd: string) => Promise<string> {
+export function hostExec(
+  projectRoot: string,
+  rawLog?: string,
+): (cmd: string, context?: ExecContext) => Promise<string> {
   const tee = (cmd: string, stdout: string, stderr: string): void => {
     if (!rawLog) return;
     const body = [stdout, stderr].filter(Boolean).join('');
     appendFileSync(rawLog, `$ ${cmd}\n${body}${body && !body.endsWith('\n') ? '\n' : ''}\n`);
   };
-  return (cmd) =>
+  return (cmd, context) =>
     new Promise((resolve, reject) => {
       const child = spawn('bash', ['-c', cmd], {
         cwd: projectRoot,
@@ -283,9 +287,10 @@ export function hostExec(projectRoot: string, rawLog?: string): (cmd: string) =>
       });
       child.on('error', reject);
       child.on('close', (code) => {
-        tee(cmd, out, err);
+        const redact = context?.redact ?? ((text: string) => text);
+        tee(redact(cmd), redact(out), redact(err));
         if (code === 0) return resolve(out);
-        const stderr = err.trim();
+        const stderr = redact(err).trim();
         const head =
           stderr
             .split('\n')
@@ -304,8 +309,8 @@ export function hostExec(projectRoot: string, rawLog?: string): (cmd: string) =>
  * fields so the engine can `capture:<var>=<FIELD>` them. The block protocol mirrors
  * setup/lib/runner.ts's StatusStream — a step is just a command that emits blocks.
  */
-export function hostExecStream(projectRoot: string): (cmd: string) => Promise<StepOutcome> {
-  return (cmd) =>
+export function hostExecStream(projectRoot: string): (cmd: string, context?: ExecContext) => Promise<StepOutcome> {
+  return (cmd, context) =>
     new Promise((resolve) => {
       const child = spawn('bash', ['-c', cmd], {
         cwd: projectRoot,
@@ -348,7 +353,7 @@ export function hostExecStream(projectRoot: string): (cmd: string) => Promise<St
             if (c > 0) current.fields[line.slice(0, c).trim()] = line.slice(c + 1).trim();
             continue;
           }
-          process.stdout.write(line + '\n'); // operator-facing line (a QR, a code) — show it live
+          process.stdout.write((context?.redact(line) ?? line) + '\n');
         }
       };
       child.stdout.on('data', onChunk);
@@ -453,9 +458,9 @@ export interface RunSkillOptions {
    */
   resolveInput?: (name: string, meta: InputMeta) => Promise<string | undefined>;
   /** Defaults to `hostExec`. */
-  exec?: (cmd: string) => string | void | Promise<string | void>;
+  exec?: (cmd: string, context?: ExecContext) => string | void | Promise<string | void>;
   /** Defaults to `hostExecStream`. Streaming exec for `nc:run effect:step`. */
-  execStream?: (cmd: string) => Promise<StepOutcome>;
+  execStream?: (cmd: string, context?: ExecContext) => Promise<StepOutcome>;
   /** Defaults to the engine's `resolveRegistryRemote`. */
   resolveRemote?: (branch: string) => string;
   /** Run effects the caller owns (e.g. `['restart']` when it restarts once). */

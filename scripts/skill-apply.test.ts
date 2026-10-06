@@ -1017,6 +1017,20 @@ describe('nc:run effect:step (streaming, multi-field capture)', () => {
     expect(res.deferred.some((d) => /platform_id/.test(d))).toBe(true); // downstream env-set then defers
   });
 
+  it('a step field that contains a resolved secret is bound as a secret', async () => {
+    const { sdir, rdir } = stepScratch();
+    writeFileSync(join(sdir, 'SKILL.md'), '```nc:prompt token secret\nToken\n```\n' + STEP_SKILL);
+    const secret = 'step-secret-never-surface';
+    const execStream = async () => ({
+      ok: true,
+      fields: { STATUS: 'success', PLATFORM_ID: `telegram:${secret}`, ADMIN_ID: '67890' },
+    });
+    const res = await applySkill(sdir, rdir, { inputs: { token: secret }, exec: () => {}, execStream });
+    expect(fullyApplied(res)).toBe(true);
+    expect(res.vars.owner_handle).toBe('67890');
+    expect(JSON.stringify(res)).not.toContain(secret);
+  });
+
   it('a failed step bounces to an agent rather than capturing empty values', async () => {
     const { sdir, rdir } = stepScratch();
     const res = await applySkill(sdir, rdir, { exec: () => {}, execStream: async () => ({ ok: false, fields: {} }) });
@@ -1393,6 +1407,20 @@ describe('onEvent (core event seam)', () => {
     expect(op.text).toBe('Hello world — go click the button.'); // {{var}} substituted
     expect(op.line).toBe(opLine); // keyed on the opening-fence line (driver policy maps)
     expect(res.operatorMessages).toEqual(['Hello world — go click the button.']); // still collected in the result
+  });
+
+  it('never renders a resolved secret into an operator message or event', async () => {
+    const md =
+      '# op\n\n```nc:prompt token secret\nToken?\n```\nTell the user:\n```nc:operator\nYour token is {{token}}; keep it safe.\n```\n';
+    writeFileSync(join(eskill, 'SKILL.md'), md);
+    const events: ApplyEvent[] = [];
+    const res = await applySkill(eskill, eroot, {
+      inputs: { token: 'operator-secret-never-shown' },
+      exec: () => {},
+      onEvent: (e) => void events.push(e),
+    });
+    expect(res.operatorMessages).toEqual(['Your token is [REDACTED]; keep it safe.']);
+    expect(JSON.stringify(events)).not.toContain('operator-secret-never-shown');
   });
 
   it('awaits each onEvent before evaluating the next directive (async handler ordering)', async () => {
