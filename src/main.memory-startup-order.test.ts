@@ -240,6 +240,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
         survivable: 0,
         unlabeled: 0,
         survivableSessionIds: [],
+        survivingWorkgroupIds: [],
         mustStopSessionIds: [],
       });
     },

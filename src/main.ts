@@ -284,10 +284,7 @@ export interface BootMountQuiescenceDeps {
     },
   ) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
-  reconcileShared?: (
-    db: Database.Database,
-    dirs: { workgroupIds?: string[]; quiescedWorkgroupIds?: string[] },
-  ) => unknown;
+  reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => unknown;
   memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
   prune?: () => void;
   fatal?: (message: string, err: unknown) => never;
@@ -335,8 +332,8 @@ export async function runBootMountQuiescence(
     string,
     { memory: WorkgroupMemoryPendingChange | null; shared: SharedDirsPendingChange | null }
   >();
-  // A workgroup is "changed" (its containers must stop) only for a write that rewrites what a live mount resolves
-  // to. A shared-dirs symlink write is reconciled under live containers instead.
+  // A workgroup is "changed" (its containers must stop) only for a write that changes what an existing path in a
+  // live mount resolves to. A pending link creation is taken at a boot that finds the workgroup idle, never live.
   // Once a D2 survivable-container path exists, a pending wiki core.hooksPath change must also count as a mount
   // change here, before the door runs: a survivor keeps its pre-migration `.git/config` mount and has no hook.
   const evaluateChanged = (): string[] => {
@@ -399,7 +396,10 @@ export async function runBootMountQuiescence(
     // Non-empty means a live agent wrote to a group directory while the door was stopping it.
     ...(flipped.length > 0 ? { flipped } : {}),
   });
-  const linkOnlyWorkgroupIds: string[] = [];
+  // Every write runs with the workgroup's containers stopped. The changed set was stopped by the door; a workgroup
+  // with only link creations pending is written at a boot where nothing of it survived, and otherwise waits.
+  const surviving = new Set(scope.survivingWorkgroupIds);
+  const idleLinkWorkgroupIds: string[] = [];
   for (const [workgroupId, entry] of pending) {
     if (changedWorkgroupIds.includes(workgroupId)) {
       log.info('Boot quiescence changed workgroup', {
@@ -410,39 +410,27 @@ export async function runBootMountQuiescence(
           : { write: entry.shared ? describeMutation(entry.shared) : 'none' }),
       });
     } else if (entry.shared && !entry.shared.invalidatesMounts) {
-      linkOnlyWorkgroupIds.push(workgroupId);
-      log.info('Boot quiescence symlink-only reconcile, containers kept', {
-        workgroupId,
-        write: describeMutation(entry.shared),
-      });
+      const idle = !surviving.has(workgroupId);
+      if (idle) idleLinkWorkgroupIds.push(workgroupId);
+      log.info(
+        idle
+          ? 'Boot quiescence link creation on an idle workgroup'
+          : 'Boot quiescence link creation deferred, containers kept',
+        {
+          workgroupId,
+          write: describeMutation(entry.shared),
+        },
+      );
     }
   }
+  const reconcileWorkgroupIds = [...changedWorkgroupIds, ...idleLinkWorkgroupIds];
 
-  // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed for the changed set, the
-  // only one proven stopped and so the only one that may take mount-invalidating writes. The link-creation set is
-  // reconciled under live containers, whose agents can make a creation fail (EACCES); the link is then still
-  // pending for the next boot's door, if it still applies — not a reason to take the fleet down.
+  // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed.
   if (sharedFsEnabled) {
     try {
-      (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, {
-        workgroupIds: changedWorkgroupIds,
-        quiescedWorkgroupIds: changedWorkgroupIds,
-      });
+      (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, { workgroupIds: reconcileWorkgroupIds });
     } catch (sharedErr) {
       fatal('Workgroup shared-FS consolidation failed at startup', sharedErr);
-    }
-    if (linkOnlyWorkgroupIds.length > 0) {
-      try {
-        (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, {
-          workgroupIds: linkOnlyWorkgroupIds,
-          quiescedWorkgroupIds: [],
-        });
-      } catch (sharedErr) {
-        log.error('Workgroup shared-FS link housekeeping failed under live containers; reconsidered next boot', {
-          workgroupIds: linkOnlyWorkgroupIds,
-          err: sharedErr,
-        });
-      }
     }
   }
 

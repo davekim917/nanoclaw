@@ -159,6 +159,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       survivable: 0,
       unlabeled: 0,
       survivableSessionIds: [],
+      survivingWorkgroupIds: [],
       mustStopSessionIds: ['nanoclaw-v2-a-1-session'],
     });
     expect(spawns).toEqual([]);
@@ -188,6 +189,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       survivable: 1,
       unlabeled: 1,
       survivableSessionIds: ['nanoclaw-v2-b-1-session'],
+      survivingWorkgroupIds: ['wg-b'],
       mustStopSessionIds: ['nanoclaw-v2-a-1-session', 'nanoclaw-v2-legacy-1-session'],
     });
     expect(scope.stopped).toBeLessThan(scope.containers);
@@ -258,6 +260,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       survivable: 1,
       unlabeled: 1,
       survivableSessionIds: ['nanoclaw-v2-b-1-session'],
+      survivingWorkgroupIds: ['wg-b'],
       mustStopSessionIds: ['nanoclaw-v2-legacy-1-session', 'nanoclaw-v2-c-1-session'],
     });
     expect(spawns).toEqual([]);

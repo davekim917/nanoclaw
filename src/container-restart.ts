@@ -443,6 +443,8 @@ export interface BootQuiescenceScope {
   unlabeled: number;
   /** Length equals `survivable`. */
   survivableSessionIds: string[];
+  /** Workgroup labels of the survivors: a workgroup absent here has no running container after the door. */
+  survivingWorkgroupIds: string[];
   /** Sessions that must be stopped; an unlabeled container is stopped by name and contributes no id. */
   mustStopSessionIds: string[];
 }
@@ -589,6 +591,7 @@ export async function quiesceWorkgroupsForBootMountChange(
     survivable: survivors.length,
     unlabeled: unlabeled.length,
     survivableSessionIds: survivors.map((entry) => entry.sessionId as string),
+    survivingWorkgroupIds: [...new Set(survivors.map((entry) => entry.workgroupId as string))],
     mustStopSessionIds: [...new Set(sessionIdsOf([...preStop.mustStop, ...afterFirstPass.mustStop]))],
   };
   // Session-id arrays stay out of the line: a large fleet would bury the counts.
