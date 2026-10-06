@@ -6,6 +6,7 @@ import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { getContinuation, setContinuation } from './db/session-state.js';
 import { cancelWorkContinuation, getWorkContinuation, queueWorkContinuation } from './modules/mailbox/index.js';
+import { getWorktreeInFlight } from './modules/mailbox/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop, type PollLoopConfig } from './poll-loop.js';
@@ -459,6 +460,8 @@ describe('durable work continuation', () => {
     expect(JSON.parse(deliverableOut()[0].content).text).toBe('plan written');
     expect(getWorkContinuation()).toBeUndefined();
     expect(autosaveReasons).toEqual(['turn end']);
+    // The turn end also wrote the reap's in-flight record (no topic checkouts here, so empty).
+    expect(getWorktreeInFlight()?.checkouts).toEqual([]);
 
     await loopPromise.catch(() => {});
   });

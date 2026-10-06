@@ -157,8 +157,10 @@ import {
   clearWorkContinuation,
   readContinuationPresence,
   readDoneProposal,
+  readWorktreeInFlight,
   type ContinuationPresence,
   type DoneProposal,
+  type WorktreeInFlight,
 } from './ops/session-state.js';
 import {
   countDueMessages,
@@ -230,6 +232,7 @@ export {
   clearWorkContinuation,
   readDoneProposal,
   type DoneProposal,
+  type WorktreeInFlight,
 } from './ops/session-state.js';
 
 /** The layout, for callers that only need a PATH; for the data, open a mailbox session. */
@@ -476,6 +479,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** Opens outbound.db read-write. The only host write to a container-owned key. */
   clearWorkContinuation(): ContinuationPresence | null;
   readDoneProposal(): DoneProposal | null;
+  readWorktreeInFlight(): WorktreeInFlight | null;
   hasRestartNoteSince(since: string): boolean;
 
   readRepoIngressFence(): RepoIngressFence | null;
@@ -524,6 +528,7 @@ type NanoclawOutboundRead = Pick<
   | 'getProcessingClaimRows'
   | 'readRepositoryMountBarrierAck'
   | 'readDoneProposal'
+  | 'readWorktreeInFlight'
   | 'readContinuationPresence'
 >;
 
@@ -675,6 +680,7 @@ function composeOutboundOps(
     // otherwise it would author the container-owned outbound.db the host must
     // never create.
     readDoneProposal: () => readOutbound(null, readDoneProposal),
+    readWorktreeInFlight: () => readOutbound(null, readWorktreeInFlight),
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
     // Rebinds upstream's op: upstream's takes `writable()` unconditionally and

@@ -36,6 +36,7 @@ import {
   type SessionRunner,
 } from '../../host-sweep.js';
 import { decideCeilingFollowUp, type CeilingFollowUp } from './decide.js';
+import { ACCOUNT_FOR_STATE, RESTART_SURVIVAL_RULES } from './reap-respawn.js';
 
 export { decideCeilingFollowUp, type CeilingFollowUp } from './decide.js';
 
@@ -214,10 +215,7 @@ function writeCeilingRespawn(
   const text =
     `[system] Your previous container was killed by the ${idleMinutes}-minute idle ceiling ` +
     `(no active turn for ~${silentMinutes} min). If work was in flight: check your durable checkpoints, ` +
-    `resume what is safely resumable, and post ONE message accounting for state — done / lost / next. ` +
-    `Re-check any work claims in claims/ before resuming a seam — a sibling may have taken it over while you were down. ` +
-    `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
-    `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay. ` +
+    `resume what is safely resumable, and ${ACCOUNT_FOR_STATE}. ${RESTART_SURVIVAL_RULES} ` +
     `If nothing was in flight, say so in one line.${savedWork}`;
   writeSystemWake(mailbox, session, `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`, text, {
     kind: 'agent_ceiling_respawn',
