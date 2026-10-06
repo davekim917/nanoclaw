@@ -3,7 +3,7 @@ import type Database from 'better-sqlite3';
 
 /** Id prefixes of the deferred wake rows the sweep parks when a budget is spent. */
 const RECOVERY_WAKE_ID_PATTERNS =
-  "(id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')";
+  "(id LIKE 'ceiling-respawn-%' OR id LIKE 'reap-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')";
 
 export function hasDueRecoveryWake(inDb: Database.Database, nowIso: string): boolean {
   return Boolean(

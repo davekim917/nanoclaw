@@ -4,7 +4,7 @@
  * kill a task-script container mid-run.
  */
 import { isTaskThread } from '../../db/sessions.js';
-import { killContainer } from '../../container-runner.js';
+import { getContainerSpawnedAt, killContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
 import { isContinuationParked, type HostWorkContinuation } from '../mailbox/index.js';
 import {
@@ -14,6 +14,7 @@ import {
   type SweepSessionContext,
 } from '../../host-sweep.js';
 
+import { startChatReapFollowUp } from './reap-follow-up.js';
 import { shouldReapIdleTaskContainer } from './task-idle.js';
 export { shouldReapIdleTaskContainer } from './task-idle.js';
 
@@ -89,13 +90,17 @@ function registerIdleReapSweepDuties(): void {
         Date.now(),
       ),
     run: (ctx) => {
-      const { session } = ctx as SweepSessionContext;
+      const sessionCtx = ctx as SweepSessionContext;
+      const { session } = sessionCtx;
       log.info('Reaping idle chat container', {
         sessionId: session.id,
         threadId: session.thread_id,
         idleFloorMs: CHAT_IDLE_REAP_MS,
       });
-      killContainer(session.id, 'chat-idle-reap');
+      const spawnedAtMs = getContainerSpawnedAt(session.id);
+      killContainer(session.id, 'chat-idle-reap', () =>
+        startChatReapFollowUp(sessionCtx, spawnedAtMs, Math.round(CHAT_IDLE_REAP_MS / 60_000)),
+      );
     },
   });
 }
