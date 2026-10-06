@@ -112,8 +112,8 @@ function copyTree(from: string, to: string): void {
 
 /**
  * Content hash of a whole fixture tree — file bytes, symlink targets, and the
- * directory shape. Used for "mutates nothing" and for the shared-dirs side,
- * whose reconcile returns no report of its own.
+ * directory shape. The second witness beside a reconcile's own report: a
+ * write the report leaves out still changes the hash.
  */
 function hashTree(rootDir: string): string {
   const lines: string[] = [];
