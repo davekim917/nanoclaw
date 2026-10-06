@@ -8,23 +8,20 @@ overrides:
   ws@<8.20.1: ^8.20.1
 
 patchedDependencies:
-  '@chat-adapter/discord@4.29.0':
-    hash: 136b5dc955de249ef62200a2c34dc93ab263fd9a1a65a55d77b10c842a3b8c9d
-    path: patches/@chat-adapter__discord@4.29.0.patch
-  '@chat-adapter/slack@4.29.0':
-    hash: bba4051c717033dd999c60d157679f24041efcf25dec11ac3c31ce9fb2a956c0
-    path: patches/@chat-adapter__slack@4.29.0.patch
+  '@chat-adapter/discord@4.41.1':
+    hash: f11e818511c2e83cfb01d90e3ac8dc0bad19e4ac8eaf8d4599e00d94e8f62af8
+    path: patches/@chat-adapter__discord@4.41.1.patch
 
 importers:
 
   .:
     dependencies:
       '@chat-adapter/discord':
-        specifier: 4.29.0
-        version: 4.29.0(patch_hash=136b5dc955de249ef62200a2c34dc93ab263fd9a1a65a55d77b10c842a3b8c9d)(zod@4.6.5)
+        specifier: 4.41.1
+        version: 4.41.1(patch_hash=f11e818511c2e83cfb01d90e3ac8dc0bad19e4ac8eaf8d4599e00d94e8f62af8)(zod@4.6.5)
       '@chat-adapter/slack':
-        specifier: 4.29.0
-        version: 4.29.0(patch_hash=bba4051c717033dd999c60d157679f24041efcf25dec11ac3c31ce9fb2a956c0)(zod@4.6.5)
+        specifier: 4.41.1
+        version: 4.41.1(zod@4.6.5)
       '@clack/core':
         specifier: ^1.4.3
         version: 1.4.3
@@ -41,8 +38,8 @@ importers:
         specifier: 11.10.0
         version: 11.10.0
       chat:
-        specifier: 4.29.0
-        version: 4.29.0(zod@4.6.5)
+        specifier: 4.41.1
+        version: 4.41.1(zod@4.6.5)
       chokidar:
         specifier: 5.0.0
         version: 5.0.0
@@ -131,16 +128,16 @@ packages:
     resolution: {integrity: sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA==}
     engines: {node: '>=18'}
 
-  '@chat-adapter/discord@4.29.0':
-    resolution: {integrity: sha512-C6pDVKn7s0PhvgeqldYxoShWXJzthwtlo+sCesqenh56M03eHsioinqxeJttmtK8y1ZD8/qiP2lAZufDwuEQhA==}
+  '@chat-adapter/discord@4.41.1':
+    resolution: {integrity: sha512-i5WH8cxsGN0KK9GXaZFijJ4X8oOlZNYMxepyIg1Boxe8HiM/7HBGpaXTy+6Ei7c5ZyoDfuPk8aWft5dx+Si/ag==}
     engines: {node: '>=20'}
 
-  '@chat-adapter/shared@4.29.0':
-    resolution: {integrity: sha512-ARqTDoHJHKN9rpytbFPJbNmqqx3fOg5xwsTZdlingQPAssOSeHDBdqrFJkgDhyCRGbmDtG09cuS0FkVzeoh2qg==}
+  '@chat-adapter/shared@4.41.1':
+    resolution: {integrity: sha512-ia1Ctd4mclpiNd+sYUc/fo9RXIFoBr/Z0JFFk3hue1XiFXPTJClG/BHpS+243UmSkeE5JORjY4MmW+szdhhFWw==}
     engines: {node: '>=20'}
 
-  '@chat-adapter/slack@4.29.0':
-    resolution: {integrity: sha512-s2DXAwkTpmiIKSATXgrO879s1pqFwS70Y0JPd+TRGRzDeh6nfqt5dnKt5Bug0P1zwkB6DoPurhnYS9nqhSmD/w==}
+  '@chat-adapter/slack@4.41.1':
+    resolution: {integrity: sha512-aq8sETBNrlrD13tB0pwMNf4jILRbrnc9TiDRP/Z9rVDejqDEImOrHVZgpX8ZHIJlT9cPXmJidgUPIE5iz45HLA==}
     engines: {node: '>=20'}
 
   '@clack/core@1.4.3':
@@ -417,12 +414,6 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
-
-  '@napi-rs/wasm-runtime@1.1.4':
-    resolution: {integrity: sha512-3NQNNgA1YSlJb/kMH1ildASP9HW7/7kYnRI2szWJaofaS1hWmbGI4H+d3+22aGzXXN9IJ+n+GiFVcGipJP18ow==}
-    peerDependencies:
-      '@emnapi/core': ^1.7.1
-      '@emnapi/runtime': ^1.7.1
 
   '@napi-rs/wasm-runtime@1.2.4':
     resolution: {integrity: sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g==}
@@ -796,8 +787,8 @@ packages:
     resolution: {integrity: sha512-KNOqpnNAlsFt5Jk9XBclslQ0lobRIg/0tnhpmvZJAglHJx9E8oceN8hC3gaBzkR6UzQ9Wzq4rLsJ98wUcxWPfw==}
     engines: {node: '>= 20', npm: '>=9.6.4'}
 
-  '@slack/web-api@7.15.1':
-    resolution: {integrity: sha512-y+TAF7TszcmFzbVtBkFqAdBwKSoD+8shkNxhp4WIfFwXmCKdFje9WD6evROApPa2FTy1v1uc9yBaJs3609PPgg==}
+  '@slack/web-api@7.19.0':
+    resolution: {integrity: sha512-ItjyjEZml+LDH8CjcCLRLJHh7VZtevPKExrRN3l5KWyBliyDnGAeoO4Y+K+fFBmRpKLYVPgqWMX4THldv2HVtA==}
     engines: {node: '>= 18', npm: '>= 8.6.0'}
 
   '@slack/web-api@8.0.0':
@@ -806,9 +797,6 @@ packages:
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
-
-  '@tybys/wasm-util@0.10.1':
-    resolution: {integrity: sha512-9tTaPJLSiejZKx+Bmog4uSubteqTvFrVrURwkmHixBo0G4seD0zUxp98E1DzUBJxLQ3NPwXrGKDiVjwx/DpPsg==}
 
   '@tybys/wasm-util@0.10.4':
     resolution: {integrity: sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A==}
@@ -1026,14 +1014,17 @@ packages:
   character-entities@2.0.2:
     resolution: {integrity: sha512-shx7oQ0Awen/BRIdkjkvz54PnEEI/EjwXDSIZp86/KKdbafHh1Df/RYGBhn4hbe2+uKC9FnT5UCEdyPz3ai9hQ==}
 
-  chat@4.29.0:
-    resolution: {integrity: sha512-KdPfzaie5ivYytyRICTERg5xT+LeCbYefokvNAqTHe92eqkFaoTMXXkSitikxJVWhZIb2YoXF1b9UZHyzSzKzw==}
+  chat@4.41.1:
+    resolution: {integrity: sha512-+/LDcLoYLihf/9Kp5ymj2ylvm6q5vySQTMn0ZoeU0UWDfNVmCNc6OiADW8hwnejOLfevUs8lEpgotG9rmIxZvg==}
     engines: {node: '>=20'}
     peerDependencies:
-      ai: ^6.0.182
+      ai: ^6.0.182 || ^7.0.0
+      workflow: ^5.0.0-beta.35
       zod: ^3.0.0 || ^4.0.0
     peerDependenciesMeta:
       ai:
+        optional: true
+      workflow:
         optional: true
       zod:
         optional: true
@@ -1098,14 +1089,14 @@ packages:
   devlop@1.1.0:
     resolution: {integrity: sha512-RWmIqhcFf1lRYBvNmr7qTNuyCt/7/ns2jbpp1+PalgE/rDQcBT0fioSMUpJ93irlUhC5hrg4cYqe6U+0ImW0rA==}
 
-  discord-api-types@0.37.120:
-    resolution: {integrity: sha512-7xpNK0EiWjjDFp2nAhHXezE4OUWm7s1zhc/UXXN6hnFFU8dfoPHgV0Hx0RPiCa3ILRpdeh152icc68DGCyXYIw==}
-
   discord-api-types@0.38.49:
     resolution: {integrity: sha512-XnqcWmnFZFAE8ZM8SHAw9DIV8D3Or00rMQ8iQLotrEA2PmXhl+ykaf6L6q4l474hrSUH1JaYcv+iOMRWp2p6Tg==}
 
   discord-api-types@0.38.51:
     resolution: {integrity: sha512-SnaFHd+b8Z3HgjEIoSA1wkstXCt6J0Zrxvny0BJZZz7AhmFSetRY3DMrIdO3LFDMeeTxF7WKornnAGxaws5Adw==}
+
+  discord-api-types@0.38.56:
+    resolution: {integrity: sha512-Hti4RZsGvF5C7SM8rF2MDHtIm0Hyfrlk84GpEA29nj91tvVVMvX+oQSCodu10t2ZcjFGofq8TX0YyC04B2E69Q==}
 
   discord-interactions@4.4.0:
     resolution: {integrity: sha512-jjJx8iwAeJcj8oEauV43fue9lNqkf38fy60aSs2+G8D1nJmDxUIrk08o3h0F3wgwuBWWJUZO+X/VgfXsxpCiJA==}
@@ -2206,11 +2197,11 @@ snapshots:
 
   '@bcoe/v8-coverage@1.0.2': {}
 
-  '@chat-adapter/discord@4.29.0(patch_hash=136b5dc955de249ef62200a2c34dc93ab263fd9a1a65a55d77b10c842a3b8c9d)(zod@4.6.5)':
+  '@chat-adapter/discord@4.41.1(patch_hash=f11e818511c2e83cfb01d90e3ac8dc0bad19e4ac8eaf8d4599e00d94e8f62af8)(zod@4.6.5)':
     dependencies:
-      '@chat-adapter/shared': 4.29.0(zod@4.6.5)
-      chat: 4.29.0(zod@4.6.5)
-      discord-api-types: 0.37.120
+      '@chat-adapter/shared': 4.41.1(zod@4.6.5)
+      chat: 4.41.1(zod@4.6.5)
+      discord-api-types: 0.38.56
       discord-interactions: 4.4.0
       discord.js: 14.27.0
     transitivePeerDependencies:
@@ -2218,28 +2209,31 @@ snapshots:
       - bufferutil
       - supports-color
       - utf-8-validate
+      - workflow
       - zod
 
-  '@chat-adapter/shared@4.29.0(zod@4.6.5)':
+  '@chat-adapter/shared@4.41.1(zod@4.6.5)':
     dependencies:
-      chat: 4.29.0(zod@4.6.5)
+      chat: 4.41.1(zod@4.6.5)
     transitivePeerDependencies:
       - ai
       - supports-color
+      - workflow
       - zod
 
-  '@chat-adapter/slack@4.29.0(patch_hash=bba4051c717033dd999c60d157679f24041efcf25dec11ac3c31ce9fb2a956c0)(zod@4.6.5)':
+  '@chat-adapter/slack@4.41.1(zod@4.6.5)':
     dependencies:
-      '@chat-adapter/shared': 4.29.0(zod@4.6.5)
+      '@chat-adapter/shared': 4.41.1(zod@4.6.5)
       '@slack/socket-mode': 2.0.7
-      '@slack/web-api': 7.15.1
-      chat: 4.29.0(zod@4.6.5)
+      '@slack/web-api': 7.19.0
+      chat: 4.41.1(zod@4.6.5)
     transitivePeerDependencies:
       - ai
       - bufferutil
       - debug
       - supports-color
       - utf-8-validate
+      - workflow
       - zod
 
   '@clack/core@1.4.3':
@@ -2467,17 +2461,17 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@napi-rs/wasm-runtime@1.1.4(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)':
-    dependencies:
-      '@emnapi/core': 1.9.2
-      '@emnapi/runtime': 1.9.2
-      '@tybys/wasm-util': 0.10.1
-    optional: true
-
   '@napi-rs/wasm-runtime@1.2.4(@emnapi/core@1.11.2)(@emnapi/runtime@1.11.2)':
     dependencies:
       '@emnapi/core': 1.11.2
       '@emnapi/runtime': 1.11.2
+      '@tybys/wasm-util': 0.10.4
+    optional: true
+
+  '@napi-rs/wasm-runtime@1.2.4(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)':
+    dependencies:
+      '@emnapi/core': 1.9.2
+      '@emnapi/runtime': 1.9.2
       '@tybys/wasm-util': 0.10.4
     optional: true
 
@@ -2645,7 +2639,7 @@ snapshots:
     dependencies:
       '@emnapi/core': 1.9.2
       '@emnapi/runtime': 1.9.2
-      '@napi-rs/wasm-runtime': 1.1.4(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)
+      '@napi-rs/wasm-runtime': 1.2.4(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)
     optional: true
 
   '@rolldown/binding-win32-arm64-msvc@1.0.0-rc.15':
@@ -2676,7 +2670,7 @@ snapshots:
   '@slack/socket-mode@2.0.7':
     dependencies:
       '@slack/logger': 4.0.1
-      '@slack/web-api': 7.15.1
+      '@slack/web-api': 7.19.0
       '@types/node': 22.19.17
       '@types/ws': 8.18.1
       eventemitter3: 5.0.4
@@ -2691,7 +2685,7 @@ snapshots:
 
   '@slack/types@3.0.0': {}
 
-  '@slack/web-api@7.15.1':
+  '@slack/web-api@7.19.0':
     dependencies:
       '@slack/logger': 4.0.1
       '@slack/types': 2.22.0
@@ -2721,11 +2715,6 @@ snapshots:
       retry: 0.13.1
 
   '@standard-schema/spec@1.1.0': {}
-
-  '@tybys/wasm-util@0.10.1':
-    dependencies:
-      tslib: 2.8.1
-    optional: true
 
   '@tybys/wasm-util@0.10.4':
     dependencies:
@@ -3001,7 +2990,7 @@ snapshots:
 
   character-entities@2.0.2: {}
 
-  chat@4.29.0(zod@4.6.5):
+  chat@4.41.1(zod@4.6.5):
     dependencies:
       '@workflow/serde': 4.1.0-beta.2
       mdast-util-to-string: 4.0.0
@@ -3063,11 +3052,11 @@ snapshots:
     dependencies:
       dequal: 2.0.3
 
-  discord-api-types@0.37.120: {}
-
   discord-api-types@0.38.49: {}
 
   discord-api-types@0.38.51: {}
+
+  discord-api-types@0.38.56: {}
 
   discord-interactions@4.4.0: {}
 
@@ -4237,10 +4226,10 @@ snapshots:
   vite@8.0.8(@types/node@22.19.17)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.1)(yaml@2.9.0):
     dependencies:
       lightningcss: 1.32.0
-      picomatch: 4.0.4
+      picomatch: 4.0.7
       postcss: 8.5.10
       rolldown: 1.0.0-rc.15
-      tinyglobby: 0.2.16
+      tinyglobby: 0.2.17
     optionalDependencies:
       '@types/node': 22.19.17
       esbuild: 0.28.1
