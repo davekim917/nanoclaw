@@ -1017,6 +1017,20 @@ describe('nc:run effect:step (streaming, multi-field capture)', () => {
     expect(res.deferred.some((d) => /platform_id/.test(d))).toBe(true); // downstream env-set then defers
   });
 
+  it('a step field that contains a resolved secret is bound as a secret', async () => {
+    const { sdir, rdir } = stepScratch();
+    writeFileSync(join(sdir, 'SKILL.md'), '```nc:prompt token secret\nToken\n```\n' + STEP_SKILL);
+    const secret = 'step-secret-never-surface';
+    const execStream = async () => ({
+      ok: true,
+      fields: { STATUS: 'success', PLATFORM_ID: `telegram:${secret}`, ADMIN_ID: '67890' },
+    });
+    const res = await applySkill(sdir, rdir, { inputs: { token: secret }, exec: () => {}, execStream });
+    expect(fullyApplied(res)).toBe(true);
+    expect(res.vars.owner_handle).toBe('67890');
+    expect(JSON.stringify(res)).not.toContain(secret);
+  });
+
   it('a failed step bounces to an agent rather than capturing empty values', async () => {
     const { sdir, rdir } = stepScratch();
     const res = await applySkill(sdir, rdir, { exec: () => {}, execStream: async () => ({ ok: false, fields: {} }) });

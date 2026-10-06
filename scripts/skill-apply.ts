@@ -602,7 +602,7 @@ function bindCapture(
   const re = validate ? new RegExp(validate) : undefined;
   const set = (name: string, value: string): void => {
     if (re && !re.test(value)) throw new Error(`captured ${name}="${value}" does not match validate:${validate}`);
-    vars.set(name, { value, secret: [...vars.values()].some((v) => v.secret && v.value && value.includes(v.value)) });
+    vars.set(name, { value, secret: derivedFromSecret(vars, value) });
   };
   if (!spec.includes('=')) {
     set(spec, stdout);
@@ -614,6 +614,11 @@ function bindCapture(
     if (eq < 1) continue;
     set(pair.slice(0, eq).trim(), String(dotPath(json, pair.slice(eq + 1).trim()) ?? ''));
   }
+}
+
+/** A captured value that contains a resolved secret is itself a secret. */
+function derivedFromSecret(vars: Map<string, { value: string; secret: boolean }>, value: string): boolean {
+  return [...vars.values()].some((v) => v.secret && v.value !== '' && value.includes(v.value));
 }
 
 // The mutating twin of selfStatus. Records what it did to the journal so remove
@@ -752,10 +757,8 @@ async function applyOne(
           for (const pair of capture.split(',')) {
             const eq = pair.indexOf('=');
             if (eq < 1) continue;
-            vars.set(pair.slice(0, eq).trim(), {
-              value: (fields[pair.slice(eq + 1).trim()] ?? '').trim(),
-              secret: false,
-            });
+            const value = (fields[pair.slice(eq + 1).trim()] ?? '').trim();
+            vars.set(pair.slice(0, eq).trim(), { value, secret: derivedFromSecret(vars, value) });
           }
         }
         journal.push({ op: 'ran', cmd: d.body.join('\n') });

@@ -353,7 +353,7 @@ export function hostExecStream(projectRoot: string): (cmd: string, context?: Exe
             if (c > 0) current.fields[line.slice(0, c).trim()] = line.slice(c + 1).trim();
             continue;
           }
-          process.stdout.write((context?.redact(line) ?? line) + '\n'); // redact after assembling complete lines
+          process.stdout.write((context?.redact(line) ?? line) + '\n');
         }
       };
       child.stdout.on('data', onChunk);
