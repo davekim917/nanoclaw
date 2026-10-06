@@ -1,57 +1,20 @@
 diff --git a/dist/index.js b/dist/index.js
-index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..05678e3a925ab44b20492668c443ce9ba94417d8 100644
+index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..838128f6a0ef21dc3c384bd237806061871738e2 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -738,20 +738,45 @@ function findCodeEnd(text, index, end) {
-   if (text[index] !== "`") {
-     return index;
+@@ -804,8 +804,14 @@ function replaceRange(text, start, end, replacer, angles) {
    }
--  const fence = text.startsWith("```", index);
--  const marker = fence ? "```" : "`";
--  const start = index + marker.length;
--  const close = text.indexOf(marker, start);
--  if (close === -1 || close >= end) {
-+  // CommonMark: a code span (1-2 backticks) closes on the next run of exactly the same length,
-+  // a fence (3+) on the next run at least as long. ``npm i @scope/pkg`` is one span, a longer run
-+  // inside it does not close it, and ```…```` is one fence. A single-backtick span stays on one
-+  // line, as upstream had it.
-+  let runLength = 1;
-+  while (text[index + runLength] === "`") {
-+    runLength += 1;
-+  }
-+  const fence = runLength >= 3;
-+  const start = index + runLength;
-+  let close = -1;
-+  let closeLength = 0;
-+  let cursor = start;
-+  while (cursor < end) {
-+    const run = text.indexOf("`", cursor);
-+    if (run === -1 || run >= end) {
-+      break;
-+    }
-+    let length = 1;
-+    while (text[run + length] === "`") {
-+      length += 1;
-+    }
-+    if (fence ? length >= runLength : length === runLength) {
-+      close = run;
-+      closeLength = length;
-+      break;
-+    }
-+    cursor = run + length;
-+  }
-+  if (close === -1) {
-     return index;
-   }
--  if (!fence) {
-+  if (runLength === 1) {
-     const newline = text.indexOf("\n", start);
-     if (newline !== -1 && newline < close) {
-       return index;
-     }
-   }
--  return close + marker.length;
-+  return close + closeLength;
+   return result;
  }
- function replaceRange(text, start, end, replacer, angles) {
++// NanoClaw: fences (3+ backticks), double-backtick spans (may cross lines) and one-line
++// single-backtick spans are cut out before the scanner runs, because findCodeEnd reads a
++// double-backtick span as two empty spans and would rewrite the @name inside it.
++var NANOCLAW_CODE_REGION_REGEX = /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g;
+ function replaceBareMentions(text, replacer) {
+-  return replaceRange(text, 0, text.length, replacer, true);
++  return text.split(NANOCLAW_CODE_REGION_REGEX).map(
++    (segment, index) => index % 2 === 1 ? segment : replaceRange(segment, 0, segment.length, replacer, true)
++  ).join("");
+ }
+ function maskCodeSpans(text, replacement = " ") {
    let result = "";
