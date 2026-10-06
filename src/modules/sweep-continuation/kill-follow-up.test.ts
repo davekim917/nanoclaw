@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   onRespawn: null as (() => void) | null,
   mailboxOpenMs: 0,
   spawns: [] as string[],
+  leases: [] as string[],
 }));
 
 function childProcessTripwire(record: string[]): Record<string, (...args: unknown[]) => never> {
@@ -66,6 +67,15 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
       if (onExit) h.exits.push(Promise.resolve().then(onExit));
     },
   };
+});
+
+vi.mock('../../db/central-lease.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../db/central-lease.js')>();
+  const withCentralSync: typeof real.withCentralSync = (fn, label, ...sync) => {
+    h.leases.push(label ?? '');
+    return real.withCentralSync(fn, label, ...sync);
+  };
+  return { ...real, withCentralSync };
 });
 
 vi.mock('../../request-wake.js', () => ({
@@ -332,6 +342,7 @@ beforeEach(async () => {
   h.respawns = [];
   h.onRespawn = null;
   h.mailboxOpenMs = 0;
+  h.leases = [];
 });
 
 afterEach(async () => {
@@ -556,13 +567,22 @@ describe('what counts as an unfinished list', () => {
     expect(decisions(info)).toEqual([expect.objectContaining({ outcome: 'nothing-in-flight' })]);
   });
 
-  it('no list writes nothing', async () => {
+  it('no list writes nothing, and is logged without taking the central lease', async () => {
     const info = vi.spyOn(log, 'info');
     await chatReap(Date.now() - HOUR);
     expect(wakeRows()).toHaveLength(0);
     expect(decisions(info)).toEqual([
       expect.objectContaining({ sessionId: SESSION_ID, killReason: 'chat-idle-reap', outcome: 'nothing-in-flight' }),
     ]);
+    expect(h.leases).not.toContain('kill follow-up');
+  });
+
+  it('a kill that left work decides and writes under the central lease', async () => {
+    const startedAt = Date.now() - HOUR;
+    recordList(startedAt + 60_000);
+    await chatReap(startedAt);
+    expect(wakeRows()).toHaveLength(1);
+    expect(h.leases.filter((label) => label === 'kill follow-up')).toHaveLength(1);
   });
 
   it.each([
@@ -1234,6 +1254,25 @@ describe('kills that never queue a wake', () => {
       expect(decisions(info)).toEqual([expect.objectContaining({ outcome })]);
     },
   );
+
+  it('a chat reap of a container the registry never named opens no session and takes no lease: one line, nothing else', async () => {
+    recordList(Date.now());
+    recordWorktree(Date.now());
+    const info = vi.spyOn(log, 'info');
+    const runIn = vi.fn();
+    h.containerName = null;
+
+    await S13.run({ ...sweepCtx(await session()), runIn } as unknown as SweepSessionContext);
+    await settle();
+
+    expect(h.kills).toEqual([{ sessionId: SESSION_ID, reason: 'chat-idle-reap' }]);
+    expect(runIn).not.toHaveBeenCalled();
+    expect(h.leases).not.toContain('kill follow-up');
+    expect(wakeRows()).toHaveLength(0);
+    expect(decisions(info)).toEqual([
+      expect.objectContaining({ sessionId: SESSION_ID, killReason: 'chat-idle-reap', outcome: 'nothing-in-flight' }),
+    ]);
+  });
 
   it('a kill of a container the registry never named is not attributable', async () => {
     recordList(Date.now());

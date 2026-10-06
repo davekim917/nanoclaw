@@ -6,19 +6,20 @@ import { containerStartedAtMs } from '../../container-runner.js';
 import { type SweepSessionContext } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import { CHAT_IDLE_REAP_KILL } from '../sweep-continuation/kill-state.js';
-import { followUpKill } from '../sweep-continuation/reap-respawn.js';
+import { followUpKill, followUpUnattributedKill } from '../sweep-continuation/reap-respawn.js';
 
 async function followUpChatReap(
   ctx: SweepSessionContext,
   containerName: string | null,
   idleMinutes: number,
 ): Promise<void> {
-  await ctx.runIn('session:health:post-kill', (mailbox) =>
-    followUpKill(mailbox, ctx.session, containerStartedAtMs(containerName), {
-      reason: CHAT_IDLE_REAP_KILL,
-      minutes: idleMinutes,
-    }),
-  );
+  const startedAtMs = containerStartedAtMs(containerName);
+  const kill = { reason: CHAT_IDLE_REAP_KILL, minutes: idleMinutes };
+  if (startedAtMs === null) {
+    followUpUnattributedKill(ctx.session, kill);
+    return;
+  }
+  await ctx.runIn('session:health:post-kill', (mailbox) => followUpKill(mailbox, ctx.session, startedAtMs, kill));
 }
 
 const reapFollowUps = new Set<Promise<void>>();

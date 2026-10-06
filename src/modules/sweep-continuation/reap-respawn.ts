@@ -12,7 +12,16 @@ import type { Session } from '../../types.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import { WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
 import type { ReapFollowUp } from './decide.js';
-import { decideKill, REAP_RESPAWN_ID_PREFIX, STRANDING_KILLS, type KillEvidence } from './kill-state.js';
+import {
+  decideKill,
+  decideKillWithoutEvidence,
+  hasKillEvidence,
+  NO_EVIDENCE,
+  readKillEvidence,
+  REAP_RESPAWN_ID_PREFIX,
+  STRANDING_KILLS,
+  type KillEvidence,
+} from './kill-state.js';
 
 export const ACCOUNT_FOR_STATE = 'post ONE message accounting for state — done / lost / next';
 
@@ -97,10 +106,48 @@ function wakeText(cause: string, evidence: KillEvidence): string {
   return `${text} ${RESTART_SURVIVAL_RULES}`;
 }
 
+function decisionLog(
+  session: Session,
+  kill: StrandingKill,
+  evidence: KillEvidence,
+  priorAttempts: number,
+): { fields: Record<string, unknown>; decided: (outcome: ReapFollowUp, armedBy?: string) => ReapFollowUp } {
+  const fields: Record<string, unknown> = {
+    sessionId: session.id,
+    killReason: kill.reason,
+    evidence: [
+      ...(evidence.checkouts.length > 0 ? ['worktree'] : []),
+      ...(evidence.unfinished.length > 0 ? ['task-list'] : []),
+    ],
+    checkouts: evidence.checkouts.map((checkout) => checkout.name),
+    unfinishedItems: evidence.unfinished.length,
+    waitingItems: evidence.waiting,
+    priorAttempts,
+    maxAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  };
+  const decided = (outcome: ReapFollowUp, armedBy?: string): ReapFollowUp => {
+    log.info('Kill follow-up decided', {
+      ...fields,
+      ...(armedBy ? { armedBy } : {}),
+      outcome: outcome.action === 'none' ? outcome.reason : 'wake',
+    });
+    return outcome;
+  };
+  return { fields, decided };
+}
+
+/** A kill of a container the registry never named: nothing is attributable to it, so no session is opened for it. */
+export function followUpUnattributedKill(session: Session, kill: StrandingKill): ReapFollowUp {
+  return decisionLog(session, kill, NO_EVIDENCE, 0).decided(
+    decideKillWithoutEvidence(session, NO_EVIDENCE, kill.reason),
+  );
+}
+
 /**
- * Decides and applies the kill's follow-up. Call after the killed container has exited. The decision and the write are
- * one synchronous block; the write sits under the outbound guard although the row is inbound: a replacement that
- * already took the session is handling the thread, and the row would greet the NEXT container with a stale notice.
+ * Decides and applies the kill's follow-up. Call after the killed container has exited. A kill that left no evidence
+ * is only logged, and takes no lease. Otherwise the decision and the write are one synchronous block; the write sits
+ * under the outbound guard although the row is inbound: a replacement that already took the session is handling the
+ * thread, and the row would greet the NEXT container with a stale notice.
  */
 export async function followUpKill(
   mailbox: NanoclawMailboxSession,
@@ -108,30 +155,13 @@ export async function followUpKill(
   startedAtMs: number | null,
   kill: StrandingKill,
 ): Promise<ReapFollowUp> {
+  const evidence = readKillEvidence(mailbox, startedAtMs);
+  if (!hasKillEvidence(evidence)) {
+    return decisionLog(session, kill, evidence, 0).decided(decideKillWithoutEvidence(session, evidence, kill.reason));
+  }
   return withCentralSync((): ReapFollowUp => {
-    const { followUp, evidence, withheldBy, priorAttempts } = decideKill(mailbox, session, startedAtMs, kill);
-    const checkouts = evidence.checkouts.map((checkout) => checkout.name);
-    const fields: Record<string, unknown> = {
-      sessionId: session.id,
-      killReason: kill.reason,
-      evidence: [
-        ...(evidence.checkouts.length > 0 ? ['worktree'] : []),
-        ...(evidence.unfinished.length > 0 ? ['task-list'] : []),
-      ],
-      checkouts,
-      unfinishedItems: evidence.unfinished.length,
-      waitingItems: evidence.waiting,
-      priorAttempts,
-      maxAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-    };
-    const decided = (outcome: ReapFollowUp, armedBy?: string): ReapFollowUp => {
-      log.info('Kill follow-up decided', {
-        ...fields,
-        ...(armedBy ? { armedBy } : {}),
-        outcome: outcome.action === 'none' ? outcome.reason : 'wake',
-      });
-      return outcome;
-    };
+    const { followUp, withheldBy, priorAttempts } = decideKill(mailbox, session, evidence, kill);
+    const { fields, decided } = decisionLog(session, kill, evidence, priorAttempts);
     if (followUp.action === 'none') {
       if (followUp.reason === 'shadow') {
         log.info('self-heal: would queue chat-reap accountability wake', {
@@ -153,7 +183,7 @@ export async function followUpKill(
           wakeText(cause(kill.minutes), evidence),
           {
             kind: 'agent_reap_respawn',
-            checkouts,
+            checkouts: evidence.checkouts.map((checkout) => checkout.name),
             ...(evidence.unfinished.length > 0 ? { unfinished_items: evidence.unfinished.length } : {}),
           },
         ),

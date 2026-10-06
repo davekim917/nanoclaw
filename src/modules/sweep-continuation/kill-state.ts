@@ -45,10 +45,19 @@ export interface KillEvidence {
   stale: boolean;
 }
 
-const NO_EVIDENCE: KillEvidence = { checkouts: [], unfinished: [], waiting: 0, stale: false };
+export const NO_EVIDENCE: KillEvidence = { checkouts: [], unfinished: [], waiting: 0, stale: false };
 
-/** A record stamped before the killed container started was left by an earlier one and must never wake the session. */
-function readKillEvidence(mailbox: NanoclawMailboxSession, startedAtMs: number): KillEvidence {
+export function hasKillEvidence(evidence: KillEvidence): boolean {
+  return evidence.checkouts.length + evidence.unfinished.length > 0;
+}
+
+/**
+ * `startedAtMs` is the killed container's `containerStartedAtMs`, resolved by the caller from a name read before the
+ * kill (the registry entry is gone after exit). A record stamped before that was left by an earlier container and
+ * must never wake the session; with no start, nothing is attributable.
+ */
+export function readKillEvidence(mailbox: NanoclawMailboxSession, startedAtMs: number | null): KillEvidence {
+  if (startedAtMs === null) return NO_EVIDENCE;
   const worktree = mailbox.readWorktreeInFlight();
   const list = mailbox.readTaskListInFlight();
   const during = (at: string): boolean => Date.parse(at) >= startedAtMs;
@@ -129,17 +138,30 @@ function decideKillFollowUp(args: {
   return followUp;
 }
 
+/** For a kill that left no evidence. Reads no database, so it needs no lease. */
+export function decideKillWithoutEvidence(session: Session, evidence: KillEvidence, reason: string): ReapFollowUp {
+  return decideKillFollowUp({
+    reasonCovered: STRANDING_KILLS.has(reason),
+    taskSession: isTaskThread(session.thread_id),
+    inFlightCheckouts: 0,
+    unfinishedItems: 0,
+    staleEvidence: evidence.stale,
+    armed: false,
+    wakeable: true,
+    priorAttempts: 0,
+    selfHeal: SELF_HEAL_ENABLED,
+  });
+}
+
 export interface KillDecision {
   followUp: ReapFollowUp;
-  evidence: KillEvidence;
   withheldBy: WithheldBy | null;
   priorAttempts: number;
 }
 
 /**
- * No writes. Call inside `withCentralSync`. `startedAtMs` is the killed container's `containerStartedAtMs`, resolved
- * by the caller from a name read before the kill (the registry entry is gone after exit). `ceilingWakeQueued` is the
- * ceiling branch's own return for this kill.
+ * For a kill that left evidence. No writes. Call inside `withCentralSync`. `ceilingWakeQueued` is the ceiling
+ * branch's own return for this kill.
  *
  * Work left only on disk has no resume path but this wake, so nothing stored withholds it: a saved continuation or
  * an armed `wait` may never run, and neither accounts for the checkouts. Those facts, and a session that takes no
@@ -148,12 +170,10 @@ export interface KillDecision {
 export function decideKill(
   mailbox: NanoclawMailboxSession,
   session: Session,
-  startedAtMs: number | null,
+  evidence: KillEvidence,
   kill: { reason: string; ceilingWakeQueued?: boolean },
 ): KillDecision {
-  const dated = startedAtMs !== null;
-  const evidence = dated ? readKillEvidence(mailbox, startedAtMs) : NO_EVIDENCE;
-  const listOnly = evidence.checkouts.length === 0 && evidence.unfinished.length > 0;
+  const listOnly = evidence.checkouts.length === 0;
   const withheldBy: WithheldBy | null = kill.ceilingWakeQueued
     ? 'ceiling-wake'
     : !listOnly
@@ -163,7 +183,7 @@ export function decideKill(
         : mailbox.getNextScheduledWakeAt() !== null
           ? 'wake-pending'
           : null;
-  const priorAttempts = dated ? mailbox.countRecoveryAttemptsSinceRealInbound(REAP_RESPAWN_ID_PREFIX) : 0;
+  const priorAttempts = mailbox.countRecoveryAttemptsSinceRealInbound(REAP_RESPAWN_ID_PREFIX);
   const followUp = decideKillFollowUp({
     reasonCovered: STRANDING_KILLS.has(kill.reason),
     taskSession: isTaskThread(session.thread_id),
@@ -175,5 +195,5 @@ export function decideKill(
     priorAttempts,
     selfHeal: SELF_HEAL_ENABLED,
   });
-  return { followUp, evidence, withheldBy, priorAttempts };
+  return { followUp, withheldBy, priorAttempts };
 }
