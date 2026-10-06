@@ -258,6 +258,7 @@ import {
   isAdoptedContainer,
   isContainerRunning,
   wakeContainer,
+  _markPendingAdoptionForTesting,
   _resetAdoptionStateForTesting,
 } from './container-runner.js';
 import { resolveContainerResources } from './container-resources.js';
@@ -1091,6 +1092,19 @@ describe('adoptRunningSessions', () => {
       fakes.listingFails = false;
       expect(await stopOrphanedSessions()).toBe(1);
       expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-unnamed-gone']);
+    });
+
+    it('names a pending survivor whose session row could not be read at boot, then stops it once the row is gone', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-unread-gone');
+      fakes.listing = [];
+      await adoptRunningSessions({ list: fakes.list });
+      _markPendingAdoptionForTesting('sess-unread-gone');
+      fakes.listing = [survivor('sess-unread-gone')];
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-unread-gone');
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-unread-gone']);
+      expect(hasPendingAdoption('sess-unread-gone')).toBe(false);
     });
 
     it('stops a supervised session whose agent group was deleted', async () => {
