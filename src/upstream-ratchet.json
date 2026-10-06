@@ -520,7 +520,7 @@
 "docs/SECURITY.md":{"diff":288,"mode":"100644","sha256":"fd96922773e964c067bfa96fceb8868821b121086e7e88fc947da54ae4eeba34"},
 "docs/SPEC.md":{"diff":0,"mode":"100644","sha256":"6175a3b674366266408b702dabe9876aac8a31b30eed48d45de9526b13c1df54"},
 "docs/agent-mailbox-seam-migration.md":{"diff":0,"mode":"100644","sha256":"5320304b4277812e874bb0f02813d0c55d6e57f640e8515e3ba67ad72dc54ee4"},
-"docs/agent-runner-details.md":{"diff":415,"mode":"100644","sha256":"b8e6c122fe23ee73c5c5b7e329e5a6ff674094086acb97db26ba3cc7ce3b92b4"},
+"docs/agent-runner-details.md":{"diff":415,"mode":"100644","sha256":"e02dcdbf0317a9f69561360ba668db961bcf96ba4f09ffa65faf1eab3e71d5dc"},
 "docs/api-details.md":{"diff":14,"mode":"100644","sha256":"e0760bf35a7676393cf0688b81c53ea7f7c85aeb1b9ee1698458ed0a779695ca"},
 "docs/architecture-diagram.html":{"diff":18,"mode":"100644","sha256":"89ea7aa572edacf9073e1d4af98f864900c87306cfef714fb03f1fcce11cf8e3"},
 "docs/architecture-diagram.md":{"diff":33,"mode":"100644","sha256":"af4b40a456e354c33aed93a674b6affe38bd9af016cc59a8dbbc2d2cc61d41c9"},

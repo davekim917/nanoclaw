@@ -106,6 +106,7 @@ import {
   deletePendingApproval,
   deletePendingQuestion,
   getSession,
+  TASKS_SYSTEM_THREAD_ID,
 } from '../../db/sessions.js';
 import { registerAgentMailbox, resetAgentMailboxForTesting } from '../../mailbox/index.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
@@ -133,8 +134,8 @@ const store: AgentMailbox = {
   },
 };
 
-async function session(): Promise<Session> {
-  return (await getSession(SESSION_ID))!;
+async function session(id: string = SESSION_ID): Promise<Session> {
+  return (await getSession(id))!;
 }
 
 function containerNamed(startedAtMs: number): string {
@@ -165,17 +166,24 @@ async function chatReap(startedAtMs: number): Promise<void> {
   await settle();
 }
 
-async function ceilingKill(startedAtMs: number, workContinuation: unknown = null): Promise<void> {
-  const ctx = sweepCtx(await session(), {
+async function ceilingKill(
+  startedAtMs: number,
+  workContinuation: unknown = null,
+  sessionId: string = SESSION_ID,
+): Promise<void> {
+  const ctx = sweepCtx(await session(sessionId), {
     killSnapshot: { reason: 'absolute-ceiling', containerState: null, pendingClaims: 0, workContinuation },
     observed: { containerIdentity: { containerName: containerNamed(startedAtMs), claimIncarnation: 1 } },
   });
   await S10.run(ctx, { action: 'kill-ceiling', heartbeatAgeMs: 31 * 60_000, ceilingMs: ABSOLUTE_CEILING_MS }, mailbox);
 }
 
-async function providerUnavailableKill(startedAtMs: number): Promise<void> {
+async function providerUnavailableKill(startedAtMs: number, sessionId: string = SESSION_ID): Promise<void> {
   h.containerName = containerNamed(startedAtMs);
-  await handleProviderUnavailable({ provider: 'codex', message: 'the process aborted mid-turn' }, await session());
+  await handleProviderUnavailable(
+    { provider: 'codex', message: 'the process aborted mid-turn' },
+    await session(sessionId),
+  );
   await settle();
 }
 
@@ -951,6 +959,51 @@ describe('kills that never queue a wake', () => {
     await S10.run(ctx, { action: 'kill-claim', messageId: 'm-1', claimAgeMs: 90_000, toleranceMs: 60_000 }, mailbox);
 
     expect(wakeRows()).toHaveLength(0);
+  });
+
+  describe('a task session, whose series fires again by itself', () => {
+    const TASK_SESSION = 'sess-task';
+
+    beforeEach(async () => {
+      await createSession({
+        id: TASK_SESSION,
+        agent_group_id: 'ag-1',
+        messaging_group_id: null,
+        thread_id: `${TASKS_SYSTEM_THREAD_ID}:series-nightly`,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'stopped',
+        last_active: '2026-10-05T00:00:00.000Z',
+        created_at: '2026-10-05T00:00:00.000Z',
+      });
+    });
+
+    it('is not woken after a ceiling kill', async () => {
+      const startedAt = Date.now() - HOUR;
+      recordList(startedAt + 60_000);
+      const info = vi.spyOn(log, 'info');
+
+      await ceilingKill(startedAt, null, TASK_SESSION);
+
+      expect(wakeRows()).toHaveLength(0);
+      expect(decisions(info)).toEqual([
+        { sessionId: TASK_SESSION, killReason: 'absolute-ceiling', outcome: 'task-session' },
+      ]);
+    });
+
+    it('is not woken after a provider-unavailable kill, and still respawns on the fallback', async () => {
+      const startedAt = Date.now() - HOUR;
+      recordList(startedAt + 60_000);
+      const info = vi.spyOn(log, 'info');
+
+      await providerUnavailableKill(startedAt, TASK_SESSION);
+
+      expect(h.respawns).toEqual([TASK_SESSION]);
+      expect(wakeRows()).toHaveLength(0);
+      expect(decisions(info)).toEqual([
+        { sessionId: TASK_SESSION, killReason: 'provider-unavailable', outcome: 'task-session' },
+      ]);
+    });
   });
 
   it('an archived session, which the sweep never wakes, gets no row', async () => {

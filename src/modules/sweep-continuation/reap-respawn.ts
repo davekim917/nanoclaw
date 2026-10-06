@@ -7,7 +7,7 @@
 import { SELF_HEAL_ENABLED } from '../../config.js';
 import { sessionStillActive } from '../../container-runner.js';
 import { withCentralSync } from '../../db/central-lease.js';
-import { withQuietInvalidationSync } from '../../db/sessions.js';
+import { isTaskThread, withQuietInvalidationSync } from '../../db/sessions.js';
 import { writeOutboundWhenStopped, writeSystemWake } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
@@ -151,6 +151,8 @@ export async function followUpKill(
   };
   const cause = STRANDING_KILLS.get(kill.reason);
   if (!cause) return decided({ action: 'none', reason: 'reason-not-covered' });
+  // A scheduled series fires again by itself, and a wake row in its session is behaviour nobody has verified.
+  if (isTaskThread(session.thread_id)) return decided({ action: 'none', reason: 'task-session' });
   const startedAtMs = containerStartedAtMs(containerName);
   if (startedAtMs === null) return decided({ action: 'none', reason: 'nothing-in-flight' });
 

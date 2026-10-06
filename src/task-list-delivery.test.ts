@@ -773,6 +773,22 @@ describe('the kill label says what is true of the session', () => {
     expect(await label(sessionId)).toBe(`paused · resuming · ${DETAIL}`);
   });
 
+  it('a session whose only queued row is its own kill follow-up wake does not read as paused', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const db = new Database(inboundDbPath('ag-1', sessionId));
+    const insert = db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, on_wake, content)
+       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), ?, ?, 'pending', 0, 1, '{}')`,
+    );
+    insert.run('reap-respawn-1790000000000', 'chat', now());
+    insert.run('recall-reap-respawn-1790000000000', 'system', now());
+    db.close();
+
+    expect(await label(sessionId)).toBe(`stopped · ${DETAIL}`);
+  });
+
   it('waiting on an approval, when the killed container’s card is unanswered', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);

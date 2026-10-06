@@ -43,6 +43,7 @@ export type ReapFollowUp =
       action: 'none';
       reason:
         | 'reason-not-covered'
+        | 'task-session'
         | 'nothing-in-flight'
         | 'stale-evidence'
         | 'armed'
