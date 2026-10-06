@@ -452,7 +452,7 @@
 "container/agent-runner/src/poll-loop.midturn.test.ts":{"diff":419,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/poll-loop.test.ts":{"diff":6976,"mode":"100644","sha256":"1861dd26b7b0c477b4d5d12461dd0172c93135aa302fbb9a90b4679a86b076b3"},
 "container/agent-runner/src/poll-loop.thrown-followup.test.ts":{"diff":265,"mode":"100644","sha256":null,"deleted":true},
-"container/agent-runner/src/poll-loop.ts":{"diff":3471,"mode":"100644","sha256":"097abf8563f8e4d4c13dfcd776cb06b58f3c8f874a8e77f78e706b68aeeab629"},
+"container/agent-runner/src/poll-loop.ts":{"diff":3471,"mode":"100644","sha256":"4be9b01a2e33a3522accae99028621c5e4e7e09464c312c3891ef7ab3213f322"},
 "container/agent-runner/src/provider-contracts/active-provider.test.ts":{"diff":97,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/provider-contracts/claude.ts":{"diff":92,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/provider-contracts/index.ts":{"diff":9,"mode":"100644","sha256":null,"deleted":true},

@@ -227,7 +227,7 @@ function isProviderQuotaExhausted(err: unknown): boolean {
 
 /**
  * Every credential in the ring rejected on a rate-limit window: the account's quota wall, not an outage. The reset is
- * the earliest slot's, when one can serve again, and only when every slot measured one.
+ * the earliest slot's, when one can serve again.
  */
 export function ringRateLimitQuota(
   failures: unknown[],

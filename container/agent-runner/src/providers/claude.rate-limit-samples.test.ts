@@ -352,3 +352,24 @@ describe('capture through the provider', () => {
     expect(getRateLimitSampleRows().some((r) => r.source === 'usage_pull')).toBe(false);
   });
 });
+
+describe('a rejected window through the provider', () => {
+  it('yields an error carrying the measured reset, so the ring report can park until exactly then', async () => {
+    sdkMessages.push(
+      INIT_MSG,
+      {
+        type: 'rate_limit_event',
+        rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: FIVE_HOUR_RESET },
+      },
+      RESULT_MSG,
+    );
+    const provider = new ClaudeProvider({ env: {} });
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const errors: unknown[] = [];
+    for await (const e of provider.query({ prompt: 'hi', cwd: tmp }).events) if (e.type === 'error') errors.push(e);
+
+    expect(errors).toContainEqual(
+      expect.objectContaining({ classification: 'rate_limit', resetAt: '2026-09-25T18:00:00.000Z' }),
+    );
+  });
+});
