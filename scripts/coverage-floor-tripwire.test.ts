@@ -8,9 +8,9 @@ import { type Baseline, discoverRiskFiles, hasExecutableCode, readRiskGlobs } fr
 const repoRoot = path.resolve(import.meta.dirname, '..');
 
 /**
- * The coverage ratchet runs only in the full suite, so a new risk file with no floor turned main red a day after it
- * merged. This holds the part of that check that needs no coverage run: every risk file with executable code has a
- * baseline entry. The floor's value is still the ratchet's to judge.
+ * The coverage ratchet runs only in the full suite. This holds the part of its check that needs no coverage run:
+ * every risk file with executable code has a floor. A baseline of 'n/a' is no floor once the file gains code. The
+ * floor's value is still the ratchet's to judge.
  */
 describe('coverage-risk-baseline.json covers every risk file', () => {
   it('names each risk:high file that has executable code', () => {
@@ -26,11 +26,12 @@ describe('coverage-risk-baseline.json covers every risk file', () => {
     expect(riskFiles.length).toBeGreaterThan(100);
     const missing = riskFiles.filter(
       (file) =>
-        !Object.hasOwn(baseline.files, file) && hasExecutableCode(fs.readFileSync(path.join(repoRoot, file), 'utf8')),
+        (!Object.hasOwn(baseline.files, file) || baseline.files[file] === 'n/a') &&
+        hasExecutableCode(fs.readFileSync(path.join(repoRoot, file), 'utf8')),
     );
     expect(
       missing,
-      'risk file(s) with no coverage floor: add each to coverage-risk-baseline.json at the value the next full-suite run measures, or "untested"',
+      'risk file(s) with no coverage floor: add each to coverage-risk-baseline.json at the value a coverage run measures (pnpm run test:coverage:risk, or gh workflow run ci-full.yml on the branch); "untested" is only for a file with no test at all',
     ).toEqual([]);
   });
 });
