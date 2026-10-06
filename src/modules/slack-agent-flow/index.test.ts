@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { registerCreateAgentFollowUp, type CreateAgentFollowUpContext } from '../agent-to-agent/create-agent.js';
+import type { CreateAgentFollowUpContext } from '../agent-to-agent/create-agent.js';
 import { followUpSlackAgentCreation } from './index.js';
 
 vi.mock('../../db/messaging-groups.js', () => ({ getMessagingGroup: vi.fn() }));
-vi.mock('../agent-to-agent/create-agent.js', () => ({ registerCreateAgentFollowUp: vi.fn() }));
+// vitest's clearMocks default wipes call history before each test, so the import-time registration is captured here.
+const registered = vi.hoisted(() => ({ followUp: undefined as unknown }));
+vi.mock('../agent-to-agent/create-agent.js', () => ({
+  registerCreateAgentFollowUp: vi.fn((followUp: unknown) => {
+    registered.followUp = followUp;
+  }),
+}));
 
 const context = (): CreateAgentFollowUpContext => ({
   session: {
@@ -35,7 +41,7 @@ beforeEach(() => {
 
 describe('manual Slack agent follow-up', () => {
   it('registers the post-create follow-up', () => {
-    expect(registerCreateAgentFollowUp).toHaveBeenCalledWith(followUpSlackAgentCreation);
+    expect(registered.followUp).toBe(followUpSlackAgentCreation);
   });
 
   it('emits a plain manifest and host attach instructions for a Slack origin', async () => {
