@@ -190,7 +190,11 @@ function openCodeMirrorDenyPlugins(): Set<string> {
 
 /** The one population every reader of the mirror must use (see openCodeMirrorDenyPlugins). */
 export function openCodeMirrorSkills(pluginsRoot: string): DiscoveredSkill[] {
-  return discoverPortableSkills(pluginsRoot, { runtime: 'opencode', denyPlugins: openCodeMirrorDenyPlugins() });
+  return discoverPortableSkills(pluginsRoot, {
+    runtime: 'opencode',
+    delivery: { nativePluginLoading: false, mirrorIsSoleDelivery: true },
+    denyPlugins: openCodeMirrorDenyPlugins(),
+  });
 }
 
 /**

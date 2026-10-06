@@ -1099,6 +1099,17 @@ async function acquireContainerStorageActivity(
   };
 }
 
+/**
+ * The instant the spawn minted this container's name, which is before the container started. Unlike the registry's
+ * `spawnedAt`, it survives a host restart: adoption reads the name back from the runtime and restamps `spawnedAt`.
+ */
+export function containerStartedAtMs(containerName: string | null): number | null {
+  if (!containerName?.startsWith(CONTAINER_NAME_PREFIX)) return null;
+  const match = /-(\d+)$/.exec(containerName);
+  const ms = match ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
+}
+
 export async function resolveSessionRepositoryWorkUnit(
   session: Session,
   workgroupId: string,

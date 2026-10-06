@@ -11,6 +11,15 @@ import path from 'path';
 
 import { discoverPortableSkills, syncSkillSymlinks } from './plugin-skill-discovery.js';
 
+const NO_DELIVERY = { nativePluginLoading: false, mirrorIsSoleDelivery: false };
+const CODEX_DELIVERY = { nativePluginLoading: true, mirrorIsSoleDelivery: false };
+const OPENCODE_DELIVERY = { nativePluginLoading: false, mirrorIsSoleDelivery: true };
+const DELIVERY_BY_RUNTIME = {
+  claude: { nativePluginLoading: false, mirrorIsSoleDelivery: false },
+  codex: CODEX_DELIVERY,
+  opencode: OPENCODE_DELIVERY,
+};
+
 let tmpDir: string;
 
 beforeEach(() => {
@@ -29,13 +38,13 @@ function writeSkill(dir: string, frontmatter: Record<string, string> = {}, body 
 
 describe('discoverPortableSkills', () => {
   it('returns empty when root does not exist', () => {
-    expect(discoverPortableSkills(path.join(tmpDir, 'missing'))).toEqual([]);
+    expect(discoverPortableSkills(path.join(tmpDir, 'missing'), { delivery: NO_DELIVERY })).toEqual([]);
   });
 
   it('finds top-level skills/<name>/SKILL.md', () => {
     writeSkill(path.join(tmpDir, 'plug-a', 'skills', 'foo'), { name: 'foo' });
     writeSkill(path.join(tmpDir, 'plug-a', 'skills', 'bar'), { name: 'bar' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out.map((s) => s.name).sort()).toEqual(['bar', 'foo']);
     expect(out.every((s) => s.plugin === 'plug-a')).toBe(true);
   });
@@ -44,7 +53,7 @@ describe('discoverPortableSkills', () => {
     writeSkill(path.join(tmpDir, 'plug-a', '.agents', 'skills', 'sk1'), { name: 'sk1', body: 'AGENTS-VERSION' });
     writeSkill(path.join(tmpDir, 'plug-a', '.claude', 'skills', 'sk1'), { name: 'sk1', body: 'CLAUDE-VERSION' });
     writeSkill(path.join(tmpDir, 'plug-a', '.cursor', 'skills', 'sk1'), { name: 'sk1', body: 'CURSOR-VERSION' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out).toHaveLength(1);
     expect(out[0].skillDir).toContain('.agents/skills/sk1');
   });
@@ -52,41 +61,41 @@ describe('discoverPortableSkills', () => {
   it('falls back to skills/ if no .agents/skills/', () => {
     writeSkill(path.join(tmpDir, 'plug-a', 'skills', 'sk1'), { name: 'sk1' });
     writeSkill(path.join(tmpDir, 'plug-a', '.claude', 'skills', 'sk1'), { name: 'sk1' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out[0].skillDir).toContain('plug-a/skills/sk1');
   });
 
   it('respects user-invocable: false (skipped)', () => {
     writeSkill(path.join(tmpDir, 'plug-a', 'skills', 'public'), { name: 'public' });
     writeSkill(path.join(tmpDir, 'plug-a', 'skills', 'internal'), { name: 'internal', 'user-invocable': 'false' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out.map((s) => s.name)).toEqual(['public']);
   });
 
   it('single-skill plugin: <plugin>/SKILL.md', () => {
     writeSkill(path.join(tmpDir, 'plug-single'), { name: 'plug-single' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out).toHaveLength(1);
     expect(out[0].name).toBe('plug-single');
   });
 
   it('impeccable-style plugin/skills/<name>/', () => {
     writeSkill(path.join(tmpDir, 'plug-imp', 'plugin', 'skills', 'imp'), { name: 'imp' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out).toHaveLength(1);
     expect(out[0].name).toBe('imp');
   });
 
   it('gitnexus-style <plugin>-claude-plugin/skills/<name>/ as last-resort fallback', () => {
     writeSkill(path.join(tmpDir, 'plug-gn', 'plug-gn-claude-plugin', 'skills', 'gn-sub'), { name: 'gn-sub' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out.map((s) => s.name)).toEqual(['gn-sub']);
   });
 
   it('preference order winner blocks lower-priority matches by name', () => {
     writeSkill(path.join(tmpDir, 'plug-a', '.agents', 'skills', 'imp'), { name: 'imp', body: 'WIN' });
     writeSkill(path.join(tmpDir, 'plug-a', 'skills', 'imp'), { name: 'imp', body: 'LOSE' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out).toHaveLength(1);
     expect(out[0].skillDir).toContain('.agents/skills/imp');
   });
@@ -94,14 +103,14 @@ describe('discoverPortableSkills', () => {
   it('skips deprecated subtrees', () => {
     writeSkill(path.join(tmpDir, 'plug-a', 'deprecated', 'old-skill'), { name: 'old-skill' });
     writeSkill(path.join(tmpDir, 'plug-a', 'skills', 'live'), { name: 'live' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out.map((s) => s.name)).toEqual(['live']);
   });
 
   it('respects custom denyPlugins option', () => {
     writeSkill(path.join(tmpDir, 'plug-deny', 'skills', 'x'), { name: 'x' });
     writeSkill(path.join(tmpDir, 'plug-keep', 'skills', 'y'), { name: 'y' });
-    const out = discoverPortableSkills(tmpDir, { denyPlugins: new Set(['plug-deny']) });
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY, denyPlugins: new Set(['plug-deny']) });
     expect(out.map((s) => s.name)).toEqual(['y']);
   });
 
@@ -122,7 +131,7 @@ describe('discoverPortableSkills', () => {
       name: 'software-engineering',
     });
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'tools', 'skills', 'cortex-code'), { name: 'cortex-code' });
-    const out = discoverPortableSkills(tmpDir, { runtime: 'codex' });
+    const out = discoverPortableSkills(tmpDir, { runtime: 'codex', delivery: CODEX_DELIVERY });
     const names = out.map((s) => s.name);
     expect(names).toContain('software-engineering');
     expect(names).toContain('cortex-code');
@@ -155,7 +164,9 @@ describe('discoverPortableSkills', () => {
     );
 
     const resolve = (rt: 'claude' | 'codex' | 'opencode') => {
-      const hits = discoverPortableSkills(tmpDir, { runtime: rt }).filter((s) => s.name === 'orchestrate');
+      const hits = discoverPortableSkills(tmpDir, { runtime: rt, delivery: DELIVERY_BY_RUNTIME[rt] }).filter(
+        (s) => s.name === 'orchestrate',
+      );
       expect(hits, `${rt}: expected exactly one orchestrate`).toHaveLength(1);
       return hits[0].skillDir;
     };
@@ -164,7 +175,9 @@ describe('discoverPortableSkills', () => {
     expect(resolve('opencode')).toBe(agentsDir);
     // Codex loads orchestrate-agents natively via .codex-plugin, and the Claude
     // copy needs a tool it lacks — neither belongs in the codex mirror.
-    expect(discoverPortableSkills(tmpDir, { runtime: 'codex' }).map((s) => s.name)).not.toContain('orchestrate');
+    expect(
+      discoverPortableSkills(tmpDir, { runtime: 'codex', delivery: CODEX_DELIVERY }).map((s) => s.name),
+    ).not.toContain('orchestrate');
   });
 
   it('opencode provisions user-invocable:false helpers (no plugin loader); claude/codex exclude them', () => {
@@ -178,7 +191,7 @@ describe('discoverPortableSkills', () => {
       'user-invocable': 'false',
     });
     const names = (rt: 'claude' | 'codex' | 'opencode') =>
-      discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
+      discoverPortableSkills(tmpDir, { runtime: rt, delivery: DELIVERY_BY_RUNTIME[rt] }).map((s) => s.name);
     expect(names('opencode')).toEqual(expect.arrayContaining(['visible', 'hidden-helper']));
     for (const rt of ['claude', 'codex'] as const) {
       expect(names(rt)).toContain('visible');
@@ -197,8 +210,12 @@ describe('discoverPortableSkills', () => {
       path.join(sub, '.codex-plugin', 'plugin.json'),
       JSON.stringify({ name: 'data-analytics', version: '0.0.0' }),
     );
-    expect(discoverPortableSkills(tmpDir, { runtime: 'codex' }).map((s) => s.name)).not.toContain('build-report');
-    expect(discoverPortableSkills(tmpDir, { runtime: 'opencode' }).map((s) => s.name)).toContain('build-report');
+    expect(
+      discoverPortableSkills(tmpDir, { runtime: 'codex', delivery: CODEX_DELIVERY }).map((s) => s.name),
+    ).not.toContain('build-report');
+    expect(
+      discoverPortableSkills(tmpDir, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }).map((s) => s.name),
+    ).toContain('build-report');
   });
 
   it('.nanoclaw-plugin.json denySiblings routes per runtime (default: all three)', () => {
@@ -209,7 +226,7 @@ describe('discoverPortableSkills', () => {
       JSON.stringify({ denySiblings: ['codex'] }),
     );
     const names = (rt: 'claude' | 'codex' | 'opencode') =>
-      discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
+      discoverPortableSkills(tmpDir, { runtime: rt, delivery: DELIVERY_BY_RUNTIME[rt] }).map((s) => s.name);
     expect(names('claude')).toContain('write-query');
     expect(names('opencode')).toContain('write-query');
     expect(names('codex')).not.toContain('write-query');
@@ -220,7 +237,9 @@ describe('discoverPortableSkills', () => {
     writeSkill(path.join(tmpDir, 'plug-badmark', 'skills', 'm'), { name: 'm' });
     fs.writeFileSync(path.join(tmpDir, 'plug-badmark', '.nanoclaw-plugin.json'), 'not valid json {');
     for (const rt of ['claude', 'codex', 'opencode'] as const) {
-      const names = discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
+      const names = discoverPortableSkills(tmpDir, { runtime: rt, delivery: DELIVERY_BY_RUNTIME[rt] }).map(
+        (s) => s.name,
+      );
       expect(names).toEqual(expect.arrayContaining(['k', 'm']));
     }
   });
@@ -228,14 +247,14 @@ describe('discoverPortableSkills', () => {
   it('cross-plugin name collision: first plugin alphabetically wins', () => {
     writeSkill(path.join(tmpDir, 'aaa', 'skills', 'dup'), { name: 'dup', body: 'FROM-AAA' });
     writeSkill(path.join(tmpDir, 'bbb', 'skills', 'dup'), { name: 'dup', body: 'FROM-BBB' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out).toHaveLength(1);
     expect(out[0].plugin).toBe('aaa');
   });
 
   it('uses frontmatter name override when present', () => {
     writeSkill(path.join(tmpDir, 'plug', 'skills', 'old-dir-name'), { name: 'real-name' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { delivery: NO_DELIVERY });
     expect(out[0].name).toBe('real-name');
   });
 
@@ -251,7 +270,9 @@ describe('discoverPortableSkills', () => {
     // which an empty sub-plugin directory also lacks.
     fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'rootlevel'), { recursive: true });
 
-    expect(discoverPortableSkills(tmpDir, { runtime: 'opencode' }).map((s) => s.name)).toEqual(['wwbd']);
+    expect(
+      discoverPortableSkills(tmpDir, { runtime: 'opencode', delivery: OPENCODE_DELIVERY }).map((s) => s.name),
+    ).toEqual(['wwbd']);
   });
 });
 
