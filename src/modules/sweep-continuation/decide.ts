@@ -37,3 +37,14 @@ export function decideCeilingFollowUp(args: {
   if (args.priorToolAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none' };
   return { action: 'wake-accountable', reason: 'tool' };
 }
+
+export type ReapFollowUp =
+  | { action: 'none'; reason: 'nothing-in-flight' | 'capped' | 'shadow' }
+  | { action: 'wake-accountable' };
+
+/** The chat-idle-reap counterpart: recency is already applied by whoever counted `inFlightCheckouts`. */
+export function decideReapFollowUp(args: { inFlightCheckouts: number; priorAttempts: number }): ReapFollowUp {
+  if (args.inFlightCheckouts === 0) return { action: 'none', reason: 'nothing-in-flight' };
+  if (args.priorAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none', reason: 'capped' };
+  return { action: 'wake-accountable' };
+}

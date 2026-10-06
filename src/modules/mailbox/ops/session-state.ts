@@ -1,7 +1,7 @@
 /**
  * Container-owned `session_state` keys other than the continuation record
  * (which lives in ops/continuation.ts): raw continuation presence and
- * force-clear, and the done proposal.
+ * force-clear, the done proposal, and the worktree in-flight record.
  */
 import type Database from 'better-sqlite3';
 
@@ -72,4 +72,98 @@ export function readDoneProposal(outbound: Database.Database): DoneProposal | nu
   } catch {
     return null;
   }
+}
+
+/** Written by the runner at each turn end (container/agent-runner/src/worktree-in-flight.ts). */
+interface WorktreeInFlightCheckout {
+  name: string;
+  branch: string | null;
+  upstream: string | null;
+  upstream_head: string | null;
+  files: string[];
+  file_count: number;
+  unpushed: number;
+}
+
+export interface WorktreeInFlight {
+  at: string;
+  checkouts: WorktreeInFlightCheckout[];
+}
+
+const MAX_RECORDED_CHECKOUTS = 32;
+const MAX_RECORDED_FILES = 20;
+const MAX_RECORDED_CHARS = 300;
+/** A maximal valid record is about 25 KiB; anything larger is malformed and is never read into memory. */
+const MAX_RECORD_BYTES = 64 * 1024;
+
+/** A single line of at most MAX_RECORDED_CHARS: these strings are spliced into a note, one checkout per line. */
+function recordedText(value: unknown): string | null {
+  if (typeof value !== 'string' || value === '' || value.length > MAX_RECORDED_CHARS || /[\r\n]/.test(value)) {
+    return null;
+  }
+  return value;
+}
+
+function recordedCount(value: unknown): number | null {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? (value as number) : null;
+}
+
+function parseInFlightCheckout(value: unknown): WorktreeInFlightCheckout | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const raw = value as Record<string, unknown>;
+  const name = recordedText(raw.name);
+  const fileCount = recordedCount(raw.file_count);
+  const unpushed = recordedCount(raw.unpushed);
+  if (name === null || fileCount === null || unpushed === null || !Array.isArray(raw.files)) return null;
+  // One bad path costs only itself; the count still says how many there were.
+  const files = raw.files
+    .slice(0, MAX_RECORDED_FILES)
+    .map(recordedText)
+    .filter((file): file is string => file !== null);
+  const optional = (field: unknown): string | null | undefined =>
+    field === null ? null : (recordedText(field) ?? undefined);
+  const branch = optional(raw.branch);
+  const upstream = optional(raw.upstream);
+  const upstreamHead = optional(raw.upstream_head);
+  if (branch === undefined || upstream === undefined || upstreamHead === undefined) return null;
+  return {
+    name,
+    branch,
+    upstream,
+    upstream_head: upstreamHead,
+    files,
+    file_count: Math.max(fileCount, files.length),
+    unpushed,
+  };
+}
+
+/**
+ * Anything malformed is absent: the record can only ever trigger a wake, so an unreadable one triggers none. A bad
+ * checkout entry drops only that entry. The value is agent-written, so its size is bounded in SQL, before it is read.
+ */
+export function readWorktreeInFlight(outbound: Database.Database): WorktreeInFlight | null {
+  const row = outbound
+    .prepare(
+      `SELECT CASE WHEN length(CAST(value AS BLOB)) <= ? THEN value END AS value
+         FROM session_state WHERE key = 'worktree_in_flight'`,
+    )
+    .get(MAX_RECORD_BYTES) as { value: string | null } | undefined;
+  if (!row || row.value === null) return null;
+  let parsed: { at?: unknown; checkouts?: unknown } | null;
+  try {
+    parsed = JSON.parse(row.value, (_key, value: unknown) => {
+      if (Array.isArray(value) && value.length > MAX_RECORDED_CHECKOUTS) throw new Error('oversized array');
+      return value;
+    }) as { at?: unknown; checkouts?: unknown } | null;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a syntax error or an oversized array: malformed is absent
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  if (typeof parsed.at !== 'string' || Number.isNaN(Date.parse(parsed.at))) return null;
+  if (!Array.isArray(parsed.checkouts)) return null;
+  const checkouts = parsed.checkouts
+    .map(parseInFlightCheckout)
+    .filter((checkout): checkout is WorktreeInFlightCheckout => checkout !== null);
+  return { at: parsed.at, checkouts };
 }

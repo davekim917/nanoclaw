@@ -1484,7 +1484,7 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
     raw.close();
 
     await _sweepSessionForTesting(session);
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-chat-reap', 'chat-idle-reap');
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-chat-reap', 'chat-idle-reap', expect.any(Function));
 
     const rowsAfterTick2 = new Database(inboundPath).prepare('SELECT id FROM messages_in ORDER BY seq').all() as Array<{
       id: string;
