@@ -80,6 +80,7 @@ import {
   getInboundRoutingAnchor,
   getInboundRequestIdentity,
   getRecoverableLifecycleStatus,
+  getNextScheduledWakeAt,
   getTaskListSettlement,
   type TaskListSettlement,
   getLatestRoutedTaskRow,
@@ -204,14 +205,11 @@ import {
   outboundHasRecentContentLike,
   parkDueRecoveryWakes,
   readMessageRouting,
-  staleClaimFate,
   writeOutboundDirectRow,
   type DirectOutboundRow,
   type InboundMessageRouting,
   type OutboundChatRow,
-  type StaleClaimFate,
 } from './ops/recovery.js';
-import { listRunnableWakes, type RunnableWake } from './ops/runnable-wakes.js';
 
 export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
 export { isContinuationParked, type HostWorkContinuation } from './ops/continuation.js';
@@ -355,6 +353,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
   getInboundRequestIdentity(sequence: number): InboundRequestIdentity | null;
   getRecoverableLifecycleStatus(outboundId?: string): RecoverableLifecycleStatus | null;
+  /** When the earliest `wait` the agent armed comes due, if it has not yet (see the op). */
+  getNextScheduledWakeAt(): string | null;
   getTaskListSettlement(killedAt: string): TaskListSettlement | null;
 
   /**
@@ -519,10 +519,6 @@ export interface NanoclawMailboxSession extends MailboxSession {
   outboundHasContentLike(marker: string): boolean;
   outboundHasRecentContentLike(marker: string, withinSeconds: number): boolean;
   hasNonStatusReplyTo(messageId: string): boolean;
-  /** What the stale-claim cleanup will do with this claim (see the op). */
-  staleClaimFate(messageId: string): StaleClaimFate;
-  /** The rows this session will be woken for once the ack sync, claim cleanup and due admission have run (see the op). */
-  listRunnableWakes(): RunnableWake[];
   /** The fork's `MAX(seq) + 2` direct write; opens the writable outbound handle. */
   writeOutboundDirect(message: DirectOutboundRow): void;
 }
@@ -886,6 +882,7 @@ function forkOps(
     getInboundRequestIdentity: (sequence) => getInboundRequestIdentity(inbound, sequence),
     getRecoverableLifecycleStatus: (outboundId) =>
       readOutbound(null, (outbound) => getRecoverableLifecycleStatus(inbound, outbound, outboundId)),
+    getNextScheduledWakeAt: () => getNextScheduledWakeAt(inbound),
     getTaskListSettlement: (killedAt) =>
       readOutbound(null, (outbound) => getTaskListSettlement(inbound, outbound, killedAt)),
 
@@ -982,10 +979,5 @@ function forkOps(
     outboundHasRecentContentLike: (marker, withinSeconds) =>
       readOutbound(false, (outbound) => outboundHasRecentContentLike(outbound, marker, withinSeconds)),
     hasNonStatusReplyTo: (messageId) => readOutbound(false, (outbound) => hasNonStatusReplyTo(outbound, messageId)),
-    staleClaimFate: (messageId) =>
-      readOutbound<StaleClaimFate>({ fate: 'orphan' }, (outbound) =>
-        staleClaimFate(inbound, outbound, messageId, Date.now()),
-      ),
-    listRunnableWakes: () => listRunnableWakes(inbound, outboundPresent ? readableOutbound() : null),
   };
 }

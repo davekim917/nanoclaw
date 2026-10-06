@@ -6,7 +6,6 @@
 import type Database from 'better-sqlite3';
 
 import { nextEvenSeq, type MessageInsert } from './ingress.js';
-import { DUE_NOW } from './sweep.js';
 
 export interface DueAdmissionRow {
   id: string;
@@ -67,8 +66,10 @@ export function demoteUnpairedLegacyTasks(db: Database.Database): void {
   ).run();
 }
 
-/** A `trigger = 0` row admission turns into a turn once it is due; any other one stays context for good. */
-export const ADMISSIBLE = `trigger = 0
+/** Shared by the select and the in-transaction re-check. */
+const DUE_PREDICATE = `status = 'pending'
+          AND trigger = 0
+          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
           AND (
             kind = 'task'
             OR EXISTS (
@@ -79,11 +80,6 @@ export const ADMISSIBLE = `trigger = 0
                  AND recall.trigger = 0
             )
           )`;
-
-/** Shared by the select and the in-transaction re-check. */
-const DUE_PREDICATE = `status = 'pending'
-          AND ${DUE_NOW}
-          AND ${ADMISSIBLE}`;
 
 /**
  * Matches a deferred wait (trigger=0) or an admitted due turn (trigger=1). A

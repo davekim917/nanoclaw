@@ -1,23 +1,16 @@
 /**
- * What is true of a session whose container was just stopped: when that container started, what already stands to
- * bring the session back, whether a human owes it an answer, and so what the kill follow-up will do. Shared by the
- * promise watch, the kill follow-up and the task list's kill label so they cannot disagree. Free of top-level side
- * effects, and of any import that reaches container-runner.ts or host-sweep.ts: task-list-host.ts loads this, and
- * both of those load task-list-host.ts.
+ * What is certain about a session whose container was just stopped, and so whether the kill follow-up queues a wake
+ * and what the task list's kill label may say. Nothing here forecasts what the sweep or a runner will do with a
+ * pending row: a wake withheld on a wrong forecast strands the work, a redundant wake costs one capped turn, so a
+ * wake is withheld only on a fact read directly. Free of top-level side effects, and of any import that reaches
+ * container-runner.ts or host-sweep.ts: task-list-host.ts loads this, and both of those load task-list-host.ts.
  */
 import { CONTAINER_NAME_PREFIX, SELF_HEAL_ENABLED } from '../../config.js';
 import { withRawDb } from '../../db/central-lease.js';
 import { isTaskThread, SESSION_BY_ID_SQL } from '../../db/sessions.js';
 import type { Session } from '../../types.js';
 import type { NanoclawMailboxSession, TaskListInFlight, WorktreeInFlight } from '../mailbox/index.js';
-import {
-  canAttemptContinuationRecovery,
-  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
-  type HostWorkContinuation,
-} from '../mailbox/ops/continuation.js';
-import { isRecoveryWakeId } from '../mailbox/ops/recovery.js';
-import type { RunnableWake } from '../mailbox/ops/runnable-wakes.js';
-import { parseSqliteUtc, sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
+import { WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
 
 export const REAP_RESPAWN_ID_PREFIX = 'reap-respawn-';
 
@@ -72,57 +65,12 @@ export function armedBy(state: ArmedState): ArmedBy | null {
   return null;
 }
 
-/** What makes a further wake redundant. Says nothing about whether the session comes back: see `Resumes`. */
-type SuppressedBy = ArmedBy | 'wake-deferred';
-
-/** What will bring a stopped session back, and when if that is a known future time. */
-interface Resumes {
-  by: 'wake-due' | 'wake-queued' | 'continuation' | 'follow-up' | 'wake-pending';
-  at: string | null;
-}
-
 /**
- * Raw pending rows are not read here: a row its container already acknowledged, a claim the cleanup will discard and
- * a context row nothing admits all look pending and never run. `listRunnableWakes` is what the sweep leaves to run.
+ * The only things that withhold the wake besides an open card, each a fact and none a reading of what is pending:
+ * the ceiling branch said it queued its own wake for this kill, a continuation is saved (the sweep resumes it, or
+ * has told the operator it could not), or the agent armed a `wait` that has not come due.
  */
-interface KillReads {
-  continuation: HostWorkContinuation | null;
-  wakes: RunnableWake[];
-}
-
-function readKill(mailbox: NanoclawMailboxSession): KillReads {
-  return { continuation: mailbox.readWorkContinuation(), wakes: mailbox.listRunnableWakes() };
-}
-
-/**
- * The kill follow-up's own unadmitted rows are left out: one row per kill is its id's job and the count is its
- * cap's, so an earlier one still pending must not read as "already coming back".
- */
-function suppressedBy({ continuation, wakes }: KillReads): SuppressedBy | null {
-  const others = wakes.filter((wake) => wake.admitted || !wake.id.startsWith(REAP_RESPAWN_ID_PREFIX));
-  if (others.some((wake) => wake.admitted && wake.at === null)) return 'wake-due';
-  if (others.some((wake) => wake.at !== null)) return 'wake-pending';
-  if (continuation !== null) return 'continuation-saved';
-  return others.length > 0 ? 'wake-deferred' : null;
-}
-
-/**
- * "Will this session come back", which is not "should another wake be withheld": a spent continuation withholds a
- * wake and resumes nothing, and the follow-up's own queued row resumes the session without withholding anything.
- * While a continuation's recovery budget is spent the sweep completes recovery wakes unread, so those bring nothing
- * back either.
- */
-function resumesBy({ continuation, wakes }: KillReads, takesAWake: boolean, followUp: ReapFollowUp): Resumes | null {
-  if (!takesAWake) return null;
-  const recoverable = continuation !== null && canAttemptContinuationRecovery(continuation);
-  const delivered = continuation !== null && !recoverable ? wakes.filter((wake) => !isRecoveryWakeId(wake.id)) : wakes;
-  const now = delivered.find((wake) => wake.at === null);
-  if (now) return { by: now.admitted ? 'wake-due' : 'wake-queued', at: null };
-  if (recoverable) return { by: 'continuation', at: null };
-  if (followUp.action === 'wake-accountable') return { by: 'follow-up', at: null };
-  const later = delivered.flatMap((wake) => wake.at ?? []).sort((a, b) => parseSqliteUtc(a) - parseSqliteUtc(b));
-  return later.length > 0 ? { by: 'wake-pending', at: sqliteUtcToIso(later[0]) } : null;
-}
+type WithheldBy = 'ceiling-wake' | 'continuation-saved' | 'wake-pending';
 
 type OpenCard = 'approval' | 'question';
 
@@ -228,10 +176,6 @@ export function decideReapFollowUp(args: {
   return { action: 'wake-accountable' };
 }
 
-/**
- * What the kill follow-up will do, from everything readable at the kill. Pure, so the task list's kill label can ask
- * the same question before the follow-up runs and the two cannot disagree.
- */
 function decideKillFollowUp(args: {
   reasonCovered: boolean;
   taskSession: boolean;
@@ -252,58 +196,72 @@ function decideKillFollowUp(args: {
   return followUp;
 }
 
-export interface KillPrediction {
-  followUp: ReapFollowUp;
+export interface KillFacts {
   /** Null when the registry never named the container: nothing can be dated, so nothing is attributable. */
   startedAtMs: number | null;
-  evidence: KillEvidence;
-  /** Why no further wake is queued; not whether the session comes back. */
-  armed: SuppressedBy | null;
-  /** The label's one question. Null for a session that takes no wake, whatever is queued for it. */
-  resumes: Resumes | null;
+  /** The earliest `wait` the agent armed that has not come due. */
+  nextCheckAt: string | null;
   openCard: OpenCard | null;
+  /** False for a closed or archived session, which takes no wake whatever is queued for it. */
+  takesAWake: boolean;
+}
+
+/** Call inside `withCentralSync`. `containerName` is read before the kill (the registry entry is gone after exit). */
+export function readKillFacts(
+  mailbox: Pick<NanoclawMailboxSession, 'getNextScheduledWakeAt'>,
+  session: Session,
+  containerName: string | null,
+): KillFacts {
+  const startedAtMs = containerStartedAtMs(containerName);
+  return {
+    startedAtMs,
+    nextCheckAt: mailbox.getNextScheduledWakeAt(),
+    openCard:
+      startedAtMs === null
+        ? null
+        : openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString()),
+    takesAWake: takesAWake(session.id),
+  };
+}
+
+export interface KillDecision {
+  followUp: ReapFollowUp;
+  startedAtMs: number | null;
+  evidence: KillEvidence;
+  withheldBy: WithheldBy | null;
   priorAttempts: number;
 }
 
-/**
- * What the kill follow-up will decide for this kill, and what it read to decide it. No writes. Call inside
- * `withCentralSync`. `containerName` is read before the kill (the registry entry is gone after exit).
- */
-export function predictKillFollowUp(
+/** No writes. Call inside `withCentralSync`. `ceilingWakeQueued` is the ceiling branch's own return for this kill. */
+export function decideKill(
   mailbox: NanoclawMailboxSession,
   session: Session,
   containerName: string | null,
-  reason: string,
-): KillPrediction {
-  const startedAtMs = containerStartedAtMs(containerName);
-  const reads = readKill(mailbox);
-  const armed = suppressedBy(reads);
+  kill: { reason: string; ceilingWakeQueued?: boolean },
+): KillDecision {
+  const facts = readKillFacts(mailbox, session, containerName);
+  const { startedAtMs } = facts;
   const dated = startedAtMs !== null;
   const evidence = dated ? readKillEvidence(mailbox, startedAtMs) : NO_EVIDENCE;
-  const openCard = dated
-    ? openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString())
-    : null;
+  const withheldBy: WithheldBy | null = kill.ceilingWakeQueued
+    ? 'ceiling-wake'
+    : mailbox.readWorkContinuation() !== null
+      ? 'continuation-saved'
+      : facts.nextCheckAt !== null
+        ? 'wake-pending'
+        : null;
   const priorAttempts = dated ? mailbox.countRecoveryAttemptsSinceRealInbound(REAP_RESPAWN_ID_PREFIX) : 0;
-  const wakeable = takesAWake(session.id);
   const followUp = decideKillFollowUp({
-    reasonCovered: STRANDING_KILLS.has(reason),
+    reasonCovered: STRANDING_KILLS.has(kill.reason),
     taskSession: isTaskThread(session.thread_id),
     inFlightCheckouts: evidence.checkouts.length,
     unfinishedItems: evidence.unfinished.length,
     staleEvidence: evidence.stale,
-    armed: armed !== null,
-    wakeable: dated && wakeable,
-    humanPending: openCard !== null,
+    armed: withheldBy !== null,
+    wakeable: facts.takesAWake,
+    humanPending: facts.openCard !== null,
     priorAttempts,
     selfHeal: SELF_HEAL_ENABLED,
   });
-  return {
-    followUp,
-    startedAtMs,
-    evidence,
-    armed,
-    resumes: resumesBy(reads, wakeable, followUp),
-    openCard,
-    priorAttempts,
-  };
+  return { followUp, startedAtMs, evidence, withheldBy, priorAttempts };
 }

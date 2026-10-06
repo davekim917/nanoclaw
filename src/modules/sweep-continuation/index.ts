@@ -440,7 +440,7 @@ function registerContinuationSweepDuties(): void {
     order: 70,
     run: (ctx) => {
       const { session, mailbox, plan } = asSessionContext(ctx);
-      if (plan.workContinuation && !canAttemptContinuationRecovery(plan.workContinuation)) {
+      if (plan.workContinuation && plan.workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) {
         const continuation = plan.workContinuation;
         writeOutboundWhenStopped(session, mailbox!, () => {
           const parked = mailbox!.parkDueRecoveryWakes(new Date().toISOString());
@@ -588,9 +588,9 @@ function registerContinuationSweepDuties(): void {
       // Inside the guard although the row is inbound: a replacement that took
       // the session has already recovered, and the row would instead greet the
       // NEXT container with a stale notice and count against its cap.
-      writeOutboundWhenStopped(ctx.session, mailbox, () => {
+      const ceiling = writeOutboundWhenStopped(ctx.session, mailbox, () => {
         try {
-          applyCeilingFollowUp(
+          return applyCeilingFollowUp(
             mailbox,
             ctx.session,
             snapshot.containerState,
@@ -600,13 +600,14 @@ function registerContinuationSweepDuties(): void {
           );
         } catch (err) {
           log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });
+          return undefined;
         }
       });
-      // After the branch above, so a wake it queued counts as armed here.
       try {
         await followUpKill(mailbox, ctx.session, ctx.observed?.containerIdentity?.containerName ?? null, {
           reason: ABSOLUTE_CEILING_KILL,
           minutes: Math.round(Math.max(outcome.ceilingMs, ABSOLUTE_CEILING_MS) / 60_000),
+          ceilingWakeQueued: ceiling?.action === 'wake-accountable',
         });
       } catch (err) {
         log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });

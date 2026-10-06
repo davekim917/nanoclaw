@@ -10,7 +10,7 @@ import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
 import type { TaskListSettlement } from './modules/mailbox/ops/lookups.js';
-import { predictKillFollowUp, type KillPrediction } from './modules/sweep-continuation/kill-state.js';
+import { readKillFacts, type KillFacts } from './modules/sweep-continuation/kill-state.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import { formatLocalTime } from './timezone.js';
@@ -45,23 +45,26 @@ const KILL_EDIT_MAX_WAIT_MS = 5 * 60_000;
 const KILL_EDIT_WAIT_BUFFER_MS = 250;
 
 /**
- * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host knows
- * more: an unanswered card the killed container posted, else whatever will bring the session back. A label the host
- * composes is host literals and host-formatted times only, so nothing the container wrote sits under a state the
- * host vouches for; with neither answer, or no usable timestamp, the runner's own label stands.
+ * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host
+ * replaces it only with something it knows for certain: an unanswered card the killed container posted, else a
+ * `wait` the agent armed that has not come due. It never says the session is resuming. A label the host composes is
+ * host literals and host-formatted times only, so nothing the container wrote sits under a state the host vouches
+ * for; with neither fact, no usable timestamp, or a session that takes no wake, the runner's own label stands.
  */
 async function killSubtext(
   session: Session,
   edit: NonNullable<TaskListSettlement['edit']>,
-  prediction: KillPrediction | null,
+  facts: KillFacts | null,
 ): Promise<string> {
-  if (edit.listedAt === null || prediction === null) return edit.interruptedSubtext;
-  const { openCard, resumes } = prediction;
-  if (!openCard && !resumes) return edit.interruptedSubtext;
+  if (edit.listedAt === null || facts === null || !facts.takesAWake) return edit.interruptedSubtext;
+  const { openCard, nextCheckAt } = facts;
+  if (!openCard && !nextCheckAt) return edit.interruptedSubtext;
   const timezone = await resolveGroupTimezone(session.agent_group_id);
-  let state = 'paused · resuming';
-  if (openCard) state = openCard === 'approval' ? 'waiting on an approval' : 'waiting on an answer';
-  else if (resumes?.at) state = `paused · next check ${formatLocalTime(resumes.at, timezone)}`;
+  const state = openCard
+    ? openCard === 'approval'
+      ? 'waiting on an approval'
+      : 'waiting on an answer'
+    : `paused · next check ${formatLocalTime(nextCheckAt!, timezone)}`;
   return `${state} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
 }
 
@@ -92,16 +95,16 @@ export async function settleTaskListOnKill(
           const found = mailbox.getTaskListSettlement(killedAt);
           if (!found) return null;
           for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
-          if (!found.edit) return { ...found, prediction: null };
+          if (!found.edit) return { ...found, facts: null };
           // A label that cannot be worked out must not cost the list its interrupted form.
-          const prediction = await withCentralSync(
-            () => predictKillFollowUp(mailbox, session, containerName, reason),
+          const facts = await withCentralSync(
+            () => readKillFacts(mailbox, session, containerName),
             'task list kill label',
           ).catch((err: unknown) => {
             log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId, reason, err });
             return null;
           });
-          return { ...found, prediction };
+          return { ...found, facts };
         });
         const edit = settlement?.edit;
         if (!edit) return 0;
@@ -118,7 +121,7 @@ export async function settleTaskListOnKill(
         }
         const cooling = taskListCooldownMs(edit.channelType);
         if (cooling > 0) return cooling;
-        const subtext = await killSubtext(session, edit, settlement.prediction);
+        const subtext = await killSubtext(session, edit, settlement.facts);
         try {
           await adapter.deliver(
             edit.channelType,

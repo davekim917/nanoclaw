@@ -19,21 +19,10 @@ vi.mock('./container-runner.js', async (importOriginal) => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return {
-    ...actual,
-    DATA_DIR: TEST_DIR,
-    GROUPS_DIR: `${TEST_DIR}/groups`,
-    TASK_LIST_ENABLED: true,
-    get SELF_HEAL_ENABLED() {
-      return selfHeal.armed;
-    },
-  };
+  return { ...actual, DATA_DIR: TEST_DIR, GROUPS_DIR: `${TEST_DIR}/groups`, TASK_LIST_ENABLED: true };
 });
 
-const { TEST_DIR, selfHeal } = vi.hoisted(() => ({
-  TEST_DIR: uniqueTmpRoot('test-task-list-delivery'),
-  selfHeal: { armed: false },
-}));
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-task-list-delivery') }));
 
 import {
   closeDb,
@@ -44,22 +33,10 @@ import {
 } from './db/index.js';
 import { resolveGroupTimezone } from './container-config.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
-import {
-  archiveSessionById,
-  createPendingApproval,
-  createPendingQuestion,
-  getSession,
-  updateSession,
-} from './db/sessions.js';
+import { archiveSessionById, createPendingApproval, createPendingQuestion, updateSession } from './db/sessions.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import {
-  ABSOLUTE_CEILING_KILL,
-  CHAT_IDLE_REAP_KILL,
-  PROVIDER_UNAVAILABLE_KILL,
-} from './modules/sweep-continuation/kill-state.js';
-import { followUpKill } from './modules/sweep-continuation/reap-respawn.js';
-import { resolveSession, withExistingMailboxSession } from './session-manager.js';
+import { resolveSession } from './session-manager.js';
 import { formatLocalTime } from './timezone.js';
 import { deliverSessionMessages, setDeliveryAdapter, withSessionDeliverySlot } from './delivery.js';
 import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
@@ -77,7 +54,7 @@ function now(): string {
   return new Date().toISOString();
 }
 
-async function seed(threadId: string = THREAD): Promise<string> {
+async function seed(): Promise<string> {
   await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
   await createMessagingGroup({
     id: 'mg-1',
@@ -88,7 +65,7 @@ async function seed(threadId: string = THREAD): Promise<string> {
     unknown_sender_policy: 'public',
     created_at: now(),
   });
-  const { session } = await resolveSession('ag-1', 'mg-1', threadId, 'per-thread');
+  const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
   return session.id;
 }
 
@@ -205,7 +182,6 @@ beforeEach(async () => {
   await initMigratedTestDb();
   _clearSecretsForTest();
   _clearTaskListCooldownsForTest();
-  selfHeal.armed = false;
 });
 
 afterEach(async () => {
@@ -729,9 +705,10 @@ describe('task list delivery (switch on)', () => {
   });
 });
 
-describe('the kill label says what is true of the session', () => {
+describe('the kill label says only what the host knows for certain', () => {
   /** What the runner wrote after its own leading state. */
   const DETAIL = 'todos as of <!date^1^{time} ({ago})|3:00 PM>';
+  const RUNNER_LABEL = `stopped · ${DETAIL}`;
   const HOUR = 60 * 60_000;
   const LISTED_AT = '2026-03-04T05:06:07.000Z';
 
@@ -749,22 +726,25 @@ describe('the kill label says what is true of the session', () => {
     return `nanoclaw-v2-agent-${ms}`;
   }
 
-  function insertInbound(sessionId: string, row: { id: string; processAfter?: string }): void {
+  function insertInbound(sessionId: string, row: { id: string; processAfter?: string; trigger?: number }): void {
     const db = new Database(inboundDbPath('ag-1', sessionId));
     db.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, process_after, content)
-       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'pending', 1, ?, ?)`,
-    ).run(row.id, now(), row.processAfter ?? null, JSON.stringify({ text: 'check the deploy' }));
+       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'pending', ?, ?, ?)`,
+    ).run(row.id, now(), row.trigger ?? 1, row.processAfter ?? null, JSON.stringify({ text: 'check the deploy' }));
     db.close();
   }
 
-  async function label(
-    sessionId: string,
-    containerName: string | null = null,
-    reason: string = CHAT_IDLE_REAP_KILL,
-  ): Promise<unknown> {
+  /** The row the `wait` action writes: its id prefix, inert until admission. */
+  function armWait(sessionId: string, name: string, processAfter: string): void {
+    insertInbound(sessionId, { id: `schedule-wake-${name}`, processAfter, trigger: 0 });
+  }
+
+  const inHours = (hours: number): string => new Date(Date.now() + hours * HOUR).toISOString();
+
+  async function label(sessionId: string, containerName: string | null = null): Promise<unknown> {
     const calls = captureAdapter();
-    await settleTaskListOnKill(sessionId, reason, containerName);
+    await settleTaskListOnKill(sessionId, 'chat-idle-reap', containerName);
     expect(calls).toHaveLength(1);
     return calls[0].content.subtext;
   }
@@ -782,16 +762,6 @@ describe('the kill label says what is true of the session', () => {
     });
   }
 
-  function wakeRowCount(sessionId: string): number {
-    const db = new Database(inboundDbPath('ag-1', sessionId), { readonly: true });
-    try {
-      return (db.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'reap-respawn-%'").get() as { c: number })
-        .c;
-    } finally {
-      db.close();
-    }
-  }
-
   function setOutboundState(sessionId: string, key: string, value: unknown): void {
     const db = outbound(sessionId);
     db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
@@ -802,390 +772,114 @@ describe('the kill label says what is true of the session', () => {
     db.close();
   }
 
-  it('stopped, when the kill is one nothing follows up and nothing is armed', async () => {
-    selfHeal.armed = true;
+  async function listed(overrides: Record<string, unknown> = current()): Promise<string> {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR), 'container-exit')).toBe(`stopped · ${DETAIL}`);
-  });
+    writeListState(sessionId, overrides);
+    return sessionId;
+  }
 
-  it('paused and resuming, when the kill follow-up is going to wake the session — and it then queues exactly one wake', async () => {
-    selfHeal.armed = true;
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    const containerName = containerStartedAt(Date.now() - HOUR);
-
-    expect(await label(sessionId, containerName)).toBe(`paused · resuming · ${await asOf()}`);
-
-    expect(wakeRowCount(sessionId)).toBe(0);
-    const session = (await getSession(sessionId))!;
-    const followUp = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
-      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
-    );
-    expect(followUp).toEqual({ action: 'wake-accountable' });
-    expect(wakeRowCount(sessionId)).toBe(1);
-  });
-
-  it('stopped, when the follow-up is capped: no wake is coming', async () => {
-    selfHeal.armed = true;
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    const db = new Database(inboundDbPath('ag-1', sessionId));
-    for (const id of ['reap-respawn-1790000000001', 'reap-respawn-1790000000002']) {
-      db.prepare(
-        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
-         VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'completed', 1, ?)`,
-      ).run(id, now(), JSON.stringify({ text: '[system] earlier wake', sender: 'system', senderId: 'system' }));
-    }
-    db.close();
-    const containerName = containerStartedAt(Date.now() - HOUR);
-
-    expect(await label(sessionId, containerName)).toBe(`stopped · ${DETAIL}`);
-
-    const session = (await getSession(sessionId))!;
-    await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
-      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
-    );
-    expect(wakeRowCount(sessionId)).toBe(2);
-  });
-
-  it('stopped, in self-heal shadow mode: the wake is only logged', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`stopped · ${DETAIL}`);
+  it('keeps the runner’s label when nothing is queued', async () => {
+    const sessionId = await listed();
+    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(RUNNER_LABEL);
   });
 
   it.each([
-    ['a ceiling kill', ABSOLUTE_CEILING_KILL],
-    ['a provider-unavailable kill', PROVIDER_UNAVAILABLE_KILL],
-  ])(
-    'paused and resuming for %s that will be woken, but stopped for the same kill of a task session',
-    async (_l, reason) => {
-      selfHeal.armed = true;
-      const sessionId = await seed();
-      seedDeliveredList(sessionId);
-      writeListState(sessionId, current());
-      expect(await label(sessionId, containerStartedAt(Date.now() - HOUR), reason)).toBe(
-        `paused · resuming · ${await asOf()}`,
-      );
-
-      const taskThread = 'system:tasks:series-nightly';
-      const { session: taskSession } = await resolveSession('ag-1', 'mg-1', taskThread, 'per-thread');
-      seedDeliveredList(taskSession.id, { threadId: taskThread });
-      writeListState(taskSession.id, { ...current(), threadId: taskThread });
-      expect(await label(taskSession.id, containerStartedAt(Date.now() - HOUR), reason)).toBe(`stopped · ${DETAIL}`);
-    },
-  );
-
-  it('paused and resuming, when a saved continuation will bring the session back', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    setOutboundState(sessionId, 'work_continuation', {
-      id: 'cont-1',
-      task: 'finish the rehearsal',
-      phase: 'queued',
-      chain: 1,
-      resume_attempts: 0,
-    });
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
+    ['a message that is due', (sessionId: string) => insertInbound(sessionId, { id: 'human-1' })],
+    [
+      'a saved continuation',
+      (sessionId: string) =>
+        setOutboundState(sessionId, 'work_continuation', {
+          id: 'cont-1',
+          task: 'finish the rehearsal',
+          phase: 'queued',
+          chain: 1,
+          resume_attempts: 0,
+        }),
+    ],
+    [
+      'a batch the container had claimed',
+      (sessionId: string) => {
+        insertInbound(sessionId, { id: 'human-1' });
+        const db = outbound(sessionId);
+        db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', ?)").run(
+          'human-1',
+          now(),
+        );
+        db.close();
+      },
+    ],
+    [
+      'a recovery wake already queued',
+      (sessionId: string) => {
+        insertInbound(sessionId, { id: 'reap-respawn-1790000000000', trigger: 0 });
+        insertInbound(sessionId, { id: 'recall-reap-respawn-1790000000000', trigger: 0 });
+      },
+    ],
+  ])('never claims the session is resuming: %s leaves the runner’s label', async (_l, arrange) => {
+    const sessionId = await listed();
+    arrange(sessionId);
+    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(RUNNER_LABEL);
   });
 
-  it('keeps the runner’s label for a parked continuation: armed against a wake, but not coming back', async () => {
-    selfHeal.armed = true;
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    setOutboundState(sessionId, 'work_continuation', {
-      id: 'cont-1',
-      task: 'finish the rehearsal',
-      phase: 'queued',
-      chain: 1,
-      resume_attempts: 2,
-      runner_id: 'runner-1',
-    });
-    const containerName = containerStartedAt(Date.now() - HOUR);
-
-    expect(await label(sessionId, containerName)).toBe(`stopped · ${DETAIL}`);
-
-    const session = (await getSession(sessionId))!;
-    const followUp = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
-      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
-    );
-    expect(followUp).toEqual({ action: 'none', reason: 'armed' });
-    expect(wakeRowCount(sessionId)).toBe(0);
-  });
-
-  it('paused with the next check, in the group’s timezone, when a wake is armed for later', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    const nextCheck = new Date(Date.now() + 3 * HOUR).toISOString();
-    insertInbound(sessionId, { id: 'wait-1', processAfter: nextCheck });
+  it('paused with the next check, in the group’s timezone, when the agent armed a wait', async () => {
+    const sessionId = await listed();
+    const nextCheck = inHours(3);
+    armWait(sessionId, 'a', nextCheck);
     await ensureContainerConfig('ag-1');
     await updateContainerConfigScalars('ag-1', { timezone: 'Asia/Tokyo' });
 
-    const subtext = await label(sessionId);
-
-    expect(subtext).toBe(
+    expect(await label(sessionId)).toBe(
       `paused · next check ${formatLocalTime(nextCheck, 'Asia/Tokyo')} · ${await asOf('Asia/Tokyo')}`,
     );
-    expect(await asOf('Asia/Tokyo')).not.toBe(await asOf('America/Anchorage'));
-    expect(subtext).not.toContain(formatLocalTime(nextCheck, 'America/Anchorage'));
+    expect(formatLocalTime(nextCheck, 'Asia/Tokyo')).not.toBe(formatLocalTime(nextCheck, 'America/Anchorage'));
   });
 
-  it('names the earliest of several later checks', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    const sooner = new Date(Date.now() + 2 * HOUR).toISOString();
-    insertInbound(sessionId, { id: 'wait-later', processAfter: new Date(Date.now() + 5 * HOUR).toISOString() });
-    insertInbound(sessionId, { id: 'wait-sooner', processAfter: sooner });
-    insertInbound(sessionId, { id: 'wait-latest', processAfter: new Date(Date.now() + 9 * HOUR).toISOString() });
+  it('names the earliest of several waits', async () => {
+    const sessionId = await listed();
+    const sooner = inHours(2);
+    armWait(sessionId, 'later', inHours(5));
+    armWait(sessionId, 'sooner', sooner);
+    armWait(sessionId, 'latest', inHours(9));
     expect(await label(sessionId)).toBe(
       `paused · next check ${formatLocalTime(sooner, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
     );
   });
 
-  it('paused and resuming, when what is armed is already due', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    insertInbound(sessionId, { id: 'due-1' });
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
+  it.each([
+    ['a context row', 'context-1'],
+    ['a recovery wake', 'ceiling-respawn-tool-fictional'],
+    ['a row that only resembles a wait', 'reschedule-wake-1'],
+  ])('a future row that is not a wait (%s) is not a check the agent promised', async (_l, id) => {
+    const sessionId = await listed();
+    insertInbound(sessionId, { id, processAfter: inHours(3), trigger: 0 });
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
 
-  function queueRecoveryWake(sessionId: string, id = 'reap-respawn-1790000000000'): void {
+  it('a wait that has already come due is no longer a next check', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', new Date(Date.now() - 60_000).toISOString());
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  it('a wait that already ran is not a next check', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', inHours(3));
     const db = new Database(inboundDbPath('ag-1', sessionId));
-    const insert = db.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, on_wake, content)
-       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), ?, ?, 'pending', 0, 1, ?)`,
-    );
-    const system = JSON.stringify({ text: '[system] earlier wake', sender: 'system', senderId: 'system' });
-    insert.run(id, 'chat', now(), system);
-    insert.run(`recall-${id}`, 'system', now(), '{}');
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'schedule-wake-a'").run();
     db.close();
-  }
-
-  it('paused and resuming on a kill follow-up wake already queued, which still does not withhold the next one', async () => {
-    selfHeal.armed = true;
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    queueRecoveryWake(sessionId);
-    const containerName = containerStartedAt(Date.now() - HOUR);
-
-    expect(await label(sessionId, containerName)).toBe(`paused · resuming · ${await asOf()}`);
-
-    const session = (await getSession(sessionId))!;
-    const followUp = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
-      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
-    );
-    expect(followUp).toEqual({ action: 'wake-accountable' });
-    expect(wakeRowCount(sessionId)).toBe(2);
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
-
-  it('paused and resuming when the last allowed follow-up wake is the one already queued', async () => {
-    selfHeal.armed = true;
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    queueRecoveryWake(sessionId, 'reap-respawn-1790000000001');
-    queueRecoveryWake(sessionId, 'reap-respawn-1790000000002');
-    const containerName = containerStartedAt(Date.now() - HOUR);
-
-    expect(await label(sessionId, containerName)).toBe(`paused · resuming · ${await asOf()}`);
-
-    const session = (await getSession(sessionId))!;
-    const followUp = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
-      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
-    );
-    expect(followUp).toEqual({ action: 'none', reason: 'capped' });
-  });
-
-  function claim(sessionId: string, messageId: string): void {
-    const db = outbound(sessionId);
-    db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', ?)").run(
-      messageId,
-      now(),
-    );
-    db.close();
-  }
-
-  it('paused and resuming for a batch the killed container had claimed and not finished', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    insertInbound(sessionId, { id: 'chat-1' });
-    claim(sessionId, 'chat-1');
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
-  });
-
-  it('stopped, when the only claim has no inbound row behind it: the cleanup drops it and nothing runs', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    claim(sessionId, 'gone-1');
-    expect(await label(sessionId)).toBe(`stopped · ${DETAIL}`);
-  });
-
-  it('stopped, when the only due row was already acknowledged by the container that died', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    insertInbound(sessionId, { id: 'chat-1' });
-    const db = outbound(sessionId);
-    db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'completed', ?)").run(
-      'chat-1',
-      now(),
-    );
-    db.close();
-    expect(await label(sessionId)).toBe(`stopped · ${DETAIL}`);
-  });
-
-  it('a later wait beside something that brings the session back sooner reads as resuming, not as that later check', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    insertInbound(sessionId, { id: 'wait-1', processAfter: new Date(Date.now() + 3 * HOUR).toISOString() });
-    queueRecoveryWake(sessionId);
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
-  });
-
-  const SPENT = { id: 'cont-1', task: 'finish the rehearsal', chain: 1, resume_attempts: 2, runner_id: 'runner-1' };
-
-  it('stopped, when the kill ended a continuation’s last recovery attempt: armed against a wake, resuming nothing', async () => {
-    selfHeal.armed = true;
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    setOutboundState(sessionId, 'work_continuation', { ...SPENT, phase: 'running' });
-    const containerName = containerStartedAt(Date.now() - HOUR);
-
-    expect(await label(sessionId, containerName, ABSOLUTE_CEILING_KILL)).toBe(`stopped · ${DETAIL}`);
-
-    const session = (await getSession(sessionId))!;
-    const followUp = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
-      followUpKill(mailbox, session, containerName, { reason: ABSOLUTE_CEILING_KILL, minutes: 30 }),
-    );
-    expect(followUp).toEqual({ action: 'none', reason: 'armed' });
-    expect(wakeRowCount(sessionId)).toBe(0);
-  });
-
-  it('paused and resuming for a running continuation with recovery budget left', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    setOutboundState(sessionId, 'work_continuation', { ...SPENT, phase: 'running', resume_attempts: 1 });
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
-  });
-
-  it.each(['queued', 'running'])(
-    'a spent %s continuation does not hide an ordinary wake that is due: resuming, on the wake’s account',
-    async (phase) => {
-      const sessionId = await seed();
-      seedDeliveredList(sessionId);
-      writeListState(sessionId, current());
-      setOutboundState(sessionId, 'work_continuation', { ...SPENT, phase });
-      insertInbound(sessionId, { id: 'due-1' });
-      expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
-    },
-  );
-
-  it('a spent continuation beside a later wait reads as paused until that check', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    setOutboundState(sessionId, 'work_continuation', { ...SPENT, phase: 'running' });
-    const nextCheck = new Date(Date.now() + 3 * HOUR).toISOString();
-    insertInbound(sessionId, { id: 'wait-1', processAfter: nextCheck });
-    expect(await label(sessionId)).toBe(
-      `paused · next check ${formatLocalTime(nextCheck, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
-    );
-  });
-
-  it.each([
-    ['queued for admission', (sessionId: string) => queueRecoveryWake(sessionId, 'ceiling-respawn-tool-1')],
-    ['already due', (sessionId: string) => insertInbound(sessionId, { id: 'ceiling-respawn-tool-1' })],
-  ])(
-    'stopped, when a recovery wake is %s behind a spent continuation: the sweep completes it unread',
-    async (_l, arrange) => {
-      const sessionId = await seed();
-      seedDeliveredList(sessionId);
-      writeListState(sessionId, current());
-      setOutboundState(sessionId, 'work_continuation', { ...SPENT, phase: 'running' });
-      arrange(sessionId);
-      expect(await label(sessionId)).toBe(`stopped · ${DETAIL}`);
-    },
-  );
-
-  describe('a session that takes no wake is never labelled as coming back', () => {
-    const ENDED = [
-      ['archived', (sessionId: string) => archiveSessionById(sessionId)],
-      ['closed', (sessionId: string) => updateSession(sessionId, { status: 'closed' })],
-    ] as const;
-    const QUEUED = [
-      ['a due row', (sessionId: string) => insertInbound(sessionId, { id: 'due-1' })],
-      [
-        'a later wait',
-        (sessionId: string) =>
-          insertInbound(sessionId, { id: 'wait-1', processAfter: new Date(Date.now() + HOUR).toISOString() }),
-      ],
-      [
-        'a recoverable continuation',
-        (sessionId: string) =>
-          setOutboundState(sessionId, 'work_continuation', { ...SPENT, phase: 'queued', resume_attempts: 0 }),
-      ],
-      ['a queued follow-up wake', (sessionId: string) => queueRecoveryWake(sessionId)],
-    ] as const;
-
-    it.each(ENDED.flatMap(([state, end]) => QUEUED.map(([what, queue]) => [state, what, end, queue] as const)))(
-      '%s, holding %s',
-      async (_state, _what, end, queue) => {
-        const sessionId = await seed();
-        seedDeliveredList(sessionId);
-        writeListState(sessionId, current());
-        queue(sessionId);
-        await end(sessionId);
-        expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`stopped · ${DETAIL}`);
-      },
-    );
-  });
-
-  it.each([
-    ['before', -800, 'stopped'],
-    ['after', 50, 'waiting on an approval'],
-  ] as const)(
-    'a card posted in the same second as the container start, %s it, is told apart to the millisecond',
-    async (_order, offsetMs, state) => {
-      const sessionId = await seed();
-      seedDeliveredList(sessionId);
-      writeListState(sessionId, current());
-      const startedAt = Math.floor((Date.now() - HOUR) / 1000) * 1000 + 900;
-      await approvalCard(sessionId, startedAt + offsetMs);
-      expect(await label(sessionId, containerStartedAt(startedAt))).toBe(
-        state === 'stopped' ? `stopped · ${DETAIL}` : `${state} · ${await asOf()}`,
-      );
-    },
-  );
 
   it('waiting on an approval, when the killed container’s card is unanswered', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
+    const sessionId = await listed();
     const startedAt = Date.now() - HOUR;
     await approvalCard(sessionId, startedAt + 60_000);
     expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${await asOf()}`);
   });
 
   it('waiting on an answer, when the killed container’s question is unanswered', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
+    const sessionId = await listed();
     const startedAt = Date.now() - HOUR;
     await createPendingQuestion({
       question_id: 'q-1',
@@ -1203,33 +897,61 @@ describe('the kill label says what is true of the session', () => {
   });
 
   it('a card from before the killed container, or a kill with no container to date it by, is not this list’s', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
+    const sessionId = await listed();
     const startedAt = Date.now() - HOUR;
     await approvalCard(sessionId, startedAt - 24 * HOUR);
-    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`stopped · ${DETAIL}`);
+    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(RUNNER_LABEL);
     await approvalCard(sessionId, startedAt + 60_000);
-    expect(await label(sessionId, null)).toBe(`stopped · ${DETAIL}`);
+    expect(await label(sessionId, null)).toBe(RUNNER_LABEL);
   });
 
-  it('an open card outranks an armed wake, timed or not', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
+  it.each([
+    ['before', -800, 'stopped'],
+    ['after', 50, 'waiting on an approval'],
+  ] as const)(
+    'a card posted in the same second as the container start, %s it, is told apart to the millisecond',
+    async (_order, offsetMs, state) => {
+      const sessionId = await listed();
+      const startedAt = Math.floor((Date.now() - HOUR) / 1000) * 1000 + 900;
+      await approvalCard(sessionId, startedAt + offsetMs);
+      expect(await label(sessionId, containerStartedAt(startedAt))).toBe(
+        state === 'stopped' ? RUNNER_LABEL : `${state} · ${await asOf()}`,
+      );
+    },
+  );
+
+  it('an open card outranks a wait', async () => {
+    const sessionId = await listed();
     const startedAt = Date.now() - HOUR;
     await approvalCard(sessionId, startedAt + 60_000);
-    insertInbound(sessionId, { id: 'wait-1', processAfter: new Date(Date.now() + HOUR).toISOString() });
+    armWait(sessionId, 'a', inHours(1));
     expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${await asOf()}`);
-    insertInbound(sessionId, { id: 'due-1' });
-    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${await asOf()}`);
+  });
+
+  describe('a session that takes no wake keeps the runner’s label', () => {
+    const ENDED = [
+      ['archived', (sessionId: string) => archiveSessionById(sessionId)],
+      ['closed', (sessionId: string) => updateSession(sessionId, { status: 'closed' })],
+    ] as const;
+    const KNOWN = [
+      ['a wait', async (sessionId: string, _startedAt: number) => armWait(sessionId, 'a', inHours(1))],
+      ['an open card', (sessionId: string, startedAt: number) => approvalCard(sessionId, startedAt + 60_000)],
+    ] as const;
+
+    it.each(ENDED.flatMap(([state, end]) => KNOWN.map(([what, arrange]) => [state, what, end, arrange] as const)))(
+      '%s, holding %s',
+      async (_state, _what, end, arrange) => {
+        const sessionId = await listed();
+        const startedAt = Date.now() - HOUR;
+        await arrange(sessionId, startedAt);
+        await end(sessionId);
+        expect(await label(sessionId, containerStartedAt(startedAt))).toBe(RUNNER_LABEL);
+      },
+    );
   });
 
   it('keeps the runner’s own label when every open item waits on someone', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    selfHeal.armed = true;
-    writeListState(sessionId, {
+    const sessionId = await listed({
       ...current(),
       items: [{ text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana' }],
       interruptedSubtext: `waiting on Dana · ${DETAIL}`,
@@ -1238,57 +960,53 @@ describe('the kill label says what is true of the session', () => {
   });
 
   it('a record from an older runner gets the host’s label too: nothing in it comes from the record but an instant', async () => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, { updatedAt: LISTED_AT });
-    insertInbound(sessionId, { id: 'due-1' });
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
+    const sessionId = await listed({ updatedAt: LISTED_AT });
+    const nextCheck = inHours(3);
+    armWait(sessionId, 'a', nextCheck);
+    expect(await label(sessionId)).toBe(
+      `paused · next check ${formatLocalTime(nextCheck, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
+    );
   });
 
   it.each([
     ['a forged second line', 'todos as of now\n# forged state @everyone'],
     ['an oversized footer', `todos as of ${'x'.repeat(20_000)}`],
   ])('a host-composed label carries none of the container’s label text: %s', async (_l, hostile) => {
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, {
+    const sessionId = await listed({
       ...current(),
       subtext: hostile,
       interruptedSubtext: `stopped · ${hostile}`,
       interruptedDetail: hostile,
     });
-    insertInbound(sessionId, { id: 'due-1' });
-    expect(await label(sessionId)).toBe(`paused · resuming · ${await asOf()}`);
+    const nextCheck = inHours(3);
+    armWait(sessionId, 'a', nextCheck);
+    expect(await label(sessionId)).toBe(
+      `paused · next check ${formatLocalTime(nextCheck, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
+    );
   });
 
   it.each([['not a time'], [42], [undefined]])(
     'keeps the runner’s label when the record’s on-screen stamp is %j, not an instant',
     async (updatedAt) => {
-      const sessionId = await seed();
-      seedDeliveredList(sessionId);
-      writeListState(sessionId, { updatedAt, touchedAt: now() });
-      insertInbound(sessionId, { id: 'due-1' });
-      expect(await label(sessionId)).toBe(`stopped · ${DETAIL}`);
+      const sessionId = await listed({ updatedAt, touchedAt: now() });
+      armWait(sessionId, 'a', inHours(3));
+      expect(await label(sessionId)).toBe(RUNNER_LABEL);
     },
   );
 
-  it('still marks the list interrupted, under the runner’s label, when the session state cannot be read', async () => {
-    selfHeal.armed = true;
-    const sessionId = await seed();
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, current());
-    const db = outbound(sessionId);
-    db.exec('DROP TABLE processing_ack');
+  it('still marks the list interrupted, under the runner’s label, when the session’s rows cannot be read', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', inHours(3));
+    const db = new Database(inboundDbPath('ag-1', sessionId));
+    db.exec('ALTER TABLE messages_in RENAME COLUMN process_after TO process_after_gone');
     db.close();
 
-    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`stopped · ${DETAIL}`);
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
 
   it('scrubs a registered secret from a label the runner wrote', async () => {
-    const sessionId = await seed();
     registerSecrets({ API_TOKEN: 'sk-live-abcdef123456' });
-    seedDeliveredList(sessionId);
-    writeListState(sessionId, { ...current(), interruptedSubtext: 'stopped · todos as of sk-live-abcdef123456' });
+    const sessionId = await listed({ ...current(), interruptedSubtext: 'stopped · todos as of sk-live-abcdef123456' });
     const subtext = await label(sessionId);
     expect(subtext).toMatch(/^stopped · todos as of /);
     expect(subtext).not.toContain('sk-live-abcdef123456');

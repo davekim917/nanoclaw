@@ -1,6 +1,6 @@
 /**
  * Kill accountability: an agent whose container is stopped while it still owes work (edits only on disk, a task list
- * with items it can still move) and with nothing armed to bring it back sits until a human pings. Same row machinery
+ * with items it can still move) and with nothing certain to bring it back sits until a human pings. Same row machinery
  * and cap as the ceiling wake; the decision itself is kill-state.ts's, this file writes the note. Kept free of
  * top-level side effects so other families can import it without registering this one.
  */
@@ -12,7 +12,7 @@ import type { Session } from '../../types.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import { WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
 import type { ReapFollowUp } from './decide.js';
-import { predictKillFollowUp, REAP_RESPAWN_ID_PREFIX, STRANDING_KILLS, type KillEvidence } from './kill-state.js';
+import { decideKill, REAP_RESPAWN_ID_PREFIX, STRANDING_KILLS, type KillEvidence } from './kill-state.js';
 
 export const ACCOUNT_FOR_STATE = 'post ONE message accounting for state — done / lost / next';
 
@@ -28,6 +28,8 @@ const CONTAINER_WORKTREES_DIR = '/workspace/worktrees';
 export interface StrandingKill {
   reason: string;
   minutes?: number;
+  /** The ceiling branch's own answer for this kill: it queued its wake, so this one would be a second. */
+  ceilingWakeQueued?: boolean;
 }
 
 function describeCheckouts(checkouts: KillEvidence['checkouts']): string {
@@ -83,8 +85,8 @@ function wakeText(cause: string, evidence: KillEvidence): string {
         ? ` Post a message only if work was lost or that ask was never made; otherwise the updated list is the answer.`
         : '';
     sections.push(
-      `Its task list still had ${evidence.unfinished.length} item(s) neither done nor marked waiting, and nothing ` +
-        `was armed to bring you back to them:\n${describeUnfinished(evidence.unfinished)}\n` +
+      `Its task list still had ${evidence.unfinished.length} item(s) neither done nor marked waiting, and you had ` +
+        `armed nothing to come back to them:\n${describeUnfinished(evidence.unfinished)}\n` +
         `Settle each one now with update_task_list. If it is in fact finished, mark it done. ` +
         `If the work is still owed, do the next item now. ` +
         `If you will check on it later (a peer agent you are waiting on counts), arm wait or continue_work naming ` +
@@ -97,7 +99,7 @@ function wakeText(cause: string, evidence: KillEvidence): string {
 }
 
 /**
- * Applies the kill's predicted follow-up. Call after the killed container has exited. The decision and the write are
+ * Decides and applies the kill's follow-up. Call after the killed container has exited. The decision and the write are
  * one synchronous block; the write sits under the outbound guard although the row is inbound: a replacement that
  * already took the session is handling the thread, and the row would greet the NEXT container with a stale notice.
  */
@@ -108,11 +110,11 @@ export async function followUpKill(
   kill: StrandingKill,
 ): Promise<ReapFollowUp> {
   return withCentralSync((): ReapFollowUp => {
-    const { followUp, startedAtMs, evidence, armed, priorAttempts } = predictKillFollowUp(
+    const { followUp, startedAtMs, evidence, withheldBy, priorAttempts } = decideKill(
       mailbox,
       session,
       containerName,
-      kill.reason,
+      kill,
     );
     const checkouts = evidence.checkouts.map((checkout) => checkout.name);
     const fields: Record<string, unknown> = {
@@ -143,7 +145,7 @@ export async function followUpKill(
           ...fields,
         });
       }
-      return decided(followUp, followUp.reason === 'armed' ? (armed ?? undefined) : undefined);
+      return decided(followUp, followUp.reason === 'armed' ? (withheldBy ?? undefined) : undefined);
     }
     const cause = STRANDING_KILLS.get(kill.reason);
     if (!cause || startedAtMs === null) throw new Error('kill follow-up predicted a wake for a kill it cannot name');

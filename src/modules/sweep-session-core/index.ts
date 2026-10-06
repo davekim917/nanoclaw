@@ -16,24 +16,29 @@ import { log } from '../../log.js';
 import { deferMessageForFreshContextRetry } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { type NanoclawMailboxSession } from '../mailbox/index.js';
-import { STALE_CLAIM_MAX_TRIES } from '../mailbox/ops/recovery.js';
-import { PENDING_MESSAGE_MAX_AGE_MS } from '../mailbox/ops/sweep.js';
+import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 
-export { PENDING_MESSAGE_MAX_AGE_MS };
-export const MAX_TRIES = STALE_CLAIM_MAX_TRIES;
+// Pending inbound rows older than this are expired so crashed-spawn leftovers
+// stop waking sessions and squatting the concurrency cap every tick.
+const parsedMaxAgeHours = Number(process.env.PENDING_MESSAGE_MAX_AGE_HOURS);
+export const PENDING_MESSAGE_MAX_AGE_MS =
+  (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
+export const MAX_TRIES = 5;
 export const BACKOFF_BASE_MS = 5000;
 
 function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Session, reason: string): void {
   const claims = mailbox.getProcessingClaimRows();
+  const now = Date.now();
 
   for (const { message_id } of claims) {
-    const msg = mailbox.staleClaimFate(message_id);
-    // `rescheduled` already waits on a future retry: don't bump tries again.
-    if (msg.fate === 'orphan' || msg.fate === 'rescheduled') continue;
+    const msg = mailbox.getMessageForRetry(message_id, 'pending');
+    if (!msg) continue;
 
-    if (msg.fate === 'answered') {
-      // Backfill completed on inbound.db only; the host must never write
-      // outbound.db here (one-writer invariant, readonly handle).
+    // Already answered (death after reply, before mark-completed): retrying would
+    // duplicate the reply. Backfill completed on inbound.db only; the host must
+    // never write outbound.db here (one-writer invariant, readonly handle).
+    const responded = mailbox.hasNonStatusReplyTo(msg.id);
+    if (responded) {
       mailbox.markInboundCompletedIfPending(msg.id);
       log.info('Reset skipped — response already written; marking completed', {
         messageId: msg.id,
@@ -43,7 +48,10 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
       continue;
     }
 
-    if (msg.fate === 'exhausted') {
+    // Already rescheduled for a future retry: don't bump tries again.
+    if (msg.processAfter && parseSqliteUtc(msg.processAfter) > now) continue;
+
+    if (msg.tries >= MAX_TRIES) {
       mailbox.markMessageFailed(msg.id);
       log.warn('Message marked as failed after max retries', {
         messageId: msg.id,

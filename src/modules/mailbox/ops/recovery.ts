@@ -1,16 +1,9 @@
 /** SQL for the sweep's self-heal paths; every cap, throttle and message body stays in the sweep. */
 import type Database from 'better-sqlite3';
 
-import { getMessageForRetry } from '../../../mailbox/sqlite/session-db.js';
-import { parseSqliteUtc } from '../sqlite-utc.js';
-
 /** Id prefixes of the deferred wake rows the sweep parks when a budget is spent. */
-const RECOVERY_WAKE_ID_PREFIXES = ['ceiling-respawn-', 'reap-respawn-', 'host-restart-', 'provider-heal-'];
-const RECOVERY_WAKE_ID_PATTERNS = `(${RECOVERY_WAKE_ID_PREFIXES.map((prefix) => `id LIKE '${prefix}%'`).join(' OR ')})`;
-
-export function isRecoveryWakeId(id: string): boolean {
-  return RECOVERY_WAKE_ID_PREFIXES.some((prefix) => id.startsWith(prefix));
-}
+const RECOVERY_WAKE_ID_PATTERNS =
+  "(id LIKE 'ceiling-respawn-%' OR id LIKE 'reap-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')";
 
 export function hasDueRecoveryWake(inDb: Database.Database, nowIso: string): boolean {
   return Boolean(
@@ -145,31 +138,6 @@ export function outboundHasRecentContentLike(outDb: Database.Database, marker: s
       )
       .get(`-${withinSeconds} seconds`, `%${marker}%`) !== undefined
   );
-}
-
-export const STALE_CLAIM_MAX_TRIES = 5;
-
-export type StaleClaimFate =
-  | { fate: 'orphan' }
-  | { fate: 'answered' | 'rescheduled' | 'exhausted' | 'retry'; id: string; tries: number };
-
-/**
- * What becomes of a claim its container died holding. `orphan` has no pending row behind it; `answered` was replied
- * to before the death, so retrying would duplicate the reply; `rescheduled` already waits on a future retry;
- * `exhausted` is out of tries. Only `retry` and `rescheduled` leave the row for another turn.
- */
-export function staleClaimFate(
-  inDb: Database.Database,
-  outDb: Database.Database,
-  messageId: string,
-  nowMs: number,
-): StaleClaimFate {
-  const msg = getMessageForRetry(inDb, messageId, 'pending');
-  if (!msg) return { fate: 'orphan' };
-  const { id, tries } = msg;
-  if (hasNonStatusReplyTo(outDb, id)) return { fate: 'answered', id, tries };
-  if (msg.processAfter && parseSqliteUtc(msg.processAfter) > nowMs) return { fate: 'rescheduled', id, tries };
-  return { fate: tries >= STALE_CLAIM_MAX_TRIES ? 'exhausted' : 'retry', id, tries };
 }
 
 /**

@@ -5,6 +5,7 @@
  */
 import type Database from 'better-sqlite3';
 
+import { sqliteUtcToIso } from '../sqlite-utc.js';
 import { readOpenTaskListRecord } from './session-state.js';
 
 export interface InboundChatSenderRow {
@@ -237,6 +238,28 @@ export interface TaskListSettlement {
  * Null when there is nothing to settle: no list, a finished or stale one (its
  * queued rows carry its real final state), or one touched after the kill began.
  */
+export const SCHEDULE_WAKE_ID_PREFIX = 'schedule-wake-';
+
+/**
+ * When the earliest `wait` the agent armed comes due, if it has not yet. Keyed on the id prefix only the `wait`
+ * action mints, so a future context row or anything else with a `process_after` is not mistaken for a check the
+ * agent promised itself. Whether the row then runs is admission's business, not read here.
+ */
+export function getNextScheduledWakeAt(inbound: Database.Database): string | null {
+  const row = inbound
+    .prepare(
+      `SELECT process_after AS at FROM messages_in
+        WHERE status = 'pending'
+          AND substr(id, 1, ?) = ?
+          AND process_after IS NOT NULL
+          AND julianday(process_after) > julianday('now')
+        ORDER BY julianday(process_after)
+        LIMIT 1`,
+    )
+    .get(SCHEDULE_WAKE_ID_PREFIX.length, SCHEDULE_WAKE_ID_PREFIX) as { at: string } | undefined;
+  return row ? sqliteUtcToIso(row.at) : null;
+}
+
 function instantOrNull(value: unknown): string | null {
   const ms = typeof value === 'string' ? Date.parse(value) : NaN;
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
