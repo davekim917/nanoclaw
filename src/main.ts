@@ -399,7 +399,6 @@ export async function runBootMountQuiescence(
     // Non-empty means a live agent wrote to a group directory while the door was stopping it.
     ...(flipped.length > 0 ? { flipped } : {}),
   });
-  // One line per workgroup the door acted on, naming the predicate and the first write behind the decision.
   const linkOnlyWorkgroupIds: string[] = [];
   for (const [workgroupId, entry] of pending) {
     if (changedWorkgroupIds.includes(workgroupId)) {

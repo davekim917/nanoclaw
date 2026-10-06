@@ -432,6 +432,24 @@ const SHARED_MATRIX: SharedCase[] = [
       fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/gone`, path.join(groupsDir, 'wgx', 'gone'));
     },
   },
+  // A link already at the name pointing elsewhere: repointing it changes what
+  // a container's existing path resolves to, so it is a mount change.
+  {
+    name: 'seed-link-wrong-target',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.unlinkSync(path.join(groupsDir, 'wgx', 'dbt'));
+      fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/other`, path.join(groupsDir, 'wgx', 'dbt'));
+    },
+  },
+  {
+    name: 'sibling-link-wrong-target',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.unlinkSync(path.join(groupsDir, 'wgx-codex', 'dbt'));
+      fs.symlinkSync('../wgx/dbt', path.join(groupsDir, 'wgx-codex', 'dbt'));
+    },
+  },
 ];
 
 function makeSharedDb(): Database.Database {
@@ -530,6 +548,18 @@ describe('sharedDirsPendingChange', () => {
         treeChanged: false,
       },
       'dangling-compat-symlink': { pending: null, invalidates: false, mutations: [], treeChanged: false },
+      'seed-link-wrong-target': {
+        pending: 'compat-link-replace:dbt',
+        invalidates: true,
+        mutations: ['compat-link-replace:dbt'],
+        treeChanged: true,
+      },
+      'sibling-link-wrong-target': {
+        pending: 'sibling-link-replace:wgx-codex/dbt',
+        invalidates: true,
+        mutations: ['sibling-link-replace:wgx-codex/dbt'],
+        treeChanged: true,
+      },
     });
   });
 
@@ -544,10 +574,15 @@ describe('sharedDirsPendingChange', () => {
     }
   });
 
-  /** Settled, plus a symlink-only write that sorts first and a move that sorts last. */
+  /**
+   * Settled, plus: a link creation that sorts first, a sibling link pointing
+   * elsewhere, and a move that sorts last.
+   */
   function buildLinkThenMove({ groupsDir, dataDir }: { groupsDir: string; dataDir: string }): void {
     buildSettled({ groupsDir, dataDir });
     fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'aaa-scratch'), { recursive: true });
+    fs.unlinkSync(path.join(groupsDir, 'wgx-codex', 'dbt'));
+    fs.symlinkSync('../wgx/dbt', path.join(groupsDir, 'wgx-codex', 'dbt'));
     fs.mkdirSync(path.join(groupsDir, 'wgx', 'zzz-repo', '.git'), { recursive: true });
   }
 
@@ -564,7 +599,7 @@ describe('sharedDirsPendingChange', () => {
     db.close();
   });
 
-  it('outside the quiesced set the reconcile writes symlinks and defers the move', () => {
+  it('outside the quiesced set the reconcile creates links and defers the move and the repoint', () => {
     const base = makeTree('deferred-move', buildLinkThenMove);
     const groupsDir = path.join(base, 'groups');
     const dataDir = path.join(base, 'data');
@@ -576,9 +611,10 @@ describe('sharedDirsPendingChange', () => {
       'compat-link:aaa-scratch',
       'sibling-link:wgx-codex/aaa-scratch',
     ]);
-    expect(live.deferred).toEqual([{ kind: 'move', name: 'zzz-repo' }]);
+    expect(live.deferred.map(describeMutation)).toEqual(['move:zzz-repo', 'sibling-link-replace:wgx-codex/dbt']);
     expect(fs.lstatSync(path.join(groupsDir, 'wgx', 'zzz-repo')).isDirectory()).toBe(true);
     expect(fs.existsSync(path.join(dataDir, 'workgroups', 'wgx', 'zzz-repo'))).toBe(false);
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx-codex', 'dbt'))).toBe('../wgx/dbt');
     expect(fs.readlinkSync(path.join(groupsDir, 'wgx', 'aaa-scratch'))).toBe(`${WORKGROUP_CONTAINER_PATH}/aaa-scratch`);
 
     // The deferred write is still pending for the next boot's door…
@@ -592,10 +628,37 @@ describe('sharedDirsPendingChange', () => {
     expect(quiesced.mutations.map(describeMutation)).toEqual([
       'move:zzz-repo',
       'compat-link:zzz-repo',
+      'sibling-link-replace:wgx-codex/dbt',
       'sibling-link:wgx-codex/zzz-repo',
     ]);
     expect(quiesced.deferred).toEqual([]);
     expect(sharedDirsPendingChange(db, 'wgx', { groupsDir, dataDir })).toBeNull();
+    db.close();
+  });
+
+  it('a name an agent takes between the lstat and the write is left to its owner', () => {
+    // Under live containers the only link write is a creation, and `symlink(2)`
+    // is what refuses: the agent's bytes survive and the boot does not fail.
+    const base = makeTree('taken-name', ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    });
+    const groupsDir = path.join(base, 'groups');
+    const dataDir = path.join(base, 'data');
+    const seedPath = path.join(groupsDir, 'wgx', 'scratch');
+    const db = makeSharedDb();
+    const realSymlink = fs.symlinkSync;
+    const spy = vi.spyOn(fs, 'symlinkSync').mockImplementation((target, linkPath, type) => {
+      if (linkPath === seedPath) fs.writeFileSync(seedPath, 'agent bytes\n');
+      return realSymlink(target, linkPath, type);
+    });
+    try {
+      const [live] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir, quiescedWorkgroupIds: [] });
+      expect(live.mutations.map(describeMutation)).toEqual(['sibling-link:wgx-codex/scratch']);
+      expect(fs.readFileSync(seedPath, 'utf8')).toBe('agent bytes\n');
+    } finally {
+      spy.mockRestore();
+    }
     db.close();
   });
 

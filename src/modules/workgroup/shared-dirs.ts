@@ -454,25 +454,32 @@ interface MigrationReport {
   strategy: 'rename' | 'copy';
 }
 
-export type SharedDirMutationKind = 'move' | 'source-cleanup' | 'compat-link' | 'sibling-link';
+export type SharedDirMutationKind =
+  | 'move'
+  | 'source-cleanup'
+  | 'compat-link'
+  | 'compat-link-replace'
+  | 'sibling-link'
+  | 'sibling-link-replace';
 
-/** One write the shared-dirs reconcile performs (or would perform). */
 export interface SharedDirMutation {
   kind: SharedDirMutationKind;
   name: string;
-  /** Set for `sibling-link`: the member folder whose link is written. */
+  /** Set for the `sibling-*` kinds: the member folder whose link is written. */
   sibling?: string;
 }
 
 /**
- * The kinds that rewrite what a live container's bind mount resolves to: a
- * real dir leaves (or is removed from) a member folder. Writing a symlink
- * into a member folder adds or repoints an entry the container can only see
- * as a new path to the same shared data, so it is not one of them.
+ * The kinds that change what an existing path in a live container's bind mount
+ * resolves to: a real dir leaves (or is removed from) a member folder, or a
+ * link already there is pointed elsewhere. Creating a link where there was no
+ * entry only adds a path, so `compat-link` and `sibling-link` are not among them.
  */
 export const MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS: ReadonlySet<SharedDirMutationKind> = new Set([
   'move',
   'source-cleanup',
+  'compat-link-replace',
+  'sibling-link-replace',
 ]);
 
 export interface SharedDirsPendingChange extends SharedDirMutation {
@@ -481,7 +488,6 @@ export interface SharedDirsPendingChange extends SharedDirMutation {
 
 export interface SharedDirsReconcileReport {
   workgroupId: string;
-  /** Writes performed, in order. */
   mutations: SharedDirMutation[];
   /** Mount-invalidating writes skipped because the workgroup was not in `quiescedWorkgroupIds`. */
   deferred: SharedDirMutation[];
@@ -616,7 +622,13 @@ export function sharedDirsPendingChange(
   const { seedDir, wgDir, siblingFolders, shared } = plan;
   if (shared.size === 0) return null;
 
-  let firstLink: SharedDirMutation | null = null;
+  const first: { link: SharedDirMutation | null } = { link: null };
+  const linkWrite = (mutation: SharedDirMutation): SharedDirsPendingChange | null => {
+    if (MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS.has(mutation.kind)) return { ...mutation, invalidatesMounts: true };
+    first.link ??= mutation;
+    return null;
+  };
+
   const moved: string[] = [];
   for (const name of [...shared].sort()) {
     const src = path.join(seedDir, name);
@@ -627,22 +639,24 @@ export function sharedDirsPendingChange(
     } else if (isRealDir(src)) {
       return { kind: 'source-cleanup', name, invalidatesMounts: true }; // interrupted move
     }
-    if (!firstLink && compatSymlinkWouldChange(seedDir, name)) firstLink = { kind: 'compat-link', name };
+    const state = containerLinkState(src, `${WORKGROUP_CONTAINER_PATH}/${name}`);
+    if (state === 'create' || state === 'replace') {
+      const pending = linkWrite({ kind: state === 'create' ? 'compat-link' : 'compat-link-replace', name });
+      if (pending) return pending;
+    }
     moved.push(name);
   }
 
-  if (!firstLink) {
-    for (const link of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
-      if (link.state === 'repoint') {
-        firstLink = { kind: 'sibling-link', name: link.name, sibling: link.sibling };
-        break;
-      }
+  for (const { sibling, name, linkPath, target } of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
+    const state = containerLinkState(linkPath, target);
+    if (state === 'create' || state === 'replace') {
+      const pending = linkWrite({ kind: state === 'create' ? 'sibling-link' : 'sibling-link-replace', name, sibling });
+      if (pending) return pending;
     }
   }
-  return firstLink ? { ...firstLink, invalidatesMounts: false } : null;
+  return first.link ? { ...first.link, invalidatesMounts: false } : null;
 }
 
-/** Would `reconcileWorkgroupSharedDirs` write anything for this workgroup? */
 export function sharedDirsReconcileWouldChange(
   db: RawStatements,
   workgroupId: string,
@@ -651,33 +665,16 @@ export function sharedDirsReconcileWouldChange(
   return sharedDirsPendingChange(db, workgroupId, dirs) !== null;
 }
 
-interface SiblingSharedLink {
-  sibling: string;
-  name: string;
-  linkPath: string;
-  lst: fs.Stats | null;
-  /** `current`: already points at the mount. `real`: the sibling owns a real entry — never clobbered. */
-  state: 'current' | 'real' | 'repoint';
-}
-
 function* siblingSharedLinks(
   groupsDir: string,
   siblingFolders: string[],
   moved: string[],
-): Generator<SiblingSharedLink> {
+): Generator<{ sibling: string; name: string; linkPath: string; target: string }> {
   for (const sibling of siblingFolders) {
     const sdir = path.join(groupsDir, sibling);
     if (!fs.existsSync(sdir)) continue;
     for (const name of moved) {
-      const linkPath = path.join(sdir, name);
-      const lst = lstatOrNull(linkPath);
-      const state =
-        lst?.isSymbolicLink() && safeReadlink(linkPath) === `${WORKGROUP_CONTAINER_PATH}/${name}`
-          ? 'current'
-          : lst && !lst.isSymbolicLink()
-            ? 'real'
-            : 'repoint';
-      yield { sibling, name, linkPath, lst, state };
+      yield { sibling, name, linkPath: path.join(sdir, name), target: `${WORKGROUP_CONTAINER_PATH}/${name}` };
     }
   }
 }
@@ -750,23 +747,44 @@ function migrateWorkgroup(
       fs.rmSync(src, { recursive: true, force: true });
       mutations.push({ kind: 'source-cleanup', name });
     }
-    if (ensureCompatSymlink(seedDir, name)) mutations.push({ kind: 'compat-link', name });
+    switch (ensureContainerLink(src, `${WORKGROUP_CONTAINER_PATH}/${name}`, quiesced)) {
+      case 'created':
+        mutations.push({ kind: 'compat-link', name });
+        break;
+      case 'replaced':
+        mutations.push({ kind: 'compat-link-replace', name });
+        break;
+      case 'deferred':
+        deferred.push({ kind: 'compat-link-replace', name });
+        break;
+      case 'real':
+        log.warn('reconcileWorkgroupSharedDirs: refusing to overwrite real seed entry with compat symlink', {
+          workgroupId,
+          name,
+        });
+        break;
+    }
     moved.push(name);
   }
 
-  for (const { sibling, name, linkPath, lst, state } of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
-    if (state === 'current') continue;
-    if (state === 'real') {
-      log.warn('reconcileWorkgroupSharedDirs: sibling has a real entry, not overlaying', {
-        workgroupId,
-        sibling,
-        name,
-      });
-      continue;
-    }
-    if (lst) fs.unlinkSync(linkPath); // remove the now-broken relative symlink
-    if (symlinkUnlessEntryAppeared(`${WORKGROUP_CONTAINER_PATH}/${name}`, linkPath)) {
-      mutations.push({ kind: 'sibling-link', name, sibling });
+  for (const { sibling, name, linkPath, target } of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
+    switch (ensureContainerLink(linkPath, target, quiesced)) {
+      case 'created':
+        mutations.push({ kind: 'sibling-link', name, sibling });
+        break;
+      case 'replaced':
+        mutations.push({ kind: 'sibling-link-replace', name, sibling });
+        break;
+      case 'deferred':
+        deferred.push({ kind: 'sibling-link-replace', name, sibling });
+        break;
+      case 'real':
+        log.warn('reconcileWorkgroupSharedDirs: sibling has a real entry, not overlaying', {
+          workgroupId,
+          sibling,
+          name,
+        });
+        break;
     }
   }
 
@@ -1195,51 +1213,46 @@ function lstatOrNull(p: string): fs.Stats | null {
   }
 }
 
-/** Create (or replace) a container-absolute compat symlink at `<dir>/<name>`; true if it wrote one. */
-function ensureCompatSymlink(dir: string, name: string): boolean {
-  const linkPath = path.join(dir, name);
-  const target = `${WORKGROUP_CONTAINER_PATH}/${name}`;
+/** `real`: a non-symlink owns the name — never clobbered. */
+type ContainerLinkState = 'current' | 'real' | 'create' | 'replace';
+
+/** What `ensureContainerLink` would do at `linkPath`, without writing. */
+function containerLinkState(linkPath: string, target: string): ContainerLinkState {
   const st = lstatOrNull(linkPath);
-  if (st) {
-    if (st.isSymbolicLink() && safeReadlink(linkPath) === target) return false; // already correct
-    if (st.isSymbolicLink()) {
-      fs.unlinkSync(linkPath);
-    } else {
-      // A real entry reappeared at the seed path — do not clobber.
-      log.warn('reconcileWorkgroupSharedDirs: refusing to overwrite real seed entry with compat symlink', {
-        dir,
-        name,
-      });
-      return false;
-    }
-  }
-  return symlinkUnlessEntryAppeared(target, linkPath);
+  if (!st) return 'create';
+  if (!st.isSymbolicLink()) return 'real';
+  return safeReadlink(linkPath) === target ? 'current' : 'replace';
 }
 
 /**
- * Symlink writes may run under live containers, whose agents can create an
- * entry at the same path between the lstat and the write. That lands as EEXIST,
- * which is the sibling-real-entry case arriving late, not a failure of the boot.
+ * The one write path for a container-absolute link in a member folder.
+ * Creation may run under live containers: `symlink(2)` refuses with EEXIST
+ * when an agent takes the name between the lstat and the write, so nothing of
+ * theirs is unlinked. Replacement is unlink-then-symlink with no refusal
+ * between the two, and it changes what the path resolves to inside any
+ * container holding the folder, so it waits for quiescence.
  */
-function symlinkUnlessEntryAppeared(target: string, linkPath: string): boolean {
+function ensureContainerLink(
+  linkPath: string,
+  target: string,
+  quiesced: boolean,
+): 'current' | 'real' | 'created' | 'replaced' | 'deferred' | 'taken' {
+  const state = containerLinkState(linkPath, target);
+  if (state === 'current' || state === 'real') return state;
+  if (state === 'replace') {
+    if (!quiesced) return 'deferred';
+    fs.unlinkSync(linkPath);
+    fs.symlinkSync(target, linkPath);
+    return 'replaced';
+  }
   try {
     fs.symlinkSync(target, linkPath);
-    return true;
+    return 'created';
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     log.warn('reconcileWorkgroupSharedDirs: entry appeared concurrently, not overlaying', { linkPath });
-    return false;
+    return 'taken';
   }
-}
-
-/** Non-mutating mirror of `ensureCompatSymlink`: would it write a link? */
-function compatSymlinkWouldChange(dir: string, name: string): boolean {
-  const linkPath = path.join(dir, name);
-  const target = `${WORKGROUP_CONTAINER_PATH}/${name}`;
-  const st = lstatOrNull(linkPath);
-  if (!st) return true;
-  if (st.isSymbolicLink()) return safeReadlink(linkPath) !== target;
-  return false; // a real seed entry is never clobbered
 }
 
 /** Prior `.migrated` report, or null when absent/unreadable/malformed. */
