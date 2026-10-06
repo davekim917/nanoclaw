@@ -252,11 +252,13 @@ import {
   getAdoptedSessionIds,
   getContainerIdentity,
   killContainer,
+  stopOrphanedSessions,
   getContainerSpawnedAt,
   hasPendingAdoption,
   isAdoptedContainer,
   isContainerRunning,
   wakeContainer,
+  _markPendingAdoptionForTesting,
   _resetAdoptionStateForTesting,
 } from './container-runner.js';
 import { resolveContainerResources } from './container-resources.js';
@@ -1038,5 +1040,83 @@ describe('adoptRunningSessions', () => {
     const spawnedAt = getContainerSpawnedAt('sess-ceiling');
     expect(spawnedAt).toBeGreaterThanOrEqual(before);
     expect(spawnedAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  describe('stopOrphanedSessions', () => {
+    it('leaves a supervised session whose rows exist alone', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-kept');
+      fakes.listing = [survivor('sess-kept')];
+      await adoptRunningSessions({ list: fakes.list });
+
+      expect(await stopOrphanedSessions()).toBe(0);
+      expect(fakes.stopped).toEqual([]);
+      expect(isContainerRunning('sess-kept')).toBe(true);
+    });
+
+    it('stops a supervised session whose row was deleted', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-gone');
+      fakes.listing = [survivor('sess-gone')];
+      await adoptRunningSessions({ list: fakes.list });
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-gone');
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-gone']);
+      expect(warnings('Stopping container whose session or agent group was deleted')).toHaveLength(1);
+    });
+
+    it('stops a pending survivor whose session row was deleted', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-held-gone');
+      await seedHostInstance('peer-live', 'live');
+      await seedForeignClaim('sess-held-gone', 'peer-live', 5);
+      fakes.listing = [survivor('sess-held-gone')];
+      expect(await adoptRunningSessions({ list: fakes.list })).toMatchObject({ pendingClaim: 1 });
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-held-gone');
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-held-gone']);
+    });
+
+    it('re-lists a survivor held on an inventory failure before stopping it, and waits while the runtime is down', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-unnamed-gone');
+      fakes.listing = [survivor('sess-unnamed-gone')];
+      fakes.listingFails = true;
+      const held = await adoptRunningSessions({ list: fakes.list, survivableSessionIds: ['sess-unnamed-gone'] });
+      expect(held).toMatchObject({ pendingClaim: 1 });
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-unnamed-gone');
+
+      // Runtime still unlistable: nothing to stop by, nothing stopped, hold kept for a later tick.
+      expect(await stopOrphanedSessions()).toBe(0);
+      expect(fakes.stopped).toEqual([]);
+      expect(hasPendingAdoption('sess-unnamed-gone')).toBe(true);
+
+      fakes.listingFails = false;
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-unnamed-gone']);
+    });
+
+    it('names a pending survivor whose session row could not be read at boot, then stops it once the row is gone', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-unread-gone');
+      fakes.listing = [];
+      await adoptRunningSessions({ list: fakes.list });
+      _markPendingAdoptionForTesting('sess-unread-gone');
+      fakes.listing = [survivor('sess-unread-gone')];
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-unread-gone');
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-unread-gone']);
+      expect(hasPendingAdoption('sess-unread-gone')).toBe(false);
+    });
+
+    it('stops a supervised session whose agent group was deleted', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-groupless');
+      fakes.listing = [survivor('sess-groupless')];
+      await adoptRunningSessions({ list: fakes.list });
+      // `ncl groups delete` order: the sessions FK means the group row can only go once its sessions have.
+      await getDb().run('DELETE FROM sessions WHERE agent_group_id = ?', CLAIM_HARNESS_AGENT_GROUP_ID);
+      await getDb().run('DELETE FROM agent_groups WHERE id = ?', CLAIM_HARNESS_AGENT_GROUP_ID);
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-groupless']);
+    });
   });
 });

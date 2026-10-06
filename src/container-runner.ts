@@ -1741,6 +1741,36 @@ export interface StartupReconciliation {
   fencedInbound: number;
 }
 
+/**
+ * Stop the containers this host supervises (adopted or spawned, and survivors held pending a claim) whose session
+ * row or agent group no longer exists. The per-session sweep fans out over `getActiveSessions()`, so a deleted row
+ * is never visited and its container would run until the idle ceiling or the next host restart. A session with a
+ * wake in flight is left for the next tick: its row was read by the spawn path and it is registered only after
+ * that read.
+ */
+export async function stopOrphanedSessions(): Promise<number> {
+  let stopped = 0;
+  const supervised = [
+    ...[...activeContainers].map(([sessionId, runtime]) => [sessionId, runtime.containerName] as const),
+    ...[...pendingAdoptions].map(
+      (sessionId) => [sessionId, pendingHolds.get(sessionId)?.containerName ?? null] as const,
+    ),
+  ];
+  for (const [sessionId, listedName] of supervised) {
+    if (wakePromises.has(sessionId) || pendingKills.has(sessionId)) continue;
+    const session = await getSession(sessionId);
+    if (session && (await getAgentGroup(session.agent_group_id))) continue;
+    // A survivor held on an inventory failure has no name to stop by; re-list it first, and leave it for a later
+    // tick while the runtime still cannot be asked.
+    if (pendingAdoptions.has(sessionId) && (await resolvePendingSurvivor(sessionId)) !== 'running') continue;
+    const containerName = listedName ?? getContainerIdentity(sessionId);
+    log.warn('Stopping container whose session or agent group was deleted', { sessionId, containerName });
+    killContainer(sessionId, 'orphaned');
+    stopped += 1;
+  }
+  return stopped;
+}
+
 /** Unclaimed survivors: alive and untracked, so `wakeContainer` checks this FIRST and routes to the adoption retry. */
 const pendingAdoptions = new Set<string>();
 
@@ -1828,7 +1858,7 @@ async function holdAsPending(
   pendingAdoptions.add(session.id);
   let hold = pendingHolds.get(session.id);
   if (!hold) {
-    hold = { containerName: null, lease: null, reservedMb: null, fits: null, waiter: null, parkedExits: [] };
+    hold = emptyPendingHold();
     pendingHolds.set(session.id, hold);
   }
   if (container && hold.containerName !== container.name) {
@@ -1957,14 +1987,19 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
   void releasePendingHold(sessionId);
 }
 
+function emptyPendingHold(): PendingHold {
+  return { containerName: null, lease: null, reservedMb: null, fits: null, waiter: null, parkedExits: [] };
+}
+
 /**
- * A hold seeded on an inventory failure has no name, so nothing can stop it: re-list. `'unknown'` means the
- * runtime could not be asked, and the caller must not report a restart it could not perform.
+ * A pending survivor with no name — held on an inventory failure, or marked pending because its session row could
+ * not be read — has nothing a stop can act on: re-list it, and name it so the stop paths can. `'unknown'` means
+ * the runtime could not be asked, and the caller must not report a restart it could not perform.
  */
 export async function resolvePendingSurvivor(sessionId: string): Promise<'running' | 'gone' | 'unknown'> {
   const hold = pendingHolds.get(sessionId);
-  if (!hold) return pendingAdoptions.has(sessionId) ? 'unknown' : 'gone';
-  if (hold.containerName) return 'running';
+  if (!hold && !pendingAdoptions.has(sessionId)) return 'gone';
+  if (hold?.containerName) return 'running';
   let listed: InstallContainerScope | undefined;
   try {
     listed = adoptionListing().find((container) => container.sessionId === sessionId);
@@ -1977,7 +2012,9 @@ export async function resolvePendingSurvivor(sessionId: string): Promise<'runnin
     await releasePendingHold(sessionId);
     return 'gone';
   }
-  hold.containerName = listed.name;
+  const named = hold ?? emptyPendingHold();
+  named.containerName = listed.name;
+  pendingHolds.set(sessionId, named);
   observePending(sessionId);
   return 'running';
 }

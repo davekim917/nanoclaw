@@ -379,6 +379,7 @@ import './modules/sweep-task-escalation/index.js';
 import './modules/mcp-oauth/index.js';
 import './modules/sweep-promise-watch/index.js';
 import './modules/sweep-provider-return/index.js';
+import './modules/sweep-orphan-containers/index.js';
 import './modules/wiki-admission/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
@@ -1372,6 +1373,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'coordination-orphans', 'tick:housekeeping', 130],
     ['duty', 'task-failure-escalation', 'tick:housekeeping', 135],
     ['duty', 'promise-watch', 'tick:housekeeping', 136],
+    ['duty', 'orphan-containers', 'tick:housekeeping', 140],
     ['duty', 'wiki-admission-recovery', 'tick:housekeeping', 9500],
     ['sla-observation-hook', 'container-oom-notice', 'sla-observation-hook', 10],
     ['kill-follow-up', 'kill-ceiling-notice', 'kill-follow-up', 10],
@@ -1401,16 +1403,16 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
     // 46 registrations: the 38 from the seam-2 port (37 unique names, one
-    // registered twice — see below) plus seven fork additions,
+    // registered twice — see below) plus eight fork additions,
     // github-token-file-refresh, cli-request-execution-prune,
     // coordination-orphans (seam 4 series A', issue #430),
-    // task-failure-escalation, mcp-oauth-refresh, promise-watch and
-    // provider-fallback-return.
-    expect(actual).toHaveLength(46);
+    // task-failure-escalation, mcp-oauth-refresh, promise-watch,
+    // provider-fallback-return and orphan-containers.
+    expect(actual).toHaveLength(47);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(45);
+    expect(names.size).toBe(46);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(45);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(46);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1835,12 +1837,12 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `provider-fallback-return` from `sweep-provider-return`. The numbers here
     // said 39/38/38 from before those landed; the tuple comparison above was
     // already right, which is why it never failed.
-    expect(actual).toHaveLength(46);
+    expect(actual).toHaveLength(47);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(45);
+    expect(names.size).toBe(46);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(45);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(46);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });
