@@ -237,12 +237,12 @@ export async function runUninstallFlow(opts: {
 }
 
 /** Unwrap a confirm result; Ctrl-C / Esc cancels the whole uninstall — nothing deleted. */
-function answered<T>(value: T | symbol): T {
+function answered<T>(value: T): Exclude<T, symbol> {
   if (p.isCancel(value)) {
     p.cancel('Uninstall cancelled. Nothing was deleted.');
     process.exit(0);
   }
-  return value as T;
+  return value as Exclude<T, symbol>;
 }
 
 async function confirmGroup(prompt: string, yes: boolean): Promise<boolean> {
