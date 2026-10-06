@@ -503,7 +503,7 @@
 "container/agent-runner/src/upload-trace.test.ts":{"diff":37,"mode":"100644","sha256":"dc555bf47ed02673be7c7a5b5032fba4afd61e6ffe9f6d25398365045c541773"},
 "container/agent-runner/src/upload-trace.ts":{"diff":77,"mode":"100644","sha256":"85cc060cb778410e66902bd04cd0fda4cae5790f87fb9ed261d4e6ba6586314d"},
 "container/agent-runner/tsconfig.json":{"diff":0,"mode":"100644","sha256":"538137373346083a608187cffa07d51d34045864124bbe11f0773d82db5176b0"},
-"container/build.sh":{"diff":282,"mode":"100755","sha256":"df47c7362a0f28518e2ee453ed00ff79b961e8939f308c0626a3a0e3d956d11f"},
+"container/build.sh":{"diff":294,"mode":"100755","sha256":"4e6b89b5916b0c681af93128872a5aa6aad36abe7c8df71a60799e9f9ad108b6"},
 "container/cli-tools.json":{"diff":13,"mode":"100644","sha256":"0eb6e6f67fbc4310106a6c9af9dbab05a5fcf18b5c0e9e237da4e64e3179a72f"},
 "container/cli-tools.test.ts":{"diff":72,"mode":"100644","sha256":null,"deleted":true},
 "container/entrypoint.sh":{"diff":216,"mode":"100755","sha256":"bfcf90c3714a7c5be9e95c3f1085ce0c8628ee1fef6144f7ac9168353ee8447e"},
