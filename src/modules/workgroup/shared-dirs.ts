@@ -336,25 +336,31 @@ export function inspectWorkgroupMemoryState(
   };
 }
 
+export interface WorkgroupMemoryPendingChange {
+  reason: 'canon-missing' | 'exact-empty-no-members' | 'member-link' | 'preferences-missing';
+  /** Set for `member-link`: the member folder whose `memory` entry is not the exact link. */
+  folder?: string;
+}
+
 /**
- * Would `reconcileWorkgroupMemory` change anything for this workgroup? Pure.
- * The boot quiescence door uses it to pick which containers to stop. It must
- * agree with the reconcile's `changed` report, which is deliberately wider than
- * the member-symlink changes that invalidate live mounts: over-stopping is safe
- * and under-stopping is not.
+ * The first write `reconcileWorkgroupMemory` would perform for this workgroup,
+ * or null when it is settled. Pure. The boot quiescence door uses it to pick
+ * which containers to stop. It must agree with the reconcile's `changed`
+ * report, which is deliberately wider than the member-symlink changes that
+ * invalidate live mounts: over-stopping is safe and under-stopping is not.
  */
-export function workgroupMemoryReconcileWouldChange(
+export function workgroupMemoryPendingChange(
   db: RawStatements,
   workgroupId: string,
   dirs: WorkgroupMemoryDirs = {},
-): boolean {
+): WorkgroupMemoryPendingChange | null {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
   const dataDir = dirs.dataDir ?? DATA_DIR;
   const before = inspectWorkgroupMemoryState(db, workgroupId, { groupsDir, dataDir });
-  if (before.status === 'migration-required') return false;
+  if (before.status === 'migration-required') return null;
 
   const members = memoryMembers(db, workgroupId);
-  if (before.status === 'exact-empty' && members.length === 0) return true;
+  if (before.status === 'exact-empty' && members.length === 0) return { reason: 'exact-empty-no-members' };
 
   const canonical = workgroupMemoryDir(workgroupId, dataDir);
   const canonExists = lstatOrNull(canonical) !== null;
@@ -362,14 +368,23 @@ export function workgroupMemoryReconcileWouldChange(
   // the reconcile's `changed` true — so the first hit can return without
   // simulating the state a mutation would have left for later members.
   for (const member of members) {
-    if (!canonExists) return true;
+    if (!canonExists) return { reason: 'canon-missing' };
     const local = path.join(groupsDir, member.folder, 'memory');
     const localStat = lstatOrNull(local);
     const exactLink = localStat?.isSymbolicLink() === true && safeReadlink(local) === WORKGROUP_MEMORY_CONTAINER_PATH;
-    if (!exactLink) return true;
-    if (!lstatOrNull(path.join(canonical, 'preferences'))) return true;
+    if (!exactLink) return { reason: 'member-link', folder: member.folder };
+    if (!lstatOrNull(path.join(canonical, 'preferences'))) return { reason: 'preferences-missing' };
   }
-  return false;
+  return null;
+}
+
+/** Would `reconcileWorkgroupMemory` change anything for this workgroup? */
+export function workgroupMemoryReconcileWouldChange(
+  db: RawStatements,
+  workgroupId: string,
+  dirs: WorkgroupMemoryDirs = {},
+): boolean {
+  return workgroupMemoryPendingChange(db, workgroupId, dirs) !== null;
 }
 
 function linkMembersToCanonical(db: RawStatements, workgroupId: string, groupsDir: string, dataDir: string): boolean {
@@ -439,24 +454,63 @@ interface MigrationReport {
   strategy: 'rename' | 'copy';
 }
 
+export type SharedDirMutationKind = 'move' | 'source-cleanup' | 'compat-link' | 'sibling-link';
+
+/** One write the shared-dirs reconcile performs (or would perform). */
+export interface SharedDirMutation {
+  kind: SharedDirMutationKind;
+  name: string;
+  /** Set for `sibling-link`: the member folder whose link is written. */
+  sibling?: string;
+}
+
+/**
+ * The kinds that rewrite what a live container's bind mount resolves to: a
+ * real dir leaves (or is removed from) a member folder. Writing a symlink
+ * into a member folder adds or repoints an entry the container can only see
+ * as a new path to the same shared data, so it is not one of them.
+ */
+export const MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS: ReadonlySet<SharedDirMutationKind> = new Set([
+  'move',
+  'source-cleanup',
+]);
+
+export interface SharedDirsPendingChange extends SharedDirMutation {
+  invalidatesMounts: boolean;
+}
+
+export interface SharedDirsReconcileReport {
+  workgroupId: string;
+  /** Writes performed, in order. */
+  mutations: SharedDirMutation[];
+  /** Mount-invalidating writes skipped because the workgroup was not in `quiescedWorkgroupIds`. */
+  deferred: SharedDirMutation[];
+}
+
 /**
  * Consolidate every workgroup's shared dirs into `data/workgroups/<id>/`.
  * Fail-closed: a per-workgroup failure throws so the caller exits rather than
  * spawn containers against a half-migrated tree. Runs only inside the boot
- * quiescence door, so containers whose mounts this invalidates are stopped.
+ * quiescence door. Mount-invalidating mutations are performed only for the
+ * workgroups in `quiescedWorkgroupIds` (default: every selected workgroup) —
+ * the ones whose containers the caller has proven stopped; elsewhere they are
+ * deferred to the next boot and only symlinks are written.
  */
 export function reconcileWorkgroupSharedDirs(
   db: RawStatements,
-  dirs: { groupsDir?: string; dataDir?: string; workgroupIds?: string[] } = {},
-): void {
+  dirs: { groupsDir?: string; dataDir?: string; workgroupIds?: string[]; quiescedWorkgroupIds?: string[] } = {},
+): SharedDirsReconcileReport[] {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
   const dataDir = dirs.dataDir ?? DATA_DIR;
   const selected = dirs.workgroupIds ? new Set(dirs.workgroupIds) : null;
+  const quiesced = dirs.quiescedWorkgroupIds ? new Set(dirs.quiescedWorkgroupIds) : null;
   const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
+  const reports: SharedDirsReconcileReport[] = [];
   for (const wg of workgroups) {
     if (selected && !selected.has(wg.id)) continue;
-    migrateWorkgroup(db, wg.id, groupsDir, dataDir);
+    reports.push(migrateWorkgroup(db, wg.id, groupsDir, dataDir, quiesced === null || quiesced.has(wg.id)));
   }
+  return reports;
 }
 
 interface SharedDirPlan {
@@ -545,39 +599,56 @@ function planWorkgroupSharedDirs(
 }
 
 /**
- * Would `reconcileWorkgroupSharedDirs` change anything for this workgroup? Pure
- * mirror of the migrator's `changed` decision, used by the boot quiescence door.
+ * The first write `reconcileWorkgroupSharedDirs` would perform for this
+ * workgroup, or null when it is settled. Pure mirror of the migrator, used by
+ * the boot quiescence door: a mount-invalidating write is reported ahead of
+ * any symlink write so the door never under-stops on a workgroup that has both.
  */
-export function sharedDirsReconcileWouldChange(
+export function sharedDirsPendingChange(
   db: RawStatements,
   workgroupId: string,
   dirs: { groupsDir?: string; dataDir?: string } = {},
-): boolean {
+): SharedDirsPendingChange | null {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
   const dataDir = dirs.dataDir ?? DATA_DIR;
   const plan = planWorkgroupSharedDirs(db, workgroupId, groupsDir, dataDir);
-  if (!plan) return false;
+  if (!plan) return null;
   const { seedDir, wgDir, siblingFolders, shared } = plan;
-  if (shared.size === 0) return false;
+  if (shared.size === 0) return null;
 
+  let firstLink: SharedDirMutation | null = null;
   const moved: string[] = [];
   for (const name of [...shared].sort()) {
     const src = path.join(seedDir, name);
     const dst = path.join(wgDir, name);
     if (!fs.existsSync(dst)) {
       if (!isRealDir(src)) continue; // nothing real to move — the migrator skips it whole
-      return true; // a move would fire
+      return { kind: 'move', name, invalidatesMounts: true };
     } else if (isRealDir(src)) {
-      return true; // interrupted move — the source cleanup would fire
+      return { kind: 'source-cleanup', name, invalidatesMounts: true }; // interrupted move
     }
-    if (compatSymlinkWouldChange(seedDir, name)) return true;
+    if (!firstLink && compatSymlinkWouldChange(seedDir, name)) firstLink = { kind: 'compat-link', name };
     moved.push(name);
   }
 
-  for (const link of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
-    if (link.state === 'repoint') return true; // the repoint would fire
+  if (!firstLink) {
+    for (const link of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
+      if (link.state === 'repoint') {
+        firstLink = { kind: 'sibling-link', name: link.name, sibling: link.sibling };
+        break;
+      }
+    }
   }
-  return false;
+  return firstLink ? { ...firstLink, invalidatesMounts: false } : null;
+}
+
+/** Would `reconcileWorkgroupSharedDirs` write anything for this workgroup? */
+export function sharedDirsReconcileWouldChange(
+  db: RawStatements,
+  workgroupId: string,
+  dirs: { groupsDir?: string; dataDir?: string } = {},
+): boolean {
+  return sharedDirsPendingChange(db, workgroupId, dirs) !== null;
 }
 
 interface SiblingSharedLink {
@@ -611,9 +682,16 @@ function* siblingSharedLinks(
   }
 }
 
-function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: string, dataDir: string): void {
+function migrateWorkgroup(
+  db: RawStatements,
+  workgroupId: string,
+  groupsDir: string,
+  dataDir: string,
+  quiesced: boolean,
+): SharedDirsReconcileReport {
+  const report: SharedDirsReconcileReport = { workgroupId, mutations: [], deferred: [] };
   const plan = planWorkgroupSharedDirs(db, workgroupId, groupsDir, dataDir);
-  if (!plan) return; // no seed data to consolidate
+  if (!plan) return report; // no seed data to consolidate
   const { seedDir, wgDir, siblingFolders, shared, candidates } = plan;
 
   const markerPath = path.join(wgDir, MIGRATION_MARKER);
@@ -624,24 +702,14 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
 
   if (shared.size === 0) {
     log.info('reconcileWorkgroupSharedDirs: nothing to consolidate', { workgroupId });
-    return;
+    return report;
   }
 
   fs.mkdirSync(wgDir, { recursive: true });
   const strategy: 'rename' | 'copy' = sameFilesystem(groupsDir, dataDir) ? 'rename' : 'copy';
 
-  log.info('reconcileWorkgroupSharedDirs: plan', {
-    workgroupId,
-    seedDir,
-    wgDir,
-    strategy,
-    moving: [...shared].sort(),
-    leftInBedroom: candidates.sort(),
-    siblings: siblingFolders,
-  });
-
-  // `changed` gates the marker rewrite: a settled re-run must not refresh `migratedAt`.
-  let changed = false;
+  // The marker rewrite is gated on a write having happened: a settled re-run must not refresh `migratedAt`.
+  const { mutations, deferred } = report;
   const moved: string[] = [];
   for (const name of [...shared].sort()) {
     const src = path.join(seedDir, name);
@@ -653,7 +721,11 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
       // mid-move can never leave a partial tree at dst that the idempotency
       // check would later mistake for a completed move.
       if (!isRealDir(src)) continue; // nothing real to move (already a symlink / gone)
-      changed = true;
+      if (!quiesced) {
+        deferred.push({ kind: 'move', name });
+        continue;
+      }
+      mutations.push({ kind: 'move', name });
       if (strategy === 'rename') {
         fs.renameSync(src, dst); // atomic within the filesystem
       } else {
@@ -669,12 +741,16 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
     } else if (isRealDir(src)) {
       // dst already exists AND src is still a real dir → a crash landed between
       // the atomic move and the source cleanup. dst is complete (both paths
-      // create it atomically), so finish the cleanup. Safe: the migration runs
-      // before any container spawn, so src cannot have been modified since.
+      // create it atomically), so finish the cleanup. Safe only once the
+      // workgroup's containers are stopped: src cannot have been modified since.
+      if (!quiesced) {
+        deferred.push({ kind: 'source-cleanup', name });
+        continue;
+      }
       fs.rmSync(src, { recursive: true, force: true });
-      changed = true;
+      mutations.push({ kind: 'source-cleanup', name });
     }
-    if (ensureCompatSymlink(seedDir, name)) changed = true;
+    if (ensureCompatSymlink(seedDir, name)) mutations.push({ kind: 'compat-link', name });
     moved.push(name);
   }
 
@@ -689,13 +765,20 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
       continue;
     }
     if (lst) fs.unlinkSync(linkPath); // remove the now-broken relative symlink
-    fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/${name}`, linkPath);
-    changed = true;
+    if (symlinkUnlessEntryAppeared(`${WORKGROUP_CONTAINER_PATH}/${name}`, linkPath)) {
+      mutations.push({ kind: 'sibling-link', name, sibling });
+    }
   }
 
-  if (!changed) return; // settled — re-run is a true no-op
+  if (deferred.length > 0) {
+    log.warn('reconcileWorkgroupSharedDirs: deferred mount-invalidating writes under live containers', {
+      workgroupId,
+      deferred: deferred.map(describeMutation),
+    });
+  }
+  if (mutations.length === 0) return report; // settled — re-run is a true no-op
 
-  const report: MigrationReport = {
+  const marker: MigrationReport = {
     migratedAt: priorReport?.migratedAt ?? new Date().toISOString(),
     seedFolder: workgroupId,
     workgroupId,
@@ -703,14 +786,27 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
     candidates: candidates.sort(),
     strategy,
   };
-  fs.writeFileSync(markerPath, JSON.stringify(report, null, 2) + '\n');
+  fs.writeFileSync(markerPath, JSON.stringify(marker, null, 2) + '\n');
   try {
     fs.mkdirSync('logs', { recursive: true });
-    fs.appendFileSync(path.join('logs', 'migration-shared-dirs.log'), JSON.stringify(report) + '\n');
+    fs.appendFileSync(path.join('logs', 'migration-shared-dirs.log'), JSON.stringify(marker) + '\n');
   } catch {
     /* report log is best-effort */
   }
-  log.info('reconcileWorkgroupSharedDirs: migrated', { workgroupId, moved: report.moved });
+  log.info('reconcileWorkgroupSharedDirs: migrated', {
+    workgroupId,
+    strategy,
+    mutations: mutations.map(describeMutation),
+    shared: moved.length,
+    leftInBedroom: candidates.length,
+  });
+  return report;
+}
+
+export function describeMutation(mutation: SharedDirMutation): string {
+  return mutation.sibling
+    ? `${mutation.kind}:${mutation.sibling}/${mutation.name}`
+    : `${mutation.kind}:${mutation.name}`;
 }
 
 /**
@@ -1117,8 +1213,23 @@ function ensureCompatSymlink(dir: string, name: string): boolean {
       return false;
     }
   }
-  fs.symlinkSync(target, linkPath);
-  return true;
+  return symlinkUnlessEntryAppeared(target, linkPath);
+}
+
+/**
+ * Symlink writes may run under live containers, whose agents can create an
+ * entry at the same path between the lstat and the write. That lands as EEXIST,
+ * which is the sibling-real-entry case arriving late, not a failure of the boot.
+ */
+function symlinkUnlessEntryAppeared(target: string, linkPath: string): boolean {
+  try {
+    fs.symlinkSync(target, linkPath);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    log.warn('reconcileWorkgroupSharedDirs: entry appeared concurrently, not overlaying', { linkPath });
+    return false;
+  }
 }
 
 /** Non-mutating mirror of `ensureCompatSymlink`: would it write a link? */

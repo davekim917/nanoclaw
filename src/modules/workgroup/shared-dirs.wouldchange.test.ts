@@ -48,13 +48,17 @@ vi.mock('child_process', () => childProcessTripwire(spawns));
 vi.mock('node:child_process', () => childProcessTripwire(spawns));
 
 import {
+  describeMutation,
+  MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS,
   reconcileWorkgroupMemory,
   reconcileWorkgroupSharedDirs,
+  sharedDirsPendingChange,
   sharedDirsReconcileWouldChange,
   workgroupMemoryReconcileWouldChange,
   workgroupMemoryDir,
   WORKGROUP_CONTAINER_PATH,
   WORKGROUP_MEMORY_CONTAINER_PATH,
+  type SharedDirMutation,
 } from './shared-dirs.js';
 
 const MEMORY_TEMPLATES = path.resolve('container/agent-runner/src/memory/templates');
@@ -386,49 +390,213 @@ const SHARED_MATRIX: SharedCase[] = [
       fs.unlinkSync(path.join(groupsDir, 'wgx-codex', 'dbt'));
     },
   },
+  {
+    name: 'interrupted-move',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.unlinkSync(path.join(groupsDir, 'wgx', 'dbt'));
+      fs.mkdirSync(path.join(groupsDir, 'wgx', 'dbt', '.git'), { recursive: true });
+    },
+  },
+  // A live agent created a top-level dir in the shared mount: canonical only,
+  // no seed entry, no sibling entry. The reconcile owes it compat symlinks and
+  // nothing a running container's mount resolves to changes.
+  {
+    name: 'agent-created-dir-in-shared-mount',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch', 'review'), { recursive: true });
+    },
+  },
+  {
+    name: 'sibling-real-dir-seed-link-canonical-present',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+      fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/scratch`, path.join(groupsDir, 'wgx', 'scratch'));
+      fs.mkdirSync(path.join(groupsDir, 'wgx-codex', 'scratch', 'own'), { recursive: true });
+    },
+  },
+  {
+    name: 'sibling-real-dir-seed-link-canonical-missing',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/scratch`, path.join(groupsDir, 'wgx', 'scratch'));
+      fs.mkdirSync(path.join(groupsDir, 'wgx-codex', 'scratch', 'own'), { recursive: true });
+    },
+  },
+  {
+    name: 'dangling-compat-symlink',
+    build: ({ groupsDir, dataDir }) => {
+      buildSettled({ groupsDir, dataDir });
+      fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/gone`, path.join(groupsDir, 'wgx', 'gone'));
+    },
+  },
 ];
 
-describe('sharedDirsReconcileWouldChange', () => {
-  it('the shared-dirs predicate matches its reconcile', () => {
-    const observed: Record<string, { predicted: boolean; actual: boolean }> = {};
+function makeSharedDb(): Database.Database {
+  return makeDb(
+    ['wgx'],
+    [
+      { id: 'ag-seed', folder: 'wgx', workgroupId: 'wgx' },
+      { id: 'ag-codex', folder: 'wgx-codex', workgroupId: 'wgx' },
+    ],
+  );
+}
+
+function invalidatesMounts(mutations: SharedDirMutation[]): boolean {
+  return mutations.some((mutation) => MOUNT_INVALIDATING_SHARED_DIR_MUTATIONS.has(mutation.kind));
+}
+
+describe('sharedDirsPendingChange', () => {
+  it('the shared-dirs predicate matches its reconcile, write for write', () => {
+    const observed: Record<
+      string,
+      { pending: string | null; invalidates: boolean; mutations: string[]; treeChanged: boolean }
+    > = {};
 
     for (const testCase of SHARED_MATRIX) {
       const base = makeTree(`shared-${testCase.name}`, testCase.build);
-      const db = makeDb(
-        ['wgx'],
-        [
-          { id: 'ag-seed', folder: 'wgx', workgroupId: 'wgx' },
-          { id: 'ag-codex', folder: 'wgx-codex', workgroupId: 'wgx' },
-        ],
-      );
+      const db = makeSharedDb();
       const dirs = { groupsDir: path.join(base, 'groups'), dataDir: path.join(base, 'data') };
 
-      const predicted = sharedDirsReconcileWouldChange(db, 'wgx', dirs);
+      const pending = sharedDirsPendingChange(db, 'wgx', dirs);
+      expect(sharedDirsReconcileWouldChange(db, 'wgx', dirs)).toBe(pending !== null);
 
-      // reconcileWorkgroupSharedDirs returns no report, so the observation is
-      // the tree itself: a boot at which it moves is exactly a boot at which a
-      // live container's mount targets are rewritten.
+      // The reconcile runs on an independent copy; the tree hash is the second
+      // witness that its report names every write and nothing else.
       const mirror = path.join(root, `shared-${testCase.name}-mirror`);
       copyTree(base, mirror);
       const before = hashTree(mirror);
-      reconcileWorkgroupSharedDirs(db, {
+      const [report] = reconcileWorkgroupSharedDirs(db, {
         groupsDir: path.join(mirror, 'groups'),
         dataDir: path.join(mirror, 'data'),
         workgroupIds: ['wgx'],
       });
-      const actual = hashTree(mirror) !== before;
+      const treeChanged = hashTree(mirror) !== before;
 
-      observed[testCase.name] = { predicted, actual };
+      expect(report.deferred).toEqual([]);
+      expect(pending !== null, testCase.name).toBe(report.mutations.length > 0);
+      expect(pending !== null, testCase.name).toBe(treeChanged);
+      expect(pending?.invalidatesMounts ?? false, testCase.name).toBe(invalidatesMounts(report.mutations));
+
+      observed[testCase.name] = {
+        pending: pending ? describeMutation(pending) : null,
+        invalidates: pending?.invalidatesMounts ?? false,
+        mutations: report.mutations.map(describeMutation),
+        treeChanged,
+      };
       db.close();
     }
 
     expect(observed).toEqual({
-      'no-seed-folder': { predicted: false, actual: false },
-      'unmoved-git-repo': { predicted: true, actual: true },
-      'nothing-shareable': { predicted: false, actual: false },
-      settled: { predicted: false, actual: false },
-      'sibling-repoint-outstanding': { predicted: true, actual: true },
+      'no-seed-folder': { pending: null, invalidates: false, mutations: [], treeChanged: false },
+      'unmoved-git-repo': {
+        pending: 'move:dbt',
+        invalidates: true,
+        mutations: ['move:dbt', 'compat-link:dbt', 'sibling-link:wgx-codex/dbt'],
+        treeChanged: true,
+      },
+      'nothing-shareable': { pending: null, invalidates: false, mutations: [], treeChanged: false },
+      settled: { pending: null, invalidates: false, mutations: [], treeChanged: false },
+      'sibling-repoint-outstanding': {
+        pending: 'sibling-link:wgx-codex/dbt',
+        invalidates: false,
+        mutations: ['sibling-link:wgx-codex/dbt'],
+        treeChanged: true,
+      },
+      'interrupted-move': {
+        pending: 'source-cleanup:dbt',
+        invalidates: true,
+        mutations: ['source-cleanup:dbt', 'compat-link:dbt'],
+        treeChanged: true,
+      },
+      'agent-created-dir-in-shared-mount': {
+        pending: 'compat-link:scratch',
+        invalidates: false,
+        mutations: ['compat-link:scratch', 'sibling-link:wgx-codex/scratch'],
+        treeChanged: true,
+      },
+      'sibling-real-dir-seed-link-canonical-present': {
+        pending: null,
+        invalidates: false,
+        mutations: [],
+        treeChanged: false,
+      },
+      'sibling-real-dir-seed-link-canonical-missing': {
+        pending: null,
+        invalidates: false,
+        mutations: [],
+        treeChanged: false,
+      },
+      'dangling-compat-symlink': { pending: null, invalidates: false, mutations: [], treeChanged: false },
     });
+  });
+
+  it('the predicate mutates nothing', () => {
+    for (const testCase of SHARED_MATRIX) {
+      const base = makeTree(`shared-nomutate-${testCase.name}`, testCase.build);
+      const db = makeSharedDb();
+      const before = hashTree(base);
+      sharedDirsPendingChange(db, 'wgx', { groupsDir: path.join(base, 'groups'), dataDir: path.join(base, 'data') });
+      expect(hashTree(base)).toBe(before);
+      db.close();
+    }
+  });
+
+  /** Settled, plus a symlink-only write that sorts first and a move that sorts last. */
+  function buildLinkThenMove({ groupsDir, dataDir }: { groupsDir: string; dataDir: string }): void {
+    buildSettled({ groupsDir, dataDir });
+    fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'aaa-scratch'), { recursive: true });
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'zzz-repo', '.git'), { recursive: true });
+  }
+
+  it('a mount-invalidating write is reported ahead of an earlier symlink write', () => {
+    // The door stops containers on the reported write alone; reporting the
+    // alphabetically-first symlink write would leave the move under live mounts.
+    const base = makeTree('link-then-move', buildLinkThenMove);
+    const db = makeSharedDb();
+    const pending = sharedDirsPendingChange(db, 'wgx', {
+      groupsDir: path.join(base, 'groups'),
+      dataDir: path.join(base, 'data'),
+    });
+    expect(pending).toEqual({ kind: 'move', name: 'zzz-repo', invalidatesMounts: true });
+    db.close();
+  });
+
+  it('outside the quiesced set the reconcile writes symlinks and defers the move', () => {
+    const base = makeTree('deferred-move', buildLinkThenMove);
+    const groupsDir = path.join(base, 'groups');
+    const dataDir = path.join(base, 'data');
+    const db = makeSharedDb();
+
+    const [live] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir, quiescedWorkgroupIds: [] });
+
+    expect(live.mutations.map(describeMutation)).toEqual([
+      'compat-link:aaa-scratch',
+      'sibling-link:wgx-codex/aaa-scratch',
+    ]);
+    expect(live.deferred).toEqual([{ kind: 'move', name: 'zzz-repo' }]);
+    expect(fs.lstatSync(path.join(groupsDir, 'wgx', 'zzz-repo')).isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(dataDir, 'workgroups', 'wgx', 'zzz-repo'))).toBe(false);
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx', 'aaa-scratch'))).toBe(`${WORKGROUP_CONTAINER_PATH}/aaa-scratch`);
+
+    // The deferred write is still pending for the next boot's door…
+    expect(sharedDirsPendingChange(db, 'wgx', { groupsDir, dataDir })).toEqual({
+      kind: 'move',
+      name: 'zzz-repo',
+      invalidatesMounts: true,
+    });
+    // …and lands once the workgroup is quiesced.
+    const [quiesced] = reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir, quiescedWorkgroupIds: ['wgx'] });
+    expect(quiesced.mutations.map(describeMutation)).toEqual([
+      'move:zzz-repo',
+      'compat-link:zzz-repo',
+      'sibling-link:wgx-codex/zzz-repo',
+    ]);
+    expect(quiesced.deferred).toEqual([]);
+    expect(sharedDirsPendingChange(db, 'wgx', { groupsDir, dataDir })).toBeNull();
+    db.close();
   });
 
   it('the selector confines the reconcile to the named workgroups', () => {

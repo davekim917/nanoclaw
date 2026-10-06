@@ -185,8 +185,8 @@ it('test_startup_runs_strict_quiescence_before_any_memory_cutover', async () => 
   await expect(
     runBootMountQuiescence(db, {
       workgroupIds: () => ['wg-1'],
-      memoryWouldChange: () => true,
-      sharedWouldChange: () => false,
+      memoryPendingChange: () => ({ reason: 'canon-missing' }),
+      sharedPendingChange: () => null,
       sharedFsEnabled: true,
       quiesce: () => {
         calls.push('quiescence');
@@ -223,8 +223,8 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
 
   await runBootMountQuiescence(db, {
     workgroupIds: () => ['wg-1'],
-    memoryWouldChange: () => true,
-    sharedWouldChange: () => false,
+    memoryPendingChange: () => ({ reason: 'canon-missing' }),
+    sharedPendingChange: () => null,
     sharedFsEnabled: true,
     quiesce: async (changed, options) => {
       calls.push('quiescence');
