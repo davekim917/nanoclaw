@@ -1756,10 +1756,14 @@ export async function stopOrphanedSessions(): Promise<number> {
       (sessionId) => [sessionId, pendingHolds.get(sessionId)?.containerName ?? null] as const,
     ),
   ];
-  for (const [sessionId, containerName] of supervised) {
+  for (const [sessionId, listedName] of supervised) {
     if (wakePromises.has(sessionId) || pendingKills.has(sessionId)) continue;
     const session = await getSession(sessionId);
     if (session && (await getAgentGroup(session.agent_group_id))) continue;
+    // A survivor held on an inventory failure has no name to stop by; re-list it first, and leave it for a later
+    // tick while the runtime still cannot be asked.
+    if (pendingAdoptions.has(sessionId) && (await resolvePendingSurvivor(sessionId)) !== 'running') continue;
+    const containerName = listedName ?? getContainerIdentity(sessionId);
     log.warn('Stopping container whose session or agent group was deleted', { sessionId, containerName });
     killContainer(sessionId, 'orphaned');
     stopped += 1;

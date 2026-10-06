@@ -1075,6 +1075,24 @@ describe('adoptRunningSessions', () => {
       expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-held-gone']);
     });
 
+    it('re-lists a survivor held on an inventory failure before stopping it, and waits while the runtime is down', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-unnamed-gone');
+      fakes.listing = [survivor('sess-unnamed-gone')];
+      fakes.listingFails = true;
+      const held = await adoptRunningSessions({ list: fakes.list, survivableSessionIds: ['sess-unnamed-gone'] });
+      expect(held).toMatchObject({ pendingClaim: 1 });
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-unnamed-gone');
+
+      // Runtime still unlistable: nothing to stop by, nothing stopped, hold kept for a later tick.
+      expect(await stopOrphanedSessions()).toBe(0);
+      expect(fakes.stopped).toEqual([]);
+      expect(hasPendingAdoption('sess-unnamed-gone')).toBe(true);
+
+      fakes.listingFails = false;
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-unnamed-gone']);
+    });
+
     it('stops a supervised session whose agent group was deleted', async () => {
       await seedSession(TEST_DATA_DIR, 'sess-groupless');
       fakes.listing = [survivor('sess-groupless')];
