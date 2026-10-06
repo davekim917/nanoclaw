@@ -143,7 +143,7 @@ export async function followUpKill(
           ...fields,
         });
       }
-      return decided(followUp, followUp.reason === 'armed' ? armed?.by : undefined);
+      return decided(followUp, followUp.reason === 'armed' ? (armed ?? undefined) : undefined);
     }
     const cause = STRANDING_KILLS.get(kill.reason);
     if (!cause || startedAtMs === null) throw new Error('kill follow-up predicted a wake for a kill it cannot name');

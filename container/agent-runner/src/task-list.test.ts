@@ -431,13 +431,6 @@ describe('applyTaskListUpdate', () => {
     expect(h.state?.interruptedSubtext).toStartWith('stopped · todos as of ');
   });
 
-  it('stores the interrupted label apart from its leading state, for a host that knows a truer one', async () => {
-    const h = harness();
-    await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), SLACK, h.deps);
-    expect(h.state?.interruptedDetail).toStartWith('todos as of ');
-    expect(h.state?.interruptedSubtext).toBe(`stopped · ${h.state?.interruptedDetail}`);
-  });
-
   it('carries a waiting item from the tool arguments to the record and the posted text', async () => {
     const h = harness();
     const parsed = parseTaskListInput({
@@ -455,7 +448,7 @@ describe('applyTaskListUpdate', () => {
     expect(h.state?.finished).toBe(false);
     expect(h.writes[0].content.text).toBe('Shipping\n✓ Built it\n◷ Merge the fix (waiting on Dana)');
     expect(h.state?.interruptedText).toBe('Shipping\n✓ Built it\n◷ Merge the fix (waiting on Dana)');
-    expect(h.state?.interruptedSubtext).toBe(`waiting on Dana · ${h.state?.interruptedDetail}`);
+    expect(h.state?.interruptedSubtext).toStartWith('waiting on Dana · todos as of ');
     expect(parseTaskListState(JSON.stringify(h.state))?.items[1].waitingOn).toBe('Dana');
     if (!out.ok) throw new Error(out.error);
     expect(describeOutcome(out)).toBe('Task list posted (1 done, 0 in progress, 0 pending, 1 waiting).');

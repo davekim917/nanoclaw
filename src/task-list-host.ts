@@ -46,31 +46,30 @@ const KILL_EDIT_WAIT_BUFFER_MS = 250;
 
 /**
  * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host knows
- * more, in this order: an unanswered card the killed container posted, a wake already armed, and a wake the kill
- * follow-up is about to queue. Host literals and a formatted time only; a runner that predates `interruptedDetail`
- * keeps its own label, and so does a session held only by a parked continuation.
+ * more: an unanswered card the killed container posted, else whatever will bring the session back. A label the host
+ * composes is host literals and host-formatted times only, so nothing the container wrote sits under a state the
+ * host vouches for; with neither answer, or no usable timestamp, the runner's own label stands.
  */
 async function killSubtext(
   session: Session,
   edit: NonNullable<TaskListSettlement['edit']>,
   prediction: KillPrediction | null,
 ): Promise<string> {
-  if (edit.interruptedDetail === null || prediction === null) return edit.interruptedSubtext;
-  const { openCard, armed, followUp } = prediction;
-  let state: string | null = null;
+  if (edit.listedAt === null || prediction === null) return edit.interruptedSubtext;
+  const { openCard, resumes } = prediction;
+  if (!openCard && !resumes) return edit.interruptedSubtext;
+  const timezone = await resolveGroupTimezone(session.agent_group_id);
+  let state = 'paused · resuming';
   if (openCard) state = openCard === 'approval' ? 'waiting on an approval' : 'waiting on an answer';
-  else if (armed?.nextCheckAt) {
-    const timezone = await resolveGroupTimezone(session.agent_group_id);
-    state = `paused · next check ${formatLocalTime(armed.nextCheckAt, timezone)}`;
-  } else if (armed ? !armed.parked : followUp.action === 'wake-accountable') state = 'paused · resuming';
-  return state === null ? edit.interruptedSubtext : `${state} · ${edit.interruptedDetail}`;
+  else if (resumes?.at) state = `paused · next check ${formatLocalTime(resumes.at, timezone)}`;
+  return `${state} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
 }
 
 /**
  * Never throws. Fenced through the session's delivery slot: the dead container's queued list rows are recorded
  * delivered-unsent durably first, so a restart can't replay them over the interrupted form. The edit target comes
- * from host-owned evidence and must be the session's own conversation; the wording is container-written but for the
- * leading state. Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
+ * from host-owned evidence and must be the session's own conversation; the wording is container-written unless the
+ * host composed the label. Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
  */
 export async function settleTaskListOnKill(
   sessionId: string,
@@ -126,7 +125,7 @@ export async function settleTaskListOnKill(
             edit.platformId,
             edit.threadId,
             'task_list',
-            // Container-written but for the subtext's leading state.
+            // Container-written, unless the host composed the subtext.
             scrubSecrets(
               JSON.stringify({
                 operation: 'edit',

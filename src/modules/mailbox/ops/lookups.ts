@@ -228,8 +228,8 @@ export interface TaskListSettlement {
     platformMessageId: string;
     interruptedText: string;
     interruptedSubtext: string;
-    /** The subtext without its leading state; null from a runner that predates it, whose own label then stands. */
-    interruptedDetail: string | null;
+    /** When the list on screen last changed, re-serialised by the host; null when the record's stamp is no instant. */
+    listedAt: string | null;
   } | null;
 }
 
@@ -237,6 +237,11 @@ export interface TaskListSettlement {
  * Null when there is nothing to settle: no list, a finished or stale one (its
  * queued rows carry its real final state), or one touched after the kill began.
  */
+function instantOrNull(value: unknown): string | null {
+  const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
 export function getTaskListSettlement(
   inbound: Database.Database,
   outbound: Database.Database,
@@ -284,7 +289,7 @@ export function getTaskListSettlement(
           platformMessageId: receipt.platform_message_id,
           interruptedText: record.interruptedText,
           interruptedSubtext: record.interruptedSubtext,
-          interruptedDetail: typeof record.interruptedDetail === 'string' ? record.interruptedDetail : null,
+          listedAt: instantOrNull(record.updatedAt),
         };
         break;
       }

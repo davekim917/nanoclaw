@@ -902,6 +902,46 @@ describe('a human who owes the next move', () => {
     expect(wakeRows()).toHaveLength(1);
   });
 
+  it.each([
+    ['before', -800, 1],
+    ['after', 50, 0],
+  ] as const)(
+    'a question posted in the same second as the container start, %s it, is told apart to the millisecond',
+    async (_order, offsetMs, wakes) => {
+      const startedAt = Math.floor((Date.now() - HOUR) / 1000) * 1000 + 900;
+      recordList(startedAt + 60_000);
+      await createPendingQuestion({
+        question_id: 'q-same-second',
+        session_id: SESSION_ID,
+        message_out_id: 'out-1',
+        platform_id: 'room-a',
+        channel_type: 'slack',
+        thread_id: null,
+        title: 'Which region?',
+        question: 'Which region should the rehearsal use?',
+        options: [],
+        created_at: new Date(startedAt + offsetMs).toISOString(),
+      });
+      await chatReap(startedAt);
+      expect(wakeRows()).toHaveLength(wakes);
+    },
+  );
+
+  it('an approval whose expiry is later in the same second as the kill is still open', async () => {
+    const startedAt = Date.now() - HOUR;
+    recordList(startedAt + 60_000);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const killSecond = Math.floor(Date.now() / 1000) * 1000;
+      vi.setSystemTime(killSecond + 100);
+      await openApproval(startedAt + 90_000, 'pending', new Date(killSecond + 900).toISOString());
+      await chatReap(startedAt);
+      expect(wakeRows()).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("another session's card does not", async () => {
     const startedAt = Date.now() - HOUR;
     recordList(startedAt + 60_000);

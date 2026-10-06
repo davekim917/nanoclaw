@@ -68,8 +68,6 @@ export interface TaskListState {
   /** What the host edits the post to if the container dies mid-list. */
   interruptedText: string;
   interruptedSubtext: string;
-  /** `interruptedSubtext` without its leading state, for a host that knows a truer one (a wake is armed, a card is open). */
-  interruptedDetail?: string;
   /** The last text/subtext actually written, so an unchanged update writes nothing. */
   text: string;
   subtext: string;
@@ -350,7 +348,6 @@ export async function applyTaskListUpdate(
     finished,
     interruptedText: renderBody(input.title, input.items, true),
     interruptedSubtext: renderSubtext(routing.channelType, now, true, input.items),
-    interruptedDetail: subtext,
     text,
     subtext,
   };

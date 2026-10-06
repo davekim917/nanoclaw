@@ -2,8 +2,12 @@
 import type Database from 'better-sqlite3';
 
 /** Id prefixes of the deferred wake rows the sweep parks when a budget is spent. */
-const RECOVERY_WAKE_ID_PATTERNS =
-  "(id LIKE 'ceiling-respawn-%' OR id LIKE 'reap-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')";
+const RECOVERY_WAKE_ID_PREFIXES = ['ceiling-respawn-', 'reap-respawn-', 'host-restart-', 'provider-heal-'];
+const RECOVERY_WAKE_ID_PATTERNS = `(${RECOVERY_WAKE_ID_PREFIXES.map((prefix) => `id LIKE '${prefix}%'`).join(' OR ')})`;
+
+export function isRecoveryWakeId(id: string): boolean {
+  return RECOVERY_WAKE_ID_PREFIXES.some((prefix) => id.startsWith(prefix));
+}
 
 export function hasDueRecoveryWake(inDb: Database.Database, nowIso: string): boolean {
   return Boolean(
