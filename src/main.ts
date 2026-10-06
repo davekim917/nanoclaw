@@ -409,7 +409,7 @@ export async function runBootMountQuiescence(
           ? { reason: entry.memory.reason, ...(entry.memory.folder ? { folder: entry.memory.folder } : {}) }
           : { write: entry.shared ? describeMutation(entry.shared) : 'none' }),
       });
-    } else if (entry.shared) {
+    } else if (entry.shared && !entry.shared.invalidatesMounts) {
       linkOnlyWorkgroupIds.push(workgroupId);
       log.info('Boot quiescence symlink-only reconcile, containers kept', {
         workgroupId,
@@ -418,16 +418,31 @@ export async function runBootMountQuiescence(
     }
   }
 
-  // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed. Only the changed set is
-  // proven stopped, so only it may take mount-invalidating writes; the symlink-only set is reconciled live.
+  // Flag-gated (NANOCLAW_WORKGROUP_SHARED_FS, default off). Idempotent and fail-closed for the changed set, the
+  // only one proven stopped and so the only one that may take mount-invalidating writes. The link-creation set is
+  // reconciled under live containers, whose agents can make any write fail (EACCES, a `.migrated` turned into a
+  // directory); that is housekeeping the next boot retries, not a reason to take the fleet down.
   if (sharedFsEnabled) {
     try {
       (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, {
-        workgroupIds: [...changedWorkgroupIds, ...linkOnlyWorkgroupIds],
+        workgroupIds: changedWorkgroupIds,
         quiescedWorkgroupIds: changedWorkgroupIds,
       });
     } catch (sharedErr) {
       fatal('Workgroup shared-FS consolidation failed at startup', sharedErr);
+    }
+    if (linkOnlyWorkgroupIds.length > 0) {
+      try {
+        (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, {
+          workgroupIds: linkOnlyWorkgroupIds,
+          quiescedWorkgroupIds: [],
+        });
+      } catch (sharedErr) {
+        log.error('Workgroup shared-FS link housekeeping failed under live containers; retried next boot', {
+          workgroupIds: linkOnlyWorkgroupIds,
+          err: sharedErr,
+        });
+      }
     }
   }
 

@@ -1216,7 +1216,6 @@ function lstatOrNull(p: string): fs.Stats | null {
 /** `real`: a non-symlink owns the name — never clobbered. */
 type ContainerLinkState = 'current' | 'real' | 'create' | 'replace';
 
-/** What `ensureContainerLink` would do at `linkPath`, without writing. */
 function containerLinkState(linkPath: string, target: string): ContainerLinkState {
   const st = lstatOrNull(linkPath);
   if (!st) return 'create';

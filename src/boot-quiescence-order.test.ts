@@ -251,7 +251,7 @@ describe('boot mount-change ordering', () => {
     const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
     const proof = source.indexOf('quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {');
     const shared = source.indexOf(
-      'reconcileWorkgroupSharedDirs)(db, {\n        workgroupIds: [...changedWorkgroupIds, ...linkOnlyWorkgroupIds],',
+      'reconcileWorkgroupSharedDirs)(db, {\n        workgroupIds: changedWorkgroupIds,\n        quiescedWorkgroupIds: changedWorkgroupIds,',
     );
     expect(proof).toBeGreaterThanOrEqual(0);
     expect(shared).toBeGreaterThan(proof);
@@ -346,9 +346,60 @@ describe('boot mount-change ordering', () => {
     expect(changedWorkgroupIds).toEqual([]);
     expect(runtime.stops).toEqual([]);
     expect(scope.survivableSessionIds).toEqual(['s1', 's2']);
-    expect(reconcileCalls).toEqual([{ workgroupIds: ['wgx'], quiescedWorkgroupIds: [] }]);
+    expect(reconcileCalls).toEqual([
+      { workgroupIds: [], quiescedWorkgroupIds: [] },
+      { workgroupIds: ['wgx'], quiescedWorkgroupIds: [] },
+    ]);
     expect(fs.readlinkSync(path.join(groupsDir, 'wgx', 'scratch'))).toBe('/workspace/workgroup/scratch');
     expect(sharedDirsPendingChange(db, 'wgx', { groupsDir, dataDir })).toBeNull();
+    db.close();
+  });
+
+  it('a live link-housekeeping failure is logged, not fatal; a quiesced failure still is', async () => {
+    const { groupsDir, dataDir } = buildSettledTree();
+    fs.mkdirSync(path.join(dataDir, 'workgroups', 'wgx', 'scratch'), { recursive: true });
+    const db = makeDb();
+    const fatals: string[] = [];
+    const deps = {
+      workgroupIds: () => ['wgx'],
+      memoryPendingChange: (database: Database.Database, id: string) =>
+        workgroupMemoryPendingChange(database, id, { groupsDir, dataDir }),
+      sharedPendingChange: (database: Database.Database, id: string) =>
+        sharedDirsPendingChange(database, id, { groupsDir, dataDir }),
+      sharedFsEnabled: true,
+      quiesce: (changed: string[], options: Parameters<typeof quiesceWorkgroupsForBootMountChange>[1]) =>
+        quiesceWorkgroupsForBootMountChange(changed, { ...fakeRuntime([]), ...options }),
+      activeSessionIds: async () => [],
+      ensureRuntime: () => undefined,
+      warnStartup: async () => undefined,
+      memoryGate: () => [],
+      prune: () => undefined,
+      fatal: (message: string): never => {
+        fatals.push(message);
+        throw new Error(message);
+      },
+    };
+
+    await runBootMountQuiescence(db, {
+      ...deps,
+      reconcileShared: (_database, dirs) => {
+        if ((dirs.quiescedWorkgroupIds ?? []).length === 0 && dirs.workgroupIds?.length) {
+          throw new Error('EACCES: permission denied, symlink');
+        }
+      },
+    });
+    expect(fatals).toEqual([]);
+
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'dbt', '.git'), { recursive: true });
+    await expect(
+      runBootMountQuiescence(db, {
+        ...deps,
+        reconcileShared: (_database, dirs) => {
+          if (dirs.quiescedWorkgroupIds?.includes('wgx')) throw new Error('rename failed');
+        },
+      }),
+    ).rejects.toThrow('Workgroup shared-FS consolidation failed at startup');
+    expect(fatals).toEqual(['Workgroup shared-FS consolidation failed at startup']);
     db.close();
   });
 
