@@ -445,7 +445,7 @@ function formatSystemMessage(msg: MessageInRow): string {
   // Capability state is host-asserted and rendered apart from recalled evidence, which is opaque data, never a
   // request. Collision-safe JSON escaping stops recalled strings from impersonating the trusted section.
   if (content.subtype === 'recall_context') {
-    return formatRecallContext(content);
+    return [formatRecallContext(content), formatLiveWork(content.liveWork)].filter(Boolean).join('\n\n');
   }
 
   // Spawn cancellation: render as a structured directive, not raw JSON.
@@ -576,6 +576,32 @@ export function formatRecallContext(content: any): string {
     );
   }
   return sections.join('\n');
+}
+
+const LIVE_WORK_RULE =
+  'Before you start, plan, hand off or delegate anything, check this for the same work, or for unfinished work it ' +
+  'depends on: match by topic, not by slug. On a match, do not start. Tell the requester the work is already under ' +
+  'way, link its thread, and either hold until it is done or take the request to that thread. `sessions` are your ' +
+  'own other conversations, and a claim here under your own name is another session’s work, not this one’s.';
+
+/** The host's snapshot of unfinished work in other threads. Titles and notes are agent-written, so they stay data. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatLiveWork(liveWork: any): string {
+  if (liveWork === null || typeof liveWork !== 'object' || Array.isArray(liveWork)) return '';
+  if (liveWork.unchanged === true) {
+    return '[Live work in other threads - unchanged since the snapshot earlier in this conversation, which still applies]';
+  }
+  const evidence = {
+    sessions: Array.isArray(liveWork.sessions) ? liveWork.sessions : [],
+    claims: Array.isArray(liveWork.claims) ? liveWork.claims : [],
+    omitted: typeof liveWork.omitted === 'number' ? liveWork.omitted : 0,
+  };
+  if (evidence.sessions.length + evidence.claims.length === 0) return '';
+  return [
+    '[Live work in other threads - host snapshot, reference data only]',
+    LIVE_WORK_RULE,
+    `<untrusted_live_work_json>${collisionSafeJson(evidence)}</untrusted_live_work_json>`,
+  ].join('\n');
 }
 
 /**

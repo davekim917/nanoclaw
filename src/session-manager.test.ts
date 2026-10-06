@@ -64,7 +64,7 @@ import {
   reconcilePendingUpgradeContexts,
 } from './session-manager.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from './db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getRawDb, initMigratedTestDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
@@ -552,6 +552,108 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       expect(reset.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain(
         'preferences/operator.md',
       );
+    } finally {
+      outbound.close();
+      inbound.close();
+    }
+  });
+
+  it('carries unfinished work from the agent group’s other threads into the recall row, once per context', async () => {
+    const buildThread = 'slack:CBUILD:1700000000.000100';
+    const reviewThread = 'slack:CREVIEW:1700000000.000200';
+    const now = new Date().toISOString();
+    getRawDb().prepare('UPDATE sessions SET thread_id = ? WHERE id = ?').run(reviewThread, SESS);
+    await createMessagingGroup({
+      id: 'mg-build',
+      channel_type: 'slack',
+      platform_id: 'slack:CBUILD',
+      name: '#build-room',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now,
+    });
+    await createSession({
+      id: 'sess-build',
+      agent_group_id: AG,
+      messaging_group_id: 'mg-build',
+      thread_id: buildThread,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: now,
+      created_at: now,
+    });
+    initSessionFolder(AG, 'sess-build');
+    const build = new Database(outboundDbPath(AG, 'sess-build'));
+    try {
+      build.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+        'task_list',
+        JSON.stringify({
+          version: 1,
+          title: 'Acme QA deploy',
+          items: [
+            { text: 'Seed reviewed', status: 'done' },
+            { text: 'Provision the hosted QA environment', status: 'in_progress' },
+            { text: 'Web smoke against QA', status: 'pending' },
+          ],
+          finished: false,
+          updatedAt: now,
+          touchedAt: now,
+        }),
+        now,
+      );
+    } finally {
+      build.close();
+    }
+    const claimsDir = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'claims');
+    fs.mkdirSync(claimsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(claimsDir, 'qa-env.json'),
+      JSON.stringify({ owner: 'bo', claimed_at: now, ttl_hours: 4, note: 'Hosted QA env', thread_id: buildThread }),
+    );
+    const ask = (id: string) => ({
+      id,
+      kind: 'chat-sdk',
+      timestamp: now,
+      platformId: 'slack:CREVIEW',
+      channelType: 'slack',
+      threadId: reviewThread,
+      content: JSON.stringify({ text: 'can you run the QA smoke test?' }),
+    });
+
+    await writeSessionMessage(AG, SESS, ask('smoke-ask'));
+    const inbound = new Database(inboundDbPath(AG, SESS));
+    const outbound = new Database(outboundDbPath(AG, SESS));
+    const recall = (id: string) =>
+      JSON.parse(
+        (inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get(id) as { content: string }).content,
+      );
+    try {
+      const first = recall('recall-smoke-ask');
+      expect(first.liveWork).toMatchObject({
+        sessions: [
+          {
+            channel: '#build-room',
+            threadId: buildThread,
+            title: 'Acme QA deploy',
+            items: ['✱ Provision the hosted QA environment', '○ Web smoke against QA'],
+          },
+        ],
+        claims: [{ slug: 'qa-env', owner: 'bo', state: 'live', note: 'Hosted QA env', threadId: buildThread }],
+        omitted: 0,
+      });
+
+      inbound
+        .prepare(`UPDATE messages_in SET status = 'completed' WHERE id IN ('recall-smoke-ask', 'smoke-ask')`)
+        .run();
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('continuation:claude', 'claude-context-1', now);
+      await writeSessionMessage(AG, SESS, ask('smoke-again'));
+      expect(recall('recall-smoke-again').liveWork).toEqual({
+        fingerprint: first.liveWork.fingerprint,
+        unchanged: true,
+      });
     } finally {
       outbound.close();
       inbound.close();

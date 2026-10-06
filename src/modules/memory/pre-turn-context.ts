@@ -817,7 +817,7 @@ function markExpansionUsed(notices: ContextNotice[]): void {
   });
 }
 
-function boundedText(value: string, maxChars: number, marker: string): string {
+export function boundedText(value: string, maxChars: number, marker: string): string {
   if (value.length <= maxChars) return value;
   const available = Math.max(0, maxChars - marker.length);
   return `${value.slice(0, available)}${marker}`;

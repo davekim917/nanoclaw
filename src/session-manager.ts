@@ -48,6 +48,12 @@ import {
   type ProviderRecallState,
 } from './modules/mailbox/index.js';
 import { log } from './log.js';
+import {
+  buildLiveWorkDigest,
+  deliveredLiveWorkFingerprint,
+  liveWorkRecallField,
+  type LiveWorkDigest,
+} from './live-work-digest.js';
 import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
 import { taskFiresFresh } from './modules/scheduling/fresh-context.js';
@@ -551,6 +557,7 @@ interface RecallSource {
 export interface RecallCentral {
   provider: string;
   services: SessionServicesCentral;
+  liveWork: LiveWorkDigest | null;
 }
 
 export async function resolveRecallCentral(agentGroupId: string, sessionId: string): Promise<RecallCentral> {
@@ -558,6 +565,7 @@ export async function resolveRecallCentral(agentGroupId: string, sessionId: stri
   return {
     provider: resolveProviderName(session?.agent_provider, (await getContainerConfig(agentGroupId))?.provider),
     services: await resolveSessionServicesCentral(agentGroupId),
+    liveWork: await buildLiveWorkDigest(agentGroupId, sessionId),
   };
 }
 
@@ -603,6 +611,7 @@ function buildRecallRow(
         seenEvidenceFingerprints: lifecycle.seenEvidenceFingerprints,
         servicesCentral: central.services,
       }),
+      ...liveWorkRecallField(central.liveWork, lifecycle.seenEvidenceFingerprints),
     }),
     processAfter: message.processAfter ?? null,
     recurrence: null,
@@ -613,6 +622,7 @@ function buildRecallRow(
 }
 
 interface ParsedRecallContext {
+  liveWork?: unknown;
   provider?: unknown;
   contextEpoch?: unknown;
   trustedCapabilities?: unknown;
@@ -647,9 +657,9 @@ function recallFingerprints(context: ParsedRecallContext): string[] {
     ...(context.memoryEvidence?.excerpts ?? []),
     ...(context.conversationEvidence?.excerpts ?? []),
   ];
-  return rows
-    .map((row) => row.fingerprint)
-    .filter((fingerprint): fingerprint is string => typeof fingerprint === 'string' && fingerprint.length > 0);
+  return [...rows.map((row) => row.fingerprint), deliveredLiveWorkFingerprint(context)].filter(
+    (fingerprint): fingerprint is string => typeof fingerprint === 'string' && fingerprint.length > 0,
+  );
 }
 
 /**
@@ -918,7 +928,10 @@ async function writeSessionMessageLocked(
   // funnel runs outbound DDL, making the host a second writer of the live container's outbound.db; the fallback
   // covers only the reclaim race. Callers must not hold a session on this key (same-key nesting throws). The
   // recall's central read happens here, with the other awaits, so the action below never yields.
-  const recallCentral = isScheduledTask ? null : await resolveRecallCentral(agentGroupId, sessionId);
+  const recallCentral =
+    isScheduledTask || !isAdmissiblePreTurnTrigger({ ...message, content })
+      ? null
+      : await resolveRecallCentral(agentGroupId, sessionId);
 
   // THE GUARD POINT: inside the mailbox action, after every await, with nothing awaited before the insert. The
   // `withCentralSync` block is deliberately NOT async (a test pins that nothing is awaited between guard and

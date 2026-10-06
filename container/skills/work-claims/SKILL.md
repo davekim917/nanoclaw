@@ -155,6 +155,9 @@ What the script enforces, so you do not have to:
 - `take` REFUSES a live claim that is not yours (exit 3). `--takeover` records an
   override; it does not make one correct. Taking a **parked** claim is always
   allowed, whoever parked it — the note records `resumed parked work from <them>:`.
+- "Yours" means this session, not your name: a live claim under your name whose
+  `thread_id` names another thread belongs to another session of yours, so `check`
+  reads it LIVE and `take` refuses it, exactly as for a sibling.
 - A stale takeover keeps the previous owner in the note instead of erasing them.
 - A claim with no parseable expiry counts as **stale**, never an indefinite lock —
   a corrupt file must not wedge a slug forever. `parked` overrides this: a parked

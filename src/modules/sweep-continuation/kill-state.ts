@@ -68,7 +68,7 @@ export function readKillEvidence(mailbox: NanoclawMailboxSession, startedAtMs: n
   return {
     checkouts,
     unfinished,
-    waiting: fresh?.waiting ?? 0,
+    waiting: fresh?.waiting.length ?? 0,
     stale: recorded > 0 && checkouts.length + unfinished.length === 0,
   };
 }

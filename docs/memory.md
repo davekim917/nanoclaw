@@ -175,7 +175,13 @@ Every pair then contains only the newly relevant evidence delta:
 3. a separately bounded exact Slack/Discord permalink lane when the input
    contains a supported message link; and
 4. explicit degraded, conflict, truncation, already-delivered, or no-match
-   notices.
+   notices; and
+5. a live-work snapshot (`src/live-work-digest.ts`): the workgroup's unexpired
+   claims outside this thread and the open task lists of the agent group's
+   other sessions touched in the last 24 hours, each with its thread link,
+   under a rule to hold or route a request that overlaps or depends on them.
+   A snapshot this provider context already received is sent as its
+   fingerprint alone.
 
 The rest of the manual canon is not pushed. `index.md` is the map, and the
 agent reads or greps the tree from it — the host runs no per-turn walk of the
