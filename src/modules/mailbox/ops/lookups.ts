@@ -239,11 +239,13 @@ export interface TaskListSettlement {
  * queued rows carry its real final state), or one touched after the kill began.
  */
 export const SCHEDULE_WAKE_ID_PREFIX = 'schedule-wake-';
+export const SCHEDULE_WAKE_SYSTEM_KIND = 'agent_scheduled_wake';
 
 /**
- * When the earliest `wait` the agent armed comes due, if it has not yet. Keyed on the id prefix only the `wait`
- * action mints, so a future context row or anything else with a `process_after` is not mistaken for a check the
- * agent promised itself. Whether the row then runs is admission's business, not read here.
+ * When the earliest `wait` the agent armed comes due, if it has not yet. Keyed on the id prefix and the system kind
+ * the `wait` action writes, so a future context row or anything else with a `process_after` is not mistaken for a
+ * check the agent promised itself. Neither is an enforced namespace: another writer could mint both. Whether the row
+ * then runs is admission's business, not read here.
  */
 export function getNextScheduledWakeAt(inbound: Database.Database): string | null {
   const row = inbound
@@ -251,12 +253,15 @@ export function getNextScheduledWakeAt(inbound: Database.Database): string | nul
       `SELECT process_after AS at FROM messages_in
         WHERE status = 'pending'
           AND substr(id, 1, ?) = ?
+          AND CASE WHEN json_valid(content) THEN json_extract(content, '$._system.kind') END = ?
           AND process_after IS NOT NULL
           AND julianday(process_after) > julianday('now')
         ORDER BY julianday(process_after)
         LIMIT 1`,
     )
-    .get(SCHEDULE_WAKE_ID_PREFIX.length, SCHEDULE_WAKE_ID_PREFIX) as { at: string } | undefined;
+    .get(SCHEDULE_WAKE_ID_PREFIX.length, SCHEDULE_WAKE_ID_PREFIX, SCHEDULE_WAKE_SYSTEM_KIND) as
+    | { at: string }
+    | undefined;
   return row ? sqliteUtcToIso(row.at) : null;
 }
 

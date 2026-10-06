@@ -722,41 +722,38 @@ describe('the kill label says only what the host knows for certain', () => {
     return `todos as of ${formatLocalTime(LISTED_AT, timezone ?? (await resolveGroupTimezone('ag-1')))}`;
   }
 
-  function insertInbound(sessionId: string, row: { id: string; processAfter?: string; trigger?: number }): void {
+  function insertInbound(
+    sessionId: string,
+    row: { id: string; processAfter?: string; trigger?: number; content?: string },
+  ): void {
     const db = new Database(inboundDbPath('ag-1', sessionId));
     db.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, process_after, content)
        VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'pending', ?, ?, ?)`,
-    ).run(row.id, now(), row.trigger ?? 1, row.processAfter ?? null, JSON.stringify({ text: 'check the deploy' }));
+    ).run(
+      row.id,
+      now(),
+      row.trigger ?? 1,
+      row.processAfter ?? null,
+      row.content ?? JSON.stringify({ text: 'check the deploy' }),
+    );
     db.close();
   }
 
-  /** The row the `wait` action writes: its id prefix, inert until admission. */
+  const WAIT_CONTENT = JSON.stringify({ text: 'check the deploy', _system: { kind: 'agent_scheduled_wake' } });
+
+  /** The row the `wait` action writes: its id prefix and system kind, inert until admission. */
   function armWait(sessionId: string, name: string, processAfter: string): void {
-    insertInbound(sessionId, { id: `schedule-wake-${name}`, processAfter, trigger: 0 });
+    insertInbound(sessionId, { id: `schedule-wake-${name}`, processAfter, trigger: 0, content: WAIT_CONTENT });
   }
 
   const inHours = (hours: number): string => new Date(Date.now() + hours * HOUR).toISOString();
 
-  /** `startedAtMs` is when the killed container started; null when the registry never named it. */
-  async function label(sessionId: string, startedAtMs: number | null = null): Promise<unknown> {
+  async function label(sessionId: string): Promise<unknown> {
     const calls = captureAdapter();
-    await settleTaskListOnKill(sessionId, 'chat-idle-reap', startedAtMs);
+    await settleTaskListOnKill(sessionId, 'chat-idle-reap');
     expect(calls).toHaveLength(1);
     return calls[0].content.subtext;
-  }
-
-  async function approvalCard(sessionId: string, createdAtMs: number): Promise<void> {
-    await createPendingApproval({
-      approval_id: `appr-${createdAtMs}`,
-      session_id: sessionId,
-      request_id: `req-${createdAtMs}`,
-      action: 'request_choice',
-      payload: '{}',
-      created_at: new Date(createdAtMs).toISOString(),
-      title: 'Ship it?',
-      options_json: '[]',
-    });
   }
 
   function setOutboundState(sessionId: string, key: string, value: unknown): void {
@@ -778,7 +775,7 @@ describe('the kill label says only what the host knows for certain', () => {
 
   it('keeps the runner’s label when nothing is queued', async () => {
     const sessionId = await listed();
-    expect(await label(sessionId, Date.now() - HOUR)).toBe(RUNNER_LABEL);
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
 
   it.each([
@@ -816,7 +813,7 @@ describe('the kill label says only what the host knows for certain', () => {
   ])('never claims the session is resuming: %s leaves the runner’s label', async (_l, arrange) => {
     const sessionId = await listed();
     arrange(sessionId);
-    expect(await label(sessionId, Date.now() - HOUR)).toBe(RUNNER_LABEL);
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
 
   it('paused with the next check, in the group’s timezone, when the agent armed a wait', async () => {
@@ -844,12 +841,14 @@ describe('the kill label says only what the host knows for certain', () => {
   });
 
   it.each([
-    ['a context row', 'context-1'],
-    ['a recovery wake', 'ceiling-respawn-tool-fictional'],
-    ['a row that only resembles a wait', 'reschedule-wake-1'],
-  ])('a future row that is not a wait (%s) is not a check the agent promised', async (_l, id) => {
+    ['a context row', 'context-1', undefined],
+    ['a recovery wake', 'ceiling-respawn-tool-fictional', undefined],
+    ['a row that only resembles a wait', 'reschedule-wake-1', WAIT_CONTENT],
+    ['a row with the wait prefix that the wait action did not write', 'schedule-wake-forwarded', undefined],
+    ['a row with the wait prefix whose content is not JSON', 'schedule-wake-garbled', '{not json'],
+  ])('a future row that is not a wait (%s) is not a check the agent promised', async (_l, id, content) => {
     const sessionId = await listed();
-    insertInbound(sessionId, { id, processAfter: inHours(3), trigger: 0 });
+    insertInbound(sessionId, { id, processAfter: inHours(3), trigger: 0, content });
     expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
 
@@ -868,16 +867,19 @@ describe('the kill label says only what the host knows for certain', () => {
     expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
 
-  it('waiting on an approval, when the killed container’s card is unanswered', async () => {
+  it('an unanswered card is not something the host labels: answering it wakes nothing', async () => {
     const sessionId = await listed();
-    const startedAt = Date.now() - HOUR;
-    await approvalCard(sessionId, startedAt + 60_000);
-    expect(await label(sessionId, startedAt)).toBe(`waiting on an approval · ${await asOf()}`);
-  });
-
-  it('waiting on an answer, when the killed container’s question is unanswered', async () => {
-    const sessionId = await listed();
-    const startedAt = Date.now() - HOUR;
+    const postedAt = new Date(Date.now() - HOUR).toISOString();
+    await createPendingApproval({
+      approval_id: 'appr-1',
+      session_id: sessionId,
+      request_id: 'req-1',
+      action: 'request_choice',
+      payload: '{}',
+      created_at: postedAt,
+      title: 'Ship it?',
+      options_json: '[]',
+    });
     await createPendingQuestion({
       question_id: 'q-1',
       session_id: sessionId,
@@ -888,39 +890,9 @@ describe('the kill label says only what the host knows for certain', () => {
       title: 'Which region?',
       question: 'Which region should the rehearsal use?',
       options: [],
-      created_at: new Date(startedAt + 60_000).toISOString(),
+      created_at: postedAt,
     });
-    expect(await label(sessionId, startedAt)).toBe(`waiting on an answer · ${await asOf()}`);
-  });
-
-  it('a card from before the killed container, or a kill with no container to date it by, is not this list’s', async () => {
-    const sessionId = await listed();
-    const startedAt = Date.now() - HOUR;
-    await approvalCard(sessionId, startedAt - 24 * HOUR);
-    expect(await label(sessionId, startedAt)).toBe(RUNNER_LABEL);
-    await approvalCard(sessionId, startedAt + 60_000);
-    expect(await label(sessionId, null)).toBe(RUNNER_LABEL);
-  });
-
-  it.each([
-    ['before', -800, 'stopped'],
-    ['after', 50, 'waiting on an approval'],
-  ] as const)(
-    'a card posted in the same second as the container start, %s it, is told apart to the millisecond',
-    async (_order, offsetMs, state) => {
-      const sessionId = await listed();
-      const startedAt = Math.floor((Date.now() - HOUR) / 1000) * 1000 + 900;
-      await approvalCard(sessionId, startedAt + offsetMs);
-      expect(await label(sessionId, startedAt)).toBe(state === 'stopped' ? RUNNER_LABEL : `${state} · ${await asOf()}`);
-    },
-  );
-
-  it('an open card outranks a wait', async () => {
-    const sessionId = await listed();
-    const startedAt = Date.now() - HOUR;
-    await approvalCard(sessionId, startedAt + 60_000);
-    armWait(sessionId, 'a', inHours(1));
-    expect(await label(sessionId, startedAt)).toBe(`waiting on an approval · ${await asOf()}`);
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
   });
 
   describe('a session that takes no wake keeps the runner’s label', () => {
@@ -928,21 +900,13 @@ describe('the kill label says only what the host knows for certain', () => {
       ['archived', (sessionId: string) => archiveSessionById(sessionId)],
       ['closed', (sessionId: string) => updateSession(sessionId, { status: 'closed' })],
     ] as const;
-    const KNOWN = [
-      ['a wait', async (sessionId: string, _startedAt: number) => armWait(sessionId, 'a', inHours(1))],
-      ['an open card', (sessionId: string, startedAt: number) => approvalCard(sessionId, startedAt + 60_000)],
-    ] as const;
 
-    it.each(ENDED.flatMap(([state, end]) => KNOWN.map(([what, arrange]) => [state, what, end, arrange] as const)))(
-      '%s, holding %s',
-      async (_state, _what, end, arrange) => {
-        const sessionId = await listed();
-        const startedAt = Date.now() - HOUR;
-        await arrange(sessionId, startedAt);
-        await end(sessionId);
-        expect(await label(sessionId, startedAt)).toBe(RUNNER_LABEL);
-      },
-    );
+    it.each(ENDED)('%s, holding a wait', async (_state, end) => {
+      const sessionId = await listed();
+      armWait(sessionId, 'a', inHours(1));
+      await end(sessionId);
+      expect(await label(sessionId)).toBe(RUNNER_LABEL);
+    });
   });
 
   it('keeps the runner’s own label when every open item waits on someone', async () => {
@@ -951,7 +915,7 @@ describe('the kill label says only what the host knows for certain', () => {
       items: [{ text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana' }],
       interruptedSubtext: `waiting on Dana · ${DETAIL}`,
     });
-    expect(await label(sessionId, Date.now() - HOUR)).toBe(`waiting on Dana · ${DETAIL}`);
+    expect(await label(sessionId)).toBe(`waiting on Dana · ${DETAIL}`);
   });
 
   it('a record from an older runner gets the host’s label too: nothing in it comes from the record but an instant', async () => {

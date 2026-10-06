@@ -24,7 +24,6 @@ import { readEnvFile } from '../../env.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY, writeSystemWake } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
-import { armedBy, readArmedState, type ArmedState } from '../sweep-continuation/kill-state.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { askJev, type JevQuestion } from '../../typesafe.js';
 import type { Session } from '../../types.js';
@@ -44,9 +43,12 @@ export function promiseWatchMode(raw: string | undefined): PromiseWatchMode {
   return raw === 'shadow' || raw === 'nudge' ? raw : 'off';
 }
 
-export interface SessionSnapshot extends ArmedState {
+export interface SessionSnapshot {
   latestChat: { id: string; timestamp: string; text: string } | null;
   latestInboundAt: string | null;
+  nextFutureProcessAfter: string | null;
+  dueCount: number;
+  hasContinuation: boolean;
 }
 
 /**
@@ -79,7 +81,10 @@ export function candidateReason(
   const age = now - chatAt;
   if (age < QUIET_MS) return 'too-recent';
   if (age > MAX_AGE_MS) return 'too-old';
-  return armedBy(snap) ?? 'candidate';
+  if (snap.dueCount > 0) return 'wake-due';
+  if (snap.nextFutureProcessAfter) return 'wake-pending';
+  if (snap.hasContinuation) return 'continuation-saved';
+  return 'candidate';
 }
 
 /** Taken inside the synchronous admission block, right before the write. */
@@ -258,7 +263,9 @@ function readSnapshot(mailbox: NanoclawMailboxSession): SessionSnapshot {
   return {
     latestChat: row ? { id: row.id, timestamp: row.timestamp, text: chatText(row.content) } : null,
     latestInboundAt: mailbox.latestInboundTimestamp(),
-    ...readArmedState(mailbox),
+    nextFutureProcessAfter: mailbox.getNextFutureProcessAfter(),
+    dueCount: mailbox.countDueMessages(),
+    hasContinuation: mailbox.readWorkContinuation() !== null,
   };
 }
 

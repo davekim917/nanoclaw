@@ -102,10 +102,7 @@ import { createAgentGroup } from '../../db/agent-groups.js';
 import {
   archiveSessionById,
   createPendingApproval,
-  createPendingQuestion,
   createSession,
-  deletePendingApproval,
-  deletePendingQuestion,
   getSession,
   TASKS_SYSTEM_THREAD_ID,
   updateSession,
@@ -269,24 +266,30 @@ function claim(messageId: string): void {
     .run(messageId, new Date().toISOString());
 }
 
-async function openApproval(
-  createdAtMs: number,
-  status: 'pending' | 'approved' | 'awaiting_reason' = 'pending',
-  expiresAt: string | null = null,
-): Promise<void> {
-  await createPendingApproval({
-    approval_id: `appr-${createdAtMs}`,
-    session_id: SESSION_ID,
-    request_id: `req-${createdAtMs}`,
-    action: 'request_choice',
-    payload: '{}',
-    created_at: new Date(createdAtMs).toISOString(),
-    title: 'Ship it?',
-    options_json: '[]',
-    status,
-    expires_at: expiresAt,
+/** The row the `wait` action writes: its id prefix and system kind, with the recall partner admission needs. */
+function armWait(processAfter: string, status: string = 'pending'): void {
+  mailbox.insertDeferredMessageWithContextIfNew({
+    id: 'schedule-wake-fictional',
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: 'ag-1',
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({ text: 'check the deploy', _system: { kind: 'agent_scheduled_wake' } }),
+    processAfter,
+    recurrence: null,
+    onWake: 0,
   });
+  inDb.prepare("UPDATE messages_in SET status = ? WHERE id = 'schedule-wake-fictional'").run(status);
 }
+
+const SAVED_CONTINUATION = JSON.stringify({
+  id: 'cont-1',
+  task: 'finish the rehearsal',
+  phase: 'queued',
+  chain: 1,
+  resume_attempts: 0,
+});
 
 function decisions(info: ReturnType<typeof vi.spyOn>): Array<Record<string, unknown>> {
   return info.mock.calls
@@ -355,19 +358,43 @@ describe('the six stalls', () => {
     expect(content.text).toContain('- in progress: Run the staging rehearsal');
     expect(content.text).toContain('- pending: Post the final wrap-up');
     expect(content.text).not.toContain('Draft the migration plan');
+    expect(content.text).toContain('and you had armed nothing to come back to them');
   });
 
-  it('2: a turn waiting on a card the operator has not answered is left alone', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await openApproval(startedAt + 90_000);
+  it('2: a turn waiting on the operator’s card is woken once to say so in its list, and a list that says so is left alone', async () => {
+    const first = Date.now() - 2 * HOUR;
+    recordList(first + 60_000);
+    await createPendingApproval({
+      approval_id: 'appr-fictional',
+      session_id: SESSION_ID,
+      request_id: 'req-fictional',
+      action: 'request_choice',
+      payload: '{}',
+      created_at: new Date(first + 90_000).toISOString(),
+      title: 'Ship it?',
+      options_json: '[]',
+    });
+
+    await chatReap(first);
+
+    expect(wakeRows().map((r) => r.id)).toEqual([`reap-respawn-${first}`]);
+    expect(wakeText()).toContain('If you cannot move it yourself, mark it waiting on whoever owes the next move.');
+
+    // The woken container consumed its wake and marked what the card holds up.
+    inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id LIKE '%reap-respawn-%'").run();
+    const second = Date.now() - HOUR;
+    recordList(second + 60_000, [
+      { text: 'Draft the migration plan', status: 'done' },
+      { text: 'Run the staging rehearsal', status: 'waiting', waitingOn: 'the operator’s Ship card' },
+      { text: 'Post the final wrap-up', status: 'waiting', waitingOn: 'the operator’s Ship card' },
+    ]);
     const info = vi.spyOn(log, 'info');
 
-    await chatReap(startedAt);
+    await chatReap(second);
 
-    expect(wakeRows()).toHaveLength(0);
+    expect(wakeRows()).toHaveLength(1);
     expect(decisions(info)).toEqual([
-      expect.objectContaining({ sessionId: SESSION_ID, killReason: 'chat-idle-reap', outcome: 'human-pending' }),
+      expect.objectContaining({ sessionId: SESSION_ID, killReason: 'chat-idle-reap', outcome: 'nothing-in-flight' }),
     ]);
   });
 
@@ -761,33 +788,13 @@ describe('the wake is withheld only on a fact, never on a reading of what is pen
     expect(decisions(info)).toEqual([expect.objectContaining({ outcome: 'armed', armedBy: withheldBy })]);
   }
 
-  /** The row the `wait` action writes. */
-  function armWait(processAfter: string, status: string = 'pending'): void {
-    mailbox.insertDeferredMessageWithContextIfNew({
-      id: 'schedule-wake-fictional',
-      kind: 'chat',
-      timestamp: new Date().toISOString(),
-      platformId: 'ag-1',
-      channelType: 'agent',
-      threadId: null,
-      content: JSON.stringify({ text: 'check the deploy' }),
-      processAfter,
-      recurrence: null,
-      onWake: 0,
-    });
-    inDb.prepare("UPDATE messages_in SET status = ? WHERE id = 'schedule-wake-fictional'").run(status);
-  }
-
   it('a wait the agent armed that has not come due', async () => {
     armWait(new Date(Date.now() + HOUR).toISOString());
     await expectWithheld('wake-pending');
   });
 
   it('a saved continuation', async () => {
-    setState(
-      'work_continuation',
-      JSON.stringify({ id: 'cont-1', task: 'finish the rehearsal', phase: 'queued', chain: 1, resume_attempts: 0 }),
-    );
+    setState('work_continuation', SAVED_CONTINUATION);
     await expectWithheld('continuation-saved');
   });
 
@@ -886,6 +893,17 @@ describe('the wake is withheld only on a fact, never on a reading of what is pen
         'a future row that is not a wait',
         () => insertInbound({ id: 'host-restart-fictional', status: 'pending', trigger: 0, processAfter: LATER() }),
       ],
+      [
+        'a future row with the wait prefix that the wait action did not write',
+        () => insertInbound({ id: 'schedule-wake-forwarded', status: 'pending', trigger: 0, processAfter: LATER() }),
+      ],
+      [
+        'a future row with the wait prefix whose content is not JSON',
+        () => {
+          insertInbound({ id: 'schedule-wake-garbled', status: 'pending', trigger: 0, processAfter: LATER() });
+          inDb.prepare("UPDATE messages_in SET content = '{not json' WHERE id = 'schedule-wake-garbled'").run();
+        },
+      ],
       ['a wait that has already come due', () => armWait(new Date(Date.now() - 60_000).toISOString())],
       ['a wait that already ran', () => armWait(LATER(), 'completed')],
       ['a wait that was cancelled', () => armWait(LATER(), 'cancelled')],
@@ -929,180 +947,81 @@ describe('the wake is withheld only on a fact, never on a reading of what is pen
   });
 });
 
-describe('a human who owes the next move', () => {
-  it('an unanswered question card posted by the killed container blocks the wake', async () => {
+describe('work left only on disk has no resume path but this wake, so nothing stored withholds it', () => {
+  const STORED: Array<[string, () => void]> = [
+    ['a saved continuation', () => setState('work_continuation', SAVED_CONTINUATION)],
+    ['a wait the agent armed', () => armWait(new Date(Date.now() + HOUR).toISOString())],
+    [
+      'a wait whose recall partner is gone, which admission can never run',
+      () => {
+        armWait(new Date(Date.now() + HOUR).toISOString());
+        inDb.prepare("DELETE FROM messages_in WHERE id = 'recall-schedule-wake-fictional'").run();
+      },
+    ],
+  ];
+
+  it.each(STORED)('%s does not withhold the worktree wake', async (_l, arrange) => {
     const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await createPendingQuestion({
-      question_id: 'q-fictional',
-      session_id: SESSION_ID,
-      message_out_id: 'out-1',
-      platform_id: 'room-a',
-      channel_type: 'slack',
-      thread_id: null,
-      title: 'Which region?',
-      question: 'Which region should the rehearsal use?',
-      options: [],
-      created_at: new Date(startedAt + 90_000).toISOString(),
-    });
+    recordWorktree(startedAt + 60_000);
+    arrange();
+
     await chatReap(startedAt);
+
+    expect(wakeRows().map((r) => r.id)).toEqual([`reap-respawn-${startedAt}`]);
+    expect(wakeText()).toContain('post ONE message accounting for state — done / lost / next');
+  });
+
+  it.each(STORED)('%s does not withhold it when the list is unfinished too', async (_l, arrange) => {
+    const startedAt = Date.now() - HOUR;
+    recordWorktree(startedAt + 60_000);
+    recordList(startedAt + 60_000);
+    arrange();
+
+    await chatReap(startedAt);
+
+    const content = JSON.parse(wakeRows()[0].content);
+    expect(content._system).toEqual({
+      kind: 'agent_reap_respawn',
+      checkouts: ['shop@orders-move'],
+      unfinished_items: 2,
+    });
+    expect(content.text).toContain('2 item(s) neither done nor marked waiting:');
+    expect(content.text).not.toContain('armed nothing');
+  });
+
+  it('an archived session still gets its row, as it did before the list counted', async () => {
+    const startedAt = Date.now() - HOUR;
+    recordWorktree(startedAt + 60_000);
+    await archiveSessionById(SESSION_ID);
+
+    await chatReap(startedAt);
+
+    expect(wakeRows().map((r) => r.id)).toEqual([`reap-respawn-${startedAt}`]);
+  });
+
+  it('a closed session is refused by the write itself, as it was before the list counted', async () => {
+    const startedAt = Date.now() - HOUR;
+    recordWorktree(startedAt + 60_000);
+    await updateSession(SESSION_ID, { status: 'closed' });
+
+    await expect(
+      followUpKill(mailbox, await session(), startedAt, { reason: 'chat-idle-reap', minutes: CHAT_REAP_MINUTES }),
+    ).rejects.toThrow('quiet-mark invalidation failed');
     expect(wakeRows()).toHaveLength(0);
   });
 
-  it('an approval awaiting its rejection reason blocks the wake', async () => {
+  it('the ceiling branch’s own wake for the same kill still does', async () => {
     const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await openApproval(startedAt + 90_000, 'awaiting_reason');
-    await chatReap(startedAt);
+    recordWorktree(startedAt + 60_000);
+
+    const outcome = await followUpKill(mailbox, await session(), startedAt, {
+      reason: ABSOLUTE_CEILING_KILL,
+      minutes: 30,
+      ceilingWakeQueued: true,
+    });
+
+    expect(outcome).toEqual({ action: 'none', reason: 'armed' });
     expect(wakeRows()).toHaveLength(0);
-  });
-
-  it('an approval that was decided, and so deleted, does not', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await openApproval(startedAt + 90_000);
-    await deletePendingApproval(`appr-${startedAt + 90_000}`);
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(1);
-  });
-
-  it('an approval mid-apply, already approved but not yet deleted, does not', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await openApproval(startedAt + 90_000, 'approved');
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(1);
-  });
-
-  it('a pending approval past its expiry does not', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await openApproval(startedAt + 90_000, 'pending', new Date(Date.now() - 60_000).toISOString());
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(1);
-  });
-
-  it('a pending approval not yet expired blocks the wake', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await openApproval(startedAt + 90_000, 'pending', new Date(Date.now() + HOUR).toISOString());
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(0);
-  });
-
-  it('a question that was answered, and so deleted, does not', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await createPendingQuestion({
-      question_id: 'q-answered',
-      session_id: SESSION_ID,
-      message_out_id: 'out-1',
-      platform_id: 'room-a',
-      channel_type: 'slack',
-      thread_id: null,
-      title: 'Which region?',
-      question: 'Which region should the rehearsal use?',
-      options: [],
-      created_at: new Date(startedAt + 90_000).toISOString(),
-    });
-    await deletePendingQuestion('q-answered');
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(1);
-  });
-
-  it('a card abandoned before the killed container started does not', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await openApproval(startedAt - 24 * HOUR);
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(1);
-  });
-
-  it('a question abandoned before the killed container started does not', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await createPendingQuestion({
-      question_id: 'q-abandoned',
-      session_id: SESSION_ID,
-      message_out_id: 'out-1',
-      platform_id: 'room-a',
-      channel_type: 'slack',
-      thread_id: null,
-      title: 'Which region?',
-      question: 'Which region should the rehearsal use?',
-      options: [],
-      created_at: new Date(startedAt - 24 * HOUR).toISOString(),
-    });
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(1);
-  });
-
-  it.each([
-    ['before', -800, 1],
-    ['after', 50, 0],
-  ] as const)(
-    'a question posted in the same second as the container start, %s it, is told apart to the millisecond',
-    async (_order, offsetMs, wakes) => {
-      const startedAt = Math.floor((Date.now() - HOUR) / 1000) * 1000 + 900;
-      recordList(startedAt + 60_000);
-      await createPendingQuestion({
-        question_id: 'q-same-second',
-        session_id: SESSION_ID,
-        message_out_id: 'out-1',
-        platform_id: 'room-a',
-        channel_type: 'slack',
-        thread_id: null,
-        title: 'Which region?',
-        question: 'Which region should the rehearsal use?',
-        options: [],
-        created_at: new Date(startedAt + offsetMs).toISOString(),
-      });
-      await chatReap(startedAt);
-      expect(wakeRows()).toHaveLength(wakes);
-    },
-  );
-
-  it('an approval whose expiry is later in the same second as the kill is still open', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    vi.useFakeTimers({ toFake: ['Date'] });
-    try {
-      const killSecond = Math.floor(Date.now() / 1000) * 1000;
-      vi.setSystemTime(killSecond + 100);
-      await openApproval(startedAt + 90_000, 'pending', new Date(killSecond + 900).toISOString());
-      await chatReap(startedAt);
-      expect(wakeRows()).toHaveLength(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("another session's card does not", async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await createSession({
-      id: 'sess-other',
-      agent_group_id: 'ag-1',
-      messaging_group_id: null,
-      thread_id: 'chat:room-a:thread-2',
-      agent_provider: null,
-      status: 'active',
-      container_status: 'stopped',
-      last_active: '2026-10-05T00:00:00.000Z',
-      created_at: '2026-10-05T00:00:00.000Z',
-    });
-    await createPendingApproval({
-      approval_id: 'appr-other',
-      session_id: 'sess-other',
-      request_id: 'req-other',
-      action: 'request_choice',
-      payload: '{}',
-      created_at: new Date(startedAt + 90_000).toISOString(),
-      title: 'Ship it?',
-      options_json: '[]',
-    });
-    await chatReap(startedAt);
-    expect(wakeRows()).toHaveLength(1);
   });
 });
 

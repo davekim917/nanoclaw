@@ -29,66 +29,12 @@ export const STRANDING_KILLS: ReadonlyMap<string, (minutes: number | undefined) 
   [PROVIDER_UNAVAILABLE_KILL, () => `was stopped mid-turn because its model provider became unavailable`],
 ]);
 
-export interface ArmedState {
-  dueCount: number;
-  nextFutureProcessAfter: string | null;
-  hasContinuation: boolean;
-}
-
-export function readArmedState(
-  mailbox: Pick<NanoclawMailboxSession, 'countDueMessages' | 'getNextFutureProcessAfter' | 'readWorkContinuation'>,
-): ArmedState {
-  return {
-    dueCount: mailbox.countDueMessages(),
-    nextFutureProcessAfter: mailbox.getNextFutureProcessAfter(),
-    hasContinuation: mailbox.readWorkContinuation() !== null,
-  };
-}
-
-export type ArmedBy = 'wake-due' | 'wake-pending' | 'continuation-saved';
-
-export function armedBy(state: ArmedState): ArmedBy | null {
-  if (state.dueCount > 0) return 'wake-due';
-  if (state.nextFutureProcessAfter) return 'wake-pending';
-  if (state.hasContinuation) return 'continuation-saved';
-  return null;
-}
-
 /**
- * The only things that withhold the wake besides an open card, each a fact and none a reading of what is pending:
- * the ceiling branch said it queued its own wake for this kill, a continuation is saved (the sweep resumes it, or
- * has told the operator it could not), or the agent armed a `wait` that has not come due.
+ * The only things that withhold the wake, each a fact and none a reading of what is pending: the ceiling branch said
+ * it queued its own wake for this kill, a continuation is saved (the sweep resumes it, or has told the operator it
+ * could not), or the agent armed a `wait` that has not come due.
  */
 type WithheldBy = 'ceiling-wake' | 'continuation-saved' | 'wake-pending';
-
-type OpenCard = 'approval' | 'question';
-
-/**
- * Call inside `withCentralSync`. A resolved approval or answered question is deleted, so a row that exists is
- * unanswered — but one nobody ever answers is never pruned, so only a card posted during the killed container's
- * life counts: an abandoned card from months ago would otherwise speak for this session for good. `julianday`
- * keeps the milliseconds `datetime` drops: a replacement can start in the second its predecessor's card was posted.
- */
-function openCardSince(sessionId: string, sinceIso: string, nowIso: string): OpenCard | null {
-  const row = withRawDb(
-    (db) =>
-      db
-        .prepare(
-          `SELECT 'approval' AS card FROM pending_approvals
-            WHERE session_id = @id
-              AND status IN ('pending', 'awaiting_reason')
-              AND (expires_at IS NULL OR julianday(expires_at) > julianday(@now))
-              AND julianday(created_at) >= julianday(@since)
-           UNION ALL
-           SELECT 'question' AS card FROM pending_questions
-            WHERE session_id = @id
-              AND julianday(created_at) >= julianday(@since)
-           LIMIT 1`,
-        )
-        .get({ id: sessionId, since: sinceIso, now: nowIso }) as { card: OpenCard } | undefined,
-  );
-  return row?.card ?? null;
-}
 
 export interface KillEvidence {
   checkouts: WorktreeInFlight['checkouts'];
@@ -136,7 +82,6 @@ export type ReapFollowUp =
         | 'stale-evidence'
         | 'armed'
         | 'not-wakeable'
-        | 'human-pending'
         | 'capped'
         | 'shadow';
     }
@@ -152,7 +97,6 @@ export function decideReapFollowUp(args: {
   staleEvidence?: boolean;
   armed?: boolean;
   wakeable?: boolean;
-  humanPending?: boolean;
   priorAttempts: number;
 }): ReapFollowUp {
   if (args.inFlightCheckouts + (args.unfinishedItems ?? 0) === 0) {
@@ -160,7 +104,6 @@ export function decideReapFollowUp(args: {
   }
   if (args.armed) return { action: 'none', reason: 'armed' };
   if (args.wakeable === false) return { action: 'none', reason: 'not-wakeable' };
-  if (args.humanPending) return { action: 'none', reason: 'human-pending' };
   if (args.priorAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none', reason: 'capped' };
   return { action: 'wake-accountable' };
 }
@@ -173,7 +116,6 @@ function decideKillFollowUp(args: {
   staleEvidence: boolean;
   armed: boolean;
   wakeable: boolean;
-  humanPending: boolean;
   priorAttempts: number;
   selfHeal: boolean;
 }): ReapFollowUp {
@@ -188,29 +130,16 @@ function decideKillFollowUp(args: {
 export interface KillFacts {
   /** The earliest `wait` the agent armed that has not come due. */
   nextCheckAt: string | null;
-  openCard: OpenCard | null;
   /** False for a closed or archived session, which takes no wake whatever is queued for it. */
   takesAWake: boolean;
 }
 
-/**
- * Call inside `withCentralSync`. `startedAtMs` is the killed container's `containerStartedAtMs`, resolved by the
- * caller from a name read before the kill (the registry entry is gone after exit): container-runner.ts owns that
- * parse and this file may not import it.
- */
+/** Call inside `withCentralSync`. */
 export function readKillFacts(
   mailbox: Pick<NanoclawMailboxSession, 'getNextScheduledWakeAt'>,
   session: Session,
-  startedAtMs: number | null,
 ): KillFacts {
-  return {
-    nextCheckAt: mailbox.getNextScheduledWakeAt(),
-    openCard:
-      startedAtMs === null
-        ? null
-        : openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString()),
-    takesAWake: takesAWake(session.id),
-  };
+  return { nextCheckAt: mailbox.getNextScheduledWakeAt(), takesAWake: takesAWake(session.id) };
 }
 
 export interface KillDecision {
@@ -220,23 +149,34 @@ export interface KillDecision {
   priorAttempts: number;
 }
 
-/** No writes. Call inside `withCentralSync`. `ceilingWakeQueued` is the ceiling branch's own return for this kill. */
+/**
+ * No writes. Call inside `withCentralSync`. `startedAtMs` is the killed container's `containerStartedAtMs`, resolved
+ * by the caller from a name read before the kill (the registry entry is gone after exit). `ceilingWakeQueued` is the
+ * ceiling branch's own return for this kill.
+ *
+ * Work left only on disk has no resume path but this wake, so nothing stored withholds it: a saved continuation or
+ * an armed `wait` may never run, and neither accounts for the checkouts. Those facts, and a session that takes no
+ * wake, withhold only when the list is the sole evidence.
+ */
 export function decideKill(
   mailbox: NanoclawMailboxSession,
   session: Session,
   startedAtMs: number | null,
   kill: { reason: string; ceilingWakeQueued?: boolean },
 ): KillDecision {
-  const facts = readKillFacts(mailbox, session, startedAtMs);
   const dated = startedAtMs !== null;
   const evidence = dated ? readKillEvidence(mailbox, startedAtMs) : NO_EVIDENCE;
+  const facts = readKillFacts(mailbox, session);
+  const listOnly = evidence.checkouts.length === 0;
   const withheldBy: WithheldBy | null = kill.ceilingWakeQueued
     ? 'ceiling-wake'
-    : mailbox.readWorkContinuation() !== null
-      ? 'continuation-saved'
-      : facts.nextCheckAt !== null
-        ? 'wake-pending'
-        : null;
+    : !listOnly
+      ? null
+      : mailbox.readWorkContinuation() !== null
+        ? 'continuation-saved'
+        : facts.nextCheckAt !== null
+          ? 'wake-pending'
+          : null;
   const priorAttempts = dated ? mailbox.countRecoveryAttemptsSinceRealInbound(REAP_RESPAWN_ID_PREFIX) : 0;
   const followUp = decideKillFollowUp({
     reasonCovered: STRANDING_KILLS.has(kill.reason),
@@ -245,8 +185,7 @@ export function decideKill(
     unfinishedItems: evidence.unfinished.length,
     staleEvidence: evidence.stale,
     armed: withheldBy !== null,
-    wakeable: facts.takesAWake,
-    humanPending: facts.openCard !== null,
+    wakeable: !listOnly || facts.takesAWake,
     priorAttempts,
     selfHeal: SELF_HEAL_ENABLED,
   });

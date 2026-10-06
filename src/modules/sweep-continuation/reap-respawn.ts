@@ -79,14 +79,16 @@ function wakeText(cause: string, evidence: KillEvidence): string {
     );
   }
   if (evidence.unfinished.length > 0) {
-    // Work only on disk must be accounted for in a message; a list alone can be settled in the list.
-    const silent =
-      evidence.checkouts.length === 0
-        ? ` Post a message only if work was lost or that ask was never made; otherwise the updated list is the answer.`
-        : '';
+    // Work only on disk must be accounted for in a message, and is woken whatever is armed; a list alone is woken
+    // only when nothing is, and can be settled in the list.
+    const listOnly = evidence.checkouts.length === 0;
+    const silent = listOnly
+      ? ` Post a message only if work was lost or that ask was never made; otherwise the updated list is the answer.`
+      : '';
     sections.push(
-      `Its task list still had ${evidence.unfinished.length} item(s) neither done nor marked waiting, and you had ` +
-        `armed nothing to come back to them:\n${describeUnfinished(evidence.unfinished)}\n` +
+      `Its task list still had ${evidence.unfinished.length} item(s) neither done nor marked waiting` +
+        `${listOnly ? ', and you had armed nothing to come back to them' : ''}:\n` +
+        `${describeUnfinished(evidence.unfinished)}\n` +
         `Settle each one now with update_task_list. If it is in fact finished, mark it done. ` +
         `If the work is still owed, do the next item now. ` +
         `If you will check on it later (a peer agent you are waiting on counts), arm wait or continue_work naming ` +

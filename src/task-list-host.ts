@@ -46,26 +46,20 @@ const KILL_EDIT_WAIT_BUFFER_MS = 250;
 
 /**
  * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host
- * replaces it only with something it knows for certain: an unanswered card the killed container posted, else a
- * `wait` the agent armed that has not come due. It never says the session is resuming. A label the host composes is
- * host literals and host-formatted times only, so nothing the container wrote sits under a state the host vouches
- * for; with neither fact, no usable timestamp, or a session that takes no wake, the runner's own label stands.
+ * replaces it only with the one thing it knows for certain: a `wait` the agent armed that has not come due. It never
+ * says the session is resuming. A label the host composes is host literals and host-formatted times only, so nothing
+ * the container wrote sits under a state the host vouches for; with no such `wait`, no usable timestamp, or a session
+ * that takes no wake, the runner's own label stands.
  */
 async function killSubtext(
   session: Session,
   edit: NonNullable<TaskListSettlement['edit']>,
   facts: KillFacts | null,
 ): Promise<string> {
-  if (edit.listedAt === null || facts === null || !facts.takesAWake) return edit.interruptedSubtext;
-  const { openCard, nextCheckAt } = facts;
-  if (!openCard && !nextCheckAt) return edit.interruptedSubtext;
+  if (edit.listedAt === null || !facts?.takesAWake || !facts.nextCheckAt) return edit.interruptedSubtext;
   const timezone = await resolveGroupTimezone(session.agent_group_id);
-  const state = openCard
-    ? openCard === 'approval'
-      ? 'waiting on an approval'
-      : 'waiting on an answer'
-    : `paused · next check ${formatLocalTime(nextCheckAt!, timezone)}`;
-  return `${state} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
+  const nextCheck = formatLocalTime(facts.nextCheckAt, timezone);
+  return `paused · next check ${nextCheck} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
 }
 
 /**
@@ -74,11 +68,7 @@ async function killSubtext(
  * from host-owned evidence and must be the session's own conversation; the wording is container-written unless the
  * host composed the label. Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
  */
-export async function settleTaskListOnKill(
-  sessionId: string,
-  reason: string,
-  containerStartedAtMs: number | null = null,
-): Promise<void> {
+export async function settleTaskListOnKill(sessionId: string, reason: string): Promise<void> {
   setTypingStatusText(sessionId, null);
   if (!TASK_LIST_ENABLED) return;
   const killedAt = new Date().toISOString();
@@ -97,13 +87,12 @@ export async function settleTaskListOnKill(
           for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
           if (!found.edit) return { ...found, facts: null };
           // A label that cannot be worked out must not cost the list its interrupted form.
-          const facts = await withCentralSync(
-            () => readKillFacts(mailbox, session, containerStartedAtMs),
-            'task list kill label',
-          ).catch((err: unknown) => {
-            log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId, reason, err });
-            return null;
-          });
+          const facts = await withCentralSync(() => readKillFacts(mailbox, session), 'task list kill label').catch(
+            (err: unknown) => {
+              log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId, reason, err });
+              return null;
+            },
+          );
           return { ...found, facts };
         });
         const edit = settlement?.edit;
