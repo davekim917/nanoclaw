@@ -19,7 +19,7 @@
 # publish a linux/arm64 prebuilt at storage.googleapis.com. The alias FROM
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
-ARG MCP_TOOLBOX_VERSION=1.7.0
+ARG MCP_TOOLBOX_VERSION=1.13.1
 ARG PNPM_VERSION=10.34.5
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
@@ -32,24 +32,24 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.284
-ARG AGENT_BROWSER_VERSION=0.33.0
-ARG VERCEL_VERSION=52.2.1
-ARG BUN_VERSION=1.3.14
-ARG MMDC_VERSION=11.16.0
+ARG CLAUDE_CODE_VERSION=2.1.290
+ARG AGENT_BROWSER_VERSION=0.38.2
+ARG VERCEL_VERSION=62.4.0
+ARG BUN_VERSION=1.4.2
+ARG MMDC_VERSION=12.0.0
 ARG GWS_VERSION=0.22.5
-ARG CODEX_VERSION=0.159.1
-ARG OPENCODE_VERSION=1.18.31
-ARG WIX_CLI_VERSION=1.1.230
-ARG DBT_MCP_VERSION=1.22.1
-ARG PIP_VERSION=26.1.2
-ARG SETUPTOOLS_VERSION=83.0.0
-ARG WHEEL_VERSION=0.47.0
-ARG SNOWFLAKE_CLI_VERSION=3.23.0
-ARG DBT_CORE_VERSION=1.12.0
-ARG DBT_SNOWFLAKE_VERSION=1.12.0
-ARG UV_VERSION=0.11.32
-ARG AWS_CLI_VERSION=2.36.8
+ARG CODEX_VERSION=0.160.1
+ARG OPENCODE_VERSION=1.18.34
+ARG WIX_CLI_VERSION=1.1.256
+ARG DBT_MCP_VERSION=2.5.0
+ARG PIP_VERSION=26.2.1
+ARG SETUPTOOLS_VERSION=84.0.0
+ARG WHEEL_VERSION=0.48.0
+ARG SNOWFLAKE_CLI_VERSION=3.28.0
+ARG DBT_CORE_VERSION=1.12.5
+ARG DBT_SNOWFLAKE_VERSION=1.12.1
+ARG UV_VERSION=0.12.23
+ARG AWS_CLI_VERSION=2.37.9
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -123,7 +123,7 @@ RUN python3 -m venv /opt/dbt-venv \
 
 # sooperset/mcp-atlassian — stdio MCP server for Jira + Confluence (72 tools).
 # Isolated venv to avoid clashing with snow/dbt transitive deps.
-ARG MCP_ATLASSIAN_VERSION=0.23.0
+ARG MCP_ATLASSIAN_VERSION=0.23.1
 RUN python3 -m venv /opt/atlassian-venv \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
@@ -163,9 +163,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # Render / Railway / Supabase CLIs and yq (released as prebuilt binaries)
-ARG RENDER_VERSION=2.22.0
-ARG RAILWAY_VERSION=5.28.1
-ARG SUPABASE_VERSION=2.109.1
+ARG RENDER_VERSION=2.28.0
+ARG RAILWAY_VERSION=5.63.2
+ARG SUPABASE_VERSION=2.119.0
 ARG YQ_VERSION=4.54.1
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
@@ -197,9 +197,9 @@ COPY --from=mcp-toolbox-src /toolbox /usr/local/bin/toolbox
 # stale CDN edge):
 #   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-aarch64-unknown-linux-gnu.tar.xz.sha256
 #   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-x86_64-unknown-linux-gnu.tar.xz.sha256
-ARG HEX_CLI_VERSION=1.2026.07.21
-ARG HEX_CLI_SHA256_arm64=3e95de9edccd678c43dae7661329d7e31b7ac4c8b2e121f406d9426fe5d40def
-ARG HEX_CLI_SHA256_amd64=33a90719b634c4a366431e4805796b0014898cf92d1863b8253cf0fe343f9762
+ARG HEX_CLI_VERSION=1.2026.09.23
+ARG HEX_CLI_SHA256_arm64=a6083e034c9f43f370a90dc04146b11eb060483d5bba44c358e50a94ce113cc5
+ARG HEX_CLI_SHA256_amd64=3845656a02f992b6bc50a8467bc18e19f52ce38a29be6b43ed13de5b8a1e34f2
 
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
@@ -294,7 +294,7 @@ RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate && \
 # The npm bundled with node:22-slim (10.9.8) vendors tar <7.5.19, which carries
 # a fixable critical (GHSA-23hp-3jrh-7fpw). Patch-level bump only. Drop this
 # once the base image ships npm >= 10.9.9.
-ARG NPM_VERSION=10.9.9
+ARG NPM_VERSION=12.2.0
 RUN npm install -g npm@${NPM_VERSION}
 
 # Global Node CLIs the agent invokes at runtime are installed explicitly below,
@@ -417,7 +417,7 @@ RUN mkdir -p /opt/remotion/public/shots /opt/remotion/public/clips /opt/remotion
 # blocked postinstall only costs `cf dev` / `--local`; API commands and deploys
 # don't need it. Auth: CLOUDFLARE_API_TOKEN placeholder, swapped by OneCLI.
 # Telemetry is on by default and ships `cf cli search` query text to Cloudflare.
-ARG CF_CLI_VERSION=1.0.0-beta.6
+ARG CF_CLI_VERSION=1.0.0-beta.12
 ENV CF_SEND_TELEMETRY=false
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "cf@${CF_CLI_VERSION}"
