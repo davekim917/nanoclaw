@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 /**
  * Provider-specific behaviour on the host is declared where the provider is (`src/providers/`), not compared
  * by name elsewhere. The agent runner enforces zero (`container/agent-runner/src/providers/contract.test.ts`);
- * the host pins today's count per file so it can only fall. Lower a number when a site moves behind a
+ * the host pins today's count per file so it can only fall. Lower a number when a comparison moves behind a
  * declaration; never raise one.
  */
 const PINNED: Record<string, number> = {
@@ -19,13 +19,13 @@ const PINNED: Record<string, number> = {
   'src/modules/channel-config/index.ts': 1,
   'src/modules/self-mod/apply.ts': 1,
   'src/onecli-secrets.ts': 1,
-  'src/plugin-skill-discovery.ts': 3,
+  'src/plugin-skill-discovery.ts': 5,
   'src/repository-discovery.ts': 1,
   'src/wiki-admission/runtime.ts': 2,
 };
 
 const PROVIDER_NAME_COMPARISON =
-  /[=!]==?\s*['"](claude|codex|opencode)['"]|['"](claude|codex|opencode)['"]\s*[=!]==?|case\s+['"](claude|codex|opencode)['"]/;
+  /[=!]==?\s*['"](claude|codex|opencode)['"]|['"](claude|codex|opencode)['"]\s*[=!]==?|case\s+['"](claude|codex|opencode)['"]/g;
 
 function countBranches(root: string): Record<string, number> {
   const counts: Record<string, number> = {};
@@ -38,10 +38,7 @@ function countBranches(root: string): Record<string, number> {
         continue;
       }
       if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
-      const hits = fs
-        .readFileSync(full, 'utf-8')
-        .split('\n')
-        .filter((line) => PROVIDER_NAME_COMPARISON.test(line)).length;
+      const hits = fs.readFileSync(full, 'utf-8').match(PROVIDER_NAME_COMPARISON)?.length ?? 0;
       if (hits > 0) counts[path.relative(root, full)] = hits;
     }
   };
