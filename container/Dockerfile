@@ -1,4 +1,6 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# Pinned by digest so a build never asks Docker Hub to resolve the `1.7` tag (that HEAD request is the one that
+# returns the occasional 5xx). Bump the tag and digest together: `docker buildx imagetools inspect docker/dockerfile:1.7`.
 # NanoClaw Agent Container
 # Runs Claude Agent SDK in isolated Linux VM with browser automation.
 #
