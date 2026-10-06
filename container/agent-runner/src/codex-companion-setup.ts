@@ -39,6 +39,7 @@ import {
   readPluginDenySiblings,
   syncSkillSymlinks as syncDiscoveredSkillSymlinks,
 } from './plugin-skill-discovery.js';
+import { providerContract } from './providers/contract.js';
 import type { McpServerConfig } from './providers/types.js';
 
 export { readCodexConfigToml };
@@ -732,10 +733,10 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
     /* container skills dir missing */
   }
 
-  // Codex loads plugin skills natively (namespaced, with their MCP servers); mirroring them too would double-list
-  // them unprefixed and MCP-less. OpenCode has no plugin loader, so the mirror is its only delivery.
+  // A native plugin loader lists skills namespaced and with their MCP servers; mirroring them too would double-list
+  // them unprefixed and MCP-less.
   const pluginSkills =
-    runtime === 'codex'
+    runtime !== undefined && providerContract(runtime).skills.nativePluginLoading
       ? []
       : discoverPortableSkills(CONTAINER_PLUGINS_DIR, { runtime, excludePlugins: loadExcludedPlugins() });
 

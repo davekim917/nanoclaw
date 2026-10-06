@@ -7,6 +7,7 @@
  */
 import fs from 'fs';
 
+import { providerContract } from './providers/contract.js';
 import type { McpServerConfig } from './providers/types.js';
 
 const DEFAULT_CONFIG_PATH = '/workspace/agent/container.json';
@@ -61,9 +62,6 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   // Provider equality cannot detect a fallback (a Codex-pinned session may fall back to the file's provider),
   // so the host's decision is carried explicitly.
   const envFallbackApplied = env?.NANOCLAW_PROVIDER_FALLBACK_APPLIED === '1';
-  // Codex-only channel defaults: applied to the primary Codex provider, never to a fallback.
-  const envCodexModel = env?.NANOCLAW_CODEX_MODEL_OVERRIDE;
-  const envCodexEffort = env?.NANOCLAW_CODEX_EFFORT_OVERRIDE;
   const fileProvider = (raw.provider as string) || 'claude';
   const provider = envProvider || fileProvider;
   // The file's providerConfig/model/effort describe the PRIMARY provider. Under an override they are the wrong
@@ -80,11 +78,13 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   const configuredProviderModel = typeof providerConfig.model === 'string' ? providerConfig.model : undefined;
   const configuredProviderEffort =
     typeof providerConfig.reasoning_effort === 'string' ? providerConfig.reasoning_effort : undefined;
-  const activeCodexModel = !onFallback && provider === 'codex' ? envCodexModel : undefined;
-  const activeCodexEffort = !onFallback && provider === 'codex' ? envCodexEffort : undefined;
-  if (!onFallback && provider === 'codex') {
+  // Channel defaults apply to the primary provider, never to a fallback.
+  const channelDefaults = onFallback ? null : providerContract(provider).channelDefaults;
+  const activeCodexModel = channelDefaults ? env?.[channelDefaults.modelEnv] : undefined;
+  const activeCodexEffort = channelDefaults ? env?.[channelDefaults.effortEnv] : undefined;
+  if (channelDefaults) {
     // Precedence: channel > per-agent providerConfig > provider-level fields. Copied into providerConfig because
-    // Codex reads its sticky values there at app-server startup.
+    // the provider reads its sticky values there at app-server startup.
     const codexModel = activeCodexModel || configuredProviderModel || configuredModel;
     const codexEffort = activeCodexEffort || configuredProviderEffort || configuredEffort;
     if (codexModel) providerConfig.model = codexModel;

@@ -15,6 +15,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from './plugin-exclusions.js';
+import { providerContract } from './providers/contract.js';
 
 export interface DiscoveredSkill {
   /** Skill name (used as `~/.codex/skills/<name>/` link basename) */
@@ -104,7 +105,12 @@ const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> =
   ]),
 };
 
-export type AgentRuntime = 'claude' | 'codex' | 'opencode';
+const AGENT_RUNTIMES = ['claude', 'codex', 'opencode'] as const;
+export type AgentRuntime = (typeof AGENT_RUNTIMES)[number];
+
+export function isAgentRuntime(value: unknown): value is AgentRuntime {
+  return (AGENT_RUNTIMES as readonly unknown[]).includes(value);
+}
 
 // Most-conservative fallback, for back-compat only; callers should pass `runtime`.
 const DEFAULT_RUNTIME: AgentRuntime = 'claude';
@@ -142,7 +148,7 @@ export function readPluginDenySiblings(pluginDir: string): Set<AgentRuntime> {
     const raw = fs.readFileSync(path.join(pluginDir, '.nanoclaw-plugin.json'), 'utf-8');
     const parsed = JSON.parse(raw) as { denySiblings?: unknown };
     const list = Array.isArray(parsed.denySiblings) ? parsed.denySiblings : [];
-    return new Set(list.filter((x): x is AgentRuntime => x === 'claude' || x === 'codex' || x === 'opencode'));
+    return new Set(list.filter(isAgentRuntime));
   } catch {
     // No marker / unreadable / malformed → deliver to all siblings (the default).
     return new Set();
@@ -205,7 +211,8 @@ function discoverInPlugin(
   const skills = new Map<string, DiscoveredSkill>();
 
   // Applied per plugin root: the top-level plugin (rules 1-6) and each sub-plugin (rules 7-8).
-  const skipCodexNative = (root: string) => runtime === 'codex' && loadedNativelyByCodex(root);
+  const skipCodexNative = (root: string) =>
+    providerContract(runtime).skills.nativePluginLoading && loadedNativelyByCodex(root);
   const doTopLevel = !skipCodexNative(pluginDir);
 
   // Exclusions are asked ONCE, at `recordCandidate`, the seam every layout rule ends at: a per-rule check is one
@@ -327,8 +334,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
   const denySkills = options.denySkills ?? new Set<string>();
   const runtime = options.runtime ?? DEFAULT_RUNTIME;
   const denySubPluginSkillDirs = DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME[runtime];
-  // OpenCode's mirror is its sole skill delivery, so it also gets `user-invocable:false` helper skills.
-  const allowNonInvocable = runtime === 'opencode';
+  const allowNonInvocable = providerContract(runtime).skills.mirrorIsSoleDelivery;
 
   const excluded = options.excludePlugins ?? splitExcludedPlugins(undefined);
 

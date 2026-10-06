@@ -108,6 +108,7 @@ import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 import { isFreshContextTaskBatch, sessionHasOpenWork, startsFreshFire } from './fresh-context-task.js';
 import { loadTaskListState, markTaskListStale, taskListEnabled, taskListReminder } from './task-list.js';
+import { providerContract } from './providers/contract.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -742,7 +743,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       `Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}` +
         (effectiveModel ? ` model=${effectiveModel}` : '') +
         (effectiveEffort ? ` effort=${effectiveEffort}` : '') +
-        (config.providerName === 'codex' ? ` fast=${effectiveFast ? 'on' : 'off'}` : ''),
+        (providerContract(config.providerName).turnFast ? ` fast=${effectiveFast ? 'on' : 'off'}` : ''),
     );
 
     // Per turn, so a since-healed credential is reachable again; otherwise a
@@ -3080,7 +3081,7 @@ export function applyFlagBatch(
       // turns ultracode off — `-e high` after `-e ultracode` means plain high.
       clearStickyUltracode();
     }
-    if (providerName === 'codex' && intent.stickyFast !== undefined) {
+    if (providerContract(providerName).turnFast && intent.stickyFast !== undefined) {
       setStickyFast(intent.stickyFast);
     }
   }
@@ -3100,9 +3101,9 @@ export function applyFlagBatch(
   // only it knows the final model.
   const effort = turn?.turnEffort ?? getStickyEffort();
   const ultracode = turn?.turnUltracode ?? getStickyUltracode() ?? false;
-  // Preserve a Codex sticky across provider migrations, but never let it
-  // perturb a Claude/OpenCode query or trigger a false mid-turn restart there.
-  const fast = providerName === 'codex' ? (turn?.turnFast ?? getStickyFast() ?? false) : false;
+  // A sticky survives provider migrations; a provider without the toggle must not see it, or it would
+  // perturb the query or trigger a false mid-turn restart.
+  const fast = providerContract(providerName).turnFast ? (turn?.turnFast ?? getStickyFast() ?? false) : false;
 
   return {
     model,
