@@ -1,0 +1,20 @@
+diff --git a/dist/index.js b/dist/index.js
+index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..838128f6a0ef21dc3c384bd237806061871738e2 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -804,8 +804,14 @@ function replaceRange(text, start, end, replacer, angles) {
+   }
+   return result;
+ }
++// NanoClaw: fences (3+ backticks), double-backtick spans (may cross lines) and one-line
++// single-backtick spans are cut out before the scanner runs, because findCodeEnd reads a
++// double-backtick span as two empty spans and would rewrite the @name inside it.
++var NANOCLAW_CODE_REGION_REGEX = /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g;
+ function replaceBareMentions(text, replacer) {
+-  return replaceRange(text, 0, text.length, replacer, true);
++  return text.split(NANOCLAW_CODE_REGION_REGEX).map(
++    (segment, index) => index % 2 === 1 ? segment : replaceRange(segment, 0, segment.length, replacer, true)
++  ).join("");
+ }
+ function maskCodeSpans(text, replacement = " ") {
+   let result = "";

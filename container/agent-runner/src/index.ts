@@ -25,6 +25,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { trustGatewayCaForChromium } from './browser-trust.js';
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
@@ -101,6 +102,9 @@ async function main(): Promise<void> {
   ensureClaudeUserConfig(log);
 
   ensureMemoryScaffold();
+
+  // The agent browser trusts only NSS, not the gateway CA env vars.
+  trustGatewayCaForChromium({ log });
 
   // Runtime-generated system-prompt addendum: agent identity + communication
   // invariants + live destinations map. Rest of the system prompt (per-module

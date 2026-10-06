@@ -231,6 +231,38 @@ describe('log never throws on unserializable data', () => {
     expect(out).not.toContain('SECRET');
   });
 
+  it('applies a nested redacting toJSON when the value has a cycle', () => {
+    const err: Record<string, unknown> = {
+      creds: {
+        token: 'SECRET',
+        toJSON() {
+          return { token: '[redacted]' };
+        },
+      },
+    };
+    err.self = err;
+    log.warn('nested cycle', { err });
+    const out = written.join('');
+    expect(out).toContain('[redacted]');
+    expect(out).toContain('[Circular');
+    expect(out).not.toContain('SECRET');
+  });
+
+  it('marks a cycle inside a toJSON result', () => {
+    const value = {
+      token: 'SECRET',
+      toJSON() {
+        const o: Record<string, unknown> = { token: '[redacted]' };
+        o.self = o;
+        return o;
+      },
+    };
+    log.warn('toJSON cycle', { err: { creds: value } });
+    const out = written.join('');
+    expect(out).toContain('[Circular');
+    expect(out).not.toContain('SECRET');
+  });
+
   it('marks only a true cycle, not a value referenced twice', () => {
     const shared = { code: 'E_SHARED' };
     log.warn('dag', { err: { a: shared, b: shared, n: 1n } });

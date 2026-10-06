@@ -155,7 +155,7 @@ describe('scanInputs', () => {
   it('does not mistake scoped package versions for email addresses', () => {
     expect(
       scanInputs(
-        [input('package.json', '"@chat-adapter/discord@4.29.0": "patches/@chat-adapter__discord@4.29.0.patch"')],
+        [input('package.json', '"@chat-adapter/discord@4.41.1": "patches/@chat-adapter__discord@4.41.1.patch"')],
         new Set(),
         [],
       ),
