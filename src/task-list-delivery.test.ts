@@ -19,10 +19,21 @@ vi.mock('./container-runner.js', async (importOriginal) => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: TEST_DIR, GROUPS_DIR: `${TEST_DIR}/groups`, TASK_LIST_ENABLED: true };
+  return {
+    ...actual,
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
+    TASK_LIST_ENABLED: true,
+    get SELF_HEAL_ENABLED() {
+      return selfHeal.armed;
+    },
+  };
 });
 
-const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-task-list-delivery') }));
+const { TEST_DIR, selfHeal } = vi.hoisted(() => ({
+  TEST_DIR: uniqueTmpRoot('test-task-list-delivery'),
+  selfHeal: { armed: false },
+}));
 
 import {
   closeDb,
@@ -32,10 +43,16 @@ import {
   initMigratedTestDb,
 } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
-import { createPendingApproval, createPendingQuestion } from './db/sessions.js';
+import { createPendingApproval, createPendingQuestion, getSession } from './db/sessions.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import { resolveSession } from './session-manager.js';
+import {
+  ABSOLUTE_CEILING_KILL,
+  CHAT_IDLE_REAP_KILL,
+  PROVIDER_UNAVAILABLE_KILL,
+} from './modules/sweep-continuation/kill-state.js';
+import { followUpKill } from './modules/sweep-continuation/reap-respawn.js';
+import { resolveSession, withExistingMailboxSession } from './session-manager.js';
 import { formatLocalTime } from './timezone.js';
 import { deliverSessionMessages, setDeliveryAdapter, withSessionDeliverySlot } from './delivery.js';
 import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
@@ -53,7 +70,7 @@ function now(): string {
   return new Date().toISOString();
 }
 
-async function seed(): Promise<string> {
+async function seed(threadId: string = THREAD): Promise<string> {
   await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
   await createMessagingGroup({
     id: 'mg-1',
@@ -64,7 +81,7 @@ async function seed(): Promise<string> {
     unknown_sender_policy: 'public',
     created_at: now(),
   });
-  const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+  const { session } = await resolveSession('ag-1', 'mg-1', threadId, 'per-thread');
   return session.id;
 }
 
@@ -181,6 +198,7 @@ beforeEach(async () => {
   await initMigratedTestDb();
   _clearSecretsForTest();
   _clearTaskListCooldownsForTest();
+  selfHeal.armed = false;
 });
 
 afterEach(async () => {
@@ -723,9 +741,13 @@ describe('the kill label says what is true of the session', () => {
     db.close();
   }
 
-  async function label(sessionId: string, containerName: string | null = null): Promise<unknown> {
+  async function label(
+    sessionId: string,
+    containerName: string | null = null,
+    reason: string = CHAT_IDLE_REAP_KILL,
+  ): Promise<unknown> {
     const calls = captureAdapter();
-    await settleTaskListOnKill(sessionId, 'chat-idle-reap', containerName);
+    await settleTaskListOnKill(sessionId, reason, containerName);
     expect(calls).toHaveLength(1);
     return calls[0].content.subtext;
   }
@@ -743,11 +765,142 @@ describe('the kill label says what is true of the session', () => {
     });
   }
 
-  it('stopped, when nothing is armed and nobody owes an answer', async () => {
+  function wakeRowCount(sessionId: string): number {
+    const db = new Database(inboundDbPath('ag-1', sessionId), { readonly: true });
+    try {
+      return (db.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'reap-respawn-%'").get() as { c: number })
+        .c;
+    } finally {
+      db.close();
+    }
+  }
+
+  function setOutboundState(sessionId: string, key: string, value: unknown): void {
+    const db = outbound(sessionId);
+    db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      key,
+      JSON.stringify(value),
+      now(),
+    );
+    db.close();
+  }
+
+  it('stopped, when the kill is one nothing follows up and nothing is armed', async () => {
+    selfHeal.armed = true;
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR), 'container-exit')).toBe(`stopped · ${DETAIL}`);
+  });
+
+  it('paused and resuming, when the kill follow-up is going to wake the session — and it then queues exactly one wake', async () => {
+    selfHeal.armed = true;
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const containerName = containerStartedAt(Date.now() - HOUR);
+
+    expect(await label(sessionId, containerName)).toBe(`paused · resuming · ${DETAIL}`);
+
+    expect(wakeRowCount(sessionId)).toBe(0);
+    const session = (await getSession(sessionId))!;
+    const followUp = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
+      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
+    );
+    expect(followUp).toEqual({ action: 'wake-accountable' });
+    expect(wakeRowCount(sessionId)).toBe(1);
+  });
+
+  it('stopped, when the follow-up is capped: no wake is coming', async () => {
+    selfHeal.armed = true;
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const db = new Database(inboundDbPath('ag-1', sessionId));
+    for (const id of ['reap-respawn-1790000000001', 'reap-respawn-1790000000002']) {
+      db.prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'completed', 1, ?)`,
+      ).run(id, now(), JSON.stringify({ text: '[system] earlier wake', sender: 'system', senderId: 'system' }));
+    }
+    db.close();
+    const containerName = containerStartedAt(Date.now() - HOUR);
+
+    expect(await label(sessionId, containerName)).toBe(`stopped · ${DETAIL}`);
+
+    const session = (await getSession(sessionId))!;
+    await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
+      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
+    );
+    expect(wakeRowCount(sessionId)).toBe(2);
+  });
+
+  it('stopped, in self-heal shadow mode: the wake is only logged', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
     writeListState(sessionId, CURRENT);
     expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`stopped · ${DETAIL}`);
+  });
+
+  it.each([
+    ['a ceiling kill', ABSOLUTE_CEILING_KILL],
+    ['a provider-unavailable kill', PROVIDER_UNAVAILABLE_KILL],
+  ])(
+    'paused and resuming for %s that will be woken, but stopped for the same kill of a task session',
+    async (_l, reason) => {
+      selfHeal.armed = true;
+      const sessionId = await seed();
+      seedDeliveredList(sessionId);
+      writeListState(sessionId, CURRENT);
+      expect(await label(sessionId, containerStartedAt(Date.now() - HOUR), reason)).toBe(
+        `paused · resuming · ${DETAIL}`,
+      );
+
+      const taskThread = 'system:tasks:series-nightly';
+      const { session: taskSession } = await resolveSession('ag-1', 'mg-1', taskThread, 'per-thread');
+      seedDeliveredList(taskSession.id, { threadId: taskThread });
+      writeListState(taskSession.id, { ...CURRENT, threadId: taskThread });
+      expect(await label(taskSession.id, containerStartedAt(Date.now() - HOUR), reason)).toBe(`stopped · ${DETAIL}`);
+    },
+  );
+
+  it('paused and resuming, when a saved continuation will bring the session back', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    setOutboundState(sessionId, 'work_continuation', {
+      id: 'cont-1',
+      task: 'finish the rehearsal',
+      phase: 'queued',
+      chain: 1,
+      resume_attempts: 0,
+    });
+    expect(await label(sessionId)).toBe(`paused · resuming · ${DETAIL}`);
+  });
+
+  it('keeps the runner’s label for a parked continuation: armed against a wake, but not coming back', async () => {
+    selfHeal.armed = true;
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    setOutboundState(sessionId, 'work_continuation', {
+      id: 'cont-1',
+      task: 'finish the rehearsal',
+      phase: 'queued',
+      chain: 1,
+      resume_attempts: 2,
+      runner_id: 'runner-1',
+    });
+    const containerName = containerStartedAt(Date.now() - HOUR);
+
+    expect(await label(sessionId, containerName)).toBe(`stopped · ${DETAIL}`);
+
+    const session = (await getSession(sessionId))!;
+    const followUp = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
+      followUpKill(mailbox, session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: 15 }),
+    );
+    expect(followUp).toEqual({ action: 'none', reason: 'armed' });
+    expect(wakeRowCount(sessionId)).toBe(0);
   });
 
   it('paused with the next check, in the group’s timezone, when a wake is armed for later', async () => {
@@ -829,20 +982,27 @@ describe('the kill label says what is true of the session', () => {
     expect(await label(sessionId, null)).toBe(`stopped · ${DETAIL}`);
   });
 
-  it('an armed wake outranks an open card', async () => {
+  it('an open card outranks an armed wake, timed or not', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
     writeListState(sessionId, CURRENT);
     const startedAt = Date.now() - HOUR;
     await approvalCard(sessionId, startedAt + 60_000);
+    insertInbound(sessionId, { id: 'wait-1', processAfter: new Date(Date.now() + HOUR).toISOString() });
+    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${DETAIL}`);
     insertInbound(sessionId, { id: 'due-1' });
-    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`paused · resuming · ${DETAIL}`);
+    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${DETAIL}`);
   });
 
   it('keeps the runner’s own label when every open item waits on someone', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
-    writeListState(sessionId, { ...CURRENT, interruptedSubtext: `waiting on Dana · ${DETAIL}` });
+    selfHeal.armed = true;
+    writeListState(sessionId, {
+      ...CURRENT,
+      items: [{ text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana' }],
+      interruptedSubtext: `waiting on Dana · ${DETAIL}`,
+    });
     expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`waiting on Dana · ${DETAIL}`);
   });
 
@@ -851,6 +1011,18 @@ describe('the kill label says what is true of the session', () => {
     seedDeliveredList(sessionId);
     insertInbound(sessionId, { id: 'wait-1', processAfter: new Date(Date.now() + HOUR).toISOString() });
     expect(await label(sessionId)).toBe('stopped · todos as of <!date^1^{time} ({ago})|3:00 PM>');
+  });
+
+  it('still marks the list interrupted, under the runner’s label, when the session state cannot be read', async () => {
+    selfHeal.armed = true;
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const db = outbound(sessionId);
+    db.exec('DROP TABLE processing_ack');
+    db.close();
+
+    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`stopped · ${DETAIL}`);
   });
 
   it('scrubs a registered secret from the part of the label the container wrote', async () => {

@@ -36,6 +36,7 @@ import {
   type SessionRunner,
 } from '../../host-sweep.js';
 import { decideCeilingFollowUp, type CeilingFollowUp } from './decide.js';
+import { ABSOLUTE_CEILING_KILL } from './kill-state.js';
 import { ACCOUNT_FOR_STATE, followUpKill, RESTART_SURVIVAL_RULES } from './reap-respawn.js';
 
 export { decideCeilingFollowUp, type CeilingFollowUp } from './decide.js';
@@ -604,7 +605,7 @@ function registerContinuationSweepDuties(): void {
       // After the branch above, so a wake it queued counts as armed here.
       try {
         await followUpKill(mailbox, ctx.session, ctx.observed?.containerIdentity?.containerName ?? null, {
-          reason: 'absolute-ceiling',
+          reason: ABSOLUTE_CEILING_KILL,
           minutes: Math.round(Math.max(outcome.ceilingMs, ABSOLUTE_CEILING_MS) / 60_000),
         });
       } catch (err) {

@@ -1,13 +1,33 @@
 /**
  * What is true of a session whose container was just stopped: when that container started, what already stands to
- * bring the session back, and whether a human owes it an answer. Shared by the promise watch, the kill follow-up
- * and the task list's kill label so they cannot disagree. Free of top-level side effects.
+ * bring the session back, whether a human owes it an answer, and so what the kill follow-up will do. Shared by the
+ * promise watch, the kill follow-up and the task list's kill label so they cannot disagree. Free of top-level side
+ * effects, and of any import that reaches container-runner.ts or host-sweep.ts: task-list-host.ts loads this, and
+ * both of those load task-list-host.ts.
  */
-import { CONTAINER_NAME_PREFIX } from '../../config.js';
+import { CONTAINER_NAME_PREFIX, SELF_HEAL_ENABLED } from '../../config.js';
 import { withRawDb } from '../../db/central-lease.js';
-import type { NanoclawMailboxSession } from '../mailbox/index.js';
+import { isTaskThread, SESSION_BY_ID_SQL } from '../../db/sessions.js';
+import type { Session } from '../../types.js';
+import type { NanoclawMailboxSession, TaskListInFlight, WorktreeInFlight } from '../mailbox/index.js';
+import { isContinuationParked, WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
 
 export const REAP_RESPAWN_ID_PREFIX = 'reap-respawn-';
+
+export const CHAT_IDLE_REAP_KILL = 'chat-idle-reap';
+export const ABSOLUTE_CEILING_KILL = 'absolute-ceiling';
+export const PROVIDER_UNAVAILABLE_KILL = 'provider unavailable — respawning on fallback';
+
+/**
+ * The only kills that may queue the follow-up wake, keyed by the reason `killContainer` is given, with how the note
+ * names each. Every other stop is one somebody asked for (a restart, a self-mod respawn, a repository-mount change)
+ * or a task session's normal exit.
+ */
+export const STRANDING_KILLS: ReadonlyMap<string, (minutes: number | undefined) => string> = new Map([
+  [CHAT_IDLE_REAP_KILL, (minutes) => `was stopped by the ${minutes}-minute chat idle reap after your turn ended`],
+  [ABSOLUTE_CEILING_KILL, (minutes) => `was killed by the ${minutes}-minute idle ceiling`],
+  [PROVIDER_UNAVAILABLE_KILL, () => `was stopped mid-turn because its model provider became unavailable`],
+]);
 
 /**
  * The instant the spawn minted this container's name, which is before the container started. Unlike the registry's
@@ -45,34 +65,41 @@ export function armedBy(state: ArmedState): ArmedBy | null {
   return null;
 }
 
-export interface KillArmed {
+interface KillArmed {
   by: ArmedBy | 'wake-deferred' | 'claimed';
   /** Set only when the next thing to happen is a wake at a known future time. */
   nextCheckAt: string | null;
+  /** A saved continuation whose attempts are spent: nothing else will wake the session, but it is not coming back. */
+  parked: boolean;
 }
 
 /**
  * The kill follow-up's own unadmitted rows are left out: one row per kill is its id's job and the count is its
  * cap's, so an earlier one still pending must not read as "already coming back".
  */
-export function readKillArmed(mailbox: NanoclawMailboxSession): KillArmed | null {
+function readKillArmed(mailbox: NanoclawMailboxSession): KillArmed | null {
   const state = readArmedState(mailbox);
   const by =
     armedBy(state) ??
     (mailbox.hasPendingRecallPairedTrigger(REAP_RESPAWN_ID_PREFIX) ? 'wake-deferred' : null) ??
     (mailbox.getProcessingClaimRows().length > 0 ? 'claimed' : null);
   if (!by) return null;
-  return { by, nextCheckAt: by === 'wake-pending' ? state.nextFutureProcessAfter : null };
+  const continuation = by === 'continuation-saved' ? mailbox.readWorkContinuation() : null;
+  return {
+    by,
+    nextCheckAt: by === 'wake-pending' ? state.nextFutureProcessAfter : null,
+    parked: continuation !== null && isContinuationParked(continuation),
+  };
 }
 
-export type OpenCard = 'approval' | 'question';
+type OpenCard = 'approval' | 'question';
 
 /**
  * Call inside `withCentralSync`. A resolved approval or answered question is deleted, so a row that exists is
  * unanswered — but one nobody ever answers is never pruned, so only a card posted during the killed container's
  * life counts: an abandoned card from months ago would otherwise speak for this session for good.
  */
-export function openCardSince(sessionId: string, sinceIso: string, nowIso: string): OpenCard | null {
+function openCardSince(sessionId: string, sinceIso: string, nowIso: string): OpenCard | null {
   const row = withRawDb(
     (db) =>
       db
@@ -91,4 +118,146 @@ export function openCardSince(sessionId: string, sinceIso: string, nowIso: strin
         .get({ id: sessionId, since: sinceIso, now: nowIso }) as { card: OpenCard } | undefined,
   );
   return row?.card ?? null;
+}
+
+export interface KillEvidence {
+  checkouts: WorktreeInFlight['checkouts'];
+  unfinished: TaskListInFlight['unfinished'];
+  waiting: number;
+  /** Something was recorded, all of it by an earlier container. */
+  stale: boolean;
+}
+
+const NO_EVIDENCE: KillEvidence = { checkouts: [], unfinished: [], waiting: 0, stale: false };
+
+/** A record stamped before the killed container started was left by an earlier one and must never wake the session. */
+function readKillEvidence(mailbox: NanoclawMailboxSession, startedAtMs: number): KillEvidence {
+  const worktree = mailbox.readWorktreeInFlight();
+  const list = mailbox.readTaskListInFlight();
+  const during = (at: string): boolean => Date.parse(at) >= startedAtMs;
+  const checkouts = worktree && during(worktree.at) ? worktree.checkouts : [];
+  const fresh = list && during(list.at) ? list : null;
+  const unfinished = fresh?.unfinished ?? [];
+  const recorded = (worktree?.checkouts.length ?? 0) + (list?.unfinished.length ?? 0);
+  return {
+    checkouts,
+    unfinished,
+    waiting: fresh?.waiting ?? 0,
+    stale: recorded > 0 && checkouts.length + unfinished.length === 0,
+  };
+}
+
+/**
+ * The sweep never wakes a closed or archived session, so a row there would sit due forever. The same three
+ * conditions as the wake path's own gate in container-runner.ts, which this file cannot import.
+ */
+function takesAWake(sessionId: string): boolean {
+  const row = withRawDb((db) => db.prepare(SESSION_BY_ID_SQL).get(sessionId) as Session | undefined);
+  return row?.status === 'active' && row.archived_at == null;
+}
+
+export type ReapFollowUp =
+  | {
+      action: 'none';
+      reason:
+        | 'reason-not-covered'
+        | 'task-session'
+        | 'nothing-in-flight'
+        | 'stale-evidence'
+        | 'armed'
+        | 'not-wakeable'
+        | 'human-pending'
+        | 'capped'
+        | 'shadow';
+    }
+  | { action: 'wake-accountable' };
+
+/**
+ * The evidence half: recency is already applied by whoever counted it, and `staleEvidence` says only that some was
+ * recorded by an earlier container.
+ */
+export function decideReapFollowUp(args: {
+  inFlightCheckouts: number;
+  unfinishedItems?: number;
+  staleEvidence?: boolean;
+  armed?: boolean;
+  wakeable?: boolean;
+  humanPending?: boolean;
+  priorAttempts: number;
+}): ReapFollowUp {
+  if (args.inFlightCheckouts + (args.unfinishedItems ?? 0) === 0) {
+    return { action: 'none', reason: args.staleEvidence ? 'stale-evidence' : 'nothing-in-flight' };
+  }
+  if (args.armed) return { action: 'none', reason: 'armed' };
+  if (args.wakeable === false) return { action: 'none', reason: 'not-wakeable' };
+  if (args.humanPending) return { action: 'none', reason: 'human-pending' };
+  if (args.priorAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none', reason: 'capped' };
+  return { action: 'wake-accountable' };
+}
+
+/**
+ * What the kill follow-up will do, from everything readable at the kill. Pure, so the task list's kill label can ask
+ * the same question before the follow-up runs and the two cannot disagree.
+ */
+function decideKillFollowUp(args: {
+  reasonCovered: boolean;
+  taskSession: boolean;
+  inFlightCheckouts: number;
+  unfinishedItems: number;
+  staleEvidence: boolean;
+  armed: boolean;
+  wakeable: boolean;
+  humanPending: boolean;
+  priorAttempts: number;
+  selfHeal: boolean;
+}): ReapFollowUp {
+  if (!args.reasonCovered) return { action: 'none', reason: 'reason-not-covered' };
+  // A scheduled series fires again by itself, and a wake row in its session is behaviour nobody has verified.
+  if (args.taskSession) return { action: 'none', reason: 'task-session' };
+  const followUp = decideReapFollowUp(args);
+  if (followUp.action === 'wake-accountable' && !args.selfHeal) return { action: 'none', reason: 'shadow' };
+  return followUp;
+}
+
+export interface KillPrediction {
+  followUp: ReapFollowUp;
+  /** Null when the registry never named the container: nothing can be dated, so nothing is attributable. */
+  startedAtMs: number | null;
+  evidence: KillEvidence;
+  armed: KillArmed | null;
+  openCard: OpenCard | null;
+  priorAttempts: number;
+}
+
+/**
+ * What the kill follow-up will decide for this kill, and what it read to decide it. No writes. Call inside
+ * `withCentralSync`. `containerName` is read before the kill (the registry entry is gone after exit).
+ */
+export function predictKillFollowUp(
+  mailbox: NanoclawMailboxSession,
+  session: Session,
+  containerName: string | null,
+  reason: string,
+): KillPrediction {
+  const startedAtMs = containerStartedAtMs(containerName);
+  const armed = readKillArmed(mailbox);
+  const dated = startedAtMs !== null;
+  const evidence = dated ? readKillEvidence(mailbox, startedAtMs) : NO_EVIDENCE;
+  const openCard = dated
+    ? openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString())
+    : null;
+  const priorAttempts = dated ? mailbox.countRecoveryAttemptsSinceRealInbound(REAP_RESPAWN_ID_PREFIX) : 0;
+  const followUp = decideKillFollowUp({
+    reasonCovered: STRANDING_KILLS.has(reason),
+    taskSession: isTaskThread(session.thread_id),
+    inFlightCheckouts: evidence.checkouts.length,
+    unfinishedItems: evidence.unfinished.length,
+    staleEvidence: evidence.stale,
+    armed: armed !== null,
+    wakeable: dated && takesAWake(session.id),
+    humanPending: openCard !== null,
+    priorAttempts,
+    selfHeal: SELF_HEAL_ENABLED,
+  });
+  return { followUp, startedAtMs, evidence, armed, openCard, priorAttempts };
 }

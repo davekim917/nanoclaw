@@ -4,6 +4,7 @@
  */
 import { type SweepSessionContext } from '../../host-sweep.js';
 import { log } from '../../log.js';
+import { CHAT_IDLE_REAP_KILL } from '../sweep-continuation/kill-state.js';
 import { followUpKill } from '../sweep-continuation/reap-respawn.js';
 
 export { containerStartedAtMs } from '../sweep-continuation/kill-state.js';
@@ -14,7 +15,7 @@ async function followUpChatReap(
   idleMinutes: number,
 ): Promise<void> {
   await ctx.runIn('session:health:post-kill', (mailbox) =>
-    followUpKill(mailbox, ctx.session, containerName, { reason: 'chat-idle-reap', minutes: idleMinutes }),
+    followUpKill(mailbox, ctx.session, containerName, { reason: CHAT_IDLE_REAP_KILL, minutes: idleMinutes }),
   );
 }
 

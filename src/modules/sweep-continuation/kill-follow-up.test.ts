@@ -84,6 +84,7 @@ vi.mock('../../container-config.js', async (importOriginal) => {
 });
 
 import './index.js';
+import { ABSOLUTE_CEILING_KILL, PROVIDER_UNAVAILABLE_KILL } from './kill-state.js';
 import { followUpKill } from './reap-respawn.js';
 import { CHAT_IDLE_REAP_MS } from '../sweep-idle-reap/index.js';
 import { _settleChatReapFollowUpsForTesting } from '../sweep-idle-reap/reap-follow-up.js';
@@ -107,7 +108,10 @@ import {
   deletePendingQuestion,
   getSession,
   TASKS_SYSTEM_THREAD_ID,
+  updateSession,
 } from '../../db/sessions.js';
+import { withCentralSync } from '../../db/central-lease.js';
+import { sessionStillActive } from '../../container-runner.js';
 import { registerAgentMailbox, resetAgentMailboxForTesting } from '../../mailbox/index.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
 import { WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
@@ -742,6 +746,21 @@ describe('nothing is queued when the session is already coming back', () => {
     await expectArmed('continuation-saved');
   });
 
+  it('a parked continuation, which nothing will resume but which the operator was already told about', async () => {
+    setState(
+      'work_continuation',
+      JSON.stringify({
+        id: 'cont-1',
+        task: 'finish the rehearsal',
+        phase: 'queued',
+        chain: 1,
+        resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+        runner_id: 'runner-1',
+      }),
+    );
+    await expectArmed('continuation-saved');
+  });
+
   it("another recovery wake that due admission has not reached yet (the ceiling path's own row)", async () => {
     writeSystemWake(mailbox, await session(), 'ceiling-respawn-tool-fictional', '[system] ceiling', {
       kind: 'agent_ceiling_respawn',
@@ -934,6 +953,7 @@ describe('kills that never queue a wake', () => {
     'repository mount quiescence failed',
     'claim-stuck',
     'container-exit',
+    'provider-unavailable',
     'constructor',
   ])('reason %s is refused even if a caller asks', async (reason) => {
     const startedAt = Date.now() - HOUR;
@@ -945,7 +965,9 @@ describe('kills that never queue a wake', () => {
 
     expect(followUp).toEqual({ action: 'none', reason: 'reason-not-covered' });
     expect(wakeRows()).toHaveLength(0);
-    expect(decisions(info)).toEqual([{ sessionId: SESSION_ID, killReason: reason, outcome: 'reason-not-covered' }]);
+    expect(decisions(info)).toEqual([
+      expect.objectContaining({ sessionId: SESSION_ID, killReason: reason, outcome: 'reason-not-covered' }),
+    ]);
   });
 
   it('a claim-stuck kill does not reach the follow-up through the ceiling duty', async () => {
@@ -987,7 +1009,12 @@ describe('kills that never queue a wake', () => {
 
       expect(wakeRows()).toHaveLength(0);
       expect(decisions(info)).toEqual([
-        { sessionId: TASK_SESSION, killReason: 'absolute-ceiling', outcome: 'task-session' },
+        expect.objectContaining({
+          sessionId: TASK_SESSION,
+          killReason: ABSOLUTE_CEILING_KILL,
+          evidence: ['task-list'],
+          outcome: 'task-session',
+        }),
       ]);
     });
 
@@ -1001,26 +1028,52 @@ describe('kills that never queue a wake', () => {
       expect(h.respawns).toEqual([TASK_SESSION]);
       expect(wakeRows()).toHaveLength(0);
       expect(decisions(info)).toEqual([
-        { sessionId: TASK_SESSION, killReason: 'provider-unavailable', outcome: 'task-session' },
+        expect.objectContaining({
+          sessionId: TASK_SESSION,
+          killReason: PROVIDER_UNAVAILABLE_KILL,
+          evidence: ['task-list'],
+          outcome: 'task-session',
+        }),
       ]);
     });
   });
 
-  it('an archived session, which the sweep never wakes, gets no row', async () => {
-    const startedAt = Date.now() - HOUR;
-    recordList(startedAt + 60_000);
-    await archiveSessionById(SESSION_ID);
-    const info = vi.spyOn(log, 'info');
+  it.each([
+    ['active', async (): Promise<void> => undefined, 'wake'],
+    [
+      'archived',
+      async (): Promise<void> => {
+        await archiveSessionById(SESSION_ID);
+      },
+      'not-wakeable',
+    ],
+    [
+      'closed',
+      async (): Promise<void> => {
+        await updateSession(SESSION_ID, { status: 'closed' });
+      },
+      'not-wakeable',
+    ],
+  ] as const)(
+    'a session that is %s gets a row exactly when the wake path would take the wake',
+    async (_state, arrange, outcome) => {
+      const startedAt = Date.now() - HOUR;
+      recordList(startedAt + 60_000);
+      await arrange();
+      const info = vi.spyOn(log, 'info');
 
-    await chatReap(startedAt);
+      await chatReap(startedAt);
 
-    expect(wakeRows()).toHaveLength(0);
-    expect(decisions(info)).toEqual([expect.objectContaining({ outcome: 'not-wakeable' })]);
-  });
+      const takesWake = (await withCentralSync(() => sessionStillActive(SESSION_ID)())) === true;
+      expect(takesWake).toBe(outcome === 'wake');
+      expect(wakeRows()).toHaveLength(takesWake ? 1 : 0);
+      expect(decisions(info)).toEqual([expect.objectContaining({ outcome })]);
+    },
+  );
 
   it('a kill of a container the registry never named is not attributable', async () => {
     recordList(Date.now());
-    const followUp = await followUpKill(mailbox, await session(), null, { reason: 'provider-unavailable' });
+    const followUp = await followUpKill(mailbox, await session(), null, { reason: PROVIDER_UNAVAILABLE_KILL });
     expect(followUp).toEqual({ action: 'none', reason: 'nothing-in-flight' });
     expect(wakeRows()).toHaveLength(0);
   });

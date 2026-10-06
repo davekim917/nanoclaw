@@ -38,39 +38,4 @@ export function decideCeilingFollowUp(args: {
   return { action: 'wake-accountable', reason: 'tool' };
 }
 
-export type ReapFollowUp =
-  | {
-      action: 'none';
-      reason:
-        | 'reason-not-covered'
-        | 'task-session'
-        | 'nothing-in-flight'
-        | 'stale-evidence'
-        | 'armed'
-        | 'human-pending'
-        | 'not-wakeable'
-        | 'capped'
-        | 'shadow';
-    }
-  | { action: 'wake-accountable' };
-
-/**
- * The kill counterpart: recency is already applied by whoever counted the evidence, and `staleEvidence` says only
- * that some was recorded by an earlier container.
- */
-export function decideReapFollowUp(args: {
-  inFlightCheckouts: number;
-  unfinishedItems?: number;
-  staleEvidence?: boolean;
-  armed?: boolean;
-  humanPending?: boolean;
-  priorAttempts: number;
-}): ReapFollowUp {
-  if (args.inFlightCheckouts + (args.unfinishedItems ?? 0) === 0) {
-    return { action: 'none', reason: args.staleEvidence ? 'stale-evidence' : 'nothing-in-flight' };
-  }
-  if (args.armed) return { action: 'none', reason: 'armed' };
-  if (args.humanPending) return { action: 'none', reason: 'human-pending' };
-  if (args.priorAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none', reason: 'capped' };
-  return { action: 'wake-accountable' };
-}
+export { decideReapFollowUp, type ReapFollowUp } from './kill-state.js';

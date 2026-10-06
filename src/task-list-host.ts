@@ -10,12 +10,7 @@ import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
 import type { TaskListSettlement } from './modules/mailbox/ops/lookups.js';
-import {
-  containerStartedAtMs,
-  openCardSince,
-  readKillArmed,
-  type KillArmed,
-} from './modules/sweep-continuation/kill-state.js';
+import { predictKillFollowUp, type KillPrediction } from './modules/sweep-continuation/kill-state.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import { formatLocalTime } from './timezone.js';
@@ -50,33 +45,24 @@ const KILL_EDIT_MAX_WAIT_MS = 5 * 60_000;
 const KILL_EDIT_WAIT_BUFFER_MS = 250;
 
 /**
- * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host
- * knows more: a session with a wake armed is paused, and one with an unanswered card is waiting on that. Host
- * literals and a formatted time only; a runner that predates `interruptedDetail` keeps its own label.
+ * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host knows
+ * more, in this order: an unanswered card the killed container posted, a wake already armed, and a wake the kill
+ * follow-up is about to queue. Host literals and a formatted time only; a runner that predates `interruptedDetail`
+ * keeps its own label, and so does a session held only by a parked continuation.
  */
 async function killSubtext(
   session: Session,
   edit: NonNullable<TaskListSettlement['edit']>,
-  armed: KillArmed | null,
-  containerName: string | null,
+  prediction: KillPrediction | null,
 ): Promise<string> {
-  if (edit.interruptedDetail === null) return edit.interruptedSubtext;
+  if (edit.interruptedDetail === null || prediction === null) return edit.interruptedSubtext;
+  const { openCard, armed, followUp } = prediction;
   let state: string | null = null;
-  if (armed) {
-    state = armed.nextCheckAt
-      ? `paused · next check ${formatLocalTime(armed.nextCheckAt, await resolveGroupTimezone(session.agent_group_id))}`
-      : 'paused · resuming';
-  } else {
-    const startedAtMs = containerStartedAtMs(containerName);
-    const card =
-      startedAtMs === null
-        ? null
-        : await withCentralSync(
-            () => openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString()),
-            'task list kill label',
-          );
-    if (card) state = card === 'approval' ? 'waiting on an approval' : 'waiting on an answer';
-  }
+  if (openCard) state = openCard === 'approval' ? 'waiting on an approval' : 'waiting on an answer';
+  else if (armed?.nextCheckAt) {
+    const timezone = await resolveGroupTimezone(session.agent_group_id);
+    state = `paused · next check ${formatLocalTime(armed.nextCheckAt, timezone)}`;
+  } else if (armed ? !armed.parked : followUp.action === 'wake-accountable') state = 'paused · resuming';
   return state === null ? edit.interruptedSubtext : `${state} · ${edit.interruptedDetail}`;
 }
 
@@ -103,10 +89,20 @@ export async function settleTaskListOnKill(
       const waitMs = await withSessionDeliverySlot(sessionId, async (): Promise<number> => {
         const adapter = getDeliveryAdapter();
         if (!adapter) return 0;
-        const settlement = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+        const settlement = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
           const found = mailbox.getTaskListSettlement(killedAt);
-          if (found) for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
-          return found && { ...found, armed: found.edit ? readKillArmed(mailbox) : null };
+          if (!found) return null;
+          for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
+          if (!found.edit) return { ...found, prediction: null };
+          // A label that cannot be worked out must not cost the list its interrupted form.
+          const prediction = await withCentralSync(
+            () => predictKillFollowUp(mailbox, session, containerName, reason),
+            'task list kill label',
+          ).catch((err: unknown) => {
+            log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId, reason, err });
+            return null;
+          });
+          return { ...found, prediction };
         });
         const edit = settlement?.edit;
         if (!edit) return 0;
@@ -123,14 +119,14 @@ export async function settleTaskListOnKill(
         }
         const cooling = taskListCooldownMs(edit.channelType);
         if (cooling > 0) return cooling;
-        const subtext = await killSubtext(session, edit, settlement.armed, containerName);
+        const subtext = await killSubtext(session, edit, settlement.prediction);
         try {
           await adapter.deliver(
             edit.channelType,
             edit.platformId,
             edit.threadId,
             'task_list',
-            // Both fields are container-written.
+            // Container-written but for the subtext's leading state.
             scrubSecrets(
               JSON.stringify({
                 operation: 'edit',

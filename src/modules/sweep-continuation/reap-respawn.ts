@@ -1,20 +1,18 @@
 /**
  * Kill accountability: an agent whose container is stopped while it still owes work (edits only on disk, a task list
- * with items not done) and with nothing armed to bring it back sits until a human pings. Same row machinery and cap
- * as the ceiling wake. Kept free of top-level side effects so other families can import it without registering this
- * one. The host never inspects checkouts or the list itself; the runner writes both records.
+ * with items it can still move) and with nothing armed to bring it back sits until a human pings. Same row machinery
+ * and cap as the ceiling wake; the decision itself is kill-state.ts's, this file writes the note. Kept free of
+ * top-level side effects so other families can import it without registering this one.
  */
-import { SELF_HEAL_ENABLED } from '../../config.js';
-import { sessionStillActive } from '../../container-runner.js';
 import { withCentralSync } from '../../db/central-lease.js';
-import { isTaskThread, withQuietInvalidationSync } from '../../db/sessions.js';
+import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { writeOutboundWhenStopped, writeSystemWake } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import type { NanoclawMailboxSession, TaskListInFlight, WorktreeInFlight } from '../mailbox/index.js';
+import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import { WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
-import { decideReapFollowUp, type ReapFollowUp } from './decide.js';
-import { containerStartedAtMs, openCardSince, readKillArmed, REAP_RESPAWN_ID_PREFIX } from './kill-state.js';
+import type { ReapFollowUp } from './decide.js';
+import { predictKillFollowUp, REAP_RESPAWN_ID_PREFIX, STRANDING_KILLS, type KillEvidence } from './kill-state.js';
 
 export const ACCOUNT_FOR_STATE = 'post ONE message accounting for state — done / lost / next';
 
@@ -30,41 +28,6 @@ const CONTAINER_WORKTREES_DIR = '/workspace/worktrees';
 export interface StrandingKill {
   reason: string;
   minutes?: number;
-}
-
-/**
- * The only kills that may queue the wake, and how the note names each. Every other stop is one somebody asked for
- * (a restart, a self-mod respawn, a repository-mount change) or a task session's normal exit.
- */
-const STRANDING_KILLS: ReadonlyMap<string, (kill: StrandingKill) => string> = new Map([
-  ['chat-idle-reap', (kill) => `was stopped by the ${kill.minutes}-minute chat idle reap after your turn ended`],
-  ['absolute-ceiling', (kill) => `was killed by the ${kill.minutes}-minute idle ceiling`],
-  ['provider-unavailable', () => `was stopped mid-turn because its model provider became unavailable`],
-]);
-
-interface KillEvidence {
-  checkouts: WorktreeInFlight['checkouts'];
-  unfinished: TaskListInFlight['unfinished'];
-  waiting: number;
-  /** Something was recorded, all of it by an earlier container. */
-  stale: boolean;
-}
-
-/** A record stamped before the killed container started was left by an earlier one and must never wake the session. */
-function readKillEvidence(mailbox: NanoclawMailboxSession, startedAtMs: number): KillEvidence {
-  const worktree = mailbox.readWorktreeInFlight();
-  const list = mailbox.readTaskListInFlight();
-  const during = (at: string): boolean => Date.parse(at) >= startedAtMs;
-  const checkouts = worktree && during(worktree.at) ? worktree.checkouts : [];
-  const fresh = list && during(list.at) ? list : null;
-  const unfinished = fresh?.unfinished ?? [];
-  const recorded = (worktree?.checkouts.length ?? 0) + (list?.unfinished.length ?? 0);
-  return {
-    checkouts,
-    unfinished,
-    waiting: fresh?.waiting ?? 0,
-    stale: recorded > 0 && checkouts.length + unfinished.length === 0,
-  };
 }
 
 function describeCheckouts(checkouts: KillEvidence['checkouts']): string {
@@ -134,9 +97,9 @@ function wakeText(cause: string, evidence: KillEvidence): string {
 }
 
 /**
- * Call after the killed container has exited, with `containerName` read before the kill (the registry entry is gone
- * after exit). The write sits under the outbound guard although the row is inbound: a replacement that already took
- * the session is handling the thread, and the row would greet the NEXT container with a stale notice.
+ * Applies the kill's predicted follow-up. Call after the killed container has exited. The decision and the write are
+ * one synchronous block; the write sits under the outbound guard although the row is inbound: a replacement that
+ * already took the session is handling the thread, and the row would greet the NEXT container with a stale notice.
  */
 export async function followUpKill(
   mailbox: NanoclawMailboxSession,
@@ -144,82 +107,64 @@ export async function followUpKill(
   containerName: string | null,
   kill: StrandingKill,
 ): Promise<ReapFollowUp> {
-  const fields: Record<string, unknown> = { sessionId: session.id, killReason: kill.reason };
-  const decided = (followUp: ReapFollowUp): ReapFollowUp => {
-    log.info('Kill follow-up decided', { ...fields, outcome: followUp.action === 'none' ? followUp.reason : 'wake' });
-    return followUp;
-  };
-  const cause = STRANDING_KILLS.get(kill.reason);
-  if (!cause) return decided({ action: 'none', reason: 'reason-not-covered' });
-  // A scheduled series fires again by itself, and a wake row in its session is behaviour nobody has verified.
-  if (isTaskThread(session.thread_id)) return decided({ action: 'none', reason: 'task-session' });
-  const startedAtMs = containerStartedAtMs(containerName);
-  if (startedAtMs === null) return decided({ action: 'none', reason: 'nothing-in-flight' });
-
-  const evidence = readKillEvidence(mailbox, startedAtMs);
-  const checkouts = evidence.checkouts.map((checkout) => checkout.name);
-  fields.evidence = [
-    ...(evidence.checkouts.length > 0 ? ['worktree'] : []),
-    ...(evidence.unfinished.length > 0 ? ['task-list'] : []),
-  ];
-  fields.checkouts = checkouts;
-  fields.unfinishedItems = evidence.unfinished.length;
-  fields.waitingItems = evidence.waiting;
-  const inFlight = {
-    inFlightCheckouts: evidence.checkouts.length,
-    unfinishedItems: evidence.unfinished.length,
-    staleEvidence: evidence.stale,
-  };
-  const armed = inFlight.inFlightCheckouts + inFlight.unfinishedItems > 0 ? readKillArmed(mailbox) : null;
-  if (armed) fields.armedBy = armed.by;
-  const early = decideReapFollowUp({ ...inFlight, armed: armed !== null, priorAttempts: 0 });
-  if (early.action === 'none') return decided(early);
-
-  fields.maxAttempts = WORK_CONTINUATION_RESUME_MAX_ATTEMPTS;
-  const followUp = await withCentralSync(
-    () =>
-      writeOutboundWhenStopped(session, mailbox, (): ReapFollowUp => {
-        // The sweep never wakes a closed or archived session, so the row would sit due forever.
-        if (sessionStillActive(session.id)() !== true) return { action: 'none', reason: 'not-wakeable' };
-        const priorAttempts = mailbox.countRecoveryAttemptsSinceRealInbound(REAP_RESPAWN_ID_PREFIX);
-        fields.priorAttempts = priorAttempts;
-        const decision = decideReapFollowUp({
-          ...inFlight,
-          humanPending:
-            openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString()) !== null,
-          priorAttempts,
+  return withCentralSync((): ReapFollowUp => {
+    const { followUp, startedAtMs, evidence, armed, priorAttempts } = predictKillFollowUp(
+      mailbox,
+      session,
+      containerName,
+      kill.reason,
+    );
+    const checkouts = evidence.checkouts.map((checkout) => checkout.name);
+    const fields: Record<string, unknown> = {
+      sessionId: session.id,
+      killReason: kill.reason,
+      evidence: [
+        ...(evidence.checkouts.length > 0 ? ['worktree'] : []),
+        ...(evidence.unfinished.length > 0 ? ['task-list'] : []),
+      ],
+      checkouts,
+      unfinishedItems: evidence.unfinished.length,
+      waitingItems: evidence.waiting,
+      priorAttempts,
+      maxAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+    };
+    const decided = (outcome: ReapFollowUp, armedBy?: string): ReapFollowUp => {
+      log.info('Kill follow-up decided', {
+        ...fields,
+        ...(armedBy ? { armedBy } : {}),
+        outcome: outcome.action === 'none' ? outcome.reason : 'wake',
+      });
+      return outcome;
+    };
+    if (followUp.action === 'none') {
+      if (followUp.reason === 'shadow') {
+        log.info('self-heal: would queue chat-reap accountability wake', {
+          class: 'killed-with-work-in-flight',
+          ...fields,
         });
-        if (decision.action === 'none') return decision;
-        if (!SELF_HEAL_ENABLED) {
-          log.info('self-heal: would queue chat-reap accountability wake', {
-            class: 'killed-with-work-in-flight',
-            ...fields,
-          });
-          return { action: 'none', reason: 'shadow' };
-        }
-        // A tick may have quiet-marked this stopped session since the kill; the mark must die with the write.
-        const written = withQuietInvalidationSync(session.id, () =>
-          writeSystemWake(
-            mailbox,
-            session,
-            `${REAP_RESPAWN_ID_PREFIX}${startedAtMs}`,
-            wakeText(cause(kill), evidence),
-            {
-              kind: 'agent_reap_respawn',
-              checkouts,
-              ...(evidence.unfinished.length > 0 ? { unfinished_items: evidence.unfinished.length } : {}),
-            },
-          ),
-        );
-        if (written) return decision;
-        fields.armedBy = 'already-queued';
-        return { action: 'none', reason: 'armed' };
-      }),
-    'kill follow-up',
-  );
-  if (followUp === undefined) {
-    fields.armedBy = 'replacement-container';
-    return decided({ action: 'none', reason: 'armed' });
-  }
-  return decided(followUp);
+      }
+      return decided(followUp, followUp.reason === 'armed' ? armed?.by : undefined);
+    }
+    const cause = STRANDING_KILLS.get(kill.reason);
+    if (!cause || startedAtMs === null) throw new Error('kill follow-up predicted a wake for a kill it cannot name');
+    const written = writeOutboundWhenStopped(session, mailbox, () =>
+      // A tick may have quiet-marked this stopped session since the kill; the mark must die with the write.
+      withQuietInvalidationSync(session.id, () =>
+        writeSystemWake(
+          mailbox,
+          session,
+          `${REAP_RESPAWN_ID_PREFIX}${startedAtMs}`,
+          wakeText(cause(kill.minutes), evidence),
+          {
+            kind: 'agent_reap_respawn',
+            checkouts,
+            ...(evidence.unfinished.length > 0 ? { unfinished_items: evidence.unfinished.length } : {}),
+          },
+        ),
+      ),
+    );
+    if (written === undefined) return decided({ action: 'none', reason: 'armed' }, 'replacement-container');
+    if (!written) return decided({ action: 'none', reason: 'armed' }, 'already-queued');
+    return decided(followUp);
+  }, 'kill follow-up');
 }

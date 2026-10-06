@@ -14,6 +14,7 @@ import { log } from '../../log.js';
 import { resolveSpawnProvider } from '../../provider-fallback.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { PROVIDER_UNAVAILABLE_KILL } from '../sweep-continuation/kill-state.js';
 import { followUpKill } from '../sweep-continuation/reap-respawn.js';
 
 function str(value: unknown): string | undefined {
@@ -105,7 +106,7 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
   const containerName = containerIdentityFor(session.id)?.containerName ?? null;
   killContainer(
     session.id,
-    'provider unavailable — respawning on fallback',
+    PROVIDER_UNAVAILABLE_KILL,
     async () => {
       // Before the wake: once the replacement is spawning it owns the session
       // and the follow-up row would be refused.
@@ -122,7 +123,7 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
 async function followUpStrandedTurn(session: Session, containerName: string | null): Promise<void> {
   try {
     await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      followUpKill(mailbox, session, containerName, { reason: 'provider-unavailable' }),
+      followUpKill(mailbox, session, containerName, { reason: PROVIDER_UNAVAILABLE_KILL }),
     );
   } catch (err) {
     log.warn('provider_unavailable: kill follow-up failed', { sessionId: session.id, err });
