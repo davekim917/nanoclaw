@@ -19,6 +19,12 @@ import {
 import { assertValidGroupFolder } from '../group-folder.js';
 import { registerProviderContainerConfig, type VolumeMount } from './provider-container-registry.js';
 
+/** Channel defaults the runner overlays onto the Codex providerConfig; the runner contract names the same keys. */
+export const CODEX_CHANNEL_DEFAULT_ENV = {
+  model: 'NANOCLAW_CODEX_MODEL_OVERRIDE',
+  effort: 'NANOCLAW_CODEX_EFFORT_OVERRIDE',
+} as const;
+
 function resolveCodexSourceDir(agentGroupFolder: string | undefined, agentGroupId: string, hostHome: string): string {
   const scopedFolder = agentGroupFolder || agentGroupId;
   // folder/id reaches path.join, so traversal is rejected before the scoped path is formed.
