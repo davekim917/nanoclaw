@@ -19,6 +19,9 @@ describe('deploy rollback shell contract', () => {
     const reexecAt = script.indexOf('NANOCLAW_DEPLOY_POST_PULL=1');
     for (const at of [lockAt, probeAt, pullAt, reexecAt]) expect(at).toBeGreaterThan(-1);
     expect(probeAt).toBeLessThan(lockAt);
+    // flock runs unconditionally: an inherited fd 9 re-locks, a foreign one is refused.
+    expect(script.slice(probeAt, lockAt)).not.toContain('flock');
+    expect(script).toMatch(/^if ! flock -n 9; then$/m);
     expect(lockAt).toBeLessThan(pullAt);
     expect(lockAt).toBeLessThan(reexecAt);
     // fd 9 is opened once, on the lock file, and never closed or redirected elsewhere.
