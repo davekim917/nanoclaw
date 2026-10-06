@@ -51,7 +51,6 @@ import { startResourceTelemetry } from './resource-telemetry.js';
 import { CLAUDE_REVIEW_SOCKET_ENV } from './cli/claude-review-contract.js';
 import { startClaudeReviewService } from './cli/claude-review-service.js';
 import { dropRetiredMcpServers } from './retired-mcp-servers.js';
-import { trustGatewayCaForChromium } from './browser-trust.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
