@@ -225,6 +225,25 @@ function isProviderQuotaExhausted(err: unknown): boolean {
   return err instanceof ProviderEventError && err.classification === 'quota';
 }
 
+/**
+ * Every credential in the ring rejected on a rate-limit window: the account's quota wall, not an outage. The reset is
+ * the earliest slot's, when one can serve again.
+ */
+export function ringRateLimitQuota(
+  failures: unknown[],
+  ringSpent: boolean,
+): { exhausted: boolean; resetAt: string | null } {
+  const rejections = failures.filter(
+    (f): f is ProviderEventError => f instanceof ProviderEventError && f.classification === 'rate_limit',
+  );
+  if (!ringSpent || rejections.length === 0 || rejections.length !== failures.length) {
+    return { exhausted: false, resetAt: null };
+  }
+  const resets = rejections.map((f) => Date.parse(f.event.resetAt ?? ''));
+  const resetAt = resets.every(Number.isFinite) ? new Date(Math.min(...resets)).toISOString() : null;
+  return { exhausted: true, resetAt };
+}
+
 export interface ProviderUnavailableDetail {
   /** Provider-MEASURED recovery instant (ISO) — see ProviderEvent error `resetAt`. */
   resetAt?: string | null;
@@ -991,6 +1010,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // before isContextTooLong, which can look retryable. The continuation
       // survives rotation (resume reads a local .jsonl). `!transient`: an
       // overload also matches isRetryable but was handled by the backoff above.
+      const ringFailures: unknown[] = [err];
       let rotation =
         !transient && !recovered && repositoryRecoveryAllowed() && config.provider.isRetryable?.(err)
           ? config.provider.rotateApiKey?.()
@@ -1010,9 +1030,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after credential rotation also failed: ${retryMsg}`);
+          ringFailures.push(retryErr);
           rotation = config.provider.isRetryable?.(retryErr) ? config.provider.rotateApiKey?.() : undefined;
         }
       }
+      const ringQuota = ringRateLimitQuota(ringFailures, !recovered && rotation?.rotated === false);
 
       // Context-too-long: clear the continuation and retry once with a recap.
       // Gated on `continuation`: a first message already over the limit falls
@@ -1099,7 +1121,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // every credential, so it looks like a dead account. Retry once with the
       // pin dropped (`undefined` = each provider's group default), on every
       // provider. One attempt only: if the default fails too, the account is spent.
-      const quotaExhausted = config.provider.isQuotaExhausted?.(err) ?? isProviderQuotaExhausted(err);
+      const providerQuota = (e: unknown): boolean =>
+        config.provider.isQuotaExhausted?.(e) ?? isProviderQuotaExhausted(e);
+      const eventResetAt = (e: unknown): string | null =>
+        e instanceof ProviderEventError ? (e.event.resetAt ?? null) : null;
+      const quotaExhausted = ringQuota.exhausted || providerQuota(err);
+      let reportErr = err;
+      let reportQuota = quotaExhausted;
+      let reportResetAt = ringQuota.exhausted ? ringQuota.resetAt : eventResetAt(err);
       if (!recovered && repositoryRecoveryAllowed() && quotaExhausted && effectiveModel !== undefined) {
         log(`Quota rejection while pinned to ${effectiveModel} — retrying once on the group's default model`);
         try {
@@ -1115,6 +1144,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             `Retry on the group's default model also failed: ` +
               `${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
           );
+          // The default model's failure is the account's current state; the pinned ring alone no longer is.
+          const union = ringQuota.exhausted ? ringRateLimitQuota([...ringFailures, retryErr], true) : null;
+          reportErr = retryErr;
+          reportQuota = union?.exhausted || providerQuota(retryErr);
+          reportResetAt = union?.exhausted ? union.resetAt : eventResetAt(retryErr);
         }
       }
 
@@ -1130,12 +1164,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         !localCrash &&
         (await reportProviderUnavailable(
           config.providerName,
-          err instanceof Error ? err.message : String(err),
-          quotaExhausted,
-          err instanceof ProviderEventError
+          reportErr instanceof Error ? reportErr.message : String(reportErr),
+          reportQuota,
+          reportErr instanceof ProviderEventError
             ? {
-                resetAt: err.event.resetAt ?? null,
-                reason: err.classification === 'system_error' ? 'system_error' : null,
+                resetAt: reportResetAt,
+                reason: reportErr.classification === 'system_error' ? 'system_error' : null,
               }
             : {},
         ));
