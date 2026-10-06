@@ -13,6 +13,7 @@ import {
   TASK_LIST_ITEMS_MAX,
   TASK_LIST_STATE_KEY,
   TASK_LIST_TITLE_MAX,
+  TASK_LIST_WAITING_ON_MAX,
   taskListEnabled,
   type TaskListDeps,
 } from '../task-list.js';
@@ -68,7 +69,12 @@ export const updateTaskList: McpToolDefinition = {
             additionalProperties: false,
             properties: {
               text: { type: 'string', maxLength: TASK_LIST_ITEM_MAX },
-              status: { type: 'string', enum: ['pending', 'in_progress', 'done'] },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'waiting', 'done'] },
+              waiting_on: {
+                type: 'string',
+                maxLength: TASK_LIST_WAITING_ON_MAX,
+                description: 'Required with status waiting: who or what this item cannot move without.',
+              },
             },
             required: ['text', 'status'],
           },

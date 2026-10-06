@@ -213,13 +213,16 @@ export function readOpenTaskListRecord(
 
 interface UnfinishedTaskItem {
   text: string;
-  status: 'pending' | 'in_progress';
+  /** `open` is a status this host does not know: a newer runner's, so still owed. */
+  status: 'pending' | 'in_progress' | 'open';
 }
 
 /** `at` is when the runner last saved the list. */
 export interface TaskListInFlight {
   at: string;
+  /** Items the agent can still move itself: neither done nor declared waiting on someone else. */
   unfinished: UnfinishedTaskItem[];
+  waiting: number;
 }
 
 /** A bad item drops only that item: an entry the runner could not have written is not evidence of owed work. */
@@ -227,12 +230,14 @@ export function readTaskListInFlight(outbound: Database.Database): TaskListInFli
   const open = readOpenTaskListRecord(outbound);
   if (!open || !Array.isArray(open.record.items)) return null;
   const unfinished: UnfinishedTaskItem[] = [];
+  let waiting = 0;
   for (const value of open.record.items as unknown[]) {
     if (typeof value !== 'object' || value === null) continue;
     const { text, status } = value as { text?: unknown; status?: unknown };
     const line = recordedText(text);
-    if (line === null || (status !== 'pending' && status !== 'in_progress')) continue;
-    unfinished.push({ text: line, status });
+    if (line === null || typeof status !== 'string' || status === 'done') continue;
+    if (status === 'waiting') waiting += 1;
+    else unfinished.push({ text: line, status: status === 'pending' || status === 'in_progress' ? status : 'open' });
   }
-  return { at: open.touchedAt, unfinished };
+  return { at: open.touchedAt, unfinished, waiting };
 }

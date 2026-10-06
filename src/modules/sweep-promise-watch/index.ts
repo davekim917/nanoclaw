@@ -24,7 +24,7 @@ import { readEnvFile } from '../../env.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY, writeSystemWake } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
-import { armedBy, readArmedState, type ArmedState } from '../sweep-continuation/armed.js';
+import { armedBy, readArmedState, type ArmedState } from '../sweep-continuation/kill-state.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { askJev, type JevQuestion } from '../../typesafe.js';
 import type { Session } from '../../types.js';

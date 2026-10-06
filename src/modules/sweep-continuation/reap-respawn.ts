@@ -4,17 +4,17 @@
  * as the ceiling wake. Kept free of top-level side effects so other families can import it without registering this
  * one. The host never inspects checkouts or the list itself; the runner writes both records.
  */
-import { CONTAINER_NAME_PREFIX, SELF_HEAL_ENABLED } from '../../config.js';
+import { SELF_HEAL_ENABLED } from '../../config.js';
 import { sessionStillActive } from '../../container-runner.js';
-import { withCentralSync, withRawDb } from '../../db/central-lease.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { writeOutboundWhenStopped, writeSystemWake } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import type { NanoclawMailboxSession, TaskListInFlight, WorktreeInFlight } from '../mailbox/index.js';
 import { WORK_CONTINUATION_RESUME_MAX_ATTEMPTS } from '../mailbox/ops/continuation.js';
-import { armedBy, readArmedState } from './armed.js';
 import { decideReapFollowUp, type ReapFollowUp } from './decide.js';
+import { containerStartedAtMs, openCardSince, readKillArmed, REAP_RESPAWN_ID_PREFIX } from './kill-state.js';
 
 export const ACCOUNT_FOR_STATE = 'post ONE message accounting for state — done / lost / next';
 
@@ -23,7 +23,6 @@ export const RESTART_SURVIVAL_RULES =
   `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
   `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay.`;
 
-const REAP_RESPAWN_ID_PREFIX = 'reap-respawn-';
 const MAX_FILES_NAMED = 20;
 const MAX_ITEMS_NAMED = 5;
 const CONTAINER_WORKTREES_DIR = '/workspace/worktrees';
@@ -43,20 +42,10 @@ const STRANDING_KILLS: ReadonlyMap<string, (kill: StrandingKill) => string> = ne
   ['provider-unavailable', () => `was stopped mid-turn because its model provider became unavailable`],
 ]);
 
-/**
- * The instant the spawn minted this container's name, which is before the container started. Unlike the registry's
- * `spawnedAt`, it survives a host restart: adoption reads the name back from the runtime and restamps `spawnedAt`.
- */
-export function containerStartedAtMs(containerName: string | null): number | null {
-  if (!containerName?.startsWith(CONTAINER_NAME_PREFIX)) return null;
-  const match = /-(\d+)$/.exec(containerName);
-  const ms = match ? Number(match[1]) : NaN;
-  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
-}
-
 interface KillEvidence {
   checkouts: WorktreeInFlight['checkouts'];
   unfinished: TaskListInFlight['unfinished'];
+  waiting: number;
   /** Something was recorded, all of it by an earlier container. */
   stale: boolean;
 }
@@ -67,41 +56,15 @@ function readKillEvidence(mailbox: NanoclawMailboxSession, startedAtMs: number):
   const list = mailbox.readTaskListInFlight();
   const during = (at: string): boolean => Date.parse(at) >= startedAtMs;
   const checkouts = worktree && during(worktree.at) ? worktree.checkouts : [];
-  const unfinished = list && during(list.at) ? list.unfinished : [];
+  const fresh = list && during(list.at) ? list : null;
+  const unfinished = fresh?.unfinished ?? [];
   const recorded = (worktree?.checkouts.length ?? 0) + (list?.unfinished.length ?? 0);
-  return { checkouts, unfinished, stale: recorded > 0 && checkouts.length + unfinished.length === 0 };
-}
-
-/** This wake's own unadmitted rows are left out: one row per kill is the id's job, the count is the cap's. */
-function armedReason(mailbox: NanoclawMailboxSession): string | null {
-  const armed = armedBy(readArmedState(mailbox));
-  if (armed) return armed;
-  if (mailbox.hasPendingRecallPairedTrigger(REAP_RESPAWN_ID_PREFIX)) return 'wake-deferred';
-  if (mailbox.getProcessingClaimRows().length > 0) return 'claimed';
-  return null;
-}
-
-/**
- * An approval or question card nobody answers is never pruned, so only one posted during the killed container's life
- * counts: an abandoned card from months ago would otherwise silence this session for good.
- */
-function humanOwesNextMove(sessionId: string, sinceIso: string): boolean {
-  return withRawDb(
-    (db) =>
-      db
-        .prepare(
-          `SELECT 1 FROM pending_approvals
-            WHERE session_id = @id
-              AND status IN ('pending', 'awaiting_reason')
-              AND datetime(created_at) >= datetime(@since)
-           UNION ALL
-           SELECT 1 FROM pending_questions
-            WHERE session_id = @id
-              AND datetime(created_at) >= datetime(@since)
-           LIMIT 1`,
-        )
-        .get({ id: sessionId, since: sinceIso }) !== undefined,
-  );
+  return {
+    checkouts,
+    unfinished,
+    waiting: fresh?.waiting ?? 0,
+    stale: recorded > 0 && checkouts.length + unfinished.length === 0,
+  };
 }
 
 function describeCheckouts(checkouts: KillEvidence['checkouts']): string {
@@ -130,10 +93,10 @@ function describeCheckouts(checkouts: KillEvidence['checkouts']): string {
     .join('\n');
 }
 
+const ITEM_STATE = { in_progress: 'in progress', pending: 'pending', open: 'open' } as const;
+
 function describeUnfinished(unfinished: KillEvidence['unfinished']): string {
-  const lines = unfinished
-    .slice(0, MAX_ITEMS_NAMED)
-    .map((item) => `- ${item.status === 'in_progress' ? 'in progress' : 'pending'}: ${item.text}`);
+  const lines = unfinished.slice(0, MAX_ITEMS_NAMED).map((item) => `- ${ITEM_STATE[item.status]}: ${item.text}`);
   const more = unfinished.length - lines.length;
   if (more > 0) lines.push(`(+${more} more)`);
   return lines.join('\n');
@@ -151,15 +114,19 @@ function wakeText(cause: string, evidence: KillEvidence): string {
     );
   }
   if (evidence.unfinished.length > 0) {
-    const quietEnd = evidence.checkouts.length === 0 ? ' and end this turn without posting' : '';
+    // Work only on disk must be accounted for in a message; a list alone can be settled in the list.
+    const silent =
+      evidence.checkouts.length === 0
+        ? ` Post a message only if work was lost or that ask was never made; otherwise the updated list is the answer.`
+        : '';
     sections.push(
-      `Its task list still had ${evidence.unfinished.length} item(s) not done, and nothing was armed to bring you ` +
-        `back to them:\n${describeUnfinished(evidence.unfinished)}\n` +
-        `Settle the list now. If every item is in fact finished, mark the list done with update_task_list${quietEnd}. ` +
+      `Its task list still had ${evidence.unfinished.length} item(s) neither done nor marked waiting, and nothing ` +
+        `was armed to bring you back to them:\n${describeUnfinished(evidence.unfinished)}\n` +
+        `Settle each one now with update_task_list. If it is in fact finished, mark it done. ` +
         `If the work is still owed, do the next item now. ` +
-        `If you are waiting on someone else, arm wait (or continue_work) naming what you will check — prose does ` +
-        `not keep this thread alive. ` +
-        `If a human owes the next move, say so once, with the exact ask.`,
+        `If you will check on it later (a peer agent you are waiting on counts), arm wait or continue_work naming ` +
+        `what you will check and when — prose does not keep this thread alive. ` +
+        `If you cannot move it yourself, mark it waiting on whoever owes the next move.${silent}`,
     );
   }
   sections.push(RESTART_SURVIVAL_RULES);
@@ -195,13 +162,14 @@ export async function followUpKill(
   ];
   fields.checkouts = checkouts;
   fields.unfinishedItems = evidence.unfinished.length;
+  fields.waitingItems = evidence.waiting;
   const inFlight = {
     inFlightCheckouts: evidence.checkouts.length,
     unfinishedItems: evidence.unfinished.length,
     staleEvidence: evidence.stale,
   };
-  const armed = inFlight.inFlightCheckouts + inFlight.unfinishedItems > 0 ? armedReason(mailbox) : null;
-  if (armed) fields.armedBy = armed;
+  const armed = inFlight.inFlightCheckouts + inFlight.unfinishedItems > 0 ? readKillArmed(mailbox) : null;
+  if (armed) fields.armedBy = armed.by;
   const early = decideReapFollowUp({ ...inFlight, armed: armed !== null, priorAttempts: 0 });
   if (early.action === 'none') return decided(early);
 
@@ -215,7 +183,8 @@ export async function followUpKill(
         fields.priorAttempts = priorAttempts;
         const decision = decideReapFollowUp({
           ...inFlight,
-          humanPending: humanOwesNextMove(session.id, new Date(startedAtMs).toISOString()),
+          humanPending:
+            openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString()) !== null,
           priorAttempts,
         });
         if (decision.action === 'none') return decision;

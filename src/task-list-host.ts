@@ -4,11 +4,22 @@
  */
 import { parseRetryAfterMs } from './channels/chat-sdk-bridge.js';
 import { TASK_LIST_ENABLED } from './config.js';
+import { resolveGroupTimezone } from './container-config.js';
+import { withCentralSync } from './db/central-lease.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
+import type { TaskListSettlement } from './modules/mailbox/ops/lookups.js';
+import {
+  containerStartedAtMs,
+  openCardSince,
+  readKillArmed,
+  type KillArmed,
+} from './modules/sweep-continuation/kill-state.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { withExistingMailboxSession } from './session-manager.js';
+import { formatLocalTime } from './timezone.js';
+import type { Session } from './types.js';
 
 /** Edits replaced by a later edit of the same message in this batch; `due` must be in delivery order. */
 export function supersededTaskListEdits(
@@ -39,12 +50,47 @@ const KILL_EDIT_MAX_WAIT_MS = 5 * 60_000;
 const KILL_EDIT_WAIT_BUFFER_MS = 250;
 
 /**
+ * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host
+ * knows more: a session with a wake armed is paused, and one with an unanswered card is waiting on that. Host
+ * literals and a formatted time only; a runner that predates `interruptedDetail` keeps its own label.
+ */
+async function killSubtext(
+  session: Session,
+  edit: NonNullable<TaskListSettlement['edit']>,
+  armed: KillArmed | null,
+  containerName: string | null,
+): Promise<string> {
+  if (edit.interruptedDetail === null) return edit.interruptedSubtext;
+  let state: string | null = null;
+  if (armed) {
+    state = armed.nextCheckAt
+      ? `paused · next check ${formatLocalTime(armed.nextCheckAt, await resolveGroupTimezone(session.agent_group_id))}`
+      : 'paused · resuming';
+  } else {
+    const startedAtMs = containerStartedAtMs(containerName);
+    const card =
+      startedAtMs === null
+        ? null
+        : await withCentralSync(
+            () => openCardSince(session.id, new Date(startedAtMs).toISOString(), new Date().toISOString()),
+            'task list kill label',
+          );
+    if (card) state = card === 'approval' ? 'waiting on an approval' : 'waiting on an answer';
+  }
+  return state === null ? edit.interruptedSubtext : `${state} · ${edit.interruptedDetail}`;
+}
+
+/**
  * Never throws. Fenced through the session's delivery slot: the dead container's queued list rows are recorded
  * delivered-unsent durably first, so a restart can't replay them over the interrupted form. The edit target comes
- * from host-owned evidence and must be the session's own conversation; only the wording is container-written.
- * Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
+ * from host-owned evidence and must be the session's own conversation; the wording is container-written but for the
+ * leading state. Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
  */
-export async function settleTaskListOnKill(sessionId: string, reason: string): Promise<void> {
+export async function settleTaskListOnKill(
+  sessionId: string,
+  reason: string,
+  containerName: string | null = null,
+): Promise<void> {
   setTypingStatusText(sessionId, null);
   if (!TASK_LIST_ENABLED) return;
   const killedAt = new Date().toISOString();
@@ -60,7 +106,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
         const settlement = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
           const found = mailbox.getTaskListSettlement(killedAt);
           if (found) for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
-          return found;
+          return found && { ...found, armed: found.edit ? readKillArmed(mailbox) : null };
         });
         const edit = settlement?.edit;
         if (!edit) return 0;
@@ -77,6 +123,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
         }
         const cooling = taskListCooldownMs(edit.channelType);
         if (cooling > 0) return cooling;
+        const subtext = await killSubtext(session, edit, settlement.armed, containerName);
         try {
           await adapter.deliver(
             edit.channelType,
@@ -89,7 +136,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
                 operation: 'edit',
                 messageId: edit.platformMessageId,
                 text: edit.interruptedText,
-                subtext: edit.interruptedSubtext,
+                subtext,
               }),
             ),
             undefined,

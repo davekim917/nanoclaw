@@ -31,9 +31,12 @@ import {
   createMessagingGroupAgent,
   initMigratedTestDb,
 } from './db/index.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
+import { createPendingApproval, createPendingQuestion } from './db/sessions.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
+import { formatLocalTime } from './timezone.js';
 import { deliverSessionMessages, setDeliveryAdapter, withSessionDeliverySlot } from './delivery.js';
 import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
 import {
@@ -698,5 +701,150 @@ describe('task list delivery (switch on)', () => {
         content: { operation: 'reaction', messageId: '1786621700.000200', emoji: 'eyes' },
       },
     ]);
+  });
+});
+
+describe('the kill label says what is true of the session', () => {
+  const DETAIL = 'todos as of <!date^1^{time} ({ago})|3:00 PM>';
+  const HOUR = 60 * 60_000;
+  /** A record from a runner that splits the label's state from the rest of it. */
+  const CURRENT = { interruptedDetail: DETAIL };
+
+  function containerStartedAt(ms: number): string {
+    return `nanoclaw-v2-agent-${ms}`;
+  }
+
+  function insertInbound(sessionId: string, row: { id: string; processAfter?: string }): void {
+    const db = new Database(inboundDbPath('ag-1', sessionId));
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, process_after, content)
+       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'pending', 1, ?, ?)`,
+    ).run(row.id, now(), row.processAfter ?? null, JSON.stringify({ text: 'check the deploy' }));
+    db.close();
+  }
+
+  async function label(sessionId: string, containerName: string | null = null): Promise<unknown> {
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'chat-idle-reap', containerName);
+    expect(calls).toHaveLength(1);
+    return calls[0].content.subtext;
+  }
+
+  async function approvalCard(sessionId: string, createdAtMs: number): Promise<void> {
+    await createPendingApproval({
+      approval_id: `appr-${createdAtMs}`,
+      session_id: sessionId,
+      request_id: `req-${createdAtMs}`,
+      action: 'request_choice',
+      payload: '{}',
+      created_at: new Date(createdAtMs).toISOString(),
+      title: 'Ship it?',
+      options_json: '[]',
+    });
+  }
+
+  it('stopped, when nothing is armed and nobody owes an answer', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`stopped · ${DETAIL}`);
+  });
+
+  it('paused with the next check, in the group’s timezone, when a wake is armed for later', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const nextCheck = new Date(Date.now() + 3 * HOUR).toISOString();
+    insertInbound(sessionId, { id: 'wait-1', processAfter: nextCheck });
+    await ensureContainerConfig('ag-1');
+    await updateContainerConfigScalars('ag-1', { timezone: 'Asia/Tokyo' });
+
+    const subtext = await label(sessionId);
+
+    expect(subtext).toBe(`paused · next check ${formatLocalTime(nextCheck, 'Asia/Tokyo')} · ${DETAIL}`);
+    expect(subtext).not.toContain(formatLocalTime(nextCheck, 'America/Anchorage'));
+  });
+
+  it('paused and resuming, when what is armed is already due', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    insertInbound(sessionId, { id: 'due-1' });
+    expect(await label(sessionId)).toBe(`paused · resuming · ${DETAIL}`);
+  });
+
+  it('waiting on an approval, when the killed container’s card is unanswered', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const startedAt = Date.now() - HOUR;
+    await approvalCard(sessionId, startedAt + 60_000);
+    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an approval · ${DETAIL}`);
+  });
+
+  it('waiting on an answer, when the killed container’s question is unanswered', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const startedAt = Date.now() - HOUR;
+    await createPendingQuestion({
+      question_id: 'q-1',
+      session_id: sessionId,
+      message_out_id: 'out-1',
+      platform_id: PLATFORM,
+      channel_type: 'slack',
+      thread_id: THREAD,
+      title: 'Which region?',
+      question: 'Which region should the rehearsal use?',
+      options: [],
+      created_at: new Date(startedAt + 60_000).toISOString(),
+    });
+    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`waiting on an answer · ${DETAIL}`);
+  });
+
+  it('a card from before the killed container, or a kill with no container to date it by, is not this list’s', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const startedAt = Date.now() - HOUR;
+    await approvalCard(sessionId, startedAt - 24 * HOUR);
+    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`stopped · ${DETAIL}`);
+    await approvalCard(sessionId, startedAt + 60_000);
+    expect(await label(sessionId, null)).toBe(`stopped · ${DETAIL}`);
+  });
+
+  it('an armed wake outranks an open card', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, CURRENT);
+    const startedAt = Date.now() - HOUR;
+    await approvalCard(sessionId, startedAt + 60_000);
+    insertInbound(sessionId, { id: 'due-1' });
+    expect(await label(sessionId, containerStartedAt(startedAt))).toBe(`paused · resuming · ${DETAIL}`);
+  });
+
+  it('keeps the runner’s own label when every open item waits on someone', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, { ...CURRENT, interruptedSubtext: `waiting on Dana · ${DETAIL}` });
+    expect(await label(sessionId, containerStartedAt(Date.now() - HOUR))).toBe(`waiting on Dana · ${DETAIL}`);
+  });
+
+  it('a record from a runner that predates the split keeps today’s label, armed or not', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    insertInbound(sessionId, { id: 'wait-1', processAfter: new Date(Date.now() + HOUR).toISOString() });
+    expect(await label(sessionId)).toBe('stopped · todos as of <!date^1^{time} ({ago})|3:00 PM>');
+  });
+
+  it('scrubs a registered secret from the part of the label the container wrote', async () => {
+    const sessionId = await seed();
+    registerSecrets({ API_TOKEN: 'sk-live-abcdef123456' });
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, { interruptedDetail: 'todos as of sk-live-abcdef123456' });
+    insertInbound(sessionId, { id: 'due-1' });
+    const subtext = await label(sessionId);
+    expect(subtext).toMatch(/^paused · resuming · /);
+    expect(subtext).not.toContain('sk-live-abcdef123456');
   });
 });

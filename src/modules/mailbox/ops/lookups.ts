@@ -228,6 +228,8 @@ export interface TaskListSettlement {
     platformMessageId: string;
     interruptedText: string;
     interruptedSubtext: string;
+    /** The subtext without its leading state; null from a runner that predates it, whose own label then stands. */
+    interruptedDetail: string | null;
   } | null;
 }
 
@@ -282,6 +284,7 @@ export function getTaskListSettlement(
           platformMessageId: receipt.platform_message_id,
           interruptedText: record.interruptedText,
           interruptedSubtext: record.interruptedSubtext,
+          interruptedDetail: typeof record.interruptedDetail === 'string' ? record.interruptedDetail : null,
         };
         break;
       }

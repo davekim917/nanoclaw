@@ -6,7 +6,7 @@ import { type SweepSessionContext } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import { followUpKill } from '../sweep-continuation/reap-respawn.js';
 
-export { containerStartedAtMs } from '../sweep-continuation/reap-respawn.js';
+export { containerStartedAtMs } from '../sweep-continuation/kill-state.js';
 
 async function followUpChatReap(
   ctx: SweepSessionContext,

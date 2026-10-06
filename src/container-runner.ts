@@ -1646,11 +1646,11 @@ export function captureContainerStderr(
  * scheduled task, whose normal exit is the idle reaper). Dynamic import: delivery.ts imports this module.
  * Fire-and-forget, never throws. Runs for a cancelled spawn too.
  */
-function clearStatusOnKill(sessionId: string, reason: string): void {
+function clearStatusOnKill(sessionId: string, reason: string, container: string | null = null): void {
   void import('./delivery.js')
     .then(async (m) => {
       const { settleTaskListOnKill } = await import('./task-list-host.js');
-      await Promise.all([m.clearSessionStatusOnKill(sessionId), settleTaskListOnKill(sessionId, reason)]);
+      await Promise.all([m.clearSessionStatusOnKill(sessionId), settleTaskListOnKill(sessionId, reason, container)]);
     })
     .catch((err) => {
       log.warn('Failed to clear status on container kill — leaving as-is', {
@@ -1670,7 +1670,7 @@ const hostStoppedContainers = new Set<string>();
  */
 function settleUnexpectedExit(sessionId: string, containerName: string): boolean {
   if (hostStoppedContainers.delete(containerName)) return false;
-  void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(sessionId, 'container-exit'));
+  void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(sessionId, 'container-exit', containerName));
   return true;
 }
 
@@ -1687,7 +1687,7 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
   }
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName, adopted: entry.adopted });
   hostStoppedContainers.add(entry.containerName);
-  clearStatusOnKill(sessionId, reason);
+  clearStatusOnKill(sessionId, reason, entry.containerName);
   try {
     stopContainer(entry.containerName);
   } catch {
@@ -1957,7 +1957,7 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
   }
   log.info('Killing container', { sessionId, reason, containerName, pending: true });
   hostStoppedContainers.add(containerName);
-  clearStatusOnKill(sessionId, reason);
+  clearStatusOnKill(sessionId, reason, containerName);
   try {
     stopContainer(containerName);
   } catch (err) {
