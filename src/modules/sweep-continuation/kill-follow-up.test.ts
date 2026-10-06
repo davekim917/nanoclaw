@@ -852,6 +852,30 @@ describe('the wake is withheld only on a fact, never on a reading of what is pen
     expect(decisions(info)).toEqual([expect.objectContaining({ outcome: 'armed', armedBy: 'ceiling-wake' })]);
   });
 
+  it('a ceiling kill whose follow-up throws still queues its own wake and finishes the duty', async () => {
+    const startedAt = Date.now() - HOUR;
+    recordList(startedAt + 60_000);
+    vi.spyOn(mailbox, 'readTaskListInFlight').mockImplementation(() => {
+      throw new Error('outbound gone');
+    });
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+    await ceilingKill(startedAt, null, SESSION_ID, {
+      current_tool: 'Bash',
+      tool_declared_timeout_ms: null,
+      tool_started_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    expect(inDb.prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'ceiling-respawn-tool-%'").get()).toEqual({
+      c: 1,
+    });
+    expect(warn).toHaveBeenCalledWith(
+      'ceiling-kill follow-up failed',
+      expect.objectContaining({ sessionId: SESSION_ID }),
+    );
+  });
+
   it('a ceiling kill whose own branch queued a continuation wake gets no second one', async () => {
     const startedAt = Date.now() - HOUR;
     recordList(startedAt + 60_000);
@@ -1077,6 +1101,24 @@ describe('work left only on disk has no resume path but this wake, so nothing st
       expect(content.text).toContain('post ONE message accounting for state — done / lost / next');
       expect(content.text).not.toContain('Post a message only if');
     });
+  });
+
+  it.each([
+    ['is not JSON', '{not json'],
+    ['is JSON null', 'null'],
+    ['holds more items than a runner can write', JSON.stringify({ version: 1, items: Array.from({ length: 65 }) })],
+  ])('a task list record that %s costs the worktree wake nothing: same row, same bytes', async (_l, list) => {
+    const startedAt = Date.now() - HOUR;
+    recordWorktree(startedAt + 60_000);
+    await chatReap(startedAt);
+    const alone = wakeRows()[0].content;
+    inDb.prepare('DELETE FROM messages_in').run();
+
+    setState('task_list', list);
+    await chatReap(startedAt);
+
+    expect(wakeRows().map((r) => r.id)).toEqual([`reap-respawn-${startedAt}`]);
+    expect(JSON.parse(wakeRows()[0].content)).toEqual(JSON.parse(alone));
   });
 
   it('an archived session still gets its row, as it did before the list counted', async () => {

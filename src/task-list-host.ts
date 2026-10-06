@@ -50,30 +50,36 @@ const KILL_EDIT_WAIT_BUFFER_MS = 250;
  * replaces it only with the one thing it knows for certain: a `wait` the agent armed that has not come due. It never
  * says the session is resuming. A label the host composes is host literals and host-formatted times only, so nothing
  * the container wrote sits under a state the host vouches for; with no such `wait`, no usable timestamp, or a session
- * that takes no wake, the runner's own label stands.
+ * that takes no wake, the runner's own label stands. So it does when the label cannot be composed: by now the dead
+ * container's queued rows are recorded delivered, and an edit that is not sent leaves the list looking live.
  */
 async function killSubtext(
   session: Session,
   edit: NonNullable<TaskListSettlement['edit']>,
   nextCheckAt: string | null,
+  reason: string,
 ): Promise<string> {
   if (edit.listedAt === null || nextCheckAt === null) return edit.interruptedSubtext;
-  const timezone = await resolveGroupTimezone(session.agent_group_id);
-  const nextCheck = formatLocalTime(nextCheckAt, timezone);
-  return `paused · next check ${nextCheck} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
+  try {
+    const timezone = await resolveGroupTimezone(session.agent_group_id);
+    const nextCheck = formatLocalTime(nextCheckAt, timezone);
+    return `paused · next check ${nextCheck} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
+  } catch (err) {
+    log.warn(KILL_LABEL_UNAVAILABLE, { sessionId: session.id, reason, err });
+    return edit.interruptedSubtext;
+  }
 }
 
-/**
- * The `wait` the label may name. Nothing but the session's own inbound rows is read unless one is armed. A label
- * that cannot be worked out must not cost the list its interrupted form.
- */
+const KILL_LABEL_UNAVAILABLE = 'Task list kill label unavailable — keeping the runner’s own';
+
+/** The `wait` the label may name. Nothing but the session's own inbound rows is read unless one is armed. */
 async function armedWaitAt(mailbox: NanoclawMailboxSession, session: Session, reason: string): Promise<string | null> {
   try {
     const at = mailbox.getNextScheduledWakeAt();
     if (at === null) return null;
     return (await withCentralSync(() => takesAWake(session.id), 'task list kill label')) ? at : null;
   } catch (err) {
-    log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId: session.id, reason, err });
+    log.warn(KILL_LABEL_UNAVAILABLE, { sessionId: session.id, reason, err });
     return null;
   }
 }
@@ -118,7 +124,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
         }
         const cooling = taskListCooldownMs(edit.channelType);
         if (cooling > 0) return cooling;
-        const subtext = await killSubtext(session, edit, settlement.nextCheckAt);
+        const subtext = await killSubtext(session, edit, settlement.nextCheckAt, reason);
         try {
           await adapter.deliver(
             edit.channelType,

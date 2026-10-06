@@ -32,8 +32,10 @@ import {
   initMigratedTestDb,
 } from './db/index.js';
 import { resolveGroupTimezone } from './container-config.js';
+import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { archiveSessionById, createPendingApproval, createPendingQuestion, updateSession } from './db/sessions.js';
+import { log } from './log.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
@@ -965,6 +967,22 @@ describe('the kill label says only what the host knows for certain', () => {
       expect(await label(sessionId)).toBe(RUNNER_LABEL);
     },
   );
+
+  it('still sends the interrupted edit, under the runner’s label, when the label cannot be composed', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', inHours(3));
+    await withCentralSync(() =>
+      withRawDb((db) => db.exec('ALTER TABLE container_configs RENAME TO container_configs_gone')),
+    );
+    await expect(resolveGroupTimezone('ag-1')).rejects.toThrow('container_configs');
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+    expect(warn).toHaveBeenCalledWith(
+      'Task list kill label unavailable — keeping the runner’s own',
+      expect.objectContaining({ sessionId }),
+    );
+  });
 
   it('still marks the list interrupted, under the runner’s label, when the session’s rows cannot be read', async () => {
     const sessionId = await listed();
