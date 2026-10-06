@@ -135,19 +135,19 @@ echo "Image: ${IMAGE_REF} (commit ${NANOCLAW_COMMIT}, agent-runner-deps ${AGENT_
 # BuildKit already writes it. No pipefail here, so docker's status comes from PIPESTATUS.
 BUILD_ATTEMPTS=3
 BUILD_RETRY_WAIT=10
+BUILD_LOG=""
+trap 'rm -f "$BUILD_LOG"' EXIT
 build_image() {
-    local attempt=1 status log
-    log="$(mktemp)"
+    local attempt=1 status
+    BUILD_LOG="$(mktemp)"
     while :; do
-        "${CONTAINER_RUNTIME}" build "$@" 2>&1 | tee "$log" >&2
+        "${CONTAINER_RUNTIME}" build "$@" 2>&1 | tee "$BUILD_LOG" >&2
         status=${PIPESTATUS[0]}
         if [ "$status" -eq 0 ]; then
-            rm -f "$log"
             return 0
         fi
         if [ "$attempt" -ge "$BUILD_ATTEMPTS" ] \
-            || ! grep -qE 'unexpected status.*: (429|5[0-9][0-9])( |$)' "$log"; then
-            rm -f "$log"
+            || ! grep -qE 'unexpected status.*: (429|5[0-9][0-9])( |$)' "$BUILD_LOG"; then
             return "$status"
         fi
         echo "" >&2
