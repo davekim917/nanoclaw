@@ -9,6 +9,26 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const script = fs.readFileSync(path.join(root, 'scripts', 'deploy.sh'), 'utf-8');
 
 describe('deploy rollback shell contract', () => {
+  it('refuses to start while another deploy holds the lock, and the re-exec inherits it', () => {
+    expect(script).toContain('exec 9>>"$DEPLOY_LOCK"');
+    expect(script).toContain('if ! flock -n 9; then');
+    expect(script).toContain('exit 3');
+    const lockAt = script.indexOf('flock -n 9');
+    const probeAt = script.indexOf('readlink /proc/self/fd/9');
+    const pullAt = script.indexOf('git pull');
+    const reexecAt = script.indexOf('NANOCLAW_DEPLOY_POST_PULL=1');
+    for (const at of [lockAt, probeAt, pullAt, reexecAt]) expect(at).toBeGreaterThan(-1);
+    expect(probeAt).toBeLessThan(lockAt);
+    // flock runs unconditionally: an inherited fd 9 re-locks, a foreign one is refused.
+    expect(script.slice(probeAt, lockAt)).not.toContain('flock');
+    expect(script).toMatch(/^if ! flock -n 9; then$/m);
+    expect(lockAt).toBeLessThan(pullAt);
+    expect(lockAt).toBeLessThan(reexecAt);
+    // fd 9 is opened once, on the lock file, and never closed or redirected elsewhere.
+    expect(script.match(/\b9[<>]/g)).toEqual(['9>']);
+    expect(script).toContain('exec 9>>"$DEPLOY_LOCK"');
+  });
+
   it('snapshots before a fast-forward pull and re-execs the pulled script', () => {
     expect(script.indexOf('snapshot_dir node_modules')).toBeLessThan(script.indexOf('git pull --ff-only origin main'));
     expect(script.indexOf('bash -n scripts/deploy.sh')).toBeLessThan(script.indexOf('exec env'));
