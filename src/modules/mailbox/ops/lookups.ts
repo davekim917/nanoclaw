@@ -5,6 +5,8 @@
  */
 import type Database from 'better-sqlite3';
 
+import { readOpenTaskListRecord } from './session-state.js';
+
 export interface InboundChatSenderRow {
   content?: string;
   channel_type?: string;
@@ -238,20 +240,9 @@ export function getTaskListSettlement(
   outbound: Database.Database,
   killedAt: string,
 ): TaskListSettlement | null {
-  let record: Record<string, unknown>;
-  try {
-    const row = outbound.prepare("SELECT value FROM session_state WHERE key = 'task_list'").get() as
-      | { value: string }
-      | undefined;
-    if (!row) return null;
-    record = JSON.parse(row.value) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  if (record.version !== 1 || record.finished === true || record.stale === true) return null;
-  // Older runner snapshots lack `touchedAt`; fall back to `updatedAt`.
-  const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
-  if (typeof touchedAt !== 'string' || !(Date.parse(touchedAt) <= Date.parse(killedAt))) return null;
+  const open = readOpenTaskListRecord(outbound);
+  if (!open || !(Date.parse(open.touchedAt) <= Date.parse(killedAt))) return null;
+  const { record } = open;
   const delivered = new Set(
     (inbound.prepare('SELECT message_out_id FROM delivered').all() as Array<{ message_out_id: string }>).map(
       (r) => r.message_out_id,

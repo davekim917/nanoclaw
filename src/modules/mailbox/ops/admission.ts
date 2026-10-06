@@ -83,9 +83,10 @@ const DUE_PREDICATE = `status = 'pending'
 
 /**
  * Matches a deferred wait (trigger=0) or an admitted due turn (trigger=1). A
- * recall marker alone does not: its trigger has already ended.
+ * recall marker alone does not: its trigger has already ended. A caller asking
+ * whether anything ELSE is queued passes its own row-id prefix to leave out.
  */
-export function hasPendingRecallPairedTrigger(db: Database.Database): boolean {
+export function hasPendingRecallPairedTrigger(db: Database.Database, exceptIdPrefix = ''): boolean {
   return (
     db
       .prepare(
@@ -93,6 +94,7 @@ export function hasPendingRecallPairedTrigger(db: Database.Database): boolean {
            FROM messages_in AS pending_turn
           WHERE pending_turn.status = 'pending'
             AND pending_turn.kind != 'system'
+            AND (@except = '' OR substr(pending_turn.id, 1, length(@except)) != @except)
             AND EXISTS (
               SELECT 1
                 FROM messages_in AS recall
@@ -102,7 +104,7 @@ export function hasPendingRecallPairedTrigger(db: Database.Database): boolean {
             )
           LIMIT 1`,
       )
-      .get() !== undefined
+      .get({ except: exceptIdPrefix }) !== undefined
   );
 }
 

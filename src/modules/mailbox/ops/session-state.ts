@@ -1,7 +1,7 @@
 /**
  * Container-owned `session_state` keys other than the continuation record
  * (which lives in ops/continuation.ts): raw continuation presence and
- * force-clear, the done proposal, and the worktree in-flight record.
+ * force-clear, the done proposal, the worktree in-flight record and the task list.
  */
 import type Database from 'better-sqlite3';
 
@@ -96,9 +96,14 @@ const MAX_RECORDED_CHARS = 300;
 /** A maximal valid record is about 25 KiB; anything larger is malformed and is never read into memory. */
 const MAX_RECORD_BYTES = 64 * 1024;
 
-/** A single line of at most MAX_RECORDED_CHARS: these strings are spliced into a note, one checkout per line. */
+/** A single printable line of at most MAX_RECORDED_CHARS: these strings are spliced into a note, one per line. */
 function recordedText(value: unknown): string | null {
-  if (typeof value !== 'string' || value === '' || value.length > MAX_RECORDED_CHARS || /[\r\n]/.test(value)) {
+  if (
+    typeof value !== 'string' ||
+    value === '' ||
+    value.length > MAX_RECORDED_CHARS ||
+    /[\p{Cc}\u2028\u2029]/u.test(value)
+  ) {
     return null;
   }
   return value;
@@ -166,4 +171,68 @@ export function readWorktreeInFlight(outbound: Database.Database): WorktreeInFli
     .map(parseInFlightCheckout)
     .filter((checkout): checkout is WorktreeInFlightCheckout => checkout !== null);
   return { at: parsed.at, checkouts };
+}
+
+/** A maximal valid list is about 60 KiB when every character is four bytes wide. */
+const MAX_TASK_LIST_BYTES = 128 * 1024;
+/** The runner caps a list at 30 items (container/agent-runner/src/task-list.ts). */
+const MAX_TASK_LIST_ITEMS = 64;
+
+/**
+ * The persisted list while it is still open (version 1, neither finished nor stale) with its last-touched stamp,
+ * which callers compare as a date, so an unparseable one matches no window. Same malformed-is-absent rule and SQL
+ * size bound as the worktree record: the value is agent-written.
+ */
+export function readOpenTaskListRecord(
+  outbound: Database.Database,
+): { record: Record<string, unknown>; touchedAt: string } | null {
+  let record: Record<string, unknown> | null;
+  try {
+    const row = outbound
+      .prepare(
+        `SELECT CASE WHEN length(CAST(value AS BLOB)) <= ? THEN value END AS value
+           FROM session_state WHERE key = 'task_list'`,
+      )
+      .get(MAX_TASK_LIST_BYTES) as { value: string | null } | undefined;
+    if (!row || row.value === null) return null;
+    record = JSON.parse(row.value, (_key, value: unknown) => {
+      if (Array.isArray(value) && value.length > MAX_TASK_LIST_ITEMS) throw new Error('oversized array');
+      return value;
+    }) as Record<string, unknown> | null;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- an outbound.db predating the table, a syntax error or an oversized array: all absent
+  } catch {
+    return null;
+  }
+  if (typeof record !== 'object' || record === null) return null;
+  if (record.version !== 1 || record.finished === true || record.stale === true) return null;
+  // Older runner snapshots lack `touchedAt`; fall back to `updatedAt`.
+  const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
+  if (typeof touchedAt !== 'string') return null;
+  return { record, touchedAt };
+}
+
+interface UnfinishedTaskItem {
+  text: string;
+  status: 'pending' | 'in_progress';
+}
+
+/** `at` is when the runner last saved the list. */
+export interface TaskListInFlight {
+  at: string;
+  unfinished: UnfinishedTaskItem[];
+}
+
+/** A bad item drops only that item: an entry the runner could not have written is not evidence of owed work. */
+export function readTaskListInFlight(outbound: Database.Database): TaskListInFlight | null {
+  const open = readOpenTaskListRecord(outbound);
+  if (!open || !Array.isArray(open.record.items)) return null;
+  const unfinished: UnfinishedTaskItem[] = [];
+  for (const value of open.record.items as unknown[]) {
+    if (typeof value !== 'object' || value === null) continue;
+    const { text, status } = value as { text?: unknown; status?: unknown };
+    const line = recordedText(text);
+    if (line === null || (status !== 'pending' && status !== 'in_progress')) continue;
+    unfinished.push({ text: line, status });
+  }
+  return { at: open.touchedAt, unfinished };
 }

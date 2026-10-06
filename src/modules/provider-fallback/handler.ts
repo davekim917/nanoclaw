@@ -8,11 +8,13 @@ import { readContainerConfig } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { isProviderUnavailable, markProviderUnavailable, parseProviderResetAt } from '../../db/provider-health.js';
 import { getSession } from '../../db/sessions.js';
-import { killContainer } from '../../container-runner.js';
+import { containerIdentityFor, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { resolveSpawnProvider } from '../../provider-fallback.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { followUpKill } from '../sweep-continuation/reap-respawn.js';
 
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
@@ -100,14 +102,29 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
 
   // Just this session: one exhausted account must not bounce every live
   // container in the group. The requeued message is answered on the fallback.
+  const containerName = containerIdentityFor(session.id)?.containerName ?? null;
   killContainer(
     session.id,
     'provider unavailable — respawning on fallback',
     async () => {
+      // Before the wake: once the replacement is spawning it owns the session
+      // and the follow-up row would be refused.
+      await followUpStrandedTurn(session, containerName);
       const fresh = await getSession(session.id);
       if (fresh) void requestWake(fresh, 'container-restart');
     },
     // A real respawn, so a host that dies between kill and wake still owes it.
     'respawn_after_stop',
   );
+}
+
+/** Never throws: the respawn must follow whatever happens here. */
+async function followUpStrandedTurn(session: Session, containerName: string | null): Promise<void> {
+  try {
+    await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      followUpKill(mailbox, session, containerName, { reason: 'provider-unavailable' }),
+    );
+  } catch (err) {
+    log.warn('provider_unavailable: kill follow-up failed', { sessionId: session.id, err });
+  }
 }

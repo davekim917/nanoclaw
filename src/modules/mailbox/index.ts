@@ -157,9 +157,11 @@ import {
   clearWorkContinuation,
   readContinuationPresence,
   readDoneProposal,
+  readTaskListInFlight,
   readWorktreeInFlight,
   type ContinuationPresence,
   type DoneProposal,
+  type TaskListInFlight,
   type WorktreeInFlight,
 } from './ops/session-state.js';
 import {
@@ -232,6 +234,7 @@ export {
   clearWorkContinuation,
   readDoneProposal,
   type DoneProposal,
+  type TaskListInFlight,
   type WorktreeInFlight,
 } from './ops/session-state.js';
 
@@ -461,7 +464,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** The recall POLICY stays with session-manager; these commit its decision. */
   demoteUnpairedLegacyTasks(): void;
   /** A pending primary row still has the recall partner required for admission. */
-  hasPendingRecallPairedTrigger(): boolean;
+  hasPendingRecallPairedTrigger(exceptIdPrefix?: string): boolean;
   listDueAdmissionRows(): DueAdmissionRow[];
   admitDueRow(recall: MessageInsert, taskId: string): boolean;
   listUnpairedPendingUpgradeRows(): PendingUpgradeRow[];
@@ -480,6 +483,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   clearWorkContinuation(): ContinuationPresence | null;
   readDoneProposal(): DoneProposal | null;
   readWorktreeInFlight(): WorktreeInFlight | null;
+  readTaskListInFlight(): TaskListInFlight | null;
   hasRestartNoteSince(since: string): boolean;
 
   readRepoIngressFence(): RepoIngressFence | null;
@@ -529,6 +533,7 @@ type NanoclawOutboundRead = Pick<
   | 'readRepositoryMountBarrierAck'
   | 'readDoneProposal'
   | 'readWorktreeInFlight'
+  | 'readTaskListInFlight'
   | 'readContinuationPresence'
 >;
 
@@ -681,6 +686,7 @@ function composeOutboundOps(
     // never create.
     readDoneProposal: () => readOutbound(null, readDoneProposal),
     readWorktreeInFlight: () => readOutbound(null, readWorktreeInFlight),
+    readTaskListInFlight: () => readOutbound(null, readTaskListInFlight),
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
     // Rebinds upstream's op: upstream's takes `writable()` unconditionally and
@@ -924,7 +930,7 @@ function forkOps(
     getCreatedTaskRow: (id) => getCreatedTaskRow(inbound, id),
 
     demoteUnpairedLegacyTasks: () => demoteUnpairedLegacyTasks(inbound),
-    hasPendingRecallPairedTrigger: () => hasPendingRecallPairedTrigger(inbound),
+    hasPendingRecallPairedTrigger: (exceptIdPrefix) => hasPendingRecallPairedTrigger(inbound, exceptIdPrefix),
     listDueAdmissionRows: () => listDueAdmissionRows(inbound),
     admitDueRow: (recall, taskId) => admitDueRow(inbound, recall, taskId),
     listUnpairedPendingUpgradeRows: () => listUnpairedPendingUpgradeRows(inbound),
