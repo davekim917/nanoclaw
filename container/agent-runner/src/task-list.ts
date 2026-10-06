@@ -16,6 +16,7 @@ export const TASK_LIST_STATE_KEY = 'task_list';
 export const TASK_LIST_TITLE_MAX = 200;
 export const TASK_LIST_ITEM_MAX = 300;
 export const TASK_LIST_ITEMS_MAX = 30;
+export const TASK_LIST_WAITING_ON_MAX = 80;
 /** Claude Tag's cap; also keeps one list inside one Slack/Discord message. */
 export const TASK_LIST_RENDER_MAX = 2000;
 /** A list older than this, with conversation below it, is reposted at the bottom. */
@@ -29,11 +30,13 @@ const TASK_LIST_REPOST_MIN_MESSAGES = 2;
  */
 export const TASK_LIST_DISCORD_REPOST_AFTER_MS = 50 * 60 * 1000;
 
-type TaskItemStatus = 'pending' | 'in_progress' | 'done';
+type TaskItemStatus = 'pending' | 'in_progress' | 'waiting' | 'done';
 
 export interface TaskItem {
   text: string;
   status: TaskItemStatus;
+  /** Who or what a `waiting` item cannot move without. */
+  waitingOn?: string;
 }
 
 export interface TaskListState {
@@ -76,7 +79,7 @@ export interface TaskListInput {
   newList: boolean;
 }
 
-const STATUS_MARK: Record<TaskItemStatus, string> = { done: '✓', in_progress: '✱', pending: '○' };
+const STATUS_MARK: Record<TaskItemStatus, string> = { done: '✓', in_progress: '✱', waiting: '◷', pending: '○' };
 
 /** Validate raw tool arguments. Returns the parsed input or a one-line error for the agent. */
 export function parseTaskListInput(args: Record<string, unknown>): TaskListInput | { error: string } {
@@ -95,17 +98,26 @@ export function parseTaskListInput(args: Record<string, unknown>): TaskListInput
   }
   const items: TaskItem[] = [];
   for (const [i, raw] of args.items.entries()) {
-    const item = raw as { text?: unknown; status?: unknown } | null;
+    const item = raw as { text?: unknown; status?: unknown; waiting_on?: unknown } | null;
     const text = typeof item?.text === 'string' ? item.text.replace(/\s+/g, ' ').trim() : '';
     if (!text) return { error: `items[${i}].text is required` };
     if (text.length > TASK_LIST_ITEM_MAX) {
       return { error: `items[${i}].text is ${text.length} chars; max is ${TASK_LIST_ITEM_MAX}` };
     }
     const status = item?.status;
-    if (status !== 'pending' && status !== 'in_progress' && status !== 'done') {
-      return { error: `items[${i}].status must be pending, in_progress or done` };
+    if (status !== 'pending' && status !== 'in_progress' && status !== 'waiting' && status !== 'done') {
+      return { error: `items[${i}].status must be pending, in_progress, waiting or done` };
     }
-    items.push({ text, status });
+    if (status !== 'waiting') {
+      items.push({ text, status });
+      continue;
+    }
+    const waitingOn = typeof item?.waiting_on === 'string' ? item.waiting_on.replace(/\s+/g, ' ').trim() : '';
+    if (!waitingOn) return { error: `items[${i}].waiting_on is required with status waiting: who or what it waits on` };
+    if (waitingOn.length > TASK_LIST_WAITING_ON_MAX) {
+      return { error: `items[${i}].waiting_on is ${waitingOn.length} chars; max is ${TASK_LIST_WAITING_ON_MAX}` };
+    }
+    items.push({ text, status, waitingOn });
   }
   if (args.new_list !== undefined && typeof args.new_list !== 'boolean') {
     return { error: 'new_list must be true or false' };
@@ -128,7 +140,19 @@ function renderTime(channelType: string, iso: string, timezone = TIMEZONE): stri
 
 function renderLine(item: TaskItem, interrupted: boolean): string {
   if (interrupted && item.status === 'in_progress') return `◌ ${item.text} (interrupted)`;
+  if (item.status === 'waiting') return `${STATUS_MARK.waiting} ${item.text} (waiting on ${item.waitingOn})`;
   return `${STATUS_MARK[item.status]} ${item.text}`;
+}
+
+const WAITING_ON_NAMED = 2;
+
+/** What a list its container left says about itself: who it waits on when every open item is waiting, else stopped. */
+function interruptedState(items: TaskItem[]): string {
+  const open = items.filter((item) => item.status !== 'done');
+  if (open.length === 0 || open.some((item) => item.status !== 'waiting')) return 'stopped';
+  const parties = [...new Set(open.map((item) => item.waitingOn))];
+  const more = parties.length - WAITING_ON_NAMED;
+  return `waiting on ${parties.slice(0, WAITING_ON_NAMED).join(', ')}${more > 0 ? ` (+${more} more)` : ''}`;
 }
 
 /**
@@ -157,9 +181,14 @@ export function renderBody(title: string, items: TaskItem[], interrupted = false
   return body.slice(0, TASK_LIST_RENDER_MAX - 1) + '…';
 }
 
-export function renderSubtext(channelType: string, updatedAt: string, interrupted = false): string {
+export function renderSubtext(
+  channelType: string,
+  updatedAt: string,
+  interrupted = false,
+  items: TaskItem[] = [],
+): string {
   const when = renderTime(channelType, updatedAt);
-  return interrupted ? `stopped · todos as of ${when}` : `todos as of ${when}`;
+  return interrupted ? `${interruptedState(items)} · todos as of ${when}` : `todos as of ${when}`;
 }
 
 /** The item the agent is on right now, for the platform's "is working…" status line. */
@@ -318,7 +347,7 @@ export async function applyTaskListUpdate(
     updatedAt: now,
     finished,
     interruptedText: renderBody(input.title, input.items, true),
-    interruptedSubtext: renderSubtext(routing.channelType, now, true),
+    interruptedSubtext: renderSubtext(routing.channelType, now, true, input.items),
     text,
     subtext,
   };
@@ -385,7 +414,8 @@ export async function applyTaskListUpdate(
 export function describeOutcome(outcome: Extract<TaskListOutcome, { ok: true }>): string {
   const items = outcome.state.items;
   const count = (s: TaskItemStatus) => items.filter((item) => item.status === s).length;
-  const tally = `${count('done')} done, ${count('in_progress')} in progress, ${count('pending')} pending`;
+  const waiting = count('waiting') > 0 ? `, ${count('waiting')} waiting` : '';
+  const tally = `${count('done')} done, ${count('in_progress')} in progress, ${count('pending')} pending${waiting}`;
   switch (outcome.action) {
     case 'posted':
       return `Task list posted (${tally}).`;
@@ -401,7 +431,7 @@ export function describeOutcome(outcome: Extract<TaskListOutcome, { ok: true }>)
 /** Re-injected after compaction or into a fresh context with an unfinished list: compaction can summarize it away. */
 export function taskListReminder(state: TaskListState | null): string | null {
   if (!state || state.finished || state.stale) return null;
-  const lines = state.items.map((item) => `${STATUS_MARK[item.status]} ${item.text}`).join('\n');
+  const lines = state.items.map((item) => renderLine(item, false)).join('\n');
   return (
     `[system] Your live task list in this conversation (keep it current with update_task_list, sending the whole list):\n` +
     `${state.title}\n${lines}`

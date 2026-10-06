@@ -5,6 +5,9 @@
  */
 import type Database from 'better-sqlite3';
 
+import { sqliteUtcToIso } from '../sqlite-utc.js';
+import { openTaskList } from './session-state.js';
+
 export interface InboundChatSenderRow {
   content?: string;
   channel_type?: string;
@@ -226,7 +229,40 @@ export interface TaskListSettlement {
     platformMessageId: string;
     interruptedText: string;
     interruptedSubtext: string;
+    /** When the list on screen last changed, re-serialised by the host; null when the record's stamp is no instant. */
+    listedAt: string | null;
   } | null;
+}
+
+export const SCHEDULE_WAKE_ID_PREFIX = 'schedule-wake-';
+export const SCHEDULE_WAKE_SYSTEM_KIND = 'agent_scheduled_wake';
+
+/**
+ * When the earliest `wait` the agent armed comes due, if it has not yet. Keyed on the id prefix and the system kind
+ * the `wait` action writes, so a future context row or anything else with a `process_after` is not mistaken for a
+ * check the agent promised itself. Neither is an enforced namespace: another writer could mint both. Whether the row
+ * then runs is admission's business, not read here.
+ */
+export function getNextScheduledWakeAt(inbound: Database.Database): string | null {
+  const row = inbound
+    .prepare(
+      `SELECT process_after AS at FROM messages_in
+        WHERE status = 'pending'
+          AND substr(id, 1, ?) = ?
+          AND CASE WHEN json_valid(content) THEN json_extract(content, '$._system.kind') END = ?
+          AND julianday(process_after) > julianday('now')
+        ORDER BY julianday(process_after)
+        LIMIT 1`,
+    )
+    .get(SCHEDULE_WAKE_ID_PREFIX.length, SCHEDULE_WAKE_ID_PREFIX, SCHEDULE_WAKE_SYSTEM_KIND) as
+    | { at: string }
+    | undefined;
+  return row ? sqliteUtcToIso(row.at) : null;
+}
+
+function instantOrNull(value: unknown): string | null {
+  const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 /**
@@ -248,10 +284,8 @@ export function getTaskListSettlement(
   } catch {
     return null;
   }
-  if (record.version !== 1 || record.finished === true || record.stale === true) return null;
-  // Older runner snapshots lack `touchedAt`; fall back to `updatedAt`.
-  const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
-  if (typeof touchedAt !== 'string' || !(Date.parse(touchedAt) <= Date.parse(killedAt))) return null;
+  const open = openTaskList(record);
+  if (!open || !(Date.parse(open.touchedAt) <= Date.parse(killedAt))) return null;
   const delivered = new Set(
     (inbound.prepare('SELECT message_out_id FROM delivered').all() as Array<{ message_out_id: string }>).map(
       (r) => r.message_out_id,
@@ -291,6 +325,7 @@ export function getTaskListSettlement(
           platformMessageId: receipt.platform_message_id,
           interruptedText: record.interruptedText,
           interruptedSubtext: record.interruptedSubtext,
+          listedAt: instantOrNull(record.updatedAt),
         };
         break;
       }

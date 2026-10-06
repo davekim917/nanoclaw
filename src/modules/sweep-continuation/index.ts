@@ -10,6 +10,7 @@ import type Database from 'better-sqlite3';
 
 import { SELF_HEAL_ENABLED } from '../../config.js';
 import {
+  containerStartedAtMs,
   getContainerSpawnedAt,
   isContainerRunning,
   isContainerSpawning,
@@ -36,7 +37,8 @@ import {
   type SessionRunner,
 } from '../../host-sweep.js';
 import { decideCeilingFollowUp, type CeilingFollowUp } from './decide.js';
-import { ACCOUNT_FOR_STATE, RESTART_SURVIVAL_RULES } from './reap-respawn.js';
+import { ABSOLUTE_CEILING_KILL } from './kill-state.js';
+import { ACCOUNT_FOR_STATE, followUpKill, RESTART_SURVIVAL_RULES } from './reap-respawn.js';
 
 export { decideCeilingFollowUp, type CeilingFollowUp } from './decide.js';
 
@@ -581,15 +583,15 @@ function registerContinuationSweepDuties(): void {
     order: 30,
     // Queue an on_wake row so the session respawns and answers for the
     // interruption. Best-effort; ceiling kills only.
-    run: (ctx, outcome, mailbox) => {
+    run: async (ctx, outcome, mailbox) => {
       if (outcome.action !== 'kill-ceiling') return;
       const snapshot = ctx.killSnapshot!;
       // Inside the guard although the row is inbound: a replacement that took
       // the session has already recovered, and the row would instead greet the
       // NEXT container with a stale notice and count against its cap.
-      writeOutboundWhenStopped(ctx.session, mailbox, () => {
+      const ceiling = writeOutboundWhenStopped(ctx.session, mailbox, () => {
         try {
-          applyCeilingFollowUp(
+          return applyCeilingFollowUp(
             mailbox,
             ctx.session,
             snapshot.containerState,
@@ -599,8 +601,19 @@ function registerContinuationSweepDuties(): void {
           );
         } catch (err) {
           log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });
+          return undefined;
         }
       });
+      try {
+        const startedAtMs = containerStartedAtMs(ctx.observed?.containerIdentity?.containerName ?? null);
+        await followUpKill(mailbox, ctx.session, startedAtMs, {
+          reason: ABSOLUTE_CEILING_KILL,
+          minutes: Math.round(Math.max(outcome.ceilingMs, ABSOLUTE_CEILING_MS) / 60_000),
+          ceilingWakeQueued: ceiling?.action === 'wake-accountable',
+        });
+      } catch (err) {
+        log.warn('ceiling-kill follow-up failed', { sessionId: ctx.session.id, err });
+      }
     },
   });
 }

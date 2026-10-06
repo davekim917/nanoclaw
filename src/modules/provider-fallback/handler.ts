@@ -8,11 +8,14 @@ import { readContainerConfig } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { isProviderUnavailable, markProviderUnavailable, parseProviderResetAt } from '../../db/provider-health.js';
 import { getSession } from '../../db/sessions.js';
-import { killContainer } from '../../container-runner.js';
+import { containerIdentityFor, containerStartedAtMs, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { resolveSpawnProvider } from '../../provider-fallback.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { PROVIDER_UNAVAILABLE_KILL } from '../sweep-continuation/kill-state.js';
+import { followUpKill } from '../sweep-continuation/reap-respawn.js';
 
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
@@ -100,14 +103,29 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
 
   // Just this session: one exhausted account must not bounce every live
   // container in the group. The requeued message is answered on the fallback.
+  const startedAtMs = containerStartedAtMs(containerIdentityFor(session.id)?.containerName ?? null);
   killContainer(
     session.id,
-    'provider unavailable — respawning on fallback',
+    PROVIDER_UNAVAILABLE_KILL,
     async () => {
+      // Before the wake: once the replacement is spawning it owns the session
+      // and the follow-up row would be refused.
+      await followUpStrandedTurn(session, startedAtMs);
       const fresh = await getSession(session.id);
       if (fresh) void requestWake(fresh, 'container-restart');
     },
     // A real respawn, so a host that dies between kill and wake still owes it.
     'respawn_after_stop',
   );
+}
+
+/** Never throws: the respawn must follow whatever happens here. */
+async function followUpStrandedTurn(session: Session, startedAtMs: number | null): Promise<void> {
+  try {
+    await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      followUpKill(mailbox, session, startedAtMs, { reason: PROVIDER_UNAVAILABLE_KILL }),
+    );
+  } catch (err) {
+    log.warn('provider_unavailable: kill follow-up failed', { sessionId: session.id, err });
+  }
 }

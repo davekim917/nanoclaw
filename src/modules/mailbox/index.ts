@@ -80,6 +80,7 @@ import {
   getInboundRoutingAnchor,
   getInboundRequestIdentity,
   getRecoverableLifecycleStatus,
+  getNextScheduledWakeAt,
   getTaskListSettlement,
   type TaskListSettlement,
   getLatestRoutedTaskRow,
@@ -157,9 +158,11 @@ import {
   clearWorkContinuation,
   readContinuationPresence,
   readDoneProposal,
+  readTaskListInFlight,
   readWorktreeInFlight,
   type ContinuationPresence,
   type DoneProposal,
+  type TaskListInFlight,
   type WorktreeInFlight,
 } from './ops/session-state.js';
 import {
@@ -232,6 +235,7 @@ export {
   clearWorkContinuation,
   readDoneProposal,
   type DoneProposal,
+  type TaskListInFlight,
   type WorktreeInFlight,
 } from './ops/session-state.js';
 
@@ -349,6 +353,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
   getInboundRequestIdentity(sequence: number): InboundRequestIdentity | null;
   getRecoverableLifecycleStatus(outboundId?: string): RecoverableLifecycleStatus | null;
+  /** When the earliest `wait` the agent armed comes due, if it has not yet (see the op). */
+  getNextScheduledWakeAt(): string | null;
   getTaskListSettlement(killedAt: string): TaskListSettlement | null;
 
   /**
@@ -480,6 +486,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   clearWorkContinuation(): ContinuationPresence | null;
   readDoneProposal(): DoneProposal | null;
   readWorktreeInFlight(): WorktreeInFlight | null;
+  readTaskListInFlight(): TaskListInFlight | null;
   hasRestartNoteSince(since: string): boolean;
 
   readRepoIngressFence(): RepoIngressFence | null;
@@ -529,6 +536,7 @@ type NanoclawOutboundRead = Pick<
   | 'readRepositoryMountBarrierAck'
   | 'readDoneProposal'
   | 'readWorktreeInFlight'
+  | 'readTaskListInFlight'
   | 'readContinuationPresence'
 >;
 
@@ -681,6 +689,7 @@ function composeOutboundOps(
     // never create.
     readDoneProposal: () => readOutbound(null, readDoneProposal),
     readWorktreeInFlight: () => readOutbound(null, readWorktreeInFlight),
+    readTaskListInFlight: () => readOutbound(null, readTaskListInFlight),
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
     // Rebinds upstream's op: upstream's takes `writable()` unconditionally and
@@ -873,6 +882,7 @@ function forkOps(
     getInboundRequestIdentity: (sequence) => getInboundRequestIdentity(inbound, sequence),
     getRecoverableLifecycleStatus: (outboundId) =>
       readOutbound(null, (outbound) => getRecoverableLifecycleStatus(inbound, outbound, outboundId)),
+    getNextScheduledWakeAt: () => getNextScheduledWakeAt(inbound),
     getTaskListSettlement: (killedAt) =>
       readOutbound(null, (outbound) => getTaskListSettlement(inbound, outbound, killedAt)),
 

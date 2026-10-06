@@ -14,6 +14,7 @@ import {
   type SweepSessionContext,
 } from '../../host-sweep.js';
 
+import { CHAT_IDLE_REAP_KILL } from '../sweep-continuation/kill-state.js';
 import { startChatReapFollowUp } from './reap-follow-up.js';
 import { shouldReapIdleTaskContainer } from './task-idle.js';
 export { shouldReapIdleTaskContainer } from './task-idle.js';
@@ -98,7 +99,7 @@ function registerIdleReapSweepDuties(): void {
         idleFloorMs: CHAT_IDLE_REAP_MS,
       });
       const containerName = containerIdentityFor(session.id)?.containerName ?? null;
-      killContainer(session.id, 'chat-idle-reap', () =>
+      killContainer(session.id, CHAT_IDLE_REAP_KILL, () =>
         startChatReapFollowUp(sessionCtx, containerName, Math.round(CHAT_IDLE_REAP_MS / 60_000)),
       );
     },

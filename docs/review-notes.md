@@ -79,6 +79,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `display denylist` — untrusted text shown to a person is filtered by listing bad characters, so every unlisted invisible, blank or markup-bearing code point still passes; only a closed allowlist ends the class
 - `unbounded wait` — a network call or wait has no deadline, so a peer that stops responding without closing the connection holds its caller (and any pool slot or progress report behind it) forever instead of failing into a retry
 - `name-keyed exemption` — a safety check lets a file or directory pass on its name alone, so whatever sits under that name (a nested repository, exports, a whole project) passes with it; the name says what the thing usually is, not what it holds
+- `borrowed predicate` — a predicate built to answer one question is reused to answer a neighbouring one ("should we refrain from acting" read as "will it happen anyway"); the two agree on the common cases, so tests written from either question pass, and they differ exactly on the states the second question exists for; in its general form, a caller's forecast of a decision that another module makes stands in for that decision
 
 ## Lessons
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 
 import {
   applyTaskListUpdate,
+  describeOutcome,
   latestListLink,
   markTaskListStale,
   parseTaskListInput,
@@ -96,9 +97,39 @@ describe('parseTaskListInput', () => {
     expect(parseTaskListInput({ title: 't', items: [], extra: 1 })).toEqual({ error: 'unknown field(s): extra' });
     expect(parseTaskListInput({ title: 't', items: [] })).toHaveProperty('error');
     expect(parseTaskListInput({ title: 't', items: [{ text: 'x', status: 'doing' }] })).toEqual({
-      error: 'items[0].status must be pending, in_progress or done',
+      error: 'items[0].status must be pending, in_progress, waiting or done',
     });
     expect(parseTaskListInput({ items: [{ text: 'x', status: 'done' }] })).toHaveProperty('error');
+  });
+
+  it('accepts a waiting item only with who or what it waits on, bounded and on one line', () => {
+    expect(
+      parseTaskListInput({
+        title: 't',
+        items: [{ text: 'Merge the fix', status: 'waiting', waiting_on: '  Dana\n to  approve ' }],
+      }),
+    ).toEqual({
+      title: 't',
+      items: [{ text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana to approve' }],
+      newList: false,
+    });
+    expect(parseTaskListInput({ title: 't', items: [{ text: 'x', status: 'waiting' }] })).toEqual({
+      error: 'items[0].waiting_on is required with status waiting: who or what it waits on',
+    });
+    expect(parseTaskListInput({ title: 't', items: [{ text: 'x', status: 'waiting', waiting_on: '   ' }] })).toEqual({
+      error: 'items[0].waiting_on is required with status waiting: who or what it waits on',
+    });
+    expect(
+      parseTaskListInput({ title: 't', items: [{ text: 'x', status: 'waiting', waiting_on: 'y'.repeat(81) }] }),
+    ).toEqual({ error: 'items[0].waiting_on is 81 chars; max is 80' });
+  });
+
+  it('keeps waiting_on only on a waiting item', () => {
+    expect(parseTaskListInput({ title: 't', items: [{ text: 'x', status: 'done', waiting_on: 'Dana' }] })).toEqual({
+      title: 't',
+      items: [{ text: 'x', status: 'done' }],
+      newList: false,
+    });
   });
 });
 
@@ -113,6 +144,31 @@ describe('rendering', () => {
     expect(renderBody('T', items(['A', 'done'], ['B', 'in_progress'], ['C', 'pending']), true)).toBe(
       'T\n✓ A\n◌ B (interrupted)\n○ C',
     );
+  });
+
+  it('renders a waiting item with who it waits on, live and interrupted alike', () => {
+    const list: TaskItem[] = [
+      { text: 'A', status: 'done' },
+      { text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana' },
+    ];
+    expect(renderBody('T', list)).toBe('T\n✓ A\n◷ Merge the fix (waiting on Dana)');
+    expect(renderBody('T', list, true)).toBe('T\n✓ A\n◷ Merge the fix (waiting on Dana)');
+  });
+
+  it('says who an interrupted list waits on only when every open item is waiting', () => {
+    const at = '2026-09-24T15:00:00.000Z';
+    const waiting = (text: string, waitingOn: string): TaskItem => ({ text, status: 'waiting', waitingOn });
+    expect(
+      renderSubtext('discord', at, true, [{ text: 'A', status: 'done' }, waiting('B', 'Dana'), waiting('C', 'Dana')]),
+    ).toBe('waiting on Dana · todos as of <t:1790262000:t> (<t:1790262000:R>)');
+    expect(
+      renderSubtext('discord', at, true, [waiting('B', 'Dana'), waiting('C', 'the deploy bot'), waiting('D', 'CI')]),
+    ).toStartWith('waiting on Dana, the deploy bot (+1 more) · todos as of ');
+    expect(renderSubtext('discord', at, true, [waiting('B', 'Dana'), { text: 'C', status: 'pending' }])).toStartWith(
+      'stopped · todos as of ',
+    );
+    expect(renderSubtext('discord', at, true, [{ text: 'A', status: 'done' }])).toStartWith('stopped · ');
+    expect(renderSubtext('discord', at, false, [waiting('B', 'Dana')])).toStartWith('todos as of ');
   });
 
   it('folds the oldest done items first when the list outgrows one message', () => {
@@ -373,6 +429,30 @@ describe('applyTaskListUpdate', () => {
     await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), SLACK, h.deps);
     expect(h.state?.interruptedText).toBe('T\n✓ A\n◌ B (interrupted)');
     expect(h.state?.interruptedSubtext).toStartWith('stopped · todos as of ');
+  });
+
+  it('carries a waiting item from the tool arguments to the record and the posted text', async () => {
+    const h = harness();
+    const parsed = parseTaskListInput({
+      title: 'Shipping',
+      items: [
+        { text: 'Built it', status: 'done' },
+        { text: 'Merge the fix', status: 'waiting', waiting_on: 'Dana' },
+      ],
+    });
+    if ('error' in parsed) throw new Error(parsed.error);
+
+    const out = await applyTaskListUpdate(parsed, SLACK, h.deps);
+
+    expect(h.state?.items[1]).toEqual({ text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana' });
+    expect(h.state?.finished).toBe(false);
+    expect(h.writes[0].content.text).toBe('Shipping\n✓ Built it\n◷ Merge the fix (waiting on Dana)');
+    expect(h.state?.interruptedText).toBe('Shipping\n✓ Built it\n◷ Merge the fix (waiting on Dana)');
+    expect(h.state?.interruptedSubtext).toStartWith('waiting on Dana · todos as of ');
+    expect(parseTaskListState(JSON.stringify(h.state))?.items[1].waitingOn).toBe('Dana');
+    if (!out.ok) throw new Error(out.error);
+    expect(describeOutcome(out)).toBe('Task list posted (1 done, 0 in progress, 0 pending, 1 waiting).');
+    expect(taskListReminder(h.state)).toContain('◷ Merge the fix (waiting on Dana)');
   });
 });
 

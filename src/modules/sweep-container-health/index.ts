@@ -51,6 +51,7 @@ import {
   type SweepKillSnapshot,
   type SweepSessionContext,
 } from '../../host-sweep.js';
+import { ABSOLUTE_CEILING_KILL } from '../sweep-continuation/kill-state.js';
 
 const oomKillObserver = new OomKillObserver();
 
@@ -607,8 +608,8 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
     killThenFollowUp(
       ctx,
       decision,
-      { reason: 'absolute-ceiling', containerState, pendingClaims, workContinuation },
-      'absolute-ceiling',
+      { reason: ABSOLUTE_CEILING_KILL, containerState, pendingClaims, workContinuation },
+      ABSOLUTE_CEILING_KILL,
     );
     return;
   }

@@ -8,6 +8,7 @@ import { createHash } from 'crypto';
 import { registerDeliveryAction, type DeliveryActionResult } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { SCHEDULE_WAKE_ID_PREFIX, SCHEDULE_WAKE_SYSTEM_KIND } from '../mailbox/ops/lookups.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
@@ -76,7 +77,7 @@ export async function applyScheduleWake(
     }
     const routing = anchoredRouting ?? mailbox.readSessionRouting();
     return mailbox.insertDeferredMessageWithContextIfNew({
-      id: `schedule-wake-${effectiveWakeId}`,
+      id: `${SCHEDULE_WAKE_ID_PREFIX}${effectiveWakeId}`,
       kind: 'chat',
       timestamp: new Date(now).toISOString(),
       platformId: routing?.platform_id ?? null,
@@ -88,7 +89,7 @@ export async function applyScheduleWake(
         text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Use the send_message tool for anything that should post, following its available schema and communication rules; if nothing needs posting, end with no message at all.)`,
         sender: 'system',
         senderId: 'system',
-        _system: { kind: 'agent_scheduled_wake' },
+        _system: { kind: SCHEDULE_WAKE_SYSTEM_KIND },
       }),
       processAfter,
       recurrence: null,

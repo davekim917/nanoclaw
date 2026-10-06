@@ -4,11 +4,18 @@
  */
 import { parseRetryAfterMs } from './channels/chat-sdk-bridge.js';
 import { TASK_LIST_ENABLED } from './config.js';
+import { resolveGroupTimezone } from './container-config.js';
+import { withCentralSync } from './db/central-lease.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
+import type { TaskListSettlement } from './modules/mailbox/ops/lookups.js';
+import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
+import { takesAWake } from './modules/sweep-continuation/kill-state.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { withExistingMailboxSession } from './session-manager.js';
+import { formatLocalTime } from './timezone.js';
+import type { Session } from './types.js';
 
 /** Edits replaced by a later edit of the same message in this batch; `due` must be in delivery order. */
 export function supersededTaskListEdits(
@@ -39,10 +46,49 @@ const KILL_EDIT_MAX_WAIT_MS = 5 * 60_000;
 const KILL_EDIT_WAIT_BUFFER_MS = 250;
 
 /**
+ * The runner's own label says "stopped" (or who every open item waits on), which is all it can know. The host
+ * replaces it only with the one thing it knows for certain: a `wait` the agent armed that has not come due. It never
+ * says the session is resuming. A label the host composes is host literals and host-formatted times only, so nothing
+ * the container wrote sits under a state the host vouches for; with no such `wait`, no usable timestamp, or a session
+ * that takes no wake, the runner's own label stands. So it does when the label cannot be composed: by now the dead
+ * container's queued rows are recorded delivered, and an edit that is not sent leaves the list looking live.
+ */
+async function killSubtext(
+  session: Session,
+  edit: NonNullable<TaskListSettlement['edit']>,
+  nextCheckAt: string | null,
+  reason: string,
+): Promise<string> {
+  if (edit.listedAt === null || nextCheckAt === null) return edit.interruptedSubtext;
+  try {
+    const timezone = await resolveGroupTimezone(session.agent_group_id);
+    const nextCheck = formatLocalTime(nextCheckAt, timezone);
+    return `paused · next check ${nextCheck} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
+  } catch (err) {
+    log.warn(KILL_LABEL_UNAVAILABLE, { sessionId: session.id, reason, err });
+    return edit.interruptedSubtext;
+  }
+}
+
+const KILL_LABEL_UNAVAILABLE = 'Task list kill label unavailable — keeping the runner’s own';
+
+/** The `wait` the label may name. Nothing but the session's own inbound rows is read unless one is armed. */
+async function armedWaitAt(mailbox: NanoclawMailboxSession, session: Session, reason: string): Promise<string | null> {
+  try {
+    const at = mailbox.getNextScheduledWakeAt();
+    if (at === null) return null;
+    return (await withCentralSync(() => takesAWake(session.id), 'task list kill label')) ? at : null;
+  } catch (err) {
+    log.warn(KILL_LABEL_UNAVAILABLE, { sessionId: session.id, reason, err });
+    return null;
+  }
+}
+
+/**
  * Never throws. Fenced through the session's delivery slot: the dead container's queued list rows are recorded
  * delivered-unsent durably first, so a restart can't replay them over the interrupted form. The edit target comes
- * from host-owned evidence and must be the session's own conversation; only the wording is container-written.
- * Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
+ * from host-owned evidence and must be the session's own conversation; the wording is container-written unless the
+ * host composed the label. Rate-limit cooldowns are waited out OUTSIDE the slot, re-deciding each time.
  */
 export async function settleTaskListOnKill(sessionId: string, reason: string): Promise<void> {
   setTypingStatusText(sessionId, null);
@@ -57,10 +103,11 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
       const waitMs = await withSessionDeliverySlot(sessionId, async (): Promise<number> => {
         const adapter = getDeliveryAdapter();
         if (!adapter) return 0;
-        const settlement = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+        const settlement = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
           const found = mailbox.getTaskListSettlement(killedAt);
-          if (found) for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
-          return found;
+          if (!found) return null;
+          for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
+          return { ...found, nextCheckAt: found.edit ? await armedWaitAt(mailbox, session, reason) : null };
         });
         const edit = settlement?.edit;
         if (!edit) return 0;
@@ -77,19 +124,20 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
         }
         const cooling = taskListCooldownMs(edit.channelType);
         if (cooling > 0) return cooling;
+        const subtext = await killSubtext(session, edit, settlement.nextCheckAt, reason);
         try {
           await adapter.deliver(
             edit.channelType,
             edit.platformId,
             edit.threadId,
             'task_list',
-            // Both fields are container-written.
+            // Container-written, unless the host composed the subtext.
             scrubSecrets(
               JSON.stringify({
                 operation: 'edit',
                 messageId: edit.platformMessageId,
                 text: edit.interruptedText,
-                subtext: edit.interruptedSubtext,
+                subtext,
               }),
             ),
             undefined,

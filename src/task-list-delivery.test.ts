@@ -31,9 +31,15 @@ import {
   createMessagingGroupAgent,
   initMigratedTestDb,
 } from './db/index.js';
+import { resolveGroupTimezone } from './container-config.js';
+import { withCentralSync, withRawDb } from './db/central-lease.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
+import { archiveSessionById, createPendingApproval, createPendingQuestion, updateSession } from './db/sessions.js';
+import { log } from './log.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
+import { formatLocalTime } from './timezone.js';
 import { deliverSessionMessages, setDeliveryAdapter, withSessionDeliverySlot } from './delivery.js';
 import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
 import {
@@ -288,6 +294,19 @@ describe('task list delivery (switch on)', () => {
   it('marks an unfinished list stopped when an idle reaper ends its container, too', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'chat-idle-reap');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].content.subtext).toContain('stopped');
+  });
+
+  it('still settles a list record too large or too long for the kill follow-up to read as evidence', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, {
+      padding: 'x'.repeat(200 * 1024),
+      history: Array.from({ length: 100 }, (_unused, index) => index),
+    });
     const calls = captureAdapter();
     await settleTaskListOnKill(sessionId, 'chat-idle-reap');
     expect(calls).toHaveLength(1);
@@ -698,5 +717,288 @@ describe('task list delivery (switch on)', () => {
         content: { operation: 'reaction', messageId: '1786621700.000200', emoji: 'eyes' },
       },
     ]);
+  });
+});
+
+describe('the kill label says only what the host knows for certain', () => {
+  /** What the runner wrote after its own leading state. */
+  const DETAIL = 'todos as of <!date^1^{time} ({ago})|3:00 PM>';
+  const RUNNER_LABEL = `stopped · ${DETAIL}`;
+  const HOUR = 60 * 60_000;
+  const LISTED_AT = '2026-03-04T05:06:07.000Z';
+
+  /** A list last changed on screen at LISTED_AT and saved just now, as every runner save stamps it. */
+  function current(): Record<string, unknown> {
+    return { updatedAt: LISTED_AT, touchedAt: now() };
+  }
+
+  /** The tail of a label the host composed: its own literal and its own rendering of the record's instant. */
+  async function asOf(timezone?: string): Promise<string> {
+    return `todos as of ${formatLocalTime(LISTED_AT, timezone ?? (await resolveGroupTimezone('ag-1')))}`;
+  }
+
+  function insertInbound(
+    sessionId: string,
+    row: { id: string; processAfter?: string; trigger?: number; content?: string },
+  ): void {
+    const db = new Database(inboundDbPath('ag-1', sessionId));
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, process_after, content)
+       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'pending', ?, ?, ?)`,
+    ).run(
+      row.id,
+      now(),
+      row.trigger ?? 1,
+      row.processAfter ?? null,
+      row.content ?? JSON.stringify({ text: 'check the deploy' }),
+    );
+    db.close();
+  }
+
+  const WAIT_CONTENT = JSON.stringify({ text: 'check the deploy', _system: { kind: 'agent_scheduled_wake' } });
+
+  /** The row the `wait` action writes: its id prefix and system kind, inert until admission. */
+  function armWait(sessionId: string, name: string, processAfter: string): void {
+    insertInbound(sessionId, { id: `schedule-wake-${name}`, processAfter, trigger: 0, content: WAIT_CONTENT });
+  }
+
+  const inHours = (hours: number): string => new Date(Date.now() + hours * HOUR).toISOString();
+
+  async function label(sessionId: string): Promise<unknown> {
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'chat-idle-reap');
+    expect(calls).toHaveLength(1);
+    return calls[0].content.subtext;
+  }
+
+  function setOutboundState(sessionId: string, key: string, value: unknown): void {
+    const db = outbound(sessionId);
+    db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      key,
+      JSON.stringify(value),
+      now(),
+    );
+    db.close();
+  }
+
+  async function listed(overrides: Record<string, unknown> = current()): Promise<string> {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, overrides);
+    return sessionId;
+  }
+
+  it('keeps the runner’s label when nothing is queued', async () => {
+    const sessionId = await listed();
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  it.each([
+    ['a message that is due', (sessionId: string) => insertInbound(sessionId, { id: 'human-1' })],
+    [
+      'a saved continuation',
+      (sessionId: string) =>
+        setOutboundState(sessionId, 'work_continuation', {
+          id: 'cont-1',
+          task: 'finish the rehearsal',
+          phase: 'queued',
+          chain: 1,
+          resume_attempts: 0,
+        }),
+    ],
+    [
+      'a batch the container had claimed',
+      (sessionId: string) => {
+        insertInbound(sessionId, { id: 'human-1' });
+        const db = outbound(sessionId);
+        db.prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', ?)").run(
+          'human-1',
+          now(),
+        );
+        db.close();
+      },
+    ],
+    [
+      'a recovery wake already queued',
+      (sessionId: string) => {
+        insertInbound(sessionId, { id: 'reap-respawn-1790000000000', trigger: 0 });
+        insertInbound(sessionId, { id: 'recall-reap-respawn-1790000000000', trigger: 0 });
+      },
+    ],
+  ])('never claims the session is resuming: %s leaves the runner’s label', async (_l, arrange) => {
+    const sessionId = await listed();
+    arrange(sessionId);
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  it('paused with the next check, in the group’s timezone, when the agent armed a wait', async () => {
+    const sessionId = await listed();
+    const nextCheck = inHours(3);
+    armWait(sessionId, 'a', nextCheck);
+    await ensureContainerConfig('ag-1');
+    await updateContainerConfigScalars('ag-1', { timezone: 'Asia/Tokyo' });
+
+    expect(await label(sessionId)).toBe(
+      `paused · next check ${formatLocalTime(nextCheck, 'Asia/Tokyo')} · ${await asOf('Asia/Tokyo')}`,
+    );
+    expect(formatLocalTime(nextCheck, 'Asia/Tokyo')).not.toBe(formatLocalTime(nextCheck, 'America/Anchorage'));
+  });
+
+  it('names the earliest of several waits', async () => {
+    const sessionId = await listed();
+    const sooner = inHours(2);
+    armWait(sessionId, 'later', inHours(5));
+    armWait(sessionId, 'sooner', sooner);
+    armWait(sessionId, 'latest', inHours(9));
+    expect(await label(sessionId)).toBe(
+      `paused · next check ${formatLocalTime(sooner, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
+    );
+  });
+
+  it.each([
+    ['a context row', 'context-1', undefined],
+    ['a recovery wake', 'ceiling-respawn-tool-fictional', undefined],
+    ['a row that only resembles a wait', 'reschedule-wake-1', WAIT_CONTENT],
+    ['a row with the wait prefix that the wait action did not write', 'schedule-wake-forwarded', undefined],
+    ['a row with the wait prefix whose content is not JSON', 'schedule-wake-garbled', '{not json'],
+  ])('a future row that is not a wait (%s) is not a check the agent promised', async (_l, id, content) => {
+    const sessionId = await listed();
+    insertInbound(sessionId, { id, processAfter: inHours(3), trigger: 0, content });
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  it('a wait that has already come due is no longer a next check', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', new Date(Date.now() - 60_000).toISOString());
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  it('a wait that already ran is not a next check', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', inHours(3));
+    const db = new Database(inboundDbPath('ag-1', sessionId));
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'schedule-wake-a'").run();
+    db.close();
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  it('an unanswered card is not something the host labels: answering it wakes nothing', async () => {
+    const sessionId = await listed();
+    const postedAt = new Date(Date.now() - HOUR).toISOString();
+    await createPendingApproval({
+      approval_id: 'appr-1',
+      session_id: sessionId,
+      request_id: 'req-1',
+      action: 'request_choice',
+      payload: '{}',
+      created_at: postedAt,
+      title: 'Ship it?',
+      options_json: '[]',
+    });
+    await createPendingQuestion({
+      question_id: 'q-1',
+      session_id: sessionId,
+      message_out_id: 'out-1',
+      platform_id: PLATFORM,
+      channel_type: 'slack',
+      thread_id: THREAD,
+      title: 'Which region?',
+      question: 'Which region should the rehearsal use?',
+      options: [],
+      created_at: postedAt,
+    });
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  describe('a session that takes no wake keeps the runner’s label', () => {
+    const ENDED = [
+      ['archived', (sessionId: string) => archiveSessionById(sessionId)],
+      ['closed', (sessionId: string) => updateSession(sessionId, { status: 'closed' })],
+    ] as const;
+
+    it.each(ENDED)('%s, holding a wait', async (_state, end) => {
+      const sessionId = await listed();
+      armWait(sessionId, 'a', inHours(1));
+      await end(sessionId);
+      expect(await label(sessionId)).toBe(RUNNER_LABEL);
+    });
+  });
+
+  it('keeps the runner’s own label when every open item waits on someone', async () => {
+    const sessionId = await listed({
+      ...current(),
+      items: [{ text: 'Merge the fix', status: 'waiting', waitingOn: 'Dana' }],
+      interruptedSubtext: `waiting on Dana · ${DETAIL}`,
+    });
+    expect(await label(sessionId)).toBe(`waiting on Dana · ${DETAIL}`);
+  });
+
+  it('a record from an older runner gets the host’s label too: nothing in it comes from the record but an instant', async () => {
+    const sessionId = await listed({ updatedAt: LISTED_AT });
+    const nextCheck = inHours(3);
+    armWait(sessionId, 'a', nextCheck);
+    expect(await label(sessionId)).toBe(
+      `paused · next check ${formatLocalTime(nextCheck, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
+    );
+  });
+
+  it.each([
+    ['a forged second line', 'todos as of now\n# forged state @everyone'],
+    ['an oversized footer', `todos as of ${'x'.repeat(20_000)}`],
+  ])('a host-composed label carries none of the container’s label text: %s', async (_l, hostile) => {
+    const sessionId = await listed({
+      ...current(),
+      subtext: hostile,
+      interruptedSubtext: `stopped · ${hostile}`,
+      interruptedDetail: hostile,
+    });
+    const nextCheck = inHours(3);
+    armWait(sessionId, 'a', nextCheck);
+    expect(await label(sessionId)).toBe(
+      `paused · next check ${formatLocalTime(nextCheck, await resolveGroupTimezone('ag-1'))} · ${await asOf()}`,
+    );
+  });
+
+  it.each([['not a time'], [42], [undefined]])(
+    'keeps the runner’s label when the record’s on-screen stamp is %j, not an instant',
+    async (updatedAt) => {
+      const sessionId = await listed({ updatedAt, touchedAt: now() });
+      armWait(sessionId, 'a', inHours(3));
+      expect(await label(sessionId)).toBe(RUNNER_LABEL);
+    },
+  );
+
+  it('still sends the interrupted edit, under the runner’s label, when the label cannot be composed', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', inHours(3));
+    await withCentralSync(() =>
+      withRawDb((db) => db.exec('ALTER TABLE container_configs RENAME TO container_configs_gone')),
+    );
+    await expect(resolveGroupTimezone('ag-1')).rejects.toThrow('container_configs');
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+    expect(warn).toHaveBeenCalledWith(
+      'Task list kill label unavailable — keeping the runner’s own',
+      expect.objectContaining({ sessionId }),
+    );
+  });
+
+  it('still marks the list interrupted, under the runner’s label, when the session’s rows cannot be read', async () => {
+    const sessionId = await listed();
+    armWait(sessionId, 'a', inHours(3));
+    const db = new Database(inboundDbPath('ag-1', sessionId));
+    db.exec('ALTER TABLE messages_in RENAME COLUMN process_after TO process_after_gone');
+    db.close();
+
+    expect(await label(sessionId)).toBe(RUNNER_LABEL);
+  });
+
+  it('scrubs a registered secret from a label the runner wrote', async () => {
+    registerSecrets({ API_TOKEN: 'sk-live-abcdef123456' });
+    const sessionId = await listed({ ...current(), interruptedSubtext: 'stopped · todos as of sk-live-abcdef123456' });
+    const subtext = await label(sessionId);
+    expect(subtext).toMatch(/^stopped · todos as of /);
+    expect(subtext).not.toContain('sk-live-abcdef123456');
   });
 });
