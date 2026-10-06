@@ -11,7 +11,6 @@ import { initDb } from '../db/connection.js';
 import { createDiscordAdapter, DiscordFormatConverter } from '@chat-adapter/discord';
 
 import {
-  installForwardUnwrap,
   installThreadParentResolve,
   isUserMessage,
   parseDiscordWorkspaces,
@@ -29,7 +28,6 @@ import {
   extractDiscordChannelId,
   discordChannelPermalink,
   discordPermalink,
-  unwrapForwardedSnapshot,
   type DiscordBotIdentity,
   type DiscordRestClient,
 } from './discord.js';
@@ -913,20 +911,6 @@ describe('installMessageThreadAutoCreate', () => {
   });
 });
 
-// Ported from upstream 437a5f064 (fix(discord): unwrap forwarded-message
-// snapshots so agents see forwarded content).
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function forwardPayload(snapshotMessage: Record<string, any> | null, overrides: Record<string, any> = {}) {
-  return {
-    id: '123',
-    content: '',
-    attachments: [] as unknown[],
-    message_reference: { type: 1, channel_id: 'c1', message_id: 'm1' },
-    ...(snapshotMessage ? { message_snapshots: [{ message: snapshotMessage }] } : {}),
-    ...overrides,
-  };
-}
-
 describe('openRecoveredMentionThread', () => {
   const platformId = 'discord:g1:c1';
 
@@ -961,104 +945,6 @@ describe('openRecoveredMentionThread', () => {
     const post = vi.fn();
     await expect(openRecoveredMentionThread({ post }, id, { id: 'm1', text: 'hi' })).resolves.toBeNull();
     expect(post).not.toHaveBeenCalled();
-  });
-});
-
-describe('unwrapForwardedSnapshot', () => {
-  it('unwraps forwarded text into content with a label', () => {
-    const data = forwardPayload({ content: 'hello from the past', attachments: [] });
-    unwrapForwardedSnapshot(data);
-    expect(data.content).toBe('[Forwarded message]\nhello from the past');
-  });
-
-  it('unwraps attachment-only forwards: label + merged attachments', () => {
-    const att = { filename: 'photo.png', content_type: 'image/png', size: 1234, url: 'https://cdn.example/photo.png' };
-    const data = forwardPayload({ content: '', attachments: [att] });
-    unwrapForwardedSnapshot(data);
-    expect(data.content).toBe('[Forwarded message]');
-    expect(data.attachments).toEqual([att]);
-  });
-
-  it('merges snapshot attachments after existing ones', () => {
-    const existing = { filename: 'own.txt', content_type: 'text/plain', size: 1, url: 'https://cdn.example/own.txt' };
-    const fwd = { filename: 'fwd.jpg', content_type: 'image/jpeg', size: 2, url: 'https://cdn.example/fwd.jpg' };
-    const data = forwardPayload({ content: 'look', attachments: [fwd] }, { attachments: [existing] });
-    unwrapForwardedSnapshot(data);
-    expect(data.attachments).toEqual([existing, fwd]);
-    expect(data.content).toBe('[Forwarded message]\nlook');
-  });
-
-  it('leaves plain messages untouched', () => {
-    const data = { id: '1', content: 'hi', attachments: [] };
-    unwrapForwardedSnapshot(data);
-    expect(data).toEqual({ id: '1', content: 'hi', attachments: [] });
-  });
-
-  it('leaves normal replies (type 0) untouched — those ride referenced_message', () => {
-    const data = {
-      id: '1',
-      content: 'a reply',
-      attachments: [],
-      message_reference: { type: 0, message_id: 'm0' },
-      referenced_message: { content: 'original', author: { username: 'alice' } },
-    };
-    unwrapForwardedSnapshot(data);
-    expect(data.content).toBe('a reply');
-  });
-
-  it('is a no-op when a forward has no snapshots', () => {
-    const data = forwardPayload(null);
-    unwrapForwardedSnapshot(data);
-    expect(data.content).toBe('');
-    expect(data.attachments).toEqual([]);
-  });
-
-  it('joins multiple snapshots', () => {
-    const data = forwardPayload(null, {
-      message_snapshots: [
-        { message: { content: 'one', attachments: [] } },
-        { message: { content: 'two', attachments: [] } },
-      ],
-    });
-    unwrapForwardedSnapshot(data);
-    expect(data.content).toBe('[Forwarded message]\none\ntwo');
-  });
-});
-
-describe('installForwardUnwrap', () => {
-  it('unwraps before the adapter handler runs, on the live webhook-forwarded seam', async () => {
-    // This install runs the Gateway listener in webhook-forwarding mode, so
-    // every MESSAGE_CREATE lands on handleForwardedMessage as raw Discord JSON.
-    const seen: Array<Record<string, unknown>> = [];
-    const adapter = {
-      handleForwardedMessage: async (data: Record<string, unknown>) => {
-        seen.push({ content: data.content, attachments: data.attachments });
-      },
-    };
-
-    installForwardUnwrap(adapter as never);
-    await (adapter as unknown as { handleForwardedMessage: (d: unknown) => Promise<void> }).handleForwardedMessage(
-      forwardPayload({ content: 'forwarded body', attachments: [] }),
-    );
-
-    expect(seen).toHaveLength(1);
-    expect(seen[0].content).toBe('[Forwarded message]\nforwarded body');
-  });
-
-  it('passes a plain message through unchanged', async () => {
-    const seen: string[] = [];
-    const adapter = {
-      handleForwardedMessage: async (data: Record<string, unknown>) => {
-        seen.push(data.content as string);
-      },
-    };
-    installForwardUnwrap(adapter as never);
-    await (adapter as unknown as { handleForwardedMessage: (d: unknown) => Promise<void> }).handleForwardedMessage({
-      id: '9',
-      content: 'plain',
-      attachments: [],
-    });
-    expect(seen).toEqual(['plain']);
   });
 });
 
