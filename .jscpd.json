@@ -21,7 +21,7 @@
     },
     {
       "files": ["src/plugin-skill-discovery.ts", "container/agent-runner/src/plugin-skill-discovery.ts"],
-      "reason": "Host and container discover plugin skills by the same rules; src/plugin-skill-discovery.test.ts asserts the runner copy stays logically identical."
+      "reason": "Host and container discover plugin skills by the same rules; src/plugin-skill-discovery-parity-tripwire.test.ts asserts the runner copy stays logically identical."
     },
     {
       "files": ["src/outcome-reporting-schema.ts", "container/agent-runner/src/outcome-reporting-schema.ts"],

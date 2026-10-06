@@ -55,7 +55,7 @@ const PREFIX_IMPORTERS: readonly string[] = ['src/agent-runner-source.ts', 'src/
 
 /** Defines the constant, so it is not an importer. */
 const PREFIX_DEFINER = 'src/config.ts';
-const SELF = 'src/container-labels.test.ts';
+const SELF = 'src/container-labels-tripwire.test.ts';
 
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:"'`])\/\/[^\n]*/g, (_m, lead: string) => lead);
