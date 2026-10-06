@@ -485,3 +485,34 @@ export function getCurrentLifecycleStatus(): string | null {
 export function clearCurrentLifecycleStatus(): void {
   deleteValue(LIFECYCLE_STATUS_KEY);
 }
+
+/** Read by the host's chat idle reap: work this container left in its topic checkouts at its last turn end. */
+const WORKTREE_IN_FLIGHT_KEY = 'worktree_in_flight';
+
+export interface WorktreeInFlightCheckout {
+  name: string;
+  branch: string | null;
+  upstream: string | null;
+  upstream_head: string | null;
+  files: string[];
+  file_count: number;
+  unpushed: number;
+}
+
+export interface WorktreeInFlight {
+  at: string;
+  checkouts: WorktreeInFlightCheckout[];
+}
+
+export function setWorktreeInFlight(record: WorktreeInFlight): void {
+  setValue(WORKTREE_IN_FLIGHT_KEY, JSON.stringify(record));
+}
+
+export function getWorktreeInFlight(): WorktreeInFlight | undefined {
+  const raw = getValue(WORKTREE_IN_FLIGHT_KEY);
+  return raw === undefined ? undefined : (JSON.parse(raw) as WorktreeInFlight);
+}
+
+export function clearWorktreeInFlight(): void {
+  deleteValue(WORKTREE_IN_FLIGHT_KEY);
+}

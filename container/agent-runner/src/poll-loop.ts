@@ -103,6 +103,7 @@ import type {
   PromptAttachment,
 } from './providers/types.js';
 import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
+import { recordWorktreeInFlight, snapshotWorktrees } from './worktree-in-flight.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 import { isFreshContextTaskBatch, sessionHasOpenWork, startsFreshFire } from './fresh-context-task.js';
@@ -365,9 +366,15 @@ export interface PollLoopConfig {
    */
   signal?: AbortSignal;
   autosaveWorktrees?: (reason: string) => Promise<AutoSaveResult>;
+  /** Replaces the startup worktree baseline and its turn-end record. */
+  recordWorktreeInFlight?: () => Promise<void>;
 }
 
-async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<AutoSaveResult>): Promise<void> {
+async function checkpointTurnEnd(
+  autosaveWorktrees: (reason: string) => Promise<AutoSaveResult>,
+  recordInFlight: () => Promise<void>,
+): Promise<void> {
+  await recordInFlight();
   const autosave = await autosaveWorktrees('turn end');
   if (autosave.committed.length > 0 || autosave.failed.length > 0) {
     log(
@@ -426,6 +433,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
+
+  // Before the first turn, so nothing this container writes can land in the baseline.
+  const worktreeBaseline = config.recordWorktreeInFlight ? null : await snapshotWorktrees(undefined, { log });
+  const recordInFlight = config.recordWorktreeInFlight ?? (() => recordWorktreeInFlight(worktreeBaseline, { log }));
 
   let pollCount = 0;
   let isFirstPoll = true;
@@ -531,7 +542,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           beginProviderBusyScope();
           try {
             await emitTurnEnd();
-            await checkpointTurnEnd(autosaveWorktrees);
+            await checkpointTurnEnd(autosaveWorktrees, recordInFlight);
           } finally {
             endProviderBusyScope();
           }
@@ -1232,7 +1243,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       // Sibling agents share this checkout: turn-end code must never stage,
       // commit, reset, or remove another sibling's index lock.
-      await checkpointTurnEnd(autosaveWorktrees);
+      await checkpointTurnEnd(autosaveWorktrees, recordInFlight);
     } finally {
       endProviderBusyScope();
     }
