@@ -76,7 +76,6 @@ function mountPathArgs(args: Record<string, unknown>): { hostPath: string; conta
   return { hostPath, containerPath };
 }
 
-/** `--speed` accepts only a tier the provider declares (`PROVIDER_SPEED_TIERS`); `""` (clear) never reaches here. */
 function assertProviderSpeedTier(speed: string, provider: string): void {
   const tiers = PROVIDER_SPEED_TIERS[provider];
   if (!tiers) throw new Error(`provider "${provider}" has no speed tiers; --speed accepts only "" (clear)`);
@@ -533,8 +532,13 @@ registerResource({
         if (timezone !== undefined) updates.timezone = timezone;
         if (args.speed !== undefined) {
           const speed = String(args.speed);
-          // Validated against the provider the group will run on: a `--provider` in this command wins over the stored one.
-          if (speed !== '') assertProviderSpeedTier(speed, resolveProviderName(updates.provider, row.provider));
+          if (speed !== '') {
+            const provider =
+              updates.provider !== undefined
+                ? resolveProviderName(null, updates.provider)
+                : await resolveGroupProvider(id);
+            assertProviderSpeedTier(speed, provider);
+          }
           updates.speed = speed || null;
         }
         // Empty is an explicit clear. A group matching the provider default must not keep a redundant pin that would

@@ -225,6 +225,7 @@ describe('parseRawConfig speed tier', () => {
   it('passes a non-empty tier through and treats "" as unset', () => {
     expect(parseRawConfig({ provider: 'claude', speed: 'fast' }).speed).toBe('fast');
     expect(parseRawConfig({ provider: 'claude', speed: '' }).speed).toBeUndefined();
+    expect(parseRawConfig({ provider: 'claude', speed: 'turbo' }).speed).toBeUndefined();
     expect(parseRawConfig({ provider: 'claude' }).speed).toBeUndefined();
   });
 

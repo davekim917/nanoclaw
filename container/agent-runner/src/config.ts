@@ -120,8 +120,10 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   };
 }
 
+const SPEED_TIERS: ReadonlySet<string> = new Set(['standard', 'fast']);
+
 function readSpeed(raw: Record<string, unknown>): string | undefined {
-  return typeof raw.speed === 'string' && raw.speed !== '' ? raw.speed : undefined;
+  return typeof raw.speed === 'string' && SPEED_TIERS.has(raw.speed) ? raw.speed : undefined;
 }
 
 /**

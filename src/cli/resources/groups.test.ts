@@ -1319,7 +1319,12 @@ describe('groups config update --speed', () => {
     fs.mkdirSync(groupDir, { recursive: true });
     fs.writeFileSync(
       `${groupDir}/container.json`,
-      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+      JSON.stringify({
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        skills: 'all',
+        ...(provider ? { provider } : {}),
+      }) + '\n',
     );
   }
 
@@ -1375,5 +1380,29 @@ describe('groups config update --speed', () => {
     );
     expect(switching.ok).toBe(true);
     expect((await getContainerConfig('ag-speed-codex'))?.speed).toBe('fast');
+  });
+
+  it('validates against the container.json provider, not the DB projection', async () => {
+    await seedGroup('ag-speed-lag', 'speed-lag', 'codex');
+    await updateContainerConfigScalars('ag-speed-lag', { provider: 'claude' });
+    const lagging = await dispatch(
+      { id: 'req-speed-lag', command: 'groups-config-update', args: { id: 'ag-speed-lag', speed: 'fast' } },
+      { caller: 'host' },
+    );
+    expect(lagging.ok).toBe(false);
+    if (lagging.ok) throw new Error('unreachable');
+    expect(JSON.stringify(lagging.error)).toMatch(/no speed tiers/);
+
+    // Clearing the provider in the same command selects the default, which has tiers.
+    const cleared = await dispatch(
+      {
+        id: 'req-speed-clear-provider',
+        command: 'groups-config-update',
+        args: { id: 'ag-speed-lag', provider: '', speed: 'fast' },
+      },
+      { caller: 'host' },
+    );
+    expect(cleared.ok).toBe(true);
+    expect((await getContainerConfig('ag-speed-lag'))?.speed).toBe('fast');
   });
 });
