@@ -326,12 +326,35 @@ describe('worktree in-flight record', () => {
   it('takes no baseline, within the budget, when listing the root stalls', async () => {
     makeCheckout();
     const startedAt = Date.now();
-    const baseline = await snapshotWorktrees(worktrees, {
-      budgetMs: 50,
-      opendir: (dir) => new Promise((resolve) => setTimeout(() => resolve(fs.promises.opendir(dir)), 1_000)),
-    });
+    const baseline = await snapshotWorktrees(worktrees, { budgetMs: 50, listCommand: () => ['sleep', '2'] });
     expect(baseline).toBeNull();
     expect(Date.now() - startedAt).toBeLessThan(400);
+  });
+
+  it('inventories only 32 of 400 checkouts and marks the baseline truncated', async () => {
+    for (let i = 0; i < 400; i++)
+      fs.mkdirSync(path.join(worktrees, `c${String(i).padStart(3, '0')}`, '.git'), { recursive: true });
+    const baseline = await snapshotWorktrees(worktrees);
+    expect(baseline!.truncated).toBe(true);
+    expect(baseline!.checkouts.size).toBe(32);
+  });
+
+  it('treats a listing cut off at the byte cap as truncated, even with no checkout found', async () => {
+    // 400 long-named plain directories print well over the 64 KiB listing cap.
+    for (let i = 0; i < 400; i++)
+      fs.mkdirSync(path.join(worktrees, `${String(i).padStart(3, '0')}-${'n'.repeat(200)}`));
+    const baseline = await snapshotWorktrees(worktrees);
+    expect(baseline).toEqual({ root: worktrees, checkouts: new Map(), truncated: true });
+  });
+
+  it('kills an endless listing at the byte cap instead of reading it to the deadline', async () => {
+    const startedAt = Date.now();
+    const baseline = await snapshotWorktrees(worktrees, {
+      budgetMs: 5_000,
+      listCommand: () => ['sh', '-c', 'yes not-a-checkout | tr "\\n" "\\0"'],
+    });
+    expect(baseline).toEqual({ root: worktrees, checkouts: new Map(), truncated: true });
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
   });
 
   it('takes an empty baseline when there is no worktrees root', async () => {

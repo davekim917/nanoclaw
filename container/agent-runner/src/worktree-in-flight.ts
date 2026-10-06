@@ -3,7 +3,7 @@
  * before the first turn is subtracted at every turn end, so dirt an earlier container left is never reported and
  * deletions need no timestamps. The host's chat idle reap reads the record to decide on an accountability wake.
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -22,6 +22,8 @@ const MAX_FILES_RECORDED = 20;
 /** The host drops a longer or multi-line string, so every recorded string is cut to fit it. */
 const MAX_RECORDED_CHARS = 200;
 const COMMAND_TIMEOUT_MS = 5_000;
+/** Far past 32 names; the listing child is killed here and the listing counts as truncated. */
+const LISTING_MAX_BYTES = 64 * 1024;
 const BUDGET_MS = 20_000;
 
 interface CheckoutBaseline {
@@ -45,7 +47,7 @@ export interface InFlightOptions {
   log?: (msg: string) => void;
   /** Test seams. */
   lstat?: (file: string) => Promise<fs.Stats>;
-  opendir?: (dir: string) => Promise<fs.Dir>;
+  listCommand?: (root: string) => string[];
   now?: () => number;
 }
 
@@ -164,55 +166,97 @@ function git(
   return budget.race(run, () => abort.abort());
 }
 
-/** Streamed, so a huge root costs at most the budget; stops at the first checkout past the cap. */
+function findDirectories(root: string): string[] {
+  return ['find', root, '-mindepth', '1', '-maxdepth', '1', '-type', 'd', '!', '-name', '.*', '-print0'];
+}
+
+/**
+ * The root's subdirectory names, read in a child process: Bun's `Dir.read()` buffers the whole directory on its
+ * first call and cannot be cancelled, while a child can be killed at the byte cap or the deadline.
+ */
+function listDirectoryNames(
+  root: string,
+  budget: Budget,
+  opts: InFlightOptions,
+): Promise<{ names: string[]; complete: boolean }> {
+  const [command, ...args] = (opts.listCommand ?? findDirectories)(root);
+  const abort = new AbortController();
+  const run = (): Promise<{ names: string[]; complete: boolean }> =>
+    new Promise((resolve, reject) => {
+      const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], signal: abort.signal });
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let settled = false;
+      let stderr = '';
+      const finish = (complete: boolean): void => {
+        if (settled) return;
+        settled = true;
+        const entries = Buffer.concat(chunks).toString('utf8').split('\0');
+        // Complete output ends with a NUL, leaving an empty last element; capped output may end mid-name.
+        entries.pop();
+        resolve({ names: entries.filter(Boolean).map((entry) => path.basename(entry)), complete });
+      };
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (settled) return;
+        const room = LISTING_MAX_BYTES - bytes;
+        chunks.push(chunk.subarray(0, room));
+        bytes += Math.min(chunk.length, room);
+        if (chunk.length >= room) {
+          // Settled here, not on 'close': a grandchild holding the pipe open would delay 'close' indefinitely.
+          child.kill('SIGKILL');
+          child.stdout.destroy();
+          finish(false);
+        }
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        if (stderr.length < 2_000) stderr += chunk.toString('utf8');
+      });
+      child.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
+      child.on('close', (code) => {
+        if (settled) return;
+        if (code !== 0) {
+          settled = true;
+          reject(new Error(`listing ${root}: exit ${code}: ${stderr.trim().split('\n').pop() ?? ''}`));
+          return;
+        }
+        finish(true);
+      });
+    });
+  return budget.race(run, () => abort.abort());
+}
+
+/** Stops at the first checkout past the cap; a listing cut short at the byte cap also counts as truncated. */
 async function listCheckouts(
   root: string,
   budget: Budget,
   opts: InFlightOptions,
 ): Promise<{ names: string[]; truncated: boolean }> {
-  const openDir = opts.opendir ?? ((dir: string) => fs.promises.opendir(dir));
-  let dir: fs.Dir;
+  let rootStat: fs.Stats;
   try {
-    dir = await budget.race(() => openDir(root));
+    rootStat = await budget.race(() => fs.promises.stat(root));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { names: [], truncated: false };
     throw err;
   }
+  if (!rootStat.isDirectory()) throw new Error(`${root} is not a directory`);
+  const listing = await listDirectoryNames(root, budget, opts);
   const names: string[] = [];
-  let truncated = false;
-  try {
-    for (;;) {
-      let entry: fs.Dirent | null;
-      try {
-        entry = await budget.race(() => dir.read());
-      } catch (err) {
-        // Bun opens lazily: a missing root surfaces on the first read, not at opendir.
-        if (names.length === 0 && (err as NodeJS.ErrnoException).code === 'ENOENT') break;
-        throw err;
-      }
-      if (entry === null) break;
-      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-      const isCheckout = await budget.race(() =>
-        fs.promises.lstat(path.join(root, entry.name, '.git')).then(
-          () => true,
-          () => false,
-        ),
-      );
-      if (!isCheckout) continue;
-      if (names.length === MAX_CHECKOUTS) {
-        truncated = true;
-        break;
-      }
-      names.push(entry.name);
-    }
-  } finally {
-    // Not awaited: a close behind a stalled read must not hold the caller past the budget.
-    // Bun's `Dir.close()` can return undefined rather than a promise, hence the wrapper.
-    void Promise.resolve()
-      .then(() => dir.close())
-      .catch(() => undefined);
+  for (const name of listing.names) {
+    const isCheckout = await budget.race(() =>
+      fs.promises.lstat(path.join(root, name, '.git')).then(
+        () => true,
+        () => false,
+      ),
+    );
+    if (!isCheckout) continue;
+    if (names.length === MAX_CHECKOUTS) return { names: names.sort(), truncated: true };
+    names.push(name);
   }
-  return { names: names.sort(), truncated };
+  return { names: names.sort(), truncated: !listing.complete };
 }
 
 async function worktreeStat(checkout: string, rel: string, budget: Budget, opts: InFlightOptions): Promise<string> {
