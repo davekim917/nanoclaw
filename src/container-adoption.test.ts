@@ -252,6 +252,7 @@ import {
   getAdoptedSessionIds,
   getContainerIdentity,
   killContainer,
+  stopOrphanedSessions,
   getContainerSpawnedAt,
   hasPendingAdoption,
   isAdoptedContainer,
@@ -1038,5 +1039,40 @@ describe('adoptRunningSessions', () => {
     const spawnedAt = getContainerSpawnedAt('sess-ceiling');
     expect(spawnedAt).toBeGreaterThanOrEqual(before);
     expect(spawnedAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  describe('stopOrphanedSessions', () => {
+    it('leaves a supervised session whose rows exist alone', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-kept');
+      fakes.listing = [survivor('sess-kept')];
+      await adoptRunningSessions({ list: fakes.list });
+
+      expect(await stopOrphanedSessions()).toBe(0);
+      expect(fakes.stopped).toEqual([]);
+      expect(isContainerRunning('sess-kept')).toBe(true);
+    });
+
+    it('stops a supervised session whose row was deleted', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-gone');
+      fakes.listing = [survivor('sess-gone')];
+      await adoptRunningSessions({ list: fakes.list });
+      await getDb().run('DELETE FROM sessions WHERE id = ?', 'sess-gone');
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-gone']);
+      expect(warnings('Stopping container whose session or agent group was deleted')).toHaveLength(1);
+    });
+
+    it('stops a supervised session whose agent group was deleted', async () => {
+      await seedSession(TEST_DATA_DIR, 'sess-groupless');
+      fakes.listing = [survivor('sess-groupless')];
+      await adoptRunningSessions({ list: fakes.list });
+      // `ncl groups delete` order: the sessions FK means the group row can only go once its sessions have.
+      await getDb().run('DELETE FROM sessions WHERE agent_group_id = ?', CLAIM_HARNESS_AGENT_GROUP_ID);
+      await getDb().run('DELETE FROM agent_groups WHERE id = ?', CLAIM_HARNESS_AGENT_GROUP_ID);
+
+      expect(await stopOrphanedSessions()).toBe(1);
+      expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-groupless']);
+    });
   });
 });

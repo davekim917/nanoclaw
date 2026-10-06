@@ -61,5 +61,6 @@ import './sweep-promise-watch/index.js';
 import './sweep-scheduling/index.js';
 
 import './sweep-task-escalation/index.js';
+import './sweep-orphan-containers/index.js';
 
 import './mcp-oauth/index.js';

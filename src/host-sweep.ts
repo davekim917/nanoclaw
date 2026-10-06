@@ -576,6 +576,7 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   FORK4: 'mcp-oauth-refresh',
   FORK5: 'promise-watch',
   FORK6: 'provider-fallback-return',
+  FORK7: 'orphan-containers',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',
