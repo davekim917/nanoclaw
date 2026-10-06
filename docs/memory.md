@@ -173,7 +173,7 @@ Every pair then contains only the newly relevant evidence delta:
    frontmatter itself is stripped before injection;
 2. up to three lexical archive excerpts, preferring the current thread;
 3. a separately bounded exact Slack/Discord permalink lane when the input
-   contains a supported message link; and
+   contains a supported message link;
 4. explicit degraded, conflict, truncation, already-delivered, or no-match
    notices; and
 5. a live-work snapshot (`src/live-work-digest.ts`): the workgroup's unexpired
