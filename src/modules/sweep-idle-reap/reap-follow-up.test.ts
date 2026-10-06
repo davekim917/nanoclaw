@@ -45,7 +45,8 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
 });
 
 import { CHAT_IDLE_REAP_MS } from './index.js';
-import { _settleChatReapFollowUpsForTesting, containerStartedAtMs } from './reap-follow-up.js';
+import { containerStartedAtMs } from '../../container-runner.js';
+import { _settleChatReapFollowUpsForTesting } from './reap-follow-up.js';
 import {
   _lastSweepTickStatsForTesting,
   _listSweepRegistrationsForTesting,
