@@ -53,7 +53,7 @@ export interface LiveWorkDigest {
   sessions: LiveWorkSession[];
   claims: LiveWorkClaim[];
   omitted: number;
-  /** The candidate scan hit its cap, so an empty snapshot does not show that nothing is under way. */
+  /** A candidate session went unread (cap or unreadable), so an empty snapshot does not show nothing is under way. */
   partial: boolean;
 }
 
@@ -121,6 +121,7 @@ async function readOpenLists(
     LIVE_WORK_BOUNDS.candidateSessions,
   );
   const open: OpenList[] = [];
+  let partial = rows.length >= LIVE_WORK_BOUNDS.candidateSessions;
   for (const row of rows) {
     let list: TaskListInFlight | null | undefined;
     try {
@@ -130,6 +131,7 @@ async function readOpenLists(
       // eslint-disable-next-line no-catch-all/no-catch-all -- one unreadable session database must not blank the others
     } catch (err) {
       log.debug('Live work digest: unreadable session, skipped', { sessionId: row.id, err });
+      partial = true;
       continue;
     }
     if (!list || !(Date.parse(list.at) >= now - LIVE_WORK_BOUNDS.listWindowMs)) continue;
@@ -137,7 +139,7 @@ async function readOpenLists(
     open.push({ row, list });
   }
   open.sort((a, b) => Date.parse(b.list.at) - Date.parse(a.list.at) || a.row.id.localeCompare(b.row.id));
-  return { open, partial: rows.length >= LIVE_WORK_BOUNDS.candidateSessions };
+  return { open, partial };
 }
 
 function markedItems(list: TaskListInFlight): string[] {

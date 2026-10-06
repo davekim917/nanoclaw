@@ -171,7 +171,7 @@ describe('buildLiveWorkDigest', () => {
       ['handoff', 'parked', 'https://chat.example/slack:CBUILD:8.000'],
     ]);
     expect(digest?.omitted).toBe(0);
-    expect(digest?.partial).toBe(false);
+    expect(digest?.partial).toBe(true);
   });
 
   it('returns an empty snapshot when the only work is this conversation’s own', async () => {

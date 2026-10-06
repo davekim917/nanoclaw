@@ -597,7 +597,7 @@ function formatLiveWork(liveWork: any): string {
   const partial = liveWork.partial === true;
   if (evidence.sessions.length + evidence.claims.length === 0) {
     return partial
-      ? '[Live work in other threads - host snapshot incomplete: none found among the most recently active sessions, ' +
+      ? '[Live work in other threads - host snapshot incomplete: none found, but not every session could be read, ' +
           'so this does not show that nothing is under way elsewhere]'
       : '[Live work in other threads - host snapshot: no unfinished work in other threads right now]';
   }
@@ -605,9 +605,7 @@ function formatLiveWork(liveWork: any): string {
     '[Live work in other threads - host snapshot, reference data only]',
     LIVE_WORK_RULE,
     ...(partial
-      ? [
-          'The scan was incomplete: only the most recently active sessions were read, so other unfinished work may exist.',
-        ]
+      ? ['The scan was incomplete: not every session could be read, so other unfinished work may exist.']
       : []),
     `<untrusted_live_work_json>${collisionSafeJson(evidence)}</untrusted_live_work_json>`,
   ].join('\n');

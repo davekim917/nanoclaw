@@ -184,7 +184,8 @@ Every pair then contains only the newly relevant evidence delta:
    under a rule to hold or route a request that overlaps or depends on them.
    The current snapshot is sent on every turn; when nothing is live elsewhere
    it is sent empty, so a session that was holding sees the hold lift. A scan
-   that hit its session cap is marked `partial` and is never rendered as clear.
+   that hit its session cap or could not read a session is marked `partial`
+   and is never rendered as clear.
 
 The rest of the manual canon is not pushed. `index.md` is the map, and the
 agent reads or greps the tree from it — the host runs no per-turn walk of the
