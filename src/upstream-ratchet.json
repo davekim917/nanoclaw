@@ -189,7 +189,7 @@
 ".claude/skills/add-onecli/versions.json":{"diff":5,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-opencode/ARCHITECTURE.md":{"diff":136,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-opencode/REMOVE.md":{"diff":145,"mode":"100644","sha256":"83f761cab3ee15dd5205ca2ffc9a4089a86f0d3f731990abf3df30e8adeb17e7"},
-".claude/skills/add-opencode/SKILL.md":{"diff":497,"mode":"100644","sha256":"5ad40ad714411c79f1af19815d6d268acba5f1d30115ced1a63e1a903b6cc7e3"},
+".claude/skills/add-opencode/SKILL.md":{"diff":497,"mode":"100644","sha256":"a5a69a133004bbe2cc09a21993e0a2f6792bcf38c0cab0697c930b9cfa1d1193"},
 ".claude/skills/add-opencode/apply-fixtures.json":{"diff":9,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-opencode/payload/container/agent-runner/src/provider-contracts/opencode.ts":{"diff":18,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-opencode/payload/container/agent-runner/src/providers/mcp-to-opencode.test.ts":{"diff":99,"mode":"100644","sha256":null,"deleted":true},

@@ -10,7 +10,7 @@ import type { McpServerConfig } from './types.js';
 
 /**
  * OpenCode's built-in tool inventory, captured from the LIVE binary at the
- * version the container actually pins — **opencode@1.18.31** (container/Dockerfile
+ * version the container actually pins — **opencode@1.18.34** (container/Dockerfile
  * `ARG OPENCODE_VERSION`) — NOT from memory or the SDK types (which model the
  * tool set as a dynamic `[key: string]: boolean` map, so they don't enumerate
  * names). Keep OPENCODE_CAPTURED_VERSION below in lock-step with that ARG.
