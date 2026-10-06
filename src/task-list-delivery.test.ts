@@ -298,6 +298,19 @@ describe('task list delivery (switch on)', () => {
     expect(calls[0].content.subtext).toContain('stopped');
   });
 
+  it('still settles a list record too large or too long for the kill follow-up to read as evidence', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, {
+      padding: 'x'.repeat(200 * 1024),
+      history: Array.from({ length: 100 }, (_unused, index) => index),
+    });
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'chat-idle-reap');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].content.subtext).toContain('stopped');
+  });
+
   it('leaves a finished list alone', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);

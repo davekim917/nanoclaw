@@ -6,7 +6,7 @@
 import type Database from 'better-sqlite3';
 
 import { sqliteUtcToIso } from '../sqlite-utc.js';
-import { readOpenTaskListRecord } from './session-state.js';
+import { openTaskList } from './session-state.js';
 
 export interface InboundChatSenderRow {
   content?: string;
@@ -234,10 +234,6 @@ export interface TaskListSettlement {
   } | null;
 }
 
-/**
- * Null when there is nothing to settle: no list, a finished or stale one (its
- * queued rows carry its real final state), or one touched after the kill began.
- */
 export const SCHEDULE_WAKE_ID_PREFIX = 'schedule-wake-';
 export const SCHEDULE_WAKE_SYSTEM_KIND = 'agent_scheduled_wake';
 
@@ -254,7 +250,6 @@ export function getNextScheduledWakeAt(inbound: Database.Database): string | nul
         WHERE status = 'pending'
           AND substr(id, 1, ?) = ?
           AND CASE WHEN json_valid(content) THEN json_extract(content, '$._system.kind') END = ?
-          AND process_after IS NOT NULL
           AND julianday(process_after) > julianday('now')
         ORDER BY julianday(process_after)
         LIMIT 1`,
@@ -270,14 +265,27 @@ function instantOrNull(value: unknown): string | null {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
+/**
+ * Null when there is nothing to settle: no list, a finished or stale one (its
+ * queued rows carry its real final state), or one touched after the kill began.
+ */
 export function getTaskListSettlement(
   inbound: Database.Database,
   outbound: Database.Database,
   killedAt: string,
 ): TaskListSettlement | null {
-  const open = readOpenTaskListRecord(outbound);
+  let record: Record<string, unknown>;
+  try {
+    const row = outbound.prepare("SELECT value FROM session_state WHERE key = 'task_list'").get() as
+      | { value: string }
+      | undefined;
+    if (!row) return null;
+    record = JSON.parse(row.value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const open = openTaskList(record);
   if (!open || !(Date.parse(open.touchedAt) <= Date.parse(killedAt))) return null;
-  const { record } = open;
   const delivered = new Set(
     (inbound.prepare('SELECT message_out_id FROM delivered').all() as Array<{ message_out_id: string }>).map(
       (r) => r.message_out_id,

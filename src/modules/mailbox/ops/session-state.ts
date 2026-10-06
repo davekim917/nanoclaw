@@ -96,14 +96,9 @@ const MAX_RECORDED_CHARS = 300;
 /** A maximal valid record is about 25 KiB; anything larger is malformed and is never read into memory. */
 const MAX_RECORD_BYTES = 64 * 1024;
 
-/** A single printable line of at most MAX_RECORDED_CHARS: these strings are spliced into a note, one per line. */
+/** A single line of at most MAX_RECORDED_CHARS: these strings are spliced into a note, one checkout per line. */
 function recordedText(value: unknown): string | null {
-  if (
-    typeof value !== 'string' ||
-    value === '' ||
-    value.length > MAX_RECORDED_CHARS ||
-    /[\p{Cc}\u2028\u2029]/u.test(value)
-  ) {
+  if (typeof value !== 'string' || value === '' || value.length > MAX_RECORDED_CHARS || /[\r\n]/.test(value)) {
     return null;
   }
   return value;
@@ -178,14 +173,25 @@ const MAX_TASK_LIST_BYTES = 128 * 1024;
 /** The runner caps a list at 30 items (container/agent-runner/src/task-list.ts). */
 const MAX_TASK_LIST_ITEMS = 64;
 
+interface OpenTaskList {
+  record: Record<string, unknown>;
+  touchedAt: string;
+}
+
 /**
  * The persisted list while it is still open (version 1, neither finished nor stale) with its last-touched stamp,
- * which callers compare as a date, so an unparseable one matches no window. Same malformed-is-absent rule and SQL
- * size bound as the worktree record: the value is agent-written.
+ * which callers compare as a date, so an unparseable one matches no window.
  */
-export function readOpenTaskListRecord(
-  outbound: Database.Database,
-): { record: Record<string, unknown>; touchedAt: string } | null {
+export function openTaskList(record: Record<string, unknown>): OpenTaskList | null {
+  if (record.version !== 1 || record.finished === true || record.stale === true) return null;
+  // Older runner snapshots lack `touchedAt`; fall back to `updatedAt`.
+  const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
+  if (typeof touchedAt !== 'string') return null;
+  return { record, touchedAt };
+}
+
+/** Same malformed-is-absent rule and SQL size bound as the worktree record: the value is agent-written. */
+function readBoundedOpenTaskList(outbound: Database.Database): OpenTaskList | null {
   let record: Record<string, unknown> | null;
   try {
     const row = outbound
@@ -204,11 +210,13 @@ export function readOpenTaskListRecord(
     return null;
   }
   if (typeof record !== 'object' || record === null) return null;
-  if (record.version !== 1 || record.finished === true || record.stale === true) return null;
-  // Older runner snapshots lack `touchedAt`; fall back to `updatedAt`.
-  const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
-  if (typeof touchedAt !== 'string') return null;
-  return { record, touchedAt };
+  return openTaskList(record);
+}
+
+/** Item text is free-form where a checkout's name is not: one printable line, or the item is not named in a note. */
+function recordedItemText(value: unknown): string | null {
+  const line = recordedText(value);
+  return line === null || /[\p{Cc}\u2028\u2029]/u.test(line) ? null : line;
 }
 
 interface UnfinishedTaskItem {
@@ -227,14 +235,14 @@ export interface TaskListInFlight {
 
 /** A bad item drops only that item: an entry the runner could not have written is not evidence of owed work. */
 export function readTaskListInFlight(outbound: Database.Database): TaskListInFlight | null {
-  const open = readOpenTaskListRecord(outbound);
+  const open = readBoundedOpenTaskList(outbound);
   if (!open || !Array.isArray(open.record.items)) return null;
   const unfinished: UnfinishedTaskItem[] = [];
   let waiting = 0;
   for (const value of open.record.items as unknown[]) {
     if (typeof value !== 'object' || value === null) continue;
     const { text, status } = value as { text?: unknown; status?: unknown };
-    const line = recordedText(text);
+    const line = recordedItemText(text);
     if (line === null || typeof status !== 'string' || status === 'done') continue;
     if (status === 'waiting') waiting += 1;
     else unfinished.push({ text: line, status: status === 'pending' || status === 'in_progress' ? status : 'open' });

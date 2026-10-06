@@ -10,7 +10,8 @@ import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
 import type { TaskListSettlement } from './modules/mailbox/ops/lookups.js';
-import { readKillFacts, type KillFacts } from './modules/sweep-continuation/kill-state.js';
+import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
+import { takesAWake } from './modules/sweep-continuation/kill-state.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import { formatLocalTime } from './timezone.js';
@@ -54,12 +55,27 @@ const KILL_EDIT_WAIT_BUFFER_MS = 250;
 async function killSubtext(
   session: Session,
   edit: NonNullable<TaskListSettlement['edit']>,
-  facts: KillFacts | null,
+  nextCheckAt: string | null,
 ): Promise<string> {
-  if (edit.listedAt === null || !facts?.takesAWake || !facts.nextCheckAt) return edit.interruptedSubtext;
+  if (edit.listedAt === null || nextCheckAt === null) return edit.interruptedSubtext;
   const timezone = await resolveGroupTimezone(session.agent_group_id);
-  const nextCheck = formatLocalTime(facts.nextCheckAt, timezone);
+  const nextCheck = formatLocalTime(nextCheckAt, timezone);
   return `paused · next check ${nextCheck} · todos as of ${formatLocalTime(edit.listedAt, timezone)}`;
+}
+
+/**
+ * The `wait` the label may name. Nothing but the session's own inbound rows is read unless one is armed. A label
+ * that cannot be worked out must not cost the list its interrupted form.
+ */
+async function armedWaitAt(mailbox: NanoclawMailboxSession, session: Session, reason: string): Promise<string | null> {
+  try {
+    const at = mailbox.getNextScheduledWakeAt();
+    if (at === null) return null;
+    return (await withCentralSync(() => takesAWake(session.id), 'task list kill label')) ? at : null;
+  } catch (err) {
+    log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId: session.id, reason, err });
+    return null;
+  }
 }
 
 /**
@@ -85,15 +101,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
           const found = mailbox.getTaskListSettlement(killedAt);
           if (!found) return null;
           for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
-          if (!found.edit) return { ...found, facts: null };
-          // A label that cannot be worked out must not cost the list its interrupted form.
-          const facts = await withCentralSync(() => readKillFacts(mailbox, session), 'task list kill label').catch(
-            (err: unknown) => {
-              log.warn('Task list kill label unavailable — keeping the runner’s own', { sessionId, reason, err });
-              return null;
-            },
-          );
-          return { ...found, facts };
+          return { ...found, nextCheckAt: found.edit ? await armedWaitAt(mailbox, session, reason) : null };
         });
         const edit = settlement?.edit;
         if (!edit) return 0;
@@ -110,7 +118,7 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
         }
         const cooling = taskListCooldownMs(edit.channelType);
         if (cooling > 0) return cooling;
-        const subtext = await killSubtext(session, edit, settlement.facts);
+        const subtext = await killSubtext(session, edit, settlement.nextCheckAt);
         try {
           await adapter.deliver(
             edit.channelType,

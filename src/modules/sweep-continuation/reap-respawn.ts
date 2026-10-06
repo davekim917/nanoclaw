@@ -67,37 +67,34 @@ function describeUnfinished(unfinished: KillEvidence['unfinished']): string {
   return lines.join('\n');
 }
 
+/** With worktree evidence alone this is the note the chat idle reap wrote before the list counted, to the byte. */
 function wakeText(cause: string, evidence: KillEvidence): string {
-  const sections = [`[system] Your previous container ${cause}.`];
-  if (evidence.checkouts.length > 0) {
-    sections.push(
-      `It left work that is not committed and pushed:\n${describeCheckouts(evidence.checkouts)}\n` +
-        `Resume what is safely resumable — commit and push what is ready — and ${ACCOUNT_FOR_STATE}. ` +
-        `A commit, a push or a PR is evidence; a description of what you meant to do is not. ` +
-        `If this work is not yours (siblings in this thread share these checkouts) or is deliberately parked, ` +
-        `say so in one line.`,
-    );
-  }
+  const listOnly = evidence.checkouts.length === 0;
+  let text = `[system] Your previous container ${cause}`;
+  text += listOnly
+    ? '.'
+    : `, and it left work that is not committed and pushed:\n${describeCheckouts(evidence.checkouts)}\n` +
+      `Resume what is safely resumable — commit and push what is ready — and ${ACCOUNT_FOR_STATE}. ` +
+      `A commit, a push or a PR is evidence; a description of what you meant to do is not. ` +
+      `If this work is not yours (siblings in this thread share these checkouts) or is deliberately parked, ` +
+      `say so in one line.`;
   if (evidence.unfinished.length > 0) {
     // Work only on disk must be accounted for in a message, and is woken whatever is armed; a list alone is woken
     // only when nothing is, and can be settled in the list.
-    const listOnly = evidence.checkouts.length === 0;
-    const silent = listOnly
-      ? ` Post a message only if work was lost or that ask was never made; otherwise the updated list is the answer.`
-      : '';
-    sections.push(
-      `Its task list still had ${evidence.unfinished.length} item(s) neither done nor marked waiting` +
-        `${listOnly ? ', and you had armed nothing to come back to them' : ''}:\n` +
-        `${describeUnfinished(evidence.unfinished)}\n` +
-        `Settle each one now with update_task_list. If it is in fact finished, mark it done. ` +
-        `If the work is still owed, do the next item now. ` +
-        `If you will check on it later (a peer agent you are waiting on counts), arm wait or continue_work naming ` +
-        `what you will check and when — prose does not keep this thread alive. ` +
-        `If you cannot move it yourself, mark it waiting on whoever owes the next move.${silent}`,
-    );
+    text +=
+      `\nIts task list still had ${evidence.unfinished.length} item(s) neither done nor marked waiting` +
+      `${listOnly ? ', and you had armed nothing to come back to them' : ''}:\n` +
+      `${describeUnfinished(evidence.unfinished)}\n` +
+      `Settle each one now with update_task_list. If it is in fact finished, mark it done. ` +
+      `If the work is still owed, do the next item now. ` +
+      `If you will check on it later (a peer agent you are waiting on counts), arm wait or continue_work naming ` +
+      `what you will check and when — prose does not keep this thread alive. ` +
+      `If you cannot move it yourself, mark it waiting on whoever owes the next move.` +
+      (listOnly
+        ? ` Post a message only if work was lost or that ask was never made; otherwise the updated list is the answer.`
+        : '');
   }
-  sections.push(RESTART_SURVIVAL_RULES);
-  return sections.join('\n');
+  return `${text} ${RESTART_SURVIVAL_RULES}`;
 }
 
 /**

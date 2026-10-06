@@ -31,8 +31,9 @@ export const STRANDING_KILLS: ReadonlyMap<string, (minutes: number | undefined) 
 
 /**
  * The only things that withhold the wake, each a fact and none a reading of what is pending: the ceiling branch said
- * it queued its own wake for this kill, a continuation is saved (the sweep resumes it, or has told the operator it
- * could not), or the agent armed a `wait` that has not come due.
+ * it queued its own wake for this kill, a continuation is saved (the sweep resumes it while it has recovery budget;
+ * with the budget spent the session stays stopped until another inbound, as a list-only session always did), or the
+ * agent armed a `wait` that has not come due.
  */
 type WithheldBy = 'ceiling-wake' | 'continuation-saved' | 'wake-pending';
 
@@ -64,10 +65,11 @@ function readKillEvidence(mailbox: NanoclawMailboxSession, startedAtMs: number):
 }
 
 /**
- * The sweep never wakes a closed or archived session, so a row there would sit due forever. The same three
- * conditions as the wake path's own gate in container-runner.ts, which this file cannot import.
+ * Call inside `withCentralSync`. The sweep never wakes a closed or archived session, so a row there would sit due
+ * forever. The same three conditions as the wake path's own gate in container-runner.ts, which this file cannot
+ * import.
  */
-function takesAWake(sessionId: string): boolean {
+export function takesAWake(sessionId: string): boolean {
   const row = withRawDb((db) => db.prepare(SESSION_BY_ID_SQL).get(sessionId) as Session | undefined);
   return row?.status === 'active' && row.archived_at == null;
 }
@@ -127,21 +129,6 @@ function decideKillFollowUp(args: {
   return followUp;
 }
 
-export interface KillFacts {
-  /** The earliest `wait` the agent armed that has not come due. */
-  nextCheckAt: string | null;
-  /** False for a closed or archived session, which takes no wake whatever is queued for it. */
-  takesAWake: boolean;
-}
-
-/** Call inside `withCentralSync`. */
-export function readKillFacts(
-  mailbox: Pick<NanoclawMailboxSession, 'getNextScheduledWakeAt'>,
-  session: Session,
-): KillFacts {
-  return { nextCheckAt: mailbox.getNextScheduledWakeAt(), takesAWake: takesAWake(session.id) };
-}
-
 export interface KillDecision {
   followUp: ReapFollowUp;
   evidence: KillEvidence;
@@ -156,7 +143,7 @@ export interface KillDecision {
  *
  * Work left only on disk has no resume path but this wake, so nothing stored withholds it: a saved continuation or
  * an armed `wait` may never run, and neither accounts for the checkouts. Those facts, and a session that takes no
- * wake, withhold only when the list is the sole evidence.
+ * wake, withhold only when the list is the sole evidence, and are not even read otherwise.
  */
 export function decideKill(
   mailbox: NanoclawMailboxSession,
@@ -166,15 +153,14 @@ export function decideKill(
 ): KillDecision {
   const dated = startedAtMs !== null;
   const evidence = dated ? readKillEvidence(mailbox, startedAtMs) : NO_EVIDENCE;
-  const facts = readKillFacts(mailbox, session);
-  const listOnly = evidence.checkouts.length === 0;
+  const listOnly = evidence.checkouts.length === 0 && evidence.unfinished.length > 0;
   const withheldBy: WithheldBy | null = kill.ceilingWakeQueued
     ? 'ceiling-wake'
     : !listOnly
       ? null
       : mailbox.readWorkContinuation() !== null
         ? 'continuation-saved'
-        : facts.nextCheckAt !== null
+        : mailbox.getNextScheduledWakeAt() !== null
           ? 'wake-pending'
           : null;
   const priorAttempts = dated ? mailbox.countRecoveryAttemptsSinceRealInbound(REAP_RESPAWN_ID_PREFIX) : 0;
@@ -185,7 +171,7 @@ export function decideKill(
     unfinishedItems: evidence.unfinished.length,
     staleEvidence: evidence.stale,
     armed: withheldBy !== null,
-    wakeable: !listOnly || facts.takesAWake,
+    wakeable: !listOnly || takesAWake(session.id),
     priorAttempts,
     selfHeal: SELF_HEAL_ENABLED,
   });

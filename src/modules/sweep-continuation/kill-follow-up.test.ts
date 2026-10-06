@@ -214,15 +214,15 @@ function recordList(touchedAtMs: number, items: unknown = OWED, overrides: Recor
   );
 }
 
-function recordWorktree(atMs: number): void {
+function recordWorktree(atMs: number, name = 'shop@orders-move', branch = 'feat/orders-move'): void {
   setState(
     'worktree_in_flight',
     JSON.stringify({
       at: new Date(atMs).toISOString(),
       checkouts: [
         {
-          name: 'shop@orders-move',
-          branch: 'feat/orders-move',
+          name,
+          branch,
           upstream: null,
           upstream_head: null,
           files: ['src/orders.ts'],
@@ -987,6 +987,76 @@ describe('work left only on disk has no resume path but this wake, so nothing st
     });
     expect(content.text).toContain('2 item(s) neither done nor marked waiting:');
     expect(content.text).not.toContain('armed nothing');
+  });
+
+  it('the worktree-only note is the one the chat idle reap wrote before the list counted, to the byte', async () => {
+    const startedAt = Date.now() - HOUR;
+    recordWorktree(startedAt + 60_000);
+
+    await chatReap(startedAt);
+
+    expect(wakeText()).toBe(
+      `[system] Your previous container was stopped by the ${CHAT_REAP_MINUTES}-minute chat idle reap after your turn ` +
+        `ended, and it left work that is not committed and pushed:\n` +
+        `- /workspace/worktrees/shop@orders-move: branch feat/orders-move, no upstream; ` +
+        `1 uncommitted file(s): src/orders.ts\n` +
+        `Resume what is safely resumable — commit and push what is ready — and post ONE message accounting for ` +
+        `state — done / lost / next. A commit, a push or a PR is evidence; a description of what you meant to do ` +
+        `is not. If this work is not yours (siblings in this thread share these checkouts) or is deliberately ` +
+        `parked, say so in one line. Re-check any work claims in claims/ before resuming a seam — a sibling may ` +
+        `have taken it over while you were down. In-container background tasks, sleeps, and /tmp do not survive a ` +
+        `restart; before going idle with work in flight, checkpoint to a durable path and call continue_work, or ` +
+        `use wait for a real time delay.`,
+    );
+    expect(JSON.parse(wakeRows()[0].content)._system).toEqual({
+      kind: 'agent_reap_respawn',
+      checkouts: ['shop@orders-move'],
+    });
+  });
+
+  describe('a checkout whose name or branch carries a Unicode line separator is still evidence, as a runner writes it', () => {
+    const SEPARATED: Array<[string, string, string]> = [
+      ['U+2028 in the name', 'shop@orders\u2028move', 'feat/orders-move'],
+      ['U+2029 in the branch', 'shop@orders-move', 'feat/orders\u2029move'],
+    ];
+    const BESIDE: Array<[string, (startedAt: number) => void]> = [
+      ['alone', () => undefined],
+      ['beside an unfinished list', (startedAt) => recordList(startedAt + 60_000)],
+      [
+        'beside an unfinished list and an armed wait',
+        (startedAt) => {
+          recordList(startedAt + 60_000);
+          armWait(new Date(Date.now() + HOUR).toISOString());
+        },
+      ],
+      [
+        'beside an unfinished list and a saved continuation',
+        (startedAt) => {
+          recordList(startedAt + 60_000);
+          setState('work_continuation', SAVED_CONTINUATION);
+        },
+      ],
+    ];
+
+    it.each(
+      SEPARATED.flatMap(([what, name, branch]) =>
+        BESIDE.map(([where, arrange]) => [what, where, name, branch, arrange] as const),
+      ),
+    )('%s, %s', async (_what, _where, name, branch, arrange) => {
+      const startedAt = Date.now() - HOUR;
+      recordWorktree(startedAt + 60_000, name, branch);
+      arrange(startedAt);
+
+      await chatReap(startedAt);
+
+      const rows = wakeRows();
+      expect(rows.map((r) => r.id)).toEqual([`reap-respawn-${startedAt}`]);
+      const content = JSON.parse(rows[0].content);
+      expect(content._system.checkouts).toEqual([name]);
+      expect(content.text).toContain(`/workspace/worktrees/${name}: branch ${branch}, no upstream`);
+      expect(content.text).toContain('post ONE message accounting for state — done / lost / next');
+      expect(content.text).not.toContain('Post a message only if');
+    });
   });
 
   it('an archived session still gets its row, as it did before the list counted', async () => {
