@@ -9,6 +9,13 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const script = fs.readFileSync(path.join(root, 'scripts', 'deploy.sh'), 'utf-8');
 
 describe('deploy rollback shell contract', () => {
+  it('refuses to start while another deploy holds the lock, and the re-exec inherits it', () => {
+    expect(script).toContain('exec 9>>"$DEPLOY_LOCK"');
+    expect(script).toContain('if ! flock -n 9; then');
+    expect(script).toContain('exit 3');
+    expect(script.indexOf('if [ "$POST_PULL" != "1" ]; then')).toBeLessThan(script.indexOf('flock -n 9'));
+  });
+
   it('snapshots before a fast-forward pull and re-execs the pulled script', () => {
     expect(script.indexOf('snapshot_dir node_modules')).toBeLessThan(script.indexOf('git pull --ff-only origin main'));
     expect(script.indexOf('bash -n scripts/deploy.sh')).toBeLessThan(script.indexOf('exec env'));

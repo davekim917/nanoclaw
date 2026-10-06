@@ -11,6 +11,19 @@ cd "$REPO_ROOT" || exit 1
 STATUS_FILE="logs/deploy-status.json"
 LOG="logs/deploy.log"
 POST_PULL="${NANOCLAW_DEPLOY_POST_PULL:-0}"
+
+# One deploy at a time. The lock rides on fd 9 so the post-pull re-exec of this
+# script (same process) inherits it instead of blocking on itself.
+DEPLOY_LOCK="logs/deploy.lock"
+if [ "$POST_PULL" != "1" ]; then
+  mkdir -p logs
+  exec 9>>"$DEPLOY_LOCK"
+  if ! flock -n 9; then
+    echo "deploy.sh: another deploy is already running (pid $(cat "$DEPLOY_LOCK" 2>/dev/null || echo unknown)); not starting a second one" >&2
+    exit 3
+  fi
+  echo "$$" > "$DEPLOY_LOCK"
+fi
 PRE_COMMIT="${NANOCLAW_DEPLOY_PRE_COMMIT:-}"
 ROLLBACK_READY=0
 DEPLOY_HANDOFF=0
