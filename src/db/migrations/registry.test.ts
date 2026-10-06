@@ -121,6 +121,7 @@ describe('central migration registry', () => {
       newlyApplied,
       'the adopted files (019/020/023) must match live rows by name and be skipped; only the net-new ones run',
     ).toEqual([
+      'container-config-speed',
       'messaging-group-detached-at',
       'host-coordination',
       'observatory-signal',

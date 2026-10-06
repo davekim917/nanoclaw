@@ -535,6 +535,9 @@ export interface ContainerConfig {
   /** IANA zone for the container's `TZ`; absent = install timezone. Mirrored from `container_configs.timezone`. */
   timezone?: string;
 
+  /** Provider speed tier; absent = the provider default. Mirrored from `container_configs.speed`. */
+  speed?: ContainerSpeed;
+
   /** `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (tokens); absent = fleet default. Not mirrored to the DB. */
   autoCompactWindow?: number;
 
@@ -732,6 +735,17 @@ export async function resolveGroupProvider(agentGroupId: string, sessionProvider
   return resolveProviderName(sessionProvider ?? null, fileProvider);
 }
 
+const CONTAINER_SPEEDS = ['standard', 'fast'] as const;
+export type ContainerSpeed = (typeof CONTAINER_SPEEDS)[number];
+
+/** Providers with a speed tier the group value can pick; any other provider accepts only a cleared value. */
+export const PROVIDER_SPEED_TIERS: Readonly<Record<string, readonly ContainerSpeed[]>> = { claude: CONTAINER_SPEEDS };
+
+/** The stored tier was validated against the provider's tiers when written; anything else reads as unset. */
+function parseContainerSpeed(value: string | null | undefined): ContainerSpeed | undefined {
+  return (CONTAINER_SPEEDS as readonly string[]).includes(value ?? '') ? (value as ContainerSpeed) : undefined;
+}
+
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
   return {
@@ -751,6 +765,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     timezone: honouredTimezoneOverride(row.timezone),
+    speed: parseContainerSpeed(row.speed),
     security: row.security_json ? (JSON.parse(row.security_json) as SecurityConfig) : undefined,
   };
 }
@@ -823,6 +838,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     model: raw.model,
     effort: raw.effort,
     timezone: raw.timezone,
+    speed: parseContainerSpeed(raw.speed),
     autoCompactWindow: validateAutoCompactWindow(raw.autoCompactWindow),
     providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
@@ -950,8 +966,8 @@ export async function writeContainerConfigScalars(
   folder: string,
   updates: Parameters<typeof updateContainerConfigScalars>[1],
 ): Promise<void> {
-  const { provider, model, effort, image_tag, assistant_name, timezone } = updates;
-  if (![provider, model, effort, image_tag, assistant_name, timezone].some((v) => v !== undefined)) {
+  const { provider, model, effort, image_tag, assistant_name, timezone, speed } = updates;
+  if (![provider, model, effort, image_tag, assistant_name, timezone, speed].some((v) => v !== undefined)) {
     await updateContainerConfigScalars(agentGroupId, updates);
     return;
   }
@@ -965,6 +981,7 @@ export async function writeContainerConfigScalars(
       if (assistant_name !== undefined) config.assistantName = assistant_name || undefined;
       // null must ERASE the field so the spawn falls back to the install timezone.
       if (timezone !== undefined) config.timezone = timezone ?? undefined;
+      if (speed !== undefined) config.speed = parseContainerSpeed(speed);
     },
     () => updateContainerConfigScalars(agentGroupId, updates),
   );

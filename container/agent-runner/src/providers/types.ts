@@ -131,6 +131,11 @@ export interface ProviderOptions {
    */
   model?: string;
   /**
+   * Provider speed tier (`standard` or `fast` for Claude). A provider maps `fast` onto its fast serving tier
+   * when it has one; `standard` keeps the default; a tier it does not know is ignored.
+   */
+  speed?: string;
+  /**
    * Reasoning effort (`'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'`). Passed
    * through to the underlying SDK. If omitted, the SDK default is used.
    */

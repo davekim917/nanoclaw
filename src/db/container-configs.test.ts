@@ -65,7 +65,7 @@ describe('ensureContainerConfig provider stamping', () => {
     expect((await getContainerConfig('ag-tz'))?.timezone).toBe('Asia/Tokyo');
 
     // `ncl groups config update --timezone ""` maps to null — the clear path.
-    await updateContainerConfigScalars('ag-tz', { timezone: null });
+    await updateContainerConfigScalars('ag-tz', { timezone: null, speed: null });
     expect((await getContainerConfig('ag-tz'))?.timezone).toBeNull();
   });
 });

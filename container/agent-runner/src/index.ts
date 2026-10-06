@@ -244,6 +244,7 @@ async function main(): Promise<void> {
     providerConfig: config.providerConfig,
     model: config.model,
     effort: config.effort,
+    speed: config.speed,
   });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
   // Must run after mailbox.start has opened the session DB.

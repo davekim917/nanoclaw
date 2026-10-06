@@ -82,6 +82,7 @@ import { migration081 } from './081-thread-key-anchors.js';
 import { migration082 } from './082-mcp-oauth-integrations.js';
 import { migration083 } from './083-work-outcome-receipts.js';
 import { migration084 } from './084-task-run-outcome-lanes.js';
+import { migration085 } from './085-container-config-speed.js';
 import { migration014 as containerConfigs } from './014-container-configs.js';
 import { migration015 as cliScope } from './015-cli-scope.js';
 // Upstream's 016: an idempotent messaging_groups recreate that backfills instance = channel_type.
@@ -178,6 +179,7 @@ export const migrations: Migration[] = [
   migration064,
   migration020,
   migration023,
+  migration085,
   migration067,
   migration068,
   messagingGroupInstance,

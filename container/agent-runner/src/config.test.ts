@@ -218,3 +218,21 @@ describe('parseRawConfig provider fallback bridge', () => {
     expect(primary.effort).toBe('medium');
   });
 });
+
+describe('parseRawConfig speed tier', () => {
+  afterEach(clearEnv);
+
+  it('passes a non-empty tier through and treats "" as unset', () => {
+    expect(parseRawConfig({ provider: 'claude', speed: 'fast' }).speed).toBe('fast');
+    expect(parseRawConfig({ provider: 'claude', speed: '' }).speed).toBeUndefined();
+    expect(parseRawConfig({ provider: 'claude' }).speed).toBeUndefined();
+  });
+
+  it('drops the tier under a provider fallback: it belongs to the primary provider', () => {
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'codex';
+    process.env.NANOCLAW_PROVIDER_FALLBACK_APPLIED = '1';
+    const config = parseRawConfig({ provider: 'claude', speed: 'fast', providerFallback: { provider: 'codex' } });
+    expect(config.provider).toBe('codex');
+    expect(config.speed).toBeUndefined();
+  });
+});

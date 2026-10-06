@@ -29,6 +29,7 @@ import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { ensureContainerConfig, getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
+import { PROVIDER_SPEED_TIERS } from '../../container-config.js';
 import { getDenialFor } from '../../db/denied-models.js';
 import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
@@ -73,6 +74,15 @@ function mountPathArgs(args: Record<string, unknown>): { hostPath: string; conta
   const containerPath = (args.container ?? args['container-path']) as string | undefined;
   if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
   return { hostPath, containerPath };
+}
+
+/** `--speed` accepts only a tier the provider declares (`PROVIDER_SPEED_TIERS`); `""` (clear) never reaches here. */
+function assertProviderSpeedTier(speed: string, provider: string): void {
+  const tiers = PROVIDER_SPEED_TIERS[provider];
+  if (!tiers) throw new Error(`provider "${provider}" has no speed tiers; --speed accepts only "" (clear)`);
+  if (!(tiers as readonly string[]).includes(speed)) {
+    throw new Error(`--speed "${speed}" is not a speed tier of provider "${provider}" (expected ${tiers.join('|')})`);
+  }
 }
 
 /**
@@ -131,6 +141,7 @@ function presentConfig(row: ContainerConfigRow, folder?: string): Record<string,
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
     timezone: row.timezone,
+    speed: row.speed,
     resources: fileConfig?.resources ?? null,
     effective_resources: fileConfig ? resolveContainerResources(fileConfig.resources) : null,
     // Privilege overrides must be visible here, not only in the spawn's docker args.
@@ -490,6 +501,7 @@ registerResource({
         'Update container config fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and scalar flags, or resource flags: --memory-request-mb, --memory-limit-mb, ' +
         '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit. ' +
+        '--speed sets the provider speed tier (claude: standard|fast, the SDK fast serving tier; other providers accept only "", which clears). Takes effect at the next restart. ' +
         '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart. ' +
         '--provider REFUSES the switch when any armed scheduled-task pin would be invalid under the new provider (model/effort vocabularies do not nest: claude has ultracode, codex has ultra, opencode has neither and no xhigh). ' +
         'Task pins are never rewritten for you and there is no --force: clear the refusal with `ncl tasks repin --target-provider <new>`, which validates against the provider you are moving TO and therefore works before the switch. ' +
@@ -513,11 +525,18 @@ registerResource({
             | 'max_messages_per_prompt'
             | 'cli_scope'
             | 'timezone'
+            | 'speed'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
         const timezone = parseTimezoneFlag(args.timezone);
         if (timezone !== undefined) updates.timezone = timezone;
+        if (args.speed !== undefined) {
+          const speed = String(args.speed);
+          // Validated against the provider the group will run on: a `--provider` in this command wins over the stored one.
+          if (speed !== '') assertProviderSpeedTier(speed, resolveProviderName(updates.provider, row.provider));
+          updates.speed = speed || null;
+        }
         // Empty is an explicit clear. A group matching the provider default must not keep a redundant pin that would
         // silently defeat a later fleet-wide default change.
         if (args.model !== undefined) updates.model = String(args.model) || null;
@@ -560,7 +579,7 @@ registerResource({
 
         if (Object.keys(updates).length === 0 && !hasResourceUpdate && statusSubtext === undefined) {
           throw new Error(
-            'Nothing to update — provide a scalar config flag, --status-subtext, or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit',
+            'Nothing to update — provide a scalar config flag (--speed included), --status-subtext, or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit',
           );
         }
 

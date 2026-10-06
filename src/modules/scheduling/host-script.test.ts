@@ -27,7 +27,7 @@ import { classifyForHostExecution, runHostGatedTaskScripts } from './host-script
 // (not initialized here) — mock it, same pattern as recurrence.test.ts.
 // Default null → falls back to the real install TIMEZONE; individual tests
 // set an override to test propagation.
-const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null }));
+const containerConfigState = vi.hoisted(() => ({ timezone: null as string | null, speed: null as string | null }));
 vi.mock('../../db/container-configs.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/container-configs.js')>()),
   getContainerConfig: () => ({ timezone: containerConfigState.timezone }),

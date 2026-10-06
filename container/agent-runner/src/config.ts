@@ -23,6 +23,8 @@ export interface RunnerConfig {
   providerConfig: Record<string, unknown>;
   model?: string;
   effort?: string;
+  /** Provider speed tier from container.json; the host validated it against the provider's tiers. */
+  speed?: string;
 
   /** True only when this spawn runs on the group's declared secondary provider; task pins validated for the primary must not cross into it. */
   fallbackApplied: boolean;
@@ -110,10 +112,16 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
       activeFallback?.effort ||
       (onFallback ? undefined : configuredProviderEffort || configuredEffort) ||
       undefined,
+    // A fallback runs the other provider's defaults: the primary's tier is not its vocabulary.
+    speed: onFallback ? undefined : readSpeed(raw),
     fallbackApplied: onFallback,
     providerFallback: declaredFallback || undefined,
     statusSubtext: raw.statusSubtext !== false,
   };
+}
+
+function readSpeed(raw: Record<string, unknown>): string | undefined {
+  return typeof raw.speed === 'string' && raw.speed !== '' ? raw.speed : undefined;
 }
 
 /**
