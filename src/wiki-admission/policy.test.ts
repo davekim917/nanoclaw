@@ -164,6 +164,8 @@ describe('maintenance authority', () => {
       'example',
     );
     expect(env.NANOCLAW_WIKI_MAINTENANCE).toBe('1');
+    expect(env.NANOCLAW_CODEX_MODEL_OVERRIDE).toBe('gpt-6-astra');
+    expect(env.NANOCLAW_CODEX_EFFORT_OVERRIDE).toBe('medium');
     expect(env.GH_TOKEN).toBeUndefined();
     // setup-token credentials carry user:inference only; claiming user:profile
     // makes the CLI call endpoints that 403 and then 429 for these tokens.
