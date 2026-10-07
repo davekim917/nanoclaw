@@ -9,7 +9,7 @@ overrides:
 
 patchedDependencies:
   '@chat-adapter/discord@4.41.1':
-    hash: f11e818511c2e83cfb01d90e3ac8dc0bad19e4ac8eaf8d4599e00d94e8f62af8
+    hash: 93ad5003d0025fc82194424c55507eaf4db50a1b277095c82d3145692ade1080
     path: patches/@chat-adapter__discord@4.41.1.patch
   '@chat-adapter/shared@4.41.1':
     hash: af65dd3b393277d838e81bd22029e33f04980326474a342cc366c4cd0202bb0b
@@ -21,7 +21,7 @@ importers:
     dependencies:
       '@chat-adapter/discord':
         specifier: 4.41.1
-        version: 4.41.1(patch_hash=f11e818511c2e83cfb01d90e3ac8dc0bad19e4ac8eaf8d4599e00d94e8f62af8)(zod@4.6.5)
+        version: 4.41.1(patch_hash=93ad5003d0025fc82194424c55507eaf4db50a1b277095c82d3145692ade1080)(zod@4.6.5)
       '@chat-adapter/slack':
         specifier: 4.41.1
         version: 4.41.1(zod@4.6.5)
@@ -2073,7 +2073,7 @@ snapshots:
       hashery: 1.5.1
       keyv: 5.6.0
 
-  '@chat-adapter/discord@4.41.1(patch_hash=f11e818511c2e83cfb01d90e3ac8dc0bad19e4ac8eaf8d4599e00d94e8f62af8)(zod@4.6.5)':
+  '@chat-adapter/discord@4.41.1(patch_hash=93ad5003d0025fc82194424c55507eaf4db50a1b277095c82d3145692ade1080)(zod@4.6.5)':
     dependencies:
       '@chat-adapter/shared': 4.41.1(patch_hash=af65dd3b393277d838e81bd22029e33f04980326474a342cc366c4cd0202bb0b)(zod@4.6.5)
       chat: 4.41.1(zod@4.6.5)
