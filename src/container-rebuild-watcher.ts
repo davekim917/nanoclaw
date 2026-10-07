@@ -260,7 +260,7 @@ export function startContainerRebuildWatcher(notifier?: Notifier): void {
   notify = notifier ?? null;
   void checkAgentRunnerDepsDrift()
     .then((check) => {
-      if (!check.ok) requestContainerRebuild(check.message);
+      if (!check.ok && check.rebuildable) requestContainerRebuild(check.message);
     })
     .catch((err) => log.warn('Container-rebuild watcher startup check failed', { err }));
   log.info('Container-rebuild watcher ready (event-driven, no poll loop)', { image: IMAGE_REF });

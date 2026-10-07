@@ -30,9 +30,11 @@ echo "$$" > "$DEPLOY_LOCK"
 PRE_COMMIT="${NANOCLAW_DEPLOY_PRE_COMMIT:-}"
 ROLLBACK_READY=0
 DEPLOY_HANDOFF=0
-IMAGE_SAVED_BASE="${NANOCLAW_DEPLOY_IMAGE_SAVED_BASE:-}"
-BUILD_TREE=""
-STAGED_IMAGE=""
+IMAGE_SAVED_BASE=""
+# Carried across the post-pull re-exec: the image staged before the pull, and a
+# build tree whose removal failed, so the second half promotes or cleans them up.
+BUILD_TREE="${NANOCLAW_DEPLOY_BUILD_TREE:-}"
+STAGED_IMAGE="${NANOCLAW_DEPLOY_STAGED_IMAGE:-}"
 # Units this deploy has asked systemd to restart, recorded BEFORE the attempt so
 # a unit whose restart failed is still put back by the rollback. nanoclaw-v2 is
 # not in here — it restarts last, under its own guard.
@@ -172,20 +174,6 @@ container_changes_since_image() {
   fi
 }
 
-# Keep the current spawn image reachable for the rollbacks: a build replaces
-# :latest, so retag it first. Record that THIS deploy saved it — the crash guard
-# must never retag a stale tag from an older deploy — and save it once, so a
-# second build in the same deploy cannot overwrite the image being rolled back to.
-save_spawn_image() {
-  [ -z "$IMAGE_SAVED_BASE" ] || return 0
-  docker inspect "$SPAWN_IMAGE" >/dev/null 2>&1 || return 0
-  if ! docker tag "$SPAWN_IMAGE" "$(container_image_base):pre-deploy" >> "$LOG" 2>&1; then
-    write_status "failed" "container snapshot" "could not preserve the current agent image — build not started"
-    exit 1
-  fi
-  IMAGE_SAVED_BASE="$(container_image_base)"
-}
-
 # The hash container/build.sh stamps as nanoclaw.agentRunnerDepsHash, computed
 # from commit $1's blobs rather than from any checkout.
 commit_deps_hash() {
@@ -201,65 +189,100 @@ image_label() {
   docker inspect "$1" --format "{{index .Config.Labels \"$2\"}}" 2>/dev/null
 }
 
-# Build $TARGET_SHA's agent image before the live checkout moves to it.
-# The running host's drift check compares the agent-runner dependency files in
-# the live checkout with the spawn image's label and refuses every spawn while
-# they differ, so pulling first and building after left the host refusing for
-# the whole image build. The build therefore runs in a throwaway worktree of
-# the target commit and lands on a staging tag; the caller retags it as the
-# spawn image right after the pull, which leaves the files and the image apart
-# only between those two commands.
+# Stage commit $1's agent image without touching the spawn tag. The running
+# host checks an image's dependency label against the agent-runner source it
+# booted with, so the new image may become the spawn image only at the restart
+# that brings the matching source; until then it waits on a staging tag.
 #
-# build.sh reads .env for build flags and takes logs/container-build.lock
-# relative to its own checkout. Both are pointed at the live ones, so the build
-# sees the same flags and still queues behind the rebuild watcher's builds.
-# NANOCLAW_PROJECT_ROOT keeps the install label on this install rather than on
-# the throwaway path, and the `latest` TAG keeps the canonical spawn image's
-# retention labels; only the ref it is written to differs.
+# It builds from a throwaway worktree of the commit, so it can run before the
+# live checkout is pulled. build.sh reads .env for build flags and takes
+# logs/container-build.lock relative to its own checkout; both are pointed at
+# the live ones, so the build sees the same flags and still queues behind the
+# rebuild watcher's builds. NANOCLAW_PROJECT_ROOT keeps the install label on
+# this install rather than on the throwaway path. The staging tag is a
+# candidate build with a lease, which the storage collector leaves alone while
+# the deploy runs; its labels are the ones the spawn image then carries.
 build_target_image() {
-  save_spawn_image
-  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Container changed (or image unlabeled), building ${TARGET_SHA:0:12} outside the live checkout before the pull..." >> "$LOG"
+  local target="$1"
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Container changed (or image unlabeled), staging ${target:0:12} as ${STAGED_TAG}..." >> "$LOG"
   write_status "running" "container build" ""
   if ! BUILD_TREE=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-deploy-build.XXXXXX") ||
-    ! git worktree add --detach "$BUILD_TREE" "$TARGET_SHA" >> "$LOG" 2>&1 ||
+    ! git worktree add --detach "$BUILD_TREE" "$target" >> "$LOG" 2>&1 ||
     ! ln -s "$PROJECT_ROOT/logs" "$BUILD_TREE/logs" ||
     { [ -e "$PROJECT_ROOT/.env" ] && ! ln -s "$PROJECT_ROOT/.env" "$BUILD_TREE/.env"; }; then
-    write_status "failed" "container build" "could not check out ${TARGET_SHA:0:12} to build from — live checkout not pulled"
+    write_status "failed" "container build" "could not check out ${target:0:12} to build from — spawn image untouched"
     exit 1
   fi
-  STAGED_IMAGE="$(container_image_base):deploy-staged"
+  STAGED_IMAGE="$(container_image_base):${STAGED_TAG}"
   if ! CONTAINER_IMAGE_REF="$STAGED_IMAGE" NANOCLAW_PROJECT_ROOT="$PROJECT_ROOT" \
-    "$BUILD_TREE/container/build.sh" "$SPAWN_TAG" >> "$LOG" 2>&1; then
-    write_status "failed" "container build" "Container image build failed — live checkout not pulled"
+    NANOCLAW_IMAGE_RETENTION_HOURS=24 NANOCLAW_IMAGE_RETENTION_OWNER=deploy \
+    "$BUILD_TREE/container/build.sh" "$STAGED_TAG" >> "$LOG" 2>&1; then
+    write_status "failed" "container build" "Container image build failed — spawn image untouched"
     exit 1
   fi
   local want_deps got_deps got_commit
-  want_deps=$(commit_deps_hash "$TARGET_SHA")
+  want_deps=$(commit_deps_hash "$target")
   got_deps=$(image_label "$STAGED_IMAGE" nanoclaw.agentRunnerDepsHash)
   got_commit=$(image_label "$STAGED_IMAGE" nanoclaw.commit)
-  if [ -z "$want_deps" ] || [ "$got_deps" != "$want_deps" ] || [ "$got_commit" != "$TARGET_SHA" ]; then
+  if [ -z "$want_deps" ] || [ "$got_deps" != "$want_deps" ] || [ "$got_commit" != "$target" ]; then
     write_status "failed" "container build" \
-      "built image is labeled commit ${got_commit:-none} deps ${got_deps:-none}, expected ${TARGET_SHA} deps ${want_deps:-unknown} — live checkout not pulled"
+      "built image is labeled commit ${got_commit:-none} deps ${got_deps:-none}, expected ${target} deps ${want_deps:-unknown} — spawn image untouched"
     exit 1
   fi
   remove_build_tree
 }
 
-# The links are removed first so nothing recursing into the tree can reach the
-# live logs/ or .env through them.
+# Make the staged image the spawn image, saving the one it replaces as
+# :pre-deploy first. Both tags move under build.sh's lock, so a rebuild-watcher
+# build cannot land between the save and the retag, and IMAGE_SAVED_BASE is set
+# only once the retag happened: the rollback and the crash guard put back an
+# image only when this deploy is the one that replaced it.
+promote_staged_image() {
+  [ -n "$STAGED_IMAGE" ] || return 0
+  local saved=0
+  (
+    flock 8 || exit 1
+    if docker inspect "$SPAWN_IMAGE" >/dev/null 2>&1; then
+      docker tag "$SPAWN_IMAGE" "$(container_image_base):pre-deploy" >> "$LOG" 2>&1 || exit 1
+      docker tag "$STAGED_IMAGE" "$SPAWN_IMAGE" >> "$LOG" 2>&1 || exit 1
+      exit 10
+    fi
+    docker tag "$STAGED_IMAGE" "$SPAWN_IMAGE" >> "$LOG" 2>&1
+  ) 8>> "logs/container-build.lock" || saved=$?
+  case "$saved" in
+    0) ;;
+    10) IMAGE_SAVED_BASE="$(container_image_base)" ;;
+    *) return 1 ;;
+  esac
+  remove_staged_image
+  return 0
+}
+
+# Both cleanups keep their state when removal fails, so the rollback trap — or
+# the second half, which inherits it — tries again rather than forgetting it.
+# The links into the live checkout go first, so nothing recursing into the tree
+# can reach the live logs/ or .env through them.
 remove_build_tree() {
-  [ -n "$BUILD_TREE" ] || return 0
+  case "$BUILD_TREE" in
+    */nanoclaw-deploy-build.*) ;;
+    *) return 0 ;;
+  esac
   rm -f "$BUILD_TREE/logs" "$BUILD_TREE/.env"
-  if ! git worktree remove --force "$BUILD_TREE" >> "$LOG" 2>&1; then
-    rm -rf "$BUILD_TREE"
-    git worktree prune >> "$LOG" 2>&1
+  git worktree remove --force "$BUILD_TREE" >> "$LOG" 2>&1 || rm -rf "$BUILD_TREE"
+  git worktree prune >> "$LOG" 2>&1
+  if [ -e "$BUILD_TREE" ]; then
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Could not remove build tree ${BUILD_TREE}" >> "$LOG"
+    return 1
   fi
   BUILD_TREE=""
 }
 
 remove_staged_image() {
   [ -n "$STAGED_IMAGE" ] || return 0
-  docker image rm "$STAGED_IMAGE" >> "$LOG" 2>&1
+  if docker inspect "$STAGED_IMAGE" >/dev/null 2>&1 && ! docker image rm "$STAGED_IMAGE" >> "$LOG" 2>&1; then
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Could not remove ${STAGED_IMAGE}" >> "$LOG"
+    return 1
+  fi
   STAGED_IMAGE=""
 }
 
@@ -346,6 +369,7 @@ PROJECT_ROOT="$(pwd)"
 source "setup/lib/install-slug.sh"
 SPAWN_TAG="latest"
 SPAWN_IMAGE="$(container_image_base):${SPAWN_TAG}"
+STAGED_TAG="deploy-staged"
 
 if [ "$POST_PULL" != "1" ]; then
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> "$LOG"
@@ -389,20 +413,13 @@ if [ "$POST_PULL" != "1" ]; then
   fi
 
   if [ -n "$(container_changes_since_image "$TARGET_SHA")" ]; then
-    build_target_image
+    build_target_image "$TARGET_SHA"
   fi
 
   write_status "running" "git pull" ""
   if ! git merge --ff-only "$TARGET_SHA" >> "$LOG" 2>&1; then
     write_status "failed" "git pull" "fast-forward pull failed — check deploy.log"
     exit 1
-  fi
-  if [ -n "$STAGED_IMAGE" ]; then
-    if ! docker tag "$STAGED_IMAGE" "$SPAWN_IMAGE" >> "$LOG" 2>&1; then
-      write_status "failed" "container build" "could not tag the built image as ${SPAWN_IMAGE} — restored the previous build"
-      exit 1
-    fi
-    remove_staged_image
   fi
 
   # Bash keeps reading the already-open script after git replaces it. Re-exec
@@ -415,7 +432,8 @@ if [ "$POST_PULL" != "1" ]; then
   exec env \
     NANOCLAW_DEPLOY_POST_PULL=1 \
     NANOCLAW_DEPLOY_PRE_COMMIT="$PRE_COMMIT" \
-    NANOCLAW_DEPLOY_IMAGE_SAVED_BASE="$IMAGE_SAVED_BASE" \
+    NANOCLAW_DEPLOY_STAGED_IMAGE="$STAGED_IMAGE" \
+    NANOCLAW_DEPLOY_BUILD_TREE="$BUILD_TREE" \
     NANOCLAW_DEPLOY_ROOT="$REPO_ROOT" \
     bash scripts/deploy.sh
 fi
@@ -489,18 +507,10 @@ if ! pnpm run build >> "$LOG" 2>&1; then
   exit 1
 fi
 
-# The image normally matches HEAD by now, built before the pull. A deploy whose
-# first half ran a deploy.sh without that step, or whose image moved since,
-# still gets it built here, in the live checkout, as before.
-CONTAINER_CHANGES=$(container_changes_since_image HEAD)
-if [ -n "$CONTAINER_CHANGES" ]; then
-  save_spawn_image
-  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Container changed (or image unlabeled), rebuilding ${SPAWN_IMAGE}..." >> "$LOG"
-  write_status "running" "container build" ""
-  if ! CONTAINER_IMAGE_REF="$SPAWN_IMAGE" ./container/build.sh "$SPAWN_TAG" >> "$LOG" 2>&1; then
-    write_status "failed" "container build" "Container image build failed"
-    exit 1
-  fi
+# The image for HEAD is normally staged by now, built before the pull. A deploy
+# whose first half ran a deploy.sh without that step stages it here instead.
+if [ -z "$STAGED_IMAGE" ] && [ -n "$(container_changes_since_image HEAD)" ]; then
+  build_target_image "$(git rev-parse HEAD)"
 fi
 
 # A repository action that drains sessions (publish, transfer) replays from
@@ -644,6 +654,16 @@ while IFS= read -r unit; do
     exit 1
   fi
 done <<< "$SIBLING_UNITS"
+
+# The staged image becomes the spawn image as the last change before the
+# restart. When its agent-runner deps differ from the old host's boot snapshot,
+# the old host refuses spawns from here until the new one boots, and the sweep
+# retries them there; promoting any earlier would stretch that window.
+write_status "running" "container promote" ""
+if ! promote_staged_image; then
+  write_status "failed" "container promote" "could not make ${STAGED_IMAGE} the spawn image — restored the previous build"
+  exit 1
+fi
 
 # Arm the post-restart crash guard (src/deploy-crash-guard.ts). The restart
 # kills this script's process group, so nothing HERE can watch the service come

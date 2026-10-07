@@ -181,6 +181,8 @@ function tailProbe(): string {
     // Overridable so a test can drive the manifest encoder's refusal path.
     'PRE_COMMIT="${PROBE_PRE_COMMIT:-0000000000000000000000000000000000000000}"',
     'IMAGE_SAVED_BASE=""',
+    // Nothing staged, so the promotion just ahead of the manifest has nothing to do.
+    'STAGED_IMAGE=""',
     'MIGRATION_CHANGES=""',
     'RESTART_ATTEMPTED_UNITS=""',
     'COMMIT_RESTORED=0',
@@ -190,6 +192,7 @@ function tailProbe(): string {
     `trap 'printf "%s" "$RESTART_ATTEMPTED_UNITS" > "${path.join(harness.dir, 'attempted')}"' EXIT`,
     shellFunction('write_status'),
     shellFunction('long_running_repo_units'),
+    shellFunction('promote_staged_image'),
     deployTail(),
     '',
   ].join('\n');
@@ -482,6 +485,8 @@ describe('deploy rollback puts restarted siblings back on the restored build', (
       `LOG="${path.join(harness.dir, 'deploy.log')}"`,
       'PRE_COMMIT="0000000000000000000000000000000000000000"',
       'IMAGE_SAVED_BASE=""',
+      'BUILD_TREE=""',
+      'STAGED_IMAGE=""',
       'ROLLBACK_READY=1',
       'DEPLOY_HANDOFF=0',
       'COMMIT_RESTORED=0',
@@ -489,6 +494,8 @@ describe('deploy rollback puts restarted siblings back on the restored build', (
       `PORCELAIN='${porcelain}'`,
       'export PORCELAIN',
       shellFunction('tracked_changes'),
+      shellFunction('remove_build_tree'),
+      shellFunction('remove_staged_image'),
       shellFunction('restore_before_restart'),
       'false',
       'restore_before_restart',

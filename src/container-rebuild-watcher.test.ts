@@ -132,7 +132,7 @@ beforeEach(() => {
   installExecImpl(world);
   notified = [];
   mockCheckDepsDrift.mockReset();
-  mockCheckDepsDrift.mockResolvedValue({ ok: true, message: 'agent-runner deps in sync' });
+  mockCheckDepsDrift.mockResolvedValue({ ok: true, rebuildable: true, message: 'agent-runner deps in sync' });
   // Register the notifier directly (not via startContainerRebuildWatcher) so
   // these tests aren't racing that function's own async startup check —
   // the startup check itself is covered by the dedicated describe block below.
@@ -261,12 +261,20 @@ const flushMicrotasks = async (): Promise<void> => {
 
 describe('startContainerRebuildWatcher', () => {
   it('runs one startup check and requests a rebuild if the base image is already drifted', async () => {
-    mockCheckDepsDrift.mockResolvedValue({ ok: false, message: 'agent-runner deps drift: x != y' });
+    mockCheckDepsDrift.mockResolvedValue({ ok: false, rebuildable: true, message: 'agent-runner deps drift: x != y' });
     startContainerRebuildWatcher(notifier);
     await flushMicrotasks();
     expect(_pendingRebuildForTest()).not.toBeNull();
     await _pendingRebuildForTest();
     expect(world.buildCalls).toBe(1);
+  });
+
+  it('does not rebuild for a refusal only a restart fixes', async () => {
+    mockCheckDepsDrift.mockResolvedValue({ ok: false, rebuildable: false, message: 'restart it' });
+    startContainerRebuildWatcher(notifier);
+    await flushMicrotasks();
+    expect(_pendingRebuildForTest()).toBeNull();
+    expect(world.buildCalls).toBe(0);
   });
 
   it('is idempotent — a second start call is a no-op', () => {
@@ -276,7 +284,7 @@ describe('startContainerRebuildWatcher', () => {
   });
 
   it('does nothing on startup when the base image is already in sync', async () => {
-    mockCheckDepsDrift.mockResolvedValue({ ok: true, message: 'agent-runner deps in sync' });
+    mockCheckDepsDrift.mockResolvedValue({ ok: true, rebuildable: true, message: 'agent-runner deps in sync' });
     startContainerRebuildWatcher(notifier);
     await flushMicrotasks();
     expect(mockCheckDepsDrift).toHaveBeenCalled();

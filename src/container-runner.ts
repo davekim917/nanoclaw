@@ -1278,9 +1278,9 @@ async function spawnContainer(
       retried: depsCheck.retried,
       message: depsCheck.message,
     });
-    // Only the shared base image is fixable by a rebuild (a per-agent image needs its self-mod re-run). Never
-    // awaited: refuse now; host-sweep retries once the detached rebuild lands.
-    if (spawnImageRef === CONTAINER_IMAGE) requestContainerRebuild(depsCheck.message);
+    // Only the base image, and only while the checkout holds the deps this host booted, is fixable by a rebuild
+    // (a per-agent image needs its self-mod re-run). Never awaited: refuse now; host-sweep retries after it lands.
+    if (spawnImageRef === CONTAINER_IMAGE && depsCheck.rebuildable) requestContainerRebuild(depsCheck.message);
     throw new Error(depsCheck.message);
   }
 

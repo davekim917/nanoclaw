@@ -34,6 +34,8 @@ import { initGroupFilesystem } from './group-init.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import {
   activateAgentRunnerSource,
+  agentRunnerBootDepsHash,
+  agentRunnerDepsHashOf,
   agentRunnerSourcePath,
   pruneAgentRunnerSnapshots,
   resetAgentRunnerSourceForTesting,
@@ -153,6 +155,29 @@ describe('activateAgentRunnerSource', async () => {
     expect(liveMount.hostPath).toBe(sourceDir);
 
     fs.rmSync(sourceDir, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('hashes the dependency files beside the snapshot at boot, and a later pull does not move it', () => {
+    const runnerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-runner-'));
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-runner-data-'));
+    fs.mkdirSync(path.join(runnerDir, 'src'));
+    fs.writeFileSync(path.join(runnerDir, 'src', 'index.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(runnerDir, 'package.json'), '{"v":1}\n');
+    fs.writeFileSync(path.join(runnerDir, 'bun.lock'), 'lock 1\n');
+
+    activateAgentRunnerSource({ sourceDir: path.join(runnerDir, 'src'), dataDir });
+    const booted = agentRunnerDepsHashOf(Buffer.from('{"v":1}\n'), Buffer.from('lock 1\n'));
+    expect(agentRunnerBootDepsHash()).toBe(booted);
+
+    fs.writeFileSync(path.join(runnerDir, 'package.json'), '{"v":2}\n');
+    expect(agentRunnerBootDepsHash()).toBe(booted);
+
+    // Mounting the checkout itself, there is no snapshot to hold a hash for.
+    activateAgentRunnerSource({ sourceDir: path.join(runnerDir, 'src'), dataDir, live: true });
+    expect(agentRunnerBootDepsHash()).toBeUndefined();
+
+    fs.rmSync(runnerDir, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 

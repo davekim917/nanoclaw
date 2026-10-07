@@ -1,7 +1,11 @@
 /**
- * Agent-runner deps drift check. Runner source is bind-mounted live but node_modules are baked into the image, so
- * a new dependency without a rebuild crash-loops every fresh spawn silently. `container/build.sh` stamps a hash
- * of package.json + bun.lock as an image LABEL; a mismatch refuses the spawn with the rebuild command.
+ * Agent-runner deps drift check. Runner source is bind-mounted but node_modules are baked into the image, so a new
+ * dependency without a rebuild crash-loops every fresh spawn silently. `container/build.sh` stamps a hash of
+ * package.json + bun.lock as an image LABEL; a mismatch refuses the spawn with the rebuild command.
+ *
+ * The expected hash is the one captured with the boot snapshot of the runner source (agent-runner-source.ts), so a
+ * pull does not change what this host accepts: an image built from pulled files would pair new node_modules with
+ * the old source it still mounts. Only when the host mounts the checkout itself are the checkout's files hashed.
  *
  * Only passing results are cached, keyed on imageRef plus the files' mtime+size (so any edit re-checks) and
  * bounded by a TTL (the image can vanish without a file edit). Failures are never cached: their fix is a rebuild,
@@ -10,12 +14,12 @@
  * During a containerd image-index rewrite, `docker inspect` can return an empty label map (exit 0), which a
  * single-key read cannot tell from an unlabeled image; the whole map is read and an absent one gets one re-read.
  */
-import { createHash } from 'crypto';
 import { readFile, stat } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as path from 'path';
 
+import { agentRunnerBootDepsHash, agentRunnerDepsHashOf } from './agent-runner-source.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 
@@ -39,6 +43,8 @@ export interface DepsDriftCheck {
   actual: string | null;
   lookup: LabelLookup;
   retried: boolean;
+  /** False when only a host restart can fix the refusal: the checkout's deps moved past the ones this host booted. */
+  rebuildable: boolean;
   message: string;
 }
 
@@ -99,18 +105,10 @@ export function resetDepsDriftCacheForTests(): void {
   inFlightChecks.clear();
 }
 
-async function fileSha256Hex(p: string): Promise<string> {
-  const buf = await readFile(p);
-  return createHash('sha256').update(buf).digest('hex');
-}
-
-/** sha256(sha256(package.json) || sha256(bun.lock)), 16 hex chars; must stay byte-identical to container/build.sh. */
+/** The checkout's deps hash; must stay byte-identical to container/build.sh (see agentRunnerDepsHashOf). */
 export async function computeAgentRunnerDepsHash(): Promise<string> {
-  const [pkgHash, lockHash] = await Promise.all([fileSha256Hex(PKG_PATH), fileSha256Hex(LOCK_PATH)]);
-  return createHash('sha256')
-    .update(pkgHash + lockHash)
-    .digest('hex')
-    .slice(0, 16);
+  const [pkg, lock] = await Promise.all([readFile(PKG_PATH), readFile(LOCK_PATH)]);
+  return agentRunnerDepsHashOf(pkg, lock);
 }
 
 /**
@@ -222,7 +220,11 @@ async function performDriftCheck(
     return cached.result;
   }
 
-  const [expected, first] = await Promise.all([computeAgentRunnerDepsHash(), lookupImageLabel(imageRef, inspect)]);
+  const bootHash = agentRunnerBootDepsHash();
+  const [expected, first] = await Promise.all([
+    bootHash ?? computeAgentRunnerDepsHash(),
+    lookupImageLabel(imageRef, inspect),
+  ]);
 
   // Exactly one re-read: a genuinely unlabeled image must still refuse, and the spawn path must not poll.
   let lookup = first;
@@ -232,6 +234,11 @@ async function performDriftCheck(
     await sleep(retryDelayMs);
     lookup = await lookupImageLabel(imageRef, inspect);
   }
+
+  const checkoutHash =
+    lookup.kind === 'found' && lookup.value !== expected && bootHash !== undefined
+      ? await computeAgentRunnerDepsHash()
+      : expected;
 
   const result: DepsDriftCheck = ((): DepsDriftCheck => {
     switch (lookup.kind) {
@@ -243,6 +250,7 @@ async function performDriftCheck(
           actual: null,
           lookup,
           retried,
+          rebuildable: true,
           message: `agent-runner deps check: docker inspect ${imageRef} failed, so no label was read (${lookup.reason}). This is an inspect failure, NOT a missing label — verify the container runtime is reachable before rebuilding anything.`,
         };
       case 'no-image':
@@ -253,6 +261,7 @@ async function performDriftCheck(
           actual: null,
           lookup,
           retried,
+          rebuildable: true,
           message: `agent-runner image ${imageRef} not found — build it: ${rebuildHint(imageRef)}`,
         };
       case 'missing':
@@ -271,6 +280,7 @@ async function performDriftCheck(
             actual: null,
             lookup,
             retried,
+            rebuildable: true,
             message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}) — treating admin-set image_tag override as opt-out from drift check. If this is a derived image from ${CONTAINER_IMAGE}, rebuild base then re-run install_packages.`,
           };
         }
@@ -281,12 +291,25 @@ async function performDriftCheck(
           actual: null,
           lookup,
           retried,
+          rebuildable: true,
           message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (${evidence}; built by an older build.sh) — rebuild: ${rebuildHint(imageRef)}`,
         };
       }
       case 'found': {
         const actual = lookup.value;
         if (actual !== expected) {
+          if (checkoutHash !== expected) {
+            return {
+              ok: false,
+              imageRef,
+              expected,
+              actual,
+              lookup,
+              retried,
+              rebuildable: false,
+              message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, this host booted agent-runner deps ${expected} and the checkout has since moved to ${checkoutHash}. A rebuild cannot fix this host; restart it so it runs the checkout.`,
+            };
+          }
           return {
             ok: false,
             imageRef,
@@ -294,10 +317,20 @@ async function performDriftCheck(
             actual,
             lookup,
             retried,
+            rebuildable: true,
             message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint(imageRef)}`,
           };
         }
-        return { ok: true, imageRef, expected, actual, lookup, retried, message: 'agent-runner deps in sync' };
+        return {
+          ok: true,
+          imageRef,
+          expected,
+          actual,
+          lookup,
+          retried,
+          rebuildable: true,
+          message: 'agent-runner deps in sync',
+        };
       }
     }
   })();

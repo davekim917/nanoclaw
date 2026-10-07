@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createHash } from 'crypto';
 import { readFile, stat, utimes } from 'fs/promises';
+import os from 'os';
 import * as path from 'path';
 import fsSync from 'fs';
 import cpSync from 'child_process';
@@ -13,6 +14,11 @@ import {
   DEPS_DRIFT_CACHE_TTL_MS,
   resetDepsDriftCacheForTests,
 } from './agent-runner-image-check.js';
+import {
+  activateAgentRunnerSource,
+  agentRunnerBootDepsHash,
+  resetAgentRunnerSourceForTesting,
+} from './agent-runner-source.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 
 // The cache is module-scoped (see agent-runner-image-check.ts), so any test
@@ -565,5 +571,70 @@ describe('checkAgentRunnerDepsDrift stays off the sync fs/child_process surface'
     }
 
     expect(record).toEqual([]);
+  });
+});
+
+/**
+ * The host mounts the runner source it snapshotted at boot, so the image has to match that snapshot's deps, not
+ * the checkout's: after a pull, an image built from the checkout would pair new node_modules with old source.
+ */
+describe('checkAgentRunnerDepsDrift expects the deps of the boot snapshot', () => {
+  const dirs: string[] = [];
+  const LABEL = 'nanoclaw.agentRunnerDepsHash';
+
+  /** A runner checkout as activation sees it: src/ plus the two dependency files beside it. */
+  function bootFrom(pkg: string | Buffer, lock: string | Buffer, live = false): string {
+    const runnerDir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-boot-deps-'));
+    const dataDir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-boot-data-'));
+    dirs.push(runnerDir, dataDir);
+    fsSync.mkdirSync(path.join(runnerDir, 'src'));
+    fsSync.writeFileSync(path.join(runnerDir, 'src', 'index.ts'), 'export {};\n');
+    fsSync.writeFileSync(path.join(runnerDir, 'package.json'), pkg);
+    fsSync.writeFileSync(path.join(runnerDir, 'bun.lock'), lock);
+    activateAgentRunnerSource({ sourceDir: path.join(runnerDir, 'src'), dataDir, live });
+    return runnerDir;
+  }
+
+  const labeled = (value: string) => ({
+    inspect: async () => JSON.stringify({ [LABEL]: value }),
+    retryDelayMs: 0,
+  });
+
+  afterEach(() => {
+    resetAgentRunnerSourceForTesting();
+    for (const dir of dirs.splice(0)) fsSync.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('accepts the image built for the booted deps and refuses one built from the checkout pulled since, as a restart', async () => {
+    bootFrom('{"dependencies":{"booted":"1.0.0"}}\n', 'booted lock\n');
+    const booted = agentRunnerBootDepsHash()!;
+    const checkout = await computeAgentRunnerDepsHash();
+    expect(booted).toMatch(/^[0-9a-f]{16}$/);
+    expect(booted).not.toBe(checkout);
+
+    const old = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, labeled(booted));
+    expect(old).toMatchObject({ ok: true, expected: booted });
+
+    resetDepsDriftCacheForTests();
+    const pulled = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, labeled(checkout));
+    expect(pulled).toMatchObject({ ok: false, rebuildable: false, expected: booted, actual: checkout });
+    expect(pulled.message).toContain('restart');
+  });
+
+  it('a mismatch while the checkout still holds the booted deps is one a rebuild fixes', async () => {
+    bootFrom(
+      await readFile(path.join(REPO_ROOT, 'container/agent-runner/package.json')),
+      await readFile(path.join(REPO_ROOT, 'container/agent-runner/bun.lock')),
+    );
+    const r = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, labeled('0000000000000000'));
+    expect(r).toMatchObject({ ok: false, rebuildable: true, expected: await computeAgentRunnerDepsHash() });
+  });
+
+  it('mounting the checkout itself, it expects the checkout', async () => {
+    bootFrom('{"dependencies":{"booted":"1.0.0"}}\n', 'booted lock\n', true);
+    expect(agentRunnerBootDepsHash()).toBeUndefined();
+    const checkout = await computeAgentRunnerDepsHash();
+    const r = await checkAgentRunnerDepsDrift(CONTAINER_IMAGE, labeled(checkout));
+    expect(r).toMatchObject({ ok: true, expected: checkout });
   });
 });

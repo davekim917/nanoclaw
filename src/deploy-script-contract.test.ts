@@ -38,7 +38,7 @@ describe('deploy rollback shell contract', () => {
 
   it('builds the image for the commit it resolved, before moving the live checkout to that commit', () => {
     const fetchAt = script.indexOf('git fetch origin main');
-    const buildAt = script.search(/^ {4}build_target_image$/m);
+    const buildAt = script.indexOf('    build_target_image "$TARGET_SHA"');
     const pullAt = script.indexOf('git merge --ff-only "$TARGET_SHA"');
     const reexecAt = script.indexOf('exec env');
     for (const at of [fetchAt, buildAt, pullAt]) expect(at).toBeGreaterThan(-1);
@@ -52,14 +52,38 @@ describe('deploy rollback shell contract', () => {
     const restore = script.match(/^restore_before_restart\(\) \{\n[\s\S]*?^\}$/m)?.[0] ?? '';
     expect(restore.indexOf('remove_build_tree')).toBeGreaterThan(-1);
     expect(restore.indexOf('remove_build_tree')).toBeLessThan(restore.indexOf('if [ "$ROLLBACK_READY" != "1" ]'));
-    // The re-exec keeps the record of which image this deploy saved for rollback.
-    expect(script.slice(reexecAt)).toContain('NANOCLAW_DEPLOY_IMAGE_SAVED_BASE="$IMAGE_SAVED_BASE"');
+    // The second half inherits the staged image, and any build tree it still has to clean up.
+    expect(script.slice(reexecAt)).toContain('NANOCLAW_DEPLOY_STAGED_IMAGE="$STAGED_IMAGE"');
+    expect(script.slice(reexecAt)).toContain('NANOCLAW_DEPLOY_BUILD_TREE="$BUILD_TREE"');
+  });
+
+  it('promotes the staged image only after the host build, as the last step before the restart', () => {
+    const promoteAt = script.indexOf('if ! promote_staged_image; then');
+    expect(promoteAt).toBeGreaterThan(script.indexOf('pnpm run build >>'));
+    expect(promoteAt).toBeGreaterThan(script.indexOf('done <<< "$SIBLING_UNITS"'));
+    expect(promoteAt).toBeLessThan(script.indexOf('if [ -z "$MIGRATION_CHANGES" ]'));
+    expect(promoteAt).toBeLessThan(script.indexOf('sudo systemctl restart nanoclaw-v2'));
+    // The spawn tag moves only in the promotion and in the rollback of a promotion.
+    const body = (name: string): [number, number] => {
+      const start = script.search(new RegExp(`^${name}\\(\\) \\{$`, 'm'));
+      return [start, script.indexOf('\n}\n', start)];
+    };
+    const owners = [body('promote_staged_image'), body('restore_before_restart')];
+    const retags = [...script.matchAll(/docker tag "[^"\n]*" "(\$SPAWN_IMAGE|\$\{IMAGE_SAVED_BASE\}:latest)"/g)];
+    expect(retags.length).toBeGreaterThanOrEqual(2);
+    for (const retag of retags) {
+      expect(owners.some(([start, end]) => retag.index! > start && retag.index! < end)).toBe(true);
+    }
   });
 
   it('fails closed on rollback snapshot and image-tag failures', () => {
     expect(script).toContain('if ! snapshot_dir node_modules || ! snapshot_dir dist; then');
-    expect(script).toContain('if ! docker tag "$SPAWN_IMAGE"');
-    expect(script).toContain('could not preserve the current agent image — build not started');
+    const promote = script.match(/^promote_staged_image\(\) \{\n[\s\S]*?^\}$/m)?.[0] ?? '';
+    // The save and the retag share build.sh's lock, and the rollback owns the image only after the retag.
+    expect(promote).toContain('flock 8 || exit 1');
+    expect(promote).toContain('8>> "logs/container-build.lock"');
+    expect(promote.indexOf('IMAGE_SAVED_BASE=')).toBeGreaterThan(promote.indexOf(') 8>>'));
+    expect(script).toContain('could not make ${STAGED_IMAGE} the spawn image — restored the previous build');
   });
 
   it('refuses tracked changes before mutation and restores pre-restart failures', () => {

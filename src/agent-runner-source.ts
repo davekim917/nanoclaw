@@ -3,8 +3,12 @@
  * /app/src, so a `git pull` never changes what the next spawn loads before a restart. Pruning is separate and only
  * removes a snapshot no running container mounts: a bind mount pins the directory, not its entries.
  * `NANOCLAW_AGENT_RUNNER_SRC_LIVE=1` mounts the checkout directly for local dev.
+ *
+ * The agent-runner dependency hash is captured at the same moment, from the same checkout, because the image's
+ * node_modules must match the source this host mounts, not whatever a later pull put on disk.
  */
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -15,6 +19,30 @@ const DEFAULT_SOURCE_DIR = path.join(REPO_ROOT, 'container', 'agent-runner', 'sr
 
 let activePath: string | undefined;
 let activationCounter = 0;
+let bootDepsHash: string | undefined;
+
+/** sha256(sha256(package.json) || sha256(bun.lock)), 16 hex chars; must stay byte-identical to container/build.sh. */
+export function agentRunnerDepsHashOf(pkg: Buffer, lock: Buffer): string {
+  const sha = (buf: Buffer): string => createHash('sha256').update(buf).digest('hex');
+  return createHash('sha256')
+    .update(sha(pkg) + sha(lock))
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function captureBootDepsHash(runnerDir: string): string | undefined {
+  try {
+    return agentRunnerDepsHashOf(
+      fs.readFileSync(path.join(runnerDir, 'package.json')),
+      fs.readFileSync(path.join(runnerDir, 'bun.lock')),
+    );
+  } catch (err) {
+    log.warn('agent-runner source: could not hash the dependency files beside the snapshot; checking the checkout', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
 
 function countFiles(dir: string): number {
   let count = 0;
@@ -36,6 +64,7 @@ export function activateAgentRunnerSource(opts?: { sourceDir?: string; dataDir?:
   const sourceDir = opts?.sourceDir ?? DEFAULT_SOURCE_DIR;
   const dataDir = opts?.dataDir ?? DATA_DIR;
   const live = opts?.live ?? process.env.NANOCLAW_AGENT_RUNNER_SRC_LIVE === '1';
+  bootDepsHash = undefined;
 
   if (live) {
     activePath = sourceDir;
@@ -57,6 +86,7 @@ export function activateAgentRunnerSource(opts?: { sourceDir?: string; dataDir?:
     fs.renameSync(tmpDir, finalDir);
 
     activePath = finalDir;
+    bootDepsHash = captureBootDepsHash(path.dirname(sourceDir));
     log.info('agent-runner source: snapshot activated', { path: finalDir, files: countFiles(finalDir) });
     return activePath;
   } catch (err) {
@@ -71,6 +101,11 @@ export function activateAgentRunnerSource(opts?: { sourceDir?: string; dataDir?:
 
 export function agentRunnerSourcePath(): string {
   return activePath ?? DEFAULT_SOURCE_DIR;
+}
+
+/** The dependency hash of the snapshot this host mounts; undefined while it mounts the checkout itself. */
+export function agentRunnerBootDepsHash(): string | undefined {
+  return bootDepsHash;
 }
 
 /**
@@ -153,4 +188,5 @@ export function pruneAgentRunnerSnapshots(opts?: {
 export function resetAgentRunnerSourceForTesting(): void {
   activePath = undefined;
   activationCounter = 0;
+  bootDepsHash = undefined;
 }
