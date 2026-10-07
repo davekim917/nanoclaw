@@ -1,8 +1,7 @@
 diff --git a/dist/index.js b/dist/index.js
-index eb26e8b64d77593219f278f2aed27ceddfc2111c..cb83bd84c5e7b3e7f27cd0a4a4cf79d902219880 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -1871,8 +1871,8 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1871,8 +1871,8 @@
          "POST",
          {
            name: threadName,
@@ -13,7 +12,20 @@ index eb26e8b64d77593219f278f2aed27ceddfc2111c..cb83bd84c5e7b3e7f27cd0a4a4cf79d9
          }
        );
        const result = await response.json();
-@@ -2556,14 +2556,23 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2494,9 +2494,10 @@
+         this.logger.info("Discord Gateway forwarding event", {
+           type: packet.t
+         });
++        const snapshot = JSON.parse(JSON.stringify(packet));
+         await this.enqueueOrderedForward(
+-          getPacketChannelId(packet),
+-          () => this.forwardRawGatewayPacket(client, webhookUrl, packet)
++          getPacketChannelId(snapshot),
++          () => this.forwardRawGatewayPacket(client, webhookUrl, snapshot)
+         );
+       });
+     } else {
+@@ -2556,14 +2557,23 @@
          this.logger.debug("Ignoring message - Gateway is shutting down");
          return;
        }
@@ -41,7 +53,7 @@ index eb26e8b64d77593219f278f2aed27ceddfc2111c..cb83bd84c5e7b3e7f27cd0a4a4cf79d9
        const isUserMentioned = message.mentions.has(client.user?.id ?? "", {
          ignoreEveryone: true
        });
-@@ -2611,13 +2620,17 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2611,13 +2621,17 @@
          this.logger.debug("Ignoring reaction - Gateway is shutting down");
          return;
        }
@@ -64,7 +76,7 @@ index eb26e8b64d77593219f278f2aed27ceddfc2111c..cb83bd84c5e7b3e7f27cd0a4a4cf79d9
        this.logger.info("Discord Gateway reaction added", {
          emoji: reaction.emoji.name,
          messageId: reaction.message.id,
-@@ -2639,13 +2652,17 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2639,13 +2653,17 @@
          );
          return;
        }
