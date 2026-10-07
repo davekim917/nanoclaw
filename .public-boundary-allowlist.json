@@ -59,6 +59,71 @@
       "path": "templates/README.md",
       "value": "nanoclaw-templates",
       "reason": "Published upstream templates repository (public); the install clones it, so its name is derived as a repository identifier"
+    },
+    {
+      "path": ".claude/skills/get-qodo-rules/SKILL.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": ".claude/skills/qodo-pr-resolver/SKILL.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "container/skills/design-artifact-loop/design-systems/LICENSE",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "container/skills/design-artifact-loop/design-systems/mastercard/DESIGN.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/always-on-directive-baseline.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/host-backup.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/specs/mnemon-rearchitecture/plan.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/specs/orchestrator-dispatch/build-state.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/specs/scheduled-tasks-board/brief.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/specs/scheduled-tasks-board/build-state.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/specs/upstream-mailbox-seam/run.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/specs/wiki-source-admission/run.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
+    },
+    {
+      "path": "docs/specs/workgroup-memory-and-session-capabilities/build-state.md",
+      "value": "compliance",
+      "reason": "Generic English word, not an install identifier"
     }
   ]
 }
