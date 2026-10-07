@@ -91,7 +91,7 @@ describe('latest-stable release policy', () => {
 
   it('marks an item on a live path with no real-library test as blocked by the dependency gate', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'container-updates-'));
-    for (const dir of ['container/agent-runner', 'container/remotion', '.github']) {
+    for (const dir of ['container/agent-runner', 'container/remotion']) {
       await mkdir(path.join(root, dir), { recursive: true });
     }
     await writeFile(path.join(root, 'container/agent-runner/package.json'), '{}\n');
@@ -109,7 +109,7 @@ describe('latest-stable release policy', () => {
       }),
     );
     await writeFile(
-      path.join(root, '.github', 'dependency-paths.json'),
+      path.join(root, 'container', 'dependency-paths.json'),
       JSON.stringify({
         livePaths: {
           'discord-inbound': { description: 'Discord inbound', tests: [] },

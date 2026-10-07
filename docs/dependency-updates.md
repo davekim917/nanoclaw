@@ -15,7 +15,7 @@ Host and container changes use separate NanoClaw PRs. Host changes activate thro
 
 ## Behaviour-change ledger and live-path gate
 
-Every PR runs `pnpm exec tsx scripts/dependency-gate.ts check` in CI. It compares the locked versions at the PR's merge base with the head: `pnpm-lock.yaml`, `container/agent-runner/bun.lock`, and the Dockerfile pins named in `container/update-sources.json`. Transitive packages count, and so does an edited file under `patches/`. Two rules follow from `.github/dependency-paths.json`, which classifies every direct dependency as `dev`, `runtime` or `live`:
+Every PR runs `pnpm exec tsx scripts/dependency-gate.ts check` in CI. It compares the locked versions at the PR's merge base with the head: `pnpm-lock.yaml` (patch hashes included), `container/agent-runner/bun.lock`, `container/remotion/pnpm-lock.yaml`, the Dockerfile pins named in `container/update-sources.json`, and the Dockerfile's base image. An edited file under `patches/` counts as a change at the same version. `container/dependency-paths.json` classifies every direct dependency as `dev`, `runtime` or `live`; a package that a `live` package depends on, transitively, inherits its live paths, because pnpm dedupes one copy for every consumer.
 
 - **A changed `runtime` or `live` package needs a ledger.** The PR adds or edits a file under `docs/dependency-changes/` with one section per package the gate names:
 
@@ -28,11 +28,13 @@ Every PR runs `pnpm exec tsx scripts/dependency-gate.ts check` in CI. It compare
   - 4.38: forwarded snapshots fold into the message text · not covered: no forwarded-message fixture yet
   ```
 
-  The heading's versions must match the lockfiles; a set of versions is comma-joined, and a package added or removed reads `none`. `Source:` names the changelog or release notes read for every version in between. Each bullet is one behaviour change and ends in `· test: <path>` (the file must exist) or `· not covered: <reason>`. When the changelog lists none, say so in one bullet with its coverage. A `dev` change needs nothing.
+  The heading's versions must match the lockfiles; a set of versions is comma-joined, and a package added or removed reads `none`. `Source:` names the changelog or release notes read for every version in between. Each bullet is one behaviour change and ends in `· test: <path>` (an existing `.test.ts` file) or `· not covered: <reason>`. When the changelog lists none, say so in one bullet with its coverage. A `dev` change needs nothing, and each package is explained in one ledger only.
 
-- **A changed `live` package needs a real-library test of each live path it is on.** A live path is an I/O path the fleet depends on: chat inbound and outbound, attachment download, the OneCLI gateway, each agent provider, MCP. Its test drives the real library over its real transport against a local fake of the remote end, never a mocked module: `src/channels/slack-live-path.test.ts` runs the host's Slack wiring, `@chat-adapter/slack`, `@slack/socket-mode` and `@slack/web-api` against a local Web API and Socket Mode server. The file name contains `live-path`, so CI's `Live-path adapter tests` step runs it on every PR. A live path with no test yet blocks every change to its packages until someone writes one and lists it in the registry.
+- **A changed `live` package needs a real-library test of each live path it is on.** A live path is an I/O path the fleet depends on: chat inbound and outbound, attachment download, the OneCLI gateway, each agent provider, MCP. Its test drives the real library over its real transport against a local fake of the remote end, never a mocked module: `src/channels/slack-live-path.test.ts` runs the host's Slack wiring, `@chat-adapter/slack`, `@slack/socket-mode` and `@slack/web-api` against a local Web API and Socket Mode server. The file name contains `live-path`, so CI's `Live-path adapter tests` step runs it on every PR. A live path with no test yet blocks every upgrade of its packages until someone writes one and lists it in the registry. Removing a package is not blocked.
 
-A new direct dependency fails the gate until it is classified. To unblock a live path, write its test; do not reclassify a package to get a bump through.
+- **Incidents.** A hotfix patch on the shipped version, or a rollback to an older version, may pass an untested live path with an `Override: <incident and reason>` line in its ledger section. The gate prints it as a warning. An upgrade can never be overridden.
+
+- **The registry cannot quietly get weaker.** Dropping a package's live path, or a test from a live path, fails unless a ledger in the same PR says why: `Reclassified: <package or live path> · <reason>`. To unblock a live path, write its test.
 
 ## Host peer-version lockstep: `vitest` / `@vitest/coverage-v8`
 

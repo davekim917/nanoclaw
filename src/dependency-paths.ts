@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-export const DEPENDENCY_PATHS_FILE = '.github/dependency-paths.json';
+export const DEPENDENCY_PATHS_FILE = 'container/dependency-paths.json';
 
 type PackageClass = { kind: 'dev' } | { kind: 'runtime' } | { kind: 'live'; paths: string[] };
 
@@ -10,7 +10,6 @@ export interface DependencyPathRegistry {
   packages: Record<string, PackageClass>;
 }
 
-/** Null when the checkout has no registry, as a container's read-only project mount may not. */
 export function readDependencyPathRegistry(repoRoot: string): DependencyPathRegistry | null {
   const file = path.join(repoRoot, DEPENDENCY_PATHS_FILE);
   if (!fs.existsSync(file)) return null;
