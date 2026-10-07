@@ -12,6 +12,7 @@ import { parse as parseYaml } from 'yaml';
 import {
   DEPENDENCY_PATHS_FILE as REGISTRY_PATH,
   readDependencyPathRegistry,
+  untestedLivePaths,
   type DependencyPathRegistry as Registry,
 } from '../src/dependency-paths.js';
 import { gitRead } from './lib/doc-citations.js';
@@ -68,8 +69,17 @@ function parseBunLock(text: string): { packages?: Record<string, unknown[]> } {
   return JSON.parse(text.replace(/,(\s*[}\]])/g, '$1')) as { packages?: Record<string, unknown[]> };
 }
 
-function dockerPins(dockerfile: string, updateSources: string): Array<{ id: string; version: string }> {
-  const items = (JSON.parse(updateSources) as { dockerfile?: Array<{ id: string; arg: string }> }).dockerfile ?? [];
+export interface TrackedTool {
+  id: string;
+  arg: string;
+  source?: { kind?: string; package?: string };
+}
+
+export function trackedTools(updateSources: string | null): TrackedTool[] {
+  return updateSources ? ((JSON.parse(updateSources) as { dockerfile?: TrackedTool[] }).dockerfile ?? []) : [];
+}
+
+function dockerPins(dockerfile: string, items: TrackedTool[]): Array<{ id: string; version: string }> {
   return items.flatMap(({ id, arg }) => {
     const match = new RegExp(`^ARG ${arg}=["']?([^"'\\s#]+)`, 'm').exec(dockerfile);
     return match ? [{ id, version: match[1]! }] : [];
@@ -102,7 +112,11 @@ function tree<T>(map: Map<Source, Map<string, T>>, source: Source): Map<string, 
   return inner;
 }
 
-export function lockedVersions(files: DependencyFiles): Locked {
+/** `tools` defaults to the files' own update-sources list; the gate passes the base's and head's union. */
+export function lockedVersions(
+  files: DependencyFiles,
+  tools: TrackedTool[] = trackedTools(files.updateSources),
+): Locked {
   const locked: Locked = { versions: new Map(), dependsOn: new Map(), patches: new Map() };
   const pnpm: Array<[Source, string | null]> = [
     ['host', files.pnpmLock],
@@ -139,10 +153,7 @@ export function lockedVersions(files: DependencyFiles): Locked {
   }
   if (files.dockerfile) {
     const docker = tree(locked.versions, 'docker');
-    if (files.updateSources) {
-      for (const { id, version } of dockerPins(files.dockerfile, files.updateSources))
-        add(docker, `docker:${id}`, version);
-    }
+    for (const { id, version } of dockerPins(files.dockerfile, tools)) add(docker, `docker:${id}`, version);
     for (const image of baseImages(files.dockerfile)) add(docker, BASE_IMAGE, image);
   }
   return locked;
@@ -157,10 +168,7 @@ export function directDependencies(files: DependencyFiles): Set<string> {
       for (const name of Object.keys(json[field] ?? {})) names.add(name);
     }
   }
-  if (files.updateSources) {
-    const items = (JSON.parse(files.updateSources) as { dockerfile?: Array<{ id: string }> }).dockerfile ?? [];
-    for (const { id } of items) names.add(`docker:${id}`);
-  }
+  for (const { id } of trackedTools(files.updateSources)) names.add(`docker:${id}`);
   if (files.dockerfile && baseImages(files.dockerfile).length > 0) names.add(BASE_IMAGE);
   return names;
 }
@@ -232,38 +240,64 @@ export function packageChanges(base: Locked, head: Locked, patchedFiles: Iterabl
 }
 
 /**
- * Live paths per tree and package, explicit or inherited: whatever a live package depends on, transitively within its
- * lockfile, carries its live paths, because a transitive move changes the same wire behaviour. A dev or runtime
- * package reached that way becomes live too; pnpm dedupes one copy for every consumer. Type-only packages carry no
- * behaviour and stop the walk.
+ * Per tree, every package a runtime code path can load: the registry's non-dev packages and whatever they depend on
+ * within that lockfile. Reach decides only whether a change needs a ledger section, so over-counting costs a ledger
+ * line; blocking stays with the packages the registry names as live. Type-only packages carry no behaviour.
  */
-export function effectiveLivePaths(
+export function runtimeReach(
   registry: Registry,
   dependsOn: Map<Source, Map<string, Set<string>>>,
-): Map<Source, Map<string, Set<string>>> {
-  const live = new Map<Source, Map<string, Set<string>>>();
+): Map<Source, Set<string>> {
+  const roots = Object.entries(registry.packages)
+    .filter(([, cls]) => cls.kind !== 'dev')
+    .map(([name]) => name);
+  const reach = new Map<Source, Set<string>>();
   for (const source of SOURCES) {
     const graph = dependsOn.get(source) ?? new Map<string, Set<string>>();
-    for (const [name, cls] of Object.entries(registry.packages)) {
-      if (cls.kind !== 'live') continue;
-      const queue = [name];
-      const seen = new Set(queue);
-      while (queue.length > 0) {
-        const current = queue.shift()!;
-        for (const id of cls.paths) add(tree(live, source), current, id);
-        for (const dep of graph.get(current) ?? []) {
-          if (!seen.has(dep) && !dep.startsWith('@types/')) {
-            seen.add(dep);
-            queue.push(dep);
-          }
+    const seen = new Set(roots);
+    const queue = [...roots];
+    while (queue.length > 0) {
+      for (const dep of graph.get(queue.shift()!) ?? []) {
+        if (!seen.has(dep) && !dep.startsWith('@types/')) {
+          seen.add(dep);
+          queue.push(dep);
         }
       }
     }
+    reach.set(source, seen);
   }
-  return live;
+  return reach;
 }
 
-export function registryProblems(registry: Registry, direct: Set<string>, exists: (file: string) => boolean): string[] {
+const IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*['"]([^'"]+)['"]/g;
+
+function importsOf(text: string): string[] {
+  return [...text.matchAll(IMPORT)].map((m) => m[1]!);
+}
+
+/**
+ * Whether a test loads one of `packages`, itself or through one host module it imports. A name-only check would accept
+ * a placeholder test; this cheap floor refuses one that never touches the libraries on its path.
+ */
+function testLoads(test: string, packages: string[], read: (file: string) => string | null): boolean {
+  const hits = (text: string): boolean =>
+    importsOf(text).some((spec) => packages.some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`)));
+  const text = read(test);
+  if (text === null) return false;
+  if (hits(text)) return true;
+  return importsOf(text)
+    .filter((spec) => spec.startsWith('.'))
+    .some((spec) => {
+      const module = read(path.posix.join(path.posix.dirname(test), spec).replace(/\.js$/, '.ts'));
+      return module !== null && hits(module);
+    });
+}
+
+export function registryProblems(
+  registry: Registry,
+  direct: Set<string>,
+  read: (file: string) => string | null,
+): string[] {
   const problems: string[] = [];
   for (const name of [...direct].sort()) {
     if (!registry.packages[name]) {
@@ -286,8 +320,17 @@ export function registryProblems(registry: Registry, direct: Set<string>, exists
         problems.push(
           `live path ${id} lists ${test}; a live-path test's file name must contain "live-path" so CI runs it`,
         );
-      } else if (!exists(test)) {
+      } else if (read(test) === null) {
         problems.push(`live path ${id} lists ${test}, which does not exist`);
+      } else {
+        const packages = Object.entries(registry.packages)
+          .filter(([name, cls]) => cls.kind === 'live' && cls.paths.includes(id) && !name.startsWith('docker:'))
+          .map(([name]) => name);
+        if (packages.length > 0 && !testLoads(test, packages, read)) {
+          problems.push(
+            `live path ${id} lists ${test}, which loads none of the packages on that path (${packages.join(', ')}), directly or through a module it imports`,
+          );
+        }
       }
     }
   }
@@ -380,12 +423,13 @@ function compareVersions(a: number[], b: number[]): number {
 const PLAIN_VERSION = /^\d+(\.\d+)*$/;
 
 /**
- * The cases an incident cannot wait a test for: a patch at the shipped version, or a rollback in which every version
- * added is a plain release older than every version removed. A git, tarball or prerelease version never qualifies.
+ * The cases an incident cannot wait a test for: a patch at the shipped versions, or a rollback in which every version
+ * added is a plain release older than every version removed. Dropping one of several versions moves its consumers up,
+ * so it is an upgrade; a git, tarball or prerelease version never qualifies.
  */
 function overridable(change: PackageChange): boolean {
-  if (change.added.length === 0) return true;
-  if (change.removed.length === 0) return false;
+  if (change.added.length === 0 && change.removed.length === 0) return true;
+  if (change.added.length === 0 || change.removed.length === 0) return false;
   if (![...change.added, ...change.removed].every((v) => PLAIN_VERSION.test(v))) return false;
   const parse = (v: string) => v.split('.').map(Number);
   const oldestRemoved = change.removed.map(parse).sort(compareVersions)[0]!;
@@ -399,7 +443,7 @@ export interface GateResult {
 
 export function changeProblems(
   registry: Registry,
-  livePaths: Map<Source, Map<string, Set<string>>>,
+  reach: Map<Source, Set<string>>,
   changes: PackageChange[],
   ledger: Ledger,
   exists: (file: string) => boolean,
@@ -407,14 +451,12 @@ export function changeProblems(
   const result: GateResult = { problems: [...ledger.problems], warnings: [] };
   for (const change of changes) {
     const explicit = registry.packages[change.name];
-    const paths = [
-      ...new Set(change.sources.flatMap((source) => [...(livePaths.get(source)?.get(change.name) ?? [])])),
-    ];
-    if (paths.length === 0 && (!explicit || explicit.kind === 'dev')) continue;
+    const reached = change.sources.some((source) => reach.get(source)?.has(change.name));
+    if (!reached && explicit?.kind !== 'live') continue;
     const label = `${change.name} ${change.from} → ${change.to}`;
     const section = ledger.sections.get(change.name);
 
-    const untested = change.to === 'none' ? [] : paths.filter((id) => registry.livePaths[id]?.tests.length === 0);
+    const untested = change.to === 'none' ? [] : untestedLivePaths(registry, change.name);
     if (untested.length > 0) {
       const message = `${label} is on live I/O path(s) with no real-library test: ${untested.map((id) => `${id} (${registry.livePaths[id]!.description})`).join('; ')}`;
       if (section?.override && overridable(change)) {
@@ -464,10 +506,37 @@ export function changeProblems(
   return result;
 }
 
-/** A weaker registry than the base's, unless a ledger names the package or path in a `Reclassified:` line. */
-export function weakenedRegistryProblems(base: Registry | null, head: Registry, ledger: Ledger): string[] {
+const RANK = { dev: 0, runtime: 1, live: 2 } as const;
+
+/**
+ * A weaker registry than the base's needs a `Reclassified:` line in a ledger, and can never ride along with a version
+ * change of a package it weakens: the reclassification has to merge, and be reviewed, on its own first.
+ */
+export function weakenedRegistryProblems(
+  base: Registry | null,
+  head: Registry,
+  ledger: Ledger,
+  changes: PackageChange[] = [],
+): string[] {
   if (!base) return [];
   const problems: string[] = [];
+  const changed = new Set(changes.map((change) => change.name));
+  const weakenedPaths = new Set(
+    Object.entries(base.livePaths)
+      .filter(([id, livePath]) => livePath.tests.some((test) => !(head.livePaths[id]?.tests ?? []).includes(test)))
+      .map(([id]) => id),
+  );
+  for (const [name, cls] of Object.entries(base.packages)) {
+    if (!changed.has(name)) continue;
+    const now = head.packages[name];
+    const lostPath = cls.kind === 'live' && cls.paths.some((id) => now?.kind !== 'live' || !now.paths.includes(id));
+    const onWeakenedPath = cls.kind === 'live' && cls.paths.some((id) => weakenedPaths.has(id));
+    if (!now || RANK[now.kind] < RANK[cls.kind] || lostPath || onWeakenedPath) {
+      problems.push(
+        `${name} changes version in the same change that weakens its classification or a live path it is on; merge the reclassification on its own first`,
+      );
+    }
+  }
   for (const [name, cls] of Object.entries(base.packages)) {
     if (cls.kind !== 'live' || ledger.reclassified.has(name)) continue;
     const now = head.packages[name];
@@ -492,6 +561,30 @@ export function weakenedRegistryProblems(base: Registry | null, head: Registry, 
   return problems;
 }
 
+/**
+ * A tracked tool must install from its ARG pin, or the gate cannot see its version: the ARG's references may not drop
+ * while the ARG is still defined, and an npm-sourced tool may not appear with a literal version.
+ */
+export function dockerfileProblems(base: string | null, head: string | null, tools: TrackedTool[]): string[] {
+  if (!head) return [];
+  const problems: string[] = [];
+  const references = (text: string, arg: string): number =>
+    [...text.matchAll(new RegExp(`\\$\\{${arg}\\}|\\$${arg}\\b`, 'g'))].length;
+  for (const tool of tools) {
+    const defined = new RegExp(`^ARG ${tool.arg}=`, 'm').test(head);
+    if (defined && base && references(head, tool.arg) < references(base, tool.arg)) {
+      problems.push(
+        `container/Dockerfile references \${${tool.arg}} fewer times than the base; ${tool.id} must install from its ARG pin`,
+      );
+    }
+    const pkg = tool.source?.kind === 'npm' ? tool.source.package : undefined;
+    if (pkg && new RegExp(`${pkg.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}@\\d`).test(head)) {
+      problems.push(`container/Dockerfile installs ${pkg} at a literal version; install it from \${${tool.arg}}`);
+    }
+  }
+  return problems;
+}
+
 function filesAt(root: string, rev: string | null): DependencyFiles {
   const read = (file: string): string | null => {
     if (rev !== null) return gitRead(root, ['show', `${rev}:${file}`]);
@@ -504,7 +597,11 @@ function filesAt(root: string, rev: string | null): DependencyFiles {
 }
 
 export function runCheck(root: string, base: string): GateResult {
-  const exists = (file: string): boolean => fs.existsSync(path.join(root, file));
+  const read = (file: string): string | null => {
+    const full = path.join(root, file);
+    return fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : null;
+  };
+  const exists = (file: string): boolean => read(file) !== null;
   const registry = readDependencyPathRegistry(root);
   if (!registry) throw new Error(`dependency-gate: ${REGISTRY_PATH} is missing`);
   const baseRegistryText = gitRead(root, ['show', `${base}:${REGISTRY_PATH}`]);
@@ -514,7 +611,11 @@ export function runCheck(root: string, base: string): GateResult {
     baseHasGate && !baseRegistry
       ? [`${REGISTRY_PATH} is not at the base, which has the gate; a moved registry cannot be checked for weakening`]
       : [];
+  const baseFiles = filesAt(root, base);
   const headFiles = filesAt(root, null);
+  const tools = [...trackedTools(baseFiles.updateSources), ...trackedTools(headFiles.updateSources)].filter(
+    (tool, index, all) => all.findIndex((other) => other.id === tool.id) === index,
+  );
 
   const diff = gitRead(root, ['diff', '--name-only', '--no-renames', base]);
   const untracked = gitRead(root, ['ls-files', '--others', '--exclude-standard']);
@@ -523,21 +624,22 @@ export function runCheck(root: string, base: string): GateResult {
   const ledger = parseLedgers(
     changedFiles
       .filter((file) => file.startsWith(`${LEDGER_DIR}/`) && file.endsWith('.md') && exists(file))
-      .map((file) => ({ file, text: fs.readFileSync(path.join(root, file), 'utf8') })),
+      .map((file) => ({ file, text: read(file)! })),
   );
 
-  const head = lockedVersions(headFiles);
+  const head = lockedVersions(headFiles, tools);
   const changes = packageChanges(
-    lockedVersions(filesAt(root, base)),
+    lockedVersions(baseFiles, tools),
     head,
     changedFiles.map(patchedPackage).filter((name): name is string => name !== null),
   );
-  const result = changeProblems(registry, effectiveLivePaths(registry, head.dependsOn), changes, ledger, exists);
+  const result = changeProblems(registry, runtimeReach(registry, head.dependsOn), changes, ledger, exists);
   return {
     problems: [
-      ...registryProblems(registry, directDependencies(headFiles), exists),
+      ...registryProblems(registry, directDependencies(headFiles), read),
       ...movedRegistry,
-      ...weakenedRegistryProblems(baseRegistry, registry, ledger),
+      ...weakenedRegistryProblems(baseRegistry, registry, ledger, changes),
+      ...dockerfileProblems(baseFiles.dockerfile, headFiles.dockerfile, tools),
       ...result.problems,
     ],
     warnings: result.warnings,

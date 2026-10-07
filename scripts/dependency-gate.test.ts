@@ -4,12 +4,14 @@ import type { DependencyPathRegistry as Registry } from '../src/dependency-paths
 import {
   changeProblems,
   directDependencies,
-  effectiveLivePaths,
+  dockerfileProblems,
   lockedVersions,
   packageChanges,
   parseLedgers,
   patchedPackage,
   registryProblems,
+  runtimeReach,
+  trackedTools,
   weakenedRegistryProblems,
   type DependencyFiles,
   type PackageChange,
@@ -107,12 +109,20 @@ const registry: Registry = {
   },
 };
 
-const existing = new Set(['src/channels/chat-live-path.test.ts', 'src/router.test.ts', 'package.json']);
-const exists = (file: string): boolean => existing.has(file);
+const contents: Record<string, string> = {
+  'src/channels/chat-live-path.test.ts': "import { wire } from './chat-wiring.js';\nit('delivers', () => wire());\n",
+  'src/channels/chat-wiring.ts': "import { Chat } from 'chat';\nexport const wire = () => new Chat();\n",
+  'src/channels/placeholder-live-path.test.ts': "it('ok', () => {});\n",
+  'src/router.test.ts': '',
+  'package.json': '{}',
+};
+const read = (file: string): string | null => contents[file] ?? null;
+const exists = (file: string): boolean => read(file) !== null;
 const head = lockedVersions(files());
-const live = effectiveLivePaths(registry, head.dependsOn);
+const reach = runtimeReach(registry, head.dependsOn);
 const ledgerOf = (text: string) => parseLedgers([{ file: 'docs/dependency-changes/2026-10-07-x.md', text }]);
-const gate = (changes: PackageChange[], text = '') => changeProblems(registry, live, changes, ledgerOf(text), exists);
+const gate = (changes: PackageChange[], text = '', within = registry) =>
+  changeProblems(within, runtimeReach(within, head.dependsOn), changes, ledgerOf(text), exists);
 const bump = (name: string, from: string, to: string, source: 'host' | 'docker' = 'host'): PackageChange => {
   const was = from === 'none' ? [] : from.split(',');
   const now = to === 'none' ? [] : to.split(',');
@@ -170,13 +180,13 @@ describe('locked versions', () => {
   });
 });
 
-describe('live paths', () => {
-  it('passes a live package’s paths to everything it depends on, a dev package included', () => {
-    const host = live.get('host')!;
-    expect([...(host.get('discord.js') ?? [])]).toEqual(['discord-inbound']);
-    expect([...(host.get('ws') ?? [])]).toEqual(['discord-inbound']);
-    expect(host.get('@types/ws')).toBeUndefined();
-    expect(host.get('zod')).toBeUndefined();
+describe('runtime reach and live paths', () => {
+  it('reaches registered non-dev packages and what they load in the same tree, not type-only packages', () => {
+    const host = reach.get('host')!;
+    expect(host.has('discord.js')).toBe(true);
+    expect(host.has('ws')).toBe(true);
+    expect(host.has('@types/ws')).toBe(false);
+    expect(reach.get('remotion')?.has('ws')).toBe(false);
   });
 
   it('judges a move in one lockfile by that tree alone', () => {
@@ -188,17 +198,31 @@ describe('live paths', () => {
     expect(changes).toEqual([
       expect.objectContaining({ name: 'ws', sources: ['remotion'], added: ['8.21.0'], removed: ['8.20.0'] }),
     ]);
-    expect(changeProblems(registry, live, changes, ledgerOf(''), exists).problems).toEqual([]);
+    expect(changeProblems(registry, reach, changes, ledgerOf(''), exists).problems).toEqual([]);
   });
 
-  it('blocks a transitive move under a live package whose path has no test', () => {
-    const moved = lockedVersions(files({ pnpmLock: pnpmLock('aaa', '8.22.0') }));
-    const result = gate(packageChanges(head, moved));
-    expect(result.problems).toEqual([
-      expect.stringContaining('ws 8.21.0 → 8.22.0 is on live I/O path(s) with no real-library test: discord-inbound'),
+  it('wants a ledger for a transitive move under a live package, and blocks it only when the registry names it live', () => {
+    const moved = packageChanges(head, lockedVersions(files({ pnpmLock: pnpmLock('aaa', '8.22.0') })));
+    expect(gate(moved).problems).toEqual([
       expect.stringContaining(
         'no docs/dependency-changes/ file this change adds or edits has a "## ws 8.21.0 → 8.22.0"',
       ),
+    ]);
+    const named: Registry = {
+      ...registry,
+      packages: { ...registry.packages, ws: { kind: 'live', paths: ['discord-inbound'] } },
+    };
+    expect(gate(moved, '', named).problems).toEqual([
+      expect.stringContaining('ws 8.21.0 → 8.22.0 is on live I/O path(s) with no real-library test: discord-inbound'),
+      expect.stringContaining('"## ws 8.21.0 → 8.22.0"'),
+    ]);
+  });
+
+  it('wants a ledger for a transitive move under a runtime package', () => {
+    const graph = new Map([['host' as const, new Map([['zod', new Set(['luxon'])]])]]);
+    const changes = [bump('luxon', '3.7.2', '4.0.0')];
+    expect(changeProblems(registry, runtimeReach(registry, graph), changes, ledgerOf(''), exists).problems).toEqual([
+      expect.stringContaining('"## luxon 3.7.2 → 4.0.0" section'),
     ]);
   });
 });
@@ -213,7 +237,7 @@ describe('registry', () => {
         packages: { chat: { kind: 'live', paths: ['chat-inbound', 'nowhere'] } },
       },
       new Set(['chat', 'zod']),
-      exists,
+      read,
     );
     expect(problems).toEqual([
       expect.stringContaining('zod is a direct dependency with no entry'),
@@ -223,8 +247,21 @@ describe('registry', () => {
     ]);
   });
 
-  it('accepts a fully classified registry', () => {
-    expect(registryProblems(registry, directDependencies(files()), exists)).toEqual([]);
+  it('accepts a fully classified registry whose live-path test loads its package through a host module', () => {
+    expect(registryProblems(registry, directDependencies(files()), read)).toEqual([]);
+  });
+
+  it('refuses a live-path test that loads none of the packages on its path', () => {
+    const placeholder: Registry = {
+      ...registry,
+      livePaths: {
+        ...registry.livePaths,
+        'chat-inbound': { description: 'x', tests: ['src/channels/placeholder-live-path.test.ts'] },
+      },
+    };
+    expect(registryProblems(placeholder, directDependencies(files()), read)).toEqual([
+      expect.stringContaining('placeholder-live-path.test.ts, which loads none of the packages on that path (chat)'),
+    ]);
   });
 
   it('refuses a weaker registry than the base unless a ledger explains it', () => {
@@ -238,6 +275,18 @@ describe('registry', () => {
     ]);
     const explained = ledgerOf('Reclassified: chat · moved to a test\nReclassified: chat-inbound · test renamed\n');
     expect(weakenedRegistryProblems(registry, weaker, explained)).toEqual([]);
+  });
+
+  it.each([
+    ['live to runtime', { kind: 'runtime' as const }],
+    ['runtime to dev', { kind: 'dev' as const }],
+  ])('refuses a %s reclassification in the same change as a version change, even explained', (_label, now) => {
+    const name = now.kind === 'runtime' ? 'chat' : 'zod';
+    const weaker: Registry = { ...registry, packages: { ...registry.packages, [name]: now } };
+    const explained = ledgerOf(`Reclassified: ${name} · not really live\n`);
+    expect(weakenedRegistryProblems(registry, weaker, explained, [bump(name, '1.0.0', '9.9.9')])).toEqual([
+      expect.stringContaining(`${name} changes version in the same change that weakens its classification`),
+    ]);
   });
 });
 
@@ -281,6 +330,7 @@ describe('version changes', () => {
     ['a git version', '4.41.1', 'github:vercel/chat#abc'],
     ['a version set whose oldest consumer moves up', '7.15.1,8.2.0', '7.19.0'],
     ['a prerelease', '4.41.1', '4.40.0-beta.1'],
+    ['a dropped version whose consumers move up', '6.28.0,8.11.2', '8.11.2'],
   ])('refuses an Override on %s', (_label, from, to) => {
     const text = `## @slack/web-api ${from} → ${to}\nSource: x\nOverride: incident\n- y · not covered: z\n`;
     expect(gate([bump('@slack/web-api', from, to)], text).problems).toEqual([
@@ -338,9 +388,37 @@ describe('version changes', () => {
       { file: 'docs/dependency-changes/a.md', text: '## zod 4.6.5 → 4.7.0\nSource: x\n' },
       { file: 'docs/dependency-changes/b.md', text: '## zod 4.6.5 → 4.7.0\nSource: x\n' },
     ]);
-    expect(changeProblems(registry, live, [bump('zod', '4.6.5', '4.7.0')], twice, exists).problems).toEqual([
+    expect(changeProblems(registry, reach, [bump('zod', '4.6.5', '4.7.0')], twice, exists).problems).toEqual([
       'zod has a ledger section in both docs/dependency-changes/a.md and docs/dependency-changes/b.md',
       expect.stringContaining('no entries'),
     ]);
+  });
+});
+
+describe('Docker pins', () => {
+  const tools = [
+    { id: 'claude-code', arg: 'CLAUDE_CODE_VERSION', source: { kind: 'npm', package: '@anthropic-ai/claude-code' } },
+  ];
+  const base = 'ARG CLAUDE_CODE_VERSION=2.1.290\nRUN npm i -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}\n';
+
+  it('reads a pin the head dropped from update-sources, so the bump is not mistaken for a removal', () => {
+    const before = files({ dockerfile: 'ARG CLAUDE_CODE_VERSION=2.1.290\n' });
+    const after = files({
+      dockerfile: 'ARG CLAUDE_CODE_VERSION=2.1.300\n',
+      updateSources: JSON.stringify({ dockerfile: [{ id: 'bun', arg: 'BUN_VERSION' }] }),
+    });
+    const union = trackedTools(before.updateSources);
+    expect(packageChanges(lockedVersions(before, union), lockedVersions(after, union))).toEqual([
+      bump('docker:claude-code', '2.1.290', '2.1.300', 'docker'),
+    ]);
+  });
+
+  it('refuses a tracked tool installed at a literal version instead of its ARG', () => {
+    const literal = 'ARG CLAUDE_CODE_VERSION=2.1.290\nRUN npm i -g @anthropic-ai/claude-code@2.1.299\n';
+    expect(dockerfileProblems(base, literal, tools)).toEqual([
+      expect.stringContaining('references ${CLAUDE_CODE_VERSION} fewer times than the base'),
+      expect.stringContaining('installs @anthropic-ai/claude-code at a literal version'),
+    ]);
+    expect(dockerfileProblems(base, base.replace('2.1.290', '2.1.300'), tools)).toEqual([]);
   });
 });
