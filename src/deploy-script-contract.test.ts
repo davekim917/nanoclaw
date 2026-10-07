@@ -30,10 +30,30 @@ describe('deploy rollback shell contract', () => {
   });
 
   it('snapshots before a fast-forward pull and re-execs the pulled script', () => {
-    expect(script.indexOf('snapshot_dir node_modules')).toBeLessThan(script.indexOf('git pull --ff-only origin main'));
+    expect(script.indexOf('snapshot_dir node_modules')).toBeLessThan(script.indexOf('git fetch origin main'));
     expect(script.indexOf('bash -n scripts/deploy.sh')).toBeLessThan(script.indexOf('exec env'));
     expect(script).toContain('NANOCLAW_DEPLOY_POST_PULL=1');
     expect(script).toContain('bash scripts/deploy.sh');
+  });
+
+  it('builds the image for the commit it resolved, before moving the live checkout to that commit', () => {
+    const fetchAt = script.indexOf('git fetch origin main');
+    const buildAt = script.search(/^ {4}build_target_image$/m);
+    const pullAt = script.indexOf('git merge --ff-only "$TARGET_SHA"');
+    const reexecAt = script.indexOf('exec env');
+    for (const at of [fetchAt, buildAt, pullAt]) expect(at).toBeGreaterThan(-1);
+    expect(fetchAt).toBeLessThan(buildAt);
+    expect(buildAt).toBeLessThan(pullAt);
+    expect(pullAt).toBeLessThan(reexecAt);
+    // Nothing moves the live checkout to a branch tip it did not build.
+    expect(script).not.toMatch(/^\s*(if ! )?git pull\b/m);
+    expect(script).toContain('"$BUILD_TREE/container/build.sh"');
+    // The temporary checkout goes away on every exit, the rollback's included.
+    const restore = script.match(/^restore_before_restart\(\) \{\n[\s\S]*?^\}$/m)?.[0] ?? '';
+    expect(restore.indexOf('remove_build_tree')).toBeGreaterThan(-1);
+    expect(restore.indexOf('remove_build_tree')).toBeLessThan(restore.indexOf('if [ "$ROLLBACK_READY" != "1" ]'));
+    // The re-exec keeps the record of which image this deploy saved for rollback.
+    expect(script.slice(reexecAt)).toContain('NANOCLAW_DEPLOY_IMAGE_SAVED_BASE="$IMAGE_SAVED_BASE"');
   });
 
   it('fails closed on rollback snapshot and image-tag failures', () => {
