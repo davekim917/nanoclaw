@@ -1121,6 +1121,20 @@ describe('work left only on disk has no resume path but this wake, so nothing st
     expect(JSON.parse(wakeRows()[0].content)).toEqual(JSON.parse(alone));
   });
 
+  it('a fresh task list whose items is not an array costs the worktree wake nothing: same row, same bytes', async () => {
+    const startedAt = Date.now() - HOUR;
+    recordWorktree(startedAt + 60_000);
+    await chatReap(startedAt);
+    const alone = wakeRows()[0].content;
+    inDb.prepare('DELETE FROM messages_in').run();
+
+    recordList(startedAt + 60_000, 7);
+    await chatReap(startedAt);
+
+    expect(wakeRows().map((r) => r.id)).toEqual([`reap-respawn-${startedAt}`]);
+    expect(wakeRows()[0].content).toBe(alone);
+  });
+
   it('an archived session still gets its row, as it did before the list counted', async () => {
     const startedAt = Date.now() - HOUR;
     recordWorktree(startedAt + 60_000);
