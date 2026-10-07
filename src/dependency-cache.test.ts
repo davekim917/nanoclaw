@@ -1260,6 +1260,10 @@ describe('dependency cache', () => {
       const stat = fs.statSync(hidden);
       fs.writeFileSync(hidden, JSON.stringify(JSON.parse(fs.readFileSync(hidden, 'utf8')), null, 4) + '\n');
       fs.utimesSync(hidden, stat.atime, stat.mtime);
+      // Installed before the source, so the entry's files are newer than the target's hidden lockfile.
+      for (const rel of regularFiles(path.join(target, 'node_modules'))) {
+        fs.utimesSync(path.join(target, 'node_modules', rel), FILE_STAMP_S - 60, FILE_STAMP_S - 60);
+      }
       expect(keyOf(target)).toBe(keyOf(src));
       expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
       return { src, target, entry: path.join(cacheRoot, 'wg-a', keyOf(src)) };
@@ -1284,6 +1288,8 @@ describe('dependency cache', () => {
       for (const rel of regularFiles(nm).filter((file) => !KEPT.includes(file))) {
         expect(fs.lstatSync(path.join(nm, rel)).ino, rel).toBe(fs.lstatSync(path.join(entryNm, rel)).ino);
       }
+      const hiddenMtimeMs = fs.statSync(path.join(nm, '.package-lock.json')).mtimeMs;
+      expect(regularFiles(nm).filter((rel) => fs.statSync(path.join(nm, rel)).mtimeMs > hiddenMtimeMs)).toEqual([]);
     }
 
     it('converts a tree whose install-script outputs and hidden lockfile differ, keeping its own copies of those', () => {

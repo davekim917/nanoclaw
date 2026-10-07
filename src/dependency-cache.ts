@@ -1366,9 +1366,13 @@ function convertVerified(
       for (const file of keepOwn) {
         const own = path.join(pkg.nodeModulesDir, file.rel);
         const target = path.join(newDir, file.rel);
+        const shared = fs.lstatSync(target);
         fs.unlinkSync(target);
         if (file.type === 'f') fs.linkSync(own, target);
         else fs.symlinkSync(fs.readlinkSync(own), target);
+        if (file.rel === HIDDEN_LOCKFILE && shared.mtimeMs > file.stat.mtimeMs) {
+          fs.utimesSync(target, file.stat.atimeMs / 1000, shared.mtimeMs / 1000);
+        }
       }
     } catch (err) {
       fs.rmSync(newDir, { recursive: true, force: true });
