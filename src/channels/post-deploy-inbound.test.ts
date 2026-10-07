@@ -7,7 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 type Module = typeof import('./post-deploy-inbound.js');
 
 const WINDOW_MS = 30 * 60_000;
-const EARLY_MS = 10 * 60_000;
+const MONITOR_MS = 10 * 60_000;
+const MINUTE = 60_000;
 
 let mod: Module;
 let dir: string;
@@ -16,26 +17,28 @@ let alerts: string[];
 
 function readReport(): {
   state: string;
-  restartedWindow?: boolean;
+  afterDeploy: boolean;
   platforms: Array<{ platform: string; verdict: string; liveInbound: number }>;
 } {
   return JSON.parse(fs.readFileSync(reportPath, 'utf8'));
 }
 
-function start(restartedWindow = false): void {
+function start(afterDeploy = true): void {
   mod.startPostDeployInboundCheck({
     build: 'abc1234',
+    afterDeploy,
     windowMs: WINDOW_MS,
-    earlyCheckMs: EARLY_MS,
+    monitorIntervalMs: MONITOR_MS,
     failingErrorThreshold: 3,
     notify: async (text) => {
       alerts.push(text);
       return true;
     },
     reportPath,
-    restartedWindow,
   });
 }
+
+const circular = { error: 'TypeError: Converting circular structure to JSON' };
 
 beforeEach(async () => {
   vi.useFakeTimers();
@@ -53,7 +56,7 @@ afterEach(() => {
 });
 
 describe('post-deploy inbound check', () => {
-  it('alerts at the early check and fails a platform whose adapter errors while no message arrives', async () => {
+  it('alerts at the first monitor check and fails a platform whose adapter errors while no message arrives', async () => {
     const discord = mod.createAdapterLogger('discord', 'discord').child('gateway');
     mod.createAdapterLogger('slack', 'slack');
     start();
@@ -62,7 +65,7 @@ describe('post-deploy inbound check', () => {
     for (let i = 0; i < 4; i++) {
       discord.error('Error forwarding Gateway event', { error: 'TypeError: Converting circular structure to JSON' });
     }
-    await vi.advanceTimersByTimeAsync(EARLY_MS - 1);
+    await vi.advanceTimersByTimeAsync(MONITOR_MS - 1);
     expect(alerts).toEqual([]);
 
     await vi.advanceTimersByTimeAsync(1);
@@ -72,7 +75,7 @@ describe('post-deploy inbound check', () => {
     expect(alerts[0]).not.toContain('slack');
     expect(readReport().state).toBe('running');
 
-    await vi.advanceTimersByTimeAsync(WINDOW_MS - EARLY_MS);
+    await vi.advanceTimersByTimeAsync(WINDOW_MS - MONITOR_MS);
     expect(alerts).toHaveLength(2);
     expect(alerts[1]).toContain('discord: FAILING');
     expect(alerts[1]).toContain('slack: verified (1 live inbound)');
@@ -84,14 +87,14 @@ describe('post-deploy inbound check', () => {
     ]);
   });
 
-  it('does not alert on routine adapter errors once the platform receives a message', async () => {
+  it('does not alert on routine adapter errors on a platform routing more messages than it logs errors', async () => {
     const codexBot = mod.createAdapterLogger('discord-codex', 'discord');
     mod.createAdapterLogger('discord', 'discord');
     start();
 
     for (let i = 0; i < 5; i++) codexBot.error('Discord API error', { status: 404 });
-    await vi.advanceTimersByTimeAsync(EARLY_MS / 2);
-    mod.recordLiveInbound('discord');
+    await vi.advanceTimersByTimeAsync(MONITOR_MS / 2);
+    for (let i = 0; i < 6; i++) mod.recordLiveInbound('discord');
     await vi.advanceTimersByTimeAsync(WINDOW_MS);
 
     expect(alerts).toEqual([]);
@@ -99,10 +102,54 @@ describe('post-deploy inbound check', () => {
       expect.objectContaining({
         platform: 'discord',
         verdict: 'verified',
-        liveInbound: 1,
-        liveInboundByChannelType: { discord: 1, 'discord-codex': 0 },
+        liveInbound: 6,
+        liveInboundByChannelType: { discord: 6, 'discord-codex': 0 },
       }),
     ]);
+  });
+
+  it('fails Discord when one plain message routed and then every bot failed to forward mentions, as on 2026-10-06', async () => {
+    const bots = ['discord', 'discord-codex', 'discord-opencode'].map((channelType) =>
+      mod.createAdapterLogger(channelType, 'discord').child('gateway'),
+    );
+    start();
+
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    mod.recordLiveInbound('discord');
+    await vi.advanceTimersByTimeAsync(7 * MINUTE);
+    for (let minute = 12; minute < 30; minute += 6) {
+      for (const bot of bots)
+        bot.error('Error forwarding Gateway event', { type: 'GATEWAY_MESSAGE_CREATE', ...circular });
+      await vi.advanceTimersByTimeAsync(3 * MINUTE);
+      mod.recordLiveInbound('discord');
+      await vi.advanceTimersByTimeAsync(3 * MINUTE);
+    }
+
+    expect(alerts[0]).toContain('discord: FAILING');
+    expect(alerts[0]).toContain('"Error forwarding Gateway event"');
+    expect(readReport()).toMatchObject({ state: 'done' });
+    expect(readReport().platforms).toEqual([expect.objectContaining({ platform: 'discord', verdict: 'failing' })]);
+    expect(alerts.at(-1)).toContain('discord: FAILING — 9 adapter error(s) against 4 live inbound');
+  });
+
+  it('alerts once when forward errors with only occasional successes start long after the boot window', async () => {
+    const discord = mod.createAdapterLogger('discord', 'discord');
+    start();
+    for (let minute = 0; minute < 120; minute += 5) {
+      mod.recordLiveInbound('discord');
+      await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    }
+    expect(alerts).toEqual([]);
+
+    for (let minute = 120; minute < 160; minute += 5) {
+      discord.error('Error forwarding Gateway event', circular);
+      discord.error('Error forwarding Gateway event', circular);
+      if (minute % 20 === 0) mod.recordLiveInbound('discord');
+      await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    }
+    expect(alerts).toEqual([expect.stringContaining('discord: FAILING')]);
+    expect(alerts[0]).toContain('last 10 min');
+    expect(readReport().platforms).toEqual([expect.objectContaining({ verdict: 'verified' })]);
   });
 
   it('reports a quiet platform as unverified, never healthy, and one routine error does not make it failing', async () => {
@@ -140,17 +187,12 @@ describe('post-deploy inbound check', () => {
     });
   });
 
-  it('lets the next boot resume a window a restart interrupted', async () => {
+  it('opens a window on a boot that did not follow a deploy, and says it was a restart', async () => {
     mod.createAdapterLogger('slack', 'slack');
-    expect(mod.previousWindowUnfinished(reportPath)).toBe(false);
-
-    start();
-    expect(mod.previousWindowUnfinished(reportPath)).toBe(true);
-
-    start(true);
-    expect(readReport()).toMatchObject({ state: 'running', restartedWindow: true });
+    start(false);
+    expect(readReport()).toMatchObject({ state: 'running', afterDeploy: false });
     await vi.advanceTimersByTimeAsync(WINDOW_MS);
-    expect(mod.previousWindowUnfinished(reportPath)).toBe(false);
+    expect(alerts).toEqual([expect.stringMatching(/^Post-restart inbound check \(build abc1234\) after 30 min:/)]);
   });
 
   it('alerts when no chat adapter started at all, instead of reading an empty list as healthy', async () => {
