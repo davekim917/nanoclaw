@@ -424,6 +424,51 @@ describe('strict completeness for link-at-checkout', () => {
     }
   });
 
+  it('accepts an optional native package npm removed because its install script failed, and what only it needs', () => {
+    // The production backend: the builds of lzo and cpu-features failed in the agent image, so npm removed them
+    // with bindings and nan, which only they require (ssh2 lists nan as optional, which npm's pruning ignores),
+    // and every checkout of that lockfile was refused a link.
+    const absent = (hasInstallScript: boolean): Record<string, Record<string, unknown>> => {
+      const script = hasInstallScript ? { hasInstallScript: true } : {};
+      return {
+        'node_modules/lzo': { ...optionalEntry({}), dependencies: { bindings: '~1.2.1' }, ...script },
+        'node_modules/bindings': optionalEntry({}),
+        'node_modules/cpu-features': { ...optionalEntry({}), dependencies: { nan: '^2.19.0' }, ...script },
+        'node_modules/nan': optionalEntry({}),
+      };
+    };
+    const installed = [nativeParent('compressor', ['lzo']), nativeParent('ssh2', ['cpu-features', 'nan']), ...PKGS];
+    const needsNan: PkgSpec = {
+      key: 'node_modules/needs-nan',
+      name: 'needs-nan',
+      version: '1.0.0',
+      files: { 'index.js': 'require("nan");\n' },
+      lock: { dependencies: { nan: '^2.19.0' } },
+    };
+
+    expect(strict(project('failed-build', installed, absent(true)))).toEqual({ complete: true });
+    expect(strict(project('no-install-script', installed, absent(false)))).toEqual({
+      complete: false,
+      reason: expect.stringContaining('node_modules/bindings'),
+    });
+    expect(strict(project('installed-requirer', [needsNan, ...installed], absent(true)))).toEqual({
+      complete: false,
+      reason: expect.stringContaining('node_modules/nan'),
+    });
+    // npm removes whatever requires a failed build through a non-optional edge, so an installed one means lzo
+    // was not removed for a failed build.
+    const needsLzo: PkgSpec = {
+      ...needsNan,
+      key: 'node_modules/needs-lzo',
+      name: 'needs-lzo',
+      lock: { dependencies: { lzo: '^0.4.11' } },
+    };
+    expect(strict(project('installed-lzo-requirer', [needsLzo, ...installed], absent(true)))).toEqual({
+      complete: false,
+      reason: expect.stringContaining('node_modules/bindings'),
+    });
+  });
+
   it('link refuses an entry lacking a build this platform installs, and still links a complete one', () => {
     // linkPackageDir checks against this host's own platform.
     const cpu = process.arch;
@@ -1158,6 +1203,174 @@ describe('dependency cache', () => {
     fs.rmSync(path.dirname(trees[6]!), { recursive: true });
     startPass();
     expect(_convertMismatchMemoSizeForTesting()).toBe(6);
+  });
+
+  describe('per-install files', () => {
+    const GYP_BUILD = 'ssh2/lib/protocol/crypto/build';
+    const KEPT = [`${GYP_BUILD}/Makefile`, `${GYP_BUILD}/config.gypi`, 'esbuild/bin/esbuild', '.package-lock.json'];
+
+    /** Packages shaped like the production refusals; `checkout` names the dir node-gyp embedded. */
+    function scriptedPkgs(checkout: string, esbuildBin: string): PkgSpec[] {
+      const moduleRoot = `/workspace/worktrees/${checkout}/node_modules/ssh2/lib/protocol/crypto`;
+      return [
+        ...PKGS,
+        {
+          key: 'node_modules/ssh2',
+          name: 'ssh2',
+          version: '1.16.0',
+          files: {
+            'lib/index.js': 'module.exports = {};\n',
+            'lib/protocol/crypto/binding.gyp': '{ "targets": [] }\n',
+            'lib/protocol/crypto/build/binding.Makefile': 'export builddir_name ?= ./build/.\n',
+            'lib/protocol/crypto/build/Makefile': `cmd_regen_makefile = -Dmodule_root_dir=${moduleRoot}\n`,
+            'lib/protocol/crypto/build/config.gypi': `{ "variables": { "local_prefix": "${moduleRoot}" } }\n`,
+          },
+          lock: { hasInstallScript: true },
+        },
+        {
+          key: 'node_modules/esbuild',
+          name: 'esbuild',
+          version: '0.25.0',
+          files: { 'bin/esbuild': esbuildBin, 'lib/main.js': 'module.exports = {};\n' },
+          lock: { hasInstallScript: true },
+        },
+        {
+          key: `node_modules/@esbuild/linux-${process.arch}`,
+          name: `@esbuild/linux-${process.arch}`,
+          version: '0.25.0',
+          files: { 'bin/esbuild': '\x7fELF native esbuild\n' },
+          lock: { optional: true, os: ['linux'], cpu: [process.arch] },
+        },
+      ];
+    }
+
+    /**
+     * Two installs of one lockfile: the source ran esbuild's install script (its shim became the native binary),
+     * the target did not; node-gyp embedded each checkout's own path; npm wrote the target's hidden lockfile
+     * with different formatting.
+     */
+    function sourceAndTarget(): { src: string; target: string; entry: string } {
+      const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), {
+        pkgs: scriptedPkgs('XZO@feat-outreach', '\x7fELF native esbuild\n'),
+      });
+      const target = path.join(tmpRoot, 'topic-b', 'repo');
+      writeManifests(target, { pkgs: scriptedPkgs('XZO@feat-outreach', '\x7fELF native esbuild\n') });
+      installTree(target, { pkgs: scriptedPkgs('XZO', '#!/usr/bin/env node\nrequire("../lib/main.js");\n') });
+      const hidden = path.join(target, 'node_modules', '.package-lock.json');
+      const stat = fs.statSync(hidden);
+      fs.writeFileSync(hidden, JSON.stringify(JSON.parse(fs.readFileSync(hidden, 'utf8')), null, 4) + '\n');
+      fs.utimesSync(hidden, stat.atime, stat.mtime);
+      expect(keyOf(target)).toBe(keyOf(src));
+      expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+      return { src, target, entry: path.join(cacheRoot, 'wg-a', keyOf(src)) };
+    }
+
+    function ownFiles(target: string): Array<{ rel: string; ino: number; bytes: string }> {
+      return KEPT.map((rel) => {
+        const full = path.join(target, 'node_modules', rel);
+        return { rel, ino: fs.lstatSync(full).ino, bytes: fs.readFileSync(full, 'utf8') };
+      });
+    }
+
+    /** A farm of `entry` except the kept files, which are still the workspace's own inodes and bytes. */
+    function expectFarmKeeping(target: string, entry: string, own: ReturnType<typeof ownFiles>): void {
+      const nm = path.join(target, 'node_modules');
+      const entryNm = path.join(entry, 'node_modules');
+      expect(regularFiles(nm)).toEqual(regularFiles(entryNm));
+      for (const { rel, ino, bytes } of own) {
+        expect(fs.lstatSync(path.join(nm, rel)).ino, rel).toBe(ino);
+        expect(fs.readFileSync(path.join(nm, rel), 'utf8'), rel).toBe(bytes);
+      }
+      for (const rel of regularFiles(nm).filter((file) => !KEPT.includes(file))) {
+        expect(fs.lstatSync(path.join(nm, rel)).ino, rel).toBe(fs.lstatSync(path.join(entryNm, rel)).ino);
+      }
+    }
+
+    it('converts a tree whose install-script outputs and hidden lockfile differ, keeping its own copies of those', () => {
+      const { target, entry } = sourceAndTarget();
+      const entryBytes = KEPT.map((rel) => fs.readFileSync(path.join(entry, 'node_modules', rel), 'utf8'));
+      const own = ownFiles(target);
+      // The pre-change refusal: an inventory difference at a per-install file.
+      expect(fs.statSync(path.join(target, 'node_modules', `${GYP_BUILD}/Makefile`)).size).not.toBe(
+        fs.statSync(path.join(entry, 'node_modules', `${GYP_BUILD}/Makefile`)).size,
+      );
+
+      expect(convertPackageDir(startPass(), 'wg-a', target)).toBe('converted');
+
+      expectFarmKeeping(target, entry, own);
+      expect(tempNamesUnder(target)).toEqual([]);
+      expect(verifyEntry(entry).ok).toBe(true);
+      // The entry still holds the source's own bytes: nothing of the workspace leaked into it.
+      expect(KEPT.map((rel) => fs.readFileSync(path.join(entry, 'node_modules', rel), 'utf8'))).toEqual(entryBytes);
+      expect(processPackageDir(startPass(), 'wg-a', target)).toBe('farm');
+    });
+
+    it.each<ConvertStep>(['link-new', 'rename-old', 'rename-new'])(
+      'a convert keeping its own per-install files survives a crash after %s with those bytes intact',
+      (crashPoint) => {
+        const { target, entry } = sourceAndTarget();
+        const own = ownFiles(target);
+
+        const crashed = convertPackageDir(startPass(), 'wg-a', target, {
+          onStep: (step) => {
+            if (step === crashPoint) throw new Error(`simulated crash after ${step}`);
+          },
+        });
+        expect(crashed, crashPoint).toBe('failed');
+        const recoveryPass = startPass();
+        expect(recoverPackageDir(recoveryPass, 'wg-a', target), crashPoint).toBe('recovered');
+        for (const { rel, ino, bytes } of own) {
+          const full = path.join(target, 'node_modules', rel);
+          expect(fs.lstatSync(full).ino, `${crashPoint} ${rel}`).toBe(ino);
+          expect(fs.readFileSync(full, 'utf8'), `${crashPoint} ${rel}`).toBe(bytes);
+        }
+
+        const reversed = crashPoint !== 'rename-new';
+        expect(processPackageDir(recoveryPass, 'wg-a', target), crashPoint).toBe(reversed ? 'converted' : 'farm');
+        expectFarmKeeping(target, entry, own);
+        expect(tempNamesUnder(target), crashPoint).toEqual([]);
+      },
+    );
+
+    it('keeps private a tree installed with --ignore-scripts, naming its first real difference', () => {
+      // The production backend: with scripts, bcrypt downloads its binding and cpu-features fails to build, so
+      // npm removes it; with --ignore-scripts, bcrypt has no binding and cpu-features stays.
+      const bcrypt = (withBinding: boolean): PkgSpec => ({
+        key: 'node_modules/bcrypt',
+        name: 'bcrypt',
+        version: '5.1.1',
+        files: {
+          'bcrypt.js': 'module.exports = {};\n',
+          ...(withBinding ? { 'lib/binding/napi-v3/bcrypt_lib.node': '\x7fELF bcrypt\n' } : {}),
+        },
+        lock: { hasInstallScript: true },
+      });
+      const cpuFeatures: PkgSpec = {
+        key: 'node_modules/cpu-features',
+        name: 'cpu-features',
+        version: '0.0.10',
+        files: { 'lib/index.js': 'module.exports = {};\n' },
+        lock: { optional: true, hasInstallScript: true },
+      };
+      const manifests = { pkgs: [...PKGS, bcrypt(true)], extraLock: lockEntries([cpuFeatures]) };
+      const src = path.join(tmpRoot, 'topic-a', 'repo');
+      writeManifests(src, manifests);
+      installTree(src, { pkgs: [...PKGS, bcrypt(true)] });
+      const target = path.join(tmpRoot, 'topic-b', 'repo');
+      writeManifests(target, manifests);
+      installTree(target, { pkgs: [...PKGS, bcrypt(false), cpuFeatures] });
+      const pass = startPass();
+      expect(processPackageDir(pass, 'wg-a', src)).toBe('adopted');
+      const before = snapshotTree(path.join(target, 'node_modules'));
+
+      expect(convertPackageDir(pass, 'wg-a', target)).toBe('convert-mismatch');
+
+      expect(snapshotTree(path.join(target, 'node_modules'))).toEqual(before);
+      expect(tempNamesUnder(target)).toEqual([]);
+      expect(pass.decisions.find((decision) => decision.op === 'convert-mismatch')?.detail).toBe(
+        'bcrypt/lib/binding/napi-v3/bcrypt_lib.node',
+      );
+    });
   });
 
   it('reads NODE_VERSION from the agent image once per process and fails closed without it', () => {
