@@ -56,6 +56,7 @@ snapshots:
 
   discord.js@14.27.0:
     dependencies:
+      '@types/ws': 8.18.1
       ws: ${wsVersion}
 
   ws@${wsVersion}: {}
@@ -92,11 +93,13 @@ const registry: Registry = {
     'chat-inbound': { description: 'chat events reaching the router', tests: ['src/channels/chat-live-path.test.ts'] },
     'discord-inbound': { description: 'Discord events reaching the router', tests: [] },
     'provider-claude': { description: 'agent turns through Claude', tests: [] },
+    'slack-files': { description: 'Slack file downloads', tests: [] },
   },
   packages: {
     chat: { kind: 'live', paths: ['chat-inbound'] },
     '@chat-adapter/discord': { kind: 'live', paths: ['discord-inbound'] },
     'docker:claude-code': { kind: 'live', paths: ['provider-claude'] },
+    '@slack/web-api': { kind: 'live', paths: ['slack-files'] },
     'docker:bun': { kind: 'runtime' },
     'docker:base-image': { kind: 'runtime' },
     zod: { kind: 'runtime' },
@@ -110,22 +113,37 @@ const head = lockedVersions(files());
 const live = effectiveLivePaths(registry, head.dependsOn);
 const ledgerOf = (text: string) => parseLedgers([{ file: 'docs/dependency-changes/2026-10-07-x.md', text }]);
 const gate = (changes: PackageChange[], text = '') => changeProblems(registry, live, changes, ledgerOf(text), exists);
-const bump = (name: string, from: string, to: string): PackageChange => ({ name, from, to });
+const bump = (name: string, from: string, to: string, source: 'host' | 'docker' = 'host'): PackageChange => {
+  const was = from === 'none' ? [] : from.split(',');
+  const now = to === 'none' ? [] : to.split(',');
+  return {
+    name,
+    from,
+    to,
+    sources: [source],
+    added: now.filter((v) => !was.includes(v)),
+    removed: was.filter((v) => !now.includes(v)),
+  };
+};
 
 describe('locked versions', () => {
   it('reads pnpm and bun.lock packages, Docker pins with quotes or comments, and the base image', () => {
-    const versions = Object.fromEntries([...head.versions].map(([name, set]) => [name, [...set]]));
+    const versions = Object.fromEntries(
+      [...head.versions].map(([source, byName]) => [
+        source,
+        Object.fromEntries([...byName].map(([name, set]) => [name, [...set]])),
+      ]),
+    );
     expect(versions).toEqual({
-      '@chat-adapter/discord': ['4.41.1'],
-      chat: ['4.41.1'],
-      'discord.js': ['14.27.0'],
-      ws: ['8.21.0'],
-      gitdep: ['git+ssh://git@github.com/example/gitdep.git#abc'],
-      '@anthropic-ai/claude-agent-sdk': ['0.3.290'],
-      zod: ['4.6.5'],
-      'docker:claude-code': ['2.1.290'],
-      'docker:bun': ['1.4.2'],
-      'docker:base-image': ['node:22-slim'],
+      host: {
+        '@chat-adapter/discord': ['4.41.1'],
+        chat: ['4.41.1'],
+        'discord.js': ['14.27.0'],
+        ws: ['8.21.0'],
+        gitdep: ['git+ssh://git@github.com/example/gitdep.git#abc'],
+      },
+      runner: { '@anthropic-ai/claude-agent-sdk': ['0.3.290'], zod: ['4.6.5'] },
+      docker: { 'docker:claude-code': ['2.1.290'], 'docker:bun': ['1.4.2'], 'docker:base-image': ['node:22-slim'] },
     });
   });
 
@@ -148,14 +166,29 @@ describe('locked versions', () => {
     expect(packageChanges(head, head, ['@chat-adapter/discord'])).toEqual([
       bump('@chat-adapter/discord', '4.41.1', '4.41.1'),
     ]);
+    expect(patchedPackage('patches/@scope__unversioned.patch')).toBe('@scope/unversioned');
   });
 });
 
 describe('live paths', () => {
   it('passes a live package’s paths to everything it depends on, a dev package included', () => {
-    expect([...(live.get('discord.js') ?? [])]).toEqual(['discord-inbound']);
-    expect([...(live.get('ws') ?? [])]).toEqual(['discord-inbound']);
-    expect(live.get('zod')).toBeUndefined();
+    const host = live.get('host')!;
+    expect([...(host.get('discord.js') ?? [])]).toEqual(['discord-inbound']);
+    expect([...(host.get('ws') ?? [])]).toEqual(['discord-inbound']);
+    expect(host.get('@types/ws')).toBeUndefined();
+    expect(host.get('zod')).toBeUndefined();
+  });
+
+  it('judges a move in one lockfile by that tree alone', () => {
+    const remotionLock = (ws: string) =>
+      `lockfileVersion: '9.0'\n\npackages:\n\n  ws@${ws}:\n    resolution: {integrity: sha512-x}\n\nsnapshots:\n\n  ws@${ws}: {}\n`;
+    const before = lockedVersions(files({ remotionLock: remotionLock('8.20.0') }));
+    const after = lockedVersions(files({ remotionLock: remotionLock('8.21.0') }));
+    const changes = packageChanges(before, after);
+    expect(changes).toEqual([
+      expect.objectContaining({ name: 'ws', sources: ['remotion'], added: ['8.21.0'], removed: ['8.20.0'] }),
+    ]);
+    expect(changeProblems(registry, live, changes, ledgerOf(''), exists).problems).toEqual([]);
   });
 
   it('blocks a transitive move under a live package whose path has no test', () => {
@@ -233,6 +266,26 @@ describe('version changes', () => {
       problems: [],
       warnings: [expect.stringContaining("Allowed by the ledger's Override: Discord inbound outage")],
     });
+  });
+
+  it('lets an exact rollback of a pooled version set through, as the 4.41 Slack bump would need', () => {
+    const text =
+      '## @slack/web-api 7.19.0,8.2.0 → 7.15.1,8.2.0\nSource: rollback\nOverride: revert\n- returns to 7.15.1 · not covered: rollback\n';
+    expect(gate([bump('@slack/web-api', '7.19.0,8.2.0', '7.15.1,8.2.0')], text)).toEqual({
+      problems: [],
+      warnings: [expect.stringContaining('Allowed by the ledger')],
+    });
+  });
+
+  it.each([
+    ['a git version', '4.41.1', 'github:vercel/chat#abc'],
+    ['a version set whose oldest consumer moves up', '7.15.1,8.2.0', '7.19.0'],
+    ['a prerelease', '4.41.1', '4.40.0-beta.1'],
+  ])('refuses an Override on %s', (_label, from, to) => {
+    const text = `## @slack/web-api ${from} → ${to}\nSource: x\nOverride: incident\n- y · not covered: z\n`;
+    expect(gate([bump('@slack/web-api', from, to)], text).problems).toEqual([
+      expect.stringContaining('is on live I/O path(s) with no real-library test: slack-files'),
+    ]);
   });
 
   it('does not block removing a live package on its untested path, but still wants its ledger', () => {

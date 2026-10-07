@@ -76,59 +76,76 @@ function dockerPins(dockerfile: string, updateSources: string): Array<{ id: stri
   });
 }
 
+/** Base images named literally; a `FROM` built from an `ARG` is already a pin. */
 function baseImages(dockerfile: string): string[] {
-  return [...dockerfile.matchAll(/^FROM\s+(?:--\S+\s+)*(\S+)/gim)].map((m) => m[1]!);
+  return [...dockerfile.matchAll(/^FROM\s+(?:--\S+\s+)*(\S+)/gim)]
+    .map((m) => m[1]!)
+    .filter((image) => !image.includes('$'));
 }
 
+/** Where a version is locked. Each lockfile is its own dependency tree; pooling names across trees conflates them. */
+type Source = 'host' | 'runner' | 'remotion' | 'docker';
+
 export interface Locked {
-  versions: Map<string, Set<string>>;
-  /** Package name → the names it depends on, across every lockfile. */
-  dependsOn: Map<string, Set<string>>;
-  /** `name@version` → patch hash, from pnpm's patchedDependencies. */
+  versions: Map<Source, Map<string, Set<string>>>;
+  dependsOn: Map<Source, Map<string, Set<string>>>;
+  /** `<source>:<name>[@version]` → patch hash, from pnpm's patchedDependencies. */
   patches: Map<string, string>;
 }
 
+function tree<T>(map: Map<Source, Map<string, T>>, source: Source): Map<string, T> {
+  let inner = map.get(source);
+  if (!inner) {
+    inner = new Map();
+    map.set(source, inner);
+  }
+  return inner;
+}
+
 export function lockedVersions(files: DependencyFiles): Locked {
-  const versions = new Map<string, Set<string>>();
-  const dependsOn = new Map<string, Set<string>>();
-  const patches = new Map<string, string>();
-  for (const text of [files.pnpmLock, files.remotionLock]) {
+  const locked: Locked = { versions: new Map(), dependsOn: new Map(), patches: new Map() };
+  const pnpm: Array<[Source, string | null]> = [
+    ['host', files.pnpmLock],
+    ['remotion', files.remotionLock],
+  ];
+  for (const [source, text] of pnpm) {
     if (!text) continue;
     const lock = parseYaml(text) as PnpmLock;
     for (const key of Object.keys(lock.packages ?? {})) {
       const spec = splitSpec(key.replace(/\(.*$/, ''));
-      if (spec) add(versions, spec[0], spec[1]);
+      if (spec) add(tree(locked.versions, source), spec[0], spec[1]);
     }
     for (const [key, snapshot] of Object.entries(lock.snapshots ?? {})) {
       const spec = splitSpec(key.replace(/\(.*$/, ''));
       if (!spec) continue;
       for (const dep of Object.keys({ ...snapshot?.dependencies, ...snapshot?.optionalDependencies })) {
-        add(dependsOn, spec[0], dep);
+        add(tree(locked.dependsOn, source), spec[0], dep);
       }
     }
     for (const [key, entry] of Object.entries(lock.patchedDependencies ?? {})) {
-      patches.set(key, typeof entry === 'string' ? entry : (entry?.hash ?? ''));
+      locked.patches.set(`${source}:${key}`, typeof entry === 'string' ? entry : (entry?.hash ?? ''));
     }
   }
   if (files.bunLock) {
     for (const entry of Object.values(parseBunLock(files.bunLock).packages ?? {})) {
       const spec = typeof entry[0] === 'string' ? splitSpec(entry[0]) : null;
       if (!spec) continue;
-      add(versions, spec[0], spec[1]);
+      add(tree(locked.versions, 'runner'), spec[0], spec[1]);
       const meta = (entry[2] ?? {}) as { dependencies?: object; optionalDependencies?: object };
-      for (const dep of Object.keys({ ...meta.dependencies, ...meta.optionalDependencies }))
-        add(dependsOn, spec[0], dep);
+      for (const dep of Object.keys({ ...meta.dependencies, ...meta.optionalDependencies })) {
+        add(tree(locked.dependsOn, 'runner'), spec[0], dep);
+      }
     }
   }
   if (files.dockerfile) {
+    const docker = tree(locked.versions, 'docker');
     if (files.updateSources) {
-      for (const { id, version } of dockerPins(files.dockerfile, files.updateSources)) {
-        add(versions, `docker:${id}`, version);
-      }
+      for (const { id, version } of dockerPins(files.dockerfile, files.updateSources))
+        add(docker, `docker:${id}`, version);
     }
-    for (const image of baseImages(files.dockerfile)) add(versions, BASE_IMAGE, image);
+    for (const image of baseImages(files.dockerfile)) add(docker, BASE_IMAGE, image);
   }
-  return { versions, dependsOn, patches };
+  return locked;
 }
 
 export function directDependencies(files: DependencyFiles): Set<string> {
@@ -148,58 +165,97 @@ export function directDependencies(files: DependencyFiles): Set<string> {
   return names;
 }
 
-/** `patches/@scope__name@1.2.3.patch` names `@scope/name`. */
+/** `patches/@scope__name@1.2.3.patch` and `patches/@scope__name.patch` both name `@scope/name`. */
 export function patchedPackage(changedPath: string): string | null {
-  const match = /^patches\/(.+)@[^@/]+\.patch$/.exec(changedPath);
+  const match = /^patches\/(.+?)(?:@[^@/]+)?\.patch$/.exec(changedPath);
   return match ? match[1]!.replace('__', '/') : null;
 }
 
 export interface PackageChange {
   name: string;
+  /** Every locked version before and after, across trees, comma-joined; `none` when absent. */
   from: string;
   to: string;
+  /** The trees the change happened in. */
+  sources: Source[];
+  /** Versions present after and not before, and the reverse, across those trees. */
+  added: string[];
+  removed: string[];
 }
 
-function versionList(versions: Set<string> | undefined): string {
-  return versions && versions.size > 0 ? [...versions].sort().join(',') : 'none';
+function versionList(versions: Iterable<string>): string {
+  const sorted = [...new Set(versions)].sort();
+  return sorted.length > 0 ? sorted.join(',') : 'none';
 }
+
+const SOURCES: Source[] = ['host', 'runner', 'remotion', 'docker'];
 
 export function packageChanges(base: Locked, head: Locked, patchedFiles: Iterable<string> = []): PackageChange[] {
-  const patched = new Set(patchedFiles);
+  const patched = new Map<string, Set<Source>>();
+  for (const name of patchedFiles) add(patched as Map<string, Set<string>>, name, 'host');
   for (const key of new Set([...base.patches.keys(), ...head.patches.keys()])) {
-    if (base.patches.get(key) !== head.patches.get(key)) {
-      const spec = splitSpec(key);
-      if (spec) patched.add(spec[0]);
-    }
+    if (base.patches.get(key) === head.patches.get(key)) continue;
+    const [source, spec] = [key.slice(0, key.indexOf(':')) as Source, key.slice(key.indexOf(':') + 1)];
+    add(patched as Map<string, Set<string>>, splitSpec(spec)?.[0] ?? spec, source);
   }
-  const names = new Set([...base.versions.keys(), ...head.versions.keys(), ...patched]);
+  const names = new Set<string>(patched.keys());
+  for (const source of SOURCES) {
+    for (const name of base.versions.get(source)?.keys() ?? []) names.add(name);
+    for (const name of head.versions.get(source)?.keys() ?? []) names.add(name);
+  }
   const changes: PackageChange[] = [];
   for (const name of [...names].sort()) {
-    const from = versionList(base.versions.get(name));
-    const to = versionList(head.versions.get(name));
-    if (from !== to || patched.has(name)) changes.push({ name, from, to });
+    const sources: Source[] = [];
+    const before: string[] = [];
+    const after: string[] = [];
+    for (const source of SOURCES) {
+      const from = versionList(base.versions.get(source)?.get(name) ?? []);
+      const to = versionList(head.versions.get(source)?.get(name) ?? []);
+      before.push(...(base.versions.get(source)?.get(name) ?? []));
+      after.push(...(head.versions.get(source)?.get(name) ?? []));
+      if (from !== to || patched.get(name)?.has(source)) sources.push(source);
+    }
+    if (sources.length === 0) continue;
+    const scoped = (locked: Locked) => sources.flatMap((source) => [...(locked.versions.get(source)?.get(name) ?? [])]);
+    const was = new Set(scoped(base));
+    const now = new Set(scoped(head));
+    changes.push({
+      name,
+      from: versionList(before),
+      to: versionList(after),
+      sources,
+      added: [...now].filter((v) => !was.has(v)).sort(),
+      removed: [...was].filter((v) => !now.has(v)).sort(),
+    });
   }
   return changes;
 }
 
 /**
- * Live paths per package, explicit or inherited: whatever a live package depends on, transitively, carries its live
- * paths, because a transitive move changes the same wire behaviour. A dev or runtime package reached that way
- * becomes live too; pnpm dedupes one copy for the test and the production path.
+ * Live paths per tree and package, explicit or inherited: whatever a live package depends on, transitively within its
+ * lockfile, carries its live paths, because a transitive move changes the same wire behaviour. A dev or runtime
+ * package reached that way becomes live too; pnpm dedupes one copy for every consumer. Type-only packages carry no
+ * behaviour and stop the walk.
  */
-export function effectiveLivePaths(registry: Registry, dependsOn: Map<string, Set<string>>): Map<string, Set<string>> {
-  const live = new Map<string, Set<string>>();
-  for (const [name, cls] of Object.entries(registry.packages)) {
-    if (cls.kind !== 'live') continue;
-    const queue = [name];
-    const seen = new Set(queue);
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      for (const id of cls.paths) add(live, current, id);
-      for (const dep of dependsOn.get(current) ?? []) {
-        if (!seen.has(dep)) {
-          seen.add(dep);
-          queue.push(dep);
+export function effectiveLivePaths(
+  registry: Registry,
+  dependsOn: Map<Source, Map<string, Set<string>>>,
+): Map<Source, Map<string, Set<string>>> {
+  const live = new Map<Source, Map<string, Set<string>>>();
+  for (const source of SOURCES) {
+    const graph = dependsOn.get(source) ?? new Map<string, Set<string>>();
+    for (const [name, cls] of Object.entries(registry.packages)) {
+      if (cls.kind !== 'live') continue;
+      const queue = [name];
+      const seen = new Set(queue);
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        for (const id of cls.paths) add(tree(live, source), current, id);
+        for (const dep of graph.get(current) ?? []) {
+          if (!seen.has(dep) && !dep.startsWith('@types/')) {
+            seen.add(dep);
+            queue.push(dep);
+          }
         }
       }
     }
@@ -313,12 +369,6 @@ export function parseLedgers(files: Array<{ file: string; text: string }>): Ledg
   return ledger;
 }
 
-function newestVersion(list: string): number[] | null {
-  if (list === 'none') return null;
-  const parsed = list.split(',').map((v) => (/^\d+(\.\d+)*/.exec(v)?.[0] ?? '').split('.').map(Number));
-  return parsed.sort(compareVersions).at(-1) ?? null;
-}
-
 function compareVersions(a: number[], b: number[]): number {
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
     const d = (a[i] ?? 0) - (b[i] ?? 0);
@@ -327,12 +377,19 @@ function compareVersions(a: number[], b: number[]): number {
   return 0;
 }
 
-/** A hotfix patch on the shipped version, or a rollback: the cases an incident cannot wait a test for. */
+const PLAIN_VERSION = /^\d+(\.\d+)*$/;
+
+/**
+ * The cases an incident cannot wait a test for: a patch at the shipped version, or a rollback in which every version
+ * added is a plain release older than every version removed. A git, tarball or prerelease version never qualifies.
+ */
 function overridable(change: PackageChange): boolean {
-  if (change.from === change.to) return true;
-  const from = newestVersion(change.from);
-  const to = newestVersion(change.to);
-  return from !== null && to !== null && compareVersions(to, from) < 0;
+  if (change.added.length === 0) return true;
+  if (change.removed.length === 0) return false;
+  if (![...change.added, ...change.removed].every((v) => PLAIN_VERSION.test(v))) return false;
+  const parse = (v: string) => v.split('.').map(Number);
+  const oldestRemoved = change.removed.map(parse).sort(compareVersions)[0]!;
+  return change.added.every((v) => compareVersions(parse(v), oldestRemoved) < 0);
 }
 
 export interface GateResult {
@@ -342,7 +399,7 @@ export interface GateResult {
 
 export function changeProblems(
   registry: Registry,
-  livePaths: Map<string, Set<string>>,
+  livePaths: Map<Source, Map<string, Set<string>>>,
   changes: PackageChange[],
   ledger: Ledger,
   exists: (file: string) => boolean,
@@ -350,7 +407,9 @@ export function changeProblems(
   const result: GateResult = { problems: [...ledger.problems], warnings: [] };
   for (const change of changes) {
     const explicit = registry.packages[change.name];
-    const paths = [...(livePaths.get(change.name) ?? [])];
+    const paths = [
+      ...new Set(change.sources.flatMap((source) => [...(livePaths.get(source)?.get(change.name) ?? [])])),
+    ];
     if (paths.length === 0 && (!explicit || explicit.kind === 'dev')) continue;
     const label = `${change.name} ${change.from} → ${change.to}`;
     const section = ledger.sections.get(change.name);
@@ -450,6 +509,11 @@ export function runCheck(root: string, base: string): GateResult {
   if (!registry) throw new Error(`dependency-gate: ${REGISTRY_PATH} is missing`);
   const baseRegistryText = gitRead(root, ['show', `${base}:${REGISTRY_PATH}`]);
   const baseRegistry = baseRegistryText ? (JSON.parse(baseRegistryText) as Registry) : null;
+  const baseHasGate = gitRead(root, ['cat-file', '-e', `${base}:scripts/dependency-gate.ts`]) !== null;
+  const movedRegistry =
+    baseHasGate && !baseRegistry
+      ? [`${REGISTRY_PATH} is not at the base, which has the gate; a moved registry cannot be checked for weakening`]
+      : [];
   const headFiles = filesAt(root, null);
 
   const diff = gitRead(root, ['diff', '--name-only', '--no-renames', base]);
@@ -472,6 +536,7 @@ export function runCheck(root: string, base: string): GateResult {
   return {
     problems: [
       ...registryProblems(registry, directDependencies(headFiles), exists),
+      ...movedRegistry,
       ...weakenedRegistryProblems(baseRegistry, registry, ledger),
       ...result.problems,
     ],
