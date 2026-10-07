@@ -14,6 +14,7 @@ import { conversationDisplayName } from './adapter.js';
 import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
+import { slackApiUrl } from './slack-lib.js';
 import { installSlackSubtextBlocks } from './slack-subtext.js';
 import { linkSlackChannelNames, warmChannelDirectory } from './channel-links.js';
 import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
@@ -564,7 +565,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
       (slackAdapter as unknown as { name: string }).name = ws.channelType;
       // Installed beside the adapter because it wraps the adapter's own Web client; see slack-subtext.ts.
       installSlackSubtextBlocks(slackAdapter);
-      const client = new WebClient(ws.botToken);
+      const client = new WebClient(ws.botToken, { slackApiUrl: slackApiUrl() });
 
       // Setup publishes the identity provisionally before Socket Mode can deliver inbound events, and rolls it back
       // if setup fails.

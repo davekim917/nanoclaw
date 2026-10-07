@@ -4,7 +4,12 @@
  * Tokens travel only in the Authorization header and must never appear in messages or logs.
  */
 
-const SLACK_API = 'https://slack.com/api';
+/** The Web API base, ending in `/`. `SLACK_API_URL` is the override the Slack adapter itself reads. */
+export function slackApiUrl(): string {
+  const configured = process.env.SLACK_API_URL?.trim();
+  if (!configured) return 'https://slack.com/api/';
+  return configured.endsWith('/') ? configured : `${configured}/`;
+}
 
 /** `message` MUST never contain a token value. */
 export class SlackApiError extends Error {
@@ -29,7 +34,7 @@ export async function slackCall(
 ): Promise<Record<string, unknown>> {
   let res: Response;
   try {
-    res = await fetch(`${SLACK_API}/${method}`, {
+    res = await fetch(`${slackApiUrl()}${method}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
