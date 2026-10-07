@@ -1249,20 +1249,23 @@ describe('dependency cache', () => {
      * the target did not; node-gyp embedded each checkout's own path; npm wrote the target's hidden lockfile
      * with different formatting.
      */
-    function sourceAndTarget(): { src: string; target: string; entry: string } {
+    function sourceAndTarget(installedAfterSource = false): { src: string; target: string; entry: string } {
       const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), {
         pkgs: scriptedPkgs('XZO@feat-outreach', '\x7fELF native esbuild\n'),
       });
       const target = path.join(tmpRoot, 'topic-b', 'repo');
       writeManifests(target, { pkgs: scriptedPkgs('XZO@feat-outreach', '\x7fELF native esbuild\n') });
       installTree(target, { pkgs: scriptedPkgs('XZO', '#!/usr/bin/env node\nrequire("../lib/main.js");\n') });
-      const hidden = path.join(target, 'node_modules', '.package-lock.json');
-      const stat = fs.statSync(hidden);
-      fs.writeFileSync(hidden, JSON.stringify(JSON.parse(fs.readFileSync(hidden, 'utf8')), null, 4) + '\n');
-      fs.utimesSync(hidden, stat.atime, stat.mtime);
-      // Installed before the source, so the entry's files are newer than the target's hidden lockfile.
-      for (const rel of regularFiles(path.join(target, 'node_modules'))) {
-        fs.utimesSync(path.join(target, 'node_modules', rel), FILE_STAMP_S - 60, FILE_STAMP_S - 60);
+      const nm = path.join(target, 'node_modules');
+      const hidden = path.join(nm, '.package-lock.json');
+      if (installedAfterSource) {
+        // Same hidden lockfile bytes as the source's, but every file is newer than the entry's hidden lockfile.
+        for (const rel of regularFiles(nm)) fs.utimesSync(path.join(nm, rel), FILE_STAMP_S + 60, FILE_STAMP_S + 60);
+        fs.utimesSync(hidden, FILE_STAMP_S + 90, FILE_STAMP_S + 90);
+      } else {
+        fs.writeFileSync(hidden, JSON.stringify(JSON.parse(fs.readFileSync(hidden, 'utf8')), null, 4) + '\n');
+        // Installed before the source, so the entry's files are newer than the target's hidden lockfile.
+        for (const rel of regularFiles(nm)) fs.utimesSync(path.join(nm, rel), FILE_STAMP_S - 60, FILE_STAMP_S - 60);
       }
       expect(keyOf(target)).toBe(keyOf(src));
       expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
@@ -1308,6 +1311,23 @@ describe('dependency cache', () => {
       expect(verifyEntry(entry).ok).toBe(true);
       // The entry still holds the source's own bytes: nothing of the workspace leaked into it.
       expect(KEPT.map((rel) => fs.readFileSync(path.join(entry, 'node_modules', rel), 'utf8'))).toEqual(entryBytes);
+      expect(processPackageDir(startPass(), 'wg-a', target)).toBe('farm');
+    });
+
+    it('converts a later install whose hidden lockfile matches the entry, keeping only its own build outputs', () => {
+      const { target, entry } = sourceAndTarget(true);
+      const hidden = '.package-lock.json';
+      expect(fs.readFileSync(path.join(target, 'node_modules', hidden), 'utf8')).toBe(
+        fs.readFileSync(path.join(entry, 'node_modules', hidden), 'utf8'),
+      );
+      const own = ownFiles(target).filter((file) => file.rel !== hidden);
+
+      expect(convertPackageDir(startPass(), 'wg-a', target)).toBe('converted');
+
+      expectFarmKeeping(target, entry, own);
+      expect(fs.readFileSync(path.join(target, 'node_modules', hidden), 'utf8')).toBe(
+        fs.readFileSync(path.join(entry, 'node_modules', hidden), 'utf8'),
+      );
       expect(processPackageDir(startPass(), 'wg-a', target)).toBe('farm');
     });
 
