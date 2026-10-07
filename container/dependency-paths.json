@@ -10,11 +10,11 @@
     },
     "discord-inbound": {
       "description": "Discord gateway events reaching the router as inbound messages",
-      "tests": []
+      "tests": ["src/channels/discord-live-path.test.ts"]
     },
     "discord-outbound": {
       "description": "Agent replies posted to Discord through the adapter and the REST API",
-      "tests": []
+      "tests": ["src/channels/discord-live-path.test.ts"]
     },
     "attachment-download": {
       "description": "Files attached to Slack and Discord messages downloaded for the agent",
