@@ -102,6 +102,14 @@ jobs:
       - name: Live-path adapter tests
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run live-path --maxWorkers=1
+      # A version change that can alter runtime behaviour needs a ledger mapping its changelog to tests, and one on a
+      # live I/O path needs a real-library test of that path (docs/dependency-updates.md). Reads git only.
+      - name: Dependency gate
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec tsx scripts/dependency-gate.ts check
+      - name: Dependency gate fixtures
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec vitest run scripts/dependency-gate.test.ts --maxWorkers=1
       # Dead code (knip, host and runner), duplication (jscpd) and prohibited
       # comment forms over the whole tree. Any finding fails the step, as does
       # a check that cannot run. Keep this line identical in host-ci.sh and

@@ -24,5 +24,7 @@ pnpm exec vitest run scripts/host-ci-declaration.test.ts --maxWorkers=1
 pnpm exec vitest run scripts/review-notes.test.ts scripts/doc-citations.test.ts --maxWorkers=1
 pnpm exec vitest run ratchet tripwire --maxWorkers=1
 pnpm exec vitest run live-path --maxWorkers=1
+pnpm exec tsx scripts/dependency-gate.ts check
+pnpm exec vitest run scripts/dependency-gate.test.ts --maxWorkers=1
 pnpm exec tsx scripts/hygiene/run.ts
 pnpm exec vitest run scripts/hygiene --maxWorkers=1

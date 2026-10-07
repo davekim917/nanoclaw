@@ -89,6 +89,50 @@ describe('latest-stable release policy', () => {
     expect(items.find((item) => item.id === 'docker:tool')).toMatchObject({ current, latest, status });
   });
 
+  it('marks an item on a live path with no real-library test as blocked by the dependency gate', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'container-updates-'));
+    for (const dir of ['container/agent-runner', 'container/remotion', '.github']) {
+      await mkdir(path.join(root, dir), { recursive: true });
+    }
+    await writeFile(path.join(root, 'container/agent-runner/package.json'), '{}\n');
+    await writeFile(path.join(root, 'container/remotion/package.json'), '{}\n');
+    await writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ dependencies: { chat: '4.41.1', zod: '4.6.5' } }),
+    );
+    await writeFile(path.join(root, 'container', 'Dockerfile'), 'ARG TOOL_VERSION=1.0.0\n');
+    await writeFile(
+      path.join(root, 'container', 'update-sources.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        dockerfile: [{ id: 'tool', name: 'tool', arg: 'TOOL_VERSION', source: { kind: 'npm', package: 'tool' } }],
+      }),
+    );
+    await writeFile(
+      path.join(root, '.github', 'dependency-paths.json'),
+      JSON.stringify({
+        livePaths: {
+          'discord-inbound': { description: 'Discord inbound', tests: [] },
+          'provider-tool': { description: 'tool turns', tests: ['src/tool-live-path.test.ts'] },
+        },
+        packages: {
+          chat: { kind: 'live', paths: ['discord-inbound', 'provider-tool'] },
+          zod: { kind: 'runtime' },
+          'docker:tool': { kind: 'live', paths: ['provider-tool'] },
+        },
+      }),
+    );
+
+    const items = await auditRepository(root, async () => ({ 'dist-tags': { latest: '9.0.0' } }));
+
+    const byName = Object.fromEntries(items.map((item) => [item.name, item.untestedLivePaths]));
+    expect(byName).toEqual({ chat: ['discord-inbound'], zod: undefined, tool: undefined });
+    const chat = items.find((item) => item.name === 'chat')!;
+    expect(renderAuditMarkdown(items)).toContain(
+      `**BLOCKED by the dependency gate — a live I/O path with no real-library test:**\n- ${chat.id}: discord-inbound`,
+    );
+  });
+
   it('selects the highest non-yanked stable PyPI release with compatible files', () => {
     expect(
       latestStablePyPiVersion({
