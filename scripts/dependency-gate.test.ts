@@ -5,6 +5,8 @@ import {
   changeProblems,
   directDependencies,
   dockerfileProblems,
+  consumerMoves,
+  liveAtEitherEnd,
   liveMoves,
   lockedVersions,
   packageChanges,
@@ -14,6 +16,7 @@ import {
   runtimeReach,
   trackedTools,
   weakenedRegistryProblems,
+  withRepoints,
   type DependencyFiles,
   type PackageChange,
 } from './dependency-gate.js';
@@ -116,6 +119,14 @@ const contents: Record<string, string> = {
   'src/channels/placeholder-live-path.test.ts': "it('ok', () => {});\n",
   'src/channels/mocked-live-path.test.ts': "vi.mock('chat', () => ({}));\nimport 'chat';\nit('ok', () => {});\n",
   'src/channels/typed-live-path.test.ts': "import type { Chat } from 'chat';\nit('ok', () => {});\n",
+  'src/channels/commented-live-path.test.ts': "// TODO: import { Chat } from 'chat';\nit('ok', () => {});\n",
+  'src/channels/stringly-live-path.test.ts': "const s = \"import 'chat'\";\nit('ok', () => {});\n",
+  'src/channels/host-mocked-live-path.test.ts':
+    "vi.mock('./chat-wiring.js');\nimport { wire } from './chat-wiring.js';\nit('ok', () => wire());\n",
+  'src/channels/dynamic-mocked-live-path.test.ts':
+    "vi.mock(import('chat'), () => ({}));\nimport 'chat';\nit('ok', () => {});\n",
+  'src/channels/template-mocked-live-path.test.ts':
+    "vi.mock(`chat`, () => ({}));\nimport 'chat';\nit('ok', () => {});\n",
   'src/router.test.ts': '',
   'package.json': '{}',
 };
@@ -345,6 +356,11 @@ describe('registry', () => {
     ['imports nothing', 'src/channels/placeholder-live-path.test.ts'],
     ['mocks the package it imports', 'src/channels/mocked-live-path.test.ts'],
     ['imports only its types', 'src/channels/typed-live-path.test.ts'],
+    ['imports it only in a comment', 'src/channels/commented-live-path.test.ts'],
+    ['imports it only inside a string', 'src/channels/stringly-live-path.test.ts'],
+    ['mocks the host module it loads it through', 'src/channels/host-mocked-live-path.test.ts'],
+    ['mocks it through import()', 'src/channels/dynamic-mocked-live-path.test.ts'],
+    ['mocks it with a template literal', 'src/channels/template-mocked-live-path.test.ts'],
   ])('refuses a live-path test that %s', (_label, test) => {
     const placeholder: Registry = {
       ...registry,
@@ -537,6 +553,28 @@ describe('Docker pins', () => {
     ]);
   });
 
+  it.each([
+    ['an ENV of the same name', 'ENV CLAUDE_CODE_VERSION=2.1.999', 'sets CLAUDE_CODE_VERSION with ENV'],
+    ['a second valued ARG', 'ARG CLAUDE_CODE_VERSION=2.1.999', 'gives ARG CLAUDE_CODE_VERSION a value 2 times'],
+  ])('refuses a pin shadowed by %s', (_label, shadow, message) => {
+    expect(dockerfileProblems(base, base.replace('\nRUN', `\n${shadow}\nRUN`), tools)).toEqual([
+      expect.stringContaining(message),
+    ]);
+  });
+
+  it.each([
+    ['a range', '"dbt-core>=1.12"'],
+    ['extras with a literal', '"dbt-core[snowflake]==1.13"'],
+    ['a name variant', 'DBT_core==1.13.0'],
+  ])('refuses a tracked PyPI tool installed as %s, even with its ARG still referenced', (_label, install) => {
+    const pypi = [{ id: 'dbt-core', arg: 'DBT_CORE_VERSION', source: { kind: 'pypi', package: 'dbt-core' } }];
+    const pinned = 'ARG DBT_CORE_VERSION=1.12.5\nRUN pip install "dbt-core==${DBT_CORE_VERSION}"\n';
+    const head = `ARG DBT_CORE_VERSION=1.12.5\nRUN pip install ${install} && echo \${DBT_CORE_VERSION}\n`;
+    expect(dockerfileProblems(pinned, head, pypi)).toEqual([
+      expect.stringContaining('install it as dbt-core==${DBT_CORE_VERSION}'),
+    ]);
+  });
+
   it('refuses a tracked PyPI tool at a literal version, and accepts both kinds from their ARG', () => {
     const pypi = [{ id: 'dbt-core', arg: 'DBT_CORE_VERSION', source: { kind: 'pypi', package: 'dbt-core' } }];
     const pinned =
@@ -547,5 +585,124 @@ describe('Docker pins', () => {
     ]);
     expect(dockerfileProblems(pinned, pinned.replace('1.12.5', '1.13.0'), pypi)).toEqual([]);
     expect(dockerfileProblems(base, base.replace('2.1.290', '2.1.300'), tools)).toEqual([]);
+  });
+});
+
+/** A pnpm lockfile from `node → { dep: version }`; every node is also a package. */
+const lockOf = (snapshots: Record<string, Record<string, string>>): string => {
+  const nodes = Object.keys(snapshots);
+  const packages = nodes.map((node) => `  '${node}':\n    resolution: {integrity: sha512-x}\n`).join('\n');
+  const snaps = nodes
+    .map((node) => {
+      const deps = Object.entries(snapshots[node]!);
+      return deps.length === 0
+        ? `  '${node}': {}\n`
+        : `  '${node}':\n    dependencies:\n${deps.map(([d, v]) => `      '${d}': ${v}\n`).join('')}`;
+    })
+    .join('\n');
+  return `lockfileVersion: '9.0'\n\npackages:\n\n${packages}\nsnapshots:\n\n${snaps}`;
+};
+
+/** The gate's own pipeline over two host lockfiles. */
+const judge = (
+  before: string,
+  after: string,
+  text = '',
+  baseReg: Registry = registry,
+  headReg: Registry = registry,
+) => {
+  const base = lockedVersions(files({ pnpmLock: before }));
+  const head = lockedVersions(files({ pnpmLock: after }));
+  const changes = packageChanges(base, head);
+  const repatched = new Set(changes.filter((c) => c.from === c.to).map((c) => c.name));
+  const moves = liveMoves(liveAtEitherEnd(baseReg, headReg), base, head, repatched);
+  return changeProblems(
+    headReg,
+    runtimeReach(headReg, head.dependsOn),
+    withRepoints(changes, consumerMoves(base, head), moves, head),
+    ledgerOf(text),
+    exists,
+    moves,
+    baseReg,
+  ).problems;
+};
+
+describe('moves the locked version set does not show', () => {
+  const stack = (wsUnderDiscord: string) =>
+    lockOf({
+      'chat@4.41.1': {},
+      '@chat-adapter/discord@4.41.1': { 'discord.js': '14.27.0' },
+      'discord.js@14.27.0': { ws: wsUnderDiscord },
+      'other@1.0.0': { ws: '8.22.0' },
+      'ws@8.21.0': {},
+      'ws@8.22.0': {},
+    });
+
+  it('blocks a live package repointed onto a version already locked for something else', () => {
+    expect(judge(stack('8.21.0'), stack('8.22.0'))).toEqual([
+      expect.stringContaining(
+        'ws 8.21.0 → 8.22.0 (loaded by @chat-adapter/discord) is on live I/O path(s) with no real-library test',
+      ),
+    ]);
+  });
+
+  it('still blocks the move when the same change reclassifies the live package above it', () => {
+    const weakened: Registry = {
+      ...registry,
+      packages: { ...registry.packages, '@chat-adapter/discord': { kind: 'runtime' } },
+    };
+    const text = 'Reclassified: @chat-adapter/discord · not really live\n';
+    expect(judge(stack('8.21.0'), stack('8.22.0'), text, registry, weakened)).toEqual([
+      expect.stringContaining('ws 8.21.0 → 8.22.0 (loaded by @chat-adapter/discord) is on live I/O path(s)'),
+    ]);
+  });
+
+  it('wants a ledger when a runtime consumer is repointed across a major onto a version already locked', () => {
+    const tree = (luxon: string) =>
+      lockOf({ 'zod@4.6.5': { luxon }, 'other@1.0.0': { luxon: '4.0.0' }, 'luxon@3.7.2': {}, 'luxon@4.0.0': {} });
+    expect(judge(tree('3.7.2'), tree('4.0.0'))).toEqual([expect.stringContaining('"## luxon 3.7.2 → 4.0.0" section')]);
+  });
+
+  it('refuses an Override for an upgrade split across two lockfiles', () => {
+    const remotion = (v: string) => lockOf({ [`zod@${v}`]: {} });
+    const runner = (v: string) =>
+      `{\n  "lockfileVersion": 1,\n  "packages": {\n    "zod": ["zod@${v}", "", {}, "sha512-x"],\n  },\n}\n`;
+    const base = lockedVersions(files({ remotionLock: remotion('4.6.5'), bunLock: runner('3.25.0') }));
+    const head = lockedVersions(files({ remotionLock: remotion('3.25.0'), bunLock: runner('4.6.5') }));
+    const [change] = packageChanges(base, head);
+    expect(change).toMatchObject({ name: 'zod', added: ['3.25.0', '4.6.5'], removed: ['3.25.0', '4.6.5'] });
+    const live: Registry = {
+      ...registry,
+      packages: { ...registry.packages, zod: { kind: 'live', paths: ['provider-claude'] } },
+    };
+    const text = '## zod 3.25.0,4.6.5 → 3.25.0,4.6.5\nSource: x\nOverride: incident\n- y · not covered: z\n';
+    expect(gate([change!], text, live).problems).toEqual([
+      expect.stringContaining('no real-library test: provider-claude'),
+    ]);
+  });
+
+  it('follows a bun peer dependency into the live closure', () => {
+    const bun = (zod: string) => `{
+  "lockfileVersion": 1,
+  "packages": {
+    "@anthropic-ai/claude-agent-sdk": ["@anthropic-ai/claude-agent-sdk@0.3.290", "", { "peerDependencies": { "zod": "^4" } }, "sha512-x"],
+    "zod": ["zod@${zod}", "", {}, "sha512-x"],
+  },
+}
+`;
+    const live: Registry = {
+      ...registry,
+      packages: {
+        ...registry.packages,
+        '@anthropic-ai/claude-agent-sdk': { kind: 'live', paths: ['provider-claude'] },
+      },
+    };
+    const moves = liveMoves(
+      live,
+      lockedVersions(files({ bunLock: bun('4.6.5') })),
+      lockedVersions(files({ bunLock: bun('4.7.0') })),
+      new Set(),
+    );
+    expect(moves.get('runner')?.get('zod')).toEqual(new Set(['@anthropic-ai/claude-agent-sdk']));
   });
 });

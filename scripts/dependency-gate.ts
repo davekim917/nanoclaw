@@ -7,6 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import ts from 'typescript';
 import { parse as parseYaml } from 'yaml';
 
 import {
@@ -176,8 +177,12 @@ export function lockedVersions(
       if (!spec) continue;
       add(tree(locked.versions, 'runner'), spec[0], spec[1]);
       tree(locked.graph, 'runner').set(node, tree(locked.graph, 'runner').get(node) ?? new Set());
-      const meta = (entry[2] ?? {}) as { dependencies?: object; optionalDependencies?: object };
-      for (const dep of Object.keys({ ...meta.dependencies, ...meta.optionalDependencies })) {
+      const meta = (entry[2] ?? {}) as {
+        dependencies?: object;
+        optionalDependencies?: object;
+        peerDependencies?: object;
+      };
+      for (const dep of Object.keys({ ...meta.dependencies, ...meta.optionalDependencies, ...meta.peerDependencies })) {
         add(tree(locked.dependsOn, 'runner'), spec[0], dep);
         const target = bunResolve(entries, key, dep);
         if (target) add(tree(locked.graph, 'runner'), node, target);
@@ -219,9 +224,11 @@ export interface PackageChange {
   to: string;
   /** The trees the change happened in. */
   sources: Source[];
-  /** Versions present after and not before, and the reverse, across those trees. */
+  /** Versions present after and not before, and the reverse, each judged within its own tree. */
   added: string[];
   removed: string[];
+  /** Consumers that moved to another exact version of this package, where the locked set alone does not show it. */
+  repointed?: Repoint[];
 }
 
 function versionList(versions: Iterable<string>): string {
@@ -257,19 +264,102 @@ export function packageChanges(base: Locked, head: Locked, patchedFiles: Iterabl
       if (from !== to || patched.get(name)?.has(source)) sources.push(source);
     }
     if (sources.length === 0) continue;
-    const scoped = (locked: Locked) => sources.flatMap((source) => [...(locked.versions.get(source)?.get(name) ?? [])]);
-    const was = new Set(scoped(base));
-    const now = new Set(scoped(head));
+    const added = new Set<string>();
+    const removed = new Set<string>();
+    for (const source of sources) {
+      const was = base.versions.get(source)?.get(name) ?? new Set<string>();
+      const now = head.versions.get(source)?.get(name) ?? new Set<string>();
+      for (const v of now) if (!was.has(v)) added.add(v);
+      for (const v of was) if (!now.has(v)) removed.add(v);
+    }
     changes.push({
       name,
       from: versionList(before),
       to: versionList(after),
       sources,
-      added: [...now].filter((v) => !was.has(v)).sort(),
-      removed: [...was].filter((v) => !now.has(v)).sort(),
+      added: [...added].sort(),
+      removed: [...removed].sort(),
     });
   }
   return changes;
+}
+
+type Repoint = { from: string; to: string };
+
+/**
+ * Per tree and package, each exact version a consumer present at both ends now loads in place of what it loaded at the
+ * base (`none` for a new edge). This sees a consumer moved onto a version already locked elsewhere, or a peer
+ * resolution that changed, where the set of locked versions stays the same.
+ */
+export function consumerMoves(base: Locked, head: Locked): Map<Source, Map<string, Repoint[]>> {
+  const moves = new Map<Source, Map<string, Repoint[]>>();
+  const byName = (targets: Iterable<string>): Map<string, Set<string>> => {
+    const out = new Map<string, Set<string>>();
+    for (const target of targets) {
+      const spec = splitSpec(target);
+      if (spec) add(out, spec[0], spec[1]);
+    }
+    return out;
+  };
+  for (const source of SOURCES) {
+    const before = base.graph.get(source);
+    for (const [node, targets] of head.graph.get(source) ?? []) {
+      const old = before?.get(node);
+      if (!old) continue;
+      const was = byName(old);
+      for (const [name, versions] of byName(targets)) {
+        const prior = was.get(name);
+        for (const version of versions) {
+          if (prior?.has(version)) continue;
+          const list = tree(moves, source).get(name) ?? [];
+          list.push({ from: prior ? versionList(prior) : 'none', to: version });
+          tree(moves, source).set(name, list);
+        }
+      }
+    }
+  }
+  return moves;
+}
+
+/**
+ * Adds the moves a version-set diff cannot see: a consumer repointed onto a version already locked, and a package that
+ * newly enters a live closure. Each becomes a change whose added and removed versions are the consumer's own, so an
+ * Override judges the move the consumer made.
+ */
+export function withRepoints(
+  changes: PackageChange[],
+  repoints: Map<Source, Map<string, Repoint[]>>,
+  moves: Map<Source, Map<string, Set<string>>>,
+  head: Locked,
+): PackageChange[] {
+  const byName = new Map(changes.map((change) => [change.name, change]));
+  const out = [...changes];
+  for (const source of SOURCES) {
+    const names = new Set([...(repoints.get(source)?.keys() ?? []), ...(moves.get(source)?.keys() ?? [])]);
+    for (const name of names) {
+      const own = repoints.get(source)?.get(name) ?? [];
+      const existing = byName.get(name);
+      if (existing) {
+        existing.repointed = [...(existing.repointed ?? []), ...own];
+        if (!existing.sources.includes(source)) existing.sources.push(source);
+        continue;
+      }
+      const into =
+        own.length > 0 ? own : [...(head.versions.get(source)?.get(name) ?? [])].map((to) => ({ from: 'none', to }));
+      const change: PackageChange = {
+        name,
+        from: versionList(into.flatMap((move) => (move.from === 'none' ? [] : move.from.split(',')))),
+        to: versionList(into.map((move) => move.to)),
+        sources: [source],
+        added: [...new Set(into.map((move) => move.to))].sort(),
+        removed: [...new Set(into.flatMap((move) => (move.from === 'none' ? [] : move.from.split(','))))].sort(),
+        repointed: into,
+      };
+      byName.set(name, change);
+      out.push(change);
+    }
+  }
+  return out;
 }
 
 /**
@@ -302,33 +392,62 @@ export function runtimeReach(
   return reach;
 }
 
-const IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*['"]([^'"]+)['"]/g;
-const TYPE_ONLY = /^\s*(?:import|export)\s+type\b[^;]*;/gm;
-const MOCK = /\b(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)\(\s*['"]([^'"]+)['"]/g;
-
-/** Runtime imports only: a type-only import loads nothing. */
-function importsOf(text: string): string[] {
-  return [...text.replace(TYPE_ONLY, '').matchAll(IMPORT)].map((m) => m[1]!);
-}
-
 const names = (spec: string, packages: string[]): boolean =>
   packages.some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`));
 
+const MOCKS = /^(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)$/;
+
 /**
- * Whether a test loads one of `packages`, itself or through one host module it imports. A name-only check would accept
- * a placeholder test; this cheap floor refuses one that never touches the libraries on its path.
+ * What a test file loads at runtime and what it mocks, from the TypeScript parser, so an import inside a comment or a
+ * string does not count. A type-only import loads nothing. A mock whose target is not a plain string cannot be
+ * judged, so it is recorded as `null` and treated as mocking everything.
+ */
+function moduleUse(file: string, text: string): { imports: string[]; mocks: Array<string | null> } {
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const imports: string[] = [];
+  const mocks: Array<string | null> = [];
+  const literal = (node: ts.Node | undefined): string | null =>
+    node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) ? node.text : null;
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && !node.importClause?.isTypeOnly) {
+      const spec = literal(node.moduleSpecifier);
+      if (spec) imports.push(spec);
+    } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && node.moduleSpecifier) {
+      const spec = literal(node.moduleSpecifier);
+      if (spec) imports.push(spec);
+    } else if (ts.isCallExpression(node)) {
+      const callee = node.expression.getText(source);
+      if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        const spec = literal(node.arguments[0]);
+        if (spec) imports.push(spec);
+      } else if (MOCKS.test(callee)) {
+        mocks.push(literal(node.arguments[0]));
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return { imports, mocks };
+}
+
+/**
+ * Whether a test loads one of `packages`, itself or through one host module it imports, without mocking it. A
+ * name-only check would accept a placeholder test; this cheap floor refuses one that never touches the libraries on
+ * its path.
  */
 function testLoads(test: string, packages: string[], read: (file: string) => string | null): boolean {
-  const hits = (text: string): boolean => importsOf(text).some((spec) => names(spec, packages));
   const text = read(test);
   if (text === null) return false;
-  if ([...text.matchAll(MOCK)].some((m) => names(m[1]!, packages))) return false;
-  if (hits(text)) return true;
-  return importsOf(text)
-    .filter((spec) => spec.startsWith('.'))
+  const { imports, mocks } = moduleUse(test, text);
+  if (mocks.some((spec) => spec === null || names(spec, packages))) return false;
+  if (imports.some((spec) => names(spec, packages))) return true;
+  const local = (spec: string): string => path.posix.join(path.posix.dirname(test), spec).replace(/\.js$/, '.ts');
+  const mocked = new Set(mocks.filter((spec): spec is string => spec?.startsWith('.') ?? false).map(local));
+  return imports
+    .filter((spec) => spec.startsWith('.') && !mocked.has(local(spec)))
     .some((spec) => {
-      const module = read(path.posix.join(path.posix.dirname(test), spec).replace(/\.js$/, '.ts'));
-      return module !== null && hits(module);
+      const module = read(local(spec));
+      return module !== null && moduleUse(local(spec), module).imports.some((inner) => names(inner, packages));
     });
 }
 
@@ -373,6 +492,17 @@ export function liveMoves(
     }
   }
   return moves;
+}
+
+/** Live at the base or the head: a change that reclassifies a live package must not hide the moves beneath it. */
+export function liveAtEitherEnd(base: Registry | null, head: Registry): Registry {
+  const packages: Registry['packages'] = { ...head.packages };
+  for (const [name, cls] of Object.entries(base?.packages ?? {})) {
+    if (cls.kind !== 'live') continue;
+    const now = packages[name];
+    packages[name] = { kind: 'live', paths: [...new Set([...cls.paths, ...(now?.kind === 'live' ? now.paths : [])])] };
+  }
+  return { livePaths: { ...(base?.livePaths ?? {}), ...head.livePaths }, packages };
 }
 
 export function registryProblems(
@@ -538,7 +668,10 @@ function breakingMove(change: PackageChange): boolean {
     .split(',')
     .filter((v) => !change.removed.includes(v))
     .map(releaseLine);
-  return change.added.some((v) => !before.has(releaseLine(v)) && !kept.includes(releaseLine(v)));
+  const repointBreaks = (change.repointed ?? []).some(
+    (move) => move.from !== 'none' && !move.from.split(',').map(releaseLine).includes(releaseLine(move.to)),
+  );
+  return repointBreaks || change.added.some((v) => !before.has(releaseLine(v)) && !kept.includes(releaseLine(v)));
 }
 
 export interface GateResult {
@@ -710,22 +843,47 @@ export function dockerfileProblems(base: string | null, head: string | null, too
         `container/Dockerfile references \${${tool.arg}} fewer times than the base, comments aside; ${tool.id} must install from its ARG pin`,
       );
     }
+    const valued = headLines.filter((line) => new RegExp(`^ARG\\s+${tool.arg}=`).test(line)).length;
+    const shadowed = headLines.some((line) => new RegExp(`^ENV\\b.*(?:^|\\s)${tool.arg}(?:=|\\s)`).test(line));
+    if (valued > 1 || shadowed) {
+      problems.push(
+        `container/Dockerfile ${shadowed ? `sets ${tool.arg} with ENV` : `gives ARG ${tool.arg} a value ${valued} times`}; the gate reads only its first ARG value, so ${tool.id} must have exactly one`,
+      );
+    }
     const kind = tool.source?.kind;
     const pkg = tool.source?.package;
     if (!pkg || (kind !== 'npm' && kind !== 'pypi')) continue;
-    const separator = kind === 'npm' ? '@' : '==';
-    const pinned = new RegExp(`^["']?(?:\\$\\{${tool.arg}\\}|\\$${tool.arg}\\b)["']?(?=[\\s"']|$)`);
-    const token = new RegExp(`(?:^|[\\s"'=])${escapeRegExp(pkg)}(${escapeRegExp(separator)}\\S*|(?=[\\s"']|$))`, 'g');
-    for (const command of headLines.flatMap((line) => line.split(/&&|\|\||;|\|/))) {
-      const verb = /\b(?:install|i|add)\b/.exec(command);
-      for (const match of command.matchAll(token)) {
-        const rest = match[1] ?? '';
-        const versioned = rest.startsWith(separator);
-        if (!versioned && (!verb || match.index < verb.index)) continue;
-        if (!versioned || !pinned.test(rest.slice(separator.length))) {
-          problems.push(
-            `container/Dockerfile installs ${pkg} as ${pkg}${rest.replace(/["']+$/, '')}; install it as ${pkg}${separator}\${${tool.arg}}`,
-          );
+    const ref = `(?:\\$\\{${tool.arg}\\}|\\$${tool.arg}\\b)`;
+    const commands = headLines.flatMap((line) => line.split(/&&|\|\||;|\|/));
+    if (kind === 'npm') {
+      const pinned = new RegExp(`^["']?${ref}["']?(?=[\\s"']|$)`);
+      const token = new RegExp(`(?:^|[\\s"'=])${escapeRegExp(pkg)}(@\\S*|(?=[\\s"']|$))`, 'g');
+      for (const command of commands) {
+        const verb = /\b(?:install|i|add)\b/.exec(command);
+        for (const match of command.matchAll(token)) {
+          const rest = match[1] ?? '';
+          const versioned = rest.startsWith('@');
+          if (!versioned && (!verb || match.index < verb.index)) continue;
+          if (!versioned || !pinned.test(rest.slice(1))) {
+            problems.push(
+              `container/Dockerfile installs ${pkg} as ${pkg}${rest.replace(/["']+$/, '')}; install it as ${pkg}@\${${tool.arg}}`,
+            );
+          }
+        }
+      }
+      continue;
+    }
+    const normalize = (name: string): string => name.toLowerCase().replace(/[-_.]+/g, '-');
+    const pinned = new RegExp(`^(?:\\[[^\\]]*\\])?==${ref}$`);
+    for (const command of commands) {
+      const verb = /\binstall\b/.exec(command);
+      if (!verb) continue;
+      for (const raw of command.slice(verb.index).split(/\s+/)) {
+        const token = raw.replace(/^["']+|["']+$/g, '');
+        const name = /^[A-Za-z0-9][A-Za-z0-9._-]*/.exec(token)?.[0];
+        if (!name || normalize(name) !== normalize(pkg)) continue;
+        if (!pinned.test(token.slice(name.length))) {
+          problems.push(`container/Dockerfile installs ${pkg} as ${token}; install it as ${pkg}==\${${tool.arg}}`);
         }
       }
     }
@@ -783,13 +941,14 @@ export function runCheck(root: string, base: string): GateResult {
     changedFiles.map(patchedPackage).filter((name): name is string => name !== null),
   );
   const repatched = new Set(changes.filter((change) => change.from === change.to).map((change) => change.name));
+  const moves = liveMoves(liveAtEitherEnd(baseRegistry, registry), baseLocked, head, repatched);
   const result = changeProblems(
     registry,
     runtimeReach(registry, head.dependsOn),
-    changes,
+    withRepoints(changes, consumerMoves(baseLocked, head), moves, head),
     ledger,
     exists,
-    liveMoves(registry, baseLocked, head, repatched),
+    moves,
     baseRegistry,
   );
   return {
