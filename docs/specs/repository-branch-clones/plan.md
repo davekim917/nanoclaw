@@ -495,7 +495,8 @@ so it stays private, and its `convert-mismatch` now names that path rather than
 The hidden lockfile `.package-lock.json` is checked like any other file but is **never
 hardlinked**. npm rewrites it in place on every reify (`@npmcli/arborist` `reify.js:254` →
 `shrinkwrap.js:1164`), and on a read-only shared inode npm unlinks it instead. Every farm and
-adopted source therefore keeps its own writable copy, with its mtime preserved (rev 2.2).
+adopted source therefore keeps its own writable copy, with its mtime preserved (rev 2.2). A
+convert may raise it so that rule 3 still holds in the farm (§5.7.4, rev 2.8).
 
 An **inventory** is the sorted list of `(relative path, type, size)` for every regular file and
 symlink, private dot entries excluded. A **content manifest** adds each item's sha256 (for a
@@ -529,9 +530,12 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   `convert-mismatch` detail names. On any mismatch the tree is kept private, with a WARN and a
   `convert-mismatch` count. Otherwise:
   1. link the entry to `<pkg>/.node_modules.nanoclaw-new`, then replace each per-install file
-     whose bytes differ with a hard link to the workspace's own (rev 2.8). This dir holds shared
-     farm links, a copy of the entry's hidden lockfile, and links to inodes `node_modules` still
-     holds, so deleting it never loses private bytes;
+     whose bytes differ with a hard link to the workspace's own (rev 2.8). Then, when any kept
+     file or the entry's hidden lockfile is newer than the farm's hidden lockfile, raise that
+     lockfile's mtime at least a whole millisecond past the newest, so no farm file is newer than
+     it (rule 3); bytes are never changed. This dir holds shared farm links, a hidden lockfile
+     (the entry's copy or the workspace's own), and links to inodes `node_modules` still holds,
+     so deleting it never loses private bytes;
   2. rename `node_modules` to `<pkg>/.node_modules.nanoclaw-old`;
   3. rename `.new` to `node_modules`;
   4. move each private root dot entry from `.old` into `node_modules`, one rename each;
@@ -541,7 +545,8 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
     yet, because step 4 only runs after step 3.
   - `node_modules` and `.old` both present: finish steps 4 and 5. If a private name already exists
     in `node_modules`, keep `.old`, WARN, and stop.
-  - `.new` present and `node_modules` present: delete `.new` (farm links only).
+  - `.new` present and `node_modules` present: delete `.new` (farm links, and links to inodes
+    `node_modules` holds).
   - `.new` present, `node_modules` missing, `.old` missing: rename `.new` to `node_modules` only
     if its inventory equals a verified entry's, otherwise delete it. A crash mid-link must never
     publish a half-built farm. With no fingerprint this case is skipped, with a WARN.
@@ -840,7 +845,7 @@ the action payload and response shapes (§5.2), and `nanoclaw-checkout.json` (§
 | P1-23 | `the 2-day delete never removes node_modules beside a pending conversion, in any flag mode` | An aged idle topic's package dir holds `.node_modules.nanoclaw-old` with a private sentinel, next to a `node_modules` holding a moved private sentinel, and recovery is blocked. With the flag at `apply`, `off`, and `report`, both dirs and both sentinels survive the sweep. `storage-manager` suite. |
 | P1-24 | `a cold-cache report predicts one adopt and converts the rest with estimated bytes` | With two same-key trees, an empty cache, and the flag at `report`, the decisions are 1 adopt and 1 convert with `estimatedBytes > 0`, and nothing on disk changes. |
 | P1-26 | `content reads count against the per-pass cap and an unchanged mismatched tree is not re-read` | With 7 trees whose inventory matches the entry but whose bytes differ, pass 1 reports `contentReads` of 5 and 2 `deferred`. Pass 2 reads only the 2 unread trees (`contentReads` 2). Pass 3 reads 0. After one tree's hidden lockfile mtime changes, pass 4 reads that tree alone. |
-| P1-27 | `converts a tree whose install-script outputs and hidden lockfile differ, keeping its own copies of those` | Rev 2.8. Two same-key trees differ only in an install-script package's node-gyp `Makefile` and `config.gypi` (each embeds its checkout's path), esbuild's `bin/esbuild` (binary in the entry, shim in the tree), and the hidden lockfile's formatting. The tree converts. Those four files keep the tree's own inode and bytes, every other file shares the entry's inode, the entry's bytes are unchanged, and the next pass sees a farm. |
+| P1-27 | `converts a tree whose install-script outputs and hidden lockfile differ, keeping its own copies of those` | Rev 2.8. Two same-key trees differ only in an install-script package's node-gyp `Makefile` and `config.gypi` (each embeds its checkout's path), esbuild's `bin/esbuild` (binary in the entry, shim in the tree), and the hidden lockfile's formatting. The tree converts. Those four files keep the tree's own inode and bytes, every other file shares the entry's inode, the entry's bytes are unchanged, and the next pass sees a farm. A second fixture, installed after the source with a hidden lockfile identical to the entry's, keeps only its build outputs. In both, no farm file is newer than the farm's hidden lockfile. |
 | P1-28 | `a convert keeping its own per-install files survives a crash after <step> with those bytes intact` | Rev 2.8. For `link-new`, `rename-old` and `rename-new`, recovery leaves the tree's own per-install files at their original inode and bytes, and the same pass ends with that farm. |
 | P1-29 | `keeps private a tree installed with --ignore-scripts, naming its first real difference` | Rev 2.8. The entry holds bcrypt's binding and no `cpu-features`, and the tree the reverse. The tree is untouched, and the `convert-mismatch` detail is `bcrypt/lib/binding/napi-v3/bcrypt_lib.node`, not `.package-lock.json`. |
 | P1-25 | `an npm-style rewrite of the hidden lockfile keeps a farm a farm and leaves the entry untouched` | After unlinking and rewriting `node_modules/.package-lock.json` in a farm, the package dir is still detected as a farm, and the entry's hidden lockfile bytes and inode are unchanged. |
