@@ -5,6 +5,7 @@
  *   pnpm exec tsx scripts/dependency-gate.ts check [--base <rev>]   (default base: merge-base HEAD origin/main)
  */
 import fs from 'fs';
+import { builtinModules } from 'module';
 import path from 'path';
 
 import ts from 'typescript';
@@ -489,6 +490,13 @@ const names = (spec: string, packages: string[]): boolean =>
   packages.some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`));
 
 const MOCKS = /^(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)$/;
+const STUBS = /^(?:vi|jest)\.stubGlobal$/;
+/** Globals a live-path test's transport runs on; stubbing one fakes the wire as surely as mocking a module. */
+const TRANSPORT_GLOBALS = new Set(['fetch', 'WebSocket', 'XMLHttpRequest']);
+
+/** A package name rather than a repo module or a Node builtin. */
+const barePackage = (spec: string): boolean =>
+  !spec.startsWith('.') && !spec.startsWith('node:') && !builtinModules.includes(spec.split('/')[0]!);
 
 /**
  * What a test file loads at runtime and what it mocks, from the TypeScript parser, so an import inside a comment or a
@@ -515,6 +523,9 @@ function moduleUse(file: string, text: string): { imports: string[]; mocks: Arra
         if (spec) imports.push(spec);
       } else if (MOCKS.test(callee)) {
         mocks.push(literal(node.arguments[0]));
+      } else if (STUBS.test(callee)) {
+        const name = literal(node.arguments[0]);
+        if (name === null || TRANSPORT_GLOBALS.has(name)) mocks.push(null);
       }
     }
     ts.forEachChild(node, visit);
@@ -531,18 +542,24 @@ function vitestSetupFiles(read: (file: string) => string | null): string[] {
 }
 
 /**
- * Whether a test loads one of `packages` without mocking it. A mock in any repo module the test reaches through
+ * Whether a test loads one of `packages` without faking them. A mock in any repo module the test reaches through
  * relative imports, or in vitest's setup files, applies to the test, so every one is read; a module mocked anywhere
- * does not count as loading what it imports. A name-only check would accept a placeholder test; this cheap floor
- * refuses one that never touches the libraries on its path.
+ * does not count as loading what it imports. The test and its modules may mock no package at all, since the library
+ * beneath a live package is its wire, nor stub a transport global; the setup files, shared by every test, may not
+ * mock the path's own packages. A name-only check would accept a placeholder test; this cheap floor refuses one that
+ * never touches the libraries on its path.
  */
 function testLoads(test: string, packages: string[], read: (file: string) => string | null): boolean {
   if (read(test) === null) return false;
   const local = (from: string, spec: string): string =>
     path.posix.join(path.posix.dirname(from), spec).replace(/\.js$/, '.ts');
-  const walk = (skip: Set<string>, visit: (file: string, use: ReturnType<typeof moduleUse>) => void): void => {
+  const walk = (
+    roots: string[],
+    skip: Set<string>,
+    visit: (file: string, use: ReturnType<typeof moduleUse>) => void,
+  ): void => {
     const seen = new Set<string>();
-    const queue = [...vitestSetupFiles(read), test];
+    const queue = [...roots];
     while (queue.length > 0) {
       const file = queue.shift()!;
       if (seen.has(file) || skip.has(file)) continue;
@@ -554,17 +571,30 @@ function testLoads(test: string, packages: string[], read: (file: string) => str
       for (const spec of use.imports) if (spec.startsWith('.')) queue.push(local(file, spec));
     }
   };
+  const setup = vitestSetupFiles(read);
   const mocked = new Set<string>();
-  let mocksPath = false;
-  walk(new Set(), (file, { mocks }) => {
-    for (const spec of mocks) {
-      if (spec === null || names(spec, packages)) mocksPath = true;
-      else if (spec.startsWith('.')) mocked.add(local(file, spec));
-    }
-  });
-  if (mocksPath) return false;
+  let fake = false;
+  const collect =
+    (refuses: (spec: string) => boolean) =>
+    (file: string, { mocks }: ReturnType<typeof moduleUse>): void => {
+      for (const spec of mocks) {
+        if (spec === null || refuses(spec)) fake = true;
+        else if (spec.startsWith('.')) mocked.add(local(file, spec));
+      }
+    };
+  walk(
+    setup,
+    new Set(),
+    collect((spec) => names(spec, packages)),
+  );
+  walk(
+    [test],
+    new Set(setup),
+    collect((spec) => names(spec, packages) || barePackage(spec)),
+  );
+  if (fake) return false;
   let loads = false;
-  walk(mocked, (_file, { imports }) => {
+  walk([...setup, test], mocked, (_file, { imports }) => {
     if (imports.some((spec) => names(spec, packages))) loads = true;
   });
   return loads;
@@ -599,8 +629,9 @@ function reachable(locked: Locked, source: Source, seeds: string[]): Set<string>
  * at the head and did not at the base, or a re-patched package it loads. Exact versions, so a copy only something else
  * loads never blocks a live path, and a version swap beneath a live package always does. A consumer moved onto a
  * version already in the closure leaves the closure's set unchanged, so each repoint is also judged on its own: a
- * consumer under a live package, or a project loading the live package itself, that switched versions. A new edge
- * onto a version the live package already loaded adds no code to its path; every switch beneath it is its own repoint.
+ * consumer under a live package, or a project loading the live package itself, that switched versions or gained an
+ * edge. A project's new edge onto a version the live package already loaded adds nothing to its path; a package's new
+ * edge can still switch on code an optional peer gates. Every switch beneath it is its own repoint.
  */
 export function liveMoves(
   registry: Registry,
@@ -627,7 +658,8 @@ export function liveMoves(
         for (const move of list) {
           const under = move.consumer.startsWith('importer:') ? name === root : within.has(move.consumer);
           if (!under) continue;
-          if (move.from !== 'none' || !before.has(`${name}@${move.to}`)) add(tree(moves, source), name, root);
+          const projectEdge = move.from === 'none' && move.consumer.startsWith('importer:');
+          if (!projectEdge || !before.has(`${name}@${move.to}`)) add(tree(moves, source), name, root);
           for (const node of reachable(head, source, [`${name}@${move.to}`])) {
             const moved = splitSpec(node)?.[0];
             if (moved && !moved.startsWith('@types/') && !before.has(node)) add(tree(moves, source), moved, root);
@@ -824,6 +856,16 @@ export interface GateResult {
   warnings: string[];
 }
 
+/** A test counts for a path only when the base and the head both list it: one dropped in this change no longer does. */
+function testsListedByBoth(base: Registry, head: Registry): Registry {
+  const livePaths: Registry['livePaths'] = {};
+  for (const [id, livePath] of Object.entries(base.livePaths)) {
+    const kept = new Set(head.livePaths[id]?.tests ?? []);
+    livePaths[id] = { ...livePath, tests: livePath.tests.filter((test) => kept.has(test)) };
+  }
+  return { ...base, livePaths };
+}
+
 export function changeProblems(
   registry: Registry,
   reach: Map<Source, Set<string>>,
@@ -833,7 +875,7 @@ export function changeProblems(
   moves: Map<Source, Map<string, Set<string>>>,
   baseRegistry: Registry | null = null,
 ): GateResult {
-  const tests = baseRegistry ?? registry;
+  const tests = baseRegistry ? testsListedByBoth(baseRegistry, registry) : registry;
   const untestedVia = (root: string): string[] => [
     ...new Set([
       ...untestedLivePaths(registry, root, tests),

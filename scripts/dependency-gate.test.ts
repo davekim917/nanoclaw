@@ -130,6 +130,10 @@ const contents: Record<string, string> = {
     "vi.mock(`chat`, () => ({}));\nimport 'chat';\nit('ok', () => {});\n",
   'src/channels/helper-mocked-live-path.test.ts': "import './chat-fake.js';\nimport 'chat';\nit('ok', () => {});\n",
   'src/channels/chat-fake.ts': "vi.mock('chat', () => ({}));\n",
+  'src/channels/transport-mocked-live-path.test.ts':
+    "vi.mock('ws', () => ({}));\nimport { wire } from './chat-wiring.js';\nit('ok', () => wire());\n",
+  'src/channels/fetch-stubbed-live-path.test.ts':
+    "import { wire } from './chat-wiring.js';\nvi.stubGlobal('fetch', () => {});\nit('ok', () => wire());\n",
   'src/router.test.ts': '',
   'package.json': '{}',
 };
@@ -385,6 +389,8 @@ describe('registry', () => {
     ['mocks it through import()', 'src/channels/dynamic-mocked-live-path.test.ts'],
     ['mocks it with a template literal', 'src/channels/template-mocked-live-path.test.ts'],
     ['mocks it in a helper module it imports', 'src/channels/helper-mocked-live-path.test.ts'],
+    ['mocks a transport library beneath its packages', 'src/channels/transport-mocked-live-path.test.ts'],
+    ['stubs the global fetch', 'src/channels/fetch-stubbed-live-path.test.ts'],
   ])('refuses a live-path test that %s', (_label, test) => {
     const placeholder: Registry = {
       ...registry,
@@ -405,6 +411,18 @@ describe('registry', () => {
     expect(registryProblems(registry, directDependencies(files()), withSetup)).toEqual([
       expect.stringContaining('src/channels/chat-live-path.test.ts, which loads none of the packages on that path'),
     ]);
+  });
+
+  it('accepts a setup file that wraps a package off the path, even one the test imports, as the hermeticity guard wraps undici', () => {
+    const withSetup = (file: string): string | null =>
+      file === 'vitest.config.ts'
+        ? "export default { test: { setupFiles: ['src/test-setup.ts'] } };\n"
+        : file === 'src/test-setup.ts'
+          ? "vi.mock('undici', async (importOriginal) => importOriginal());\nexport const allowNetwork = () => {};\n"
+          : file === 'src/channels/chat-live-path.test.ts'
+            ? `import { allowNetwork } from '../test-setup.js';\n${read(file)}`
+            : read(file);
+    expect(registryProblems(registry, directDependencies(files()), withSetup)).toEqual([]);
   });
 
   it('refuses a weaker registry than the base unless a ledger explains it', () => {
@@ -798,6 +816,32 @@ describe('moves the locked version set does not show', () => {
         project(lock, { wrapper: '1.0.0', '@chat-adapter/discord': '4.41.1' }),
       ),
     ).toEqual([]);
+  });
+
+  it('blocks a package under a live package gaining an edge onto a version the closure already loads', () => {
+    const tree = (adapterDeps: Record<string, string>) =>
+      lockOf({
+        '@chat-adapter/discord@4.41.1': adapterDeps,
+        'discord.js@14.27.0': { zod: '4.6.5' },
+        'zod@4.6.5': {},
+      });
+    expect(judge(tree({ 'discord.js': '14.27.0' }), tree({ 'discord.js': '14.27.0', zod: '4.6.5' }))).toEqual(
+      expect.arrayContaining([expect.stringContaining('(loaded by @chat-adapter/discord) is on live I/O path(s)')]),
+    );
+  });
+
+  it('blocks a move beneath a live package when the same change drops the test of its path', () => {
+    const tree = (ws: string) => lockOf({ 'chat@4.41.1': { ws }, 'ws@8.21.0': {}, 'ws@8.22.0': {} });
+    const dropped: Registry = {
+      ...registry,
+      livePaths: { ...registry.livePaths, 'chat-inbound': { description: 'x', tests: [] } },
+    };
+    expect(judge(tree('8.21.0'), tree('8.22.0'), '', registry, registry)).toEqual([]);
+    expect(judge(tree('8.21.0'), tree('8.22.0'), '', registry, dropped)).toEqual([
+      expect.stringContaining(
+        'ws 8.21.0 → 8.22.0 (loaded by chat) is on live I/O path(s) with no real-library test: chat-inbound',
+      ),
+    ]);
   });
 
   it('blocks a consumer under a live package moved onto a version that package already loads elsewhere', () => {
