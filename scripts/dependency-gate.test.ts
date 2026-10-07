@@ -134,6 +134,12 @@ const contents: Record<string, string> = {
     "vi.mock('ws', () => ({}));\nimport { wire } from './chat-wiring.js';\nit('ok', () => wire());\n",
   'src/channels/fetch-stubbed-live-path.test.ts':
     "import { wire } from './chat-wiring.js';\nvi.stubGlobal('fetch', () => {});\nit('ok', () => wire());\n",
+  'src/channels/fetch-spied-live-path.test.ts':
+    "import { wire } from './chat-wiring.js';\nvi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response());\nit('ok', () => wire());\n",
+  'src/channels/fetch-assigned-live-path.test.ts':
+    "import { wire } from './chat-wiring.js';\nglobalThis.fetch = vi.fn();\nit('ok', () => wire());\n",
+  'src/channels/https-mocked-live-path.test.ts':
+    "vi.mock('node:https');\nimport { wire } from './chat-wiring.js';\nit('ok', () => wire());\n",
   'src/router.test.ts': '',
   'package.json': '{}',
 };
@@ -391,6 +397,9 @@ describe('registry', () => {
     ['mocks it in a helper module it imports', 'src/channels/helper-mocked-live-path.test.ts'],
     ['mocks a transport library beneath its packages', 'src/channels/transport-mocked-live-path.test.ts'],
     ['stubs the global fetch', 'src/channels/fetch-stubbed-live-path.test.ts'],
+    ['spies on the global fetch', 'src/channels/fetch-spied-live-path.test.ts'],
+    ['reassigns the global fetch', 'src/channels/fetch-assigned-live-path.test.ts'],
+    ['mocks a network builtin', 'src/channels/https-mocked-live-path.test.ts'],
   ])('refuses a live-path test that %s', (_label, test) => {
     const placeholder: Registry = {
       ...registry,
@@ -413,12 +422,12 @@ describe('registry', () => {
     ]);
   });
 
-  it('accepts a setup file that wraps a package off the path, even one the test imports, as the hermeticity guard wraps undici', () => {
+  it('accepts a setup file that wraps a package off the path and fetch, even one the test imports, as the hermeticity guard does', () => {
     const withSetup = (file: string): string | null =>
       file === 'vitest.config.ts'
         ? "export default { test: { setupFiles: ['src/test-setup.ts'] } };\n"
         : file === 'src/test-setup.ts'
-          ? "vi.mock('undici', async (importOriginal) => importOriginal());\nexport const allowNetwork = () => {};\n"
+          ? "vi.mock('undici', async (importOriginal) => importOriginal());\nglobalThis.fetch = guard(globalThis.fetch);\nexport const allowNetwork = () => {};\n"
           : file === 'src/channels/chat-live-path.test.ts'
             ? `import { allowNetwork } from '../test-setup.js';\n${read(file)}`
             : read(file);
@@ -838,6 +847,20 @@ describe('moves the locked version set does not show', () => {
     };
     expect(judge(tree('8.21.0'), tree('8.22.0'), '', registry, registry)).toEqual([]);
     expect(judge(tree('8.21.0'), tree('8.22.0'), '', registry, dropped)).toEqual([
+      expect.stringContaining(
+        'ws 8.21.0 → 8.22.0 (loaded by chat) is on live I/O path(s) with no real-library test: chat-inbound',
+      ),
+    ]);
+  });
+
+  it('blocks a move beneath a tested path when the same change drops its test and reclassifies the parent', () => {
+    const tree = (ws: string) => lockOf({ 'chat@4.41.1': { ws }, 'ws@8.21.0': {}, 'ws@8.22.0': {} });
+    const weakened: Registry = {
+      livePaths: { ...registry.livePaths, 'chat-inbound': { description: 'x', tests: [] } },
+      packages: { ...registry.packages, chat: { kind: 'runtime' } },
+    };
+    const text = 'Reclassified: chat · not live\nReclassified: chat-inbound · test retired\n';
+    expect(judge(tree('8.21.0'), tree('8.22.0'), text, registry, weakened)).toEqual([
       expect.stringContaining(
         'ws 8.21.0 → 8.22.0 (loaded by chat) is on live I/O path(s) with no real-library test: chat-inbound',
       ),

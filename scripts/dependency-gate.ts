@@ -491,22 +491,35 @@ const names = (spec: string, packages: string[]): boolean =>
 
 const MOCKS = /^(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)$/;
 const STUBS = /^(?:vi|jest)\.stubGlobal$/;
+const SPIES = /^(?:vi|jest)\.spyOn$/;
 /** Globals a live-path test's transport runs on; stubbing one fakes the wire as surely as mocking a module. */
 const TRANSPORT_GLOBALS = new Set(['fetch', 'WebSocket', 'XMLHttpRequest']);
 
-/** A package name rather than a repo module or a Node builtin. */
-const barePackage = (spec: string): boolean =>
-  !spec.startsWith('.') && !spec.startsWith('node:') && !builtinModules.includes(spec.split('/')[0]!);
+/** Node builtins that carry network traffic; mocking one fakes the wire like mocking a package. */
+const NETWORK_BUILTINS = new Set(['dgram', 'dns', 'http', 'http2', 'https', 'net', 'tls']);
+
+/** A package name, or a network builtin, rather than a repo module or another Node builtin. */
+const barePackage = (spec: string): boolean => {
+  if (spec.startsWith('.')) return false;
+  const base = spec.replace(/^node:/, '').split('/')[0]!;
+  return NETWORK_BUILTINS.has(base) || (!spec.startsWith('node:') && !builtinModules.includes(base));
+};
+
+const GLOBAL_OBJECTS = new Set(['globalThis', 'global', 'window']);
 
 /**
  * What a test file loads at runtime and what it mocks, from the TypeScript parser, so an import inside a comment or a
  * string does not count. A type-only import loads nothing. A mock whose target is not a plain string cannot be
  * judged, so it is recorded as `null` and treated as mocking everything.
  */
-function moduleUse(file: string, text: string): { imports: string[]; mocks: Array<string | null> } {
+function moduleUse(
+  file: string,
+  text: string,
+): { imports: string[]; mocks: Array<string | null>; fakesTransport: boolean } {
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const imports: string[] = [];
   const mocks: Array<string | null> = [];
+  let fakesTransport = false;
   const literal = (node: ts.Node | undefined): string | null =>
     node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) ? node.text : null;
   const visit = (node: ts.Node): void => {
@@ -525,13 +538,27 @@ function moduleUse(file: string, text: string): { imports: string[]; mocks: Arra
         mocks.push(literal(node.arguments[0]));
       } else if (STUBS.test(callee)) {
         const name = literal(node.arguments[0]);
-        if (name === null || TRANSPORT_GLOBALS.has(name)) mocks.push(null);
+        if (name === null || TRANSPORT_GLOBALS.has(name)) fakesTransport = true;
+      } else if (SPIES.test(callee)) {
+        const target = node.arguments[0];
+        const name = literal(node.arguments[1]);
+        if (target && GLOBAL_OBJECTS.has(target.getText(source)) && (name === null || TRANSPORT_GLOBALS.has(name))) {
+          fakesTransport = true;
+        }
       }
+    } else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isPropertyAccessExpression(node.left) &&
+      GLOBAL_OBJECTS.has(node.left.expression.getText(source)) &&
+      TRANSPORT_GLOBALS.has(node.left.name.text)
+    ) {
+      fakesTransport = true;
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return { imports, mocks };
+  return { imports, mocks, fakesTransport };
 }
 
 /** The setup files vitest loads before every test file, which can mock a module for all of them. */
@@ -544,8 +571,8 @@ function vitestSetupFiles(read: (file: string) => string | null): string[] {
 /**
  * Whether a test loads one of `packages` without faking them. A mock in any repo module the test reaches through
  * relative imports, or in vitest's setup files, applies to the test, so every one is read; a module mocked anywhere
- * does not count as loading what it imports. The test and its modules may mock no package at all, since the library
- * beneath a live package is its wire, nor stub a transport global; the setup files, shared by every test, may not
+ * does not count as loading what it imports. The test and its modules may mock no package or network builtin, since
+ * the library beneath a live package is its wire, nor stub, spy on or reassign a transport global; the setup files, shared by every test, may not
  * mock the path's own packages. A name-only check would accept a placeholder test; this cheap floor refuses one that
  * never touches the libraries on its path.
  */
@@ -575,8 +602,9 @@ function testLoads(test: string, packages: string[], read: (file: string) => str
   const mocked = new Set<string>();
   let fake = false;
   const collect =
-    (refuses: (spec: string) => boolean) =>
-    (file: string, { mocks }: ReturnType<typeof moduleUse>): void => {
+    (refuses: (spec: string) => boolean, transport: boolean) =>
+    (file: string, { mocks, fakesTransport }: ReturnType<typeof moduleUse>): void => {
+      if (transport && fakesTransport) fake = true;
       for (const spec of mocks) {
         if (spec === null || refuses(spec)) fake = true;
         else if (spec.startsWith('.')) mocked.add(local(file, spec));
@@ -585,12 +613,12 @@ function testLoads(test: string, packages: string[], read: (file: string) => str
   walk(
     setup,
     new Set(),
-    collect((spec) => names(spec, packages)),
+    collect((spec) => names(spec, packages), false),
   );
   walk(
     [test],
     new Set(setup),
-    collect((spec) => names(spec, packages) || barePackage(spec)),
+    collect((spec) => names(spec, packages) || barePackage(spec), true),
   );
   if (fake) return false;
   let loads = false;
@@ -879,7 +907,7 @@ export function changeProblems(
   const untestedVia = (root: string): string[] => [
     ...new Set([
       ...untestedLivePaths(registry, root, tests),
-      ...(baseRegistry ? untestedLivePaths(baseRegistry, root) : []),
+      ...(baseRegistry ? untestedLivePaths(baseRegistry, root, tests) : []),
     ]),
   ];
   const result: GateResult = { problems: [...ledger.problems], warnings: [] };
