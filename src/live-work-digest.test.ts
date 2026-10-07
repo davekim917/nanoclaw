@@ -106,7 +106,7 @@ describe('buildLiveWorkDigest', () => {
       items: [
         { text: 'Seed reviewed', status: 'done' },
         { text: 'Rebuild APK', status: 'pending' },
-        { text: 'Deploy web', status: 'waiting', waitingOn: 'bo' },
+        { text: 'Deploy web', status: 'waiting', waitingOn: 'kit' },
         { text: 'Provision QA', status: 'in_progress' },
         { text: 'Post logins', status: 'pending' },
       ],
@@ -131,12 +131,12 @@ describe('buildLiveWorkDigest', () => {
     await session('sess-corrupt', 'slack:CBUILD:5.000');
     fs.writeFileSync(outboundDbPath(AG, 'sess-corrupt'), 'not a database');
 
-    claim('qa-env', liveClaim('bo', 'slack:CBUILD:2.000'));
+    claim('qa-env', liveClaim('kit', 'slack:CBUILD:2.000'));
     claim('other-build', liveClaim('ava'));
     claim('here', liveClaim('ava', MY_THREAD));
-    claim('old', { ...liveClaim('bo', 'slack:CBUILD:6.000'), claimed_at: '2020-01-01T00:00:00Z' });
-    claim('held', { ...liveClaim('bo', 'slack:CBUILD:7.000'), status: 'paused', paused_at: at(-HOUR) });
-    claim('handoff', { ...liveClaim('bo', 'slack:CBUILD:8.000'), status: 'parked', parked_at: at(-HOUR) });
+    claim('old', { ...liveClaim('kit', 'slack:CBUILD:6.000'), claimed_at: '2020-01-01T00:00:00Z' });
+    claim('held', { ...liveClaim('kit', 'slack:CBUILD:7.000'), status: 'paused', paused_at: at(-HOUR) });
+    claim('handoff', { ...liveClaim('kit', 'slack:CBUILD:8.000'), status: 'parked', parked_at: at(-HOUR) });
 
     const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
 
@@ -158,7 +158,7 @@ describe('buildLiveWorkDigest', () => {
         threadId: 'slack:CBUILD:2.000',
         link: 'https://chat.example/slack:CBUILD:2.000',
         title: 'Acme QA deploy',
-        items: ['✱ Provision QA', '◷ Deploy web (waiting on bo)', '○ Rebuild APK'],
+        items: ['✱ Provision QA', '◷ Deploy web (waiting on kit)', '○ Rebuild APK'],
         updatedAt: at(-30 * 60 * 1000),
       },
     ]);
@@ -241,7 +241,7 @@ describe('buildLiveWorkDigest', () => {
   });
 
   it('caps the claims it carries and counts the rest as omitted', async () => {
-    for (let i = 0; i < LIVE_WORK_BOUNDS.claims + 2; i++) claim(`c-${i}`, liveClaim('bo'));
+    for (let i = 0; i < LIVE_WORK_BOUNDS.claims + 2; i++) claim(`c-${i}`, liveClaim('kit'));
 
     const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
 
