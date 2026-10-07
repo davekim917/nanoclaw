@@ -96,6 +96,12 @@ jobs:
       - name: Ratchets and tripwires
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run ratchet tripwire --maxWorkers=1
+      # Each chat adapter over its real transport library against a local fake of the platform, on every PR: a
+      # dependency bump that changes how a platform event becomes an inbound message fails here, where mocked
+      # adapter tests stay green. Seconds-long and network-free.
+      - name: Live-path adapter tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec vitest run live-path --maxWorkers=1
       # Dead code (knip, host and runner), duplication (jscpd) and prohibited
       # comment forms over the whole tree. Any finding fails the step, as does
       # a check that cannot run. Keep this line identical in host-ci.sh and

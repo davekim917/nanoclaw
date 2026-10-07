@@ -905,7 +905,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     // Raw ids are already resolved to @name here.
     let effectiveMention = isMention;
-    if (effectiveMention && config.refineInboundMention && typeof serialized.text === 'string') {
+    if (effectiveMention && isDM !== true && config.refineInboundMention && typeof serialized.text === 'string') {
       effectiveMention = config.refineInboundMention(serialized.text);
     }
 
