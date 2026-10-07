@@ -153,6 +153,17 @@ if [ -n "$rest" ]; then
       echo 'gh: Not Found (HTTP 404)' >&2
       exit 1
       ;;
+    */contents/*\\?ref=*)
+      # contents--<ref>--<path, each / as __> is any other file at that ref; absent = GitHub's 404.
+      ref="\${rest##*ref=}"
+      file="\${rest#*/contents/}"
+      file="\${file%%\\?ref=*}"
+      src="$MOCK_DIR/contents--$ref--\${file//\\//__}"
+      if [ -f "$src" ]; then cat "$src"; exit 0; fi
+      echo '{"message":"Not Found","status":"404"}'
+      echo 'gh: Not Found (HTTP 404)' >&2
+      exit 1
+      ;;
     */actions/runs/*/attempts/*/jobs\\?*)
       # jobs--<run id>--attempt-<n>.json is that attempt's jobs page. A run
       # with no attempt pages at all is a single-attempt run, and its
@@ -7216,6 +7227,8 @@ describe(
     const INVENTORY_NAME = 'Brannoch Vale';
     const OPT_IN = '{ "commentRule": false, "publicBoundaryScan": true }\n';
     const CLEAN_BASE = { 'README.md': 'Fixture project.\n' };
+    const TITLE = 'feat: route a new message kind';
+    const LEAK = { 'src/fixture.ts': `export const owner = '${INVENTORY_NAME}';\n` };
 
     function isolatedEnv(home: string): Record<string, string> {
       const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
@@ -7223,7 +7236,7 @@ describe(
     }
 
     // A stand-in install: the real scanner and dependencies beside a temp registry and inventory.
-    function fakeInstall(root: string, opts: { inventory?: boolean } = {}): string {
+    function fakeInstall(root: string, opts: { inventory?: string | false; brokenGroup?: boolean } = {}): string {
       const dir = path.join(root, 'install');
       fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
       fs.mkdirSync(path.join(dir, 'data'));
@@ -7239,7 +7252,14 @@ describe(
       db.close();
       if (opts.inventory !== false) {
         fs.mkdirSync(path.join(dir, '.nanoclaw'));
-        fs.writeFileSync(path.join(dir, '.nanoclaw', 'public-boundary-identifiers'), `${INVENTORY_NAME}\n`);
+        fs.writeFileSync(
+          path.join(dir, '.nanoclaw', 'public-boundary-identifiers'),
+          opts.inventory ?? `${INVENTORY_NAME}\n`,
+        );
+      }
+      if (opts.brokenGroup) {
+        fs.mkdirSync(path.join(dir, 'groups', 'fixture-group'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'groups', 'fixture-group', 'container.json'), '{ not json');
       }
       return dir;
     }
@@ -7263,12 +7283,11 @@ describe(
       return result.stdout.trim();
     }
 
-    // The PR's repository as GitHub would serve it: the base commit, then the head the PR would merge.
+    // The PR's repository as GitHub would serve it: a base commit, any earlier PR commits, then the head.
     function prRepository(
       root: string,
       head: Record<string, string>,
-      base: Record<string, string> = CLEAN_BASE,
-      message = 'feat: add the fixture module',
+      opts: { base?: Record<string, string>; earlier?: Record<string, string>[] } = {},
     ): { remote: string; head: string } {
       const remote = path.join(root, 'remote');
       fs.mkdirSync(remote);
@@ -7277,17 +7296,31 @@ describe(
         env: isolatedEnv(remote),
       });
       if (init.status !== 0) throw new Error('fixture init failed');
-      commit(remote, base, 'chore: base');
-      return { remote, head: commit(remote, head, message) };
+      commit(remote, opts.base ?? CLEAN_BASE, 'chore: base');
+      for (const files of opts.earlier ?? []) commit(remote, files, 'wip');
+      return { remote, head: commit(remote, head, 'feat: add the fixture module') };
     }
 
-    // scopeFixture's merge-ready PR (verdict skip, green CI), moved onto the real head commit.
+    // scopeFixture's merge-ready PR (verdict skip, green CI), moved onto the real head commit. `baseFiles` are
+    // served as files at the base commit; `changed` is the file list the comparison reports for the PR.
     function readyPr(
       root: string,
       head: string,
-      opts: { reviewLoop?: string; title?: string; body?: string; message?: string } = {},
+      opts: {
+        reviewLoop?: string;
+        title?: string;
+        body?: string;
+        baseFiles?: Record<string, string>;
+        changed?: string[];
+      } = {},
     ): void {
-      scopeFixture(root, { labels: [], reviewLoop: opts.reviewLoop ?? OPT_IN, title: opts.title, body: opts.body });
+      scopeFixture(root, {
+        labels: [],
+        reviewLoop: opts.reviewLoop ?? OPT_IN,
+        title: opts.title ?? TITLE,
+        body: opts.body,
+        ...(opts.changed ? { files: opts.changed.map((name) => changedFile(name)) } : {}),
+      });
       for (const name of fs.readdirSync(root)) {
         const file = path.join(root, name);
         if (!fs.statSync(file).isFile()) continue;
@@ -7295,15 +7328,15 @@ describe(
         fs.writeFileSync(moved, fs.readFileSync(file, 'utf8').replaceAll(HEAD, head));
         if (moved !== file) fs.rmSync(file);
       }
-      const pr = JSON.parse(fs.readFileSync(path.join(root, 'pr.json'), 'utf8')) as Page;
-      pr.commits = [{ oid: head, messageHeadline: opts.message ?? 'feat: add the fixture module', messageBody: '' }];
-      writeJson(root, 'pr.json', pr);
+      for (const [name, text] of Object.entries(opts.baseFiles ?? {}))
+        fs.writeFileSync(path.join(root, `contents--${BASE_OID}--${name.replaceAll('/', '__')}`), text);
+      writeJson(root, 'pr-merged.json', { state: 'MERGED', mergeCommit: { oid: MERGE_OID } });
     }
 
-    // merge-check with real git and the real scanner; only the PR's GitHub remote is swapped for the fixture.
-    function mergeCheck(root: string, head: string, remote: string, nanoclawDir: string) {
+    // The helper with real git and the real scanner; only the PR's GitHub remote is swapped for the fixture.
+    function runGate(root: string, args: string[], remote: string, nanoclawDir: string) {
       const { bin, calls, sleepLog } = writeMocks(root);
-      fs.rmSync(calls, { force: true });
+      for (const file of [calls, path.join(root, 'merged')]) fs.rmSync(file, { force: true });
       fs.writeFileSync(
         path.join(bin, 'git'),
         `#!/usr/bin/env bash
@@ -7314,7 +7347,7 @@ exec git "$@"
 `,
         { mode: 0o755 },
       );
-      const result = spawnSync('bash', [HELPER, 'merge-check', '--head', head], {
+      const result = spawnSync('bash', [HELPER, ...args], {
         cwd: root,
         encoding: 'utf8',
         timeout: 110_000,
@@ -7336,9 +7369,13 @@ exec git "$@"
       return { ...result, calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '' };
     }
 
+    function mergeCheck(root: string, head: string, remote: string, nanoclawDir: string) {
+      return runGate(root, ['merge-check', '--head', head], remote, nanoclawDir);
+    }
+
     it('refuses a head whose tree adds a listed name, scanning that exact head and never printing the name', () => {
       const root = tempRoot();
-      const { remote, head } = prRepository(root, { 'src/fixture.ts': `export const owner = '${INVENTORY_NAME}';\n` });
+      const { remote, head } = prRepository(root, LEAK);
       readyPr(root, head);
 
       const result = mergeCheck(root, head, remote, fakeInstall(root));
@@ -7350,49 +7387,47 @@ exec git "$@"
       expect(result.calls).toContain(`git fetch -q --no-tags --depth=1 origin ${head}\n`);
     });
 
-    it('lets a clean head through to the rest of the gate', () => {
+    it('lets a clean head through to the rest of the gate, with NANOCLAW_DIR given relative to the caller', () => {
       const root = tempRoot();
       const { remote, head } = prRepository(root, { 'src/fixture.ts': "export const owner = 'Fixture Owner';\n" });
       readyPr(root, head);
+      fakeInstall(root);
 
-      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      const result = mergeCheck(root, head, remote, 'install');
       expect(result.status).toBe(0);
       expect(result.stdout).toMatch(new RegExp(`merge=allowed head=${head} mode=risk-scoped`));
       expect(result.stderr).toContain(`public_boundary: clean at ${head}`);
     });
 
-    it.each<[string, { title?: string; body?: string; message?: string }]>([
-      ['title', { title: `feat: onboard ${REGISTRY_NAME}` }],
-      ['body', { body: `Summary.\n\nRolls out to ${REGISTRY_NAME}.` }],
-      ['commit message', { message: `feat: ${REGISTRY_NAME} fixture` }],
-    ])('refuses a clean tree whose PR %s names a registry name', (where, text) => {
+    // pr-text is the squash commit message: the subject, a blank line, then the body.
+    it.each<[string, { title?: string; body?: string }, number]>([
+      ['title', { title: `feat: onboard ${REGISTRY_NAME}` }, 1],
+      ['body', { body: `Summary.\n\nRolls out to ${REGISTRY_NAME}.` }, 5],
+    ])('refuses a clean tree whose PR %s names a registry name', (_where, text, line) => {
       const root = tempRoot();
-      const { remote, head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' }, CLEAN_BASE, text.message);
+      const { remote, head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
       readyPr(root, head, text);
 
       const result = mergeCheck(root, head, remote, fakeInstall(root));
       expect(result.status).toBe(24);
-      // pr-text is the title, branch, body and commit messages, each under a header line.
-      expect(result.stderr).toContain(`pr-text:${where === 'title' ? 2 : 8} private-identifier`);
+      expect(result.stderr).toContain(`pr-text:${line} private-identifier`);
       expect(result.stderr).not.toContain(REGISTRY_NAME);
     });
 
+    const HISTORY = 'docs/history.md';
+    const HELD = { files: { [HISTORY]: 1 } };
+
     it.each([
-      ['holds a pre-existing line the committed baseline records', { 'docs/notes.md': 'Notes.\n' }, 0],
+      ['holds a pre-existing line the base baseline records', { [HISTORY]: `Migrated from ${INVENTORY_NAME}.\n` }, 0],
       [
-        'refuses a second line above the recorded count',
-        { 'docs/history.md': `Migrated from ${INVENTORY_NAME}.\nAnd ${INVENTORY_NAME} again.\n` },
+        'refuses a second line above the base baseline count',
+        { [HISTORY]: `Migrated from ${INVENTORY_NAME}.\nAnd ${INVENTORY_NAME} again.\n` },
         24,
       ],
     ])('%s', (_case, headFiles, status) => {
       const root = tempRoot();
-      const base = {
-        ...CLEAN_BASE,
-        'docs/history.md': `Migrated from ${INVENTORY_NAME}.\n`,
-        '.public-boundary-baseline.json': '{ "files": { "docs/history.md": 1 } }\n',
-      };
-      const { remote, head } = prRepository(root, headFiles, base);
-      readyPr(root, head);
+      const { remote, head } = prRepository(root, headFiles);
+      readyPr(root, head, { baseFiles: { '.public-boundary-baseline.json': JSON.stringify(HELD) } });
 
       const result = mergeCheck(root, head, remote, fakeInstall(root));
       expect(result.status).toBe(status);
@@ -7401,13 +7436,55 @@ exec git "$@"
       );
     });
 
+    // The PR adds its own hit and an exemption for it in the same change; the scan reads the base's copy.
+    it.each([
+      ['baseline', { '.public-boundary-baseline.json': JSON.stringify({ files: { 'src/fixture.ts': 1 } }) }],
+      [
+        'allowlist',
+        {
+          '.public-boundary-allowlist.json': JSON.stringify({
+            entries: [{ path: 'src/fixture.ts', value: INVENTORY_NAME, reason: 'fixture' }],
+          }),
+        },
+      ],
+    ])("refuses a PR that adds its own hit to the head's %s", (_file, exemption) => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, { ...LEAK, ...exemption });
+      readyPr(root, head, { changed: ['src/fixture.ts', ...Object.keys(exemption)] });
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+    });
+
+    it('squash-merges a head whose earlier commit leaked, with exactly the subject and body it scanned', () => {
+      const root = tempRoot();
+      const body = 'Adds the fixture module.\n\nReplaces: nothing';
+      const { remote, head } = prRepository(
+        root,
+        { 'src/fixture.ts': "export const owner = 'Fixture Owner';\n" },
+        { earlier: [LEAK] },
+      );
+      readyPr(root, head, { body });
+      // Every read after the gate's sees a title edited to name a private identifier; the merge must not use it.
+      const pr = JSON.parse(fs.readFileSync(path.join(root, 'pr.json'), 'utf8')) as Page;
+      for (const n of [1, 2, 3, 4]) writeJson(root, `pr-${n}.json`, pr);
+      writeJson(root, 'pr.json', { ...pr, title: `feat: onboard ${REGISTRY_NAME}` });
+
+      const result = runGate(root, ['merge', '--head', head], remote, fakeInstall(root));
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merged pr=1 head=${head} method=squash commit=${MERGE_OID}`);
+      expect(result.stderr).toContain('this merge is a squash with the scanned message, not --method merge');
+      expect(result.calls).toContain(
+        `merge-args pr merge 1 --repo example/repository --squash --match-head-commit ${head} --subject ${TITLE} (#1) --body ${body}\n`,
+      );
+      expect(result.calls).not.toContain(REGISTRY_NAME);
+    });
+
     it('reads the flag at the base commit alone, so a PR cannot switch the scan off for itself', () => {
       const root = tempRoot();
       const optOut = '{ "commentRule": false, "publicBoundaryScan": false }\n';
-      const { remote, head } = prRepository(root, {
-        '.github/pr-review-loop.json': optOut,
-        'src/fixture.ts': `export const owner = '${INVENTORY_NAME}';\n`,
-      });
+      const { remote, head } = prRepository(root, { '.github/pr-review-loop.json': optOut, ...LEAK });
       readyPr(root, head);
       for (const ref of ['feat', head]) fs.writeFileSync(path.join(root, `review-loop--${ref}.json`), optOut);
 
@@ -7416,14 +7493,17 @@ exec git "$@"
       expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
     });
 
-    it('skips the scan where the base does not turn it on', () => {
+    it('skips the scan, and merges by the method asked, where the base does not turn it on', () => {
       const root = tempRoot();
-      const { remote, head } = prRepository(root, { 'src/fixture.ts': `export const owner = '${INVENTORY_NAME}';\n` });
+      const { remote, head } = prRepository(root, LEAK);
       readyPr(root, head, { reviewLoop: '{ "commentRule": false }\n' });
 
-      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      const result = runGate(root, ['merge', '--head', head], remote, fakeInstall(root));
       expect(result.status).toBe(0);
       expect(result.calls).not.toContain('git fetch');
+      expect(result.calls).toContain(
+        `merge-args pr merge 1 --repo example/repository --merge --match-head-commit ${head}\n`,
+      );
     });
 
     it.each([
@@ -7448,6 +7528,16 @@ exec git "$@"
         },
         'the public-boundary scan gave no verdict',
       ],
+      [
+        'the scanner exits 1 for an unreadable identifier source, not a finding',
+        (root: string) => fakeInstall(root, { brokenGroup: true }),
+        'the public-boundary scan gave no verdict',
+      ],
+      [
+        'the scanner cannot run (exit 2)',
+        (root: string) => fakeInstall(root, { inventory: '# no names\n' }),
+        'the public-boundary scan gave no verdict',
+      ],
     ])('gives no verdict when %s', (_case, install, message) => {
       const root = tempRoot();
       const { remote, head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
@@ -7458,6 +7548,17 @@ exec git "$@"
       expect(result.stderr).toContain(message);
       expect(result.stderr).toContain(`merge=error head=${head}:`);
       expect(result.stdout).not.toContain('merge=allowed');
+    });
+
+    it('gives no verdict when the head cannot be fetched', () => {
+      const root = tempRoot();
+      const { head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
+      readyPr(root, head);
+
+      const result = mergeCheck(root, head, path.join(root, 'no-such-remote'), fakeInstall(root));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`could not fetch ${head} from example/repository`);
+      expect(result.stderr).toContain(`merge=error head=${head}: the public-boundary scan gave no verdict`);
     });
   },
 );

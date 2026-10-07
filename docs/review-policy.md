@@ -186,15 +186,26 @@ approach is wrong); anything else is a finding to cut.
 
 In a repo whose base branch sets `"publicBoundaryScan": true` in
 `.github/pr-review-loop.json`, merge-check also runs the install's
-`scripts/check-public-boundary.ts` over exactly the head it is asked to merge,
-as the pre-push hook scans a pushed commit (its tree, with the allowlist and
-baseline it commits), and over the PR title, branch, body and commit messages.
-A private identifier refuses the merge (exit 24); the fix is a fictional value
-in a new head, or an edited title or body. The scan needs the install's
-registry and identifier inventory, which only the host has: merge-check run
-where they are missing (an agent container, a scratch extraction without
-`NANOCLAW_DIR` naming the install) gives no verdict rather than passing.
-`audit` does not re-run it, since a GitHub runner has no identifier list.
+`scripts/check-public-boundary.ts` over exactly the head it is asked to merge
+(its tree, as the pre-push hook scans a pushed commit) and over the squash
+commit message the merge would publish: the PR title with ` (#<n>)`, then its
+body. A private identifier refuses the merge (exit 24); the fix is a fictional
+value in a new head, or an edited title or body. The scan's exemptions, the
+baseline and allowlist, are read from the base branch, never the head, so a
+PR's own entry never exempts its own hit; a PR that adds an exemption for a
+name it publishes cannot pass the gate and is reviewed and merged by hand.
+
+In such a repo `codex-review.sh merge` always squash-merges, with exactly the
+subject and body it scanned. A merge commit would carry every intermediate
+commit's tree and message into the base, and GitHub's default message would
+re-read a title edited after the scan.
+
+The scan needs the install's registry and identifier inventory, which only the
+host has: merge-check run where they are missing (an agent container, a scratch
+extraction without `NANOCLAW_DIR` naming the install) gives no verdict rather
+than passing. `audit` does not re-run it, since a GitHub runner has no
+identifier list; the host's daily scan of main (`scripts/check-remote-boundary.ts`)
+catches a merge that went around the gate.
 
 ## The test is blocking, not correctness
 

@@ -22,7 +22,8 @@
 #   codex-review.sh merge-check [--head <sha>]
 #                                             # exit 0 only when merging exactly that head is allowed
 #   codex-review.sh merge --head <sha> [--method merge|squash]
-#                                             # risk-scoped repos' only merge path: merge-check, then gh pr merge on its exit 0 alone
+#                                             # risk-scoped repos' only merge path: merge-check, then gh pr merge on its exit 0 alone;
+#                                             # where the public-boundary scan is on, always a squash with the message it scanned
 #   codex-review.sh audit                     # a merged PR as of its merge, by the merge-check rules of THIS copy; exit 28 = it bypassed the gate
 #                                             # (review-thread resolution alone is read as it stands now; see the audit arm)
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
@@ -805,9 +806,11 @@ comment_rule_gate() {
 PUBLIC_BOUNDARY_NEEDS=(scripts/check-public-boundary.ts node_modules/.bin/tsx data/v2.db .nanoclaw/public-boundary-identifiers)
 
 # The install whose scanner and private identifier list the public-boundary
-# scan uses: NANOCLAW_DIR, else the checkout this copy of the script sits in.
+# scan uses, as an absolute path: NANOCLAW_DIR, else the checkout this copy of
+# the script sits in. A directory that does not exist is printed as given.
 public_boundary_install() {
-  printf '%s' "${NANOCLAW_DIR:-$(cd "$HERE/../../../.." && pwd)}"
+  local dir="${NANOCLAW_DIR:-$HERE/../../../..}"
+  (cd "$dir" 2>/dev/null && pwd) || printf '%s' "$dir"
 }
 
 # 0 clean, 1 a finding, 2 no verdict, for one run of the scanner: its exit 1
@@ -821,19 +824,23 @@ public_boundary_verdict() {
   return 2
 }
 
-# Scans head $2 with the scanner and identifier list in install $1, as
-# .husky/pre-push scans a pushed commit: its tree with the allowlist and baseline
-# it commits, then the text a merge publishes beside it, the PR title, branch,
-# body and commit messages, as the file pr-text. Prints the scanner's redacted
-# report and returns public_boundary_verdict's code, the worst of the two.
+# Scans head $2 with the scanner and identifier list in install $1: its tree, as
+# .husky/pre-push scans a pushed commit but with the base's baseline $3 and
+# allowlist $4, then the squash commit message the merge publishes, subject $5
+# and body $6, as the file pr-text. Prints the scanner's redacted report and
+# returns public_boundary_verdict's code, the worse of the two.
 public_boundary_run() {
-  local install="$1" head="$2" dir pr report tree=0 text=0 worst=0 status
+  local install="$1" head="$2" dir report tree=0 text=0 worst=0 status=0
   local -a scan=(nice -n 10)
   command -v ionice >/dev/null 2>&1 && scan=(ionice -c3 nice -n 10)
-  scan+=("$install/node_modules/.bin/tsx" "$install/scripts/check-public-boundary.ts"
-    --db "$install/data/v2.db" --identifiers "$install/.nanoclaw/public-boundary-identifiers")
   PUBLIC_BOUNDARY_DIR=$(mktemp -d)
   trap 'rm -rf "$PUBLIC_BOUNDARY_DIR"' EXIT
+  printf '%s\n' "$3" > "$PUBLIC_BOUNDARY_DIR/baseline.json"
+  printf '%s\n' "$4" > "$PUBLIC_BOUNDARY_DIR/allowlist.json"
+  printf '%s\n\n%s\n' "$5" "$6" > "$PUBLIC_BOUNDARY_DIR/pr-text"
+  scan+=("$install/node_modules/.bin/tsx" "$install/scripts/check-public-boundary.ts"
+    --db "$install/data/v2.db" --identifiers "$install/.nanoclaw/public-boundary-identifiers"
+    --allowlist "$PUBLIC_BOUNDARY_DIR/allowlist.json")
   dir="$PUBLIC_BOUNDARY_DIR/head"
   export GIT_TERMINAL_PROMPT=0
   {
@@ -846,38 +853,36 @@ public_boundary_run() {
     echo "could not fetch $head from $REPO"
     return 2
   }
-  git -C "$dir" show "$head:.public-boundary-allowlist.json" > "$PUBLIC_BOUNDARY_DIR/allowlist.json" 2>/dev/null ||
-    printf '{"entries": []}\n' > "$PUBLIC_BOUNDARY_DIR/allowlist.json"
-  pr=$(gh pr view "$PR" --repo "$REPO" --json title,body,headRefName,commits) || {
-    echo "could not read the PR's title, body and commits"
-    return 2
-  }
-  printf '%s' "$pr" | jq -r --arg head "$head" '
-    if (.commits | last | .oid) != $head then error("the PR commits do not end at \($head)")
-    else "# title", .title, "# branch", .headRefName, "# body", (.body // ""),
-      (.commits[] | "# commit \(.oid[0:12])", .messageHeadline, (.messageBody // ""))
-    end' > "$PUBLIC_BOUNDARY_DIR/pr-text" || {
-    echo "could not read the PR's commits up to $head"
-    return 2
-  }
-  report=$(cd "$install" && "${scan[@]}" --root "$dir" --index 2>&1 </dev/null) || tree=$?
+  report=$(cd "$install" && "${scan[@]}" --root "$dir" --index --baseline "$PUBLIC_BOUNDARY_DIR/baseline.json" 2>&1 </dev/null) || tree=$?
   printf '%s\n' "$report"
   public_boundary_verdict "$tree" "$report" || worst=$?
-  report=$(cd "$install" && "${scan[@]}" --root "$dir" --message "$PUBLIC_BOUNDARY_DIR/pr-text" --message-raw \
-    --allowlist "$PUBLIC_BOUNDARY_DIR/allowlist.json" 2>&1 </dev/null) || text=$?
+  report=$(cd "$install" && "${scan[@]}" --root "$dir" --message "$PUBLIC_BOUNDARY_DIR/pr-text" --message-raw 2>&1 </dev/null) || text=$?
   printf '%s\n' "$report"
-  status=0
   public_boundary_verdict "$text" "$report" || status=$?
   [ "$status" -gt "$worst" ] && worst=$status
   return "$worst"
 }
 
+# File $1 at the base commit, or the JSON $2 when the base has none. The scan's
+# exemptions come from here, never the head: a PR's own baseline or allowlist
+# entry must not exempt its own hit.
+public_boundary_policy() {
+  local raw status=0
+  raw=$(base_file "$SCOPE_BASE" "$1") || status=$?
+  case "$status" in
+    0) printf '%s' "$raw" ;;
+    3) printf '%s' "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Refuses (24) a head that publishes a private identifier, where the base's
 # REVIEW_LOOP_CONFIG sets "publicBoundaryScan": true. A scan that cannot run,
 # including where the install holds no identifier list (an agent container), is
-# no verdict (1).
+# no verdict (1). On a pass, writes the squash subject and body it scanned to
+# $PUBLIC_BOUNDARY_PUBLISH, when `merge` set it, which merges with exactly them.
 public_boundary_gate() {
-  local enabled install missing="" need report status=0
+  local enabled install missing="" need pr subject body baseline allowlist report status=0
   [ -n "$SCOPE_BASE" ] || return 0
   enabled=$(review_loop_flag publicBoundaryScan false) || enabled=error
   case "$enabled" in
@@ -896,12 +901,30 @@ public_boundary_gate() {
     echo "merge=error head=$SCOPE_HEAD: public_boundary: $REVIEW_LOOP_CONFIG on $SCOPE_BASE_REF turns the private-identifier scan on, but $install lacks the scanner or the identifier list (missing:$missing). Run merge-check on the host, with NANOCLAW_DIR set to the install that holds them" >&2
     exit 1
   fi
-  report=$(public_boundary_run "$install" "$SCOPE_HEAD") || status=$?
+  baseline=$(public_boundary_policy .public-boundary-baseline.json '{"files": {}}') &&
+    allowlist=$(public_boundary_policy .public-boundary-allowlist.json '{"entries": []}') || {
+    echo "merge=error head=$SCOPE_HEAD: public_boundary: could not read the baseline and allowlist at $SCOPE_BASE" >&2
+    exit 1
+  }
+  pr=$(gh pr view "$PR" --repo "$REPO" --json title,body) &&
+    subject=$(printf '%s' "$pr" | jq -er '.title | strings') &&
+    body=$(printf '%s' "$pr" | jq -r '.body // ""') || {
+    echo "merge=error head=$SCOPE_HEAD: public_boundary: could not read the PR title and body" >&2
+    exit 1
+  }
+  subject="$subject (#$PR)"
+  report=$(public_boundary_run "$install" "$SCOPE_HEAD" "$baseline" "$allowlist" "$subject" "$body") || status=$?
   case "$status" in
-    0) echo "merge-check: public_boundary: clean at $SCOPE_HEAD" >&2 ;;
+    0)
+      echo "merge-check: public_boundary: clean at $SCOPE_HEAD" >&2
+      if [ -n "${PUBLIC_BOUNDARY_PUBLISH:-}" ]; then
+        printf '%s' "$subject" > "$PUBLIC_BOUNDARY_PUBLISH/subject"
+        printf '%s' "$body" > "$PUBLIC_BOUNDARY_PUBLISH/body"
+      fi
+      ;;
     1)
       printf '%s\n' "$report" >&2
-      echo "merge=refused head=$SCOPE_HEAD: public_boundary: this head would publish a private identifier (redacted report above: file:line, where pr-text is the PR title, branch, body and commit messages in that order). Replace it with a fictional value and push a new head, or edit the title or body" >&2
+      echo "merge=refused head=$SCOPE_HEAD: public_boundary: this head would publish a private identifier (redacted report above: file:line, where pr-text is the squash commit message, line 1 the PR title and line 3 on its body). Replace it with a fictional value and push a new head, or edit the title or body" >&2
       exit 24
       ;;
     *)
@@ -3038,19 +3061,34 @@ $assessment
     # this shell before its code is read. `( ... ) || checked=$?` would not do:
     # bash ignores errexit in anything run on the left of `||`, a subshell
     # that sets it again included (bash(1), `set -e`).
+    #
+    # Where the public-boundary scan is on, the merge is a squash whose subject
+    # and body are exactly the text the scan read (public_boundary_gate): a
+    # merge commit would carry every intermediate commit's tree and message into
+    # the base, and GitHub's default message would re-read a title edited after
+    # the scan.
+    PUBLIC_BOUNDARY_PUBLISH=$(mktemp -d)
+    trap 'rm -rf "$PUBLIC_BOUNDARY_PUBLISH"' EXIT
     set +e
     ( set -e; merge_check_main --head "$head" )
     checked=$?
     set -e
     if [ "$checked" -eq 25 ]; then
       echo "merge: the base moved while merge-check ran; checking once more" >&2
+      rm -f "$PUBLIC_BOUNDARY_PUBLISH/subject" "$PUBLIC_BOUNDARY_PUBLISH/body"
       set +e
       ( set -e; merge_check_main --head "$head" )
       checked=$?
       set -e
     fi
     [ "$checked" -eq 0 ] || exit "$checked"
-    gh pr merge "$PR" --repo "$REPO" "--$method" --match-head-commit "$head" || {
+    message=()
+    if [ -f "$PUBLIC_BOUNDARY_PUBLISH/subject" ]; then
+      [ "$method" = squash ] || echo "merge: the public-boundary scan is on, so this merge is a squash with the scanned message, not --method $method" >&2
+      method=squash
+      message=(--subject "$(cat "$PUBLIC_BOUNDARY_PUBLISH/subject")" --body "$(cat "$PUBLIC_BOUNDARY_PUBLISH/body")")
+    fi
+    gh pr merge "$PR" --repo "$REPO" "--$method" --match-head-commit "$head" "${message[@]}" || {
       echo "merge=failed head=$head: merge-check allowed it, but gh pr merge did not merge PR #$PR" >&2
       exit 27
     }
