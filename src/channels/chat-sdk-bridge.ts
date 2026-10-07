@@ -31,6 +31,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
+import { recordLiveInbound } from './post-deploy-inbound.js';
 import type {
   ChannelAdapter,
   ChannelDefaults,
@@ -784,6 +785,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       await setupConfig.onInbound(platformId, threadId, message);
       return;
     }
+    recordLiveInbound(adapter.name);
     await ingressGate.runLive(async () => {
       await setupConfig.onInbound(platformId, threadId, message);
       await advanceRecoveryCursor(message.timestamp);

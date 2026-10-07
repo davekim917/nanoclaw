@@ -22,6 +22,7 @@ import { log } from '../log.js';
 import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
+import { createAdapterLogger } from './post-deploy-inbound.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { linkDiscordChannelNames, warmChannelDirectory } from './channel-links.js';
 import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
@@ -821,6 +822,7 @@ for (const ws of workspaces) {
         botToken: ws.botToken,
         publicKey: ws.publicKey,
         applicationId: ws.applicationId,
+        logger: createAdapterLogger(ws.channelType, 'discord'),
       });
       // Multi-bot dedup isolation: the dedup key is `dedupe:${adapter.name}:${message.id}` and every Discord adapter
       // defaults to name "discord", so two bots seeing the same message would collide in the shared state and the

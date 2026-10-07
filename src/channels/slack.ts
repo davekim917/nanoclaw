@@ -10,6 +10,7 @@ import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
+import { createAdapterLogger } from './post-deploy-inbound.js';
 import { conversationDisplayName } from './adapter.js';
 import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -553,6 +554,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         signingSecret: ws.signingSecret,
         appToken: ws.appToken,
         mode: ws.appToken ? 'socket' : 'webhook',
+        logger: createAdapterLogger(ws.channelType, 'slack'),
       });
       log.info('Slack workspace connecting', {
         channelType: ws.channelType,
