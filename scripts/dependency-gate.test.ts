@@ -2,23 +2,24 @@ import { describe, expect, it } from 'vitest';
 
 import type { DependencyPathRegistry as Registry } from '../src/dependency-paths.js';
 import {
-  changeProblems,
-  directDependencies,
-  dockerfileProblems,
-  consumerMoves,
-  liveAtEitherEnd,
-  liveMoves,
-  lockedVersions,
   packageChanges,
   parseLedgers,
   patchedPackage,
-  registryProblems,
-  runtimeReach,
+  changeProblems,
+  consumerMoves,
+  type DependencyFiles,
+  directDependencies,
+  dockerfileProblems,
+  liveAtEitherEnd,
+  liveMoves,
+  lockedVersions,
+  type PackageChange,
   trackedTools,
+  registryProblems,
+  repatchedPackages,
+  runtimeReach,
   weakenedRegistryProblems,
   withRepoints,
-  type DependencyFiles,
-  type PackageChange,
 } from './dependency-gate.js';
 
 const pnpmLock = (patchHash = 'aaa', wsVersion = '8.21.0'): string => `lockfileVersion: '9.0'
@@ -127,6 +128,8 @@ const contents: Record<string, string> = {
     "vi.mock(import('chat'), () => ({}));\nimport 'chat';\nit('ok', () => {});\n",
   'src/channels/template-mocked-live-path.test.ts':
     "vi.mock(`chat`, () => ({}));\nimport 'chat';\nit('ok', () => {});\n",
+  'src/channels/helper-mocked-live-path.test.ts': "import './chat-fake.js';\nimport 'chat';\nit('ok', () => {});\n",
+  'src/channels/chat-fake.ts': "vi.mock('chat', () => ({}));\n",
   'src/router.test.ts': '',
   'package.json': '{}',
 };
@@ -160,8 +163,7 @@ const gate = (changes: PackageChange[], text = '', within = registry, base: Regi
   );
 const movesBetween = (before: ReturnType<typeof lockedVersions>, after: ReturnType<typeof lockedVersions>) => {
   const changes = packageChanges(before, after);
-  const repatched = new Set(changes.filter((c) => c.from === c.to).map((c) => c.name));
-  return { changes, moves: liveMoves(registry, before, after, repatched) };
+  return { changes, moves: liveMoves(registry, before, after, repatchedPackages(before, after)) };
 };
 const bump = (name: string, from: string, to: string, source: 'host' | 'docker' = 'host'): PackageChange => {
   const was = from === 'none' ? [] : from.split(',');
@@ -209,14 +211,35 @@ describe('locked versions', () => {
   });
 
   it('reports a changed patch, by lockfile hash or by file, as a change at the same version', () => {
-    expect(patchedPackage('patches/@chat-adapter__discord@4.41.1.patch')).toBe('@chat-adapter/discord');
+    expect(patchedPackage('patches/@chat-adapter__discord@4.41.1.patch')).toEqual({
+      name: '@chat-adapter/discord',
+      source: 'host',
+    });
     expect(patchedPackage('docs/patches.md')).toBeNull();
     const repatched = lockedVersions(files({ pnpmLock: pnpmLock('bbb') }));
     expect(packageChanges(head, repatched)).toEqual([bump('@chat-adapter/discord', '4.41.1', '4.41.1')]);
-    expect(packageChanges(head, head, ['@chat-adapter/discord'])).toEqual([
+    expect(packageChanges(head, head, [{ name: '@chat-adapter/discord', source: 'host' }])).toEqual([
       bump('@chat-adapter/discord', '4.41.1', '4.41.1'),
     ]);
-    expect(patchedPackage('patches/@scope__unversioned.patch')).toBe('@scope/unversioned');
+    expect(patchedPackage('patches/@scope__unversioned.patch')).toEqual({ name: '@scope/unversioned', source: 'host' });
+  });
+
+  it('reports a changed agent-runner patch, by file or by bun.lock entry, in the runner tree', () => {
+    expect(patchedPackage('container/agent-runner/patches/@anthropic-ai__claude-agent-sdk@0.3.290.patch')).toEqual({
+      name: '@anthropic-ai/claude-agent-sdk',
+      source: 'runner',
+    });
+    const patched = lockedVersions(
+      files({
+        bunLock: BUN_LOCK.replace(
+          '"lockfileVersion": 1,',
+          '"lockfileVersion": 1,\n  "patchedDependencies": { "@anthropic-ai/claude-agent-sdk@0.3.290": "patches/sdk.patch" },',
+        ),
+      }),
+    );
+    expect(packageChanges(head, patched)).toEqual([
+      { ...bump('@anthropic-ai/claude-agent-sdk', '0.3.290', '0.3.290'), sources: ['runner'] },
+    ]);
   });
 });
 
@@ -286,7 +309,7 @@ describe('runtime reach and live paths', () => {
       },
     };
     const moves = (a: string, b: string) =>
-      liveMoves(live, lockedVersions(files({ bunLock: a })), lockedVersions(files({ bunLock: b })), new Set());
+      liveMoves(live, lockedVersions(files({ bunLock: a })), lockedVersions(files({ bunLock: b })), new Map());
     expect(moves(bun('3.25.0', '4.6.5'), bun('3.26.0', '4.6.5')).get('runner')?.get('zod')).toEqual(
       new Set(['@anthropic-ai/claude-agent-sdk']),
     );
@@ -361,6 +384,7 @@ describe('registry', () => {
     ['mocks the host module it loads it through', 'src/channels/host-mocked-live-path.test.ts'],
     ['mocks it through import()', 'src/channels/dynamic-mocked-live-path.test.ts'],
     ['mocks it with a template literal', 'src/channels/template-mocked-live-path.test.ts'],
+    ['mocks it in a helper module it imports', 'src/channels/helper-mocked-live-path.test.ts'],
   ])('refuses a live-path test that %s', (_label, test) => {
     const placeholder: Registry = {
       ...registry,
@@ -368,6 +392,18 @@ describe('registry', () => {
     };
     expect(registryProblems(placeholder, directDependencies(files()), read)).toEqual([
       expect.stringContaining(`${test}, which loads none of the packages on that path (chat) at runtime`),
+    ]);
+  });
+
+  it('refuses a live-path test whose package a vitest setup file mocks for every test', () => {
+    const withSetup = (file: string): string | null =>
+      file === 'vitest.config.ts'
+        ? "export default { test: { setupFiles: ['src/test-setup.ts'] } };\n"
+        : file === 'src/test-setup.ts'
+          ? "vi.mock('chat', () => ({}));\n"
+          : read(file);
+    expect(registryProblems(registry, directDependencies(files()), withSetup)).toEqual([
+      expect.stringContaining('src/channels/chat-live-path.test.ts, which loads none of the packages on that path'),
     ]);
   });
 
@@ -524,6 +560,36 @@ describe('Docker pins', () => {
   ];
   const base = 'ARG CLAUDE_CODE_VERSION=2.1.290\nRUN npm i -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}\n';
 
+  it.each([
+    ['two spaces', 'ARG  CLAUDE_CODE_VERSION=2.1.300'],
+    ['a tab', 'ARG\tCLAUDE_CODE_VERSION=2.1.300'],
+    ['a lowercase keyword', 'arg CLAUDE_CODE_VERSION=2.1.300'],
+  ])('reads a pin written with %s, so the bump is not mistaken for a removal', (_label, pin) => {
+    expect(
+      packageChanges(
+        lockedVersions(files()),
+        lockedVersions(files({ dockerfile: `FROM node:22-slim\n${pin}\nARG BUN_VERSION=1.4.2\n` })),
+      ),
+    ).toEqual([bump('docker:claude-code', '2.1.290', '2.1.300', 'docker')]);
+  });
+
+  it('refuses a tracked ARG that is used but given no value the gate can read', () => {
+    const head = 'ARG CLAUDE_CODE_VERSION\nRUN npm i -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}\n';
+    expect(dockerfileProblems(base, head, tools)).toEqual([
+      expect.stringContaining('uses ${CLAUDE_CODE_VERSION} but the gate reads no ARG value for it'),
+    ]);
+  });
+
+  it('refuses an unpinned update of a tracked npm tool after its pinned install', () => {
+    const head = base.replace(
+      '${CLAUDE_CODE_VERSION}\n',
+      '${CLAUDE_CODE_VERSION} && pnpm update -g @anthropic-ai/claude-code\n',
+    );
+    expect(dockerfileProblems(base, head, tools)).toEqual([
+      expect.stringContaining('installs @anthropic-ai/claude-code as @anthropic-ai/claude-code;'),
+    ]);
+  });
+
   it('reads a pin the head dropped from update-sources, so the bump is not mistaken for a removal', () => {
     const before = files({ dockerfile: 'ARG CLAUDE_CODE_VERSION=2.1.290\n' });
     const after = files({
@@ -556,6 +622,15 @@ describe('Docker pins', () => {
   it.each([
     ['an ENV of the same name', 'ENV CLAUDE_CODE_VERSION=2.1.999', 'sets CLAUDE_CODE_VERSION with ENV'],
     ['a second valued ARG', 'ARG CLAUDE_CODE_VERSION=2.1.999', 'gives ARG CLAUDE_CODE_VERSION a value 2 times'],
+    ['a lowercase env', 'env CLAUDE_CODE_VERSION=2.1.999', 'sets CLAUDE_CODE_VERSION with ENV'],
+    ['a second lowercase arg', 'arg CLAUDE_CODE_VERSION=2.1.999', 'gives ARG CLAUDE_CODE_VERSION a value 2 times'],
+    [
+      'a second ARG spaced with a tab',
+      'ARG\tCLAUDE_CODE_VERSION = 2.1.999',
+      'gives ARG CLAUDE_CODE_VERSION a value 2 times',
+    ],
+    ['a shell assignment in a RUN', 'RUN CLAUDE_CODE_VERSION=2.1.999 && true', 'assigns CLAUDE_CODE_VERSION in a RUN'],
+    ['an exported shell variable', 'RUN export CLAUDE_CODE_VERSION=2.1.999', 'assigns CLAUDE_CODE_VERSION in a RUN'],
   ])('refuses a pin shadowed by %s', (_label, shadow, message) => {
     expect(dockerfileProblems(base, base.replace('\nRUN', `\n${shadow}\nRUN`), tools)).toEqual([
       expect.stringContaining(message),
@@ -614,12 +689,12 @@ const judge = (
   const base = lockedVersions(files({ pnpmLock: before }));
   const head = lockedVersions(files({ pnpmLock: after }));
   const changes = packageChanges(base, head);
-  const repatched = new Set(changes.filter((c) => c.from === c.to).map((c) => c.name));
-  const moves = liveMoves(liveAtEitherEnd(baseReg, headReg), base, head, repatched);
+  const repoints = consumerMoves(base, head);
+  const moves = liveMoves(liveAtEitherEnd(baseReg, headReg), base, head, repatchedPackages(base, head), repoints);
   return changeProblems(
     headReg,
     runtimeReach(headReg, head.dependsOn),
-    withRepoints(changes, consumerMoves(base, head), moves, head),
+    withRepoints(changes, repoints, moves, head),
     ledgerOf(text),
     exists,
     moves,
@@ -681,6 +756,104 @@ describe('moves the locked version set does not show', () => {
     ]);
   });
 
+  /** `lockOf` with a root project that depends on `deps`. */
+  const project = (lock: string, deps: Record<string, string>): string =>
+    lock.replace(
+      "lockfileVersion: '9.0'\n",
+      `lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n${Object.entries(deps)
+        .map(([d, v]) => `      '${d}':\n        specifier: ${v}\n        version: ${v}\n`)
+        .join('')}`,
+    );
+
+  it('blocks the project moving a live package onto a version already locked for something else', () => {
+    const tree = (adapter: string) =>
+      project(
+        lockOf({
+          '@chat-adapter/discord@4.41.1': { 'discord.js': '14.27.0' },
+          '@chat-adapter/discord@4.42.0': { 'discord.js': '14.99.0' },
+          'zzother@1.0.0': { '@chat-adapter/discord': '4.42.0' },
+          'discord.js@14.27.0': {},
+          'discord.js@14.99.0': {},
+        }),
+        { '@chat-adapter/discord': adapter, zzother: '1.0.0' },
+      );
+    expect(judge(tree('4.41.1'), tree('4.42.0'))).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          '@chat-adapter/discord 4.41.1 → 4.42.0 is on live I/O path(s) with no real-library test',
+        ),
+      ]),
+    );
+  });
+
+  it('blocks a consumer under a live package moved onto a version that package already loads elsewhere', () => {
+    const tree = (undici: string) =>
+      lockOf({
+        '@chat-adapter/discord@4.41.1': { 'discord.js': '14.27.0', rest: '2.6.3' },
+        'discord.js@14.27.0': { undici },
+        'rest@2.6.3': { undici: '8.11.2' },
+        'undici@6.28.0': {},
+        'undici@8.11.2': {},
+      });
+    expect(judge(tree('6.28.0'), tree('8.11.2'))).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('undici 6.28.0 → 8.11.2 (loaded by @chat-adapter/discord) is on live I/O path(s)'),
+      ]),
+    );
+  });
+
+  it('refuses an Override for a consumer upgrade hidden behind a version set that looks like a rollback', () => {
+    const before = lockOf({
+      '@chat-adapter/discord@4.41.1': { rest: '2.6.3' },
+      'rest@2.6.3': { undici: '6.28.0' },
+      'other@1.0.0': { undici: '8.11.2' },
+      'undici@6.28.0': {},
+      'undici@8.11.2': {},
+    });
+    const after = lockOf({
+      '@chat-adapter/discord@4.41.1': { rest: '2.6.3' },
+      'rest@2.6.3': { undici: '8.11.2' },
+      'other@1.0.0': { undici: '8.11.2' },
+      'undici@6.0.0': {},
+      'undici@8.11.2': {},
+    });
+    const text = '## undici 6.28.0,8.11.2 → 6.0.0,8.11.2\nSource: x\nOverride: incident\n- y · not covered: z\n';
+    expect(judge(before, after, text)).toEqual([
+      expect.stringContaining('undici 6.28.0,8.11.2 → 6.0.0,8.11.2 (loaded by @chat-adapter/discord) is on live I/O'),
+    ]);
+  });
+
+  it('does not block a type-only package moving beneath a live package', () => {
+    const tree = (types: string) =>
+      lockOf({ '@chat-adapter/discord@4.41.1': { '@types/ws': types }, [`@types/ws@${types}`]: {} });
+    expect(judge(tree('8.18.1'), tree('8.18.2'))).toEqual([]);
+  });
+
+  it('counts only a changed patch as a re-patch, not a version one tree dropped while another kept it', () => {
+    const runner = `{
+  "lockfileVersion": 1,
+  "packages": {
+    "@anthropic-ai/claude-agent-sdk": ["@anthropic-ai/claude-agent-sdk@0.3.290", "", { "dependencies": { "inherits": "^2" } }, "sha512-x"],
+    "inherits": ["inherits@2.0.4", "", {}, "sha512-x"],
+  },
+}
+`;
+    const base = lockedVersions(files({ pnpmLock: lockOf({ 'inherits@2.0.4': {} }), bunLock: runner }));
+    const head = lockedVersions(files({ pnpmLock: lockOf({ 'chat@4.41.1': {} }), bunLock: runner }));
+    expect(packageChanges(base, head)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'inherits', from: '2.0.4', to: '2.0.4' })]),
+    );
+    const live: Registry = {
+      ...registry,
+      packages: {
+        ...registry.packages,
+        '@anthropic-ai/claude-agent-sdk': { kind: 'live', paths: ['provider-claude'] },
+      },
+    };
+    expect(repatchedPackages(base, head)).toEqual(new Map());
+    expect(liveMoves(live, base, head, repatchedPackages(base, head)).get('runner')).toBeUndefined();
+  });
+
   it('follows a bun peer dependency into the live closure', () => {
     const bun = (zod: string) => `{
   "lockfileVersion": 1,
@@ -701,7 +874,7 @@ describe('moves the locked version set does not show', () => {
       live,
       lockedVersions(files({ bunLock: bun('4.6.5') })),
       lockedVersions(files({ bunLock: bun('4.7.0') })),
-      new Set(),
+      new Map(),
     );
     expect(moves.get('runner')?.get('zod')).toEqual(new Set(['@anthropic-ai/claude-agent-sdk']));
   });

@@ -59,7 +59,13 @@ function splitSpec(spec: string): [string, string] | null {
   return at > 0 ? [spec.slice(0, at), spec.slice(at + 1)] : null;
 }
 
+type ImporterDeps = Record<string, { version?: string } | string>;
+
 interface PnpmLock {
+  importers?: Record<
+    string,
+    { dependencies?: ImporterDeps; devDependencies?: ImporterDeps; optionalDependencies?: ImporterDeps }
+  >;
   packages?: Record<string, unknown>;
   snapshots?: Record<string, { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string> }>;
   patchedDependencies?: Record<string, string | { hash?: string }>;
@@ -85,10 +91,25 @@ function bunResolve(entries: Record<string, unknown[]>, key: string, dep: string
   return null;
 }
 
-/** bun.lock is JSON with trailing commas. */
-function parseBunLock(text: string): { packages?: Record<string, unknown[]> } {
-  return JSON.parse(text.replace(/,(\s*[}\]])/g, '$1')) as { packages?: Record<string, unknown[]> };
+interface BunLock {
+  workspaces?: Record<
+    string,
+    { dependencies?: object; devDependencies?: object; optionalDependencies?: object; peerDependencies?: object }
+  >;
+  packages?: Record<string, unknown[]>;
+  patchedDependencies?: Record<string, string>;
 }
+
+/** bun.lock is JSON with trailing commas. */
+function parseBunLock(text: string): BunLock {
+  return JSON.parse(text.replace(/,(\s*[}\]])/g, '$1')) as BunLock;
+}
+
+/**
+ * The graph node for a project in a lockfile. It has no `@version`, so it is never a package, but its edges are
+ * compared like a package's: a project moved onto a version already locked for something else is a repoint.
+ */
+const importerNode = (project: string): string => `importer:${project || '.'}`;
 
 export interface TrackedTool {
   id: string;
@@ -100,9 +121,13 @@ export function trackedTools(updateSources: string | null): TrackedTool[] {
   return updateSources ? ((JSON.parse(updateSources) as { dockerfile?: TrackedTool[] }).dockerfile ?? []) : [];
 }
 
+/** `ARG <arg>=<value>` in any case and spacing: Docker reads instruction keywords case-insensitively. */
+const argValue = (arg: string): RegExp =>
+  new RegExp(`^[ \\t]*[Aa][Rr][Gg][ \\t]+${arg}[ \\t]*=[ \\t]*["']?([^"'\\s#]+)`, 'm');
+
 function dockerPins(dockerfile: string, items: TrackedTool[]): Array<{ id: string; version: string }> {
   return items.flatMap(({ id, arg }) => {
-    const match = new RegExp(`^ARG ${arg}=["']?([^"'\\s#]+)`, 'm').exec(dockerfile);
+    const match = argValue(arg).exec(dockerfile);
     return match ? [{ id, version: match[1]! }] : [];
   });
 }
@@ -120,9 +145,9 @@ type Source = 'host' | 'runner' | 'remotion' | 'docker';
 export interface Locked {
   versions: Map<Source, Map<string, Set<string>>>;
   dependsOn: Map<Source, Map<string, Set<string>>>;
-  /** `name@version` → the exact `name@version`s it loads, per tree. */
+  /** `name@version`, or a project's `importer:<path>`, → the exact `name@version`s it loads, per tree. */
   graph: Map<Source, Map<string, Set<string>>>;
-  /** `<source>:<name>[@version]` → patch hash, from pnpm's patchedDependencies. */
+  /** `<source>:<name>[@version]` → patch hash (pnpm) or patch file (bun), from the lockfile's patchedDependencies. */
   patches: Map<string, string>;
 }
 
@@ -165,12 +190,37 @@ export function lockedVersions(
         add(tree(locked.graph, source), node, target);
       }
     }
+    for (const [project, importer] of Object.entries(lock.importers ?? {})) {
+      const node = importerNode(project);
+      tree(locked.graph, source).set(node, tree(locked.graph, source).get(node) ?? new Set());
+      for (const deps of [importer.dependencies, importer.devDependencies, importer.optionalDependencies]) {
+        for (const [dep, ref] of Object.entries(deps ?? {})) {
+          const version = String(typeof ref === 'string' ? ref : (ref?.version ?? '')).replace(/\(.*$/, '');
+          if (version) add(tree(locked.graph, source), node, `${dep}@${version}`);
+        }
+      }
+    }
     for (const [key, entry] of Object.entries(lock.patchedDependencies ?? {})) {
       locked.patches.set(`${source}:${key}`, typeof entry === 'string' ? entry : (entry?.hash ?? ''));
     }
   }
   if (files.bunLock) {
-    const entries = parseBunLock(files.bunLock).packages ?? {};
+    const lock = parseBunLock(files.bunLock);
+    const entries = lock.packages ?? {};
+    for (const [project, workspace] of Object.entries(lock.workspaces ?? {})) {
+      const node = importerNode(project);
+      tree(locked.graph, 'runner').set(node, tree(locked.graph, 'runner').get(node) ?? new Set());
+      for (const dep of Object.keys({
+        ...workspace.dependencies,
+        ...workspace.devDependencies,
+        ...workspace.optionalDependencies,
+        ...workspace.peerDependencies,
+      })) {
+        const target = entries[dep]?.[0];
+        if (typeof target === 'string') add(tree(locked.graph, 'runner'), node, target);
+      }
+    }
+    for (const [key, file] of Object.entries(lock.patchedDependencies ?? {})) locked.patches.set(`runner:${key}`, file);
     for (const [key, entry] of Object.entries(entries)) {
       const node = typeof entry[0] === 'string' ? entry[0] : '';
       const spec = splitSpec(node);
@@ -211,10 +261,36 @@ export function directDependencies(files: DependencyFiles): Set<string> {
   return names;
 }
 
-/** `patches/@scope__name@1.2.3.patch` and `patches/@scope__name.patch` both name `@scope/name`. */
-export function patchedPackage(changedPath: string): string | null {
-  const match = /^patches\/(.+?)(?:@[^@/]+)?\.patch$/.exec(changedPath);
-  return match ? match[1]!.replace('__', '/') : null;
+const PATCH_DIRS: Array<[string, Source]> = [
+  ['patches/', 'host'],
+  ['container/agent-runner/patches/', 'runner'],
+  ['container/remotion/patches/', 'remotion'],
+];
+
+/** `patches/@scope__name@1.2.3.patch` and `patches/@scope__name.patch` both name `@scope/name`, in the tree whose patches dir holds it. */
+export function patchedPackage(changedPath: string): { name: string; source: Source } | null {
+  for (const [dir, source] of PATCH_DIRS) {
+    if (!changedPath.startsWith(dir)) continue;
+    const match = /^(.+?)(?:@[^@/]+)?\.patch$/.exec(changedPath.slice(dir.length));
+    return match && !match[1]!.includes('/') ? { name: match[1]!.replace('__', '/'), source } : null;
+  }
+  return null;
+}
+
+/** Per tree, the packages whose patch changed: a patch file edited, or a lockfile patch entry added, removed or rehashed. */
+export function repatchedPackages(
+  base: Locked,
+  head: Locked,
+  patchedFiles: Iterable<{ name: string; source: Source }> = [],
+): Map<Source, Set<string>> {
+  const out = new Map<Source, Set<string>>();
+  for (const { name, source } of patchedFiles) add(out as Map<string, Set<string>>, source, name);
+  for (const key of new Set([...base.patches.keys(), ...head.patches.keys()])) {
+    if (base.patches.get(key) === head.patches.get(key)) continue;
+    const [source, spec] = [key.slice(0, key.indexOf(':')) as Source, key.slice(key.indexOf(':') + 1)];
+    add(out as Map<string, Set<string>>, source, splitSpec(spec)?.[0] ?? spec);
+  }
+  return out;
 }
 
 export interface PackageChange {
@@ -238,13 +314,14 @@ function versionList(versions: Iterable<string>): string {
 
 const SOURCES: Source[] = ['host', 'runner', 'remotion', 'docker'];
 
-export function packageChanges(base: Locked, head: Locked, patchedFiles: Iterable<string> = []): PackageChange[] {
+export function packageChanges(
+  base: Locked,
+  head: Locked,
+  patchedFiles: Iterable<{ name: string; source: Source }> = [],
+): PackageChange[] {
   const patched = new Map<string, Set<Source>>();
-  for (const name of patchedFiles) add(patched as Map<string, Set<string>>, name, 'host');
-  for (const key of new Set([...base.patches.keys(), ...head.patches.keys()])) {
-    if (base.patches.get(key) === head.patches.get(key)) continue;
-    const [source, spec] = [key.slice(0, key.indexOf(':')) as Source, key.slice(key.indexOf(':') + 1)];
-    add(patched as Map<string, Set<string>>, splitSpec(spec)?.[0] ?? spec, source);
+  for (const [source, packages] of repatchedPackages(base, head, patchedFiles)) {
+    for (const name of packages) add(patched as Map<string, Set<string>>, name, source);
   }
   const names = new Set<string>(patched.keys());
   for (const source of SOURCES) {
@@ -284,7 +361,8 @@ export function packageChanges(base: Locked, head: Locked, patchedFiles: Iterabl
   return changes;
 }
 
-type Repoint = { from: string; to: string };
+/** A consumer — a `name@version` node or a project's `importer:<path>` — that loads `to` where it loaded `from`. */
+type Repoint = { from: string; to: string; consumer: string };
 
 /**
  * Per tree and package, each exact version a consumer present at both ends now loads in place of what it loaded at the
@@ -312,7 +390,7 @@ export function consumerMoves(base: Locked, head: Locked): Map<Source, Map<strin
         for (const version of versions) {
           if (prior?.has(version)) continue;
           const list = tree(moves, source).get(name) ?? [];
-          list.push({ from: prior ? versionList(prior) : 'none', to: version });
+          list.push({ from: prior ? versionList(prior) : 'none', to: version, consumer: node });
           tree(moves, source).set(name, list);
         }
       }
@@ -323,8 +401,8 @@ export function consumerMoves(base: Locked, head: Locked): Map<Source, Map<strin
 
 /**
  * Adds the moves a version-set diff cannot see: a consumer repointed onto a version already locked, and a package that
- * newly enters a live closure. Each becomes a change whose added and removed versions are the consumer's own, so an
- * Override judges the move the consumer made.
+ * newly enters a live closure. A consumer's move counts among a change's added and removed versions, so an Override
+ * judges every move a consumer made, not only the versions that entered or left the lockfile.
  */
 export function withRepoints(
   changes: PackageChange[],
@@ -342,10 +420,19 @@ export function withRepoints(
       if (existing) {
         existing.repointed = [...(existing.repointed ?? []), ...own];
         if (!existing.sources.includes(source)) existing.sources.push(source);
+        existing.added = [...new Set([...existing.added, ...own.map((move) => move.to)])].sort();
+        existing.removed = [
+          ...new Set([
+            ...existing.removed,
+            ...own.flatMap((move) => (move.from === 'none' ? [] : move.from.split(','))),
+          ]),
+        ].sort();
         continue;
       }
       const into =
-        own.length > 0 ? own : [...(head.versions.get(source)?.get(name) ?? [])].map((to) => ({ from: 'none', to }));
+        own.length > 0
+          ? own
+          : [...(head.versions.get(source)?.get(name) ?? [])].map((to) => ({ from: 'none', to, consumer: '' }));
       const change: PackageChange = {
         name,
         from: versionList(into.flatMap((move) => (move.from === 'none' ? [] : move.from.split(',')))),
@@ -430,30 +517,64 @@ function moduleUse(file: string, text: string): { imports: string[]; mocks: Arra
   return { imports, mocks };
 }
 
+/** The setup files vitest loads before every test file, which can mock a module for all of them. */
+function vitestSetupFiles(read: (file: string) => string | null): string[] {
+  const config = read('vitest.config.ts');
+  const list = config ? /setupFiles:\s*\[([^\]]*)\]/.exec(config)?.[1] : undefined;
+  return list ? [...list.matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1]!) : [];
+}
+
 /**
- * Whether a test loads one of `packages`, itself or through one host module it imports, without mocking it. A
- * name-only check would accept a placeholder test; this cheap floor refuses one that never touches the libraries on
- * its path.
+ * Whether a test loads one of `packages` without mocking it. A mock in any repo module the test reaches through
+ * relative imports, or in vitest's setup files, applies to the test, so every one is read; a module mocked anywhere
+ * does not count as loading what it imports. A name-only check would accept a placeholder test; this cheap floor
+ * refuses one that never touches the libraries on its path.
  */
 function testLoads(test: string, packages: string[], read: (file: string) => string | null): boolean {
-  const text = read(test);
-  if (text === null) return false;
-  const { imports, mocks } = moduleUse(test, text);
-  if (mocks.some((spec) => spec === null || names(spec, packages))) return false;
-  if (imports.some((spec) => names(spec, packages))) return true;
-  const local = (spec: string): string => path.posix.join(path.posix.dirname(test), spec).replace(/\.js$/, '.ts');
-  const mocked = new Set(mocks.filter((spec): spec is string => spec?.startsWith('.') ?? false).map(local));
-  return imports
-    .filter((spec) => spec.startsWith('.') && !mocked.has(local(spec)))
-    .some((spec) => {
-      const module = read(local(spec));
-      return module !== null && moduleUse(local(spec), module).imports.some((inner) => names(inner, packages));
-    });
+  if (read(test) === null) return false;
+  const local = (from: string, spec: string): string =>
+    path.posix.join(path.posix.dirname(from), spec).replace(/\.js$/, '.ts');
+  const walk = (skip: Set<string>, visit: (file: string, use: ReturnType<typeof moduleUse>) => void): void => {
+    const seen = new Set<string>();
+    const queue = [...vitestSetupFiles(read), test];
+    while (queue.length > 0) {
+      const file = queue.shift()!;
+      if (seen.has(file) || skip.has(file)) continue;
+      seen.add(file);
+      const text = read(file);
+      if (text === null) continue;
+      const use = moduleUse(file, text);
+      visit(file, use);
+      for (const spec of use.imports) if (spec.startsWith('.')) queue.push(local(file, spec));
+    }
+  };
+  const mocked = new Set<string>();
+  let mocksPath = false;
+  walk(new Set(), (file, { mocks }) => {
+    for (const spec of mocks) {
+      if (spec === null || names(spec, packages)) mocksPath = true;
+      else if (spec.startsWith('.')) mocked.add(local(file, spec));
+    }
+  });
+  if (mocksPath) return false;
+  let loads = false;
+  walk(mocked, (_file, { imports }) => {
+    if (imports.some((spec) => names(spec, packages))) loads = true;
+  });
+  return loads;
 }
 
 function closure(locked: Locked, source: Source, root: string): Set<string> {
+  return reachable(
+    locked,
+    source,
+    [...(locked.versions.get(source)?.get(root) ?? [])].map((version) => `${root}@${version}`),
+  );
+}
+
+function reachable(locked: Locked, source: Source, seeds: string[]): Set<string> {
   const graph = locked.graph.get(source);
-  const seen = new Set([...(locked.versions.get(source)?.get(root) ?? [])].map((version) => `${root}@${version}`));
+  const seen = new Set(seeds);
   const queue = [...seen];
   while (queue.length > 0) {
     const node = queue.shift()!;
@@ -470,13 +591,16 @@ function closure(locked: Locked, source: Source, root: string): Set<string> {
 /**
  * Per tree and moved package, the live packages whose exact-version closure it moved: a version a live package loads
  * at the head and did not at the base, or a re-patched package it loads. Exact versions, so a copy only something else
- * loads never blocks a live path, and a version swap beneath a live package always does.
+ * loads never blocks a live path, and a version swap beneath a live package always does. A consumer moved onto a
+ * version already in the closure leaves the closure's set unchanged, so each repoint is also judged on its own: a
+ * consumer under a live package, or a project loading the live package itself, that now loads what it did not.
  */
 export function liveMoves(
   registry: Registry,
   base: Locked,
   head: Locked,
-  repatched: Set<string>,
+  repatched: Map<Source, Set<string>>,
+  repoints: Map<Source, Map<string, Repoint[]>> = new Map(),
 ): Map<Source, Map<string, Set<string>>> {
   const moves = new Map<Source, Map<string, Set<string>>>();
   const live = Object.entries(registry.packages)
@@ -487,7 +611,26 @@ export function liveMoves(
       const before = closure(base, source, root);
       for (const node of closure(head, source, root)) {
         const name = splitSpec(node)?.[0];
-        if (name && (!before.has(node) || repatched.has(name))) add(tree(moves, source), name, root);
+        if (!name || name.startsWith('@types/')) continue;
+        if (!before.has(node) || repatched.get(source)?.has(name)) add(tree(moves, source), name, root);
+      }
+      const within = closure(head, source, root);
+      for (const [name, list] of repoints.get(source) ?? []) {
+        if (name.startsWith('@types/')) continue;
+        for (const move of list) {
+          const under = move.consumer.startsWith('importer:') ? name === root : within.has(move.consumer);
+          if (!under) continue;
+          add(tree(moves, source), name, root);
+          const was = reachable(
+            base,
+            source,
+            move.from === 'none' ? [] : move.from.split(',').map((version) => `${name}@${version}`),
+          );
+          for (const node of reachable(head, source, [`${name}@${move.to}`])) {
+            const moved = splitSpec(node)?.[0];
+            if (moved && !moved.startsWith('@types/') && !was.has(node)) add(tree(moves, source), moved, root);
+          }
+        }
       }
     }
   }
@@ -834,20 +977,30 @@ export function dockerfileProblems(base: string | null, head: string | null, too
   const headLines = dockerInstructions(head);
   const references = (lines: string[], arg: string): number =>
     lines
-      .filter((line) => !new RegExp(`^ARG\\s+${arg}=`).test(line))
+      .filter((line) => !argValue(arg).test(line))
       .reduce((count, line) => count + [...line.matchAll(new RegExp(`\\$\\{${arg}\\}|\\$${arg}\\b`, 'g'))].length, 0);
   for (const tool of tools) {
-    const defined = headLines.some((line) => new RegExp(`^ARG\\s+${tool.arg}=`).test(line));
+    const defined = headLines.some((line) => argValue(tool.arg).test(line));
+    if (!defined && references(headLines, tool.arg) > 0) {
+      problems.push(
+        `container/Dockerfile uses \${${tool.arg}} but the gate reads no ARG value for it; ${tool.id} must have one "ARG ${tool.arg}=<version>"`,
+      );
+    }
     if (defined && base && references(headLines, tool.arg) < references(dockerInstructions(base), tool.arg)) {
       problems.push(
         `container/Dockerfile references \${${tool.arg}} fewer times than the base, comments aside; ${tool.id} must install from its ARG pin`,
       );
     }
-    const valued = headLines.filter((line) => new RegExp(`^ARG\\s+${tool.arg}=`).test(line)).length;
-    const shadowed = headLines.some((line) => new RegExp(`^ENV\\b.*(?:^|\\s)${tool.arg}(?:=|\\s)`).test(line));
-    if (valued > 1 || shadowed) {
+    const valued = headLines.filter((line) => argValue(tool.arg).test(line)).length;
+    const shadowed = headLines.some((line) => new RegExp(`^ENV\\b.*(?:^|\\s)${tool.arg}(?:=|\\s)`, 'i').test(line));
+    const assigned = headLines.some(
+      (line) =>
+        /^RUN\b/i.test(line) &&
+        new RegExp(`(?:^|[\\s;&|(\`])(?:(?:export|readonly|local|declare(?:\\s+-\\S+)*)\\s+)?${tool.arg}=`).test(line),
+    );
+    if (valued > 1 || shadowed || assigned) {
       problems.push(
-        `container/Dockerfile ${shadowed ? `sets ${tool.arg} with ENV` : `gives ARG ${tool.arg} a value ${valued} times`}; the gate reads only its first ARG value, so ${tool.id} must have exactly one`,
+        `container/Dockerfile ${shadowed ? `sets ${tool.arg} with ENV` : assigned ? `assigns ${tool.arg} in a RUN` : `gives ARG ${tool.arg} a value ${valued} times`}; the gate reads only its first ARG value, so ${tool.id} must have exactly one`,
       );
     }
     const kind = tool.source?.kind;
@@ -859,7 +1012,7 @@ export function dockerfileProblems(base: string | null, head: string | null, too
       const pinned = new RegExp(`^["']?${ref}["']?(?=[\\s"']|$)`);
       const token = new RegExp(`(?:^|[\\s"'=])${escapeRegExp(pkg)}(@\\S*|(?=[\\s"']|$))`, 'g');
       for (const command of commands) {
-        const verb = /\b(?:install|i|add)\b/.exec(command);
+        const verb = /\b(?:install|i|add|update|up|upgrade|dlx|npx|bunx)\b/.exec(command);
         for (const match of command.matchAll(token)) {
           const rest = match[1] ?? '';
           const versioned = rest.startsWith('@');
@@ -876,7 +1029,7 @@ export function dockerfileProblems(base: string | null, head: string | null, too
     const normalize = (name: string): string => name.toLowerCase().replace(/[-_.]+/g, '-');
     const pinned = new RegExp(`^(?:\\[[^\\]]*\\])?==${ref}$`);
     for (const command of commands) {
-      const verb = /\binstall\b/.exec(command);
+      const verb = /\b(?:install|upgrade|add|sync)\b/.exec(command);
       if (!verb) continue;
       for (const raw of command.slice(verb.index).split(/\s+/)) {
         const token = raw.replace(/^["']+|["']+$/g, '');
@@ -935,17 +1088,22 @@ export function runCheck(root: string, base: string): GateResult {
 
   const head = lockedVersions(headFiles, tools);
   const baseLocked = lockedVersions(baseFiles, tools);
-  const changes = packageChanges(
+  const patchedFiles = changedFiles
+    .map(patchedPackage)
+    .filter((patch): patch is { name: string; source: Source } => patch !== null);
+  const changes = packageChanges(baseLocked, head, patchedFiles);
+  const repoints = consumerMoves(baseLocked, head);
+  const moves = liveMoves(
+    liveAtEitherEnd(baseRegistry, registry),
     baseLocked,
     head,
-    changedFiles.map(patchedPackage).filter((name): name is string => name !== null),
+    repatchedPackages(baseLocked, head, patchedFiles),
+    repoints,
   );
-  const repatched = new Set(changes.filter((change) => change.from === change.to).map((change) => change.name));
-  const moves = liveMoves(liveAtEitherEnd(baseRegistry, registry), baseLocked, head, repatched);
   const result = changeProblems(
     registry,
     runtimeReach(registry, head.dependsOn),
-    withRepoints(changes, consumerMoves(baseLocked, head), moves, head),
+    withRepoints(changes, repoints, moves, head),
     ledger,
     exists,
     moves,
