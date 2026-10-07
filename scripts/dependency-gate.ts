@@ -400,8 +400,9 @@ export function consumerMoves(base: Locked, head: Locked): Map<Source, Map<strin
 }
 
 /**
- * Adds the moves a version-set diff cannot see: a consumer repointed onto a version already locked, and a package that
- * newly enters a live closure. A consumer's move counts among a change's added and removed versions, so an Override
+ * Adds the moves a version-set diff cannot see: a consumer switched onto a version already locked, and a package that
+ * newly enters a live closure. A consumer's new edge onto a version already locked is not a version change; `liveMoves`
+ * judges whether it adds code to a live path. A consumer's move counts among a change's added and removed versions, so an Override
  * judges every move a consumer made, not only the versions that entered or left the lockfile.
  */
 export function withRepoints(
@@ -413,9 +414,14 @@ export function withRepoints(
   const byName = new Map(changes.map((change) => [change.name, change]));
   const out = [...changes];
   for (const source of SOURCES) {
-    const names = new Set([...(repoints.get(source)?.keys() ?? []), ...(moves.get(source)?.keys() ?? [])]);
+    const switched = new Map(
+      [...(repoints.get(source) ?? [])]
+        .map(([name, list]) => [name, list.filter((move) => move.from !== 'none')] as const)
+        .filter(([, list]) => list.length > 0),
+    );
+    const names = new Set([...switched.keys(), ...(moves.get(source)?.keys() ?? [])]);
     for (const name of names) {
-      const own = repoints.get(source)?.get(name) ?? [];
+      const own = switched.get(name) ?? [];
       const existing = byName.get(name);
       if (existing) {
         existing.repointed = [...(existing.repointed ?? []), ...own];
@@ -593,7 +599,8 @@ function reachable(locked: Locked, source: Source, seeds: string[]): Set<string>
  * at the head and did not at the base, or a re-patched package it loads. Exact versions, so a copy only something else
  * loads never blocks a live path, and a version swap beneath a live package always does. A consumer moved onto a
  * version already in the closure leaves the closure's set unchanged, so each repoint is also judged on its own: a
- * consumer under a live package, or a project loading the live package itself, that now loads what it did not.
+ * consumer under a live package, or a project loading the live package itself, that switched versions. A new edge
+ * onto a version the live package already loaded adds no code to its path; every switch beneath it is its own repoint.
  */
 export function liveMoves(
   registry: Registry,
@@ -620,15 +627,10 @@ export function liveMoves(
         for (const move of list) {
           const under = move.consumer.startsWith('importer:') ? name === root : within.has(move.consumer);
           if (!under) continue;
-          add(tree(moves, source), name, root);
-          const was = reachable(
-            base,
-            source,
-            move.from === 'none' ? [] : move.from.split(',').map((version) => `${name}@${version}`),
-          );
+          if (move.from !== 'none' || !before.has(`${name}@${move.to}`)) add(tree(moves, source), name, root);
           for (const node of reachable(head, source, [`${name}@${move.to}`])) {
             const moved = splitSpec(node)?.[0];
-            if (moved && !moved.startsWith('@types/') && !was.has(node)) add(tree(moves, source), moved, root);
+            if (moved && !moved.startsWith('@types/') && !before.has(node)) add(tree(moves, source), moved, root);
           }
         }
       }

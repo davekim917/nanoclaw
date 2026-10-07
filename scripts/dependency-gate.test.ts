@@ -786,6 +786,20 @@ describe('moves the locked version set does not show', () => {
     );
   });
 
+  it('does not block the project newly depending on a live package version it already loaded', () => {
+    const lock = lockOf({
+      'wrapper@1.0.0': { '@chat-adapter/discord': '4.41.1' },
+      '@chat-adapter/discord@4.41.1': { 'discord.js': '14.27.0' },
+      'discord.js@14.27.0': {},
+    });
+    expect(
+      judge(
+        project(lock, { wrapper: '1.0.0' }),
+        project(lock, { wrapper: '1.0.0', '@chat-adapter/discord': '4.41.1' }),
+      ),
+    ).toEqual([]);
+  });
+
   it('blocks a consumer under a live package moved onto a version that package already loads elsewhere', () => {
     const tree = (undici: string) =>
       lockOf({
