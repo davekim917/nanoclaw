@@ -820,8 +820,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const enriched = [];
       let budget = INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES;
       const overBudget = (name: string | undefined, bytes: number | undefined): boolean => {
-        if (bytes === undefined || bytes <= budget) return false;
-        log.warn('Attachment exceeds the message attachment budget, skipping', { name, bytes, budget });
+        const limit = Math.min(budget, INBOUND_ATTACHMENT_MAX_BYTES);
+        if (bytes === undefined || bytes <= limit) return false;
+        log.warn('Attachment exceeds the file limit or what is left of the message budget, skipping', {
+          name,
+          bytes,
+          limit,
+        });
         return true;
       };
       for (const att of message.attachments) {

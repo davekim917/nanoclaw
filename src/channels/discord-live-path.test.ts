@@ -335,10 +335,7 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
     expect(attachments.map((a) => a.name)).toEqual(['footage.zip', 'originals.zip']);
     expect(attachments[0]!.data).toBeUndefined();
     expect(Buffer.from(attachments[1]!.data ?? '', 'base64').length).toBe(30 * MiB);
-    expect(requests).toEqual([
-      { url: huge, authorization: undefined },
-      { url: big, authorization: undefined },
-    ]);
+    expect(requests).toEqual([{ url: big, authorization: undefined }]);
   });
 
   it('delivers a plain guild message as not a mention', async () => {

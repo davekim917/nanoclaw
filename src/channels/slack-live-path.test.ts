@@ -380,13 +380,13 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     expect(attachments.map((a) => a.name)).toEqual(['footage.zip', 'originals.zip']);
     expect(attachments[0]!.data).toBeUndefined();
     expect(Buffer.from(attachments[1]!.data ?? '', 'base64').length).toBe(30 * MiB);
-    expect(requests).toEqual([
-      { url: huge, authorization: `Bearer ${BOT_TOKEN}` },
-      { url: big, authorization: `Bearer ${BOT_TOKEN}` },
-    ]);
+    expect(requests).toEqual([{ url: big, authorization: `Bearer ${BOT_TOKEN}` }]);
   });
 
-  it("stops downloading a message's files once their total would pass the per-message budget", async () => {
+  it.each([
+    ['declared truthfully, without requesting the file that would not fit', 'honest', 2],
+    ['understated, by checking the bytes that arrived', 'understated', 3],
+  ])("stops a message's files at the per-message budget when their sizes are %s", async (_label, sizes, fetched) => {
     const { INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES } = await import('../config.js');
     const MiB = 1024 * 1024;
     const each = Math.floor(INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES / 2.5);
@@ -396,7 +396,7 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     const requests = serveAttachments(new Map(urls.map((url) => [url, each])));
     inbound.length = 0;
     await sendEnvelope(
-      'env-budget',
+      `env-budget-${sizes}`,
       message({
         type: 'message',
         subtype: 'file_share',
@@ -404,12 +404,12 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
         channel_type: 'channel',
         user: HUMAN,
         text: 'three parts',
-        ts: '1790000008.000100',
+        ts: sizes === 'honest' ? '1790000008.000100' : '1790000009.000100',
         files: urls.map((url, i) => ({
           id: `F0PART${i}`,
           name: `part${i}.bin`,
           mimetype: 'application/octet-stream',
-          size: each,
+          size: sizes === 'honest' ? each : 1024,
           url_private: url,
         })),
       }),
@@ -418,7 +418,7 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
 
     const attachments = (inbound[0]!.message.content as { attachments: Array<{ data?: string }> }).attachments;
     expect(attachments.map((a) => Buffer.from(a.data ?? '', 'base64').length)).toEqual([each, each, 0]);
-    expect(requests.map((request) => request.url)).toEqual(urls.slice(0, 2));
+    expect(requests.map((request) => request.url)).toEqual(urls.slice(0, fetched));
     expect(each).toBeGreaterThan(25 * MiB);
   });
 

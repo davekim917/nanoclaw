@@ -7,6 +7,7 @@ package now also lets the host hand it a limit.
 ## @chat-adapter/shared 4.41.1 → 4.41.1
 
 Source: patches/@chat-adapter__shared@4.41.1.patch
+Override: inbound files over 25 MiB dropped since the 2026-10-06 adapter bump; a patch at the shipped version. This PR adds the attachment-download tests, which count for later changes once merged
 
 - Slack downloads take the host's limit (100 MiB, `INBOUND_ATTACHMENT_MAX_BYTES`) instead of the 25 MiB default · test: src/channels/slack-live-path.test.ts
 - Discord downloads take the same limit · test: src/channels/discord-live-path.test.ts

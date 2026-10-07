@@ -824,7 +824,7 @@
 "src/channels/chat-sdk-bridge-membership.test.ts":{"diff":192,"mode":"100644","sha256":null,"deleted":true},
 "src/channels/chat-sdk-bridge-raw-text.test.ts":{"diff":66,"mode":"100644","sha256":null,"deleted":true},
 "src/channels/chat-sdk-bridge.test.ts":{"diff":1425,"mode":"100644","sha256":"7f3b68331d6e5beda0ceafc9168ef44e1e43434a186c02363896982d7d8c13e7"},
-"src/channels/chat-sdk-bridge.ts":{"diff":2170,"mode":"100644","sha256":"ac0ad1438f6331d11c8a369e3fd582e4432382351e15011e92ecada0f8229f51"},
+"src/channels/chat-sdk-bridge.ts":{"diff":2175,"mode":"100644","sha256":"10c4fa674fe06c120ecbbb6a0ed3f0db14ae01b1274c1794e4b39af5f1d31b6e"},
 "src/channels/cli.test.ts":{"diff":86,"mode":"100644","sha256":null,"deleted":true},
 "src/channels/cli.ts":{"diff":41,"mode":"100644","sha256":"e1d91aff3739fee72e8c4d5ce7fd45290f69c37c52786f14ba7114c7e631c6dc"},
 "src/channels/index.ts":{"diff":2,"mode":"100644","sha256":"7711a88123049d713ea36a49aceabc640c2e2a46cae98b56ce1dbee1b02f496c"},
