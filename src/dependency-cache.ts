@@ -1377,7 +1377,7 @@ function convertVerified(
         ...keepOwn.filter((file) => file.type === 'f').map((file) => fs.statSync(path.join(newDir, file.rel)).mtimeMs),
       );
       if (newestMs > hidden.mtimeMs) {
-        fs.utimesSync(hiddenLockfile, hidden.atimeMs / 1000, (Math.floor(newestMs) + 1) / 1000);
+        fs.utimesSync(hiddenLockfile, hidden.atimeMs / 1000, (Math.ceil(newestMs) + 1) / 1000);
       }
     } catch (err) {
       fs.rmSync(newDir, { recursive: true, force: true });
