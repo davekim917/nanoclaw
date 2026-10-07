@@ -106,11 +106,11 @@ describe('post-deploy inbound check', () => {
   });
 
   it('reports a quiet platform as unverified, never healthy, and one routine error does not make it failing', async () => {
-    const slack = mod.createAdapterLogger('slack', 'slack');
-    mod.createAdapterLogger('discord', 'discord');
+    mod.createAdapterLogger('slack', 'slack');
+    const discord = mod.createAdapterLogger('discord', 'discord');
     start();
-    mod.recordLiveInbound('discord');
-    slack.error('Could not fetch user info', { userId: 'U0EXAMPLE' });
+    mod.recordLiveInbound('slack');
+    discord.error('Discord API error', { status: 404 });
 
     await vi.advanceTimersByTimeAsync(WINDOW_MS - 1);
     expect(readReport().state).toBe('running');
@@ -118,8 +118,8 @@ describe('post-deploy inbound check', () => {
 
     await vi.advanceTimersByTimeAsync(1);
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toContain('slack: unverified — no live inbound, 1 adapter error(s)');
-    expect(alerts[0]).toContain('discord: verified');
+    expect(alerts[0]).toContain('discord: unverified — no live inbound, 1 adapter error(s)');
+    expect(alerts[0]).toContain('slack: verified');
   });
 
   it('logs the message and stack of an Error an adapter passes, which the host log would print as {}', async () => {
@@ -151,5 +151,11 @@ describe('post-deploy inbound check', () => {
     expect(readReport()).toMatchObject({ state: 'running', restartedWindow: true });
     await vi.advanceTimersByTimeAsync(WINDOW_MS);
     expect(mod.previousWindowUnfinished(reportPath)).toBe(false);
+  });
+
+  it('alerts when no chat adapter started at all, instead of reading an empty list as healthy', async () => {
+    start();
+    await vi.advanceTimersByTimeAsync(WINDOW_MS);
+    expect(alerts).toEqual([expect.stringContaining('no chat adapter started')]);
   });
 });

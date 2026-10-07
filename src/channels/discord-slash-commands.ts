@@ -146,8 +146,8 @@ async function announceDeployStatus(): Promise<void> {
   if (!textChannel) return;
   if (status.status === 'ok') {
     await textChannel.send(
-      `Deploy complete — service is up. Inbound is not verified yet: the post-deploy check reports each platform ` +
-        `within ${Math.round(POST_DEPLOY_INBOUND_WINDOW_MS / 60_000)} min and alerts the owner on a failure.`,
+      `Deploy complete — service is up. Inbound is not verified yet: the post-deploy check alerts the owner if any ` +
+        `platform is failing or unverified within ${Math.round(POST_DEPLOY_INBOUND_WINDOW_MS / 60_000)} min.`,
     );
   } else if (status.status === 'failed') {
     await textChannel.send(formatFailure(status));

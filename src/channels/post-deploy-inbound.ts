@@ -206,11 +206,12 @@ export function startPostDeployInboundCheck(deps: PostDeployCheckDeps): void {
     clearTimeout(early);
     const report = snapshot('done');
     writeReport(deps.reportPath, report);
-    const healthy = report.platforms.every((p) => p.verdict === 'verified');
+    const healthy = report.platforms.length > 0 && report.platforms.every((p) => p.verdict === 'verified');
     log[healthy ? 'info' : 'error']('Post-deploy inbound check finished', { ...report });
     if (!healthy) {
       const minutes = Math.round(deps.windowMs / 60_000);
-      send(`${header} after ${minutes} min:\n${report.platforms.map(describe).join('\n')}`);
+      const lines = report.platforms.length > 0 ? report.platforms.map(describe) : ['no chat adapter started'];
+      send(`${header} after ${minutes} min:\n${lines.join('\n')}`);
     }
   }, deps.windowMs);
   final.unref?.();
