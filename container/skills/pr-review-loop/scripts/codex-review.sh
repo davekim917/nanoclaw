@@ -49,7 +49,10 @@
 #       asked for changes and it neither adds docs/review-notes/<this PR>.md nor
 #       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`), or
 #       it adds a prohibited comment form (`comment_rule`; on unless the base's
-#       .github/pr-review-loop.json sets "commentRule": false)
+#       .github/pr-review-loop.json sets "commentRule": false), or it would
+#       publish a private identifier from the install's list (`public_boundary`;
+#       only where the base's .github/pr-review-loop.json sets
+#       "publicBoundaryScan": true, and with no identifier list it is exit 1)
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
@@ -799,8 +802,119 @@ comment_rule_gate() {
   esac
 }
 
+PUBLIC_BOUNDARY_NEEDS=(scripts/check-public-boundary.ts node_modules/.bin/tsx data/v2.db .nanoclaw/public-boundary-identifiers)
+
+# The install whose scanner and private identifier list the public-boundary
+# scan uses: NANOCLAW_DIR, else the checkout this copy of the script sits in.
+public_boundary_install() {
+  printf '%s' "${NANOCLAW_DIR:-$(cd "$HERE/../../../.." && pwd)}"
+}
+
+# 0 clean, 1 a finding, 2 no verdict, for one run of the scanner: its exit 1
+# also covers an identifier source it could not read, and an exit 0 that never
+# says it passed is a scanner that did not run its check.
+public_boundary_verdict() {
+  case "$1" in
+    0) [[ "$2" == *'public boundary check passed ('* ]] && return 0 ;;
+    1) [[ "$2" == *'public boundary check failed with '*' redacted finding(s)'* ]] && return 1 ;;
+  esac
+  return 2
+}
+
+# Scans head $2 with the scanner and identifier list in install $1, as
+# .husky/pre-push scans a pushed commit: its tree with the allowlist and baseline
+# it commits, then the text a merge publishes beside it, the PR title, branch,
+# body and commit messages, as the file pr-text. Prints the scanner's redacted
+# report and returns public_boundary_verdict's code, the worst of the two.
+public_boundary_run() {
+  local install="$1" head="$2" dir pr report tree=0 text=0 worst=0 status
+  local -a scan=(nice -n 10)
+  command -v ionice >/dev/null 2>&1 && scan=(ionice -c3 nice -n 10)
+  scan+=("$install/node_modules/.bin/tsx" "$install/scripts/check-public-boundary.ts"
+    --db "$install/data/v2.db" --identifiers "$install/.nanoclaw/public-boundary-identifiers")
+  PUBLIC_BOUNDARY_DIR=$(mktemp -d)
+  trap 'rm -rf "$PUBLIC_BOUNDARY_DIR"' EXIT
+  dir="$PUBLIC_BOUNDARY_DIR/head"
+  export GIT_TERMINAL_PROMPT=0
+  {
+    git init -q "$dir" &&
+      git -C "$dir" remote add origin "https://github.com/$REPO" &&
+      git -C "$dir" config credential.helper '!gh auth git-credential' &&
+      git -C "$dir" fetch -q --no-tags --depth=1 origin "$head" &&
+      git -C "$dir" read-tree "$head"
+  } 2>&1 >/dev/null || {
+    echo "could not fetch $head from $REPO"
+    return 2
+  }
+  git -C "$dir" show "$head:.public-boundary-allowlist.json" > "$PUBLIC_BOUNDARY_DIR/allowlist.json" 2>/dev/null ||
+    printf '{"entries": []}\n' > "$PUBLIC_BOUNDARY_DIR/allowlist.json"
+  pr=$(gh pr view "$PR" --repo "$REPO" --json title,body,headRefName,commits) || {
+    echo "could not read the PR's title, body and commits"
+    return 2
+  }
+  printf '%s' "$pr" | jq -r --arg head "$head" '
+    if (.commits | last | .oid) != $head then error("the PR commits do not end at \($head)")
+    else "# title", .title, "# branch", .headRefName, "# body", (.body // ""),
+      (.commits[] | "# commit \(.oid[0:12])", .messageHeadline, (.messageBody // ""))
+    end' > "$PUBLIC_BOUNDARY_DIR/pr-text" || {
+    echo "could not read the PR's commits up to $head"
+    return 2
+  }
+  report=$(cd "$install" && "${scan[@]}" --root "$dir" --index 2>&1 </dev/null) || tree=$?
+  printf '%s\n' "$report"
+  public_boundary_verdict "$tree" "$report" || worst=$?
+  report=$(cd "$install" && "${scan[@]}" --root "$dir" --message "$PUBLIC_BOUNDARY_DIR/pr-text" --message-raw \
+    --allowlist "$PUBLIC_BOUNDARY_DIR/allowlist.json" 2>&1 </dev/null) || text=$?
+  printf '%s\n' "$report"
+  status=0
+  public_boundary_verdict "$text" "$report" || status=$?
+  [ "$status" -gt "$worst" ] && worst=$status
+  return "$worst"
+}
+
+# Refuses (24) a head that publishes a private identifier, where the base's
+# REVIEW_LOOP_CONFIG sets "publicBoundaryScan": true. A scan that cannot run,
+# including where the install holds no identifier list (an agent container), is
+# no verdict (1).
+public_boundary_gate() {
+  local enabled install missing="" need report status=0
+  [ -n "$SCOPE_BASE" ] || return 0
+  enabled=$(review_loop_flag publicBoundaryScan false) || enabled=error
+  case "$enabled" in
+    false) return 0 ;;
+    true) ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: could not read $REVIEW_LOOP_CONFIG at $SCOPE_BASE as an object with a boolean publicBoundaryScan" >&2
+      exit 1
+      ;;
+  esac
+  install=$(public_boundary_install)
+  for need in "${PUBLIC_BOUNDARY_NEEDS[@]}"; do
+    [ -r "$install/$need" ] || missing="$missing $need"
+  done
+  if [ -n "$missing" ]; then
+    echo "merge=error head=$SCOPE_HEAD: public_boundary: $REVIEW_LOOP_CONFIG on $SCOPE_BASE_REF turns the private-identifier scan on, but $install lacks the scanner or the identifier list (missing:$missing). Run merge-check on the host, with NANOCLAW_DIR set to the install that holds them" >&2
+    exit 1
+  fi
+  report=$(public_boundary_run "$install" "$SCOPE_HEAD") || status=$?
+  case "$status" in
+    0) echo "merge-check: public_boundary: clean at $SCOPE_HEAD" >&2 ;;
+    1)
+      printf '%s\n' "$report" >&2
+      echo "merge=refused head=$SCOPE_HEAD: public_boundary: this head would publish a private identifier (redacted report above: file:line, where pr-text is the PR title, branch, body and commit messages in that order). Replace it with a fictional value and push a new head, or edit the title or body" >&2
+      exit 24
+      ;;
+    *)
+      printf '%s\n' "$report" >&2
+      echo "merge=error head=$SCOPE_HEAD: the public-boundary scan gave no verdict" >&2
+      exit 1
+      ;;
+  esac
+}
+
 final_gates() {
   comment_rule_gate
+  public_boundary_gate
   refuse_if_base_moved
 }
 

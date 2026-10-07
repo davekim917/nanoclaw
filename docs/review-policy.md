@@ -184,6 +184,18 @@ the diff adds: it stays only when a reader, human or agent, would get
 something wrong without it (an external system's quirk, why the obvious
 approach is wrong); anything else is a finding to cut.
 
+In a repo whose base branch sets `"publicBoundaryScan": true` in
+`.github/pr-review-loop.json`, merge-check also runs the install's
+`scripts/check-public-boundary.ts` over exactly the head it is asked to merge,
+as the pre-push hook scans a pushed commit (its tree, with the allowlist and
+baseline it commits), and over the PR title, branch, body and commit messages.
+A private identifier refuses the merge (exit 24); the fix is a fictional value
+in a new head, or an edited title or body. The scan needs the install's
+registry and identifier inventory, which only the host has: merge-check run
+where they are missing (an agent container, a scratch extraction without
+`NANOCLAW_DIR` naming the install) gives no verdict rather than passing.
+`audit` does not re-run it, since a GitHub runner has no identifier list.
+
 ## The test is blocking, not correctness
 
 Most findings should not stop a merge, including real ones. Review exists to
