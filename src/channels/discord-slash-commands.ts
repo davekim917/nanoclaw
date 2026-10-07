@@ -20,8 +20,9 @@ import {
   type TextChannel,
 } from 'discord.js';
 
-import { DATA_DIR, REPO_ROOT } from '../config.js';
+import { DATA_DIR, POST_DEPLOY_INBOUND_WINDOW_MS, REPO_ROOT } from '../config.js';
 import { startContainerRebuildWatcher, stopContainerRebuildWatcher } from '../container-rebuild-watcher.js';
+import { consumeDeployStatus, readDeployStatus, RECENT_DEPLOY_MS, type DeployStatus } from '../deploy-status.js';
 import { writeUpstreamPolicySnapshot } from '../container-updates.js';
 import { log } from '../log.js';
 import { runPluginUpdates } from '../plugin-updater.js';
@@ -35,7 +36,6 @@ const COMMANDS = [
 
 const DEPLOY_SCRIPT = path.resolve(REPO_ROOT, 'scripts', 'deploy.sh');
 const DEPLOY_LOG = path.resolve(REPO_ROOT, 'logs', 'deploy.log');
-const DEPLOY_STATUS = path.resolve(REPO_ROOT, 'logs', 'deploy-status.json');
 let client: Client | null = null;
 
 async function registerCommands(botToken: string, clientId: string, guildId: string): Promise<void> {
@@ -99,31 +99,6 @@ function spawnDetachedLogged(script: string): void {
   log.info('Detached deploy spawned', { pid: child.pid });
 }
 
-interface DeployStatus {
-  status?: 'ok' | 'failed';
-  step?: string;
-  error?: string;
-  mtimeMs: number;
-}
-
-function readDeployStatus(): DeployStatus | null {
-  try {
-    const raw = fs.readFileSync(DEPLOY_STATUS, 'utf-8');
-    const { mtimeMs } = fs.statSync(DEPLOY_STATUS);
-    return { ...(JSON.parse(raw) as Omit<DeployStatus, 'mtimeMs'>), mtimeMs };
-  } catch {
-    return null;
-  }
-}
-
-function consumeDeployStatus(): void {
-  try {
-    fs.unlinkSync(DEPLOY_STATUS);
-  } catch {
-    /* ignore — racy unlink is fine */
-  }
-}
-
 function formatFailure(status: DeployStatus): string {
   return `Deploy failed at **${status.step ?? 'unknown'}**: ${status.error ?? 'no detail'}`;
 }
@@ -164,13 +139,16 @@ function pollDeployStatus(interaction: ChatInputCommandInteraction): void {
 async function announceDeployStatus(): Promise<void> {
   const status = readDeployStatus();
   if (!status) return;
-  if (Date.now() - status.mtimeMs > 300_000) return;
+  if (Date.now() - status.mtimeMs > RECENT_DEPLOY_MS) return;
   const channelId = deployChannelId();
   if (!channelId) return;
   const textChannel = await getTextChannel(channelId);
   if (!textChannel) return;
   if (status.status === 'ok') {
-    await textChannel.send('Deploy complete — service is up.');
+    await textChannel.send(
+      `Deploy complete — service is up. Inbound is not verified yet: the post-deploy check alerts the owner if any ` +
+        `platform is failing or unverified within ${Math.round(POST_DEPLOY_INBOUND_WINDOW_MS / 60_000)} min.`,
+    );
   } else if (status.status === 'failed') {
     await textChannel.send(formatFailure(status));
   }

@@ -28,6 +28,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_NETWORK',
   'NANOCLAW_TASK_SCRIPT_TIMEOUT_MS',
   'NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS',
+  'NANOCLAW_POST_DEPLOY_INBOUND_WINDOW_MS',
   'ONECLI_GATEWAY_CONTAINER',
 ]);
 
@@ -92,6 +93,11 @@ export const REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS = parseTimeoutMs(
   process.env.NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS ?? envConfig.NANOCLAW_REPOSITORY_QUIESCE_TIMEOUT_MS,
   600_000,
   30 * 60_000,
+);
+export const POST_DEPLOY_INBOUND_WINDOW_MS = parseTimeoutMs(
+  process.env.NANOCLAW_POST_DEPLOY_INBOUND_WINDOW_MS ?? envConfig.NANOCLAW_POST_DEPLOY_INBOUND_WINDOW_MS,
+  30 * 60_000,
+  6 * 60 * 60_000,
 );
 function parseTimeoutMs(raw: string | undefined, fallbackMs = 120_000, maxMs = 600_000): number {
   const parsed = Number.parseInt(raw ?? '', 10);

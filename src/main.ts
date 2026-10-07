@@ -4,7 +4,16 @@ import { pathToFileURL } from 'url';
 
 import { activateAgentRunnerSource, pruneAgentRunnerSnapshots } from './agent-runner-source.js';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
+import {
+  POST_DEPLOY_EARLY_CHECK_MS,
+  POST_DEPLOY_FAILING_ERROR_THRESHOLD,
+  POST_DEPLOY_REPORT_PATH,
+  previousWindowUnfinished,
+  startPostDeployInboundCheck,
+} from './channels/post-deploy-inbound.js';
 import { markDeployBootHealthy } from './deploy-crash-guard.js';
+import { bootFollowsSuccessfulDeploy } from './deploy-status.js';
+import { notifyOperators } from './operator-alert.js';
 import {
   changedPathsBetween,
   commitCountBetween,
@@ -15,7 +24,7 @@ import {
   readBuildInfo,
   readCheckoutHead,
 } from './build-info.js';
-import { DATA_DIR, HOST_LEASE_TTL_MS, REPO_ROOT } from './config.js';
+import { DATA_DIR, HOST_LEASE_TTL_MS, POST_DEPLOY_INBOUND_WINDOW_MS, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
@@ -470,6 +479,9 @@ export function resolveChannelMetadataUpdates(
 
 export async function main(): Promise<void> {
   log.info('NanoClaw starting');
+  // Read before the Discord deploy announcer consumes the status file.
+  const deployBoot = bootFollowsSuccessfulDeploy();
+  const restartedWindow = !deployBoot && previousWindowUnfinished();
 
   const buildInfo = readBuildInfo(REPO_ROOT);
   if (buildInfo) {
@@ -728,6 +740,18 @@ export async function main(): Promise<void> {
   // Dispatches by exact registry key (instance ?? channelType): an offline named instance is never rerouted
   // through a sibling bot.
   setDeliveryAdapter(createChannelDeliveryAdapter());
+  if (deployBoot || restartedWindow) {
+    startPostDeployInboundCheck({
+      build: buildInfo?.shortSha ?? null,
+      windowMs: POST_DEPLOY_INBOUND_WINDOW_MS,
+      earlyCheckMs: POST_DEPLOY_EARLY_CHECK_MS,
+      failingErrorThreshold: POST_DEPLOY_FAILING_ERROR_THRESHOLD,
+      notify: notifyOperators,
+      reportPath: POST_DEPLOY_REPORT_PATH,
+      restartedWindow,
+    });
+    log.info('Post-deploy inbound check started', { windowMs: POST_DEPLOY_INBOUND_WINDOW_MS, restartedWindow });
+  }
 
   // Everything that can mutate central-DB state on this process's behalf is up only now; an earlier `ncl` call
   // could read or write mid-setup state.
