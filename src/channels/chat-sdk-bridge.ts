@@ -26,6 +26,9 @@ import {
   getNodeChildren,
   isListNode,
 } from 'chat';
+import { setAttachmentDownloadDefaults } from '@chat-adapter/shared';
+
+import { INBOUND_ATTACHMENT_MAX_BYTES, INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES } from '../config.js';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
@@ -41,6 +44,8 @@ import type {
   ChannelSetup,
   InboundMessage,
 } from './adapter.js';
+
+setAttachmentDownloadDefaults({ limit: INBOUND_ATTACHMENT_MAX_BYTES });
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -813,6 +818,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // Download attachment data before serialization loses fetchData()
     if (message.attachments && message.attachments.length > 0) {
       const enriched = [];
+      let budget = INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES;
+      const overBudget = (name: string | undefined, bytes: number | undefined): boolean => {
+        const limit = Math.min(budget, INBOUND_ATTACHMENT_MAX_BYTES);
+        if (bytes === undefined || bytes <= limit) return false;
+        log.warn('Attachment exceeds the file limit or what is left of the message budget, skipping', {
+          name,
+          bytes,
+          limit,
+        });
+        return true;
+      };
       for (const att of message.attachments) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const entry: Record<string, any> = {
@@ -825,21 +841,38 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         };
         const attUrl = (att as unknown as { url?: string }).url;
         if (attUrl) entry.url = attUrl;
+        if (overBudget(att.name, typeof att.size === 'number' ? att.size : undefined)) {
+          enriched.push(entry);
+          continue;
+        }
         if (att.fetchData) {
           try {
-            const buffer = await att.fetchData();
-            entry.data = buffer.toString('base64');
+            const raw = await att.fetchData();
+            const buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+            if (!overBudget(att.name, buffer.length)) {
+              entry.data = buffer.toString('base64');
+              budget -= buffer.length;
+            }
           } catch (err) {
             log.warn('Failed to download attachment via fetchData', { type: att.type, err });
           }
         } else if (attUrl) {
-          // For adapters without fetchData (e.g. @chat-adapter/discord): Discord CDN URLs are signed and public, but
-          // the signature expires, so bytes must be pulled now.
+          // For an adapter without fetchData: a signed attachment URL expires, so bytes must be pulled now.
           try {
             const response = await fetch(attUrl);
             if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+            const declared = Number(response.headers.get('content-length'));
+            const limit = Math.min(budget, INBOUND_ATTACHMENT_MAX_BYTES);
+            if (Number.isFinite(declared) && declared > limit) {
+              await response.body?.cancel();
+              throw new Error(`declared ${declared} bytes, over the ${limit}-byte limit`);
+            }
             const buffer = Buffer.from(await response.arrayBuffer());
-            entry.data = buffer.toString('base64');
+            if (buffer.length > INBOUND_ATTACHMENT_MAX_BYTES) throw new Error(`${buffer.length} bytes, over the limit`);
+            if (!overBudget(att.name, buffer.length)) {
+              entry.data = buffer.toString('base64');
+              budget -= buffer.length;
+            }
           } catch (err) {
             log.warn('Failed to download attachment via url fallback', { type: att.type, url: attUrl, err });
           }

@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 import type { ChannelSetup, InboundMessage } from './adapter.js';
+import { serveAttachments } from '../test-attachment-transport.js';
 
 const BOT_TOKEN = 'xoxb-live-path-test';
 const APP_TOKEN = 'xapp-live-path-test';
@@ -336,6 +337,89 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     expect(inbound[0]).toMatchObject({ platformId: `slack:${DM}`, threadId: `slack:${DM}:1790000004.000100` });
     expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: true });
     expect(inbound[0]!.message.content).toMatchObject({ text: 'a private question' });
+  });
+
+  it('downloads a shared file above the adapter default with the bot token, and refuses one above the host limit', async () => {
+    const { INBOUND_ATTACHMENT_MAX_BYTES } = await import('../config.js');
+    const MiB = 1024 * 1024;
+    const big = 'https://files.slack.com/files-pri/T0TEAMTEST-F0BIG/originals.zip';
+    const huge = 'https://files.slack.com/files-pri/T0TEAMTEST-F0HUGE/footage.zip';
+    const requests = serveAttachments(
+      new Map([
+        [big, 30 * MiB],
+        [huge, INBOUND_ATTACHMENT_MAX_BYTES + 1],
+      ]),
+    );
+    const file = (id: string, name: string, size: number, url: string) => ({
+      id,
+      name,
+      mimetype: 'application/zip',
+      filetype: 'zip',
+      size,
+      url_private: url,
+      url_private_download: url,
+    });
+    inbound.length = 0;
+    await sendEnvelope(
+      'env-files',
+      message({
+        type: 'message',
+        subtype: 'file_share',
+        channel: CHANNEL,
+        channel_type: 'channel',
+        user: HUMAN,
+        text: 'the archives',
+        ts: '1790000007.000100',
+        files: [file('F0HUGE', 'footage.zip', 101 * MiB, huge), file('F0BIG', 'originals.zip', 30 * MiB, big)],
+      }),
+    );
+    await nextInbound(1);
+
+    const attachments = (inbound[0]!.message.content as { attachments: Array<{ name: string; data?: string }> })
+      .attachments;
+    expect(attachments.map((a) => a.name)).toEqual(['footage.zip', 'originals.zip']);
+    expect(attachments[0]!.data).toBeUndefined();
+    expect(Buffer.from(attachments[1]!.data ?? '', 'base64').length).toBe(30 * MiB);
+    expect(requests).toEqual([{ url: big, authorization: `Bearer ${BOT_TOKEN}` }]);
+  });
+
+  it.each([
+    ['declared truthfully, without requesting the file that would not fit', 'honest', 2],
+    ['understated, by checking the bytes that arrived', 'understated', 3],
+  ])("stops a message's files at the per-message budget when their sizes are %s", async (_label, sizes, fetched) => {
+    const { INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES } = await import('../config.js');
+    const MiB = 1024 * 1024;
+    const each = Math.floor(INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES / 2.5);
+    const urls = ['F0ONE', 'F0TWO', 'F0THREE'].map(
+      (id) => `https://files.slack.com/files-pri/T0TEAMTEST-${id}/part.bin`,
+    );
+    const requests = serveAttachments(new Map(urls.map((url) => [url, each])));
+    inbound.length = 0;
+    await sendEnvelope(
+      `env-budget-${sizes}`,
+      message({
+        type: 'message',
+        subtype: 'file_share',
+        channel: CHANNEL,
+        channel_type: 'channel',
+        user: HUMAN,
+        text: 'three parts',
+        ts: sizes === 'honest' ? '1790000008.000100' : '1790000009.000100',
+        files: urls.map((url, i) => ({
+          id: `F0PART${i}`,
+          name: `part${i}.bin`,
+          mimetype: 'application/octet-stream',
+          size: sizes === 'honest' ? each : 1024,
+          url_private: url,
+        })),
+      }),
+    );
+    await nextInbound(1);
+
+    const attachments = (inbound[0]!.message.content as { attachments: Array<{ data?: string }> }).attachments;
+    expect(attachments.map((a) => Buffer.from(a.data ?? '', 'base64').length)).toEqual([each, each, 0]);
+    expect(requests.map((request) => request.url)).toEqual(urls.slice(0, fetched));
+    expect(each).toBeGreaterThan(25 * MiB);
   });
 
   it('posts an agent reply into its thread through chat.postMessage', async () => {

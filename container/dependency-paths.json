@@ -18,7 +18,7 @@
     },
     "attachment-download": {
       "description": "Files attached to Slack and Discord messages downloaded for the agent",
-      "tests": []
+      "tests": ["src/channels/discord-live-path.test.ts", "src/channels/slack-live-path.test.ts"]
     },
     "onecli-gateway": {
       "description": "Host calls to the OneCLI control API that every container spawn depends on",

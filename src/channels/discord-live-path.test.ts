@@ -14,6 +14,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 
 import { allowNetwork } from '../test-hermeticity.js';
 import type { ChannelSetup, InboundMessage } from './adapter.js';
+import { serveAttachments } from '../test-attachment-transport.js';
 
 const TOKEN = 'live-path-test-token';
 const BOT = '123456789000000001';
@@ -294,6 +295,47 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
 
     expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: false });
     expect(inbound[0]!.message.content).toMatchObject({ text: expect.stringContaining('one more thing') });
+  });
+
+  it('downloads an attachment above the adapter default without sending the bot token to the CDN', async () => {
+    const { INBOUND_ATTACHMENT_MAX_BYTES } = await import('../config.js');
+    const MiB = 1024 * 1024;
+    const big = `https://cdn.discordapp.com/attachments/${CHANNEL}/123456789000000020/originals.zip`;
+    const huge = `https://cdn.discordapp.com/attachments/${CHANNEL}/123456789000000021/footage.zip`;
+    const requests = serveAttachments(
+      new Map([
+        [big, 30 * MiB],
+        [huge, INBOUND_ATTACHMENT_MAX_BYTES + 1],
+      ]),
+    );
+    const attachment = (id: string, filename: string, size: number, url: string) => ({
+      id,
+      filename,
+      size,
+      url,
+      proxy_url: url.replace('cdn.discordapp.com', 'media.discordapp.net'),
+      content_type: 'application/zip',
+    });
+    inbound.length = 0;
+    dispatch(
+      'MESSAGE_CREATE',
+      messageCreate('123456789000000014', {
+        channel_id: DM_CHANNEL,
+        content: 'the archives',
+        attachments: [
+          attachment('123456789000000021', 'footage.zip', 101 * MiB, huge),
+          attachment('123456789000000020', 'originals.zip', 30 * MiB, big),
+        ],
+      }),
+    );
+    await nextInbound(1);
+
+    const attachments = (inbound[0]!.message.content as { attachments: Array<{ name: string; data?: string }> })
+      .attachments;
+    expect(attachments.map((a) => a.name)).toEqual(['footage.zip', 'originals.zip']);
+    expect(attachments[0]!.data).toBeUndefined();
+    expect(Buffer.from(attachments[1]!.data ?? '', 'base64').length).toBe(30 * MiB);
+    expect(requests).toEqual([{ url: big, authorization: undefined }]);
   });
 
   it('delivers a plain guild message as not a mention', async () => {

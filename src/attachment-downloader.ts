@@ -2,10 +2,9 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { INBOUND_ATTACHMENT_MAX_BYTES } from './config.js';
 import { sessionDir } from './session-manager.js';
 import { log } from './log.js';
-
-const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024; // 25MB per file — Slack's own limit
 
 function sanitizeSegment(segment: string, fallback: string): string {
   const cleaned = segment
@@ -53,7 +52,7 @@ export function persistInboundAttachments(
     try {
       const buffer = Buffer.from(raw.data, 'base64');
       if (buffer.length === 0) continue;
-      if (buffer.length > MAX_ATTACHMENT_BYTES) {
+      if (buffer.length > INBOUND_ATTACHMENT_MAX_BYTES) {
         log.warn('Attachment exceeds size limit, skipping', {
           messageId,
           name: raw.name,
