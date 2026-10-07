@@ -37,6 +37,11 @@ interface DiscordRecoveryThread {
 
 const DISCORD_EPOCH_MS = 1420070400000n;
 
+/** The versioned REST base. `DISCORD_API_URL` is the override the Discord adapter itself reads. */
+function discordApiUrl(): string {
+  return process.env.DISCORD_API_URL || 'https://discord.com/api/v10';
+}
+
 function snowflakeMs(id: string | null | undefined): number | null {
   if (!id) return null;
   try {
@@ -288,7 +293,7 @@ function makeFetchThreadAnchor(
     // first wake the trigger IS the anchor; prepending it would duplicate the current turn.
     if (opts?.excludeMessageId && opts.excludeMessageId === threadId) return null;
 
-    const url = `https://discord.com/api/v10/channels/${channelId}/messages/${threadId}`;
+    const url = `${discordApiUrl()}/channels/${channelId}/messages/${threadId}`;
     let response: Response;
     try {
       response = await fetch(url, { headers: { Authorization: `Bot ${botToken}` } });
@@ -427,7 +432,7 @@ const DISCORD_REST_TIMEOUT_MS = 5000;
 
 async function fetchDiscordBotIdentity(botToken: string): Promise<DiscordBotIdentity | null> {
   try {
-    const res = await fetch('https://discord.com/api/v10/users/@me', {
+    const res = await fetch(`${discordApiUrl()}/users/@me`, {
       headers: { Authorization: `Bot ${botToken}` },
       signal: AbortSignal.timeout(DISCORD_REST_TIMEOUT_MS),
     });
