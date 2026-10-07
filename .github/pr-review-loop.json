@@ -1,3 +1,4 @@
 {
-  "requireReplacesLine": true
+  "requireReplacesLine": true,
+  "publicBoundaryScan": true
 }

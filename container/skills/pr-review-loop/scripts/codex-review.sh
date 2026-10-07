@@ -22,7 +22,9 @@
 #   codex-review.sh merge-check [--head <sha>]
 #                                             # exit 0 only when merging exactly that head is allowed
 #   codex-review.sh merge --head <sha> [--method merge|squash]
-#                                             # risk-scoped repos' only merge path: merge-check, then gh pr merge on its exit 0 alone
+#                                             # risk-scoped repos' only merge path: merge-check, then gh pr merge on its exit 0 alone;
+#                                             # where the public-boundary scan is on, always a squash with the message it scanned,
+#                                             # and exit 24 before queueing for a base that requires a merge queue
 #   codex-review.sh audit                     # a merged PR as of its merge, by the merge-check rules of THIS copy; exit 28 = it bypassed the gate
 #                                             # (review-thread resolution alone is read as it stands now; see the audit arm)
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
@@ -49,7 +51,10 @@
 #       asked for changes and it neither adds docs/review-notes/<this PR>.md nor
 #       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`), or
 #       it adds a prohibited comment form (`comment_rule`; on unless the base's
-#       .github/pr-review-loop.json sets "commentRule": false)
+#       .github/pr-review-loop.json sets "commentRule": false), or it would
+#       publish a private identifier from the install's list (`public_boundary`;
+#       only where the default branch's .github/pr-review-loop.json sets
+#       "publicBoundaryScan": true, and with no identifier list it is exit 1)
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
@@ -677,12 +682,13 @@ fix_link_state() {
     )'
 }
 
-# Key $1 of REVIEW_LOOP_CONFIG at the base commit scope_eval resolved, through jq
-# filter $3, or $2 when the file or key is absent. A config that cannot be read, or
-# holds a value $3 rejects, returns non-zero: no verdict, never a pass.
+# Key $1 of REVIEW_LOOP_CONFIG at commit $4, by default the base commit scope_eval
+# resolved, through jq filter $3, or $2 when the file or key is absent. A config
+# that cannot be read, or holds a value $3 rejects, returns non-zero: no verdict,
+# never a pass.
 review_loop_value() {
   local config status=0
-  config=$(base_file "$SCOPE_BASE" "$REVIEW_LOOP_CONFIG") || status=$?
+  config=$(base_file "${4:-$SCOPE_BASE}" "$REVIEW_LOOP_CONFIG") || status=$?
   case "$status" in
     0)
       printf '%s' "$config" | jq -r --arg key "$1" --argjson default "$2" "def valid: $3;"'
@@ -696,7 +702,7 @@ review_loop_value() {
 }
 
 review_loop_flag() {
-  review_loop_value "$1" "$2" 'if type == "boolean" then . else error("not a boolean") end'
+  review_loop_value "$1" "$2" 'if type == "boolean" then . else error("not a boolean") end' "${3:-}"
 }
 
 # `missing` when the base requires a `Replaces:` line and the {body} JSON
@@ -799,8 +805,159 @@ comment_rule_gate() {
   esac
 }
 
+PUBLIC_BOUNDARY_NEEDS=(scripts/check-public-boundary.ts node_modules/.bin/tsx data/v2.db .nanoclaw/public-boundary-identifiers)
+
+# The install whose scanner and private identifier list the public-boundary
+# scan uses, as an absolute path: NANOCLAW_DIR, else the checkout this copy of
+# the script sits in. A directory that does not exist is printed as given.
+public_boundary_install() {
+  local dir="${NANOCLAW_DIR:-$HERE/../../../..}"
+  (cd "$dir" 2>/dev/null && pwd) || printf '%s' "$dir"
+}
+
+# 0 clean, 1 a finding, 2 no verdict, for one run of the scanner: its exit 1
+# also covers an identifier source it could not read, and an exit 0 that never
+# says it passed is a scanner that did not run its check.
+public_boundary_verdict() {
+  case "$1" in
+    0) [[ "$2" == *'public boundary check passed ('* ]] && return 0 ;;
+    1) [[ "$2" == *'public boundary check failed with '*' redacted finding(s)'* ]] && return 1 ;;
+  esac
+  return 2
+}
+
+# Scans head $2 with the scanner and identifier list in install $1: its tree, as
+# .husky/pre-push scans a pushed commit but with the base's baseline $3 and
+# allowlist $4, then the squash commit message the merge publishes, subject $5
+# and body $6, as the file pr-text. Prints the scanner's redacted report and
+# returns public_boundary_verdict's code, the worse of the two.
+public_boundary_run() {
+  local install="$1" head="$2" dir report tree=0 text=0 worst=0 status=0 var
+  local -a scan=(nice -n 10)
+  # Always run in a command substitution, so this unsets nothing for the caller:
+  # an exported GIT_DIR or GIT_INDEX_FILE would point the scratch repository's
+  # git, and the scanner's, at the caller's repository and index.
+  for var in $(git rev-parse --local-env-vars); do unset "$var"; done
+  command -v ionice >/dev/null 2>&1 && scan=(ionice -c3 nice -n 10)
+  PUBLIC_BOUNDARY_DIR=$(mktemp -d)
+  trap 'rm -rf "$PUBLIC_BOUNDARY_DIR"' EXIT
+  printf '%s\n' "$3" > "$PUBLIC_BOUNDARY_DIR/baseline.json"
+  printf '%s\n' "$4" > "$PUBLIC_BOUNDARY_DIR/allowlist.json"
+  printf '%s\n\n%s\n' "$5" "$6" > "$PUBLIC_BOUNDARY_DIR/pr-text"
+  scan+=("$install/node_modules/.bin/tsx" "$install/scripts/check-public-boundary.ts"
+    --db "$install/data/v2.db" --identifiers "$install/.nanoclaw/public-boundary-identifiers"
+    --allowlist "$PUBLIC_BOUNDARY_DIR/allowlist.json")
+  dir="$PUBLIC_BOUNDARY_DIR/head"
+  export GIT_TERMINAL_PROMPT=0
+  {
+    git init -q "$dir" &&
+      git -C "$dir" remote add origin "https://github.com/$REPO" &&
+      git -C "$dir" config credential.helper '!gh auth git-credential' &&
+      git -C "$dir" fetch -q --no-tags --depth=1 origin "$head" &&
+      git -C "$dir" read-tree "$head"
+  } 2>&1 >/dev/null || {
+    echo "could not fetch $head from $REPO"
+    return 2
+  }
+  report=$(cd "$install" && "${scan[@]}" --root "$dir" --index --baseline "$PUBLIC_BOUNDARY_DIR/baseline.json" 2>&1 </dev/null) || tree=$?
+  printf '%s\n' "$report"
+  public_boundary_verdict "$tree" "$report" || worst=$?
+  report=$(cd "$install" && "${scan[@]}" --root "$dir" --message "$PUBLIC_BOUNDARY_DIR/pr-text" --message-raw 2>&1 </dev/null) || text=$?
+  printf '%s\n' "$report"
+  public_boundary_verdict "$text" "$report" || status=$?
+  [ "$status" -gt "$worst" ] && worst=$status
+  return "$worst"
+}
+
+# File $2 at commit $1, or the JSON $3 when that commit has none. The scan's
+# exemptions come from the default branch, never the head: a PR's own baseline or
+# allowlist entry must not exempt its own hit.
+public_boundary_policy() {
+  local raw status=0
+  raw=$(base_file "$1" "$2") || status=$?
+  case "$status" in
+    0) printf '%s' "$raw" ;;
+    3) printf '%s' "$3" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Refuses (24) a head that publishes a private identifier, where the default
+# branch's REVIEW_LOOP_CONFIG sets "publicBoundaryScan": true. The default branch
+# decides, not the PR's base, because GitHub merges a PR into whatever base it has
+# by then: one retargeted after this check would otherwise skip the scan. A scan
+# that cannot run, including where the install holds no identifier list (an agent
+# container), is no verdict (1). On a pass, writes the squash subject and body it
+# scanned to $PUBLIC_BOUNDARY_PUBLISH, when `merge` set it, which merges with
+# exactly them.
+public_boundary_gate() {
+  local default tip enabled install missing="" need pr subject body baseline allowlist report status=0
+  default=$(gh api "repos/$REPO" --jq .default_branch) && [ -n "$default" ] || {
+    echo "merge=error head=$SCOPE_HEAD: public_boundary: could not read the default branch of $REPO, whose $REVIEW_LOOP_CONFIG decides the private-identifier scan" >&2
+    exit 1
+  }
+  if [ "$default" = "$SCOPE_BASE_REF" ] && [ -n "$SCOPE_BASE" ]; then
+    tip="$SCOPE_BASE"
+  else
+    tip=$(base_tip "$default") || {
+      echo "merge=error head=$SCOPE_HEAD: public_boundary: could not resolve $default, the default branch of $REPO" >&2
+      exit 1
+    }
+  fi
+  enabled=$(review_loop_flag publicBoundaryScan false "$tip") || enabled=error
+  case "$enabled" in
+    false) return 0 ;;
+    true) ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: could not read $REVIEW_LOOP_CONFIG at $tip ($default) as an object with a boolean publicBoundaryScan" >&2
+      exit 1
+      ;;
+  esac
+  install=$(public_boundary_install)
+  for need in "${PUBLIC_BOUNDARY_NEEDS[@]}"; do
+    [ -r "$install/$need" ] || missing="$missing $need"
+  done
+  if [ -n "$missing" ]; then
+    echo "merge=error head=$SCOPE_HEAD: public_boundary: $REVIEW_LOOP_CONFIG on $SCOPE_BASE_REF turns the private-identifier scan on, but $install lacks the scanner or the identifier list (missing:$missing). Run merge-check on the host, with NANOCLAW_DIR set to the install that holds them" >&2
+    exit 1
+  fi
+  baseline=$(public_boundary_policy "$tip" .public-boundary-baseline.json '{"files": {}}') &&
+    allowlist=$(public_boundary_policy "$tip" .public-boundary-allowlist.json '{"entries": []}') || {
+    echo "merge=error head=$SCOPE_HEAD: public_boundary: could not read the baseline and allowlist at $tip ($default)" >&2
+    exit 1
+  }
+  pr=$(gh pr view "$PR" --repo "$REPO" --json title,body) &&
+    subject=$(printf '%s' "$pr" | jq -er '.title | strings') &&
+    body=$(printf '%s' "$pr" | jq -r '.body // ""') || {
+    echo "merge=error head=$SCOPE_HEAD: public_boundary: could not read the PR title and body" >&2
+    exit 1
+  }
+  subject="$subject (#$PR)"
+  report=$(public_boundary_run "$install" "$SCOPE_HEAD" "$baseline" "$allowlist" "$subject" "$body") || status=$?
+  case "$status" in
+    0)
+      echo "merge-check: public_boundary: clean at $SCOPE_HEAD" >&2
+      if [ -n "${PUBLIC_BOUNDARY_PUBLISH:-}" ]; then
+        printf '%s' "$subject" > "$PUBLIC_BOUNDARY_PUBLISH/subject"
+        printf '%s' "$body" > "$PUBLIC_BOUNDARY_PUBLISH/body"
+      fi
+      ;;
+    1)
+      printf '%s\n' "$report" >&2
+      echo "merge=refused head=$SCOPE_HEAD: public_boundary: this head would publish a private identifier (redacted report above: file:line, where pr-text is the squash commit message, line 1 the PR title and line 3 on its body). Replace it with a fictional value and push a new head, or edit the title or body" >&2
+      exit 24
+      ;;
+    *)
+      printf '%s\n' "$report" >&2
+      echo "merge=error head=$SCOPE_HEAD: the public-boundary scan gave no verdict" >&2
+      exit 1
+      ;;
+  esac
+}
+
 final_gates() {
   comment_rule_gate
+  public_boundary_gate
   refuse_if_base_moved
 }
 
@@ -2924,19 +3081,46 @@ $assessment
     # this shell before its code is read. `( ... ) || checked=$?` would not do:
     # bash ignores errexit in anything run on the left of `||`, a subshell
     # that sets it again included (bash(1), `set -e`).
+    #
+    # Where the public-boundary scan is on, the merge is a squash whose subject
+    # and body are exactly the text the scan read (public_boundary_gate): a
+    # merge commit would carry every intermediate commit's tree and message into
+    # the base, and GitHub's default message would re-read a title edited after
+    # the scan.
+    PUBLIC_BOUNDARY_PUBLISH=$(mktemp -d)
+    trap 'rm -rf "$PUBLIC_BOUNDARY_PUBLISH"' EXIT
     set +e
     ( set -e; merge_check_main --head "$head" )
     checked=$?
     set -e
     if [ "$checked" -eq 25 ]; then
       echo "merge: the base moved while merge-check ran; checking once more" >&2
+      rm -f "$PUBLIC_BOUNDARY_PUBLISH/subject" "$PUBLIC_BOUNDARY_PUBLISH/body"
       set +e
       ( set -e; merge_check_main --head "$head" )
       checked=$?
       set -e
     fi
     [ "$checked" -eq 0 ] || exit "$checked"
-    gh pr merge "$PR" --repo "$REPO" "--$method" --match-head-commit "$head" || {
+    message=()
+    if [ -f "$PUBLIC_BOUNDARY_PUBLISH/subject" ]; then
+      # A queued merge ignores the method, subject and body (gh pr merge's own
+      # manual), so its message and history would be ones the scan never read.
+      queue=$(gh api graphql -F owner="$OWNER" -F name="$NAME" -F pr="$PR" \
+        -f query='query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isMergeQueueEnabled baseRefName } } }' |
+        jq -er '.data.repository.pullRequest | if (.isMergeQueueEnabled | type) == "boolean" then "\(.isMergeQueueEnabled)\t\(.baseRefName)" else error("no isMergeQueueEnabled") end') || {
+        echo "merge=error head=$head: could not read whether PR #$PR's base requires a merge queue; nothing merged" >&2
+        exit 1
+      }
+      if [ "${queue%%$'\t'*}" = true ]; then
+        echo "merge=refused head=$head: ${queue#*$'\t'} requires a merge queue, which would ignore the squash subject and body the public-boundary scan read; merge PR #$PR by hand, checking the queued commit's message and history yourself" >&2
+        exit 24
+      fi
+      [ "$method" = squash ] || echo "merge: the public-boundary scan is on, so this merge is a squash with the scanned message, not --method $method" >&2
+      method=squash
+      message=(--subject "$(cat "$PUBLIC_BOUNDARY_PUBLISH/subject")" --body "$(cat "$PUBLIC_BOUNDARY_PUBLISH/body")")
+    fi
+    gh pr merge "$PR" --repo "$REPO" "--$method" --match-head-commit "$head" "${message[@]}" || {
       echo "merge=failed head=$head: merge-check allowed it, but gh pr merge did not merge PR #$PR" >&2
       exit 27
     }

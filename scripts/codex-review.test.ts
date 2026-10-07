@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
@@ -118,6 +119,11 @@ for arg in "$@"; do
 done
 if [ -n "$rest" ]; then
   printf 'rest %s\\n' "$rest" >> "$MOCK_CALLS"
+  # The repository itself, as --jq .default_branch prints it: default-branch holds the name (absent = main).
+  if [[ "$rest" =~ ^repos/[^/]+/[^/]+$ ]]; then
+    if [ -f "$MOCK_DIR/default-branch" ]; then cat "$MOCK_DIR/default-branch"; else echo main; fi
+    exit 0
+  fi
   case "$rest" in
     */contents/.github/labeler.yml\\?ref=*)
       # labeler--<ref>.yml is the file at that ref. A .nocommit marker answers as
@@ -148,6 +154,17 @@ if [ -n "$rest" ]; then
         exit 1
       fi
       if [ -f "$MOCK_DIR/review-loop--$ref.json" ]; then cat "$MOCK_DIR/review-loop--$ref.json"; exit 0; fi
+      echo '{"message":"Not Found","status":"404"}'
+      echo 'gh: Not Found (HTTP 404)' >&2
+      exit 1
+      ;;
+    */contents/*\\?ref=*)
+      # contents--<ref>--<path, each / as __> is any other file at that ref; absent = GitHub's 404.
+      ref="\${rest##*ref=}"
+      file="\${rest#*/contents/}"
+      file="\${file%%\\?ref=*}"
+      src="$MOCK_DIR/contents--$ref--\${file//\\//__}"
+      if [ -f "$src" ]; then cat "$src"; exit 0; fi
       echo '{"message":"Not Found","status":"404"}'
       echo 'gh: Not Found (HTTP 404)' >&2
       exit 1
@@ -311,6 +328,7 @@ for arg in "$@"; do
   esac
 done
 case "$query" in
+  *isMergeQueueEnabled*) connection=mergeQueue ;;
   *userContentEdits*) connection=audit ;;
   *statusCheckRollup*) connection=rollup ;;
   *adminReadiness*) connection=adminReadiness ;;
@@ -7205,3 +7223,419 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     });
   });
 });
+
+describe(
+  'codex-review public-boundary scan: a head that would publish a private identifier never merges',
+  { timeout: 120_000 },
+  () => {
+    // Fictional names, one per identifier source the scanner reads: the install registry and the inventory.
+    const REGISTRY_NAME = 'Quillmoor Analytics';
+    const INVENTORY_NAME = 'Brannoch Vale';
+    const OPT_IN = '{ "commentRule": false, "publicBoundaryScan": true }\n';
+    const CLEAN_BASE = { 'README.md': 'Fixture project.\n' };
+    const TITLE = 'feat: route a new message kind';
+    const LEAK = { 'src/fixture.ts': `export const owner = '${INVENTORY_NAME}';\n` };
+
+    function isolatedEnv(home: string): Record<string, string> {
+      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+      return { ...(env as Record<string, string>), HOME: home, GIT_CONFIG_NOSYSTEM: '1' };
+    }
+
+    // A stand-in install: the real scanner and dependencies beside a temp registry and inventory.
+    function fakeInstall(root: string, opts: { inventory?: string | false; brokenGroup?: boolean } = {}): string {
+      const dir = path.join(root, 'install');
+      fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+      fs.mkdirSync(path.join(dir, 'data'));
+      // A copy, not a symlink: the scanner runs main() only when argv[1] is its own real path.
+      fs.copyFileSync(
+        path.resolve('scripts/check-public-boundary.ts'),
+        path.join(dir, 'scripts/check-public-boundary.ts'),
+      );
+      fs.symlinkSync(path.resolve('node_modules'), path.join(dir, 'node_modules'));
+      const db = new Database(path.join(dir, 'data', 'v2.db'));
+      db.exec('CREATE TABLE workgroups (id TEXT, display_name TEXT)');
+      db.prepare('INSERT INTO workgroups (id, display_name) VALUES (?, ?)').run('wg-fixture', REGISTRY_NAME);
+      db.close();
+      if (opts.inventory !== false) {
+        fs.mkdirSync(path.join(dir, '.nanoclaw'));
+        fs.writeFileSync(
+          path.join(dir, '.nanoclaw', 'public-boundary-identifiers'),
+          opts.inventory ?? `${INVENTORY_NAME}\n`,
+        );
+      }
+      if (opts.brokenGroup) {
+        fs.mkdirSync(path.join(dir, 'groups', 'fixture-group'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'groups', 'fixture-group', 'container.json'), '{ not json');
+      }
+      return dir;
+    }
+
+    function commit(dir: string, files: Record<string, string>, message: string): string {
+      for (const [name, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+        fs.writeFileSync(path.join(dir, name), text);
+      }
+      const result = spawnSync(
+        'bash',
+        [
+          '-c',
+          'git add -A && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -q -m "$1" && git rev-parse HEAD',
+          'commit',
+          message,
+        ],
+        { cwd: dir, encoding: 'utf8', env: isolatedEnv(dir) },
+      );
+      if (result.status !== 0) throw new Error(`fixture commit failed: ${result.stderr}`);
+      return result.stdout.trim();
+    }
+
+    // The PR's repository as GitHub would serve it: a base commit, any earlier PR commits, then the head.
+    function prRepository(
+      root: string,
+      head: Record<string, string>,
+      opts: { base?: Record<string, string>; earlier?: Record<string, string>[] } = {},
+    ): { remote: string; head: string } {
+      const remote = path.join(root, 'remote');
+      fs.mkdirSync(remote);
+      const init = spawnSync('bash', ['-c', 'git init -q && git config uploadpack.allowAnySHA1InWant true'], {
+        cwd: remote,
+        env: isolatedEnv(remote),
+      });
+      if (init.status !== 0) throw new Error('fixture init failed');
+      commit(remote, opts.base ?? CLEAN_BASE, 'chore: base');
+      for (const files of opts.earlier ?? []) commit(remote, files, 'wip');
+      return { remote, head: commit(remote, head, 'feat: add the fixture module') };
+    }
+
+    // scopeFixture's merge-ready PR (verdict skip, green CI), moved onto the real head commit. `baseFiles` are
+    // served as files at the base commit; `changed` is the file list the comparison reports for the PR.
+    function readyPr(
+      root: string,
+      head: string,
+      opts: {
+        reviewLoop?: string;
+        title?: string;
+        body?: string;
+        baseFiles?: Record<string, string>;
+        changed?: string[];
+        mergeQueue?: boolean;
+      } = {},
+    ): void {
+      scopeFixture(root, {
+        labels: [],
+        reviewLoop: opts.reviewLoop ?? OPT_IN,
+        title: opts.title ?? TITLE,
+        body: opts.body,
+        ...(opts.changed ? { files: opts.changed.map((name) => changedFile(name)) } : {}),
+      });
+      for (const name of fs.readdirSync(root)) {
+        const file = path.join(root, name);
+        if (!fs.statSync(file).isFile()) continue;
+        const moved = path.join(root, name.replaceAll(HEAD, head));
+        fs.writeFileSync(moved, fs.readFileSync(file, 'utf8').replaceAll(HEAD, head));
+        if (moved !== file) fs.rmSync(file);
+      }
+      for (const [name, text] of Object.entries(opts.baseFiles ?? {}))
+        fs.writeFileSync(path.join(root, `contents--${BASE_OID}--${name.replaceAll('/', '__')}`), text);
+      writeJson(root, 'pr-merged.json', { state: 'MERGED', mergeCommit: { oid: MERGE_OID } });
+      writeJson(root, 'mergeQueue-1.json', {
+        data: { repository: { pullRequest: { isMergeQueueEnabled: opts.mergeQueue ?? false, baseRefName: 'main' } } },
+      });
+    }
+
+    // The helper with real git and the real scanner; only the PR's GitHub remote is swapped for the fixture.
+    function runGate(
+      root: string,
+      args: string[],
+      remote: string,
+      nanoclawDir: string,
+      env: Record<string, string> = {},
+    ) {
+      const { bin, calls, sleepLog } = writeMocks(root);
+      for (const file of [calls, path.join(root, 'merged')]) fs.rmSync(file, { force: true });
+      fs.writeFileSync(
+        path.join(bin, 'git'),
+        `#!/usr/bin/env bash
+PATH="\${PATH#*:}"
+if [ "$1" = -C ] && [ "$3 $4 $5" = "remote add origin" ]; then exec git -C "$2" remote add origin "file://$MOCK_BOUNDARY_REMOTE"; fi
+if [ "$1" = -C ] && [ "$3" = fetch ]; then printf 'git %s\\n' "\${*:3}" >> "$MOCK_CALLS"; fi
+exec git "$@"
+`,
+        { mode: 0o755 },
+      );
+      const result = spawnSync('bash', [HELPER, ...args], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 110_000,
+        env: {
+          ...isolatedEnv(root),
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          REPO: 'example/repository',
+          PR: '1',
+          MOCK_DIR: root,
+          MOCK_CALLS: calls,
+          MOCK_SLEEP_LOG: sleepLog,
+          MOCK_BOUNDARY_REMOTE: remote,
+          REVIEW_ROUND_CAP: '',
+          CODEX_REVIEW_REQUIRED_WORKFLOWS: '',
+          CODEX_REVIEW_HOST_CI_POSTERS: 'fleet-bot',
+          NANOCLAW_DIR: nanoclawDir,
+          ...env,
+        },
+      });
+      return { ...result, calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '' };
+    }
+
+    function mergeCheck(root: string, head: string, remote: string, nanoclawDir: string) {
+      return runGate(root, ['merge-check', '--head', head], remote, nanoclawDir);
+    }
+
+    it('refuses a head whose tree adds a listed name, scanning that exact head and never printing the name', () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, LEAK);
+      readyPr(root, head);
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+      expect(result.stderr).toContain(`merge=refused head=${head}: public_boundary:`);
+      expect(result.stderr).not.toContain(INVENTORY_NAME);
+      expect(result.stdout).not.toContain('merge=allowed');
+      expect(result.calls).toContain(`git fetch -q --no-tags --depth=1 origin ${head}\n`);
+    });
+
+    it('lets a clean head through to the rest of the gate, with NANOCLAW_DIR given relative to the caller', () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, { 'src/fixture.ts': "export const owner = 'Fixture Owner';\n" });
+      readyPr(root, head);
+      fakeInstall(root);
+
+      const result = mergeCheck(root, head, remote, 'install');
+      expect(result.status).toBe(0);
+      expect(result.stdout).toMatch(new RegExp(`merge=allowed head=${head} mode=risk-scoped`));
+      expect(result.stderr).toContain(`public_boundary: clean at ${head}`);
+    });
+
+    // pr-text is the squash commit message: the subject, a blank line, then the body.
+    it.each<[string, { title?: string; body?: string }, number]>([
+      ['title', { title: `feat: onboard ${REGISTRY_NAME}` }, 1],
+      ['body', { body: `Summary.\n\nRolls out to ${REGISTRY_NAME}.` }, 5],
+    ])('refuses a clean tree whose PR %s names a registry name', (_where, text, line) => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
+      readyPr(root, head, text);
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(`pr-text:${line} private-identifier`);
+      expect(result.stderr).not.toContain(REGISTRY_NAME);
+    });
+
+    const HISTORY = 'docs/history.md';
+    const HELD = { files: { [HISTORY]: 1 } };
+
+    it.each([
+      ['holds a pre-existing line the base baseline records', { [HISTORY]: `Migrated from ${INVENTORY_NAME}.\n` }, 0],
+      [
+        'refuses a second line above the base baseline count',
+        { [HISTORY]: `Migrated from ${INVENTORY_NAME}.\nAnd ${INVENTORY_NAME} again.\n` },
+        24,
+      ],
+    ])('%s', (_case, headFiles, status) => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, headFiles);
+      readyPr(root, head, { baseFiles: { '.public-boundary-baseline.json': JSON.stringify(HELD) } });
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(status);
+      expect(result.stderr).toContain(
+        status === 0 ? 'public_boundary: clean' : 'public_boundary: this head would publish',
+      );
+    });
+
+    // The PR adds its own hit and an exemption for it in the same change; the scan reads the base's copy.
+    it.each([
+      ['baseline', { '.public-boundary-baseline.json': JSON.stringify({ files: { 'src/fixture.ts': 1 } }) }],
+      [
+        'allowlist',
+        {
+          '.public-boundary-allowlist.json': JSON.stringify({
+            entries: [{ path: 'src/fixture.ts', value: INVENTORY_NAME, reason: 'fixture' }],
+          }),
+        },
+      ],
+    ])("refuses a PR that adds its own hit to the head's %s", (_file, exemption) => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, { ...LEAK, ...exemption });
+      readyPr(root, head, { changed: ['src/fixture.ts', ...Object.keys(exemption)] });
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+    });
+
+    it('squash-merges a head whose earlier commit leaked, with exactly the subject and body it scanned', () => {
+      const root = tempRoot();
+      const body = 'Adds the fixture module.\n\nReplaces: nothing';
+      const { remote, head } = prRepository(
+        root,
+        { 'src/fixture.ts': "export const owner = 'Fixture Owner';\n" },
+        { earlier: [LEAK] },
+      );
+      readyPr(root, head, { body });
+      // Every read after the gate's sees a title edited to name a private identifier; the merge must not use it.
+      const pr = JSON.parse(fs.readFileSync(path.join(root, 'pr.json'), 'utf8')) as Page;
+      for (const n of [1, 2, 3, 4]) writeJson(root, `pr-${n}.json`, pr);
+      writeJson(root, 'pr.json', { ...pr, title: `feat: onboard ${REGISTRY_NAME}` });
+
+      const result = runGate(root, ['merge', '--head', head], remote, fakeInstall(root));
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merged pr=1 head=${head} method=squash commit=${MERGE_OID}`);
+      expect(result.stderr).toContain('this merge is a squash with the scanned message, not --method merge');
+      expect(result.calls).toContain(
+        `merge-args pr merge 1 --repo example/repository --squash --match-head-commit ${head} --subject ${TITLE} (#1) --body ${body}\n`,
+      );
+      expect(result.calls).not.toContain(REGISTRY_NAME);
+    });
+
+    it('reads the flag at the default branch alone, so a PR cannot switch the scan off for itself', () => {
+      const root = tempRoot();
+      const optOut = '{ "commentRule": false, "publicBoundaryScan": false }\n';
+      const { remote, head } = prRepository(root, { '.github/pr-review-loop.json': optOut, ...LEAK });
+      readyPr(root, head);
+      for (const ref of ['feat', head]) fs.writeFileSync(path.join(root, `review-loop--${ref}.json`), optOut);
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+    });
+
+    it('scans a PR whose own base leaves the flag off, since a retarget to the default branch needs no new head', () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, LEAK);
+      readyPr(root, head);
+      const pr = JSON.parse(fs.readFileSync(path.join(root, 'pr.json'), 'utf8')) as Page;
+      writeJson(root, 'pr.json', { ...pr, baseRefName: 'stable' });
+      fs.writeFileSync(path.join(root, 'ref--stable'), OTHER_HEAD);
+      fs.writeFileSync(path.join(root, `labeler--${OTHER_HEAD}.yml`), RISK_CONFIG);
+      fs.writeFileSync(path.join(root, `review-loop--${OTHER_HEAD}.json`), '{ "commentRule": false }\n');
+      writeJson(root, `compare--${OTHER_HEAD}...${head}.json`, {
+        status: 'ahead',
+        files: [changedFile('docs/notes.md')],
+      });
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+      expect(result.calls).toContain(
+        `rest repos/example/repository/contents/.github/pr-review-loop.json?ref=${BASE_OID}`,
+      );
+    });
+
+    it("leaves the caller's repository and index alone when GIT_DIR and GIT_INDEX_FILE are exported", () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, LEAK);
+      readyPr(root, head);
+      const caller = path.join(root, 'caller');
+      fs.mkdirSync(caller);
+      const staged = spawnSync(
+        'bash',
+        ['-c', 'git init -q && printf "staged work\\n" > work.txt && git add work.txt && git rev-parse --git-dir'],
+        { cwd: caller, encoding: 'utf8', env: isolatedEnv(caller) },
+      );
+      if (staged.status !== 0) throw new Error(`caller fixture failed: ${staged.stderr}`);
+      const index = path.join(caller, '.git', 'index');
+      const before = fs.readFileSync(index);
+
+      const result = runGate(root, ['merge-check', '--head', head], remote, fakeInstall(root), {
+        GIT_DIR: path.join(caller, '.git'),
+        GIT_INDEX_FILE: index,
+      });
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+      expect(fs.readFileSync(index).equals(before)).toBe(true);
+      expect(
+        fs.readdirSync(path.join(caller, '.git', 'objects')).filter((name) => /^[0-9a-f]{2}$/.test(name)),
+      ).toHaveLength(1);
+    });
+
+    it('refuses to merge into a branch that requires a merge queue, which would ignore the scanned message', () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
+      readyPr(root, head, { mergeQueue: true });
+
+      const result = runGate(root, ['merge', '--head', head], remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(`merge=refused head=${head}: main requires a merge queue`);
+      expect(result.calls).not.toContain('merge-args');
+    });
+
+    it('skips the scan, and merges by the method asked, where the base does not turn it on', () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, LEAK);
+      readyPr(root, head, { reviewLoop: '{ "commentRule": false }\n' });
+
+      const result = runGate(root, ['merge', '--head', head], remote, fakeInstall(root));
+      expect(result.status).toBe(0);
+      expect(result.calls).not.toContain('git fetch');
+      expect(result.calls).toContain(
+        `merge-args pr merge 1 --repo example/repository --merge --match-head-commit ${head}\n`,
+      );
+    });
+
+    it.each([
+      [
+        'the identifier inventory is missing',
+        (root: string) => fakeInstall(root, { inventory: false }),
+        'missing: .nanoclaw/public-boundary-identifiers)',
+      ],
+      [
+        'NANOCLAW_DIR names no install',
+        (root: string) => fs.mkdtempSync(path.join(root, 'empty-')),
+        'missing: scripts/check-public-boundary.ts node_modules/.bin/tsx data/v2.db',
+      ],
+      [
+        'the scanner exits 0 without running its check',
+        (root: string) => {
+          const dir = fakeInstall(root);
+          const scanner = path.join(dir, 'scripts/check-public-boundary.ts');
+          fs.rmSync(scanner);
+          fs.symlinkSync(path.resolve('scripts/check-public-boundary.ts'), scanner);
+          return dir;
+        },
+        'the public-boundary scan gave no verdict',
+      ],
+      [
+        'the scanner exits 1 for an unreadable identifier source, not a finding',
+        (root: string) => fakeInstall(root, { brokenGroup: true }),
+        'the public-boundary scan gave no verdict',
+      ],
+      [
+        'the scanner cannot run (exit 2)',
+        (root: string) => fakeInstall(root, { inventory: '# no names\n' }),
+        'the public-boundary scan gave no verdict',
+      ],
+    ])('gives no verdict when %s', (_case, install, message) => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
+      readyPr(root, head);
+
+      const result = mergeCheck(root, head, remote, install(root));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(message);
+      expect(result.stderr).toContain(`merge=error head=${head}:`);
+      expect(result.stdout).not.toContain('merge=allowed');
+    });
+
+    it('gives no verdict when the head cannot be fetched', () => {
+      const root = tempRoot();
+      const { head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
+      readyPr(root, head);
+
+      const result = mergeCheck(root, head, path.join(root, 'no-such-remote'), fakeInstall(root));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`could not fetch ${head} from example/repository`);
+      expect(result.stderr).toContain(`merge=error head=${head}: the public-boundary scan gave no verdict`);
+    });
+  },
+);
