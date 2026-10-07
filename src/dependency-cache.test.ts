@@ -1251,11 +1251,11 @@ describe('dependency cache', () => {
      */
     function sourceAndTarget(installedAfterSource = false): { src: string; target: string; entry: string } {
       const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), {
-        pkgs: scriptedPkgs('demo@feat-outreach', '\x7fELF native esbuild\n'),
+        pkgs: scriptedPkgs('demo-app@feat-branch', '\x7fELF native esbuild\n'),
       });
       const target = path.join(tmpRoot, 'topic-b', 'repo');
-      writeManifests(target, { pkgs: scriptedPkgs('demo@feat-outreach', '\x7fELF native esbuild\n') });
-      installTree(target, { pkgs: scriptedPkgs('demo', '#!/usr/bin/env node\nrequire("../lib/main.js");\n') });
+      writeManifests(target, { pkgs: scriptedPkgs('demo-app@feat-branch', '\x7fELF native esbuild\n') });
+      installTree(target, { pkgs: scriptedPkgs('demo-app', '#!/usr/bin/env node\nrequire("../lib/main.js");\n') });
       const nm = path.join(target, 'node_modules');
       const hidden = path.join(nm, '.package-lock.json');
       if (installedAfterSource) {
