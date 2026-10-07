@@ -127,8 +127,27 @@ function message(event: Record<string, unknown>): Record<string, unknown> {
     event_id: `Ev0LIVE${eventSeq}`,
     event_time: 1_790_000_000 + eventSeq,
     authorizations: [{ team_id: TEAM, user_id: BOT_USER, is_bot: true }],
-    event: { team: TEAM, event_ts: event.ts, ...event },
+    event: { team: TEAM, event_ts: event.ts, ...richText(event.text), ...event },
   };
+}
+
+/** Slack sends the text a second time as rich_text blocks: code spans as code-styled text, mentions as user elements. */
+function richText(text: unknown): Record<string, unknown> {
+  if (typeof text !== 'string') return {};
+  const elements = text
+    .split(/(`[^`]*`)/)
+    .filter(Boolean)
+    .flatMap((part) => {
+      if (part.startsWith('`')) return [{ type: 'text', text: part.slice(1, -1), style: { code: true } }];
+      return part
+        .split(/(<@[A-Z0-9]+>)/)
+        .filter(Boolean)
+        .map((piece) => {
+          const mention = /^<@([A-Z0-9]+)>$/.exec(piece);
+          return mention ? { type: 'user', user_id: mention[1] } : { type: 'text', text: piece };
+        });
+    });
+  return { blocks: [{ type: 'rich_text', block_id: 'b0', elements: [{ type: 'rich_text_section', elements }] }] };
 }
 
 beforeAll(async () => {
@@ -247,6 +266,18 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: false });
   });
 
+  it('delivers a channel mention once, though Slack sends it as both a message and an app_mention', async () => {
+    inbound.length = 0;
+    const event = { channel: CHANNEL, user: HUMAN, text: `<@${BOT_USER}> one delivery`, ts: '1790000006.000100' };
+    await sendEnvelope('env-pair-message', message({ type: 'message', channel_type: 'channel', ...event }));
+    await sendEnvelope('env-pair-mention', message({ type: 'app_mention', ...event }));
+    await nextInbound(1);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expect(inbound).toHaveLength(1);
+    expect(inbound[0]!.message).toMatchObject({ isMention: true });
+  });
+
   it('demotes a channel mention that appears only inside code', async () => {
     inbound.length = 0;
     await sendEnvelope(
@@ -302,7 +333,7 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     );
     await nextInbound(1);
 
-    expect(inbound[0]!.platformId).toBe(`slack:${DM}`);
+    expect(inbound[0]).toMatchObject({ platformId: `slack:${DM}`, threadId: `slack:${DM}:1790000004.000100` });
     expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: true });
     expect(inbound[0]!.message.content).toMatchObject({ text: 'a private question' });
   });

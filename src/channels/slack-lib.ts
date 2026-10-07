@@ -6,7 +6,7 @@
 
 /** The Web API base, ending in `/`. `SLACK_API_URL` is the override the Slack adapter itself reads. */
 export function slackApiUrl(): string {
-  const configured = process.env.SLACK_API_URL?.trim();
+  const configured = process.env.SLACK_API_URL;
   if (!configured) return 'https://slack.com/api/';
   return configured.endsWith('/') ? configured : `${configured}/`;
 }
