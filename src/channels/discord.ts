@@ -37,7 +37,7 @@ interface DiscordRecoveryThread {
 
 const DISCORD_EPOCH_MS = 1420070400000n;
 
-/** The versioned REST base. `DISCORD_API_URL` is the override the Discord adapter itself reads. */
+/** The versioned REST base, from the override the Discord adapter also reads; an empty value means the default. */
 function discordApiUrl(): string {
   return process.env.DISCORD_API_URL || 'https://discord.com/api/v10';
 }

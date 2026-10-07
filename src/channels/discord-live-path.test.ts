@@ -53,6 +53,7 @@ let gateway: WebSocketServer;
 let socket: WebSocket | null = null;
 let seq = 0;
 let identifyToken: string | undefined;
+let identifyIntents = 0;
 const unfaked: string[] = [];
 const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
 const inbound: Array<{ platformId: string; threadId: string | null; message: InboundMessage }> = [];
@@ -107,7 +108,7 @@ function nextInbound(count: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`expected ${count} inbound message(s), got ${inbound.length}`)),
-      5_000,
+      3_000,
     );
     const check = (): void => {
       if (inbound.length >= count) {
@@ -157,10 +158,11 @@ beforeAll(async () => {
   gateway.on('connection', (ws) => {
     socket = ws;
     ws.on('message', (data) => {
-      const frame = JSON.parse(data.toString()) as { op: number; d: { token?: string } };
+      const frame = JSON.parse(data.toString()) as { op: number; d: { token?: string; intents?: number } };
       if (frame.op === 1) ws.send(JSON.stringify({ op: 11 }));
       if (frame.op === 2) {
         identifyToken = frame.d.token;
+        identifyIntents = frame.d.intents ?? 0;
         const { port } = server.address() as AddressInfo;
         dispatch('READY', {
           v: 10,
@@ -234,8 +236,13 @@ afterAll(async () => {
 });
 
 describe('Discord inbound and outbound through the real adapter and discord.js gateway', () => {
-  it('identifies to the gateway with the bot token', () => {
+  it('identifies to the gateway with the bot token and the intents inbound needs', () => {
     expect(identifyToken).toBe(TOKEN);
+    // Discord withholds what an intent does not ask for: DMs without DirectMessages, message text without
+    // MessageContent. The fake gateway delivers regardless, so the request itself is the contract.
+    const required = { Guilds: 1 << 0, GuildMessages: 1 << 9, DirectMessages: 1 << 12, MessageContent: 1 << 15 };
+    const missing = Object.entries(required).filter(([, bit]) => (identifyIntents & bit) === 0);
+    expect(missing.map(([name]) => name)).toEqual([]);
   });
 
   it('delivers a guild @mention that discord.js turns circular once it builds its Message', async () => {
