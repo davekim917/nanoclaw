@@ -247,6 +247,7 @@ export function startPostDeployInboundCheck(deps: PostDeployCheckDeps): void {
       const minutes = Math.round(deps.windowMs / 60_000);
       const lines = report.platforms.length > 0 ? report.platforms.map(describe) : ['no chat adapter started'];
       send(`${header} after ${minutes} min:\n${lines.join('\n')}`);
+      for (const p of report.platforms) if (p.verdict === 'failing') failing.add(p.platform);
     }
   }, deps.windowMs);
   final.unref?.();

@@ -141,6 +141,26 @@ describe('post-deploy inbound check', () => {
     expect(alerts).toEqual([expect.stringContaining('discord: FAILING')]);
   });
 
+  it('does not page again at the next monitor tick for a failure the window report already paged', async () => {
+    const discord = mod.createAdapterLogger('discord', 'discord');
+    mod.startPostDeployInboundCheck({
+      build: 'abc1234',
+      afterDeploy: true,
+      windowMs: 25 * MINUTE,
+      monitorIntervalMs: MONITOR_MS,
+      failingErrorThreshold: 3,
+      notify: async (text) => {
+        alerts.push(text);
+        return true;
+      },
+      reportPath,
+    });
+    await vi.advanceTimersByTimeAsync(21 * MINUTE);
+    for (let i = 0; i < 3; i++) discord.error('Error forwarding Gateway event', circular);
+    await vi.advanceTimersByTimeAsync(9 * MINUTE);
+    expect(alerts).toEqual([expect.stringContaining('after 25 min')]);
+  });
+
   it('does not count outbound REST errors, so a burst of 429s on a quiet platform does not page', async () => {
     const discord = mod.createAdapterLogger('discord', 'discord');
     mod.createAdapterLogger('slack', 'slack');
