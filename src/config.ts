@@ -94,8 +94,6 @@ export const REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS = parseTimeoutMs(
   600_000,
   30 * 60_000,
 );
-// How long after a deploy each chat platform has to show one live inbound message before the post-deploy check
-// reports it unverified (src/channels/post-deploy-inbound.ts).
 export const POST_DEPLOY_INBOUND_WINDOW_MS = parseTimeoutMs(
   process.env.NANOCLAW_POST_DEPLOY_INBOUND_WINDOW_MS ?? envConfig.NANOCLAW_POST_DEPLOY_INBOUND_WINDOW_MS,
   30 * 60_000,

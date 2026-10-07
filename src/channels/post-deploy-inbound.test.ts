@@ -14,21 +14,26 @@ let dir: string;
 let reportPath: string;
 let alerts: string[];
 
-function readReport(): { state: string; platforms: Array<{ platform: string; verdict: string; liveInbound: number }> } {
+function readReport(): {
+  state: string;
+  restartedWindow?: boolean;
+  platforms: Array<{ platform: string; verdict: string; liveInbound: number }>;
+} {
   return JSON.parse(fs.readFileSync(reportPath, 'utf8'));
 }
 
-function start(): void {
+function start(restartedWindow = false): void {
   mod.startPostDeployInboundCheck({
     build: 'abc1234',
     windowMs: WINDOW_MS,
     earlyCheckMs: EARLY_MS,
-    earlyErrorThreshold: 3,
+    failingErrorThreshold: 3,
     notify: async (text) => {
       alerts.push(text);
       return true;
     },
     reportPath,
+    restartedWindow,
   });
 }
 
@@ -43,6 +48,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -90,24 +96,60 @@ describe('post-deploy inbound check', () => {
 
     expect(alerts).toEqual([]);
     expect(readReport().platforms).toEqual([
-      expect.objectContaining({ platform: 'discord', verdict: 'verified', liveInbound: 1 }),
+      expect.objectContaining({
+        platform: 'discord',
+        verdict: 'verified',
+        liveInbound: 1,
+        liveInboundByChannelType: { discord: 1, 'discord-codex': 0 },
+      }),
     ]);
   });
 
-  it('reports a platform with no inbound and no errors as unverified, never healthy', async () => {
-    mod.createAdapterLogger('slack', 'slack');
+  it('reports a quiet platform as unverified, never healthy, and one routine error does not make it failing', async () => {
+    const slack = mod.createAdapterLogger('slack', 'slack');
     mod.createAdapterLogger('discord', 'discord');
     start();
     mod.recordLiveInbound('discord');
+    slack.error('Could not fetch user info', { userId: 'U0EXAMPLE' });
 
     await vi.advanceTimersByTimeAsync(WINDOW_MS - 1);
     expect(readReport().state).toBe('running');
     expect(alerts).toEqual([]);
 
     await vi.advanceTimersByTimeAsync(1);
-
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toContain('slack: unverified');
+    expect(alerts[0]).toContain('slack: unverified — no live inbound, 1 adapter error(s)');
     expect(alerts[0]).toContain('discord: verified');
+  });
+
+  it('logs the message and stack of an Error an adapter passes, which the host log would print as {}', async () => {
+    const { log } = await import('../log.js');
+    const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const slack = mod.createAdapterLogger('slack', 'slack');
+
+    slack.error('Error in socket mode async handler', { error: new Error('socket closed') });
+    slack.error('Failed to resolve token for team', new Error('no installation'));
+
+    expect(error).toHaveBeenNthCalledWith(1, '[chat-sdk:slack] Error in socket mode async handler', {
+      channelType: 'slack',
+      error: { message: 'socket closed', stack: expect.stringContaining('socket closed') },
+    });
+    expect(error).toHaveBeenNthCalledWith(2, '[chat-sdk:slack] Failed to resolve token for team', {
+      channelType: 'slack',
+      args: [{ message: 'no installation', stack: expect.stringContaining('no installation') }],
+    });
+  });
+
+  it('lets the next boot resume a window a restart interrupted', async () => {
+    mod.createAdapterLogger('slack', 'slack');
+    expect(mod.previousWindowUnfinished(reportPath)).toBe(false);
+
+    start();
+    expect(mod.previousWindowUnfinished(reportPath)).toBe(true);
+
+    start(true);
+    expect(readReport()).toMatchObject({ state: 'running', restartedWindow: true });
+    await vi.advanceTimersByTimeAsync(WINDOW_MS);
+    expect(mod.previousWindowUnfinished(reportPath)).toBe(false);
   });
 });

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { parseMarkdown, type Adapter, type Message as ChatMessage } from 'chat';
+import { parseMarkdown, type Adapter, type ChatInstance, type Message as ChatMessage } from 'chat';
 
 vi.mock('../webhook-server.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../webhook-server.js')>()),
@@ -218,6 +218,58 @@ describe('Chat SDK bridge missed-message recovery', () => {
       { id: 'new-2', isMention: false },
     ]);
     expect(result).toEqual({ scannedTargets: 1, recoveredMessages: 2, failedTargets: 0 });
+  });
+
+  it('counts a routed live message toward the post-deploy inbound check, and neither a replay nor a failed route', async () => {
+    const { createAdapterLogger, evaluatePlatforms } = await import('./post-deploy-inbound.js');
+    createAdapterLogger('stub-counted', 'stub-counted');
+    const liveInbound = (): number => evaluatePlatforms(3).find((p) => p.platform === 'stub-counted')!.liveInbound;
+    let chat: ChatInstance | undefined;
+    const adapter = {
+      name: 'stub-counted',
+      initialize: async (instance: ChatInstance) => {
+        chat = instance;
+      },
+      channelIdFromThreadId: () => 'stub:C',
+      fetchMessages: vi.fn(async () => ({
+        messages: [message({ id: 'missed', timestamp: '2026-07-21T18:20:00Z', text: 'sent while down' })],
+      })),
+    } as unknown as Adapter;
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true });
+    const inbound: string[] = [];
+    let routeFails = false;
+    await bridge.setup({
+      onInbound: async (_platformId, _threadId, msg) => {
+        if (routeFails) throw new Error('routing failed');
+        inbound.push(msg.id);
+      },
+      onInboundEvent: async () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    } as ChannelSetup);
+
+    await bridge.recoverMissedMessages!({
+      since: '2026-07-21T18:16:00Z',
+      reason: 'event-loop-stall',
+      targets: [{ platformId: 'stub:C', threadId: 'stub:C:T', isDM: false }],
+    });
+    expect(inbound).toEqual(['missed']);
+    expect(liveInbound()).toBe(0);
+
+    const now = new Date().toISOString();
+    await chat!.handleIncomingMessage(adapter, 'stub:C:T', message({ id: 'live', timestamp: now, text: 'hello' }));
+    expect(inbound).toEqual(['missed', 'live']);
+    expect(liveInbound()).toBe(1);
+
+    routeFails = true;
+    await chat!
+      .handleIncomingMessage(
+        adapter,
+        'stub:C:T2',
+        message({ id: 'unrouted', timestamp: now, text: 'lost', threadId: 'stub:C:T2' }),
+      )
+      .catch(() => {});
+    expect(liveInbound()).toBe(1);
   });
 
   it('threads a recovered channel-root mention through threadRecoveredRootMention; plain root posts stay root', async () => {

@@ -785,9 +785,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       await setupConfig.onInbound(platformId, threadId, message);
       return;
     }
-    recordLiveInbound(adapter.name);
     await ingressGate.runLive(async () => {
       await setupConfig.onInbound(platformId, threadId, message);
+      recordLiveInbound(bridgeChannelType);
       await advanceRecoveryCursor(message.timestamp);
     });
   }
