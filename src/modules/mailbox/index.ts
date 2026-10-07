@@ -196,7 +196,6 @@ import {
   hasDueRecoveryWake,
   hasNonStatusReplyTo,
   latestInboundTimestamp,
-  latestOutboundChat,
   latestOutboundTimestamp,
   latestRecoveryMarkerId,
   latestRecoveryMarkerTimestamp,
@@ -208,7 +207,6 @@ import {
   writeOutboundDirectRow,
   type DirectOutboundRow,
   type InboundMessageRouting,
-  type OutboundChatRow,
 } from './ops/recovery.js';
 
 export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
@@ -513,8 +511,6 @@ export interface NanoclawMailboxSession extends MailboxSession {
   readMessageRouting(messageId: string): InboundMessageRouting | undefined;
   latestInboundTimestamp(): string | null;
   latestOutboundTimestamp(): string | null;
-  /** Status edits excluded. */
-  latestOutboundChat(): OutboundChatRow | null;
   markInboundCompletedIfPending(messageId: string): void;
   outboundHasContentLike(marker: string): boolean;
   outboundHasRecentContentLike(marker: string, withinSeconds: number): boolean;
@@ -973,7 +969,6 @@ function forkOps(
     readMessageRouting: (messageId) => readMessageRouting(inbound, messageId),
     latestInboundTimestamp: () => latestInboundTimestamp(inbound),
     latestOutboundTimestamp: () => readOutbound(null, latestOutboundTimestamp),
-    latestOutboundChat: () => readOutbound(null, latestOutboundChat),
     markInboundCompletedIfPending: (messageId) => markInboundCompletedIfPending(inbound, messageId),
     outboundHasContentLike: (marker) => readOutbound(false, (outbound) => outboundHasContentLike(outbound, marker)),
     outboundHasRecentContentLike: (marker, withinSeconds) =>

@@ -56,7 +56,6 @@ import './sweep-usage/index.js';
 import './sweep-session-core/index.js';
 
 import './sweep-continuation/index.js';
-import './sweep-promise-watch/index.js';
 
 import './sweep-scheduling/index.js';
 

@@ -574,7 +574,6 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   FORK2: 'coordination-orphans',
   FORK3: 'wiki-admission-recovery',
   FORK4: 'mcp-oauth-refresh',
-  FORK5: 'promise-watch',
   FORK6: 'provider-fallback-return',
   FORK7: 'orphan-containers',
   S2: 'processing-ack-sync',

@@ -2,25 +2,10 @@
  * Host Haiku calls go straight to `/v1/messages`, never via the OneCLI gateway: it swaps the Authorization header for
  * one fixed account's credential, which defeats key rotation.
  */
-import { EnvHttpProxyAgent, type Dispatcher } from 'undici';
-
 import { readEnvFileMatching } from './env.js';
 import { log } from './log.js';
 
 const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
-
-let _envProxyDispatcher: Dispatcher | null | undefined;
-export function getProxyDispatcher(): Dispatcher | null {
-  if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
-  const hasProxyEnv = !!(
-    process.env['HTTPS_PROXY'] ||
-    process.env['https_proxy'] ||
-    process.env['HTTP_PROXY'] ||
-    process.env['http_proxy']
-  );
-  _envProxyDispatcher = hasProxyEnv ? new EnvHttpProxyAgent() : null;
-  return _envProxyDispatcher;
-}
 
 export type ClaudeCredentialSlot = 'oauth:primary' | `oauth:${number}` | 'api-key:primary';
 
