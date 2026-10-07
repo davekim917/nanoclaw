@@ -119,6 +119,11 @@ for arg in "$@"; do
 done
 if [ -n "$rest" ]; then
   printf 'rest %s\\n' "$rest" >> "$MOCK_CALLS"
+  # The repository itself, as --jq .default_branch prints it: default-branch holds the name (absent = main).
+  if [[ "$rest" =~ ^repos/[^/]+/[^/]+$ ]]; then
+    if [ -f "$MOCK_DIR/default-branch" ]; then cat "$MOCK_DIR/default-branch"; else echo main; fi
+    exit 0
+  fi
   case "$rest" in
     */contents/.github/labeler.yml\\?ref=*)
       # labeler--<ref>.yml is the file at that ref. A .nocommit marker answers as
@@ -323,6 +328,7 @@ for arg in "$@"; do
   esac
 done
 case "$query" in
+  *isMergeQueueEnabled*) connection=mergeQueue ;;
   *userContentEdits*) connection=audit ;;
   *statusCheckRollup*) connection=rollup ;;
   *adminReadiness*) connection=adminReadiness ;;
@@ -7312,6 +7318,7 @@ describe(
         body?: string;
         baseFiles?: Record<string, string>;
         changed?: string[];
+        mergeQueue?: boolean;
       } = {},
     ): void {
       scopeFixture(root, {
@@ -7331,10 +7338,19 @@ describe(
       for (const [name, text] of Object.entries(opts.baseFiles ?? {}))
         fs.writeFileSync(path.join(root, `contents--${BASE_OID}--${name.replaceAll('/', '__')}`), text);
       writeJson(root, 'pr-merged.json', { state: 'MERGED', mergeCommit: { oid: MERGE_OID } });
+      writeJson(root, 'mergeQueue-1.json', {
+        data: { repository: { pullRequest: { isMergeQueueEnabled: opts.mergeQueue ?? false, baseRefName: 'main' } } },
+      });
     }
 
     // The helper with real git and the real scanner; only the PR's GitHub remote is swapped for the fixture.
-    function runGate(root: string, args: string[], remote: string, nanoclawDir: string) {
+    function runGate(
+      root: string,
+      args: string[],
+      remote: string,
+      nanoclawDir: string,
+      env: Record<string, string> = {},
+    ) {
       const { bin, calls, sleepLog } = writeMocks(root);
       for (const file of [calls, path.join(root, 'merged')]) fs.rmSync(file, { force: true });
       fs.writeFileSync(
@@ -7364,6 +7380,7 @@ exec git "$@"
           CODEX_REVIEW_REQUIRED_WORKFLOWS: '',
           CODEX_REVIEW_HOST_CI_POSTERS: 'fleet-bot',
           NANOCLAW_DIR: nanoclawDir,
+          ...env,
         },
       });
       return { ...result, calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '' };
@@ -7481,7 +7498,7 @@ exec git "$@"
       expect(result.calls).not.toContain(REGISTRY_NAME);
     });
 
-    it('reads the flag at the base commit alone, so a PR cannot switch the scan off for itself', () => {
+    it('reads the flag at the default branch alone, so a PR cannot switch the scan off for itself', () => {
       const root = tempRoot();
       const optOut = '{ "commentRule": false, "publicBoundaryScan": false }\n';
       const { remote, head } = prRepository(root, { '.github/pr-review-loop.json': optOut, ...LEAK });
@@ -7491,6 +7508,66 @@ exec git "$@"
       const result = mergeCheck(root, head, remote, fakeInstall(root));
       expect(result.status).toBe(24);
       expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+    });
+
+    it('scans a PR whose own base leaves the flag off, since a retarget to the default branch needs no new head', () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, LEAK);
+      readyPr(root, head);
+      const pr = JSON.parse(fs.readFileSync(path.join(root, 'pr.json'), 'utf8')) as Page;
+      writeJson(root, 'pr.json', { ...pr, baseRefName: 'stable' });
+      fs.writeFileSync(path.join(root, 'ref--stable'), OTHER_HEAD);
+      fs.writeFileSync(path.join(root, `labeler--${OTHER_HEAD}.yml`), RISK_CONFIG);
+      fs.writeFileSync(path.join(root, `review-loop--${OTHER_HEAD}.json`), '{ "commentRule": false }\n');
+      writeJson(root, `compare--${OTHER_HEAD}...${head}.json`, {
+        status: 'ahead',
+        files: [changedFile('docs/notes.md')],
+      });
+
+      const result = mergeCheck(root, head, remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+      expect(result.calls).toContain(
+        `rest repos/example/repository/contents/.github/pr-review-loop.json?ref=${BASE_OID}`,
+      );
+    });
+
+    it("leaves the caller's repository and index alone when GIT_DIR and GIT_INDEX_FILE are exported", () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, LEAK);
+      readyPr(root, head);
+      const caller = path.join(root, 'caller');
+      fs.mkdirSync(caller);
+      const staged = spawnSync(
+        'bash',
+        ['-c', 'git init -q && printf "staged work\\n" > work.txt && git add work.txt && git rev-parse --git-dir'],
+        { cwd: caller, encoding: 'utf8', env: isolatedEnv(caller) },
+      );
+      if (staged.status !== 0) throw new Error(`caller fixture failed: ${staged.stderr}`);
+      const index = path.join(caller, '.git', 'index');
+      const before = fs.readFileSync(index);
+
+      const result = runGate(root, ['merge-check', '--head', head], remote, fakeInstall(root), {
+        GIT_DIR: path.join(caller, '.git'),
+        GIT_INDEX_FILE: index,
+      });
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('src/fixture.ts:1 private-identifier');
+      expect(fs.readFileSync(index).equals(before)).toBe(true);
+      expect(
+        fs.readdirSync(path.join(caller, '.git', 'objects')).filter((name) => /^[0-9a-f]{2}$/.test(name)),
+      ).toHaveLength(1);
+    });
+
+    it('refuses to merge into a branch that requires a merge queue, which would ignore the scanned message', () => {
+      const root = tempRoot();
+      const { remote, head } = prRepository(root, { 'docs/notes.md': 'Notes.\n' });
+      readyPr(root, head, { mergeQueue: true });
+
+      const result = runGate(root, ['merge', '--head', head], remote, fakeInstall(root));
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(`merge=refused head=${head}: main requires a merge queue`);
+      expect(result.calls).not.toContain('merge-args');
     });
 
     it('skips the scan, and merges by the method asked, where the base does not turn it on', () => {
