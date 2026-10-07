@@ -9,7 +9,9 @@ M1–M7 plus S2, S5, and S6 (see `run.md`). The corrections themselves are cross
 at `/team-review --implementation`. Build order: Phase 1, then Phase 2 after Phase 1 is applied.
 Rev 2.7 (2026-09-11, operator decision after the PR #657 review) drops the host's refresh from a
 clone: containers fetch into the canonical instead, as linked worktrees do (§5.3, §5.4, §5.5,
-P2-8, P2-9).
+P2-8, P2-9). Rev 2.8 (2026-10-07, approved follow-up after the live `apply` window shared almost
+nothing) adds per-install files (§5.7.3, §5.7.4) and strict-completeness rule (d) (§5.7.5), with
+P1-27–P1-29 and P2-22.
 
 **Change type:** behavior-changing. The acceptance criteria in §9 are the exact test cases
 `/team-build` materializes first.
@@ -450,7 +452,7 @@ A tree is complete when all of these hold:
    `libc`. Others were correct: native binaries really missing, such as `@esbuild/linux-x64` in 14
    trees.)* Optional-only is sufficient in Phase 1 because no Phase 1 operation changes a
    workspace's file set: adopt shares the source tree's own inodes, and convert requires
-   byte-for-byte equality (inventory and content manifest). Phase 2's link-at-checkout does hand content to a workspace that never
+   byte-for-byte equality (inventory and content manifest; per-install files excepted, rev 2.8). Phase 2's link-at-checkout does hand content to a workspace that never
    installed it, so it needs a strict rule (§5.7.5). The evidence and the platform-aware
    implementation are kept for it.
 2. Every package path in that map exists as a directory whose `package.json` `name` and `version`
@@ -474,10 +476,27 @@ A tree is complete when all of these hold:
 Root-level dot entries other than `.bin` and `.package-lock.json`, such as `.vite` and `.cache`,
 are workspace-private. They are excluded from every check and never shared.
 
+**Per-install files (rev 2.8).** Two installs of one lockfile on one platform may still hold
+different bytes in two places: the hidden lockfile, and the files of a package whose lockfile
+entry says `hasInstallScript`, because its lifecycle script writes into its own dir. The live
+`apply` window refused about 37 trees an hour and shared almost nothing. node-gyp's
+`build/Makefile` and `build/config.gypi` embed the absolute install path, so every checkout
+differs (`ssh2`). esbuild's install script swaps its JS shim at `bin/esbuild` for the native
+binary, and `npm ci --ignore-scripts` skips that. Convert requires a per-install file to match the
+entry only in path and type, and the farm keeps the workspace's own copy of any whose bytes differ
+(§5.7.4). Which files are per-install is read from the entry's hidden lockfile, so one entry gives
+one answer. A file outside those packages must still match byte for byte, and so must a
+per-install file whose bytes equal the entry's, which is then shared: `aws-sdk` declares an install
+script, holds 98 MB, and is identical everywhere. Two installs that differ in which files exist
+still never merge. An `--ignore-scripts` backend keeps `cpu-features` and lacks bcrypt's binding,
+so it stays private, and its `convert-mismatch` now names that path rather than
+`.package-lock.json`, which sorted first.
+
 The hidden lockfile `.package-lock.json` is checked like any other file but is **never
 hardlinked**. npm rewrites it in place on every reify (`@npmcli/arborist` `reify.js:254` →
 `shrinkwrap.js:1164`), and on a read-only shared inode npm unlinks it instead. Every farm and
-adopted source therefore keeps its own writable copy, with its mtime preserved (rev 2.2).
+adopted source therefore keeps its own writable copy, with its mtime preserved (rev 2.2). A
+convert may raise it so that rule 3 still holds in the farm (§5.7.4, rev 2.8).
 
 An **inventory** is the sorted list of `(relative path, type, size)` for every regular file and
 symlink, private dot entries excluded. A **content manifest** adds each item's sha256 (for a
@@ -505,11 +524,18 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
 
   A link failure (`EPERM`/`EXDEV`) aborts with the tree untouched and a WARN.
 - **Convert (M3).** For a complete private tree whose key has a verified entry, and whose
-  inventory and content manifest both equal the entry's, so only byte-identical installs merge
-  (rev 2.2). On any mismatch the tree is kept private, with a WARN and a `convert-mismatch`
-  count. Otherwise:
-  1. link the entry to `<pkg>/.node_modules.nanoclaw-new`. This dir only ever holds shared farm
-     links and a copy of the entry's hidden lockfile, never private bytes;
+  inventory and content both equal the entry's, so only byte-identical installs merge (rev 2.2),
+  apart from per-install files, which need only the same path and type (rev 2.8). Content is
+  compared file by file against the entry, stopping at the first difference, which the
+  `convert-mismatch` detail names. On any mismatch the tree is kept private, with a WARN and a
+  `convert-mismatch` count. Otherwise:
+  1. link the entry to `<pkg>/.node_modules.nanoclaw-new`, then replace each per-install file
+     whose bytes differ with a hard link to the workspace's own (rev 2.8). Then, when any kept
+     file or the entry's hidden lockfile is newer than the farm's hidden lockfile, raise that
+     lockfile's mtime at least a whole millisecond past the newest, so no farm file is newer than
+     it (rule 3); bytes are never changed. This dir holds shared farm links, a hidden lockfile
+     (the entry's copy or the workspace's own), and links to inodes `node_modules` still holds,
+     so deleting it never loses private bytes;
   2. rename `node_modules` to `<pkg>/.node_modules.nanoclaw-old`;
   3. rename `.new` to `node_modules`;
   4. move each private root dot entry from `.old` into `node_modules`, one rename each;
@@ -519,7 +545,8 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
     yet, because step 4 only runs after step 3.
   - `node_modules` and `.old` both present: finish steps 4 and 5. If a private name already exists
     in `node_modules`, keep `.old`, WARN, and stop.
-  - `.new` present and `node_modules` present: delete `.new` (farm links only).
+  - `.new` present and `node_modules` present: delete `.new` (farm links, and links to inodes
+    `node_modules` holds).
   - `.new` present, `node_modules` missing, `.old` missing: rename `.new` to `node_modules` only
     if its inventory equals a verified entry's, otherwise delete it. A crash mid-link must never
     publish a half-built farm. With no fingerprint this case is skipped, with a WARN.
@@ -529,8 +556,9 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   again.
 - **Link.** For a package dir with no `node_modules` whose key has a verified entry: link it to
   `.new`, then rename to `node_modules`.
-- **Already a farm.** The first regular file in the entry's inventory, other than the hidden
-  lockfile, shares its inode with the workspace's copy. Nothing to do.
+- **Already a farm.** The first regular file in the entry's inventory that is not a per-install
+  file shares its inode with the workspace's copy. Nothing to do. A tree with no such file is
+  never adopted, because nothing could prove it a farm (rev 2.8).
 
 #### 5.7.5 Triggers
 
@@ -559,7 +587,15 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   completeness rule: no absent optional that this platform would install. Its exact definition
   belongs to the Phase 2 build, informed by the rev 2.1 evidence. That evidence covers the
   transitive-skip and musl-without-`libc` false refusals, and the native binaries really missing
-  from production trees.
+  from production trees. **Rule (d), rev 2.8:** an absent optional entry that declares
+  `hasInstallScript`, and that nothing installed requires through a non-optional edge, is excused,
+  as is what only it requires (rule (c)). npm removes an optional
+  package whose install script fails, and the entry was installed from the same lockfile for the
+  same platform. Rule (c) now follows npm's own pruning (arborist `optional-set.js`, used for both
+  platform skips and failed builds): only non-optional edges count, so `nan`, which the failed
+  `cpu-features` requires and the installed `ssh2` lists as optional, goes with `cpu-features`.
+  Without both, every backend checkout was refused (`bindings`, then `nan`), and its first
+  `npm ci` made a private tree.
 
 #### 5.7.6 Seal and tamper
 
@@ -809,6 +845,9 @@ the action payload and response shapes (§5.2), and `nanoclaw-checkout.json` (§
 | P1-23 | `the 2-day delete never removes node_modules beside a pending conversion, in any flag mode` | An aged idle topic's package dir holds `.node_modules.nanoclaw-old` with a private sentinel, next to a `node_modules` holding a moved private sentinel, and recovery is blocked. With the flag at `apply`, `off`, and `report`, both dirs and both sentinels survive the sweep. `storage-manager` suite. |
 | P1-24 | `a cold-cache report predicts one adopt and converts the rest with estimated bytes` | With two same-key trees, an empty cache, and the flag at `report`, the decisions are 1 adopt and 1 convert with `estimatedBytes > 0`, and nothing on disk changes. |
 | P1-26 | `content reads count against the per-pass cap and an unchanged mismatched tree is not re-read` | With 7 trees whose inventory matches the entry but whose bytes differ, pass 1 reports `contentReads` of 5 and 2 `deferred`. Pass 2 reads only the 2 unread trees (`contentReads` 2). Pass 3 reads 0. After one tree's hidden lockfile mtime changes, pass 4 reads that tree alone. |
+| P1-27 | `converts a tree whose install-script outputs and hidden lockfile differ, keeping its own copies of those` | Rev 2.8. Two same-key trees differ only in an install-script package's node-gyp `Makefile` and `config.gypi` (each embeds its checkout's path), esbuild's `bin/esbuild` (binary in the entry, shim in the tree), and the hidden lockfile's formatting. The tree converts. Those four files keep the tree's own inode and bytes, every other file shares the entry's inode, the entry's bytes are unchanged, and the next pass sees a farm. A second fixture, installed after the source with a hidden lockfile identical to the entry's, keeps only its build outputs. In both, no farm file is newer than the farm's hidden lockfile. |
+| P1-28 | `a convert keeping its own per-install files survives a crash after <step> with those bytes intact` | Rev 2.8. For `link-new`, `rename-old` and `rename-new`, recovery leaves the tree's own per-install files at their original inode and bytes, and the same pass ends with that farm. |
+| P1-29 | `keeps private a tree installed with --ignore-scripts, naming its first real difference` | Rev 2.8. The entry holds bcrypt's binding and no `cpu-features`, and the tree the reverse. The tree is untouched, and the `convert-mismatch` detail is `bcrypt/lib/binding/napi-v3/bcrypt_lib.node`, not `.package-lock.json`. |
 | P1-25 | `an npm-style rewrite of the hidden lockfile keeps a farm a farm and leaves the entry untouched` | After unlinking and rewriting `node_modules/.package-lock.json` in a farm, the package dir is still detected as a farm, and the entry's hidden lockfile bytes and inode are unchanged. |
 
 ### Phase 2
@@ -839,6 +878,7 @@ Host tests go in `src/modules/repository-workspaces/index.test.ts`, `job-runner`
 | P2-18 | `clones stay usable after rollback to worktree mode` | Create a primary and a secondary clone in clone mode, with dirty bytes and a stash. Switch to worktree mode. `create_worktree` (no branch and branch B), `git_commit`, `git_push`, and `open_pr` succeed on them, and the dirty bytes, refs, and stash are preserved. |
 | P2-19 | `a host completion after the tool timed out is served on the next call` | The tool times out and the host finishes later. The next `create_worktree` returns `created:false` with correct HEAD, index, and files. |
 | P2-20 | `a checkout is not delayed by an unrelated repository job` | With a held global-lane publish job, a checkout on another work unit's lane completes, asserted by ordering rather than timing. |
+| P2-22 | `accepts an optional native package npm removed because its install script failed, and what only it needs` | Rev 2.8. With `lzo` and `cpu-features` (optional, `hasInstallScript`) absent, plus `bindings` and `nan`, which only they require (an installed `ssh2` lists `nan` as optional), strict completeness holds. Without `hasInstallScript` it refuses, naming `bindings`. With an installed package requiring `nan` through `dependencies`, it refuses, naming `nan`; with one requiring `lzo` that way, it refuses too. |
 | P2-21 | `the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule` | Rev 2.6. Clones configure a clean filter selected by an attribute, `log.showSignature` with `gpg.program` on a signed commit, and an embedded repository with its own filter. The proof runs and no program writes its sentinel. The verdicts are `clean-and-pushed`, `unpushed` and `submodule`. |
 
 ## 10. Risks and open questions

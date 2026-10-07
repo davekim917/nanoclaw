@@ -1,8 +1,9 @@
 /**
  * Host-side npm dependency cache: one sealed, read-only `node_modules` per lockfile per workgroup, hardlinked into
- * each workspace (a "farm"); only the hidden lockfile, which npm rewrites on every run, stays per-tree. Sole owner
- * of verify/adopt/convert/link/seal/recovery (spec: docs/specs/repository-branch-clones/plan.md §5.7); the storage
- * sweep only decides WHEN.
+ * each workspace (a "farm"); the hidden lockfile, which npm rewrites on every run, stays per-tree, and so does a
+ * converted workspace's copy of any per-install file (`perInstallPredicate`) that differs from the entry's. Sole
+ * owner of verify/adopt/convert/link/seal/recovery (spec: docs/specs/repository-branch-clones/plan.md §5.7); the
+ * storage sweep only decides WHEN.
  *
  * The cache root must share a filesystem and mount with `v2-topics` (`link(2)` returns EXDEV across mounts).
  * Agents share the host uid, so read-only bits guard against accidents, not tampering. A `report` pass mutates
@@ -18,7 +19,10 @@ import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
 
 export const DEPENDENCY_CACHE_DIRNAME = 'dependency-cache';
-/** Convert/link build target. Only ever holds farm links, never private bytes. */
+/**
+ * Convert/link build target. Holds farm links, plus links to per-install files the tree it replaces still holds,
+ * so deleting it never loses private bytes.
+ */
 export const FARM_NEW_NAME = '.node_modules.nanoclaw-new';
 export const FARM_OLD_NAME = '.node_modules.nanoclaw-old';
 /** Never descended into by the regenerable sweep (they hold private bytes mid-convert). */
@@ -326,6 +330,87 @@ function firstInventoryDifference(expected: InventoryItem[], actual: InventoryIt
   return NODE_MODULES;
 }
 
+/** The deepest lockfile package dir holding `rel` (relative to `node_modules`), or `null` when none does. */
+function owningPackageKey(rel: string, packages: JsonObject): string | null {
+  const segments = `${NODE_MODULES}/${rel}`.split('/');
+  for (let i = segments.length - 2; i >= 0; i--) {
+    if (segments[i] !== NODE_MODULES) continue;
+    const end = i + 1 + (segments[i + 1]!.startsWith('@') ? 2 : 1);
+    if (end >= segments.length) continue;
+    const key = segments.slice(0, end).join('/');
+    if (Object.prototype.hasOwnProperty.call(packages, key)) return key;
+  }
+  return null;
+}
+
+/**
+ * Files two installs of one lockfile may legitimately hold with different bytes: the hidden lockfile, and every
+ * file of a package whose lockfile entry says `hasInstallScript`. Its lifecycle script writes into its own dir:
+ * node-gyp's `build/Makefile` and `config.gypi` embed the absolute install path, esbuild swaps its JS shim for the
+ * native binary, and `--ignore-scripts` skips both. Read from the hidden lockfile of the tree the others are
+ * compared with, so one entry always yields one predicate.
+ */
+function perInstallPredicate(referenceNodeModulesDir: string): (rel: string) => boolean {
+  const packages = packagesOf(readJsonObject(path.join(referenceNodeModulesDir, HIDDEN_LOCKFILE))) ?? {};
+  return (rel) => {
+    if (rel === HIDDEN_LOCKFILE) return true;
+    const owner = owningPackageKey(rel, packages);
+    const entry = owner === null ? undefined : packages[owner];
+    return isJsonObject(entry) && entry.hasInstallScript === true;
+  };
+}
+
+/** Per-install items keep path and type only: their size may differ between installs. */
+function comparableInventory(items: InventoryItem[], perInstall: (rel: string) => boolean): Inventory {
+  const comparable = items.map(([rel, type, size]): InventoryItem => [rel, type, perInstall(rel) ? -1 : size]);
+  return { items: comparable, sha256: sha256(JSON.stringify(comparable)) };
+}
+
+function sameContent(a: string, aStat: fs.Stats, b: string, bStat: fs.Stats): boolean {
+  if (aStat.isSymbolicLink() || bStat.isSymbolicLink()) {
+    return aStat.isSymbolicLink() && bStat.isSymbolicLink() && fs.readlinkSync(a) === fs.readlinkSync(b);
+  }
+  return (
+    aStat.isFile() &&
+    bStat.isFile() &&
+    aStat.size === bStat.size &&
+    (aStat.mode & 0o111) === (bStat.mode & 0o111) &&
+    fileSha256(a) === fileSha256(b)
+  );
+}
+
+interface ContentComparison {
+  /** First path whose bytes, symlink target or exec bits differ from the entry's, per-install files excluded. */
+  difference: string | null;
+  /** Per-install files that differ from the entry's: the farm keeps the workspace's own. */
+  keepOwn: TreeFile[];
+}
+
+/**
+ * Compares every file of a tree with the entry's copy, stopping at the first difference that bars a convert.
+ * Assumes equal comparable inventories. `null` when either tree is unreadable.
+ */
+function compareWithEntry(
+  entryNodeModulesDir: string,
+  nodeModulesDir: string,
+  walk: TreeWalk,
+  perInstall: (rel: string) => boolean,
+): ContentComparison | null {
+  const keepOwn: TreeFile[] = [];
+  try {
+    for (const file of walk.files) {
+      const entryFile = path.join(entryNodeModulesDir, file.rel);
+      const own = path.join(nodeModulesDir, file.rel);
+      if (sameContent(entryFile, fs.lstatSync(entryFile), own, file.stat)) continue;
+      if (!perInstall(file.rel)) return { difference: file.rel, keepOwn };
+      keepOwn.push(file);
+    }
+  } catch {
+    return null;
+  }
+  return { difference: null, keepOwn };
+}
+
 export type Completeness =
   | { complete: true; walk: TreeWalk; inventory: Inventory }
   | { complete: false; reason: string };
@@ -456,7 +541,7 @@ interface SealedRecord {
   lastLinkedAt: string;
   inventorySha256: string;
   inventory: InventoryItem[];
-  /** `contentManifestSha256` of the sealed tree; convert requires a private tree to match it. */
+  /** `contentManifestSha256` of the sealed tree; identifies the entry a remembered convert mismatch was against. */
   contentSha256: string;
 }
 
@@ -727,13 +812,14 @@ function warnNoEntry(pass: DependencyCachePass, workgroupId: string, key: string
 }
 
 /**
- * The first regular file in the entry's inventory other than the hidden lockfile (every tree holds its own copy
- * of that); with no readable SEALED, the first such file a short walk finds.
+ * The first regular file in the entry's inventory that is not per-install (a farm may hold its own copy of
+ * those); with no readable SEALED, the first such file a short walk finds.
  */
 function sampleSharedFile(entryDir: string, sealed: SealedRecord | null): string | null {
-  const record = sealed ?? readSealed(entryDir);
-  if (record) return record.inventory.find(([rel, type]) => type === 'f' && rel !== HIDDEN_LOCKFILE)?.[0] ?? null;
   const root = path.join(entryDir, NODE_MODULES);
+  const perInstall = perInstallPredicate(root);
+  const record = sealed ?? readSealed(entryDir);
+  if (record) return record.inventory.find(([rel, type]) => type === 'f' && !perInstall(rel))?.[0] ?? null;
   const stack = [''];
   while (stack.length > 0) {
     const rel = stack.pop()!;
@@ -745,7 +831,7 @@ function sampleSharedFile(entryDir: string, sealed: SealedRecord | null): string
     }
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      if (entry.isFile() && childRel !== HIDDEN_LOCKFILE) return childRel;
+      if (entry.isFile() && !perInstall(childRel)) return childRel;
       if (entry.isDirectory()) stack.push(childRel);
     }
   }
@@ -858,13 +944,14 @@ function touchLastLinked(pass: DependencyCachePass, entryDir: string, sealed: Se
   }
 }
 
-/** Bytes a convert frees: the private tree's, less the private dot entries that stay. */
-function convertReclaimBytes(pass: DependencyCachePass, nodeModulesDir: string): number {
+/** Bytes a convert frees: the private tree's, less the private dot entries and kept per-install files that stay. */
+function convertReclaimBytes(pass: DependencyCachePass, nodeModulesDir: string, keepOwn: TreeFile[]): number {
   const privateBytes = privateRootNames(nodeModulesDir).reduce(
     (sum, name) => sum + pass.reclaimableBytes(path.join(nodeModulesDir, name)),
     0,
   );
-  return Math.max(0, pass.reclaimableBytes(nodeModulesDir) - privateBytes);
+  const keptBytes = keepOwn.reduce((sum, file) => sum + (file.stat.nlink === 1 ? file.stat.size : 0), 0);
+  return Math.max(0, pass.reclaimableBytes(nodeModulesDir) - privateBytes - keptBytes);
 }
 
 /** Move each private root dot entry from `.old` into `node_modules`; a name already there stops and keeps `.old`. */
@@ -935,14 +1022,16 @@ function resolveDependency(packages: JsonObject, from: string, name: string): st
   }
 }
 
-/** Dependencies, optional deps and non-optional peers; the root's devDependencies too (never a dependency's). */
+/**
+ * Names required through a non-optional edge: dependencies and non-optional peers, plus the root's devDependencies
+ * (never a dependency's). A name also listed in optionalDependencies is optional, as in arborist.
+ */
 function requiredNames(key: string, entry: JsonObject): string[] {
   const names = new Set<string>();
   const addAll = (field: unknown): void => {
     if (isJsonObject(field)) for (const name of Object.keys(field)) names.add(name);
   };
   addAll(entry.dependencies);
-  addAll(entry.optionalDependencies);
   if (key === '') addAll(entry.devDependencies);
   const peerMeta = isJsonObject(entry.peerDependenciesMeta) ? entry.peerDependenciesMeta : {};
   if (isJsonObject(entry.peerDependencies)) {
@@ -950,6 +1039,9 @@ function requiredNames(key: string, entry: JsonObject): string[] {
       const meta = peerMeta[name];
       if (!(isJsonObject(meta) && meta.optional === true)) names.add(name);
     }
+  }
+  if (isJsonObject(entry.optionalDependencies)) {
+    for (const name of Object.keys(entry.optionalDependencies)) names.delete(name);
   }
   return [...names];
 }
@@ -968,8 +1060,13 @@ function platformExcludes(entry: JsonObject, platform: LinkPlatform): boolean {
  *   (a) its lockfile `os`/`cpu`, or a declared `libc`, exclude this platform (npm-install-checks 7.1.2);
  *   (b) it declares `os`/`cpu` but no `libc`, is named as a musl build, and this platform is glibc (older
  *       lockfiles omit `libc`; npm skips these after reading the package manifest);
- *   (c) every entry requiring it (by node resolution, at least one) is itself absent and excused. Least
- *       fixpoint, so a cycle with no excused root excuses nothing.
+ *   (c) every entry requiring it through a non-optional edge (by node resolution, at least one) is itself
+ *       absent and excused. Optional edges are ignored, as npm's optional-set pruning ignores them (arborist
+ *       `optional-set.js`): a failed `cpu-features` takes `nan` with it though an installed `ssh2` lists `nan`
+ *       as optional. Least fixpoint, so a cycle with no excused root excuses nothing;
+ *   (d) it declares `hasInstallScript` and nothing installed requires it through a non-optional edge: npm
+ *       removes an optional package whose install script fails, with every package requiring it that way, and
+ *       the entry was installed from this lockfile for this platform, where that build failed.
  * Anything else absent refuses the link, as does an absent non-`optional` entry.
  *
  * Reads `package-lock.json` from `pkgDir` (the key pins its bytes) and the hidden lockfile from `nodeModulesDir`.
@@ -1014,7 +1111,9 @@ export function checkLinkCompleteness(
       (entry.os !== undefined || entry.cpu !== undefined) &&
       entry.libc === undefined &&
       MUSL_BUILD_NAME.test(typeof entry.name === 'string' ? entry.name : nameFromPackageKey(key));
-    if (platformExcludes(entry, platform) || muslBuild) excused.add(key);
+    const failedBuild =
+      entry.hasInstallScript === true && [...(requiredBy.get(key) ?? [])].every((by) => !installed(by));
+    if (platformExcludes(entry, platform) || muslBuild || failedBuild) excused.add(key);
   }
   for (let grew = true; grew; ) {
     grew = false;
@@ -1190,21 +1289,27 @@ function convertMismatch(pass: DependencyCachePass, pkg: PreparedPackage, firstD
 }
 
 /**
- * Convert (§5.7.4): deletes private bytes, so requires inventory AND content equality with the entry. Order is
- * load-bearing: `.new` only ever holds farm links and private bytes move only after `.new` is in place, so
- * `recoverPackageDir` can finish or reverse every interruption. `sealed` is null only for a report pass.
+ * Convert (§5.7.4): deletes private bytes, so requires inventory AND content equality with the entry, except that
+ * a per-install file need only match in path and type and the farm keeps the workspace's own copy when its bytes
+ * differ. Order is load-bearing: `.new` holds only farm links and links to inodes the replaced tree still holds,
+ * and private dot entries move only after `.new` is in place, so `recoverPackageDir` can finish or reverse every
+ * interruption. `sealed` is null only for a report pass, whose would-be entry is its source's `node_modules`.
  */
 function convertVerified(
   pass: DependencyCachePass,
   pkg: PreparedPackage,
   identity: EntryIdentity,
+  entryNodeModulesDir: string,
   sealed: SealedRecord | null,
   completeness: { walk: TreeWalk; inventory: Inventory },
   hooks: ConvertHooks = {},
 ): PackageOutcome {
   const { inventory } = completeness;
-  if (inventory.sha256 !== identity.inventorySha256) {
-    return convertMismatch(pass, pkg, firstInventoryDifference(identity.inventory, inventory.items));
+  const perInstall = perInstallPredicate(entryNodeModulesDir);
+  const expected = comparableInventory(identity.inventory, perInstall);
+  const actual = comparableInventory(inventory.items, perInstall);
+  if (actual.sha256 !== expected.sha256) {
+    return convertMismatch(pass, pkg, firstInventoryDifference(expected.items, actual.items));
   }
   if (pass.mode === 'apply' && !sealed) return 'failed';
   const verdict: ConvertMismatchVerdict = {
@@ -1226,12 +1331,24 @@ function convertVerified(
   if (deferIfCapped(pass, pkg)) return 'deferred';
   pass.mutations += 1;
   pass.counters.contentReads += 1;
-  if (contentManifestSha256(pkg.nodeModulesDir, completeness.walk) !== identity.contentSha256) {
+  const comparison = compareWithEntry(entryNodeModulesDir, pkg.nodeModulesDir, completeness.walk, perInstall);
+  if (comparison?.difference !== null) {
     convertMismatchMemo.set(pkg.pkgDir, verdict);
-    return convertMismatch(pass, pkg, 'content differs (file bytes, symlink target or exec bits)');
+    return convertMismatch(
+      pass,
+      pkg,
+      comparison
+        ? `content differs (file bytes, symlink target or exec bits): ${comparison.difference}`
+        : 'content unreadable',
+    );
   }
+  const { keepOwn } = comparison;
   convertMismatchMemo.delete(pkg.pkgDir);
-  decide(pass, 'convert', pkg.pkgDir, { key: pkg.key, estimatedBytes: convertReclaimBytes(pass, pkg.nodeModulesDir) });
+  decide(pass, 'convert', pkg.pkgDir, {
+    key: pkg.key,
+    estimatedBytes: convertReclaimBytes(pass, pkg.nodeModulesDir, keepOwn),
+    ...(keepOwn.length > 0 ? { detail: `keeps its own ${keepOwn.map((file) => file.rel).join(', ')}` } : {}),
+  });
   if (pass.mode === 'report' || !sealed) {
     pass.counters.converted += 1;
     return 'converted';
@@ -1245,8 +1362,25 @@ function convertVerified(
   const step = (name: ConvertStep): void => hooks.onStep?.(name);
   const result = withPackageDirTimesPreserved(pkg.pkgDir, (): PackageOutcome => {
     try {
-      linkTree(path.join(pkg.entryDir, NODE_MODULES), newDir);
+      linkTree(entryNodeModulesDir, newDir);
+      for (const file of keepOwn) {
+        const own = path.join(pkg.nodeModulesDir, file.rel);
+        const target = path.join(newDir, file.rel);
+        fs.unlinkSync(target);
+        if (file.type === 'f') fs.linkSync(own, target);
+        else fs.symlinkSync(fs.readlinkSync(own), target);
+      }
+      const hiddenLockfile = path.join(newDir, HIDDEN_LOCKFILE);
+      const hidden = fs.statSync(hiddenLockfile);
+      const newestMs = Math.max(
+        fs.statSync(path.join(entryNodeModulesDir, HIDDEN_LOCKFILE)).mtimeMs,
+        ...keepOwn.filter((file) => file.type === 'f').map((file) => fs.statSync(path.join(newDir, file.rel)).mtimeMs),
+      );
+      if (newestMs > hidden.mtimeMs) {
+        fs.utimesSync(hiddenLockfile, hidden.atimeMs / 1000, (Math.ceil(newestMs) + 1) / 1000);
+      }
     } catch (err) {
+      fs.rmSync(newDir, { recursive: true, force: true });
       warnLinkFailure('convert', pkg.pkgDir, err);
       return 'failed';
     }
@@ -1301,7 +1435,15 @@ export function convertPackageDir(
     decide(pass, 'incomplete', pkgDir, { key: pkg.key, detail: completeness.reason });
     return 'incomplete';
   }
-  return convertVerified(pass, pkg, verified.sealed, verified.sealed, completeness, hooks);
+  return convertVerified(
+    pass,
+    pkg,
+    verified.sealed,
+    path.join(pkg.entryDir, NODE_MODULES),
+    verified.sealed,
+    completeness,
+    hooks,
+  );
 }
 
 /**
@@ -1337,8 +1479,9 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
     decide(pass, 'incomplete', pkgDir, { key: pkg.key, detail: completeness.reason });
     return 'incomplete';
   }
-  if (!completeness.inventory.items.some(([rel, type]) => type === 'f' && rel !== HIDDEN_LOCKFILE)) {
-    // Nothing a farm could share: every tree keeps its own hidden lockfile.
+  const perInstall = perInstallPredicate(pkg.nodeModulesDir);
+  if (!completeness.inventory.items.some(([rel, type]) => type === 'f' && !perInstall(rel))) {
+    // Nothing a farm is sure to share, so no file could prove a tree is a farm.
     return 'ineligible';
   }
   if (entryExists) {
@@ -1347,9 +1490,16 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
       quarantineEntry(pass, pkg.entryDir, verified);
       return 'quarantined';
     }
-    return convertVerified(pass, pkg, verified.sealed, verified.sealed, completeness);
+    return convertVerified(
+      pass,
+      pkg,
+      verified.sealed,
+      path.join(pkg.entryDir, NODE_MODULES),
+      verified.sealed,
+      completeness,
+    );
   }
-  if (wouldBe) return convertVerified(pass, pkg, wouldBe, null, completeness);
+  if (wouldBe) return convertVerified(pass, pkg, wouldBe, path.join(wouldBe.source, NODE_MODULES), null, completeness);
   return adopt(pass, pkg, completeness);
 }
 
@@ -1433,7 +1583,7 @@ function plannedRecoveryStep(hasNm: boolean, hasOld: boolean, hasNew: boolean): 
  *     entries have not moved yet, because step 4 runs only after step 3);
  *   - both present: finish steps 4 and 5; a private name already in
  *     `node_modules` keeps `.old` and stops, with a WARN;
- *   - `.new` and `node_modules` present: delete `.new` (farm links only);
+ *   - `.new` and `node_modules` present: delete `.new` (farm links, and links to inodes `node_modules` holds);
  *   - `.new` alone: rename it into place when it is a complete farm of the
  *     verified entry, else delete it (an interrupted link had no tree before).
  *     Judging that needs the key, so with no environment fingerprint this one
