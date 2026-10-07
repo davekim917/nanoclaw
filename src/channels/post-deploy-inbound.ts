@@ -1,9 +1,10 @@
 /**
- * After a deploy, each chat platform must show live inbound. Boot, preflight, outbound and reactions can all stay
- * green while an adapter drops every message. Adapter errors alone do not fail a platform that is receiving messages:
- * adapters log routine API errors every day.
+ * After every boot, each chat platform must show live inbound, and keep showing it. Boot, preflight, outbound and
+ * reactions can all stay green while an adapter drops messages. A platform fails when its adapter errors reach a
+ * threshold and are at least as many as the messages it routed: one routed message must not hide a stream of
+ * failures, as a plain Discord message hid the 2026-10-06 mention failures, while adapters' routine API errors on a
+ * busy platform stay outnumbered by its traffic.
  */
-import fs from 'fs';
 import path from 'path';
 
 import type { Logger } from 'chat';
@@ -43,6 +44,18 @@ function logData(channelType: string, args: unknown[]): Record<string, unknown> 
   return args.length === 0 ? { channelType } : { args: args.map(loggable), channelType };
 }
 
+/**
+ * Errors the adapters log for a failed outbound or lookup request. A REST call made on the inbound path logs its own
+ * inbound error as well, so these say nothing about inbound health; counted, the Discord 429 bursts on posting at the
+ * morning peak would page a quiet platform several times a week.
+ */
+const OUTBOUND_ERRORS = new Set([
+  'Discord API error',
+  'Discord interaction API error',
+  'Slack rejected blocks (invalid_blocks)',
+  'Slack response_url failed',
+]);
+
 export function createAdapterLogger(channelType: string, platform: string, prefix: string = platform): Logger {
   platformByChannelType.set(channelType, platform);
   const tally = tallyFor(platform);
@@ -55,7 +68,7 @@ export function createAdapterLogger(channelType: string, platform: string, prefi
     warn: (message: string, ...args: unknown[]) => log.warn(`${tag} ${message}`, logData(channelType, args)),
     error: (message: string, ...args: unknown[]) => {
       log.error(`${tag} ${message}`, logData(channelType, args));
-      tally.errors.set(message, (tally.errors.get(message) ?? 0) + 1);
+      if (!OUTBOUND_ERRORS.has(message)) tally.errors.set(message, (tally.errors.get(message) ?? 0) + 1);
     },
   };
 }
@@ -85,13 +98,17 @@ function sum(values: Iterable<number>): number {
   return total;
 }
 
+function verdictFor(liveInbound: number, errors: number, failingErrorThreshold: number): PlatformVerdict {
+  if (errors >= failingErrorThreshold && errors >= liveInbound) return 'failing';
+  return liveInbound > 0 ? 'verified' : 'unverified';
+}
+
 export function evaluatePlatforms(failingErrorThreshold: number): PlatformReport[] {
   return [...tallies.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([platform, t]) => {
       const liveInbound = sum(t.inbound.values());
-      const verdict: PlatformVerdict =
-        liveInbound > 0 ? 'verified' : sum(t.errors.values()) >= failingErrorThreshold ? 'failing' : 'unverified';
+      const verdict = verdictFor(liveInbound, sum(t.errors.values()), failingErrorThreshold);
       return {
         platform,
         verdict,
@@ -119,7 +136,7 @@ function describe(report: PlatformReport): string {
         (silent.length > 0 ? `; no messages yet on ${silent.join(', ')}` : '')
       );
     case 'failing':
-      return `${report.platform}: FAILING — no live inbound, ${errorTotal} adapter error(s): ${errors}`;
+      return `${report.platform}: FAILING — ${errorTotal} adapter error(s) against ${report.liveInbound} live inbound: ${errors}`;
     case 'unverified':
       return (
         `${report.platform}: unverified — no live inbound` +
@@ -133,37 +150,29 @@ export interface PostDeployReport {
   startedAt: string;
   windowMs: number;
   state: 'running' | 'done';
-  /** Set when a restart interrupted the previous window and this one replaced it. */
-  restartedWindow?: boolean;
+  /** Whether this boot followed a successful `deploy.sh`, or was a manual, crash or hot-patch restart. */
+  afterDeploy: boolean;
   platforms: PlatformReport[];
 }
 
 export interface PostDeployCheckDeps {
   build: string | null;
+  afterDeploy: boolean;
   windowMs: number;
-  earlyCheckMs: number;
-  /** Adapter errors that make a platform with no inbound `failing` rather than `unverified`. */
+  /** How often the monitor judges the errors and inbound since its last look, for as long as the host runs. */
+  monitorIntervalMs: number;
+  /** Adapter errors, at least as many as the live inbound beside them, that make a platform `failing`. */
   failingErrorThreshold: number;
   notify: (text: string) => Promise<boolean>;
   reportPath: string;
-  restartedWindow?: boolean;
 }
 
 export const POST_DEPLOY_REPORT_PATH = path.join(REPO_ROOT, 'logs', 'post-deploy-inbound.json');
 
-/** The early report waits ten minutes so a restart's first messages can arrive before anyone is paged. */
-export const POST_DEPLOY_EARLY_CHECK_MS = 10 * 60_000;
+/** Ten minutes, so a restart's first messages can arrive before anyone is paged. */
+export const INBOUND_MONITOR_INTERVAL_MS = 10 * 60_000;
 /** Three, because one routine API error must not turn a quiet platform into a failing one. */
 export const POST_DEPLOY_FAILING_ERROR_THRESHOLD = 3;
-
-/** A window still `running` on disk at boot was cut short by a restart, so this boot owes the verdict. */
-export function previousWindowUnfinished(reportPath: string = POST_DEPLOY_REPORT_PATH): boolean {
-  try {
-    return (JSON.parse(fs.readFileSync(reportPath, 'utf8')) as Partial<PostDeployReport>).state === 'running';
-  } catch {
-    return false;
-  }
-}
 
 function writeReport(file: string, report: PostDeployReport): void {
   try {
@@ -173,45 +182,72 @@ function writeReport(file: string, report: PostDeployReport): void {
   }
 }
 
-/** The report says `running` until the window closes, so nobody reads a previous deploy's verdict as this one's. */
+/**
+ * Starts the boot window and the monitor. The report says `running`, refreshed at each monitor tick, until the window
+ * closes, so nobody reads a previous boot's verdict as this one's. The monitor then keeps judging each interval on its
+ * own and pages once when a platform starts failing, however long after boot.
+ */
 export function startPostDeployInboundCheck(deps: PostDeployCheckDeps): void {
   const startedAt = new Date().toISOString();
-  const snapshot = (state: PostDeployReport['state']): PostDeployReport => ({
+  let done = false;
+  const snapshot = (): PostDeployReport => ({
     build: deps.build,
     startedAt,
     windowMs: deps.windowMs,
-    state,
-    ...(deps.restartedWindow ? { restartedWindow: true } : {}),
+    state: done ? 'done' : 'running',
+    afterDeploy: deps.afterDeploy,
     platforms: evaluatePlatforms(deps.failingErrorThreshold),
   });
-  const header = `Post-deploy inbound check${deps.build ? ` (build ${deps.build})` : ''}`;
-  writeReport(deps.reportPath, snapshot('running'));
+  const header = `${deps.afterDeploy ? 'Post-deploy' : 'Post-restart'} inbound check${deps.build ? ` (build ${deps.build})` : ''}`;
+  writeReport(deps.reportPath, snapshot());
 
   const send = (text: string): void => {
     void deps.notify(text).catch((err: unknown) => log.warn('post-deploy inbound: alert failed', { err, text }));
   };
 
-  const early =
-    deps.earlyCheckMs < deps.windowMs
-      ? setTimeout(() => {
-          const failing = snapshot('running').platforms.filter((r) => r.verdict === 'failing');
-          if (failing.length === 0) return;
-          log.error('Post-deploy inbound check: platform failing', { platforms: failing });
-          send(`${header}: ${failing.map(describe).join('\n')}\nThe final verdict follows when the window closes.`);
-        }, deps.earlyCheckMs)
-      : undefined;
-  early?.unref?.();
+  let previous = evaluatePlatforms(deps.failingErrorThreshold);
+  const failing = new Set<string>();
+  const monitor = setInterval(() => {
+    const current = evaluatePlatforms(deps.failingErrorThreshold);
+    const interval = current.map((now) => {
+      const before = previous.find((p) => p.platform === now.platform);
+      const liveInbound = now.liveInbound - (before?.liveInbound ?? 0);
+      const adapterErrors = Object.fromEntries(
+        Object.entries(now.adapterErrors)
+          .map(([message, n]) => [message, n - (before?.adapterErrors[message] ?? 0)] as const)
+          .filter(([, n]) => n > 0),
+      );
+      const verdict = verdictFor(liveInbound, sum(Object.values(adapterErrors)), deps.failingErrorThreshold);
+      return { ...now, verdict, liveInbound, adapterErrors };
+    });
+    previous = current;
+    if (!done) writeReport(deps.reportPath, snapshot());
+    const started = interval.filter((r) => r.verdict === 'failing' && !failing.has(r.platform));
+    for (const r of interval) {
+      if (r.verdict === 'failing') failing.add(r.platform);
+      else if (r.verdict === 'verified' && failing.delete(r.platform)) {
+        log.info('Inbound check: platform recovered', { platform: r.platform });
+      }
+    }
+    if (started.length === 0) return;
+    const minutes = Math.round(deps.monitorIntervalMs / 60_000);
+    log.error('Inbound check: platform failing', { platforms: started });
+    send(`${header}, last ${minutes} min:\n${started.map(describe).join('\n')}`);
+  }, deps.monitorIntervalMs);
+  monitor.unref?.();
 
   const final = setTimeout(() => {
-    clearTimeout(early);
-    const report = snapshot('done');
+    done = true;
+    const report = snapshot();
     writeReport(deps.reportPath, report);
     const healthy = report.platforms.length > 0 && report.platforms.every((p) => p.verdict === 'verified');
     log[healthy ? 'info' : 'error']('Post-deploy inbound check finished', { ...report });
-    if (!healthy) {
+    const alreadyPaged = report.platforms.every((p) => p.verdict === 'verified' || failing.has(p.platform));
+    if (!healthy && !(report.platforms.length > 0 && alreadyPaged)) {
       const minutes = Math.round(deps.windowMs / 60_000);
       const lines = report.platforms.length > 0 ? report.platforms.map(describe) : ['no chat adapter started'];
       send(`${header} after ${minutes} min:\n${lines.join('\n')}`);
+      for (const p of report.platforms) if (p.verdict === 'failing') failing.add(p.platform);
     }
   }, deps.windowMs);
   final.unref?.();
