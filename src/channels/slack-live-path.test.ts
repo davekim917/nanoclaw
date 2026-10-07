@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 import type { ChannelSetup, InboundMessage } from './adapter.js';
+import { serveAttachments } from './live-path-attachments.js';
 
 const BOT_TOKEN = 'xoxb-live-path-test';
 const APP_TOKEN = 'xapp-live-path-test';
@@ -336,6 +337,53 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
     expect(inbound[0]).toMatchObject({ platformId: `slack:${DM}`, threadId: `slack:${DM}:1790000004.000100` });
     expect(inbound[0]!.message).toMatchObject({ isMention: true, isDM: true });
     expect(inbound[0]!.message.content).toMatchObject({ text: 'a private question' });
+  });
+
+  it('downloads a shared file above the adapter default with the bot token, and refuses one above the host limit', async () => {
+    const { INBOUND_ATTACHMENT_MAX_BYTES } = await import('../config.js');
+    const MiB = 1024 * 1024;
+    const big = 'https://files.slack.com/files-pri/T0TEAMTEST-F0BIG/originals.zip';
+    const huge = 'https://files.slack.com/files-pri/T0TEAMTEST-F0HUGE/footage.zip';
+    const requests = serveAttachments(
+      new Map([
+        [big, 30 * MiB],
+        [huge, INBOUND_ATTACHMENT_MAX_BYTES + 1],
+      ]),
+    );
+    const file = (id: string, name: string, size: number, url: string) => ({
+      id,
+      name,
+      mimetype: 'application/zip',
+      filetype: 'zip',
+      size,
+      url_private: url,
+      url_private_download: url,
+    });
+    inbound.length = 0;
+    await sendEnvelope(
+      'env-files',
+      message({
+        type: 'message',
+        subtype: 'file_share',
+        channel: CHANNEL,
+        channel_type: 'channel',
+        user: HUMAN,
+        text: 'the archives',
+        ts: '1790000007.000100',
+        files: [file('F0BIG', 'originals.zip', 30 * MiB, big), file('F0HUGE', 'footage.zip', 101 * MiB, huge)],
+      }),
+    );
+    await nextInbound(1);
+
+    const attachments = (inbound[0]!.message.content as { attachments: Array<{ name: string; data?: string }> })
+      .attachments;
+    expect(attachments.map((a) => a.name)).toEqual(['originals.zip', 'footage.zip']);
+    expect(Buffer.from(attachments[0]!.data ?? '', 'base64').length).toBe(30 * MiB);
+    expect(attachments[1]!.data).toBeUndefined();
+    expect(requests).toEqual([
+      { url: big, authorization: `Bearer ${BOT_TOKEN}` },
+      { url: huge, authorization: `Bearer ${BOT_TOKEN}` },
+    ]);
   });
 
   it('posts an agent reply into its thread through chat.postMessage', async () => {

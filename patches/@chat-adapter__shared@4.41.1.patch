@@ -1,8 +1,55 @@
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index c461c6602428e6ae2328f61f999b2b8ad6d98522..df34ba8efae18502ef41dbc41f858832619fb231 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -306,6 +306,8 @@ interface DownloadAttachmentOptions {
+  * holds even for a transport that ignores the signal.
+  */
+ declare function downloadAttachment(value: string, options: DownloadAttachmentOptions): Promise<Buffer>;
++/** NanoClaw: defaults for every downloadAttachment call that does not pass its own. */
++declare function setAttachmentDownloadDefaults(defaults: { limit?: number; transport?: AttachmentTransport }): void;
+ 
+ /**
+  * Standardized error types for chat adapters.
+@@ -436,4 +438,4 @@ declare function replaceBareMentions(text: string, replacer: MentionReplacer): s
+  */
+ declare function maskCodeSpans(text: string, replacement?: string): string;
+ 
+-export { AdapterError, AdapterRateLimitError, type AttachmentTransport, AuthenticationError, BUTTON_STYLE_MAPPINGS, type DownloadAttachmentOptions, type EncryptedTokenData, type FallbackTextOptions, type FileDataInput, type MentionReplacer, NetworkError, type NormalizeCodeFencesOptions, PermissionError, type PlatformName, ResourceNotFoundError, type ToBufferOptions, ValidationError, bufferToDataUri, cardToFallbackText, createEmojiConverter, decodeKey, decryptToken, downloadAttachment, encryptToken, escapeTableCell, extractCard, extractFiles, extractPostableAttachments, isEncryptedTokenData, mapButtonStyle, maskCodeSpans, normalizeCodeFences, renderGfmTable, replaceBareMentions, toBuffer, toBufferSync };
++export { AdapterError, AdapterRateLimitError, type AttachmentTransport, AuthenticationError, BUTTON_STYLE_MAPPINGS, type DownloadAttachmentOptions, type EncryptedTokenData, type FallbackTextOptions, type FileDataInput, type MentionReplacer, NetworkError, type NormalizeCodeFencesOptions, PermissionError, type PlatformName, ResourceNotFoundError, type ToBufferOptions, ValidationError, bufferToDataUri, cardToFallbackText, createEmojiConverter, decodeKey, decryptToken, downloadAttachment, encryptToken, escapeTableCell, extractCard, extractFiles, extractPostableAttachments, isEncryptedTokenData, mapButtonStyle, maskCodeSpans, normalizeCodeFences, renderGfmTable, replaceBareMentions, setAttachmentDownloadDefaults, toBuffer, toBufferSync };
 diff --git a/dist/index.js b/dist/index.js
-index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..838128f6a0ef21dc3c384bd237806061871738e2 100644
+index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..6660d23d3169239f1f13453f9e2bc53b063be853 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -804,8 +804,14 @@ function replaceRange(text, start, end, replacer, angles) {
+@@ -381,6 +381,11 @@ import { BlockList, isIP } from "net";
+ import { pipeline } from "stream";
+ import { createBrotliDecompress, createGunzip, createInflate } from "zlib";
+ var LIMIT = 25 * 1024 * 1024;
++// NanoClaw: the host sets one download limit for every adapter, and a test can serve bytes without a network.
++var nanoclawDownloadDefaults = {};
++function setAttachmentDownloadDefaults(defaults) {
++  nanoclawDownloadDefaults = { ...nanoclawDownloadDefaults, ...defaults };
++}
+ var REDIRECTS = 5;
+ var TIMEOUT = 3e4;
+ var STATUSES = /* @__PURE__ */ new Set([301, 302, 303, 307, 308]);
+@@ -597,13 +602,13 @@ async function downloadAttachment(value, options) {
+     adapter,
+     headers,
+     hosts,
+-    limit = LIMIT,
++    limit = nanoclawDownloadDefaults.limit ?? LIMIT,
+     onResponse,
+     redirects = REDIRECTS,
+     timeoutMs = TIMEOUT,
+     transport
+   } = options;
+-  const send = transport ?? createTransport(adapter);
++  const send = transport ?? nanoclawDownloadDefaults.transport ?? createTransport(adapter);
+   const signal = AbortSignal.timeout(timeoutMs);
+   let url = validateAttachmentUrl(value, adapter, hosts);
+   try {
+@@ -804,8 +809,14 @@ function replaceRange(text, start, end, replacer, angles) {
    }
    return result;
  }
@@ -18,3 +65,11 @@ index 46436dab68fdbdc11d2c555b83e116b1fd5516dd..838128f6a0ef21dc3c384bd237806061
  }
  function maskCodeSpans(text, replacement = " ") {
    let result = "";
+@@ -849,6 +860,7 @@ export {
+   normalizeCodeFences,
+   renderGfmTable,
+   replaceBareMentions,
++  setAttachmentDownloadDefaults,
+   toBuffer,
+   toBufferSync
+ };

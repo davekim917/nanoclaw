@@ -83,6 +83,8 @@ export const SELF_HEAL_TAKEOVER_ENABLED =
   (process.env.NANOCLAW_SELF_HEAL_TAKEOVER ?? envConfig.NANOCLAW_SELF_HEAL_TAKEOVER) === '1';
 // Default on; `0` is the fleet-wide off switch. Read at host start to gate delivery (reaches adopted
 // containers too) and at spawn to decide whether the container gets update_task_list.
+/** Largest inbound file the host downloads for an agent. A larger Slack or Discord file arrives as metadata only. */
+export const INBOUND_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024;
 export const TASK_LIST_ENABLED = (process.env.NANOCLAW_TASK_LIST ?? envConfig.NANOCLAW_TASK_LIST) !== '0';
 export const TASK_SCRIPT_TIMEOUT_MS = parseTimeoutMs(
   process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? envConfig.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS,

@@ -26,6 +26,9 @@ import {
   getNodeChildren,
   isListNode,
 } from 'chat';
+import { setAttachmentDownloadDefaults } from '@chat-adapter/shared';
+
+import { INBOUND_ATTACHMENT_MAX_BYTES } from '../config.js';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
@@ -41,6 +44,8 @@ import type {
   ChannelSetup,
   InboundMessage,
 } from './adapter.js';
+
+setAttachmentDownloadDefaults({ limit: INBOUND_ATTACHMENT_MAX_BYTES });
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -833,8 +838,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             log.warn('Failed to download attachment via fetchData', { type: att.type, err });
           }
         } else if (attUrl) {
-          // For adapters without fetchData (e.g. @chat-adapter/discord): Discord CDN URLs are signed and public, but
-          // the signature expires, so bytes must be pulled now.
+          // For an adapter without fetchData: a signed attachment URL expires, so bytes must be pulled now.
           try {
             const response = await fetch(attUrl);
             if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
