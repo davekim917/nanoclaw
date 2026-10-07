@@ -1,0 +1,131 @@
+{
+  "livePaths": {
+    "slack-inbound": {
+      "description": "Slack events over Socket Mode reaching the router as inbound messages",
+      "tests": ["src/channels/slack-live-path.test.ts"]
+    },
+    "slack-outbound": {
+      "description": "Agent replies posted to Slack through the adapter and the Web API",
+      "tests": ["src/channels/slack-live-path.test.ts"]
+    },
+    "discord-inbound": {
+      "description": "Discord gateway events reaching the router as inbound messages",
+      "tests": []
+    },
+    "discord-outbound": {
+      "description": "Agent replies posted to Discord through the adapter and the REST API",
+      "tests": []
+    },
+    "attachment-download": {
+      "description": "Files attached to Slack and Discord messages downloaded for the agent",
+      "tests": []
+    },
+    "onecli-gateway": {
+      "description": "Host calls to the OneCLI control API that every container spawn depends on",
+      "tests": []
+    },
+    "provider-claude": {
+      "description": "Agent turns through the Claude Agent SDK and the Claude Code CLI in the container",
+      "tests": []
+    },
+    "provider-codex": {
+      "description": "Agent turns through the Codex CLI in the container",
+      "tests": []
+    },
+    "provider-opencode": {
+      "description": "Agent turns through OpenCode in the container",
+      "tests": []
+    },
+    "mcp-tools": {
+      "description": "The agent-runner's MCP servers and clients",
+      "tests": []
+    }
+  },
+  "packages": {
+    "@chat-adapter/discord": {
+      "kind": "live",
+      "paths": ["discord-inbound", "discord-outbound", "attachment-download"]
+    },
+    "@chat-adapter/slack": { "kind": "live", "paths": ["slack-inbound", "slack-outbound", "attachment-download"] },
+    "@chat-adapter/shared": {
+      "kind": "live",
+      "paths": ["slack-inbound", "slack-outbound", "discord-inbound", "discord-outbound", "attachment-download"]
+    },
+    "chat": { "kind": "live", "paths": ["slack-inbound", "slack-outbound", "discord-inbound", "discord-outbound"] },
+    "discord.js": { "kind": "live", "paths": ["discord-inbound", "discord-outbound"] },
+    "@slack/web-api": { "kind": "live", "paths": ["slack-inbound", "slack-outbound"] },
+    "ws": { "kind": "dev" },
+    "@onecli-sh/sdk": { "kind": "live", "paths": ["onecli-gateway"] },
+
+    "@clack/core": { "kind": "runtime" },
+    "@clack/prompts": { "kind": "runtime" },
+    "better-sqlite3": { "kind": "runtime" },
+    "chokidar": { "kind": "runtime" },
+    "cron-parser": { "kind": "runtime" },
+    "kleur": { "kind": "runtime" },
+    "undici": { "kind": "runtime" },
+    "yaml": { "kind": "runtime" },
+
+    "@eslint/js": { "kind": "dev" },
+    "@types/better-sqlite3": { "kind": "dev" },
+    "@types/bun": { "kind": "dev" },
+    "@types/node": { "kind": "dev" },
+    "@types/ws": { "kind": "dev" },
+    "@vitest/coverage-v8": { "kind": "dev" },
+    "eslint": { "kind": "dev" },
+    "eslint-plugin-no-catch-all": { "kind": "dev" },
+    "globals": { "kind": "dev" },
+    "husky": { "kind": "dev" },
+    "jscpd": { "kind": "dev" },
+    "knip": { "kind": "dev" },
+    "prettier": { "kind": "dev" },
+    "tsx": { "kind": "dev" },
+    "typescript": { "kind": "dev" },
+    "typescript-eslint": { "kind": "dev" },
+    "vitest": { "kind": "dev" },
+
+    "@anthropic-ai/claude-agent-sdk": { "kind": "live", "paths": ["provider-claude"] },
+    "@anthropic-ai/sdk": { "kind": "live", "paths": ["provider-claude"] },
+    "@modelcontextprotocol/sdk": { "kind": "live", "paths": ["mcp-tools"] },
+    "@opencode-ai/sdk": { "kind": "live", "paths": ["provider-opencode"] },
+    "zod": { "kind": "runtime" },
+
+    "@remotion/cli": { "kind": "runtime" },
+    "@remotion/renderer": { "kind": "runtime" },
+    "remotion": { "kind": "runtime" },
+    "react": { "kind": "runtime" },
+    "react-dom": { "kind": "runtime" },
+    "@types/react": { "kind": "dev" },
+    "@types/react-dom": { "kind": "dev" },
+
+    "docker:claude-code": { "kind": "live", "paths": ["provider-claude"] },
+    "docker:codex": { "kind": "live", "paths": ["provider-codex"] },
+    "docker:opencode": { "kind": "live", "paths": ["provider-opencode"] },
+    "docker:base-image": { "kind": "runtime" },
+    "docker:bun": { "kind": "runtime" },
+    "docker:pnpm": { "kind": "runtime" },
+    "docker:npm": { "kind": "runtime" },
+    "docker:mcp-toolbox": { "kind": "runtime" },
+    "docker:agent-browser": { "kind": "runtime" },
+    "docker:vercel": { "kind": "runtime" },
+    "docker:mermaid-cli": { "kind": "runtime" },
+    "docker:google-workspace-cli": { "kind": "runtime" },
+    "docker:wix-cli": { "kind": "runtime" },
+    "docker:cf": { "kind": "runtime" },
+    "docker:dbt-mcp": { "kind": "runtime" },
+    "docker:pip": { "kind": "runtime" },
+    "docker:setuptools": { "kind": "runtime" },
+    "docker:wheel": { "kind": "runtime" },
+    "docker:snowflake-cli": { "kind": "runtime" },
+    "docker:dbt-core": { "kind": "runtime" },
+    "docker:dbt-snowflake": { "kind": "runtime" },
+    "docker:uv": { "kind": "runtime" },
+    "docker:aws-cli": { "kind": "runtime" },
+    "docker:mcp-atlassian": { "kind": "runtime" },
+    "docker:render": { "kind": "runtime" },
+    "docker:railway": { "kind": "runtime" },
+    "docker:supabase": { "kind": "runtime" },
+    "docker:yq": { "kind": "runtime" },
+    "docker:hex-cli": { "kind": "runtime" }
+  }
+}

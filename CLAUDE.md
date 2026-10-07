@@ -178,6 +178,7 @@ Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yan
 - **`allowBuilds`**: never add/enable packages here without approval — build scripts execute arbitrary code during install.
 - **`pnpm install --frozen-lockfile`** in CI/automation/container builds — never bare `pnpm install` there.
 - **Exact resolution**: commit manifests with regenerated lockfiles; Docker/runtime tools stay exact-pinned; registry failure is `unknown`, never "current."
+- **Dependency gate** (`scripts/dependency-gate.ts`, CI on every PR): a runtime or live version change needs a `docs/dependency-changes/` ledger mapping each changelog behaviour change to a test or a reason; a version move beneath a package `container/dependency-paths.json` names live, at any depth, cannot merge until each of its live I/O paths has a real-library `*live-path*.test.ts` already listed at the base (an incident hotfix or rollback may carry an `Override:` line). Never reclassify a package to get a bump through.
 
 ## Docs Index
 

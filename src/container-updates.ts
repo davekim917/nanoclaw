@@ -4,6 +4,8 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import { readDependencyPathRegistry, untestedLivePaths } from './dependency-paths.js';
+
 const execFileAsync = promisify(execFile);
 
 export const CONTAINER_PLUGINS_ROOT = '/workspace/plugins';
@@ -35,6 +37,8 @@ export interface AuditItem {
   heldByMerge?: boolean;
   /** The locally-running component that must move in the SAME change (a wire contract no test can see). */
   pairedWith?: string;
+  /** Live I/O paths this package is on that have no real-library test; the CI dependency gate refuses the bump. */
+  untestedLivePaths?: string[];
 }
 
 /** Client halves of client/server pairs with a local component; build and tests can't catch a wire break. */
@@ -689,7 +693,15 @@ export async function auditRepository(
     auditCodexSources(manifest, fetchJson),
     auditPluginVersions(manifest, fetchJson),
   ]);
-  return [...host, ...bun, ...remotion, ...docker, ...codex, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
+  const registry = readDependencyPathRegistry(repoRoot);
+  return [...host, ...bun, ...remotion, ...docker, ...codex, ...plugins]
+    .map((item) => {
+      const untested = registry
+        ? untestedLivePaths(registry, item.kind === 'dockerfile-pin' ? item.id : item.name)
+        : [];
+      return untested.length > 0 ? { ...item, untestedLivePaths: untested } : item;
+    })
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function statusLabel(status: AuditStatus): string {
@@ -729,6 +741,12 @@ export function renderAuditMarkdown(items: AuditItem[]): string {
   if (drifted.length > 0) {
     lines.push('', '**Upstream pins differ from ours** (upstream parity is usually the safer target than latest):');
     for (const item of drifted) lines.push(`- ${item.id}: ours \`${item.current}\`, upstream \`${item.upstreamPin}\``);
+  }
+
+  const untested = actionable.filter((item) => item.untestedLivePaths);
+  if (untested.length > 0) {
+    lines.push('', '**BLOCKED by the dependency gate — a live I/O path with no real-library test:**');
+    for (const item of untested) lines.push(`- ${item.id}: ${item.untestedLivePaths!.join(', ')}`);
   }
 
   const paired = actionable.filter((item) => item.pairedWith);
