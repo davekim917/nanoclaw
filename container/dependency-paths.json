@@ -54,11 +54,7 @@
     "chat": { "kind": "live", "paths": ["slack-inbound", "slack-outbound", "discord-inbound", "discord-outbound"] },
     "discord.js": { "kind": "live", "paths": ["discord-inbound", "discord-outbound"] },
     "@slack/web-api": { "kind": "live", "paths": ["slack-inbound", "slack-outbound"] },
-    "ws": { "kind": "live", "paths": ["discord-inbound", "slack-inbound"] },
-    "@discordjs/ws": { "kind": "live", "paths": ["discord-inbound"] },
-    "@discordjs/rest": { "kind": "live", "paths": ["discord-outbound"] },
-    "discord-api-types": { "kind": "live", "paths": ["discord-inbound", "discord-outbound"] },
-    "@slack/socket-mode": { "kind": "live", "paths": ["slack-inbound"] },
+    "ws": { "kind": "dev" },
     "@onecli-sh/sdk": { "kind": "live", "paths": ["onecli-gateway"] },
 
     "@clack/core": { "kind": "runtime" },

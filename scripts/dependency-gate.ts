@@ -64,6 +64,26 @@ interface PnpmLock {
   patchedDependencies?: Record<string, string | { hash?: string }>;
 }
 
+/** Package names in a bun.lock key: `a/@s/b/c` is a → @s/b → c. */
+function bunKeyNames(key: string): string[] {
+  const names: string[] = [];
+  const parts = key.split('/');
+  for (let i = 0; i < parts.length; i++) {
+    names.push(parts[i]!.startsWith('@') ? `${parts[i]}/${parts[++i]}` : parts[i]!);
+  }
+  return names;
+}
+
+/** The entry a dependency `dep` of the package at `key` resolves to: the nearest `<ancestors>/dep`, as Node's lookup. */
+function bunResolve(entries: Record<string, unknown[]>, key: string, dep: string): string | null {
+  const names = bunKeyNames(key);
+  for (let i = names.length; i >= 0; i--) {
+    const entry = entries[[...names.slice(0, i), dep].join('/')];
+    if (entry && typeof entry[0] === 'string') return entry[0];
+  }
+  return null;
+}
+
 /** bun.lock is JSON with trailing commas. */
 function parseBunLock(text: string): { packages?: Record<string, unknown[]> } {
   return JSON.parse(text.replace(/,(\s*[}\]])/g, '$1')) as { packages?: Record<string, unknown[]> };
@@ -99,6 +119,8 @@ type Source = 'host' | 'runner' | 'remotion' | 'docker';
 export interface Locked {
   versions: Map<Source, Map<string, Set<string>>>;
   dependsOn: Map<Source, Map<string, Set<string>>>;
+  /** `name@version` → the exact `name@version`s it loads, per tree. */
+  graph: Map<Source, Map<string, Set<string>>>;
   /** `<source>:<name>[@version]` → patch hash, from pnpm's patchedDependencies. */
   patches: Map<string, string>;
 }
@@ -117,7 +139,7 @@ export function lockedVersions(
   files: DependencyFiles,
   tools: TrackedTool[] = trackedTools(files.updateSources),
 ): Locked {
-  const locked: Locked = { versions: new Map(), dependsOn: new Map(), patches: new Map() };
+  const locked: Locked = { versions: new Map(), dependsOn: new Map(), graph: new Map(), patches: new Map() };
   const pnpm: Array<[Source, string | null]> = [
     ['host', files.pnpmLock],
     ['remotion', files.remotionLock],
@@ -129,11 +151,17 @@ export function lockedVersions(
       const spec = splitSpec(key.replace(/\(.*$/, ''));
       if (spec) add(tree(locked.versions, source), spec[0], spec[1]);
     }
+    const nodes = new Set(Object.keys(lock.snapshots ?? {}).map((key) => key.replace(/\(.*$/, '')));
     for (const [key, snapshot] of Object.entries(lock.snapshots ?? {})) {
-      const spec = splitSpec(key.replace(/\(.*$/, ''));
+      const node = key.replace(/\(.*$/, '');
+      const spec = splitSpec(node);
       if (!spec) continue;
-      for (const dep of Object.keys({ ...snapshot?.dependencies, ...snapshot?.optionalDependencies })) {
+      tree(locked.graph, source).set(node, tree(locked.graph, source).get(node) ?? new Set());
+      for (const [dep, ref] of Object.entries({ ...snapshot?.dependencies, ...snapshot?.optionalDependencies })) {
         add(tree(locked.dependsOn, source), spec[0], dep);
+        const version = String(ref).replace(/\(.*$/, '');
+        const target = nodes.has(`${dep}@${version}`) || !nodes.has(version) ? `${dep}@${version}` : version;
+        add(tree(locked.graph, source), node, target);
       }
     }
     for (const [key, entry] of Object.entries(lock.patchedDependencies ?? {})) {
@@ -141,13 +169,18 @@ export function lockedVersions(
     }
   }
   if (files.bunLock) {
-    for (const entry of Object.values(parseBunLock(files.bunLock).packages ?? {})) {
-      const spec = typeof entry[0] === 'string' ? splitSpec(entry[0]) : null;
+    const entries = parseBunLock(files.bunLock).packages ?? {};
+    for (const [key, entry] of Object.entries(entries)) {
+      const node = typeof entry[0] === 'string' ? entry[0] : '';
+      const spec = splitSpec(node);
       if (!spec) continue;
       add(tree(locked.versions, 'runner'), spec[0], spec[1]);
+      tree(locked.graph, 'runner').set(node, tree(locked.graph, 'runner').get(node) ?? new Set());
       const meta = (entry[2] ?? {}) as { dependencies?: object; optionalDependencies?: object };
       for (const dep of Object.keys({ ...meta.dependencies, ...meta.optionalDependencies })) {
         add(tree(locked.dependsOn, 'runner'), spec[0], dep);
+        const target = bunResolve(entries, key, dep);
+        if (target) add(tree(locked.graph, 'runner'), node, target);
       }
     }
   }
@@ -241,8 +274,8 @@ export function packageChanges(base: Locked, head: Locked, patchedFiles: Iterabl
 
 /**
  * Per tree, every package a runtime code path can load: the registry's non-dev packages and whatever they depend on
- * within that lockfile. Reach decides only whether a change needs a ledger section, so over-counting costs a ledger
- * line; blocking stays with the packages the registry names as live. Type-only packages carry no behaviour.
+ * within that lockfile, by name. Reach decides only whether a change needs a ledger section, so over-counting costs a
+ * ledger line; blocking follows exact versions (`liveMoves`). Type-only packages carry no behaviour.
  */
 export function runtimeReach(
   registry: Registry,
@@ -270,20 +303,26 @@ export function runtimeReach(
 }
 
 const IMPORT = /(?:\bfrom|\bimport)\s*\(?\s*['"]([^'"]+)['"]/g;
+const TYPE_ONLY = /^\s*(?:import|export)\s+type\b[^;]*;/gm;
+const MOCK = /\b(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)\(\s*['"]([^'"]+)['"]/g;
 
+/** Runtime imports only: a type-only import loads nothing. */
 function importsOf(text: string): string[] {
-  return [...text.matchAll(IMPORT)].map((m) => m[1]!);
+  return [...text.replace(TYPE_ONLY, '').matchAll(IMPORT)].map((m) => m[1]!);
 }
+
+const names = (spec: string, packages: string[]): boolean =>
+  packages.some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`));
 
 /**
  * Whether a test loads one of `packages`, itself or through one host module it imports. A name-only check would accept
  * a placeholder test; this cheap floor refuses one that never touches the libraries on its path.
  */
 function testLoads(test: string, packages: string[], read: (file: string) => string | null): boolean {
-  const hits = (text: string): boolean =>
-    importsOf(text).some((spec) => packages.some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`)));
+  const hits = (text: string): boolean => importsOf(text).some((spec) => names(spec, packages));
   const text = read(test);
   if (text === null) return false;
+  if ([...text.matchAll(MOCK)].some((m) => names(m[1]!, packages))) return false;
   if (hits(text)) return true;
   return importsOf(text)
     .filter((spec) => spec.startsWith('.'))
@@ -291,6 +330,49 @@ function testLoads(test: string, packages: string[], read: (file: string) => str
       const module = read(path.posix.join(path.posix.dirname(test), spec).replace(/\.js$/, '.ts'));
       return module !== null && hits(module);
     });
+}
+
+function closure(locked: Locked, source: Source, root: string): Set<string> {
+  const graph = locked.graph.get(source);
+  const seen = new Set([...(locked.versions.get(source)?.get(root) ?? [])].map((version) => `${root}@${version}`));
+  const queue = [...seen];
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    for (const next of graph?.get(node) ?? []) {
+      if (!seen.has(next)) {
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  return seen;
+}
+
+/**
+ * Per tree and moved package, the live packages whose exact-version closure it moved: a version a live package loads
+ * at the head and did not at the base, or a re-patched package it loads. Exact versions, so a copy only something else
+ * loads never blocks a live path, and a version swap beneath a live package always does.
+ */
+export function liveMoves(
+  registry: Registry,
+  base: Locked,
+  head: Locked,
+  repatched: Set<string>,
+): Map<Source, Map<string, Set<string>>> {
+  const moves = new Map<Source, Map<string, Set<string>>>();
+  const live = Object.entries(registry.packages)
+    .filter(([, cls]) => cls.kind === 'live')
+    .map(([name]) => name);
+  for (const source of SOURCES) {
+    for (const root of live) {
+      const before = closure(base, source, root);
+      for (const node of closure(head, source, root)) {
+        const name = splitSpec(node)?.[0];
+        if (name && (!before.has(node) || repatched.has(name))) add(tree(moves, source), name, root);
+      }
+    }
+  }
+  return moves;
 }
 
 export function registryProblems(
@@ -328,7 +410,7 @@ export function registryProblems(
           .map(([name]) => name);
         if (packages.length > 0 && !testLoads(test, packages, read)) {
           problems.push(
-            `live path ${id} lists ${test}, which loads none of the packages on that path (${packages.join(', ')}), directly or through a module it imports`,
+            `live path ${id} lists ${test}, which loads none of the packages on that path (${packages.join(', ')}) at runtime, directly or through a module it imports, or mocks one of them`,
           );
         }
       }
@@ -356,8 +438,9 @@ export interface Ledger {
 }
 
 /**
- * Sections: `## <name> <from> → <to>`, a `Source:` line, an optional `Override:` line, then one bullet per behaviour
- * change ending in `· test: <path>` or `· not covered: <reason>`. Fenced code is skipped.
+ * Sections: `## <name>[, <name>…] <from> → <to>` (packages that moved between the same versions), a `Source:` line,
+ * an optional `Override:` line, then one bullet per behaviour change ending in `· test: <path>` or
+ * `· not covered: <reason>`. Fenced code is skipped.
  */
 export function parseLedgers(files: Array<{ file: string; text: string }>): Ledger {
   const ledger: Ledger = { sections: new Map(), reclassified: new Map(), problems: [] };
@@ -376,13 +459,14 @@ export function parseLedgers(files: Array<{ file: string; text: string }>): Ledg
         ledger.reclassified.set(reclassified[1]!, reclassified[2]!.trim());
         continue;
       }
-      const heading = /^## (\S+) (\S+) → (\S+)\s*$/.exec(line);
+      const heading = /^## (\S+(?:, \S+)*) (\S+) → (\S+)\s*$/.exec(line);
       if (heading) {
-        const name = heading[1]!;
-        const previous = ledger.sections.get(name);
-        if (previous) ledger.problems.push(`${name} has a ledger section in both ${previous.file} and ${file}`);
         current = { from: heading[2]!, to: heading[3]!, source: '', override: '', entries: [], file };
-        ledger.sections.set(name, current);
+        for (const name of heading[1]!.split(', ')) {
+          const previous = ledger.sections.get(name);
+          if (previous) ledger.problems.push(`${name} has a ledger section in both ${previous.file} and ${file}`);
+          ledger.sections.set(name, current);
+        }
         continue;
       }
       if (/^#{1,2} /.test(line)) {
@@ -436,6 +520,27 @@ function overridable(change: PackageChange): boolean {
   return change.added.every((v) => compareVersions(parse(v), oldestRemoved) < 0);
 }
 
+/** The release line a version belongs to under semver: its major, or `0.<minor>` before 1.0. */
+function releaseLine(version: string): string {
+  if (!PLAIN_VERSION.test(version)) return version;
+  const [major, minor] = version.split('.');
+  return major === '0' ? `0.${minor ?? '0'}` : major!;
+}
+
+/**
+ * A transitive move that leaves its semver-compatible range: a version on a release line the package was not on. A
+ * direct dependency needs a ledger for any change; a transitive one inside its range rides on its parent's ledger,
+ * and a live path's real-library test covers it on the wire.
+ */
+function breakingMove(change: PackageChange): boolean {
+  const before = new Set(change.removed.map(releaseLine));
+  const kept = change.from
+    .split(',')
+    .filter((v) => !change.removed.includes(v))
+    .map(releaseLine);
+  return change.added.some((v) => !before.has(releaseLine(v)) && !kept.includes(releaseLine(v)));
+}
+
 export interface GateResult {
   problems: string[];
   warnings: string[];
@@ -447,18 +552,30 @@ export function changeProblems(
   changes: PackageChange[],
   ledger: Ledger,
   exists: (file: string) => boolean,
+  moves: Map<Source, Map<string, Set<string>>>,
+  baseRegistry: Registry | null = null,
 ): GateResult {
+  const tests = baseRegistry ?? registry;
+  const untestedVia = (root: string): string[] => [
+    ...new Set([
+      ...untestedLivePaths(registry, root, tests),
+      ...(baseRegistry ? untestedLivePaths(baseRegistry, root) : []),
+    ]),
+  ];
   const result: GateResult = { problems: [...ledger.problems], warnings: [] };
   for (const change of changes) {
     const explicit = registry.packages[change.name];
     const reached = change.sources.some((source) => reach.get(source)?.has(change.name));
-    if (!reached && explicit?.kind !== 'live') continue;
+    const moved = change.sources.some((source) => moves.get(source)?.has(change.name));
+    if (!reached && !moved && explicit?.kind !== 'live') continue;
     const label = `${change.name} ${change.from} → ${change.to}`;
     const section = ledger.sections.get(change.name);
 
-    const untested = change.to === 'none' ? [] : untestedLivePaths(registry, change.name);
+    const roots = [...new Set(change.sources.flatMap((source) => [...(moves.get(source)?.get(change.name) ?? [])]))];
+    const untested = change.to === 'none' ? [] : [...new Set(roots.flatMap(untestedVia))];
     if (untested.length > 0) {
-      const message = `${label} is on live I/O path(s) with no real-library test: ${untested.map((id) => `${id} (${registry.livePaths[id]!.description})`).join('; ')}`;
+      const via = roots.filter((root) => root !== change.name);
+      const message = `${label}${via.length > 0 ? ` (loaded by ${via.join(', ')})` : ''} is on live I/O path(s) with no real-library test: ${untested.map((id) => `${id} (${(registry.livePaths[id] ?? tests.livePaths[id])?.description ?? id})`).join('; ')}`;
       if (section?.override && overridable(change)) {
         result.warnings.push(`${message}. Allowed by the ledger's Override: ${section.override}`);
       } else {
@@ -470,6 +587,7 @@ export function changeProblems(
     }
 
     if (!section) {
+      if (explicit?.kind !== 'runtime' && explicit?.kind !== 'live' && !breakingMove(change)) continue;
       result.problems.push(
         `${label} changes runtime behaviour but no ${LEDGER_DIR}/ file this change adds or edits has a "## ${label}" section`,
       );
@@ -561,25 +679,55 @@ export function weakenedRegistryProblems(
   return problems;
 }
 
+/** Dockerfile instructions with continuations joined, comments and blank lines dropped. */
+function dockerInstructions(dockerfile: string): string[] {
+  return dockerfile
+    .replace(/\\\r?\n/g, ' ')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('#'));
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+
 /**
- * A tracked tool must install from its ARG pin, or the gate cannot see its version: the ARG's references may not drop
- * while the ARG is still defined, and an npm-sourced tool may not appear with a literal version.
+ * A tracked tool must install from its ARG pin, or the gate cannot see its version: the ARG's references outside
+ * comments may not drop while the ARG is defined, and every npm or PyPI install token for the tool must read exactly
+ * `pkg@${ARG}` or `pkg==${ARG}` — no literal, tag, other ARG, or missing version.
  */
 export function dockerfileProblems(base: string | null, head: string | null, tools: TrackedTool[]): string[] {
   if (!head) return [];
   const problems: string[] = [];
-  const references = (text: string, arg: string): number =>
-    [...text.matchAll(new RegExp(`\\$\\{${arg}\\}|\\$${arg}\\b`, 'g'))].length;
+  const headLines = dockerInstructions(head);
+  const references = (lines: string[], arg: string): number =>
+    lines
+      .filter((line) => !new RegExp(`^ARG\\s+${arg}=`).test(line))
+      .reduce((count, line) => count + [...line.matchAll(new RegExp(`\\$\\{${arg}\\}|\\$${arg}\\b`, 'g'))].length, 0);
   for (const tool of tools) {
-    const defined = new RegExp(`^ARG ${tool.arg}=`, 'm').test(head);
-    if (defined && base && references(head, tool.arg) < references(base, tool.arg)) {
+    const defined = headLines.some((line) => new RegExp(`^ARG\\s+${tool.arg}=`).test(line));
+    if (defined && base && references(headLines, tool.arg) < references(dockerInstructions(base), tool.arg)) {
       problems.push(
-        `container/Dockerfile references \${${tool.arg}} fewer times than the base; ${tool.id} must install from its ARG pin`,
+        `container/Dockerfile references \${${tool.arg}} fewer times than the base, comments aside; ${tool.id} must install from its ARG pin`,
       );
     }
-    const pkg = tool.source?.kind === 'npm' ? tool.source.package : undefined;
-    if (pkg && new RegExp(`${pkg.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}@\\d`).test(head)) {
-      problems.push(`container/Dockerfile installs ${pkg} at a literal version; install it from \${${tool.arg}}`);
+    const kind = tool.source?.kind;
+    const pkg = tool.source?.package;
+    if (!pkg || (kind !== 'npm' && kind !== 'pypi')) continue;
+    const separator = kind === 'npm' ? '@' : '==';
+    const pinned = new RegExp(`^["']?(?:\\$\\{${tool.arg}\\}|\\$${tool.arg}\\b)["']?(?=[\\s"']|$)`);
+    const token = new RegExp(`(?:^|[\\s"'=])${escapeRegExp(pkg)}(${escapeRegExp(separator)}\\S*|(?=[\\s"']|$))`, 'g');
+    for (const command of headLines.flatMap((line) => line.split(/&&|\|\||;|\|/))) {
+      const verb = /\b(?:install|i|add)\b/.exec(command);
+      for (const match of command.matchAll(token)) {
+        const rest = match[1] ?? '';
+        const versioned = rest.startsWith(separator);
+        if (!versioned && (!verb || match.index < verb.index)) continue;
+        if (!versioned || !pinned.test(rest.slice(separator.length))) {
+          problems.push(
+            `container/Dockerfile installs ${pkg} as ${pkg}${rest.replace(/["']+$/, '')}; install it as ${pkg}${separator}\${${tool.arg}}`,
+          );
+        }
+      }
     }
   }
   return problems;
@@ -628,12 +776,22 @@ export function runCheck(root: string, base: string): GateResult {
   );
 
   const head = lockedVersions(headFiles, tools);
+  const baseLocked = lockedVersions(baseFiles, tools);
   const changes = packageChanges(
-    lockedVersions(baseFiles, tools),
+    baseLocked,
     head,
     changedFiles.map(patchedPackage).filter((name): name is string => name !== null),
   );
-  const result = changeProblems(registry, runtimeReach(registry, head.dependsOn), changes, ledger, exists);
+  const repatched = new Set(changes.filter((change) => change.from === change.to).map((change) => change.name));
+  const result = changeProblems(
+    registry,
+    runtimeReach(registry, head.dependsOn),
+    changes,
+    ledger,
+    exists,
+    liveMoves(registry, baseLocked, head, repatched),
+    baseRegistry,
+  );
   return {
     problems: [
       ...registryProblems(registry, directDependencies(headFiles), read),

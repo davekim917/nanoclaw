@@ -5,6 +5,7 @@ import {
   changeProblems,
   directDependencies,
   dockerfileProblems,
+  liveMoves,
   lockedVersions,
   packageChanges,
   parseLedgers,
@@ -113,6 +114,8 @@ const contents: Record<string, string> = {
   'src/channels/chat-live-path.test.ts': "import { wire } from './chat-wiring.js';\nit('delivers', () => wire());\n",
   'src/channels/chat-wiring.ts': "import { Chat } from 'chat';\nexport const wire = () => new Chat();\n",
   'src/channels/placeholder-live-path.test.ts': "it('ok', () => {});\n",
+  'src/channels/mocked-live-path.test.ts': "vi.mock('chat', () => ({}));\nimport 'chat';\nit('ok', () => {});\n",
+  'src/channels/typed-live-path.test.ts': "import type { Chat } from 'chat';\nit('ok', () => {});\n",
   'src/router.test.ts': '',
   'package.json': '{}',
 };
@@ -121,8 +124,34 @@ const exists = (file: string): boolean => read(file) !== null;
 const head = lockedVersions(files());
 const reach = runtimeReach(registry, head.dependsOn);
 const ledgerOf = (text: string) => parseLedgers([{ file: 'docs/dependency-changes/2026-10-07-x.md', text }]);
-const gate = (changes: PackageChange[], text = '', within = registry) =>
-  changeProblems(within, runtimeReach(within, head.dependsOn), changes, ledgerOf(text), exists);
+/** A synthetic change to a live package moves that package's own closure. */
+const selfMoves = (changes: PackageChange[], within: Registry) => {
+  const moves = new Map<'host' | 'runner' | 'remotion' | 'docker', Map<string, Set<string>>>();
+  for (const change of changes) {
+    if (within.packages[change.name]?.kind !== 'live') continue;
+    for (const source of change.sources) {
+      const bySource = moves.get(source) ?? new Map<string, Set<string>>();
+      bySource.set(change.name, new Set([change.name]));
+      moves.set(source, bySource);
+    }
+  }
+  return moves;
+};
+const gate = (changes: PackageChange[], text = '', within = registry, base: Registry | null = null) =>
+  changeProblems(
+    within,
+    runtimeReach(within, head.dependsOn),
+    changes,
+    ledgerOf(text),
+    exists,
+    selfMoves(changes, within),
+    base,
+  );
+const movesBetween = (before: ReturnType<typeof lockedVersions>, after: ReturnType<typeof lockedVersions>) => {
+  const changes = packageChanges(before, after);
+  const repatched = new Set(changes.filter((c) => c.from === c.to).map((c) => c.name));
+  return { changes, moves: liveMoves(registry, before, after, repatched) };
+};
 const bump = (name: string, from: string, to: string, source: 'host' | 'docker' = 'host'): PackageChange => {
   const was = from === 'none' ? [] : from.split(',');
   const now = to === 'none' ? [] : to.split(',');
@@ -198,32 +227,93 @@ describe('runtime reach and live paths', () => {
     expect(changes).toEqual([
       expect.objectContaining({ name: 'ws', sources: ['remotion'], added: ['8.21.0'], removed: ['8.20.0'] }),
     ]);
-    expect(changeProblems(registry, reach, changes, ledgerOf(''), exists).problems).toEqual([]);
+    expect(changeProblems(registry, reach, changes, ledgerOf(''), exists, new Map()).problems).toEqual([]);
   });
 
-  it('wants a ledger for a transitive move under a live package, and blocks it only when the registry names it live', () => {
-    const moved = packageChanges(head, lockedVersions(files({ pnpmLock: pnpmLock('aaa', '8.22.0') })));
-    expect(gate(moved).problems).toEqual([
+  it('blocks an exact-version move beneath a live package whose path has no test', () => {
+    const { changes, moves } = movesBetween(head, lockedVersions(files({ pnpmLock: pnpmLock('aaa', '8.22.0') })));
+    expect(changeProblems(registry, reach, changes, ledgerOf(''), exists, moves).problems).toEqual([
       expect.stringContaining(
-        'no docs/dependency-changes/ file this change adds or edits has a "## ws 8.21.0 → 8.22.0"',
+        'ws 8.21.0 → 8.22.0 (loaded by @chat-adapter/discord) is on live I/O path(s) with no real-library test: discord-inbound',
       ),
     ]);
-    const named: Registry = {
-      ...registry,
-      packages: { ...registry.packages, ws: { kind: 'live', paths: ['discord-inbound'] } },
-    };
-    expect(gate(moved, '', named).problems).toEqual([
-      expect.stringContaining('ws 8.21.0 → 8.22.0 is on live I/O path(s) with no real-library test: discord-inbound'),
-      expect.stringContaining('"## ws 8.21.0 → 8.22.0"'),
-    ]);
   });
 
-  it('wants a ledger for a transitive move under a runtime package', () => {
-    const graph = new Map([['host' as const, new Map([['zod', new Set(['luxon'])]])]]);
-    const changes = [bump('luxon', '3.7.2', '4.0.0')];
-    expect(changeProblems(registry, runtimeReach(registry, graph), changes, ledgerOf(''), exists).problems).toEqual([
-      expect.stringContaining('"## luxon 3.7.2 → 4.0.0" section'),
+  it('does not block a version of the same name that only something else loads', () => {
+    const withOther = (otherWs: string) =>
+      pnpmLock()
+        .replace(
+          'packages:\n',
+          `packages:\n\n  other@1.0.0:\n    resolution: {integrity: sha512-x}\n\n  ws@${otherWs}:\n    resolution: {integrity: sha512-x}\n`,
+        )
+        .replace(
+          'snapshots:\n',
+          `snapshots:\n\n  other@1.0.0:\n    dependencies:\n      ws: ${otherWs}\n\n  ws@${otherWs}: {}\n`,
+        );
+    const before = lockedVersions(files({ pnpmLock: withOther('7.0.0') }));
+    const after = lockedVersions(files({ pnpmLock: withOther('7.1.0') }));
+    const { changes, moves } = movesBetween(before, after);
+    expect(changes.map((c) => `${c.name} ${c.from} → ${c.to}`)).toEqual(['ws 7.0.0,8.21.0 → 7.1.0,8.21.0']);
+    expect(moves.get('host')?.has('ws')).toBeFalsy();
+  });
+
+  it('follows bun.lock nested keys to the copy a live package actually loads', () => {
+    const bun = (nested: string, top: string) => `{
+  "lockfileVersion": 1,
+  "packages": {
+    "@anthropic-ai/claude-agent-sdk": ["@anthropic-ai/claude-agent-sdk@0.3.290", "", { "dependencies": { "zod": "^3" } }, "sha512-x"],
+    "@anthropic-ai/claude-agent-sdk/zod": ["zod@${nested}", "", {}, "sha512-x"],
+    "zod": ["zod@${top}", "", {}, "sha512-x"],
+  },
+}
+`;
+    const live: Registry = {
+      ...registry,
+      packages: {
+        ...registry.packages,
+        '@anthropic-ai/claude-agent-sdk': { kind: 'live', paths: ['provider-claude'] },
+      },
+    };
+    const moves = (a: string, b: string) =>
+      liveMoves(live, lockedVersions(files({ bunLock: a })), lockedVersions(files({ bunLock: b })), new Set());
+    expect(moves(bun('3.25.0', '4.6.5'), bun('3.26.0', '4.6.5')).get('runner')?.get('zod')).toEqual(
+      new Set(['@anthropic-ai/claude-agent-sdk']),
+    );
+    expect(moves(bun('3.25.0', '4.6.5'), bun('3.25.0', '4.7.0')).get('runner')?.has('zod')).toBeFalsy();
+  });
+
+  it('counts a live path tested only if the base registry already listed its test', () => {
+    const listedNow: Registry = {
+      ...registry,
+      livePaths: {
+        ...registry.livePaths,
+        'discord-inbound': { description: 'x', tests: ['src/channels/chat-live-path.test.ts'] },
+      },
+    };
+    const change = [bump('@chat-adapter/discord', '4.41.1', '4.42.0')];
+    const text = '## @chat-adapter/discord 4.41.1 → 4.42.0\nSource: x\n- y · not covered: z\n';
+    expect(gate(change, text, listedNow, registry).problems).toEqual([
+      expect.stringContaining('is on live I/O path(s) with no real-library test: discord-inbound'),
     ]);
+    expect(gate(change, text, listedNow, listedNow).problems).toEqual([]);
+  });
+
+  it.each([
+    ['a major move', '3.7.2', '4.0.0', true],
+    ['a 0.x minor move', '0.3.1', '0.4.0', true],
+    ['a new release line beside the old', '3.7.2', '3.7.2,4.0.0', true],
+    ['a move inside its range', '3.7.2', '3.8.0', false],
+  ])('wants a ledger for a transitive package under a runtime one on %s', (_label, from, to, wanted) => {
+    const graph = new Map([['host' as const, new Map([['zod', new Set(['luxon'])]])]]);
+    const problems = changeProblems(
+      registry,
+      runtimeReach(registry, graph),
+      [bump('luxon', from, to)],
+      ledgerOf(''),
+      exists,
+      new Map(),
+    ).problems;
+    expect(problems).toEqual(wanted ? [expect.stringContaining(`"## luxon ${from} → ${to}" section`)] : []);
   });
 });
 
@@ -251,16 +341,17 @@ describe('registry', () => {
     expect(registryProblems(registry, directDependencies(files()), read)).toEqual([]);
   });
 
-  it('refuses a live-path test that loads none of the packages on its path', () => {
+  it.each([
+    ['imports nothing', 'src/channels/placeholder-live-path.test.ts'],
+    ['mocks the package it imports', 'src/channels/mocked-live-path.test.ts'],
+    ['imports only its types', 'src/channels/typed-live-path.test.ts'],
+  ])('refuses a live-path test that %s', (_label, test) => {
     const placeholder: Registry = {
       ...registry,
-      livePaths: {
-        ...registry.livePaths,
-        'chat-inbound': { description: 'x', tests: ['src/channels/placeholder-live-path.test.ts'] },
-      },
+      livePaths: { ...registry.livePaths, 'chat-inbound': { description: 'x', tests: [test] } },
     };
     expect(registryProblems(placeholder, directDependencies(files()), read)).toEqual([
-      expect.stringContaining('placeholder-live-path.test.ts, which loads none of the packages on that path (chat)'),
+      expect.stringContaining(`${test}, which loads none of the packages on that path (chat) at runtime`),
     ]);
   });
 
@@ -383,15 +474,31 @@ describe('version changes', () => {
     ]);
   });
 
+  it('lets one section cover packages that moved between the same versions', () => {
+    const text = [
+      '## @anthropic-ai/claude-agent-sdk-linux-x64, @anthropic-ai/claude-agent-sdk-darwin-arm64 0.3.290 → 0.3.300',
+      'Source: https://example.com/changelog',
+      '- platform binaries follow the SDK · not covered: no behaviour of their own',
+    ].join('\n');
+    const ledger = ledgerOf(text);
+    expect([...ledger.sections.keys()]).toEqual([
+      '@anthropic-ai/claude-agent-sdk-linux-x64',
+      '@anthropic-ai/claude-agent-sdk-darwin-arm64',
+    ]);
+    expect(ledger.sections.get('@anthropic-ai/claude-agent-sdk-darwin-arm64')?.entries).toHaveLength(1);
+  });
+
   it('refuses a package explained in two ledgers, or a section with no entries', () => {
     const twice = parseLedgers([
       { file: 'docs/dependency-changes/a.md', text: '## zod 4.6.5 → 4.7.0\nSource: x\n' },
       { file: 'docs/dependency-changes/b.md', text: '## zod 4.6.5 → 4.7.0\nSource: x\n' },
     ]);
-    expect(changeProblems(registry, reach, [bump('zod', '4.6.5', '4.7.0')], twice, exists).problems).toEqual([
-      'zod has a ledger section in both docs/dependency-changes/a.md and docs/dependency-changes/b.md',
-      expect.stringContaining('no entries'),
-    ]);
+    expect(changeProblems(registry, reach, [bump('zod', '4.6.5', '4.7.0')], twice, exists, new Map()).problems).toEqual(
+      [
+        'zod has a ledger section in both docs/dependency-changes/a.md and docs/dependency-changes/b.md',
+        expect.stringContaining('no entries'),
+      ],
+    );
   });
 });
 
@@ -413,12 +520,32 @@ describe('Docker pins', () => {
     ]);
   });
 
-  it('refuses a tracked tool installed at a literal version instead of its ARG', () => {
-    const literal = 'ARG CLAUDE_CODE_VERSION=2.1.290\nRUN npm i -g @anthropic-ai/claude-code@2.1.299\n';
-    expect(dockerfileProblems(base, literal, tools)).toEqual([
-      expect.stringContaining('references ${CLAUDE_CODE_VERSION} fewer times than the base'),
-      expect.stringContaining('installs @anthropic-ai/claude-code at a literal version'),
+  it.each([
+    ['a literal version', 'npm i -g @anthropic-ai/claude-code@2.1.299'],
+    [
+      'a dist tag, with the ARG kept alive in a comment',
+      'npm i -g @anthropic-ai/claude-code@latest\n# pinned by ${CLAUDE_CODE_VERSION}',
+    ],
+    ['a quoted literal', 'npm install -g @anthropic-ai/claude-code@"2.1.299"'],
+    ['another ARG', 'npm i -g @anthropic-ai/claude-code@${CLAUDE_NEXT}'],
+    ['no version', 'npm add -g @anthropic-ai/claude-code'],
+  ])('refuses a tracked npm tool installed with %s', (_label, install) => {
+    const head = `ARG CLAUDE_CODE_VERSION=2.1.290\nRUN ${install}\n`;
+    expect(dockerfileProblems(base, head, tools)).toEqual([
+      expect.stringContaining('references ${CLAUDE_CODE_VERSION} fewer times than the base, comments aside'),
+      expect.stringContaining('install it as @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}'),
     ]);
+  });
+
+  it('refuses a tracked PyPI tool at a literal version, and accepts both kinds from their ARG', () => {
+    const pypi = [{ id: 'dbt-core', arg: 'DBT_CORE_VERSION', source: { kind: 'pypi', package: 'dbt-core' } }];
+    const pinned =
+      'ARG DBT_CORE_VERSION=1.12.5\nRUN /opt/v/bin/pip install "dbt-core==${DBT_CORE_VERSION}" \\\n  && dbt-core --version\n';
+    expect(dockerfileProblems(pinned, pinned.replace('==${DBT_CORE_VERSION}', '==1.13.0'), pypi)).toEqual([
+      expect.stringContaining('fewer times'),
+      expect.stringContaining('install it as dbt-core==${DBT_CORE_VERSION}'),
+    ]);
+    expect(dockerfileProblems(pinned, pinned.replace('1.12.5', '1.13.0'), pypi)).toEqual([]);
     expect(dockerfileProblems(base, base.replace('2.1.290', '2.1.300'), tools)).toEqual([]);
   });
 });
