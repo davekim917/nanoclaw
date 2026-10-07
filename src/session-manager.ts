@@ -48,6 +48,7 @@ import {
   type ProviderRecallState,
 } from './modules/mailbox/index.js';
 import { log } from './log.js';
+import { buildLiveWorkDigest, type LiveWorkDigest } from './live-work-digest.js';
 import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
 import { taskFiresFresh } from './modules/scheduling/fresh-context.js';
@@ -551,6 +552,7 @@ interface RecallSource {
 export interface RecallCentral {
   provider: string;
   services: SessionServicesCentral;
+  liveWork: LiveWorkDigest | null;
 }
 
 export async function resolveRecallCentral(agentGroupId: string, sessionId: string): Promise<RecallCentral> {
@@ -558,6 +560,7 @@ export async function resolveRecallCentral(agentGroupId: string, sessionId: stri
   return {
     provider: resolveProviderName(session?.agent_provider, (await getContainerConfig(agentGroupId))?.provider),
     services: await resolveSessionServicesCentral(agentGroupId),
+    liveWork: await buildLiveWorkDigest(agentGroupId, sessionId),
   };
 }
 
@@ -603,6 +606,7 @@ function buildRecallRow(
         seenEvidenceFingerprints: lifecycle.seenEvidenceFingerprints,
         servicesCentral: central.services,
       }),
+      ...(central.liveWork ? { liveWork: central.liveWork } : {}),
     }),
     processAfter: message.processAfter ?? null,
     recurrence: null,
@@ -918,7 +922,10 @@ async function writeSessionMessageLocked(
   // funnel runs outbound DDL, making the host a second writer of the live container's outbound.db; the fallback
   // covers only the reclaim race. Callers must not hold a session on this key (same-key nesting throws). The
   // recall's central read happens here, with the other awaits, so the action below never yields.
-  const recallCentral = isScheduledTask ? null : await resolveRecallCentral(agentGroupId, sessionId);
+  const recallCentral =
+    isScheduledTask || !isAdmissiblePreTurnTrigger({ ...message, content })
+      ? null
+      : await resolveRecallCentral(agentGroupId, sessionId);
 
   // THE GUARD POINT: inside the mailbox action, after every await, with nothing awaited before the insert. The
   // `withCentralSync` block is deliberately NOT async (a test pins that nothing is awaited between guard and
@@ -984,6 +991,7 @@ export async function admitPendingUpgradeContexts(
   agentGroupId: string,
   sessionId: string,
 ): Promise<number> {
+  if (mailbox.listUnpairedPendingUpgradeRows().length === 0) return 0;
   // The one central read, first: the loop below is one synchronous pass over a single snapshot.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
   // Under the lease: the pre-turn context carries a lease-only central read.
@@ -1244,13 +1252,25 @@ export async function admitDueTaskContexts(
   sessionId: string,
   withheld: ReadonlySet<string> = new Set(),
 ): Promise<number> {
-  // The one central read, BEFORE the first inbound read, so the admission is one synchronous snapshot pass.
+  if (dueAdmissionRows(mailbox, withheld).length === 0) return 0;
+  // The one central read, BEFORE the admitting inbound read, so the admission is one synchronous snapshot pass.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
   // Under the lease: the recall rows read one lease-only central fact each.
   return withCentralSync(
     () => admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central, withheld),
     'admitDueTaskContexts',
   );
+}
+
+function dueAdmissionRows(mailbox: NanoclawMailboxSession, withheld: ReadonlySet<string>) {
+  // An active repository ingress fence admits nothing (no new turn while mounts change); release replays the
+  // deferred rows with their original triggers, so this defers rather than drops.
+  if (mailbox.readRepoIngressFence()?.state === 'active') return [];
+
+  // Legacy rows were stored trigger=1: demote only unpaired live tasks before selecting due work.
+  mailbox.demoteUnpairedLegacyTasks();
+
+  return mailbox.listDueAdmissionRows().filter((task) => !withheld.has(task.id));
 }
 
 /** The synchronous half, for a caller whose mailbox action must not yield (resolve `resolveRecallCentral` first). */
@@ -1261,16 +1281,8 @@ export function admitDueTaskContextsFor(
   central: RecallCentral,
   withheld: ReadonlySet<string> = new Set(),
 ): number {
-  // An active repository ingress fence admits nothing (no new turn while mounts change); release replays the
-  // deferred rows with their original triggers, so this defers rather than drops.
-  if (mailbox.readRepoIngressFence()?.state === 'active') return 0;
-
-  // Legacy rows were stored trigger=1: demote only unpaired live tasks before selecting due work.
-  mailbox.demoteUnpairedLegacyTasks();
-
   let admitted = 0;
-  for (const task of mailbox.listDueAdmissionRows()) {
-    if (withheld.has(task.id)) continue;
+  for (const task of dueAdmissionRows(mailbox, withheld)) {
     let recall: MessageInsert;
     try {
       recall = buildRecallRow(

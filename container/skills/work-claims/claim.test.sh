@@ -40,6 +40,15 @@ jq -e '
 # 3. Your own live claim reads YOURS, not LIVE — you are not blocked by yourself.
 bash "$CLAIM" check acme-pr-733 | grep -q '^YOURS' || fail "own claim not YOURS"
 
+# 3b. Your name on a claim from another thread is another session of yours, not
+#     you: check reads LIVE and take refuses, exactly as for a sibling.
+OTHER_THREAD=slack:C0BBB:1786700000.000100
+out="$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" check acme-pr-733 2>&1)" && fail "own name, other thread checked free"
+grep -q '^LIVE — held by ava (another session of yours' <<<"$out" || fail "own name, other thread not LIVE: $out"
+NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" take acme-pr-733 4 duplicate build >/dev/null 2>&1 \
+  && fail "took another session's live claim"
+[ "$(jq -r .note "$CLAIMS_DIR/acme-pr-733.json")" = "publish-gate seam" ] || fail "refused take still wrote"
+
 # 4. A sibling's live claim is refused with exit 3, and the file is untouched.
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pr-733 4 stealing it >/dev/null 2>&1 \
   && fail "took a live claim off a sibling"

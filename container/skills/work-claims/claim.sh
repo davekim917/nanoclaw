@@ -150,7 +150,13 @@ inspect() {
   fi
   now="$(date -u +%s)"
 
+  # The owner is the agent's name, which every session of that agent shares; the
+  # claim's thread is what tells this session from another session of the same agent.
+  local tid
+  tid="$(jq -r '.thread_id // empty' "$f")"
   if [ "$now" -gt "$expires" ]; then printf 'stale\t%s\t%s\n' "$owner" "$note"
+  elif [ "$owner" = "$(me)" ] && [ -n "$tid" ] && [ -n "${NANOCLAW_THREAD_ID:-}" ] && [ "$tid" != "$NANOCLAW_THREAD_ID" ]; then
+    printf 'live\t%s\t%s\n' "$owner (another session of yours, thread $tid)" "$note"
   elif [ "$owner" = "$(me)" ]; then printf 'yours\t%s\t%s\n' "$owner" "$note"
   else printf 'live\t%s\t%s\n' "$owner" "$note"
   fi

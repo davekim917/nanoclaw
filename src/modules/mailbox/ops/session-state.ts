@@ -225,12 +225,18 @@ interface UnfinishedTaskItem {
   status: 'pending' | 'in_progress' | 'open';
 }
 
+interface WaitingTaskItem {
+  text: string;
+  waitingOn: string | null;
+}
+
 /** `at` is when the runner last saved the list. */
 export interface TaskListInFlight {
   at: string;
+  title: string | null;
   /** Items the agent can still move itself: neither done nor declared waiting on someone else. */
   unfinished: UnfinishedTaskItem[];
-  waiting: number;
+  waiting: WaitingTaskItem[];
 }
 
 /** A bad item drops only that item: an entry the runner could not have written is not evidence of owed work. */
@@ -238,14 +244,14 @@ export function readTaskListInFlight(outbound: Database.Database): TaskListInFli
   const open = readBoundedOpenTaskList(outbound);
   if (!open || !Array.isArray(open.record.items)) return null;
   const unfinished: UnfinishedTaskItem[] = [];
-  let waiting = 0;
+  const waiting: WaitingTaskItem[] = [];
   for (const value of open.record.items as unknown[]) {
     if (typeof value !== 'object' || value === null) continue;
-    const { text, status } = value as { text?: unknown; status?: unknown };
+    const { text, status, waitingOn } = value as { text?: unknown; status?: unknown; waitingOn?: unknown };
     const line = recordedItemText(text);
     if (line === null || typeof status !== 'string' || status === 'done') continue;
-    if (status === 'waiting') waiting += 1;
+    if (status === 'waiting') waiting.push({ text: line, waitingOn: recordedItemText(waitingOn) });
     else unfinished.push({ text: line, status: status === 'pending' || status === 'in_progress' ? status : 'open' });
   }
-  return { at: open.touchedAt, unfinished, waiting };
+  return { at: open.touchedAt, title: recordedItemText(open.record.title), unfinished, waiting };
 }

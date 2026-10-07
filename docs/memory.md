@@ -173,9 +173,19 @@ Every pair then contains only the newly relevant evidence delta:
    frontmatter itself is stripped before injection;
 2. up to three lexical archive excerpts, preferring the current thread;
 3. a separately bounded exact Slack/Discord permalink lane when the input
-   contains a supported message link; and
+   contains a supported message link;
 4. explicit degraded, conflict, truncation, already-delivered, or no-match
-   notices.
+   notices; and
+5. a live-work snapshot (`src/live-work-digest.ts`): the workgroup's unexpired
+   claims outside this thread and the open task lists of the other active
+   sessions of this agent group and its workgroup siblings touched in the last
+   24 hours, outside this session's own conversation, each labelled with its
+   owning agent group (`self` marks this agent's own) and its thread link,
+   under a rule to hold or route a request that overlaps or depends on them.
+   The current snapshot is sent on every turn; when nothing is live elsewhere
+   it is sent empty, so a session that was holding sees the hold lift. A scan
+   that hit its session cap or could not read a session is marked `partial`
+   and is never rendered as clear.
 
 The rest of the manual canon is not pushed. `index.md` is the map, and the
 agent reads or greps the tree from it — the host runs no per-turn walk of the
