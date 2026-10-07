@@ -157,7 +157,7 @@ Check these first when something goes wrong:
 | Setup logs | `logs/setup.log` (overall), `logs/setup-steps/*.log` (per-step) |
 | Session DBs | `data/v2-sessions/<agent-group>/<session>/` — `inbound.db`/`messages_in` (reached container?), `outbound.db`/`messages_out` (agent responded?) |
 | Post-restart health | `grep 'OneCLI preflight ok' logs/nanoclaw.log` — adapter counts are not proof; a host that cannot reach the OneCLI control API refuses every spawn at WARN |
-| Post-deploy inbound | `logs/post-deploy-inbound.json` — per-platform verdict from live inbound in the 30 min after every boot, refreshed every 10 min; a platform whose adapter errors match or outnumber its routed messages is `failing`, and a monitor pages on that at any later time too. `running` or `unverified` is not healthy, and preflight alone never is |
+| Post-deploy inbound | `logs/post-deploy-inbound.json` — per-platform verdict from live inbound in the 30 min after every boot, refreshed every 10 min; a platform whose inbound-path adapter errors match or outnumber its routed messages is `failing`. After the window the file stays as written, and a monitor pages the operator and logs `Inbound check: platform failing` at any later time. `running` or `unverified` is not healthy, and preflight alone never is |
 
 Host logs rotate daily via `/etc/logrotate.d/<systemd-unit-name>` (30 days) with `copytruncate` — required: systemd holds the `StandardOutput=append:` redirect open, so rename-based rotation leaves the daemon writing to an unlinked file until restart. Container logs vanish on exit (`--rm`); a silent in-container failure leaves nothing to inspect.
 

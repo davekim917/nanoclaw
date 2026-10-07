@@ -76,9 +76,7 @@ describe('post-deploy inbound check', () => {
     expect(readReport().state).toBe('running');
 
     await vi.advanceTimersByTimeAsync(WINDOW_MS - MONITOR_MS);
-    expect(alerts).toHaveLength(2);
-    expect(alerts[1]).toContain('discord: FAILING');
-    expect(alerts[1]).toContain('slack: verified (1 live inbound)');
+    expect(alerts).toHaveLength(1);
     const report = readReport();
     expect(report.state).toBe('done');
     expect(report.platforms.map((p) => [p.platform, p.verdict])).toEqual([
@@ -109,27 +107,53 @@ describe('post-deploy inbound check', () => {
   });
 
   it('fails Discord when one plain message routed and then every bot failed to forward mentions, as on 2026-10-06', async () => {
-    const bots = ['discord', 'discord-codex', 'discord-opencode'].map((channelType) =>
-      mod.createAdapterLogger(channelType, 'discord').child('gateway'),
-    );
+    const channelTypes = ['discord', 'discord-codex', 'discord-opencode'];
+    const bots = channelTypes.map((channelType) => mod.createAdapterLogger(channelType, 'discord').child('gateway'));
+    const plainMessage = () => channelTypes.forEach((channelType) => mod.recordLiveInbound(channelType));
+    const mention = () =>
+      bots.forEach((bot) =>
+        bot.error('Error forwarding Gateway event', { type: 'GATEWAY_MESSAGE_CREATE', ...circular }),
+      );
     start();
 
     await vi.advanceTimersByTimeAsync(5 * MINUTE);
-    mod.recordLiveInbound('discord');
-    await vi.advanceTimersByTimeAsync(7 * MINUTE);
-    for (let minute = 12; minute < 30; minute += 6) {
-      for (const bot of bots)
-        bot.error('Error forwarding Gateway event', { type: 'GATEWAY_MESSAGE_CREATE', ...circular });
-      await vi.advanceTimersByTimeAsync(3 * MINUTE);
-      mod.recordLiveInbound('discord');
-      await vi.advanceTimersByTimeAsync(3 * MINUTE);
+    plainMessage();
+    for (let minute = 5; minute < 30; minute++) {
+      if (minute >= 12 && minute % 3 === 0) mention();
+      if (minute === 22) plainMessage();
+      await vi.advanceTimersByTimeAsync(MINUTE);
     }
 
-    expect(alerts[0]).toContain('discord: FAILING');
-    expect(alerts[0]).toContain('"Error forwarding Gateway event"');
+    expect(alerts).toEqual([expect.stringContaining('discord: FAILING — 9 adapter error(s) against 0 live inbound')]);
     expect(readReport()).toMatchObject({ state: 'done' });
-    expect(readReport().platforms).toEqual([expect.objectContaining({ platform: 'discord', verdict: 'failing' })]);
-    expect(alerts.at(-1)).toContain('discord: FAILING — 9 adapter error(s) against 4 live inbound');
+    expect(readReport().platforms).toEqual([
+      expect.objectContaining({ platform: 'discord', verdict: 'failing', liveInbound: 6 }),
+    ]);
+  });
+
+  it('pages once through a sustained outage, though quiet intervals with no traffic come between', async () => {
+    const discord = mod.createAdapterLogger('discord', 'discord');
+    start();
+    for (const errors of [3, 0, 3, 0, 4]) {
+      for (let i = 0; i < errors; i++) discord.error('Error forwarding Gateway event', circular);
+      await vi.advanceTimersByTimeAsync(MONITOR_MS);
+    }
+    expect(alerts).toEqual([expect.stringContaining('discord: FAILING')]);
+  });
+
+  it('does not count outbound REST errors, so a burst of 429s on a quiet platform does not page', async () => {
+    const discord = mod.createAdapterLogger('discord', 'discord');
+    mod.createAdapterLogger('slack', 'slack');
+    start();
+    for (let i = 0; i < 9; i++) discord.error('Discord API error', { method: 'POST', status: 429 });
+    mod.recordLiveInbound('discord');
+    mod.recordLiveInbound('slack');
+    await vi.advanceTimersByTimeAsync(WINDOW_MS);
+    expect(alerts).toEqual([]);
+    expect(readReport().platforms).toEqual([
+      expect.objectContaining({ platform: 'discord', verdict: 'verified', adapterErrors: {} }),
+      expect.objectContaining({ platform: 'slack', verdict: 'verified' }),
+    ]);
   });
 
   it('alerts once when forward errors with only occasional successes start long after the boot window', async () => {
@@ -157,7 +181,7 @@ describe('post-deploy inbound check', () => {
     const discord = mod.createAdapterLogger('discord', 'discord');
     start();
     mod.recordLiveInbound('slack');
-    discord.error('Discord API error', { status: 404 });
+    discord.error('Error handling Gateway message', { error: 'Unknown Channel' });
 
     await vi.advanceTimersByTimeAsync(WINDOW_MS - 1);
     expect(readReport().state).toBe('running');

@@ -44,6 +44,18 @@ function logData(channelType: string, args: unknown[]): Record<string, unknown> 
   return args.length === 0 ? { channelType } : { args: args.map(loggable), channelType };
 }
 
+/**
+ * Errors the adapters log for a failed outbound or lookup request. A REST call made on the inbound path logs its own
+ * inbound error as well, so these say nothing about inbound health; counted, the Discord 429 bursts on posting at the
+ * morning peak would page a quiet platform several times a week.
+ */
+const OUTBOUND_ERRORS = new Set([
+  'Discord API error',
+  'Discord interaction API error',
+  'Slack rejected blocks (invalid_blocks)',
+  'Slack response_url failed',
+]);
+
 export function createAdapterLogger(channelType: string, platform: string, prefix: string = platform): Logger {
   platformByChannelType.set(channelType, platform);
   const tally = tallyFor(platform);
@@ -56,7 +68,7 @@ export function createAdapterLogger(channelType: string, platform: string, prefi
     warn: (message: string, ...args: unknown[]) => log.warn(`${tag} ${message}`, logData(channelType, args)),
     error: (message: string, ...args: unknown[]) => {
       log.error(`${tag} ${message}`, logData(channelType, args));
-      tally.errors.set(message, (tally.errors.get(message) ?? 0) + 1);
+      if (!OUTBOUND_ERRORS.has(message)) tally.errors.set(message, (tally.errors.get(message) ?? 0) + 1);
     },
   };
 }
@@ -213,7 +225,9 @@ export function startPostDeployInboundCheck(deps: PostDeployCheckDeps): void {
     const started = interval.filter((r) => r.verdict === 'failing' && !failing.has(r.platform));
     for (const r of interval) {
       if (r.verdict === 'failing') failing.add(r.platform);
-      else if (failing.delete(r.platform)) log.info('Inbound check: platform recovered', { platform: r.platform });
+      else if (r.verdict === 'verified' && failing.delete(r.platform)) {
+        log.info('Inbound check: platform recovered', { platform: r.platform });
+      }
     }
     if (started.length === 0) return;
     const minutes = Math.round(deps.monitorIntervalMs / 60_000);
@@ -228,7 +242,8 @@ export function startPostDeployInboundCheck(deps: PostDeployCheckDeps): void {
     writeReport(deps.reportPath, report);
     const healthy = report.platforms.length > 0 && report.platforms.every((p) => p.verdict === 'verified');
     log[healthy ? 'info' : 'error']('Post-deploy inbound check finished', { ...report });
-    if (!healthy) {
+    const alreadyPaged = report.platforms.every((p) => p.verdict === 'verified' || failing.has(p.platform));
+    if (!healthy && !(report.platforms.length > 0 && alreadyPaged)) {
       const minutes = Math.round(deps.windowMs / 60_000);
       const lines = report.platforms.length > 0 ? report.platforms.map(describe) : ['no chat adapter started'];
       send(`${header} after ${minutes} min:\n${lines.join('\n')}`);
