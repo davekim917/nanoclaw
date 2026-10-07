@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 import type { ChannelSetup, InboundMessage } from './adapter.js';
-import { serveAttachments } from './live-path-attachments.js';
+import { serveAttachments } from '../test-attachment-transport.js';
 
 const BOT_TOKEN = 'xoxb-live-path-test';
 const APP_TOKEN = 'xapp-live-path-test';
@@ -370,20 +370,56 @@ describe('Slack inbound through the real adapter and Socket Mode client', () => 
         user: HUMAN,
         text: 'the archives',
         ts: '1790000007.000100',
-        files: [file('F0BIG', 'originals.zip', 30 * MiB, big), file('F0HUGE', 'footage.zip', 101 * MiB, huge)],
+        files: [file('F0HUGE', 'footage.zip', 101 * MiB, huge), file('F0BIG', 'originals.zip', 30 * MiB, big)],
       }),
     );
     await nextInbound(1);
 
     const attachments = (inbound[0]!.message.content as { attachments: Array<{ name: string; data?: string }> })
       .attachments;
-    expect(attachments.map((a) => a.name)).toEqual(['originals.zip', 'footage.zip']);
-    expect(Buffer.from(attachments[0]!.data ?? '', 'base64').length).toBe(30 * MiB);
-    expect(attachments[1]!.data).toBeUndefined();
+    expect(attachments.map((a) => a.name)).toEqual(['footage.zip', 'originals.zip']);
+    expect(attachments[0]!.data).toBeUndefined();
+    expect(Buffer.from(attachments[1]!.data ?? '', 'base64').length).toBe(30 * MiB);
     expect(requests).toEqual([
-      { url: big, authorization: `Bearer ${BOT_TOKEN}` },
       { url: huge, authorization: `Bearer ${BOT_TOKEN}` },
+      { url: big, authorization: `Bearer ${BOT_TOKEN}` },
     ]);
+  });
+
+  it("stops downloading a message's files once their total would pass the per-message budget", async () => {
+    const { INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES } = await import('../config.js');
+    const MiB = 1024 * 1024;
+    const each = Math.floor(INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES / 2.5);
+    const urls = ['F0ONE', 'F0TWO', 'F0THREE'].map(
+      (id) => `https://files.slack.com/files-pri/T0TEAMTEST-${id}/part.bin`,
+    );
+    const requests = serveAttachments(new Map(urls.map((url) => [url, each])));
+    inbound.length = 0;
+    await sendEnvelope(
+      'env-budget',
+      message({
+        type: 'message',
+        subtype: 'file_share',
+        channel: CHANNEL,
+        channel_type: 'channel',
+        user: HUMAN,
+        text: 'three parts',
+        ts: '1790000008.000100',
+        files: urls.map((url, i) => ({
+          id: `F0PART${i}`,
+          name: `part${i}.bin`,
+          mimetype: 'application/octet-stream',
+          size: each,
+          url_private: url,
+        })),
+      }),
+    );
+    await nextInbound(1);
+
+    const attachments = (inbound[0]!.message.content as { attachments: Array<{ data?: string }> }).attachments;
+    expect(attachments.map((a) => Buffer.from(a.data ?? '', 'base64').length)).toEqual([each, each, 0]);
+    expect(requests.map((request) => request.url)).toEqual(urls.slice(0, 2));
+    expect(each).toBeGreaterThan(25 * MiB);
   });
 
   it('posts an agent reply into its thread through chat.postMessage', async () => {

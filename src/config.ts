@@ -81,10 +81,16 @@ export const SELF_HEAL_ENABLED = (process.env.NANOCLAW_SELF_HEAL ?? envConfig.NA
 // misfire hands one agent's claim to another with no human in the loop.
 export const SELF_HEAL_TAKEOVER_ENABLED =
   (process.env.NANOCLAW_SELF_HEAL_TAKEOVER ?? envConfig.NANOCLAW_SELF_HEAL_TAKEOVER) === '1';
-// Default on; `0` is the fleet-wide off switch. Read at host start to gate delivery (reaches adopted
-// containers too) and at spawn to decide whether the container gets update_task_list.
 /** Largest inbound file the host downloads for an agent. A larger Slack or Discord file arrives as metadata only. */
 export const INBOUND_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024;
+/**
+ * Largest total the host downloads for one message. Every file rides as base64 inside one JSON string, which V8 caps
+ * near 512M characters, and is re-parsed per routed agent on a heap of about 4 GiB; a file past the budget arrives as
+ * metadata only.
+ */
+export const INBOUND_ATTACHMENTS_PER_MESSAGE_MAX_BYTES = 128 * 1024 * 1024;
+// Default on; `0` is the fleet-wide off switch. Read at host start to gate delivery (reaches adopted
+// containers too) and at spawn to decide whether the container gets update_task_list.
 export const TASK_LIST_ENABLED = (process.env.NANOCLAW_TASK_LIST ?? envConfig.NANOCLAW_TASK_LIST) !== '0';
 export const TASK_SCRIPT_TIMEOUT_MS = parseTimeoutMs(
   process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? envConfig.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS,

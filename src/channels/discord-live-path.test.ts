@@ -14,7 +14,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 
 import { allowNetwork } from '../test-hermeticity.js';
 import type { ChannelSetup, InboundMessage } from './adapter.js';
-import { serveAttachments } from './live-path-attachments.js';
+import { serveAttachments } from '../test-attachment-transport.js';
 
 const TOKEN = 'live-path-test-token';
 const BOT = '123456789000000001';
@@ -323,8 +323,8 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
         channel_id: DM_CHANNEL,
         content: 'the archives',
         attachments: [
-          attachment('123456789000000020', 'originals.zip', 30 * MiB, big),
           attachment('123456789000000021', 'footage.zip', 101 * MiB, huge),
+          attachment('123456789000000020', 'originals.zip', 30 * MiB, big),
         ],
       }),
     );
@@ -332,12 +332,12 @@ describe('Discord inbound and outbound through the real adapter and discord.js g
 
     const attachments = (inbound[0]!.message.content as { attachments: Array<{ name: string; data?: string }> })
       .attachments;
-    expect(attachments.map((a) => a.name)).toEqual(['originals.zip', 'footage.zip']);
-    expect(Buffer.from(attachments[0]!.data ?? '', 'base64').length).toBe(30 * MiB);
-    expect(attachments[1]!.data).toBeUndefined();
+    expect(attachments.map((a) => a.name)).toEqual(['footage.zip', 'originals.zip']);
+    expect(attachments[0]!.data).toBeUndefined();
+    expect(Buffer.from(attachments[1]!.data ?? '', 'base64').length).toBe(30 * MiB);
     expect(requests).toEqual([
-      { url: big, authorization: undefined },
       { url: huge, authorization: undefined },
+      { url: big, authorization: undefined },
     ]);
   });
 
