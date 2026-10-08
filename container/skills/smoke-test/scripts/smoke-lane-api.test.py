@@ -637,6 +637,8 @@ class ApprovalModeGuard(Harness):
             self.assertEqual(no.returncode, 77, path)
             self.assertIn("bad-path", no.stderr, path)
         self.assertEqual(Backend.seen[before:], [], "an ambiguous path sends nothing, not even the mode read")
+        for method in ("GET", "HEAD", "OPTIONS"):
+            self.assertEqual(api.judge(self.run_dir, method, "/objects/a%2Fb"), "read", "reads always go")
 
     def test_req_reads_the_mode_with_the_writes_own_token(self):
         h = self.client("M")

@@ -226,18 +226,18 @@ def walk(value):
             yield from walk(item)
 
 
-def route_of(path):
-    return cased_route_of(path).lower()
+def route_of(path, write=True):
+    return cased_route_of(path, write).lower()
 
 
-def cased_route_of(path):
+def cased_route_of(path, write=True):
     if not path.startswith("/") or path.startswith("//"):
         raise WriteScopeRefused("bad-path (a request path is a single-slash absolute path)")
     segments = [urllib.parse.unquote(s) for s in urllib.parse.urlsplit(path).path.split("/")]
     if any(s in (".", "..") for s in segments):
         raise WriteScopeRefused("bad-path (no dot segments)")
     # A separator decoded inside one segment would let the rules see a different route than the server routes.
-    if any(AMBIGUOUS_SEGMENT.search(s) for s in segments):
+    if write and any(AMBIGUOUS_SEGMENT.search(s) for s in segments):
         raise WriteScopeRefused("bad-path (no encoded separator, backslash, control character or double "
                                 "encoding in a segment)")
     return "/" + "/".join(s for s in segments if s)
@@ -291,10 +291,11 @@ def tenant_key(key):
 
 def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
     method = method.upper()
-    route = route_of(path)
+    write = method not in READ_METHODS
+    route = route_of(path, write)
     if base_path:
-        route = route_of(base_path.rstrip("/") + route)
-    if method in READ_METHODS:
+        route = route_of(base_path.rstrip("/") + route, write)
+    if not write:
         return "read"
     scope = load_scope(run_dir)
     if scope["mode"] == LEGACY_MODE:
@@ -440,7 +441,6 @@ class H:
             self.refuse(tag, seat, method, path, body, e)
 
     def approval_mode(self, tag, seat, need, base_path, tok):
-        """Read the write's approval mode with the write's own token; anything but an allowed mode refuses it."""
         read = need.read_path
         prefix = base_path.rstrip("/")
         if prefix:
