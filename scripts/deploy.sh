@@ -297,6 +297,14 @@ if ! pnpm install --frozen-lockfile >> "$LOG" 2>&1; then
   exit 1
 fi
 
+# Verify the install the build and restart below will run on: a package link another checkout's install
+# wrote into this tree is a start failure once that checkout is removed.
+write_status "running" "dependency links" ""
+if ! pnpm run -s check:dependency-links >> "$LOG" 2>&1; then
+  write_status "failed" "dependency links" "node_modules links leave the checkout or dangle — check deploy.log"
+  exit 1
+fi
+
 write_status "running" "build" ""
 # `build` is bare `tsc` — it never prunes dist/. A renamed or deleted source
 # file leaves an orphan .js behind that the service (ExecStart runs

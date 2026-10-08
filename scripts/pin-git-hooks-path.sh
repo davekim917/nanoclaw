@@ -30,8 +30,8 @@
 #     tree is not mounted), so Git finds no hook and no-ops — exactly today's
 #     behaviour for container pushes.
 #   - Tracking husky's `_` shims would instead make the hooks RESOLVE in a
-#     container and then fail: `.husky/pre-push`'s `scan_message` does an
-#     unconditional `ln -s "$repo_root/node_modules" ...` under `set -e`, and
+#     container and then fail: `.husky/pre-push`'s `scan_message` runs
+#     `$repo_root/node_modules/.bin/tsx` under `set -e`, and
 #     `$repo_root/node_modules` is host-only. Every container push would hard-fail.
 #
 # So the fix is exactly this: absolutize, do not track.
