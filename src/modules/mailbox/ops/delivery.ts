@@ -10,6 +10,8 @@ export interface OutboundMessage {
   thread_id: string | null;
   content: string;
   in_reply_to: string | null;
+  /** When the runner queued the row (ISO). */
+  timestamp?: string;
 }
 
 export function getDueOutboundMessages(db: Database.Database): OutboundMessage[] {
@@ -50,16 +52,36 @@ export function markPending(db: Database.Database, messageOutId: string): void {
   ).run(messageOutId, new Date().toISOString());
 }
 
-export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {
-  db.prepare(
-    `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
-     VALUES (?, ?, 'delivered', ?)
-     ON CONFLICT(message_out_id) DO UPDATE SET
-       platform_message_id = excluded.platform_message_id,
-       status = 'delivered',
-       error = NULL,
-       delivered_at = excluded.delivered_at`,
-  ).run(messageOutId, platformMessageId ?? null, new Date().toISOString());
+/**
+ * `notice` (a routing veto) reaches the agent through the runner's ack wait. It is written in the same transaction as
+ * the delivered row, so an ack is never read without it; without one the statement is the plain upsert.
+ */
+export function markDelivered(
+  db: Database.Database,
+  messageOutId: string,
+  platformMessageId: string | null,
+  notice?: string,
+): void {
+  const upsert = () =>
+    db
+      .prepare(
+        `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
+         VALUES (?, ?, 'delivered', ?)
+         ON CONFLICT(message_out_id) DO UPDATE SET
+           platform_message_id = excluded.platform_message_id,
+           status = 'delivered',
+           error = NULL,
+           delivered_at = excluded.delivered_at`,
+      )
+      .run(messageOutId, platformMessageId ?? null, new Date().toISOString());
+  if (notice === undefined) {
+    upsert();
+    return;
+  }
+  db.transaction(() => {
+    upsert();
+    db.prepare('UPDATE delivered SET notice = ? WHERE message_out_id = ?').run(notice, messageOutId);
+  })();
 }
 
 export function markDeliveryFailed(db: Database.Database, messageOutId: string, errorMessage?: string): void {

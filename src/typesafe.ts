@@ -8,13 +8,16 @@ import { fetch as undiciFetch } from 'undici';
 import { getProxyDispatcher } from './llm.js';
 
 /** Pinned: a threshold tuned against one model means nothing after an alias moves. */
-const JEV_MODEL = 'jev-1.13.0';
+export const JEV_MODEL = 'jev-1.13.0';
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 
+/** An object holds the question in one field and the data it refers to in others ("structured instructions"). */
+type JevInstructions = string | Record<string, unknown>;
+
 export type JevQuestion =
-  | { type: 'noul'; instructions: string; criteria?: { true?: string; false?: string } }
-  | { type: 'choice'; instructions: string; criteria: Record<string, string> }
-  | { type: 'score'; instructions: string; criteria: string[] };
+  | { type: 'noul'; instructions: JevInstructions; criteria?: { true?: string; false?: string } }
+  | { type: 'choice'; instructions: JevInstructions; criteria: Record<string, string> }
+  | { type: 'score'; instructions: JevInstructions; criteria: string[] };
 
 export interface JevAnswer {
   type?: string;

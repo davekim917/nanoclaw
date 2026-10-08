@@ -36,6 +36,10 @@
       "reason": "Hermeticity guard for each test runner (vitest on the host, bun:test in the runner); the runner copy names the host file as its counterpart."
     },
     {
+      "files": ["src/thread-route-split.ts", "container/agent-runner/src/thread-route-split.ts"],
+      "reason": "The routing check's key scope and split key, which the host applies and the runner names to the agent; the two package trees share no modules, so the file is duplicated verbatim and src/thread-route-check.test.ts fails on drift."
+    },
+    {
       "files": ["src/timezone.ts", "container/agent-runner/src/timezone.ts"],
       "reason": "Timezone rules the host and the container must apply identically; the runner copy is declared a mirror of the host file."
     },

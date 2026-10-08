@@ -254,17 +254,73 @@ export function archiveMessage(msg: ArchiveMessage): boolean {
  * channel family, the same rule as `search_threads`; an unprefixed native id keeps exact channel_type matching.
  */
 export function archiveHasThread(channelType: string, platformId: string, threadId: string): boolean {
-  const dash = channelType.indexOf('-');
-  const family = dash > 0 ? channelType.slice(0, dash) : channelType;
-  const pooled = platformId.startsWith(`${family}:`);
   const row = openDb()
     .prepare(
       `SELECT 1 FROM messages_archive
         WHERE (channel_type = ? OR channel_type = ? OR channel_type LIKE ?) AND platform_id = ? AND thread_id = ?
         LIMIT 1`,
     )
-    .get(channelType, pooled ? family : channelType, pooled ? `${family}-%` : null, platformId, threadId);
+    .get(...pooledChannelTypes(channelType, platformId), platformId, threadId);
   return row !== undefined;
+}
+
+function pooledChannelTypes(channelType: string, platformId: string): [string, string, string | null] {
+  const dash = channelType.indexOf('-');
+  const family = dash > 0 ? channelType.slice(0, dash) : channelType;
+  const pooled = platformId.startsWith(`${family}:`);
+  return [channelType, pooled ? family : channelType, pooled ? `${family}-%` : null];
+}
+
+export interface ArchivedThreadMessage {
+  id: string;
+  senderName: string | null;
+  text: string;
+  sentAt: string;
+}
+
+/**
+ * One thread's messages, oldest first, pooled like `archiveHasThread`: its replies plus its starter message, which a
+ * Discord thread shares its id with (`<id>` or `<id>:<agent group>`). Sibling copies of one message collapse on
+ * (time, text), so a message counts once.
+ */
+export function readArchivedThread(
+  channelType: string,
+  platformId: string,
+  threadPlatformId: string,
+): ArchivedThreadMessage[] {
+  // The pooled channel types are listed by an index skip-scan first: a LIKE against channel_type makes the planner
+  // scan the whole archive instead of seeking idx_archive_channel.
+  const rows = openDb()
+    .prepare(
+      `WITH RECURSIVE kinds(v) AS (
+         SELECT MIN(channel_type) FROM messages_archive
+         UNION ALL
+         SELECT (SELECT MIN(channel_type) FROM messages_archive WHERE channel_type > v) FROM kinds WHERE v IS NOT NULL)
+       SELECT id, sender_name AS senderName, text, sent_at AS sentAt FROM messages_archive
+        WHERE channel_type IN (SELECT v FROM kinds WHERE v = ? OR v = ? OR v LIKE ?)
+          AND platform_id = ? AND thread_id IN (?, ?)
+       UNION
+       SELECT id, sender_name, text, sent_at FROM messages_archive
+        WHERE (id = ? OR (id >= ? AND id < ?)) AND platform_id = ?
+       ORDER BY sentAt`,
+    )
+    .all(
+      ...pooledChannelTypes(channelType, platformId),
+      platformId,
+      threadPlatformId,
+      `${platformId}:${threadPlatformId}`,
+      threadPlatformId,
+      `${threadPlatformId}:`,
+      `${threadPlatformId};`,
+      platformId,
+    ) as ArchivedThreadMessage[];
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    const key = JSON.stringify([row.sentAt, row.text.slice(0, 200)]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 export interface ArchiveEvidenceRow {

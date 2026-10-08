@@ -36,6 +36,8 @@ import { registerTools } from './server.js';
 import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 import { CONTINUE_THREAD_DESCRIPTION, parseContinueThread } from './continue-thread.js';
+import { routeCheckedSendResult } from './route-check-ack.js';
+import { isRouteCheckedKey } from '../thread-route-split.js';
 
 const SEND_FILE_MAX_BYTES = 50 * 1024 * 1024; // Slack's own cap is 1GB but most adapters fail long before
 const SEND_FILE_ALLOWED_PREFIXES = [
@@ -355,6 +357,8 @@ export const sendMessage: McpToolDefinition = {
       );
     }
     log(`send_message: #${seq} → ${routing.resolvedName}`);
+    if (policy && purpose === 'handoff' && key.threadKey && isRouteCheckedKey(key.threadKey))
+      return routeCheckedSendResult(id, seq, routing.resolvedName, key.threadKey);
     return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
   },
 };
