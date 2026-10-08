@@ -2926,6 +2926,19 @@ export STUB_RUN_LIST="[{\"headSha\":\"$OTHER_SHA\",\"status\":\"completed\",\"co
 bash "$GATE" check 61 | jq -e '
   .ciTotal == 1 and .ciReady == true and .settled == true
 ' >/dev/null
+# 16b. A run still in flight (the runs API reports conclusion null) is
+# pending, never failed; completed failure/cancelled/timed_out runs still
+# count as failed. Neither head settles.
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"in_progress\",\"conclusion\":null,\"workflowName\":\"Backend CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+PR_INFLIGHT="$(bash "$GATE" check 61)"
+jq -e '.ciTotal == 2 and .ciPending == 1 and .ciFailed == 0 and .ciSucceeded == 1 and
+       .ciReady == false and .settled == false' <<<"$PR_INFLIGHT" >/dev/null || {
+  echo "16b: an in-progress run was not reported as pending only: $PR_INFLIGHT" >&2; exit 1; }
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"failure\",\"workflowName\":\"Backend CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"cancelled\",\"workflowName\":\"Mobile CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"timed_out\",\"workflowName\":\"E2E\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"queued\",\"conclusion\":null,\"workflowName\":\"Lint\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+PR_MIXED="$(bash "$GATE" check 61)"
+jq -e '.ciTotal == 5 and .ciPending == 1 and .ciFailed == 3 and .ciSucceeded == 1 and
+       .ciReady == false and .settled == false' <<<"$PR_MIXED" >/dev/null || {
+  echo "16b: completed non-success runs were not all counted as failed: $PR_MIXED" >&2; exit 1; }
 
 # --- 17. A PR that can never settle alarms instead of failing silently ----
 # The 2026-08-12 outage in one test: freeze PR #786 was built, live and warm

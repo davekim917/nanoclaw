@@ -24,6 +24,12 @@ READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 SCOPE_LISTS = ("tenants", "authPaths", "readOnlyPosts", "denyPaths", "denyPrefixes")
 REQUIRED_LISTS = ("tenants", "denyPaths", "denyPrefixes")
 PINNED_KEYS = {"mode", "schemaVersion", "runId"}
+GUARD_KEY = "approvalModeGuards"
+GUARD_FIELDS = {"methods", "path", "read", "field", "allow"}
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
+GUARD_REASON = "single_person_publish"
+AMBIGUOUS_SEGMENT = re.compile(r"[/\\\x00-\x1f\x7f]|%[0-9a-fA-F]{2}")
 LEGACY_MODE = "allowlist"
 LEGACY_LISTS = ("tenants", "brands", "accounts", "authPaths", "readOnlyPosts")
 LEGACY_TARGET_KEYS = {
@@ -47,6 +53,14 @@ SECRET_KEY = re.compile(r"password|secret|token", re.I)
 
 class WriteScopeRefused(Exception):
     pass
+
+
+class ApprovalModeUnread(WriteScopeRefused):
+    """A guarded write whose approval mode has not been read on the writing seat yet."""
+
+    def __init__(self, message, read_path, field, allow):
+        super().__init__(message)
+        self.read_path, self.field, self.allow = read_path, field, allow
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -76,7 +90,7 @@ def validated_scope(raw):
         return legacy_validated_scope(raw)
     if raw.get("mode") != SCOPE_MODE:
         raise ValueError("mode must be {!r} (an allowlist scope file is no longer accepted)".format(SCOPE_MODE))
-    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS)
+    unknown = sorted(set(raw) - set(SCOPE_LISTS) - PINNED_KEYS - {GUARD_KEY})
     if unknown:
         raise ValueError("unknown keys {}".format(unknown))
     for key in SCOPE_LISTS:
@@ -98,7 +112,46 @@ def validated_scope(raw):
         if prefix != canonical or canonical == "/":
             raise ValueError("denyPrefixes entry {!r} is not a canonical path below the root".format(prefix))
     scope = {key: [str(v) for v in raw.get(key, [])] for key in SCOPE_LISTS}
+    guards = validated_guards(raw.get(GUARD_KEY, []))
+    if guards:
+        scope[GUARD_KEY] = guards
     return dict(scope, mode=SCOPE_MODE)
+
+
+def validated_guards(raw):
+    if not isinstance(raw, list):
+        raise ValueError("{} must be a list of objects".format(GUARD_KEY))
+    guards = []
+    for i, guard in enumerate(raw):
+        where = "{}[{}]".format(GUARD_KEY, i)
+        if not isinstance(guard, dict) or set(guard) != GUARD_FIELDS:
+            raise ValueError("{} must have exactly the keys {}".format(where, sorted(GUARD_FIELDS)))
+        methods = guard["methods"]
+        if (not isinstance(methods, list) or not methods
+                or not all(isinstance(m, str) and m in WRITE_METHODS for m in methods)):
+            raise ValueError("{}.methods must be a non-empty list of {}".format(where, sorted(WRITE_METHODS)))
+        path = guard["path"]
+        if not isinstance(path, str) or not path.startswith("/") or path.endswith("/") or "//" in path or "%" in path:
+            raise ValueError("{}.path {!r} is not a canonical path pattern".format(where, path))
+        groups = set(re.compile(path).groupindex)
+        for key in ("read", "field"):
+            value = guard[key]
+            if not isinstance(value, str) or not value or (key == "read" and not value.startswith("/")):
+                raise ValueError("{}.{} must be a non-empty string{}".format(
+                    where, key, " starting with /" if key == "read" else ""))
+            for name in PLACEHOLDER.findall(value):
+                body_key = name[len("body."):] if name.startswith("body.") else None
+                if not (name in groups or body_key):
+                    raise ValueError("{}.{} names {{{}}}, which is neither a named group of path nor body.<key>"
+                                     .format(where, key, name))
+            if "{" in PLACEHOLDER.sub("", value) or "}" in PLACEHOLDER.sub("", value):
+                raise ValueError("{}.{} has an unbalanced brace".format(where, key))
+        allow = guard["allow"]
+        if not isinstance(allow, list) or not allow or not all(isinstance(v, (str, bool)) for v in allow):
+            raise ValueError("{}.allow must be a non-empty list of strings or booleans".format(where))
+        guards.append({"methods": list(methods), "path": path, "read": guard["read"],
+                       "field": guard["field"], "allow": list(allow)})
+    return guards
 
 
 def init_scope(run_dir, source):
@@ -173,13 +226,21 @@ def walk(value):
             yield from walk(item)
 
 
-def route_of(path):
+def route_of(path, write=True):
+    return cased_route_of(path, write).lower()
+
+
+def cased_route_of(path, write=True):
     if not path.startswith("/") or path.startswith("//"):
         raise WriteScopeRefused("bad-path (a request path is a single-slash absolute path)")
     segments = [urllib.parse.unquote(s) for s in urllib.parse.urlsplit(path).path.split("/")]
     if any(s in (".", "..") for s in segments):
         raise WriteScopeRefused("bad-path (no dot segments)")
-    return "/" + "/".join(s for s in segments if s).lower()
+    # A separator decoded inside one segment would let the rules see a different route than the server routes.
+    if write and any(AMBIGUOUS_SEGMENT.search(s) for s in segments):
+        raise WriteScopeRefused("bad-path (no encoded separator, backslash, control character or double "
+                                "encoding in a segment)")
+    return "/" + "/".join(s for s in segments if s)
 
 
 def denied(scope, route):
@@ -230,10 +291,11 @@ def tenant_key(key):
 
 def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
     method = method.upper()
-    route = route_of(path)
+    write = method not in READ_METHODS
+    route = route_of(path, write)
     if base_path:
-        route = route_of(base_path.rstrip("/") + route)
-    if method in READ_METHODS:
+        route = route_of(base_path.rstrip("/") + route, write)
+    if not write:
         return "read"
     scope = load_scope(run_dir)
     if scope["mode"] == LEGACY_MODE:
@@ -259,7 +321,48 @@ def judge(run_dir, method, path, body=None, token_tenants=(), base_path=""):
     outside = [t for t in token_tenants if t not in scope["tenants"]]
     if outside:
         raise WriteScopeRefused("foreign-tenant seat-tenant={}".format(",".join(outside)))
+    need_approval_mode(scope, method, path, body, base_path)
     return "write"
+
+
+def need_approval_mode(scope, method, path, body, base_path):
+    # Ids keep their case: the mode read goes back to the server with them.
+    route = cased_route_of(path)
+    if base_path:
+        route = cased_route_of(base_path.rstrip("/") + route)
+    for guard in scope.get(GUARD_KEY, []):
+        if method not in guard["methods"]:
+            continue
+        match = re.fullmatch(guard["path"], route, re.I)
+        if not match:
+            continue
+        values = {}
+        for name in PLACEHOLDER.findall(guard["read"] + guard["field"]):
+            if name.startswith("body."):
+                value = body.get(name[len("body."):]) if isinstance(body, dict) else None
+            else:
+                value = match.group(name)
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or str(value) == "":
+                raise WriteScopeRefused("{} approval-mode-unreadable missing={} guard={}".format(
+                    GUARD_REASON, name, guard["path"]))
+            values[name] = str(value)
+        read_path = PLACEHOLDER.sub(lambda m: urllib.parse.quote(values[m.group(1)], safe=""), guard["read"])
+        field = PLACEHOLDER.sub(lambda m: values[m.group(1)], guard["field"])
+        raise ApprovalModeUnread("{} approval-mode-unread read={} (the client reads it on the writing seat; "
+                                 "check cannot)".format(GUARD_REASON, read_path), read_path, field, guard["allow"])
+
+
+def field_value(response, field):
+    value = response
+    for key in field.split("."):
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def mode_allowed(value, allow):
+    return any(type(value) is type(a) and value == a for a in allow)
 
 
 def seat_tenants(token):
@@ -328,10 +431,32 @@ class H:
         raise error
 
     def guarded(self, tag, seat, method, path, body, tok=None):
+        base_path = urllib.parse.urlsplit(self.base).path
         try:
-            judge(self.run_dir, method, path, body, seat_tenants(tok), urllib.parse.urlsplit(self.base).path)
+            try:
+                judge(self.run_dir, method, path, body, seat_tenants(tok), base_path)
+            except ApprovalModeUnread as need:
+                self.approval_mode(tag, seat, need, base_path, tok)
         except WriteScopeRefused as e:
             self.refuse(tag, seat, method, path, body, e)
+
+    def approval_mode(self, tag, seat, need, base_path, tok):
+        read = need.read_path
+        prefix = base_path.rstrip("/")
+        if prefix:
+            if not read.lower().startswith(prefix.lower() + "/"):
+                raise WriteScopeRefused("{} approval-mode-unreadable read={} is outside the client base {}".format(
+                    GUARD_REASON, read, prefix))
+            read = read[len(prefix):]
+        code, js = self.exchange(tag + "-approval-mode", seat, "GET", read, None, tok)
+        value = field_value(js, need.field) if 200 <= code < 300 else None
+        if mode_allowed(value, need.allow):
+            return
+        if value is None or isinstance(value, (dict, list)):
+            raise WriteScopeRefused("{} approval-mode-unreadable status={} field={} read={}".format(
+                GUARD_REASON, code, need.field, need.read_path))
+        raise WriteScopeRefused("{} mode={} field={} read={}".format(
+            GUARD_REASON, value if isinstance(value, str) else json.dumps(value), need.field, need.read_path))
 
     def own(self, tag, seat, create_path, fixture_id, name):
         path = "{}/{}".format(create_path.rstrip("/"), urllib.parse.quote(str(fixture_id), safe=""))
@@ -393,7 +518,10 @@ class H:
         return code
 
     def call(self, tag, seat, method, path, body=None, save=True):
-        code, js, dt = self.req(method, path, self.tok.get(seat), body, tag, seat)
+        return self.exchange(tag, seat, method, path, body, self.tok.get(seat), save)
+
+    def exchange(self, tag, seat, method, path, body, tok, save=True):
+        code, js, dt = self.req(method, path, tok, body, tag, seat)
         if save:
             self.save(tag, {"status": code, "seat": seat, "method": method, "path": sanitized(path),
                             "body": redacted(body), "at": now(), "response": redacted(js)})
