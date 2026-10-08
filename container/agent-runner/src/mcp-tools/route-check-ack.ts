@@ -4,14 +4,8 @@
  */
 import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { readDeliveryNotice } from '../modules/mailbox/index.js';
-import { splitThreadKey } from '../thread-route-split.js';
+import { ROUTE_CHECK_ACK_WAIT_MS, splitThreadKey } from '../thread-route-split.js';
 import { err, ok } from './tool-helpers.js';
-
-/**
- * Longer than the host's routing deadline (20 s from queueing) plus its post and ack, so a verdict the host reached
- * in time is read here; past it the host has already counted the check as a veto.
- */
-const ROUTE_CHECK_ACK_WAIT_MS = 45_000;
 
 export async function routeCheckedSendResult(
   id: string,

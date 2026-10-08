@@ -40,7 +40,7 @@ import {
   threadView,
   type RouteCheckRequest,
 } from './thread-route-check.js';
-import { isRouteCheckedKey, splitThreadKey } from './thread-route-split.js';
+import { isRouteCheckedKey, ROUTE_CHECK_ACK_WAIT_MS, splitThreadKey } from './thread-route-split.js';
 import { ROUTE_CHECK_DELIVER_BY_MS } from './thread-route-verdict.js';
 import { askJev, JEV_MODEL, type JevAnswer } from './typesafe.js';
 import Database from 'better-sqlite3';
@@ -650,9 +650,7 @@ describe('route-checked keys and the split key', () => {
     expect(fs.readFileSync('container/agent-runner/src/thread-route-split.ts', 'utf8')).toBe(
       fs.readFileSync('src/thread-route-split.ts', 'utf8'),
     );
-    const runner = fs.readFileSync('container/agent-runner/src/mcp-tools/route-check-ack.ts', 'utf8');
-    const wait = Number(/ROUTE_CHECK_ACK_WAIT_MS = ([\d_]+);/.exec(runner)?.[1].replaceAll('_', ''));
     expect(ROUTE_CHECK_DELIVER_BY_MS).toBeGreaterThan(ROUTE_CHECK_DEADLINE_MS + ROUTE_CHECK_TOTAL_TIMEOUT_MS);
-    expect(wait).toBeGreaterThanOrEqual(ROUTE_CHECK_DELIVER_BY_MS + 5_000);
+    expect(ROUTE_CHECK_ACK_WAIT_MS).toBeGreaterThanOrEqual(ROUTE_CHECK_DELIVER_BY_MS + 5_000);
   });
 });
