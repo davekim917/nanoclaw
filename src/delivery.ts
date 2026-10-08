@@ -82,6 +82,9 @@ const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
 
+/** A deterministic policy refusal: retrying cannot change the verdict, so it is recorded on the first attempt. */
+class DeliveryRefusal extends Error {}
+
 /**
  * Attempt counts live in the `delivery_attempts` table, so they survive a
  * host restart: a poison message gets MAX_DELIVERY_ATTEMPTS total, not
@@ -817,13 +820,17 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     decidedFrom: 'this attempt' | 'a count stored before this host started',
     err?: unknown,
   ): Promise<void> => {
-    log.error('Message delivery failed permanently, giving up', {
-      messageId: msg.id,
-      sessionId: session.id,
-      attempts,
-      decidedFrom,
-      err: err ?? errMsg,
-    });
+    const refused = err instanceof DeliveryRefusal;
+    (refused ? log.warn : log.error)(
+      refused ? 'Message delivery refused by policy, not retried' : 'Message delivery failed permanently, giving up',
+      {
+        messageId: msg.id,
+        sessionId: session.id,
+        attempts,
+        decidedFrom,
+        err: err ?? errMsg,
+      },
+    );
     await ackDelivery(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id, errMsg));
     await clearAttemptRow(msg.id);
     // Giving up is the last moment the host knows a transition has ended: release any repo-ingress fence no live
@@ -919,6 +926,10 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       if (isGateRow(msg)) {
         log.warn('Gate result not recorded — retrying next poll', { messageId: msg.id, sessionId: session.id, err });
         break;
+      }
+      if (err instanceof DeliveryRefusal) {
+        await giveUpOnMessage(msg, 1, err.message, 'this attempt', err);
+        continue;
       }
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
@@ -1612,7 +1623,7 @@ async function deliverMessage(
   let outcomeClaim: { workgroup: string; key: string } | undefined;
   if (content.reporting?.version === 1 && content.reporting.purpose === 'outcome') {
     if (externalOutcomeChannels.includes(msg.platform_id))
-      throw new Error(
+      throw new DeliveryRefusal(
         'This channel has an existing terminal reporter. Hand off the outcome through that route; do not post a competing report.',
       );
     const rawOutcome = content.reporting.outcome as Record<string, unknown> | undefined;

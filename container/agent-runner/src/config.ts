@@ -35,6 +35,9 @@ export interface RunnerConfig {
 
   /** Only an explicit `false` disables it; missing, null or non-boolean means ON. */
   statusSubtext: boolean;
+
+  /** Channels whose outcomes belong to an existing terminal reporter; the host refuses a typed outcome to them. */
+  outcomeReportingExternalChannels: string[];
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -116,6 +119,9 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
     fallbackApplied: onFallback,
     providerFallback: declaredFallback || undefined,
     statusSubtext: raw.statusSubtext !== false,
+    outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
+      ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
+      : [],
   };
 }
 

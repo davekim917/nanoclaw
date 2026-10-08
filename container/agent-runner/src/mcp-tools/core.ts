@@ -12,6 +12,7 @@ import { OUTCOME_PURPOSES, renderWorkOutcome, type TrustedRequestIdentity } from
 import fs from 'fs';
 import path from 'path';
 
+import { getConfig } from '../config.js';
 import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
@@ -198,6 +199,15 @@ function resolveRouting(
   return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
 }
 
+/** The host stays the enforcer; without readable config this answers no and the host's refusal still applies. */
+function isReservedOutcomeChannel(platformId: string): boolean {
+  try {
+    return getConfig().outcomeReportingExternalChannels.includes(platformId);
+  } catch {
+    return false;
+  }
+}
+
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
@@ -272,6 +282,10 @@ export const sendMessage: McpToolDefinition = {
     if (policy && purpose === 'outcome' && cont.continueThread)
       return err(
         'An outcome reports in its own request thread and cannot take continue_thread. Send it without, or post to the other thread with purpose reply or handoff.',
+      );
+    if (policy && purpose === 'outcome' && isReservedOutcomeChannel(routing.platform_id))
+      return err(
+        'This channel has an existing terminal reporter. Hand off the outcome through that route; do not post a competing report.',
       );
     if (policy && purpose === 'outcome') {
       try {

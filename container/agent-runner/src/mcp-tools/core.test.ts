@@ -922,6 +922,32 @@ describe('outcome reporting send_message contract', () => {
     expect(result.isError === true).toBe(status === 'failed');
   });
 
+  it('refuses an outcome to a reserved terminal-reporter channel before queuing it', async () => {
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _setConfigForTest({ outcomeReportingExternalChannels: ['slack:TEST'] });
+    try {
+      const refused = await sendMessage.handler({
+        purpose: 'outcome',
+        text: 'Checkout fixed.',
+        outcome: {
+          workItem: 'https://github.com/org/repo/pull/17',
+          verified: 'Tests passed',
+          evidence: 'https://github.com/org/repo/pull/17',
+        },
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0].text).toContain('existing terminal reporter');
+      expect(getUndeliveredMessages()).toHaveLength(0);
+
+      expect((await sendMessage.handler({ purpose: 'reply', text: 'The detail you asked for.' })).isError).not.toBe(
+        true,
+      );
+      expect(getUndeliveredMessages()).toHaveLength(1);
+    } finally {
+      _resetConfig();
+    }
+  }, 10_000);
+
   it.each(['reply', 'urgent', 'decision', 'handoff'])(
     'preserves %s without applying the routine outcome cap',
     async (purpose) => {
