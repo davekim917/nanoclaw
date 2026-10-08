@@ -2720,7 +2720,7 @@ evaluate_pr() {
         fetch_ok=false
       else
         ci_pending="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s and .status != "completed")] | length' <<<"$runs_json")"
-        ci_failed="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s) | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))] | length' <<<"$runs_json")"
+        ci_failed="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s and .status == "completed") | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))] | length' <<<"$runs_json")"
         ci_succeeded="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s and .status == "completed" and .conclusion == "success")] | length' <<<"$runs_json")"
         # Same rule the develop gate applies: >=1 real success required, so a
         # head whose every workflow was path-skipped can never clear on

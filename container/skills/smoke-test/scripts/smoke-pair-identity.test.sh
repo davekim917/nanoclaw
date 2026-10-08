@@ -7,7 +7,8 @@
 # stays BLOCKED, a stale-generation receipt never counts toward the current
 # baseline, and `finish` (and the evidence barrier) refuse until every lane
 # the contract declared at the re-freeze has been redispatched after it
-# (F3). Contracts and redispatches go through the real
+# (F3), and check/finish/refreeze reading the frozen services rather than
+# whatever pair the env names. Contracts and redispatches go through the real
 # smoke-run-scaffold.sh verbs, so the snapshot is tested against its field.
 set -euo pipefail
 
@@ -580,5 +581,72 @@ expect_rc "$RC" 2 static-unsafe-url-refused
 RC="$(SMOKE_PREVIEW_PROVIDER=elsewhere bash "$SCRIPT" read >"$T/out" 2>"$T/err"; echo $?)"
 expect_rc "$RC" 2 unknown-provider
 err | grep -q 'SMOKE_PREVIEW_PROVIDER' || fail "unknown-provider: message did not name the key"
+
+# --- 10. check/finish/refreeze bind to the FROZEN services, not the env ----
+# The shared gate env names the develop pair. A PR run checked with it sourced
+# compared the frozen preview against the develop services and appended a
+# source-mismatch that voided the run. Now the ids come from identity.json: env
+# may be unset or repeat them; any other id refuses before anything is read or
+# appended.
+DEV_FE=srv-dev0000000fe; DEV_BE=srv-dev0000000be
+unset_run() { env -u SMOKE_GATE_FRONTEND_SERVICE -u SMOKE_GATE_BACKEND_SERVICE bash "$SCRIPT" "$@" >"$T/out" 2>"$T/err"; echo $?; }
+dev_run() { SMOKE_GATE_FRONTEND_SERVICE="$DEV_FE" SMOKE_GATE_BACKEND_SERVICE="$DEV_BE" bash "$SCRIPT" "$@" >"$T/out" 2>"$T/err"; echo $?; }
+lines_or_0() { [ -e "$1/coordinator/identity-checks.ndjson" ] && journal_lines "$1" || echo 0; }
+RUNF="$T/run-frozen"; mkdir -p "$RUNF"
+serve_pair 101 "$SRC_SHA" "$SRC_SHA"; pr_contract "$RUNF" "$SRC_SHA"
+expect_rc "$(run start "$RUNF")" 0 frozen-ids-start
+expect_rc "$(unset_run check "$RUNF" env-unset)" 0 frozen-ids-env-unset-check
+tail -1 "$RUNF/coordinator/identity-checks.ndjson" | jq -e --arg fe "$SMOKE_GATE_FRONTEND_SERVICE" --arg be "$SMOKE_GATE_BACKEND_SERVICE" '
+  .verdict == "ok" and .now.frontend.service == $fe and .now.backend.service == $be' >/dev/null ||
+  fail "frozen-ids-env-unset-check: receipt did not read the frozen services"
+expect_rc "$(run check "$RUNF" env-equal)" 0 frozen-ids-env-equal-check
+BEFORE="$(journal_lines "$RUNF")"
+expect_rc "$(dev_run check "$RUNF" env-develop)" 2 frozen-ids-env-differs-check
+err | grep -Fq "frontend=$DEV_FE backend=$DEV_BE" && err | grep -Fq "frontend=$SMOKE_GATE_FRONTEND_SERVICE backend=$SMOKE_GATE_BACKEND_SERVICE" ||
+  fail "frozen-ids-env-differs-check: refusal did not name both pairs"
+expect_rc "$(SMOKE_GATE_BACKEND_SERVICE="$DEV_BE" bash "$SCRIPT" check "$RUNF" one-side >"$T/out" 2>"$T/err"; echo $?)" 2 frozen-ids-one-side-differs
+expect_rc "$(dev_run finish "$RUNF")" 2 frozen-ids-env-differs-finish
+[ "$(journal_lines "$RUNF")" = "$BEFORE" ] || fail "frozen-ids-env-differs: a refused check/finish appended a receipt"
+expect_rc "$(unset_run finish "$RUNF")" 0 frozen-ids-env-unset-finish
+# No identity.json, or one naming no services: refuse, create no journal.
+RUNM="$T/run-missing"; mkdir -p "$RUNM"
+expect_rc "$(unset_run check "$RUNM" no-identity)" 2 frozen-ids-missing-check
+expect_rc "$(unset_run finish "$RUNM")" 2 frozen-ids-missing-finish
+mkdir -p "$RUNM/coordinator"; printf '{"ok":true,"freezeGeneration":1}\n' > "$RUNM/coordinator/identity.json"
+expect_rc "$(run check "$RUNM" no-services)" 2 frozen-ids-no-services-check
+[ "$(lines_or_0 "$RUNM")" = 0 ] || fail "frozen-ids-missing: a refused check created a receipt"
+# refreeze: env unset re-freezes the frozen services; other ids refuse unless
+# the run is bound to a PR sourceSha the new pair must serve.
+RUNR="$T/run-refreeze-dev"; mkdir -p "$RUNR"
+serve_pair 102 "$A" "$B"; expect_rc "$(run start "$RUNR")" 0 frozen-ids-refreeze-start
+serve_pair 103 "$A" "$B"
+expect_rc "$(dev_run refreeze "$RUNR" "sourced the gate env")" 2 frozen-ids-refreeze-unbound-retarget
+jq -e '.freezeGeneration == 1 and .history == []' "$RUNR/coordinator/identity.json" >/dev/null ||
+  fail "frozen-ids-refreeze-unbound-retarget: identity.json was re-frozen anyway"
+expect_rc "$(unset_run refreeze "$RUNR" "backend redeployed")" 0 frozen-ids-refreeze-env-unset
+jq -e --arg fe "$SMOKE_GATE_FRONTEND_SERVICE" '.freezeGeneration == 2 and .frontend.service == $fe' "$RUNR/coordinator/identity.json" >/dev/null ||
+  fail "frozen-ids-refreeze-env-unset: did not re-freeze the frozen services"
+RUNP="$T/run-refreeze-pr"; mkdir -p "$RUNP"
+serve_pair 104 "$A" "$B"; expect_rc "$(dev_run start "$RUNP")" 0 frozen-ids-retarget-start
+pr_contract "$RUNP" "$SRC_SHA"; serve_pair 105 "$SRC_SHA" "$SRC_SHA"
+expect_rc "$(run refreeze "$RUNP" "froze the develop pair before the contract")" 0 frozen-ids-retarget-bound
+jq -e --arg fe "$SMOKE_GATE_FRONTEND_SERVICE" --arg dev "$DEV_FE" '.frontend.service == $fe and .history[0].frontend.service == $dev' \
+  "$RUNP/coordinator/identity.json" >/dev/null || fail "frozen-ids-retarget-bound: history did not keep the old services"
+expect_rc "$(dev_run check "$RUNP" develop-again)" 2 frozen-ids-check-after-retarget
+# static: frozen preview URLs select the provider when it is not given.
+RUNS="$T/run-static-frozen"; mkdir -p "$RUNS"
+WEB=https://web-pr-8.acme.example; API=https://api-pr-8.acme.example
+mk "sha-$A" live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"; mk "sha-$A" live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(SMOKE_PREVIEW_PROVIDER=static SMOKE_GATE_FRONTEND_SERVICE=$WEB SMOKE_GATE_BACKEND_SERVICE=$API bash "$SCRIPT" start "$RUNS" >"$T/out" 2>"$T/err"; echo $?)" 0 frozen-ids-static-start
+expect_rc "$(unset_run check "$RUNS" provider-unset)" 0 frozen-ids-static-provider-inferred
+expect_rc "$(SMOKE_PREVIEW_PROVIDER=render unset_run check "$RUNS" provider-render)" 2 frozen-ids-static-provider-conflict
+err | grep -q 'SMOKE_PREVIEW_PROVIDER=render' || fail "frozen-ids-static-provider-conflict: refused for the wrong reason"
+[ "$(journal_lines "$RUNS")" = 1 ] || fail "frozen-ids-static-provider-conflict: a refused check appended a receipt"
+# start and read keep their env-only semantics.
+RUNST="$T/run-start-env"; mkdir -p "$RUNST"; serve_pair 106 "$A" "$B"
+expect_rc "$(unset_run start "$RUNST")" 2 frozen-ids-start-still-needs-env
+expect_rc "$(dev_run start "$RUNST")" 0 frozen-ids-start-uses-env
+jq -e --arg dev "$DEV_FE" '.frontend.service == $dev' "$RUNST/coordinator/identity.json" >/dev/null || fail "frozen-ids-start-uses-env"
+expect_rc "$(unset_run read)" 2 frozen-ids-read-still-needs-env
 
 echo "smoke pair identity tests passed"

@@ -5,7 +5,7 @@
 # not the shared worktree HEAD. Fails closed on everything.
 #
 #   start    <run-dir>          freeze once → <run-dir>/coordinator/identity.json (no-clobber: exit 4 if it exists)
-#   check    <run-dir> <label>  re-read live pair, append coordinator/identity-checks.ndjson
+#   check    <run-dir> <label>  re-read the FROZEN services' live pair, append coordinator/identity-checks.ndjson
 #   refreeze <run-dir> <reason> bounded re-freeze after drift: exactly ONCE per run (see below)
 #   finish   <run-dir>          coordinator pre-publication check: identity.json present; after a
 #                                re-freeze, every required lane redispatched since it; ≥1 prior check
@@ -29,9 +29,16 @@
 #       PR-contract source mismatch (lane finishes BLOCKED) · 4 refused (re-start
 #       after freeze, or a second re-freeze)
 #
-# Env: RENDER_API_KEY; SMOKE_GATE_FRONTEND_SERVICE / SMOKE_GATE_BACKEND_SERVICE (required —
-#      no defaults; a missing id fails closed rather than silently identifying the wrong pair.
-#      Same names smoke-develop-gate.sh reads, so one wrapper env file configures both.)
+# Env: RENDER_API_KEY; SMOKE_GATE_FRONTEND_SERVICE / SMOKE_GATE_BACKEND_SERVICE (required by
+#      start and read — no defaults; a missing id fails closed rather than silently identifying
+#      the wrong pair. Same names smoke-develop-gate.sh reads, so one wrapper env file
+#      configures both.) check, finish and refreeze take the ids from the run's frozen
+#      identity.json instead: env may be unset or repeat them, and any other id refuses
+#      (exit 2, nothing appended), because the shared gate env names the develop pair and a
+#      PR run checked against it records a source-mismatch that voids the run. refreeze
+#      moves to different ids only for a run bound to a PR sourceSha the new pair must serve.
+#      With SMOKE_PREVIEW_PROVIDER unset, those three verbs take the provider from the frozen
+#      ids' shape (URLs → static); an explicit provider that disagrees refuses.
 #      SMOKE_PREVIEW_PROVIDER=static: the two ids are the PR previews' URLs (the gate's
 #      frontendPreviewId/backendPreviewId), and each side's identity is the commit it serves
 #      (smoke-preview-static.sh), recorded as deploy `sha-<commit>`; no Render call, no key.
@@ -157,6 +164,38 @@ pair_matches_source_sha() { # <pair-json> <source-sha>
   ' <<<"$1" >/dev/null 2>&1
 }
 
+is_url() { case "$1" in http://*|https://*) return 0 ;; esac; return 1; }
+frozen_service() { # <identity.json> <frontend|backend> → frozen service id
+  jq -er --arg s "$2" '.[$s].service | select(type == "string" and length > 0)' "$1" 2>/dev/null
+}
+
+# Sets FE/BE (and PROVIDER when not given) from the frozen pair. An env id that
+# names another service refuses here, before anything reads or records; only
+# refreeze may carry one forward, as RETARGET, for its source-bound check.
+use_frozen_pair() { # <identity.json> <verb>
+  local f="$1" verb="$2" ffe fbe shape
+  ffe="$(frozen_service "$f" frontend)" && fbe="$(frozen_service "$f" backend)" || {
+    echo "REFUSED: $verb: $f names no frozen frontend/backend service id — nothing read or recorded (exit 2)" >&2; exit 2; }
+  RETARGET=""
+  if { [ -n "$FE" ] && [ "$FE" != "$ffe" ]; } || { [ -n "$BE" ] && [ "$BE" != "$fbe" ]; }; then
+    if [ "$verb" != refreeze ]; then
+      echo "REFUSED: $verb: env names frontend=${FE:-<unset>} backend=${BE:-<unset>} but this run froze frontend=$ffe backend=$fbe ($f). Unset SMOKE_GATE_FRONTEND_SERVICE/SMOKE_GATE_BACKEND_SERVICE (the frozen ids are used) or pass the frozen ids; nothing read or recorded (exit 2)" >&2
+      exit 2
+    fi
+    RETARGET="frontend=$ffe backend=$fbe → frontend=${FE:-$ffe} backend=${BE:-$fbe}"
+  fi
+  FE="${FE:-$ffe}"; BE="${BE:-$fbe}"
+  if is_url "$FE" && is_url "$BE"; then shape=static
+  elif is_url "$FE" || is_url "$BE"; then
+    echo "REFUSED: $verb: frontend=$FE backend=$BE mixes a preview URL with a service id — no provider reads that pair (exit 2)" >&2; exit 2
+  else shape=render; fi
+  if [ -z "${SMOKE_PREVIEW_PROVIDER:-}" ]; then PROVIDER="$shape"
+  elif [ "$PROVIDER" != "$shape" ]; then
+    echo "REFUSED: $verb: SMOKE_PREVIEW_PROVIDER=$PROVIDER but frontend=$FE backend=$BE are $shape ids — nothing read or recorded (exit 2)" >&2
+    exit 2
+  fi
+}
+
 compare() { # $1 frozen file, $2 now json, $3 label, $4 rc-of-read, $5 log, $6 freeze-generation, $7 expected-source-sha → prints verdict, exit 0/2/3
   python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PY'
 import json, sys, os
@@ -277,13 +316,14 @@ print("identity frozen: " + payload)
 PY
     exit $? ;;
   refreeze)
-    require_services
     RUN="${2:?run dir}"; REASON="${3:-}"; F="$RUN/coordinator/identity.json"
     [ -n "$REASON" ] || { echo "REFUSED: refreeze requires a reason (exit 2)" >&2; exit 2; }
     [ -s "$F" ] || { echo "REFUSED: no identity.json in $RUN — run start first (exit 2)" >&2; exit 2; }
     OLD="$(cat "$F")"
     python3 -c 'import json,sys; json.loads(sys.argv[1])' "$OLD" >/dev/null 2>&1 || {
       echo "REFUSED: identity.json is not valid JSON — cannot re-freeze over it (exit 2)" >&2; exit 2; }
+    use_frozen_pair "$F" refreeze
+    require_services
     HIST_LEN="$(jq -r '(.history // []) | length' <<<"$OLD" 2>/dev/null || echo x)"
     printf '%s' "$HIST_LEN" | grep -Eq '^[0-9]+$' || HIST_LEN=0
     if [ "$HIST_LEN" -ge 1 ]; then
@@ -313,6 +353,10 @@ PY
     CONTRACT_SOURCE_SHA="$(pr_contract_source_sha "$RUN")" || exit 2
     EXPECTED_SOURCE_SHA="$CONTRACT_SOURCE_SHA"
     [ -n "$EXPECTED_SOURCE_SHA" ] || EXPECTED_SOURCE_SHA="$(stored_expected_source_sha "$F")"
+    if [ -n "$RETARGET" ] && [ -z "$EXPECTED_SOURCE_SHA" ]; then
+      echo "REFUSED: refreeze onto other services ($RETARGET) needs a PR sourceSha the new pair must serve, and this run has none — nothing re-frozen. Scaffold the PR contract first, or unset SMOKE_GATE_FRONTEND_SERVICE/SMOKE_GATE_BACKEND_SERVICE to re-freeze the frozen services (exit 2)" >&2
+      exit 2
+    fi
     P="$(read_pair)"; rc=$?
     [ $rc -eq 0 ] || { echo "REFUSED: live identity unreadable/invalid — nothing re-frozen: $P" >&2; exit 2; }
     if [ -n "$EXPECTED_SOURCE_SHA" ] && ! pair_matches_source_sha "$P" "$EXPECTED_SOURCE_SHA"; then
@@ -354,9 +398,10 @@ print("identity re-frozen: " + payload)
 PY
     exit $? ;;
   check|finish)
-    require_services
     RUN="${2:?run dir}"; LABEL="${3:-$1}"; F="$RUN/coordinator/identity.json"; LOG="$RUN/coordinator/identity-checks.ndjson"
     [ -s "$F" ] || { echo "$LABEL: unreadable — no identity.json in $RUN (run start first) (exit 2)"; exit 2; }
+    use_frozen_pair "$F" "$1"
+    require_services
     CONTRACT_SOURCE_SHA="$(pr_contract_source_sha "$RUN")" || exit 2
     EXPECTED_SOURCE_SHA="$CONTRACT_SOURCE_SHA"
     [ -n "$EXPECTED_SOURCE_SHA" ] || EXPECTED_SOURCE_SHA="$(stored_expected_source_sha "$F")"

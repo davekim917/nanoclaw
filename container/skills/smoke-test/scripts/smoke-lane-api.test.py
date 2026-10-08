@@ -32,6 +32,9 @@ def token_for(claims):
 class Backend(http.server.BaseHTTPRequestHandler):
     seen = []
     store = {}
+    modes = {}
+    modes_by_auth = {}
+    auths = []
 
     def log_message(self, format, *args):
         pass
@@ -40,6 +43,16 @@ class Backend(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n)) if n else None
         Backend.seen.append((self.command, self.path, body))
+        Backend.auths.append(self.headers.get("Authorization"))
+        auth_key = (self.path, self.headers.get("Authorization"))
+        if self.command == "GET" and (auth_key in Backend.modes_by_auth or self.path in Backend.modes):
+            status, out = Backend.modes_by_auth.get(auth_key) or Backend.modes[self.path]
+            raw = json.dumps(out).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/elsewhere")
@@ -66,7 +79,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
     do_GET = do_POST = do_PATCH = do_DELETE = do_PUT = reply
 
 
-class Guard(unittest.TestCase):
+class Harness(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Backend)
@@ -80,6 +93,9 @@ class Guard(unittest.TestCase):
     def setUp(self):
         Backend.seen.clear()
         Backend.store.clear()
+        Backend.modes.clear()
+        Backend.modes_by_auth.clear()
+        Backend.auths.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.run_dir = os.path.join(self.tmp.name, RUN_ID)
         os.makedirs(self.run_dir)
@@ -131,6 +147,8 @@ class Guard(unittest.TestCase):
         self.assertIn(code, (200, 201))
         self.assertEqual(len(Backend.seen), before + 1)
 
+
+class Guard(Harness):
     def test_no_scope_refuses_writes_but_not_reads(self):
         h = self.client()
         self.assertEqual(h.call("r1", "M", "GET", "/widgets/5")[0], 200)
@@ -440,6 +458,227 @@ class Guard(unittest.TestCase):
         self.assertEqual(run("init", old, "--from", src).returncode, 0, "init accepts an allowlist-era file")
         self.assertEqual(run("check", old, "POST", "/users/login").returncode, 0)
         self.assertEqual(run("check", old, "POST", "/notes", "--body", '{"title": "x"}').returncode, 77)
+
+
+GUARDS = [
+    {"methods": ["PUT"], "path": "/v1/blocks/(?P<level>[^/]+)/(?P<id>[^/]+)",
+     "read": "/v1/blocks/{level}/{id}", "field": "{level}.mode", "allow": ["two_person"]},
+    {"methods": ["POST"], "path": "/v1/visuals",
+     "read": "/v1/collateral/{body.canonicalSubjectType}/{body.canonicalSubjectId}", "field": "mode",
+     "allow": ["two_person"]},
+    {"methods": ["POST"], "path": "/v1/asset-studio/assets/(?P<id>[^/]+)/save",
+     "read": "/v1/asset-studio/assets/{id}", "field": "needsApproval", "allow": [True]},
+]
+GUARDED = dict(SCOPE, approvalModeGuards=GUARDS)
+
+
+class ApprovalModeGuard(Harness):
+    """A save that publishes without a second approver is refused unless the seat reads an allowed mode first."""
+
+    def setUp(self):
+        super().setUp()
+        self.pin(GUARDED)
+
+    def assert_refused_unwritten(self, h, tag, method, path, body, reason, seat="M"):
+        before = len(Backend.seen)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.call(tag, seat, method, path, body)
+        self.assertIn(reason, str(ctx.exception))
+        sent = Backend.seen[before:]
+        self.assertTrue(all(m == "GET" for m, _, _ in sent), "only the mode read may go: {}".format(sent))
+        with open(os.path.join(h.out, tag + ".json")) as f:
+            rec = json.load(f)
+        self.assertTrue(rec["harnessBlocked"])
+        self.assertEqual(rec["refusal"], "WRITE_SCOPE_REFUSED")
+        self.assertIn("single_person_publish", rec["reason"])
+        self.assertNotIn("status", rec)
+        with open(os.path.join(h.out, "00-timeline.txt")) as f:
+            self.assertIn("[{}] {} {} {} -> HARNESS_BLOCKED WRITE_SCOPE_REFUSED reason=single_person_publish".format(
+                tag, seat, method, path), f.read())
+        return sent
+
+    def test_single_person_mode_refuses_the_save_and_sends_no_write(self):
+        Backend.modes["/v1/blocks/brand/ACME-B-000166"] = (200, {"brand": {"mode": "single_person"}})
+        h = self.client("M")
+        sent = self.assert_refused_unwritten(h, "b1", "PUT", "/v1/blocks/brand/ACME-B-000166",
+                                             {"writingSamples": []}, "single_person_publish mode=single_person")
+        self.assertEqual([p for _, p, _ in sent], ["/v1/blocks/brand/ACME-B-000166"], "ids keep their case")
+        self.assertEqual(Backend.auths[-1], "Bearer " + h.tok["M"], "the mode is read on the writing seat")
+        with open(os.path.join(h.out, "b1-approval-mode.json")) as f:
+            self.assertEqual(json.load(f)["response"]["brand"]["mode"], "single_person")
+        Backend.modes["/v1/collateral/brand/ACME-B-1"] = (200, {"mode": "single_person"})
+        self.assert_refused_unwritten(h, "v1", "POST", "/v1/visuals",
+                                      {"canonicalSubjectType": "brand", "canonicalSubjectId": "ACME-B-1"}, "mode=")
+        Backend.modes["/v1/asset-studio/assets/a7"] = (200, {"needsApproval": False})
+        self.assert_refused_unwritten(h, "a1", "POST", "/v1/asset-studio/assets/a7/save", {}, "mode=false")
+
+    def test_two_person_mode_lets_the_save_go(self):
+        Backend.modes["/v1/blocks/company/ACME-O-000004"] = (200, {"company": {"mode": "two_person"}})
+        h = self.client("M")
+        before = len(Backend.seen)
+        code, _ = h.call("c1", "M", "PUT", "/v1/blocks/company/ACME-O-000004", {"story": "x"})
+        self.assertEqual(code, 200)
+        self.assertEqual([(m, p) for m, p, _ in Backend.seen[before:]],
+                         [("GET", "/v1/blocks/company/ACME-O-000004"), ("PUT", "/v1/blocks/company/ACME-O-000004")])
+        Backend.modes["/v1/asset-studio/assets/a8"] = (200, {"needsApproval": True})
+        self.assert_sent_after_read(h, "a2", "POST", "/v1/asset-studio/assets/a8/save", {})
+
+    def assert_sent_after_read(self, h, tag, method, path, body):
+        before = len(Backend.seen)
+        code, _ = h.call(tag, "M", method, path, body)
+        self.assertIn(code, (200, 201))
+        self.assertEqual([m for m, _, _ in Backend.seen[before:]], ["GET", method])
+
+    def test_an_unreadable_mode_refuses(self):
+        h = self.client("M")
+        cases = (
+            ("u1", (200, {"brand": {"mode": None}}), "approval-mode-unreadable"),
+            ("u2", (403, {"brand": {"mode": "two_person"}}), "approval-mode-unreadable status=403"),
+            ("u3", (200, {"company": {"mode": "two_person"}}), "approval-mode-unreadable"),
+            ("u4", (200, {"brand": {"mode": "TWO_PERSON"}}), "mode=TWO_PERSON"),
+            ("u5", (200, {"brand": {"mode": {"value": "two_person"}}}), "approval-mode-unreadable"),
+            ("u6", (200, {"brand": "two_person"}), "approval-mode-unreadable"),
+            ("u7", (200, {"data": {"brand": {"mode": "two_person"}}}), "approval-mode-unreadable"),
+        )
+        for tag, reply, reason in cases:
+            Backend.modes["/v1/blocks/brand/B-{}".format(tag)] = reply
+            self.assert_refused_unwritten(h, tag, "PUT", "/v1/blocks/brand/B-{}".format(tag), {"k": 1}, reason)
+        sent = self.assert_refused_unwritten(h, "u8", "PUT", "/v1/blocks/brand/B-404", {"k": 1}, "unreadable")
+        self.assertEqual(len(sent), 1, "an absent read route is unreadable, not a pass")
+        Backend.modes["/v1/asset-studio/assets/a9"] = (200, {"needsApproval": "true"})
+        self.assert_refused_unwritten(h, "u9", "POST", "/v1/asset-studio/assets/a9/save", {}, "mode=true")
+        for i, body in enumerate(({"canonicalSubjectType": "brand"}, None, ["x"],
+                                  {"canonicalSubjectType": "brand", "canonicalSubjectId": ""},
+                                  {"canonicalSubjectType": "brand", "canonicalSubjectId": True})):
+            sent = self.assert_refused_unwritten(h, "ub%d" % i, "POST", "/v1/visuals", body, "missing=")
+            self.assertEqual(sent, [], "an unresolvable read sends nothing at all")
+
+    def test_unguarded_routes_and_reads_are_untouched(self):
+        h = self.client("M")
+        before = len(Backend.seen)
+        self.assertEqual(h.call("n1", "M", "PUT", "/v1/blocks/brand/B1/extra", {"k": 1})[0], 200)
+        self.assertEqual(h.call("n2", "M", "POST", "/v1/blocks/brand/B1/derive", {"k": 1})[0], 201)
+        self.assertEqual(h.call("n3", "M", "PATCH", "/v1/blocks/brand/B1", {"k": 1})[0], 200)
+        self.assertEqual(h.call("n4", "M", "GET", "/v1/blocks/brand/B1")[0], 200)
+        self.assertEqual(h.call("n5", "M", "POST", "/notes", {"k": 1})[0], 201)
+        self.assertEqual([m for m, _, _ in Backend.seen[before:]], ["PUT", "POST", "PATCH", "GET", "POST"],
+                         "no mode read for a route no guard names")
+
+    def test_static_refusals_come_first_and_send_no_read(self):
+        h = self.client("M", "G")
+        Backend.modes["/v1/blocks/brand/B1"] = (200, {"brand": {"mode": "two_person"}})
+        before = len(Backend.seen)
+        self.refused_without_read(h, "f1", "G", "foreign-tenant")
+        self.refused_without_read(h, "f2", "M", "foreign-tenant", {"tenantId": "globex"})
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        self.pin(dict(GUARDED, denyPaths=["/v1/blocks/[^/]+/[^/]+"]))
+        self.refused_without_read(h, "f3", "M", "denied-path")
+        self.assertEqual(len(Backend.seen), before)
+
+    def refused_without_read(self, h, tag, seat, reason, body=None):
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.call(tag, seat, "PUT", "/v1/blocks/brand/B1", body or {"k": 1})
+        self.assertIn(reason, str(ctx.exception))
+
+    def test_base_path_is_stripped_from_the_read(self):
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        guard = dict(GUARDS[0], path="/api/v1/blocks/(?P<level>[^/]+)/(?P<id>[^/]+)", read="/api/v1/blocks/{level}/{id}")
+        self.pin(dict(SCOPE, approvalModeGuards=[guard]))
+        h = api.H(os.path.join(self.run_dir, "lanes", "l2"), run_dir=self.run_dir, base=self.base + "/api/",
+                  seats={"M": "m@example.test"}, password_helper=self.helper)
+        h.tok["M"] = token_for({"tenantId": "sandbox"})
+        Backend.modes["/api/v1/blocks/brand/B1"] = (200, {"brand": {"mode": "single_person"}})
+        before = len(Backend.seen)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.call("bp1", "M", "PUT", "/v1/blocks/brand/B1", {"k": 1})
+        self.assertIn("mode=single_person", str(ctx.exception))
+        self.assertEqual([(m, p) for m, p, _ in Backend.seen[before:]], [("GET", "/api/v1/blocks/brand/B1")])
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        self.pin(dict(SCOPE, approvalModeGuards=[dict(guard, read="/other/{level}/{id}")]))
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.call("bp2", "M", "PUT", "/v1/blocks/brand/B1", {"k": 1})
+        self.assertIn("outside the client base", str(ctx.exception))
+
+    def test_cli_check_refuses_a_guarded_route_it_cannot_read(self):
+        cli = [sys.executable, os.path.join(HERE, "smoke_lane_api.py")]
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        no = subprocess.run(cli + ["check", self.run_dir, "PUT", "/v1/blocks/brand/B1", "--tenant", "sandbox",
+                                   "--body", "{}"], capture_output=True, text=True, env=env)
+        self.assertEqual(no.returncode, 77)
+        self.assertTrue(no.stderr.startswith("WRITE_SCOPE_REFUSED reason=single_person_publish approval-mode-unread"))
+        ok = subprocess.run(cli + ["check", self.run_dir, "PUT", "/v1/blocks/brand/B1/extra", "--tenant", "sandbox"],
+                            capture_output=True, text=True, env=env)
+        self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "write"))
+        with self.assertRaises(api.ApprovalModeUnread) as ctx:
+            api.judge(self.run_dir, "put", "/v1/Blocks/Brand/B%2D1", {}, ["sandbox"])
+        self.assertEqual((ctx.exception.read_path, ctx.exception.field), ("/v1/blocks/Brand/B-1", "Brand.mode"))
+
+    def test_encoded_separators_are_refused_at_every_entry(self):
+        Backend.modes["/v1/blocks/brand/B1"] = (200, {"brand": {"mode": "single_person"}})
+        h = self.client("M")
+        cli = [sys.executable, os.path.join(HERE, "smoke_lane_api.py")]
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        cases = (("PUT", "/v1/blocks/brand/B1%2F"), ("PUT", "/v1/blocks/brand/B1%2f/"), ("PUT", "/v1/blocks%2Fbrand/B1"),
+                 ("POST", "/v1/visuals%2F"), ("POST", "/v1/asset-studio/assets/A1/save%2F"),
+                 ("PUT", "/v1/blocks/brand/B1%5C"), ("PUT", "/v1/blocks/brand/B1\\x"), ("PUT", "/v1/blocks/brand/B1%00"),
+                 ("PUT", "/v1/blocks/brand/B1%252F"), ("POST", "/ledger%2Fclose"), ("DELETE", "/media%2F5"))
+        before = len(Backend.seen)
+        for i, (method, path) in enumerate(cases):
+            body = {"canonicalSubjectType": "brand", "canonicalSubjectId": "B1"}
+            with self.assertRaises(api.WriteScopeRefused, msg=path) as ctx:
+                h.call("x%d" % i, "M", method, path, body)
+            self.assertIn("bad-path", str(ctx.exception), path)
+            with open(os.path.join(h.out, "x%d.json" % i)) as f:
+                self.assertTrue(json.load(f)["harnessBlocked"])
+            with self.assertRaises(api.WriteScopeRefused, msg=path):
+                h.req(method, path, h.tok["M"], body, tag="xr%d" % i, seat="M")
+            no = subprocess.run(cli + ["check", self.run_dir, method, path, "--tenant", "sandbox", "--body", json.dumps(body)],
+                                capture_output=True, text=True, env=env)
+            self.assertEqual(no.returncode, 77, path)
+            self.assertIn("bad-path", no.stderr, path)
+        self.assertEqual(Backend.seen[before:], [], "an ambiguous path sends nothing, not even the mode read")
+
+    def test_req_reads_the_mode_with_the_writes_own_token(self):
+        h = self.client("M")
+        cached = h.tok["M"]
+        other = token_for({"tenantId": "playground"})
+        Backend.modes_by_auth[("/v1/blocks/brand/B1", "Bearer " + cached)] = (200, {"brand": {"mode": "two_person"}})
+        Backend.modes_by_auth[("/v1/blocks/brand/B1", "Bearer " + other)] = (200, {"brand": {"mode": "single_person"}})
+        before = len(Backend.seen)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.req("PUT", "/v1/blocks/brand/B1", other, {"k": 1}, tag="r1", seat="M")
+        self.assertIn("mode=single_person", str(ctx.exception))
+        self.assertEqual([m for m, _, _ in Backend.seen[before:]], ["GET"])
+        self.assertEqual(Backend.auths[-1], "Bearer " + other, "the mode is read with the token that would write")
+        code, _, _ = h.req("PUT", "/v1/blocks/brand/B1", cached, {"k": 1}, tag="r2", seat="M")
+        self.assertEqual(code, 200)
+        self.assertEqual([m for m, _, _ in Backend.seen[before:]], ["GET", "GET", "PUT"])
+        self.assertEqual(Backend.auths[-2:], ["Bearer " + cached] * 2)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            h.req("PUT", "/v1/blocks/brand/B1", None, {"k": 1}, tag="r3", seat="M")
+        self.assertIn("no-tenant", str(ctx.exception))
+        self.assertEqual(len(Backend.seen), before + 3, "a tokenless write reads nothing")
+
+    def test_guards_are_pinned_and_malformed_guards_fail_closed(self):
+        with open(os.path.join(self.run_dir, api.SCOPE_FILE)) as f:
+            self.assertEqual(json.load(f)["approvalModeGuards"], GUARDS)
+        os.unlink(os.path.join(self.run_dir, api.SCOPE_FILE))
+        g = GUARDS[0]
+        bad = ({}, "x", [dict(g, extra=1)], [{k: v for k, v in g.items() if k != "allow"}],
+               [dict(g, methods=["put"])], [dict(g, methods=["GET"])], [dict(g, methods=[])],
+               [dict(g, path="/v1/blocks/")], [dict(g, path="/v1//blocks")], [dict(g, path="v1/blocks")],
+               [dict(g, path="/v1/blocks/(")], [dict(g, read="v1/blocks/{id}")], [dict(g, read="/v1/{nope}")],
+               [dict(g, field="{nope}.mode")], [dict(g, read="/v1/{id")], [dict(g, field="")],
+               [dict(g, allow=[])], [dict(g, allow="two_person")], [dict(g, allow=[1])])
+        for guards in bad:
+            with self.assertRaises((ValueError, api.re.error), msg=guards):
+                self.pin(dict(SCOPE, approvalModeGuards=guards))
+            self.assertFalse(os.path.exists(os.path.join(self.run_dir, api.SCOPE_FILE)), guards)
+        with open(os.path.join(self.run_dir, api.SCOPE_FILE), "w") as f:
+            json.dump(dict(SCOPE, approvalModeGuards=[dict(g, methods=["put"])], runId=RUN_ID), f)
+        with self.assertRaises(api.WriteScopeRefused) as ctx:
+            api.judge(self.run_dir, "POST", "/notes", {"k": 1}, ["sandbox"])
+        self.assertIn("unreadable-scope", str(ctx.exception), "a tampered pin refuses every write")
 
 
 if __name__ == "__main__":

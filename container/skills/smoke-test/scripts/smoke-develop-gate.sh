@@ -1555,7 +1555,8 @@ wait "$PID_ACTIVITY" || : >"$TMP_DIR/activity.json"
 SOURCE_SHA="$(jq -r '.commit.sha // empty' "$TMP_DIR/branch.json" 2>/dev/null)"
 CHECK_TOTAL="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha)] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
 CHECK_PENDING="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha and .status != "completed")] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
-CHECK_FAILED="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha) | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
+# An unfinished run reports an empty conclusion; it is pending, not failed.
+CHECK_FAILED="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha and .status == "completed") | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
 # Any completed successful run counts. Requiring one NAMED workflow here
 # ("Frontend CI") deadlocked every backend-only merge forever: the workflow
 # is path-filtered, never starts, and a run that never existed reads the
@@ -1946,7 +1947,7 @@ if [ "$CI_READY" != true ] || [ "$DEPLOY_READY" != true ]; then
     STATE="$(jq -c --arg sha "$SOURCE_SHA" '.unsettledWakeSha=$sha' <<<"$STATE")"
     write_state "$STATE"
     FAILED_WORKFLOWS="$(jq -c --arg sha "$SOURCE_SHA" \
-      '[.[]? | select(.headSha == $sha)
+      '[.[]? | select(.headSha == $sha and .status == "completed")
         | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))
         | .workflowName] | unique' "$TMP_DIR/checks.json" 2>/dev/null)"
     printf '%s' "$FAILED_WORKFLOWS" | jq -e 'type == "array"' >/dev/null 2>&1 || FAILED_WORKFLOWS='[]'

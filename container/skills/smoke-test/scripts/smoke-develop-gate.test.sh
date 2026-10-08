@@ -84,6 +84,7 @@ case "$1 $2" in
   "api repos/org/repo/branches/develop")
     printf '{"commit":{"sha":"%s"}}' "$STUB_SOURCE_SHA" ;;
   "run list")
+    if [ -n "${STUB_RUN_LIST_JSON:-}" ]; then printf '%s' "$STUB_RUN_LIST_JSON"; exit 0; fi
     # wait-settled tests only: flip from failure to success after N calls, so
     # a bounded poll loop can observe a build settle mid-wait instead of every
     # attempt reading the same static fixture. Unset = unchanged behavior.
@@ -326,7 +327,7 @@ fresh_state() {
   export SMOKE_GATE_STATE_DIR="$STATE_DIR2"
   export SMOKE_GATE_DEBOUNCE_SECONDS=0
   unset SMOKE_GATE_FRONTEND_PATHS SMOKE_GATE_BACKEND_PATHS SMOKE_GATE_ACTIVE_FILE \
-        STUB_FRONTEND_SHA STUB_BACKEND_SHA STUB_FRONTEND_CI STUB_COMPARE_FILES \
+        STUB_FRONTEND_SHA STUB_BACKEND_SHA STUB_FRONTEND_CI STUB_COMPARE_FILES STUB_RUN_LIST_JSON \
         SMOKE_GATE_UNSETTLED_ALERT_SECONDS \
         SMOKE_GATE_FREEZE_HANDOFF SMOKE_GATE_FREEZE_HELPER SMOKE_GATE_HOLD_FILE \
         STUB_FREEZE_EXIT STUB_FREEZE_JSON STUB_FREEZE_PR_STATE \
@@ -387,6 +388,39 @@ bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for
 unset STUB_FRONTEND_CI
 bash "$GATE" poll >/dev/null
 jq -e '.unsettledSha == null and .unsettledWakeSha == null' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# 18b. A run still in flight is pending, never failed. `gh run list` reports
+# an unfinished run's conclusion as "", so the head reads 1 pending, 0 failed
+# and names no failed workflow; the gate still refuses to settle on it.
+run_row() { printf '{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"%s"}' "$STUB_SOURCE_SHA" "$1" "$2" "$3"; }
+fresh_state
+export SMOKE_GATE_UNSETTLED_ALERT_SECONDS=0
+export STUB_RUN_LIST_JSON="[$(run_row in_progress "" "Backend CI"),$(run_row completed success "Master Data CI")]"
+INFLIGHT_CHECK="$(bash "$GATE" check)"
+jq -e '.settled == false and .ciReady == false and .checkCount == 2 and
+       .pendingChecks == 1 and .failedChecks == 0 and .succeededChecks == 1' <<<"$INFLIGHT_CHECK" >/dev/null || {
+  echo "18b: an in-progress run was not reported as pending only: $INFLIGHT_CHECK" >&2; exit 1; }
+INFLIGHT_POLL="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "develop_unsettled" and
+       .data.failedChecks == 0 and .data.pendingChecks == 1 and .data.failedWorkflows == []' <<<"$INFLIGHT_POLL" >/dev/null || {
+  echo "18b: an in-progress run was named as a failed workflow: $INFLIGHT_POLL" >&2; exit 1; }
+
+# 18c. Every completed run with a non-success conclusion still counts as
+# failed (failure, cancelled, timed_out, and a completed run with no
+# conclusion), alongside a queued run that does not; settled stays false.
+fresh_state
+export SMOKE_GATE_UNSETTLED_ALERT_SECONDS=0
+export STUB_RUN_LIST_JSON="[$(run_row completed failure "Frontend CI"),$(run_row completed cancelled "Mobile CI"),$(run_row completed timed_out "E2E"),$(run_row completed "" "Lint"),$(run_row queued "" "Backend CI"),$(run_row completed success "Master Data CI"),$(run_row completed skipped "Docs")]"
+MIXED_CHECK="$(bash "$GATE" check)"
+jq -e '.settled == false and .ciReady == false and .checkCount == 7 and
+       .pendingChecks == 1 and .failedChecks == 4 and .succeededChecks == 1' <<<"$MIXED_CHECK" >/dev/null || {
+  echo "18c: completed non-success runs were not all counted as failed: $MIXED_CHECK" >&2; exit 1; }
+MIXED_POLL="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "develop_unsettled" and
+       .data.failedChecks == 4 and .data.pendingChecks == 1 and
+       .data.failedWorkflows == ["E2E","Frontend CI","Lint","Mobile CI"]' <<<"$MIXED_POLL" >/dev/null || {
+  echo "18c: failedWorkflows did not name exactly the completed non-success runs: $MIXED_POLL" >&2; exit 1; }
+unset STUB_RUN_LIST_JSON SMOKE_GATE_UNSETTLED_ALERT_SECONDS
 
 # 19. Live-run artifact: written on claim with a merge-hold cap, refreshed by
 # progress, removed by finish.

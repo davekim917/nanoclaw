@@ -514,8 +514,13 @@ while IFS= read -r SCREEN; do
          + (if $diff == null then {} else {diff:$diff} end)')"
     else
       CAPTURED_ALL=false
-      REASON="$CAP_REASON"
-      [ "$NAV_OK" = true ] || REASON="$NAV_ERR"
+      # capture_view never ran when navigation failed, so CAP_REASON is either
+      # unset (aborts under set -u) or left over from an earlier capture.
+      if [ "$NAV_OK" = true ]; then
+        REASON="$CAP_REASON"
+      else
+        REASON="$NAV_ERR"
+      fi
       ENTRY="$(jq -cn --arg r "$REASON" --argjson b "$([ -n "$BASELINE_URL" ] && echo true || echo false)" \
         '{captured:false, file:null, reason:$r}
          + (if $b then {diff:{status:"failed",reason:"head not captured"}} else {} end)')"
