@@ -20,9 +20,8 @@ staged=$(git diff --cached --name-only --diff-filter=ACM -- src/ | grep '\.ts$' 
 
 # Resolve tooling from the MAIN checkout, not $PWD.
 #
-# Agent worktrees deliberately carry no node_modules (a `pnpm install` there
-# leaves better-sqlite3's native binding unbuilt and yields hundreds of phantom
-# failures), so `$PWD/node_modules/.bin/prettier` does not exist in one. The old
+# A worktree's own install is optional (CLAUDE.md, Development), so
+# `$PWD/node_modules/.bin/prettier` need not exist in one. The old
 # hardcoded path made this hook unrunnable from a worktree, and workers
 # improvised their way around it — on 2026-08-23 one `cp`-ed over a symlink and
 # wrote THROUGH it into the shared pnpm store, replacing prettier's real CLI

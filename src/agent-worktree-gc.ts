@@ -149,7 +149,7 @@ export function hasLiveProcess(dir: string, procRoot = '/proc'): LivenessProbe {
 }
 
 /**
- * Tracked modifications, ignoring the node_modules symlink into the live checkout (it would veto every candidate).
+ * Tracked modifications, ignoring an untracked node_modules (a worktree's own install would veto every candidate).
  * Matched as a PATH COMPONENT, never a substring, since a missed edit is lost when the worktree is deleted.
  */
 export function hasTrackedChanges(status: string): boolean {

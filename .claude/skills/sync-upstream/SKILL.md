@@ -86,7 +86,7 @@ Open one PR per fast-lane batch (host or container) and one per theme. Work in a
 ```bash
 W=<scratchpad>/wt-<topic>
 git -C $R worktree add -b port/<topic> "$W" origin/main
-ln -s $R/node_modules "$W/node_modules"      # read-only use; never install or rebuild into it
+(cd "$W" && pnpm install --frozen-lockfile --offline)   # the worktree's own install, seconds from the shared store; never link $R/node_modules (the install refuses through a link)
 git -C "$W" cherry-pick -x <sha>             # -m 1 for a merge commit; resolve against the customization contract
 ```
 
@@ -99,11 +99,11 @@ node_modules/.bin/tsc --noEmit -p tsconfig.json
 flock <scratchpad>/vitest.lock ionice -c3 nice -n 10 node_modules/.bin/eslint src/ scripts/ setup/
 flock <scratchpad>/vitest.lock ionice -c3 nice -n 10 node_modules/.bin/vitest run <targeted files> --maxWorkers=2
 node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --root "$W" --write [--accept <path>]   # when an upstream-owned file changed
-(cd container/agent-runner && bun install && bun run typecheck && bun run test)                 # when container/agent-runner/ changed
+(cd container/agent-runner && bun install --frozen-lockfile && bun run typecheck && bun run test)   # when container/agent-runner/ changed
 (cd $R && pnpm run check:public-boundary -- --root "$W" --index)   # from the live checkout so pnpm resolves; scans $W's index
 ```
 
-Never run the full host suite on this host. Push, open the PR from `$W` (`gh pr create` takes its head branch from the working directory) with a `Replaces:` line, and drive it with the `pr-review-loop` skill, which owns review rounds, receipts and the merge (`codex-review.sh merge --head <sha>`). After the merge: `git -C $R worktree remove --force "$W"`. The untracked `node_modules` symlink makes a plain remove refuse; git deletes the link, not its target.
+Never run the full host suite on this host. Push, open the PR from `$W` (`gh pr create` takes its head branch from the working directory) with a `Replaces:` line, and drive it with the `pr-review-loop` skill, which owns review rounds, receipts and the merge (`codex-review.sh merge --head <sha>`). After the merge: `git -C $R worktree remove "$W"`. The worktree's `node_modules` is ignored, so a plain remove deletes it along with the tree; `--force` is only for untracked files you left behind.
 
 Drift tests, green before and after every port:
 

@@ -297,6 +297,15 @@ if ! pnpm install --frozen-lockfile >> "$LOG" 2>&1; then
   exit 1
 fi
 
+# An up-to-date lockfile makes the install above a no-op, so it does not repair links another checkout's
+# install wrote into this tree; the build and restart below would run on an install that goes away with
+# that checkout.
+write_status "running" "dependency links" ""
+if ! pnpm run -s check:dependency-links >> "$LOG" 2>&1; then
+  write_status "failed" "dependency links" "node_modules links leave the checkout or dangle — check deploy.log"
+  exit 1
+fi
+
 write_status "running" "build" ""
 # `build` is bare `tsc` — it never prunes dist/. A renamed or deleted source
 # file leaves an orphan .js behind that the service (ExecStart runs

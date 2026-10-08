@@ -11,6 +11,7 @@ import {
   startPostDeployInboundCheck,
 } from './channels/post-deploy-inbound.js';
 import { markDeployBootHealthy } from './deploy-crash-guard.js';
+import { brokenDependencyLinks, describeBrokenDependencyLink } from './dependency-links.js';
 import { bootFollowsSuccessfulDeploy } from './deploy-status.js';
 import { notifyOperators } from './operator-alert.js';
 import {
@@ -175,6 +176,36 @@ async function checkBuildDrift(buildInfo: ReturnType<typeof readBuildInfo>): Pro
     }
   } catch (err) {
     log.warn('build-drift: check failed, continuing boot', { err: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+/**
+ * Boot-time check of the checkout's own package links. Never blocks boot: this process has its modules loaded,
+ * and it is the NEXT start that fails once a link's target (another checkout's install) is gone.
+ */
+async function checkDependencyLinks(): Promise<void> {
+  try {
+    const broken = brokenDependencyLinks(REPO_ROOT);
+    if (broken.length === 0) return;
+    const sample = broken.slice(0, 5).map((b) => describeBrokenDependencyLink(REPO_ROOT, b));
+    log.error('dependency-links: node_modules links leave the checkout or dangle; the next restart may not start', {
+      count: broken.length,
+      sample,
+    });
+    const result = await notifyOwner({
+      title: 'Host node_modules depends on another checkout',
+      body:
+        `${broken.length} package link(s) under the live checkout's node_modules leave the checkout or dangle, ` +
+        `e.g. ${sample.join('; ')}.\n\n` +
+        'The running host is unaffected, but the next restart may fail to start. A fresh ' +
+        '`pnpm install --frozen-lockfile` from the live checkout (scripts/deploy.sh runs one) rewrites them.',
+    });
+    if (result.code !== 0)
+      log.warn('dependency-links: could not DM the owner', { code: result.code, message: result.message });
+  } catch (err) {
+    log.warn('dependency-links: check failed, continuing boot', {
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -498,6 +529,7 @@ export async function main(): Promise<void> {
   // Below both gates above: it sends a DM and writes a shared dedupe marker, so two racing hosts must not both
   // run it, and a crash-looping host is throttled before it can message anyone.
   await checkBuildDrift(buildInfo);
+  await checkDependencyLinks();
 
   // Shell-set values take precedence over .env.
   loadEnvIntoProcess();

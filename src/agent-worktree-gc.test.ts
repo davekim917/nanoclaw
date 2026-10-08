@@ -136,7 +136,7 @@ describe('hasLiveProcess', () => {
 });
 
 describe('hasTrackedChanges', () => {
-  it('ignores node_modules, which is a symlink present in every worktree', () => {
+  it('ignores node_modules, a worktree install that git reports as untracked', () => {
     expect(hasTrackedChanges('?? node_modules\n?? container/agent-runner/node_modules\n')).toBe(false);
   });
 
