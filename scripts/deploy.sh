@@ -297,9 +297,8 @@ if ! pnpm install --frozen-lockfile >> "$LOG" 2>&1; then
   exit 1
 fi
 
-# An up-to-date lockfile makes the install above a no-op, so it does not repair links another checkout's
-# install wrote into this tree; the build and restart below would run on an install that goes away with
-# that checkout.
+# Verify the install the build and restart below will run on: a package link another checkout's install
+# wrote into this tree is a start failure once that checkout is removed.
 write_status "running" "dependency links" ""
 if ! pnpm run -s check:dependency-links >> "$LOG" 2>&1; then
   write_status "failed" "dependency links" "node_modules links leave the checkout or dangle — check deploy.log"

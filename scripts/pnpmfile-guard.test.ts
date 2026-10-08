@@ -69,7 +69,7 @@ describe('.pnpmfile.cjs', () => {
     fs.writeFileSync(path.join(target, 'sentinel'), 'another checkout\n');
     fs.symlinkSync(target, path.join(root, 'node_modules'));
 
-    for (const env of [{}, { CI: 'true' }] as Record<string, string>[]) {
+    for (const env of [{ CI: 'false' }, { CI: 'true' }]) {
       const r = pnpm(root, install, env);
       expect(r.status).toBe(1);
       expect(r.stderr).toContain(`it is a symlink to ${target}`);

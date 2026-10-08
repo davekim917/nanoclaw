@@ -60,6 +60,18 @@ describe('brokenDependencyLinks', () => {
     expect(describeBrokenDependencyLink(root, broken[1]!)).toBe(`node_modules/esc -> ${escaped} (escapes)`);
   });
 
+  it('flags a lexically in-tree link whose .pnpm entry is itself a link out of the tree', () => {
+    const root = tempRoot();
+    const modules = pnpmTree(root);
+    const other = tempRoot();
+    fs.mkdirSync(path.join(other, 'mid@1.0.0', 'node_modules', 'mid'), { recursive: true });
+    fs.symlinkSync(path.join(other, 'mid@1.0.0'), path.join(modules, '.pnpm', 'mid@1.0.0'));
+    fs.symlinkSync('.pnpm/mid@1.0.0/node_modules/mid', path.join(modules, 'mid'));
+    expect(brokenDependencyLinks(root)).toEqual([
+      { link: path.join(modules, 'mid'), target: '.pnpm/mid@1.0.0/node_modules/mid', reason: 'escapes' },
+    ]);
+  });
+
   it('flags a link inside node_modules whose target is gone', () => {
     const root = tempRoot();
     const modules = pnpmTree(root);
