@@ -978,7 +978,7 @@
 "src/delivery-guard.ts":{"diff":34,"mode":"100644","sha256":"68dc4d0681ad9bbd52246098f1a34e873abc16d795266ff5f62b2cf5df0920f8"},
 "src/delivery-poll.test.ts":{"diff":194,"mode":"100644","sha256":null,"deleted":true},
 "src/delivery-shadow.test.ts":{"diff":141,"mode":"100644","sha256":null,"deleted":true},
-"src/delivery.test.ts":{"diff":4029,"mode":"100644","sha256":"109d66794cb56a41d4a1ed0a3811d261a6726f42fe76fde6d4ad2f601afa4edb"},
+"src/delivery.test.ts":{"diff":4025,"mode":"100644","sha256":"c568af823c4d3c1c25afa7273ddffcca9bd0d123c06e76be7a059c037113c1ea"},
 "src/delivery.ts":{"diff":1781,"mode":"100644","sha256":"43ba066741559d9a34196d449f159eb9989b4631469bfcf310acd1826f04b9fa"},
 "src/drivers/cli.test.ts":{"diff":33,"mode":"100644","sha256":null,"deleted":true},
 "src/drivers/cli.ts":{"diff":88,"mode":"100644","sha256":null,"deleted":true},

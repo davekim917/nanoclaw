@@ -2382,7 +2382,6 @@ function openInboundDb(agentGroupId: string, sessionId: string): Database.Databa
   return openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
 }
 
-/** One drain records the refusal as failed at WARN; a retryable error would log a retry and leave the row open. */
 async function expectRefusedOnFirstDrain(
   session: Parameters<typeof deliverSessionMessages>[0],
   messageId: string,
@@ -3335,12 +3334,9 @@ describe('per-work-item outcome delivery', () => {
     await Promise.all([deliverSessionMessages(first), deliverSessionMessages(second)]);
     const owner = getRawDb().prepare('SELECT session_id FROM work_outcome_receipts').get() as { session_id: string };
     const sibling = owner.session_id === first.id ? second : first;
-    // The non-owner's conflicting result becomes a truthful failed row instead of a false ACK; later drains send nothing.
     await deliverSessionMessages(sibling);
     await deliverSessionMessages(sibling);
     insertOutboundKind('ag-2', second.id, 'outcome-replay', 'chat', 'telegram', 'telegram:123', await outcome());
-    // A replay from the owner records the existing receipt immediately; a
-    // replay from the sibling hits the same ownership refusal.
     await deliverSessionMessages(second);
     await deliverSessionMessages(second);
     await deliverSessionMessages(second);
