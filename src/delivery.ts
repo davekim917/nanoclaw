@@ -1101,7 +1101,7 @@ async function deliverMessage(
     externalOutcomeChannels = cfg.outcomeReportingExternalChannels ?? [];
     if (wikiEnrollment(wikiGroup.id, cfg.wikiMaintenance === true)) {
       if (!allowedWikiOutbound(msg.kind, content.action))
-        throw new Error('Wiki maintenance outbound capability denied');
+        throw new DeliveryRefusal('Wiki maintenance outbound capability denied');
     }
   }
 
@@ -1635,7 +1635,7 @@ async function deliverMessage(
       const source = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
         mailbox.getInboundRequestIdentity(sequence as number),
       );
-      if (!source) throw new Error('Harness request identity does not belong to this source session');
+      if (!source) throw new DeliveryRefusal('Harness request identity does not belong to this source session');
       let sourceContent: {
         platformMsgId?: unknown;
         sender?: unknown;
@@ -1688,7 +1688,7 @@ async function deliverMessage(
       if (claim.receipt.session_id !== session.id) {
         const receiptSession = await getSession(claim.receipt.session_id);
         if (!receiptSession || receiptSession.agent_group_id !== session.agent_group_id)
-          throw new Error(
+          throw new DeliveryRefusal(
             `Outcome not published: another agent owns the existing receipt` +
               `${claim.receipt.platform_message_id ? ` (${claim.receipt.platform_message_id})` : ''}. ` +
               'Merge this result through that owner report or use an explicitly requested separate reply.',

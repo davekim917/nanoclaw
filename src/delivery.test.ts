@@ -156,6 +156,34 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       expect(deliver).toHaveBeenCalledTimes(listed ? 0 : 1);
     },
   );
+  it('refuses a wiki actor row outside its outbound capability on its first attempt', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const directory = `${TEST_DIR}/groups/_ops/wiki`;
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(`${directory}/actors.json`, JSON.stringify({ version: 1, actorGroupIds: ['ag-1', 'verifier'] }));
+    fs.writeFileSync(
+      `${directory}/admission.json`,
+      JSON.stringify({
+        version: 1,
+        workgroupId: 'example',
+        repository: 'wiki',
+        defaultRef: 'refs/heads/main',
+        writerGroupId: 'ag-1',
+        verifierGroupId: 'verifier',
+        seriesId: 'synth-example',
+        sourcePrefixes: ['https://primary.example/'],
+        notification: { channelType: 'test', instance: 'test', platformId: 'example', threadId: null },
+      }),
+    );
+    fs.mkdirSync(`${TEST_DIR}/groups/test-agent`, { recursive: true });
+    fs.writeFileSync(`${TEST_DIR}/groups/test-agent/container.json`, JSON.stringify({ wikiMaintenance: true }));
+    insertOutbound('ag-1', session.id, 'wiki-chat');
+    const deliver = vi.fn(async () => 'must-not-deliver');
+    setDeliveryAdapter({ deliver });
+    await expectRefusedOnFirstDrain(session, 'wiki-chat', 'Wiki maintenance outbound capability denied');
+    expect(deliver).not.toHaveBeenCalled();
+  });
   it('delivers a message exactly once when active and sweep polls overlap', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
@@ -2354,6 +2382,32 @@ function openInboundDb(agentGroupId: string, sessionId: string): Database.Databa
   return openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
 }
 
+async function expectRefusedOnFirstDrain(
+  session: Parameters<typeof deliverSessionMessages>[0],
+  messageId: string,
+  reason: string,
+): Promise<void> {
+  const warn = vi.spyOn(log, 'warn');
+  const error = vi.spyOn(log, 'error');
+  try {
+    await deliverSessionMessages(session);
+    expect(error).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map(([line]) => line)).toEqual(['Message delivery refused by policy, not retried']);
+  } finally {
+    warn.mockRestore();
+    error.mockRestore();
+  }
+  const inDb = openInboundDb(session.agent_group_id, session.id);
+  try {
+    expect(inDb.prepare('SELECT status, error FROM delivered WHERE message_out_id = ?').get(messageId)).toEqual({
+      status: 'failed',
+      error: expect.stringContaining(reason),
+    });
+  } finally {
+    inDb.close();
+  }
+}
+
 const STAT = { mtimeNs: 1_000n, size: 4096 };
 
 describe('shouldSkipQuietDelivery (A1-A5)', () => {
@@ -3280,13 +3334,9 @@ describe('per-work-item outcome delivery', () => {
     await Promise.all([deliverSessionMessages(first), deliverSessionMessages(second)]);
     const owner = getRawDb().prepare('SELECT session_id FROM work_outcome_receipts').get() as { session_id: string };
     const sibling = owner.session_id === first.id ? second : first;
-    // The non-owner's conflicting result remains retryable for three delivery
-    // attempts, then becomes a truthful failed row instead of a false ACK.
     await deliverSessionMessages(sibling);
     await deliverSessionMessages(sibling);
     insertOutboundKind('ag-2', second.id, 'outcome-replay', 'chat', 'telegram', 'telegram:123', await outcome());
-    // A replay from the owner records the existing receipt immediately; a
-    // replay from the sibling exhausts the same recoverable ownership conflict.
     await deliverSessionMessages(second);
     await deliverSessionMessages(second);
     await deliverSessionMessages(second);
@@ -3361,6 +3411,49 @@ describe('per-work-item outcome delivery', () => {
     });
     siblingInbound.close();
   });
+
+  it.each([
+    {
+      reason: 'does not belong to this source session',
+      async queue(session: Awaited<ReturnType<typeof prepare>>) {
+        // The runner certified this request, then the host dropped its inbound row (a deleted task, a pruned row).
+        const content = opaqueOutcome('ag-1', session.id, 2, 'platform-request-gone');
+        const inbound = openInboundDbAt(inboundDbPath('ag-1', session.id));
+        inbound.prepare('DELETE FROM messages_in WHERE seq = 2').run();
+        inbound.close();
+        insertOutboundKind('ag-1', session.id, 'refused-outcome', 'chat', 'telegram', 'telegram:123', content);
+        return session;
+      },
+    },
+    {
+      reason: 'another agent owns the existing receipt',
+      async queue(owner: Awaited<ReturnType<typeof prepare>>) {
+        await createAgentGroup({
+          id: 'ag-2',
+          name: 'Sibling',
+          folder: 'sibling',
+          agent_provider: null,
+          workgroup_id: 'outcomes',
+          created_at: now(),
+        });
+        const sibling = (await resolveSession('ag-2', 'mg-1', null, 'shared')).session;
+        insertOutboundKind('ag-1', owner.id, 'owner-outcome', 'chat', 'telegram', 'telegram:123', await outcome());
+        await deliverSessionMessages(owner);
+        insertOutboundKind('ag-2', sibling.id, 'refused-outcome', 'chat', 'telegram', 'telegram:123', await outcome());
+        return sibling;
+      },
+    },
+  ])(
+    'refuses an outcome whose verdict a retry cannot change on its first attempt: $reason',
+    async ({ reason, queue }) => {
+      const deliver = vi.fn().mockResolvedValue('platform-outcome');
+      setDeliveryAdapter({ deliver });
+      const session = await queue(await prepare());
+      const deliveredBefore = deliver.mock.calls.length;
+      await expectRefusedOnFirstDrain(session, 'refused-outcome', reason);
+      expect(deliver).toHaveBeenCalledTimes(deliveredBefore);
+    },
+  );
 
   it('rejects an opaque outcome keyed to an agent-authored inbound row', async () => {
     const session = await prepare();
@@ -3743,7 +3836,11 @@ describe('per-work-item outcome delivery', () => {
     insertOutboundKind('ag-2', second.id, 'retry-sibling', 'chat', 'telegram', 'telegram:123', await outcome());
     await deliverSessionMessages(second);
     expect(deliver).toHaveBeenCalledTimes(1);
-    expect(getDeliveredIds(openInboundDb('ag-2', second.id)).has('retry-sibling')).toBe(false);
+    const siblingInbound = openInboundDb('ag-2', second.id);
+    expect(
+      siblingInbound.prepare('SELECT status,error FROM delivered WHERE message_out_id = ?').get('retry-sibling'),
+    ).toEqual({ status: 'failed', error: expect.stringContaining('another agent owns the existing receipt') });
+    siblingInbound.close();
     await deliverSessionMessages(first);
     await deliverSessionMessages(second);
     expect(deliver).toHaveBeenCalledTimes(2);
@@ -3781,22 +3878,8 @@ describe('per-work-item outcome delivery', () => {
     const deliver = vi.fn().mockResolvedValue('reply');
     setDeliveryAdapter({ deliver });
     insertOutboundKind('ag-1', session.id, 'external-terminal', 'chat', 'telegram', 'telegram:123', await outcome());
-    const warn = vi.spyOn(log, 'warn');
-    const error = vi.spyOn(log, 'error');
-    try {
-      await deliverSessionMessages(session);
-      expect(error).not.toHaveBeenCalled();
-      expect(warn.mock.calls.map(([line]) => line)).toEqual(['Message delivery refused by policy, not retried']);
-    } finally {
-      warn.mockRestore();
-      error.mockRestore();
-    }
+    await expectRefusedOnFirstDrain(session, 'external-terminal', 'existing terminal reporter');
     expect(deliver).not.toHaveBeenCalled();
-    const inDb = openInboundDb('ag-1', session.id);
-    expect(
-      inDb.prepare('SELECT status, error FROM delivered WHERE message_out_id = ?').get('external-terminal'),
-    ).toEqual({ status: 'failed', error: expect.stringContaining('existing terminal reporter') });
-    inDb.close();
     insertOutboundKind('ag-1', session.id, 'external-reply', 'chat', 'telegram', 'telegram:123', {
       text: 'The detail you requested.',
       reporting: { version: 1, purpose: 'reply' },
