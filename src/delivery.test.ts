@@ -3781,8 +3781,22 @@ describe('per-work-item outcome delivery', () => {
     const deliver = vi.fn().mockResolvedValue('reply');
     setDeliveryAdapter({ deliver });
     insertOutboundKind('ag-1', session.id, 'external-terminal', 'chat', 'telegram', 'telegram:123', await outcome());
-    for (let i = 0; i < 3; i++) await deliverSessionMessages(session);
+    const warn = vi.spyOn(log, 'warn');
+    const error = vi.spyOn(log, 'error');
+    try {
+      await deliverSessionMessages(session);
+      expect(error).not.toHaveBeenCalled();
+      expect(warn.mock.calls.map(([line]) => line)).toEqual(['Message delivery refused by policy, not retried']);
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
     expect(deliver).not.toHaveBeenCalled();
+    const inDb = openInboundDb('ag-1', session.id);
+    expect(
+      inDb.prepare('SELECT status, error FROM delivered WHERE message_out_id = ?').get('external-terminal'),
+    ).toEqual({ status: 'failed', error: expect.stringContaining('existing terminal reporter') });
+    inDb.close();
     insertOutboundKind('ag-1', session.id, 'external-reply', 'chat', 'telegram', 'telegram:123', {
       text: 'The detail you requested.',
       reporting: { version: 1, purpose: 'reply' },
