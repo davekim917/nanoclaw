@@ -82,6 +82,7 @@ import {
   getRecoverableLifecycleStatus,
   getNextScheduledWakeAt,
   getTaskListSettlement,
+  isDeliveredTaskListPost,
   type TaskListSettlement,
   getLatestRoutedTaskRow,
   getLatestTaskContent,
@@ -356,6 +357,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** When the earliest `wait` the agent armed comes due, if it has not yet (see the op). */
   getNextScheduledWakeAt(): string | null;
   getTaskListSettlement(killedAt: string): TaskListSettlement | null;
+  isDeliveredTaskListPost(platformMessageId: string, channelType: string, platformId: string): boolean;
 
   /**
    * False for never-woken sessions. Outbound READS already degrade to empty,
@@ -886,6 +888,10 @@ function forkOps(
     getNextScheduledWakeAt: () => getNextScheduledWakeAt(inbound),
     getTaskListSettlement: (killedAt) =>
       readOutbound(null, (outbound) => getTaskListSettlement(inbound, outbound, killedAt)),
+    isDeliveredTaskListPost: (platformMessageId, channelType, platformId) =>
+      readOutbound(false, (outbound) =>
+        isDeliveredTaskListPost(inbound, outbound, platformMessageId, channelType, platformId),
+      ),
 
     getNextFutureProcessAfter: () => getNextFutureProcessAfter(inbound),
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),

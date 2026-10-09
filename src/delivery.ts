@@ -61,6 +61,7 @@ import {
   deferTaskListOnRateLimit,
   noteHeldTaskListPost,
   noteTaskListDelivered,
+  retiringTaskListAdapter,
   supersededTaskListEdits,
   taskListCooldownMs,
 } from './task-list-host.js';
@@ -1548,7 +1549,8 @@ async function deliverMessage(
   // fires per (session, destination), rotating on `anchorRotationKey` (default: UTC day). Never overrides an
   // explicit thread_id. A series with `threadAnchor === false` (one NEW thread per item) is exempt. Edits and
   // reactions follow the anchor to reach in-thread messages but never drop or record one.
-  const isInPlaceOp = content.operation === 'edit' || content.operation === 'reaction';
+  const listDelete = msg.kind === 'task_list' && content.operation === 'delete';
+  const isInPlaceOp = content.operation === 'edit' || content.operation === 'reaction' || listDelete;
   const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
 
   // Keyed anchor (`content.threadKey`): the first post under a key lands at root and is recorded; later posts
@@ -1751,8 +1753,9 @@ async function deliverMessage(
     outcomeClaim = { workgroup: receiptScope, key: rendered.key };
   }
   let platformMsgId: string | undefined;
+  const adapter = listDelete ? retiringTaskListAdapter(deliveryAdapter, session, msg) : deliveryAdapter;
   try {
-    platformMsgId = await deliveryAdapter.deliver(
+    platformMsgId = await adapter.deliver(
       msg.channel_type,
       msg.platform_id,
       effectiveThreadId,
@@ -1795,7 +1798,7 @@ async function deliverMessage(
       chatThreadAnchorDisabled.set(session.id, msg.in_reply_to as string);
     }
     effectiveThreadId = null;
-    platformMsgId = await deliveryAdapter.deliver(
+    platformMsgId = await adapter.deliver(
       msg.channel_type,
       msg.platform_id,
       null,

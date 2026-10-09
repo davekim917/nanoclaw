@@ -690,6 +690,116 @@ describe('task list delivery (switch on)', () => {
     expect(['edit-0', 'edit-1', 'edit-2'].every((id) => done.has(id))).toBe(true);
   });
 
+  describe('a superseded list post', () => {
+    type Deleted = { platformId: string; threadId: string | null; messageId: string };
+    function deletingAdapter(deleteImpl?: () => Promise<void>): { calls: Call[]; deleted: Deleted[] } {
+      const calls: Call[] = [];
+      const deleted: Deleted[] = [];
+      setDeliveryAdapter({
+        async deliver(_channelType, _platformId, threadId, kind, content) {
+          calls.push({ kind, threadId, content: JSON.parse(content) as Record<string, unknown> });
+          return `plat-${calls.length}`;
+        },
+        async deleteMessage(_channelType, platformId, threadId, messageId) {
+          deleted.push({ platformId, threadId, messageId });
+          await deleteImpl?.();
+        },
+      });
+      return { calls, deleted };
+    }
+    const retire = (sessionId: string, id = 'retire-1', messageId = '1786621600.000100', timestamp = now()) =>
+      insertRow(sessionId, id, 'task_list', { operation: 'delete', messageId }, { timestamp });
+
+    it('is deleted, with no edit', async () => {
+      const sessionId = await seed();
+      seedDeliveredList(sessionId);
+      const { calls, deleted } = deletingAdapter();
+      retire(sessionId);
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      expect(deleted).toEqual([{ platformId: PLATFORM, threadId: THREAD, messageId: '1786621600.000100' }]);
+      expect(calls).toEqual([]);
+      expect(await delivered(sessionId)).toContain('retire-1');
+    });
+
+    it('is edited to the plain stub, with no link, when the delete fails', async () => {
+      const sessionId = await seed();
+      seedDeliveredList(sessionId);
+      const warn = vi.spyOn(log, 'warn');
+      const { calls, deleted } = deletingAdapter(async () => {
+        throw new Error('slack cant_delete_message');
+      });
+      retire(sessionId);
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      expect(deleted).toHaveLength(1);
+      expect(calls).toEqual([
+        {
+          kind: 'task_list',
+          threadId: THREAD,
+          content: { operation: 'edit', messageId: '1786621600.000100', text: 'Latest task list below ↓' },
+        },
+      ]);
+      expect(warn).toHaveBeenCalledWith(
+        'Failed to delete a superseded task list — editing it to a stub',
+        expect.objectContaining({ messageId: '1786621600.000100' }),
+      );
+      expect(await delivered(sessionId)).toContain('retire-1');
+      warn.mockRestore();
+    });
+
+    it('is edited to the plain stub when the adapter cannot delete', async () => {
+      const sessionId = await seed();
+      seedDeliveredList(sessionId);
+      const calls = captureAdapter();
+      retire(sessionId);
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      expect(calls.map((c) => c.content)).toEqual([
+        { operation: 'edit', messageId: '1786621600.000100', text: 'Latest task list below ↓' },
+      ]);
+    });
+
+    it('never deletes or edits a message the session did not deliver as a list post', async () => {
+      const sessionId = await seed();
+      seedDeliveredList(sessionId);
+      insertRow(sessionId, 'answer', 'chat', { text: 'An answer' });
+      recordDelivered(sessionId, 'answer', '1786621600.000200');
+      const { calls, deleted } = deletingAdapter();
+      retire(sessionId, 'forged-chat', '1786621600.000200');
+      retire(sessionId, 'forged-unknown', '1786621699.000999');
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      expect(deleted).toEqual([]);
+      expect(calls).toEqual([]);
+      const done = await delivered(sessionId);
+      expect(done).toContain('forged-chat');
+      expect(done).toContain('forged-unknown');
+    });
+
+    it('waits out a rate-limited delete, even past an answer, and never falls back to the stub', async () => {
+      const sessionId = await seed();
+      seedDeliveredList(sessionId);
+      let limited = true;
+      const { calls, deleted } = deletingAdapter(async () => {
+        if (limited) throw new Error('slack rate_limited: Retry-After: 1');
+      });
+      const base = Date.now();
+      retire(sessionId, 'retire-1', '1786621600.000100', new Date(base).toISOString());
+      insertRow(sessionId, 'answer', 'chat', { text: 'Done.' }, { timestamp: new Date(base + 1).toISOString() });
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      expect(calls.map((c) => c.kind)).toEqual(['chat']);
+      expect(await delivered(sessionId)).not.toContain('retire-1');
+      limited = false;
+      await new Promise((r) => setTimeout(r, 1_100));
+      await deliverSessionMessages(session);
+      expect(deleted).toHaveLength(2);
+      expect(calls.map((c) => c.kind)).toEqual(['chat']);
+      expect(await delivered(sessionId)).toContain('retire-1');
+    });
+  });
+
   it('shows the scrubbed item in the status line, never a registered secret', async () => {
     const sessionId = await seed();
     registerSecrets({ API_TOKEN: 'sk-live-abcdef123456' });

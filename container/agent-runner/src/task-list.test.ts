@@ -3,7 +3,6 @@ import { describe, expect, it } from 'bun:test';
 import {
   applyTaskListUpdate,
   describeOutcome,
-  latestListLink,
   markTaskListStale,
   parseTaskListInput,
   parseTaskListState,
@@ -191,14 +190,6 @@ describe('rendering', () => {
     expect(renderSubtext('discord', at)).toBe('todos as of <t:1790262000:t> (<t:1790262000:R>)');
     expect(renderSubtext('slack', at, true)).toStartWith('stopped · todos as of ');
   });
-
-  it('links to the new list only when every id is a real Slack id', () => {
-    expect(latestListLink('slack', 'slack:C0AAA', 'slack:C0AAA:1786621514.008659', '1786621600.001')).toBe(
-      'https://slack.com/archives/C0AAA/p1786621600001?thread_ts=1786621514.008659&cid=C0AAA',
-    );
-    expect(latestListLink('discord', 'discord:1:2', null, '123')).toBeNull();
-    expect(latestListLink('slack', 'slack:C0AAA', null, null)).toBeNull();
-  });
 });
 
 describe('applyTaskListUpdate', () => {
@@ -246,7 +237,7 @@ describe('applyTaskListUpdate', () => {
     expect(h.state?.touchedAt).toBe('2026-09-24T15:00:30.000Z');
   });
 
-  it('starts a new list after a finished one and points the old one at it', async () => {
+  it('starts a new list after a finished one and deletes the old one', async () => {
     // Conversation below the finished list: the new one goes at the bottom.
     const h = harness({ messagesAfter: 1 });
     await applyTaskListUpdate(input('First', items(['A', 'done'])), SLACK, h.deps);
@@ -254,11 +245,8 @@ describe('applyTaskListUpdate', () => {
     const out = await applyTaskListUpdate(input('Second', items(['B', 'in_progress'])), SLACK, h.deps);
     expect(out).toMatchObject({ ok: true, action: 'posted' });
     expect(h.state?.generation).toBe(2);
-    const pointer = h.writes[2].content;
-    expect(pointer).toMatchObject({ operation: 'edit', messageId: '1786621600.001', taskList: { superseded: true } });
-    expect(pointer.text).toBe(
-      '[Latest task list →](https://slack.com/archives/C0AAA/p1786621600002?thread_ts=1786621514.008659&cid=C0AAA)',
-    );
+    expect(h.writes).toHaveLength(3);
+    expect(h.writes[2].content).toEqual({ operation: 'delete', messageId: '1786621600.001' });
   });
 
   it('new_list starts a separate list even while the old one is unfinished', async () => {
@@ -288,7 +276,7 @@ describe('applyTaskListUpdate', () => {
     expect(out).toMatchObject({ ok: true, action: 'edited' });
     expect(h.state?.generation).toBe(2);
     expect(h.state?.finished).toBe(false);
-    // One post, edited in place — no second list and no "Latest task list" pointer.
+    // One post, edited in place — no second list and nothing deleted.
     expect(h.writes).toHaveLength(2);
     expect(h.writes[1].content).toMatchObject({ operation: 'edit', messageId: '1786621600.001' });
     expect(String(h.writes[1].content.text)).toContain('Second');
@@ -308,7 +296,7 @@ describe('applyTaskListUpdate', () => {
     expect(h.state?.generation).toBe(2);
   });
 
-  it('reposts at the bottom of a busy thread after 15 minutes, collapsing the old copy', async () => {
+  it('reposts at the bottom of a busy thread after 15 minutes, deleting the old copy', async () => {
     const h = harness({ messagesAfter: 3 });
     await applyTaskListUpdate(input('T', items(['A', 'in_progress'], ['B', 'pending'])), SLACK, h.deps);
     h.advance(TASK_LIST_REPOST_AFTER_MS);
@@ -316,7 +304,7 @@ describe('applyTaskListUpdate', () => {
     expect(out).toMatchObject({ ok: true, action: 'reposted' });
     expect(h.state?.generation).toBe(1);
     expect(h.state?.postOutboundId).toBe('out-2');
-    expect(h.writes[2].content).toMatchObject({ operation: 'edit', messageId: '1786621600.001' });
+    expect(h.writes[2].content).toEqual({ operation: 'delete', messageId: '1786621600.001' });
   });
 
   it('counts busy-thread traffic from each mailbox’s own cursor', async () => {
@@ -329,7 +317,7 @@ describe('applyTaskListUpdate', () => {
     expect(h.trafficQueries).toEqual([[h.writes[0].seq, 4]]);
   });
 
-  it('collapses the old copy only once the repost is on screen', async () => {
+  it('deletes the old copy only once the repost is on screen', async () => {
     const h = harness({ messagesAfter: 3 });
     await applyTaskListUpdate(input('T', items(['A', 'in_progress'], ['B', 'pending'])), SLACK, h.deps);
     h.advance(TASK_LIST_REPOST_AFTER_MS);
@@ -340,30 +328,22 @@ describe('applyTaskListUpdate', () => {
     expect(h.state?.supersedes).toEqual({ outboundId: 'out-1', platformMessageId: '1786621600.001' });
     h.setDeliver('ok');
     await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'done'])), SLACK, h.deps);
-    expect(h.writes[2].content).toMatchObject({
-      operation: 'edit',
-      messageId: '1786621600.001',
-      taskList: { superseded: true },
-    });
+    expect(h.writes[2].content).toEqual({ operation: 'delete', messageId: '1786621600.001' });
     expect(h.writes[3].content).toMatchObject({ operation: 'edit', messageId: '1786621600.002' });
     expect(h.state?.supersedes).toBeNull();
   });
 
-  it('never collapses a list into a pointer at a replacement that failed', async () => {
+  it('never deletes a list for a replacement that failed', async () => {
     const h = harness({ messagesAfter: 1 });
     await applyTaskListUpdate(input('T', items(['A', 'done'])), SLACK, h.deps);
     h.setDeliver('failed');
     await applyTaskListUpdate(input('Next', items(['B', 'in_progress']), true), SLACK, h.deps);
     expect(h.writes).toHaveLength(2);
     expect(h.state?.supersedes).toEqual({ outboundId: 'out-1', platformMessageId: '1786621600.001' });
-    // The next fresh post inherits the replacement and collapses the original once it shows.
+    // The next fresh post inherits the replacement and deletes the original once it shows.
     h.setDeliver('ok');
     await applyTaskListUpdate(input('Next', items(['B', 'done'])), SLACK, h.deps);
-    expect(h.writes[3].content).toMatchObject({
-      operation: 'edit',
-      messageId: '1786621600.001',
-      taskList: { superseded: true },
-    });
+    expect(h.writes[3].content).toEqual({ operation: 'delete', messageId: '1786621600.001' });
     expect(h.state?.supersedes).toBeNull();
   });
 
@@ -374,12 +354,7 @@ describe('applyTaskListUpdate', () => {
     h.advance(TASK_LIST_DISCORD_REPOST_AFTER_MS);
     const out = await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), DISCORD, h.deps);
     expect(out).toMatchObject({ action: 'reposted' });
-    // The old copy, still under an hour old, becomes a pointer.
-    expect(h.writes[2].content).toMatchObject({
-      operation: 'edit',
-      messageId: '1786621600.001',
-      taskList: { superseded: true },
-    });
+    expect(h.writes[2].content).toEqual({ operation: 'delete', messageId: '1786621600.001' });
   });
 
   it('does not repost a quiet thread', async () => {

@@ -234,6 +234,29 @@ export interface TaskListSettlement {
   } | null;
 }
 
+/**
+ * Whether `platformMessageId` is a task-list post this session's host delivered on that platform address. A
+ * container-written delete row names its target, so the host deletes only a message it can prove is one of the
+ * list's own posts (a Discord bot that can manage messages could otherwise delete a person's message).
+ */
+export function isDeliveredTaskListPost(
+  inbound: Database.Database,
+  outbound: Database.Database,
+  platformMessageId: string,
+  channelType: string,
+  platformId: string,
+): boolean {
+  const receipts = inbound
+    .prepare("SELECT message_out_id FROM delivered WHERE platform_message_id = ? AND status = 'delivered'")
+    .all(platformMessageId) as Array<{ message_out_id: string }>;
+  const post = outbound.prepare(
+    `SELECT 1 FROM messages_out
+      WHERE id = ? AND kind = 'task_list' AND channel_type = ? AND platform_id = ?
+        AND CASE WHEN json_valid(content) THEN json_extract(content, '$.operation') END IS NULL`,
+  );
+  return receipts.some((r) => post.get(r.message_out_id, channelType, platformId) !== undefined);
+}
+
 export const SCHEDULE_WAKE_ID_PREFIX = 'schedule-wake-';
 export const SCHEDULE_WAKE_SYSTEM_KIND = 'agent_scheduled_wake';
 
