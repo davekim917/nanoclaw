@@ -53,8 +53,8 @@ export function markPending(db: Database.Database, messageOutId: string): void {
 }
 
 /**
- * `notice` (a routing veto) reaches the agent through the runner's ack wait. It is written in the same transaction as
- * the delivered row, so an ack is never read without it; without one the statement is the plain upsert.
+ * `notice` (a routing veto) reaches the agent through the runner's ack wait. It is written in the same statement as
+ * the delivered row, so an ack is never read without it; without one an earlier notice is kept.
  */
 export function markDelivered(
   db: Database.Database,
@@ -62,26 +62,16 @@ export function markDelivered(
   platformMessageId: string | null,
   notice?: string,
 ): void {
-  const upsert = () =>
-    db
-      .prepare(
-        `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
-         VALUES (?, ?, 'delivered', ?)
-         ON CONFLICT(message_out_id) DO UPDATE SET
-           platform_message_id = excluded.platform_message_id,
-           status = 'delivered',
-           error = NULL,
-           delivered_at = excluded.delivered_at`,
-      )
-      .run(messageOutId, platformMessageId ?? null, new Date().toISOString());
-  if (notice === undefined) {
-    upsert();
-    return;
-  }
-  db.transaction(() => {
-    upsert();
-    db.prepare('UPDATE delivered SET notice = ? WHERE message_out_id = ?').run(notice, messageOutId);
-  })();
+  db.prepare(
+    `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at, notice)
+     VALUES (?, ?, 'delivered', ?, ?)
+     ON CONFLICT(message_out_id) DO UPDATE SET
+       platform_message_id = excluded.platform_message_id,
+       status = 'delivered',
+       error = NULL,
+       delivered_at = excluded.delivered_at,
+       notice = COALESCE(excluded.notice, delivered.notice)`,
+  ).run(messageOutId, platformMessageId ?? null, new Date().toISOString(), notice ?? null);
 }
 
 export function markDeliveryFailed(db: Database.Database, messageOutId: string, errorMessage?: string): void {
