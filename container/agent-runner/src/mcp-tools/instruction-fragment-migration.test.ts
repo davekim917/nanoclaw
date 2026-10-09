@@ -89,6 +89,13 @@ describe('onecli-gateway/instructions.md content merged into SKILL.md', () => {
     expect(frontmatter).toContain('connect_url');
   });
 
+  it('SKILL.md description routes a missing API key to the intake form, not a link', () => {
+    const raw = fs.readFileSync(skillPath, 'utf-8');
+    const frontmatter = raw.split('---')[1] ?? '';
+    expect(frontmatter).toContain('credential_not_found');
+    expect(frontmatter).toContain('ncl secrets intake');
+  });
+
   it('SKILL.md body still carries the bare-URL display rule', () => {
     const raw = fs.readFileSync(skillPath, 'utf-8');
     expect(raw).toMatch(/bare URL/i);

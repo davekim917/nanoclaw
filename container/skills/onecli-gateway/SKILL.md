@@ -6,9 +6,12 @@ description: >-
   read emails, check calendar, access GitHub repos, create issues, check
   Stripe payments, or interact with ANY external service or API. Do NOT
   use browser extensions or OAuth CLI tools. Make HTTP requests directly;
-  the gateway injects credentials automatically. On a 401, 403, or
-  app_not_connected error, show the response's connect_url to the user as a
-  bare URL on its own line so they can click to connect.
+  the gateway injects credentials automatically. On a 401, 403, or gateway
+  error, the error code decides: a missing API key (credential_not_found,
+  carries a secret_url) ALWAYS goes to `ncl secrets intake`, which posts the
+  secure entry form; never show the user a secret_url or a link for a key.
+  Only an OAuth app's app_not_connected gets its connect_url, shown as a bare
+  URL on its own line so they can click to connect.
 compatibility: Requires HTTPS_PROXY set in environment (automatic when launched via `onecli run`)
 metadata:
   author: onecli
@@ -26,8 +29,8 @@ see or handle credential values directly.
 You have direct HTTP access to external APIs. OAuth apps (Gmail, GitHub,
 Google Calendar, Google Drive, etc.) and API key services are all available
 through the gateway. Just make the request directly; the gateway injects
-credentials if the app is connected. If not, it returns an error with a
-connect URL you can present to the user. Use any method that makes an HTTP
+credentials if the app is connected. If not, it returns an error whose code
+says what is missing (see When a Request Fails). Use any method that makes an HTTP
 request — curl, Python, a CLI tool, whatever fits; if a tool insists on a
 locally-configured credential, pass any placeholder value, since the proxy
 replaces it with the real credential at request time.
@@ -73,21 +76,28 @@ https://www.onecli.sh/docs/guides/credential-stubs/general-app
 
 ## When a Request Fails
 
-If you get a 401, 403, or a gateway error (e.g., `app_not_connected`):
+If you get a 401, 403, or a gateway error, the error code says which case
+you are in:
 
-**Step 1 — Show the user a connect link.** Use the `connect_url` from the
-error response. You MUST show it as a bare URL on its own line — no angle
-brackets, no markdown link syntax — so it's clickable as-is:
+- **`credential_not_found`** (body has a `secret_url`): the vault has no key
+  for this host. Run `ncl secrets intake` (next section). Never show the
+  `secret_url`: it opens the OneCLI dashboard on the host, which the user
+  usually cannot reach from chat, and it is not the secure form.
+- **`access_restricted`** (body has a `manage_url`): the key exists but this
+  agent is not granted it. Run `ncl secrets grant --name <vault name>`,
+  which waits for an admin's approval; the grant reaches you at your next
+  container start. Never show the `manage_url`.
+- **`app_not_connected`** (body has a `connect_url`): an OAuth app (Gmail,
+  GitHub, Google Calendar, ...) is not connected. Show the `connect_url` as
+  a bare URL on its own line — no angle brackets, no markdown link syntax —
+  so it's clickable as-is:
 
-> To connect [service], open this link:
-> https://example.com/connect/...
+  > To connect [service], open this link:
+  > https://example.com/connect/...
 
-If there is no `connect_url` in the error, tell the user to open the
-OneCLI dashboard and connect the service there.
-
-**Step 2 — Retry after the user connects.** Let the user know you will
-retry once they have connected. When they confirm, retry the original
-request. If the retry still fails, ask if they need help with the setup.
+  Tell the user you will retry once they have connected. When they confirm,
+  retry the original request. If the retry still fails, ask if they need
+  help with the setup.
 
 ## Adding or Rotating an API Key
 
@@ -114,8 +124,11 @@ use or repeat it; tell them to rotate it, since chat history keeps it.
   request through the proxy.
 - **Never** use browser extensions, gcloud, or manual auth flows. The
   gateway handles credentials for you.
-- **Never** ask the user for API keys or tokens in chat. Use
-  `ncl secrets intake`, or the service's connect URL / the OneCLI dashboard.
+- **Never** ask the user for API keys or tokens in chat. A missing key
+  always goes through `ncl secrets intake`; only an OAuth app uses its
+  `connect_url`.
+- **Never** build your own card, button, or link for entering a key.
+  `ncl secrets intake` posts the only secure form.
 - **Never** suggest the user open Gmail/Calendar/GitHub in their browser
   when they ask you to read or interact with those services. You have API
   access. Use it.
