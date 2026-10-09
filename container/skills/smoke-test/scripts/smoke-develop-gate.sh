@@ -1628,6 +1628,7 @@ fi
 # next run continues from where it stopped instead of starting over. Cost: one
 # request per file page (1-30 per commit), paid once per commit.
 LAG_MAX_COMMITS=250
+LAG_PAGE_SIZE=100
 LAG_COMMIT_DIR="$STATE_DIR/lag-commits"
 # Cached per-commit lists are derived data in the gate's private STATE_DIR and
 # `check` writes them too: `check` stays read-only for gate state, claims and
@@ -1661,7 +1662,9 @@ lag_range_files() {
        and all(.commits[]; (.sha | type) == "string" and (.sha | test("^[0-9a-f]{40}$")))
        and ((.commits | map(.sha) | unique | length) == (.commits | length))
     then .commits[].sha else error("range") end' <<<"$out" 2>/dev/null)" || return 1
-  find "$LAG_COMMIT_DIR" -maxdepth 1 -type f -mmin +10080 -delete 2>/dev/null || true
+  rem=$(( LAG_DEADLINE - $(date +%s) ))
+  [ "$rem" -ge 1 ] || return 1
+  timeout "$rem" find "$LAG_COMMIT_DIR" -maxdepth 1 -type f -mmin +10080 -delete 2>/dev/null || true
   for c in $commits; do
     [ "$(date +%s)" -lt "$LAG_DEADLINE" ] || return 1
     if names="$(lag_commit_read "$c")"; then
@@ -1674,25 +1677,31 @@ lag_range_files() {
     [ "$rem" -le 20 ] || rem=20
     # One line per file, so the per-commit cap counts files, not names. gh
     # prints nothing, successfully, for a body its --jq never ran on (an empty
-    # 204), so each validated page also emits a tab-free marker line that no
-    # @tsv file line can equal; no marker means no evidence.
-    listed="$(timeout "$rem" gh api --paginate "repos/$REPO/commits/$c?per_page=100" \
+    # 204), on any page, so each validated page also emits a tab-free
+    # "#page <files>" line that no @tsv file line can equal. The list is
+    # complete only when every page but the last is full and the last is short;
+    # a commit whose file count is an exact multiple of the page size therefore
+    # refuses rather than being trusted.
+    listed="$(timeout "$rem" gh api --paginate "repos/$REPO/commits/$c?per_page=$LAG_PAGE_SIZE" \
       --jq 'if (.files | type) == "array"
                and all(.files[]; (.filename | type) == "string" and (.filename | length) > 0
                  and ((.previous_filename // "") | type) == "string"
                  and (.status != "renamed" or ((.previous_filename | type) == "string" and (.previous_filename | length) > 0)))
-             then "#page", (.files[] | [.filename, (.previous_filename // "")] | @tsv)
+             then "#page \(.files | length)", (.files[] | [.filename, (.previous_filename // "")] | @tsv)
              else error("malformed commit") end' 2>/dev/null)" || return 1
-    case "$listed" in '#page'*) ;; *) return 1 ;; esac
-    listed="$(printf '%s\n' "$listed" | grep -v '^#page$' || true)"
-    if [ "$(printf '%s' "$listed" | grep -c . || true)" -ge 3000 ]; then
+    if [ "$(printf '%s\n' "$listed" | grep -v '^#page [0-9]*$' | grep -c . || true)" -ge 3000 ]; then
       lag_commit_write "$c" capped ""
       return 1
     fi
+    printf '%s\n' "$listed" | awk -v size="$LAG_PAGE_SIZE" '
+      /^#page [0-9]+$/ { if (pages++ && last != size) bad = 1; last = $2 + 0 }
+      END { exit !(pages > 0 && !bad && last < size) }' || return 1
+    listed="$(printf '%s\n' "$listed" | grep -v '^#page [0-9]*$' || true)"
     names="$(printf '%s' "$listed" | tr '\t' '\n' | grep . || true)"
     lag_commit_write "$c" "$(printf '%s' "$names" | grep -c . || true) $(printf '%s' "$names" | sha256sum | cut -c1-64)" "$names"
     [ -z "$names" ] || printf '%s\n' "$names"
   done
+  [ "$(date +%s)" -lt "$LAG_DEADLINE" ] || return 1
   return 0
 }
 deploy_lag_safe() {
