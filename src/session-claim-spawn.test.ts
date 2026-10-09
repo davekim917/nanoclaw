@@ -375,6 +375,7 @@ import {
   _resetAdoptionStateForTesting,
 } from './container-runner.js';
 import { getSessionClaim } from './db/coordination.js';
+import { getProviderHealth, markProviderUnavailable } from './db/provider-health.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeDb, getDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/index.js';
@@ -570,6 +571,20 @@ describe('claim-first spawn', () => {
     // Winning the claim is what licenses touching this session's runtime state,
     // and the heartbeat file is runtime state.
     expect(claimed).toBeLessThan(heartbeat);
+  });
+
+  it('a spawn back on the primary keeps its failure streak until the primary answers', async () => {
+    await seedSession('sess-streak');
+    // A window that has aged out: the spawn resolves to the primary.
+    await markProviderUnavailable(AGENT_GROUP_ID, 'claude', 'unavailable', { nowMs: Date.now() - 60 * 60_000 });
+
+    await wakeContainer(callerSnapshot('sess-streak'));
+    await waitForFinalize('sess-streak');
+
+    expect(containerSpawned('sess-streak'), 'the spawn never reached spawn()').toBe(true);
+    // Clearing here restarted every fallback-return cycle at the base window, so a primary that failed each
+    // first turn never escalated its cooldown.
+    expect((await getProviderHealth(AGENT_GROUP_ID, 'claude'))?.consecutive_failures).toBe(1);
   });
 
   it('a lost claim starts no container', async () => {

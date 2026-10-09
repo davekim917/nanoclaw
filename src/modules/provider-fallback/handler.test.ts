@@ -26,6 +26,7 @@ import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } fro
 import type { Session } from '../../types.js';
 import { SYSTEM_ERROR_PARK_MAX_MS, handleProviderUnavailable, measuredResetAt } from './handler.js';
 import { handleProviderRetryPrimary } from './retry-primary.js';
+import { handleProviderTurnCompleted } from './turn-completed.js';
 import { handleCodexAccountExhausted } from './codex-account.js';
 import { isCodexAccountExhausted } from '../../codex-accounts.js';
 
@@ -264,6 +265,67 @@ describe('provider_retry_primary handler', () => {
     // window is the operator's own visible signal — not ours to clear.
     expect(await isProviderUnavailable(GID, 'claude')).toBe(true);
     expect(killed).toHaveLength(0);
+  });
+});
+
+describe('provider_turn_completed handler', () => {
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await initMigratedTestDb();
+    await createAgentGroup({
+      id: GID,
+      name: FOLDER,
+      folder: FOLDER,
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+  });
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('ends the failure streak once the provider answers a turn', async () => {
+    await markProviderUnavailable(GID, 'codex', 'unavailable');
+    await markProviderUnavailable(GID, 'codex', 'unavailable');
+
+    await handleProviderTurnCompleted(
+      { action: 'provider_turn_completed', provider: 'Codex', completedAt: new Date(Date.now() + 1_000).toISOString() },
+      session,
+    );
+
+    const row = await getProviderHealth(GID, 'codex');
+    expect(row?.consecutive_failures).toBe(0);
+    expect(row?.unavailable_until).toBeNull();
+  });
+
+  it('keeps a failure recorded after the answered turn', async () => {
+    const answeredAt = new Date(Date.now() - 60_000).toISOString();
+    await markProviderUnavailable(GID, 'codex', 'unavailable');
+
+    await handleProviderTurnCompleted(
+      { action: 'provider_turn_completed', provider: 'codex', completedAt: answeredAt },
+      session,
+    );
+
+    expect((await getProviderHealth(GID, 'codex'))?.consecutive_failures).toBe(1);
+    expect(await isProviderUnavailable(GID, 'codex')).toBe(true);
+  });
+
+  it('ignores a report without a provider or a parseable completion time', async () => {
+    await markProviderUnavailable(GID, 'codex', 'unavailable');
+
+    await handleProviderTurnCompleted(
+      { action: 'provider_turn_completed', completedAt: new Date().toISOString() },
+      session,
+    );
+    await handleProviderTurnCompleted(
+      { action: 'provider_turn_completed', provider: 'codex', completedAt: 'soon' },
+      session,
+    );
+
+    expect((await getProviderHealth(GID, 'codex'))?.consecutive_failures).toBe(1);
   });
 });
 

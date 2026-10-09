@@ -137,19 +137,23 @@ export async function markProviderUnavailable(
 }
 
 /**
- * Clears a cooldown after a successful turn. A CONDITIONAL update keyed on `updated_at` (every writer bumps it), so a
- * newer `markProviderUnavailable` committed between the read and the write is not clobbered by an older success.
- * Returns whether it applied.
+ * Clears a cooldown and the failure streak: a completed turn, or the operator's explicit retry. A CONDITIONAL update
+ * keyed on `updated_at` (every writer bumps it), so a newer `markProviderUnavailable` committed between the read and
+ * the write is not clobbered by an older success. `answeredAt` is when the clearing turn completed: a failure
+ * recorded after it is newer evidence and stays. Returns whether it applied.
  */
 export async function markProviderAvailable(
   agentGroupId: string,
   provider: string,
-  options: { nowMs?: number } = {},
+  options: { nowMs?: number; answeredAt?: string } = {},
 ): Promise<boolean> {
   if (!agentGroupId || !provider) return false;
   const row = await getProviderHealth(agentGroupId, provider);
   // A healthy provider must not cause a DB write on every turn.
   if (!row || (row.unavailable_until === null && row.consecutive_failures === 0)) return false;
+  if (options.answeredAt !== undefined && !(Date.parse(row.updated_at) <= Date.parse(options.answeredAt))) {
+    return false;
+  }
   const result = await getDb().run(
     `UPDATE provider_health
           SET unavailable_until = NULL, consecutive_failures = 0, updated_at = ?

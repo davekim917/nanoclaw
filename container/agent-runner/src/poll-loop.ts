@@ -105,6 +105,7 @@ import type {
 import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
 import { recordWorktreeInFlight, snapshotWorktrees } from './worktree-in-flight.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
+import { confirmProviderTurn, markProviderTurnUnconfirmed } from './provider-turn-completed.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 import { isFreshContextTaskBatch, sessionHasOpenWork, startsFreshFire } from './fresh-context-task.js';
 import { loadTaskListState, markTaskListStale, taskListEnabled, taskListReminder } from './task-list.js';
@@ -174,6 +175,10 @@ function formatCredentialRetryPrompt(
 // costs another full 5 min, so retry once.
 const CODEX_IDLE_RETRY_MAX = 1;
 const CODEX_IDLE_RETRY_BASE_MS = 3000;
+
+export const STALE_SESSION_NOTICE =
+  '[Your saved conversation could not be resumed, so this is a fresh session and your conversation memory was ' +
+  'reset. Catch up from this thread and your durable notes before acting.]\n\n';
 
 export function buildWorkContinuationPrompt(task: string): string {
   return (
@@ -302,6 +307,7 @@ async function reportProviderUnavailable(
         buildProviderUnavailableReport(activeProvider, recognizedQuota, message, fallbackProvider, detail),
       ),
     });
+    markProviderTurnUnconfirmed();
     const suppress = !alreadyOnFallback;
     log(
       `Provider ${activeProvider} unusable (${recognizedQuota ? 'quota' : 'unrecovered failure'}); ` +
@@ -1084,10 +1090,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
-            (recap
-              ? wrapRecap(recap, 'stale-session-recovered')
-              : '[The prior agent session transcript was unavailable and could not be resumed. Starting a fresh session.]\n\n') +
-              prompt,
+            STALE_SESSION_NOTICE + (recap ? wrapRecap(recap, 'stale-session-recovered') : '') + prompt,
           );
           freshContextBootstrapRequired = false;
           await retryInTurn(retryPrompt, undefined, effectiveModel);
@@ -1469,10 +1472,9 @@ export async function processQuery(
       platformId: own ? human.platform_id : from.platformId,
     };
   };
-  let humanReplyOwed: ReplyDebt | null = replyDebt(
-    initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null),
-    routing,
-  );
+  const initialBatch = initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null);
+  let humanReplyOwed: ReplyDebt | null = replyDebt(initialBatch, routing);
+  let providerTurnConfirmed = false;
   // Retryable events (SDK `api_retry`) are the SDK's own mid-stream retry, not
   // turn-ending: surface the last only if the stream ends without a result.
   let sawResult = false;
@@ -2092,6 +2094,14 @@ export async function processQuery(
         // Complete the initial batch now so the sweep sees no stale claims
         // while the query stays open.
         markCompleted(initialBatchIds);
+        if (!providerTurnConfirmed && event.isError !== true) {
+          providerTurnConfirmed = true;
+          await confirmProviderTurn(
+            initialBatch,
+            { providerName, onFallback: options.providerFallbackActive === true },
+            log,
+          );
+        }
         // Only pushes this result CONSUMED; one still queued stays claimed.
         const answered = event.answeredPrompts;
         completeConsumedFollowUps(

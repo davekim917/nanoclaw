@@ -28,7 +28,6 @@ const state = vi.hoisted(() => ({
     containerName: string;
     claimIncarnation: number;
   } | null,
-  ownsOutbound: false,
   providerFallback: { provider: 'codex' } as { provider: string } | undefined,
 }));
 const killContainer = vi.hoisted(() => vi.fn());
@@ -45,7 +44,8 @@ vi.mock('../../container-config.js', () => ({
 }));
 vi.mock('../../container-runner.js', () => ({
   containerIdentityFor: () => state.registered,
-  containerOwnsOutbound: () => state.ownsOutbound,
+  // No container owns outbound.db here, so a thread line the duty wrote would land and fail the test.
+  containerOwnsOutbound: () => false,
   killContainer,
   sameContainerIdentity: (
     a: { containerName: string; claimIncarnation: number } | null,
@@ -119,7 +119,6 @@ beforeEach(() => {
   state.fallbackUnavailable = false;
   state.liveClaims = 0;
   state.registered = { containerName: 'nanoclaw-v2-g-1', claimIncarnation: 1 };
-  state.ownsOutbound = false;
   state.providerFallback = { provider: 'codex' };
   killContainer.mockReset();
   requestWake.mockClear();
@@ -152,22 +151,27 @@ describe('isBetweenTurns', () => {
 });
 
 describe('sweepProviderReturn', () => {
-  it('restarts a fallback container between turns once the primary is available, then notes it and respawns', async () => {
+  it('restarts a fallback container between turns once the primary is available, and respawns it without a thread line', async () => {
     const readMarker = vi.fn(() => true);
     await expect(sweepProviderReturn(context(), { readMarker })).resolves.toBe(true);
 
     expect(wakeRows).toHaveLength(1);
     expect(wakeRows[0]).toMatchObject({ onWake: 1 });
     expect(String(wakeRows[0].content)).toContain('move it back to claude');
+    // The runner posts the thread line from these fields once the primary answers the wake.
+    expect(JSON.parse(String(wakeRows[0].content))._system).toEqual({
+      kind: 'provider_fallback_return',
+      provider: 'claude',
+      from: 'codex',
+    });
     expect(killContainer).toHaveBeenCalledTimes(1);
     const [sessionId, , onExit, intent] = killContainer.mock.calls[0];
     expect(sessionId).toBe('sess-1');
     expect(intent).toBe('respawn_after_stop');
 
     await onExit();
-    expect(outboundWrites).toHaveLength(1);
-    expect(outboundWrites[0]).toMatchObject({ kind: 'chat', platformId: 'slack:C1', threadId: 'T1' });
-    expect(String(outboundWrites[0].content)).toContain('claude is available again');
+    // The primary has not answered yet: the line is the runner's to post once it does.
+    expect(outboundWrites).toHaveLength(0);
     expect(requestWake).toHaveBeenCalledWith(session, 'container-restart', expect.anything());
   });
 
@@ -245,21 +249,5 @@ describe('sweepProviderReturn', () => {
     await expect(sweepProviderReturn(context(), { readMarker: () => true })).resolves.toBe(true);
     expect(wakeRows).toHaveLength(0);
     expect(killContainer).not.toHaveBeenCalled();
-  });
-
-  it('skips the thread note when the primary failed again before the exit, and still respawns', async () => {
-    await sweepProviderReturn(context(), { readMarker: () => true });
-    state.primaryUnavailable = true;
-    await killContainer.mock.calls[0][2]();
-    expect(outboundWrites).toHaveLength(0);
-    expect(requestWake).toHaveBeenCalledTimes(1);
-  });
-
-  it('skips the thread note when a container already owns outbound.db, and still respawns', async () => {
-    await sweepProviderReturn(context(), { readMarker: () => true });
-    state.ownsOutbound = true;
-    await killContainer.mock.calls[0][2]();
-    expect(outboundWrites).toHaveLength(0);
-    expect(requestWake).toHaveBeenCalledTimes(1);
   });
 });

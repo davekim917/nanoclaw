@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, jest } from 'bun:test';
 import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -21,6 +21,7 @@ import {
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
+import { CodexProvider } from './codex.js';
 
 interface RecordedRequest {
   id: number;
@@ -378,12 +379,35 @@ describe('MCP server startup', () => {
   ];
   const PARAMS: ThreadParams = { model: 'gpt-test', cwd: '/workspace' };
 
-  it.each(REQUIRED_FAILURES)('rejects the resume and keeps the thread when the required server fails: %s', async (message) => {
-    const { server, requests } = fakeAppServer((request) =>
-      request.method === 'thread/resume' ? { error: { code: -32603, message } } : { result: { thread: { id: 'fresh' } } },
-    );
-    await expect(startOrResumeCodexThread(server, 'thread-kept', PARAMS)).rejects.toThrow('required MCP servers');
-    expect(requests.map((r) => r.method)).toEqual(['thread/resume']);
+  it.each(REQUIRED_FAILURES)(
+    'rejects the resume and keeps the thread when the required server fails: %s',
+    async (message) => {
+      const { server, requests } = fakeAppServer((request) =>
+        request.method === 'thread/resume'
+          ? { error: { code: -32603, message } }
+          : { result: { thread: { id: 'fresh' } } },
+      );
+      await expect(startOrResumeCodexThread(server, 'thread-kept', PARAMS)).rejects.toThrow('required MCP servers');
+      expect(requests.map((r) => r.method)).toEqual(['thread/resume']);
+    },
+  );
+
+  it('turns an unanswered resume into a stale-thread failure, not an outage', async () => {
+    jest.useFakeTimers();
+    try {
+      const { server, requests } = fakeAppServer((request) =>
+        request.method === 'thread/resume' ? null : { result: { thread: { id: 'fresh' } } },
+      );
+      const resumed = startOrResumeCodexThread(server, 'thread-wedged', PARAMS).catch((err: unknown) => err);
+      jest.advanceTimersByTime(60_000);
+      const err = await resumed;
+      expect(String(err)).toContain('thread-wedged');
+      // The poll loop's stale-session branch keys on this; a miss reports `provider_unavailable` and moves the group.
+      expect(new CodexProvider().isSessionInvalid(err)).toBe(true);
+      expect(requests.map((r) => r.method)).toEqual(['thread/resume']);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('still starts a fresh thread when the stored thread is gone', async () => {

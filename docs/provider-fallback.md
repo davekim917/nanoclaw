@@ -63,6 +63,14 @@ An app-server that does not answer `initialize` within 30 seconds is replaced
 once before the turn fails, because that failure reaches rung 3 and moves the
 whole group to its fallback provider for 15 minutes.
 
+An app-server that answers `initialize` but not `thread/resume` (60 seconds) is
+stuck on that one saved conversation, not out of service. The runner treats it
+like a thread Codex no longer knows: it drops the saved thread id, replays the
+turn on a fresh Codex thread with a recap of the chat, and tells the agent its
+conversation memory was reset and to catch up from the thread and its durable
+notes. No `provider_unavailable` is reported. If the fresh thread fails too,
+that failure walks the ladder as usual.
+
 ### What the user sees
 
 When rung 2 succeeds, one line says so — the turn was answered by a different
@@ -80,8 +88,12 @@ clear, and the line says nothing about re-pinning).
 
 Normally: nothing. The window in `provider_health` ages out and the next spawn
 returns to the primary — no cron, no probe, no operator action. Cooldowns
-escalate on the failure streak (15m → 30m → 1h → … → 6h cap), and a completed
-turn on the primary clears the streak.
+escalate on the failure streak (15m → 30m → 1h → … → 6h cap). Only a completed
+turn clears the streak: the runner reports its first answered turn per
+container (and again after any outage it reported) as `provider_turn_completed`,
+and the host clears that provider's window and streak when they predate the
+turn. A spawn that picks the primary clears nothing, because the primary has
+not answered yet.
 
 A container already running on the fallback does not wait for its next spawn.
 A busy thread can keep one container alive for a day, long past the window, so
@@ -93,25 +105,24 @@ wake row. As with every sweep kill, a turn that starts in the moment between
 that read and the kill is cut off; its claimed message is reset and retried on
 the fresh container. It runs after provider self-heal in the same
 exclusive chain, so a container self-heal restarts is not restarted twice. The
-thread gets one line:
+fresh container wakes on an `on_wake` row telling the agent why it was
+restarted and that, back on the primary, its conversation memory does not cover
+the fallback period. Only when the primary completes that turn does the thread
+get one line, posted by the runner:
 
-> ⚙️ claude is available again — this thread is moving back from codex.
+> ⚙️ claude is available again — this thread has moved back from codex.
 
-The line is skipped when the primary's outage is re-recorded before the old
-container exits. The fresh container wakes on an `on_wake` row telling the
-agent why it was restarted and that, back on the primary, its conversation
-memory does not cover the fallback period. The sweep tells a fallback container
+A return whose first turn fails says nothing in the thread. The sweep tells a fallback container
 from a primary one by the `NANOCLAW_PROVIDER_FALLBACK_APPLIED` marker in the
 container's own env, so an adopted container started by an earlier host is
 judged the same way.
 
 If the primary is still failing, that turn re-records the outage and the
-session goes back to the fallback. The cooldown does **not** escalate across
-these returns: a spawn that picks the primary clears the failure streak before
-the primary has answered (`markProviderAvailable` in `spawnContainer`). So an
-outage with no measured reset costs a busy fallback session one restart, one
-failing turn and one thread line about every 15 minutes; a quota window with a
-measured reset holds the session on the fallback until that reset.
+session goes back to the fallback. The streak keeps growing across these
+returns, so an outage with no measured reset costs a busy fallback session one
+restart and one failing turn after 15m, then 30m, 1h and so on up to the 6h
+cap, and no thread line; a quota window with a measured reset holds the session
+on the fallback until that reset.
 
 **The operator override.** Typing `-m <a primary-provider model>` while the
 session is serving from the fallback now asks for the primary back. The
@@ -125,22 +136,27 @@ Only a **freshly typed** `-m` does this. The same pin read out of
 otherwise hold the group in a re-probe loop for the whole window.
 
 If the primary really is still spent, the cost is one failing turn: the outage is
-re-recorded from 15m and the session goes straight back to the fallback.
+re-recorded from 15m and the session goes straight back to the fallback. The
+override keeps resetting the streak because it is a typed, one-off request: the
+pending `-m` is claimed once, so it cannot drive a loop on its own.
 
 ## Where it lives
 
-| Piece                             | File                                             |
-| --------------------------------- | ------------------------------------------------ |
-| Rungs 1–3, the chat lines         | `container/agent-runner/src/poll-loop.ts`        |
-| Availability windows, backoff     | `src/db/provider-health.ts`                      |
-| Spawn-time routing decision       | `src/provider-fallback.ts`                       |
-| Return of a live fallback session | `src/modules/sweep-provider-return/index.ts`     |
-| `provider_unavailable` handler    | `src/modules/provider-fallback/handler.ts`       |
-| `provider_retry_primary` handler  | `src/modules/provider-fallback/retry-primary.ts` |
-| `codex_account_exhausted` handler | `src/modules/provider-fallback/codex-account.ts` |
-| Spent Codex accounts, start pick  | `src/codex-accounts.ts`                          |
+| Piece                               | File                                                       |
+| ----------------------------------- | ---------------------------------------------------------- |
+| Rungs 1–3, the chat lines           | `container/agent-runner/src/poll-loop.ts`                  |
+| Answered-turn report, return line   | `container/agent-runner/src/provider-turn-completed.ts`    |
+| Codex resume timeout → fresh thread | `container/agent-runner/src/providers/codex-app-server.ts` |
+| Availability windows, backoff       | `src/db/provider-health.ts`                                |
+| Spawn-time routing decision         | `src/provider-fallback.ts`                                 |
+| Return of a live fallback session   | `src/modules/sweep-provider-return/index.ts`               |
+| `provider_unavailable` handler      | `src/modules/provider-fallback/handler.ts`                 |
+| `provider_retry_primary` handler    | `src/modules/provider-fallback/retry-primary.ts`           |
+| `provider_turn_completed` handler   | `src/modules/provider-fallback/turn-completed.ts`          |
+| `codex_account_exhausted` handler   | `src/modules/provider-fallback/codex-account.ts`           |
+| Spent Codex accounts, start pick    | `src/codex-accounts.ts`                                    |
 
-The two provider actions are session-scoped and act only on the reporting
-session's own agent group: one records a window, the other clears one.
+The three provider actions are session-scoped and act only on the reporting
+session's own agent group: one records a window, the other two clear one.
 `codex_account_exhausted` accepts only a Codex home mounted into the reporting
 group, and its mark reaches every group that mounts the same host account.
