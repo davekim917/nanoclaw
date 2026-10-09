@@ -8,8 +8,8 @@ import { readClaims, type BoardClaim } from './claims-board.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb } from './db/connection.js';
 import { isTaskThread, TASKS_SYSTEM_THREAD_ID } from './db/sessions.js';
-import { latestTaskSeriesAnchorThread } from './db/task-thread-anchors.js';
 import { log } from './log.js';
+import { resolveTaskSeries } from './modules/claims/task-series-destination.js';
 import { withExistingNanoclawOutboundSync } from './modules/mailbox/index.js';
 import type { TaskListInFlight } from './modules/mailbox/ops/session-state.js';
 import { boundedText } from './modules/memory/pre-turn-context.js';
@@ -174,14 +174,14 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
     sessionId,
   );
   const ownThread = own?.thread_id ?? null;
+  const workgroupId = (await getAgentGroup(agentGroupId))?.workgroup_id ?? null;
   const link = async (threadId: string | null) => {
     if (!threadId) return null;
     if (!isTaskThread(threadId)) return linkFor(threadId);
-    const landsIn = await latestTaskSeriesAnchorThread(threadId);
+    const landsIn = workgroupId ? (await resolveTaskSeries(workgroupId, threadId))?.destination?.threadId : null;
     return landsIn ? linkFor(landsIn) : null;
   };
 
-  const workgroupId = (await getAgentGroup(agentGroupId))?.workgroup_id ?? null;
   const { open: lists, partial } = await readOpenLists(
     agentGroupId,
     workgroupId,

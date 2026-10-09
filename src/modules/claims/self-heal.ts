@@ -379,73 +379,17 @@ interface WiredCandidate {
 
 /**
  * A task-series claim's thread is `system:tasks:<seriesId>`, a session with no
- * messaging group, so the channel join matches nothing. The task session row
- * IS the owner. Destination, ranked: the newest `task_thread_anchors` row
- * (where output actually landed), then the series' routing stamp, else none.
- * Same precedence the display side uses. The wiring join still applies.
+ * messaging group, so the channel join matches nothing: `resolveTaskSeries`
+ * names the owner and where its output lands, and the wiring join still applies.
  */
 async function taskSeriesCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
-  const { getDb } = await import('../../db/connection.js');
-  const owner = await getDb().get<{ sessionId: string; agentGroupId: string; name: string; folder: string }>(
-    `SELECT s.id AS sessionId, ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder
-         FROM sessions s
-         JOIN agent_groups ag ON ag.id = s.agent_group_id
-        WHERE s.thread_id = ? AND ag.workgroup_id = ?
-        ORDER BY s.created_at DESC
-        LIMIT 1`,
-    threadId,
-    workgroupId,
-  );
-  if (!owner) return [];
-
-  // Newest anchor wins: the channel the series spoke in last.
-  const anchor = await getDb().get<{
-    channelType: string;
-    platformId: string;
-    threadPlatformId: string;
-    messagingGroupId: string;
-  }>(
-    `SELECT a.channel_type AS channelType, a.platform_id AS platformId, a.thread_platform_id AS threadPlatformId,
-              mg.id AS messagingGroupId
-         FROM task_thread_anchors a
-         JOIN messaging_groups mg ON mg.platform_id = a.platform_id AND mg.channel_type = a.channel_type
-         JOIN messaging_group_agents mga
-              ON mga.messaging_group_id = mg.id AND mga.agent_group_id = ?
-        WHERE a.session_id = ?
-        ORDER BY a.created_at DESC
-        LIMIT 1`,
-    owner.agentGroupId,
-    owner.sessionId,
-  );
-  const where = anchor
-    ? { messagingGroupId: anchor.messagingGroupId, deliverThreadId: `${anchor.platformId}:${anchor.threadPlatformId}` }
-    : // `system:tasks:<seriesId>` — the series id is everything after the prefix.
-      await seriesRoutingStamp(owner.agentGroupId, owner.sessionId, threadId.split(':').slice(2).join(':'));
-  if (!where) return [];
-
-  return [{ agentGroupId: owner.agentGroupId, name: owner.name, folder: owner.folder, ...where }];
-}
-
-/** Lazy (a session-DB open): only after the anchor lookup missed. */
-async function seriesRoutingStamp(
-  agentGroupId: string,
-  sessionId: string,
-  seriesId: string,
-): Promise<{ messagingGroupId: string; deliverThreadId: string | null } | null> {
-  // Read-only: a probe must never provision or migrate the session. No mailbox
-  // reads as "no routing stamp".
-  const [{ readSessionInbound }, { getDb }] = await Promise.all([
-    import('../mailbox/index.js'),
+  const [{ resolveTaskSeries }, { getDb }] = await Promise.all([
+    import('./task-series-destination.js'),
     import('../../db/connection.js'),
   ]);
-  // Not in one lease block: a row changing between the two reads costs at most
-  // one stale destination, re-resolved later.
-  const stamp = readSessionInbound(
-    { agentGroupId, sessionId },
-    (mailbox) => mailbox.getLatestTaskRoutingStamp(seriesId),
-    { busyTimeoutMs: 5000, recoverJournal: true },
-  );
-  if (!stamp) return null; // `--isolated`: stamped no routing on purpose
+  const series = await resolveTaskSeries(workgroupId, threadId);
+  if (!series?.destination) return [];
+  const { owner, destination } = series;
 
   const mg = await getDb().get<{ messagingGroupId: string }>(
     `SELECT mg.id AS messagingGroupId
@@ -453,11 +397,21 @@ async function seriesRoutingStamp(
          JOIN messaging_group_agents mga
               ON mga.messaging_group_id = mg.id AND mga.agent_group_id = ?
         WHERE mg.platform_id = ? AND mg.channel_type = ?`,
-    agentGroupId,
-    stamp.platformId,
-    stamp.channelType,
+    owner.agentGroupId,
+    destination.platformId,
+    destination.channelType,
   );
-  return mg ? { messagingGroupId: mg.messagingGroupId, deliverThreadId: stamp.threadId } : null;
+  if (!mg) return [];
+
+  return [
+    {
+      agentGroupId: owner.agentGroupId,
+      name: owner.name,
+      folder: owner.folder,
+      messagingGroupId: mg.messagingGroupId,
+      deliverThreadId: destination.threadId,
+    },
+  ];
 }
 
 /**

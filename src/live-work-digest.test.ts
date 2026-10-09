@@ -14,7 +14,7 @@ vi.mock('./config.js', async () => {
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initMigratedTestDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { buildLiveWorkDigest, LIVE_WORK_BOUNDS } from './live-work-digest.js';
-import { outboundDbPath } from './mailbox/sqlite/paths.js';
+import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { initSessionFolder } from './session-manager.js';
 
 const AG = 'ag-live';
@@ -262,6 +262,27 @@ describe('buildLiveWorkDigest', () => {
 
     expect(digest?.claims.map((c) => [c.slug, c.owner, c.threadId, c.link])).toEqual([
       ['definitions-check', 'kit', 'system:tasks:dispatch-abc', 'https://chat.example/slack:CBUILD:9.000'],
+    ]);
+  });
+
+  it('links a scheduled task’s claim through its routing stamp when its posts never anchored', async () => {
+    // A task dispatched into a thread posts there directly, so delivery writes no anchor row.
+    await session('sess-dispatch', 'system:tasks:dispatch-abc');
+    const db = new Database(inboundDbPath(AG, 'sess-dispatch'));
+    try {
+      db.prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, series_id, platform_id, channel_type, thread_id, content)
+         VALUES ('task-1', 2, 'task', ?, 'dispatch-abc', 'slack:CBUILD', 'slack', 'slack:CBUILD:7.000', '{}')`,
+      ).run(at(-HOUR));
+    } finally {
+      db.close();
+    }
+    claim('definitions-check', liveClaim('kit', 'system:tasks:dispatch-abc'));
+
+    const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
+
+    expect(digest?.claims.map((c) => [c.slug, c.link])).toEqual([
+      ['definitions-check', 'https://chat.example/slack:CBUILD:7.000'],
     ]);
   });
 
