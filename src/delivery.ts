@@ -1603,7 +1603,9 @@ async function deliverMessage(
       });
     const anchor = await getThreadKeyAnchor(keyAddr, new Date().toISOString());
     if (anchor && !(isInPlaceOp && content.messageId === anchor.threadPlatformId)) {
-      // Only a `handoff` post routes a new request here; results and drafts under the key are never judged.
+      // Only a `handoff` post is judged: work sessions post their results as `decision` into their own thread, and
+      // judging those would veto legitimate results. A routing post sent as `decision` therefore goes unchecked; the
+      // current watcher routes only by handoff, but did post `decision` before it split dispatch from triage.
       const split =
         checked && content.reporting?.purpose === 'handoff' ? splitThreadKey(keyAddr.threadKey, msg.id) : null;
       const verdict = split !== null ? routeCheck('anchor', anchor.threadPlatformId, split) : undefined;
