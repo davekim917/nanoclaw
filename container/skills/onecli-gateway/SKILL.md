@@ -95,6 +95,10 @@ you are in:
   > To connect [service], open this link:
   > https://example.com/connect/...
 
+  If the URL's host is `localhost` or `127.0.0.1`, it opens only on the
+  machine running OneCLI: say so, so the user connects the app from there
+  instead of clicking a link that fails on their phone or laptop.
+
   Tell the user you will retry once they have connected. When they confirm,
   retry the original request. If the retry still fails, ask if they need
   help with the setup.
