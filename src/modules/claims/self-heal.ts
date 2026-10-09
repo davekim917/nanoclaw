@@ -387,7 +387,7 @@ async function taskSeriesCandidates(workgroupId: string, threadId: string): Prom
     import('./task-series-destination.js'),
     import('../../db/connection.js'),
   ]);
-  const series = await resolveTaskSeries(workgroupId, threadId);
+  const series = await resolveTaskSeries(workgroupId, threadId, { wiredOnly: true });
   if (!series?.destination) return [];
   const { owner, destination } = series;
 

@@ -907,6 +907,22 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
     ]);
   });
 
+  it('skips a newer anchor in a channel the owner is not wired to', async () => {
+    // A destination grant lets a series post where its agent is not wired; nobody there can be nudged.
+    getRawDb()
+      .prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, NULL, ?, ?)')
+      .run('mg-2', 'slack-example', 'slack:C0BBB', '#channel-b', '2026-08-01T00:00:00Z');
+    anchor('slack-example', 'slack:C0BBB', '2222.0002', '2026-08-21T00:00:00Z');
+    stampRouting('slack:C0AAA', 'slack-example', null);
+
+    const [row] = await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
+    expect(row).toMatchObject({ messagingGroupId: 'mg-1', deliverThreadId: null });
+
+    anchor('slack-example', 'slack:C0AAA', '1111.0001', '2026-08-19T00:00:00Z');
+    const [older] = await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
+    expect(older).toMatchObject({ messagingGroupId: 'mg-1', deliverThreadId: 'slack:C0AAA:1111.0001' });
+  });
+
   it('resolves nothing rather than guessing when the series never posted and never routed', async () => {
     expect(await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd')).toEqual([]);
   });
