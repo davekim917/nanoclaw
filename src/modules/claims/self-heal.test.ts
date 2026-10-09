@@ -601,7 +601,8 @@ describe('a claim whose owning session is still working', () => {
       last_active: iso(-HOUR),
       created_at: iso(-30 * HOUR),
     });
-    if (lastOutboundAt) await getDb().run('UPDATE sessions SET last_outbound_at = ? WHERE id = ?', lastOutboundAt, 'sess-owner');
+    if (lastOutboundAt)
+      await getDb().run('UPDATE sessions SET last_outbound_at = ? WHERE id = ?', lastOutboundAt, 'sess-owner');
   }
 
   it('leaves a stale claim alone, spending no rung, while its owner has a running container in the thread', async () => {
