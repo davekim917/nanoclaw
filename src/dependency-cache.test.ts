@@ -46,6 +46,7 @@ import {
   type DependencyCachePass,
 } from './dependency-cache.js';
 import { dirSizeBytes } from './storage-manager.js';
+import { writeInstallStamp } from './test-install-stamp.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
 
@@ -160,10 +161,11 @@ const FILE_STAMP_S = (Date.now() - 60 * 60 * 1000) / 1000;
 
 /**
  * What `npm ci` leaves behind: every declared package dir, a `.bin` symlink,
- * and the hidden lockfile written last. Private dirs (`.vite`, `.cache`) are
- * workspace state that must never be shared.
+ * and the hidden lockfile written last, then the install stamp unless the
+ * install skipped lifecycle scripts (`stamp: false`). Private dirs (`.vite`,
+ * `.cache`) are workspace state that must never be shared.
  */
-function installTree(pkgDir: string, options: { pkgs?: PkgSpec[]; privateDirs?: boolean } = {}): void {
+function installTree(pkgDir: string, options: { pkgs?: PkgSpec[]; privateDirs?: boolean; stamp?: boolean } = {}): void {
   const pkgs = options.pkgs ?? PKGS;
   const nm = path.join(pkgDir, 'node_modules');
   for (const pkg of pkgs) {
@@ -193,11 +195,17 @@ function installTree(pkgDir: string, options: { pkgs?: PkgSpec[]; privateDirs?: 
     fs.mkdirSync(path.join(nm, '.cache'), { recursive: true });
     fs.writeFileSync(path.join(nm, '.cache', 'sentinel'), 'cache-sentinel');
   }
+  if (options.stamp !== false) writeInstallStamp(pkgDir, { arch: 'x64' });
 }
 
 function makeProject(
   pkgDir: string,
-  options: { pkgs?: PkgSpec[]; privateDirs?: boolean; extraLock?: Record<string, Record<string, unknown>> } = {},
+  options: {
+    pkgs?: PkgSpec[];
+    privateDirs?: boolean;
+    stamp?: boolean;
+    extraLock?: Record<string, Record<string, unknown>>;
+  } = {},
 ): string {
   writeManifests(pkgDir, { pkgs: options.pkgs, extraLock: options.extraLock });
   installTree(pkgDir, options);
@@ -503,6 +511,175 @@ describe('strict completeness for link-at-checkout', () => {
     writeManifests(bare);
     expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('no-entry');
     expect(log.warn).not.toHaveBeenCalledWith('dependency-cache: no verified entry for key', expect.anything());
+  });
+});
+
+// ── Install stamps: adoption gate and propagation ───────────────────────────
+
+describe('install stamps', () => {
+  const STAMP = '.install-stamp.json';
+
+  function readStamp(pkgDir: string): Record<string, unknown> | null {
+    const file = path.join(pkgDir, 'node_modules', STAMP);
+    return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>) : null;
+  }
+
+  function sha(file: string): string {
+    return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  }
+
+  /** An entry sealed before stamps gated adoption: same SEALED, no `installStamp`. */
+  function stripEntryStamp(entry: string): void {
+    const sealedFile = path.join(entry, 'SEALED');
+    const { installStamp: _dropped, ...sealed } = JSON.parse(fs.readFileSync(sealedFile, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    fs.chmodSync(sealedFile, 0o644);
+    fs.writeFileSync(sealedFile, JSON.stringify(sealed));
+    fs.chmodSync(sealedFile, 0o444);
+  }
+
+  it.each<[string, (pkgDir: string) => void]>([
+    ['no stamp (an --ignore-scripts install)', (dir) => fs.rmSync(path.join(dir, 'node_modules', STAMP))],
+    ['an unparseable stamp', (dir) => fs.writeFileSync(path.join(dir, 'node_modules', STAMP), '{"v":1,')],
+    ['scripts not true', (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { scripts: false } })],
+    ['another stamp version', (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { v: 2 } })],
+    [
+      'a stale lockfile digest',
+      (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { lockSha256: 'f'.repeat(64) } }),
+    ],
+    [
+      'a stale package.json digest',
+      (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { pkgSha256: 'f'.repeat(64) } }),
+    ],
+    [
+      'an .npmrc digest when the dir has none',
+      (dir) =>
+        writeInstallStamp(dir, { arch: 'x64', overrides: { npmrcSha256: crypto.createHash('sha256').digest('hex') } }),
+    ],
+    ['another node minor', (dir) => writeInstallStamp(dir, { arch: 'x64', node: '22.22.0' })],
+    ['another arch', (dir) => writeInstallStamp(dir, { arch: 'arm64' })],
+    ['another platform', (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { platform: 'darwin' } })],
+    ['the musl libc', (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { libc: 'musl' } })],
+  ])('never adopts a complete tree with %s', (_case, spoil) => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    spoil(src);
+    const before = snapshotTree(src);
+
+    expect(processPackageDir(startPass('report'), 'wg-a', src)).toBe('unstamped');
+    const pass = startPass();
+    expect(processPackageDir(pass, 'wg-a', src)).toBe('unstamped');
+
+    expect(cacheEntries('wg-a')).toEqual([]);
+    expect(snapshotTree(src)).toEqual(before);
+    expect(pass.counters.adopted).toBe(0);
+    expect(pass.mutations).toBe(0);
+    expect(decisionOps()).toContain('unstamped');
+  });
+
+  it('adopts a tree whose stamp passes the skip test, ignoring the node patch, and seals the stamp with the entry', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    writeInstallStamp(src, { arch: 'x64', node: '22.23.0' });
+    const stamp = readStamp(src);
+
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+
+    const entry = path.join(cacheRoot, 'wg-a', keyOf(src));
+    expect(JSON.parse(fs.readFileSync(path.join(entry, 'SEALED'), 'utf8')).installStamp).toEqual(stamp);
+    // The stamp is the source's private file: never part of the shared tree.
+    expect(fs.existsSync(path.join(entry, 'node_modules', STAMP))).toBe(false);
+    expect(verifyEntry(entry).ok).toBe(true);
+  });
+
+  it("link stamps the copy from the entry's stamp with the copy's own package-dir digests", () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    const entryStamp = readStamp(src)!;
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+    const bare = path.join(tmpRoot, 'topic-b', 'repo');
+    writeManifests(bare);
+
+    expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('linked');
+
+    expectFarmOf(bare, path.join(cacheRoot, 'wg-a', keyOf(bare)));
+    expect(readStamp(bare)).toEqual({
+      ...entryStamp,
+      lockSha256: sha(path.join(bare, 'package-lock.json')),
+      pkgSha256: sha(path.join(bare, 'package.json')),
+      npmrcSha256: null,
+    });
+    expect(fs.lstatSync(path.join(bare, 'node_modules', STAMP)).nlink).toBe(1);
+    expect(fs.readdirSync(path.join(bare, 'node_modules')).filter((name) => name.includes(STAMP))).toEqual([STAMP]);
+  });
+
+  it("link leaves a copy unstamped when its own package-dir digests differ from the entry's under the same key", () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+    // An empty .npmrc keys like an absent one, but its stamp digest differs.
+    const bare = path.join(tmpRoot, 'topic-b', 'repo');
+    writeManifests(bare, { npmrc: '' });
+    expect(keyOf(bare)).toBe(keyOf(src));
+
+    expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('linked');
+
+    expectFarmOf(bare, path.join(cacheRoot, 'wg-a', keyOf(bare)));
+    expect(readStamp(bare)).toBeNull();
+  });
+
+  it("convert stamps an unstamped copy that holds the entry's content, even with its own hidden lockfile", () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    const entryStamp = readStamp(src)!;
+    const target = makeProject(path.join(tmpRoot, 'topic-b', 'repo'), { stamp: false });
+    const hidden = path.join(target, 'node_modules', '.package-lock.json');
+    fs.writeFileSync(hidden, JSON.stringify(JSON.parse(fs.readFileSync(hidden, 'utf8')), null, 4) + '\n');
+    const pass = startPass();
+    expect(processPackageDir(pass, 'wg-a', src)).toBe('adopted');
+
+    expect(convertPackageDir(pass, 'wg-a', target)).toBe('converted');
+
+    expect(readStamp(target)).toEqual({
+      ...entryStamp,
+      lockSha256: sha(path.join(target, 'package-lock.json')),
+      pkgSha256: sha(path.join(target, 'package.json')),
+      npmrcSha256: null,
+    });
+    expect(tempNamesUnder(target)).toEqual([]);
+  });
+
+  it('convert ignores a differing stamp of the copy for equality and never replaces it', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    const target = makeProject(path.join(tmpRoot, 'topic-b', 'repo'));
+    writeInstallStamp(target, { arch: 'x64', overrides: { writer: 'own-install', npm: '11.0.0' } });
+    const ownFile = path.join(target, 'node_modules', STAMP);
+    const own = { ino: fs.lstatSync(ownFile).ino, bytes: fs.readFileSync(ownFile, 'utf8') };
+    const pass = startPass();
+    expect(processPackageDir(pass, 'wg-a', src)).toBe('adopted');
+
+    expect(convertPackageDir(pass, 'wg-a', target)).toBe('converted');
+
+    expectFarmOf(target, path.join(cacheRoot, 'wg-a', keyOf(src)));
+    expect(fs.lstatSync(ownFile).ino).toBe(own.ino);
+    expect(fs.readFileSync(ownFile, 'utf8')).toBe(own.bytes);
+  });
+
+  it('an entry sealed without a stamp still links and converts, but never stamps a copy', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+    const entry = path.join(cacheRoot, 'wg-a', keyOf(src));
+    stripEntryStamp(entry);
+    expect(verifyEntry(entry).ok).toBe(true);
+    const bare = path.join(tmpRoot, 'topic-b', 'repo');
+    writeManifests(bare);
+    const target = makeProject(path.join(tmpRoot, 'topic-c', 'repo'), { stamp: false });
+    const pass = startPass();
+
+    expect(linkPackageDir(pass, 'wg-a', bare)).toBe('linked');
+    expect(convertPackageDir(pass, 'wg-a', target)).toBe('converted');
+
+    expectFarmOf(bare, entry);
+    expectFarmOf(target, entry);
+    expect(readStamp(bare)).toBeNull();
+    expect(readStamp(target)).toBeNull();
   });
 });
 
@@ -1312,6 +1489,17 @@ describe('dependency cache', () => {
       // The entry still holds the source's own bytes: nothing of the workspace leaked into it.
       expect(KEPT.map((rel) => fs.readFileSync(path.join(entry, 'node_modules', rel), 'utf8'))).toEqual(entryBytes);
       expect(processPackageDir(startPass(), 'wg-a', target)).toBe('farm');
+    });
+
+    it("never stamps a converted copy that keeps its own build outputs, which the entry's stamp does not vouch for", () => {
+      const { target, entry } = sourceAndTarget();
+      fs.rmSync(path.join(target, 'node_modules', '.install-stamp.json'));
+      const own = ownFiles(target);
+
+      expect(convertPackageDir(startPass(), 'wg-a', target)).toBe('converted');
+
+      expectFarmKeeping(target, entry, own);
+      expect(fs.existsSync(path.join(target, 'node_modules', '.install-stamp.json'))).toBe(false);
     });
 
     it('converts a later install whose hidden lockfile matches the entry, keeping only its own build outputs', () => {

@@ -62,6 +62,7 @@ import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
 import { sessionContextPathFor } from './session-manager.js';
+import { writeInstallStamp } from './test-install-stamp.js';
 
 // The rescue round-trip suite needs a REAL tar/zstd. `vi.mock('child_process')`
 // intercepts the `node:`-prefixed specifier too, so a plain import would just
@@ -3564,6 +3565,7 @@ describe('storage-manager regenerable tree sweep', () => {
       JSON.stringify({ name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages }),
     );
     fs.utimesSync(hidden, old + 30, old + 30);
+    writeInstallStamp(repoDir);
     ageTopic(topicDir, idleDays);
     return { topicDir, repoDir };
   }
